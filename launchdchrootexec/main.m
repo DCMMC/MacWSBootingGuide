@@ -41,6 +41,8 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     
     setenv("DYLD_INSERT_LIBRARIES", "/usr/local/lib/libmachook.dylib", 1);
+    setenv("HOME", "/Users/root", 1);
+    setenv("TMPDIR", "/tmp", 1);
     
     posix_spawnattr_t attr;
     if(posix_spawnattr_init(&attr) != 0) {

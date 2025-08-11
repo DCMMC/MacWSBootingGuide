@@ -73,25 +73,35 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 
 __attribute__((constructor)) void InitStuff() {
     EnableJIT();
-    setenv("HOME", "/Users/root", 1);
-    setenv("TMPDIR", "/tmp", 1);
     _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))loadImageCallback);
 }
 
 extern int gpu_bundle_find_trusted(const char *name, char *trusted_path, size_t trusted_path_len);
 
 int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    printf("Calling interposed sysctlbyname\n");
-    if (name && oldp && !strcmp(name, "kern.osvariant_status")) {
-        *(unsigned long long *)oldp = 0x70010000f388828a;
-        return 0;
+    //printf("Calling interposed sysctlbyname\n");
+    if (name && oldp) {
+        if(!strcmp(name, "kern.osvariant_status")) {
+            *(unsigned long long *)oldp = 0x70010000f388828a;
+            return 0;
+        } else if(!strcmp(name, "kern.osproductversion")) {
+            sysctlbyname(name, oldp, oldlenp, newp, newlen);
+            char *version = (char *)oldp;
+            assert(version[0] == '1');
+            if(version[1] >= '4') {
+                version[1] -= 3; // 16 -> 13
+            } else {
+                version[1] = '1'; // always macOS 11
+            }
+            return 0;
+        }
     }
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags, const char **params, char **errorbuf);
 int sandbox_init_with_parameters_new(const char *profile, uint64_t flags, const char **params, char **errorbuf) {
-    printf("Calling interposed sandbox_init_with_parameters\n");
+    //printf("Calling interposed sandbox_init_with_parameters\n");
     return 0;
 }
 
@@ -157,8 +167,16 @@ int auditon_new(int cmd, void *data, uint32_t length) {
             auditpinfo_addr_t *addr = (auditpinfo_addr_t *)data;
             auditpinfo_fill(addr);
         } return 0;
+        case A_GETCOND: {
+            if(length < sizeof(int)) {
+                errno = EINVAL;
+                return -1;
+            }
+            int *cond = (int *)data;
+            *cond = 2; // AUC_NOAUDIT
+        } return 0;
         default:
-            NSLog(@"Unimplemented auditon cmd: %d", cmd);
+            NSLog(@"auditon: unimplemented cmd: %d", cmd);
             abort();
     }
 }

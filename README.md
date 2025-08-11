@@ -1,11 +1,27 @@
 # MacWSBootingGuide
 Booting macOS's WindowServer on your jailbroken iDevice for real (WIP)
 
+Some path are currently hardcoded for rootless jailbreak, but you can change them to work with rootful jailbreak.
+
 You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementation.framework, MetalSerializer.framework
 
-## Setting up
+## Setting up (macOS Base System aka recoveryOS)
 - TODO
 - Copy `/System/Volumes/Data/System/Library/CoreServices/CoreTypes.bundle/Contents/Library`
+
+## Setting up (macOS full installation)
+- Extract full filesystem dmg to a directory, e.g. `/var/mnt/rootfs`
+- ~~Extract App cryptex dmg to `rootfs/System/Volumes/Preboot/Cryptexes/App`~~ (for Safari only, which is not needed)
+- Extract OS cryptex dmg to `rootfs/System/Volumes/Preboot/Cryptexes/OS`
+- Copy-merge folders from `rootfs/System/Library/Templates/Data` to your `rootfs`
+- Symlink `rootfs/System/Volumes/Data` -> `../..`
+- Symlink `/home` -> `rootfs/System/Volumes/Data/home` (optional?)
+- Symlink `rootfs/var/folders/zz` -> `/var/folders/zz`
+- mkdir `rootfs/Users/root`
+- Copy `/etc` from macOS installation to `rootfs/etc` (optional?)
+- Bind mount `rootfs/var/jb` -> `/var/jb`
+- Patch `dyld`, `launchservicesd` and `WindowServer` as described below.
+- Modify `cpusubtype` in `Installer Progress` and `WindowServer`
 
 ## Additional patches
 > [!NOTE]

@@ -60,7 +60,7 @@
 		<string>/var/jb/usr/macOS/bin/launchdchrootexec</string>
 		<string>0</string>
 		<string>0</string>
-		<string>/System/Library/VideoCodecs</string>
+		<string>/var/mnt/rootfs_macOS</string>
 		<string>/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer</string>
 		<string>-virtualonly</string>
 		<string>-daemon</string>

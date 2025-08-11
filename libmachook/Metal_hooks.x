@@ -6,8 +6,12 @@
 
 void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction) {
     Method m1 = class_getInstanceMethod(class2, swizzledAction);
-    class_addMethod(class, swizzledAction, method_getImplementation(m1), method_getTypeEncoding(m1));
-    method_exchangeImplementations(class_getInstanceMethod(class, originalAction), class_getInstanceMethod(class, swizzledAction));
+    if(class_getInstanceMethod(class, originalAction) == NULL) {
+        class_addMethod(class, originalAction, method_getImplementation(m1), method_getTypeEncoding(m1));
+    } else {
+        class_addMethod(class, swizzledAction, method_getImplementation(m1), method_getTypeEncoding(m1));
+        method_exchangeImplementations(class_getInstanceMethod(class, originalAction), class_getInstanceMethod(class, swizzledAction));
+    }
 }
 
 @interface _MTLDevice : NSObject
@@ -42,6 +46,9 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
     swizzle2(MTLSimDeviceClass, @selector(newBufferWithBytesNoCopy:length:options:deallocator:), MTLFakeDevice.class, @selector(hooked_newBufferWithBytesNoCopy:length:options:deallocator:));
     swizzle2(MTLSimDeviceClass, @selector(newBufferWithLength:options:pointer:copyBytes:deallocator:), MTLFakeDevice.class, @selector(hooked_newBufferWithLength:options:pointer:copyBytes:deallocator:));
     swizzle2(MTLSimDeviceClass, @selector(acceleratorPort), MTLFakeDevice.class, @selector(hooked_acceleratorPort));
+    swizzle2(MTLSimDeviceClass, @selector(location), MTLFakeDevice.class, @selector(hooked_location));
+    swizzle2(MTLSimDeviceClass, @selector(locationNumber), MTLFakeDevice.class, @selector(hooked_locationNumber));
+    swizzle2(MTLSimDeviceClass, @selector(maxTransferRate), MTLFakeDevice.class, @selector(hooked_maxTransferRate));
     
     id(*MTLCreateSimulatorDevice)(void) = dlsym(handle, "MTLCreateSimulatorDevice");
     self = MTLCreateSimulatorDevice();
@@ -51,6 +58,18 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 
 - (uint32_t)hooked_acceleratorPort {
     return ((NSNumber *)objc_getAssociatedObject(self, @selector(acceleratorPort))).unsignedIntValue;
+}
+
+- (NSUInteger)hooked_location {
+    return 0; // MTLDeviceLocationBuiltIn
+}
+
+- (NSUInteger)hooked_locationNumber {
+    return 0;
+}
+
+- (NSUInteger)hooked_maxTransferRate {
+    return 0; // The maximum transfer rate for built-in GPUs is 0.
 }
 
 - (id<MTLBuffer>)hooked_newBufferWithBytesNoCopy:(void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void * pointer, NSUInteger length)) deallocator {
@@ -123,8 +142,11 @@ extern int xpc_connection_enable_sim2host_4sim();
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
-    // force Apple 5 profile
-    CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // force Apple 5 profile
+        CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
+    });
+    
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
     %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
     
