@@ -8,6 +8,7 @@
 #import "IOMobileFramebuffer.h"
 
 #define kUTTypePNG CFSTR("public.png")
+#define USE_HW_FORMAT 1
 
 BOOL CGImageWriteToFile(CGImageRef image, NSString *path) {
     CFURLRef url = (__bridge CFURLRef)[NSURL fileURLWithPath:path];
@@ -46,6 +47,8 @@ typedef struct {
 
 - (instancetype)init {
     self = [super init];
+    CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
+    
     _device = MTLCreateSystemDefaultDevice();
     _commandQueue = [_device newCommandQueue];
     
@@ -85,14 +88,23 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
     desc.vertexFunction = [library newFunctionWithName:@"vertex_main"];
     desc.fragmentFunction = [library newFunctionWithName:@"fragment_main"];
+#if USE_HW_FORMAT
+    desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA10_XR;
+#else
     desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+#endif
     
     _pipelineState = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
     if (error) {
         NSLog(@"Pipeline error: %@", error);
     }
     
-    [self createIOSurfaceBackedTexture:1242 height:2688];
+    CGSize screenSize;
+    CGRect frame = CGRectMake(0, 0, 0, 0);
+    IOMobileFramebufferRef fbConn;
+    IOMobileFramebufferGetMainDisplay(&fbConn);
+    IOMobileFramebufferGetDisplaySize(fbConn, &screenSize);
+    [self createIOSurfaceBackedTexture:screenSize.width height:screenSize.height];
     return self;
 }
 
@@ -110,9 +122,10 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
         @"IOSurfaceHeight": @(height),
         @"IOSurfaceMapCacheAttribute": @0,
         @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        @"IOSurfacePixelFormat": @((uint32_t)'&w4a'),
         @"IOSurfacePixelSizeCastingAllowed": @0,
         @"IOSurfaceBytesPerElement": @(bytesPerElement),
+#if USE_HW_FORMAT
+         @"IOSurfacePixelFormat": @((uint32_t)'&w4a'),
         @"IOSurfacePlaneInfo": @[
             @{
                 @"IOSurfacePlaneWidth": @(width),
@@ -133,13 +146,20 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
                 @"IOSurfacePlaneWidthInCompressedTiles": @(widthLonger / tileWidth),
             }
         ],
+#else
+        @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+#endif
         @"IOSurfaceWidth": @(width)
     };
     _surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProps);
     
     MTLTextureDescriptor *texDesc = [[MTLTextureDescriptor alloc] init];
     texDesc.textureType = MTLTextureType2D;
+#if USE_HW_FORMAT
     texDesc.pixelFormat = MTLPixelFormatBGRA10_XR;
+#else
+    texDesc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+#endif
     texDesc.width = (NSUInteger)width;
     texDesc.height = (NSUInteger)height;
     texDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
@@ -174,9 +194,10 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     [cmdBuffer waitUntilCompleted];
     
     int token;
-    CGRect frame = CGRectMake(0, 0, 1242, 2688);
+    CGRect frame = CGRectMake(0, 0, 0, 0);
     IOMobileFramebufferRef fbConn;
     IOMobileFramebufferGetMainDisplay(&fbConn);
+    IOMobileFramebufferGetDisplaySize(fbConn, &frame.size);
     IOMobileFramebufferSwapBegin(fbConn, &token);
     IOMobileFramebufferSwapSetLayer(fbConn, 0, _surface, frame, frame, 0);
     IOMobileFramebufferSwapEnd(fbConn);
