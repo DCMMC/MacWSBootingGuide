@@ -100,7 +100,6 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     }
     
     CGSize screenSize;
-    CGRect frame = CGRectMake(0, 0, 0, 0);
     IOMobileFramebufferRef fbConn;
     IOMobileFramebufferGetMainDisplay(&fbConn);
     IOMobileFramebufferGetDisplaySize(fbConn, &screenSize);
@@ -109,23 +108,25 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
 }
 
 - (void)createIOSurfaceBackedTexture:(size_t)width height:(size_t)height {
-    int widthLonger = width + 6;
     int tileWidth = 8;
     int tileHeight = 16;
+    int widthLonger = ((width-1) & ~(tileWidth-1))+tileWidth;
+    int heightLonger = ((height-1) & ~(tileHeight-1))+tileHeight;
     int bytesPerElement = 8;
     size_t bytesPerRow = widthLonger * bytesPerElement;
-    size_t size = widthLonger * height * bytesPerElement;
+    size_t size = widthLonger * heightLonger * bytesPerElement;
     size_t totalBytes = size + 0x20000;
     NSDictionary *surfaceProps = @{
         //@"IOSurfaceAllocSize": @(totalBytes),
         @"IOSurfaceCacheMode": @1024,
+        @"IOSurfaceWidth": @(width),
         @"IOSurfaceHeight": @(height),
         @"IOSurfaceMapCacheAttribute": @0,
         @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
         @"IOSurfacePixelSizeCastingAllowed": @0,
         @"IOSurfaceBytesPerElement": @(bytesPerElement),
 #if USE_HW_FORMAT
-         @"IOSurfacePixelFormat": @((uint32_t)'&w4a'),
+        @"IOSurfacePixelFormat": @((uint32_t)'&w4a'),
         @"IOSurfacePlaneInfo": @[
             @{
                 @"IOSurfacePlaneWidth": @(width),
@@ -142,14 +143,13 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
                 @"IOSurfacePlaneCompressedTileHeight": @(tileHeight),
                 @"IOSurfacePlaneCompressedTileWidth": @(tileWidth),
                 @"IOSurfacePlaneCompressionType": @2,
-                @"IOSurfacePlaneHeightInCompressedTiles": @(height / tileHeight),
+                @"IOSurfacePlaneHeightInCompressedTiles": @(heightLonger / tileHeight),
                 @"IOSurfacePlaneWidthInCompressedTiles": @(widthLonger / tileWidth),
             }
         ],
 #else
         @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
 #endif
-        @"IOSurfaceWidth": @(width)
     };
     _surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProps);
     
