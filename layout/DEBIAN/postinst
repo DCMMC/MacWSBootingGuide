@@ -9,6 +9,7 @@ add_trustcache() {
     jbctl trustcache add "$cdhash"
 }
 
+add_trustcache "bin/login"
 add_trustcache "bin/TestMetalIOSurface"
 add_trustcache "lib/libmachook.dylib"
 add_trustcache "Frameworks/MetalSerializer.framework/MetalSerializer"

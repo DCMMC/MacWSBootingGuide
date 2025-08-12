@@ -258,23 +258,31 @@ DYLD_INTERPOSE(IOSurfaceCreate_new, IOSurfaceCreate);
 
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
-    printf("IOServiceNameMatching called with name: %s\n", name);
+    //printf("IOServiceNameMatching called with name: %s\n", name);
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceNameMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {
         return IOServiceNameMatching("IOAcceleratorES");
     }
-    return IOServiceNameMatching(name);
+    CFMutableDictionaryRef service = IOServiceNameMatching(name);
+    if(!service) {
+        fprintf(stderr, "IOServiceNameMatching not found for name: %s\n", name);
+    }
+    return service;
 }
 
 CFDictionaryRef IOServiceMatching_new(const char *name) {
-    printf("IOServiceMatching called with name: %s\n", name);
+    //printf("IOServiceMatching called with name: %s\n", name);
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {
         return IOServiceMatching("IOAcceleratorES");
     }
-    return IOServiceMatching(name);
+    CFMutableDictionaryRef service = IOServiceMatching(name);
+    if(!service) {
+        fprintf(stderr, "IOServiceMatching not found for name: %s\n", name);
+    }
+    return service;
 }
 DYLD_INTERPOSE(IOServiceNameMatching_new, IOServiceNameMatching);
 DYLD_INTERPOSE(IOServiceMatching_new, IOServiceMatching);

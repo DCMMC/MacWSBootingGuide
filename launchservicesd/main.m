@@ -35,5 +35,5 @@ void *dlopen_entry_point(const char *path, int flags) {
 
 int main(int argc, const char **argv, const char **envp, const char **apple) {
     int( *original_main)(int argc, const char **argv, const char **envp, const char **apple) = dlopen_entry_point("@loader_path/launchservicesd.dylib", RTLD_GLOBAL);
-    return original_main(argc, argv, envp, apple);
+    __attribute__((musttail))return original_main(argc, argv, envp, apple);
 }

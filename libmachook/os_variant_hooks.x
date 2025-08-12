@@ -8,10 +8,6 @@ bool os_variant_has_internal_content(const char *subsystem);
 bool os_variant_has_internal_ui(const char *subsystem);
 
 bool hooked_os_variant_is_basesystem(const char * subsystem) {
-    if(subsystem && strcmp(subsystem, "com.apple.Terminal") == 0) {
-        // bypass /usr/bin/login
-        return true;
-    }
     return false;
 }
 
