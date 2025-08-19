@@ -5,6 +5,7 @@
 @import MachO;
 #import <IOKit/IOKitLib.h>
 #import "interpose.h"
+#import "utils.h"
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -16,7 +17,6 @@ extern uid_t audit_token_to_auid(audit_token_t atoken);
 //#define FORCE_SW_RENDER 1
 BOOL hooked_return_1(void) { return YES; }
 void EnableJIT(void);
-void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void));
 
 // offsets hardcoded for macOS 13.4
 // IOMobileFramebuffer`kern_SwapEnd + 36

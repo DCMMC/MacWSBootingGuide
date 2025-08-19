@@ -2,7 +2,8 @@
 @import Darwin;
 @import Foundation;
 @import Metal;
-#include <rootless.h>
+#import <rootless.h>
+#import "utils.h"
 
 void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction) {
     Method m1 = class_getInstanceMethod(class2, swizzledAction);
@@ -26,21 +27,27 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 }
 @end
 
+static id(*MTLCreateSimulatorDevice)(void);
 @interface MTLFakeDevice : _MTLDevice
 @end
 @implementation MTLFakeDevice
-- (id)initWithAcceleratorPort:(int)port {
+- (BOOL)initHooks {
+    if(%c(MTLSimDevice)) {
+        return YES; // Already hooked
+    }
+    
     void *handle = dlopen("@loader_path/../Frameworks/MetalSerializer.framework/MetalSerializer", RTLD_GLOBAL);
     if(!handle) {
         NSLog(@"Failed to load MetalSerializer framework: %s", dlerror());
-        return nil;
+        return NO;
     }
     
     handle = dlopen("@loader_path/../Frameworks/MTLSimDriver.framework/MTLSimDriver", RTLD_GLOBAL);
     if(!handle) {
         NSLog(@"Failed to load MTLSimDriver framework: %s", dlerror());
-        return nil;
+        return NO;
     }
+    MTLCreateSimulatorDevice = dlsym(handle, "MTLCreateSimulatorDevice");
     
     Class MTLSimDeviceClass = %c(MTLSimDevice);
     swizzle2(MTLSimDeviceClass, @selector(newBufferWithBytesNoCopy:length:options:deallocator:), MTLFakeDevice.class, @selector(hooked_newBufferWithBytesNoCopy:length:options:deallocator:));
@@ -50,7 +57,48 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
     swizzle2(MTLSimDeviceClass, @selector(locationNumber), MTLFakeDevice.class, @selector(hooked_locationNumber));
     swizzle2(MTLSimDeviceClass, @selector(maxTransferRate), MTLFakeDevice.class, @selector(hooked_maxTransferRate));
     
-    id(*MTLCreateSimulatorDevice)(void) = dlsym(handle, "MTLCreateSimulatorDevice");
+    uint32_t *imp;
+    // This check isn't present in iOS 14 simulator, maybe it was added in iOS 15?
+    // Patch -[MTLSimTexture initWithDescriptor:decompressedPixelFormat:iosurface:plane:textureRef:heap:device:] to bypass `IOSurface backed XR10 textures are not supported in the simulator`
+    imp = (uint32_t *)method_getImplementation(class_getInstanceMethod(%c(MTLSimTexture), @selector(initWithDescriptor:decompressedPixelFormat:iosurface:plane:textureRef:heap:device:)));
+    for(int i = 0; i < 50; i++) {
+        //    MTLSimDriver[0xfb7c] <+144>: bl     0x2e660        ; objc_msgSend$pixelFormat
+        // -> MTLSimDriver[0xfb80] <+148>: and    x8, x0, #0xfffffffffffffffc
+        // -> MTLSimDriver[0xfb84] <+152>: cmp    x8, #0x228
+        // -> MTLSimDriver[0xfb88] <+156>: b.eq   0xfdf8         ; <+780>
+        if(imp[i] == 0x927ef408 && imp[i+1] == 0xf108a11f) {
+            ModifyExecutableRegion(imp, sizeof(uint32_t[3]), ^{
+                imp[i+1] = imp[i+2] = 0xd503201f; // nop
+            });
+            break;
+        }
+    }
+    
+    // Patch -[MTLSimBuffer newTextureWithDescriptor:offset:bytesPerRow:] to bypass `Linear texture can only be created on buffers with MTLStorageModePrivate in the simulator`
+    imp = (uint32_t *)method_getImplementation(class_getInstanceMethod(%c(MTLSimBuffer), @selector(newTextureWithDescriptor:offset:bytesPerRow:)));
+    for(int i = 0; i < 50; i++) {
+        //    MTLSimDriver[0x85bc] <+84>:  bl     0x2eda0        ; objc_msgSend$storageMode
+        // -> MTLSimDriver[0x85c0] <+88>:  cmp    x0, #0x2
+        //    MTLSimDriver[0x85c4] <+92>:  b.ne   0x8798         ; <+560>
+        if(imp[i] == 0xf100081f) {
+            ModifyExecutableRegion(imp, sizeof(uint32_t), ^{
+                imp[i] = imp[i+1] = 0xd503201f; // nop
+            });
+            break;
+        }
+    }
+    
+    return YES;
+}
+
+- (id)initWithAcceleratorPort:(int)port {
+    if(![self initHooks]) {
+        return nil;
+    }
+    if(!MTLCreateSimulatorDevice) {
+        NSLog(@"Failed to find MTLCreateSimulatorDevice: %s", dlerror());
+        return nil;
+    }
     self = MTLCreateSimulatorDevice();
     objc_setAssociatedObject(self, @selector(acceleratorPort), @(port), OBJC_ASSOCIATION_ASSIGN);
     return self;

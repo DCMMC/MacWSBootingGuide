@@ -10,6 +10,7 @@ You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementat
 - Copy `/System/Volumes/Data/System/Library/CoreServices/CoreTypes.bundle/Contents/Library`
 
 ## Setting up (macOS full installation)
+TODO: make a script
 - Extract full filesystem dmg to a directory, e.g. `/var/mnt/rootfs`
 - ~~Extract App cryptex dmg to `rootfs/System/Volumes/Preboot/Cryptexes/App`~~ (for Safari only, which is not needed)
 - Extract OS cryptex dmg to `rootfs/System/Volumes/Preboot/Cryptexes/OS`
@@ -22,6 +23,10 @@ You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementat
 - Bind mount `rootfs/var/jb` -> `/var/jb`
 - Patch `dyld`, `launchservicesd` and `WindowServer` as described below.
 - Modify `cpusubtype` in `Installer Progress` and `WindowServer`
+
+## Starting up
+- `launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist`
+- `launchctl load /var/jb/usr/macOS/LaunchDaemons`
 
 ## Additional patches
 > [!NOTE]
@@ -46,8 +51,8 @@ You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementat
 - [x] `Attempt to pass a malloc(3)ed region to xpc_shmem_create().`: while regular drivers accept passing `malloc`ed region to `newBufferWithBytesNoCopy:length:options:deallocator:`, doing so to simulator is not allowed since XPC has to share the memory with `MTLSimDriverHost.xpc` process. Workaround is to create a mirrored region using `vm_remap` that can be shared across processes.
 - [x] `Unimplemented pixel format of 645346401 used in WSCompositeDestinationCreateWithIOSurface.` due to missing implementation of `-[MTLSimDevice acceleratorPort]`, which mysteriously caused WindowServer to fallback to software rendering in some places, causing said fatal error.
 - [x] `-[MTLSimDevice newRenderPipelineStateWithTileDescriptor:options:reflection:error:], line 2124: error 'not supported in the simulator'`. FIXME: this is not implemented at all. However, it is only used by `QuartzCore'CA::OGL::BlurState::tile_downsample(int)` which is skipped by the hook.
-- [ ] `-[MTLSimTexture initWithDescriptor:decompressedPixelFormat:iosurface:plane:textureRef:heap:device:]:813: failed assertion 'IOSurface backed XR10 textures are not supported in the simulator'`: patch out the check, since it actually works fine.
-- [ ] `-[MTLSimBuffer newTextureWithDescriptor:offset:bytesPerRow:]`: patch `storageMode == private` check.
+- [x] `-[MTLSimTexture initWithDescriptor:decompressedPixelFormat:iosurface:plane:textureRef:heap:device:]:813: failed assertion 'IOSurface backed XR10 textures are not supported in the simulator'`: patch out the check, since it actually works fine.
+- [x] `-[MTLSimBuffer newTextureWithDescriptor:offset:bytesPerRow:]`: patch `storageMode == private` check.
 
 #### WindowServer
 - [x] It hangs twice when calling `NXClickTime` and `NXGetClickSpace`. Hooked to do nothing instead since both were deprecated.
