@@ -13,7 +13,7 @@ int main(int argc, char *argv[], char *envp[]) {
     const char *rootPath = argv[3];
     const char *execPath = argv[4];
     char **execArgs = &argv[4];
-    
+     
     char currentPath[PATH_MAX];
     if(getcwd(currentPath, sizeof(currentPath)) == NULL) {
         perror("getcwd");
@@ -43,7 +43,7 @@ int main(int argc, char *argv[], char *envp[]) {
     setenv("DYLD_INSERT_LIBRARIES", "/usr/local/lib/libmachook.dylib", 1);
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
-    
+
     posix_spawnattr_t attr;
     if(posix_spawnattr_init(&attr) != 0) {
         perror("posix_spawnattr_init");
