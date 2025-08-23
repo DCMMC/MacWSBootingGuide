@@ -32,6 +32,6 @@ int main(int argc, char *argv[], char *envp[]) {
     pid_t child_pid;
     extern char **environ;
     posix_spawn(&child_pid, argv[0], NULL, &attr, argv, environ);
-    perror("posix_spawn");
+    perror("posix_spawn test dcmmc");
     return 1;
 }

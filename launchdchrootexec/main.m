@@ -19,7 +19,8 @@ int main(int argc, char *argv[], char *envp[]) {
         perror("getcwd");
         return 1;
     }
-    
+
+    fprintf(stderr, "before chroot %s\n", rootPath);
     if(chroot(rootPath) < 0) {
         perror("chroot");
         return 1;
@@ -29,6 +30,7 @@ int main(int argc, char *argv[], char *envp[]) {
         perror("chdir");
         chdir("/");
     }
+    fprintf(stderr, "after chdir %s\n", currentPath);
     
     if(setgid(gid) < 0) {
         perror("setgid");
@@ -43,6 +45,12 @@ int main(int argc, char *argv[], char *envp[]) {
     setenv("DYLD_INSERT_LIBRARIES", "/usr/local/lib/libmachook.dylib", 1);
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
+    setenv("MallocNanoZone", "0", 1);
+    setenv("DYLD_PRINT_SEARCHING", "1", 1);
+    setenv("DYLD_PRINT_LIBRARIES", "1", 1);
+    // setenv("DYLD_PRINT_LIBRARIES_POST_LAUNCH", "1", 1);
+    // setenv("DYLD_PRINT_WARNINGS", "1", 1);
+    // setenv("DYLD_PRINT_INITIALIZERS", "1", 1);
 
     posix_spawnattr_t attr;
     if(posix_spawnattr_init(&attr) != 0) {
@@ -51,20 +59,23 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     
     if(getppid() == 1) {
+        fprintf(stderr, "getppid = 1\n");
         if(posix_spawnattr_set_launch_type_np(&attr, CS_LAUNCH_TYPE_SYSTEM_SERVICE) != 0) {
             perror("posix_spawnattr_set_launch_type_np");
             return 1;
         }
     }
-    
+    // if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED) != 0) {
     if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC) != 0) {
         perror("posix_spawnattr_set_flags");
         return 1;
     }
     
-    pid_t child_pid;
+    pid_t child_pid = 0;
     extern char **environ;
+    fprintf(stderr, "before posix_spawn %s\n", execPath);
     posix_spawn(&child_pid, execPath, NULL, &attr, execArgs, environ);
+    fprintf(stderr, "pid= %d\n", child_pid);
     perror("posix_spawn");
     return 1;
 }

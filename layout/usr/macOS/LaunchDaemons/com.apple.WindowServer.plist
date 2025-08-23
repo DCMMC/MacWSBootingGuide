@@ -65,5 +65,9 @@
 		<string>-virtualonly</string>
 		<string>-daemon</string>
 	</array>
+	<key>StandardOutPath</key>
+	<string>/var/jb/var/mobile/launchdchrootexec.out</string>
+	<key>StandardErrorPath</key>
+	<string>/var/jb/var/mobile/launchdchrootexec.err</string>
 </dict>
 </plist>

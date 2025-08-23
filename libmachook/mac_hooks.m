@@ -79,7 +79,7 @@ __attribute__((constructor)) void InitStuff() {
 extern int gpu_bundle_find_trusted(const char *name, char *trusted_path, size_t trusted_path_len);
 
 int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    //printf("Calling interposed sysctlbyname\n");
+    printf("Calling interposed sysctlbyname\n");
     if (name && oldp) {
         if(!strcmp(name, "kern.osvariant_status")) {
             *(unsigned long long *)oldp = 0x70010000f388828a;
