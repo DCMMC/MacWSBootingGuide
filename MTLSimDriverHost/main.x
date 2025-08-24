@@ -22,6 +22,7 @@ xpc_connection_t xpc_connection_create_mach_service(const char *name, dispatch_q
 int main(int argc, const char **argv, const char **envp) {
     xpc_object_t (*xpc_connection_create_mach_service)(const char *name, dispatch_queue_t targetq, uint64_t flags) = dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
     xpc_connection_t peerConnection = xpc_connection_create_mach_service("com.apple.metal.simulator", dispatch_get_main_queue(), XPC_CONNECTION_MACH_SERVICE_LISTENER);
+    NSLog(@"#### debug MTLSimDriverHost.xpc main before dispatch_async");
     dispatch_async(dispatch_get_main_queue(), ^{
         char frameworkPath[PATH_MAX];
         snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimImplementation.framework/MTLSimImplementation", JBROOT_PATH("/usr/macOS/Frameworks"));

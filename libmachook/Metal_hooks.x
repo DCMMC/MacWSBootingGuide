@@ -40,14 +40,19 @@ static id(*MTLCreateSimulatorDevice)(void);
     if(!handle) {
         NSLog(@"Failed to load MetalSerializer framework: %s", dlerror());
         return NO;
+    } else {
+        NSLog(@"#### debug load MetalSerializer successfully!");
     }
     
     handle = dlopen("@loader_path/../Frameworks/MTLSimDriver.framework/MTLSimDriver", RTLD_GLOBAL);
     if(!handle) {
         NSLog(@"Failed to load MTLSimDriver framework: %s", dlerror());
         return NO;
+    } else {
+        NSLog(@"#### debug load MTLSimDriver successfully!");
     }
     MTLCreateSimulatorDevice = dlsym(handle, "MTLCreateSimulatorDevice");
+    NSLog(@"#### debug load MTLCreateSimulatorDevice successfully!");
     
     Class MTLSimDeviceClass = %c(MTLSimDevice);
     swizzle2(MTLSimDeviceClass, @selector(newBufferWithBytesNoCopy:length:options:deallocator:), MTLFakeDevice.class, @selector(hooked_newBufferWithBytesNoCopy:length:options:deallocator:));
@@ -56,6 +61,7 @@ static id(*MTLCreateSimulatorDevice)(void);
     swizzle2(MTLSimDeviceClass, @selector(location), MTLFakeDevice.class, @selector(hooked_location));
     swizzle2(MTLSimDeviceClass, @selector(locationNumber), MTLFakeDevice.class, @selector(hooked_locationNumber));
     swizzle2(MTLSimDeviceClass, @selector(maxTransferRate), MTLFakeDevice.class, @selector(hooked_maxTransferRate));
+    NSLog(@"#### debug load swizzle2 successfully!");
     
     uint32_t *imp;
     // This check isn't present in iOS 14 simulator, maybe it was added in iOS 15?
@@ -98,7 +104,11 @@ static id(*MTLCreateSimulatorDevice)(void);
     if(!MTLCreateSimulatorDevice) {
         NSLog(@"Failed to find MTLCreateSimulatorDevice: %s", dlerror());
         return nil;
+    } else {
+        NSLog(@"#### debug load MTLCreateSimulatorDevice successfully!");
     }
+    Class cls = NSClassFromString(@"MTLSimDevice");
+    NSLog(@"#### debug MTLSimDevice class %@", cls ? @"present" : @"missing");
     self = MTLCreateSimulatorDevice();
     objc_setAssociatedObject(self, @selector(acceleratorPort), @(port), OBJC_ASSOCIATION_ASSIGN);
     return self;
@@ -205,6 +215,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
     snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/MTLSimDriver", JBROOT_PATH("/usr/macOS/Frameworks"));
     xpc_object_t dict0 = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_uint64(dict0, frameworkPath, 2);
+    NSLog(@"#### debug register MTLSimDriverHost.xpc %s", frameworkPath);
     int(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol(xpc, "__xpc_bootstrap_services");
     _xpc_bootstrap_services(dict0);
 }

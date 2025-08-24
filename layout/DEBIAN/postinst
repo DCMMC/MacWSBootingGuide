@@ -9,9 +9,18 @@ add_trustcache() {
     jbctl trustcache add "$cdhash"
 }
 
+add_arm64e_trustcache() {
+    local path="$1"
+    local cdhash
+    cdhash=$(ldid -arch arm64e -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+    echo "Adding $path cdhash: $cdhash"
+    jbctl trustcache add "$cdhash"
+}
+
 add_trustcache "bin/login"
 add_trustcache "bin/TestMetalIOSurface"
 add_trustcache "lib/libmachook.dylib"
+add_arm64e_trustcache "lib/libmachook.dylib"
 add_trustcache "Frameworks/MetalSerializer.framework/MetalSerializer"
 add_trustcache "Frameworks/MTLSimDriver.framework/MTLSimDriver"
 add_trustcache "Frameworks/MTLSimImplementation.framework/MTLSimImplementation"
