@@ -1,7 +1,7 @@
 # MacWSBootingGuide
 Booting macOS's WindowServer on your jailbroken iDevice for real (WIP)
 
-Some path are currently hardcoded for rootless jailbreak, but you can change them to work with rootful jailbreak.
+Some paths are currently hardcoded for rootless jailbreak, but you can change them to work with rootful jailbreak. Some tools are hardcoded for Dopamine jailbreak.
 
 You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementation.framework, MetalSerializer.framework
 
@@ -20,9 +20,11 @@ TODO: make a script
 - Symlink `rootfs/var/folders/zz` -> `/var/folders/zz`
 - mkdir `rootfs/Users/root`
 - Copy `/etc` from macOS installation to `rootfs/etc` (optional?)
-- Bind mount `rootfs/var/jb` -> `/var/jb`
+- [Bind mount](https://github.com/khanhduytran0/mount-bindfs-dopamine) `rootfs/var/jb` -> `/var/jb`
 - Patch `dyld`, `launchservicesd` and `WindowServer` as described below.
 - Modify `cpusubtype` in `Installer Progress` and `WindowServer`
+- For every executable you wanna run, sign and merge with `entitlements.plist` in this repo.
+- Load macOS trustcaches using `loadtc /path/to/trustcache`
 
 ## Starting up
 - `launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist`
@@ -40,7 +42,7 @@ TODO: make a script
 
 #### launchservicesd
 - [x] Missing syscalls: `audit_token_to_asid`, `audit_token_to_auid`, `auditon`, `getaudit_addr`
-- [ ] This daemon needs to be converted to a dylib using [LiveContainer's method](https://github.com/LiveContainer/LiveContainer/blob/341cc87d40d8eec690d21dc71bd69d74667588da/LiveContainer/LCMachOUtils.m#L71-L88)
+- [ ] This daemon needs to be converted to a dylib using [LiveContainer's method](https://github.com/LiveContainer/LiveContainer/blob/341cc87d40d8eec690d21dc71bd69d74667588da/LiveContainer/LCMachOUtils.m#L71-L88). Please make sure to resign dylib without entitlements to avoid codesign panic ([#2](https://github.com/khanhduytran0/MacWSBootingGuide/issues/2)).
 
 #### loginwindowLite
 - [ ] `Error (non-fatal) enumerating <private>: Error Domain=NSCocoaErrorDomain Code=256 "The file “Library” couldn’t be opened." UserInfo={NSURL=Library/ -- file:///System/Library/CoreServices/CoreTypes.bundle/Contents/, NSFilePath=/System/Library/CoreServices/CoreTypes.bundle/Contents/Library, NSUnderlyingError=0x13d5a73b0 {Error Domain=NSPOSIXErrorDomain Code=20 "Not a directory"}}`: because `/System/Volumes/Data/System/Library/CoreServices/CoreTypes.bundle/Contents/Library` might be missing.
@@ -63,7 +65,7 @@ TODO: make a script
 - [x] `MTLCompilerObject::readModuleFromBinaryRequest`: patch platform check to allow cross-platform compilation. MTLCompilerBypassOSCheck compares against hardcoded instruction so it might not be reliable across iOS versions.
 
 #### launchd
-- [ ] `Path not allowed in target domain` is raised when attempting to load XPC bundles not declared in `launchd.plist` (`MTLSimDriverHost.xpc` in this case).
+- [x] `Path not allowed in target domain` is raised when attempting to load XPC bundles not declared in `launchd.plist` (`MTLSimDriverHost.xpc` in this case). This can be bypassed by adding `com.apple.private.domain-extension` entitlement.
 
 #### watchdogd
 - [x] Install `WatchDisable` tweak from [this repo](https://nathan4s.lol/repo) which automatically runs @zhuowei's `who_let_the_dogs_out.c` at boot.
