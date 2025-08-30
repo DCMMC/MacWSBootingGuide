@@ -65,8 +65,8 @@ int main(int argc, char *argv[], char *envp[]) {
             return 1;
         }
     }
-    if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED) != 0) {
-    // if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC) != 0) {
+    // if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED) != 0) {
+    if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC) != 0) {
         perror("posix_spawnattr_set_flags");
         return 1;
     }

@@ -55,6 +55,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         int64_t *once = (int64_t *)(OFF_SkyLight_WSSystemCanCompositeWithMetal + (uintptr_t)header);
         *once = -1;
 #endif
+        NSLog(@"#### debug loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
         // patch kern_SwapEnd passing correct inputStructCnt
         uint32_t *swapEnd = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt + (uintptr_t)header);
@@ -63,11 +64,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             *swapEnd = 0x52808d83; // mov    w3, #0x46c
         });
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
+        NSLog(@"#### debug loadImageCallback MTLCompilerService before _xpc_bootstrap_services");
         // register MTLCompilerService.xpc
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
         void(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
         _xpc_bootstrap_services(dict);
+        NSLog(@"#### debug loadImageCallback MTLCompilerService after _xpc_bootstrap_services");
     }
 }
 
