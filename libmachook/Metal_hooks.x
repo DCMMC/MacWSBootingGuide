@@ -212,10 +212,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
     // register MTLSimDriverHost.xpc
     char frameworkPath[PATH_MAX];
-    snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/MTLSimDriver", JBROOT_PATH("/usr/macOS/Frameworks"));
-    xpc_object_t dict0 = xpc_dictionary_create(NULL, NULL, 0);
-    xpc_dictionary_set_uint64(dict0, frameworkPath, 2);
-    NSLog(@"#### debug register MTLSimDriverHost.xpc %s", frameworkPath);
-    int(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol(xpc, "__xpc_bootstrap_services");
-    _xpc_bootstrap_services(dict0);
+    NSLog(@"#### debug register MTLSimDriverHost.xpc");
+    snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
+    xpc_add_bundle(frameworkPath, 2);
 }
