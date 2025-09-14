@@ -55,7 +55,7 @@
 	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/var/jb/usr/macOS/bin/launchdchrootexec</string>
+		<string>/var/jb/usr/macOS/bin/launchdchrootexec_debug</string>
 		<string>0</string>
 		<string>0</string>
 		<string>/var/mnt/rootfs</string>

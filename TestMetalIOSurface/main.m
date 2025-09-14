@@ -46,11 +46,17 @@ typedef struct {
 @implementation MetalRenderer
 
 - (instancetype)init {
+    NSLog(@"### debugbydcmmc TestMetalIOSurface init start");
     self = [super init];
     CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
     
     _device = MTLCreateSystemDefaultDevice();
+    if (!_device) {
+        NSLog(@"ERROR: no Metal device");
+        return nil;
+    }
     _commandQueue = [_device newCommandQueue];
+    if (!_commandQueue) NSLog(@"ERROR: no command queue");
     
     NSError *error = nil;
     NSString *source = @" \
@@ -104,6 +110,7 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     IOMobileFramebufferGetMainDisplay(&fbConn);
     IOMobileFramebufferGetDisplaySize(fbConn, &screenSize);
     [self createIOSurfaceBackedTexture:screenSize.width height:screenSize.height];
+    NSLog(@"### debugbydcmmc TestMetalIOSurface init done");
     return self;
 }
 
@@ -116,8 +123,12 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     size_t bytesPerRow = widthLonger * bytesPerElement;
     size_t size = widthLonger * heightLonger * bytesPerElement;
     size_t totalBytes = size + 0x20000;
+    // NSDictionary *surfaceProps = @{
+    //     @"IOSurfaceWidth": @(width),
+    //     @"IOSurfaceHeight": @(height),
+    //     @"IOSurfaceBytesPerElement": @(4),
     NSDictionary *surfaceProps = @{
-        //@"IOSurfaceAllocSize": @(totalBytes),
+        @"IOSurfaceAllocSize": @(totalBytes),
         @"IOSurfaceCacheMode": @1024,
         @"IOSurfaceWidth": @(width),
         @"IOSurfaceHeight": @(height),
@@ -151,7 +162,37 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
         @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
 #endif
     };
+    NSLog(@"### debugbydcmmc TestMetalIOSurface IOSurfaceCreate before %@", surfaceProps);
     _surface = IOSurfaceCreate((__bridge CFDictionaryRef)surfaceProps);
+    // after IOSurfaceCreate
+    if (!_surface) {
+        NSLog(@"ERROR: IOSurfaceCreate returned NULL");
+    } else {
+        NSLog(@"IOSurface created: %p width=%u height=%u bytesPerElement=%zu",
+            _surface,
+            (unsigned)IOSurfaceGetWidth(_surface),
+            (unsigned)IOSurfaceGetHeight(_surface),
+            IOSurfaceGetElementWidth(_surface) /* if available */);
+    }
+    IOSurfaceLock(_surface, 0, NULL);
+    void *base = IOSurfaceGetBaseAddress(_surface);
+    size_t bpr = IOSurfaceGetBytesPerRow(_surface);
+    size_t w = IOSurfaceGetWidth(_surface);
+    size_t h = IOSurfaceGetHeight(_surface);
+    size_t alloc = IOSurfaceGetAllocSize ? IOSurfaceGetAllocSize(_surface) : 0; // if available
+    NSLog(@"IOSurface base=%p bpr=%zu w=%zu h=%zu alloc=%zu", base, bpr, w, h, alloc);
+    IOSurfaceUnlock(_surface, 0, NULL);
+
+    IOSurfaceLock(_surface, 0, NULL);
+    uint8_t *p = IOSurfaceGetBaseAddress(_surface);
+    NSLog(@"first 16 bytes: %02x %02x %02x %02x ...", p[0], p[1], p[2], p[3]);
+    bpr = IOSurfaceGetBytesPerRow(_surface);
+    h = IOSurfaceGetHeight(_surface);
+    uint8_t *last = p + bpr*(h-1);
+    NSLog(@"last row first bytes: %02x %02x %02x %02x", last[0], last[1], last[2], last[3]);
+    IOSurfaceUnlock(_surface, 0, NULL);
+
+
     
     MTLTextureDescriptor *texDesc = [[MTLTextureDescriptor alloc] init];
     texDesc.textureType = MTLTextureType2D;
@@ -165,9 +206,21 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     texDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     
     _surfaceTexture = [_device newTextureWithDescriptor:texDesc iosurface:_surface plane:0];
+    if (!_surfaceTexture) {
+        NSLog(@"ERROR: newTextureWithDescriptor:iosurface: returned nil");
+    } else {
+        NSLog(@"surfaceTexture created: %@ fmt=%lu size=%zux%zu bytesPerRow=%zu",
+            _surfaceTexture,
+            _surfaceTexture.pixelFormat,
+            _surfaceTexture.width,
+            _surfaceTexture.height,
+            IOSurfaceGetBytesPerRow(_surface));
+    }
+    NSLog(@"### debugbydcmmc TestMetalIOSurface createIOSurfaceBackedTexture done");
 }
 
 - (void)renderToIOSurface {
+    NSLog(@"### debugbydcmmc TestMetalIOSurface renderToIOSurface start");
     Vertex vertices[] = {
         {{-0.8, -0.8, 0, 1}, {1, 0, 0, 1}},
         {{ 0.8, -0.8, 0, 1}, {0, 1, 0, 1}},
@@ -190,6 +243,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     [encoder setVertexBuffer:vertexBuffer offset:0 atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
     [encoder endEncoding];
+    [cmdBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb){
+        if (cb.error) {
+            NSLog(@"CommandBuffer error: %@", cb.error);
+            NSLog(@"CB error userInfo: %@", cb.error.userInfo);
+        } else {
+            NSLog(@"CommandBuffer completed OK, status=%ld", (long)cb.status);
+        }
+    }];
     [cmdBuffer commit];
     [cmdBuffer waitUntilCompleted];
     
@@ -198,9 +259,14 @@ fragment float4 fragment_main(VertexOut in [[stage_in]]) { \n \
     IOMobileFramebufferRef fbConn;
     IOMobileFramebufferGetMainDisplay(&fbConn);
     IOMobileFramebufferGetDisplaySize(fbConn, &frame.size);
-    IOMobileFramebufferSwapBegin(fbConn, &token);
-    IOMobileFramebufferSwapSetLayer(fbConn, 0, _surface, frame, frame, 0);
-    IOMobileFramebufferSwapEnd(fbConn);
+    int r;
+    r = IOMobileFramebufferSwapBegin(fbConn, &token);
+    NSLog(@"IOMobileFramebufferSwapBegin status=%d", r);
+    r = IOMobileFramebufferSwapSetLayer(fbConn, 0, _surface, frame, frame, 0);
+    NSLog(@"IOMobileFramebufferSwapSetLayer status=%d", r);
+    r = IOMobileFramebufferSwapEnd(fbConn);
+    NSLog(@"IOMobileFramebufferSwapEnd status=%d", r);
+    NSLog(@"### debugbydcmmc TestMetalIOSurface renderToIOSurface done");
 }
 
 @end

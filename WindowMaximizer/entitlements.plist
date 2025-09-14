@@ -169,6 +169,8 @@
 	<string>backboardd</string>
 	<key>com.apple.private.iosurfaceinfo</key>
 	<true/>
+	<key>com.apple.private.kernel.setpriority-darwin-role</key>
+	<true/>
 	<key>com.apple.private.kernel.work-interval</key>
 	<true/>
 	<key>com.apple.private.mobile_storage.allowedSPI</key>
@@ -176,6 +178,8 @@
 		<string>CopyDevices</string>
 	</array>
 	<key>com.apple.private.ppm.client</key>
+	<true/>
+	<key>com.apple.private.runningboard.roles</key>
 	<true/>
 	<key>com.apple.private.security.no-container</key>
 	<true/>
@@ -226,6 +230,8 @@
 	<true/>
 	<key>com.apple.runningboard.assertions.fuseboard</key>
 	<true/>
+	<key>com.apple.runningboard.assertions.launchservices</key>
+	<true/>
 	<key>com.apple.runningboard.hereditarygrantoriginator</key>
 	<true/>
 	<key>com.apple.runningboard.launchprocess</key>
@@ -270,7 +276,6 @@
 		<string>IOSurfaceRootUserClient</string>
 		<string>RootDomainUserClient</string>
 		<string>IOGPUDeviceUserClient</string>
-		<string>AFKEndpointInterfaceUserClient</string>
 	</array>
 	<key>com.apple.security.system-container</key>
 	<true/>

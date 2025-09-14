@@ -14,7 +14,7 @@ extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
 extern au_asid_t audit_token_to_asid(audit_token_t atoken);
 extern uid_t audit_token_to_auid(audit_token_t atoken);
 
-//#define FORCE_SW_RENDER 1
+// #define FORCE_SW_RENDER 1
 BOOL hooked_return_1(void) { return YES; }
 void EnableJIT(void);
 
@@ -25,7 +25,8 @@ void EnableJIT(void);
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
 #if FORCE_SW_RENDER
 // SkyLight`WSSystemCanCompositeWithMetal::once
-#define OFF_SkyLight_WSSystemCanCompositeWithMetal 0x1d72b148
+// #define OFF_SkyLight_WSSystemCanCompositeWithMetal 0x1d72b148
+#define OFF_SkyLight_WSSystemCanCompositeWithMetal 0x53ae9028
 #endif
 
 const char *IOMFBPath = "/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Versions/A/IOMobileFramebuffer";
@@ -42,6 +43,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         uint32_t *check = (uint32_t *)(OFF_SkyLight_CAWSManager_register_abort + (uintptr_t)header);
         ModifyExecutableRegion(check, sizeof(uint32_t), ^{
 #warning TODO: has hardcoded instruction
+            NSLog(@"#### debugbydcmmc OFF_SkyLight_CAWSManager_register_abort ModifyExecutableRegion addr %lu val %lu, expect: %lu",
+                (unsigned long) check, (unsigned long) *check, (unsigned long) 0xb4000588);
             assert(*check == 0xb4000588); // cbz    x8, do_abort
             *check = 0xd503201f; // nop
         });
@@ -49,22 +52,25 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // grant all permissions
         MSHookFunction(MSFindSymbol((MSImageRef)header, "_audit_token_check_tcc_access"), hooked_return_1, NULL);
             
-        
+        NSLog(@"#### debugbydcmmc loadImageCallback before OFF_SkyLight_WSSystemCanCompositeWithMetal");
 #if FORCE_SW_RENDER
         // skip Metal check (WSSystemCanCompositeWithMetal::once)
         int64_t *once = (int64_t *)(OFF_SkyLight_WSSystemCanCompositeWithMetal + (uintptr_t)header);
         *once = -1;
 #endif
-        NSLog(@"#### debug loadImageCallback SkyLight modified");
+        NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
         // patch kern_SwapEnd passing correct inputStructCnt
         uint32_t *swapEnd = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt + (uintptr_t)header);
         ModifyExecutableRegion(swapEnd, sizeof(uint32_t), ^{
+            NSLog(@"#### debugbydcmmc OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt ModifyExecutableRegion addr %lu val %lu, expect: %lu",
+                (unsigned long) swapEnd, (unsigned long) *swapEnd, (unsigned long) 0x52808d03);
             assert(*swapEnd == 0x52808d03); // mov    w3, #0x468
             *swapEnd = 0x52808d83; // mov    w3, #0x46c
         });
+        NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
-        NSLog(@"#### debug loadImageCallback MTLCompilerService before _xpc_add_bundle");
+        NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService before _xpc_add_bundle");
         xpc_add_bundle("/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc", 2);
     }
 }
@@ -77,7 +83,7 @@ __attribute__((constructor)) void InitStuff() {
 extern int gpu_bundle_find_trusted(const char *name, char *trusted_path, size_t trusted_path_len);
 
 int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    printf("Calling interposed sysctlbyname\n");
+    printf("debugbydcmmc Calling interposed sysctlbyname\n");
     if (name && oldp) {
         if(!strcmp(name, "kern.osvariant_status")) {
             *(unsigned long long *)oldp = 0x70010000f388828a;
@@ -99,7 +105,7 @@ int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, 
 
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags, const char **params, char **errorbuf);
 int sandbox_init_with_parameters_new(const char *profile, uint64_t flags, const char **params, char **errorbuf) {
-    //printf("Calling interposed sandbox_init_with_parameters\n");
+    printf("debugbydcmmc Calling interposed sandbox_init_with_parameters\n");
     return 0;
 }
 
@@ -189,15 +195,16 @@ int getaudit_addr_new(auditinfo_addr_t *auditinfo_addr, u_int length) {
 
 IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
     IOSurfaceRef result;
+    NSLog(@"debugbydcmmc before IOSurfaceCreate %@", properties);
 #if FORCE_SW_RENDER
     /*
     NSMutableDictionary *newProperties = [NSMutableDictionary dictionaryWithDictionary:properties];
     newProperties[@"IOSurfacePixelFormat"] = @((unsigned int)'BGRA');
     [newProperties removeObjectForKey:@"IOSurfacePlaneInfo"];
 */
-    int width = 1242;
+    int width = 2388; 
     int widthLonger = width + 6;
-    int height = 2688;
+    int height = 1668;
     int tileWidth = 8;
     int tileHeight = 1;
     int bytesPerElement = 4;
@@ -239,7 +246,7 @@ IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
 #else
     result = IOSurfaceCreate(properties);
 #endif
-    NSLog(@"IOSurfaceCreate %@ -> %@", properties, result);
+    NSLog(@"debugbydcmmc IOSurfaceCreate %@ -> %@", properties, result);
     return result;
 }
 
@@ -250,13 +257,13 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
-#if FORCE_SW_RENDER
+// #if FORCE_SW_RENDER
 DYLD_INTERPOSE(IOSurfaceCreate_new, IOSurfaceCreate);
-#endif
+// #endif
 
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
-    //printf("IOServiceNameMatching called with name: %s\n", name);
+    printf("debugbydcmmc IOServiceNameMatching called with name: %s\n", name);
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceNameMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {
@@ -264,13 +271,13 @@ CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
     }
     CFMutableDictionaryRef service = IOServiceNameMatching(name);
     if(!service) {
-        fprintf(stderr, "IOServiceNameMatching not found for name: %s\n", name);
+        fprintf(stderr, "debugbydcmmc IOServiceNameMatching not found for name: %s\n", name);
     }
     return service;
 }
 
 CFDictionaryRef IOServiceMatching_new(const char *name) {
-    //printf("IOServiceMatching called with name: %s\n", name);
+    printf("debugbydcmmc IOServiceMatching called with name: %s\n", name);
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {
@@ -278,7 +285,7 @@ CFDictionaryRef IOServiceMatching_new(const char *name) {
     }
     CFMutableDictionaryRef service = IOServiceMatching(name);
     if(!service) {
-        fprintf(stderr, "IOServiceMatching not found for name: %s\n", name);
+        fprintf(stderr, "debugbydcmmc IOServiceMatching not found for name: %s\n", name);
     }
     return service;
 }
