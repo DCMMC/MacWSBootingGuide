@@ -6,6 +6,6 @@ include $(THEOS)/makefiles/common.mk
 # iOS subprojects
 SUBPROJECTS += MTLCompilerBypassOSCheck MTLSimDriverHost launchdchrootexec loadtc
 # macOS subprojects
-SUBPROJECTS += launchservicesd libmachook login TestMetalIOSurface
+SUBPROJECTS += launchservicesd libmachook login TestMetalIOSurface PingMTLCompilerService HostInjectBootstrap
 
 include $(THEOS_MAKE_PATH)/aggregate.mk

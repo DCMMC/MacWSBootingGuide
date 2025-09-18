@@ -9,8 +9,8 @@ vtool -set-build-version 1 13.0 13.0 -replace -output libmachook.dylib libmachoo
 ldid -S libmachook.dylib
 codesign -f -s - libmachook.dylib 
 
-vtool -arch arm64 -set-build-version 1 13.0 13.0 -replace -output .theos/obj/launchservicesd .theos/obj/launchservicesd
-ldid -S -M .theos/obj/launchservicesd
+vtool -arch arm64 -set-build-version 1 13.0 13.0 -replace -output .theos/obj/macosx/launchservicesd .theos/obj/macosx/launchservicesd
+ldid -S -M .theos/obj/macosx/launchservicesd
 
 libmachook_path="/var/jb/usr/macOS/lib/libmachook.dylib"
 driverhost_path="/var/jb/usr/macOS/Frameworks/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc/MTLSimDriverHost"

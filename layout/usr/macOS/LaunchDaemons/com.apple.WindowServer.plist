@@ -59,7 +59,7 @@
 		<string>0</string>
 		<string>0</string>
 		<string>/var/mnt/rootfs</string>
-		<string>/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer_arm64</string>
+		<string>/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer</string>
 		<string>-virtualonly</string>
 		<string>-daemon</string>
 	</array>

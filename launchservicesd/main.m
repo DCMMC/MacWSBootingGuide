@@ -7,6 +7,7 @@
 
 @import Darwin;
 @import MachO;
+#include <assert.h> 
 
 void *dlopen_entry_point(const char *path, int flags) {
     int index = _dyld_image_count();
