@@ -9,12 +9,12 @@ void xpc_connection_set_instance(xpc_connection_t, uuid_t);
 int main(int argc, const char * argv[]) {
 	@autoreleasepool {
 		printf("debugbydcmmc My pid: %d\n", getpid());
-        printf("Sleeping for 60 seconds to allow host to inject bootstrap port...\n");
-        sleep(60);
+        // printf("Sleeping for 60 seconds to allow host to inject bootstrap port...\n");
+        // sleep(60);
 
 		void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", 1); assert(metal);
         NSLog(@"debugbydcmmc Metal.framework dlopen");
-      xpc_add_bundle("/home/Metal.framework/XPCServices/MTLCompilerService.xpc", 2);
+      xpc_add_bundle("/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc", 2);
 		uuid_t uuid;
 		uuid_generate(uuid);
 		xpc_connection_t connection = xpc_connection_create("com.apple.MTLCompilerService", 0);
