@@ -9,13 +9,13 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
 }
 
 %ctor {
-    NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck start");
+    // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck start");
     dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_GLOBAL);
     MSImageRef image = MSGetImageByName("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler");
     assert(image);
     uint32_t *symbol = MSFindSymbol(image, "__ZN17MTLCompilerObject27readModuleFromBinaryRequestERK20ReadModuleParametersRN4llvm11LLVMContextEP15MTLFunctionTypePPvPmb");
     assert(symbol);
-    NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck find symbol");
+    // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck find symbol");
     
     // 0x1eaaa17c4 <+608>:  ldr    w8, [sp, #0x84]
     // 0x1eaaa17c8 <+612>:  cmp    w8, #0x7
@@ -28,5 +28,5 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
     ModifyExecutableRegion(symbol + 2, sizeof(uint32_t), ^{
         symbol[2] = 0xd503201f; // nop
     });
-    NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck modify successfully!");
+    // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck modify successfully!");
 }

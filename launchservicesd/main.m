@@ -16,13 +16,12 @@ void *dlopen_entry_point(const char *path, int flags) {
         printf("debugbydcmmc Failed to load launchservicesd.dylib: %s\n", dlerror());
         return NULL;
     } else {
-        printf("debugbydcmmc load launchservicesd.dylib successful\n");
+        // printf("debugbydcmmc load launchservicesd.dylib successful\n");
     }
-    
     uint32_t entryoff = 0;
-    printf("debugbydcmmc load launchservicesd.dylib before _dyld_get_image_header\n");
+    // printf("debugbydcmmc load launchservicesd.dylib before _dyld_get_image_header\n");
     const struct mach_header_64 *header = (struct mach_header_64 *)_dyld_get_image_header(index);
-    printf("debugbydcmmc load launchservicesd.dylib after _dyld_get_image_header\n");
+    // printf("debugbydcmmc load launchservicesd.dylib after _dyld_get_image_header\n");
     uint8_t *imageHeaderPtr = (uint8_t*)header + sizeof(struct mach_header_64);
     struct load_command *command = (struct load_command *)imageHeaderPtr;
     for(int i = 0; i < header->ncmds; ++i) {
@@ -35,7 +34,7 @@ void *dlopen_entry_point(const char *path, int flags) {
         command = (struct load_command *)imageHeaderPtr;
     }
     assert(entryoff > 0);
-    printf("debugbydcmmc launchservicesd.dylib entryoff %d\n", entryoff);
+    // printf("debugbydcmmc launchservicesd.dylib entryoff %d\n", entryoff);
     return (void *)header + entryoff;
 }
 

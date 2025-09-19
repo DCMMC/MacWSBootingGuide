@@ -10,6 +10,8 @@
 #import "interpose.h"
 #import <os/log.h>
 
+// #define DEBUG_LOG 1
+
 /*
  * Structure definition
  */
@@ -265,4 +267,6 @@ void _os_log_impl_new(void *dso, os_log_t log, os_log_type_t type, const char *f
     NSLog(@"OS_LOG: %s", format);
     _os_log_impl(dso, log, type, format, buf, size);
 }
+#if DEBUG_LOG
 DYLD_INTERPOSE(_os_log_impl_new, _os_log_impl);
+#endif

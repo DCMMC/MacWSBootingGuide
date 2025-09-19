@@ -8,17 +8,6 @@ cp .theos/obj/libmachook.dylib .
 vtool -set-build-version 1 13.0 13.0 -replace -output libmachook.dylib libmachook.dylib
 ldid -S libmachook.dylib
 codesign -f -s - libmachook.dylib 
-
-vtool -arch arm64 -set-build-version 1 13.0 13.0 -replace -output .theos/obj/macosx/launchservicesd .theos/obj/macosx/launchservicesd
-ldid -S -M .theos/obj/macosx/launchservicesd
-
-libmachook_path="/var/jb/usr/macOS/lib/libmachook.dylib"
-driverhost_path="/var/jb/usr/macOS/Frameworks/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc/MTLSimDriverHost"
-launchdchrootexec_path="/var/jb/usr/macOS/LaunchDaemons/launchdchrootexec"
-driverhost_hash=$(ldid -h .theos/obj/MTLSimDriverHost.xpc/MTLSimDriverHost | grep CDHash= | cut -c8-)
-# libmachook_hash=$(ldid -h libmachook.dylib | grep CDHash= | cut -c8-)
-# exec_hash=$(ldid -h .theos/obj/exec | grep CDHash= | cut -c8-)
-launchdchrootexec_hash=$(ldid -h .theos/obj/launchdchrootexec | grep CDHash= | cut -c8-)
-
-ssh root@$DEVICE_IP -p 2222 "jbctl trustcache add $driverhost_hash; jbctl trustcache add $launchdchrootexec_hash"
-# ssh root@$DEVICE_IP -p 2222 "jbctl trustcache add $exec_hash;"
+scp -P 2222 libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook.dylib
+scp -P 2222 ./misc/postinst.sh root@$DEVICE_IP:/var/jb/usr/macOS/bin
+scp -P 2222 ./misc/run_bash.sh root@$DEVICE_IP:/var/jb/usr/macOS/bin

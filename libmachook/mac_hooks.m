@@ -43,8 +43,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         uint32_t *check = (uint32_t *)(OFF_SkyLight_CAWSManager_register_abort + (uintptr_t)header);
         ModifyExecutableRegion(check, sizeof(uint32_t), ^{
 #warning TODO: has hardcoded instruction
-            NSLog(@"#### debugbydcmmc OFF_SkyLight_CAWSManager_register_abort ModifyExecutableRegion addr %lu val %lu, expect: %lu",
-                (unsigned long) check, (unsigned long) *check, (unsigned long) 0xb4000588);
+            // NSLog(@"#### debugbydcmmc OFF_SkyLight_CAWSManager_register_abort ModifyExecutableRegion addr %lu val %lu, expect: %lu",
+            //     (unsigned long) check, (unsigned long) *check, (unsigned long) 0xb4000588);
             assert(*check == 0xb4000588); // cbz    x8, do_abort
             *check = 0xd503201f; // nop
         });
@@ -52,31 +52,31 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // grant all permissions
         MSHookFunction(MSFindSymbol((MSImageRef)header, "_audit_token_check_tcc_access"), hooked_return_1, NULL);
             
-        NSLog(@"#### debugbydcmmc loadImageCallback before OFF_SkyLight_WSSystemCanCompositeWithMetal");
+        // NSLog(@"#### debugbydcmmc loadImageCallback before OFF_SkyLight_WSSystemCanCompositeWithMetal");
 #if FORCE_SW_RENDER
         // skip Metal check (WSSystemCanCompositeWithMetal::once)
         int64_t *once = (int64_t *)(OFF_SkyLight_WSSystemCanCompositeWithMetal + (uintptr_t)header);
         *once = -1;
 #endif
-        NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
+        // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
         // patch kern_SwapEnd passing correct inputStructCnt
         uint32_t *swapEnd = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt + (uintptr_t)header);
         ModifyExecutableRegion(swapEnd, sizeof(uint32_t), ^{
-            NSLog(@"#### debugbydcmmc OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt ModifyExecutableRegion addr %lu val %lu, expect: %lu",
-                (unsigned long) swapEnd, (unsigned long) *swapEnd, (unsigned long) 0x52808d03);
+            // NSLog(@"#### debugbydcmmc OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt ModifyExecutableRegion addr %lu val %lu, expect: %lu",
+            //     (unsigned long) swapEnd, (unsigned long) *swapEnd, (unsigned long) 0x52808d03);
             assert(*swapEnd == 0x52808d03); // mov    w3, #0x468
             *swapEnd = 0x52808d83; // mov    w3, #0x46c
         });
-        NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
+        // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
-        NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService before _xpc_add_bundle");
+        // NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService before _xpc_add_bundle");
         // register MTLCompilerService.xpc
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
         void(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
         _xpc_bootstrap_services(dict);
-        NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService after _xpc_add_bundle");
+        // NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService after _xpc_add_bundle");
         // xpc_add_bundle("/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc", 2);
     }
 }
@@ -89,7 +89,7 @@ __attribute__((constructor)) void InitStuff() {
 extern int gpu_bundle_find_trusted(const char *name, char *trusted_path, size_t trusted_path_len);
 
 int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
-    printf("debugbydcmmc Calling interposed sysctlbyname\n");
+    // printf("debugbydcmmc Calling interposed sysctlbyname\n");
     if (name && oldp) {
         if(!strcmp(name, "kern.osvariant_status")) {
             *(unsigned long long *)oldp = 0x70010000f388828a;
@@ -111,7 +111,7 @@ int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, 
 
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags, const char **params, char **errorbuf);
 int sandbox_init_with_parameters_new(const char *profile, uint64_t flags, const char **params, char **errorbuf) {
-    printf("debugbydcmmc Calling interposed sandbox_init_with_parameters\n");
+    // printf("debugbydcmmc Calling interposed sandbox_init_with_parameters\n");
     return 0;
 }
 
@@ -263,13 +263,13 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
-// #if FORCE_SW_RENDER
+#if FORCE_SW_RENDER
 DYLD_INTERPOSE(IOSurfaceCreate_new, IOSurfaceCreate);
-// #endif
+#endif
 
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
-    printf("debugbydcmmc IOServiceNameMatching called with name: %s\n", name);
+    // printf("debugbydcmmc IOServiceNameMatching called with name: %s\n", name);
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceNameMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {
@@ -283,7 +283,7 @@ CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
 }
 
 CFDictionaryRef IOServiceMatching_new(const char *name) {
-    printf("debugbydcmmc IOServiceMatching called with name: %s\n", name);
+    // printf("debugbydcmmc IOServiceMatching called with name: %s\n", name);
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {

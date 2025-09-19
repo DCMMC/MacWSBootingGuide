@@ -38,18 +38,18 @@ static id(*MTLCreateSimulatorDevice)(void);
     
     void *handle = dlopen("@loader_path/../Frameworks/MetalSerializer.framework/MetalSerializer", RTLD_GLOBAL);
     if(!handle) {
-        NSLog(@"Failed to load MetalSerializer framework: %s", dlerror());
+        NSLog(@"#### debugbydcmmc Failed to load MetalSerializer framework: %s", dlerror());
         return NO;
     } else {
-        NSLog(@"#### debugbydcmmc load MetalSerializer successfully!");
+        // NSLog(@"#### debugbydcmmc load MetalSerializer successfully!");
     }
     
     handle = dlopen("@loader_path/../Frameworks/MTLSimDriver.framework/MTLSimDriver", RTLD_GLOBAL);
     if(!handle) {
-        NSLog(@"Failed to load MTLSimDriver framework: %s", dlerror());
+        NSLog(@"#### debugbydcmmc Failed to load MTLSimDriver framework: %s", dlerror());
         return NO;
     } else {
-        NSLog(@"#### debugbydcmmc load MTLSimDriver successfully!");
+        // NSLog(@"#### debugbydcmmc load MTLSimDriver successfully!");
     }
     MTLCreateSimulatorDevice = dlsym(handle, "MTLCreateSimulatorDevice");
     NSLog(@"#### debugbydcmmc load MTLCreateSimulatorDevice successfully!");
@@ -102,15 +102,15 @@ static id(*MTLCreateSimulatorDevice)(void);
         return nil;
     }
     if(!MTLCreateSimulatorDevice) {
-        NSLog(@"Failed to find MTLCreateSimulatorDevice: %s", dlerror());
+        NSLog(@"#### debugbydcmmc Failed to find MTLCreateSimulatorDevice: %s", dlerror());
         return nil;
     } else {
-        NSLog(@"#### debugbydcmmc load MTLCreateSimulatorDevice successfully!");
+        // NSLog(@"#### debugbydcmmc load MTLCreateSimulatorDevice successfully!");
     }
-    Class cls = NSClassFromString(@"MTLSimDevice");
-    NSLog(@"#### debugbydcmmc MTLSimDevice class %@", cls ? @"present" : @"missing");
+    // Class cls = NSClassFromString(@"MTLSimDevice");
+    // NSLog(@"#### debugbydcmmc MTLSimDevice class %@", cls ? @"present" : @"missing");
     self = MTLCreateSimulatorDevice();
-    NSLog(@"#### debugbydcmmc MTLCreateSimulatorDevice done");
+    // NSLog(@"#### debugbydcmmc MTLCreateSimulatorDevice done");
     objc_setAssociatedObject(self, @selector(acceleratorPort), @(port), OBJC_ASSOCIATION_ASSIGN);
     return self;
 }
@@ -134,14 +134,14 @@ static id(*MTLCreateSimulatorDevice)(void);
 }
 
 - (id<MTLBuffer>)hooked_newBufferWithBytesNoCopy:(void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void * pointer, NSUInteger length)) deallocator {
-    NSLog(@"#### debugbydcmmc hooked_newBufferWithBytesNoCopy start");
+    // NSLog(@"#### debugbydcmmc hooked_newBufferWithBytesNoCopy start");
     if(malloc_size(bytes) > 0) {
         // XPC doesn't like malloced buffers since they don't have MAP_SHARED flag, so we mirror it to a shared region here
         vm_address_t mirrored = 0;
         vm_prot_t cur_prot, max_prot;
         kern_return_t ret = vm_remap(mach_task_self(), &mirrored, length, 0, VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)bytes, false, &cur_prot, &max_prot, VM_INHERIT_SHARE);
         if(ret != KERN_SUCCESS) {
-            NSLog(@"Failed to mirror memory: %s", mach_error_string(ret));
+            NSLog(@"#### debugbydcmmc Failed to mirror memory: %s", mach_error_string(ret));
             return nil;
         }
         vm_protect(mach_task_self(), mirrored, length, NO,
@@ -192,7 +192,7 @@ const char *metalSimService = "com.apple.metal.simulator";
 xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, dispatch_queue_t targetq, uint64_t flags);
 xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, dispatch_queue_t targetq, uint64_t flags) {
     flags &= ~XPC_CONNECTION_MACH_SERVICE_PRIVILEGED;
-    NSLog(@"#### debugbydcmmc hooked_xpc_connection_create_mach_service %s", name);
+    // NSLog(@"#### debugbydcmmc hooked_xpc_connection_create_mach_service %s", name);
     if(!strncmp(name, metalSimService, strlen(metalSimService))) {
         return xpc_connection_create(metalSimService, 0);
     }
@@ -217,7 +217,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
     // register MTLSimDriverHost.xpc
     char frameworkPath[PATH_MAX];
-    NSLog(@"#### debugbydcmmc register MTLSimDriverHost.xpc");
+    // NSLog(@"#### debugbydcmmc register MTLSimDriverHost.xpc");
     snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
     xpc_add_bundle(frameworkPath, 2);
 }

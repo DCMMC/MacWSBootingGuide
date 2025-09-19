@@ -20,7 +20,7 @@ int main(int argc, char *argv[], char *envp[]) {
         return 1;
     }
 
-    fprintf(stderr, "before chroot %s\n", rootPath);
+    // fprintf(stderr, "before chroot %s\n", rootPath);
     if(chroot(rootPath) < 0) {
         perror("chroot");
         return 1;
@@ -30,7 +30,7 @@ int main(int argc, char *argv[], char *envp[]) {
         perror("chdir");
         chdir("/");
     }
-    fprintf(stderr, "after chdir %s\n", currentPath);
+    // fprintf(stderr, "after chdir %s\n", currentPath);
     
     if(setgid(gid) < 0) {
         perror("setgid");
@@ -46,8 +46,8 @@ int main(int argc, char *argv[], char *envp[]) {
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
-    setenv("DYLD_PRINT_SEARCHING", "1", 1);
-    setenv("DYLD_PRINT_LIBRARIES", "1", 1);
+    // setenv("DYLD_PRINT_SEARCHING", "1", 1);
+    // setenv("DYLD_PRINT_LIBRARIES", "1", 1);
     // setenv("DYLD_PRINT_LIBRARIES_POST_LAUNCH", "1", 1);
     // setenv("DYLD_PRINT_WARNINGS", "1", 1);
     // setenv("DYLD_PRINT_INITIALIZERS", "1", 1);
@@ -73,9 +73,9 @@ int main(int argc, char *argv[], char *envp[]) {
     
     pid_t child_pid = 0;
     extern char **environ;
-    fprintf(stderr, "before posix_spawn %s\n", execPath);
+    // fprintf(stderr, "before posix_spawn %s\n", execPath);
     posix_spawn(&child_pid, execPath, NULL, &attr, execArgs, environ);
-    fprintf(stderr, "pid= %d\n", child_pid);
+    // fprintf(stderr, "pid= %d\n", child_pid);
     perror("posix_spawn");
     return 1;
 }
