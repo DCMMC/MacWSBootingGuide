@@ -5,10 +5,6 @@ Some paths are currently hardcoded for rootless jailbreak, but you can change th
 
 You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementation.framework, MetalSerializer.framework
 
-## Setting up (macOS Base System aka recoveryOS)
-- TODO
-- Copy `/System/Volumes/Data/System/Library/CoreServices/CoreTypes.bundle/Contents/Library`
-
 ## Setting up (macOS full installation)
 TODO: make a script
 - Extract full filesystem dmg to a directory, e.g. `/var/mnt/rootfs`
@@ -22,13 +18,17 @@ TODO: make a script
 - Copy `/etc` from macOS installation to `rootfs/etc` (optional?)
 - [Bind mount](https://github.com/khanhduytran0/mount-bindfs-dopamine) `rootfs/var/jb` -> `/var/jb`
 - Patch `dyld`, `launchservicesd` and `WindowServer` as described below.
-- Modify `cpusubtype` in `Installer Progress` and `WindowServer`
+- Modify `cpusubtype` in `Installer Progress` and `WindowServer` using `set_to_arm64`
 - For every executable you wanna run, sign and merge with `entitlements.plist` in this repo.
 - Load macOS trustcaches using `loadtc /path/to/trustcache`
 
 ## Starting up
 - `launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist`
 - `launchctl load /var/jb/usr/macOS/LaunchDaemons`
+- run bash
+    - `/usr/local/bin/OSXvnc-server -rfbnoauth`
+    - `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Termina`
+    - `/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor`
 
 ## Additional patches
 > [!NOTE]

@@ -43,6 +43,8 @@ add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
+cp -vf /var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer_macos /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
+add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MTLSimDriver.framework/MTLSimDriver"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MTLSimImplementation.framework/MTLSimImplementation"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc/MTLSimDriverHost"
@@ -90,7 +92,6 @@ add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fra
 # add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/SessionFilters/IOAnalytics.plugin/Contents/MacOS/IOAnalytics
 # add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/TouchBarEvent.bundle
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
-add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/.jbroot/usr/lib/libroot.dylib
 # vnc server

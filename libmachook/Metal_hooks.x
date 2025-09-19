@@ -5,6 +5,8 @@
 #import <rootless.h>
 #import "utils.h"
 
+// #define FORCE_M1_DRIVER
+
 void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction) {
     Method m1 = class_getInstanceMethod(class2, swizzledAction);
     if(class_getInstanceMethod(class, originalAction) == NULL) {
