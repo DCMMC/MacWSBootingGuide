@@ -147,7 +147,7 @@ int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, 
     // printf("debugbydcmmc Calling interposed sysctlbyname\n");
     if (name && oldp) {
         if(!strcmp(name, "kern.osvariant_status")) {
-            *(unsigned long long *)oldp = 0x70010000f388828a;
+            *(unsigned long long *)oldp = 0x70010000f388828b; // bit 0 = diagnostics enabled
             return 0;
         } else if(!strcmp(name, "kern.osproductversion")) {
             sysctlbyname(name, oldp, oldlenp, newp, newlen);

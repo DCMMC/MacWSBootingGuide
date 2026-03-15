@@ -1,5 +1,24 @@
 cd $(realpath $HOME/../..)/usr/macOS
 
+ENT="/var/jb/usr/macOS/bin/entitlements.plist"
+
+# Sign a binary with the project entitlements AND register all its CDHashes.
+# Use this for binaries that need re-signing (e.g. macOS rootfs binaries for Homebrew/MacPorts).
+# Idempotent: safe to call on every boot or after re-install.
+sign_and_trustcache() {
+    local path="$1"
+    [ -f "$path" ] || return
+    ldid -S"$ENT" -M "$path" 2>/dev/null
+    for arch in arm64 arm64e x86_64; do
+        local cdhash
+        cdhash=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        if [ -n "$cdhash" ]; then
+            echo "Trusting $path [$arch]: $cdhash"
+            jbctl trustcache add "$cdhash"
+        fi
+    done
+}
+
 add_trustcache() {
     local path="$1"
     local cdhash
@@ -125,3 +144,89 @@ add_all_trustcache /var/mnt/rootfs/usr/local/bin/OSXvnc-server
 if [ -d /var/mnt/rootfs/var/jb ] && [ ! "$(ls -A /var/mnt/rootfs/var/jb)" ]; then
 	/var/jb/usr/local/bin/mount_bindfs /var/jb /var/mnt/rootfs/var/jb
 fi
+
+# ─── Homebrew / MacPorts: sign macOS rootfs utilities ─────────────────────────
+# These binaries need re-signing because their Apple signatures are not in
+# Dopamine's trustcache. sign_and_trustcache re-signs with our entitlements.plist
+# and registers CDHashes — run once on first setup, then CDHashes are re-added
+# on every reboot automatically.
+
+ROOTFS=/var/mnt/rootfs
+
+# Core shell / execution helpers
+sign_and_trustcache "$ROOTFS/bin/sh"
+sign_and_trustcache "$ROOTFS/bin/chmod"
+sign_and_trustcache "$ROOTFS/bin/mkdir"
+sign_and_trustcache "$ROOTFS/bin/ln"
+sign_and_trustcache "$ROOTFS/bin/cat"
+sign_and_trustcache "$ROOTFS/bin/echo"
+
+# Text processing
+sign_and_trustcache "$ROOTFS/usr/bin/awk"
+sign_and_trustcache "$ROOTFS/usr/bin/cut"
+sign_and_trustcache "$ROOTFS/usr/bin/sed"
+sign_and_trustcache "$ROOTFS/usr/bin/head"
+sign_and_trustcache "$ROOTFS/usr/bin/tail"
+sign_and_trustcache "$ROOTFS/usr/bin/tr"
+sign_and_trustcache "$ROOTFS/usr/bin/sort"
+sign_and_trustcache "$ROOTFS/usr/bin/uniq"
+sign_and_trustcache "$ROOTFS/usr/bin/wc"
+sign_and_trustcache "$ROOTFS/usr/bin/tee"
+sign_and_trustcache "$ROOTFS/usr/bin/xargs"
+sign_and_trustcache "$ROOTFS/usr/bin/grep"
+
+# File / path utilities
+sign_and_trustcache "$ROOTFS/usr/bin/find"
+sign_and_trustcache "$ROOTFS/usr/bin/stat"
+sign_and_trustcache "$ROOTFS/usr/bin/file"
+sign_and_trustcache "$ROOTFS/usr/bin/readlink"
+sign_and_trustcache "$ROOTFS/usr/bin/realpath"
+sign_and_trustcache "$ROOTFS/usr/bin/install"
+sign_and_trustcache "$ROOTFS/usr/bin/mktemp"
+sign_and_trustcache "$ROOTFS/usr/bin/xcode-select"
+
+# System info / privilege
+sign_and_trustcache "$ROOTFS/usr/bin/uname"
+sign_and_trustcache "$ROOTFS/usr/bin/sw_vers"
+sign_and_trustcache "$ROOTFS/usr/bin/arch"
+sign_and_trustcache "$ROOTFS/usr/bin/id"
+sign_and_trustcache "$ROOTFS/usr/bin/date"
+sign_and_trustcache "$ROOTFS/usr/bin/sudo"
+sign_and_trustcache "$ROOTFS/usr/sbin/chown"
+
+# Archive / compression
+sign_and_trustcache "$ROOTFS/usr/bin/tar"
+sign_and_trustcache "$ROOTFS/usr/bin/gzip"
+sign_and_trustcache "$ROOTFS/usr/bin/bzip2"
+sign_and_trustcache "$ROOTFS/usr/bin/xz"
+sign_and_trustcache "$ROOTFS/usr/bin/zstd"
+sign_and_trustcache "$ROOTFS/usr/bin/lz4"
+sign_and_trustcache "$ROOTFS/usr/bin/unzip"
+
+# Network
+sign_and_trustcache "$ROOTFS/usr/bin/curl"
+sign_and_trustcache "$ROOTFS/usr/bin/openssl"
+sign_and_trustcache "$ROOTFS/usr/bin/rsync"
+
+# Scripting runtimes
+sign_and_trustcache "$ROOTFS/usr/bin/ruby"
+sign_and_trustcache "$ROOTFS/usr/bin/git"
+
+# Portable Ruby (Homebrew's vendored Ruby 4.0.1)
+PRUBY="$ROOTFS/opt/homebrew/Library/Homebrew/vendor/portable-ruby/4.0.1"
+sign_and_trustcache "$PRUBY/bin/ruby"
+for bundle in \
+    "lib/ruby/gems/4.0.0/extensions/arm64-darwin-20/4.0.0-static/fiddle-1.1.8/fiddle.bundle" \
+    "lib/ruby/gems/4.0.0/extensions/arm64-darwin-20/4.0.0-static/debug-1.11.1/debug/debug.bundle" \
+    "lib/ruby/gems/4.0.0/extensions/arm64-darwin-20/4.0.0-static/bootsnap-1.21.1/bootsnap/bootsnap.bundle" \
+    "lib/ruby/gems/4.0.0/extensions/arm64-darwin-20/4.0.0-static/msgpack-1.8.0/msgpack/msgpack.bundle"
+do
+    sign_and_trustcache "$PRUBY/$bundle"
+done
+
+# MacPorts base binaries (if installed at /opt/local)
+# sign_and_trustcache_tree() will sign all Mach-O files under a directory tree.
+# Uncomment and call after installing MacPorts:
+# find "$ROOTFS/opt/local/bin" "$ROOTFS/opt/local/sbin" -type f 2>/dev/null | while read f; do
+#     sign_and_trustcache "$f"
+# done
