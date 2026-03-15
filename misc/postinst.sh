@@ -224,9 +224,35 @@ do
     sign_and_trustcache "$PRUBY/$bundle"
 done
 
-# MacPorts base binaries (if installed at /opt/local)
-# sign_and_trustcache_tree() will sign all Mach-O files under a directory tree.
-# Uncomment and call after installing MacPorts:
-# find "$ROOTFS/opt/local/bin" "$ROOTFS/opt/local/sbin" -type f 2>/dev/null | while read f; do
-#     sign_and_trustcache "$f"
-# done
+# MacPorts binaries and libraries (installed at /opt/local)
+# Re-adds CDHashes on every reboot (signing is persistent, trustcache is not).
+# On first install, run the bulk-sign loop in CLAUDE.md "Skills" to sign all Mach-O files.
+if [ -d "$ROOTFS/opt/local" ]; then
+    # Core MacPorts port(1) binary
+    sign_and_trustcache "$ROOTFS/opt/local/bin/port"
+
+    # Tcl interpreter (MacPorts uses tclsh internally)
+    sign_and_trustcache "$ROOTFS/opt/local/bin/tclsh"
+    sign_and_trustcache "$ROOTFS/opt/local/bin/tclsh9.0"
+    sign_and_trustcache "$ROOTFS/opt/local/bin/tclsh8.6"
+
+    # Common dependency libraries (confirmed installed)
+    sign_and_trustcache "$ROOTFS/opt/local/lib/liblzma.dylib"
+    sign_and_trustcache "$ROOTFS/opt/local/lib/liblzma.5.dylib"
+    sign_and_trustcache "$ROOTFS/opt/local/lib/libedit.dylib"
+    sign_and_trustcache "$ROOTFS/opt/local/lib/libedit.3.dylib"
+    sign_and_trustcache "$ROOTFS/opt/local/lib/libffi.dylib"
+    sign_and_trustcache "$ROOTFS/opt/local/lib/libffi.8.dylib"
+
+    # Python (if installed via MacPorts)
+    sign_and_trustcache "$ROOTFS/opt/local/bin/python3"
+    sign_and_trustcache "$ROOTFS/opt/local/bin/python3.12"
+    sign_and_trustcache "$ROOTFS/opt/local/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
+
+    # Re-register CDHashes for all installed MacPorts Mach-O binaries/dylibs.
+    # This loop is fast (skips non-Mach-O files) and safe to run on every boot.
+    find "$ROOTFS/opt/local/bin" "$ROOTFS/opt/local/sbin" "$ROOTFS/opt/local/lib" \
+         -type f 2>/dev/null | while read f; do
+        sign_and_trustcache "$f"
+    done
+fi

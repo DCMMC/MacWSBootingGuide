@@ -152,3 +152,234 @@ sudo launchctl load /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboa
 3. Run `postinst.sh` to re-sign binaries and register trustcaches via `jbctl trustcache add`.
 4. Use `launchdchrootexec` (via launchctl) to start macOS daemons; WindowServer reads display via `IOMobileFramebuffer`.
 5. Connect via VNC (`OSXvnc-server`) or interact via the chroot shell.
+
+---
+
+## Practical Knowledge: iOS Shell Operations
+
+### Commands That Require `sudo`
+
+Run these from the iOS shell (SSH or terminal). Almost all privileged operations need `sudo`:
+
+```bash
+# Always need sudo:
+sudo bash /var/jb/usr/macOS/bin/run_bash.sh          # enter chroot
+sudo bash /var/jb/usr/macOS/bin/postinst.sh          # re-sign & trustcache
+sudo ldid -S<entitlements> -M <binary>               # re-sign a binary
+sudo /var/jb/usr/bin/jbctl trustcache add <cdhash>   # register CDHash
+sudo /var/jb/usr/local/bin/mount_bindfs <src> <dst>  # bind mount
+sudo launchctl load/unload <plist>                   # manage daemons
+sudo dmesg                                           # kernel log
+
+# Do NOT need sudo (read-only or user-space):
+ldid -h <binary>                  # inspect CDHash (read-only)
+ldid -arch arm64 -h <bin> 2>/dev/null | grep CDHash= | cut -c8=  # extract cdhash
+ls, cat, grep, file, strings      # read-only inspection
+oslog                             # log streaming (may need sudo for kernel logs)
+python3                           # iOS procursus python3
+```
+
+**Non-interactive sudo pattern** (for scripting from macOS via SSH):
+```bash
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/run_bash.sh -c "command"
+```
+
+### Extracting and Registering CDHashes
+
+```bash
+# Sign and register a single binary (all architectures):
+ENT=/var/jb/usr/macOS/bin/entitlements.plist
+sudo ldid -S"$ENT" -M /var/mnt/rootfs/path/to/binary
+for arch in arm64 arm64e x86_64; do
+    h=$(ldid -arch "$arch" -h /var/mnt/rootfs/path/to/binary 2>/dev/null | grep CDHash= | cut -c8-)
+    [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h"
+done
+```
+
+---
+
+## Critical Constraint: AMFI Shebang Block
+
+**AMFI kills `execve()` of any file with a `#!/...` shebang line** (exits 126, `EPERM`).
+This applies to ALL scripts, not just shell scripts.
+
+**Symptoms**: Command exits immediately with no output; `dmesg` shows `AMFI: ... deny`.
+
+**Workaround — remove shebangs**: When bash tries to exec a file and gets `ENOEXEC` (no
+recognized binary/shebang format), it falls back to interpreting it as a shell script directly.
+This works for any script executed within a running bash session.
+
+```bash
+# Strip the first line if it's a shebang (iOS-side, using python3 — NOT GNU sed):
+python3 -c "
+import sys
+with open(sys.argv[1], 'r+') as f:
+    lines = f.readlines()
+    if lines and lines[0].startswith('#!'):
+        f.seek(0); f.writelines(lines[1:]); f.truncate()
+" /var/mnt/rootfs/path/to/script
+```
+
+**Do NOT use GNU sed** (`/var/jb/usr/bin/sed`) to strip shebangs — it corrupts files due to
+`\n`/`\r\n` line-ending differences. Use procursus `python3` on the iOS side instead.
+
+**Applies to**: Any shell script, Python script, Ruby script, Perl script, Tcl script — any
+text file with a `#!` first line that is exec'd via `execve`.
+
+**Exception**: Scripts invoked by `bash script.sh` or `python3 script.py` (not exec'd directly)
+are not affected since bash/python handle them without calling `execve` on the script file.
+
+---
+
+## Environment Variables for `run_bash.sh` Sessions
+
+`launchdchrootexec` sets a minimal environment. Always export the following at the start of
+any chroot session or script:
+
+```bash
+# Minimal working environment for the macOS chroot:
+export PATH=/opt/local/bin:/opt/local/sbin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/Users/root
+export USER=root
+export TMPDIR=/tmp
+export SHELL=/bin/bash
+
+# If you need network access (DNS goes through the SOCKS5 proxy):
+export ALL_PROXY=socks5h://127.0.0.1:1082
+export HTTPS_PROXY=socks5h://127.0.0.1:1082
+export HTTP_PROXY=socks5h://127.0.0.1:1082
+# Note: use socks5h:// (NOT socks5://) so DNS is resolved through the proxy too
+
+# DYLD_INSERT_LIBRARIES is set automatically by launchdchrootexec; do not override it.
+# If a subprocess strips it (e.g. via exec env -i), re-inject:
+export DYLD_INSERT_LIBRARIES=/usr/local/lib/libmachook.dylib
+```
+
+**`launchdchrootexec` pre-sets**: `HOME=/Users/root`, `USER=root`, `TMPDIR=/tmp`,
+`DYLD_INSERT_LIBRARIES=/usr/local/lib/libmachook.dylib`.
+
+**PATH is inherited from the iOS shell** — always set it explicitly inside scripts.
+
+---
+
+## Skills: Common Operations
+
+### Skill: Sign and Trustcache a Single Binary
+
+```bash
+# On iOS shell (run_bash NOT needed — this is iOS-side ldid):
+ENT=/var/jb/usr/macOS/bin/entitlements.plist
+BIN=/var/mnt/rootfs/path/to/binary
+sudo ldid -S"$ENT" -M "$BIN"
+for arch in arm64 arm64e x86_64; do
+    h=$(ldid -arch "$arch" -h "$BIN" 2>/dev/null | grep CDHash= | cut -c8-)
+    [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h" && echo "Trusted [$arch]: $h"
+done
+```
+
+### Skill: Sign All Mach-O Files in a Directory Tree
+
+```bash
+# Bulk-sign everything under a directory (e.g. after a package install):
+ENT=/var/jb/usr/macOS/bin/entitlements.plist
+DIR=/var/mnt/rootfs/opt/local
+sudo find "$DIR" -type f | while read f; do
+    if file "$f" 2>/dev/null | grep -q 'Mach-O'; then
+        sudo ldid -S"$ENT" -M "$f" 2>/dev/null
+        for arch in arm64 arm64e x86_64; do
+            h=$(ldid -arch "$arch" -h "$f" 2>/dev/null | grep CDHash= | cut -c8-)
+            [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h"
+        done
+        echo "Signed: $f"
+    fi
+done
+```
+
+### Skill: Run a Multi-Line Script in the Chroot (Non-Interactive)
+
+Place the script in the rootfs so it is accessible inside the chroot:
+```bash
+# Write script to rootfs (accessible inside chroot as /tmp/myscript.sh)
+cat > /var/mnt/rootfs/tmp/myscript.sh << 'EOF'
+export PATH=/opt/local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export ALL_PROXY=socks5h://127.0.0.1:1082
+# ... script body ...
+EOF
+
+# Run it (no shebang needed — bash -s reads from stdin or bash <path> executes directly):
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/run_bash.sh /tmp/myscript.sh
+```
+
+Or pipe inline via stdin (script stays on iOS filesystem):
+```bash
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/run_bash.sh -s << 'EOF'
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+echo "hello from chroot"
+EOF
+```
+
+### Skill: Strip Shebangs from a Directory of Scripts (iOS Side)
+
+```bash
+python3 << 'EOF'
+import os, sys
+
+target_dir = "/var/mnt/rootfs/opt/homebrew/Library/Homebrew/shims"
+for root, dirs, files in os.walk(target_dir):
+    for fname in files:
+        fpath = os.path.join(root, fname)
+        try:
+            with open(fpath, 'r+', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+                if content.startswith('#!'):
+                    newline_pos = content.find('\n')
+                    if newline_pos != -1:
+                        f.seek(0)
+                        f.write(content[newline_pos+1:])
+                        f.truncate()
+                        print(f"Stripped shebang: {fpath}")
+        except (IsADirectoryError, PermissionError):
+            pass
+EOF
+```
+
+### Skill: Check If a CDHash Is in the Trustcache
+
+```bash
+cdhash=$(ldid -arch arm64 -h /var/mnt/rootfs/path/to/binary 2>/dev/null | grep CDHash= | cut -c8-)
+echo "CDHash: $cdhash"
+sudo /var/jb/usr/bin/jbctl trustcache list | grep -i "$cdhash" && echo "IN trustcache" || echo "NOT in trustcache"
+```
+
+### Skill: Debug Why a Binary Is Being Killed
+
+```bash
+# Watch AMFI/kernel logs while running the binary in another session:
+sudo dmesg | grep -E 'AMFI|deny|kill|sigkill' | tail -20
+# Or:
+sudo oslog | grep "AMFI\|violation\|kill"
+```
+
+### Skill: Install MacPorts Package (After Base is Set Up)
+
+```bash
+# Inside chroot, with proxy set:
+export ALL_PROXY=socks5h://127.0.0.1:1082
+export PATH=/opt/local/bin:/opt/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+port install <package>
+
+# After install, sign all new Mach-O files (run from iOS shell, NOT inside chroot):
+# (use the bulk-sign skill above, targeting /var/mnt/rootfs/opt/local)
+```
+
+---
+
+## Package Manager Notes
+
+- **MacPorts** (`/opt/local`): Works. Has prebuilt binaries for macOS 13 arm64. `port` binary
+  is a Mach-O (no shebang issue). After each `port install`, re-sign all new Mach-O files.
+  See `docs/macports-notes.md` for full details.
+
+- **Homebrew** (`/opt/homebrew`): Does NOT work for package installation on macOS 13 arm64 —
+  no bottles available, source builds require Xcode CLT (AMFI-killed). `brew --version` can
+  be made to work but `brew install` fails. See `docs/homebrew-notes.md` for full details.
