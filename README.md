@@ -33,15 +33,9 @@ run in your iPad/iPhone device:
 
 ```bash
 sudo bash /var/jb/usr/macOS/bin/postinst.sh
-sudo launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
-sudo launchctl load /var/jb/usr/macOS/LaunchDaemons
 # enter macOS bash environment
 sudo bash /var/jb/usr/macOS/bin/run_bash.sh
 ```
-In (chroot) macOS bash environment, you can run CLI or GUI applications:
-    - `/usr/local/bin/OSXvnc-server -rfbnoauth` to open a VNC server
-    - `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal`
-    - `/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor`
 
 To run any exectuable in (chroot) macOS, run this in iOS shell:
 
@@ -85,7 +79,7 @@ add_all_trustcache() {
 }
 
 cp /var/mnt/rootfs/usr/bin/whoami{,.bak}
-ldid -S./entitlements.plist -M /var/mnt/rootfs/usr/bin/whoami
+ldid -S./bin/entitlements.plist -M /var/mnt/rootfs/usr/bin/whoami
 add_all_trustcache /var/mnt/rootfs/usr/bin/whoami
 ```
 
@@ -93,6 +87,19 @@ Debug `kill: 9` when running macOS binary in iOS:
 ```bash
 sudo oslog | grep "AMFI\|debugbydcmmc\|launchd\|launchser\|WindowSer\|MTL\|Metal\|Terminal\|iolation"
 ```
+
+Open GUI in (chroot) macOS:
+
+```bash
+sudo launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
+sudo launchctl load /var/jb/usr/macOS/LaunchDaemons
+```
+
+In (chroot) macOS bash environment, you can run CLI or GUI applications:
+
+- `/usr/local/bin/OSXvnc-server -rfbnoauth` first to open a VNC server
+- `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal`
+- `/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor`
 
 Respring to iOS:
 
