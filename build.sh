@@ -12,5 +12,6 @@ ldid -S libmachook.dylib
 codesign -f -s - libmachook.dylib 
 scp -P 2222 libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook.dylib
 scp -P 2222 ./misc/postinst.sh root@$DEVICE_IP:/var/jb/usr/macOS/bin
+scp -P 2222 ./misc/sign_installed.sh root@$DEVICE_IP:/var/jb/usr/macOS/bin
 scp -P 2222 ./misc/run_bash.sh root@$DEVICE_IP:/var/jb/usr/macOS/bin
 scp -P 2222 ./entitlements.plist root@$DEVICE_IP:/var/jb/usr/macOS/bin

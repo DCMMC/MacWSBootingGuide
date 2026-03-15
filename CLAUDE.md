@@ -111,9 +111,28 @@ Run commands or scripts non-interactively (`run_bash.sh` forwards all arguments 
 sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c "echo hello"
 
 # Multi-line script piped via stdin (script lives on iOS filesystem)
+# Always set the full environment at the top of every script:
 sudo bash /var/jb/usr/macOS/bin/run_bash.sh -s <<'EOF'
-export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# --- standard chroot environment ---
+export PATH=/opt/local/bin:/opt/local/sbin:\
+/opt/local/Library/Frameworks/Python.framework/Versions/3.13/bin:\
+/opt/homebrew/bin:/opt/homebrew/sbin:\
+/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=/Users/root
+export USER=root
+export TMPDIR=/tmp
+export SHELL=/bin/bash
+# Network (DNS routed through SOCKS5h proxy):
+export ALL_PROXY=socks5h://127.0.0.1:1082
+export HTTPS_PROXY=socks5h://127.0.0.1:1082
+export HTTP_PROXY=socks5h://127.0.0.1:1082
+# SSL: Security framework is unreachable in chroot; use the system cert bundle:
+export SSL_CERT_FILE=/etc/ssl/cert.pem
+# --- end environment ---
+
 echo "running in chroot"
+port version
+python3.13 --version
 EOF
 
 # Script file that lives on the macOS rootfs, with arguments
@@ -122,9 +141,11 @@ sudo bash /var/jb/usr/macOS/bin/run_bash.sh /tmp/script.sh arg1 arg2
 
 Notes:
 - `chdir: No such file or directory` always appears on stderr — harmless, falls back to `/`.
-- PATH is inherited from the iOS shell. Set it explicitly inside scripts if macOS tools are needed.
-- `HOME=/Users/root`, `USER=root`, `TMPDIR=/tmp` are fixed by `launchdchrootexec`.
+- PATH is inherited from the iOS shell; **always override it** in scripts or tools will resolve to iOS procursus binaries which crash inside the chroot (libiosexec sandbox).
+- `HOME=/Users/root`, `USER=root`, `TMPDIR=/tmp` are pre-set by `launchdchrootexec` but PATH is not.
+- `SSL_CERT_FILE=/etc/ssl/cert.pem` is required for any Python/curl SSL to work — the macOS Security framework (Keychain) is unreachable in the chroot.
 - For script files: place them under `/var/mnt/rootfs/` so they are accessible inside the chroot (e.g. iOS path `/var/mnt/rootfs/tmp/script.sh` → chroot path `/tmp/script.sh`).
+- After installing software via `port` or `brew`, run `misc/sign_installed.sh` from the iOS shell to sign and trustcache all new Mach-O files (see below).
 
 Start WindowServer and GUI daemons (unloads SpringBoard/backboardd first):
 ```bash
@@ -279,21 +300,28 @@ done
 
 ### Skill: Sign All Mach-O Files in a Directory Tree
 
+Use `misc/sign_installed.sh` (deployed to `/var/jb/usr/macOS/bin/sign_installed.sh`).
+This is the standard tool for signing after any `port install`, `brew install`, or `pip install`.
+
 ```bash
-# Bulk-sign everything under a directory (e.g. after a package install):
-ENT=/var/jb/usr/macOS/bin/entitlements.plist
-DIR=/var/mnt/rootfs/opt/local
-sudo find "$DIR" -type f | while read f; do
-    if file "$f" 2>/dev/null | grep -q 'Mach-O'; then
-        sudo ldid -S"$ENT" -M "$f" 2>/dev/null
-        for arch in arm64 arm64e x86_64; do
-            h=$(ldid -arch "$arch" -h "$f" 2>/dev/null | grep CDHash= | cut -c8-)
-            [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h"
-        done
-        echo "Signed: $f"
-    fi
-done
+# Sign everything MacPorts installed (most common case after port install):
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/sign_installed.sh macports
+
+# Sign everything Homebrew installed:
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/sign_installed.sh homebrew
+
+# Sign both (default):
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/sign_installed.sh
+
+# Sign an arbitrary directory (e.g. after extracting a tarball):
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/sign_installed.sh /var/mnt/rootfs/usr/local/myapp
+
+# After pip install — sign new .so files in Python site-packages:
+echo 'alpine' | sudo -S bash /var/jb/usr/macOS/bin/sign_installed.sh \
+  /var/mnt/rootfs/opt/local/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages
 ```
+
+The script is idempotent and safe to re-run at any time. It skips non-Mach-O files silently.
 
 ### Skill: Run a Multi-Line Script in the Chroot (Non-Interactive)
 
@@ -383,3 +411,55 @@ port install <package>
 - **Homebrew** (`/opt/homebrew`): Does NOT work for package installation on macOS 13 arm64 —
   no bottles available, source builds require Xcode CLT (AMFI-killed). `brew --version` can
   be made to work but `brew install` fails. See `docs/homebrew-notes.md` for full details.
+
+---
+
+## Python 3.13 (MacPorts)
+
+Installed as `port install python313`. Confirmed working as of 2026-03-15 (version 3.13.12).
+
+### Required: sign all Mach-O files after install
+
+Run `/tmp/sign_python313.sh` (iOS side) or the bulk-sign skill from CLAUDE.md targeting
+`/opt/local/Library/Frameworks/Python.framework/Versions/3.13` and `/opt/local/lib`.
+
+### pip setup
+
+```bash
+# Install pip (bundled with Python 3.13):
+python3.13 -m ensurepip --upgrade
+
+# pip needs PySocks to use a SOCKS5 proxy. Bootstrap it via curl:
+curl -sL --proxy socks5h://127.0.0.1:1082 --cacert /etc/ssl/cert.pem \
+  "https://files.pythonhosted.org/packages/a2/4b/52123768624ae28d84c97515dd96c9958888e8c2d8f122074e31e2be878c/PySocks-1.7.1-py27-none-any.whl" \
+  -o /tmp/PySocks-1.7.1-py3-none-any.whl
+python3.13 -m pip install --no-deps /tmp/PySocks-1.7.1-py3-none-any.whl
+```
+
+### Required environment variables for Python sessions
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/cert.pem           # macOS cert bundle (Security fw unreachable in chroot)
+export ALL_PROXY=socks5h://127.0.0.1:1082        # DNS-aware SOCKS5 proxy
+export HTTPS_PROXY=socks5h://127.0.0.1:1082
+# Include the Python framework bin for pip3/pip3.13 commands:
+export PATH=/opt/local/Library/Frameworks/Python.framework/Versions/3.13/bin:$PATH
+```
+
+### After every `pip install` — sign new .so files (from iOS shell)
+
+```bash
+ENT=/var/jb/usr/macOS/bin/entitlements.plist
+SITE=/var/mnt/rootfs/opt/local/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages
+find "$SITE" -type f \( -name "*.so" -o -name "*.dylib" \) | while read f; do
+    sudo ldid -S"$ENT" -M "$f" 2>/dev/null
+    h=$(ldid -arch arm64 -h "$f" 2>/dev/null | grep CDHash= | cut -c8-)
+    [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h" && echo "signed: $(basename $f)"
+done
+```
+
+### Confirmed working modules
+
+`sys`, `os`, `json`, `re`, `math`, `hashlib`, `sqlite3`, `ssl`, `zlib`, `lzma`, `bz2`, `csv`,
+`ctypes`, `decimal`, `readline`, `multiprocessing`, `concurrent.futures`,
+`requests` (pip), `charset_normalizer` (pip), `certifi` (pip), `urllib3` (pip)

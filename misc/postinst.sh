@@ -228,30 +228,36 @@ done
 # Re-adds CDHashes on every reboot (signing is persistent, trustcache is not).
 # On first install, run the bulk-sign loop in CLAUDE.md "Skills" to sign all Mach-O files.
 if [ -d "$ROOTFS/opt/local" ]; then
-    # Core MacPorts port(1) binary
-    sign_and_trustcache "$ROOTFS/opt/local/bin/port"
-
-    # Tcl interpreter (MacPorts uses tclsh internally)
+    # Tcl interpreter (MacPorts uses tclsh internally; port binary is a wrapper script)
+    sign_and_trustcache "$ROOTFS/opt/local/libexec/macports/bin/tclsh8.6"
     sign_and_trustcache "$ROOTFS/opt/local/bin/tclsh"
     sign_and_trustcache "$ROOTFS/opt/local/bin/tclsh9.0"
-    sign_and_trustcache "$ROOTFS/opt/local/bin/tclsh8.6"
 
-    # Common dependency libraries (confirmed installed)
-    sign_and_trustcache "$ROOTFS/opt/local/lib/liblzma.dylib"
-    sign_and_trustcache "$ROOTFS/opt/local/lib/liblzma.5.dylib"
-    sign_and_trustcache "$ROOTFS/opt/local/lib/libedit.dylib"
-    sign_and_trustcache "$ROOTFS/opt/local/lib/libedit.3.dylib"
-    sign_and_trustcache "$ROOTFS/opt/local/lib/libffi.dylib"
-    sign_and_trustcache "$ROOTFS/opt/local/lib/libffi.8.dylib"
+    # Confirmed-installed dependency libraries
+    for lib in liblzma liblzma.5 libedit libedit.3 libffi libffi.8 \
+                libintl libintl.8 libiconv libiconv.2 \
+                libsqlite3 libsqlite3.0 libbz2 libbz2.1.0 libbz2.1 \
+                libncurses libncurses.6 libncursesw libncursesw.6 \
+                libmpdec libmpdec.4 libmpdec++ libmpdec++.4; do
+        sign_and_trustcache "$ROOTFS/opt/local/lib/${lib}.dylib"
+    done
 
-    # Python (if installed via MacPorts)
-    sign_and_trustcache "$ROOTFS/opt/local/bin/python3"
-    sign_and_trustcache "$ROOTFS/opt/local/bin/python3.12"
-    sign_and_trustcache "$ROOTFS/opt/local/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
+    # Python 3.13 (confirmed working; installed via port install python313)
+    PY313="$ROOTFS/opt/local/Library/Frameworks/Python.framework/Versions/3.13"
+    sign_and_trustcache "$ROOTFS/opt/local/bin/python3.13"
+    sign_and_trustcache "$PY313/bin/python3.13"
+    sign_and_trustcache "$PY313/Resources/Python.app/Contents/MacOS/Python"
+    sign_and_trustcache "$PY313/Python"
 
-    # Re-register CDHashes for all installed MacPorts Mach-O binaries/dylibs.
-    # This loop is fast (skips non-Mach-O files) and safe to run on every boot.
+    # Python 3.13 extension modules and site-packages .so files
+    # (also picks up any new .so files installed by pip)
+    find "$PY313/lib" -type f \( -name "*.so" -o -name "*.dylib" \) 2>/dev/null \
+        | while read f; do sign_and_trustcache "$f"; done
+
+    # Re-register CDHashes for all other MacPorts Mach-O binaries/dylibs.
+    # This loop is safe to run on every boot (sign_and_trustcache skips non-Mach-O).
     find "$ROOTFS/opt/local/bin" "$ROOTFS/opt/local/sbin" "$ROOTFS/opt/local/lib" \
+         "$ROOTFS/opt/local/libexec" \
          -type f 2>/dev/null | while read f; do
         sign_and_trustcache "$f"
     done

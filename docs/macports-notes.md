@@ -2,7 +2,7 @@
 
 MacPorts was chosen as the package manager for the macOS chroot after Homebrew hit a hard wall
 (no bottles for macOS 13 arm64, source builds require Xcode CLT which AMFI kills). MacPorts
-ships prebuilt `.pkg` archives for macOS arm64 and does not require Xcode for most packages.
+ships prebuilt binary archives for macOS arm64 and does not require Xcode for most packages.
 
 ---
 
@@ -17,36 +17,25 @@ ships prebuilt `.pkg` archives for macOS arm64 and does not require Xcode for mo
 | Non-interactive entry | `echo 'alpine' \| sudo -S bash /var/jb/usr/macOS/bin/run_bash.sh -c "..."` |
 | Proxy | SOCKS5h on `127.0.0.1:1082` (iOS side, DNS via proxy) |
 | MacPorts install prefix | `/opt/local` |
+| MacPorts version | 2.12.3 |
 
 ---
 
 ## Phase 1 — Installing MacPorts Base
 
 MacPorts provides a source tarball and a `.pkg` installer. The `.pkg` installer cannot be used
-inside the chroot (no `/System/Library/PrivateFrameworks/PackageKit.framework`). The tarball
-approach was used instead:
+inside the chroot (no `PackageKit.framework`). Building from source requires a compiler — also
+blocked by AMFI.
+
+**Resolution**: Copy a pre-built MacPorts installation tree from an actual macOS 13.4 machine
+(or Docker container) and extract it into the rootfs on the iOS side:
 
 ```bash
-# Download from iOS side (not inside chroot)
-curl -sL --proxy socks5h://127.0.0.1:1082 \
-  https://github.com/macports/macports-base/releases/download/v2.9.3/MacPorts-2.9.3.tar.gz \
-  -o /tmp/macports-base.tar.gz
-
-tar -xzf /tmp/macports-base.tar.gz -C /tmp
+# On iOS, extract the pre-built MacPorts tree into the rootfs
+sudo tar xzf /tmp/macports_opt_local.tar.gz -C /var/mnt/rootfs
 ```
 
-**Build issue**: `./configure && make && make install` requires a working compiler inside the
-chroot. Clang (from Xcode CLT) is killed by AMFI the same as with Homebrew.
-
-**Resolution**: A pre-built MacPorts base tarball was extracted directly into `/opt/local` by
-copying the contents from an actual macOS 13.4 machine (or Docker container), then transferred
-to the device rootfs:
-
-```bash
-# On iOS, extract the pre-built MacPorts installation tree into the rootfs
-cd /var/mnt/rootfs
-sudo tar xzf /tmp/macports_opt_local.tar.gz
-```
+After extraction, run the postinst.sh signing loop (Phase 4) before attempting to use `port`.
 
 ---
 
@@ -54,168 +43,243 @@ sudo tar xzf /tmp/macports_opt_local.tar.gz
 
 Same constraint as Homebrew: no mDNSResponder in the chroot.
 
-**Fix**: Set proxy environment before running `port`:
+**Fix**: Set SOCKS5h proxy environment (the `h` suffix routes DNS through the proxy too):
 ```bash
 export ALL_PROXY=socks5h://127.0.0.1:1082
 export HTTPS_PROXY=socks5h://127.0.0.1:1082
 export HTTP_PROXY=socks5h://127.0.0.1:1082
-# rsync also needs a proxy for port sync:
-export RSYNC_PROXY=127.0.0.1:1082
 ```
 
-`port sync` uses rsync by default. RSYNC_PROXY only works for HTTP proxies; rsync over SOCKS5
-doesn't work. **Fix**: Switch MacPorts to use HTTPS for syncing in `/opt/local/etc/macports/sources.conf`:
+`port selfupdate` downloads via HTTPS and works with the proxy set. `port sync` uses rsync by
+default. Switch to HTTPS sync in `/opt/local/etc/macports/sources.conf`:
 ```
 # Replace rsync line with:
 https://distfiles.macports.org/ports.tar.gz [nosync]
 ```
 
-Or disable sync entirely and copy the ports tree from macOS side.
-
 ---
 
-## Phase 3 — Shebang Constraint (AMFI kills `#!/...` scripts)
+## Phase 3 — `port` Command: Shebang Block
 
-The `port` command itself (`/opt/local/bin/port`) is a compiled binary — no shebang issue.
-However, many portfiles and helper scripts use shebangs.
+**Critical finding**: `/opt/local/bin/port` is **not** a compiled binary — it is a Tcl script
+with `#!/opt/local/libexec/macports/bin/tclsh8.6` as its shebang. AMFI kills it on exec
+(exit 126).
 
-**Key finding**: MacPorts' core `port` binary is a proper Mach-O executable (unlike Homebrew's
-`brew` which is a bash script), so the primary interface works. Only portfiles (Tcl scripts
-executed internally by `port`) and some shell-script utilities are affected.
+The Tcl interpreter `tclsh8.6` itself is a Mach-O binary (not a script), so tclsh runs fine
+once trustcached.
 
-**Port build scripts**: MacPorts runs build phases via its internal Tcl interpreter, not
-by exec-ing shell scripts with shebangs. Most packages build cleanly.
+**Fix**: Replace `port` with a no-shebang wrapper that calls tclsh explicitly:
 
-**Shell scripts with shebangs that needed patching**:
-- `/opt/local/share/macports/Tcl/port1.0/portutil.tcl` — No shebang, fine
-- Some port distfiles contain configure scripts: `./configure` scripts have `#!/bin/sh` shebangs
-
-**Workaround for configure scripts**: Remove the shebang line from `configure` before running:
 ```bash
-sed -i '' '1{/^#!/d}' configure
-bash configure ...
+# Inside chroot (run as root, using macOS /bin/cp):
+/bin/cp /opt/local/bin/port /opt/local/bin/port.tcl
+
+# Write wrapper (no shebang — bash falls back to direct interpretation):
+printf 'exec /opt/local/libexec/macports/bin/tclsh8.6 /opt/local/bin/port.tcl "$@"\n' \
+    > /opt/local/bin/port
+/bin/chmod +x /opt/local/bin/port
 ```
 
-Or run via bash explicitly: `bash ./configure ...` (bash will interpret without execve).
+**Important**: The `port.tcl` source is the MacPorts-version-specific installed script.
+If it is accidentally overwritten (e.g. from running the above twice without making the
+backup first), restore it from GitHub:
 
-**Important**: `/opt/local/bin/tclsh9.0` is a Mach-O binary (fine). All compiled MacPorts
-binaries are fine — only shell scripts called via `execve` are affected.
+```bash
+# Restore port.tcl for MacPorts 2.12.3 (replace version as needed):
+curl -fsSL --proxy socks5h://127.0.0.1:1082 \
+  "https://raw.githubusercontent.com/macports/macports-base/v2.12.3/src/port/port.tcl" \
+  -o /opt/local/bin/port.tcl
+# The @TCLSH@ placeholder in the downloaded file is fine — it's the first line (shebang)
+# which is not exec'd; tclsh is invoked directly by the wrapper.
+```
+
+**PATH caveat inside chroot**: The iOS shell PATH (`/var/jb/usr/bin`) leaks in. Use absolute
+macOS paths for file operations:
+- `/bin/cp`, `/bin/chmod`, `/bin/cat`, `/usr/bin/head` — macOS rootfs binaries
+- `cp`, `chmod` without full path → resolves to iOS procursus, which crashes (libiosexec sandbox)
 
 ---
 
 ## Phase 4 — Binary Signing After Every `port install`
 
 Every Mach-O file installed by MacPorts must be:
-1. Re-signed: `ldid -S"$ENT" -M <path>`
-2. Trustcached: CDHash extracted and registered via `jbctl trustcache add`
+1. Re-signed: `sudo ldid -S"$ENT" -M <path>` (from **iOS shell**, not inside chroot)
+2. Trustcached: CDHash extracted and registered via `sudo jbctl trustcache add`
 
-**Automation**: A helper was added to `postinst.sh` to sign all files under `/opt/local/bin`
-and `/opt/local/sbin` on each boot (re-adds CDHashes after reboot). For first install, a
-one-shot script must also sign dylibs under `/opt/local/lib`.
+**Trustcache is not persistent across reboots.** `postinst.sh` re-registers all known CDHashes
+on every boot. For newly installed packages, run the bulk-sign loop from the iOS shell:
 
-**Signing all MacPorts Mach-O files** (run after each `port install`):
 ```bash
 ENT=/var/jb/usr/macOS/bin/entitlements.plist
-ROOTFS=/var/mnt/rootfs
+LDID=/var/jb/usr/bin/ldid
+JBCTL=/var/jb/usr/bin/jbctl
 
-find "$ROOTFS/opt/local" -type f | while read f; do
-    # Only sign Mach-O files (skip text/data)
-    if file "$f" 2>/dev/null | grep -q 'Mach-O'; then
-        ldid -S"$ENT" -M "$f" 2>/dev/null
-        for arch in arm64 arm64e x86_64; do
-            h=$(ldid -arch "$arch" -h "$f" 2>/dev/null | grep CDHash= | cut -c8-)
-            [ -n "$h" ] && jbctl trustcache add "$h"
-        done
-    fi
+sudo find /var/mnt/rootfs/opt/local -type f | while read f; do
+    sudo "$LDID" -S"$ENT" -M "$f" 2>/dev/null || continue
+    for arch in arm64 arm64e x86_64; do
+        h=$(sudo "$LDID" -arch "$arch" -h "$f" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && sudo "$JBCTL" trustcache add "$h" && echo "[$arch] $(basename $f)"
+    done
 done
 ```
 
-**Known libraries that needed signing** (checked via `ls /var/mnt/rootfs/opt/local/lib/`):
-- `liblzma.dylib` / `liblzma.5.dylib` — xz/lzma decompression
-- `libedit.dylib` / `libedit.3.dylib` — command-line editing (used by python3, tclsh)
-- `libffi.dylib` / `libffi.8.dylib` — foreign function interface
+**Known libraries confirmed signed and working**:
 
-All three are dependencies pulled in transitively by most packages.
-
----
-
-## Phase 5 — DYLD_INSERT_LIBRARIES Stripping
-
-MacPorts' `port` binary does **not** use `exec env -i` (unlike Homebrew's `brew`), so
-`DYLD_INSERT_LIBRARIES` is naturally inherited by child processes in most cases.
-
-**Exception**: Some ports run their build phases via `xcrun` or `xcode-select` which AMFI
-kills outright. Workaround: stub `xcrun`:
-```bash
-echo '/usr/bin/clang "$@"' > /opt/local/bin/xcrun
-# No shebang — bash interprets directly
-chmod +x /opt/local/bin/xcrun
-ldid -S"$ENT" -M /opt/local/bin/xcrun
-```
-
-**`env` invocations**: When a script uses `/usr/bin/env programname`, env must be trustcached
-and `programname` must be in PATH and trustcached. `usr/bin/env` is already signed and
-trustcached by `postinst.sh`.
-
----
-
-## Phase 6 — Python3 and JIT
-
-MacPorts Python (`port install python312`) creates `/opt/local/bin/python3.12`. Python requires
-JIT memory allocation (`MAP_JIT`) for its bytecode compiler.
-
-**Fix**: The `jit.m` hook in `libmachook` already enables `MAP_JIT` for all processes, so
-Python works once trustcached.
-
-A helper script was created at `/tmp/sign_python3_jit.sh` during debugging:
-```bash
-#!/bin/bash
-ENT=/var/jb/usr/macOS/bin/entitlements.plist
-ldid -S"$ENT" -M /var/mnt/rootfs/opt/local/bin/python3.12
-h=$(ldid -arch arm64 -h /var/mnt/rootfs/opt/local/bin/python3.12 2>/dev/null | grep CDHash= | cut -c8-)
-jbctl trustcache add "$h"
-```
-
----
-
-## Phase 7 — `port` Sync and Portfile Index
-
-`port selfupdate` and `port sync` try to update the ports tree. Both use rsync or git which
-have network/SOCKS issues.
-
-**Workaround**: Manually copy the ports tree from macOS side:
-```bash
-# On macOS (host), compress MacPorts ports tree:
-tar czf /tmp/macports_ports.tar.gz -C /opt/local/var/macports/sources/rsync.macports.org \
-  macports/release/tarballs/ports.tar
-# Transfer to device and extract into rootfs
-```
-
-Or use `port -d sync` with HTTP source as described in Phase 2.
-
----
-
-## Phase 8 — Confirmed Working Packages
-
-After all the above fixes, the following packages were confirmed to install and run:
-
-| Package | Notes |
+| Library | Purpose |
 |---|---|
-| `python312` | Works; JIT enabled via `jit.m` hook |
-| `liblzma` (`xz`) | Library works; `xz` binary works |
-| `libffi` | Library works |
-| `libedit` | Library works |
+| `liblzma.5.dylib` | XZ/LZMA compression |
+| `libedit.3.dylib` | Readline-compatible input (tclsh, python) |
+| `libffi.8.dylib` | Foreign function interface (ctypes) |
+| `libintl.8.dylib` | Internationalization (gettext) |
+| `libiconv.2.dylib` | Character encoding conversion |
+| `libsqlite3.0.dylib` | SQLite database |
+| `libbz2.1.0.dylib` | BZ2 compression |
+| `libncurses.6.dylib` | Terminal UI |
+| `libmpdec.4.dylib` | Decimal arithmetic (Python decimal module) |
 
 ---
 
-## Phase 9 — Remaining Limitations
+## Phase 5 — `uname -m` Returns Device Model String
 
-1. **Packages requiring Xcode CLT**: Any package that invokes `xcode-select` or `xcrun` directly
-   for compiler detection will fail unless `xcrun` is stubbed as above.
-2. **No persistent trustcache**: CDHashes are lost on reboot. `postinst.sh` re-registers them.
-3. **Signed binaries count**: Every new `port install` adds new Mach-O files that need signing.
-   Run the full signing loop in Phase 4 after each install.
-4. **`port` interactive mode**: `port -i` uses readline/libedit; works once libedit is signed.
+`uname -m` (and `$tcl_platform(machine)` in Tcl) returns the iOS device model identifier
+(e.g. `iPad13,6`) instead of `arm64`. This is because `hw.machine` sysctl is not yet hooked
+in `libmachook` to return `arm64`.
+
+**Impact**: MacPorts' architecture detection uses `$tcl_platform(machine)`. `iPad13,6` is
+not a recognized arch string.
+
+**Fix**: Set `build_arch arm64` in `/opt/local/etc/macports/macports.conf` (already present
+in the installed configuration):
+```
+build_arch      arm64
+```
+
+MacPorts then uses the configured `build_arch` rather than the detected machine string.
+
+**Long-term fix**: Add `hw.machine` → `arm64` spoofing to the `sysctlbyname_new` hook in
+`libmachook/mac_hooks.m` alongside the existing `kern.osproductversion` hook.
+
+---
+
+## Phase 6 — DYLD_INSERT_LIBRARIES Preservation
+
+MacPorts' `port` wrapper (shell → tclsh → macports tcl) does **not** use `exec env -i`,
+so `DYLD_INSERT_LIBRARIES` is inherited through the call chain naturally.
+
+**Exception**: Some port build phases invoke `xcrun` or `xcode-select` which AMFI kills.
+Workaround: stub `/opt/local/bin/xcrun` as a no-shebang shell script:
+```bash
+printf '/usr/bin/clang "$@"\n' > /opt/local/bin/xcrun
+/bin/chmod +x /opt/local/bin/xcrun
+```
+
+---
+
+## Phase 7 — Python 3.13 (`port install python313`)
+
+### Install and sign
+
+```bash
+# Inside chroot:
+export PATH=/opt/local/bin:/opt/local/sbin:/usr/bin:/bin
+export ALL_PROXY=socks5h://127.0.0.1:1082
+port install python313
+```
+
+After install, sign all Mach-O files from the iOS shell (see Phase 4 bulk-sign, targeting
+`/var/mnt/rootfs/opt/local/Library/Frameworks/Python.framework/Versions/3.13`).
+
+Key Mach-O files to sign:
+- `Python.framework/Versions/3.13/Python` — the framework dylib itself
+- `Python.framework/Versions/3.13/bin/python3.13` — the executable
+- `Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python`
+- All `lib/python3.13/lib-dynload/*.cpython-313-darwin.so` (73 extension modules)
+
+### pip bootstrap
+
+pip is not installed by default. Use `ensurepip`:
+
+```bash
+python3.13 -m ensurepip --upgrade
+```
+
+pip requires `PySocks` to use SOCKS5 proxy. Bootstrap it via curl (no SOCKS needed for curl):
+
+```bash
+# iOS shell or inside chroot with curl + proxy:
+curl -sL --proxy socks5h://127.0.0.1:1082 --cacert /etc/ssl/cert.pem \
+  "https://files.pythonhosted.org/packages/a2/4b/52123768624ae28d84c97515dd96c9958888e8c2d8f122074e31e2be878c/PySocks-1.7.1-py27-none-any.whl" \
+  -o /tmp/PySocks-1.7.1-py3-none-any.whl
+python3.13 -m pip install --no-deps /tmp/PySocks-1.7.1-py3-none-any.whl
+```
+
+### SSL certificate fix
+
+Python's ssl module tries to use the macOS Security framework (Keychain) for CA validation,
+which doesn't work in the chroot (no system services). Use the system cert bundle instead:
+
+```bash
+export SSL_CERT_FILE=/etc/ssl/cert.pem   # macOS ships this at 333KB
+```
+
+After setting this, `ssl.create_default_context()` and `requests` both work.
+
+### Required environment for Python sessions
+
+```bash
+export PATH=/opt/local/Library/Frameworks/Python.framework/Versions/3.13/bin:/opt/local/bin:/usr/bin:/bin
+export ALL_PROXY=socks5h://127.0.0.1:1082
+export HTTPS_PROXY=socks5h://127.0.0.1:1082
+export SSL_CERT_FILE=/etc/ssl/cert.pem
+```
+
+### After `pip install` — sign new .so files
+
+Compiled pip packages (e.g. `charset_normalizer`) install `.so` extension modules that must
+be signed. From iOS shell after each `pip install`:
+
+```bash
+ENT=/var/jb/usr/macOS/bin/entitlements.plist
+SITE=/var/mnt/rootfs/opt/local/Library/Frameworks/Python.framework/Versions/3.13/lib/python3.13/site-packages
+find "$SITE" -name "*.so" -o -name "*.dylib" | while read f; do
+    sudo /var/jb/usr/bin/ldid -S"$ENT" -M "$f" 2>/dev/null
+    h=$(ldid -arch arm64 -h "$f" 2>/dev/null | grep CDHash= | cut -c8-)
+    [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h" && echo "signed: $(basename $f)"
+done
+```
+
+---
+
+## Phase 8 — Confirmed Working
+
+| Package/Component | Version | Notes |
+|---|---|---|
+| `port` (MacPorts CLI) | 2.12.3 | Wrapper fix required (Phase 3) |
+| `port selfupdate` | — | Works with HTTPS proxy |
+| `python313` | 3.13.12 | Full stdlib, ctypes, ssl, multiprocessing |
+| `pip` | 25.3 | Via ensurepip; needs PySocks for SOCKS5 proxy |
+| `requests` | 2.32.5 | pip install; needs SSL_CERT_FILE |
+| `charset_normalizer` | 3.4.5 | C extension; must sign after pip install |
+| `liblzma`, `libedit`, `libffi` | various | Dependency libs for python313 |
+
+---
+
+## Phase 9 — Remaining Issues / Limitations
+
+1. **`uname -m` / `hw.machine`**: Returns `iPad13,6` instead of `arm64`. Mitigated by
+   `build_arch arm64` in `macports.conf` for MacPorts. Python itself is unaffected since it
+   uses compile-time arch (`arm64`), not runtime sysctl. Long-term fix: hook `hw.machine`
+   in `libmachook`.
+
+2. **`port install` for new packages**: Every new package needs the bulk-sign loop run after
+   install. The `postinst.sh` loop handles reboots but not first-time installs.
+
+3. **Packages requiring a C compiler**: Any port that doesn't have a prebuilt binary for
+   macOS 13 arm64 will try to compile — clang is killed by AMFI. Check variant availability
+   with `port info <pkg>` before installing.
+
+4. **Signed `.so` count grows with pip installs**: `postinst.sh` must be updated or the
+   per-`pip install` signing loop run manually each time.
 
 ---
 
@@ -223,11 +287,12 @@ After all the above fixes, the following packages were confirmed to install and 
 
 | | MacPorts | Homebrew |
 |---|---|---|
-| Binary packages for macOS 13 arm64 | Yes (`.pkg`, extracted) | No (Tier 3, deprecated) |
-| Core CLI is Mach-O binary | Yes (`port`) | No (bash script → shebang blocked) |
-| `DYLD_INSERT_LIBRARIES` preservation | Yes (no `exec env -i`) | No (must patch `FILTERED_ENV`) |
-| Requires Xcode CLT for packages | Rarely (pre-built binaries) | Always (source-only on macOS 13) |
-| Outcome | Usable | Hard wall at package install |
+| Binary packages for macOS 13 arm64 | Yes | No (Tier 3 deprecated) |
+| `port` CLI is executable directly | No (Tcl script, needs wrapper) | No (bash script, needs shebang strip) |
+| `DYLD_INSERT_LIBRARIES` preserved | Yes | No (patch `FILTERED_ENV` needed) |
+| Requires Xcode CLT | Rarely | Always (source-only on macOS 13) |
+| DNS/network | SOCKS5h proxy | SOCKS5h proxy |
+| Outcome | **Working** | Hard wall at package install |
 
 ---
 
@@ -235,6 +300,8 @@ After all the above fixes, the following packages were confirmed to install and 
 
 | File (under `/var/mnt/rootfs/`) | Change |
 |---|---|
+| `opt/local/bin/port` | Replaced with no-shebang tclsh wrapper |
+| `opt/local/bin/port.tcl` | Restored from MacPorts 2.12.3 GitHub source |
 | `opt/local/etc/macports/sources.conf` | Changed rsync source to HTTPS |
-| `opt/local/bin/xcrun` (stub) | Created stub script forwarding to `/usr/bin/clang` |
+| `opt/local/etc/macports/macports.conf` | `build_arch arm64` already set |
 | All Mach-O files under `opt/local/` | Re-signed with `entitlements.plist` and trustcached |
