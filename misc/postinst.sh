@@ -110,6 +110,8 @@ add_all_trustcache /var/mnt/rootfs/usr/bin/which
 add_all_trustcache /var/mnt/rootfs/usr/bin/env
 add_all_trustcache /var/mnt/rootfs/usr/bin/grep
 add_all_trustcache /var/mnt/rootfs/usr/bin/vim
+add_all_trustcache /var/mnt/rootfs/usr/bin/whoami
+add_all_trustcache /var/mnt/rootfs/sbin/mount
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/ardpackage
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/build_hd_index
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/distnotifyutil

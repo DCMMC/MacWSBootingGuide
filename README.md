@@ -19,16 +19,87 @@ TODO: make a script
 - [Bind mount](https://github.com/khanhduytran0/mount-bindfs-dopamine) `rootfs/var/jb` -> `/var/jb`
 - Patch `dyld`, `launchservicesd` and `WindowServer` as described below.
 - Modify `cpusubtype` in `Installer Progress` and `WindowServer` using `set_to_arm64`
-- For every executable you wanna run, sign and merge with `entitlements.plist` in this repo.
+- For every executable you wanna run, sign and merge with `entitlements.plist` in this repo: `ldid -S./entitlements.plist -M binary_name`.
 - Load macOS trustcaches using `loadtc /path/to/trustcache`
 
 ## Starting up
-- `launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist`
-- `launchctl load /var/jb/usr/macOS/LaunchDaemons`
-- run bash
-    - `/usr/local/bin/OSXvnc-server -rfbnoauth`
-    - `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Termina`
+build in macOS:
+```bash
+# change DEVICE_IP to your iPad/iPhone device's IP
+bash build.sh
+```
+
+run in your iPad/iPhone device:
+
+```bash
+sudo bash /var/jb/usr/macOS/bin/postinst.sh
+sudo launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
+sudo launchctl load /var/jb/usr/macOS/LaunchDaemons
+# enter macOS bash environment
+sudo bash /var/jb/usr/macOS/bin/run_bash.sh
+```
+In (chroot) macOS bash environment, you can run CLI or GUI applications:
+    - `/usr/local/bin/OSXvnc-server -rfbnoauth` to open a VNC server
+    - `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal`
     - `/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor`
+
+To run any exectuable in (chroot) macOS, run this in iOS shell:
+
+```bash
+cd $(realpath $HOME/../..)/usr/macOS
+
+add_trustcache() {
+    local path=$1
+    local cdhash
+    cdhash=$(ldid -arch arm64 -h $path 2>/dev/null | grep CDHash= | cut -c8-)
+    if [ -n "$cdhash" ]; then
+        echo "Adding $path cdhash: $cdhash"
+        jbctl trustcache add "$cdhash"
+    fi
+}
+
+add_arm64e_trustcache() {
+    local path=$1
+    local cdhash
+    cdhash=$(ldid -arch arm64e -h $path 2>/dev/null | grep CDHash= | cut -c8-)
+    if [ -n "$cdhash" ]; then
+        echo "Adding $path cdhash: $cdhash"
+        jbctl trustcache add "$cdhash"
+    fi
+}
+
+add_x86_64_trustcache() {
+    local path=$1
+    local cdhash
+    cdhash=$(ldid -arch x86_64 -h $path 2>/dev/null | grep CDHash= | cut -c8-)
+    if [ -n "$cdhash" ]; then
+        echo "Adding $path cdhash: $cdhash"
+        jbctl trustcache add "$cdhash"
+    fi
+}
+
+add_all_trustcache() {
+    add_trustcache $1
+    add_arm64e_trustcache $1
+    add_x86_64_trustcache $1
+}
+
+cp /var/mnt/rootfs/usr/bin/whoami{,.bak}
+ldid -S./entitlements.plist -M /var/mnt/rootfs/usr/bin/whoami
+add_all_trustcache /var/mnt/rootfs/usr/bin/whoami
+```
+
+Debug `kill: 9` when running macOS binary in iOS:
+```bash
+sudo oslog | grep "AMFI\|debugbydcmmc\|launchd\|launchser\|WindowSer\|MTL\|Metal\|Terminal\|iolation"
+```
+
+Respring to iOS:
+
+```bash
+sudo launchctl unload /var/jb/usr/macOS/LaunchDaemons
+sudo launchctl load /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
+```
 
 ## Additional patches
 > [!NOTE]
