@@ -93,7 +93,7 @@ Before any macOS binary can run on the device, it must be re-signed and its CDHa
 
 ```bash
 # Re-sign with required entitlements
-ldid -S./entitlements.plist -M /var/mnt/rootfs/path/to/binary
+ldid -S/var/jb/usr/macOS/bin/entitlements.plist -M /var/mnt/rootfs/path/to/binary
 
 # Register CDHash(es) — repeat for each slice you need
 cdhash=$(ldid -arch arm64 -h /var/mnt/rootfs/path/to/binary 2>/dev/null | grep CDHash= | cut -c8-)
