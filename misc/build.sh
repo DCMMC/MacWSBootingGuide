@@ -23,9 +23,15 @@ python3 misc/set_macos_version.py libmachook.dylib
 ldid -S libmachook.dylib
 codesign -f -s - libmachook.dylib
 
+# arm64e-only dylib for chroot (macOS dyld SIGKILL on fat DYLD_INSERT_LIBRARIES)
+lipo -thin arm64e libmachook.dylib -output libmachook-rootfs.dylib
+ldid -S libmachook-rootfs.dylib
+codesign -f -s - libmachook-rootfs.dylib
+
 # Replace the package-installed version with the post-processed one
 scp -P $DEVICE_PORT libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook.dylib
-rm libmachook.dylib
+scp -P $DEVICE_PORT libmachook-rootfs.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook-rootfs.dylib
+rm -f libmachook.dylib libmachook-rootfs.dylib
 
 echo "==> Running postinst..."
 ssh -p $DEVICE_PORT root@$DEVICE_IP 'echo alpine | sudo -S bash /var/jb/usr/macOS/bin/postinst.sh'

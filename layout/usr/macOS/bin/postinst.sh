@@ -122,24 +122,29 @@ add_all_trustcache "/var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fr
 add_all_trustcache /var/jb/usr/macOS/bin/HostInjectBootstrap
 add_all_trustcache /var/mnt/rootfs/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 add_all_trustcache /System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc/MTLCompilerService
-cp -vf /var/jb/usr/macOS/lib/libmachook.dylib /var/mnt/rootfs/usr/local/lib/libmachook.dylib
-# macOS dyld (chrooted bash, WindowServer, etc.) SIGKILLs with CODESIGNING / Invalid Page
-# while mapping a *fat* libmachook as DYLD_INSERT_LIBRARIES.  Thin to arm64e only for the
-# rootfs copy; keep the fat dylib under /var/jb for iOS-side injection (arm64 + arm64e).
-LMRF="/var/mnt/rootfs/usr/local/lib/libmachook.dylib"
-if command -v lipo >/dev/null 2>&1; then
-	LMTHIN="/tmp/libmachook-rootfs-thin.$$"
-	if lipo -thin arm64e "$LMRF" -output "$LMTHIN" 2>/dev/null && [ -f "$LMTHIN" ]; then
-		mv -f "$LMTHIN" "$LMRF"
-		ldid -S"$ENT" -M "$LMRF" || echo "[WARN] ldid re-sign failed for $LMRF"
+# macOS dyld SIGKILL (CODESIGNING) if DYLD_INSERT_LIBRARIES maps a *fat* libmachook.
+# Prefer libmachook-rootfs.dylib (arm64e thin, from build_on_ios / misc/build.sh); else thin here.
+LMJB="/var/jb/usr/macOS/lib/libmachook.dylib"
+LMROOT="/var/mnt/rootfs/usr/local/lib/libmachook.dylib"
+LMROOTSRC="/var/jb/usr/macOS/lib/libmachook-rootfs.dylib"
+if [ -f "$LMROOTSRC" ]; then
+	cp -vf "$LMROOTSRC" "$LMROOT"
+elif [ -f "$LMJB" ]; then
+	cp -vf "$LMJB" "$LMROOT"
+	if command -v lipo >/dev/null 2>&1; then
+		LMTHIN="/tmp/libmachook-rootfs-thin.$$"
+		if lipo -thin arm64e "$LMROOT" -output "$LMTHIN" 2>/dev/null && [ -f "$LMTHIN" ]; then
+			mv -f "$LMTHIN" "$LMROOT"
+		else
+			rm -f "$LMTHIN"
+			echo "[ERROR] lipo -thin arm64e failed — run_bash will SIGKILL until fixed." >&2
+		fi
 	else
-		rm -f "$LMTHIN"
-		echo "[WARN] lipo -thin arm64e failed for $LMRF; leaving fat copy (run_bash may SIGKILL)"
+		echo "[ERROR] lipo not found (install cctools) — run_bash may SIGKILL." >&2
 	fi
-else
-	echo "[WARN] lipo not found; cannot thin $LMRF (install cctools or use fat at own risk)"
 fi
-add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook.dylib
+# Full entitlements + trustcache (thin file needs this after lipo; do not use add_all only)
+sign_and_trustcache "$LMROOT"
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld

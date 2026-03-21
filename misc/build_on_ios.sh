@@ -44,6 +44,15 @@ sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook
 echo "==> Re-signing libmachook.dylib..."
 sudo ldid -S /var/jb/usr/macOS/lib/libmachook.dylib
 
+# Pre-thin arm64e sibling for chroot DYLD_INSERT_LIBRARIES (macOS dyld rejects fat insert libs).
+echo "==> Writing libmachook-rootfs.dylib (arm64e thin)..."
+if command -v lipo >/dev/null 2>&1; then
+	sudo lipo -thin arm64e /var/jb/usr/macOS/lib/libmachook.dylib -output /var/jb/usr/macOS/lib/libmachook-rootfs.dylib
+	sudo ldid -S /var/jb/usr/macOS/lib/libmachook-rootfs.dylib
+else
+	echo "WARN: lipo missing; postinst will thin on-device if lipo exists."
+fi
+
 echo "==> Running postinst (copy dylib to rootfs, update trustcache)..."
 sudo bash /var/jb/usr/macOS/bin/postinst.sh
 
