@@ -97,6 +97,14 @@ add_all_trustcache() {
     add_x86_64_trustcache "$path"
 }
 
+# libSystem runs os_variant before DYLD_INSERT_LIBRARIES interpose applies — patch on disk.
+LSDARWIN="/var/mnt/rootfs/usr/lib/system/libsystem_darwin.dylib"
+if [ -f "$LSDARWIN" ] && command -v python3 >/dev/null 2>&1; then
+	python3 /var/jb/usr/macOS/bin/patch_libsystem_darwin_os_variant.py "$LSDARWIN" || echo "[WARN] patch_libsystem_darwin_os_variant.py failed" >&2
+	ldid -S"$ENT" -M "$LSDARWIN" 2>/dev/null || echo "[WARN] ldid libsystem_darwin.dylib failed" >&2
+	add_all_trustcache "$LSDARWIN"
+fi
+
 add_trustcache "/var/jb/usr/macOS/bin/login"
 add_trustcache "/var/jb/usr/macOS/bin/TestMetalIOSurface"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"

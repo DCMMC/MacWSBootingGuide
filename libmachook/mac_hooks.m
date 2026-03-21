@@ -40,6 +40,7 @@ const char *IOMFBPath = "/System/Library/PrivateFrameworks/IOMobileFramebuffer.f
 const char *MetalPath = "/System/Library/Frameworks/Metal.framework/Versions/A/Metal";
 const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
+const char *libsystemDarwinPath = "/usr/lib/system/libsystem_darwin.dylib";
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
@@ -134,6 +135,22 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 MTLFragmentReflectionReader_deserialize[i] = 0xd503201f; // nop
             }
         });
+    } else if(info.dli_fname && !strncmp(info.dli_fname, libsystemDarwinPath, strlen(libsystemDarwinPath))) {
+        // libSystem initializer calls os_variant before DYLD_INSERT_LIBRARIES can interpose.
+        // On-disk patch (postinst) is primary; this covers dlopen / late loads.
+        void *sym = MSFindSymbol((MSImageRef)header, "_os_variant_has_internal_diagnostics");
+        if(!sym) {
+            sym = MSFindSymbol((MSImageRef)header, "os_variant_has_internal_diagnostics");
+        }
+        if(sym) {
+            uint32_t *p = (uint32_t *)sym;
+            if(p[0] != 0x52800020u || p[1] != 0xd65f03c0u) {
+                ModifyExecutableRegion(p, 8, ^{
+                    p[0] = 0x52800020u; // mov w0, #1
+                    p[1] = 0xd65f03c0u; // ret
+                });
+            }
+        }
     }
 }
 
