@@ -38,7 +38,7 @@ sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook
 
 # Re-sign after modifying
 echo "==> Re-signing libmachook.dylib..."
-sudo ldid -S/var/jb/usr/macOS/bin/entitlements.plist -M /var/jb/usr/macOS/lib/libmachook.dylib
+sudo ldid -S /var/jb/usr/macOS/lib/libmachook.dylib
 
 echo "==> Running postinst (copy dylib to rootfs, update trustcache)..."
 sudo bash /var/jb/usr/macOS/bin/postinst.sh

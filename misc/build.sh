@@ -27,4 +27,7 @@ codesign -f -s - libmachook.dylib
 scp -P $DEVICE_PORT libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook.dylib
 rm libmachook.dylib
 
+echo "==> Running postinst..."
+ssh -p $DEVICE_PORT root@$DEVICE_IP 'echo alpine | sudo -S bash /var/jb/usr/macOS/bin/postinst.sh'
+
 echo "==> Done!"
