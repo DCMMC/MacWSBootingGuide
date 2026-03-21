@@ -1,7 +1,8 @@
 #!/bin/bash
-# Fast path for iterative work: only jb hook + launcher + chroot insert copy + bash.
-# Skips MacPorts scan, Metal copy, long rootfs lists, dyld_shared_cache hashes, etc.
-# Usage: sudo bash /var/jb/usr/macOS/bin/postinst_quick.sh
+# Default post-install for dev builds: jb hook + launcher + chroot insert + libsystem_darwin
+# patch + bash trustcache. Skips MacPorts scan, long rootfs lists, dyld_shared_cache hashes, etc.
+# For the full signing pass use: sudo bash /var/jb/usr/macOS/bin/postinst.sh
+# Usage: sudo bash /var/jb/usr/macOS/bin/postinst_simple.sh
 
 cd "$(realpath "$HOME/../..")/usr/macOS" || exit 1
 
@@ -47,7 +48,7 @@ sign_then_trust_all() {
 	add_all_trustcache "$path"
 }
 
-echo "==> postinst_quick: jb Mach-O + chroot libmachook + bash"
+echo "==> postinst_simple: jb Mach-O + chroot libmachook + bash"
 
 LSDARWIN="/var/mnt/rootfs/usr/lib/system/libsystem_darwin.dylib"
 if [ -f "$LSDARWIN" ] && command -v python3 >/dev/null 2>&1; then
@@ -94,4 +95,4 @@ fi
 
 add_all_trustcache "/var/mnt/rootfs/bin/bash"
 
-echo "==> postinst_quick done"
+echo "==> postinst_simple done"

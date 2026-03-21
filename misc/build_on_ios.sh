@@ -7,6 +7,9 @@
 
 set -e
 
+# Default: postinst_simple.sh (fast). Override: POSTINST_SCRIPT=/var/jb/usr/macOS/bin/postinst.sh bash misc/build_on_ios.sh
+POSTINST_SCRIPT="${POSTINST_SCRIPT:-/var/jb/usr/macOS/bin/postinst_simple.sh}"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -53,7 +56,7 @@ else
 	echo "WARN: lipo missing; postinst will thin on-device if lipo exists."
 fi
 
-echo "==> Running postinst (copy dylib to rootfs, update trustcache)..."
-sudo bash /var/jb/usr/macOS/bin/postinst.sh
+echo "==> Running postinst ($POSTINST_SCRIPT)..."
+sudo bash "$POSTINST_SCRIPT"
 
 echo "==> Done! Package installed successfully."

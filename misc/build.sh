@@ -9,6 +9,8 @@ set -e
 
 DEVICE_IP="192.168.5.8"
 DEVICE_PORT=2222
+# Default: postinst_simple.sh (fast). Override: POSTINST_SCRIPT=/var/jb/usr/macOS/bin/postinst.sh bash misc/build.sh
+POSTINST_SCRIPT="${POSTINST_SCRIPT:-/var/jb/usr/macOS/bin/postinst_simple.sh}"
 
 # Setup SSH key (default password: alpine)
 ssh-copy-id -p $DEVICE_PORT root@$DEVICE_IP 2>/dev/null || true
@@ -33,7 +35,7 @@ scp -P $DEVICE_PORT libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libma
 scp -P $DEVICE_PORT libmachook-rootfs.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook-rootfs.dylib
 rm -f libmachook.dylib libmachook-rootfs.dylib
 
-echo "==> Running postinst..."
-ssh -p $DEVICE_PORT root@$DEVICE_IP 'echo alpine | sudo -S bash /var/jb/usr/macOS/bin/postinst.sh'
+echo "==> Running postinst ($POSTINST_SCRIPT)..."
+ssh -p $DEVICE_PORT root@$DEVICE_IP "echo alpine | sudo -S bash $POSTINST_SCRIPT"
 
 echo "==> Done!"
