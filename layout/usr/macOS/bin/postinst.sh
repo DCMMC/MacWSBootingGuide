@@ -29,39 +29,44 @@ trust_cdhash() {
 }
 
 # Sign a binary with the project entitlements AND register all its CDHashes.
-# Optimized: single ldid call to get all hashes, skip if all trusted.
+# Optimized: skip re-signing if all per-arch hashes are already trusted.
 sign_and_trustcache() {
     local path="$1"
     [ -f "$path" ] || return
 
-    # Get all CDHashes in one ldid call (no -arch = all slices)
-    local hashes
-    hashes=$(ldid -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+    # Collect CDHashes per-arch (ldid -h without -arch does not output CDHash lines)
+    local hashes="" h
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && hashes="$hashes $h"
+    done
     [ -z "$hashes" ] && return  # Not a Mach-O file
 
     # Check if ALL hashes are already trusted
     local dominated=1
-    while IFS= read -r h; do
-        [ -z "$h" ] && continue
+    for h in $hashes; do
         if ! is_trusted "$h"; then
             dominated=0
             break
         fi
-    done <<< "$hashes"
+    done
 
     if [ "$dominated" -eq 1 ]; then
         return 0  # Silent skip - all trusted
     fi
 
-    # Sign and get new hashes
+    # Sign and collect new hashes
     ldid -S"$ENT" -M "$path" 2>/dev/null || return
-    hashes=$(ldid -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+    hashes=""
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && hashes="$hashes $h"
+    done
 
     # Add all hashes
-    while IFS= read -r h; do
-        [ -z "$h" ] && continue
+    for h in $hashes; do
         trust_cdhash "$h" "$path" "all"
-    done <<< "$hashes"
+    done
 }
 
 add_trustcache() {
