@@ -143,8 +143,14 @@ elif [ -f "$LMJB" ]; then
 		echo "[ERROR] lipo not found (install cctools) — run_bash may SIGKILL." >&2
 	fi
 fi
-# Full entitlements + trustcache (thin file needs this after lipo; do not use add_all only)
-sign_and_trustcache "$LMROOT"
+# Always apply project entitlements to the chroot insert lib. sign_and_trustcache() can skip
+# ldid when the arm64e CDHash matches an already-trusted fat slice hash — then the thin file
+# never gets ENT and macOS dyld SIGKILLs (same symptom as an unsigned insert).
+ldid -S"$ENT" -M "$LMROOT" || echo "[WARN] ldid -S ENT failed for $LMROOT"
+for arch in arm64 arm64e x86_64; do
+	h=$(ldid -arch "$arch" -h "$LMROOT" 2>/dev/null | grep CDHash= | cut -c8-)
+	[ -n "$h" ] && trust_cdhash "$h" "$LMROOT" "$arch"
+done
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
