@@ -37,7 +37,7 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 // arm64e slice has no class_t entries, letting the arm64 slice handle Metal.
 // On-device builds (misc/build_on_ios.sh) pass -DLIBMACHOOK_ON_DEVICE_BUILD: lld
 // uses -fixup_chains there, so arm64e can include this code.
-#if !defined(__arm64e__) || defined(LIBMACHOOK_ON_DEVICE_BUILD)
+#if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
 static id(*MTLCreateSimulatorDevice)(void);
 @interface MTLFakeDevice : _MTLDevice
 @end
@@ -222,7 +222,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
     });
     
-#if !defined(__arm64e__) || defined(LIBMACHOOK_ON_DEVICE_BUILD)
+#if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
     %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
 #endif
