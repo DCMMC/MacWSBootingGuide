@@ -198,19 +198,25 @@ Run these from the iOS shell (SSH or terminal). Almost all privileged operations
 # Always need sudo:
 sudo bash /var/jb/usr/macOS/bin/run_bash.sh          # enter chroot
 sudo bash /var/jb/usr/macOS/bin/postinst.sh          # re-sign & trustcache
-sudo ldid -S<entitlements> -M <binary>               # re-sign a binary
-sudo /var/jb/usr/bin/jbctl trustcache add <cdhash>   # register CDHash
+sudo ldid -S<entitlements> -M <binary>               # re-sign a binary (writes signature)
+sudo jbctl trustcache add <cdhash>                   # register CDHash (modifies trustcache)
 sudo /var/jb/usr/local/bin/mount_bindfs <src> <dst>  # bind mount
 sudo launchctl load/unload <plist>                   # manage daemons
 sudo dmesg                                           # kernel log
 
 # Do NOT need sudo (read-only or user-space):
 ldid -h <binary>                  # inspect CDHash (read-only)
-ldid -arch arm64 -h <bin> 2>/dev/null | grep CDHash= | cut -c8=  # extract cdhash
+ldid -arch arm64 -h <bin> 2>/dev/null | grep CDHash= | cut -c8-  # extract cdhash
+jbctl trustcache info             # dump trustcache contents (read-only)
 ls, cat, grep, file, strings      # read-only inspection
 oslog                             # log streaming (may need sudo for kernel logs)
 python3                           # iOS procursus python3
 ```
+
+**jbctl trustcache commands**:
+- `jbctl trustcache add <hash>` — requires sudo (modifies trustcache)
+- `jbctl trustcache info` — no sudo needed (read-only, dumps all CDHashes)
+- `jbctl trustcache list` — **broken**, always returns empty; use `info` instead
 
 **Non-interactive sudo pattern** (for scripting from macOS via SSH):
 ```bash
@@ -388,8 +394,11 @@ EOF
 ```bash
 cdhash=$(ldid -arch arm64 -h /var/mnt/rootfs/path/to/binary 2>/dev/null | grep CDHash= | cut -c8-)
 echo "CDHash: $cdhash"
-sudo /var/jb/usr/bin/jbctl trustcache list | grep -i "$cdhash" && echo "IN trustcache" || echo "NOT in trustcache"
+jbctl trustcache info | grep -i "$cdhash" && echo "IN trustcache" || echo "NOT in trustcache"
 ```
+
+**Note**: Use `jbctl trustcache info` to dump the trustcache contents. `jbctl trustcache list`
+always returns empty output and does not work for checking trustcache membership.
 
 ### Skill: Debug Why a Binary Is Being Killed
 

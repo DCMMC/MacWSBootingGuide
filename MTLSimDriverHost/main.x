@@ -2,11 +2,7 @@
 @import Foundation;
 @import Metal;
 #include <rootless.h>
-
-// Forward declarations for XPC types (header not available on-device)
-typedef NSObject *xpc_object_t;
-typedef xpc_object_t xpc_connection_t;
-#define XPC_CONNECTION_MACH_SERVICE_LISTENER (1ULL << 0)
+#include <xpc/xpc.h>
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end

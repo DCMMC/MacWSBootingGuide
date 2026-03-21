@@ -4,14 +4,9 @@
 @import Foundation;
 @import MachO;
 #import <IOKit/IOKitLib.h>
+#import <xpc/xpc.h>
 #import "interpose.h"
 #import "utils.h"
-
-// Forward declarations for XPC types (header not available on-device)
-typedef NSObject *xpc_object_t;
-typedef xpc_object_t xpc_connection_t;
-extern xpc_object_t xpc_dictionary_create(const char * const *keys, xpc_object_t const *values, size_t count);
-extern void xpc_dictionary_set_uint64(xpc_object_t xdict, const char *key, uint64_t value);
 
 // IOSurface
 typedef id IOSurfaceRef;

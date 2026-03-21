@@ -3,14 +3,8 @@
 @import Foundation;
 @import Metal;
 #import <rootless.h>
+#import <xpc/xpc.h>
 #import "utils.h"
-
-// Forward declarations for XPC types (header not available on-device)
-typedef NSObject *xpc_object_t;
-typedef xpc_object_t xpc_connection_t;
-#define XPC_CONNECTION_MACH_SERVICE_PRIVILEGED (1ULL << 1)
-extern xpc_connection_t xpc_connection_create(const char *name, dispatch_queue_t targetq);
-// xpc_add_bundle already declared in utils.h
 
 // #define FORCE_M1_DRIVER
 
