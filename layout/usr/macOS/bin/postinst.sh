@@ -138,19 +138,11 @@ add_all_trustcache /var/jb/usr/macOS/bin/launchdchrootexec
 add_all_trustcache /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
 add_all_trustcache /var/mnt/rootfs/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
 add_all_trustcache /var/mnt/rootfs/System/Tweaks/TweakLoader.dylib
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/ServicePlugins/IOHIDEventServicePlugin.plugin/Contents/MacOS/IOHIDEventServicePlugin
 add_all_trustcache "/var/mnt/rootfs/System/Library/CoreServices/Installer Progress.app/Contents/MacOS/Installer Progress"
 add_all_trustcache /var/mnt/rootfs/usr/lib/systemhook.dylib
 add_all_trustcache /var/jb/usr/lib/libroot.dylib
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset_base
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/AppleSPUHIDStatistics.plugin/Contents/MacOS/AppleSPUHIDStatistics
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/IOHIDEventSystemStatistics.plugin/Contents/MacOS/IOHIDEventSystemStatistics
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/IOHIDNXEventTranslatorSessionFilter.plugin/Contents/MacOS/IOHIDNXEventTranslatorSessionFilter
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/IOHIDDFREventFilter.plugin/Contents/MacOS/IOHIDDFREventFilter
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/SessionFilters/IOHIDRemoteSensorSessionFilter.plugin/Contents/MacOS/IOHIDRemoteSensorSessionFilter
-# add_all_trustcache /var/mnt/rootfs/System/Library/HIDPlugins/SessionFilters/IOAnalytics.plugin/Contents/MacOS/IOAnalytics
-# add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/TouchBarEvent.bundle
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/.jbroot/usr/lib/libroot.dylib
@@ -172,14 +164,6 @@ add_all_trustcache /var/mnt/rootfs/usr/bin/grep
 add_all_trustcache /var/mnt/rootfs/usr/bin/vim
 add_all_trustcache /var/mnt/rootfs/usr/bin/whoami
 add_all_trustcache /var/mnt/rootfs/sbin/mount
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/ardpackage
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/build_hd_index
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/distnotifyutil
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/sysinfocachegen
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/tccstate
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/Remote\ Desktop\ Message.app/Contents/MacOS/Remote\ Desktop\ Message
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/Remote\ Desktop\ Message.app/Contents/MacOS/Remote\ Desktop\ Message
-add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Support/Shared\ Screen\ Viewer.app/Contents/MacOS/Shared\ Screen\ Viewer
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
 add_all_trustcache /var/mnt/rootfs/usr/local/bin/OSXvnc-server
 if [ -d /var/mnt/rootfs/var/jb ] && [ ! "$(ls -A /var/mnt/rootfs/var/jb)" ]; then
