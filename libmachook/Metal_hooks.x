@@ -30,6 +30,12 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 }
 @end
 
+// MTLFakeDevice creates a new ObjC class.  On arm64e, on-device lld emits a
+// plain (non-auth) chained-fixup rebase for class_t->data, but macOS libobjc
+// expects an address-diversified autda pointer → EXC_BREAKPOINT (PAC trap DA)
+// in readClass during map_images.  Exclude the entire class from arm64e so the
+// arm64e slice has no class_t entries, letting the arm64 slice handle Metal.
+#ifndef __arm64e__
 static id(*MTLCreateSimulatorDevice)(void);
 @interface MTLFakeDevice : _MTLDevice
 @end
@@ -177,6 +183,7 @@ static id(*MTLCreateSimulatorDevice)(void);
     return MTLFakeDevice.class;
 #endif
 }
+#endif // !__arm64e__
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end
@@ -213,8 +220,10 @@ __attribute__((constructor)) static void InitMetalHooks() {
         CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
     });
     
+#ifndef __arm64e__
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
     %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
+#endif
     
     MSImageRef xpc = MSGetImageByName("/usr/lib/system/libxpc.dylib");
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
