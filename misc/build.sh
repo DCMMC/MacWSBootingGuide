@@ -28,7 +28,4 @@ codesign -f -s - libmachook.dylib
 scp -P $DEVICE_PORT libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook.dylib
 rm libmachook.dylib
 
-# Run postinst.sh on device
-ssh -p $DEVICE_PORT root@$DEVICE_IP "bash /var/jb/usr/macOS/bin/postinst.sh"
-
 echo "==> Done!"

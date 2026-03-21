@@ -40,7 +40,4 @@ sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook
 echo "==> Re-signing libmachook.dylib..."
 sudo ldid -S/var/jb/usr/macOS/bin/entitlements.plist -M /var/jb/usr/macOS/lib/libmachook.dylib
 
-echo "==> Running postinst.sh..."
-sudo bash /var/jb/usr/macOS/bin/postinst.sh
-
 echo "==> Done! Package installed successfully."
