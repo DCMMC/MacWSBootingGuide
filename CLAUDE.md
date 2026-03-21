@@ -10,15 +10,36 @@ MacWSBootingGuide is a WIP jailbreak project that enables running macOS's Window
 
 This project uses [Theos](https://theos.dev).
 
-### Build on iOS (on-device)
+### Build on iOS (on-device) via SSH
 
-If you have Theos installed on the jailbroken device:
+Theos is installed at `/var/jb/var/mobile/theos`. The project lives at
+`/var/jb/var/mobile/MacWSBootingGuide`. SSH does **not** inherit `THEOS` from
+the device's interactive shell, so pass it explicitly:
 
 ```bash
-# Build, package, and install (from project directory)
-bash misc/build_on_ios.sh
+# From macOS, over SSH (one-liner):
+ssh -p 2222 root@192.168.5.8 \
+  'THEOS=/var/jb/var/mobile/theos bash /var/jb/var/mobile/MacWSBootingGuide/misc/build_on_ios.sh'
+```
 
-# Or manually:
+`build_on_ios.sh` does: clean → make → package → dpkg install → set macOS
+build version → fix arm64e interpose section → re-sign → postinst.
+
+After a successful build, verify with:
+```bash
+ssh -p 2222 root@192.168.5.8 'sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c "echo hi"'
+# Expected output: "chdir: No such file or directory" (harmless), then "hi", exit 0
+```
+
+Git operations over SSH fail due to host-key policy; use `git reset --hard
+origin/main` to sync (fetch works with HTTPS, push does not from device).
+
+### Build on iOS (on-device) manually
+
+```bash
+# On the device shell with THEOS set:
+export THEOS=/var/jb/var/mobile/theos
+cd /var/jb/var/mobile/MacWSBootingGuide
 make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
 sudo dpkg -i packages/*.deb
 sudo bash /var/jb/usr/macOS/bin/postinst.sh
@@ -484,3 +505,119 @@ done
 `sys`, `os`, `json`, `re`, `math`, `hashlib`, `sqlite3`, `ssl`, `zlib`, `lzma`, `bz2`, `csv`,
 `ctypes`, `decimal`, `readline`, `multiprocessing`, `concurrent.futures`,
 `requests` (pip), `charset_normalizer` (pip), `certifi` (pip), `urllib3` (pip)
+
+---
+
+## Debugging Techniques
+
+### Skill: Reproduce the Basic Sanity Test
+
+```bash
+# Quick smoke test — must exit 0 and print "hi":
+ssh -p 2222 root@192.168.5.8 \
+  'sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c "echo hi" 2>&1; echo "exit: $?"'
+# "chdir: No such file or directory" on stderr is harmless (falls back to /).
+# Any non-zero exit or SIGTRAP means libmachook is broken.
+```
+
+### Skill: Read Crash Reports (iOS CrashReporter)
+
+macOS binaries running inside the chroot are reported by iOS CrashReporter:
+
+```bash
+# List recent bash crashes:
+ls -t /private/var/mobile/Library/Logs/CrashReporter/bash*.ips | head -5
+
+# Key fields to extract from a .ips crash report (JSON format):
+#   exception.type        — EXC_BREAKPOINT = PAC trap or __builtin_trap
+#   exception.signal      — SIGTRAP = Trace/BPT trap
+#   threads[].threadState.esr.description — "(Breakpoint) pointer authentication trap DA"
+#   threads[].frames[].symbol — call stack symbols
+#   usedImages[].path     — loaded images at crash time
+
+# Quick parse (procursus python3, NOT inside chroot):
+python3 -c "
+import json, sys
+data = json.loads(open(sys.argv[1]).readlines()[1])   # skip first line (metadata)
+print('Exception:', data['exception'])
+print('ESR:', data['threads'][0]['threadState'].get('esr', {}))
+for f in data['threads'][0]['frames'][:10]:
+    print(' ', f.get('symbol','?'), '+', f.get('symbolLocation',0))
+" /private/var/mobile/Library/Logs/CrashReporter/bash-XXXX.ips
+```
+
+**Common crash signatures:**
+
+| Signal | ESR description | Cause |
+|--------|----------------|-------|
+| SIGTRAP / EXC_BREAKPOINT | pointer authentication trap DA | `autda` on unsigned or wrongly-signed pointer — ObjC class data PAC mismatch |
+| SIGTRAP / EXC_BREAKPOINT | (none / BRK) | `abort()`, ObjC uncaught exception, `__builtin_trap()` |
+| SIGKILL (exit 137) | — | AMFI denial or sandbox violation |
+
+### Skill: Inspect Mach-O Fixup Format
+
+```python
+# Check LC_DYLD_INFO_ONLY vs LC_DYLD_CHAINED_FIXUPS for each slice:
+python3 - /path/to/binary <<'EOF'
+import struct, sys
+data = open(sys.argv[1],'rb').read()
+LC_DYLD_INFO_ONLY=0x80000022; LC_DYLD_CHAINED_FIXUPS=0x80000034
+nfat = struct.unpack_from('>I', data, 4)[0]
+for i in range(nfat):
+    ct,cs,off,sz,_ = struct.unpack_from('>IIIII', data, 8+i*20)
+    name = {(0x0100000c,0):'arm64',(0x0100000c,2):'arm64e'}.get((ct,cs&0xFF),'?')
+    hdr = struct.unpack_from('<IIIIIIII', data, off)
+    cmd_off = off + 32
+    for _ in range(hdr[4]):
+        cmd,sz2 = struct.unpack_from('<II', data, cmd_off)
+        if cmd==LC_DYLD_CHAINED_FIXUPS: print(f'{name}: LC_DYLD_CHAINED_FIXUPS')
+        if cmd==LC_DYLD_INFO_ONLY:      print(f'{name}: LC_DYLD_INFO_ONLY')
+        cmd_off += sz2
+EOF
+```
+
+**arm64e + LC_DYLD_INFO_ONLY**: lld on-device stores ObjC `class_t->data` as a
+PAC-pre-signed value (iOS keys).  macOS libobjc's `autda` fails → PAC trap.
+
+**arm64e + LC_DYLD_CHAINED_FIXUPS** (what `-Wl,-fixup_chains` gives): lld stores
+`class_t->data` as a plain non-auth rebase.  macOS libobjc's `autda` still fails
+on an unsigned pointer.  **Workaround**: guard ObjC class definitions with
+`#ifndef __arm64e__` so no `class_t` entries exist in the arm64e slice.
+
+### Skill: Attach lldb to a Stuck macOS Process
+
+macOS binaries that hang (waiting for XPC / WindowServer / Metal init) can be
+debugged by attaching iOS lldb from the iOS shell:
+
+```bash
+# 1. Launch the process in background from a chroot session:
+sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c \
+  "export PATH=/usr/local/bin:/usr/bin:/bin; /path/to/MacOS/Binary &" &
+
+# 2. Find its PID (it is a macOS arm64e process):
+sleep 2 && pgrep -n Binary
+
+# 3. Attach lldb (iOS-side lldb at /var/jb/usr/bin/lldb):
+sudo /var/jb/usr/bin/lldb -p <PID>
+
+# 4. Inside lldb — get all thread backtraces to find what's blocking:
+(lldb) thread backtrace all
+(lldb) process interrupt     # pause if running
+(lldb) bt all                # same as thread backtrace all
+```
+
+Key lldb commands for diagnosing hangs:
+- `thread list` — list all threads and their current state
+- `thread backtrace all` — full stack for every thread
+- `frame info` — details about current frame
+- `p (char*)dlerror()` — check last dyld/dl error
+- `image list` — all loaded images (check if Metal/libmachook loaded)
+- `process detach` — detach without killing
+
+### Known arm64e libmachook Issues (on-device lld)
+
+| Problem | Root cause | Fix |
+|---------|-----------|-----|
+| PAC trap in `readClass` on `MTLFakeDevice` | on-device lld emits plain non-auth chained fixup for `class_t->data`; macOS libobjc does `autda` → trap | Guard `MTLFakeDevice` with `#ifndef __arm64e__` in `Metal_hooks.x` |
+| `__interpose` hooks silently not applied | on-device lld emits `auth_rebase`/`auth_bind` in `__DATA,__interpose` with LC_DYLD_INFO_ONLY; macOS classic fixup path misinterprets PAC bits | `misc/fix_arm64e_interpose.py` strips PAC bits (needed for LC_DYLD_INFO_ONLY); with LC_DYLD_CHAINED_FIXUPS (`-fixup_chains`) dyld handles it natively |
+| Arm64-only dylib rejected | macOS arm64e dyld rejects DYLD_INSERT_LIBRARIES dylib without arm64e slice | Keep `ARCHS = arm64 arm64e` in `libmachook/Makefile` |
