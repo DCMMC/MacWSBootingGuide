@@ -16,15 +16,16 @@ echo "==> Cleaning previous build..."
 make clean 2>/dev/null || true
 
 echo "==> Building..."
-# libmachook/Makefile sets ARCHS=arm64 and TARGET=iphone:clang:latest:14.0 to
-# prevent two on-device lld bugs:
-#   1. lld generates broken arm64e __DATA,__interpose chained fixup entries that
-#      corrupt dyld's GOT (PAC failure, EXC_BAD_ACCESS code=50).
+# libmachook/Makefile sets ARCHS=arm64 arm64e, TARGET=iphone:clang:latest:14.0,
+# and LDFLAGS=-fixup_chains to fix two on-device lld issues:
+#   1. On-device lld defaults to LC_DYLD_INFO_ONLY for arm64e.  Without -fixup_chains,
+#      ObjC class data pointers (e.g. MTLFakeDevice) are PAC-signed with iOS keys but
+#      the classic rebase path cannot re-sign them at load time.  macOS arm64e libobjc
+#      then fails autda → EXC_BREAKPOINT (PAC trap DA) in readClass during map_images.
+#      -fixup_chains forces LC_DYLD_CHAINED_FIXUPS so macOS dyld re-signs PAC at
+#      runtime with the correct macOS keys.
 #   2. Without TARGET set, Theos defaults to iOS 9.0, producing old-style
-#      LC_VERSION_MIN_IPHONEOS load commands and old reloc format. macOS dyld
-#      may not process the __interpose section correctly in that format, so the
-#      objc_addExceptionHandler stubs in objc_hooks.c don't apply, causing
-#      SIGTRAP inside the macOS chroot.
+#      LC_VERSION_MIN_IPHONEOS load commands. macOS dyld rejects these.
 # Other subprojects keep their own ARCHS (arm64+arm64e is fine since they use
 # Substrate hooks, not DYLD_INTERPOSE).
 make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1

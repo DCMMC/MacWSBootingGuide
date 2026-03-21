@@ -78,7 +78,6 @@ def find_section(data, slice_offset, endian, seg_name, sect_name):
             # maxprot initprot nsects flags
             seg_fmt = f'{endian}II16sQQQQIIII'
             seg = struct.unpack_from(seg_fmt, data, cmd_offset)
-            print(f"    [find_section] segment: {seg[2]!r} looking for {seg_name_bytes!r} match={seg[2] == seg_name_bytes}")
             if seg[2] == seg_name_bytes:
                 nsects = seg[9]
                 sect_off = cmd_offset + struct.calcsize(seg_fmt)
@@ -88,7 +87,6 @@ def find_section(data, slice_offset, endian, seg_name, sect_name):
                 sect_size_each = struct.calcsize(sect_fmt)
                 for i in range(nsects):
                     sect = struct.unpack_from(sect_fmt, data, sect_off + i * sect_size_each)
-                    print(f"    [find_section]   section[{i}]: {sect[0]!r} match={sect[0] == sect_name_bytes}")
                     if sect[0] == sect_name_bytes:
                         return sect[4], sect[3]  # file offset, size
         cmd_offset += cmdsize
