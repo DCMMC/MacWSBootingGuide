@@ -1,5 +1,5 @@
-TARGET := macosx:clang:latest:13.0
-ARCHS = arm64
+TARGET := iphone:clang:latest:14.0
+ARCHS = arm64 arm64e
 include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = libmachook
