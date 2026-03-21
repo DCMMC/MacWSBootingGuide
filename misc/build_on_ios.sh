@@ -28,10 +28,14 @@ echo "==> Building..."
 #      LC_VERSION_MIN_IPHONEOS load commands. macOS dyld rejects these.
 # Other subprojects keep their own ARCHS (arm64+arm64e is fine since they use
 # Substrate hooks, not DYLD_INTERPOSE).
-make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1
+# On-device lld + -Wl,-fixup_chains allows ObjC in the arm64e slice; enable it
+# (see Metal_hooks.x — cross-compiles still omit MTLFakeDevice from arm64e).
+make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+	libmachook_CFLAGS+="-DLIBMACHOOK_ON_DEVICE_BUILD=1"
 
 echo "==> Packaging..."
-make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
+make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+	libmachook_CFLAGS+="-DLIBMACHOOK_ON_DEVICE_BUILD=1" package
 
 # Find the built .deb
 DEB=$(ls -t packages/*.deb 2>/dev/null | head -1)

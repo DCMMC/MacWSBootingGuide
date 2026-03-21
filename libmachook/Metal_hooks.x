@@ -35,7 +35,9 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 // expects an address-diversified autda pointer → EXC_BREAKPOINT (PAC trap DA)
 // in readClass during map_images.  Exclude the entire class from arm64e so the
 // arm64e slice has no class_t entries, letting the arm64 slice handle Metal.
-#ifndef __arm64e__
+// On-device builds (misc/build_on_ios.sh) pass -DLIBMACHOOK_ON_DEVICE_BUILD: lld
+// uses -fixup_chains there, so arm64e can include this code.
+#if !defined(__arm64e__) || defined(LIBMACHOOK_ON_DEVICE_BUILD)
 static id(*MTLCreateSimulatorDevice)(void);
 @interface MTLFakeDevice : _MTLDevice
 @end
@@ -183,7 +185,7 @@ static id(*MTLCreateSimulatorDevice)(void);
     return MTLFakeDevice.class;
 #endif
 }
-#endif // !__arm64e__
+#endif // arm64e guard
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end
@@ -220,7 +222,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
     });
     
-#ifndef __arm64e__
+#if !defined(__arm64e__) || defined(LIBMACHOOK_ON_DEVICE_BUILD)
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
     %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
 #endif
