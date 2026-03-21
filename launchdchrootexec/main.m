@@ -1,4 +1,5 @@
 @import Darwin;
+#import <copyfile.h>
 
 #define CS_LAUNCH_TYPE_SYSTEM_SERVICE 1
 int posix_spawnattr_set_launch_type_np(posix_spawnattr_t *attr, int launch_type);
@@ -31,7 +32,34 @@ int main(int argc, char *argv[], char *envp[]) {
         chdir("/");
     }
     // fprintf(stderr, "after chdir %s\n", currentPath);
-    
+
+    // Copy hook to /tmp so dyld mmap is on a normal writable file (avoids CODESIGNING
+    // kills seen when loading from some rootfs/bindfs layouts). Source: postinst copy
+    // first, then jb thin, then jb fat.
+    {
+        const char *dstHook = "/tmp/.libmachook.dylib";
+        const char *local = "/usr/local/lib/libmachook.dylib";
+        const char *jbThin = "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib";
+        const char *jbFat = "/var/jb/usr/macOS/lib/libmachook.dylib";
+        const char *src = NULL;
+        if(access(local, R_OK) == 0) {
+            src = local;
+        } else if(access(jbThin, R_OK) == 0) {
+            src = jbThin;
+        } else if(access(jbFat, R_OK) == 0) {
+            src = jbFat;
+        }
+        if(src != NULL) {
+            if(copyfile(src, dstHook, NULL, (copyfile_flags_t)(COPYFILE_DATA | COPYFILE_UNLINK)) == 0) {
+                setenv("DYLD_INSERT_LIBRARIES", dstHook, 1);
+            } else {
+                setenv("DYLD_INSERT_LIBRARIES", src, 1);
+            }
+        } else {
+            setenv("DYLD_INSERT_LIBRARIES", local, 1);
+        }
+    }
+
     if(setgid(gid) < 0) {
         perror("setgid");
         return 1;
@@ -42,7 +70,6 @@ int main(int argc, char *argv[], char *envp[]) {
         return 1;
     }
     
-    setenv("DYLD_INSERT_LIBRARIES", "/usr/local/lib/libmachook.dylib", 1);
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
