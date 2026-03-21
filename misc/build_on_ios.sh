@@ -47,6 +47,16 @@ sudo dpkg -i "$DEB"
 echo "==> Setting macOS build version on libmachook.dylib..."
 sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook.dylib
 
+# Fix arm64e __DATA,__interpose entries.
+# On-device lld generates PAC-encoded (auth_rebase/auth_bind) values in the
+# interpose slots even though the binary uses LC_DYLD_INFO_ONLY.  macOS dyld's
+# classic fixup path doesn't understand the PAC encoding and silently skips the
+# hooks (sysctlbyname, objc_addExceptionHandler, etc.), causing a SIGTRAP crash.
+# This script strips the PAC bits, leaving plain pointer values for dyld to
+# rebase/bind in the normal LC_DYLD_INFO_ONLY way.
+echo "==> Fixing arm64e interpose section in libmachook.dylib..."
+sudo python3 "$SCRIPT_DIR/fix_arm64e_interpose.py" /var/jb/usr/macOS/lib/libmachook.dylib
+
 # Re-sign after modifying
 echo "==> Re-signing libmachook.dylib..."
 sudo ldid -S /var/jb/usr/macOS/lib/libmachook.dylib
