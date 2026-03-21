@@ -49,10 +49,6 @@ sudo python3 misc/set_macos_version.py /var/jb/usr/macOS/lib/libmachook.dylib
 # Required: re-sign after binary was modified above
 sudo ldid -S /var/jb/usr/macOS/lib/libmachook.dylib
 
-# Optional (no-op with -fixup_chains): would fix PAC-encoded __interpose entries
-# in LC_DYLD_INFO_ONLY arm64e slices; safe to run but currently does nothing
-# sudo python3 misc/fix_arm64e_interpose.py /var/jb/usr/macOS/lib/libmachook.dylib
-
 sudo bash /var/jb/usr/macOS/bin/postinst.sh
 ```
 
@@ -630,5 +626,4 @@ Key lldb commands for diagnosing hangs:
 | Problem | Root cause | Fix |
 |---------|-----------|-----|
 | PAC trap in `readClass` on `MTLFakeDevice` | on-device lld emits plain non-auth chained fixup for `class_t->data`; macOS libobjc does `autda` → trap | Guard `MTLFakeDevice` with `#ifndef __arm64e__` in `Metal_hooks.x` |
-| `__interpose` hooks silently not applied | on-device lld emits `auth_rebase`/`auth_bind` in `__DATA,__interpose` with LC_DYLD_INFO_ONLY; macOS classic fixup path misinterprets PAC bits | `misc/fix_arm64e_interpose.py` strips PAC bits (needed for LC_DYLD_INFO_ONLY); with LC_DYLD_CHAINED_FIXUPS (`-fixup_chains`) dyld handles it natively |
 | Arm64-only dylib rejected | macOS arm64e dyld rejects DYLD_INSERT_LIBRARIES dylib without arm64e slice | Keep `ARCHS = arm64 arm64e` in `libmachook/Makefile` |
