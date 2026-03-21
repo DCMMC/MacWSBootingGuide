@@ -1,5 +1,4 @@
 @import Darwin;
-#import <copyfile.h>
 
 #define CS_LAUNCH_TYPE_SYSTEM_SERVICE 1
 int posix_spawnattr_set_launch_type_np(posix_spawnattr_t *attr, int launch_type);
@@ -33,11 +32,9 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     // fprintf(stderr, "after chdir %s\n", currentPath);
 
-    // Copy hook to /tmp so dyld mmap is on a normal writable file (avoids CODESIGNING
-    // kills seen when loading from some rootfs/bindfs layouts). Source: postinst copy
-    // first, then jb thin, then jb fat.
+    // Prefer chroot copy from postinst (thin arm64e). Do not copy to /tmp here — copyfile
+    // can yield a bad image and macOS dyld SIGSEGVs while mapping the insert library.
     {
-        const char *dstHook = "/tmp/.libmachook.dylib";
         const char *local = "/usr/local/lib/libmachook.dylib";
         const char *jbThin = "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib";
         const char *jbFat = "/var/jb/usr/macOS/lib/libmachook.dylib";
@@ -50,13 +47,7 @@ int main(int argc, char *argv[], char *envp[]) {
             src = jbFat;
         }
         if(src != NULL) {
-            if(copyfile(src, dstHook, NULL, (copyfile_flags_t)(COPYFILE_DATA | COPYFILE_UNLINK)) == 0) {
-                setenv("DYLD_INSERT_LIBRARIES", dstHook, 1);
-            } else {
-                setenv("DYLD_INSERT_LIBRARIES", src, 1);
-            }
-        } else {
-            setenv("DYLD_INSERT_LIBRARIES", local, 1);
+            setenv("DYLD_INSERT_LIBRARIES", src, 1);
         }
     }
 
