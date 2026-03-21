@@ -42,6 +42,17 @@ export THEOS=/var/jb/var/mobile/theos
 cd /var/jb/var/mobile/MacWSBootingGuide
 make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
 sudo dpkg -i packages/*.deb
+
+# Required: patch LC_BUILD_VERSION from iOS → macOS 13.0; macOS dyld rejects iOS platform tag
+sudo python3 misc/set_macos_version.py /var/jb/usr/macOS/lib/libmachook.dylib
+
+# Required: re-sign after binary was modified above
+sudo ldid -S /var/jb/usr/macOS/lib/libmachook.dylib
+
+# Optional (no-op with -fixup_chains): would fix PAC-encoded __interpose entries
+# in LC_DYLD_INFO_ONLY arm64e slices; safe to run but currently does nothing
+# sudo python3 misc/fix_arm64e_interpose.py /var/jb/usr/macOS/lib/libmachook.dylib
+
 sudo bash /var/jb/usr/macOS/bin/postinst.sh
 ```
 
