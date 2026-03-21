@@ -16,10 +16,16 @@ echo "==> Cleaning previous build..."
 make clean 2>/dev/null || true
 
 echo "==> Building..."
-make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1
+# Build arm64 only: on-device Theos uses lld (not Apple ld), which generates
+# arm64e __DATA,__interpose chained fixup entries in a format that iOS dyld
+# cannot process correctly, causing a PAC failure (EXC_BAD_ACCESS code=50) at
+# dyld`kdebug_is_enabled when loading the dylib into an arm64e process.
+# arm64e processes (macOS bash inside the chroot) fall back to the arm64 slice
+# seamlessly, so arm64-only is correct for on-device builds.
+make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 ARCHS=arm64
 
 echo "==> Packaging..."
-make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
+make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 ARCHS=arm64 package
 
 # Find the built .deb
 DEB=$(ls -t packages/*.deb 2>/dev/null | head -1)
