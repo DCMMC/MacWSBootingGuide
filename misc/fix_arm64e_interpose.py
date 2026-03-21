@@ -62,8 +62,8 @@ def extract_auth_rebase_target(val):
 
 def find_section(data, slice_offset, endian, seg_name, sect_name):
     """Return (offset_in_file, size) of a named section, or (None, None)."""
-    seg_name  = seg_name.ljust(16, '\x00').encode()
-    sect_name = sect_name.ljust(16, '\x00').encode()
+    seg_name_bytes  = seg_name.encode().ljust(16, b'\x00')
+    sect_name_bytes = sect_name.encode().ljust(16, b'\x00')
 
     header_fmt = f'{endian}IIIIIIII'
     header_size = struct.calcsize(header_fmt)
@@ -78,7 +78,8 @@ def find_section(data, slice_offset, endian, seg_name, sect_name):
             # maxprot initprot nsects flags
             seg_fmt = f'{endian}II16sQQQQIIII'
             seg = struct.unpack_from(seg_fmt, data, cmd_offset)
-            if seg[2] == seg_name:
+            print(f"    [find_section] segment: {seg[2]!r} looking for {seg_name_bytes!r} match={seg[2] == seg_name_bytes}")
+            if seg[2] == seg_name_bytes:
                 nsects = seg[9]
                 sect_off = cmd_offset + struct.calcsize(seg_fmt)
                 # section_64: sectname[16] segname[16] addr size offset align
@@ -87,7 +88,8 @@ def find_section(data, slice_offset, endian, seg_name, sect_name):
                 sect_size_each = struct.calcsize(sect_fmt)
                 for i in range(nsects):
                     sect = struct.unpack_from(sect_fmt, data, sect_off + i * sect_size_each)
-                    if sect[0] == sect_name:
+                    print(f"    [find_section]   section[{i}]: {sect[0]!r} match={sect[0] == sect_name_bytes}")
+                    if sect[0] == sect_name_bytes:
                         return sect[4], sect[3]  # file offset, size
         cmd_offset += cmdsize
 
