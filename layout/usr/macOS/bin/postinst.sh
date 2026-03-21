@@ -2,58 +2,94 @@ cd $(realpath $HOME/../..)/usr/macOS
 
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 
+# ─── Trustcache optimization: cache existing hashes ─────────────────────────
+# Dump trustcache once at startup to avoid repeated jbctl calls
+TRUSTCACHE_FILE="/tmp/postinst_trustcache_$$"
+jbctl trustcache list 2>/dev/null | tr '[:upper:]' '[:lower:]' > "$TRUSTCACHE_FILE"
+trap "rm -f '$TRUSTCACHE_FILE'" EXIT
+
+is_trusted() {
+    local cdhash="$1"
+    [ -z "$cdhash" ] && return 1
+    grep -qi "$cdhash" "$TRUSTCACHE_FILE" 2>/dev/null
+}
+
+trust_cdhash() {
+    local cdhash="$1"
+    local path="$2"
+    local arch="$3"
+    if is_trusted "$cdhash"; then
+        echo "[SKIP] $path [$arch]: $cdhash (already trusted)"
+        return 0
+    fi
+    echo "[ADD]  $path [$arch]: $cdhash"
+    jbctl trustcache add "$cdhash"
+    # Add to cache so we don't re-add duplicates within this run
+    echo "$cdhash" >> "$TRUSTCACHE_FILE"
+}
+
 # Sign a binary with the project entitlements AND register all its CDHashes.
-# Use this for binaries that need re-signing (e.g. macOS rootfs binaries for Homebrew/MacPorts).
-# Idempotent: safe to call on every boot or after re-install.
+# Optimized: single ldid call to get all hashes, skip if all trusted.
 sign_and_trustcache() {
     local path="$1"
     [ -f "$path" ] || return
-    ldid -S"$ENT" -M "$path" 2>/dev/null
-    for arch in arm64 arm64e x86_64; do
-        local cdhash
-        cdhash=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
-        if [ -n "$cdhash" ]; then
-            echo "Trusting $path [$arch]: $cdhash"
-            jbctl trustcache add "$cdhash"
+
+    # Get all CDHashes in one ldid call (no -arch = all slices)
+    local hashes
+    hashes=$(ldid -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+    [ -z "$hashes" ] && return  # Not a Mach-O file
+
+    # Check if ALL hashes are already trusted
+    local dominated=1
+    while IFS= read -r h; do
+        [ -z "$h" ] && continue
+        if ! is_trusted "$h"; then
+            dominated=0
+            break
         fi
-    done
+    done <<< "$hashes"
+
+    if [ "$dominated" -eq 1 ]; then
+        return 0  # Silent skip - all trusted
+    fi
+
+    # Sign and get new hashes
+    ldid -S"$ENT" -M "$path" 2>/dev/null || return
+    hashes=$(ldid -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+
+    # Add all hashes
+    while IFS= read -r h; do
+        [ -z "$h" ] && continue
+        trust_cdhash "$h" "$path" "all"
+    done <<< "$hashes"
 }
 
 add_trustcache() {
     local path="$1"
     local cdhash
     cdhash=$(ldid -arch arm64 -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
-    if [ -n "$cdhash" ]; then
-        echo "Adding $path cdhash: $cdhash"
-        jbctl trustcache add "$cdhash"
-    fi
+    [ -n "$cdhash" ] && trust_cdhash "$cdhash" "$path" "arm64"
 }
 
 add_arm64e_trustcache() {
     local path="$1"
     local cdhash
     cdhash=$(ldid -arch arm64e -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
-    if [ -n "$cdhash" ]; then
-        echo "Adding $path cdhash: $cdhash"
-        jbctl trustcache add "$cdhash"
-    fi
+    [ -n "$cdhash" ] && trust_cdhash "$cdhash" "$path" "arm64e"
 }
 
 add_x86_64_trustcache() {
     local path="$1"
     local cdhash
     cdhash=$(ldid -arch x86_64 -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
-    if [ -n "$cdhash" ]; then
-        echo "Adding $path cdhash: $cdhash"
-        jbctl trustcache add "$cdhash"
-    fi
+    [ -n "$cdhash" ] && trust_cdhash "$cdhash" "$path" "x86_64"
 }
 
 add_all_trustcache() {
     local path="$1"
-    add_trustcache $1
-    add_arm64e_trustcache $1
-    add_x86_64_trustcache $1
+    add_trustcache "$path"
+    add_arm64e_trustcache "$path"
+    add_x86_64_trustcache "$path"
 }
 
 add_trustcache "/var/jb/usr/macOS/bin/login"
@@ -254,11 +290,26 @@ if [ -d "$ROOTFS/opt/local" ]; then
     find "$PY313/lib" -type f \( -name "*.so" -o -name "*.dylib" \) 2>/dev/null \
         | while read f; do sign_and_trustcache "$f"; done
 
-    # Re-register CDHashes for all other MacPorts Mach-O binaries/dylibs.
-    # This loop is safe to run on every boot (sign_and_trustcache skips non-Mach-O).
-    find "$ROOTFS/opt/local/bin" "$ROOTFS/opt/local/sbin" "$ROOTFS/opt/local/lib" \
-         "$ROOTFS/opt/local/libexec" \
-         -type f 2>/dev/null | while read f; do
-        sign_and_trustcache "$f"
+    # Re-register CDHashes for MacPorts Mach-O binaries/dylibs.
+    # Only process files with Mach-O extensions to skip scripts/text files.
+    echo "[INFO] Scanning MacPorts for Mach-O files..."
+    MACHO_COUNT=0
+    for dir in "$ROOTFS/opt/local/bin" "$ROOTFS/opt/local/sbin"; do
+        [ -d "$dir" ] || continue
+        for f in "$dir"/*; do
+            [ -f "$f" ] || continue
+            # Skip shell scripts (check for #! or text files)
+            head -c2 "$f" 2>/dev/null | grep -q '^#!' && continue
+            sign_and_trustcache "$f"
+            MACHO_COUNT=$((MACHO_COUNT + 1))
+        done
     done
+    # Process only .dylib, .so, .bundle in lib directories
+    find "$ROOTFS/opt/local/lib" "$ROOTFS/opt/local/libexec" \
+         -type f \( -name "*.dylib" -o -name "*.so" -o -name "*.bundle" -o -name "*.a" \) \
+         2>/dev/null | while read f; do
+        sign_and_trustcache "$f"
+        MACHO_COUNT=$((MACHO_COUNT + 1))
+    done
+    echo "[INFO] Processed $MACHO_COUNT MacPorts files"
 fi

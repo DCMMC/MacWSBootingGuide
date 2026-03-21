@@ -8,13 +8,25 @@ MacWSBootingGuide is a WIP jailbreak project that enables running macOS's Window
 
 ## Build
 
-This project uses [Theos](https://theos.dev). Building is done from macOS:
+This project uses [Theos](https://theos.dev).
+
+### Build on iOS (on-device)
+
+If you have Theos installed on the jailbroken device:
 
 ```bash
-# Build, package, and install to device (edit DEVICE_IP in misc/build.sh first)
-bash misc/build.sh
+# Build, package, and install (from project directory)
+bash misc/build_on_ios.sh
 
-# Or build manually
+# Or manually:
+make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
+sudo dpkg -i packages/*.deb
+sudo bash /var/jb/usr/macOS/bin/postinst.sh
+```
+
+### Build on macOS (cross-compile)
+
+```bash
 gmake FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless package install \
   THEOS_DEVICE_IP=<device_ip> THEOS_DEVICE_PORT=2222 GO_EASY_ON_ME=1
 ```
