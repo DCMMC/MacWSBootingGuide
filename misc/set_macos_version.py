@@ -126,7 +126,9 @@ def process_file(path):
     if magic == FAT_MAGIC or magic == FAT_MAGIC_64:
         # Fat binary
         is_64 = (magic == FAT_MAGIC_64)
-        arch_fmt = '>IIIII' if not is_64 else '>QQQQQ'
+        # fat_arch:    cputype(I) cpusubtype(I) offset(I) size(I) align(I)     = 20 bytes
+        # fat_arch_64: cputype(I) cpusubtype(I) offset(Q) size(Q) align(I) reserved(I) = 32 bytes
+        arch_fmt = '>IIIII' if not is_64 else '>IIQQII'
         arch_size = struct.calcsize(arch_fmt)
 
         nfat_arch = struct.unpack('>I', data[4:8])[0]
@@ -135,7 +137,7 @@ def process_file(path):
         arch_offset = 8
         for i in range(nfat_arch):
             if is_64:
-                cputype, cpusubtype, offset, size, align = struct.unpack_from('>QQQQQ', data, arch_offset)
+                cputype, cpusubtype, offset, size, align, _reserved = struct.unpack_from('>IIQQII', data, arch_offset)
             else:
                 cputype, cpusubtype, offset, size, align = struct.unpack_from('>IIIII', data, arch_offset)
 
