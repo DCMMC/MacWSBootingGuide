@@ -6,6 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MacWSBootingGuide is a WIP jailbreak project that enables running macOS's WindowServer (and macOS GUI applications) on jailbroken iOS/iPadOS devices (arm64, Dopamine rootless jailbreak). It works by chrooting into a bind-mounted macOS filesystem and using dyld interpositioning to patch incompatible system calls and framework behaviors at runtime.
 
+## Agent policy: edits outside this repository
+
+Before modifying **any** file that lives **outside** this git working tree (for example on-device paths under `/var/jb/`, `/var/mnt/rootfs/`, or other host paths not inside the clone), **back up** the original (copy, `cp -a`, tarball, or equivalent) so it can be restored. After making such changes, **record** them in a durable place—append to `file_changed.md` in the repo root (date, absolute path, one-line summary), or ensure the same detail appears in the commit message if the session only touched tracked files afterward. Do not edit unmanaged locations without both backup and a written record.
+
+**Do not** patch, replace, or re-sign **Apple system libraries** shipped on the macOS rootfs (for example `libsystem_darwin.dylib`, `libSystem.B.dylib`, or other `/usr/lib/system/*` dylibs). Prefer hooks in `libmachook`, jb-installed binaries, and paths under `/usr/local` on the rootfs instead.
+
 ## Build
 
 This project uses [Theos](https://theos.dev).

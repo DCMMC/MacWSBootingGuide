@@ -1,6 +1,6 @@
 #!/bin/bash
-# Default post-install for dev builds: jb hook + launcher + chroot insert + libsystem_darwin
-# patch + bash trustcache. Skips MacPorts scan, long rootfs lists, dyld_shared_cache hashes, etc.
+# Default post-install for dev builds: jb hook + launcher + chroot insert copy + bash trustcache.
+# Skips MacPorts scan, long rootfs lists, dyld_shared_cache hashes, etc.
 # For the full signing pass use: sudo bash /var/jb/usr/macOS/bin/postinst.sh
 # Usage: sudo bash /var/jb/usr/macOS/bin/postinst_simple.sh
 
@@ -49,13 +49,6 @@ sign_then_trust_all() {
 }
 
 echo "==> postinst_simple: jb Mach-O + chroot libmachook + bash"
-
-LSDARWIN="/var/mnt/rootfs/usr/lib/system/libsystem_darwin.dylib"
-if [ -f "$LSDARWIN" ] && command -v python3 >/dev/null 2>&1; then
-	python3 /var/jb/usr/macOS/bin/patch_libsystem_darwin_os_variant.py "$LSDARWIN" || echo "[WARN] patch_libsystem_darwin failed" >&2
-	ldid -S"$ENT" -M "$LSDARWIN" 2>/dev/null || true
-	add_all_trustcache "$LSDARWIN"
-fi
 
 sign_then_trust_all "/var/jb/usr/macOS/lib/libmachook.dylib"
 [ -f "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib" ] && sign_then_trust_all "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib"
