@@ -79,7 +79,7 @@ def find_section(data, slice_offset, endian, seg_name, sect_name):
             seg_fmt = f'{endian}II16sQQQQIIII'
             seg = struct.unpack_from(seg_fmt, data, cmd_offset)
             if seg[2] == seg_name:
-                nsects = seg[10]
+                nsects = seg[9]
                 sect_off = cmd_offset + struct.calcsize(seg_fmt)
                 # section_64: sectname[16] segname[16] addr size offset align ...
                 sect_fmt = f'{endian}16s16sQQIIIIII'
