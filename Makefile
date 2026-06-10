@@ -4,8 +4,8 @@ ARCHS = arm64
 include $(THEOS)/makefiles/common.mk
 
 # iOS subprojects
-SUBPROJECTS += MTLCompilerBypassOSCheck MTLSimDriverHost launchdchrootexec
+SUBPROJECTS += MTLCompilerBypassOSCheck MTLSimDriverHost launchdchrootexec autosignd
 # macOS subprojects
-SUBPROJECTS += launchservicesd libmachook login
+SUBPROJECTS += launchservicesd libmachook
 
 include $(THEOS_MAKE_PATH)/aggregate.mk

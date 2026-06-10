@@ -97,7 +97,19 @@ add_all_trustcache() {
     add_x86_64_trustcache "$path"
 }
 
-add_trustcache "/var/jb/usr/macOS/bin/login"
+# ─── On-demand auto-sign daemon (iOS side) ──────────────────────────────────
+# libmachook's exec hooks ask this daemon (over /tmp/autosignd.sock) to
+# sign+trustcache a binary on first exec, so arbitrary macOS programs run in the
+# chroot without pre-listing every binary here. Trustcache it, then (re)start it.
+AUTOSIGND=/var/jb/usr/macOS/bin/autosignd
+if [ -x "$AUTOSIGND" ]; then
+    add_all_trustcache "$AUTOSIGND"
+    pkill -x autosignd 2>/dev/null
+    rm -f /var/mnt/rootfs/tmp/autosignd.sock
+    nohup "$AUTOSIGND" >/var/mnt/rootfs/tmp/autosignd.log 2>&1 &
+    echo "[INFO] started autosignd (on-demand auto-sign daemon)"
+fi
+
 add_trustcache "/var/jb/usr/macOS/bin/TestMetalIOSurface"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
@@ -236,6 +248,12 @@ sign_and_trustcache "$ROOTFS/usr/bin/rsync"
 # Scripting runtimes
 sign_and_trustcache "$ROOTFS/usr/bin/ruby"
 sign_and_trustcache "$ROOTFS/usr/bin/git"
+
+# Claude Code (native bun/JSC binary installed to /usr/local/bin/claude) and the
+# macOS Keychain CLI it spawns for credential storage. See README "Running
+# Claude Code in the chroot". Run with GIGACAGE_ENABLED=0 (see ~/.bashrc).
+sign_and_trustcache "$ROOTFS/usr/local/bin/claude"
+sign_and_trustcache "$ROOTFS/usr/bin/security"
 
 # Portable Ruby (Homebrew's vendored Ruby 4.0.1)
 PRUBY="$ROOTFS/opt/homebrew/Library/Homebrew/vendor/portable-ruby/4.0.1"

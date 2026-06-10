@@ -25,8 +25,8 @@ TODO: make a script
 ## Starting up
 build in macOS:
 ```bash
-# change DEVICE_IP to your iPad/iPhone device's IP
-bash build.sh
+# edit DEVICE_IP/DEVICE_PORT at the top of misc/build.sh to match your iPad/iPhone
+bash misc/build.sh
 ```
 
 run in your iPad/iPhone device:
@@ -107,6 +107,85 @@ Respring to iOS:
 sudo launchctl unload /var/jb/usr/macOS/LaunchDaemons
 sudo launchctl load /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
 ```
+
+## Running Claude Code in the chroot
+
+The Claude Code native CLI (a bun/JSC binary) runs inside the macOS chroot.
+Several chroot-specific quirks are involved:
+
+- **AMFI / signing** — every Mach-O must be ad-hoc re-signed + trustcached or AMFI
+  `SIGKILL`s it (an Apple signature alone is not enough — its platform-binary /
+  library-validation flags get the process killed even when the CDHash is
+  trustcached). This is now automatic: the `autosignd` daemon + `libmachook`'s
+  exec hooks sign+trustcache each binary on first `exec` (see "On-demand signing"
+  below), so `claude` and everything it spawns (`security`, `ps`, `ioreg`, `git`,
+  …) just work. `postinst.sh` also signs `claude` and `/usr/bin/security` up front.
+- **JSC gigacage** — JavaScriptCore tries to reserve a 64 GiB virtual-address
+  "gigacage" at startup, which fails on iOS (`FATAL: Could not allocate gigacage
+  memory`). Set `GIGACAGE_ENABLED=0` to disable it.
+- **No DNS** — the chroot has network but no working resolver. Route through a
+  proxy (the chroot can't resolve hostnames itself). **Important:** Claude Code's
+  API client (undici) only honors **`http(s)://` proxies, not `socks5h://`**
+  (it does run its own SOCKS server for sandboxed children, but won't use a SOCKS
+  proxy for its own API calls). So set `HTTPS_PROXY=http://HOST:PORT` — e.g. point
+  it at a mixed http+socks proxy like `pproxy`. `curl`/`git`/`pip` accept the same
+  `http://` proxy and resolve DNS through it too.
+
+**1. Install the binary.** The official `install.sh` aborts because the chroot's
+`uname -m` reports `iPadN,N` ("Unsupported architecture"), so download the
+macOS-arm64 build directly into the chroot at `/usr/local/bin/claude`:
+
+```bash
+# inside the chroot (network via your http proxy):
+ver=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)
+curl -fsSL -o /usr/local/bin/claude \
+  "https://downloads.claude.ai/claude-code-releases/$ver/darwin-arm64/claude"
+chmod +x /usr/local/bin/claude
+sudo bash /var/jb/usr/macOS/bin/postinst.sh   # sign + trustcache it (from iOS shell)
+```
+
+**2. Configure the environment.** The `Claude Code TUI environment` block in
+`/var/mnt/rootfs/Users/root/.bashrc` sets `PATH`, `GIGACAGE_ENABLED=0`,
+`SSL_CERT_FILE`, and the `http://` proxy vars. Add your auth (env vars work — no
+`settings.json` required):
+
+```bash
+# Official API key (sent as x-api-key):
+export ANTHROPIC_API_KEY=sk-ant-...
+# OR a Bearer token for a relay/gateway (sent as Authorization: Bearer) — then
+# also set the relay endpoint:
+export ANTHROPIC_AUTH_TOKEN=...
+export ANTHROPIC_BASE_URL=https://your-relay.example.com/
+```
+
+If `ANTHROPIC_BASE_URL` is an **internal** host (e.g. a corp gateway on a `10.x`
+IP) it must be reached directly, not via an overseas circumvention proxy — add the
+host to the chroot's `/etc/hosts` (chroot has no DNS) and `NO_PROXY` it, or use a
+proxy whose egress is on that internal network.
+
+**3. Run it:**
+
+```bash
+sudo bash /var/jb/usr/macOS/bin/run_bash.sh   # interactive; sources ~/.bashrc
+claude          # TUI; or:  claude -p "hi"
+```
+
+### On-demand signing (`autosignd` + `libmachook` exec hooks)
+
+AMFI evaluates every `exec` in the kernel, so a binary can only be signed from an
+**iOS-platform** process (the chroot's macOS dyld refuses to load
+`libjailbreak.dylib`, so chroot code cannot call `jbclient_*` directly). The flow:
+
+- `libmachook` interposes `posix_spawn[p]` / `execve` / `execv` / `execvp`. Before
+  each `exec` it sends the target's chroot path to `autosignd` over the unix socket
+  `/tmp/autosignd.sock` and waits for an ack (fail-open; per-process path cache).
+- `autosignd` (started by `postinst.sh`, runs in the iOS context) translates the
+  path into the rootfs, ad-hoc re-signs it with `ldid -S<entitlements> -M`, and
+  registers every slice's CDHash via `jbctl trustcache add`.
+
+Net effect: arbitrary macOS programs run in the chroot without pre-listing every
+binary in `postinst.sh`. (`execl*` varargs forms are not interposed — rare, and
+they call the array forms internally inside libsystem.)
 
 ## Additional patches
 > [!NOTE]

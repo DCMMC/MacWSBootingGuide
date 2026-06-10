@@ -79,11 +79,11 @@ The root `Makefile` builds six subprojects:
 - `MTLCompilerBypassOSCheck/` — CydiaSubstrate tweak that patches `MTLCompilerService` platform checks so it will compile Metal shaders for a macOS (non-iOS) target.
 - `MTLSimDriverHost/` — XPC service that hosts `MTLSimDriver.framework` (from the iOS Simulator runtime). Bridging macOS Metal calls to the iOS GPU driver.
 - `launchdchrootexec/` — Small iOS binary that chroots into the macOS rootfs and execs a macOS binary with `DYLD_INSERT_LIBRARIES` pointing to `libmachook.dylib`.
+- `autosignd/` — iOS-side daemon that signs + trustcaches Mach-O binaries on demand. `libmachook`'s exec hooks ask it (over a unix socket) to ad-hoc re-sign + trustcache each binary just before it is `exec`'d, so arbitrary macOS programs run in the chroot without pre-listing every binary in `postinst.sh`.
 
 **macOS-side (compiled for macOS target, run inside the chroot):**
 - `libmachook/` — The core dylib injected into every macOS process. Contains all runtime interposition hooks.
 - `launchservicesd/` — Loader that converts the macOS `launchservicesd` daemon into a dylib so it can run without entitlements that would cause a codesign panic.
-- `login/` — Thin wrapper that spawns bash inside the macOS chroot environment.
 
 ### libmachook — Core Hook Library
 
