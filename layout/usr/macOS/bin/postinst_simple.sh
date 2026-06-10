@@ -48,10 +48,12 @@ sign_then_trust_all() {
 	add_all_trustcache "$path"
 }
 
-echo "==> postinst_simple: jb Mach-O + chroot libmachook + bash"
+echo "==> postinst_simple: jb Mach-O + chroot libmachook(_cli) + bash"
 
 sign_then_trust_all "/var/jb/usr/macOS/lib/libmachook.dylib"
 [ -f "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib" ] && sign_then_trust_all "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib"
+sign_then_trust_all "/var/jb/usr/macOS/lib/libmachook_cli.dylib"
+[ -f "/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib" ] && sign_then_trust_all "/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib"
 
 sign_then_trust_all "/var/jb/usr/macOS/bin/launchdchrootexec"
 [ -f "/var/jb/usr/macOS/bin/launchdchrootexec_debug" ] && sign_then_trust_all "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
@@ -83,6 +85,32 @@ if [ -f "$LMROOT" ]; then
 	for arch in arm64 arm64e x86_64; do
 		h=$(ldid -arch "$arch" -h "$LMROOT" 2>/dev/null | grep CDHash= | cut -c8-)
 		[ -n "$h" ] && trust_cdhash "$h" "$LMROOT" "$arch"
+	done
+fi
+
+# run_bash / launchdchrootexec uses libmachook_cli (thin arm64e on rootfs).
+LMCLIB="/var/jb/usr/macOS/lib/libmachook_cli.dylib"
+LMROOTCLI="/var/mnt/rootfs/usr/local/lib/libmachook_cli.dylib"
+LMROOTCLISRC="/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib"
+if [ -f "$LMROOTCLISRC" ]; then
+	cp -vf "$LMROOTCLISRC" "$LMROOTCLI"
+elif [ -f "$LMCLIB" ]; then
+	cp -vf "$LMCLIB" "$LMROOTCLI"
+	if command -v lipo >/dev/null 2>&1; then
+		LMCTHIN="/tmp/libmachook_cli-rootfs-thin.$$"
+		if lipo -thin arm64e "$LMROOTCLI" -output "$LMCTHIN" 2>/dev/null && [ -f "$LMCTHIN" ]; then
+			mv -f "$LMCTHIN" "$LMROOTCLI"
+		else
+			rm -f "$LMCTHIN"
+			echo "[WARN] lipo -thin arm64e failed for $LMROOTCLI" >&2
+		fi
+	fi
+fi
+if [ -f "$LMROOTCLI" ]; then
+	ldid -S"$ENT" -M "$LMROOTCLI" || echo "[WARN] ldid ENT failed for $LMROOTCLI" >&2
+	for arch in arm64 arm64e x86_64; do
+		h=$(ldid -arch "$arch" -h "$LMROOTCLI" 2>/dev/null | grep CDHash= | cut -c8-)
+		[ -n "$h" ] && trust_cdhash "$h" "$LMROOTCLI" "$arch"
 	done
 fi
 

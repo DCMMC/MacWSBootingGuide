@@ -56,6 +56,16 @@ else
 	echo "WARN: lipo missing; postinst will thin on-device if lipo exists."
 fi
 
+echo "==> Setting macOS build version on libmachook_cli.dylib..."
+sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook_cli.dylib
+sudo ldid -S /var/jb/usr/macOS/lib/libmachook_cli.dylib
+
+echo "==> Writing libmachook_cli-rootfs.dylib (arm64e thin)..."
+if command -v lipo >/dev/null 2>&1; then
+	sudo lipo -thin arm64e /var/jb/usr/macOS/lib/libmachook_cli.dylib -output /var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib
+	sudo ldid -S /var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib
+fi
+
 echo "==> Running postinst ($POSTINST_SCRIPT)..."
 sudo bash "$POSTINST_SCRIPT"
 

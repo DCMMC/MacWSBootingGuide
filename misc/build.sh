@@ -19,21 +19,32 @@ ssh-copy-id -p $DEVICE_PORT root@$DEVICE_IP 2>/dev/null || true
 gmake FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless package install \
   THEOS_DEVICE_IP=$DEVICE_IP THEOS_DEVICE_PORT=$DEVICE_PORT GO_EASY_ON_ME=1
 
-# Post-process libmachook.dylib with macOS build version
+# Post-process libmachook*.dylib with macOS build version
 cp .theos/obj/libmachook.dylib .
 python3 misc/set_macos_version.py libmachook.dylib
 ldid -S libmachook.dylib
 codesign -f -s - libmachook.dylib
 
-# arm64e-only dylib for chroot (macOS dyld SIGKILL on fat DYLD_INSERT_LIBRARIES)
+cp .theos/obj/libmachook_cli.dylib .
+python3 misc/set_macos_version.py libmachook_cli.dylib
+ldid -S libmachook_cli.dylib
+codesign -f -s - libmachook_cli.dylib
+
+# arm64e-only dylibs for chroot (macOS dyld rejects fat DYLD_INSERT_LIBRARIES)
 lipo -thin arm64e libmachook.dylib -output libmachook-rootfs.dylib
 ldid -S libmachook-rootfs.dylib
 codesign -f -s - libmachook-rootfs.dylib
 
-# Replace the package-installed version with the post-processed one
+lipo -thin arm64e libmachook_cli.dylib -output libmachook_cli-rootfs.dylib
+ldid -S libmachook_cli-rootfs.dylib
+codesign -f -s - libmachook_cli-rootfs.dylib
+
+# Replace the package-installed versions with the post-processed ones
 scp -P $DEVICE_PORT libmachook.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook.dylib
 scp -P $DEVICE_PORT libmachook-rootfs.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook-rootfs.dylib
-rm -f libmachook.dylib libmachook-rootfs.dylib
+scp -P $DEVICE_PORT libmachook_cli.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook_cli.dylib
+scp -P $DEVICE_PORT libmachook_cli-rootfs.dylib root@$DEVICE_IP:/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib
+rm -f libmachook.dylib libmachook-rootfs.dylib libmachook_cli.dylib libmachook_cli-rootfs.dylib
 
 echo "==> Running postinst ($POSTINST_SCRIPT)..."
 ssh -p $DEVICE_PORT root@$DEVICE_IP "echo alpine | sudo -S bash $POSTINST_SCRIPT"

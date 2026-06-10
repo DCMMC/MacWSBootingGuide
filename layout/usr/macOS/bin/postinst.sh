@@ -100,6 +100,8 @@ add_all_trustcache() {
 add_trustcache "/var/jb/usr/macOS/bin/login"
 add_trustcache "/var/jb/usr/macOS/bin/TestMetalIOSurface"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
+add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_cli.dylib"
+[ -f "/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib" ] && add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
@@ -151,6 +153,31 @@ for arch in arm64 arm64e x86_64; do
 	h=$(ldid -arch "$arch" -h "$LMROOT" 2>/dev/null | grep CDHash= | cut -c8-)
 	[ -n "$h" ] && trust_cdhash "$h" "$LMROOT" "$arch"
 done
+# libmachook_cli for run_bash (launchdchrootexec)
+LMCLIB="/var/jb/usr/macOS/lib/libmachook_cli.dylib"
+LMROOTCLI="/var/mnt/rootfs/usr/local/lib/libmachook_cli.dylib"
+LMROOTCLISRC="/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib"
+if [ -f "$LMROOTCLISRC" ]; then
+	cp -vf "$LMROOTCLISRC" "$LMROOTCLI"
+elif [ -f "$LMCLIB" ]; then
+	cp -vf "$LMCLIB" "$LMROOTCLI"
+	if command -v lipo >/dev/null 2>&1; then
+		LMCTHIN="/tmp/libmachook_cli-rootfs-thin.$$"
+		if lipo -thin arm64e "$LMROOTCLI" -output "$LMCTHIN" 2>/dev/null && [ -f "$LMCTHIN" ]; then
+			mv -f "$LMCTHIN" "$LMROOTCLI"
+		else
+			rm -f "$LMCTHIN"
+			echo "[ERROR] lipo -thin arm64e failed for $LMROOTCLI" >&2
+		fi
+	fi
+fi
+if [ -f "$LMROOTCLI" ]; then
+	ldid -S"$ENT" -M "$LMROOTCLI" || echo "[WARN] ldid libmachook_cli on rootfs failed" >&2
+	for arch in arm64 arm64e x86_64; do
+		h=$(ldid -arch "$arch" -h "$LMROOTCLI" 2>/dev/null | grep CDHash= | cut -c8-)
+		[ -n "$h" ] && trust_cdhash "$h" "$LMROOTCLI" "$arch"
+	done
+fi
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld

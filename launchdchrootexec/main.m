@@ -32,12 +32,11 @@ int main(int argc, char *argv[], char *envp[]) {
     }
     // fprintf(stderr, "after chdir %s\n", currentPath);
 
-    // Prefer chroot copy from postinst (thin arm64e). Do not copy to /tmp here — copyfile
-    // can yield a bad image and macOS dyld SIGSEGVs while mapping the insert library.
+    // Slim insert lib for chroot shells (no Metal). Full libmachook.dylib is for WindowServer/GUI.
     {
-        const char *local = "/usr/local/lib/libmachook.dylib";
-        const char *jbThin = "/var/jb/usr/macOS/lib/libmachook-rootfs.dylib";
-        const char *jbFat = "/var/jb/usr/macOS/lib/libmachook.dylib";
+        const char *local = "/usr/local/lib/libmachook_cli.dylib";
+        const char *jbThin = "/var/jb/usr/macOS/lib/libmachook_cli-rootfs.dylib";
+        const char *jbFat = "/var/jb/usr/macOS/lib/libmachook_cli.dylib";
         const char *src = NULL;
         if(access(local, R_OK) == 0) {
             src = local;
