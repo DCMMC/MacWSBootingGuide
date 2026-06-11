@@ -218,8 +218,17 @@ extern int xpc_connection_enable_sim2host_4sim();
 
 __attribute__((constructor)) static void InitMetalHooks() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // force Apple 5 profile
-        CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
+        // force Apple 5 profile.
+        // NOTE: do NOT pass ObjC/CF constant literals (@"..." / @(YES)) here. On the
+        // on-device lld arm64e build, the constant CFString's pointer still PAC-faults
+        // when CoreFoundation reads it (autda DA trap in CFStringGetCharacterAtIndex
+        // via _CFXPreferences withSearchListForIdentifier) -- even with -fixup_chains.
+        // Build the strings at runtime (proper isa from the CF allocator) instead.
+        CFStringRef key = CFStringCreateWithCString(kCFAllocatorDefault, "EnableSimApple5", kCFStringEncodingUTF8);
+        CFStringRef app = CFStringCreateWithCString(kCFAllocatorDefault, "com.apple.Metal", kCFStringEncodingUTF8);
+        CFPreferencesSetAppValue(key, kCFBooleanTrue, app);
+        CFRelease(key);
+        CFRelease(app);
     });
     
 #if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
