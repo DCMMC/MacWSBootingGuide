@@ -112,6 +112,7 @@ fi
 
 add_trustcache "/var/jb/usr/macOS/bin/TestMetalIOSurface"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
+add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
@@ -134,8 +135,23 @@ add_all_trustcache "/var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fr
 add_all_trustcache /var/jb/usr/macOS/bin/HostInjectBootstrap
 add_all_trustcache /var/mnt/rootfs/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 add_all_trustcache /System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc/MTLCompilerService
+# Refresh the chroot copy of libmachook. CRITICAL: rm before cp so the new file
+# gets a FRESH INODE. Overwriting in place (cp -f, same inode) leaves the chroot
+# kernel's cached code-signature blob for that vnode stale -> it validates the new
+# file's pages against the OLD cached hashes -> AMFI "Invalid Page" SIGKILLs every
+# arm64e chroot process at dyld insert-map time. A new inode has no cached blob.
+# (arm64 escaped this only because WindowServer stayed mapped from one clean load.)
+rm -f /var/mnt/rootfs/usr/local/lib/libmachook.dylib
 cp -vf /var/jb/usr/macOS/lib/libmachook.dylib /var/mnt/rootfs/usr/local/lib/libmachook.dylib
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook.dylib
+# arm64 thin slice (loaded into pure-arm64 chroot processes: WindowServer, claude,
+# MacPorts tools). Present only after an on-device build; guard so cross-compile
+# installs (single fat libmachook.dylib) don't fail here.
+if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
+	rm -f /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
+	cp -vf /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
+	add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
+fi
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
@@ -180,6 +196,17 @@ add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.ap
 add_all_trustcache /var/mnt/rootfs/usr/local/bin/OSXvnc-server
 if [ -d /var/mnt/rootfs/var/jb ] && [ ! "$(ls -A /var/mnt/rootfs/var/jb)" ]; then
 	/var/jb/usr/local/bin/mount_bindfs /var/jb /var/mnt/rootfs/var/jb
+fi
+
+# Mount a writable devfs into the chroot /dev. Without it the rootfs /dev has no
+# /dev/ptmx, so pty programs fail: Terminal.app -> forkpty -> open("/dev/ptmx")
+# returns ENOENT ("forkpty: No such file or directory") and no shell spawns.
+# mount_bindfs would expose the nodes read-only (ptmx O_RDWR -> EROFS) and the
+# macOS mount_devfs is EPERM'd inside the chroot, so use our iOS-native helper.
+# It is idempotent (no-op if /var/mnt/rootfs/dev is already a devfs).
+if [ -x /var/jb/usr/macOS/bin/mountdevfs ]; then
+	add_all_trustcache /var/jb/usr/macOS/bin/mountdevfs
+	/var/jb/usr/macOS/bin/mountdevfs /var/mnt/rootfs/dev
 fi
 
 # ─── Homebrew / MacPorts: sign macOS rootfs utilities ─────────────────────────

@@ -6,7 +6,11 @@
 #import <xpc/xpc.h>
 #import "utils.h"
 
-// #define FORCE_M1_DRIVER
+// FORCE_M1_DRIVER auto-enabled for the arm64e on-device slice only (see
+// mac_hooks.m). arm64e -> real macOS AGX driver; arm64/x86_64 -> MTLSimDevice.
+#if defined(__arm64e__) && defined(LIBMACHOOK_ON_DEVICE_BUILD)
+#define FORCE_M1_DRIVER 1
+#endif
 
 void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction) {
     Method m1 = class_getInstanceMethod(class2, swizzledAction);
@@ -176,16 +180,19 @@ static id(*MTLCreateSimulatorDevice)(void);
     return [self hooked_newBufferWithLength:length options:options pointer:pointer copyBytes:copyBytes deallocator:deallocator];
 }
 @end
+#endif // MTLFakeDevice static class (off for arm64e on-device)
+
 %hookf(Class, getMetalPluginClassForService, int service) {
 #ifdef FORCE_M1_DRIVER
-    NSBundle *bundle = [NSBundle bundleWithPath:@"/System/Library/Extensions/AGXMetal13_3.bundle"];
-    [bundle load];
-    return %c(AGXG13GDevice);
+    // survival pivot (safe). AGX shim: heap+cmdqueue+parent-lookup work (UPDATE 5/6 in
+    // memory agx-direct-path-kernel-abi-deadend); sub-resource size-fix pending a clean
+    // test. Live AGX testing strains the GUI (MTLSimDriverHost/WindowServer crashes), so
+    // default to Nil (CPU fallback) for stability.
+    return Nil;
 #else
     return MTLFakeDevice.class;
 #endif
 }
-#endif // arm64e guard
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end
@@ -218,14 +225,22 @@ extern int xpc_connection_enable_sim2host_4sim();
 
 __attribute__((constructor)) static void InitMetalHooks() {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // force Apple 5 profile
-        CFPreferencesSetAppValue((const CFStringRef)@"EnableSimApple5", (__bridge CFPropertyListRef)@(YES), (const CFStringRef)@"com.apple.Metal");
+        // force Apple 5 profile.
+        // NOTE: do NOT pass ObjC/CF constant literals (@"..." / @(YES)) here. On the
+        // on-device lld arm64e build, the constant CFString's pointer still PAC-faults
+        // when CoreFoundation reads it (autda DA trap in CFStringGetCharacterAtIndex
+        // via _CFXPreferences withSearchListForIdentifier) -- even with -fixup_chains.
+        // Build the strings at runtime (proper isa from the CF allocator) instead.
+        CFStringRef key = CFStringCreateWithCString(kCFAllocatorDefault, "EnableSimApple5", kCFStringEncodingUTF8);
+        CFStringRef app = CFStringCreateWithCString(kCFAllocatorDefault, "com.apple.Metal", kCFStringEncodingUTF8);
+        CFPreferencesSetAppValue(key, kCFBooleanTrue, app);
+        CFRelease(key);
+        CFRelease(app);
     });
     
-#if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
+    // Install on all arches: arm64/x86_64 -> MTLFakeDevice; arm64e -> AGX (FORCE_M1_DRIVER).
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
     %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
-#endif
     
     MSImageRef xpc = MSGetImageByName("/usr/lib/system/libxpc.dylib");
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);

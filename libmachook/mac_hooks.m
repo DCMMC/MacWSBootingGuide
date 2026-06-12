@@ -19,11 +19,25 @@ extern uid_t audit_token_to_auid(audit_token_t atoken);
 BOOL hooked_return_1(void) { return YES; }
 void EnableJIT(void);
 
-// #define FORCE_M1_DRIVER
+// FORCE_M1_DRIVER: route Metal through the REAL macOS AGX (M1/G13G) GPU driver
+// instead of the MTLSimDriver simulator bridge. Auto-enabled ONLY for the arm64e
+// on-device slice — arm64e GUI apps (Terminal, etc.) can't load the arm64-only
+// MTLSimDriver frameworks, so AGX-direct is their only Metal path. arm64 (e.g.
+// WindowServer) keeps the proven MTLSimDriver path. Needs the IOConnect selector
+// translation + IOServiceOpen type fixup below (macOS GPU userclient ABI -> iOS).
+#if defined(__arm64e__) && defined(LIBMACHOOK_ON_DEVICE_BUILD)
+#define FORCE_M1_DRIVER 1
+#endif
 
 // offsets hardcoded for macOS 13.4
 // IOMobileFramebuffer`kern_SwapEnd + 36
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt 0x4400 + 0x24
+// IOMobileFramebuffer`kern_SwapEnd + 0x30: `bl IOConnectCallStructMethod` (sel=5) — the call
+// that presents WindowServer's composited surface to the PHYSICAL iPad panel.  In coexistence
+// mode (iOS backboardd owns the panel, macOS viewed via VNC off-screen) we neutralize this so
+// WS never scans out to the panel -> no iOS/macOS flicker.  Gated to WindowServer + the runtime
+// flag file /tmp/ws_headless (chroot path) so the default macOS-on-panel behavior is unchanged.
+#define OFF_IOMobileFramebuffer_kern_SwapEnd_submit 0x4400 + 0x30
 // SkyLight`WS::Displays::CAWSManager::CAWSManager() + 560
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
 #if FORCE_SW_RENDER
@@ -35,10 +49,21 @@ void EnableJIT(void);
 #define OFF_Metal_MTLFragmentReflectionReader_deserialize_extra 0x90ebc + 0x16c
 // Metal`MTLInputStageReflectionReader::deserialize + 956
 #define OFF_Metal_MTLInputStageReflectionReader_deserialize_extra 0x90678 + 0x3bc
+// QuartzCore`CABackingStorePrepareUpdates_ + 812.  At this site the original
+// `cbz w21, +852` sends every window backing store down the NON-accelerated path
+// (w21==0 because the format/capability arg w23==2 has bit 8 clear): it allocates a
+// CPU `CA::Render::Shmem::new_bitmap` instead of an IOSurface, so drawn content never
+// becomes a GPU surface WindowServer can composite -> window CONTENT stays BLACK
+// (chrome renders via a different path).  Forcing this branch to `b +840` takes the
+// accelerated path (`mov w8,#1; str w8,[sp,#0x68]`), so create_iosurface() runs and an
+// IOSurface-backed buffer is allocated -> content renders.  Verified live with lldb:
+// patching this single instruction makes create_iosurface + IOSurfaceCreate fire.
+#define OFF_QuartzCore_CABackingStore_force_accel 0x227cc
 
 const char *IOMFBPath = "/System/Library/PrivateFrameworks/IOMobileFramebuffer.framework/Versions/A/IOMobileFramebuffer";
 const char *MetalPath = "/System/Library/Frameworks/Metal.framework/Versions/A/Metal";
 const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
+const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
@@ -52,8 +77,11 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 #warning TODO: has hardcoded instruction
             // NSLog(@"#### debugbydcmmc OFF_SkyLight_CAWSManager_register_abort ModifyExecutableRegion addr %lu val %lu, expect: %lu",
             //     (unsigned long) check, (unsigned long) *check, (unsigned long) 0xb4000588);
-            assert(*check == 0xb4000588); // cbz    x8, do_abort
-            *check = 0xd503201f; // nop
+            // Patch only if the expected instruction is present; skip (do not
+            // abort) on a non-matching SkyLight version/arch.
+            if (*check == 0xb4000588) { // cbz    x8, do_abort
+                *check = 0xd503201f; // nop
+            }
         });
         
         // grant all permissions
@@ -72,10 +100,35 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         ModifyExecutableRegion(swapEnd, sizeof(uint32_t), ^{
             // NSLog(@"#### debugbydcmmc OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt ModifyExecutableRegion addr %lu val %lu, expect: %lu",
             //     (unsigned long) swapEnd, (unsigned long) *swapEnd, (unsigned long) 0x52808d03);
-            assert(*swapEnd == 0x52808d03); // mov    w3, #0x468
-            *swapEnd = 0x52808d83; // mov    w3, #0x46c
+            // Patch only if the expected instruction is present; skip (do not
+            // abort) on a non-matching IOMobileFramebuffer version/arch.  The
+            // arm64 slice differs from arm64e, and CLI tools that merely pull
+            // IOMFB in via libmachook's deps must not crash here.
+            if (*swapEnd == 0x52808d03) { // mov    w3, #0x468
+                *swapEnd = 0x52808d83; // mov    w3, #0x46c
+            }
         });
         // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
+
+        // COEXISTENCE (flicker fix): in WindowServer only, and only when the runtime flag file
+        // /tmp/ws_headless exists, neutralize kern_SwapEnd's panel present so WS renders to its
+        // framebuffer (VNC reads it) but never scans out to the physical iPad panel — iOS keeps
+        // the panel, eliminating the iOS/macOS flicker.  Default OFF (no flag file) => original
+        // macOS-on-panel behavior is untouched.  Toggle live by touch/rm /var/mnt/rootfs/tmp/ws_headless
+        // then restarting WindowServer.
+        {
+            char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
+            if(_NSGetExecutablePath(exe, &exelen) == 0 &&
+               strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
+               access("/tmp/ws_headless", F_OK) == 0) {
+                uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
+                ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
+                    if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
+                        *swapSubmit = 0xd2800000;    // mov x0, #0  (skip present, return KERN_SUCCESS)
+                    }
+                });
+            }
+        }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
         // NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService before _xpc_add_bundle");
         // register MTLCompilerService.xpc
@@ -106,9 +159,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // 0x18ae78a6c <+1012>: ldr    w8, [x20, #0x68]
         uint32_t *MTLInputStageReflectionReader_deserialize = (uint32_t *)(OFF_Metal_MTLInputStageReflectionReader_deserialize_extra + (uintptr_t)header);
         ModifyExecutableRegion(MTLInputStageReflectionReader_deserialize, sizeof(uint32_t[15]), ^{
-            assert(MTLInputStageReflectionReader_deserialize[0] == 0x52800049); // mov w9, #0x2
-            for(int i = 0; i < 15; ++i) {
-                MTLInputStageReflectionReader_deserialize[i] = 0xd503201f; // nop
+            if (MTLInputStageReflectionReader_deserialize[0] == 0x52800049) { // mov w9, #0x2
+                for(int i = 0; i < 15; ++i) {
+                    MTLInputStageReflectionReader_deserialize[i] = 0xd503201f; // nop
+                }
             }
         });
         
@@ -129,11 +183,34 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // 0x18ae79060 <+420>: ldr    w8, [x20, #0x68]
         uint32_t *MTLFragmentReflectionReader_deserialize = (uint32_t *)(OFF_Metal_MTLFragmentReflectionReader_deserialize_extra + (uintptr_t)header);
         ModifyExecutableRegion(MTLFragmentReflectionReader_deserialize, sizeof(uint32_t[15]), ^{
-            assert(MTLFragmentReflectionReader_deserialize[0] == 0x52800049); // mov w9, #0x2
-            for(int i = 0; i < 15; ++i) {
-                MTLFragmentReflectionReader_deserialize[i] = 0xd503201f; // nop
+            if (MTLFragmentReflectionReader_deserialize[0] == 0x52800049) { // mov w9, #0x2
+                for(int i = 0; i < 15; ++i) {
+                    MTLFragmentReflectionReader_deserialize[i] = 0xd503201f; // nop
+                }
             }
         });
+    } else if(!strncmp(info.dli_fname, QuartzCorePath, strlen(QuartzCorePath))) {
+        // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
+        // content gets a GPU surface instead of a CPU bitmap (see OFF_ comment above).
+        // Patch `cbz w21, +852` (0x34000155) -> `b +840` (0x14000007).
+        //
+        // Apply only in CLIENT apps, NOT in WindowServer itself: WindowServer also links
+        // QuartzCore and uses CABackingStore for its own (menu bar / cursor) rendering, where
+        // forcing the accelerated path breaks its UI (menus stop opening).  Detect WindowServer
+        // by its main executable path and skip the patch there.
+        char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
+        BOOL isWindowServer = NO;
+        if(_NSGetExecutablePath(exe, &exelen) == 0) {
+            isWindowServer = (strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL);
+        }
+        if(!isWindowServer) {
+            uint32_t *forceAccel = (uint32_t *)(OFF_QuartzCore_CABackingStore_force_accel + (uintptr_t)header);
+            ModifyExecutableRegion(forceAccel, sizeof(uint32_t), ^{
+                if (*forceAccel == 0x34000155) { // cbz w21, #0x28 (+852)
+                    *forceAccel = 0x14000007;    // b +840 (accelerated path)
+                }
+            });
+        }
     }
 }
 
@@ -256,59 +333,57 @@ int getaudit_addr_new(auditinfo_addr_t *auditinfo_addr, u_int length) {
 }
 
 IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
-    IOSurfaceRef result;
-    NSLog(@"debugbydcmmc before IOSurfaceCreate %@", properties);
-#if FORCE_SW_RENDER
-    /*
-    NSMutableDictionary *newProperties = [NSMutableDictionary dictionaryWithDictionary:properties];
-    newProperties[@"IOSurfacePixelFormat"] = @((unsigned int)'BGRA');
-    [newProperties removeObjectForKey:@"IOSurfacePlaneInfo"];
-*/
-    int width = 2388; 
-    int widthLonger = width + 6;
-    int height = 1668;
-    int tileWidth = 8;
-    int tileHeight = 1;
-    int bytesPerElement = 4;
-    size_t bytesPerRow = widthLonger * bytesPerElement;
-    size_t size = widthLonger * height * bytesPerElement;
-    size_t totalBytes = size + 0x20000;
-    NSDictionary *newProperties = @{
-        //@"IOSurfaceAllocSize": @(totalBytes),
-        @"IOSurfaceCacheMode": @1024,
-        @"IOSurfaceHeight": @(height),
-        @"IOSurfaceMapCacheAttribute": @0,
-        @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        @"IOSurfacePixelFormat": @((unsigned int)'BGRA'),
-        @"IOSurfacePixelSizeCastingAllowed": @0,
-        @"IOSurfaceBytesPerElement": @(bytesPerElement),
-        @"IOSurfacePlaneInfo": @[
-            @{
-                @"IOSurfacePlaneWidth": @(width),
-                @"IOSurfacePlaneHeight": @(height),
-                @"IOSurfacePlaneBytesPerRow": @(bytesPerRow),
-                @"IOSurfacePlaneOffset": @0,
-                @"IOSurfacePlaneSize": @(totalBytes),
-                
-                @"IOSurfaceAddressFormat": @3,
-                @"IOSurfacePlaneBytesPerCompressedTileHeader": @2,
-                @"IOSurfacePlaneBytesPerElement": @(bytesPerElement),
-                @"IOSurfacePlaneCompressedTileDataRegionOffset": @0,
-                @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @(size),
-                @"IOSurfacePlaneCompressedTileHeight": @(tileHeight),
-                @"IOSurfacePlaneCompressedTileWidth": @(tileWidth),
-                @"IOSurfacePlaneCompressionType": @2,
-                @"IOSurfacePlaneHeightInCompressedTiles": @(height / tileHeight),
-                @"IOSurfacePlaneWidthInCompressedTiles": @(widthLonger / tileWidth),
-            }
-        ],
-        @"IOSurfaceWidth": @(width)
-    };
-    result = IOSurfaceCreate(newProperties);
-#else
-    result = IOSurfaceCreate(properties);
-#endif
-    NSLog(@"debugbydcmmc IOSurfaceCreate %@ -> %@", properties, result);
+    // WindowServer composites window content into Apple-GPU LOSSLESS-COMPRESSED / TILED
+    // IOSurfaces (IOSurfacePlaneCompressionType != 0, pf 0x26425241, 16x16 tiles). The
+    // MTLSimDevice simulator cannot read/write compressed-tiled textures, so the composited
+    // CONTENT comes out BLACK (chrome, drawn uncompressed, is fine). Detect a compressed
+    // surface and rebuild it as PLAIN UNCOMPRESSED BGRA (linear) so the sim Metal device can
+    // write it. See memory agx-direct-path-kernel-abi-deadend UPDATE 12.
+    int w = [[properties objectForKey:@"IOSurfaceWidth"] intValue];
+    int h = [[properties objectForKey:@"IOSurfaceHeight"] intValue];
+    NSArray *planes = [properties objectForKey:@"IOSurfacePlaneInfo"];
+    BOOL compressed = NO;
+    if([planes isKindOfClass:[NSArray class]]) {
+        for(NSDictionary *pl in planes) {
+            id ct = [pl objectForKey:@"IOSurfacePlaneCompressionType"];
+            if(ct && [ct intValue] != 0) { compressed = YES; break; }
+        }
+    }
+    NSDictionary *useProps = properties;
+    if(compressed && w > 0 && h > 0) {
+        const int bpe = 4;                 // BGRA8888
+        size_t bytesPerRow = (size_t)w * bpe;
+        size_t planeSize   = bytesPerRow * (size_t)h;
+        NSMutableDictionary *np = [NSMutableDictionary dictionary];
+        np[@"IOSurfaceWidth"]  = @(w);
+        np[@"IOSurfaceHeight"] = @(h);
+        np[@"IOSurfacePixelFormat"] = @((unsigned int)'BGRA');   // 0x42475241, uncompressed
+        np[@"IOSurfaceBytesPerElement"] = @(bpe);
+        np[@"IOSurfaceBytesPerRow"] = @(bytesPerRow);
+        np[@"IOSurfaceAllocSize"] = @(planeSize);
+        np[@"IOSurfaceCacheMode"] = [properties objectForKey:@"IOSurfaceCacheMode"] ?: @0;
+        np[@"IOSurfacePixelSizeCastingAllowed"] = @0;
+        // single linear plane, no compression keys
+        np[@"IOSurfacePlaneInfo"] = @[ @{
+            @"IOSurfacePlaneWidth": @(w),
+            @"IOSurfacePlaneHeight": @(h),
+            @"IOSurfacePlaneBytesPerRow": @(bytesPerRow),
+            @"IOSurfacePlaneBytesPerElement": @(bpe),
+            @"IOSurfacePlaneElementWidth": @1,
+            @"IOSurfacePlaneElementHeight": @1,
+            @"IOSurfacePlaneOffset": @0,
+            @"IOSurfacePlaneSize": @(planeSize),
+            @"IOSurfaceAddressFormat": @0,
+        } ];
+        useProps = np;
+    }
+    IOSurfaceRef result = IOSurfaceCreate((NSDictionary *)useProps);
+    // Log EVERY surface (size + format + compression) to map the full topology — the per-window
+    // content source surface (e.g. 500x350) vs the 1920x1080 display/composite surfaces.
+    unsigned int pf = [[properties objectForKey:@"IOSurfacePixelFormat"] unsignedIntValue];
+    char fcc[5] = { (char)(pf>>24), (char)(pf>>16), (char)(pf>>8), (char)pf, 0 };
+    fprintf(stderr, "#### IOSURF %dx%d pf=0x%x('%s') comp=%d -> %p%s\n",
+            w, h, pf, fcc, (int)compressed, (void*)result, compressed ? " [DECOMP]" : "");
     return result;
 }
 
@@ -319,9 +394,45 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
-#if FORCE_SW_RENDER
-DYLD_INTERPOSE(IOSurfaceCreate_new, IOSurfaceCreate);
-#endif
+
+// ─── CARenderServer bootstrap-name rewrite ──────────────────────────────────
+// The macOS window-content pipeline ships each app's rendered IOSurface to
+// WindowServer over a CARenderServer connection.  WindowServer
+// bootstrap_check_in("com.apple.CARenderServer") and clients
+// bootstrap_look_up("com.apple.CARenderServer") (QuartzCore
+// CARenderServerGetServerPort, hardcoded string).  But iOS launchd never
+// publishes the com.apple.CARenderServer endpoint (it is declared in the WS
+// plist yet dropped -- count 0 system-wide, not a name conflict; apparently a
+// reserved iOS name).  So WS's check-in fails, clients' look-up fails, no remote
+// context is formed, and window CONTENT never reaches WindowServer -> black
+// (chrome still shows, drawn by WS from window geometry).
+//
+// Fix: rewrite the bootstrap name on BOTH sides to an unreserved name that our
+// WindowServer LaunchDaemon plist declares (com.apple.macosbooter.CARenderServer),
+// so check-in publishes a port and look-up resolves it.  Same DYLD_INSERT runs in
+// WS and clients, so both rewrites are consistent.
+#define CARENDER_ORIG "com.apple.CARenderServer"
+#define CARENDER_NEW  "com.apple.macosbooter.CARenderServer"
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
+extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
+kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_t *sp) {
+    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
+    return bootstrap_look_up(bp, name, sp);
+}
+kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port_t *sp) {
+    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
+    return bootstrap_check_in(bp, name, sp);
+}
+DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
+DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
+
+// NOTE: IOSurfaceCreate is intentionally NOT interposed. The IOSurfaceCreate_new hook
+// (compression-rewrite + property logging) was a diagnostic dead-end (compression was a
+// red herring; the real window-content fix is the QuartzCore CABackingStorePrepareUpdates_
+// +812 patch in loadImageCallback). Worse, it CRASHED CoreImage-using apps (Terminal):
+// CoreImage calls IOSurfaceCreate with a properties dict whose objectForKey: access PAC-
+// faulted in the hook (EXC_BAD_ACCESS in IOSurfaceCreate_new <- CIImage). Leave the real
+// IOSurfaceCreate untouched.
 
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
@@ -451,29 +562,104 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
     return selector;
 }
 
+// AGX ID-translation shim. The iOS kernel AUTO-ASSIGNS resource GIDs (IOGPUObject
+// atomic counter; getResource matches resource+0x28), but the macOS AGX driver uses
+// CLIENT-ASSIGNED ids at IOGPUNewResourceArgs+0x48 (e.g. heap=0x20000, sub-resource
+// parent-id=0x20000). libmachook is userspace-only (can't patch the kernel), so we
+// bridge the two id-spaces here: record each created resource's clientID -> the
+// iOS GID returned in its OUT struct, and rewrite parent-id references in 0x80
+// sub-resources from clientID to the iOS GID so getResource() finds the parent.
+static struct { uint64_t clientID, iosGID, size; } g_agxIdMap[128];
+static int g_agxIdMapCount;
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
+    uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
-    __attribute__((musttail)) return IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
+    unsigned char shadowbuf[256];
+    uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
+    int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
+    if(agxIsRes) {
+        const unsigned char *src = (const unsigned char *)inStruct;
+        agxType = src[0];
+        agxClientID = *(const uint32_t *)(src + 0x48);           // client-assigned id / parent-id
+        uint64_t bc = *(const uint64_t *)(src + 0x40);           // iOS 32-bit IOByteCount
+        uint64_t f30 = *(const uint64_t *)(src + 0x30);
+        uint64_t va38 = *(const uint64_t *)(src + 0x38);
+        int patched = 0;
+        memcpy(shadowbuf, inStruct, inStructCnt);
+        if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t nb = sz32 ? sz32 : 0x1000; *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count
+        if(agxType == 0x80) {
+            int mapped = 0;
+            for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
+                *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosGID;            // parent-id: client -> iOS GID
+                if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + g_agxIdMap[i].size;  // +0x30 = end-VA so size(=+0x30-+0x38) = parent size
+                patched = 1; mapped = 1;
+                fprintf(stderr, "#### AGXIOC subres parent %#x -> GID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
+                break;
+            }
+            if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
+        }
+        if(patched) inStruct = shadowbuf;
+    }
+    IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    if(agxIsRes && r == 0 && agxType == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
+        const unsigned char *o = (const unsigned char *)outStruct;
+        uint64_t gid = *(const uint64_t *)(o + 0x28);   // iOS GID: monotonic IOGPUObject counter, echoed at OUT+0x28
+        int slot = -1;
+        for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) { slot = i; break; }  // overwrite (clientID reused)
+        if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
+        if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosGID = gid; g_agxIdMap[slot].size = agxHeapSz; }
+        fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz);
+    }
+    if(IOConnectIsIOGPU(client)) {
+        fprintf(stderr, "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    }
+    return r;
 }
 IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
+    uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
-    __attribute__((musttail)) return IOConnectCallScalarMethod(client, selector, in, inCnt, out, outCnt);
+    IOReturn r = IOConnectCallScalarMethod(client, selector, in, inCnt, out, outCnt);
+    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC Scalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
+    return r;
 }
 IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {
+    uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
-    __attribute__((musttail)) return IOConnectCallStructMethod(client, selector, inStruct, inStructCnt, outStruct, outStructCnt);
+    // AGX GPU device-info query (method 256 / setupImmediate): macOS 13.4 asks for
+    // a 0x78 (120-byte) output struct, but the iOS 16.x GPU userclient hard-checks
+    // the output size at 0x70 (112). The 8-byte mismatch -> kIOReturnBadArgument and
+    // AGX device init aborts. Clamp to what the iOS kernel accepts. (Found by diffing
+    // macOS AGXMetal13_3 727C250E vs iOS BA327004 in Ghidra: both selector 0x100,
+    // outStructCnt 0x78 vs 0x70.)
+    if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) {
+        *outStructCnt = 0x70;
+    }
+    IOReturn r = IOConnectCallStructMethod(client, selector, inStruct, inStructCnt, outStruct, outStructCnt);
+    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    return r;
 }
 IOReturn IOConnectCallAsyncMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
+    uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
-    __attribute__((musttail)) return IOConnectCallAsyncMethod(client, selector, wake_port, ref, refCnt, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    IOReturn r = IOConnectCallAsyncMethod(client, selector, wake_port, ref, refCnt, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncMethod sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    return r;
 }
 IOReturn IOConnectCallAsyncScalarMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
+    uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
-    __attribute__((musttail)) return IOConnectCallAsyncScalarMethod(client, selector, wake_port, ref, refCnt, in, inCnt, out, outCnt);
+    IOReturn r = IOConnectCallAsyncScalarMethod(client, selector, wake_port, ref, refCnt, in, inCnt, out, outCnt);
+    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncScalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
+    return r;
 }
 IOReturn IOConnectCallAsyncStructMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {
+    uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
-    __attribute__((musttail)) return IOConnectCallAsyncStructMethod(client, selector, wake_port, ref, refCnt, inStruct, inStructCnt, outStruct, outStructCnt);
+    IOReturn r = IOConnectCallAsyncStructMethod(client, selector, wake_port, ref, refCnt, inStruct, inStructCnt, outStruct, outStructCnt);
+    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncStruct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    return r;
 }
 DYLD_INTERPOSE(IOConnectCallMethod_new, IOConnectCallMethod);
 DYLD_INTERPOSE(IOConnectCallScalarMethod_new, IOConnectCallScalarMethod);
@@ -496,7 +682,7 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
     assert(iogpuClientsCount < sizeof(iogpuClients) / sizeof(iogpuClients[0]));
     if(result == KERN_SUCCESS && service == agxService) {
         iogpuClients[iogpuClientsCount++] = *connect;
-        NSLog(@"IOServiceOpen agx called, connect: %d, type: %d", *connect, type);
+        fprintf(stderr, "#### debugbydcmmc IOServiceOpen agx connect=%d type=%d\n", *connect, type);
     }
     return result;
 }

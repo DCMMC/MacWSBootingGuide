@@ -42,7 +42,13 @@ int main(int argc, char *argv[], char *envp[]) {
         return 1;
     }
     
-    setenv("DYLD_INSERT_LIBRARIES", "/usr/local/lib/libmachook.dylib", 1);
+    // Insert BOTH thin libmachook slices (colon-separated).  The device's dyld
+    // won't load a fat insert into a chrooted macOS process, so libmachook ships
+    // as two thin dylibs; each macOS process loads the slice matching its arch
+    // (arm64e or arm64) and dyld silently skips the non-matching one.  Children
+    // inherit this via the environment.  See misc/build_on_ios.sh.
+    setenv("DYLD_INSERT_LIBRARIES",
+           "/usr/local/lib/libmachook.dylib:/usr/local/lib/libmachook_arm64.dylib", 1);
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);

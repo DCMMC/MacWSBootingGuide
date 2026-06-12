@@ -38,6 +38,11 @@
 			<key>ResetAtClose</key>
 			<true/>
 		</dict>
+		<key>com.apple.macosbooter.CARenderServer</key>
+		<dict>
+			<key>HideUntilCheckIn</key>
+			<true/>
+		</dict>
 		<key>com.apple.windowserver</key>
 		<true/>
 		<key>com.apple.windowserver.active</key>
@@ -63,9 +68,9 @@
 		<string>-virtualonly</string>
 		<string>-daemon</string>
 	</array>
-	<key>StandardOutPath</key>
-	<string>/var/jb/var/mobile/WindowServer.out</string>
 	<key>StandardErrorPath</key>
 	<string>/var/jb/var/mobile/WindowServer.err</string>
+	<key>StandardOutPath</key>
+	<string>/var/jb/var/mobile/WindowServer.out</string>
 </dict>
 </plist>

@@ -2,10 +2,14 @@
 @import Foundation;
 @import Darwin;
 
-void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
-    vm_protect(mach_task_self(), (vm_address_t)addr, size, false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
-    callback();
-    vm_protect(mach_task_self(), (vm_address_t)addr, size, false, PROT_READ | PROT_EXEC);
+// NOTE: do NOT take an ObjC block here. Under -fobjc-arc the on-device lld
+// arm64e build mis-signs the block's metadata pointer, so ARC's objc_storeStrong
+// on the block parameter PAC-faults in this dylib's %ctor (crashes MTLCompilerService
+// on inject -> deadlocks the whole Metal/WindowServer path). Patch the word directly.
+static void PatchInstruction(uint32_t *addr, uint32_t value) {
+    vm_protect(mach_task_self(), (vm_address_t)addr, sizeof(uint32_t), false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
+    *addr = value;
+    vm_protect(mach_task_self(), (vm_address_t)addr, sizeof(uint32_t), false, PROT_READ | PROT_EXEC);
 }
 
 %ctor {
@@ -25,8 +29,6 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
     }
     assert(symbol[1] == 0x71001d1f);
     //assert(symbol[2] == 0x540003a1);
-    ModifyExecutableRegion(symbol + 2, sizeof(uint32_t), ^{
-        symbol[2] = 0xd503201f; // nop
-    });
+    PatchInstruction(symbol + 2, 0xd503201f); // nop
     // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck modify successfully!");
 }
