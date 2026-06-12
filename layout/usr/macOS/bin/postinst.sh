@@ -135,12 +135,20 @@ add_all_trustcache "/var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fr
 add_all_trustcache /var/jb/usr/macOS/bin/HostInjectBootstrap
 add_all_trustcache /var/mnt/rootfs/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService
 add_all_trustcache /System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc/MTLCompilerService
+# Refresh the chroot copy of libmachook. CRITICAL: rm before cp so the new file
+# gets a FRESH INODE. Overwriting in place (cp -f, same inode) leaves the chroot
+# kernel's cached code-signature blob for that vnode stale -> it validates the new
+# file's pages against the OLD cached hashes -> AMFI "Invalid Page" SIGKILLs every
+# arm64e chroot process at dyld insert-map time. A new inode has no cached blob.
+# (arm64 escaped this only because WindowServer stayed mapped from one clean load.)
+rm -f /var/mnt/rootfs/usr/local/lib/libmachook.dylib
 cp -vf /var/jb/usr/macOS/lib/libmachook.dylib /var/mnt/rootfs/usr/local/lib/libmachook.dylib
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook.dylib
 # arm64 thin slice (loaded into pure-arm64 chroot processes: WindowServer, claude,
 # MacPorts tools). Present only after an on-device build; guard so cross-compile
 # installs (single fat libmachook.dylib) don't fail here.
 if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
+	rm -f /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	cp -vf /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 fi
