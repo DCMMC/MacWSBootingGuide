@@ -167,12 +167,24 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
         // content gets a GPU surface instead of a CPU bitmap (see OFF_ comment above).
         // Patch `cbz w21, +852` (0x34000155) -> `b +840` (0x14000007).
-        uint32_t *forceAccel = (uint32_t *)(OFF_QuartzCore_CABackingStore_force_accel + (uintptr_t)header);
-        ModifyExecutableRegion(forceAccel, sizeof(uint32_t), ^{
-            if (*forceAccel == 0x34000155) { // cbz w21, #0x28 (+852)
-                *forceAccel = 0x14000007;    // b +840 (accelerated path)
-            }
-        });
+        //
+        // Apply only in CLIENT apps, NOT in WindowServer itself: WindowServer also links
+        // QuartzCore and uses CABackingStore for its own (menu bar / cursor) rendering, where
+        // forcing the accelerated path breaks its UI (menus stop opening).  Detect WindowServer
+        // by its main executable path and skip the patch there.
+        char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
+        BOOL isWindowServer = NO;
+        if(_NSGetExecutablePath(exe, &exelen) == 0) {
+            isWindowServer = (strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL);
+        }
+        if(!isWindowServer) {
+            uint32_t *forceAccel = (uint32_t *)(OFF_QuartzCore_CABackingStore_force_accel + (uintptr_t)header);
+            ModifyExecutableRegion(forceAccel, sizeof(uint32_t), ^{
+                if (*forceAccel == 0x34000155) { // cbz w21, #0x28 (+852)
+                    *forceAccel = 0x14000007;    // b +840 (accelerated path)
+                }
+            });
+        }
     }
 }
 
@@ -356,7 +368,45 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
-DYLD_INTERPOSE(IOSurfaceCreate_new, IOSurfaceCreate);
+
+// ─── CARenderServer bootstrap-name rewrite ──────────────────────────────────
+// The macOS window-content pipeline ships each app's rendered IOSurface to
+// WindowServer over a CARenderServer connection.  WindowServer
+// bootstrap_check_in("com.apple.CARenderServer") and clients
+// bootstrap_look_up("com.apple.CARenderServer") (QuartzCore
+// CARenderServerGetServerPort, hardcoded string).  But iOS launchd never
+// publishes the com.apple.CARenderServer endpoint (it is declared in the WS
+// plist yet dropped -- count 0 system-wide, not a name conflict; apparently a
+// reserved iOS name).  So WS's check-in fails, clients' look-up fails, no remote
+// context is formed, and window CONTENT never reaches WindowServer -> black
+// (chrome still shows, drawn by WS from window geometry).
+//
+// Fix: rewrite the bootstrap name on BOTH sides to an unreserved name that our
+// WindowServer LaunchDaemon plist declares (com.apple.macosbooter.CARenderServer),
+// so check-in publishes a port and look-up resolves it.  Same DYLD_INSERT runs in
+// WS and clients, so both rewrites are consistent.
+#define CARENDER_ORIG "com.apple.CARenderServer"
+#define CARENDER_NEW  "com.apple.macosbooter.CARenderServer"
+extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
+extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
+kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_t *sp) {
+    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
+    return bootstrap_look_up(bp, name, sp);
+}
+kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port_t *sp) {
+    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
+    return bootstrap_check_in(bp, name, sp);
+}
+DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
+DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
+
+// NOTE: IOSurfaceCreate is intentionally NOT interposed. The IOSurfaceCreate_new hook
+// (compression-rewrite + property logging) was a diagnostic dead-end (compression was a
+// red herring; the real window-content fix is the QuartzCore CABackingStorePrepareUpdates_
+// +812 patch in loadImageCallback). Worse, it CRASHED CoreImage-using apps (Terminal):
+// CoreImage calls IOSurfaceCreate with a properties dict whose objectForKey: access PAC-
+// faulted in the hook (EXC_BAD_ACCESS in IOSurfaceCreate_new <- CIImage). Leave the real
+// IOSurfaceCreate untouched.
 
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
