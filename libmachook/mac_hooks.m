@@ -32,6 +32,12 @@ void EnableJIT(void);
 // offsets hardcoded for macOS 13.4
 // IOMobileFramebuffer`kern_SwapEnd + 36
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt 0x4400 + 0x24
+// IOMobileFramebuffer`kern_SwapEnd + 0x30: `bl IOConnectCallStructMethod` (sel=5) — the call
+// that presents WindowServer's composited surface to the PHYSICAL iPad panel.  In coexistence
+// mode (iOS backboardd owns the panel, macOS viewed via VNC off-screen) we neutralize this so
+// WS never scans out to the panel -> no iOS/macOS flicker.  Gated to WindowServer + the runtime
+// flag file /tmp/ws_headless (chroot path) so the default macOS-on-panel behavior is unchanged.
+#define OFF_IOMobileFramebuffer_kern_SwapEnd_submit 0x4400 + 0x30
 // SkyLight`WS::Displays::CAWSManager::CAWSManager() + 560
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
 #if FORCE_SW_RENDER
@@ -103,6 +109,26 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         });
         // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
+
+        // COEXISTENCE (flicker fix): in WindowServer only, and only when the runtime flag file
+        // /tmp/ws_headless exists, neutralize kern_SwapEnd's panel present so WS renders to its
+        // framebuffer (VNC reads it) but never scans out to the physical iPad panel — iOS keeps
+        // the panel, eliminating the iOS/macOS flicker.  Default OFF (no flag file) => original
+        // macOS-on-panel behavior is untouched.  Toggle live by touch/rm /var/mnt/rootfs/tmp/ws_headless
+        // then restarting WindowServer.
+        {
+            char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
+            if(_NSGetExecutablePath(exe, &exelen) == 0 &&
+               strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
+               access("/tmp/ws_headless", F_OK) == 0) {
+                uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
+                ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
+                    if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
+                        *swapSubmit = 0xd2800000;    // mov x0, #0  (skip present, return KERN_SUCCESS)
+                    }
+                });
+            }
+        }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
         // NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService before _xpc_add_bundle");
         // register MTLCompilerService.xpc
