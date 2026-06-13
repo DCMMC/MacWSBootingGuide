@@ -669,8 +669,12 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
                 *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosGID;            // parent-id: client -> iOS GID
                 if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + g_agxIdMap[i].size;  // +0x30 = end-VA so size(=+0x30-+0x38) = parent size
+                // macOS puts a ~4GB VA at +0x40; iOS reads +0x40 as the wire-down IOByteCount
+                // -> "try to wire down too much memory" (kIOReturnBadArgument). A 0x80 sub-resource
+                // ALIASES the parent heap (already wired), so its wire-down size = the parent size.
+                *(uint64_t *)(shadowbuf + 0x40) = g_agxIdMap[i].size;
                 patched = 1; mapped = 1;
-                fprintf(stderr, "#### AGXIOC subres parent %#x -> GID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
+                fprintf(stderr, "#### AGXIOC subres parent %#x -> GID %#llx, +0x30=%#llx +0x40=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size, (unsigned long long)g_agxIdMap[i].size);
                 break;
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
@@ -680,7 +684,16 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
     if(agxIsRes && r == 0 && agxType == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
         const unsigned char *o = (const unsigned char *)outStruct;
-        uint64_t gid = *(const uint64_t *)(o + 0x28);   // iOS GID: monotonic IOGPUObject counter, echoed at OUT+0x28
+        for(size_t _i = 0; _i < *outStructCnt && _i <= 0x40; _i += 16) {  // DIAGNOSTIC: find the small namespace index (parent lookup wants array index, not the OUT+0x28 global counter)
+            fprintf(stderr, "#### AGXIOC heap-OUT +%02zx:", _i);
+            for(size_t _j = 0; _j < 16 && _i + _j < *outStructCnt; _j++) fprintf(stderr, " %02x", o[_i + _j]);
+            fprintf(stderr, "\n");
+        }
+        // IOGPUNamespace is an ARRAY indexed by a SMALL id (getObjectLocked: id<count, array[id]).
+        // OUT+0x1c holds that small sequential namespace INDEX (1,2,3...); OUT+0x28 is the global
+        // IOGPUObject counter (huge) which is NOT a valid namespace index -> retainResource()
+        // failed ("failed to lookup parent resource from shared"). Use the +0x1c index.
+        uint64_t gid = *(const uint32_t *)(o + 0x1c);
         int slot = -1;
         for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) { slot = i; break; }  // overwrite (clientID reused)
         if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
