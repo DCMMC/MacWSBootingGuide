@@ -14,6 +14,37 @@
 @import IOSurface;
 #import <stdio.h>
 #import <stdlib.h>
+#import <unistd.h>
+#import <dlfcn.h>
+#import <mach/mach.h>
+#import <libkern/OSCacheControl.h>
+
+// In the chroot the macOS sandbox is unreachable, so libsystem_sandbox's
+// gpu_bundle_is_path_trusted() returns FALSE for the (existing) AGX bundle
+// /System/Library/Extensions/AGXMetal13_3.bundle -> getMetalPluginClassForService
+// logs "Failed to find bundle for accelerator bundle named: AGXMetal13_3" and
+// returns Nil (no AGX device). Force the trust check to succeed so the real AGX
+// Metal class loads. gpu_bundle_is_path_trusted = gpu_bundle_find_trusted + 0x190
+// (measured live, macOS 13.4 22F66). Self-contained in the probe (no libmachook
+// rebuild) for fast/safe iteration of the AGX path.
+static void patch_sandbox_gpu_trust(void) {
+    void *ft = dlsym(RTLD_DEFAULT, "gpu_bundle_find_trusted");
+    if (!ft) { fprintf(stderr, "AGXPROBE trustpatch: gpu_bundle_find_trusted NOT FOUND\n"); return; }
+    uint32_t *p = (uint32_t *)((uintptr_t)ft + 0x190); // gpu_bundle_is_path_trusted
+    fprintf(stderr, "AGXPROBE trustpatch: is_path_trusted@%p orig=0x%08x 0x%08x\n", (void *)p, p[0], p[1]);
+    if (vm_protect(mach_task_self(), (vm_address_t)p, 8, false,
+                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+        fprintf(stderr, "AGXPROBE trustpatch: vm_protect RW failed\n"); return;
+    }
+    // gpu_bundle_is_path_trusted convention: 0 = trusted (success), 1 = not trusted
+    // (try next path), -1 = hard error. find_trusted only strlcpy's the path + returns
+    // success when the trust check returns 0. So return 0, NOT 1.
+    p[0] = 0x52800000; // mov w0, #0
+    p[1] = 0xd65f03c0; // ret
+    vm_protect(mach_task_self(), (vm_address_t)p, 8, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    sys_icache_invalidate(p, 8);
+    fprintf(stderr, "AGXPROBE trustpatch: is_path_trusted -> return 0 (trusted)\n");
+}
 
 int main(int argc, char **argv) {
     int maxStage = (argc > 1) ? atoi(argv[1]) : 3;
@@ -26,6 +57,11 @@ int main(int argc, char **argv) {
         "?"
 #endif
     );
+
+    // optional pre-Metal pause so lldb can attach (AGXPROBE_DELAY=seconds)
+    { const char *d = getenv("AGXPROBE_DELAY"); if (d && atoi(d) > 0) { fprintf(stderr, "AGXPROBE sleeping %ds for debugger...\n", atoi(d)); sleep(atoi(d)); } }
+    // force the sandbox GPU-bundle trust check to pass (chroot has no sandbox)
+    patch_sandbox_gpu_trust();
 
     @autoreleasepool {
         // Stage 1: device — enumerate ALL Metal devices, print names, PREFER the non-sim (AGX)
