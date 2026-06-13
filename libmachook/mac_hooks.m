@@ -650,6 +650,13 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if(agxIsRes) {
         const unsigned char *src = (const unsigned char *)inStruct;
         agxType = src[0];
+        if(agxType == 0x80) {  // DIAGNOSTIC: dump the macOS-sent sub-resource args struct (IOGPUNewResourceArgs)
+            for(size_t _i = 0; _i < inStructCnt && _i <= 0x60; _i += 16) {
+                fprintf(stderr, "#### AGXIOC subres-IN +%02zx:", _i);
+                for(size_t _j = 0; _j < 16 && _i + _j < inStructCnt; _j++) fprintf(stderr, " %02x", src[_i + _j]);
+                fprintf(stderr, "\n");
+            }
+        }
         agxClientID = *(const uint32_t *)(src + 0x48);           // client-assigned id / parent-id
         uint64_t bc = *(const uint64_t *)(src + 0x40);           // iOS 32-bit IOByteCount
         uint64_t f30 = *(const uint64_t *)(src + 0x30);

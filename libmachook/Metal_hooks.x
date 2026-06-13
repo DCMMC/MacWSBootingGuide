@@ -227,6 +227,19 @@ extern int xpc_connection_enable_sim2host_4sim();
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
+    // Install the getMetalPluginClassForService hook on ALL arches: arm64/x86_64 ->
+    // MTLFakeDevice; arm64e -> AGX for the agxprobe harness (FORCE_M1_DRIVER).
+    MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
+    %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
+
+    // The SIM bridge below (EnableSimApple5 pref + reroute of com.apple.metal.simulator XPC
+    // + MTLSimDriverHost.xpc registration) is what makes the SIM MTLDevice available — even
+    // on arm64e (MTLCopyAllDevices then returns only the sim device, so MTLCreateSystemDefault
+    // picks sim regardless of getMetalPluginClassForService -> AGX).  For the agxprobe AGX-path
+    // harness, SKIP the sim bridge so no sim device can register and Metal must use the real
+    // AGX device.  Everything else (GUI apps, WindowServer) keeps the sim bridge unchanged.
+    { const char *pn = getprogname(); if(pn && strstr(pn, "agxprobe")) return; }
+
     dispatch_async(dispatch_get_main_queue(), ^{
         // force Apple 5 profile.
         // NOTE: do NOT pass ObjC/CF constant literals (@"..." / @(YES)) here. On the
@@ -240,11 +253,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         CFRelease(key);
         CFRelease(app);
     });
-    
-    // Install on all arches: arm64/x86_64 -> MTLFakeDevice; arm64e -> AGX (FORCE_M1_DRIVER).
-    MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
-    %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
-    
+
     MSImageRef xpc = MSGetImageByName("/usr/lib/system/libxpc.dylib");
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
     // register MTLSimDriverHost.xpc
