@@ -698,21 +698,19 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
                 *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosGID;            // parent-id: client -> iOS GID
-                if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + g_agxIdMap[i].size;  // +0x30 = end-VA so size(=+0x30-+0x38) = parent size
-                // macOS puts a ~4GB VA at +0x40; iOS reads +0x40 as the wire-down IOByteCount
-                // -> "try to wire down too much memory" (kIOReturnBadArgument). A 0x80 sub-resource
-                // ALIASES the parent heap (already wired), so its wire-down size = the parent size.
-                *(uint64_t *)(shadowbuf + 0x40) = g_agxIdMap[i].size;
-                // sub iOS GPU VA = parent iOS base + bufferOffset. bufferOffset = sub macOS VA - parent
-                // macOS base. The heap's own IN carries no macOS VA (it's 0), so LEARN the base lazily as
-                // the LOWEST sub VA seen for this parent (= the offset-0 buffer). The iOS kernel hands every
-                // sub the same VA (parent+1page), so we must reconstruct the real per-buffer offset here.
+                // Learn the parent CPU base (lowest sub VA = the offset-0 buffer), then this sub's offset.
                 if(va38 && (g_agxIdMap[i].macosbase == 0 || va38 < g_agxIdMap[i].macosbase)) g_agxIdMap[i].macosbase = va38;
-                { uint64_t _off = (va38 >= g_agxIdMap[i].macosbase) ? (va38 - g_agxIdMap[i].macosbase) : 0;
-                  agxSubGpu0 = g_agxIdMap[i].gpuva0 + _off; }
+                uint64_t _off = (va38 >= g_agxIdMap[i].macosbase) ? (va38 - g_agxIdMap[i].macosbase) : 0;
+                // The iOS kernel computes the returned sub gpuAddr = parent_base + (args[0x30]-args[0x38]).
+                // Setting that delta = the REAL sub offset makes the KERNEL itself return a distinct VA =
+                // parent_base+off AND map the sub there (driver & kernel stay consistent — no OUT[0] desync).
+                // [Previously the shim set delta = parent.size, so every sub collapsed to parent_base+size.]
+                if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + _off;
+                *(uint64_t *)(shadowbuf + 0x40) = g_agxIdMap[i].size;   // wire/size IOByteCount = arena size (≥ sub)
+                agxSubGpu0 = g_agxIdMap[i].gpuva0 + _off;               // expected returned VA (verify post-call)
                 agxSubRW = 1;
                 patched = 1; mapped = 1;
-                fprintf(stderr, "#### AGXIOC subres parent %#x -> GID %#llx, +0x30=%#llx +0x40=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size, (unsigned long long)g_agxIdMap[i].size);
+                fprintf(stderr, "#### AGXIOC subres parent %#x GID %#llx off %#llx -> expect %#llx\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)_off, (unsigned long long)agxSubGpu0);
                 break;
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
@@ -748,14 +746,13 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx gpuva0 %#llx macosbase %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz, (unsigned long long)*(const uint64_t *)(o + 0x00), (unsigned long long)agxVa38);
         }
         if(agxType == 0x80 && agxSubRW) {
-            // Each sub gets a DISTINCT GPU VA = parent arena base + (sub CPU offset within the arena).
-            // The arena is mapped for its full 0x8000 slot now (heap byte-count fix), so these are all
-            // backed -> no GPU fault; and this matches the IOGPUMetalBuffer assert (sub.gpuAddr ==
-            // primary.gpuAddr + bufferOffset). [anchoring on the kernel's sub VA = parent+arena_size
-            // lands past the mapped arena -> status=5 GPU fault; anchoring on parent base lands inside.]
             uint64_t oldg = *(uint64_t *)((unsigned char *)outStruct + 0x00);
-            if(agxSubGpu0) *(uint64_t *)((unsigned char *)outStruct + 0x00) = agxSubGpu0;
-            fprintf(stderr, "#### AGXIOC subres OUT[0] %#llx -> %#llx (cpuVA %#llx)\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0, (unsigned long long)agxVa38);
+            // The kernel should now return parent_base+off (we set args[0x30]-args[0x38]=off). If it does
+            // (MATCH), the sub is mapped THERE -> leave it (driver & kernel consistent). If not (MISMATCH),
+            // override OUT[0] to the expected VA as a fallback (kernel mapping may differ -> may still fault).
+            int match = (oldg == agxSubGpu0);
+            if(!match && agxSubGpu0) *(uint64_t *)((unsigned char *)outStruct + 0x00) = agxSubGpu0;
+            fprintf(stderr, "#### AGXIOC subres OUT[0] kernel=%#llx expect=%#llx %s\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0, match ? "MATCH" : "MISMATCH(override)");
         }
     }
     if(IOConnectIsIOGPU(client)) {
