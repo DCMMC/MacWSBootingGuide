@@ -5,6 +5,7 @@
 @import MachO;
 #import <IOKit/IOKitLib.h>
 #import <xpc/xpc.h>
+#import <sys/sysctl.h>
 #import "interpose.h"
 #import "utils.h"
 
@@ -35,8 +36,9 @@ void EnableJIT(void);
 // IOMobileFramebuffer`kern_SwapEnd + 0x30: `bl IOConnectCallStructMethod` (sel=5) — the call
 // that presents WindowServer's composited surface to the PHYSICAL iPad panel.  In coexistence
 // mode (iOS backboardd owns the panel, macOS viewed via VNC off-screen) we neutralize this so
-// WS never scans out to the panel -> no iOS/macOS flicker.  Gated to WindowServer + the runtime
-// flag file /tmp/ws_headless (chroot path) so the default macOS-on-panel behavior is unchanged.
+// WS never scans out to the panel -> no iOS/macOS flicker.  Gated to WindowServer + auto-detection
+// of a running backboardd (coexistence); left intact in the original macOS-on-panel mode where
+// backboardd is unloaded.  (/tmp/ws_headless still force-enables it for testing.)
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_submit 0x4400 + 0x30
 // MTLSimDriver`sendXPCMessageWithReplySync + 0x58: `bl .cold.1` which abort()s when the XPC
 // reply is an error object (i.e. the MTLSimDriverHost XPC service crashed — its
@@ -75,6 +77,28 @@ const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *MTLSimDriverPath = "/usr/local/Frameworks/MTLSimDriver.framework/MTLSimDriver";
+
+// True if a process named `name` is currently running anywhere on the system.  The chroot
+// shares the kernel proc table, so iOS-context processes (e.g. backboardd) are visible.
+// Used to auto-detect "coexistence mode": when iOS's backboardd is alive we are sharing the
+// device with the iOS UI, so WindowServer must not scan out to the physical panel.
+static BOOL is_process_running(const char *name) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return NO;
+    len += len / 8 + 0x4000;  // pad: the table can grow between the sizing and the fetch
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(len);
+    if (!procs) return NO;
+    BOOL found = NO;
+    if (sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
+        size_t n = len / sizeof(struct kinfo_proc);
+        for (size_t i = 0; i < n; i++) {
+            if (strncmp(procs[i].kp_proc.p_comm, name, MAXCOMLEN) == 0) { found = YES; break; }
+        }
+    }
+    free(procs);
+    return found;
+}
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
@@ -120,17 +144,18 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         });
         // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
 
-        // COEXISTENCE (flicker fix): in WindowServer only, and only when the runtime flag file
-        // /tmp/ws_headless exists, neutralize kern_SwapEnd's panel present so WS renders to its
-        // framebuffer (VNC reads it) but never scans out to the physical iPad panel — iOS keeps
-        // the panel, eliminating the iOS/macOS flicker.  Default OFF (no flag file) => original
-        // macOS-on-panel behavior is untouched.  Toggle live by touch/rm /var/mnt/rootfs/tmp/ws_headless
-        // then restarting WindowServer.
+        // COEXISTENCE (flicker fix): in WindowServer only, when iOS's backboardd is running
+        // (we're sharing the device with the iOS UI), neutralize kern_SwapEnd's panel present
+        // so WS renders to its framebuffer (VNC reads it) but never scans out to the physical
+        // iPad panel — iOS keeps the panel, eliminating the iOS/macOS flicker.  When backboardd
+        // is NOT running (the original "unload SpringBoard+backboardd, macOS takes the panel"
+        // mode) the present is left intact.  Auto-detecting backboardd makes this survive
+        // reboots with no flag file; /tmp/ws_headless still force-enables it for testing.
         {
             char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
             if(_NSGetExecutablePath(exe, &exelen) == 0 &&
                strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
-               access("/tmp/ws_headless", F_OK) == 0) {
+               (is_process_running("backboardd") || access("/tmp/ws_headless", F_OK) == 0)) {
                 uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
                 ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
                     if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
