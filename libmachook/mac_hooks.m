@@ -726,6 +726,17 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         fprintf(stderr, "#### AGXIOC SUBMIT IN[%zu]:", inStructCnt);
         for(size_t i = 0; i < inStructCnt && i < 64; i++) fprintf(stderr, " %02x", s[i]);
         fprintf(stderr, "\n");
+        // Deref the two command-buffer descriptor pointers (+0x10,+0x18) the firmware reads — dump 96 bytes
+        // each to see the cmdbuf GPU VA / length / flags (is a referenced VA still wrong, or format-diverged?).
+        if(inStructCnt >= 0x20) {
+            uint64_t cbp[2] = { *(const uint64_t *)(s + 0x10), *(const uint64_t *)(s + 0x18) };
+            for(int pi = 0; pi < 2; pi++) if(cbp[pi] > 0x100000000ULL) {
+                const unsigned char *cb = (const unsigned char *)cbp[pi];
+                fprintf(stderr, "#### AGXIOC SUBMIT cmdbuf%d@%#llx:", pi, (unsigned long long)cbp[pi]);
+                for(int j = 0; j < 96; j++) fprintf(stderr, " %02x", cb[j]);
+                fprintf(stderr, "\n");
+            }
+        }
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
     if(IOConnectIsIOGPU(client) && selector == 0xd && r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x10) {
