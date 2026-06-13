@@ -187,7 +187,10 @@ static id(*MTLCreateSimulatorDevice)(void);
     // survival pivot (safe). AGX shim: heap+cmdqueue+parent-lookup work (UPDATE 5/6 in
     // memory agx-direct-path-kernel-abi-deadend); sub-resource size-fix pending a clean
     // test. Live AGX testing strains the GUI (MTLSimDriverHost/WindowServer crashes), so
-    // default to Nil (CPU fallback) for stability.
+    // default to Nil (CPU fallback) for stability — EXCEPT the standalone `agxprobe` test
+    // harness, which gets the REAL AGX class (%orig) so the AGX path can be iterated SAFELY
+    // (a wrong value crashes only the throwaway probe, never WindowServer/GUI apps).
+    { const char *pn = getprogname(); if(pn && strstr(pn, "agxprobe")) return %orig; }
     return Nil;
 #else
     return MTLFakeDevice.class;
