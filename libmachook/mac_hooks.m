@@ -637,7 +637,7 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
 // bridge the two id-spaces here: record each created resource's clientID -> the
 // iOS GID returned in its OUT struct, and rewrite parent-id references in 0x80
 // sub-resources from clientID to the iOS GID so getResource() finds the parent.
-static struct { uint64_t clientID, iosGID, size; } g_agxIdMap[128];
+static struct { uint64_t clientID, iosGID, size, gpuva0, macosbase; } g_agxIdMap[128];
 static int g_agxIdMapCount;
 
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
@@ -646,13 +646,14 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
     unsigned char shadowbuf[256];
     uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
+    uint64_t agxSubGpu0 = 0; int agxSubRW = 0; uint64_t agxVa38 = 0;
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
     if(agxIsRes) {
         const unsigned char *src = (const unsigned char *)inStruct;
         agxType = src[0];
-        if(agxType == 0x80) {  // DIAGNOSTIC: dump the macOS-sent sub-resource args struct (IOGPUNewResourceArgs)
+        {  // DIAGNOSTIC: dump the macOS-sent args struct (IOGPUNewResourceArgs) for heap(t=0)+sub(t=0x80)
             for(size_t _i = 0; _i < inStructCnt && _i <= 0x60; _i += 16) {
-                fprintf(stderr, "#### AGXIOC subres-IN +%02zx:", _i);
+                fprintf(stderr, "#### AGXIOC res-IN[t=%#x] +%02zx:", agxType, _i);
                 for(size_t _j = 0; _j < 16 && _i + _j < inStructCnt; _j++) fprintf(stderr, " %02x", src[_i + _j]);
                 fprintf(stderr, "\n");
             }
@@ -661,6 +662,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         uint64_t bc = *(const uint64_t *)(src + 0x40);           // iOS 32-bit IOByteCount
         uint64_t f30 = *(const uint64_t *)(src + 0x30);
         uint64_t va38 = *(const uint64_t *)(src + 0x38);
+        agxVa38 = va38;                                          // carry to post-call (heap macOS base)
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
         if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t nb = sz32 ? sz32 : 0x1000; *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count
@@ -673,6 +675,14 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 // -> "try to wire down too much memory" (kIOReturnBadArgument). A 0x80 sub-resource
                 // ALIASES the parent heap (already wired), so its wire-down size = the parent size.
                 *(uint64_t *)(shadowbuf + 0x40) = g_agxIdMap[i].size;
+                // sub iOS GPU VA = parent iOS base + bufferOffset. bufferOffset = sub macOS VA - parent
+                // macOS base. The heap's own IN carries no macOS VA (it's 0), so LEARN the base lazily as
+                // the LOWEST sub VA seen for this parent (= the offset-0 buffer). The iOS kernel hands every
+                // sub the same VA (parent+1page), so we must reconstruct the real per-buffer offset here.
+                if(va38 && (g_agxIdMap[i].macosbase == 0 || va38 < g_agxIdMap[i].macosbase)) g_agxIdMap[i].macosbase = va38;
+                { uint64_t _off = (va38 >= g_agxIdMap[i].macosbase) ? (va38 - g_agxIdMap[i].macosbase) : 0;
+                  agxSubGpu0 = g_agxIdMap[i].gpuva0 + _off; }
+                agxSubRW = 1;
                 patched = 1; mapped = 1;
                 fprintf(stderr, "#### AGXIOC subres parent %#x -> GID %#llx, +0x30=%#llx +0x40=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size, (unsigned long long)g_agxIdMap[i].size);
                 break;
@@ -682,23 +692,27 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         if(patched) inStruct = shadowbuf;
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
-    if(agxIsRes && r == 0 && agxType == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
+    if(agxIsRes && r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
         const unsigned char *o = (const unsigned char *)outStruct;
-        for(size_t _i = 0; _i < *outStructCnt && _i <= 0x40; _i += 16) {  // DIAGNOSTIC: find the small namespace index (parent lookup wants array index, not the OUT+0x28 global counter)
-            fprintf(stderr, "#### AGXIOC heap-OUT +%02zx:", _i);
-            for(size_t _j = 0; _j < 16 && _i + _j < *outStructCnt; _j++) fprintf(stderr, " %02x", o[_i + _j]);
-            fprintf(stderr, "\n");
+        if(agxType == 0) {  // parent HEAP: record namespace index (OUT+0x1c) + base GPU VA (OUT+0x00)
+            // IOGPUNamespace is an ARRAY indexed by a SMALL id (getObjectLocked: id<count, array[id]);
+            // OUT+0x1c is that small index. The GPU VA (resource[0x38] via IOGPUResourceCreate) = OUT+0x00.
+            uint64_t gid = *(const uint32_t *)(o + 0x1c);
+            int slot = -1;
+            for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) { slot = i; break; }  // overwrite (clientID reused)
+            if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
+            if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosGID = gid; g_agxIdMap[slot].size = agxHeapSz; g_agxIdMap[slot].gpuva0 = *(const uint64_t *)(o + 0x00); g_agxIdMap[slot].macosbase = agxVa38; }
+            fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx gpuva0 %#llx macosbase %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz, (unsigned long long)*(const uint64_t *)(o + 0x00), (unsigned long long)agxVa38);
         }
-        // IOGPUNamespace is an ARRAY indexed by a SMALL id (getObjectLocked: id<count, array[id]).
-        // OUT+0x1c holds that small sequential namespace INDEX (1,2,3...); OUT+0x28 is the global
-        // IOGPUObject counter (huge) which is NOT a valid namespace index -> retainResource()
-        // failed ("failed to lookup parent resource from shared"). Use the +0x1c index.
-        uint64_t gid = *(const uint32_t *)(o + 0x1c);
-        int slot = -1;
-        for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) { slot = i; break; }  // overwrite (clientID reused)
-        if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
-        if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosGID = gid; g_agxIdMap[slot].size = agxHeapSz; }
-        fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz);
+        if(agxType == 0x80 && agxSubRW) {
+            // gpuAddress = resource[0x38] = new_resource OUT[0x00] (IOGPUResourceCreate @0x1eec601b0).
+            // The iOS kernel gives the 0x80 sub-resource its OWN GPU VA (one page past the parent),
+            // but the buffer ALIASES the parent at offset 0, so IOGPUMetalBuffer.m:310 asserts
+            // sub.gpuAddr==parent.gpuAddr+bufferOffset and fails. Rewrite OUT[0] to the parent's base GPU VA.
+            uint64_t oldg = *(uint64_t *)((unsigned char *)outStruct + 0x00);
+            if(agxSubGpu0) *(uint64_t *)((unsigned char *)outStruct + 0x00) = agxSubGpu0;
+            fprintf(stderr, "#### AGXIOC subres OUT[0] gpuAddr %#llx -> %#llx\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0);
+        }
     }
     if(IOConnectIsIOGPU(client)) {
         fprintf(stderr, "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
