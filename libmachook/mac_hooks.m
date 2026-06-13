@@ -51,6 +51,14 @@ void EnableJIT(void);
 #define OFF_MTLSimDriver_sendXPC_abort 0x25c8
 // SkyLight`WS::Displays::CAWSManager::CAWSManager() + 560
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
+// SkyLight`WSCompositeDestinationCreateWithMetalTexture (func at SkyLight+0x14b53c) asserts
+// `texture != nil` at func+0x364.  When MTLSimDriverHost crashes, -[MTLSimDevice
+// newTextureWithDescriptor:] returns nil (our MTLSimDriver patch returns the error reply
+// instead of aborting WS), and WS then aborts on this assert -> launchd relaunch loop / wedge.
+// Overwrite the texture-assert block (func+0x364: `adrp x0,648; add x0,x0,#0xd4d`) with
+// `mov x0,#0 ; b func+0x318` (the function's epilogue, just after `mov x0,x23`), so the
+// texture-nil path returns nil (WS skips that layer for the frame) instead of asserting.
+#define OFF_SkyLight_WSCompositeDest_texAssert 0x14b8a0
 #if FORCE_SW_RENDER
 // SkyLight`WSSystemCanCompositeWithMetal::once
 // #define OFF_SkyLight_WSSystemCanCompositeWithMetal 0x1d72b148
@@ -115,6 +123,16 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // abort) on a non-matching SkyLight version/arch.
             if (*check == 0xb4000588) { // cbz    x8, do_abort
                 *check = 0xd503201f; // nop
+            }
+        });
+
+        // Make WSCompositeDestinationCreateWithMetalTexture survive a nil texture (from an
+        // MTLSimDriverHost crash) by returning nil instead of asserting `texture != nil`.
+        uint32_t *texAssert = (uint32_t *)(OFF_SkyLight_WSCompositeDest_texAssert + (uintptr_t)header);
+        ModifyExecutableRegion(texAssert, sizeof(uint32_t[2]), ^{
+            if (texAssert[0] == 0x90001440 && texAssert[1] == 0x91353400) { // adrp x0,648 ; add x0,x0,#0xd4d
+                texAssert[0] = 0xd2800000; // mov x0, #0   (return nil)
+                texAssert[1] = 0x17ffffec; // b func+0x318 (epilogue, after `mov x0,x23`)
             }
         });
         
