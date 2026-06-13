@@ -102,9 +102,18 @@ log "starting OSXvnc-server on :5900..."
 bash "$RUN_BASH" -c "export PATH=$CHROOT_PATH; /usr/local/bin/OSXvnc-server -rfbnoauth -rfbport 5900 >/tmp/vnc.out 2>&1 &" >/dev/null 2>&1
 sleep 2
 
-log "starting Terminal.app..."
-bash "$RUN_BASH" -c "export PATH=$CHROOT_PATH; /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal >/tmp/term.out 2>&1 &" >/dev/null 2>&1
-sleep 3
+# Terminal (and other .apps) can intermittently abort at launch in HIServices
+# _RegisterApplication when launchservicesd fails to hand out an Application Serial
+# Number (ASN) — a launch-time race.  It is recoverable, so just retry the launch a few
+# times until it stays up.  (LSDONOTABORTIFNOASN is set as a belt-and-suspenders; the
+# documented LaunchServices opt-out for the no-ASN abort.)
+log "starting Terminal.app (retry on the intermittent _RegisterApplication abort)..."
+for attempt in 1 2 3 4 5; do
+    bash "$RUN_BASH" -c "export PATH=$CHROOT_PATH LSDONOTABORTIFNOASN=1; /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal >/tmp/term.out 2>&1 &" >/dev/null 2>&1
+    sleep 3
+    if [ -n "$(pids_for 'MacOS/Terminal' | head -1)" ]; then log "  Terminal up (attempt $attempt)"; break; fi
+    log "  Terminal did not stay up (attempt $attempt) — retrying..."
+done
 
 show_status
 IP=$(/usr/sbin/ipconfig getifaddr en0 2>/dev/null)
