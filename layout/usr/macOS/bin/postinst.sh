@@ -115,6 +115,15 @@ add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
+
+# Fix macOS LaunchDaemons plist ownership.  dpkg installs them as the build user
+# (e.g. mobile:mobile); `launchctl load` then rejects them with "bad ownership/
+# permissions" (launchd requires root:wheel and not group/world-writable).
+if [ -d /var/jb/usr/macOS/LaunchDaemons ]; then
+    chown root:wheel /var/jb/usr/macOS/LaunchDaemons/*.plist 2>/dev/null
+    chmod 644 /var/jb/usr/macOS/LaunchDaemons/*.plist 2>/dev/null
+    echo "[INFO] fixed LaunchDaemons plist ownership (root:wheel 644)"
+fi
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
 cp -vf /var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer_macos /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
 add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer

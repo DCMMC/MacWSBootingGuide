@@ -38,6 +38,15 @@ void EnableJIT(void);
 // WS never scans out to the panel -> no iOS/macOS flicker.  Gated to WindowServer + the runtime
 // flag file /tmp/ws_headless (chroot path) so the default macOS-on-panel behavior is unchanged.
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_submit 0x4400 + 0x30
+// MTLSimDriver`sendXPCMessageWithReplySync + 0x58: `bl .cold.1` which abort()s when the XPC
+// reply is an error object (i.e. the MTLSimDriverHost XPC service crashed — its
+// newIOSurfaceTexture null-context bug fires under heavy compositing).  That abort kills
+// WindowServer and launchd relaunches it on-demand, which can runaway-loop and wedge the
+// device.  Patch the abort call site to `b +168` (the function's normal return) so it returns
+// the error reply instead; the caller _MTLNewObject_Deprecated already handles a non-success
+// reply (creates no object), so newTextureWithDescriptor just returns nil and WS survives the
+// host crash (the host relaunches on the next request).  bl .cold.1 (0x9400606e) -> b (0x14000014).
+#define OFF_MTLSimDriver_sendXPC_abort 0x25c8
 // SkyLight`WS::Displays::CAWSManager::CAWSManager() + 560
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
 #if FORCE_SW_RENDER
@@ -65,6 +74,7 @@ const char *MetalPath = "/System/Library/Frameworks/Metal.framework/Versions/A/M
 const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
+const char *MTLSimDriverPath = "/usr/local/Frameworks/MTLSimDriver.framework/MTLSimDriver";
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
@@ -211,6 +221,21 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             });
         }
+    } else if(!strncmp(info.dli_fname, MTLSimDriverPath, strlen(MTLSimDriverPath))) {
+        // Make WindowServer (and any Metal client using the sim driver) SURVIVE an
+        // MTLSimDriverHost XPC-service crash instead of abort()ing into a launchd
+        // relaunch loop.  sendXPCMessageWithReplySync calls .cold.1 -> abort() when the
+        // reply is an XPC error object (host crashed).  Patch that call site to the
+        // function's normal return so it returns the error reply; the caller
+        // _MTLNewObject_Deprecated handles a non-success reply (creates no object), so
+        // newTextureWithDescriptor returns nil and WS keeps running.  The byte guard makes
+        // this a no-op on any slice/version where the expected instruction isn't present.
+        uint32_t *abortSite = (uint32_t *)(OFF_MTLSimDriver_sendXPC_abort + (uintptr_t)header);
+        ModifyExecutableRegion(abortSite, sizeof(uint32_t), ^{
+            if (*abortSite == 0x9400606e) { // bl sendXPCMessageWithReplySync.cold.1 (abort)
+                *abortSite = 0x14000014;    // b +168 (normal return; return the reply)
+            }
+        });
     }
 }
 
