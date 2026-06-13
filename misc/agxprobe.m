@@ -112,6 +112,13 @@ int main(int argc, char **argv) {
         for(int _i = 0; _i < 30 && [cb status] < 4; _i++) usleep(100000);  // up to 3s
         fprintf(stderr, "AGXPROBE [4d] status=%ld error=%s\n", (long)[cb status],
                 [cb error] ? [[[cb error] localizedDescription] UTF8String] : "none");
+        if ([cb error]) {
+            NSError *e = [cb error];
+            fprintf(stderr, "AGXPROBE [4d2] domain=%s code=%ld userInfo=%s\n",
+                    [[e domain] UTF8String], (long)[e code], [[[e userInfo] description] UTF8String]);
+            NSArray *infos = [[e userInfo] objectForKey:@"MTLCommandBufferEncoderInfoErrorKey"];
+            for (id info in infos) fprintf(stderr, "AGXPROBE [4d2]   enc: %s\n", [[info description] UTF8String]);
+        }
         fprintf(stderr, "AGXPROBE [4e] readback[0]=0x%02x [4095]=0x%02x (expect 0xab if GPU ran)\n", p[0], p[4095]);
         if (p[0] != 0xAB || p[4095] != 0xAB) {
             fprintf(stderr, "AGXPROBE WARN stage4 (buffer readback not 0xAB) — continuing to IOSurface test\n");

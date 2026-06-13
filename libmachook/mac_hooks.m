@@ -665,7 +665,7 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
 // bridge the two id-spaces here: record each created resource's clientID -> the
 // iOS GID returned in its OUT struct, and rewrite parent-id references in 0x80
 // sub-resources from clientID to the iOS GID so getResource() finds the parent.
-static struct { uint64_t clientID, iosGID, size, gpuva0, macosbase; } g_agxIdMap[128];
+static struct { uint64_t clientID, iosGID, size, gpuva0, macosbase, subBaseGpu, subBaseCpu; } g_agxIdMap[128];
 static int g_agxIdMapCount;
 
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
@@ -693,7 +693,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         agxVa38 = va38;                                          // carry to post-call (heap macOS base)
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
-        if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t nb = sz32 ? sz32 : 0x1000; *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count
+        if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t nb = sz32 ? sz32 : (agxClientID == 0x20000 ? 0x8000 : 0x1000); *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count (0x20000 sub-arenas have no +0x58 size: map the full 0x8000 VA slot so sub VAs are backed)
         if(agxType == 0x80) {
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
@@ -719,7 +719,22 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
         if(patched) inStruct = shadowbuf;
     }
+    // DIAGNOSTIC: CreateDeviceShmem (0xd) scalar inputs + submit (0x1a) 56-byte descriptor
+    if(IOConnectIsIOGPU(client) && selector == 0xd && in && inCnt >= 2) {
+        fprintf(stderr, "#### AGXIOC CreateDeviceShmem IN size=%#llx type=%#llx\n", (unsigned long long)in[0], (unsigned long long)in[1]);
+    }
+    if(IOConnectIsIOGPU(client) && selector == 0x1a && inStruct && inStructCnt >= 0x10) {
+        const unsigned char *s = (const unsigned char *)inStruct;
+        fprintf(stderr, "#### AGXIOC SUBMIT IN[%zu]:", inStructCnt);
+        for(size_t i = 0; i < inStructCnt && i < 64; i++) fprintf(stderr, " %02x", s[i]);
+        fprintf(stderr, "\n");
+    }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    if(IOConnectIsIOGPU(client) && selector == 0xd && r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x10) {
+        const uint64_t *o64 = (const uint64_t *)outStruct;
+        const uint32_t *o32 = (const uint32_t *)outStruct;
+        fprintf(stderr, "#### AGXIOC CreateDeviceShmem OUT va=%#llx id=%#x sz=%#x\n", (unsigned long long)o64[0], o32[2], o32[3]);
+    }
     if(agxIsRes && r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
         const unsigned char *o = (const unsigned char *)outStruct;
         if(agxType == 0) {  // parent HEAP: record namespace index (OUT+0x1c) + base GPU VA (OUT+0x00)
@@ -729,19 +744,18 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             int slot = -1;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) { slot = i; break; }  // overwrite (clientID reused)
             if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
-            if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosGID = gid; g_agxIdMap[slot].size = agxHeapSz; g_agxIdMap[slot].gpuva0 = *(const uint64_t *)(o + 0x00); g_agxIdMap[slot].macosbase = agxVa38; }
+            if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosGID = gid; g_agxIdMap[slot].size = agxHeapSz; g_agxIdMap[slot].gpuva0 = *(const uint64_t *)(o + 0x00); g_agxIdMap[slot].macosbase = agxVa38; g_agxIdMap[slot].subBaseGpu = 0; g_agxIdMap[slot].subBaseCpu = 0; }
             fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx gpuva0 %#llx macosbase %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz, (unsigned long long)*(const uint64_t *)(o + 0x00), (unsigned long long)agxVa38);
         }
         if(agxType == 0x80 && agxSubRW) {
-            // gpuAddress = resource[0x38] = new_resource OUT[0x00] (IOGPUResourceCreate @0x1eec601b0).
-            // The iOS kernel maps each 0x80 sub-resource's backing at its OWN real VA (NOT aliased to
-            // the parent). Faking OUT[0]=parent.gpuAddr+offset passed the IOGPUMetalBuffer.m:310 assert
-            // but made the GPU access the wrong (unmapped) VA -> the command buffer never executed
-            // (status stuck at Committed, buffer unchanged). So KEEP the kernel's real VA here and
-            // instead relax that assert (IOGPU patch in loadImageCallback) so the GPU uses the real,
-            // correctly-mapped VA. (agxSubGpu0 retained for logging only.)
+            // Each sub gets a DISTINCT GPU VA = parent arena base + (sub CPU offset within the arena).
+            // The arena is mapped for its full 0x8000 slot now (heap byte-count fix), so these are all
+            // backed -> no GPU fault; and this matches the IOGPUMetalBuffer assert (sub.gpuAddr ==
+            // primary.gpuAddr + bufferOffset). [anchoring on the kernel's sub VA = parent+arena_size
+            // lands past the mapped arena -> status=5 GPU fault; anchoring on parent base lands inside.]
             uint64_t oldg = *(uint64_t *)((unsigned char *)outStruct + 0x00);
-            fprintf(stderr, "#### AGXIOC subres OUT[0] gpuAddr %#llx (kept real; would-alias %#llx)\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0);
+            if(agxSubGpu0) *(uint64_t *)((unsigned char *)outStruct + 0x00) = agxSubGpu0;
+            fprintf(stderr, "#### AGXIOC subres OUT[0] %#llx -> %#llx (cpuVA %#llx)\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0, (unsigned long long)agxVa38);
         }
     }
     if(IOConnectIsIOGPU(client)) {
