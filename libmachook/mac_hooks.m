@@ -83,6 +83,7 @@ const char *IOMFBPath = "/System/Library/PrivateFrameworks/IOMobileFramebuffer.f
 const char *MetalPath = "/System/Library/Frameworks/Metal.framework/Versions/A/Metal";
 const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
+const char *IOGPUPath = "/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU";  // dladdr returns the versioned path (not the flat install-name)
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *MTLSimDriverPath = "/usr/local/Frameworks/MTLSimDriver.framework/MTLSimDriver";
 
@@ -264,6 +265,33 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             });
         }
+    } else if(!strncmp(info.dli_fname, IOGPUPath, strlen(IOGPUPath))) {
+        // Relax the IOGPUMetalBuffer.m:310 gpuAddress assert. The iOS kernel gives each 0x80
+        // sub-resource its OWN (correctly-mapped) GPU VA, not aliased to the parent, so the macOS
+        // driver's `sub._res.gpuAddress == primaryBuffer._res.gpuAddress + bufferOffset` assert fails
+        // — but the kernel's VA is valid for GPU access, so skipping the abort lets the GPU use the
+        // real buffer VA. Patch `b.ne .cold.1` (0x54000401) at -[IOGPUMetalBuffer initWithPrimaryBuffer:]
+        // +0x134 (IOGPU __TEXT base 0x1eec5a000 -> offset 0x3cac) -> nop. macOS 13.4.
+        // Find the assert by PATTERN (the cache splits __TEXT_EXEC from the mach_header, so a fixed
+        // header+offset is unreliable). The gpuAddress check is: ldr x8,[x25,#0x48]; ldr x9,[x24,#0x48];
+        // add x9,x9,x20; cmp x8,x9 — immediately followed by `b.ne .cold.1`. Nop that branch.
+        unsigned long tsz = 0;
+        uint8_t *txt = getsectiondata((const struct mach_header_64 *)header, "__TEXT_EXEC", "__text", &tsz);
+        if(!txt) txt = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &tsz);
+        static const uint8_t pat[] = {0x28,0x27,0x40,0xf9, 0x09,0x27,0x40,0xf9, 0x29,0x01,0x14,0x8b, 0x1f,0x01,0x09,0xeb};
+        int patched = 0;
+        if(txt) for(unsigned long k = 0; k + sizeof(pat) + 4 <= tsz; k += 4) {
+            if(memcmp(txt + k, pat, sizeof(pat)) == 0) {
+                uint32_t *bne = (uint32_t *)(txt + k + sizeof(pat));
+                if((*bne & 0xFF00001F) == 0x54000001) {  // b.ne <imm>
+                    ModifyExecutableRegion(bne, sizeof(uint32_t), ^{ *bne = 0xd503201f; });  // -> nop
+                    fprintf(stderr, "#### IOGPU gpuAddr assert nop'd @%p\n", (void *)bne);
+                    patched = 1;
+                }
+                break;
+            }
+        }
+        if(!patched) fprintf(stderr, "#### IOGPU gpuAddr assert pattern NOT FOUND (txt=%p sz=%lu)\n", (void *)txt, tsz);
     } else if(!strncmp(info.dli_fname, MTLSimDriverPath, strlen(MTLSimDriverPath))) {
         // Make WindowServer (and any Metal client using the sim driver) SURVIVE an
         // MTLSimDriverHost XPC-service crash instead of abort()ing into a launchd
@@ -706,12 +734,14 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
         if(agxType == 0x80 && agxSubRW) {
             // gpuAddress = resource[0x38] = new_resource OUT[0x00] (IOGPUResourceCreate @0x1eec601b0).
-            // The iOS kernel gives the 0x80 sub-resource its OWN GPU VA (one page past the parent),
-            // but the buffer ALIASES the parent at offset 0, so IOGPUMetalBuffer.m:310 asserts
-            // sub.gpuAddr==parent.gpuAddr+bufferOffset and fails. Rewrite OUT[0] to the parent's base GPU VA.
+            // The iOS kernel maps each 0x80 sub-resource's backing at its OWN real VA (NOT aliased to
+            // the parent). Faking OUT[0]=parent.gpuAddr+offset passed the IOGPUMetalBuffer.m:310 assert
+            // but made the GPU access the wrong (unmapped) VA -> the command buffer never executed
+            // (status stuck at Committed, buffer unchanged). So KEEP the kernel's real VA here and
+            // instead relax that assert (IOGPU patch in loadImageCallback) so the GPU uses the real,
+            // correctly-mapped VA. (agxSubGpu0 retained for logging only.)
             uint64_t oldg = *(uint64_t *)((unsigned char *)outStruct + 0x00);
-            if(agxSubGpu0) *(uint64_t *)((unsigned char *)outStruct + 0x00) = agxSubGpu0;
-            fprintf(stderr, "#### AGXIOC subres OUT[0] gpuAddr %#llx -> %#llx\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0);
+            fprintf(stderr, "#### AGXIOC subres OUT[0] gpuAddr %#llx (kept real; would-alias %#llx)\n", (unsigned long long)oldg, (unsigned long long)agxSubGpu0);
         }
     }
     if(IOConnectIsIOGPU(client)) {
