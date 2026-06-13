@@ -28,9 +28,21 @@ int main(int argc, char **argv) {
     );
 
     @autoreleasepool {
-        // Stage 1: device
-        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-        fprintf(stderr, "AGXPROBE [1] device=%p name=%s\n", (void*)dev, dev ? [[dev name] UTF8String] : "NIL");
+        // Stage 1: device — enumerate ALL Metal devices, print names, PREFER the non-sim (AGX)
+        // one. MTLCreateSystemDefaultDevice() picks the sim device (registered via the
+        // MTLSimDriverHost XPC bridge) even when getMetalPluginClassForService returns AGX, so
+        // we explicitly select the real GPU here to exercise the AGX-direct path.
+        NSArray<id<MTLDevice>> *allDevs = MTLCopyAllDevices();
+        fprintf(stderr, "AGXPROBE [0] MTLCopyAllDevices count=%lu\n", (unsigned long)[allDevs count]);
+        id<MTLDevice> dev = nil;
+        for (id<MTLDevice> d in allDevs) {
+            const char *nm = [[d name] UTF8String];
+            int isSim = (strstr(nm, "simulator") != NULL || strstr(nm, "iOS") != NULL);
+            fprintf(stderr, "AGXPROBE [0]   device=%p name=%s %s\n", (void*)d, nm, isSim ? "(sim)" : "(AGX?)");
+            if (!isSim) dev = d;   // prefer the non-sim device = real AGX
+        }
+        if (!dev) { fprintf(stderr, "AGXPROBE [0] no non-sim device; fallback MTLCreateSystemDefaultDevice\n"); dev = MTLCreateSystemDefaultDevice(); }
+        fprintf(stderr, "AGXPROBE [1] CHOSEN device=%p name=%s\n", (void*)dev, dev ? [[dev name] UTF8String] : "NIL");
         if (!dev) { fprintf(stderr, "AGXPROBE FAIL stage1 (no device)\n"); return 1; }
         if (maxStage < 2) { fprintf(stderr, "AGXPROBE OK (stopped after stage1)\n"); return 0; }
 
