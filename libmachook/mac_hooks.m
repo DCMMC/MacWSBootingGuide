@@ -87,6 +87,7 @@ const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Ve
 const char *IOGPUPath = "/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU";  // dladdr returns the versioned path (not the flat install-name)
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *MTLSimDriverPath = "/usr/local/Frameworks/MTLSimDriver.framework/MTLSimDriver";
+const char *AGXMetalPath = "/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3";
 
 // True if a process named `name` is currently running anywhere on the system.  The chroot
 // shares the kernel proc table, so iOS-context processes (e.g. backboardd) are visible.
@@ -308,6 +309,31 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 *abortSite = 0x14000014;    // b +168 (normal return; return the reply)
             }
         });
+    } else if(getenv("AGX_OBJC_VA_FIX") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
+        // POSTMORTEM: this code is left for documentation. The hypothesis behind it was wrong.
+        // Earlier static analysis found 22 occurrences of the byte pattern "00 00 00 00 11 00 00 00"
+        // in macOS AGXMetal13_3 __DATA_CONST,__objc_const, vs 0 occurrences in iOS, which I
+        // interpreted as 22 hardcoded 0x1100000000 GPU VAs baked into AGXResource class metadata.
+        // Verified at runtime via in-memory section dump: all 22 hits were UNALIGNED u64 reads
+        // (offset%8 == 4) of an ObjC ivar-list-like struct that holds two adjacent u32 fields
+        // 0x11 (= 17) and 0x28 (= 40). NOT a GPU VA at all.
+        // Also separately: the EXACT fault VA 0x1158048000 is NOT literally present (as bytes)
+        // in AGXMetal13_3, AGXG13G, IOGPUFamily, AGXFirmwareKextG13GRTBuddy, or RTBuddy. It is
+        // a RUNTIME-COMPUTED value from kernel- or firmware-side allocations not visible to
+        // any userland shim. Leaving this code as a "patched 0" diagnostic.
+        unsigned long sz = 0;
+        uint8_t *seg = getsectiondata((const struct mach_header_64 *)header, "__DATA_CONST", "__objc_const", &sz);
+        if(seg && sz) {
+            const uint64_t old_va = 0x1100000000ULL;
+            int patched_count = 0, near_count = 0;
+            for(unsigned long k = 0; k + 8 <= sz; k += 8) {
+                uint64_t v = *(const uint64_t *)(seg + k);
+                if(v == old_va) patched_count++;
+                if((v >> 32) == 0x11) near_count++;
+            }
+            fprintf(stderr, "#### AGX_OBJC_VA_FIX diagnostic: aligned %#llx instances=%d, high32=0x11 candidates=%d (sz=%lu) — no real targets, hypothesis was wrong\n",
+                    (unsigned long long)old_va, patched_count, near_count, sz);
+        }
     }
 }
 
