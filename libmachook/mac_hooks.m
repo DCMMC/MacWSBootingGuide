@@ -821,6 +821,22 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                         fprintf(stderr, "####   cb%d+%#x -> %#llx (raw %#llx):", pi, off, (unsigned long long)p, (unsigned long long)pv_raw);
                         for(int j = 0; j < 64; j++) fprintf(stderr, " %02x", t[j]);
                         fprintf(stderr, "\n");
+                        // BAD-VA HUNT: scan 0x1000 bytes here for any uint64 in the 0x11_xxxxxxxx
+                        // range — the GPU page-faulted at 0x1158048000 (BIF0, Compute DM). If a
+                        // bad VA was written, we'll see it.
+                        for(int k = 0; k + 8 <= 0x1000; k += 8) {
+                            uint64_t v = *(const uint64_t *)(t + k);
+                            if(v >= 0x1100000000ULL && v < 0x1200000000ULL) {
+                                fprintf(stderr, "####     BAD-VA HUNT cb%d+%#x[+%#x] = %#llx (sus, fault was 0x1158048000)\n",
+                                        pi, off, k, (unsigned long long)v);
+                            }
+                            // Also dump VAs from kernel-returned 0x115x range that might be GPU-mapped
+                            // surfaces / firmware control buffers (not heap-allocated by user)
+                            if(v >= 0x1150000000ULL && v < 0x1160000000ULL) {
+                                fprintf(stderr, "####     SUS-VA cb%d+%#x[+%#x] = %#llx (in fault range!)\n",
+                                        pi, off, k, (unsigned long long)v);
+                            }
+                        }
                     }
                 }
             }
