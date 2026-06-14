@@ -334,6 +334,56 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             fprintf(stderr, "#### AGX_OBJC_VA_FIX diagnostic: aligned %#llx instances=%d, high32=0x11 candidates=%d (sz=%lu) — no real targets, hypothesis was wrong\n",
                     (unsigned long long)old_va, patched_count, near_count, sz);
         }
+    } else if(getenv("AGX_PIPELINE_BASE_PATCH") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
+        // EXPERIMENT (2026-06-15): patch macOS AGXMetal13_3 to load a different Pipelines base
+        // than 0x1100000000. There are 10 `MOVZ Xd, #0x11, LSL #32` instructions in the
+        // __TEXT/__text of AGXMetal13_3 that produce the immediate 0x1100000000. These are the
+        // candidate source of macOS Metal's INTERNAL pipeline-base allocator (the part that
+        // doesn't go through IOConnect, so the previous AGX_STRIP_HEAP_OPT / FIX_LOW_HEAP
+        // patches couldn't reach it).
+        //
+        // MOVZ Xd, #imm16, LSL #32 encoding: 0xD2C00000 | (imm16 << 5) | Rd. For imm16=0x11
+        // that's 0xD2C00220 | Rd (Rd ∈ 0..31, so low byte 0x20..0x3F).
+        //
+        // To change to MOVZ Xd, #<NEW_IMM>, LSL #32 we just OR the new imm16<<5 into the
+        // template. NEW_IMM is read from AGX_PIPELINE_BASE_PATCH (hex, 16-bit max). E.g. 0x15
+        // for 0x1500000000, 0x5b for 0x5b00000000.
+        //
+        // Outcome interpretation:
+        //  (a) Fault VA shifts to <new_base>+0x58048000 → macOS Metal's userland MOVZ-loaded
+        //      constant DOES control the embedded pipeline VA. C is viable; iterate to find a
+        //      base in an iOS-mapped page range.
+        //  (b) Fault VA stays at 0x1158048000 → these MOVZ instructions don't drive the
+        //      pipeline allocator. The fault VA is purely firmware-determined. C dead-dead.
+        unsigned long new_imm16 = strtoul(getenv("AGX_PIPELINE_BASE_PATCH"), NULL, 0) & 0xFFFFu;
+        unsigned long sz = 0;
+        uint8_t *seg = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &sz);
+        if(!seg || sz < 4) {
+            fprintf(stderr, "#### AGX_PIPELINE_BASE_PATCH: __TEXT,__text not found\n");
+        } else {
+            uint32_t *insns = (uint32_t *)seg;
+            size_t count = sz / 4;
+            int patched = 0;
+            // Match MOVZ Xd, #0x11, LSL #32 = 0xD2C00220 | Rd (Rd in low 5 bits = 0..31)
+            uint32_t match_template = 0xD2C00220u;
+            uint32_t match_mask     = 0xFFFFFFE0u; // keep all but low 5 bits (Rd)
+            uint32_t replace_template = 0xD2C00000u | ((uint32_t)new_imm16 << 5);
+            for(size_t i = 0; i < count; i++) {
+                if((insns[i] & match_mask) == match_template) {
+                    uint32_t Rd = insns[i] & 0x1Fu;
+                    uint32_t new_insn = replace_template | Rd;
+                    fprintf(stderr, "#### AGX_PIPELINE_BASE_PATCH @ %p (Xd=X%u): %#x -> %#x  (load #%#lx<<32)\n",
+                            (void *)&insns[i], Rd, insns[i], new_insn, new_imm16);
+                    uint32_t *target = &insns[i];
+                    ModifyExecutableRegion(target, sizeof(uint32_t), ^{
+                        *target = new_insn;
+                    });
+                    patched++;
+                }
+            }
+            fprintf(stderr, "#### AGX_PIPELINE_BASE_PATCH: patched %d MOVZ instructions (new base = %#lx)\n",
+                    patched, new_imm16 << 32);
+        }
     }
 }
 
