@@ -109,6 +109,28 @@ int main(int argc, char **argv) {
         fprintf(stderr, "AGXPROBE [4b] blit=%p\n", (void*)blit);
         [blit fillBuffer:buf range:NSMakeRange(0, 4096) value:0xAB];
         [blit endEncoding];
+        // Also encode a COMPUTE dispatch (matches iosblit's added compute) so we can compare
+        // iOS-native vs macOS-chroot kernel-command bytes for the SAME operation. iOS uses
+        // FastBlit fast-path for fillBuffer (KCMD buffer empty); compute forces the generic
+        // kernel-command path on both sides.
+        if (getenv("AGXPROBE_COMPUTE")) {
+            NSError *err = nil;
+            NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                            @"kernel void cf(device uint *b [[buffer(0)]], uint i [[thread_position_in_grid]]) { b[i] = 0xC0DEC0DE; }";
+            id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
+            if (lib) {
+                id<MTLFunction> fn = [lib newFunctionWithName:@"cf"];
+                id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
+                if (ps) {
+                    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                    [ce setComputePipelineState:ps];
+                    [ce setBuffer:buf offset:0 atIndex:0];
+                    [ce dispatchThreads:MTLSizeMake(8,1,1) threadsPerThreadgroup:MTLSizeMake(8,1,1)];
+                    [ce endEncoding];
+                    fprintf(stderr, "AGXPROBE [4b2] encoded compute dispatch\n");
+                } else { fprintf(stderr, "AGXPROBE compute pso err: %s\n", [[err localizedDescription] UTF8String]); }
+            } else { fprintf(stderr, "AGXPROBE compute lib err: %s\n", [[err localizedDescription] UTF8String]); }
+        }
         fprintf(stderr, "AGXPROBE [4c] committing...\n");
         [cb commit];
         // The iOS kernel may not signal the macOS completion notification, so waitUntilCompleted can

@@ -873,23 +873,30 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                     uint32_t inner   = *(uint32_t *)(p + off + 0x30);
                     uint32_t sub     = *(uint32_t *)(p + off + 0x34);
                     if(inner == 0x30 && sub == 3 && size == 0x1b8 && end_off == 0x1e8) {
-                        // SHIFT trailing bytes down by 16 to keep subsequent commands in place.
-                        size_t cmd_end_abs = off + end_off; // absolute end of THIS outer cmd
-                        size_t trailer_len = total - cmd_end_abs;
-                        if(trailer_len > 0) {
-                            memmove(p + cmd_end_abs - 0x10, p + cmd_end_abs, trailer_len);
-                            // zero the now-vacated 16 bytes at the new tail (just in case)
-                            memset(p + total - 0x10, 0, 0x10);
-                        }
+                        // iOS native subtype-3 layout (RE'd from iosblit compute-dispatch capture):
+                        // sentinel "01 00 00 00 ff ff ff ff ff ff ff ff" lives at cmd+0x1cc..0x1d7
+                        // (12 bytes, ending at cmd+0x1d8 = end of cmd). macOS has the SAME sentinel
+                        // but at cmd+0x1dc..0x1e7 — i.e. 16 extra ZERO PADDING bytes inserted at
+                        // cmd+0x1cc..0x1db. Removing the wrong 16 bytes (the sentinel itself) makes
+                        // the GPU read garbage at the event slot and page-fault (0x0b at VA 0x1158…).
+                        // Correct fix: remove the 16 zeros at cmd+0x1cc..0x1db so the sentinel shifts
+                        // into iOS-equivalent position 0x1cc..0x1d7.
+                        unsigned char *cmd_base = p + off;
+                        // Move bytes [0x1dc .. total_after_cmd] (sentinel + trailer) DOWN by 16:
+                        size_t total_to_shift = (total - off) - 0x1dc;  // sentinel(0xc) + trailer(0x28) = 0x34, but
+                                                                          // may also include any extra after; compute from total
+                        memmove(cmd_base + 0x1cc, cmd_base + 0x1dc, total_to_shift);
+                        // Zero the now-vacated tail
+                        memset(p + (total - 0x10), 0, 0x10);
                         // Patch the size + end_offset fields
                         *(uint32_t *)(p + off + 0x28) = 0x1d8;  // end_offset
                         *(uint32_t *)(p + off + 0x2c) = 0x1a8;  // size
                         total -= 0x10;
-                        fprintf(stderr, "#### AGXIOC KCMD_FIX cb%d cmd@+%#zx size 0x1b8->0x1a8 end 0x1e8->0x1d8 trailer_shift=%zu new_total=%#zx\n",
-                                _pi, off, trailer_len, total);
+                        fprintf(stderr, "#### AGXIOC KCMD_FIX cb%d cmd@+%#zx size 0x1b8->0x1a8 end 0x1e8->0x1d8 (deleted 16 zero pad at +0x1cc..0x1db, shifted %zu bytes) new_total=%#zx\n",
+                                _pi, off, total_to_shift, total);
                         // Update the cmdbuf state's `current` ptr to reflect the new total
                         *(uint64_t *)(uintptr_t)(state_p + 0x30) = start + total;
-                        // Continue iterating starting at the shifted next cmd
+                        // Continue iterating starting at the (now-correct) next cmd
                         off += 0x1d8;
                     } else {
                         off += end_off;

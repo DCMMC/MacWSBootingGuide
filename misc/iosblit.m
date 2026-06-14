@@ -163,12 +163,39 @@ static int run_blit(int maxStage) {
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         [blit fillBuffer:buf range:NSMakeRange(0, 4096) value:0xAB];
         [blit endEncoding];
-        fprintf(stderr, "IOSBLIT [4c] committing...\n");
+        // Also encode a COMPUTE dispatch — blit fillBuffer goes via the FastBlit fast path on iOS
+        // (bypasses kernel-command encoding, so KCMD buffer is empty). A compute dispatch instead
+        // goes through the generic kernel-command path that the macOS-chroot driver hits + that the
+        // iOS kernel `AGXCommandQueue::processSegmentKernelCommand` validates (subtype-3 size=0x1a8).
+        // This captures iOS-NATIVE subtype-3 outer-cmd bytes so we can byte-diff vs macOS-chroot's
+        // 0x1b8 layout and find what the extra 16 bytes are (currently truncated by AGX_KCMD_FIX
+        // → kernel passes, GPU page-faults at VA 0x1158048000 — those bytes are likely an event
+        // pointer the GPU needs).
+        NSError *err = nil;
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                        @"kernel void cf(device uint *b [[buffer(0)]], uint i [[thread_position_in_grid]]) { b[i] = 0xC0DEC0DE; }";
+        id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
+        if (!lib) { fprintf(stderr, "IOSBLIT lib err: %s\n", [[err localizedDescription] UTF8String]); }
+        else {
+            id<MTLFunction> fn = [lib newFunctionWithName:@"cf"];
+            id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:fn error:&err];
+            if (!ps) { fprintf(stderr, "IOSBLIT pso err: %s\n", [[err localizedDescription] UTF8String]); }
+            else {
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:ps];
+                [ce setBuffer:buf offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(8,1,1) threadsPerThreadgroup:MTLSizeMake(8,1,1)];
+                [ce endEncoding];
+            }
+        }
+        fprintf(stderr, "IOSBLIT [4c] committing (blit + compute)...\n");
+        // Dump kcmd BEFORE commit too — endEncoding may have already written the kernel cmds.
+        fprintf(stderr, "KCMD pre-commit:\n"); kcmd_dump_cb(cb);
         [cb commit];
         [cb waitUntilCompleted];
         // Dump after commit+wait — at this point the kernel has read the cmd buffer; the
         // userland VA still maps to the same region, so the bytes are visible to us.
-        kcmd_dump_cb(cb);
+        fprintf(stderr, "KCMD post-commit:\n"); kcmd_dump_cb(cb);
         fprintf(stderr, "IOSBLIT [4d] status=%ld readback[0]=0x%02x [4095]=0x%02x (expect 0xab)\n",
                 (long)[cb status], p[0], p[4095]);
     }
