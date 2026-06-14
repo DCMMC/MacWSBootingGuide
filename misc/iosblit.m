@@ -104,6 +104,45 @@ static int oslog_writefn(void *cookie, const char *buf, int n) {
 
 // The actual Metal blit + IOConnect-traced submit. Returns 0 on success. Called after the app
 // is foreground (so it holds the GPU sandbox extension a real app gets).
+//
+// After commit, walk the IOGPUMetalCommandBuffer's kernel-command buffer state (private SPI
+// at runtime) and dump start..current. These are the bytes the iOS kernel
+// `AGXCommandQueue::processSegmentKernelCommand` iterates + validates (looking for outer cmd
+// type 0x10000/0x10001, inner type=0x30, size in {0x7c8, 0x3b0, 0x1a8, ...} per subtype 1..5).
+// macOS-chroot agxprobe gets status=5 0x103 here; iOS native gets status=4. This dump is the
+// REFERENCE for diffing against libmachook's macOS-chroot KCMD dump.
+static void kcmd_dump_cb(id cb) {
+    SEL sel = NSSelectorFromString(@"getCurrentKernelCommandBufferStart:current:end:");
+    if (![cb respondsToSelector:sel]) { fprintf(stderr, "KCMD cb does not respond to selector\n"); return; }
+    void *start=NULL, *cur=NULL, *end=NULL;
+    void (*imp)(id, SEL, void**, void**, void**) = (void *)[cb methodForSelector:sel];
+    imp(cb, sel, &start, &cur, &end);
+    fprintf(stderr, "KCMD start=%p current=%p end=%p\n", start, cur, end);
+    if (!start || !cur || cur <= start) return;
+    size_t len = (uintptr_t)cur - (uintptr_t)start;
+    if (len > 0x10000) len = 0x10000; // safety cap
+    const unsigned char *p = (const unsigned char *)start;
+    fprintf(stderr, "KCMD bytes (%zu = %#zx total):\n", len, len);
+    for (size_t off = 0; off < len; off += 32) {
+        char line[256]; int n = snprintf(line, sizeof line, "  +%04zx:", off);
+        for (size_t j = 0; j < 32 && (off + j) < len && n < (int)sizeof(line) - 4; j++)
+            n += snprintf(line + n, sizeof line - n, " %02x", p[off + j]);
+        fprintf(stderr, "%s\n", line);
+        // Mark outer-cmd boundaries by checking +0x00 against the kernel's expected outer types.
+        if (off + 0x38 <= len) {
+            uint32_t v = *(const uint32_t *)(p + off);
+            if (v == 0x10000 || v == 0x10001) {
+                uint32_t eo = *(const uint32_t *)(p + off + 0x28);
+                uint32_t sz = *(const uint32_t *)(p + off + 0x2c);
+                uint32_t it = *(const uint32_t *)(p + off + 0x30);
+                uint32_t st = *(const uint32_t *)(p + off + 0x34);
+                fprintf(stderr, "  OUTER@+%#zx type=%#x end_off=%#x size=%#x inner=%#x sub=%u\n",
+                        off, v, eo, sz, it, st);
+            }
+        }
+    }
+}
+
 static int run_blit(int maxStage) {
     fprintf(stderr, "IOSBLIT START maxStage=%d\n", maxStage);
     @autoreleasepool {
@@ -127,6 +166,9 @@ static int run_blit(int maxStage) {
         fprintf(stderr, "IOSBLIT [4c] committing...\n");
         [cb commit];
         [cb waitUntilCompleted];
+        // Dump after commit+wait — at this point the kernel has read the cmd buffer; the
+        // userland VA still maps to the same region, so the bytes are visible to us.
+        kcmd_dump_cb(cb);
         fprintf(stderr, "IOSBLIT [4d] status=%ld readback[0]=0x%02x [4095]=0x%02x (expect 0xab)\n",
                 (long)[cb status], p[0], p[4095]);
     }

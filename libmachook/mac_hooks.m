@@ -751,6 +751,13 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // deeper: each 8-byte slot that looks like a userland CPU VA is deref'd + 64 bytes dumped. This
         // surfaces the deeper AGX command-list structures (control list / pipeline / resource refs + the
         // GPU VAs embedded there) to byte-diff vs the working iosblit path. Range-guarded to avoid faults.
+        //
+        // DEEP DUMP: the Block at args+0x10/+0x18 captures self=IOGPUMetalCommandBuffer at cb+0x20.
+        // The ObjC instance has a sub-object at +0x1f0 holding the kernel-cmd-buffer state, with
+        // {start: sub+0x28, current: sub+0x30, end: sub+0x38} (RE'd from
+        // -[IOGPUMetalCommandBuffer getCurrentKernelCommandBufferStart:current:end:]). The bytes from
+        // start..current are exactly what `AGXCommandQueue::processSegmentKernelCommand` iterates +
+        // validates (looking for type=0x30 + size=0x1a8 + end_offset=size+0x30). Dump them.
         if(inStructCnt >= 0x20) {
             uint64_t cbp[2] = { *(const uint64_t *)(s + 0x10), *(const uint64_t *)(s + 0x18) };
             for(int pi = 0; pi < 2; pi++) if(cbp[pi] > 0x100000000ULL && cbp[pi] < 0x280000000ULL) {
@@ -758,11 +765,60 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 fprintf(stderr, "#### AGXIOC cmdbuf%d@%#llx:", pi, (unsigned long long)cbp[pi]);
                 for(int j = 0; j < 0x60; j++) fprintf(stderr, " %02x", cb[j]);
                 fprintf(stderr, "\n");
+                // KERNEL-COMMAND DEEP DUMP: cb+0x20 = captures[0] = self pointer
+                // The macOS IOGPUMetalCommandBuffer holds its kernel-cmd-buffer-state ptr at
+                // ivar +0x250 (iOS uses +0x1f0; verified via __objc_ivar lookup in macOS IOGPU).
+                uint64_t self_raw = *(const uint64_t *)(cb + 0x20);
+                uint64_t self_p = self_raw & 0x0000ffffffffffffULL;
+                if(self_p > 0x100000000ULL && self_p < 0x280000000ULL) {
+                    uint64_t state_raw = *(const uint64_t *)(uintptr_t)(self_p + 0x250);
+                    uint64_t state_p = state_raw & 0x0000ffffffffffffULL;
+                    if(state_p > 0x100000000ULL && state_p < 0x280000000ULL) {
+                        uint64_t start_raw  = *(const uint64_t *)(uintptr_t)(state_p + 0x28);
+                        uint64_t curr_raw   = *(const uint64_t *)(uintptr_t)(state_p + 0x30);
+                        uint64_t end_raw    = *(const uint64_t *)(uintptr_t)(state_p + 0x38);
+                        uint64_t start = start_raw & 0x0000ffffffffffffULL;
+                        uint64_t curr  = curr_raw  & 0x0000ffffffffffffULL;
+                        uint64_t end   = end_raw   & 0x0000ffffffffffffULL;
+                        fprintf(stderr, "#### AGXIOC cb%d KCMD self=%#llx state=%#llx start=%#llx curr=%#llx end=%#llx\n",
+                                pi, (unsigned long long)self_p, (unsigned long long)state_p,
+                                (unsigned long long)start, (unsigned long long)curr, (unsigned long long)end);
+                        if(start && curr > start && (curr - start) < 0x10000) {
+                            size_t len = curr - start;
+                            const unsigned char *p = (const unsigned char *)(uintptr_t)start;
+                            fprintf(stderr, "#### AGXIOC cb%d KCMD bytes (%zu = %#zx total):\n", pi, len, len);
+                            for(size_t off = 0; off < len; off += 32) {
+                                fprintf(stderr, "####   +%04zx:", off);
+                                for(size_t j = 0; j < 32 && (off + j) < len; j++) fprintf(stderr, " %02x", p[off + j]);
+                                fprintf(stderr, "\n");
+                                // After every block, check if first 4 bytes look like an outer-cmd type
+                                // (0x10000 / 0x10001) — log a marker so we can find OUTER CMD boundaries.
+                                if((off & 0x1ff) == 0 && off + 4 <= len) {
+                                    uint32_t v = *(const uint32_t *)(p + off);
+                                    if(v == 0x10000 || v == 0x10001) {
+                                        // also dump type/size/subtype/end_offset fields per the kernel's
+                                        // validation: cmd+0x28=end_offset, +0x2c=size, +0x30=inner_type, +0x34=subtype
+                                        if(off + 0x38 <= len) {
+                                            uint32_t eo = *(const uint32_t *)(p + off + 0x28);
+                                            uint32_t sz = *(const uint32_t *)(p + off + 0x2c);
+                                            uint32_t it = *(const uint32_t *)(p + off + 0x30);
+                                            uint32_t st = *(const uint32_t *)(p + off + 0x34);
+                                            fprintf(stderr, "####   OUTER cmd@+%#zx type=%#x end_off=%#x size=%#x inner=%#x sub=%u\n",
+                                                    off, v, eo, sz, it, st);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 for(int off = 0; off < 0x60; off += 8) {
-                    uint64_t p = *(const uint64_t *)(cb + off);
+                    // Strip PAC tag bits before deref (high 16 bits are signature, low 48 are VA)
+                    uint64_t pv_raw = *(const uint64_t *)(cb + off);
+                    uint64_t p = pv_raw & 0x0000ffffffffffffULL;
                     if(p > 0x100000000ULL && p < 0x280000000ULL) {
-                        const unsigned char *t = (const unsigned char *)p;
-                        fprintf(stderr, "####   cb%d+%#x -> %#llx:", pi, off, (unsigned long long)p);
+                        const unsigned char *t = (const unsigned char *)(uintptr_t)p;
+                        fprintf(stderr, "####   cb%d+%#x -> %#llx (raw %#llx):", pi, off, (unsigned long long)p, (unsigned long long)pv_raw);
                         for(int j = 0; j < 64; j++) fprintf(stderr, " %02x", t[j]);
                         fprintf(stderr, "\n");
                     }
@@ -779,6 +835,67 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 uint32_t *_tok = (uint32_t *)(uintptr_t)(_cbp[_pi] + 8);
                 uint32_t _old = *_tok; *_tok &= ~0x02000000u;
                 fprintf(stderr, "#### AGXIOC CB_FIX cmdbuf%d +0x08 %#x -> %#x\n", _pi, _old, *_tok);
+            }
+        }
+        // 0x103 FIX (AGX_KCMD_FIX): the macOS-chroot AGXMetal13_3 emits subtype-3 outer commands as
+        // 0x1b8 bytes (16 bytes too big — iOS kernel's AGXCommandQueue::processSegmentKernelCommand
+        // expects subtype-3 size == 0x1a8 exactly). The 16 extra bytes at offset cmd+0x1d8..0x1e7
+        // look like an optional macOS extension field (00..00 01..00 ff..ff). Rewrite each
+        // subtype-3 outer cmd in the KCMD buffer to size=0x1a8, end_offset=0x1d8, and shift any
+        // bytes AFTER end_offset (e.g. trailer commands) DOWN by 16 to keep the kcmd-list
+        // consistent. Update the cmdbuf's state.current pointer to reflect the new total.
+        if(getenv("AGX_KCMD_FIX") && inStructCnt >= 0x20) {
+            uint64_t _cbp[2] = { *(const uint64_t *)(s + 0x10), *(const uint64_t *)(s + 0x18) };
+            for(int _pi = 0; _pi < 2; _pi++) {
+                uint64_t cb = _cbp[_pi];
+                if(cb < 0x100000000ULL || cb >= 0x280000000ULL) continue;
+                uint64_t self_raw = *(const uint64_t *)(cb + 0x20);
+                uint64_t self_p = self_raw & 0x0000ffffffffffffULL;
+                if(self_p < 0x100000000ULL || self_p >= 0x280000000ULL) continue;
+                uint64_t state_raw = *(const uint64_t *)(uintptr_t)(self_p + 0x250);
+                uint64_t state_p = state_raw & 0x0000ffffffffffffULL;
+                if(state_p < 0x100000000ULL || state_p >= 0x280000000ULL) continue;
+                uint64_t start = (*(const uint64_t *)(uintptr_t)(state_p + 0x28)) & 0x0000ffffffffffffULL;
+                uint64_t curr  = (*(const uint64_t *)(uintptr_t)(state_p + 0x30)) & 0x0000ffffffffffffULL;
+                if(start == 0 || curr <= start) continue;
+                size_t total = curr - start;
+                if(total > 0x10000) continue;
+                unsigned char *p = (unsigned char *)(uintptr_t)start;
+                // Walk outer commands. Each cmd@off has +0x00=type, +0x28=end_offset, +0x2c=size,
+                // +0x30=inner_type, +0x34=subtype. For subtype 3 with size != 0x1a8, fix.
+                size_t off = 0;
+                while(off + 0x38 <= total) {
+                    uint32_t *cmd = (uint32_t *)(p + off);
+                    uint32_t type = cmd[0];
+                    if(type != 0x10000 && type != 0x10001) break;
+                    uint32_t end_off = *(uint32_t *)(p + off + 0x28);
+                    uint32_t size    = *(uint32_t *)(p + off + 0x2c);
+                    uint32_t inner   = *(uint32_t *)(p + off + 0x30);
+                    uint32_t sub     = *(uint32_t *)(p + off + 0x34);
+                    if(inner == 0x30 && sub == 3 && size == 0x1b8 && end_off == 0x1e8) {
+                        // SHIFT trailing bytes down by 16 to keep subsequent commands in place.
+                        size_t cmd_end_abs = off + end_off; // absolute end of THIS outer cmd
+                        size_t trailer_len = total - cmd_end_abs;
+                        if(trailer_len > 0) {
+                            memmove(p + cmd_end_abs - 0x10, p + cmd_end_abs, trailer_len);
+                            // zero the now-vacated 16 bytes at the new tail (just in case)
+                            memset(p + total - 0x10, 0, 0x10);
+                        }
+                        // Patch the size + end_offset fields
+                        *(uint32_t *)(p + off + 0x28) = 0x1d8;  // end_offset
+                        *(uint32_t *)(p + off + 0x2c) = 0x1a8;  // size
+                        total -= 0x10;
+                        fprintf(stderr, "#### AGXIOC KCMD_FIX cb%d cmd@+%#zx size 0x1b8->0x1a8 end 0x1e8->0x1d8 trailer_shift=%zu new_total=%#zx\n",
+                                _pi, off, trailer_len, total);
+                        // Update the cmdbuf state's `current` ptr to reflect the new total
+                        *(uint64_t *)(uintptr_t)(state_p + 0x30) = start + total;
+                        // Continue iterating starting at the shifted next cmd
+                        off += 0x1d8;
+                    } else {
+                        off += end_off;
+                        if(end_off == 0) break;
+                    }
+                }
             }
         }
         // EXPERIMENTAL FIX (AGX_PAC_FIX): the "cmdbuf descriptors" at submit+0x10/+0x18 are ObjC
