@@ -18,6 +18,7 @@
 #import <dlfcn.h>
 #import <mach/mach.h>
 #import <libkern/OSCacheControl.h>
+#import <ptrauth.h>
 
 // In the chroot the macOS sandbox is unreachable, so libsystem_sandbox's
 // gpu_bundle_is_path_trusted() returns FALSE for the (existing) AGX bundle
@@ -30,6 +31,10 @@
 static void patch_sandbox_gpu_trust(void) {
     void *ft = dlsym(RTLD_DEFAULT, "gpu_bundle_find_trusted");
     if (!ft) { fprintf(stderr, "AGXPROBE trustpatch: gpu_bundle_find_trusted NOT FOUND\n"); return; }
+    // dlsym returns a PAC-signed function pointer on arm64e (with PAC keys active in USR00
+    // process). Strip PAC before arithmetic — otherwise (raw + 0x190) keeps the high tag and
+    // dereference faults (KERN_INVALID_ADDRESS / pointer auth failure).
+    ft = ptrauth_strip(ft, ptrauth_key_asia);
     uint32_t *p = (uint32_t *)((uintptr_t)ft + 0x190); // gpu_bundle_is_path_trusted
     fprintf(stderr, "AGXPROBE trustpatch: is_path_trusted@%p orig=0x%08x 0x%08x\n", (void *)p, p[0], p[1]);
     if (vm_protect(mach_task_self(), (vm_address_t)p, 8, false,

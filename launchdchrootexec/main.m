@@ -58,30 +58,14 @@ int main(int argc, char *argv[], char *envp[]) {
     // setenv("DYLD_PRINT_WARNINGS", "1", 1);
     // setenv("DYLD_PRINT_INITIALIZERS", "1", 1);
 
-    posix_spawnattr_t attr;
-    if(posix_spawnattr_init(&attr) != 0) {
-        perror("posix_spawnattr_init");
-        return 1;
-    }
-    
-    if(getppid() == 1) {
-        fprintf(stderr, "getppid = 1\n");
-        if(posix_spawnattr_set_launch_type_np(&attr, CS_LAUNCH_TYPE_SYSTEM_SERVICE) != 0) {
-            perror("posix_spawnattr_set_launch_type_np");
-            return 1;
-        }
-    }
-    // if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED) != 0) {
-    if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC) != 0) {
-        perror("posix_spawnattr_set_flags");
-        return 1;
-    }
-    
-    pid_t child_pid = 0;
+    // EXPERIMENT (PAC keys): POSIX_SPAWN_SETEXEC replaces the current task in-place but the
+    // resulting arm64e child has 3 of 4 PAC keys (DA/IA/DB) zeroed (only IB works because
+    // pacibsp/retab need it). Use plain execve() instead — the standard exec syscall path
+    // re-initializes ALL PAC keys for the new task on arm64e binaries.
+    // (Old SETEXEC code commented out for reference.)
+    // posix_spawnattr_t attr; ... posix_spawn(... POSIX_SPAWN_SETEXEC ...);
     extern char **environ;
-    // fprintf(stderr, "before posix_spawn %s\n", execPath);
-    posix_spawn(&child_pid, execPath, NULL, &attr, execArgs, environ);
-    // fprintf(stderr, "pid= %d\n", child_pid);
-    perror("posix_spawn");
+    execve(execPath, execArgs, environ);
+    perror("execve");
     return 1;
 }
