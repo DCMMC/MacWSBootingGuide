@@ -6,6 +6,7 @@
 #import <IOKit/IOKitLib.h>
 #import <xpc/xpc.h>
 #import <sys/sysctl.h>
+#import <ptrauth.h>
 #import "interpose.h"
 #import "utils.h"
 
@@ -693,7 +694,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         agxVa38 = va38;                                          // carry to post-call (heap macOS base)
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
-        if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t nb = sz32 ? sz32 : (agxClientID == 0x20000 ? 0x8000 : 0x1000); *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count (0x20000 sub-arenas have no +0x58 size: map the full 0x8000 VA slot so sub VAs are backed)
+        if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t _adflt = 0x8000; const char *_as = getenv("AGX_ARENA_SIZE"); if(_as) _adflt = strtoull(_as, NULL, 0); uint64_t nb = sz32 ? sz32 : (agxClientID == 0x20000 ? _adflt : 0x1000); *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count; AGX_ARENA_SIZE overrides the 0x20000-arena default (0x8000) to test whether the shim shrink breaks the firmware heap view
         if(agxType == 0x80) {
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
@@ -721,21 +722,115 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if(IOConnectIsIOGPU(client) && selector == 0xd && in && inCnt >= 2) {
         fprintf(stderr, "#### AGXIOC CreateDeviceShmem IN size=%#llx type=%#llx\n", (unsigned long long)in[0], (unsigned long long)in[1]);
     }
+    // DIAGNOSTIC: queue-context create (macOS sel 0x8 -> iOS 0x7), 1032-byte (0x408) struct.
+    // Suspected to carry the per-queue firmware context state; if the macOS driver writes
+    // bytes the iOS firmware doesn't recognize, every later submit on this queue → 0x103.
+    if(IOConnectIsIOGPU(client) && selector == 0x7 && inStruct && inStructCnt >= 0x100) {
+        const unsigned char *s = (const unsigned char *)inStruct;
+        fprintf(stderr, "#### AGXIOC QCTX IN[%zu]:\n", inStructCnt);
+        for(size_t i = 0; i < inStructCnt; i += 32) {
+            fprintf(stderr, "####   +%03zx:", i);
+            for(size_t j = 0; j < 32 && (i + j) < inStructCnt; j++) fprintf(stderr, " %02x", s[i + j]);
+            fprintf(stderr, "\n");
+        }
+    }
     if(IOConnectIsIOGPU(client) && selector == 0x1a && inStruct && inStructCnt >= 0x10) {
         const unsigned char *s = (const unsigned char *)inStruct;
         fprintf(stderr, "#### AGXIOC SUBMIT IN[%zu]:", inStructCnt);
         for(size_t i = 0; i < inStructCnt && i < 64; i++) fprintf(stderr, " %02x", s[i]);
         fprintf(stderr, "\n");
-        // Deref the two command-buffer descriptor pointers (+0x10,+0x18) the firmware reads — dump 96 bytes
-        // each to see the cmdbuf GPU VA / length / flags (is a referenced VA still wrong, or format-diverged?).
+        // The submit is IOConnectCallMethod(sel 0x1a, 4 SCALARS + struct). Dump the scalar array too:
+        // working iOS reference = [*(queue+0x18)=0x1, arg2=0x0, cmdbuf-count=0x1, per-cmdbuf-size=0x38].
+        // scalar[0] (per-queue context handle) is the prime 0x103-divergence suspect.
+        if(in && inCnt) {
+            fprintf(stderr, "#### AGXIOC SUBMIT SCALARS[%u]:", inCnt);
+            for(uint32_t _si = 0; _si < inCnt && _si < 8; _si++) fprintf(stderr, " %#llx", (unsigned long long)in[_si]);
+            fprintf(stderr, "\n");
+        }
+        // Deref the two command-buffer descriptor pointers (+0x10,+0x18) the firmware reads, AND one level
+        // deeper: each 8-byte slot that looks like a userland CPU VA is deref'd + 64 bytes dumped. This
+        // surfaces the deeper AGX command-list structures (control list / pipeline / resource refs + the
+        // GPU VAs embedded there) to byte-diff vs the working iosblit path. Range-guarded to avoid faults.
         if(inStructCnt >= 0x20) {
             uint64_t cbp[2] = { *(const uint64_t *)(s + 0x10), *(const uint64_t *)(s + 0x18) };
-            for(int pi = 0; pi < 2; pi++) if(cbp[pi] > 0x100000000ULL) {
+            for(int pi = 0; pi < 2; pi++) if(cbp[pi] > 0x100000000ULL && cbp[pi] < 0x280000000ULL) {
                 const unsigned char *cb = (const unsigned char *)cbp[pi];
-                fprintf(stderr, "#### AGXIOC SUBMIT cmdbuf%d@%#llx:", pi, (unsigned long long)cbp[pi]);
-                for(int j = 0; j < 96; j++) fprintf(stderr, " %02x", cb[j]);
+                fprintf(stderr, "#### AGXIOC cmdbuf%d@%#llx:", pi, (unsigned long long)cbp[pi]);
+                for(int j = 0; j < 0x60; j++) fprintf(stderr, " %02x", cb[j]);
                 fprintf(stderr, "\n");
+                for(int off = 0; off < 0x60; off += 8) {
+                    uint64_t p = *(const uint64_t *)(cb + off);
+                    if(p > 0x100000000ULL && p < 0x280000000ULL) {
+                        const unsigned char *t = (const unsigned char *)p;
+                        fprintf(stderr, "####   cb%d+%#x -> %#llx:", pi, off, (unsigned long long)p);
+                        for(int j = 0; j < 64; j++) fprintf(stderr, " %02x", t[j]);
+                        fprintf(stderr, "\n");
+                    }
+                }
             }
+        }
+        // EXPERIMENTAL FIX (AGX_CB_FIX): the cmdbuf-descriptor header token at +0x08 is 0xc3000002 on
+        // the macOS driver but 0xc1000002 on the WORKING iOS path (lldb-confirmed, consistent across
+        // cmdbuf0+1). The spoofed-macOS driver sets an extra header flag bit (0x02000000) the iOS
+        // firmware rejects -> 0x103. Clear it to match iOS, then let the REAL submit proceed.
+        if(getenv("AGX_CB_FIX") && inStructCnt >= 0x20) {
+            uint64_t _cbp[2] = { *(const uint64_t *)(s + 0x10), *(const uint64_t *)(s + 0x18) };
+            for(int _pi = 0; _pi < 2; _pi++) if(_cbp[_pi] > 0x100000000ULL && _cbp[_pi] < 0x300000000ULL) {
+                uint32_t *_tok = (uint32_t *)(uintptr_t)(_cbp[_pi] + 8);
+                uint32_t _old = *_tok; *_tok &= ~0x02000000u;
+                fprintf(stderr, "#### AGXIOC CB_FIX cmdbuf%d +0x08 %#x -> %#x\n", _pi, _old, *_tok);
+            }
+        }
+        // EXPERIMENTAL FIX (AGX_PAC_FIX): the "cmdbuf descriptors" at submit+0x10/+0x18 are ObjC
+        // Blocks (kernel-side completion callbacks). On the WORKING iOS path Block.isa (cb+0x00) and
+        // Block.invoke (cb+0x10) are PAC-signed by the standard arm64e Block runtime (pacda + pacia,
+        // disc = field_addr [| 0x6ae1<<48 for isa]; same instructions in macOS+iOS IOGPU builds). In
+        // the macOS-chroot dump both fields are RAW (high 16 bits = 0) → the kernel's autda on the
+        // submit fails → 0x103. Re-sign in-process here to test whether the process's DA/IA keys are
+        // present (just unused by the unsigned-emit Block runtime) or genuinely zero.
+        if(getenv("AGX_PAC_FIX") && inStructCnt >= 0x20) {
+            uint64_t _cbp[2] = { *(const uint64_t *)(s + 0x10), *(const uint64_t *)(s + 0x18) };
+            for(int _pi = 0; _pi < 2; _pi++) {
+                uint64_t cb = _cbp[_pi];
+                if(cb < 0x100000000ULL || cb >= 0x300000000ULL) continue;
+                uint64_t *isa_p = (uint64_t *)(uintptr_t)cb;
+                uint64_t *inv_p = (uint64_t *)(uintptr_t)(cb + 0x10);
+                uint64_t old_isa = *isa_p, old_inv = *inv_p;
+                if((old_isa >> 48) == 0) {  // currently unsigned high 16 bits
+                    uint64_t disc = (uint64_t)isa_p | (0x6ae1ULL << 48);
+                    uint64_t new_isa = (uint64_t)ptrauth_sign_unauthenticated((void *)old_isa, ptrauth_key_asda, disc);
+                    *isa_p = new_isa;
+                    fprintf(stderr, "#### AGXIOC PAC_FIX cb%d isa %#llx -> %#llx (disc=%#llx)\n",
+                            _pi, (unsigned long long)old_isa, (unsigned long long)new_isa, (unsigned long long)disc);
+                }
+                if((old_inv >> 48) == 0) {
+                    uint64_t disc = (uint64_t)inv_p;
+                    uint64_t new_inv = (uint64_t)ptrauth_sign_unauthenticated((void *)old_inv, ptrauth_key_asia, disc);
+                    *inv_p = new_inv;
+                    fprintf(stderr, "#### AGXIOC PAC_FIX cb%d invoke %#llx -> %#llx (disc=%#llx)\n",
+                            _pi, (unsigned long long)old_inv, (unsigned long long)new_inv, (unsigned long long)disc);
+                }
+            }
+        }
+        // SAFE MODE: dump only, do NOT submit to the GPU (avoids the cumulative GPU-wedge -> reboot).
+        if(getenv("AGX_DUMP_ONLY")) { fprintf(stderr, "#### AGXIOC SUBMIT skipped (AGX_DUMP_ONLY) — no GPU exec\n"); return 0; }
+    }
+    // DIAGNOSTIC + gated FIX: set_api_property (macOS 0x7 -> iOS 0x6). The iOS kernel handler
+    // (IOGPUDeviceUserClient::s_set_api_property) strlcpy's structInput AS A STRING and sets the
+    // device "API" property (expects "Metal"). This is the ONLY IOConnect call that fails on the
+    // M1-direct path (KERN_INVALID_ADDRESS=0x1); a failed Metal-client registration is a candidate
+    // root-cause for the accepted command buffer being later nopped (status=5 / 0x103, no GPU fault).
+    if(IOConnectIsIOGPU(client) && selector == 0x6 && inStruct) {
+        const unsigned char *s = (const unsigned char *)inStruct;
+        fprintf(stderr, "#### AGXIOC set_api IN[%zu]:", inStructCnt);
+        for(size_t i = 0; i < inStructCnt && i < 32; i++) fprintf(stderr, " %02x", s[i]);
+        fprintf(stderr, " ascii='");
+        for(size_t i = 0; i < inStructCnt && i < 16; i++) fprintf(stderr, "%c", (s[i] >= 0x20 && s[i] < 0x7f) ? s[i] : '.');
+        fprintf(stderr, "'\n");
+        if(getenv("AGX_API_FIX")) {
+            memset(shadowbuf, 0, 16); memcpy(shadowbuf, "Metal", 5);
+            inStruct = shadowbuf; inStructCnt = 16;
+            fprintf(stderr, "#### AGXIOC set_api -> rewrote structInput to inline \"Metal\" (16B)\n");
         }
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
@@ -790,7 +885,46 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
     if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) {
         *outStructCnt = 0x70;
     }
+    // set_api_property (macOS 0x7 -> iOS 0x6): the iOS kernel handler strlcpy's structInput AS A
+    // STRING and sets the device "API" property (expects "Metal"). This is the ONLY failing IOConnect
+    // call on the M1-direct path (-> 0x1 KERN_INVALID_ADDRESS); a failed Metal-client registration is a
+    // candidate root-cause for the accepted command buffer being nopped (status=5/0x103, no GPU fault).
+    static unsigned char apibuf[16];
+    if(IOConnectIsIOGPU(client) && selector == 0x6 && inStruct) {
+        const unsigned char *s = (const unsigned char *)inStruct;
+        fprintf(stderr, "#### AGXIOC set_api IN[%zu]:", inStructCnt);
+        for(size_t i = 0; i < inStructCnt && i < 32; i++) fprintf(stderr, " %02x", s[i]);
+        fprintf(stderr, " ascii='");
+        for(size_t i = 0; i < inStructCnt && i < 16; i++) fprintf(stderr, "%c", (s[i] >= 0x20 && s[i] < 0x7f) ? s[i] : '.');
+        fprintf(stderr, "'\n");
+        if(getenv("AGX_API_FIX")) {
+            memset(apibuf, 0, sizeof(apibuf)); memcpy(apibuf, "Metal", 5);
+            inStruct = apibuf; inStructCnt = 16;
+            fprintf(stderr, "#### AGXIOC set_api -> rewrote structInput to inline \"Metal\" (16B)\n");
+        }
+    }
     IOReturn r = IOConnectCallStructMethod(client, selector, inStruct, inStructCnt, outStruct, outStructCnt);
+    // DIAGNOSTIC: device-info (sel 0x100) OUT — dump full 0x78 incl the +0x70..+0x78 field the iOS kernel
+    // (0x70-byte struct) never fills but the macOS-13.4 driver (0x78 struct) reads. If that field is the
+    // firmware-context divergence, the shim's size-clamp is incomplete and we must populate it here.
+    if(IOConnectIsIOGPU(client) && selector == 0x100 && outStruct) {
+        const unsigned char *o = (const unsigned char *)outStruct;
+        fprintf(stderr, "#### AGXIOC devinfo OUT[0x78] (kernel filled 0x0..0x70; 0x70..0x78 is macOS-read):");
+        for(int i = 0; i < 0x78; i++) { if(i == 0x70) fprintf(stderr, " |"); fprintf(stderr, " %02x", o[i]); }
+        fprintf(stderr, "\n");
+    }
+    // FIX ATTEMPT: the macOS-13.4 driver reads device-info[+0x70..+0x78] which the iOS-16.3 kernel never
+    // fills (its struct is 0x70). It reads its buffer's stale value (0x80000000) -> may build a wrong
+    // firmware context -> every submit aborts (0x103). Write an env-chosen value there so the driver sees
+    // a compatible value. AGX_DEVINFO_FIX=0 (zero/feature-absent), or =0x... to try a specific value.
+    if(IOConnectIsIOGPU(client) && selector == 0x100 && outStruct) {
+        const char *_df = getenv("AGX_DEVINFO_FIX");
+        if(_df) {
+            uint64_t _v = strtoull(_df, NULL, 0);
+            *(uint64_t *)((unsigned char *)outStruct + 0x70) = _v;
+            fprintf(stderr, "#### AGXIOC devinfo FIX: wrote +0x70 = %#llx\n", (unsigned long long)_v);
+        }
+    }
     if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
     return r;
 }
