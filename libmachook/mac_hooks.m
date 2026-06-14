@@ -695,6 +695,28 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
         if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t _adflt = 0x8000; const char *_as = getenv("AGX_ARENA_SIZE"); if(_as) _adflt = strtoull(_as, NULL, 0); uint64_t nb = sz32 ? sz32 : (agxClientID == 0x20000 ? _adflt : 0x1000); *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count; AGX_ARENA_SIZE overrides the 0x20000-arena default (0x8000) to test whether the shim shrink breaks the firmware heap view
+        // 0x103-AFTER-FIX: macOS internal-heap (clientID 0x10000, args[+0x5c] high u32 = 0xc) is
+        // allocated by AGXMetal with the assumption that the kernel SHIFTS the heap base by
+        // 0x400000000 (bit 3 of the flags = bit 35 = 0x800000000 → shift). iOS does NOT honor
+        // this shift, returning a normal 0x15xx VA, while macOS Metal compiles shaders with the
+        // pre-shifted 0x11xx VA baked in → GPU page fault at 0x1158048000 (in the 0x11xx range).
+        //
+        // FIX_LOW_HEAP (env-gated): for clientID 0x10000 heaps with high-u32 of args[+0x58] = 0xc,
+        // record the iOS heap base, then in libmachook also report a SHIFTED VA back to AGXMetal
+        // via post-call OUT[0] patch — making macOS Metal compute offsets from 0x11xx, matching
+        // its shader-baked VAs. This is fundamentally a userland-only fix attempt; if the kernel
+        // also computes things from the OUT VA, this will desync. Currently EXPERIMENT-ONLY.
+        // Also tries the inverse: STRIP the option bit pre-call so iOS allocs from same range.
+        if(agxType == 0 && agxClientID == 0x10000 && getenv("AGX_STRIP_HEAP_OPT")) {
+            uint64_t *opt = (uint64_t *)(shadowbuf + 0x58);
+            if((*opt >> 32) & 0xc) {
+                uint64_t old = *opt;
+                *opt &= 0xffffffffULL;  // strip high u32 flags entirely
+                fprintf(stderr, "#### AGXIOC HEAP_OPT_STRIP clientID %#x args[+0x58] %#llx -> %#llx\n",
+                        agxClientID, (unsigned long long)old, (unsigned long long)*opt);
+                patched = 1;
+            }
+        }
         if(agxType == 0x80) {
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
