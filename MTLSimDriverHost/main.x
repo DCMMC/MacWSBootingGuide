@@ -6,28 +6,44 @@
 @import CydiaSubstrate;
 #include <mach-o/dyld.h>
 
-// ─── Root-cause stability fix: MTLSimDriverHost NULL-`this` crash guard ──────
+// ─── Root-cause stability fix: MTLSimDriverHost appContext race ──────────────
 // Under heavy compositing MTLSimDriverHost SIGSEGVs at 0x0 in
-// MTLSimApplicationContext::newObjectCommand_DEPRECATED: a newObjectCommand
-// request arrives on a connection whose appContext ([connectionContext+0x10]) is
-// still null (a race around appContext setup/teardown), so `this` is NULL and the
-// function's first instruction `ldr x0,[this]` faults. When the host dies the XPC
-// connection drops, every in-flight -[MTLSimDevice newTextureWithDescriptor:]
-// returns nil, and SkyLight's compositor asserts -> WindowServer crash-loops.
+// MTLSimApplicationContext::newObjectCommand_DEPRECATED. The lifecycle:
+//   * appContext is PER-PROCESS, created/looked-up via
+//     MTLSimGlobalContext::getApplicationForProcessRef and held by the global
+//     registry. The per-connection context only stores a *pointer* to it at
+//     [connectionContext+0x10], assigned by the connection's "init" message.
+//   * MTLSimulatorHandleEvent xpc_connection_activate()s a new peer connection
+//     while [ctx+0x10] is still NULL (it's zeroed at accept).
+//   * Under load WindowServer's XPC connection is interrupted
+//     (XPC_ERROR_CONNECTION_INTERRUPTED in the WindowServer logs); it reconnects
+//     and a newObjectCommand beats the new connection's init message -> `this`
+//     (= [ctx+0x10]) is NULL -> `ldr x0,[this]` faults.
 //
-// Returning an empty reply (no replyData) for the NULL-`this` case is exactly
-// what the function's own "object creation returned nil" path does (cbz x0,+0x8c
-// -> return the bare reply), so the client just sees a failed request for that one
-// frame while the host stays alive and the next request (with a valid appContext)
-// succeeds. xpc objects are handled as opaque void* here to keep ARC out of their
-// +1 create-reply ownership.
+// The appContext for WindowServer's process is STILL ALIVE in the global registry
+// throughout this (the connection-invalid handler frees only the connection's
+// pointer, not the registry's shared_ptr). So rather than fail the request, serve
+// it with that same per-process appContext: cache the live one from every valid
+// call and reuse it when the per-connection pointer is NULL. The request then
+// SUCCEEDS with the correct context -> no nil texture is produced -> none of the
+// downstream SkyLight nil-texture asserts can fire. Only if nothing has been
+// cached yet (no valid call ever) do we fall back to an empty reply (the
+// function's own "no object produced" semantics). xpc objects are opaque void* to
+// keep ARC out of their +1 create-reply ownership.
 static void *(*orig_newObjectCommand_DEPRECATED)(void *thiz, void *xpcMsg);
 static void *(*p_xpc_dictionary_create_reply)(void *original);
+static void *g_last_appContext = NULL;  // last live per-process appContext (kept alive by the global registry)
 static void *hooked_newObjectCommand_DEPRECATED(void *thiz, void *xpcMsg) {
-    if (thiz == NULL) {
-        return p_xpc_dictionary_create_reply ? p_xpc_dictionary_create_reply(xpcMsg) : NULL;
+    if (thiz != NULL) {
+        g_last_appContext = thiz;
+        return orig_newObjectCommand_DEPRECATED(thiz, xpcMsg);
     }
-    return orig_newObjectCommand_DEPRECATED(thiz, xpcMsg);
+    if (g_last_appContext != NULL) {
+        NSLog(@"#### debugbydcmmc appContext race handled: served newObjectCommand with cached per-process appContext %p", g_last_appContext);
+        return orig_newObjectCommand_DEPRECATED(g_last_appContext, xpcMsg);
+    }
+    NSLog(@"#### debugbydcmmc appContext race but NO cache yet -> empty reply");
+    return p_xpc_dictionary_create_reply ? p_xpc_dictionary_create_reply(xpcMsg) : NULL;
 }
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
