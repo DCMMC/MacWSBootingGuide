@@ -88,7 +88,27 @@ Debug `kill: 9` when running macOS binary in iOS:
 sudo oslog | grep "AMFI\|debugbydcmmc\|launchd\|launchser\|WindowSer\|MTL\|Metal\|Terminal\|iolation"
 ```
 
-Open GUI in (chroot) macOS:
+Open GUI in (chroot) macOS — the easy way (recommended), via `macos_gui.sh`:
+
+```bash
+# Cleans up any previous macOS services, sets the display mode, loads WindowServer,
+# and starts the VNC server + Terminal as persistent launchd jobs (so they survive
+# an SSH disconnect). Run on the iOS side as root:
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist     # iPad keeps iOS on the panel, macOS -> VNC only
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start exclusive   # macOS takes over the physical panel + VNC
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh status            # show what is running
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop              # tear everything down, return to iOS
+```
+
+Then connect a VNC viewer to `vnc://<device-ip>:5900` (no password). Add
+`--no-terminal` / `--no-vnc` to `start` to skip those clients. **coexist** is the
+safer default — **exclusive** drives the panel from WindowServer, the most
+panic-prone GPU path on this device. `start` also launches a watchdog that
+auto-stops the GUI if WindowServer crash-loops or the load runs away (panic guard);
+`--no-watchdog` disables it. After a reboot wipes the trustcache, `start` re-runs
+`postinst.sh` automatically.
+
+Open GUI in (chroot) macOS — the manual way:
 
 ```bash
 sudo launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
@@ -100,6 +120,11 @@ In (chroot) macOS bash environment, you can run CLI or GUI applications:
 - `/usr/local/bin/OSXvnc-server -rfbnoauth` first to open a VNC server
 - `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal`
 - `/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor`
+
+Note: launched this way, the VNC server / GUI apps are children of your shell and
+die when it (or the SSH session) exits. For coexistence mode (iOS keeps the panel)
+set the runtime flag `touch /var/mnt/rootfs/tmp/ws_headless` before starting
+WindowServer. `macos_gui.sh` above handles both of these for you.
 
 Respring to iOS:
 
