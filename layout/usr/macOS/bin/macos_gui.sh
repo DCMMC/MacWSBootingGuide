@@ -117,9 +117,11 @@ run_watchdog() {
     log "watchdog: armed (load>=$WD_LOAD_LIMIT or >=$WD_RESTART_LIMIT WS restarts / ${WD_WINDOW}s -> auto-stop)"
     while :; do
         sleep "$WD_POLL"
-        # If WindowServer is gone for good, there is nothing to guard.
-        if ! proc_running "$P_WINDOWSERVER"; then
-            log "watchdog: WindowServer not running — exiting."
+        # Exit only when the GUI was actually torn down (the WindowServer launchd
+        # job is unloaded). A momentarily-absent PROCESS just means launchd is
+        # relaunching it after a crash — keep guarding (and count it as a restart).
+        if ! launchctl list com.apple.WindowServer >/dev/null 2>&1; then
+            log "watchdog: WindowServer job unloaded (GUI stopped) — exiting."
             return 0
         fi
         pid=$(ws_pid)
