@@ -60,6 +60,18 @@ void EnableJIT(void);
 // `mov x0,#0 ; b func+0x318` (the function's epilogue, just after `mov x0,x23`), so the
 // texture-nil path returns nil (WS skips that layer for the frame) instead of asserting.
 #define OFF_SkyLight_WSCompositeDest_texAssert 0x14b8a0
+// SkyLight`MetalContext::StartComposite(WSCompositeDestination*, MTLLoadAction, MTLStoreAction)
+// (func at SkyLight+0x148358) asserts at func+0x510 ("state->_target[1] && \"Failed to add
+// memoryless rendering target.\"", MetalContext.mm:918) when -[... newTextureWithDescriptor:]
+// returns nil — which happens when MTLSimDriverHost crashes under heavy compositing (its
+// newObjectCommand NULL-deref). WS then aborts -> launchd relaunch loop -> load runs away ->
+// kernel panic. The function ALREADY has a graceful fallback at func+0x3b8 (StartComposite+952):
+// `mov w0,#0 ; b func+0x308` (skip the memoryless target, return, continue to the epilogue),
+// normally taken when [x19+0x1c0] is set. The guard at func+0x4f0 is
+// `cbnz w8, +952` (0x35fff648); make it UNCONDITIONAL `b +952` (0x17ffffb2) so a nil texture
+// also takes that existing skip-and-survive path instead of asserting. Same philosophy as the
+// WSCompositeDest texAssert patch above.
+#define OFF_SkyLight_MetalContext_memoryless_guard 0x148848
 #if FORCE_SW_RENDER
 // SkyLight`WSSystemCanCompositeWithMetal::once
 // #define OFF_SkyLight_WSSystemCanCompositeWithMetal 0x1d72b148
@@ -138,7 +150,18 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 texAssert[1] = 0x17ffffec; // b func+0x318 (epilogue, after `mov x0,x23`)
             }
         });
-        
+
+        // Make MetalContext::StartComposite survive a nil memoryless render target (same
+        // root cause: MTLSimDriverHost crash -> newTextureWithDescriptor: returns nil).
+        // Force the assert-guard branch unconditional so the nil path takes the function's
+        // own graceful "skip memoryless target" fallback (+952) instead of __assert_rtn.
+        uint32_t *memGuard = (uint32_t *)(OFF_SkyLight_MetalContext_memoryless_guard + (uintptr_t)header);
+        ModifyExecutableRegion(memGuard, sizeof(uint32_t), ^{
+            if (*memGuard == 0x35fff648) { // cbnz w8, +952
+                *memGuard = 0x17ffffb2;    // b    +952  (mov w0,#0 ; b epilogue — no assert)
+            }
+        });
+
         // grant all permissions
         MSHookFunction(MSFindSymbol((MSImageRef)header, "_audit_token_check_tcc_access"), hooked_return_1, NULL);
             
