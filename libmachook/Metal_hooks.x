@@ -276,14 +276,53 @@ static void install_agx_init_redirect(Class agx) {
     }
 }
 
+// NSVisualEffectView backdrop-blur compositor fails in chroot via the iOS AGX
+// kernel (the macOS CABackdropLayer's filter graph never reaches a state where
+// the destination texture has valid content, so AppKit fills the layer with
+// OPAQUE BLACK as a safety fallback). Diagnostic proof: an identical layout
+// without NSVisualEffectView (NoVFX binary) renders every label, segmented
+// control, button correctly. Therefore the controls themselves work; the bug
+// is in the vibrancy filter chain.
+//
+// Until we have a working chroot-side backdrop blur (Option B — needs SkyLight
+// CABackdropLayer or AGX kernel patching), force NSVisualEffectView into the
+// "background coloring only" mode: the view fills with the material's solid
+// background color (e.g. light-gray for sidebar, darker for HUD) but skips the
+// blur filter. Subviews then render against a solid color and are visible.
+//
+// API approach: redirect the `material` getter so AppKit thinks the view's
+// material is `NSVisualEffectMaterialAppearanceBased` (0) which on light
+// appearance uses a solid material that doesn't require backdrop sampling.
+%hook NSVisualEffectView
+- (long long)material { return 0; /* NSVisualEffectMaterialAppearanceBased — solid */ }
+- (void)setMaterial:(long long)m { %orig(0); }
+- (long long)blendingMode { return 1; /* NSVisualEffectBlendingModeWithinWindow — no
+                                          backdrop sampling outside our window */ }
+- (void)setBlendingMode:(long long)bm { %orig(1); }
+%end
+
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end
 %hook MTLTextureDescriptorInternal
 - (MTLStorageMode)storageMode {
     MTLStorageMode mode = %orig;
-    if(mode == 1) { // MTLStorageModeManaged
+    static int callCount = 0;
+    if (getenv("MACWS_TEX_TRACE") && callCount < 100) {
+        callCount++;
+        fprintf(stderr, "#### MTL_TEX storageMode=%d fmt=%lu w=%lu h=%lu usage=%#lx\n",
+            (int)mode, (unsigned long)self.pixelFormat,
+            (unsigned long)self.width, (unsigned long)self.height,
+            (unsigned long)self.usage);
+    }
+    if(mode == 1) { // MTLStorageModeManaged (macOS only) → Shared on iOS
         self.storageMode = MTLStorageModeShared;
         return MTLStorageModeShared;
+    }
+    if(mode == 3) { // MTLStorageModeMemoryless (iOS support is narrower than macOS)
+                    // → Private. Without this, Memoryless textures cause AGX kernel
+                    // to return kIOReturnBadArgument and layers render BLACK.
+        self.storageMode = MTLStorageModePrivate;
+        return MTLStorageModePrivate;
     }
     return mode;
 }
@@ -445,6 +484,10 @@ __attribute__((constructor)) static void InitMetalHooks() {
     // Constructor-time class lookup PAC-traps on arm64e (autda fault in libobjc class
     // realization). dispatch_async waits until the main runloop is active.
     dispatch_async(dispatch_get_main_queue(), ^{
+        // (NOTE: tried calling MTLCreateSystemDefaultDevice here to force Metal load
+        // for the black-tab fix — it DEADLOCKED chroot AppKit startup. Revisit via
+        // a background queue load or hook on NSWindow display time.)
+
         install_nsxpcsharedlistener_swizzle();
 
         // If this is Terminal, force "New Window" via responder chain since AppKit's
