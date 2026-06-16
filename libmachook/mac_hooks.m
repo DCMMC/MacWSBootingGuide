@@ -94,117 +94,81 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         *once = -1;
 #endif
 
-        // MACWS_AGX_NATIVE: in chroot under AGX-native userspace, MANY SkyLight assertions
-        // fail because AGX-native paths set up resources differently than the sim wrapper.
-        // Strategy: find every file basename like "*.mm" or "*.cpp" cstring in SkyLight
-        // (these are __assert_rtn filename args), and NOP every backward BL whose preceding
-        // adrp+add references such a string — that's a __assert_rtn site.
+        // MACWS_AGX_NATIVE: in chroot under AGX-native userspace, multiple SkyLight
+        // assertions in the compositor path fail because the AGX-native render targets
+        // are set up differently than the sim wrapper. Auto-patch backward-BL calls
+        // following an adrp+add that loads ONE OF a known list of file-basename strings
+        // (so we only neuter __assert_rtn callsites in specific files, not random BL).
         if (getenv("MACWS_AGX_NATIVE")) {
             unsigned long text_sz = 0, cstr_sz = 0;
             uint8_t *text = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &text_sz);
             uint8_t *cstr = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__cstring", &cstr_sz);
-            fprintf(stderr, "#### MACWS_AGX_NATIVE SkyLight: text=%p sz=%lu cstr=%p sz=%lu (broad assert patcher)\n",
+            fprintf(stderr, "#### MACWS_AGX_NATIVE SkyLight: text=%p sz=%lu cstr=%p sz=%lu\n",
                 text, text_sz, cstr, cstr_sz);
 
-            // Collect all .mm/.cpp filename strings (these are __assert_rtn 2nd arg)
-            // Walk cstring section finding NUL-terminated runs that end in ".mm", ".cpp", or ".c"
-            uint64_t filename_addrs[512];
-            int num_filenames = 0;
-            for (size_t p = 0; p < cstr_sz && num_filenames < 512; ) {
-                size_t end = p;
-                while (end < cstr_sz && cstr[end]) end++;
-                if (end > p && end < cstr_sz) {
-                    size_t len = end - p;
-                    if (len >= 4 && len < 80) {
-                        // ends in ".mm" / ".cpp" / ".cc"?
-                        const char *s = (const char *)(cstr + p);
-                        if ((len >= 4 && memcmp(s + len - 3, ".mm", 3) == 0) ||
-                            (len >= 5 && memcmp(s + len - 4, ".cpp", 4) == 0) ||
-                            (len >= 4 && memcmp(s + len - 3, ".cc", 3) == 0)) {
-                            // Filter: must look like a source filename (no spaces, no slashes
-                            // except leading path, alphanumeric+_./- only)
-                            int ok = 1;
-                            for (size_t k = 0; k < len; k++) {
-                                char c = s[k];
-                                if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-                                      (c >= '0' && c <= '9') || c == '_' || c == '.' ||
-                                      c == '/' || c == '-' || c == '+')) {
-                                    ok = 0; break;
-                                }
-                            }
-                            if (ok) {
-                                filename_addrs[num_filenames++] = (uint64_t)(cstr + p);
-                            }
-                        }
-                    }
-                }
-                p = end + 1;
-            }
-            fprintf(stderr, "#### MACWS_AGX_NATIVE found %d candidate assert-filename strings\n", num_filenames);
+            // File-basename strings whose assertions we target. Add more as new crashes
+            // are diagnosed. Each string must be the EXACT filename token used in
+            // __assert_rtn's file argument (no leading path, ends in .mm/.cpp/.cc).
+            const char *target_files[] = {
+                "CAWSBackend.mm",
+                NULL
+            };
 
-            // Build a sorted set for O(log n) lookups
-            // (simple bubble sort since n is small)
-            for (int a = 0; a < num_filenames - 1; a++)
-                for (int b = a + 1; b < num_filenames; b++)
-                    if (filename_addrs[a] > filename_addrs[b]) {
-                        uint64_t t = filename_addrs[a];
-                        filename_addrs[a] = filename_addrs[b];
-                        filename_addrs[b] = t;
-                    }
-
-            // For each adrp+add pair, check if the computed address is in our filename set,
-            // then look for backward BL within next 8 insns (assert calls are tight).
-            uint32_t *text32 = (uint32_t *)text;
-            size_t text_n = text_sz / 4;
-            int patched_total = 0;
-            for (size_t i = 0; i + 12 < text_n; i++) {
-                uint32_t adrp = text32[i];
-                if ((adrp & 0x9F000000) != 0x90000000) continue;
-                int64_t immlo = (int64_t)((adrp >> 29) & 0x3);
-                int64_t immhi = (int64_t)((adrp >> 5) & 0x7FFFF);
-                int64_t imm = (immhi << 2) | immlo;
-                if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
-                imm <<= 12;
-                uint64_t pc = (uint64_t)&text32[i];
-                uint64_t page_target = (pc & ~0xFFFULL) + (uint64_t)imm;
-
-                uint32_t inst1 = text32[i + 1];
-                if ((inst1 & 0xFFC00000) != 0x91000000) continue;
-                uint32_t add_imm = (inst1 >> 10) & 0xFFF;
-                uint32_t shift = (inst1 >> 22) & 0x3;
-                uint64_t final_addr = page_target + ((uint64_t)add_imm << (shift * 12));
-
-                // Binary search filename_addrs for final_addr
-                int lo = 0, hi = num_filenames - 1, found = 0;
-                while (lo <= hi) {
-                    int mid = (lo + hi) / 2;
-                    if (filename_addrs[mid] == final_addr) { found = 1; break; }
-                    if (filename_addrs[mid] < final_addr) lo = mid + 1;
-                    else hi = mid - 1;
-                }
-                if (!found) continue;
-
-                // Find backward BL within next 8 insns (__assert_rtn calls are tight after
-                // the filename load)
-                for (size_t j = i + 2; j < i + 10 && j < text_n; j++) {
-                    uint32_t inst = text32[j];
-                    if ((inst & 0xFC000000) == 0x94000000) {  // BL
-                        int32_t imm26 = (int32_t)(inst & 0x03FFFFFF);
-                        if (imm26 & 0x02000000) imm26 |= 0xFC000000;
-                        int64_t bl_offset = (int64_t)imm26 * 4;
-                        if (bl_offset >= 0) break;  // forward — not __assert_rtn
-                        // Patch: NOP the BL. Also patch a few following insns that would
-                        // load the abort path? No — keep minimal: just NOP the BL so the
-                        // assert returns normally.
-                        ModifyExecutableRegion(&text32[j], sizeof(uint32_t), ^{
-                            text32[j] = 0xd503201f;  // NOP
-                        });
-                        patched_total++;
+            for (int n = 0; target_files[n]; n++) {
+                size_t nlen = strlen(target_files[n]);
+                uint64_t string_addr = 0;
+                for (size_t p = 0; p + nlen < cstr_sz; p++) {
+                    if (cstr[p] == target_files[n][0] && memcmp(cstr + p, target_files[n], nlen) == 0 &&
+                        cstr[p + nlen] == '\x00' && (p == 0 || cstr[p - 1] == '\x00')) {
+                        string_addr = (uint64_t)(cstr + p);
                         break;
                     }
                 }
+                if (!string_addr) {
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE filename '%s' not found\n", target_files[n]);
+                    continue;
+                }
+
+                uint32_t *text32 = (uint32_t *)text;
+                size_t text_n = text_sz / 4;
+                int patched = 0;
+                for (size_t i = 0; i + 12 < text_n; i++) {
+                    uint32_t adrp = text32[i];
+                    if ((adrp & 0x9F000000) != 0x90000000) continue;
+                    int64_t immlo = (int64_t)((adrp >> 29) & 0x3);
+                    int64_t immhi = (int64_t)((adrp >> 5) & 0x7FFFF);
+                    int64_t imm = (immhi << 2) | immlo;
+                    if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
+                    imm <<= 12;
+                    uint64_t pc = (uint64_t)&text32[i];
+                    uint64_t page_target = (pc & ~0xFFFULL) + (uint64_t)imm;
+
+                    uint32_t inst1 = text32[i + 1];
+                    if ((inst1 & 0xFFC00000) != 0x91000000) continue;
+                    uint32_t add_imm = (inst1 >> 10) & 0xFFF;
+                    uint32_t shift = (inst1 >> 22) & 0x3;
+                    uint64_t final_addr = page_target + ((uint64_t)add_imm << (shift * 12));
+                    if (final_addr != string_addr) continue;
+
+                    // Find backward BL within next 8 insns (assert calls are tight)
+                    for (size_t j = i + 2; j < i + 10 && j < text_n; j++) {
+                        uint32_t inst = text32[j];
+                        if ((inst & 0xFC000000) == 0x94000000) {  // BL
+                            int32_t imm26 = (int32_t)(inst & 0x03FFFFFF);
+                            if (imm26 & 0x02000000) imm26 |= 0xFC000000;
+                            int64_t bl_offset = (int64_t)imm26 * 4;
+                            if (bl_offset >= 0) continue;  // forward
+                            ModifyExecutableRegion(&text32[j], sizeof(uint32_t), ^{
+                                text32[j] = 0xd503201f;  // NOP
+                            });
+                            fprintf(stderr, "#### MACWS_AGX_NATIVE %s assert NOP at text+%#zx\n", target_files[n], j * 4);
+                            patched++;
+                            break;
+                        }
+                    }
+                }
+                fprintf(stderr, "#### MACWS_AGX_NATIVE %s: patched %d sites\n", target_files[n], patched);
             }
-            fprintf(stderr, "#### MACWS_AGX_NATIVE broad-assert-patch: %d BLs nopped\n", patched_total);
         }
 
         // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
