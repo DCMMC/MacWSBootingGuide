@@ -182,16 +182,87 @@ static id(*MTLCreateSimulatorDevice)(void);
 @end
 #endif // MTLFakeDevice static class (off for arm64e on-device)
 
+// Forward declarations for AGX init redirect (definitions below the hook).
+static void install_agx_init_redirect(Class agx);
+
 %hookf(Class, getMetalPluginClassForService, int service) {
+    // MACWS_AGX_NATIVE=1: both slices return the real AGX device class.
+    // dlopen the AGXMetal13_3 bundle on demand so its ObjC classes register,
+    // then look up AGXG13GFamilyDevice.
+    static int agx_once = 0;
+    static Class agx_cls = Nil;
+    if (getenv("MACWS_AGX_NATIVE")) {
+        if (!agx_once) {
+            agx_once = 1;
+            void *h = dlopen("/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3", RTLD_NOW);
+            if (!h) {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE dlopen AGXMetal13_3 FAILED: %s\n", dlerror());
+            } else {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE dlopen AGXMetal13_3 OK h=%p\n", h);
+            }
+            agx_cls = objc_getClass("AGXG13GFamilyDevice");
+            fprintf(stderr, "#### MACWS_AGX_NATIVE getMetalPluginClassForService: returning class %s = %p\n",
+                agx_cls ? class_getName(agx_cls) : "(nil)", (void*)agx_cls);
+            if (agx_cls) {
+                install_agx_init_redirect(agx_cls);
+            }
+        }
+        return agx_cls;
+    }
+
 #ifdef FORCE_M1_DRIVER
-    // survival pivot (safe). AGX shim: heap+cmdqueue+parent-lookup work (UPDATE 5/6 in
-    // memory agx-direct-path-kernel-abi-deadend); sub-resource size-fix pending a clean
-    // test. Live AGX testing strains the GUI (MTLSimDriverHost/WindowServer crashes), so
-    // default to Nil (CPU fallback) for stability.
+    // FORCE_M1_DRIVER on-device default (env unset): Nil = CPU/sim fallback for stability.
     return Nil;
 #else
     return MTLFakeDevice.class;
 #endif
+}
+
+// When Metal asks the plugin class to instantiate a device, it does:
+//   id raw = [pluginClass alloc];
+//   [raw initWithAcceleratorPort:port];
+//
+// MTLFakeDevice has -initWithAcceleratorPort:. AGXG13GFamilyDevice does NOT —
+// it has -initWithAcceleratorPort:simultaneousInstances: (two-arg). So Metal's
+// single-arg dispatch on AGXG13GFamilyDevice falls through to NSObject (no-op),
+// leaving AGX-specific ivars (especially the AGX::G13::Device* at offset 0x3a8)
+// uninitialized → crashes later in newBufferWithLength: at +132.
+//
+// We install the single-arg method on AGXG13GFamilyDevice at runtime via
+// class_addMethod (Logos %hook can't add a previously-nonexistent method
+// reliably) and have it forward to the 2-arg init.
+static id agx_initWithAcceleratorPort_impl(id self, SEL _cmd, int port) {
+    fprintf(stderr, "#### MACWS_AGX_NATIVE redirecting AGXG13GFamilyDevice init(port=%d) → 2-arg variant\n", port);
+    SEL realSel = sel_registerName("initWithAcceleratorPort:simultaneousInstances:");
+    typedef id (*RealInit)(id, SEL, int, uint64_t);
+    return ((RealInit)objc_msgSend)(self, realSel, port, 1);
+}
+
+static void install_agx_init_redirect(Class agx) {
+    SEL sel = @selector(initWithAcceleratorPort:);
+    BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
+    fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);
+
+    // No-op methods that crash in chroot because their setup dependencies
+    // (timers, mempools, dispatch sources, etc.) require kernel state that
+    // wasn't fully initialized. Downstream code may not actually need them.
+    const char *noopMethods[] = {
+        "setupDeferred",                        // dispatch_once block — mempools
+        "alertCommandBufferActivityStart",      // dispatch timer
+        "alertCommandBufferActivityComplete",   // companion
+        NULL
+    };
+    IMP noop = imp_implementationWithBlock(^void(id self) {
+        // silently
+    });
+    for (int i = 0; noopMethods[i]; i++) {
+        SEL s = sel_registerName(noopMethods[i]);
+        Method m = class_getInstanceMethod(agx, s);
+        if (m) {
+            method_setImplementation(m, noop);
+            fprintf(stderr, "#### MACWS_AGX_NATIVE noop'd %s\n", noopMethods[i]);
+        }
+    }
 }
 
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
@@ -224,6 +295,18 @@ extern int xpc_connection_enable_sim2host_4sim();
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
+    // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
+    // at first invocation and decides whether to return AGXG13GFamilyDevice or Nil.
+    MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
+    %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
+
+    // NOTE: we used to short-circuit out of all sim-related init when
+    // MACWS_AGX_NATIVE=1, but Metal.framework still needs the EnableSimApple5
+    // CFPref + MTLSimDriver registration paths so that fallback codepaths
+    // resolve without nil-deref crashes when AGX-native paths exit early.
+    // Leave the rest of init running unconditionally; the plugin-class hook
+    // alone is enough to route the device choice.
+
     dispatch_async(dispatch_get_main_queue(), ^{
         // force Apple 5 profile.
         // NOTE: do NOT pass ObjC/CF constant literals (@"..." / @(YES)) here. On the
@@ -237,11 +320,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         CFRelease(key);
         CFRelease(app);
     });
-    
-    // Install on all arches: arm64/x86_64 -> MTLFakeDevice; arm64e -> AGX (FORCE_M1_DRIVER).
-    MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
-    %init(getMetalPluginClassForService = MSFindSymbol(sys, "_getMetalPluginClassForService"));
-    
+
     MSImageRef xpc = MSGetImageByName("/usr/lib/system/libxpc.dylib");
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
     // register MTLSimDriverHost.xpc

@@ -111,6 +111,7 @@ if [ -x "$AUTOSIGND" ]; then
 fi
 
 add_trustcache "/var/jb/usr/macOS/bin/TestMetalIOSurface"
+add_trustcache "/var/jb/usr/macOS/bin/PinnedVAProbe"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
