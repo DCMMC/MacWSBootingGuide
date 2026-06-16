@@ -46,14 +46,15 @@ make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
 	LIBMACHOOK_ON_DEVICE_BUILD=1
 
 if [ "$FAST" = "1" ]; then
-    # Fast path: skip dpkg roundtrip. Just copy the freshly-built libmachook to
-    # its install location, set macOS build version, split + sign, then postinst.
     BUILT=$(find .theos/obj -name libmachook.dylib | head -1)
     if [ -z "$BUILT" ]; then
         echo "FAST: built libmachook not found in .theos/obj — falling back to full"
         FAST=0
     else
         echo "==> FAST: copying built libmachook to /var/jb/usr/macOS/lib/"
+        # rm before cp so target gets a FRESH INODE — avoids the stale-codesign-cache
+        # AMFI Invalid Page bug (see [[ondevice-arm64e-libmachook-invalidpage-regression]]).
+        sudo rm -f /var/jb/usr/macOS/lib/libmachook.dylib
         sudo cp "$BUILT" /var/jb/usr/macOS/lib/libmachook.dylib
     fi
 fi
@@ -119,24 +120,24 @@ sudo ldid -S "$LIB_ARM64"; sudo ldid -S "$LIB_ARM64"
 
 echo "==> Running postinst (copy dylibs to rootfs, update trustcache)..."
 if [ "$FAST" = "1" ]; then
-    # Fast postinst: only re-sign + trustcache + cp the freshly-built libmachook.
-    # Skip the dozens-of-unrelated-binaries portion (autosignd / launchservicesd /
-    # mount_bindfs / signing macOS bin tree). Those don't change between rebuilds.
-    set -e
+    # Fast postinst — disable set -e for this block (sign_and_trust may have
+    # non-zero exits we can tolerate).
+    set +e
     ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 
     sign_and_trust() {
         local p="$1"
-        sudo ldid -S"$ENT" -M "$p" 2>/dev/null
+        sudo ldid -S"$ENT" -M "$p" 2>/dev/null || true
         for arch in arm64 arm64e x86_64; do
             local h=$(ldid -arch "$arch" -h "$p" 2>/dev/null | grep CDHash= | cut -c8-)
             [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h" >/dev/null 2>&1
         done
+        return 0
     }
     sign_and_trust /var/jb/usr/macOS/lib/libmachook.dylib
     [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ] && sign_and_trust /var/jb/usr/macOS/lib/libmachook_arm64.dylib
 
-    # Refresh chroot copies (rm before cp so new inode — avoids stale code-sign cache).
+    echo "==> FAST postinst: cp libmachook → /var/mnt/rootfs/usr/local/lib/"
     sudo rm -f /var/mnt/rootfs/usr/local/lib/libmachook.dylib
     sudo cp /var/jb/usr/macOS/lib/libmachook.dylib /var/mnt/rootfs/usr/local/lib/libmachook.dylib
     sign_and_trust /var/mnt/rootfs/usr/local/lib/libmachook.dylib
@@ -145,7 +146,9 @@ if [ "$FAST" = "1" ]; then
         sudo cp /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
         sign_and_trust /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
     fi
-    echo "==> FAST postinst done (skipped autosignd / launchservicesd / mount_bindfs / macOS bin signing)"
+    ls -la /var/mnt/rootfs/usr/local/lib/libmachook*.dylib 2>/dev/null | head -3
+    echo "==> FAST postinst done"
+    set -e
 else
     sudo bash /var/jb/usr/macOS/bin/postinst.sh
 fi
