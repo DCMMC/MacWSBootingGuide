@@ -276,31 +276,6 @@ static void install_agx_init_redirect(Class agx) {
     }
 }
 
-// NSVisualEffectView backdrop-blur compositor fails in chroot via the iOS AGX
-// kernel (the macOS CABackdropLayer's filter graph never reaches a state where
-// the destination texture has valid content, so AppKit fills the layer with
-// OPAQUE BLACK as a safety fallback). Diagnostic proof: an identical layout
-// without NSVisualEffectView (NoVFX binary) renders every label, segmented
-// control, button correctly. Therefore the controls themselves work; the bug
-// is in the vibrancy filter chain.
-//
-// Until we have a working chroot-side backdrop blur (Option B — needs SkyLight
-// CABackdropLayer or AGX kernel patching), force NSVisualEffectView into the
-// "background coloring only" mode: the view fills with the material's solid
-// background color (e.g. light-gray for sidebar, darker for HUD) but skips the
-// blur filter. Subviews then render against a solid color and are visible.
-//
-// API approach: redirect the `material` getter so AppKit thinks the view's
-// material is `NSVisualEffectMaterialAppearanceBased` (0) which on light
-// appearance uses a solid material that doesn't require backdrop sampling.
-%hook NSVisualEffectView
-- (long long)material { return 0; /* NSVisualEffectMaterialAppearanceBased — solid */ }
-- (void)setMaterial:(long long)m { %orig(0); }
-- (long long)blendingMode { return 1; /* NSVisualEffectBlendingModeWithinWindow — no
-                                          backdrop sampling outside our window */ }
-- (void)setBlendingMode:(long long)bm { %orig(1); }
-%end
-
 @interface MTLTextureDescriptorInternal : MTLTextureDescriptor
 @end
 %hook MTLTextureDescriptorInternal

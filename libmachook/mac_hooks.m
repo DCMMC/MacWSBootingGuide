@@ -761,14 +761,15 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
                 return 0x1a;
             case 0x1f: // IOGPUCommandQueueSetPriorityAndBackground
                 return 0x1b;
-            // NOTE: tried sel 0x25 → 0x21 (following -4 delta) to fix NSVisualEffectView
-            // backdrop blur loop. Translation succeeded (return 0x0) but WS then crashed —
-            // 0x21 in iOS is a different method (likely IOGPUResource-something) and
-            // calling it with sel 0x25's scalar args corrupted WS state. Forward-fix needs
-            // to identify which iOS scalar matches macOS 0x25's semantics (probably some
-            // wait/sync that should return 0xe00002... for "not supported" so SkyLight
-            // takes the CPU compositing fallback, OR find a matching iOS sel that does
-            // the same job). Multi-session work.
+            case 0x25: // IOGPUDeviceSetDisplayParams — confirmed by BN disasm of both
+                       // macOS IOGPU.framework (file /Users/.../agx-re/IOGPU at func
+                       // _IOGPUDeviceSetDisplayParams uses `mov w1, #0x25; mov w3, #0x2`)
+                       // and iOS IOGPU.bndb (same function uses sel 0x21 with same
+                       // inCnt=2). Without this, WS loops on sel 0x25 →
+                       // kIOReturnBadArgument while trying to set up the compositor
+                       // display params during NSVisualEffectView backdrop-blur init,
+                       // resulting in opaque-black vibrancy and high autosignd load.
+                return 0x21;
             case 0x2a: // IOGPUDeviceCreateVNIODesc
                 return 0x26;
         }
