@@ -214,17 +214,33 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
-        // register MTLCompilerService.xpc
+        // Register the bundled XPC services inside each framework. KEY here is
+        // the FRAMEWORK BINARY path (not the .xpc bundle path) — _xpc_bootstrap_services
+        // walks each framework, finds its XPCServices/ subdir, and registers every .xpc
+        // inside. xpc_add_bundle (the .xpc-path variant) silently fails in this context;
+        // _xpc_bootstrap_services is the working API.
+        //
+        // - Metal.framework → MTLCompilerService.xpc (existing, shader compile)
+        // - ViewBridge.framework → ViewBridgeAuxiliary.xpc (NEW: AppKit window content
+        //   render — without this, Terminal logs "Connection Invalid for
+        //   com.apple.ViewBridgeAuxiliary" and window content never renders)
+        // - HIServices.framework → com.apple.hiservices-xpcservice.xpc (NEW: AppKit's
+        //   client-aux endpoint; previously: "Connection Invalid for
+        //   com.apple.hiservices-xpcservice")
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
-        void(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
-        _xpc_bootstrap_services(dict);
-        // NOTE: tried registering ApplicationServices / HIServices xpc here to fix
-        // Terminal's "Connection Invalid for com.apple.hiservices-xpcservice" but the
-        // XPC subprocess spawn goes via the (iOS-root) launchd which can't resolve the
-        // macOS framework path. See [[hiservices-xpc-chroot-window-blocker]] for forward
-        // paths (D: copy hiservices binary into /var/jb/usr/macOS-visible space + register
-        // it, with shim deps for ApplicationServices/HIServices dlopen).
+        // Framework binary path uses TLD symlink form (matches Metal pattern)
+        xpc_dictionary_set_uint64(dict, "/System/Library/PrivateFrameworks/ViewBridge.framework/ViewBridge", 2);
+        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/HIServices", 2);
+        void(*_xpc_bootstrap_services_fn)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
+        fprintf(stderr, "#### XPC_BOOTSTRAP: fn=%p dict=%p (registering Metal/ViewBridge/HIServices)\n",
+            _xpc_bootstrap_services_fn, dict);
+        if (_xpc_bootstrap_services_fn) {
+            _xpc_bootstrap_services_fn(dict);
+            fprintf(stderr, "#### XPC_BOOTSTRAP: called OK\n");
+        } else {
+            fprintf(stderr, "#### XPC_BOOTSTRAP: SYMBOL NOT FOUND\n");
+        }
     } else if(!strncmp(info.dli_fname, MetalPath, strlen(MetalPath))) {
         // patch MTL*ReflectionReader::deserialize to match iOS
         // on macOS, there are extra instructions

@@ -319,9 +319,96 @@ extern int xpc_connection_enable_sim2host_4sim();
     return 0;
 }
 
-// (NSXPCSharedListener swizzle reverted — its constructor-time init crashed
-// libSystem_initializer on arm64e chroot processes. Re-attempt requires
-// deferred install via dispatch_async after libSystem is up.)
+// Deferred install of NSXPCSharedListener swizzle.
+// AppKit calls +[NSXPCSharedListener endpointForReply:withListenerName:replyErrorCode:]
+// to obtain endpoints to ViewBridgeAuxiliary / hiservices. In chroot these XPC services
+// can't be spawned (macOS-only frameworks; iOS launchd has no equivalent), so the call
+// returns nil and AppKit logs "Connection invalid", skipping window content creation.
+//
+// We return a process-local NSXPCListener's endpoint so AppKit thinks it got one. The
+// in-process listener doesn't actually serve the real protocol, but AppKit's "endpoint
+// non-nil" check passes and downstream window creation proceeds.
+//
+// MUST run AFTER libSystem_initializer (constructor-time NSClassFromString causes
+// libSystem PAC traps on arm64e). Install via dispatch_async-after-main-loop.
+static IMP gOrigEndpointForReply = NULL;
+
+static id hook_endpointForReply_replacement(Class self, SEL _cmd, id reply,
+                                             id listenerName, int *replyErrorCode) {
+    // listenerName is an OS_xpc_string (XPC string), not NSString. Extract cstring
+    // via the OS_xpc_string instance method instead of NSString's UTF8String.
+    const char *name_c = "(nil)";
+    if (listenerName) {
+        SEL utf8_sel = sel_registerName("UTF8String");
+        if ([listenerName respondsToSelector:utf8_sel]) {
+            // NSString-style — fine
+            name_c = ((const char *(*)(id, SEL))objc_msgSend)(listenerName, utf8_sel);
+        } else {
+            // Assume xpc_string_t — try xpc_string_get_string_ptr
+            extern const char *xpc_string_get_string_ptr(xpc_object_t xstring);
+            name_c = xpc_string_get_string_ptr((xpc_object_t)listenerName);
+            if (!name_c) name_c = "(xpc-string?)";
+        }
+    }
+    fprintf(stderr, "#### NSXPCSharedListener intercept: listener=%s\n", name_c);
+
+    static NSMutableDictionary *cache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+    if (!listenerName) {
+        if (replyErrorCode) *replyErrorCode = 0;
+        return nil;
+    }
+    NSString *key = [NSString stringWithUTF8String:name_c];
+    @synchronized(cache) {
+        NSXPCListenerEndpoint *ep = cache[key];
+        if (!ep) {
+            NSXPCListener *l = [NSXPCListener anonymousListener];
+            [l resume];
+            ep = l.endpoint;
+            cache[key] = ep;
+            fprintf(stderr, "#### NSXPCSharedListener: provided in-process endpoint %p for '%s'\n",
+                ep, name_c);
+        }
+        if (replyErrorCode) *replyErrorCode = 0;
+        return ep;
+    }
+}
+
+// Replacement for +[NSXPCSharedListener connectToService:instanceIdentifier:listener:error:].
+// Returning YES makes ViewBridge believe the connection is up; it then dereferences
+// an expected proxy and crashes in __auxiliaryProxyFor_block_invoke. Returning NO
+// makes ViewBridge bail with a graceful failure — auxiliaryProxyFor returns nil,
+// NSRemoteView initialize finishes without crashing, AppKit continues to window
+// creation (which doesn't strictly need NSRemoteView).
+static BOOL hook_connectToService_replacement(Class self, SEL _cmd, id service,
+                                                id instanceIdentifier, id listener,
+                                                NSError **errorPtr) {
+    fprintf(stderr, "#### NSXPCSharedListener connectToService intercepted (graceful fail)\n");
+    // Don't set errorPtr; NSError instantiation triggers PAC autda fault in chroot arm64e.
+    // Returning NO with *errorPtr untouched should be acceptable for ViewBridge's call site.
+    return NO;
+}
+
+static void install_nsxpcsharedlistener_swizzle(void) {
+    Class shl = objc_getClass("NSXPCSharedListener");
+    fprintf(stderr, "#### NSXPCSharedListener class=%p\n", shl);
+    if (!shl) return;
+    SEL sel = sel_registerName("endpointForReply:withListenerName:replyErrorCode:");
+    Method m = class_getClassMethod(shl, sel);
+    if (m) {
+        gOrigEndpointForReply = method_getImplementation(m);
+        method_setImplementation(m, (IMP)hook_endpointForReply_replacement);
+        fprintf(stderr, "#### NSXPCSharedListener endpointForReply swizzle installed\n");
+    }
+    // Also swizzle connectToService:instanceIdentifier:listener:error: to silently succeed.
+    SEL sel2 = sel_registerName("connectToService:instanceIdentifier:listener:error:");
+    Method m2 = class_getClassMethod(shl, sel2);
+    if (m2) {
+        method_setImplementation(m2, (IMP)hook_connectToService_replacement);
+        fprintf(stderr, "#### NSXPCSharedListener connectToService swizzle installed\n");
+    }
+}
 
 __attribute__((constructor)) static void InitMetalHooks() {
     // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
@@ -354,18 +441,53 @@ __attribute__((constructor)) static void InitMetalHooks() {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"), hooked_xpc_connection_create, (void *)&orig_xpc_connection_create);
 
-    // (NSXPCSharedListener swizzle install removed — see comment above.)
+    // Defer NSXPCSharedListener swizzle install until after libSystem is fully up.
+    // Constructor-time class lookup PAC-traps on arm64e (autda fault in libobjc class
+    // realization). dispatch_async waits until the main runloop is active.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        install_nsxpcsharedlistener_swizzle();
+
+        // If this is Terminal, force "New Window" via responder chain since AppKit's
+        // automatic startup-window-creation depends on hiservices/launchservices which
+        // are broken in chroot. Multiple selector attempts (Terminal uses
+        // newWindowWithProfile: typically, but newWindow: also responds).
+        const char *prog = getprogname();
+        if (prog && strstr(prog, "Terminal")) {
+            // Schedule slightly after main queue so app's didFinishLaunching has fired.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
+                dispatch_get_main_queue(), ^{
+                fprintf(stderr, "#### Forcing Terminal new-window via sendAction:\n");
+                SEL sels[] = {
+                    sel_registerName("newWindow:"),
+                    sel_registerName("newWindowWithProfile:"),
+                    sel_registerName("newTerminal:"),
+                    sel_registerName("newTerminalWithDefaultProfile:"),
+                };
+                Class app_cls = objc_getClass("NSApplication");
+                id app = ((id (*)(Class, SEL))objc_msgSend)(app_cls, sel_registerName("sharedApplication"));
+                fprintf(stderr, "#### NSApp=%p\n", app);
+                if (app) {
+                    for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
+                        BOOL ok = ((BOOL (*)(id, SEL, SEL, id, id))objc_msgSend)(
+                            app, sel_registerName("sendAction:to:from:"),
+                            sels[i], nil, nil);
+                        fprintf(stderr, "####   sendAction %s -> %d\n", sel_getName(sels[i]), ok);
+                        if (ok) break;
+                    }
+                }
+            });
+        }
+    });
     // register MTLSimDriverHost.xpc
     char frameworkPath[PATH_MAX];
     // NSLog(@"#### debugbydcmmc register MTLSimDriverHost.xpc");
     snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
     xpc_add_bundle(frameworkPath, 2);
 
-    // register ViewBridgeChrootProxy.xpc — wrapper that chroots+execs the real
-    // macOS ViewBridgeAuxiliary inside chroot. Without this, Terminal's AppKit
-    // NSXPCSharedListener for ClientCallsAuxiliary fails with "Connection invalid",
-    // so window CONTENT never renders (menu bar does, but no window surface).
-    char vbPath[PATH_MAX];
-    snprintf(vbPath, sizeof(vbPath), "%s/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
-    xpc_add_bundle(vbPath, 2);
+    // ViewBridgeAuxiliary.xpc & hiservices-xpcservice.xpc are now registered via
+    // _xpc_bootstrap_services in mac_hooks.m's libxpc branch — pointing at the
+    // FRAMEWORK BINARY paths, which lets xpc auto-discover bundled XPCServices/
+    // children. xpc_add_bundle (the .xpc-path variant) didn't actually trigger
+    // spawn; _xpc_bootstrap_services does. (Credit: user-suggested fix based on
+    // their earlier MTLCompilerService shader recompile issue.)
 }
