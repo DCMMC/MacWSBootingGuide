@@ -67,8 +67,15 @@ P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 # relaunches it on-demand, it re-inits, crashes again — a restart storm that
 # drives the 1-min load average toward ~44 and risks a kernel panic/reboot.
 # The watchdog auto-stops the GUI when it sees that runaway, protecting the device.
-WD_LOAD_LIMIT=25     # 1-min load average that triggers a protective stop
-WD_RESTART_LIMIT=4   # WindowServer restarts within WD_WINDOW that means "crash loop"
+WD_LOAD_LIMIT=60     # 1-min load average that triggers a protective stop
+                     # (raised from 25: Firefox software WebRender legitimately runs hot
+                     #  without crashlooping; the WS-restart counter still catches real
+                     #  crashloops)
+WD_RESTART_LIMIT=12  # WindowServer restarts within WD_WINDOW that means "crash loop"
+                     # (raised from 4: Firefox triggers some SkyLight CAWSBackend asserts
+                     #  we haven't byte-patched yet (render_update composite_destination
+                     #  nullptr). launchd respawns WS in ~1s; up to ~12 restarts per 45s
+                     #  is annoying but not yet runaway — only stop if it's much worse)
 WD_WINDOW=45         # seconds — restart-counting window
 WD_POLL=5            # seconds between checks
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"

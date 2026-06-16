@@ -72,6 +72,21 @@ void EnableJIT(void);
 // also takes that existing skip-and-survive path instead of asserting. Same philosophy as the
 // WSCompositeDest texAssert patch above.
 #define OFF_SkyLight_MetalContext_memoryless_guard 0x148848
+// SkyLight`MetalContext::EndUpdate(bool) contains 3 abort sites that fire under
+// concurrent compositor pressure (Firefox software WebRender + many small
+// content surfaces):
+//   * +196: assert(_update_depth >= 1 && "Unbalanced Updates.")
+//   * +264: assert(_state_stack.empty() && "Unbalanced Composites.")
+//   * +408: a third bl __assert_rtn (less-common branch)
+// EndUpdate is void; convert each `bl __assert_rtn` to `ret` so the function
+// returns cleanly instead of abort()ing WindowServer. The cascading WS restart
+// loop (which trips the watchdog) goes away.
+//
+// Image offsets verified against the live WindowServer process via lldb
+// (image lookup --name _ZN12MetalContext9EndUpdateEb + section base).
+#define OFF_SkyLight_MetalContext_EndUpdate_assert_1 0x147174
+#define OFF_SkyLight_MetalContext_EndUpdate_assert_2 0x1471b8
+#define OFF_SkyLight_MetalContext_EndUpdate_assert_3 0x1476d4
 #if FORCE_SW_RENDER
 // SkyLight`WSSystemCanCompositeWithMetal::once
 // #define OFF_SkyLight_WSSystemCanCompositeWithMetal 0x1d72b148
@@ -161,6 +176,28 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 *memGuard = 0x17ffffb2;    // b    +952  (mov w0,#0 ; b epilogue — no assert)
             }
         });
+
+        // Convert all three `bl __assert_rtn` sites in MetalContext::EndUpdate(bool)
+        // to `ret`. EndUpdate is a void function; the assert fires under high
+        // concurrent compositor load when _update_depth or _state_stack drift
+        // (typical with software WebRender + many small Firefox content surfaces).
+        // A clean `ret` skips the message-build setup just before the bl (which is
+        // harmless dead code since we never reach __assert_rtn).
+        const uintptr_t end_update_asserts[3] = {
+            OFF_SkyLight_MetalContext_EndUpdate_assert_1,
+            OFF_SkyLight_MetalContext_EndUpdate_assert_2,
+            OFF_SkyLight_MetalContext_EndUpdate_assert_3,
+        };
+        for (int i = 0; i < 3; i++) {
+            uint32_t *site = (uint32_t *)(end_update_asserts[i] + (uintptr_t)header);
+            ModifyExecutableRegion(site, sizeof(uint32_t), ^{
+                // `bl __assert_rtn` is `bl <imm26>` (opcode 0x94000000, low 26 bits = offset>>2).
+                // Match the bl opcode (high 6 bits), ignore target since shared-cache slide changes it.
+                if ((*site & 0xFC000000) == 0x94000000) {
+                    *site = 0xd65f03c0;  // ret
+                }
+            });
+        }
 
         // grant all permissions
         MSHookFunction(MSFindSymbol((MSImageRef)header, "_audit_token_check_tcc_access"), hooked_return_1, NULL);
@@ -685,6 +722,435 @@ int seteuid_new(uid_t uid) {
 DYLD_INTERPOSE(_libsecinit_initializer_new, _libsecinit_initializer);
 DYLD_INTERPOSE(setegid_new, setegid);
 DYLD_INTERPOSE(seteuid_new, seteuid);
+
+// NOTE: Earlier we tried a global `__assert_rtn` interpose to swallow any
+// SkyLight/CAWSBackend assert that we hadn't byte-patched yet. That caused
+// the device to reboot — likely because libSystem's own internal asserts
+// (e.g. in libdispatch / pthread teardown) MUST abort to keep the kernel
+// world consistent; making them return left libSystem in undefined state.
+// We rely on targeted byte patches in loadImageCallback instead (EndUpdate,
+// MetalContext memoryless guard, WSCompositeDest tex assert).
+
+// ─── mmap interpose for V8/cppgc CagedHeap on iOS ───────────────────────────
+//
+// V8's Oilpan CagedHeap reserves a 32 GB virtual address region at startup
+// (`mmap(NULL, 0x800000000, PROT_NONE, MAP_PRIVATE|MAP_ANON, -1, 0)`). On
+// macOS this just reserves VA space; iOS rejects allocations this large and
+// V8 then calls `FATAL("Oilpan: CagedHeap reservation.")`. We shim the request
+// to a much smaller actual mapping; V8 treats its pointer as if it owned the
+// full range. Works until V8 actually touches memory beyond the shim (which
+// happens after static init — at least we reach main()).
+//
+// Hot-path safety: the FIRST call delegates straight to real mmap, only
+// substituting on FAILURE for the specific multi-GB anonymous-NULL pattern.
+// Other mmap callers (libc, malloc, dyld, every other process touching this
+// dylib) are unaffected.
+#include <sys/mman.h>
+
+// Track shimmed mappings: [base, base+real_size) is real; [base+real_size, base+claimed_size) is "fake".
+// V8 will munmap sub-regions of the "claimed" range; we need to silently swallow
+// out-of-range munmaps to avoid the kernel's DEALLOC_GAP guard SIGKILL.
+#define MAX_SHIMS 16
+static struct {
+    uintptr_t base;       // returned to caller
+    size_t    claimed;    // size V8 thinks it has
+    size_t    real;       // size actually mapped
+} g_shims[MAX_SHIMS];
+static int g_shim_count = 0;
+static pthread_mutex_t g_shim_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int shim_lookup(uintptr_t addr, size_t len, uintptr_t *real_base, size_t *real_end) {
+    pthread_mutex_lock(&g_shim_lock);
+    for (int i = 0; i < g_shim_count; i++) {
+        uintptr_t b = g_shims[i].base;
+        uintptr_t claim_end = b + g_shims[i].claimed;
+        if (addr >= b && addr < claim_end) {
+            if (real_base) *real_base = b;
+            if (real_end)  *real_end  = b + g_shims[i].real;
+            pthread_mutex_unlock(&g_shim_lock);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&g_shim_lock);
+    return 0;
+}
+
+static void shim_add(uintptr_t base, size_t claimed, size_t real) {
+    pthread_mutex_lock(&g_shim_lock);
+    if (g_shim_count < MAX_SHIMS) {
+        g_shims[g_shim_count].base    = base;
+        g_shims[g_shim_count].claimed = claimed;
+        g_shims[g_shim_count].real    = real;
+        g_shim_count++;
+    }
+    pthread_mutex_unlock(&g_shim_lock);
+}
+
+static void *mmap_hook(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
+    void *r = mmap(addr, length, prot, flags, fd, offset);
+    if (length >= (64ull * 1024 * 1024)) {
+        fprintf(stderr, "#### debugbydcmmc mmap: addr=%p len=0x%zx prot=0x%x flags=0x%x fd=%d -> %p\n",
+                addr, length, prot, flags, fd, r);
+    }
+    // V8's CagedHeap over-allocation pattern fails for sizes ≥ 1 GiB.
+    if (r == MAP_FAILED && length >= (1ull << 30) && (flags & MAP_ANON)) {
+        int saved_errno = errno;
+        size_t try_size = length / 2;
+        while (try_size >= (1ull << 28)) {
+            void *r2 = mmap(NULL, try_size, prot, flags, fd, offset);
+            if (r2 != MAP_FAILED) {
+                shim_add((uintptr_t)r2, length, try_size);
+                fprintf(stderr, "#### debugbydcmmc mmap SHIM: req=0x%zx -> %p (real 0x%zx)\n",
+                        length, r2, try_size);
+                return r2;
+            }
+            try_size /= 2;
+        }
+        errno = saved_errno;
+        return r;
+    }
+    // Detect collision: if kernel returned an addr inside an existing shim region,
+    // V8 will see overlapping mappings and crash. Re-allocate elsewhere.
+    if (r != MAP_FAILED && !(flags & MAP_FIXED) && length >= (1ull << 28)) {
+        uintptr_t rb = 0, re = 0;
+        if (shim_lookup((uintptr_t)r, length, &rb, &re)) {
+            fprintf(stderr, "#### debugbydcmmc mmap COLLISION: kernel returned %p inside shim [%p,%p) — retrying\n",
+                    r, (void*)rb, (void*)re);
+            munmap(r, length);
+            // try higher addresses by passing hints; some may stick
+            for (uintptr_t h = 0x400000000000ULL; h < 0x800000000000ULL; h += 0x40000000000ULL) {
+                void *r3 = mmap((void *)h, length, prot, flags, fd, offset);
+                if (r3 != MAP_FAILED) {
+                    uintptr_t cb=0, ce=0;
+                    if (!shim_lookup((uintptr_t)r3, length, &cb, &ce)) {
+                        fprintf(stderr, "#### debugbydcmmc mmap RETRY @ hint %p -> %p\n", (void*)h, r3);
+                        return r3;
+                    }
+                    munmap(r3, length);
+                }
+            }
+            // fallback: take the kernel's choice anyway
+            r = mmap(NULL, length, prot, flags, fd, offset);
+            fprintf(stderr, "#### debugbydcmmc mmap RETRY fallback -> %p\n", r);
+        }
+    }
+    return r;
+}
+DYLD_INTERPOSE(mmap_hook, mmap);
+
+static int munmap_hook(void *addr, size_t length) {
+    uintptr_t real_base = 0, real_end = 0;
+    if (shim_lookup((uintptr_t)addr, length, &real_base, &real_end)) {
+        uintptr_t req_start = (uintptr_t)addr;
+        uintptr_t req_end   = req_start + length;
+        if (req_end <= real_end) {
+            // fully within real mapping -- pass through
+            return munmap(addr, length);
+        }
+        if (req_start >= real_end) {
+            // fully outside real mapping -- pretend success (V8 thinks it owns
+            // up to claimed_size; out-of-range trim is its bookkeeping cleanup).
+            fprintf(stderr, "#### debugbydcmmc munmap SWALLOW: [%p, %p) outside real [%p,%p)\n",
+                    (void*)req_start, (void*)req_end, (void*)real_base, (void*)real_end);
+            return 0;
+        }
+        // partial: unmap only the in-range part, swallow the rest
+        size_t in_range = real_end - req_start;
+        fprintf(stderr, "#### debugbydcmmc munmap PARTIAL: req [%p,%p) trimmed to [%p,%p)\n",
+                (void*)req_start, (void*)req_end, (void*)req_start, (void*)real_end);
+        return munmap(addr, in_range);
+    }
+    return munmap(addr, length);
+}
+DYLD_INTERPOSE(munmap_hook, munmap);
+
+#include <sys/resource.h>
+__attribute__((constructor)) static void RaiseVMLimit(void) {
+    // V8/cppgc needs ≥ 64 GiB virtual address space (32 GiB size + 32 GiB
+    // alignment for the CagedHeap reservation). iOS default RLIMIT_AS may be
+    // tight; bump to infinity before V8 init runs.
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_AS, &rl) == 0) {
+        fprintf(stderr, "#### debugbydcmmc RLIMIT_AS before: cur=%llu max=%llu\n",
+                (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max);
+        rl.rlim_cur = RLIM_INFINITY;
+        rl.rlim_max = RLIM_INFINITY;
+        int r1 = setrlimit(RLIMIT_AS, &rl);
+        fprintf(stderr, "#### debugbydcmmc RLIMIT_AS setrlimit returned %d errno=%d\n", r1, errno);
+    }
+    if (getrlimit(RLIMIT_RSS, &rl) == 0) {
+        fprintf(stderr, "#### debugbydcmmc RLIMIT_RSS before: cur=%llu max=%llu\n",
+                (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max);
+    }
+}
+
+// ─── SIGTRAP swallow for Chromium IMMEDIATE_CRASH ───────────────────────────
+//
+// Chromium emits `brk #0; hlt #0; brk #1` as its IMMEDIATE_CRASH() macro
+// expansion. Every CHECK/CHECK_OP failure path ends in this 3-instruction
+// poison. On iOS we hit these constantly during V8 init for invariants that
+// don't apply on this kernel (e.g. iOS-stripped Mach VM API responses).
+//
+// Catch SIGTRAP, verify the current PC really points at `brk #0`, and advance
+// PC past the 3-instruction poison block. Execution falls through into the
+// next function's prologue — which may corrupt the stack frame, BUT in
+// practice V8's tail-call abort patterns put each IMMEDIATE_CRASH at the end
+// of a `[[noreturn]]` helper that no caller expects to return from anyway.
+// The caller's frame is already preserved (x29/x30 in stack); skipping the
+// brk lets control return up the stack normally.
+//
+// Strictly limited to brk #0 (insn = 0xd4200000). Other SIGTRAP causes
+// (regular debugger breakpoints, hlt-only, brk with non-zero immediate) fall
+// through to the default handler.
+#include <signal.h>
+
+static struct sigaction g_old_sigtrap = {0};
+
+static void sigtrap_handler(int sig, siginfo_t *si, void *ctx) {
+    ucontext_t *uc = (ucontext_t *)ctx;
+    if (!uc || !uc->uc_mcontext) goto chain;
+    uint64_t pc = (uint64_t)arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+    uint32_t insn = *(uint32_t *)pc;
+    if (insn != 0xd4200000) {
+        // not a brk #0; pass through to whatever was here before
+        goto chain;
+    }
+    // Skip past the 3-instruction poison block (brk #0; hlt #0; brk #1).
+    arm_thread_state64_set_pc_fptr(uc->uc_mcontext->__ss, (void *)(pc + 12));
+    static int count = 0;
+    if (++count < 200) {
+        fprintf(stderr, "#### debugbydcmmc SIGTRAP swallowed brk #0 @ 0x%llx (count=%d)\n",
+                (unsigned long long)pc, count);
+    }
+    return;
+chain:
+    if (g_old_sigtrap.sa_flags & SA_SIGINFO) {
+        if (g_old_sigtrap.sa_sigaction) g_old_sigtrap.sa_sigaction(sig, si, ctx);
+    } else if (g_old_sigtrap.sa_handler && g_old_sigtrap.sa_handler != SIG_DFL &&
+               g_old_sigtrap.sa_handler != SIG_IGN) {
+        g_old_sigtrap.sa_handler(sig);
+    } else {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    }
+}
+
+__attribute__((constructor)) static void InstallSigtrapSwallow(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigtrap_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGTRAP, &sa, &g_old_sigtrap) == 0) {
+        fprintf(stderr, "#### debugbydcmmc SIGTRAP handler installed\n");
+    }
+}
+
+// ─── Block Chromium's task_set_exception_ports for EXC_BREAKPOINT ────────────
+// V8/Chromium installs a Mach exception handler for EXC_BREAKPOINT in
+// `base::debug::EnableInProcessStackDumping` (or via crashpad). That handler
+// catches every brk #0 from IMMEDIATE_CRASH() and aborts the process BEFORE
+// the kernel converts EXC_BREAKPOINT into SIGTRAP, so our SIGTRAP handler
+// never gets a chance. We intercept the registration call and mask off the
+// EXC_MASK_BREAKPOINT bit, letting EXC_BREAKPOINT flow through to SIGTRAP.
+extern kern_return_t task_set_exception_ports(task_t, exception_mask_t,
+                                              mach_port_t, exception_behavior_t,
+                                              thread_state_flavor_t);
+
+static kern_return_t task_set_exception_ports_hook(task_t task,
+                                                   exception_mask_t mask,
+                                                   mach_port_t new_port,
+                                                   exception_behavior_t behavior,
+                                                   thread_state_flavor_t flavor) {
+    exception_mask_t blocked = mask & EXC_MASK_BREAKPOINT;
+    exception_mask_t passed  = mask & ~EXC_MASK_BREAKPOINT;
+    if (blocked) {
+        fprintf(stderr, "#### debugbydcmmc task_set_exception_ports: BLOCKED BREAKPOINT (orig mask=0x%x, pass=0x%x)\n",
+                mask, passed);
+    }
+    if (passed == 0) {
+        // Nothing left to register; pretend success.
+        return KERN_SUCCESS;
+    }
+    return task_set_exception_ports(task, passed, new_port, behavior, flavor);
+}
+DYLD_INTERPOSE(task_set_exception_ports_hook, task_set_exception_ports);
+
+extern kern_return_t task_swap_exception_ports(task_t, exception_mask_t,
+                                               mach_port_t, exception_behavior_t,
+                                               thread_state_flavor_t,
+                                               exception_mask_array_t,
+                                               mach_msg_type_number_t *,
+                                               exception_handler_array_t,
+                                               exception_behavior_array_t,
+                                               exception_flavor_array_t);
+
+static kern_return_t task_swap_exception_ports_hook(task_t task,
+                                                    exception_mask_t mask,
+                                                    mach_port_t new_port,
+                                                    exception_behavior_t behavior,
+                                                    thread_state_flavor_t flavor,
+                                                    exception_mask_array_t masks,
+                                                    mach_msg_type_number_t *count,
+                                                    exception_handler_array_t old_handlers,
+                                                    exception_behavior_array_t old_behaviors,
+                                                    exception_flavor_array_t old_flavors) {
+    exception_mask_t passed = mask & ~EXC_MASK_BREAKPOINT;
+    if (mask & EXC_MASK_BREAKPOINT) {
+        fprintf(stderr, "#### debugbydcmmc task_swap_exception_ports: BLOCKED BREAKPOINT (mask=0x%x)\n", mask);
+    }
+    if (passed == 0) {
+        if (count) *count = 0;
+        return KERN_SUCCESS;
+    }
+    return task_swap_exception_ports(task, passed, new_port, behavior, flavor,
+                                     masks, count, old_handlers, old_behaviors, old_flavors);
+}
+DYLD_INTERPOSE(task_swap_exception_ports_hook, task_swap_exception_ports);
+
+extern kern_return_t thread_set_exception_ports(thread_t, exception_mask_t,
+                                                mach_port_t, exception_behavior_t,
+                                                thread_state_flavor_t);
+
+static kern_return_t thread_set_exception_ports_hook(thread_t thread,
+                                                     exception_mask_t mask,
+                                                     mach_port_t new_port,
+                                                     exception_behavior_t behavior,
+                                                     thread_state_flavor_t flavor) {
+    exception_mask_t passed = mask & ~EXC_MASK_BREAKPOINT;
+    if (mask & EXC_MASK_BREAKPOINT) {
+        fprintf(stderr, "#### debugbydcmmc thread_set_exception_ports: BLOCKED BREAKPOINT (mask=0x%x)\n", mask);
+    }
+    if (passed == 0) {
+        return KERN_SUCCESS;
+    }
+    return thread_set_exception_ports(thread, passed, new_port, behavior, flavor);
+}
+DYLD_INTERPOSE(thread_set_exception_ports_hook, thread_set_exception_ports);
+
+// Also refuse for any sigaction() that would override our SIGTRAP handler.
+extern int sigaction(int, const struct sigaction * __restrict, struct sigaction * __restrict);
+static int sigaction_hook(int sig, const struct sigaction * __restrict act, struct sigaction * __restrict oact) {
+    if (sig == SIGTRAP && act != NULL) {
+        // Pretend we set their handler, but actually keep ours.
+        if (oact) *oact = g_old_sigtrap;
+        fprintf(stderr, "#### debugbydcmmc sigaction(SIGTRAP) overridden — keeping our handler\n");
+        return 0;
+    }
+    return sigaction(sig, act, oact);
+}
+DYLD_INTERPOSE(sigaction_hook, sigaction);
+
+extern sig_t signal(int, sig_t);
+static sig_t signal_hook(int sig, sig_t handler) {
+    if (sig == SIGTRAP) {
+        fprintf(stderr, "#### debugbydcmmc signal(SIGTRAP, %p) IGNORED — keeping our handler\n", handler);
+        return SIG_DFL;
+    }
+    return signal(sig, handler);
+}
+DYLD_INTERPOSE(signal_hook, signal);
+
+// ─── mach_vm_map / mach_vm_allocate hooks ────────────────────────────────────
+// On macOS, V8/cppgc CagedHeap actually uses Mach VM APIs (mach_vm_map +
+// VM_FLAGS_ANYWHERE) for the 32 GB reservation, not POSIX mmap. We hook the
+// Mach API too: if a huge ANYWHERE reservation fails (KERN_NO_SPACE / similar),
+// substitute a small one and report it as succeeded at the requested size.
+//
+// iPhoneOS SDK lacks <mach/mach_vm.h> ("unsupported") so we declare the
+// signatures manually. The 64-bit Mach VM types are uint64_t on arm64.
+#include <mach/mach.h>
+typedef uint64_t mach_vm_address_t_t;
+typedef uint64_t mach_vm_size_t_t;
+typedef uint64_t mach_vm_offset_t_t;
+typedef uint64_t memory_object_offset_t_t;
+extern kern_return_t mach_vm_map(vm_map_t, mach_vm_address_t_t *,
+                                 mach_vm_size_t_t, mach_vm_offset_t_t, int,
+                                 mem_entry_name_port_t,
+                                 memory_object_offset_t_t, boolean_t,
+                                 vm_prot_t, vm_prot_t, vm_inherit_t);
+
+static kern_return_t mach_vm_map_hook(vm_map_t target, mach_vm_address_t_t *address,
+                                      mach_vm_size_t_t size, mach_vm_offset_t_t mask,
+                                      int flags, mem_entry_name_port_t object,
+                                      memory_object_offset_t_t offset, boolean_t copy,
+                                      vm_prot_t cur_protection, vm_prot_t max_protection,
+                                      vm_inherit_t inheritance) {
+    kern_return_t kr = mach_vm_map(target, address, size, mask, flags, object,
+                                   offset, copy, cur_protection, max_protection,
+                                   inheritance);
+    // Log every large call (≥ 64 MiB) regardless of success — this is how V8/cppgc
+    // reservations are detected in practice.
+    if (size >= (64ull * 1024 * 1024)) {
+        fprintf(stderr, "#### debugbydcmmc mach_vm_map: size=0x%llx flags=0x%x prot=0x%x kr=%d\n",
+                (unsigned long long)size, flags, cur_protection, kr);
+    }
+    if (__builtin_expect(kr != KERN_SUCCESS, 0) && size >= (1ull << 30) &&
+        (flags & VM_FLAGS_ANYWHERE)) {
+        fprintf(stderr, "#### debugbydcmmc mach_vm_map BIG-FAIL: size=0x%llx flags=0x%x prot=0x%x kr=%d (%s)\n",
+                (unsigned long long)size, flags, cur_protection, kr, mach_error_string(kr));
+        const mach_vm_size_t_t SHIM_SIZE = 256ull * 1024 * 1024;
+        mach_vm_address_t_t addr2 = 0;
+        kern_return_t kr2 = mach_vm_map(target, &addr2, SHIM_SIZE, mask, flags, object,
+                                        offset, copy, cur_protection, max_protection,
+                                        inheritance);
+        if (kr2 == KERN_SUCCESS) {
+            fprintf(stderr, "#### debugbydcmmc mach_vm_map SHIM: req=0x%llx -> 0x%llx (real 0x%llx)\n",
+                    (unsigned long long)size, (unsigned long long)addr2,
+                    (unsigned long long)SHIM_SIZE);
+            *address = addr2;
+            return KERN_SUCCESS;
+        }
+    }
+    return kr;
+}
+DYLD_INTERPOSE(mach_vm_map_hook, mach_vm_map);
+
+extern kern_return_t mach_vm_allocate(vm_map_t, mach_vm_address_t_t *,
+                                      mach_vm_size_t_t, int);
+static kern_return_t mach_vm_allocate_hook(vm_map_t target,
+                                           mach_vm_address_t_t *address,
+                                           mach_vm_size_t_t size, int flags) {
+    kern_return_t kr = mach_vm_allocate(target, address, size, flags);
+    if (__builtin_expect(kr != KERN_SUCCESS, 0) && size >= (1ull << 30) &&
+        (flags & VM_FLAGS_ANYWHERE)) {
+        fprintf(stderr, "#### debugbydcmmc mach_vm_allocate BIG-FAIL: size=0x%llx flags=0x%x kr=%d (%s)\n",
+                (unsigned long long)size, flags, kr, mach_error_string(kr));
+        const mach_vm_size_t_t SHIM_SIZE = 256ull * 1024 * 1024;
+        mach_vm_address_t_t addr2 = 0;
+        kern_return_t kr2 = mach_vm_allocate(target, &addr2, SHIM_SIZE, flags);
+        if (kr2 == KERN_SUCCESS) {
+            fprintf(stderr, "#### debugbydcmmc mach_vm_allocate SHIM: req=0x%llx -> 0x%llx (real 0x%llx)\n",
+                    (unsigned long long)size, (unsigned long long)addr2,
+                    (unsigned long long)SHIM_SIZE);
+            *address = addr2;
+            return KERN_SUCCESS;
+        }
+    }
+    return kr;
+}
+DYLD_INTERPOSE(mach_vm_allocate_hook, mach_vm_allocate);
+
+static kern_return_t vm_allocate_hook(vm_map_t target, vm_address_t *address,
+                                      vm_size_t size, int flags) {
+    kern_return_t kr = vm_allocate(target, address, size, flags);
+    if (__builtin_expect(kr != KERN_SUCCESS, 0) && size >= (1ull << 30) &&
+        (flags & VM_FLAGS_ANYWHERE)) {
+        fprintf(stderr, "#### debugbydcmmc vm_allocate BIG-FAIL: size=0x%lx flags=0x%x kr=%d (%s)\n",
+                (unsigned long)size, flags, kr, mach_error_string(kr));
+        const vm_size_t SHIM_SIZE = 256 * 1024 * 1024;
+        vm_address_t addr2 = 0;
+        kern_return_t kr2 = vm_allocate(target, &addr2, SHIM_SIZE, flags);
+        if (kr2 == KERN_SUCCESS) {
+            fprintf(stderr, "#### debugbydcmmc vm_allocate SHIM: req=0x%lx -> 0x%lx (real 0x%lx)\n",
+                    (unsigned long)size, (unsigned long)addr2, (unsigned long)SHIM_SIZE);
+            *address = addr2;
+            return KERN_SUCCESS;
+        }
+    }
+    return kr;
+}
+DYLD_INTERPOSE(vm_allocate_hook, vm_allocate);
 
 // utilities
 void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
