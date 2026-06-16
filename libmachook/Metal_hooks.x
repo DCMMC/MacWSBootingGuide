@@ -253,8 +253,12 @@ static void install_agx_init_redirect(Class agx) {
     // newBuffer/newTexture/newCommandQueue/newCommandBuffer to succeed (probe7
     // stages 1-6+8). Texture/buffer creation reads OTHER ivars set by the 2-arg
     // init, not the deferred mempool ivars.
+    // Note: setupDeferred is NOT noop'd here anymore. Texture init reads
+    // mempool storage that setupDeferred populates (see crash in
+    // AGX::Mempool<...ImageStateEncoderGen6...>::grow when WS creates an
+    // IOSurface-backed texture). The alert* methods are still noop'd because
+    // their dispatch_source setup fails in chroot but no other code uses them.
     const char *noopMethods[] = {
-        "setupDeferred",
         "alertCommandBufferActivityStart",
         "alertCommandBufferActivityComplete",
         NULL

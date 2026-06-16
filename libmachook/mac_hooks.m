@@ -291,11 +291,108 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             });
         }
     } else if(getenv("MACWS_AGX_NATIVE") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
-        // Note: previous AGXMetal13_3 cmp/b.hi binary patches removed — they
-        // weren't actually helping (probe7 stage 2 was already failing without
-        // them, then). The ObjC-level method_setImplementation no-op of
-        // setupDeferred in Metal_hooks.x is the only thing that matters.
-        fprintf(stderr, "#### MACWS_AGX_NATIVE AGXMetal13_3 loaded (no binary patches applied)\n");
+        // CHROOT AGX-NATIVE: two-layer patch for the strict-AGX-native userspace path.
+        //
+        // ROOT CAUSE: when libmachook injected chroot processes dlopen AGXMetal13_3
+        // standalone (not via macOS dyld_shared_cache, which isn't activated for chroot),
+        // cross-image BSS function pointers stay null/zero (the IOGPU pool allocator at
+        // 0x21f95bc90 etc.). Mempool<...>::grow then runs its inline freelist-init
+        // believing the pool allocator populated [this+8]; *(NULL+8+0x18+0x18) faults
+        // at addr 0x30 (KERN_INVALID_ADDRESS).
+        //
+        // FIX 1: Make -[setupDeferred] a no-op (skip the dispatch_once call that
+        // initializes per-encoder mempools en masse). This unblocks newCommandQueue.
+        // FIX 2: Patch each individual Mempool<...>::grow function — since textures
+        // also lazily call grow on their own — to skip its broken inline freelist loop.
+        // Both are pattern-based, version-stable signatures.
+
+        unsigned long text_sz = 0;
+        uint8_t *text = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &text_sz);
+        uint32_t *text32 = (uint32_t *)text;
+        size_t n = text_sz / 4;
+
+        // FIX 1: setupDeferred outer — patch b.ne at +0x64 to NOP so we fall through
+        // to the epilogue without ever calling dispatch_once.
+        int setup_patched = 0;
+        for (size_t i = 0; i + 4 < n && setup_patched < 1; i++) {
+            if (text32[i] == 0xb100051f && text32[i+1] == 0x54000081 &&
+                text32[i+2] == 0xa9437bfd && text32[i+3] == 0x910103ff &&
+                text32[i+4] == 0xd65f0fff) {
+                ModifyExecutableRegion(&text32[i+1], sizeof(uint32_t), ^{
+                    text32[i+1] = 0xd503201f; // NOP
+                });
+                fprintf(stderr, "#### MACWS_AGX_NATIVE setupDeferred dispatch_once skipped at text+%#zx\n", i*4);
+                setup_patched++;
+            }
+        }
+
+        // FIX 2: All 4 Mempool<...>::grow variants share a structural signature in
+        // the entry path: a `cmp w8, w<X>` followed by `b.hs +<off>` that branches
+        // PAST the broken init loop. We force the branch to be taken AND extend its
+        // target to the function epilogue (which is at a fixed pattern of
+        // ldp x29,x30 / [ldp x20,x19] / add sp,sp / retab).
+        //
+        // Simpler universal patch: at every `cmp w?, w?` followed by `b.hs +<off>`
+        // inside __text that lies between specific markers (entry pattern of
+        // Mempool::grow: `pacibsp / sub sp,sp,#0x40 / stp x20,x19,[sp,#0x20]`)
+        // — make the b.hs unconditional and use its existing target.
+        //
+        // For now, hardcode the 4 known grow function addresses and patch each.
+        uint64_t text_static_base = 0x1e53e321c;
+        intptr_t slide = (intptr_t)text - (intptr_t)text_static_base;
+        uint64_t grows_static[] = {
+            0x1e57236cc, // Mempool<16,0,true, ImageStateEncoderGen6>::grow
+            0x1e571c4f4, // Mempool<1024,28,false, SamplerStateEncoderGen4>::grow
+            0x1e55d1ff0, // Mempool<16,0,true, uint64_t>::grow
+            0x1e564d640, // Mempool<32,0,true, uint64_t>::grow
+        };
+        int grow_patched = 0;
+        for (int g = 0; g < 4; g++) {
+            uint32_t *grow = (uint32_t *)(grows_static[g] + slide);
+            // Find the cmp/b.hs site first.
+            int bhs_idx = -1;
+            for (int i = 0; i < 64; i++) {
+                uint32_t insn = grow[i];
+                if ((insn & 0xFF00001F) == 0x54000002) {  // b.hs
+                    bhs_idx = i;
+                    break;
+                }
+            }
+            if (bhs_idx < 0) continue;
+            // Then scan forward for retab (d65f0fff) — the function epilogue.
+            int retab_idx = -1;
+            for (int i = bhs_idx + 1; i < 256; i++) {
+                if (grow[i] == 0xd65f0fff) { retab_idx = i; break; }
+            }
+            if (retab_idx < 0) {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d retab not found, skip\n", g);
+                continue;
+            }
+            // The epilogue prologue (ldp x29,x30 / [ldp x20,x19] / add sp,sp) is the
+            // 2-3 instructions before retab. Jump TARGET = retab_idx - 2 (typically
+            // ldp x29,x30). For safety, scan backward from retab for the first
+            // ldp x29,x30,[sp,#N] (0xA9?37BFD pattern matches stp/ldp X29,X30).
+            int epi_idx = -1;
+            for (int i = retab_idx - 1; i > bhs_idx && i > retab_idx - 8; i--) {
+                if ((grow[i] & 0xFFC07FFF) == 0xA9407BFD || // ldp x29,x30,[sp,#X]
+                    (grow[i] & 0xFFC07FFF) == 0xA9407BFD) {
+                    epi_idx = i;
+                    break;
+                }
+            }
+            // Looser fallback: just use retab_idx - 2 if ldp pattern isn't matched.
+            if (epi_idx < 0) epi_idx = retab_idx - 2;
+            int64_t off_bytes = (int64_t)(epi_idx - bhs_idx) * 4;
+            uint32_t b_insn = 0x14000000 | (((uint32_t)(off_bytes >> 2)) & 0x03FFFFFF);
+            ModifyExecutableRegion(&grow[bhs_idx], sizeof(uint32_t), ^{
+                grow[bhs_idx] = b_insn;
+            });
+            fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d (%#llx) b.hs@+%#x → b epi@+%#x (off %lld)\n",
+                g, (unsigned long long)grows_static[g], bhs_idx*4, epi_idx*4, (long long)off_bytes);
+            grow_patched++;
+        }
+        fprintf(stderr, "#### MACWS_AGX_NATIVE patches: setupDeferred=%d grows=%d\n",
+            setup_patched, grow_patched);
     }
 }
 

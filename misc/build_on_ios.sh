@@ -12,8 +12,19 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
-echo "==> Cleaning previous build..."
-make clean 2>/dev/null || true
+# Incremental mode: skip `make clean` and only rebuild changed files.
+# Triggered by env FAST=1 or argument --fast. The first build of the day
+# should still be a full one; subsequent edits to libmachook/*.m can use
+# the fast path to cut build time from ~20s to ~3s.
+FAST=${FAST:-0}
+for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
+
+if [ "$FAST" != "1" ]; then
+    echo "==> Cleaning previous build..."
+    make clean 2>/dev/null || true
+else
+    echo "==> FAST mode: skipping make clean (incremental build)"
+fi
 
 echo "==> Building..."
 # Pass LIBMACHOOK_ON_DEVICE_BUILD=1 so libmachook/Makefile adds, for the
