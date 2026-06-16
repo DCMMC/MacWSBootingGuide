@@ -243,12 +243,18 @@ static void install_agx_init_redirect(Class agx) {
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
     fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);
 
-    // No-op only the dispatch-source / timer hooks that we *know* require kernel
-    // state we don't have. Don't touch setupDeferred — it populates mempool ivars
-    // that downstream AGX::TextureGen4 and friends require. Need to debug WHY the
-    // device->+0x3a8 ivar is nil at setupDeferred-time (the 2-arg init should
-    // populate it).
+    // No-op methods that crash in chroot because their setup dependencies
+    // (timers, mempools, dispatch sources, etc.) require kernel state that
+    // wasn't fully initialized. Downstream code may not actually need them.
+    // setupDeferred: the dispatch_once block crashes in chroot; the AGXMetal13_3
+    // binary cmp/b.hi patches in mac_hooks.m skip its mempool grow calls, but
+    // post-grow code still reads uninitialized ivars. As a workaround, no-op
+    // the ObjC method entirely — combined with proper init redirect this allows
+    // newBuffer/newTexture/newCommandQueue/newCommandBuffer to succeed (probe7
+    // stages 1-6+8). Texture/buffer creation reads OTHER ivars set by the 2-arg
+    // init, not the deferred mempool ivars.
     const char *noopMethods[] = {
+        "setupDeferred",
         "alertCommandBufferActivityStart",
         "alertCommandBufferActivityComplete",
         NULL
