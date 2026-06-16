@@ -65,6 +65,7 @@ const char *MetalPath = "/System/Library/Frameworks/Metal.framework/Versions/A/M
 const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/SkyLight";
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
+const char *AGXMetalPath = "/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3";
 
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
@@ -288,6 +289,78 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     *forceAccel = 0x14000007;    // b +840 (accelerated path)
                 }
             });
+        }
+    } else if(getenv("MACWS_AGX_NATIVE") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
+        // MACWS_AGX_NATIVE: in chroot, AGXG13GFamilyDevice's C++ Device subobject
+        // (device->+0x3a8) gets constructed but its Mempool sub-objects don't get
+        // their internal allocator pointer fully initialized — so the first
+        // Mempool::grow call dereferences nil at offset 0x28+8+...=0x30.
+        //
+        // setupDeferred's dispatch_once block (starts at 0x1e574dee0 in macOS dsc)
+        // has the pattern:
+        //   ldr w8, [x20, #0x390]    (current count of mempool entries)
+        //   cmp w8, #0xf             (threshold)
+        //   b.hi skip_grow           (if count > 0xf, skip)
+        //   add x0, x20, #0x370      (mempool ptr)
+        //   mov w1, #0x10            (init size)
+        //   bl Mempool::grow         ← CRASHES because allocator nil
+        //
+        // Patch: change "b.hi skip_grow" → "b skip_grow" so grow is never called.
+        // Repeats ~10 times in the block for different mempool sub-objects.
+        // We scan for the pattern (cmp w8, #imm; b.hi +N; bl ...; ...; bl __ZN3AGX7Mempool...)
+        // and unconditionalize the b.hi.
+        unsigned long size = 0;
+        uint8_t *text = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &size);
+        if (text) {
+            uint32_t *t = (uint32_t *)text;
+            size_t n = size / 4;
+            int patched = 0;
+            // Look for: cmp wN, #imm; b.hi +X; ... add x0, ..., #?; mov w1, #?; bl ...Mempool*grow*
+            // We pattern-match on cmp w8, #0xf (specifically the ImageStateEncoder one).
+            // Encoding cmp w8, #0xf = 0x710 03d 1f = 0x71003d1f
+            for (size_t i = 0; i + 6 < n; i++) {
+                if (t[i] == 0x71003d1f) {                  // cmp w8, #0xf
+                    if ((t[i+1] & 0xFF00001F) == 0x54000008) {  // b.hi (condition 8)
+                        // Convert to unconditional b. Preserve the imm19 → imm26.
+                        uint32_t cond_branch = t[i+1];
+                        int32_t imm19 = (int32_t)((cond_branch >> 5) & 0x7FFFF);
+                        if (imm19 & 0x40000) imm19 |= 0xFFF80000;  // sign extend 19→32
+                        // Construct unconditional B with same target (imm26 = imm19)
+                        uint32_t b_inst = 0x14000000 | (imm19 & 0x03FFFFFF);
+                        ModifyExecutableRegion(&t[i+1], sizeof(uint32_t), ^{
+                            t[i+1] = b_inst;
+                        });
+                        patched++;
+                    }
+                }
+                // Also handle cmp w8, #0x3ff (a different mempool size threshold)
+                else if (t[i] == 0x710ffd1f) {
+                    if ((t[i+1] & 0xFF00001F) == 0x54000008) {
+                        uint32_t cond_branch = t[i+1];
+                        int32_t imm19 = (int32_t)((cond_branch >> 5) & 0x7FFFF);
+                        if (imm19 & 0x40000) imm19 |= 0xFFF80000;
+                        uint32_t b_inst = 0x14000000 | (imm19 & 0x03FFFFFF);
+                        ModifyExecutableRegion(&t[i+1], sizeof(uint32_t), ^{
+                            t[i+1] = b_inst;
+                        });
+                        patched++;
+                    }
+                }
+                // cmp w8, #0x1f (32-size mempool)
+                else if (t[i] == 0x71007d1f) {
+                    if ((t[i+1] & 0xFF00001F) == 0x54000008) {
+                        uint32_t cond_branch = t[i+1];
+                        int32_t imm19 = (int32_t)((cond_branch >> 5) & 0x7FFFF);
+                        if (imm19 & 0x40000) imm19 |= 0xFFF80000;
+                        uint32_t b_inst = 0x14000000 | (imm19 & 0x03FFFFFF);
+                        ModifyExecutableRegion(&t[i+1], sizeof(uint32_t), ^{
+                            t[i+1] = b_inst;
+                        });
+                        patched++;
+                    }
+                }
+            }
+            fprintf(stderr, "#### MACWS_AGX_NATIVE AGXMetal13_3: patched %d cmp/b.hi -> b (skip mempool grow)\n", patched);
         }
     }
 }

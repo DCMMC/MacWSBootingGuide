@@ -243,13 +243,14 @@ static void install_agx_init_redirect(Class agx) {
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
     fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);
 
-    // No-op methods that crash in chroot because their setup dependencies
-    // (timers, mempools, dispatch sources, etc.) require kernel state that
-    // wasn't fully initialized. Downstream code may not actually need them.
+    // No-op only the dispatch-source / timer hooks that we *know* require kernel
+    // state we don't have. Don't touch setupDeferred — it populates mempool ivars
+    // that downstream AGX::TextureGen4 and friends require. Need to debug WHY the
+    // device->+0x3a8 ivar is nil at setupDeferred-time (the 2-arg init should
+    // populate it).
     const char *noopMethods[] = {
-        "setupDeferred",                        // dispatch_once block — mempools
-        "alertCommandBufferActivityStart",      // dispatch timer
-        "alertCommandBufferActivityComplete",   // companion
+        "alertCommandBufferActivityStart",
+        "alertCommandBufferActivityComplete",
         NULL
     };
     IMP noop = imp_implementationWithBlock(^void(id self) {
