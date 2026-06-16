@@ -171,134 +171,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 fprintf(stderr, "#### MACWS_AGX_NATIVE %s: patched %d sites\n", target_files[n], patched);
             }
 
-            // MetalIOSurfaceBacking::PrepareForUse — TWO crashes hit here in chroot
-            // strict-AGX mode:
-            //   1) +0x200 (bl AbortWithTextureInfo when the empty mempool texture state
-            //      fails the post-init validator)
-            //   2) +0x15c (PAC trap on the result of `bl objc_msgSend
-            //      $initWithDescriptor:iosurface:plane:` — chroot AGXTexture init
-            //      returns a corrupt pointer because of the empty mempool)
-            //
-            // Fast workaround: short-circuit the function. At +0x4c there's a
-            // `cbz x20, 0x18540506c` (fail-path going to texture re-create). Replace
-            // with `b 0x185405038` (mov w0, #1 → success epilogue). PrepareForUse
-            // then becomes a near no-op that returns success. SkyLight downstream
-            // composite uses [x20+0x48/0x50] which were set in the early
-            // `bl 0x18533ed48 → str d0` lines (still execute before our patch).
-            //
-            // Patterns (BN-confirmed, SkyLight 13.4):
-            //   +0x44: mov x0, x22       (e0 03 16 aa)
-            //   +0x48: bl 0x1854051c8    (70 00 00 94 — relative, depends on slide)
-            //   +0x4c: mov x20, x0       (f4 03 00 aa)
-            //   +0x50: cbz x0, +0x5c     (e0 02 00 b4) ← PATCH to `b +0x28` (0x1400000a)
-            {
-                uint32_t *text32 = (uint32_t *)text;
-                size_t n2 = text_sz / 4;
-                int prep_patched = 0;
-                for (size_t i = 0; i + 4 < n2 && prep_patched < 1; i++) {
-                    // Look for sequence ending with the cbz to patch.
-                    //   mov x0, x22 ; bl ANY ; mov x20, x0 ; cbz x0, +0x5c
-                    if (text32[i]   == 0xaa1603e0 &&  // mov x0, x22
-                        (text32[i+1] & 0xFC000000) == 0x94000000 &&  // bl ?
-                        text32[i+2] == 0xaa0003f4 &&  // mov x20, x0
-                        text32[i+3] == 0xb40002e0) {  // cbz x0, +0x5c (0xb4...e0 = cbz x0)
-                        ModifyExecutableRegion(&text32[i+3], sizeof(uint32_t), ^{
-                            text32[i+3] = 0x1400000a;  // b +0x28 (PC + 0x28 = success path)
-                        });
-                        fprintf(stderr, "#### MACWS_AGX_NATIVE NOP'd PrepareForUse fail-path cbz at text+%#zx\n", (i+3)*4);
-                        prep_patched++;
-                    }
-                }
-                fprintf(stderr, "#### MACWS_AGX_NATIVE PrepareForUse fail-path skip patches: %d\n", prep_patched);
-            }
-
-            // MetalIOSurfaceBacking::PrepareForUse+0x200 — abort BL when the empty-
-            // mempool texture state fails the post-init validator. Runtime-probed:
-            //   PrepareForUse @ SkyLight+0x31ffc4, BL at +0x200 = SkyLight+0x3201c4
-            //   The BL targets _ZN12MetalBacking20AbortWithTextureInfo... (one 'A'
-            //   short of "AbortWithTextureInfoE" — the actual symbol name in this
-            //   build differs by one trailing char from the crash frame's display).
-            // Pattern: ldr x2,[x21,#0x120] / ldr x1,[x24,#0x80] / mov x0,x21 / BL.
-            // NOP'ing the BL lets PrepareForUse continue past the abort.
-            {
-                uint32_t *text32 = (uint32_t *)text;
-                size_t n2 = text_sz / 4;
-                int abrt_patched = 0;
-                for (size_t i = 0; i + 3 < n2 && abrt_patched < 4; i++) {
-                    if (text32[i]   == 0xf94092a2 &&
-                        text32[i+1] == 0xf9404301 &&
-                        text32[i+2] == 0xaa1503e0 &&
-                        (text32[i+3] & 0xFC000000) == 0x94000000) {
-                        ModifyExecutableRegion(&text32[i+3], sizeof(uint32_t), ^{
-                            text32[i+3] = 0xd503201f; // NOP
-                        });
-                        fprintf(stderr, "#### MACWS_AGX_NATIVE NOP'd PrepareForUse abort BL at text+%#zx\n", (i+3)*4);
-                        abrt_patched++;
-                    }
-                }
-                fprintf(stderr, "#### MACWS_AGX_NATIVE PrepareForUse abort patches: %d\n", abrt_patched);
-            }
-
-            // WSCompositeDestinationCreateWithMetalTexture: previous NOP-the-assert
-            // patch caused __stack_chk_fail because the assert setup writes to the
-            // stack BEFORE the BL we NOP'd. Better: turn the entire function into
-            // an early `return NULL` (caller MetalBacking::CreateCompositeDestination
-            // handles NULL).
-            //
-            // Function starts with: pacibsp (0xd503237f) / sub sp,sp,#0xd0 (0xd10343ff)
-            // followed by many stp pairs. Patch byte-1 (sub sp) with `ret` (0xd65f03c0)
-            // and byte-0 (pacibsp) with `mov x0, #0` (0xd2800000) — function returns
-            // NULL immediately on entry. Stack state never disturbed → no canary
-            // failure. PAC matters less since we're not pacibsp+retab paired
-            // (just plain ret).
-            //
-            // Find function start by unique byte sequence (BN-confirmed):
-            //   pacibsp / sub sp,sp,#0xd0 / stp d13,d12,[sp,#0x40] / stp d11,d10,[sp,#0x50]
-            //   = 0xd503237f, 0xd10343ff, 0x6d0433ed, 0x6d052beb
-            {
-                uint32_t *text32 = (uint32_t *)text;
-                size_t n2 = text_sz / 4;
-                int wsc_patched = 0;
-                for (size_t i = 0; i + 4 < n2 && wsc_patched < 2; i++) {
-                    if (text32[i]   == 0xd503237f &&
-                        text32[i+1] == 0xd10343ff &&
-                        text32[i+2] == 0x6d0433ed &&
-                        text32[i+3] == 0x6d052beb) {
-                        ModifyExecutableRegion(&text32[i], sizeof(uint32_t)*2, ^{
-                            text32[i]   = 0xd2800000; // mov x0, #0
-                            text32[i+1] = 0xd65f03c0; // ret
-                        });
-                        fprintf(stderr, "#### MACWS_AGX_NATIVE WSComposite early-return-NULL at text+%#zx\n", i*4);
-                        wsc_patched++;
-                    }
-                }
-            // MetalBacking::CreateCompositeDestination doesn't NULL-check the
-            // return of WSCompositeDestinationCreateWithMetalTexture, then does
-            //   stp x21, x19, [x0, #0xa8]   ← fault when x0=NULL (always in our patched flow)
-            // Replace that stp with `cbz x0, NULL-return-path`. Since x0 is always
-            // NULL in chroot strict mode (per WSComposite early-return-NULL above),
-            // the cbz always branches, skipping the store and going to the
-            // `mov x20, #0; return NULL` epilogue.
-            //
-            // Pattern: bl WSComposite (any) / mov x20, x0 (0xaa0003f4) / stp x21,x19,[x0,#0xa8] (0xa90acc15)
-            // Branch target offset 0x34 = +13 instructions (cbz encoding 0xb40001a0).
-            {
-                uint32_t *text32 = (uint32_t *)text;
-                size_t n2 = text_sz / 4;
-                int ccd_patched = 0;
-                for (size_t i = 0; i + 2 < n2 && ccd_patched < 4; i++) {
-                    if ((text32[i] & 0xFC000000) == 0x94000000 &&  // bl ?
-                        text32[i+1] == 0xaa0003f4 &&               // mov x20, x0
-                        text32[i+2] == 0xa90acc15) {               // stp x21, x19, [x0, #0xa8]
-                        ModifyExecutableRegion(&text32[i+2], sizeof(uint32_t), ^{
-                            text32[i+2] = 0xb40001a0; // cbz x0, +0x34 (skip to mov x20,#0 path)
-                        });
-                        fprintf(stderr, "#### MACWS_AGX_NATIVE NULL-guarded CreateCompositeDestination stp at text+%#zx\n", (i+2)*4);
-                        ccd_patched++;
-                    }
-                }
-                fprintf(stderr, "#### MACWS_AGX_NATIVE CreateCompositeDestination null-guards: %d\n", ccd_patched);
-            }
+            // NOTE: Removed previous PrepareForUse / WSComposite / CreateCompositeDestination
+            // NOP-cascade patches per user direction. They let WS survive longer but produced
+            // empty textures (no GPU content) — VNC would show blank. The correct fix is the
+            // BSS pool allocator shim in the AGXMetal13_3 branch below (see MACWS_AGX_BSS_SHIM).
         }
 
         // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
@@ -338,14 +214,24 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
-        // NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService before _xpc_add_bundle");
         // register MTLCompilerService.xpc
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
+        // Also register ApplicationServices.framework so its XPCServices/hiservices-xpcservice
+        // gets discovered. App processes (Terminal, etc.) get "Connection Invalid for
+        // com.apple.hiservices-xpcservice" otherwise → AppKit registers the menu bar with WS
+        // but window creation falls flat because hiservices isn't reachable, so no real
+        // NSWindow content is rendered. Bootstrapping the framework lets xpc resolve the
+        // bundled service path.
+        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", 2);
+        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/HIServices", 2);
         void(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
         _xpc_bootstrap_services(dict);
-        // NSLog(@"#### debugbydcmmc loadImageCallback MTLCompilerService after _xpc_add_bundle");
-        // xpc_add_bundle("/System/Library/Frameworks/Metal.framework/XPCServices/MTLCompilerService.xpc", 2);
+
+        // Direct bundle registration of the hiservices XPC service so xpc_connection_create
+        // for "com.apple.hiservices-xpcservice" actually launches the bundled binary.
+        // xpc_add_bundle prototype comes from xpc/private.h transitively via Foundation/xpc.h.
+        xpc_add_bundle("/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc", 2);
     } else if(!strncmp(info.dli_fname, MetalPath, strlen(MetalPath))) {
         // patch MTL*ReflectionReader::deserialize to match iOS
         // on macOS, there are extra instructions
