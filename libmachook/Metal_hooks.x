@@ -293,17 +293,35 @@ const char *metalSimService = "com.apple.metal.simulator";
 xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, dispatch_queue_t targetq, uint64_t flags);
 xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, dispatch_queue_t targetq, uint64_t flags) {
     flags &= ~XPC_CONNECTION_MACH_SERVICE_PRIVILEGED;
-    // NSLog(@"#### debugbydcmmc hooked_xpc_connection_create_mach_service %s", name);
+    // Log every mach-service connection attempt so we can spot the hiservices /
+    // AppKit window-creation flow in chroot. Filter to Terminal process to limit noise.
+    if (getenv("MACWS_XPC_DEBUG") || strstr(getprogname() ?: "", "Terminal")) {
+        fprintf(stderr, "#### XPC_TRACE mach_service create: '%s' flags=%#llx\n",
+            name ?: "(null)", (unsigned long long)flags);
+    }
     if(!strncmp(name, metalSimService, strlen(metalSimService))) {
         return xpc_connection_create(metalSimService, 0);
     }
     return orig_xpc_connection_create_mach_service(name, targetq, flags);
 }
 
+// Also trace xpc_connection_create (the XPC service / bundle-name style)
+xpc_connection_t (*orig_xpc_connection_create)(const char *name, dispatch_queue_t queue);
+xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
+    if (name && (getenv("MACWS_XPC_DEBUG") || strstr(getprogname() ?: "", "Terminal"))) {
+        fprintf(stderr, "#### XPC_TRACE service create: '%s'\n", name);
+    }
+    return orig_xpc_connection_create(name, queue);
+}
+
 extern int xpc_connection_enable_sim2host_4sim();
 %hookf(int, xpc_connection_enable_sim2host_4sim) {
     return 0;
 }
+
+// (NSXPCSharedListener swizzle reverted — its constructor-time init crashed
+// libSystem_initializer on arm64e chroot processes. Re-attempt requires
+// deferred install via dispatch_async after libSystem is up.)
 
 __attribute__((constructor)) static void InitMetalHooks() {
     // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
@@ -334,9 +352,20 @@ __attribute__((constructor)) static void InitMetalHooks() {
 
     MSImageRef xpc = MSGetImageByName("/usr/lib/system/libxpc.dylib");
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
+    MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"), hooked_xpc_connection_create, (void *)&orig_xpc_connection_create);
+
+    // (NSXPCSharedListener swizzle install removed — see comment above.)
     // register MTLSimDriverHost.xpc
     char frameworkPath[PATH_MAX];
     // NSLog(@"#### debugbydcmmc register MTLSimDriverHost.xpc");
     snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
     xpc_add_bundle(frameworkPath, 2);
+
+    // register ViewBridgeChrootProxy.xpc — wrapper that chroots+execs the real
+    // macOS ViewBridgeAuxiliary inside chroot. Without this, Terminal's AppKit
+    // NSXPCSharedListener for ClientCallsAuxiliary fails with "Connection invalid",
+    // so window CONTENT never renders (menu bar does, but no window surface).
+    char vbPath[PATH_MAX];
+    snprintf(vbPath, sizeof(vbPath), "%s/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
+    xpc_add_bundle(vbPath, 2);
 }

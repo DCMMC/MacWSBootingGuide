@@ -217,21 +217,14 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // register MTLCompilerService.xpc
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
-        // Also register ApplicationServices.framework so its XPCServices/hiservices-xpcservice
-        // gets discovered. App processes (Terminal, etc.) get "Connection Invalid for
-        // com.apple.hiservices-xpcservice" otherwise → AppKit registers the menu bar with WS
-        // but window creation falls flat because hiservices isn't reachable, so no real
-        // NSWindow content is rendered. Bootstrapping the framework lets xpc resolve the
-        // bundled service path.
-        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices", 2);
-        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/HIServices", 2);
         void(*_xpc_bootstrap_services)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
         _xpc_bootstrap_services(dict);
-
-        // Direct bundle registration of the hiservices XPC service so xpc_connection_create
-        // for "com.apple.hiservices-xpcservice" actually launches the bundled binary.
-        // xpc_add_bundle prototype comes from xpc/private.h transitively via Foundation/xpc.h.
-        xpc_add_bundle("/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc", 2);
+        // NOTE: tried registering ApplicationServices / HIServices xpc here to fix
+        // Terminal's "Connection Invalid for com.apple.hiservices-xpcservice" but the
+        // XPC subprocess spawn goes via the (iOS-root) launchd which can't resolve the
+        // macOS framework path. See [[hiservices-xpc-chroot-window-blocker]] for forward
+        // paths (D: copy hiservices binary into /var/jb/usr/macOS-visible space + register
+        // it, with shim deps for ApplicationServices/HIServices dlopen).
     } else if(!strncmp(info.dli_fname, MetalPath, strlen(MetalPath))) {
         // patch MTL*ReflectionReader::deserialize to match iOS
         // on macOS, there are extra instructions
