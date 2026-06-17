@@ -210,6 +210,17 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                     }
                     continue;
                 }
+                // Force-redirect objc_alloc to our tracer regardless of current
+                // slot value. The lambda in AGX::Mempool::grow calls objc_alloc
+                // through this slot; we need to log its result and provide a
+                // class_createInstance fallback when libobjc returns nil for an
+                // under-realized AGX class.
+                int force_override = 0;
+                extern id objc_alloc_trace(Class);
+                if (!strcmp(lookup, "objc_alloc")) {
+                    resolved = (void *)objc_alloc_trace;
+                    force_override = 1;
+                }
                 uint64_t value = (uint64_t)resolved;
                 // For __auth_got we'd need PAC signing — but without chained
                 // fixup metadata we don't know diversifier/key. For non-auth
@@ -235,14 +246,15 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                         value = macws_pac_sign(value, mod, 0);  // key=IA
                     }
                 }
-                if (cur == 0) {
+                if (cur == 0 || force_override) {
                     ModifyExecutableRegion(slot, sizeof(uint64_t), ^{
                         *slot = value;
                     });
                     patched++;
-                    if (patched < 12) {
-                        fprintf(stderr, "####   bind[%d] %s -> %p (slot=%p auth=%d)\n",
-                            patched, name, resolved, slot, is_auth);
+                    if (patched < 12 || force_override) {
+                        fprintf(stderr, "####   bind[%d] %s -> %p (slot=%p auth=%d%s)\n",
+                            patched, name, resolved, slot, is_auth,
+                            force_override ? " FORCE" : "");
                     }
                     // Dump IOGPU-related symbols specifically — these are the
                     // pool allocator helpers we need to know about.
@@ -483,16 +495,20 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
     return orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
 }
 
-// SkyLight `WSCompositeDestinationCreateWithMetalTexture(MetalContext*, MTLTexture*, ...)`
-// — asserts texture != nil at CompositeDestinationMetal.mm:165. Called directly
-// from SLCADisplay::render_update without going through MetalIOSurfaceBacking
-// (so PrepareForUse tolerate-nil doesn't help). Hook to return NULL early if
-// texture arg is nil — caller in render_update tolerates a NULL destination
-// (it's the SAME pattern the function uses internally when CGRect is empty).
+// SkyLight `WSCompositeDestinationCreateWithMetalTexture(MTLTexture*, MetalContext*, ...)`
+// — asserts texture != nil at CompositeDestinationMetal.mm:165. BN disasm
+// (SkyLight at 0x18523053c):
+//   - first instr after prologue: `cbz x1, +0x344` → device assert (line 160)
+//   - then `cbnz x19, +0x10` (x19 = x0) skips OK path if texture is set
+//   - `cbz x19, +0x2e4` → texture assert (line 165)
+// So x0 IS THE TEXTURE, x1 is the device/MetalContext. Earlier hook had the
+// argument order REVERSED and was checking the wrong slot for nil, which is
+// why the hook never absorbed the nil — the texture argument carrying the
+// nil sat at x0 while the hook tested x1.
 typedef void *(*WSCompositeDestinationCreateWithMetalTexture_t)(
-    void *ctx, id texture, void *protectionOptions, void *colorspace, void *region);
+    id texture, void *ctx, void *protectionOptions, void *colorspace, void *region);
 static WSCompositeDestinationCreateWithMetalTexture_t orig_skylight_wsccd_with_tex = NULL;
-static void *hooked_skylight_wsccd_with_tex(void *ctx, id texture, void *protectionOptions,
+static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protectionOptions,
                                             void *colorspace, void *region) {
     if (!texture) {
         static int nil_count = 0;
@@ -502,7 +518,7 @@ static void *hooked_skylight_wsccd_with_tex(void *ctx, id texture, void *protect
         }
         return NULL;
     }
-    return orig_skylight_wsccd_with_tex(ctx, texture, protectionOptions, colorspace, region);
+    return orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
 }
 
 static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *header) {
@@ -623,21 +639,40 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     uint64_t final_addr = page_target + ((uint64_t)add_imm << (shift * 12));
                     if (final_addr != string_addr) continue;
 
-                    // Find backward BL within next 8 insns (assert calls are tight)
-                    for (size_t j = i + 2; j < i + 10 && j < text_n; j++) {
+                    // The matcher above finds an adrp+add that loads
+                    // "CAWSBackend.mm" — but this string is referenced from
+                    // many places in SkyLight, not just __assert_rtn calls
+                    // (logging, debug strings, etc.). To target ONLY actual
+                    // assertions, require the call site to look like an
+                    // assertion-handler call: within ~8 insns we should see a
+                    // `mov w2, #<line>` followed by a BL. The mov w2 sets
+                    // line number; the BL is the assert helper.
+                    int bl_found = -1;
+                    int mov_w2_seen = 0;
+                    for (size_t j = i + 2; j < i + 12 && j < text_n; j++) {
                         uint32_t inst = text32[j];
-                        if ((inst & 0xFC000000) == 0x94000000) {  // BL
-                            int32_t imm26 = (int32_t)(inst & 0x03FFFFFF);
-                            if (imm26 & 0x02000000) imm26 |= 0xFC000000;
-                            int64_t bl_offset = (int64_t)imm26 * 4;
-                            if (bl_offset >= 0) continue;  // forward
-                            ModifyExecutableRegion(&text32[j], sizeof(uint32_t), ^{
-                                text32[j] = 0xd503201f;  // NOP
-                            });
-                            fprintf(stderr, "#### MACWS_AGX_NATIVE %s assert NOP at text+%#zx\n", target_files[n], j * 4);
-                            patched++;
-                            break;
+                        // `mov w2, #imm`: 52800002 base, imm in bits 20:5
+                        // Pattern: 0x52800002 OR'd with (imm<<5)
+                        if ((inst & 0xFFE0001F) == 0x52800002) {
+                            mov_w2_seen = 1;
                         }
+                        // `movk w2, #imm`: high16 variant — also part of large line numbers
+                        if ((inst & 0xFFE0001F) == 0x72A00002) {
+                            mov_w2_seen = 1;
+                        }
+                        if ((inst & 0xFC000000) == 0x94000000) {  // BL
+                            if (mov_w2_seen) {
+                                bl_found = (int)j;
+                                break;
+                            }
+                        }
+                    }
+                    if (bl_found >= 0) {
+                        ModifyExecutableRegion(&text32[bl_found], sizeof(uint32_t), ^{
+                            text32[bl_found] = 0xd503201f;  // NOP
+                        });
+                        fprintf(stderr, "#### MACWS_AGX_NATIVE %s assert NOP at text+%#zx\n", target_files[n], bl_found * 4);
+                        patched++;
                     }
                 }
                 fprintf(stderr, "#### MACWS_AGX_NATIVE %s: patched %d sites\n", target_files[n], patched);
@@ -912,6 +947,21 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d lambda BL kept (MACWS_AGX_KEEP_LAMBDA=1)\n", g);
             }
 
+            // FIX 2 (b.hs → epi redirect): SKIP this patch when
+            // MACWS_AGX_KEEP_LAMBDA=1. The b.hs redirect was added when the
+            // lambda crashed (broken IOGPU bindings) — it forced grow to skip
+            // the init loop entirely. But with KEEP_LAMBDA=1 the lambda runs
+            // correctly (IOGPU bindings repaired by GOT walker, AGX classes
+            // registered via objc_readClassPair), so the init loop CAN and
+            // MUST execute to populate the encoder freelist. Skipping the loop
+            // leaves *(encoders+0x450) = NULL and the very next instruction
+            // in setupDeferred_block_invoke does `ldr x8, [x8+0x18]` on it →
+            // PC=0x180 fault at addr 0x30.
+            if (getenv("MACWS_AGX_KEEP_LAMBDA")) {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d b.hs→epi patch SKIPPED (KEEP_LAMBDA — let init loop run)\n", g);
+                continue;
+            }
+
             // Find the cmp/b.hs site first.
             int bhs_idx = -1;
             for (int i = 0; i < 64; i++) {
@@ -956,6 +1006,356 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         }
         fprintf(stderr, "#### MACWS_AGX_NATIVE patches: setupDeferred=%d grows=%d lambdas=%d\n",
             setup_patched, grow_patched, lambda_patched);
+
+        // ──────────────────────────────────────────────────────────────────
+        // EVERYTHING BELOW (class registration via objc_readClassPair, AGX
+        // class-method swizzles, initFull subDis fix) is gated behind
+        // MACWS_AGX_REGISTER_CLASSES=1. This is the still-experimental "full
+        // strict AGX-native" path. Default off so the prior stable baseline
+        // (MACWS_AGX_NATIVE=1 only → MTLSim path with stable nil-tolerate
+        // hooks) keeps working without regressions.
+        if (!getenv("MACWS_AGX_REGISTER_CLASSES")) {
+            return;
+        }
+        // Diagnostic: check if AGXBuffer class is registered + __objc_classrefs
+        // entries are populated. The Mempool::grow lambda calls
+        // objc_alloc(AGXBuffer) — if the class ref slot at __objc_classrefs is
+        // null, alloc returns nil and crashes downstream at addr 0x30 (the
+        // *(this+0x28) deref).
+        Class agxbuf = objc_getClass("AGXBuffer");
+        fprintf(stderr, "#### MACWS_AGX_NATIVE objc_getClass(AGXBuffer) = %p\n", (void *)agxbuf);
+
+        // Read __objc_classlist — list of pointers to OUR OWN classes. If
+        // libobjc didn't process them (callback skipped due to dlopen path),
+        // we can register them manually.
+        unsigned long classlist_sz = 0;
+        uint64_t *classlist = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+            "__DATA_CONST", "__objc_classlist", &classlist_sz);
+        if (!classlist) {
+            classlist = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+                "__DATA", "__objc_classlist", &classlist_sz);
+        }
+        if (classlist) {
+            size_t n = classlist_sz / 8;
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __objc_classlist: %zu entries\n", n);
+            // Dump first 6 with class name
+            for (size_t i = 0; i < n && i < 6; i++) {
+                if (classlist[i] == 0) continue;
+                Class c = (Class)classlist[i];
+                const char *name = class_getName(c);
+                fprintf(stderr, "####   classlist[%zu] = %p name=%s registered=%p\n",
+                    i, (void *)c, name ?: "?", (void *)objc_getClass(name ?: ""));
+            }
+            // Force registration by calling _objc_init-equivalent machinery:
+            // libobjc's `_dyld_objc_register_callbacks` or `_objc_map_images`.
+            // Alternatively: walk __objc_classlist, for each non-null class
+            // pointer, call objc_registerClassPair() — but this fails on
+            // already-registered classes. Try simpler: use the runtime's
+            // class_addMethod/etc on each, which forces registration as a
+            // side effect.
+            //
+            // Most reliable: directly call libobjc's `_objc_register_classes`
+            // private API if exposed.
+            // The classes are in classlist as RAW DATA but not in the
+            // runtime's class table. dlsym a few possible APIs to register
+            // them. Failing all those, use the runtime trick of allocating
+            // a temporary class pair and then PIVOTING the existing class to
+            // it via objc_setClass on instances — but that's incomplete.
+            //
+            // Most reliable: call `objc_duplicateClass(orig_cls, new_name)`
+            // to register via class duplication. Or use the dyld objc
+            // notification API by re-registering ourselves.
+            void (*objc_duplicate)(Class, const char *, size_t) = dlsym(
+                RTLD_DEFAULT, "objc_duplicateClass");
+            fprintf(stderr, "#### MACWS_AGX_NATIVE objc_duplicateClass=%p\n",
+                (void *)objc_duplicate);
+
+            // Register each class with libobjc via objc_readClassPair.
+            //
+            // ROOT CAUSE of `objc_getClass("AGXBuffer") = 0x0`:
+            //   AGXMetal13_3 is loaded by Metal.framework's eager constructor
+            //   BEFORE libmachook's loadImageCallback can run. In a normal
+            //   process flow, libobjc's _dyld_objc_notify_register callback
+            //   processes __objc_classlist and adds each class to
+            //   gdb_objc_realized_classes (the name → class hash). But in
+            //   chroot, that processing never reached the AGXMetal13_3 entries
+            //   (likely because Metal loads AGXMetal13_3 via a private dyld
+            //   path that bypasses the notify hook, or because the load order
+            //   races with libmachook's pre-load IOGPU dlopen).
+            //
+            //   Result: class STRUCT DATA is fully valid — class_getName,
+            //   class_getSuperclass, class_isMetaClass all work — but
+            //   objc_getClass(name) returns NULL because the name table was
+            //   never populated.
+            //
+            // FIX: walk __objc_classlist, call objc_readClassPair on each
+            //   entry. objc_readClassPair both calls readClass (which adds to
+            //   gdb_objc_realized_classes) and realizeClassWithoutSwift (which
+            //   sets up the cache / method tables). After this loop completes,
+            //   objc_getClass("AGXBuffer") returns the right pointer and
+            //   [AGXBuffer alloc] returns a real, usable instance.
+            //
+            // Get __objc_imageinfo (required arg to objc_readClassPair).
+            typedef struct { uint32_t version; uint32_t flags; } objc_image_info_t;
+            unsigned long iinfo_sz = 0;
+            objc_image_info_t *iinfo = (objc_image_info_t *)getsectiondata(
+                (const struct mach_header_64 *)header,
+                "__DATA_CONST", "__objc_imageinfo", &iinfo_sz);
+            if (!iinfo) iinfo = (objc_image_info_t *)getsectiondata(
+                (const struct mach_header_64 *)header,
+                "__DATA", "__objc_imageinfo", &iinfo_sz);
+            if (!iinfo) iinfo = (objc_image_info_t *)getsectiondata(
+                (const struct mach_header_64 *)header,
+                "__OBJC", "__image_info", &iinfo_sz);
+            fprintf(stderr, "#### MACWS_AGX_NATIVE imageinfo=%p sz=%lu\n",
+                (void *)iinfo, iinfo_sz);
+
+            typedef Class (*readPair_t)(Class, const void *);
+            readPair_t readPair = (readPair_t)dlsym(RTLD_DEFAULT, "objc_readClassPair");
+            int realized = 0;
+            if (readPair && iinfo) {
+                // Multi-pass: re-iterate if any new classes registered, so a
+                // class whose superclass got registered in pass N can register
+                // in pass N+1.
+                for (int pass = 0; pass < 3; pass++) {
+                    int this_pass = 0;
+                    for (size_t i = 0; i < n; i++) {
+                        if (classlist[i] == 0) continue;
+                        Class c = (Class)classlist[i];
+                        const char *name = class_getName(c);
+                        if (!name || !name[0]) continue;
+                        if (objc_getClass(name)) continue;  // registered
+                        Class result = readPair(c, iinfo);
+                        if (result && objc_getClass(name)) {
+                            realized++;
+                            this_pass++;
+                            if (realized < 6) {
+                                fprintf(stderr, "####   registered %s -> %p\n",
+                                    name, (void *)result);
+                            }
+                        } else {
+                            if (i < 6 && pass == 0) {
+                                fprintf(stderr, "####   FAILED %s: result=%p getClass=%p\n",
+                                    name, (void *)result, (void *)objc_getClass(name));
+                            }
+                        }
+                    }
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE register pass %d: %d new (total %d)\n",
+                        pass, this_pass, realized);
+                    if (this_pass == 0) break;
+                }
+            } else {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE readPair=%p iinfo=%p — CANNOT REGISTER\n",
+                    (void *)readPair, (void *)iinfo);
+            }
+            fprintf(stderr, "#### MACWS_AGX_NATIVE realized %d/%zu classes\n", realized, n);
+            Class agxbuf_after = objc_getClass("AGXBuffer");
+            fprintf(stderr, "#### MACWS_AGX_NATIVE AGXBuffer after register: %p\n",
+                (void *)agxbuf_after);
+            // Also try sending +alloc to verify the registered class is usable.
+            if (agxbuf_after) {
+                @try {
+                    id inst = ((id (*)(id, SEL))objc_msgSend)(
+                        (id)agxbuf_after, sel_registerName("alloc"));
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE [AGXBuffer alloc] = %p\n",
+                        (void *)inst);
+                } @catch (NSException *e) {
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE [AGXBuffer alloc] threw: %s\n",
+                        [[e description] UTF8String] ?: "?");
+                }
+
+                // Swizzle initUntrackedInternalBufferWithDevice:length:options:
+                // and initWithDevice:length:alignment:options:isSuballocDisabled:
+                // resourceInArgs:pinnedGPULocation: so we can trace what these
+                // return in the AGX::Mempool::grow lambda hot path. If they
+                // return nil, Mempool+0x8 stays NULL and setupDeferred crashes
+                // dereferencing it at addr 0x30. Tracing tells us whether the
+                // problem is alloc-side (class invalid) or IOGPU-side (kernel
+                // resource creation fails).
+                SEL initUntracked = sel_registerName("initUntrackedInternalBufferWithDevice:length:options:");
+                Method m_unt = class_getInstanceMethod(agxbuf_after, initUntracked);
+                if (m_unt) {
+                    IMP orig_unt = method_getImplementation(m_unt);
+                    IMP trace_unt = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long opt) {
+                        id r = ((id (*)(id, SEL, id, unsigned long, unsigned long))orig_unt)(
+                            self, initUntracked, dev, len, opt);
+                        fprintf(stderr,
+                            "#### TRACE -[AGXBuffer initUntracked] self=%p dev=%p len=%lu opt=%lu -> %p\n",
+                            self, dev, len, opt, r);
+                        return r;
+                    });
+                    method_setImplementation(m_unt, trace_unt);
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled initUntrackedInternalBufferWithDevice:length:options:\n");
+                }
+                SEL initFull = sel_registerName("initWithDevice:length:alignment:options:isSuballocDisabled:resourceInArgs:pinnedGPULocation:");
+                Method m_full = class_getInstanceMethod(agxbuf_after, initFull);
+                if (m_full) {
+                    IMP orig_full = method_getImplementation(m_full);
+                    IMP trace_full = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long align, unsigned long opt, int subDis, void *resInArgs, void *pinned) {
+                        // FIX: small AGXBuffer allocs (used by AGX::Mempool::grow
+                        // lambda for ImageStateEncoderGen6 freelist columns)
+                        // fail because the IOGPU sub-resource creation rejects
+                        // align=1 small buffers (sel=0xa → 0xe00002c2). Forcing
+                        // suballocDisabled=1 routes through individual heap
+                        // alloc, which works for both small and large sizes.
+                        // This affects ONLY chroot, where IOGPU suballoc rejects
+                        // the small element layout — macOS-native devices have
+                        // the parent heap pre-initialized so sub-element creation
+                        // succeeds.
+                        int subDis_eff = subDis;
+                        unsigned long align_eff = align;
+                        // IOGPU sub-resource creation rejects every align≤1
+                        // request with kIOReturnExclusiveAccess (sel=0xa →
+                        // 0xe00002c2) in the chroot. Force suballocDisabled=1
+                        // to take the heap-direct allocation branch which
+                        // works at any length. Tighten alignment to 64 (the
+                        // AGX hardware min) so the heap allocator doesn't
+                        // round down to 0.
+                        if (align <= 1) {
+                            subDis_eff = 1;
+                            align_eff = 64;
+                        }
+                        id r = ((id (*)(id, SEL, id, unsigned long, unsigned long, unsigned long, int, void *, void *))orig_full)(
+                            self, initFull, dev, len, align_eff, opt, subDis_eff, resInArgs, pinned);
+                        if (!r && (subDis_eff != subDis || align_eff != align)) {
+                            // Retry with original args if our forced path failed
+                            r = ((id (*)(id, SEL, id, unsigned long, unsigned long, unsigned long, int, void *, void *))orig_full)(
+                                self, initFull, dev, len, align, opt, subDis, resInArgs, pinned);
+                        }
+                        static int trace_cnt = 0;
+                        if (trace_cnt++ < 12) {
+                            fprintf(stderr,
+                                "#### TRACE -[AGXBuffer initFull] self=%p dev=%p len=%lu align=%lu→%lu opt=%lu subDis=%d→%d resIn=%p pin=%p -> %p\n",
+                                self, dev, len, align, align_eff, opt, subDis, subDis_eff, resInArgs, pinned, r);
+                        }
+                        return r;
+                    });
+                    method_setImplementation(m_full, trace_full);
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled initWithDevice:length:alignment:options:isSuballocDisabled:resourceInArgs:pinnedGPULocation:\n");
+                }
+            }
+
+            // Probe what libobjc class-registration symbols are exposed in this
+            // libobjc build. Goal: find a callable function that takes a
+            // pre-existing class struct (from __objc_classlist) and adds it
+            // to gdb_objc_realized_classes (name → class map). Without that
+            // table entry, objc_getClass(name) returns NULL even though the
+            // class data exists at a known pointer.
+            const char *libobjc_apis[] = {
+                "objc_addClass",
+                "_objc_addClass",
+                "_objc_addClass_quiet",
+                "objc_constructInstance",
+                "_dyld_objc_notify_register",
+                "_dyld_objc_register_callbacks",
+                "_objc_loadDebug",
+                "objc_readClassPair",
+                "objc_registerClassPair",
+                "_objc_register_class",
+                "_objc_realizeClassFromSwift",
+                "objc_realizeClassFromSwift",
+                "_objc_addLoadImageFunc",
+                "objc_addLoadImageFunc",
+                "_objc_swiftMetadataInitializer",
+                "_objc_remappedClasses",
+                "_read_images",
+                "map_images",
+                "map_images_nolock",
+                "_objc_init",
+                NULL
+            };
+            for (int i = 0; libobjc_apis[i]; i++) {
+                void *p = dlsym(RTLD_DEFAULT, libobjc_apis[i]);
+                if (p) fprintf(stderr, "#### LIBOBJC dlsym(%s) = %p\n",
+                                libobjc_apis[i], p);
+            }
+
+            // For each AGX class we found, dump:
+            //   class ptr, name, superclass ptr, superclass name (if reachable),
+            //   isMeta flag, classref-target-name.
+            // This pinpoints whether class structs are corrupt or whether it's
+            // purely a name-table miss.
+            for (size_t i = 0; i < n && i < 16; i++) {
+                if (classlist[i] == 0) continue;
+                Class c = (Class)classlist[i];
+                const char *name = class_getName(c);
+                Class sc = class_getSuperclass(c);
+                const char *scname = sc ? class_getName(sc) : "(nil)";
+                BOOL meta = class_isMetaClass(c);
+                fprintf(stderr,
+                    "#### CLASS_DETAIL [%zu] %p name=%s super=%p (%s) meta=%d\n",
+                    i, (void *)c, name ?: "?", (void *)sc, scname ?: "?", meta);
+            }
+        } else {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __objc_classlist NOT FOUND\n");
+        }
+        // Walk __objc_classrefs section: read each pointer entry.
+        unsigned long classrefs_sz = 0;
+        uint64_t *classrefs = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+            "__DATA", "__objc_classrefs", &classrefs_sz);
+        if (classrefs) {
+            size_t n = classrefs_sz / 8;
+            int nulls = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (classrefs[i] == 0) nulls++;
+            }
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __objc_classrefs: %zu entries, %d null\n", n, nulls);
+            // Try to fix nulls by reading class name from neighboring metadata
+            // and replacing with objc_getClass result. We don't have direct
+            // mapping from classref slot to class name in stripped binaries —
+            // but we have ALL OUR OWN classes in __objc_classlist which IS
+            // populated. So our best bet is: dlsym OBJC_CLASS_$_NAME for known
+            // AGX classes and patch their slot.
+            const char *known_agx_classes[] = {
+                "AGXBuffer",
+                "AGXCommandQueue",
+                "AGXCommandBuffer",
+                "AGXMetalCommandQueue",
+                "AGXMetalCommandBuffer",
+                "AGXMetalBuffer",
+                "AGXMetalTexture",
+                "AGXMetalHeap",
+                "AGXMetalResource",
+                "AGXMetalDevice",
+                "AGXMetalFence",
+                "AGXTexture",
+                "IOGPUMetalBuffer",
+                "IOGPUMetalCommandBuffer",
+                "IOGPUMetalCommandQueue",
+                "IOGPUMetalDevice",
+                "IOGPUMetalHeap",
+                "IOGPUMetalResource",
+                "IOGPUMetalTexture",
+                "IOGPUMetalFence",
+                "IOGPUMTLLateEvalEvent",
+                NULL
+            };
+            for (int i = 0; known_agx_classes[i]; i++) {
+                Class c = objc_getClass(known_agx_classes[i]);
+                fprintf(stderr, "####   class %s = %p\n", known_agx_classes[i], (void *)c);
+            }
+            // Dump first 16 classrefs: deref each pointer, get class_getName.
+            // If class_getName returns valid AGX name → classref points to OUR
+            // class data (the bind worked, the slot just isn't realized in
+            // libobjc's name table). If name is junk or addr is bad → bind
+            // never happened and the slot points to stale/null garbage.
+            for (size_t i = 0; i < n && i < 24; i++) {
+                uint64_t cp = classrefs[i];
+                if (cp == 0) {
+                    fprintf(stderr, "#### CLASSREF [%zu] @%p = NULL\n",
+                        i, (void *)&classrefs[i]);
+                    continue;
+                }
+                const char *nm = "?";
+                @try {
+                    nm = class_getName((Class)cp) ?: "?";
+                } @catch (NSException *e) {
+                    nm = "(crash)";
+                }
+                fprintf(stderr, "#### CLASSREF [%zu] @%p -> %p name=%s\n",
+                    i, (void *)&classrefs[i], (void *)cp, nm);
+            }
+        }
 
         // Walk LC_DYLD_CHAINED_FIXUPS and patch each null import bind by
         // resolving the symbol via dlsym(RTLD_DEFAULT). This repairs the
@@ -1225,6 +1625,34 @@ DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
+
+// ─── objc_alloc tracer for AGX classes ──────────────────────────────────────
+// When AGXMetal13_3's AGX::Mempool::grow lambda calls objc_alloc(AGXBuffer),
+// the GOT slot for objc_alloc is resolved via our walker. If that slot still
+// returns nil — either because the slot isn't bound or because libobjc's
+// alloc dispatch fails on an under-realized class — Mempool gets nil buffers
+// and setupDeferred crashes at +0x180 dereferencing the first buffer field.
+// Interpose objc_alloc so every AGX-named class allocation gets logged AND
+// gets a class_createInstance fallback if libobjc's alloc returns nil.
+// objc_alloc trace: ONLY active when the experimental "register AGX classes"
+// flag is set. Otherwise it's a pure passthrough (same behavior as no
+// interpose) so the prior stable baseline stays unaffected.
+extern id objc_alloc(Class);
+id objc_alloc_trace(Class cls) {
+    id r = objc_alloc(cls);
+    if (!getenv("MACWS_AGX_REGISTER_CLASSES")) return r;
+    if (cls) {
+        const char *n = class_getName(cls);
+        if (n && strncmp(n, "AGX", 3) == 0) {
+            static int agx_alloc_count = 0;
+            if (agx_alloc_count++ < 6) {
+                fprintf(stderr, "#### objc_alloc(%s) -> %p\n", n, r);
+            }
+        }
+    }
+    return r;
+}
+DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 
 // ─── CARenderServer bootstrap-name rewrite ──────────────────────────────────
 // The macOS window-content pipeline ships each app's rendered IOSurface to
