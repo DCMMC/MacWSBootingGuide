@@ -441,13 +441,43 @@ static void macws_sigabrt_trampoline(int sig) {
                 }
                 IOSurfaceRef shadow = (IOSurfaceRef)[shadowVal pointerValue];
                 if (!shadow) {
+                    // Match the iPad CA Framebuffer's kernel-side IOSurface
+                    // properties so AGX accepts our shadow for
+                    // newTextureWithDescriptor:iosurface:. Without these
+                    // hints the userland IOSurface lacks IOGPU memory-region
+                    // metadata and AGX rejects the wrap (verified: bare
+                    // BGRA8 shadow at 2388x1668 returns nil; even h=48
+                    // returns nil). The properties are mirrored from the
+                    // original surface's reported "CreationProperties" dict:
+                    //   IOSurfaceCacheMode      = 1792  (= 0x700, kIOMapWriteCombineCache)
+                    //   IOSurfaceMapCacheAttribute = 0
+                    //   IOSurfaceMemoryRegion   = "PurpleGfxMem"
                     NSDictionary *props = @{
-                        @"IOSurfaceWidth":           @(desc.width),
-                        @"IOSurfaceHeight":          @(desc.height),
-                        @"IOSurfaceBytesPerElement": @4,
-                        @"IOSurfacePixelFormat":     @((uint32_t)'BGRA'),
+                        @"IOSurfaceWidth":              @(desc.width),
+                        @"IOSurfaceHeight":             @(desc.height),
+                        @"IOSurfaceBytesPerElement":    @4,
+                        @"IOSurfacePixelFormat":        @((uint32_t)'BGRA'),
+                        @"IOSurfaceCacheMode":          @1792,
+                        @"IOSurfaceMapCacheAttribute":  @0,
+                        @"IOSurfaceMemoryRegion":       @"PurpleGfxMem",
                     };
                     shadow = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+                    // Fall back to bare BGRA8 if the kernel rejects
+                    // PurpleGfxMem from userland.
+                    if (!shadow) {
+                        NSDictionary *bareprops = @{
+                            @"IOSurfaceWidth":           @(desc.width),
+                            @"IOSurfaceHeight":          @(desc.height),
+                            @"IOSurfaceBytesPerElement": @4,
+                            @"IOSurfacePixelFormat":     @((uint32_t)'BGRA'),
+                        };
+                        shadow = IOSurfaceCreate((__bridge CFDictionaryRef)bareprops);
+                        fprintf(stderr, "#### MTL_TEX/iosurf SHADOW PurpleGfxMem rejected, fallback bare BGRA8 = %p\n",
+                                (void *)shadow);
+                    } else {
+                        fprintf(stderr, "#### MTL_TEX/iosurf SHADOW PurpleGfxMem accepted = %p\n",
+                                (void *)shadow);
+                    }
                     if (shadow) {
                         @synchronized(shadowCache) {
                             shadowCache[origKey] = [NSValue valueWithPointer:(void *)shadow];
