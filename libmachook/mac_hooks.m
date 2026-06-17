@@ -705,6 +705,94 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // textures (which DO succeed) run normally.
         install_skylight_prepare_for_use_tolerate_nil_hook((const void *)header);
 
+        // ── render_update composite_destination fail-fast retarget ──────────
+        // Patch the `cbz x24, +0x660` at SkyLight 0x18525ec50 so that when
+        // _WSCompositeDestinationCreateWithIOSurface (or its WithMetalTexture
+        // inner call) returns NULL, render_update jumps STRAIGHT to its
+        // epilogue at 0x18525f62c instead of falling into the assert block
+        // at 0x18525f2b0. The assert block sets up arg strings and a `bl
+        // sub_18547c20c` — we already NOP that BL via the CAWSBackend.mm
+        // patcher, but the post-NOP code reads `[sp, #0x38]` which is an
+        // uninitialized local var on the FAIL path (only the OK path writes
+        // it earlier). x8 = 0x3ff... (NaN-shaped 1.0f from a prior d-reg
+        // spill) then ldr x8, [x8, #0x10] faults.
+        //
+        // Re-targeting the cbz to the epilogue makes the FAIL path return
+        // cleanly without touching sp+0x38. x0 = 0 from the failed
+        // composite-destination call is harmless to the caller (UpdateDisplays
+        // tolerates a 0 return — it just renders nothing for this frame).
+        {
+            // Search for cbz x24 followed by an adrp+add+mov_w2+bl pattern
+            // (the assert sequence). The cbz target is the assert block.
+            const uint64_t expected_orig = 0xB4003318;  // cbz x24, +0x660
+            const uint64_t expected_new  = 0xB4004EF8;  // cbz x24, +0x9DC
+            uint64_t static_check_pc = 0x18525ec50;
+            uint64_t sl_static_base  = 0x18523053c - 0; // anchor on the wsccd entry
+            // Use the entry-symbol resolved address as the slide anchor.
+            void *wsccd = MSFindSymbol((MSImageRef)header,
+                "_WSCompositeDestinationCreateWithMetalTexture");
+            if (wsccd) {
+                intptr_t slide_sl = (intptr_t)wsccd - (intptr_t)sl_static_base;
+                uint32_t *cbz_at = (uint32_t *)(static_check_pc + slide_sl);
+                if (*cbz_at == expected_orig) {
+                    ModifyExecutableRegion(cbz_at, sizeof(uint32_t), ^{
+                        *cbz_at = (uint32_t)expected_new;
+                    });
+                    fprintf(stderr, "#### SkyLight render_update cbz retargeted to epilogue at %p\n",
+                            cbz_at);
+                } else {
+                    fprintf(stderr, "#### SkyLight render_update cbz mismatch at %p (got %#x)\n",
+                            cbz_at, *cbz_at);
+                }
+
+                // Second cbz at 0x18525f0a8: `cbz w0, 0x18525f2d0` — when
+                // sub_18547aa0c returns 0 (rect-empty or similar), control
+                // jumps DIRECTLY to the same `ldr x8, [sp,#0x38] / ldr x8,
+                // [x8,#0x10]` crash sequence. Retarget the second cbz to the
+                // epilogue too so this path also returns cleanly.
+                const uint32_t orig2 = 0x34001140;  // cbz w0, +0x228
+                const uint32_t new2  = 0x34002C20;  // cbz w0, +0x584
+                uint32_t *cbz2_at = (uint32_t *)(0x18525f0a8 + slide_sl);
+                if (*cbz2_at == orig2) {
+                    ModifyExecutableRegion(cbz2_at, sizeof(uint32_t), ^{
+                        *cbz2_at = new2;
+                    });
+                    fprintf(stderr, "#### SkyLight render_update second-cbz retargeted at %p\n",
+                            cbz2_at);
+                } else {
+                    fprintf(stderr, "#### SkyLight render_update second-cbz mismatch at %p (got %#x)\n",
+                            cbz2_at, *cbz2_at);
+                }
+
+                // THIRD entry to the assert/crash block: another
+                // WithMetalTexture call at 0x18525f2a0 returns NULL → falls
+                // through `cbnz x24, 0x18525ec54` at 0x18525f2ac into the
+                // assert setup at 0x18525f2b0. The cleanest catch-all is to
+                // overwrite the FIRST instruction of the assert block
+                // (0x18525f2b0) with `b 0x18525f62c` (jump straight to
+                // epilogue). This makes EVERY path into the assert block —
+                // including the cbnz fall-through, cbz x24 jump (already
+                // retargeted), and any future variants — exit render_update
+                // cleanly instead of touching the post-NOP uninit-stack
+                // sequence.
+                //   imm26 = (0x18525f62c - 0x18525f2b0) / 4 = 0x37C/4 = 0xDF
+                //   B encoding: 0x14000000 | imm26 = 0x140000DF
+                const uint32_t orig3 = 0xb00012e0;  // adrp x0, 0x1854bc000
+                const uint32_t new3  = 0x140000DF;  // b 0x18525f62c
+                uint32_t *assert_block_at = (uint32_t *)(0x18525f2b0 + slide_sl);
+                if (*assert_block_at == orig3) {
+                    ModifyExecutableRegion(assert_block_at, sizeof(uint32_t), ^{
+                        *assert_block_at = new3;
+                    });
+                    fprintf(stderr, "#### SkyLight render_update assert-block b-to-epilogue at %p\n",
+                            assert_block_at);
+                } else {
+                    fprintf(stderr, "#### SkyLight render_update assert-block mismatch at %p (got %#x)\n",
+                            assert_block_at, *assert_block_at);
+                }
+            }
+        }
+
         // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
         // patch kern_SwapEnd passing correct inputStructCnt
