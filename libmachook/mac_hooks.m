@@ -732,7 +732,14 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             void *wsccd = MSFindSymbol((MSImageRef)header,
                 "_WSCompositeDestinationCreateWithMetalTexture");
             if (wsccd) {
-                intptr_t slide_sl = (intptr_t)wsccd - (intptr_t)sl_static_base;
+                // On arm64e MSFindSymbol returns a PAC-signed pointer.
+                // Strip the auth bits before arithmetic so subsequent
+                // pointer reads don't fault as `KERN_INVALID_ADDRESS at
+                // 0xfc508001983dec50 (possible pointer authentication
+                // failure)` when bash / other non-WS chroot processes
+                // load SkyLight (e.g. via QuartzCore_hooks dlopen).
+                uintptr_t wsccd_raw = ((uintptr_t)wsccd) & 0x0000007FFFFFFFFFULL;
+                intptr_t slide_sl = (intptr_t)wsccd_raw - (intptr_t)sl_static_base;
                 uint32_t *cbz_at = (uint32_t *)(static_check_pc + slide_sl);
                 if (*cbz_at == expected_orig) {
                     ModifyExecutableRegion(cbz_at, sizeof(uint32_t), ^{
