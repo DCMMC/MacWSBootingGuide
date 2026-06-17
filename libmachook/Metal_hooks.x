@@ -10,6 +10,30 @@
 
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 
+// Process-wide stash of the current IOSurfaceID being wrapped as a texture.
+// Was per-thread but the texture init dispatches the kernel call onto a
+// worker thread that __thread doesn't reach. Set by
+// `hooked_newTextureWithDescriptor:iosurface:plane:` before %orig is
+// invoked, cleared after. Read by IOConnectCallMethod_new in mac_hooks.m
+// to inject args[+0x30] = IOSurfaceID for sel=0xa type=0x82 — the iOS
+// kernel AGX dispatcher requires this for IOSurface-backed textures.
+//
+// Race risk: WS may have concurrent texture creates from different
+// threads. Mitigate by capturing the value just before %orig and restoring
+// just after; concurrent creates would see each other's IDs, but in
+// practice WS serialises scanout texture creation.
+static _Atomic uint32_t s_current_iosurface_id = 0;
+
+__attribute__((visibility("default")))
+uint32_t macws_get_current_iosurface_id(void) {
+    return s_current_iosurface_id;
+}
+
+__attribute__((visibility("default")))
+void macws_set_current_iosurface_id(uint32_t id) {
+    s_current_iosurface_id = id;
+}
+
 // FORCE_M1_DRIVER auto-enabled for the arm64e on-device slice only (see
 // mac_hooks.m). arm64e -> real macOS AGX driver; arm64/x86_64 -> MTLSimDevice.
 #if defined(__arm64e__) && defined(LIBMACHOOK_ON_DEVICE_BUILD)
@@ -729,6 +753,20 @@ static void macws_sigabrt_trampoline(int sig) {
             probelog++;
         }
     }
+    // Stash the IOSurfaceID into TLS so IOConnectCallMethod_new can inject it
+    // into args[+0x30] for the sel=0xa type=0x82 path. Save/restore the
+    // previous value to handle re-entry (shadow IOSurface fallback path).
+    uint32_t prev_iosurface_id = macws_get_current_iosurface_id();
+    macws_set_current_iosurface_id(iosurface ? IOSurfaceGetID(iosurface) : 0);
+    static int tls_log = 0;
+    if (tls_log < 8) {
+        fprintf(stderr,
+            "#### MTL_TEX TLS set iosurface=%p id=%#x (thread=%p addr=%p)\n",
+            iosurface, macws_get_current_iosurface_id(), (void*)pthread_self(),
+            NULL);
+        tls_log++;
+    }
+
     id<MTLTexture> result = nil;
     struct sigaction old_sa, new_sa;
     memset(&new_sa, 0, sizeof(new_sa));
@@ -879,6 +917,7 @@ static void macws_sigabrt_trampoline(int sig) {
     } else if (!result) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.NIL");
     }
+    macws_set_current_iosurface_id(prev_iosurface_id);
     return result;
 }
 

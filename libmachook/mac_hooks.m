@@ -1373,7 +1373,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // SkyLight only needs a non-nil object: it holds the reference,
             // and VNC reads the underlying IOSurface bytes via CPU lock —
             // GPU-side state inside IOGPUMetalTexture isn't on the path.
-            {
+            if (getenv("MACWS_AGX_KEEP_SUPERINIT_BYPASS")) {
                 // Patch:
                 //   0x1e5a5af38: mov x23, x0  → mov x23, x25   (x23 = self)
                 //   0x1e5a5af3c: cbz x0, +0x40 → b   +0x40     (jump to epilogue
@@ -1383,6 +1383,11 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 // updateBindData / finalize / validate chain entirely; with
                 // a partially-init'd object those downstream calls fault on
                 // uninitialised ivars.
+                //
+                // After 2026-06-18 (sel=0xa type=0x82 IOSurfaceID fix) super-
+                // init actually succeeds, so this bypass is no longer needed
+                // — disabled by default. Set MACWS_AGX_KEEP_SUPERINIT_BYPASS
+                // if reverting to the workaround.
                 uint64_t mov_static = 0x1e5a5af38;
                 uint32_t *mov_at    = (uint32_t *)(mov_static + slide);
                 const uint32_t MOV_X23_X0  = 0xAA0003F7u; // orr x23, xzr, x0
@@ -2697,6 +2702,14 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
     return selector;
 }
 
+// Per-thread IOSurfaceID stash. Set by Metal_hooks.x's swizzled
+// hooked_newTextureWithDescriptor:iosurface:plane: before %orig runs, read
+// here by IOConnectCallMethod_new to inject args[+0x30] for sel=0xa
+// type=0x82 — the iOS kernel AGX dispatcher requires the IOSurfaceID at
+// that offset to call find_iosurface_for_id (without it, returns
+// kIOReturnNoMemory).
+extern uint32_t macws_get_current_iosurface_id(void);
+
 // AGX ID-translation shim. The iOS kernel AUTO-ASSIGNS resource GIDs (IOGPUObject
 // atomic counter; getResource matches resource+0x28), but the macOS AGX driver uses
 // CLIENT-ASSIGNED ids at IOGPUNewResourceArgs+0x48 (e.g. heap=0x20000, sub-resource
@@ -2735,38 +2748,75 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
         }
-        // type=0x82: macOS "standalone resource with pinned GPU VA" — iOS
-        // kernel rejects (kIOReturnNoMemory). Re-shape as sub-resource of
-        // the most-recently-created heap:
-        //   - type 0x82 → 0x80
-        //   - parent_id := last heap's iOS GID
-        //   - +0x30 (end-VA) := heap's va38 + size, +0x38 := heap's start_va
-        //   - +0x58 (pinned GPU VA) := 0 (let kernel allocate freely)
-        // SkyLight gets a real kernel-allocated resource; GPU state is
-        // valid; pinned-VA semantics are lost but for the framebuffer scan-
-        // out path SkyLight reads CPU-side via IOSurface anyway.
-        if(agxType == 0x82 && g_agxIdMapCount > 0) {
-            int slot = g_agxIdMapCount - 1;  // most recent heap
-            shadowbuf[0] = 0x80;                                              // type → sub-resource
-            *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[slot].iosGID;
-            *(uint64_t *)(shadowbuf + 0x58) = 0;                              // drop pinned VA
-            // For sub-resources, kernel reads (+0x30 - +0x38) as size. Mirror
-            // the existing type=0x80 path: end_va = start_va + heap_size.
-            // If +0x38 was a small flag value rather than a VA, force it to 0.
-            uint64_t start_va = va38 < 0x1000 ? 0 : va38;
-            *(uint64_t *)(shadowbuf + 0x38) = start_va;
-            *(uint64_t *)(shadowbuf + 0x30) = start_va + g_agxIdMap[slot].size;
-            // +0x40 (mostly flags+0x80000000 hi-bit) — clear hi bits that may
-            // confuse the sub-resource path.
+        // type=0x82 is the iOS-NATIVE type byte for iosurface-backed textures
+        // too — confirmed by static disasm of iOS IOGPUMetalTexture's
+        // initWithDevice:descriptor:iosurface:plane:field:args:argsSize: at
+        // 0x1eec5d33c: `ldr d0, [#0x1eec7e710]; str d0, [args]` loads the 8-
+        // byte template `82 00 00 00 00 00 00 00` and writes it to args[0].
+        //
+        // The chroot WS fails not because of the type byte, but because the
+        // macOS userland fills two extra fields that iOS init leaves zero:
+        //
+        //   field      iOS userland sets                  macOS sets
+        //   args+0x40  0    (zero-initialised stack)      0x80888300 (flag mask)
+        //   args+0x58  0    (zero-initialised stack)      0x180888300 (pinned VA)
+        //
+        // Both non-zero values trigger the iOS kernel's macOS-only
+        // "standalone with pinned GPU VA" code path which doesn't exist,
+        // returning kIOReturnNoMemory.
+        //
+        // Fix: for iosurface texture creates (detected by args+0x14 flag
+        // mask 0x430 — the iOS-set marker from IOGPUMetalResource init),
+        // zero args+0x40 and args+0x58. The iOS kernel then takes the same
+        // path as native iOS iosurface texture creation. The IOSurface
+        // identity is still bound by the follow-up sel=0x29→0x25
+        // (IOGPUResourceCreateIOSurface) call.
+        // 2026-06-18 disasm of iOS AGXG13G + IOGPUFamily kexts located the
+        // exact kernel check that rejects our chroot args. IOGPUDevice::
+        // new_resource() at fffffe0009f03bb4:
+        //   cmp w8, #0x82                 ; type word
+        //   ldr w1, [x24, #0x30]          ; args+0x30 = IOSurfaceID
+        //   ldr x2, [x22, #0x50]          ; this->0x50 = task
+        //   bl  IOGPU::find_iosurface_for_id
+        //   cbz x0, FAIL                  ; ← we hit this. IOSurfaceID=0 →
+        //                                   no lookup hit → kIOReturnNoMemory
+        // iOS userland's iOS IOGPUMetalTexture iosurface init writes
+        //   stp w0, w21, [x24, #0x30]      ; +0x30 = IOSurfaceGetID(io)
+        // before sel=0xa fires. macOS WS path leaves +0x30 = 0.
+        //
+        // Fix: read the IOSurfaceID we stashed in TLS from Metal_hooks.x's
+        // swizzled newTextureWithDescriptor:iosurface:plane: (we're called
+        // synchronously from inside that swizzle's %orig), and inject it
+        // into args[+0x30]. Also keep the +0x40 / +0x58 zeroing because
+        // non-zero values there take the pinned-VA fast path which iOS
+        // doesn't recognise.
+        // macOS chroot stores the IOSurfaceID at args+0x38 (where iOS puts
+        // the plane index); iOS userland stores IOSurfaceID at args+0x30
+        // (which macOS leaves zero). Swap them: write +0x38's value into
+        // +0x30, and put the actual plane (always 0 in our path) at +0x38.
+        // Also zero +0x40 / +0x58 — the iOS kernel rejects non-zero values
+        // there (pinned-VA path that doesn't exist on iOS).
+        if(agxType == 0x82) {
+            uint32_t f14 = *(const uint32_t *)(src + 0x14);
+            uint64_t old_40 = *(const uint64_t *)(src + 0x40);
+            uint64_t old_58 = *(const uint64_t *)(src + 0x58);
+            uint32_t old_30 = *(const uint32_t *)(src + 0x30);
+            uint32_t old_38 = *(const uint32_t *)(src + 0x38);
+            *(uint64_t *)(shadowbuf + 0x40) = 0;
+            *(uint64_t *)(shadowbuf + 0x58) = 0;
+            // If +0x30 is empty and +0x38 looks like an IOSurfaceID, swap.
+            if (old_30 == 0 && old_38 != 0) {
+                *(uint32_t *)(shadowbuf + 0x30) = old_38;
+                *(uint32_t *)(shadowbuf + 0x38) = 0;
+            }
             patched = 1;
             fprintf(stderr,
-                "#### AGXIOC type=0x82 → sub-res of heap GID=%#llx (clientID=%#x size=%#llx)\n"
-                "####   start_va=%#llx end_va=%#llx\n",
-                (unsigned long long)g_agxIdMap[slot].iosGID,
-                g_agxIdMap[slot].clientID,
-                (unsigned long long)g_agxIdMap[slot].size,
-                (unsigned long long)start_va,
-                (unsigned long long)(start_va + g_agxIdMap[slot].size));
+                "#### AGXIOC type=0x82 patch: f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
+                "+0x40 %#llx→0 +0x58 %#llx→0\n",
+                f14,
+                old_30, *(const uint32_t *)(shadowbuf + 0x30),
+                old_38, *(const uint32_t *)(shadowbuf + 0x38),
+                (unsigned long long)old_40, (unsigned long long)old_58);
         }
         if(patched) inStruct = shadowbuf;
     }
