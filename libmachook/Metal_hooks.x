@@ -6,6 +6,10 @@
 #import <xpc/xpc.h>
 #import "utils.h"
 
+#import <IOSurface/IOSurfaceRef.h>
+
+extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
+
 // FORCE_M1_DRIVER auto-enabled for the arm64e on-device slice only (see
 // mac_hooks.m). arm64e -> real macOS AGX driver; arm64/x86_64 -> MTLSimDevice.
 #if defined(__arm64e__) && defined(LIBMACHOOK_ON_DEVICE_BUILD)
@@ -76,6 +80,57 @@ static id(*MTLCreateSimulatorDevice)(void);
     swizzle2(MTLSimDeviceClass, @selector(location), MTLFakeDevice.class, @selector(hooked_location));
     swizzle2(MTLSimDeviceClass, @selector(locationNumber), MTLFakeDevice.class, @selector(hooked_locationNumber));
     swizzle2(MTLSimDeviceClass, @selector(maxTransferRate), MTLFakeDevice.class, @selector(hooked_maxTransferRate));
+    // MACWS_TEX_TRACE=1 enables full IOSurface→Metal texture descriptor logging.
+    // Always-installed because the cold/abort path of MTLSimDriver's
+    // sendXPCMessageWithReplySync hits abort() with no recovery — we MUST see
+    // every descriptor right before the failure to know what to translate.
+    swizzle2(MTLSimDeviceClass, @selector(newTextureWithDescriptor:iosurface:plane:),
+             MTLFakeDevice.class, @selector(hooked_newTextureWithDescriptor:iosurface:plane:));
+    swizzle2(MTLSimDeviceClass, @selector(newTextureWithDescriptor:),
+             MTLFakeDevice.class, @selector(hooked_newTextureWithDescriptor:));
+
+    // MTLSimDevice has SUBCLASSES (MTLSimGPU13MDevice, MTLSimGPU11Device, ...).
+    // If the runtime class is a subclass that overrides our hooked selectors, the
+    // base-class swizzle is shadowed and our hook never runs. Enumerate all
+    // subclasses and apply the same swizzle to each one that has its own IMP.
+    unsigned int numClasses = 0;
+    Class *allClasses = objc_copyClassList(&numClasses);
+    int subclassPatched = 0;
+    for (unsigned int i = 0; i < numClasses; i++) {
+        Class c = allClasses[i];
+        // Walk superclasses to find MTLSimDevice ancestry
+        Class p = c;
+        BOOL is_sim_sub = NO;
+        while (p && p != MTLSimDeviceClass) {
+            p = class_getSuperclass(p);
+        }
+        if (p != MTLSimDeviceClass || c == MTLSimDeviceClass) continue;
+        // Only swizzle if THIS class itself implements the selector (not inherited)
+        unsigned int nm = 0;
+        Method *methods = class_copyMethodList(c, &nm);
+        BOOL has_iosurf = NO;
+        BOOL has_plain  = NO;
+        SEL iosurf_sel = @selector(newTextureWithDescriptor:iosurface:plane:);
+        SEL plain_sel  = @selector(newTextureWithDescriptor:);
+        for (unsigned int j = 0; j < nm; j++) {
+            SEL s = method_getName(methods[j]);
+            if (s == iosurf_sel) has_iosurf = YES;
+            if (s == plain_sel)  has_plain  = YES;
+        }
+        if (methods) free(methods);
+        if (has_iosurf) {
+            swizzle2(c, iosurf_sel, MTLFakeDevice.class, @selector(hooked_newTextureWithDescriptor:iosurface:plane:));
+            subclassPatched++;
+        }
+        if (has_plain) {
+            swizzle2(c, plain_sel, MTLFakeDevice.class, @selector(hooked_newTextureWithDescriptor:));
+            subclassPatched++;
+        }
+        fprintf(stderr, "#### MTL_TEX subclass %s iosurf=%d plain=%d\n",
+            class_getName(c), has_iosurf, has_plain);
+    }
+    if (allClasses) free(allClasses);
+    fprintf(stderr, "#### MTL_TEX swizzled MTLSimDevice + %d subclass overrides\n", subclassPatched);
     NSLog(@"#### debugbydcmmc load swizzle2 successfully!");
     
     uint32_t *imp;
@@ -126,13 +181,27 @@ static id(*MTLCreateSimulatorDevice)(void);
     // NSLog(@"#### debugbydcmmc MTLSimDevice class %@", cls ? @"present" : @"missing");
     self = MTLCreateSimulatorDevice();
     // NSLog(@"#### debugbydcmmc MTLCreateSimulatorDevice done");
-    objc_setAssociatedObject(self, @selector(acceleratorPort), @(port), OBJC_ASSOCIATION_ASSIGN);
+    // CRITICAL: use OBJC_ASSOCIATION_RETAIN (not ASSIGN). With ASSIGN the
+    // autoreleased @(port) NSNumber is deallocated after the autorelease pool
+    // drains, leaving a dangling pointer. -[hooked_acceleratorPort] then reads
+    // garbage, WS thinks the GPU port is invalid → falls back to software
+    // rendering, the SW renderer creates an IOSurface with FourCC '&b38'
+    // (0x26623338) that MTLSim cannot wrap, and WS crash-loops in
+    // WSCompositeDestinationCreateWithMetalTexture. Same root cause as the
+    // upstream README "Unimplemented pixel format of 645346401" bug.
+    objc_setAssociatedObject(self, @selector(acceleratorPort), @(port), OBJC_ASSOCIATION_RETAIN);
+    fprintf(stderr, "#### MTLFakeDevice initWithAcceleratorPort:%d retained\n", port);
     return self;
 }
 
 - (uint32_t)hooked_acceleratorPort {
-    uint32_t port = ((NSNumber *)objc_getAssociatedObject(self, @selector(acceleratorPort))).unsignedIntValue;
-    // NSLog(@"#### debugbydcmmc hooked_acceleratorPort %lu", (unsigned long) port);
+    NSNumber *n = (NSNumber *)objc_getAssociatedObject(self, @selector(acceleratorPort));
+    uint32_t port = n ? [n unsignedIntValue] : 0;
+    static int trace_count = 0;
+    if (trace_count < 10) {
+        fprintf(stderr, "#### MTLFakeDevice acceleratorPort -> %u (NSNumber=%p)\n", port, n);
+        trace_count++;
+    }
     return port;
 }
 
@@ -179,6 +248,265 @@ static id(*MTLCreateSimulatorDevice)(void);
     }
     return [self hooked_newBufferWithLength:length options:options pointer:pointer copyBytes:copyBytes deallocator:deallocator];
 }
+
+// IOSurface-backed texture creation: the SkyLight WSCompositeDestination /
+// CAWindowServerDisplay surface path goes through here, and MTLSimDriver's
+// sendXPCMessageWithReplySync cold path aborts on XPC reply errors with no
+// recovery. Log every descriptor + IOSurface so we can characterize failures
+// from the WindowServer.err / oslog stream BEFORE the abort kills the process.
+static void macws_log_mtldesc(MTLTextureDescriptor *desc, IOSurfaceRef iosurface,
+                              NSUInteger plane, const char *tag) {
+    if (!desc) {
+        fprintf(stderr, "#### MTL_TEX/%s desc=NIL\n", tag);
+        return;
+    }
+    @try {
+        fprintf(stderr, "#### MTL_TEX/%s pfmt=%lu type=%lu w=%lu h=%lu d=%lu mips=%lu arr=%lu samp=%lu storage=%lu cpu=%lu usage=%#lx swiz=%#x cs=%p plane=%lu ios=%p\n",
+            tag,
+            (unsigned long)desc.pixelFormat,
+            (unsigned long)desc.textureType,
+            (unsigned long)desc.width,
+            (unsigned long)desc.height,
+            (unsigned long)desc.depth,
+            (unsigned long)desc.mipmapLevelCount,
+            (unsigned long)desc.arrayLength,
+            (unsigned long)desc.sampleCount,
+            (unsigned long)desc.storageMode,
+            (unsigned long)desc.cpuCacheMode,
+            (unsigned long)desc.usage,
+            0u, // swizzle placeholder (Metal 13+ only)
+            (void*)0,
+            (unsigned long)plane,
+            (void*)iosurface);
+    } @catch (NSException *e) {
+        fprintf(stderr, "#### MTL_TEX/%s exception reading desc: %s\n", tag, [[e description] UTF8String] ?: "?");
+    }
+    if (iosurface) {
+        uint32_t iosfmt = IOSurfaceGetPixelFormat(iosurface);
+        char fmtstr[8] = {0};
+        for (int i = 0; i < 4; i++) {
+            char c = (char)((iosfmt >> (24 - i * 8)) & 0xff);
+            fmtstr[i] = (c >= 0x20 && c < 0x7f) ? c : '.';
+        }
+        size_t npl = IOSurfaceGetPlaneCount(iosurface);
+        fprintf(stderr, "####     ios: w=%zu h=%zu bpr=%zu fmt=%#x(%s) elemSz=%zu allocSz=%zu planes=%zu\n",
+            IOSurfaceGetWidth(iosurface),
+            IOSurfaceGetHeight(iosurface),
+            IOSurfaceGetBytesPerRow(iosurface),
+            (unsigned)iosfmt, fmtstr,
+            IOSurfaceGetElementWidth(iosurface),
+            IOSurfaceGetAllocSize(iosurface),
+            npl);
+        for (size_t p = 0; p < npl && p < 4; p++) {
+            fprintf(stderr, "####       plane[%zu]: w=%zu h=%zu bpr=%zu bpe=%zu\n",
+                p,
+                IOSurfaceGetWidthOfPlane(iosurface, p),
+                IOSurfaceGetHeightOfPlane(iosurface, p),
+                IOSurfaceGetBytesPerRowOfPlane(iosurface, p),
+                IOSurfaceGetBytesPerElementOfPlane(iosurface, p));
+        }
+        // Dump ALL IOSurface property keys (one-shot — only on NIL traces so we
+        // don't flood per-frame). The dict reveals IOSurfacePlaneCompressionType
+        // and other Apple-private flags that explain WHY iOS Metal rejects it.
+        if (strstr(tag, ".NIL") || strstr(tag, ".IN")) {
+            CFDictionaryRef d = (CFDictionaryRef)IOSurfaceCopyAllValues(iosurface);
+            if (d) {
+                NSDictionary *nd = (__bridge NSDictionary *)d;
+                for (id k in [nd allKeys]) {
+                    NSString *desc = [nd[k] description];
+                    if ([desc length] > 200) desc = [desc substringToIndex:200];
+                    fprintf(stderr, "####       prop[%s] = %s\n",
+                        [[k description] UTF8String] ?: "?",
+                        [desc UTF8String] ?: "?");
+                }
+                CFRelease(d);
+            }
+        }
+    }
+}
+
+// Empirical: macOS SkyLight on iPad asks for MTLPixelFormat=550 wrapping an
+// IOSurface with FourCC '&b38' (0x26623338) — Apple-private 40-bit BGRA10_XR-like
+// format used for iPad display backbuffers (5.19 bytes/pixel). iOS Metal returns
+// nil for unknown private formats, so we translate 550 → public BGRA10_XR (552),
+// falling back to sRGB (553), RGB10A2 (90), BGRA8 (80). The first hit wins.
+//
+// Translation list ordered by closeness to the source layout. Add formats here
+// as new IOSurface fourCCs surface in the trace.
+static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
+    552,  // BGRA10_XR
+    553,  // BGRA10_XR_sRGB
+    94,   // BGR10A2Unorm (32-bit packed, lossy width)
+    90,   // RGB10A2Unorm
+    80,   // BGRA8Unorm (degraded SDR)
+    81,   // BGRA8Unorm_sRGB
+    0
+};
+
+// SIGABRT survival scope. MTLSimDriver's sendXPCMessageWithReplySync.cold.1
+// calls abort() on any XPC reply error — there is NO return path. We install a
+// thread-local SIGABRT handler around the %orig call so abort()-via-pthread_kill
+// becomes a recoverable siglongjmp instead of a fatal process exit. Outside the
+// protected scope, abort() reverts to the system default.
+static __thread sigjmp_buf macws_abort_env;
+static __thread int macws_in_protected = 0;
+static void macws_sigabrt_trampoline(int sig) {
+    if (macws_in_protected) {
+        siglongjmp(macws_abort_env, 1);
+    }
+    // Not in our scope — re-raise with default to give the system its abort.
+    signal(SIGABRT, SIG_DFL);
+    raise(SIGABRT);
+}
+
+- (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc
+                                        iosurface:(IOSurfaceRef)iosurface
+                                            plane:(NSUInteger)plane {
+    if (getenv("MACWS_TEX_TRACE") != NULL) {
+        macws_log_mtldesc(desc, iosurface, plane, "iosurf.IN");
+    }
+    static int classlog = 0;
+    if (classlog < 3) {
+        fprintf(stderr, "#### MTL_TEX entry self class=%s\n", class_getName([self class]));
+        classlog++;
+    }
+    id<MTLTexture> result = nil;
+    struct sigaction old_sa, new_sa;
+    memset(&new_sa, 0, sizeof(new_sa));
+    new_sa.sa_handler = macws_sigabrt_trampoline;
+    sigemptyset(&new_sa.sa_mask);
+    new_sa.sa_flags = SA_NODEFER;
+    sigaction(SIGABRT, &new_sa, &old_sa);
+    macws_in_protected = 1;
+    if (sigsetjmp(macws_abort_env, 1) == 0) {
+        result = [self hooked_newTextureWithDescriptor:desc iosurface:iosurface plane:plane];
+    } else {
+        fprintf(stderr, "#### MTL_TEX/iosurf CAUGHT SIGABRT (XPC reply error) "
+            "— recovered, will fall back (w=%lu h=%lu pf=%lu ios=%p)\n",
+            (unsigned long)desc.width, (unsigned long)desc.height,
+            (unsigned long)desc.pixelFormat, (void*)iosurface);
+        result = nil;
+    }
+    macws_in_protected = 0;
+    sigaction(SIGABRT, &old_sa, NULL);
+    if (!result && desc) {
+        NSUInteger orig_fmt = desc.pixelFormat;
+        // Try fallback translations only for the private 550 format (and nearby
+        // private values in case Apple varies). Don't retry for known public
+        // formats — their nil return means a real semantic error.
+        BOOL is_private = (orig_fmt >= 548 && orig_fmt <= 551);
+        if (is_private) {
+            for (int i = 0; kMacwsTexFmt550Fallbacks[i] != 0; i++) {
+                NSUInteger try_fmt = kMacwsTexFmt550Fallbacks[i];
+                desc.pixelFormat = try_fmt;
+                result = [self hooked_newTextureWithDescriptor:desc iosurface:iosurface plane:plane];
+                if (result) {
+                    fprintf(stderr,
+                        "#### MTL_TEX/iosurf translated %lu->%lu OK (w=%lu h=%lu ios=%p tex=%p)\n",
+                        (unsigned long)orig_fmt, (unsigned long)try_fmt,
+                        (unsigned long)desc.width, (unsigned long)desc.height,
+                        (void*)iosurface, (void*)result);
+                    break;
+                }
+            }
+            desc.pixelFormat = orig_fmt; // restore so caller sees original
+        }
+        // Shadow IOSurface substitution: when MTLSim/AGX-native cannot wrap
+        // the iPad's compressed CA Framebuffer ('&b38' FourCC, 0x26-prefixed
+        // Apple lossless-compressed format), allocate a SHADOW IOSurface in
+        // plain BGRA8 with the same dimensions and wrap THAT in a Metal
+        // texture. SkyLight + AGX both accept BGRA8 IOSurfaces fine; the
+        // shadow stays in this process's address space so VNC's compositor
+        // read path (which goes via the SkyLight display surface, not the
+        // iPad's IOMFB scanout) sees the new content. The original iPad
+        // scanout buffer stays untouched — coexistence mode (CA_VSYNC_OFF=1)
+        // keeps the iPad panel on iOS anyway, so no visible artifact there.
+        //
+        // Pattern mirrors misc/TestMetalIOSurface and misc/agxprobe.m's
+        // stage 5: minimal IOSurfaceCreate(width, height, bpe=4, pf='BGRA').
+        //
+        // Cache (original IOSurface ptr → shadow IOSurface ptr) so repeated
+        // calls for the same scanout buffer reuse the same shadow.
+        if (!result && iosurface && desc.width > 0 && desc.height > 0) {
+            uint32_t fcc = IOSurfaceGetPixelFormat(iosurface);
+            BOOL is_apple_compressed = ((fcc & 0xFF000000u) == 0x26000000u);
+            if (is_apple_compressed) {
+                static NSMutableDictionary *shadowCache = nil;
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{ shadowCache = [NSMutableDictionary new]; });
+                NSValue *origKey = [NSValue valueWithPointer:(void *)iosurface];
+                NSValue *shadowVal;
+                @synchronized(shadowCache) {
+                    shadowVal = shadowCache[origKey];
+                }
+                IOSurfaceRef shadow = (IOSurfaceRef)[shadowVal pointerValue];
+                if (!shadow) {
+                    NSDictionary *props = @{
+                        @"IOSurfaceWidth":           @(desc.width),
+                        @"IOSurfaceHeight":          @(desc.height),
+                        @"IOSurfaceBytesPerElement": @4,
+                        @"IOSurfacePixelFormat":     @((uint32_t)'BGRA'),
+                    };
+                    shadow = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+                    if (shadow) {
+                        @synchronized(shadowCache) {
+                            shadowCache[origKey] = [NSValue valueWithPointer:(void *)shadow];
+                        }
+                        fprintf(stderr,
+                            "#### MTL_TEX/iosurf SHADOW alloc'd BGRA8 (%lux%lu) %p for orig=%p (fcc=%#x)\n",
+                            (unsigned long)desc.width, (unsigned long)desc.height,
+                            (void *)shadow, (void *)iosurface, (unsigned)fcc);
+                    } else {
+                        fprintf(stderr,
+                            "#### MTL_TEX/iosurf SHADOW IOSurfaceCreate FAILED for %lux%lu\n",
+                            (unsigned long)desc.width, (unsigned long)desc.height);
+                    }
+                }
+                if (shadow) {
+                    MTLPixelFormat orig_fmt = desc.pixelFormat;
+                    desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+                    result = [self hooked_newTextureWithDescriptor:desc iosurface:shadow plane:0];
+                    desc.pixelFormat = orig_fmt;
+                    if (result) {
+                        static int logged = 0;
+                        if (logged < 8) {
+                            fprintf(stderr,
+                                "#### MTL_TEX/iosurf SHADOW-backed texture %p (BGRA8) for orig surf=%p\n",
+                                (void *)result, (void *)iosurface);
+                            logged++;
+                        }
+                    } else {
+                        fprintf(stderr,
+                            "#### MTL_TEX/iosurf SHADOW newTexture STILL nil — giving up\n");
+                    }
+                }
+            }
+        }
+    }
+    if (getenv("MACWS_TEX_TRACE") != NULL) {
+        fprintf(stderr, "#### MTL_TEX/iosurf.OUT -> %p (label=%s)\n",
+            (void*)result,
+            result ? ([[result label] UTF8String] ?: "(nolabel)") : "(nil)");
+    } else if (!result) {
+        macws_log_mtldesc(desc, iosurface, plane, "iosurf.NIL");
+    }
+    return result;
+}
+
+- (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
+    if (getenv("MACWS_TEX_TRACE") != NULL) {
+        macws_log_mtldesc(desc, NULL, 0, "plain.IN");
+    }
+    id<MTLTexture> result = [self hooked_newTextureWithDescriptor:desc];
+    if (getenv("MACWS_TEX_TRACE") != NULL) {
+        fprintf(stderr, "#### MTL_TEX/plain.OUT -> %p (label=%s)\n",
+            (void*)result,
+            result ? ([[result label] UTF8String] ?: "(nolabel)") : "(nil)");
+    } else if (!result) {
+        macws_log_mtldesc(desc, NULL, 0, "plain.NIL");
+    }
+    return result;
+}
 @end
 #endif // MTLFakeDevice static class (off for arm64e on-device)
 
@@ -194,6 +522,46 @@ static void install_agx_init_redirect(Class agx);
     if (getenv("MACWS_AGX_NATIVE")) {
         if (!agx_once) {
             agx_once = 1;
+            // Pre-load IOGPU so its symbols are in the address space when
+            // dyld binds AGXMetal13_3's cross-image references. AGXMetal13_3
+            // calls IOGPU pool-allocator / IOGPUMetalCommonResource functions
+            // through __got/__auth_got slots; if dyld can't resolve them at
+            // bind time, the slots end up null and Mempool::grow's lambda
+            // tail-jumps into garbage (see memory:
+            // agx-mempool-grow-fault-decomposed and the lambda BL NOP fix in
+            // mac_hooks.m). Force-loading IOGPU first lets the binder do its
+            // job for those refs.
+            const char *iogpuPaths[] = {
+                "/System/Library/PrivateFrameworks/IOGPU.framework/IOGPU",
+                "/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU",
+                NULL
+            };
+            void *iogpu = NULL;
+            for (int i = 0; iogpuPaths[i]; i++) {
+                iogpu = dlopen(iogpuPaths[i], RTLD_GLOBAL | RTLD_NOW);
+                if (iogpu) {
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE pre-loaded IOGPU via %s -> %p\n",
+                        iogpuPaths[i], iogpu);
+                    break;
+                }
+            }
+            if (!iogpu) {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE could NOT pre-load IOGPU: %s\n", dlerror());
+            }
+            // Verify some critical IOGPU symbols are resolvable
+            const char *probeSyms[] = {
+                "IOGPUResourceCreate",
+                "IOGPUMetalCommonResourceCreate",
+                "IOGPUDeviceCreateWithAPIProperty",
+                "_IOGPUMetalAllocateResource",
+                "IOGPUMetalAllocateResource",
+                NULL
+            };
+            for (int i = 0; probeSyms[i]; i++) {
+                void *p = dlsym(RTLD_DEFAULT, probeSyms[i]);
+                fprintf(stderr, "#### MACWS_AGX_NATIVE dlsym(%s) = %p\n", probeSyms[i], p);
+            }
+
             void *h = dlopen("/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3", RTLD_NOW);
             if (!h) {
                 fprintf(stderr, "#### MACWS_AGX_NATIVE dlopen AGXMetal13_3 FAILED: %s\n", dlerror());
@@ -242,6 +610,28 @@ static void install_agx_init_redirect(Class agx) {
     SEL sel = @selector(initWithAcceleratorPort:);
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
     fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);
+
+#if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
+    // Also swizzle AGXG13GFamilyDevice's newTextureWithDescriptor:iosurface:plane:
+    // so our shadow-IOSurface fallback runs when AGX-native is active.
+    // Without this, the MTLSimDevice swizzle in -[MTLFakeDevice initHooks]
+    // doesn't reach AGXG13GFamilyDevice (it's a separate class hierarchy under
+    // AGXTexture, not MTLSimDevice). SkyLight's compositor path goes through
+    // AGXG13GFamilyTexture's underlying device method, which returns nil on
+    // the iPad's '&b38' compressed CA Framebuffer just like MTLSim does.
+    SEL iosurf_sel = @selector(newTextureWithDescriptor:iosurface:plane:);
+    SEL iosurf_hook_sel = @selector(hooked_newTextureWithDescriptor:iosurface:plane:);
+    if (class_getInstanceMethod(agx, iosurf_sel)) {
+        swizzle2(agx, iosurf_sel, MTLFakeDevice.class, iosurf_hook_sel);
+        fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled AGXG13GFamilyDevice newTextureWithDescriptor:iosurface:plane:\n");
+    }
+    SEL plain_sel = @selector(newTextureWithDescriptor:);
+    SEL plain_hook_sel = @selector(hooked_newTextureWithDescriptor:);
+    if (class_getInstanceMethod(agx, plain_sel)) {
+        swizzle2(agx, plain_sel, MTLFakeDevice.class, plain_hook_sel);
+        fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled AGXG13GFamilyDevice newTextureWithDescriptor:\n");
+    }
+#endif
 
     // No-op methods that crash in chroot because their setup dependencies
     // (timers, mempools, dispatch sources, etc.) require kernel state that

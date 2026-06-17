@@ -67,6 +67,478 @@ const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Ve
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *AGXMetalPath = "/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3";
 
+// ─── Chained-fixups walker for chroot-loaded AGXMetal13_3 ──────────────────
+//
+// In chroot, AGXMetal13_3.bundle is loaded from disk via dlopen, not from
+// dyld_shared_cache. iOS dyld processes LC_DYLD_CHAINED_FIXUPS at image-load
+// time. Cross-image bindings (especially to IOGPU.framework) fail silently
+// when IOGPU isn't yet loaded → all 97 __got slots stay NULL → AGX::Mempool
+// ::grow's lambda crashes on the null function pointers.
+//
+// This walker re-parses the chained-fixups load command and patches each null
+// import bind by resolving the symbol via dlsym(RTLD_DEFAULT, name). The
+// arm64e auth variants are PAC-signed with the embedded key + diversifier.
+
+#include <mach-o/fixup-chains.h>
+
+static inline uint64_t macws_ptr_blend(uint64_t addr, uint16_t div) {
+    return (addr & 0x0000FFFFFFFFFFFFull) | ((uint64_t)div << 48);
+}
+
+#if __arm64e__
+static inline uint64_t macws_pac_sign(uint64_t ptr, uint64_t mod, uint8_t key) {
+    uint64_t r = ptr;
+    switch (key) {
+        case 0: asm("pacia %0, %1" : "+r"(r) : "r"(mod)); break;
+        case 1: asm("pacib %0, %1" : "+r"(r) : "r"(mod)); break;
+        case 2: asm("pacda %0, %1" : "+r"(r) : "r"(mod)); break;
+        case 3: asm("pacdb %0, %1" : "+r"(r) : "r"(mod)); break;
+    }
+    return r;
+}
+#else
+static inline uint64_t macws_pac_sign(uint64_t ptr, uint64_t mod, uint8_t key) {
+    return ptr;  // no PAC on plain arm64
+}
+#endif
+
+#include <mach-o/nlist.h>
+#include <mach-o/reloc.h>
+
+// Repair __got / __auth_got slots via indirect symbol table + LC_SYMTAB. Used
+// for dlopen'd DSC-bound images that have no LC_DYLD_CHAINED_FIXUPS (because
+// the cache builder removed it; cache pre-filled __got at cache-prep time).
+// When loaded standalone, the pre-fill is gone — but the indirect symbol
+// table still references LC_SYMTAB entries that name each slot's target.
+static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
+                                        intptr_t slide,
+                                        const char *image_name) {
+    const struct symtab_command   *st = NULL;
+    const struct dysymtab_command *dt = NULL;
+    uint64_t linkedit_vmaddr = 0, linkedit_fileoff = 0;
+    const struct segment_command_64 *segs[16] = {0};
+    int seg_count = 0;
+
+    const struct load_command *cmd = (const struct load_command *)((const uint8_t *)header + sizeof(*header));
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        switch (cmd->cmd) {
+            case LC_SYMTAB:   st = (const struct symtab_command *)cmd; break;
+            case LC_DYSYMTAB: dt = (const struct dysymtab_command *)cmd; break;
+            case LC_SEGMENT_64: {
+                const struct segment_command_64 *sc = (const struct segment_command_64 *)cmd;
+                if (strcmp(sc->segname, "__LINKEDIT") == 0) {
+                    linkedit_vmaddr  = sc->vmaddr;
+                    linkedit_fileoff = sc->fileoff;
+                }
+                if (seg_count < 16) segs[seg_count++] = sc;
+                break;
+            }
+        }
+        cmd = (const struct load_command *)((const uint8_t *)cmd + cmd->cmdsize);
+    }
+    if (!st || !dt || !linkedit_vmaddr) {
+        fprintf(stderr, "#### MACWS_GOT %s: missing LC_SYMTAB/LC_DYSYMTAB/LC_SEGMENT\n", image_name);
+        return;
+    }
+    int64_t linkedit_runtime_base = (int64_t)linkedit_vmaddr + slide - (int64_t)linkedit_fileoff;
+    const struct nlist_64 *symtab    = (const struct nlist_64 *)(linkedit_runtime_base + st->symoff);
+    const char            *strtab    = (const char           *)(linkedit_runtime_base + st->stroff);
+    const uint32_t        *indirect  = (const uint32_t        *)(linkedit_runtime_base + dt->indirectsymoff);
+
+    fprintf(stderr, "#### MACWS_GOT %s: symtab=%u syms, strtab=%u bytes, indirect=%u entries\n",
+        image_name, st->nsyms, st->strsize, dt->nindirectsyms);
+
+    int total_indirect_slots = 0, patched = 0, failed = 0;
+    for (int s = 0; s < seg_count; s++) {
+        const struct segment_command_64 *sc = segs[s];
+        const struct section_64 *sect =
+            (const struct section_64 *)((const uint8_t *)sc + sizeof(*sc));
+        for (uint32_t k = 0; k < sc->nsects; k++) {
+            const struct section_64 *sn = &sect[k];
+            uint32_t type = sn->flags & SECTION_TYPE;
+            // We want pointer-table sections that index into the indirect
+            // symbol table. Per Mach-O spec, these are:
+            //   S_NON_LAZY_SYMBOL_POINTERS (__got, __auth_got pointers)
+            //   S_LAZY_SYMBOL_POINTERS     (__la_symbol_ptr — old style)
+            //   S_SYMBOL_STUBS             (__stubs / __auth_stubs)
+            // Match by sectname — DSC strips section type bits but preserves
+            // the section NAME and reserved1 (indirect symbol table start).
+            // Also accept ANY section in __DATA_CONST/__AUTH_CONST whose
+            // reserved1 is non-zero AND whose name suggests pointer table
+            // (`got`, `ptr`, `symbol`). Catches:
+            //   __DATA_CONST,__got           (no-auth GOT)
+            //   __AUTH_CONST,__auth_got      (PAC-auth GOT)
+            //   __DATA,__la_symbol_ptr       (lazy stubs)
+            //   __DATA,__nl_symbol_ptr       (non-lazy pointers)
+            //   __DATA_CONST,__symbol_ptrs   (some images)
+            //   __AUTH_CONST,__auth_ptr      (when reserved1 set)
+            BOOL is_pointer_section = (strstr(sn->sectname, "got") != NULL ||
+                                       strstr(sn->sectname, "ptr") != NULL ||
+                                       strstr(sn->sectname, "symbol") != NULL);
+            if (!is_pointer_section) continue;
+            if (sn->reserved1 == 0) continue;
+            uint32_t entries = (uint32_t)(sn->size / 8);
+            uint32_t indirect_start = sn->reserved1;
+            BOOL is_auth = (strstr(sn->sectname, "auth") != NULL);
+            uint64_t *slots = (uint64_t *)(sn->addr + slide);
+            fprintf(stderr, "####   sect[%u] %s,%s type=%u entries=%u indirect_start=%u auth=%d\n",
+                k, sc->segname, sn->sectname, type, entries, indirect_start, is_auth);
+            for (uint32_t e = 0; e < entries; e++) {
+                if (indirect_start + e >= dt->nindirectsyms) break;
+                total_indirect_slots++;
+                uint32_t idx = indirect[indirect_start + e];
+                if (idx == INDIRECT_SYMBOL_LOCAL ||
+                    idx == INDIRECT_SYMBOL_ABS ||
+                    idx == (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) {
+                    continue;
+                }
+                if (idx >= st->nsyms) {
+                    failed++;
+                    continue;
+                }
+                const struct nlist_64 *sym = &symtab[idx];
+                const char *name = strtab + sym->n_un.n_strx;
+                if (!name || !name[0]) { failed++; continue; }
+                // Skip leading underscore for dlsym
+                const char *lookup = name;
+                if (lookup[0] == '_') lookup++;
+                void *resolved = dlsym(RTLD_DEFAULT, lookup);
+                if (!resolved) {
+                    failed++;
+                    if (failed < 6) {
+                        fprintf(stderr, "####   bind FAIL %s\n", name);
+                    }
+                    continue;
+                }
+                uint64_t value = (uint64_t)resolved;
+                // For __auth_got we'd need PAC signing — but without chained
+                // fixup metadata we don't know diversifier/key. For non-auth
+                // __got (which is what the diagnostic showed as 97 nulls), no
+                // PAC needed.
+                //
+                // Most slot consumers expect a non-auth pointer for __got
+                // and PAC-signed for __auth_got. If we patch __auth_got with
+                // a raw pointer, the consuming code's autda/autia will fail
+                // and trap. For now, skip __auth_got — we'll see how far we
+                // get with __got alone.
+                uint64_t *slot = &slots[e];
+                uint64_t cur = *slot;
+                // arm64e standard ABI for cross-image __auth_got slots:
+                //   key=IA (0), addrDiv=1, diversity=0
+                // The modifier becomes blend(slot_addr, 0) = slot_addr (low 48
+                // bits). Consumer uses `ldraa x16, [slot]` which auths with
+                // this exact modifier, then branches.
+                if (is_auth) {
+                    if (getenv("MACWS_GOT_SKIP_AUTH")) continue;
+                    if (!getenv("MACWS_GOT_RAW_AUTH")) {
+                        uint64_t mod = (uint64_t)slot & 0xFFFFFFFFFFFFull;
+                        value = macws_pac_sign(value, mod, 0);  // key=IA
+                    }
+                }
+                if (cur == 0) {
+                    ModifyExecutableRegion(slot, sizeof(uint64_t), ^{
+                        *slot = value;
+                    });
+                    patched++;
+                    if (patched < 12) {
+                        fprintf(stderr, "####   bind[%d] %s -> %p (slot=%p auth=%d)\n",
+                            patched, name, resolved, slot, is_auth);
+                    }
+                    // Dump IOGPU-related symbols specifically — these are the
+                    // pool allocator helpers we need to know about.
+                    if (strstr(name, "IOGPU") || strstr(name, "iogpu") ||
+                        strstr(name, "MetalCommon") || strstr(name, "PoolAlloc") ||
+                        strstr(name, "Pool") || strstr(name, "Heap")) {
+                        fprintf(stderr, "####   IOGPU-CRITICAL %s = %p (slot=%p auth=%d)\n",
+                            name, resolved, slot, is_auth);
+                    }
+                }
+            }
+        }
+    }
+    fprintf(stderr, "#### MACWS_GOT %s: indirect_slots=%d patched=%d failed=%d\n",
+        image_name, total_indirect_slots, patched, failed);
+}
+
+static void macws_walk_chained_fixups(const struct mach_header_64 *header,
+                                      intptr_t slide,
+                                      const char *image_name) {
+    // 1) Find LC_DYLD_CHAINED_FIXUPS load command and __LINKEDIT segment base
+    const struct linkedit_data_command *fixups_cmd = NULL;
+    uint64_t linkedit_vmaddr = 0;
+    uint64_t linkedit_fileoff = 0;
+    const struct load_command *cmd = (const struct load_command *)((const uint8_t *)header + sizeof(*header));
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        if (cmd->cmd == LC_DYLD_CHAINED_FIXUPS) {
+            fixups_cmd = (const struct linkedit_data_command *)cmd;
+        } else if (cmd->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sc = (const struct segment_command_64 *)cmd;
+            if (strcmp(sc->segname, "__LINKEDIT") == 0) {
+                linkedit_vmaddr  = sc->vmaddr;
+                linkedit_fileoff = sc->fileoff;
+            }
+        }
+        cmd = (const struct load_command *)((const uint8_t *)cmd + cmd->cmdsize);
+    }
+    if (!fixups_cmd) {
+        // No LC_DYLD_CHAINED_FIXUPS — the binary was loaded from
+        // dyld_shared_cache, whose builder strips fixup info and pre-fills
+        // the __got. When dlopen'd standalone, __got entries stay null.
+        // Fall back to: walk indirect symbol table + LC_SYMTAB to recover
+        // symbol names for each __got slot, dlsym, write back.
+        macws_repair_got_via_symtab(header, slide, image_name);
+        return;
+    }
+    if (!linkedit_vmaddr) {
+        fprintf(stderr, "#### MACWS_FIXUP %s: no __LINKEDIT segment\n", image_name);
+        return;
+    }
+    // dataoff is a FILE offset within __LINKEDIT; runtime addr = linkedit
+    // vmaddr + slide + (dataoff - linkedit_fileoff).
+    const uint8_t *fixups = (const uint8_t *)(linkedit_vmaddr + slide +
+                                               ((int64_t)fixups_cmd->dataoff - (int64_t)linkedit_fileoff));
+    const struct dyld_chained_fixups_header *fh =
+        (const struct dyld_chained_fixups_header *)fixups;
+    fprintf(stderr, "#### MACWS_FIXUP %s: header v=%u imports=%u fmt=%u sym_fmt=%u\n",
+        image_name, fh->fixups_version, fh->imports_count,
+        fh->imports_format, fh->symbols_format);
+
+    const char *symbols = (const char *)(fixups + fh->symbols_offset);
+
+    // Helper: resolve symbol name for an import index, given imports format.
+    const void *imports_base = fixups + fh->imports_offset;
+    typedef const char *(*import_name_t)(const void *imports_base, uint32_t idx);
+    const char *(^get_import_name)(uint32_t) = ^const char *(uint32_t idx) {
+        switch (fh->imports_format) {
+            case DYLD_CHAINED_IMPORT: {
+                const struct dyld_chained_import *imp =
+                    (const struct dyld_chained_import *)imports_base;
+                return symbols + imp[idx].name_offset;
+            }
+            case DYLD_CHAINED_IMPORT_ADDEND: {
+                const struct dyld_chained_import_addend *imp =
+                    (const struct dyld_chained_import_addend *)imports_base;
+                return symbols + imp[idx].name_offset;
+            }
+            case DYLD_CHAINED_IMPORT_ADDEND64: {
+                const struct dyld_chained_import_addend64 *imp =
+                    (const struct dyld_chained_import_addend64 *)imports_base;
+                return symbols + imp[idx].name_offset;
+            }
+        }
+        return "<unknown_format>";
+    };
+
+    // 2) Walk starts_in_image → starts_in_segment → chains
+    const struct dyld_chained_starts_in_image *starts =
+        (const struct dyld_chained_starts_in_image *)(fixups + fh->starts_offset);
+
+    int total_binds = 0, patched_binds = 0, failed_binds = 0;
+    int auth_binds = 0, non_auth_binds = 0;
+    for (uint32_t s = 0; s < starts->seg_count; s++) {
+        uint32_t seg_off = starts->seg_info_offset[s];
+        if (!seg_off) continue;
+        const struct dyld_chained_starts_in_segment *seg =
+            (const struct dyld_chained_starts_in_segment *)((const uint8_t *)starts + seg_off);
+        if (seg->pointer_format != DYLD_CHAINED_PTR_ARM64E &&
+            seg->pointer_format != DYLD_CHAINED_PTR_ARM64E_USERLAND &&
+            seg->pointer_format != DYLD_CHAINED_PTR_ARM64E_USERLAND24 &&
+            seg->pointer_format != DYLD_CHAINED_PTR_64 &&
+            seg->pointer_format != DYLD_CHAINED_PTR_64_OFFSET) {
+            fprintf(stderr, "#### MACWS_FIXUP seg[%u] unsupported pointer_format=%u\n",
+                s, seg->pointer_format);
+            continue;
+        }
+        for (uint16_t p = 0; p < seg->page_count; p++) {
+            uint16_t page_start = seg->page_start[p];
+            if (page_start == DYLD_CHAINED_PTR_START_NONE) continue;
+            uint64_t page_va = (uint64_t)header + seg->segment_offset + (uint64_t)p * seg->page_size;
+            uint64_t chain_va = page_va + page_start;
+            for (;;) {
+                uint64_t *slot = (uint64_t *)chain_va;
+                uint64_t raw = *slot;
+                int is_bind = 0, is_auth = 0;
+                uint32_t ordinal = 0;
+                uint16_t diversity = 0;
+                uint8_t key = 0;
+                uint8_t addrDiv = 0;
+                uint32_t next = 0;
+
+                if (seg->pointer_format == DYLD_CHAINED_PTR_ARM64E ||
+                    seg->pointer_format == DYLD_CHAINED_PTR_ARM64E_USERLAND ||
+                    seg->pointer_format == DYLD_CHAINED_PTR_ARM64E_USERLAND24) {
+                    is_bind = (raw >> 62) & 1;
+                    is_auth = (raw >> 63) & 1;
+                    if (seg->pointer_format == DYLD_CHAINED_PTR_ARM64E_USERLAND24 && is_bind) {
+                        ordinal = raw & 0xFFFFFF;
+                        next = (raw >> 51) & 0x7FF;
+                    } else if (is_bind) {
+                        ordinal = raw & 0xFFFF;
+                        next = (raw >> 51) & 0x7FF;
+                    } else {
+                        next = (raw >> 51) & 0x7FF;
+                    }
+                    if (is_auth && is_bind) {
+                        diversity = (raw >> 32) & 0xFFFF;
+                        addrDiv = (raw >> 48) & 1;
+                        key = (raw >> 49) & 3;
+                    } else if (is_auth) {
+                        diversity = (raw >> 32) & 0xFFFF;
+                        addrDiv = (raw >> 48) & 1;
+                        key = (raw >> 49) & 3;
+                    }
+                } else { // DYLD_CHAINED_PTR_64 / _64_OFFSET
+                    is_bind = (raw >> 63) & 1;
+                    next = (raw >> 51) & 0xFFF;
+                    if (is_bind) {
+                        ordinal = raw & 0xFFFFFF;
+                    }
+                }
+
+                if (is_bind) {
+                    total_binds++;
+                    if (is_auth) auth_binds++; else non_auth_binds++;
+                    if (ordinal < fh->imports_count) {
+                        const char *name = get_import_name(ordinal);
+                        if (name && name[0]) {
+                            // dlsym wants the name without the leading underscore.
+                            const char *lookup = name;
+                            if (lookup[0] == '_') lookup++;
+                            void *resolved = dlsym(RTLD_DEFAULT, lookup);
+                            if (resolved) {
+                                uint64_t value = (uint64_t)resolved;
+                                if (is_auth) {
+                                    uint64_t mod = addrDiv
+                                        ? macws_ptr_blend((uint64_t)slot, diversity)
+                                        : (uint64_t)diversity;
+                                    value = macws_pac_sign(value, mod, key);
+                                }
+                                ModifyExecutableRegion(slot, sizeof(uint64_t), ^{
+                                    *slot = value;
+                                });
+                                patched_binds++;
+                                if (patched_binds < 6) {
+                                    fprintf(stderr,
+                                        "####   bind[%d] %s -> %p (auth=%d key=%d div=%#x addrDiv=%d)\n",
+                                        patched_binds, name, resolved, is_auth, key,
+                                        diversity, addrDiv);
+                                }
+                            } else {
+                                failed_binds++;
+                                if (failed_binds < 6) {
+                                    fprintf(stderr,
+                                        "####   bind FAIL %s — dlsym NULL\n", name);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (next == 0) break;
+                uint32_t stride = (seg->pointer_format == DYLD_CHAINED_PTR_64 ||
+                                   seg->pointer_format == DYLD_CHAINED_PTR_64_OFFSET) ? 4 : 8;
+                chain_va += (uint64_t)next * stride;
+            }
+        }
+    }
+    fprintf(stderr, "#### MACWS_FIXUP %s: walked binds=%d (auth=%d non-auth=%d) patched=%d failed=%d\n",
+        image_name, total_binds, auth_binds, non_auth_binds, patched_binds, failed_binds);
+}
+
+// SkyLight `MetalIOSurfaceBacking::PrepareForUse(MetalContext*, unsigned long
+// long)` tolerate-nil hook. See loadImageCallback for full rationale.
+typedef int (*PrepareForUse_t)(void *self, void *ctx, unsigned long long arg);
+static PrepareForUse_t orig_skylight_prepare_for_use = NULL;
+static int hooked_skylight_prepare_for_use(void *self, void *ctx,
+                                           unsigned long long arg) {
+    if (ctx) {
+        // MetalContext+0x1c0 is a single-byte "tolerate-nil-texture" flag
+        // (ldrb w8 at the abort-decision site). SkyLight returns 0 from
+        // PrepareForUse silently when the flag is set; aborts when it's 0.
+        *((volatile uint8_t *)ctx + 0x1c0) = 1;
+    }
+    return orig_skylight_prepare_for_use(self, ctx, arg);
+}
+
+// SkyLight `MetalContext::StartCompositeForDisplayStream(id<MTLTexture>,
+// id<MTLTexture>, MTLLoadAction, MTLStoreAction)` — asserts target_attachment_0
+// != nil at MetalContext.mm:627. When the CA Framebuffer texture cascade from
+// PrepareForUse leaves the display-stream target as nil, this asserts. Hook to
+// early-return 0 (skip this composite frame) instead of aborting.
+typedef int (*StartCompositeForDisplayStream_t)(void *self, id target0, id target1,
+                                                 unsigned long load_action,
+                                                 unsigned long store_action);
+static StartCompositeForDisplayStream_t orig_skylight_start_composite_ds = NULL;
+static int hooked_skylight_start_composite_ds(void *self, id target0, id target1,
+                                              unsigned long load_action,
+                                              unsigned long store_action) {
+    if (!target0) {
+        static int skipped = 0;
+        if (skipped < 3) {
+            fprintf(stderr, "#### SkyLight StartCompositeForDisplayStream: target0=nil, skip\n");
+            skipped++;
+        }
+        return 0;
+    }
+    return orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
+}
+
+// SkyLight `WSCompositeDestinationCreateWithMetalTexture(MetalContext*, MTLTexture*, ...)`
+// — asserts texture != nil at CompositeDestinationMetal.mm:165. Called directly
+// from SLCADisplay::render_update without going through MetalIOSurfaceBacking
+// (so PrepareForUse tolerate-nil doesn't help). Hook to return NULL early if
+// texture arg is nil — caller in render_update tolerates a NULL destination
+// (it's the SAME pattern the function uses internally when CGRect is empty).
+typedef void *(*WSCompositeDestinationCreateWithMetalTexture_t)(
+    void *ctx, id texture, void *protectionOptions, void *colorspace, void *region);
+static WSCompositeDestinationCreateWithMetalTexture_t orig_skylight_wsccd_with_tex = NULL;
+static void *hooked_skylight_wsccd_with_tex(void *ctx, id texture, void *protectionOptions,
+                                            void *colorspace, void *region) {
+    if (!texture) {
+        static int nil_count = 0;
+        if (nil_count < 4) {
+            fprintf(stderr, "#### SkyLight WSCompositeDestinationCreateWithMetalTexture: texture=nil, return NULL\n");
+            nil_count++;
+        }
+        return NULL;
+    }
+    return orig_skylight_wsccd_with_tex(ctx, texture, protectionOptions, colorspace, region);
+}
+
+static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *header) {
+    MSImageRef sl = MSGetImageByName(SkyLightPath);
+    if (!sl) {
+        fprintf(stderr, "#### SkyLight tolerate-nil hooks: image not loadable, skipped\n");
+        return;
+    }
+    void *sym1 = MSFindSymbol(sl,
+        "__ZN21MetalIOSurfaceBacking13PrepareForUseEP12MetalContexty");
+    if (sym1) {
+        MSHookFunction(sym1, (void *)hooked_skylight_prepare_for_use,
+                       (void **)&orig_skylight_prepare_for_use);
+        fprintf(stderr, "#### SkyLight PrepareForUse tolerate-nil hook installed at %p\n", sym1);
+    } else {
+        fprintf(stderr, "#### SkyLight PrepareForUse: symbol not found, skipped\n");
+    }
+    void *sym2 = MSFindSymbol(sl,
+        "__ZN12MetalContext30StartCompositeForDisplayStreamEPU21objcproto10MTLTexture11objc_objectS1_13MTLLoadAction14MTLStoreAction");
+    if (sym2) {
+        MSHookFunction(sym2, (void *)hooked_skylight_start_composite_ds,
+                       (void **)&orig_skylight_start_composite_ds);
+        fprintf(stderr, "#### SkyLight StartCompositeForDisplayStream nil-skip hook installed at %p\n", sym2);
+    } else {
+        fprintf(stderr, "#### SkyLight StartCompositeForDisplayStream: symbol not found, skipped\n");
+    }
+    void *sym3 = MSFindSymbol(sl, "_WSCompositeDestinationCreateWithMetalTexture");
+    if (sym3) {
+        MSHookFunction(sym3, (void *)hooked_skylight_wsccd_with_tex,
+                       (void **)&orig_skylight_wsccd_with_tex);
+        fprintf(stderr, "#### SkyLight WSCompositeDestinationCreateWithMetalTexture nil-tolerate hook installed at %p\n", sym3);
+    } else {
+        fprintf(stderr, "#### SkyLight WSCompositeDestinationCreateWithMetalTexture: symbol not found, skipped\n");
+    }
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
     dladdr(header, &info);
@@ -176,6 +648,27 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // empty textures (no GPU content) — VNC would show blank. The correct fix is the
             // BSS pool allocator shim in the AGXMetal13_3 branch below (see MACWS_AGX_BSS_SHIM).
         }
+
+        // Tolerate-nil texture in MetalIOSurfaceBacking::PrepareForUse
+        //
+        // RE'd via live lldb on WS PID 4218: PrepareForUse calls
+        // [device newTextureWithDescriptor:iosurface:plane:] at +340. If the
+        // result is nil (cbz at +352 → +484), the function loads a flag from
+        // MetalContext+0x1c0 (ldrb w8 at +484), and if w8 == 0 calls
+        // MetalBacking::AbortWithTextureInfo at +512 — killing WS.
+        //
+        // SkyLight already ships a "tolerate-nil" code path at +492 (mov w0,#0;
+        // ret 0) that fires when MetalContext+0x1c0 is non-zero. The hook here
+        // sets that byte to 1 before %orig, so SkyLight's own fallback runs
+        // instead of the abort. No instruction patching, no NOP cascade — we
+        // just flip the flag SkyLight already checks.
+        //
+        // The CA Framebuffer 2388×1668 '&b38' compressed IOSurface returns nil
+        // from MTLSim AND from AGXG13GFamilyDevice. Other surfaces (blur
+        // scratchpads, normal app windows) wrap fine. Tolerating nil for the
+        // specific failing surface keeps WS alive and lets blur scratchpad
+        // textures (which DO succeed) run normally.
+        install_skylight_prepare_for_use_tolerate_nil_hook((const void *)header);
 
         // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
@@ -337,17 +830,26 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 
         // FIX 1: setupDeferred outer — patch b.ne at +0x64 to NOP so we fall through
         // to the epilogue without ever calling dispatch_once.
+        // Gated: when MACWS_AGX_KEEP_SETUPDEFERRED=1 (paired with KEEP_LAMBDA
+        // and IOGPU preload), let setupDeferred's dispatch_once actually run so
+        // the mempools are properly initialized. Without that, even though the
+        // lambda's IOGPU call works, mempool state is empty and grow's memmove
+        // copies from a NULL/garbage source.
         int setup_patched = 0;
-        for (size_t i = 0; i + 4 < n && setup_patched < 1; i++) {
-            if (text32[i] == 0xb100051f && text32[i+1] == 0x54000081 &&
-                text32[i+2] == 0xa9437bfd && text32[i+3] == 0x910103ff &&
-                text32[i+4] == 0xd65f0fff) {
-                ModifyExecutableRegion(&text32[i+1], sizeof(uint32_t), ^{
-                    text32[i+1] = 0xd503201f; // NOP
-                });
-                fprintf(stderr, "#### MACWS_AGX_NATIVE setupDeferred dispatch_once skipped at text+%#zx\n", i*4);
-                setup_patched++;
+        if (!getenv("MACWS_AGX_KEEP_SETUPDEFERRED")) {
+            for (size_t i = 0; i + 4 < n && setup_patched < 1; i++) {
+                if (text32[i] == 0xb100051f && text32[i+1] == 0x54000081 &&
+                    text32[i+2] == 0xa9437bfd && text32[i+3] == 0x910103ff &&
+                    text32[i+4] == 0xd65f0fff) {
+                    ModifyExecutableRegion(&text32[i+1], sizeof(uint32_t), ^{
+                        text32[i+1] = 0xd503201f; // NOP
+                    });
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE setupDeferred dispatch_once skipped at text+%#zx\n", i*4);
+                    setup_patched++;
+                }
             }
+        } else {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE setupDeferred dispatch_once KEPT (MACWS_AGX_KEEP_SETUPDEFERRED=1)\n");
         }
 
         // FIX 2: All 4 Mempool<...>::grow variants share a structural signature in
@@ -371,8 +873,45 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             0x1e564d640, // Mempool<32,0,true, uint64_t>::grow
         };
         int grow_patched = 0;
+        int lambda_patched = 0;
         for (int g = 0; g < 4; g++) {
             uint32_t *grow = (uint32_t *)(grows_static[g] + slide);
+
+            // FIX 2a: NOP the lambda BL — only if MACWS_AGX_KEEP_LAMBDA is
+            // NOT set. Setting MACWS_AGX_KEEP_LAMBDA=1 lets the real lambda
+            // run (requires IOGPU to be pre-loaded — see Metal_hooks.x
+            // getMetalPluginClassForService hook). With the lambda running,
+            // Mempool::grow actually populates its freelist, and downstream
+            // texture creation can succeed instead of returning nil.
+            //
+            // Pre-NOP rationale: BN decompile of the
+            // Mempool<...ImageStateEncoderGen6...>::grow shows the first
+            // instruction-block calls a lambda at +0x28; the lambda tail-jumps
+            // to data_21f95bc90 (cross-image IOGPU pool allocator BSS slot).
+            // If IOGPU bindings aren't resolved (chroot dyld doesn't auto-bind
+            // when AGXMetal is dlopen'd standalone) the lambda crashes in
+            // memmove via a garbage function pointer.
+            if (!getenv("MACWS_AGX_KEEP_LAMBDA")) {
+                for (int i = 0; i < 24; i++) {
+                    uint32_t insn = grow[i];
+                    if ((insn & 0xFC000000) == 0x94000000) {  // BL imm26
+                        int32_t imm26 = (int32_t)(insn & 0x03FFFFFF);
+                        if (imm26 & 0x02000000) imm26 |= 0xFC000000;
+                        int64_t bl_off = (int64_t)imm26 * 4;
+                        if (bl_off <= 0) continue;
+                        ModifyExecutableRegion(&grow[i], sizeof(uint32_t), ^{
+                            grow[i] = 0xd503201f;  // NOP
+                        });
+                        fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d lambda BL@+%#x NOPed (target +%#llx)\n",
+                            g, i*4, (long long)((i*4) + bl_off));
+                        lambda_patched++;
+                        break;
+                    }
+                }
+            } else {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d lambda BL kept (MACWS_AGX_KEEP_LAMBDA=1)\n", g);
+            }
+
             // Find the cmp/b.hs site first.
             int bhs_idx = -1;
             for (int i = 0; i < 64; i++) {
@@ -415,13 +954,99 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 g, (unsigned long long)grows_static[g], bhs_idx*4, epi_idx*4, (long long)off_bytes);
             grow_patched++;
         }
-        fprintf(stderr, "#### MACWS_AGX_NATIVE patches: setupDeferred=%d grows=%d\n",
-            setup_patched, grow_patched);
+        fprintf(stderr, "#### MACWS_AGX_NATIVE patches: setupDeferred=%d grows=%d lambdas=%d\n",
+            setup_patched, grow_patched, lambda_patched);
+
+        // Walk LC_DYLD_CHAINED_FIXUPS and patch each null import bind by
+        // resolving the symbol via dlsym(RTLD_DEFAULT). This repairs the
+        // cross-image bindings that chroot dyld failed to resolve at load
+        // time (especially IOGPU symbols). After this runs, the lambda in
+        // Mempool::grow can safely tail-call its target.
+        macws_walk_chained_fixups((const struct mach_header_64 *)header, vmaddr_slide, "AGXMetal13_3");
+
+        // Diagnostic: enumerate __auth_got entries and report how many are null.
+        // If null entries are present → cross-image binding failed in chroot dyld
+        // and we'd need the chained-fixup walker to repair. If all are populated
+        // → binding worked and the lambda crash is from a different cause.
+        unsigned long auth_got_sz = 0;
+        uint64_t *auth_got = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+            "__DATA_CONST", "__auth_got", &auth_got_sz);
+        if (!auth_got) {
+            auth_got = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+                "__DATA", "__auth_got", &auth_got_sz);
+        }
+        if (auth_got) {
+            size_t entries = auth_got_sz / 8;
+            int nulls = 0, nonnull = 0;
+            for (size_t i = 0; i < entries; i++) {
+                if (auth_got[i] == 0) nulls++;
+                else nonnull++;
+            }
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __auth_got: %zu entries, %d null, %d non-null\n",
+                entries, nulls, nonnull);
+            // Dump first 8 entries
+            for (size_t i = 0; i < entries && i < 8; i++) {
+                fprintf(stderr, "####   auth_got[%zu] @%p = 0x%016llx\n",
+                    i, (void *)&auth_got[i], (unsigned long long)auth_got[i]);
+            }
+        } else {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __auth_got section NOT FOUND\n");
+        }
+        unsigned long got_sz = 0;
+        uint64_t *got = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+            "__DATA_CONST", "__got", &got_sz);
+        if (!got) {
+            got = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
+                "__DATA", "__got", &got_sz);
+        }
+        if (got) {
+            size_t entries = got_sz / 8;
+            int nulls = 0, nonnull = 0;
+            for (size_t i = 0; i < entries; i++) {
+                if (got[i] == 0) nulls++;
+                else nonnull++;
+            }
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __got: %zu entries, %d null, %d non-null\n",
+                entries, nulls, nonnull);
+        } else {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE __got section NOT FOUND\n");
+        }
     }
 }
 
 __attribute__((constructor)) void InitStuff() {
     EnableJIT();
+
+    // Pre-load IOGPU BEFORE Metal.framework speculatively loads AGXMetal13_3.
+    // AGXMetal13_3 has cross-image GOT entries that reference IOGPU symbols
+    // (the pool allocator, IOGPUMetalResource helpers, ...). If IOGPU is not
+    // yet in the address space when dyld binds AGXMetal13_3, those slots
+    // resolve to null/<unresolved>. A later dlopen of IOGPU does NOT trigger
+    // a re-bind, so the slots stay broken and AGX::Mempool::grow's lambda
+    // tail-jumps into garbage (SIGSEGV at addr 0x30, see memory note
+    // agx-mempool-grow-fault-decomposed). Doing this in the constructor
+    // (instead of in the getMetalPluginClassForService hook) guarantees IOGPU
+    // is bound before Metal touches AGXMetal13_3.
+    if (getenv("MACWS_AGX_NATIVE")) {
+        const char *iogpuPaths[] = {
+            "/System/Library/PrivateFrameworks/IOGPU.framework/IOGPU",
+            "/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU",
+            NULL
+        };
+        void *iogpu = NULL;
+        for (int i = 0; iogpuPaths[i]; i++) {
+            iogpu = dlopen(iogpuPaths[i], RTLD_GLOBAL | RTLD_NOW);
+            if (iogpu) {
+                fprintf(stderr, "#### MACWS_AGX_NATIVE [ctor] pre-loaded IOGPU via %s -> %p\n",
+                    iogpuPaths[i], iogpu);
+                break;
+            }
+        }
+        if (!iogpu) {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE [ctor] could NOT pre-load IOGPU: %s\n", dlerror());
+        }
+    }
+
     _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))loadImageCallback);
 }
 
@@ -632,13 +1257,92 @@ kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
 
-// NOTE: IOSurfaceCreate is intentionally NOT interposed. The IOSurfaceCreate_new hook
-// (compression-rewrite + property logging) was a diagnostic dead-end (compression was a
-// red herring; the real window-content fix is the QuartzCore CABackingStorePrepareUpdates_
-// +812 patch in loadImageCallback). Worse, it CRASHED CoreImage-using apps (Terminal):
-// CoreImage calls IOSurfaceCreate with a properties dict whose objectForKey: access PAC-
-// faulted in the hook (EXC_BAD_ACCESS in IOSurfaceCreate_new <- CIImage). Leave the real
-// IOSurfaceCreate untouched.
+// Tightly-scoped IOSurfaceCreate interposer — only rewrites SkyLight's "CA
+// Framebuffer" 2-plane Apple-GPU-compressed BGRA10_XR surface (FourCC '&b38' /
+// 0x26623338). Without rewrite, MTLSimDriverHost cannot wrap this IOSurface in
+// any iOS-Metal-accepted MTLPixelFormat (we tried 552/553/94/90/80/81 — all NIL),
+// so SkyLight asserts on its compositor destination and WS dies on every frame.
+//
+// The previous wide-scope rewrite crashed CoreImage-using apps (Terminal) because
+// IOSurfaceCreate_new called -objectForKey: on a dict that turned out to be a
+// non-NSDictionary CFType — PAC fault. We now (a) typecheck the input via
+// CFGetTypeID == CFDictionaryGetTypeID, and (b) gate the rewrite on the
+// IOSurfaceName key being EXACTLY "CA Framebuffer" plus the FourCC's high byte
+// being 0x26 (Apple compression marker), which excludes every other surface.
+IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
+    if (getenv("MACWS_IOSURF_TRACE") != NULL) {
+        fprintf(stderr, "#### IOSURF_HOOK call cf=%p\n", (void *)properties_cf);
+    }
+    if (!properties_cf) {
+        return IOSurfaceCreate((NSDictionary *)properties_cf);
+    }
+    // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
+    // real NSDictionary bridge — fall back to the raw CFDictionaryGetValue.
+    if (CFGetTypeID(properties_cf) != CFDictionaryGetTypeID()) {
+        return IOSurfaceCreate((NSDictionary *)properties_cf);
+    }
+    CFNumberRef pfNum = (CFNumberRef)CFDictionaryGetValue(properties_cf,
+        (const void *)CFSTR("IOSurfacePixelFormat"));
+    uint32_t pf = 0;
+    if (pfNum && CFGetTypeID(pfNum) == CFNumberGetTypeID()) {
+        CFNumberGetValue(pfNum, kCFNumberSInt32Type, &pf);
+    }
+    BOOL is_apple_compressed = ((pf & 0xFF000000u) == 0x26000000u);
+    CFStringRef name = (CFStringRef)CFDictionaryGetValue(properties_cf,
+        (const void *)CFSTR("IOSurfaceName"));
+    BOOL is_ca_fb = NO;
+    if (name && CFGetTypeID(name) == CFStringGetTypeID()) {
+        is_ca_fb = (CFStringCompare(name, CFSTR("CA Framebuffer"), 0) == kCFCompareEqualTo);
+    }
+    if (!(is_apple_compressed && is_ca_fb)) {
+        return IOSurfaceCreate((NSDictionary *)properties_cf);
+    }
+    // Rebuild as plain BGRA8 — drop the compression-metadata plane and the
+    // private FourCC so MTLSimDriverHost can wrap it as MTLPixelFormatBGRA8Unorm.
+    CFNumberRef wNum = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceWidth"));
+    CFNumberRef hNum = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceHeight"));
+    int w = 0, h = 0;
+    if (wNum && CFGetTypeID(wNum) == CFNumberGetTypeID()) CFNumberGetValue(wNum, kCFNumberSInt32Type, &w);
+    if (hNum && CFGetTypeID(hNum) == CFNumberGetTypeID()) CFNumberGetValue(hNum, kCFNumberSInt32Type, &h);
+    if (w <= 0 || h <= 0) {
+        return IOSurfaceCreate((NSDictionary *)properties_cf);
+    }
+    const int bpe = 4;                         // BGRA8 = 4 bytes/pixel
+    size_t bytesPerRow = (size_t)w * (size_t)bpe;
+    // Align to 64 bytes (typical Apple GPU stride alignment)
+    bytesPerRow = (bytesPerRow + 63u) & ~63ul;
+    size_t planeSize = bytesPerRow * (size_t)h;
+    NSMutableDictionary *np = [NSMutableDictionary dictionary];
+    np[@"IOSurfaceWidth"]  = @(w);
+    np[@"IOSurfaceHeight"] = @(h);
+    np[@"IOSurfacePixelFormat"] = @((unsigned int)'BGRA');   // 0x42475241
+    np[@"IOSurfaceBytesPerElement"] = @(bpe);
+    np[@"IOSurfaceBytesPerRow"] = @(bytesPerRow);
+    np[@"IOSurfaceAllocSize"] = @(planeSize);
+    np[@"IOSurfaceCacheMode"] = @0;
+    np[@"IOSurfacePixelSizeCastingAllowed"] = @0;
+    np[@"IOSurfaceName"] = @"CA Framebuffer";  // preserve identity
+    // Carry CAWindowServerSurface so SkyLight still treats it as the compositor target.
+    CFNumberRef wsFlag = (CFNumberRef)CFDictionaryGetValue(properties_cf,
+        (const void *)CFSTR("CAWindowServerSurface"));
+    if (wsFlag) np[@"CAWindowServerSurface"] = (__bridge id)wsFlag;
+    np[@"IOSurfacePlaneInfo"] = @[ @{
+        @"IOSurfacePlaneWidth": @(w),
+        @"IOSurfacePlaneHeight": @(h),
+        @"IOSurfacePlaneBytesPerRow": @(bytesPerRow),
+        @"IOSurfacePlaneBytesPerElement": @(bpe),
+        @"IOSurfacePlaneElementWidth": @1,
+        @"IOSurfacePlaneElementHeight": @1,
+        @"IOSurfacePlaneOffset": @0,
+        @"IOSurfacePlaneSize": @(planeSize),
+        @"IOSurfaceAddressFormat": @0,
+    } ];
+    IOSurfaceRef result = IOSurfaceCreate(np);
+    fprintf(stderr, "#### IOSURF/CA_FB rewrote %dx%d pf=0x%x->BGRA8 result=%p\n",
+        w, h, pf, (void *)result);
+    return result;
+}
+DYLD_INTERPOSE(IOSurfaceCreate_safe, IOSurfaceCreate);
 
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
