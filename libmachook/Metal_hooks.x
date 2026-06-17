@@ -191,8 +191,10 @@ static void macws_dispatchThreadsPerTile_impl(id self, SEL _cmd, void *sizeArg) 
 
     // Try the XPC forward: pick up the source (cached in setTileTexture[0])
     // and destination (cached in newRenderCommandEncoderWithDescriptor hook).
-    id<MTLTexture> srcTex = objc_getAssociatedObject(self, MACWS_SRC_TEX_KEY);
-    id<MTLTexture> dstTex = objc_getAssociatedObject(self, MACWS_DST_TEX_KEY);
+    // MACWS_BLUR_XPC=1 enables — default off so the synchronous reply wait
+    // can't hang WS if MTLSimDriverHost doesn't publish the listener.
+    id<MTLTexture> srcTex = getenv("MACWS_BLUR_XPC") ? objc_getAssociatedObject(self, MACWS_SRC_TEX_KEY) : nil;
+    id<MTLTexture> dstTex = getenv("MACWS_BLUR_XPC") ? objc_getAssociatedObject(self, MACWS_DST_TEX_KEY) : nil;
     if (srcTex && dstTex) {
         IOSurfaceRef srcSurf = NULL, dstSurf = NULL;
         @try { srcSurf = [srcTex iosurface]; } @catch (NSException *e) {}
