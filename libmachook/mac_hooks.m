@@ -1793,33 +1793,43 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 if (m_full) {
                     IMP orig_full = method_getImplementation(m_full);
                     IMP trace_full = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long align, unsigned long opt, int subDis, void *resInArgs, void *pinned) {
-                        // FIX: small AGXBuffer allocs (used by AGX::Mempool::grow
-                        // lambda for ImageStateEncoderGen6 freelist columns)
-                        // fail because the IOGPU sub-resource creation rejects
-                        // align=1 small buffers (sel=0xa → 0xe00002c2). Forcing
-                        // suballocDisabled=1 routes through individual heap
-                        // alloc, which works for both small and large sizes.
-                        // This affects ONLY chroot, where IOGPU suballoc rejects
-                        // the small element layout — macOS-native devices have
-                        // the parent heap pre-initialized so sub-element creation
-                        // succeeds.
+                        // iOS IOGPU's kernel sub-resource creation rejects
+                        // align=1 with kIOReturnExclusiveAccess (0xe00002c2)
+                        // for every length tier — Mempool::grow's freelist
+                        // columns (len=64/384), QuartzCore staging buffers
+                        // (len=8192), MetalContext scratch (len=131072), …
+                        // all fail in chroot with align=1. Forcing align=64 +
+                        // isSuballocDisabled=1 routes through the standalone-
+                        // heap branch which the kernel accepts at any size.
+                        // Confirmed 2026-06-18 by side-by-side trace.
+                        //
+                        // Side effect: the standalone branch creates a fresh
+                        // heap, so each align=1 AGXBuffer now pays a heap-
+                        // alloc syscall instead of a sub-resource slot from
+                        // an existing heap. That's a slowdown but not a
+                        // correctness issue for chroot WS.
                         int subDis_eff = subDis;
                         unsigned long align_eff = align;
-                        // IOGPU sub-resource creation rejects every align≤1
-                        // request with kIOReturnExclusiveAccess (sel=0xa →
-                        // 0xe00002c2) in the chroot. Force suballocDisabled=1
-                        // to take the heap-direct allocation branch which
-                        // works at any length. Tighten alignment to 64 (the
-                        // AGX hardware min) so the heap allocator doesn't
-                        // round down to 0.
                         if (align <= 1) {
-                            subDis_eff = 1;
                             align_eff = 64;
+                            // isSuballocDisabled=1 routes through standalone-
+                            // heap branch which the kernel accepts for any
+                            // size when align=1 in chroot. BUT for medium-
+                            // large lengths (>= 64KB) the standalone branch
+                            // ends up using the device's small default heap
+                            // (clientID 0x4000, 4KB) as parent and the
+                            // sub-resource creation fails because the parent
+                            // is too small. The medium/large align=1 callers
+                            // (QuartzCore staging buffers) work fine with
+                            // subDis=0 + align=64 because macOS's normal
+                            // sub-resource path picks the right big heap.
+                            // Cap the subDis=1 forcing at len<64KB.
+                            if (len < 0x10000) subDis_eff = 1;
                         }
                         id r = ((id (*)(id, SEL, id, unsigned long, unsigned long, unsigned long, int, void *, void *))orig_full)(
                             self, initFull, dev, len, align_eff, opt, subDis_eff, resInArgs, pinned);
                         if (!r && (subDis_eff != subDis || align_eff != align)) {
-                            // Retry with original args if our forced path failed
+                            // Forced path failed; retry with original args.
                             r = ((id (*)(id, SEL, id, unsigned long, unsigned long, unsigned long, int, void *, void *))orig_full)(
                                 self, initFull, dev, len, align, opt, subDis, resInArgs, pinned);
                         }
