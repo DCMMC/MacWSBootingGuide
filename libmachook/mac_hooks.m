@@ -948,169 +948,35 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             });
         }
     } else if(getenv("MACWS_AGX_NATIVE") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
-        // CHROOT AGX-NATIVE: two-layer patch for the strict-AGX-native userspace path.
+        // CHROOT AGX-NATIVE patches for the strict-AGX-native userspace path.
         //
-        // ROOT CAUSE: when libmachook injected chroot processes dlopen AGXMetal13_3
-        // standalone (not via macOS dyld_shared_cache, which isn't activated for chroot),
-        // cross-image BSS function pointers stay null/zero (the IOGPU pool allocator at
-        // 0x21f95bc90 etc.). Mempool<...>::grow then runs its inline freelist-init
-        // believing the pool allocator populated [this+8]; *(NULL+8+0x18+0x18) faults
-        // at addr 0x30 (KERN_INVALID_ADDRESS).
+        // Originally three layered binary patches lived here:
         //
-        // FIX 1: Make -[setupDeferred] a no-op (skip the dispatch_once call that
-        // initializes per-encoder mempools en masse). This unblocks newCommandQueue.
-        // FIX 2: Patch each individual Mempool<...>::grow function — since textures
-        // also lazily call grow on their own — to skip its broken inline freelist loop.
-        // Both are pattern-based, version-stable signatures.
-
-        unsigned long text_sz = 0;
-        uint8_t *text = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &text_sz);
-        uint32_t *text32 = (uint32_t *)text;
-        size_t n = text_sz / 4;
-
-        // FIX 1: setupDeferred outer — patch b.ne at +0x64 to NOP so we fall through
-        // to the epilogue without ever calling dispatch_once.
-        // Gated: when MACWS_AGX_KEEP_SETUPDEFERRED=1 (paired with KEEP_LAMBDA
-        // and IOGPU preload), let setupDeferred's dispatch_once actually run so
-        // the mempools are properly initialized. Without that, even though the
-        // lambda's IOGPU call works, mempool state is empty and grow's memmove
-        // copies from a NULL/garbage source.
-        int setup_patched = 0;
-        if (!getenv("MACWS_AGX_KEEP_SETUPDEFERRED")) {
-            for (size_t i = 0; i + 4 < n && setup_patched < 1; i++) {
-                if (text32[i] == 0xb100051f && text32[i+1] == 0x54000081 &&
-                    text32[i+2] == 0xa9437bfd && text32[i+3] == 0x910103ff &&
-                    text32[i+4] == 0xd65f0fff) {
-                    ModifyExecutableRegion(&text32[i+1], sizeof(uint32_t), ^{
-                        text32[i+1] = 0xd503201f; // NOP
-                    });
-                    fprintf(stderr, "#### MACWS_AGX_NATIVE setupDeferred dispatch_once skipped at text+%#zx\n", i*4);
-                    setup_patched++;
-                }
-            }
-        } else {
-            fprintf(stderr, "#### MACWS_AGX_NATIVE setupDeferred dispatch_once KEPT (MACWS_AGX_KEEP_SETUPDEFERRED=1)\n");
-        }
-
-        // FIX 2: All 4 Mempool<...>::grow variants share a structural signature in
-        // the entry path: a `cmp w8, w<X>` followed by `b.hs +<off>` that branches
-        // PAST the broken init loop. We force the branch to be taken AND extend its
-        // target to the function epilogue (which is at a fixed pattern of
-        // ldp x29,x30 / [ldp x20,x19] / add sp,sp / retab).
+        //   1. NOP setupDeferred's dispatch_once  (b.ne at +0x64 → NOP)
+        //   2. NOP the first forward BL inside each Mempool<X>::grow (the lambda
+        //      that tail-jumps to the IOGPU pool allocator BSS slot)
+        //   3. Replace `b.hs +<off>` near grow's entry with an unconditional
+        //      `b epilogue` so the broken inline freelist loop is skipped
         //
-        // Simpler universal patch: at every `cmp w?, w?` followed by `b.hs +<off>`
-        // inside __text that lies between specific markers (entry pattern of
-        // Mempool::grow: `pacibsp / sub sp,sp,#0x40 / stp x20,x19,[sp,#0x20]`)
-        // — make the b.hs unconditional and use its existing target.
+        // All three existed because cross-image IOGPU bindings stayed null in
+        // chroot dyld — Mempool::grow's lambda then crashed dereferencing the
+        // garbage function pointer at data_21f95bc90.
         //
-        // For now, hardcode the 4 known grow function addresses and patch each.
+        // Those root causes have since been fixed by the chained-fixups walker
+        // (macws_walk_chained_fixups), the LC_SYMTAB-based GOT repair
+        // (macws_repair_got_via_symtab), the IOGPU ctor preload, and the
+        // sub_1e5a5dfc0 stub rewrite. Once IOGPU is bound, setupDeferred and
+        // grow's lambda both have to run — they're the only place
+        // _storageCreateParams.hwResourcePoolCount gets set, and without that
+        // commandBufferResourceInfo returns nil and DataBufferAllocator::
+        // newCommand crashes on a null base.
+        //
+        // Removed 2026-06-18 after auditing the patches.
         uint64_t text_static_base = 0x1e53e321c;
+        unsigned long text_sz = 0;
+        uint8_t *text = getsectiondata((const struct mach_header_64 *)header,
+                                       "__TEXT", "__text", &text_sz);
         intptr_t slide = (intptr_t)text - (intptr_t)text_static_base;
-        uint64_t grows_static[] = {
-            0x1e57236cc, // Mempool<16,0,true, ImageStateEncoderGen6>::grow
-            0x1e571c4f4, // Mempool<1024,28,false, SamplerStateEncoderGen4>::grow
-            0x1e55d1ff0, // Mempool<16,0,true, uint64_t>::grow
-            0x1e564d640, // Mempool<32,0,true, uint64_t>::grow
-        };
-        int grow_patched = 0;
-        int lambda_patched = 0;
-        for (int g = 0; g < 4; g++) {
-            uint32_t *grow = (uint32_t *)(grows_static[g] + slide);
-
-            // FIX 2a: NOP the lambda BL — only if MACWS_AGX_KEEP_LAMBDA is
-            // NOT set. Setting MACWS_AGX_KEEP_LAMBDA=1 lets the real lambda
-            // run (requires IOGPU to be pre-loaded — see Metal_hooks.x
-            // getMetalPluginClassForService hook). With the lambda running,
-            // Mempool::grow actually populates its freelist, and downstream
-            // texture creation can succeed instead of returning nil.
-            //
-            // Pre-NOP rationale: BN decompile of the
-            // Mempool<...ImageStateEncoderGen6...>::grow shows the first
-            // instruction-block calls a lambda at +0x28; the lambda tail-jumps
-            // to data_21f95bc90 (cross-image IOGPU pool allocator BSS slot).
-            // If IOGPU bindings aren't resolved (chroot dyld doesn't auto-bind
-            // when AGXMetal is dlopen'd standalone) the lambda crashes in
-            // memmove via a garbage function pointer.
-            if (!getenv("MACWS_AGX_KEEP_LAMBDA")) {
-                for (int i = 0; i < 24; i++) {
-                    uint32_t insn = grow[i];
-                    if ((insn & 0xFC000000) == 0x94000000) {  // BL imm26
-                        int32_t imm26 = (int32_t)(insn & 0x03FFFFFF);
-                        if (imm26 & 0x02000000) imm26 |= 0xFC000000;
-                        int64_t bl_off = (int64_t)imm26 * 4;
-                        if (bl_off <= 0) continue;
-                        ModifyExecutableRegion(&grow[i], sizeof(uint32_t), ^{
-                            grow[i] = 0xd503201f;  // NOP
-                        });
-                        fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d lambda BL@+%#x NOPed (target +%#llx)\n",
-                            g, i*4, (long long)((i*4) + bl_off));
-                        lambda_patched++;
-                        break;
-                    }
-                }
-            } else {
-                fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d lambda BL kept (MACWS_AGX_KEEP_LAMBDA=1)\n", g);
-            }
-
-            // FIX 2 (b.hs → epi redirect): SKIP this patch when
-            // MACWS_AGX_KEEP_LAMBDA=1. The b.hs redirect was added when the
-            // lambda crashed (broken IOGPU bindings) — it forced grow to skip
-            // the init loop entirely. But with KEEP_LAMBDA=1 the lambda runs
-            // correctly (IOGPU bindings repaired by GOT walker, AGX classes
-            // registered via objc_readClassPair), so the init loop CAN and
-            // MUST execute to populate the encoder freelist. Skipping the loop
-            // leaves *(encoders+0x450) = NULL and the very next instruction
-            // in setupDeferred_block_invoke does `ldr x8, [x8+0x18]` on it →
-            // PC=0x180 fault at addr 0x30.
-            if (getenv("MACWS_AGX_KEEP_LAMBDA")) {
-                fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d b.hs→epi patch SKIPPED (KEEP_LAMBDA — let init loop run)\n", g);
-                continue;
-            }
-
-            // Find the cmp/b.hs site first.
-            int bhs_idx = -1;
-            for (int i = 0; i < 64; i++) {
-                uint32_t insn = grow[i];
-                if ((insn & 0xFF00001F) == 0x54000002) {  // b.hs
-                    bhs_idx = i;
-                    break;
-                }
-            }
-            if (bhs_idx < 0) continue;
-            // Then scan forward for retab (d65f0fff) — the function epilogue.
-            int retab_idx = -1;
-            for (int i = bhs_idx + 1; i < 256; i++) {
-                if (grow[i] == 0xd65f0fff) { retab_idx = i; break; }
-            }
-            if (retab_idx < 0) {
-                fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d retab not found, skip\n", g);
-                continue;
-            }
-            // The epilogue prologue (ldp x29,x30 / [ldp x20,x19] / add sp,sp) is the
-            // 2-3 instructions before retab. Jump TARGET = retab_idx - 2 (typically
-            // ldp x29,x30). For safety, scan backward from retab for the first
-            // ldp x29,x30,[sp,#N] (0xA9?37BFD pattern matches stp/ldp X29,X30).
-            int epi_idx = -1;
-            for (int i = retab_idx - 1; i > bhs_idx && i > retab_idx - 8; i--) {
-                if ((grow[i] & 0xFFC07FFF) == 0xA9407BFD || // ldp x29,x30,[sp,#X]
-                    (grow[i] & 0xFFC07FFF) == 0xA9407BFD) {
-                    epi_idx = i;
-                    break;
-                }
-            }
-            // Looser fallback: just use retab_idx - 2 if ldp pattern isn't matched.
-            if (epi_idx < 0) epi_idx = retab_idx - 2;
-            int64_t off_bytes = (int64_t)(epi_idx - bhs_idx) * 4;
-            uint32_t b_insn = 0x14000000 | (((uint32_t)(off_bytes >> 2)) & 0x03FFFFFF);
-            ModifyExecutableRegion(&grow[bhs_idx], sizeof(uint32_t), ^{
-                grow[bhs_idx] = b_insn;
-            });
-            fprintf(stderr, "#### MACWS_AGX_NATIVE grow %d (%#llx) b.hs@+%#x → b epi@+%#x (off %lld)\n",
-                g, (unsigned long long)grows_static[g], bhs_idx*4, epi_idx*4, (long long)off_bytes);
-            grow_patched++;
-        }
-        fprintf(stderr, "#### MACWS_AGX_NATIVE patches: setupDeferred=%d grows=%d lambdas=%d\n",
-            setup_patched, grow_patched, lambda_patched);
 
         // ──────────────────────────────────────────────────────────────────
         // AGX texture wrap gate bypass (env-gated).
@@ -1377,69 +1243,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             //
             // Patch is per-process (ModifyExecutableRegion does COW), other
             // processes' libobjc unaffected.
-            // ──────────────────────────────────────────────────────────────
-            // -[AGXTexture initWithDevice:desc:iosurface:plane:] super-init
-            // bypass.
-            //
-            // libobjc autda fixed (xpacd below), so msgSendSuper2 now
-            // dispatches successfully to IOGPUMetalTexture's super impl. But
-            // IOGPUMetalTexture's impl itself returns nil in chroot (verified
-            // via IOGPU_INIT_HOOK [post] showing result=0x0 + self zeroed for
-            // every pfmt). The kernel-side AGX init it does diverges from
-            // what chroot can provide.
-            //
-            // Workaround: skip the super-init's return-value check. Patch
-            //     0x1e5a5af38: mov x23, x0     ; x23 = super-init result
-            //     0x1e5a5af3c: cbz x0, nil_exit
-            // → mov x23, x25 (self, preserved across BL) + nop. The init
-            // function will fall through to validate (already patched) and
-            // return self regardless of super-init result. The texture is
-            // partially-initialised at the IOGPUMetalTexture level, but
-            // SkyLight only needs a non-nil object: it holds the reference,
-            // and VNC reads the underlying IOSurface bytes via CPU lock —
-            // GPU-side state inside IOGPUMetalTexture isn't on the path.
-            // ──────────────────────────────────────────────────────────────
 
-            if (getenv("MACWS_AGX_KEEP_SUPERINIT_BYPASS")) {
-                // Patch:
-                //   0x1e5a5af38: mov x23, x0  → mov x23, x25   (x23 = self)
-                //   0x1e5a5af3c: cbz x0, +0x40 → b   +0x40     (jump to epilogue
-                //                                               unconditionally)
-                // The +0x40 target is 0x1e5a5af7c — the function epilogue
-                // which loads x0 from x23 and returns. We skip the
-                // updateBindData / finalize / validate chain entirely; with
-                // a partially-init'd object those downstream calls fault on
-                // uninitialised ivars.
-                //
-                // After 2026-06-18 (sel=0xa type=0x82 IOSurfaceID fix) super-
-                // init actually succeeds, so this bypass is no longer needed
-                // — disabled by default. Set MACWS_AGX_KEEP_SUPERINIT_BYPASS
-                // if reverting to the workaround.
-                uint64_t mov_static = 0x1e5a5af38;
-                uint32_t *mov_at    = (uint32_t *)(mov_static + slide);
-                const uint32_t MOV_X23_X0  = 0xAA0003F7u; // orr x23, xzr, x0
-                const uint32_t MOV_X23_X25 = 0xAA1903F7u; // orr x23, xzr, x25
-                const uint32_t CBZ_X0_P40  = 0xB4000200u; // cbz x0, +0x40
-                const uint32_t B_P40       = 0x14000010u; // b +0x40
-                uint32_t cur_mov = mov_at[0];
-                uint32_t cur_cbz = mov_at[1];
-                fprintf(stderr,
-                    "#### MACWS_AGX_SUPERINIT_BYPASS @%p insns=[%08x %08x]\n",
-                    mov_at, cur_mov, cur_cbz);
-                if (cur_mov == MOV_X23_X25 && cur_cbz == B_P40) {
-                    fprintf(stderr, "####   already patched, skip\n");
-                } else if (cur_mov != MOV_X23_X0 || cur_cbz != CBZ_X0_P40) {
-                    fprintf(stderr,
-                        "####   unexpected — expected mov x23,x0 + cbz x0,+0x40 — skip\n");
-                } else {
-                    ModifyExecutableRegion(mov_at, 8, ^{
-                        mov_at[0] = MOV_X23_X25;
-                        mov_at[1] = B_P40;
-                    });
-                    fprintf(stderr,
-                        "####   PATCHED → mov x23,x25 + b epilogue (init returns self)\n");
-                }
-            }
+            // (The previous AGXTexture super-init bypass that lived here —
+            // forcing -[AGXTexture initWithDevice:desc:iosurface:plane:] to
+            // return self regardless of IOGPUMetalTexture's super-init result
+            // — was removed 2026-06-18. The IOSurfaceID +0x30 swap on sel=0xa
+            // type=0x82 made the super-init actually succeed, so the bypass
+            // is no longer needed.)
 
             void *super2 = dlsym(RTLD_DEFAULT, "objc_msgSendSuper2");
             if (super2) {
