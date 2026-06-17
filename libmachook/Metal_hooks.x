@@ -690,6 +690,45 @@ static void macws_sigabrt_trampoline(int sig) {
         fprintf(stderr, "#### MTL_TEX entry self class=%s\n", class_getName([self class]));
         classlog++;
     }
+    // AGX gate probe: log the EXACT values the 3 entry-gate IOSurface APIs
+    // return for THIS surface. If our prediction is right (compType=0,
+    // heightInCompTiles=0, validateWithDevice=YES) and the texture is still
+    // nil, then the failure must be inside `initImplWith...` (post-gate).
+    // Logged once per unique (self_class, iosurface, plane) combo to avoid
+    // spam.
+    if (getenv("MACWS_AGX_TEX_BYPASS_GATE") && iosurface) {
+        extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef, size_t)
+            __attribute__((weak_import));
+        extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(IOSurfaceRef, size_t)
+            __attribute__((weak_import));
+        static int probelog = 0;
+        if (probelog < 8) {
+            uint32_t ctype = IOSurfaceGetCompressionTypeOfPlane
+                ? IOSurfaceGetCompressionTypeOfPlane(iosurface, plane) : 0xFFFFFFFF;
+            size_t hct = IOSurfaceGetHeightInCompressedTilesOfPlane
+                ? IOSurfaceGetHeightInCompressedTilesOfPlane(iosurface, plane) : (size_t)-1;
+            BOOL validOK = NO;
+            @try {
+                validOK = [desc respondsToSelector:@selector(validateWithDevice:)]
+                    ? ((BOOL (*)(id, SEL, id))objc_msgSend)(desc,
+                          @selector(validateWithDevice:), self)
+                    : NO;
+            } @catch (NSException *e) {
+                validOK = -1; // marker that it threw
+            }
+            fprintf(stderr,
+                "#### AGX_GATE_PROBE class=%s ios=%p plane=%lu "
+                "compressionType=%u heightInCompressedTiles=%zu validateWithDevice=%d "
+                "desc=(w=%lu h=%lu pf=%lu storage=%lu usage=0x%lx)\n",
+                class_getName([self class]),
+                (void*)iosurface, (unsigned long)plane,
+                ctype, hct, (int)validOK,
+                (unsigned long)desc.width, (unsigned long)desc.height,
+                (unsigned long)desc.pixelFormat,
+                (unsigned long)desc.storageMode, (unsigned long)desc.usage);
+            probelog++;
+        }
+    }
     id<MTLTexture> result = nil;
     struct sigaction old_sa, new_sa;
     memset(&new_sa, 0, sizeof(new_sa));
@@ -1158,7 +1197,174 @@ static id agx_initWithAcceleratorPort_impl(id self, SEL _cmd, int port) {
     return ((RealInit)objc_msgSend)(self, realSel, port, 1);
 }
 
+// Diag hook on `-[AGXG13GFamilyTexture initImplWithDevice:Descriptor:iosurface:plane:buffer:
+//                bytesPerRow:allowNPOT:sparsePageSize:isCompressedIOSurface:isHeapBacked:]`.
+// Per-call log of (self_class, iosurface, descriptor.pixelFormat, return value).
+// Identifies which calls return nil and correlates to the iosurface.
+typedef id (*macws_initimpl_orig_t)(
+    id self, SEL _cmd,
+    id device, id descriptor, IOSurfaceRef iosurface, NSUInteger plane,
+    id buffer, NSUInteger bytesPerRow, BOOL allowNPOT, NSUInteger sparsePageSize,
+    BOOL isCompressedIOSurface, BOOL isHeapBacked);
+static macws_initimpl_orig_t macws_orig_initimpl = NULL;
+
+static id macws_hook_initimpl(
+    id self, SEL _cmd,
+    id device, id descriptor, IOSurfaceRef iosurface, NSUInteger plane,
+    id buffer, NSUInteger bytesPerRow, BOOL allowNPOT, NSUInteger sparsePageSize,
+    BOOL isCompressedIOSurface, BOOL isHeapBacked) {
+    id result = nil;
+    if (macws_orig_initimpl) {
+        result = macws_orig_initimpl(self, _cmd, device, descriptor, iosurface,
+            plane, buffer, bytesPerRow, allowNPOT, sparsePageSize,
+            isCompressedIOSurface, isHeapBacked);
+    }
+    static int log_count = 0;
+    if (log_count < 30) {
+        NSUInteger pf = 0, w = 0, h = 0;
+        if (descriptor) {
+            pf = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(pixelFormat));
+            w = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(width));
+            h = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(height));
+        }
+        uint32_t fcc = iosurface ? IOSurfaceGetPixelFormat(iosurface) : 0;
+        fprintf(stderr,
+            "#### INITIMPL_HOOK self=%p cls=%s ios=%p ios_fcc=%#x desc(pf=%lu w=%lu h=%lu) "
+            "buf=%p bpr=%lu npot=%d sparse=%lu compIOS=%d heap=%d → result=%p\n",
+            self, class_getName([self class]),
+            iosurface, fcc,
+            (unsigned long)pf, (unsigned long)w, (unsigned long)h,
+            buffer, (unsigned long)bytesPerRow,
+            (int)allowNPOT, (unsigned long)sparsePageSize,
+            (int)isCompressedIOSurface, (int)isHeapBacked,
+            result);
+        log_count++;
+    }
+    return result;
+}
+
+static void install_agx_initimpl_hook(void) {
+    if (!getenv("MACWS_AGX_INITIMPL_TRACE")) return;
+    Class tex_cls = objc_getClass("AGXG13GFamilyTexture");
+    if (!tex_cls) {
+        fprintf(stderr, "#### INITIMPL_HOOK: AGXG13GFamilyTexture class not found\n");
+        return;
+    }
+    SEL sel = sel_registerName(
+        "initImplWithDevice:Descriptor:iosurface:plane:buffer:bytesPerRow:"
+        "allowNPOT:sparsePageSize:isCompressedIOSurface:isHeapBacked:");
+    Method m = class_getInstanceMethod(tex_cls, sel);
+    if (!m) {
+        fprintf(stderr, "#### INITIMPL_HOOK: method not found\n");
+        return;
+    }
+    macws_orig_initimpl = (macws_initimpl_orig_t)method_getImplementation(m);
+    method_setImplementation(m, (IMP)macws_hook_initimpl);
+    fprintf(stderr, "#### INITIMPL_HOOK: installed (orig=%p)\n",
+        (void*)macws_orig_initimpl);
+}
+
+// Diag hook on `-[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:
+//                field:args:argsSize:]`. This is the SUPER-INIT dispatched by
+// -[AGXTexture initWithDevice:desc:iosurface:plane:] via objc_msgSendSuper2.
+// AGXG13GFamilyTexture's initImpl succeeds (verified by INITIMPL_HOOK), so the
+// nil-exit happens here at the cbz x0 at static 0x1e5a5af3c. Per the static
+// disasm there are only two nil-exit paths after initImpl: super-init returns
+// 0 OR validate returns BIT0=0 (we already patched validate to always-YES).
+// Therefore super-init MUST be returning 0 — log its args + return.
+typedef id (*macws_iogpu_init_t)(
+    id self, SEL _cmd,
+    id device, id descriptor, IOSurfaceRef iosurface, NSUInteger plane,
+    NSUInteger field, void *args, NSUInteger argsSize);
+static macws_iogpu_init_t macws_orig_iogpu_init = NULL;
+
+static id macws_hook_iogpu_init(
+    id self, SEL _cmd,
+    id device, id descriptor, IOSurfaceRef iosurface, NSUInteger plane,
+    NSUInteger field, void *args, NSUInteger argsSize) {
+    static int log_count = 0;
+    // Log BEFORE calling orig — IOGPUMetalTexture's init may zero out self
+    // on failure (verified by lldb: self.isa = 0 after orig returns nil),
+    // so any [self class] after orig will crash.
+    const char *cls_name_before = "?";
+    if (log_count < 30) {
+        Class c = object_getClass(self);
+        cls_name_before = c ? class_getName(c) : "(nil)";
+        NSUInteger pf = 0, w = 0, h = 0;
+        if (descriptor) {
+            pf = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(pixelFormat));
+            w  = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(width));
+            h  = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(height));
+        }
+        uint32_t fcc = iosurface ? IOSurfaceGetPixelFormat(iosurface) : 0;
+        // argsSize comes in via stack slot; the caller stores only the low
+        // 32 bits (`str w8, [sp]`), so mask off the high garbage.
+        NSUInteger argsSize_lo = argsSize & 0xFFFFFFFFu;
+        fprintf(stderr,
+            "#### IOGPU_INIT_HOOK [pre] self=%p cls=%s ios=%p ios_fcc=%#x "
+            "desc(pf=%lu w=%lu h=%lu) plane=%lu field=%lu args=%p "
+            "argsSize=%lu (raw=%#lx)\n",
+            self, cls_name_before,
+            iosurface, fcc,
+            (unsigned long)pf, (unsigned long)w, (unsigned long)h,
+            (unsigned long)plane, (unsigned long)field,
+            args, (unsigned long)argsSize_lo, (unsigned long)argsSize);
+    }
+    // Save isa BEFORE calling orig — orig zeros the entire object on
+    // failure, which makes any subsequent msgSend on `self` crash.
+    uint64_t saved_isa = *(uint64_t *)self;
+    id result = nil;
+    if (macws_orig_iogpu_init) {
+        result = macws_orig_iogpu_init(self, _cmd, device, descriptor,
+            iosurface, plane, field, args, argsSize);
+    }
+    // If orig zeroed our isa, restore it so the caller's super-init bypass
+    // hands a usable (if partially-init'd) object back to SkyLight. The
+    // texture's IVAR area is uninitialised but its objc identity works:
+    // [self class] / [self pixelFormat] / ARC retain/release all dispatch
+    // correctly.
+    uint64_t isa_after = *(uint64_t *)self;
+    if (isa_after == 0 && saved_isa != 0) {
+        *(uint64_t *)self = saved_isa;
+    }
+    if (log_count < 30) {
+        fprintf(stderr,
+            "#### IOGPU_INIT_HOOK [post] self=%p isa_was=%#llx isa_after=%#llx "
+            "(restored=%d) → result=%p\n",
+            self,
+            (unsigned long long)saved_isa,
+            (unsigned long long)isa_after,
+            isa_after == 0 && saved_isa != 0,
+            result);
+        log_count++;
+    }
+    return result;
+}
+
+static void install_iogpu_init_hook(void) {
+    if (!getenv("MACWS_AGX_INITIMPL_TRACE")) return;
+    Class iogpu_cls = objc_getClass("IOGPUMetalTexture");
+    if (!iogpu_cls) {
+        fprintf(stderr, "#### IOGPU_INIT_HOOK: IOGPUMetalTexture class not found\n");
+        return;
+    }
+    SEL sel = sel_registerName(
+        "initWithDevice:descriptor:iosurface:plane:field:args:argsSize:");
+    Method m = class_getInstanceMethod(iogpu_cls, sel);
+    if (!m) {
+        fprintf(stderr, "#### IOGPU_INIT_HOOK: method not found\n");
+        return;
+    }
+    macws_orig_iogpu_init = (macws_iogpu_init_t)method_getImplementation(m);
+    method_setImplementation(m, (IMP)macws_hook_iogpu_init);
+    fprintf(stderr, "#### IOGPU_INIT_HOOK: installed (orig=%p)\n",
+        (void*)macws_orig_iogpu_init);
+}
+
 static void install_agx_init_redirect(Class agx) {
+    install_agx_initimpl_hook();  // install diag hook on texture class
+    install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
+
     SEL sel = @selector(initWithAcceleratorPort:);
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
     fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);

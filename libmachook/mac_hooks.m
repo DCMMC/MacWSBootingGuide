@@ -1113,6 +1113,660 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             setup_patched, grow_patched, lambda_patched);
 
         // ──────────────────────────────────────────────────────────────────
+        // AGX texture wrap gate bypass (env-gated).
+        // -[AGXTexture initWithDevice:desc:iosurface:plane:] @ 0x1e5a5ae18 calls
+        //   sub_1e5a5d5f0(iosurface, plane)   ; some IOSurface-type query
+        //   cmp w0, #0x4
+        //   ccmp w0, #0x1, #0x4, ls           ; flags = (w0==1 if w0<=4) else Z=1
+        //   b.eq EXIT_NIL                     ; @ 0x1e5a5ae60, fires if w0==1 OR w0>4
+        // In chroot the query returns a value that triggers the nil-exit even for
+        // a perfectly valid BGRA8 IOSurface. NOP the b.eq so the function always
+        // proceeds to the real init path (sub_1e5aad880 →
+        // initImplWithDevice:Descriptor:iosurface:plane:buffer:bytesPerRow:...).
+        // Gated by MACWS_AGX_TEX_BYPASS_GATE=1 so we can A/B with the original.
+        // DIAG: identify the cross-image GOT bindings used by AGXTexture's
+        // init chain. The stubs:
+        //   sub_1e5a5d540 loads *0x21f934130 → gate-1 query (called from
+        //     -[AGXG13GFamilyDevice newTextureWithDescriptor:iosurface:plane:])
+        //   sub_1e5a5d5f0 loads *0x21f934200 → gate-1 of -[AGXTexture init...]
+        //     (returns int; value 1 or >4 triggers immediate nil)
+        //   sub_1e5a5d650 loads *0x21f934240 → gate-3 query (iosurface)
+        //   sub_1e5a5d590 loads *0x21f934220 → property loader (no gate)
+        // Resolve each via dladdr to identify the actual IOSurface/IOGPU
+        // symbol so we can reason about what they SEMANTICALLY check
+        // rather than blindly NOPing.
+        if (getenv("MACWS_AGX_TEX_BYPASS_GATE")) {
+            struct got_probe { uint64_t addr; const char *role; } probes[] = {
+                { 0x21f934130, "newTexture:iosurface: gate query" },
+                { 0x21f934200, "AGXTexture init gate-1 (returns int)" },
+                { 0x21f934220, "AGXTexture init prop load" },
+                { 0x21f934240, "AGXTexture init gate-3 (iosurface)" },
+                // Stub @0x1e5a5dfc0 = adrp 0x21f95b000 + add #0xca8 + ldr [#0xca8].
+                // (Earlier note had this as 0x21f934ca8 — wrong page; the
+                // ADRP target for THIS stub is 0x21f95b000.)
+                //
+                // BN's macOS DSC view shows ALL __auth_stubs reference one of
+                // ~15 cache-shared __got pages (0x21f927000..0x21f95b000). The
+                // 0x21f95b000 page is the libobjc runtime-helper page; sub_
+                // 1e5a5dfc0 specifically is `_objc_msgSendSuper2` (called from
+                // every -[…super dealloc] / [super initWith…] in this image).
+                //
+                // In chroot the page is OUTSIDE the dlopen'd image's segments
+                // → the slot reads whatever happens to be at that VA (e.g.
+                // MTCapabilityIsAvailable from MediaToolbox), super-init
+                // returns 0, -[AGXTexture init…] nil-exits.
+                //
+                // The MACWS_AGX_NATIVE block below patches the stub itself
+                // (movz/movk/movk/br x16 to dlsym'd objc_msgSendSuper2),
+                // bypassing the broken slot entirely.
+                { 0x21f95bca8, "objc_msgSendSuper2 slot (via stub sub_1e5a5dfc0)" },
+            };
+            for (size_t pi = 0; pi < sizeof(probes)/sizeof(probes[0]); pi++) {
+                void **slot = (void **)(probes[pi].addr + slide);
+                void *fn = *slot;
+                Dl_info di = {0};
+                int ok = dladdr(fn, &di);
+                fprintf(stderr,
+                    "#### AGX_TEX_DIAG GOT@%p = %p  (slid %#llx + %#zx = %#llx)\n"
+                    "####   role: %s\n"
+                    "####   dladdr ok=%d sym=%s base=%p path=%s\n",
+                    slot, fn,
+                    (unsigned long long)probes[pi].addr, (size_t)slide,
+                    (unsigned long long)(probes[pi].addr + slide),
+                    probes[pi].role,
+                    ok, di.dli_sname ?: "(none)", di.dli_fbase, di.dli_fname ?: "(none)");
+            }
+        }
+        // ──────────────────────────────────────────────────────────────────
+        // texBaseAddressesUpdated null-deref skip (env-gated).
+        //
+        // Root cause (see memory [[agx-texbaseaddresses-nullderef]]):
+        //   SkyLight's CompositorMetal::CreateShadowFromMask (window shadow
+        //   texture for chrome rendering) calls -[AGXG13GFamilyDevice
+        //   newTextureWithDescriptor:] (no-iosurface variant), which routes
+        //   through -[AGXTexture initWithDevice:desc:isSuballocDisabled:].
+        //   That init calls
+        //     [self updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:]
+        //   which internally calls AGX::TextureGen4<G13>::texBaseAddressesUpdated().
+        //   In chroot, the texture's `(self->0x1c8)->0x8` is null, so
+        //   texBaseAddressesUpdated +2932 (ldr x11,[x11,#0x18] after
+        //   `add x11,x11,x10` where x10 is an ivar offset of 0x18) faults
+        //   at addr 0x30. WS dies with SIGSEGV.
+        //
+        // Confirmed by iOS-side lldb runtime trace (see [[lldb-remote-
+        // debugserver-setup]] + misc/ios_lldb_tmux.sh): the initImpl* path
+        // I'd been investigating earlier runs fine (9/9 calls reach
+        // epilogue); only this initWithDevice:desc:isSuballocDisabled:
+        // path crashes. The crash is in a SHADOW texture path, not the
+        // framebuffer-IOSurface path.
+        //
+        // Patch: NOP the BL @ 0x1e5a5ba10 inside
+        //   `-[AGXTexture initWithDevice:desc:isSuballocDisabled:]`. That
+        // BL targets objc_msgSend$updateBindDataWithAddresses:gpuVirtual\
+        // Address:shouldInitMetadata: (the stub @ 0x1e5ab1bc0). Skipping
+        // it means the AGX encoder bind tables don't get updated with this
+        // texture's base address (so a draw using the texture might show
+        // garbage), but the texture object itself is still created and
+        // returned. AGXTexture's `finalizeTextureCreation` call right
+        // after (at 0x1e5a5ba18, bl 0x1e5aacfa0) still runs.
+        //
+        // For SkyLight's shadow-mask use case the worst-case is window
+        // chrome shadows render incorrectly — acceptable trade vs WS dying.
+        //
+        // Gated by MACWS_AGX_SKIP_BIND_UPDATE=1 (default ON for AGX-native
+        // mode since AGX-native otherwise crashes on first shadow draw).
+
+        // DIAG: what class is in __objc_classrefs at offset 0x298?
+        // -[AGXG13GFamilyDevice newTextureWithDescriptor:iosurface:plane:]
+        //   at 0x1e574d5ac (FAIL path): loads classref @ 0x21a8a9298 →
+        //   objc_alloc(<class>) → ... initWithDevice:desc:iosurface:plane:.
+        // The init's `[self initImplWith...]` dispatch goes to the alloc'd
+        // class's impl. If the class is AGXTexture (base, returns 0) the
+        // texture wrap fails. If it's AGXG13GFamilyTexture (subclass with
+        // the real impl), the wrap should work. Log which one.
+        if (getenv("MACWS_AGX_NATIVE")) {
+            void **classref_slot = (void **)(0x21a8a9298 + slide);
+            void *cls = *classref_slot;
+            const char *clsname = cls ? class_getName((Class)cls) : "(nil)";
+            fprintf(stderr,
+                "#### AGX_CLASSREF_DIAG newTexture iosurface alloc class "
+                "@%p = %p name=%s\n",
+                classref_slot, cls, clsname);
+            // Check critical method on the texture class — initImpl variants
+            // The plain stub on AGXTexture base returns 0 (we saw at static
+            // 0x1e5a5a880-884: mov w0,#0; ret). If dispatch resolves to that
+            // base stub instead of AGXG13GFamilyTexture's real impl, every
+            // texture creation returns nil. Compare imp address against
+            // both static addresses (with slide):
+            //   AGXTexture initImplWith... = 0x1e5a5a880 (base, stub)
+            //   AGXG13GFamilyTexture initImplWith... = 0x1e5a4a284 (subclass, real)
+            if (cls) {
+                SEL sel = sel_registerName(
+                    "initImplWithDevice:Descriptor:iosurface:plane:buffer:"
+                    "bytesPerRow:allowNPOT:sparsePageSize:isCompressedIOSurface:"
+                    "isHeapBacked:");
+                Method m = class_getInstanceMethod((Class)cls, sel);
+                IMP imp = m ? method_getImplementation(m) : NULL;
+                uintptr_t agxtex_stub = (uintptr_t)0x1e5a5a880 + slide;
+                uintptr_t agxg13_real = (uintptr_t)0x1e5a4a284 + slide;
+                const char *which = "UNKNOWN";
+                if ((uintptr_t)imp == agxtex_stub) which = "AGXTexture-stub-returns-0";
+                else if ((uintptr_t)imp == agxg13_real) which = "AGXG13GFamilyTexture-real";
+                fprintf(stderr,
+                    "#### AGX_CLASSREF_DIAG initImpl method m=%p imp=%p "
+                    "expected stub=%p real=%p WHICH=%s\n",
+                    m, imp, (void*)agxtex_stub, (void*)agxg13_real, which);
+            }
+        }
+
+        if (getenv("MACWS_AGX_SKIP_BIND_UPDATE") ||
+            (getenv("MACWS_AGX_NATIVE") && !getenv("MACWS_AGX_KEEP_BIND_UPDATE"))) {
+            uint64_t bl_static = 0x1e5a5ba10;
+            uint32_t *bl_at = (uint32_t *)(bl_static + slide);
+            const uint32_t NOP_INSN = 0xd503201f;
+            ModifyExecutableRegion(bl_at, sizeof(uint32_t), ^{
+                uint32_t insn = *bl_at;
+                // BL opcode mask: top 6 bits = 100101 (0x94/0x97 with imm).
+                BOOL is_bl = ((insn & 0xFC000000) == 0x94000000);
+                if (is_bl) {
+                    *bl_at = NOP_INSN;
+                    fprintf(stderr,
+                        "#### MACWS_AGX_SKIP_BIND_UPDATE: NOPed BL @%p "
+                        "(static 0x1e5a5ba10 + slide=%#zx)\n",
+                        bl_at, (size_t)slide);
+                } else if (insn == NOP_INSN) {
+                    /* already patched on a prior load of same image */
+                } else {
+                    fprintf(stderr,
+                        "#### MACWS_AGX_SKIP_BIND_UPDATE: @%p got %#x "
+                        "expected BL — SKIP\n",
+                        bl_at, insn);
+                }
+            });
+        }
+        //
+        // Need to read what each gate actually does before patching. The
+        // stubs sub_1e5a5d5f0 / sub_1e5a5d650 are __auth_stub jump-thunks
+        // into IOSurface/IOGPU framework via __got slots 0x21f934200 /
+        // 0x21f934240 (etc.). Those slots' bound symbols can only be read
+        // by attaching lldb to a running WS and dumping the slot contents
+        // (or by decoding the dyld chained-fixups via otool -bind).
+        //
+        // TODO once symbols are identified:
+        //   1. Understand what the IOSurface property check actually wants
+        //   2. Either: (a) modify our IOSurface to satisfy the check, or
+        //      (b) hook the IOSurface API itself to return the expected
+        //      value for AGX's framebuffer surfaces in chroot.
+
+        // ──────────────────────────────────────────────────────────────────
+        // __objc_superrefs slot patcher for AGXTexture → IOGPUMetalTexture.
+        //
+        // Background discovered 2026-06-17:
+        //   -[AGXTexture initWithDevice:desc:iosurface:plane:] at 0x1e5a5af00
+        //   loads its [super …] receiver class from 0x21a8a96d0 (an entry in
+        //   __objc_superrefs). In a normal binary, dyld would process the
+        //   chained-fixup record at that slot and write the runtime class
+        //   pointer. AGXMetal13_3 was extracted from the DSC and has NO
+        //   LC_DYLD_CHAINED_FIXUPS / LC_DYLD_INFO_ONLY — so the slot keeps
+        //   its raw cache-baked chained-fixup encoding (e.g. high-byte 0x01,
+        //   0xf0 noise bits) and reads back as a pointer to garbage.
+        //
+        //   objc_msgSendSuper2 then class-looks-up the selector against the
+        //   garbage receiver → no method found → 0 return → init nil-exit
+        //   at the cbz x0 immediately after. Our IOGPU_INIT_HOOK never fires
+        //   even though class_getSuperclass(AGXTexture)==IOGPUMetalTexture
+        //   resolves correctly via libobjc's superClassName fallback — the
+        //   ABI-level superref slot is unaffected by that fallback.
+        //
+        // Fix: at AGXMetal13_3 load time, write the LIVE IOGPUMetalTexture
+        // class pointer into 0x21a8a96d0+slide. __objc_superrefs is in plain
+        // __DATA (no PAC auth needed); a raw pointer write suffices.
+        //
+        // Slot is at the very END of __objc_superrefs (size 0x140 from
+        // 0x21a8a9598; offset 0x6d0 from page 0x21a8a9000 → 0x21a8a96d0,
+        // which is 0x138 from the start of __objc_superrefs == the 40th /
+        // last superref entry). Other superref entries used by other AGX
+        // classes are TODO — patch reactively as more nil-exits surface.
+        if (getenv("MACWS_AGX_NATIVE")) {
+            // 2026-06-17 lldb-confirmed root cause of texture-init nil-exit
+            // (and the actual fix that worked):
+            //
+            // libobjc's objc_msgSendSuper2 does at +16:
+            //     autda x16, x17     ; PAC-auth super_class->superclass
+            //     ldr   x10, [x16, #0x10]    ; load cache buckets
+            //
+            // AGXTexture's runtime class_t.superclass holds a raw unsigned
+            // 0x1fdfdcfb0 (= IOGPUMetalTexture) — the cache-baked PAC-signed
+            // chained-fixup record at __DATA AGXTexture+0x8 isn't processed
+            // by chroot dyld (DSC extraction strips chained fixups), so
+            // libobjc's name-based class registration left the field as a
+            // raw pointer. autda on a raw pointer fails → x16 becomes 0 (or
+            // poisoned) → ldr [x16+0x10] segfaults at 0x10. WS dies.
+            //
+            // PAC-signing from libmachook is unavailable here — we're built
+            // as arm64 (not arm64e), so macws_pac_sign is a no-op. Instead:
+            // replace the autda inside libobjc with xpacd x16. xpacd just
+            // STRIPS PAC bits without verification — works for both signed
+            // (legit) and raw (our case) pointers. autda x16,x17 and
+            // xpacd x16 are both 4 bytes, so it's a single-instruction patch.
+            //
+            // Patch is per-process (ModifyExecutableRegion does COW), other
+            // processes' libobjc unaffected.
+            // ──────────────────────────────────────────────────────────────
+            // -[AGXTexture initWithDevice:desc:iosurface:plane:] super-init
+            // bypass.
+            //
+            // libobjc autda fixed (xpacd below), so msgSendSuper2 now
+            // dispatches successfully to IOGPUMetalTexture's super impl. But
+            // IOGPUMetalTexture's impl itself returns nil in chroot (verified
+            // via IOGPU_INIT_HOOK [post] showing result=0x0 + self zeroed for
+            // every pfmt). The kernel-side AGX init it does diverges from
+            // what chroot can provide.
+            //
+            // Workaround: skip the super-init's return-value check. Patch
+            //     0x1e5a5af38: mov x23, x0     ; x23 = super-init result
+            //     0x1e5a5af3c: cbz x0, nil_exit
+            // → mov x23, x25 (self, preserved across BL) + nop. The init
+            // function will fall through to validate (already patched) and
+            // return self regardless of super-init result. The texture is
+            // partially-initialised at the IOGPUMetalTexture level, but
+            // SkyLight only needs a non-nil object: it holds the reference,
+            // and VNC reads the underlying IOSurface bytes via CPU lock —
+            // GPU-side state inside IOGPUMetalTexture isn't on the path.
+            {
+                // Patch:
+                //   0x1e5a5af38: mov x23, x0  → mov x23, x25   (x23 = self)
+                //   0x1e5a5af3c: cbz x0, +0x40 → b   +0x40     (jump to epilogue
+                //                                               unconditionally)
+                // The +0x40 target is 0x1e5a5af7c — the function epilogue
+                // which loads x0 from x23 and returns. We skip the
+                // updateBindData / finalize / validate chain entirely; with
+                // a partially-init'd object those downstream calls fault on
+                // uninitialised ivars.
+                uint64_t mov_static = 0x1e5a5af38;
+                uint32_t *mov_at    = (uint32_t *)(mov_static + slide);
+                const uint32_t MOV_X23_X0  = 0xAA0003F7u; // orr x23, xzr, x0
+                const uint32_t MOV_X23_X25 = 0xAA1903F7u; // orr x23, xzr, x25
+                const uint32_t CBZ_X0_P40  = 0xB4000200u; // cbz x0, +0x40
+                const uint32_t B_P40       = 0x14000010u; // b +0x40
+                uint32_t cur_mov = mov_at[0];
+                uint32_t cur_cbz = mov_at[1];
+                fprintf(stderr,
+                    "#### MACWS_AGX_SUPERINIT_BYPASS @%p insns=[%08x %08x]\n",
+                    mov_at, cur_mov, cur_cbz);
+                if (cur_mov == MOV_X23_X25 && cur_cbz == B_P40) {
+                    fprintf(stderr, "####   already patched, skip\n");
+                } else if (cur_mov != MOV_X23_X0 || cur_cbz != CBZ_X0_P40) {
+                    fprintf(stderr,
+                        "####   unexpected — expected mov x23,x0 + cbz x0,+0x40 — skip\n");
+                } else {
+                    ModifyExecutableRegion(mov_at, 8, ^{
+                        mov_at[0] = MOV_X23_X25;
+                        mov_at[1] = B_P40;
+                    });
+                    fprintf(stderr,
+                        "####   PATCHED → mov x23,x25 + b epilogue (init returns self)\n");
+                }
+            }
+
+            void *super2 = dlsym(RTLD_DEFAULT, "objc_msgSendSuper2");
+            if (super2) {
+                // autda is at msgSendSuper2 + 16 (verified by lldb).
+                uint32_t *autda_at = (uint32_t *)((uint8_t *)super2 + 16);
+                const uint32_t AUTDA_X16_X17 = 0xdac11a30u;
+                const uint32_t XPACD_X16     = 0xdac147f0u;
+                uint32_t cur = *autda_at;
+                fprintf(stderr,
+                    "#### MACWS_AGX_OBJC_AUTDA_PATCH msgSendSuper2=%p "
+                    "autda@%p insn=%#x\n",
+                    super2, autda_at, cur);
+                if (cur == XPACD_X16) {
+                    fprintf(stderr, "####   already patched, skip\n");
+                } else if (cur != AUTDA_X16_X17) {
+                    fprintf(stderr,
+                        "####   unexpected insn (expected %#x for autda x16,x17) — skip\n",
+                        AUTDA_X16_X17);
+                } else {
+                    ModifyExecutableRegion(autda_at, 4, ^{
+                        *autda_at = XPACD_X16;
+                    });
+                    fprintf(stderr,
+                        "####   PATCHED autda x16,x17 → xpacd x16 (%#x → %#x)\n",
+                        AUTDA_X16_X17, XPACD_X16);
+                }
+            } else {
+                fprintf(stderr,
+                    "#### MACWS_AGX_OBJC_AUTDA_PATCH: dlsym(objc_msgSendSuper2)=NULL\n");
+            }
+
+            // Diagnostic (read-only) — useful when triaging future variants.
+            Class agx_tex = objc_getClass("AGXTexture");
+            Class iogpu_tex = objc_getClass("IOGPUMetalTexture");
+            if (agx_tex && iogpu_tex) {
+                uint64_t *super_field = (uint64_t *)((uintptr_t)agx_tex + 8);
+                fprintf(stderr,
+                    "#### MACWS_AGX_SUPERCLASS_DIAG AGXTexture=%p field@%p=%#llx "
+                    "IOGPUMetalTexture=%p\n",
+                    (void*)agx_tex, super_field,
+                    (unsigned long long)*super_field,
+                    (void*)iogpu_tex);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // Runtime diagnostic: dump the cstring at the [super initWith…]
+        // selector address used by -[AGXTexture initWithDevice:desc:iosurface\
+        // :plane:].
+        //
+        // At static 0x1e5a5af08:
+        //     adrp x8, 0x1cffc6000
+        //     add  x1, x8, #0xf26    ; SEL @ 0x1cffc6f26
+        //
+        // 0x1cffc6f26 is OUTSIDE every segment of the extracted binary —
+        // in the cache it points to libobjc's __objc_methname, which is
+        // not part of the extracted image. After slide-relocation in chroot
+        // it lands at some unrelated VA. objc_msgSendSuper2 sees a wrong
+        // (or garbage) selector name → method lookup fails → returns 0 →
+        // -[AGXTexture initWithDevice:desc:iosurface:plane:] nil-exits at
+        // cbz x0 (static 0x1e5a5af3c) before validate is ever reached.
+        //
+        // Print the first 96 bytes at the slid VA so we can see what
+        // actually lives there.
+        if (getenv("MACWS_AGX_NATIVE")) {
+            uint64_t sel_static = 0x1cffc6f26;
+            const char *sel_runtime = (const char *)(sel_static + slide);
+            char preview[97] = {0};
+            int readable = 0;
+            @try {
+                memcpy(preview, sel_runtime, 96);
+                readable = 1;
+            } @catch (id e) {
+                readable = 0;
+            }
+            // Sanitize for printing
+            for (size_t i = 0; i < sizeof(preview)-1; i++) {
+                unsigned char c = (unsigned char)preview[i];
+                if (c == 0) { preview[i] = 0; break; }
+                if (c < 0x20 || c >= 0x7f) preview[i] = '.';
+            }
+            fprintf(stderr,
+                "#### MACWS_AGX_SEL_DIAG super-init SEL static=%#llx slid=%p "
+                "readable=%d\n"
+                "####   bytes=\"%s\"\n",
+                (unsigned long long)sel_static, sel_runtime, readable, preview);
+
+            // Also: what does sel_registerName resolve THIS cstring to?
+            if (readable && preview[0]) {
+                SEL s = sel_registerName(sel_runtime);
+                fprintf(stderr,
+                    "####   sel_registerName(...) = %p name=\"%s\"\n",
+                    s, sel_getName(s));
+            }
+
+            // And what selector does our AGXG13GFamilyTexture's superclass
+            // actually expect for initWith…iosurface… ? Try the obvious
+            // candidate names.
+            const char *candidates[] = {
+                "initWithDevice:desc:iosurface:plane:",
+                "initWithDevice:descriptor:iosurface:plane:",
+                "initWithDevice:descriptor:iosurface:plane:field:args:argsSize:",
+                "initImplWithDevice:Descriptor:iosurface:plane:buffer:"
+                  "bytesPerRow:allowNPOT:sparsePageSize:isCompressedIOSurface:"
+                  "isHeapBacked:",
+                NULL
+            };
+            // Also peek at IOGPUMetalTexture class registration + method list count
+            Class iogpu_tex = objc_getClass("IOGPUMetalTexture");
+            fprintf(stderr,
+                "####   objc_getClass(IOGPUMetalTexture) = %p\n", iogpu_tex);
+            if (iogpu_tex) {
+                unsigned int n = 0;
+                Method *ml = class_copyMethodList(iogpu_tex, &n);
+                fprintf(stderr, "####   IOGPUMetalTexture method count = %u\n", n);
+                int shown = 0;
+                for (unsigned int j = 0; j < n && shown < 32; j++) {
+                    const char *mn = sel_getName(method_getName(ml[j]));
+                    if (strstr(mn, "init") || strstr(mn, "Init")) {
+                        fprintf(stderr, "####     - %s\n", mn);
+                        shown++;
+                    }
+                }
+                if (ml) free(ml);
+            }
+            Class agxtex_cls = objc_getClass("AGXTexture");
+            Class super_cls  = agxtex_cls ? class_getSuperclass(agxtex_cls) : NULL;
+            fprintf(stderr,
+                "####   AGXTexture super class = %p (%s)\n",
+                super_cls, super_cls ? class_getName(super_cls) : "(nil)");
+            for (int c = 0; candidates[c]; c++) {
+                SEL s = sel_registerName(candidates[c]);
+                Method m = super_cls ? class_getInstanceMethod(super_cls, s) : NULL;
+                fprintf(stderr,
+                    "####   super responds to \"%s\" = %d (Method=%p)\n",
+                    candidates[c], m != NULL, m);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // validateBufferTextureWithSize: always-YES patch (MACWS_AGX_NATIVE).
+        //
+        // Discovered this session (2026-06-17) while chasing the
+        // newTextureWithDescriptor:iosurface:plane: = nil failure mode:
+        //
+        // -[AGXTexture initWithDevice:desc:iosurface:plane:] is reached. It
+        // alloc's the texture and calls [AGXG13GFamilyTexture initImplWith…]
+        // which we already verified returns 1 (success) for every format WS
+        // tries (BGRA8 / depth / stencil / depth32f_s8 / 2-plane '&b38').
+        //
+        // Then init continues past initImpl and at static 0x1e5a5afdc does:
+        //     ldr  x8, [x20, #0x28]
+        //     and  x2, x8, #0xffffffffffffff
+        //     mov  x0, x23
+        //     bl   0x1e5ab1d00            ; objc_msgSend$validateBufferTexture\
+        //                                 ; WithSize:
+        //     tbnz w0, #0, return_self    ; if bit-0 set → success
+        //     mov  x0, x23
+        //     b    0x1e5a5e010            ; → -[AGXTexture dealloc] → nil
+        //
+        // i.e. if `validateBufferTextureWithSize:` returns 0 the init nil-
+        // exits. AGXG13GFamilyTexture's impl at 0x1e576ef94 does:
+        //     ivar_off = data_21a8a9884
+        //     desc     = self->ivar
+        //     if (!desc->0x18a)        return 1
+        //     if (desc->0x168+0x10 > arg3) return 0    ; size check
+        //     ptr      = desc->0x130
+        //     if (!ptr)                return 1
+        //     {a,b}    = *(ptr + desc->0x168)
+        //     if ((a ^ 0x99b7d4010ce3ead3) | (b ^ 0x92482f97c0394fd0) == 0)
+        //                              return 1        ; magic match
+        //     return 0
+        //
+        // The two magic constants are a guard-word at the END of an internal
+        // texture-metadata blob written by the AGX firmware/kernel after
+        // creation. In chroot the blob is not initialised (firmware path
+        // diverges) so the magic mismatches → validate returns 0 → init
+        // nil-exits → newTextureWithDescriptor:iosurface:plane: = nil →
+        // SkyLight gets nil texture → WSCompositeDestinationCreateWith\
+        // MetalTexture: texture=nil → VNC stays black.
+        //
+        // Bypass: rewrite the function's first 2 instructions:
+        //     movz w0, #1   (0x52800020)
+        //     ret           (0xd65f03c0)
+        // (Function has no PAC prologue; safe to overwrite from byte 0.)
+        //
+        // Risk: validate is checking that the texture metadata footer is
+        // intact. Returning YES blindly means we accept textures whose
+        // metadata is wrong; later GPU draws using them may render garbage.
+        // For the SkyLight CaptureSurface path (a single 2-plane scanout
+        // target) that's acceptable — VNC reads the IOSurface CPU side via
+        // IOSurfaceLock and we don't need the GPU metadata at all.
+        //
+        // Gated by MACWS_AGX_VALIDATE_ALWAYS=1 (default ON when AGX-native).
+        if (getenv("MACWS_AGX_NATIVE") &&
+            !getenv("MACWS_AGX_KEEP_VALIDATE")) {
+            uint64_t fn_static = 0x1e576ef94;
+            uint32_t *fn_at = (uint32_t *)(fn_static + slide);
+            const uint32_t MOVZ_W0_1 = 0x52800020u;   // movz w0, #1
+            const uint32_t RET        = 0xd65f03c0u;  // ret
+            uint32_t cur0 = fn_at[0], cur1 = fn_at[1];
+            if (cur0 == MOVZ_W0_1 && cur1 == RET) {
+                fprintf(stderr,
+                    "#### MACWS_AGX_VALIDATE_ALWAYS: already patched @%p\n",
+                    fn_at);
+            } else {
+                // Sanity: expected first instruction is ADRP (the ivar load).
+                BOOL is_adrp = ((cur0 & 0x9F000000) == 0x90000000);
+                if (!is_adrp) {
+                    fprintf(stderr,
+                        "#### MACWS_AGX_VALIDATE_ALWAYS: @%p got %#x expected"
+                        " ADRP — skip\n",
+                        fn_at, cur0);
+                } else {
+                    ModifyExecutableRegion(fn_at, 8, ^{
+                        fn_at[0] = MOVZ_W0_1;
+                        fn_at[1] = RET;
+                    });
+                    fprintf(stderr,
+                        "#### MACWS_AGX_VALIDATE_ALWAYS: patched @%p "
+                        "(static 0x1e576ef94 + slide=%#zx) → always YES\n",
+                        fn_at, (size_t)slide);
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
+        // External __auth_stub patcher (MACWS_AGX_NATIVE-gated).
+        //
+        // The chained-fixups walker above repairs slots INSIDE this image's
+        // own __got / __auth_got sections. But AGXMetal13_3 was extracted
+        // from the dyld_shared_cache, and the cache builder consolidated
+        // cross-image function-pointer slots (objc_msgSend, objc_msgSend\
+        // Super2, libc, libobjc helpers, …) into shared __got pages OUTSIDE
+        // individual images. For this binary they live at:
+        //     0x21f927000..0x21f95b000     (15 pages, ~228 slots total)
+        // none of which are in any segment of the extracted file.
+        //
+        // 228 of AGXMetal13_3's __auth_stubs reference one of these external
+        // pages — the only 4 that stay in-image use 0x21e807000 (the local
+        // __auth_got). Walking chained-fixups can't reach the external slots:
+        // they have no fixup record because they were inlined into the cache
+        // at cache-build time.
+        //
+        // In chroot the pages are not mapped at the runtime VA the stubs
+        // compute (or they land in whatever happens to be at that VA from a
+        // neighboring mapping — e.g. MediaToolbox). `ldr x16, [x17] ; braa
+        // x16, x17` then reads garbage and either auth-traps or tail-calls
+        // the wrong function.
+        //
+        // Worked example confirmed via BN macOS DSC analysis this session:
+        //   stub @ 0x1e5a5dfc0 = adrp 0x21f95b000 + #0xca8 = slot 0x21f95bca8
+        //   slot in cache holds &_objc_msgSendSuper2
+        //   xrefs to sub_1e5a5dfc0 confirm 100+ -[…super dealloc] /
+        //     [super initWith…] call sites pass through this stub
+        //   in chroot the slot is wrong → super-init returns 0 →
+        //     -[AGXTexture initWithDevice:desc:iosurface:plane:] nil-exits →
+        //     newTextureWithDescriptor:iosurface:plane: = nil →
+        //     SkyLight's framebuffer wrap fails.
+        //
+        // Fix: rewrite the 4-instruction stub with a direct absolute jump:
+        //     movz x16, #lo16
+        //     movk x16, #mid16, lsl #16
+        //     movk x16, #hi16, lsl #32          ; user-space VA is 48-bit
+        //     br   x16                          ; unauthenticated br
+        // Same byte count (16). No PAC modulus issues; br is not authed and
+        // the stub itself lives in __TEXT which we already write through
+        // ModifyExecutableRegion elsewhere.
+        //
+        // Bootstrap the slot-offset→symbol map with the highest-value entry
+        // (msgSendSuper2). Extend as more broken paths are identified by
+        // crash-log triage.
+        if (getenv("MACWS_AGX_NATIVE")) {
+            struct stub_repair {
+                uint64_t    stub_static;
+                uint64_t    slot_static;   // expected adrp(page)+add(off) for logging
+                const char *symbol;
+            };
+            static const struct stub_repair repairs[] = {
+                // sub_1e5a5dfc0 — adrp 0x21f95b000 + #0xca8 = slot 0x21f95bca8.
+                // Slot holds _objc_msgSendSuper2 in the macOS DSC; the stub
+                // is the super-init / super-dealloc dispatcher for every
+                // class in this image.
+                { 0x1e5a5dfc0, 0x21f95bca8, "objc_msgSendSuper2" },
+            };
+            for (size_t i = 0; i < sizeof(repairs)/sizeof(repairs[0]); i++) {
+                const struct stub_repair *r = &repairs[i];
+                void *fn = dlsym(RTLD_DEFAULT, r->symbol);
+                if (!fn) {
+                    fprintf(stderr, "#### MACWS_AGX_STUB_FIX dlsym(%s)=NULL skip\n",
+                        r->symbol);
+                    continue;
+                }
+                uint32_t *stub_at      = (uint32_t *)(r->stub_static + slide);
+                void    **slot_runtime = (void **)   (r->slot_static + slide);
+
+                uint32_t cur0 = stub_at[0], cur1 = stub_at[1];
+                uint32_t cur2 = stub_at[2], cur3 = stub_at[3];
+
+                // Read slot value defensively — VA may not be mapped.
+                void *cur_slot = NULL;
+                Dl_info di = {0};
+                int dlinfo_ok = 0;
+                @try {
+                    cur_slot = *slot_runtime;
+                    dlinfo_ok = dladdr(cur_slot, &di);
+                } @catch (id e) {
+                    cur_slot = (void *)-1;
+                    dlinfo_ok = 0;
+                }
+                fprintf(stderr,
+                    "#### MACWS_AGX_STUB_FIX %s\n"
+                    "####   stub@%p insns=[%08x %08x %08x %08x]\n"
+                    "####   slot@%p value=%p sym=%s base=%p path=%s\n",
+                    r->symbol, stub_at, cur0, cur1, cur2, cur3,
+                    slot_runtime, cur_slot,
+                    dlinfo_ok ? (di.dli_sname ?: "(none)") : "(no-mapping)",
+                    dlinfo_ok ? di.dli_fbase : NULL,
+                    dlinfo_ok ? (di.dli_fname ?: "(none)") : "(none)");
+
+                // Build movz/movk/movk/br x16 → fn. (4 named vars, not an
+                // array — blocks can't capture C arrays directly.)
+                uint64_t t  = (uint64_t)fn;
+                uint16_t i0 = (uint16_t)( t        & 0xFFFF);
+                uint16_t i1 = (uint16_t)((t >> 16) & 0xFFFF);
+                uint16_t i2 = (uint16_t)((t >> 32) & 0xFFFF);
+                const uint32_t Rd = 16;   // x16
+                uint32_t insn0 = 0xD2800000u | ((uint32_t)i0 << 5) | Rd; // movz x16,#i0
+                uint32_t insn1 = 0xF2A00000u | ((uint32_t)i1 << 5) | Rd; // movk x16,#i1,#16
+                uint32_t insn2 = 0xF2C00000u | ((uint32_t)i2 << 5) | Rd; // movk x16,#i2,#32
+                uint32_t insn3 = 0xD61F0200u;                            // br   x16
+
+                BOOL already_patched = (cur0 == insn0 && cur1 == insn1 &&
+                                        cur2 == insn2 && cur3 == insn3);
+                if (already_patched) {
+                    fprintf(stderr, "####   already patched, skipping\n");
+                    continue;
+                }
+                // Sanity: top of original insn must look like ADRP.
+                //   ADRP encoding: bit31=1, bits28:24=10000 → mask 0x9F000000 == 0x90000000
+                BOOL is_adrp = ((cur0 & 0x9F000000) == 0x90000000);
+                if (!is_adrp) {
+                    fprintf(stderr, "####   first insn %#x not ADRP — skip\n", cur0);
+                    continue;
+                }
+                ModifyExecutableRegion(stub_at, 16, ^{
+                    stub_at[0] = insn0;
+                    stub_at[1] = insn1;
+                    stub_at[2] = insn2;
+                    stub_at[3] = insn3;
+                });
+                fprintf(stderr,
+                    "####   PATCHED → br %p (movz/movk/movk/br)\n"
+                    "####   new=[%08x %08x %08x %08x]\n",
+                    fn, insn0, insn1, insn2, insn3);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────────────
         // EVERYTHING BELOW (class registration via objc_readClassPair, AGX
         // class-method swizzles, initFull subDis fix) is gated behind
         // MACWS_AGX_REGISTER_CLASSES=1. This is the still-experimental "full
@@ -1809,6 +2463,23 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     if (!properties_cf) {
         return IOSurfaceCreate((NSDictionary *)properties_cf);
     }
+    // Scope this rewrite to WindowServer ONLY. Other processes (Activity Monitor,
+    // Terminal, etc.) crash in CFDictionaryGetValue when properties_cf is a
+    // real NSMutableDictionary subclass — the toll-free bridge dispatches to
+    // -[NSDictionary objectForKey:], and on-device arm64e PAC-faults when
+    // hashing keys whose class pointer is iOS-signed. WindowServer is the only
+    // caller that creates the '&b38' Apple-compressed CA Framebuffer surface
+    // we need to rewrite anyway.
+    {
+        static int s_is_ws = -1;
+        if (s_is_ws < 0) {
+            const char *prog = getprogname();
+            s_is_ws = (prog && strstr(prog, "WindowServer")) ? 1 : 0;
+        }
+        if (!s_is_ws) {
+            return IOSurfaceCreate((NSDictionary *)properties_cf);
+        }
+    }
     // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
     // real NSDictionary bridge — fall back to the raw CFDictionaryGetValue.
     if (CFGetTypeID(properties_cf) != CFDictionaryGetTypeID()) {
@@ -1984,6 +2655,18 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
                 return 0x9;
             case 0xb: // ioGPUResourceFinalize
                 return 0xa;
+            case 0xd: // IOGPUResourceSetPurgeable — function exists in both
+                      // builds (macOS IOGPU at 0x19d156478, iOS IOGPU at
+                      // 0x1eec60320). Byte-identical except `mov w1, #X`:
+                      // macOS uses #0xd, iOS uses #0xc. Args identical:
+                      // (resource->0x30, newState) → oldState; inCnt=2,
+                      // outCnt=1. Confirmed by static disasm of both this
+                      // session (2026-06-17). Without this, IOGPUMetal\
+                      // Texture's super-init issues sel=0xd to set
+                      // texture's heap purgeable state, iOS kernel returns
+                      // 0xe00002c2 (kIOReturnNoMemory or kIOReturnBadArg),
+                      // init returns nil + zeros self → texture wrap nil.
+                return 0xc;
             case 0xf: // IOGPUDeviceCreateDeviceShmem
                 return 0xd;
             case 0x10: // IOGPUDeviceDestroyDeviceShmem
@@ -2052,6 +2735,39 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
         }
+        // type=0x82: macOS "standalone resource with pinned GPU VA" — iOS
+        // kernel rejects (kIOReturnNoMemory). Re-shape as sub-resource of
+        // the most-recently-created heap:
+        //   - type 0x82 → 0x80
+        //   - parent_id := last heap's iOS GID
+        //   - +0x30 (end-VA) := heap's va38 + size, +0x38 := heap's start_va
+        //   - +0x58 (pinned GPU VA) := 0 (let kernel allocate freely)
+        // SkyLight gets a real kernel-allocated resource; GPU state is
+        // valid; pinned-VA semantics are lost but for the framebuffer scan-
+        // out path SkyLight reads CPU-side via IOSurface anyway.
+        if(agxType == 0x82 && g_agxIdMapCount > 0) {
+            int slot = g_agxIdMapCount - 1;  // most recent heap
+            shadowbuf[0] = 0x80;                                              // type → sub-resource
+            *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[slot].iosGID;
+            *(uint64_t *)(shadowbuf + 0x58) = 0;                              // drop pinned VA
+            // For sub-resources, kernel reads (+0x30 - +0x38) as size. Mirror
+            // the existing type=0x80 path: end_va = start_va + heap_size.
+            // If +0x38 was a small flag value rather than a VA, force it to 0.
+            uint64_t start_va = va38 < 0x1000 ? 0 : va38;
+            *(uint64_t *)(shadowbuf + 0x38) = start_va;
+            *(uint64_t *)(shadowbuf + 0x30) = start_va + g_agxIdMap[slot].size;
+            // +0x40 (mostly flags+0x80000000 hi-bit) — clear hi bits that may
+            // confuse the sub-resource path.
+            patched = 1;
+            fprintf(stderr,
+                "#### AGXIOC type=0x82 → sub-res of heap GID=%#llx (clientID=%#x size=%#llx)\n"
+                "####   start_va=%#llx end_va=%#llx\n",
+                (unsigned long long)g_agxIdMap[slot].iosGID,
+                g_agxIdMap[slot].clientID,
+                (unsigned long long)g_agxIdMap[slot].size,
+                (unsigned long long)start_va,
+                (unsigned long long)(start_va + g_agxIdMap[slot].size));
+        }
         if(patched) inStruct = shadowbuf;
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
@@ -2066,6 +2782,34 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     if(IOConnectIsIOGPU(client)) {
         fprintf(stderr, "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
+        // Diagnostic: dump the inStruct for ALL sel=0xa calls (resource
+        // create). Compare successful heap (line A) vs failing texture
+        // (line B) so we can identify what kernel rejects.
+        if (orig == 0xa && selector == 0x9 &&
+            inStruct && inStructCnt >= 0x60) {
+            const unsigned char *src = (const unsigned char *)inStruct;
+            uint8_t type = src[0];
+            uint32_t clientID = *(const uint32_t *)(src + 0x48);
+            uint64_t f30 = *(const uint64_t *)(src + 0x30);
+            uint64_t va38 = *(const uint64_t *)(src + 0x38);
+            uint64_t bc40 = *(const uint64_t *)(src + 0x40);
+            uint64_t va58 = *(const uint64_t *)(src + 0x58);
+            fprintf(stderr,
+                "####   ResCreate %s type=%#x clientID=%#x "
+                "+0x30=%#llx +0x38=%#llx +0x40=%#llx +0x58=%#llx\n",
+                r ? "FAIL" : "OK",
+                type, clientID,
+                (unsigned long long)f30, (unsigned long long)va38,
+                (unsigned long long)bc40,
+                (unsigned long long)va58);
+            // Hex dump first 0x70 bytes
+            fprintf(stderr, "####   inStruct[0..%zu]:", inStructCnt);
+            for (size_t i = 0; i < inStructCnt && i < 0x70; i++) {
+                if (i % 16 == 0) fprintf(stderr, "\n####     %02zx:", i);
+                fprintf(stderr, " %02x", src[i]);
+            }
+            fprintf(stderr, "\n");
+        }
     }
     return r;
 }
