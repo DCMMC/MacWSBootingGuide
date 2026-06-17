@@ -705,6 +705,15 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // textures (which DO succeed) run normally.
         install_skylight_prepare_for_use_tolerate_nil_hook((const void *)header);
 
+        // Render-update fail-fast retargets are ONLY needed under
+        // MACWS_AGX_NATIVE (where AGXG13GFamilyDevice rejects every
+        // newTexture call → nil propagates to render_update). Under the
+        // MTLSim path, render_update gets a valid composite_destination
+        // back and DOES write the framebuffer; redirecting its fail-path
+        // to the epilogue then prematurely shorts out subsequent
+        // re-renders too. Skip unless AGX-native is requested.
+        if (!getenv("MACWS_AGX_NATIVE")) goto skip_render_update_patches;
+
         // ── render_update composite_destination fail-fast retarget ──────────
         // Patch the `cbz x24, +0x660` at SkyLight 0x18525ec50 so that when
         // _WSCompositeDestinationCreateWithIOSurface (or its WithMetalTexture
@@ -799,6 +808,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             }
         }
+        skip_render_update_patches:;
 
         // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
