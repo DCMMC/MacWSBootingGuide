@@ -46,6 +46,8 @@
 	<dict>
 		<key>com.apple.metal.simulator</key>
 		<true/>
+		<key>com.macwsguide.blur</key>
+		<true/>
 	</dict>
 	<key>MinimumOSVersion</key>
 	<string>16.5</string>

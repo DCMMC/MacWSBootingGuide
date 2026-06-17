@@ -9,6 +9,7 @@ MTLSimDriverHost_FILES = main.x
 # -isystem: use the vendored iOS xpc headers (the theos iPhoneOS SDK ships
 # without xpc/). See ../vendor/ios-xpc/README.md.
 MTLSimDriverHost_CFLAGS = -fobjc-arc -isystem $(CURDIR)/../vendor/ios-xpc
+MTLSimDriverHost_FRAMEWORKS = Foundation Metal MetalPerformanceShaders IOSurface
 MTLSimDriverHost_CODESIGN_FLAGS = -S../entitlements.plist
 MTLSimDriverHost_INSTALL_PATH = /usr/macOS/Frameworks/MTLSimDriver.framework/XPCServices
 

@@ -49,6 +49,12 @@ static int macws_blur_trace(void) {
     if (v < 0) v = getenv("MACWS_BLUR_TRACE") ? 1 : 0;
     return v;
 }
+// Associated-object keys for caching the source / destination textures
+// captured on the render encoder so dispatchThreadsPerTile can hand them to
+// the XPC blur forward.
+static const void *MACWS_SRC_TEX_KEY = &MACWS_SRC_TEX_KEY;
+static const void *MACWS_DST_TEX_KEY = &MACWS_DST_TEX_KEY;
+
 static void macws_setTileTexture_impl(id self, SEL _cmd, id tex, NSUInteger idx) {
     if (macws_blur_trace()) {
         const char *label = "?";
@@ -57,6 +63,11 @@ static void macws_setTileTexture_impl(id self, SEL _cmd, id tex, NSUInteger idx)
                           w = (NSUInteger)[tex width]; h = (NSUInteger)[tex height]; } } @catch (NSException *e) {}
         fprintf(stderr, "#### blur-trace setTileTexture[%lu] = %p label=%s %lux%lu\n",
                 (unsigned long)idx, (void *)tex, label, (unsigned long)w, (unsigned long)h);
+    }
+    // Cache source texture on the encoder so the dispatchThreadsPerTile→XPC
+    // path can recover it.
+    if (idx == 0 && tex) {
+        objc_setAssociatedObject(self, MACWS_SRC_TEX_KEY, tex, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
         self, sel_registerName("setFragmentTexture:atIndex:"), tex, idx);
@@ -102,13 +113,8 @@ static void macws_setTileSamplerState_impl(id self, SEL _cmd, id sampler, NSUInt
 // render target. For a regular render encoder we substitute a fullscreen
 // triangle draw (3 vertices, MTLPrimitiveTypeTriangle) — the
 // downsample_blur_vert_lpf passthrough writes positions covering NDC.
-// 3-vertex fullscreen triangle, layout matches the vertex descriptor we
-// built for downsample_blur_vert_lpf:
-//   attr[0] position (float4) at offset 0
-//   attr[1] texcoord0 (float4, low 2 components used) at offset 16
-//   attr[3] color (float4) at offset 32
-// stride = 48 bytes; bufferIndex = 30 (chosen to avoid clash with
-// BlurState's fragment-slot buffer 0/1).
+// 3-vertex fullscreen triangle layout (vertex shader fallback when XPC
+// blur forward isn't available).
 typedef struct {
     float pos[4];
     float tex[4];
@@ -119,14 +125,94 @@ static const macws_fs_vtx_t macws_fs_triangle[3] = {
     {{ 3.0f, -1.0f, 0.0f, 1.0f}, {2.0f, 1.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}},
     {{-1.0f,  3.0f, 0.0f, 1.0f}, {0.0f,-1.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}},
 };
+
+// XPC blur forward to MTLSimDriverHost (iOS Metal + MPSImageGaussianBlur).
+// Cached connection so we don't reconnect every frame.
+static xpc_connection_t gBlurXpc = NULL;
+static xpc_connection_t macws_blur_xpc(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
+            dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+        if (!createMach) {
+            fprintf(stderr, "#### blur-xpc: createMach symbol missing\n");
+            return;
+        }
+        gBlurXpc = createMach("com.macwsguide.blur", NULL, 0);
+        if (!gBlurXpc) {
+            fprintf(stderr, "#### blur-xpc: createMach returned NULL\n");
+            return;
+        }
+        xpc_connection_set_event_handler(gBlurXpc, ^(xpc_object_t event) { (void)event; });
+        xpc_connection_resume(gBlurXpc);
+        fprintf(stderr, "#### blur-xpc: opened connection to com.macwsguide.blur\n");
+    });
+    return gBlurXpc;
+}
+
+// Send the source+dest IOSurfaces over to the host, wait synchronously, and
+// return YES on a successful blur. The caller then skips drawPrimitives so
+// the existing render encoder doesn't overwrite the host's MPS output.
+static BOOL macws_blur_forward(IOSurfaceRef src, IOSurfaceRef dst, double sigma) {
+    xpc_connection_t conn = macws_blur_xpc();
+    if (!conn || !src || !dst) return NO;
+    mach_port_t srcPort = IOSurfaceCreateMachPort(src);
+    mach_port_t dstPort = IOSurfaceCreateMachPort(dst);
+    if (srcPort == MACH_PORT_NULL || dstPort == MACH_PORT_NULL) {
+        if (srcPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), srcPort);
+        if (dstPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), dstPort);
+        return NO;
+    }
+    xpc_object_t req = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(req, "op", "blur");
+    xpc_dictionary_set_mach_send(req, "source_port", srcPort);
+    xpc_dictionary_set_mach_send(req, "dest_port", dstPort);
+    xpc_dictionary_set_double(req, "radius", sigma);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, req);
+    BOOL ok = NO;
+    if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+        const char *r = xpc_dictionary_get_string(reply, "result");
+        ok = r && strcmp(r, "ok") == 0;
+        if (macws_blur_trace()) {
+            fprintf(stderr, "#### blur-xpc reply: %s\n", r ?: "(no result)");
+        }
+    } else if (macws_blur_trace()) {
+        fprintf(stderr, "#### blur-xpc no reply\n");
+    }
+    if (srcPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), srcPort);
+    if (dstPort != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), dstPort);
+    return ok;
+}
+
 static void macws_dispatchThreadsPerTile_impl(id self, SEL _cmd, void *sizeArg) {
     if (macws_blur_trace()) {
-        fprintf(stderr, "#### blur-trace dispatchThreadsPerTile → setVertexBytes(fs triangle) + drawPrimitives(triangle, 3 verts)\n");
+        fprintf(stderr, "#### blur-trace dispatchThreadsPerTile\n");
     }
-    // Stage the fullscreen-triangle vertex buffer into slot 30 so the
-    // substitute pipeline's vertex shader has actual positions+texcoords
-    // to read. setVertexBytes:length:atIndex: is small enough (48*3 = 144 B
-    // < 4 KB) to go via inline upload.
+
+    // Try the XPC forward: pick up the source (cached in setTileTexture[0])
+    // and destination (cached in newRenderCommandEncoderWithDescriptor hook).
+    id<MTLTexture> srcTex = objc_getAssociatedObject(self, MACWS_SRC_TEX_KEY);
+    id<MTLTexture> dstTex = objc_getAssociatedObject(self, MACWS_DST_TEX_KEY);
+    if (srcTex && dstTex) {
+        IOSurfaceRef srcSurf = NULL, dstSurf = NULL;
+        @try { srcSurf = [srcTex iosurface]; } @catch (NSException *e) {}
+        @try { dstSurf = [dstTex iosurface]; } @catch (NSException *e) {}
+        if (srcSurf && dstSurf) {
+            // sigma from setTileBytes[0] is BlurState's tap-count/level — we
+            // map that to a fixed sigma for now (8 for the menu-bar feel).
+            BOOL ok = macws_blur_forward(srcSurf, dstSurf, 8.0);
+            if (ok) {
+                if (macws_blur_trace()) {
+                    fprintf(stderr, "#### blur-xpc: forward OK — skipping drawPrimitives\n");
+                }
+                // Host already wrote the destination IOSurface; don't run
+                // the local substitute draw which would overwrite it.
+                return;
+            }
+        }
+    }
+
+    // Fallback: substitute non-tile draw with QC blur shaders.
     ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(
         self, sel_registerName("setVertexBytes:length:atIndex:"),
         (const void *)macws_fs_triangle,
@@ -134,9 +220,7 @@ static void macws_dispatchThreadsPerTile_impl(id self, SEL _cmd, void *sizeArg) 
         (NSUInteger)30);
     ((void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
         self, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
-        (NSUInteger)3,  // MTLPrimitiveTypeTriangle
-        (NSUInteger)0,
-        (NSUInteger)3);
+        (NSUInteger)3, (NSUInteger)0, (NSUInteger)3);
 }
 // setThreadgroupMemoryLength:offset:atIndex: is a tile-encoder API for
 // declaring tile-local shared memory. Regular encoders don't need it.
@@ -144,6 +228,31 @@ static void macws_setThreadgroupMemoryLength_impl(id self, SEL _cmd, NSUInteger 
     (void)self; (void)len; (void)off; (void)idx;
     // no-op for non-tile encoder
 }
+// Swizzle target on MTLSimCommandBuffer: captures the render-pass
+// descriptor's color attachment[0] texture and associates it with the
+// returned encoder so dispatchThreadsPerTile→XPC can read it back.
+static id (*orig_renderCommandEncoderWithDescriptor)(id, SEL, id) = NULL;
+static id macws_renderCommandEncoder_capture(id self, SEL _cmd, id passDesc) {
+    id encoder = orig_renderCommandEncoderWithDescriptor(self, _cmd, passDesc);
+    if (encoder && passDesc) {
+        @try {
+            id colorAtts = [passDesc valueForKey:@"colorAttachments"];
+            id att0 = [colorAtts objectAtIndexedSubscript:0];
+            id<MTLTexture> dst = [att0 valueForKey:@"texture"];
+            if (dst) {
+                objc_setAssociatedObject(encoder, MACWS_DST_TEX_KEY, dst, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                if (macws_blur_trace()) {
+                    NSUInteger w = (NSUInteger)[dst width], h = (NSUInteger)[dst height];
+                    const char *lab = [[dst label] UTF8String] ?: "(nolabel)";
+                    fprintf(stderr, "#### blur-trace renderCommandEncoder colorAtt[0] = %p label=%s %lux%lu\n",
+                            (void *)dst, lab, (unsigned long)w, (unsigned long)h);
+                }
+            }
+        } @catch (NSException *e) {}
+    }
+    return encoder;
+}
+
 __attribute__((constructor)) static void macws_install_tile_encoder_forwards(void) {
     // Defer until MTLSimRenderCommandEncoder class is loaded.
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -165,6 +274,70 @@ __attribute__((constructor)) static void macws_install_tile_encoder_forwards(voi
         class_addMethod(enc, sel_registerName("setThreadgroupMemoryLength:offset:atIndex:"),
                         (IMP)macws_setThreadgroupMemoryLength_impl, "v@:QQQ");
         fprintf(stderr, "#### tile-encoder forwards installed on MTLSimRenderCommandEncoder\n");
+        fflush(stderr);
+        fprintf(stderr, "#### BLUR-DEBUG: about to look for MTLSim command buffer class\n");
+        fflush(stderr);
+
+        // Swizzle the MTLSim command-buffer class's
+        // renderCommandEncoderWithDescriptor: to capture the render pass's
+        // color attachment[0] texture (= the blur destination) so the XPC
+        // forward can pass it across. Class name varies across MTLSimDriver
+        // builds — try several candidates.
+        const char *cb_names[] = {
+            "MTLSimCommandBuffer",
+            "MTLSimMainCommandBuffer",
+            "MTLSimSecondaryCommandBuffer",
+            "MTLSimulatorCommandBuffer",
+            "MTLToolsCommandBuffer",
+            "MTLDebugCommandBuffer",
+            "MTLIGAccelCommandBuffer",
+            NULL
+        };
+        Class cb = nil;
+        for (int i = 0; cb_names[i]; i++) {
+            Class c = objc_getClass(cb_names[i]);
+            if (c) {
+                cb = c;
+                fprintf(stderr, "#### blur: found command-buffer class %s\n", cb_names[i]);
+                break;
+            }
+        }
+        if (!cb) {
+            // Fall back: enumerate ALL classes, find any whose name has
+            // "CommandBuffer" and "Sim" or implements renderCommandEncoder.
+            unsigned int n = 0;
+            Class *all = objc_copyClassList(&n);
+            for (unsigned int i = 0; i < n; i++) {
+                const char *nm = class_getName(all[i]);
+                if (!nm) continue;
+                if (strstr(nm, "CommandBuffer") && (strstr(nm, "Sim") || strstr(nm, "MTL"))) {
+                    Method mm = class_getInstanceMethod(all[i],
+                        sel_registerName("renderCommandEncoderWithDescriptor:"));
+                    if (mm) {
+                        cb = all[i];
+                        fprintf(stderr, "#### blur: located command-buffer class %s by scan\n", nm);
+                        break;
+                    }
+                }
+            }
+            if (all) free(all);
+        }
+        if (cb) {
+            SEL sel = sel_registerName("renderCommandEncoderWithDescriptor:");
+            Method m = class_getInstanceMethod(cb, sel);
+            if (m) {
+                orig_renderCommandEncoderWithDescriptor =
+                    (id (*)(id, SEL, id))method_getImplementation(m);
+                method_setImplementation(m, (IMP)macws_renderCommandEncoder_capture);
+                fprintf(stderr, "#### %s.renderCommandEncoderWithDescriptor swizzled\n",
+                        class_getName(cb));
+            } else {
+                fprintf(stderr, "#### blur: cmd-buffer class %s has NO renderCommandEncoderWithDescriptor\n",
+                        class_getName(cb));
+            }
+        } else {
+            fprintf(stderr, "#### blur: no MTLSim command-buffer class found\n");
+        }
     });
 }
 
