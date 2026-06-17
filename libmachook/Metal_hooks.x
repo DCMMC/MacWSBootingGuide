@@ -41,31 +41,60 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 // setTileBytes:length:atIndex: on the regular render encoder (since the
 // substitute pipeline isn't actually a tile pipeline, but BlurState doesn't
 // know). Redirect each tile-* selector to its fragment-* equivalent.
+// MACWS_BLUR_TRACE=1 dumps every tile-encoder selector forward with the
+// actual arguments so we can reconstruct what BlurState is staging into the
+// (substitute) fragment slots and align the shader IO accordingly.
+static int macws_blur_trace(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("MACWS_BLUR_TRACE") ? 1 : 0;
+    return v;
+}
 static void macws_setTileTexture_impl(id self, SEL _cmd, id tex, NSUInteger idx) {
-    static int log_count = 0;
-    if (log_count++ < 3) {
-        fprintf(stderr, "#### tile-encoder: setTileTexture:atIndex:%lu → setFragmentTexture\n", (unsigned long)idx);
+    if (macws_blur_trace()) {
+        const char *label = "?";
+        NSUInteger w = 0, h = 0;
+        @try { if (tex) { label = [[tex label] UTF8String] ?: "(nolabel)";
+                          w = (NSUInteger)[tex width]; h = (NSUInteger)[tex height]; } } @catch (NSException *e) {}
+        fprintf(stderr, "#### blur-trace setTileTexture[%lu] = %p label=%s %lux%lu\n",
+                (unsigned long)idx, (void *)tex, label, (unsigned long)w, (unsigned long)h);
     }
     ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
         self, sel_registerName("setFragmentTexture:atIndex:"), tex, idx);
 }
 static void macws_setTileBuffer_impl(id self, SEL _cmd, id buf, NSUInteger off, NSUInteger idx) {
-    static int log_count = 0;
-    if (log_count++ < 3) {
-        fprintf(stderr, "#### tile-encoder: setTileBuffer:offset:atIndex:%lu → setFragmentBuffer\n", (unsigned long)idx);
+    if (macws_blur_trace()) {
+        const char *label = "?";
+        NSUInteger len = 0;
+        @try { if (buf) { label = [[buf label] UTF8String] ?: "(nolabel)";
+                          len = (NSUInteger)[buf length]; } } @catch (NSException *e) {}
+        fprintf(stderr, "#### blur-trace setTileBuffer[%lu] = %p label=%s len=%lu off=%lu\n",
+                (unsigned long)idx, (void *)buf, label, (unsigned long)len, (unsigned long)off);
     }
     ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(
         self, sel_registerName("setFragmentBuffer:offset:atIndex:"), buf, off, idx);
 }
 static void macws_setTileBytes_impl(id self, SEL _cmd, const void *bytes, NSUInteger len, NSUInteger idx) {
-    static int log_count = 0;
-    if (log_count++ < 3) {
-        fprintf(stderr, "#### tile-encoder: setTileBytes:length:atIndex:%lu → setFragmentBytes\n", (unsigned long)idx);
+    if (macws_blur_trace()) {
+        fprintf(stderr, "#### blur-trace setTileBytes[%lu] len=%lu", (unsigned long)idx, (unsigned long)len);
+        const uint8_t *p = (const uint8_t *)bytes;
+        size_t dump = len < 64 ? len : 64;
+        fprintf(stderr, "  bytes=");
+        for (size_t i = 0; i < dump; i++) fprintf(stderr, "%02x", p[i]);
+        // Also interpret first 32 bytes as 8 floats (typical uniform layout).
+        if (len >= 32) {
+            const float *f = (const float *)bytes;
+            fprintf(stderr, "\n####   floats=[%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f]",
+                    f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+        }
+        fprintf(stderr, "\n");
     }
     ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(
         self, sel_registerName("setFragmentBytes:length:atIndex:"), bytes, len, idx);
 }
 static void macws_setTileSamplerState_impl(id self, SEL _cmd, id sampler, NSUInteger idx) {
+    if (macws_blur_trace()) {
+        fprintf(stderr, "#### blur-trace setTileSampler[%lu] = %p\n", (unsigned long)idx, (void *)sampler);
+    }
     ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
         self, sel_registerName("setFragmentSamplerState:atIndex:"), sampler, idx);
 }
@@ -73,13 +102,36 @@ static void macws_setTileSamplerState_impl(id self, SEL _cmd, id sampler, NSUInt
 // render target. For a regular render encoder we substitute a fullscreen
 // triangle draw (3 vertices, MTLPrimitiveTypeTriangle) — the
 // downsample_blur_vert_lpf passthrough writes positions covering NDC.
+// 3-vertex fullscreen triangle, layout matches the vertex descriptor we
+// built for downsample_blur_vert_lpf:
+//   attr[0] position (float4) at offset 0
+//   attr[1] texcoord0 (float4, low 2 components used) at offset 16
+//   attr[3] color (float4) at offset 32
+// stride = 48 bytes; bufferIndex = 30 (chosen to avoid clash with
+// BlurState's fragment-slot buffer 0/1).
+typedef struct {
+    float pos[4];
+    float tex[4];
+    float col[4];
+} macws_fs_vtx_t;
+static const macws_fs_vtx_t macws_fs_triangle[3] = {
+    {{-1.0f, -1.0f, 0.0f, 1.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}},
+    {{ 3.0f, -1.0f, 0.0f, 1.0f}, {2.0f, 1.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}},
+    {{-1.0f,  3.0f, 0.0f, 1.0f}, {0.0f,-1.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f, 1.0f}},
+};
 static void macws_dispatchThreadsPerTile_impl(id self, SEL _cmd, void *sizeArg) {
-    static int log_count = 0;
-    if (log_count++ < 3) {
-        fprintf(stderr, "#### tile-encoder: dispatchThreadsPerTile → drawPrimitives(triangle, 3 verts)\n");
+    if (macws_blur_trace()) {
+        fprintf(stderr, "#### blur-trace dispatchThreadsPerTile → setVertexBytes(fs triangle) + drawPrimitives(triangle, 3 verts)\n");
     }
-    // drawPrimitives:vertexStart:vertexCount: = sel_registerName("drawPrimitives:vertexStart:vertexCount:")
-    // MTLPrimitiveTypeTriangle = 3
+    // Stage the fullscreen-triangle vertex buffer into slot 30 so the
+    // substitute pipeline's vertex shader has actual positions+texcoords
+    // to read. setVertexBytes:length:atIndex: is small enough (48*3 = 144 B
+    // < 4 KB) to go via inline upload.
+    ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(
+        self, sel_registerName("setVertexBytes:length:atIndex:"),
+        (const void *)macws_fs_triangle,
+        (NSUInteger)sizeof(macws_fs_triangle),
+        (NSUInteger)30);
     ((void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
         self, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
         (NSUInteger)3,  // MTLPrimitiveTypeTriangle
@@ -760,24 +812,28 @@ static void macws_sigabrt_trampoline(int sig) {
     }
     if (cached_vfn) {
         rdesc.vertexFunction = cached_vfn;
-        // std_vert0_lpf and friends take vertex inputs ([[attribute(0..N)]]).
-        // Build a vertex descriptor that matches each declared stage-input
-        // attribute by introspecting the function. Each attribute gets a
-        // float4 layout in its own buffer with stride 0 (constant attribute).
         NSArray *attrs = [cached_vfn performSelector:@selector(vertexAttributes)];
         if (attrs && [attrs count] > 0) {
             MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
-            NSUInteger maxBuf = 0;
+            // Log all attributes so we know what to pre-populate for draw.
             for (id a in attrs) {
                 NSUInteger idx = (NSUInteger)[[a valueForKey:@"attributeIndex"] unsignedLongValue];
+                NSUInteger attrType = (NSUInteger)[[a valueForKey:@"attributeType"] unsignedLongValue];
+                NSString *nm = [a valueForKey:@"name"];
+                fprintf(stderr,
+                    "#### blur-trace vertex attr[%lu]: name=%s type=%lu\n",
+                    (unsigned long)idx,
+                    nm ? [nm UTF8String] : "(no name)",
+                    (unsigned long)attrType);
+                // All attributes use buffer idx 0 (we'll populate one buffer
+                // with all needed data per vertex in dispatchThreadsPerTile).
                 vd.attributes[idx].format = MTLVertexFormatFloat4;
-                vd.attributes[idx].offset = 0;
-                vd.attributes[idx].bufferIndex = idx;
-                vd.layouts[idx].stride = 16;
-                vd.layouts[idx].stepFunction = MTLVertexStepFunctionConstant;
-                vd.layouts[idx].stepRate = 0;  // 0 required for Constant step
-                if (idx > maxBuf) maxBuf = idx;
+                vd.attributes[idx].offset = idx * 16;
+                vd.attributes[idx].bufferIndex = 30;  // high slot to avoid clash
             }
+            vd.layouts[30].stride = [attrs count] * 16;
+            vd.layouts[30].stepFunction = MTLVertexStepFunctionPerVertex;
+            vd.layouts[30].stepRate = 1;
             rdesc.vertexDescriptor = vd;
         }
     } else {
