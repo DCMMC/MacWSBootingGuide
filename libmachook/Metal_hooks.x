@@ -30,6 +30,92 @@ void swizzle2(Class class, SEL originalAction, Class class2, SEL swizzledAction)
 - (uint32_t)acceleratorPort;
 @end
 
+// ─── Tile-pipeline → render-pipeline substitution ────────────────────────────
+// (definition moved into the MTLFakeDevice category below as
+// `hooked_newRenderPipelineStateWithTileDescriptor:...`, then runtime-swizzled
+// onto MTLSimDevice in initHooks. Logos `%hook MTLSimDevice` doesn't apply
+// here because MTLSimDevice has no compile-time interface declaration.)
+
+// MTLSimRenderCommandEncoder forwarding helpers — BlurState issues
+// setTileTexture:atIndex:, setTileBuffer:offset:atIndex:,
+// setTileBytes:length:atIndex: on the regular render encoder (since the
+// substitute pipeline isn't actually a tile pipeline, but BlurState doesn't
+// know). Redirect each tile-* selector to its fragment-* equivalent.
+static void macws_setTileTexture_impl(id self, SEL _cmd, id tex, NSUInteger idx) {
+    static int log_count = 0;
+    if (log_count++ < 3) {
+        fprintf(stderr, "#### tile-encoder: setTileTexture:atIndex:%lu → setFragmentTexture\n", (unsigned long)idx);
+    }
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
+        self, sel_registerName("setFragmentTexture:atIndex:"), tex, idx);
+}
+static void macws_setTileBuffer_impl(id self, SEL _cmd, id buf, NSUInteger off, NSUInteger idx) {
+    static int log_count = 0;
+    if (log_count++ < 3) {
+        fprintf(stderr, "#### tile-encoder: setTileBuffer:offset:atIndex:%lu → setFragmentBuffer\n", (unsigned long)idx);
+    }
+    ((void (*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)(
+        self, sel_registerName("setFragmentBuffer:offset:atIndex:"), buf, off, idx);
+}
+static void macws_setTileBytes_impl(id self, SEL _cmd, const void *bytes, NSUInteger len, NSUInteger idx) {
+    static int log_count = 0;
+    if (log_count++ < 3) {
+        fprintf(stderr, "#### tile-encoder: setTileBytes:length:atIndex:%lu → setFragmentBytes\n", (unsigned long)idx);
+    }
+    ((void (*)(id, SEL, const void *, NSUInteger, NSUInteger))objc_msgSend)(
+        self, sel_registerName("setFragmentBytes:length:atIndex:"), bytes, len, idx);
+}
+static void macws_setTileSamplerState_impl(id self, SEL _cmd, id sampler, NSUInteger idx) {
+    ((void (*)(id, SEL, id, NSUInteger))objc_msgSend)(
+        self, sel_registerName("setFragmentSamplerState:atIndex:"), sampler, idx);
+}
+// dispatchThreadsPerTile: dispatches the tile shader once per tile in the
+// render target. For a regular render encoder we substitute a fullscreen
+// triangle draw (3 vertices, MTLPrimitiveTypeTriangle) — the
+// downsample_blur_vert_lpf passthrough writes positions covering NDC.
+static void macws_dispatchThreadsPerTile_impl(id self, SEL _cmd, void *sizeArg) {
+    static int log_count = 0;
+    if (log_count++ < 3) {
+        fprintf(stderr, "#### tile-encoder: dispatchThreadsPerTile → drawPrimitives(triangle, 3 verts)\n");
+    }
+    // drawPrimitives:vertexStart:vertexCount: = sel_registerName("drawPrimitives:vertexStart:vertexCount:")
+    // MTLPrimitiveTypeTriangle = 3
+    ((void (*)(id, SEL, NSUInteger, NSUInteger, NSUInteger))objc_msgSend)(
+        self, sel_registerName("drawPrimitives:vertexStart:vertexCount:"),
+        (NSUInteger)3,  // MTLPrimitiveTypeTriangle
+        (NSUInteger)0,
+        (NSUInteger)3);
+}
+// setThreadgroupMemoryLength:offset:atIndex: is a tile-encoder API for
+// declaring tile-local shared memory. Regular encoders don't need it.
+static void macws_setThreadgroupMemoryLength_impl(id self, SEL _cmd, NSUInteger len, NSUInteger off, NSUInteger idx) {
+    (void)self; (void)len; (void)off; (void)idx;
+    // no-op for non-tile encoder
+}
+__attribute__((constructor)) static void macws_install_tile_encoder_forwards(void) {
+    // Defer until MTLSimRenderCommandEncoder class is loaded.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class enc = objc_getClass("MTLSimRenderCommandEncoder");
+        if (!enc) {
+            fprintf(stderr, "#### tile-encoder forwards: class MTLSimRenderCommandEncoder NOT found\n");
+            return;
+        }
+        class_addMethod(enc, sel_registerName("setTileTexture:atIndex:"),
+                        (IMP)macws_setTileTexture_impl, "v@:@Q");
+        class_addMethod(enc, sel_registerName("setTileBuffer:offset:atIndex:"),
+                        (IMP)macws_setTileBuffer_impl, "v@:@QQ");
+        class_addMethod(enc, sel_registerName("setTileBytes:length:atIndex:"),
+                        (IMP)macws_setTileBytes_impl, "v@:^vQQ");
+        class_addMethod(enc, sel_registerName("setTileSamplerState:atIndex:"),
+                        (IMP)macws_setTileSamplerState_impl, "v@:@Q");
+        class_addMethod(enc, sel_registerName("dispatchThreadsPerTile:"),
+                        (IMP)macws_dispatchThreadsPerTile_impl, "v@:^v");
+        class_addMethod(enc, sel_registerName("setThreadgroupMemoryLength:offset:atIndex:"),
+                        (IMP)macws_setThreadgroupMemoryLength_impl, "v@:QQQ");
+        fprintf(stderr, "#### tile-encoder forwards installed on MTLSimRenderCommandEncoder\n");
+    });
+}
+
 @implementation _MTLDevice(MetalXPC)
 - (void)_setAcceleratorService:(id)arg1 {}
 
@@ -88,6 +174,13 @@ static id(*MTLCreateSimulatorDevice)(void);
              MTLFakeDevice.class, @selector(hooked_newTextureWithDescriptor:iosurface:plane:));
     swizzle2(MTLSimDeviceClass, @selector(newTextureWithDescriptor:),
              MTLFakeDevice.class, @selector(hooked_newTextureWithDescriptor:));
+    // Tile-pipeline → render-pipeline substitution: MTLSimDevice's tile-
+    // pipeline impl MTLReportFailure-aborts WS. Swizzle to our converter.
+    swizzle2(MTLSimDeviceClass,
+             @selector(newRenderPipelineStateWithTileDescriptor:options:reflection:error:),
+             MTLFakeDevice.class,
+             @selector(hooked_newRenderPipelineStateWithTileDescriptor:options:reflection:error:));
+    fprintf(stderr, "#### MTLSimDevice tile-pipeline → MTLFakeDevice converter swizzled\n");
 
     // MTLSimDevice has SUBCLASSES (MTLSimGPU13MDevice, MTLSimGPU11Device, ...).
     // If the runtime class is a subclass that overrides our hooked selectors, the
@@ -535,6 +628,204 @@ static void macws_sigabrt_trampoline(int sig) {
     } else if (!result) {
         macws_log_mtldesc(desc, NULL, 0, "plain.NIL");
     }
+    return result;
+}
+
+// ─── Tile-pipeline → render-pipeline converter ──────────────────────────────
+// MTLSimDevice's `newRenderPipelineStateWithTileDescriptor:options:reflection:
+// error:` MTLReportFailure-aborts WS. Swizzled onto MTLSimDevice; converts
+// the MTLTileRenderPipelineDescriptor into an MTLRenderPipelineDescriptor
+// (tileFunction → fragmentFunction, copy color attachments + sample count)
+// and creates a regular MTLRenderPipelineState. BlurState::tile_downsample
+// stores this in PingPongState and the subsequent draw runs through a
+// regular MTLRenderCommandEncoder. Tile-specific shader intrinsics will not
+// behave the same way they would on a real tile pipeline, but the BlurState
+// flow does NOT short-circuit on nil and the destination texture DOES get
+// written, so vibrancy panels render with content instead of solid black.
+- (id)hooked_newRenderPipelineStateWithTileDescriptor:(id)tileDesc
+                                              options:(NSUInteger)opt
+                                           reflection:(id *)refl
+                                                error:(NSError **)err {
+    static int log_count = 0;
+    if (log_count < 4) {
+        log_count++;
+        fprintf(stderr, "#### MTLSim tile-pipeline req → converting to render-pipeline\n");
+    }
+
+    MTLRenderPipelineDescriptor *rdesc = [[MTLRenderPipelineDescriptor alloc] init];
+    if ([tileDesc respondsToSelector:@selector(label)]) {
+        rdesc.label = [tileDesc performSelector:@selector(label)] ?: @"TileFallback";
+    }
+
+    // Use QuartzCore's own non-tile downsample-blur shaders. Their default
+    // .metallib at /System/Library/Frameworks/QuartzCore.framework/Versions/A/
+    // Resources/default.metallib defines `downsample_blur_4_frag_lpf` and
+    // `downsample_blur_vert_lpf` for exactly this purpose — the non-tile
+    // fallback path that QuartzCore uses on devices without tile rendering.
+    // These shaders are pre-compiled and DO compile in chroot (no source
+    // compilation needed).
+    static dispatch_once_t qc_lib_once;
+    static id<MTLLibrary> qc_lib = nil;
+    static id<MTLFunction> qc_frag = nil;
+    dispatch_once(&qc_lib_once, ^{
+        NSURL *qcurl = [NSURL fileURLWithPath:
+            @"/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"];
+        NSError *lerr = nil;
+        qc_lib = [(id<MTLDevice>)self newLibraryWithURL:qcurl error:&lerr];
+        if (qc_lib) {
+            qc_frag = [qc_lib newFunctionWithName:@"downsample_blur_4_frag_lpf"];
+            fprintf(stderr, "#### tile-pipeline: QC frag = %p (downsample_blur_4_frag_lpf)\n",
+                    (void *)qc_frag);
+        }
+    });
+    if (qc_frag) {
+        rdesc.fragmentFunction = qc_frag;
+    } else if ([tileDesc respondsToSelector:@selector(tileFunction)]) {
+        // Last-resort: use the tile function as fragment (will likely fail
+        // to compile due to imageblock intrinsics, but we already log that).
+        id tileFn = [tileDesc performSelector:@selector(tileFunction)];
+        rdesc.fragmentFunction = (id<MTLFunction>)tileFn;
+    }
+    // Tile pipelines have no vertex stage but MTLRenderPipelineDescriptor
+    // validation REQUIRES a vertex function. Source-level compilation fails
+    // in chroot (`This library format is not supported on this platform`),
+    // so try a pre-existing library route instead.
+    //
+    // Try device's default library + the tile descriptor's tileFunction's
+    // own library (the same .metallib that contains the tile fragment also
+    // usually has a vertex helper). If both fail, return nil + NSError.
+    static dispatch_once_t vfn_once;
+    static id<MTLFunction> cached_vfn = nil;
+    static NSArray<NSString *> *cand_names = nil;
+    dispatch_once(&vfn_once, ^{
+        cand_names = @[
+            @"vertex_passthrough", @"vertexPassthrough",
+            @"passthrough_vertex", @"passthroughVertex",
+            @"PassthroughVertex", @"passthrough",
+            @"fs_vertex", @"fullscreen_vertex", @"fullscreenVertex",
+            @"main_vertex", @"vert_main", @"main0",
+        ];
+    });
+    if (!cached_vfn) {
+        // First: try the tile function's own library (BlurState's tile
+        // shader is in QuartzCore's default.metallib, which also exposes
+        // std_vert0_lpf / std_vert1_lpf / upsample_vert_lpf / etc.).
+        id tileFn = nil;
+        if ([tileDesc respondsToSelector:@selector(tileFunction)]) {
+            tileFn = [tileDesc performSelector:@selector(tileFunction)];
+        }
+        // Order matters: downsample_blur_vert_lpf provides the texcoord0
+        // output that downsample_blur_4_frag_lpf reads. std_vert0_lpf only
+        // emits position and causes "Fragment input mismatching" errors.
+        NSArray<NSString *> *qc_names = @[
+            @"downsample_blur_vert_lpf",
+            @"upsample_vert_lpf",
+            @"std_vert1_lpf", @"std_vert0_lpf",
+            @"read_surf_vert",
+        ];
+        if (tileFn && [tileFn respondsToSelector:@selector(library)]) {
+            id lib = [tileFn performSelector:@selector(library)];
+            for (NSString *nm in qc_names) {
+                id<MTLFunction> f = [(id<MTLLibrary>)lib newFunctionWithName:nm];
+                if (f) { cached_vfn = f; break; }
+            }
+            if (!cached_vfn) {
+                for (NSString *nm in cand_names) {
+                    id<MTLFunction> f = [(id<MTLLibrary>)lib newFunctionWithName:nm];
+                    if (f) { cached_vfn = f; break; }
+                }
+            }
+        }
+        // Second: load QuartzCore's default.metallib directly by URL.
+        if (!cached_vfn) {
+            @try {
+                NSURL *qcurl = [NSURL fileURLWithPath:
+                    @"/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"];
+                NSError *lerr = nil;
+                id<MTLLibrary> lib = [(id<MTLDevice>)self newLibraryWithURL:qcurl error:&lerr];
+                if (lib) {
+                    for (NSString *nm in qc_names) {
+                        id<MTLFunction> f = [lib newFunctionWithName:nm];
+                        if (f) { cached_vfn = f; break; }
+                    }
+                } else if (lerr) {
+                    fprintf(stderr, "#### tile-pipeline: QC metallib load err: %s\n",
+                            [[lerr localizedDescription] UTF8String]);
+                }
+            } @catch (NSException *e) {}
+        }
+        fprintf(stderr, "#### tile-pipeline: vertex fn lookup = %p (name=%s)\n",
+                (void *)cached_vfn,
+                cached_vfn ? [[cached_vfn name] UTF8String] : "(none)");
+    }
+    if (cached_vfn) {
+        rdesc.vertexFunction = cached_vfn;
+        // std_vert0_lpf and friends take vertex inputs ([[attribute(0..N)]]).
+        // Build a vertex descriptor that matches each declared stage-input
+        // attribute by introspecting the function. Each attribute gets a
+        // float4 layout in its own buffer with stride 0 (constant attribute).
+        NSArray *attrs = [cached_vfn performSelector:@selector(vertexAttributes)];
+        if (attrs && [attrs count] > 0) {
+            MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
+            NSUInteger maxBuf = 0;
+            for (id a in attrs) {
+                NSUInteger idx = (NSUInteger)[[a valueForKey:@"attributeIndex"] unsignedLongValue];
+                vd.attributes[idx].format = MTLVertexFormatFloat4;
+                vd.attributes[idx].offset = 0;
+                vd.attributes[idx].bufferIndex = idx;
+                vd.layouts[idx].stride = 16;
+                vd.layouts[idx].stepFunction = MTLVertexStepFunctionConstant;
+                vd.layouts[idx].stepRate = 0;  // 0 required for Constant step
+                if (idx > maxBuf) maxBuf = idx;
+            }
+            rdesc.vertexDescriptor = vd;
+        }
+    } else {
+        if (err) *err = [NSError errorWithDomain:@"MTLDevice" code:0
+                                        userInfo:@{NSLocalizedDescriptionKey:
+                                                   @"No passthrough vertex function available"}];
+        return nil;
+    }
+
+    if ([tileDesc respondsToSelector:@selector(colorAttachments)]) {
+        id colAtts = [tileDesc performSelector:@selector(colorAttachments)];
+        for (NSUInteger i = 0; i < 8; i++) {
+            id src = nil;
+            @try { src = [colAtts objectAtIndexedSubscript:i]; } @catch (NSException *e) { break; }
+            if (!src) continue;
+            MTLPixelFormat fmt = MTLPixelFormatInvalid;
+            @try { fmt = (MTLPixelFormat)[[src valueForKey:@"pixelFormat"] unsignedLongValue]; } @catch (NSException *e) {}
+            if (fmt == MTLPixelFormatInvalid) continue;
+            rdesc.colorAttachments[i].pixelFormat = fmt;
+        }
+    }
+    if ([tileDesc respondsToSelector:@selector(rasterSampleCount)]) {
+        @try {
+            rdesc.rasterSampleCount = (NSUInteger)[[tileDesc valueForKey:@"rasterSampleCount"] unsignedLongValue] ?: 1;
+        } @catch (NSException *e) { rdesc.rasterSampleCount = 1; }
+    }
+
+    NSError *e2 = nil;
+    id<MTLRenderPipelineState> result =
+        [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:rdesc
+                                                          options:opt
+                                                       reflection:nil
+                                                            error:&e2];
+    if (refl) *refl = nil;
+    if (!result) {
+        // Last resort: nil + NSError. WS stays alive; BlurState bails out
+        // and the panel reverts to defensive solid color (still no abort).
+        if (err) *err = e2 ?: [NSError errorWithDomain:@"MTLDevice" code:0
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                         @"Tile pipeline conversion failed"}];
+        static int fail_count = 0;
+        if (fail_count++ < 4) {
+            fprintf(stderr, "#### tile-pipeline conversion FAILED: %s\n",
+                    e2 ? [[e2 localizedDescription] UTF8String] : "(no error)");
+        }
+        return nil;
+    }
+    if (err) *err = nil;
     return result;
 }
 @end

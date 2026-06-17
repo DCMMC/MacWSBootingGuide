@@ -58,6 +58,30 @@ __attribute__((constructor)) static void InitQuartzCoreHooks() {
     void *handle = dlopen(quartzCorePath, RTLD_GLOBAL);
     assert(handle);
     MSImageRef quartzCore = MSGetImageByName(quartzCorePath);
-    MSHookFunction(MSFindSymbol(quartzCore, "__ZN2CA3OGL9BlurState15tile_downsampleEi"),
-        (void *)BlurState_tile_downsample, NULL);
+    // MACWS_DISABLE_BLUR_TILE=1 keeps the defensive stub that returns 0
+    // (used during earlier sessions when tile-pipeline creation hard-crashed
+    // WS via MTLReportFailure). With the assert-NOP patches now covering ~50
+    // CAWSBackend assertion sites + the SkyLight render_update fail-path
+    // catch-all, the real tile path may complete (Metal's base impl returns
+    // nil + NSError; that error path is more recoverable than a kernel
+    // abort). Default: let original run.
+    // Default: stub `BlurState::tile_downsample` to return 0. The original
+    // function calls `MetalContext::get_tile_pipeline` which is hard-coded
+    // to `abort_with_payload` if tile pipeline creation returns nil.
+    // Even with our Metal_hooks tile→render-pipeline converter, QuartzCore's
+    // internal compiler returns "Compiler internal error" on the substitute
+    // descriptor (vertex/fragment IO mismatch), so we still get nil from
+    // get_tile_pipeline → abort. Stub returns 0 → BlurState skips
+    // tile_downsample_surface entirely → no abort → WS stays alive (vibrancy
+    // panels render solid color, but the rest of compositing keeps working).
+    //
+    // MACWS_TRY_TILE_PIPELINE=1 disables the stub so the substitute path can
+    // be exercised (development/debug only — currently crashes WS).
+    if (!getenv("MACWS_TRY_TILE_PIPELINE")) {
+        MSHookFunction(MSFindSymbol(quartzCore, "__ZN2CA3OGL9BlurState15tile_downsampleEi"),
+            (void *)BlurState_tile_downsample, NULL);
+        fprintf(stderr, "#### BlurState::tile_downsample STUB installed (set MACWS_TRY_TILE_PIPELINE=1 to disable)\n");
+    } else {
+        fprintf(stderr, "#### BlurState::tile_downsample stub DISABLED — original runs (will likely crash WS via get_tile_pipeline → abort_with_payload)\n");
+    }
 }
