@@ -1399,48 +1399,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // and VNC reads the underlying IOSurface bytes via CPU lock —
             // GPU-side state inside IOGPUMetalTexture isn't on the path.
             // ──────────────────────────────────────────────────────────────
-            // findOrCreateDriverProgramVariant<BackgroundObject> short-
-            // circuit (both `tryFind…` and `findOr…` variants).
-            //
-            // The Framebuffer ctor (called from
-            // -[AGXG13GFamilyCommandBuffer renderCommandEncoderWithDescriptor:]
-            // which is dispatched by QuartzCore's CA::OGL::MetalContext
-            // during ACTUAL compositing) calls these to look up the
-            // "BackgroundObject" driver shader variant. In chroot the
-            // BackgroundObjectProgramKey's +0x98 field is null → crash:
-            //   tryFind…  +852  : ldr x8, [x23, #0x10] with x23=0
-            //   findOr…   +228  : ldr x8, [x20, #0x10] with x20=0
-            //
-            // Caller checks the return: `cbz x?, alt_path` — if we return
-            // null, ctor takes the alternative path that doesn't need this
-            // shader. Patch both entry points to `movz x0, #0; ret`.
-            // (Plain `ret` not `retab` — we didn't pacibsp so no auth.)
-            {
-                uint64_t fn_statics[] = {
-                    0x1e575f758,  // tryFindOrCreateDriverProgramVariant<BackgroundObject>
-                    0x1e575e85c,  // findOrCreateDriverProgramVariant<BackgroundObject>
-                };
-                const uint32_t MOVZ_X0_0 = 0xd2800000u;
-                const uint32_t RET        = 0xd65f03c0u;
-                for (size_t i = 0; i < sizeof(fn_statics)/sizeof(fn_statics[0]); i++) {
-                    uint64_t fn_static = fn_statics[i];
-                    uint32_t *fn_at    = (uint32_t *)(fn_static + slide);
-                    if (fn_at[0] == MOVZ_X0_0 && fn_at[1] == RET) {
-                        fprintf(stderr,
-                            "#### MACWS_AGX_NO_BG_PROGRAM: %#llx already patched\n",
-                            (unsigned long long)fn_static);
-                        continue;
-                    }
-                    ModifyExecutableRegion(fn_at, 8, ^{
-                        fn_at[0] = MOVZ_X0_0;
-                        fn_at[1] = RET;
-                    });
-                    fprintf(stderr,
-                        "#### MACWS_AGX_NO_BG_PROGRAM: patched @%p "
-                        "(static %#llx) → return null\n",
-                        fn_at, (unsigned long long)fn_static);
-                }
-            }
 
             if (getenv("MACWS_AGX_KEEP_SUPERINIT_BYPASS")) {
                 // Patch:
@@ -2247,8 +2205,77 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
     }
 }
 
+// MACWS_AGX_CRASH_DIAG: install SIGSEGV/SIGBUS/SIGILL handlers so the faulting
+// PC (slid + unslid) and backtrace land in stderr before the process exits.
+// Faster than racing lldb against a short-lived crash. Gated by env var so
+// production runs aren't affected.
+#import <execinfo.h>
+#import <dlfcn.h>
+static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
+    ucontext_t *uctx = (ucontext_t *)uctx_;
+    uintptr_t pc = 0, lr = 0, fp = 0, sp = 0;
+    uintptr_t fault_addr = (uintptr_t)(info ? info->si_addr : 0);
+#if defined(__arm64__) || defined(__arm64e__)
+    if (uctx && uctx->uc_mcontext) {
+        pc = (uintptr_t)arm_thread_state64_get_pc(uctx->uc_mcontext->__ss);
+        lr = (uintptr_t)arm_thread_state64_get_lr(uctx->uc_mcontext->__ss);
+        fp = (uintptr_t)arm_thread_state64_get_fp(uctx->uc_mcontext->__ss);
+        sp = (uintptr_t)arm_thread_state64_get_sp(uctx->uc_mcontext->__ss);
+    }
+#endif
+    Dl_info dli;
+    fprintf(stderr,
+        "\n#### MACWS_CRASH_DIAG signo=%d fault_addr=%p pc=%p lr=%p fp=%p sp=%p\n",
+        signo, (void*)fault_addr, (void*)pc, (void*)lr, (void*)fp, (void*)sp);
+    if (pc && dladdr((void*)pc, &dli) && dli.dli_fname) {
+        uintptr_t base = (uintptr_t)dli.dli_fbase;
+        fprintf(stderr, "####   pc image=%s base=%p pc-base=%#llx symbol=%s+%#llx\n",
+            dli.dli_fname, (void*)base, (unsigned long long)(pc - base),
+            dli.dli_sname ? dli.dli_sname : "?",
+            (unsigned long long)(pc - (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)));
+    }
+    if (lr && dladdr((void*)lr, &dli) && dli.dli_fname) {
+        uintptr_t base = (uintptr_t)dli.dli_fbase;
+        fprintf(stderr, "####   lr image=%s base=%p lr-base=%#llx symbol=%s+%#llx\n",
+            dli.dli_fname, (void*)base, (unsigned long long)(lr - base),
+            dli.dli_sname ? dli.dli_sname : "?",
+            (unsigned long long)(lr - (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)));
+    }
+    void *frames[32];
+    int nf = backtrace(frames, 32);
+    fprintf(stderr, "####   backtrace (%d frames):\n", nf);
+    for (int i = 0; i < nf; i++) {
+        if (dladdr(frames[i], &dli) && dli.dli_fname) {
+            uintptr_t base = (uintptr_t)dli.dli_fbase;
+            fprintf(stderr, "####     [%2d] %p %s+%#llx (%s)\n", i, frames[i],
+                dli.dli_sname ? dli.dli_sname : "?",
+                (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)),
+                dli.dli_fname);
+        } else {
+            fprintf(stderr, "####     [%2d] %p\n", i, frames[i]);
+        }
+    }
+    fflush(stderr);
+    _exit(128 + signo);
+}
+
+static void macws_install_crash_diag(void) {
+    if (!getenv("MACWS_AGX_CRASH_DIAG")) return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = macws_crash_diag_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    fprintf(stderr, "#### MACWS_AGX_CRASH_DIAG handlers installed\n");
+}
+
 __attribute__((constructor)) void InitStuff() {
     EnableJIT();
+    macws_install_crash_diag();
 
     // Pre-load IOGPU BEFORE Metal.framework speculatively loads AGXMetal13_3.
     // AGXMetal13_3 has cross-image GOT entries that reference IOGPU symbols

@@ -1198,6 +1198,31 @@ static void install_agx_init_redirect(Class agx);
             } else {
                 fprintf(stderr, "#### MACWS_AGX_NATIVE dlopen AGXMetal13_3 OK h=%p\n", h);
             }
+            // dlopen on the inner binary does NOT register an NSBundle. AGX's
+            // own getBundle() iterates [NSBundle allBundles] looking for one
+            // whose identifier contains "AGXMetal13_3" — without an explicit
+            // bundleWithPath: the list is empty, so getBundle returns nil and
+            // setupCompiler:'s pathForResource:@"ds" ofType:@"g13g" fails
+            // (FATAL: driver shader binary file not found), leaving
+            // Device->0x318 (the Compiler wrapper) uninitialised → every
+            // shader-variant lookup later crashes on null deref.
+            NSBundle *agxBundle = [NSBundle bundleWithPath:
+                @"/System/Library/Extensions/AGXMetal13_3.bundle"];
+            fprintf(stderr, "#### MACWS_AGX_NATIVE +[NSBundle bundleWithPath:AGXMetal13_3.bundle] = %p id=%s\n",
+                agxBundle, agxBundle ? [agxBundle.bundleIdentifier UTF8String] : "(nil)");
+            if (agxBundle) {
+                // [NSBundle load] forces principal class loading + registers
+                // the bundle so it appears in +allBundles. We already loaded
+                // the binary via dlopen so this is just the metadata side.
+                NSError *err = nil;
+                BOOL loaded = [agxBundle loadAndReturnError:&err];
+                fprintf(stderr, "#### MACWS_AGX_NATIVE bundle loadAndReturnError: %d (err=%s) loaded=%d\n",
+                    loaded, err ? [[err description] UTF8String] : "nil",
+                    [agxBundle isLoaded]);
+                NSString *dsPath = [agxBundle pathForResource:@"ds" ofType:@"g13g"];
+                fprintf(stderr, "#### MACWS_AGX_NATIVE bundle pathForResource:ds.g13g = %s\n",
+                    dsPath ? [dsPath UTF8String] : "(nil)");
+            }
             agx_cls = objc_getClass("AGXG13GFamilyDevice");
             fprintf(stderr, "#### MACWS_AGX_NATIVE getMetalPluginClassForService: returning class %s = %p\n",
                 agx_cls ? class_getName(agx_cls) : "(nil)", (void*)agx_cls);
@@ -1233,7 +1258,25 @@ static id agx_initWithAcceleratorPort_impl(id self, SEL _cmd, int port) {
     fprintf(stderr, "#### MACWS_AGX_NATIVE redirecting AGXG13GFamilyDevice init(port=%d) → 2-arg variant\n", port);
     SEL realSel = sel_registerName("initWithAcceleratorPort:simultaneousInstances:");
     typedef id (*RealInit)(id, SEL, int, uint64_t);
-    return ((RealInit)objc_msgSend)(self, realSel, port, 1);
+    id dev = ((RealInit)objc_msgSend)(self, realSel, port, 1);
+    // AGXG13GDevice's own -initWithAcceleratorPort: calls super-init then
+    // [self setupCompiler:0x30010] — the call that allocates Device->0x318
+    // (the AGX::Compiler wrapper, used by every shader-variant lookup).
+    // We instantiate the parent class directly, so setupCompiler: never
+    // runs — Device->0x318 stays null and every find/tryFind*ProgramVariant
+    // crashes. Call setupCompiler: explicitly here so the wrapper gets built.
+    // Arg 0x30010 = same hardcoded value AGXG13GDevice's init passes.
+    if (dev) {
+        SEL setupCompilerSel = sel_registerName("setupCompiler:");
+        if ([dev respondsToSelector:setupCompilerSel]) {
+            ((void (*)(id, SEL, int))objc_msgSend)(dev, setupCompilerSel, 0x30010);
+            fprintf(stderr, "#### MACWS_AGX_NATIVE setupCompiler:0x30010 fired (Device=%p)\n", dev);
+        } else {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE setupCompiler: NOT FOUND on %s\n",
+                class_getName([dev class]));
+        }
+    }
+    return dev;
 }
 
 // Diag hook on `-[AGXG13GFamilyTexture initImplWithDevice:Descriptor:iosurface:plane:buffer:
