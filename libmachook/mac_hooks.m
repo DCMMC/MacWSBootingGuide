@@ -1261,28 +1261,53 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 
         if (getenv("MACWS_AGX_SKIP_BIND_UPDATE") ||
             (getenv("MACWS_AGX_NATIVE") && !getenv("MACWS_AGX_KEEP_BIND_UPDATE"))) {
-            uint64_t bl_static = 0x1e5a5ba10;
-            uint32_t *bl_at = (uint32_t *)(bl_static + slide);
+            // Two BL sites both target objc_msgSend$updateBindDataWith…
+            // which calls AGX::TextureGen4<G13>::texBaseAddressesUpdated()
+            // — that function +2932 does `ldr x11, [x11, #0x18]` where
+            // x11's prior load is null in chroot → SEGV at addr 0x30.
+            // NOP both so neither texture-init path crashes:
+            //
+            //   0x1e5a5ba10 (3-arg variant)
+            //     called from -[AGXTexture initWithDevice:desc:isSuballocDisabled:]
+            //     dispatches objc_msgSend$updateBindDataWithAddresses:
+            //                gpuVirtualAddress:shouldInitMetadata:
+            //   0x1e5a5afc4 (5-arg variant) — IOSURFACE init path
+            //     called from -[AGXTexture initWithDevice:desc:iosurface:plane:]
+            //     dispatches objc_msgSend$updateBindDataWithAddresses:cpu
+            //                MetadataAddress:gpuVirtualAddress:isCompressible:
+            //                shouldInitMetadata:
+            //
+            // After the sel=0xa type=0x82 IOSurfaceID fix (2026-06-18),
+            // texture init reaches the iosurface variant for the first
+            // time and crashes there too — symptom-identical to the
+            // pre-existing 3-arg crash this patch already handled. Same
+            // fix applies.
+            uint64_t bl_statics[] = { 0x1e5a5ba10, 0x1e5a5afc4 };
             const uint32_t NOP_INSN = 0xd503201f;
-            ModifyExecutableRegion(bl_at, sizeof(uint32_t), ^{
-                uint32_t insn = *bl_at;
-                // BL opcode mask: top 6 bits = 100101 (0x94/0x97 with imm).
-                BOOL is_bl = ((insn & 0xFC000000) == 0x94000000);
-                if (is_bl) {
-                    *bl_at = NOP_INSN;
-                    fprintf(stderr,
-                        "#### MACWS_AGX_SKIP_BIND_UPDATE: NOPed BL @%p "
-                        "(static 0x1e5a5ba10 + slide=%#zx)\n",
-                        bl_at, (size_t)slide);
-                } else if (insn == NOP_INSN) {
-                    /* already patched on a prior load of same image */
-                } else {
-                    fprintf(stderr,
-                        "#### MACWS_AGX_SKIP_BIND_UPDATE: @%p got %#x "
-                        "expected BL — SKIP\n",
-                        bl_at, insn);
-                }
-            });
+            for (size_t i = 0; i < sizeof(bl_statics)/sizeof(bl_statics[0]); i++) {
+                uint64_t bl_static = bl_statics[i];
+                uint32_t *bl_at = (uint32_t *)(bl_static + slide);
+                ModifyExecutableRegion(bl_at, sizeof(uint32_t), ^{
+                    uint32_t insn = *bl_at;
+                    // BL opcode mask: top 6 bits = 100101 (0x94/0x97 with imm).
+                    BOOL is_bl = ((insn & 0xFC000000) == 0x94000000);
+                    if (is_bl) {
+                        *bl_at = NOP_INSN;
+                        fprintf(stderr,
+                            "#### MACWS_AGX_SKIP_BIND_UPDATE: NOPed BL @%p "
+                            "(static %#llx + slide=%#zx)\n",
+                            bl_at, (unsigned long long)bl_static,
+                            (size_t)slide);
+                    } else if (insn == NOP_INSN) {
+                        /* already patched */
+                    } else {
+                        fprintf(stderr,
+                            "#### MACWS_AGX_SKIP_BIND_UPDATE: @%p got %#x "
+                            "expected BL — SKIP\n",
+                            bl_at, insn);
+                    }
+                });
+            }
         }
         //
         // Need to read what each gate actually does before patching. The
@@ -1373,6 +1398,50 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // SkyLight only needs a non-nil object: it holds the reference,
             // and VNC reads the underlying IOSurface bytes via CPU lock —
             // GPU-side state inside IOGPUMetalTexture isn't on the path.
+            // ──────────────────────────────────────────────────────────────
+            // findOrCreateDriverProgramVariant<BackgroundObject> short-
+            // circuit (both `tryFind…` and `findOr…` variants).
+            //
+            // The Framebuffer ctor (called from
+            // -[AGXG13GFamilyCommandBuffer renderCommandEncoderWithDescriptor:]
+            // which is dispatched by QuartzCore's CA::OGL::MetalContext
+            // during ACTUAL compositing) calls these to look up the
+            // "BackgroundObject" driver shader variant. In chroot the
+            // BackgroundObjectProgramKey's +0x98 field is null → crash:
+            //   tryFind…  +852  : ldr x8, [x23, #0x10] with x23=0
+            //   findOr…   +228  : ldr x8, [x20, #0x10] with x20=0
+            //
+            // Caller checks the return: `cbz x?, alt_path` — if we return
+            // null, ctor takes the alternative path that doesn't need this
+            // shader. Patch both entry points to `movz x0, #0; ret`.
+            // (Plain `ret` not `retab` — we didn't pacibsp so no auth.)
+            {
+                uint64_t fn_statics[] = {
+                    0x1e575f758,  // tryFindOrCreateDriverProgramVariant<BackgroundObject>
+                    0x1e575e85c,  // findOrCreateDriverProgramVariant<BackgroundObject>
+                };
+                const uint32_t MOVZ_X0_0 = 0xd2800000u;
+                const uint32_t RET        = 0xd65f03c0u;
+                for (size_t i = 0; i < sizeof(fn_statics)/sizeof(fn_statics[0]); i++) {
+                    uint64_t fn_static = fn_statics[i];
+                    uint32_t *fn_at    = (uint32_t *)(fn_static + slide);
+                    if (fn_at[0] == MOVZ_X0_0 && fn_at[1] == RET) {
+                        fprintf(stderr,
+                            "#### MACWS_AGX_NO_BG_PROGRAM: %#llx already patched\n",
+                            (unsigned long long)fn_static);
+                        continue;
+                    }
+                    ModifyExecutableRegion(fn_at, 8, ^{
+                        fn_at[0] = MOVZ_X0_0;
+                        fn_at[1] = RET;
+                    });
+                    fprintf(stderr,
+                        "#### MACWS_AGX_NO_BG_PROGRAM: patched @%p "
+                        "(static %#llx) → return null\n",
+                        fn_at, (unsigned long long)fn_static);
+                }
+            }
+
             if (getenv("MACWS_AGX_KEEP_SUPERINIT_BYPASS")) {
                 // Patch:
                 //   0x1e5a5af38: mov x23, x0  → mov x23, x25   (x23 = self)
