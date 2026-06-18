@@ -20,15 +20,19 @@ BOOL hooked_return_1(void) { return YES; }
 void EnableJIT(void);
 
 // FORCE_M1_DRIVER: route Metal through the REAL macOS AGX (M1/G13G) GPU driver
-// instead of the MTLSimDriver simulator bridge. Needed for the IOConnect
-// selector translation + IOServiceOpen type fixup below (macOS GPU userclient
-// ABI -> iOS). Previously auto-enabled ONLY for arm64e — arm64 (WindowServer)
-// kept the MTLSimDriver path. Now also enabled for arm64 on-device because
-// WS runs under MACWS_AGX_NATIVE=1 + MACWS_AGX_REGISTER_CLASSES=1, which is
-// the AGX-direct path; without IOConnect translation the kernel rejects
-// every AGXIOC ResCreate (sel=0xa) and the compositor never gets a backing
-// texture. (The historical MTLSim fallback is gone for WS — see Metal_hooks.x.)
-#if defined(LIBMACHOOK_ON_DEVICE_BUILD)
+// instead of the MTLSimDriver simulator bridge. Auto-enabled ONLY for the arm64e
+// on-device slice. EXPERIMENT 2026-06-19: enabled for arm64 too in commit
+// f37b55e — empirically NET NEGATIVE for arm64 WS: with translation on, every
+// sel=0xa→0x9 ResCreate returned 0xe00002c2 BadArgument from
+// IOGPUDevice::new_resource. Without translation, the same calls succeed (the
+// raw macOS sel=0xa apparently hits a different dispatch in the iOS AGX
+// userclient that accepts the args as-is — per
+// [[chroot-uses-real-agx-kernel-driver-directly]] WS does ~53 successful
+// AGXIOC calls per session this way). Reverted to arm64e only for the
+// translation stack. WS arm64 keeps its working "no translation" path under
+// MACWS_AGX_NATIVE; REGISTER_CLASSES + the Mempool::grow class fix still
+// apply regardless (they don't live inside this #ifdef).
+#if defined(__arm64e__) && defined(LIBMACHOOK_ON_DEVICE_BUILD)
 #define FORCE_M1_DRIVER 1
 #endif
 
@@ -3571,6 +3575,19 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
     if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
+    // sel=0x9 (ResCreate): iOS kernel IOGPUDevice::new_resource @ <+76>
+    // does `cmp (this->0x48)->0x224 + 0x50, *outCnt; b.hi → BadArgument`.
+    // iOS userland IOGPUResourceCreate sets *outCnt = device->0x34 + 0x50
+    // (where device->0x34 mirrors the same kernel field). macOS WS sends
+    // *outCnt = 0x50, so kernel rejects when device->0x34 > 0. Bump the
+    // count enough to clear the check. The kernel later WRITES into the
+    // output buffer up to that size — if WS's buffer is only 0x50 bytes,
+    // we may overflow on return. WS allocates a fat scanout return area
+    // (uses IOGPUMetalBuffer-style alloc), so a small bump (≤ 0x80) is safe.
+    // (outStructCnt diagnostic-probe removed — confirmed via runtime test
+    // that the BadArgument from IOGPUDevice::new_resource was the size
+    // check, not the *outCnt vs (this->0x48)->0x224+0x50 check. Bumping
+    // outStructCnt to 0x10000 made no difference.)
     unsigned char shadowbuf[256];
     uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
@@ -3604,41 +3621,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             agxHeapSz = nb;
             patched = 1;
         }
-        // type=0 heap: kernel IOGPUResource::newResourceWithOptions silently
-        // returns NULL (→ IOGPUDevice::new_resource returns kIOReturnNoResources
-        // 0xe00002be) when args+0x40 exceeds the iOS-side per-device heap
-        // size limit. Observed at WS startup with the SLCADisplay scanout
-        // backing-store allocation:
-        //   args+0x40 = 0x80888f00  (= 2.15 GB, bit 31 set)  ← REJECTED
-        //   args+0x58 = 0x380888f00 (= 0x3<<32 | size_low)
-        //   typical OK heap sizes seen: 4 KB / 128 MB / 384 MB / 896 MB
-        // RE'd via lldb on iOS IOGPUFamily kext:
-        //   IOGPUDevice::new_resource @ fffffe0009f03b4c
-        //     <+1552> ldr  x4, [x24, #0x40]      ; size arg
-        //     <+1588> bl   newResourceWithOptions
-        //     <+884>  cbz  x23, <+1168>          ; if NULL → error path
-        //     <+1168> sub  w19, w19, #0x4        ; 0xe00002c2 - 4 = 0xe00002be
-        // Cap args+0x40 to a kernel-acceptable max so the call succeeds and
-        // we can see what WS does with the (smaller) heap downstream.
-        // 256 MB is between the largest OK observation (896 MB matches some
-        // calls, but starts to fail past ~1 GB on iPad Pro 11" iOS 16.3) and
-        // small enough to be safe.
-        if(agxType == 0 && bc > 0x10000000ULL) {
-            uint64_t orig40 = bc;
-            uint64_t orig58 = *(const uint64_t *)(src + 0x58);
-            uint64_t capped = 0x10000000ULL;            // 256 MB
-            *(uint64_t *)(shadowbuf + 0x40) = capped;
-            // Keep args+0x58's upper flag bits but rewrite low 32 to match.
-            *(uint64_t *)(shadowbuf + 0x58) = (orig58 & 0xFFFFFFFF00000000ULL) | capped;
-            agxHeapSz = capped;
-            patched = 1;
-            fprintf(stderr,
-                "#### AGXIOC type=0 size cap: +0x40 %#llx → %#llx, "
-                "+0x58 %#llx → %#llx\n",
-                (unsigned long long)orig40, (unsigned long long)capped,
-                (unsigned long long)orig58,
-                (unsigned long long)((orig58 & 0xFFFFFFFF00000000ULL) | capped));
-        }
+        // (Obsolete bc>cap check moved into the heap fixup above —
+        // macOS leaves args+0x40 = 0; the size we cap is the one we
+        // derive from src+0x58, not bc.)
         if(agxType == 0x80 && t80_has_parent) {
             // Sub-resource carved from a tracked parent heap.
             int mapped = 0;
