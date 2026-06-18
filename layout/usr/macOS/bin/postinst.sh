@@ -110,6 +110,23 @@ if [ -x "$AUTOSIGND" ]; then
     echo "[INFO] started autosignd (on-demand auto-sign daemon)"
 fi
 
+# ─── iOS-native IOSurface allocator daemon (for chroot WS CodeHeap) ─────────
+# Chroot WS in AGX-native mode can't allocate via sel=0xa heap-creates (kernel
+# rejects on the macOS user-client). This daemon runs in iOS-native context
+# (sees the real AGX), allocates IOSurfaces of the requested size, returns the
+# mach send-right back over XPC. libmachook's CODEHEAP-SHIM connects to it.
+ALLOCD=/var/jb/usr/macOS/bin/macwsallocd
+ALLOCD_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.alloc.plist
+if [ -x "$ALLOCD" ]; then
+    add_all_trustcache "$ALLOCD"
+    if [ -f "$ALLOCD_PLIST" ]; then
+        # Unload + load to pick up plist changes.
+        launchctl unload "$ALLOCD_PLIST" 2>/dev/null || true
+        launchctl load "$ALLOCD_PLIST" 2>&1 | head -3
+        echo "[INFO] loaded com.macwsguide.alloc launchd job"
+    fi
+fi
+
 add_trustcache "/var/jb/usr/macOS/bin/TestMetalIOSurface"
 add_trustcache "/var/jb/usr/macOS/bin/PinnedVAProbe"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"

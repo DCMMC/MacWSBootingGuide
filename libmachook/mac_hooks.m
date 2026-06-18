@@ -11,6 +11,185 @@
 // IOSurface
 typedef id IOSurfaceRef;
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
+extern IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t port);
+extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
+
+// ─── Synthesized AGXG13GFamilyBuffer accessors (CODEHEAP-SHIM) ──────────────
+//
+// When the iOS-native macwsallocd hands us an IOSurface with CPU base address
+// X and size Y, we need a buffer-like object whose -resourceSize / -length /
+// -contents / -virtualAddress / -gpuAddress return values derived from
+// (X, Y, IOSurface). Direct re-implementation of MTLBuffer-protocol on a new
+// class is heavy; the lightweight alternative is to associate the values
+// onto the alloc'd instance and override the accessors so they read those
+// associated values when present, falling back to the original impl
+// otherwise.
+//
+// SAFE: an alloc'd-but-uninit'd instance has nil isa-ivars; the original
+// accessors would return 0/null on those. Our overrides check the
+// associated marker and only kick in for our synthesized objects.
+
+static const char kSynthMarkerKey = 0;
+static const char kSynthContentsKey = 0;
+static const char kSynthLengthKey = 0;
+static const char kSynthGpuAddrKey = 0;
+static const char kSynthDeviceKey = 0;
+static const char kSynthSurfaceKey = 0;
+
+static IMP s_orig_resourceSize = NULL;
+static IMP s_orig_length = NULL;
+static IMP s_orig_contents = NULL;
+static IMP s_orig_virtualAddress = NULL;
+static IMP s_orig_gpuAddress = NULL;
+static IMP s_orig_device = NULL;
+
+#define MACWS_SYNTH_MARKER ((__bridge id)(void *)0x53594E5448) /* "SYNTH" */
+
+static NSUInteger macws_synth_resourceSize(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
+        id v = objc_getAssociatedObject(self, &kSynthLengthKey);
+        return v ? [v unsignedIntegerValue] : 0;
+    }
+    return ((NSUInteger(*)(id, SEL))s_orig_resourceSize)(self, _cmd);
+}
+static NSUInteger macws_synth_length(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
+        id v = objc_getAssociatedObject(self, &kSynthLengthKey);
+        return v ? [v unsignedIntegerValue] : 0;
+    }
+    return ((NSUInteger(*)(id, SEL))s_orig_length)(self, _cmd);
+}
+static void *macws_synth_contents(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
+        id v = objc_getAssociatedObject(self, &kSynthContentsKey);
+        return v ? [v pointerValue] : NULL;
+    }
+    return ((void *(*)(id, SEL))s_orig_contents)(self, _cmd);
+}
+static void *macws_synth_virtualAddress(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
+        id v = objc_getAssociatedObject(self, &kSynthContentsKey);
+        return v ? [v pointerValue] : NULL;
+    }
+    return ((void *(*)(id, SEL))s_orig_virtualAddress)(self, _cmd);
+}
+static uint64_t macws_synth_gpuAddress(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
+        id v = objc_getAssociatedObject(self, &kSynthGpuAddrKey);
+        return v ? [v unsignedLongLongValue] : 0;
+    }
+    return ((uint64_t(*)(id, SEL))s_orig_gpuAddress)(self, _cmd);
+}
+static id macws_synth_device(id self, SEL _cmd) {
+    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
+        return objc_getAssociatedObject(self, &kSynthDeviceKey);
+    }
+    return ((id(*)(id, SEL))s_orig_device)(self, _cmd);
+}
+
+// Install the synth overrides on the given class. Idempotent — first call
+// captures orig IMPs, subsequent calls are no-ops.
+static void macws_install_synth_overrides(Class cls) {
+    if (!cls) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        SEL sels[] = {
+            @selector(resourceSize),
+            @selector(length),
+            @selector(contents),
+            @selector(virtualAddress),
+            @selector(gpuAddress),
+            @selector(device),
+        };
+        IMP newImps[] = {
+            (IMP)macws_synth_resourceSize,
+            (IMP)macws_synth_length,
+            (IMP)macws_synth_contents,
+            (IMP)macws_synth_virtualAddress,
+            (IMP)macws_synth_gpuAddress,
+            (IMP)macws_synth_device,
+        };
+        IMP *origSlots[] = {
+            &s_orig_resourceSize,
+            &s_orig_length,
+            &s_orig_contents,
+            &s_orig_virtualAddress,
+            &s_orig_gpuAddress,
+            &s_orig_device,
+        };
+        for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
+            Method m = class_getInstanceMethod(cls, sels[i]);
+            if (m) {
+                *origSlots[i] = method_getImplementation(m);
+                method_setImplementation(m, newImps[i]);
+                fprintf(stderr, "#### SYNTH override installed: %s\n",
+                    sel_getName(sels[i]));
+            } else {
+                fprintf(stderr, "#### SYNTH override SKIP %s — class %s has no method\n",
+                    sel_getName(sels[i]), class_getName(cls));
+            }
+        }
+    });
+}
+
+// ─── XPC client: ask iOS-native MTLSimDriverHost to allocate an IOSurface ──
+// for chroot CodeHeap use. The chroot kernel rejects sel=0xa heap-creates,
+// but an iOS-native helper opens AGX with the right userclient and CAN
+// allocate. Returns the IOSurface mach send-right (or MACH_PORT_NULL on
+// failure) plus the actual allocated size out-param. Caller is responsible
+// for mach_port_deallocate'ing the returned port.
+// See MTLSimDriverHost/main.x install_alloc_listener for the server side.
+static mach_port_t macws_alloc_iosurf_xpc(uint64_t size, uint64_t options,
+                                           uint64_t *out_alloc_size) {
+    static xpc_connection_t conn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
+            dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+        if (!createMach) {
+            fprintf(stderr, "#### alloc-xpc: createMach symbol missing\n");
+            return;
+        }
+        // com.macwsguide.alloc is published by the dedicated launchd job
+        // /var/jb/Library/LaunchDaemons/com.macwsguide.alloc.plist, which
+        // launchd auto-spawns on first lookup. No bootstrap needed.
+        conn = createMach("com.macwsguide.alloc", NULL, 0);
+        if (!conn) {
+            fprintf(stderr, "#### alloc-xpc: createMach returned NULL\n");
+            return;
+        }
+        xpc_connection_set_event_handler(conn, ^(xpc_object_t event) { (void)event; });
+        xpc_connection_resume(conn);
+        fprintf(stderr, "#### alloc-xpc: opened connection to com.macwsguide.alloc\n");
+    });
+    if (!conn) return MACH_PORT_NULL;
+
+    xpc_object_t req = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(req, "op", "alloc-iosurf");
+    xpc_dictionary_set_uint64(req, "size", size);
+    xpc_dictionary_set_uint64(req, "options", options);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, req);
+    mach_port_t port = MACH_PORT_NULL;
+    if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+        const char *result = xpc_dictionary_get_string(reply, "result");
+        if (result && strcmp(result, "ok") == 0) {
+            port = xpc_dictionary_copy_mach_send(reply, "surface");
+            if (out_alloc_size) *out_alloc_size = xpc_dictionary_get_uint64(reply, "alloc_size");
+        }
+        static int once_log = 0;
+        if (once_log++ < 6) {
+            fprintf(stderr,
+                "#### alloc-xpc reply: result=%s port=%u alloc_size=%llu\n",
+                result ?: "(none)", port,
+                out_alloc_size ? (unsigned long long)*out_alloc_size : 0ULL);
+        }
+    } else {
+        static int once_log = 0;
+        if (once_log++ < 6) fprintf(stderr, "#### alloc-xpc: no reply\n");
+    }
+    return port;
+}
 
 extern au_asid_t audit_token_to_asid(audit_token_t atoken);
 extern uid_t audit_token_to_auid(audit_token_t atoken);
@@ -1676,6 +1855,80 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             typedef Class (*readPair_t)(Class, const void *);
             readPair_t readPair = (readPair_t)dlsym(RTLD_DEFAULT, "objc_readClassPair");
             int realized = 0;
+            // Cross-image preregistration: previously this loop only walked
+            // AGXMetal13_3's own __objc_classlist, so a class whose superclass
+            // lives in another framework (e.g. AGXBuffer -> IOGPUMetalBuffer in
+            // IOGPU.framework) failed because readClassPair needs the super to
+            // already be in libobjc's name table. In chroot, the libobjc
+            // _dyld_objc_notify_register callback misses IOGPU's classlist for
+            // the same reason it misses AGXMetal's — so we have to register
+            // every loaded image's pending classes here, not just our own.
+            // Walks _dyld_image_count() and, for any image carrying a
+            // __objc_classlist + __objc_imageinfo, runs the same multi-pass
+            // readPair loop. IOGPU goes first because it's a parent of
+            // AGXBuffer/AGXG13GFamilyBuffer/AGXG13GFamilyCommandBuffer/…
+            // Per-image cap of 8 passes catches deep super chains.
+            if (readPair) {
+                uint32_t img_count = _dyld_image_count();
+                for (uint32_t img_i = 0; img_i < img_count; img_i++) {
+                    const struct mach_header *imgh = _dyld_get_image_header(img_i);
+                    if (!imgh) continue;
+                    const char *imgname = _dyld_get_image_name(img_i);
+                    unsigned long cl_sz = 0;
+                    uint64_t *cl = (uint64_t *)getsectiondata(
+                        (const struct mach_header_64 *)imgh, "__DATA_CONST",
+                        "__objc_classlist", &cl_sz);
+                    if (!cl) cl = (uint64_t *)getsectiondata(
+                        (const struct mach_header_64 *)imgh, "__DATA",
+                        "__objc_classlist", &cl_sz);
+                    if (!cl || cl_sz == 0) continue;
+                    unsigned long ii_sz = 0;
+                    objc_image_info_t *ii = (objc_image_info_t *)getsectiondata(
+                        (const struct mach_header_64 *)imgh, "__DATA_CONST",
+                        "__objc_imageinfo", &ii_sz);
+                    if (!ii) ii = (objc_image_info_t *)getsectiondata(
+                        (const struct mach_header_64 *)imgh, "__DATA",
+                        "__objc_imageinfo", &ii_sz);
+                    if (!ii) ii = (objc_image_info_t *)getsectiondata(
+                        (const struct mach_header_64 *)imgh, "__OBJC",
+                        "__image_info", &ii_sz);
+                    if (!ii) continue;
+                    size_t nn = cl_sz / 8;
+                    int img_realized = 0;
+                    int img_pending = 0;
+                    for (size_t i = 0; i < nn; i++) {
+                        if (cl[i] == 0) continue;
+                        Class cc = (Class)cl[i];
+                        const char *nm = class_getName(cc);
+                        if (nm && nm[0] && !objc_getClass(nm)) img_pending++;
+                    }
+                    if (img_pending == 0) continue;
+                    for (int pass = 0; pass < 8; pass++) {
+                        int tp = 0;
+                        for (size_t i = 0; i < nn; i++) {
+                            if (cl[i] == 0) continue;
+                            Class cc = (Class)cl[i];
+                            const char *nm = class_getName(cc);
+                            if (!nm || !nm[0]) continue;
+                            if (objc_getClass(nm)) continue;
+                            Class rr = readPair(cc, ii);
+                            if (rr && objc_getClass(nm)) { img_realized++; tp++; }
+                        }
+                        if (tp == 0) break;
+                    }
+                    realized += img_realized;
+                    const char *bn = strrchr(imgname ? imgname : "", '/');
+                    bn = bn ? bn + 1 : (imgname ? imgname : "?");
+                    if (img_realized > 0) {
+                        fprintf(stderr,
+                            "#### PREREGISTER image[%u] %s: %d/%d realized\n",
+                            img_i, bn, img_realized, img_pending);
+                    }
+                }
+            }
+            // Now also try AGXMetal13_3's own classlist (most should already be
+            // realized by the loop above since this image is in img_count too,
+            // but the original multi-pass below catches any leftover surface).
             if (readPair && iinfo) {
                 // Multi-pass: re-iterate if any new classes registered, so a
                 // class whose superclass got registered in pass N can register
@@ -1755,6 +2008,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 if (m_full) {
                     IMP orig_full = method_getImplementation(m_full);
                     IMP trace_full = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long align, unsigned long opt, int subDis, void *resInArgs, void *pinned) {
+                        // Capture class BEFORE orig in case it releases self.
+                        Class pre_cls_full = object_getClass(self);
                         // iOS IOGPU's kernel sub-resource creation rejects
                         // align=1 with kIOReturnExclusiveAccess (0xe00002c2)
                         // for every length tier — Mempool::grow's freelist
@@ -1795,6 +2050,55 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                             r = ((id (*)(id, SEL, id, unsigned long, unsigned long, unsigned long, int, void *, void *))orig_full)(
                                 self, initFull, dev, len, align, opt, subDis, resInArgs, pinned);
                         }
+                        // PIN-FALLBACK (MACWS_PIN_FALLBACK=1): when the 7-arg
+                        // initFull returns nil (chroot kernel rejected the
+                        // resInArgs-shaped IOConnect call), try the 6-arg
+                        // `initWithDevice:length:options:isSuballocDisabled:
+                        // pinnedGPULocation:` variant that PinnedVAProbe proved
+                        // works in iOS-native userland end-to-end (alloc +
+                        // compute write-through + blit roundtrip — see
+                        // [[pinned-gpu-va-exists-in-ios-userland]]). The
+                        // pinnedGPULocation: argument is a pointer to a u64
+                        // holding the desired GPU VA; passing 0 lets the
+                        // framework pick. Logs both empirical signal (does it
+                        // work in chroot at all?) and wires up a real fallback
+                        // if it does.
+                        if (!r && getenv("MACWS_PIN_FALLBACK")) {
+                            static SEL pin5_sel = NULL;
+                            static int pin5_known_missing = 0;
+                            if (!pin5_sel) {
+                                pin5_sel = sel_registerName(
+                                    "initWithDevice:length:options:isSuballocDisabled:pinnedGPULocation:");
+                            }
+                            // pre_cls_full was captured at block entry before
+                            // orig consumed self (object_getClass(self) returns
+                            // nil after orig freed self).
+                            Class cls = pre_cls_full ?: object_getClass(self);
+                            if (!pin5_known_missing && cls &&
+                                class_getInstanceMethod(cls, pin5_sel)) {
+                                // Fresh +alloc: the failed initFull consumed `self`.
+                                id raw = ((id (*)(Class, SEL))objc_msgSend)(
+                                    cls, sel_registerName("alloc"));
+                                uint64_t pinVA = 0;  // framework picks
+                                typedef id (*Pin5Fn)(id, SEL, id, unsigned long,
+                                                      unsigned long, int, uint64_t *);
+                                Pin5Fn pin5 = (Pin5Fn)objc_msgSend;
+                                id pr = pin5(raw, pin5_sel, dev, len, opt, 1, &pinVA);
+                                static int fb_log = 0;
+                                if (fb_log++ < 12) {
+                                    fprintf(stderr,
+                                        "#### PIN_FALLBACK %s len=%lu opt=%lu -> %p (pinVA=%#llx)\n",
+                                        class_getName(cls), len, opt,
+                                        (void *)pr, (unsigned long long)pinVA);
+                                }
+                                if (pr) r = pr;
+                            } else if (!pin5_known_missing) {
+                                pin5_known_missing = 1;
+                                fprintf(stderr,
+                                    "#### PIN_FALLBACK: class %s does NOT respond to 5-colon pinnedGPULocation: selector\n",
+                                    cls ? class_getName(cls) : "(nil)");
+                            }
+                        }
                         static int trace_cnt = 0;
                         if (trace_cnt++ < 12) {
                             fprintf(stderr,
@@ -1805,6 +2109,177 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     });
                     method_setImplementation(m_full, trace_full);
                     fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled initWithDevice:length:alignment:options:isSuballocDisabled:resourceInArgs:pinnedGPULocation:\n");
+                }
+
+                // -[AGXBuffer initWithDevice:options:args:argsSize:] — the
+                // 4-arg init called from inside `AGX::Heap<true>::allocateImpl`
+                // (setupCompiler:'s CodeHeap dispatch_sync block). Runtime
+                // lldb backtrace 2026-06-19:
+                //   frame#3 AGX::Heap<true>::allocateImpl block_invoke +596
+                //   frame#2 -[IOGPUMetalResource initWithDevice:remoteStorageResource:options:args:argsSize:] +460
+                //   frame#1 IOGPUResourceCreate +236
+                //   frame#0 IOConnectCallMethod sel=0xa → kernel 0xe00002c2
+                // Pin-fallback approach: when orig returns nil (cascading from
+                // IOConnect rejection), synthesize via the 6-arg `pinnedGPULocation:`
+                // selector PinnedVAProbe proved works in iOS-native userland.
+                // Size is extracted from args+0x58 sz32 field (the heap byte-
+                // count macOS writes there before this init).
+                {
+                    SEL initArgs = sel_registerName("initWithDevice:options:args:argsSize:");
+                    Method m_args = class_getInstanceMethod(agxbuf_after, initArgs);
+                    if (m_args && getenv("MACWS_PIN_FALLBACK")) {
+                        IMP orig_args = method_getImplementation(m_args);
+                        IMP shim_args = imp_implementationWithBlock(^id(
+                                id self, id dev, unsigned long opt,
+                                void *args, unsigned long argsSize) {
+                            // Capture class BEFORE orig — orig may release self
+                            // and corrupt its isa on failure (object_getClass(self)
+                            // then returns nil), making the post-orig fallback
+                            // unable to identify the class.
+                            Class pre_cls = object_getClass(self);
+                            static int entry_log = 0;
+                            if (entry_log++ < 4) {
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM entry self=%p cls=%s dev=%p opt=%#lx args=%p argsSize=%lu\n",
+                                    self, pre_cls ? class_getName(pre_cls) : "(nil)",
+                                    dev, opt, args, argsSize);
+                            }
+                            id r = ((id (*)(id, SEL, id, unsigned long, void *, unsigned long))orig_args)(
+                                self, initArgs, dev, opt, args, argsSize);
+                            static int post_log = 0;
+                            if (post_log++ < 4) {
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM post-orig: r=%p (orig %s)\n",
+                                    r, r ? "non-nil" : "nil — entering synth");
+                            }
+                            if (r) return r;
+                            // PIN-FALLBACK path. Use pre_cls (captured before orig)
+                            // — orig consumed self, so object_getClass(self) now
+                            // returns nil.
+                            Class cls = pre_cls;
+                            Class kFam = objc_getClass("AGXG13GFamilyBuffer");
+                            Class target = kFam ?: cls;
+                            fprintf(stderr,
+                                "#### CODEHEAP-SHIM synth-step1: kFam=%p (%s) target=%s\n",
+                                kFam, kFam ? class_getName(kFam) : "(nil)",
+                                target ? class_getName(target) : "(nil)");
+                            static SEL pin5_sel = NULL;
+                            if (!pin5_sel) pin5_sel = sel_registerName(
+                                "initWithDevice:length:options:isSuballocDisabled:pinnedGPULocation:");
+                            BOOL responds = class_getInstanceMethod(target, pin5_sel) != NULL;
+                            fprintf(stderr,
+                                "#### CODEHEAP-SHIM synth-step2: %s responds to pin5? %d\n",
+                                target ? class_getName(target) : "(nil)", responds);
+                            if (!responds) {
+                                static int log_once = 0;
+                                if (!log_once++) {
+                                    fprintf(stderr,
+                                        "#### CODEHEAP-SHIM: %s does NOT respond to 5-colon pinnedGPULocation:\n",
+                                        target ? class_getName(target) : "(nil)");
+                                }
+                                return nil;
+                            }
+                            uint64_t sz = 0;
+                            if (args && argsSize >= 0x60) {
+                                const uint8_t *a = (const uint8_t *)args;
+                                // args+0x58 sz32 is what the existing heap fixup
+                                // reads as the requested byte-count. Confirmed by
+                                // runtime dump: args+0x58=0x38000000 for the
+                                // setupCompiler CodeHeap allocation.
+                                sz = (uint64_t)*(const uint32_t *)(a + 0x58);
+                                // Safety cap at 256 MB — even if 0x38000000 (939 MB)
+                                // is what macOS asks for, iOS-native CodeHeap rarely
+                                // exceeds 64 MB, and oversizing on the iOS path may
+                                // get rejected for separate reasons (kernel VA quota).
+                                if (sz > 0x10000000ULL) sz = 0x10000000ULL;
+                                if (sz < 0x10000ULL)    sz = 0x10000ULL;
+                            }
+                            if (!sz) sz = 0x10000;
+                            // pinnedGPULocation: ALSO routes through IOConnect
+                            // sel=0xa internally and the iOS kernel rejects it
+                            // the same way for chroot WS. Skip that path. The
+                            // working approach is: ask iOS-native helper to
+                            // allocate an IOSurface (kernel-blessed shared GPU
+                            // memory), receive the mach send-right back, then
+                            // wrap as a buffer using bytes/length init (which
+                            // takes a CPU pointer and doesn't need sel=0xa).
+                            fprintf(stderr,
+                                "#### CODEHEAP-SHIM synth-step3: requesting IOSurface from helper sz=%#llx\n",
+                                (unsigned long long)sz);
+                            uint64_t alloc_size = 0;
+                            mach_port_t surfPort = macws_alloc_iosurf_xpc(sz, opt, &alloc_size);
+                            if (surfPort == MACH_PORT_NULL) {
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM synth-step3 FAIL: alloc helper returned no surface\n");
+                                // Last-ditch: return alloc'd-but-uninit'd object
+                                // so caller continues briefly and we see the
+                                // next cascade.
+                                return ((id (*)(Class, SEL))objc_msgSend)(
+                                    target, sel_registerName("alloc"));
+                            }
+                            IOSurfaceRef surf = IOSurfaceLookupFromMachPort(surfPort);
+                            mach_port_deallocate(mach_task_self(), surfPort);
+                            if (!surf) {
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM synth-step3 FAIL: IOSurfaceLookupFromMachPort returned nil\n");
+                                return ((id (*)(Class, SEL))objc_msgSend)(
+                                    target, sel_registerName("alloc"));
+                            }
+                            void *baseAddr = IOSurfaceGetBaseAddress(surf);
+                            fprintf(stderr,
+                                "#### CODEHEAP-SHIM synth-step4: IOSurface=%p baseAddr=%p alloc_size=%llu\n",
+                                (void *)surf, baseAddr, (unsigned long long)alloc_size);
+                            // Install the class-wide synth overrides on the
+                            // target class once. From now on, instances tagged
+                            // with kSynthMarkerKey respond with our values to
+                            // -resourceSize / -length / -contents /
+                            // -virtualAddress / -gpuAddress / -device. Untagged
+                            // instances see the original impls (passthrough).
+                            macws_install_synth_overrides(target);
+                            // Alloc a bare instance — no init — so isa is the
+                            // target class but ivars are zero (we don't use
+                            // them, the overrides read associated objects).
+                            id pr = ((id (*)(Class, SEL))objc_msgSend)(
+                                target, sel_registerName("alloc"));
+                            if (!pr) {
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM synth-step5 FAIL: alloc returned nil\n");
+                                CFRelease((CFTypeRef)surf);
+                                return nil;
+                            }
+                            // Tag + attach backing values. We pretend gpuAddress
+                            // equals the CPU base address; chroot's GPU can't
+                            // reach this VA but downstream code will surface
+                            // the next cascade so we can plan from there.
+                            objc_setAssociatedObject(pr, &kSynthMarkerKey,
+                                @"SYNTH", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            objc_setAssociatedObject(pr, &kSynthContentsKey,
+                                [NSValue valueWithPointer:baseAddr],
+                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            objc_setAssociatedObject(pr, &kSynthLengthKey,
+                                @((NSUInteger)alloc_size),
+                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            objc_setAssociatedObject(pr, &kSynthGpuAddrKey,
+                                @((uint64_t)(uintptr_t)baseAddr),
+                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            objc_setAssociatedObject(pr, &kSynthDeviceKey,
+                                dev, OBJC_ASSOCIATION_ASSIGN);
+                            // Retain the IOSurface via association so it stays
+                            // alive as long as the buffer does.
+                            objc_setAssociatedObject(pr, &kSynthSurfaceKey,
+                                (__bridge id)surf,
+                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                            CFRelease((CFTypeRef)surf);
+                            fprintf(stderr,
+                                "#### CODEHEAP-SHIM (%s) iosurf-synth len=%llu base=%p -> %p\n",
+                                class_getName(target),
+                                (unsigned long long)alloc_size, baseAddr, (void *)pr);
+                            return pr;
+                        });
+                        method_setImplementation(m_args, shim_args);
+                        fprintf(stderr,
+                            "#### MACWS_PIN_FALLBACK swizzled -[AGXBuffer initWithDevice:options:args:argsSize:]\n");
+                    }
                 }
             }
 
@@ -3742,6 +4217,57 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         if(patched) inStruct = shadowbuf;
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // Parameter fuzz: if sel=0x9 ResCreate returned BadArgument, try a
+    // handful of perturbations and report which ones the kernel accepts.
+    // One-shot per process (static seen flag) and only for type=0 heap
+    // creates, since those are what's broken.
+    if (getenv("MACWS_AGXIOC_FUZZ") && IOConnectIsIOGPU(client) && selector == 0x9 &&
+        r == 0xe00002c2 && inStruct && inStructCnt >= 0x60) {
+        static int s_fuzz_done = 0;
+        const unsigned char *src = (const unsigned char *)inStruct;
+        if (!s_fuzz_done && src[0] == 0) {
+            s_fuzz_done = 1;
+            unsigned char buf[256];
+            struct { const char *name; int ofs; int sz; uint64_t val; } perturbs[] = {
+                {"zero args+0x40",     0x40, 8, 0},
+                {"args+0x40 = 0x1000", 0x40, 8, 0x1000},
+                {"args+0x40 = 0x4000", 0x40, 8, 0x4000},
+                {"zero args+0x58",     0x58, 8, 0},
+                {"args+0x14 = 0",      0x14, 4, 0},
+                {"args+0x10..1f = 0",  0x10, 8, 0},
+                {"args+0x48 = 0",      0x48, 8, 0},
+                {"args+0x60 = 0",      0x60, 8, 0},
+                {"args+0x08 = 0",      0x08, 8, 0},
+                {NULL, 0, 0, 0}
+            };
+            for (int i = 0; perturbs[i].name; i++) {
+                memcpy(buf, inStruct, inStructCnt);
+                if (perturbs[i].sz == 8) {
+                    *(uint64_t*)(buf + perturbs[i].ofs) = perturbs[i].val;
+                } else {
+                    *(uint32_t*)(buf + perturbs[i].ofs) = (uint32_t)perturbs[i].val;
+                }
+                size_t osc = outStructCnt ? *outStructCnt : 0;
+                IOReturn rr = IOConnectCallMethod(client, selector, in, inCnt,
+                    buf, inStructCnt, out, outCnt, outStruct, outStructCnt ? &osc : NULL);
+                fprintf(stderr,
+                    "#### AGXIOC FUZZ [%s]: outSC=%zu → 0x%x\n",
+                    perturbs[i].name, osc, rr);
+                // Restore for next iteration
+                if (outStructCnt) *outStructCnt = osc;
+            }
+            // Also try with outStructCnt = 0
+            if (outStructCnt) {
+                size_t saved = *outStructCnt;
+                *outStructCnt = 0;
+                memcpy(buf, inStruct, inStructCnt);
+                IOReturn rr = IOConnectCallMethod(client, selector, in, inCnt,
+                    buf, inStructCnt, out, outCnt, outStruct, outStructCnt);
+                fprintf(stderr, "#### AGXIOC FUZZ [outStructCnt=0]: → 0x%x\n", rr);
+                *outStructCnt = saved;
+            }
+        }
+    }
     if(agxIsRes && r == 0 && agxType == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
         const unsigned char *o = (const unsigned char *)outStruct;
         uint64_t gid = *(const uint64_t *)(o + 0x28);   // iOS GID: monotonic IOGPUObject counter, echoed at OUT+0x28
@@ -3866,15 +4392,36 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
         agxService = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
         assert(agxService != IO_OBJECT_NULL);
     }
-    
+
     // clear flag 4 (FIXME: idk what is this)
     type &= ~4;
-    
+
+    // AGXG13GFamilyDevice opens its user client with type=0x100001 on macOS.
+    // The iOS AGX kext doesn't recognise that high-bit flag and gives us back
+    // a degraded user client whose sel=0x8/0x9 (heap/sub-resource create) all
+    // return kIOReturnExclusiveAccess (0xe00002c2) — fuzzing every byte of
+    // args+0x08..+0x60 confirmed the user client itself rejects the calls,
+    // not the args. Masking the high-bit flag down to type=1 (the iOS-native
+    // "full IOGPUDevice user client" type) gets us a real client. Gated on
+    // MACWS_AGX_NATIVE so the sim path is unaffected. Allow MACWS_AGX_FORCE_TYPE
+    // to override the masked type for fuzzing.
+    uint32_t orig_type = type;
+    if (getenv("MACWS_AGX_NATIVE") && service == agxService) {
+        if (type & 0xFFFF0000) {
+            type &= 0xFFFF;
+        }
+        const char *force = getenv("MACWS_AGX_FORCE_TYPE");
+        if (force) {
+            type = (uint32_t)strtoul(force, NULL, 0);
+        }
+    }
+
     kern_return_t result = IOServiceOpen(service, owningTask, type, connect);
     assert(iogpuClientsCount < sizeof(iogpuClients) / sizeof(iogpuClients[0]));
     if(result == KERN_SUCCESS && service == agxService) {
         iogpuClients[iogpuClientsCount++] = *connect;
-        fprintf(stderr, "#### debugbydcmmc IOServiceOpen agx connect=%d type=%d\n", *connect, type);
+        fprintf(stderr, "#### debugbydcmmc IOServiceOpen agx connect=%d type=%u (orig=%u)\n",
+            *connect, type, orig_type);
     }
     return result;
 }
