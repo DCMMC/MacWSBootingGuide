@@ -56,6 +56,80 @@ static void PatchInstruction(uint32_t *addr, uint32_t value) {
 // If the byte at the computed address is not `pacibsp` (0xd503237f),
 // the iOS AGXCompilerCore has changed and the anchor needs re-checking;
 // we abort instead of silently corrupting an unknown instruction.
+// ─── AGX renamer fix: skip the "agx." prepend ─────────────────────────────
+//
+// `AGCLLVMUserObject::linkMetalRuntime(bool)` walks the module's
+// runtime-shim function list and for each function builds a renamed
+// declaration `"agx." + originalName + ".fast"`, replaces uses, and
+// hands the new declaration to the next pass. For an originalName like
+// `air.fract.v3f16` the produced name `agx.air.fract.v3f16.fast` is
+// never matched by `AGCLLVMAirBuiltins::replaceBuiltins`'s dispatcher
+// (which only accepts the "air." prefix), so the call survives into
+// `AGCLLVMUserObject::verifyLoweredIR` as an unlowered declaration and
+// the compile aborts.
+//
+// The rename is implemented as a `std::string::insert(0, "agx.")` call
+// — instruction `bl __ZNSt3__112basic_string…::insert(pos, str)` that
+// follows the `add x2, x2, #… ; "agx."` adrp pair. If we NOP that one
+// BL the agx-prefix step is skipped: the rename becomes
+// `"" + originalName + ".fast" = "air.fract.v3f16.fast"`, the
+// dispatcher's findPrefix accepts the "air." prefix, splits at the
+// first dot of the remainder into ("fract", "v3f16.fast"), and the
+// "fract" key already resolves to `AGCLLVMAirBuiltins::buildFract`,
+// which lowers via the operand's runtime LLVM type — the trailing
+// ".fast" in the name is just a suffix on the Function name and is
+// ignored by buildFract (it reads the actual Value type, not the
+// Function name).
+//
+// The patch site is found by anchoring on the surviving export
+// `_AIRNTGetVersion` (one of the 33 public AIRNT* symbols). Delta
+// measured against the iPad13,6 16.3.1 (20D67) DSC:
+//   bl insert @ 0x1be243b70
+//   _AIRNTGetVersion @ 0x1be369514
+//   delta = -0x1259a4
+//
+// Validation: the instruction at the patch site must be a BL (opcode
+// bits 26..31 == 0b100101 == 0x25). If the iOS AGXCompilerCore has
+// changed and the byte is not a BL, we leave the original behaviour
+// alone instead of corrupting some unknown instruction.
+static void PatchAGXRenamerSkipAgxPrefix(void) {
+    void *h = dlopen(
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore",
+        RTLD_NOW | RTLD_GLOBAL);
+    if (!h) {
+        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch dlopen: %s",
+              dlerror());
+        return;
+    }
+    MSImageRef img = MSGetImageByName(
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore");
+    if (!img) {
+        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch: image not "
+              "MSGetImageByName-able");
+        return;
+    }
+    void *anchor = MSFindSymbol(img, "_AIRNTGetVersion");
+    if (!anchor) {
+        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch: anchor "
+              "_AIRNTGetVersion not found");
+        return;
+    }
+    intptr_t delta = -0x1259a4;
+    uint32_t *bl_site = (uint32_t *)((uintptr_t)anchor + delta);
+    uint32_t cur = bl_site[0];
+    // BL opcode: bits 31..26 == 100101
+    if (((cur >> 26) & 0x3F) != 0x25) {
+        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch site@%p "
+              "insn=%#x — NOT a BL, refusing to patch (DSC drift?)",
+              bl_site, cur);
+        return;
+    }
+    PatchInstruction(bl_site, 0xd503201fu); // NOP
+    NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch installed: "
+          "BL std::string::insert @%p NOPed (no more 'agx.' prefix on "
+          "AIR-builtin rename) — was %#x", bl_site, cur);
+}
+
 static void PatchAGXVerifyLoweredIR(void) {
     void *h = dlopen(
         "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore",
@@ -114,15 +188,34 @@ static void PatchAGXVerifyLoweredIR(void) {
 
     // Originally tried: PatchAGXVerifyLoweredIR() — bypass the
     // AGCLLVMUserObject::verifyLoweredIR check that surfaces the
-    // `agx.air.fract.v3f16.fast` unlowered-call error. RESULT was worse
-    // than the original abort: when the verifier is silenced the
-    // unlowered Call survives into codegen, and codegen's downstream
-    // `llvm::NamedMDNode::getOperand` reads metadata at addr 0x30 from
-    // a NULL Function ptr → MTLCompilerService dies with SIGSEGV
-    // (confirmed via /private/var/mobile/Library/Logs/CrashReporter/
-    // MTLCompilerService-…ips, faulting thread frame 0 =
-    // libLLVM.dylib`llvm::NamedMDNode::getOperand(unsigned int) const).
-    // The verifier is a real safety check, not just a noisemaker.
-    // Helper kept above for next iterations; not called.
+    // `agx.air.fract.v3f16.fast` unlowered-call error. That moved the
+    // crash into libLLVM (NULL Function metadata at offset 0x30 in
+    // codegen) — see commit message. Kept for reference only.
     (void)PatchAGXVerifyLoweredIR;
+    // Actual fix: disable the rename inside AGCLLVMUserObject::
+    // linkMetalRuntime that produces `agx.air.fract.v3f16.fast` from
+    // an existing `air.fract.v3f16`. The dispatcher
+    // AGCLLVMAirBuiltins::replaceBuiltins requires the function name
+    // to start with "air." (it calls findPrefix(name, "air.", 4) and
+    // bails if the prefix doesn't match), so the renamer's "agx."
+    // prepend hides the function from the dispatcher and leaves it
+    // unlowered. If we skip the prepend, the result is
+    // `air.fract.v3f16.fast` — still starts with "air.", findPrefix
+    // splits at the first '.' after the prefix so the dispatcher
+    // gets out1="fract" and looks up buildFract, which reads the
+    // actual operand type (half3) from the LLVM Value and emits the
+    // valid `x - floor(x)` lowering. No more unlowered call → no
+    // verifier complaint → no abort.
+    //
+    // Opt-in: set MTLCOMPILER_PATCH_RENAMER=1 in the LaunchAgent
+    // environment to enable. Disabled by default until we can
+    // confirm it doesn't regress WindowServer startup (current
+    // observation: when enabled, WindowServer dies before reaching
+    // pipeline build, suggesting the patched MTLCompilerService is
+    // returning compiled binaries that fail differently — possible
+    // ordering issue, possible findPrefix split mismatch we haven't
+    // RE'd yet).
+    if (getenv("MTLCOMPILER_PATCH_RENAMER")) {
+        PatchAGXRenamerSkipAgxPrefix();
+    }
 }
