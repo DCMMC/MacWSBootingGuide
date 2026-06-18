@@ -2050,6 +2050,35 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                             r = ((id (*)(id, SEL, id, unsigned long, unsigned long, unsigned long, int, void *, void *))orig_full)(
                                 self, initFull, dev, len, align, opt, subDis, resInArgs, pinned);
                         }
+                        // Mempool::grow's freelist-init loop reads
+                        // `*(buf + global + 0x18)` (= *(buf+0x30) with the
+                        // global symbol IOGPU.IOGPUMetalResource._res = 0x18)
+                        // and writes sequential ints there. For our synth
+                        // path we already populate that ivar from baseAddr.
+                        // For the "orig-succeed" path (small buffers via
+                        // align=64+subDis=1), the buf comes back with all
+                        // ivars zero — including +0x30 — and Mempool's freelist
+                        // init then null-derefs. Allocate a per-buf scratch
+                        // (4 KB) and point +0x30 at it so the freelist init
+                        // writes land in valid memory. Use malloc since the
+                        // GPU never touches this region (it's freelist
+                        // bookkeeping, not buffer contents).
+                        if (r && ((void **)r)[6] == NULL) {
+                            // 16 KB is enough for sequential-int freelist init
+                            // (~15 entries) plus memcpy-grow expansion of the
+                            // Mempool's internal counters. dealloc later free()s
+                            // this pointer, so it MUST be malloc-derived.
+                            void *scratch = calloc(1, 16384);
+                            if (scratch) {
+                                ((void **)r)[6] = scratch;
+                                static int fl_log = 0;
+                                if (fl_log++ < 4) {
+                                    fprintf(stderr,
+                                        "#### initFull freelist-scratch: buf=%p ivar+0x30 ← %p\n",
+                                        r, scratch);
+                                }
+                            }
+                        }
                         // PIN-FALLBACK (MACWS_PIN_FALLBACK=1): when the 7-arg
                         // initFull returns nil (chroot kernel rejected the
                         // resInArgs-shaped IOConnect call), try the 6-arg
@@ -2270,6 +2299,27 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 (__bridge id)surf,
                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                             CFRelease((CFTypeRef)surf);
+                            // Mempool::grow's freelist-init loop loads from
+                            // `*(buf + global + 0x18)` where global = 0x18
+                            // (confirmed via lldb 2026-06-19, value at
+                            // `IOGPU\`IOGPUMetalResource._res`). So the
+                            // freelist target is at ivar offset 0x30. For
+                            // a non-synth buffer this is set by the real init
+                            // to a chunk freelist pointer that the buf's
+                            // dealloc later free()s. CRITICAL: this MUST be
+                            // a malloc'd pointer — using the IOSurface base
+                            // here corrupts the libmalloc heap (dealloc → free
+                            // → libmalloc detects non-malloc address →
+                            // checksum_botch → abort). Use a separate
+                            // calloc'd scratch (16 KB is enough for the
+                            // sequential-int freelist init + later memcpy
+                            // grow operations). The IOSurface stays attached
+                            // via associated objects for downstream code that
+                            // wants the contents pointer.
+                            ((void **)pr)[6] = calloc(1, 16384);
+                            fprintf(stderr,
+                                "#### CODEHEAP-SHIM ivar+0x30 = scratch (%p, 16K) — Mempool freelist target\n",
+                                ((void **)pr)[6]);
                             fprintf(stderr,
                                 "#### CODEHEAP-SHIM (%s) iosurf-synth len=%llu base=%p -> %p\n",
                                 class_getName(target),
