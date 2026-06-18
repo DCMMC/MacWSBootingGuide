@@ -521,6 +521,22 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
     return orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
 }
 
+// MetalContext::StopCapture() guard — see install_skylight_prepare_for_use_tolerate_nil_hook()
+// for the call-site explanation.
+typedef void (*MetalContext_StopCapture_t)(void *this);
+static MetalContext_StopCapture_t orig_metalcontext_stop_capture = NULL;
+static void hooked_metalcontext_stop_capture(void *this) {
+    if ((uintptr_t)this < 0x1000) {
+        static int bad_count = 0;
+        if (bad_count < 4) {
+            fprintf(stderr, "#### MetalContext::StopCapture: invalid this=%p, skipping\n", this);
+            bad_count++;
+        }
+        return;
+    }
+    orig_metalcontext_stop_capture(this);
+}
+
 static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *header) {
     MSImageRef sl = MSGetImageByName(SkyLightPath);
     if (!sl) {
@@ -552,6 +568,22 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
         fprintf(stderr, "#### SkyLight WSCompositeDestinationCreateWithMetalTexture nil-tolerate hook installed at %p\n", sym3);
     } else {
         fprintf(stderr, "#### SkyLight WSCompositeDestinationCreateWithMetalTexture: symbol not found, skipped\n");
+    }
+
+    // MetalContext::StopCapture() — called from render_update when the GPU
+    // capture-in-progress flag is set. Under AGX-native the WS::Updater
+    // sometimes invokes this with an invalid `this` (observed x0 = 0x95 on
+    // the crashing thread), which then SEGVs on `ldr x0, [x0, #0xb8]` at
+    // StopCapture+0x38. We don't actually want any GPU-capture work
+    // happening during the AGX-native bring-up, so just no-op the call
+    // when this looks invalid (< 0x1000 = unmapped low-address page).
+    void *sym4 = MSFindSymbol(sl, "__ZN12MetalContext11StopCaptureEv");
+    if (sym4) {
+        MSHookFunction(sym4, (void *)hooked_metalcontext_stop_capture,
+                       (void **)&orig_metalcontext_stop_capture);
+        fprintf(stderr, "#### SkyLight MetalContext::StopCapture invalid-this guard installed at %p\n", sym4);
+    } else {
+        fprintf(stderr, "#### SkyLight MetalContext::StopCapture: symbol not found, skipped\n");
     }
 }
 
