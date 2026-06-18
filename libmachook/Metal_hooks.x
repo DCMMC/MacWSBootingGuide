@@ -1483,10 +1483,201 @@ static void install_iogpu_init_hook(void) {
         (void*)macws_orig_iogpu_init);
 }
 
+// ─── Render-pipeline fallback for AGX-native ─────────────────────────────
+//
+// The macOS 13.4 AGXMetal13_3 we run under iOS 16.3 lacks a lowering
+// pass for at least one AIR intrinsic that CA's compiled shaders use
+// (`agx.air.fract.v3f16.fast`, hit by the `PBGRAXm_A2Xghfc` pipeline
+// spec). The runtime compile fails inside
+// -[AGXG13GFamilyDevice newRenderPipelineStateWithDescriptor:error:]
+// and CA::OGL::MetalContext::create_pipeline_state calls
+// abort_with_payload(13,4,…,"Metal failed to build render pipeline").
+//
+// Most CA pipelines DO build (~4800 successful texture creations are
+// observed before the first failure), so we can't just disable
+// AGX-native. Instead we install a fallback IMP on the device's
+// newRenderPipelineStateWithDescriptor:error: that calls the real
+// implementation and — only when that returns nil — substitutes the
+// descriptor's vertex/fragment functions with a pre-compiled
+// passthrough pair built from inline MSL (no half-precision, no
+// fract intrinsic, no tile features). The substitute pipeline does
+// NOT render the same content as the original would have, but it IS
+// a valid MTLRenderPipelineState matching the descriptor's attachment
+// formats, so CA proceeds and the WS process stays up. Affected
+// surfaces show a dark-magenta tint as a visual signal.
+//
+// Direct-IMP-call avoids re-entering the swizzle on the retry.
+typedef id (*macws_pip_orig_t)(id self, SEL _cmd,
+    MTLRenderPipelineDescriptor *desc, NSError **err);
+static macws_pip_orig_t macws_pip_orig = NULL;
+static id<MTLFunction> macws_fb_vfn = nil;
+static id<MTLFunction> macws_fb_ffn = nil;
+static dispatch_once_t macws_fb_once;
+static int macws_fb_logged = 0;
+
+static void macws_build_fallback_shaders(id<MTLDevice> device) {
+    dispatch_once(&macws_fb_once, ^{
+        // `newLibraryWithSource:` invokes the same AGX compiler that fails
+        // on CA's `fract.v3f16.fast` intrinsic, so it ALSO can't compile
+        // any new MSL we'd hand it (Error 1 / "library format not
+        // supported"). Use a pre-built metallib instead. QuartzCore's
+        // own `default.metallib` is shipped with already-lowered AIR
+        // and is the same source the tile-pipeline fallback uses; its
+        // simple-passthrough pair (`std_vert0_lpf` /
+        // `downsample_blur_4_frag_lpf`) is known to survive the
+        // chroot AGXMetal13_3 compiler. We accept the visual mismatch.
+        NSArray *candidate_paths = @[
+            @"/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib",
+            @"/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/default.metallib",
+        ];
+        // Ordered pairs — each entry is {vertex, fragment} where the
+        // vertex shader exposes the outputs the fragment shader reads.
+        // The existing tile-pipeline hook discovered std_vert0_lpf only
+        // emits position so "downsample_blur_4_frag_lpf" — which reads
+        // texcoord0 — won't link against it. We have to pair every
+        // fragment with a vertex that publishes its required varyings.
+        NSArray *pairs = @[
+            @[@"downsample_blur_vert_lpf", @"downsample_blur_4_frag_lpf"],
+            @[@"upsample_vert_lpf",        @"upsample_blur_4_frag_lpf"],
+            @[@"std_vert1_lpf",            @"std_frag1_lpf"],
+            @[@"std_vert0_lpf",            @"std_frag0_lpf"],
+        ];
+        for (NSString *path in candidate_paths) {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            NSError *lerr = nil;
+            id<MTLLibrary> lib = [device newLibraryWithURL:url
+                                                     error:&lerr];
+            if (!lib) {
+                fprintf(stderr,
+                    "#### MACWS_PIPELINE_FALLBACK lib %s load: %s\n",
+                    [path UTF8String],
+                    lerr ? [[lerr description] UTF8String] : "(no error)");
+                continue;
+            }
+            for (NSArray *pair in pairs) {
+                NSString *vn = pair[0];
+                NSString *fn = pair[1];
+                id<MTLFunction> v = [lib newFunctionWithName:vn];
+                id<MTLFunction> f = [lib newFunctionWithName:fn];
+                if (v && f) {
+                    macws_fb_vfn = v;
+                    macws_fb_ffn = f;
+                    fprintf(stderr,
+                        "#### MACWS_PIPELINE_FALLBACK pair loaded from %s "
+                        "vs=%s fs=%s\n",
+                        [path UTF8String],
+                        [vn UTF8String], [fn UTF8String]);
+                    break;
+                }
+            }
+            if (macws_fb_vfn && macws_fb_ffn) break;
+            // Reset partial matches and try the next library.
+            macws_fb_vfn = nil; macws_fb_ffn = nil;
+        }
+        if (!macws_fb_vfn || !macws_fb_ffn) {
+            fprintf(stderr,
+                "#### MACWS_PIPELINE_FALLBACK: no compatible vfn/ffn pair found\n");
+        }
+    });
+}
+
+static id macws_hook_newRenderPipelineState(id self, SEL _cmd,
+        MTLRenderPipelineDescriptor *desc, NSError **err) {
+    NSError *real_err = nil;
+    id result = macws_pip_orig
+        ? macws_pip_orig(self, _cmd, desc, err ?: &real_err)
+        : nil;
+    if (result) return result;
+    // Build fallback library the first time we need it.
+    macws_build_fallback_shaders((id<MTLDevice>)self);
+    if (!macws_fb_vfn || !macws_fb_ffn) {
+        // Couldn't build the fallback either; propagate nil + original
+        // NSError so the caller's abort_with_payload still has context.
+        return nil;
+    }
+    // Clone the descriptor so we don't mutate the caller's instance.
+    MTLRenderPipelineDescriptor *fb = [desc copy];
+    fb.vertexFunction = macws_fb_vfn;
+    fb.fragmentFunction = macws_fb_ffn;
+    // The original descriptor's vertex descriptor was built for the
+    // ORIGINAL vertex shader's attribute layout; replacing the shader
+    // forces us to publish a matching layout for ours. Mirror what
+    // the existing tile-pipeline fallback does: query the fallback
+    // vertex function's vertexAttributes (Metal exposes them on the
+    // function object), make every attribute a float4 at sequential
+    // 16-byte offsets, and wire them all to a single buffer slot
+    // (high index 30 to dodge whatever the caller binds).
+    @try {
+        NSArray *attrs = nil;
+        if ([macws_fb_vfn respondsToSelector:@selector(vertexAttributes)]) {
+            attrs = [(id)macws_fb_vfn performSelector:@selector(vertexAttributes)];
+        }
+        if (attrs && [attrs count] > 0) {
+            MTLVertexDescriptor *vd = [[MTLVertexDescriptor alloc] init];
+            for (id a in attrs) {
+                NSUInteger idx = 0;
+                @try {
+                    idx = (NSUInteger)[[a valueForKey:@"attributeIndex"]
+                        unsignedLongValue];
+                } @catch (NSException *e) {}
+                vd.attributes[idx].format = MTLVertexFormatFloat4;
+                vd.attributes[idx].offset = idx * 16;
+                vd.attributes[idx].bufferIndex = 30;
+            }
+            vd.layouts[30].stride = [attrs count] * 16;
+            vd.layouts[30].stepFunction = MTLVertexStepFunctionPerVertex;
+            vd.layouts[30].stepRate = 1;
+            fb.vertexDescriptor = vd;
+        } else {
+            // Shader takes no vertex input — drop any descriptor the
+            // caller had set so Metal validation doesn't complain about
+            // unused attributes.
+            fb.vertexDescriptor = nil;
+        }
+    } @catch (NSException *e) {
+        fb.vertexDescriptor = nil;
+    }
+    NSError *fb_err = nil;
+    id fb_result = macws_pip_orig
+        ? macws_pip_orig(self, _cmd, fb, &fb_err) : nil;
+    if (macws_fb_logged < 8) {
+        macws_fb_logged++;
+        const char *desc_lbl = "(no label)";
+        @try {
+            NSString *lbl = [desc label];
+            if (lbl) desc_lbl = [lbl UTF8String];
+        } @catch (NSException *e) {}
+        fprintf(stderr,
+            "#### MACWS_PIPELINE_FALLBACK label=\"%s\" orig=nil "
+            "fallback=%p err=%s\n",
+            desc_lbl, (void*)fb_result,
+            fb_err ? [[fb_err description] UTF8String] : "(none)");
+    }
+    if (err && !*err && real_err) *err = real_err;
+    return fb_result;
+}
+
+static void macws_install_pipeline_fallback(Class agx) {
+    SEL sel = @selector(newRenderPipelineStateWithDescriptor:error:);
+    Method m = class_getInstanceMethod(agx, sel);
+    if (!m) {
+        fprintf(stderr,
+            "#### MACWS_PIPELINE_FALLBACK: AGX device has no %s, skip\n",
+            sel_getName(sel));
+        return;
+    }
+    macws_pip_orig = (macws_pip_orig_t)method_getImplementation(m);
+    method_setImplementation(m, (IMP)macws_hook_newRenderPipelineState);
+    fprintf(stderr,
+        "#### MACWS_PIPELINE_FALLBACK installed on %s (orig=%p)\n",
+        class_getName(agx), (void*)macws_pip_orig);
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
     install_cbri_probe();         // log commandBufferResourceInfo returns
+    macws_install_pipeline_fallback(agx);  // fallback for unlowered shaders
 
     SEL sel = @selector(initWithAcceleratorPort:);
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
