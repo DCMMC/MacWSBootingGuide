@@ -215,6 +215,29 @@ static void PatchAGXVerifyLoweredIR(void) {
     // returning compiled binaries that fail differently — possible
     // ordering issue, possible findPrefix split mismatch we haven't
     // RE'd yet).
+    // Opt-in via env (set MTLCOMPILER_PATCH_RENAMER=1 in MTLCompilerService's
+    // launchd environment to enable). Verified-correct patch site by static RE
+    // — anchor `_AIRNTGetVersion` minus delta `-0x1259a4` lands on `bl
+    // std::string::insert(0, "agx.")` in
+    // `AGCLLVMUserObject::linkMetalRuntime`. Empirically, however, enabling
+    // the patch on this iOS-16.3 build did NOT prevent the
+    // `agx.air.fract.v3f16.fast` abort — same payload still fires. Two
+    // most likely explanations to investigate next:
+    //   (a) Substrate's MTLCompilerService filter on this Dopamine install
+    //       is loading the tweak too late (after AGCLLVMUserObject has
+    //       already cached the renamed Function declarations from a prior
+    //       MetalRuntime warm-up). lldb verification was inconclusive
+    //       because the per-request MTLCompilerService spawn lifetime is
+    //       too short to attach without altering timing.
+    //   (b) the iOS-16.3 AGXCompilerCore has a SECOND `agx.` prepend
+    //       path I haven't located yet. Only one `"agx."` literal xref
+    //       exists in the iOS binary (chroot has 5, four of which are in
+    //       raytracing accessors), and we patched the matching one, so
+    //       this would have to be a Twine concatenation that doesn't
+    //       reuse the standalone literal — feasible if the renamer
+    //       constructs `Twine("agx.air.") + …` directly off the longer
+    //       agx.air.indirect literal at iOS 0x199a891 (sliding 8 chars
+    //       earlier into "agx.air." would give a usable prefix).
     if (getenv("MTLCOMPILER_PATCH_RENAMER")) {
         PatchAGXRenamerSkipAgxPrefix();
     }
