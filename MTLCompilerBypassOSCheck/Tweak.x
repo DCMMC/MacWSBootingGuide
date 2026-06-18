@@ -352,21 +352,50 @@ static void PatchAGXVerifyLoweredIR(void) {
     // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck start");
     dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_GLOBAL);
     MSImageRef image = MSGetImageByName("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler");
-    assert(image);
+    if (image) {
     uint32_t *symbol = MSFindSymbol(image, "__ZN17MTLCompilerObject27readModuleFromBinaryRequestERK20ReadModuleParametersRN4llvm11LLVMContextEP15MTLFunctionTypePPvPmb");
-    assert(symbol);
-    // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck find symbol");
+    if (symbol) {
 
-    // 0x1eaaa17c4 <+608>:  ldr    w8, [sp, #0x84]
-    // 0x1eaaa17c8 <+612>:  cmp    w8, #0x7
-    // 0x1eaaa17cc <+616>:  b.ne   0x1eaaa1840 (throws "Target OS is incompatible.")
-    while(symbol[0] != 0xb94087e8) {
-        symbol++;
+    // The OS check is the triplet:
+    //   0xb94087e8  ldr w8, [sp, #0x84]
+    //   0x71001d1f  cmp w8, #0x7              (iOS platform enum)
+    //   0x540003a1  b.ne <error path: "Target OS is incompatible.">
+    // The PREVIOUS implementation walked the function looking for the first
+    // ldr-w8 and asserted on the next cmp, which was brittle: if MSFindSymbol
+    // returned a slightly different address or the function's preamble was
+    // shifted on a newer iOS DSC, the walk could either go off the end of
+    // the dylib's __TEXT (SEGV) or land on a false match. Now we verify all
+    // three instructions and cap the scan window so a miss is silent rather
+    // than fatal.
+    const uint32_t SIG_LDR  = 0xb94087e8u;
+    const uint32_t SIG_CMP  = 0x71001d1fu;
+    const uint32_t SIG_BNE  = 0x540003a1u;
+    const int MAX_WALK_INSNS = 4096;  // bounds the scan to ~16KB of __text
+    int hit = 0;
+    for (int i = 0; i < MAX_WALK_INSNS; i++) {
+        if (symbol[i]   == SIG_LDR &&
+            symbol[i+1] == SIG_CMP &&
+            symbol[i+2] == SIG_BNE) {
+            PatchInstruction(&symbol[i + 2], 0xd503201f); // nop the b.ne
+            hit = 1;
+            break;
+        }
     }
-    assert(symbol[1] == 0x71001d1f);
-    //assert(symbol[2] == 0x540003a1);
-    PatchInstruction(symbol + 2, 0xd503201f); // nop
-    // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck modify successfully!");
+    if (!hit) {
+        // Fallback: try the older partial-match where b.ne could be a
+        // different conditional but cmp w8 #0x7 is still the marker.
+        for (int i = 0; i < MAX_WALK_INSNS; i++) {
+            if (symbol[i]   == SIG_LDR &&
+                symbol[i+1] == SIG_CMP &&
+                ((symbol[i+2] & 0xff00001fu) == 0x54000001u)) {
+                PatchInstruction(&symbol[i + 2], 0xd503201f);
+                break;
+            }
+        }
+    }
+
+    } // if (symbol)
+    } // if (image)
 
     // Originally tried: PatchAGXVerifyLoweredIR() — bypass the
     // AGCLLVMUserObject::verifyLoweredIR check that surfaces the
