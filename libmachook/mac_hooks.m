@@ -20,19 +20,17 @@ BOOL hooked_return_1(void) { return YES; }
 void EnableJIT(void);
 
 // FORCE_M1_DRIVER: route Metal through the REAL macOS AGX (M1/G13G) GPU driver
-// instead of the MTLSimDriver simulator bridge. Auto-enabled ONLY for the arm64e
-// on-device slice. EXPERIMENT 2026-06-19: enabled for arm64 too in commit
-// f37b55e — empirically NET NEGATIVE for arm64 WS: with translation on, every
-// sel=0xa→0x9 ResCreate returned 0xe00002c2 BadArgument from
-// IOGPUDevice::new_resource. Without translation, the same calls succeed (the
-// raw macOS sel=0xa apparently hits a different dispatch in the iOS AGX
-// userclient that accepts the args as-is — per
-// [[chroot-uses-real-agx-kernel-driver-directly]] WS does ~53 successful
-// AGXIOC calls per session this way). Reverted to arm64e only for the
-// translation stack. WS arm64 keeps its working "no translation" path under
-// MACWS_AGX_NATIVE; REGISTER_CLASSES + the Mempool::grow class fix still
-// apply regardless (they don't live inside this #ifdef).
-#if defined(__arm64e__) && defined(LIBMACHOOK_ON_DEVICE_BUILD)
+// instead of the MTLSimDriver simulator bridge. Auto-enabled for both arm64e
+// (Terminal, etc. — AGX-direct is their only Metal path) and arm64 (WS).
+//
+// HISTORY: f37b55e enabled for arm64 too, 5e89f2b reverted on the
+// (incorrect) assumption that the raw sel=0xa hit a working path. Disasm
+// of iOS sDeviceMethods table shows sel=0xa = s_delete_resource. macOS
+// WS's create-shaped args sent to that selector get rejected at the
+// IOExternalMethod arg-count check (checkScalarInputCount=1 mismatch
+// with macOS's 0). Translation `sel=0xa → 0x9` IS the right thing; what
+// went wrong was the type=0 args layout for s_new_resource. Re-enabled.
+#if defined(LIBMACHOOK_ON_DEVICE_BUILD)
 #define FORCE_M1_DRIVER 1
 #endif
 
@@ -3620,6 +3618,27 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             *(uint64_t *)(shadowbuf + 0x40) = nb;
             agxHeapSz = nb;
             patched = 1;
+        }
+        // type=0 with args+0x40 already set (high bit pattern = pinned-VA
+        // shape — macOS used `pinnedGPULocation:` to request a specific
+        // VA range; the kernel reads args+0x40 as IOByteCount and
+        // rejects sizes that look like VAs). For SLCADisplay scanout
+        // backing: args+0x40 = 0x80888f00 (= 2.15 GB, bit 31 set) and
+        // args+0x48 = 0x1fb8000 (~33 MB, looks like a real length).
+        // Substitute the length-shaped args+0x48 as the size.
+        if(agxType == 0 && bc != 0 && (bc & 0x80000000ULL)) {
+            uint64_t len_field = *(const uint64_t *)(src + 0x48);
+            // Only swap if the length looks reasonable (<= 2 GB) and the
+            // VA-shaped field has the high bit.
+            if (len_field > 0 && len_field < 0x80000000ULL) {
+                fprintf(stderr,
+                    "#### AGXIOC sel=0x9 type=0 VA-shape detected: "
+                    "args+0x40=%#llx (bit31) → using args+0x48=%#llx as size\n",
+                    (unsigned long long)bc, (unsigned long long)len_field);
+                *(uint64_t *)(shadowbuf + 0x40) = len_field;
+                agxHeapSz = len_field;
+                patched = 1;
+            }
         }
         // (Obsolete bc>cap check moved into the heap fixup above —
         // macOS leaves args+0x40 = 0; the size we cap is the one we
