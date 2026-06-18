@@ -2552,6 +2552,159 @@ static void macws_install_agc_fastmath_disable(void) {
         "regardless of caller intent\n", sym);
 }
 
+// ─── AGXCompilerCore linkMetalRuntime rename patch ───────────────────────
+//
+// CONTEXT: chroot WindowServer compiles CA shaders IN-PROCESS via
+// AGXCompilerCore (loaded as a dependency of AGXMetal13_3). The earlier
+// hypothesis that compile goes out-of-process to MTLCompilerService.xpc
+// was WRONG — `ps aux` shows no MTLCompilerService process at the time
+// the v3f16 abort fires, and the matching Substrate-tweak patch never
+// logs (its %ctor never runs in the chroot WS process). So the patch
+// has to live here in libmachook, which already injects into the WS
+// process.
+//
+// PATCH SITE: In macOS-13.4 AGXCompilerCore (the version chroot loads
+// from the bind-mounted rootfs DSC), `AGCLLVMUserObject::linkMetalRuntime(bool)`
+// at 0x1a2591b90 builds a renamed Function name as
+// `"agx." + originalName + ".fast"`. The "agx." prepend is done by
+// `std::string::insert(0, "agx.")`, a single BL at 0x1a2591ca0. The
+// downstream dispatcher `AGCLLVMAirBuiltins::replaceBuiltins` only
+// matches Function names that start with "air."; the renamer's "agx."
+// prepend makes the renamed declaration invisible to the dispatcher and
+// the verifier then aborts with "Encountered unlowered function call to
+// agx.air.fract.v3f16.fast".
+//
+// If we NOP the insert call, the renamer produces `air.fract.v3f16.fast`
+// instead — still starts with "air.", findPrefix splits at the first
+// dot of the remainder ("fract" / "v3f16.fast"), the dispatcher's
+// StringMap lookup hits the "fract" key → `buildFract`, which reads the
+// operand type from the LLVM Value (half3) and emits the regular
+// `x - floor(x)` lowering. No more unlowered call → no verifier
+// complaint → no abort.
+//
+// ANCHOR + SIGNATURE:
+//   _AIRNTGetVersion is exported by AGXCompilerCore; BL site is at
+//   anchor + delta. To make the patch self-validating under DSC drift,
+//   we also require that the instruction IMMEDIATELY BEFORE the BL
+//   matches `add x2, x2, #0xdf4` (encoding 0x9137d042). That's the
+//   literal-pool prep for the "agx." string pointer — it's a unique
+//   signature for this exact call site.
+//
+//   Known deltas:
+//     - macOS-13.4 chroot DSC (this device): -0x7e470 (RE'd 2026-06-18
+//       from /System/Volumes/Preboot/Cryptexes/OS/.../dyld_shared_cache_arm64e,
+//       linkMetalRuntime @ 0x1a2591b90, BL @ 0x1a2591ca0,
+//       _AIRNTGetVersion @ 0x1a2610110)
+//
+// If the delta-1 instruction isn't the expected ADD, we walk a small
+// window around the anchor looking for the (ADD #0xdf4) + (BL) pair so
+// minor DSC version drift still resolves the right site.
+//
+// Opt-in via env: set MACWS_AGX_RENAMER_PATCH=1 in the WindowServer
+// plist EnvironmentVariables. Off by default until we've validated the
+// fix doesn't regress something else.
+static void macws_install_agx_renamer_patch(void) {
+    if (!getenv("MACWS_AGX_RENAMER_PATCH")) {
+        fprintf(stderr,
+            "#### MACWS_AGX_RENAMER_PATCH: off (set "
+            "MACWS_AGX_RENAMER_PATCH=1 to enable)\n");
+        return;
+    }
+    // Force-load AGXCompilerCore. It's pulled in by AGXMetal13_3 the
+    // first time Metal asks the device for a compiler, but doing it
+    // here ensures the symbol table is reachable before our hooks run.
+    const char *acc_paths[] = {
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/Versions/A/AGXCompilerCore",
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore",
+        NULL,
+    };
+    void *h = NULL;
+    for (int i = 0; acc_paths[i]; i++) {
+        h = dlopen(acc_paths[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (h) {
+            fprintf(stderr,
+                "#### MACWS_AGX_RENAMER_PATCH dlopen ok %s -> %p\n",
+                acc_paths[i], h);
+            break;
+        }
+    }
+    if (!h) {
+        fprintf(stderr,
+            "#### MACWS_AGX_RENAMER_PATCH dlopen FAILED: %s\n",
+            dlerror());
+        return;
+    }
+    void *anchor = dlsym(h, "AIRNTGetVersion");
+    if (!anchor) anchor = dlsym(h, "_AIRNTGetVersion");
+    if (!anchor) anchor = dlsym(RTLD_DEFAULT, "AIRNTGetVersion");
+    if (!anchor) anchor = dlsym(RTLD_DEFAULT, "_AIRNTGetVersion");
+    if (!anchor) {
+        fprintf(stderr,
+            "#### MACWS_AGX_RENAMER_PATCH: AIRNTGetVersion not found "
+            "via dlsym in AGXCompilerCore handle or RTLD_DEFAULT\n");
+        return;
+    }
+    fprintf(stderr,
+        "#### MACWS_AGX_RENAMER_PATCH anchor AIRNTGetVersion=%p\n",
+        anchor);
+    // Signature: the BL site is preceded by `add x2, x2, #0xdf4`
+    // (encoding 0x9137d042) which loads the "agx." literal pointer.
+    // Patch only if both the ADD signature matches AND the next insn
+    // is a BL — that's the unambiguous call site.
+    const uint32_t SIG_ADD_X2_DF4 = 0x9137d042u;  // add x2, x2, #0xdf4
+    BOOL (^try_patch)(uint32_t *, const char *) =
+        ^BOOL(uint32_t *bl_site, const char *label) {
+        uint32_t prev = bl_site[-1];
+        uint32_t cur  = bl_site[0];
+        unsigned op   = (cur >> 26) & 0x3F;
+        fprintf(stderr,
+            "#### MACWS_AGX_RENAMER_PATCH probe %s: site=%p prev=%#x "
+            "insn=%#x op6=%#x (sig %s, BL %s)\n",
+            label, bl_site, prev, cur, op,
+            prev == SIG_ADD_X2_DF4 ? "OK" : "MISMATCH",
+            op == 0x25 ? "OK" : "MISMATCH");
+        if (prev != SIG_ADD_X2_DF4 || op != 0x25) return NO;
+        ModifyExecutableRegion(bl_site, sizeof(uint32_t), ^{
+            *bl_site = 0xd503201fu; // nop
+        });
+        fprintf(stderr,
+            "#### MACWS_AGX_RENAMER_PATCH installed at %p (variant=%s) "
+            "BL %#x → NOP\n",
+            bl_site, label, cur);
+        return YES;
+    };
+
+    // Primary delta: macOS-13.4 chroot DSC (this device).
+    struct { intptr_t delta; const char *label; } candidates[] = {
+        { -0x7e470,  "macOS-13.4 chroot" },
+        // Legacy probes kept for diagnostic comparison only:
+        { -0xa721c,  "alt-A (old probe)" },
+        { -0x1259a4, "alt-B (old probe)" },
+    };
+    for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); i++) {
+        uint32_t *site = (uint32_t *)((uintptr_t)anchor + candidates[i].delta);
+        if (try_patch(site, candidates[i].label)) return;
+    }
+
+    // Fallback: small +/-2KB scan for (ADD x2,x2,#0xdf4 ; BL) pair.
+    // Stops at the first match.
+    fprintf(stderr,
+        "#### MACWS_AGX_RENAMER_PATCH: candidates missed — scanning "
+        "+/-2KB around primary site for ADD+BL signature\n");
+    uint32_t *base = (uint32_t *)((uintptr_t)anchor + (-0x7e470));
+    for (int off = -512; off <= 512; off++) {
+        uint32_t *probe = base + off;
+        if (probe[-1] == SIG_ADD_X2_DF4 && ((probe[0] >> 26) & 0x3F) == 0x25) {
+            char label[64];
+            snprintf(label, sizeof label, "scan off=%+d", off);
+            if (try_patch(probe, label)) return;
+        }
+    }
+    fprintf(stderr,
+        "#### MACWS_AGX_RENAMER_PATCH: no (ADD x2,x2,#0xdf4 ; BL) pair "
+        "found — AGXCompilerCore version drift, NOT patching\n");
+}
+
 static void macws_install_iohid_unserialize_bypass(void) {
     static int once = 0;
     if (once) return;
@@ -2805,6 +2958,8 @@ __attribute__((constructor)) void InitStuff() {
     // Targeted fix for the IOMFBServer thread BUS_ADRALN: skip just the
     // CFBinaryPlist deserialize step inside IOKit's HID-property cache.
     macws_install_iohid_unserialize_bypass();
+    // AGX renamer patch — opt-in via MACWS_AGX_RENAMER_PATCH=1.
+    macws_install_agx_renamer_patch();
     // (AGCLLVMCtx::compile fast-math hook attempt — VERIFIED NOT
     // CALLED for CA pipeline compiles. The fast-math AIR-intrinsic
     // rename happens in AGCLLVMUserObject::compile's optimization

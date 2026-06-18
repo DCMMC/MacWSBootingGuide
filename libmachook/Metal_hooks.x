@@ -1483,30 +1483,23 @@ static void install_iogpu_init_hook(void) {
         (void*)macws_orig_iogpu_init);
 }
 
-// ─── Render-pipeline fallback for AGX-native ─────────────────────────────
+#if 0
+// ─── REMOVED: render-pipeline shader-substitution fallback ──────────────
 //
-// The macOS 13.4 AGXMetal13_3 we run under iOS 16.3 lacks a lowering
-// pass for at least one AIR intrinsic that CA's compiled shaders use
-// (`agx.air.fract.v3f16.fast`, hit by the `PBGRAXm_A2Xghfc` pipeline
-// spec). The runtime compile fails inside
-// -[AGXG13GFamilyDevice newRenderPipelineStateWithDescriptor:error:]
-// and CA::OGL::MetalContext::create_pipeline_state calls
-// abort_with_payload(13,4,…,"Metal failed to build render pipeline").
+// Earlier iterations swizzled
+// `-[AGXG13GFamilyDevice newRenderPipelineStateWithDescriptor:error:]`
+// to retry a failed pipeline build with QuartzCore's
+// `downsample_blur_vert_lpf` + `downsample_blur_4_frag_lpf` shader pair
+// (loaded from QC's pre-compiled `default.metallib`). The pipeline did
+// build — but every CA draw that used a failing spec got the blur
+// downsample shaders instead of its intended composite/draw pair, so
+// affected layers rendered the wrong content. That's not a fix, it's a
+// graphical regression masquerading as one.
 //
-// Most CA pipelines DO build (~4800 successful texture creations are
-// observed before the first failure), so we can't just disable
-// AGX-native. Instead we install a fallback IMP on the device's
-// newRenderPipelineStateWithDescriptor:error: that calls the real
-// implementation and — only when that returns nil — substitutes the
-// descriptor's vertex/fragment functions with a pre-compiled
-// passthrough pair built from inline MSL (no half-precision, no
-// fract intrinsic, no tile features). The substitute pipeline does
-// NOT render the same content as the original would have, but it IS
-// a valid MTLRenderPipelineState matching the descriptor's attachment
-// formats, so CA proceeds and the WS process stays up. Affected
-// surfaces show a dark-magenta tint as a visual signal.
-//
-// Direct-IMP-call avoids re-entering the swizzle on the retry.
+// The whole block is deleted. The correct path is to make AGXCompilerCore
+// actually lower the renamed intrinsic — see the MTLCompilerService
+// tweak (MTLCompilerBypassOSCheck/Tweak.x) and the dispatch-table /
+// linkMetalRuntime RE writeup there.
 typedef id (*macws_pip_orig_t)(id self, SEL _cmd,
     MTLRenderPipelineDescriptor *desc, NSError **err);
 static macws_pip_orig_t macws_pip_orig = NULL;
@@ -1689,12 +1682,13 @@ static void macws_install_pipeline_fallback(Class agx) {
         "#### MACWS_PIPELINE_FALLBACK installed on %s (orig=%p)\n",
         class_getName(agx), (void*)macws_pip_orig);
 }
+#endif // 0 — disabled shader-substitution fallback
 
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
     install_cbri_probe();         // log commandBufferResourceInfo returns
-    macws_install_pipeline_fallback(agx);  // fallback for unlowered shaders
+    // (no pipeline fallback — see removed block above)
 
     SEL sel = @selector(initWithAcceleratorPort:);
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");

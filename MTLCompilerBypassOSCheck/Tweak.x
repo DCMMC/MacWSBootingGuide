@@ -1,6 +1,8 @@
 @import CydiaSubstrate;
 @import Foundation;
 @import Darwin;
+#include <stdarg.h>
+#include <time.h>
 
 // NOTE: do NOT take an ObjC block here. Under -fobjc-arc the on-device lld
 // arm64e build mis-signs the block's metadata pointer, so ARC's objc_storeStrong
@@ -92,42 +94,63 @@ static void PatchInstruction(uint32_t *addr, uint32_t value) {
 // bits 26..31 == 0b100101 == 0x25). If the iOS AGXCompilerCore has
 // changed and the byte is not a BL, we leave the original behaviour
 // alone instead of corrupting some unknown instruction.
+// Write a single line to /tmp/mtl_compiler_patch.log so we can verify
+// the renamer patch state without relying on oslog (which is hard to
+// read on a jailbroken iOS without the macOS-side `log show` binary).
+static void MTLPatchLog(const char *fmt, ...) {
+    FILE *f = fopen("/tmp/mtl_compiler_patch.log", "a");
+    if (!f) return;
+    pid_t pid = getpid();
+    time_t now = time(NULL);
+    struct tm tm; localtime_r(&now, &tm);
+    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d pid=%d] ",
+        tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec, pid);
+    va_list ap; va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
 static void PatchAGXRenamerSkipAgxPrefix(void) {
+    MTLPatchLog("renamer-patch: ENTER");
     void *h = dlopen(
         "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore",
         RTLD_NOW | RTLD_GLOBAL);
     if (!h) {
-        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch dlopen: %s",
-              dlerror());
+        MTLPatchLog("renamer-patch: dlopen FAILED: %s",
+                    dlerror() ?: "(no dlerror)");
         return;
     }
+    MTLPatchLog("renamer-patch: dlopen ok (h=%p)", h);
     MSImageRef img = MSGetImageByName(
         "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore");
     if (!img) {
-        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch: image not "
-              "MSGetImageByName-able");
+        MTLPatchLog("renamer-patch: MSGetImageByName returned NULL");
         return;
     }
     void *anchor = MSFindSymbol(img, "_AIRNTGetVersion");
     if (!anchor) {
-        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch: anchor "
-              "_AIRNTGetVersion not found");
+        MTLPatchLog("renamer-patch: MSFindSymbol _AIRNTGetVersion NULL");
         return;
     }
     intptr_t delta = -0x1259a4;
     uint32_t *bl_site = (uint32_t *)((uintptr_t)anchor + delta);
     uint32_t cur = bl_site[0];
+    MTLPatchLog("renamer-patch: anchor=%p delta=%#lx site=%p first_insn=%#x",
+                anchor, (unsigned long)delta, bl_site, cur);
     // BL opcode: bits 31..26 == 100101
     if (((cur >> 26) & 0x3F) != 0x25) {
-        NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch site@%p "
-              "insn=%#x — NOT a BL, refusing to patch (DSC drift?)",
-              bl_site, cur);
+        MTLPatchLog("renamer-patch: insn at site is NOT a BL "
+                    "(opcode bits=%#x), refusing to patch",
+                    (cur >> 26) & 0x3F);
         return;
     }
     PatchInstruction(bl_site, 0xd503201fu); // NOP
-    NSLog(@"#### MTLCompilerBypassOSCheck renamer-patch installed: "
-          "BL std::string::insert @%p NOPed (no more 'agx.' prefix on "
-          "AIR-builtin rename) — was %#x", bl_site, cur);
+    uint32_t after = bl_site[0];
+    MTLPatchLog("renamer-patch: NOPed BL site=%p was=%#x now=%#x",
+                bl_site, cur, after);
 }
 
 static void PatchAGXVerifyLoweredIR(void) {
@@ -238,6 +261,10 @@ static void PatchAGXVerifyLoweredIR(void) {
     //       constructs `Twine("agx.air.") + …` directly off the longer
     //       agx.air.indirect literal at iOS 0x199a891 (sliding 8 chars
     //       earlier into "agx.air." would give a usable prefix).
+    // Always log the entry — so we can verify the tweak ctor itself runs
+    // in MTLCompilerService, separately from whether the patch is gated.
+    MTLPatchLog("%%ctor: OS-check patched; env MTLCOMPILER_PATCH_RENAMER=%s",
+                getenv("MTLCOMPILER_PATCH_RENAMER") ?: "(unset)");
     if (getenv("MTLCOMPILER_PATCH_RENAMER")) {
         PatchAGXRenamerSkipAgxPrefix();
     }
