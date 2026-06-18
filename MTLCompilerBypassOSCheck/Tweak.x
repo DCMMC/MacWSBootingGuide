@@ -113,24 +113,102 @@ static void MTLPatchLog(const char *fmt, ...) {
     fflush(stderr);
 }
 
+// Strip arm64e PAC bits from a pointer. dlsym/MSFindSymbol on arm64e
+// returns PAC-signed pointers for code symbols; doing pointer arithmetic
+// on them carries the PAC bits into the result and the dereference faults.
+// Mask the lower 48 bits — arm64e iOS uses 47-bit virtual addresses so
+// bits 47..63 hold the PAC tag.
+static uintptr_t StripPAC(const void *p) {
+    return (uintptr_t)p & 0x0000FFFFFFFFFFFFull;
+}
+
 // Scan a window around (anchor + delta_hint) for the BL site preceded by
 // `add x2, x2, #0xdf4` (encoding 0x9137d042). That ADD is the
 // literal-pool-load for "agx." in `linkMetalRuntime`, so the immediately
 // following BL is the std::string::insert(0, "agx.") call we want NOPed.
 // Returns the BL site pointer or NULL if not found in the search window.
-static uint32_t *FindRenamerBLSite(void *anchor, intptr_t delta_hint, int window_bytes) {
+//
+// `image_lo`/`image_hi` bound the scan to the AGXCompilerCore image —
+// passing 0/0 lets the scan run unrestrained. We also wrap each
+// dereference in a SIGBUS/SIGSEGV-tolerant sigsetjmp so an off-image
+// probe just stops the scan instead of crashing the whole tweak.
+#include <setjmp.h>
+#include <signal.h>
+static sigjmp_buf g_renamer_scan_jmp;
+static volatile sig_atomic_t g_renamer_scan_in_probe = 0;
+static void RenamerScanSignalHandler(int sig) {
+    (void)sig;
+    if (g_renamer_scan_in_probe) {
+        siglongjmp(g_renamer_scan_jmp, 1);
+    }
+}
+static uint32_t *FindRenamerBLSite(void *anchor_raw, intptr_t delta_hint,
+                                   int window_bytes,
+                                   uintptr_t image_lo, uintptr_t image_hi) {
     const uint32_t SIG_ADD_X2_DF4 = 0x9137d042u;
-    uint32_t *base = (uint32_t *)((uintptr_t)anchor + delta_hint);
+    uintptr_t anchor = StripPAC(anchor_raw);
+    uint32_t *base = (uint32_t *)(anchor + delta_hint);
     int max_words = window_bytes / 4;
-    // Search both directions from the hint.
+
+    struct sigaction sa_old_segv, sa_old_bus, sa = {0};
+    sa.sa_handler = RenamerScanSignalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, &sa_old_segv);
+    sigaction(SIGBUS,  &sa, &sa_old_bus);
+
+    uint32_t *found = NULL;
     for (int off = -max_words; off <= max_words; off++) {
         uint32_t *probe = base + off;
-        if (probe[-1] == SIG_ADD_X2_DF4 &&
-            ((probe[0] >> 26) & 0x3F) == 0x25) {
-            return probe;
+        if (image_hi && ((uintptr_t)probe < image_lo + 4 ||
+                         (uintptr_t)probe >= image_hi)) continue;
+        uint32_t prev_insn, cur_insn;
+        if (sigsetjmp(g_renamer_scan_jmp, 1) != 0) continue;
+        g_renamer_scan_in_probe = 1;
+        prev_insn = probe[-1];
+        cur_insn  = probe[0];
+        g_renamer_scan_in_probe = 0;
+        if (prev_insn == SIG_ADD_X2_DF4 &&
+            ((cur_insn >> 26) & 0x3F) == 0x25) {
+            found = probe;
+            break;
         }
     }
-    return NULL;
+    sigaction(SIGSEGV, &sa_old_segv, NULL);
+    sigaction(SIGBUS,  &sa_old_bus,  NULL);
+    return found;
+}
+
+// Walk dyld's image list to get the AGXCompilerCore binary's mapped
+// __TEXT range. We use this to bound the scan so an off-end probe
+// doesn't dereference unmapped memory.
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+static void GetAGXCompilerCoreTextRange(uintptr_t *lo_out, uintptr_t *hi_out) {
+    *lo_out = 0; *hi_out = 0;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name || !strstr(name, "AGXCompilerCore")) continue;
+        const struct mach_header_64 *mh =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!mh) continue;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        const struct load_command *lc =
+            (const struct load_command *)((const char *)mh + sizeof(*mh));
+        for (uint32_t j = 0; j < mh->ncmds; j++) {
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *sc =
+                    (const struct segment_command_64 *)lc;
+                if (strncmp(sc->segname, "__TEXT", 16) == 0) {
+                    *lo_out = (uintptr_t)sc->vmaddr + slide;
+                    *hi_out = *lo_out + sc->vmsize;
+                    return;
+                }
+            }
+            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+        }
+    }
 }
 
 static void PatchAGXRenamerSkipAgxPrefix(void) {
@@ -155,27 +233,41 @@ static void PatchAGXRenamerSkipAgxPrefix(void) {
         MTLPatchLog("renamer-patch: MSFindSymbol _AIRNTGetVersion NULL");
         return;
     }
-    MTLPatchLog("renamer-patch: anchor _AIRNTGetVersion=%p", anchor);
+    uintptr_t anchor_stripped = StripPAC(anchor);
+    MTLPatchLog("renamer-patch: anchor _AIRNTGetVersion=%p (stripped=%#lx)",
+                anchor, (long)anchor_stripped);
+
+    uintptr_t image_lo = 0, image_hi = 0;
+    GetAGXCompilerCoreTextRange(&image_lo, &image_hi);
+    MTLPatchLog("renamer-patch: AGXCompilerCore __TEXT range %#lx-%#lx",
+                (long)image_lo, (long)image_hi);
 
     // Known iOS-16.3 delta from prior RE. May be stale — the scan below
     // handles drift by walking +/-16KB around the hint for the
     // (ADD x2,x2,#0xdf4 ; BL) pair.
     intptr_t delta_hint = -0x1259a4;
-    uint32_t *bl_site = FindRenamerBLSite(anchor, delta_hint, 16 * 1024);
+    uint32_t *bl_site = FindRenamerBLSite(anchor, delta_hint,
+                                          16 * 1024,
+                                          image_lo, image_hi);
     if (!bl_site) {
         MTLPatchLog("renamer-patch: ADD+BL signature NOT found within "
                     "+/-16KB of anchor+delta_hint=%#lx — scanning whole "
                     "__text for fallback", (unsigned long)delta_hint);
-        // Broader fallback: scan +/-2MB around anchor (AGXCompilerCore's
-        // __text is roughly 1.7MB; this covers it).
-        bl_site = FindRenamerBLSite(anchor, 0, 2 * 1024 * 1024);
+        // Broader fallback: scan from the image base offset, bounded by
+        // __TEXT range. AGXCompilerCore's __text is roughly 1.7MB.
+        if (image_hi) {
+            // window = entire __TEXT size, centred at anchor
+            int win = (int)(image_hi - image_lo);
+            bl_site = FindRenamerBLSite(anchor, 0, win,
+                                        image_lo, image_hi);
+        }
         if (!bl_site) {
             MTLPatchLog("renamer-patch: FAILED — no ADD+BL pair found "
-                        "anywhere within +/-2MB of anchor");
+                        "within AGXCompilerCore __TEXT");
             return;
         }
     }
-    intptr_t actual_delta = (intptr_t)bl_site - (intptr_t)anchor;
+    intptr_t actual_delta = (intptr_t)((uintptr_t)bl_site - anchor_stripped);
     uint32_t cur = bl_site[0];
     MTLPatchLog("renamer-patch: found BL site=%p actual_delta=%#lx insn=%#x",
                 bl_site, (long)actual_delta, cur);
