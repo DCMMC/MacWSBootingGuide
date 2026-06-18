@@ -19,6 +19,34 @@ cd "$PROJECT_DIR"
 FAST=${FAST:-0}
 for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
 
+# Guardrail: FAST only copies libmachook.{arm64,arm64e}.dylib to the rootfs.
+# Any other build artefact (CydiaSubstrate tweak under TweakInject, iOS-side
+# binaries like launchdchrootexec / autosignd / MTLSimDriverHost, scripts in
+# layout/) gets shipped exclusively via `make package` + `dpkg -i`, which the
+# FAST path skips. If we silently do FAST while one of those sources is dirty,
+# the device runs stale code (most painful case: MTLCompilerBypassOSCheck/Tweak.x
+# changes never reach /var/jb/usr/lib/TweakInject/, so MTLCompilerService keeps
+# failing the OS check). Detect that and force FAST=0 with a warning.
+if [ "$FAST" = "1" ]; then
+    MARKER=/var/jb/usr/lib/TweakInject/MTLCompilerBypassOSCheck.dylib
+    if [ -f "$MARKER" ]; then
+        STALE=$(find MTLCompilerBypassOSCheck launchdchrootexec autosignd \
+                     MTLSimDriverHost launchservicesd mountdevfs \
+                     Makefile control layout \
+                     -type f -newer "$MARKER" 2>/dev/null \
+                | grep -v '/\._' | head -3)
+        if [ -n "$STALE" ]; then
+            echo "==> FAST guardrail tripped: source files newer than last dpkg-installed tweak:"
+            echo "$STALE" | sed 's/^/      /'
+            echo "==> Forcing full build (FAST only ships libmachook; deb-installed bits would stay stale)"
+            FAST=0
+        fi
+    else
+        echo "==> FAST guardrail: no installed tweak found at $MARKER — forcing full build"
+        FAST=0
+    fi
+fi
+
 if [ "$FAST" != "1" ]; then
     echo "==> Cleaning previous build..."
     make clean 2>/dev/null || true

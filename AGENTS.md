@@ -6,6 +6,55 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 MacWSBootingGuide is a WIP jailbreak project that enables running macOS's WindowServer (and macOS GUI applications) on jailbroken iOS/iPadOS devices (arm64, Dopamine rootless jailbreak). It works by chrooting into a bind-mounted macOS filesystem and using dyld interpositioning to patch incompatible system calls and framework behaviors at runtime.
 
+## Patch Discipline (load-bearing rule — read first)
+
+This codebase has burned multiple sessions on patches that LOOK fixed because
+the immediate crash stopped but actually leave the underlying invariant
+broken, then cascade into worse failures. Don't do this.
+
+**A symptom-suppressing patch is NOT a fix.** If your change is one of:
+
+- `bl <thing> → nop` (the thing was supposed to run; NOPing it skips setup
+  that downstream code assumes ran)
+- `b.{eq,ne,hi,hs} → b` (forcing a path the original wouldn't take; the
+  unforced path's preconditions still apply to what runs after)
+- Hooking a check function (`validateBufferTextureWithSize:`,
+  `someInternalThing` etc.) to always return 1 / YES / non-nil
+- Blanket-bypassing `__assert_rtn`, `abort_with_payload`, `objc_release`,
+  any class-wide method override returning a constant
+- "If nil, calloc a zero buffer and return that as a stub"
+- Filling `Device->X` / `this->Y` with a zero blob "so the deref doesn't
+  crash"
+- An env-gated `if (getenv("MACWS_X")) skip_check();` for an actual
+  protocol check, not just a diagnostic toggle
+
+then call it a **diagnostic** or **temporary scaffold**, **not** a fix.
+Either keep going to find the root cause, or label it explicitly so the
+next reader knows it's a marker that something is still broken.
+
+**The right layer is upstream.** If a buffer field is nil where it
+shouldn't be, the question is "what was supposed to fill it" — and then
+"why didn't that fill succeed". Walking down into the crashing function
+and NOPing past the deref is working at the wrong layer.
+
+**Process uptime ≠ stability.** A process whose `__assert_rtn` is
+globally bypassed can stay alive while quietly leaking state every frame.
+Witnesses for stability are: visible output (VNC pixels, completed XPC
+round-trips), counters advancing, frames landing. Not `etime`.
+
+**Existing band-aids that exemplify what NOT to repeat:**
+
+| Patch (was/is in tree) | Why it was wrong | Real fix |
+|---|---|---|
+| `Mempool::grow b.hs → b` NOP (commit `4124628`, rolled back by `098690e`) | Skipped freelist init; downstream `newBuffer` read uninit storage and crashed worse | `MACWS_AGX_REGISTER_CLASSES=1` walks `__objc_classlist`+`objc_readClassPair` so `objc_alloc(AGXBuffer)` actually works → lambda fills the chunks legitimately |
+| `findOrCreate<X>ProgramVariant` stub-prologue 5-insn `movz/movk*3/ret 0x1000-byte calloc` (whack-a-mole, removed by `247da92`) | Every new variant lookup was its own null deref | NSBundle registration via `bundleWithPath:` + `loadAndReturnError:` so `setupCompiler:`'s `pathForResource:ds.g13g` resolves → `Device->0x318` (AGX::Compiler*) is real → ALL variant lookups succeed naturally |
+| Blanket `__assert_rtn → log+return` (still in tree, **lazy**) | Masks `_state_stack.empty() "Unbalanced Composites"` at MetalContext.mm:411 → SkyLight composite state stack leaks every frame | Find why intermediate composite ops early-return (currently ResCreate FAIL inside AGXIOC) and fix THAT |
+
+See `[[feedback-no-lazy-nop-ret-bypass]]` in agent memory for the
+catalogue + the diagnostic technique (`MACWS_AGX_CRASH_DIAG` register +
+memory dump in `mac_hooks.m`) that turns these into one-cycle
+root-cause solves.
+
 ## Build
 
 This project uses [Theos](https://theos.dev).

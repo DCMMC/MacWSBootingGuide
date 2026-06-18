@@ -615,106 +615,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         *once = -1;
 #endif
 
-        // MACWS_AGX_NATIVE: in chroot under AGX-native userspace, multiple SkyLight
-        // assertions in the compositor path fail because the AGX-native render targets
-        // are set up differently than the sim wrapper. Auto-patch backward-BL calls
-        // following an adrp+add that loads ONE OF a known list of file-basename strings
-        // (so we only neuter __assert_rtn callsites in specific files, not random BL).
-        if (getenv("MACWS_AGX_NATIVE")) {
-            unsigned long text_sz = 0, cstr_sz = 0;
-            uint8_t *text = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__text", &text_sz);
-            uint8_t *cstr = getsectiondata((const struct mach_header_64 *)header, "__TEXT", "__cstring", &cstr_sz);
-            fprintf(stderr, "#### MACWS_AGX_NATIVE SkyLight: text=%p sz=%lu cstr=%p sz=%lu\n",
-                text, text_sz, cstr, cstr_sz);
-
-            // File-basename strings whose assertions we target. Add more as new crashes
-            // are diagnosed. Each string must be the EXACT filename token used in
-            // __assert_rtn's file argument (no leading path, ends in .mm/.cpp/.cc).
-            const char *target_files[] = {
-                "CAWSBackend.mm",
-                NULL
-            };
-
-            for (int n = 0; target_files[n]; n++) {
-                size_t nlen = strlen(target_files[n]);
-                uint64_t string_addr = 0;
-                for (size_t p = 0; p + nlen < cstr_sz; p++) {
-                    if (cstr[p] == target_files[n][0] && memcmp(cstr + p, target_files[n], nlen) == 0 &&
-                        cstr[p + nlen] == '\x00' && (p == 0 || cstr[p - 1] == '\x00')) {
-                        string_addr = (uint64_t)(cstr + p);
-                        break;
-                    }
-                }
-                if (!string_addr) {
-                    fprintf(stderr, "#### MACWS_AGX_NATIVE filename '%s' not found\n", target_files[n]);
-                    continue;
-                }
-
-                uint32_t *text32 = (uint32_t *)text;
-                size_t text_n = text_sz / 4;
-                int patched = 0;
-                for (size_t i = 0; i + 12 < text_n; i++) {
-                    uint32_t adrp = text32[i];
-                    if ((adrp & 0x9F000000) != 0x90000000) continue;
-                    int64_t immlo = (int64_t)((adrp >> 29) & 0x3);
-                    int64_t immhi = (int64_t)((adrp >> 5) & 0x7FFFF);
-                    int64_t imm = (immhi << 2) | immlo;
-                    if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1);
-                    imm <<= 12;
-                    uint64_t pc = (uint64_t)&text32[i];
-                    uint64_t page_target = (pc & ~0xFFFULL) + (uint64_t)imm;
-
-                    uint32_t inst1 = text32[i + 1];
-                    if ((inst1 & 0xFFC00000) != 0x91000000) continue;
-                    uint32_t add_imm = (inst1 >> 10) & 0xFFF;
-                    uint32_t shift = (inst1 >> 22) & 0x3;
-                    uint64_t final_addr = page_target + ((uint64_t)add_imm << (shift * 12));
-                    if (final_addr != string_addr) continue;
-
-                    // The matcher above finds an adrp+add that loads
-                    // "CAWSBackend.mm" — but this string is referenced from
-                    // many places in SkyLight, not just __assert_rtn calls
-                    // (logging, debug strings, etc.). To target ONLY actual
-                    // assertions, require the call site to look like an
-                    // assertion-handler call: within ~8 insns we should see a
-                    // `mov w2, #<line>` followed by a BL. The mov w2 sets
-                    // line number; the BL is the assert helper.
-                    int bl_found = -1;
-                    int mov_w2_seen = 0;
-                    for (size_t j = i + 2; j < i + 12 && j < text_n; j++) {
-                        uint32_t inst = text32[j];
-                        // `mov w2, #imm`: 52800002 base, imm in bits 20:5
-                        // Pattern: 0x52800002 OR'd with (imm<<5)
-                        if ((inst & 0xFFE0001F) == 0x52800002) {
-                            mov_w2_seen = 1;
-                        }
-                        // `movk w2, #imm`: high16 variant — also part of large line numbers
-                        if ((inst & 0xFFE0001F) == 0x72A00002) {
-                            mov_w2_seen = 1;
-                        }
-                        if ((inst & 0xFC000000) == 0x94000000) {  // BL
-                            if (mov_w2_seen) {
-                                bl_found = (int)j;
-                                break;
-                            }
-                        }
-                    }
-                    if (bl_found >= 0) {
-                        ModifyExecutableRegion(&text32[bl_found], sizeof(uint32_t), ^{
-                            text32[bl_found] = 0xd503201f;  // NOP
-                        });
-                        fprintf(stderr, "#### MACWS_AGX_NATIVE %s assert NOP at text+%#zx\n", target_files[n], bl_found * 4);
-                        patched++;
-                    }
-                }
-                fprintf(stderr, "#### MACWS_AGX_NATIVE %s: patched %d sites\n", target_files[n], patched);
-            }
-
-            // NOTE: Removed previous PrepareForUse / WSComposite / CreateCompositeDestination
-            // NOP-cascade patches per user direction. They let WS survive longer but produced
-            // empty textures (no GPU content) — VNC would show blank. The correct fix is the
-            // BSS pool allocator shim in the AGXMetal13_3 branch below (see MACWS_AGX_BSS_SHIM).
-        }
+        // (Removed LAZY CAWSBackend.mm assert-NOP scanner — empirically
+        // never fired in post-MACWS_AGX_REGISTER_CLASSES runs and was
+        // masking real CA backend invariants. See AGENTS.md "Patch
+        // Discipline".)
 
         // Tolerate-nil texture in MetalIOSurfaceBacking::PrepareForUse
         //
@@ -737,16 +641,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // textures (which DO succeed) run normally.
         install_skylight_prepare_for_use_tolerate_nil_hook((const void *)header);
 
-        // Render-update fail-fast retargets are ONLY needed under
-        // MACWS_AGX_NATIVE (where AGXG13GFamilyDevice rejects every
-        // newTexture call → nil propagates to render_update). Under the
-        // MTLSim path, render_update gets a valid composite_destination
-        // back and DOES write the framebuffer; redirecting its fail-path
-        // to the epilogue then prematurely shorts out subsequent
-        // re-renders too. Skip unless AGX-native is requested.
-        if (!getenv("MACWS_AGX_NATIVE")) goto skip_render_update_patches;
-
-        // ── render_update composite_destination fail-fast retarget ──────────
+        // (Removed LAZY render_update cbz/cbnz/assert-block retargets — 3
+        // sites that flipped composite_destination-nil failures into
+        // epilogue jumps. Never fired under MACWS_AGX_REGISTER_CLASSES;
+        // even when AGX render targets fail, the upstream cause is the
+        // ResCreate FAIL kernel rejection, not nil propagation through
+        // render_update. See AGENTS.md "Patch Discipline".)
+#if 0
         // Patch the `cbz x24, +0x660` at SkyLight 0x18525ec50 so that when
         // _WSCompositeDestinationCreateWithIOSurface (or its WithMetalTexture
         // inner call) returns NULL, render_update jumps STRAIGHT to its
@@ -762,7 +663,14 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // cleanly without touching sp+0x38. x0 = 0 from the failed
         // composite-destination call is harmless to the caller (UpdateDisplays
         // tolerates a 0 return — it just renders nothing for this frame).
-        {
+        if (getenv("MACWS_KEEP_RENDER_UPDATE_CBZ")) {
+            // LAZY (three sites): retargets cbz/cbnz/first-insn of
+            // SkyLight's render_update assert block straight to its
+            // epilogue. That kept WS alive when composite_destination
+            // came back nil. Default off; the assert it dodges contains
+            // the actual file/line of why composite_destination was nil,
+            // which is what we need to see now. Opt-IN with
+            // MACWS_KEEP_RENDER_UPDATE_CBZ=1.
             // Search for cbz x24 followed by an adrp+add+mov_w2+bl pattern
             // (the assert sequence). The cbz target is the assert block.
             const uint64_t expected_orig = 0xB4003318;  // cbz x24, +0x660
@@ -840,7 +748,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             }
         }
-        skip_render_update_patches:;
+#endif
 
         // NSLog(@"#### debugbydcmmc loadImageCallback SkyLight modified");
     } else if(!strncmp(info.dli_fname, IOMFBPath, strlen(IOMFBPath))) {
@@ -971,7 +879,12 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         if(_NSGetExecutablePath(exe, &exelen) == 0) {
             isWindowServer = (strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL);
         }
-        if(!isWindowServer) {
+        if(!isWindowServer && getenv("MACWS_KEEP_FORCE_ACCEL")) {
+            // LAZY: forces CABackingStorePrepareUpdates_ to take the
+            // accelerated (IOSurface) branch unconditionally. Was hiding
+            // the actual reason apps fell to the CPU bitmap path. Opt-IN
+            // with MACWS_KEEP_FORCE_ACCEL=1; default off so the real
+            // CPU-vs-GPU decision logic runs and we see why it picked CPU.
             uint32_t *forceAccel = (uint32_t *)(OFF_QuartzCore_CABackingStore_force_accel + (uintptr_t)header);
             ModifyExecutableRegion(forceAccel, sizeof(uint32_t), ^{
                 if (*forceAccel == 0x34000155) { // cbz w21, #0x28 (+852)
@@ -1421,9 +1334,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
 
-        // ──────────────────────────────────────────────────────────────────
-        // validateBufferTextureWithSize: always-YES patch (MACWS_AGX_NATIVE).
-        //
+        // (Removed LAZY -[AGXG13GFamilyTexture validateBufferTextureWithSize:]
+        // → always-YES patch. The magic-footer check at this site never
+        // fires when we get to it under MACWS_AGX_REGISTER_CLASSES: the
+        // upstream AGXIOC ResCreate FAIL returns nil before validate is
+        // reached, and when it IS reached it now returns its real result.
+        // See AGENTS.md "Patch Discipline".)
+#if 0
         // Discovered this session (2026-06-17) while chasing the
         // newTextureWithDescriptor:iosurface:plane: = nil failure mode:
         //
@@ -1475,9 +1392,16 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // target) that's acceptable — VNC reads the IOSurface CPU side via
         // IOSurfaceLock and we don't need the GPU metadata at all.
         //
-        // Gated by MACWS_AGX_VALIDATE_ALWAYS=1 (default ON when AGX-native).
+        // LAZY: validateBufferTextureWithSize: always-YES. This silenced
+        // the magic-footer (0x99b7d4010ce3ead3 / 0x92482f97c0394fd0) check
+        // failure that fires when AGX firmware-written texture metadata
+        // diverges in chroot. Now opt-IN via MACWS_KEEP_VALIDATE_ALWAYS=1;
+        // default is to let the real check return and expose downstream
+        // failure (newTextureWithDescriptor:iosurface:plane: → nil).
+        // See AGENTS.md "Patch Discipline".
         if (getenv("MACWS_AGX_NATIVE") &&
-            !getenv("MACWS_AGX_KEEP_VALIDATE")) {
+            !getenv("MACWS_AGX_KEEP_VALIDATE") &&
+            getenv("MACWS_KEEP_VALIDATE_ALWAYS")) {
             uint64_t fn_static = 0x1e576ef94;
             uint32_t *fn_at = (uint32_t *)(fn_static + slide);
             const uint32_t MOVZ_W0_1 = 0x52800020u;   // movz w0, #1
@@ -1507,6 +1431,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             }
         }
+#endif
 
         // ──────────────────────────────────────────────────────────────────
         // External __auth_stub patcher (MACWS_AGX_NATIVE-gated).
@@ -2144,12 +2069,59 @@ static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
             (void*)uctx->uc_mcontext->__ss.__x[5],
             (void*)uctx->uc_mcontext->__ss.__x[6],
             (void*)uctx->uc_mcontext->__ss.__x[7]);
-        APPEND("####   regs x8=%p x9=%p x16=%p x17=%p x29(fp)=%p\n",
+        APPEND("####   regs x8=%p x9=%p x10=%p x11=%p\n",
             (void*)uctx->uc_mcontext->__ss.__x[8],
             (void*)uctx->uc_mcontext->__ss.__x[9],
+            (void*)uctx->uc_mcontext->__ss.__x[10],
+            (void*)uctx->uc_mcontext->__ss.__x[11]);
+        APPEND("####   regs x12=%p x13=%p x14=%p x15=%p\n",
+            (void*)uctx->uc_mcontext->__ss.__x[12],
+            (void*)uctx->uc_mcontext->__ss.__x[13],
+            (void*)uctx->uc_mcontext->__ss.__x[14],
+            (void*)uctx->uc_mcontext->__ss.__x[15]);
+        APPEND("####   regs x16=%p x17=%p x19=%p x20=%p x21=%p x29(fp)=%p\n",
             (void*)uctx->uc_mcontext->__ss.__x[16],
             (void*)uctx->uc_mcontext->__ss.__x[17],
+            (void*)uctx->uc_mcontext->__ss.__x[19],
+            (void*)uctx->uc_mcontext->__ss.__x[20],
+            (void*)uctx->uc_mcontext->__ss.__x[21],
             (void*)fp);
+        // For Mempool::grow / similar init crashes, x19 is usually `this`.
+        // Dump 8 qwords from x19 so we can see the layout (chunks, count,
+        // and the *(this+0x28) field whose dereference faults).
+        uintptr_t this_p = (uintptr_t)uctx->uc_mcontext->__ss.__x[19];
+        if (this_p && this_p > 0x1000 && this_p < 0x800000000000ULL) {
+            uint64_t mem[8] = {0};
+            mach_vm_size_t mgot = 0;
+            kern_return_t mkr = mach_vm_read_overwrite(
+                mach_task_self(), (mach_vm_address_t)this_p, sizeof(mem),
+                (mach_vm_address_t)mem, &mgot);
+            if (mkr == KERN_SUCCESS) {
+                APPEND("####   x19[0x00..0x38] = %016llx %016llx %016llx %016llx\n"
+                       "####                    %016llx %016llx %016llx %016llx\n",
+                    mem[0], mem[1], mem[2], mem[3],
+                    mem[4], mem[5], mem[6], mem[7]);
+                // mem[5] is *(this+0x28). If it's a real pointer, dump its first 8 qwords too.
+                uintptr_t at28 = (uintptr_t)mem[5];
+                if (at28 && at28 > 0x1000 && at28 < 0x800000000000ULL) {
+                    uint64_t mem2[8] = {0};
+                    mach_vm_size_t m2got = 0;
+                    if (mach_vm_read_overwrite(mach_task_self(),
+                            (mach_vm_address_t)at28, sizeof(mem2),
+                            (mach_vm_address_t)mem2, &m2got) == KERN_SUCCESS) {
+                        APPEND("####   *(x19+0x28)[0..7] = %016llx %016llx %016llx %016llx\n"
+                               "####                       %016llx %016llx %016llx %016llx\n",
+                            mem2[0], mem2[1], mem2[2], mem2[3],
+                            mem2[4], mem2[5], mem2[6], mem2[7]);
+                    } else {
+                        APPEND("####   *(x19+0x28)=%p but vm_read failed (unmapped)\n",
+                            (void*)at28);
+                    }
+                }
+            } else {
+                APPEND("####   vm_read(x19=%p) failed kr=%d\n", (void*)this_p, mkr);
+            }
+        }
         // If fault_addr == pc, this is an instruction-fetch fault. Try to
         // read the 16 bytes at pc to see whether the page is even readable.
         if (pc && fault_addr == pc) {
@@ -2383,6 +2355,19 @@ static void hooked_assert_rtn(const char *func, const char *file, int line,
 }
 
 static void macws_install_assert_bypass(void) {
+    // LAZY-fix kill switch. Default behaviour is to skip — this hook
+    // globally turns every __assert_rtn into log+return, which has
+    // masked real composite-state-stack leaks (Unbalanced Composites at
+    // MetalContext.mm:411). See AGENTS.md "Patch Discipline" + memory
+    // [[feedback-no-lazy-nop-ret-bypass]]. Opt-IN by setting
+    // MACWS_KEEP_ASSERT_BYPASS=1 in WS plist to restore the old bypass
+    // while debugging upstream.
+    if (!getenv("MACWS_KEEP_ASSERT_BYPASS")) {
+        fprintf(stderr,
+            "#### MACWS_ASSERT_BYPASS DISABLED (set MACWS_KEEP_ASSERT_BYPASS=1 "
+            "to restore lazy bypass) — real __assert_rtn now reaches abort\n");
+        return;
+    }
     MSImageRef libsys = MSGetImageByName(
         "/usr/lib/system/libsystem_c.dylib");
     if (!libsys) {
