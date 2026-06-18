@@ -3,6 +3,7 @@
 @import Darwin;
 #include <stdarg.h>
 #include <time.h>
+#include <syslog.h>
 
 // NOTE: do NOT take an ObjC block here. Under -fobjc-arc the on-device lld
 // arm64e build mis-signs the block's metadata pointer, so ARC's objc_storeStrong
@@ -94,27 +95,46 @@ static void PatchInstruction(uint32_t *addr, uint32_t value) {
 // bits 26..31 == 0b100101 == 0x25). If the iOS AGXCompilerCore has
 // changed and the byte is not a BL, we leave the original behaviour
 // alone instead of corrupting some unknown instruction.
-// Write a single line to /tmp/mtl_compiler_patch.log so we can verify
-// the renamer patch state without relying on oslog (which is hard to
-// read on a jailbroken iOS without the macOS-side `log show` binary).
+// Sandboxed XPC services (like MTLCompilerService under its
+// `seatbelt-profiles=[MTLCompilerService]` profile) cannot create files
+// outside /private/var/mobile, so the old fopen("/tmp/...") path silently
+// failed. Use syslog instead — it routes through the system logger and
+// shows up in oslog/console.app. Tagged with "MTLBypass" for easy grep.
 static void MTLPatchLog(const char *fmt, ...) {
-    FILE *f = fopen("/tmp/mtl_compiler_patch.log", "a");
-    if (!f) return;
-    pid_t pid = getpid();
-    time_t now = time(NULL);
-    struct tm tm; localtime_r(&now, &tm);
-    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d pid=%d] ",
-        tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
-        tm.tm_hour, tm.tm_min, tm.tm_sec, pid);
+    static int once = 0;
+    if (!once) { openlog("MTLBypass", LOG_PID | LOG_NDELAY, LOG_USER); once = 1; }
+    char buf[512];
     va_list ap; va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    fputc('\n', f);
-    fclose(f);
+    syslog(LOG_NOTICE, "%s", buf);
+    // Also stderr — in case the process has a stderr we can read.
+    fprintf(stderr, "#### MTLBypass %s\n", buf);
+    fflush(stderr);
+}
+
+// Scan a window around (anchor + delta_hint) for the BL site preceded by
+// `add x2, x2, #0xdf4` (encoding 0x9137d042). That ADD is the
+// literal-pool-load for "agx." in `linkMetalRuntime`, so the immediately
+// following BL is the std::string::insert(0, "agx.") call we want NOPed.
+// Returns the BL site pointer or NULL if not found in the search window.
+static uint32_t *FindRenamerBLSite(void *anchor, intptr_t delta_hint, int window_bytes) {
+    const uint32_t SIG_ADD_X2_DF4 = 0x9137d042u;
+    uint32_t *base = (uint32_t *)((uintptr_t)anchor + delta_hint);
+    int max_words = window_bytes / 4;
+    // Search both directions from the hint.
+    for (int off = -max_words; off <= max_words; off++) {
+        uint32_t *probe = base + off;
+        if (probe[-1] == SIG_ADD_X2_DF4 &&
+            ((probe[0] >> 26) & 0x3F) == 0x25) {
+            return probe;
+        }
+    }
+    return NULL;
 }
 
 static void PatchAGXRenamerSkipAgxPrefix(void) {
-    MTLPatchLog("renamer-patch: ENTER");
+    MTLPatchLog("renamer-patch: ENTER pid=%d", getpid());
     void *h = dlopen(
         "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore",
         RTLD_NOW | RTLD_GLOBAL);
@@ -135,22 +155,35 @@ static void PatchAGXRenamerSkipAgxPrefix(void) {
         MTLPatchLog("renamer-patch: MSFindSymbol _AIRNTGetVersion NULL");
         return;
     }
-    intptr_t delta = -0x1259a4;
-    uint32_t *bl_site = (uint32_t *)((uintptr_t)anchor + delta);
-    uint32_t cur = bl_site[0];
-    MTLPatchLog("renamer-patch: anchor=%p delta=%#lx site=%p first_insn=%#x",
-                anchor, (unsigned long)delta, bl_site, cur);
-    // BL opcode: bits 31..26 == 100101
-    if (((cur >> 26) & 0x3F) != 0x25) {
-        MTLPatchLog("renamer-patch: insn at site is NOT a BL "
-                    "(opcode bits=%#x), refusing to patch",
-                    (cur >> 26) & 0x3F);
-        return;
+    MTLPatchLog("renamer-patch: anchor _AIRNTGetVersion=%p", anchor);
+
+    // Known iOS-16.3 delta from prior RE. May be stale — the scan below
+    // handles drift by walking +/-16KB around the hint for the
+    // (ADD x2,x2,#0xdf4 ; BL) pair.
+    intptr_t delta_hint = -0x1259a4;
+    uint32_t *bl_site = FindRenamerBLSite(anchor, delta_hint, 16 * 1024);
+    if (!bl_site) {
+        MTLPatchLog("renamer-patch: ADD+BL signature NOT found within "
+                    "+/-16KB of anchor+delta_hint=%#lx — scanning whole "
+                    "__text for fallback", (unsigned long)delta_hint);
+        // Broader fallback: scan +/-2MB around anchor (AGXCompilerCore's
+        // __text is roughly 1.7MB; this covers it).
+        bl_site = FindRenamerBLSite(anchor, 0, 2 * 1024 * 1024);
+        if (!bl_site) {
+            MTLPatchLog("renamer-patch: FAILED — no ADD+BL pair found "
+                        "anywhere within +/-2MB of anchor");
+            return;
+        }
     }
-    PatchInstruction(bl_site, 0xd503201fu); // NOP
+    intptr_t actual_delta = (intptr_t)bl_site - (intptr_t)anchor;
+    uint32_t cur = bl_site[0];
+    MTLPatchLog("renamer-patch: found BL site=%p actual_delta=%#lx insn=%#x",
+                bl_site, (long)actual_delta, cur);
+    PatchInstruction(bl_site, 0xd503201fu);  // NOP
     uint32_t after = bl_site[0];
-    MTLPatchLog("renamer-patch: NOPed BL site=%p was=%#x now=%#x",
-                bl_site, cur, after);
+    MTLPatchLog("renamer-patch: NOPed BL site=%p was=%#x now=%#x %s",
+                bl_site, cur, after,
+                after == 0xd503201fu ? "OK" : "FAIL");
 }
 
 static void PatchAGXVerifyLoweredIR(void) {
@@ -261,11 +294,12 @@ static void PatchAGXVerifyLoweredIR(void) {
     //       constructs `Twine("agx.air.") + …` directly off the longer
     //       agx.air.indirect literal at iOS 0x199a891 (sliding 8 chars
     //       earlier into "agx.air." would give a usable prefix).
-    // Always log the entry — so we can verify the tweak ctor itself runs
-    // in MTLCompilerService, separately from whether the patch is gated.
-    MTLPatchLog("%%ctor: OS-check patched; env MTLCOMPILER_PATCH_RENAMER=%s",
-                getenv("MTLCOMPILER_PATCH_RENAMER") ?: "(unset)");
-    if (getenv("MTLCOMPILER_PATCH_RENAMER")) {
-        PatchAGXRenamerSkipAgxPrefix();
-    }
+    // Always run the renamer patch — no env gate. XPC services don't
+    // inherit env vars from the WS launchd plist and modifying the
+    // service's own Info.plist would require re-signing the bundle.
+    // The patch is signature-validated (only fires when both the ADD
+    // x2,x2,#0xdf4 AND BL opcode match within the search window), so
+    // an unknown DSC version safely no-ops instead of corrupting code.
+    MTLPatchLog("%%ctor: OS-check patched; running renamer patch now");
+    PatchAGXRenamerSkipAgxPrefix();
 }
