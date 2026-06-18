@@ -2444,6 +2444,61 @@ static void hooked_agc_compile(void *self, void *obj, void *module,
     macws_orig_agc_compile(self, obj, module, 0, pipeType, opts, safeMode);
 }
 
+// ─── Experiment: bypass verifyLoweredIR ─────────────────────────────────
+//
+// `AGCLLVMUserObject::verifyLoweredIR()` iterates the module's function
+// list looking for declarations whose name contains "air.". Each match
+// is logged via `_os_log_fault_impl` with the format
+//   "Encountered unlowered function call to %s"
+// and that log output is captured by the surrounding compile pipeline
+// into the abort_with_payload payload string the host sees as
+// "Metal failed to build render pipeline".
+//
+// If we make verifyLoweredIR a no-op (RET on entry), no fault is logged,
+// no payload is constructed, the compile pipeline reports success, and
+// the downstream codegen tries to emit machine code for the as-yet-
+// unlowered call. There are three possible outcomes:
+//
+//   1. Codegen succeeds — the AGX backend has a fallback for the
+//      unlowered call (perhaps emits a stub that the GPU runtime
+//      handles), pipeline state builds OK, GPU executes correctly.
+//      Best case — we've found the real fix.
+//   2. Codegen succeeds but the GPU traps at runtime when the
+//      unlowered call is reached.
+//   3. Codegen itself fails with a different error.
+//
+// This is gated behind MACWS_AGC_VERIFY_BYPASS=1 because the trade-off
+// depends on which outcome we hit. The verifier is meant to catch real
+// bugs, so silencing it in general is risky.
+typedef void (*macws_verify_t)(void *self);
+static macws_verify_t macws_orig_agc_verify = NULL;
+static void hooked_agc_verify(void *self) {
+    static int log_once = 0;
+    if (!log_once) {
+        log_once = 1;
+        fprintf(stderr,
+            "#### MACWS_AGC_VERIFY_BYPASS verifyLoweredIR called on %p "
+            "→ skipping check\n", self);
+    }
+    // Just return — don't iterate the module, don't log faults.
+}
+
+static void macws_install_agc_verify_bypass(MSImageRef img) {
+    void *sym = MSFindSymbol(img,
+        "__ZN17AGCLLVMUserObject15verifyLoweredIREv");
+    if (!sym) {
+        fprintf(stderr,
+            "#### MACWS_AGC_VERIFY_BYPASS: verifyLoweredIR symbol not "
+            "found, skip\n");
+        return;
+    }
+    MSHookFunction(sym, (void *)hooked_agc_verify,
+        (void **)&macws_orig_agc_verify);
+    fprintf(stderr,
+        "#### MACWS_AGC_VERIFY_BYPASS installed at %p "
+        "(verifyLoweredIR → no-op)\n", sym);
+}
+
 static void macws_install_agc_fastmath_disable(void) {
     static int once = 0;
     if (once) return;
@@ -2765,6 +2820,25 @@ __attribute__((constructor)) void InitStuff() {
     // the proper fix is being designed.)
     if (getenv("MACWS_AGC_FASTMATH_HOOK")) {
         macws_install_agc_fastmath_disable();
+    }
+    // Verify-bypass experiment: if the unlowered `agx.air.fract.v3f16.fast`
+    // is benign (codegen has a fallback or never executes it on the
+    // observed CA pipelines), bypassing the verifier is the simplest
+    // viable elegant fix. Opt-in via env to keep the verifier honest
+    // in normal operation.
+    if (getenv("MACWS_AGC_VERIFY_BYPASS")) {
+        const char *path =
+            "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/Versions/A/AGXCompilerCore";
+        void *h = dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+        (void)h;
+        MSImageRef img = MSGetImageByName(path);
+        if (img) {
+            macws_install_agc_verify_bypass(img);
+        } else {
+            fprintf(stderr,
+                "#### MACWS_AGC_VERIFY_BYPASS: AGXCompilerCore not in "
+                "image table, skip\n");
+        }
     }
     // Optional: trace which abort_with_payload site fires (opt-in via env).
     macws_install_abort_trace();
