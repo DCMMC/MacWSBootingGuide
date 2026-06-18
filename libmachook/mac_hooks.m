@@ -3575,17 +3575,12 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
     // sel=0x9 (ResCreate): iOS kernel IOGPUDevice::new_resource @ <+76>
     // does `cmp (this->0x48)->0x224 + 0x50, *outCnt; b.hi → BadArgument`.
-    // iOS userland IOGPUResourceCreate sets *outCnt = device->0x34 + 0x50
-    // (where device->0x34 mirrors the same kernel field). macOS WS sends
-    // *outCnt = 0x50, so kernel rejects when device->0x34 > 0. Bump the
-    // count enough to clear the check. The kernel later WRITES into the
-    // output buffer up to that size — if WS's buffer is only 0x50 bytes,
-    // we may overflow on return. WS allocates a fat scanout return area
-    // (uses IOGPUMetalBuffer-style alloc), so a small bump (≤ 0x80) is safe.
-    // (outStructCnt diagnostic-probe removed — confirmed via runtime test
-    // that the BadArgument from IOGPUDevice::new_resource was the size
-    // check, not the *outCnt vs (this->0x48)->0x224+0x50 check. Bumping
-    // outStructCnt to 0x10000 made no difference.)
+    // iOS userland IOGPUResourceCreate sets *outCnt = device->0x34 + 0x50.
+    // macOS WS sends *outCnt = 0x50. Bump matches what iOS userland
+    // sends (worked for sel=0x100 with 0x78 → 0x70 by similar logic).
+    if(IOConnectIsIOGPU(client) && selector == 0x9 && outStructCnt && *outStructCnt == 0x50) {
+        *outStructCnt = 0x10000;
+    }
     unsigned char shadowbuf[256];
     uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
