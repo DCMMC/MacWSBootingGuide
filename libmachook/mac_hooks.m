@@ -4500,11 +4500,67 @@ DYLD_INTERPOSE(IOConnectCallAsyncMethod_new, IOConnectCallAsyncMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncScalarMethod_new, IOConnectCallAsyncScalarMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncStructMethod_new, IOConnectCallAsyncStructMethod);
 
+// XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
+// signed-equivalent so the kernel runs the full privileged UC-init (sets
+// device->0x108, this->0x100, etc.) — which the chroot's macOS-userland
+// IOServiceOpen can't trigger directly (RE-traced to per-UC size limit at
+// IOGPUDevice::new_resource +0xff; see memory cross-image-objc-class-
+// register-and-ioconnect-heap-blocker). Once borrowed, IOConnectCallMethod
+// calls from the chroot run against the kernel-side UC state set by the
+// helper — heap/queue/resource create all become available.
+static mach_port_t macws_borrow_agx_conn_xpc(void) {
+    static mach_port_t cached = MACH_PORT_NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
+            dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+        if (!createMach) return;
+        xpc_connection_t conn = createMach("com.macwsguide.alloc", NULL, 0);
+        if (!conn) return;
+        xpc_connection_set_event_handler(conn, ^(xpc_object_t e) { (void)e; });
+        xpc_connection_resume(conn);
+        xpc_object_t req = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(req, "op", "borrow-agx-conn");
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, req);
+        if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+            const char *result = xpc_dictionary_get_string(reply, "result");
+            if (result && strcmp(result, "ok") == 0) {
+                cached = xpc_dictionary_copy_mach_send(reply, "connect");
+            }
+            fprintf(stderr, "#### borrow-agx-conn reply result=%s cached=%u\n",
+                result ?: "(none)", cached);
+        } else {
+            fprintf(stderr, "#### borrow-agx-conn no reply\n");
+        }
+    });
+    return cached;
+}
+
 kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t *connect) {
     static io_service_t agxService;
     if(!agxService) {
         agxService = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"));
         assert(agxService != IO_OBJECT_NULL);
+    }
+
+    // BORROW path: when MACWS_AGX_BORROW_CONN=1 and the open is for the AGX
+    // service, ask macwsallocd to open it on our behalf (the helper runs in
+    // iOS-native context where the kernel does full UC privileged init) and
+    // return the borrowed mach port as the io_connect_t. All subsequent
+    // IOConnectCallMethod calls then run against the kernel-side UC state
+    // set by the helper.
+    if (getenv("MACWS_AGX_BORROW_CONN") && service == agxService) {
+        mach_port_t borrowed = macws_borrow_agx_conn_xpc();
+        if (borrowed != MACH_PORT_NULL) {
+            *connect = (io_connect_t)borrowed;
+            assert(iogpuClientsCount < sizeof(iogpuClients) / sizeof(iogpuClients[0]));
+            iogpuClients[iogpuClientsCount++] = *connect;
+            fprintf(stderr, "#### IOServiceOpen agx BORROWED connect=%u (type was %u)\n",
+                *connect, type);
+            return KERN_SUCCESS;
+        }
+        // Fallback to normal path if XPC borrow failed.
+        fprintf(stderr, "#### IOServiceOpen agx BORROW failed — falling back to normal IOServiceOpen\n");
     }
 
     // clear flag 4 (FIXME: idk what is this)
