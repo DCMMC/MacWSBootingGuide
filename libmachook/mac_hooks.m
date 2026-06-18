@@ -2031,10 +2031,42 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 // production runs aren't affected.
 #import <execinfo.h>
 #import <dlfcn.h>
+#import <unistd.h>
+// mach_vm.h is marked unsupported in the iOS SDK; declare the one symbol
+// we need so we can fail-safe read potentially-bad pointers.
+extern kern_return_t mach_vm_read_overwrite(
+    vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size,
+    mach_vm_address_t data, mach_vm_size_t *outsize);
+
+// Crash handler emits ALL diagnostic lines into a single static buffer then
+// flushes via one write(2). Mixing fprintf calls from a signal handler with
+// log lines from other threads scrambled the backtrace beyond use; an atomic
+// write keeps the trace contiguous.
+#define MACWS_CRASH_BUF_LEN 16384
+static char macws_crash_buf[MACWS_CRASH_BUF_LEN];
+
+static const char *macws_si_code_string(int signo, int code) {
+    if (signo == SIGBUS) {
+        if (code == BUS_ADRALN)  return "BUS_ADRALN (misaligned)";
+        if (code == BUS_ADRERR)  return "BUS_ADRERR (nonexistent phys addr)";
+        if (code == BUS_OBJERR)  return "BUS_OBJERR (hw object error)";
+    } else if (signo == SIGSEGV) {
+        if (code == SEGV_MAPERR) return "SEGV_MAPERR (unmapped)";
+        if (code == SEGV_ACCERR) return "SEGV_ACCERR (permission)";
+    } else if (signo == SIGILL) {
+        if (code == ILL_ILLOPC)  return "ILL_ILLOPC (illegal opcode)";
+        if (code == ILL_ILLTRP)  return "ILL_ILLTRP (illegal trap)";
+        if (code == ILL_PRVOPC)  return "ILL_PRVOPC (priv opcode)";
+        if (code == ILL_BADSTK)  return "ILL_BADSTK (bad stack)";
+    }
+    return "?";
+}
+
 static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
     ucontext_t *uctx = (ucontext_t *)uctx_;
     uintptr_t pc = 0, lr = 0, fp = 0, sp = 0;
     uintptr_t fault_addr = (uintptr_t)(info ? info->si_addr : 0);
+    int si_code = info ? info->si_code : 0;
 #if defined(__arm64__) || defined(__arm64e__)
     if (uctx && uctx->uc_mcontext) {
         pc = (uintptr_t)arm_thread_state64_get_pc(uctx->uc_mcontext->__ss);
@@ -2043,39 +2075,108 @@ static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
         sp = (uintptr_t)arm_thread_state64_get_sp(uctx->uc_mcontext->__ss);
     }
 #endif
+    char *p = macws_crash_buf;
+    char *end = macws_crash_buf + MACWS_CRASH_BUF_LEN;
+#define APPEND(...) do { \
+        if (p < end) p += snprintf(p, (size_t)(end - p), __VA_ARGS__); \
+    } while (0)
+
     Dl_info dli;
-    fprintf(stderr,
-        "\n#### MACWS_CRASH_DIAG signo=%d fault_addr=%p pc=%p lr=%p fp=%p sp=%p\n",
-        signo, (void*)fault_addr, (void*)pc, (void*)lr, (void*)fp, (void*)sp);
+    APPEND("\n#### MACWS_CRASH_DIAG signo=%d si_code=%d (%s) "
+           "fault_addr=%p pc=%p lr=%p fp=%p sp=%p\n",
+        signo, si_code, macws_si_code_string(signo, si_code),
+        (void*)fault_addr, (void*)pc, (void*)lr, (void*)fp, (void*)sp);
     if (pc && dladdr((void*)pc, &dli) && dli.dli_fname) {
         uintptr_t base = (uintptr_t)dli.dli_fbase;
-        fprintf(stderr, "####   pc image=%s base=%p pc-base=%#llx symbol=%s+%#llx\n",
+        APPEND("####   pc image=%s base=%p pc-base=%#llx symbol=%s+%#llx\n",
             dli.dli_fname, (void*)base, (unsigned long long)(pc - base),
             dli.dli_sname ? dli.dli_sname : "?",
             (unsigned long long)(pc - (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)));
     }
     if (lr && dladdr((void*)lr, &dli) && dli.dli_fname) {
         uintptr_t base = (uintptr_t)dli.dli_fbase;
-        fprintf(stderr, "####   lr image=%s base=%p lr-base=%#llx symbol=%s+%#llx\n",
+        APPEND("####   lr image=%s base=%p lr-base=%#llx symbol=%s+%#llx\n",
             dli.dli_fname, (void*)base, (unsigned long long)(lr - base),
             dli.dli_sname ? dli.dli_sname : "?",
             (unsigned long long)(lr - (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)));
     }
+#if defined(__arm64__) || defined(__arm64e__)
+    if (uctx && uctx->uc_mcontext) {
+        APPEND("####   regs x0=%p x1=%p x2=%p x3=%p\n",
+            (void*)uctx->uc_mcontext->__ss.__x[0],
+            (void*)uctx->uc_mcontext->__ss.__x[1],
+            (void*)uctx->uc_mcontext->__ss.__x[2],
+            (void*)uctx->uc_mcontext->__ss.__x[3]);
+        APPEND("####   regs x4=%p x5=%p x6=%p x7=%p\n",
+            (void*)uctx->uc_mcontext->__ss.__x[4],
+            (void*)uctx->uc_mcontext->__ss.__x[5],
+            (void*)uctx->uc_mcontext->__ss.__x[6],
+            (void*)uctx->uc_mcontext->__ss.__x[7]);
+        APPEND("####   regs x8=%p x9=%p x16=%p x17=%p x29(fp)=%p\n",
+            (void*)uctx->uc_mcontext->__ss.__x[8],
+            (void*)uctx->uc_mcontext->__ss.__x[9],
+            (void*)uctx->uc_mcontext->__ss.__x[16],
+            (void*)uctx->uc_mcontext->__ss.__x[17],
+            (void*)fp);
+        // If fault_addr == pc, this is an instruction-fetch fault. Try to
+        // read the 16 bytes at pc to see whether the page is even readable.
+        if (pc && fault_addr == pc) {
+            uint32_t insn[4] = {0,0,0,0};
+            mach_vm_size_t igot = 0;
+            kern_return_t ikr = mach_vm_read_overwrite(
+                mach_task_self(), (mach_vm_address_t)pc,
+                sizeof(insn), (mach_vm_address_t)insn, &igot);
+            APPEND("####   pc bytes (vm_read kr=%d got=%llu): %08x %08x %08x %08x\n",
+                ikr, (unsigned long long)igot, insn[0], insn[1], insn[2], insn[3]);
+        }
+        // For an ObjC fault, x0 is usually the receiver. Try to dladdr its
+        // isa to see what class it claims to be.
+        uintptr_t obj = (uintptr_t)uctx->uc_mcontext->__ss.__x[0];
+        if (obj && obj > 0x1000 && obj < 0x800000000000ULL) {
+            uintptr_t isa = 0;
+            Dl_info di2;
+            if (dladdr((void*)obj, &di2) && di2.dli_fname) {
+                APPEND("####   x0 dladdr: %s in %s\n",
+                    di2.dli_sname ?: "?", di2.dli_fname);
+            }
+            mach_vm_size_t got = 0;
+            kern_return_t kr = mach_vm_read_overwrite(
+                mach_task_self(),
+                (mach_vm_address_t)obj, sizeof(uintptr_t),
+                (mach_vm_address_t)&isa, &got);
+            if (kr == KERN_SUCCESS && got == sizeof(uintptr_t)) {
+                uintptr_t stripped = isa & 0x0000007FFFFFFFFFULL;
+                APPEND("####   x0->isa=%p stripped=%p\n",
+                    (void*)isa, (void*)stripped);
+                if (dladdr((void*)stripped, &di2) && di2.dli_fname) {
+                    APPEND("####   x0->isa dladdr: %s in %s\n",
+                        di2.dli_sname ?: "?", di2.dli_fname);
+                }
+            } else {
+                APPEND("####   x0->isa: vm_read kr=%d (obj unmapped/freed)\n",
+                    kr);
+            }
+        }
+    }
+#endif
     void *frames[32];
     int nf = backtrace(frames, 32);
-    fprintf(stderr, "####   backtrace (%d frames):\n", nf);
+    APPEND("####   backtrace (%d frames):\n", nf);
     for (int i = 0; i < nf; i++) {
         if (dladdr(frames[i], &dli) && dli.dli_fname) {
-            uintptr_t base = (uintptr_t)dli.dli_fbase;
-            fprintf(stderr, "####     [%2d] %p %s+%#llx (%s)\n", i, frames[i],
+            APPEND("####     [%2d] %p %s+%#llx (%s)\n", i, frames[i],
                 dli.dli_sname ? dli.dli_sname : "?",
                 (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)),
                 dli.dli_fname);
         } else {
-            fprintf(stderr, "####     [%2d] %p\n", i, frames[i]);
+            APPEND("####     [%2d] %p\n", i, frames[i]);
         }
     }
-    fflush(stderr);
+#undef APPEND
+    // Atomic flush.
+    size_t len = (size_t)(p - macws_crash_buf);
+    if (len > MACWS_CRASH_BUF_LEN) len = MACWS_CRASH_BUF_LEN;
+    (void)write(STDERR_FILENO, macws_crash_buf, len);
     _exit(128 + signo);
 }
 
@@ -2093,9 +2194,310 @@ static void macws_install_crash_diag(void) {
     fprintf(stderr, "#### MACWS_AGX_CRASH_DIAG handlers installed\n");
 }
 
+// ─── Targeted IOKit-IOHIDUnserialize bypass ──────────────────────────────
+//
+// The minimal fix for the IOMFBServer thread BUS_ADRALN crash. macOS
+// IOKit's `_IOHIDUnserializeAndVMDealloc` takes a raw mach buffer (a
+// binary plist serialized by the kernel) and feeds it through
+// `CFPropertyListCreateFromStream` →
+// `__CFBinaryPlistCreateObjectFiltered`. In our chroot the kernel-side
+// serializer is iOS 16.3's IOKit, and the macOS 13.4 CoreFoundation
+// parser builds an NSCFString whose internal char pointer lands on an
+// unaligned byte. When the parser's cleanup block_invoke releases that
+// string, the destructor faults with SIGBUS BUS_ADRALN inside
+// `_CFRelease+0x4a4` (verified via the in-process MACWS_AGX_CRASH_DIAG
+// handler — full backtrace: IOMFBServer ctor block_invoke →
+// IOHIDEventSystemClientCreateWithType → IOHIDEventSystemClientRefresh →
+// IOHIDEventSystemClientSetMatchingMultiple → CacheMatchingServices →
+// IOHIDUnserializeAndVMDealloc → CFPropertyListCreateFromStream →
+// CFBinaryPlist parse → CFRelease → objc_destructInstance → BUS_ADRALN).
+//
+// Stubbing this single function to return NULL skips the iOS plist parse
+// without touching any of the public `IOHIDEventSystem*` APIs — those
+// keep dispatching normally on the real client object, just with empty
+// property data. WindowServer keeps running; we lose HID property data
+// for display-related devices, which we don't have parseable copies of
+// anyway.
+static CFTypeRef hooked_IOHIDUnserializeAndVMDealloc(
+        const void *buffer, mach_vm_size_t length) {
+    (void)buffer; (void)length;
+    return NULL;
+}
+
+// The IOHIDUnserialize symbol is internal (non-exported), so MSFindSymbol
+// can't reach it. Hook the nearest PUBLIC API frame above the crash:
+// `IOHIDEventSystemClientSetMatchingMultiple`. The IOMFBServer ctor block
+// is the only consumer that crashes; it stores the client at +0x358 and
+// then chains through SetMatchingMultiple → RegisterDeviceMatchingBlock →
+// CopyServices → RegisterEventBlock → ScheduleWithRunLoop. Only the first
+// of these dives into property serialization. Returning 1 (success) lets
+// the block continue with an empty matching set; everything else stays
+// real, so we don't have to fake out RegisterEventBlock/Schedule/etc.
+static int hooked_IOHIDEventSystemClientSetMatchingMultiple_skip(
+        CFTypeRef client, CFArrayRef multiple) {
+    (void)client; (void)multiple;
+    return 1;
+}
+
+static void macws_install_iohid_unserialize_bypass(void) {
+    static int once = 0;
+    if (once) return;
+    once = 1;
+    MSImageRef iokit = MSGetImageByName(
+        "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit");
+    if (!iokit) {
+        iokit = MSGetImageByName(
+            "/System/Library/Frameworks/IOKit.framework/IOKit");
+    }
+    if (!iokit) {
+        fprintf(stderr,
+            "#### MACWS_HID_BYPASS: IOKit image not loadable, skip\n");
+        return;
+    }
+    void *sym = MSFindSymbol(iokit,
+        "_IOHIDEventSystemClientSetMatchingMultiple");
+    if (!sym) {
+        fprintf(stderr,
+            "#### MACWS_HID_BYPASS: SetMatchingMultiple not found, skip\n");
+        return;
+    }
+    MSHookFunction(sym,
+        (void *)hooked_IOHIDEventSystemClientSetMatchingMultiple_skip, NULL);
+    fprintf(stderr,
+        "#### MACWS_HID_BYPASS installed SetMatchingMultiple → no-op (1) "
+        "at %p — skips iOS-format CFBinaryPlist parse inside\n"
+        "####   IOHIDEventSystemClientCacheMatchingServices → "
+        "IOHIDUnserializeAndVMDealloc → CFPropertyListCreateFromStream\n"
+        "####   that BUS_ADRALNs in the IOMFBServer thread.\n", sym);
+}
+
+// ─── (Disabled) bulk IOMFBServer HID-init bypass ─────────────────────────
+//
+// QuartzCore's `CA::WindowServer::IOMFBServer` constructor enqueues a
+// block (block_invoke at +0x3c) onto its runloop that walks the IOKit HID
+// event-system to wire up display-related HID notifications (orientation,
+// ambient light, hotplug). The block calls — in order:
+//
+//     client = IOHIDEventSystemClientCreate(NULL)
+//     IOHIDEventSystemClientSetMatchingMultiple(client, matchArray)
+//     IOHIDEventSystemClientRegisterDeviceMatchingBlock(client, …)
+//     services = IOHIDEventSystemClientCopyServices(client)
+//     for s in services: invoke per-service block
+//     IOHIDEventSystemClientRegisterEventBlock(client, …)
+//     IOHIDEventSystemClientScheduleWithRunLoop(client, …)
+//
+// In our chroot, the kernel that backs these calls is iOS 16.3's IOKit,
+// not macOS 13.4's. The `SetMatchingMultiple` step asks the kernel to
+// pre-cache matched services; the kernel responds with each service's
+// property dict serialized as a binary plist. macOS CoreFoundation's
+// `__CFBinaryPlistCreateObjectFiltered` parses the buffer and ends up
+// constructing an NSCFString whose internal char pointer lands on an
+// unaligned byte — the recursive parser's cleanup block_invoke then
+// `CFRelease()`s that NSCFString and the destructor faults with SIGBUS
+// si_code=BUS_ADRALN inside `_CFRelease+0x4a4` (verified by the in-process
+// CRASH_DIAG handler — full stack: block_invoke → CFRelease →
+// CFBinaryPlist → CFTryParseBinaryPlist → CFPropertyListCreateFromStream
+// → _IOHIDUnserializeAndVMDealloc → CacheMatchingServices → SetMatching).
+//
+// The mismatch is between the iOS-kernel binary-plist serializer and the
+// macOS-userspace parser. We don't have iOS-style HID devices that WS can
+// usefully drive anyway, so the cheapest correct fix is: take WS out of
+// the entire HID notification path. We make `…ClientCreate*` return a
+// real (refcounted) sentinel CF object so the block's `str x0,[x20,#0x358]`
+// store + later CFRetain/CFRelease still work, and we no-op every
+// `…Client*` function that would otherwise mach-msg the kernel.
+static CFTypeRef macws_hid_sentinel = NULL;
+static dispatch_once_t macws_hid_sentinel_once = 0;
+static CFTypeRef macws_get_hid_sentinel(void) {
+    dispatch_once(&macws_hid_sentinel_once, ^{
+        macws_hid_sentinel = (CFTypeRef)CFArrayCreate(
+            kCFAllocatorDefault, NULL, 0, &kCFTypeArrayCallBacks);
+        if (macws_hid_sentinel) {
+            CFRetain(macws_hid_sentinel);  // pin forever
+        }
+    });
+    return macws_hid_sentinel;
+}
+
+static CFTypeRef hooked_IOHIDEventSystemClientCreate(
+        CFAllocatorRef allocator) {
+    CFTypeRef s = macws_get_hid_sentinel();
+    fprintf(stderr, "#### MACWS_HID_BYPASS IOHIDEventSystemClientCreate "
+        "→ sentinel %p\n", s);
+    if (s) CFRetain(s);
+    return s;
+}
+static CFTypeRef hooked_IOHIDEventSystemClientCreateWithType(
+        CFAllocatorRef allocator, int type, CFDictionaryRef attributes) {
+    CFTypeRef s = macws_get_hid_sentinel();
+    fprintf(stderr,
+        "#### MACWS_HID_BYPASS IOHIDEventSystemClientCreateWithType(type=%d) "
+        "→ sentinel %p\n", type, s);
+    if (s) CFRetain(s);
+    return s;
+}
+// Boolean-returning setter; return 1 for "success".
+static int hooked_IOHIDEventSystemClientSetMatchingMultiple(
+        CFTypeRef client, CFArrayRef multiple) {
+    (void)client; (void)multiple;
+    return 1;
+}
+static void hooked_IOHIDEventSystemClientRegisterDeviceMatchingBlock(
+        CFTypeRef client, void *block, void *ctx, void *target) {
+    (void)client; (void)block; (void)ctx; (void)target;
+}
+static void hooked_IOHIDEventSystemClientUnregisterDeviceMatchingBlock(
+        CFTypeRef client) {
+    (void)client;
+}
+static void hooked_IOHIDEventSystemClientRegisterEventBlock(
+        CFTypeRef client, void *block, void *ctx, void *target) {
+    (void)client; (void)block; (void)ctx; (void)target;
+}
+// Callback-pointer variant — same signature shape, also a no-op.
+static void hooked_IOHIDEventSystemClientRegisterEventCallback(
+        CFTypeRef client, void *callback, void *target, void *refcon) {
+    (void)client; (void)callback; (void)target; (void)refcon;
+}
+static void hooked_IOHIDEventSystemClientRegisterPropertyChangedCallback(
+        CFTypeRef client, void *callback, void *target, void *refcon) {
+    (void)client; (void)callback; (void)target; (void)refcon;
+}
+static void hooked_IOHIDEventSystemClientScheduleWithRunLoop(
+        CFTypeRef client, CFRunLoopRef rl, CFStringRef mode) {
+    (void)client; (void)rl; (void)mode;
+}
+static void hooked_IOHIDEventSystemClientUnscheduleFromRunLoop(
+        CFTypeRef client, CFRunLoopRef rl, CFStringRef mode) {
+    (void)client; (void)rl; (void)mode;
+}
+static CFArrayRef hooked_IOHIDEventSystemClientCopyServices(
+        CFTypeRef client) {
+    (void)client;
+    return NULL;  // block checks cbz x0 and skips iteration
+}
+// Generic no-op stub — used for every "set/register/schedule/activate/cancel"
+// IOHIDEventSystem call that takes our sentinel and otherwise tries to
+// dereference its non-CFArray internals.
+static void hooked_IOHID_noop(void) {}
+// Bool/int returning variant — return 1 (success) by convention.
+static int hooked_IOHID_noop_ret1(void) { return 1; }
+
+static void macws_hook_iokit_sym(MSImageRef img, const char *sym,
+                                  void *replacement) {
+    void *p = MSFindSymbol(img, sym);
+    if (!p) {
+        fprintf(stderr, "#### MACWS_HID_BYPASS: %s not found, skip\n", sym);
+        return;
+    }
+    MSHookFunction(p, replacement, NULL);
+    fprintf(stderr, "#### MACWS_HID_BYPASS hooked %s @ %p\n", sym, p);
+}
+
+static void macws_install_iomfb_hid_bypass(void) {
+    static int once = 0;
+    if (once) return;
+    once = 1;
+    MSImageRef iokit = MSGetImageByName(
+        "/System/Library/Frameworks/IOKit.framework/Versions/A/IOKit");
+    if (!iokit) {
+        iokit = MSGetImageByName(
+            "/System/Library/Frameworks/IOKit.framework/IOKit");
+    }
+    if (!iokit) {
+        fprintf(stderr,
+            "#### MACWS_HID_BYPASS: IOKit image not loadable, skip\n");
+        return;
+    }
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientCreate",
+        (void *)hooked_IOHIDEventSystemClientCreate);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientCreateWithType",
+        (void *)hooked_IOHIDEventSystemClientCreateWithType);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientSetMatchingMultiple",
+        (void *)hooked_IOHIDEventSystemClientSetMatchingMultiple);
+    macws_hook_iokit_sym(iokit,
+        "_IOHIDEventSystemClientRegisterDeviceMatchingBlock",
+        (void *)hooked_IOHIDEventSystemClientRegisterDeviceMatchingBlock);
+    macws_hook_iokit_sym(iokit,
+        "_IOHIDEventSystemClientUnregisterDeviceMatchingBlock",
+        (void *)hooked_IOHIDEventSystemClientUnregisterDeviceMatchingBlock);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientRegisterEventBlock",
+        (void *)hooked_IOHIDEventSystemClientRegisterEventBlock);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientRegisterEventCallback",
+        (void *)hooked_IOHIDEventSystemClientRegisterEventCallback);
+    macws_hook_iokit_sym(iokit,
+        "_IOHIDEventSystemClientRegisterPropertyChangedCallback",
+        (void *)hooked_IOHIDEventSystemClientRegisterPropertyChangedCallback);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientScheduleWithRunLoop",
+        (void *)hooked_IOHIDEventSystemClientScheduleWithRunLoop);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientUnscheduleFromRunLoop",
+        (void *)hooked_IOHIDEventSystemClientUnscheduleFromRunLoop);
+    macws_hook_iokit_sym(iokit, "_IOHIDEventSystemClientCopyServices",
+        (void *)hooked_IOHIDEventSystemClientCopyServices);
+    // All remaining client-side IOHIDEventSystem APIs that SkyLight /
+    // QuartzCore call on our sentinel. Each one would otherwise read an
+    // internal IOHID-object vtable from the sentinel (CFArray storage,
+    // not an IOHID object) and SEGV. The no-op stubs absorb the call.
+    static const char *noop_void_syms[] = {
+        "_IOHIDEventSystemClientActivate",
+        "_IOHIDEventSystemClientCancel",
+        "_IOHIDEventSystemClientScheduleWithDispatchQueue",
+        "_IOHIDEventSystemClientSetCancelHandler",
+        "_IOHIDEventSystemClientSetDispatchQueue",
+        "_IOHIDEventSystemClientUnregisterEventCallback",
+        "_IOHIDEventSystemClientUnregisterPropertyChangedCallback",
+        "_IOHIDEventSystemClientStop",
+        "_IOHIDEventSystemRegisterServicesCallback",
+        NULL
+    };
+    static const char *noop_ret1_syms[] = {
+        "_IOHIDEventSystemClientSetMatching",
+        "_IOHIDEventSystemClientSetMatchingMultiple",
+        "_IOHIDEventSystemClientSetProperty",
+        "_IOHIDEventSystemSetProperty",
+        NULL
+    };
+    for (int i = 0; noop_void_syms[i]; i++) {
+        void *p = MSFindSymbol(iokit, noop_void_syms[i]);
+        if (p) {
+            MSHookFunction(p, (void *)hooked_IOHID_noop, NULL);
+            fprintf(stderr, "#### MACWS_HID_BYPASS noop %s @ %p\n",
+                noop_void_syms[i], p);
+        }
+    }
+    for (int i = 0; noop_ret1_syms[i]; i++) {
+        void *p = MSFindSymbol(iokit, noop_ret1_syms[i]);
+        if (p) {
+            // Already hooked SetMatchingMultiple above with a specialised
+            // 2-arg stub; the generic ret-1 works equivalently for it but
+            // re-hooking is harmless. MSHook keeps the first install.
+            MSHookFunction(p, (void *)hooked_IOHID_noop_ret1, NULL);
+            fprintf(stderr, "#### MACWS_HID_BYPASS ret1 %s @ %p\n",
+                noop_ret1_syms[i], p);
+        }
+    }
+}
+
 __attribute__((constructor)) void InitStuff() {
     EnableJIT();
     macws_install_crash_diag();
+    // HID bypass is OPT-IN. Whole-IOKit-symbol hooking creates a tower of
+    // MSHook'd functions; if any one of them is itself called recursively
+    // via PAC-signed pointers from elsewhere in IOKit, the bypass starts
+    // cascading crashes. In practice, WindowServer survives the original
+    // CFBinaryPlist BUS_ADRALN crash by itself most of the time once the
+    // other AGX-native patches are in place, so don't install the bypass
+    // by default. Re-enable with MACWS_HID_BYPASS=1 on a process whose
+    // IOMFB/SkyLight HID setup is reliably crashing.
+    // Targeted fix for the IOMFBServer thread BUS_ADRALN: skip just the
+    // CFBinaryPlist deserialize step inside IOKit's HID-property cache.
+    macws_install_iohid_unserialize_bypass();
+    // Broader bulk hook (one stub per public `IOHIDEventSystem*` symbol)
+    // is opt-in and currently unstable — see the comment block in
+    // `macws_install_iomfb_hid_bypass`. Keep it accessible for debugging.
+    if (getenv("MACWS_HID_BYPASS")) {
+        macws_install_iomfb_hid_bypass();
+    }
 
     // Pre-load IOGPU BEFORE Metal.framework speculatively loads AGXMetal13_3.
     // AGXMetal13_3 has cross-image GOT entries that reference IOGPU symbols
