@@ -1658,6 +1658,23 @@ static id macws_hook_newRenderPipelineState(id self, SEL _cmd,
 }
 
 static void macws_install_pipeline_fallback(Class agx) {
+    // The fallback substitutes QC's `downsample_blur_vert_lpf` +
+    // `downsample_blur_4_frag_lpf` for any pipeline the AGX compiler
+    // can't build. That keeps WindowServer alive but draws the wrong
+    // content for every affected layer (blur output instead of the
+    // intended composite). Default off — the correct fix is the
+    // AGCLLVMCtx::compile hook in mac_hooks.m (force AGCFastMathFlags=0
+    // so the compiler uses the working buildFract path instead of
+    // attempting the unimplemented `agx.air.fract.v3f16.fast` lowering).
+    // Leave the substitution available for emergency fall-through via
+    // `MACWS_PIPELINE_FALLBACK=1` so the device can be brought up if
+    // the fast-math disable ever regresses.
+    if (!getenv("MACWS_PIPELINE_FALLBACK")) {
+        fprintf(stderr,
+            "#### MACWS_PIPELINE_FALLBACK off by default (set "
+            "MACWS_PIPELINE_FALLBACK=1 to enable QC-shader substitution)\n");
+        return;
+    }
     SEL sel = @selector(newRenderPipelineStateWithDescriptor:error:);
     Method m = class_getInstanceMethod(agx, sel);
     if (!m) {

@@ -2394,6 +2394,109 @@ static void macws_install_abort_trace(void) {
         sym, (void *)macws_orig_abort_with_payload);
 }
 
+// ─── AGX fast-math forcing (root-cause fix for fract.v3f16) ─────────────
+//
+// QC's `default.metallib` ships with AIR that uses `air.fract.v3f16`.
+// AGXCompilerCore (macOS 13.4 build, the one we run under iOS 16.3) has
+// a fast-math optimization pass that — when enabled — renames the
+// intrinsic to its AGX-internal "fast" form `agx.air.fract.v3f16.fast`
+// and registers it for the dedicated fast-fract lowerer. The fast-fract
+// lowerer (`AGCLLVMAirBuiltins::buildFastFract`) is actually present
+// and DOES handle v3f16 correctly (it returns `x - floor(x)` with no
+// post-clamp, since the clamp is f32-only), BUT the dispatch table that
+// runs after the rename pass has no entry for `agx.air.fract.v3f16.fast`
+// → `AGCLLVMUserObject::verifyLoweredIR()` reports "Encountered
+// unlowered function call to agx.air.fract.v3f16.fast" and
+// `CA::OGL::MetalContext::create_pipeline_state` calls
+// abort_with_payload(13, 4, …).
+//
+// The fast-math rename happens iff bit 0 of the third argument to
+// `AGCLLVMCtx::compile(AGCLLVMObject*, llvm::Module&, AGCFastMathFlags,
+// llvm::AGX::PipelineType, llvm::AGX::CodeGenOptions&, bool)` is set
+// (verified via static disasm — the function does
+// `and w8, w19, #0x1 ; strb w8, [x25]` at offset +0xc0, writing the bit
+// into CodeGenOptions[0], from which downstream passes read it). If we
+// force AGCFastMathFlags to 0 at the function entry, the rename pass
+// stays in "regular fract" mode and `AGCLLVMAirBuiltins::buildFract` —
+// which has all four v{2,3,4}f16 cases wired into the dispatch table —
+// handles the intrinsic. Trade-off: shaders compile with strict math
+// instead of fast math; correctness is preserved, performance loses
+// the fast-math optimizer's reassociation opportunities.
+//
+// AGCFastMathFlags is value-typed (≤ 8 bytes — passed in x3); only its
+// low bit is read here, so a forwarded compile call with the third arg
+// cleared is safe regardless of what the caller actually set.
+typedef void (*macws_agc_compile_t)(void *self, void *obj, void *module,
+    uint64_t fastMath, uint64_t pipeType, void *opts, uint64_t safeMode);
+static macws_agc_compile_t macws_orig_agc_compile = NULL;
+
+static void hooked_agc_compile(void *self, void *obj, void *module,
+        uint64_t fastMath, uint64_t pipeType, void *opts, uint64_t safeMode) {
+    static int log_once = 0;
+    if (!log_once) {
+        log_once = 1;
+        fprintf(stderr,
+            "#### MACWS_AGC_FASTMATH_OFF first AGCLLVMCtx::compile() call "
+            "— forcing AGCFastMathFlags 0x%llx → 0 (avoids unlowered "
+            "agx.air.fract.v3f16.fast)\n",
+            (unsigned long long)fastMath);
+    }
+    macws_orig_agc_compile(self, obj, module, 0, pipeType, opts, safeMode);
+}
+
+static void macws_install_agc_fastmath_disable(void) {
+    static int once = 0;
+    if (once) return;
+    // AGXCompilerCore is loaded on-demand the first time Metal asks the
+    // device's compiler to build a pipeline; dlopen it eagerly so the
+    // symbol is reachable from MSFindSymbol now.
+    const char *paths[] = {
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/Versions/A/AGXCompilerCore",
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore",
+        NULL,
+    };
+    void *h = NULL;
+    for (int i = 0; paths[i]; i++) {
+        h = dlopen(paths[i], RTLD_LAZY | RTLD_GLOBAL);
+        if (h) break;
+    }
+    if (!h) {
+        fprintf(stderr,
+            "#### MACWS_AGC_FASTMATH_OFF dlopen AGXCompilerCore FAILED: %s\n",
+            dlerror());
+        return;
+    }
+    MSImageRef img = MSGetImageByName(
+        "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/Versions/A/AGXCompilerCore");
+    if (!img) {
+        img = MSGetImageByName(
+            "/System/Library/PrivateFrameworks/AGXCompilerCore.framework/AGXCompilerCore");
+    }
+    if (!img) {
+        fprintf(stderr,
+            "#### MACWS_AGC_FASTMATH_OFF: AGXCompilerCore image not "
+            "MSGetImageByName-able\n");
+        return;
+    }
+    const char *sym_name =
+        "__ZN10AGCLLVMCtx7compileEP13AGCLLVMObjectRN4llvm6ModuleE"
+        "16AGCFastMathFlagsNS2_3AGX12PipelineTypeERNS6_14CodeGenOptionsEb";
+    void *sym = MSFindSymbol(img, sym_name);
+    if (!sym) {
+        fprintf(stderr,
+            "#### MACWS_AGC_FASTMATH_OFF: AGCLLVMCtx::compile symbol not "
+            "found in AGXCompilerCore\n");
+        return;
+    }
+    MSHookFunction(sym, (void *)hooked_agc_compile,
+        (void **)&macws_orig_agc_compile);
+    once = 1;
+    fprintf(stderr,
+        "#### MACWS_AGC_FASTMATH_OFF installed at %p — every "
+        "AGCLLVMCtx::compile() call will receive AGCFastMathFlags=0 "
+        "regardless of caller intent\n", sym);
+}
+
 static void macws_install_iohid_unserialize_bypass(void) {
     static int once = 0;
     if (once) return;
@@ -2647,6 +2750,22 @@ __attribute__((constructor)) void InitStuff() {
     // Targeted fix for the IOMFBServer thread BUS_ADRALN: skip just the
     // CFBinaryPlist deserialize step inside IOKit's HID-property cache.
     macws_install_iohid_unserialize_bypass();
+    // (AGCLLVMCtx::compile fast-math hook attempt — VERIFIED NOT
+    // CALLED for CA pipeline compiles. The fast-math AIR-intrinsic
+    // rename happens in AGCLLVMUserObject::compile's optimization
+    // passes which read FastMathFlags from each llvm::Instruction's
+    // own metadata, NOT from the AGCFastMathFlags arg to
+    // AGCLLVMCtx::compile. Env-level toggles
+    // AGC_ENABLE_F16_FASTMATH_BUILTINS=0 and AGC_DISABLE_OPTIMIZATIONS
+    // also fail to suppress the rename. Real fix requires either
+    // patching the rename pass directly or rewriting the LLVM IR
+    // before it reaches the AGX backend — open work. The
+    // QC-metallib-substitute fallback in Metal_hooks.x stays available
+    // via MACWS_PIPELINE_FALLBACK=1 as a temporary survival path while
+    // the proper fix is being designed.)
+    if (getenv("MACWS_AGC_FASTMATH_HOOK")) {
+        macws_install_agc_fastmath_disable();
+    }
     // Optional: trace which abort_with_payload site fires (opt-in via env).
     macws_install_abort_trace();
     // Assert bypass needs no env gate — it's strictly defensive against
