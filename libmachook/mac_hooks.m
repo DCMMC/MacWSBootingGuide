@@ -2775,6 +2775,31 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 fprintf(stderr, " %02x", src[i]);
             }
             fprintf(stderr, "\n");
+            // For each FAILED type=0x80 sub-resource: dump the caller chain
+            // so we know which AGXBuffer / IOGPUMetalBuffer path picked the
+            // parent. Sometimes ties macOS's `allocBufferSubData` vs the
+            // standalone init path.
+            if (r != 0 && type == 0x80) {
+                void *frames[12];
+                int nf = backtrace(frames, 12);
+                fprintf(stderr, "####   caller chain (%d frames):\n", nf);
+                for (int i = 0; i < nf; i++) {
+                    Dl_info di;
+                    if (dladdr(frames[i], &di) && di.dli_fname) {
+                        uintptr_t base = (uintptr_t)di.dli_fbase;
+                        const char *fname = strrchr(di.dli_fname, '/');
+                        fname = fname ? fname + 1 : di.dli_fname;
+                        fprintf(stderr, "####     [%d] %p %s+%#llx (%s)\n",
+                            i, frames[i],
+                            di.dli_sname ? di.dli_sname : "?",
+                            (unsigned long long)((uintptr_t)frames[i] -
+                                (uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)),
+                            fname);
+                    } else {
+                        fprintf(stderr, "####     [%d] %p (unmapped)\n", i, frames[i]);
+                    }
+                }
+            }
         }
     }
     return r;

@@ -1346,6 +1346,46 @@ static void install_agx_initimpl_hook(void) {
         (void*)macws_orig_initimpl);
 }
 
+// Probe -[IOGPUMetalCommandBuffer commandBufferResourceInfo].
+// RenderContext init stores its result at renderContext->0x10. If nil,
+// DataBufferAllocator::newCommand crashes 0x114 in dereferencing this->0x10.
+// Hook this method to log every call's return; if it returns nil, the next
+// step is figuring out why commandBufferStorage->0x300 is unset.
+typedef id (*macws_cbri_orig_t)(id self, SEL _cmd);
+static macws_cbri_orig_t macws_orig_cbri = NULL;
+static id macws_hook_cbri(id self, SEL _cmd) {
+    id result = macws_orig_cbri ? macws_orig_cbri(self, _cmd) : nil;
+    static int log_count = 0;
+    if (log_count < 10) {
+        fprintf(stderr,
+            "#### CBRI_HOOK self=%p cls=%s → resourceInfo=%p\n",
+            self, class_getName([self class]), result);
+        log_count++;
+    }
+    return result;
+}
+
+static void install_cbri_probe(void) {
+    if (!getenv("MACWS_AGX_NATIVE")) return;
+    // The method lives on IOGPUMetalCommandBuffer (super class). Hook there
+    // — AGXG13GFamilyCommandBuffer doesn't override.
+    Class cb_cls = objc_getClass("IOGPUMetalCommandBuffer");
+    if (!cb_cls) {
+        fprintf(stderr, "#### CBRI_HOOK: IOGPUMetalCommandBuffer class not found\n");
+        return;
+    }
+    SEL sel = sel_registerName("commandBufferResourceInfo");
+    Method m = class_getInstanceMethod(cb_cls, sel);
+    if (!m) {
+        fprintf(stderr, "#### CBRI_HOOK: method not found\n");
+        return;
+    }
+    macws_orig_cbri = (macws_cbri_orig_t)method_getImplementation(m);
+    method_setImplementation(m, (IMP)macws_hook_cbri);
+    fprintf(stderr, "#### CBRI_HOOK: installed (orig=%p)\n",
+        (void*)macws_orig_cbri);
+}
+
 // Diag hook on `-[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:
 //                field:args:argsSize:]`. This is the SUPER-INIT dispatched by
 // -[AGXTexture initWithDevice:desc:iosurface:plane:] via objc_msgSendSuper2.
@@ -1446,6 +1486,7 @@ static void install_iogpu_init_hook(void) {
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
+    install_cbri_probe();         // log commandBufferResourceInfo returns
 
     SEL sel = @selector(initWithAcceleratorPort:);
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
@@ -1471,7 +1512,93 @@ static void install_agx_init_redirect(Class agx) {
         swizzle2(agx, plain_sel, MTLFakeDevice.class, plain_hook_sel);
         fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled AGXG13GFamilyDevice newTextureWithDescriptor:\n");
     }
+
+    // (newBufferWithBytesNoCopy device-level swizzles previously here removed —
+    // SkyLight's MetalTiledBacking::PrepareForUse does NOT go through the
+    // device method.  The caller chain captured 2026-06-18 is:
+    //   SkyLight → -[AGXBuffer initWithDevice:bytes:length:options:
+    //                deallocator:pinnedGPUAddress:] → IOGPUResourceCreate
+    // so we have to interpose on the AGXBuffer init below instead, where the
+    // raw malloc'd `bytes` VA arrives.)
 #endif
+
+    // -[AGXBuffer initWithDevice:bytes:length:options:deallocator:
+    //                pinnedGPUAddress:] is what SkyLight calls (caller chain
+    // confirmed via backtrace in IOConnectCallMethod_new).  When `bytes` is
+    // malloc'd CPU memory the iOS IOGPU kernel rejects the sel=0xa type=0x80
+    // sub-resource — Apple's malloc returns pages with a private (non-MAP_
+    // SHARED) backing that the GPU can't pin.  Same trick as the existing
+    // MTLFakeDevice hooked_newBufferWithBytesNoCopy: vm_remap to a MAP_SHARED
+    // mirror, pass that VA to %orig, and chain the deallocator to free both.
+    Class agxbuf = objc_getClass("AGXBuffer");
+    if (agxbuf) {
+        SEL bytes_sel = sel_registerName(
+            "initWithDevice:bytes:length:options:deallocator:pinnedGPUAddress:");
+        Method m = class_getInstanceMethod(agxbuf, bytes_sel);
+        if (m) {
+            typedef id (*orig_t)(id, SEL, id, void *, NSUInteger,
+                                  NSUInteger, void (^)(void *, NSUInteger),
+                                  uint64_t);
+            static orig_t s_orig = NULL;
+            s_orig = (orig_t)method_getImplementation(m);
+            IMP shim = imp_implementationWithBlock(^id(
+                    id self, id dev, void *bytes, NSUInteger length,
+                    NSUInteger opt,
+                    void (^deallocator)(void *, NSUInteger),
+                    uint64_t pinnedGPUAddress) {
+                static int rmap_log = 0;
+                static int seen_log = 0;
+                if (seen_log < 4) {
+                    fprintf(stderr,
+                        "#### AGXBuffer init-bytes ENTRY self=%p dev=%p bytes=%p len=%lu opt=%lu pin=%#llx malloc_size=%zu\n",
+                        self, dev, bytes, (unsigned long)length, (unsigned long)opt,
+                        (unsigned long long)pinnedGPUAddress,
+                        bytes ? malloc_size(bytes) : 0);
+                    seen_log++;
+                }
+                if (bytes && length > 0 && malloc_size(bytes) > 0) {
+                    vm_address_t mirrored = 0;
+                    vm_prot_t cur_p, max_p;
+                    kern_return_t kr = vm_remap(
+                        mach_task_self(), &mirrored, length, 0,
+                        VM_FLAGS_ANYWHERE, mach_task_self(),
+                        (vm_address_t)bytes, false, &cur_p, &max_p,
+                        VM_INHERIT_SHARE);
+                    if (kr == KERN_SUCCESS) {
+                        vm_protect(mach_task_self(), mirrored, length,
+                                   NO, VM_PROT_READ | VM_PROT_WRITE);
+                        void *origBytes = bytes;
+                        void (^origDealloc)(void *, NSUInteger) = deallocator;
+                        deallocator = ^(void *p, NSUInteger l) {
+                            vm_deallocate(mach_task_self(),
+                                          (vm_address_t)p, l);
+                            if (origDealloc) origDealloc(origBytes, l);
+                        };
+                        if (rmap_log < 4) {
+                            fprintf(stderr,
+                                "#### AGXBuffer bytes: vm_remap'd %p -> %p (len=%lu)\n",
+                                origBytes, (void*)mirrored, (unsigned long)length);
+                            rmap_log++;
+                        }
+                        bytes = (void *)mirrored;
+                    } else {
+                        if (rmap_log < 4) {
+                            fprintf(stderr,
+                                "#### AGXBuffer bytes: vm_remap FAILED %p len=%lu kr=%d\n",
+                                bytes, (unsigned long)length, kr);
+                            rmap_log++;
+                        }
+                    }
+                }
+                return s_orig(self, bytes_sel, dev, bytes, length, opt,
+                              deallocator, pinnedGPUAddress);
+            });
+            method_setImplementation(m, shim);
+            fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled -[AGXBuffer initWithDevice:bytes:length:options:deallocator:pinnedGPUAddress:]\n");
+        } else {
+            fprintf(stderr, "#### MACWS_AGX_NATIVE AGXBuffer initWithDevice:bytes:length:options:deallocator:pinnedGPUAddress: NOT FOUND\n");
+        }
+    }
 
     // No-op methods that crash in chroot because their setup dependencies
     // (timers, mempools, dispatch sources, etc.) require kernel state that
