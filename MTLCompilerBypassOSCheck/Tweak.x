@@ -349,14 +349,6 @@ static void PatchAGXVerifyLoweredIR(void) {
 }
 
 %ctor {
-    // First thing: log who we are. This tells us whether ellekit's
-    // libinjector's Filter > Executables check used the right exec name.
-    {
-        char exec_path[1024];
-        uint32_t sz = sizeof(exec_path);
-        int rc = _NSGetExecutablePath(exec_path, &sz);
-        MTLPatchLog("%%ctor: pid=%d rc=%d exec=%s", getpid(), rc, rc == 0 ? exec_path : "(error)");
-    }
     // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck start");
     dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_GLOBAL);
     MSImageRef image = MSGetImageByName("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler");
