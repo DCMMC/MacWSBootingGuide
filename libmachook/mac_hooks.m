@@ -4106,6 +4106,36 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if(IOConnectIsIOGPU(client) && selector == 0x9 && outStructCnt && *outStructCnt == 0x50) {
         *outStructCnt = 0x10000;
     }
+    // sel=0x6 (iOS IOGPUDeviceCreateWithAPIProperty) and sel=0x7 (iOS
+    // IOGPUCommandQueueCreateWithQoS) both take inSC=1032 (0x408). iOS
+    // userland zeros the entire buffer first, then writes QoS at +0x400 and
+    // priority at +0x404. macOS userland instead writes a process path
+    // string starting at offset 0 ("/System/Library/PrivateFrameworks/
+    // SkyLight.framework/Versions/A/Resources/WindowServer\0…"). The iOS
+    // kernel then reads whatever is at +0x400/+0x404 as QoS/priority — and
+    // for the macOS payload, those are zero (since the path is well under
+    // 1024 bytes), which iOS could in principle tolerate. But the kernel
+    // also seems to scan the leading bytes (probably the "device flags" /
+    // "api_property" header at +0x0..+0x10) and rejects non-zero garbage
+    // there. Fix: build a fresh zeroed 1032-byte buffer (the iOS-native
+    // shape with QoS/priority defaulting to 0), pass that instead. The
+    // existing 256-byte shadowbuf is too small; allocate on the heap.
+    unsigned char *qbuf = NULL;
+    if (IOConnectIsIOGPU(client) && (selector == 0x6 || selector == 0x7) &&
+        inStruct && inStructCnt == 0x408) {
+        qbuf = (unsigned char *)calloc(1, inStructCnt);
+        // Default QoS/priority = 0 is fine; iOS Metal uses 0 when no
+        // explicit QoS is requested. Leave +0x400/+0x404 as zero.
+        inStruct = qbuf;
+        static int q_patched[2] = {0, 0};
+        int sl = (selector == 0x6) ? 0 : 1;
+        if (!q_patched[sl]) {
+            q_patched[sl] = 1;
+            fprintf(stderr,
+                "#### AGXIOC QueueArgs-fix sel=0x%x: replaced path-string args with zeroed 0x408 buffer\n",
+                selector);
+        }
+    }
     unsigned char shadowbuf[256];
     uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
@@ -4329,6 +4359,39 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     if(IOConnectIsIOGPU(client)) {
         fprintf(stderr, "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
+        // Diagnostic: dump the inStruct for sel=0x7/0x8 failures (queue
+        // creation). 1032-byte args; the iOS kernel rejects with 0xe00002c2.
+        // Dump first 128 bytes + scan for non-zero regions so we can RE the
+        // macOS-vs-iOS field divergence.
+        if (r == 0xe00002c2 && (orig == 0x7 || orig == 0x8) &&
+            inStruct && inStructCnt >= 0x10) {
+            const unsigned char *src = (const unsigned char *)inStruct;
+            static int q_dump_done[2] = {0, 0};
+            int slot = (orig == 0x7) ? 0 : 1;
+            if (!q_dump_done[slot]) {
+                q_dump_done[slot] = 1;
+                fprintf(stderr,
+                    "####   QueueCreate sel=0x%x inSC=%zu FAIL — full dump:\n",
+                    orig, inStructCnt);
+                // Hex dump head + every non-zero u64 chunk
+                size_t max = inStructCnt;
+                for (size_t i = 0; i < max && i < 256; i++) {
+                    if (i % 16 == 0) fprintf(stderr, "\n####     %03zx:", i);
+                    fprintf(stderr, " %02x", src[i]);
+                }
+                fprintf(stderr, "\n");
+                // Scan for non-zero u64s past offset 256
+                size_t step = 8;
+                for (size_t i = 256; i + step <= inStructCnt; i += step) {
+                    uint64_t v = *(const uint64_t *)(src + i);
+                    if (v) {
+                        fprintf(stderr,
+                            "####     +%03zx: %016llx\n",
+                            i, (unsigned long long)v);
+                    }
+                }
+            }
+        }
         // Diagnostic: dump the inStruct for ALL sel=0xa calls (resource
         // create). Compare successful heap (line A) vs failing texture
         // (line B) so we can identify what kernel rejects.
@@ -4383,6 +4446,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
         }
     }
+    if (qbuf) free(qbuf);
     return r;
 }
 IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
