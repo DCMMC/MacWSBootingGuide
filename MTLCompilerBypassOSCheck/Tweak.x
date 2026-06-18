@@ -98,19 +98,42 @@ static void PatchInstruction(uint32_t *addr, uint32_t value) {
 // Sandboxed XPC services (like MTLCompilerService under its
 // `seatbelt-profiles=[MTLCompilerService]` profile) cannot create files
 // outside /private/var/mobile, so the old fopen("/tmp/...") path silently
-// failed. Use syslog instead — it routes through the system logger and
-// shows up in oslog/console.app. Tagged with "MTLBypass" for easy grep.
+// failed. Try multiple destinations: a file under /var/mobile (writable
+// by the XPC service's sandbox), syslog (tagged "MTLBypass"), and stderr.
 static void MTLPatchLog(const char *fmt, ...) {
     static int once = 0;
     if (!once) { openlog("MTLBypass", LOG_PID | LOG_NDELAY, LOG_USER); once = 1; }
     char buf[512];
+    pid_t pid = getpid();
+    time_t now = time(NULL);
+    struct tm tm; localtime_r(&now, &tm);
+    int hdr = snprintf(buf, sizeof(buf),
+        "[%04d-%02d-%02d %02d:%02d:%02d pid=%d] ",
+        tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+        tm.tm_hour, tm.tm_min, tm.tm_sec, pid);
     va_list ap; va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(buf + hdr, sizeof(buf) - hdr, fmt, ap);
     va_end(ap);
-    syslog(LOG_NOTICE, "%s", buf);
-    // Also stderr — in case the process has a stderr we can read.
-    fprintf(stderr, "#### MTLBypass %s\n", buf);
+    syslog(LOG_NOTICE, "%s", buf + hdr);
+    fprintf(stderr, "#### MTLBypass %s\n", buf + hdr);
     fflush(stderr);
+    // Try several paths until one is writable from the sandbox.
+    static const char *paths[] = {
+        "/var/mobile/Library/Logs/mtl_compiler_patch.log",
+        "/var/mobile/mtl_compiler_patch.log",
+        "/var/jb/var/mobile/mtl_compiler_patch.log",
+        "/tmp/mtl_compiler_patch.log",
+        NULL,
+    };
+    for (int i = 0; paths[i]; i++) {
+        FILE *f = fopen(paths[i], "a");
+        if (f) {
+            fputs(buf, f);
+            fputc('\n', f);
+            fclose(f);
+            return;
+        }
+    }
 }
 
 // Strip arm64e PAC bits from a pointer. dlsym/MSFindSymbol on arm64e
