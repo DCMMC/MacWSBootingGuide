@@ -147,9 +147,14 @@ static uintptr_t StripPAC(const void *p) {
 }
 
 // Scan a window around (anchor + delta_hint) for the BL site preceded by
-// `add x2, x2, #0xdf4` (encoding 0x9137d042). That ADD is the
-// literal-pool-load for "agx." in `linkMetalRuntime`, so the immediately
-// following BL is the std::string::insert(0, "agx.") call we want NOPed.
+// `add x2, x2, #<imm12>` where the imm12 is the offset of the "agx."
+// literal within its __cstring page. Two known imm12 values across the
+// AGXCompilerCore variants we run against:
+//   - iOS-16.3 DSC:        add x2, x2, #0x44e (encoding 0x91113842)
+//   - macOS-13.4 chroot DSC: add x2, x2, #0xdf4 (encoding 0x9137d042)
+// The MTLCompilerBypassOSCheck tweak runs in iOS-side MTLCompilerService
+// only, so the iOS signature is what we actually need. But scanning for
+// either makes the code robust if the DSC version shifts.
 // Returns the BL site pointer or NULL if not found in the search window.
 //
 // `image_lo`/`image_hi` bound the scan to the AGXCompilerCore image —
@@ -169,7 +174,11 @@ static void RenamerScanSignalHandler(int sig) {
 static uint32_t *FindRenamerBLSite(void *anchor_raw, intptr_t delta_hint,
                                    int window_bytes,
                                    uintptr_t image_lo, uintptr_t image_hi) {
-    const uint32_t SIG_ADD_X2_DF4 = 0x9137d042u;
+    // `add x2, x2, #imm12` encoding with imm12 specific to each DSC variant.
+    // iOS-16.3 sees the "agx." literal at __cstring offset 0x44e; macOS-13.4
+    // chroot at 0xdf4. Match either so the patch is portable.
+    const uint32_t SIG_ADD_X2_44E = 0x91113842u; // add x2, x2, #0x44e (iOS)
+    const uint32_t SIG_ADD_X2_DF4 = 0x9137d042u; // add x2, x2, #0xdf4 (chroot)
     uintptr_t anchor = StripPAC(anchor_raw);
     uint32_t *base = (uint32_t *)(anchor + delta_hint);
     int max_words = window_bytes / 4;
@@ -192,7 +201,8 @@ static uint32_t *FindRenamerBLSite(void *anchor_raw, intptr_t delta_hint,
         prev_insn = probe[-1];
         cur_insn  = probe[0];
         g_renamer_scan_in_probe = 0;
-        if (prev_insn == SIG_ADD_X2_DF4 &&
+        if ((prev_insn == SIG_ADD_X2_44E ||
+             prev_insn == SIG_ADD_X2_DF4) &&
             ((cur_insn >> 26) & 0x3F) == 0x25) {
             found = probe;
             break;
