@@ -2646,14 +2646,35 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if(agxIsRes) {
         const unsigned char *src = (const unsigned char *)inStruct;
         agxType = src[0];
-        agxClientID = *(const uint32_t *)(src + 0x48);           // client-assigned id / parent-id
-        uint64_t bc = *(const uint64_t *)(src + 0x40);           // iOS 32-bit IOByteCount
-        uint64_t f30 = *(const uint64_t *)(src + 0x30);
+        uint8_t  f15  = src[0x15];                                // flag byte; bit-3 = "has parent"
+        uint64_t bc   = *(const uint64_t *)(src + 0x40);          // for type=0: heap byte-count
+        uint64_t f30  = *(const uint64_t *)(src + 0x30);
         uint64_t va38 = *(const uint64_t *)(src + 0x38);
+        uint64_t va48 = *(const uint64_t *)(src + 0x48);          // parent_id OR length depending on type/flags
+        // RE confirms (iOS kernel IOGPUDevice::new_resource @
+        // fffffe0009f03c1c): for type=0x80, args[0x48] is
+        // parent_id only when args[0x15] bit-3 is set. Otherwise it's
+        // the client buffer length and the kernel skips the parent
+        // lookup, calling IOGPUResource::newResourceWithClientBuffer
+        // with (args[0x40], args[0x30], args[0x38]) instead. The
+        // previous translator unconditionally clobbered args[0x48]
+        // which corrupted the length on every client-buffer path.
+        BOOL t80_has_parent = (agxType == 0x80) && (f15 & 0x08);
+        agxClientID = t80_has_parent ? *(const uint32_t *)(src + 0x48) : 0;
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
-        if(bc == 0) { uint32_t sz32 = *(const uint32_t *)(src + 0x58); uint64_t nb = sz32 ? sz32 : 0x1000; *(uint64_t *)(shadowbuf + 0x40) = nb; agxHeapSz = nb; patched = 1; }  // heap byte-count
-        if(agxType == 0x80) {
+        if(bc == 0 && agxType == 0) {
+            // Heap byte-count fixup (only valid for type=0 heap creation;
+            // type=0x80 client-buffer path uses args+0x40 as the end VA,
+            // not a size).
+            uint32_t sz32 = *(const uint32_t *)(src + 0x58);
+            uint64_t nb = sz32 ? sz32 : 0x1000;
+            *(uint64_t *)(shadowbuf + 0x40) = nb;
+            agxHeapSz = nb;
+            patched = 1;
+        }
+        if(agxType == 0x80 && t80_has_parent) {
+            // Sub-resource carved from a tracked parent heap.
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
                 *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosGID;            // parent-id: client -> iOS GID
@@ -2663,6 +2684,25 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 break;
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
+        } else if(agxType == 0x80) {
+            // Client-buffer path (type=0x80, no parent flag): iOS kernel
+            // entry checks `args[0x40] <= limit` early (IOGPUDevice::
+            // new_resource @ fffffe0009f03c4c: cmp x9, x10; b.ls). macOS
+            // IOGPUMetalBuffer init writes args[0x40] = client pointer VA
+            // (same as args[0x38]) which exceeds the limit (a kalloc-sized
+            // value), so this fails before the actual newResourceWithClient-
+            // Buffer call. iOS native userland writes args[0x40] = length
+            // here. Length sits at args[0x48] (macOS IOGPUMetalBuffer
+            // stores it there before this call).
+            uint64_t length = va48;
+            uint64_t cur40 = *(const uint64_t *)(src + 0x40);
+            if(length && cur40 == va38) {
+                *(uint64_t *)(shadowbuf + 0x40) = length;
+                patched = 1;
+                fprintf(stderr,
+                    "#### AGXIOC client-buf: +0x40 %#llx -> %#llx (=len)\n",
+                    (unsigned long long)cur40, (unsigned long long)length);
+            }
         }
         // type=0x82 is the iOS-NATIVE type byte for iosurface-backed textures
         // too — confirmed by static disasm of iOS IOGPUMetalTexture's
