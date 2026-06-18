@@ -72,7 +72,17 @@ int main(int argc, char *argv[], char *envp[]) {
         }
     }
     // if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED) != 0) {
-    if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC) != 0) {
+    // env-gated suspend: set MACWS_SUSPEND_AT_EXEC=1 (in WS plist
+    // EnvironmentVariables) to start the spawn'd macOS process in STOPPED
+    // state. Lets us race-attach lldb before a single instruction runs.
+    // Resume with `process continue` in lldb or `kill -CONT <pid>`.
+    short spawn_flags = POSIX_SPAWN_SETEXEC;
+    if (getenv("MACWS_SUSPEND_AT_EXEC")) {
+        spawn_flags |= POSIX_SPAWN_START_SUSPENDED;
+        fprintf(stderr, "[launchdchrootexec] MACWS_SUSPEND_AT_EXEC set — %s will start STOPPED\n",
+                execPath);
+    }
+    if(posix_spawnattr_setflags(&attr, spawn_flags) != 0) {
         perror("posix_spawnattr_set_flags");
         return 1;
     }
