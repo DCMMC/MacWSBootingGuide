@@ -2239,6 +2239,161 @@ static int hooked_IOHIDEventSystemClientSetMatchingMultiple_skip(
     return 1;
 }
 
+// ─── abort_with_payload diagnostic hook ──────────────────────────────────
+//
+// QuartzCore's CA::OGL::MetalContext methods call abort_with_payload(13, X)
+// (namespace = OS_REASON_COREANIMATION = 13) when they can't create a
+// pipeline state / tile pipeline / compute pipeline / vertex shader /
+// fragment shader / Metal context. There are seven such sites in the
+// chroot's macOS 13.4 QuartzCore. Without runtime instrumentation we
+// can't tell which one is firing — launchd only reports the namespace,
+// not the reason_code or call site.
+//
+// This hook is a NON-INTERCEPTING diagnostic: it logs (reason_namespace,
+// reason_code, reason_string, caller backtrace) and then tail-calls the
+// real abort_with_payload so the process exits exactly as it would
+// without the hook. That lets us identify the failing site in one run.
+//
+// Once the site is known, the proper fix lives in libmachook (skip the
+// failing pipeline build, return a known-good replacement, …) — this
+// hook is just here to find the site, not to "fix" the assert.
+typedef int (*macws_abort_t)(uint32_t reason_namespace, uint64_t reason_code,
+    void *payload, uint32_t payload_size, const char *reason_string,
+    uint64_t reason_flags);
+static macws_abort_t macws_orig_abort_with_payload = NULL;
+
+static int hooked_abort_with_payload(uint32_t reason_namespace,
+        uint64_t reason_code, void *payload, uint32_t payload_size,
+        const char *reason_string, uint64_t reason_flags) {
+    // Trace mode only (no survival action). Hanging the dispatch worker
+    // and bypassing __assert_rtn KEPT THE PROCESS UP but left CA's
+    // _state_stack non-empty, so the next MetalContext::EndUpdate
+    // SEGV'd at StopCapture+0x38 on a nil shader-state pointer. The
+    // real fix lives elsewhere: we need to build a real fallback
+    // RenderPipelineState (vertex passthrough + simple fragment) at WS
+    // init time and return it from a hook on
+    // -[MTLDevice newRenderPipelineStateWithDescriptor:error:] when the
+    // AGX compiler refuses a CA shader (e.g. the
+    // "Encountered unlowered function call to agx.air.fract.v3f16.fast"
+    // case observed on the macOS-13.4 AGXMetal13_3 + iOS-16.3 chroot
+    // combination). Without that, hanging the worker just defers the
+    // crash by one frame.
+    // Default: behave like a tracing hook — log and forward to the real
+    // abort_with_payload so other namespaces/codes still terminate.
+    char *p = macws_crash_buf;
+    char *end = macws_crash_buf + MACWS_CRASH_BUF_LEN;
+#define AP(...) do { if (p < end) p += snprintf(p, (size_t)(end - p), __VA_ARGS__); } while (0)
+    AP("\n#### MACWS_ABORT_TRACE namespace=%u code=%llu string=\"%s\" "
+       "payload=%p size=%u flags=%llu\n",
+        reason_namespace, (unsigned long long)reason_code,
+        reason_string ? reason_string : "(null)",
+        payload, payload_size, (unsigned long long)reason_flags);
+    // Payload is usually a CFString-ish buffer with the Metal error
+    // description in the first ~size bytes. Print as both hex and as
+    // raw text so we see exactly what reason came from the driver.
+    if (payload && payload_size > 0 && payload_size < 4096) {
+        AP("####   payload bytes (text): \"");
+        const unsigned char *pl = (const unsigned char *)payload;
+        for (uint32_t i = 0; i < payload_size && p + 4 < end; i++) {
+            unsigned char c = pl[i];
+            if (c == '\\' || c == '"') { AP("\\%c", c); }
+            else if (c >= 0x20 && c < 0x7f) { AP("%c", c); }
+            else if (c == 0) { AP("\\0"); }
+            else { AP("\\x%02x", c); }
+        }
+        AP("\"\n");
+    }
+    void *frames[24];
+    int nf = backtrace(frames, 24);
+    for (int i = 0; i < nf; i++) {
+        Dl_info dli;
+        if (dladdr(frames[i], &dli) && dli.dli_fname) {
+            AP("####     [%2d] %p %s+%#llx (%s)\n", i, frames[i],
+                dli.dli_sname ? dli.dli_sname : "?",
+                (unsigned long long)((uintptr_t)frames[i] -
+                    (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)),
+                dli.dli_fname);
+        } else {
+            AP("####     [%2d] %p\n", i, frames[i]);
+        }
+    }
+#undef AP
+    size_t len = (size_t)(p - macws_crash_buf);
+    if (len > MACWS_CRASH_BUF_LEN) len = MACWS_CRASH_BUF_LEN;
+    (void)write(STDERR_FILENO, macws_crash_buf, len);
+    // Tail-call the real abort_with_payload so process exit + launchd's
+    // reason reporting are unchanged.
+    if (macws_orig_abort_with_payload) {
+        return macws_orig_abort_with_payload(reason_namespace, reason_code,
+            payload, payload_size, reason_string, reason_flags);
+    }
+    _exit(128 + 6); // SIGABRT fallback
+    return 0;
+}
+
+// __assert_rtn is what `assert()` macro calls before abort(). CA's
+// MetalContext.mm has classic-assert "Unbalanced Composites" / similar
+// guards. When we park a pipeline-build worker on a pipeline failure
+// (above), the CA state stack is left non-empty, and the *next* frame's
+// EndUpdate hits assert(_state_stack.empty()). That triggers abort() on
+// a DIFFERENT thread from the abort_with_payload hang. Catch it here too
+// and just return; the assertion message is logged for diagnostics.
+static void hooked_assert_rtn(const char *func, const char *file, int line,
+                              const char *expr) {
+    char buf[512];
+    int len = snprintf(buf, sizeof(buf),
+        "#### MACWS_ASSERT_BYPASS func=%s file=%s line=%d expr=%s — return, "
+        "NOT aborting\n",
+        func ?: "?", file ?: "?", line, expr ?: "?");
+    (void)write(STDERR_FILENO, buf,
+        (size_t)(len > 0 ? (size_t)len : 0));
+    return;
+}
+
+static void macws_install_assert_bypass(void) {
+    MSImageRef libsys = MSGetImageByName(
+        "/usr/lib/system/libsystem_c.dylib");
+    if (!libsys) {
+        fprintf(stderr,
+            "#### MACWS_ASSERT_BYPASS: libsystem_c image not found, skip\n");
+        return;
+    }
+    void *sym = MSFindSymbol(libsys, "___assert_rtn");
+    if (!sym) sym = MSFindSymbol(libsys, "__assert_rtn");
+    if (!sym) {
+        fprintf(stderr,
+            "#### MACWS_ASSERT_BYPASS: __assert_rtn not found, skip\n");
+        return;
+    }
+    MSHookFunction(sym, (void *)hooked_assert_rtn, NULL);
+    fprintf(stderr,
+        "#### MACWS_ASSERT_BYPASS __assert_rtn → log+return at %p\n", sym);
+}
+
+static void macws_install_abort_trace(void) {
+    if (!getenv("MACWS_ABORT_TRACE")) return;
+    MSImageRef libsys = MSGetImageByName(
+        "/usr/lib/system/libsystem_kernel.dylib");
+    if (!libsys) libsys = MSGetImageByName(
+        "/usr/lib/system/libsystem_c.dylib");
+    if (!libsys) {
+        fprintf(stderr,
+            "#### MACWS_ABORT_TRACE: libsystem image not found, skip\n");
+        return;
+    }
+    void *sym = MSFindSymbol(libsys, "_abort_with_payload");
+    if (!sym) {
+        fprintf(stderr,
+            "#### MACWS_ABORT_TRACE: _abort_with_payload symbol not found\n");
+        return;
+    }
+    MSHookFunction(sym, (void *)hooked_abort_with_payload,
+        (void **)&macws_orig_abort_with_payload);
+    fprintf(stderr,
+        "#### MACWS_ABORT_TRACE installed at %p (orig=%p)\n",
+        sym, (void *)macws_orig_abort_with_payload);
+}
+
 static void macws_install_iohid_unserialize_bypass(void) {
     static int once = 0;
     if (once) return;
@@ -2492,6 +2647,12 @@ __attribute__((constructor)) void InitStuff() {
     // Targeted fix for the IOMFBServer thread BUS_ADRALN: skip just the
     // CFBinaryPlist deserialize step inside IOKit's HID-property cache.
     macws_install_iohid_unserialize_bypass();
+    // Optional: trace which abort_with_payload site fires (opt-in via env).
+    macws_install_abort_trace();
+    // Assert bypass needs no env gate — it's strictly defensive against
+    // CA::OGL::MetalContext assert() calls that fire as a downstream
+    // consequence of a failed pipeline build.
+    macws_install_assert_bypass();
     // Broader bulk hook (one stub per public `IOHIDEventSystem*` symbol)
     // is opt-in and currently unstable — see the comment block in
     // `macws_install_iomfb_hid_bypass`. Keep it accessible for debugging.
