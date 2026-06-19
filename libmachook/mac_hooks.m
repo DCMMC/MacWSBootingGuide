@@ -191,6 +191,86 @@ static mach_port_t macws_alloc_iosurf_xpc(uint64_t size, uint64_t options,
     return port;
 }
 
+// macws_make_mem_entry_xpc — ask iOS-native macwsallocd to allocate a
+// CPU buffer + mach_make_memory_entry_64-wrap it, return entry port +
+// mapped VA in our task. Used for type=0x80 standalone client-buffer
+// path where iOS kernel rejects raw mmap'd CPU VAs (rejected even with
+// pre-fault + mlock). Memory entry created by an iOS-native task with
+// real task credentials passes the kernel's wire check.
+//
+// PoC verified 2026-06-19 via misc/test_mem_entry_xpc.c that mach
+// memory entry mach ports DO cross XPC task boundaries (unlike
+// io_connect_t which trips EXC_GUARD ILLEGAL_MOVE).
+//
+// Returns the mapped CPU VA in our task on success, 0 on failure.
+// Caller writes this VA into args+0x30 before sel=0xa.
+extern kern_return_t mach_vm_map(
+    vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size,
+    mach_vm_offset_t mask, int flags, mach_port_t object,
+    memory_object_offset_t offset, boolean_t copy,
+    vm_prot_t cur_protection, vm_prot_t max_protection,
+    vm_inherit_t inheritance);
+
+static uint64_t macws_make_mem_entry_xpc(uint64_t size, uint64_t *out_size) {
+    static xpc_connection_t conn = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
+            dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
+        if (!createMach) return;
+        conn = createMach("com.macwsguide.alloc", NULL, 0);
+        if (!conn) return;
+        xpc_connection_set_event_handler(conn, ^(xpc_object_t event) { (void)event; });
+        xpc_connection_resume(conn);
+    });
+    if (!conn) return 0;
+
+    xpc_object_t req = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(req, "op", "make-mem-entry");
+    xpc_dictionary_set_uint64(req, "size", size);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, req);
+    if (!reply || xpc_get_type(reply) != XPC_TYPE_DICTIONARY) {
+        static int log_once = 0;
+        if (!log_once++) fprintf(stderr, "#### mem-entry-xpc: no reply\n");
+        return 0;
+    }
+    const char *result = xpc_dictionary_get_string(reply, "result");
+    if (!result || strcmp(result, "ok") != 0) {
+        static int log_once = 0;
+        if (log_once++ < 4) fprintf(stderr,
+            "#### mem-entry-xpc: result=%s\n", result ?: "(null)");
+        return 0;
+    }
+    mach_port_t entry = xpc_dictionary_copy_mach_send(reply, "entry");
+    uint64_t actual = xpc_dictionary_get_uint64(reply, "size");
+    if (entry == MACH_PORT_NULL || actual == 0) return 0;
+
+    // Map the entry into THIS task (chroot WS). The mapped VA is what
+    // the kernel will see when we put it in args+0x30.
+    mach_vm_address_t addr = 0;
+    kern_return_t kr = mach_vm_map(
+        mach_task_self(), &addr, (mach_vm_size_t)actual, 0,
+        0x1 /* VM_FLAGS_ANYWHERE */, entry, 0, FALSE,
+        VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+        VM_INHERIT_NONE);
+    mach_port_deallocate(mach_task_self(), entry);
+    if (kr != KERN_SUCCESS) {
+        static int log_once = 0;
+        if (log_once++ < 4) fprintf(stderr,
+            "#### mem-entry-xpc: mach_vm_map kr=%#x\n", kr);
+        return 0;
+    }
+    static int log_once = 0;
+    if (log_once++ < 6) {
+        fprintf(stderr,
+            "#### mem-entry-xpc: req=%#llx → addr=%#llx size=%#llx (mapped from helper)\n",
+            (unsigned long long)size, (unsigned long long)addr,
+            (unsigned long long)actual);
+    }
+    if (out_size) *out_size = actual;
+    return (uint64_t)addr;
+}
+
 extern au_asid_t audit_token_to_asid(audit_token_t atoken);
 extern uid_t audit_token_to_auid(audit_token_t atoken);
 
@@ -4436,12 +4516,33 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // doesn't support standalone client-buffer at all under
             // chroot's task credentials.)
             uint64_t cur30 = *(const uint64_t *)(src + 0x30);
-            if (cur30 > 0x40000000ULL) {
-                *(uint64_t *)(shadowbuf + 0x30) = 0;
-                patched = 1;
-                fprintf(stderr,
-                    "#### AGXIOC client-buf: +0x30 %#llx (pinned VA) -> 0\n",
-                    (unsigned long long)cur30);
+            if (cur30 > 0x40000000ULL || cur30 == 0x1) {
+                // Real fix via iOS-native macwsallocd memory entry.
+                // PoC verified entry port crosses XPC (test_mem_entry_xpc.c).
+                uint64_t buflen = va48 ? va48 : 0x4000;
+                if (buflen & 0xfff) buflen = (buflen + 0xfff) & ~0xfffULL;
+                uint64_t mapped_va = macws_make_mem_entry_xpc(buflen, NULL);
+                if (mapped_va) {
+                    *(uint64_t *)(shadowbuf + 0x30) = mapped_va;
+                    patched = 1;
+                    static int log_once = 0;
+                    if (log_once++ < 4) {
+                        fprintf(stderr,
+                            "#### AGXIOC client-buf: +0x30 %#llx -> %#llx "
+                            "(macwsallocd mem_entry %#llx bytes)\n",
+                            (unsigned long long)cur30,
+                            (unsigned long long)mapped_va,
+                            (unsigned long long)buflen);
+                    }
+                } else {
+                    *(uint64_t *)(shadowbuf + 0x30) = 0;
+                    patched = 1;
+                    static int log_once_zero = 0;
+                    if (log_once_zero++ < 4) fprintf(stderr,
+                        "#### AGXIOC client-buf: mem_entry helper unavailable; "
+                        "+0x30 %#llx -> 0 (will likely fail)\n",
+                        (unsigned long long)cur30);
+                }
             }
             // args+0x58 for type=0x80: same logic as type=0 — macOS tags
             // it with extended pinned-VA, iOS kernel rejects. Zero if

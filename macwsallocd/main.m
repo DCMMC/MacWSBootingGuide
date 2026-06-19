@@ -26,6 +26,16 @@
 #include <dispatch/dispatch.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <mach/mach.h>
+// mach_vm.h is unsupported in iOS SDK — manually declare what we need.
+extern kern_return_t mach_make_memory_entry_64(
+    vm_map_t target_task, memory_object_size_t *size,
+    memory_object_offset_t offset, vm_prot_t permission,
+    mach_port_t *object_handle, mach_port_t parent_entry);
+#ifndef MAP_MEM_NAMED_CREATE
+#define MAP_MEM_NAMED_CREATE 0x020000
+#endif
 #include <IOKit/IOKitLib.h>
 
 // AGX user-client borrowing — opens IOAcceleratorES from iOS-native context
@@ -102,6 +112,79 @@ static void alloc_serve(xpc_object_t event) {
     if (!op) return;
     if (strcmp(op, "borrow-agx-conn") == 0) {
         borrow_serve(event);
+        return;
+    }
+    if (strcmp(op, "make-mem-entry") == 0) {
+        // 2026-06-19 — mach_make_memory_entry_64 helper.
+        // For chroot WS's type=0x80 standalone client-buffer sel=0xa path,
+        // iOS kernel rejects raw mmap'd CPU VAs. The expected input is a
+        // mach memory entry created via `mach_make_memory_entry_64` (or
+        // equivalent IOMemoryDescriptor flavor) where the entry's owner
+        // credentials let iOS kernel safely map it for GPU access.
+        //
+        // We run in iOS-native context so this call works without funky
+        // entitlement issues. We mmap + mlock the buffer and create the
+        // entry with MAP_MEM_NAMED_CREATE, then send the entry port to
+        // the caller.
+        //
+        // Open question: does the entry mach port cross task boundaries
+        // via XPC the way IOSurface does? IOSurface's IOSurfaceCreateMachPort
+        // works fine across XPC, but io_connect_t triggers EXC_GUARD. A
+        // mach memory entry is a regular Mach VM object, no IOKit guards,
+        // so should be OK — but needs runtime confirmation.
+        uint64_t size_req = xpc_dictionary_get_uint64(event, "size");
+        xpc_connection_t peer = xpc_dictionary_get_remote_connection(event);
+        xpc_object_t r = xpc_dictionary_create_reply(event);
+        const char *result = "ok";
+        mach_port_t entry = MACH_PORT_NULL;
+        uint64_t actual = 0;
+        void *cpu_buf = NULL;
+        if (size_req == 0 || size_req > (256ULL * 1024 * 1024)) {
+            result = "size_invalid";
+        } else {
+            actual = (size_req + 0xfff) & ~0xfffULL;
+            cpu_buf = mmap(NULL, actual, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANON, -1, 0);
+            if (cpu_buf == MAP_FAILED) {
+                result = "mmap_fail";
+                cpu_buf = NULL;
+            } else {
+                memset(cpu_buf, 0, actual);
+                (void)mlock(cpu_buf, actual);
+                memory_object_size_t sz = (memory_object_size_t)actual;
+                kern_return_t kr = mach_make_memory_entry_64(
+                    mach_task_self(), &sz,
+                    (memory_object_offset_t)cpu_buf,
+                    VM_PROT_READ | VM_PROT_WRITE | MAP_MEM_NAMED_CREATE,
+                    &entry, MACH_PORT_NULL);
+                NSLog(@"make-mem-entry: mmap %p (%llu B) entry kr=%#x port=%u sz_out=%llu",
+                    cpu_buf, actual, kr, entry, (unsigned long long)sz);
+                if (kr != KERN_SUCCESS) {
+                    result = "entry_fail";
+                    munmap(cpu_buf, actual);
+                    cpu_buf = NULL;
+                    entry = MACH_PORT_NULL;
+                }
+            }
+        }
+        if (r && peer) {
+            xpc_dictionary_set_string(r, "result", result);
+            if (entry != MACH_PORT_NULL) {
+                xpc_dictionary_set_mach_send(r, "entry", entry);
+                xpc_dictionary_set_uint64(r, "size", actual);
+                // Send the iOS-side CPU VA as a u64 too — informational
+                // only (chroot can't dereference it; it's in our task).
+                xpc_dictionary_set_uint64(r, "helper_va", (uint64_t)cpu_buf);
+            }
+            xpc_connection_send_message(peer, r);
+        }
+        if (entry != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), entry);
+        }
+        // Do NOT munmap/free cpu_buf — the entry references it. The
+        // mapping persists until all entry send-rights are dropped.
+        NSLog(@"make-mem-entry size_req=%llu actual=%llu -> %s port=%u",
+            size_req, actual, result, entry);
         return;
     }
     if (strcmp(op, "alloc-iosurf") != 0) return;
