@@ -3896,6 +3896,31 @@ kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
 
+// 2026-06-19 RE: chroot's texture super-init failure traces to
+// `-[IOGPUMetalResource initWithDevice:remoteStorageResource:options:args:
+// argsSize:]` returning nil at the GetClientShared cbz check. Original
+// hypothesis was CF-type-id mismatch; runtime+disasm refined: macOS
+// `_IOGPUResourceCreate` (unslid 0x19d156140..0x19d156248) builds a CF
+// wrapper after kernel sel=0xa returns. On the success leg it copies
+// fields out of `outStruct`:
+//   wrapper[+0x40] = outStruct[+0x48]
+//   wrapper[+0x48] = outStruct[+0x10]   ← what GetClientShared returns
+// `_IOGPUResourceGetClientShared(wrapper)` returns wrapper[+0x48]. The
+// orig init then `cbz x0, error` — if wrapper[+0x48] == 0, releases self
+// and returns nil. So if iOS kernel doesn't populate outStruct[+0x10]
+// for the chroot's texture-path call, the whole texture init dies.
+//
+// NOT FIXED YET — next step is to actually read outStruct[+0x10] at
+// runtime for the failing call (via lldb at the wrapper-construction
+// site, +0x19d1561d8 / +0x19d15621c) to confirm it's NULL, then dig into
+// iOS userland's `_IOGPUResourceCreate` to see what args bit makes iOS
+// kernel populate that field. Then patch our IOConnectCallMethod_new
+// args swap so kernel returns a valid value there.
+//
+// The simplest hack (DYLD_INTERPOSE GetClientShared to fall back to the
+// resource pointer when it returns NULL) was tried + reverted — user
+// asked for structural understanding first, not whack-a-mole.
+
 // Tightly-scoped IOSurfaceCreate interposer — only rewrites SkyLight's "CA
 // Framebuffer" 2-plane Apple-GPU-compressed BGRA10_XR surface (FourCC '&b38' /
 // 0x26623338). Without rewrite, MTLSimDriverHost cannot wrap this IOSurface in
@@ -4300,6 +4325,43 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // as a VA (no real allocation request is that big — IOGPU+0x108
         // cap is ~5 GB total, individual allocations rarely exceed
         // hundreds of MB). Use args+0x48 as the real length.
+        // 2026-06-19 part 3 — type=0 heap with pinned-VA args+0x38 also
+        // triggers kernel kIOReturnNoMemory. SkyLight texture path sends
+        // args+0x38=0x102fec000 (high VA) AND args+0x40=0x4000 (already a
+        // length, so previous VA-shape patch on +0x40 doesn't fire). The
+        // VA at +0x38 tells the macOS kernel "place this heap at this
+        // pinned GPU VA", iOS kernel rejects. Zero args+0x38 for ANY
+        // type=0 heap call where it's >1GB — same logic as +0x40 swap.
+        if(agxType == 0) {
+            uint64_t va38 = *(const uint64_t *)(src + 0x38);
+            if (va38 > 0x40000000ULL) {
+                static int log_once_38 = 0;
+                if (log_once_38++ < 4) {
+                    fprintf(stderr,
+                        "#### AGXIOC sel=0x9 type=0 VA-shape +0x38=%#llx → 0\n",
+                        (unsigned long long)va38);
+                }
+                *(uint64_t *)(shadowbuf + 0x38) = 0;
+                patched = 1;
+            }
+            // args+0x14 flag mask: known-good values are 0x470 / 0x430.
+            // SkyLight texture path sends 0x2c30 (adds bits 11 0x800 and
+            // 13 0x2000) which iOS kernel rejects with kIOReturnNoMemory.
+            // Strip these bits — they're macOS-only options (e.g. pinned-VA
+            // request flag).
+            uint32_t f14 = *(const uint32_t *)(src + 0x14);
+            uint32_t f14_clean = f14 & ~0x2800u;
+            if (f14_clean != f14) {
+                static int log_once_14 = 0;
+                if (log_once_14++ < 4) {
+                    fprintf(stderr,
+                        "#### AGXIOC sel=0x9 type=0 args+0x14=%#x → %#x "
+                        "(stripped macOS-only bits 0x2800)\n", f14, f14_clean);
+                }
+                *(uint32_t *)(shadowbuf + 0x14) = f14_clean;
+                patched = 1;
+            }
+        }
         if(agxType == 0 && bc != 0 && bc > 0x40000000ULL) {
             uint64_t len_field = *(const uint64_t *)(src + 0x48);
             uint64_t va58 = *(const uint64_t *)(src + 0x58);
@@ -4539,14 +4601,28 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t va38 = *(const uint64_t *)(src + 0x38);
             uint64_t bc40 = *(const uint64_t *)(src + 0x40);
             uint64_t va58 = *(const uint64_t *)(src + 0x58);
+            // 2026-06-19 diagnostic for outStruct[+0x10]: macOS userland
+            // copies outStruct[+0x10] → wrapper[+0x48] (the
+            // "client-shared-memory pointer" returned by
+            // _IOGPUResourceGetClientShared). If outStruct[+0x10] is
+            // NULL, IOGPUMetalResource init bails to error path.
+            uint64_t out10 = 0, out48 = 0;
+            if (r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x18) {
+                const unsigned char *o = (const unsigned char *)outStruct;
+                out10 = *(const uint64_t *)(o + 0x10);
+                if (*outStructCnt >= 0x50)
+                    out48 = *(const uint64_t *)(o + 0x48);
+            }
             fprintf(stderr,
                 "####   ResCreate %s type=%#x clientID=%#x "
-                "+0x30=%#llx +0x38=%#llx +0x40=%#llx +0x58=%#llx\n",
+                "+0x30=%#llx +0x38=%#llx +0x40=%#llx +0x58=%#llx "
+                "OUT[+0x10]=%#llx OUT[+0x48]=%#llx\n",
                 r ? "FAIL" : "OK",
                 type, clientID,
                 (unsigned long long)f30, (unsigned long long)va38,
                 (unsigned long long)bc40,
-                (unsigned long long)va58);
+                (unsigned long long)va58,
+                (unsigned long long)out10, (unsigned long long)out48);
             // Hex dump first 0x70 bytes
             fprintf(stderr, "####   inStruct[0..%zu]:", inStructCnt);
             for (size_t i = 0; i < inStructCnt && i < 0x70; i++) {
