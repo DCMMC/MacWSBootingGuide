@@ -6,6 +6,7 @@
 #import <IOKit/IOKitLib.h>
 #import <xpc/xpc.h>
 #import <sys/sysctl.h>
+#import <malloc/malloc.h>
 #import "interpose.h"
 #import "utils.h"
 
@@ -339,6 +340,27 @@ const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *AGXMetalPath = "/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3";
+
+// Private malloc zone for synth-buffer scratch (ivar+0x30) — Mempool freelist
+// target. AGX driver writes its own sentinels (e.g. 0x1) into this buffer for
+// its internal freelist tracking. When the synth AGXG13GFamilyBuffer is
+// dealloc'd, free() routes the pointer to its zone. With this private zone,
+// the corruption stays here — nothing else allocates from this zone, so
+// tiny_malloc_from_free_list iterations in the DEFAULT zone never touch it.
+// Without this isolation, AGX driver's `0x1` writes poison the default-zone
+// free list and crash WS at the next NSString/CF object allocation.
+static malloc_zone_t *macws_synth_scratch_zone(void) {
+    static malloc_zone_t *zone = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        zone = malloc_create_zone(0, 0);
+        if (zone) malloc_set_zone_name(zone, "macws_synth_scratch");
+        fprintf(stderr,
+            "#### CODEHEAP-SHIM private scratch zone created: %p name=%s\n",
+            zone, zone ? malloc_get_zone_name(zone) : "(nil)");
+    });
+    return zone;
+}
 
 // True if a process named `name` is currently running anywhere on the system.
 // chroot shares the kernel proc table, so iOS-context processes (e.g.
@@ -2186,14 +2208,22 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                             // 16 KB is enough for sequential-int freelist init
                             // (~15 entries) plus memcpy-grow expansion of the
                             // Mempool's internal counters. dealloc later free()s
-                            // this pointer, so it MUST be malloc-derived.
-                            void *scratch = calloc(1, 16384);
+                            // this pointer — AGX driver writes sentinel values
+                            // (e.g. 0x1) into it for its own freelist tracking,
+                            // which corrupts the default malloc free list on
+                            // dealloc. Route through a private zone so the
+                            // corruption stays isolated and the default zone's
+                            // free list stays intact.
+                            malloc_zone_t *zone = macws_synth_scratch_zone();
+                            void *scratch = zone ?
+                                malloc_zone_calloc(zone, 1, 16384) :
+                                calloc(1, 16384);
                             if (scratch) {
                                 ((void **)r)[6] = scratch;
                                 static int fl_log = 0;
                                 if (fl_log++ < 4) {
                                     fprintf(stderr,
-                                        "#### initFull freelist-scratch: buf=%p ivar+0x30 ← %p\n",
+                                        "#### initFull freelist-scratch: buf=%p ivar+0x30 ← %p (private-zone)\n",
                                         r, scratch);
                                 }
                             }
@@ -2412,7 +2442,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 // is what macOS asks for, iOS-native CodeHeap rarely
                                 // exceeds 64 MB, and oversizing on the iOS path may
                                 // get rejected for separate reasons (kernel VA quota).
-                                if (sz > 0x10000000ULL) sz = 0x10000000ULL;
+                                // 2026-06-19 — Empirically iOS IOSurface backing
+                                // for >64MB allocations: macwsallocd creates the
+                                // surface and returns port+id, but chroot's
+                                // IOSurfaceLookup + IOSurfaceLookupFromMachPort
+                                // BOTH return nil for those sizes. Smaller surfaces
+                                // (<= 64MB) round-trip fine. Cap at 64MB.
+                                if (sz > 0x4000000ULL) sz = 0x4000000ULL;
                                 if (sz < 0x10000ULL)    sz = 0x10000ULL;
                             }
                             if (!sz) sz = 0x10000;
@@ -2521,19 +2557,25 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                             // freelist target is at ivar offset 0x30. For
                             // a non-synth buffer this is set by the real init
                             // to a chunk freelist pointer that the buf's
-                            // dealloc later free()s. CRITICAL: this MUST be
-                            // a malloc'd pointer — using the IOSurface base
-                            // here corrupts the libmalloc heap (dealloc → free
-                            // → libmalloc detects non-malloc address →
-                            // checksum_botch → abort). Use a separate
-                            // calloc'd scratch (16 KB is enough for the
-                            // sequential-int freelist init + later memcpy
-                            // grow operations). The IOSurface stays attached
-                            // via associated objects for downstream code that
-                            // wants the contents pointer.
-                            ((void **)pr)[6] = calloc(1, 16384);
+                            // dealloc later free()s. The IOSurface base
+                            // can NOT go here (libmalloc detects non-malloc
+                            // address → checksum_botch → abort on dealloc).
+                            // AGX driver also writes sentinel values
+                            // (e.g. 0x1) into this buffer for its OWN freelist
+                            // tracking, which then corrupts the default
+                            // malloc free list when the buffer is dealloc'd.
+                            // Route through a private zone so the corruption
+                            // stays here — nothing else allocates from this
+                            // zone, so tiny_malloc_from_free_list iterations
+                            // in the DEFAULT zone never touch it.
+                            // 16 KB suffices for sequential-int freelist
+                            // init + later memcpy grow operations.
+                            malloc_zone_t *zone = macws_synth_scratch_zone();
+                            ((void **)pr)[6] = zone ?
+                                malloc_zone_calloc(zone, 1, 16384) :
+                                calloc(1, 16384);
                             fprintf(stderr,
-                                "#### CODEHEAP-SHIM ivar+0x30 = scratch (%p, 16K) — Mempool freelist target\n",
+                                "#### CODEHEAP-SHIM ivar+0x30 = scratch (%p, 16K, private-zone) — Mempool freelist target\n",
                                 ((void **)pr)[6]);
                             fprintf(stderr,
                                 "#### CODEHEAP-SHIM (%s) iosurf-synth len=%llu base=%p -> %p\n",
@@ -2724,6 +2766,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         } else {
             fprintf(stderr, "#### MACWS_AGX_NATIVE __got section NOT FOUND\n");
         }
+
     }
 }
 
