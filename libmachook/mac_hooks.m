@@ -2229,6 +2229,57 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                     r, r ? "non-nil" : "nil — entering synth");
                             }
                             if (r) return r;
+                            // 2026-06-19 — lldb-instrumented diagnosis:
+                            //
+                            // For Texture super-init (pre_cls = Texture class),
+                            // orig (real -[IOGPUMetalResource initWithDevice:
+                            // options:args:argsSize:]) returns nil even AFTER
+                            // the sel=0x9 fix landed (chroot sel=0x9 succeeds).
+                            //
+                            // Returning our existing synth Buffer here gets
+                            // AGXTexture init through finalizeTextureCreation
+                            // (we no-op it) but the next downstream method on
+                            // the buffer (height, width, etc.) crashes.
+                            //
+                            // Returning nil makes AGXTexture init return nil
+                            // cleanly to SkyLight, which then trips
+                            // `_state_stack.empty() Unbalanced Composites`
+                            // assert in MetalContext.mm:411 (the
+                            // WSCompositeDestinationCreateWithMetalTexture
+                            // nil-tolerate hook only covers ONE call site).
+                            //
+                            // Real fix needs: either (a) make orig succeed for
+                            // texture path (RE why it returns nil — possibly
+                            // sub-resource-allocation step uses different args
+                            // shape that the kernel rejects), or (b) synth a
+                            // proper AGXG13GFamilyTexture-class instance with
+                            // working accessor swizzles for all MTLTexture
+                            // protocol methods. Both larger than this commit.
+                            //
+                            // CURRENT BEHAVIOR: dump args + return nil. WS will
+                            // assert downstream on Unbalanced Composites; this
+                            // is documented as a known follow-up.
+                            const char *pre_name = pre_cls ? class_getName(pre_cls) : "(nil)";
+                            if (pre_name && strstr(pre_name, "Texture")) {
+                                static int log_once = 0;
+                                if (log_once++ < 4) {
+                                    fprintf(stderr,
+                                        "#### CODEHEAP-SHIM DIAG texture-orig-nil pre_cls=%s "
+                                        "args@%p argsSize=%lu\n",
+                                        pre_name, args, argsSize);
+                                    if (args && argsSize <= 0x200) {
+                                        const uint8_t *a = (const uint8_t *)args;
+                                        for (size_t i = 0; i < argsSize; i += 16) {
+                                            fprintf(stderr, "####   args+%#04zx:", i);
+                                            for (size_t j = 0; j < 16 && i + j < argsSize; j++) {
+                                                fprintf(stderr, " %02x", a[i + j]);
+                                            }
+                                            fprintf(stderr, "\n");
+                                        }
+                                    }
+                                }
+                                return nil;
+                            }
                             // PIN-FALLBACK path. Use pre_cls (captured before orig)
                             // — orig consumed self, so object_getClass(self) now
                             // returns nil.
