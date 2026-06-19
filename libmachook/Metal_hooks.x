@@ -1859,19 +1859,75 @@ static void install_agx_init_redirect(Class agx) {
                 // Env-gated MACWS_AGX_SKIP_PINNED_ALLOC (default ON when
                 // MACWS_AGX_NATIVE=1) so we can A/B against the old
                 // vm_remap path.
-                if (pinnedGPUAddress != 0 &&
-                    getenv("MACWS_AGX_NATIVE") &&
+                // 2026-06-20 — Widened gate. Previously only fired when
+                // pinnedGPUAddress != 0, but runtime traces show this init
+                // is called with pinnedGPUAddress=0 from
+                // MetalTiledBacking::PrepareForUse AND the internal code
+                // path still goes to kernel sel=0x9 type=0x80 (which
+                // iOS rejects). The init-bytes variant always routes
+                // through that broken path. Redirect for any AGX-native
+                // invocation.
+                if (getenv("MACWS_AGX_NATIVE") &&
                     !getenv("MACWS_AGX_KEEP_PINNED_ALLOC")) {
-                    static int skip_log = 0;
-                    if (skip_log++ < 8) {
+                    // 2026-06-20 — REDIRECT-iOS-NATIVE.
+                    // Previously this returned nil because the macOS-pattern
+                    // pinnedGPUAddress: call routes through kernel sel=0x9
+                    // type=0x80 (scanout class) which iOS structurally
+                    // rejects from chroot. The "self-implement tile buffer"
+                    // detour was overcomplicated.
+                    //
+                    // Real fix: just redirect to `[device newBufferWithLength:
+                    // options:]` — iOS-native Metal's normal buffer alloc
+                    // which goes through kernel sel=0x9 type=0 heap (known
+                    // working, 3700+ successes per WS lifetime). The buffer
+                    // gets a GPU VA from AGX (not the caller-requested
+                    // pinned VA). SkyLight queries it via [buffer gpuAddress]
+                    // at bind time, so the mismatch is transparent to
+                    // downstream code. iOS Metal tile-pipeline support is
+                    // native on M1 — blur/vibrancy should render properly
+                    // once the buffer is alloc'd through this iOS-compatible
+                    // path.
+                    //
+                    // If the caller supplied init `bytes`, memcpy them into
+                    // the new buffer's CPU contents. Invoke their deallocator
+                    // immediately since we no longer need the original
+                    // pointer.
+                    static int redirect_log = 0;
+                    if (redirect_log++ < 8) {
                         fprintf(stderr,
-                            "#### AGXBuffer init-bytes SKIP-PINNED (scanout intent): "
-                            "self=%p len=%lu pin=%#llx -> returning nil "
-                            "(PrepareForUse tolerate-nil handles downstream)\n",
-                            self, (unsigned long)length,
-                            (unsigned long long)pinnedGPUAddress);
+                            "#### AGXBuffer init-bytes REDIRECT-iOS-NATIVE: "
+                            "self=%p dev=%p len=%lu opt=%#lx pin=%#llx "
+                            "-> [dev newBufferWithLength:%lu options:%#lx]\n",
+                            self, dev, (unsigned long)length,
+                            (unsigned long)opt,
+                            (unsigned long long)pinnedGPUAddress,
+                            (unsigned long)length, (unsigned long)opt);
                     }
-                    return nil;
+                    id<MTLBuffer> ios_buf = [(id<MTLDevice>)dev
+                        newBufferWithLength:length options:opt];
+                    if (ios_buf) {
+                        if (bytes && length > 0) {
+                            void *contents = [ios_buf contents];
+                            if (contents) memcpy(contents, bytes, length);
+                        }
+                        if (deallocator) {
+                            // Caller expects bytes to be freed eventually.
+                            // We've copied; release them now.
+                            deallocator(bytes, length);
+                        }
+                        if (redirect_log < 12) {
+                            fprintf(stderr,
+                                "#### AGXBuffer init-bytes REDIRECT-iOS-NATIVE result: "
+                                "%p class=%s len=%lu gpuAddr=%#llx\n",
+                                (void *)ios_buf,
+                                class_getName([(id)ios_buf class]),
+                                (unsigned long)[ios_buf length],
+                                [ios_buf respondsToSelector:@selector(gpuAddress)]
+                                    ? (unsigned long long)[(id)ios_buf gpuAddress]
+                                    : 0ULL);
+                        }
+                    }
+                    return (id)ios_buf;
                 }
                 if (bytes && length > 0 && malloc_size(bytes) > 0) {
                     vm_address_t mirrored = 0;
