@@ -1190,6 +1190,39 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             }
         });
+
+        // 2026-06-19 — MallocScribble surfaced the real upstream bug:
+        // -[AGXTexture initWithDevice:desc:isSuballocDisabled:] at static
+        // 0x1e5a5b7d4 calls `_objc_msgSend$validateWithDevice:` on the
+        // MTLTextureDescriptor; descriptor doesn't implement that selector
+        // in chroot → forwarding raises doesNotRecognizeSelector exception
+        // → uncaught → SIGTRAP. Add the selector as a class method
+        // returning YES on MTLTextureDescriptor (and any subclass), so the
+        // AGXTexture init's cbz w0 check (at 0x1e5a5b7d8) passes and the
+        // init proceeds.
+        if (getenv("MACWS_AGX_NATIVE")) {
+            Class kDesc = objc_getClass("MTLTextureDescriptor");
+            if (kDesc) {
+                SEL valSel = sel_registerName("validateWithDevice:");
+                if (!class_getInstanceMethod(kDesc, valSel)) {
+                    IMP validStub = imp_implementationWithBlock(^BOOL(id self, id device) {
+                        (void)self; (void)device;
+                        return YES;
+                    });
+                    BOOL ok = class_addMethod(kDesc, valSel,
+                                              validStub, "c@:@");
+                    fprintf(stderr,
+                        "#### MACWS_AGX_NATIVE class_addMethod(MTLTextureDescriptor, validateWithDevice:) = %d\n",
+                        ok);
+                } else {
+                    fprintf(stderr,
+                        "#### MACWS_AGX_NATIVE MTLTextureDescriptor already responds to validateWithDevice:\n");
+                }
+            } else {
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE objc_getClass(MTLTextureDescriptor) = nil\n");
+            }
+        }
     } else if(!strncmp(info.dli_fname, QuartzCorePath, strlen(QuartzCorePath))) {
         // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
         // content gets a GPU surface instead of a CPU bitmap (see OFF_ comment above).
