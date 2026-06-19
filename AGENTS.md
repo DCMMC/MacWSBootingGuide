@@ -55,6 +55,161 @@ catalogue + the diagnostic technique (`MACWS_AGX_CRASH_DIAG` register +
 memory dump in `mac_hooks.m`) that turns these into one-cycle
 root-cause solves.
 
+## Evidence Discipline (load-bearing rule — read second)
+
+**Hard rule: every claim about why something is broken must be backed by
+either (a) decompiled code from the actual binary involved (otool /
+capstone / lldb disasm of the specific function), or (b) a runtime log
+line / lldb register dump / crash report excerpt that you copied verbatim
+from the running system.**
+
+No hypotheses promoted to fact without one of those two artifacts.
+Examples of statements that fail this rule:
+
+- "The kernel rejects because of signature check" — without showing the
+  disasm of the rejection point.
+- "asyncReference must be non-NULL" — without dumping it from a kernel
+  externalMethod breakpoint.
+- "iOS sends a different args layout" — without disasming both
+  iOS and macOS userland's call sites.
+
+When a claim IS RE-backed, label it: `RE-confirmed via <file>+<offset>`
+or `runtime-confirmed via <log/crash filename>`. When it's a guess,
+label it THEORY and add what evidence would confirm/refute it.
+
+This rule exists because we've burned multiple sessions chasing theories
+that felt obvious but were wrong. Two recent examples that the discipline
+caught:
+
+1. "macOS binary lacks signing identity for private GPU operations"
+   hypothesis — disproven by capstone disasm of
+   `IOGPUDeviceUserClient::externalMethod` at `0xfffffe0009eed344`
+   showing the kernel does NOT check signing or entitlement strings in
+   that path.
+
+2. Then we hypothesized "the rejection is from a per-user-client
+   `device->0x108` size limit that gets zero'd for unprivileged opener".
+   Also disproven: `misc/agx_iogpu_probe.c` (iOS-native KRW reader) opened
+   an AGXAccelerator UC and walked
+   `task_get_ipc_port_kobject → UC+0x120 → IOGPUDevice+0x48 → IOGPU`
+   to find `IOGPU+0x108 = 0x139ce0000` (5.13 GB cap) AND that IOGPU is a
+   real singleton (same kernel address across multiple matching paths,
+   so chroot sees same value). The size check trivially passes. UC+0x103
+   = 0 → not the saaramar restricted-method-table mechanism either.
+   The actual reject site that returns `0xe00002c2 = kIOReturnNoBandwidth`
+   is elsewhere in `IOGPUFamily` and is still being RE'd.
+
+See `[[cross-image-objc-class-register-and-ioconnect-heap-blocker]]` for
+the corrected attribution (the "LATE UPDATE" section at the top).
+
+## Current Goal & Progress (AGX-Native, NO Sim Path)
+
+**Goal:** Run macOS WindowServer in chroot on jailbroken iPad13,6 (iOS
+16.3 arm64) using **real iOS AGX kernel driver only**
+(`MACWS_AGX_NATIVE=1`). Verify via VNC screen capture that **GlassDemo
+renders fully** — title bar, controls, AND **blur**
+(`NSVisualEffectView` vibrancy / backdrop blur) — none of which work
+fully under the MTLSim path.
+
+### Why NOT the SIM path
+
+Confirmed gaps (memory: `backdrop-blur-tile-pipeline-blocked`):
+
+- MTLSimDriver's `newRenderPipelineStateWithTileDescriptor` is a
+  `MTLReportFailure` stub → tile pipelines unavailable.
+- QuartzCore's `BlurState::tile_downsample` returns no output →
+  NSVisualEffectView vibrancy renders pure black.
+- Complex GPU-heavy apps (Firefox WebRender / Chrome) hit the same
+  modern-Metal-feature gaps and can't render.
+
+### What works under AGX-native today (runtime-confirmed)
+
+- Cross-image ObjC class preregistration (`_dyld_image_count` walk +
+  `objc_readClassPair` per image with `__objc_classlist`) — AGXBuffer
+  + 51 other AGXMetal13_3 classes register. Log:
+  `PREREGISTER image[308] AGXMetal13_3: 52/52 realized`.
+- `-[AGXG13GFamilyDevice setupCompiler:]` runs to completion. Log:
+  `MACWS_AGX_NATIVE setupCompiler:0x30010 fired (Device=…)`.
+- `setupDeferred` dispatch_once block reaches `Mempool::grow` and
+  iterates the lambda 6+ times per session without crashing.
+- 4-arg `-[IOGPUMetalResource initWithDevice:options:args:argsSize:]`
+  swizzle catches the BL site lldb-traced inside
+  `AGX::Heap<true>::allocateImpl` block_invoke at `0x1e5a4d628`.
+- `macwsallocd` (iOS-native launchd daemon,
+  `com.macwsguide.alloc`) allocates 256 MB IOSurfaces and ships
+  mach-ports to chroot. ~10-15 IOSurface round-trips per WS start.
+- Synthesized AGXG13GFamilyBuffer via bare-alloc + associated-object
+  tagging + class-wide swizzles on `-resourceSize` / `-length` /
+  `-contents` / `-virtualAddress` / `-gpuAddress` / `-device` returns
+  the IOSurface-derived values when tagged.
+- `ivar+0x30 = calloc(16K)` per buf satisfies Mempool::grow's
+  freelist init without libmalloc heap corruption (using IOSurface
+  base there triggers `free_list_checksum_botch` on dealloc — RE +
+  runtime confirmed).
+- AGXIOC sels 0x0, 0x2, 0x4, 0x5, 0x21, 0x25, 0x100, 0x102, 0x107 all
+  succeed against the chroot's user-client (these are read/query/info
+  methods — they don't need the privileged init state).
+
+### Structural blockers (RE-confirmed, NOT theories)
+
+| # | Failing op | RE evidence | Root cause |
+|---|---|---|---|
+| 1 | `IOConnectCallMethod sel=0xa→0x9` (heap create) | kernel returns `0xe00002c2 = kIOReturnNoBandwidth`. The two reject sites inside `IOGPUDevice::new_resource` (`+0x44` checking `(IOGPU+0x224)+0x50 vs *outCnt`, and `+0xff` checking `args+0x40 vs (3*IOGPU+0x108/4)`) BOTH pass for our calls: `misc/agx_iogpu_probe` runtime measured `IOGPU+0x108 = 0x139ce0000` (5.13 GB) and `IOGPU+0x224 = 0` against the singleton at `0xfffffe690002c000` (same kernel object for chroot and iOS-native). | **Reject site is elsewhere in `IOGPUFamily`** — RE in progress to find which path returns 0xe00002c2 (candidates: per-task wire/pin limit, IOMemoryDescriptor::prepare on the backing memory, or a higher-up dispatch check). `MACWS_AGXIOC_FUZZ=1` confirms NO args-shape perturbation succeeds → the gate doesn't look at args at all. |
+| 2 | `IOConnectCallMethod sel=0x7→0x6` / `sel=0x8→0x7` (queue create) | `inSC=1032` hex dump captured via libmachook `IOConnectCallMethod_new` one-shot dumper. macOS userland packs process path string at offset 0; iOS-native `_IOGPUCommandQueueCreateWithQoS+0xaf0` (otool disasm of `~/Downloads/agx-re/ios/IOGPU`) zeros the buffer then writes QoS at `+0x400` / priority at `+0x404`. Patched IOConnect translator to substitute iOS-shape buffer → kernel STILL returns `0xe00002c2`. | Same UC-init root cause as #1. |
+| 3 | Borrow io_connect_t from iOS-native helper via XPC | Standalone borrow test runtime log (no chroot WS in loop): macwsallocd opens UC OK → `set_mach_send completed` → `about to send_message` → SIGKILL'd. Crash report `EXC_GUARD ILLEGAL_MOVE on mach port`. | `io_connect_t` mach ports are first-class GUARDED by IOKit at the kernel-port level. `mach_msg` transfer of the send-right trips the kernel guard. **Structural — the user-client port cannot cross task boundaries.** |
+| 4 | SkyLight compositor needs non-nil queue | `CAWSBackend.mm:5130 — Assertion failed: (compositor != nullptr)`. BT chain via lldb: `setupDeferred → newCommandQueue` (queue alloc'd via sel=0x7/0x8 which return nil). | Downstream of #2. |
+| 5 | Compositor missing means no rendering | VNC framebuffer all-zero PNG (`md5` confirmed identical across multiple grabs from `vncdo capture`); chroot `screencapture -x` also all-zero. WS process can stay alive (no crash log) but produces no display output. | Downstream of #4. |
+
+### What this rules out (saved from repeating)
+
+| Approach | Status | Why ruled out |
+|---|---|---|
+| Add more entitlements | ❌ Disproved | backboardd (works) has only 2 GPU-private entitlements: `allow-explicit-graphics-priority`, `graphics-restart-no-kill`. Our `entitlements.plist` already has both. |
+| Re-sign binary with iOS team-id | ❌ Disproved by RE | `IOGPUDeviceUserClient::externalMethod` at `0xfffffe0009eed344` (capstone) has no entitlement-string check or task-credential check in the dispatch path. |
+| `IOServiceOpen` type variations | ❌ Disproved | Tested `type=0`, `type=2`, `type=1` (mask of `0x100001`), and `0x100001` raw — all give same broken UC. `MACWS_AGX_FORCE_TYPE` env var exists for further fuzzing. |
+| `IOConnectCallMethod` args shape patch | ❌ Disproved | `MACWS_AGXIOC_FUZZ=1` perturbed every reachable byte; all 10 perturbations fail same code. |
+| Borrow opened io_connect_t from helper | ❌ Disproved this session | EXC_GUARD ILLEGAL_MOVE; see blocker #3. |
+| Synth buffer via `pinnedGPULocation:` in chroot | ❌ Disproved | `pinnedGPULocation:` also routes through sel=0xa internally → same kernel rejection. Verified: pin5 call hangs the chroot thread. |
+
+### Only remaining viable path (NOT implemented; substantial work)
+
+**Full Metal proxy**: chroot serializes every `MTL*` operation
+(`setBuffer/setTexture/setRenderPipelineState/draw…/blit*/commit`) →
+XPC to a new helper running in iOS-native context (sees real AGX) →
+helper replays on a real iOS `MTLCommandQueue` → returns IOSurfaces
+back.
+
+Open architectural risks (must be considered before committing):
+
+- **Performance** — typical SkyLight frame = 500-2000 encoder calls.
+  At ~10-50 µs/XPC roundtrip, 60 fps budget (16.7 ms) is overrun 1-4×.
+  Static scenes likely OK; interactive/scrolling not.
+- **`MTLDrawable` / `CAMetalLayer` cross-process** — display
+  submission may not be proxyable; if not, no on-screen pixels.
+- **`MTLLibrary` / pipeline state per-device binding** — chroot-built
+  libraries won't directly run in helper's device; may require
+  AIR-source re-ship + re-compile, slow.
+- The architecture is **NOT** strictly "AGX native from chroot" —
+  chroot itself never directly touches AGX. It's an iOS-native AGX
+  execution bridge. Same shape as MTLSim path, just with a self-built
+  proxy instead of Apple's MTLSim.
+
+### Recovery: one-click stop of all chroot services
+
+When CPU/load gets stuck due to a crash loop, build-helper zombies, or
+orphan debug tools, **don't keep restarting WS** — that just keeps the
+loop alive. Run the project's recovery script:
+
+```bash
+sudo bash /var/jb/var/mobile/MacWSBootingGuide/misc/cleanup_all.sh
+```
+
+It stops the GUI stack, unloads all `com.macwsguide.*` launchd jobs,
+kills WindowServer / launchservicesd / OSXvnc-server / macwsallocd /
+autosignd / launchdchrootexec / orphan oslog / tail / find_crash from
+debug sessions, then prints the final state. Bounds damage from a
+runaway loop to ~10 seconds of high CPU.
+
 ## Build
 
 This project uses [Theos](https://theos.dev).
@@ -378,6 +533,79 @@ export DYLD_INSERT_LIBRARIES=/usr/local/lib/libmachook.dylib
 
 ---
 
+## AGX-Native Environment Variables (libmachook + WindowServer plist)
+
+These are read by `libmachook` via `getenv()` at image-load time. The
+production switches live in `layout/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist`
+under `<key>EnvironmentVariables</key>`. After editing the plist, **unload + load** the
+job — `launchctl kickstart -k` does NOT refresh env.
+
+```bash
+sudo launchctl unload /var/jb/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist
+sudo launchctl load   /var/jb/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist
+```
+
+### Currently shipped in WindowServer plist (2026-06-19)
+
+| Var | Value | Purpose | Status |
+|---|---|---|---|
+| `CA_VSYNC_OFF` | `1` | CoreAnimation skips vblank wait — required, IOMFBServer's CADisplay handoff doesn't reach chroot | always-on |
+| `MACWS_AGX_NATIVE` | `1` | Master gate for AGX-native code path (vs. fallback MTLSim path). Disables the legacy `getenv("MACWS_KEEP_FORCE_ACCEL")` shim that returns the simulator MTLDevice | always-on for goal |
+| `MACWS_AGX_REGISTER_CLASSES` | `1` | Walks `_dyld_image_count()` per loaded image, runs `objc_readClassPair` on every `__objc_classlist` entry. Required because Metal eager-dlopens AGXMetal13_3 before `_dyld_objc_notify_register`, so `objc_getClass("AGXBuffer") = 0x0` without this | always-on for goal |
+| `MACWS_PIN_FALLBACK` | `1` | Installs the `setupCompiler`-time AGXBuffer 4-arg initFull swizzle that returns an IOSurface-backed buffer when AGXIOC sel=0x9 ResCreate fails. RE-confirmed only fires from `setupCompiler:` path; the cascade-blocker `Mempool::grow` calls `IOGPUResourceCreate` directly (no ObjC hook can intercept) | always-on for goal |
+
+### Disabled / removed (RE- or runtime-disproved)
+
+| Var | Why removed | Evidence |
+|---|---|---|
+| `MACWS_AGX_BORROW_CONN` | Tried to XPC-borrow `io_connect_t` from `macwsallocd` so chroot WS could reuse iOS-side-opened AGX UC | RE-disproved: `xpc_dictionary_set_mach_send(reply, "connect", conn)` followed by `xpc_connection_send_message` triggers `EXC_GUARD ILLEGAL_MOVE` on the io_connect_t mach port — IOKit guards io_connect_t at the kernel-port level, structurally cannot cross processes |
+| `MACWS_AGX_FORCE_TYPE` | Override the `type` argument to `IOServiceOpen` (0/1/2 etc.) to coerce a privileged AGX user-client variant | runtime-disproved: type=0 and type=2 hang `IOServiceOpen` (no return), type=1 returns a degraded UC that still rejects sel=0x9 with `0xe00002c2`. Masking `0x100001`→`1` is the only value that doesn't hang and is kept in `IOServiceOpen_new` as the default |
+| `MACWS_AGXIOC_FUZZ` | Perturb args+0x08..+0x60 by 1-byte/4-byte/8-byte deltas on sel=0x9 failure | runtime-disproved as a fix: ALL 10 perturbations across +0x08..+0x60 fail SAME code `0xe00002c2`. Kernel rejection isn't args-shape — and isn't `IOGPU+0x108` either (RE-measured 5.13 GB, see `misc/agx_iogpu_probe.c`). Real reject site still being RE'd |
+| `MACWS_SUSPEND_AT_EXEC` | `SIGSTOP` self right after libmachook ctor to allow lldb attach before any ObjC class load | debug-only, never ship to plist — leaves WS frozen across respring |
+
+### Diagnostic / opt-in (set in shell, not plist)
+
+| Var | Effect | When to use |
+|---|---|---|
+| `MACWS_AGX_CRASH_DIAG` | Installs a SIGSEGV handler that dumps x0–x29, sp, faulting PC, the 64 bytes around PC, and 64-byte memory at x19 + at `*(x19+0x28)`. **Critical** for AGX-native crashes where the C++ frame is mid-vector-op and lldb can't unwind | every AGX-native debug session — sole reason the Mempool::grow root cause was findable |
+| `MACWS_IOSURF_TRACE` | Logs every `IOSurfaceCreate` call + size + IOSurfaceID | when chasing cross-process IOSurface bridge issues |
+| `MACWS_ABORT_TRACE` | Installs a hook that prints stack frames on `abort()` / `__assert_rtn` before the program dies | tracing where assert hits came from |
+| `MACWS_HID_BYPASS` | Skip the bulk hook of 15 IOHIDEventSystem* APIs (kept narrow because bulk-hooking caused silent PAC-dispatch crashes) | leave OFF in production; see [[iomfbserver-bus-adraln-fix]] |
+| `MACWS_AGC_VERIFY_BYPASS` | Skip `verifyLoweredIR` in AGXCompilerCore | out-of-process MTLCompilerService runs the compile, so this is INERT in chroot — see [[agx-renamer-out-of-process-confirmed]] |
+| `MACWS_AGC_FASTMATH_HOOK` | Renamer patch for `agx.air.fract.v3f16.fast` | superseded by `MTLCompilerBypassOSCheck` tweak (also out-of-process) |
+| `MACWS_AGX_RENAMER_PATCH` | Alternative renamer patch entry-point | superseded — see above |
+| `MACWS_AGX_OBJC_AUTDA_PATCH` | Patch libobjc `autda` → `xpacd` to survive pre-PAC-signed ObjC ivars (on-device lld arm64e fixup ABI) | runtime-confirmed needed only on certain re-signing flows; keep OFF unless diagnosing `autda` traps |
+| `MACWS_AGX_SKIP_BIND_UPDATE` | NOP `MTLBindings::update_for_render_pass` BL inside AGX render-pass init (was a band-aid for setupDeferred crashes) | now implicit when `MACWS_AGX_NATIVE=1`; opt-out via `MACWS_AGX_KEEP_BIND_UPDATE=1` if testing without the skip |
+| `MACWS_AGX_TEX_BYPASS_GATE` | Bypass the `validateBufferTextureWithSize:` magic-footer check (`0x99b7d4010ce3ead3 / 0x92482f97c0394fd0`) | superseded by always-on patch in `objc_hooks.c`; A/B knob |
+| `MACWS_KEEP_VALIDATE_ALWAYS` | Restore the always-validate path | opposite of above — only when intentionally A/B'ing |
+| `MACWS_KEEP_ASSERT_BYPASS` | Keep the blanket `__assert_rtn → log+return` patch even after fixes land | LAZY — see [[feedback-no-lazy-nop-ret-bypass]]. Only honor with explicit user instruction |
+| `MACWS_KEEP_RENDER_UPDATE_CBZ` | Keep render_update CBZ-bypass | LAZY — same as above |
+| `MACWS_GOT_SKIP_AUTH` | Skip authenticated-GOT slot patching during chained-fixup walker | diagnostic only — used while bootstrapping the chained-fixups walker; should be OFF in prod |
+| `MACWS_GOT_RAW_AUTH` | Write raw (unsigned) pointer into auth-GOT (no `ptrauth_sign_unauthenticated`) | diagnostic only |
+
+### Outside libmachook
+
+| File / key | Value | Purpose |
+|---|---|---|
+| `layout/Library/LaunchDaemons/com.macwsguide.alloc.plist` `KeepAlive` | `False` | Prevents respawn loop when handler crashes — see [[ws-crash-loop-stop-immediately]] |
+| `layout/Library/LaunchDaemons/com.macwsguide.alloc.plist` `ThrottleInterval` | `60` | Lower bound on respawn cadence even if launchd-side flag flips |
+| `layout/Library/LaunchDaemons/com.macwsguide.alloc.plist` `RunAtLoad` | `True` | macwsallocd should be up before WS so the XPC service answer for `borrow-agx-conn` / `alloc-iosurf` is already listening |
+
+### How to verify a var is active in the running WS
+
+```bash
+# Find WS PID (chroot binary, NOT iOS WindowServer if any):
+PID=$(pgrep -f WindowServer | xargs -I{} sh -c 'ps -p {} -o command= | grep -q chroot && echo {}')
+
+# Dump its env (kernel-stored; sudo required for foreign-user proc):
+sudo ps -E -p "$PID" | tr ' ' '\n' | grep MACWS_
+```
+
+If a var is missing, the plist edit did not take effect (likely `launchctl
+unload + load` was skipped, or the file inside the deb is being shadowed).
+
+---
+
 ## Skills: Common Operations
 
 ### Skill: Sign and Trustcache a Single Binary
@@ -679,3 +907,265 @@ Key lldb commands for diagnosing hangs:
 | arm64e chroot process SIGKILL'd at load (`KILL - CODESIGNING / Invalid Page`); backtrace `dyld4::...forEachInsertedDylib → mapFileReadOnly → hasMachOMagic()`; arm64 unaffected | **`cp -f` over the rootfs libmachook reuses the SAME inode** → the chroot kernel's cached code-signature blob for that vnode goes stale, so the new file's pages validate against the OLD hashes → AMFI Invalid Page. File/sig/trustcache all look correct (page hashes are self-consistent); the kernel just isn't using this blob. arm64 escapes only because WindowServer stays mapped from one clean load. Spans reboots (every rebuild re-`cp -f`'s in place). | **`rm -f` the dest before `cp`** so the refreshed dylib gets a NEW inode (no stale cached blob). Done in `layout/usr/macOS/bin/postinst.sh`. Verified: rm+cp → `run_bash.sh -c "echo hi"` → exit 0. |
 
 **Note:** `jbctl trustcache info` REQUIRES root on this build (despite the "no sudo" note earlier in this file) — without sudo it errors out, and grepping its (empty) output yields false "not trusted" results.
+
+---
+
+## On-Device Debug Workflows
+
+### Skill: USB SSH via `iproxy` (port 22222 → device 22)
+
+WiFi SSH (`ssh -p 2222 root@192.168.5.8`) is the comfortable path but fails
+when the device WiFi flaps under heavy iOS load (high load average kills WiFi
+keepalive). USB SSH stays up regardless of CPU pressure.
+
+```bash
+# On macOS host, start iproxy in a background-friendly mode:
+brew install libimobiledevice   # provides `iproxy`
+iproxy 22222 22 &               # forwards localhost:22222 → device:22
+
+# Then SSH stays on localhost — survives WiFi outages:
+ssh -p 22222 root@127.0.0.1
+```
+
+Add to `~/.ssh/config` for convenience:
+```
+Host ipad-usb
+    HostName 127.0.0.1
+    Port 22222
+    User root
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+```
+
+Then: `ssh ipad-usb 'uptime'`.
+
+**Practical rule**: any session involving lldb (long-lived TCP), `oslog -f`
+streaming, or repeated builds — use USB SSH. The cost of a dropped TCP is
+re-attaching lldb from scratch, which loses all breakpoint state.
+
+### Skill: lldb on iOS via tmux (`misc/ios_lldb_tmux.sh`)
+
+The iOS Procursus lldb has **no python scripting**, **no expression evaluator**,
+and `lldb-server` crashes on attach. Only `debugserver` works on the iOS side
+for remote lldb-from-mac, but that path needs every breakpoint round-trip to
+ping the dyld shared cache on the host (slow). For interactive RE we use
+**iOS-local lldb driven via tmux** — symbol lookups stay on-device and we
+never restart the lldb session.
+
+```bash
+# Attach (creates a persistent tmux session named "ioslldb"):
+bash misc/ios_lldb_tmux.sh attach 127.0.0.1 22222 WindowServer
+
+# Send one lldb command and read the reply:
+bash misc/ios_lldb_tmux.sh cmd 'register read x0 x21'
+bash misc/ios_lldb_tmux.sh cmd 'br set -n IOConnectCallMethod -c "$x1 == 0xa"'
+bash misc/ios_lldb_tmux.sh cmd 'continue'
+
+# Multi-line (use only -o per BP — iOS lldb has no script):
+bash misc/ios_lldb_tmux.sh cmd-multi <<'EOF'
+breakpoint command add 1
+register read x0 x1 x2 x3
+continue
+DONE
+EOF
+
+# Dump latest pane output:
+bash misc/ios_lldb_tmux.sh capture 400
+
+# Detach + kill session cleanly:
+bash misc/ios_lldb_tmux.sh stop
+```
+
+**Quirks discovered (runtime-verified):**
+
+| Quirk | Workaround |
+|---|---|
+| `br set -n foo -c "selector == 10"` fails — iOS lldb cannot parse arg names | Use registers: `br set -n IOConnectCallMethod -c '$x1 == 0xa'` |
+| `memory read --size 8 --count 8` chooses default format incorrectly under some lldb builds → garbled output | Always pass `--format x` explicitly |
+| `script` / `script-language` / `expression` all unavailable | Pre-compute the value on host, paste literal. For loops, use `br command add -o cmd1 -o cmd2 -o continue` (single `-o` per line) |
+| tmux under sudo errors `LC_CTYPE: cannot set locale` and `/tmp/tmux-501` permission denied | Wrap: `sudo env LC_CTYPE=UTF-8 TMUX_TMPDIR=/var/tmp tmux ...` |
+| Attaching to a process that already has TXs state can hang the attach | `process detach` from any prior lldb first; if no lldb, `kill -CONT $PID` then re-attach |
+| `image list` returns the chroot image set — NOT iOS dyld_cache. Symbols there map to chroot paths | Cross-binary lookups must run separately against `~/Downloads/agx-re/` slid binaries with capstone |
+
+**`MACWS_SUSPEND_AT_EXEC=1` pattern** for early-startup RE: makes libmachook
+`raise(SIGSTOP)` in its `__attribute__((constructor))` so the process is
+frozen BEFORE any framework init. Then attach iOS lldb, set breakpoints in
+AGXMetal13_3 / SkyLight / IOSurface, then `process signal SIGCONT`. Without
+this, the crash happens during one of the deep-load initializers and lldb
+catches it after the fact.
+
+```bash
+# In WS plist EnvironmentVariables (TEMPORARY — never ship):
+<key>MACWS_SUSPEND_AT_EXEC</key>
+<string>1</string>
+```
+
+### Skill: `FAST=1 bash build_on_ios.sh` — what it skips, what trips it
+
+`build_on_ios.sh` defaults to a full clean build (~20s on iPad13,6). Add
+`FAST=1` (or `--fast`) and it skips `make clean` + skips `make package` +
+just `cp`s the rebuilt `libmachook.{arm64,arm64e}.dylib` to
+`/var/mnt/rootfs/usr/local/lib/` and runs the libmachook-only postinst step.
+Cuts to ~3s.
+
+**The guardrail (auto-fallback to full)**:
+```
+FAST=1 → check mtime of MTLCompilerBypassOSCheck / launchdchrootexec /
+        autosignd / MTLSimDriverHost / launchservicesd / mountdevfs /
+        Makefile / control / layout against /var/jb/usr/lib/TweakInject/
+        MTLCompilerBypassOSCheck.dylib — if ANY source newer → FAST=0
+```
+
+This is critical: `FAST` only ships libmachook. Any edit to:
+- `MTLCompilerBypassOSCheck/Tweak.x` — out-of-process Substrate tweak hooks won't refresh
+- `launchdchrootexec/*` — chroot loader won't refresh
+- `autosignd/*` — re-sign daemon won't refresh
+- `MTLSimDriverHost/*` — XPC host won't refresh
+- `layout/usr/macOS/LaunchDaemons/*.plist` — env vars and ProgramArgs won't refresh
+- `layout/Library/LaunchDaemons/com.macwsguide.*.plist` — iOS-side daemons won't refresh
+- `layout/usr/macOS/bin/*.sh` — helper scripts won't refresh
+
+... requires the full path (deb build + `dpkg -i`). The guardrail forces it.
+
+**Common FAST trip case**:
+```
+==> FAST guardrail tripped: source files newer than last dpkg-installed tweak:
+      layout/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist
+==> Forcing full build (FAST only ships libmachook; deb-installed bits would stay stale)
+```
+This is correct behavior — you edited the plist; `cp libmachook` would have
+hidden the change.
+
+**Pitfall — `git stash` + `git checkout -- file` interaction**: stash only
+saves PRE-stash uncommitted changes. If you `git stash`, then
+`git checkout commit -- some_file`, that creates a NEW modification not in
+the stash. `git stash pop` will NOT restore the original. Always
+`git status` after stash operations.
+
+**Pitfall — running `build_on_ios.sh` without `THEOS`**: SSH does not
+inherit `THEOS` from the device's interactive shell. Always:
+```bash
+ssh -p 22222 root@127.0.0.1 \
+  'THEOS=/var/jb/var/mobile/theos bash /var/jb/var/mobile/MacWSBootingGuide/misc/build_on_ios.sh'
+```
+without that prefix you'll see `Theos not found` and the build silently
+falls back to system make rules.
+
+**Pitfall — `cp -f` over rootfs libmachook reuses the same inode** — already
+fixed in `layout/usr/macOS/bin/postinst.sh` (it `rm -f`s the dest first),
+but if you write a side-channel that bypasses postinst (e.g. `scp` directly
+to `/var/mnt/rootfs/usr/local/lib/libmachook.dylib`) you'll hit the AMFI
+Invalid Page bug. See the Known arm64e Issues table above.
+
+### Skill: AGXIOC selector argument FUZZ (`MACWS_AGXIOC_FUZZ=1`)
+
+When kernel rejects an `IOConnectCallMethod` with a structurally-correct
+error code (`0xe00002c2 = kIOReturnNotPermitted`), the question is whether
+the rejection is **input-shape** (some args field is invalid for this
+selector) or **structural** (the UC doesn't have permission regardless of
+input).
+
+The fuzz path in `mac_hooks.m` perturbs args at +0x08, +0x10, +0x18, ...,
++0x60 by 1-byte / 4-byte / 8-byte deltas around the failing call and re-runs
+each variant. The expected outcomes:
+
+| Result | Interpretation |
+|---|---|
+| One or two perturbations succeed (return 0) | Input-shape — narrow on which field controls the gate |
+| **ALL** perturbations fail same error code | Structural — kernel doesn't look at args. (Previously attributed to `device->0x108==0` per-UC field — DISPROVEN; see `misc/agx_iogpu_probe.c` measurement of `+0x108 = 5.13 GB`.) Real reject site still being RE'd |
+| Some perturbations cause `IOServiceClose`-on-error | The kernel is doing input validation, fuzz has triggered a different validation path |
+
+**RE-confirmed for sel=0x9 ResCreate**: all 10 perturbations fail `0xe00002c2`.
+Conclusion: structural — see [[agx-direct-path-all-three-paths-blocked]].
+
+### Skill: One-shot hex dump for large opaque struct inputs
+
+When an external method takes a 1032-byte `inputStruct` (sel=0x7/0x8 args)
+and we don't know the layout, dump it ONCE per (PID, selector) tuple:
+
+```c
+/* In IOConnectCallMethod_new, after the failing call: */
+static dispatch_once_t dumped[16];
+if (selector < 16) {
+    dispatch_once(&dumped[selector], ^{
+        /* Head: first 256 bytes, hex+ascii */
+        fprintf(stderr, "#### sel=%llu inputStructCnt=%zu head256:\n", selector, inputStructCnt);
+        hex_dump_chunk((const char *)inputStruct, MIN(inputStructCnt, 256));
+        /* Tail: scan past 256 for non-zero u64s */
+        const uint64_t *u = (const uint64_t *)inputStruct;
+        size_t cnt = inputStructCnt / 8;
+        for (size_t i = 32; i < cnt; ++i) {
+            if (u[i]) fprintf(stderr, "    +%#zx: %#llx\n", i * 8, u[i]);
+        }
+    });
+}
+```
+
+The "head + non-zero scan" pattern beats raw `xxd` because the typical iOS
+AGX inputStruct is `512 zero, qos@0x400, 504 more zero` — the head shows
+the live fields, the scan catches the late qos slot without spamming.
+
+### Skill: Cross-binary RE with capstone for arm64e kexts
+
+`otool -tV /System/Library/Extensions/AGXKextG13.kext/...` fails on arm64e
+kext bundles — the disassembler doesn't decode PAC-flavored auth-call
+opcodes. Use macholib + capstone instead:
+
+```python
+import macholib.MachO, capstone
+m = macholib.MachO.MachO('/path/to/AGXKextG13')
+hdr = m.headers[0]
+slide = next(s.vmaddr for c, _, s in hdr.commands if hasattr(s, 'segname') and s.segname == b'__TEXT')
+text  = next(c for c, _, _ in hdr.commands if hasattr(c, 'segname') and c.segname == b'__TEXT')
+# capstone CS_MODE_ARM disasm
+cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+cs.detail = True
+data = open('/path/to/AGXKextG13', 'rb').read()
+# disasm function at unslid 0xfffffe0009f03b4c → file offset
+off = 0xfffffe0009f03b4c - slide + text.fileoff
+for ins in cs.disasm(data[off:off+0x400], 0xfffffe0009f03b4c):
+    print(f"{ins.address:#x}  {ins.mnemonic:6s}  {ins.op_str}")
+```
+
+This is the only way to read `IOGPUDevice::new_resource +0xff` (the source
+of the `0xe00002c2` rejection) — BN MCP works too but the macholib+capstone
+loop fits inline into our usual evidence-discipline workflow.
+
+### Skill: Read AGX-native crash report stack with mid-vector PCs
+
+AGX-native crashes typically die mid-vector-op (PC inside a 256-byte
+`memmove` / `__bzero` / `memcpy` slot) and lldb cannot unwind across the
+fault. The `MACWS_AGX_CRASH_DIAG` SIGSEGV handler dumps register + memory
+snapshot — combine with the `.ips` crash report's framepointers:
+
+```bash
+# 1. Find the latest WindowServer crash:
+ls -t /private/var/mobile/Library/Logs/CrashReporter/WindowServer-*.ips | head -1
+
+# 2. Parse exception PC + key frames:
+python3 - "$1" <<'EOF'
+import json, sys
+data = json.loads(open(sys.argv[1]).readlines()[1])
+print('exception:', data['exception'])
+print('threadState x19=', hex(data['threads'][0]['threadState']['x'][19]['value']))
+print('threadState x0=',  hex(data['threads'][0]['threadState']['x'][0]['value']))
+print('pc=',              hex(data['threads'][0]['threadState']['pc']['value']))
+print('faulting frames:')
+for f in data['threads'][0]['frames'][:8]:
+    print(f"  {f.get('imageIndex','?'):3} +{f.get('imageOffset','?'):#x}  {f.get('symbol','?')}")
+print('images:')
+for f in data['threads'][0]['frames'][:8]:
+    idx = f.get('imageIndex')
+    if idx is None: continue
+    img = data['usedImages'][idx]
+    print(f"  {idx:3}  base={img['base']:#x}  {img['name']}")
+EOF
+
+# 3. With the chosen image's `base` and frame offset, look up the macOS
+#    AGXMetal13_3 (in ~/Downloads/agx-re/) symbol at base+offset using BN
+#    or capstone+addr2line.
+```
+
+The `MACWS_AGX_CRASH_DIAG` log line and the `.ips` exception are
+**redundant by design** — if one is missing or corrupted (oslog buffer
+overflow, crashreporter race), the other is usually intact.

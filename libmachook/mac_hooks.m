@@ -4094,16 +4094,52 @@ extern uint32_t macws_get_current_iosurface_id(void);
 static struct { uint64_t clientID, iosGID, size; } g_agxIdMap[128];
 static int g_agxIdMapCount;
 
+// 2026-06-19 — sel=0xa double-translation root cause:
+// `launchdchrootexec` DYLD_INSERTs BOTH `libmachook.dylib` (arm64e) and
+// `libmachook_arm64.dylib` (arm64). For arm64 chroot binaries (bash, our
+// test tools), macOS arm64e dyld actually loads BOTH dylibs side-by-side
+// (the comment in launchdchrootexec/main.m's "silently skips" is wrong:
+// the device's dyld loads both anyway). Both run their initializers, both
+// register DYLD_INTERPOSE tuples for IOConnectCallMethod. The result is
+// that EACH `IOConnectCallMethod_new` invocation is re-entered AGAIN by
+// the OTHER dylib's interpose. With per-dylib static `g_skip_translate`,
+// the inner re-entry sees a different variable address (proved by &g_skip
+// dump: outer 0x10090c9c0, inner 0x10087c5f0). The selector gets
+// translated TWICE — for sel=0xa: 0xa→0x9→0x8 (queue_finalize) — and the
+// kernel returns kIOReturnNoBandwidth (0xe00002c2). EVERY chroot
+// "sel=0xa fails" event traces back to this. Decisive fix: detect the
+// re-entry by inspecting the immediate caller via __builtin_return_address;
+// if the caller is inside ANY copy of libmachook, skip translation. Works
+// regardless of how many libmachook arch variants are loaded.
+#include <execinfo.h>
+static int caller_is_libmachook(void *ret) {
+    Dl_info di;
+    if (!dladdr(ret, &di) || !di.dli_fname) return 0;
+    const char *base = strrchr(di.dli_fname, '/');
+    base = base ? base + 1 : di.dli_fname;
+    return strncmp(base, "libmachook", 10) == 0;
+}
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
-    selector = IOConnectTranslateSelector(client, selector);
+    int skip = caller_is_libmachook(__builtin_return_address(0));
+    if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
-    // sel=0x9 (ResCreate): iOS kernel IOGPUDevice::new_resource @ <+76>
-    // does `cmp (this->0x48)->0x224 + 0x50, *outCnt; b.hi → BadArgument`.
-    // iOS userland IOGPUResourceCreate sets *outCnt = device->0x34 + 0x50.
-    // macOS WS sends *outCnt = 0x50. Bump matches what iOS userland
-    // sends (worked for sel=0x100 with 0x78 → 0x70 by similar logic).
-    if(IOConnectIsIOGPU(client) && selector == 0x9 && outStructCnt && *outStructCnt == 0x50) {
+    // sel=0x9 (ResCreate): WAS bumping outStructCnt 0x50 → 0x10000 here based
+    // on a misread of `IOGPUDevice::new_resource <+76>`. Standalone iOS-native
+    // test (misc/agx_iogpu_probe.c + misc/sel9_test_macos.c) proves the OPPOSITE:
+    //
+    //   outSC=0x50   → SUCCESS (kernel-correct, what macOS userland sends)
+    //   outSC=0x10000 → FAIL with kIOReturnNoBandwidth (0xe00002c2)
+    //
+    // The 0xe00002c2 reject IS the result of this bump. EVERY chroot sel=0xa
+    // failure in this codebase traces back to this single line. Removed. See
+    // [[cross-image-objc-class-register-and-ioconnect-heap-blocker]] LATE
+    // UPDATE for the runtime evidence.
+    //
+    // (Set MACWS_RESTORE_OUTBUMP=1 to revive for A/B testing.)
+    if(IOConnectIsIOGPU(client) && selector == 0x9 && outStructCnt && *outStructCnt == 0x50 &&
+       getenv("MACWS_RESTORE_OUTBUMP")) {
         *outStructCnt = 0x10000;
     }
     // sel=0x6 (iOS IOGPUDeviceCreateWithAPIProperty) and sel=0x7 (iOS
@@ -4178,14 +4214,26 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // Substitute the length-shaped args+0x48 as the size.
         if(agxType == 0 && bc != 0 && (bc & 0x80000000ULL)) {
             uint64_t len_field = *(const uint64_t *)(src + 0x48);
+            uint64_t va58 = *(const uint64_t *)(src + 0x58);
             // Only swap if the length looks reasonable (<= 2 GB) and the
             // VA-shaped field has the high bit.
             if (len_field > 0 && len_field < 0x80000000ULL) {
                 fprintf(stderr,
                     "#### AGXIOC sel=0x9 type=0 VA-shape detected: "
-                    "args+0x40=%#llx (bit31) → using args+0x48=%#llx as size\n",
-                    (unsigned long long)bc, (unsigned long long)len_field);
+                    "args+0x40=%#llx (bit31) → using args+0x48=%#llx as size, +0x58 %#llx → 0\n",
+                    (unsigned long long)bc, (unsigned long long)len_field,
+                    (unsigned long long)va58);
                 *(uint64_t *)(shadowbuf + 0x40) = len_field;
+                // SLCADisplay scanout: macOS leaves args+0x58 set to a tagged
+                // GPU-VA (e.g. 0x380888f00). On iOS the kernel reads this as
+                // a "pinned VA" request — a macOS-only fast path that doesn't
+                // exist on iOS → kIOReturnNoMemory (0xe00002be). Zero it so
+                // the kernel falls into the standard heap allocator (which
+                // chooses its own VA), same as the type=0x82 IOSurface fix
+                // a few blocks down. RE-runtime-confirmed: chroot WS WAS
+                // failing every SLCADisplay scanout heap with 0xe00002be even
+                // after the +0x40 swap; this companion zero is needed.
+                *(uint64_t *)(shadowbuf + 0x58) = 0;
                 agxHeapSz = len_field;
                 patched = 1;
             }
@@ -4451,14 +4499,16 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
 }
 IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
     uint32_t orig = selector;
-    selector = IOConnectTranslateSelector(client, selector);
+    if (!caller_is_libmachook(__builtin_return_address(0)))
+        selector = IOConnectTranslateSelector(client, selector);
     IOReturn r = IOConnectCallScalarMethod(client, selector, in, inCnt, out, outCnt);
-    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC Scalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
+    if(IOConnectIsIOGPU(client) && orig != selector) fprintf(stderr, "#### AGXIOC Scalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
     return r;
 }
 IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
-    selector = IOConnectTranslateSelector(client, selector);
+    if (!caller_is_libmachook(__builtin_return_address(0)))
+        selector = IOConnectTranslateSelector(client, selector);
     // AGX GPU device-info query (method 256 / setupImmediate): macOS 13.4 asks for
     // a 0x78 (120-byte) output struct, but the iOS 16.x GPU userclient hard-checks
     // the output size at 0x70 (112). The 8-byte mismatch -> kIOReturnBadArgument and
@@ -4469,7 +4519,7 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
         *outStructCnt = 0x70;
     }
     IOReturn r = IOConnectCallStructMethod(client, selector, inStruct, inStructCnt, outStruct, outStructCnt);
-    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    if(IOConnectIsIOGPU(client) && orig != selector) fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
     return r;
 }
 IOReturn IOConnectCallAsyncMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
