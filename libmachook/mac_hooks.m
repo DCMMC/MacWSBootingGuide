@@ -2229,43 +2229,19 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                     r, r ? "non-nil" : "nil — entering synth");
                             }
                             if (r) return r;
-                            // 2026-06-19 — lldb-instrumented diagnosis:
-                            //
-                            // For Texture super-init (pre_cls = Texture class),
-                            // orig (real -[IOGPUMetalResource initWithDevice:
-                            // options:args:argsSize:]) returns nil even AFTER
-                            // the sel=0x9 fix landed (chroot sel=0x9 succeeds).
-                            //
-                            // Returning our existing synth Buffer here gets
-                            // AGXTexture init through finalizeTextureCreation
-                            // (we no-op it) but the next downstream method on
-                            // the buffer (height, width, etc.) crashes.
-                            //
-                            // Returning nil makes AGXTexture init return nil
-                            // cleanly to SkyLight, which then trips
-                            // `_state_stack.empty() Unbalanced Composites`
-                            // assert in MetalContext.mm:411 (the
-                            // WSCompositeDestinationCreateWithMetalTexture
-                            // nil-tolerate hook only covers ONE call site).
-                            //
-                            // Real fix needs: either (a) make orig succeed for
-                            // texture path (RE why it returns nil — possibly
-                            // sub-resource-allocation step uses different args
-                            // shape that the kernel rejects), or (b) synth a
-                            // proper AGXG13GFamilyTexture-class instance with
-                            // working accessor swizzles for all MTLTexture
-                            // protocol methods. Both larger than this commit.
-                            //
-                            // CURRENT BEHAVIOR: dump args + return nil. WS will
-                            // assert downstream on Unbalanced Composites; this
-                            // is documented as a known follow-up.
+                            // 2026-06-19 — texture super-init that reaches here
+                            // means even AFTER the widened VA-shape patch the
+                            // orig still returned nil. Log args ONCE per process
+                            // for follow-up RE so we know if the patch missed a
+                            // case. Then continue into the existing synth path
+                            // (best-effort). This rarely fires now.
                             const char *pre_name = pre_cls ? class_getName(pre_cls) : "(nil)";
                             if (pre_name && strstr(pre_name, "Texture")) {
-                                static int log_once = 0;
-                                if (log_once++ < 4) {
+                                static int diag_once = 0;
+                                if (!diag_once++) {
                                     fprintf(stderr,
-                                        "#### CODEHEAP-SHIM DIAG texture-orig-nil pre_cls=%s "
-                                        "args@%p argsSize=%lu\n",
+                                        "#### CODEHEAP-SHIM POST-VAFIX texture-orig-nil pre_cls=%s "
+                                        "args@%p argsSize=%lu — VA-shape patch did NOT cover this case\n",
                                         pre_name, args, argsSize);
                                     if (args && argsSize <= 0x200) {
                                         const uint8_t *a = (const uint8_t *)args;
@@ -2278,7 +2254,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                         }
                                     }
                                 }
-                                return nil;
                             }
                             // PIN-FALLBACK path. Use pre_cls (captured before orig)
                             // — orig consumed self, so object_getClass(self) now
@@ -4310,15 +4285,29 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // backing: args+0x40 = 0x80888f00 (= 2.15 GB, bit 31 set) and
         // args+0x48 = 0x1fb8000 (~33 MB, looks like a real length).
         // Substitute the length-shaped args+0x48 as the size.
-        if(agxType == 0 && bc != 0 && (bc & 0x80000000ULL)) {
+        // Widened VA-shape detection (2026-06-19 part 2):
+        //
+        // Original condition `bc & 0x80000000` only caught SLCADisplay
+        // scanout backing where args+0x40 = 0x80888f00 (bit-31 set).
+        // For texture-backing requests SkyLight sends args+0x40 like
+        // 0x108198000 or 0x1081f4000 — values > 4 GB whose bit-31 is
+        // CLEAR (the high 33+ bits hold the VA). The previous condition
+        // missed these → unpatched VA reaches kernel → rejected as
+        // oversized IOByteCount → AGXTexture super-init returns nil →
+        // downstream SkyLight Unbalanced Composites assert.
+        //
+        // Widened condition: any args+0x40 > 0x40000000 (1 GB) is treated
+        // as a VA (no real allocation request is that big — IOGPU+0x108
+        // cap is ~5 GB total, individual allocations rarely exceed
+        // hundreds of MB). Use args+0x48 as the real length.
+        if(agxType == 0 && bc != 0 && bc > 0x40000000ULL) {
             uint64_t len_field = *(const uint64_t *)(src + 0x48);
             uint64_t va58 = *(const uint64_t *)(src + 0x58);
-            // Only swap if the length looks reasonable (<= 2 GB) and the
-            // VA-shaped field has the high bit.
+            // Only swap if the length looks reasonable (<= 2 GB).
             if (len_field > 0 && len_field < 0x80000000ULL) {
                 fprintf(stderr,
                     "#### AGXIOC sel=0x9 type=0 VA-shape detected: "
-                    "args+0x40=%#llx (bit31) → using args+0x48=%#llx as size, +0x58 %#llx → 0\n",
+                    "args+0x40=%#llx (>1GB) → using args+0x48=%#llx as size, +0x58 %#llx → 0\n",
                     (unsigned long long)bc, (unsigned long long)len_field,
                     (unsigned long long)va58);
                 *(uint64_t *)(shadowbuf + 0x40) = len_field;
