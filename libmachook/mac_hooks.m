@@ -817,6 +817,30 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
     return orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
 }
 
+// SkyLight `MetalContext::StartComposite(WSCompositeDestination*,
+// MTLLoadAction, MTLStoreAction)` at static 0x18522d358. Disasm
+// (otool of SkyLight) confirms two assert sites inside this function:
+//   line 589 — `state._target[0] && "Failed to obtain..."` (destination)
+//   line 918 — `state->_target[1] && "Failed to add memoryless..."`
+// Both protected by a tolerate-nil flag at MetalContext+0x1c0. The
+// existing PrepareForUse-tolerate-nil sets the flag for IOSurface
+// backing path, but THIS variant runs from CompositorMetal::composite
+// with a different MetalContext. Hook to set the flag on the actual
+// ctx (x0=self) being composited.
+typedef int (*StartComposite_WSCD_t)(void *self, void *dest,
+                                      unsigned long load_action,
+                                      unsigned long store_action);
+void *orig_skylight_start_composite_wscd_ref = NULL;
+int hooked_skylight_start_composite_wscd(void *self, void *dest,
+                                          unsigned long load_action,
+                                          unsigned long store_action) {
+    if (self) {
+        *((volatile uint8_t *)self + 0x1c0) = 1;
+    }
+    return ((StartComposite_WSCD_t)orig_skylight_start_composite_wscd_ref)(
+        self, dest, load_action, store_action);
+}
+
 // SkyLight `WSCompositeDestinationCreateWithMetalTexture(MTLTexture*, MetalContext*, ...)`
 // — asserts texture != nil at CompositeDestinationMetal.mm:165. BN disasm
 // (SkyLight at 0x18523053c):
@@ -883,6 +907,27 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
     } else {
         fprintf(stderr, "#### SkyLight StartCompositeForDisplayStream: symbol not found, skipped\n");
     }
+    // 2026-06-20 — MetalContext::StartComposite(WSCompositeDestination*,
+    // MTLLoadAction, MTLStoreAction) — hook installed below. Helper
+    // function definitions are at top-level (see above this function).
+    extern void *orig_skylight_start_composite_wscd_ref;
+    void *sym_sc_wscd = MSFindSymbol(sl,
+        "__ZN12MetalContext14StartCompositeEP22WSCompositeDestination13MTLLoadAction14MTLStoreAction");
+    if (sym_sc_wscd) {
+        extern int hooked_skylight_start_composite_wscd(void *, void *,
+                                                        unsigned long,
+                                                        unsigned long);
+        MSHookFunction(sym_sc_wscd,
+            (void *)hooked_skylight_start_composite_wscd,
+            (void **)&orig_skylight_start_composite_wscd_ref);
+        fprintf(stderr,
+            "#### SkyLight StartComposite(WSCD) tolerate-nil hook installed at %p\n",
+            sym_sc_wscd);
+    } else {
+        fprintf(stderr,
+            "#### SkyLight StartComposite(WSCD): symbol not found\n");
+    }
+
     void *sym3 = MSFindSymbol(sl, "_WSCompositeDestinationCreateWithMetalTexture");
     if (sym3) {
         MSHookFunction(sym3, (void *)hooked_skylight_wsccd_with_tex,

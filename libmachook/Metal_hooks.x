@@ -951,6 +951,27 @@ static void macws_sigabrt_trampoline(int sig) {
         // through the iosurface-init code path (avoids the missing
         // selector cascade in -[AGXTexture initWithDevice:desc:
         // isSuballocDisabled:]).
+        //
+        // EXCEPTION: memoryless textures (storageMode = 3). SkyLight's
+        // AddMemorylessTarget at MetalContext.mm:918 asserts that the
+        // returned texture is a memoryless target; IOSurface-backed
+        // textures have real memory, so the assert fails. For memoryless
+        // requests, swap storageMode to Private (2) — same lifecycle
+        // characteristics from SkyLight's POV (no CPU access), but
+        // backed by real GPU memory (transparent to caller).
+        NSUInteger storageMode = [desc respondsToSelector:@selector(storageMode)]
+                                 ? [desc storageMode] : 0;
+        if (storageMode == 3 /* MTLStorageModeMemoryless */) {
+            static int memless_log = 0;
+            if (memless_log++ < 4) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MEMORYLESS: forcing storageMode "
+                    "Memoryless(3) -> Private(2) so IOSurface route works\n");
+            }
+            if ([desc respondsToSelector:@selector(setStorageMode:)]) {
+                [desc setStorageMode:2 /* MTLStorageModePrivate */];
+            }
+        }
         NSUInteger width  = [desc respondsToSelector:@selector(width)]
                             ? [desc width] : 0;
         NSUInteger height = [desc respondsToSelector:@selector(height)]
