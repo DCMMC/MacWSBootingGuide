@@ -5,6 +5,7 @@
 @import MachO;
 #import <IOKit/IOKitLib.h>
 #import <xpc/xpc.h>
+#import <sys/sysctl.h>
 #import "interpose.h"
 #import "utils.h"
 
@@ -297,10 +298,11 @@ void EnableJIT(void);
 // IOMobileFramebuffer`kern_SwapEnd + 36
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt 0x4400 + 0x24
 // IOMobileFramebuffer`kern_SwapEnd + 0x30: `bl IOConnectCallStructMethod` (sel=5) — the call
-// that presents WindowServer's composited surface to the PHYSICAL iPad panel.  In coexistence
+// that presents WindowServer's composited surface to the PHYSICAL iPad panel. In coexistence
 // mode (iOS backboardd owns the panel, macOS viewed via VNC off-screen) we neutralize this so
-// WS never scans out to the panel -> no iOS/macOS flicker.  Gated to WindowServer + the runtime
-// flag file /tmp/ws_headless (chroot path) so the default macOS-on-panel behavior is unchanged.
+// WS never scans out to the panel -> no iOS/macOS flicker. Gated to WindowServer + auto-detection
+// of a running backboardd (coexistence); left intact in the original macOS-on-panel mode where
+// backboardd is unloaded. (/tmp/ws_headless still force-enables it for testing.)
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_submit 0x4400 + 0x30
 // SkyLight`WS::Displays::CAWSManager::CAWSManager() + 560
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
@@ -330,6 +332,33 @@ const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *AGXMetalPath = "/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3";
+
+// True if a process named `name` is currently running anywhere on the system.
+// chroot shares the kernel proc table, so iOS-context processes (e.g.
+// backboardd) are visible. Used to auto-detect coexistence mode: when iOS's
+// backboardd is alive we share the device with iOS UI so WindowServer must
+// not scan out to the panel. Cherry-picked from commit 0bba4a6 on stale
+// branch feat/window-content-rendering.
+static BOOL is_process_running(const char *name) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return NO;
+    len += len / 8 + 0x4000;  // pad: proc table can grow between size + fetch
+    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(len);
+    if (!procs) return NO;
+    BOOL found = NO;
+    if (sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
+        size_t n = len / sizeof(struct kinfo_proc);
+        for (size_t i = 0; i < n; i++) {
+            if (strncmp(procs[i].kp_proc.p_comm, name, MAXCOMLEN) == 0) {
+                found = YES;
+                break;
+            }
+        }
+    }
+    free(procs);
+    return found;
+}
 
 // ─── Chained-fixups walker for chroot-loaded AGXMetal13_3 ──────────────────
 //
@@ -1031,21 +1060,24 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         });
         // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
 
-        // COEXISTENCE (flicker fix): in WindowServer only, and only when the runtime flag file
-        // /tmp/ws_headless exists, neutralize kern_SwapEnd's panel present so WS renders to its
-        // framebuffer (VNC reads it) but never scans out to the physical iPad panel — iOS keeps
-        // the panel, eliminating the iOS/macOS flicker.  Default OFF (no flag file) => original
-        // macOS-on-panel behavior is untouched.  Toggle live by touch/rm /var/mnt/rootfs/tmp/ws_headless
-        // then restarting WindowServer.
+        // COEXISTENCE (flicker fix): in WindowServer only, when iOS's backboardd is running
+        // (we're sharing the device with the iOS UI), neutralize kern_SwapEnd's panel present
+        // so WS renders to its framebuffer (VNC reads it) but never scans out to the physical
+        // iPad panel — iOS keeps the panel, eliminating the iOS/macOS flicker. When backboardd
+        // is NOT running (the original "unload SpringBoard+backboardd, macOS takes the panel"
+        // mode) the present is left intact. Auto-detecting backboardd makes this survive
+        // reboots with no flag file; /tmp/ws_headless still force-enables it for testing.
         {
             char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
             if(_NSGetExecutablePath(exe, &exelen) == 0 &&
                strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
-               access("/tmp/ws_headless", F_OK) == 0) {
+               (is_process_running("backboardd") || access("/tmp/ws_headless", F_OK) == 0)) {
                 uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
                 ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
                     if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
                         *swapSubmit = 0xd2800000;    // mov x0, #0  (skip present, return KERN_SUCCESS)
+                        fprintf(stderr,
+                            "#### COEXIST: kern_SwapEnd panel-present NOPed (backboardd detected)\n");
                     }
                 });
             }
@@ -2677,6 +2709,12 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 extern kern_return_t mach_vm_read_overwrite(
     vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size,
     mach_vm_address_t data, mach_vm_size_t *outsize);
+extern kern_return_t mach_vm_allocate(
+    vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
+extern kern_return_t mach_vm_region(
+    vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t *size,
+    vm_region_flavor_t flavor, vm_region_info_t info,
+    mach_msg_type_number_t *info_count, mach_port_t *object_name);
 
 // Crash handler emits ALL diagnostic lines into a single static buffer then
 // flushes via one write(2). Mixing fprintf calls from a signal handler with
@@ -4486,6 +4524,31 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
         } else if(agxType == 0x80) {
+            // ONE-SHOT raw-bytes dump: capture the EXACT inStruct bytes
+            // macOS WS sends for sel=0x9 type=0x80 BEFORE any libmachook
+            // patching. Compare to iOS-native probe (agx_iogpu_probe.c)
+            // args that also fail kr=0xe00002be. If bytes match → truly
+            // structural; if they diverge, the differing field IS the
+            // rejection trigger.
+            static int t80_dumped = 0;
+            if (!t80_dumped) {
+                t80_dumped = 1;
+                fprintf(stderr,
+                    "#### AGXIOC RAW DUMP sel=0x9 type=0x80 inStructCnt=%zu (pre-patch):\n",
+                    inStructCnt);
+                for (size_t i = 0; i < inStructCnt; i += 16) {
+                    fprintf(stderr, "    +%#04zx:", i);
+                    for (size_t j = 0; j < 16 && (i + j) < inStructCnt; j++)
+                        fprintf(stderr, " %02x", src[i + j]);
+                    fprintf(stderr, "\n");
+                }
+                // Non-zero u64 scan past 0x60 in case macOS sends more.
+                const uint64_t *u = (const uint64_t *)src;
+                for (size_t i = 12; i * 8 < inStructCnt; i++) {
+                    if (u[i]) fprintf(stderr, "    nz @ +%#zx: %#llx\n",
+                        i * 8, (unsigned long long)u[i]);
+                }
+            }
             // Client-buffer path (type=0x80, no parent flag): iOS kernel
             // entry checks `args[0x40] <= limit` early (IOGPUDevice::
             // new_resource @ fffffe0009f03c4c: cmp x9, x10; b.ls). macOS
@@ -4495,65 +4558,29 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // Buffer call. iOS native userland writes args[0x40] = length
             // here. Length sits at args[0x48] (macOS IOGPUMetalBuffer
             // stores it there before this call).
+            // 2026-06-19 — type=0x80 + args+0x30=0x1 + mach_vm VA at +0x38
+            // is the macOS SCANOUT-buffer creation path. iOS kernel
+            // accepts it (probe[5] proved kr=0) but treats the result as
+            // a display-engine scanout source — wiring our garbage
+            // buffer to the physical LCD framebuffer, corrupting iOS UI
+            // (purple/pink screen). Reverted: keep kernel rejection.
+            // The CODEHEAP-SHIM IOSurface synth path handles AGXBuffer
+            // creates more safely (no scanout side-effect).
             uint64_t length = va48;
             uint64_t cur40 = *(const uint64_t *)(src + 0x40);
-            // Widened: not just when cur40 == va38; also when cur40 is a
-            // pinned-VA value > 1GB. SkyLight texture path sends
-            // cur40 = 0x100ff8000 with va38 = 0 (i.e. cur40 != va38 but
-            // it's still a VA, not a length).
             if(length && (cur40 == va38 || cur40 > 0x40000000ULL)) {
                 *(uint64_t *)(shadowbuf + 0x40) = length;
                 patched = 1;
-                fprintf(stderr,
-                    "#### AGXIOC client-buf: +0x40 %#llx -> %#llx (=len)\n",
-                    (unsigned long long)cur40, (unsigned long long)length);
             }
-            // args+0x30 is the user's client-buffer VA. iOS kernel will
-            // reject any pinned VA (>1GB). Zero it — kernel allocates
-            // its own client-buffer mapping. (Earlier tried substituting
-            // mmap'd + mlock'd buffer; kernel still rejected, suggests
-            // it wants a mach_make_memory_entry-registered region or
-            // doesn't support standalone client-buffer at all under
-            // chroot's task credentials.)
             uint64_t cur30 = *(const uint64_t *)(src + 0x30);
             if (cur30 > 0x40000000ULL || cur30 == 0x1) {
-                // Real fix via iOS-native macwsallocd memory entry.
-                // PoC verified entry port crosses XPC (test_mem_entry_xpc.c).
-                uint64_t buflen = va48 ? va48 : 0x4000;
-                if (buflen & 0xfff) buflen = (buflen + 0xfff) & ~0xfffULL;
-                uint64_t mapped_va = macws_make_mem_entry_xpc(buflen, NULL);
-                if (mapped_va) {
-                    *(uint64_t *)(shadowbuf + 0x30) = mapped_va;
-                    patched = 1;
-                    static int log_once = 0;
-                    if (log_once++ < 4) {
-                        fprintf(stderr,
-                            "#### AGXIOC client-buf: +0x30 %#llx -> %#llx "
-                            "(macwsallocd mem_entry %#llx bytes)\n",
-                            (unsigned long long)cur30,
-                            (unsigned long long)mapped_va,
-                            (unsigned long long)buflen);
-                    }
-                } else {
-                    *(uint64_t *)(shadowbuf + 0x30) = 0;
-                    patched = 1;
-                    static int log_once_zero = 0;
-                    if (log_once_zero++ < 4) fprintf(stderr,
-                        "#### AGXIOC client-buf: mem_entry helper unavailable; "
-                        "+0x30 %#llx -> 0 (will likely fail)\n",
-                        (unsigned long long)cur30);
-                }
+                *(uint64_t *)(shadowbuf + 0x30) = 0;
+                patched = 1;
             }
-            // args+0x58 for type=0x80: same logic as type=0 — macOS tags
-            // it with extended pinned-VA, iOS kernel rejects. Zero if
-            // non-zero.
             uint64_t cur58 = *(const uint64_t *)(src + 0x58);
             if (cur58 != 0) {
                 *(uint64_t *)(shadowbuf + 0x58) = 0;
                 patched = 1;
-                fprintf(stderr,
-                    "#### AGXIOC client-buf: +0x58 %#llx -> 0\n",
-                    (unsigned long long)cur58);
             }
         }
         // type=0x82 is the iOS-NATIVE type byte for iosurface-backed textures
@@ -4627,8 +4654,37 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 (unsigned long long)old_40, (unsigned long long)old_58);
         }
         if(patched) inStruct = shadowbuf;
+        // POST-patch dump for sel=0x9 type=0x80: capture EXACT bytes that
+        // hit the kernel — to compare against iOS-native probe args that
+        // also fail kr=0xe00002be with all-zero-but-required-fields.
+        if (agxType == 0x80) {
+            static int t80_post_dumped = 0;
+            if (!t80_post_dumped) {
+                t80_post_dumped = 1;
+                fprintf(stderr,
+                    "#### AGXIOC POST-PATCH sel=0x9 type=0x80 inStructCnt=%zu (bytes that hit kernel):\n",
+                    inStructCnt);
+                const unsigned char *p = (const unsigned char *)inStruct;
+                for (size_t i = 0; i < inStructCnt; i += 16) {
+                    fprintf(stderr, "    +%#04zx:", i);
+                    for (size_t j = 0; j < 16 && (i + j) < inStructCnt; j++)
+                        fprintf(stderr, " %02x", p[i + j]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // Log the kr for sel=0x9 type=0x80 once so we can pair it with the
+    // POST-PATCH dump above.
+    if (agxIsRes && agxType == 0x80) {
+        static int t80_kr_logged = 0;
+        if (!t80_kr_logged) {
+            t80_kr_logged = 1;
+            fprintf(stderr,
+                "#### AGXIOC POST-CALL sel=0x9 type=0x80 -> kr=%#x\n", r);
+        }
+    }
     // Parameter fuzz: if sel=0x9 ResCreate returned BadArgument, try a
     // handful of perturbations and report which ones the kernel accepts.
     // One-shot per process (static seen flag) and only for type=0 heap

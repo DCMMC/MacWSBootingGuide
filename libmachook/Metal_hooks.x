@@ -1758,6 +1758,35 @@ static void install_agx_init_redirect(Class agx) {
                         bytes ? malloc_size(bytes) : 0);
                     seen_log++;
                 }
+                // 2026-06-19 — when pinnedGPUAddress != 0 the caller (e.g.
+                // SkyLight MetalTiledBacking::PrepareForUse) wants the
+                // buffer placed at a specific GPU VA. On macOS this maps
+                // to kernel sel=0x9 type=0x80 scanout-class allocation,
+                // which iOS kernel treats as a display-engine source —
+                // wires our buffer to the physical LCD and corrupts iOS UI
+                // (proven 2026-06-19). The kernel's NoMemory rejection is
+                // the safe behavior. Short-circuit to nil here so we don't
+                // call %orig (which would call IOGPUResourceCreate and try
+                // sel=0x9 type=0x80). SkyLight's PrepareForUse already has
+                // a tolerate-nil hook in mac_hooks.m, so nil should flow
+                // through.
+                // Env-gated MACWS_AGX_SKIP_PINNED_ALLOC (default ON when
+                // MACWS_AGX_NATIVE=1) so we can A/B against the old
+                // vm_remap path.
+                if (pinnedGPUAddress != 0 &&
+                    getenv("MACWS_AGX_NATIVE") &&
+                    !getenv("MACWS_AGX_KEEP_PINNED_ALLOC")) {
+                    static int skip_log = 0;
+                    if (skip_log++ < 8) {
+                        fprintf(stderr,
+                            "#### AGXBuffer init-bytes SKIP-PINNED (scanout intent): "
+                            "self=%p len=%lu pin=%#llx -> returning nil "
+                            "(PrepareForUse tolerate-nil handles downstream)\n",
+                            self, (unsigned long)length,
+                            (unsigned long long)pinnedGPUAddress);
+                    }
+                    return nil;
+                }
                 if (bytes && length > 0 && malloc_size(bytes) > 0) {
                     vm_address_t mirrored = 0;
                     vm_prot_t cur_p, max_p;

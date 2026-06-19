@@ -139,6 +139,82 @@ static void probe_one(const char *match_class, uint32_t type) {
     fprintf(stderr, "  derived         3*0x108/4 = %#llx\n",
             (unsigned long long)((cap_108 * 3) / 4));
 
+    // === Trigger sel=0x9 type=0x80 STANDALONE from iOS-native context ===
+    // Multiple shape variants — to test if the args-shape (not credentials)
+    // gates the rejection. Real WS-captured bytes (2026-06-19 runtime):
+    //   +0x00: 80 (type=0x80)
+    //   +0x08: 01 00 01 00 01 00 01 00 (mystery 4-short struct)
+    //   +0x14: 70 04 00 00 (flag mask 0x470)
+    //   +0x30: 01 (then VA — pinned-VA magic)
+    //   +0x38: pinned VA
+    //   +0x40: pinned VA (same as +0x38)
+    //   +0x48: 0x4000 (length)
+    //   +0x60: 01 (mystery flag)
+    {
+        extern kern_return_t mach_vm_allocate(uint64_t target,
+            uint64_t *addr, uint64_t size, int flags);
+        struct shape {
+            const char *name;
+            uint64_t f08;     // +0x08 mystery 4-short
+            uint32_t f14;     // +0x14 flag mask
+            uint64_t f60;     // +0x60 mystery
+            int      raw30;   // +0x30: 1 = magic 0x1, 0 = use mach_vm VA, 2 = pinned VA
+        };
+        struct shape shapes[] = {
+            // (1) clean — what original test used
+            { "clean f14=0x430 zeros",         0,                    0x0430, 0, 0 },
+            // (2) try WS f14
+            { "clean f14=0x470 zeros",         0,                    0x0470, 0, 0 },
+            // (3) WS flags struct only
+            { "WS flags struct f14=0x470",     0x0001000100010001,   0x0470, 0, 0 },
+            // (4) WS flags + f60=1
+            { "WS flags + f60=1 f14=0x470",    0x0001000100010001,   0x0470, 1, 0 },
+            // (5) WS f60 only
+            { "f60=1 only f14=0x470",          0,                    0x0470, 1, 0 },
+            // (6) full WS shape with magic 0x30 = 0x1
+            { "full WS shape (+0x30=0x1)",     0x0001000100010001,   0x0470, 1, 1 },
+            // (7) full WS shape + pinned VA at +0x30
+            { "full WS shape (pinned +0x30)",  0x0001000100010001,   0x0470, 1, 2 },
+            { NULL, 0, 0, 0, 0 }
+        };
+        for (int si = 0; shapes[si].name; ++si) {
+            uint64_t user_va = 0;
+            kern_return_t ar = mach_vm_allocate(
+                (uint64_t)(uintptr_t)mach_task_self(), &user_va, 0x4000, 0x1);
+            if (ar) continue;
+            memset((void*)(uintptr_t)user_va, 0, 0x4000);
+            unsigned char in_args[0x68];
+            unsigned char out_args[0x50];
+            memset(in_args, 0, sizeof(in_args));
+            memset(out_args, 0, sizeof(out_args));
+            in_args[0x00] = 0x80;
+            *(uint64_t *)(in_args + 0x08) = shapes[si].f08;
+            *(uint32_t *)(in_args + 0x14) = shapes[si].f14;
+            *(uint64_t *)(in_args + 0x60) = shapes[si].f60;
+            if (shapes[si].raw30 == 1) {
+                *(uint64_t *)(in_args + 0x30) = 0x1; // magic
+                *(uint64_t *)(in_args + 0x38) = user_va;
+                *(uint64_t *)(in_args + 0x40) = 0x4000;
+            } else if (shapes[si].raw30 == 2) {
+                *(uint64_t *)(in_args + 0x30) = user_va;
+                *(uint64_t *)(in_args + 0x38) = user_va;
+                *(uint64_t *)(in_args + 0x40) = user_va;
+            } else {
+                *(uint64_t *)(in_args + 0x30) = user_va;
+                *(uint64_t *)(in_args + 0x40) = 0x4000;
+            }
+            *(uint64_t *)(in_args + 0x48) = 0x4000;
+            size_t outSz = sizeof(out_args);
+            kr = IOConnectCallMethod(conn, 0x9, NULL, 0,
+                in_args, sizeof(in_args), NULL, NULL,
+                out_args, &outSz);
+            fprintf(stderr, "  shape[%d] '%s' -> kr=%#x %s\n", si, shapes[si].name, kr,
+                kr == 0 ? "*** SUCCESS ***" : "(fail)");
+            extern kern_return_t mach_vm_deallocate(uint64_t target, uint64_t addr, uint64_t size);
+            mach_vm_deallocate((uint64_t)(uintptr_t)mach_task_self(), user_va, 0x4000);
+        }
+    }
+
     // === Trigger sel=0xa heap-create from iOS-native context ===
     // The iOS-native userland Metal builds args this way (from
     // ~/Downloads/agx-re/ios/IOGPU disasm of _IOGPUResourceCreate):
