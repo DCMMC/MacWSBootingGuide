@@ -4430,7 +4430,11 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             // args+0x30 is the user's client-buffer VA. iOS kernel will
             // reject any pinned VA (>1GB). Zero it — kernel allocates
-            // its own client-buffer mapping.
+            // its own client-buffer mapping. (Earlier tried substituting
+            // mmap'd + mlock'd buffer; kernel still rejected, suggests
+            // it wants a mach_make_memory_entry-registered region or
+            // doesn't support standalone client-buffer at all under
+            // chroot's task credentials.)
             uint64_t cur30 = *(const uint64_t *)(src + 0x30);
             if (cur30 > 0x40000000ULL) {
                 *(uint64_t *)(shadowbuf + 0x30) = 0;
