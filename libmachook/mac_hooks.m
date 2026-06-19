@@ -2443,12 +2443,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 // exceeds 64 MB, and oversizing on the iOS path may
                                 // get rejected for separate reasons (kernel VA quota).
                                 // 2026-06-19 — Empirically iOS IOSurface backing
-                                // for >64MB allocations: macwsallocd creates the
+                                // for >16MB allocations: macwsallocd creates the
                                 // surface and returns port+id, but chroot's
                                 // IOSurfaceLookup + IOSurfaceLookupFromMachPort
-                                // BOTH return nil for those sizes. Smaller surfaces
-                                // (<= 64MB) round-trip fine. Cap at 64MB.
-                                if (sz > 0x4000000ULL) sz = 0x4000000ULL;
+                                // BOTH return nil. Smaller (<= 16MB) round-trip
+                                // fine. Cap at 16MB so synth-step3 reliably
+                                // succeeds and downstream gets a real IOSurface.
+                                if (sz > 0x1000000ULL) sz = 0x1000000ULL;
                                 if (sz < 0x10000ULL)    sz = 0x10000ULL;
                             }
                             if (!sz) sz = 0x10000;
