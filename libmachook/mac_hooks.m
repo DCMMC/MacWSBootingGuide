@@ -4332,31 +4332,35 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // VA at +0x38 tells the macOS kernel "place this heap at this
         // pinned GPU VA", iOS kernel rejects. Zero args+0x38 for ANY
         // type=0 heap call where it's >1GB — same logic as +0x40 swap.
-        if(agxType == 0) {
+        // Apply VA-shape + flag-strip to ALL types (was only type=0).
+        // type=0x80 client-buffer path showed same pattern: args+0x38 has
+        // pinned-VA, args+0x14=0x0c30 has bit 11 (macOS-only) set.
+        {
             uint64_t va38 = *(const uint64_t *)(src + 0x38);
-            if (va38 > 0x40000000ULL) {
+            if (va38 > 0x40000000ULL && agxType != 0x82) {
                 static int log_once_38 = 0;
                 if (log_once_38++ < 4) {
                     fprintf(stderr,
-                        "#### AGXIOC sel=0x9 type=0 VA-shape +0x38=%#llx → 0\n",
-                        (unsigned long long)va38);
+                        "#### AGXIOC sel=0x9 type=%#x VA-shape +0x38=%#llx → 0\n",
+                        agxType, (unsigned long long)va38);
                 }
                 *(uint64_t *)(shadowbuf + 0x38) = 0;
                 patched = 1;
             }
             // args+0x14 flag mask: known-good values are 0x470 / 0x430.
-            // SkyLight texture path sends 0x2c30 (adds bits 11 0x800 and
-            // 13 0x2000) which iOS kernel rejects with kIOReturnNoMemory.
-            // Strip these bits — they're macOS-only options (e.g. pinned-VA
-            // request flag).
+            // SkyLight texture path sends 0x2c30 (type=0) or 0x0c30
+            // (type=0x80) — both add bit 11 (0x800), 0x2c30 also adds
+            // bit 13 (0x2000). These are macOS-only options that iOS
+            // kernel rejects. Strip 0x2800.
             uint32_t f14 = *(const uint32_t *)(src + 0x14);
             uint32_t f14_clean = f14 & ~0x2800u;
             if (f14_clean != f14) {
                 static int log_once_14 = 0;
                 if (log_once_14++ < 4) {
                     fprintf(stderr,
-                        "#### AGXIOC sel=0x9 type=0 args+0x14=%#x → %#x "
-                        "(stripped macOS-only bits 0x2800)\n", f14, f14_clean);
+                        "#### AGXIOC sel=0x9 type=%#x args+0x14=%#x → %#x "
+                        "(stripped macOS-only bits 0x2800)\n",
+                        agxType, f14, f14_clean);
                 }
                 *(uint32_t *)(shadowbuf + 0x14) = f14_clean;
                 patched = 1;
@@ -4413,12 +4417,38 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // stores it there before this call).
             uint64_t length = va48;
             uint64_t cur40 = *(const uint64_t *)(src + 0x40);
-            if(length && cur40 == va38) {
+            // Widened: not just when cur40 == va38; also when cur40 is a
+            // pinned-VA value > 1GB. SkyLight texture path sends
+            // cur40 = 0x100ff8000 with va38 = 0 (i.e. cur40 != va38 but
+            // it's still a VA, not a length).
+            if(length && (cur40 == va38 || cur40 > 0x40000000ULL)) {
                 *(uint64_t *)(shadowbuf + 0x40) = length;
                 patched = 1;
                 fprintf(stderr,
                     "#### AGXIOC client-buf: +0x40 %#llx -> %#llx (=len)\n",
                     (unsigned long long)cur40, (unsigned long long)length);
+            }
+            // args+0x30 is the user's client-buffer VA. iOS kernel will
+            // reject any pinned VA (>1GB). Zero it — kernel allocates
+            // its own client-buffer mapping.
+            uint64_t cur30 = *(const uint64_t *)(src + 0x30);
+            if (cur30 > 0x40000000ULL) {
+                *(uint64_t *)(shadowbuf + 0x30) = 0;
+                patched = 1;
+                fprintf(stderr,
+                    "#### AGXIOC client-buf: +0x30 %#llx (pinned VA) -> 0\n",
+                    (unsigned long long)cur30);
+            }
+            // args+0x58 for type=0x80: same logic as type=0 — macOS tags
+            // it with extended pinned-VA, iOS kernel rejects. Zero if
+            // non-zero.
+            uint64_t cur58 = *(const uint64_t *)(src + 0x58);
+            if (cur58 != 0) {
+                *(uint64_t *)(shadowbuf + 0x58) = 0;
+                patched = 1;
+                fprintf(stderr,
+                    "#### AGXIOC client-buf: +0x58 %#llx -> 0\n",
+                    (unsigned long long)cur58);
             }
         }
         // type=0x82 is the iOS-NATIVE type byte for iosurface-backed textures
