@@ -1231,26 +1231,80 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // on IOGPUMetalTexture (the super class that AGXTexture
             // queries) AND on AGXG13GFamilyBuffer (the synth that gets
             // returned from CODEHEAP-SHIM).
-            SEL memSel = sel_registerName("isMemoryless");
-            IMP memStub = imp_implementationWithBlock(^BOOL(id self) {
-                (void)self;
-                return NO;
+            // 2026-06-20 — Full cascade RE'd via otool on AGXTexture init.
+            // Selectors AGXTexture init sends that need to resolve on the
+            // synth buffer / chroot descriptor / texture:
+            //   validateWithDevice:   (descriptor) [already added above]
+            //   isMemoryless          (super-init result texture)
+            //   protectionOptions     (descriptor)
+            //   getCPUSizeBytes       (descriptor or buffer)
+            //   getAlignment          (descriptor)
+            //   descriptorPrivate     (descriptor)
+            //   getBytesPerRow        (descriptor)
+            //   finalizeTextureCreation (self) [already added on AGXG13GFamilyBuffer]
+            //   updateBindDataWithAddresses:gpuVirtualAddress:
+            //   updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:
+            //   allocBufferSubDataWithLength:options:alignment:heapIndex:bufferIndex:bufferOffset:
+            //   initNewTextureData:
+            //   initImplWithDevice:Descriptor:... (the real init — skip stubbing)
+            // Pre-emptively stub the ones whose default value is well-defined.
+            // Each returns a safe value (NO, 0, nil, self) so the call site
+            // continues past doesNotRecognizeSelector.
+            struct stub { const char *sel; const char *enc; IMP imp; };
+            // BOOL stubs returning NO
+            IMP retNO = imp_implementationWithBlock(^BOOL(id s) { (void)s; return NO; });
+            // size_t stubs returning 0
+            IMP retZeroSize = imp_implementationWithBlock(^NSUInteger(id s) { (void)s; return 0; });
+            // NSUInteger stubs returning 0
+            IMP retZeroNS = imp_implementationWithBlock(^NSUInteger(id s) { (void)s; return 0; });
+            // id stub returning self (for descriptorPrivate / initNewTextureData:)
+            IMP retSelf = imp_implementationWithBlock(^id(id s) { (void)s; return s; });
+            IMP retSelfArg = imp_implementationWithBlock(^id(id s, id a) { (void)s; (void)a; return s; });
+            // void no-op (for finalizeTextureCreation, updateBindData…)
+            IMP retVoid = imp_implementationWithBlock(^(id s) { (void)s; });
+            IMP retVoid3 = imp_implementationWithBlock(^(id s, void *p, uint64_t va) { (void)s; (void)p; (void)va; });
+            IMP retVoid4 = imp_implementationWithBlock(^(id s, void *p, uint64_t va, BOOL b) { (void)s; (void)p; (void)va; (void)b; });
+            // nil stub for allocBufferSubData…
+            IMP retNil = imp_implementationWithBlock(^id(id s, NSUInteger l, NSUInteger o, NSUInteger a,
+                                                          NSUInteger h, NSUInteger b, NSUInteger off) {
+                (void)s; (void)l; (void)o; (void)a; (void)h; (void)b; (void)off; return nil;
             });
+            struct stub stubs[] = {
+                { "isMemoryless",                                  "c@:",                retNO },
+                { "protectionOptions",                             "Q@:",                retZeroNS },
+                { "getCPUSizeBytes",                               "Q@:",                retZeroSize },
+                { "getAlignment",                                  "Q@:",                retZeroSize },
+                { "descriptorPrivate",                             "@@:",                retSelf },
+                { "getBytesPerRow",                                "Q@:",                retZeroSize },
+                { "finalizeTextureCreation",                       "v@:",                retVoid },
+                { "updateBindDataWithAddresses:gpuVirtualAddress:", "v@:^vQ",            retVoid3 },
+                { "updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:", "v@:^vQc", retVoid4 },
+                { "allocBufferSubDataWithLength:options:alignment:heapIndex:bufferIndex:bufferOffset:",
+                                                                    "@@:QQQQQQ",        retNil },
+                { "initNewTextureData:",                           "@@:@",               retSelfArg },
+                { NULL, NULL, NULL }
+            };
             const char *targets[] = {
                 "IOGPUMetalTexture",
                 "AGXG13GFamilyBuffer",
                 "AGXTexture",
                 "MTLTextureDescriptor",
+                "AGXG13GFamilyTexture",
                 NULL
             };
-            for (int i = 0; targets[i]; i++) {
-                Class k = objc_getClass(targets[i]);
+            for (int t = 0; targets[t]; t++) {
+                Class k = objc_getClass(targets[t]);
                 if (!k) continue;
-                if (class_getInstanceMethod(k, memSel)) continue;
-                BOOL ok = class_addMethod(k, memSel, memStub, "c@:");
-                fprintf(stderr,
-                    "#### MACWS_AGX_NATIVE class_addMethod(%s, isMemoryless) = %d\n",
-                    targets[i], ok);
+                for (int s = 0; stubs[s].sel; s++) {
+                    SEL sel = sel_registerName(stubs[s].sel);
+                    if (class_getInstanceMethod(k, sel)) continue;
+                    BOOL ok = class_addMethod(k, sel, stubs[s].imp, stubs[s].enc);
+                    if (ok) {
+                        fprintf(stderr,
+                            "#### MACWS_AGX_NATIVE class_addMethod(%s, %s) = 1\n",
+                            targets[t], stubs[s].sel);
+                    }
+                }
             }
         }
     } else if(!strncmp(info.dli_fname, QuartzCorePath, strlen(QuartzCorePath))) {

@@ -925,6 +925,34 @@ static void macws_sigabrt_trampoline(int sig) {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
     }
+    // 2026-06-20 — Block the plain newTextureWithDescriptor path from
+    // entering AGX kernel. -[AGXTexture init...] has a cascade of
+    // missing selectors (validateWithDevice:, isMemoryless,
+    // protectionOptions, getCPUSizeBytes, getAlignment, descriptorPrivate,
+    // getBytesPerRow, finalizeTextureCreation, updateBindData...,
+    // allocBufferSubData..., initNewTextureData:) that chroot's loaded
+    // class hierarchy doesn't fully implement. Even with 22 stubs added
+    // via class_addMethod the cascade still cascades because some
+    // receivers are internal subclasses. Plus the synth-buffer-as-texture
+    // pattern triggers iOS kernel panics. Returning nil here is SAFER —
+    // SkyLight's PrepareForUse tolerate-nil + WSCompositeDestination
+    // CreateWithMetalTexture nil-tolerate hooks handle the nil cascade
+    // gracefully; that composite layer is skipped instead of crashing WS.
+    // The iosurface variant (hooked_newTextureWithDescriptor:iosurface:plane:)
+    // still works because the descriptor + IOSurface together fully define
+    // the texture and AGXTexture init's checks pass for that path.
+    // Env opt-out via MACWS_AGX_KEEP_PLAIN_NEWTEX=1 for A/B testing.
+    if (getenv("MACWS_AGX_NATIVE") &&
+        !getenv("MACWS_AGX_KEEP_PLAIN_NEWTEX")) {
+        static int skip_log = 0;
+        if (skip_log++ < 4) {
+            fprintf(stderr,
+                "#### MTL_TEX plain SKIP-AGX-KERNEL: returning nil "
+                "(AGXTexture init selector cascade can't fully resolve; "
+                "SkyLight tolerate-nil hooks handle downstream)\n");
+        }
+        return nil;
+    }
     id<MTLTexture> result = [self hooked_newTextureWithDescriptor:desc];
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         fprintf(stderr, "#### MTL_TEX/plain.OUT -> %p (label=%s)\n",
