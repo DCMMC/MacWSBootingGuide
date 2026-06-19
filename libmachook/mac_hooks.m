@@ -1222,6 +1222,36 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 fprintf(stderr,
                     "#### MACWS_AGX_NATIVE objc_getClass(MTLTextureDescriptor) = nil\n");
             }
+            // 2026-06-20 (lldb-confirmed) — AGXTexture init at static
+            // 0x1e5a5b9cc calls `_objc_msgSend$isMemoryless` on the
+            // result of super-init (x19 = IOGPUMetalTexture instance).
+            // For our synth AGXG13GFamilyBuffer-as-texture this method
+            // doesn't exist → forwarding → SIGTRAP. Add isMemoryless
+            // returning NO (IOSurface-backed = real memory, not memoryless)
+            // on IOGPUMetalTexture (the super class that AGXTexture
+            // queries) AND on AGXG13GFamilyBuffer (the synth that gets
+            // returned from CODEHEAP-SHIM).
+            SEL memSel = sel_registerName("isMemoryless");
+            IMP memStub = imp_implementationWithBlock(^BOOL(id self) {
+                (void)self;
+                return NO;
+            });
+            const char *targets[] = {
+                "IOGPUMetalTexture",
+                "AGXG13GFamilyBuffer",
+                "AGXTexture",
+                "MTLTextureDescriptor",
+                NULL
+            };
+            for (int i = 0; targets[i]; i++) {
+                Class k = objc_getClass(targets[i]);
+                if (!k) continue;
+                if (class_getInstanceMethod(k, memSel)) continue;
+                BOOL ok = class_addMethod(k, memSel, memStub, "c@:");
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE class_addMethod(%s, isMemoryless) = %d\n",
+                    targets[i], ok);
+            }
         }
     } else if(!strncmp(info.dli_fname, QuartzCorePath, strlen(QuartzCorePath))) {
         // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
