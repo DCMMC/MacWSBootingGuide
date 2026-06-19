@@ -2140,6 +2140,53 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled initWithDevice:length:alignment:options:isSuballocDisabled:resourceInArgs:pinnedGPULocation:\n");
                 }
 
+                // 2026-06-19 — `finalizeTextureCreation` no-op on
+                // AGXG13GFamilyBuffer.
+                //
+                // lldb caught chroot WS dying via objc_exception_throw with
+                // reason `-[AGXG13GFamilyBuffer finalizeTextureCreation]:
+                // unrecognized selector`. Backtrace:
+                //   AGXTexture::initWithDevice:desc:isSuballocDisabled: +632
+                //   SkyLight MetalTiledBacking::PrepareForUse + 528
+                //   SkyLight CompositorMetal::composite ...
+                //
+                // RE shows AGXTexture +636 does `mov x0, x19; bl
+                // objc_msgSend$finalizeTextureCreation` where x19 came from
+                // an earlier `bl objc_msgSendSuper2` at +540. The super-init
+                // returned an AGXG13GFamilyBuffer (instead of an
+                // AGXG13GFamilyTexture) — probably because our PIN_FALLBACK
+                // or CODEHEAP-SHIM intercept of -[IOGPUMetalResource
+                // initWith...args:argsSize:] is sometimes also crossed by
+                // a texture super-init path (both share that 4-arg init in
+                // the AGXResource class hierarchy).
+                //
+                // `finalizeTextureCreation` is normally only declared on
+                // AGXTexture / AGXG13GFamilyTexture (image lookup confirmed
+                // — only two implementations in AGXMetal13_3). Adding a
+                // no-op to AGXG13GFamilyBuffer keeps the AGXTexture init
+                // moving forward when its super-init returns a Buffer-class
+                // instance instead of a Texture-class one. Real
+                // AGXG13GFamilyTexture instances STILL get the real method
+                // via normal dispatch.
+                {
+                    Class kBuf = objc_getClass("AGXG13GFamilyBuffer");
+                    if (kBuf) {
+                        SEL sel_ftc = sel_registerName("finalizeTextureCreation");
+                        IMP noop_ftc = imp_implementationWithBlock(^void(id self){
+                            static int once = 0;
+                            if (once++ < 6) {
+                                fprintf(stderr,
+                                    "#### finalizeTextureCreation no-op on AGXG13GFamilyBuffer self=%p cls=%s\n",
+                                    self, object_getClass(self) ? class_getName(object_getClass(self)) : "(nil)");
+                            }
+                        });
+                        BOOL added = class_addMethod(kBuf, sel_ftc, noop_ftc, "v@:");
+                        fprintf(stderr,
+                            "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyBuffer, finalizeTextureCreation) = %d\n",
+                            added);
+                    }
+                }
+
                 // -[AGXBuffer initWithDevice:options:args:argsSize:] — the
                 // 4-arg init called from inside `AGX::Heap<true>::allocateImpl`
                 // (setupCompiler:'s CodeHeap dispatch_sync block). Runtime
