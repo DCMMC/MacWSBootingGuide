@@ -944,14 +944,72 @@ static void macws_sigabrt_trampoline(int sig) {
     // Env opt-out via MACWS_AGX_KEEP_PLAIN_NEWTEX=1 for A/B testing.
     if (getenv("MACWS_AGX_NATIVE") &&
         !getenv("MACWS_AGX_KEEP_PLAIN_NEWTEX")) {
-        static int skip_log = 0;
-        if (skip_log++ < 4) {
-            fprintf(stderr,
-                "#### MTL_TEX plain SKIP-AGX-KERNEL: returning nil "
-                "(AGXTexture init selector cascade can't fully resolve; "
-                "SkyLight tolerate-nil hooks handle downstream)\n");
+        // 2026-06-20 — Route plain newTextureWithDescriptor through the
+        // iosurface variant (the known-working path). Create a chroot-
+        // local IOSurface sized to the descriptor, then delegate to
+        // hooked_newTextureWithDescriptor:iosurface:plane: which goes
+        // through the iosurface-init code path (avoids the missing
+        // selector cascade in -[AGXTexture initWithDevice:desc:
+        // isSuballocDisabled:]).
+        NSUInteger width  = [desc respondsToSelector:@selector(width)]
+                            ? [desc width] : 0;
+        NSUInteger height = [desc respondsToSelector:@selector(height)]
+                            ? [desc height] : 0;
+        NSUInteger pf     = [desc respondsToSelector:@selector(pixelFormat)]
+                            ? [desc pixelFormat] : 80; // MTLPixelFormatBGRA8Unorm default
+        if (width == 0 || height == 0) {
+            static int bad_log = 0;
+            if (bad_log++ < 4)
+                fprintf(stderr,
+                    "#### MTL_TEX plain ROUTE-IOSURF: bad descriptor "
+                    "(w=%lu h=%lu) — returning nil\n",
+                    (unsigned long)width, (unsigned long)height);
+            return nil;
         }
-        return nil;
+        // Map MTLPixelFormat → IOSurface bytes-per-element + format4cc.
+        // For now assume BGRA8/RGBA8 (4 bpp) which covers SkyLight's
+        // composite path. More formats can be added as needed.
+        uint32_t fmt4cc  = 'BGRA';
+        NSUInteger bpe   = 4;
+        // Common cases:
+        //   MTLPixelFormatBGRA8Unorm        = 80   (default)
+        //   MTLPixelFormatRGBA8Unorm        = 70
+        //   MTLPixelFormatBGRA8Unorm_sRGB   = 81
+        //   MTLPixelFormatRGBA16Float       = 115  (8 bpp)
+        //   MTLPixelFormatR8Unorm           = 10   (1 bpp)
+        if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
+        else if (pf == 10) { fmt4cc = 'L008'; bpe = 1; }
+        else if (pf == 70 || pf == 71) { fmt4cc = 'RGBA'; bpe = 4; }
+        NSDictionary *props = @{
+            @"IOSurfaceWidth":           @(width),
+            @"IOSurfaceHeight":          @(height),
+            @"IOSurfaceBytesPerElement": @(bpe),
+            @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
+        };
+        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        static int route_log = 0;
+        if (route_log++ < 8) {
+            fprintf(stderr,
+                "#### MTL_TEX plain ROUTE-IOSURF: w=%lu h=%lu pf=%lu "
+                "→ IOSurface=%p (bpe=%lu fmt=%c%c%c%c)\n",
+                (unsigned long)width, (unsigned long)height, (unsigned long)pf,
+                (void *)surf, (unsigned long)bpe,
+                (char)(fmt4cc>>24), (char)(fmt4cc>>16),
+                (char)(fmt4cc>>8), (char)fmt4cc);
+        }
+        if (!surf) return nil;
+        id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc
+                                                          iosurface:(__bridge id)surf
+                                                              plane:0];
+        // Texture retains IOSurface internally via its own backing
+        // reference, so we can release our local CFRef.
+        CFRelease(surf);
+        if (route_log < 12) {
+            fprintf(stderr,
+                "#### MTL_TEX plain ROUTE-IOSURF result: %p\n",
+                (void *)tex);
+        }
+        return tex;
     }
     id<MTLTexture> result = [self hooked_newTextureWithDescriptor:desc];
     if (getenv("MACWS_TEX_TRACE") != NULL) {
