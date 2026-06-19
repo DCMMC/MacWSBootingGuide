@@ -202,11 +202,17 @@ static void alloc_serve(xpc_object_t event) {
     if (size == 0 || size > (256ULL * 1024 * 1024)) {
         result = "size_invalid";
     } else {
+        // kIOSurfaceIsGlobal=YES makes the surface looked-up-able cross-
+        // process via IOSurfaceLookup(int id) — the per-task
+        // IOSurfaceClient.IOSurfaceLookupFromMachPort path fails for ports
+        // created in another task (runtime-confirmed 2026-06-19: chroot's
+        // local-test roundtrip works; cross-process port lookup returns nil).
         NSDictionary *props = @{
             (id)kIOSurfaceWidth:           @(size),
             (id)kIOSurfaceHeight:          @(1),
             (id)kIOSurfaceBytesPerElement: @(1),
             (id)kIOSurfacePixelFormat:     @((uint32_t)'L008'),
+            (id)kIOSurfaceIsGlobal:        @YES,
         };
         IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
         if (!surf) {
@@ -214,10 +220,30 @@ static void alloc_serve(xpc_object_t event) {
         } else {
             surfPort = IOSurfaceCreateMachPort(surf);
             alloc_size = IOSurfaceGetAllocSize(surf);
-            CFRelease(surf);
-            if (surfPort == MACH_PORT_NULL) {
-                result = "io_create_fail";
+            uint32_t iosurfid = IOSurfaceGetID(surf);
+            // Keep surface ref retained until after reply — defense in depth.
+            xpc_dictionary_set_string(r, "result", result);
+            if (surfPort != MACH_PORT_NULL) {
+                xpc_dictionary_set_mach_send(r, "surface", surfPort);
             }
+            xpc_dictionary_set_uint64(r, "alloc_size", alloc_size);
+            xpc_dictionary_set_uint64(r, "iosurface_id", iosurfid);
+            xpc_connection_send_message(peer, r);
+            // Self-roundtrip both APIs as sanity for the iOS-native side.
+            IOSurfaceRef rt_port = (surfPort != MACH_PORT_NULL) ?
+                IOSurfaceLookupFromMachPort(surfPort) : NULL;
+            IOSurfaceRef rt_id = IOSurfaceLookup(iosurfid);
+            NSLog(@"alloc-iosurf self-roundtrip: port=%u -> surf=%p | id=%u -> surf=%p",
+                surfPort, rt_port, iosurfid, rt_id);
+            if (rt_port) CFRelease(rt_port);
+            if (rt_id) CFRelease(rt_id);
+            CFRelease(surf);
+            if (surfPort != MACH_PORT_NULL) {
+                mach_port_deallocate(mach_task_self(), surfPort);
+            }
+            NSLog(@"alloc-iosurf size=%llu opts=%#llx -> ok alloc=%llu port=%u id=%u (IsGlobal=YES)",
+                size, options, alloc_size, surfPort, iosurfid);
+            return;
         }
     }
 

@@ -141,8 +141,13 @@ static void macws_install_synth_overrides(Class cls) {
 // failure) plus the actual allocated size out-param. Caller is responsible
 // for mach_port_deallocate'ing the returned port.
 // See MTLSimDriverHost/main.x install_alloc_listener for the server side.
+// out_iosurf_id (optional) receives the global IOSurfaceID — used for
+// IOSurfaceLookup(int) cross-process lookup since the per-task
+// IOSurfaceClient.IOSurfaceLookupFromMachPort doesn't resolve send-rights
+// created in another task (runtime-confirmed 2026-06-19).
 static mach_port_t macws_alloc_iosurf_xpc(uint64_t size, uint64_t options,
-                                           uint64_t *out_alloc_size) {
+                                           uint64_t *out_alloc_size,
+                                           uint32_t *out_iosurf_id) {
     static xpc_connection_t conn = NULL;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -177,13 +182,15 @@ static mach_port_t macws_alloc_iosurf_xpc(uint64_t size, uint64_t options,
         if (result && strcmp(result, "ok") == 0) {
             port = xpc_dictionary_copy_mach_send(reply, "surface");
             if (out_alloc_size) *out_alloc_size = xpc_dictionary_get_uint64(reply, "alloc_size");
+            if (out_iosurf_id) *out_iosurf_id = (uint32_t)xpc_dictionary_get_uint64(reply, "iosurface_id");
         }
         static int once_log = 0;
         if (once_log++ < 6) {
             fprintf(stderr,
-                "#### alloc-xpc reply: result=%s port=%u alloc_size=%llu\n",
+                "#### alloc-xpc reply: result=%s port=%u alloc_size=%llu iosurface_id=%u\n",
                 result ?: "(none)", port,
-                out_alloc_size ? (unsigned long long)*out_alloc_size : 0ULL);
+                out_alloc_size ? (unsigned long long)*out_alloc_size : 0ULL,
+                out_iosurf_id ? *out_iosurf_id : 0);
         }
     } else {
         static int once_log = 0;
@@ -2421,21 +2428,44 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 "#### CODEHEAP-SHIM synth-step3: requesting IOSurface from helper sz=%#llx\n",
                                 (unsigned long long)sz);
                             uint64_t alloc_size = 0;
-                            mach_port_t surfPort = macws_alloc_iosurf_xpc(sz, opt, &alloc_size);
-                            if (surfPort == MACH_PORT_NULL) {
+                            uint32_t iosurfid = 0;
+                            mach_port_t surfPort = macws_alloc_iosurf_xpc(
+                                sz, opt, &alloc_size, &iosurfid);
+                            if (surfPort == MACH_PORT_NULL && iosurfid == 0) {
                                 fprintf(stderr,
                                     "#### CODEHEAP-SHIM synth-step3 FAIL: alloc helper returned no surface\n");
-                                // Last-ditch: return alloc'd-but-uninit'd object
-                                // so caller continues briefly and we see the
-                                // next cascade.
                                 return ((id (*)(Class, SEL))objc_msgSend)(
                                     target, sel_registerName("alloc"));
                             }
-                            IOSurfaceRef surf = IOSurfaceLookupFromMachPort(surfPort);
-                            mach_port_deallocate(mach_task_self(), surfPort);
+                            // 2026-06-19 — Per-task IOSurfaceClient's
+                            // IOSurfaceLookupFromMachPort does NOT resolve
+                            // send-rights created in a different task
+                            // (runtime-confirmed: chroot local-test
+                            // roundtrip works, cross-process returns nil).
+                            // The IsGlobal=YES surface is reachable via the
+                            // global IOSurfaceLookup(int id) table — try
+                            // that first.
+                            extern IOSurfaceRef IOSurfaceLookup(uint32_t id);
+                            IOSurfaceRef surf = NULL;
+                            if (iosurfid) {
+                                surf = IOSurfaceLookup(iosurfid);
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM IOSurfaceLookup(id=%u) -> %p\n",
+                                    iosurfid, (void *)surf);
+                            }
+                            if (!surf && surfPort != MACH_PORT_NULL) {
+                                surf = IOSurfaceLookupFromMachPort(surfPort);
+                                fprintf(stderr,
+                                    "#### CODEHEAP-SHIM fallback IOSurfaceLookupFromMachPort(port=%u) -> %p\n",
+                                    surfPort, (void *)surf);
+                            }
+                            if (surfPort != MACH_PORT_NULL)
+                                mach_port_deallocate(mach_task_self(), surfPort);
                             if (!surf) {
                                 fprintf(stderr,
-                                    "#### CODEHEAP-SHIM synth-step3 FAIL: IOSurfaceLookupFromMachPort returned nil\n");
+                                    "#### CODEHEAP-SHIM synth-step3 FAIL: "
+                                    "IOSurfaceLookup id=%u + LookupFromMachPort port=%u both returned nil\n",
+                                    iosurfid, surfPort);
                                 return ((id (*)(Class, SEL))objc_msgSend)(
                                     target, sel_registerName("alloc"));
                             }
