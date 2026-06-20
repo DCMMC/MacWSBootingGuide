@@ -4155,13 +4155,47 @@ static char *macws_vnc_fb = NULL;
 static int  *macws_rfbScreen = NULL;
 static int   macws_vnc_test_on = 0;
 
+static IOSurfaceRef macws_vnc_src = NULL;
 static void macws_vnc_fill_test(void) {
-    if (!macws_vnc_test_on || !macws_vnc_fb || !macws_rfbScreen) return;
+    if (!macws_vnc_fb || !macws_rfbScreen) return;
     int padded = macws_rfbScreen[1];   // paddedWidthInBytes
     int height = macws_rfbScreen[2];   // height
     int bpp    = macws_rfbScreen[4];   // bitsPerPixel
     if (padded <= 0 || height <= 0 || height > 8192 || padded > (1 << 20)) return;
     int bytespp = (bpp > 0 ? bpp / 8 : 4); if (bytespp < 1) bytespp = 4;
+    extern IOSurfaceRef IOSurfaceLookup(uint32_t);
+    extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef);
+    extern size_t IOSurfaceGetHeight(IOSurfaceRef);
+    extern int IOSurfaceLock(IOSurfaceRef, uint32_t, uint32_t *);
+    extern int IOSurfaceUnlock(IOSurfaceRef, uint32_t, uint32_t *);
+    // 1) Preferred: the global composite surface published by WS
+    //    (/tmp/macws_vnc_surfid). This is the real GlassDemo content
+    //    delivered cross-process; the gradient below is just a fallback.
+    if (!macws_vnc_src) {
+        FILE *f = fopen("/tmp/macws_vnc_surfid", "r");
+        if (f) {
+            unsigned id = 0;
+            if (fscanf(f, "%u", &id) == 1 && id) macws_vnc_src = IOSurfaceLookup(id);
+            fclose(f);
+        }
+    }
+    if (macws_vnc_src) {
+        if (IOSurfaceLock(macws_vnc_src, 0x1u /*readonly*/, NULL) == 0) {
+            void *sb = IOSurfaceGetBaseAddress(macws_vnc_src);
+            size_t sbpr = IOSurfaceGetBytesPerRow(macws_vnc_src);
+            size_t sh = IOSurfaceGetHeight(macws_vnc_src);
+            if (sb) {
+                size_t cw = ((size_t)padded < sbpr) ? (size_t)padded : sbpr;
+                size_t rows = ((size_t)height < sh) ? (size_t)height : sh;
+                for (size_t y = 0; y < rows; y++)
+                    memcpy(macws_vnc_fb + y * (size_t)padded, (char *)sb + y * sbpr, cw);
+            }
+            IOSurfaceUnlock(macws_vnc_src, 0x1u, NULL);
+        }
+        return;
+    }
+    // 2) Fallback: test gradient (only when /tmp/macws_vnc_test exists).
+    if (!macws_vnc_test_on) return;
     int pxw = padded / bytespp;
     for (int y = 0; y < height; y++) {
         unsigned char *row = (unsigned char *)macws_vnc_fb + (size_t)y * padded;

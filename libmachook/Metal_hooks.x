@@ -47,6 +47,54 @@ static int macws_disp_mode(void) {
     }
     return cached;
 }
+// Cross-process VNC share: WS mirrors the composite into a GLOBAL IOSurface that
+// OSXvnc (a separate process) looks up by ID and blits into its frameBufferData
+// (see mac_hooks.m macws_install_osxvnc_hooks / macws_vnc_fill). Gated by
+// sentinel /tmp/macws_vnc_share. Content is still the tiled +0xa0 copy until the
+// detile lands — this first proves the WS->OSXvnc->VNC pipeline with REAL bytes.
+extern uint32_t IOSurfaceGetID(IOSurfaceRef);
+static IOSurfaceRef g_vncSurf = NULL;
+static int macws_vnc_share_enabled(void) {
+    static int c = -1;
+    if (c < 0) c = (getenv("MACWS_VNC_SHARE") || access("/tmp/macws_vnc_share", F_OK) == 0) ? 1 : 0;
+    return c;
+}
+static void macws_vnc_share_ensure(size_t w, size_t h) {
+    if (g_vncSurf || w < 1000 || h < 600) return;
+    NSDictionary *p = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+        @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+        @"IOSurfaceIsGlobal": @YES };
+    g_vncSurf = IOSurfaceCreate((__bridge CFDictionaryRef)p);
+    if (g_vncSurf) {
+        uint32_t sid = IOSurfaceGetID(g_vncSurf);
+        FILE *f = fopen("/tmp/macws_vnc_surfid", "w");
+        if (f) { fprintf(f, "%u\n", (unsigned)sid); fclose(f); }
+        fprintf(stderr, "#### VNC-SHARE global surf id=%u %zux%zu\n", (unsigned)sid, w, h);
+    }
+}
+// Mirror a filled display surface (base/sbpr/sh) into g_vncSurf for OSXvnc.
+static void macws_vnc_share_mirror(void *base, size_t sbpr, size_t sh, size_t w) {
+    if (!macws_vnc_share_enabled() || !base) return;
+    // Skip empty/black surfaces so an empty frame doesn't CLOBBER a
+    // content-bearing one (the bg loop mirrors every tracked surface,
+    // last-writer-wins). Only mirror when this surface actually has content.
+    size_t nz = 0, samp = 0, tot = sbpr * sh;
+    for (size_t off = 0; off < tot; off += 4096) { if (((uint8_t *)base)[off]) nz++; samp++; }
+    if (!samp || (double)nz / samp < 0.01) return;
+    macws_vnc_share_ensure(w, sh);
+    if (!g_vncSurf) return;
+    if (IOSurfaceLock(g_vncSurf, 0, NULL) != 0) return;
+    void *vb = IOSurfaceGetBaseAddress(g_vncSurf);
+    size_t vbpr = IOSurfaceGetBytesPerRow(g_vncSurf);
+    size_t vh = IOSurfaceGetHeight(g_vncSurf);
+    if (vb) {
+        size_t cw = sbpr < vbpr ? sbpr : vbpr;
+        size_t rows = sh < vh ? sh : vh;
+        for (size_t y = 0; y < rows; y++)
+            memcpy((char *)vb + y * vbpr, (char *)base + y * sbpr, cw);
+    }
+    IOSurfaceUnlock(g_vncSurf, 0, NULL);
+}
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
 // thread on first use. The thread either fills the surface gray (mode 1) or
 // copies the texture's CPU-mapped GPU backing (+0xa0, which holds the real
@@ -93,6 +141,10 @@ static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
                                     for (size_t y = 0; y < sh; y++)
                                         memcpy((char *)base + y * sbpr,
                                                (char *)backing + y * sbpr, sbpr);
+                                // Mirror this filled display surface to the global
+                                // VNC share surface (cross-process → OSXvnc).
+                                if (backing)
+                                    macws_vnc_share_mirror(base, sbpr, sh, iw);
                                 // One-shot raw dumps for OFFLINE detile RE,
                                 // gated by sentinel /tmp/macws_disp_dump. Two
                                 // independent files so we learn which texture
