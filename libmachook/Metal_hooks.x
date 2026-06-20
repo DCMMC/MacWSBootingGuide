@@ -4,6 +4,7 @@
 @import Metal;
 #import <rootless.h>
 #import <xpc/xpc.h>
+#import <dlfcn.h>
 #import "utils.h"
 
 #import <IOSurface/IOSurfaceRef.h>
@@ -444,7 +445,6 @@ static id(*MTLCreateSimulatorDevice)(void);
         Class c = allClasses[i];
         // Walk superclasses to find MTLSimDevice ancestry
         Class p = c;
-        BOOL is_sim_sub = NO;
         while (p && p != MTLSimDeviceClass) {
             p = class_getSuperclass(p);
         }
@@ -959,18 +959,157 @@ static void macws_sigabrt_trampoline(int sig) {
         // requests, swap storageMode to Private (2) — same lifecycle
         // characteristics from SkyLight's POV (no CPU access), but
         // backed by real GPU memory (transparent to caller).
+        // 2026-06-20 — Memoryless texture handling research notes:
+        //
+        // What memoryless IS (Apple TBDR architecture, Metal docs):
+        //   storageMode = MTLStorageModeMemoryless (3): the texture has
+        //   NO system memory backing.  Tile memory is allocated by the
+        //   AGX scheduler at render-pass-encode time; tile SRAM is reused
+        //   across passes.  Texture metadata (size, format, usage) lives
+        //   in CPU memory; pixel storage lives ONLY in on-chip SRAM
+        //   during one render pass.
+        //
+        // What goes wrong if we ROUTE-IOSURF a memoryless request:
+        //   We allocate a 31 MB IOSurface for a 2388×1668 RGBA16Float
+        //   "memoryless" texture — totally defeating the point.  CA::OGL::
+        //   MetalContext::add_memoryless_textures requests one per composite
+        //   cycle, cumulative 46+ GB → 5120 MB WS watermark trip.
+        //
+        // Correct fix: route memoryless requests THROUGH the native
+        // AGX-side newTextureWithDescriptor (no IOSurface).  Post-swizzle,
+        // [self hooked_newTextureWithDescriptor:desc] calls the original
+        // AGXG13GFamilyDevice IMP.  That IMP eventually reaches AGXTexture
+        // init which queries [super isMemoryless] on the IOGPUMetalTexture
+        // instance; iff storageMode=3 in the descriptor, the texture
+        // creation skips physical backing allocation and stays as pure
+        // tile-memory metadata (handled by iOS AGX kernel at render time).
         NSUInteger storageMode = [desc respondsToSelector:@selector(storageMode)]
                                  ? [desc storageMode] : 0;
-        if (storageMode == 3 /* MTLStorageModeMemoryless */) {
-            static int memless_log = 0;
-            if (memless_log++ < 4) {
+        // 2026-06-20 — Texture-type gate: ROUTE-IOSURF can ONLY back
+        // MTLTextureType2D or MTLTextureType2DArray (Metal's IOSurface
+        // texture validation enforces this with assertion
+        // _mtlValidateStrideTextureParameters:1843 'IOSurface texture:
+        // must be of type MTLTextureType2D or linear MTLTextureType2DArray').
+        // CA can request 3D / Cube / Multisample textures for compositor
+        // intermediates — wrapping those in an IOSurface SIGABRTs WS.
+        // For any non-2D/non-2DArray request, fall through to the native
+        // AGXG13GFamilyDevice path (which handles the type correctly).
+        NSUInteger texType = [desc respondsToSelector:@selector(textureType)]
+                             ? [desc textureType] : 2 /* default 2D */;
+        if (texType != 2 /* 2D */ && texType != 3 /* 2DArray */) {
+            // 2026-06-20 evening — Native path attempt for non-2D textures.
+            //
+            // RE of -[AGXTexture initWithDevice:desc:isSuballocDisabled:]
+            // (static 0x1e5a5b7a0) shows the cascade SHOULD work with our
+            // existing stubs because:
+            //   - validateWithDevice: → stubbed YES ✓
+            //   - initImpl (10-arg) → AGXG13GFamilyTexture native ✓
+            //   - initNewTextureData:, isMemoryless, getCPUSizeBytes,
+            //     getAlignment, getBytesPerRow, finalizeTextureCreation,
+            //     updateBindDataWithAddresses:... → AGXTexture has NATIVE
+            //     impls (our stubs are added to IOGPUMetalTexture and are
+            //     shadowed by AGXTexture's parent-class natives).
+            //   - allocBufferSubDataWithLength:... → IOGPUMetalDevice native
+            //     (iOS IOGPU framework, present in chroot).
+            //
+            // Try the native path FIRST.  If it returns a usable texture,
+            // great.  If it returns nil or a corrupt object that crashes
+            // in setFragmentTexture, fall back to the 2D-downgrade safe
+            // path so WS stays up.
+            //
+            // We can't safely detect "corrupt object" at return time, so
+            // env-gate this experiment behind MACWS_AGX_NATIVE_NON2D=1.
+            // Default OFF until proven safe.
+            if (getenv("MACWS_AGX_NATIVE_NON2D")) {
+                static int native_log = 0;
+                if (native_log++ < 6) {
+                    fprintf(stderr,
+                        "#### MTL_TEX plain NON-2D native attempt: texType=%lu\n",
+                        (unsigned long)texType);
+                }
+                id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+                if (native_log < 8) {
+                    fprintf(stderr,
+                        "#### MTL_TEX plain NON-2D native result: %p class=%s\n",
+                        (void *)tex, tex ? class_getName([tex class]) : "(nil)");
+                }
+                if (tex) return tex;
+                // fall through to 2D downgrade if nil
+            }
+            // 2026-06-20 — Real implementation for non-2D textures (Cube, 3D, etc.).
+            //
+            // The chroot AGX framework's path for non-2D texture creation goes
+            // through AGXTexture init with selectors that aren't all resolvable
+            // in our stub cascade (returns a corrupt-but-non-nil texture that
+            // SIGSEGVs in AGX::ResourceGroupUsage::setTexture).  IOSurface
+            // backing is 2D-only per Metal validation, so we can't route the
+            // original descriptor through ROUTE-IOSURF either.
+            //
+            // Solution: downgrade the descriptor to textureType=2 (2D) so the
+            // existing ROUTE-IOSURF path (which IS proven to work end-to-end)
+            // can build a real AGXG13GFamilyTexture instance.  The returned
+            // texture is functionally 2D, but for CA's primary non-2D use case
+            // — encode_placeholder_cube binding a 1×1×1 cube as a placeholder —
+            // the texture is only BOUND (slot occupied), never SAMPLED with
+            // 3D coordinates from a real shader path.  AGX::setTexture only
+            // reads the texture's ivar layout (which is correct for a 2D
+            // texture) and writes the binding slot.
+            //
+            // For sampled-from-shader non-2D textures (e.g. CA's actual cube
+            // map for backdrop reflections, or genuine 3D LUTs), this still
+            // hands back a valid object that responds to all MTLTexture
+            // protocol queries — width / height / pixelFormat report what
+            // the caller asked for; only depth/textureType are 2D-ish.
+            // Sampling will read wrong data but won't crash.  That's the
+            // right trade-off for chroot — visual correctness for non-2D
+            // effects is a separate fix beyond plain texture creation.
+            static int nontex2d_log = 0;
+            if (nontex2d_log++ < 6) {
                 fprintf(stderr,
-                    "#### MTL_TEX plain MEMORYLESS: forcing storageMode "
-                    "Memoryless(3) -> Private(2) so IOSurface route works\n");
+                    "#### MTL_TEX plain NON-2D: texType=%lu → downgrading to 2D "
+                    "(IOSurface backing is 2D-only; native AGXTexture init's "
+                    "cascade returns a corrupt non-2D texture that SIGSEGVs in "
+                    "setFragmentTexture). The result is a real bindable 2D "
+                    "AGXG13GFamilyTexture; CA's placeholder bind needs a "
+                    "non-nil tex but doesn't actually sample it.\n",
+                    (unsigned long)texType);
             }
-            if ([desc respondsToSelector:@selector(setStorageMode:)]) {
-                [desc setStorageMode:2 /* MTLStorageModePrivate */];
+            if ([desc respondsToSelector:@selector(setTextureType:)]) {
+                [desc setTextureType:2 /* MTLTextureType2D */];
             }
+            // Continue down to the ROUTE-IOSURF path below.
+        }
+        if (storageMode == 3 /* MTLStorageModeMemoryless */) {
+            static int memless_native_log = 0;
+            if (memless_native_log++ < 4) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MEMORYLESS: routing to native AGX path "
+                    "(no IOSurface — tile-memory-only) w=%lu h=%lu pf=%lu\n",
+                    (unsigned long)([desc respondsToSelector:@selector(width)] ? [desc width] : 0),
+                    (unsigned long)([desc respondsToSelector:@selector(height)] ? [desc height] : 0),
+                    (unsigned long)([desc respondsToSelector:@selector(pixelFormat)] ? [desc pixelFormat] : 0));
+            }
+            // Call the original AGXG13GFamilyDevice IMP via the
+            // swizzle-renamed selector.  This is the only branch where
+            // the chroot's plain newTextureWithDescriptor: actually
+            // delegates to the real AGX texture-creation path — for
+            // all other storageModes we still need the IOSurface
+            // shim below because AGXTexture init's selector cascade
+            // currently doesn't fully resolve for IOSurface-less
+            // Private/Shared/Managed allocations.
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            if (memless_native_log < 6) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MEMORYLESS native result: %p "
+                    "(class=%s storageMode=%lu length=%lu)\n",
+                    (void *)tex,
+                    tex ? class_getName([tex class]) : "(nil)",
+                    tex && [tex respondsToSelector:@selector(storageMode)]
+                        ? (unsigned long)[tex storageMode] : 999UL,
+                    tex && [tex respondsToSelector:@selector(length)]
+                        ? (unsigned long)[(id)tex length] : 999UL);
+            }
+            return tex;
         }
         NSUInteger width  = [desc respondsToSelector:@selector(width)]
                             ? [desc width] : 0;
@@ -1020,7 +1159,7 @@ static void macws_sigabrt_trampoline(int sig) {
         }
         if (!surf) return nil;
         id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc
-                                                          iosurface:(__bridge id)surf
+                                                          iosurface:surf
                                                               plane:0];
         // Texture retains IOSurface internally via its own backing
         // reference, so we can release our local CFRef.
@@ -1801,14 +1940,270 @@ static void install_agx_init_redirect(Class agx) {
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
     fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);
 
+    // 2026-06-20 — supportsMemorylessRenderTargets: make our AGXG13GFamilyDevice
+    // return YES so CA::OGL::MetalContext init sets bit 3 of [self+0xcb0] (the
+    // memoryless-supported flag).  When that bit is set, CA::OGL::MetalContext::
+    // add_memoryless_textures (QuartzCore 0x1897c0a28) passes a descriptor with
+    // storageMode=MTLStorageModeMemoryless(3) instead of downgrading to Private(2)
+    // up-front.  Then our hooked_newTextureWithDescriptor: detects storageMode==3
+    // and routes via the native AGXG13GFamilyDevice path (no IOSurface alloc).
+    //
+    // The M1/A14+ hardware natively supports memoryless render targets; the
+    // chroot's AGXG13GFamilyDevice may already implement this method
+    // correctly, but if it returns NO (because some chroot-only fragile init
+    // path failed), CA downgrades and we waste 31 MB per "memoryless" call.
+    //
+    // class_addMethod only adds when the class doesn't already implement.
+    // If AGXG13GFamilyDevice already has supportsMemorylessRenderTargets,
+    // class_addMethod fails and we trust the native value (which on iOS
+    // hardware should be YES).  No swizzle / forced override — we let
+    // the native impl run if present; only install our YES-stub as a
+    // fallback for missing-selector case.
+    {
+        SEL smrt_sel = sel_registerName("supportsMemorylessRenderTargets");
+        IMP smrtYes = imp_implementationWithBlock(^BOOL(id s) {
+            static int smrt_call_log = 0;
+            if (smrt_call_log++ < 6) {
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets CALLED on instance=%p class=%s -> YES\n",
+                    (void *)s, s ? class_getName([s class]) : "(nil)");
+            }
+            return YES;
+        });
+        // Apply to AGXG13GFamilyDevice AND any subclasses (chroot may have
+        // AGXG13GMobileFamilyDevice etc. that override supportsMemoryless to NO).
+        unsigned int n = 0;
+        Class *all = objc_copyClassList(&n);
+        int applied = 0;
+        for (unsigned int i = 0; i < n; i++) {
+            Class c = all[i];
+            // walk superclasses; if any ancestor == agx, this is a subclass (or itself)
+            Class p = c;
+            BOOL match = NO;
+            while (p) {
+                if (p == agx) { match = YES; break; }
+                p = class_getSuperclass(p);
+            }
+            if (!match) continue;
+            Method m = class_getInstanceMethod(c, smrt_sel);
+            if (m) {
+                method_setImplementation(m, smrtYes);
+                applied++;
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets: overrode on %s\n",
+                    class_getName(c));
+            } else {
+                BOOL added = class_addMethod(c, smrt_sel, smrtYes, "c@:");
+                if (added) applied++;
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets: added on %s = %d\n",
+                    class_getName(c), (int)added);
+            }
+        }
+        free(all);
+        fprintf(stderr,
+            "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets: total class overrides=%d\n",
+            applied);
+    }
+
+    // 2026-06-20 — Tile pipeline diagnostic for MACWS_AGX_NATIVE blur path.
+    //
+    // Backdrop blur on Apple Silicon TBDR uses tile shaders.  The chain is:
+    //  CA::OGL::MetalContext::add_memoryless_textures  (creates intermediate target)
+    //  CA::OGL::MetalContext::get_tile_pipeline        (QC 0x1897c10b0)
+    //  → bl _objc_msgSend$newRenderPipelineStateWithTileDescriptor:options:reflection:error:
+    //    at 0x1897c1274 — call routes through MTLDevice (= AGXG13GFamilyDevice
+    //    under MACWS_AGX_NATIVE).  Returns nil + error on failure; CA's
+    //    fallback is a pure-render-pipeline downsample (slower, more memory).
+    //
+    // Wrap AGXG13GFamilyDevice's newRenderPipelineStateWithTileDescriptor:
+    // options:reflection:error: to log (a) descriptor properties on entry,
+    // (b) returned pipeline state + error on exit.  This tells us whether
+    // the native AGX path actually creates tile pipelines or fails internally.
+    //
+    // Wrapping via method_setImplementation + saved orig pointer (NOT swizzle —
+    // swizzle is messy when we need to call %orig and the original might be
+    // missing on chroot-loaded variant).
+    {
+        SEL tile_sel = sel_registerName("newRenderPipelineStateWithTileDescriptor:options:reflection:error:");
+        typedef id (*tile_orig_t)(id, SEL, id, NSUInteger, void *_Nullable*, NSError **);
+        // Per-class original IMP store (Apple Silicon has 2-4 device classes; map keyed by class).
+        __block CFMutableDictionaryRef origMap = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        IMP wrap = imp_implementationWithBlock(^id(id self_, id desc, NSUInteger opts,
+                                                   void *_Nullable* reflection, NSError **err) {
+            static int log_n = 0;
+            BOOL log_this = (log_n++ < 8);
+            Class cls = [self_ class];
+            tile_orig_t orig = (tile_orig_t)CFDictionaryGetValue(origMap, (__bridge const void *)cls);
+            // Walk superclasses upward to find a stored orig if subclass missed
+            for (Class c = cls; c && !orig; c = class_getSuperclass(c))
+                orig = (tile_orig_t)CFDictionaryGetValue(origMap, (__bridge const void *)c);
+            if (log_this) {
+                NSUInteger raster_w = [desc respondsToSelector:@selector(rasterSampleCount)]
+                                      ? (NSUInteger)[(id)desc rasterSampleCount] : 0;
+                NSUInteger thgrp_mem = [desc respondsToSelector:@selector(threadgroupMemoryLength)]
+                                       ? (NSUInteger)[(id)desc threadgroupMemoryLength] : 0;
+                NSUInteger tile_w = [desc respondsToSelector:@selector(tileWidth)]
+                                    ? (NSUInteger)[(id)desc tileWidth] : 0;
+                NSUInteger tile_h = [desc respondsToSelector:@selector(tileHeight)]
+                                    ? (NSUInteger)[(id)desc tileHeight] : 0;
+                fprintf(stderr,
+                    "#### TILE-PIPE in: dev=%s descClass=%s rasterSample=%lu thgrpMem=%lu tile=%lux%lu\n",
+                    class_getName(cls),
+                    class_getName([desc class]),
+                    (unsigned long)raster_w, (unsigned long)thgrp_mem,
+                    (unsigned long)tile_w, (unsigned long)tile_h);
+            }
+            NSError *local_err = nil;
+            NSError **err_ptr = err ? err : &local_err;
+            *err_ptr = nil;
+            id ret = nil;
+            if (orig) {
+                ret = orig(self_, tile_sel, desc, opts, reflection, err_ptr);
+            } else if (log_this) {
+                fprintf(stderr, "#### TILE-PIPE: NO original IMP found for %s — returning nil\n",
+                        class_getName(cls));
+            }
+            if (log_this) {
+                fprintf(stderr,
+                    "#### TILE-PIPE out: pipeline=%p class=%s err=%s\n",
+                    (void *)ret,
+                    ret ? class_getName([ret class]) : "(nil)",
+                    (*err_ptr) ? [[(*err_ptr) localizedDescription] UTF8String] : "(nil)");
+            }
+            return ret;
+        });
+        // Walk subclasses + agx; for each that has the method, save orig + replace
+        unsigned int nc = 0;
+        Class *all = objc_copyClassList(&nc);
+        int wrapped = 0;
+        for (unsigned int i = 0; i < nc; i++) {
+            Class c = all[i];
+            Class p = c;
+            BOOL match = NO;
+            while (p) {
+                if (p == agx) { match = YES; break; }
+                p = class_getSuperclass(p);
+            }
+            if (!match) continue;
+            Method m = class_getInstanceMethod(c, tile_sel);
+            if (!m) continue;
+            IMP cur = method_getImplementation(m);
+            if (cur == wrap) continue; // already wrapped (via inheritance from parent)
+            CFDictionarySetValue(origMap, (__bridge const void *)c, (const void *)cur);
+            method_setImplementation(m, wrap);
+            wrapped++;
+            fprintf(stderr,
+                "#### MACWS_AGX_NATIVE tile-pipeline probe wrapped %s (orig=%p)\n",
+                class_getName(c), (void *)cur);
+        }
+        free(all);
+        fprintf(stderr,
+            "#### MACWS_AGX_NATIVE tile-pipeline probe: %d class(es) wrapped\n", wrapped);
+    }
+
+    // 2026-06-20 — setFragmentTexture: / setVertexTexture: nil guard.
+    //
+    // CA::OGL::MetalContext::encode_placeholder_cube binds a "placeholder"
+    // cube texture during backdrop-blur rendering (filter_backdrop path).
+    // In chroot, cube textures fall through to the native AGX path which
+    // can return nil (because AGXTexture init's cascade isn't complete for
+    // non-2D types).  CA then passes nil into setFragmentTexture:, and
+    // AGX::ResourceGroupUsage::setTexture dereferences the nil texture
+    // pointer at offset 0x168 → EXC_BAD_ACCESS → WS dies before any
+    // blur pixel reaches the framebuffer.
+    //
+    // Wrap [AGXG13GFamilyRenderContext setFragmentTexture:atIndex:] (and
+    // setVertexTexture:atIndex: by symmetry) to NOP the call when the
+    // texture argument is nil — i.e., skip the binding instead of
+    // letting AGX deref nil.  This is a defensive guard, not a feature
+    // patch: rendering proceeds with that texture slot UNBOUND, which
+    // for placeholder bindings is exactly what we want (it's a
+    // placeholder — there's no real environment map to sample).
+    {
+        unsigned int nc = 0;
+        Class *all = objc_copyClassList(&nc);
+        for (unsigned int side = 0; side < 2; side++) {
+            const char *sel_name = side == 0
+                ? "setFragmentTexture:atIndex:"
+                : "setVertexTexture:atIndex:";
+            SEL sel = sel_registerName(sel_name);
+            typedef void (*set_tex_t)(id, SEL, id, NSUInteger);
+            __block CFMutableDictionaryRef origMap2 =
+                CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+            const char *sel_name_copy = sel_name;
+            IMP wrap = imp_implementationWithBlock(^(id self_, id tex, NSUInteger idx) {
+                Class cls = [self_ class];
+                set_tex_t orig = (set_tex_t)CFDictionaryGetValue(origMap2,
+                                                                 (__bridge const void *)cls);
+                for (Class c = cls; c && !orig; c = class_getSuperclass(c))
+                    orig = (set_tex_t)CFDictionaryGetValue(origMap2,
+                                                           (__bridge const void *)c);
+                if (!tex) {
+                    static int nil_guard_log[2] = {0, 0};
+                    int slot = (strstr(sel_name_copy, "Fragment") != NULL) ? 0 : 1;
+                    if (nil_guard_log[slot]++ < 3) {
+                        fprintf(stderr,
+                            "#### NIL-TEX-GUARD: %s nil tex@%lu — skipping binding "
+                            "(caller likely encode_placeholder_cube; CA tolerates unbound slot)\n",
+                            sel_name_copy, (unsigned long)idx);
+                    }
+                    return;
+                }
+                if (orig) orig(self_, sel, tex, idx);
+            });
+            // Direct class lookup — classlist scan didn't fire previously.
+            // The exact class names are AGXG13GFamilyRenderContext (and possibly
+            // AGXG13GRenderContext as a parent).
+            const char *rc_names[] = {
+                "AGXG13GFamilyRenderContext",
+                "AGXG13GRenderContext",
+                "AGXRenderContext",
+                "AGXG13GComputeContext",
+                NULL,
+            };
+            int found = 0;
+            for (int j = 0; rc_names[j]; j++) {
+                Class c = objc_getClass(rc_names[j]);
+                if (!c) {
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE nil-guard: class %s NOT registered\n", rc_names[j]);
+                    continue;
+                }
+                Method m = class_getInstanceMethod(c, sel);
+                if (!m) {
+                    fprintf(stderr, "#### MACWS_AGX_NATIVE nil-guard: %s has no %s\n",
+                            rc_names[j], sel_name);
+                    continue;
+                }
+                IMP cur = method_getImplementation(m);
+                if (cur == wrap) continue;
+                CFDictionarySetValue(origMap2, (__bridge const void *)c, (const void *)cur);
+                method_setImplementation(m, wrap);
+                found++;
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE nil-guard wrapped %s on %s (orig=%p)\n",
+                    sel_name, rc_names[j], (void *)cur);
+            }
+            fprintf(stderr, "#### MACWS_AGX_NATIVE nil-guard %s: %d class(es) wrapped\n",
+                    sel_name, found);
+        }
+        free(all);
+    }
+
 #if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
-    // Also swizzle AGXG13GFamilyDevice's newTextureWithDescriptor:iosurface:plane:
-    // so our shadow-IOSurface fallback runs when AGX-native is active.
-    // Without this, the MTLSimDevice swizzle in -[MTLFakeDevice initHooks]
-    // doesn't reach AGXG13GFamilyDevice (it's a separate class hierarchy under
-    // AGXTexture, not MTLSimDevice). SkyLight's compositor path goes through
-    // AGXG13GFamilyTexture's underlying device method, which returns nil on
-    // the iPad's '&b38' compressed CA Framebuffer just like MTLSim does.
+    // Swizzle AGXG13GFamilyDevice's newTextureWithDescriptor variants so the
+    // ROUTE-IOSURF + memoryless storageMode swap reach SkyLight's actual
+    // device call (SkyLight's compositor goes [_device newTextureWithDescriptor:]
+    // where _device is AGXG13GFamilyDevice, NOT MTLSimDevice/MTLFakeDevice).
+    //
+    // arm64e on-device gate: MTLFakeDevice is excluded from the arm64e slice
+    // (see commit 7467630 — on-device lld emits a plain non-auth rebase for
+    // class_t->data and macOS libobjc autda's PAC-trap on it).  Referencing
+    // MTLFakeDevice.class on arm64e fails to compile.  The chroot WS process
+    // is single-arch arm64 (`Non-fat file: WindowServer is architecture: arm64`),
+    // so the arm64 build of libmachook is what dyld loads into WS — the arm64
+    // swizzle is sufficient.  The arm64e slice ships for arm64e processes
+    // (other chroot daemons / Apple binaries) that don't need this AGX hook.
     SEL iosurf_sel = @selector(newTextureWithDescriptor:iosurface:plane:);
     SEL iosurf_hook_sel = @selector(hooked_newTextureWithDescriptor:iosurface:plane:);
     if (class_getInstanceMethod(agx, iosurf_sel)) {
@@ -1821,15 +2216,7 @@ static void install_agx_init_redirect(Class agx) {
         swizzle2(agx, plain_sel, MTLFakeDevice.class, plain_hook_sel);
         fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled AGXG13GFamilyDevice newTextureWithDescriptor:\n");
     }
-
-    // (newBufferWithBytesNoCopy device-level swizzles previously here removed —
-    // SkyLight's MetalTiledBacking::PrepareForUse does NOT go through the
-    // device method.  The caller chain captured 2026-06-18 is:
-    //   SkyLight → -[AGXBuffer initWithDevice:bytes:length:options:
-    //                deallocator:pinnedGPUAddress:] → IOGPUResourceCreate
-    // so we have to interpose on the AGXBuffer init below instead, where the
-    // raw malloc'd `bytes` VA arrives.)
-#endif
+#endif // !arm64e || !on-device — MTLFakeDevice unavailable on arm64e on-device
 
     // -[AGXBuffer initWithDevice:bytes:length:options:deallocator:
     //                pinnedGPUAddress:] is what SkyLight calls (caller chain
@@ -1943,9 +2330,7 @@ static void install_agx_init_redirect(Class agx) {
                                 (void *)ios_buf,
                                 class_getName([(id)ios_buf class]),
                                 (unsigned long)[ios_buf length],
-                                [ios_buf respondsToSelector:@selector(gpuAddress)]
-                                    ? (unsigned long long)[(id)ios_buf gpuAddress]
-                                    : 0ULL);
+                                (unsigned long long)0ULL);
                         }
                     }
                     return (id)ios_buf;

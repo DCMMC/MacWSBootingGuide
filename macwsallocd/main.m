@@ -207,6 +207,8 @@ static void alloc_serve(xpc_object_t event) {
         // IOSurfaceClient.IOSurfaceLookupFromMachPort path fails for ports
         // created in another task (runtime-confirmed 2026-06-19: chroot's
         // local-test roundtrip works; cross-process port lookup returns nil).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
         NSDictionary *props = @{
             (id)kIOSurfaceWidth:           @(size),
             (id)kIOSurfaceHeight:          @(1),
@@ -214,6 +216,7 @@ static void alloc_serve(xpc_object_t event) {
             (id)kIOSurfacePixelFormat:     @((uint32_t)'L008'),
             (id)kIOSurfaceIsGlobal:        @YES,
         };
+#pragma clang diagnostic pop
         IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
         if (!surf) {
             result = "io_create_fail";

@@ -97,6 +97,17 @@ add_all_trustcache() {
     add_x86_64_trustcache "$path"
 }
 
+# ─── LaunchDaemons plist ownership/permissions ─────────────────────────────
+# launchctl refuses to load any plist under a system LaunchDaemons dir unless
+# owner=root:wheel and mode=0644.  The deb install preserves whatever owner
+# the build host had (typically mobile:staff), so reset to root:wheel 0644.
+# Without this, launchservicesd never starts (chroot Cocoa apps then crash in
+# HIServices _RegisterApplication).
+if [ -d /var/jb/usr/macOS/LaunchDaemons ]; then
+    chown root:wheel /var/jb/usr/macOS/LaunchDaemons/*.plist 2>/dev/null || true
+    chmod 644       /var/jb/usr/macOS/LaunchDaemons/*.plist 2>/dev/null || true
+fi
+
 # ─── On-demand auto-sign daemon (iOS side) ──────────────────────────────────
 # libmachook's exec hooks ask this daemon (over /tmp/autosignd.sock) to
 # sign+trustcache a binary on first exec, so arbitrary macOS programs run in the

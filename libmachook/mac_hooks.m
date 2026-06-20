@@ -7,6 +7,7 @@
 #import <xpc/xpc.h>
 #import <sys/sysctl.h>
 #import <malloc/malloc.h>
+#import <stdatomic.h>
 #import "interpose.h"
 #import "utils.h"
 
@@ -220,6 +221,7 @@ extern kern_return_t mach_vm_map(
     vm_prot_t cur_protection, vm_prot_t max_protection,
     vm_inherit_t inheritance);
 
+__attribute__((unused))
 static uint64_t macws_make_mem_entry_xpc(uint64_t size, uint64_t *out_size) {
     static xpc_connection_t conn = NULL;
     static dispatch_once_t once;
@@ -641,6 +643,7 @@ static void macws_walk_chained_fixups(const struct mach_header_64 *header,
 
     // Helper: resolve symbol name for an import index, given imports format.
     const void *imports_base = fixups + fh->imports_offset;
+    __attribute__((unused))
     typedef const char *(*import_name_t)(const void *imports_base, uint32_t idx);
     const char *(^get_import_name)(uint32_t) = ^const char *(uint32_t idx) {
         switch (fh->imports_format) {
@@ -962,7 +965,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // if backboardd is running, WindowServer switches to offscreen rendering
         uint32_t *check = (uint32_t *)(OFF_SkyLight_CAWSManager_register_abort + (uintptr_t)header);
         ModifyExecutableRegion(check, sizeof(uint32_t), ^{
-#warning TODO: has hardcoded instruction
+            // TODO: has hardcoded instruction
             // NSLog(@"#### debugbydcmmc OFF_SkyLight_CAWSManager_register_abort ModifyExecutableRegion addr %lu val %lu, expect: %lu",
             //     (unsigned long) check, (unsigned long) *check, (unsigned long) 0xb4000588);
             // Patch only if the expected instruction is present; skip (do not
@@ -1298,6 +1301,27 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             struct stub { const char *sel; const char *enc; IMP imp; };
             // BOOL stubs returning NO
             IMP retNO = imp_implementationWithBlock(^BOOL(id s) { (void)s; return NO; });
+            // 2026-06-20 — isMemoryless was previously stubbed to ALWAYS
+            // return NO, breaking memoryless texture handling: AGXTexture
+            // init at 0x1e5a5b9c0 sends `isMemoryless` to the IOGPUMetalTexture
+            // super-init result; returning NO sends it down the "with
+            // backing memory" path, which for a memoryless request meant
+            // ROUTE-IOSURF allocated a 31 MB IOSurface per call → 5120 MB
+            // WS watermark OOM in <60 composite cycles.  Replace with an
+            // IMP that queries the texture's storageMode property (part
+            // of MTLTexture protocol; natively implemented on IOGPUMetalTexture
+            // / AGXG13GFamilyBuffer) and returns YES iff the texture was
+            // requested as memoryless (storageMode == 3).
+            IMP retIsMemoryless = imp_implementationWithBlock(^BOOL(id s) {
+                if (s && [s respondsToSelector:@selector(storageMode)]) {
+                    // storageMode returns NSUInteger; use objc_msgSend variant
+                    // to avoid pulling in Metal headers here.
+                    typedef NSUInteger (*sm_t)(id, SEL);
+                    NSUInteger sm = ((sm_t)objc_msgSend)(s, @selector(storageMode));
+                    return sm == 3 /* MTLStorageModeMemoryless */;
+                }
+                return NO;
+            });
             // size_t stubs returning 0
             IMP retZeroSize = imp_implementationWithBlock(^NSUInteger(id s) { (void)s; return 0; });
             // NSUInteger stubs returning 0
@@ -1315,7 +1339,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 (void)s; (void)l; (void)o; (void)a; (void)h; (void)b; (void)off; return nil;
             });
             struct stub stubs[] = {
-                { "isMemoryless",                                  "c@:",                retNO },
+                { "isMemoryless",                                  "c@:",                retIsMemoryless },
                 { "protectionOptions",                             "Q@:",                retZeroNS },
                 { "getCPUSizeBytes",                               "Q@:",                retZeroSize },
                 { "getAlignment",                                  "Q@:",                retZeroSize },
@@ -1380,6 +1404,18 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             });
         }
     } else if(getenv("MACWS_AGX_NATIVE") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
+        // 2026-06-20 — One-shot guard.  AGXMetal13_3 is dlopen'd multiple
+        // times across the WS lifetime (initial Metal load + chroot's
+        // explicit re-dlopen + dyld notify on dependent-loads).  Re-running
+        // the patches is idempotent BUT the diagnostic fprintf calls
+        // accumulate stderr writes, and on the Nth invocation we've seen
+        // KERN_PROTECTION_FAILURE in __write_nocancel (stderr's FILE buffer
+        // gets corrupted somewhere — likely a stack overlap during the
+        // dyld notify-load lock).  Make this block fire ONCE per process.
+        static _Atomic int s_agxmetal_patched = 0;
+        if (atomic_exchange(&s_agxmetal_patched, 1)) {
+            return; // already patched in this process
+        }
         // CHROOT AGX-NATIVE patches for the strict-AGX-native userspace path.
         //
         // Originally three layered binary patches lived here:
@@ -1464,7 +1500,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 void *fn = *slot;
                 Dl_info di = {0};
                 int ok = dladdr(fn, &di);
-                fprintf(stderr,
+                dprintf(2,
                     "#### AGX_TEX_DIAG GOT@%p = %p  (slid %#llx + %#zx = %#llx)\n"
                     "####   role: %s\n"
                     "####   dladdr ok=%d sym=%s base=%p path=%s\n",
@@ -1526,7 +1562,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             void **classref_slot = (void **)(0x21a8a9298 + slide);
             void *cls = *classref_slot;
             const char *clsname = cls ? class_getName((Class)cls) : "(nil)";
-            fprintf(stderr,
+            dprintf(2,
                 "#### AGX_CLASSREF_DIAG newTexture iosurface alloc class "
                 "@%p = %p name=%s\n",
                 classref_slot, cls, clsname);
@@ -1550,7 +1586,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 const char *which = "UNKNOWN";
                 if ((uintptr_t)imp == agxtex_stub) which = "AGXTexture-stub-returns-0";
                 else if ((uintptr_t)imp == agxg13_real) which = "AGXG13GFamilyTexture-real";
-                fprintf(stderr,
+                dprintf(2,
                     "#### AGX_CLASSREF_DIAG initImpl method m=%p imp=%p "
                     "expected stub=%p real=%p WHICH=%s\n",
                     m, imp, (void*)agxtex_stub, (void*)agxg13_real, which);
@@ -1591,7 +1627,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     BOOL is_bl = ((insn & 0xFC000000) == 0x94000000);
                     if (is_bl) {
                         *bl_at = NOP_INSN;
-                        fprintf(stderr,
+                        dprintf(2,
                             "#### MACWS_AGX_SKIP_BIND_UPDATE: NOPed BL @%p "
                             "(static %#llx + slide=%#zx)\n",
                             bl_at, (unsigned long long)bl_static,
@@ -1599,7 +1635,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     } else if (insn == NOP_INSN) {
                         /* already patched */
                     } else {
-                        fprintf(stderr,
+                        dprintf(2,
                             "#### MACWS_AGX_SKIP_BIND_UPDATE: @%p got %#x "
                             "expected BL — SKIP\n",
                             bl_at, insn);
@@ -1690,26 +1726,26 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 const uint32_t AUTDA_X16_X17 = 0xdac11a30u;
                 const uint32_t XPACD_X16     = 0xdac147f0u;
                 uint32_t cur = *autda_at;
-                fprintf(stderr,
+                dprintf(2,
                     "#### MACWS_AGX_OBJC_AUTDA_PATCH msgSendSuper2=%p "
                     "autda@%p insn=%#x\n",
                     super2, autda_at, cur);
                 if (cur == XPACD_X16) {
-                    fprintf(stderr, "####   already patched, skip\n");
+                    dprintf(2, "####   already patched, skip\n");
                 } else if (cur != AUTDA_X16_X17) {
-                    fprintf(stderr,
+                    dprintf(2,
                         "####   unexpected insn (expected %#x for autda x16,x17) — skip\n",
                         AUTDA_X16_X17);
                 } else {
                     ModifyExecutableRegion(autda_at, 4, ^{
                         *autda_at = XPACD_X16;
                     });
-                    fprintf(stderr,
+                    dprintf(2,
                         "####   PATCHED autda x16,x17 → xpacd x16 (%#x → %#x)\n",
                         AUTDA_X16_X17, XPACD_X16);
                 }
             } else {
-                fprintf(stderr,
+                dprintf(2,
                     "#### MACWS_AGX_OBJC_AUTDA_PATCH: dlsym(objc_msgSendSuper2)=NULL\n");
             }
 
@@ -1718,7 +1754,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             Class iogpu_tex = objc_getClass("IOGPUMetalTexture");
             if (agx_tex && iogpu_tex) {
                 uint64_t *super_field = (uint64_t *)((uintptr_t)agx_tex + 8);
-                fprintf(stderr,
+                dprintf(2,
                     "#### MACWS_AGX_SUPERCLASS_DIAG AGXTexture=%p field@%p=%#llx "
                     "IOGPUMetalTexture=%p\n",
                     (void*)agx_tex, super_field,
@@ -1763,7 +1799,15 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 if (c == 0) { preview[i] = 0; break; }
                 if (c < 0x20 || c >= 0x7f) preview[i] = '.';
             }
-            fprintf(stderr,
+            // 2026-06-20 — dprintf(2, ...) not dprintf(2, ...) here.
+            // The latter writes to libsystem's _stderr FILE struct's
+            // internal buffer; if the FILE struct's _p (current write
+            // position) gets corrupted (we saw KERN_PROTECTION_FAILURE
+            // in __write_nocancel writing to a shared-cache RO address),
+            // every subsequent fprintf in any loadImageCallback re-entry
+            // crashes WS.  dprintf does fresh-buffer-then-write(fd) — no
+            // FILE* state involved, robust against the corruption.
+            dprintf(2,
                 "#### MACWS_AGX_SEL_DIAG super-init SEL static=%#llx slid=%p "
                 "readable=%d\n"
                 "####   bytes=\"%s\"\n",
@@ -1772,7 +1816,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // Also: what does sel_registerName resolve THIS cstring to?
             if (readable && preview[0]) {
                 SEL s = sel_registerName(sel_runtime);
-                fprintf(stderr,
+                dprintf(2,
                     "####   sel_registerName(...) = %p name=\"%s\"\n",
                     s, sel_getName(s));
             }
@@ -3179,6 +3223,7 @@ static void macws_install_crash_diag(void) {
 // property data. WindowServer keeps running; we lose HID property data
 // for display-related devices, which we don't have parseable copies of
 // anyway.
+__attribute__((unused))
 static CFTypeRef hooked_IOHIDUnserializeAndVMDealloc(
         const void *buffer, mach_vm_size_t length) {
     (void)buffer; (void)length;
@@ -4291,6 +4336,37 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     if (getenv("MACWS_IOSURF_TRACE") != NULL) {
         fprintf(stderr, "#### IOSURF_HOOK call cf=%p\n", (void *)properties_cf);
     }
+    // OOM leak diagnostic (2026-06-20): count creates + per-caller bytes.
+    // Every 25 calls, dump caller+size attribution so we can find who's
+    // accumulating IOSurfaces against the 5120 MB WS watermark.
+    {
+        static _Atomic unsigned long s_count = 0;
+        static _Atomic unsigned long s_total_bytes = 0;
+        unsigned long my_n = atomic_fetch_add(&s_count, 1) + 1;
+        size_t my_bytes = 0;
+        if (properties_cf && CFGetTypeID(properties_cf) == CFDictionaryGetTypeID()) {
+            CFNumberRef w = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceWidth"));
+            CFNumberRef h = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceHeight"));
+            CFNumberRef bpe = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceBytesPerElement"));
+            int wi = 0, hi = 0, bi = 4;
+            if (w && CFGetTypeID(w) == CFNumberGetTypeID()) CFNumberGetValue(w, kCFNumberSInt32Type, &wi);
+            if (h && CFGetTypeID(h) == CFNumberGetTypeID()) CFNumberGetValue(h, kCFNumberSInt32Type, &hi);
+            if (bpe && CFGetTypeID(bpe) == CFNumberGetTypeID()) CFNumberGetValue(bpe, kCFNumberSInt32Type, &bi);
+            my_bytes = (size_t)wi * (size_t)hi * (size_t)bi;
+        }
+        unsigned long my_total = atomic_fetch_add(&s_total_bytes, my_bytes) + my_bytes;
+        if (my_n % 250 == 1 /* 1, 251, 501, ... — keep low under steady state */) {
+            Dl_info di;
+            void *ra1 = __builtin_return_address(0);
+            void *ra2 = __builtin_return_address(1);
+            const char *sym1 = "?", *sym2 = "?";
+            if (dladdr(ra1, &di) && di.dli_sname) sym1 = di.dli_sname;
+            if (dladdr(ra2, &di) && di.dli_sname) sym2 = di.dli_sname;
+            fprintf(stderr,
+                "#### IOSURF_STATS n=%lu cumulative_bytes=%lu MB this_size=%zu KB caller1=%s caller2=%s\n",
+                my_n, my_total / (1024*1024), my_bytes / 1024, sym1, sym2);
+        }
+    }
     if (!properties_cf) {
         return IOSurfaceCreate((NSDictionary *)properties_cf);
     }
@@ -4982,6 +5058,29 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz);
     }
     if(IOConnectIsIOGPU(client)) {
+        // OOM leak diagnostic (2026-06-20): periodic per-caller sel=0xa vs
+        // sel=0xb delta — narrows which AGX upstream creates without
+        // matching releases.  We sample 1 in 50 of each (sel=0xa, sel=0xb)
+        // to bound log volume; cumulative counts always printed.
+        if (orig == 0xa || orig == 0xb) {
+            static _Atomic unsigned long s_a_count = 0;
+            static _Atomic unsigned long s_b_count = 0;
+            unsigned long me = (orig == 0xa)
+                ? atomic_fetch_add(&s_a_count, 1) + 1
+                : atomic_fetch_add(&s_b_count, 1) + 1;
+            if (me % 500 == 1) {
+                Dl_info di;
+                void *ra = __builtin_return_address(0);
+                const char *sym = "?";
+                if (dladdr(ra, &di) && di.dli_sname) sym = di.dli_sname;
+                fprintf(stderr,
+                    "#### AGX_LEAK sel=0x%x #%lu (cumA=%lu cumB=%lu delta=%ld) caller=%s\n",
+                    orig, me,
+                    atomic_load(&s_a_count), atomic_load(&s_b_count),
+                    (long)(atomic_load(&s_a_count) - atomic_load(&s_b_count)),
+                    sym);
+            }
+        }
         fprintf(stderr, "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
         // Diagnostic: dump the inStruct for sel=0x7/0x8 failures (queue
         // creation). 1032-byte args; the iOS kernel rejects with 0xe00002c2.
