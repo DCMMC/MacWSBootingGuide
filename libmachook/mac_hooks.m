@@ -830,18 +830,153 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
 // backing path, but THIS variant runs from CompositorMetal::composite
 // with a different MetalContext. Hook to set the flag on the actual
 // ctx (x0=self) being composited.
+//
+// 2026-06-20 — added pop-on-bail invariant restorer (see comments above
+// `orig_skylight_state_stack_pop_back` below).
 typedef int (*StartComposite_WSCD_t)(void *self, void *dest,
                                       unsigned long load_action,
                                       unsigned long store_action);
 void *orig_skylight_start_composite_wscd_ref = NULL;
+// SkyLight `MetalContext::StartComposite(MTLTexture*, MTLLoadAction,
+// MTLStoreAction)` — texture variant, called from `SLCADisplay::
+// render_update` (the path that drives the assert in MetalContext.mm:411).
+//
+// SAME pop-on-bail invariant restorer as the WSCD variant.
+typedef int (*StartComposite_MTLTex_t)(void *self, id texture,
+                                       unsigned long load_action,
+                                       unsigned long store_action);
+static StartComposite_MTLTex_t orig_skylight_start_composite_mtltex = NULL;
+
+// SkyLight `std::deque<RenderState>::pop_back()` symbol at static 0x186637f84.
+// `_state_stack` is the std::deque<RenderState> embedded as the FIRST member
+// of MetalContext, so passing `MetalContext*` to pop_back is correct (same
+// pointer the C++ symbol expects). MUST be resolved at runtime — the chroot
+// SkyLight UUID differs from our static-analysis copy.
+typedef void (*StateStack_pop_back_t)(void *deque);
+static StateStack_pop_back_t orig_skylight_state_stack_pop_back = NULL;
+
+// LEAK INVARIANT RESTORER — runs after MetalContext::StartComposite returns
+// 0 (bail).
+//
+// Root cause RE'd 2026-06-20:
+//   - MetalContext::StartComposite (BOTH the WSCD and MTLTex variants)
+//     calls `_state_stack.emplace_back()` UNCONDITIONALLY at +0x12c, BEFORE
+//     any inner resource allocation. The push grows [self+0x28] by 1.
+//   - When the inner alloc fails (e.g. resolve-tex `_makeTextureFromSurface`
+//     returns NULL on chroot because AGXIOC sel=0xa→0x9 ResCreate rejects
+//     kIOReturnNoBandwidth), StartComposite returns 0 — WITHOUT popping the
+//     just-pushed state.
+//   - `SLCADisplay::render_update`'s SITE 2/3 cleanup paths
+//     (render_update +0x16c8/+0x1738) handle `Start == 0` by jumping
+//     STRAIGHT to `EndUpdate(_, 0, 0)` and SKIPPING the matching
+//     `EndCurrentComposite`. They assume Apple's contract: rv==0 means no
+//     push happened.
+//   - On real Apple hardware the only `rv==0` path is P1 (degenerate rect,
+//     checked BEFORE push), so the invariant holds. On our chroot the
+//     post-push L3 path is the common case, so the invariant breaks — push
+//     leaks, deque grows by one per failed composite, and the next frame's
+//     `EndUpdate` trips `__assert_rtn(_state_stack.empty())` at
+//     MetalContext.mm:411.
+//
+// Fix: at hook exit, if `%orig` returned 0 AND the deque size
+// (`*((u64*)(self+0x28))`) is HIGHER than before %orig, call the deque's
+// `pop_back` directly. That restores the invariant Apple's render_update
+// is built on. NOT a NOP/return-bypass; the legitimate inverse of the push
+// that StartComposite did.
+// Compute the address of the last slot in the std::deque<RenderState> embedded
+// in MetalContext. Mirrors the deque math at emplace_back +0x130-+0x170 and
+// pop_back +0x14-+0x54 disassembly. Returns NULL on shape inconsistency.
+//
+// Layout:
+//   deque+0x00: map_first    (allocation start)
+//   deque+0x08: block_start  (pointer-to-pointer at start of in-use buckets)
+//   deque+0x10: block_end    (pointer-to-pointer one past last in-use)
+//   deque+0x18: map_last     (allocation end)
+//   deque+0x20: start_offset (element index of first element from block 0)
+//   deque+0x28: size         (element count)
+//
+// idx = start_offset + size - 1
+// block_idx = idx / 23
+// slot = block_start[block_idx] + (idx % 23) * 0xb0
+static void *macws_deque_slot_ptr(void *self, uint64_t idx) {
+    if (!self) return NULL;
+    uintptr_t d = (uintptr_t)self;
+    void **bucket = *(void ***)(d + 8);
+    if (!bucket) return NULL;
+    uint64_t block_idx = idx / 23;
+    uint8_t *block = (uint8_t *)bucket[block_idx];
+    if (!block || (uintptr_t)block < 0x1000) return NULL;
+    return block + (idx % 23) * 0xb0;
+}
+
+static int macws_pop_on_startcomp_bail(void *self, uint64_t before, int rv) {
+    if (rv != 0) return rv;
+    if (!self || (uintptr_t)self < 0x1000) return rv;
+    if (!orig_skylight_state_stack_pop_back) return rv;
+    uint64_t after = *(volatile uint64_t *)((char *)self + 0x28);
+    if (after <= before) return rv;
+    // pop until we're back to the pre-call size. In practice that's a single
+    // pop because StartComposite only pushes once, but a `while` guards us
+    // against the (theoretical) case where it pushed twice before bailing.
+    static _Atomic int leaks_observed = 0;
+    int n = atomic_fetch_add(&leaks_observed, 1);
+    if (n < 16) {
+        dprintf(STDERR_FILENO,
+            "#### SS BAIL-POP self=%p before=%llu after=%llu rv=%d (#%d)\n",
+            self, (unsigned long long)before, (unsigned long long)after, rv, n);
+    }
+    while (after > before) {
+        // Zero the just-pushed slot BEFORE pop_back's destructor runs.
+        // RenderState::~RenderState (0x186637c0c) calls objc_release on
+        // [slot+8], [slot+0x10], [slot+0x18], [slot+0x20] and another
+        // cleanup on [slot+0x00]. After StartComposite L3 bailed, those
+        // fields hold either: nil (for never-written), retained but
+        // dangling refs (for L3 partial), or uninitialised stack-leftover.
+        // Zero them — objc_release(nil) is a documented safe no-op, and
+        // the [slot+0x00] cleanup is similarly nil-safe per the AppKit
+        // convention. The OBJECTS the slot referenced are NOT released;
+        // their owning code (CA backend) holds independent retains. We
+        // skip releasing the slot's copies — equivalent to a one-frame
+        // ObjC retain "leak" worth ≤4 refs per failed composite. The
+        // alternative (allowing the destructor to chase the dangling
+        // refs) was empirically SIGSEGV'ing on the first BAIL-POP fire.
+        uint64_t start = *(volatile uint64_t *)((char *)self + 0x20);
+        uint64_t cur_size = *(volatile uint64_t *)((char *)self + 0x28);
+        if (cur_size == 0) break;
+        void *slot = macws_deque_slot_ptr(self, start + cur_size - 1);
+        if (slot) memset(slot, 0, 0xb0);
+        orig_skylight_state_stack_pop_back(self);
+        uint64_t new_after = *(volatile uint64_t *)((char *)self + 0x28);
+        if (new_after >= after) break;  // safety: pop didn't shrink → stop
+        after = new_after;
+    }
+    return rv;
+}
+
 int hooked_skylight_start_composite_wscd(void *self, void *dest,
                                           unsigned long load_action,
                                           unsigned long store_action) {
     if (self) {
         *((volatile uint8_t *)self + 0x1c0) = 1;
     }
-    return ((StartComposite_WSCD_t)orig_skylight_start_composite_wscd_ref)(
+    uint64_t before = (self && (uintptr_t)self >= 0x1000)
+        ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
+    int rv = ((StartComposite_WSCD_t)orig_skylight_start_composite_wscd_ref)(
         self, dest, load_action, store_action);
+    return macws_pop_on_startcomp_bail(self, before, rv);
+}
+
+static int hooked_skylight_start_composite_mtltex(void *self, id texture,
+                                                  unsigned long load_action,
+                                                  unsigned long store_action) {
+    if (self) {
+        *((volatile uint8_t *)self + 0x1c0) = 1;
+    }
+    uint64_t before = (self && (uintptr_t)self >= 0x1000)
+        ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
+    int rv = orig_skylight_start_composite_mtltex(
+        self, texture, load_action, store_action);
+    return macws_pop_on_startcomp_bail(self, before, rv);
 }
 
 // SkyLight `WSCompositeDestinationCreateWithMetalTexture(MTLTexture*, MetalContext*, ...)`
@@ -924,11 +1059,46 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
             (void *)hooked_skylight_start_composite_wscd,
             (void **)&orig_skylight_start_composite_wscd_ref);
         fprintf(stderr,
-            "#### SkyLight StartComposite(WSCD) tolerate-nil hook installed at %p\n",
+            "#### SkyLight StartComposite(WSCD) tolerate-nil + pop-on-bail hook installed at %p\n",
             sym_sc_wscd);
     } else {
         fprintf(stderr,
             "#### SkyLight StartComposite(WSCD): symbol not found\n");
+    }
+
+    // 2026-06-20 — StartComposite(MTLTexture*, …) hook (the variant
+    // called from SLCADisplay::render_update). Same pop-on-bail invariant
+    // restorer logic as WSCD — when %orig returns 0 after pushing onto
+    // _state_stack, restore the invariant the caller assumes (rv==0
+    // ⟹ no push).
+    void *sym_sc_mtltex = MSFindSymbol(sl,
+        "__ZN12MetalContext14StartCompositeEPU21objcproto10MTLTexture"
+        "11objc_object13MTLLoadAction14MTLStoreAction");
+    if (sym_sc_mtltex) {
+        MSHookFunction(sym_sc_mtltex,
+            (void *)hooked_skylight_start_composite_mtltex,
+            (void **)&orig_skylight_start_composite_mtltex);
+        fprintf(stderr,
+            "#### SkyLight StartComposite(MTLTex) pop-on-bail hook installed at %p\n",
+            sym_sc_mtltex);
+    } else {
+        fprintf(stderr,
+            "#### SkyLight StartComposite(MTLTex): symbol not found\n");
+    }
+
+    // 2026-06-20 — _state_stack pop_back resolution. MetalContext starts
+    // with std::deque<RenderState>, so passing MetalContext* == passing
+    // deque*. Required by `macws_pop_on_startcomp_bail` above.
+    void *sym_pop = MSFindSymbol(sl,
+        "__ZNSt3__15dequeI11RenderStateNS_9allocatorIS1_EEE8pop_backEv");
+    if (sym_pop) {
+        orig_skylight_state_stack_pop_back = (StateStack_pop_back_t)sym_pop;
+        fprintf(stderr,
+            "#### SkyLight _state_stack pop_back resolved at %p\n", sym_pop);
+    } else {
+        fprintf(stderr,
+            "#### SkyLight _state_stack pop_back: symbol not found — "
+            "pop-on-bail will NO-OP, expect Unbalanced Composites asserts\n");
     }
 
     void *sym3 = MSFindSymbol(sl, "_WSCompositeDestinationCreateWithMetalTexture");
