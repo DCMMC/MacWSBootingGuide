@@ -1282,22 +1282,80 @@ static void macws_sigabrt_trampoline(int sig) {
         if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
         else if (pf == 10) { fmt4cc = 'L008'; bpe = 1; }
         else if (pf == 70 || pf == 71) { fmt4cc = 'RGBA'; bpe = 4; }
-        NSDictionary *props = @{
-            @"IOSurfaceWidth":           @(width),
-            @"IOSurfaceHeight":          @(height),
-            @"IOSurfaceBytesPerElement": @(bpe),
-            @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
-        };
-        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        // 2026-06-20 — IOSurface pool keyed by (w,h,pf,fmt4cc,bpe) to
+        // bound WS memory growth.  Previously ROUTE-IOSURF allocated a
+        // fresh 31 MB IOSurface per newTextureWithDescriptor call,
+        // accumulating ~25 MB/sec → 5 GB in ~3 min → iOS Jetsam fires
+        // → WS killed.  Pool ensures repeated requests for same
+        // (w,h,pf) reuse the same surface (bounded by # unique
+        // dimensions, typically 10-30 for SkyLight compositor —
+        // ~300-900 MB total cap).
+        //
+        // Aliasing concern: multiple textures wrapping the same
+        // IOSurface alias its memory.  For SkyLight's compositor, the
+        // SAME (w,h,pf) is the canonical scratch surface (one per layer
+        // type) and textures are used serially — last-write-wins is
+        // acceptable.  If concurrent access causes visual tearing, the
+        // tradeoff (tearing vs OOM-kill) still favors pooling.
+        //
+        // Lifetime: IOSurfaces stay in pool forever (WS process
+        // lifetime).  Metal retains them via texture-internal refs;
+        // pool holds an extra retain to keep them stable across
+        // texture release cycles.  CFBridgingRetain to make ObjC
+        // retain the IOSurfaceRef in a NSValue wrapper.
+        NSString *poolKey = [NSString stringWithFormat:@"%lux%lu-pf%lu-bpe%lu-fcc%u",
+            (unsigned long)width, (unsigned long)height,
+            (unsigned long)pf, (unsigned long)bpe, (unsigned)fmt4cc];
+        static NSMutableDictionary<NSString *, NSValue *> *surfPool = nil;
+        static dispatch_once_t surfPoolOnce;
+        dispatch_once(&surfPoolOnce, ^{ surfPool = [NSMutableDictionary new]; });
+        IOSurfaceRef surf = NULL;
+        @synchronized(surfPool) {
+            NSValue *v = surfPool[poolKey];
+            if (v) {
+                surf = (IOSurfaceRef)[v pointerValue];
+            }
+        }
         static int route_log = 0;
-        if (route_log++ < 8) {
-            fprintf(stderr,
-                "#### MTL_TEX plain ROUTE-IOSURF: w=%lu h=%lu pf=%lu "
-                "→ IOSurface=%p (bpe=%lu fmt=%c%c%c%c)\n",
-                (unsigned long)width, (unsigned long)height, (unsigned long)pf,
-                (void *)surf, (unsigned long)bpe,
-                (char)(fmt4cc>>24), (char)(fmt4cc>>16),
-                (char)(fmt4cc>>8), (char)fmt4cc);
+        if (!surf) {
+            NSDictionary *props = @{
+                @"IOSurfaceWidth":           @(width),
+                @"IOSurfaceHeight":          @(height),
+                @"IOSurfaceBytesPerElement": @(bpe),
+                @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
+            };
+            surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            if (surf) {
+                @synchronized(surfPool) {
+                    // Re-check (double-checked locking) — another
+                    // thread may have raced and inserted.
+                    NSValue *vNow = surfPool[poolKey];
+                    if (vNow) {
+                        // Lost the race — release our surf and use the
+                        // pooled one.
+                        CFRelease(surf);
+                        surf = (IOSurfaceRef)[vNow pointerValue];
+                    } else {
+                        // We're the inserter — surf already has +1 ref
+                        // from IOSurfaceCreate; pool holds that ref for
+                        // process lifetime.  Don't CFRelease later in
+                        // this branch.
+                        surfPool[poolKey] = [NSValue valueWithPointer:(const void *)surf];
+                    }
+                }
+                if (route_log++ < 16) {
+                    fprintf(stderr,
+                        "#### MTL_TEX POOL-NEW: key=%s → IOSurface=%p (size~%lu KB)\n",
+                        [poolKey UTF8String], (void *)surf,
+                        (unsigned long)(width * height * bpe / 1024));
+                }
+            }
+        } else {
+            if (route_log++ < 16) {
+                fprintf(stderr,
+                    "#### MTL_TEX POOL-HIT: key=%s → IOSurface=%p\n",
+                    [poolKey UTF8String], (void *)surf);
+            }
         }
         if (!surf) return nil;
         id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc
@@ -1316,10 +1374,14 @@ static void macws_sigabrt_trampoline(int sig) {
         if (tex) {
             macws_wire_iosurface_base_into_texture(tex, surf);
         }
-        // Texture retains IOSurface internally via its own backing
-        // reference, so we can release our local CFRef.
-        CFRelease(surf);
-        if (route_log < 12) {
+        // 2026-06-20 — DO NOT CFRelease(surf): the pool retains the
+        // surface for process lifetime (see POOL-NEW/POOL-HIT branches
+        // above).  Metal's internal IOSurface retain comes on top.
+        // CFRelease here would over-balance for POOL-HIT (returned ref
+        // from [v pointerValue] is borrowed, no +1) and also dropping
+        // the pool's strong ref on POOL-NEW would cause the surface to
+        // be freed once Metal releases it.
+        if (route_log < 16) {
             fprintf(stderr,
                 "#### MTL_TEX plain ROUTE-IOSURF result: %p\n",
                 (void *)tex);
