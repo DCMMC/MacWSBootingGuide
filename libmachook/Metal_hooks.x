@@ -5,11 +5,144 @@
 #import <rootless.h>
 #import <xpc/xpc.h>
 #import <dlfcn.h>
+#import <stdatomic.h>
+#import <objc/runtime.h>
 #import "utils.h"
 
 #import <IOSurface/IOSurfaceRef.h>
 
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
+extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
+extern int IOSurfaceLock(IOSurfaceRef, uint32_t options, uint32_t *seed);
+
+// 2026-06-20 — Wire IOSurface base address into AGX texture's writable
+// backing pointer ivar.
+//
+// Root cause (RE'd from chroot WS crash WindowServer-2026-06-20-144645.ips):
+//   CA's BackdropLayer renderer calls
+//   CA::OGL::MetalContext::create_texture, which builds a Metal texture
+//   then calls `-[IOGPUMetalTexture replaceRegion:mipmapLevel:withBytes:
+//   bytesPerRow:]` to upload pixel data.  That forwards to
+//   `-[AGXG13GFamilyTexture replaceRegion: ...]` which then calls
+//   `AGX::Texture<...>::writeRegion(...)`.  writeRegion computes the
+//   destination pointer as `[cpp+0xa0] + offset` and memmove's pixel
+//   data there.  On real Apple HW `[cpp+0xa0]` is the CPU-mapped GPU
+//   memory pointer set up by the AGX kernel driver during texture init.
+//   In chroot, AGX kernel returns kIOReturnNoBandwidth for the scanout
+//   path so the ivar stays NULL — writeRegion's memmove(dst=NULL, ...)
+//   SIGSEGVs.
+//
+// RE evidence (from ~/Downloads/agx-re/AGXMetal13_3 arm64e):
+//   - `-[AGXG13GFamilyTexture replaceRegion:...]` at +0x394a90 reads
+//     `_impl` ivar offset (file_addr 0x21a8a9884 → ivar offset 0x208)
+//     to dereference self → C++ AGX::Texture object.
+//   - `fn @0x1e5770000` (called from writeRegion +0x6c4): reads
+//     `[cpp+0x184]` (layout flag); if 0, returns `[cpp+0xa0]` (the
+//     writable backing pointer); if != 0 and != 3, returns 0.
+//   - `[cpp+0xa8]` is a 32-bit offset added to base for indexing.
+//
+// Fix: after our IOSurface-backed texture is created successfully,
+// reach into the C++ implementation object and set:
+//   - cpp+0xa0 = IOSurfaceGetBaseAddress(surface)  ← writable backing
+//   - cpp+0xa8 = 0                                  ← offset
+// This makes the texture's "linear backing" path point at the IOSurface
+// CPU mapping — replaceRegion now writes pixel bytes into the IOSurface
+// memory, which is the same memory the GPU later samples from.  Proper
+// upstream fix mirroring what AGX kernel driver does on real HW.  NOT a
+// NOP/return-bypass — it's the missing setup step.
+//
+// Layout sanity: only patches when `[cpp+0x184] == 0` (linear layout).
+// Compressed/heap-paged textures (layout=3) use a different ivar layout
+// we haven't RE'd — left untouched so they don't get corrupted.
+//
+// IOSurface lifetime: Metal's newTextureWithDescriptor:iosurface:
+// retains the IOSurface internally; base address stays valid as long
+// as the texture stays alive.  We lock the surface for
+// kIOSurfaceLockAvoidSync at first use to ensure base address is
+// mapped — IOSurfaceCreate without explicit cache mode may defer the
+// mapping until first lock.
+static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
+                                                   IOSurfaceRef surf) {
+    if (!tex || !surf) return;
+    // Resolve _impl ivar offset dynamically (fallback to 0x208 from RE
+    // if the class introspection fails — UUID-stable across 13.x).
+    static ptrdiff_t s_impl_off = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cls = objc_getClass("AGXG13GFamilyTexture");
+        if (cls) {
+            Ivar iv = class_getInstanceVariable(cls, "_impl");
+            if (iv) {
+                s_impl_off = ivar_getOffset(iv);
+            }
+        }
+        if (s_impl_off == 0) s_impl_off = 0x208;  // RE-fallback
+        fprintf(stderr,
+            "#### AGX_WIRE_IOSURF: _impl ivar offset = %#tx\n", s_impl_off);
+    });
+    // Lock the IOSurface to ensure base address is mapped into our VM.
+    // kIOSurfaceLockAvoidSync = no implicit GPU sync, just map.  Leave
+    // it locked — texture's IOSurface retain keeps it alive; pages
+    // unmap when surface is released (texture release path).
+    int lock_rc = IOSurfaceLock(surf, /*kIOSurfaceLockAvoidSync*/0, NULL);
+    void *base = IOSurfaceGetBaseAddress(surf);
+    if (!base) {
+        static int nolog = 0;
+        if (nolog++ < 3) {
+            fprintf(stderr,
+                "#### AGX_WIRE_IOSURF: IOSurfaceGetBaseAddress=NULL (lock_rc=%d) tex=%p surf=%p\n",
+                lock_rc, (void *)tex, (void *)surf);
+        }
+        return;
+    }
+    void *impl = *(void **)((char *)(__bridge void *)tex + s_impl_off);
+    if (!impl) {
+        static int impllog = 0;
+        if (impllog++ < 3) {
+            fprintf(stderr,
+                "#### AGX_WIRE_IOSURF: _impl=NULL (uninit C++ obj) tex=%p\n",
+                (void *)tex);
+        }
+        return;
+    }
+    uint8_t layout = *(volatile uint8_t *)((char *)impl + 0x184);
+    if (layout != 0) {
+        static int layoutlog = 0;
+        if (layoutlog++ < 4) {
+            fprintf(stderr,
+                "#### AGX_WIRE_IOSURF: skip — layout=%d ≠ 0 (linear) tex=%p impl=%p\n",
+                layout, (void *)tex, impl);
+        }
+        return;
+    }
+    // Apply the wire-up ONLY when the existing backing pointer is NULL.
+    // RE evidence: on real Apple HW, AGX kernel driver populates +0xa0
+    // during texture init with a CPU-mapped GPU memory address.  In
+    // chroot, SOME textures get that init (prev_base non-NULL — leave
+    // them alone), OTHERS hit the kIOReturnNoBandwidth gate before
+    // init populates the ivar (prev_base NULL — these are the ones
+    // that crash replaceRegion).  Only fill the NULL case so we don't
+    // clobber AGX's legitimate setup.
+    void *prev_base = *(void **)((char *)impl + 0xa0);
+    if (prev_base != NULL) {
+        static int skiplog = 0;
+        if (skiplog++ < 6) {
+            fprintf(stderr,
+                "#### AGX_WIRE_IOSURF: skip (AGX-set) tex=%p impl=%p +0xa0=%p (not overwriting)\n",
+                (void *)tex, impl, prev_base);
+        }
+        return;
+    }
+    *(void * volatile *)((char *)impl + 0xa0) = base;
+    *(volatile uint32_t *)((char *)impl + 0xa8) = 0;
+    static _Atomic int wired_count = 0;
+    int n = atomic_fetch_add(&wired_count, 1);
+    if (n < 16) {
+        fprintf(stderr,
+            "#### AGX_WIRE_IOSURF #%d: tex=%p impl=%p +0xa0: NULL→%p layout=%d (lock_rc=%d)\n",
+            n, (void *)tex, impl, base, layout, lock_rc);
+    }
+}
 
 // Process-wide stash of the current IOSurfaceID being wrapped as a texture.
 // Was per-thread but the texture init dispatches the kernel call onto a
@@ -917,6 +1050,15 @@ static void macws_sigabrt_trampoline(int sig) {
     } else if (!result) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.NIL");
     }
+    // 2026-06-20 — Wire IOSurface base address into texture's writable
+    // backing pointer ivar (cpp+0xa0) ONLY when the AGX-set pointer is
+    // NULL (the failing chroot-AGX case).  Most textures already have
+    // a non-NULL +0xa0 set by AGX init — leave those alone (overwriting
+    // would clobber AGX's legitimate setup).  See
+    // macws_wire_iosurface_base_into_texture comment at top of file.
+    if (result && iosurface) {
+        macws_wire_iosurface_base_into_texture(result, iosurface);
+    }
     macws_set_current_iosurface_id(prev_iosurface_id);
     return result;
 }
@@ -1161,6 +1303,19 @@ static void macws_sigabrt_trampoline(int sig) {
         id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc
                                                           iosurface:surf
                                                               plane:0];
+        // 2026-06-20 — Wire IOSurface base into the texture's +0xa0
+        // ivar so AGX::Texture::writeRegion's memmove has a valid
+        // dest pointer for CA's replaceRegion pixel uploads.  The
+        // `[self hooked_newTextureWithDescriptor:iosurface:plane:]`
+        // call above goes through swizzle and lands in the ORIGINAL
+        // Apple AGXG13GFamilyDevice impl (not our iosurface variant
+        // hook epilogue), so we must wire here too — duplicating the
+        // wire from the iosurface variant hook epilogue does NOT
+        // double-write because wire is idempotent on the same
+        // (impl+0xa0, base) pair.
+        if (tex) {
+            macws_wire_iosurface_base_into_texture(tex, surf);
+        }
         // Texture retains IOSurface internally via its own backing
         // reference, so we can release our local CFRef.
         CFRelease(surf);
