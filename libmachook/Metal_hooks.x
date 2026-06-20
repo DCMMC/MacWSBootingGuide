@@ -16,6 +16,160 @@ extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
 extern int IOSurfaceLock(IOSurfaceRef, uint32_t options, uint32_t *seed);
 extern int IOSurfaceUnlock(IOSurfaceRef, uint32_t options, uint32_t *seed);
 
+// MACWS_DISP_FILL_LOOP read-path probe (2026-06-20). Resolved once: enabled
+// by env MACWS_DISP_FILL_LOOP or sentinel file /tmp/macws_disp_fill (chroot
+// path; lets us toggle with a FAST libmachook-only build, no WS-plist edit
+// that would trip the build guardrail). See
+// [[vnc-read-path-is-cgdisplaycreateimage-compositor-black]]: CGDisplayCreateImage
+// reads SkyLight's display surface; SURF_FILL_IOS filled it only at creation
+// so WS's black composites overwrote it. This drives a continuous bg fill so
+// the gray survives between composites — decisive for whether CreateImage
+// reads the surface (CPU-copy bridge viable) or re-composites (need pinned VA).
+extern size_t IOSurfaceGetWidth(IOSurfaceRef);
+extern size_t IOSurfaceGetHeight(IOSurfaceRef);
+extern size_t IOSurfaceGetAllocSize(IOSurfaceRef);
+extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef);
+// Display-surface bridge mode. 0 = off, 1 = gray-fill (validation: proves
+// CGDisplayCreateImage reads the surface), 2 = REAL copy (texture +0xa0
+// backing -> IOSurface, the actual CPU-copy bridge). Resolved once via env
+// or sentinel files so we can toggle with a FAST libmachook-only build
+// (a WS-plist env edit would trip the build guardrail).
+//   /tmp/macws_disp_copy  -> mode 2 (real content)
+//   /tmp/macws_disp_fill  -> mode 1 (gray)
+static int macws_disp_mode(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        if (getenv("MACWS_DISP_COPY") || access("/tmp/macws_disp_copy", F_OK) == 0)
+            cached = 2;
+        else if (getenv("MACWS_DISP_FILL_LOOP") || access("/tmp/macws_disp_fill", F_OK) == 0)
+            cached = 1;
+        else cached = 0;
+    }
+    return cached;
+}
+// Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
+// thread on first use. The thread either fills the surface gray (mode 1) or
+// copies the texture's CPU-mapped GPU backing (+0xa0, which holds the real
+// GPU-rendered composite — see [[composite-iosurface-all-zero-gpu-not-writing]])
+// into the IOSurface that CGDisplayCreateImage reads
+// ([[vnc-read-path-is-cgdisplaycreateimage-compositor-black]]).
+static NSMutableArray *g_dispTexs = nil;   // id<MTLTexture>, ARC-retained
+static NSMutableArray *g_dispSurfs = nil;  // NSValue ptr, surface CFRetained
+static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
+    int mode = macws_disp_mode();
+    if (!iosurface || mode == 0) return;
+    size_t iw = IOSurfaceGetWidth(iosurface);
+    size_t ih = IOSurfaceGetHeight(iosurface);
+    if (iw < 1000 || ih < 600) return;
+    static dispatch_once_t dispOnce;
+    dispatch_once(&dispOnce, ^{
+        g_dispTexs = [NSMutableArray new];
+        g_dispSurfs = [NSMutableArray new];
+        [NSThread detachNewThreadWithBlock:^{
+            for (;;) {
+                @synchronized(g_dispSurfs) {
+                    NSUInteger n = g_dispSurfs.count;
+                    for (NSUInteger i = 0; i < n; i++) {
+                        IOSurfaceRef s = (IOSurfaceRef)[g_dispSurfs[i] pointerValue];
+                        id<MTLTexture> t = (i < g_dispTexs.count) ? g_dispTexs[i] : nil;
+                        if (IOSurfaceLock(s, 0, NULL) != 0) continue;
+                        void *base = IOSurfaceGetBaseAddress(s);
+                        size_t sbpr = IOSurfaceGetBytesPerRow(s);
+                        size_t sh = IOSurfaceGetHeight(s);
+                        if (mode == 1) {
+                            size_t al = IOSurfaceGetAllocSize(s);
+                            if (base && al) memset(base, 0xC0, al);
+                        } else if (mode == 2 && t && base) {
+                            // SAFE raw copy of the texture's GPU backing (+0xa0)
+                            // into the surface. NOTE: backing is AGX-tiled so
+                            // this is NOT display-correct yet — it's the input
+                            // for CPU detiling (TODO). getBytes auto-detiles but
+                            // CRASHES WS from a bg thread (races render). Raw
+                            // memcpy is safe.
+                            void *impl = *(void **)((char *)(__bridge void *)t + 0x208);
+                            if ((uintptr_t)impl > 0x1000) {
+                                void *backing = *(void **)((char *)impl + 0xa0);
+                                if (backing)
+                                    for (size_t y = 0; y < sh; y++)
+                                        memcpy((char *)base + y * sbpr,
+                                               (char *)backing + y * sbpr, sbpr);
+                                // One-shot raw dump of the pf=115 (RGBA16Float)
+                                // composite backing for OFFLINE detile RE.
+                                // Gated by sentinel /tmp/macws_disp_dump.
+                                static int s_dumped16 = 0;
+                                if (!s_dumped16 && backing &&
+                                    access("/tmp/macws_disp_dump", F_OK) == 0 &&
+                                    [t width] >= 1000) {
+                                    size_t tw = [t width], th = [t height];
+                                    unsigned long pf = (unsigned long)[t pixelFormat];
+                                    size_t bpe = (pf == 115) ? 8 : 4;  // 16F=8B, BGRA8=4B
+                                    size_t total = tw * th * bpe;
+                                    // Only dump a CONTENT-RICH texture (>5% nonzero) so we
+                                    // skip near-empty overlay layers and capture the real
+                                    // composite. Retries each bg pass until one qualifies.
+                                    size_t nzc = 0, samp = 0;
+                                    for (size_t off = 0; off < total; off += 1024) {
+                                        if (((uint8_t *)backing)[off]) nzc++;
+                                        samp++;
+                                    }
+                                    double dens = samp ? (double)nzc / samp : 0;
+                                    if (dens > 0.05) {
+                                        FILE *df = fopen("/tmp/macws_backing16f.raw", "wb");
+                                        if (df) {
+                                            uint32_t hdr[4] = { (uint32_t)tw, (uint32_t)th,
+                                                                (uint32_t)pf, (uint32_t)IOSurfaceGetAllocSize(s) };
+                                            fwrite(hdr, 4, 4, df);
+                                            fwrite(backing, 1, total, df);
+                                            fclose(df);
+                                            s_dumped16 = 1;
+                                            fprintf(stderr, "#### DUMPBACK %zux%zu pf=%lu bpe=%zu dens=%.3f -> raw\n",
+                                                    tw, th, pf, bpe, dens);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        IOSurfaceUnlock(s, 0, NULL);
+                    }
+                }
+                usleep(mode == 2 ? 16000 : 25000);
+            }
+        }];
+    });
+    @synchronized(g_dispSurfs) {
+        for (NSValue *v in g_dispSurfs)
+            if ((IOSurfaceRef)[v pointerValue] == iosurface) return;
+        CFRetain(iosurface);
+        [g_dispSurfs addObject:[NSValue valueWithPointer:iosurface]];
+        [g_dispTexs addObject:(tex ?: (id)[NSNull null])];
+        // Log layout once so we know if the backing is linear (flat copy OK)
+        // or Morton-tiled (would need detiling).
+        uint8_t layout = 0xff;
+        if (tex) {
+            void *impl = *(void **)((char *)(__bridge void *)tex + 0x208);
+            if ((uintptr_t)impl > 0x1000) layout = *(uint8_t *)((char *)impl + 0x184);
+        }
+        uint32_t tstride = 0;
+        if (tex) {
+            void *impl = *(void **)((char *)(__bridge void *)tex + 0x208);
+            if ((uintptr_t)impl > 0x1000) tstride = *(uint32_t *)((char *)impl + 0xa8);
+        }
+        fprintf(stderr, "#### DISP-BRIDGE mode=%d track surf=%p tex=%p %zux%zu layout=%u tstride=%u sbpr=%zu (n=%lu)\n",
+                mode, (void*)iosurface, (void*)tex, iw, ih, layout, tstride,
+                IOSurfaceGetBytesPerRow(iosurface), (unsigned long)g_dispSurfs.count);
+        unsigned long tpf = tex ? (unsigned long)[tex pixelFormat] : 0;
+        unsigned long tw = tex ? (unsigned long)[tex width] : 0;
+        unsigned long th = tex ? (unsigned long)[tex height] : 0;
+        FILE *lf = fopen("/tmp/macws_disp.log", "a");
+        if (lf) {
+            fprintf(lf, "DISP-BRIDGE mode=%d surf=%p tex=%p surf=%zux%zu tex=%lux%lu pf=%lu layout=%u tstride=%u sbpr=%zu n=%lu\n",
+                    mode, (void*)iosurface, (void*)tex, iw, ih, tw, th, tpf, layout, tstride,
+                    IOSurfaceGetBytesPerRow(iosurface), (unsigned long)g_dispSurfs.count);
+            fclose(lf);
+        }
+    }
+}
+
 // 2026-06-20 — Wire IOSurface base address into AGX texture's writable
 // backing pointer ivar.
 //
@@ -1101,6 +1255,76 @@ static void macws_sigabrt_trampoline(int sig) {
             }
         }
     }
+    // 2026-06-20 — CONTINUOUS display-surface fill (read-path probe).
+    // Tracks every display-sized IOSurface SkyLight passes here and a single
+    // bg thread re-fills them all with solid gray every 25ms, so the fill
+    // survives WS's intervening (black) composites. If VNC / a CLI
+    // CGDisplayCreateImage then shows gray, THIS is the surface CreateImage
+    // reads → the CPU-copy bridge (final-composite backing → this surface)
+    // is the fix. If it stays black, CreateImage re-composites via GPU and
+    // we need the pinnedGPULocation route. Diagnostic only; gated.
+    macws_disp_fill_track(result, iosurface);
+    // 2026-06-20 — FEASIBILITY TEST for the "iOS app displays macOS UI"
+    // architecture.  The chroot AGX GPU renders real pixels into the
+    // texture's private +0xa0 backing (proven: backing nonzero, IOSurface
+    // zero).  If that backing is LINEAR (impl+0x184==0), a flat memcpy of
+    // it yields a correct image — which an iOS app could display from a
+    // shared IOSurface.  This one-shot dump captures the backing of the
+    // largest texture to a file so we can convert it to PNG and visually
+    // confirm it's recognizable GlassDemo/AM UI (the decisive proof that
+    // the content is CPU-readable + linear).  MACWS_DUMP_BACKING.
+    if (getenv("MACWS_DUMP_BACKING") && result && iosurface) {
+        size_t iw = IOSurfaceGetWidth(iosurface);
+        size_t ih = IOSurfaceGetHeight(iosurface);
+        size_t bpe = IOSurfaceGetBytesPerElement(iosurface);
+        // Dump the first large surface whose backing has content,
+        // regardless of bpe (content turned out to land in the bpe=1
+        // L008 macwsallocd buffers, not the RGBA pooled ones).  Logs
+        // bpe so the reader picks grayscale vs RGBA interpretation.
+        if (iw >= 1000 && ih >= 600 && bpe >= 1) {
+            static _Atomic int dumped = 0;
+            if (atomic_load(&dumped) == 0) {
+                // _impl ivar offset (RE-confirmed 0x208), → C++ obj.
+                void *impl = *(void **)((char *)(__bridge void *)result + 0x208);
+                if (impl && (uintptr_t)impl > 0x1000) {
+                    void *backing = *(void **)((char *)impl + 0xa0);
+                    uint32_t stride = *(uint32_t *)((char *)impl + 0xa8);
+                    uint8_t  layout = *(uint8_t  *)((char *)impl + 0x184);
+                    // Only dump a backing that actually has content in its
+                    // first 4 KB (skip cleared/staging textures).
+                    int nz = 0;
+                    if (backing && (uintptr_t)backing > 0x1000) {
+                        for (int i = 0; i < 4096; i++)
+                            if (((volatile uint8_t*)backing)[i]) { nz++; }
+                    }
+                    fprintf(stderr,
+                        "#### DUMP-BACKING tex=%p impl=%p backing=%p stride=%u "
+                        "layout=%u  %zux%zu bpe=%zu first4Knz=%d (linear iff layout==0)\n",
+                        (void*)result, impl, backing, stride, layout,
+                        iw, ih, bpe, nz);
+                    if (backing && (uintptr_t)backing > 0x1000 && nz > 0) {
+                        atomic_store(&dumped, 1);
+                        size_t rowbytes = stride ? stride : iw * bpe;
+                        size_t total = rowbytes * ih;
+                        if (total > 64u*1024*1024) total = 64u*1024*1024; // cap
+                        FILE *f = fopen("/tmp/composite_backing.raw", "wb");
+                        if (f) {
+                            // header line so the reader knows geometry
+                            fprintf(f, "MACWSDUMP w=%zu h=%zu bpe=%zu stride=%zu layout=%u\n",
+                                    iw, ih, bpe, rowbytes, layout);
+                            size_t wrote = fwrite(backing, 1, total, f);
+                            fclose(f);
+                            fprintf(stderr,
+                                "#### DUMP-BACKING wrote %zu/%zu bytes → /tmp/composite_backing.raw\n",
+                                wrote, total);
+                        } else {
+                            fprintf(stderr, "#### DUMP-BACKING fopen failed errno=%d\n", errno);
+                        }
+                    }
+                }
+            }
+        }
+    }
     macws_set_current_iosurface_id(prev_iosurface_id);
     return result;
 }
@@ -1606,6 +1830,10 @@ static void macws_sigabrt_trampoline(int sig) {
         if (tex) {
             macws_wire_iosurface_base_into_texture(tex, surf);
         }
+        // Read-path probe: also track surfaces arriving via the
+        // AGXG13GFamilyDevice swizzle (different entry point than the
+        // IOGPUMetalDevice iosurface variant). See macws_disp_fill_track.
+        macws_disp_fill_track(tex, surf);
         // 2026-06-20 — DO NOT CFRelease(surf): the pool retains the
         // surface for process lifetime (see POOL-NEW/POOL-HIT branches
         // above).  Metal's internal IOSurface retain comes on top.
