@@ -10,6 +10,9 @@
 #import <stdatomic.h>
 #import "interpose.h"
 #import "utils.h"
+#import <sys/mman.h>
+#import <sys/stat.h>
+#import <fcntl.h>
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -4188,36 +4191,35 @@ static void macws_vnc_fill_test(void) {
     int bpp    = macws_rfbScreen[4];   // bitsPerPixel
     if (padded <= 0 || height <= 0 || height > 8192 || padded > (1 << 20)) return;
     int bytespp = (bpp > 0 ? bpp / 8 : 4); if (bytespp < 1) bytespp = 4;
-    extern IOSurfaceRef IOSurfaceLookup(uint32_t);
-    extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef);
-    extern size_t IOSurfaceGetHeight(IOSurfaceRef);
-    extern int IOSurfaceLock(IOSurfaceRef, uint32_t, uint32_t *);
-    extern int IOSurfaceUnlock(IOSurfaceRef, uint32_t, uint32_t *);
-    // 1) Preferred: the global composite surface published by WS
-    //    (/tmp/macws_vnc_surfid). This is the real GlassDemo content
-    //    delivered cross-process; the gradient below is just a fallback.
-    if (!macws_vnc_src) {
-        FILE *f = fopen("/tmp/macws_vnc_surfid", "r");
-        if (f) {
-            unsigned id = 0;
-            if (fscanf(f, "%u", &id) == 1 && id) macws_vnc_src = IOSurfaceLookup(id);
-            fclose(f);
+    // 1) Preferred: the detiled composite WS writes to the mmap'd file
+    //    /tmp/macws_vnc_fb (IOSurfaceIsGlobal+Lookup is NULL cross-process on
+    //    this iOS, so we use a shared mmap instead). Header (16B): magic 'VNCF',
+    //    w, h, stride; BGRA8 data follows. Gradient is the fallback.
+    static void *rmap = NULL; static size_t rmap_sz = 0;
+    if (!rmap) {
+        int fd = open("/tmp/macws_vnc_fb", O_RDONLY);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && st.st_size >= 16) {
+                void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+                if (m != MAP_FAILED) { rmap = m; rmap_sz = (size_t)st.st_size; }
+            }
+            close(fd);
         }
     }
-    if (macws_vnc_src) {
-        if (IOSurfaceLock(macws_vnc_src, 0x1u /*readonly*/, NULL) == 0) {
-            void *sb = IOSurfaceGetBaseAddress(macws_vnc_src);
-            size_t sbpr = IOSurfaceGetBytesPerRow(macws_vnc_src);
-            size_t sh = IOSurfaceGetHeight(macws_vnc_src);
-            if (sb) {
-                size_t cw = ((size_t)padded < sbpr) ? (size_t)padded : sbpr;
+    if (rmap && rmap_sz >= 16) {
+        uint32_t *hdr = (uint32_t *)rmap;
+        if (hdr[0] == 0x564E4346u) {
+            size_t sh = hdr[2], sstride = hdr[3];
+            char *data = (char *)rmap + 16;
+            if (16 + sstride * sh <= rmap_sz) {
+                size_t cw = ((size_t)padded < sstride) ? (size_t)padded : sstride;
                 size_t rows = ((size_t)height < sh) ? (size_t)height : sh;
                 for (size_t y = 0; y < rows; y++)
-                    memcpy(macws_vnc_fb + y * (size_t)padded, (char *)sb + y * sbpr, cw);
+                    memcpy(macws_vnc_fb + y * (size_t)padded, data + y * sstride, cw);
+                return;
             }
-            IOSurfaceUnlock(macws_vnc_src, 0x1u, NULL);
         }
-        return;
     }
     // 2) Fallback: test gradient (only when /tmp/macws_vnc_test exists).
     if (!macws_vnc_test_on) return;

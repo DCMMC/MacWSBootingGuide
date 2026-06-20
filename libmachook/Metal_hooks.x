@@ -95,6 +95,31 @@ static void macws_vnc_share_mirror(void *base, size_t sbpr, size_t sh, size_t w)
     }
     IOSurfaceUnlock(g_vncSurf, 0, NULL);
 }
+// Cross-process VNC channel via a MMAP'd file (IOSurfaceIsGlobal+Lookup(id)
+// returns NULL across processes on this iOS — RE-confirmed). Both WS and OSXvnc
+// are in the chroot and see /tmp/macws_vnc_fb. WS writes the detiled BGRA8 frame
+// here; OSXvnc mmaps it read-only and blits into frameBufferData. Header (16B):
+// [0]=magic 'VNCF', [1]=w, [2]=h, [3]=stride(=w*4); pixel data follows.
+#import <sys/mman.h>
+#import <fcntl.h>
+static void *g_vnc_mmap = NULL;       // base (header + data)
+static size_t g_vnc_mmap_w = 0, g_vnc_mmap_h = 0;
+static void *macws_vnc_mmap_data(size_t w, size_t h) {
+    if (g_vnc_mmap && g_vnc_mmap_w == w && g_vnc_mmap_h == h)
+        return (char *)g_vnc_mmap + 16;
+    size_t stride = w * 4, sz = 16 + stride * h;
+    int fd = open("/tmp/macws_vnc_fb", O_RDWR | O_CREAT, 0666);
+    if (fd < 0) return NULL;
+    if (ftruncate(fd, sz) != 0) { close(fd); return NULL; }
+    void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return NULL;
+    uint32_t *hdr = (uint32_t *)m;
+    hdr[0] = 0x564E4346u; hdr[1] = (uint32_t)w; hdr[2] = (uint32_t)h; hdr[3] = (uint32_t)stride;
+    g_vnc_mmap = m; g_vnc_mmap_w = w; g_vnc_mmap_h = h;
+    fprintf(stderr, "#### VNC-MMAP /tmp/macws_vnc_fb %zux%zu sz=%zu\n", w, h, sz);
+    return (char *)m + 16;
+}
 // Half (IEEE binary16) -> u8 [0,255], clamped to [0,1]. For RGBA16Float composites.
 static inline uint8_t macws_half_to_u8(uint16_t h) {
     uint16_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -138,25 +163,65 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                 if (t) {
                     size_t w = [t width], h = [t height];
                     unsigned long pf = (unsigned long)[t pixelFormat];
-                    if (w >= 1000 && h >= 600) {
-                        void *impl = *(void **)((char *)(__bridge void *)t + 0x208);
-                        if ((uintptr_t)impl > 0x1000) {
-                            void *backing = *(void **)((char *)impl + 0xa0);
-                            if (backing) {
-                                size_t bpe = (pf == 115) ? 8 : 4;
-                                size_t srcbpr = w * bpe;
-                                macws_vnc_share_ensure(w, h);
-                                if (g_vncSurf && IOSurfaceLock(g_vncSurf, 0, NULL) == 0) {
-                                    void *vb = IOSurfaceGetBaseAddress(g_vncSurf);
-                                    size_t vbpr = IOSurfaceGetBytesPerRow(g_vncSurf);
-                                    if (vb) {
-                                        size_t cw = srcbpr < vbpr ? srcbpr : vbpr;
+                    if (w >= 1000 && h >= 600 && (pf == 80 || pf == 115)) {
+                        // GPU blit the (AGX-tiled) LIVE composite into an IDLE
+                        // linear texture on our OWN queue (GPU detiles), then
+                        // CPU-read the idle dst's now-linear +0xa0 -> g_vncSurf.
+                        // Avoids CPU-reading the live target (perturbs WS) and
+                        // getBytes (hangs/crashes). The blit READS the live
+                        // target on the GPU (tearing at worst, not a crash).
+                        static id<MTLDevice> dev = nil;
+                        static id<MTLCommandQueue> q = nil;
+                        static id<MTLTexture> dst = nil;
+                        static unsigned long dstpf = 0; static size_t dstw = 0, dsth = 0;
+                        if (!dev) { dev = [t device]; q = [dev newCommandQueue]; }
+                        if (dev && q && (!dst || dstpf != pf || dstw != w || dsth != h)) {
+                            MTLTextureDescriptor *d = [MTLTextureDescriptor
+                                texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf
+                                width:w height:h mipmapped:NO];
+                            d.storageMode = MTLStorageModeShared;
+                            d.usage = MTLTextureUsageShaderRead;
+                            dst = [dev newTextureWithDescriptor:d];
+                            dstpf = pf; dstw = w; dsth = h;
+                            fprintf(stderr, "#### VNC-BLIT dst=%p %zux%zu pf=%lu\n", (void*)dst, w, h, pf);
+                        }
+                        if (dst && q) {
+                            id<MTLCommandBuffer> cb = [q commandBuffer];
+                            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0
+                                   sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,h,1)
+                                      toTexture:dst destinationSlice:0 destinationLevel:0
+                              destinationOrigin:MTLOriginMake(0,0,0)];
+                            [bl endEncoding];
+                            [cb commit];
+                            [cb waitUntilCompleted];
+                            void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
+                            if ((uintptr_t)impl > 0x1000) {
+                                void *backing = *(void **)((char *)impl + 0xa0);
+                                if (backing) {
+                                    void *vb = macws_vnc_mmap_data(w, h);  // cross-process mmap
+                                    size_t vbpr = w * 4;
+                                    if (vb && pf == 80) {
+                                        size_t srcbpr = w * 4;
                                         for (size_t y = 0; y < h; y++)
-                                            memcpy((char *)vb + y * vbpr, (char *)backing + y * srcbpr, cw);
+                                            memcpy((char *)vb + y*vbpr, (char *)backing + y*srcbpr, vbpr);
+                                    } else if (vb) { // pf==115 RGBA16F -> BGRA8
+                                        size_t srcbpr = w * 8;
+                                        for (size_t y = 0; y < h; y++) {
+                                            uint16_t *src = (uint16_t *)((char *)backing + y*srcbpr);
+                                            uint8_t  *d8  = (uint8_t  *)((char *)vb + y*vbpr);
+                                            for (size_t x = 0; x < w; x++) {
+                                                d8[x*4+0] = macws_half_to_u8(src[x*4+2]);
+                                                d8[x*4+1] = macws_half_to_u8(src[x*4+1]);
+                                                d8[x*4+2] = macws_half_to_u8(src[x*4+0]);
+                                                d8[x*4+3] = 0xff;
+                                            }
+                                        }
                                     }
-                                    IOSurfaceUnlock(g_vncSurf, 0, NULL);
-                                    static int lg = 0;
-                                    if (lg < 3) { fprintf(stderr, "#### VNC-CAPTURE(bg) +0xa0 %zux%zu pf=%lu -> share (tiled,TODO detile)\n", w, h, pf); lg++; }
+                                    if (vb) {
+                                        static int lg = 0;
+                                        if (lg < 3) { fprintf(stderr, "#### VNC-BLIT captured %zux%zu pf=%lu -> mmap (detiled)\n", w, h, pf); lg++; }
+                                    }
                                 }
                             }
                         }
