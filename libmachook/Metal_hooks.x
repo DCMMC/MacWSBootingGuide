@@ -114,38 +114,59 @@ static inline uint8_t macws_half_to_u8(uint16_t h) {
 // valid at completion). getBytes is SAFE on the WS thread between frames (it
 // crashed only from the async bg thread racing active render). Throttled. ARC
 // keeps the previous texture alive via the strong static.
-// Capture `dest` at the WSCD StartComposite hook (WS render thread, before
-// %orig): the destination texture's +0xa0 GPU backing holds the PREVIOUS,
-// fully-composited frame (this frame's draw happens after %orig). RAW memcpy of
-// +0xa0 — SAFE (the bridge does this). NOTE getBytes is NOT used: it CRASHES
-// from the bg thread and HANGS on the render thread (waits for a composite not
-// yet submitted). The backing is AGX-TILED, so g_vncSurf gets tiled bytes for
-// now — a reliable content SOURCE; CPU twiddle-detile is the remaining TODO
-// (getBytes/Metal-detile is unavailable). pf=115 (16F, 8B/px) backing is read
-// at its 8B stride into the BGRA8 share surface best-effort.
+// Composite-completion capture, SPLIT for safety:
+//   - render thread (WSCD StartComposite hook): only STASH the dest texture
+//     pointer (cheap, no read) — the big +0xa0 memcpy on the render thread
+//     destabilized WS (A/B-confirmed).
+//   - background thread: raw memcpy of the stashed dest's +0xa0 backing ->
+//     g_vncSurf. A bg-thread raw +0xa0 read is SAFE (proven by the bridge);
+//     reading the STASHED composite dest (not random tracked textures) makes
+//     it RELIABLE. Concurrent GPU writes -> tearing, not a crash. getBytes is
+//     unusable (hangs render / crashes bg). Backing is AGX-TILED -> g_vncSurf
+//     holds tiled bytes (CPU twiddle-detile is the remaining TODO).
+static id<MTLTexture> g_vnc_comp_tex = nil;   // stashed composite dest (ARC strong)
+static id g_vnc_lock = nil;
 void macws_vnc_on_composite(id<MTLTexture> dest) {
     if (!macws_vnc_share_enabled() || !dest) return;
-    size_t w = [dest width], h = [dest height];
-    unsigned long pf = (unsigned long)[dest pixelFormat];
-    if (w < 1000 || h < 600) return;
-    void *impl = *(void **)((char *)(__bridge void *)dest + 0x208);
-    if ((uintptr_t)impl <= 0x1000) return;
-    void *backing = *(void **)((char *)impl + 0xa0);
-    if (!backing) return;
-    size_t bpe = (pf == 115) ? 8 : 4;
-    size_t srcbpr = w * bpe;             // approximate; tiled data has no true stride
-    macws_vnc_share_ensure(w, h);
-    if (!g_vncSurf || IOSurfaceLock(g_vncSurf, 0, NULL) != 0) return;
-    void *vb = IOSurfaceGetBaseAddress(g_vncSurf);
-    size_t vbpr = IOSurfaceGetBytesPerRow(g_vncSurf);
-    if (vb) {
-        size_t cw = srcbpr < vbpr ? srcbpr : vbpr;
-        for (size_t y = 0; y < h; y++)
-            memcpy((char *)vb + y * vbpr, (char *)backing + y * srcbpr, cw);
-        static int logged = 0;
-        if (logged < 3) { fprintf(stderr, "#### VNC-CAPTURE raw +0xa0 %zux%zu pf=%lu bpe=%zu -> share (tiled,TODO detile)\n", w, h, pf, bpe); logged++; }
-    }
-    IOSurfaceUnlock(g_vncSurf, 0, NULL);
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_vnc_lock = [NSObject new];
+        [NSThread detachNewThreadWithBlock:^{
+            for (;;) {
+                id<MTLTexture> t = nil;
+                @synchronized(g_vnc_lock) { t = g_vnc_comp_tex; }  // ARC retains into local
+                if (t) {
+                    size_t w = [t width], h = [t height];
+                    unsigned long pf = (unsigned long)[t pixelFormat];
+                    if (w >= 1000 && h >= 600) {
+                        void *impl = *(void **)((char *)(__bridge void *)t + 0x208);
+                        if ((uintptr_t)impl > 0x1000) {
+                            void *backing = *(void **)((char *)impl + 0xa0);
+                            if (backing) {
+                                size_t bpe = (pf == 115) ? 8 : 4;
+                                size_t srcbpr = w * bpe;
+                                macws_vnc_share_ensure(w, h);
+                                if (g_vncSurf && IOSurfaceLock(g_vncSurf, 0, NULL) == 0) {
+                                    void *vb = IOSurfaceGetBaseAddress(g_vncSurf);
+                                    size_t vbpr = IOSurfaceGetBytesPerRow(g_vncSurf);
+                                    if (vb) {
+                                        size_t cw = srcbpr < vbpr ? srcbpr : vbpr;
+                                        for (size_t y = 0; y < h; y++)
+                                            memcpy((char *)vb + y * vbpr, (char *)backing + y * srcbpr, cw);
+                                    }
+                                    IOSurfaceUnlock(g_vncSurf, 0, NULL);
+                                    static int lg = 0;
+                                    if (lg < 3) { fprintf(stderr, "#### VNC-CAPTURE(bg) +0xa0 %zux%zu pf=%lu -> share (tiled,TODO detile)\n", w, h, pf); lg++; }
+                                }
+                            }
+                        }
+                    }
+                }
+                usleep(50000);   // ~20 fps
+            }
+        }];
+    });
+    @synchronized(g_vnc_lock) { g_vnc_comp_tex = dest; }   // cheap stash, render thread
 }
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
 // thread on first use. The thread either fills the surface gray (mode 1) or
