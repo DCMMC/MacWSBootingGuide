@@ -140,10 +140,25 @@ static void MTLPatchLog(const char *fmt, ...) {
 // Strip arm64e PAC bits from a pointer. dlsym/MSFindSymbol on arm64e
 // returns PAC-signed pointers for code symbols; doing pointer arithmetic
 // on them carries the PAC bits into the result and the dereference faults.
-// Mask the lower 48 bits — arm64e iOS uses 47-bit virtual addresses so
-// bits 47..63 hold the PAC tag.
+//
+// iOS arm64e user space is a 47-bit VA (T0SZ=17), so the PAC tag begins at
+// bit 47 — the low 47 bits (0..46) are the real address, bits 47..63 hold
+// the tag. The PREVIOUS mask 0x0000FFFFFFFFFFFF kept the low *48* bits,
+// which leaves bit 47 in place. PAC tags are per-process random, so bit 47
+// is set ~50% of the time; when set, the "stripped" anchor lands at a bogus
+// out-of-__TEXT address (e.g. 0x8001d1669514 instead of 0x1d1669514) and
+// the bounds-checked BL scan in FindRenamerBLSite skips every probe →
+// "no ADD+BL pair found" → renamer patch never applies → the
+// agx.air.fract.v3f16.fast abort fires.
+//
+// RE-confirmed via /var/jb/var/mobile/mtl_compiler_patch.log (2026-06-20):
+// EVERY anchor with bit47 set ("stripped=0x8001d1669514") FAILED the scan;
+// EVERY bit47-clear anchor ("stripped=0x1ed3dd514") found the BL and NOPed
+// OK — a 61/63 OK/FAIL coin-flip that exactly tracks bit 47. Masking the
+// low 47 bits removes the tag for both cases (real user addresses never set
+// bit 47, so this can't clobber a legitimate address).
 static uintptr_t StripPAC(const void *p) {
-    return (uintptr_t)p & 0x0000FFFFFFFFFFFFull;
+    return (uintptr_t)p & 0x00007FFFFFFFFFFFull;
 }
 
 // Scan a window around (anchor + delta_hint) for the BL site preceded by
