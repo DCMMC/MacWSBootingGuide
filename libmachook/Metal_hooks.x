@@ -14,6 +14,7 @@
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
 extern int IOSurfaceLock(IOSurfaceRef, uint32_t options, uint32_t *seed);
+extern int IOSurfaceUnlock(IOSurfaceRef, uint32_t options, uint32_t *seed);
 
 // 2026-06-20 — Wire IOSurface base address into AGX texture's writable
 // backing pointer ivar.
@@ -126,10 +127,22 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
     void *prev_base = *(void **)((char *)impl + 0xa0);
     if (prev_base != NULL) {
         static int skiplog = 0;
-        if (skiplog++ < 6) {
+        if (skiplog++ < 16) {
+            // 2026-06-20 — CONFIRMED SEPARATE-MEMORY: texture's CPU
+            // backing (+0xa0) != IOSurface base.  Now sample the
+            // backing's first 4 KB to see if the GPU rendered content
+            // THERE (→ copy backing→IOSurface fixes VNC) or if it's
+            // also zero (→ GPU truly not executing).  4 KB is safe for
+            // any real texture backing.
+            int nz = 0; uint64_t acc = 0;
+            for (int i = 0; i < 4096; i++) {
+                uint8_t v = ((volatile uint8_t *)prev_base)[i];
+                if (v) nz++; acc += v;
+            }
             fprintf(stderr,
-                "#### AGX_WIRE_IOSURF: skip (AGX-set) tex=%p impl=%p +0xa0=%p (not overwriting)\n",
-                (void *)tex, impl, prev_base);
+                "#### AGX_WIRE_IOSURF: skip(AGX-set) tex=%p backing=%p IOSurf=%p "
+                "SEPARATE backing[0:4K] nonzero=%d sum=%llu\n",
+                (void *)tex, prev_base, base, nz, (unsigned long long)acc);
         }
         return;
     }
@@ -1059,6 +1072,35 @@ static void macws_sigabrt_trampoline(int sig) {
     if (result && iosurface) {
         macws_wire_iosurface_base_into_texture(result, iosurface);
     }
+    // 2026-06-20 — VNC read-path test on the IOSURFACE VARIANT.  Filling
+    // our pooled ROUTE-IOSURF surfaces with gray did NOT change VNC
+    // (VNC reads SkyLight's own scanout surface, not our scratch
+    // surfaces).  This variant is called directly by SkyLight for its
+    // display/scanout surfaces (SkyLight-allocated IOSurface in the
+    // `iosurface` arg).  Fill those large ones with gray (gated 1/240)
+    // — if VNC turns gray, this IS the surface VNC reads → the fix is to
+    // route GPU-rendered content here.  MACWS_SURF_FILL_IOS.
+    if (getenv("MACWS_SURF_FILL_IOS") && iosurface) {
+        size_t iw = IOSurfaceGetWidth(iosurface);
+        size_t ih = IOSurfaceGetHeight(iosurface);
+        if (iw >= 1000 && ih >= 600) {
+            static _Atomic int fios = 0;
+            if ((atomic_fetch_add(&fios, 1) % 240) == 0) {
+                IOSurfaceLock(iosurface, 0, NULL);
+                void *fb = IOSurfaceGetBaseAddress(iosurface);
+                size_t al = IOSurfaceGetAllocSize(iosurface);
+                if (fb && al) {
+                    memset(fb, 0x80, al);
+                    static int l = 0;
+                    if (l++ < 4)
+                        fprintf(stderr,
+                            "#### SURF-FILL-IOS ios=%p %zux%zu allocSize=%zu filled 0x80\n",
+                            (void*)iosurface, iw, ih, al);
+                }
+                IOSurfaceUnlock(iosurface, 0, NULL);
+            }
+        }
+    }
     macws_set_current_iosurface_id(prev_iosurface_id);
     return result;
 }
@@ -1436,6 +1478,83 @@ static void macws_sigabrt_trampoline(int sig) {
                 fprintf(stderr,
                     "#### MTL_TEX TEX-CACHE-HIT: surf=%p → tex=%p (no sel=0xa, +1 retain)\n",
                     (void *)surf, (void *)tex);
+            }
+            // 2026-06-20 — GPU-execution decisive diagnostic.  VNC is
+            // black despite WS alive + composites succeeding.  Either the
+            // GPU isn't executing (composite produces no pixels) or the
+            // VNC read path reads a different surface.  Sample this
+            // pooled surface's center pixels: if they ever become
+            // non-black, the GPU IS writing rendered content → black-VNC
+            // is a read-path problem.  Gated MACWS_SURF_SAMPLE.
+            // 2026-06-20 — VNC read-path test.  GPU renders to the
+            // texture's separate backing (confirmed: backing has
+            // content, IOSurface all-zero).  Before building a real
+            // backing→IOSurface bridge, confirm VNC actually READS this
+            // IOSurface by filling it with a solid pattern.  If VNC
+            // turns white/gray, the read path is correct and the fix is
+            // to route rendered content here.  Gated MACWS_SURF_FILL.
+            // Only fill the large (display-sized) surfaces.
+            if (getenv("MACWS_SURF_FILL") && width >= 1000 && height >= 600) {
+                // Fill RARELY (every 240th hit).  GPU writes to the
+                // texture's SEPARATE backing, never this IOSurface, so
+                // the gray fill PERSISTS until we fill again — one fill
+                // is enough for VNC to show it.  Filling every hit
+                // (31 MB memset × hundreds/frame) thrashed the device.
+                static _Atomic int fillN = 0;
+                if ((atomic_fetch_add(&fillN, 1) % 240) == 0) {
+                    IOSurfaceLock(surf, 0, NULL);
+                    uint8_t *fb = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+                    if (fb) {
+                        memset(fb, 0x80, (size_t)width * height * bpe);
+                        static int filllog = 0;
+                        if (filllog++ < 4)
+                            fprintf(stderr,
+                                "#### SURF-FILL surf=%p %lux%lu bpe=%lu filled 0x80\n",
+                                (void*)surf,(unsigned long)width,
+                                (unsigned long)height,(unsigned long)bpe);
+                    }
+                    IOSurfaceUnlock(surf, 0, NULL);
+                }
+            }
+            if (getenv("MACWS_SURF_SAMPLE")) {
+                static _Atomic int sampN = 0;
+                int sn = atomic_fetch_add(&sampN, 1);
+                if ((sn % 240) == 0 && width >= 64 && height >= 64) {
+                    IOSurfaceLock(surf, 0x1 /*kIOSurfaceLockReadOnly*/, NULL);
+                    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
+                    if (base) {
+                        size_t bpr = width * bpe;
+                        // Scan a sparse grid across the WHOLE surface:
+                        // 32 rows × 32 cols = 1024 sample points.  If ANY
+                        // is non-zero, the GPU wrote visible content
+                        // somewhere → it's a VNC read-path issue, not a
+                        // GPU-execution issue.  All-zero across the whole
+                        // surface = GPU not writing to this IOSurface.
+                        uint64_t acc = 0; int nz = 0; int total = 0;
+                        size_t firstnz_off = (size_t)-1;
+                        for (int ry = 0; ry < 32; ry++) {
+                            size_t y = (size_t)ry * (height-1) / 31;
+                            for (int rx = 0; rx < 32; rx++) {
+                                size_t x = (size_t)rx * (width-1) / 31;
+                                size_t off = y * bpr + x * bpe;
+                                for (size_t b = 0; b < bpe; b++) {
+                                    uint8_t v = base[off + b];
+                                    acc += v; total++;
+                                    if (v) { nz++; if (firstnz_off==(size_t)-1) firstnz_off=off+b; }
+                                }
+                            }
+                        }
+                        fprintf(stderr,
+                            "#### SURF-SAMPLE surf=%p %lux%lu bpe=%lu GRID32x32: "
+                            "nonzero=%d/%d sum=%llu firstNZ@%#zx\n",
+                            (void *)surf, (unsigned long)width,
+                            (unsigned long)height, (unsigned long)bpe,
+                            nz, total, (unsigned long long)acc, firstnz_off);
+                    } else {
+                        fprintf(stderr, "#### SURF-SAMPLE surf=%p base=NULL\n", (void*)surf);
+                    }
+                    IOSurfaceUnlock(surf, 0x1, NULL);
+                }
             }
         } else {
             tex = [self hooked_newTextureWithDescriptor:desc
