@@ -93,37 +93,47 @@ static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
                                     for (size_t y = 0; y < sh; y++)
                                         memcpy((char *)base + y * sbpr,
                                                (char *)backing + y * sbpr, sbpr);
-                                // One-shot raw dump of the pf=115 (RGBA16Float)
-                                // composite backing for OFFLINE detile RE.
-                                // Gated by sentinel /tmp/macws_disp_dump.
-                                static int s_dumped16 = 0;
-                                if (!s_dumped16 && backing &&
-                                    access("/tmp/macws_disp_dump", F_OK) == 0 &&
+                                // One-shot raw dumps for OFFLINE detile RE,
+                                // gated by sentinel /tmp/macws_disp_dump. Two
+                                // independent files so we learn which texture
+                                // actually holds content:
+                                //   /tmp/macws_back115.raw   = the pf=115 (16F)
+                                //       composite (the surface CreateImage reads)
+                                //   /tmp/macws_backdense.raw = densest of any pf
+                                // Header: {w, h, pf, dens*1e6}.
+                                if (backing && access("/tmp/macws_disp_dump", F_OK) == 0 &&
                                     [t width] >= 1000) {
                                     size_t tw = [t width], th = [t height];
                                     unsigned long pf = (unsigned long)[t pixelFormat];
-                                    size_t bpe = (pf == 115) ? 8 : 4;  // 16F=8B, BGRA8=4B
+                                    size_t bpe = (pf == 115) ? 8 : 4;
                                     size_t total = tw * th * bpe;
-                                    // Only dump a CONTENT-RICH texture (>5% nonzero) so we
-                                    // skip near-empty overlay layers and capture the real
-                                    // composite. Retries each bg pass until one qualifies.
+                                    // Denser nonzero sampler (every 256B, was 1024)
+                                    // — 16F low-bytes are often 0 so coarse sampling
+                                    // undercounted the real composite.
                                     size_t nzc = 0, samp = 0;
-                                    for (size_t off = 0; off < total; off += 1024) {
+                                    for (size_t off = 0; off < total; off += 256) {
                                         if (((uint8_t *)backing)[off]) nzc++;
                                         samp++;
                                     }
                                     double dens = samp ? (double)nzc / samp : 0;
-                                    if (dens > 0.05) {
-                                        FILE *df = fopen("/tmp/macws_backing16f.raw", "wb");
+                                    static int s_d115 = 0;
+                                    if (!s_d115 && pf == 115) {
+                                        FILE *df = fopen("/tmp/macws_back115.raw", "wb");
                                         if (df) {
-                                            uint32_t hdr[4] = { (uint32_t)tw, (uint32_t)th,
-                                                                (uint32_t)pf, (uint32_t)IOSurfaceGetAllocSize(s) };
-                                            fwrite(hdr, 4, 4, df);
-                                            fwrite(backing, 1, total, df);
-                                            fclose(df);
-                                            s_dumped16 = 1;
-                                            fprintf(stderr, "#### DUMPBACK %zux%zu pf=%lu bpe=%zu dens=%.3f -> raw\n",
-                                                    tw, th, pf, bpe, dens);
+                                            uint32_t hdr[4] = { (uint32_t)tw, (uint32_t)th, (uint32_t)pf, (uint32_t)(dens*1e6) };
+                                            fwrite(hdr, 4, 4, df); fwrite(backing, 1, total, df); fclose(df);
+                                            s_d115 = 1;
+                                            fprintf(stderr, "#### DUMP115 %zux%zu dens=%.3f\n", tw, th, dens);
+                                        }
+                                    }
+                                    static int s_ddense = 0;
+                                    if (!s_ddense && dens > 0.01) {
+                                        FILE *df = fopen("/tmp/macws_backdense.raw", "wb");
+                                        if (df) {
+                                            uint32_t hdr[4] = { (uint32_t)tw, (uint32_t)th, (uint32_t)pf, (uint32_t)(dens*1e6) };
+                                            fwrite(hdr, 4, 4, df); fwrite(backing, 1, total, df); fclose(df);
+                                            s_ddense = 1;
+                                            fprintf(stderr, "#### DUMPDENSE %zux%zu pf=%lu dens=%.3f\n", tw, th, pf, dens);
                                         }
                                     }
                                 }
