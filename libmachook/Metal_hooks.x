@@ -1326,40 +1326,37 @@ static void macws_sigabrt_trampoline(int sig) {
             // Each IOSurface registered via AGXIOC sel=0xa type=0x82
             // can be added to DCP's scanout-source registry — DCP's
             // bounded RTKit heap fills up with our chroot's IOSurfaces
-            // and panics, rebooting the device.  These props tell
-            // IOKit/AGX "this surface is NOT a scanout source — keep
-            // it out of DCP's registry":
+            // and panics, rebooting the device.  IOSurfaceIsGlobal:NO
+            // keeps the surface out of the cross-process / DCP path.
             //
             //   IOSurfaceIsGlobal: NO         — not cross-process; AGX
             //                                  doesn't need to share it
-            //                                  with DCP for window-server
-            //                                  display
-            //   IOSurfaceNonPurgeable: YES    — kernel keeps it in
-            //                                  high-priority memory; not
-            //                                  a scratchpad DCP might
-            //                                  reclaim
+            //                                  with DCP for display
             //   IOSurfaceCacheMode: 0         — default cached (NOT
             //                                  WriteCombineCache 0x700,
-            //                                  which is the scanout
-            //                                  mode our shadow path
-            //                                  used and is what
-            //                                  signals "for display
+            //                                  which signals "for display
             //                                  engine consumption")
-            //   IOSurfaceElementWidth: 1      — explicit non-tiled
-            //                                  layout; DCP scanout
-            //                                  prefers tiled
-            //                                  arrangements
-            //   IOSurfaceElementHeight: 1     — ditto
+            //
+            // 2026-06-20 17:56 — REMOVED IOSurfaceNonPurgeable:YES.
+            // RE'd from WindowServer-2026-06-20-175357.ips
+            // (MTLPipelineDataCache::getElement → malloc → memmove(NULL)
+            // crash with ktriageinfo "pmap_enter retried due to resource
+            // shortage" x4).  vm_stat showed 1.76 GB free but 983 MB
+            // WIRED — the NonPurgeable hint wired every pooled 31 MB
+            // IOSurface permanently, exhausting pmap PTE-page resources
+            // so a small Metal pipeline-cache malloc returned NULL and
+            // Metal's getElement memmove'd into it unchecked.  The
+            // surfaces don't need wiring; purgeable (default) lets the
+            // kernel manage them and keeps pmap pressure down.  Also
+            // removed the speculative ElementWidth/Height:1 hints (no
+            // measured effect on DCP registration).
             NSDictionary *props = @{
                 @"IOSurfaceWidth":           @(width),
                 @"IOSurfaceHeight":          @(height),
                 @"IOSurfaceBytesPerElement": @(bpe),
                 @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
                 @"IOSurfaceIsGlobal":        @NO,
-                @"IOSurfaceNonPurgeable":    @YES,
                 @"IOSurfaceCacheMode":       @0,
-                @"IOSurfaceElementWidth":    @1,
-                @"IOSurfaceElementHeight":   @1,
             };
             surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
             if (surf) {
