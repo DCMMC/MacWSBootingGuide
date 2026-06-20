@@ -1409,9 +1409,17 @@ static void macws_sigabrt_trampoline(int sig) {
         // for the same surf is shape-safe.  Repeated creates → ZERO
         // additional AGXIOC sel=0xa → ZERO DCP-registry growth.
         //
-        // Aliasing risk: same as IOSurface pool.  For SkyLight
-        // compositor the (w,h,pf) scratch textures are used serially
-        // so returning the same MTLTexture object is acceptable.
+        // 2026-06-20 17:46 — ARC-correct retain on cache HIT.  Naming
+        // convention: methods starting with "new" return +1 retain.
+        // Without explicit retain, callers ARC-release → texture
+        // refcount drops past 0 → next [MTLResourceList
+        // releaseAllObjectsAndReset] → objc_release on dangling ptr →
+        // SIGSEGV (WindowServer-2026-06-20-174649.ips faultingThread
+        // crash at FAR=0x20 inside objc_release+16, called from
+        // MTLResourceListChunkFreeEntries).  Fix: CFRetain on cache
+        // HIT so each caller still gets +1 it can release.  On
+        // CACHE-NEW the texture comes from %orig at +1 already (Apple
+        // ARC convention).
         static NSMutableDictionary<NSValue *, id<MTLTexture>> *texCache = nil;
         static dispatch_once_t texCacheOnce;
         dispatch_once(&texCacheOnce, ^{ texCache = [NSMutableDictionary new]; });
@@ -1422,9 +1430,14 @@ static void macws_sigabrt_trampoline(int sig) {
         }
         static int texCacheLog = 0;
         if (tex) {
+            // Cache hit — give caller its expected +1 ARC retain.  The
+            // dictionary's retain keeps tex alive across the
+            // CFRetain → ARC-balanced via CFBridgingRelease at autorelease
+            // / explicit release sites downstream.
+            CFRetain((__bridge CFTypeRef)tex);
             if (texCacheLog++ < 8) {
                 fprintf(stderr,
-                    "#### MTL_TEX TEX-CACHE-HIT: surf=%p → tex=%p (no sel=0xa)\n",
+                    "#### MTL_TEX TEX-CACHE-HIT: surf=%p → tex=%p (no sel=0xa, +1 retain)\n",
                     (void *)surf, (void *)tex);
             }
         } else {
@@ -1435,8 +1448,25 @@ static void macws_sigabrt_trampoline(int sig) {
                 @synchronized(texCache) {
                     id<MTLTexture> cached = texCache[texKey];
                     if (cached) {
+                        // Lost the race — drop our fresh tex (let ARC
+                        // release it via end-of-scope autorelease) and
+                        // hand caller the cached one with +1.
+                        CFRetain((__bridge CFTypeRef)cached);
                         tex = cached;
                     } else {
+                        // Insert into dict.  Dict retains; %orig +1
+                        // already belongs to caller.  Bump retain once
+                        // more to keep dict's reference matched to the
+                        // explicit retain we'll add on every HIT — this
+                        // way dict ref == sum of (HITs we'll service).
+                        // Without this extra retain, dict→tex link is
+                        // the only thing holding tex; first HIT's
+                        // CFRetain still works (refcount goes 1→2 then
+                        // back to 1 on caller's release), but if dict
+                        // is ever cleared, tex dies even though HITs
+                        // were still expected.  Conservative: keep tex
+                        // alive for process lifetime.
+                        CFRetain((__bridge CFTypeRef)tex);
                         texCache[texKey] = tex;
                     }
                 }
