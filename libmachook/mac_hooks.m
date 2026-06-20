@@ -4133,9 +4133,83 @@ static void macws_install_iomfb_hid_bypass(void) {
     }
 }
 
+// ─── OSXvnc framebuffer delivery hook ────────────────────────────────────────
+// OSXvnc-server captures via CGDisplayCreateImage(CGMainDisplayID()), but in its
+// "off-screen user session" that returns BLACK (CGS session isolation — same
+// displayID as a CLI capture that DOES see our composite). Source
+// (github.com/stweil/OSXvnc, OSXvnc-server/main.c): rfbGetFramebuffer() caches
+// frameBufferData and returns its .mutableBytes; rfbGetFramebufferUpdateInRect()
+// re-captures per frame INTO it. We hook both and overwrite frameBufferData with
+// OUR content, bypassing the black session-CreateImage.
+//   Phase 1 (this build): write a TEST GRADIENT to prove the delivery path
+//   end-to-end on VNC. Phase 2: read the detiled composite from a shared
+//   IOSurface instead of the gradient.
+// rfbScreenInfo (rfb.h): width@0 paddedWidthInBytes@+4 height@+8 depth@+12
+//   bitsPerPixel@+16 (all int32). Offsets from base 0x100000000 (otool of the
+//   device OSXvnc-server arm64): rfbGetFramebuffer @0xd9d4,
+//   rfbGetFramebufferUpdateInRect @0xdc28, rfbScreen @0x79bf8.
+// Always installed inside OSXvnc but INERT unless /tmp/macws_vnc_test exists.
+static char *(*macws_orig_rfbGetFB)(void);
+static void (*macws_orig_rfbGetFBRect)(int, int, int, int);
+static char *macws_vnc_fb = NULL;
+static int  *macws_rfbScreen = NULL;
+static int   macws_vnc_test_on = 0;
+
+static void macws_vnc_fill_test(void) {
+    if (!macws_vnc_test_on || !macws_vnc_fb || !macws_rfbScreen) return;
+    int padded = macws_rfbScreen[1];   // paddedWidthInBytes
+    int height = macws_rfbScreen[2];   // height
+    int bpp    = macws_rfbScreen[4];   // bitsPerPixel
+    if (padded <= 0 || height <= 0 || height > 8192 || padded > (1 << 20)) return;
+    int bytespp = (bpp > 0 ? bpp / 8 : 4); if (bytespp < 1) bytespp = 4;
+    int pxw = padded / bytespp;
+    for (int y = 0; y < height; y++) {
+        unsigned char *row = (unsigned char *)macws_vnc_fb + (size_t)y * padded;
+        for (int x = 0; x < pxw; x++) {
+            unsigned char *p = row + (size_t)x * bytespp;
+            p[0] = (unsigned char)((x * 255) / (pxw ? pxw : 1)); // X ramp
+            p[1] = (unsigned char)((y * 255) / height);          // Y ramp
+            p[2] = 0x40;
+            if (bytespp >= 4) p[3] = 0xff;
+        }
+    }
+}
+
+static char *macws_new_rfbGetFB(void) {
+    char *p = macws_orig_rfbGetFB ? macws_orig_rfbGetFB() : NULL;
+    macws_vnc_fb = p;
+    macws_vnc_fill_test();
+    return p;
+}
+static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
+    if (macws_orig_rfbGetFBRect) macws_orig_rfbGetFBRect(x, y, w, h);
+    macws_vnc_fill_test();
+}
+
+static void macws_install_osxvnc_hooks(void) {
+    const char *prog = getprogname();
+    if (!prog || !strstr(prog, "OSXvnc")) return;
+    macws_vnc_test_on = (access("/tmp/macws_vnc_test", F_OK) == 0);
+    const struct mach_header *mh = NULL;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "OSXvnc-server")) { mh = _dyld_get_image_header(i); break; }
+    }
+    if (!mh) mh = _dyld_get_image_header(0);
+    if (!mh) return;
+    char *base = (char *)mh;
+    macws_rfbScreen = (int *)(base + 0x79bf8);
+    MSHookFunction(base + 0xd9d4, (void *)macws_new_rfbGetFB,     (void **)&macws_orig_rfbGetFB);
+    MSHookFunction(base + 0xdc28, (void *)macws_new_rfbGetFBRect, (void **)&macws_orig_rfbGetFBRect);
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d) base=%p rfbScreen=%p\n",
+            macws_vnc_test_on, (void *)mh, (void *)macws_rfbScreen);
+}
+
 __attribute__((constructor)) void InitStuff() {
     EnableJIT();
     macws_install_crash_diag();
+    macws_install_osxvnc_hooks();
     // HID bypass is OPT-IN. Whole-IOKit-symbol hooking creates a tower of
     // MSHook'd functions; if any one of them is itself called recursively
     // via PAC-signed pointers from elsewhere in IOKit, the bypass starts
