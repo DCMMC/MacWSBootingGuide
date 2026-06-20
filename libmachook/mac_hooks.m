@@ -4932,6 +4932,42 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // VA at +0x38 tells the macOS kernel "place this heap at this
         // pinned GPU VA", iOS kernel rejects. Zero args+0x38 for ANY
         // type=0 heap call where it's >1GB — same logic as +0x40 swap.
+        // 2026-06-20 — ONE-SHOT pre-patch dump for type=0x82 (IOSurface
+        // texture).  RE of IOGPUDevice::new_resource (kernelcache
+        // 0xfffffe0009f03b4c) shows the newResourceWithIOSurface (wrap)
+        // path requires args+0x34 >= IOSurface-plane-dimension AND
+        // args+0x15 bit3.  Our SURF diagnostics proved the resulting
+        // texture has SEPARATE backing (GPU renders there, IOSurface
+        // VNC reads stays black).  Hypothesis: our arg-mangling routes
+        // the call away from the wrap path.  Dump the ORIGINAL macOS
+        // args to see what +0x34 / +0x15 / +0x40 / +0x58 actually hold
+        // before we touch them.
+        if (agxType == 0x82) {
+            static int t82_pre = 0;
+            if (!t82_pre) {
+                t82_pre = 1;
+                fprintf(stderr,
+                    "#### AGXIOC RAW DUMP sel=0x9 type=0x82 inStructCnt=%zu (PRE-patch):\n",
+                    inStructCnt);
+                for (size_t i = 0; i < inStructCnt && i < 0x70; i += 16) {
+                    fprintf(stderr, "    +%#04zx:", i);
+                    for (size_t j = 0; j < 16 && (i + j) < inStructCnt; j++)
+                        fprintf(stderr, " %02x", src[i + j]);
+                    fprintf(stderr, "\n");
+                }
+                fprintf(stderr,
+                    "####   key fields: +0x14=%#x +0x15(byte)=%#x +0x30=%#x "
+                    "+0x34=%#x +0x38=%#llx +0x40=%#llx +0x48=%#llx +0x58=%#llx\n",
+                    *(const uint32_t *)(src + 0x14),
+                    (unsigned)src[0x15],
+                    *(const uint32_t *)(src + 0x30),
+                    *(const uint32_t *)(src + 0x34),
+                    (unsigned long long)*(const uint64_t *)(src + 0x38),
+                    (unsigned long long)*(const uint64_t *)(src + 0x40),
+                    (unsigned long long)*(const uint64_t *)(src + 0x48),
+                    (unsigned long long)*(const uint64_t *)(src + 0x58));
+            }
+        }
         // Apply VA-shape + flag-strip to ALL types (was only type=0).
         // type=0x80 client-buffer path showed same pattern: args+0x38 has
         // pinned-VA, args+0x14=0x0c30 has bit 11 (macOS-only) set.
