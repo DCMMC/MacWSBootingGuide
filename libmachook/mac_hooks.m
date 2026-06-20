@@ -817,7 +817,11 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
         }
         return 0;
     }
-    return orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
+    int rv = orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
+    // WS-render-thread completion capture for VNC (gated /tmp/macws_vnc_share):
+    // getBytes the previous (complete) display frame -> shared surface -> OSXvnc.
+    { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(target0); }
+    return rv;
 }
 
 // SkyLight `MetalContext::StartComposite(WSCompositeDestination*,
@@ -963,6 +967,15 @@ int hooked_skylight_start_composite_wscd(void *self, void *dest,
         ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
     int rv = ((StartComposite_WSCD_t)orig_skylight_start_composite_wscd_ref)(
         self, dest, load_action, store_action);
+    // VNC completion-capture: map the WSCompositeDestination back to its
+    // MTLTexture (recorded at WSCompositeDestinationCreateWithMetalTexture)
+    // and feed it to the WS-render-thread capture.
+    { extern NSMutableDictionary *g_wscd_tex;
+      if (g_wscd_tex && dest) {
+          id tex = nil;
+          @synchronized(g_wscd_tex) { tex = g_wscd_tex[[NSValue valueWithPointer:dest]]; }
+          if (tex) { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(tex); }
+      } }
     return macws_pop_on_startcomp_bail(self, before, rv);
 }
 
@@ -976,6 +989,7 @@ static int hooked_skylight_start_composite_mtltex(void *self, id texture,
         ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
     int rv = orig_skylight_start_composite_mtltex(
         self, texture, load_action, store_action);
+    { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(texture); }
     return macws_pop_on_startcomp_bail(self, before, rv);
 }
 
@@ -1002,8 +1016,19 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
         }
         return NULL;
     }
-    return orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
+    void *wscd = orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
+    // Map WSCompositeDestination -> its MTLTexture, so the WSCD-variant
+    // StartComposite hook (the one that fires in coexist) can feed the
+    // VNC completion-capture (which needs the destination texture).
+    if (wscd && texture) {
+        static NSMutableDictionary *m = nil; static dispatch_once_t o;
+        dispatch_once(&o, ^{ m = [NSMutableDictionary new]; });
+        extern NSMutableDictionary *g_wscd_tex; g_wscd_tex = m;
+        @synchronized(m) { m[[NSValue valueWithPointer:wscd]] = texture; }
+    }
+    return wscd;
 }
+NSMutableDictionary *g_wscd_tex = nil;  // WSCD ptr (NSValue) -> id<MTLTexture>
 
 // MetalContext::StopCapture() guard — see install_skylight_prepare_for_use_tolerate_nil_hook()
 // for the call-site explanation.

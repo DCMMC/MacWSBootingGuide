@@ -95,6 +95,58 @@ static void macws_vnc_share_mirror(void *base, size_t sbpr, size_t sh, size_t w)
     }
     IOSurfaceUnlock(g_vncSurf, 0, NULL);
 }
+// Half (IEEE binary16) -> u8 [0,255], clamped to [0,1]. For RGBA16Float composites.
+static inline uint8_t macws_half_to_u8(uint16_t h) {
+    uint16_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    float f;
+    if (e == 0) f = ldexpf((float)m, -24);
+    else if (e == 31) f = 1.0f;
+    else f = ldexpf((float)(m + 1024), (int)e - 25);
+    if (s) f = 0.0f;            // negatives clamp to 0
+    if (f < 0) f = 0; if (f > 1) f = 1;
+    return (uint8_t)(f * 255.0f + 0.5f);
+}
+// WS-RENDER-THREAD composite-completion capture. Called from the StartComposite
+// hook (mac_hooks.m, WS thread) with the current frame's display destination.
+// getBytes the PREVIOUS frame's dest (now GPU-complete) — Metal-native DETILE —
+// convert to BGRA8 -> g_vncSurf (cross-process to OSXvnc). This is the reliable
+// content source the bg-thread +0xa0 sampling could not be (the backing is only
+// valid at completion). getBytes is SAFE on the WS thread between frames (it
+// crashed only from the async bg thread racing active render). Throttled. ARC
+// keeps the previous texture alive via the strong static.
+// Capture `dest` at the WSCD StartComposite hook (WS render thread, before
+// %orig): the destination texture's +0xa0 GPU backing holds the PREVIOUS,
+// fully-composited frame (this frame's draw happens after %orig). RAW memcpy of
+// +0xa0 — SAFE (the bridge does this). NOTE getBytes is NOT used: it CRASHES
+// from the bg thread and HANGS on the render thread (waits for a composite not
+// yet submitted). The backing is AGX-TILED, so g_vncSurf gets tiled bytes for
+// now — a reliable content SOURCE; CPU twiddle-detile is the remaining TODO
+// (getBytes/Metal-detile is unavailable). pf=115 (16F, 8B/px) backing is read
+// at its 8B stride into the BGRA8 share surface best-effort.
+void macws_vnc_on_composite(id<MTLTexture> dest) {
+    if (!macws_vnc_share_enabled() || !dest) return;
+    size_t w = [dest width], h = [dest height];
+    unsigned long pf = (unsigned long)[dest pixelFormat];
+    if (w < 1000 || h < 600) return;
+    void *impl = *(void **)((char *)(__bridge void *)dest + 0x208);
+    if ((uintptr_t)impl <= 0x1000) return;
+    void *backing = *(void **)((char *)impl + 0xa0);
+    if (!backing) return;
+    size_t bpe = (pf == 115) ? 8 : 4;
+    size_t srcbpr = w * bpe;             // approximate; tiled data has no true stride
+    macws_vnc_share_ensure(w, h);
+    if (!g_vncSurf || IOSurfaceLock(g_vncSurf, 0, NULL) != 0) return;
+    void *vb = IOSurfaceGetBaseAddress(g_vncSurf);
+    size_t vbpr = IOSurfaceGetBytesPerRow(g_vncSurf);
+    if (vb) {
+        size_t cw = srcbpr < vbpr ? srcbpr : vbpr;
+        for (size_t y = 0; y < h; y++)
+            memcpy((char *)vb + y * vbpr, (char *)backing + y * srcbpr, cw);
+        static int logged = 0;
+        if (logged < 3) { fprintf(stderr, "#### VNC-CAPTURE raw +0xa0 %zux%zu pf=%lu bpe=%zu -> share (tiled,TODO detile)\n", w, h, pf, bpe); logged++; }
+    }
+    IOSurfaceUnlock(g_vncSurf, 0, NULL);
+}
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
 // thread on first use. The thread either fills the surface gray (mode 1) or
 // copies the texture's CPU-mapped GPU backing (+0xa0, which holds the real
