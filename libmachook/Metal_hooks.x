@@ -1318,11 +1318,48 @@ static void macws_sigabrt_trampoline(int sig) {
         }
         static int route_log = 0;
         if (!surf) {
+            // 2026-06-20 17:16 — IOSurface props with NON-SCANOUT hints
+            // to prevent DCP (Display Coprocessor) RTKit firmware OOM
+            // panic (panic-full-2026-06-20-171622.000.ips: DCP PANIC
+            // CXXnew:2208 - iomfb_ap_callee_0(21)).
+            //
+            // Each IOSurface registered via AGXIOC sel=0xa type=0x82
+            // can be added to DCP's scanout-source registry — DCP's
+            // bounded RTKit heap fills up with our chroot's IOSurfaces
+            // and panics, rebooting the device.  These props tell
+            // IOKit/AGX "this surface is NOT a scanout source — keep
+            // it out of DCP's registry":
+            //
+            //   IOSurfaceIsGlobal: NO         — not cross-process; AGX
+            //                                  doesn't need to share it
+            //                                  with DCP for window-server
+            //                                  display
+            //   IOSurfaceNonPurgeable: YES    — kernel keeps it in
+            //                                  high-priority memory; not
+            //                                  a scratchpad DCP might
+            //                                  reclaim
+            //   IOSurfaceCacheMode: 0         — default cached (NOT
+            //                                  WriteCombineCache 0x700,
+            //                                  which is the scanout
+            //                                  mode our shadow path
+            //                                  used and is what
+            //                                  signals "for display
+            //                                  engine consumption")
+            //   IOSurfaceElementWidth: 1      — explicit non-tiled
+            //                                  layout; DCP scanout
+            //                                  prefers tiled
+            //                                  arrangements
+            //   IOSurfaceElementHeight: 1     — ditto
             NSDictionary *props = @{
                 @"IOSurfaceWidth":           @(width),
                 @"IOSurfaceHeight":          @(height),
                 @"IOSurfaceBytesPerElement": @(bpe),
                 @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
+                @"IOSurfaceIsGlobal":        @NO,
+                @"IOSurfaceNonPurgeable":    @YES,
+                @"IOSurfaceCacheMode":       @0,
+                @"IOSurfaceElementWidth":    @1,
+                @"IOSurfaceElementHeight":   @1,
             };
             surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
             if (surf) {
@@ -1358,9 +1395,58 @@ static void macws_sigabrt_trampoline(int sig) {
             }
         }
         if (!surf) return nil;
-        id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc
-                                                          iosurface:surf
-                                                              plane:0];
+        // 2026-06-20 17:20 — MTLTexture cache by IOSurface (DCP-OOM fix
+        // companion).  Each newTextureWithDescriptor:iosurface:plane:
+        // call triggers fresh AGXIOC sel=0x9/0xa type=0x82 — visible in
+        // WindowServer.err: every POOL-HIT is still followed by another
+        // AGXIOC type=0x82 patch + ResCreate.  Each sel=0xa registers
+        // a fresh IOGPUMetalResource for the same IOSurface, which AGX
+        // may forward to DCP's scanout-source registry (root cause of
+        // panic-full-2026-06-20-171622.000.ips).
+        //
+        // Cache the MTLTexture by IOSurfaceRef.  Since pool guarantees
+        // same surface → same dimensions, returning the cached texture
+        // for the same surf is shape-safe.  Repeated creates → ZERO
+        // additional AGXIOC sel=0xa → ZERO DCP-registry growth.
+        //
+        // Aliasing risk: same as IOSurface pool.  For SkyLight
+        // compositor the (w,h,pf) scratch textures are used serially
+        // so returning the same MTLTexture object is acceptable.
+        static NSMutableDictionary<NSValue *, id<MTLTexture>> *texCache = nil;
+        static dispatch_once_t texCacheOnce;
+        dispatch_once(&texCacheOnce, ^{ texCache = [NSMutableDictionary new]; });
+        NSValue *texKey = [NSValue valueWithPointer:(const void *)surf];
+        id<MTLTexture> tex = nil;
+        @synchronized(texCache) {
+            tex = texCache[texKey];
+        }
+        static int texCacheLog = 0;
+        if (tex) {
+            if (texCacheLog++ < 8) {
+                fprintf(stderr,
+                    "#### MTL_TEX TEX-CACHE-HIT: surf=%p → tex=%p (no sel=0xa)\n",
+                    (void *)surf, (void *)tex);
+            }
+        } else {
+            tex = [self hooked_newTextureWithDescriptor:desc
+                                              iosurface:surf
+                                                  plane:0];
+            if (tex) {
+                @synchronized(texCache) {
+                    id<MTLTexture> cached = texCache[texKey];
+                    if (cached) {
+                        tex = cached;
+                    } else {
+                        texCache[texKey] = tex;
+                    }
+                }
+                if (texCacheLog++ < 8) {
+                    fprintf(stderr,
+                        "#### MTL_TEX TEX-CACHE-NEW: surf=%p → tex=%p\n",
+                        (void *)surf, (void *)tex);
+                }
+            }
+        }
         // 2026-06-20 — Wire IOSurface base into the texture's +0xa0
         // ivar so AGX::Texture::writeRegion's memmove has a valid
         // dest pointer for CA's replaceRegion pixel uploads.  The
