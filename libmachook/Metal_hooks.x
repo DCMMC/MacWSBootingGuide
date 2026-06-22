@@ -10,6 +10,8 @@
 #import "utils.h"
 
 #import <IOSurface/IOSurfaceRef.h>
+#import <mach/mach.h>
+#import <mach/vm_region.h>
 
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
@@ -29,6 +31,13 @@ extern size_t IOSurfaceGetWidth(IOSurfaceRef);
 extern size_t IOSurfaceGetHeight(IOSurfaceRef);
 extern size_t IOSurfaceGetAllocSize(IOSurfaceRef);
 extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef);
+extern unsigned long IOSurfaceGetTypeID(void);
+extern unsigned long CFGetTypeID(const void *);
+extern uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef);
+extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef);
+extern size_t IOSurfaceGetElementWidth(IOSurfaceRef);
+extern size_t IOSurfaceGetElementHeight(IOSurfaceRef);
+extern size_t IOSurfaceGetPlaneCount(IOSurfaceRef);
 // Display-surface bridge mode. 0 = off, 1 = gray-fill (validation: proves
 // CGDisplayCreateImage reads the surface), 2 = REAL copy (texture +0xa0
 // backing -> IOSurface, the actual CPU-copy bridge). Resolved once via env
@@ -43,6 +52,8 @@ static int macws_disp_mode(void) {
             cached = 2;
         else if (getenv("MACWS_DISP_FILL_LOOP") || access("/tmp/macws_disp_fill", F_OK) == 0)
             cached = 1;
+        else if (getenv("MACWS_TEX_SCAN") || access("/tmp/macws_tex_scan", F_OK) == 0)
+            cached = 3;   // light density scan only (no copy/mirror) — stable
         else cached = 0;
     }
     return cached;
@@ -151,6 +162,102 @@ static inline uint8_t macws_half_to_u8(uint16_t h) {
 //     holds tiled bytes (CPU twiddle-detile is the remaining TODO).
 static id<MTLTexture> g_vnc_comp_tex = nil;   // stashed composite dest (ARC strong)
 static id g_vnc_lock = nil;
+
+// DETILE SELF-TEST (gated /tmp/macws_vnc_selftest, one-shot). Runs INSIDE WS —
+// the only context where AGX GPU command submission actually executes (a
+// standalone chroot CLI fails every clear/blit with Internal Error 0x102/0x103;
+// misc/DetileTest/main.m runtime-confirmed 2026-06-21).
+//
+// Strategy: use the REAL composite `t0` as the (genuinely AGX-laid-out) source —
+// NO synthetic fill, so NO -replaceRegion (which crashes: writeRegion ->
+// memmove dst=NULL on the pooled wrapper). Blit t0 into the pipeline's idle dst,
+// then read dst BOTH ways and compare them to each other:
+//   G = getBytes(dst)         — the driver's canonical detiled/linear output
+//   A = raw bytes at impl+0xa0 — EXACTLY what the VNC pipeline memcpy's (w*4)
+// If A == G the pipeline read path is CORRECT. If A != G, +0xa0 is the wrong
+// memory / wrong stride and that's the real bug. Also logs dst layout(+0x184)
+// & stride(+0xa8), and whether dst aliases t0 (pool dedupe would void the test).
+// Dumps both reads to /tmp/detile_getbytes.raw + /tmp/detile_a0.raw.
+// Returns 1 when the test ran to a valid comparison (or hit an unrecoverable
+// condition); 0 to ask the caller to RETRY (the GPU submission context needs a
+// few frames to warm up — early blits fail Internal Error 0x103, like the
+// production VNC-BLIT path does before it settles).
+static int macws_vnc_selftest(id<MTLTexture> t0) {
+    if (!t0) return 0;
+    static int attempt = 0;
+    attempt++;
+    id<MTLDevice> dev = [t0 device];
+    size_t w = [t0 width], h = [t0 height], bpr = w * 4, sz = bpr * h;
+    unsigned long pf = (unsigned long)[t0 pixelFormat];
+    if (!dev || pf != 80 /*BGRA8*/ || w < 100 || h < 100) {
+        fprintf(stderr, "#### SELFTEST skip dev=%p pf=%lu %zux%zu (need BGRA8 >=100px)\n",
+                (void*)dev, pf, w, h);
+        return 1;
+    }
+    MTLTextureDescriptor *d = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:w height:h mipmapped:NO];
+    d.storageMode = MTLStorageModeShared;
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> dst = [dev newTextureWithDescriptor:d];   // pipeline's idle dst
+    if (!dst) { fprintf(stderr, "#### SELFTEST dst nil\n"); return 1; }
+    if (dst == t0) { fprintf(stderr, "#### SELFTEST dst==t0 (pool aliased src) — cannot test\n"); return 1; }
+
+    // Reuse ONE command queue like the production VNC-BLIT path — a fresh
+    // newCommandQueue per attempt fails submission (chroot AGX queue blocker).
+    static id<MTLCommandQueue> q = nil;
+    if (!q) q = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+    [bl copyFromTexture:t0 sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+            sourceSize:MTLSizeMake(w,h,1) toTexture:dst destinationSlice:0 destinationLevel:0
+     destinationOrigin:MTLOriginMake(0,0,0)];
+    [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    if ([cb status] != MTLCommandBufferStatusCompleted) {
+        if (attempt <= 3 || attempt % 40 == 0)
+            fprintf(stderr, "#### SELFTEST detile blit FAILED (attempt %d) status=%ld err=%s\n",
+                    attempt, (long)[cb status],
+                    [cb error] ? [[[cb error] localizedDescription] UTF8String] : "none");
+        return (attempt >= 400) ? 1 : 0;   // retry until warm; give up after ~20s
+    }
+    fprintf(stderr, "#### SELFTEST blit OK on attempt %d\n", attempt);
+
+    // dst layout fields
+    void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
+    void *backing = ((uintptr_t)impl > 0x1000) ? *(void **)((char *)impl + 0xa0) : NULL;
+    uint8_t layout = ((uintptr_t)impl > 0x1000) ? *(uint8_t  *)((char *)impl + 0x184) : 0xff;
+    uint32_t stride = ((uintptr_t)impl > 0x1000) ? *(uint32_t *)((char *)impl + 0xa8) : 0;
+
+    // G = getBytes (driver canonical) ; A = raw +0xa0 (pipeline read)
+    uint8_t *gb = (uint8_t *)malloc(sz);
+    int haveGB = 0;
+    if (gb) {
+        @try {
+            [dst getBytes:gb bytesPerRow:bpr fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+            haveGB = 1;
+        } @catch (NSException *e) { fprintf(stderr, "#### SELFTEST getBytes EXC %s\n", [[e reason] UTF8String]?:"?"); }
+    }
+    size_t diff = 0, samp = 0, nzG = 0, nzA = 0;
+    if (haveGB && backing) {
+        for (size_t i = 0; i < sz; i += 37) {
+            samp++;
+            uint8_t gv = gb[i], av = ((uint8_t*)backing)[i];
+            if (gv != av) diff++;
+            if (gv) nzG++;
+            if (av) nzA++;
+        }
+    }
+    fprintf(stderr, "#### SELFTEST dst=%p layout=%u stride=%u backing=%p  "
+            "getBytes-vs-+0xa0 mismatch=%zu/%zu (%.1f%%)  nonzero getBytes=%zu +0xa0=%zu\n",
+            (void*)dst, layout, stride, backing, diff, samp,
+            samp ? 100.0*diff/samp : 0.0, nzG, nzA);
+
+    if (haveGB) { FILE *f = fopen("/tmp/detile_getbytes.raw", "wb");
+        if (f) { uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr}; fwrite(hd,4,4,f); fwrite(gb,1,sz,f); fclose(f); } }
+    if (backing) { FILE *f = fopen("/tmp/detile_a0.raw", "wb");
+        if (f) { uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr}; fwrite(hd,4,4,f); fwrite(backing,1,sz,f); fclose(f); } }
+    if (gb) free(gb);
+    return 1;
+}
 void macws_vnc_on_composite(id<MTLTexture> dest) {
     if (!macws_vnc_share_enabled() || !dest) return;
     static dispatch_once_t once;
@@ -158,6 +265,10 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
         g_vnc_lock = [NSObject new];
         [NSThread detachNewThreadWithBlock:^{
             for (;;) {
+                // (old separate-blit self-test retired — its standalone blit fails
+                //  0x103 for reasons orthogonal to detile; the in-production SELFCHK
+                //  below piggybacks the already-working VNC-BLIT instead.)
+                (void)macws_vnc_selftest;
                 id<MTLTexture> t = nil;
                 @synchronized(g_vnc_lock) { t = g_vnc_comp_tex; }  // ARC retains into local
                 if (t) {
@@ -198,6 +309,54 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                             void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
                             if ((uintptr_t)impl > 0x1000) {
                                 void *backing = *(void **)((char *)impl + 0xa0);
+                                // DETILE SELF-CHECK (gated /tmp/macws_vnc_selftest, ~5x):
+                                // getBytes-FREE (getBytes on this bg thread destabilizes WS).
+                                // The dst is the blit target; if layout(+0x184)==0 and
+                                // stride(+0xa8)==0 (tight w*4), then +0xa0 IS the correct
+                                // linear pixel layout the pipeline memcpy's. Report those plus
+                                // the first row bytes + content nonzero fraction. The actual
+                                // detiled frame is in /tmp/macws_vnc_fb (pull + render to PNG
+                                // for visual proof — that's the real ground truth).
+                                if (backing && pf == 80 &&
+                                    access("/tmp/macws_vnc_selftest", F_OK) == 0) {
+                                    static int chk = 0;
+                                    if (chk < 1) {
+                                        chk++;
+                                        uint8_t layout = *(uint8_t  *)((char *)impl + 0x184);
+                                        uint32_t stride = *(uint32_t *)((char *)impl + 0xa8);
+                                        size_t sz = (size_t)w * h * 4, bpr = w * 4;
+                                        // DUMP A: pipeline read = raw impl+0xa0
+                                        { FILE *f=fopen("/tmp/detile_a0.raw","wb");
+                                          if(f){uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr};fwrite(hd,4,4,f);fwrite(backing,1,sz,f);fclose(f);} }
+                                        // DUMP B: IOSurfaceGetBaseAddress of dst's surface (the
+                                        // "other" candidate pixel pointer)
+                                        IOSurfaceRef ds = NULL;
+                                        if ([dst respondsToSelector:@selector(iosurface)]) ds = [dst iosurface];
+                                        void *iosb = ds ? IOSurfaceGetBaseAddress(ds) : NULL;
+                                        if (iosb) { FILE *f=fopen("/tmp/detile_iosurf.raw","wb");
+                                          if(f){uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr};fwrite(hd,4,4,f);fwrite(iosb,1,sz,f);fclose(f);} }
+                                        // DUMP C: driver canonical getBytes (one-shot, wrapped)
+                                        int gbOK = 0;
+                                        uint8_t *gb = (uint8_t *)malloc(sz);
+                                        if (gb) { @try {
+                                            [dst getBytes:gb bytesPerRow:bpr fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
+                                            gbOK = 1;
+                                            FILE *f=fopen("/tmp/detile_getbytes.raw","wb");
+                                            if(f){uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr};fwrite(hd,4,4,f);fwrite(gb,1,sz,f);fclose(f);}
+                                        } @catch (NSException *e) { fprintf(stderr,"#### SELFCHK getBytes EXC %s\n",[[e reason] UTF8String]?:"?"); } }
+                                        // content stats for each
+                                        size_t nzA=0,nzI=0,nzG=0,samp=0;
+                                        for (size_t i=0;i<sz;i+=37){samp++;
+                                            if(((uint8_t*)backing)[i])nzA++;
+                                            if(iosb&&((uint8_t*)iosb)[i])nzI++;
+                                            if(gbOK&&gb[i])nzG++; }
+                                        fprintf(stderr,"#### SELFCHK dst=%p layout=%u stride=%u  iosurf=%p iosb=%p  "
+                                            "nonzero: +0xa0=%.2f%% IOSurf=%.2f%% getBytes=%.2f%%  (gbOK=%d)\n",
+                                            (void*)dst,layout,stride,(void*)ds,iosb,
+                                            100.0*nzA/samp, iosb?100.0*nzI/samp:-1.0, gbOK?100.0*nzG/samp:-1.0, gbOK);
+                                        if (gb) free(gb);
+                                    }
+                                }
                                 if (backing) {
                                     void *vb = macws_vnc_mmap_data(w, h);  // cross-process mmap
                                     size_t vbpr = w * 4;
@@ -232,6 +391,340 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
         }];
     });
     @synchronized(g_vnc_lock) { g_vnc_comp_tex = dest; }   // cheap stash, render thread
+}
+
+// 2026-06-22 — DEBUG composite capture (gated /tmp/macws_grab_png). Crash-safe:
+// runs on the WS RENDER THREAD (called from the StartComposite hook). DIRECT
+// +0xa0 CPU read of the composite dest's C++ AGX::Texture backing — NO getBytes
+// (getBytes on any AGX tex hits NULL +0xa0 inside readRegion<layout3> →
+// memmove(0) → WS SIGSEGV, runtime-confirmed WindowServer-2026-06-22-174347.ips).
+// The +0xa0 backing read is LINEAR (RE-confirmed 2026-06-21
+// [[detile-read-correct-composite-empty]]). memcpy is clamped to the mapped vm
+// extent so a short backing can't fault.
+//
+// Two functions, both gated /tmp/macws_grab_png:
+//   A. CONTENT PROBE — every full-screen composite, log pf + nonzero% of its
+//      backing (cheap sampled scan). Tells which surface (pf=80 capture vs
+//      pf=550 display) actually carries content, with no capture.
+//   B. CAPTURE — when /tmp/macws_grab_now exists, dump that surface's backing to
+//      /tmp/macws_grab.raw then unlink the trigger (re-armable: touch again to
+//      grab a fresh frame AFTER the app is fully up). Header (24B): magic 'GRB1',
+//      w, h, pf, layout, copied_bytes. stride = copied/h offline.
+static ptrdiff_t macws_tex_impl_off(void) {
+    static ptrdiff_t off = 0;
+    if (!off) {
+        Class cls = objc_getClass("AGXG13GFamilyTexture");
+        Ivar iv = cls ? class_getInstanceVariable(cls, "_impl") : NULL;
+        off = iv ? ivar_getOffset(iv) : 0x208;   // RE-fallback
+    }
+    return off;
+}
+// Resolve the linear CPU backing of a composite-dest AGX texture. Returns base
+// (or NULL) and fills *layout + *ext (readable vm extent from base).
+//
+// 2026-06-22 CRITICAL FIX: for the compositor's OWN render-target
+// AGXG13GFamilyTexture, `_impl+0xa0` is NOT a flat pixel pointer — it is an
+// **IOSurface object** (lldb-confirmed: isa resolves to the IOSurface class;
+// embedded label = pf550 fullscreen surface). The real pixels are reached via
+// IOSurfaceGetBaseAddress(thatObject), NOT by reading +0xa0 as bytes. (The
+// SYNTHESIZED pooled textures are different — macws_wire_iosurface_base_into_texture
+// sets THEIR +0xa0 = raw IOSurface base. So detect which kind we have.)
+static void *macws_tex_backing(id<MTLTexture> tex, uint8_t *layout_out, size_t *ext_out) {
+    if (layout_out) *layout_out = 0xff;
+    if (ext_out) *ext_out = 0;
+    if (!tex) return NULL;
+    void *impl = *(void **)((char *)(__bridge void *)tex + macws_tex_impl_off());
+    if (!impl) return NULL;
+    if (layout_out) *layout_out = *(volatile uint8_t *)((char *)impl + 0x184);
+    void *backing = *(void **)((char *)impl + 0xa0);
+    if (!backing) return NULL;
+    // Is `backing` an IOSurface OBJECT (compositor render-target case) or a raw
+    // pixel pointer (synthesized pooled case)? Check whether it's a valid objc
+    // object whose class is IOSurface — if so, resolve its real base address.
+    // Canonical IOSurface detection: CFGetTypeID(backing) == IOSurfaceGetTypeID().
+    // (objc_getClass("IOSurface") returns nil in the chroot, so the old
+    // object_getClass check never matched → we fell through to reading the
+    // IOSurface OBJECT header as pixels = "noise". This is THE read bug behind
+    // the bogus "composite empty" conclusion. The real pixels are
+    // IOSurfaceGetBaseAddress(thatObject).) Guard the CFGetTypeID deref by first
+    // confirming `backing` sits in a readable region.
+    void *resolved = backing;
+    int is_surf = 0;
+    {
+        vm_address_t a = (vm_address_t)backing; vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t mo = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&bi, &cnt, &mo) == KERN_SUCCESS &&
+            a <= (vm_address_t)backing && (bi.protection & VM_PROT_READ)) {
+            @try {
+                if (CFGetTypeID(backing) == IOSurfaceGetTypeID()) {
+                    IOSurfaceRef s = (IOSurfaceRef)backing;
+                    IOSurfaceLock(s, 0x1 /*kIOSurfaceLockReadOnly*/, NULL);
+                    void *b = IOSurfaceGetBaseAddress(s);
+                    if (b) { resolved = b; is_surf = 1; }
+                    // One-shot per (pf) METADATA dump — the exact layout params for
+                    // offline de-tile (bpe disambiguates 4 vs 8 byte; bpr = stride;
+                    // allocSize = full surface size; elem dims hint tiling).
+                    static _Atomic int metalog = 0;
+                    if (atomic_fetch_add(&metalog, 1) < 8) {
+                        fprintf(stderr, "#### IOSURF-META surf=%p w=%zu h=%zu pf=0x%x bpe=%zu bpr=%zu alloc=%zu elem=%zux%zu planes=%zu\n",
+                            (void*)s, IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+                            IOSurfaceGetPixelFormat(s), IOSurfaceGetBytesPerElement(s),
+                            IOSurfaceGetBytesPerRow(s), IOSurfaceGetAllocSize(s),
+                            IOSurfaceGetElementWidth(s), IOSurfaceGetElementHeight(s),
+                            IOSurfaceGetPlaneCount(s));
+                    }
+                }
+            } @catch (__unused NSException *e) { }
+        }
+    }
+    { static _Atomic int diaglog = 0; int n = atomic_fetch_add(&diaglog, 1);
+      if (n < 6) fprintf(stderr, "#### TEX-BACKING +0xa0=%p is_iosurface=%d resolved=%p\n",
+                         backing, is_surf, resolved); }
+    size_t ext = 0; vm_address_t want = (vm_address_t)resolved;
+    for (int i = 0; i < 4096; i++) {
+        vm_address_t a = want; vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&bi, &cnt, &obj) != KERN_SUCCESS) break;
+        if (a > want || !(bi.protection & VM_PROT_READ)) break;
+        vm_address_t end = a + rsz; if (end <= want) break;
+        ext += (size_t)(end - want); want = end;
+    }
+    if (ext_out) *ext_out = ext;
+    if (ext == 0) return NULL;
+    return resolved;
+}
+// GPU-blit DE-TILE: the composite dest IOSurface holds AGX-twiddled (Morton)
+// pixels — a raw linear read is spatially scrambled. Blit the (twiddled) source
+// texture into a LINEAR buffer-backed texture; the AGX blit engine de-twiddles
+// into the buffer's linear layout. Read [buf contents] directly (NOT getBytes —
+// that crashes on chroot AGX textures). Returns malloc'd linear pixels (caller
+// frees) + sets *out_bpr/*out_sz, or NULL on any failure (caller falls back to
+// the twiddled read). Same pixel format as src (pf=550 stays 10-bit).
+static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *out_sz) {
+    // OPT-IN ONLY (gate /tmp/macws_detile). For pf=550 the chroot texture-creation
+    // path aborts (AGXTexture init → MTLReportFailure, runtime-confirmed
+    // WindowServer-2026-06-22-204831.ips), so the blit-detile crashes WS. Default
+    // OFF → the grab safely writes twiddled-raw. Only enable for pf=80 experiments.
+    if (access("/tmp/macws_detile", F_OK) != 0) return NULL;
+    @try {
+        size_t w = [src width], h = [src height];
+        id<MTLDevice> dev = [src device];
+        if (!dev || w == 0 || h == 0) return NULL;
+        MTLPixelFormat pf = [src pixelFormat];
+        size_t bpp = 4;  // pf 550/80/70 are all 4 bytes/pixel
+        size_t align = 256;
+        @try { NSUInteger a = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+               if (a > align) align = a; } @catch (__unused NSException *e) {}
+        size_t bpr = ((w * bpp + align - 1) / align) * align;
+        size_t sz = bpr * h;
+        fprintf(stderr, "#### DETILE: w=%zu h=%zu pf=%lu bpr=%zu sz=%#zx\n", w, h, (unsigned long)pf, bpr, sz);
+        // BUFFER-BACKED linear dst (works for BGRA8/RGBA8 pf=80/70; returns nil for
+        // pf=550 → safe fallback). The blit de-twiddles into the buffer's linear
+        // layout; read [buf contents] directly (NOT getBytes).
+        id<MTLBuffer> buf = [dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
+        if (!buf) { fprintf(stderr, "#### DETILE: newBuffer nil\n"); return NULL; }
+        MTLTextureDescriptor *dd = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+        dd.storageMode = MTLStorageModeShared;
+        dd.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> lintex = [buf newTextureWithDescriptor:dd offset:0 bytesPerRow:bpr];
+        if (!lintex) { fprintf(stderr, "#### DETILE: buffer-backed lintex nil (pf=%lu unsupported)\n", (unsigned long)pf); return NULL; }
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                 sourceSize:MTLSizeMake(w,h,1) toTexture:lintex destinationSlice:0
+                 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        if ([cb status] != MTLCommandBufferStatusCompleted) {
+            fprintf(stderr, "#### DETILE: blit status=%ld\n", (long)[cb status]);
+            return NULL;
+        }
+        void *base = [buf contents];
+        if (!base) { fprintf(stderr, "#### DETILE: buf contents nil\n"); return NULL; }
+        fprintf(stderr, "#### DETILE: OK linear bpr=%zu sz=%#zx\n", bpr, sz);
+        uint8_t *res = (uint8_t *)malloc(sz);
+        if (!res) return NULL;
+        memcpy(res, base, sz);
+        if (out_bpr) *out_bpr = bpr;
+        if (out_sz) *out_sz = sz;
+        return res;
+    } @catch (NSException *e) {
+        fprintf(stderr, "#### DETILE EXC %s\n", [[e reason] UTF8String] ?: "?");
+        return NULL;
+    }
+}
+// RAW +0xa0 backing (NO IOSurface resolution) + its readable vm extent. In
+// coexist the GPU renders into this raw backing while the texture's IOSurface
+// stays empty (AGX_WIRE_IOSURF "SEPARATE backing" pattern), so compare both.
+static void *macws_tex_raw_backing(id<MTLTexture> tex, size_t *ext_out) {
+    if (ext_out) *ext_out = 0;
+    if (!tex) return NULL;
+    void *impl = *(void **)((char *)(__bridge void *)tex + macws_tex_impl_off());
+    if (!impl) return NULL;
+    void *backing = *(void **)((char *)impl + 0xa0);
+    if (!backing) return NULL;
+    size_t ext = 0; vm_address_t want = (vm_address_t)backing;
+    for (int i = 0; i < 4096; i++) {
+        vm_address_t a = want; vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t mo = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&bi, &cnt, &mo) != KERN_SUCCESS) break;
+        if (a > want || !(bi.protection & VM_PROT_READ)) break;
+        vm_address_t end = a + rsz; if (end <= want) break;
+        ext += (size_t)(end - want); want = end;
+    }
+    if (ext_out) *ext_out = ext;
+    if (ext == 0) return NULL;
+    return backing;
+}
+static _Atomic int g_grab_busy = 0;
+void macws_grab_composite(id<MTLTexture> tex) {
+    if (!tex || access("/tmp/macws_grab_png", F_OK) != 0) return;
+    size_t w = [tex width], h = [tex height];
+    unsigned long pf = (unsigned long)[tex pixelFormat];
+    if ((size_t)w * h < 1000000) return;     // full-screen surfaces only
+    if (pf != 70 && pf != 80 && pf != 550) return;
+    int want_capture = (access("/tmp/macws_grab_now", F_OK) == 0);
+    // Serialize: one capture/probe at a time across composite threads.
+    if (atomic_exchange(&g_grab_busy, 1)) return;
+    @try {
+        // The hook fires right after StartComposite returns — this frame's layer
+        // draws + GPU exec happen AFTER, async. So `tex` (current dest) is read
+        // PRE-draw → stale/uninit. To capture a GPU-COMPLETE frame, defer: keep a
+        // ring of recent dest texs and snapshot the OLDEST (several composites of
+        // slack ⇒ its render cmdbuf has long since completed). RE-confirmed the
+        // +0xa0 backing read is linear [[detile-read-correct-composite-empty]].
+        static NSMutableArray *ring = nil;
+        if (!ring) ring = [[NSMutableArray alloc] init];
+        // helper to probe one tex (content% of its +0xa0 backing)
+        uint8_t cl = 0xff; size_t cext = 0;
+        void *cbk = macws_tex_backing(tex, &cl, &cext);
+        double cur_pct = -1.0;
+        if (cbk) {
+            size_t ccopy = w*h*4; if (cext < ccopy) ccopy = cext;
+            size_t nz=0,samp=0;
+            for (size_t o=0;o+4<=ccopy;o+=997*4){ if(*(volatile uint32_t*)((char*)cbk+o)&0xffffff)nz++; samp++; }
+            cur_pct = samp?100.0*nz/samp:0.0;
+        }
+        static _Atomic int probe_n = 0;
+        int pn = atomic_fetch_add(&probe_n, 1);
+        if (pn < 40 || want_capture)
+            fprintf(stderr, "#### GRAB-PROBE #%d %zux%zu pf=%lu layout=%d cur_content=%.1f%% ringN=%lu%s\n",
+                pn, w, h, pf, cl, cur_pct, (unsigned long)[ring count], want_capture ? " [CAPTURE]" : "");
+        // push current dest into the ring (cap 5)
+        [ring addObject:tex];
+        if ([ring count] > 5) [ring removeObjectAtIndex:0];
+        // (B) capture on demand — pick the ring tex with the most CONTENT
+        // (sample each backing's nonzero%; the empty pf=80 capture surfaces and
+        // partial swapchain buffers lose to the real composited pf=550 display
+        // surface). 2026-06-22: backing is now IOSurface-resolved, so content%
+        // is meaningful.
+        if (want_capture && [ring count] >= 1) {
+            int detile_on = (access("/tmp/macws_detile", F_OK) == 0);
+            id<MTLTexture> dtex = nil; double best_pct = -1.0, best_score = -1.0;
+            for (id<MTLTexture> rt in ring) {
+                uint8_t rl=0xff; size_t re=0;
+                void *rb = macws_tex_backing(rt,&rl,&re);
+                size_t rw=[rt width], rh=[rt height];
+                unsigned long rpf=(unsigned long)[rt pixelFormat];
+                double pct = 0.0;
+                if (rb && re >= 0x10000) {
+                    size_t rcopy = rw*rh*4; if (re < rcopy) rcopy = re;
+                    size_t nz=0,samp=0;
+                    for (size_t o=0;o+4<=rcopy;o+=997*4){ if(*(volatile uint32_t*)((char*)rb+o)&0xffffff)nz++; samp++; }
+                    pct = samp?100.0*nz/samp:0.0;
+                }
+                // ALSO score the RAW +0xa0 backing (coexist content lands there,
+                // not the IOSurface) — gate must pass if EITHER has content.
+                size_t rre=0; void *rraw = macws_tex_raw_backing(rt,&rre);
+                if (rraw && rraw!=rb && rre>=0x10000) {
+                    size_t rc2=rw*rh*4; if(rre<rc2)rc2=rre;
+                    size_t n2=0,s2=0;
+                    for(size_t o=0;o+4<=rc2;o+=997*4){ if(*(volatile uint32_t*)((char*)rraw+o)&0xffffff)n2++; s2++; }
+                    double rawp=s2?100.0*n2/s2:0.0;
+                    if (rawp>pct) pct=rawp;
+                }
+                // When de-tiling, bias toward de-tileable BGRA8/RGBA8 (pf=80/70)
+                // surfaces — pf=550 can't be blit-detiled. Only if they carry content.
+                double score = pct;
+                if (detile_on && (rpf==80||rpf==70) && pct>=5.0) score += 1000.0;
+                if (score > best_score) { best_score=score; best_pct=pct; dtex=rt; }
+            }
+            // Don't consume the trigger on an all-empty frame — the real
+            // composited display surface (pf=550, ~59% content) interleaves with
+            // empty pf=80 capture surfaces across composite threads; wait for a
+            // frame whose ring actually holds content (≥5%).
+            if (best_pct < 5.0) { atomic_store(&g_grab_busy, 0); return; }
+            if (!dtex) dtex = [ring objectAtIndex:0];
+            uint8_t layout = 0xff; size_t ext = 0;
+            void *backing = macws_tex_backing(dtex, &layout, &ext);
+            if (backing) {
+                size_t dw=[dtex width], dh=[dtex height];
+                unsigned long dpf=(unsigned long)[dtex pixelFormat];
+                size_t copy = dw*dh*4; if (ext < copy) copy = ext;
+                if (copy > 64u*1024*1024) copy = 64u*1024*1024;
+                // probe the deferred tex too
+                size_t nz=0,samp=0;
+                for (size_t o=0;o+4<=copy;o+=997*4){ if(*(volatile uint32_t*)((char*)backing+o)&0xffffff)nz++; samp++; }
+                double dpct = samp?100.0*nz/samp:0.0;
+                // COEXIST: content may be in the RAW +0xa0 backing (GPU writes
+                // there; IOSurface stays empty). Compare and prefer whichever has
+                // more content; capture its FULL extent.
+                size_t rawext=0; void *raw=macws_tex_raw_backing(dtex,&rawext);
+                double rawpct=-1.0;
+                if (raw && raw!=backing && rawext>=0x10000) {
+                    size_t rc=dw*dh*4; if(rawext<rc)rc=rawext;
+                    size_t rn=0,rs=0;
+                    for(size_t o=0;o+4<=rc;o+=997*4){ if(*(volatile uint32_t*)((char*)raw+o)&0xffffff)rn++; rs++; }
+                    rawpct=rs?100.0*rn/rs:0.0;
+                }
+                fprintf(stderr,"#### GRAB-RAW: iosurf_pct=%.1f%% raw=%p rawpct=%.1f%% rawext=%#zx\n", dpct, raw, rawpct, rawext);
+                if (rawpct > dpct + 1.0) {   // raw backing has the real content
+                    backing = raw; ext = rawext;
+                    copy = dw*dh*4; if (ext < copy) copy = ext;
+                    if (copy > 64u*1024*1024) copy = 64u*1024*1024;
+                    dpct = rawpct;
+                    layout = 0xA0;  /* raw-backing marker */
+                }
+                // Try GPU-blit DE-TILE first → clean LINEAR pixels. On any failure
+                // fall back to the raw (twiddled) IOSurface read so we always get
+                // something. Marker layout=0xD0 = detiled-linear (offline stride=bpr),
+                // else layout=the AGX layout (twiddled).
+                size_t lin_bpr = 0, lin_sz = 0;
+                uint8_t *lin = macws_blit_detile(dtex, &lin_bpr, &lin_sz);
+                uint8_t *out = NULL; size_t out_sz = 0, out_bpr = 0; uint32_t out_layout = layout;
+                if (lin && lin_sz) {
+                    out = lin; out_sz = lin_sz; out_bpr = lin_bpr; out_layout = 0xD0;  /* detiled */
+                } else {
+                    out = (uint8_t *)malloc(copy);
+                    if (out) { memcpy(out, backing, copy); out_sz = copy; out_bpr = dw*4; }
+                }
+                if (out) {
+                    int fd = open("/tmp/macws_grab.raw", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (fd >= 0) {
+                        // header (28B): magic 'GRB2', w, h, pf, layout, copied_bytes, bpr
+                        uint32_t hd[7] = {0x47524232u, (uint32_t)dw, (uint32_t)dh,
+                                          (uint32_t)dpf, out_layout, (uint32_t)out_sz, (uint32_t)out_bpr};
+                        write(fd, hd, 28); write(fd, out, out_sz); fsync(fd); close(fd);
+                    }
+                    free(out);
+                    unlink("/tmp/macws_grab_now");   // consume the trigger (re-armable)
+                    fprintf(stderr, "#### GRAB-PNG: wrote %zux%zu pf=%lu layout=0x%x sz=%#zx bpr=%zu %s content=%.1f%% (cur=%.1f%%)\n",
+                            dw, dh, dpf, out_layout, out_sz, out_bpr,
+                            out_layout==0xD0?"DETILED-LINEAR":"twiddled-raw", dpct, cur_pct);
+                }
+            }
+        }
+    } @catch (NSException *e) {
+        fprintf(stderr, "#### GRAB EXC %s\n", [[e reason] UTF8String] ?: "?");
+    }
+    atomic_store(&g_grab_busy, 0);
 }
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
 // thread on first use. The thread either fills the surface gray (mode 1) or
@@ -328,11 +821,31 @@ static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
                                     }
                                 }
                             }
+                        } else if (mode == 3 && t) {
+                            // LIGHT density scan (no memcpy/mirror/dump) — find
+                            // which tracked texture holds content + its pf. Read
+                            // the texture's +0xa0 backing, sample every 4 KB.
+                            void *impl = *(void **)((char *)(__bridge void *)t + 0x208);
+                            if ((uintptr_t)impl > 0x1000) {
+                                void *backing = *(void **)((char *)impl + 0xa0);
+                                if (backing) {
+                                    size_t tw = [t width], th = [t height];
+                                    unsigned long pf = (unsigned long)[t pixelFormat];
+                                    size_t bpe = (pf == 115) ? 8 : 4;
+                                    size_t total = tw * th * bpe, nz = 0, samp = 0;
+                                    for (size_t off = 0; off < total; off += 4096) { samp++; if (((uint8_t*)backing)[off]) nz++; }
+                                    double dens = samp ? 100.0*nz/samp : 0;
+                                    static int sc = 0;
+                                    if ((sc++ % 8) == 0 || dens > 1.0)
+                                        fprintf(stderr, "#### TEXSCAN tex=%p %zux%zu pf=%lu dens=%.2f%%\n",
+                                                (void*)t, tw, th, pf, dens);
+                                }
+                            }
                         }
                         IOSurfaceUnlock(s, 0, NULL);
                     }
                 }
-                usleep(mode == 2 ? 16000 : 25000);
+                usleep(mode == 3 ? 250000 : (mode == 2 ? 16000 : 25000));
             }
         }];
     });
@@ -461,11 +974,22 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
         return;
     }
     uint8_t layout = *(volatile uint8_t *)((char *)impl + 0x184);
-    if (layout != 0) {
+    // RE-confirmed 2026-06-21 (AGX::Texture<3>::getCPUPtr @ 0x1e576fb74): the
+    // CPU backing base is read from `this->0xa0` for BOTH layout 0 (linear) AND
+    // layout 3 (twiddled) — only the offset math differs (linear stride vs Z-order
+    // twiddle). The connection-triggered WS crash (WindowServer-2026-06-21-154750.ips:
+    // memmove(dst=NULL) <- AGX::Texture<3>::writeRegion <- replaceRegion <-
+    // CA::OGL::MetalContext::create_texture <- BackdropLayer blur) is a layout=3
+    // texture whose +0xa0 was left NULL because this function used to skip layout!=0.
+    // Since these textures ARE IOSurface-backed (routed via the plain-newTexture
+    // path) and AGX chose layout=3 to FIT that IOSurface, wiring 0xa0 = IOSurface
+    // base is correct AND GPU-coherent. Only layouts 0 and 3 use the 0xa0 path;
+    // skip anything else (un-RE'd ivar geometry).
+    if (layout != 0 && layout != 3) {
         static int layoutlog = 0;
         if (layoutlog++ < 4) {
             fprintf(stderr,
-                "#### AGX_WIRE_IOSURF: skip — layout=%d ≠ 0 (linear) tex=%p impl=%p\n",
+                "#### AGX_WIRE_IOSURF: skip — layout=%d (not 0/3) tex=%p impl=%p\n",
                 layout, (void *)tex, impl);
         }
         return;
@@ -501,7 +1025,11 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
         return;
     }
     *(void * volatile *)((char *)impl + 0xa0) = base;
-    *(volatile uint32_t *)((char *)impl + 0xa8) = 0;
+    // layout=0 (linear) wants a tight stride at +0xa8; layout=3 (twiddled) keeps
+    // AGX's own twiddle params at +0xa8 (getCPUPtr's twiddle math reads it) —
+    // zeroing it would corrupt the layout-3 address computation.
+    if (layout == 0)
+        *(volatile uint32_t *)((char *)impl + 0xa8) = 0;
     static _Atomic int wired_count = 0;
     int n = atomic_fetch_add(&wired_count, 1);
     if (n < 16) {
@@ -1214,6 +1742,51 @@ static void macws_sigabrt_trampoline(int sig) {
         fprintf(stderr, "#### MTL_TEX entry self class=%s\n", class_getName([self class]));
         classlog++;
     }
+    // 2026-06-22 — ROOT CHURN FIX (part 2): cache window-content textures by
+    // (IOSurface,plane,format,dims).
+    //
+    // WS::Displays::CASurface::metal_texture() calls THIS hook directly to wrap
+    // each window's backing IOSurface as a Metal texture for compositing — once
+    // per composite, NOT cached by SkyLight in the chroot. Every fresh wrap runs
+    // -[AGXTexture initWithDevice:desc:iosurface:plane:] →
+    // AGX::TextureGen4IL<layout3> ctor → AGX::Mempool<…ImageStateEncoder…>::grow,
+    // whose per-index entry array (heap "B", pool+0x10) is persistently smaller
+    // than heap "A" (pool+0x8). As the live-texture count climbs, grow's memmove
+    // (oldcount*24 bytes) overruns heap B's source region → SIGSEGV SEGV_ACCERR
+    // in _platform_memmove (RE-confirmed crash-diag: memmove ← Mempool::grow
+    // lambda ← TextureGen4IL<layout3> ctor ← initImpl ← THIS hook ←
+    // CASurface::metal_texture). Same heap-B-undersize root as the
+    // texBaseAddressesUpdated write overrun.
+    //
+    // A window's backing IOSurface is stable across frames (double/triple-
+    // buffered), so wrapping it ONCE and reusing the texture is correct — and it
+    // bounds the AGX descriptor/encoder pools to the LIVE texture count instead
+    // of letting them grow per frame. "new"-family convention: +1 to the caller
+    // on every return (cache holds its own strong ref). Opt-out:
+    // MACWS_NO_IOSTEX_CACHE=1. (Recursive %orig calls from this hook's fallback
+    // paths go to the original AGX IMP, not back through here, so they bypass the
+    // cache — only external callers like CASurface::metal_texture hit it.)
+    static NSMutableDictionary<NSString *, id<MTLTexture>> *iosTexCache = nil;
+    static dispatch_once_t iosTexOnce;
+    dispatch_once(&iosTexOnce, ^{ iosTexCache = [NSMutableDictionary new]; });
+    NSString *iosTexKey = nil;
+    if (iosurface && desc && !getenv("MACWS_NO_IOSTEX_CACHE")) {
+        iosTexKey = [NSString stringWithFormat:@"%p-%lu-%lux%lu-pf%lu",
+            (void *)iosurface, (unsigned long)plane,
+            (unsigned long)desc.width, (unsigned long)desc.height,
+            (unsigned long)desc.pixelFormat];
+        id<MTLTexture> hit = nil;
+        @synchronized(iosTexCache) { hit = iosTexCache[iosTexKey]; }
+        if (hit) {
+            CFRetain((__bridge CFTypeRef)hit);  // caller's +1
+            static _Atomic int iosHitN = 0;
+            int hn = atomic_fetch_add(&iosHitN, 1);
+            if ((hn % 256) == 0)
+                fprintf(stderr, "#### MTL_TEX IOSTEX-CACHE-HIT key=%s tex=%p (#%d)\n",
+                    [iosTexKey UTF8String], (void *)hit, hn);
+            return hit;
+        }
+    }
     // AGX gate probe: log the EXACT values the 3 entry-gate IOSurface APIs
     // return for THIS surface. If our prediction is right (compType=0,
     // heightInCompTiles=0, validateWithDevice=YES) and the texture is still
@@ -1525,6 +2098,24 @@ static void macws_sigabrt_trampoline(int sig) {
             }
         }
     }
+    // Cache the freshly-wrapped texture by (IOSurface,plane,fmt,dims) so the
+    // next composite reuses it instead of re-running AGXTexture init (which
+    // grows the AGX encoder/descriptor pools per frame → eventual heap-B
+    // overrun). The dictionary retains it (+1, held for process lifetime);
+    // `result` keeps the +1 it came with for the caller. See the cache-check
+    // block at the top of this method.
+    if (result && iosTexKey) {
+        @synchronized(iosTexCache) {
+            if (!iosTexCache[iosTexKey]) {
+                iosTexCache[iosTexKey] = result;
+                static _Atomic int iosNewN = 0;
+                int nn = atomic_fetch_add(&iosNewN, 1);
+                if (nn < 16 || (nn % 64) == 0)
+                    fprintf(stderr, "#### MTL_TEX IOSTEX-CACHE-NEW key=%s tex=%p (#%d)\n",
+                        [iosTexKey UTF8String], (void *)result, nn);
+            }
+        }
+    }
     macws_set_current_iosurface_id(prev_iosurface_id);
     return result;
 }
@@ -1532,6 +2123,33 @@ static void macws_sigabrt_trampoline(int sig) {
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
+    }
+    // BLUR-PATH DIAG (gated /tmp/macws_textrace_file): does the CA::OGL backdrop-blur
+    // create_texture reach THIS hook (→ routing gap, fixable) or bypass it via a cached
+    // IMP (→ need a deterministic hook)? Log QuartzCore-caller plain-newTexture calls to
+    // an append file (survives the crash) with descriptor + caller symbol.
+    if (access("/tmp/macws_textrace_file", F_OK) == 0) {
+        void *ra[4] = { __builtin_return_address(0), __builtin_return_address(1),
+                        __builtin_return_address(2), __builtin_return_address(3) };
+        const char *qcsym = NULL;
+        for (int i = 0; i < 4; i++) {
+            Dl_info di;
+            if (ra[i] && dladdr(ra[i], &di) && di.dli_fname && strstr(di.dli_fname, "QuartzCore")) {
+                qcsym = di.dli_sname ? di.dli_sname : "QuartzCore?"; break;
+            }
+        }
+        if (qcsym) {
+            NSUInteger w  = [desc respondsToSelector:@selector(width)] ? [desc width] : 0;
+            NSUInteger h  = [desc respondsToSelector:@selector(height)] ? [desc height] : 0;
+            NSUInteger pf = [desc respondsToSelector:@selector(pixelFormat)] ? [desc pixelFormat] : 0;
+            NSUInteger tt = [desc respondsToSelector:@selector(textureType)] ? [desc textureType] : 0;
+            NSUInteger sm = [desc respondsToSelector:@selector(storageMode)] ? [desc storageMode] : 0;
+            int fd = open("/tmp/macws_qctex.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { char b[224];
+                int n = snprintf(b, sizeof b, "QCTEX w=%lu h=%lu pf=%lu type=%lu storage=%lu caller=%s\n",
+                                 (unsigned long)w,(unsigned long)h,(unsigned long)pf,(unsigned long)tt,(unsigned long)sm,qcsym);
+                if (n > 0) write(fd, b, (size_t)n); close(fd); }
+        }
     }
     // 2026-06-20 — Block the plain newTextureWithDescriptor path from
     // entering AGX kernel. -[AGXTexture init...] has a cascade of
@@ -1688,34 +2306,76 @@ static void macws_sigabrt_trampoline(int sig) {
             // Continue down to the ROUTE-IOSURF path below.
         }
         if (storageMode == 3 /* MTLStorageModeMemoryless */) {
-            static int memless_native_log = 0;
-            if (memless_native_log++ < 4) {
-                fprintf(stderr,
-                    "#### MTL_TEX plain MEMORYLESS: routing to native AGX path "
-                    "(no IOSurface — tile-memory-only) w=%lu h=%lu pf=%lu\n",
-                    (unsigned long)([desc respondsToSelector:@selector(width)] ? [desc width] : 0),
-                    (unsigned long)([desc respondsToSelector:@selector(height)] ? [desc height] : 0),
-                    (unsigned long)([desc respondsToSelector:@selector(pixelFormat)] ? [desc pixelFormat] : 0));
+            // 2026-06-22 — ROOT FIX for the WS coexist crash-loop.
+            //
+            // Memoryless render targets were created FRESH on every composite
+            // (this native AGX path has no cache, unlike the IOSurface path
+            // below). Each fresh -[AGXTexture initWithDevice:desc:...] grabs a
+            // new AGX descriptor-table slot (w9 = *(tex+0x1c0)). The per-frame
+            // churn drove w9 monotonically to 682, which overflowed the
+            // layout-3 device descriptor heap B (a single 16 KB page, capacity
+            // 682 entries) inside
+            //   AGX::TextureGen4IL<AGXTextureMemoryLayout3,…>::texBaseAddressesUpdated
+            // → store across the page boundary into a read-only page →
+            // SIGSEGV SEGV_ACCERR → WS dies (no .ips; ReportCrash is dead on
+            // this device). RE-confirmed via the in-process crash-diag handler:
+            //   texBaseAddressesUpdated ← AGXTexture init ← THIS native path
+            //   ← MetalContext::StartComposite ← CompositorMetal::composite.
+            //
+            // Memoryless textures have NO persistent contents — their storage
+            // is tile SRAM allocated by the AGX scheduler at render-pass-encode
+            // time and reused across passes — so REUSING the same texture
+            // object across passes is correct (the next pass fully overwrites
+            // it; there is nothing to preserve). Pool a small ROUND-ROBIN set
+            // per (w,h,pf,texType): this bounds the live texture count
+            // (≈ MEMLESS_RING × unique dims) so w9 stops climbing and the
+            // descriptor heap never overflows. Round-robin (vs a single cached
+            // object) keeps consecutive requests distinct so a single pass that
+            // binds two same-size memoryless attachments (e.g. blur ping-pong)
+            // never gets the same object twice. This RECYCLES slots at the root
+            // — it is not a nop of the overflowing store. Opt-out:
+            // MACWS_NO_MEMLESS_POOL=1 (A/B back to per-call fresh creation).
+            if (getenv("MACWS_NO_MEMLESS_POOL")) {
+                return [self hooked_newTextureWithDescriptor:desc];
             }
-            // Call the original AGXG13GFamilyDevice IMP via the
-            // swizzle-renamed selector.  This is the only branch where
-            // the chroot's plain newTextureWithDescriptor: actually
-            // delegates to the real AGX texture-creation path — for
-            // all other storageModes we still need the IOSurface
-            // shim below because AGXTexture init's selector cascade
-            // currently doesn't fully resolve for IOSurface-less
-            // Private/Shared/Managed allocations.
-            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-            if (memless_native_log < 6) {
+            NSUInteger mw  = [desc respondsToSelector:@selector(width)]       ? [desc width]       : 0;
+            NSUInteger mh  = [desc respondsToSelector:@selector(height)]      ? [desc height]      : 0;
+            NSUInteger mpf = [desc respondsToSelector:@selector(pixelFormat)] ? [desc pixelFormat] : 0;
+            NSUInteger mtt = [desc respondsToSelector:@selector(textureType)] ? [desc textureType] : 2;
+            const NSUInteger MEMLESS_RING = 4;
+            NSString *mkey = [NSString stringWithFormat:@"%lux%lu-pf%lu-tt%lu",
+                (unsigned long)mw, (unsigned long)mh, (unsigned long)mpf, (unsigned long)mtt];
+            static NSMutableDictionary<NSString *, NSMutableArray *> *memlessPool = nil;
+            static NSMutableDictionary<NSString *, NSNumber *> *memlessIdx = nil;
+            static dispatch_once_t memlessOnce;
+            dispatch_once(&memlessOnce, ^{
+                memlessPool = [NSMutableDictionary new];
+                memlessIdx  = [NSMutableDictionary new];
+            });
+            id<MTLTexture> tex = nil;
+            BOOL grew = NO;
+            @synchronized(memlessPool) {
+                NSMutableArray *ring = memlessPool[mkey];
+                if (!ring) { ring = [NSMutableArray new]; memlessPool[mkey] = ring; }
+                if (ring.count < MEMLESS_RING) {
+                    // Grow the ring with a fresh native memoryless texture.
+                    tex = [self hooked_newTextureWithDescriptor:desc];  // +1, ARC-owned local
+                    if (tex) { [ring addObject:tex]; grew = YES; }       // pool keeps a strong ref
+                } else {
+                    NSUInteger i = [memlessIdx[mkey] unsignedIntegerValue];
+                    tex = ring[i % ring.count];
+                    memlessIdx[mkey] = @(i + 1);
+                }
+            }
+            // "new"-family convention: hand the caller its own +1 it can release.
+            if (tex) CFRetain((__bridge CFTypeRef)tex);
+            static _Atomic int memlessN = 0;
+            int mn = atomic_fetch_add(&memlessN, 1);
+            if (grew || (mn % 128) == 0) {
                 fprintf(stderr,
-                    "#### MTL_TEX plain MEMORYLESS native result: %p "
-                    "(class=%s storageMode=%lu length=%lu)\n",
-                    (void *)tex,
-                    tex ? class_getName([tex class]) : "(nil)",
-                    tex && [tex respondsToSelector:@selector(storageMode)]
-                        ? (unsigned long)[tex storageMode] : 999UL,
-                    tex && [tex respondsToSelector:@selector(length)]
-                        ? (unsigned long)[(id)tex length] : 999UL);
+                    "#### MTL_TEX MEMLESS-POOL %s key=%s ring=%lu call#%d tex=%p\n",
+                    grew ? "NEW" : "REUSE", [mkey UTF8String],
+                    (unsigned long)[memlessPool[mkey] count], mn, (void *)tex);
             }
             return tex;
         }
@@ -1748,6 +2408,16 @@ static void macws_sigabrt_trampoline(int sig) {
         if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
         else if (pf == 10) { fmt4cc = 'L008'; bpe = 1; }
         else if (pf == 70 || pf == 71) { fmt4cc = 'RGBA'; bpe = 4; }
+        // 2026-06-21 — wide-color/extended-range formats CA uses for the
+        // backdrop-blur path. BGRA10_XR (552) / BGRA10_XR_sRGB (553) are
+        // 64-bit (8 bytes/pixel); without this they fell to the default
+        // bpe=4 → IOSurface bytesPerRow = w*4, which is HALF what Metal
+        // requires → `_mtlValidateStrideTextureParameters:1843 IOSurface
+        // texture: bytesPerRow must be >= ...` assertion → WS abort
+        // (runtime-confirmed: 64x64 pf552 gave bpr 256, needed 512).
+        // BGR10_XR (554) / BGR10_XR_sRGB (555) are 32-bit packed (4 bytes,
+        // the default is already correct).
+        else if (pf == 552 || pf == 553) { fmt4cc = 'b3a8'; bpe = 8; }
         // 2026-06-20 — IOSurface pool keyed by (w,h,pf,fmt4cc,bpe) to
         // bound WS memory growth.  Previously ROUTE-IOSURF allocated a
         // fresh 31 MB IOSurface per newTextureWithDescriptor call,
@@ -1848,6 +2518,26 @@ static void macws_sigabrt_trampoline(int sig) {
                         "#### MTL_TEX POOL-NEW: key=%s → IOSurface=%p (size~%lu KB)\n",
                         [poolKey UTF8String], (void *)surf,
                         (unsigned long)(width * height * bpe / 1024));
+                }
+                // DIAG (gated /tmp/macws_route_log): dump the ACTUAL IOSurface
+                // geometry vs the requested descriptor, so we can derive the
+                // stride rule _mtlValidateStrideTextureParameters enforces for
+                // the AGX texture-over-IOSurface wrap (file-log survives abort).
+                if (access("/tmp/macws_route_log", F_OK) == 0) {
+                    size_t surfBpr = IOSurfaceGetBytesPerRow(surf);
+                    size_t surfBpe = IOSurfaceGetBytesPerElement(surf);
+                    size_t surfEw  = IOSurfaceGetElementWidth(surf);
+                    size_t surfEh  = IOSurfaceGetElementHeight(surf);
+                    size_t surfAlloc = IOSurfaceGetAllocSize(surf);
+                    char rl[320];
+                    int rn = snprintf(rl, sizeof rl,
+                        "ROUTE pf=%lu w=%lu h=%lu reqBpe=%lu → surfBpr=%zu surfBpe=%zu "
+                        "elemW=%zu elemH=%zu alloc=%zu (need w*reqBpe=%lu)\n",
+                        (unsigned long)pf, (unsigned long)width, (unsigned long)height,
+                        (unsigned long)bpe, surfBpr, surfBpe, surfEw, surfEh, surfAlloc,
+                        (unsigned long)(width * bpe));
+                    int rfd = open("/tmp/macws_route.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+                    if (rfd >= 0) { if (rn > 0) write(rfd, rl, (size_t)rn); close(rfd); }
                 }
             }
         } else {
@@ -2424,8 +3114,32 @@ static id macws_hook_initimpl(
             plane, buffer, bytesPerRow, allowNPOT, sparsePageSize,
             isCompressedIOSurface, isHeapBacked);
     }
+    // FORCE-LAYOUT0 (gated /tmp/macws_force_layout0): the connection-crash blur texture is
+    // layout=3 (twiddled) but backed by a LINEAR chroot IOSurface — inconsistent; getCPUPtr's
+    // twiddle translation returns 0 → writeRegion memmove(NULL) crash. The layout=0 path
+    // (linear) maps fine over a linear IOSurface (proven by the 32x32). Correct AGX's wrong
+    // layout choice: force impl layout(+0x184)=0, +0xa0=IOSurface base, +0xa8=0 (tight) so
+    // getCPUPtr reads the IOSurface linearly. (Test: does WS survive the blur menu?)
+    if (result && iosurface && access("/tmp/macws_force_layout0", F_OK) == 0) {
+        void *impl = *(void **)((char *)(__bridge void *)self + 0x208);
+        if ((uintptr_t)impl > 0x1000) {
+            uint8_t *lay = (uint8_t *)((char *)impl + 0x184);
+            if (*lay == 3) {
+                void *base = IOSurfaceGetBaseAddress(iosurface);
+                if (base) {
+                    *lay = 0;
+                    *(void * volatile *)((char *)impl + 0xa0) = base;
+                    *(volatile uint32_t *)((char *)impl + 0xa8) = 0;
+                    static int fl = 0; if (fl++ < 12) {
+                        fprintf(stderr, "#### FORCE-L0 tex=%p impl=%p layout 3->0 +0xa0=%p ios=%p\n",
+                                (void *)self, impl, base, iosurface); fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
     static int log_count = 0;
-    if (log_count < 30) {
+    if (log_count < 400) {
         NSUInteger pf = 0, w = 0, h = 0;
         if (descriptor) {
             pf = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(pixelFormat));
@@ -2443,13 +3157,14 @@ static id macws_hook_initimpl(
             (int)allowNPOT, (unsigned long)sparsePageSize,
             (int)isCompressedIOSurface, (int)isHeapBacked,
             result);
+        fflush(stderr);   // crash follows soon — flush so the blur tex init survives
         log_count++;
     }
     return result;
 }
 
 static void install_agx_initimpl_hook(void) {
-    if (!getenv("MACWS_AGX_INITIMPL_TRACE")) return;
+    if (!getenv("MACWS_AGX_INITIMPL_TRACE") && access("/tmp/macws_initimpl_trace", F_OK) != 0) return;
     Class tex_cls = objc_getClass("AGXG13GFamilyTexture");
     if (!tex_cls) {
         fprintf(stderr, "#### INITIMPL_HOOK: AGXG13GFamilyTexture class not found\n");
@@ -2807,10 +3522,164 @@ static void macws_install_pipeline_fallback(Class agx) {
 }
 #endif // 0 — disabled shader-substitution fallback
 
+// DIAGNOSTIC ISOLATION (gated /tmp/macws_skip_layout3 or MACWS_SKIP_LAYOUT3_WRITE).
+// The window drop-shadow path (SkyLight WSWindowMaskGetMetalTexture ->
+// -[IOGPUMetalTexture replaceRegion:] -> AGX::Texture<layout 3>::writeRegion)
+// crashes memmove(dst=NULL): the chroot only wires CPU backing for layout=0
+// textures, not layout=3 (twiddled) — lldb-confirmed 2026-06-21
+// [[ws-window-shadow-layout3-null-backing-crash]]. To ISOLATE that wall and see
+// what else blocks GlassDemo rendering, skip replaceRegion for layout!=0
+// textures (the shadow mask stays empty; WS survives). NOT A FIX — a scaffold;
+// the real fix RE's the layout=3 backing ivar and wires it.
+static IMP s_orig_iogpu_replaceRegion = NULL;
+static SEL s_replaceRegion_sel = NULL;
+static void install_shadow_isolation(void) {
+    if (!getenv("MACWS_SKIP_LAYOUT3_WRITE") && access("/tmp/macws_skip_layout3", F_OK) != 0) return;
+    Class c = objc_getClass("IOGPUMetalTexture");
+    if (!c) { fprintf(stderr, "#### SHADOW-ISO: no IOGPUMetalTexture class\n"); return; }
+    s_replaceRegion_sel = sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:");
+    Method m = class_getInstanceMethod(c, s_replaceRegion_sel);
+    if (!m) { fprintf(stderr, "#### SHADOW-ISO: no replaceRegion method\n"); return; }
+    s_orig_iogpu_replaceRegion = method_getImplementation(m);
+    IMP newimp = imp_implementationWithBlock(^void(id self, MTLRegion region,
+                                                   NSUInteger level, const void *bytes, NSUInteger bpr) {
+        void *impl = *(void **)((char *)(__bridge void *)self + 0x208);
+        uint8_t layout = ((uintptr_t)impl > 0x1000) ? *(uint8_t *)((char *)impl + 0x184) : 0;
+        if (layout != 0) {
+            static int n = 0;
+            if (n++ < 8)
+                fprintf(stderr, "#### SHADOW-ISO skip replaceRegion layout=%u tex=%p %lux%lu\n",
+                        layout, (void *)self,
+                        (unsigned long)region.size.width, (unsigned long)region.size.height);
+            return;  // skip the would-crash NULL-backing write
+        }
+        ((void (*)(id, SEL, MTLRegion, NSUInteger, const void *, NSUInteger))s_orig_iogpu_replaceRegion)(
+            self, s_replaceRegion_sel, region, level, bytes, bpr);
+    });
+    method_setImplementation(m, newimp);
+    fprintf(stderr, "#### SHADOW-ISO installed: replaceRegion skips layout!=0 (orig=%p)\n",
+            (void *)s_orig_iogpu_replaceRegion);
+}
+
+// REAL FIX (gated /tmp/macws_wire_backing or MACWS_WIRE_REPLACEREGION) for the
+// connection-triggered WS crash. RE-confirmed from WindowServer-2026-06-21-154750.ips:
+//   EXC_BAD_ACCESS write@0x0  _platform_memmove <- AGX::Texture<layout 3>::writeRegion
+//   <- -[AGXG13GFamilyTexture replaceRegion:] <- -[IOGPUMetalTexture replaceRegion:
+//      mipmapLevel:withBytes:bytesPerRow:] <- CA::OGL::MetalContext::create_texture
+//   <- ... <- render_subclass::visit_subclass(CA::Render::BackdropLayer)  [NSVisualEffectView blur].
+// QuartzCore creates a layout=3 (twiddled) texture for the backdrop-blur and uploads
+// pixel data via replaceRegion, but the chroot's synthesized AGX texture has a NULL
+// CPU-writable backing (impl+0xa0). RE of AGX::Texture<3>::getCPUPtr (0x1e576fb74):
+// it returns `this->0xa0` as the twiddle base for BOTH layout 0 and 3; when 0xa0==NULL
+// writeRegion memmoves to ~NULL → SIGSEGV → WS restart → (re-floods DCP → eventual panic).
+// FIX: before the real write, if impl+0xa0 is NULL, allocate a real backing sized to the
+// texture's twiddled allocation (256-tile-rounded upper bound) and wire it. The backing
+// is attached as an associated NSMutableData so it is freed WITH the texture (no per-frame
+// leak), NOT a static stub. This makes writeRegion write to real memory → no crash.
+// (GPU-coherency of the blur sampling is a separate downstream wall; this only fixes the
+// CPU upload crash so WS survives and the window renders.)
+static const char kMacwsRRBackingKey;
+static IMP s_orig_rr_wire = NULL;
+static SEL s_rr_wire_sel = NULL;
+static void install_replaceregion_backing_wire(void) {
+    if (!getenv("MACWS_WIRE_REPLACEREGION") && access("/tmp/macws_wire_backing", F_OK) != 0) return;
+    Class c = objc_getClass("IOGPUMetalTexture");
+    if (!c) { fprintf(stderr, "#### RR-WIRE: no IOGPUMetalTexture class\n"); return; }
+    s_rr_wire_sel = sel_registerName("replaceRegion:mipmapLevel:withBytes:bytesPerRow:");
+    Method m = class_getInstanceMethod(c, s_rr_wire_sel);
+    if (!m) { fprintf(stderr, "#### RR-WIRE: no replaceRegion method\n"); return; }
+    s_orig_rr_wire = method_getImplementation(m);
+    // resolve _impl ivar offset dynamically (same as AGX_WIRE_IOSURF); fallback 0x208
+    static ptrdiff_t rr_impl_off = 0;
+    { Class tc = objc_getClass("AGXG13GFamilyTexture");
+      Ivar iv = tc ? class_getInstanceVariable(tc, "_impl") : NULL;
+      rr_impl_off = iv ? ivar_getOffset(iv) : 0x208;
+      fprintf(stderr, "#### RR-WIRE: _impl ivar offset=%#tx\n", rr_impl_off); }
+    IMP nimp = imp_implementationWithBlock(^void(id self, MTLRegion region,
+                                                 NSUInteger level, const void *bytes, NSUInteger bpr) {
+        void *impl = *(void **)((char *)(__bridge void *)self + rr_impl_off);
+        if ((uintptr_t)impl > 0x1000) {
+            void **slot    = (void **)((char *)impl + 0xa0);
+            uint8_t layout = *(uint8_t *)((char *)impl + 0x184);
+            void *back     = *slot;
+            // Bulletproof per-call record (survives the crash; last write = the
+            // crashing texture). stderr logs were lost to buffering on crash.
+            { int fd = open("/tmp/macws_rr_last", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+              if (fd >= 0) { char b[192];
+                int n = snprintf(b, sizeof b,
+                    "impl=%p back=%p layout=%u dim=%lux%lu reg=%lux%lu lvl=%lu bpr=%lu cls=%s\n",
+                    impl, back, layout, (unsigned long)[self width], (unsigned long)[self height],
+                    (unsigned long)region.size.width, (unsigned long)region.size.height,
+                    (unsigned long)level, (unsigned long)bpr, object_getClassName(self));
+                if (n > 0) write(fd, b, (size_t)n); close(fd); } }
+            // FIX-TEST: wire 0xa0 when NULL, AND force-wire layout-3 (the blur crash)
+            // once per texture — tests whether +0xa0 is the field writeRegion reads.
+            BOOL mine = objc_getAssociatedObject(self, &kMacwsRRBackingKey) != nil;
+            if (back == NULL || (layout == 3 && !mine)) {
+                NSUInteger tw = [self width], th = [self height];
+                NSUInteger rw = region.size.width ? region.size.width : 1;
+                NSUInteger bpe = bpr / rw; if (bpe == 0) bpe = 4;
+                size_t W = ((size_t)tw + 255) & ~(size_t)255;
+                size_t H = ((size_t)th + 255) & ~(size_t)255;
+                size_t sz = W * H * bpe + (1u << 20);
+                if (sz < (1u << 16)) sz = (1u << 16);
+                if (sz > (128u << 20)) sz = (128u << 20);
+                NSMutableData *d = [NSMutableData dataWithLength:sz];
+                if (d) {
+                    objc_setAssociatedObject(self, &kMacwsRRBackingKey, d, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    *(void * volatile *)slot = [d mutableBytes];
+                    static int n = 0; if (n++ < 16) {
+                        fprintf(stderr, "#### RR-WIRE WIRED impl=%p 0xa0:%p->%p layout=%u %lux%lu sz=%zu\n",
+                                impl, back, [d mutableBytes], layout, (unsigned long)tw, (unsigned long)th, sz);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
+        ((void (*)(id, SEL, MTLRegion, NSUInteger, const void *, NSUInteger))s_orig_rr_wire)(
+            self, s_rr_wire_sel, region, level, bytes, bpr);
+    });
+    method_setImplementation(m, nimp);
+    fprintf(stderr, "#### RR-WIRE installed: replaceRegion wires NULL +0xa0 backing (orig=%p)\n",
+            (void *)s_orig_rr_wire);
+}
+
+// Actual mapped/writable extent of the VM region starting at-or-below p,
+// measured from p (0 if p is unmapped). Used to expose the truncated CPU
+// mapping of native AGX buffers in chroot.
+static size_t macws_mapped_extent_from(void *p) {
+    if (!p) return 0;
+    // Walk CONTIGUOUS, writable VM regions starting at p. AGX may map a buffer
+    // as several adjacent sub-regions, so a single vm_region undercounts; sum
+    // them until the first gap or non-writable region.
+    vm_address_t want = (vm_address_t)p;
+    size_t total = 0;
+    for (int i = 0; i < 4096; i++) {
+        vm_address_t a = want;
+        vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+        kern_return_t kr = vm_region_64(mach_task_self(), &a, &sz,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &cnt, &obj);
+        if (kr != KERN_SUCCESS) break;
+        if (a > want) break;                    // gap: `want` is unmapped
+        if (!(info.protection & VM_PROT_WRITE)) break;  // not writable
+        vm_address_t region_end = a + sz;
+        if (region_end <= want) break;          // no forward progress
+        total += (size_t)(region_end - want);
+        want = region_end;                      // continue from this region's end
+    }
+    return total;
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
     install_cbri_probe();         // log commandBufferResourceInfo returns
+    install_shadow_isolation();   // diag: skip layout!=0 replaceRegion (gated)
+    install_replaceregion_backing_wire();  // REAL FIX: wire NULL +0xa0 backing (gated)
     // (no pipeline fallback — see removed block above)
 
     SEL sel = @selector(initWithAcceleratorPort:);
@@ -2977,6 +3846,129 @@ static void install_agx_init_redirect(Class agx) {
         free(all);
         fprintf(stderr,
             "#### MACWS_AGX_NATIVE tile-pipeline probe: %d class(es) wrapped\n", wrapped);
+    }
+
+    // 2026-06-22 — STORAGE-MODE FIX (always-on for AGX-native; the real blur
+    // root cause). BUFDIAG runtime evidence (/tmp/macws_bufdiag.log) proved the
+    // backdrop-blur / gamma-LUT buffers that crash WS are NATIVE AGX buffers
+    // (synth=0: real distinct GPU VA, GPU-coherent, reslen==requested) created
+    // with **opt=0x10 = MTLResourceStorageModeManaged**. Managed is a macOS-ONLY
+    // storage mode (separate CPU+GPU copies synced via didModifyRange). iOS AGX
+    // has no Managed mode → it builds the buffer but the CPU `-contents` mapping
+    // is malformed/partial, so a full-length write overruns into unmapped/RO
+    // pages → SIGSEGV (WS .ips: copy_image_to_texture, create_gamma_lut_buffer).
+    //
+    // Fix: translate Managed → Shared at the -newBufferWithLength:options:
+    // boundary. On M1 unified memory a Shared buffer is a single physical
+    // allocation mapped BOTH CPU-writable (full length, no overrun) AND
+    // GPU-coherent (the GPU samples exactly what CA wrote) — so this fixes the
+    // crash AND lets blur actually render. CA's didModifyRange: becomes a
+    // harmless no-op on Shared. Only Managed is rewritten; Shared/Private/
+    // Memoryless pass through untouched. Logging stays gated on
+    // /tmp/macws_buf_diag.
+    {
+        SEL nbl_sel = sel_registerName("newBufferWithLength:options:");
+        typedef id (*nbl_t)(id, SEL, NSUInteger, NSUInteger);
+        __block CFMutableDictionaryRef nblMap = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        IMP nblWrap = imp_implementationWithBlock(^id(id self_, NSUInteger len, NSUInteger opt) {
+            Class cls = [self_ class];
+            nbl_t orig = (nbl_t)CFDictionaryGetValue(nblMap, (__bridge const void *)cls);
+            for (Class c = cls; c && !orig; c = class_getSuperclass(c))
+                orig = (nbl_t)CFDictionaryGetValue(nblMap, (__bridge const void *)c);
+            // Managed (storage bits 4-7 == 0x10) → Shared (0x0). iOS has no
+            // Managed mode; Shared is the coherent unified-memory equivalent.
+            NSUInteger sopt = opt;
+            if ((opt & 0xF0) == 0x10) sopt = opt & ~(NSUInteger)0xF0;
+            // EXPERIMENT (gated /tmp/macws_no_suballoc): force standalone resource.
+            // RE-confirmed (AGXG13GFamilyDevice -newBufferWithLength: @0x1e574dc24):
+            // isSuballocDisabled = byte at device+0x7cd. With suballoc ON, a
+            // sub-buffer's CPU contents = parentHeapCPU + offset, valid only as far
+            // as the parent heap's KERNEL-TRUNCATED CPU mapping → large sub-buffers
+            // overrun. Standalone resources may get a full CPU map (BUFDIAG #3
+            // showed a 22MB contiguous mapping for a standalone buffer).
+            uint8_t *suballoc_flag = (uint8_t *)((char *)(__bridge void *)self_ + 0x7cd);
+            uint8_t saved_suballoc = *suballoc_flag;
+            if (access("/tmp/macws_no_suballoc", F_OK) == 0 && len > 0x4000)
+                *suballoc_flag = 1;
+            id buf = orig ? orig(self_, nbl_sel, len, sopt) : nil;
+            *suballoc_flag = saved_suballoc;
+            if (access("/tmp/macws_buf_diag", F_OK) == 0) {
+                static _Atomic int bn = 0;
+                int n = atomic_fetch_add(&bn, 1);
+                if (buf && n < 64) {
+                    void *cont = [buf contents];
+                    uint64_t gpu = [buf gpuAddress];
+                    size_t ms = cont ? malloc_size(cont) : 0;
+                    size_t vext = macws_mapped_extent_from(cont);
+                    int synth = (cont && gpu == (uint64_t)(uintptr_t)cont);
+                    char b[300];
+                    int k = snprintf(b, sizeof b,
+                        "BUFDIAG #%d req=%lu reslen=%lu opt=%#lx->%#lx contents=%p gpuAddr=%#llx malloc_size=%zu vm_extent=%#zx suballocDisabled=%d synth=%d cls=%s\n",
+                        n, (unsigned long)len, (unsigned long)[buf length],
+                        (unsigned long)opt, (unsigned long)sopt,
+                        cont, (unsigned long long)gpu, ms, vext, (int)saved_suballoc, synth, class_getName([buf class]));
+                    int fd = open("/tmp/macws_bufdiag.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+                    if (fd >= 0) { if (k > 0) write(fd, b, (size_t)k); fsync(fd); close(fd); }
+                    // One-shot: for the first large (>16KB) buffer, scan the
+                    // IOGPUMetalResource struct (embedded at buf+0x18) AND the
+                    // AGX _impl C++ object (*(buf+0x208)) for any pointer field
+                    // that holds a FULL-length CPU mapping. The kernel maps the
+                    // resource full (createMappingInTask len=0=getLength); if a
+                    // full mapping exists in this task it must be reachable from a
+                    // resource/impl field — find it and we can repoint -contents.
+                    static _Atomic int dumped_big = 0;
+                    if (len > 0x4000 && atomic_fetch_add(&dumped_big, 1) == 0) {
+                        int df = open("/tmp/macws_bufstruct.log", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                        if (df >= 0) {
+                            const char *bp = (const char *)(__bridge void *)buf;
+                            void *impl = *(void * const *)(bp + 0x208);
+                            char d[256];
+                            int dk = snprintf(d, sizeof d,
+                                "BUFSTRUCT buf=%p len=%lu contents=%p impl=%p — pointer fields w/ vm_extent:\n",
+                                (void*)buf, (unsigned long)len, cont, impl);
+                            write(df, d, dk);
+                            for (int off = 0x18; off <= 0x160; off += 8) {
+                                uint64_t v = *(const uint64_t *)(bp + off);
+                                if (v >= 0x100000000ULL && v < 0x300000000000ULL) {
+                                    size_t ext = macws_mapped_extent_from((void*)(uintptr_t)v);
+                                    dk = snprintf(d, sizeof d, "  res+0x%x = %#llx  vm_extent=%#zx%s\n",
+                                        off, (unsigned long long)v, ext, ext >= len ? "  <== FULL!" : "");
+                                    write(df, d, dk);
+                                }
+                            }
+                            if ((uintptr_t)impl > 0x100000000ULL) {
+                                const char *ip = (const char *)impl;
+                                for (int off = 0; off <= 0x200; off += 8) {
+                                    uint64_t v = *(const uint64_t *)(ip + off);
+                                    if (v >= 0x100000000ULL && v < 0x300000000000ULL) {
+                                        size_t ext = macws_mapped_extent_from((void*)(uintptr_t)v);
+                                        dk = snprintf(d, sizeof d, "  impl+0x%x = %#llx  vm_extent=%#zx%s\n",
+                                            off, (unsigned long long)v, ext, ext >= len ? "  <== FULL!" : "");
+                                        write(df, d, dk);
+                                    }
+                                }
+                            }
+                            fsync(df); close(df);
+                        }
+                    }
+                }
+            }
+            return buf;
+        });
+        unsigned int nc = 0; Class *all = objc_copyClassList(&nc); int w = 0;
+        for (unsigned int i = 0; i < nc; i++) {
+            Class c = all[i]; Class p = c; BOOL match = NO;
+            while (p) { if (p == agx) { match = YES; break; } p = class_getSuperclass(p); }
+            if (!match) continue;
+            Method m = class_getInstanceMethod(c, nbl_sel);
+            if (!m) continue;
+            IMP cur = method_getImplementation(m);
+            if (cur == nblWrap) continue;
+            CFDictionarySetValue(nblMap, (__bridge const void *)c, (const void *)cur);
+            method_setImplementation(m, nblWrap); w++;
+        }
+        free(all);
+        fprintf(stderr, "#### MACWS_AGX_NATIVE newBufferWithLength: Managed→Shared translation installed on %d class(es)\n", w);
     }
 
     // 2026-06-20 — setFragmentTexture: / setVertexTexture: nil guard.
@@ -3177,6 +4169,20 @@ static void install_agx_init_redirect(Class agx) {
                     // the new buffer's CPU contents. Invoke their deallocator
                     // immediately since we no longer need the original
                     // pointer.
+                    // 2026-06-22 — CRASH FIX (runtime-confirmed SEGV_ACCERR in
+                    // _platform_memmove ← this block ← CA::OGL::MetalContext::
+                    // copy_image_to_texture ← render_contents_background, i.e. the
+                    // NSVisualEffectView backdrop-blur path; WindowServer.err exit
+                    // 139). The caller (CoreAnimation, thinking it's on macOS)
+                    // passes MTLResourceStorageModeManaged (storage bits 4-7 ==
+                    // 0x10). iOS has NO Managed storage mode — feeding it to iOS
+                    // -newBufferWithLength: returns a buffer whose CPU `contents`
+                    // mapping is undersized / wrong-permission, so the unbounded
+                    // memcpy below overran into a read-only page. This init-BYTES
+                    // variant must produce CPU-writable storage to receive `bytes`
+                    // anyway, so force Shared (fully GPU-accessible on M1 unified
+                    // memory — no correctness loss). Keep the cache/hazard bits.
+                    MTLResourceOptions safe_opt = opt & ~(MTLResourceOptions)0xF0;
                     static int redirect_log = 0;
                     if (redirect_log++ < 8) {
                         fprintf(stderr,
@@ -3186,14 +4192,35 @@ static void install_agx_init_redirect(Class agx) {
                             self, dev, (unsigned long)length,
                             (unsigned long)opt,
                             (unsigned long long)pinnedGPUAddress,
-                            (unsigned long)length, (unsigned long)opt);
+                            (unsigned long)length, (unsigned long)safe_opt);
                     }
                     id<MTLBuffer> ios_buf = [(id<MTLDevice>)dev
-                        newBufferWithLength:length options:opt];
+                        newBufferWithLength:length options:safe_opt];
                     if (ios_buf) {
                         if (bytes && length > 0) {
                             void *contents = [ios_buf contents];
-                            if (contents) memcpy(contents, bytes, length);
+                            NSUInteger blen = [ios_buf length];
+                            // Never copy more than the destination's CPU backing
+                            // actually holds. RUNTIME-CONFIRMED (WS .ips
+                            // 2026-06-22-131221: memmove dst+0x4000 fault): the
+                            // chroot's synthesized AGXG13GFamilyBuffer reports the
+                            // *requested* -length (e.g. 128KB) but backs -contents
+                            // with only a small (16KB calloc) scratch, so a
+                            // [length]-based clamp still overruns. malloc_size() on
+                            // the contents pointer returns that scratch's true size;
+                            // use it as the authoritative CPU-writable bound.
+                            if (contents && blen > 0) {
+                                size_t cap = (size_t)blen;
+                                size_t ms  = malloc_size(contents);
+                                if (ms > 0 && ms < cap) cap = ms;
+                                size_t ncopy = (size_t)length < cap ? (size_t)length : cap;
+                                memcpy(contents, bytes, ncopy);
+                                if (ncopy < length) {
+                                    fprintf(stderr,
+                                        "#### AGXBuffer REDIRECT: UNDERSIZED dst (len=%lu malloc_size=%zu) < requested %lu — clamped memcpy to %zu (GPU will see truncated data)\n",
+                                        (unsigned long)blen, ms, (unsigned long)length, ncopy);
+                                }
+                            }
                         }
                         if (deallocator) {
                             // Caller expects bytes to be freed eventually.
@@ -3302,13 +4329,33 @@ static void install_agx_init_redirect(Class agx) {
             (unsigned long)self.width, (unsigned long)self.height,
             (unsigned long)self.usage);
     }
-    if(mode == 1) { // MTLStorageModeManaged (macOS only) → Shared on iOS
+    if(mode == 1) { // MTLStorageModeManaged (macOS-discrete-GPU only) → Shared on
+                    // iOS unified memory. iOS AGX has no Managed mode; Shared is the
+                    // unified-memory equivalent. This rewrite is always correct.
         self.storageMode = MTLStorageModeShared;
         return MTLStorageModeShared;
     }
-    if(mode == 3) { // MTLStorageModeMemoryless (iOS support is narrower than macOS)
-                    // → Private. Without this, Memoryless textures cause AGX kernel
-                    // to return kIOReturnBadArgument and layers render BLACK.
+    // 2026-06-21 — Memoryless(3) is NO LONGER unconditionally downgraded to
+    // Private(2) here. The old always-on 3→2 rewrite MUTATED the descriptor
+    // (self.storageMode = Private), which DEFEATED two higher-layer memoryless
+    // fixes that came later:
+    //   1. supportsMemorylessRenderTargets→YES (Metal_hooks.x:~3181) — makes
+    //      CA::OGL::MetalContext pass *real* memoryless descriptors instead of
+    //      downgrading them up-front.
+    //   2. hooked_newTextureWithDescriptor:'s `storageMode == 3` branch
+    //      (Metal_hooks.x:~1902) routes memoryless to the NATIVE AGX path
+    //      (tile-memory-only, NO IOSurface).
+    // Because this accessor persisted the mutation, by the time
+    // newTextureWithDescriptor: read [desc storageMode] it saw 2 (never 3), so
+    // the native memoryless branch was dead code and EVERY memoryless request
+    // fell into ROUTE-IOSURF → a 31 MB IOSurface per "memoryless" texture →
+    // multi-GB growth → system Jetsam. A14+/M1 TBDR natively supports
+    // memoryless render targets, so the original kIOReturnBadArgument/BLACK
+    // concern is now handled correctly at the newTexture layer instead of by
+    // this blunt accessor rewrite.
+    //
+    // A/B opt-out: MACWS_FORCE_MEMORYLESS_PRIVATE=1 restores the old downgrade.
+    if(mode == 3 && getenv("MACWS_FORCE_MEMORYLESS_PRIVATE")) {
         self.storageMode = MTLStorageModePrivate;
         return MTLStorageModePrivate;
     }

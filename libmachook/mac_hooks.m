@@ -13,6 +13,7 @@
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <fcntl.h>
+#import <time.h>
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -20,6 +21,18 @@ extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
 extern IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t port);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
 extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
+extern int IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern int IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
+extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
+extern size_t IOSurfaceGetWidth(IOSurfaceRef surface);
+extern size_t IOSurfaceGetHeight(IOSurfaceRef surface);
+extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef surface);
+extern CFTypeID IOSurfaceGetTypeID(void);
+
+// True for a plausible userland/heap/mapped arm64 pointer (avoids deref of garbage).
+static inline int macws_ptr_ok(uint64_t p) {
+    return p >= 0x100000000ULL && p < 0x800000000000ULL;
+}
 
 // ─── Synthesized AGXG13GFamilyBuffer accessors (CODEHEAP-SHIM) ──────────────
 //
@@ -824,6 +837,7 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
     // WS-render-thread completion capture for VNC (gated /tmp/macws_vnc_share):
     // getBytes the previous (complete) display frame -> shared surface -> OSXvnc.
     { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(target0); }
+    { extern void macws_grab_composite(id); macws_grab_composite(target0); }
     return rv;
 }
 
@@ -977,7 +991,8 @@ int hooked_skylight_start_composite_wscd(void *self, void *dest,
       if (g_wscd_tex && dest) {
           id tex = nil;
           @synchronized(g_wscd_tex) { tex = g_wscd_tex[[NSValue valueWithPointer:dest]]; }
-          if (tex) { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(tex); }
+          if (tex) { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(tex);
+                     extern void macws_grab_composite(id); macws_grab_composite(tex); }
       } }
     return macws_pop_on_startcomp_bail(self, before, rv);
 }
@@ -993,6 +1008,7 @@ static int hooked_skylight_start_composite_mtltex(void *self, id texture,
     int rv = orig_skylight_start_composite_mtltex(
         self, texture, load_action, store_action);
     { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(texture); }
+    { extern void macws_grab_composite(id); macws_grab_composite(texture); }
     return macws_pop_on_startcomp_bail(self, before, rv);
 }
 
@@ -1009,6 +1025,38 @@ static int hooked_skylight_start_composite_mtltex(void *self, id texture,
 typedef void *(*WSCompositeDestinationCreateWithMetalTexture_t)(
     id texture, void *ctx, void *protectionOptions, void *colorspace, void *region);
 static WSCompositeDestinationCreateWithMetalTexture_t orig_skylight_wsccd_with_tex = NULL;
+
+// DIAG helper (gated /tmp/macws_dest_diag): identify which WSCD arg is the real
+// MTLTexture vs a destination/scanout container — RE workflow + project hook
+// disagree on arg index. Logs class + iosurface + _impl backing fields per arg.
+static void macws_dump_wscd_arg(int n, const char *which, id obj) {
+    char l[280];
+    if (!macws_ptr_ok((uint64_t)obj)) {
+        snprintf(l, sizeof l, "WSCDARG #%d %s = %p (not obj)\n", n, which, (void *)obj);
+    } else {
+        const char *cls = object_getClassName(obj);
+        uint64_t ios = 0, impl = 0, b130 = 0, a0 = 0, res = 0;
+        if ([obj respondsToSelector:@selector(iosurface)]) {
+            typedef IOSurfaceRef (*f)(id, SEL);
+            ios = (uint64_t)((f)objc_msgSend)(obj, @selector(iosurface));
+        }
+        Ivar iv = class_getInstanceVariable(object_getClass(obj), "_impl");
+        if (iv) {
+            impl = *(volatile uint64_t *)((char *)obj + ivar_getOffset(iv));
+            if (macws_ptr_ok(impl)) {
+                b130 = *(volatile uint64_t *)(impl + 0x130);
+                a0   = *(volatile uint64_t *)(impl + 0xa0);
+                res  = *(volatile uint64_t *)(impl + 0x10);
+            }
+        }
+        snprintf(l, sizeof l,
+            "WSCDARG #%d %s cls=%s iosurf=%#llx impl=%#llx 0x130=%#llx 0xa0=%#llx 0x10=%#llx\n",
+            n, which, cls ? cls : "?", (unsigned long long)ios, (unsigned long long)impl,
+            (unsigned long long)b130, (unsigned long long)a0, (unsigned long long)res);
+    }
+    int fd = open("/tmp/macws_dest.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) { write(fd, l, strlen(l)); close(fd); }
+}
 static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protectionOptions,
                                             void *colorspace, void *region) {
     if (!texture) {
@@ -1020,6 +1068,131 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
         return NULL;
     }
     void *wscd = orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
+    // ── WSCDARG identify (gated /tmp/macws_dest_diag): which arg is the real
+    // MTLTexture render dest vs the scanout container? Dump arg0(texture)+arg1(ctx). ──
+    if (access("/tmp/macws_dest_diag", F_OK) == 0) {
+        static _Atomic int idn = 0;
+        int in = atomic_fetch_add(&idn, 1);
+        if (in < 6) {
+            macws_dump_wscd_arg(in, "arg0", texture);
+            macws_dump_wscd_arg(in, "arg1", (id)ctx);
+        }
+    }
+    // ── DEST-SCAN (gated /tmp/macws_dest_diag): the decisive step-① test ──
+    // Does the COMPOSE actually render pixels into its destination IOSurface,
+    // or is the dest empty? texture (arg0) is the compose destination. We scan
+    // the PREVIOUS dest (already rendered by the frame between calls) with a
+    // 1-frame lag, so we read content AFTER the GPU drew it. If nz% is high →
+    // compose DOES produce content (then the wall is routing to VNC). If ~0 →
+    // compose draws nothing (deeper / Metal-proxy). Reliable file-log; no lldb.
+    if (access("/tmp/macws_dest_diag", F_OK) == 0 &&
+        [texture respondsToSelector:@selector(iosurface)]) {
+        // Self-contained per-call (NO cross-frame texture retain — that crashed
+        // WS's texture lifecycle). The compose dest IOSurface is REUSED per frame
+        // (base stable across scans), so scanning it at setup-time reads the PRIOR
+        // frame's render. (1) read this texture's C++ _impl backing fields; (2)
+        // scan its IOSurface content; (3) verdict: is the CPU base the IOSurface?
+        typedef IOSurfaceRef (*iosurf_imp_t)(id, SEL);
+        static _Atomic int dn = 0;
+        int n = atomic_fetch_add(&dn, 1);
+        if (n < 200) {
+            uint64_t impl = 0, b130 = 0, a0 = 0, res = 0;
+            Ivar iv = class_getInstanceVariable(object_getClass(texture), "_impl");
+            if (iv) {
+                impl = *(volatile uint64_t *)((char *)texture + ivar_getOffset(iv));
+                if (macws_ptr_ok(impl)) {
+                    b130 = *(volatile uint64_t *)(impl + 0x130);
+                    a0   = *(volatile uint64_t *)(impl + 0xa0);
+                    res  = *(volatile uint64_t *)(impl + 0x10);
+                }
+            }
+            IOSurfaceRef surf = ((iosurf_imp_t)objc_msgSend)(texture, @selector(iosurface));
+            uint64_t sbase = 0; size_t nz = 0, samp = 0, w = 0, h = 0, bpr = 0, bpe = 0;
+            if (surf) {
+                IOSurfaceLock(surf, 0x1, NULL);
+                void *base = IOSurfaceGetBaseAddress(surf); sbase = (uint64_t)base;
+                w = IOSurfaceGetWidth(surf); h = IOSurfaceGetHeight(surf);
+                bpr = IOSurfaceGetBytesPerRow(surf); bpe = IOSurfaceGetBytesPerElement(surf);
+                if (base && w && h && bpr && bpe) {
+                    for (size_t gy = 0; gy < 64; gy++) { size_t y = gy * h / 64;
+                        for (size_t gx = 0; gx < 64; gx++) { size_t x = gx * w / 64;
+                            uint8_t *p = (uint8_t *)base + y * bpr + x * bpe;
+                            uint64_t v = 0; for (size_t b = 0; b < bpe && b < 8; b++) v |= ((uint64_t)p[b]) << (8 * b);
+                            if (v) nz++; samp++;
+                        } }
+                }
+                IOSurfaceUnlock(surf, 0x1, NULL);
+            }
+            const char *match = (b130 && sbase && b130 == sbase) ? "B130==IOSURF"
+                              : (b130 && sbase) ? "B130!=IOSURF(separate)" : "?";
+            char line[360];
+            snprintf(line, sizeof line,
+                "DEST2 #%d %zux%zu bpe=%zu surfref=%p IOSurf.base=%#llx nz=%zu/%zu(%.1f%%) | impl=%#llx 0x130=%#llx 0xa0=%#llx res=%#llx | %s\n",
+                n, w, h, bpe, (void *)surf, (unsigned long long)sbase, nz, samp,
+                samp ? 100.0 * (double)nz / (double)samp : 0.0,
+                (unsigned long long)impl, (unsigned long long)b130,
+                (unsigned long long)a0, (unsigned long long)res, match);
+            int fd = open("/tmp/macws_dest.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { write(fd, line, strlen(line)); close(fd); }
+        }
+    }
+    // ── BLIT-RB (gated /tmp/macws_blit_rb): one-shot GPU blit-readback of the
+    // compose dest's ACTUAL GPU backing in the LIVE WS (which CAN submit). Splits
+    // the last ambiguity: blit copyFromTexture:toBuffer: reads the texture's real
+    // render backing regardless of IOSurface/field offsets. content>0 → the GPU
+    // rendered but the backing is DECOUPLED from the scanout IOSurface (routing,
+    // fixable: blit dest→IOSurface each frame). content~0 → compose draws nothing
+    // (samples empty inputs → deeper). Fires at call #20 so the dest is composed.
+    if (access("/tmp/macws_blit_rb", F_OK) == 0) {
+        static _Atomic int bc = 0;
+        int bn = atomic_fetch_add(&bc, 1);
+        if (bn == 20) {
+            {
+                id tex = texture;
+                id dev = ((id(*)(id, SEL))objc_msgSend)(tex, @selector(device));
+                unsigned long w  = ((unsigned long(*)(id, SEL))objc_msgSend)(tex, @selector(width));
+                unsigned long h  = ((unsigned long(*)(id, SEL))objc_msgSend)(tex, @selector(height));
+                unsigned long pf = ((unsigned long(*)(id, SEL))objc_msgSend)(tex, @selector(pixelFormat));
+                unsigned long bpe = (pf == 115) ? 8 : (pf == 10) ? 1 : 4;
+                unsigned long bpr = w * bpe, total = bpr * h;
+                id dst = ((id(*)(id, SEL, unsigned long, unsigned long))objc_msgSend)(
+                    dev, @selector(newBufferWithLength:options:), total, 0 /*Shared*/);
+                id q  = ((id(*)(id, SEL))objc_msgSend)(dev, @selector(newCommandQueue));
+                id cb = ((id(*)(id, SEL))objc_msgSend)(q, @selector(commandBuffer));
+                id bl = ((id(*)(id, SEL))objc_msgSend)(cb, @selector(blitCommandEncoder));
+                typedef struct { unsigned long a, b, c; } V3;  // MTLOrigin / MTLSize (24B, indirect ABI)
+                typedef void (*copy_t)(id, SEL, id, unsigned long, unsigned long, V3, V3,
+                                       id, unsigned long, unsigned long, unsigned long);
+                V3 org = {0, 0, 0}, sz = {w, h, 1};
+                ((copy_t)objc_msgSend)(bl, @selector(copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:),
+                    tex, 0, 0, org, sz, dst, 0, bpr, total);
+                ((void(*)(id, SEL))objc_msgSend)(bl, @selector(endEncoding));
+                ((void(*)(id, SEL))objc_msgSend)(cb, @selector(commit));
+                ((void(*)(id, SEL))objc_msgSend)(cb, @selector(waitUntilCompleted));
+                long st = ((long(*)(id, SEL))objc_msgSend)(cb, @selector(status));
+                id err  = ((id(*)(id, SEL))objc_msgSend)(cb, @selector(error));
+                uint8_t *p = ((void *(*)(id, SEL))objc_msgSend)(dst, @selector(contents));
+                size_t nz = 0, samp = 0;
+                if (p && w && h) {
+                    for (size_t gy = 0; gy < 64; gy++) { size_t y = gy * h / 64;
+                        for (size_t gx = 0; gx < 64; gx++) { size_t x = gx * w / 64;
+                            uint8_t *q2 = p + y * bpr + x * bpe;
+                            uint64_t v = 0; for (size_t b = 0; b < bpe && b < 8; b++) v |= ((uint64_t)q2[b]) << (8 * b);
+                            if (v) nz++; samp++;
+                        } }
+                }
+                char line[256];
+                snprintf(line, sizeof line,
+                    "BLIT-RB w=%lu h=%lu bpe=%lu cbstatus=%ld err=%s nz=%zu/%zu (%.1f%%)\n",
+                    w, h, bpe, st, err ? "YES" : "no", nz, samp, samp ? 100.0 * (double)nz / (double)samp : 0.0);
+                int fd = open("/tmp/macws_blit_rb.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd >= 0) { write(fd, line, strlen(line)); close(fd); }
+                // one-shot diagnostic: intentionally leak dst/q/cb (no release, no
+                // autoreleasepool) — avoids the async use-after-free that crashed WS
+                // when the cb's completion fired after the pool drained / over-release.
+            }
+        }
+    }
     // Map WSCompositeDestination -> its MTLTexture, so the WSCD-variant
     // StartComposite hook (the one that fires in coexist) can feed the
     // VNC completion-capture (which needs the destination texture).
@@ -1047,6 +1220,247 @@ static void hooked_metalcontext_stop_capture(void *this) {
         return;
     }
     orig_metalcontext_stop_capture(this);
+}
+
+#import <execinfo.h>
+// ── (diagnostic, gated /tmp/macws_modeset_trace) IOMFBDisplay mode-set trace ──
+// Watchpoint-confirmed: [IOMFBDisplay+0x228] (scanout pixel-format/config) is
+// NEVER written → stays -1 → current_page_surface's predicate discards the page
+// every frame → per-frame realloc leak + no valid scanout. Log [self+0x228]/
+// [+0x218]/[+0x20] before+after the mode-apply functions to locate the writer /
+// the bail that skips the write. By-symbol hooks (no offset drift). NOT a fix.
+typedef void (*ms_ufl_t)(void *self, unsigned int a);
+typedef void (*ms_uti_t)(void *self);
+typedef void (*ms_sps_t)(void *self, unsigned int on);
+static intptr_t g_qc_slide = 0;   // QuartzCore ASLR slide (set in install_modeset_trace)
+static ms_ufl_t orig_ms_ufl = NULL;
+static ms_uti_t orig_ms_uti = NULL;
+static ms_sps_t orig_ms_sps = NULL;
+static void macws_rd228(const char *tag, void *self) {
+    if (!self || (uintptr_t)self <= 0x1000) { fprintf(stderr, "#### MODESET %s self=%p\n", tag, self); return; }
+    uint64_t v = *(volatile uint64_t *)((char *)self + 0x228);
+    uint32_t f218 = *(volatile uint32_t *)((char *)self + 0x218);
+    void *p20 = *(void **)((char *)self + 0x20);
+    fprintf(stderr, "#### MODESET %s self=%p [+0x228]=%#llx [+0x218]=%#x [+0x20]=%p\n",
+            tag, self, (unsigned long long)v, f218, p20);
+}
+static void macws_hook_ms_ufl(void *self, unsigned int a) {
+    static int n = 0; int log = (n++ < 12);
+    if (log) macws_rd228("ufl.IN", self);
+    orig_ms_ufl(self, a);
+    if (log) macws_rd228("ufl.OUT", self);
+}
+static void macws_hook_ms_uti(void *self) {
+    static int n = 0; int log = (n++ < 12);
+    if (log) macws_rd228("uti.IN", self);
+    orig_ms_uti(self);
+    if (log) macws_rd228("uti.OUT", self);
+}
+// The mode-set ORCHESTRATOR (unslid 0x187c83f44): big sub sp,#0x680 frame,
+// the ONLY function that bl's update_framebuffer_locked (@0x187c85218/2e4),
+// update_timing_info (@0x187c854e0) and set_power_state (@0x187c854f4). It's
+// gated on its w1 flags arg (bail to epilogue unless flags&~0x130 != 0; the
+// ufl/mode-apply is deep behind more flag/field gates). Log every (self,flags)
+// to learn what flags chroot calls it with + correlate with whether ufl fires.
+typedef void (*ms_orch_t)(void *self, unsigned int flags);
+static ms_orch_t orig_ms_orch = NULL;
+// Display CONSTRUCTION handshake (QC 13.4):
+//  - 0x187a8aa08 = display init (calls orchestrator flags=-0x11 on some path)
+//  - 0x187c8bf58 = setter: if [self+0x224]!=w1 -> store + orchestrator flags=0x246
+// Both should fire at display construction and trigger the mode-set. Log them to
+// see (a) does construction reach them in chroot, (b) [self+0x224] value (gate).
+typedef void* (*disp_init_t)(void *self, void *a1, uint64_t a2, uint64_t a3);
+typedef void* (*disp_setter_t)(void *self, unsigned int w1);
+static disp_init_t   orig_disp_init = NULL;
+static disp_setter_t orig_disp_setter = NULL;
+_Atomic int g_in_createmode = 0;     // read by IOConnectCallMethod_new; set around the QC IOMFBDisplay ctor
+static intptr_t macws_imfb_slide(void) {
+    static intptr_t s = -1;
+    if (s == -1) {
+        s = 0;
+        for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+            const char *nm = _dyld_get_image_name(i);
+            if (nm && strstr(nm, "IOMobileFramebuffer")) { s = _dyld_get_image_vmaddr_slide(i); break; }
+        }
+    }
+    return s;
+}
+static void *macws_hook_disp_init(void *self, void *a1, uint64_t a2, uint64_t a3) {
+    // Lightweight one-shot logging only. (Removed the IOMFB __DATA table read —
+    // _dyld_get_image_vmaddr_slide gives __TEXT slide; __DATA may be in a different
+    // subcache with a different slide, so the computed-addr read could fault and
+    // kill WS at display-init. Read IOMFB __DATA only via a verified slide later.)
+    static int once = 0;
+    if (!once) {
+        once = 1;
+        fprintf(stderr, "#### DISPCFG init self=%p a3=%#llx\n", self, (unsigned long long)a3);
+    }
+    // Mark the window so IOConnectCallMethod_new logs every IOConnect the ctor
+    // makes (the mode/timing query that gates the mode-set). Safe: this hook is
+    // QuartzCore (correct slide, known sig) — no IOMFB-function patching.
+    atomic_fetch_add(&g_in_createmode, 1);
+    void *r = orig_disp_init(self,a1,a2,a3);
+    atomic_fetch_sub(&g_in_createmode, 1);
+    return r;
+}
+static void *macws_hook_disp_setter(void *self, unsigned int w1) {
+    static int n=0;
+    if (n++<12) {
+        uint8_t cur = ((uintptr_t)self>0x1000)?*(volatile uint8_t*)((char*)self+0x224):0xff;
+        fprintf(stderr, "#### DISPCFG setter#%d self=%p w1=%u [+0x224]_before=%u (%s)\n",
+                n, self, w1, cur, (cur==w1)?"SKIP-equal":"WILL-reconfig");
+    }
+    return orig_disp_setter(self,w1);
+}
+// IOMobileFramebuffer "create display-mode" accessor (unslid 0x18b024a5c). The
+// QC IOMFBDisplay ctor calls it; it allocs a mode obj, calls an IOConnect mode/
+// timing query (-> IOKit MIG leaf 0x1835881f8), and on query-error frees the obj
+// and returns *out=0 -> the ctor's `cbz x1` skips the whole mode-set. We log its
+// status + *out, and (via g_in_createmode) make the IOConnect hook log EVERY call
+// it makes so we capture the exact failing selector/kr. Cache shares one slide,
+// so this is reachable via g_qc_slide.
+// current_page_surface (QC 0x187c98b10): the per-frame page allocator. Hook it to
+// read the REAL churning display's scanout state ([+0x228]/[+0x218]/[+0x20]) — the
+// prior measurement was on the set_power_state-target display which may differ.
+// ONE-SHOT logging (per-frame fn — keep overhead near zero). Gated /tmp/macws_pred_hook.
+typedef void* (*cps_t)(void *self, void *a1, void *a2, void *a3);
+static cps_t orig_cps = NULL;
+static void *macws_hook_cps(void *self, void *a1, void *a2, void *a3) {
+    static int n = 0;
+    if (n < 4 && (uintptr_t)self > 0x1000) {
+        n++;
+        uint64_t v228 = *(volatile uint64_t*)((char*)self + 0x228);
+        uint32_t f218 = *(volatile uint32_t*)((char*)self + 0x218);
+        void *p20 = *(void**)((char*)self + 0x20);
+        fprintf(stderr, "#### CPS#%d self=%p [+0x228]=%#llx [+0x218]=%#x [+0x20]=%p\n",
+                n, self, (unsigned long long)v228, f218, p20);
+    }
+    return orig_cps(self, a1, a2, a3);
+}
+typedef unsigned long (*imfb_cm_t)(void *a0, void *a1, void *a2, void **outp);
+static imfb_cm_t orig_imfb_cm = NULL;
+static unsigned long macws_hook_imfb_cm(void *a0, void *a1, void *a2, void **outp) {
+    atomic_fetch_add(&g_in_createmode, 1);
+    unsigned long st = orig_imfb_cm(a0, a1, a2, outp);
+    atomic_fetch_sub(&g_in_createmode, 1);
+    static int n=0;
+    if (n++<8)
+        fprintf(stderr, "#### IMFB createmode#%d a0=%p a1=%p a2=%p -> status=%#lx *out=%p\n",
+                n, a0, a1, a2, st, outp ? *outp : NULL);
+    return st;
+}
+// Second accessor variant (unslid 0x18b029710), used on the [this+0x2f8]==0 path
+// (stub 0x187cbf9d8). Signature: (x0, x1=out**).
+typedef unsigned long (*imfb_cm2_t)(void *a0, void **outp);
+static imfb_cm2_t orig_imfb_cm2 = NULL;
+static unsigned long macws_hook_imfb_cm2(void *a0, void **outp) {
+    atomic_fetch_add(&g_in_createmode, 1);
+    unsigned long st = orig_imfb_cm2(a0, outp);
+    atomic_fetch_sub(&g_in_createmode, 1);
+    static int n=0;
+    if (n++<8)
+        fprintf(stderr, "#### IMFB createmode2#%d a0=%p -> status=%#lx *out=%p\n",
+                n, a0, st, outp ? *outp : NULL);
+    return st;
+}
+static void macws_hook_ms_orch(void *self, unsigned int flags) {
+    static int n = 0; int log = (n++ < 24);
+    if (log) {
+        uint64_t v228 = ((uintptr_t)self>0x1000)?*(volatile uint64_t*)((char*)self+0x228):0;
+        fprintf(stderr, "#### MODESET ORCH#%d self=%p flags=%#x [+0x228]=%#llx\n",
+                n, self, flags, (unsigned long long)v228);
+    }
+    orig_ms_orch(self, flags);
+}
+static void macws_hook_ms_sps(void *self, unsigned int on) {
+    static int n = 0; int log = (n++ < 4);
+    if (log) {
+        void *ra = __builtin_return_address(0);
+        uintptr_t unslid = (uintptr_t)ra - (uintptr_t)g_qc_slide;
+        fprintf(stderr, "#### MODESET sps self=%p on=%u caller_ra=%p caller_unslid=%#lx\n",
+                self, on, ra, (unsigned long)unslid);
+        macws_rd228("sps.IN", self);
+        // Full backtrace: resolve each QuartzCore frame to its unslid __text
+        // offset (frame - slide) so we can map the display-setup call chain
+        // offline against qc_text.bin and find where config SHOULD happen.
+        void *bt[40]; int nf = backtrace(bt, 40);
+        for (int i = 0; i < nf; i++) {
+            uintptr_t u = (uintptr_t)bt[i] - (uintptr_t)g_qc_slide;
+            Dl_info di; const char *img = "?";
+            if (dladdr(bt[i], &di) && di.dli_fname) {
+                const char *b = strrchr(di.dli_fname, '/'); img = b ? b+1 : di.dli_fname;
+            }
+            fprintf(stderr, "#### MODESET bt[%02d] %p unslid=%#lx %s\n",
+                    i, bt[i], (unsigned long)u, img);
+        }
+    }
+    orig_ms_sps(self, on);
+    if (log) macws_rd228("sps.OUT", self);
+}
+// 13.4 QuartzCore UNSLID __text addresses (cache file addrs from extraction).
+// update_framebuffer_locked / update_timing_info are LOCAL symbols (MSFindSymbol
+// can't find them), but set_power_state IS exported — derive the ASLR slide from
+// it and reach the locals by computed address.
+#define QC_UNSLID_set_power_state        0x187c86c34
+#define QC_UNSLID_update_framebuffer_lk  0x187c86174
+#define QC_UNSLID_update_timing_info     0x187c869a0
+#define QC_UNSLID_fetch_current_mode     0x187c88470
+#define QC_UNSLID_modeset_orchestrator   0x187c83f44
+#define QC_UNSLID_disp_init              0x187a8aa08
+#define QC_UNSLID_disp_setter            0x187c8bf58
+#define QC_UNSLID_current_page_surface   0x187c98b10
+#define UNSLID_imfb_createmode           0x18b024a5c  /* IOMobileFramebuffer (same cache slide) */
+#define UNSLID_imfb_createmode2          0x18b029710  /* variant used on [this+0x2f8]==0 path */
+static void install_modeset_trace(void) {
+    if (access("/tmp/macws_modeset_trace", F_OK) != 0) return;
+    MSImageRef qc = MSGetImageByName(QuartzCorePath);
+    if (!qc) { fprintf(stderr, "#### MODESET: QuartzCore image not found\n"); return; }
+    void *s3 = MSFindSymbol(qc, "__ZN2CA12WindowServer12IOMFBDisplay15set_power_stateEb");
+    if (!s3) { fprintf(stderr, "#### MODESET: set_power_state sym not found (cannot derive slide)\n"); return; }
+    intptr_t slide = (intptr_t)s3 - (intptr_t)QC_UNSLID_set_power_state;
+    g_qc_slide = slide;
+    fprintf(stderr, "#### MODESET: set_power_state @%p slide=%#lx\n", s3, (long)slide);
+    MSHookFunction(s3, (void *)macws_hook_ms_sps, (void **)&orig_ms_sps);
+    void *s1 = (void *)((uintptr_t)QC_UNSLID_update_framebuffer_lk + slide);
+    MSHookFunction(s1, (void *)macws_hook_ms_ufl, (void **)&orig_ms_ufl);
+    fprintf(stderr, "#### MODESET hook update_framebuffer_locked @%p\n", s1);
+    void *s2 = (void *)((uintptr_t)QC_UNSLID_update_timing_info + slide);
+    MSHookFunction(s2, (void *)macws_hook_ms_uti, (void **)&orig_ms_uti);
+    fprintf(stderr, "#### MODESET hook update_timing_info @%p\n", s2);
+    void *s4 = (void *)((uintptr_t)QC_UNSLID_modeset_orchestrator + slide);
+    MSHookFunction(s4, (void *)macws_hook_ms_orch, (void **)&orig_ms_orch);
+    fprintf(stderr, "#### MODESET hook orchestrator @%p\n", s4);
+    // disp_init (IOMFBDisplay ctor 0x187a8aa08) + disp_setter hooks DISABLED:
+    // hooking the ctor destabilized WS startup (died at display-init before GPU,
+    // reproducibly) while sps/ufl/uti/orchestrator hooks are stable. Re-enable only
+    // with a gentler observation method if ctor-time data is needed again.
+    (void)macws_hook_disp_init; (void)macws_hook_disp_setter;
+    (void)QC_UNSLID_disp_init; (void)QC_UNSLID_disp_setter;
+    fprintf(stderr, "#### MODESET disp_init/disp_setter hooks DISABLED (destabilize startup)\n");
+    // Observe the REAL churn decision: hook current_page_surface (QC, stable class).
+    if (access("/tmp/macws_pred_hook", F_OK) == 0) {
+        void *sc = (void *)((uintptr_t)QC_UNSLID_current_page_surface + slide);
+        MSHookFunction(sc, (void *)macws_hook_cps, (void **)&orig_cps);
+        fprintf(stderr, "#### MODESET hook current_page_surface @%p\n", sc);
+    }
+    // Option B: hook the IOMFB mode accessors using the CORRECT IOMFB slide
+    // (macws_imfb_slide — IOMFB is in a different subcache than QC, so g_qc_slide is
+    // wrong for it; that was the earlier crash). Observe their return status + *out
+    // in the chroot, and (next) synthesize a valid mode on failure. Gated by a
+    // SEPARATE sentinel /tmp/macws_imfb_hook so it can be A/B'd against the stable
+    // baseline (hooking IOMFB-internal fns may destabilize startup like the ctor hook).
+    if (access("/tmp/macws_imfb_hook", F_OK) == 0) {
+        intptr_t isl = macws_imfb_slide();
+        if (isl) {
+            void *s7 = (void *)((uintptr_t)UNSLID_imfb_createmode + isl);
+            MSHookFunction(s7, (void *)macws_hook_imfb_cm, (void **)&orig_imfb_cm);
+            void *s8 = (void *)((uintptr_t)UNSLID_imfb_createmode2 + isl);
+            MSHookFunction(s8, (void *)macws_hook_imfb_cm2, (void **)&orig_imfb_cm2);
+            fprintf(stderr, "#### MODESET imfb hooks @%p/%p imfb_slide=%#lx\n", s7, s8, (long)isl);
+        } else {
+            fprintf(stderr, "#### MODESET imfb hooks SKIP (IOMFB image not found yet)\n");
+        }
+    }
 }
 
 static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *header) {
@@ -1155,9 +1569,255 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
     }
 }
 
+// ─── Deterministic guard for the backdrop-blur layout=3 NULL-backing WS crash ───
+// Gated /tmp/macws_wr3_guard or MACWS_WR3_GUARD. See
+// [[ws-connection-crash-is-backdrop-blur-layout3]]. RE-confirmed (fresh .ips):
+//   EXC_BAD_ACCESS write@0x0  _platform_memmove <- AGX::Texture<3>::writeRegion
+//   <- -[AGXG13GFamilyTexture replaceRegion:] <- -[IOGPUMetalTexture replaceRegion:]
+//   <- CA::OGL::MetalContext::create_texture <- ... <- visit_subclass(BackdropLayer).
+// CA::OGL (software-Metal) uploads a layout=3 blur texture via replaceRegion, but the
+// chroot-synth texture's CPU backing (this->0xa0) is NULL → writeRegion memmoves to NULL.
+// ObjC-swizzle hooks of replaceRegion fire NON-deterministically here (double libmachook
+// arm64+arm64e + CA::OGL multithread); an MSHookFunction PROLOGUE patch on writeRegion is
+// deterministic (catches the direct C++ call). When this->0xa0 is NULL the write would
+// fault, so skip it: the texture stays uninitialized (empty/garbage blur — a separate
+// fidelity wall) but WS SURVIVES, which stops the restart-loop that re-floods the DCP →
+// panic. writeRegion(this, uint×9, void* src, ulong, ulong) per mangled ...EjjjjjjjjjPvmm.
+typedef void (*macws_wr3_t)(void *thiz, uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,
+                            uint32_t,uint32_t,uint32_t,uint32_t, void *, uint64_t, uint64_t);
+static macws_wr3_t macws_orig_wr3 = NULL;
+
+static void macws_wr3_logline(const char *path, int trunc, const char *line) {
+    int fl = O_WRONLY | O_CREAT | (trunc ? O_TRUNC : O_APPEND);
+    int fd = open(path, fl, 0644);
+    if (fd >= 0) { write(fd, line, strlen(line)); close(fd); }
+}
+
+// ─── ROOT-CAUSE diagnostic + S1 fix for the layout=3 backdrop-blur memmove(NULL) ───
+// RE-confirmed (AGXMetal13_3 getCPUPtr@0x1e576fb74 disasm) the dst getCPUPtr returns is
+// `*(this+0x130) + delta`; runtime-confirmed (WindowServer-2026-06-21-175127.ips:
+// x21(dst)=0, x24(this)=0x147050d10, offset terms 0) that this->0x130 == 0 for the
+// crashing texture. The CPU base 0x130 is set by the lazy binder @0x1e56de1e4 from
+// `(this->0x10 /*resource*/)->0x218`, and that binder bails (leaving 0x130=0) if the
+// cross-image prepare-call @0x1e5a5d4c0 fails. The earlier WR3-GUARD checked 0xa0
+// (always non-NULL → inert). This rewrite checks the RIGHT field (0x130) and, when it
+// is NULL, recovers the CPU base from the resource (mirroring the binder's success
+// store, NO abort risk) — distinguishing S1 (resource->0x218 valid, binder just didn't
+// run → fixable here) from S2 (resource->0x218 also 0 → resource itself unmapped).
+static void macws_my_wr3(void *thiz, uint32_t a0,uint32_t a1,uint32_t a2,uint32_t a3,uint32_t a4,
+                         uint32_t a5,uint32_t a6,uint32_t a7,uint32_t a8, void *src, uint64_t j, uint64_t k) {
+    uint64_t cpubase = 0, res = 0, res218 = 0, a0field = 0;
+    uint8_t  layout = 0xff;
+    if (macws_ptr_ok((uint64_t)thiz)) {
+        cpubase = *(volatile uint64_t *)((char *)thiz + 0x130);
+        res     = *(volatile uint64_t *)((char *)thiz + 0x10);
+        a0field = *(volatile uint64_t *)((char *)thiz + 0xa0);  // = the IOSurface (WSCDARG-confirmed)
+        layout  = *(volatile uint8_t  *)((char *)thiz + 0x184);
+        if (macws_ptr_ok(res)) res218 = *(volatile uint64_t *)((char *)res + 0x218);
+    }
+
+    static _Atomic int wn = 0;
+    int n = atomic_fetch_add(&wn, 1);
+    char line[320];
+    snprintf(line, sizeof line,
+        "WR3 #%d thiz=%p layout=%u 0x130=%#llx 0xa0=%#llx res=%#llx res218=%#llx src=%p len=%llu,%llu\n",
+        n, thiz, (unsigned)(layout & 0xff),
+        (unsigned long long)cpubase, (unsigned long long)a0field,
+        (unsigned long long)res, (unsigned long long)res218, src,
+        (unsigned long long)j, (unsigned long long)k);
+    if (n < 80) macws_wr3_logline("/tmp/macws_wr3.log", 0, line);
+    macws_wr3_logline("/tmp/macws_wr3_last", 1, line);
+
+    if (cpubase == 0) {
+        if (!access("/tmp/macws_wr3_diagonly", F_OK)) return;  // diag-only: skip, survive
+        // PRINCIPLED FIX (gated /tmp/macws_wr3_iosfix): the texture references its IOSurface
+        // at _impl+0xa0 (WSCDARG-confirmed: impl+0xa0 == [tex iosurface]) but the chroot AGX
+        // init never wired the CPU base _impl+0x130 from it. Set 0x130 = IOSurfaceGetBaseAddress
+        // (0xa0) so getCPUPtr returns an address INSIDE the IOSurface → writeRegion uploads into
+        // the IOSurface (which the GPU then samples / VNC reads), instead of memmove(NULL).
+        if (access("/tmp/macws_wr3_iosfix", F_OK) == 0 && macws_ptr_ok(a0field) &&
+            CFGetTypeID((CFTypeRef)a0field) == IOSurfaceGetTypeID()) {
+            uint64_t iosbase = (uint64_t)IOSurfaceGetBaseAddress((IOSurfaceRef)a0field);
+            if (macws_ptr_ok(iosbase)) {
+                *(volatile uint64_t *)((char *)thiz + 0x130) = iosbase;
+                char f[160];
+                snprintf(f, sizeof f, "WR3-FIX-IOS #%d set 0x130 = IOSurfaceGetBaseAddress(0xa0)=%#llx\n",
+                         n, (unsigned long long)iosbase);
+                macws_wr3_logline("/tmp/macws_wr3.log", 0, f);
+                macws_orig_wr3(thiz, a0,a1,a2,a3,a4,a5,a6,a7,a8, src, j, k);
+                return;
+            }
+        }
+        if (macws_ptr_ok(res218)) {  // fallback: resource CPU base (binder's source)
+            *(volatile uint64_t *)((char *)thiz + 0x130) = res218;
+        } else {
+            char f[160];
+            snprintf(f, sizeof f, "WR3-SKIP #%d cpubase=0 0xa0=%#llx res218=%#llx\n",
+                     n, (unsigned long long)a0field, (unsigned long long)res218);
+            macws_wr3_logline("/tmp/macws_wr3.log", 0, f);
+            return;  // survive (skip upload)
+        }
+    }
+    macws_orig_wr3(thiz, a0,a1,a2,a3,a4,a5,a6,a7,a8, src, j, k);
+}
+static void macws_install_wr3_guard(void *fn) {
+    static int done = 0; if (done) return; done = 1;
+    extern void MSHookFunction(void *, void *, void **);
+    MSHookFunction(fn, (void *)macws_my_wr3, (void **)&macws_orig_wr3);
+    fprintf(stderr, "#### WR3-GUARD installed @ %p (orig=%p)\n", fn, (void *)macws_orig_wr3);
+}
+
+// ─── REAL-BLUR FIX: cache-proof IOSurface routing for CA::OGL blur textures ───
+// (gated /tmp/macws_blur_route or MACWS_BLUR_ROUTE). RE-confirmed
+// [[ws-connection-crash-is-backdrop-blur-layout3]]: CA::OGL caches the device's
+// newTextureWithDescriptor: IMP for its render hot-path, BYPASSING the ObjC swizzle →
+// the backdrop-blur layout=3 texture is created native (NO GPU-coherent backing) →
+// getCPUPtr's address translation returns 0 → writeRegion memmove(NULL) → WS crash →
+// restart → DCP re-flood. FIX: MSHookFunction the ORIGINAL AGXG13GFamilyDevice
+// -[newTextureWithDescriptor:] IMP (unslid 0x1e574d5ec; a prologue patch catches the
+// cached-IMP callers — proven to work on AGXMetal13_3 via macws_my_wr3) and re-dispatch
+// via objc_msgSend to the swizzled IOSurface routing (hooked_newTextureWithDescriptor:),
+// which builds a layout=0 IOSurface-backed GPU-coherent texture (proven for the 32x32).
+// The routing's native fallback `[self hooked_newTextureWithDescriptor:]` resolves (via
+// swizzle2's method exchange) back to this MSHook'd original; a __thread guard sends that
+// re-entry to the real orig. Net: blur textures become GPU-coherent → getCPUPtr maps them
+// → writeRegion writes + GPU samples → real blur, AND no crash/restart.
+typedef id (*macws_newtex_t)(id, SEL, id);
+static macws_newtex_t macws_orig_newtex = NULL;
+static SEL macws_newtex_sel = NULL;
+static __thread int macws_in_newtex = 0;
+static id macws_my_newtex(id self, SEL _cmd, id desc) {
+    if (macws_in_newtex)
+        return macws_orig_newtex(self, _cmd, desc);   // re-entrant (routing's native fallback) → real AGX
+    macws_in_newtex = 1;
+    id r = ((id (*)(id, SEL, id))objc_msgSend)(self, macws_newtex_sel, desc);  // → swizzled IOSurface routing
+    macws_in_newtex = 0;
+    static int n = 0; if (n++ < 8) {
+        fprintf(stderr, "#### BLUR-ROUTE redispatched newTex -> %p cls=%s\n",
+                (void *)r, r ? object_getClassName(r) : "nil");
+        fflush(stderr);
+    }
+    return r;
+}
+static void macws_install_blur_route(void *imp) {
+    static int done = 0; if (done) return; done = 1;
+    macws_newtex_sel = sel_registerName("newTextureWithDescriptor:");
+    // MSHookFunction silently fails to stick on the dlopen'd (DSC-extracted) AGXMetal13_3
+    // unless the target page is first made private-writable (VM_PROT_COPY resolved) by a
+    // real write — confirmed: the writeRegion MSHook only took because the byte-patch had
+    // COW'd writeRegion's page. newTextureWithDescriptor is on a different page, so force
+    // a CoW resolve here (rewrite the first instruction to itself) before hooking.
+    ModifyExecutableRegion(imp, 16, ^{
+        volatile uint32_t *p = (uint32_t *)imp; uint32_t v = p[0]; p[0] = v;
+    });
+    extern void MSHookFunction(void *, void *, void **);
+    MSHookFunction(imp, (void *)macws_my_newtex, (void **)&macws_orig_newtex);
+    fprintf(stderr, "#### BLUR-ROUTE installed on AGX -[newTextureWithDescriptor:] @ %p (orig=%p)\n",
+            imp, (void *)macws_orig_newtex);
+}
+
+// Gated /tmp/macws_status_skip: disable the SystemStatus status-DOMAIN re-registration
+// that crashes WS in the chroot. RE-confirmed crash (WindowServer-2026-06-21-231156.ips):
+// EXC_BAD_ACCESS cache_getImp ← _NSIsNSNumber ← -[NSXPCEncoder _encodeObject:] ← ... ←
+// -[STStatusDomainXPCServerHandle _reregisterForDomains]_block_invoke_3 — i.e. NSXPC encodes
+// a status-domain object with a bad isa in the chroot. Status domains (Control Center / menu-bar
+// status items) are NOT a rendering path; like the project's sandbox/audit-token stubs, this
+// disables an iOS-incompatible subsystem so WS survives a client connect. One-shot; retries each
+// image load until the class is present.
+// Default-ON in the AGX-native goal: the SystemStatus status-domain
+// re-registration is a non-rendering subsystem (system status-bar items;
+// needs a real status daemon that doesn't exist in the chroot) and it
+// crashes WS on a client connect — RE-confirmed crash-diag: BUS_ADRALN at
+// objc_msgSend, the encoded object's isa = `_xpc_type_serializer` (libxpc),
+// i.e. NSXPC's `-[NSXPCEncoder _encodeObject:]` ObjC-messages a raw XPC
+// object during `-[STStatusDomainXPCServerHandle _reregisterForDomains]`.
+// Disabling it (like the project's sandbox / audit-token / HID stubs) keeps
+// WS alive through the GlassDemo connect. Opt-OUT with /tmp/macws_no_status_skip.
+static void macws_status_skip_try(void) {
+    static int done = 0; if (done) return;
+    if (access("/tmp/macws_no_status_skip", F_OK) == 0) { done = 1; return; }
+    Class c = objc_getClass("STStatusDomainXPCServerHandle");
+    if (!c) return;  // SystemStatus not loaded yet — retry later
+    // class_getInstanceMethod searches the class AND its superclasses, so it
+    // finds `_reregisterForDomains` even though it isn't in the class's OWN
+    // method list (the earlier class_copyMethodList attempt missed it for
+    // exactly that reason). Returns NULL until the method is registered, so
+    // we keep retrying.
+    SEL sel = sel_registerName("_reregisterForDomains");
+    Method m = class_getInstanceMethod(c, sel);
+    if (!m) return;  // not registered yet — retry later
+    IMP noop = imp_implementationWithBlock(^void(id self) { (void)self; });
+    method_setImplementation(m, noop);
+    done = 1;
+    fprintf(stderr, "#### MACWS status-skip: -[STStatusDomainXPCServerHandle "
+        "_reregisterForDomains] -> no-op (NSXPC-encode-XPC-object crash avoided)\n");
+}
+
+// WindowServer-only: the SystemStatus _reregisterForDomains crash is a WS-side
+// issue, and this is called from loadImageCallback (every image, EVERY process).
+// Running it in client apps (e.g. GlassDemo) — especially the dispatch_after
+// backstop scheduled during the FIRST add-image callback, before the client's
+// libdispatch/main is ready — HANGS the client at load (runtime-confirmed
+// 2026-06-22: GlassDemo hung in ctor with no output until this was gated). Gate
+// to WindowServer so no status-skip code (and no dispatch_after) runs in clients.
+static int macws_is_windowserver(void) {
+    static int v = -1;
+    if (v < 0) {
+        char exe[PATH_MAX]; uint32_t n = sizeof(exe);
+        v = (_NSGetExecutablePath(exe, &n) == 0 &&
+             strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL) ? 1 : 0;
+    }
+    return v;
+}
+
+static void macws_install_status_skip(void) {
+    if (!macws_is_windowserver()) return;  // WS-only; never run in client apps
+    // Called from loadImageCallback (fires per dylib load during startup) so the
+    // swizzle lands as soon as SystemStatus + its category are up. A one-shot
+    // dispatch_after backstop guarantees it installs before the ~t+4s client
+    // connect even if no image loads late in startup.
+    macws_status_skip_try();
+    static dispatch_once_t backstop_once;
+    dispatch_once(&backstop_once, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{ macws_status_skip_try(); });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ macws_status_skip_try(); });
+    });
+}
+
+// PANIC FIX (gated /tmp/macws_swap_cancel): recycle the per-frame DCP swap object
+// WITHOUT scanning out to the physical panel. Coexist can't present (iOS owns the
+// panel → purple flicker) but NOPing the present leaks the swap → DCP RTKit OOM
+// panic. RE (agent, IOMobileFramebuffer): SwapBegin(sel4) caches the swap-id at
+// conn+0x68; SwapEnd(sel5,StructMethod) presents+recycles; kern_SwapCancel(sel52,
+// ScalarMethod, 1 scalar = swap-id) RELEASES the swap with NO scanout. So replace
+// the present with a cancel → frees the DCP object (no leak/panic), never drives the
+// panel (no flicker). sel52 kernel semantics are THEORY (AppleCLCD2 table stripped)
+// → gated + A/B. conn+0x14 = IOMFB fd, conn+0x68 = swap-id (RE-confirmed).
+extern kern_return_t IOConnectCallScalarMethod(mach_port_t, uint32_t, const uint64_t *,
+                                               uint32_t, uint64_t *, uint32_t *);
+typedef int (*kern_SwapEnd_t)(void *conn);
+static kern_SwapEnd_t orig_kern_SwapEnd = NULL;
+static int hooked_kern_SwapEnd(void *conn) {
+    if (conn) {
+        uint32_t fd = *(volatile uint32_t *)((char *)conn + 0x14);
+        uint32_t swapid = *(volatile uint32_t *)((char *)conn + 0x68);
+        uint64_t sid = swapid;
+        kern_return_t r = IOConnectCallScalarMethod(fd, 52, &sid, 1, NULL, NULL);
+        static _Atomic int n = 0; int k = atomic_fetch_add(&n, 1);
+        if (k < 5 || (k % 600) == 0)
+            fprintf(stderr, "#### SWAP-CANCEL #%d fd=%u swapid=%u sel52 r=0x%x (recycle, no present)\n",
+                    k, fd, swapid, (int)r);
+        return 0;   /* KERN_SUCCESS — swap freed, no panel present */
+    }
+    return orig_kern_SwapEnd ? orig_kern_SwapEnd(conn) : 0;
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
     dladdr(header, &info);
+    macws_install_status_skip();  // gated /tmp/macws_status_skip
     if(!strncmp(info.dli_fname, SkyLightPath, strlen(SkyLightPath))) {
         // allow coexist with backboardd in WS::Displays::CAWSManager::CAWSManager() + 560
         // if backboardd is running, WindowServer switches to offscreen rendering
@@ -1172,7 +1832,26 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 *check = 0xd503201f; // nop
             }
         });
-        
+
+        // 2026-06-21 — USER DIRECTION: use CA::Render (Metal) path, NEVER CARenderOGLRender.
+        // MetalCompositeCoreAnimation (SkyLight+0x920ac) selects the renderer:
+        //   +0x9208c ldrh w8,[x20,#0x52]; tst w8,#0x240
+        //   +0x9209c b.eq +0x920b0   ; (flags&0x240)==0 → Metal vtable renderer (blraaz x8 @ +0x920d0)
+        //   +0x920a8 bl CARenderOGLRender  ; else → OGL (crashes: layout-3 create_texture memmove NULL)
+        // Backdrop/filter layers set flags&0x240 → OGL → crash. Force b.eq unconditional so
+        // ALL layers use the Metal vtable renderer the majority already use; never OGL.
+        // NULL-guarded by the function's own `cbz x8` at +0x920c8. Witness = VNC shows the
+        // window rendering (not just survival). Gated /tmp/macws_no_ogl or MACWS_NO_OGL.
+        if (getenv("MACWS_NO_OGL") || access("/tmp/macws_no_ogl", F_OK) == 0) {
+            uint32_t *sel = (uint32_t *)((uintptr_t)header + 0x9209c);
+            if (*sel == 0x540000a0u) {   // b.eq +0x920b0
+                ModifyExecutableRegion(sel, sizeof(uint32_t), ^{ *sel = 0x14000005u; }); // b +0x920b0
+                fprintf(stderr, "#### NO-OGL: MetalCompositeCoreAnimation b.eq->b @ %p (force Metal renderer, skip CARenderOGLRender)\n", (void *)sel);
+            } else {
+                fprintf(stderr, "#### NO-OGL: site %p = %#x != b.eq 0x540000a0 — abort patch\n", (void *)sel, *sel);
+            }
+        }
+
         // grant all permissions
         MSHookFunction(MSFindSymbol((MSImageRef)header, "_audit_token_check_tcc_access"), hooked_return_1, NULL);
             
@@ -1347,14 +2026,44 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             if(_NSGetExecutablePath(exe, &exelen) == 0 &&
                strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
                (is_process_running("backboardd") || access("/tmp/ws_headless", F_OK) == 0)) {
-                uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
-                ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
-                    if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
-                        *swapSubmit = 0xd2800000;    // mov x0, #0  (skip present, return KERN_SUCCESS)
-                        fprintf(stderr,
-                            "#### COEXIST: kern_SwapEnd panel-present NOPed (backboardd detected)\n");
-                    }
-                });
+                // 2026-06-22 — the present-NOP is the DCP-panic REGRESSION: the
+                // per-frame swap (SwapBegin/IOMFB sel74) allocates a DCP firmware
+                // object that ONLY the panel-present (this sel=5 call) recycles;
+                // NOPing it leaks one DCP object/frame → DCP RTKit heap OOM →
+                // kernel panic (first seen 06-20, right after coexist auto-detect
+                // 775e65d). /tmp/macws_present_recycle LETS THE PRESENT RUN so the
+                // swap is recycled (no leak) — testing whether the backboardd
+                // ownership conflict it was meant to avoid is actually fatal or
+                // just cosmetic. Default (gate absent): keep the NOP (old behavior).
+                // 2026-06-22 — DEFAULT = swap-cancel (THE panic fix, runtime-VALIDATED):
+                // hook kern_SwapEnd → kern_SwapCancel(sel52) so the per-frame DCP swap
+                // object is RELEASED (no leak → no DCP RTKit OOM panic) WITHOUT presenting
+                // to the panel (no iOS purple flicker). Proven: 22k cancels r=0x0, WS
+                // survived >4min coexist with ZERO DCP panic / reboot (vs reboot in ~90s
+                // with the old present-NOP). Opt-outs for A/B: /tmp/macws_present_nop
+                // (old NOP — LEAKS → panics) and /tmp/macws_present_recycle (present runs
+                // → panel FLICKERS). Both are dead-ends kept only for comparison.
+                if (access("/tmp/macws_present_recycle", F_OK) == 0) {
+                    fprintf(stderr,
+                        "#### COEXIST: present-recycle gate ON — present INTACT (FLICKERS, A/B only)\n");
+                } else if (access("/tmp/macws_present_nop", F_OK) == 0) {
+                    uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
+                    ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
+                        if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
+                            *swapSubmit = 0xd2800000;    // mov x0, #0  (skip present)
+                            fprintf(stderr,
+                                "#### COEXIST: kern_SwapEnd panel-present NOPed (LEAKS→panics, A/B only)\n");
+                        }
+                    });
+                } else {
+                    // DEFAULT: recycle-without-scanout via SwapCancel(sel52).
+                    void *swapEndFn = (void *)((uintptr_t)header + 0x4400);
+                    MSHookFunction(swapEndFn, (void *)hooked_kern_SwapEnd,
+                                   (void **)&orig_kern_SwapEnd);
+                    fprintf(stderr,
+                        "#### COEXIST: kern_SwapEnd → SwapCancel(sel52) recycle-without-scanout "
+                        "@ %p (no leak, no flicker) [DEFAULT panic-fix]\n", swapEndFn);
+                }
             }
         }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
@@ -1601,6 +2310,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             });
         }
+        if (isWindowServer) install_modeset_trace();  // diag, gated /tmp/macws_modeset_trace
     } else if(getenv("MACWS_AGX_NATIVE") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
         // 2026-06-20 — One-shot guard.  AGXMetal13_3 is dlopen'd multiple
         // times across the WS lifetime (initial Metal load + chroot's
@@ -1643,6 +2353,32 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         uint8_t *text = getsectiondata((const struct mach_header_64 *)header,
                                        "__TEXT", "__text", &text_sz);
         intptr_t slide = (intptr_t)text - (intptr_t)text_static_base;
+
+        // ROOT-CAUSE diagnostic + S1 fix for the backdrop-blur memmove(NULL) crash
+        // (gated /tmp/macws_wr3_guard). RE+runtime-confirmed the crash is
+        // getCPUPtr→*(this+0x130)==0; see macws_my_wr3 above. We intercept writeRegion
+        // with an MSHookFunction PROLOGUE patch (runs full C logic: read 0x130/resource,
+        // log, recover the CPU base). MSHookFunction silently no-ops on the dlopen'd
+        // arm64e AGXMetal13_3 UNLESS its page is first made private via VM_PROT_COPY, so
+        // we ModifyExecutableRegion the writeRegion page (a NO-OP write that preserves the
+        // original instruction — only the CoW side effect matters) before installing the
+        // hook. writeRegion start (0x1e5771af8) and the touched insn (+0x6c) share one
+        // page (0x1e5771000), so CoW'ing there makes the prologue patchable.
+        if (getenv("MACWS_WR3_GUARD") || access("/tmp/macws_wr3_guard", F_OK) == 0) {
+            uint32_t *site = (uint32_t *)((uintptr_t)0x1e5771b64 + slide);  // writeRegion+0x6c (same page)
+            uint32_t orig_insn = *site;
+            ModifyExecutableRegion(site, sizeof(uint32_t), ^{ *site = orig_insn; });  // no-op write → CoW page
+            void *wr3 = (void *)((uintptr_t)0x1e5771af8 + slide);  // AGX::Texture<3>::writeRegion
+            macws_install_wr3_guard(wr3);
+            fprintf(stderr, "#### WR3-GUARD: CoW'd page + MSHook writeRegion @ %p\n", wr3);
+        }
+
+        // REAL-BLUR FIX (gated /tmp/macws_blur_route): cache-proof IOSurface routing.
+        // AGXG13GFamilyDevice -[newTextureWithDescriptor:] @ unslid 0x1e574d5ec.
+        if (getenv("MACWS_BLUR_ROUTE") || access("/tmp/macws_blur_route", F_OK) == 0) {
+            void *imp = (void *)((uintptr_t)0x1e574d5ec + slide);
+            macws_install_blur_route(imp);
+        }
 
         // ──────────────────────────────────────────────────────────────────
         // AGX texture wrap gate bypass (env-gated).
@@ -2773,6 +3509,28 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                     self, pre_cls ? class_getName(pre_cls) : "(nil)",
                                     dev, opt, args, argsSize);
                             }
+                            // 2026-06-22 — KernelUserShared fix (RE-confirmed via
+                            // AGXMetal13_3+IOGPU+kernel disasm). -[IOGPUMetalResource
+                            // initWithDevice:options:args:argsSize:] sets
+                            // args+0x14 |= 0x10000 (kIOMemoryKernelUserShared) IFF
+                            // (options & 0x40000); IOGPUSysMemory::withOptions then
+                            // turns that into a full kernel-user-shared CPU mapping.
+                            // Without it the iOS kernel only hands back the one-page
+                            // ClientShared region → 16KB -contents → blur overruns.
+                            // macOS CA/AGX never sets 0x40000 in the chroot. Force it
+                            // on (heap + buffer creates both flow through here) so
+                            // resources get FULL CPU-coherent mappings. Gated
+                            // /tmp/macws_kusershare for A/B; promote to always-on once
+                            // confirmed.
+                            if (access("/tmp/macws_kusershare", F_OK) == 0 ||
+                                getenv("MACWS_KUSERSHARE")) {
+                                static int kus_log = 0;
+                                if (kus_log++ < 4)
+                                    fprintf(stderr,
+                                        "#### KUSERSHARE: opt %#lx -> %#lx (set 0x40000 = request KernelUserShared)\n",
+                                        opt, opt | 0x40000UL);
+                                opt |= 0x40000UL;
+                            }
                             id r = ((id (*)(id, SEL, id, unsigned long, void *, unsigned long))orig_args)(
                                 self, initArgs, dev, opt, args, argsSize);
                             static int post_log = 0;
@@ -3384,7 +4142,12 @@ static void macws_crash_diag_handler(int signo, siginfo_t *info, void *uctx_) {
 }
 
 static void macws_install_crash_diag(void) {
-    if (!getenv("MACWS_AGX_CRASH_DIAG")) return;
+    // Env (MACWS_AGX_CRASH_DIAG) OR the /tmp/macws_exit_trace file gate, so one
+    // diagnostic run captures abort_with_payload + exit()/_exit() + SIGSEGV/
+    // SIGBUS together. Needed because ReportCrash is itself unstable on this
+    // device, so a real signal crash can leave NO .ips — the in-process
+    // handler dumps registers + backtrace to stderr (WSERR) regardless.
+    if (!getenv("MACWS_AGX_CRASH_DIAG") && access("/tmp/macws_exit_trace", F_OK) != 0) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = macws_crash_diag_handler;
@@ -3535,6 +4298,73 @@ static int hooked_abort_with_payload(uint32_t reason_namespace,
     return 0;
 }
 
+// ─── exit()/_exit() diagnostic tracer ────────────────────────────────────
+//
+// WS in coexist sometimes dies on a client (GlassDemo) connect WITHOUT a
+// crash report (.ips) and WITHOUT a JetsamEvent — i.e. it is a VOLUNTARY
+// exit()/_exit(), not abort_with_payload (which would emit an OS_REASON .ips)
+// nor a SIGKILL. SkyLight's CGXServer calls exit() on some fatal-but-
+// "recoverable" conditions (server teardown, port death). This is a NON-
+// intercepting tracer: it logs the caller backtrace + code, then forwards to
+// the real exit so the process terminates exactly as it would. Gated by the
+// FILE /tmp/macws_exit_trace (not an env var) so it can be toggled without a
+// plist edit — editing the WS plist would trip the FAST guardrail → full
+// rebuild.
+typedef void (*macws_exit_t)(int) __attribute__((noreturn));
+static macws_exit_t macws_orig_exit  = NULL;
+static macws_exit_t macws_orig__exit = NULL;
+
+static void macws_dump_exit(const char *which, int code) {
+    char *p = macws_crash_buf;
+    char *end = macws_crash_buf + MACWS_CRASH_BUF_LEN;
+#define AP(...) do { if (p < end) p += snprintf(p, (size_t)(end - p), __VA_ARGS__); } while (0)
+    AP("\n#### MACWS_EXIT_TRACE %s(%d) pid=%d\n", which, code, getpid());
+    void *frames[32];
+    int nf = backtrace(frames, 32);
+    for (int i = 0; i < nf; i++) {
+        Dl_info dli;
+        if (dladdr(frames[i], &dli) && dli.dli_fname) {
+            AP("####     [%2d] %p %s+%#llx (%s)\n", i, frames[i],
+                dli.dli_sname ? dli.dli_sname : "?",
+                (unsigned long long)((uintptr_t)frames[i] -
+                    (uintptr_t)(dli.dli_saddr ? dli.dli_saddr : dli.dli_fbase)),
+                dli.dli_fname);
+        } else {
+            AP("####     [%2d] %p\n", i, frames[i]);
+        }
+    }
+#undef AP
+    size_t len = (size_t)(p - macws_crash_buf);
+    if (len > MACWS_CRASH_BUF_LEN) len = MACWS_CRASH_BUF_LEN;
+    (void)write(STDERR_FILENO, macws_crash_buf, len);
+}
+
+static void hooked_exit(int code) {
+    macws_dump_exit("exit", code);
+    if (macws_orig_exit) macws_orig_exit(code);
+    _exit(code);
+}
+static void hooked__exit(int code) {
+    macws_dump_exit("_exit", code);
+    if (macws_orig__exit) macws_orig__exit(code);
+    __builtin_trap();
+}
+
+static void macws_install_exit_trace(void) {
+    if (access("/tmp/macws_exit_trace", F_OK) != 0) return;
+    static int done = 0; if (done) return; done = 1;
+    void *pe  = dlsym(RTLD_DEFAULT, "exit");
+    void *p_e = dlsym(RTLD_DEFAULT, "_exit");
+    if (pe) {
+        MSHookFunction(pe, (void *)hooked_exit, (void **)&macws_orig_exit);
+        fprintf(stderr, "#### MACWS_EXIT_TRACE: hooked exit @ %p\n", pe);
+    }
+    if (p_e && p_e != pe) {
+        MSHookFunction(p_e, (void *)hooked__exit, (void **)&macws_orig__exit);
+        fprintf(stderr, "#### MACWS_EXIT_TRACE: hooked _exit @ %p\n", p_e);
+    }
+}
+
 // __assert_rtn is what `assert()` macro calls before abort(). CA's
 // MetalContext.mm has classic-assert "Unbalanced Composites" / similar
 // guards. When we park a pipeline-build worker on a pipeline failure
@@ -3587,8 +4417,40 @@ static void macws_install_assert_bypass(void) {
         "#### MACWS_ASSERT_BYPASS __assert_rtn → log+return at %p\n", sym);
 }
 
+// DIAG (gated /tmp/macws_assert_log): log-only __assert_rtn capture. NOT a
+// bypass — it records func/file/line/expr to a truncating file (survives the
+// abort, unlike block-buffered stderr) then STILL calls orig → abort. Used to
+// capture the exact Metal MTLReportFailure assertion (which ends in __assert_rtn)
+// for the IOSurface-wrapped pf552 texture, deterministically, without the global
+// timing perturbation that unbuffered stderr causes.
+static void (*macws_orig_assert_diag)(const char *, const char *, int, const char *) = NULL;
+static void macws_diag_assert_rtn(const char *func, const char *file, int line, const char *expr) {
+    char buf[640];
+    int len = snprintf(buf, sizeof buf, "ASSERT func=%s file=%s line=%d expr=%s\n",
+                       func ?: "?", file ?: "?", line, expr ?: "?");
+    int fd = open("/tmp/macws_assert_last", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) { if (len > 0) write(fd, buf, (size_t)len); close(fd); }
+    int fd2 = open("/tmp/macws_assert.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd2 >= 0) { if (len > 0) write(fd2, buf, (size_t)len); close(fd2); }
+    if (macws_orig_assert_diag) macws_orig_assert_diag(func, file, line, expr);
+    abort();  // belt-and-suspenders: orig should not return, but ensure abort
+}
+static void macws_install_assert_diag(void) {
+    if (access("/tmp/macws_assert_log", F_OK) != 0) return;
+    MSImageRef libsys = MSGetImageByName("/usr/lib/system/libsystem_c.dylib");
+    if (!libsys) return;
+    void *sym = MSFindSymbol(libsys, "___assert_rtn");
+    if (!sym) sym = MSFindSymbol(libsys, "__assert_rtn");
+    if (!sym) return;
+    MSHookFunction(sym, (void *)macws_diag_assert_rtn, (void **)&macws_orig_assert_diag);
+    fprintf(stderr, "#### MACWS_ASSERT_DIAG installed (log-only, still aborts) @ %p\n", sym);
+}
+
 static void macws_install_abort_trace(void) {
-    if (!getenv("MACWS_ABORT_TRACE")) return;
+    // Enabled by env (MACWS_ABORT_TRACE) OR by the /tmp/macws_exit_trace file
+    // gate so a single diagnostic run captures BOTH abort_with_payload (CA
+    // OS_REASON) and plain exit()/_exit() voluntary exits.
+    if (!getenv("MACWS_ABORT_TRACE") && access("/tmp/macws_exit_trace", F_OK) != 0) return;
     MSImageRef libsys = MSGetImageByName(
         "/usr/lib/system/libsystem_kernel.dylib");
     if (!libsys) libsys = MSGetImageByName(
@@ -4236,6 +5098,29 @@ static void macws_vnc_fill_test(void) {
     }
 }
 
+// 2026-06-21 LEAK FIX: OSXvnc's original rfbGetFramebufferUpdateInRect re-captures
+// the desktop every frame via CGDisplayCreateImage → SLSHWCaptureDesktop →
+// WindowServer's _XHWCaptureDesktop allocates a fresh full-screen 15MB IOSurface
+// PER FRAME that isn't recycled → unbounded leak → WS Jetsam + DCP-RTKit OOM panic
+// (symbol-traced via IOSURF_STATS backtrace 2026-06-21). We OVERWRITE the framebuffer
+// with our own content (mmap/gradient) anyway, so the original capture is pure waste.
+// Skip it to stop the leak. Gated /tmp/macws_vnc_skipcap so it can be A/B'd; once
+// proven this should be the default (the orig capture serves no purpose for us).
+// THROTTLE the per-frame capture: the orig CGDisplayCreateImage capture both DRIVES
+// WS's compositing (in coexist there's no physical display, so capture requests are
+// WS's only render trigger — fully skipping it makes WS idle/exit) AND leaks a 15MB
+// WS-side IOSurface per call. So call orig only 1-in-N to keep WS driven while cutting
+// the leak (and DCP-panic) rate ~N×. N from /tmp/macws_vnc_capthrottle content (default
+// 12); absent → no throttle (orig every frame, original behavior).
+static int macws_cap_throttle = -2;
+static int macws_cap_throttle_n(void) {
+    if (macws_cap_throttle == -2) {
+        macws_cap_throttle = 0;
+        FILE *f = fopen("/tmp/macws_vnc_capthrottle", "r");
+        if (f) { int v=0; if (fscanf(f, "%d", &v)==1 && v>0) macws_cap_throttle = v; else macws_cap_throttle = 12; fclose(f); }
+    }
+    return macws_cap_throttle;   // 0 = no throttle
+}
 static char *macws_new_rfbGetFB(void) {
     char *p = macws_orig_rfbGetFB ? macws_orig_rfbGetFB() : NULL;
     macws_vnc_fb = p;
@@ -4243,7 +5128,10 @@ static char *macws_new_rfbGetFB(void) {
     return p;
 }
 static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
-    if (macws_orig_rfbGetFBRect) macws_orig_rfbGetFBRect(x, y, w, h);
+    static unsigned long callno = 0;
+    int n = macws_cap_throttle_n();
+    int do_orig = (n <= 0) ? 1 : ((callno++ % (unsigned)n) == 0);
+    if (macws_orig_rfbGetFBRect && do_orig) macws_orig_rfbGetFBRect(x, y, w, h);
     macws_vnc_fill_test();
 }
 
@@ -4267,7 +5155,90 @@ static void macws_install_osxvnc_hooks(void) {
             macws_vnc_test_on, (void *)mh, (void *)macws_rfbScreen);
 }
 
+// DIAGNOSTIC (gated /tmp/macws_raise_footprint, content=MB default 12288, or env
+// MACWS_FOOTPRINT_MB). lldb-confirmed 2026-06-21: WS is killed by a per-task
+// phys_footprint EXC_RESOURCE high-watermark (limit=5120 MB) — the AGX-native
+// compositor's GPU working set (~6.3GB) genuinely exceeds it, and cutting
+// footprint can't get under (Mempool just allocates more chunks). Raise the
+// task's own footprint limit so we can peel past this wall and test the
+// downstream render path (the layout=3 shadow crash etc.). This is the
+// "necessary component" half of the fix, NOT a standalone band-aid.
+extern kern_return_t task_set_phys_footprint_limit(task_t task, int new_limit_mb, int *old_limit_mb);
+__attribute__((constructor)) static void macws_raise_footprint_limit(void) {
+    if (!getenv("MACWS_RAISE_FOOTPRINT") && access("/tmp/macws_raise_footprint", F_OK) != 0) return;
+    int mb = 12288;
+    const char *e = getenv("MACWS_FOOTPRINT_MB");
+    if (e) mb = atoi(e);
+    else { FILE *f = fopen("/tmp/macws_raise_footprint", "r");
+           if (f) { int v = 0; if (fscanf(f, "%d", &v) == 1 && v > 0) mb = v; fclose(f); } }
+    int old = -1;
+    kern_return_t kr = task_set_phys_footprint_limit(mach_task_self(), mb, &old);
+    fprintf(stderr, "#### FOOTPRINT-RAISE set_phys_footprint_limit(%d MB) kr=%d old=%d MB\n", mb, kr, old);
+}
+
+// B: SYNTHETIC VSYNC DRIVER (gated /tmp/macws_vsync_drive, WindowServer only).
+// In coexist there's no physical vblank, so WS's per-frame composite callback is
+// never armed (gate _WSCurrentSessionDrawsToFramebuffer=0) → windows never get
+// composited into the display dest (only ~3-6%). RE (agent, SkyLight.bndb):
+// update_display_callback@0x18536ed0c composites ALL windows, armed by
+// _CGXScheduleUpdateDisplay@0x18536f9c8. We replace the missing vblank: a 60Hz
+// MAIN-QUEUE dispatch timer calls CGXScheduleUpdateDisplay(NULL,1,0) (must run on
+// the WS main thread for correct session context — hence main queue, not a bg
+// pthread). Result lands in the same SLCADisplay dest IOSurface we already read.
+static void macws_install_vsync_driver(void) {
+    if (access("/tmp/macws_vsync_drive", F_OK) != 0) return;
+    const char *pn = getprogname();
+    if (!pn || !strstr(pn, "WindowServer")) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Defer onto the main queue so it runs AFTER WS sets up its run-loop/session.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            // CGXScheduleUpdateDisplay is a PRIVATE (non-exported) SkyLight symbol —
+            // dlsym fails; MSFindSymbol reads the symbol table incl. local symbols.
+            extern const char *SkyLightPath;
+            MSImageRef sl = MSGetImageByName(SkyLightPath);
+            void *sched = sl ? MSFindSymbol(sl, "_CGXScheduleUpdateDisplay") : NULL;
+            if (!sched && sl) sched = MSFindSymbol(sl, "_SLSScheduleUpdateDisplay");
+            fprintf(stderr, "#### VSYNC-DRIVE: sl=%p CGXScheduleUpdateDisplay=%p\n", (void *)sl, sched);
+            if (!sched) { fprintf(stderr, "#### VSYNC-DRIVE: symbol unresolved\n"); return; }
+            dispatch_source_t t = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                         dispatch_get_main_queue());
+            dispatch_source_set_timer(t, DISPATCH_TIME_NOW, 16ull * NSEC_PER_MSEC, 4ull * NSEC_PER_MSEC);
+            dispatch_source_set_event_handler(t, ^{
+                static _Atomic int n = 0;
+                int k = atomic_fetch_add(&n, 1);
+                if (k < 3 || (k % 120) == 0) fprintf(stderr, "#### VSYNC-DRIVE tick %d\n", k);
+                ((void (*)(void *, int, int))sched)(NULL, 1, 0);
+            });
+            dispatch_resume(t);   // leak intentionally — lives for process lifetime
+            fprintf(stderr, "#### VSYNC-DRIVE: 60Hz main-queue timer installed\n");
+        });
+    });
+}
+
 __attribute__((constructor)) void InitStuff() {
+    // DEBUG (gated /tmp/macws_suspend_ws): SIGSTOP WindowServer in its ctor so
+    // lldb can attach BEFORE AGX/GPU init (setupDeferred queue/heap creates that
+    // return 0xe00002c2). Gated to WindowServer ONLY via progname so other chroot
+    // execs (run_bash helpers, MTLCompilerService, etc.) don't wedge — cf. the
+    // fork/exit-trace deadlock [[fork-deadlock-from-exit-trace-diagnostic]].
+    // Resume with: process signal SIGCONT (or `continue` after breakpoints set).
+    if (access("/tmp/macws_suspend_ws", F_OK) == 0) {
+        const char *pn = getprogname();
+        if (pn && strstr(pn, "WindowServer")) {
+            fprintf(stderr, "#### MACWS_SUSPEND_WS: SIGSTOP pid=%d — attach lldb, set bps, then SIGCONT\n", getpid());
+            raise(SIGSTOP);
+            fprintf(stderr, "#### MACWS_SUSPEND_WS: resumed pid=%d\n", getpid());
+        }
+    }
+    macws_install_vsync_driver();   // B: drive coexist composite (gated /tmp/macws_vsync_drive)
+    // DIAG (gated /tmp/macws_lbuf_stderr): make stderr LINE-buffered (_IOLBF) so
+    // Metal's MTLReportFailure/__assert_rtn message (which ends in \n) flushes to
+    // WindowServer.err before abort(). Far lighter than _IONBF (per-char) — only
+    // flushes on newline, which fprintf already emits, so minimal perturbation.
+    if (access("/tmp/macws_lbuf_stderr", F_OK) == 0) {
+        setvbuf(stderr, NULL, _IOLBF, 4096);
+    }
     EnableJIT();
     macws_install_crash_diag();
     macws_install_osxvnc_hooks();
@@ -4321,6 +5292,8 @@ __attribute__((constructor)) void InitStuff() {
     }
     // Optional: trace which abort_with_payload site fires (opt-in via env).
     macws_install_abort_trace();
+    // Optional: trace voluntary exit()/_exit() call sites (file-gated).
+    macws_install_exit_trace();
     // Assert bypass needs no env gate — it's strictly defensive against
     // CA::OGL::MetalContext assert() calls that fire as a downstream
     // consequence of a failed pipeline build.
@@ -4664,12 +5637,92 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
             Dl_info di;
             void *ra1 = __builtin_return_address(0);
             void *ra2 = __builtin_return_address(1);
-            const char *sym1 = "?", *sym2 = "?";
-            if (dladdr(ra1, &di) && di.dli_sname) sym1 = di.dli_sname;
-            if (dladdr(ra2, &di) && di.dli_sname) sym2 = di.dli_sname;
-            fprintf(stderr,
-                "#### IOSURF_STATS n=%lu cumulative_bytes=%lu MB this_size=%zu KB caller1=%s caller2=%s\n",
-                my_n, my_total / (1024*1024), my_bytes / 1024, sym1, sym2);
+            void *raN[8] = { ra1, ra2, __builtin_return_address(2), __builtin_return_address(3),
+                             __builtin_return_address(4), __builtin_return_address(5),
+                             __builtin_return_address(6), __builtin_return_address(7) };
+            fprintf(stderr, "#### IOSURF_STATS n=%lu cum=%lu MB sz=%zu KB\n",
+                    my_n, my_total / (1024*1024), my_bytes / 1024);
+            for (int ci = 0; ci < 8; ci++) {
+                const char *s = "?";
+                if (raN[ci] && dladdr(raN[ci], &di) && di.dli_sname) s = di.dli_sname;
+                fprintf(stderr, "  c%d=%s\n", ci+1, s);
+            }
+            (void)ra2;
+        }
+    }
+    // ─── VNC capture-surface RECYCLE (gated /tmp/macws_vnc_cappool) ───────────
+    // The VNC screen-capture path (WS::Capture::create_iosurface_for_window_list →
+    // CompositorMetal::CreateCaptureSurface → CaptureSurfaceMetal::CreateMetalBacking,
+    // driven by OSXvnc's per-frame CGDisplayCreateImage → _XHWCaptureDesktop) allocates
+    // a FRESH full-screen 15MB IOSurface per frame that never frees → n→751 → Jetsam +
+    // DCP-RTKit OOM panic (symbol-traced 2026-06-21). In coexist the captures are
+    // load-bearing (only render trigger) so we can't skip/throttle them. Instead POOL:
+    // reuse ONE retained surface per (w,h,pf) so n stays ~1 at full capture rate. Scoped
+    // to the capture path via caller symbol (other surfaces untouched). __thread reent
+    // guard avoids the libmachook double-interpose pooling twice.
+    {
+        static int s_cappool = -1;
+        if (s_cappool < 0) s_cappool = (access("/tmp/macws_vnc_cappool", F_OK) == 0);
+        static __thread int cap_reent = 0;
+        if (s_cappool && !cap_reent && properties_cf &&
+            CFGetTypeID(properties_cf) == CFDictionaryGetTypeID()) {
+            int wi=0, hi=0, bi=4; uint32_t cpf=0;
+            CFNumberRef cw =(CFNumberRef)CFDictionaryGetValue(properties_cf,(const void*)CFSTR("IOSurfaceWidth"));
+            CFNumberRef ch =(CFNumberRef)CFDictionaryGetValue(properties_cf,(const void*)CFSTR("IOSurfaceHeight"));
+            CFNumberRef cbe=(CFNumberRef)CFDictionaryGetValue(properties_cf,(const void*)CFSTR("IOSurfaceBytesPerElement"));
+            CFNumberRef cpn=(CFNumberRef)CFDictionaryGetValue(properties_cf,(const void*)CFSTR("IOSurfacePixelFormat"));
+            if (cw &&CFGetTypeID(cw )==CFNumberGetTypeID()) CFNumberGetValue(cw ,kCFNumberSInt32Type,&wi);
+            if (ch &&CFGetTypeID(ch )==CFNumberGetTypeID()) CFNumberGetValue(ch ,kCFNumberSInt32Type,&hi);
+            if (cbe&&CFGetTypeID(cbe)==CFNumberGetTypeID()) CFNumberGetValue(cbe,kCFNumberSInt32Type,&bi);
+            if (cpn&&CFGetTypeID(cpn)==CFNumberGetTypeID()) CFNumberGetValue(cpn,kCFNumberSInt32Type,&cpf);
+            if ((size_t)wi*(size_t)hi*(size_t)bi >= 0x400000) {  // only big (full-screen)
+                int is_cap = 0; Dl_info cdi;
+                void *rr[6] = { __builtin_return_address(0), __builtin_return_address(1),
+                                __builtin_return_address(2), __builtin_return_address(3),
+                                __builtin_return_address(4), __builtin_return_address(5) };
+                // Pool BOTH the VNC capture path AND the dominant leak: the
+                // display-page churn CA::WindowServer::Display::allocate_iosurface ←
+                // IOMFBDisplay (pf=643969848, the page-recycle predicate discards it
+                // every frame). Reusing one surface per (w,h,pf) IS the swapchain the
+                // predicate failed to keep.
+                // Pool ALL big (>=4MB) full-screen surfaces in WS by (w,h,pf): the
+                // churn is across multiple allocators (capture BGRA, display-page
+                // 643969848 via Display::allocate_iosurface, composite 1380411457 via
+                // start_composite). Per-allocator symbol matching kept missing some;
+                // for a full-screen WS surface of a churning format, reuse-by-(w,h,pf)
+                // is the swapchain behavior. (Coexist WS has no unique-per-frame
+                // full-screen consumer that needs distinct buffers — the page-recycle
+                // predicate WANTED to reuse but discarded.)
+                is_cap = 1; (void)cdi; (void)rr;
+                { static int dl=0; if (dl++<16) { const char *s2="?",*s3="?"; Dl_info d2;
+                    if (rr[2]&&dladdr(rr[2],&d2)&&d2.dli_sname) s2=d2.dli_sname;
+                    if (rr[3]&&dladdr(rr[3],&d2)&&d2.dli_sname) s3=d2.dli_sname;
+                    fprintf(stderr,"#### CAPDBG is_cap=%d %dx%d pf=%u sz=%zuKB c2=%.34s c3=%.34s\n",
+                            is_cap,wi,hi,cpf,(size_t)wi*hi*bi/1024,s2,s3); } }
+                if (is_cap) {
+                    static NSMutableDictionary *capPool = nil; static dispatch_once_t capOnce;
+                    dispatch_once(&capOnce, ^{ capPool = [NSMutableDictionary new]; });
+                    NSString *k = [NSString stringWithFormat:@"%dx%d-%u-%d", wi, hi, cpf, bi];
+                    IOSurfaceRef out = NULL;
+                    @synchronized(capPool) {
+                        NSValue *v = capPool[k];
+                        if (v) { out = (IOSurfaceRef)[v pointerValue]; CFRetain(out); }
+                    }
+                    if (!out) {
+                        cap_reent = 1;
+                        @try { out = IOSurfaceCreate((NSDictionary *)properties_cf); }
+                        @finally { cap_reent = 0; }   // ALWAYS reset (else stuck=>pool dies)
+                        if (out) {
+                            CFRetain(out);  // pool keeps a persistent ref
+                            @synchronized(capPool) { capPool[k] = [NSValue valueWithPointer:out]; }
+                            static int nl=0; if (nl++<24) fprintf(stderr,"#### CAPPOOL NEW %s -> %p (poolN=%lu)\n",[k UTF8String],(void*)out,(unsigned long)capPool.count);
+                        }
+                    } else {
+                        static int hl=0; if (hl++<8) fprintf(stderr,"#### CAPPOOL HIT %s -> %p\n",[k UTF8String],(void*)out);
+                    }
+                    return out;
+                }
+            }
         }
     }
     if (!properties_cf) {
@@ -4760,6 +5813,24 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
 }
 DYLD_INTERPOSE(IOSurfaceCreate_safe, IOSurfaceCreate);
 
+// DIAG (gated /tmp/macws_dest_diag): tag cross-process IOSurface origin. Logs every
+// full-screen IOSurfaceLookupFromMachPort so we can tell whether the compose-dest's
+// surfref (logged by DEST2) came from a cross-process lookup (macwsallocd) or an
+// in-process create (CAPPOOL NEW). Interposer's call to the real fn does NOT recurse
+// (same pattern as IOSurfaceCreate_safe → IOSurfaceCreate).
+IOSurfaceRef IOSurfaceLookupFromMachPort_log(mach_port_t port) {
+    IOSurfaceRef s = IOSurfaceLookupFromMachPort(port);
+    if (s && access("/tmp/macws_dest_diag", F_OK) == 0) {
+        size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s);
+        if (w * h >= 0x100000) {
+            static int ll = 0;
+            if (ll++ < 32) fprintf(stderr, "#### IOSLOOKUP-FS port=%u -> %p %zux%zu\n", port, (void *)s, w, h);
+        }
+    }
+    return s;
+}
+DYLD_INTERPOSE(IOSurfaceLookupFromMachPort_log, IOSurfaceLookupFromMachPort);
+
 // IOKit
 CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
     // printf("debugbydcmmc IOServiceNameMatching called with name: %s\n", name);
@@ -4777,6 +5848,10 @@ CFMutableDictionaryRef IOServiceNameMatching_new(const char *name) {
 
 CFDictionaryRef IOServiceMatching_new(const char *name) {
     // printf("debugbydcmmc IOServiceMatching called with name: %s\n", name);
+    if (name && strstr(name, "IOMobileFramebuffer") &&
+        access("/tmp/macws_iomfb_trace", F_OK) == 0) {
+        fprintf(stderr, "#### IOSVC-MATCH IOServiceMatching(\"%s\")\n", name);
+    }
     if (strcmp("IOSurfaceRoot", name) == 0) {
         return IOServiceMatching("IOCoreSurfaceRoot");
     } else if (strcmp("IOAccelerator", name) == 0) {
@@ -4790,6 +5865,12 @@ CFDictionaryRef IOServiceMatching_new(const char *name) {
 }
 DYLD_INTERPOSE(IOServiceNameMatching_new, IOServiceNameMatching);
 DYLD_INTERPOSE(IOServiceMatching_new, IOServiceMatching);
+
+// (IOMFB service matching CONFIRMED working in chroot — IOServiceMatching
+// "IOMobileFramebuffer" + IOServiceGetMatchingService return valid svc handles.
+// The per-call GetMatchingService interposes were removed: they added fprintf
+// volume on every IOService lookup which perturbed WS startup (caused the
+// non-deterministic early deaths). Keep matching unhooked.)
 
 #ifndef FORCE_M1_DRIVER
 kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t *connect) {
@@ -4927,6 +6008,47 @@ extern uint32_t macws_get_current_iosurface_id(void);
 static struct { uint64_t clientID, iosGID, size; } g_agxIdMap[128];
 static int g_agxIdMapCount;
 
+// ─── type=0x82 IOSurface→DCP dedup (gated /tmp/macws_t82dedup or MACWS_T82_DEDUP) ──
+// RE+runtime-confirmed 2026-06-21: of 378 sel=0xa type=0x82 (IOSurface-backed)
+// ResCreates during WS startup, 364 re-wrap the SAME IOSurface (id 0x17); only 4
+// distinct surfaces total. Each type=0x82 create registers the surface with the
+// DCP (display footprint) in IOGPUDevice::create_resource_iosurface →
+// newResourceWithIOSurface, and the DCP RTKit firmware heap fills → kernel panic
+// "DCP PANIC - CXXnew:2208" → device reboot. (Distinct from the host-side capture
+// IOSurface leak the cappool fixes; see [[dcp-oom-is-dominant-blocker-after-leak-fix]].)
+//
+// Fix: dedup by IOSurfaceID. Keep ONE kernel resource alive per distinct surface
+// (bounded to T82_MAX; the kernel frees them when WS exits and closes the UC), return
+// its cached outStruct for every repeat wrap (NO kernel call → NO new DCP
+// registration), and SWALLOW frees whose scalar in[0] is an owned resource-id.
+// Safe-by-construction against double-free: owned resource-ids are NEVER kernel-freed,
+// so the kernel can't recycle the id and a stale free can't hit a different resource.
+// Correlation (RE of ios/IOGPU): create (sel 0x9) returns the resource-id at
+// OUT[+0x1c]; _IOGPUResourceCreate stores it at resource->0x30; _ioGPUResourceFinalize
+// frees via IOConnectCallMethod(sel=0xa, inCnt=1, in[0]=resource->0x30). So
+// owned-id == OUT[+0x1c] == free's in[0]. A fixed display/composite surface re-wrapped
+// every frame SHOULD reuse one resource, so returning the same one is also correct.
+#define MACWS_T82_MAX 32
+static struct { uint32_t iosID; uint32_t resID; size_t outLen; unsigned char out[0x80]; } g_t82[MACWS_T82_MAX];
+static int g_t82n;
+static int g_t82_on = -1;
+static int macws_t82_dedup_on(void) {
+    // 2026-06-22 — DEFAULT-ON (was opt-in via /tmp/macws_t82dedup). The dedup IS
+    // the principled fix for the DCP RTKit firmware-heap OOM panic that reboots
+    // the device: it keeps exactly ONE live kernel resource per distinct
+    // IOSurfaceID and serves the cached outStruct for every repeat wrap, so a
+    // fixed display/composite surface re-wrapped every frame reuses one DCP
+    // registration instead of issuing a fresh one (RE+runtime: ~189-378 type=0x82
+    // creates collapse to ~4 distinct surfaces). NOT a blunt nop/cap — it restores
+    // the correct one-resource-per-surface invariant and is safe-by-construction
+    // against double-free (owned ids are never kernel-freed). See
+    // [[dcp-oom-is-dominant-blocker-after-leak-fix]]. Opt-out:
+    // /tmp/macws_no_t82dedup or MACWS_NO_T82_DEDUP (A/B back to per-call creates).
+    if (g_t82_on < 0)
+        g_t82_on = (getenv("MACWS_NO_T82_DEDUP") || access("/tmp/macws_no_t82dedup", F_OK) == 0) ? 0 : 1;
+    return g_t82_on;
+}
+
 // 2026-06-19 — sel=0xa double-translation root cause:
 // `launchdchrootexec` DYLD_INSERTs BOTH `libmachook.dylib` (arm64e) and
 // `libmachook_arm64.dylib` (arm64). For arm64 chroot binaries (bash, our
@@ -4953,10 +6075,99 @@ static int caller_is_libmachook(void *ret) {
     return strncmp(base, "libmachook", 10) == 0;
 }
 
+// ─── IOMFB per-selector RATE counter (gated /tmp/macws_iomfb_rate_diag) ──────
+// PHASE-0 diagnostic for the DCP RTKit firmware-heap OOM panic
+// (`DCP PANIC - CXXnew:2208 - iomfb_ap_callee_0(21)`). The per-frame call that
+// allocates a DCP object is NOT IOGPU (type=0x82 ResCreate is deduped to ~4)
+// and NOT the already-NOP'd panel-present (kern_SwapEnd sel=5). It must be
+// another non-IOGPU (IOMobileFramebuffer) UC selector in the swap lifecycle.
+// Count every non-IOGPU IOConnect call by (translated) selector and, once per
+// wall-second, append the per-second + cumulative counts to a fsync'd file that
+// SURVIVES the panic-reboot — so ONE short no-VNC-client run reveals the
+// per-frame swap selector by its rate, with no kernel disassembly. Read-only;
+// cannot worsen the panic.
+static int macws_iomfb_rate_on(void) {
+    static int on = -1;
+    if (on < 0) on = (access("/tmp/macws_iomfb_rate_diag", F_OK) == 0) ? 1 : 0;
+    return on;
+}
+static _Atomic unsigned long long g_iomfb_sel[512];
+static _Atomic unsigned long long g_iomfb_sel_tot[512];
+static void macws_iomfb_rate_tick(uint32_t selector) {
+    if (!macws_iomfb_rate_on()) return;
+    uint32_t s = (selector < 512) ? selector : 511;
+    atomic_fetch_add(&g_iomfb_sel[s], 1ULL);
+    atomic_fetch_add(&g_iomfb_sel_tot[s], 1ULL);
+    static _Atomic long last_sec = 0;
+    long now = (long)time(NULL);
+    long prev = atomic_load(&last_sec);
+    if (now != prev && atomic_compare_exchange_strong(&last_sec, &prev, now)) {
+        char buf[3072]; int n = 0;
+        n += snprintf(buf + n, sizeof(buf) - n, "#### IOMFB-RATE t=%ld:", now);
+        for (uint32_t i = 0; i < 512 && n < (int)sizeof(buf) - 96; i++) {
+            unsigned long long c = atomic_exchange(&g_iomfb_sel[i], 0ULL);
+            if (c) n += snprintf(buf + n, sizeof(buf) - n, " sel%u=%llu/s(tot%llu)",
+                                 i, c, atomic_load(&g_iomfb_sel_tot[i]));
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "\n");
+        if (n > 0) {
+            (void)write(STDERR_FILENO, buf, (size_t)n);
+            int fd = open("/tmp/macws_iomfb_rate", O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) { (void)write(fd, buf, (size_t)n); fsync(fd); close(fd); }
+        }
+    }
+}
+
+// One-shot signature dump for a non-IOGPU (IOMFB) selector — captures which
+// IOConnect variant it uses + the in/out counts so the sel74 (per-frame swap)
+// intercept can fake the right return shape instead of blind-NOPing. Gated by
+// the same /tmp/macws_iomfb_rate_diag file. `phase` = "pre"/"post" the call.
+static void macws_iomfb_sig(const char *hook, const char *phase, uint32_t sel,
+        uint32_t inCnt, size_t inSC, const uint64_t *out, uint32_t *outCnt,
+        const void *outStruct, size_t *outSC, IOReturn r) {
+    if (!macws_iomfb_rate_on()) return;
+    if (sel >= 512) return;
+    static _Atomic unsigned char dumped[512];
+    unsigned char z = 0;
+    if (!atomic_compare_exchange_strong(&dumped[sel], &z, 1)) return;
+    char buf[320]; int n = snprintf(buf, sizeof buf,
+        "#### IOMFB-SIG %s/%s sel=%u inCnt=%u inSC=%zu outCnt=%u outSC=%zu r=%#x out0=%#llx out1=%#llx\n",
+        hook, phase, sel, inCnt, inSC,
+        outCnt ? *outCnt : 0xffffffffu, outSC ? *outSC : (size_t)-1, r,
+        (out && outCnt && *outCnt >= 1) ? (unsigned long long)out[0] : 0ULL,
+        (out && outCnt && *outCnt >= 2) ? (unsigned long long)out[1] : 0ULL);
+    (void)outStruct;
+    if (n > 0) {
+        (void)write(STDERR_FILENO, buf, (size_t)n);
+        int fd = open("/tmp/macws_iomfb_rate", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) { (void)write(fd, buf, (size_t)n); fsync(fd); close(fd); }
+    }
+}
+
+// Captured AGX device user-client connection (the one ResCreate sel=0x9 uses).
+// Exposed so the buffer CPU-map experiment (clientMemoryForType /
+// IOConnectMapMemory64) in Metal_hooks.x can map a resource's full CPU memory.
+_Atomic io_connect_t g_agx_conn = 0;
+__attribute__((visibility("default"))) io_connect_t macws_get_agx_conn(void) {
+    return atomic_load(&g_agx_conn);
+}
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
+    if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    if (!skip && !IOConnectIsIOGPU(client)) {
+        macws_iomfb_rate_tick(selector);
+        macws_iomfb_sig("M", "pre", selector, inCnt, inStructCnt, in, &inCnt, inStruct, outStructCnt, 0);
+        // NOTE: a prior attempt skipped sel74 (SwapBegin) here to avoid the
+        // per-frame DCP alloc — but skipping the ALLOC breaks WS startup (WS
+        // needs the swap; WS died at startup → respawn storm → panic anyway,
+        // runtime-confirmed 2026-06-22). The DCP swap object must be RECYCLED,
+        // not un-allocated — that happens by letting the panel-present run (see
+        // the /tmp/macws_present_recycle gate in loadImageCallback), so the
+        // sel74 intercept was removed.
+    }
     if(IOConnectIsIOGPU(client) && selector == 0x100 && outStructCnt && *outStructCnt == 0x78) *outStructCnt = 0x70;
     // sel=0x9 (ResCreate): WAS bumping outStructCnt 0x50 → 0x10000 here based
     // on a misread of `IOGPUDevice::new_resource <+76>`. Standalone iOS-native
@@ -5034,6 +6245,44 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // not a size).
             uint32_t sz32 = *(const uint32_t *)(src + 0x58);
             uint64_t nb = sz32 ? sz32 : 0x1000;
+            // FOOTPRINT-CAP EXPERIMENT (gated MACWS_CAP_HEAP, cap MB via
+            // MACWS_HEAP_CAP_MB, default 256). RE-confirmed 2026-06-21:
+            // these type=0 AGX heaps are charged to WS phys_footprint as
+            // wired GPU memory (RSS stays ~80MB but footprint hits the
+            // 5120MB EXC_RESOURCE watermark → WS killed). Idle alloc is
+            // ~3.9GB (13x128MiB + 3x384MiB + 1x939MiB CodeHeap); a client
+            // app's render adds ~5GB (11x384MiB) → >5120MB. This caps the
+            // byte-count we pass to the iOS kernel. EXPERIMENT: must verify
+            // rendering still produces content — if AGX overruns the capped
+            // heap it will fault. Back off / raise the cap if so.
+            // Sentinel /tmp/macws_cap_heap (content = cap MB, default 256) so it
+            // toggles with a FAST libmachook-only build (no WS-plist edit).
+            // Env MACWS_HEAP_CAP_MB overrides the cap value.
+            static long s_cap = -2;
+            if (s_cap == -2) {
+                s_cap = -1;
+                if (getenv("MACWS_CAP_HEAP") || access("/tmp/macws_cap_heap", F_OK) == 0) {
+                    s_cap = 256;
+                    const char *mb = getenv("MACWS_HEAP_CAP_MB");
+                    if (mb) s_cap = atol(mb);
+                    else {
+                        FILE *cf = fopen("/tmp/macws_cap_heap", "r");
+                        if (cf) { long v = 0; if (fscanf(cf, "%ld", &v) == 1 && v > 0) s_cap = v; fclose(cf); }
+                    }
+                    fprintf(stderr, "#### FOOTPRINT-CAP enabled, cap=%ld MB\n", s_cap);
+                }
+            }
+            if (s_cap > 0) {
+                uint64_t capb = (uint64_t)s_cap << 20;
+                if (nb > capb) {
+                    static int caplog = 0;
+                    if (caplog++ < 12)
+                        fprintf(stderr, "#### FOOTPRINT-CAP heap %#llx (%lluMB) → %#llx (%ldMB)\n",
+                                (unsigned long long)nb, (unsigned long long)(nb>>20),
+                                (unsigned long long)capb, s_cap);
+                    nb = capb;
+                }
+            }
             *(uint64_t *)(shadowbuf + 0x40) = nb;
             agxHeapSz = nb;
             patched = 1;
@@ -5306,6 +6555,36 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 old_38, *(const uint32_t *)(shadowbuf + 0x38),
                 (unsigned long long)old_40, (unsigned long long)old_58);
         }
+        // 2026-06-22 — CPU-MAP-SIZE FIX (gated /tmp/macws_cpusize). RE+runtime
+        // confirmed: for type=0 BUFFER resources the chroot's macOS-AGX sets the
+        // CPU-mappable byte-count at args+0x40 to 0x1000 (4KB → one 16KB page),
+        // while the buffer's real size sits at args+0x48 (e.g. 0x40000=256KB).
+        // The iOS kernel maps exactly page_round(args+0x40), so -[buffer contents]
+        // comes back 16KB and any full-length CPU write overruns → SIGSEGV/SIGBUS
+        // (the backdrop-blur crash). The compiler codeheap PROVES the kernel
+        // honors a large args+0x40 (it sets +0x40=full → OUT[+0x48]=full CPU map),
+        // and a native iOS process gets full maps the same way. Fix: set
+        // args+0x40 = args+0x48 so the kernel maps the WHOLE buffer CPU-side →
+        // GPU-coherent full-length contents → real blur, no kcall / no proxy.
+        if (agxType == 0 &&
+            (access("/tmp/macws_cpusize", F_OK) == 0 || getenv("MACWS_CPUSIZE"))) {
+            const unsigned char *isrc = (const unsigned char *)inStruct;
+            uint64_t cpu_sz = *(const uint64_t *)(isrc + 0x40);
+            uint64_t tot_sz = *(const uint64_t *)(isrc + 0x48);
+            uint64_t v58    = *(const uint64_t *)(isrc + 0x58);
+            // Only plain buffer resources: +0x58==0 (a pinned/codeheap-class
+            // resource carries a GPU VA at +0x58 and must NOT have +0x40 rewritten
+            // — runtime-confirmed it carries a special meaning there).
+            if (v58 == 0 && tot_sz >= 0x8000 && tot_sz > cpu_sz && cpu_sz <= 0x4000) {
+                *(uint64_t *)(shadowbuf + 0x40) = tot_sz;
+                patched = 1;
+                static int cs_log = 0;
+                if (cs_log++ < 8)
+                    fprintf(stderr,
+                        "#### CPUSIZE: type=0 +0x40 %#llx -> %#llx (= +0x48 total; full CPU map)\n",
+                        (unsigned long long)cpu_sz, (unsigned long long)tot_sz);
+            }
+        }
         if(patched) inStruct = shadowbuf;
         // POST-patch dump for sel=0x9 type=0x80: capture EXACT bytes that
         // hit the kernel — to compare against iOS-native probe args that
@@ -5327,7 +6606,110 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
         }
     }
-    IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // ─── type=0x82 IOSurface→DCP dedup: create cache-hit / free swallow ───
+    int    t82_hit = 0;        // create satisfied from cache → skip kernel (no DCP reg)
+    int    t82_free_sw = 0;    // free of an owned resource → swallow (never kernel-free)
+    uint32_t t82_iosID = 0;    // create's IOSurfaceID (for post-call cache on miss)
+    if (macws_t82_dedup_on() && IOConnectIsIOGPU(client) && !skip) {
+        if (agxIsRes && agxType == 0x82) {
+            t82_iosID = *(const uint32_t *)((const unsigned char *)inStruct + 0x30);
+            if (t82_iosID) {
+                for (int i = 0; i < g_t82n; i++) if (g_t82[i].iosID == t82_iosID) {
+                    if (outStruct && outStructCnt && *outStructCnt >= g_t82[i].outLen) {
+                        memcpy(outStruct, g_t82[i].out, g_t82[i].outLen);
+                        *outStructCnt = g_t82[i].outLen;
+                        t82_hit = 1;
+                        static int hl = 0; if (hl++ < 16)
+                            fprintf(stderr, "#### T82 DEDUP HIT ios=%#x resID=%#x (n=%d)\n",
+                                    t82_iosID, g_t82[i].resID, g_t82n);
+                    }
+                    break;
+                }
+            }
+        } else if (selector == 0xa && inCnt == 1 && in && inStructCnt == 0) {
+            uint32_t resID = (uint32_t)in[0];
+            for (int i = 0; i < g_t82n; i++) if (g_t82[i].resID == resID) {
+                t82_free_sw = 1;
+                static int fl = 0; if (fl++ < 16)
+                    fprintf(stderr, "#### T82 DEDUP SWALLOW free resID=%#x\n", resID);
+                break;
+            }
+        }
+    }
+    IOReturn r = (t82_hit || t82_free_sw)
+        ? (IOReturn)0 /* kIOReturnSuccess */
+        : IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // type=0x82 create cache-MISS that succeeded: record the kernel resource so future
+    // wraps of this IOSurface reuse it (and its single DCP registration).
+    if (macws_t82_dedup_on() && IOConnectIsIOGPU(client) && !skip && !t82_hit &&
+        agxIsRes && agxType == 0x82 && t82_iosID && r == 0 &&
+        outStruct && outStructCnt && *outStructCnt >= 0x20) {
+        size_t ol = *outStructCnt; if (ol > sizeof(g_t82[0].out)) ol = sizeof(g_t82[0].out);
+        uint32_t resID = *(const uint32_t *)((const unsigned char *)outStruct + 0x1c);
+        int idx = -1;
+        for (int i = 0; i < g_t82n; i++) if (g_t82[i].iosID == t82_iosID) { idx = i; break; }
+        if (idx < 0 && g_t82n < MACWS_T82_MAX) idx = g_t82n++;
+        if (idx >= 0) {
+            g_t82[idx].iosID = t82_iosID; g_t82[idx].resID = resID; g_t82[idx].outLen = ol;
+            memcpy(g_t82[idx].out, outStruct, ol);
+            static int nl = 0; if (nl++ < 16)
+                fprintf(stderr, "#### T82 DEDUP CACHE ios=%#x resID=%#x outLen=%zu (n=%d)\n",
+                        t82_iosID, resID, ol, g_t82n);
+        }
+    }
+    // CM-IOC: every non-IOGPU IOConnect made WHILE the QC IOMFBDisplay ctor runs
+    // (g_in_createmode>0, set by macws_hook_disp_init). The mode/timing query that
+    // gates the mode-set is in here — logs sel+kr+out so we see exactly which one
+    // and whether it fails at kr or returns success+empty.
+    if (atomic_load(&g_in_createmode) > 0 && !IOConnectIsIOGPU(client)) {
+        size_t osc = outStructCnt ? *outStructCnt : 0;
+        fprintf(stderr, "#### CM-IOC c=%u sel=%u inCnt=%u inSC=%zu outSC=%zu kr=%#x",
+                client, selector, inCnt, inStructCnt, osc, r);
+        const uint8_t *o = (const uint8_t *)outStruct;
+        if (o && osc) { fprintf(stderr, " outS="); for (size_t i=0;i<osc&&i<48;i++) fprintf(stderr,"%02x",o[i]); }
+        fprintf(stderr, "\n");
+    }
+    // IOMFB-FAIL (gated /tmp/macws_iomfb_trace): log EVERY non-IOGPU IOConnect that
+    // returns an ERROR (kr != 0), with NO dedup — the IOMFBDisplay-ctor mode/timing
+    // query (-> IOKit MIG) errors in the chroot and is the gate that skips the
+    // mode-set. Capturing every failure (sel + kr + in/out) pinpoints it without
+    // the slide/signature risk of hooking IOMFB framework functions directly.
+    if (!skip && r != 0 && !IOConnectIsIOGPU(client) &&
+        access("/tmp/macws_iomfb_trace", F_OK) == 0) {
+        static int failN = 0;
+        if (failN++ < 64) {
+            size_t osc = outStructCnt ? *outStructCnt : 0;
+            fprintf(stderr, "#### IOMFB-FAIL c=%u sel=%u inCnt=%u inSC=%zu outSC=%zu kr=%#x",
+                    client, selector, inCnt, inStructCnt, osc, r);
+            const uint8_t *ip = (const uint8_t *)inStruct;
+            if (ip && inStructCnt) { fprintf(stderr, " inS="); for (size_t i=0;i<inStructCnt&&i<32;i++) fprintf(stderr,"%02x",ip[i]); }
+            fprintf(stderr, "\n");
+        }
+    }
+    // IOMFB-TRACE (gated /tmp/macws_iomfb_trace): capture NON-IOGPU IOConnect
+    // calls (IOMFB display-mode/timing/power, IOSurface, HID) + their returns,
+    // deduped per (client,selector), to find which selector should populate the
+    // display scanout config / mode but returns error/garbage in the chroot.
+    // 2026-06-21 — diagnostic for the current_page_surface page-leak root
+    // (display never reaches a valid powered-on mode). Read-only logging.
+    if (!skip && !IOConnectIsIOGPU(client) &&
+        access("/tmp/macws_iomfb_trace", F_OK) == 0) {
+        static struct { io_connect_t c; uint32_t s; } seen[96];
+        static int seenN = 0;
+        int dup = 0;
+        for (int i = 0; i < seenN; i++) if (seen[i].c == client && seen[i].s == selector) { dup = 1; break; }
+        if (!dup && seenN < 96) {
+            seen[seenN].c = client; seen[seenN].s = selector; seenN++;
+            size_t osc = outStructCnt ? *outStructCnt : 0;
+            size_t oc  = outCnt ? *outCnt : 0;
+            fprintf(stderr, "#### IOMFB-TRACE c=%u sel=%u inCnt=%u inSC=%zu outCnt=%zu outSC=%zu kr=%#x",
+                    client, selector, inCnt, inStructCnt, oc, osc, r);
+            const uint8_t *o = (const uint8_t *)outStruct;
+            if (o && osc) { fprintf(stderr, " outS="); for (size_t i = 0; i < osc && i < 40; i++) fprintf(stderr, "%02x", o[i]); }
+            if (out && oc) { fprintf(stderr, " out64="); for (size_t i = 0; i < oc && i < 6; i++) fprintf(stderr, "%llx,", (unsigned long long)out[i]); }
+            fprintf(stderr, "\n");
+        }
+    }
     // Log the kr for sel=0x9 type=0x80 once so we can pair it with the
     // POST-PATCH dump above.
     if (agxIsRes && agxType == 0x80) {
@@ -5537,8 +6919,38 @@ IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, c
 }
 IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
-    if (!caller_is_libmachook(__builtin_return_address(0)))
+    int sm_skip = caller_is_libmachook(__builtin_return_address(0));
+    if (!sm_skip)
         selector = IOConnectTranslateSelector(client, selector);
+    if (!sm_skip && !IOConnectIsIOGPU(client)) {
+        macws_iomfb_rate_tick(selector);
+        macws_iomfb_sig("S", "pre", selector, 0, inStructCnt, NULL, NULL, inStruct, outStructCnt, 0);
+        // PRESENT-STRUCT dump (gated /tmp/macws_present_dump): with the
+        // present-recycle gate on, the per-frame IOMFB panel-present
+        // (kern_SwapEnd's IOConnectCallStructMethod) reaches this hook. Dump its
+        // inStruct (one-shot per selector) so we can find the scanout-target /
+        // display field to redirect to a virtual surface (recycle w/o lighting
+        // the panel). fsync'd to /tmp/macws_present_struct (survives any reboot).
+        if (inStruct && inStructCnt && selector < 256 &&
+            access("/tmp/macws_present_dump", F_OK) == 0) {
+            static _Atomic unsigned char pd_done[256];
+            unsigned char z0 = 0;
+            if (atomic_compare_exchange_strong(&pd_done[selector], &z0, 1)) {
+                const unsigned char *s = (const unsigned char *)inStruct;
+                char b[1400]; int n = 0;
+                n += snprintf(b+n, sizeof(b)-n, "#### PRESENT-STRUCT sel=%u inSC=%zu:\n", selector, inStructCnt);
+                size_t lim = inStructCnt < 256 ? inStructCnt : 256;
+                for (size_t i = 0; i < lim && n < (int)sizeof(b)-8; i++) {
+                    if (i % 16 == 0) n += snprintf(b+n, sizeof(b)-n, "\n  %03zx:", i);
+                    n += snprintf(b+n, sizeof(b)-n, " %02x", s[i]);
+                }
+                n += snprintf(b+n, sizeof(b)-n, "\n");
+                if (n > 0) { (void)write(STDERR_FILENO, b, (size_t)n);
+                    int fd = open("/tmp/macws_present_struct", O_WRONLY|O_CREAT|O_APPEND, 0644);
+                    if (fd >= 0) { (void)write(fd, b, (size_t)n); fsync(fd); close(fd); } }
+            }
+        }
+    }
     // AGX GPU device-info query (method 256 / setupImmediate): macOS 13.4 asks for
     // a 0x78 (120-byte) output struct, but the iOS 16.x GPU userclient hard-checks
     // the output size at 0x70 (112). The 8-byte mismatch -> kIOReturnBadArgument and
@@ -5579,6 +6991,43 @@ DYLD_INTERPOSE(IOConnectCallStructMethod_new, IOConnectCallStructMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncMethod_new, IOConnectCallAsyncMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncScalarMethod_new, IOConnectCallAsyncScalarMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncStructMethod_new, IOConnectCallAsyncStructMethod);
+
+// 2026-06-22 — MAPDIAG (gated /tmp/macws_map_diag): the deep blur RE. AGX
+// buffers in chroot get a full GPU allocation but a CPU -contents mapping
+// capped at 16KB (BUFDIAG vm_extent=0x4000). Log every IOConnectMapMemory[64]
+// the AGX driver issues for an IOGPU connection: memoryType (= resource id),
+// the kernel-returned CPU address, and crucially the SIZE the kernel maps. If
+// the kernel returns a truncated *ofSize the cap is kernel-side; if AGX passes
+// a small size / never maps the rest, it's userland-side. fsync'd to survive
+// the WS crash.
+// IOConnectMapMemory64 is exported by IOKit but absent from this SDK's headers;
+// declare it (resolved at runtime via -undefined dynamic_lookup).
+extern kern_return_t IOConnectMapMemory64(io_connect_t connect, uint32_t memoryType,
+                                          task_port_t intoTask, mach_vm_address_t *atAddress,
+                                          mach_vm_size_t *ofSize, IOOptionBits options);
+
+static void macws_mapdiag_log(io_connect_t c, uint32_t mt,
+                              uint64_t addr, uint64_t size, IOOptionBits opt, kern_return_t kr) {
+    if (access("/tmp/macws_map_diag", F_OK) != 0) return;
+    static _Atomic int mn = 0;
+    int n = atomic_fetch_add(&mn, 1);
+    if (n >= 128) return;
+    char b[224];
+    int k = snprintf(b, sizeof b,
+        "MAPDIAG #%d Map64 isIOGPU=%d memType=0x%x addr=%#llx size=%#llx opt=%#x kr=%#x\n",
+        n, IOConnectIsIOGPU(c), mt, (unsigned long long)addr,
+        (unsigned long long)size, opt, kr);
+    int fd = open("/tmp/macws_mapdiag.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) { if (k > 0) write(fd, b, (size_t)k); fsync(fd); close(fd); }
+}
+
+kern_return_t IOConnectMapMemory64_new(io_connect_t c, uint32_t mt, task_port_t t,
+                                       mach_vm_address_t *addr, mach_vm_size_t *size, IOOptionBits opt) {
+    kern_return_t kr = IOConnectMapMemory64(c, mt, t, addr, size, opt);
+    macws_mapdiag_log(c, mt, addr ? *addr : 0, size ? *size : 0, opt, kr);
+    return kr;
+}
+DYLD_INTERPOSE(IOConnectMapMemory64_new, IOConnectMapMemory64);
 
 // XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
 // signed-equivalent so the kernel runs the full privileged UC-init (sets

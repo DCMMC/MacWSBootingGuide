@@ -150,15 +150,41 @@ Confirmed gaps (memory: `backdrop-blur-tile-pipeline-blocked`):
   succeed against the chroot's user-client (these are read/query/info
   methods — they don't need the privileged init state).
 
-### Structural blockers (RE-confirmed, NOT theories)
+### Structural blockers — ⚠️ #1/#2 OVERTURNED 2026-06-22 (now PASS)
+
+> **CORRECTION (2026-06-22, lldb + workflow RE, runtime-confirmed).** Blockers
+> #1 and #2 below are **STALE — the AGX queue/heap create now SUCCEED**. See
+> `[[agx-queue-heap-create-now-succeed-0xe00002c2-is-badarg]]`.
+> - `0xe00002c2 = kIOReturnBadArgument` (verified IOReturn.h), **NOT**
+>   kIOReturnNoBandwidth/NotPermitted/ExclusiveAccess — every old note had the
+>   constant wrong. It meant the kernel rejected the *args shape*, not bandwidth
+>   or a UC privilege.
+> - The historic reject was caused by libmachook's own `outStructCnt 0x50→0x10000`
+>   bump on sel=0x9 — that line was **removed** (mac_hooks.m:6088-6104;
+>   `MACWS_RESTORE_OUTBUMP=1` revives it for A/B). Without it the kernel returns 0.
+> - Live lldb (gated WS-only SIGSTOP `/tmp/macws_suspend_ws`, attach before init):
+>   sel=0x8 queue-create (inSC=1032) and sel=0xa→0x9 heap/resource creates **all
+>   return 0**; the REAL IOKit `IOConnectCallMethod` returns **0 from the kernel**
+>   for sel=0x9 on AGX conn `0x1d003` (not a libmachook fake).
+> - The chroot AGX user-client is **fully initialized** (UC+0x100 set,
+>   UC+0x103 isRestrictedClient=0 → full dispatch table). The "half-broken UC"
+>   theory is **REFUTED**.
+> - ⟹ The empty composite (#5) is **DOWNSTREAM of resource/queue creation** —
+>   investigate command-buffer SUBMISSION + GPU execution, and whether window
+>   backing IOSurfaces reach WS as composite SOURCES (solidwin test: even a flat
+>   solid window's content is absent from the composite — see
+>   `[[detile-read-correct-composite-empty]]`).
+> - Kernel reject sites (if it ever recurs): externalMethod@0xeed360 (asyncRef
+>   args+0x10 must be NULL); s_new_resource@0xeeb82c (inStructSize≥0x50 + OOL
+>   output); new_resource SITE#4@0xf03d84 (type=0 cache_mode args+0x04 bits only
+>   in 8..11 — never fuzzed by the old MACWS_AGXIOC_FUZZ).
+
+Remaining (still believed valid):
 
 | # | Failing op | RE evidence | Root cause |
 |---|---|---|---|
-| 1 | `IOConnectCallMethod sel=0xa→0x9` (heap create) | kernel returns `0xe00002c2 = kIOReturnNoBandwidth`. The two reject sites inside `IOGPUDevice::new_resource` (`+0x44` checking `(IOGPU+0x224)+0x50 vs *outCnt`, and `+0xff` checking `args+0x40 vs (3*IOGPU+0x108/4)`) BOTH pass for our calls: `misc/agx_iogpu_probe` runtime measured `IOGPU+0x108 = 0x139ce0000` (5.13 GB) and `IOGPU+0x224 = 0` against the singleton at `0xfffffe690002c000` (same kernel object for chroot and iOS-native). | **Reject site is elsewhere in `IOGPUFamily`** — RE in progress to find which path returns 0xe00002c2 (candidates: per-task wire/pin limit, IOMemoryDescriptor::prepare on the backing memory, or a higher-up dispatch check). `MACWS_AGXIOC_FUZZ=1` confirms NO args-shape perturbation succeeds → the gate doesn't look at args at all. |
-| 2 | `IOConnectCallMethod sel=0x7→0x6` / `sel=0x8→0x7` (queue create) | `inSC=1032` hex dump captured via libmachook `IOConnectCallMethod_new` one-shot dumper. macOS userland packs process path string at offset 0; iOS-native `_IOGPUCommandQueueCreateWithQoS+0xaf0` (otool disasm of `~/Downloads/agx-re/ios/IOGPU`) zeros the buffer then writes QoS at `+0x400` / priority at `+0x404`. Patched IOConnect translator to substitute iOS-shape buffer → kernel STILL returns `0xe00002c2`. | Same UC-init root cause as #1. |
-| 3 | Borrow io_connect_t from iOS-native helper via XPC | Standalone borrow test runtime log (no chroot WS in loop): macwsallocd opens UC OK → `set_mach_send completed` → `about to send_message` → SIGKILL'd. Crash report `EXC_GUARD ILLEGAL_MOVE on mach port`. | `io_connect_t` mach ports are first-class GUARDED by IOKit at the kernel-port level. `mach_msg` transfer of the send-right trips the kernel guard. **Structural — the user-client port cannot cross task boundaries.** |
-| 4 | SkyLight compositor needs non-nil queue | `CAWSBackend.mm:5130 — Assertion failed: (compositor != nullptr)`. BT chain via lldb: `setupDeferred → newCommandQueue` (queue alloc'd via sel=0x7/0x8 which return nil). | Downstream of #2. |
-| 5 | Compositor missing means no rendering | VNC framebuffer all-zero PNG (`md5` confirmed identical across multiple grabs from `vncdo capture`); chroot `screencapture -x` also all-zero. WS process can stay alive (no crash log) but produces no display output. | Downstream of #4. |
+| 3 | Borrow io_connect_t from iOS-native helper via XPC | Standalone borrow test runtime log (no chroot WS in loop): macwsallocd opens UC OK → `set_mach_send completed` → `about to send_message` → SIGKILL'd. Crash report `EXC_GUARD ILLEGAL_MOVE on mach port`. | `io_connect_t` mach ports are first-class GUARDED by IOKit at the kernel-port level. `mach_msg` transfer of the send-right trips the kernel guard. **Structural — the user-client port cannot cross task boundaries.** (Now moot: chroot opens its own working UC; no need to borrow.) |
+| 5 | Compositor produces no display output | VNC framebuffer / `screencapture -x` / direct `+0xa0` composite-dest read all ~empty (uninitialized noise). WS stays alive. | **CURRENT FRONTIER.** No longer downstream of a queue-create failure (#2 fixed). Now: composite GPU work not landing in the dest backing, and/or source window-backing IOSurfaces not reaching WS. |
 
 ### What this rules out (saved from repeating)
 
