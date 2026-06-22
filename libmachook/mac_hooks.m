@@ -810,7 +810,83 @@ static int hooked_skylight_prepare_for_use(void *self, void *ctx,
         // PrepareForUse silently when the flag is set; aborts when it's 0.
         *((volatile uint8_t *)ctx + 0x1c0) = 1;
     }
-    return orig_skylight_prepare_for_use(self, ctx, arg);
+    int r = orig_skylight_prepare_for_use(self, ctx, arg);
+    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
+        // self = MetalIOSurfaceBacking; +0x18 typically the IOSurface-backed
+        // MTLTexture. ret!=0 = source texture ready; ret==0 = nil/abort path.
+        static int n; if (++n <= 40)
+            fprintf(stderr, "#### WS_DIAG PrepareForUse #%d self=%p tex=%p ret=%d\n",
+                    n, self, self ? *(void **)((char *)self + 0x18) : NULL, r);
+    }
+    return r;
+}
+
+// ── WS-side window-backing diagnostics (agent RE 2026-06-23) ──
+// Split cause #1 (flatten render fails on AGX source texture) vs #2 (window
+// never enters CA-flatten mode). Hooked by computed slide off PrepareForUse.
+typedef void *(*wcb_flatten_t)(void *, void *, void *, void *);
+static wcb_flatten_t orig_wcb_flatten = NULL;
+static void *hooked_wcb_flatten(void *self, void *a1, void *a2, void *a3) {
+    static int n;
+    BOOL diag = (access("/tmp/macws_ws_diag", F_OK) == 0);
+    if (diag && ++n <= 30)
+        fprintf(stderr, "#### WS_DIAG WSCAWindowBacking::Flatten #%d self=%p flag2e8(pre)=%d\n",
+                n, self, self ? *(int *)((char *)self + 0x2e8) : -1);
+    void *r = orig_wcb_flatten(self, a1, a2, a3);
+    if (diag && n <= 30)
+        fprintf(stderr, "#### WS_DIAG   Flatten done self=%p flag2e8(post)=%d\n",
+                self, self ? *(int *)((char *)self + 0x2e8) : -1);
+    return r;
+}
+typedef int (*flat_valid_t)(void *, void *, void *, void *);
+static flat_valid_t orig_flat_valid = NULL;
+static int hooked_flat_valid(void *self, void *a1, void *a2, void *a3) {
+    int r = orig_flat_valid(self, a1, a2, a3);
+    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
+        static int n; if (++n <= 40)
+            fprintf(stderr, "#### WS_DIAG IsFlattenedCopyValid #%d self=%p ret=%d\n", n, self, r);
+    }
+    return r;
+}
+// UpdateDisplays — SANITY: known-called (seen in leak trace). If this fires via
+// the slide method, the method works → genLayers=0 is real.
+typedef void *(*upd_disp_t)(void *, void *, void *, void *);
+static upd_disp_t orig_upd_disp = NULL;
+static void *hooked_upd_disp(void *a, void *b, void *c, void *d) {
+    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
+        static int n; if (++n <= 5)
+            fprintf(stderr, "#### WS_DIAG UpdateDisplays #%d (slide-method sanity OK)\n", n);
+    }
+    return orig_upd_disp(a, b, c, d);
+}
+// get_selective_sharing_visible_window_list_for_filter — the window enumeration.
+// Log return + first 2 words (CFArray isa/cnt, or C++ vector begin/end → count).
+typedef void *(*vis_list_t)(void *, void *, void *, void *);
+static vis_list_t orig_vis_list = NULL;
+static void *hooked_vis_list(void *a, void *b, void *c, void *d) {
+    void *r = orig_vis_list(a, b, c, d);
+    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
+        static int n; if (++n <= 10)
+            fprintf(stderr, "#### WS_DIAG visible_window_list #%d ret=%p w0=%p w1=%p\n",
+                    n, r, r ? *(void **)r : NULL, r ? *((void **)r + 1) : NULL);
+    }
+    return r;
+}
+// generate_layers_for_window(window, ...) — per-window content-source state.
+typedef void *(*gen_layers_t)(void *, void *, void *, void *);
+static gen_layers_t orig_gen_layers = NULL;
+static void *hooked_gen_layers(void *win, void *a1, void *a2, void *a3) {
+    if (win && access("/tmp/macws_ws_diag", F_OK) == 0) {
+        static int n; if (++n <= 30) {
+            uint32_t wid = *(uint32_t *)((char *)win + 0x10); // CGXWindow id (best-effort)
+            void *flatBack = *(void **)((char *)win + 0x838);
+            void *legacy   = *(void **)((char *)win + 0x128);
+            int mode       = *(int  *)((char *)win + 0x58);
+            fprintf(stderr, "#### WS_DIAG genLayers #%d win=%p id=%u mode58=%d flat838=%p legacy128=%p\n",
+                    n, win, wid, mode, flatBack, legacy);
+        }
+    }
+    return orig_gen_layers(win, a1, a2, a3);
 }
 
 // SkyLight `MetalContext::StartCompositeForDisplayStream(id<MTLTexture>,
@@ -1475,6 +1551,28 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
         MSHookFunction(sym1, (void *)hooked_skylight_prepare_for_use,
                        (void **)&orig_skylight_prepare_for_use);
         fprintf(stderr, "#### SkyLight PrepareForUse tolerate-nil hook installed at %p\n", sym1);
+        // WS-side window-backing diag (RE 2026-06-23): hook by computed slide off
+        // sym1 (PrepareForUse @ unslid 0x185404fcc). ⚠️ DISABLED BY DEFAULT — the
+        // offsets came from an agent RE of an off-version SkyLight.bndb (likely NOT
+        // on-device 13.4), so these computed addresses are WRONG and crash WS (a
+        // WS .ips was produced when they were installed). Gated behind a SEPARATE
+        // file (/tmp/macws_ws_diag2) so the normal diag gate (/tmp/macws_ws_diag)
+        // stays safe. DO NOT enable until the offsets are re-derived from the
+        // on-device 13.4 SkyLight (the agx-re/ bndb is the wrong version).
+        if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
+            uintptr_t sl_slide = (uintptr_t)sym1 - 0x185404fcc;
+            void *fl = (void *)(0x1852e69b4 + sl_slide);
+            MSHookFunction(fl, (void *)hooked_wcb_flatten, (void **)&orig_wcb_flatten);
+            void *fv = (void *)(0x185320d98 + sl_slide);
+            MSHookFunction(fv, (void *)hooked_flat_valid, (void **)&orig_flat_valid);
+            void *gl = (void *)(0x185382d48 + sl_slide);
+            MSHookFunction(gl, (void *)hooked_gen_layers, (void **)&orig_gen_layers);
+            void *ud = (void *)(0x185379848 + sl_slide);
+            MSHookFunction(ud, (void *)hooked_upd_disp, (void **)&orig_upd_disp);
+            void *vl = (void *)(0x185104420 + sl_slide);
+            MSHookFunction(vl, (void *)hooked_vis_list, (void **)&orig_vis_list);
+            fprintf(stderr, "#### WS_DIAG2 window-backing hooks (UNRELIABLE offsets): slide=%#lx\n", sl_slide);
+        }
     } else {
         fprintf(stderr, "#### SkyLight PrepareForUse: symbol not found, skipped\n");
     }
@@ -2297,16 +2395,22 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         if(_NSGetExecutablePath(exe, &exelen) == 0) {
             isWindowServer = (strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL);
         }
+        { uint32_t *fa = (uint32_t *)(OFF_QuartzCore_CABackingStore_force_accel + (uintptr_t)header);
+          fprintf(stderr, "#### FORCE-ACCEL gate: prog=%s isWS=%d env=%s byte=%#x\n",
+                  getprogname() ?: "?", isWindowServer,
+                  getenv("MACWS_KEEP_FORCE_ACCEL") ?: "(null)", *fa); }
         if(!isWindowServer && getenv("MACWS_KEEP_FORCE_ACCEL")) {
-            // LAZY: forces CABackingStorePrepareUpdates_ to take the
-            // accelerated (IOSurface) branch unconditionally. Was hiding
-            // the actual reason apps fell to the CPU bitmap path. Opt-IN
-            // with MACWS_KEEP_FORCE_ACCEL=1; default off so the real
-            // CPU-vs-GPU decision logic runs and we see why it picked CPU.
+            // RE-confirmed LOAD-BEARING (SIM-vs-AGX A/B): forces
+            // CABackingStorePrepareUpdates_ onto the IOSurface branch so client
+            // window content becomes a GPU surface WS can composite (else CPU
+            // bitmap → window+0x128==0 → not composited).
             uint32_t *forceAccel = (uint32_t *)(OFF_QuartzCore_CABackingStore_force_accel + (uintptr_t)header);
             ModifyExecutableRegion(forceAccel, sizeof(uint32_t), ^{
                 if (*forceAccel == 0x34000155) { // cbz w21, #0x28 (+852)
                     *forceAccel = 0x14000007;    // b +840 (accelerated path)
+                    fprintf(stderr, "#### FORCE-ACCEL: PATCHED CABackingStore→IOSurface in %s\n", getprogname() ?: "?");
+                } else {
+                    fprintf(stderr, "#### FORCE-ACCEL: byte mismatch %#x (not patched) in %s\n", *forceAccel, getprogname() ?: "?");
                 }
             });
         }
@@ -5563,12 +5667,20 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
 extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
 kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_t *sp) {
-    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
-    return bootstrap_look_up(bp, name, sp);
+    BOOL ca = (name && !strcmp(name, CARENDER_ORIG));
+    if(ca) name = CARENDER_NEW;
+    kern_return_t kr = bootstrap_look_up(bp, name, sp);
+    if(ca) fprintf(stderr, "#### CARENDER look_up by %s -> kr=%#x port=%#x\n",
+                   getprogname() ?: "?", kr, sp ? *sp : 0);
+    return kr;
 }
 kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port_t *sp) {
-    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
-    return bootstrap_check_in(bp, name, sp);
+    BOOL ca = (name && !strcmp(name, CARENDER_ORIG));
+    if(ca) name = CARENDER_NEW;
+    kern_return_t kr = bootstrap_check_in(bp, name, sp);
+    if(ca) fprintf(stderr, "#### CARENDER check_in by %s -> kr=%#x port=%#x\n",
+                   getprogname() ?: "?", kr, sp ? *sp : 0);
+    return kr;
 }
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
