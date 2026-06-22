@@ -52,6 +52,19 @@ int main(int argc, char *argv[], char *envp[]) {
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
+    // 2026-06-23 — REGRESSION FIX (RE-confirmed via SIM-vs-AGX-native A/B): the
+    // client CABackingStorePrepareUpdates_ force-IOSurface patch (mac_hooks.m,
+    // gated MACWS_KEEP_FORCE_ACCEL, !isWindowServer) is LOAD-BEARING, not lazy:
+    // without it the chroot client renders window content to a CPU bitmap (w21==0)
+    // instead of an IOSurface → no IOSurfaceCreateMachPort → no surface-backing
+    // reaches WS → window+0x128==0 → generate_layers_for_window emits no content
+    // layer → app windows are NOT composited (only the WS bg shows). The SIM path
+    // (dca5fa2) applied it unconditionally and app windows composited correctly
+    // (solidwin/GlassDemo proven). Propagating it to every chroot app here restores
+    // that. WS itself is excluded by the !isWindowServer guard, so this is a no-op
+    // for WS (which composites via real AGX). Clients stay on CPU/sim Metal (the
+    // patch is a pure CPU-render→IOSurface-backing flip; needs no GPU Metal device).
+    setenv("MACWS_KEEP_FORCE_ACCEL", "1", 1);
     // setenv("DYLD_PRINT_SEARCHING", "1", 1);
     // setenv("DYLD_PRINT_LIBRARIES", "1", 1);
     // setenv("DYLD_PRINT_LIBRARIES_POST_LAUNCH", "1", 1);
