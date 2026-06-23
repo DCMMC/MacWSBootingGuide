@@ -1251,6 +1251,7 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
         return NULL;
     }
     { extern void macws_dest_trace(const char *, id); macws_dest_trace("WSCDcreate", texture); }
+    { extern void macws_2b_alias_dest(id); macws_2b_alias_dest(texture); }
     // ── TEXTURE-WALL FIX (gated /tmp/macws_dest_iosurf) ──
     // RE-confirmed: the macOS compose dest (pf=550) is a PLAIN render target — the GPU
     // renders into its private backing and the scanout IOSurface stays empty (black).

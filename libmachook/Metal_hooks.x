@@ -750,6 +750,49 @@ void macws_dest_trace(const char *site, id tex) {
                 (void *)ios, (void *)tex);
     } @catch (__unused NSException *e) {}
 }
+// 2b PROBE/FIX (gated /tmp/macws_2b): the macOS dest is IOSurface-backed (iosurf=SET) but its
+// IOSurface is EMPTY — the GPU renders into a separate backing. AGX::Texture GPU render-target VA
+// = impl+0x40 (getGPUVirtualAddress); impl=*(tex+0x208); CPU base = impl+0x130. Compare the dest's
+// impl+0x40 to a REFERENCE texture freshly created from the SAME IOSurface: DIFFER => dest has a
+// private backing not aliasing the IOSurface (patchable); same => IOSurface IS the backing (empty =
+// no render, a different problem). When /tmp/macws_2b_fix exists AND they differ, set the dest's
+// impl+0x40 := ref_va so the GPU renders into the IOSurface-aliased VA (re-push handled by the next
+// frame's bind; texBaseAddressesUpdated re-push is a follow-up if the bare set doesn't take).
+void macws_2b_alias_dest(id texture) {
+    if (!texture || access("/tmp/macws_2b", F_OK) != 0) return;
+    @try {
+        NSUInteger w = [texture width], h = [texture height];
+        if (w < 1900 || w >= 2300) return;   // macOS virtual-display dest only
+        static _Atomic int n = 0;
+        if (atomic_fetch_add(&n, 1) >= 6) return;   // limit AFTER the dims filter
+        void *impl = *(void **)((char *)(__bridge void *)texture + 0x208);
+        if (!impl) return;
+        uint64_t dest_va = *(volatile uint64_t *)((char *)impl + 0x40);
+        uint64_t cpu_base = *(volatile uint64_t *)((char *)impl + 0x130);
+        typedef IOSurfaceRef (*iosf_t)(id, SEL);
+        IOSurfaceRef ios = [texture respondsToSelector:@selector(iosurface)]
+            ? ((iosf_t)objc_msgSend)(texture, @selector(iosurface)) : NULL;
+        uint64_t ref_va = 0;
+        if (ios) {
+            id<MTLDevice> dev = [texture device];
+            MTLTextureDescriptor *d = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:[texture pixelFormat] width:w height:h mipmapped:NO];
+            d.usage = [texture usage]; d.storageMode = MTLStorageModeShared;
+            id ref = nil;
+            @try { ref = [dev newTextureWithDescriptor:d iosurface:ios plane:0]; } @catch (__unused NSException *e) {}
+            void *rimpl = ref ? *(void **)((char *)(__bridge void *)ref + 0x208) : NULL;
+            if (rimpl) ref_va = *(volatile uint64_t *)((char *)rimpl + 0x40);
+        }
+        int differ = (ref_va && ref_va != dest_va);
+        fprintf(stderr, "#### 2B dest %lux%lu impl=%p +0x40=%#llx +0x130=%#llx ios=%p ref+0x40=%#llx %s\n",
+            (unsigned long)w, (unsigned long)h, impl, dest_va, cpu_base, (void *)ios, ref_va,
+            differ ? "DIFFER" : "same");
+        if (differ && access("/tmp/macws_2b_fix", F_OK) == 0) {
+            *(volatile uint64_t *)((char *)impl + 0x40) = ref_va;
+            fprintf(stderr, "#### 2B FIX set dest impl+0x40 := ref_va %#llx\n", ref_va);
+        }
+    } @catch (__unused NSException *e) {}
+}
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
     if (!tex || access("/tmp/macws_grab_png", F_OK) != 0) return;
@@ -844,11 +887,44 @@ void macws_grab_composite(id<MTLTexture> tex) {
                 for (id<MTLTexture> rt in ring)
                     if ((unsigned long)[rt pixelFormat] == 550) { dtex = rt; best_pct = 100.0; break; }
             }
+            // 2B-POST (gated /tmp/macws_2b): read the ring's macOS-dest texture's
+            // POST-RENDER VAs (ring tex is from a prior frame -> bound). BEFORE the
+            // empty-content gate (the dest IOSurface is empty, so we'd never reach the
+            // post-gate read). impl+0x40=GPU VA, +0x130=CPU base.
+            if (access("/tmp/macws_2b", F_OK) == 0) {
+                for (id<MTLTexture> rt in ring) {
+                    NSUInteger rw = [rt width];
+                    if (rw >= 1900 && rw < 2300) {
+                        void *ri = *(void **)((char *)(__bridge void *)rt + 0x208);
+                        if (ri) { static int pn; if (pn++ < 10)
+                            fprintf(stderr, "#### 2B-POST %lux%lu impl=%p +0x40=%#llx +0x130=%#llx\n",
+                                (unsigned long)rw, (unsigned long)[rt height], ri,
+                                *(volatile uint64_t *)((char *)ri + 0x40),
+                                *(volatile uint64_t *)((char *)ri + 0x130)); }
+                        break;
+                    }
+                }
+            }
             if (best_pct < 5.0) { atomic_store(&g_grab_busy, 0); return; }
             if (!dtex) dtex = [ring objectAtIndex:0];
             uint8_t layout = 0xff; size_t ext = 0;
             void *backing = macws_tex_backing(dtex, &layout, &ext);
             if (backing) {
+                // 2B-POST (gated /tmp/macws_2b): read the POST-RENDER dest's GPU VA
+                // (impl+0x40) + CPU base (impl+0x130) vs the resolved IOSurface base.
+                // CPU==IOSURF => texture backing IS the IOSurface (aliased; empty = no
+                // render). CPU!=IOSURF => separate backing (the coherence wall).
+                if (access("/tmp/macws_2b", F_OK) == 0) {
+                    void *dimpl = *(void **)((char *)(__bridge void *)dtex + 0x208);
+                    if (dimpl) {
+                        uint64_t va40 = *(volatile uint64_t *)((char *)dimpl + 0x40);
+                        uint64_t va130 = *(volatile uint64_t *)((char *)dimpl + 0x130);
+                        static int pn; if (pn++ < 10)
+                            fprintf(stderr, "#### 2B-POST %lux%lu impl=%p +0x40=%#llx +0x130=%#llx iosurf_base=%p %s\n",
+                                (unsigned long)[dtex width], (unsigned long)[dtex height], dimpl, va40, va130,
+                                backing, (va130 == (uint64_t)backing) ? "CPU==IOSURF" : "CPU!=IOSURF");
+                    }
+                }
                 size_t dw=[dtex width], dh=[dtex height];
                 unsigned long dpf=(unsigned long)[dtex pixelFormat];
                 size_t copy = dw*dh*4; if (ext < copy) copy = ext;
