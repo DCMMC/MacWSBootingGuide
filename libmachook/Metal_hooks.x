@@ -828,6 +828,22 @@ void macws_grab_composite(id<MTLTexture> tex) {
     // the GPU render into the readable IOSurface (THE FIX worked).
     if (g_dest_iosurf && access("/tmp/macws_wscd_iosurf", F_OK) == 0) {
         @try {
+            // NEWBUF-PROBE (one-shot, decisive): does newBufferWithIOSurface yield a REAL GPU VA
+            // in the chroot, or also the 0xeeee0000 placeholder? If real -> the IOSurface CAN be
+            // GPU-bound and the bind-substitution fix is viable. If placeholder/0 -> the kernel
+            // assigns no VA for IOSurface resources from the chroot -> IOSurface-RT dead at kernel.
+            static dispatch_once_t nbp_once;
+            dispatch_once(&nbp_once, ^{
+                id dev = MTLCreateSystemDefaultDevice();
+                uint64_t va = 0; id buf = nil;
+                if (dev) {
+                    typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                    buf = ((nbi_t)objc_msgSend)(dev, sel_registerName("newBufferWithIOSurface:"), g_dest_iosurf);
+                    if (buf) { typedef uint64_t (*ga_t)(id, SEL); va = ((ga_t)objc_msgSend)(buf, sel_registerName("gpuAddress")); }
+                }
+                fprintf(stderr, "#### NEWBUF-PROBE dev=%s ios=%p buf=%p gpuAddress=%#llx\n",
+                    dev ? class_getName([dev class]) : "nil", (void *)g_dest_iosurf, (void *)buf, va);
+            });
             IOSurfaceLock(g_dest_iosurf, 0x1 /*readonly*/, NULL);
             void *b = IOSurfaceGetBaseAddress(g_dest_iosurf);
             size_t sz = IOSurfaceGetAllocSize(g_dest_iosurf);
@@ -2192,6 +2208,47 @@ static void macws_sigabrt_trampoline(int sig) {
     }
     macws_in_protected = 0;
     sigaction(SIGABRT, &old_sa, NULL);
+    // ── BINDFIX-REBIND (gated /tmp/macws_bindfix) — THE driver-level AGX-native fix ──
+    // RE + runtime proof: the chroot kernel DOES assign a real GPU VA for the IOSurface (the
+    // NEWBUF-PROBE: newBufferWithIOSurface→gpuAddress=0x17398d8000), but the texture render-target
+    // bind writes the 0xeeee0000 placeholder VA instead (23/24 textures bind 0xeeee0000) → GPU
+    // fragment writes go to a scratch page, not the IOSurface → black dest. Re-bind the full-screen
+    // dest texture to the IOSurface's REAL VA (obtained via newBufferWithIOSurface, cached+retained
+    // so the resource/mapping stays alive) and re-bake the PBE descriptor via updateBindData.
+    if (result && iosurface && access("/tmp/macws_bindfix", F_OK) == 0) {
+        int w = (int)IOSurfaceGetWidth(iosurface);
+        if (w >= 1900 && w < 2300) {            // the macOS compositor full-screen dest
+            @try {
+                static NSMutableDictionary *bufcache; static dispatch_once_t bc_once;
+                dispatch_once(&bc_once, ^{ bufcache = [NSMutableDictionary new]; });
+                NSValue *key = [NSValue valueWithPointer:(void *)iosurface];
+                id buf; @synchronized(bufcache) { buf = bufcache[key]; }
+                if (!buf) {
+                    typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                    buf = ((nbi_t)objc_msgSend)(self, sel_registerName("newBufferWithIOSurface:"), iosurface);
+                    if (buf) { @synchronized(bufcache) { bufcache[key] = buf; } }   // retain → VA stays valid
+                }
+                uint64_t realVA = 0;
+                if (buf) { typedef uint64_t (*ga_t)(id, SEL); realVA = ((ga_t)objc_msgSend)(buf, sel_registerName("gpuAddress")); }
+                void *impl = *(void **)((char *)(__bridge void *)result + 0x208);
+                uint64_t oldVA = ((uintptr_t)impl > 0x1000) ? *(uint64_t *)((char *)impl + 0x40) : 0;
+                if (realVA && (uintptr_t)impl > 0x1000) {
+                    void *base = IOSurfaceGetBaseAddress(iosurface);
+                    uint64_t pbe_before = *(uint64_t *)((char *)impl + 0x190);
+                    typedef void (*ub_t)(id, SEL, uint64_t, uint64_t, uint64_t, bool, bool);
+                    ((ub_t)objc_msgSend)(result,
+                        sel_registerName("updateBindDataWithAddresses:cpuMetadataAddress:gpuVirtualAddress:isCompressible:shouldInitMetadata:"),
+                        (uint64_t)base, 0, realVA, false, true);
+                    uint64_t newVA = *(uint64_t *)((char *)impl + 0x40);
+                    uint64_t pbe_after = *(uint64_t *)((char *)impl + 0x190);
+                    void *bufcont = NULL; { typedef void *(*c_t)(id, SEL); bufcont = ((c_t)objc_msgSend)(buf, sel_registerName("contents")); }
+                    static int rb; if (rb++ < 6)
+                        fprintf(stderr, "#### BINDFIX-REBIND dest %dx%d oldVA=%#llx realVA=%#llx impl+0x40=%#llx pbe190 %#llx->%#llx bufcont=%p iosbase=%p alias=%d\n",
+                            w, (int)IOSurfaceGetHeight(iosurface), oldVA, realVA, newVA, pbe_before, pbe_after, bufcont, base, (bufcont == base) ? 1 : 0);
+                }
+            } @catch (__unused NSException *e) {}
+        }
+    }
     if (!result && desc) {
         NSUInteger orig_fmt = desc.pixelFormat;
         // Try fallback translations only for the private 550 format (and nearby
@@ -3604,6 +3661,71 @@ static void install_agx_initimpl_hook(void) {
         (void*)macws_orig_initimpl);
 }
 
+// ── BINDFIX (gated /tmp/macws_bindfix) — THE driver-level AGX-native fix ──
+// RE-confirmed root cause (macOS-vs-iOS AGXMetal13_3 diff): the IOSurface dest's GPU render-target
+// VA flows -[AGXTexture initWithDevice:desc:iosurface:plane:]@0x1e5a5ae18 → IOGPUMetalResource →
+// _res+0x48 (= _IOGPUResourceGetGPUVirtualAddress = kernel s_new_resource output[0]) →
+// -[…updateBindDataWithAddresses:…gpuVirtualAddress:…]@0x1e57716b4 writes it to impl+0x40 and
+// re-bakes the PBE descriptor (texBaseAddressesUpdated). In the chroot the kernel hands back GPU
+// VA=0 for the type=0x82 IOSurface resource (or macOS IOGPU misparses the iOS-kernel output) → the
+// dest binds VA 0 → GPU writes nowhere → black. Driver logic + offsets are IDENTICAL to iOS, so
+// the only userland fix is at this single chokepoint: when gpuVirtualAddress==0 for the IOSurface
+// full-screen dest, substitute the IOSurface's REAL GPU VA obtained independently via
+// -[AGXG13GFamilyDevice newBufferWithIOSurface:]@0x1e574d858 (same IOGPUMetalResource path) →
+// its gpuAddress. Diagnostic-first: logs in_gpuVA + newbuf_va so one run tells us whether the
+// buffer path yields a non-0 VA (fix viable) or also 0 (kernel truly assigns none → fallback).
+typedef void (*macws_updatebind_orig_t)(id, SEL, uint64_t, uint64_t, uint64_t, bool, bool);
+static macws_updatebind_orig_t macws_orig_updatebind = NULL;
+static void macws_hook_updatebind(id self, SEL _cmd, uint64_t addresses, uint64_t cpuMeta,
+                                  uint64_t gpuVA, bool isComp, bool shouldInit) {
+    uint64_t useVA = gpuVA;
+    if (access("/tmp/macws_bindfix", F_OK) == 0) {
+        { void *impl0 = *(void **)((char *)(__bridge void *)self + 0x208);
+          uint64_t ios0 = ((uintptr_t)impl0 > 0x1000) ? *(uint64_t *)((char *)impl0 + 0xa0) : 0;
+          static _Atomic int alln = 0; int n = atomic_fetch_add(&alln, 1);
+          if (n < 24) fprintf(stderr, "#### BINDFIX-ALL #%d cls=%s impl=%p ios=%#llx gpuVA=%#llx cpuMeta=%#llx\n",
+                n, class_getName([self class]), impl0, ios0, gpuVA, cpuMeta); }
+        @try {
+            void *impl = *(void **)((char *)(__bridge void *)self + 0x208);
+            uint64_t ios = ((uintptr_t)impl > 0x1000) ? *(uint64_t *)((char *)impl + 0xa0) : 0;
+            if (ios) {                            // IOSurface-backed (impl+0xa0 set by initImplWith before this)
+                int w = (int)IOSurfaceGetWidth((IOSurfaceRef)ios);
+                int h = (int)IOSurfaceGetHeight((IOSurfaceRef)ios);
+                uint64_t newva = 0;
+                if (w >= 1900 && w < 2300) {      // the macOS compositor full-screen dest
+                    static NSMutableDictionary *cache; static dispatch_once_t once;
+                    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+                    NSValue *key = [NSValue valueWithPointer:(void *)ios];
+                    id buf; @synchronized(cache) { buf = cache[key]; }
+                    if (!buf) {
+                        id dev = [(id<MTLTexture>)self device];
+                        typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                        buf = ((nbi_t)objc_msgSend)(dev, sel_registerName("newBufferWithIOSurface:"), (IOSurfaceRef)ios);
+                        if (buf) { @synchronized(cache) { cache[key] = buf; } }   // retain so the VA stays valid
+                    }
+                    if (buf) { typedef uint64_t (*ga_t)(id, SEL); newva = ((ga_t)objc_msgSend)(buf, sel_registerName("gpuAddress")); }
+                    if (gpuVA == 0 && newva) useVA = newva;          // SUBSTITUTE the real IOSurface GPU VA
+                }
+                static int bn; if (bn++ < 16)
+                    fprintf(stderr, "#### BINDFIX ios-tex %dx%d in_gpuVA=%#llx ios=%#llx newbuf_va=%#llx -> useVA=%#llx\n",
+                        w, h, gpuVA, ios, newva, useVA);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    if (macws_orig_updatebind) macws_orig_updatebind(self, _cmd, addresses, cpuMeta, useVA, isComp, shouldInit);
+}
+static void install_updatebind_hook(void) {
+    if (!getenv("MACWS_AGX_NATIVE")) return;
+    Class tex_cls = objc_getClass("AGXG13GFamilyTexture");
+    if (!tex_cls) { fprintf(stderr, "#### BINDFIX: AGXG13GFamilyTexture class not found\n"); return; }
+    SEL sel = sel_registerName("updateBindDataWithAddresses:cpuMetadataAddress:gpuVirtualAddress:isCompressible:shouldInitMetadata:");
+    Method m = class_getInstanceMethod(tex_cls, sel);
+    if (!m) { fprintf(stderr, "#### BINDFIX: updateBindData method not found\n"); return; }
+    macws_orig_updatebind = (macws_updatebind_orig_t)method_getImplementation(m);
+    method_setImplementation(m, (IMP)macws_hook_updatebind);
+    fprintf(stderr, "#### BINDFIX: updateBindData hook installed (orig=%p)\n", (void *)macws_orig_updatebind);
+}
+
 // Probe -[IOGPUMetalCommandBuffer commandBufferResourceInfo].
 // RenderContext init stores its result at renderContext->0x10. If nil,
 // DataBufferAllocator::newCommand crashes 0x114 in dereferencing this->0x10.
@@ -4096,6 +4218,7 @@ static size_t macws_mapped_extent_from(void *p) {
 
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
+    install_updatebind_hook();    // BINDFIX: substitute IOSurface GPU VA when bind gets 0 (gated)
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
     install_cbri_probe();         // log commandBufferResourceInfo returns
     install_shadow_isolation();   // diag: skip layout!=0 replaceRegion (gated)
