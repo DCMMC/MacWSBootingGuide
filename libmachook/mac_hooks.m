@@ -20,7 +20,10 @@ typedef id IOSurfaceRef;
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
 extern IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t port);
 extern uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef surface);
+extern uint32_t IOSurfaceGetID(IOSurfaceRef surface);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+static void *g_glass_wcb = NULL;   // GlassDemo's WSCAWindowBacking (set in gen_layers, mode-5 window)
+static void *g_iosurface_isa = NULL;   // isa of a known IOSurface — to safely identify IOSurfaces by pointer
 extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
 extern int IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
 extern int IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
@@ -971,7 +974,6 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
 // the client IOSurface that _MetalCompositeCoreAnimation resolves at 0x185177294 (it calls
 // IOSurfaceGetPixelFormat(client_iosurface) at 0x1851772f4 — so a caller-filtered interpose catches it).
 static void *g_cca_base = NULL, *g_cca_end = NULL;
-static void *g_glass_wcb = NULL;   // GlassDemo's WSCAWindowBacking (captured in gen_layers, mode-5 window)
 // _MetalCompositeCoreAnimation@0x185176a14(window=x0, srcLayer=x1, dest=x2, sub=x3) — the LIVE
 // CARenderServer CA-tree re-render that Route A (mode-5 CA-flatten) windows like GlassDemo depend on
 // (vs the menu bar's static-IOSurface texture sample). If this fires at all in WS+GlassDemo it's
@@ -995,6 +997,39 @@ static void *hooked_cca(void *window, void *srcLayer, void *dest, void *sub) {
             fprintf(stderr, "#### WS_DIAG2 CCA #%d CALLED (chroot re-renders client CA tree) window=%p dest=%p wcb=%p a(wcb+0x2b0)=%p ios_cand=%p\n",
                     n, window, dest, wcb, a, ios);
         }
+        // one-shot: wcb+0x2b0 (the bound client surface) is NULL, so find the client IOSurface elsewhere in
+        // the wcb / its CARenderUpdate (wcb+0xa8) — that's the capture point for the wcb+0x2b0 SYNTHESIS.
+        // IOSurfaceGet* on a 16-aligned heap ptr is a field-read (safe); sane-dim filter rejects non-surfaces.
+        static dispatch_once_t wdump;
+        dispatch_once(&wdump, ^{
+            if (!g_iosurface_isa) {   // reliable reference isa: create a throwaway IOSurface
+                IOSurfaceRef t = IOSurfaceCreate((__bridge CFDictionaryRef)@{
+                    @"IOSurfaceWidth": @4, @"IOSurfaceHeight": @4, @"IOSurfaceBytesPerElement": @4 });
+                if (t) { g_iosurface_isa = *(void **)t; CFRelease(t); }
+            }
+            void *w = g_glass_wcb;   // GlassDemo's wcb (from gen_layers); fallback to this CCA's window
+            if (!w && (uintptr_t)window > 0x100000000 && (uintptr_t)window < 0x800000000000)
+                w = *(void **)((char *)window + 0xf8);
+            if ((uintptr_t)w <= 0x100000000 || (uintptr_t)w >= 0x800000000000) {
+                fprintf(stderr, "#### WCB-DUMP no wcb (g_glass_wcb=%p)\n", g_glass_wcb); return; }
+            fprintf(stderr, "#### WCB-DUMP wcb=%p isa=%p\n", w, g_iosurface_isa);
+            void *bases[2] = { w, *(void **)((char *)w + 0xa8) };
+            const char *bn[2] = { "wcb", "cru" };
+            for (int bi = 0; bi < 2; bi++) {
+                void *base = bases[bi];
+                if ((uintptr_t)base <= 0x100000000 || (uintptr_t)base >= 0x800000000000) continue;
+                for (int off = 0; off < 0x340; off += 8) {
+                    void *v = *(void **)((char *)base + off);
+                    if ((uintptr_t)v <= 0x100000000 || (uintptr_t)v >= 0x800000000000 || ((uintptr_t)v & 0x7)) continue;
+                    if (g_iosurface_isa && *(void **)v == g_iosurface_isa)   // isa-match = real IOSurface (safe to query)
+                        fprintf(stderr, "#### WCB-FIELD %s+%#x=%p IOSurf %lux%lu id=%u pf=%#x\n",
+                                bn[bi], off, v, (unsigned long)IOSurfaceGetWidth((IOSurfaceRef)v),
+                                (unsigned long)IOSurfaceGetHeight((IOSurfaceRef)v), IOSurfaceGetID((IOSurfaceRef)v),
+                                IOSurfaceGetPixelFormat((IOSurfaceRef)v));
+                }
+            }
+            fprintf(stderr, "#### WCB-DUMP done\n");
+        });
     }
     return orig_cca(window, srcLayer, dest, sub);
 }
@@ -6237,6 +6272,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
         @"IOSurfaceAddressFormat": @0,
     } ];
     IOSurfaceRef result = IOSurfaceCreate(np);
+    if (result && !g_iosurface_isa) g_iosurface_isa = *(void **)result;   // reference isa for safe IOSurface ID
     fprintf(stderr, "#### IOSURF/CA_FB rewrote %dx%d pf=0x%x->BGRA8 result=%p\n",
         w, h, pf, (void *)result);
     return result;
