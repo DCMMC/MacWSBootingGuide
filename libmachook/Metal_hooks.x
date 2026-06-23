@@ -3114,6 +3114,27 @@ static id macws_hook_initimpl(
             plane, buffer, bytesPerRow, allowNPOT, sparsePageSize,
             isCompressedIOSurface, isHeapBacked);
     }
+    // SEPARATE-BACKING PROOF (gated /tmp/macws_copy_ios_a0): +0xa0 is a separate alloc
+    // from the client IOSurface (ALIAS=0, runtime-confirmed) → GPU samples empty. Copy
+    // the client IOSurface content INTO +0xa0 so WS samples real pixels. Tiling-invariant
+    // for solid colors (solidwin proof). PROOF/diagnostic, NOT a production fix.
+    if (result && iosurface && access("/tmp/macws_copy_ios_a0", F_OK) == 0) {
+        NSUInteger cw = descriptor ? ((NSUInteger(*)(id,SEL))objc_msgSend)(descriptor, @selector(width)) : 0;
+        if (cw >= 500) {  // window-content sized; skip tiny (a0-overflow safety)
+            void *impl = *(void **)((char *)(__bridge void *)self + 0x208);
+            if ((uintptr_t)impl > 0x1000) {
+                void *a0 = *(void **)((char *)impl + 0xa0);
+                void *base = IOSurfaceGetBaseAddress(iosurface);
+                size_t sz = IOSurfaceGetAllocSize(iosurface);
+                if (a0 && base && a0 != base && sz > 0 && sz <= 64u*1024*1024) {
+                    memcpy(a0, base, sz);
+                    static int cc = 0; if (cc++ < 20)
+                        fprintf(stderr, "#### COPY_IOS_A0 cw=%lu a0=%p base=%p sz=%zu\n",
+                                (unsigned long)cw, a0, base, sz);
+                }
+            }
+        }
+    }
     // FORCE-LAYOUT0 (gated /tmp/macws_force_layout0): the connection-crash blur texture is
     // layout=3 (twiddled) but backed by a LINEAR chroot IOSurface — inconsistent; getCPUPtr's
     // twiddle translation returns 0 → writeRegion memmove(NULL) crash. The layout=0 path
@@ -3147,16 +3168,25 @@ static id macws_hook_initimpl(
             h = ((NSUInteger (*)(id, SEL))objc_msgSend)(descriptor, @selector(height));
         }
         uint32_t fcc = iosurface ? IOSurfaceGetPixelFormat(iosurface) : 0;
+        // SEPARATE-BACKING TEST: compare the texture's GPU backing (_impl+0xa0)
+        // to the IOSurface base. alias=1 ⟹ GPU samples the real IOSurface pages;
+        // alias=0 ⟹ separate backing (GPU samples empty → source content lost).
+        void *ios_base = iosurface ? IOSurfaceGetBaseAddress(iosurface) : NULL;
+        void *impl_a0 = NULL; uint32_t ios_id = 0;
+        if (iosurface) ios_id = ((uint32_t (*)(IOSurfaceRef))IOSurfaceGetID)(iosurface);
+        { void *impl = *(void **)((char *)(__bridge void *)self + 0x208);
+          if ((uintptr_t)impl > 0x1000) impl_a0 = *(void **)((char *)impl + 0xa0); }
         fprintf(stderr,
-            "#### INITIMPL_HOOK self=%p cls=%s ios=%p ios_fcc=%#x desc(pf=%lu w=%lu h=%lu) "
-            "buf=%p bpr=%lu npot=%d sparse=%lu compIOS=%d heap=%d → result=%p\n",
+            "#### INITIMPL_HOOK self=%p cls=%s ios=%p iosID=%u ios_fcc=%#x desc(pf=%lu w=%lu h=%lu) "
+            "buf=%p bpr=%lu npot=%d sparse=%lu compIOS=%d heap=%d → result=%p "
+            "ios_base=%p a0=%p ALIAS=%d\n",
             self, class_getName([self class]),
-            iosurface, fcc,
+            iosurface, ios_id, fcc,
             (unsigned long)pf, (unsigned long)w, (unsigned long)h,
             buffer, (unsigned long)bytesPerRow,
             (int)allowNPOT, (unsigned long)sparsePageSize,
             (int)isCompressedIOSurface, (int)isHeapBacked,
-            result);
+            result, ios_base, impl_a0, (ios_base && ios_base == impl_a0) ? 1 : 0);
         fflush(stderr);   // crash follows soon — flush so the blur tex init survives
         log_count++;
     }

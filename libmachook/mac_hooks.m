@@ -821,72 +821,159 @@ static int hooked_skylight_prepare_for_use(void *self, void *ctx,
     return r;
 }
 
-// ── WS-side window-backing diagnostics (agent RE 2026-06-23) ──
-// Split cause #1 (flatten render fails on AGX source texture) vs #2 (window
-// never enters CA-flatten mode). Hooked by computed slide off PrepareForUse.
+// ── WS-side window-backing diagnostics (agent RE 2026-06-23; offsets VERIFIED
+// against the on-device 13.4 SkyLight __TEXT @0x1850E5000 — all 4 are clean
+// function prologues). DEREF-SAFE: count + raw arg pointer only (no field reads
+// — the earlier win+0x838 read crashed WS when win wasn't a CGXWindow). Gate
+// /tmp/macws_ws_diag2; addresses computed off the clean image header. ──
 typedef void *(*wcb_flatten_t)(void *, void *, void *, void *);
 static wcb_flatten_t orig_wcb_flatten = NULL;
 static void *hooked_wcb_flatten(void *self, void *a1, void *a2, void *a3) {
-    static int n;
-    BOOL diag = (access("/tmp/macws_ws_diag", F_OK) == 0);
-    if (diag && ++n <= 30)
-        fprintf(stderr, "#### WS_DIAG WSCAWindowBacking::Flatten #%d self=%p flag2e8(pre)=%d\n",
-                n, self, self ? *(int *)((char *)self + 0x2e8) : -1);
     void *r = orig_wcb_flatten(self, a1, a2, a3);
-    if (diag && n <= 30)
-        fprintf(stderr, "#### WS_DIAG   Flatten done self=%p flag2e8(post)=%d\n",
-                self, self ? *(int *)((char *)self + 0x2e8) : -1);
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
+        static int n; if (++n <= 20) {
+            int f2e8 = -1; void *a8 = NULL, *e0 = NULL;
+            if ((uintptr_t)self > 0x100000000) { f2e8 = *(uint8_t *)((char *)self + 0x2e8);
+                a8 = *(void **)((char *)self + 0xa8); e0 = *(void **)((char *)self + 0x2e0); }
+            fprintf(stderr, "#### WS_DIAG2 Flatten #%d self=%p AFTER is_flat2e8=%d backing+0xa8=%p flat2e0=%p\n",
+                    n, self, f2e8, a8, e0);
+        }
+    }
+    return r;
+}
+static void *(*orig_popfc)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static void *hooked_popfc(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 PopulateFlattenedContent #%d self=%p\n", n, a); }
+    return orig_popfc(a, b, c, d, e, f, g, h);
+}
+static void *(*orig_gfmb)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static void *hooked_gfmb(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *r = orig_gfmb(a, b, c, d, e, f, g, h);
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 GetFlattenedMetalBacking #%d backing=%p ret=%p\n", n, a, r); }
+    return r;
+}
+// Flatten-RENDER chain (the validity-commit path) — all normal prologues, hookable.
+static void *(*orig_wlb_flatten)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static void *hooked_wlb_flatten(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 WSCALayerBacking::Flatten #%d self=%p\n", n, a); }
+    return orig_wlb_flatten(a, b, c, d, e, f, g, h);
+}
+static int (*orig_cmb)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static int hooked_cmb(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    int r = orig_cmb(a, b, c, d, e, f, g, h);
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 CreateMetalBacking #%d self=%p ret=%d\n", n, a, r); }
+    return r;
+}
+static void *(*orig_csmpop)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static void *hooked_csmpop(void *self, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *before = ((uintptr_t)self > 0x100000000) ? *(void **)((char *)self + 0x58) : (void *)-1;
+    void *r = orig_csmpop(self, b, c, d, e, f, g, h);
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20) {
+        void *after = ((uintptr_t)self > 0x100000000) ? *(void **)((char *)self + 0x58) : (void *)-1;
+        fprintf(stderr, "#### WS_DIAG2 CSMPopulate #%d self=%p dirty+0x58 before=%p after=%p\n", n, self, before, after); }
+    }
+    return r;
+}
+static void *(*orig_cltd)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static void *hooked_cltd(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 CompositeLayersToDest #%d (AGX GPU composite)\n", n); }
+    return orig_cltd(a, b, c, d, e, f, g, h);
+}
+static void *(*orig_wcomp)(void *, void *, void *, void *, void *, void *, void *, void *) = NULL;
+static void *hooked_wcomp(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *r = orig_wcomp(a, b, c, d, e, f, g, h);
+    // DIAGNOSTIC (gated /tmp/macws_force_wcomp): force "composite the flattened content"
+    // even when IsFlattenedCopyValid says invalid — tests whether the produced flattened
+    // surface (backing+0x2e0) is actually usable. If GlassDemo appears → content is real,
+    // the validity check is the only gap. If black/crash → content genuinely invalid.
+    if (!r && access("/tmp/macws_force_wcomp", F_OK) == 0) r = (void *)1;
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 30)
+        fprintf(stderr, "#### WS_DIAG2 will_composite_ca_flat #%d win=%p ret=%p\n", n, a, r); }
     return r;
 }
 typedef int (*flat_valid_t)(void *, void *, void *, void *);
 static flat_valid_t orig_flat_valid = NULL;
 static int hooked_flat_valid(void *self, void *a1, void *a2, void *a3) {
     int r = orig_flat_valid(self, a1, a2, a3);
-    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
-        static int n; if (++n <= 40)
-            fprintf(stderr, "#### WS_DIAG IsFlattenedCopyValid #%d self=%p ret=%d\n", n, self, r);
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
+        static int n; if (++n <= 30)
+            fprintf(stderr, "#### WS_DIAG2 IsFlattenedCopyValid #%d self=%p ret=%d\n", n, self, r);
     }
     return r;
 }
-// UpdateDisplays — SANITY: known-called (seen in leak trace). If this fires via
-// the slide method, the method works → genLayers=0 is real.
 typedef void *(*upd_disp_t)(void *, void *, void *, void *);
 static upd_disp_t orig_upd_disp = NULL;
 static void *hooked_upd_disp(void *a, void *b, void *c, void *d) {
-    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
         static int n; if (++n <= 5)
-            fprintf(stderr, "#### WS_DIAG UpdateDisplays #%d (slide-method sanity OK)\n", n);
+            fprintf(stderr, "#### WS_DIAG2 UpdateDisplays #%d (SANITY: hook works)\n", n);
     }
     return orig_upd_disp(a, b, c, d);
 }
-// get_selective_sharing_visible_window_list_for_filter — the window enumeration.
-// Log return + first 2 words (CFArray isa/cnt, or C++ vector begin/end → count).
 typedef void *(*vis_list_t)(void *, void *, void *, void *);
 static vis_list_t orig_vis_list = NULL;
 static void *hooked_vis_list(void *a, void *b, void *c, void *d) {
     void *r = orig_vis_list(a, b, c, d);
-    if (access("/tmp/macws_ws_diag", F_OK) == 0) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
         static int n; if (++n <= 10)
-            fprintf(stderr, "#### WS_DIAG visible_window_list #%d ret=%p w0=%p w1=%p\n",
-                    n, r, r ? *(void **)r : NULL, r ? *((void **)r + 1) : NULL);
+            fprintf(stderr, "#### WS_DIAG2 visible_window_list #%d ret=%p\n", n, r);
     }
     return r;
 }
-// generate_layers_for_window(window, ...) — per-window content-source state.
 typedef void *(*gen_layers_t)(void *, void *, void *, void *);
 static gen_layers_t orig_gen_layers = NULL;
-static void *hooked_gen_layers(void *win, void *a1, void *a2, void *a3) {
-    if (win && access("/tmp/macws_ws_diag", F_OK) == 0) {
-        static int n; if (++n <= 30) {
-            uint32_t wid = *(uint32_t *)((char *)win + 0x10); // CGXWindow id (best-effort)
-            void *flatBack = *(void **)((char *)win + 0x838);
-            void *legacy   = *(void **)((char *)win + 0x128);
-            int mode       = *(int  *)((char *)win + 0x58);
-            fprintf(stderr, "#### WS_DIAG genLayers #%d win=%p id=%u mode58=%d flat838=%p legacy128=%p\n",
-                    n, win, wid, mode, flatBack, legacy);
+static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
+    // RE-confirmed: generate_layers_for_window(x0=ctx, x1=WINDOW). Window = arg1.
+    // Content gate @0x18538496c: cbz (window+0x838) → !=0 emits a content layer.
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
+        static int n; if (++n <= 40) {
+            if ((uintptr_t)win > 0x100000000 && (uintptr_t)win < 0x800000000000) {
+                int    f58      = *(int  *)((char *)win + 0x58);
+                void  *wcb_f8   = *(void **)((char *)win + 0xf8);   // WSCAWindowBacking object (prep_ca reads this)
+                void  *flat838  = *(void **)((char *)win + 0x838);  // flatten backing (content gate)
+                void  *legacy128= *(void **)((char *)win + 0x128);  // legacy attached surface
+                fprintf(stderr, "#### WS_DIAG2 genLayers #%d window=%p f58=%d wcb_f8=%p flat838=%p legacy128=%p\n",
+                        n, win, f58, wcb_f8, flat838, legacy128);
+            }
         }
     }
-    return orig_gen_layers(win, a1, a2, a3);
+    return orig_gen_layers(a0, win, a2, a3);
+}
+// Content-receipt chain (does the client's CA content reach WS + bind?). 8-arg
+// safe passthrough (preserves x0-x7). Count-only, gate /tmp/macws_ws_diag2.
+typedef void *(*sl8_t)(void *, void *, void *, void *, void *, void *, void *, void *);
+static sl8_t orig_bind_layer_ctx = NULL, orig_ctx_payload = NULL, orig_bind_surface = NULL;
+static void *hooked_bind_layer_ctx(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 BindLayerCtx #%d a0=%p a1=%p\n", n, a, b); }
+    return orig_bind_layer_ctx(a, b, c, d, e, f, g, h);
+}
+static void *hooked_ctx_payload(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 ctxPayloadChanged #%d a0=%p a1=%p\n", n, a, b); }
+    return orig_ctx_payload(a, b, c, d, e, f, g, h);
+}
+static void *hooked_bind_surface(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 BindSurface #%d a0=%p a2=%p a3(type?)=%p a4=%p\n", n, a, c, d, e); }
+    return orig_bind_surface(a, b, c, d, e, f, g, h);
+}
+static sl8_t orig_prep_ca = NULL;
+static void *hooked_prep_ca(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 10)
+        fprintf(stderr, "#### WS_DIAG2 prepare_coreanimation #%d (flatten driver runs)\n", n); }
+    return orig_prep_ca(a, b, c, d, e, f, g, h);
+}
+static sl8_t orig_upd_flat = NULL;
+static void *hooked_upd_flat(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
+        fprintf(stderr, "#### WS_DIAG2 UpdateFlatteningIfNeeded #%d self=%p\n", n, a); }
+    return orig_upd_flat(a, b, c, d, e, f, g, h);
 }
 
 // SkyLight `MetalContext::StartCompositeForDisplayStream(id<MTLTexture>,
@@ -1559,8 +1646,32 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
         // file (/tmp/macws_ws_diag2) so the normal diag gate (/tmp/macws_ws_diag)
         // stays safe. DO NOT enable until the offsets are re-derived from the
         // on-device 13.4 SkyLight (the agx-re/ bndb is the wrong version).
+        // ── 2026-06-23 FIX: force CA-flatten (sWSCAFlattenAlways=1) ──
+        // RE-confirmed root cause (NOT GPU): in a -virtualonly chroot WS,
+        // _WSWindowOrSurfaceMustFlatten@0x18521b9a8 returns 0 (no real/HiDPI display +
+        // under-established session) so the FIRST CA-flatten never runs → window+0x838
+        // (the flattened-content surface generate_layers' content gate reads) is never
+        // produced → client app windows never composite. Set sWSCAFlattenAlways
+        // (SkyLight __DATA @0x1d8bcc830) = 1 — the real Apple policy flag (official setter
+        // _WSFlatteningSetDebugOptions(0x80000083) case sets Never=0,Always=1) that forces
+        // the flatten path: makes _WSWindowOrSurfaceMustFlatten return 1 AND
+        // UpdateFlatteningIfNeeded reach the Flatten@0x1852e69b4 BL (@0x1852e68cc).
+        // This is a shipped WS policy switch, not a NOP/ret/assert-bypass. Gated
+        // /tmp/macws_flatten_always for A/B; promote to default-on once verified.
+        if (access("/tmp/macws_flatten_always", F_OK) == 0) {
+            volatile uint8_t *fa = (volatile uint8_t *)(0x1d8bcc830 + ((uintptr_t)header - 0x1850E5000));
+            uint8_t before = *fa;
+            *fa = 1;
+            fprintf(stderr, "#### MACWS_FLATTEN_ALWAYS sWSCAFlattenAlways @%p: %d -> %d\n",
+                    (void *)fa, before, *fa);
+        }
         if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
-            uintptr_t sl_slide = (uintptr_t)sym1 - 0x185404fcc;
+            // CLEAN slide off the image header (NOT sym1 — sym1 is PAC-signed and
+            // carried a wrong signature onto the computed addrs → MSHookFunction
+            // crash). header = runtime SkyLight base; unslid __TEXT base verified
+            // 0x1850E5000 (dd of on-device Cryptex cache; all 4 offsets are clean
+            // function prologues).
+            uintptr_t sl_slide = (uintptr_t)header - 0x1850E5000;
             void *fl = (void *)(0x1852e69b4 + sl_slide);
             MSHookFunction(fl, (void *)hooked_wcb_flatten, (void **)&orig_wcb_flatten);
             void *fv = (void *)(0x185320d98 + sl_slide);
@@ -1571,7 +1682,39 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
             MSHookFunction(ud, (void *)hooked_upd_disp, (void **)&orig_upd_disp);
             void *vl = (void *)(0x185104420 + sl_slide);
             MSHookFunction(vl, (void *)hooked_vis_list, (void **)&orig_vis_list);
-            fprintf(stderr, "#### WS_DIAG2 window-backing hooks (UNRELIABLE offsets): slide=%#lx\n", sl_slide);
+            // content-receipt chain (RE-verified prologues @on-version __TEXT)
+            void *blc = (void *)(0x18543bf20 + sl_slide);
+            MSHookFunction(blc, (void *)hooked_bind_layer_ctx, (void **)&orig_bind_layer_ctx);
+            void *cpc = (void *)(0x18543c080 + sl_slide);
+            MSHookFunction(cpc, (void *)hooked_ctx_payload, (void **)&orig_ctx_payload);
+            void *bsf = (void *)(0x1853a9274 + sl_slide);
+            MSHookFunction(bsf, (void *)hooked_bind_surface, (void **)&orig_bind_surface);
+            void *pca = (void *)(0x1853809e4 + sl_slide);
+            MSHookFunction(pca, (void *)hooked_prep_ca, (void **)&orig_prep_ca);
+            void *uf = (void *)(0x1852e66ec + sl_slide);
+            MSHookFunction(uf, (void *)hooked_upd_flat, (void **)&orig_upd_flat);
+            void *pfc = (void *)(0x1852e87d0 + sl_slide);
+            MSHookFunction(pfc, (void *)hooked_popfc, (void **)&orig_popfc);
+            // will_composite hook is a tiny tail-call fn — hooking it relocates the
+            // tail-call to IsFlattenedCopyValid and bypasses that hook. Gate it so we can
+            // run WITHOUT it (so the unmodified tail-call cleanly fires the fv hook).
+            if (access("/tmp/macws_hook_wcomp", F_OK) == 0) {
+                void *wcm = (void *)(0x18538e6a4 + sl_slide);
+                MSHookFunction(wcm, (void *)hooked_wcomp, (void **)&orig_wcomp);
+            }
+            void *gfmb = (void *)(0x185320c9c + sl_slide);
+            MSHookFunction(gfmb, (void *)hooked_gfmb, (void **)&orig_gfmb);
+            // flatten-render validity chain (Step-0 diagnostic)
+            void *wlbf = (void *)(0x18531c654 + sl_slide);
+            MSHookFunction(wlbf, (void *)hooked_wlb_flatten, (void **)&orig_wlb_flatten);
+            void *cmb = (void *)(0x1853f6f6c + sl_slide);
+            MSHookFunction(cmb, (void *)hooked_cmb, (void **)&orig_cmb);
+            void *csmp = (void *)(0x1853f6e54 + sl_slide);
+            MSHookFunction(csmp, (void *)hooked_csmpop, (void **)&orig_csmpop);
+            void *cltd = (void *)(0x185411dc4 + sl_slide);
+            MSHookFunction(cltd, (void *)hooked_cltd, (void **)&orig_cltd);
+            fprintf(stderr, "#### WS_DIAG2 hooks installed (header-based, verified offsets): slide=%#lx fl=%p gl=%p ud=%p\n",
+                    sl_slide, fl, gl, ud);
         }
     } else {
         fprintf(stderr, "#### SkyLight PrepareForUse: symbol not found, skipped\n");
