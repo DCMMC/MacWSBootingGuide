@@ -961,6 +961,10 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
     }
     return r;
 }
+// CCA function range (set at install) — used by the IOSurfaceGetPixelFormat interpose to identify
+// the client IOSurface that _MetalCompositeCoreAnimation resolves at 0x185177294 (it calls
+// IOSurfaceGetPixelFormat(client_iosurface) at 0x1851772f4 — so a caller-filtered interpose catches it).
+static void *g_cca_base = NULL, *g_cca_end = NULL;
 // _MetalCompositeCoreAnimation@0x185176a14(window=x0, srcLayer=x1, dest=x2, sub=x3) — the LIVE
 // CARenderServer CA-tree re-render that Route A (mode-5 CA-flatten) windows like GlassDemo depend on
 // (vs the menu bar's static-IOSurface texture sample). If this fires at all in WS+GlassDemo it's
@@ -1849,6 +1853,7 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
             MSHookFunction(cltd, (void *)hooked_cltd, (void **)&orig_cltd);
             void *cca = (void *)(0x185176a14 + sl_slide);   // _MetalCompositeCoreAnimation (Route A live CA re-render)
             MSHookFunction(cca, (void *)hooked_cca, (void **)&orig_cca);
+            g_cca_base = cca; g_cca_end = (void *)((char *)cca + 0x2000);   // for the IOSurfaceGetPixelFormat caller filter
             fprintf(stderr, "#### WS_DIAG2 hooks installed (header-based, verified offsets): slide=%#lx fl=%p gl=%p ud=%p cca=%p\n",
                     sl_slide, fl, gl, ud, cca);
         }
@@ -6207,6 +6212,36 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     return result;
 }
 DYLD_INTERPOSE(IOSurfaceCreate_safe, IOSurfaceCreate);
+
+// CCA-IOSURF probe (gated /tmp/macws_ws_diag2): _MetalCompositeCoreAnimation resolves the client window
+// IOSurface and calls IOSurfaceGetPixelFormat(it) @0x1851772f4. By filtering this interpose on a caller
+// inside the CCA function range [g_cca_base,g_cca_end), we catch exactly that client IOSurface and read
+// its content at composite time → settles "client delivered content (sample-side fix viable)" vs "empty".
+static unsigned int (*real_iosgpf)(IOSurfaceRef) = NULL;
+unsigned int IOSurfaceGetPixelFormat_probe(IOSurfaceRef s) {
+    if (!real_iosgpf) real_iosgpf = (unsigned int (*)(IOSurfaceRef))dlsym(RTLD_NEXT, "IOSurfaceGetPixelFormat");
+    if (s && access("/tmp/macws_ws_diag2", F_OK) == 0) {
+        void *ra = __builtin_return_address(0);
+        int in_cca = (g_cca_base && ra >= g_cca_base && ra < g_cca_end);
+        static _Atomic int an = 0; int nn = atomic_fetch_add(&an, 1);
+        if (in_cca || nn < 6) {   // first-6 (any caller) proves the interpose fires; in_cca = the CCA client IOSurface
+            fprintf(stderr, "#### WS_DIAG2 iosgpf #%d ra=%p cca=[%p,%p) in_cca=%d s=%p\n",
+                    nn, ra, g_cca_base, g_cca_end, in_cca, (void *)s);
+            if (in_cca) {
+                IOSurfaceLock(s, 0x1 /*readonly*/, NULL);
+                void *b = IOSurfaceGetBaseAddress(s);
+                size_t sz = IOSurfaceGetAllocSize(s);
+                size_t nz = 0, samp = 0;
+                if (b && sz) for (size_t o = 0; o + 4 <= sz; o += 1021 * 4) { if (*(volatile uint32_t *)((char *)b + o) & 0xffffff) nz++; samp++; }
+                IOSurfaceUnlock(s, 0x1, NULL);
+                fprintf(stderr, "#### WS_DIAG2 CCA-IOSURF %lux%lu sz=%#zx base=%p nonzero=%.1f%% (GlassDemo client content @ composite)\n",
+                    (unsigned long)IOSurfaceGetWidth(s), (unsigned long)IOSurfaceGetHeight(s), sz, b, samp ? 100.0 * nz / samp : 0.0);
+            }
+        }
+    }
+    return real_iosgpf ? real_iosgpf(s) : 0;
+}
+DYLD_INTERPOSE(IOSurfaceGetPixelFormat_probe, IOSurfaceGetPixelFormat);
 
 // DIAG (gated /tmp/macws_dest_diag): tag cross-process IOSurface origin. Logs every
 // full-screen IOSurfaceLookupFromMachPort so we can tell whether the compose-dest's
