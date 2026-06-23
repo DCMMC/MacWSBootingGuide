@@ -843,6 +843,41 @@ void macws_grab_composite(id<MTLTexture> tex) {
                 }
                 fprintf(stderr, "#### NEWBUF-PROBE dev=%s ios=%p buf=%p gpuAddress=%#llx\n",
                     dev ? class_getName([dev class]) : "nil", (void *)g_dest_iosurf, (void *)buf, va);
+                // NEWBUF-FILL (decisive): GPU-blit fillBuffer the IOSurface-backed buffer with 0xAB,
+                // then read the IOSurface CPU base. If it reads 0xABABABAB → the buffer TRULY aliases
+                // the IOSurface (kernel mapping reaches where the chroot GPU writes) → only the texture
+                // render-target path is broken (route through buffer). If it stays unchanged → the
+                // chroot's IOSurface GPU mapping does NOT alias at all (kernel/vmspace issue).
+                @try {
+                    if (buf && dev) {
+                        IOSurfaceLock(g_dest_iosurf, 0, NULL);
+                        uint32_t *ip = (uint32_t *)IOSurfaceGetBaseAddress(g_dest_iosurf);
+                        if (ip) { ip[0] = 0x55555555; ip[1] = 0x55555555; }
+                        IOSurfaceUnlock(g_dest_iosurf, 0, NULL);
+                        id q = [dev newCommandQueue];
+                        typedef id (*cb_t)(id, SEL); id cb = ((cb_t)objc_msgSend)(q, sel_registerName("commandBuffer"));
+                        id be = ((cb_t)objc_msgSend)(cb, sel_registerName("blitCommandEncoder"));
+                        typedef unsigned long (*len_t)(id, SEL); unsigned long blen = ((len_t)objc_msgSend)(buf, sel_registerName("length"));
+                        unsigned long fillLen = blen < 0x10000 ? blen : 0x10000;
+                        typedef void (*fb_t)(id, SEL, id, NSRange, uint8_t);
+                        ((fb_t)objc_msgSend)(be, sel_registerName("fillBuffer:range:value:"), buf, NSMakeRange(0, fillLen), 0xAB);
+                        typedef void (*v_t)(id, SEL); ((v_t)objc_msgSend)(be, sel_registerName("endEncoding"));
+                        ((v_t)objc_msgSend)(cb, sel_registerName("commit"));
+                        ((v_t)objc_msgSend)(cb, sel_registerName("waitUntilCompleted"));
+                        typedef long (*st_t)(id, SEL); long status = ((st_t)objc_msgSend)(cb, sel_registerName("status"));
+                        id err = ((id (*)(id, SEL))objc_msgSend)(cb, sel_registerName("error"));
+                        const char *errs = "none";
+                        if (err) { id desc = ((id (*)(id, SEL))objc_msgSend)(err, sel_registerName("localizedDescription")); if (desc) errs = [desc UTF8String]; }
+                        IOSurfaceLock(g_dest_iosurf, 0x1, NULL);
+                        uint32_t v0 = ip ? ip[0] : 0, v1 = ip ? ip[1] : 0;
+                        IOSurfaceUnlock(g_dest_iosurf, 0x1, NULL);
+                        fprintf(stderr, "#### NEWBUF-FILL cb.status=%ld err=%s buf.len=%#lx ios[0,1]=%08x,%08x  VERDICT=%s\n",
+                            status, errs, blen, v0, v1,
+                            (v0 == 0xABABABAB) ? "BUFFER-ALIASES-IOSURFACE ✓ (only texture path broken)"
+                                               : (status == 5 ? "GPU-OP-ERRORED (inconclusive — chroot cmdbuf fails)"
+                                                              : "IOSURFACE-NOT-ALIASED ✗ (kernel/vmspace mapping issue)"));
+                    }
+                } @catch (__unused NSException *e) { fprintf(stderr, "#### NEWBUF-FILL exception\n"); }
             });
             IOSurfaceLock(g_dest_iosurf, 0x1 /*readonly*/, NULL);
             void *b = IOSurfaceGetBaseAddress(g_dest_iosurf);
