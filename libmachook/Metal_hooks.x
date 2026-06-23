@@ -305,13 +305,11 @@ static int macws_blit_to_linear(id<MTLTexture> src, void **out_base, size_t *out
             size_t nz = 0, sm = 0; if (b) for (size_t i = 0; i < lim; i += 997) { sm++; if (((uint8_t *)b)[i]) nz++; }
             fprintf(stderr, "#### VNC-SURF pf=%lu %zux%zu layout=%u compressed=%d iosurf=%p nonzero=%.1f%%\n",
                     spf, w, h, layout, (pbe7 >> 3) & 1, (void *)s, sm ? 100.0 * nz / sm : -1.0); } }
-        // --- LINEAR path (layout==0): read the IOSurface base directly, NO blit ---
-        if (s && layout == 0) {
-            void *base = IOSurfaceGetBaseAddress(s);
-            size_t bpr = IOSurfaceGetBytesPerRow(s);
-            if (base && bpr) { *out_base = base; *out_bpr = bpr; *out_w = w; *out_h = h; return 1; }
-        }
-        // --- TILED path (layout!=0): GPU blit into a buffer-backed LINEAR texture ---
+        // NOTE: do NOT direct-read +0xa0 even for layout==0 — that IOSurface is the WIRED-
+        // but-empty one (AGX_WIRE_IOSURF: the GPU renders the real content into a SEPARATE
+        // backing, the IOSurface stays zero — memory composite-iosurface-all-zero). The
+        // GPU BLIT reads the texture's ACTUAL content (Apple logo / desktop). Always blit.
+        // --- GPU blit into a buffer-backed LINEAR texture (reads the real GPU backing) ---
         if (spf == 550 || spf == 552) {   // pf550 buffer-backed readback aborts; no converter yet
             static int sk = 0; if (sk < 3) { sk++; fprintf(stderr, "#### VNC-BLIT pf=%lu tiled: no linear readback yet (skip)\n", spf); }
             return 0;
@@ -331,6 +329,8 @@ static int macws_blit_to_linear(id<MTLTexture> src, void **out_base, size_t *out
             lintex = buf ? [buf newTextureWithDescriptor:dd offset:0 bytesPerRow:bpr] : nil;
             lw = w; lh = h; lpf = dpf;
         }
+        { static int sl = 0; if (sl < 3) { sl++; fprintf(stderr, "#### VNC-BLIT setup q=%p buf=%p lintex=%p dpf=%lu bpr=%zu\n",
+              (void *)q, (void *)buf, (void *)lintex, (unsigned long)dpf, bpr); } }
         if (!q || !buf || !lintex) return 0;
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
@@ -346,6 +346,15 @@ static int macws_blit_to_linear(id<MTLTexture> src, void **out_base, size_t *out
         }
         void *base = [buf contents];
         if (!base) return 0;
+        // Proof for "the Apple logo composites, so +0xa0 was the wrong read": does the BLIT
+        // surface content the wired +0xa0 IOSurface missed?
+        { static int cl = 0; if (cl < 4) { cl++;
+            size_t nzB = 0, smB = 0; for (size_t i = 0; i < sz; i += 4093) { smB++; if (((uint8_t *)base)[i]) nzB++; }
+            void *a0 = s ? IOSurfaceGetBaseAddress(s) : NULL; size_t nzA = 0, smA = 0;
+            if (a0) { size_t la = IOSurfaceGetAllocSize(s); if (la > sz) la = sz;
+                      for (size_t i = 0; i < la; i += 4093) { smA++; if (((uint8_t *)a0)[i]) nzA++; } }
+            fprintf(stderr, "#### VNC-CONTENT %zux%zu pf=%lu: BLIT nonzero=%.1f%%  vs  +0xa0 nonzero=%.1f%%\n",
+                    w, h, spf, smB ? 100.0 * nzB / smB : -1.0, smA ? 100.0 * nzA / smA : -1.0); } }
         *out_base = base; *out_bpr = bpr; *out_w = w; *out_h = h;
         return 1;
     } @catch (NSException *e) {
