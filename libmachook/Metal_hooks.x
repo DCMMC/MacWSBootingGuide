@@ -2748,6 +2748,11 @@ static void macws_sigabrt_trampoline(int sig) {
     // Env opt-out via MACWS_AGX_KEEP_PLAIN_NEWTEX=1 for A/B testing.
     if (getenv("MACWS_AGX_NATIVE") &&
         !getenv("MACWS_AGX_KEEP_PLAIN_NEWTEX")) {
+        if (access("/tmp/macws_plaintex_log", F_OK) == 0) { static int pl = 0; if (pl++ < 40) {
+            NSUInteger pw = [desc respondsToSelector:@selector(width)] ? [desc width] : 0, ph = [desc respondsToSelector:@selector(height)] ? [desc height] : 0;
+            NSUInteger pu = [desc respondsToSelector:@selector(usage)] ? [desc usage] : 0, ps = [desc respondsToSelector:@selector(storageMode)] ? [desc storageMode] : 0;
+            NSUInteger pp = [desc respondsToSelector:@selector(pixelFormat)] ? [desc pixelFormat] : 0, pt = [desc respondsToSelector:@selector(textureType)] ? [desc textureType] : 2;
+            fprintf(stderr, "#### PLAIN-NEWTEX #%d %lux%lu pf=%lu usage=%#lx sm=%lu tt=%lu\n", pl, (unsigned long)pw, (unsigned long)ph, (unsigned long)pp, (unsigned long)pu, (unsigned long)ps, (unsigned long)pt); } }
         // 2026-06-20 — Route plain newTextureWithDescriptor through the
         // iosurface variant (the known-working path). Create a chroot-
         // local IOSurface sized to the descriptor, then delegate to
@@ -2789,6 +2794,27 @@ static void macws_sigabrt_trampoline(int sig) {
         // tile-memory metadata (handled by iOS AGX kernel at render time).
         NSUInteger storageMode = [desc respondsToSelector:@selector(storageMode)]
                                  ? [desc storageMode] : 0;
+        // === COMPOSITE-DEST COMBINE FIX (regression 4382d8f, RE-confirmed 2026-06-24) ===
+        // The SkyLight compositor combine DEST is a PLAIN, full-screen RENDER TARGET. In the
+        // glass4.png era (58dd895) the plain hook passed it to the NATIVE AGX driver, so the GPU
+        // combine wrote pixels the scanout/+0xa0 readback could see. 4382d8f rerouted ALL plain
+        // textures (incl. the dest) through a synth chroot IOSurface -> the dest detached from the
+        // scanout binding -> +0xa0 reads 0%. Route the DEST (large render target) back to NATIVE
+        // AGX; keep ROUTE-IOSURF for the small intermediate textures. A/B opt-out: MACWS_NO_DEST_NATIVE.
+        {
+            NSUInteger dw = [desc respondsToSelector:@selector(width)]  ? [desc width]  : 0;
+            NSUInteger dh = [desc respondsToSelector:@selector(height)] ? [desc height] : 0;
+            NSUInteger du = [desc respondsToSelector:@selector(usage)]  ? [desc usage]  : 0;
+            if (!getenv("MACWS_NO_DEST_NATIVE") && dw * dh >= 1000000 &&
+                (du & MTLTextureUsageRenderTarget) && storageMode != 3) {
+                id<MTLTexture> dtex = [self hooked_newTextureWithDescriptor:desc];   // native AGX dest (glass4.png path)
+                static int dlog = 0;
+                if (dlog++ < 8)
+                    fprintf(stderr, "#### DEST-NATIVE %lux%lu usage=%#lx sm=%lu -> native AGX render target (combine fix) = %p\n",
+                            (unsigned long)dw, (unsigned long)dh, (unsigned long)du, (unsigned long)storageMode, (void *)dtex);
+                if (dtex) return dtex;   // native returned a usable dest; else fall through to ROUTE-IOSURF
+            }
+        }
         // 2026-06-20 — Texture-type gate: ROUTE-IOSURF can ONLY back
         // MTLTextureType2D or MTLTextureType2DArray (Metal's IOSurface
         // texture validation enforces this with assertion
