@@ -979,6 +979,11 @@ static void *hooked_upd_flat(void *a, void *b, void *c, void *d, void *e, void *
 // Raw (unsigned) address of SkyLight's _WSIOSurfaceCreateTargetableWithFormatAndProtection,
 // resolved in the SkyLight install (DEST-IOSURF 2a). make_iosurf_dest PAC-signs + calls it.
 void *g_ws_targetable_iosurf_raw = NULL;
+// Raw addr of _WSCompositeDestinationCreateWithIOSurface@0x185437210 (type-2 dest path).
+// The dest-routing fix calls this instead of WithMetalTexture so the compositor dest goes
+// through MetalIOSurfaceBacking -> newTextureWithDescriptor:iosurface:plane: (the working
+// source bind path), making impl+0x40 bind to the IOSurface's kernel-aliased GPU pages.
+void *g_ws_wscd_iosurface_raw = NULL;
 
 // SkyLight `MetalContext::StartCompositeForDisplayStream(id<MTLTexture>,
 // id<MTLTexture>, MTLLoadAction, MTLStoreAction)` — asserts target_attachment_0
@@ -1252,6 +1257,40 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
     }
     { extern void macws_dest_trace(const char *, id); macws_dest_trace("WSCDcreate", texture); }
     { extern void macws_2b_alias_dest(id); macws_2b_alias_dest(texture); }
+    // ── DEST→IOSurface REDIRECT (gated /tmp/macws_wscd_iosurf) — THE FIX ──
+    // RE-confirmed: the dest is created via WithMetalTexture (type-3, plain texture) so its
+    // GPU-RT VA (impl+0x40) never binds to an IOSurface (NOT a kernel wall — type=0x82 maps
+    // IOSurface pages writably, no gate). Route the dest through WithIOSurface (type-2) against
+    // a WS targetable IOSurface so it goes through MetalIOSurfaceBacking ->
+    // newTextureWithDescriptor:iosurface:plane: (the working source bind path) -> the GPU
+    // renders into the IOSurface's kernel-aliased pages. Scoped to the 2000x1456 macOS dest.
+    if (access("/tmp/macws_wscd_iosurf", F_OK) == 0 && g_ws_wscd_iosurface_raw && texture) {
+        @try {
+            typedef unsigned long (*wh_t)(id, SEL);
+            unsigned long w = ((wh_t)objc_msgSend)(texture, @selector(width));
+            unsigned long h = ((wh_t)objc_msgSend)(texture, @selector(height));
+            if (w >= 1900 && w < 2300) {
+                extern IOSurfaceRef macws_dest_targetable_iosurf(int, int);
+                IOSurfaceRef ios = macws_dest_targetable_iosurf((int)w, (int)h);
+                if (ios) {
+#if __has_feature(ptrauth_calls)
+                    void *(*wfn)(void *, void *, void *, void *, void *) =
+                        __builtin_ptrauth_sign_unauthenticated(g_ws_wscd_iosurface_raw, 0, 0);
+#else
+                    void *(*wfn)(void *, void *, void *, void *, void *) =
+                        (void *(*)(void *, void *, void *, void *, void *))g_ws_wscd_iosurface_raw;
+#endif
+                    void *wscd2 = NULL;
+                    @try { wscd2 = wfn((void *)ios, ctx, protectionOptions, colorspace, region); }
+                    @catch (__unused NSException *e) { wscd2 = NULL; }
+                    static int rn;
+                    if (rn++ < 4) fprintf(stderr, "#### WSCD->IOSURFACE redirect %lux%lu ios=%p wscd2=%p\n",
+                                          (unsigned long)w, (unsigned long)h, (void *)ios, wscd2);
+                    if (wscd2) return wscd2;
+                }
+            }
+        } @catch (__unused NSException *e) {}
+    }
     // ── TEXTURE-WALL FIX (gated /tmp/macws_dest_iosurf) ──
     // RE-confirmed: the macOS compose dest (pf=550) is a PLAIN render target — the GPU
     // renders into its private backing and the scanout IOSurface stays empty (black).
@@ -1713,7 +1752,9 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
         if (access("/tmp/macws_dest_iosurf", F_OK) == 0) {
             extern void *g_ws_targetable_iosurf_raw;
             g_ws_targetable_iosurf_raw = (void *)(0x1853b9d9c + ((uintptr_t)header - 0x1850E5000));
-            fprintf(stderr, "#### DEST-IOSURF targetable helper resolved @ %p\n", g_ws_targetable_iosurf_raw);
+            g_ws_wscd_iosurface_raw = (void *)(0x185437210 + ((uintptr_t)header - 0x1850E5000));
+            fprintf(stderr, "#### DEST-IOSURF targetable helper @ %p ; WithIOSurface @ %p\n",
+                    g_ws_targetable_iosurf_raw, g_ws_wscd_iosurface_raw);
         }
         if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
             // CLEAN slide off the image header (NOT sym1 — sym1 is PAC-signed and

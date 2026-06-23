@@ -729,6 +729,34 @@ id macws_make_iosurf_dest(id orig) {
         return nt;
     } @catch (__unused NSException *e) { return nil; }
 }
+// Targetable IOSurface for the type-2 dest redirect (cached by w×h). g_dest_iosurf =
+// the latest one, so the grab can read the type-2 dest's content directly.
+IOSurfaceRef g_dest_iosurf = NULL;
+IOSurfaceRef macws_dest_targetable_iosurf(int w, int h) {
+    static NSMutableDictionary *cache = nil;
+    static dispatch_once_t once; dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+    NSString *key = [NSString stringWithFormat:@"%dx%d", w, h];
+    @synchronized(cache) { NSValue *v = cache[key]; if (v) { g_dest_iosurf = (IOSurfaceRef)[v pointerValue]; return g_dest_iosurf; } }
+    IOSurfaceRef surf = NULL;
+    extern void *g_ws_targetable_iosurf_raw;
+    if (g_ws_targetable_iosurf_raw) {
+#if __has_feature(ptrauth_calls)
+        IOSurfaceRef (*tfn)(int, int, int, unsigned long long, const char *) =
+            __builtin_ptrauth_sign_unauthenticated(g_ws_targetable_iosurf_raw, 0, 0);
+#else
+        IOSurfaceRef (*tfn)(int, int, int, unsigned long long, const char *) =
+            (IOSurfaceRef (*)(int, int, int, unsigned long long, const char *))g_ws_targetable_iosurf_raw;
+#endif
+        @try { surf = tfn(w, h, 4 /*'BGRA'*/, 0, "MacWSDestIOSurf"); } @catch (__unused NSException *e) { surf = NULL; }
+    }
+    if (!surf) {
+        NSDictionary *p = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA') };
+        surf = IOSurfaceCreate((__bridge CFDictionaryRef)p);
+    }
+    if (surf) { @synchronized(cache) { cache[key] = [NSValue valueWithPointer:surf]; } g_dest_iosurf = surf; }
+    return surf;
+}
 // DEST-PATH TRACE (gated /tmp/macws_dest_trace): log every macOS-sized (w>=1900)
 // texture seen at each composite entry point, to map WHERE the 2000x1456 macOS
 // virtual-display dest is created/used (its composite path is intermittent across
@@ -795,6 +823,24 @@ void macws_2b_alias_dest(id texture) {
 }
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
+    // DEST-IOSURF-CONTENT (gated /tmp/macws_wscd_iosurf): probe the type-2 dest's IOSurface
+    // (g_dest_iosurf) for GPU-rendered content. Non-zero => the WithIOSurface redirect made
+    // the GPU render into the readable IOSurface (THE FIX worked).
+    if (g_dest_iosurf && access("/tmp/macws_wscd_iosurf", F_OK) == 0) {
+        @try {
+            IOSurfaceLock(g_dest_iosurf, 0x1 /*readonly*/, NULL);
+            void *b = IOSurfaceGetBaseAddress(g_dest_iosurf);
+            size_t sz = IOSurfaceGetAllocSize(g_dest_iosurf);
+            if (b && sz) {
+                size_t nz = 0, samp = 0;
+                for (size_t o = 0; o + 4 <= sz; o += 997 * 4) { if (*(volatile uint32_t *)((char *)b + o) & 0xffffff) nz++; samp++; }
+                static _Atomic int dn = 0;
+                if (atomic_fetch_add(&dn, 1) < 12)
+                    fprintf(stderr, "#### DEST-IOSURF-CONTENT base=%p sz=%#zx nonzero=%.1f%%\n",
+                        b, sz, samp ? 100.0 * nz / samp : 0.0);
+            }
+        } @catch (__unused NSException *e) {}
+    }
     if (!tex || access("/tmp/macws_grab_png", F_OK) != 0) return;
     size_t w = [tex width], h = [tex height];
     unsigned long pf = (unsigned long)[tex pixelFormat];
@@ -2010,6 +2056,18 @@ static void macws_sigabrt_trampoline(int sig) {
                 spf, (spf>>24)&0xff, (spf>>16)&0xff, (spf>>8)&0xff, spf&0xff,
                 (unsigned long)plane, (unsigned long)desc.storageMode, (unsigned long)desc.usage,
                 class_getName([self class]));
+        }
+    }
+    // DEST STORAGE FORCE (gated /tmp/macws_wscd_iosurf): the type-2 dest RT texture is
+    // created Private (storage=2) -> the GPU writes a private alloc and the IOSurface stays
+    // empty. Force Shared (Apple Silicon's host-coherent mode) for the 2000x1456 macOS dest so
+    // the GPU renders into the IOSurface itself (CPU/VNC-readable).
+    if (iosurface && desc && access("/tmp/macws_wscd_iosurf", F_OK) == 0) {
+        NSUInteger dw = [desc width];
+        if (dw >= 1900 && dw < 2300 && [desc storageMode] == MTLStorageModePrivate) {
+            [desc setStorageMode:MTLStorageModeShared];
+            static int sn; if (sn++ < 4)
+                fprintf(stderr, "#### DEST-STORAGE forced Shared for %lux%lu\n", (unsigned long)dw, (unsigned long)[desc height]);
         }
     }
     static int classlog = 0;
