@@ -937,14 +937,31 @@ void macws_grab_composite(id<MTLTexture> tex) {
                 @try {
                     id<MTLDevice> dev = [tex device];
                     size_t bbpr = ((bw * 4 + 255) / 256) * 256, blen = bbpr * bh;  // 256-align for copyToBuffer
-                    id<MTLBuffer> buf = [dev newBufferWithLength:blen options:MTLResourceStorageModeShared];
+                    // newBufferWithLength gives gpuAddr=0 (no GPU resource) → texture-from-it is nil. Use a
+                    // fresh LINEAR IOSurface + newBufferWithIOSurface (registers via sel=0x9 → real VA); read the IOSurface.
+                    NSDictionary *sp = @{ (id)kIOSurfaceWidth:@((long)bw), (id)kIOSurfaceHeight:@((long)bh),
+                        (id)kIOSurfaceBytesPerElement:@4, (id)kIOSurfaceBytesPerRow:@((long)bbpr),
+                        (id)kIOSurfacePixelFormat:@(0x42475241) /*BGRA*/ };
+                    IOSurfaceRef osurf = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+                    typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                    id<MTLBuffer> buf = osurf ? ((nbi_t)objc_msgSend)(dev, sel_registerName("newBufferWithIOSurface:"), osurf) : nil;
+                    { uint64_t bva = 0; if (buf) { typedef uint64_t(*ga_t)(id,SEL); bva = ((ga_t)objc_msgSend)(buf, sel_registerName("gpuAddress")); }
+                      fprintf(stderr, "#### BLIT-TEST destbuf osurf=%p buf=%p gpuAddr=%#llx\n", (void *)osurf, (void *)buf, bva); }
                     // AGXG13GFamilyBlitContext has NO copyFromTexture:toBuffer: (unrecognized selector).
                     // Use copyFromTexture:toTexture: into a BUFFER-BACKED LINEAR Shared texture (Asahi staging-blit):
                     // the blit decompresses+detiles into the linear texture, whose backing IS our CPU-readable buffer.
                     MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)bpf width:bw height:bh mipmapped:NO];
                     dd.usage = MTLTextureUsageShaderRead; dd.storageMode = MTLStorageModeShared;
                     id<MTLTexture> lintex = buf ? [buf newTextureWithDescriptor:dd offset:0 bytesPerRow:bbpr] : nil;
-                    if (!lintex) { fprintf(stderr, "#### BLIT-TEST lintex nil (buf=%p pf=%lu — buffer-backed linear unsupported)\n", (void *)buf, bpf); return; }
+                    if (!lintex) {
+                        fprintf(stderr, "#### BLIT-TEST lintex nil: buf.len=%lu need(off0+%zu) bbpr=%zu pf=%lu — diagnosing...\n",
+                            (unsigned long)[buf length], blen, bbpr, bpf);
+                        id<MTLBuffer> pbuf = [dev newBufferWithLength:blen options:MTLResourceStorageModePrivate];
+                        id<MTLTexture> plt = pbuf ? [pbuf newTextureWithDescriptor:dd offset:0 bytesPerRow:bbpr] : nil;
+                        fprintf(stderr, "#### BLIT-TEST Private-buf lintex=%p pbuf=%p (len=%lu) => %s\n", (void *)plt, (void *)pbuf,
+                            (unsigned long)[pbuf length], plt ? "PRIVATE WORKS (storageMode IS the gate)" : "Private ALSO nil (downstream: size/compression/resource)");
+                        return;
+                    }
                     id<MTLCommandQueue> q = [dev newCommandQueue];
                     id<MTLCommandBuffer> cb = [q commandBuffer];
                     id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
@@ -952,7 +969,7 @@ void macws_grab_composite(id<MTLTexture> tex) {
                          sourceSize:MTLSizeMake(bw,bh,1) toTexture:lintex destinationSlice:0 destinationLevel:0
                          destinationOrigin:MTLOriginMake(0,0,0)];
                     [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
-                    long st = (long)[cb status]; id err = [cb error]; void *bc = [buf contents];
+                    long st = (long)[cb status]; id err = [cb error]; void *bc = osurf ? IOSurfaceGetBaseAddress(osurf) : NULL;
                     size_t nz = 0, sm = 0;
                     if (bc && st == 4) for (size_t i = 0; i + 4 <= blen; i += 997 * 4) { sm++; if (*(uint32_t *)((char *)bc + i) & 0xffffff) nz++; }
                     fprintf(stderr, "#### BLIT-TEST %zux%zu pf=%lu status=%ld err=%s contents=%p nonzero=%.1f%%\n",
