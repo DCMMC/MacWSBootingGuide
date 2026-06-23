@@ -1435,6 +1435,31 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
                 "SEPARATE backing[0:4K] nonzero=%d sum=%llu\n",
                 (void *)tex, prev_base, base, nz, (unsigned long long)acc);
         }
+        // VERIFY-DETILE (gated /tmp/macws_grab_now, one-shot): dump the largest CONTENT source
+        // backing to /tmp/macws_src.raw for offline agx_detile — proves the Asahi algorithm on real
+        // device content (the dest is empty in coexist, but these AGX-set source backings have it).
+        if (access("/tmp/macws_grab_now", F_OK) == 0) {
+            size_t tw = [tex width], th = [tex height];
+            unsigned long pf = (unsigned long)[tex pixelFormat];
+            if (tw >= 256 && th >= 48) {
+                int nzc = 0; for (int i = 0; i < 8192; i++) if (((volatile uint8_t *)prev_base)[i]) nzc++;
+                if (nzc > 400) {
+                    size_t ext = 0; { vm_address_t a = (vm_address_t)prev_base; vm_size_t rs = 0;
+                        vm_region_basic_info_data_64_t bi2; mach_msg_type_number_t c2 = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t o2 = MACH_PORT_NULL;
+                        if (vm_region_64(mach_task_self(), &a, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi2, &c2, &o2) == KERN_SUCCESS && a <= (vm_address_t)prev_base) ext = (size_t)(a + rs - (vm_address_t)prev_base); }
+                    size_t bpp = (pf == 115) ? 8 : 4;
+                    size_t want = ((tw + 63) / 64 * 64) * ((th + 63) / 64 * 64) * bpp * 2;
+                    if (want > ext) want = ext;
+                    if (want > 96u * 1024 * 1024) want = 96u * 1024 * 1024;
+                    uint32_t stride = *(volatile uint32_t *)((char *)impl + 0xa8);
+                    FILE *f = fopen("/tmp/macws_src.raw", "wb");
+                    if (f) { uint32_t hd[6] = { (uint32_t)tw, (uint32_t)th, (uint32_t)pf, layout, (uint32_t)want, stride };
+                        fwrite(hd, 4, 6, f); fwrite(prev_base, 1, want, f); fclose(f);
+                        fprintf(stderr, "#### VERIFY-DETILE dumped %zux%zu pf=%lu layout=%d bytes=%zu nz8k=%d -> /tmp/macws_src.raw\n", tw, th, pf, layout, want, nzc);
+                        unlink("/tmp/macws_grab_now"); }
+                }
+            }
+        }
         return;
     }
     *(void * volatile *)((char *)impl + 0xa0) = base;
