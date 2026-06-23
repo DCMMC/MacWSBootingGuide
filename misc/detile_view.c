@@ -29,8 +29,17 @@ static void wr(FILE *f, const char *t, const uint8_t *d, uint32_t n) {
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s in.raw out.png\n", argv[0]); return 1; }
     FILE *f = fopen(argv[1], "rb"); if (!f) { perror("open"); return 1; }
-    uint32_t hd[6]; if (fread(hd, 4, 6, f) != 6) { fprintf(stderr, "short header\n"); return 1; }
-    uint32_t w = hd[0], h = hd[1], pf = hd[2], layout = hd[3], bytes = hd[4], stride = hd[5];
+    uint32_t hd[7]; if (fread(hd, 4, 1, f) != 1) { fprintf(stderr, "short\n"); return 1; }
+    uint32_t w, h, pf, layout, bytes, stride;
+    if (hd[0] == 0x47524232u) {            // GRB2 dest grab: magic,w,h,pf,layout,sz,bpr
+        if (fread(hd + 1, 4, 6, f) != 6) { fprintf(stderr, "short GRB2\n"); return 1; }
+        w = hd[1]; h = hd[2]; pf = hd[3]; layout = hd[4]; bytes = hd[5]; stride = hd[6];
+        if (layout == 0xD0) layout = 0;    // detiled-linear marker -> linear (use bpr)
+        else if (layout == 0xA0) layout = 2;   // raw-backing marker -> treat as tiled
+    } else {                               // VERIFY-DETILE src: w,h,pf,layout,bytes,stride
+        if (fread(hd + 1, 4, 5, f) != 5) { fprintf(stderr, "short\n"); return 1; }
+        w = hd[0]; h = hd[1]; pf = hd[2]; layout = hd[3]; bytes = hd[4]; stride = hd[5];
+    }
     if (argc > 3 && argv[3][0] == 't') { layout = 2; fprintf(stderr, "[forced tiled]\n"); }   // override: force detile
     if (argc > 3 && argv[3][0] == 'l') { layout = 0; fprintf(stderr, "[forced linear]\n"); }
     uint8_t *src = malloc(bytes); if (fread(src, 1, bytes, f) != bytes) fprintf(stderr, "short data\n"); fclose(f);

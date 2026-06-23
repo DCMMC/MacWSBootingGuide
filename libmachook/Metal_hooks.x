@@ -1437,8 +1437,8 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
         }
         // VERIFY-DETILE (gated /tmp/macws_grab_now, one-shot): dump the largest CONTENT source
         // backing to /tmp/macws_src.raw for offline agx_detile — proves the Asahi algorithm on real
-        // device content (the dest is empty in coexist, but these AGX-set source backings have it).
-        if (access("/tmp/macws_grab_now", F_OK) == 0) {
+        // device content. SEPARATE trigger (macws_src_now) so it doesn't race the dest grab (macws_grab_now).
+        if (access("/tmp/macws_src_now", F_OK) == 0) {
             size_t tw = [tex width], th = [tex height];
             unsigned long pf = (unsigned long)[tex pixelFormat];
             if (tw >= 256 && th >= 48) {
