@@ -976,6 +976,10 @@ static void *hooked_upd_flat(void *a, void *b, void *c, void *d, void *e, void *
     return orig_upd_flat(a, b, c, d, e, f, g, h);
 }
 
+// Raw (unsigned) address of SkyLight's _WSIOSurfaceCreateTargetableWithFormatAndProtection,
+// resolved in the SkyLight install (DEST-IOSURF 2a). make_iosurf_dest PAC-signs + calls it.
+void *g_ws_targetable_iosurf_raw = NULL;
+
 // SkyLight `MetalContext::StartCompositeForDisplayStream(id<MTLTexture>,
 // id<MTLTexture>, MTLLoadAction, MTLStoreAction)` — asserts target_attachment_0
 // != nil at MetalContext.mm:627. When the CA Framebuffer texture cascade from
@@ -1694,6 +1698,17 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
             *fa = 1;
             fprintf(stderr, "#### MACWS_FLATTEN_ALWAYS sWSCAFlattenAlways @%p: %d -> %d\n",
                     (void *)fa, before, *fa);
+        }
+        // ── DEST-IOSURF (2a): resolve SkyLight's targetable-IOSurface helper ──
+        // _WSIOSurfaceCreateTargetableWithFormatAndProtection@0x1853b9d9c
+        //   (int w, int h, int format[4='BGRA'], uint64_t protection, const char *label)
+        // builds an IOSurface with the kernel metadata AGX needs for a GPU-render
+        // target (what the working source/capture path uses) — our plain IOSurfaceCreate
+        // lacks it. Store the RAW (unsigned) addr; make_iosurf_dest PAC-signs + calls it.
+        if (access("/tmp/macws_dest_iosurf", F_OK) == 0) {
+            extern void *g_ws_targetable_iosurf_raw;
+            g_ws_targetable_iosurf_raw = (void *)(0x1853b9d9c + ((uintptr_t)header - 0x1850E5000));
+            fprintf(stderr, "#### DEST-IOSURF targetable helper resolved @ %p\n", g_ws_targetable_iosurf_raw);
         }
         if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
             // CLEAN slide off the image header (NOT sym1 — sym1 is PAC-signed and

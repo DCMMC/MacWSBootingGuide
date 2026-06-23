@@ -658,6 +658,10 @@ id macws_make_iosurf_dest(id orig) {
         NSUInteger w = [t0 width], h = [t0 height], pf = [t0 pixelFormat], usage = [t0 usage];
         id<MTLDevice> dev = [t0 device];
         if (!dev || w == 0 || h == 0) return nil;
+        // SCOPE: only the macOS virtual-display dest (w<2300, e.g. 2000x1456). Swapping
+        // the 2388-wide iOS-panel/strip dests destabilized WS (coexist panel render) — the
+        // macOS app content lives in the smaller virtual-display surface that feeds VNC.
+        if (w >= 2300) return nil;
         // Skip only OUR OWN swapped textures on re-entry (prevents chaining/churn).
         // Do NOT skip "has an IOSurface" — the plain dest has a SEPARATE scanout
         // IOSurface at +0xa0 yet still renders into a private backing, so it must be
@@ -671,17 +675,37 @@ id macws_make_iosurf_dest(id orig) {
         id<MTLTexture> hit = nil;
         @synchronized(cache) { hit = cache[key]; }
         if (hit) return hit;
-        NSDictionary *props = @{
-            @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
-            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
-            @"IOSurfaceCacheMode": @1792, @"IOSurfaceMapCacheAttribute": @0,
-            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
-        };
-        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        IOSurfaceRef surf = NULL;
+        // 2a: prefer SkyLight's targetable-IOSurface helper (GPU-render metadata AGX
+        // needs for aliasing) over plain IOSurfaceCreate. Raw addr resolved in the
+        // SkyLight install; PAC-sign (arm64e) before the indirect call.
+        extern void *g_ws_targetable_iosurf_raw;
+        if (g_ws_targetable_iosurf_raw) {
+#if __has_feature(ptrauth_calls)
+            IOSurfaceRef (*tfn)(int, int, int, unsigned long long, const char *) =
+                __builtin_ptrauth_sign_unauthenticated(g_ws_targetable_iosurf_raw, 0, 0);
+#else
+            IOSurfaceRef (*tfn)(int, int, int, unsigned long long, const char *) =
+                (IOSurfaceRef (*)(int, int, int, unsigned long long, const char *))g_ws_targetable_iosurf_raw;
+#endif
+            @try { surf = tfn((int)w, (int)h, 4 /*'BGRA'*/, 0, "MacWSDest"); }
+            @catch (__unused NSException *e) { surf = NULL; }
+            if (surf) fprintf(stderr, "#### DEST-SWAP targetable IOSurface %lux%lu -> %p\n",
+                (unsigned long)w, (unsigned long)h, (void *)surf);
+        }
         if (!surf) {
-            NSDictionary *bp = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
-                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA') };
-            surf = IOSurfaceCreate((__bridge CFDictionaryRef)bp);
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+                @"IOSurfaceCacheMode": @1792, @"IOSurfaceMapCacheAttribute": @0,
+                @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+            };
+            surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            if (!surf) {
+                NSDictionary *bp = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+                    @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA') };
+                surf = IOSurfaceCreate((__bridge CFDictionaryRef)bp);
+            }
         }
         if (!surf) return nil;
         MTLTextureDescriptor *d = [MTLTextureDescriptor
