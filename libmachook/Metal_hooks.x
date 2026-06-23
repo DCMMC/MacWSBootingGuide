@@ -922,6 +922,43 @@ void macws_grab_composite(id<MTLTexture> tex) {
             } @catch(__unused NSException *e){ fprintf(stderr,"#### NEWBUF-TEST exception\n"); }
         });
     }
+    // BLIT-TEST (Asahi Scheme B, gated /tmp/macws_blit_test, one-shot): read the composite dest
+    // TEXTURE via copyFromTexture:toBuffer: — Metal decompresses+detiles into a LINEAR Shared
+    // buffer. This reads where the GPU actually wrote (the texture's RT backing impl+0x40), NOT
+    // the empty +0xa0 IOSurface the grab reads — so it bypasses BOTH the coherence wall and the
+    // compression/AUX. Decisive: if status=Completed + nonzero, the texture HAS content + Metal
+    // gave us a clean linear copy (the whole problem solved); writes /tmp/macws_blit.raw.
+    if (tex && access("/tmp/macws_blit_test", F_OK) == 0) {
+        static dispatch_once_t blt;
+        size_t bw = [tex width], bh = [tex height]; unsigned long bpf = (unsigned long)[tex pixelFormat];
+        if ((size_t)bw * bh >= 1000000 && (bpf == 80 || bpf == 550 || bpf == 552)) {
+            dispatch_once(&blt, ^{
+                @try {
+                    id<MTLDevice> dev = [tex device];
+                    size_t bbpr = bw * 4, blen = bbpr * bh;
+                    id<MTLBuffer> buf = [dev newBufferWithLength:blen options:MTLResourceStorageModeShared];
+                    id<MTLCommandQueue> q = [dev newCommandQueue];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                    [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                         sourceSize:MTLSizeMake(bw,bh,1) toBuffer:buf destinationOffset:0
+                         destinationBytesPerRow:bbpr destinationImageHeight:bh];
+                    [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    long st = (long)[cb status]; id err = [cb error]; void *bc = [buf contents];
+                    size_t nz = 0, sm = 0;
+                    if (bc && st == 4) for (size_t i = 0; i + 4 <= blen; i += 997 * 4) { sm++; if (*(uint32_t *)((char *)bc + i) & 0xffffff) nz++; }
+                    fprintf(stderr, "#### BLIT-TEST %zux%zu pf=%lu status=%ld err=%s contents=%p nonzero=%.1f%%\n",
+                        bw, bh, bpf, st, err ? [[err localizedDescription] UTF8String] : "none", bc, sm ? 100.0 * nz / sm : -1.0);
+                    if (st == 4 && bc) {
+                        FILE *f = fopen("/tmp/macws_blit.raw", "wb");
+                        if (f) { uint32_t hd[7] = {0x47524232u, (uint32_t)bw, (uint32_t)bh, (uint32_t)bpf, 0xD0, (uint32_t)blen, (uint32_t)bbpr};
+                                 fwrite(hd, 4, 7, f); fwrite(bc, 1, blen, f); fclose(f);
+                                 fprintf(stderr, "#### BLIT-TEST wrote /tmp/macws_blit.raw (%zu bytes)\n", blen); }
+                    }
+                } @catch (__unused NSException *e) { fprintf(stderr, "#### BLIT-TEST exception\n"); }
+            });
+        }
+    }
     // BINDFIX-RECHECK (gated /tmp/macws_bindfix): re-read the LIVE composite dest's impl+0x40
     // AFTER frames executed. Still realVA => no encoder re-clobber (empty IOSurface = no-alias,
     // kernel-deep). 0/changed => encoder re-clobbers (durability fix = wrapper+0x48). Decisive.
