@@ -19,6 +19,7 @@
 typedef id IOSurfaceRef;
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
 extern IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t port);
+extern uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef surface);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
 extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
 extern int IOSurfaceLock(IOSurfaceRef surface, uint32_t options, uint32_t *seed);
@@ -6213,35 +6214,12 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
 }
 DYLD_INTERPOSE(IOSurfaceCreate_safe, IOSurfaceCreate);
 
-// CCA-IOSURF probe (gated /tmp/macws_ws_diag2): _MetalCompositeCoreAnimation resolves the client window
-// IOSurface and calls IOSurfaceGetPixelFormat(it) @0x1851772f4. By filtering this interpose on a caller
-// inside the CCA function range [g_cca_base,g_cca_end), we catch exactly that client IOSurface and read
-// its content at composite time → settles "client delivered content (sample-side fix viable)" vs "empty".
-static unsigned int (*real_iosgpf)(IOSurfaceRef) = NULL;
-unsigned int IOSurfaceGetPixelFormat_probe(IOSurfaceRef s) {
-    if (!real_iosgpf) real_iosgpf = (unsigned int (*)(IOSurfaceRef))dlsym(RTLD_NEXT, "IOSurfaceGetPixelFormat");
-    if (s && access("/tmp/macws_ws_diag2", F_OK) == 0) {
-        void *ra = __builtin_return_address(0);
-        int in_cca = (g_cca_base && ra >= g_cca_base && ra < g_cca_end);
-        static _Atomic int an = 0; int nn = atomic_fetch_add(&an, 1);
-        if (in_cca || nn < 6) {   // first-6 (any caller) proves the interpose fires; in_cca = the CCA client IOSurface
-            fprintf(stderr, "#### WS_DIAG2 iosgpf #%d ra=%p cca=[%p,%p) in_cca=%d s=%p\n",
-                    nn, ra, g_cca_base, g_cca_end, in_cca, (void *)s);
-            if (in_cca) {
-                IOSurfaceLock(s, 0x1 /*readonly*/, NULL);
-                void *b = IOSurfaceGetBaseAddress(s);
-                size_t sz = IOSurfaceGetAllocSize(s);
-                size_t nz = 0, samp = 0;
-                if (b && sz) for (size_t o = 0; o + 4 <= sz; o += 1021 * 4) { if (*(volatile uint32_t *)((char *)b + o) & 0xffffff) nz++; samp++; }
-                IOSurfaceUnlock(s, 0x1, NULL);
-                fprintf(stderr, "#### WS_DIAG2 CCA-IOSURF %lux%lu sz=%#zx base=%p nonzero=%.1f%% (GlassDemo client content @ composite)\n",
-                    (unsigned long)IOSurfaceGetWidth(s), (unsigned long)IOSurfaceGetHeight(s), sz, b, samp ? 100.0 * nz / samp : 0.0);
-            }
-        }
-    }
-    return real_iosgpf ? real_iosgpf(s) : 0;
-}
-DYLD_INTERPOSE(IOSurfaceGetPixelFormat_probe, IOSurfaceGetPixelFormat);
+// NOTE: a caller-filtered IOSurfaceGetPixelFormat interpose to catch the CCA client IOSurface was tried
+// and REMOVED — runtime-verified it fires (28x) but NEVER with a caller in the CCA range (in_cca=0): the
+// SkyLight→IOSurface call inside _MetalCompositeCoreAnimation is an intra-dyld-shared-cache DIRECT bind
+// that DYLD_INTERPOSE cannot redirect. It also broke WS (an always-on interpose returning 0 when
+// dlsym(RTLD_NEXT) is null poisons every IOSurfaceGetPixelFormat). To grab the CCA client surface, use
+// lldb at 0x185177294+slide or replicate the exact x9_11=*(window+0xf8+OFF)→+0x2b0→+0x18 chain in hooked_cca.
 
 // DIAG (gated /tmp/macws_dest_diag): tag cross-process IOSurface origin. Logs every
 // full-screen IOSurfaceLookupFromMachPort so we can tell whether the compose-dest's
@@ -6252,9 +6230,21 @@ IOSurfaceRef IOSurfaceLookupFromMachPort_log(mach_port_t port) {
     IOSurfaceRef s = IOSurfaceLookupFromMachPort(port);
     if (s && access("/tmp/macws_dest_diag", F_OK) == 0) {
         size_t w = IOSurfaceGetWidth(s), h = IOSurfaceGetHeight(s);
-        if (w * h >= 0x100000) {
+        if (w * h >= 0x4000) {       // window-sized+ (catches GlassDemo's window, the menu bar, fb)
             static int ll = 0;
-            if (ll++ < 32) fprintf(stderr, "#### IOSLOOKUP-FS port=%u -> %p %zux%zu\n", port, (void *)s, w, h);
+            if (ll++ < 40) {
+                // OPTION-2 GATE: read the looked-up (client) surface content. A window-sized surface with
+                // nonzero content = GlassDemo's CG-rendered window arriving at WS → capture point for the
+                // static-texture bypass. (Lookup may be pre-first-frame; the shared surface fills later.)
+                IOSurfaceLock(s, 0x1 /*readonly*/, NULL);
+                void *b = IOSurfaceGetBaseAddress(s); size_t sz = IOSurfaceGetAllocSize(s);
+                size_t nz = 0, samp = 0;
+                if (b && sz) for (size_t o = 0; o + 4 <= sz; o += 1021 * 4) { if (*(volatile uint32_t *)((char *)b + o) & 0xffffff) nz++; samp++; }
+                IOSurfaceUnlock(s, 0x1, NULL);
+                unsigned int pf = IOSurfaceGetPixelFormat(s);
+                fprintf(stderr, "#### IOSLOOKUP port=%u -> %p %zux%zu pf=0x%x sz=%#zx nonzero=%.1f%%\n",
+                        port, (void *)s, w, h, pf, sz, samp ? 100.0 * nz / samp : 0.0);
+            }
         }
     }
     return s;
