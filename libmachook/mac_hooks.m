@@ -938,6 +938,11 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
     int  avalid = ((uintptr_t)a0 > 0x100000000 && (uintptr_t)a0 < 0x800000000000);
     void *list_before = (diag2 && avalid) ? *(void **)((char *)a0 + 0x78) : NULL;
     void *r = orig_gen_layers(a0, win, a2, a3);
+    if (diag2 && (uintptr_t)win > 0x100000000 && (uintptr_t)win < 0x800000000000
+        && *(int *)((char *)win + 0x58) == 5) {          // mode-5 CA-flatten window = GlassDemo
+        void *w = *(void **)((char *)win + 0xf8);
+        if ((uintptr_t)w > 0x100000000 && (uintptr_t)w < 0x800000000000) g_glass_wcb = w;
+    }
     if (diag2) {
         static int n; if (++n <= 60) {
             if ((uintptr_t)win > 0x100000000 && (uintptr_t)win < 0x800000000000) {
@@ -966,6 +971,7 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
 // the client IOSurface that _MetalCompositeCoreAnimation resolves at 0x185177294 (it calls
 // IOSurfaceGetPixelFormat(client_iosurface) at 0x1851772f4 — so a caller-filtered interpose catches it).
 static void *g_cca_base = NULL, *g_cca_end = NULL;
+static void *g_glass_wcb = NULL;   // GlassDemo's WSCAWindowBacking (captured in gen_layers, mode-5 window)
 // _MetalCompositeCoreAnimation@0x185176a14(window=x0, srcLayer=x1, dest=x2, sub=x3) — the LIVE
 // CARenderServer CA-tree re-render that Route A (mode-5 CA-flatten) windows like GlassDemo depend on
 // (vs the menu bar's static-IOSurface texture sample). If this fires at all in WS+GlassDemo it's
@@ -996,26 +1002,49 @@ static void *hooked_cca(void *window, void *srcLayer, void *dest, void *sub) {
 // safe passthrough (preserves x0-x7). Count-only, gate /tmp/macws_ws_diag2.
 typedef void *(*sl8_t)(void *, void *, void *, void *, void *, void *, void *, void *);
 static sl8_t orig_bind_layer_ctx = NULL, orig_ctx_payload = NULL, orig_bind_surface = NULL;
+// RECEIPT-SET probe: read GlassDemo's wcb+0x2b0 (the field CCA samples; NULL in chroot) before/after each
+// content-receipt fn — if any one sets it, we find the binder; if none, the setter is elsewhere (QuartzCore).
+static void *macws_glass_2b0(void) {
+    return (g_glass_wcb && (uintptr_t)g_glass_wcb > 0x100000000 && (uintptr_t)g_glass_wcb < 0x800000000000)
+           ? *(void **)((char *)g_glass_wcb + 0x2b0) : NULL;
+}
+static void macws_receipt_check(const char *name, void *before) {
+    void *after = macws_glass_2b0();
+    if (g_glass_wcb && before != after && access("/tmp/macws_ws_diag2", F_OK) == 0)
+        fprintf(stderr, "#### RECEIPT-SET %s wcb(%p)+0x2b0 %p->%p\n", name, g_glass_wcb, before, after);
+}
 static void *hooked_bind_layer_ctx(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *before = macws_glass_2b0();
     if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
         fprintf(stderr, "#### WS_DIAG2 BindLayerCtx #%d a0=%p a1=%p\n", n, a, b); }
-    return orig_bind_layer_ctx(a, b, c, d, e, f, g, h);
+    void *r = orig_bind_layer_ctx(a, b, c, d, e, f, g, h);
+    macws_receipt_check("BindLayerCtx", before);
+    return r;
 }
 static void *hooked_ctx_payload(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *before = macws_glass_2b0();
     if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
         fprintf(stderr, "#### WS_DIAG2 ctxPayloadChanged #%d a0=%p a1=%p\n", n, a, b); }
-    return orig_ctx_payload(a, b, c, d, e, f, g, h);
+    void *r = orig_ctx_payload(a, b, c, d, e, f, g, h);
+    macws_receipt_check("ctxPayload", before);
+    return r;
 }
 static void *hooked_bind_surface(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *before = macws_glass_2b0();
     if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 20)
         fprintf(stderr, "#### WS_DIAG2 BindSurface #%d a0=%p a2=%p a3(type?)=%p a4=%p\n", n, a, c, d, e); }
-    return orig_bind_surface(a, b, c, d, e, f, g, h);
+    void *r = orig_bind_surface(a, b, c, d, e, f, g, h);
+    macws_receipt_check("BindSurface", before);
+    return r;
 }
 static sl8_t orig_prep_ca = NULL;
 static void *hooked_prep_ca(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
+    void *before = macws_glass_2b0();
     if (access("/tmp/macws_ws_diag2", F_OK) == 0) { static int n; if (++n <= 10)
         fprintf(stderr, "#### WS_DIAG2 prepare_coreanimation #%d (flatten driver runs)\n", n); }
-    return orig_prep_ca(a, b, c, d, e, f, g, h);
+    void *r = orig_prep_ca(a, b, c, d, e, f, g, h);
+    macws_receipt_check("prepare_ca", before);
+    return r;
 }
 static sl8_t orig_upd_flat = NULL;
 static void *hooked_upd_flat(void *a, void *b, void *c, void *d, void *e, void *f, void *g, void *h) {
