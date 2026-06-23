@@ -1001,6 +1001,7 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
         return 0;
     }
     int rv = orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
+    { extern void macws_dest_trace(const char *, id); macws_dest_trace("DS.target0", target0); macws_dest_trace("DS.target1", target1); }
     // WS-render-thread completion capture for VNC (gated /tmp/macws_vnc_share):
     // getBytes the previous (complete) display frame -> shared surface -> OSXvnc.
     { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(target0); }
@@ -1158,7 +1159,8 @@ int hooked_skylight_start_composite_wscd(void *self, void *dest,
       if (g_wscd_tex && dest) {
           id tex = nil;
           @synchronized(g_wscd_tex) { tex = g_wscd_tex[[NSValue valueWithPointer:dest]]; }
-          if (tex) { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(tex);
+          if (tex) { extern void macws_dest_trace(const char *, id); macws_dest_trace("WSCDstart", tex);
+                     extern void macws_vnc_on_composite(id); macws_vnc_on_composite(tex);
                      extern void macws_grab_composite(id); macws_grab_composite(tex); }
       } }
     return macws_pop_on_startcomp_bail(self, before, rv);
@@ -1172,6 +1174,7 @@ static int hooked_skylight_start_composite_mtltex(void *self, id texture,
     }
     uint64_t before = (self && (uintptr_t)self >= 0x1000)
         ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
+    { extern void macws_dest_trace(const char *, id); macws_dest_trace("MTLTex", texture); }
     // ── TEXTURE-WALL FIX (gated /tmp/macws_dest_iosurf): swap the plain dest for an
     // IOSurface-backed one (cached) so the composite renders into readable memory. ──
     id usetex = texture;
@@ -1247,6 +1250,7 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
         }
         return NULL;
     }
+    { extern void macws_dest_trace(const char *, id); macws_dest_trace("WSCDcreate", texture); }
     // ── TEXTURE-WALL FIX (gated /tmp/macws_dest_iosurf) ──
     // RE-confirmed: the macOS compose dest (pf=550) is a PLAIN render target — the GPU
     // renders into its private backing and the scanout IOSurface stays empty (black).

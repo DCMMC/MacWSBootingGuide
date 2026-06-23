@@ -658,10 +658,12 @@ id macws_make_iosurf_dest(id orig) {
         NSUInteger w = [t0 width], h = [t0 height], pf = [t0 pixelFormat], usage = [t0 usage];
         id<MTLDevice> dev = [t0 device];
         if (!dev || w == 0 || h == 0) return nil;
-        // SCOPE: only the macOS virtual-display dest (w<2300, e.g. 2000x1456). Swapping
-        // the 2388-wide iOS-panel/strip dests destabilized WS (coexist panel render) — the
-        // macOS app content lives in the smaller virtual-display surface that feeds VNC.
-        if (w >= 2300) return nil;
+        // SCOPE: ONLY the macOS virtual-display dest (w 1900..2300, e.g. 2000x1456).
+        // Swapping the 2388-wide iOS-panel/strip dests crashed WS; swapping the small
+        // (<1900) sub-composite dests disrupted the composite chain (the 2000x1456
+        // macOS composite then didn't run). RE-confirmed via DEST-TRACE: the macOS app
+        // content lives in the 2000x1456 surface that reaches WSCDcreate.
+        if (w < 1900 || w >= 2300) return nil;
         // Skip only OUR OWN swapped textures on re-entry (prevents chaining/churn).
         // Do NOT skip "has an IOSurface" — the plain dest has a SEPARATE scanout
         // IOSurface at +0xa0 yet still renders into a private backing, so it must be
@@ -726,6 +728,27 @@ id macws_make_iosurf_dest(id orig) {
         }
         return nt;
     } @catch (__unused NSException *e) { return nil; }
+}
+// DEST-PATH TRACE (gated /tmp/macws_dest_trace): log every macOS-sized (w>=1900)
+// texture seen at each composite entry point, to map WHERE the 2000x1456 macOS
+// virtual-display dest is created/used (its composite path is intermittent across
+// the DS / WSCD-create / WSCD-start / MTLTex hooks). Read-only.
+void macws_dest_trace(const char *site, id tex) {
+    if (!tex || access("/tmp/macws_dest_trace", F_OK) != 0) return;
+    @try {
+        NSUInteger w = [tex width], h = [tex height], pf = [tex pixelFormat];
+        if (w < 1900) return;
+        IOSurfaceRef ios = NULL;
+        if ([tex respondsToSelector:@selector(iosurface)]) {
+            typedef IOSurfaceRef (*f)(id, SEL);
+            ios = ((f)objc_msgSend)(tex, @selector(iosurface));
+        }
+        static _Atomic int n = 0;
+        if (atomic_fetch_add(&n, 1) < 240)
+            fprintf(stderr, "#### DEST-TRACE [%s] %lux%lu pf=%lu iosurf=%p tex=%p\n",
+                site, (unsigned long)w, (unsigned long)h, (unsigned long)pf,
+                (void *)ios, (void *)tex);
+    } @catch (__unused NSException *e) {}
 }
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
