@@ -568,6 +568,24 @@ static void *macws_tex_raw_backing(id<MTLTexture> tex, size_t *ext_out) {
     if (!impl) return NULL;
     void *backing = *(void **)((char *)impl + 0xa0);
     if (!backing) return NULL;
+    // GRAB BUG FIX (2026-06-23): in the compositor case +0xa0 is an IOSurface
+    // OBJECT, not a raw pixel buffer. Reading it as bytes yields the object
+    // header (~9% nonzero = noise) which falsely beat the (empty) resolved
+    // IOSurface base and made the grab capture noise instead of reporting the
+    // surface honestly empty. Only treat +0xa0 as a raw buffer when it is NOT
+    // an IOSurface object (synthesized-pool case); IOSurface objects go through
+    // macws_tex_backing's IOSurfaceGetBaseAddress path.
+    {
+        vm_address_t a = (vm_address_t)backing; vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t mo = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&bi, &cnt, &mo) == KERN_SUCCESS &&
+            a <= (vm_address_t)backing && (bi.protection & VM_PROT_READ)) {
+            @try { if (CFGetTypeID(backing) == IOSurfaceGetTypeID()) return NULL; }
+            @catch (__unused NSException *e) {}
+        }
+    }
     size_t ext = 0; vm_address_t want = (vm_address_t)backing;
     for (int i = 0; i < 4096; i++) {
         vm_address_t a = want; vm_size_t rsz = 0;
