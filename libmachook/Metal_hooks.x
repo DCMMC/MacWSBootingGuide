@@ -933,16 +933,24 @@ void macws_grab_composite(id<MTLTexture> tex) {
         size_t bw = [tex width], bh = [tex height]; unsigned long bpf = (unsigned long)[tex pixelFormat];
         if ((size_t)bw * bh >= 1000000 && (bpf == 80 || bpf == 550 || bpf == 552)) {
             dispatch_once(&blt, ^{
+                unlink("/tmp/macws_blit_test");   // one-shot: never re-run even if WS restarts
                 @try {
                     id<MTLDevice> dev = [tex device];
-                    size_t bbpr = bw * 4, blen = bbpr * bh;
+                    size_t bbpr = ((bw * 4 + 255) / 256) * 256, blen = bbpr * bh;  // 256-align for copyToBuffer
                     id<MTLBuffer> buf = [dev newBufferWithLength:blen options:MTLResourceStorageModeShared];
+                    // AGXG13GFamilyBlitContext has NO copyFromTexture:toBuffer: (unrecognized selector).
+                    // Use copyFromTexture:toTexture: into a BUFFER-BACKED LINEAR Shared texture (Asahi staging-blit):
+                    // the blit decompresses+detiles into the linear texture, whose backing IS our CPU-readable buffer.
+                    MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)bpf width:bw height:bh mipmapped:NO];
+                    dd.usage = MTLTextureUsageShaderRead; dd.storageMode = MTLStorageModeShared;
+                    id<MTLTexture> lintex = buf ? [buf newTextureWithDescriptor:dd offset:0 bytesPerRow:bbpr] : nil;
+                    if (!lintex) { fprintf(stderr, "#### BLIT-TEST lintex nil (buf=%p pf=%lu — buffer-backed linear unsupported)\n", (void *)buf, bpf); return; }
                     id<MTLCommandQueue> q = [dev newCommandQueue];
                     id<MTLCommandBuffer> cb = [q commandBuffer];
                     id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
                     [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
-                         sourceSize:MTLSizeMake(bw,bh,1) toBuffer:buf destinationOffset:0
-                         destinationBytesPerRow:bbpr destinationImageHeight:bh];
+                         sourceSize:MTLSizeMake(bw,bh,1) toTexture:lintex destinationSlice:0 destinationLevel:0
+                         destinationOrigin:MTLOriginMake(0,0,0)];
                     [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
                     long st = (long)[cb status]; id err = [cb error]; void *bc = [buf contents];
                     size_t nz = 0, sm = 0;
@@ -955,7 +963,7 @@ void macws_grab_composite(id<MTLTexture> tex) {
                                  fwrite(hd, 4, 7, f); fwrite(bc, 1, blen, f); fclose(f);
                                  fprintf(stderr, "#### BLIT-TEST wrote /tmp/macws_blit.raw (%zu bytes)\n", blen); }
                     }
-                } @catch (__unused NSException *e) { fprintf(stderr, "#### BLIT-TEST exception\n"); }
+                } @catch (NSException *e) { fprintf(stderr, "#### BLIT-TEST exception: %s\n", [[e reason] UTF8String] ?: "?"); }
             });
         }
     }
