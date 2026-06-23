@@ -258,8 +258,125 @@ static int macws_vnc_selftest(id<MTLTexture> t0) {
     if (gb) free(gb);
     return 1;
 }
+// Asahi-RE-informed VNC capture primitive (docs/asahi-agx-findings.md §1/§4):
+// the composite is AGX GPU-tiled AND lossless-COMPRESSED by default, so a raw
+// +0xa0 CPU read is scrambled garbage. copyFromTexture:toBuffer: makes Metal
+// DECOMPRESS + DETILE into a LINEAR buffer in one GPU op (format-agnostic: copies
+// bytes/pixel in row-major order; sidesteps the pf=550 buffer-backed-texture abort
+// that macws_blit_detile hits). Caller CPU-decodes per pf -> BGRA8. Returns 1 +
+// fills *base (=[buf contents], valid until next call) /*bpr/*w/*h; 0 on early/
+// failed frames (the chroot AGX queue needs a few frames to warm).
+static int macws_blit_to_linear(id<MTLTexture> src, void **out_base, size_t *out_bpr,
+                                size_t *out_w, size_t *out_h) {
+    @try {
+        if (!src) return 0;
+        size_t w = [src width], h = [src height];
+        unsigned long spf = (unsigned long)[src pixelFormat];
+        id<MTLDevice> dev = [src device];
+        if (!dev || w == 0 || h == 0) return 0;
+        // --- resolve the source's layout byte + its +0xa0 IOSurface (safe, guarded) ---
+        void *impl = *(void **)((char *)(__bridge void *)src + 0x208);
+        uint8_t layout = ((uintptr_t)impl > 0x1000) ? *(volatile uint8_t *)((char *)impl + 0x184) : 0xff;
+        IOSurfaceRef s = NULL;
+        if ((uintptr_t)impl > 0x1000) {
+            void *cand = *(void **)((char *)impl + 0xa0);
+            if (cand) {
+                vm_address_t a = (vm_address_t)cand; vm_size_t rsz = 0;
+                vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t mo = MACH_PORT_NULL;
+                if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                                 (vm_region_info_t)&bi, &cnt, &mo) == KERN_SUCCESS &&
+                    a <= (vm_address_t)cand && (bi.protection & VM_PROT_READ)) {
+                    @try { if (CFGetTypeID(cand) == IOSurfaceGetTypeID()) s = (IOSurfaceRef)cand; }
+                    @catch (__unused NSException *e) {}
+                }
+            }
+        }
+        // Per-distinct-surface content probe: find WHICH composite dest holds the macOS
+        // pixels (nonzero%) and its layout — the pf=80 scanout is empty; the content is
+        // elsewhere (likely pf=550 tiled). Sampled from the resolved IOSurface base.
+        { static unsigned long seen[24]; static int ns = 0;
+          unsigned long key = ((unsigned long)spf << 40) ^ ((unsigned long)w << 20) ^ (unsigned long)h;
+          int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) { dup = 1; break; }
+          if (!dup && ns < 24) { seen[ns++] = key;
+            uint8_t pbe7 = ((uintptr_t)impl > 0x1000) ? *(uint8_t *)((char *)impl + 0x190 + 7) : 0;
+            void *b = s ? IOSurfaceGetBaseAddress(s) : NULL;
+            size_t lim = s ? IOSurfaceGetAllocSize(s) : 0; if (lim > (size_t)w * h * 8) lim = (size_t)w * h * 8;
+            size_t nz = 0, sm = 0; if (b) for (size_t i = 0; i < lim; i += 997) { sm++; if (((uint8_t *)b)[i]) nz++; }
+            fprintf(stderr, "#### VNC-SURF pf=%lu %zux%zu layout=%u compressed=%d iosurf=%p nonzero=%.1f%%\n",
+                    spf, w, h, layout, (pbe7 >> 3) & 1, (void *)s, sm ? 100.0 * nz / sm : -1.0); } }
+        // --- LINEAR path (layout==0): read the IOSurface base directly, NO blit ---
+        if (s && layout == 0) {
+            void *base = IOSurfaceGetBaseAddress(s);
+            size_t bpr = IOSurfaceGetBytesPerRow(s);
+            if (base && bpr) { *out_base = base; *out_bpr = bpr; *out_w = w; *out_h = h; return 1; }
+        }
+        // --- TILED path (layout!=0): GPU blit into a buffer-backed LINEAR texture ---
+        if (spf == 550 || spf == 552) {   // pf550 buffer-backed readback aborts; no converter yet
+            static int sk = 0; if (sk < 3) { sk++; fprintf(stderr, "#### VNC-BLIT pf=%lu tiled: no linear readback yet (skip)\n", spf); }
+            return 0;
+        }
+        MTLPixelFormat dpf = (spf == 115) ? (MTLPixelFormat)115 : (MTLPixelFormat)80;
+        size_t bpp = (spf == 115) ? 8 : 4;
+        size_t align = 256;
+        @try { NSUInteger al = [dev minimumLinearTextureAlignmentForPixelFormat:dpf]; if (al > align) align = al; } @catch (__unused NSException *e) {}
+        size_t bpr = ((w * bpp + align - 1) / align) * align, sz = bpr * h;
+        static id<MTLCommandQueue> q = nil; static id<MTLBuffer> buf = nil; static id<MTLTexture> lintex = nil;
+        static size_t lw = 0, lh = 0; static MTLPixelFormat lpf = 0;
+        if (!q) q = [dev newCommandQueue];
+        if (!buf || lw != w || lh != h || lpf != dpf) {
+            buf = [dev newBufferWithLength:sz options:MTLResourceStorageModeShared];
+            MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dpf width:w height:h mipmapped:NO];
+            dd.storageMode = MTLStorageModeShared; dd.usage = MTLTextureUsageShaderRead;
+            lintex = buf ? [buf newTextureWithDescriptor:dd offset:0 bytesPerRow:bpr] : nil;
+            lw = w; lh = h; lpf = dpf;
+        }
+        if (!q || !buf || !lintex) return 0;
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                 sourceSize:MTLSizeMake(w,h,1) toTexture:lintex destinationSlice:0 destinationLevel:0
+          destinationOrigin:MTLOriginMake(0,0,0)];
+        [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        if ([cb status] != MTLCommandBufferStatusCompleted) {
+            static int fl = 0; if (fl < 5) { fl++;
+                fprintf(stderr, "#### VNC-BLIT toTexture status=%ld err=%s\n", (long)[cb status],
+                        [cb error] ? [[[cb error] localizedDescription] UTF8String] : "none"); }
+            return 0;
+        }
+        void *base = [buf contents];
+        if (!base) return 0;
+        *out_base = base; *out_bpr = bpr; *out_w = w; *out_h = h;
+        return 1;
+    } @catch (NSException *e) {
+        fprintf(stderr, "#### VNC-BLIT EXC %s\n", [[e reason] UTF8String] ?: "?");
+        return 0;
+    }
+}
 void macws_vnc_on_composite(id<MTLTexture> dest) {
     if (!macws_vnc_share_enabled() || !dest) return;
+    // Cheap per-distinct-dest log (layout only, no content read = render-thread-safe): see
+    // EVERY composite dest the 3 StartComposite hooks feed, to find which holds macOS pixels.
+    { static unsigned long seen[32]; static int ns = 0;
+      @try { size_t w = [dest width], h = [dest height]; unsigned long pf = (unsigned long)[dest pixelFormat];
+        unsigned long key = ((unsigned long)pf << 40) ^ ((unsigned long)w << 20) ^ (unsigned long)h;
+        int dup = 0; for (int i = 0; i < ns; i++) if (seen[i] == key) { dup = 1; break; }
+        if (!dup && ns < 32) { seen[ns++] = key;
+          void *impl = *(void **)((char *)(__bridge void *)dest + 0x208);
+          uint8_t layout = ((uintptr_t)impl > 0x1000) ? *(volatile uint8_t *)((char *)impl + 0x184) : 0xff;
+          IOSurfaceRef s = NULL;
+          if ((uintptr_t)impl > 0x1000) { void *cand = *(void **)((char *)impl + 0xa0);
+            if (cand) { vm_address_t a = (vm_address_t)cand; vm_size_t rsz = 0;
+              vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t mo = MACH_PORT_NULL;
+              if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &mo) == KERN_SUCCESS
+                  && a <= (vm_address_t)cand && (bi.protection & VM_PROT_READ)) {
+                @try { if (CFGetTypeID(cand) == IOSurfaceGetTypeID()) s = (IOSurfaceRef)cand; } @catch (__unused NSException *e) {} } } }
+          void *b = s ? IOSurfaceGetBaseAddress(s) : NULL;
+          size_t lim = s ? IOSurfaceGetAllocSize(s) : 0; if (lim > (size_t)w * h * 8) lim = (size_t)w * h * 8;
+          size_t nz = 0, sm = 0; if (b) for (size_t i = 0; i < lim; i += 4093) { sm++; if (((uint8_t *)b)[i]) nz++; }
+          fprintf(stderr, "#### VNC-DEST pf=%lu %zux%zu layout=%u iosurf=%p nonzero=%.1f%%\n",
+                  pf, w, h, layout, (void *)s, sm ? 100.0 * nz / sm : -1.0); }
+      } @catch (__unused NSException *e) {} }
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_vnc_lock = [NSObject new];
@@ -274,114 +391,44 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                 if (t) {
                     size_t w = [t width], h = [t height];
                     unsigned long pf = (unsigned long)[t pixelFormat];
-                    if (w >= 1000 && h >= 600 && (pf == 80 || pf == 115)) {
-                        // GPU blit the (AGX-tiled) LIVE composite into an IDLE
-                        // linear texture on our OWN queue (GPU detiles), then
-                        // CPU-read the idle dst's now-linear +0xa0 -> g_vncSurf.
-                        // Avoids CPU-reading the live target (perturbs WS) and
-                        // getBytes (hangs/crashes). The blit READS the live
-                        // target on the GPU (tearing at worst, not a crash).
-                        static id<MTLDevice> dev = nil;
-                        static id<MTLCommandQueue> q = nil;
-                        static id<MTLTexture> dst = nil;
-                        static unsigned long dstpf = 0; static size_t dstw = 0, dsth = 0;
-                        if (!dev) { dev = [t device]; q = [dev newCommandQueue]; }
-                        if (dev && q && (!dst || dstpf != pf || dstw != w || dsth != h)) {
-                            MTLTextureDescriptor *d = [MTLTextureDescriptor
-                                texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf
-                                width:w height:h mipmapped:NO];
-                            d.storageMode = MTLStorageModeShared;
-                            d.usage = MTLTextureUsageShaderRead;
-                            dst = [dev newTextureWithDescriptor:d];
-                            dstpf = pf; dstw = w; dsth = h;
-                            fprintf(stderr, "#### VNC-BLIT dst=%p %zux%zu pf=%lu\n", (void*)dst, w, h, pf);
-                        }
-                        if (dst && q) {
-                            id<MTLCommandBuffer> cb = [q commandBuffer];
-                            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-                            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0
-                                   sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,h,1)
-                                      toTexture:dst destinationSlice:0 destinationLevel:0
-                              destinationOrigin:MTLOriginMake(0,0,0)];
-                            [bl endEncoding];
-                            [cb commit];
-                            [cb waitUntilCompleted];
-                            void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
-                            if ((uintptr_t)impl > 0x1000) {
-                                void *backing = *(void **)((char *)impl + 0xa0);
-                                // DETILE SELF-CHECK (gated /tmp/macws_vnc_selftest, ~5x):
-                                // getBytes-FREE (getBytes on this bg thread destabilizes WS).
-                                // The dst is the blit target; if layout(+0x184)==0 and
-                                // stride(+0xa8)==0 (tight w*4), then +0xa0 IS the correct
-                                // linear pixel layout the pipeline memcpy's. Report those plus
-                                // the first row bytes + content nonzero fraction. The actual
-                                // detiled frame is in /tmp/macws_vnc_fb (pull + render to PNG
-                                // for visual proof — that's the real ground truth).
-                                if (backing && pf == 80 &&
-                                    access("/tmp/macws_vnc_selftest", F_OK) == 0) {
-                                    static int chk = 0;
-                                    if (chk < 1) {
-                                        chk++;
-                                        uint8_t layout = *(uint8_t  *)((char *)impl + 0x184);
-                                        uint32_t stride = *(uint32_t *)((char *)impl + 0xa8);
-                                        size_t sz = (size_t)w * h * 4, bpr = w * 4;
-                                        // DUMP A: pipeline read = raw impl+0xa0
-                                        { FILE *f=fopen("/tmp/detile_a0.raw","wb");
-                                          if(f){uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr};fwrite(hd,4,4,f);fwrite(backing,1,sz,f);fclose(f);} }
-                                        // DUMP B: IOSurfaceGetBaseAddress of dst's surface (the
-                                        // "other" candidate pixel pointer)
-                                        IOSurfaceRef ds = NULL;
-                                        if ([dst respondsToSelector:@selector(iosurface)]) ds = [dst iosurface];
-                                        void *iosb = ds ? IOSurfaceGetBaseAddress(ds) : NULL;
-                                        if (iosb) { FILE *f=fopen("/tmp/detile_iosurf.raw","wb");
-                                          if(f){uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr};fwrite(hd,4,4,f);fwrite(iosb,1,sz,f);fclose(f);} }
-                                        // DUMP C: driver canonical getBytes (one-shot, wrapped)
-                                        int gbOK = 0;
-                                        uint8_t *gb = (uint8_t *)malloc(sz);
-                                        if (gb) { @try {
-                                            [dst getBytes:gb bytesPerRow:bpr fromRegion:MTLRegionMake2D(0,0,w,h) mipmapLevel:0];
-                                            gbOK = 1;
-                                            FILE *f=fopen("/tmp/detile_getbytes.raw","wb");
-                                            if(f){uint32_t hd[4]={(uint32_t)w,(uint32_t)h,80,(uint32_t)bpr};fwrite(hd,4,4,f);fwrite(gb,1,sz,f);fclose(f);}
-                                        } @catch (NSException *e) { fprintf(stderr,"#### SELFCHK getBytes EXC %s\n",[[e reason] UTF8String]?:"?"); } }
-                                        // content stats for each
-                                        size_t nzA=0,nzI=0,nzG=0,samp=0;
-                                        for (size_t i=0;i<sz;i+=37){samp++;
-                                            if(((uint8_t*)backing)[i])nzA++;
-                                            if(iosb&&((uint8_t*)iosb)[i])nzI++;
-                                            if(gbOK&&gb[i])nzG++; }
-                                        fprintf(stderr,"#### SELFCHK dst=%p layout=%u stride=%u  iosurf=%p iosb=%p  "
-                                            "nonzero: +0xa0=%.2f%% IOSurf=%.2f%% getBytes=%.2f%%  (gbOK=%d)\n",
-                                            (void*)dst,layout,stride,(void*)ds,iosb,
-                                            100.0*nzA/samp, iosb?100.0*nzI/samp:-1.0, gbOK?100.0*nzG/samp:-1.0, gbOK);
-                                        if (gb) free(gb);
-                                    }
-                                }
-                                if (backing) {
-                                    void *vb = macws_vnc_mmap_data(w, h);  // cross-process mmap
-                                    size_t vbpr = w * 4;
-                                    if (vb && pf == 80) {
-                                        size_t srcbpr = w * 4;
-                                        for (size_t y = 0; y < h; y++)
-                                            memcpy((char *)vb + y*vbpr, (char *)backing + y*srcbpr, vbpr);
-                                    } else if (vb) { // pf==115 RGBA16F -> BGRA8
-                                        size_t srcbpr = w * 8;
-                                        for (size_t y = 0; y < h; y++) {
-                                            uint16_t *src = (uint16_t *)((char *)backing + y*srcbpr);
-                                            uint8_t  *d8  = (uint8_t  *)((char *)vb + y*vbpr);
-                                            for (size_t x = 0; x < w; x++) {
-                                                d8[x*4+0] = macws_half_to_u8(src[x*4+2]);
-                                                d8[x*4+1] = macws_half_to_u8(src[x*4+1]);
-                                                d8[x*4+2] = macws_half_to_u8(src[x*4+0]);
-                                                d8[x*4+3] = 0xff;
-                                            }
+                    if (w >= 1000 && h >= 600 && (pf == 80 || pf == 550 || pf == 552 || pf == 115)) {
+                        // Asahi RE (docs/asahi-agx-findings.md §4): the composite is AGX
+                        // GPU-tiled AND lossless-COMPRESSED, so the old "blit to a default
+                        // tiled dst + read +0xa0" produced scrambled garbage. copyFromTexture:
+                        // toBuffer: makes Metal decompress+detile into a LINEAR buffer; then
+                        // CPU-decode per pf -> BGRA8 -> VNC mmap. pf=550 (the real composite)
+                        // is now accepted (toBuffer avoids the pf=550 texture-creation abort).
+                        void *lin = NULL; size_t lbpr = 0, lw = 0, lh = 0;
+                        if (macws_blit_to_linear(t, &lin, &lbpr, &lw, &lh)) {
+                            void *vb = macws_vnc_mmap_data(lw, lh);
+                            size_t vbpr = lw * 4;
+                            if (vb) {
+                                for (size_t y = 0; y < lh; y++) {
+                                    uint8_t *d8 = (uint8_t *)vb + y * vbpr;
+                                    char *row = (char *)lin + y * lbpr;
+                                    if (pf == 115) {                       // RGBA16Float -> BGRA8
+                                        uint16_t *s = (uint16_t *)row;
+                                        for (size_t x = 0; x < lw; x++) {
+                                            d8[x*4+0] = macws_half_to_u8(s[x*4+2]);
+                                            d8[x*4+1] = macws_half_to_u8(s[x*4+1]);
+                                            d8[x*4+2] = macws_half_to_u8(s[x*4+0]);
+                                            d8[x*4+3] = 0xff;
                                         }
-                                    }
-                                    if (vb) {
-                                        static int lg = 0;
-                                        if (lg < 3) { fprintf(stderr, "#### VNC-BLIT captured %zux%zu pf=%lu -> mmap (detiled)\n", w, h, pf); lg++; }
+                                    } else if (pf == 550 || pf == 552) {   // BGRA10_XR packed 32b -> BGRA8 (10b>>2; exact XR color decode deferred, doc §5 P2)
+                                        uint32_t *s = (uint32_t *)row;
+                                        for (size_t x = 0; x < lw; x++) {
+                                            uint32_t px = s[x];
+                                            d8[x*4+0] = (uint8_t)(((px >>  0) & 0x3ff) >> 2);  // ch0
+                                            d8[x*4+1] = (uint8_t)(((px >> 10) & 0x3ff) >> 2);  // ch1
+                                            d8[x*4+2] = (uint8_t)(((px >> 20) & 0x3ff) >> 2);  // ch2
+                                            d8[x*4+3] = 0xff;
+                                        }
+                                    } else {                               // pf 80 BGRA8 straight
+                                        memcpy(d8, row, vbpr);
                                     }
                                 }
+                                static int lg = 0;
+                                if (lg < 3) { fprintf(stderr, "#### VNC-BLIT(linear toBuffer) %zux%zu pf=%lu bpr=%zu -> mmap\n", lw, lh, pf, lbpr); lg++; }
                             }
                         }
                     }
