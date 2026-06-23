@@ -2230,6 +2230,13 @@ static void macws_sigabrt_trampoline(int sig) {
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc
                                         iosurface:(IOSurfaceRef)iosurface
                                             plane:(NSUInteger)plane {
+    // NO-COMPRESS (gated /tmp/macws_no_compress): disable AGX lossless compression so a dumped
+    // source backing reads UNCOMPRESSED → the verified Asahi detile yields clean real content
+    // (proving detile on a real GlassDemo source layer). allowGPUOptimizedContents is public Metal API.
+    if (desc && access("/tmp/macws_no_compress", F_OK) == 0 &&
+        [desc respondsToSelector:@selector(setAllowGPUOptimizedContents:)]) {
+        [desc setAllowGPUOptimizedContents:NO];
+    }
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.IN");
     }

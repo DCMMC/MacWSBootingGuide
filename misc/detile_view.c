@@ -42,12 +42,15 @@ int main(int argc, char **argv) {
     }
     if (argc > 3 && argv[3][0] == 't') { layout = 2; fprintf(stderr, "[forced tiled]\n"); }   // override: force detile
     if (argc > 3 && argv[3][0] == 'l') { layout = 0; fprintf(stderr, "[forced linear]\n"); }
+    uint32_t stride_override = (argc > 4) ? (uint32_t)strtoul(argv[4], 0, 0) : 0;   // e.g. 9600 (2400px padded)
+    if (stride_override) fprintf(stderr, "[stride override %u]\n", stride_override);
     uint8_t *src = malloc(bytes); if (fread(src, 1, bytes, f) != bytes) fprintf(stderr, "short data\n"); fclose(f);
     uint32_t bpp = (pf == 115) ? 8 : 4, tw = 64, th = (bpp == 8) ? 32 : 64;
     fprintf(stderr, "in: %ux%u pf=%u layout=%u bytes=%u stride=%u bpp=%u tile=%ux%u\n", w, h, pf, layout, bytes, stride, bpp, tw, th);
     uint8_t *lin = calloc((size_t)w * h, bpp);
     if (layout == 0) {                                  // linear: honor stride
-        uint32_t st = (stride >= w * bpp && (size_t)stride <= (size_t)w * bpp * 4) ? stride : w * bpp;
+        uint32_t st = stride_override ? stride_override
+                    : ((stride >= w * bpp && (size_t)stride <= (size_t)w * bpp * 4) ? stride : w * bpp);
         for (uint32_t y = 0; y < h; y++) if ((size_t)y * st + (size_t)w * bpp <= bytes) memcpy(lin + (size_t)y * w * bpp, src + (size_t)y * st, (size_t)w * bpp);
     } else {                                            // tiled (GPU/twiddled): Asahi detile
         uint32_t tpr = (w + tw - 1) / tw;
