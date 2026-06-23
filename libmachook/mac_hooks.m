@@ -931,14 +931,22 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
     // RE-confirmed: generate_layers_for_window(x0=ctx, x1=WINDOW). Window = arg1.
     // Content gate @0x18538496c: cbz (window+0x838) → !=0 emits a content layer.
     if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
-        static int n; if (++n <= 40) {
+        static int n; if (++n <= 60) {
             if ((uintptr_t)win > 0x100000000 && (uintptr_t)win < 0x800000000000) {
                 int    f58      = *(int  *)((char *)win + 0x58);
                 void  *wcb_f8   = *(void **)((char *)win + 0xf8);   // WSCAWindowBacking object (prep_ca reads this)
-                void  *flat838  = *(void **)((char *)win + 0x838);  // flatten backing (content gate)
-                void  *legacy128= *(void **)((char *)win + 0x128);  // legacy attached surface
-                fprintf(stderr, "#### WS_DIAG2 genLayers #%d window=%p f58=%d wcb_f8=%p flat838=%p legacy128=%p\n",
-                        n, win, f58, wcb_f8, flat838, legacy128);
+                void  *flat838  = *(void **)((char *)win + 0x838);  // flatten backing (DP-5 content gate)
+                void  *legacy128= *(void **)((char *)win + 0x128);  // legacy attached surface (DP-6)
+                // DP-2/DP-4: wcb+0xa8 = the live present-backing (CA surface). Agent's #1 hypothesis:
+                // this is the field that is non-NULL under SIM-WS but NULL under AGX-WS → no source layer.
+                void  *present_a8 = (wcb_f8 && (uintptr_t)wcb_f8 > 0x100000000 && (uintptr_t)wcb_f8 < 0x800000000000)
+                                    ? *(void **)((char *)wcb_f8 + 0xa8) : (void *)-1;
+                void  *binddisp = *(void **)((char *)win + 0x818);  // DP-1 window's bound display
+                void  *curdisp  = (a0 && (uintptr_t)a0 > 0x100000000 && (uintptr_t)a0 < 0x800000000000)
+                                    ? *(void **)((char *)a0 + 0x30) : (void *)-1;  // DP-1 current display
+                int    f718     = (int)(*(uint64_t *)((char *)win + 0x718) & 0x40);
+                fprintf(stderr, "#### WS_DIAG2 genLayers #%d window=%p f58=%d bind818=%p cur=%p wcb=%p present_a8=%p f718&40=%d flat838=%p legacy128=%p\n",
+                        n, win, f58, binddisp, curdisp, wcb_f8, present_a8, f718, flat838, legacy128);
             }
         }
     }
