@@ -643,6 +643,66 @@ static void macws_scan_impl_backings(id<MTLTexture> tex, size_t surf_sz) {
     }
     fprintf(stderr, "#### IMPL-SCAN end\n");
 }
+// ── 2026-06-23 TEXTURE-WALL FIX: IOSurface-backed compose dest ──
+// RE-confirmed: the macOS compose dest is a PLAIN render target (no IOSurface) →
+// GPU renders into a private backing, the scanout IOSurface stays empty. This helper
+// builds (and caches by w×h×pf) an IOSurface-backed texture matching `orig`, so the
+// StartComposite hook can SWAP it in → the GPU renders into readable IOSurface memory
+// (the texture's GPU VA impl+0x40 becomes the IOSurface's). Keeps `orig`'s pixelFormat
+// so the compositor's render-pipeline color-attachment format still matches. Gated by
+// the caller (/tmp/macws_dest_iosurf); nil on failure → caller keeps the plain dest.
+id macws_make_iosurf_dest(id orig) {
+    if (!orig) return nil;
+    @try {
+        id<MTLTexture> t0 = (id<MTLTexture>)orig;
+        NSUInteger w = [t0 width], h = [t0 height], pf = [t0 pixelFormat], usage = [t0 usage];
+        id<MTLDevice> dev = [t0 device];
+        if (!dev || w == 0 || h == 0) return nil;
+        // Skip only OUR OWN swapped textures on re-entry (prevents chaining/churn).
+        // Do NOT skip "has an IOSurface" — the plain dest has a SEPARATE scanout
+        // IOSurface at +0xa0 yet still renders into a private backing, so it must be
+        // swapped. Track our created textures in a set and skip exactly those.
+        static NSMutableSet *mine = nil;
+        static dispatch_once_t mineOnce; dispatch_once(&mineOnce, ^{ mine = [NSMutableSet new]; });
+        @synchronized(mine) { if ([mine containsObject:orig]) return orig; }
+        static NSMutableDictionary *cache = nil;
+        static dispatch_once_t once; dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
+        NSString *key = [NSString stringWithFormat:@"%lux%lu-%lu", (unsigned long)w, (unsigned long)h, (unsigned long)pf];
+        id<MTLTexture> hit = nil;
+        @synchronized(cache) { hit = cache[key]; }
+        if (hit) return hit;
+        NSDictionary *props = @{
+            @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+            @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+            @"IOSurfaceCacheMode": @1792, @"IOSurfaceMapCacheAttribute": @0,
+            @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+        };
+        IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+        if (!surf) {
+            NSDictionary *bp = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA') };
+            surf = IOSurfaceCreate((__bridge CFDictionaryRef)bp);
+        }
+        if (!surf) return nil;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:w height:h mipmapped:NO];
+        d.usage = usage; d.storageMode = MTLStorageModeShared;
+        id<MTLTexture> nt = nil;
+        @try { nt = [dev newTextureWithDescriptor:d iosurface:surf plane:0]; }
+        @catch (__unused NSException *e) { nt = nil; }
+        CFRelease(surf);   // texture holds its own ref
+        if (nt) {
+            @synchronized(cache) { cache[key] = nt; }
+            @synchronized(mine) { [mine addObject:nt]; }
+            fprintf(stderr, "#### DEST-SWAP made IOSurface-backed dest %lux%lu pf=%lu -> %p\n",
+                (unsigned long)w, (unsigned long)h, (unsigned long)pf, (void *)nt);
+        } else {
+            fprintf(stderr, "#### DEST-SWAP iosurface wrap nil for %lux%lu pf=%lu\n",
+                (unsigned long)w, (unsigned long)h, (unsigned long)pf);
+        }
+        return nt;
+    } @catch (__unused NSException *e) { return nil; }
+}
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
     if (!tex || access("/tmp/macws_grab_png", F_OK) != 0) return;

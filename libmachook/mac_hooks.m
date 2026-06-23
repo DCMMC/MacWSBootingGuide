@@ -1168,10 +1168,23 @@ static int hooked_skylight_start_composite_mtltex(void *self, id texture,
     }
     uint64_t before = (self && (uintptr_t)self >= 0x1000)
         ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
+    // ── TEXTURE-WALL FIX (gated /tmp/macws_dest_iosurf): swap the plain dest for an
+    // IOSurface-backed one (cached) so the composite renders into readable memory. ──
+    id usetex = texture;
+    if (access("/tmp/macws_dest_iosurf", F_OK) == 0) {
+        extern id macws_make_iosurf_dest(id);
+        id swapped = macws_make_iosurf_dest(texture);
+        if (swapped) {
+            static int sw = 0;
+            if (sw++ < 4) fprintf(stderr, "#### MTLTEX DEST-SWAP texture=%p -> %p\n",
+                                  (void *)texture, (void *)swapped);
+            usetex = swapped;
+        }
+    }
     int rv = orig_skylight_start_composite_mtltex(
-        self, texture, load_action, store_action);
-    { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(texture); }
-    { extern void macws_grab_composite(id); macws_grab_composite(texture); }
+        self, usetex, load_action, store_action);
+    { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(usetex); }
+    { extern void macws_grab_composite(id); macws_grab_composite(usetex); }
     return macws_pop_on_startcomp_bail(self, before, rv);
 }
 
@@ -1229,6 +1242,23 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
             nil_count++;
         }
         return NULL;
+    }
+    // ── TEXTURE-WALL FIX (gated /tmp/macws_dest_iosurf) ──
+    // RE-confirmed: the macOS compose dest (pf=550) is a PLAIN render target — the GPU
+    // renders into its private backing and the scanout IOSurface stays empty (black).
+    // Swap it for an IOSurface-backed dest (cached by w×h×pf) BEFORE the WSCompositeDestination
+    // is built, so the composite renders into readable IOSurface memory. g_wscd_tex then
+    // maps the WSCD to the swapped texture, so the grab/VNC read real pixels. nil-swap →
+    // keep the original (safe).
+    if (access("/tmp/macws_dest_iosurf", F_OK) == 0) {
+        extern id macws_make_iosurf_dest(id);
+        id swapped = macws_make_iosurf_dest(texture);
+        if (swapped) {
+            static int sw = 0;
+            if (sw++ < 4) fprintf(stderr, "#### WSCD DEST-SWAP texture=%p -> IOSurface-backed=%p\n",
+                                  (void *)texture, (void *)swapped);
+            texture = swapped;
+        }
     }
     void *wscd = orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
     // ── WSCDARG identify (gated /tmp/macws_dest_diag): which arg is the real
