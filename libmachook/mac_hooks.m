@@ -961,6 +961,32 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
     }
     return r;
 }
+// _MetalCompositeCoreAnimation@0x185176a14(window=x0, srcLayer=x1, dest=x2, sub=x3) — the LIVE
+// CARenderServer CA-tree re-render that Route A (mode-5 CA-flatten) windows like GlassDemo depend on
+// (vs the menu bar's static-IOSurface texture sample). If this fires at all in WS+GlassDemo it's
+// GlassDemo's window → the chroot DOES reach the CA re-render (so the failure is the render itself, not
+// a skip). ios_candidate walks the agent's chain wcb(window+0xf8)→+0x2b0→+0x18 (the client IOSurface
+// the fn resolves at 0x185177294); chain-only read (no IOSurface deref) to stay crash-safe this pass.
+typedef void *(*cca_t)(void *, void *, void *, void *);
+static cca_t orig_cca = NULL;
+static void *hooked_cca(void *window, void *srcLayer, void *dest, void *sub) {
+    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
+        static int n; if (++n <= 20) {
+            void *wcb = NULL, *a = NULL, *ios = NULL;
+            if ((uintptr_t)window > 0x100000000 && (uintptr_t)window < 0x800000000000) {
+                wcb = *(void **)((char *)window + 0xf8);
+                if ((uintptr_t)wcb > 0x100000000 && (uintptr_t)wcb < 0x800000000000) {
+                    a = *(void **)((char *)wcb + 0x2b0);
+                    if ((uintptr_t)a > 0x100000000 && (uintptr_t)a < 0x800000000000)
+                        ios = *(void **)((char *)a + 0x18);
+                }
+            }
+            fprintf(stderr, "#### WS_DIAG2 CCA #%d CALLED (chroot re-renders client CA tree) window=%p dest=%p wcb=%p a(wcb+0x2b0)=%p ios_cand=%p\n",
+                    n, window, dest, wcb, a, ios);
+        }
+    }
+    return orig_cca(window, srcLayer, dest, sub);
+}
 // Content-receipt chain (does the client's CA content reach WS + bind?). 8-arg
 // safe passthrough (preserves x0-x7). Count-only, gate /tmp/macws_ws_diag2.
 typedef void *(*sl8_t)(void *, void *, void *, void *, void *, void *, void *, void *);
@@ -1821,8 +1847,10 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
             MSHookFunction(csmp, (void *)hooked_csmpop, (void **)&orig_csmpop);
             void *cltd = (void *)(0x185411dc4 + sl_slide);
             MSHookFunction(cltd, (void *)hooked_cltd, (void **)&orig_cltd);
-            fprintf(stderr, "#### WS_DIAG2 hooks installed (header-based, verified offsets): slide=%#lx fl=%p gl=%p ud=%p\n",
-                    sl_slide, fl, gl, ud);
+            void *cca = (void *)(0x185176a14 + sl_slide);   // _MetalCompositeCoreAnimation (Route A live CA re-render)
+            MSHookFunction(cca, (void *)hooked_cca, (void **)&orig_cca);
+            fprintf(stderr, "#### WS_DIAG2 hooks installed (header-based, verified offsets): slide=%#lx fl=%p gl=%p ud=%p cca=%p\n",
+                    sl_slide, fl, gl, ud, cca);
         }
     } else {
         fprintf(stderr, "#### SkyLight PrepareForUse: symbol not found, skipped\n");
