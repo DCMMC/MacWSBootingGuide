@@ -2228,6 +2228,51 @@ static void macws_sigabrt_trampoline(int sig) {
                 (unsigned long)[desc storageMode], (unsigned long)[desc usage],
                 class_getName([self class]));
     }
+    // ── 2026-06-23 DEST-IOSURF FIX (the texture wall) ──
+    // RE-confirmed (agent): the macOS compose-DEST is a PLAIN render target (no
+    // IOSurface) created in WS::SurfacePool::Acquire@0x185135d7c via
+    // -[newTextureWithDescriptor:]. The GPU renders into its private backing; the
+    // scanout IOSurface (separate) stays empty → the display is black. Sources are
+    // IOSurface-backed and render fine. Fix: back the full-screen dest render target
+    // with an IOSurface so the GPU writes readable memory (the texture's GPU VA
+    // impl+0x40 becomes the IOSurface's). Keep desc.pixelFormat so the compositor's
+    // render-pipeline color-attachment format still matches. Gated /tmp/macws_dest_iosurf
+    // for A/B; nil-fallback to the plain texture if the IOSurface wrap fails.
+    if (desc && access("/tmp/macws_dest_iosurf", F_OK) == 0) {
+        NSUInteger dw = [desc width], dh = [desc height];
+        NSUInteger dusage = [desc usage], dsm = [desc storageMode];
+        unsigned long dpf = (unsigned long)[desc pixelFormat];
+        static int destn = 0;
+        if (dw * dh >= 1000000 && (dusage & MTLTextureUsageRenderTarget) && dsm != 3 && destn < 12) {
+            destn++;
+            fprintf(stderr, "#### DEST-IOSURF candidate #%d %lux%lu pf=%lu usage=0x%lx sm=%lu cls=%s\n",
+                destn, (unsigned long)dw, (unsigned long)dh, dpf, (unsigned long)dusage,
+                (unsigned long)dsm, class_getName([self class]));
+            NSDictionary *props = @{
+                @"IOSurfaceWidth": @(dw), @"IOSurfaceHeight": @(dh),
+                @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+                @"IOSurfaceCacheMode": @1792, @"IOSurfaceMapCacheAttribute": @0,
+                @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+            };
+            IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            if (!surf) {
+                NSDictionary *bp = @{ @"IOSurfaceWidth": @(dw), @"IOSurfaceHeight": @(dh),
+                    @"IOSurfaceBytesPerElement": @4, @"IOSurfacePixelFormat": @((uint32_t)'BGRA') };
+                surf = IOSurfaceCreate((__bridge CFDictionaryRef)bp);
+            }
+            if (surf) {
+                id<MTLTexture> t = nil;
+                @try { t = [self newTextureWithDescriptor:desc iosurface:surf plane:0]; }
+                @catch (__unused NSException *e) { t = nil; }
+                CFRelease(surf);   // texture holds its own ref
+                if (t) {
+                    fprintf(stderr, "#### DEST-IOSURF redirected -> IOSurface-backed tex=%p\n", (void *)t);
+                    return t;
+                }
+                fprintf(stderr, "#### DEST-IOSURF iosurface wrap returned nil — falling back to plain\n");
+            }
+        }
+    }
     // BLUR-PATH DIAG (gated /tmp/macws_textrace_file): does the CA::OGL backdrop-blur
     // create_texture reach THIS hook (→ routing gap, fixable) or bypass it via a cached
     // IMP (→ need a deterministic hook)? Log QuartzCore-caller plain-newTexture calls to
