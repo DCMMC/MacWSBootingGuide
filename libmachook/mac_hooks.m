@@ -5979,7 +5979,11 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
             my_bytes = (size_t)wi * (size_t)hi * (size_t)bi;
         }
         unsigned long my_total = atomic_fetch_add(&s_total_bytes, my_bytes) + my_bytes;
-        if (my_n % 250 == 1 /* 1, 251, 501, ... — keep low under steady state */) {
+        // Gated: the dladdr+__builtin_return_address(0..7) walk SIGSEGVs on shallow call
+        // stacks (e.g. a standalone chroot CLI: main→IOSurfaceCreate has no 8 frames, so the
+        // high return-address slots are garbage and dladdr() faults). It's a leak-attribution
+        // DIAGNOSTIC — gate it behind MACWS_IOSURF_TRACE so non-WS callers don't crash.
+        if (my_n % 250 == 1 && getenv("MACWS_IOSURF_TRACE") /* 1,251,501,... */) {
             Dl_info di;
             void *ra1 = __builtin_return_address(0);
             void *ra2 = __builtin_return_address(1);
