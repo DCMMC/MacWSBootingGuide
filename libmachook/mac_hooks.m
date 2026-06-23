@@ -928,9 +928,16 @@ static void *hooked_vis_list(void *a, void *b, void *c, void *d) {
 typedef void *(*gen_layers_t)(void *, void *, void *, void *);
 static gen_layers_t orig_gen_layers = NULL;
 static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
-    // RE-confirmed: generate_layers_for_window(x0=ctx, x1=WINDOW). Window = arg1.
-    // Content gate @0x18538496c: cbz (window+0x838) → !=0 emits a content layer.
-    if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
+    // RE-confirmed: generate_layers_for_window(x0=redrawState, x1=WINDOW). Window = arg1.
+    // Emitted source layers are linked into *(redrawState+0x78). Capture it before+after the
+    // orig call: if it changes for GlassDemo's window, generate_layers EMITTED a source layer
+    // (drop-out is downstream / sampling); if unchanged, the window is dropped INSIDE
+    // generate_layers (a content gate after entry).
+    int  diag2  = (access("/tmp/macws_ws_diag2", F_OK) == 0);
+    int  avalid = ((uintptr_t)a0 > 0x100000000 && (uintptr_t)a0 < 0x800000000000);
+    void *list_before = (diag2 && avalid) ? *(void **)((char *)a0 + 0x78) : NULL;
+    void *r = orig_gen_layers(a0, win, a2, a3);
+    if (diag2) {
         static int n; if (++n <= 60) {
             if ((uintptr_t)win > 0x100000000 && (uintptr_t)win < 0x800000000000) {
                 int    f58      = *(int  *)((char *)win + 0x58);
@@ -945,12 +952,14 @@ static void *hooked_gen_layers(void *a0, void *win, void *a2, void *a3) {
                 void  *curdisp  = (a0 && (uintptr_t)a0 > 0x100000000 && (uintptr_t)a0 < 0x800000000000)
                                     ? *(void **)((char *)a0 + 0x30) : (void *)-1;  // DP-1 current display
                 int    f718     = (int)(*(uint64_t *)((char *)win + 0x718) & 0x40);
-                fprintf(stderr, "#### WS_DIAG2 genLayers #%d window=%p f58=%d bind818=%p cur=%p wcb=%p present_a8=%p f718&40=%d flat838=%p legacy128=%p\n",
-                        n, win, f58, binddisp, curdisp, wcb_f8, present_a8, f718, flat838, legacy128);
+                void  *list_after = avalid ? *(void **)((char *)a0 + 0x78) : (void *)-1;
+                fprintf(stderr, "#### WS_DIAG2 genLayers #%d window=%p f58=%d bind818=%p cur=%p wcb=%p present_a8=%p f718&40=%d flat838=%p legacy128=%p  srclist %p->%p EMITTED=%d\n",
+                        n, win, f58, binddisp, curdisp, wcb_f8, present_a8, f718, flat838, legacy128,
+                        list_before, list_after, (list_before != list_after));
             }
         }
     }
-    return orig_gen_layers(a0, win, a2, a3);
+    return r;
 }
 // Content-receipt chain (does the client's CA content reach WS + bind?). 8-arg
 // safe passthrough (preserves x0-x7). Count-only, gate /tmp/macws_ws_diag2.
