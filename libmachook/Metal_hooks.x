@@ -2107,6 +2107,21 @@ static void macws_sigabrt_trampoline(int sig) {
                 spf, (spf>>24)&0xff, (spf>>16)&0xff, (spf>>8)&0xff, spf&0xff,
                 (unsigned long)plane, (unsigned long)desc.storageMode, (unsigned long)desc.usage,
                 class_getName([self class]));
+            // SRC-CONTENT: sample the SOURCE IOSurface's bytes at texture-creation time. This is the
+            // client's delivered window content (e.g. GlassDemo's CG-rendered pixels). nonzero>0 ⟹ the
+            // client delivered + WS HAS the pixels (drop-out = composite sampling, sub-hyp b); ~0 ⟹
+            // content never reached WS's surface (CARenderServer/CA receipt gap, sub-hyp a).
+            @try {
+                IOSurfaceLock(iosurface, 0x1 /*readonly*/, NULL);
+                void *b = IOSurfaceGetBaseAddress(iosurface);
+                size_t sz = IOSurfaceGetAllocSize(iosurface);
+                size_t nz = 0, samp = 0;
+                if (b && sz) for (size_t o = 0; o + 4 <= sz; o += 1021 * 4) { if (*(volatile uint32_t *)((char *)b + o) & 0xffffff) nz++; samp++; }
+                IOSurfaceUnlock(iosurface, 0x1, NULL);
+                fprintf(stderr, "####   SRC-CONTENT %lux%lu sz=%#zx base=%p nonzero=%.1f%%\n",
+                    (unsigned long)IOSurfaceGetWidth(iosurface), (unsigned long)IOSurfaceGetHeight(iosurface),
+                    sz, b, samp ? 100.0 * nz / samp : 0.0);
+            } @catch (__unused NSException *e) {}
         }
     }
     // DEST STORAGE FORCE (gated /tmp/macws_wscd_iosurf): the type-2 dest RT texture is
