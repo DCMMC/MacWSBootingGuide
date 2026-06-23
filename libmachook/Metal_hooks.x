@@ -1814,6 +1814,21 @@ static void macws_sigabrt_trampoline(int sig) {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.IN");
     }
+    // FMT-CHECK (gated /tmp/macws_fmt_check): verify the texture-descriptor format vs
+    // the IOSurface format for every IOSurface-backed texture — confirms (a) whether
+    // the composite DEST (2000x1456 / 2388x1668) is created through THIS path, and
+    // (b) the desc.pf=550 vs iosurf 'BGRA' mismatch hypothesis. Evidence before fix.
+    if (iosurface && desc && access("/tmp/macws_fmt_check", F_OK) == 0) {
+        static int fcn = 0;
+        if (fcn++ < 60) {
+            unsigned int spf = IOSurfaceGetPixelFormat(iosurface);
+            fprintf(stderr, "#### FMT-CHECK %lux%lu desc.pf=%lu iosurf.pf=0x%x('%c%c%c%c') plane=%lu storage=%lu usage=0x%lx cls=%s\n",
+                (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat,
+                spf, (spf>>24)&0xff, (spf>>16)&0xff, (spf>>8)&0xff, spf&0xff,
+                (unsigned long)plane, (unsigned long)desc.storageMode, (unsigned long)desc.usage,
+                class_getName([self class]));
+        }
+    }
     static int classlog = 0;
     if (classlog < 3) {
         fprintf(stderr, "#### MTL_TEX entry self class=%s\n", class_getName([self class]));
@@ -2200,6 +2215,18 @@ static void macws_sigabrt_trampoline(int sig) {
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
+    }
+    // FMT-CHECK-PLAIN (gated /tmp/macws_fmt_check): find where the pf=550 macOS
+    // composite dest (2000x1456) is created — it's NOT in the iosurface swizzle, so
+    // it's likely a PLAIN (no-IOSurface) creation. Dest-sized textures only.
+    if (desc && access("/tmp/macws_fmt_check", F_OK) == 0) {
+        static int pfcn = 0;
+        NSUInteger w = [desc width], h = [desc height];
+        if ((unsigned long)w * h > 500000 && pfcn++ < 40)
+            fprintf(stderr, "#### FMT-CHECK-PLAIN %lux%lu desc.pf=%lu storage=%lu usage=0x%lx cls=%s\n",
+                (unsigned long)w, (unsigned long)h, (unsigned long)[desc pixelFormat],
+                (unsigned long)[desc storageMode], (unsigned long)[desc usage],
+                class_getName([self class]));
     }
     // BLUR-PATH DIAG (gated /tmp/macws_textrace_file): does the CA::OGL backdrop-blur
     // create_texture reach THIS hook (→ routing gap, fixable) or bypass it via a cached
