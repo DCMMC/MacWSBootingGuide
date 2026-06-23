@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
     FILE *f = fopen(argv[1], "rb"); if (!f) { perror("open"); return 1; }
     uint32_t hd[7]; if (fread(hd, 4, 1, f) != 1) { fprintf(stderr, "short\n"); return 1; }
     uint32_t w, h, pf, layout, bytes, stride;
-    if (hd[0] == 0x47524232u) {            // GRB2 dest grab: magic,w,h,pf,layout,sz,bpr
+    if (hd[0] == 0x47524232u || hd[0] == 0x47524231u) {   // GRB2/GRB1 dest grab: magic,w,h,pf,layout,sz,bpr
         if (fread(hd + 1, 4, 6, f) != 6) { fprintf(stderr, "short GRB2\n"); return 1; }
         w = hd[1]; h = hd[2]; pf = hd[3]; layout = hd[4]; bytes = hd[5]; stride = hd[6];
         if (layout == 0xD0) layout = 0;    // detiled-linear marker -> linear (use bpr)
@@ -47,7 +47,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "in: %ux%u pf=%u layout=%u bytes=%u stride=%u bpp=%u tile=%ux%u\n", w, h, pf, layout, bytes, stride, bpp, tw, th);
     uint8_t *lin = calloc((size_t)w * h, bpp);
     if (layout == 0) {                                  // linear: honor stride
-        uint32_t st = stride ? stride : w * bpp;
+        uint32_t st = (stride >= w * bpp && (size_t)stride <= (size_t)w * bpp * 4) ? stride : w * bpp;
         for (uint32_t y = 0; y < h; y++) if ((size_t)y * st + (size_t)w * bpp <= bytes) memcpy(lin + (size_t)y * w * bpp, src + (size_t)y * st, (size_t)w * bpp);
     } else {                                            // tiled (GPU/twiddled): Asahi detile
         uint32_t tpr = (w + tw - 1) / tw;

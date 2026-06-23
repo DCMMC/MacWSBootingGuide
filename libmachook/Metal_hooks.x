@@ -879,6 +879,64 @@ void macws_2b_alias_dest(id texture) {
 }
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
+    // NEWBUF-TEST (self-contained, gated /tmp/macws_newbuf_test, one-shot): THE decisive question —
+    // does -[device newBufferWithIOSurface:] yield a REAL GPU VA that ALIASES the IOSurface in the
+    // chroot? Create our own 256x256 BGRA IOSurface, make a buffer from it, GPU fillBuffer 0xAB,
+    // then read the IOSurface CPU base. 0xABABABAB => buffer truly aliases the IOSurface (the
+    // texture-RT-via-buffer fix is viable). Unchanged => kernel doesn't alias IOSurface GPU
+    // mappings from the chroot at all (userland fix dead; only full-Metal-proxy left).
+    if (access("/tmp/macws_newbuf_test", F_OK) == 0) {
+        static dispatch_once_t nbt_once;
+        dispatch_once(&nbt_once, ^{
+            @try {
+                NSDictionary *props = @{ (id)kIOSurfaceWidth:@256, (id)kIOSurfaceHeight:@256,
+                    (id)kIOSurfaceBytesPerElement:@4, (id)kIOSurfaceBytesPerRow:@(256*4),
+                    (id)kIOSurfacePixelFormat:@(0x42475241) /*'BGRA'*/ };
+                IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+                id dev = MTLCreateSystemDefaultDevice();
+                uint64_t va = 0; id buf = nil;
+                if (s && dev) {
+                    typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                    buf = ((nbi_t)objc_msgSend)(dev, sel_registerName("newBufferWithIOSurface:"), s);
+                    if (buf) { typedef uint64_t (*ga_t)(id, SEL); va = ((ga_t)objc_msgSend)(buf, sel_registerName("gpuAddress")); }
+                }
+                if (s) { IOSurfaceLock(s,0,NULL); uint32_t *ip=(uint32_t*)IOSurfaceGetBaseAddress(s); if(ip){ip[0]=ip[1]=0x55555555;} IOSurfaceUnlock(s,0,NULL); }
+                if (buf && dev) {
+                    id q=[dev newCommandQueue];
+                    id cb=((id(*)(id,SEL))objc_msgSend)(q,sel_registerName("commandBuffer"));
+                    id be=((id(*)(id,SEL))objc_msgSend)(cb,sel_registerName("blitCommandEncoder"));
+                    unsigned long blen=((unsigned long(*)(id,SEL))objc_msgSend)(buf,sel_registerName("length"));
+                    unsigned long fl=blen<0x1000?blen:0x1000;
+                    ((void(*)(id,SEL,id,NSRange,uint8_t))objc_msgSend)(be,sel_registerName("fillBuffer:range:value:"),buf,NSMakeRange(0,fl),0xAB);
+                    ((void(*)(id,SEL))objc_msgSend)(be,sel_registerName("endEncoding"));
+                    ((void(*)(id,SEL))objc_msgSend)(cb,sel_registerName("commit"));
+                    ((void(*)(id,SEL))objc_msgSend)(cb,sel_registerName("waitUntilCompleted"));
+                    long status=((long(*)(id,SEL))objc_msgSend)(cb,sel_registerName("status"));
+                    uint32_t v0=0,v1=0;
+                    IOSurfaceLock(s,0x1,NULL); uint32_t *ip=(uint32_t*)IOSurfaceGetBaseAddress(s); if(ip){v0=ip[0];v1=ip[1];} IOSurfaceUnlock(s,0x1,NULL);
+                    fprintf(stderr,"#### NEWBUF-TEST gpuAddress=%#llx cb.status=%ld buf.len=%#lx ios[0,1]=%08x,%08x VERDICT=%s\n",
+                        va,status,blen,v0,v1,
+                        (v0==0xABABABAB)?"BUFFER-ALIASES-IOSURFACE ✓ (fix viable)"
+                            :(status==5?"GPU-OP-ERRORED (inconclusive)":"IOSURFACE-NOT-ALIASED ✗ (kernel denies alias)"));
+                } else fprintf(stderr,"#### NEWBUF-TEST setup failed s=%p dev=%p buf=%p gpuAddress=%#llx\n",(void*)s,(void*)dev,(void*)buf,va);
+            } @catch(__unused NSException *e){ fprintf(stderr,"#### NEWBUF-TEST exception\n"); }
+        });
+    }
+    // BINDFIX-RECHECK (gated /tmp/macws_bindfix): re-read the LIVE composite dest's impl+0x40
+    // AFTER frames executed. Still realVA => no encoder re-clobber (empty IOSurface = no-alias,
+    // kernel-deep). 0/changed => encoder re-clobbers (durability fix = wrapper+0x48). Decisive.
+    if (tex && access("/tmp/macws_bindfix", F_OK) == 0) {
+        @try {
+            size_t tw=[tex width], th=[tex height];
+            if ((size_t)tw*th >= 1000000) {
+                void *impl = *(void**)((char*)(__bridge void*)tex + macws_tex_impl_off());
+                if ((uintptr_t)impl > 0x1000) {
+                    static int rc=0; if (rc++ < 8)
+                        fprintf(stderr,"#### BINDFIX-RECHECK dest %zux%zu impl+0x40=%#llx\n", tw,th,*(uint64_t*)((char*)impl+0x40));
+                }
+            }
+        } @catch(__unused NSException*e){}
+    }
     // DEST-IOSURF-CONTENT (gated /tmp/macws_wscd_iosurf): probe the type-2 dest's IOSurface
     // (g_dest_iosurf) for GPU-rendered content. Non-zero => the WithIOSurface redirect made
     // the GPU render into the readable IOSurface (THE FIX worked).
@@ -2348,7 +2406,8 @@ static void macws_sigabrt_trampoline(int sig) {
     // so the resource/mapping stays alive) and re-bake the PBE descriptor via updateBindData.
     if (result && iosurface && access("/tmp/macws_bindfix", F_OK) == 0) {
         int w = (int)IOSurfaceGetWidth(iosurface);
-        if (w >= 1900 && w < 2300) {            // the macOS compositor full-screen dest
+        int hh = (int)IOSurfaceGetHeight(iosurface);
+        if ((uint64_t)w * hh >= 1000000) {      // any full-screen dest (panel scanout 2388 + composite 2000)
             @try {
                 static NSMutableDictionary *bufcache; static dispatch_once_t bc_once;
                 dispatch_once(&bc_once, ^{ bufcache = [NSMutableDictionary new]; });
