@@ -514,8 +514,15 @@ static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *o
         size_t w = [src width], h = [src height];
         id<MTLDevice> dev = [src device];
         if (!dev || w == 0 || h == 0) return NULL;
+        // pf=550 has NO safe GPU-readback path in the chroot: a buffer-backed pf=550
+        // texture ABORTS (_mtlValidateStrideTextureParameters) AND a BGRA8 reinterpret
+        // VIEW of the pf=550 texture HARD-CRASHES WS (runtime-confirmed 2026-06-23,
+        // WindowServer-...020254.ips — crash before any DETILE log). Skip it; the dest
+        // GPU content stays unreadable via CPU/blit until a working readback exists.
         MTLPixelFormat pf = [src pixelFormat];
-        size_t bpp = 4;  // pf 550/80/70 are all 4 bytes/pixel
+        if ((unsigned long)pf == 550) { fprintf(stderr, "#### DETILE: pf=550 has no safe readback path — skipping\n"); return NULL; }
+        id<MTLTexture> bsrc = src;
+        size_t bpp = 4;  // pf 80/70 are 4 bytes/pixel
         size_t align = 256;
         @try { NSUInteger a = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
                if (a > align) align = a; } @catch (__unused NSException *e) {}
@@ -536,7 +543,7 @@ static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *o
         id<MTLCommandQueue> q = [dev newCommandQueue];
         id<MTLCommandBuffer> cb = [q commandBuffer];
         id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
-        [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+        [bl copyFromTexture:bsrc sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                  sourceSize:MTLSizeMake(w,h,1) toTexture:lintex destinationSlice:0
                  destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
         [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
@@ -600,6 +607,41 @@ static void *macws_tex_raw_backing(id<MTLTexture> tex, size_t *ext_out) {
     if (ext_out) *ext_out = ext;
     if (ext == 0) return NULL;
     return backing;
+}
+// IMPL-STRUCT SCAN (gated /tmp/macws_impl_scan): the compositor dest texture's
+// GPU-rendered pixels live in a SEPARATE backing (the +0xa0 IOSurface CPU base is
+// EMPTY). Scan the AGX texture impl struct for ANY pointer to a ~surface-sized
+// readable region + sample its content% to locate that separate backing — answers
+// "is GlassDemo rendered-but-mis-routed (some offset has content) or never
+// rendered (all empty)". Read-only; vm_region-guarded; no GPU ops.
+static void macws_scan_impl_backings(id<MTLTexture> tex, size_t surf_sz) {
+    void *impl = *(void **)((char *)(__bridge void *)tex + macws_tex_impl_off());
+    if (!impl) return;
+    fprintf(stderr, "#### IMPL-SCAN begin impl=%p surf_sz=%#zx\n", impl, surf_sz);
+    for (size_t off = 0; off < 0x400; off += 8) {
+        void *p = *(void **)((char *)impl + off);
+        if ((uintptr_t)p < 0x10000 || ((uintptr_t)p & 7)) continue;
+        vm_address_t a = (vm_address_t)p; vm_size_t rsz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t mo = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &rsz, VM_REGION_BASIC_INFO_64,
+                         (vm_region_info_t)&bi, &cnt, &mo) != KERN_SUCCESS) continue;
+        if (a > (vm_address_t)p || !(bi.protection & VM_PROT_READ)) continue;
+        size_t ext = (size_t)((a + rsz) - (vm_address_t)p);
+        if (ext < surf_sz / 2) continue;   // must be ~surface-sized
+        int is_surf = 0;
+        @try { if (CFGetTypeID(p) == IOSurfaceGetTypeID()) is_surf = 1; } @catch (__unused NSException *e) {}
+        void *sample = p; size_t cap = ext;
+        if (is_surf) { @try { IOSurfaceLock((IOSurfaceRef)p, 0x1, NULL);
+            void *b = IOSurfaceGetBaseAddress((IOSurfaceRef)p); if (b) { sample = b; cap = surf_sz; } } @catch (__unused NSException *e) {} }
+        if (cap > surf_sz) cap = surf_sz;
+        size_t nz=0,samp=0;
+        for (size_t o=0;o+4<=cap;o+=997*4){ if(*(volatile uint32_t*)((char*)sample+o)&0xffffff)nz++; samp++; }
+        double pct = samp?100.0*nz/samp:0.0;
+        fprintf(stderr, "#### IMPL-SCAN impl+%#zx ptr=%p ext=%#zx is_surf=%d content=%.1f%%\n",
+                off, p, ext, is_surf, pct);
+    }
+    fprintf(stderr, "#### IMPL-SCAN end\n");
 }
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
@@ -678,6 +720,23 @@ void macws_grab_composite(id<MTLTexture> tex) {
             // composited display surface (pf=550, ~59% content) interleaves with
             // empty pf=80 capture surfaces across composite threads; wait for a
             // frame whose ring actually holds content (≥5%).
+            // IMPL-SCAN: locate the separate GPU backing on the pf=550 dest even
+            // when the readable IOSurface base is empty (runs before the 5% gate).
+            if (access("/tmp/macws_impl_scan", F_OK) == 0) {
+                for (id<MTLTexture> rt in ring) {
+                    if ((unsigned long)[rt pixelFormat] == 550) {
+                        macws_scan_impl_backings(rt, (size_t)[rt width]*[rt height]*4);
+                        break;
+                    }
+                }
+            }
+            // When blit-detiling, capture the pf=550 dest's GPU backing even if its
+            // IOSurface base reads empty — the blit reads GPU-PRIVATE content (the
+            // decisive render-empty vs separate-backing test).
+            if (detile_on) {
+                for (id<MTLTexture> rt in ring)
+                    if ((unsigned long)[rt pixelFormat] == 550) { dtex = rt; best_pct = 100.0; break; }
+            }
             if (best_pct < 5.0) { atomic_store(&g_grab_busy, 0); return; }
             if (!dtex) dtex = [ring objectAtIndex:0];
             uint8_t layout = 0xff; size_t ext = 0;
