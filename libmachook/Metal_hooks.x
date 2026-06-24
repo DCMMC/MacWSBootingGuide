@@ -66,6 +66,7 @@ static int macws_disp_mode(void) {
 extern uint32_t IOSurfaceGetID(IOSurfaceRef);
 static IOSurfaceRef g_vncSurf = NULL;
 static id g_ws_cmdq = nil;   // WS's captured compositor command queue (WSQ-TEST: the only queue whose CBs submit)
+extern _Atomic int g_dump_my_submit;   // SUBMIT-DUMP: tag MY blit's selector-30 submit (mac_hooks.m)
 static int macws_vnc_share_enabled(void) {
     static int c = -1;
     if (c < 0) c = (getenv("MACWS_VNC_SHARE") || access("/tmp/macws_vnc_share", F_OK) == 0) ? 1 : 0;
@@ -969,7 +970,7 @@ void macws_grab_composite(id<MTLTexture> tex) {
                     [bl copyFromTexture:tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                          sourceSize:MTLSizeMake(bw,bh,1) toTexture:lintex destinationSlice:0 destinationLevel:0
                          destinationOrigin:MTLOriginMake(0,0,0)];
-                    [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                    [bl endEncoding]; g_dump_my_submit = 1; [cb commit]; [cb waitUntilCompleted]; g_dump_my_submit = 0;
                     long st = (long)[cb status]; id err = [cb error]; void *bc = osurf ? IOSurfaceGetBaseAddress(osurf) : NULL;
                     size_t nz = 0, sm = 0;
                     if (bc && st == 4) for (size_t i = 0; i + 4 <= blen; i += 997 * 4) { sm++; if (*(uint32_t *)((char *)bc + i) & 0xffffff) nz++; }
@@ -1005,7 +1006,7 @@ void macws_grab_composite(id<MTLTexture> tex) {
                     id<MTLCommandBuffer> cbA = [wq commandBuffer];
                     id<MTLBlitCommandEncoder> blA = [cbA blitCommandEncoder];
                     [blA fillBuffer:tb range:NSMakeRange(0, 65536) value:0xAB];
-                    [blA endEncoding]; [cbA commit]; [cbA waitUntilCompleted];
+                    [blA endEncoding]; g_dump_my_submit = 1; [cbA commit]; [cbA waitUntilCompleted]; g_dump_my_submit = 0;
                     long sA = (long)[cbA status]; id eA = [cbA error]; uint8_t fb = ((uint8_t *)[tb contents])[0];
                     fprintf(stderr, "#### WSQ-TEST A(fillBuffer on WS queue) status=%ld err=%s firstByte=0x%02x => %s\n",
                         sA, eA ? [[eA localizedDescription] UTF8String] : "none", fb,

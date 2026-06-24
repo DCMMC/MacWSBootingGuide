@@ -6637,11 +6637,72 @@ __attribute__((visibility("default"))) io_connect_t macws_get_agx_conn(void) {
     return atomic_load(&g_agx_conn);
 }
 
+// SUBMIT-DUMP: set by the libmachook BLIT-TEST around its [cb commit] so the IOConnectCallMethod
+// selector-30 (AGX command-buffer submit) dump can tag MY submit vs WS's. See agx commit RE:
+// the kernel (AGXCommandQueue::processSegmentKernelCommand) rejects with 0x103 when an embedded
+// command record isn't {type=0x30, size=0x1a8, next=size+0x30}. Dump+compare WS (valid) vs mine.
+_Atomic int g_dump_my_submit = 0;
+
+static void macws_scan_records(const char *tag, const char *where, const uint32_t *p, size_t n_u32) {
+    int found = 0;
+    for (size_t k = 0; k + 1 < n_u32 && found < 16; k++) {
+        if (p[k] == 0x30) {                       // candidate kernel-command record type
+            uint32_t size = p[k + 1];
+            fprintf(stderr, "#### SUBMIT-DUMP[%s] %s rec@+%#zx type=0x30 size=%#x next=%#x %s\n",
+                tag, where, k * 4, size, p[k + 1] + 0x30,
+                size == 0x1a8 ? "(VALID 0x1a8)" : "(!!MISMATCH want 0x1a8)");
+            found++;
+        }
+    }
+    if (!found) fprintf(stderr, "#### SUBMIT-DUMP[%s] %s NO type=0x30 record in %zu u32\n", tag, where, n_u32);
+}
+
+static void macws_dump_submit(const char *tag, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt) {
+    fprintf(stderr, "#### SUBMIT-DUMP[%s] inCnt=%u inStructCnt=%zu inStruct=%p scalars:", tag, inCnt, inStructCnt, inStruct);
+    for (uint32_t i = 0; i < inCnt && i < 8; i++) fprintf(stderr, " %#llx", (unsigned long long)in[i]);
+    fprintf(stderr, "\n");
+    if (!inStruct || inStructCnt < 8) return;
+    const uint8_t *b = (const uint8_t *)inStruct;
+    fprintf(stderr, "#### SUBMIT-DUMP[%s] inStruct head:", tag);
+    for (size_t i = 0; i < inStructCnt && i < 64; i++) fprintf(stderr, "%02x", b[i]);
+    fprintf(stderr, "\n");
+    macws_scan_records(tag, "inStruct", (const uint32_t *)inStruct, inStructCnt / 4);
+    // follow plausible pointers in inStruct to the command-stream segment(s)
+    const uint64_t *u = (const uint64_t *)inStruct;
+    for (size_t i = 0; i < inStructCnt / 8 && i < 24; i++) {
+        uint64_t pp = u[i];
+        if (pp < 0x100000000ULL || pp > 0x7fffffffffffULL) continue;
+        vm_address_t a = (vm_address_t)pp; vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t mo = MACH_PORT_NULL;
+        if (vm_region_64(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &mo) != KERN_SUCCESS) continue;
+        if (a > (vm_address_t)pp || (vm_address_t)(a + sz) < (vm_address_t)pp + 256 || !(bi.protection & VM_PROT_READ)) continue;
+        const uint8_t *sb = (const uint8_t *)pp; const uint32_t *seg = (const uint32_t *)pp;
+        fprintf(stderr, "#### SUBMIT-DUMP[%s] args[%zu]=%#llx seg head:", tag, i, (unsigned long long)pp);
+        for (size_t j = 0; j < 96; j++) fprintf(stderr, "%02x", sb[j]);
+        fprintf(stderr, "\n");
+        size_t segn = ((vm_address_t)(a + sz) - (vm_address_t)pp) / 4; if (segn > 512) segn = 512;
+        char w[40]; snprintf(w, sizeof w, "seg[%zu]", i);
+        macws_scan_records(tag, w, seg, segn);
+        for (size_t j = 0; j < segn; j++)
+            if (seg[j] == 0x10000 || seg[j] == 0x10001) { fprintf(stderr, "#### SUBMIT-DUMP[%s] %s MAGIC %#x @+%#zx\n", tag, w, seg[j], j * 4); break; }
+    }
+}
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    // SUBMIT-DUMP (gated /tmp/macws_submit_dump): one-shot dump of the AGX command-buffer submit
+    // (selector 30 = 0x1e) command-stream records, tagged MY (g_dump_my_submit) vs WS. Read-only.
+    if ((orig == 0x1e || selector == 0x1e) && IOConnectIsIOGPU(client) && access("/tmp/macws_submit_dump", F_OK) == 0) {
+        int mine = atomic_load(&g_dump_my_submit);
+        static int dumped_ws = 0, dumped_mine = 0;
+        if ((mine && !dumped_mine) || (!mine && !dumped_ws)) {
+            if (mine) dumped_mine = 1; else dumped_ws = 1;
+            macws_dump_submit(mine ? "MYBLIT" : "WS", in, inCnt, inStruct, inStructCnt);
+        }
+    }
     if (!skip && !IOConnectIsIOGPU(client)) {
         macws_iomfb_rate_tick(selector);
         macws_iomfb_sig("M", "pre", selector, inCnt, inStructCnt, in, &inCnt, inStruct, outStructCnt, 0);
