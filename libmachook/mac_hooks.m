@@ -7638,19 +7638,23 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                                                       // BREAKS init (mg_all.out): those have a DIFFERENT
                                                       // output layout that macOS reads fine at 80B (no
                                                       // +0x50 extra). Only textures need the 88B layout.
-        // RE-DERIVED translation (2026-06-24, disasm of macOS 13.4 _IOGPUResourceCreate @ IOGPU
-        // 0x19d1560a0): macOS Metal reads outStruct[+0x08]/[+0x10] (GPU VA / client-shared) at the
-        // SAME offsets as iOS; the layouts diverge at +0x18 where macOS has an extra 8-byte field,
-        // shifting everything from +0x18 onward up by 8 (iOS size +0x20/+0x48 -> macOS +0x28/+0x50,
-        // and the consumer memcpy's outStruct[+0x50] (the w22=8B "extra") -> obj+0x70). So insert 8
-        // zero bytes at +0x18 (NOT the front — that moved the VAs and crashed Metal, the earlier
-        // refuted attempt). Result: iOS 80B -> macOS 88B with VAs preserved + size at the right spots.
+        // RE + EMPIRICALLY-CONFIRMED translation (2026-06-24):
+        //  CONSUMER = macOS 13.4 _IOGPUResourceCreate @ IOGPU 0x19d1560a0 allocates
+        //    outStructCnt = device[+0x34](=8)+0x50 = 88; reads out[+0x08]->GPU VA, out[+0x28]->size,
+        //    memcpy out[+0x50..+0x58]->obj+0x70.
+        //  PRODUCER = iOS 16.3 IOGPUDevice::new_resource @ 0xfffffe0009f03b4c writes 80 bytes
+        //    (output size = IOGPU->0x224(=0)+0x50).
+        //  The iOS 16.3 and macOS 13.4 layouts DIFFER: macOS has an extra 8-byte field at +0x18,
+        //  shifting +0x18.. up by 8. EMPIRICALLY CONFIRMED: insert-8B-@+0x18 beats the page fault
+        //  (0xb->0x9); "extend-only" (no shift, just zero the +0x50 extra) brings the page fault
+        //  BACK -> the shift is REQUIRED, not the size alone. (Front-insert @+0x00 crashed Metal:
+        //  it moved the VAs at +0x08/+0x10, which are NOT shifted.)
         unsigned char *o = (unsigned char *)outStruct;
         memmove(o + 0x20, o + 0x18, 0x38);   // iOS[0x18..0x50) -> macOS[0x20..0x58)
-        memset(o + 0x18, 0, 8);              // inserted macOS field @ +0x18 (= 0 per local dump)
+        memset(o + 0x18, 0, 8);              // inserted macOS-only field @ +0x18
         *outStructCnt = 88;
         static int xn = 0; if (xn++ < 4)
-            fprintf(stderr, "#### OUT-XLATE: iOS 80B -> macOS 88B (insert 8B @ +0x18, RE-derived)\n");
+            fprintf(stderr, "#### OUT-XLATE: iOS 80B -> macOS 88B (insert 8B @ +0x18, confirmed)\n");
     }
     if (qbuf) free(qbuf);
     return r;
