@@ -18,6 +18,11 @@
 // IOSurface
 typedef id IOSurfaceRef;
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
+// BYPASS-COMPRESSION forward decls (defined near IOSurfaceCreate_safe below):
+static IOSurfaceRef (*orig_IOSurfaceCreate_ms)(CFDictionaryRef);
+static IOSurfaceRef hooked_IOSurfaceCreate(CFDictionaryRef);
+static IOSurfaceRef (*orig_ws_targetable)(int, int, int, uint64_t, const char *);
+static IOSurfaceRef hooked_ws_targetable(int, int, int, uint64_t, const char *);
 extern IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t port);
 extern uint32_t IOSurfaceGetPixelFormat(IOSurfaceRef surface);
 extern uint32_t IOSurfaceGetID(IOSurfaceRef surface);
@@ -1867,6 +1872,43 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
             g_ws_wscd_iosurface_raw = (void *)(0x185437210 + ((uintptr_t)header - 0x1850E5000));
             fprintf(stderr, "#### DEST-IOSURF targetable helper @ %p ; WithIOSurface @ %p\n",
                     g_ws_targetable_iosurf_raw, g_ws_wscd_iosurface_raw);
+        }
+        // BYPASS-COMPRESSION (gated /tmp/macws_uncompress): MSHook the REAL
+        // IOSurfaceCreate (dlsym — NOT the DYLD_INTERPOSE'd symbol) so SkyLight's
+        // intra-shared-cache DIRECT-bind composite-dest creation is caught and
+        // rewritten to BGRA8 LINEAR (uncompressed). Then the AGX composite renders
+        // the logo as plain pixels — no compression to decode.
+        if (access("/tmp/macws_uncompress", F_OK) == 0 && !orig_IOSurfaceCreate_ms) {
+            // Get the REAL IOSurfaceCreate from IOSurface.framework — NOT dlsym, which
+            // returns libmachook's DYLD_INTERPOSE'd IOSurfaceCreate_safe (a low libmachook
+            // addr); hooking THAT recursed + killed WS and never reached the composite.
+            void *iosc = NULL;
+            // Walk loaded images to find IOSurface, then dlsym ITS OWN handle for the
+            // REAL IOSurfaceCreate (dlsym(RTLD_DEFAULT) returns libmachook's interpose;
+            // MSGetImageByName(path) failed — shared-cache install name differs).
+            for (uint32_t ii = 0; ii < _dyld_image_count(); ii++) {
+                const char *nm = _dyld_get_image_name(ii);
+                if (nm && strstr(nm, "IOSurface")) {
+                    void *hh = dlopen(nm, RTLD_NOLOAD | RTLD_LAZY);
+                    void *s = hh ? dlsym(hh, "IOSurfaceCreate") : NULL;
+                    if (s) { iosc = s; fprintf(stderr, "#### UNCOMPRESS: real IOSurfaceCreate %p in %s\n", s, nm); break; }
+                }
+            }
+            if (iosc) {
+                MSHookFunction(iosc, (void *)hooked_IOSurfaceCreate, (void **)&orig_IOSurfaceCreate_ms);
+                fprintf(stderr, "#### UNCOMPRESS: MSHook REAL IOSurfaceCreate @ %p installed (orig=%p)\n",
+                        iosc, (void *)orig_IOSurfaceCreate_ms);
+            } else {
+                fprintf(stderr, "#### UNCOMPRESS: real IOSurfaceCreate not found in loaded images\n");
+            }
+            // Also hook SkyLight's targetable-surface creator — the '&b38' composite dest
+            // is created there, NOT via the public IOSurfaceCreate (RING/CALL-confirmed).
+            if (!orig_ws_targetable) {
+                void *tgt = (void *)(0x1853b9d9c + ((uintptr_t)header - 0x1850E5000));
+                MSHookFunction(tgt, (void *)hooked_ws_targetable, (void **)&orig_ws_targetable);
+                fprintf(stderr, "#### UNCOMPRESS: MSHook _WSIOSurfaceCreateTargetable @ %p (orig=%p)\n",
+                        tgt, (void *)orig_ws_targetable);
+            }
         }
         if (access("/tmp/macws_ws_diag2", F_OK) == 0) {
             // CLEAN slide off the image header (NOT sym1 — sym1 is PAC-signed and
@@ -6079,6 +6121,99 @@ DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
 // The simplest hack (DYLD_INTERPOSE GetClientShared to fall back to the
 // resource pointer when it returns NULL) was tried + reverted — user
 // asked for structural understanding first, not whack-a-mole.
+
+// ── BYPASS-COMPRESSION (gated /tmp/macws_uncompress) ───────────────────────
+// Rewrite SkyLight's compressed '&b38' "CA Framebuffer" composite dest into a
+// plain BGRA8 LINEAR (uncompressed) surface (Asahi: linear ⟹ never compressed),
+// so the AGX composite renders the logo as plain pixels we can read directly —
+// no decompress, no detile, no cross-hatch. The existing DYLD_INTERPOSE
+// (IOSurfaceCreate_safe) CANNOT reach the composite: SkyLight's IOSurfaceCreate
+// call inside _MetalCompositeCoreAnimation is an intra-shared-cache DIRECT bind
+// that DYLD_INTERPOSE can't redirect. MSHookFunction patches the function itself,
+// so the direct bind hits it too.
+static IOSurfaceRef (*orig_IOSurfaceCreate_ms)(CFDictionaryRef) = NULL;
+
+static NSMutableDictionary *macws_caframebuffer_to_bgra8_linear(CFDictionaryRef properties_cf) {
+    if (!properties_cf || CFGetTypeID(properties_cf) != CFDictionaryGetTypeID()) return nil;
+    CFNumberRef pfNum = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfacePixelFormat"));
+    uint32_t pf = 0;
+    if (pfNum && CFGetTypeID(pfNum) == CFNumberGetTypeID()) CFNumberGetValue(pfNum, kCFNumberSInt32Type, &pf);
+    if ((pf & 0xFF000000u) != 0x26000000u) return nil;   // Apple-compression marker (high byte 0x26)
+    CFStringRef name = (CFStringRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceName"));
+    if (!(name && CFGetTypeID(name) == CFStringGetTypeID() &&
+          CFStringCompare(name, CFSTR("CA Framebuffer"), 0) == kCFCompareEqualTo)) return nil;
+    CFNumberRef wNum = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceWidth"));
+    CFNumberRef hNum = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceHeight"));
+    int w = 0, h = 0;
+    if (wNum && CFGetTypeID(wNum) == CFNumberGetTypeID()) CFNumberGetValue(wNum, kCFNumberSInt32Type, &w);
+    if (hNum && CFGetTypeID(hNum) == CFNumberGetTypeID()) CFNumberGetValue(hNum, kCFNumberSInt32Type, &h);
+    if (w <= 0 || h <= 0) return nil;
+    const int bpe = 4;
+    size_t bytesPerRow = ((size_t)w * (size_t)bpe + 63u) & ~63ul;   // BytesPerRow set ⟹ Linear ⟹ uncompressed
+    size_t planeSize = bytesPerRow * (size_t)h;
+    NSMutableDictionary *np = [NSMutableDictionary dictionary];
+    np[@"IOSurfaceWidth"] = @(w); np[@"IOSurfaceHeight"] = @(h);
+    np[@"IOSurfacePixelFormat"] = @((unsigned int)'BGRA');   // 0x42475241, plain uncompressed BGRA8
+    np[@"IOSurfaceBytesPerElement"] = @(bpe);
+    np[@"IOSurfaceBytesPerRow"] = @(bytesPerRow);
+    np[@"IOSurfaceAllocSize"] = @(planeSize);
+    np[@"IOSurfaceName"] = @"CA Framebuffer";   // preserve identity so SkyLight still treats it as the dest
+    CFNumberRef wsFlag = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("CAWindowServerSurface"));
+    if (wsFlag) np[@"CAWindowServerSurface"] = (__bridge id)wsFlag;
+    return np;
+}
+
+static IOSurfaceRef hooked_IOSurfaceCreate(CFDictionaryRef properties_cf) {
+    static int s_on = -1;
+    if (s_on < 0) s_on = (access("/tmp/macws_uncompress", F_OK) == 0) ? 1 : 0;
+    if (s_on) {
+        // DIAG: log the first calls' pf+name+size so we can see whether the '&b38'
+        // composite dest is even created via this IOSurfaceCreate (or elsewhere).
+        static int s_cn = 0;
+        if (s_cn < 50 && properties_cf && CFGetTypeID(properties_cf) == CFDictionaryGetTypeID()) {
+            s_cn++;
+            uint32_t dpf = 0; CFNumberRef pn = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfacePixelFormat"));
+            if (pn && CFGetTypeID(pn) == CFNumberGetTypeID()) CFNumberGetValue(pn, kCFNumberSInt32Type, &dpf);
+            CFStringRef nm = (CFStringRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceName"));
+            char nb[64] = "?"; if (nm && CFGetTypeID(nm) == CFStringGetTypeID()) CFStringGetCString(nm, nb, 64, kCFStringEncodingUTF8);
+            int dw = 0, dh = 0;
+            CFNumberRef wn = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceWidth"));
+            CFNumberRef hn = (CFNumberRef)CFDictionaryGetValue(properties_cf, (const void *)CFSTR("IOSurfaceHeight"));
+            if (wn && CFGetTypeID(wn) == CFNumberGetTypeID()) CFNumberGetValue(wn, kCFNumberSInt32Type, &dw);
+            if (hn && CFGetTypeID(hn) == CFNumberGetTypeID()) CFNumberGetValue(hn, kCFNumberSInt32Type, &dh);
+            fprintf(stderr, "#### UNCOMPRESS-CALL #%d pf=%#x name='%s' %dx%d\n", s_cn, dpf, nb, dw, dh);
+        }
+        NSMutableDictionary *np = macws_caframebuffer_to_bgra8_linear(properties_cf);
+        if (np) {
+            IOSurfaceRef r = orig_IOSurfaceCreate_ms((__bridge CFDictionaryRef)np);
+            static int nl = 0; if (nl++ < 16)
+                fprintf(stderr, "#### UNCOMPRESS: CA-Framebuffer '&b38' -> BGRA8 linear %p\n", (void *)r);
+            return r;
+        }
+    }
+    return orig_IOSurfaceCreate_ms(properties_cf);
+}
+
+// BYPASS-COMPRESSION: hook SkyLight's targetable-surface creator. The compressed
+// '&b38' composite dest is created HERE (not via the public IOSurfaceCreate). Log
+// every call's (w,h,format,protection,label); FORCE the full-screen Apple-compressed
+// dest to plain BGRA8 so the AGX composite renders uncompressed. Gated /tmp/macws_uncompress.
+static IOSurfaceRef hooked_ws_targetable(int w, int h, int format, uint64_t protection, const char *label) {
+    static int s_cn = 0;
+    if (s_cn < 40) { s_cn++;
+        char fc[5] = { (char)format, (char)(format >> 8), (char)(format >> 16), (char)(format >> 24), 0 };
+        fprintf(stderr, "#### WSTARGET #%d %dx%d format=%#x '%s' prot=%#llx label='%s'\n",
+                s_cn, w, h, (unsigned)format, fc, (unsigned long long)protection, label ? label : "?");
+    }
+    if (access("/tmp/macws_uncompress", F_OK) == 0 && w >= 1900 && h >= 1400 &&
+        (((unsigned)format & 0xFF000000u) == 0x26000000u)) {     // Apple-compression marker
+        IOSurfaceRef r = orig_ws_targetable(w, h, (int)'BGRA', protection, label);
+        static int nl = 0; if (nl++ < 8)
+            fprintf(stderr, "#### WSTARGET-FORCE %dx%d %#x->'BGRA' -> %p\n", w, h, (unsigned)format, (void *)r);
+        return r;
+    }
+    return orig_ws_targetable(w, h, format, protection, label);
+}
 
 // Tightly-scoped IOSurfaceCreate interposer — only rewrites SkyLight's "CA
 // Framebuffer" 2-plane Apple-GPU-compressed BGRA10_XR surface (FourCC '&b38' /

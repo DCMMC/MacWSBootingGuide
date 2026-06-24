@@ -111,6 +111,88 @@ renders fully** — title bar, controls, AND **blur**
 (`NSVisualEffectView` vibrancy / backdrop blur) — none of which work
 fully under the MTLSim path.
 
+### ✅ VERIFIED REPRODUCTION (2026-06-24): macOS Apple logo, AGX-native, EXCLUSIVE
+
+First confirmed visible AGX-native output. The chroot WS renders the macOS
+boot/login **Apple logo** to the pf=550 display surface; captured + decoded to a
+recognizable image. This is the load-bearing proof the AGX-native render→capture
+pipeline works end-to-end. Re-run this exact recipe to re-verify.
+
+**Commit:** verified on `ac7ea16` AND on the branch HEAD `78730a5`
+(both on `session-2026-06-23-agx-panic-detile`). ac7ea16 = "DCP panic fix
+(SwapEnd→SwapCancel), vsync driver, IOSurface-resolved grab, de-tile (linear
+9600)". The later commits (`b7b4fd2` REC-SIZE FIX, `78730a5` WIREBLIT, the
+BLIT-TEST/SUBMIT-DUMP/WSQ-TEST series) are **all gated diagnostics, OFF by
+default**, so they do NOT regress this path — the recipe reproduces identically
+(content ~60%) on the latest commit. Required deployed-`libmachook.dylib` markers:
+contains `GRAB-PNG`/`macws_cpusize`/`SWAP-CANCEL` (the grab path). Mode is
+**EXCLUSIVE only** (the pf=550 panel surface needs the present; coexist
+swap-cancels it).
+
+**Flag files** (chroot `/tmp`, i.e. host `/var/mnt/rootfs/tmp/`):
+- SET exactly two: `macws_cpusize` (THE key — switches grab to the pf=550-finding
+  GRAB-PNG path) and `macws_grab_png`. Plus `macws_grab_now` to trigger each capture.
+- **REMOVE all stray flags first.** A leftover **`macws_vnc_test`** (or
+  `macws_vnc_share` / `vnc_surfid` / `vnc_selftest` / `vnc_cappool`) enables the
+  `macws_vnc_on_composite` background thread → `-[MTLFakeDevice
+  hooked_newTextureWithDescriptor:]` → `IOSurfaceCreate_safe` **SIGSEGV
+  KERN_INVALID_ADDRESS at 0x8** → **WS dies ~3 s after every start** (WS-only,
+  no app needed). This was the sole cause of repeated reproduction failures.
+  Also remove `macws_vsync_drive`, `macws_disp_copy`, `macws_disp_dump`,
+  `macws_src_now`, `ws_headless`.
+
+**Environment variables** (exported on the trigger app; WS plist already carries
+the always-on `MACWS_AGX_NATIVE` etc.):
+`CA_VSYNC_OFF=1 MACWS_AGX_NATIVE=1 MACWS_AGX_REGISTER_CLASSES=1 MACWS_PIN_FALLBACK=1`
+
+**Execution commands** (run on device; after a reboot first `sudo bash
+/var/jb/usr/macOS/bin/postinst.sh` to restore the trustcache, then verify
+`run_bash.sh -c "echo hi"` prints `hi`):
+
+```bash
+R=/var/mnt/rootfs/tmp
+# 1. REMOVE the WS-crashing vnc flags + all stray capture flags
+rm -f $R/macws_vnc_test $R/macws_vnc_share $R/macws_vnc_surfid $R/macws_vnc_selftest \
+      $R/macws_vnc_cappool $R/macws_vsync_drive $R/macws_disp_copy $R/macws_disp_dump \
+      $R/macws_src_now $R/ws_headless $R/macws_grab.raw $R/macws_grab_now
+# 2. SET only the two capture flags
+touch $R/macws_cpusize $R/macws_grab_png
+: > /var/jb/var/mobile/WindowServer.err
+# 3. Start WS in EXCLUSIVE
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh restart exclusive --no-terminal
+#    wait until `ps ax | grep SkyLight.*WindowServer` shows a pid, then ~12 s;
+#    WS MUST stay alive (if it dies in ~3 s a stray vnc flag is still set)
+# 4. Run a fullscreen app as a composite TRIGGER (its own pixels are NOT composited;
+#    the pf=550 content is the boot Apple-logo screen already on the panel)
+sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c \
+  "export PATH=/usr/local/bin:/usr/bin:/bin; \
+   export CA_VSYNC_OFF=1 MACWS_AGX_NATIVE=1 MACWS_AGX_REGISTER_CLASSES=1 MACWS_PIN_FALLBACK=1; \
+   /tmp/encgrad >/tmp/encgrad.out 2>&1 &"
+sleep 12
+grep -c 'ordered front' $R/encgrad.out      # MUST be >=1 (app rendered → composite fires)
+# 5. Trigger the grab; GRAB-PNG must log `pf=550 ... content=~53-61%`
+touch $R/macws_grab_now; sleep 4
+grep 'GRAB-PNG' /var/jb/var/mobile/WindowServer.err | tail -1
+# 6. Restore iOS UI when done (safety)
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop
+```
+
+**Decode (host side):** pull `$R/macws_grab.raw`; it is **linear, stride 9600**
+(2400 px padded — NOT 9552, NOT twiddled). Header = 6×u32 `{magic,w,h,pf,layout,
+bytes}`, pixels pf550 = 4 B/px B10G10R10A2:
+```bash
+misc/detile_view macws_grab.raw applelogo.png l 9600    # or detile_view in.raw out.png l 9600
+```
+Result: the Apple logo, centered on a two-tone gray background, content ~53-61%.
+The residual cross-hatch weave is **G13 lossless framebuffer compression**
+(expected; a fully clean image needs a GPU decompress pass — see
+`docs/asahi-agx-findings.md`).
+
+**Witnesses (all required):** `encgrad.out` logs `ENCGRAD ordered front`; WS pid
+stays alive through the grab; `GRAB-PNG` logs `pf=550 ... content≈53-61%`; the
+decoded PNG shows the logo. If WS dies ~3 s in → a stray `macws_vnc_*` flag is
+set. If grab only shows `pf=80 ~5%` → the app never rendered (no pf=550 composite).
+
 ### Why NOT the SIM path
 
 Confirmed gaps (memory: `backdrop-blur-tile-pipeline-blocked`):

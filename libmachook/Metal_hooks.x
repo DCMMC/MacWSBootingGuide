@@ -562,6 +562,56 @@ static void *macws_tex_backing(id<MTLTexture> tex, uint8_t *layout_out, size_t *
 // that crashes on chroot AGX textures). Returns malloc'd linear pixels (caller
 // frees) + sets *out_bpr/*out_sz, or NULL on any failure (caller falls back to
 // the twiddled read). Same pixel format as src (pf=550 stays 10-bit).
+
+// OFFICIAL macOS RESOLVE (gated /tmp/macws_optcpu). On real macOS, GPU render
+// targets are GPU-internally compressed/twiddled; the framework resolves them to
+// CPU-readable linear form on access via -[MTLBlitCommandEncoder
+// optimizeContentsForCPUAccess:] (host-verified callable, M3). The chroot's
+// IOSurface coherency doesn't auto-resolve → CPU sees the cross-hatch. This calls
+// the SAME official API on the composite texture, then reads its IOSurface backing.
+// Decisive 3-way: (a) status=completed + clean backing => SOLVED via the macOS path;
+// (b) status!=completed (e.g. 0xb page fault) => the texture isn't GPU-mapped in the
+// chroot (coherency wall, pinned precisely); (c) completed but still cross-hatch =>
+// the resolve is a no-op here. Returns malloc'd linear (same pf as src) or NULL.
+static uint8_t *macws_optimize_cpu(id<MTLTexture> src, size_t *out_bpr, size_t *out_sz) {
+    if (access("/tmp/macws_optcpu", F_OK) != 0) return NULL;
+    @try {
+        id<MTLDevice> dev = [src device];
+        if (!dev) return NULL;
+        void *simpl = *(void **)((char *)(__bridge void *)src + 0x208);
+        IOSurfaceRef ios = ((uintptr_t)simpl > 0x1000) ? *(IOSurfaceRef *)((char *)simpl + 0xa0) : NULL;
+        uint64_t srcVA = ((uintptr_t)simpl > 0x1000) ? *(volatile uint64_t *)((char *)simpl + 0x40) : 0;
+        id<MTLCommandQueue> q = [dev newCommandQueue];
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+        if (![bl respondsToSelector:@selector(optimizeContentsForCPUAccess:)]) {
+            fprintf(stderr, "#### OPTCPU: selector unavailable\n"); [bl endEncoding]; return NULL; }
+        [bl optimizeContentsForCPUAccess:src];
+        [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        long st = (long)[cb status]; NSError *e = [cb error];
+        fprintf(stderr, "#### OPTCPU: status=%ld err=%s srcVA=%#llx ios=%p\n",
+                st, e ? [[e localizedDescription] UTF8String] : "none", (unsigned long long)srcVA, ios);
+        if (st != MTLCommandBufferStatusCompleted || !ios) return NULL;
+        size_t h = [src height];
+        IOSurfaceLock(ios, 0x1 /*kIOSurfaceLockReadOnly*/, NULL);
+        void *base = IOSurfaceGetBaseAddress(ios);
+        size_t bpr = IOSurfaceGetBytesPerRow(ios), sz = bpr * h;
+        uint8_t *res = NULL;
+        if (base && sz) {
+            size_t nz=0,smp=0; for (size_t o=0;o+4<=sz;o+=997*4){ if(*(volatile uint32_t*)((char*)base+o)&0xffffff)nz++; smp++; }
+            res = (uint8_t *)malloc(sz);
+            if (res) memcpy(res, base, sz);
+            fprintf(stderr, "#### OPTCPU: resolved bpr=%zu sz=%#zx content=%.1f%%\n", bpr, sz, smp?100.0*nz/smp:0.0);
+        }
+        IOSurfaceUnlock(ios, 0x1, NULL);
+        if (res) { if (out_bpr) *out_bpr = bpr; if (out_sz) *out_sz = sz; }
+        return res;
+    } @catch (NSException *e) {
+        fprintf(stderr, "#### OPTCPU EXC %s\n", [[e reason] UTF8String] ?: "?");
+        return NULL;
+    }
+}
+
 static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *out_sz) {
     // OPT-IN ONLY (gate /tmp/macws_detile). For pf=550 the chroot texture-creation
     // path aborts (AGXTexture init → MTLReportFailure, runtime-confirmed
@@ -578,7 +628,91 @@ static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *o
         // WindowServer-...020254.ips — crash before any DETILE log). Skip it; the dest
         // GPU content stays unreadable via CPU/blit until a working readback exists.
         MTLPixelFormat pf = [src pixelFormat];
-        if ((unsigned long)pf == 550) { fprintf(stderr, "#### DETILE: pf=550 has no safe readback path — skipping\n"); return NULL; }
+        if ((unsigned long)pf == 550) {
+            // ROUTE B (Asahi GPU-decompress): blit the compressed pf=550 source into a
+            // FRESH LINEAR IOSurface dest. Setting IOSurfaceBytesPerRow forces a Linear
+            // (uncompressed) layout, so Metal decompresses+detiles during the blit; then
+            // read the IOSurface base directly (clean linear pf=550). This avoids the
+            // buffer-backed pf=550 abort (_mtlValidateStrideTextureParameters) AND the
+            // BGRA8-view WS crash that the old path hit. Submission needs the REC-SIZE FIX
+            // (/tmp/macws_recfix) so the op-3 blit records pass the iOS kernel (0x103->0xb).
+            size_t bpp = 4, ualign = 256;
+            @try { NSUInteger a = [dev minimumLinearTextureAlignmentForPixelFormat:pf];
+                   if (a > ualign) ualign = a; } @catch (__unused NSException *e) {}
+            size_t bpr = ((w * bpp + ualign - 1) / ualign) * ualign;
+            size_t sz = bpr * h;
+            // STEP 1 LOCALIZE: blit src -> a Metal-PRIVATE dest (Metal maps it itself, no
+            // IOSurface registration). If this COMPLETES, the 0xb fault is the dest IOSurface's
+            // GPU registration; if it ALSO faults, the fault is the source decompress read.
+            @try {
+                MTLTextureDescriptor *pd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+                pd.storageMode = MTLStorageModePrivate; pd.usage = MTLTextureUsageShaderRead;
+                id<MTLTexture> ptex = [dev newTextureWithDescriptor:pd];
+                if (ptex) {
+                    id<MTLCommandQueue> pq = [dev newCommandQueue];
+                    id<MTLCommandBuffer> pcb = [pq commandBuffer];
+                    id<MTLBlitCommandEncoder> pbl = [pcb blitCommandEncoder];
+                    [pbl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                              sourceSize:MTLSizeMake(w,h,1) toTexture:ptex destinationSlice:0
+                              destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                    [pbl endEncoding]; [pcb commit]; [pcb waitUntilCompleted];
+                    NSError *pe = [pcb error];
+                    fprintf(stderr, "#### DETILE550-PRIV: status=%ld err=%s\n",
+                            (long)[pcb status], pe ? [[pe localizedDescription] UTF8String] : "none");
+                } else fprintf(stderr, "#### DETILE550-PRIV: private tex nil\n");
+            } @catch (__unused NSException *e) { fprintf(stderr, "#### DETILE550-PRIV: exception\n"); }
+            // Match the source IOSurface's pixel format (the valid IOSurface fourcc for
+            // pf=550) so newTextureWithDescriptor:iosurface: accepts the dest.
+            uint32_t iofmt = 0;
+            void *simpl = *(void **)((char *)(__bridge void *)src + 0x208);
+            if ((uintptr_t)simpl > 0x1000) {
+                IOSurfaceRef sios = *(IOSurfaceRef *)((char *)simpl + 0xa0);
+                if ((uintptr_t)sios > 0x1000) { uint32_t f = IOSurfaceGetPixelFormat(sios); if (f) iofmt = f; }
+            }
+            if (!iofmt) iofmt = 550;
+            NSDictionary *dp = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
+                @"IOSurfaceBytesPerElement": @(bpp), @"IOSurfacePixelFormat": @(iofmt),
+                @"IOSurfaceBytesPerRow": @(bpr), @"IOSurfaceAllocSize": @(sz) };
+            IOSurfaceRef dios = IOSurfaceCreate((__bridge CFDictionaryRef)dp);
+            if (!dios) { fprintf(stderr, "#### DETILE550: IOSurfaceCreate nil (iofmt=%#x)\n", iofmt); return NULL; }
+            MTLTextureDescriptor *dd = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:pf width:w height:h mipmapped:NO];
+            dd.storageMode = MTLStorageModeShared; dd.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> lintex = nil;
+            @try { lintex = [dev newTextureWithDescriptor:dd iosurface:dios plane:0]; }
+            @catch (__unused NSException *e) { lintex = nil; }
+            if (!lintex) { fprintf(stderr, "#### DETILE550: iosurface-linear lintex nil (iofmt=%#x bpr=%zu)\n", iofmt, bpr); CFRelease(dios); return NULL; }
+            { // localize the 0xb page-fault: src + dest GPU VAs (impl+0x40); 0 = not GPU-mapped
+                void *limpl = *(void **)((char *)(__bridge void *)lintex + 0x208);
+                void *simpl2 = *(void **)((char *)(__bridge void *)src + 0x208);
+                fprintf(stderr, "#### DETILE550: srcVA=%#llx destVA=%#llx (0=>not GPU-mapped)\n",
+                    (unsigned long long)((uintptr_t)simpl2>0x1000 ? *(volatile uint64_t *)((char *)simpl2+0x40) : 0),
+                    (unsigned long long)((uintptr_t)limpl>0x1000 ? *(volatile uint64_t *)((char *)limpl+0x40) : 0));
+            }
+            id<MTLCommandQueue> q = [dev newCommandQueue];
+            id<MTLCommandBuffer> cb = [q commandBuffer];
+            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+            [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                     sourceSize:MTLSizeMake(w,h,1) toTexture:lintex destinationSlice:0
+                     destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+            [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            long st = (long)[cb status];
+            NSError *berr = [cb error];
+            fprintf(stderr, "#### DETILE550: blit status=%ld err=%s iofmt=%#x bpr=%zu sz=%#zx\n",
+                    st, berr ? [[berr localizedDescription] UTF8String] : "none", iofmt, bpr, sz);
+            if (st != MTLCommandBufferStatusCompleted) { CFRelease(dios); return NULL; }
+            void *base = IOSurfaceGetBaseAddress(dios);
+            if (!base) { fprintf(stderr, "#### DETILE550: base nil\n"); CFRelease(dios); return NULL; }
+            size_t nz=0,smp=0; for (size_t o=0;o+4<=sz;o+=997*4){ if(*(volatile uint32_t*)((char*)base+o)&0xffffff)nz++; smp++; }
+            uint8_t *res = (uint8_t *)malloc(sz);
+            if (!res) { CFRelease(dios); return NULL; }
+            memcpy(res, base, sz);
+            CFRelease(dios);
+            if (out_bpr) *out_bpr = bpr;
+            if (out_sz) *out_sz = sz;
+            fprintf(stderr, "#### DETILE550: OK linear bpr=%zu sz=%#zx content=%.1f%%\n", bpr, sz, smp?100.0*nz/smp:0.0);
+            return res;
+        }
         id<MTLTexture> bsrc = src;
         size_t bpp = 4;  // pf 80/70 are 4 bytes/pixel
         size_t align = 256;
@@ -1193,6 +1327,16 @@ void macws_grab_composite(id<MTLTexture> tex) {
                     double rawp=s2?100.0*n2/s2:0.0;
                     if (rawp>pct) pct=rawp;
                 }
+                // RING-DUMP (gated /tmp/macws_ringdump): is there a GPU-mapped composite
+                // source (non-'&b38') with content, or is the content only in the '&b38'
+                // DCP scanout (which the GPU can't blit-read)?
+                if (access("/tmp/macws_ringdump", F_OK) == 0) {
+                    uint32_t iosf = 0; void *rimpl = *(void **)((char *)(__bridge void *)rt + 0x208);
+                    if ((uintptr_t)rimpl > 0x1000) { IOSurfaceRef ri = *(IOSurfaceRef *)((char *)rimpl + 0xa0);
+                        if ((uintptr_t)ri > 0x1000) iosf = IOSurfaceGetPixelFormat(ri); }
+                    fprintf(stderr, "#### RING-DUMP pf=%lu %lux%lu iosfmt=%#x content=%.1f%%\n",
+                            rpf, (unsigned long)rw, (unsigned long)rh, iosf, pct);
+                }
                 // When de-tiling, bias toward de-tileable BGRA8/RGBA8 (pf=80/70)
                 // surfaces — pf=550 can't be blit-detiled. Only if they carry content.
                 double score = pct;
@@ -1260,6 +1404,46 @@ void macws_grab_composite(id<MTLTexture> tex) {
                 }
                 size_t dw=[dtex width], dh=[dtex height];
                 unsigned long dpf=(unsigned long)[dtex pixelFormat];
+                // COMP-DIAG (gated /tmp/macws_comp_diag): detect compression + locate the
+                // metadata plane. PBE descriptor baked at impl+0x190 (Asahi cmdbuf.xml:
+                // Layout bits 4-5, Compressed bit 59 = byte+7 bit3, Extended bit127,
+                // Accel-buffer bits128 = 3rd u64). Compare IOSurface AllocSize vs body
+                // (w*h*4): a tail means the metadata is appended in the same allocation.
+                if (access("/tmp/macws_comp_diag", F_OK) == 0) {
+                    void *dimpl = *(void **)((char *)(__bridge void *)dtex + 0x208);
+                    if ((uintptr_t)dimpl > 0x1000) {
+                        uint8_t *pb = (uint8_t *)dimpl + 0x190;
+                        uint64_t w0,w1,w2,w3;
+                        memcpy(&w0,pb,8); memcpy(&w1,pb+8,8); memcpy(&w2,pb+16,8); memcpy(&w3,pb+24,8);
+                        IOSurfaceRef dios = *(IOSurfaceRef *)((char *)dimpl + 0xa0);
+                        size_t asz = ((uintptr_t)dios > 0x1000) ? IOSurfaceGetAllocSize(dios) : 0;
+                        fprintf(stderr, "#### COMP-DIAG pf=%lu Layout=%u Compressed=%u Ext=%u PBE=[%#llx %#llx %#llx %#llx] backing_ext=%#zx allocsz=%#zx body=%#zx tail=%lld\n",
+                            dpf, (unsigned)((w0>>4)&3u), (unsigned)((pb[7]>>3)&1u), (unsigned)((w1>>63)&1u),
+                            (unsigned long long)w0,(unsigned long long)w1,(unsigned long long)w2,(unsigned long long)w3,
+                            ext, asz, (size_t)dw*dh*4, (long long)asz-(long long)((size_t)dw*dh*4));
+                    }
+                }
+                // IMPL-DUMP (gated /tmp/macws_impl_dump): full impl[0..0x200] dump to DIFF
+                // against the host M3 golden reference (host: GPU VA ~0xa010d0000 at impl+0x08/0x1f8,
+                // HW descriptor at impl+0x1b0..0x1d8). Find the chroot composite texture's GPU VA +
+                // aux buffer; is the VA 0/garbage (no mapping) or valid-but-unbacked? G13: impl@tex+0x208,
+                // ios@impl+0xa0 (host G15 was tex+0x260, impl+0x148 — semantic compare only).
+                if (access("/tmp/macws_impl_dump", F_OK) == 0) {
+                    void *dimpl = *(void **)((char *)(__bridge void *)dtex + 0x208);
+                    if ((uintptr_t)dimpl > 0x1000) {
+                        IOSurfaceRef dios = *(IOSurfaceRef *)((char *)dimpl + 0xa0);
+                        void *iosb = ((uintptr_t)dios > 0x1000) ? IOSurfaceGetBaseAddress(dios) : NULL;
+                        uint64_t rid = 0;
+                        if ([dtex respondsToSelector:@selector(gpuResourceID)]) { MTLResourceID r = [dtex gpuResourceID]; rid = *(uint64_t *)&r; }
+                        fprintf(stderr, "#### IMPL-DUMP pf=%lu dtex=%p class=%s impl=%p iosbase=%p gpuResID=%#llx\n",
+                                dpf, (void *)dtex, class_getName([dtex class]), dimpl, iosb, (unsigned long long)rid);
+                        for (int j=0;j<0x200;j+=8){ uint64_t v=*(volatile uint64_t*)((char*)dimpl+j);
+                            const char*tag=""; if(iosb&&(void*)v==iosb)tag=" <- iosbase";
+                            else if(v>0x100000000ull && v<0x80000000000ull)tag=" <- ptr/VA?";
+                            if(v) fprintf(stderr,"  impl+%#04x = %#018llx%s\n",j,(unsigned long long)v,tag);
+                        }
+                    }
+                }
                 size_t copy = dw*dh*4; if (ext < copy) copy = ext;
                 if (copy > 64u*1024*1024) copy = 64u*1024*1024;
                 // probe the deferred tex too
@@ -1290,10 +1474,13 @@ void macws_grab_composite(id<MTLTexture> tex) {
                 // something. Marker layout=0xD0 = detiled-linear (offline stride=bpr),
                 // else layout=the AGX layout (twiddled).
                 size_t lin_bpr = 0, lin_sz = 0;
-                uint8_t *lin = macws_blit_detile(dtex, &lin_bpr, &lin_sz);
+                uint32_t lin_layout = 0xD0;  /* detiled (Route B) */
+                uint8_t *lin = macws_optimize_cpu(dtex, &lin_bpr, &lin_sz);  /* official resolve, gated /tmp/macws_optcpu */
+                if (lin) lin_layout = 0xC0;  /* optcpu-resolved */
+                else lin = macws_blit_detile(dtex, &lin_bpr, &lin_sz);
                 uint8_t *out = NULL; size_t out_sz = 0, out_bpr = 0; uint32_t out_layout = layout;
                 if (lin && lin_sz) {
-                    out = lin; out_sz = lin_sz; out_bpr = lin_bpr; out_layout = 0xD0;  /* detiled */
+                    out = lin; out_sz = lin_sz; out_bpr = lin_bpr; out_layout = lin_layout;
                 } else {
                     out = (uint8_t *)malloc(copy);
                     if (out) { memcpy(out, backing, copy); out_sz = copy; out_bpr = dw*4; }
@@ -1310,7 +1497,7 @@ void macws_grab_composite(id<MTLTexture> tex) {
                     unlink("/tmp/macws_grab_now");   // consume the trigger (re-armable)
                     fprintf(stderr, "#### GRAB-PNG: wrote %zux%zu pf=%lu layout=0x%x sz=%#zx bpr=%zu %s content=%.1f%% (cur=%.1f%%)\n",
                             dw, dh, dpf, out_layout, out_sz, out_bpr,
-                            out_layout==0xD0?"DETILED-LINEAR":"twiddled-raw", dpct, cur_pct);
+                            out_layout==0xC0?"OPTCPU-RESOLVED":out_layout==0xD0?"DETILED-LINEAR":"twiddled-raw", dpct, cur_pct);
                 }
             }
         }
