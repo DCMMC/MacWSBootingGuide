@@ -1640,6 +1640,49 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
                 }
             }
         }
+        // WIREBLIT (gated /tmp/macws_wireblit, one-shot, bg thread): GPU-blit-DECOMPRESS this content
+        // texture (its impl+0xa0 backing has pixels). With the REC-SIZE FIX, op-3 blits now execute, so
+        // macws_blit_detile should decompress+detile into a CPU-readable linear buffer (Metal does it).
+        if (access("/tmp/macws_wireblit", F_OK) == 0) {
+            static dispatch_once_t wb;
+            @try { size_t tw = [tex width], th = [tex height];
+                if ((size_t)tw * th >= 1000000) {
+                    id texR = tex;
+                    dispatch_once(&wb, ^{
+                        unlink("/tmp/macws_wireblit");
+                        [NSThread detachNewThreadWithBlock:^{
+                          @try {
+                            id<MTLTexture> t = (id<MTLTexture>)texR; id<MTLDevice> dev = [t device];
+                            size_t bw = [t width], bh = [t height]; unsigned long pf = (unsigned long)[t pixelFormat];
+                            size_t bbpr = ((bw * 4 + 255) / 256) * 256, blen = bbpr * bh;
+                            NSDictionary *sp = @{ (id)kIOSurfaceWidth:@((long)bw), (id)kIOSurfaceHeight:@((long)bh),
+                                (id)kIOSurfaceBytesPerElement:@4, (id)kIOSurfaceBytesPerRow:@((long)bbpr), (id)kIOSurfacePixelFormat:@(0x42475241) };
+                            IOSurfaceRef os2 = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+                            typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                            id<MTLBuffer> buf = os2 ? ((nbi_t)objc_msgSend)(dev, sel_registerName("newBufferWithIOSurface:"), os2) : nil;
+                            MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:bw height:bh mipmapped:NO];
+                            dd.usage = MTLTextureUsageShaderRead; dd.storageMode = MTLStorageModeShared;
+                            id<MTLTexture> lintex = buf ? [buf newTextureWithDescriptor:dd offset:0 bytesPerRow:bbpr] : nil;
+                            if (!lintex) { fprintf(stderr, "#### WIREBLIT lintex nil pf=%lu buf=%p\n", pf, (void *)buf); return; }
+                            id<MTLCommandQueue> q = [dev newCommandQueue];
+                            id<MTLCommandBuffer> cb = [q commandBuffer];
+                            id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
+                            [bl copyFromTexture:t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                                 sourceSize:MTLSizeMake(bw,bh,1) toTexture:lintex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                            [bl endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                            long st = (long)[cb status]; id err = [cb error]; void *bc = os2 ? IOSurfaceGetBaseAddress(os2) : NULL;
+                            size_t nz = 0, sm = 0; if (bc && st == 4) for (size_t i = 0; i + 4 <= blen; i += 997 * 4) { sm++; if (*(uint32_t *)((char *)bc + i) & 0xffffff) nz++; }
+                            fprintf(stderr, "#### WIREBLIT %zux%zu pf=%lu status=%ld err=%s nonzero=%.1f%%\n",
+                                bw, bh, pf, st, err ? [[err localizedDescription] UTF8String] : "none", sm ? 100.0 * nz / sm : -1.0);
+                            if (st == 4 && bc) { FILE *f = fopen("/tmp/macws_wireblit.raw", "wb");
+                                if (f) { uint32_t hd[7] = {0x47524232u, (uint32_t)bw, (uint32_t)bh, (uint32_t)pf, 0xD0, (uint32_t)blen, (uint32_t)bbpr};
+                                         fwrite(hd, 4, 7, f); fwrite(bc, 1, blen, f); fclose(f); fprintf(stderr, "#### WIREBLIT wrote /tmp/macws_wireblit.raw\n"); } }
+                          } @catch (NSException *e) { fprintf(stderr, "#### WIREBLIT EXC %s\n", [[e reason] UTF8String] ?: "?"); }
+                        }];
+                    });
+                }
+            } @catch (__unused NSException *e) {}
+        }
         return;
     }
     *(void * volatile *)((char *)impl + 0xa0) = base;
