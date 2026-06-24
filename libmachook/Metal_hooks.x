@@ -563,6 +563,82 @@ static void *macws_tex_backing(id<MTLTexture> tex, uint8_t *layout_out, size_t *
 // frees) + sets *out_bpr/*out_sz, or NULL on any failure (caller falls back to
 // the twiddled read). Same pixel format as src (pf=550 stays 10-bit).
 
+// PART 2 INJECTION (gated /tmp/macws_inject) — the composite dest is resident ONLY in the
+// compositor's own GPU submission (gpuEvent proved a fresh-queue read 0xb-faults). So identify
+// the compositor's command buffer by swizzling the AGX cmdbuf class's renderCommandEncoderWithDescriptor:
+// (its color attachment is the pf=550 composite dest), then inject a decompress blit into that SAME
+// cmdbuf at commit time (where the dest is mapped). Piece 1 = identify + log only (no inject yet).
+static id  (*orig_renc)(id, SEL, id) = NULL;
+static void (*orig_cbcommit)(id, SEL) = NULL;
+static id g_inject_dest = nil;            // latest full-screen pf=80 composite dest (weak)
+static IOSurfaceRef g_inject_surf = NULL; // persistent linear BGRA8 capture surface
+static id g_inject_tex = nil;             // texture over g_inject_surf (ARC-retained)
+
+static id hooked_renc(id self, SEL _cmd, id rpd) {
+    id enc = orig_renc(self, _cmd, rpd);
+    @try {
+        MTLRenderPassDescriptor *d = (MTLRenderPassDescriptor *)rpd;
+        id tex = d.colorAttachments[0].texture;
+        unsigned long pf = tex ? (unsigned long)[tex pixelFormat] : 0;
+        unsigned long w = tex ? (unsigned long)[tex width] : 0, hh = tex ? (unsigned long)[tex height] : 0;
+        static int alln = 0;   // log ALL render-encoder dests: does the chroot ever render pf=550 full-screen?
+        if (alln < 20) { alln++; fprintf(stderr, "#### INJECT-RENC #%d cmdbuf=%p dest=%p pf=%lu %lux%lu\n", alln, self, tex, pf, w, hh); }
+        if (tex && pf == 80 && w >= 1900 && hh >= 1400) {   // full-screen BGRA8 composite dest
+            objc_setAssociatedObject(self, (void *)&orig_renc, tex, OBJC_ASSOCIATION_ASSIGN);
+            g_inject_dest = tex;
+            static int n = 0; if (n++ < 6)
+                fprintf(stderr, "#### INJECT-ID: composite cmdbuf=%p dest=%p pf=80 %lux%lu (renderEncoder)\n", self, tex, w, hh);
+        }
+    } @catch (__unused NSException *e) {}
+    return enc;
+}
+// Inject a copy of the full-screen BGRA8 composite dest into a persistent linear surface,
+// IN THE COMPOSITOR'S OWN command buffer (where the dest is resident as the render target),
+// just before it commits. The dest is uncompressed BGRA8 → a plain blit gives clean pixels,
+// no decode. g_inject_surf is then CPU-readable by the grab.
+static void hooked_cbcommit(id self, SEL _cmd) {
+    @try {
+        id dest = objc_getAssociatedObject(self, (void *)&orig_renc);
+        if (dest) {
+            id dev = [dest device];
+            unsigned long w = [dest width], h = [dest height];
+            if (!g_inject_surf && dev) {
+                size_t bpr = ((w * 4) + 63) & ~63ul;
+                NSDictionary *p = @{ (id)kIOSurfaceWidth:@(w), (id)kIOSurfaceHeight:@(h),
+                    (id)kIOSurfacePixelFormat:@((unsigned)'BGRA'), (id)kIOSurfaceBytesPerElement:@4,
+                    (id)kIOSurfaceBytesPerRow:@(bpr), (id)kIOSurfaceAllocSize:@(bpr * h) };
+                g_inject_surf = IOSurfaceCreate((__bridge CFDictionaryRef)p);
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
+                td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+                g_inject_tex = g_inject_surf ? [dev newTextureWithDescriptor:td iosurface:g_inject_surf plane:0] : nil;
+                fprintf(stderr, "#### INJECT: created g_inject %lux%lu surf=%p tex=%p\n", w, h, g_inject_surf, g_inject_tex);
+            }
+            if (g_inject_tex) {
+                id<MTLBlitCommandEncoder> bl = [self blitCommandEncoder];
+                [bl copyFromTexture:dest sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                         sourceSize:MTLSizeMake(w,h,1) toTexture:g_inject_tex destinationSlice:0
+                         destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+                [bl endEncoding];
+                static int n = 0; if (n++ < 6)
+                    fprintf(stderr, "#### INJECT: blit composite dest->g_inject in compositor cmdbuf=%p\n", self);
+            }
+        }
+    } @catch (__unused NSException *e) { fprintf(stderr, "#### INJECT: commit exc\n"); }
+    orig_cbcommit(self, _cmd);
+}
+static void macws_install_inject(void) {
+    if (access("/tmp/macws_inject", F_OK) != 0) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class cbc = objc_getClass("AGXG13GFamilyCommandBuffer");
+        if (!cbc) cbc = objc_getClass("AGXG13FamilyCommandBuffer");
+        if (!cbc) { fprintf(stderr, "#### INJECT-ID: AGX cmdbuf class not found\n"); return; }
+        fprintf(stderr, "#### INJECT-ID: swizzling %s renderEncoder+commit\n", class_getName(cbc));
+        MSHookMessageEx(cbc, @selector(renderCommandEncoderWithDescriptor:), (IMP)hooked_renc, (IMP *)&orig_renc);
+        MSHookMessageEx(cbc, @selector(commit), (IMP)hooked_cbcommit, (IMP *)&orig_cbcommit);
+    });
+}
+
 // OFFICIAL macOS RESOLVE (gated /tmp/macws_optcpu). On real macOS, GPU render
 // targets are GPU-internally compressed/twiddled; the framework resolves them to
 // CPU-readable linear form on access via -[MTLBlitCommandEncoder
@@ -1038,6 +1114,7 @@ void macws_2b_alias_dest(id texture) {
 }
 static _Atomic int g_grab_busy = 0;
 void macws_grab_composite(id<MTLTexture> tex) {
+    macws_install_inject();   // PART 2: one-time swizzle of the AGX cmdbuf class (gated /tmp/macws_inject)
     // NEWBUF-TEST (self-contained, gated /tmp/macws_newbuf_test, one-shot): THE decisive question —
     // does -[device newBufferWithIOSurface:] yield a REAL GPU VA that ALIASES the IOSurface in the
     // chroot? Create our own 256x256 BGRA IOSurface, make a buffer from it, GPU fillBuffer 0xAB,
@@ -1294,6 +1371,30 @@ void macws_grab_composite(id<MTLTexture> tex) {
     // Serialize: one capture/probe at a time across composite threads.
     if (atomic_exchange(&g_grab_busy, 1)) return;
     @try {
+        // PART 2 INJECT-GRAB: if the compositor-cmdbuf blit populated g_inject (uncompressed
+        // BGRA8 composite), write it directly — NO decode/detile needed. Priority over the
+        // ring/detile path when /tmp/macws_inject is set.
+        if (want_capture && access("/tmp/macws_inject", F_OK) == 0 && g_inject_surf) {
+            IOSurfaceLock(g_inject_surf, 0x1, NULL);
+            void *gb = IOSurfaceGetBaseAddress(g_inject_surf);
+            size_t gbpr = IOSurfaceGetBytesPerRow(g_inject_surf);
+            size_t gw = IOSurfaceGetWidth(g_inject_surf), gh = IOSurfaceGetHeight(g_inject_surf);
+            size_t gsz = gbpr * gh;
+            size_t nz=0,smp=0; if (gb) for (size_t o=0;o+4<=gsz;o+=997*4){ if(*(volatile uint32_t*)((char*)gb+o)&0xffffff)nz++; smp++; }
+            double gp = smp ? 100.0*nz/smp : 0.0;
+            fprintf(stderr, "#### INJECT-GRAB: g_inject %zux%zu bpr=%zu content=%.1f%%\n", gw, gh, gbpr, gp);
+            if (gb && gp >= 1.0) {
+                int fd = open("/tmp/macws_grab.raw", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+                if (fd >= 0) { uint32_t hd[7]={0x47524232u,(uint32_t)gw,(uint32_t)gh,80u,0xE0u,(uint32_t)gsz,(uint32_t)gbpr};
+                    write(fd,hd,28); write(fd,gb,gsz); fsync(fd); close(fd); }
+                IOSurfaceUnlock(g_inject_surf, 0x1, NULL);
+                unlink("/tmp/macws_grab_now");
+                fprintf(stderr, "#### INJECT-GRAB: wrote g_inject pf=80 layout=0xE0 content=%.1f%% (uncompressed, no decode)\n", gp);
+                atomic_store(&g_grab_busy, 0);
+                return;
+            }
+            IOSurfaceUnlock(g_inject_surf, 0x1, NULL);
+        }
         // The hook fires right after StartComposite returns — this frame's layer
         // draws + GPU exec happen AFTER, async. So `tex` (current dest) is read
         // PRE-draw → stale/uninit. To capture a GPU-COMPLETE frame, defer: keep a
