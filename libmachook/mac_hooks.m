@@ -7581,6 +7581,19 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 fprintf(stderr, " %02x", src[i]);
             }
             fprintf(stderr, "\n");
+            // OUT-DIFF: full output struct dump (iOS 80-byte layout) to field-diff vs the
+            // macOS 88-byte layout (local mingpu) — the iOS kernel returns a different/shorter
+            // output, so macOS Metal reads the resource's mapping/size from wrong offsets.
+            { static int odn = 0;
+              if (r == 0 && outStruct && outStructCnt && *outStructCnt && odn++ < 3) {
+                const unsigned char *o = (const unsigned char *)outStruct;
+                fprintf(stderr, "####   OUTstruct[cnt=%zu]:", *outStructCnt);
+                for (size_t i = 0; i < *outStructCnt && i < 0x60; i++) {
+                    if (i % 16 == 0) fprintf(stderr, "\n####     %02zx:", i);
+                    fprintf(stderr, " %02x", o[i]);
+                }
+                fprintf(stderr, "\n");
+              } }
             // For each FAILED type=0x80 sub-resource: dump the caller chain
             // so we know which AGXBuffer / IOGPUMetalBuffer path picked the
             // parent. Sometimes ties macOS's `allocBufferSubData` vs the
