@@ -7800,6 +7800,13 @@ kern_return_t IOConnectMapMemory64_new(io_connect_t c, uint32_t mt, task_port_t 
                                        mach_vm_address_t *addr, mach_vm_size_t *size, IOOptionBits opt) {
     kern_return_t kr = IOConnectMapMemory64(c, mt, t, addr, size, opt);
     macws_mapdiag_log(c, mt, addr ? *addr : 0, size ? *size : 0, opt, kr);
+    // VASCAN step 2: is the 0x11xx fixed region mapped via IOConnectMapMemory64? Log all mappings
+    // + flag any landing in the BIF0 fault range. If 0x11xx shows here -> interceptable (redirect mt
+    // or the returned addr). If not -> the 0x11xx VA is established purely in AGXMetal userland.
+    if (kr == 0 && addr && access("/tmp/macws_vascan", F_OK) == 0)
+        fprintf(stderr, "#### VASCAN MAPMEM conn=%u mt=%u addr=%#llx size=%#llx opt=%#x%s\n",
+            c, mt, (unsigned long long)*addr, (unsigned long long)(size ? *size : 0), opt,
+            (*addr >= 0x1100000000ULL && *addr < 0x1200000000ULL) ? "  <<< 0x11xx!" : "");
     return kr;
 }
 DYLD_INTERPOSE(IOConnectMapMemory64_new, IOConnectMapMemory64);
