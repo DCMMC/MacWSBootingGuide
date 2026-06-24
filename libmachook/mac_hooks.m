@@ -7649,12 +7649,20 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         //  (0xb->0x9); "extend-only" (no shift, just zero the +0x50 extra) brings the page fault
         //  BACK -> the shift is REQUIRED, not the size alone. (Front-insert @+0x00 crashed Metal:
         //  it moved the VAs at +0x08/+0x10, which are NOT shifted.)
+        //  0x9 ROOT CAUSE (RE-confirmed via the cmdbuf resource-table lookup @ 0xeea3a4):
+        //  getResource(id) rejects id==0 -> NULL -> kIOReturnInvalidResource. The +0x18 memset
+        //  ZEROED out[+0x1c] = the resource ID (iOS writes a namespace index there; the consumer
+        //  reads out[+0x1c]->obj+0x30 and macOS Metal uses it in the cmdbuf). So preserve it:
+        //  save the iOS resID before the shift, restore it at +0x1c after. Keeps the shift's
+        //  VA/size/extra placement (no page fault) AND a valid resource ID (no 0x9).
         unsigned char *o = (unsigned char *)outStruct;
+        uint32_t resID = *(const uint32_t *)(o + 0x1c);   // iOS resource-table namespace index
         memmove(o + 0x20, o + 0x18, 0x38);   // iOS[0x18..0x50) -> macOS[0x20..0x58)
         memset(o + 0x18, 0, 8);              // inserted macOS-only field @ +0x18
+        *(uint32_t *)(o + 0x1c) = resID;     // restore resID @ +0x1c (getResource rejects id==0)
         *outStructCnt = 88;
         static int xn = 0; if (xn++ < 4)
-            fprintf(stderr, "#### OUT-XLATE: iOS 80B -> macOS 88B (insert 8B @ +0x18, confirmed)\n");
+            fprintf(stderr, "#### OUT-XLATE: iOS 80B -> macOS 88B (insert@+0x18 + resID@+0x1c=%u preserved)\n", resID);
     }
     if (qbuf) free(qbuf);
     return r;
