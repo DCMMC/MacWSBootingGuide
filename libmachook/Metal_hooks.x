@@ -583,11 +583,11 @@ static id hooked_renc(id self, SEL _cmd, id rpd) {
         unsigned long w = tex ? (unsigned long)[tex width] : 0, hh = tex ? (unsigned long)[tex height] : 0;
         static int alln = 0;   // log ALL render-encoder dests: does the chroot ever render pf=550 full-screen?
         if (alln < 20) { alln++; fprintf(stderr, "#### INJECT-RENC #%d cmdbuf=%p dest=%p pf=%lu %lux%lu\n", alln, self, tex, pf, w, hh); }
-        if (tex && pf == 80 && w >= 1900 && hh >= 1400) {   // full-screen BGRA8 composite dest
+        if (tex && pf == 550 && w >= 1900 && hh >= 1400) {   // full-screen pf=550 composite dest (HAS content)
             objc_setAssociatedObject(self, (void *)&orig_renc, tex, OBJC_ASSOCIATION_ASSIGN);
             g_inject_dest = tex;
             static int n = 0; if (n++ < 6)
-                fprintf(stderr, "#### INJECT-ID: composite cmdbuf=%p dest=%p pf=80 %lux%lu (renderEncoder)\n", self, tex, w, hh);
+                fprintf(stderr, "#### INJECT-ID: composite cmdbuf=%p dest=%p pf=550 %lux%lu (renderEncoder)\n", self, tex, w, hh);
         }
     } @catch (__unused NSException *e) {}
     return enc;
@@ -603,15 +603,22 @@ static void hooked_cbcommit(id self, SEL _cmd) {
             id dev = [dest device];
             unsigned long w = [dest width], h = [dest height];
             if (!g_inject_surf && dev) {
-                size_t bpr = ((w * 4) + 63) & ~63ul;
+                // g_inject = LINEAR pf=550 (BytesPerRow set ⟹ linear), same format as the compressed
+                // composite dest, so the in-cmdbuf blit DECOMPRESSES+detiles '&b38' → linear pf=550.
+                size_t bpr = ((w * 4) + 63) & ~63ul;   // pf=550 = 4 bytes/px
+                uint32_t iofmt = 0;
+                void *si = *(void **)((char *)dest + 0x208);
+                if ((uintptr_t)si > 0x1000) { IOSurfaceRef s = *(IOSurfaceRef *)((char *)si + 0xa0);
+                    if ((uintptr_t)s > 0x1000) { uint32_t f = IOSurfaceGetPixelFormat(s); if (f) iofmt = f; } }
+                if (!iofmt) iofmt = 550;
                 NSDictionary *p = @{ (id)kIOSurfaceWidth:@(w), (id)kIOSurfaceHeight:@(h),
-                    (id)kIOSurfacePixelFormat:@((unsigned)'BGRA'), (id)kIOSurfaceBytesPerElement:@4,
+                    (id)kIOSurfacePixelFormat:@(iofmt), (id)kIOSurfaceBytesPerElement:@4,
                     (id)kIOSurfaceBytesPerRow:@(bpr), (id)kIOSurfaceAllocSize:@(bpr * h) };
                 g_inject_surf = IOSurfaceCreate((__bridge CFDictionaryRef)p);
-                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:w height:h mipmapped:NO];
-                td.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:[dest pixelFormat] width:w height:h mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead; td.storageMode = MTLStorageModeShared;
                 g_inject_tex = g_inject_surf ? [dev newTextureWithDescriptor:td iosurface:g_inject_surf plane:0] : nil;
-                fprintf(stderr, "#### INJECT: created g_inject %lux%lu surf=%p tex=%p\n", w, h, g_inject_surf, g_inject_tex);
+                fprintf(stderr, "#### INJECT: created g_inject %lux%lu pf=%lu iofmt=%#x surf=%p tex=%p\n", w, h, (unsigned long)[dest pixelFormat], iofmt, g_inject_surf, g_inject_tex);
             }
             if (g_inject_tex) {
                 id<MTLBlitCommandEncoder> bl = [self blitCommandEncoder];
@@ -1385,7 +1392,7 @@ void macws_grab_composite(id<MTLTexture> tex) {
             fprintf(stderr, "#### INJECT-GRAB: g_inject %zux%zu bpr=%zu content=%.1f%%\n", gw, gh, gbpr, gp);
             if (gb && gp >= 1.0) {
                 int fd = open("/tmp/macws_grab.raw", O_WRONLY|O_CREAT|O_TRUNC, 0644);
-                if (fd >= 0) { uint32_t hd[7]={0x47524232u,(uint32_t)gw,(uint32_t)gh,80u,0xE0u,(uint32_t)gsz,(uint32_t)gbpr};
+                if (fd >= 0) { uint32_t hd[7]={0x47524232u,(uint32_t)gw,(uint32_t)gh,550u,0xE0u,(uint32_t)gsz,(uint32_t)gbpr};
                     write(fd,hd,28); write(fd,gb,gsz); fsync(fd); close(fd); }
                 IOSurfaceUnlock(g_inject_surf, 0x1, NULL);
                 unlink("/tmp/macws_grab_now");
