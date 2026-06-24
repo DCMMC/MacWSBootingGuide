@@ -7621,6 +7621,30 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
         }
     }
+    // OUT-XLATE (gated /tmp/macws_outxlate): translate the iOS-kernel sel=0x9 ResCreate output ABI
+    // to the macOS layout macOS Metal expects. mingpu local-vs-chroot diff (commit cddd259): macOS
+    // sel=0x9 output = 88B, iOS = 80B with fields shifted 8 bytes (sizes at local +0x28/+0x50 <->
+    // iOS +0x20/+0x48; zeros +0x40/+0x48 <-> +0x38/+0x40; count +0x20 <-> +0x18). macOS Metal reads
+    // the resource size/descriptor at the macOS offsets (+0x50 doesn't exist in the 80B output) ->
+    // garbage -> bogus GPU mapping -> BIF0 fault (mingpu 0x102/0xb). Fix: shift the 80 iOS bytes up
+    // by 8 into the macOS layout + cnt=88. Done LAST (after all internal iOS-layout reads) so only
+    // the macOS-Metal caller sees the translated struct. SELF-VERIFYING: mingpu render-clear
+    // status 5->4 confirms. The macOS-Metal buffer capacity is >=88 (it expects 88, per the local
+    // IOConnectCallMethod trace), so writing 88 is in-bounds.
+    if (selector == 0x9 && r == 0 && outStruct && outStructCnt && *outStructCnt == 80 &&
+        inStruct && inStructCnt >= 1 && ((const unsigned char *)inStruct)[0] == 0x82 &&
+        access("/tmp/macws_outxlate", F_OK) == 0) {   // ONLY type=0x82 iosurface textures
+                                                      // (uniform shift broke heap/queue init)
+        // REFUTED (2026-06-24, mingpu crash report mingpu-...230747.ips): the naive 8-byte
+        // shift below CRASHES macOS Metal during texture creation — the iOS->macOS ResCreate
+        // output ABI is NOT a clean shift. The real translation needs field-by-field RE of both
+        // kernels' IOGPUDevice::new_resource output-write. Disabled (log-only) so the gated path
+        // can't crash. Root cause (88B vs 80B mismatch) stands; the exact field map is the next step.
+        static int xn = 0; if (xn++ < 4)
+            fprintf(stderr, "#### OUT-XLATE: type=0x82 outSC=80 (8-byte shift REFUTED — needs field-by-field RE; no-op)\n");
+        // unsigned char *o = (unsigned char *)outStruct;
+        // memmove(o + 8, o, 80); memset(o, 0, 8); *outStructCnt = 88;   // <- CRASHES macOS Metal
+    }
     if (qbuf) free(qbuf);
     return r;
 }
