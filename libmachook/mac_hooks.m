@@ -7341,6 +7341,23 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     IOReturn r = (t82_hit || t82_free_sw)
         ? (IOReturn)0 /* kIOReturnSuccess */
         : IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // VASCAN (gated /tmp/macws_vascan): hunt the 0x11xx fixed-region base (the BIF0 fault VA range,
+    // 0x1168000000) in the IOConnect traffic. If a config input/output carries a 0x11xx value -> patch
+    // that field to a mapped 0x15xx base. If 0x11xx is absent everywhere -> it is AGXMetal-internal
+    // (the command stream picks it; needs the relocate-and-patch-references path instead).
+    if (IOConnectIsIOGPU(client) && access("/tmp/macws_vascan", F_OK) == 0) {
+        const uint64_t VLO=0x1100000000ULL, VHI=0x1200000000ULL;
+        if (inStruct && inStructCnt>=8) { const uint64_t *u=(const uint64_t*)inStruct;
+            for (size_t i=0;i<inStructCnt/8;i++) if (u[i]>=VLO && u[i]<VHI)
+                fprintf(stderr,"#### VASCAN sel=%u->%u IN+%#zx=%#llx (inSC=%zu)\n",orig,selector,i*8,(unsigned long long)u[i],inStructCnt); }
+        if (r==0 && outStruct && outStructCnt && *outStructCnt>=8) { const uint64_t *u=(const uint64_t*)outStruct;
+            for (size_t i=0;i<*outStructCnt/8;i++) if (u[i]>=VLO && u[i]<VHI)
+                fprintf(stderr,"#### VASCAN sel=%u->%u OUT+%#zx=%#llx\n",orig,selector,i*8,(unsigned long long)u[i]); }
+        if (orig==0x8 && inStruct && inStructCnt>=0x400) { static dispatch_once_t qd; dispatch_once(&qd, ^{
+            const uint64_t *u=(const uint64_t*)inStruct;
+            fprintf(stderr,"#### VASCAN queue-create(sel0x8) inSC=%zu nonzero-u64s:\n",inStructCnt);
+            for (size_t i=0;i<inStructCnt/8;i++) if (u[i]) fprintf(stderr,"####   +%#zx = %#llx\n",i*8,(unsigned long long)u[i]); }); }
+    }
     // type=0x82 create cache-MISS that succeeded: record the kernel resource so future
     // wraps of this IOSurface reuse it (and its single DCP registration).
     if (macws_t82_dedup_on() && IOConnectIsIOGPU(client) && !skip && !t82_hit &&
