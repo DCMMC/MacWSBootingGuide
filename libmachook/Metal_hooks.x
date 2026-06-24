@@ -621,11 +621,37 @@ static void hooked_cbcommit(id self, SEL _cmd) {
                 fprintf(stderr, "#### INJECT: created g_inject %lux%lu pf=%lu iofmt=%#x surf=%p tex=%p\n", w, h, (unsigned long)[dest pixelFormat], iofmt, g_inject_surf, g_inject_tex);
             }
             if (g_inject_tex) {
+                static int verify_n = 0;
+                int do_verify = (verify_n < 4);
+                if (do_verify) {   // sentinel-fill g_inject BEFORE the blit so the completion
+                    verify_n++;     // handler can tell blit-didn't-run (0xAB) from empty (0) from content
+                    IOSurfaceLock(g_inject_surf, 0, NULL);
+                    void *sgb = IOSurfaceGetBaseAddress(g_inject_surf);
+                    size_t sgsz = IOSurfaceGetBytesPerRow(g_inject_surf) * IOSurfaceGetHeight(g_inject_surf);
+                    if (sgb) memset(sgb, 0xAB, sgsz);
+                    IOSurfaceUnlock(g_inject_surf, 0, NULL);
+                }
                 id<MTLBlitCommandEncoder> bl = [self blitCommandEncoder];
                 [bl copyFromTexture:dest sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                          sourceSize:MTLSizeMake(w,h,1) toTexture:g_inject_tex destinationSlice:0
                          destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
                 [bl endEncoding];
+                if (do_verify) {
+                    [self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                        @try {
+                            IOSurfaceLock(g_inject_surf, 0x1, NULL);
+                            uint8_t *vb = (uint8_t *)IOSurfaceGetBaseAddress(g_inject_surf);
+                            size_t vsz = IOSurfaceGetBytesPerRow(g_inject_surf) * IOSurfaceGetHeight(g_inject_surf);
+                            size_t ab=0, zr=0, ot=0, smp=0;
+                            if (vb) for (size_t o=0;o+4<=vsz;o+=997*4){ uint32_t v=*(uint32_t *)(vb+o);
+                                if (v==0xABABABAB) ab++; else if ((v&0xffffff)==0) zr++; else ot++; smp++; }
+                            NSError *e = [cb error];
+                            fprintf(stderr, "#### INJECT-VERIFY: post-completion g_inject sentinel=%zu zero=%zu content=%zu /%zu  cb.status=%ld err=%s\n",
+                                    ab, zr, ot, smp, (long)[cb status], e ? [[e localizedDescription] UTF8String] : "none");
+                            IOSurfaceUnlock(g_inject_surf, 0x1, NULL);
+                        } @catch (__unused NSException *ex) {}
+                    }];
+                }
                 static int n = 0; if (n++ < 6)
                     fprintf(stderr, "#### INJECT: blit composite dest->g_inject in compositor cmdbuf=%p\n", self);
             }
