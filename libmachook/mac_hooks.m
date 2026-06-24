@@ -2978,6 +2978,27 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     "expected stub=%p real=%p WHICH=%s\n",
                     m, imp, (void*)agxtex_stub, (void*)agxg13_real, which);
             }
+            // REC-SIZE FIX (gated /tmp/macws_recfix): the chroot runs macOS AGXMetal13_3 against the
+            // iOS 16.3 GPU kernel. macOS emits the op-3 (compute/blit/render-pass) GPU command record
+            // 0x10 LARGER than the iOS kernel validator (AGXCommandQueue::processSegmentKernelCommand)
+            // accepts — size 0x1b8 vs 0x1a8, end 0x1e8 vs 0x1d8 — so EVERY submit is rejected 0x103.
+            // Shrink the record by 0x10: the template const (size+end), the body memset size, and the
+            // newCommand reservation; the trailing 16 bytes are droppable padding (clobbered by the
+            // next record's header). RE+byte-verified (agx-blit-record-malformation workflow 2026-06-24).
+            if (access("/tmp/macws_recfix", F_OK) == 0) {
+                uint32_t *t1 = (uint32_t *)(0x1e5a629d0 + slide);   // {end=0x1e8, size=0x1b8}
+                uint32_t *t2 = (uint32_t *)(0x1e5a62bb8 + slide);   // {size=0x1b8}
+                uint32_t *b1 = (uint32_t *)(0x1e55fb308 + slide);   // mov w1,#0x1b8 (body memset)
+                uint32_t *n1 = (uint32_t *)(0x1e55fb2cc + slide);   // mov w1,#0x1f0 (newCommand)
+                int ok1 = (t1[0] == 0x1e8 && t1[1] == 0x1b8), ok2 = (t2[0] == 0x1b8);
+                int ok3 = (*b1 == 0x52803701), ok4 = (*n1 == 0x52803e01);
+                if (ok1) ModifyExecutableRegion(t1, sizeof(uint32_t[2]), ^{ t1[0] = 0x1d8; t1[1] = 0x1a8; });
+                if (ok2) ModifyExecutableRegion(t2, sizeof(uint32_t),    ^{ t2[0] = 0x1a8; });
+                if (ok3) ModifyExecutableRegion(b1, sizeof(uint32_t),    ^{ *b1 = 0x52803501; });
+                if (ok4) ModifyExecutableRegion(n1, sizeof(uint32_t),    ^{ *n1 = 0x52803c01; });
+                dprintf(2, "#### REC-SIZE FIX (op-3 0x1b8->0x1a8) sig[%d%d%d%d] slide=%p now t1={%#x,%#x} t2=%#x b1=%#x n1=%#x\n",
+                    ok1, ok2, ok3, ok4, (void*)slide, t1[0], t1[1], t2[0], *b1, *n1);
+            }
         }
 
         if (getenv("MACWS_AGX_SKIP_BIND_UPDATE") ||
