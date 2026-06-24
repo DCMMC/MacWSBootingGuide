@@ -2849,6 +2849,47 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                        "__TEXT", "__text", &text_sz);
         intptr_t slide = (intptr_t)text - (intptr_t)text_static_base;
 
+        // USC-BASE EXPERIMENT (gated /tmp/macws_uscbase): the BIF0 fault is the GPU shader/USC unit
+        // (requestor=1) reading shader code at 0x1168000000, in the 0x11xx region the iOS kernel
+        // defines (AGXG13G VA-region table {0x11xx,0x13xx,0x14xx}) but does not map for the chroot
+        // context. 0x1100000000 is a const in AGXMetal's __DATA_CONST/__TEXT region tables. This
+        // rewrites it (to the flag-file value, default 0x1500000000 = the mapped GEM base) to test
+        // whether the fault VA moves -> confirms this is the USC-base control point.
+        if (access("/tmp/macws_uscbase", F_OK) == 0) {
+            uint64_t newbase = 0x1500000000ULL;
+            FILE *uf = fopen("/tmp/macws_uscbase","r");
+            if (uf){ unsigned long long v=0; if (fscanf(uf,"%llx",&v)==1 && v) newbase=v; fclose(uf); }
+            int npatched=0;
+            const char *segn[] = {"__DATA_CONST","__TEXT","__DATA","__AUTH_CONST"};
+            for (int si=0; si<4; si++){
+                unsigned long segsz=0;
+                uint8_t *seg=getsegmentdata((const struct mach_header_64*)header, segn[si], &segsz);
+                if(!seg) continue;
+                int isText = (si==1);  // __TEXT is executable -> needs CoW via vm_protect, not mprotect
+                for (unsigned long i=0; i+8<=segsz; i+=4){   // 4-aligned: the consts sit at 0x..bc/0x..3c
+                    uint64_t v; memcpy(&v, seg+i, 8);
+                    if(v==0x1100000000ULL){
+                        uintptr_t pg=(uintptr_t)(seg+i) & ~0xfffUL;
+                        int ok=0;
+                        if(isText){
+                            if(vm_protect(mach_task_self(),pg,0x2000,FALSE,VM_PROT_READ|VM_PROT_WRITE|VM_PROT_COPY)==KERN_SUCCESS){
+                                memcpy(seg+i,&newbase,8);
+                                vm_protect(mach_task_self(),pg,0x2000,FALSE,VM_PROT_READ|VM_PROT_EXECUTE);
+                                ok=1;
+                            }
+                        } else if(mprotect((void*)pg,0x2000,PROT_READ|PROT_WRITE)==0){
+                            memcpy(seg+i,&newbase,8);
+                            mprotect((void*)pg,0x2000,PROT_READ);
+                            ok=1;
+                        }
+                        if(ok){ npatched++; fprintf(stderr,"#### USCBASE: patched %s+%#lx\n",segn[si],i); }
+                    }
+                }
+            }
+            fprintf(stderr,"#### USCBASE: patched %d x 0x1100000000 -> %#llx in AGXMetal\n",
+                    npatched,(unsigned long long)newbase);
+        }
+
         // ROOT-CAUSE diagnostic + S1 fix for the backdrop-blur memmove(NULL) crash
         // (gated /tmp/macws_wr3_guard). RE+runtime-confirmed the crash is
         // getCPUPtr→*(this+0x130)==0; see macws_my_wr3 above. We intercept writeRegion
