@@ -7633,8 +7633,11 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     // IOConnectCallMethod trace), so writing 88 is in-bounds.
     if (selector == 0x9 && r == 0 && outStruct && outStructCnt && *outStructCnt == 80 &&
         inStruct && inStructCnt >= 1 && ((const unsigned char *)inStruct)[0] == 0x82 &&
-        access("/tmp/macws_outxlate", F_OK) == 0) {   // ONLY type=0x82 iosurface textures
-                                                      // (uniform shift broke heap/queue init)
+        access("/tmp/macws_outxlate", F_OK) == 0) {   // type=0x82 IOSurface textures ONLY. Extending
+                                                      // to all sel=0x9 (buffers/heaps/cmdbuf storage)
+                                                      // BREAKS init (mg_all.out): those have a DIFFERENT
+                                                      // output layout that macOS reads fine at 80B (no
+                                                      // +0x50 extra). Only textures need the 88B layout.
         // RE-DERIVED translation (2026-06-24, disasm of macOS 13.4 _IOGPUResourceCreate @ IOGPU
         // 0x19d1560a0): macOS Metal reads outStruct[+0x08]/[+0x10] (GPU VA / client-shared) at the
         // SAME offsets as iOS; the layouts diverge at +0x18 where macOS has an extra 8-byte field,
