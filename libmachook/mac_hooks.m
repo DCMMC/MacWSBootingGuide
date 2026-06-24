@@ -7635,15 +7635,19 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         inStruct && inStructCnt >= 1 && ((const unsigned char *)inStruct)[0] == 0x82 &&
         access("/tmp/macws_outxlate", F_OK) == 0) {   // ONLY type=0x82 iosurface textures
                                                       // (uniform shift broke heap/queue init)
-        // REFUTED (2026-06-24, mingpu crash report mingpu-...230747.ips): the naive 8-byte
-        // shift below CRASHES macOS Metal during texture creation — the iOS->macOS ResCreate
-        // output ABI is NOT a clean shift. The real translation needs field-by-field RE of both
-        // kernels' IOGPUDevice::new_resource output-write. Disabled (log-only) so the gated path
-        // can't crash. Root cause (88B vs 80B mismatch) stands; the exact field map is the next step.
+        // RE-DERIVED translation (2026-06-24, disasm of macOS 13.4 _IOGPUResourceCreate @ IOGPU
+        // 0x19d1560a0): macOS Metal reads outStruct[+0x08]/[+0x10] (GPU VA / client-shared) at the
+        // SAME offsets as iOS; the layouts diverge at +0x18 where macOS has an extra 8-byte field,
+        // shifting everything from +0x18 onward up by 8 (iOS size +0x20/+0x48 -> macOS +0x28/+0x50,
+        // and the consumer memcpy's outStruct[+0x50] (the w22=8B "extra") -> obj+0x70). So insert 8
+        // zero bytes at +0x18 (NOT the front — that moved the VAs and crashed Metal, the earlier
+        // refuted attempt). Result: iOS 80B -> macOS 88B with VAs preserved + size at the right spots.
+        unsigned char *o = (unsigned char *)outStruct;
+        memmove(o + 0x20, o + 0x18, 0x38);   // iOS[0x18..0x50) -> macOS[0x20..0x58)
+        memset(o + 0x18, 0, 8);              // inserted macOS field @ +0x18 (= 0 per local dump)
+        *outStructCnt = 88;
         static int xn = 0; if (xn++ < 4)
-            fprintf(stderr, "#### OUT-XLATE: type=0x82 outSC=80 (8-byte shift REFUTED — needs field-by-field RE; no-op)\n");
-        // unsigned char *o = (unsigned char *)outStruct;
-        // memmove(o + 8, o, 80); memset(o, 0, 8); *outStructCnt = 88;   // <- CRASHES macOS Metal
+            fprintf(stderr, "#### OUT-XLATE: iOS 80B -> macOS 88B (insert 8B @ +0x18, RE-derived)\n");
     }
     if (qbuf) free(qbuf);
     return r;
