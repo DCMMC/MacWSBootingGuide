@@ -17,6 +17,17 @@ int main(){@autoreleasepool{
   id<MTLDevice> dev=MTLCreateSystemDefaultDevice();
   LOG("device=%s unified=%d", dev?[dev.name UTF8String]:"NIL", dev?(int)[dev hasUnifiedMemory]:-1);
   if(!dev) return 1;
+  // VA-RANGE PROBE: the macOS-Metal allocator's GPU VA range. Compare vs iOS-native iosblit
+  // and vs the BIF0 fault VA (0x1168000000). UAT is per-task (registerTaskForService); the wall
+  // is the VA-range mismatch (macOS 0x11xx vs the iOS-kernel-mapped 0x15xx GEM range).
+  id<MTLBuffer> probeS=[dev newBufferWithLength:0x4000 options:MTLResourceStorageModeShared];
+  LOG("VA-PROBE shared  gpuAddress=0x%llx", (unsigned long long)[probeS gpuAddress]);
+  id<MTLBuffer> probeP=[dev newBufferWithLength:0x4000 options:MTLResourceStorageModePrivate];
+  LOG("VA-PROBE private gpuAddress=0x%llx", (unsigned long long)[probeP gpuAddress]);
+  id<MTLHeap> hd=nil; MTLHeapDescriptor*hdesc=[MTLHeapDescriptor new]; hdesc.size=0x10000; hdesc.storageMode=MTLStorageModePrivate;
+  hd=[dev newHeapWithDescriptor:hdesc];
+  id<MTLBuffer> probeH=hd?[hd newBufferWithLength:0x4000 options:MTLResourceStorageModePrivate]:nil;
+  LOG("VA-PROBE heap-priv gpuAddress=0x%llx", (unsigned long long)(probeH?[probeH gpuAddress]:0));
   int W=256,H=256;
   NSDictionary*sp=@{(id)kIOSurfaceWidth:@(W),(id)kIOSurfaceHeight:@(H),(id)kIOSurfacePixelFormat:@(0x42475241),(id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfaceBytesPerRow:@(W*4),(id)kIOSurfaceAllocSize:@(W*H*4)};
   IOSurfaceRef ss=IOSurfaceCreate((__bridge CFDictionaryRef)sp);
