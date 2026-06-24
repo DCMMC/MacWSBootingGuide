@@ -65,6 +65,7 @@ static int macws_disp_mode(void) {
 // detile lands — this first proves the WS->OSXvnc->VNC pipeline with REAL bytes.
 extern uint32_t IOSurfaceGetID(IOSurfaceRef);
 static IOSurfaceRef g_vncSurf = NULL;
+static id g_ws_cmdq = nil;   // WS's captured compositor command queue (WSQ-TEST: the only queue whose CBs submit)
 static int macws_vnc_share_enabled(void) {
     static int c = -1;
     if (c < 0) c = (getenv("MACWS_VNC_SHARE") || access("/tmp/macws_vnc_share", F_OK) == 0) ? 1 : 0;
@@ -981,6 +982,64 @@ void macws_grab_composite(id<MTLTexture> tex) {
                                  fprintf(stderr, "#### BLIT-TEST wrote /tmp/macws_blit.raw (%zu bytes)\n", blen); }
                     }
                 } @catch (NSException *e) { fprintf(stderr, "#### BLIT-TEST exception: %s\n", [[e reason] UTF8String] ?: "?"); }
+            });
+        }
+    }
+    // WSQ-TEST (gated /tmp/macws_wsq_test, one-shot, BG thread): does MY command buffer submit on
+    // WS's OWN compositor queue (g_ws_cmdq, captured at newCommandQueue)? This answers "why only WS
+    // submits". Part A = trivial fillBuffer of my own buffer (no WS resources, safe). Part B = the
+    // Scheme-B blit of the composite dest (only if A succeeds). Runs on a detached thread so the
+    // waitUntilCompleted does NOT block WS's render thread (which would deadlock the in-flight composite).
+    if (tex && g_ws_cmdq && access("/tmp/macws_wsq_test", F_OK) == 0) {
+        static dispatch_once_t wsqo;
+        size_t tw_ = [tex width], th_ = [tex height]; unsigned long tpf_ = (unsigned long)[tex pixelFormat];
+        if ((size_t)tw_ * th_ >= 1000000 && (tpf_ == 80 || tpf_ == 550 || tpf_ == 552)) {
+            id texR = tex;  // ARC retains into the block to keep the dest alive for the bg thread
+            dispatch_once(&wsqo, ^{
+                unlink("/tmp/macws_wsq_test");
+                [NSThread detachNewThreadWithBlock:^{
+                  @try {
+                    id<MTLTexture> t = texR; id<MTLDevice> dev = [t device]; id<MTLCommandQueue> wq = g_ws_cmdq;
+                    // Part A: trivial fillBuffer on WS's queue (no WS resources)
+                    id<MTLBuffer> tb = [dev newBufferWithLength:65536 options:MTLResourceStorageModeShared];
+                    id<MTLCommandBuffer> cbA = [wq commandBuffer];
+                    id<MTLBlitCommandEncoder> blA = [cbA blitCommandEncoder];
+                    [blA fillBuffer:tb range:NSMakeRange(0, 65536) value:0xAB];
+                    [blA endEncoding]; [cbA commit]; [cbA waitUntilCompleted];
+                    long sA = (long)[cbA status]; id eA = [cbA error]; uint8_t fb = ((uint8_t *)[tb contents])[0];
+                    fprintf(stderr, "#### WSQ-TEST A(fillBuffer on WS queue) status=%ld err=%s firstByte=0x%02x => %s\n",
+                        sA, eA ? [[eA localizedDescription] UTF8String] : "none", fb,
+                        (sA == 4 && fb == 0xAB) ? "WS-QUEUE SUBMITS MY CB (wall is per-queue config!)" : "still fails on WS queue (deeper than queue)");
+                    // Part C: render-encoder CLEAR on WS's queue (no shader) — does the RENDER encoder
+                    // submit while the BLIT encoder (A) failed 0x103? If yes, blit-encoder is the broken path.
+                    {
+                        size_t bbpr = ((tw_ * 4 + 255) / 256) * 256;
+                        NSDictionary *sp = @{ (id)kIOSurfaceWidth:@((long)tw_), (id)kIOSurfaceHeight:@((long)th_),
+                            (id)kIOSurfaceBytesPerElement:@4, (id)kIOSurfaceBytesPerRow:@((long)bbpr), (id)kIOSurfacePixelFormat:@(0x42475241) };
+                        IOSurfaceRef os2 = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+                        typedef id (*nbi_t)(id, SEL, IOSurfaceRef);
+                        id<MTLBuffer> buf2 = os2 ? ((nbi_t)objc_msgSend)(dev, sel_registerName("newBufferWithIOSurface:"), os2) : nil;
+                        MTLTextureDescriptor *dd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)80 width:tw_ height:th_ mipmapped:NO];
+                        dd.usage = MTLTextureUsageRenderTarget; dd.storageMode = MTLStorageModeShared;
+                        id<MTLTexture> rt = buf2 ? [buf2 newTextureWithDescriptor:dd offset:0 bytesPerRow:bbpr] : nil;
+                        if (rt) {
+                            MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                            rpd.colorAttachments[0].texture = rt;
+                            rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+                            rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                            rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 1.0, 1.0); // blue
+                            id<MTLCommandBuffer> cbC = [wq commandBuffer];
+                            id<MTLRenderCommandEncoder> rce = [cbC renderCommandEncoderWithDescriptor:rpd];
+                            [rce endEncoding]; [cbC commit]; [cbC waitUntilCompleted];
+                            long sC = (long)[cbC status]; id eC = [cbC error];
+                            void *b2 = os2 ? IOSurfaceGetBaseAddress(os2) : NULL; uint32_t px = b2 ? *(uint32_t *)b2 : 0;
+                            fprintf(stderr, "#### WSQ-TEST C(render-clear on WS queue) status=%ld err=%s px0=0x%08x => %s\n",
+                                sC, eC ? [[eC localizedDescription] UTF8String] : "none", px,
+                                sC == 4 ? "RENDER SUBMITS (blit-encoder is the broken path!)" : "render ALSO fails (deeper than encoder)");
+                        } else fprintf(stderr, "#### WSQ-TEST C rt nil (buf2=%p)\n", (void *)buf2);
+                    }
+                  } @catch (NSException *e) { fprintf(stderr, "#### WSQ-TEST exception: %s\n", [[e reason] UTF8String] ?: "?"); }
+                }];
             });
         }
     }
@@ -4501,7 +4560,32 @@ static size_t macws_mapped_extent_from(void *p) {
     return total;
 }
 
+// WSQ capture: swizzle the AGX device's newCommandQueue* so we keep a reference to WS's OWN
+// compositor command queue (the only one whose command buffers actually submit in the chroot).
+// Installed from install_agx_init_redirect (when WS discovers the AGX device) — BEFORE SkyLight's
+// compositor creates its queue, so we catch the first one. arm64e-safe (C IMP + method_setImplementation).
+static id (*orig_newCommandQueue)(id, SEL) = NULL;
+static id (*orig_newCommandQueueN)(id, SEL, NSUInteger) = NULL;
+static id hooked_newCommandQueue(id self, SEL _cmd) {
+    id q = orig_newCommandQueue ? orig_newCommandQueue(self, _cmd) : nil;
+    if (!g_ws_cmdq && q) { g_ws_cmdq = q; fprintf(stderr, "#### WSQ captured newCommandQueue=%p dev=%s\n", (void *)q, class_getName([self class])); }
+    return q;
+}
+static id hooked_newCommandQueueN(id self, SEL _cmd, NSUInteger n) {
+    id q = orig_newCommandQueueN ? orig_newCommandQueueN(self, _cmd, n) : nil;
+    if (!g_ws_cmdq && q) { g_ws_cmdq = q; fprintf(stderr, "#### WSQ captured newCommandQueueWithMax=%p n=%lu dev=%s\n", (void *)q, (unsigned long)n, class_getName([self class])); }
+    return q;
+}
+static void install_wsqueue_capture(Class agx) {
+    Method m1 = class_getInstanceMethod(agx, @selector(newCommandQueue));
+    if (m1) { orig_newCommandQueue = (void *)method_getImplementation(m1); method_setImplementation(m1, (IMP)hooked_newCommandQueue); }
+    Method m2 = class_getInstanceMethod(agx, @selector(newCommandQueueWithMaxCommandBufferCount:));
+    if (m2) { orig_newCommandQueueN = (void *)method_getImplementation(m2); method_setImplementation(m2, (IMP)hooked_newCommandQueueN); }
+    fprintf(stderr, "#### WSQ capture installed on %s (newCommandQueue=%p withMax=%p)\n", class_getName(agx), (void *)m1, (void *)m2);
+}
+
 static void install_agx_init_redirect(Class agx) {
+    install_wsqueue_capture(agx);  // WSQ-TEST: keep WS's compositor command queue
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_updatebind_hook();    // BINDFIX: substitute IOSurface GPU VA when bind gets 0 (gated)
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
