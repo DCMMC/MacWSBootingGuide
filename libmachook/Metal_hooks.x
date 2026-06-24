@@ -651,6 +651,15 @@ static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *o
                 if (ptex) {
                     id<MTLCommandQueue> pq = [dev newCommandQueue];
                     id<MTLCommandBuffer> pcb = [pq commandBuffer];
+                    // PART 2 (residency, gated /tmp/macws_resident): force src into this
+                    // cmdbuf's resource list so the AGXIOC submit maps it (the gpuEvent
+                    // BIF0 fault proved src's VA is valid but unmapped for our fresh-queue READ).
+                    if (access("/tmp/macws_resident", F_OK) == 0) {
+                        @try { id<MTLComputeCommandEncoder> ce = [pcb computeCommandEncoder];
+                            [ce useResource:src usage:MTLResourceUsageRead]; [ce endEncoding];
+                            fprintf(stderr, "#### PART2-RESIDENT(priv): useResource(src) added\n");
+                        } @catch (__unused NSException *e) { fprintf(stderr, "#### PART2-RESIDENT(priv): exc\n"); }
+                    }
                     id<MTLBlitCommandEncoder> pbl = [pcb blitCommandEncoder];
                     [pbl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                               sourceSize:MTLSizeMake(w,h,1) toTexture:ptex destinationSlice:0
@@ -691,6 +700,20 @@ static uint8_t *macws_blit_detile(id<MTLTexture> src, size_t *out_bpr, size_t *o
             }
             id<MTLCommandQueue> q = [dev newCommandQueue];
             id<MTLCommandBuffer> cb = [q commandBuffer];
+            // PART 2 (residency fix, gated /tmp/macws_resident): explicitly add src (read)
+            // + lintex (write) to this command buffer's resource list via a no-dispatch
+            // compute encoder, so the AGXIOC submit maps them. gpuEvent proved the BIF0
+            // fault is a READ of a valid-but-unmapped VA — src is resident for the
+            // compositor's write but not auto-tracked into our fresh-queue blit submission.
+            if (access("/tmp/macws_resident", F_OK) == 0) {
+                @try {
+                    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                    [ce useResource:src usage:MTLResourceUsageRead];
+                    [ce useResource:lintex usage:MTLResourceUsageWrite];
+                    [ce endEncoding];
+                    fprintf(stderr, "#### PART2-RESIDENT: useResource(src=read, lintex=write) added to cmdbuf\n");
+                } @catch (__unused NSException *e) { fprintf(stderr, "#### PART2-RESIDENT: exception\n"); }
+            }
             id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
             [bl copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
                      sourceSize:MTLSizeMake(w,h,1) toTexture:lintex destinationSlice:0
