@@ -7066,10 +7066,12 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     // (selector 30 = 0x1e) command-stream records, tagged MY (g_dump_my_submit) vs WS. Read-only.
     if ((orig == 0x1e || selector == 0x1e) && IOConnectIsIOGPU(client) && access("/tmp/macws_submit_dump", F_OK) == 0) {
         int mine = atomic_load(&g_dump_my_submit);
-        static int dumped_ws = 0, dumped_mine = 0;
-        if ((mine && !dumped_mine) || (!mine && !dumped_ws)) {
-            if (mine) dumped_mine = 1; else dumped_ws = 1;
-            macws_dump_submit(mine ? "MYBLIT" : "WS", in, inCnt, inStruct, inStructCnt);
+        static int n_dumped = 0;
+        // Dump up to 8 submits regardless of WS/MY tag — see all PASS1/PASS2 cmd bytes
+        if (n_dumped < 8) {
+            n_dumped++;
+            char tag[16]; snprintf(tag, sizeof tag, "%s#%d", mine ? "MY" : "WS", n_dumped);
+            macws_dump_submit(tag, in, inCnt, inStruct, inStructCnt);
         }
     }
     if (!skip && !IOConnectIsIOGPU(client)) {
