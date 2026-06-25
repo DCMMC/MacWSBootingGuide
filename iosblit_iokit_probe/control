@@ -1,0 +1,9 @@
+Package: com.dcmmc.iosblit-iokit-probe
+Name: iosblit IOKit probe
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Capture iosblit sel=9 IOConnectCallMethod inputs for AGX RE
+Maintainer: dcmmc
+Author: dcmmc
+Section: Tweaks
+Depends: mobilesubstrate

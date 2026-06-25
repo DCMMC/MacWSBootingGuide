@@ -5,10 +5,10 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <string.h>
+#include <stdlib.h>
+#include <syslog.h>
 
 // Hook IOConnectCallMethod inside iosblit to capture every sel=9 input.
-// Output: /var/mobile/Containers/Data/Application/<uuid>/Documents/iosblit_iokit.log (sandbox-safe)
-// or fallback /tmp/iosblit_iokit.log (works if entitlements allow).
 
 static FILE *g_log = NULL;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -31,7 +31,7 @@ static kern_return_t my_IOConnectCallMethod(
     uint64_t *output, uint32_t *outputCnt,
     void *outputStruct, size_t *outputStructCnt) {
 
-    // Snapshot input bytes BEFORE the call (kernel may write back into them)
+    // Snapshot input bytes BEFORE the call
     uint64_t pre_in10 = 0, pre_in40 = 0, pre_in00 = 0, pre_in08 = 0;
     if (inputStruct && inputStructCnt >= 0x48) {
         const uint8_t *ib = (const uint8_t *)inputStruct;
@@ -65,7 +65,7 @@ static kern_return_t my_IOConnectCallMethod(
             }
             fprintf(g_log,
                 "  SEL9#%03d PRE: in+0x00=%#llx in+0x08=%#llx in+0x10=%#llx in+0x40=%#llx\n"
-                "           POST: in+0x40=%#llx out+0x08(gpuAddr)=%#llx out+0x18(region)=%#llx (=%#llx) out+0x40=%#llx\n",
+                "           POST: in+0x40=%#llx out+0x08(gpuAddr)=%#llx out+0x18(region)=%#llx (R=%#llx) out+0x40=%#llx\n",
                 g_sel9,
                 (unsigned long long)pre_in00, (unsigned long long)pre_in08,
                 (unsigned long long)pre_in10, (unsigned long long)pre_in40,
@@ -83,37 +83,31 @@ static kern_return_t my_IOConnectCallMethod(
 }
 
 %ctor {
-    // EARLIEST possible diagnostic — syslog always works
-    syslog(LOG_NOTICE, "IOSBLIT_PROBE: ctor running pid=%d", getpid());
-    fprintf(stderr, "IOSBLIT_PROBE: ctor running pid=%d\n", getpid());
+    syslog(LOG_NOTICE, "IOSBLIT_PROBE: ctor entered pid=%d", getpid());
 
-    // iOS sandbox: write to NSDocumentDirectory (always writable for the app)
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    syslog(LOG_NOTICE, "IOSBLIT_PROBE: NSDocumentDirectory has %lu paths", (unsigned long)paths.count);
-    if (paths.count > 0) {
-        NSString *p = [paths.firstObject stringByAppendingPathComponent:@"iosblit_iokit.log"];
-        g_log = fopen(p.UTF8String, "w");
-        if (g_log) {
-            fprintf(g_log, "==== iosblit_iokit_probe loaded; logging to %s ====\n", p.UTF8String);
-            // Also drop a marker filename into /tmp via syslog so we can find the container
-            syslog(LOG_NOTICE, "iosblit_iokit_probe: log at %s", p.UTF8String);
+    // No Foundation calls from %ctor on arm64e — PAC-traps. Use C only.
+    char path[1024];
+    const char *home = getenv("HOME");
+    if (home && *home) {
+        snprintf(path, sizeof path, "%s/Documents/iosblit_iokit.log", home);
+        g_log = fopen(path, "w");
+        if (g_log) syslog(LOG_NOTICE, "IOSBLIT_PROBE: log opened at %s", path);
+        else syslog(LOG_NOTICE, "IOSBLIT_PROBE: fopen %s failed errno=%d", path, errno);
+    } else {
+        syslog(LOG_NOTICE, "IOSBLIT_PROBE: HOME unset");
+    }
+    if (!g_log) {
+        const char *fallbacks[] = { "/tmp/iosblit_iokit.log", "/var/tmp/iosblit_iokit.log", NULL };
+        for (int i = 0; fallbacks[i]; i++) {
+            g_log = fopen(fallbacks[i], "w");
+            if (g_log) { syslog(LOG_NOTICE, "IOSBLIT_PROBE: fallback log at %s", fallbacks[i]); break; }
         }
     }
     if (!g_log) {
-        // Fallback paths
-        const char *paths_c[] = { "/tmp/iosblit_iokit.log", "/var/tmp/iosblit_iokit.log", NULL };
-        for (int i = 0; paths_c[i]; i++) {
-            g_log = fopen(paths_c[i], "w");
-            if (g_log) {
-                fprintf(g_log, "==== iosblit_iokit_probe loaded; logging to %s ====\n", paths_c[i]);
-                break;
-            }
-        }
-    }
-    if (!g_log) {
-        syslog(LOG_NOTICE, "iosblit_iokit_probe: ALL paths failed");
+        syslog(LOG_NOTICE, "IOSBLIT_PROBE: ALL fopen attempts failed");
         g_log = stderr;
     }
+    fprintf(g_log, "==== iosblit_iokit_probe pid=%d HOME=%s ====\n", getpid(), home ? home : "(null)");
     fflush(g_log);
 
     MSHookFunction((void *)&IOConnectCallMethod,
@@ -121,4 +115,5 @@ static kern_return_t my_IOConnectCallMethod(
                    (void **)&orig_IOConnectCallMethod);
     fprintf(g_log, "==== IOConnectCallMethod hook installed ====\n");
     fflush(g_log);
+    syslog(LOG_NOTICE, "IOSBLIT_PROBE: hook installed, ctor done");
 }
