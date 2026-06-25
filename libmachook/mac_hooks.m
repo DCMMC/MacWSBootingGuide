@@ -6954,6 +6954,26 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    // USC-CHUNK-SIZE-BUMP (gated /tmp/macws_usc_chunk_bump): the chroot's macOS AGXMetal13_3 asks
+    // for USC chunks of 128 MB (in+0x40 = 0x8000000) with in+0x10 = 0x43001000101. Bump each chunk
+    // to 384 MB (0x18000000) — kernel HAS shown it accepts that size (regions 0x16/0x18/0x1e in
+    // baseline got 384 MB). If kernel honors the bigger ask, shader fault VA (around 0x115xxxxxxx,
+    // ~3.8 GB into region 0x11) might land within a larger first-chunk allocation.
+    if (selector == 0x9 && inStruct && inStructCnt >= 0x48 && IOConnectIsIOGPU(client) && !skip &&
+        access("/tmp/macws_usc_chunk_bump", F_OK) == 0) {
+        uint64_t v10 = *(uint64_t *)((uintptr_t)inStruct + 0x10);
+        uint64_t *sz_ptr = (uint64_t *)((uintptr_t)inStruct + 0x40);
+        // Diagnostic: ALWAYS log to confirm path runs
+        static int diag = 0;
+        if (diag++ < 8) fprintf(stderr, "#### USC-CHUNK-DIAG sel=%u inSC=%zu skip=%d v10=%#llx sz=%#llx\n",
+            selector, inStructCnt, skip, (unsigned long long)v10, (unsigned long long)*sz_ptr);
+        // USC chunk pattern: in+0x10 == 0x43001000101 AND in+0x40 == 128 MB
+        if (v10 == 0x43001000101ULL && *sz_ptr == 0x8000000ULL) {
+            *sz_ptr = 0x18000000ULL;  // 128 MB -> 384 MB
+            static int bn = 0;
+            if (bn++ < 8) fprintf(stderr, "#### USC-CHUNK-BUMP +0x40: 0x8000000 -> 0x18000000 (128 MB -> 384 MB)\n");
+        }
+    }
     // USC-CLASS-TAG (gated /tmp/macws_usc_classtag): the chroot's sel=9 input at +0x14 carries a
     // class-tag in the low 12 bits (e.g. 0x430 = USC chunk class, 0x470 = device-private page,
     // 0x8430 = bit15 + USC chunk). iOS-native iosblit sends `0x8000` (pure bit15, no class tag) at
