@@ -3833,31 +3833,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     IMP trace_unt = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long opt) {
                         id r = ((id (*)(id, SEL, id, unsigned long, unsigned long))orig_unt)(
                             self, initUntracked, dev, len, opt);
-                        // USC-IVAR REDIRECT (gated /tmp/macws_uscivar): these setupDeferred buffers carry a
-                        // USC VA (region 0x11) ivar that gets encoded into the shader descriptor; the GPU then
-                        // faults reading shader code at 0x11xx (unmapped for chroot). RE-confirmed USC = GEM
-                        // region-swapped (out+0x00 GEM 0x1540110000, USC 0x1140110000, SAME offset). Rewrite the
-                        // buffer's USC-VA ivar 0x11xx -> 0x15xx (the buffer's REAL mapped GEM pages) at the
-                        // SOURCE, so every descriptor derived from it points at mapped memory — robust vs the
-                        // submit-time encoded-descriptor scan which missed the faulting shader. Host pointers are
-                        // <0x110000000 and GEM VAs are 0x15xx, so a 0x11xx u64 is unambiguously the USC VA.
-                        if (r && access("/tmp/macws_uscivar", F_OK) == 0) {
-                            uint64_t *iv = (uint64_t *)r;
-                            size_t bs = malloc_size((void *)r); size_t n = bs / 8; if (n > 0x400) n = 0x400;
-                            int patched = 0, logged = 0;
-                            for (size_t k = 1; k < n; k++) {
-                                uint64_t v = iv[k];
-                                if (v >= 0x1100000000ULL && v < 0x1700000000ULL && logged < 16) {
-                                    fprintf(stderr, "#### USC-IVAR scan buf+%#zx = %#llx\n", k * 8, (unsigned long long)v);
-                                    logged++;
-                                }
-                                if (v >= 0x1100000000ULL && v < 0x1200000000ULL) {   // USC VA (region 0x11)
-                                    iv[k] = v + 0x400000000ULL;   // -> region 0x15 (the buffer's mapped GEM pages)
-                                    patched++;
-                                }
-                            }
-                            fprintf(stderr, "#### USC-IVAR buf=%p size=%zu len=%lu patched=%d\n", r, bs, len, patched);
-                        }
                         fprintf(stderr,
                             "#### TRACE -[AGXBuffer initUntracked] self=%p dev=%p len=%lu opt=%lu -> %p\n",
                             self, dev, len, opt, r);
@@ -6951,6 +6926,7 @@ static int macws_usc_redirect(const void *inStruct, size_t inStructCnt) {
         addr = a + sz;
     }
     if (total) fprintf(stderr, "#### USC-REDIR rewrote %d x 0x11xx -> 0x15xx (broad sweep, %zuMB)\n", total, scanned>>20);
+    else       fprintf(stderr, "#### USC-REDIR found 0 encoded descriptors in %zuMB (range [0x20440000000,0x20480000000) absent at submit)\n", scanned>>20);
     return total;
 }
 
@@ -7466,15 +7442,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         if (out18 >= 0x1100000000ULL && out18 < 0x1200000000ULL) {   // region 0x11 = USC
             static int utn = 0;
             if (utn++ < 4) {
-                // Dump the FULL output as u64s: out+0x08 is the GEM VA the kernel mapped (0x15xx),
-                // out+0x18 is the region index (0x11). Comparing the offsets of GEM VA vs the USC VA
-                // (0x1168140000) tells us if USC = GEM region-swapped (same offset) or independent.
-                const uint64_t *ou = (const uint64_t *)outStruct;
-                fprintf(stderr, "#### USC-TRACE region-0x11 ResCreate inSC=%zu outSC=%zu out u64[0..0x40]:\n",
-                    inStructCnt, (size_t)*outStructCnt);
-                for (size_t k = 0; k * 8 + 8 <= *outStructCnt && k < 8; k++)
-                    fprintf(stderr, "####   out+%#04zx = %#llx\n", k * 8, (unsigned long long)ou[k]);
-                fprintf(stderr, "####   in[0..0x30]:");
+                fprintf(stderr, "#### USC-TRACE region-0x11 ResCreate out+0x18=%#llx inSC=%zu in[0..0x30]:",
+                    (unsigned long long)out18, inStructCnt);
                 const uint8_t *ib = (const uint8_t *)inStruct;
                 for (size_t k = 0; inStruct && k < inStructCnt && k < 0x30; k++) fprintf(stderr, "%02x", ib[k]);
                 fprintf(stderr, "\n");
