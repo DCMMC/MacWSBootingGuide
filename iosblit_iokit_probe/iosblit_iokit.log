@@ -1,0 +1,93 @@
+==== iosblit_iokit_probe v2 pid=92438 HOME=/private/var/mobile/Containers/Data/Application/010FFB25-57CF-4C94-B1A7-05F4A6DB6EB1 ====
+  hooked IOServiceOpen @ 0xfe010001ca005fac (orig=0x9a610001010e4000)
+  hooked IOConnectCallMethod @ 0x1e268001c9ff24f4 (orig=0xaa1f800103050000)
+  hooked IOConnectCallScalarMethod @ 0xe1660001c9ff19d4 (orig=0x772480010305c000)
+  hooked IOConnectCallStructMethod @ 0x3e218001c9ff24b0 (orig=0x9076800103068000)
+  hooked IOConnectCallAsyncMethod @ 0xf7768001c9ff2ac8 (orig=0xcf38000103074000)
+  hooked IOConnectCallAsyncStructMethod @ 0xbf5f0001ca0189e0 (orig=0xaa478001030bc000)
+  hooked IOConnectCallAsyncScalarMethod @ 0xcf0e0001ca0181d4 (orig=0x813a0001030c8000)
+[IOServiceOpen #1] type=1048577 kr=0 conn=19467
+[0001] CallMethod conn=19467 sel=6 inSC=16 kr=1
+[0002] CallStructMethod conn=19467 sel=6 inSC=16 kr=1
+[0003] CallMethod conn=19467 sel=2 inSC=0 kr=0
+[0004] CallStructMethod conn=19467 sel=2 inSC=0 kr=0
+[0005] CallMethod conn=19467 sel=0 inSC=0 kr=0
+[0006] CallStructMethod conn=19467 sel=0 inSC=0 kr=0
+[0007] CallMethod conn=19467 sel=4 inSC=0 kr=0
+[0008] CallStructMethod conn=19467 sel=4 inSC=0 kr=0
+[IOServiceOpen #2] type=0 kr=0 conn=25355
+[0009] CallMethod conn=25355 sel=13 inSC=0 kr=0
+[0010] CallMethod conn=25355 sel=32 inSC=0 kr=0
+[0011] CallMethod conn=19467 sel=258 inSC=0 kr=0
+[0012] CallStructMethod conn=19467 sel=258 inSC=0 kr=0
+[0013] CallAsyncMethod conn=19467 sel=263 inSC=0 kr=0
+[0014] CallAsyncScalarMethod conn=19467 sel=263 kr=0
+[0015] CallMethod conn=19467 sel=256 inSC=0 kr=0
+[0016] CallStructMethod conn=19467 sel=256 inSC=0 kr=0
+[0017] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#001 [CallMethod] conn=19467 | in+0x10=0x800001000101 in+0x40=0x10000 | out+0x08=0x103148000 out+0x18(R=0x1)
+[0018] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#002 [CallMethod] conn=19467 | in+0x10=0x47001000101 in+0x40=0x20000 | out+0x08=0x1031e0000 out+0x18(R=0x2)
+[0019] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#003 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x3)
+[0020] CallMethod conn=19467 sel=7 inSC=1032 kr=0
+[0021] CallMethod conn=19467 sel=15 inSC=0 kr=0
+[0022] CallMethod conn=19467 sel=25 inSC=0 kr=0
+[0023] CallScalarMethod conn=19467 sel=264 inCnt=2 kr=0
+[0024] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#004 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x4)
+[0025] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#005 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x5)
+[0026] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#006 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x6)
+[0027] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#007 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x7)
+[0028] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#008 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x8)
+[0029] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#009 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0x9)
+[0030] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#010 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0xa)
+[0031] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#011 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0xb)
+[0032] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#012 [CallMethod] conn=19467 | in+0x10=0x1000101 in+0x40=0x10000 | out+0x08=0x103200000 out+0x18(R=0xc)
+[0033] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#013 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0xd)
+[0034] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#014 [CallMethod] conn=19467 | in+0x10=0x47001000101 in+0x40=0x20000 | out+0x08=0x103210000 out+0x18(R=0xe)
+[0035] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#015 [CallMethod] conn=19467 | in+0x10=0xc3001000101 in+0x40=0x20000 | out+0x08=0 out+0x18(R=0xf)
+[0036] CallMethod conn=19467 sel=13 inSC=0 kr=0
+[0037] CallMethod conn=19467 sel=13 inSC=0 kr=0
+[0038] CallMethod conn=19467 sel=5 inSC=0 kr=0
+[0039] CallStructMethod conn=19467 sel=5 inSC=0 kr=0
+[0040] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#016 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103238000 out+0x18(R=0x10)
+[0041] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#017 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103240000 out+0x18(R=0x11)
+[0042] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#018 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103248000 out+0x18(R=0x12)
+[0043] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#019 [CallMethod] conn=19467 | in+0x10=0x843001000101 in+0x40=0x8000 | out+0x08=0x103250000 out+0x18(R=0x13)
+[0044] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#020 [CallMethod] conn=19467 | in+0x10=0x843001000101 in+0x40=0x8000 | out+0x08=0x103258000 out+0x18(R=0x14)
+[0045] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#021 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0xff80 | out+0x08=0x103260000 out+0x18(R=0x15)
+[0046] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#022 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103270000 out+0x18(R=0x16)
+[0047] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#023 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103278000 out+0x18(R=0x17)
+[0048] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#024 [CallMethod] conn=19467 | in+0x10=0x843001000101 in+0x40=0x8000 | out+0x08=0x103280000 out+0x18(R=0x18)
+[0049] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#025 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103288000 out+0x18(R=0x19)
+[0050] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#026 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103290000 out+0x18(R=0x1a)
+[0051] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#027 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0xff80 | out+0x08=0x103d04000 out+0x18(R=0x1b)
+[0052] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#028 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103d14000 out+0x18(R=0x1c)
+[0053] CallMethod conn=19467 sel=9 inSC=96 kr=0
+  SEL9#029 [CallMethod] conn=19467 | in+0x10=0x43001000101 in+0x40=0x8000 | out+0x08=0x103d1c000 out+0x18(R=0x1d)
+[0054] CallMethod conn=19467 sel=26 inSC=56 kr=0
