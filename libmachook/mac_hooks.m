@@ -6841,14 +6841,71 @@ __attribute__((visibility("default"))) io_connect_t macws_get_agx_conn(void) {
 _Atomic int g_dump_my_submit = 0;
 
 static void macws_scan_records(const char *tag, const char *where, const uint32_t *p, size_t n_u32) {
+    // Record header layout (RE-confirmed 2026-06-25 via capstone disasm of
+    // iOS XNU AGXCommandQueue::processSegmentKernelCommand @0xfffffe00086e2274):
+    //   record[+0x00] u32  = magic (0x10000 for kernel-cmd path)
+    //   record[+0x2c] u32  = SIZE (validated; subtype 1→0x7c8, 2→0x3b0, 3→0x1a8, 5→table)
+    //   record[+0x30] u32  = TYPE (validated; must equal 0x30)
+    //   record[+0x34] u32  = SUBTYPE (validated; must be in 1..5)
+    //
+    // Body sub-fn (0x086e434c) reads OOL trail fields AFTER record body:
+    //   x24 = record_body + record_size = record + 8 + 0x1a8 = record + 0x1b0
+    //   [x24, #0x1a8] u8  flag-A   ; OOL has data
+    //   [x24, #0x6a8] u8  flag-B   ; OOL trail extension (checked iff flag-A!=0)
+    //   [x24, #0x19c] u32 size-w14 ; bounds-checked vs 1<<queue[+0xc]
+    //   [x24, #0x1ae] u8  flag-C   ; path branch
+    //
+    // These reads land PAST the record's 0x1f0 newCommand reservation (≈0x328
+    // .. 0x828 byte offset from this record's TYPE marker), so they fall in
+    // NEXT record / segment padding. We dump them so we can see whether
+    // REC-SIZE FIX is "happens-to-work" (those bytes are reliably zero) or
+    // structural.  See docs/op3-record-ool-dump-spec.md and memory file
+    // agx-kernel-validator-fully-decoded.md for the full RE story.
+    const uint8_t *b = (const uint8_t *)p;
+    size_t n_bytes = n_u32 * 4;
     int found = 0;
     for (size_t k = 0; k + 1 < n_u32 && found < 16; k++) {
-        if (p[k] == 0x30) {                       // candidate kernel-command record type
-            uint32_t size = p[k + 1];
-            fprintf(stderr, "#### SUBMIT-DUMP[%s] %s rec@+%#zx type=0x30 size=%#x next=%#x %s\n",
-                tag, where, k * 4, size, p[k + 1] + 0x30,
-                size == 0x1a8 ? "(VALID 0x1a8)" : "(!!MISMATCH want 0x1a8)");
-            found++;
+        if (p[k] != 0x30) continue;                 // candidate TYPE field
+        // record[+0x2c] (size) is at u32 index k-1 IF this 0x30 is at +0x30
+        // record[+0x34] (subtype) is at u32 index k+1
+        if (k * 4 < 0x30) continue;                  // 0x30 byte hit too close to seg start to be a real record
+        uint32_t size = p[k - 1];
+        uint32_t subtype = p[k + 1];
+        // Subtype→expected-size constants (from kernel validator):
+        const char *valid =
+            (subtype == 1 && size == 0x7c8) ? "(VALID s1 0x7c8)" :
+            (subtype == 2 && size == 0x3b0) ? "(VALID s2 0x3b0)" :
+            (subtype == 3 && size == 0x1a8) ? "(VALID s3 0x1a8)" :
+            (subtype == 4)                   ? "(UNSUP s4)"      :
+            (subtype == 5)                   ? "(s5 table-sized)" :
+                                               "(!!MISMATCH)";
+        fprintf(stderr, "#### SUBMIT-DUMP[%s] %s rec@+%#zx hdr={size=%#x type=%#x subtype=%u} %s\n",
+            tag, where, (k * 4) - 0x30, size, p[k], subtype, valid);
+        found++;
+
+        // OOL field dump — only meaningful for subtype 3 records.
+        // x24 = record_body + record_size = (record_start + 8) + size
+        // Byte offset of x24 from segment start `b`:
+        //   x24_byte = (k * 4 - 0x30) + 8 + size = k*4 + size - 0x28
+        // For size = 0x1a8: x24_byte = k*4 + 0x180.
+        if (subtype != 3) continue;
+        size_t x24_byte = (k * 4) + (size_t)size - 0x28;
+        struct { size_t off; const char *name; int width; } ool[] = {
+            { x24_byte + 0x1a8, "flag-A",   1 },
+            { x24_byte + 0x6a8, "flag-B",   1 },
+            { x24_byte + 0x19c, "size-w14", 4 },
+            { x24_byte + 0x1ae, "flag-C",   1 },
+        };
+        for (size_t i = 0; i < 4; i++) {
+            if (ool[i].off + ool[i].width > n_bytes) {
+                fprintf(stderr, "        ool[%s] @ +%#zx — OUT OF SEGMENT (n=%#zx)\n",
+                    ool[i].name, ool[i].off, n_bytes);
+                continue;
+            }
+            uint32_t v = 0;
+            memcpy(&v, b + ool[i].off, ool[i].width);
+            fprintf(stderr, "        ool[%s] @ +%#zx = %#x\n",
+                ool[i].name, ool[i].off, v);
         }
     }
     if (!found) fprintf(stderr, "#### SUBMIT-DUMP[%s] %s NO type=0x30 record in %zu u32\n", tag, where, n_u32);
@@ -6877,7 +6934,11 @@ static void macws_dump_submit(const char *tag, const uint64_t *in, uint32_t inCn
         fprintf(stderr, "#### SUBMIT-DUMP[%s] args[%zu]=%#llx seg head:", tag, i, (unsigned long long)pp);
         for (size_t j = 0; j < 96; j++) fprintf(stderr, "%02x", sb[j]);
         fprintf(stderr, "\n");
-        size_t segn = ((vm_address_t)(a + sz) - (vm_address_t)pp) / 4; if (segn > 512) segn = 512;
+        size_t segn = ((vm_address_t)(a + sz) - (vm_address_t)pp) / 4;
+        // Bumped 512→8192 (2KB→32KB) so subtype-3 OOL fields at record_off+0x828
+        // (flag-B = x24+0x6a8 = body+0x1a8+0x6a8) fall inside the scan window —
+        // see docs/op3-record-ool-dump-spec.md.
+        if (segn > 8192) segn = 8192;
         char w[40]; snprintf(w, sizeof w, "seg[%zu]", i);
         macws_scan_records(tag, w, seg, segn);
         for (size_t j = 0; j < segn; j++)
