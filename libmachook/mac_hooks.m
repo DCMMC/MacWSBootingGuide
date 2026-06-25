@@ -6885,11 +6885,55 @@ static void macws_dump_submit(const char *tag, const uint64_t *in, uint32_t inCn
     }
 }
 
+// USC-REDIRECT (gated /tmp/macws_uscredir): the GPU shader/USC unit faults reading shader code at
+// the USC region 0x11xx, which the iOS kernel does NOT map for the chroot. But the SAME shader heap
+// IS mapped at its GEM VA (0x15xx = USC + 0x4<<32, same in-region offset). So before submit, rewrite
+// every 0x11xx GPU-VA in the command stream -> +0x4<<32 (region 0x11 -> the mapped 0x15 GEM region).
+// This sidesteps the missing kernel mapping by pointing the GPU at the mapping that exists.
+// Tests the open question: does the GPU shader-fetch honor the descriptor VA (works) or a fixed
+// hardware USC base (fault moves/persists)?  Follows inStruct pointers via vm_region_64 (bounded/safe).
+static int macws_usc_redirect(const void *inStruct, size_t inStructCnt) {
+    // Broad sweep: the shader's USC VA (0x11xx) lives in a deeper GPU-shared buffer, not the
+    // level-1 command-stream segments. Walk ALL writable VM regions in the GPU-shared address
+    // range and rewrite every 0x11xx GPU-VA -> +0x4<<32 (the mapped 0x15xx GEM alias).
+    (void)inStruct; (void)inStructCnt;
+    int total = 0; size_t scanned = 0;
+    vm_address_t addr = 0x100000000ULL;          // start above the low CPU heap
+    while (addr < 0x800000000ULL && scanned < 0x8000000ULL) {   // GPU-shared range; cap 128MB scanned
+        vm_size_t sz = 0;
+        vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t mo = MACH_PORT_NULL;
+        vm_address_t a = addr;
+        if (vm_region_64(mach_task_self(), &a, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &mo) != KERN_SUCCESS) break;
+        if (a >= 0x800000000ULL) break;
+        if ((bi.protection & (VM_PROT_READ|VM_PROT_WRITE)) == (VM_PROT_READ|VM_PROT_WRITE) && sz <= 0x2000000) {
+            uint8_t *base = (uint8_t *)a;
+            for (size_t j = 0; j + 8 <= sz; j += 4) {
+                uint64_t v; memcpy(&v, base + j, 8);
+                if (v >= 0x1100000000ULL && v < 0x1200000000ULL) {
+                    uint64_t nv = v + 0x400000000ULL; memcpy(base + j, &nv, 8);
+                    if (total < 12) fprintf(stderr, "#### USC-REDIR @%#llx %#llx -> %#llx\n",
+                        (unsigned long long)(a + j), (unsigned long long)v, (unsigned long long)nv);
+                    total++;
+                }
+            }
+            scanned += sz;
+        }
+        addr = a + sz;
+    }
+    if (total) fprintf(stderr, "#### USC-REDIR rewrote %d x 0x11xx -> 0x15xx (broad sweep, %zuMB)\n", total, scanned>>20);
+    return total;
+}
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    // USC-REDIRECT at submit (sel 0x1a/0x1e = AGX command-buffer submit), BEFORE the orig call so the GPU sees it.
+    if ((orig == 0x1a || orig == 0x1e || selector == 0x1a) && IOConnectIsIOGPU(client) && !skip &&
+        access("/tmp/macws_uscredir", F_OK) == 0) {
+        macws_usc_redirect(inStruct, inStructCnt);
+    }
     // SUBMIT-DUMP (gated /tmp/macws_submit_dump): one-shot dump of the AGX command-buffer submit
     // (selector 30 = 0x1e) command-stream records, tagged MY (g_dump_my_submit) vs WS. Read-only.
     if ((orig == 0x1e || selector == 0x1e) && IOConnectIsIOGPU(client) && access("/tmp/macws_submit_dump", F_OK) == 0) {
