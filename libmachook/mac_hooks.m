@@ -6943,6 +6943,89 @@ static void macws_dump_submit(const char *tag, const uint64_t *in, uint32_t inCn
         macws_scan_records(tag, w, seg, segn);
         for (size_t j = 0; j < segn; j++)
             if (seg[j] == 0x10000 || seg[j] == 0x10001) { fprintf(stderr, "#### SUBMIT-DUMP[%s] %s MAGIC %#x @+%#zx\n", tag, w, seg[j], j * 4); break; }
+
+        // LAYER-3 RECURSIVE SCAN (2026-06-25): runtime test showed inStruct is a
+        // 56-byte IOGPUCommandBufferDescriptor whose +0x10/+0x18 ptrs lead to
+        // "Layer-2" segments with magic 0x003d7770 — NOT the kernel cmd-record
+        // segment. The real type=0x30 records live one more level deep, in
+        // buffers pointed to by Layer-2's inner ptr fields at +0x10, +0x18,
+        // +0x20 etc. Follow them recursively (depth=1, no further) and scan
+        // each for 0x10000 magic + type=0x30 records. See memory file
+        // agx-kernel-validator-fully-decoded.md "RUNTIME CORRECTION" section.
+        size_t l3_max_ptrs = segn / 2 < 8 ? segn / 2 : 8;  // walk first 8 u64s of Layer-2
+        const uint64_t *u64_l2 = (const uint64_t *)pp;
+        int l3_dumped = 0;
+        int l3_inspected = 0;
+        for (size_t j = 0; j < l3_max_ptrs && l3_dumped < 4; j++) {
+            uint64_t lp = u64_l2[j];
+            l3_inspected++;
+            // Skip non-pointer-looking values: sentinels (0xaaaaaa…), zeros, small ints,
+            // and values past normal user VA range.
+            if (lp < 0x100000000ULL || lp > 0x7fffffffffffULL) continue;
+            if (lp == 0xaaaaaaaaaaaaaaaaULL) continue;
+            // Also skip the Layer-2 ptr itself (could be self-ref?)
+            if (lp == pp) continue;
+            vm_address_t la = (vm_address_t)lp; vm_size_t lsz = 0;
+            vm_region_basic_info_data_64_t lbi; mach_msg_type_number_t lcnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t lmo = MACH_PORT_NULL;
+            kern_return_t lkr = vm_region_64(mach_task_self(), &la, &lsz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&lbi, &lcnt, &lmo);
+            if (lkr != KERN_SUCCESS) {
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] seg[%zu]→L3[%zu] lp=%#llx vm_region_64 kr=%#x SKIP\n",
+                    tag, i, j, (unsigned long long)lp, lkr);
+                continue;
+            }
+            if (la > (vm_address_t)lp || (vm_address_t)(la + lsz) < (vm_address_t)lp + 256 || !(lbi.protection & VM_PROT_READ)) {
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] seg[%zu]→L3[%zu] lp=%#llx range/prot mismatch SKIP (la=%#llx end=%#llx prot=%#x)\n",
+                    tag, i, j, (unsigned long long)lp, (unsigned long long)la, (unsigned long long)(la + lsz), lbi.protection);
+                continue;
+            }
+            const uint8_t *lsb = (const uint8_t *)lp;
+            const uint32_t *lseg = (const uint32_t *)lp;
+            char w3[40]; snprintf(w3, sizeof w3, "seg[%zu]→L3[%zu]@%#llx", i, j, (unsigned long long)lp);
+            fprintf(stderr, "#### SUBMIT-DUMP[%s] %s head:", tag, w3);
+            for (size_t k = 0; k < 64; k++) fprintf(stderr, "%02x", lsb[k]);
+            fprintf(stderr, "\n");
+            size_t l3n = ((vm_address_t)(la + lsz) - (vm_address_t)lp) / 4;
+            if (l3n > 8192) l3n = 8192;
+            // Find 0x10000 magic at u32 index k — must ALSO be a real cmd-record
+            // (record[+0x30]=0x30 and record[+0x34] in 1..5), else it's a u32
+            // coincidence not a record start.
+            int found_magic = 0;
+            for (size_t k = 0; k + 0x34/4 < l3n; k++) {
+                if (lseg[k] != 0x10000 && lseg[k] != 0x10001) continue;
+                uint32_t maybe_type = lseg[k + 0x30/4];
+                uint32_t maybe_subtype = lseg[k + 0x34/4];
+                if (maybe_type != 0x30 || maybe_subtype < 1 || maybe_subtype > 5) {
+                    // coincidental magic — log but don't claim cmd-segment
+                    fprintf(stderr, "#### SUBMIT-DUMP[%s] %s pseudo-MAGIC %#x @+%#zx (type=%#x sub=%u not a real record)\n",
+                        tag, w3, lseg[k], k * 4, maybe_type, maybe_subtype);
+                    continue;
+                }
+                uint32_t maybe_size = lseg[k + 0x2c/4];
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] %s MAGIC %#x @+%#zx ← REAL CMD-SEGMENT (size=%#x type=%#x sub=%u)\n",
+                    tag, w3, lseg[k], k * 4, maybe_size, maybe_type, maybe_subtype);
+                // Dump 0x100 bytes around the magic for ground-truth inspection
+                size_t dump_start = k * 4 > 0x20 ? k * 4 - 0x20 : 0;
+                size_t dump_end   = (k * 4) + 0x80;
+                if (dump_end > l3n * 4) dump_end = l3n * 4;
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] %s record bytes @+%#zx..+%#zx:",
+                    tag, w3, dump_start, dump_end);
+                for (size_t b2 = dump_start; b2 < dump_end; b2++)
+                    fprintf(stderr, "%02x", lsb[b2]);
+                fprintf(stderr, "\n");
+                found_magic = 1;
+                break;
+            }
+            // Always scan for type=0x30 records — macws_scan_records will report
+            // matches (or 'NO type=0x30' if false)
+            macws_scan_records(tag, w3, lseg, l3n);
+            l3_dumped++;
+            (void)found_magic;
+        }
+        if (l3_dumped == 0) {
+            fprintf(stderr, "#### SUBMIT-DUMP[%s] seg[%zu] L3 inspected=%d dumped=0 (all u64s outside user-VA range / sentinels)\n",
+                tag, i, l3_inspected);
+        }
+
         // 0x115xxxxxxx HUNT: scan EVERY u64 in the segment for the GPU-fault-VA range. This is the
         // userland-built data structure containing the 0x115xxxxxxx that the GPU later reads.
         // Scan a bigger window (segn is u32 count; treat as u64 pairs).
