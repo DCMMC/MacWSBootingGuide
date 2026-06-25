@@ -6882,6 +6882,25 @@ static void macws_dump_submit(const char *tag, const uint64_t *in, uint32_t inCn
         macws_scan_records(tag, w, seg, segn);
         for (size_t j = 0; j < segn; j++)
             if (seg[j] == 0x10000 || seg[j] == 0x10001) { fprintf(stderr, "#### SUBMIT-DUMP[%s] %s MAGIC %#x @+%#zx\n", tag, w, seg[j], j * 4); break; }
+        // 0x115xxxxxxx HUNT: scan EVERY u64 in the segment for the GPU-fault-VA range. This is the
+        // userland-built data structure containing the 0x115xxxxxxx that the GPU later reads.
+        // Scan a bigger window (segn is u32 count; treat as u64 pairs).
+        const uint64_t *u64seg = (const uint64_t *)pp;
+        size_t u64n = ((vm_address_t)(a + sz) - (vm_address_t)pp) / 8; if (u64n > 16384) u64n = 16384;
+        int va_hits = 0;
+        for (size_t j = 0; j < u64n && va_hits < 8; j++) {
+            uint64_t v = u64seg[j];
+            if (v >= 0x1100000000ULL && v < 0x1200000000ULL) {
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] %s VA-HIT @+%#zx val=%#llx ctx:",
+                    tag, w, j * 8, (unsigned long long)v);
+                size_t cs_start = j * 8 > 32 ? j * 8 - 32 : 0;
+                size_t cs_end   = j * 8 + 64; if (cs_end > u64n * 8) cs_end = u64n * 8;
+                for (size_t k = cs_start; k < cs_end; k++)
+                    fprintf(stderr, "%02x", sb[k]);
+                fprintf(stderr, "\n");
+                va_hits++;
+            }
+        }
     }
 }
 
