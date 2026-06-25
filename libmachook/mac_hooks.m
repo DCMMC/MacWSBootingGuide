@@ -6954,6 +6954,44 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    // USC-SIZE-FILL (gated /tmp/macws_usc_size_fill): the chroot's macOS AGXMetal13_3 passes
+    // +0x40 = 0 (the size field) for ALL sel=9 ResCreate calls. The iOS kernel responds with
+    // large per-class default sizes (128MB / 384MB / 896MB). But macOS-AGXMetal13_3's encoded USC
+    // descriptors are calibrated for SMALL sizes -- when the kernel gives it a huge region, the
+    // shader-baked offsets land within the region but outside the buffer macOS-AGXMetal "expects",
+    // causing GPU page-fault at 0x115xxxxxxx.
+    //
+    // FIX (from iosblit_iokit_probe captured data, 2026-06-25): explicitly fill +0x40 with the
+    // sizes iOS-native iosblit uses for each class tag:
+    //   v10 = 0x43001000101  -> +0x40 = 0x8000   (32 KB)   [USC chunk]
+    //   v10 = 0x47001000101  -> +0x40 = 0x20000  (128 KB)  [page]
+    //   v10 = 0x843001000101 -> +0x40 = 0x8000   (32 KB)   [parent]
+    //   v10 = 0xc3001000101  -> +0x40 = 0x20000  (128 KB)  [op]
+    //   v10 = 0x800001000101 -> +0x40 = 0x10000  (64 KB)
+    //   v10 = 0x1000101      -> +0x40 = 0x10000  (64 KB)
+    if (selector == 0x9 && inStruct && inStructCnt >= 0x48 && IOConnectIsIOGPU(client) && !skip &&
+        access("/tmp/macws_usc_size_fill", F_OK) == 0) {
+        uint64_t v10 = *(uint64_t *)((uintptr_t)inStruct + 0x10);
+        uint64_t *sz_ptr = (uint64_t *)((uintptr_t)inStruct + 0x40);
+        uint64_t old = *sz_ptr;
+        uint64_t newsz = 0;
+        if (old == 0) {
+            switch (v10) {
+                case 0x43001000101ULL:  newsz = 0x8000;  break;
+                case 0x47001000101ULL:  newsz = 0x20000; break;
+                case 0x843001000101ULL: newsz = 0x8000;  break;
+                case 0xc3001000101ULL:  newsz = 0x20000; break;
+                case 0x800001000101ULL: newsz = 0x10000; break;
+                case 0x1000101ULL:      newsz = 0x10000; break;
+            }
+        }
+        if (newsz) {
+            *sz_ptr = newsz;
+            static int fn = 0;
+            if (fn++ < 32) fprintf(stderr, "#### USC-SIZE-FILL v10=%#llx +0x40: %#llx -> %#llx\n",
+                (unsigned long long)v10, (unsigned long long)old, (unsigned long long)newsz);
+        }
+    }
     // USC-CHUNK-SIZE-BUMP (gated /tmp/macws_usc_chunk_bump): the chroot's macOS AGXMetal13_3 asks
     // for USC chunks of 128 MB (in+0x40 = 0x8000000) with in+0x10 = 0x43001000101. Bump each chunk
     // to 384 MB (0x18000000) — kernel HAS shown it accepts that size (regions 0x16/0x18/0x1e in
@@ -6965,7 +7003,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         uint64_t *sz_ptr = (uint64_t *)((uintptr_t)inStruct + 0x40);
         // Diagnostic: ALWAYS log to confirm path runs
         static int diag = 0;
-        if (diag++ < 8) fprintf(stderr, "#### USC-CHUNK-DIAG sel=%u inSC=%zu skip=%d v10=%#llx sz=%#llx\n",
+        if (diag++ < 200) fprintf(stderr, "#### USC-CHUNK-DIAG sel=%u inSC=%zu skip=%d v10=%#llx sz=%#llx\n",
             selector, inStructCnt, skip, (unsigned long long)v10, (unsigned long long)*sz_ptr);
         // USC chunk pattern: in+0x10 == 0x43001000101 AND in+0x40 == 128 MB
         if (v10 == 0x43001000101ULL && *sz_ptr == 0x8000000ULL) {
