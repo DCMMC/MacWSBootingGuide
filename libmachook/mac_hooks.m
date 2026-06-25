@@ -6959,16 +6959,24 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     // (class 0x43001000101). Shader expects contiguous multi-GB region. Bump chunk size to 4 GB
     // so the 3.8 GB offset fits within one mapped chunk.
     //
-    // Reverse direction from the iosblit-based SIZE-FILL: that filled small sizes (iosblit's
-    // run-time), but the chroot needs LARGER per-class allocation than the kernel's default.
+    // SIZE-FILL SWEEP MODE: read size from env var MACWS_USC_SIZE (hex). Lets us sweep different
+    // sizes without rebuilding libmachook. Empty env -> fall back to 4 GB (legacy behavior).
     if (selector == 0x9 && inStruct && inStructCnt >= 0x48 && IOConnectIsIOGPU(client) && !skip &&
         access("/tmp/macws_usc_chunk_big", F_OK) == 0) {
         uint64_t v10 = *(uint64_t *)((uintptr_t)inStruct + 0x10);
         uint64_t *sz_ptr = (uint64_t *)((uintptr_t)inStruct + 0x40);
         if (v10 == 0x43001000101ULL && *sz_ptr == 0) {
-            *sz_ptr = 0x100000000ULL;  // 4 GB (covers the observed 3.8 GB shader offset)
+            uint64_t newsz = 0x100000000ULL;  // default 4 GB
+            const char *env = getenv("MACWS_USC_SIZE");
+            if (env && *env) {
+                char *endp = NULL;
+                uint64_t v = strtoull(env, &endp, 0);
+                if (endp != env && v > 0) newsz = v;
+            }
+            *sz_ptr = newsz;
             static int bn = 0;
-            if (bn++ < 8) fprintf(stderr, "#### USC-CHUNK-BIG +0x40: 0 -> 0x100000000 (4 GB) for v10=0x43001000101\n");
+            if (bn++ < 12) fprintf(stderr, "#### USC-CHUNK-BIG +0x40: 0 -> %#llx for v10=0x43001000101\n",
+                (unsigned long long)newsz);
         }
     }
     // USC-SIZE-FILL (gated /tmp/macws_usc_size_fill): the chroot's macOS AGXMetal13_3 passes
