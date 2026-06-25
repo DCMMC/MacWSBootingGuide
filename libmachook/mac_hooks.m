@@ -7774,10 +7774,12 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t in10 = 0, in40 = 0;
             memcpy(&in10, ib + 0x10, 8);
             memcpy(&in40, ib + 0x40, 8);
-            uint64_t gpu_va = 0, cpu_va = 0, sz = 0;
+            uint64_t gpu_va = 0, cpu_va = 0, sz = 0, out18 = 0;
             memcpy(&gpu_va, ob + 0x00, 8);
             memcpy(&cpu_va, ob + 0x08, 8);
             memcpy(&sz,     ob + 0x20, 8);
+            memcpy(&out18,  ob + 0x18, 8);
+            unsigned region = (unsigned)(out18 >> 32) & 0xff;
             // Track in a static inventory so SUBMIT-DUMP can correlate
             extern struct macws_rescpuva_inv_e g_rescpuva_inv[];
             extern _Atomic int g_rescpuva_n;
@@ -7789,9 +7791,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 g_rescpuva_inv[slot].cls  = in10;
                 g_rescpuva_inv[slot].id   = rcid;
             }
-            fprintf(stderr, "#### RES-CPUVA #%d in+0x10=%#llx in+0x40=%#llx | "
+            fprintf(stderr, "#### RES-CPUVA #%d region=0x%02x in+0x10=%#llx in+0x40=%#llx | "
                             "gpu=%#llx cpu=%#llx size=%#llx outSC=%zu\n",
-                rcid,
+                rcid, region,
                 (unsigned long long)in10, (unsigned long long)in40,
                 (unsigned long long)gpu_va, (unsigned long long)cpu_va,
                 (unsigned long long)sz,
