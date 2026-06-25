@@ -7700,6 +7700,41 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     IOReturn r = (t82_hit || t82_free_sw)
         ? (IOReturn)0 /* kIOReturnSuccess */
         : IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+
+    // RES-CPUVA (gated /tmp/macws_res_cpuva): runtime test 2026-06-25 showed
+    // IOConnectMapMemory64 is NEVER called by chroot WS (mapdiag.log empty),
+    // so the cmd-record buffer for sel=0x1a SubmitCommandBuffers must be
+    // shared via sel=0x9 ResCreate's output: kernel returns out+0x08 = CPU
+    // VA (RE'd as `cpu` in Asahi-style agx_allocate_resource_resp). Log first
+    // 32 successful sel=0x9 calls' { input class word, returned CPU VA,
+    // GPU VA, size } for inventory — then we know which (small set of) CPU
+    // VAs to scan for type=0x30 records on sel=0x1a submit.
+    if (selector == 0x9 && r == 0 && IOConnectIsIOGPU(client) &&
+        outStruct && outStructCnt && *outStructCnt >= 0x30 &&
+        inStruct && inStructCnt >= 0x48 &&
+        access("/tmp/macws_res_cpuva", F_OK) == 0) {
+        static _Atomic int rcn = 0;
+        int rcid = atomic_fetch_add(&rcn, 1);
+        if (rcid < 32) {
+            const uint8_t *ob = (const uint8_t *)outStruct;
+            const uint8_t *ib = (const uint8_t *)inStruct;
+            uint64_t in10 = 0, in40 = 0;
+            memcpy(&in10, ib + 0x10, 8);
+            memcpy(&in40, ib + 0x40, 8);
+            uint64_t gpu_va = 0, cpu_va = 0, sz = 0;
+            memcpy(&gpu_va, ob + 0x00, 8);
+            memcpy(&cpu_va, ob + 0x08, 8);
+            memcpy(&sz,     ob + 0x20, 8);
+            fprintf(stderr, "#### RES-CPUVA #%d in+0x10=%#llx in+0x40=%#llx | "
+                            "gpu=%#llx cpu=%#llx size=%#llx outSC=%zu\n",
+                rcid,
+                (unsigned long long)in10, (unsigned long long)in40,
+                (unsigned long long)gpu_va, (unsigned long long)cpu_va,
+                (unsigned long long)sz,
+                outStructCnt ? *outStructCnt : 0);
+        }
+    }
+
     // REGION-DIFF (gated /tmp/macws_regiondiff): for every successful sel=9 ResCreate, log the input
     // args bytes alongside which region the kernel returned (out+0x18 high nibble). One line per
     // unique (input-hash, region) so we can byte-diff a 0x11 (USC) request vs a 0x15 (GEM) request
