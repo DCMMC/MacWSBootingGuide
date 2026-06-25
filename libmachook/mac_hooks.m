@@ -6840,6 +6840,13 @@ __attribute__((visibility("default"))) io_connect_t macws_get_agx_conn(void) {
 // command record isn't {type=0x30, size=0x1a8, next=size+0x30}. Dump+compare WS (valid) vs mine.
 _Atomic int g_dump_my_submit = 0;
 
+// RES-CPUVA inventory — filled by sel=0x9 hook in IOConnectCallMethod_new,
+// read by SUBMIT-DUMP RES-CORR (in macws_dump_submit) to map cmd-buffer ptrs
+// back to their containing GPU resource.
+struct macws_rescpuva_inv_e { uint64_t cpu, gpu, size; uint64_t cls; int id; };
+struct macws_rescpuva_inv_e g_rescpuva_inv[1024];
+_Atomic int g_rescpuva_n = 0;
+
 static void macws_scan_records(const char *tag, const char *where, const uint32_t *p, size_t n_u32) {
     // Record header layout (RE-confirmed 2026-06-25 via capstone disasm of
     // iOS XNU AGXCommandQueue::processSegmentKernelCommand @0xfffffe00086e2274):
@@ -6920,6 +6927,50 @@ static void macws_dump_submit(const char *tag, const uint64_t *in, uint32_t inCn
     fprintf(stderr, "#### SUBMIT-DUMP[%s] inStruct head:", tag);
     for (size_t i = 0; i < inStructCnt && i < 64; i++) fprintf(stderr, "%02x", b[i]);
     fprintf(stderr, "\n");
+
+    // RES-CORR: correlate inStruct's ptrs at +0x10/+0x18 with the RES-CPUVA
+    // inventory built by sel=0x9 hook. Tells us which (resource_id, offset
+    // within resource) the cmd-buffer ptrs land inside — proving that
+    // cmd-records live INSIDE a ResCreate-returned CPU-mapped buffer (rather
+    // than separate malloc).
+    extern struct macws_rescpuva_inv_e g_rescpuva_inv[];
+    extern _Atomic int g_rescpuva_n;
+    int inv_n = atomic_load(&g_rescpuva_n);
+    if (inv_n > 1024) inv_n = 1024;
+    if (inStructCnt >= 0x20 && inv_n > 0) {
+        uint64_t p10 = 0, p18 = 0;
+        memcpy(&p10, b + 0x10, 8);
+        memcpy(&p18, b + 0x18, 8);
+        for (int pi = 0; pi < 2; pi++) {
+            uint64_t pp = pi == 0 ? p10 : p18;
+            if (pp == 0) continue;
+            int found = -1; uint64_t off = 0;
+            for (int k = 0; k < inv_n; k++) {
+                if (g_rescpuva_inv[k].cpu == 0) continue;
+                if (pp >= g_rescpuva_inv[k].cpu && pp < g_rescpuva_inv[k].cpu + g_rescpuva_inv[k].size) {
+                    found = k;
+                    off = pp - g_rescpuva_inv[k].cpu;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] RES-CORR inStruct+0x%x ptr=%#llx → "
+                                "Res#%d (cls=%#llx cpu=%#llx size=%#llx gpu=%#llx) offset=%#llx\n",
+                    tag, pi == 0 ? 0x10 : 0x18,
+                    (unsigned long long)pp,
+                    g_rescpuva_inv[found].id,
+                    (unsigned long long)g_rescpuva_inv[found].cls,
+                    (unsigned long long)g_rescpuva_inv[found].cpu,
+                    (unsigned long long)g_rescpuva_inv[found].size,
+                    (unsigned long long)g_rescpuva_inv[found].gpu,
+                    (unsigned long long)off);
+            } else {
+                fprintf(stderr, "#### SUBMIT-DUMP[%s] RES-CORR inStruct+0x%x ptr=%#llx → NOT in any RES-CPUVA range (inv_n=%d)\n",
+                    tag, pi == 0 ? 0x10 : 0x18, (unsigned long long)pp, inv_n);
+            }
+        }
+    }
+
     macws_scan_records(tag, "inStruct", (const uint32_t *)inStruct, inStructCnt / 4);
     // follow plausible pointers in inStruct to the command-stream segment(s)
     const uint64_t *u = (const uint64_t *)inStruct;
@@ -7211,8 +7262,10 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     if ((orig == 0x1e || selector == 0x1e) && IOConnectIsIOGPU(client) && access("/tmp/macws_submit_dump", F_OK) == 0) {
         int mine = atomic_load(&g_dump_my_submit);
         static int n_dumped = 0;
-        // Dump up to 8 submits regardless of WS/MY tag — see all PASS1/PASS2 cmd bytes
-        if (n_dumped < 8) {
+        // Dump up to 50 submits (was 8) to capture later submits when RES-CPUVA
+        // inventory is more populated — cmd-buffer storage resource may be
+        // allocated AFTER the first few submits.
+        if (n_dumped < 50) {
             n_dumped++;
             char tag[16]; snprintf(tag, sizeof tag, "%s#%d", mine ? "MY" : "WS", n_dumped);
             macws_dump_submit(tag, in, inCnt, inStruct, inStructCnt);
@@ -7715,7 +7768,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         access("/tmp/macws_res_cpuva", F_OK) == 0) {
         static _Atomic int rcn = 0;
         int rcid = atomic_fetch_add(&rcn, 1);
-        if (rcid < 32) {
+        if (rcid < 1024) {
             const uint8_t *ob = (const uint8_t *)outStruct;
             const uint8_t *ib = (const uint8_t *)inStruct;
             uint64_t in10 = 0, in40 = 0;
@@ -7725,6 +7778,17 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             memcpy(&gpu_va, ob + 0x00, 8);
             memcpy(&cpu_va, ob + 0x08, 8);
             memcpy(&sz,     ob + 0x20, 8);
+            // Track in a static inventory so SUBMIT-DUMP can correlate
+            extern struct macws_rescpuva_inv_e g_rescpuva_inv[];
+            extern _Atomic int g_rescpuva_n;
+            int slot = atomic_fetch_add(&g_rescpuva_n, 1);
+            if (slot < 1024) {
+                g_rescpuva_inv[slot].cpu  = cpu_va;
+                g_rescpuva_inv[slot].gpu  = gpu_va;
+                g_rescpuva_inv[slot].size = sz;
+                g_rescpuva_inv[slot].cls  = in10;
+                g_rescpuva_inv[slot].id   = rcid;
+            }
             fprintf(stderr, "#### RES-CPUVA #%d in+0x10=%#llx in+0x40=%#llx | "
                             "gpu=%#llx cpu=%#llx size=%#llx outSC=%zu\n",
                 rcid,
