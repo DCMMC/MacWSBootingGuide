@@ -6935,6 +6935,29 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    // USC-HEAP-BUMP (gated /tmp/macws_usc_bump): on the FIRST ResCreate matching the USC-parent
+    // sentinel (`+0x10 = 0x843001000101`, baseline `+0x40 = 0x38000000` = ~0.875GB), increase
+    // size at `+0x40` so subsequent USC chunks fall INSIDE one large region 0x11 instead of
+    // being scattered across regions 0x0b..0x1b. Bound: cap to 0x100000000 (4GB) — covers the
+    // observed 3.8GB shader offset. Mutates the input IN PLACE before the kernel sees it.
+    if (selector == 0x9 && inStruct && inStructCnt >= 0x48 && IOConnectIsIOGPU(client) && !skip &&
+        access("/tmp/macws_usc_bump", F_OK) == 0) {
+        uint64_t v10 = *(uint64_t *)((uintptr_t)inStruct + 0x10);
+        uint64_t sz0 = *(uint64_t *)((uintptr_t)inStruct + 0x40);
+        // Debug: log every sel=9 we see while the gate is on
+        static int dbgn = 0;
+        if (dbgn++ < 6) fprintf(stderr, "#### USC-HEAP-BUMP-CHECK +0x10=%#llx +0x40=%#llx\n",
+            (unsigned long long)v10, (unsigned long long)sz0);
+        if (v10 == 0x843001000101ULL) {                              // the USC-parent sentinel (LE u64 at +0x10)
+            uint64_t *sz = (uint64_t *)((uintptr_t)inStruct + 0x40);
+            uint64_t old = *sz;
+            if (old == 0x38000000ULL) {                              // only on baseline value
+                *sz = 0x100000000ULL;                                 // 4GB
+                fprintf(stderr, "#### USC-HEAP-BUMP +0x40: %#llx -> %#llx (USC parent region)\n",
+                    (unsigned long long)old, (unsigned long long)*sz);
+            }
+        }
+    }
     // USC-REDIRECT at submit (sel 0x1a/0x1e = AGX command-buffer submit), BEFORE the orig call so the GPU sees it.
     if ((orig == 0x1a || orig == 0x1e || selector == 0x1a) && IOConnectIsIOGPU(client) && !skip &&
         access("/tmp/macws_uscredir", F_OK) == 0) {
