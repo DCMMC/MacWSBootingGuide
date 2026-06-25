@@ -6954,6 +6954,23 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+    // USC-CHUNK-BIG (gated /tmp/macws_usc_chunk_big): inverse experiment. The chroot's shader
+    // faults at 0x115xxxxxxx = ~3.8 GB into region 0x11. Region 0x11 is a 128 MB USC chunk
+    // (class 0x43001000101). Shader expects contiguous multi-GB region. Bump chunk size to 4 GB
+    // so the 3.8 GB offset fits within one mapped chunk.
+    //
+    // Reverse direction from the iosblit-based SIZE-FILL: that filled small sizes (iosblit's
+    // run-time), but the chroot needs LARGER per-class allocation than the kernel's default.
+    if (selector == 0x9 && inStruct && inStructCnt >= 0x48 && IOConnectIsIOGPU(client) && !skip &&
+        access("/tmp/macws_usc_chunk_big", F_OK) == 0) {
+        uint64_t v10 = *(uint64_t *)((uintptr_t)inStruct + 0x10);
+        uint64_t *sz_ptr = (uint64_t *)((uintptr_t)inStruct + 0x40);
+        if (v10 == 0x43001000101ULL && *sz_ptr == 0) {
+            *sz_ptr = 0x100000000ULL;  // 4 GB (covers the observed 3.8 GB shader offset)
+            static int bn = 0;
+            if (bn++ < 8) fprintf(stderr, "#### USC-CHUNK-BIG +0x40: 0 -> 0x100000000 (4 GB) for v10=0x43001000101\n");
+        }
+    }
     // USC-SIZE-FILL (gated /tmp/macws_usc_size_fill): the chroot's macOS AGXMetal13_3 passes
     // +0x40 = 0 (the size field) for ALL sel=9 ResCreate calls. The iOS kernel responds with
     // large per-class default sizes (128MB / 384MB / 896MB). But macOS-AGXMetal13_3's encoded USC
