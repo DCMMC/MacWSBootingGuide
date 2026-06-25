@@ -7432,6 +7432,30 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     IOReturn r = (t82_hit || t82_free_sw)
         ? (IOReturn)0 /* kIOReturnSuccess */
         : IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // REGION-DIFF (gated /tmp/macws_regiondiff): for every successful sel=9 ResCreate, log the input
+    // args bytes alongside which region the kernel returned (out+0x18 high nibble). One line per
+    // unique (input-hash, region) so we can byte-diff a 0x11 (USC) request vs a 0x15 (GEM) request
+    // and find the exact input byte that selects region.
+    if (selector == 0x9 && r == 0 && IOConnectIsIOGPU(client) && outStruct && outStructCnt &&
+        *outStructCnt >= 0x20 && inStruct && inStructCnt >= 0x60 && access("/tmp/macws_regiondiff", F_OK) == 0) {
+        uint64_t out18 = *(const uint64_t *)((const uint8_t *)outStruct + 0x18);
+        unsigned region = (unsigned)(out18 >> 32) & 0xff;
+        // Dedupe by (region, first 16 bytes of input) — only log distinct shapes per region.
+        static struct { unsigned region; uint64_t sig[2]; } seen[32];
+        static int nseen = 0;
+        uint64_t s0, s1; memcpy(&s0, inStruct, 8); memcpy(&s1, (const uint8_t*)inStruct+8, 8);
+        int dup = 0;
+        for (int i = 0; i < nseen; i++)
+            if (seen[i].region == region && seen[i].sig[0] == s0 && seen[i].sig[1] == s1) { dup = 1; break; }
+        if (!dup && nseen < 32) {
+            seen[nseen].region = region; seen[nseen].sig[0] = s0; seen[nseen].sig[1] = s1; nseen++;
+            fprintf(stderr, "#### REGION-DIFF region=0x%02x out+0x18=%#llx inSC=%zu in:",
+                region, (unsigned long long)out18, inStructCnt);
+            const uint8_t *ib = (const uint8_t *)inStruct;
+            for (size_t k = 0; k < inStructCnt && k < 0x68; k++) fprintf(stderr, "%02x", ib[k]);
+            fprintf(stderr, "\n");
+        }
+    }
     // USC-TRACE (gated /tmp/macws_usctrace): the chroot DOES get region 0x11 (USC) assigned -> some
     // AGXMetal function deliberately requested a USC/parameter heap. Capture the call chain at the
     // moment a region-0x11 resource is created (out+0x18 = 0x11<<32) to find THAT function (and any
