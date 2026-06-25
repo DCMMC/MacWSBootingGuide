@@ -7149,6 +7149,51 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int skip = caller_is_libmachook(__builtin_return_address(0));
     if (!skip) selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && selector == 0x9) atomic_store(&g_agx_conn, client);
+
+    // USC-PARENT-BUMP (gated /tmp/macws_usc_parent_bump): RES-CPUVA capture
+    // 2026-06-25 (commit 7de55b2) shows 3 sel=9 calls with class=0x843001000101
+    // ("big USC parent"):
+    //   #0  region 0x01: size=0x38000000 (896 MB) requested, kernel grants full
+    //   #19 region 0x14: size=0x48000000 (1.125 GB) requested, kernel caps to 0x8000 (32 KB)
+    //   #20 region 0x15: size=0x48000000 (1.125 GB) requested, kernel caps to 0x8000 (32 KB)
+    // Hypothesis: per-task USC-parent budget cap. The 2nd/3rd big-USC-parent
+    // requests get truncated; the shader likely expects ALL THREE to be its
+    // code page heap. Getting 32 KB for 2/3 of them is why shader faults at
+    // ~0x1168xxxxxx (3.8 GB into a region it thinks is huge).
+    //
+    // TEST: bump every big-USC-parent request to a uniform large size before
+    // it hits the kernel. If kernel honors all three at the bigger size, the
+    // shader's code address space is contiguous and the fault should move/go.
+    // If kernel keeps the budget cap, this proves the cap is structural.
+    if (selector == 0x9 && inStruct && inStructCnt >= 0x48 && IOConnectIsIOGPU(client) && !skip &&
+        access("/tmp/macws_usc_parent_bump", F_OK) == 0) {
+        uint64_t v10 = *(uint64_t *)((uintptr_t)inStruct + 0x10);
+        uint64_t *sz_ptr = (uint64_t *)((uintptr_t)inStruct + 0x40);
+        // Diag: log EVERY sel=9 call entry (gated) to confirm gate is reached
+        static _Atomic int diagn = 0;
+        int didx = atomic_fetch_add(&diagn, 1);
+        if (didx < 40) fprintf(stderr, "#### USC-PARENT-DIAG #%d skip=%d v10=%#llx +0x40=%#llx\n",
+            didx, skip, (unsigned long long)v10, (unsigned long long)*sz_ptr);
+        if (v10 == 0x843001000101ULL) {
+            uint64_t old = *sz_ptr;
+            // Try: force same size kernel granted for #0 (0x38000000 = 896 MB)
+            // for ALL big-USC-parent requests. Hypothesis: subsequent requests
+            // get truncated because kernel sees +0x40=0 (defer) and thinks
+            // "task already has 896 MB, give scraps." If we explicitly ask for
+            // 896 MB each, maybe kernel honors all three.
+            uint64_t target = 0x38000000ULL;   // 896 MB — kernel-known-good
+            if (old != target) {
+                static _Atomic int pbn = 0;
+                int pbid = atomic_fetch_add(&pbn, 1);
+                *sz_ptr = target;
+                if (pbid < 12) {
+                    fprintf(stderr, "#### USC-PARENT-BUMP #%d v10=0x843001000101 +0x40: %#llx -> %#llx\n",
+                        pbid, (unsigned long long)old, (unsigned long long)*sz_ptr);
+                }
+            }
+        }
+    }
+
     // USC-CHUNK-BIG (gated /tmp/macws_usc_chunk_big): inverse experiment. The chroot's shader
     // faults at 0x115xxxxxxx = ~3.8 GB into region 0x11. Region 0x11 is a 128 MB USC chunk
     // (class 0x43001000101). Shader expects contiguous multi-GB region. Bump chunk size to 4 GB
