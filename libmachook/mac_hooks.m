@@ -6908,10 +6908,15 @@ static int macws_usc_redirect(const void *inStruct, size_t inStructCnt) {
         if ((bi.protection & (VM_PROT_READ|VM_PROT_WRITE)) == (VM_PROT_READ|VM_PROT_WRITE) && sz <= 0x2000000) {
             uint8_t *base = (uint8_t *)a;
             for (size_t j = 0; j + 8 <= sz; j += 4) {
-                uint64_t v; memcpy(&v, base + j, 8);
-                if (v >= 0x1100000000ULL && v < 0x1200000000ULL) {
-                    uint64_t nv = v + 0x400000000ULL; memcpy(base + j, &nv, 8);
-                    if (total < 12) fprintf(stderr, "#### USC-REDIR @%#llx %#llx -> %#llx\n",
+                uint64_t v; memcpy(&v, base + j, 8); uint64_t nv = 0;
+                // TARGETED: only the ENCODED USC descriptor (x9 = (VA>>2)|bit41, region 0x11 in bits
+                // 30-37 -> the encoded word lands in [0x20440000000, 0x20480000000)). +0x1<<32 makes
+                // it region 0x15 (the mapped GEM alias). Raw-0x11xx broad sweep removed (it corrupted
+                // unrelated data + muddied the test).
+                if (v >= 0x20440000000ULL && v < 0x20480000000ULL) nv = v + 0x100000000ULL;
+                if (nv) {
+                    memcpy(base + j, &nv, 8);
+                    if (total < 16) fprintf(stderr, "#### USC-REDIR @%#llx %#llx -> %#llx\n",
                         (unsigned long long)(a + j), (unsigned long long)v, (unsigned long long)nv);
                     total++;
                 }
@@ -7426,6 +7431,34 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     IOReturn r = (t82_hit || t82_free_sw)
         ? (IOReturn)0 /* kIOReturnSuccess */
         : IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // USC-TRACE (gated /tmp/macws_usctrace): the chroot DOES get region 0x11 (USC) assigned -> some
+    // AGXMetal function deliberately requested a USC/parameter heap. Capture the call chain at the
+    // moment a region-0x11 resource is created (out+0x18 = 0x11<<32) to find THAT function (and any
+    // follow-up USC-map call it expects). Also dumps the input (the type/flag that requests USC).
+    if (selector == 0x9 && r == 0 && IOConnectIsIOGPU(client) && outStruct && outStructCnt &&
+        *outStructCnt >= 0x20 && access("/tmp/macws_usctrace", F_OK) == 0) {
+        uint64_t out18 = *(const uint64_t *)((const uint8_t *)outStruct + 0x18);
+        if (out18 >= 0x1100000000ULL && out18 < 0x1200000000ULL) {   // region 0x11 = USC
+            static int utn = 0;
+            if (utn++ < 4) {
+                fprintf(stderr, "#### USC-TRACE region-0x11 ResCreate out+0x18=%#llx inSC=%zu in[0..0x30]:",
+                    (unsigned long long)out18, inStructCnt);
+                const uint8_t *ib = (const uint8_t *)inStruct;
+                for (size_t k = 0; inStruct && k < inStructCnt && k < 0x30; k++) fprintf(stderr, "%02x", ib[k]);
+                fprintf(stderr, "\n");
+                void *frames[24]; int nf = backtrace(frames, 24);
+                for (int i = 1; i < nf; i++) {
+                    Dl_info di;
+                    if (dladdr(frames[i], &di) && di.dli_fname) {
+                        const char *fn = strrchr(di.dli_fname, '/'); fn = fn ? fn + 1 : di.dli_fname;
+                        fprintf(stderr, "####   [%d] %s %s+%#llx\n", i, fn,
+                            di.dli_sname ? di.dli_sname : "?",
+                            (unsigned long long)((uintptr_t)frames[i] - (uintptr_t)(di.dli_saddr ? di.dli_saddr : di.dli_fbase)));
+                    } else fprintf(stderr, "####   [%d] %p\n", i, frames[i]);
+                }
+            }
+        }
+    }
     // VASCAN (gated /tmp/macws_vascan): hunt the 0x11xx fixed-region base (the BIF0 fault VA range,
     // 0x1168000000) in the IOConnect traffic. If a config input/output carries a 0x11xx value -> patch
     // that field to a mapped 0x15xx base. If 0x11xx is absent everywhere -> it is AGXMetal-internal
