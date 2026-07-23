@@ -29,6 +29,21 @@ _return_contexts = {}
 _awaiting_agx_open = 0
 
 
+# Exact unslid function VAs from the iPad13,6 iOS 16.3.1 (20D67) binaries.
+# They are a fallback for Command Line Tools LLDB, which can enumerate the
+# remote dyld shared cache in partial mode but has no local cache symbol file.
+# Normal symbol breakpoints remain preferred whenever they resolve.
+_IOS_20D67_IOKIT_TEXT_BASE = 0x18EE63000
+_IOS_20D67_FALLBACKS = {
+    "IOConnectCallMethod": 0x18EE664F4,
+    "IOConnectCallStructMethod": 0x18EE664B0,
+    "IOServiceOpen": 0x18EE79FAC,
+    "-[IOGPUMetalDevice initWithAcceleratorPort:options:]": 0x1EEC5EFF4,
+    "IOGPUDeviceCreateWithAPIProperty": 0x1EEC63A18,
+    "IOGPUCommandQueueCreateWithQoS": 0x1EEC62A00,
+}
+
+
 def _reg(frame, name):
     return frame.FindRegister(name).GetValueAsUnsigned()
 
@@ -304,6 +319,23 @@ def io_connect_callback(frame, bp_location, internal_dict):
     return False
 
 
+def _ios_20d67_shared_cache_slide(target):
+    """Derive the shared-cache slide from the already-loaded IOKit image."""
+    for module in target.module_iter():
+        if module.GetFileSpec().GetFilename() != "IOKit":
+            continue
+        header = module.GetObjectFileHeaderAddress()
+        load_address = header.GetLoadAddress(target)
+        if load_address in (0, lldb.LLDB_INVALID_ADDRESS):
+            continue
+        slide = load_address - _IOS_20D67_IOKIT_TEXT_BASE
+        print("IOSCLEAR_IOGPU shared-cache IOKit-load=%#x slide=%#x" %
+              (load_address, slide))
+        return slide
+    print("IOSCLEAR_IOGPU shared-cache slide unavailable: IOKit not found")
+    return None
+
+
 def install(debugger):
     target = debugger.GetSelectedTarget()
     specifications = (
@@ -315,9 +347,25 @@ def install(debugger):
         ("IOGPUDeviceCreateWithAPIProperty", "api_create_callback"),
         ("IOGPUCommandQueueCreateWithQoS", "queue_function_callback"),
     )
+    slide = None
     for name, callback in specifications:
         breakpoint = target.BreakpointCreateByName(name)
         breakpoint.SetScriptCallbackFunction(
             "lldb_trace_iosclear_iogpu.%s" % callback)
         print("IOSCLEAR_IOGPU installed name=%s breakpoint=%d locations=%d" %
               (name, breakpoint.GetID(), breakpoint.GetNumLocations()))
+        if breakpoint.GetNumLocations() != 0:
+            continue
+        if slide is None:
+            slide = _ios_20d67_shared_cache_slide(target)
+        file_address = _IOS_20D67_FALLBACKS.get(name)
+        if slide is None or file_address is None:
+            continue
+        runtime_address = file_address + slide
+        fallback = target.BreakpointCreateByAddress(runtime_address)
+        fallback.SetScriptCallbackFunction(
+            "lldb_trace_iosclear_iogpu.%s" % callback)
+        print("IOSCLEAR_IOGPU installed-address name=%s file=%#x "
+              "runtime=%#x breakpoint=%d locations=%d" %
+              (name, file_address, runtime_address, fallback.GetID(),
+               fallback.GetNumLocations()))

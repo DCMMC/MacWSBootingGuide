@@ -8,12 +8,81 @@ is a VNC capture of GlassDemo with non-black content and a visibly rendered
 
 ## Target
 
-- Device: iPad13,6, iOS 16.3, arm64.
+- Device: iPad13,6, iOS 16.3.1 (20D67), arm64.
 - Guest: macOS 13.4 chroot.
 - Driver path: the real iOS AGX kernel driver (`MACWS_AGX_NATIVE=1`), not the
   MTLSim fallback.
 - Final witness: GlassDemo title bar, controls, and backdrop blur visible in a
   captured VNC frame.
+
+## 2026-07-24: native open options and bounded queue A/B
+
+### Runtime-confirmed: the native reference uses option `0x10`
+
+The project LLDB trace attached to the early-held iOS-native `iosclear_ref`
+and recorded the actual iPad13,6 values before the first render submit:
+
+```text
+IOSCLEAR_IOGPU DEVICE-INIT accelerator-port=0x2503 options=0x10
+IOSCLEAR_IOGPU API-CREATE accelerator-port=0x2503 options=0x10 expected-open-type=0x100001 api=b'Metal'
+IOSCLEAR_IOGPU AGX-OPEN service=0x2503 task=0x203 type=0x100001 connect-out=0x16d046bbc
+IOSCLEAR_IOGPU API-PROPERTY sel=0x6 len=0x10 bytes=4d 65 74 61 6c 00 00 00 00 00 00 00 00 00 00 00
+IOSCLEAR_IOGPU QUEUE-FUNCTION device=0xe3a8058b0 qos=0x2 priority=0x0
+IOSCLEAR_IOGPU QUEUE #1 sel=0x7 len=0x408 qos=0x2 priority=0x0 nonzero-bytes=199
+```
+
+Runtime artifact: `/tmp/lldb-iosclear-headless-fallback.log` on the
+development Mac. The trace also captured 33 successful resource-create
+entries before selector `0x1a`: 22 type-0 resources, 10 type-`0x80`
+resources, and one type-`0x82` resource. It stopped at the first submit and
+saved a `0x820`-byte native subtype-1 command.
+
+Command Line Tools LLDB had no local dyld shared-cache symbols and a full
+remote module load did not finish in four minutes. The trace runner now uses
+`target.memory-module-load-level=partial` and exact iOS 20D67 unslid function
+addresses as a fallback. The shared-cache slide is derived at runtime from
+the loaded IOKit image; symbol-name breakpoints remain preferred when they
+resolve. This is debugger instrumentation only.
+
+### Runtime-confirmed: open options change device state, not queue creation
+
+`misc/agx_iogpu_probe.c` was run in a bounded `queue` mode. It performs one
+API-property call, one selector-`0x7` queue create using the native
+QoS/priority values, and one device-info query; it skips all resource-shape
+fuzzing. Exact A/B results:
+
+```text
+type=1:
+  UC+0x128 options= 0
+  Device/AGXShared+0xd8 options = 0
+  sel=0x7 (queue-create) -> kr=0x0 (SUCCESS)
+  AGXCommandQueue ... +0x80c=0 +0x820=80 priority=3 qos=2
+
+type=0x100001:
+  UC+0x128 options= 0x10
+  Device/AGXShared+0xd8 options = 0x10
+  sel=0x7 (queue-create) -> kr=0x0 (SUCCESS)
+  AGXCommandQueue ... +0x80c=0 +0x820=80 priority=3 qos=2
+```
+
+Runtime artifact: `/tmp/agx-probe-queue-options-ab-v2.log`. Both runs used
+the same IOGPU singleton and reported all 16 IOGPUTask allocator slots as
+zero. The direct selector-`0x6` call returned `1` in both runs; because the
+native user-space function does not branch on that return before continuing,
+this probe result is not evidence of a missing prerequisite.
+
+This disproves the historical generalization that type 1 necessarily creates
+a degraded user client which cannot create a queue. It also proves that
+clearing the high word discards real native device state. It does **not**
+prove that preserving option `0x10` will fix first submit: the created queue
+fields are identical in this bounded comparison.
+
+Production `IOServiceOpen_new` now removes only macOS low-word platform bit 4,
+converting the macOS builder's `0x100005` to the native `0x100001`. The old
+high-word removal remains available only as the diagnostic
+`MACWS_AGX_STRIP_OPEN_OPTIONS`; `MACWS_AGX_FORCE_TYPE` remains an explicit A/B
+override. This is an upstream ABI correction, not a claim that GUI rendering
+is fixed.
 
 ## 2026-07-24: first render reaches the kernel, then returns raw `0x08`
 
@@ -175,13 +244,14 @@ fffffe0009f074c0 IOGPUTask::init(IOGPU*, task*, unsigned int,
                                  IORangeAllocator**)
 ```
 
-The one-argument `createUserGPUTask` implementation makes several calls and
-never materializes an allocator-array value in `x4` before calling the task
-initializer. That is static evidence that the count should be zero on this
-specific iOS AGX path, but the exact native runtime value is still required:
-the claim remains THEORY until LLDB captures it. Forcing options to zero
-before that capture remains a diagnostic ABI translation, not a root-cause
-fix.
+The earlier inference that the count “should therefore be zero” is
+runtime-disproved. Native LLDB captured option `0x10`, and the KRW probe read
+that same value from both UC `+0x128` and Device/AGXShared `+0xd8`; all 16
+IOGPUTask allocator slots were nevertheless zero. The exact relation between
+this option/count and the null allocator array still needs RE. What is already
+established is narrower: zero allocator slots are not evidence that the
+native option must be zero, and clearing it is not a valid production
+translation.
 
 Disassembly artifacts: `/tmp/ios-iogpu.disasm`,
 `/tmp/macos-iogpu.disasm`, `/tmp/iogpufamily-text.disasm`, and
@@ -203,10 +273,8 @@ before the read, this initializer checks a `dispatch_once` token at
 resulting halfword to `0x214430030` at `0x20ccc53dc`.
 
 Therefore zero-initialized BSS is not evidence that native uses options zero.
-The value is computed once and may still evaluate to zero on iPad13,6, but
-that is THEORY pending the prepared LLDB trace. This correction is important
-because it prevents treating the current high-word mask in
-`IOServiceOpen_new` as a proven production fix.
+Runtime LLDB has now resolved the value as `0x10` on this iPad13,6; the former
+production high-word mask was an actual divergence from the native ABI.
 
 The new field-dump portion of `misc/agx_iogpu_probe.c` uses only KRW reads for
 UC `+0x128`, AGXShared `+0xd8`, IOGPUDevice `+0x58`, and the 16 fixed
@@ -256,7 +324,7 @@ from a clean run identifies the failing stage.
 Disassembly artifacts: `/tmp/agx-allocate3DWorkQueue.disasm`,
 `/tmp/agxg13g-text.disasm`, and `/tmp/iogpufamily-text.disasm`.
 
-## Native trace prepared
+## Native trace completed
 
 `misc/iosclear_ref.m` now supports an early hold before
 `MTLCreateSystemDefaultDevice`, armed by `IOSCLEAR_EARLY_HOLD` or the sentinel
@@ -273,13 +341,13 @@ Disassembly artifacts: `/tmp/agx-allocate3DWorkQueue.disasm`,
   selector-`0x1a` submit.
 
 It saves bounded native queue/resource/KCMD payloads under
-`/tmp/iosclear-native-iogpu` on the device and stops at the first render submit.
+`/tmp/iosclear-native-iogpu` and stops at the first render submit.
 `misc/lldb_trace_iosclear_iogpu.lldb` drives the trace and emits a summary.
-
-Local validation: the ObjC method, API-property function, and queue-create
-function each resolve to one breakpoint location in the actual iOS 16.3
-binaries. IOKit import breakpoints remain pending until IOKit loads, as
-expected. Python bytecode compilation succeeds.
+The completed run recorded 51 IOGPU calls, one queue, 33 resources, and the
+first selector-`0x1a` submit. Entry arguments and copied payloads are reliable;
+the current per-call return-breakpoint implementation can collide when several
+calls share one return address, so pointer-shaped `RETURN status=` lines are
+not used as evidence.
 
 ## Native/macOS subtype-1 comparison
 
@@ -300,23 +368,17 @@ Artifacts on the development Mac:
 
 ## Next runtime experiment
 
-The device was unreachable at the end of this milestone (`No route to host` /
-`Host is down`), so no new kernel log could be collected.
-
-When it reconnects:
-
-1. Run `misc/cleanup_all.sh` before restarting WindowServer and collect the
-   existing AGX kernel log. Search specifically for `Failed to init work
-   queue`, `create GTP`, `init GTP`, `create PM`, and `Render Target Memory`.
-2. Run the early-held native `iosclear_ref` under the project LLDB trace and
-   capture the exact service-open type/options, API property, queue QoS,
-   priority byte, resource sequence, and first submit.
-3. Compare those values to the chroot path. Change the earliest confirmed
-   mismatch that feeds the failing work-queue stage; do not patch the raw-8
-   exit or force a success return.
-4. Use `/tmp/macws_stop_after_clear` for a single bounded WindowServer frame.
-   Require `clear-control executed=YES`, a non-black control pixel, then run
-   GlassDemo and capture the VNC blur witness.
+1. Build/deploy the native option preservation and the already-RE-confirmed
+   queue-payload preservation.
+2. Run `misc/cleanup_all.sh`, arm `/tmp/macws_stop_after_clear`, and start one
+   bounded WindowServer frame while collecting libmachook and live system
+   logs. Verify the actual chroot open type, selector-`0x7` result, queue
+   payload, and first-submit result.
+3. If raw `0x08` remains, identify its precise work-queue failure with a
+   runtime kernel log or LLDB register trace. Do not bypass the raw-8 exit or
+   force a success return.
+4. Require `clear-control executed=YES` and a non-black VNC control pixel,
+   then run GlassDemo and capture the final blur witness.
 
 ## Success criteria
 

@@ -17,7 +17,8 @@
 //   sudo /var/jb/usr/bin/jbctl trustcache add $(ldid -arch arm64 -h /tmp/agx_iogpu_probe \
 //        2>/dev/null | awk -F= '/CDHash/{print $2}')
 //   sudo /tmp/agx_iogpu_probe                         # fields only
-//   sudo /tmp/agx_iogpu_probe 1 AGXAccelerator exercise  # run call tests
+//   sudo /tmp/agx_iogpu_probe 1 AGXAccelerator queue     # one queue only
+//   sudo /tmp/agx_iogpu_probe 1 AGXAccelerator exercise  # resource call tests
 //
 // Decision matrix once we have numbers:
 //
@@ -89,7 +90,14 @@ static int load_libjb(void) {
     return 0;
 }
 
-static void probe_one(const char *match_class, uint32_t type, bool exercise) {
+typedef enum {
+    kProbeFieldsOnly,
+    kProbeQueueOnly,
+    kProbeExercise,
+} probe_mode_t;
+
+static void probe_one(const char *match_class, uint32_t type,
+                      probe_mode_t mode) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
         IOServiceMatching(match_class));
     if (!svc) {
@@ -138,11 +146,13 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
     if (!iogpu) { IOServiceClose(conn); return; }
 
     uint64_t vt_iogpu   = p_kread64(iogpu + 0x00);
-    uint64_t agx_options = p_kread64(iogpu + 0xd8);
+    // RE-confirmed via AGXShared::init: the receiver is the newly created
+    // IOGPUDevice subclass, not the IOGPU singleton at Device+0x48.
+    uint64_t agx_options = p_kread64(device + 0xd8);
     uint64_t cap_108    = p_kread64(iogpu + 0x108);
     uint32_t cap_224    = p_kread32(iogpu + 0x224);
     fprintf(stderr, "  IOGPU vtable    = %#llx\n", (unsigned long long)vt_iogpu);
-    fprintf(stderr, "  AGXShared+0xd8 options = %#llx\n",
+    fprintf(stderr, "  Device/AGXShared+0xd8 options = %#llx\n",
             (unsigned long long)agx_options);
     fprintf(stderr, "  IOGPU+0x108     = %#llx  (the size cap field)\n",
             (unsigned long long)cap_108);
@@ -168,7 +178,7 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
         }
     }
 
-    if (!exercise) {
+    if (mode == kProbeFieldsOnly) {
         fprintf(stderr,
                 "  fields-only: skipping resource/queue call tests\n");
         IOServiceClose(conn);
@@ -186,7 +196,7 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
     //   +0x40: pinned VA (same as +0x38)
     //   +0x48: 0x4000 (length)
     //   +0x60: 01 (mystery flag)
-    {
+    if (mode == kProbeExercise) {
         extern kern_return_t mach_vm_allocate(uint64_t target,
             uint64_t *addr, uint64_t size, int flags);
         struct shape {
@@ -261,7 +271,7 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
     //
     // Output struct: kernel writes a IOGPUResource ID/handle at args.out
     // outStructCnt = 0x50 (matches what macOS userland sends).
-    {
+    if (mode == kProbeExercise) {
         unsigned char in_args[0x70];
         unsigned char out_args[0x50];
         memset(in_args, 0, sizeof(in_args));
@@ -288,28 +298,26 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
         }
     }
 
-    // Hypothesis: iOS Metal calls sel=0x6 (set_api_property) FIRST, that sets
-    // up per-UC state (maybe writes UC->0x108 / device->0x224 / similar) that
-    // new_resource depends on. Let's try the sequence:
-    //   1. sel=0x6 with zeroed 0x408 inStruct (we just confirmed this works)
-    //   2. sel=0x9 with type=0 heap-create
-    // If sel=0x9 now succeeds → 0x6 IS the missing setup step.
+    // Native-reference LLDB capture (iPad13,6, iOS 16.3.1 20D67) observed
+    // _IOGPUDeviceCreateWithAPIProperty(options=0x10, property="Metal") before
+    // queue creation.  Reproduce that input for both the queue-only A/B and
+    // the wider exercise instead of relying on a zero-filled diagnostic.
     {
-        unsigned char in_p[0x408];
-        unsigned char out_p[0x10];
+        unsigned char in_p[0x10];
         memset(in_p, 0, sizeof(in_p));
-        memset(out_p, 0, sizeof(out_p));
-        size_t outSz = sizeof(out_p);
-        kr = IOConnectCallMethod(conn, 0x6,
-            NULL, 0,
-            in_p, sizeof(in_p),
-            NULL, NULL,
-            out_p, &outSz);
+        memcpy(in_p, "Metal", sizeof("Metal"));
+        // RE-confirmed via _IOGPUDeviceCreateWithAPIProperty at
+        // 0x1eec63a94..0x1eec63ac4: the actual wrapper uses
+        // IOConnectCallStructMethod with a fixed 0x10-byte input and no
+        // output, not the 0x408-byte IOConnectCallMethod diagnostic used by
+        // the old probe.
+        kr = IOConnectCallStructMethod(conn, 0x6,
+            in_p, 0x10, NULL, NULL);
         fprintf(stderr, "  sel=0x6 set_api_property (prereq?) -> kr=0x%x %s\n",
             kr, kr == 0 ? "(SUCCESS)" : "(FAIL)");
     }
-    // Retry sel=0x9 after sel=0x6
-    {
+    // Retry sel=0x9 after sel=0x6 only in the explicit resource exercise.
+    if (mode == kProbeExercise) {
         unsigned char in_args[0x70];
         unsigned char out_args[0x50];
         memset(in_args, 0, sizeof(in_args));
@@ -332,6 +340,12 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
         unsigned char out_q[0x10];
         memset(in_q, 0, sizeof(in_q));
         memset(out_q, 0, sizeof(out_q));
+        // Runtime-confirmed via the native LLDB trace: QoS=2 and the
+        // background/priority byte is zero.  The leading bytes are only a
+        // diagnostic queue name in the iOS 16.3 kernel initializer.
+        memcpy(in_q, "agx_iogpu_probe", sizeof("agx_iogpu_probe"));
+        *(uint32_t *)(in_q + 0x400) = 2;
+        in_q[0x404] = 0;
         size_t outSz = sizeof(out_q);
         kr = IOConnectCallMethod(conn, 0x7,
             NULL, 0,
@@ -407,7 +421,12 @@ int main(int argc, char **argv) {
     uint32_t type = 1;
     if (argc > 1) type = (uint32_t)strtoul(argv[1], NULL, 0);
     const char *match_class = argc > 2 ? argv[2] : "AGXAccelerator";
-    bool exercise = argc > 3 && strcmp(argv[3], "exercise") == 0;
-    probe_one(match_class, type, exercise);
+    probe_mode_t mode = kProbeFieldsOnly;
+    if (argc > 3 && strcmp(argv[3], "queue") == 0) {
+        mode = kProbeQueueOnly;
+    } else if (argc > 3 && strcmp(argv[3], "exercise") == 0) {
+        mode = kProbeExercise;
+    }
+    probe_one(match_class, type, mode);
     return 0;
 }

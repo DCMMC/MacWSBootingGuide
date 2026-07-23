@@ -5638,21 +5638,20 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
         fprintf(stderr, "#### IOServiceOpen agx BORROW failed — falling back to normal IOServiceOpen\n");
     }
 
-    // clear flag 4 (FIXME: idk what is this)
+    uint32_t requested_type = type;
+
+    // RE-confirmed user-space ABI translation: macOS 13.4 IOGPU builds
+    // 5|(options<<16), while iOS 16.3 accepts low type 1 or 0x21.  Remove
+    // only macOS platform bit 4; preserve the caller's high-word options.
+    // Native-reference LLDB captured options=0x10 and type=0x100001, and the
+    // KRW probe runtime-confirmed those bits at UC+0x128 and Device+0xd8.
     type &= ~4;
 
-    // AGXG13GFamilyDevice opens its user client with type=0x100001 on macOS.
-    // The iOS AGX kext doesn't recognise that high-bit flag and gives us back
-    // a degraded user client whose sel=0x8/0x9 (heap/sub-resource create) all
-    // return kIOReturnExclusiveAccess (0xe00002c2) — fuzzing every byte of
-    // args+0x08..+0x60 confirmed the user client itself rejects the calls,
-    // not the args. Masking the high-bit flag down to type=1 (the iOS-native
-    // "full IOGPUDevice user client" type) gets us a real client. Gated on
-    // MACWS_AGX_NATIVE so the sim path is unaffected. Allow MACWS_AGX_FORCE_TYPE
-    // to override the masked type for fuzzing.
-    uint32_t orig_type = type;
+    // Keep the former high-word mask as an explicit diagnostic A/B only.  It
+    // is not a fix: queue-only probing shows both types can create equivalent
+    // kernel queues, while the high word changes real device state.
     if (getenv("MACWS_AGX_NATIVE") && service == agxService) {
-        if (type & 0xFFFF0000) {
+        if (getenv("MACWS_AGX_STRIP_OPEN_OPTIONS")) {
             type &= 0xFFFF;
         }
         const char *force = getenv("MACWS_AGX_FORCE_TYPE");
@@ -5665,8 +5664,8 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
     assert(iogpuClientsCount < sizeof(iogpuClients) / sizeof(iogpuClients[0]));
     if(result == KERN_SUCCESS && service == agxService) {
         iogpuClients[iogpuClientsCount++] = *connect;
-        fprintf(stderr, "#### debugbydcmmc IOServiceOpen agx connect=%d type=%u (orig=%u)\n",
-            *connect, type, orig_type);
+        fprintf(stderr, "#### debugbydcmmc IOServiceOpen agx connect=%d type=%#x (requested=%#x)\n",
+            *connect, type, requested_type);
     }
     return result;
 }

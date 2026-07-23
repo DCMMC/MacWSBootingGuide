@@ -20,8 +20,11 @@ HOST=${1:-}
 PORT=${2:-2222}
 PROC_NAME=${3:-WindowServer}
 CMDS_FILE=${4:-}
+SSH_USER=${SSH_USER:-root}
 DBG_PORT=${DBG_PORT:-5555}
 RUN_LOG=${RUN_LOG:-/tmp/lldb_trace_run.log}
+LLDB_MEMORY_MODULE_LOAD_LEVEL=${LLDB_MEMORY_MODULE_LOAD_LEVEL:-}
+IOS_SYMBOL_ROOT=${IOS_SYMBOL_ROOT:-}
 
 if [ -z "$HOST" ] || [ -z "$CMDS_FILE" ]; then
     echo "usage: bash $0 <host> [ssh-port] [process-name] <commands-file>" >&2
@@ -32,7 +35,7 @@ if [ ! -f "$CMDS_FILE" ]; then
     exit 1
 fi
 
-PID=$(ssh -p "$PORT" root@"$HOST" \
+PID=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
     "ps aux | grep -E '$PROC_NAME' | grep -v grep | head -1 | awk '{print \$2}'")
 if [ -z "$PID" ]; then
     echo "error: no process matching '$PROC_NAME'" >&2
@@ -42,7 +45,7 @@ echo "[trace] $PROC_NAME PID=$PID" >&2
 
 cleanup() {
     pkill -f "ssh.*-L $DBG_PORT:127.0.0.1" 2>/dev/null || true
-    ssh -p "$PORT" root@"$HOST" \
+    ssh -p "$PORT" "$SSH_USER@$HOST" \
         'echo alpine | sudo -S bash -c '\''for p in $(ps aux | grep debugserver | grep -v grep | awk "{print \$2}"); do kill -9 $p 2>/dev/null; done'\''' \
         >/dev/null 2>&1 || true
 }
@@ -51,25 +54,37 @@ trap cleanup EXIT INT TERM
 cleanup
 sleep 1
 
-ssh -p "$PORT" root@"$HOST" \
+ssh -p "$PORT" "$SSH_USER@$HOST" \
     "echo alpine | sudo -S /var/jb/usr/bin/debugserver 127.0.0.1:$DBG_PORT --attach=$PID" \
     >/tmp/debugserver_remote.log 2>&1 &
 sleep 3
 
-STATE=$(ssh -p "$PORT" root@"$HOST" \
+STATE=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
     "ps -o state= -p $PID 2>/dev/null | tr -d ' ' || echo MISS")
 if [ "${STATE:0:1}" != "T" ]; then
     echo "[trace] WARNING: target state '$STATE' (expected T) — debugserver attach failed?" >&2
 fi
 
-ssh -fN -p "$PORT" -L "$DBG_PORT:127.0.0.1:$DBG_PORT" root@"$HOST"
+ssh -fN -p "$PORT" -L "$DBG_PORT:127.0.0.1:$DBG_PORT" "$SSH_USER@$HOST"
 sleep 1
 
 # lldb runs the commands file via --source — that respects multi-line
 # `script ... DONE` blocks, lldb python heredocs, etc. (which `-o` would
 # split across separate one-line invocations).
-LLDB_ARGS=(
-    --batch
+LLDB_ARGS=(--batch)
+if [ -n "$LLDB_MEMORY_MODULE_LOAD_LEVEL" ]; then
+    LLDB_ARGS+=(
+        -O "settings set target.memory-module-load-level $LLDB_MEMORY_MODULE_LOAD_LEVEL"
+        -O "settings set target.preload-symbols false"
+    )
+fi
+if [ -n "$IOS_SYMBOL_ROOT" ]; then
+    LLDB_ARGS+=(
+        -O "settings set target.exec-search-paths $IOS_SYMBOL_ROOT"
+        -O "settings set target.debug-file-search-paths $IOS_SYMBOL_ROOT"
+    )
+fi
+LLDB_ARGS+=(
     -O "process connect --plugin gdb-remote connect://127.0.0.1:$DBG_PORT"
     --source "$CMDS_FILE"
     -o "process detach"
