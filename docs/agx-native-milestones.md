@@ -114,11 +114,12 @@ Actual binary: iOS 16.3 `com.apple.iokit.IOGPUFamily`, development artifact
 - stores QoS at queue `+0x450`;
 - initializes queue `+0x44c` to 3.
 
-The zero-filled payload currently produced by the diagnostic translator passes
-this initializer (QoS 0 and an empty path). It is nevertheless not proven to be
-equivalent to a native Metal queue for downstream policy. The native payload
-and the caller's options must be captured before deciding whether to remove or
-replace this diagnostic.
+The leading path is copied but is not inspected by this initializer. The
+production translator therefore preserves the caller's payload. A zero-filled
+replacement remains available only through the diagnostic
+`MACWS_AGX_ZERO_QUEUE_ARGS` A/B switch. This removes an RE-disproved
+translation; it does not establish that queue creation or first submit is
+fixed, and the native caller's runtime values still need to be captured.
 
 Disassembly artifact: `/tmp/iogpufamily-text.disasm`.
 

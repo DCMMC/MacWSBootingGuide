@@ -4975,33 +4975,28 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
        getenv("MACWS_RESTORE_OUTBUMP")) {
         *outStructCnt = 0x10000;
     }
-    // sel=0x6 (iOS IOGPUDeviceCreateWithAPIProperty) and sel=0x7 (iOS
-    // IOGPUCommandQueueCreateWithQoS) both take inSC=1032 (0x408). iOS
-    // userland zeros the entire buffer first, then writes QoS at +0x400 and
-    // priority at +0x404. macOS userland instead writes a process path
-    // string starting at offset 0 ("/System/Library/PrivateFrameworks/
-    // SkyLight.framework/Versions/A/Resources/WindowServer\0…"). The iOS
-    // kernel then reads whatever is at +0x400/+0x404 as QoS/priority — and
-    // for the macOS payload, those are zero (since the path is well under
-    // 1024 bytes), which iOS could in principle tolerate. But the kernel
-    // also seems to scan the leading bytes (probably the "device flags" /
-    // "api_property" header at +0x0..+0x10) and rejects non-zero garbage
-    // there. Fix: build a fresh zeroed 1032-byte buffer (the iOS-native
-    // shape with QoS/priority defaulting to 0), pass that instead. The
-    // existing 256-byte shadowbuf is too small; allocate on the heap.
+    // Preserve the translated selector-7 queue payload. RE-confirmed against
+    // iOS 16.3 IOGPU::_IOGPUCommandQueueCreateWithQoS @ 0x1eec62a00 and
+    // macOS 13.4 IOGPU::_IOGPUCommandQueueCreateWithQoS @ 0x19d1558b8: both
+    // zero a 0x408-byte buffer, copy proc_pidpath into the first 0x400 bytes,
+    // then store QoS at +0x400 and the background/priority byte at +0x404.
+    // The iOS 16.3 kernel IOGPUCommandQueue initializer @
+    // 0xfffffe0009f0c798 only bounds-checks +0x400 against 4 and copies the
+    // leading bytes as the queue name; it does not reject a non-empty path.
+    //
+    // Keep zero substitution only as an explicitly requested A/B diagnostic.
+    // It is a scaffold, not an ABI fix.
     unsigned char *qbuf = NULL;
-    if (IOConnectIsIOGPU(client) && (selector == 0x6 || selector == 0x7) &&
-        inStruct && inStructCnt == 0x408) {
+    if (IOConnectIsIOGPU(client) && selector == 0x7 &&
+        inStruct && inStructCnt == 0x408 &&
+        getenv("MACWS_AGX_ZERO_QUEUE_ARGS")) {
         qbuf = (unsigned char *)calloc(1, inStructCnt);
-        // Default QoS/priority = 0 is fine; iOS Metal uses 0 when no
-        // explicit QoS is requested. Leave +0x400/+0x404 as zero.
         inStruct = qbuf;
-        static int q_patched[2] = {0, 0};
-        int sl = (selector == 0x6) ? 0 : 1;
-        if (!q_patched[sl]) {
-            q_patched[sl] = 1;
+        static int q_patched;
+        if (!q_patched) {
+            q_patched = 1;
             fprintf(stderr,
-                "#### AGXIOC QueueArgs-fix sel=0x%x: replaced path-string args with zeroed 0x408 buffer\n",
+                "#### AGXIOC QueueArgs-DIAGNOSTIC sel=0x%x: MACWS_AGX_ZERO_QUEUE_ARGS replaced native-shaped path/QoS payload with zeroed 0x408 scaffold\n",
                 selector);
         }
     }
