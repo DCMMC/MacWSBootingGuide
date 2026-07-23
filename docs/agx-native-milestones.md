@@ -214,6 +214,17 @@ field-only mode and no longer tries open types 0 and 2, both of which
 previously hung on this device. A non-default type or the existing
 resource/queue call suite must be requested explicitly (`exercise`).
 
+In explicit `exercise` mode, a successful selector-`0x7` queue creation is
+also resolved through the command-queue `IOGPUNamespace`. RE-confirmed via
+`IOGPUDevice::retainCommandQueue(unsigned int)` at
+`0xfffffe0009f02f50`: device `+0x88` is the namespace passed to
+`IOGPUNamespace::retainObject`, whose implementation at
+`0xfffffe0009eea1d0` indexes the pointer array at namespace `+0x10` after
+checking the capacity at `+0x28`. The probe can therefore read the actual
+kernel queue's accelerator pointer, `+0x80c`, `+0x820`, priority/QoS, and the
+accelerator configuration fields `+0x1870/+0x56c`. This is diagnostic
+instrumentation; no queue field is changed.
+
 ### RE-confirmed: the first work-queue initializer has only narrow failures
 
 The first `allocate3DWorkQueue(false)` call passes AGX queue fields

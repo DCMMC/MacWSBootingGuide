@@ -340,6 +340,45 @@ static void probe_one(const char *match_class, uint32_t type, bool exercise) {
             out_q, &outSz);
         fprintf(stderr, "  sel=0x7 (queue-create) -> kr=0x%x %s\n",
             kr, kr == 0 ? "(SUCCESS)" : "(FAIL)");
+        if (kr == 0 && outSz >= 0x10) {
+            uint32_t queue_id = *(uint32_t *)(out_q + 0x00);
+            uint64_t queue_token = *(uint64_t *)(out_q + 0x08);
+            // RE-confirmed via IOGPUDevice::retainCommandQueue(unsigned):
+            // Device+0x88 is the command-queue IOGPUNamespace;
+            // namespace+0x10 is its pointer array and +0x28 its capacity.
+            uint64_t queue_namespace = p_kread64(device + 0x88);
+            uint64_t queue_array = queue_namespace
+                ? p_kread64(queue_namespace + 0x10) : 0;
+            uint32_t queue_capacity = queue_namespace
+                ? p_kread32(queue_namespace + 0x28) : 0;
+            uint64_t kernel_queue = queue_array && queue_id < queue_capacity
+                ? p_kread64(queue_array + (uint64_t)queue_id * 8) : 0;
+            fprintf(stderr,
+                    "    queue id=%#x token=%#llx namespace=%#llx "
+                    "capacity=%u kernel=%#llx\n",
+                    queue_id, (unsigned long long)queue_token,
+                    (unsigned long long)queue_namespace, queue_capacity,
+                    (unsigned long long)kernel_queue);
+            if (kernel_queue) {
+                uint64_t accelerator = p_kread64(kernel_queue + 0x530);
+                uint32_t work_queue_count = p_kread32(kernel_queue + 0x80c);
+                uint32_t work_queue_limit = p_kread32(kernel_queue + 0x820);
+                uint32_t priority = p_kread32(kernel_queue + 0x44c);
+                uint32_t qos = p_kread32(kernel_queue + 0x450);
+                uint32_t cfg_1870 = accelerator
+                    ? p_kread32(accelerator + 0x1870) : 0;
+                uint32_t cfg_56c = accelerator
+                    ? p_kread32(accelerator + 0x56c) : 0;
+                fprintf(stderr,
+                        "    AGXCommandQueue +0x530=%#llx +0x80c=%u "
+                        "+0x820=%u priority=%u qos=%u\n",
+                        (unsigned long long)accelerator, work_queue_count,
+                        work_queue_limit, priority, qos);
+                fprintf(stderr,
+                        "    accelerator config +0x1870=%u +0x56c=%u\n",
+                        cfg_1870, cfg_56c);
+            }
+        }
     }
 
     // Try sel=0x100 = device info query — should always work
