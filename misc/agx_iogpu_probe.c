@@ -7,6 +7,8 @@
 //     → UC kernel kobject              [task_get_ipc_port_kobject]
 //     → IOGPUDevice* at UC+0x120       [kread64]
 //     → IOGPU*       at IOGPUDevice+0x48
+//     → IOGPUTask*   at IOGPUDevice+0x58
+//     → open options at UC+0x128 / AGXShared+0xd8
 //     → cap fields   at IOGPU+0x108 / IOGPU+0x224
 //
 // Compile + sign + run on iOS (NOT chroot):
@@ -14,7 +16,8 @@
 //   sudo ldid -S /tmp/agx_iogpu_probe
 //   sudo /var/jb/usr/bin/jbctl trustcache add $(ldid -arch arm64 -h /tmp/agx_iogpu_probe \
 //        2>/dev/null | awk -F= '/CDHash/{print $2}')
-//   sudo /tmp/agx_iogpu_probe
+//   sudo /tmp/agx_iogpu_probe                         # fields only
+//   sudo /tmp/agx_iogpu_probe 1 AGXAccelerator exercise  # run call tests
 //
 // Decision matrix once we have numbers:
 //
@@ -86,7 +89,7 @@ static int load_libjb(void) {
     return 0;
 }
 
-static void probe_one(const char *match_class, uint32_t type) {
+static void probe_one(const char *match_class, uint32_t type, bool exercise) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
         IOServiceMatching(match_class));
     if (!svc) {
@@ -114,30 +117,63 @@ static void probe_one(const char *match_class, uint32_t type) {
         return;
     }
 
-    uint64_t vt_uc  = p_kread64(uc + 0x00);
-    uint64_t device = p_kread64(uc + 0x120);
+    uint64_t vt_uc      = p_kread64(uc + 0x00);
+    uint64_t device     = p_kread64(uc + 0x120);
+    uint64_t uc_options = p_kread64(uc + 0x128);
     uint8_t  uc_103 = (uint8_t)(p_kread32(uc + 0x100) >> 24);
     fprintf(stderr, "  UC vtable       = %#llx\n", (unsigned long long)vt_uc);
     fprintf(stderr, "  UC+0x120 device = %#llx\n", (unsigned long long)device);
+    fprintf(stderr, "  UC+0x128 options= %#llx\n",
+            (unsigned long long)uc_options);
     fprintf(stderr, "  UC+0x103 byte   = 0x%02x  (1=restricted method table)\n", uc_103);
     if (!device) { IOServiceClose(conn); return; }
 
-    uint64_t vt_dev = p_kread64(device + 0x00);
-    uint64_t iogpu  = p_kread64(device + 0x48);
+    uint64_t vt_dev  = p_kread64(device + 0x00);
+    uint64_t iogpu   = p_kread64(device + 0x48);
+    uint64_t gpu_task = p_kread64(device + 0x58);
     fprintf(stderr, "  Device vtable   = %#llx\n", (unsigned long long)vt_dev);
     fprintf(stderr, "  Device+0x48 IOGPU = %#llx\n", (unsigned long long)iogpu);
+    fprintf(stderr, "  Device+0x58 IOGPUTask = %#llx\n",
+            (unsigned long long)gpu_task);
     if (!iogpu) { IOServiceClose(conn); return; }
 
-    uint64_t vt_iogpu = p_kread64(iogpu + 0x00);
-    uint64_t cap_108  = p_kread64(iogpu + 0x108);
-    uint32_t cap_224  = p_kread32(iogpu + 0x224);
+    uint64_t vt_iogpu   = p_kread64(iogpu + 0x00);
+    uint64_t agx_options = p_kread64(iogpu + 0xd8);
+    uint64_t cap_108    = p_kread64(iogpu + 0x108);
+    uint32_t cap_224    = p_kread32(iogpu + 0x224);
     fprintf(stderr, "  IOGPU vtable    = %#llx\n", (unsigned long long)vt_iogpu);
+    fprintf(stderr, "  AGXShared+0xd8 options = %#llx\n",
+            (unsigned long long)agx_options);
     fprintf(stderr, "  IOGPU+0x108     = %#llx  (the size cap field)\n",
             (unsigned long long)cap_108);
     fprintf(stderr, "  IOGPU+0x224     = %#x      (outCnt-related field)\n",
             cap_224);
     fprintf(stderr, "  derived         3*0x108/4 = %#llx\n",
             (unsigned long long)((cap_108 * 3) / 4));
+
+    // RE-confirmed against the iOS 16.3 IOGPUFamily binary:
+    // IOGPUTask::init(IOGPU *, task *, unsigned count,
+    //                 IORangeAllocator **allocators)
+    // retains allocator[i] into task+0x138+(i*8).  It does not retain the
+    // count in an adjacent field, so this dump is intentionally just the 16
+    // fixed slots, not an inferred count.
+    if (gpu_task) {
+        uint64_t vt_task = p_kread64(gpu_task + 0x00);
+        fprintf(stderr, "  IOGPUTask vtable = %#llx\n",
+                (unsigned long long)vt_task);
+        for (unsigned i = 0; i < 16; ++i) {
+            uint64_t allocator = p_kread64(gpu_task + 0x138 + i * 8);
+            fprintf(stderr, "  IOGPUTask allocator[%u] = %#llx\n", i,
+                    (unsigned long long)allocator);
+        }
+    }
+
+    if (!exercise) {
+        fprintf(stderr,
+                "  fields-only: skipping resource/queue call tests\n");
+        IOServiceClose(conn);
+        return;
+    }
 
     // === Trigger sel=0x9 type=0x80 STANDALONE from iOS-native context ===
     // Multiple shape variants — to test if the args-shape (not credentials)
@@ -325,10 +361,14 @@ int main(int argc, char **argv) {
     fprintf(stderr, "agx_iogpu_probe — iOS-native AGX UC field reader\n");
     if (load_libjb() != 0) return 1;
 
-    // Try several user-client class types to ensure at least one works.
-    probe_one("AGXAccelerator", 1);   // standard IOGPUDeviceUserClient
-    probe_one("AGXAccelerator", 0);   // alt type used by chroot WS path
-    probe_one("AGXAccelerator", 2);   // explicit alt
-    probe_one("IOGPU", 1);            // direct
+    // Types 0 and 2 have hung IOServiceOpen on this device.  Keep the default
+    // bounded to the native low-word type 1; explicitly requested values are
+    // useful for a single controlled A/B test (for example 0x100001) but are
+    // never fuzzed automatically.
+    uint32_t type = 1;
+    if (argc > 1) type = (uint32_t)strtoul(argv[1], NULL, 0);
+    const char *match_class = argc > 2 ? argv[2] : "AGXAccelerator";
+    bool exercise = argc > 3 && strcmp(argv[3], "exercise") == 0;
+    probe_one(match_class, type, exercise);
     return 0;
 }
