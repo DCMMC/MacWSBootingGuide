@@ -13,6 +13,7 @@
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <fcntl.h>
+#import <ptrauth.h>
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -1919,15 +1920,26 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
 
             void *super2 = dlsym(RTLD_DEFAULT, "objc_msgSendSuper2");
             if (super2) {
+                // dlsym returns a PAC-signed function pointer in an arm64e
+                // process.  Using that value as a data pointer after adding
+                // 0x10 faults with SEGV_ACCERR instead of reading the
+                // instruction.  Runtime witness (agxprobe_e, 2026-07-24):
+                // x0=0x132400019280de00 and loadImageCallback+0xf94 faulted
+                // while reading 0x132400019280de10.  Strip only the pointer
+                // authentication bits used for arithmetic; the instruction
+                // value below still has to match before any patch is made.
+                void *super2_code = ptrauth_strip(
+                    super2, ptrauth_key_function_pointer);
                 // autda is at msgSendSuper2 + 16 (verified by lldb).
-                uint32_t *autda_at = (uint32_t *)((uint8_t *)super2 + 16);
+                uint32_t *autda_at =
+                    (uint32_t *)((uint8_t *)super2_code + 16);
                 const uint32_t AUTDA_X16_X17 = 0xdac11a30u;
                 const uint32_t XPACD_X16     = 0xdac147f0u;
                 uint32_t cur = *autda_at;
                 dprintf(2,
                     "#### MACWS_AGX_OBJC_AUTDA_PATCH msgSendSuper2=%p "
-                    "autda@%p insn=%#x\n",
-                    super2, autda_at, cur);
+                    "code=%p autda@%p insn=%#x\n",
+                    super2, super2_code, autda_at, cur);
                 if (cur == XPACD_X16) {
                     dprintf(2, "####   already patched, skip\n");
                 } else if (cur != AUTDA_X16_X17) {

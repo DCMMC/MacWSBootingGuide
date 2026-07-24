@@ -366,19 +366,133 @@ Artifacts on the development Mac:
 - `/tmp/iosclear-native-segment-list.bin`
 - `/tmp/macws-segment-list-spanfix.bin`
 
+## 2026-07-24: isolated blit fault and pinned-VA control
+
+### Runtime-confirmed: the page fault reproduces without WindowServer
+
+The arm64 macOS `agxprobe` was run inside the chroot from a clean GUI state.
+Stages 1 through 3 created an Apple M1 device, a 4096-byte shared buffer, and a
+command queue. Stage 4 submitted only one blit fill. With the current
+**temporary diagnostic** subtype-3 KCMD normalization enabled, the parser
+accepted the command and the GPU reported a BIF0 page fault:
+
+```text
+#### AGX_SUBMIT_DIAG #1 TEMP-KCMD-ABI-FIX subtype=3 size 0x1b8->0x1a8 end 0x1e8->0x1d8 total 0x210->0x200
+AGXPROBE [4d] status=5 error=Caused GPU Address Fault (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)
+AGXPROBE [4e] readback[0]=0x00 [4095]=0x00 (expect 0xab if GPU ran)
+```
+
+The matching GPU report contains:
+
+```text
+"restart_reason":3
+"bif0_fault":{"is_read":true,"sideband":68,"level":1,
+              "requestor":1,"address":74491363328}
+"guilty_dm":3
+"signature":563
+```
+
+`74491363328` is `0x1158080000`. Without the diagnostic normalization, the
+same test returned `Internal Error (00000103)` and emitted no GPU event. This
+establishes that the 16-byte deletion advances the iOS parser far enough to
+execute hardware, but it remains a scaffold: deleting bytes has not been
+proved semantically correct.
+
+Artifacts and SHA-256:
+
+- `/tmp/macws-agxprobe-isolated-d04a3e8/arm64-stage4.log` —
+  `4e02be0d148162cbe9e32b8dde230441c76389eb2c38ac4ea69cfa4a045b7a9f`
+- `/tmp/macws-agxprobe-isolated-d04a3e8/gpuEvent-agxprobe_arm64-2026-07-24-065502.ips` —
+  `2f60db455f7cf5adaf9b334f790aa13abc92e2e97fff18b9a8b558e69ee46578`
+- `/tmp/macws-agxprobe-isolated-d04a3e8/macws_submit_kcmd_1_0_pre.bin` —
+  `5851f14a47539378d6955afa3fe731385bcf1269b6862b1b4673e2d9cdd24fbc`
+
+This moves the first failing invariant below SkyLight and the compositor: a
+generic chroot Metal blit has the same failure class.
+
+### Runtime-confirmed: iOS can map and execute at the exact fault VA
+
+The iOS-native `PinnedVAProbe` requested `0x1158080000` and then exercised the
+mapping with compute and blit operations in both directions. The exact run
+reported:
+
+```text
+requested=0x1158080000 reported=0x1158080000 match=YES
+PINPROBE stage2 cb.status = 4
+PINPROBE stage2 result: [0]=0xdeadbeef [1]=0xcafebabe
+PINPROBE stage2c blit status=4 sink[0]=0xdeadbeef sink[1]=0xcafebabe
+PINPROBE stage2d status=4 roundtrip[0]=0xfeedface roundtrip[1]=0xbaddcafe
+PINPROBE stage2b CONTROL OK: shader ran correctly on plain buffer
+PINPROBE FINAL: PINNED VA HAS A REAL GPU PAGE TABLE ENTRY
+```
+
+There was no GPU fault report. Artifact:
+`/tmp/macws-agxprobe-isolated-d04a3e8/pinnedva-1158080000.log`, SHA-256
+`d02715bb83d44eb997ef266671e99f620d6e4e2880666f64c3ee57c1263eae47`.
+This runtime-disproves the historical conclusion that
+`pinnedGPULocation:` is merely symbolic on this device.
+
+The project LLDB tracer then captured the exact native selector-`0x9`
+resource request. `res-001.bin` has SHA-256
+`62c6918d1f405bcef6d95e82cbd7dbe52ef34c98b4b2676ddc1fe49723ec2dbf`
+and these relevant fields:
+
+```text
++0x00 type=0
++0x10 0x0000047001000101
++0x20 0x0000001158080000    requested GPU VA
++0x28 0x0000000000004000    allocation span
++0x40 0x0000000000004000
+```
+
+Its first native compute KCMD is exactly `0x200` bytes, contains a subtype-3
+record with `size=0x1a8` and `end=0x1d8`, and references
+`0x1158080000` at KCMD `+0x1e8`. Artifact
+`/tmp/pintrace-1158080000-held-20260724/pinned-native-kcmd.bin`, SHA-256
+`d0c5d2898b40fb9b59c8fc6b352ec0996c92279c576c23e8ca1ee64c8f642906`.
+
+The narrow evidence-backed conclusion is that iOS's resource ABI places an
+explicit pinned VA at request `+0x20`, and the resulting native command uses
+that same VA successfully. In the isolated chroot probe, the translated
+type-0 resource requests observed so far had zero at `+0x20/+0x28`, while its
+KCMD contained GPU-address-looking values. **THEORY:** macOS user space and
+the iOS kernel are assigning different GPU VAs. The next experiment must
+correlate the chroot buffer's `gpuAddress`, the unmodified resource request,
+the translated request, and the resource-create output before this theory can
+be promoted to fact.
+
+### Runtime-confirmed: strip PAC before arithmetic on `dlsym` results
+
+An arm64e diagnostic host crashed in `loadImageCallback` while reading
+`objc_msgSendSuper2 + 0x10`. The crash register was a PAC-signed function
+pointer (`x0=0x132400019280de00`), and the installed instruction sequence
+performed a raw `add x8, x8, #0x10` followed by `ldr w8, [x8]`. The hook now
+uses `ptrauth_strip(..., ptrauth_key_function_pointer)` before instruction
+address arithmetic. The rebuilt runtime logged:
+
+```text
+MACWS_AGX_OBJC_AUTDA_PATCH msgSendSuper2=0xdc5e80018a721e00
+code=0x18a721e00 autda@0x18a721e10 insn=0xdac11a30
+```
+
+This fixes the hook's own pointer invariant; it is not a GPU fix and does not
+change the status of the arm64e host's separate constant-NSString ABI crash.
+
 ## Next runtime experiment
 
-1. Build/deploy the native option preservation and the already-RE-confirmed
-   queue-payload preservation.
-2. Run `misc/cleanup_all.sh`, arm `/tmp/macws_stop_after_clear`, and start one
-   bounded WindowServer frame while collecting libmachook and live system
-   logs. Verify the actual chroot open type, selector-`0x7` result, queue
-   payload, and first-submit result.
-3. If raw `0x08` remains, identify its precise work-queue failure with a
-   runtime kernel log or LLDB register trace. Do not bypass the raw-8 exit or
-   force a success return.
-4. Require `clear-control executed=YES` and a non-black VNC control pixel,
-   then run GlassDemo and capture the final blur witness.
+1. Instrument the isolated arm64 chroot `agxprobe` to print the buffer's real
+   `gpuAddress` and capture both the pre-translation and post-translation
+   selector-`0x9` bytes plus the complete resource-create output.
+2. RE the actual iOS 16.3 `IOGPUResourceCreate` and
+   `-[IOGPUMetalBuffer gpuAddress]` implementations to label those output
+   fields. Do not infer a field solely because it looks pointer-shaped.
+3. If the buffer accessor's VA is absent from the iOS request, test an
+   upstream resource translation which requests that exact VA at the
+   RE/runtime-confirmed `+0x20/+0x28` fields. Mapping a zero-filled page only
+   to suppress the BIF0 fault is a diagnostic scaffold, not a fix.
+4. Require isolated stage-4 readback `0xab/0xab` before restarting
+   WindowServer. Then require the clear-control VNC pixel, followed by the
+   GlassDemo blur capture.
 
 ## Success criteria
 
