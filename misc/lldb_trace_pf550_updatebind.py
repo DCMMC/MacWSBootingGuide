@@ -15,6 +15,8 @@ UPDATE_BIND_THREE_ARG_STATIC = 0x1E5770C1C
 UPDATE_BIND_TWO_ARG_STATIC = 0x1E5770C14
 THREE_ARG_DISPATCH_STATIC = 0x1E5770C7C
 THREE_ARG_DEVICE_GATE_STATIC = 0x1E5770C50
+COMPRESSION_QUERY_STUB_STATIC = 0x1E5A5D5F0
+COMPRESSION_QUERY_RETURN_STATIC = 0x1E5A5AE58
 AFTER_COMPRESSIBLE_STORES_STATIC = 0x1E5771718
 COMPRESSIBLE_VIRTUAL_CALL_STATIC = 0x1E577173C
 UNCOMPRESSIBLE_VIRTUAL_CALL_STATIC = 0x1E5771868
@@ -25,6 +27,7 @@ _compressible = False
 _target_impl = 0
 _entry_count = 0
 _three_entry_count = 0
+_compression_query_count = 0
 
 
 def _reg(frame, name):
@@ -35,6 +38,11 @@ def _read(process, address, size):
     error = lldb.SBError()
     data = process.ReadMemory(address, size, error)
     return data if error.Success() else b""
+
+
+def _read_u64(process, address):
+    data = _read(process, address, 8)
+    return struct.unpack("<Q", data)[0] if len(data) == 8 else None
 
 
 def _descriptor(process, impl):
@@ -101,7 +109,13 @@ def entry_callback(frame, _bp_location, _internal_dict):
                        (value >> 4) & 3, (value >> 103) & 1,
                        (value >> 127) & 1, _reg(frame, "x4"),
                        _reg(frame, "x5") & 0xFF, candidate.hex()))
-        return False
+        # In the controlled fresh-WindowServer harness, the first direct
+        # five-argument bind is the display-sized pf550 IOSurface.  Its
+        # hardware descriptor is intentionally still zero at this entry; the
+        # method's virtual call constructs it.  Stop on that first call so the
+        # caller which supplied isCompressible can be recovered.
+        if _entry_count != 1:
+            return False
     _target_thread = frame.GetThread().GetThreadID()
     _compressible = bool(_reg(frame, "x5") & 0xFF)
     _target_impl = impl
@@ -112,6 +126,9 @@ def entry_callback(frame, _bp_location, _internal_dict):
            _reg(frame, "x3"), _reg(frame, "x4"),
            _reg(frame, "x5") & 0xFF, _reg(frame, "x6") & 0xFF,
            _reg(frame, "lr")))
+    if _slide is not None:
+        print("PF550-UPDATEBIND ENTRY caller runtime=%#x static=%#x" %
+              (_reg(frame, "lr"), _reg(frame, "lr") - _slide))
     _print_descriptor(frame, "entry", impl)
     return True
 
@@ -145,6 +162,22 @@ def three_arg_entry_callback(frame, _bp_location, _internal_dict):
     return True
 
 
+def compression_query_callback(frame, _bp_location, _internal_dict):
+    global _target_thread, _compression_query_count
+    _compression_query_count += 1
+    if _compression_query_count != 1:
+        return False
+    _target_thread = frame.GetThread().GetThreadID()
+    print("PF550-COMPRESSION-QUERY ENTRY count=%d thread=%#x "
+          "iosurface(x0)=%#x plane(x1)=%#x lr=%#x" %
+          (_compression_query_count, _target_thread, _reg(frame, "x0"),
+           _reg(frame, "x1"), _reg(frame, "lr")))
+    if _slide is not None:
+        print("PF550-COMPRESSION-QUERY caller runtime=%#x static=%#x" %
+              (_reg(frame, "lr"), _reg(frame, "lr") - _slide))
+    return True
+
+
 def _arm(debugger, static_address, label):
     target = debugger.GetSelectedTarget()
     address = static_address + _slide
@@ -171,6 +204,11 @@ def arm_three_arg_device_gate(debugger):
     _arm(debugger, THREE_ARG_DEVICE_GATE_STATIC, "three-arg-device-gate")
 
 
+def arm_compression_query_return(debugger):
+    _arm(debugger, COMPRESSION_QUERY_RETURN_STATIC,
+         "compression-query-return")
+
+
 def arm_compressible_virtual_call(debugger):
     _arm(debugger, COMPRESSIBLE_VIRTUAL_CALL_STATIC,
          "compressible-virtual-call")
@@ -186,6 +224,53 @@ def dump_target_impl(debugger, label):
     process = debugger.GetSelectedTarget().GetProcess()
     frame = process.GetSelectedThread().GetFrameAtIndex(0)
     _print_descriptor(frame, label, _target_impl)
+
+
+def dump_three_arg_device_gate(debugger):
+    process = debugger.GetSelectedTarget().GetProcess()
+    frame = process.GetSelectedThread().GetFrameAtIndex(0)
+    inner = _reg(frame, "x0")
+    mac_child = _read_u64(process, inner + 0x1D8)
+    ios_child = _read_u64(process, inner + 0x1C8)
+
+    def field(pointer, offset):
+        if pointer is None or pointer < 0x1000:
+            return None
+        return _read_u64(process, pointer + offset)
+
+    print("PF550-UPDATEBIND GATE inner(x0)=%#x x8=%#x "
+          "inner+1c8=%s inner+1d8=%s" %
+          (inner, _reg(frame, "x8"),
+           "UNREAD" if ios_child is None else "%#x" % ios_child,
+           "UNREAD" if mac_child is None else "%#x" % mac_child))
+    print("PF550-UPDATEBIND GATE macChild+3f8=%s macChild+418=%s "
+          "iosChild+3f8=%s iosChild+418=%s" %
+          tuple("UNREAD" if value is None else "%#x" % value for value in (
+              field(mac_child, 0x3F8), field(mac_child, 0x418),
+              field(ios_child, 0x3F8), field(ios_child, 0x418))))
+
+
+def continue_until_target(debugger):
+    """Ignore unrelated first-chance exceptions until our callback matches."""
+    process = debugger.GetSelectedTarget().GetProcess()
+    for stop_count in range(1, 257):
+        error = process.Continue()
+        if error.Fail():
+            print("PF550-UPDATEBIND FATAL target continue failed: %s" % error)
+            return False
+        if _target_thread:
+            print("PF550-UPDATEBIND target selected after %d stops" % stop_count)
+            return True
+        state = process.GetState()
+        if state != lldb.eStateStopped:
+            print("PF550-UPDATEBIND FATAL target process state=%d" % state)
+            return False
+        thread = process.GetSelectedThread()
+        print("PF550-UPDATEBIND ignored stop=%d reason=%d description=%s" %
+              (stop_count, thread.GetStopReason(),
+               thread.GetStopDescription(256)))
+    print("PF550-UPDATEBIND FATAL target absent after 256 stops")
+    return False
 
 
 def _find_slide(target):
@@ -223,6 +308,38 @@ def install(debugger):
     return True
 
 
+def install_five_only(debugger):
+    global _slide
+    target = debugger.GetSelectedTarget()
+    _slide = _find_slide(target)
+    if _slide is None:
+        print("PF550-UPDATEBIND FATAL AGXMetal13_3 module not found")
+        return False
+    breakpoint = target.BreakpointCreateByAddress(UPDATE_BIND_STATIC + _slide)
+    breakpoint.SetScriptCallbackFunction(
+        "lldb_trace_pf550_updatebind.entry_callback")
+    print("PF550-UPDATEBIND installed five-only entry=%#x slide=%#x bp=%d" %
+          (UPDATE_BIND_STATIC + _slide, _slide, breakpoint.GetID()))
+    return True
+
+
+def install_compression_query(debugger):
+    global _slide
+    target = debugger.GetSelectedTarget()
+    _slide = _find_slide(target)
+    if _slide is None:
+        print("PF550-COMPRESSION-QUERY FATAL AGXMetal13_3 module not found")
+        return False
+    breakpoint = target.BreakpointCreateByAddress(
+        COMPRESSION_QUERY_STUB_STATIC + _slide)
+    breakpoint.SetScriptCallbackFunction(
+        "lldb_trace_pf550_updatebind.compression_query_callback")
+    print("PF550-COMPRESSION-QUERY installed stub=%#x slide=%#x bp=%d" %
+          (COMPRESSION_QUERY_STUB_STATIC + _slide, _slide,
+           breakpoint.GetID()))
+    return True
+
+
 def wait_for_agx_and_install(debugger):
     """Continue only between dyld image-load stops until AGX is present."""
     target = debugger.GetSelectedTarget()
@@ -241,4 +358,44 @@ def wait_for_agx_and_install(debugger):
                   process.GetState())
             return False
     print("PF550-UPDATEBIND FATAL AGX absent after 1024 image events")
+    return False
+
+
+def wait_for_agx_and_install_five(debugger):
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    for event_count in range(1, 1025):
+        if _find_slide(target) is not None:
+            print("PF550-UPDATEBIND AGX loaded after %d image events" %
+                  (event_count - 1))
+            return install_five_only(debugger)
+        error = process.Continue()
+        if error.Fail():
+            print("PF550-UPDATEBIND FATAL continue failed: %s" % error)
+            return False
+        if process.GetState() != lldb.eStateStopped:
+            print("PF550-UPDATEBIND FATAL process state=%d before AGX load" %
+                  process.GetState())
+            return False
+    print("PF550-UPDATEBIND FATAL AGX absent after 1024 image events")
+    return False
+
+
+def wait_for_agx_and_install_compression_query(debugger):
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess()
+    for event_count in range(1, 1025):
+        if _find_slide(target) is not None:
+            print("PF550-COMPRESSION-QUERY AGX loaded after %d image events" %
+                  (event_count - 1))
+            return install_compression_query(debugger)
+        error = process.Continue()
+        if error.Fail():
+            print("PF550-COMPRESSION-QUERY FATAL continue failed: %s" % error)
+            return False
+        if process.GetState() != lldb.eStateStopped:
+            print("PF550-COMPRESSION-QUERY FATAL process state=%d before AGX load" %
+                  process.GetState())
+            return False
+    print("PF550-COMPRESSION-QUERY FATAL AGX absent after 1024 image events")
     return False

@@ -716,11 +716,23 @@ static `0x1e5770c1c` computes the five-argument call.  It loads an internal
 device pointer, tests `internal+0x1d8`, then tests `*(internal+0x1d8)+0x418`.
 Either zero branch supplies `metadataAddress=0` and `isCompressible=0`; only
 the nonzero path computes a metadata address and sets `isCompressible=1`
-before dispatching the five-argument selector.  **THEORY:** one of these two
-feature-state fields is missing or zero because macOS AGX setup is reading an
-iOS cross-image object with a different initialization/layout contract.  The
-next LLDB stop at static `0x1e5770c50` will distinguish the two branches and
-must precede any fix.
+before dispatching the five-argument selector.
+
+The exact iPad13,6 iOS 16.3.1 DeviceSupport image, SHA-256
+`6ef447b91de58f0049c8813a14a431a279abad6a1d0883a04335e768b1540eb6`,
+contains the same methods at static `0x20ccd76bc` (three-argument) and
+`0x20ccd8234` (five-argument).  Its equivalent gate reads `internal+0x1c8`
+and `*(internal+0x1c8)+0x3f8`, then sets `w5=1` on the nonzero path.  Thus the
+two builds have concrete private-layout deltas of `+0x10` and `+0x20` at this
+decision.  This is RE-confirmed via the relative Objective-C method list for
+`AGXG13GFamilyTexture` plus capstone disassembly of the actual iOS binary.
+It is not yet proof that macOS is using the wrong offsets: its C++ texture
+object also legitimately places the hardware descriptor at `+0x190` instead
+of iOS's `+0x180`.  **THEORY:** either the macOS feature state was never
+initialized, or one of these reads crosses into an iOS-layout object.  The
+next LLDB stop at static `0x1e5770c50` will dump both the macOS-expected and
+iOS-native alternate offsets, distinguish the cases, and must precede any
+fix.
 
 Chroot artifacts are archived under
 `/tmp/macws-pf550-updatebind-20260724-2316`: `WindowServer.err` SHA-256
@@ -728,16 +740,113 @@ Chroot artifacts are archived under
 and LLDB session SHA-256
 `a2d21bb34d00f9baa23eb041f7b83961172ef7b056129261e5dca05910494224`.
 
+### RE/runtime-confirmed: IOSurface per-plane ABI recovery makes the real pf550 initializer succeed
+
+The suspected `internal+0x1d8` gate was not a macOS/iOS C++ object-layout
+mix-up. A read-only project-LLDB trace of the exact macOS 13.4 outer texture
+initializer (`0x1e5a5ae18`) showed that its compression query and descriptor
+validation passed, but the real family `initImpl` returned zero. After tracing
+the inner method and its `TextureGen4` constructor, the failure was moved
+upstream to IOSurface per-plane metadata.
+
+The first confirmed ABI mismatch was BytesPerRow. The exact IOSurface clients
+read these offsets:
+
+```text
+macOS 13.4 IOSurfaceClientGetBytesPerRowOfPlane: +0xe0
+iOS 16.3 IOSurfaceClientGetBytesPerRowOfPlane:   +0xdc
+```
+
+For pf550 plane 0, the iOS object has explicit `BytesPerRow=153600`, while the
+macOS getter's shifted read lands on `PlaneSize=16390144`. Before recovery the
+real `initImpl` therefore received `x7=0xfa1800`; after recovery it received
+`x7=0x25800`. The native iOS probe independently returned the creation
+property and API values below for both planes:
+
+```text
+plane=0 propertyBytesPerRow=153600 apiBytesPerRow=153600
+plane=1 propertyBytesPerRow=38400  apiBytesPerRow=38400
+```
+
+Correcting BPR exposed, rather than hid, the next invariant: the C++ Texture
+was allocated and constructed, but `Texture+0x1d8` remained zero. The exact
+macOS constructor is static `0x1e5a46868`; its metadata object is 0x450 bytes
+and is installed at `0x1e5a4805c`. A native-iOS runtime locator stripped PAC
+from the corresponding ObjC IMP and found image offset `0x55bffc`, static
+`0x20ceeaffc`; its constructor call targets `0x20cee7358`. That iOS constructor
+uses the same decision tree, with a 0x430-byte metadata object and the expected
+iOS-private layout deltas.
+
+The macOS constructor trace then located the first failing branch exactly:
+
+```text
+0x1e5a47320  ldr  w10, [x25, #0x48]
+0x1e5a47324  ands w9, w10, #0xff
+0x1e5a47328  b.eq 0x1e5a47354
+
+runtime before fix:
+settings+0x48 = 0x05000200, low byte = 0
+next stage       = metadata-fallback
+Texture+0x1d8   = 0
+```
+
+The byte is derived from `IOSurfaceGetAddressFormatOfPlane`. Disassembly of
+the exact IOSurface binaries found another four-byte drift:
+
+```text
+macOS 13.4 IOSurfaceClientGetAddressFormatOfPlane:
+    client + plane*0x80 + 0xed
+iOS 16.3 IOSurfaceClientGetAddressFormatOfPlane:
+    client + plane*0x80 + 0xe9
+```
+
+The iOS-native probe returned `propertyAddressFormat=5 apiAddressFormat=5`
+for both pf550 planes. In chroot the unmodified macOS getter returned zero.
+The compatibility layer now recovers CompressionType,
+HeightInCompressedTiles, BytesPerRow, and AddressFormat from the IOSurface's
+own explicit creation properties when the exact macOS getter disagrees. It
+does not synthesize a format or force a validation result. Because the
+standalone AGX cache image has pre-populated GOT slots, only those four
+RE-confirmed imports are force-bound to the wrappers.
+
+The AddressFormat A/B run produced the expected causal chain:
+
+```text
+IOSURFACE-COMPAT addressFormat plane=0 original=0 property=5 recovery=1
+settings+0x48 = 0x05000203, low byte = 3
+PF550-CTOR stage=metadata-allocation
+PF550-CTOR stage=metadata-install
+Texture+0x1d8 = 0x15303c000
+PF550-INNER stage=inner-epilogue x0=0x1
+PF550-INIT stage=initImpl-return x0=0x1
+PF550-INIT stage=super-init-return x0=<real texture>
+PF550-INIT stage=footer-validation-return x0=0x1
+```
+
+This is the first runtime witness that macOS AGX accepted the real
+2388x1668 private-pixel-format-550 compressed IOSurface texture all the way
+through its outer initializer. It does not yet prove a completed shader read,
+WindowServer frame, or blur.
+
+Pre-fix constructor artifact
+`/tmp/macws-pf550-ctor-20260725-0240/lldb.log` has SHA-256
+`1cda714c721692ab2233ff022b9a65532db0058eb4f748062773faf666bf3fc2`.
+Its WindowServer log has SHA-256
+`3da7ce62abfceda43a0800f54b90f7d9c2d5e499a343b19375919cb005a321a3`.
+Post-fix artifacts under
+`/tmp/macws-pf550-address-fix-20260725-0255` have SHA-256
+`8a12309aff6bb0ece6cd269af6f5a85581f3cc96c6670d8d5fe3f8d2df84d3f4`
+(LLDB) and
+`7facd03b8bdeea50be352717b6953b8da94a66a99cbfcb26f340ec4f34400ba8`
+(WindowServer).
+
 ## Next runtime experiment
 
-1. At `updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:`
-   static `0x1e5770c50`, dump the internal device pointer and its `+0x418`
-   feature word for the controlled pf550 texture. Compare against the
-   iOS-native reference path before changing either field.
-2. Fix the upstream cross-image feature/metadata contract identified by that
-   comparison, then require the completed descriptor to match the native
-   `layout=3 compressed=1` semantics and the pf550 shader-read command to
-   complete without a GPU report.
+1. Start WindowServer without the debugger or suspend-at-exec flag, enable VNC,
+   and record the next production failure or first nonzero framebuffer witness.
+2. Require the completed pf550 descriptor to match the native
+   `layout=3 compressed=1` semantics and the shader-read command to complete
+   without a new GPU report; do not infer this merely from initializer success.
 3. Re-run the BGRA control and pf550 read into the VNC IOSurface, then capture
    GlassDemo with title bar, controls, and visible
    `NSVisualEffectView` backdrop blur.
