@@ -478,21 +478,88 @@ code=0x18a721e00 autda@0x18a721e10 insn=0xdac11a30
 This fixes the hook's own pointer invariant; it is not a GPU fix and does not
 change the status of the arm64e host's separate constant-NSString ABI crash.
 
+### Runtime-confirmed: resource tail ABI translation fixes the native AGX page fault
+
+The earlier pinned-VA theory was incomplete.  RE of the actual wrappers shows
+that the kernel resource-create output at `+0x00` is the GPU address:
+
+- iOS 16.3 `_IOGPUResourceCreate` at `0x1eec60040` copies kernel output
+  `+0x00` into `IOGPUResource+0x38`; `IOGPUResourceGetGPUVirtualAddress` at
+  `0x1eec652a4` returns that field, and `-[IOGPUMetalResource gpuAddress]` at
+  `0x1eec6f110` returns the value subsequently stored in its `+0x48` ivar.
+- macOS 13.4 has the same output flow in `_IOGPUResourceCreate` at
+  `0x19d1560a0` and `-[IOGPUMetalResource gpuAddress]` at `0x19d15068c`.
+- RE-confirmed in the iOS kernel at
+  `IOGPUDevice::new_resource+0x610` (`0xfffffe0009f0415c`): a no-parent
+  type-0 allocation reads its byte count from request `+0x40` before calling
+  the resource allocator at `0xfffffe0009f04180`.
+
+The project LLDB return tracer then captured complete 104-byte native iOS
+requests.  Matching internal allocations differ from the macOS 13.4 request
+by a tail-field shift:
+
+```text
+                       +0x40      +0x48      +0x50       +0x58
+macOS f14=0x8430       0          0x8000     0           0x48000000
+iOS   f14=0x8430       0x8000     0          0x48000000  0
+```
+
+The native calls returned `0x18000`, `0x28000`, and `0x1100038000` for the
+three `f14=0x8430` resources.  With only the size translated and `+0x50`
+left zero, the chroot instead received ordinary addresses such as
+`0x15000b8000`; its GPU fault was exactly `0x11000b8000`, the same value with
+bit 34 clear.  The matching report is
+`/tmp/gpuEvent-agxprobe_arm64-2026-07-24-104713.ips`, SHA-256
+`9fa98c5d9a74d49e80821efcd7abc973151bb03b3061862e6385a102e9f175e8`.
+
+The translator now performs the upstream request conversion for no-parent
+type-0 resources:
+
+```text
+iOS +0x40 = macOS allocation span from +0x48
+iOS +0x48 = 0
+iOS +0x50 = low 32 bits of macOS +0x58 (the address arena)
+iOS +0x58 = 0
+```
+
+This is not a returned-address rewrite or a nil/zero-object scaffold.  The
+iOS kernel now allocates the resource in the address arena requested by the
+macOS AGX userland.  Runtime-confirmed after rebuilding:
+
+```text
+f14=0x8430 SENT +40=0x8000 +48=0 +50=0x48000000 +58=0
+f14=0x8430 RETURN +00=0x18000
+f14=0x8430 RETURN +00=0x28000
+f14=0x8430 SENT +40=0x8000 +48=0 +50=0x28000000 +58=0
+f14=0x8430 RETURN +00=0x1100038000
+AGXPROBE [4d] status=4 error=none
+AGXPROBE [4e] readback[0]=0xab [4095]=0xab
+```
+
+Artifact `/tmp/agxprobe-arena-shift-stage4-real.log`, SHA-256
+`b9202c91ce0efea36eb1de18a43fcd4cb19bf55ffbc1b36401f7e4ce3b9213e9`.
+The full native request trace is
+`/tmp/lldb-pin-native-fulltype0.log`, SHA-256
+`710330858d59b48426c5850d4bfdbe68266c9fef67272b92eb55ec4117f75b5a`.
+No new GPU event was emitted by the successful run.
+
+This closes the isolated BIF0 page-fault blocker.  The stage-4 submission
+still uses the explicitly labelled `TEMP-KCMD-ABI-FIX` to normalize the
+macOS subtype-3 command record from `0x210` to the native iOS `0x200` shape;
+that remaining diagnostic scaffold must be replaced by a semantic command
+ABI translation before the native path can be called production-ready.
+
 ## Next runtime experiment
 
-1. Instrument the isolated arm64 chroot `agxprobe` to print the buffer's real
-   `gpuAddress` and capture both the pre-translation and post-translation
-   selector-`0x9` bytes plus the complete resource-create output.
-2. RE the actual iOS 16.3 `IOGPUResourceCreate` and
-   `-[IOGPUMetalBuffer gpuAddress]` implementations to label those output
-   fields. Do not infer a field solely because it looks pointer-shaped.
-3. If the buffer accessor's VA is absent from the iOS request, test an
-   upstream resource translation which requests that exact VA at the
-   RE/runtime-confirmed `+0x20/+0x28` fields. Mapping a zero-filled page only
-   to suppress the BIF0 fault is a diagnostic scaffold, not a fix.
-4. Require isolated stage-4 readback `0xab/0xab` before restarting
-   WindowServer. Then require the clear-control VNC pixel, followed by the
-   GlassDemo blur capture.
+1. Run isolated `agxprobe` stage 5 and require a completed render command plus
+   a red pixel read from its IOSurface-backed texture.
+2. Replace `TEMP-KCMD-ABI-FIX` with a field-level subtype-3 translator backed
+   by macOS/iOS producer and parser disassembly; retain the `0x200` stage-4
+   witness as the regression test.
+3. Start WindowServer in a bounded session and require non-zero VNC pixels
+   and advancing completed command buffers before launching GlassDemo.
+4. Capture the clear-control image, then GlassDemo with title bar, controls,
+   and visible `NSVisualEffectView` backdrop blur.
 
 ## Success criteria
 
