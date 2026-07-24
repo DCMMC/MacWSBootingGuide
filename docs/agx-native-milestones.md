@@ -651,15 +651,95 @@ the same IOGPU submit boundary with the project's LLDB tooling.  Its resource
 requests, subtype-1 record, and referenced GPU addresses will be compared
 field-by-field with the chroot draw before any further translator change.
 
+### Runtime-confirmed: pf550 descriptor divergence is owned by the compression gate
+
+The project LLDB tooling captured the same 2388x1668 private pixel-format-550
+IOSurface texture in an iOS-native reference and in chroot WindowServer.  Mesa
+Asahi's generated texture XML provides the independent field map for the
+24-byte hardware descriptor: layout is bits 4..5, address is bits 66..101
+shifted by four, compressed is bit 103, extended is bit 127, and the low 36
+bits of the final word encode the acceleration/metadata address shifted by
+four.
+
+The native iOS texture finished initialization with:
+
+```text
+descriptor offset in native impl = +0x180
+layout=3 compressed=1 extended=1
+address=0x1500068000
+accelerationLow36=0x1501009800
+acceleration = address + 0xfa1800 (the IOSurface pixel-plane span)
+bytes=32b30a36950c1a0000a00140854025808009105051090000
+```
+
+Runtime artifact `/tmp/lldb-native-pf550-texture.log`, SHA-256
+`1740e33be288d0ccd729f59d765a11dd9122ff0d5899af4973ecc2ac4f51372f`.
+The raw native object/implementation dumps have SHA-256
+`db5cda5aca5fec8c426cd25909c0d435c8c8644440fdfea88ea84671479d9527`
+and `9abb3d1020f5a3bce1f8a61855d7bf5874a1ae557aa6727d5669c7d53b227994`.
+
+The corresponding chroot texture finished initialization with a different
+private-object layout and, more importantly, different descriptor semantics:
+
+```text
+descriptor offset in macOS impl = +0x190
+layout=0 compressed=0 extended=1
+address=0x1500070000
+accelerationLow36=0x1500053e00
+bytes=02b30a36950c1a0000c0014005c05fa8e0530050f1850100
+```
+
+The previous GPU fault at `0x150006c500` is below the primary base by
+`0x3b00`; the malformed acceleration address is below that same base by
+`0x1c200`.  This numerical relationship explains why the descriptor is the
+immediate read-fault boundary, but it does not by itself identify the owner.
+
+The upstream owner was then observed at the actual five-argument macOS AGX
+method, static `0x1e57716b4`.  At entry for this exact texture, its 24-byte
+hardware descriptor was still zero and LLDB recorded:
+
+```text
+PF550-UPDATEBIND SEEN count=1 texture=0x146f49430 impl=0x146f49640
+candidate=1x1 layout=0 compressed=0 extended=0
+gpuVA(x4)=0x1500070000 isCompressible(x5)=0
+raw=000000000000000000000000000000000000000000000000
+```
+
+After the method returned, the same texture/impl pair was logged with the
+`layout=0 compressed=0` descriptor above.  This is runtime-confirmed evidence
+that `texBaseAddressesUpdated` is consuming an explicit
+`isCompressible=0`; directly rewriting the completed descriptor would only
+mask the broken upstream invariant.
+
+RE-confirmed in the actual macOS 13.4 AGX image: the three-argument wrapper at
+static `0x1e5770c1c` computes the five-argument call.  It loads an internal
+device pointer, tests `internal+0x1d8`, then tests `*(internal+0x1d8)+0x418`.
+Either zero branch supplies `metadataAddress=0` and `isCompressible=0`; only
+the nonzero path computes a metadata address and sets `isCompressible=1`
+before dispatching the five-argument selector.  **THEORY:** one of these two
+feature-state fields is missing or zero because macOS AGX setup is reading an
+iOS cross-image object with a different initialization/layout contract.  The
+next LLDB stop at static `0x1e5770c50` will distinguish the two branches and
+must precede any fix.
+
+Chroot artifacts are archived under
+`/tmp/macws-pf550-updatebind-20260724-2316`: `WindowServer.err` SHA-256
+`697693a8eca340dd3c9c9971e624b07adfc2690b38a31196776dc70c1f15a484`
+and LLDB session SHA-256
+`a2d21bb34d00f9baa23eb041f7b83961172ef7b056129261e5dca05910494224`.
+
 ## Next runtime experiment
 
-1. Capture an iOS-native textured draw through the same IOGPU submit boundary
-   and compare its subtype-1 layout and address-bearing fields against the
-   chroot draw that triggers GPU recovery.
-2. Fix the upstream command/resource ABI mismatch identified by that A/B
-   comparison, then require advancing completed command buffers and non-zero
-   VNC pixels before launching GlassDemo.
-3. Capture GlassDemo with title bar, controls, and visible
+1. At `updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:`
+   static `0x1e5770c50`, dump the internal device pointer and its `+0x418`
+   feature word for the controlled pf550 texture. Compare against the
+   iOS-native reference path before changing either field.
+2. Fix the upstream cross-image feature/metadata contract identified by that
+   comparison, then require the completed descriptor to match the native
+   `layout=3 compressed=1` semantics and the pf550 shader-read command to
+   complete without a GPU report.
+3. Re-run the BGRA control and pf550 read into the VNC IOSurface, then capture
+   GlassDemo with title bar, controls, and visible
    `NSVisualEffectView` backdrop blur.
 4. Replace both `TEMP-KCMD-ABI-FIX` paths with field-level subtype-1 and
    subtype-3 translators backed by macOS/iOS producer and kernel-parser
