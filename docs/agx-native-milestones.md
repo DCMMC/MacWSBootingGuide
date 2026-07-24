@@ -601,17 +601,70 @@ the CPU.  This does not yet prove WindowServer compositing, tile pipelines,
 or blur, and the subtype-1 plus subtype-3 byte-deletion normalizers remain
 explicitly diagnostic scaffolds.
 
+### Runtime-confirmed: WindowServer high-resolution clear passes; textured draw reaches GPU recovery
+
+The same subtype-1 diagnostic normalizer was then exercised by WindowServer
+against its real 2388x1668 BGRA8 IOSurface.  The final clear-control command
+used submit scalar `[0] = 4`; all subtype-1 structural anchors matched and the
+normalizer converted its record from `0x840` to `0x820`.  The native AGX GPU
+wrote the expected center pixel:
+
+```text
+#520 scalar0=0x4 ...
+TEMP-KCMD-ABI-FIX subtype1-clear pads=0x1c0,0x4c0 total=0x840->0x820
+VNC-FINAL clear-control executed=YES pixel=OK center=804020ff
+```
+
+Runtime artifact `/tmp/windowserver-native-clear-pass-20260724.log`, SHA-256
+`35b8de4e02fd6307080d331b2563d150353cbbdee40ca02411c4a3fd67db6161`.
+This disproves the earlier diagnostic gate's assumption that only scalar
+values 1 and 3 can carry this record shape.  The scalar is outside the record
+being transformed, so it was removed from the gate; the complete record,
+segment, zero-pad, and sentinel predicates remain mandatory.
+
+WindowServer's shader draw has the same framing but preserves operation state
+`0x100` at record offset `+0x4d4`, whereas the clear control carries `0x300`.
+Accepting those two observed states allowed both draw records to reach the
+kernel parser.  The clear still completed, but the subsequent draw command
+buffer was discarded during GPU recovery:
+
+```text
+#510/#513 clear normalized, clear-control pixel OK center=804020ff
+#515/#516 shader draw records normalized
+VNC-FINAL pass MACWS VNC BGRA8 shader control error:
+Discarded (victim of GPU error/recovery) (00000005 InnocentVictim)
+encoder state=2
+VNC-FINAL control clear=OK texture=... draw=FAIL pixel=UNREAD
+```
+
+Runtime artifact `/tmp/windowserver-native-draw-fault-20260724.log`, SHA-256
+`6e0c9e07307962fed3c558401551bab8b2bb978575f1424a99ea41672bac2c87`.
+No new `.ips` was emitted for that run.  The reports still on disk had older
+13:45 timestamps, so none is attributed to this command.  On 2026-07-24 the
+device's 51 project-related `gpuEvent`, WindowServer, agxprobe, and GlassDemo
+reports were cleared after archiving the 46 WindowServer/GPU reports locally
+at `/tmp/macws-device-crash-archive-20260724-1400`; this resets the report set
+for a one-run/one-fault correlation.
+
+The next evidence target is an iOS-native textured-draw reference captured at
+the same IOGPU submit boundary with the project's LLDB tooling.  Its resource
+requests, subtype-1 record, and referenced GPU addresses will be compared
+field-by-field with the chroot draw before any further translator change.
+
 ## Next runtime experiment
 
-1. Start WindowServer in a bounded session with the diagnostic command-layout
-   normalizers and require non-zero VNC pixels plus advancing completed
-   command buffers before launching GlassDemo.
-2. Capture the clear-control image, then GlassDemo with title bar, controls,
-   and visible `NSVisualEffectView` backdrop blur.
-3. Replace both `TEMP-KCMD-ABI-FIX` paths with field-level subtype-1 and
+1. Capture an iOS-native textured draw through the same IOGPU submit boundary
+   and compare its subtype-1 layout and address-bearing fields against the
+   chroot draw that triggers GPU recovery.
+2. Fix the upstream command/resource ABI mismatch identified by that A/B
+   comparison, then require advancing completed command buffers and non-zero
+   VNC pixels before launching GlassDemo.
+3. Capture GlassDemo with title bar, controls, and visible
+   `NSVisualEffectView` backdrop blur.
+4. Replace both `TEMP-KCMD-ABI-FIX` paths with field-level subtype-1 and
    subtype-3 translators backed by macOS/iOS producer and kernel-parser
    disassembly; retain stages 4 and 5 as regression tests.
-4. Re-run WindowServer without the byte-deletion diagnostic scaffold and
+5. Re-run WindowServer without the byte-deletion diagnostic scaffold and
    reproduce the VNC and blur witnesses.
 
 ## Success criteria
