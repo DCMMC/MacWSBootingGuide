@@ -549,17 +549,70 @@ macOS subtype-3 command record from `0x210` to the native iOS `0x200` shape;
 that remaining diagnostic scaffold must be replaced by a semantic command
 ABI translation before the native path can be called production-ready.
 
+### Runtime-confirmed: native render pass writes the expected IOSurface pixel
+
+The first isolated stage-5 run, with the resource-tail fix but without the
+subtype-1 diagnostic normalization, created a real IOSurface-backed texture
+and render encoder but ended with:
+
+```text
+AGX_SUBMIT_DIAG #2 scalars[4]: 0x1 0 0x1 0x38 fix-requested=YES
+AGX_SUBMIT_DIAG #2 record[0] off=0 type=0x10000 end=0x818 size=0x7e8 inner=0x30 subtype=1
+AGX_SUBMIT_DIAG #2 result=0 records=1 candidates=0 fixed=0
+AGXPROBE [5d] render status=5 error=Internal Error (00000102:Internal Error)
+AGXPROBE [5e] pixel[0] BGRA = 00 00 00 00
+```
+
+Artifact `/tmp/agxprobe-arena-shift-stage5.log`, SHA-256
+`2bf6c4481bf646bd674daf08223ca6d5b5ea4f80c3ba3ac2e8bbc731d203c9b1`.
+The record has the same complete `0x840 / 0x818 / 0x7e8` macOS subtype-1
+layout and structural anchors as the earlier VNC clear control, but its
+submit scalar `[0]` is `1` rather than `3`.  The diagnostic gate was expanded
+only to accept scalar `[0]` in `{1,3}`; all framing fields, both zero-pad
+windows, and every stable surrounding-byte anchor remain mandatory.  This is
+an A/B experiment, not evidence that scalar values 1 and 3 are semantically
+equivalent.
+
+After rebuilding, the same stage-5 probe completed on the real iOS AGX
+driver and wrote the exact clear color into the IOSurface:
+
+```text
+AGX_SUBMIT_DIAG #2 record[0] off=0 type=0x10000 end=0x818 size=0x7e8 inner=0x30 subtype=1
+AGX_SUBMIT_DIAG #2 TEMP-KCMD-ABI-FIX subtype1-clear pads=0x1c0,0x4c0 total=0x840->0x820 size=0x7e8->0x7c8 end=0x818->0x7f8 segment-span=0x840->0x820
+AGX_SUBMIT_DIAG #2 result=0 records=1 candidates=1 fixed=1
+AGXIOC Method sel=0x1e->0x1a inCnt=4 inSC=56 outSC=0 -> 0x0
+AGXPROBE [5d] render status=4 error=none
+AGXPROBE [5e] pixel[0] BGRA = 00 00 ff ff (expect red: 00 00 ff ff)
+AGXPROBE OK — IOSurface RENDER PATH WORKS (content rendering is fine!)
+```
+
+Artifact `/tmp/agxprobe-stage5-subtype1-ab.log`, SHA-256
+`e2562b6c0b0ff1372a9873dd73dae1b64a6ce2b9f74a104da50e9668a896216e`.
+The normalized `0x820` KCMD is
+`/tmp/agxprobe-stage5-kcmd-post.bin`, SHA-256
+`fa0a44db42a8381fd230d370420d7d75b9dd0947e5535ae454df0a4387226b31`.
+At device time 11:18, the latest GPU event remained the older 10:59 report;
+this successful run emitted no new GPU fault.
+
+The narrow conclusion is that a macOS process in the chroot can now create an
+IOSurface-backed AGX texture, submit a native render pass through the iOS AGX
+kernel driver, wait for completion, and observe the GPU-written pixel from
+the CPU.  This does not yet prove WindowServer compositing, tile pipelines,
+or blur, and the subtype-1 plus subtype-3 byte-deletion normalizers remain
+explicitly diagnostic scaffolds.
+
 ## Next runtime experiment
 
-1. Run isolated `agxprobe` stage 5 and require a completed render command plus
-   a red pixel read from its IOSurface-backed texture.
-2. Replace `TEMP-KCMD-ABI-FIX` with a field-level subtype-3 translator backed
-   by macOS/iOS producer and parser disassembly; retain the `0x200` stage-4
-   witness as the regression test.
-3. Start WindowServer in a bounded session and require non-zero VNC pixels
-   and advancing completed command buffers before launching GlassDemo.
-4. Capture the clear-control image, then GlassDemo with title bar, controls,
+1. Start WindowServer in a bounded session with the diagnostic command-layout
+   normalizers and require non-zero VNC pixels plus advancing completed
+   command buffers before launching GlassDemo.
+2. Capture the clear-control image, then GlassDemo with title bar, controls,
    and visible `NSVisualEffectView` backdrop blur.
+3. Replace both `TEMP-KCMD-ABI-FIX` paths with field-level subtype-1 and
+   subtype-3 translators backed by macOS/iOS producer and kernel-parser
+   disassembly; retain stages 4 and 5 as regression tests.
+4. Re-run WindowServer without the byte-deletion diagnostic scaffold and
+   reproduce the VNC and blur witnesses.
 
 ## Success criteria
 
