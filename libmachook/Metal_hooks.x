@@ -182,6 +182,18 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                     if (!atomic_load(&g_vnc_final_available)) {
                         @synchronized(g_vnc_lock) {
                             t = macws_vnc_retain(g_vnc_comp_tex);
+                            // Consume each completed composite once.  The old
+                            // loop retained and re-blitted the same texture at
+                            // 20 fps forever; runtime lifecycle logs showed
+                            // that this eventually advanced IOMFB into a
+                            // PF550 SwapCancel/replacement-surface storm even
+                            // though no new VNC frame existed.  A later frame
+                            // replaces this slot in macws_vnc_on_composite,
+                            // naturally coalescing producers faster than the
+                            // background copy without dropping ownership.
+                            id consumed = g_vnc_comp_tex;
+                            g_vnc_comp_tex = nil;
+                            macws_vnc_release(consumed);
                         }
                     }
                     if (t) {
@@ -278,7 +290,7 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                     }
                     macws_vnc_release(t);
                 }
-                usleep(50000);   // ~20 fps
+                usleep(50000);   // poll for a newly completed/coalesced frame
             }
         }];
     });
@@ -788,18 +800,24 @@ void macws_vnc_finish_update(void *context) {
     }
     if (!texture) return;
 
-    // Deep capture remains an explicit diagnostic.  Before it is armed we
-    // still pair the composite/update state correctly, but retain no frame or
-    // command buffer and impose no asynchronous wait load on WindowServer.
-    if (access("/tmp/macws_capture_final", F_OK) != 0) {
+    unsigned long pixelFormat = (unsigned long)[texture pixelFormat];
+    BOOL deepCapture = access("/tmp/macws_capture_final", F_OK) == 0;
+
+    // The ordinary VNC bridge consumes the completed, uncompressed PF80/115
+    // composite and never needs physical-display scanout.  PF550 remains an
+    // explicitly armed deep diagnostic: without the sentinel, do not retain
+    // or wait on compressed IOMFB page surfaces.  Runtime A/B on 2026-07-25
+    // captured the complete blurred GlassDemo from PF80 with no VNC-FINAL
+    // capture and a stable ~65 MiB type-82 footprint.
+    BOOL observeCurrent = deepCapture || pixelFormat == 80 || pixelFormat == 115;
+    if (!observeCurrent) {
         macws_vnc_release(texture);
         return;
     }
 
     id<MTLCommandBuffer> commandBuffer = macws_vnc_retain(
         *(id<MTLCommandBuffer> *)((char *)context + 0x68));
-    if (!commandBuffer ||
-        ![commandBuffer respondsToSelector:@selector(waitUntilCompleted)]) {
+    if (!commandBuffer || ![commandBuffer respondsToSelector:@selector(status)]) {
         static int missingLog = 0;
         if (missingLog++ < 4) {
             fprintf(stderr,
@@ -812,58 +830,60 @@ void macws_vnc_finish_update(void *context) {
         return;
     }
 
-    unsigned long pixelFormat = (unsigned long)[texture pixelFormat];
-    IOSurfaceRef surface = NULL;
-    if (pixelFormat == 550) {
-        void *impl = *(void **)((char *)(__bridge void *)texture + 0x208);
-        if ((uintptr_t)impl > 0x1000) {
-            surface = *(IOSurfaceRef *)((char *)impl + 0xa0);
-            if (surface) CFRetain(surface);
-        }
-    }
-
-    // One in-flight wait is enough for a screenshot and bounds retained
-    // display surfaces if WindowServer produces frames faster than the GPU.
-    static _Atomic int waitInFlight = 0;
-    if (atomic_exchange(&waitInFlight, 1)) {
-        if (surface) CFRelease(surface);
+    // EndUpdate/Flush has already committed this buffer.  Metal aborts if an
+    // addCompletedHandler: is added here (runtime-confirmed by the assertion
+    // "Completed handler provided after commit call" and the matching crash
+    // frame at Metal_hooks.x:856).  A background wait is also not purely
+    // observational: it changes the timing of the PF550/SwapCancel transition
+    // (a no-wait control proved the transition also occurs naturally).  Instead,
+    // One read-only observer is enough: it polls status for at most two
+    // seconds, but never waits, commits, or registers a post-commit handler.
+    // This lets the initial PF80 frame reach the mmap before the VNC-only
+    // session would otherwise enter its IOMFB PF550 capture cycle.
+    static _Atomic int pollInFlight = 0;
+    if (atomic_exchange(&pollInFlight, 1)) {
         macws_vnc_release(commandBuffer);
         macws_vnc_release(texture);
         return;
     }
-    static dispatch_queue_t waitQueue = NULL;
-    static dispatch_once_t waitOnce;
-    dispatch_once(&waitOnce, ^{
-        waitQueue = dispatch_queue_create(
-            "com.macwsguide.vnc-command-completion", DISPATCH_QUEUE_SERIAL);
-    });
-    dispatch_async(waitQueue, ^{
-        [commandBuffer waitUntilCompleted];
-        MTLCommandBufferStatus status = [commandBuffer status];
-        NSError *error = [commandBuffer error];
-        static _Atomic int waitLog = 0;
-        int n = atomic_fetch_add(&waitLog, 1);
-        if (n < 16) {
-            fprintf(stderr,
-                "#### VNC-ENDUPDATE-WAIT #%d context=%p tex=%p pf=%lu "
-                "cb=%p status=%ld error=%s surface=%p\n",
-                n, context, (void *)texture, pixelFormat,
-                (void *)commandBuffer, (long)status,
-                error ? [[error description] UTF8String] : "nil",
-                (void *)surface);
-        }
-        if (status == MTLCommandBufferStatusCompleted && !error) {
-            if (pixelFormat == 550 && surface) {
-                macws_vnc_track_final(texture, surface);
-            } else if (pixelFormat == 80 || pixelFormat == 115) {
-                macws_vnc_on_composite(texture);
+    [NSThread detachNewThreadWithBlock:^{
+        @autoreleasepool {
+            MTLCommandBufferStatus status = [commandBuffer status];
+            unsigned polls = 0;
+            while (status != MTLCommandBufferStatusCompleted &&
+                   status != MTLCommandBufferStatusError && polls < 400) {
+                usleep(5000);
+                status = [commandBuffer status];
+                polls++;
             }
+            NSError *error = status == MTLCommandBufferStatusError
+                ? [commandBuffer error] : nil;
+            unsigned long completedPF = (unsigned long)[texture pixelFormat];
+            static _Atomic int pollLog = 0;
+            int n = atomic_fetch_add(&pollLog, 1);
+            if (n < 16) {
+                fprintf(stderr,
+                    "#### VNC-ENDUPDATE-POLL #%d context=%p tex=%p pf=%lu "
+                    "cb=%p status=%ld polls=%u error=%s\n",
+                    n, context, (void *)texture, completedPF,
+                    (void *)commandBuffer, (long)status, polls,
+                    error ? [[error description] UTF8String] : "nil");
+            }
+            if (status == MTLCommandBufferStatusCompleted && !error) {
+                if (completedPF == 550) {
+                    void *impl = *(void **)((char *)(__bridge void *)texture + 0x208);
+                    IOSurfaceRef surface = (uintptr_t)impl > 0x1000
+                        ? *(IOSurfaceRef *)((char *)impl + 0xa0) : NULL;
+                    if (surface) macws_vnc_track_final(texture, surface);
+                } else if (completedPF == 80 || completedPF == 115) {
+                    macws_vnc_on_composite(texture);
+                }
+            }
+            macws_vnc_release(commandBuffer);
+            macws_vnc_release(texture);
+            atomic_store(&pollInFlight, 0);
         }
-        if (surface) CFRelease(surface);
-        macws_vnc_release(commandBuffer);
-        macws_vnc_release(texture);
-        atomic_store(&waitInFlight, 0);
-    });
+    }];
 }
 
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge

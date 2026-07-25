@@ -260,6 +260,8 @@ static _Thread_local uint64_t g_macws_agx_initfull_len = 0;
 // this to translate physical-panel SwapEnd into SwapCancel while leaving the
 // rest of Apple's kern_SwapEnd cleanup intact.
 static _Atomic int g_macws_iomfb_coexist_swap_cancel = 0;
+static void macws_install_quartzcore_frame_info_hook(
+    const struct mach_header *header);
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -1123,12 +1125,44 @@ int hooked_skylight_start_composite_wscd(void *self, void *dest,
         extern NSMutableDictionary *g_wscd_tex;
         if (g_wscd_tex && dest) {
             id tex = nil;
+            NSValue *key = [NSValue valueWithPointer:dest];
             @synchronized(g_wscd_tex) {
-                tex = g_wscd_tex[[NSValue valueWithPointer:dest]];
+                tex = g_wscd_tex[key];
             }
             if (tex) {
                 extern void macws_vnc_stage_composite(void *, id);
                 macws_vnc_stage_composite(self, tex);
+
+                // g_wscd_tex is only the hand-off from
+                // WSCompositeDestinationCreateWithMetalTexture to the first
+                // successful StartComposite.  The composite stack now owns
+                // the texture for the matching EndCurrentComposite, so
+                // retaining it in both places indefinitely leaks one pf550
+                // AGX resource for nearly every display update.  Remove only
+                // the exact value we consumed; an unsuccessful StartComposite
+                // leaves its mapping available for a legitimate retry.
+                NSUInteger before = 0, after = 0;
+                BOOL consumed = NO;
+                @synchronized(g_wscd_tex) {
+                    before = g_wscd_tex.count;
+                    if (g_wscd_tex[key] == tex) {
+                        [g_wscd_tex removeObjectForKey:key];
+                        consumed = YES;
+                    }
+                    after = g_wscd_tex.count;
+                }
+                if (consumed) {
+                    static _Atomic unsigned long consume_count = 0;
+                    unsigned long n =
+                        atomic_fetch_add(&consume_count, 1) + 1;
+                    if (n <= 24 || (n % 600) == 0) {
+                        fprintf(stderr,
+                            "#### WSCD-MAP consume #%lu dest=%p tex=%p "
+                            "count=%lu->%lu\n",
+                            n, dest, (void *)tex,
+                            (unsigned long)before, (unsigned long)after);
+                    }
+                }
             }
         }
     }
@@ -1168,8 +1202,9 @@ static void hooked_skylight_end_current_composite(void *self, bool synchronize) 
 // RE-confirmed via the same live SkyLight image: EndUpdate(bool) reaches
 // MetalContext::Flush at +0x78 only when _update_depth (self+0x178) drops from
 // one to zero.  Flush ends encoders, commits the command buffer, retains that
-// submitted buffer at self+0x68, and clears self+0x60.  The VNC worker waits on
-// that exact buffer off the render thread before reading the staged target.
+// submitted buffer at self+0x68, and clears self+0x60.  The VNC observer keeps
+// one submitted pair per context and polls that buffer's status off the render
+// thread; it does not wait, commit, or add a post-commit completion handler.
 typedef void (*EndUpdate_t)(void *self, bool waitUntilSubmitted);
 static EndUpdate_t orig_skylight_end_update = NULL;
 static void hooked_skylight_end_update(void *self, bool waitUntilSubmitted) {
@@ -1206,18 +1241,31 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
         return NULL;
     }
     void *wscd = orig_skylight_wsccd_with_tex(texture, ctx, protectionOptions, colorspace, region);
-    // Map WSCompositeDestination -> its MTLTexture, so the WSCD-variant
-    // StartComposite hook (the one that fires in coexist) can feed the
-    // VNC completion-capture (which needs the destination texture).
+    // One-shot hand-off from WSCompositeDestination to its MTLTexture.  The
+    // successful StartComposite hook transfers this value into the matching
+    // composite stack and removes the dictionary entry.  Keeping every value
+    // here forever was runtime-correlated with the second, render_update-side
+    // 0x13bc000-byte type-0x82 resource for each pf550 IOSurface.
     if (wscd && texture) {
         static NSMutableDictionary *m = nil; static dispatch_once_t o;
         dispatch_once(&o, ^{ m = [NSMutableDictionary new]; });
         extern NSMutableDictionary *g_wscd_tex; g_wscd_tex = m;
-        @synchronized(m) { m[[NSValue valueWithPointer:wscd]] = texture; }
+        NSUInteger count = 0;
+        @synchronized(m) {
+            m[[NSValue valueWithPointer:wscd]] = texture;
+            count = m.count;
+        }
+        static _Atomic unsigned long insert_count = 0;
+        unsigned long n = atomic_fetch_add(&insert_count, 1) + 1;
+        if (n <= 24 || (n % 600) == 0) {
+            fprintf(stderr,
+                "#### WSCD-MAP insert #%lu dest=%p tex=%p count=%lu\n",
+                n, wscd, (void *)texture, (unsigned long)count);
+        }
     }
     return wscd;
 }
-NSMutableDictionary *g_wscd_tex = nil;  // WSCD ptr (NSValue) -> id<MTLTexture>
+NSMutableDictionary *g_wscd_tex = nil;  // one-shot WSCD ptr -> MTLTexture hand-off
 
 // MetalContext::StopCapture() guard — see install_skylight_prepare_for_use_tolerate_nil_hook()
 // for the call-site explanation.
@@ -1840,6 +1888,15 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
     } else if(!strncmp(info.dli_fname, QuartzCorePath, strlen(QuartzCorePath))) {
+        // The cancellation-completion experiment observes QuartzCore state
+        // immediately after its real FrameInfo registration without changing
+        // IOMFB's function or import slot.  Install that narrow observer only
+        // when explicitly requested before this image loads; with no sentinel
+        // the baseline is byte-for-byte untouched.
+        if (atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
+            access("/tmp/macws_cancel_completion", F_OK) == 0) {
+            macws_install_quartzcore_frame_info_hook(header);
+        }
         // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
         // content gets a GPU surface instead of a CPU bitmap (see OFF_ comment above).
         // Patch `cbz w21, +852` (0x34000155) -> `b +840` (0x14000007).
@@ -5349,8 +5406,13 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
         };
         g_agxLifeLive[type]++;
         g_agxLifeBytes[type] += bytes;
+        // The normal steady-state type-0x82 live set is only 4--6 entries, so
+        // the old `live <= 96` condition logged every frame (hundreds of
+        // create/destroy lines per second) and became its own load source.
+        // Keep full per-operation output opt-in; ordinary runs retain startup
+        // witnesses plus periodic lifecycle summaries.
         if (g_agxLifeCreateOK <= 16 ||
-            (type == 0x82 && g_agxLifeLive[0x82] <= 96) ||
+            getenv("MACWS_AGX_LIFE_VERBOSE") ||
             (g_agxLifeCreateOK % 250) == 0)
             macws_agx_life_summary_locked("CREATE", gid, type,
                                           surface_id, bytes, 0);
@@ -5396,7 +5458,7 @@ static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
         g_agxLifeBytes[type] -= bytes;
         g_agxLife[slot].gid = UINT64_MAX;
         if (g_agxLifeDestroyOK <= 16 ||
-            (type == 0x82 && g_agxLifeLive[0x82] <= 96) ||
+            getenv("MACWS_AGX_LIFE_VERBOSE") ||
             (g_agxLifeDestroyOK % 250) == 0)
             macws_agx_life_summary_locked("DESTROY", gid, type,
                                           surface_id, bytes, kr);
@@ -5428,6 +5490,254 @@ static int caller_is_libmachook(void *ret) {
     const char *base = strrchr(di.dli_fname, '/');
     base = base ? base + 1 : di.dli_fname;
     return strncmp(base, "libmachook", 10) == 0;
+}
+
+// Diagnostic protocol adapter for coexistence-mode IOMFB cancellation.
+//
+// Runtime-confirmed on 2026-07-25 with the exact QuartzCore image
+// CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC:
+//   * IOMobileFramebufferFrameInfo registration returned 0 and enabled the
+//     display's frame-info bit;
+//   * every successful SwapCancel ID (10759...) was subsequently retained in
+//     IOMFBDisplay's pending FrameInfo vector at +0x510/+0x518;
+//   * no frame_info_callback fired, so the vector and 15-MiB IOSurfaces grew
+//     until Jetsam (792819 x 16-KiB resident pages).
+// A cancelled swap has no physical-display completion notification.  Observe
+// Apple's enabled registration state and exact callback/context so the opt-in
+// diagnostic can synthesize the missing *cancellation completion* after the
+// successful Cancel returns.
+// This is deliberately gated by /tmp/macws_cancel_completion until runtime
+// proves callback ordering, bounded ownership, and unchanged VNC pixels.
+typedef void *MacwsIOMobileFramebufferRef;
+typedef void (*MacwsIOMFBFrameInfoCallback)(
+    MacwsIOMobileFramebufferRef framebuffer, uint32_t swap_id,
+    CFDictionaryRef info, void *context);
+
+struct macws_iomfb_frame_registration {
+    MacwsIOMobileFramebufferRef framebuffer;
+    io_connect_t client;
+    MacwsIOMFBFrameInfoCallback callback;
+    void *context;
+};
+
+static pthread_mutex_t g_macws_iomfb_frame_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct macws_iomfb_frame_registration g_macws_iomfb_frame_regs[8];
+static unsigned g_macws_iomfb_frame_reg_count = 0;
+
+// Do not wrap IOMobileFramebufferFrameInfo itself.  Runtime control runs
+// showed that adding a plain-arm64 forwarding frame makes its private callback
+// registration return kIOReturnNoBandwidth, while the untouched QuartzCore
+// call returns success.  Instead observe the immediately following
+// IOMFBServer::enable_frame_info_tag_list call.  RE-confirmed call order at
+// QuartzCore 0x187ac8d44..0x187ac8d70 is:
+//   FrameInfo(...) -> set_frame_info_enabled(status == 0) -> enable_tag_list.
+// The enabled bit written by set_frame_info_enabled is display+0x9a4 bit 35.
+typedef void (*MacwsEnableFrameInfoTagListFunction)(
+    void *server, const char *const *available_tags, size_t available_count,
+    const char *const *requested_tags, size_t requested_count);
+static MacwsEnableFrameInfoTagListFunction
+    g_macws_orig_enable_frame_info_tag_list = NULL;
+static uintptr_t g_macws_quartzcore_header = 0;
+
+static void macws_enable_frame_info_tag_list(
+    void *server, const char *const *available_tags, size_t available_count,
+    const char *const *requested_tags, size_t requested_count) {
+    g_macws_orig_enable_frame_info_tag_list(server, available_tags,
+        available_count, requested_tags, requested_count);
+
+    if (!server || !g_macws_quartzcore_header)
+        return;
+    void *display_holder = *(void **)((char *)server + 0x58);
+    void *display = display_holder;
+    MacwsIOMobileFramebufferRef framebuffer = display_holder
+        ? *(MacwsIOMobileFramebufferRef *)((char *)display_holder + 0x300)
+        : NULL;
+    uint64_t flags = display
+        ? *(const volatile uint64_t *)((const char *)display + 0x9a4)
+        : 0;
+    BOOL frame_info_enabled = (flags & 0x800000000ull) != 0;
+    if (!frame_info_enabled || !framebuffer)
+        return;
+
+    // RE-confirmed via live iOS 16.3.1 kern_SwapEnd: the io_connect_t used for
+    // selector 5 is the uint32_t at IOMobileFramebufferRef+0x14.  QuartzCore's
+    // exact frame_info_callback is at image offset 0x29209c; call its raw code
+    // address from the plain-arm64 WindowServer slice on the main queue.
+    io_connect_t client =
+        *(const volatile io_connect_t *)((const char *)framebuffer + 0x14);
+    MacwsIOMFBFrameInfoCallback callback =
+        (MacwsIOMFBFrameInfoCallback)(g_macws_quartzcore_header + 0x29209c);
+    unsigned registration_slot = 0;
+    pthread_mutex_lock(&g_macws_iomfb_frame_lock);
+    for (; registration_slot < g_macws_iomfb_frame_reg_count;
+         registration_slot++) {
+        if (g_macws_iomfb_frame_regs[registration_slot].framebuffer ==
+            framebuffer) {
+            break;
+        }
+    }
+    if (registration_slot == g_macws_iomfb_frame_reg_count &&
+        registration_slot < sizeof(g_macws_iomfb_frame_regs) /
+                                sizeof(g_macws_iomfb_frame_regs[0])) {
+        g_macws_iomfb_frame_reg_count++;
+    }
+    if (registration_slot < sizeof(g_macws_iomfb_frame_regs) /
+                                sizeof(g_macws_iomfb_frame_regs[0])) {
+        g_macws_iomfb_frame_regs[registration_slot] =
+            (struct macws_iomfb_frame_registration){
+                framebuffer, client, callback, server};
+    }
+    pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
+    fprintf(stderr,
+        "#### IOMFB CANCEL-COMPLETION observed enabled registration "
+        "fb=%p client=%u callback=%p context=%p flags=%#llx slot=%u\n",
+        framebuffer, client, callback, server,
+        (unsigned long long)flags, registration_slot);
+}
+
+static void macws_install_quartzcore_frame_info_hook(
+    const struct mach_header *untyped_header) {
+    // RE-confirmed via the exact macOS 13.4 QuartzCore image:
+    //   UUID CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC
+    //   __TEXT vmaddr                                  0x1879be000
+    //   IOMFBServer::enable_frame_info_tag_list        0x187c5085c
+    //   IOMFBServer::frame_info_callback               0x187c5009c
+    static const uint8_t expected_uuid[16] = {
+        0xcf, 0x85, 0x3b, 0xbd, 0x01, 0xb6, 0x3f, 0x46,
+        0xad, 0xa1, 0xec, 0x70, 0xfd, 0x2d, 0xc9, 0xdc,
+    };
+    static const uint32_t expected_prologue[4] = {
+        0xd503237f, // pacibsp
+        0xd10243ff, // sub sp, sp, #0x90
+        0xa9036ffc, // stp x28, x27, [sp, #0x30]
+        0xa90467fa, // stp x26, x25, [sp, #0x40]
+    };
+    enum {
+        kQuartzCoreEnableFrameInfoTagListOffset = 0x29285c,
+    };
+
+    static _Atomic int installed = 0;
+    if (atomic_exchange(&installed, 1))
+        return;
+
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!header || header->magic != MH_MAGIC_64) {
+        atomic_store(&installed, 0);
+        return;
+    }
+    const uint8_t *command_bytes = (const uint8_t *)(header + 1);
+    BOOL uuid_matches = NO;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *command =
+            (const struct load_command *)command_bytes;
+        if (command->cmd == LC_UUID &&
+            command->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *uuid =
+                (const struct uuid_command *)command;
+            uuid_matches = memcmp(uuid->uuid, expected_uuid,
+                                  sizeof(expected_uuid)) == 0;
+            break;
+        }
+        if (command->cmdsize < sizeof(*command))
+            break;
+        command_bytes += command->cmdsize;
+    }
+    if (!uuid_matches) {
+        fprintf(stderr,
+            "#### IOMFB CANCEL-COMPLETION QuartzCore observer skipped: "
+            "UUID mismatch\n");
+        atomic_store(&installed, 0);
+        return;
+    }
+
+    void *target = (void *)((uintptr_t)header +
+        kQuartzCoreEnableFrameInfoTagListOffset);
+    if (memcmp(target, expected_prologue, sizeof(expected_prologue)) != 0) {
+        const uint32_t *actual = (const uint32_t *)target;
+        fprintf(stderr,
+            "#### IOMFB CANCEL-COMPLETION QuartzCore observer skipped: "
+            "enable-tag-list prologue mismatch %#x %#x %#x %#x\n",
+            actual[0], actual[1], actual[2], actual[3]);
+        atomic_store(&installed, 0);
+        return;
+    }
+
+    g_macws_quartzcore_header = (uintptr_t)header;
+    MSHookFunction(target, (void *)macws_enable_frame_info_tag_list,
+        (void **)&g_macws_orig_enable_frame_info_tag_list);
+    fprintf(stderr,
+        "#### IOMFB CANCEL-COMPLETION QuartzCore observer "
+        "enable-tag-list=%p trampoline=%p callback=%p\n",
+        target, g_macws_orig_enable_frame_info_tag_list,
+        (void *)(g_macws_quartzcore_header + 0x29209c));
+}
+
+static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
+                                                 uint32_t swap_id) {
+    if (access("/tmp/macws_cancel_completion", F_OK) != 0)
+        return;
+
+    struct macws_iomfb_frame_registration registration = {0};
+    pthread_mutex_lock(&g_macws_iomfb_frame_lock);
+    for (unsigned i = 0; i < g_macws_iomfb_frame_reg_count; i++) {
+        if (g_macws_iomfb_frame_regs[i].client == client) {
+            registration = g_macws_iomfb_frame_regs[i];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
+
+    static _Atomic unsigned long scheduled_count = 0;
+    unsigned long sequence = atomic_fetch_add(&scheduled_count, 1) + 1;
+    if (!registration.callback) {
+        if (sequence <= 16 || (sequence % 600) == 0) {
+            fprintf(stderr,
+                "#### IOMFB CANCEL-COMPLETION schedule #%lu swapID=%u "
+                "client=%u FAIL no registration\n",
+                sequence, swap_id, client);
+        }
+        return;
+    }
+
+    if (sequence <= 16 || (sequence % 600) == 0) {
+        fprintf(stderr,
+            "#### IOMFB CANCEL-COMPLETION schedule #%lu swapID=%u "
+            "client=%u fb=%p\n",
+            sequence, swap_id, client, registration.framebuffer);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        // The real callback dictionary contains presentation timing fields.
+        // A cancelled virtual-only frame was never scanned out, so an empty
+        // immutable dictionary truthfully supplies no fabricated timestamps;
+        // QuartzCore still performs its normal collect_frame_info(swap_id)
+        // ownership transition before reading those optional fields.
+        void *display_holder = registration.context
+            ? *(void **)((char *)registration.context + 0x58) : NULL;
+        uintptr_t pending_begin_before = display_holder
+            ? *(const volatile uintptr_t *)((char *)display_holder + 0x510) : 0;
+        uintptr_t pending_end_before = display_holder
+            ? *(const volatile uintptr_t *)((char *)display_holder + 0x518) : 0;
+        size_t pending_before = pending_end_before >= pending_begin_before
+            ? (pending_end_before - pending_begin_before) / sizeof(void *) : 0;
+        NSDictionary *cancelInfo = @{};
+        registration.callback(registration.framebuffer, swap_id,
+            (__bridge CFDictionaryRef)cancelInfo, registration.context);
+        uintptr_t pending_begin_after = display_holder
+            ? *(const volatile uintptr_t *)((char *)display_holder + 0x510) : 0;
+        uintptr_t pending_end_after = display_holder
+            ? *(const volatile uintptr_t *)((char *)display_holder + 0x518) : 0;
+        size_t pending_after = pending_end_after >= pending_begin_after
+            ? (pending_end_after - pending_begin_after) / sizeof(void *) : 0;
+        static _Atomic unsigned long delivered_count = 0;
+        unsigned long delivered = atomic_fetch_add(&delivered_count, 1) + 1;
+        if (delivered <= 16 || (delivered % 600) == 0) {
+            fprintf(stderr,
+                "#### IOMFB CANCEL-COMPLETION delivered #%lu swapID=%u "
+                "client=%u pending=%zu->%zu\n",
+                delivered, swap_id, client, pending_before, pending_after);
+        }
+    });
 }
 
 // Bounded command-submit diagnostics for the native-AGX VNC control pass.
@@ -5763,7 +6073,7 @@ static unsigned macws_translate_agx_multisegment_subtype1(
 static struct macws_submit_diag_result
 macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                          const void *inStruct, size_t inStructCnt,
-                         int allow_fix) {
+                         int allow_fix, int verbose_requested) {
     struct macws_submit_diag_result result = {0};
     result.sequence = atomic_fetch_add(&g_macws_submit_diag_sequence, 1) + 1;
     if (!inStruct || inStructCnt < 0x20)
@@ -5774,7 +6084,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
     // `sequence > 8` early return meant WindowServer's later command buffers
     // silently skipped TEMP-KCMD-ABI-FIX altogether.  Runtime witness:
     // `VNC-FINAL clear-control` then completed with MTL internal error 0x102.
-    int verbose = result.sequence <= 8;
+    int verbose = verbose_requested && result.sequence <= 8;
 
     const unsigned char *submit = (const unsigned char *)inStruct;
     if (verbose) {
@@ -6195,6 +6505,126 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         }
     }
     return result;
+}
+
+// macOS 13.4 and iOS 16.3 use different IOSurface user-client release ABIs.
+// This is an exact two-call-to-one-call protocol adapter, not a generic trap
+// bypass:
+//
+//   macOS IOSurface 2B44B850-7D19-34F3-AB8E-A3B93016A96D
+//     IOSurfaceClientRelease+0xa0: IOConnectTrap1(conn, 4, surfaceID)
+//     release client+0x60
+//     IOSurfaceClientRelease+0x104: IOConnectTrap1(conn, 5, surfaceID)
+//
+//   iOS IOSurface DF041B53-4BAA-3668-8781-43DE39FA8905
+//     release client+0x60
+//     IOConnectCallMethod(conn, 1, &surfaceID, 1, ...)
+//
+// RE-confirmed from the exact framework binaries.  Runtime confirmation from
+// misc/iosurface_release_probe.m is even more direct: 16 create/map/CFRelease
+// pairs left exactly 16 IOSurface regions / 16384 16-KiB pages resident when
+// the macOS trap ABI reached the iOS kernel.  Translate only the two verified
+// call sites.  TLS pairing permits the replacement at the second call site
+// only when trap 5 follows trap 4 with the same connection and surface ID on
+// the same thread.
+struct macws_iosurface_release_pair {
+    io_connect_t connect;
+    uintptr_t surface_id;
+    BOOL armed;
+};
+
+static __thread struct macws_iosurface_release_pair
+    g_macws_iosurface_release_pair;
+
+static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
+                                     const uint8_t expected[16]) {
+    if (!header || header->magic != MH_MAGIC_64)
+        return NO;
+    const uint8_t *command_bytes = (const uint8_t *)(header + 1);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *command =
+            (const struct load_command *)command_bytes;
+        if (command->cmdsize < sizeof(*command))
+            return NO;
+        if (command->cmd == LC_UUID &&
+            command->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *uuid =
+                (const struct uuid_command *)command;
+            return memcmp(uuid->uuid, expected, 16) == 0;
+        }
+        command_bytes += command->cmdsize;
+    }
+    return NO;
+}
+
+kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
+                                  uintptr_t p1) {
+    void *raw_return_address = __builtin_return_address(0);
+    void *return_address = ptrauth_strip(raw_return_address,
+                                         ptrauth_key_return_address);
+
+    // launchdchrootexec can load both libmachook architecture variants.  Let
+    // only the outer interpose inspect IOSurface's caller; an inner interpose
+    // must forward rather than consume the pair a second time.
+    if (caller_is_libmachook(return_address))
+        return IOConnectTrap1(connect, index, p1);
+
+    Dl_info info;
+    static const uint8_t macos_iosurface_uuid[16] = {
+        0x2b, 0x44, 0xb8, 0x50, 0x7d, 0x19, 0x34, 0xf3,
+        0xab, 0x8e, 0xa3, 0xb9, 0x30, 0x16, 0xa9, 0x6d,
+    };
+    BOOL exact_image = NO;
+    if (dladdr(return_address, &info) && info.dli_fbase && info.dli_fname) {
+        const char *image_basename = strrchr(info.dli_fname, '/');
+        image_basename = image_basename ? image_basename + 1 : info.dli_fname;
+        exact_image = strcmp(image_basename, "IOSurface") == 0 &&
+            macws_macho_uuid_matches(
+                (const struct mach_header_64 *)info.dli_fbase,
+                macos_iosurface_uuid);
+    }
+    uintptr_t return_offset = exact_image
+        ? (uintptr_t)return_address - (uintptr_t)info.dli_fbase : 0;
+    uint32_t call_instruction = exact_image
+        ? *((const uint32_t *)return_address - 1) : 0;
+    BOOL exact_first = exact_image && return_offset == 0x4b90 &&
+        call_instruction == 0x94003617 && index == 4;
+    BOOL exact_second = exact_image && return_offset == 0x4bf4 &&
+        call_instruction == 0x940035fe && index == 5;
+
+    if (exact_first) {
+        g_macws_iosurface_release_pair =
+            (struct macws_iosurface_release_pair){connect, p1, YES};
+        // iOS has no first operation.  Its sole release selector belongs at
+        // the second call site, after macOS has released client+0x60.
+        return KERN_SUCCESS;
+    }
+
+    if (exact_second && g_macws_iosurface_release_pair.armed &&
+        g_macws_iosurface_release_pair.connect == connect &&
+        g_macws_iosurface_release_pair.surface_id == p1) {
+        g_macws_iosurface_release_pair.armed = NO;
+        uint64_t surface_id = p1;
+        kern_return_t result = IOConnectCallScalarMethod(
+            connect, 1, &surface_id, 1, NULL, NULL);
+        static _Atomic unsigned long release_count = 0;
+        unsigned long release_n = atomic_fetch_add(&release_count, 1) + 1;
+        if (release_n <= 16 || (release_n % 250) == 0 ||
+            result != KERN_SUCCESS) {
+            fprintf(stderr,
+                "#### IOSURFACE-RELEASE-ABI pair #%lu: conn=%u "
+                "surfaceID=%llu sel=1 -> %#x\n",
+                release_n, connect, (unsigned long long)p1, result);
+        }
+        return result;
+    }
+
+    // A mismatched second half must not inherit a stale pair later.  Preserve
+    // the real trap for this call so an unexpected framework build/sequence
+    // fails observably instead of silently changing semantics.
+    if (exact_second)
+        g_macws_iosurface_release_pair.armed = NO;
+    return IOConnectTrap1(connect, index, p1);
 }
 
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
@@ -6687,12 +7117,22 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
     }
     struct macws_submit_diag_result submit_diag = {0};
-    int submit_diag_active = !skip && IOConnectIsIOGPU(client) &&
-        selector == 0x1a && access("/tmp/macws_submit_diag", F_OK) == 0;
-    if (submit_diag_active) {
-        int allow_fix = access("/tmp/macws_kcmd_fix", F_OK) == 0;
+    int translated_agx_submit = !skip && IOConnectIsIOGPU(client) &&
+        selector == 0x1a;
+    int submit_diag_active = translated_agx_submit &&
+        access("/tmp/macws_submit_diag", F_OK) == 0;
+    int submit_fix_active = translated_agx_submit &&
+        access("/tmp/macws_kcmd_fix", F_OK) == 0;
+    // The ABI translator and the byte-dump diagnostic are independent gates.
+    // Previously, macws_kcmd_fix was silently inert unless submit_diag also
+    // existed, which made the same PF80 submit complete in exclusive tests but
+    // fail with MTL 0x102 in an ordinary VNC run.  Inspection is still needed
+    // to prove all structural anchors before translating, but deep dumps are
+    // emitted only when their own sentinel is present.
+    if (submit_diag_active || submit_fix_active) {
         submit_diag = macws_inspect_agx_submit(
-            in, inCnt, inStruct, inStructCnt, allow_fix);
+            in, inCnt, inStruct, inStructCnt,
+            submit_fix_active, submit_diag_active);
     }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
     if (agxIsRes && resDiagActive && resDiagSequence <= 64) {
@@ -6738,6 +7178,31 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                         "#### AGX_LIFE type82 CREATE stack #%u resourceID=%#llx surf=%#x (%d frames):\n",
                         bt_n + 1, (unsigned long long)gid, surface_id, nf);
                     backtrace_symbols_fd(frames, nf, STDERR_FILENO);
+                }
+
+                // Opt-in diagnostic for the display-sized resources that
+                // dominate long native-AGX sessions.  The first four type-82
+                // calls above happen during compositor bootstrap and miss the
+                // later ~20 MiB CAWindowServerSurface churn.  Record successful
+                // creates only; do not alter the arguments, result, ownership,
+                // or finalize path.  A bounded count keeps a failed experiment
+                // from turning its stderr into another pressure source.
+                if (getenv("MACWS_AGX_LIFE_STACK_LARGE") &&
+                    bytes >= (8ull << 20)) {
+                    static _Atomic unsigned int large_t82_bt_count = 0;
+                    unsigned int large_n =
+                        atomic_fetch_add(&large_t82_bt_count, 1);
+                    if (large_n < 24) {
+                        void *frames[24];
+                        int nf = backtrace(frames, 24);
+                        fprintf(stderr,
+                            "#### AGX_LIFE LARGE-TYPE82 stack #%u "
+                            "resourceID=%#llx surf=%#x bytes=%#llx "
+                            "(%d frames):\n",
+                            large_n + 1, (unsigned long long)gid,
+                            surface_id, (unsigned long long)bytes, nf);
+                        backtrace_symbols_fd(frames, nf, STDERR_FILENO);
+                    }
                 }
             }
         } else if (r != 0) {
@@ -6965,7 +7430,15 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
     // In coexistence, cancel that exact swap through the RE-confirmed iOS ABI
     // instead of presenting to the panel. Return the real cancel status; the
     // caller then continues the remainder of kern_SwapEnd normally.
-    if (!struct_skip && atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
+    // `/tmp/macws_real_swapend` is a short-lived A/B diagnostic only.  It
+    // leaves the verified macOS selector-5 call entirely untouched so we can
+    // measure whether the Cancel substitution itself breaks page ownership.
+    // Do not ship the sentinel: a real SwapEnd can contend with backboardd for
+    // the physical panel in coexistence mode.
+    BOOL realSwapEndDiagnostic =
+        access("/tmp/macws_real_swapend", F_OK) == 0;
+    if (!struct_skip && !realSwapEndDiagnostic &&
+        atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
         orig == 5 && selector == 5 && inStruct && inStructCnt == 0x46c) {
         uint32_t swap_id = *(const volatile uint32_t *)((const char *)inStruct + 0x50);
         uint64_t scalar = swap_id;
@@ -6978,6 +7451,10 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
                 "#### COEXIST SwapCancel #%lu: conn=%u swapID=%u sel=0x34 -> %#x\n",
                 cancel_n, client, swap_id, cancel_r);
         }
+
+        if (cancel_r == KERN_SUCCESS)
+            macws_iomfb_complete_cancelled_swap(client, swap_id);
+
         return cancel_r;
     }
     // AGX GPU device-info query (method 256 / setupImmediate): macOS 13.4 asks for
@@ -6990,6 +7467,23 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
         *outStructCnt = 0x70;
     }
     IOReturn r = IOConnectCallStructMethod(client, selector, inStruct, inStructCnt, outStruct, outStructCnt);
+    // Read-only witness for the exclusive-mode control experiment.  The exact
+    // 0x46c-byte shape is the macOS 13.4 kern_SwapEnd call verified above;
+    // coexistence returns from the narrow SwapCancel branch before reaching
+    // this point.  Do not change the selector, payload, return code, or state.
+    if ((getenv("MACWS_IOMFB_SWAP_TRACE") || realSwapEndDiagnostic) && !struct_skip &&
+        orig == 5 && selector == 5 && inStruct && inStructCnt == 0x46c) {
+        uint32_t swap_id =
+            *(const volatile uint32_t *)((const char *)inStruct + 0x50);
+        static _Atomic unsigned long real_swap_count = 0;
+        unsigned long swap_n = atomic_fetch_add(&real_swap_count, 1) + 1;
+        if (swap_n <= 16 || (swap_n % 600) == 0 || r != KERN_SUCCESS) {
+            fprintf(stderr,
+                "#### IOMFB REAL SwapEnd #%lu: conn=%u swapID=%u "
+                "sel=5 bytes=0x46c -> %#x\n",
+                swap_n, client, swap_id, r);
+        }
+    }
     if(IOConnectIsIOGPU(client) && orig != selector) fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
     return r;
 }
@@ -7020,6 +7514,7 @@ DYLD_INTERPOSE(IOConnectCallStructMethod_new, IOConnectCallStructMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncMethod_new, IOConnectCallAsyncMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncScalarMethod_new, IOConnectCallAsyncScalarMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncStructMethod_new, IOConnectCallAsyncStructMethod);
+DYLD_INTERPOSE(IOConnectTrap1_new, IOConnectTrap1);
 
 // XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
 // signed-equivalent so the kernel runs the full privileged UC-init (sets

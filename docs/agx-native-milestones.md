@@ -995,6 +995,28 @@ gpuEvent or panic was emitted.
 Full excerpts, artifact hashes, and the three crash-report hashes are in
 [`docs/evidence/native-agx-glassdemo-20260725.txt`](evidence/native-agx-glassdemo-20260725.txt).
 
+## 2026-07-25: IOSurface release ABI fixed; native GlassDemo remains bounded
+
+The long-run pressure root cause was the cross-OS IOSurface release ABI, not
+the CA page vector or a missing AGX destroy.  RE of the exact frameworks shows
+macOS 13.4 issuing `IOConnectTrap1` indices 4 then 5, while iOS 16.3.1 releases
+with one selector-1 scalar method after dropping client+0x60.
+
+The new UUID/callsite/instruction/TLS-pair-validated adapter maps those two
+macOS calls to the one real iOS operation.  A Metal-free 16 x 16-MiB probe went
+from 16 surviving IOSurface regions (256 MiB) after balanced `CFRelease`s to no
+IOSurface regions and a 7.6-MiB total footprint.  Under active WindowServer,
+more than 30,000 AGX resource operations left a 43-resource / 78-MiB live set
+and a 165-MiB process footprint instead of the previous multi-gigabyte growth.
+
+A final normal GlassDemo + VNC run held 53--54 IOSurface regions while
+WindowServer footprint decreased from 213 MiB to 189 MiB across about 54 seconds.
+The selector-1 release witness reached 4,250, GlassDemo stayed alive, and RFB
+captured the title bar, controls, and frosted/vibrancy regions.  No new crash
+or Jetsam report appeared.  Full disassembly excerpts, runtime samples, and
+artifact hashes are in
+[`docs/evidence/iosurface-release-abi-20260725.txt`](evidence/iosurface-release-abi-20260725.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator
@@ -1003,5 +1025,7 @@ Full excerpts, artifact hashes, and the three crash-report hashes are in
 2. RE the SystemStatus/NSXPC `objc_msgSend` SIGBUS using the saved reports and
    the project's early-attach LLDB tooling; do not globally bypass XPC or
    Objective-C release/encoding.
-3. Pair type-`0x82` creates/destroys and stop the long-run allocation growth;
-   require stable counters and repeated VNC frames, not process uptime.
+3. Replace the opt-in cancelled-swap completion shim with a production-quality
+   coexistence completion model, then repeat a substantially longer VNC/blur
+   soak.  The catastrophic IOSurface accumulation is fixed; the remaining
+   requirement is protocol confidence rather than process-uptime evidence.
