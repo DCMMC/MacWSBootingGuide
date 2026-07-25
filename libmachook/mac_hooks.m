@@ -16,6 +16,229 @@
 #import <pthread.h>
 #import <limits.h>
 #import <ptrauth.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+
+// GlassDemo blur A/B fixture.  This is deliberately a render-input diagnostic,
+// not a graphics-protocol patch: it inserts a high-frequency stripe view below
+// the demo's existing material=13 / WithinWindow NSVisualEffectView.  The
+// exposed margin and the covered center therefore carry the same source pattern
+// through two paths in one window.  Nothing here changes the effect view's
+// material, blending mode, state, or compositor implementation.
+//
+// Enabled only for the GlassDemo process by MACWS_GLASS_BLUR_AB=1.  AppKit is
+// resolved dynamically because libmachook itself is built against the iOS SDK.
+typedef CGRect (*macws_msg_rect_t)(id, SEL);
+typedef id (*macws_msg_id_t)(id, SEL);
+typedef id (*macws_msg_id_rect_t)(id, SEL, CGRect);
+typedef id (*macws_msg_id_index_t)(id, SEL, NSUInteger);
+typedef BOOL (*macws_msg_bool_id_t)(id, SEL, id);
+typedef NSInteger (*macws_msg_integer_t)(id, SEL);
+typedef NSUInteger (*macws_msg_count_t)(id, SEL);
+typedef void (*macws_msg_void_bool_t)(id, SEL, BOOL);
+typedef void (*macws_msg_void_uint_t)(id, SEL, NSUInteger);
+typedef void (*macws_msg_void_view_order_t)(id, SEL, id, NSInteger, id);
+typedef void (*macws_msg_void_rect_t)(id, SEL, CGRect);
+
+static BOOL macws_glass_blur_ab_is_opaque(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
+    return YES;
+}
+
+static void macws_glass_blur_ab_draw(id self, SEL _cmd, CGRect dirty) {
+    (void)_cmd;
+    (void)dirty;
+    Class colorClass = objc_getClass("NSColor");
+    Class pathClass = objc_getClass("NSBezierPath");
+    if (!colorClass || !pathClass) return;
+
+    CGRect bounds = ((macws_msg_rect_t)objc_msgSend)(self,
+        sel_registerName("bounds"));
+    id black = ((macws_msg_id_t)objc_msgSend)((id)colorClass,
+        sel_registerName("blackColor"));
+    id white = ((macws_msg_id_t)objc_msgSend)((id)colorClass,
+        sel_registerName("whiteColor"));
+    SEL setFill = sel_registerName("setFill");
+    SEL fillRect = sel_registerName("fillRect:");
+
+    // Three spatial frequencies in one source distinguish an opaque flat tint
+    // from a real low-pass backdrop: 4pt bars should be strongly attenuated,
+    // while 48pt bars should retain black/white influence with broadened edges.
+    // The uncovered 28pt top/bottom margins are the sharp-input controls.
+    const CGFloat stripeWidths[3] = { 4.0, 16.0, 48.0 };
+    CGFloat minX = bounds.origin.x;
+    CGFloat maxX = bounds.origin.x + bounds.size.width;
+    CGFloat sectionWidth = bounds.size.width / 3.0;
+    for (NSInteger section = 0; section < 3; section++) {
+        CGFloat sectionMinX = minX + sectionWidth * section;
+        CGFloat sectionMaxX = section == 2 ? maxX : sectionMinX + sectionWidth;
+        CGFloat stripeWidth = stripeWidths[section];
+        NSInteger stripe = 0;
+        for (CGFloat x = sectionMinX; x < sectionMaxX;
+             x += stripeWidth, stripe++) {
+            id color = (stripe & 1) ? white : black;
+            ((void (*)(id, SEL))objc_msgSend)(color, setFill);
+            CGFloat width = x + stripeWidth > sectionMaxX
+                ? sectionMaxX - x : stripeWidth;
+            CGRect r = (CGRect){
+                .origin = { x, bounds.origin.y },
+                .size = { width, bounds.size.height },
+            };
+            ((macws_msg_void_rect_t)objc_msgSend)((id)pathClass, fillRect, r);
+        }
+    }
+}
+
+static void macws_glass_blur_ab_find_effect(id view, Class effectClass,
+                                             id *target) {
+    if (!view || *target) return;
+    if (((macws_msg_bool_id_t)objc_msgSend)(view,
+            sel_registerName("isKindOfClass:"), effectClass)) {
+        NSInteger material = ((macws_msg_integer_t)objc_msgSend)(view,
+            sel_registerName("material"));
+        NSInteger blending = ((macws_msg_integer_t)objc_msgSend)(view,
+            sel_registerName("blendingMode"));
+        if (material == 13 && blending == 1) {
+            *target = view;
+            return;
+        }
+    }
+    id children = ((macws_msg_id_t)objc_msgSend)(view,
+        sel_registerName("subviews"));
+    NSUInteger count = children ? ((macws_msg_count_t)objc_msgSend)(children,
+        sel_registerName("count")) : 0;
+    for (NSUInteger i = 0; i < count && !*target; i++) {
+        id child = ((macws_msg_id_index_t)objc_msgSend)(children,
+            sel_registerName("objectAtIndex:"), i);
+        macws_glass_blur_ab_find_effect(child, effectClass, target);
+    }
+}
+
+static Class macws_glass_blur_ab_stripe_class(void) {
+    Class cls = objc_getClass("MACWSGlassBlurABStripeView");
+    if (cls) return cls;
+    Class superClass = objc_getClass("NSView");
+    if (!superClass) return Nil;
+    cls = objc_allocateClassPair(superClass, "MACWSGlassBlurABStripeView", 0);
+    if (!cls) return objc_getClass("MACWSGlassBlurABStripeView");
+    class_addMethod(cls, sel_registerName("drawRect:"),
+                    (IMP)macws_glass_blur_ab_draw,
+                    "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+    class_addMethod(cls, sel_registerName("isOpaque"),
+                    (IMP)macws_glass_blur_ab_is_opaque, "B@:");
+    objc_registerClassPair(cls);
+    return cls;
+}
+
+static void macws_glass_blur_ab_attempt(unsigned attempt) {
+    Class appClass = objc_getClass("NSApplication");
+    Class effectClass = objc_getClass("NSVisualEffectView");
+    if (!appClass || !effectClass) goto retry;
+
+    id app = ((macws_msg_id_t)objc_msgSend)((id)appClass,
+        sel_registerName("sharedApplication"));
+    id windows = app ? ((macws_msg_id_t)objc_msgSend)(app,
+        sel_registerName("windows")) : nil;
+    NSUInteger windowCount = windows ? ((macws_msg_count_t)objc_msgSend)(windows,
+        sel_registerName("count")) : 0;
+    id target = nil;
+    for (NSUInteger i = 0; i < windowCount && !target; i++) {
+        id window = ((macws_msg_id_index_t)objc_msgSend)(windows,
+            sel_registerName("objectAtIndex:"), i);
+        id content = ((macws_msg_id_t)objc_msgSend)(window,
+            sel_registerName("contentView"));
+        macws_glass_blur_ab_find_effect(content, effectClass, &target);
+    }
+    if (!target) goto retry;
+
+    id parent = ((macws_msg_id_t)objc_msgSend)(target,
+        sel_registerName("superview"));
+    Class stripeClass = macws_glass_blur_ab_stripe_class();
+    if (!parent || !stripeClass) goto retry;
+
+    CGRect effectFrame = ((macws_msg_rect_t)objc_msgSend)(target,
+        sel_registerName("frame"));
+    CGRect parentBounds = ((macws_msg_rect_t)objc_msgSend)(parent,
+        sel_registerName("bounds"));
+    const CGFloat margin = 28.0;
+    CGFloat stripeMinX = effectFrame.origin.x - margin;
+    CGFloat stripeMinY = effectFrame.origin.y - margin;
+    CGFloat stripeMaxX = effectFrame.origin.x + effectFrame.size.width + margin;
+    CGFloat stripeMaxY = effectFrame.origin.y + effectFrame.size.height + margin;
+    CGFloat parentMinX = parentBounds.origin.x;
+    CGFloat parentMinY = parentBounds.origin.y;
+    CGFloat parentMaxX = parentBounds.origin.x + parentBounds.size.width;
+    CGFloat parentMaxY = parentBounds.origin.y + parentBounds.size.height;
+    if (stripeMinX < parentMinX) stripeMinX = parentMinX;
+    if (stripeMinY < parentMinY) stripeMinY = parentMinY;
+    if (stripeMaxX > parentMaxX) stripeMaxX = parentMaxX;
+    if (stripeMaxY > parentMaxY) stripeMaxY = parentMaxY;
+    CGRect stripeFrame = (CGRect){
+        .origin = { stripeMinX, stripeMinY },
+        .size = { stripeMaxX - stripeMinX, stripeMaxY - stripeMinY },
+    };
+    if (stripeFrame.size.width <= 0 || stripeFrame.size.height <= 0) {
+        fprintf(stderr,
+            "#### GLASS-BLUR-AB invalid frame effect=(%.1f %.1f %.1f %.1f) parent=(%.1f %.1f %.1f %.1f)\n",
+            effectFrame.origin.x, effectFrame.origin.y,
+            effectFrame.size.width, effectFrame.size.height,
+            parentBounds.origin.x, parentBounds.origin.y,
+            parentBounds.size.width, parentBounds.size.height);
+        return;
+    }
+
+    id stripe = ((macws_msg_id_rect_t)objc_msgSend)(
+        ((macws_msg_id_t)objc_msgSend)((id)stripeClass, sel_registerName("alloc")),
+        sel_registerName("initWithFrame:"), stripeFrame);
+    if (!stripe) goto retry;
+    ((macws_msg_void_uint_t)objc_msgSend)(stripe,
+        sel_registerName("setAutoresizingMask:"), 0);
+    ((macws_msg_void_view_order_t)objc_msgSend)(parent,
+        sel_registerName("addSubview:positioned:relativeTo:"),
+        stripe, -1 /* NSWindowBelow */, target);
+    ((macws_msg_void_bool_t)objc_msgSend)(stripe,
+        sel_registerName("setNeedsDisplay:"), YES);
+    ((macws_msg_void_bool_t)objc_msgSend)(target,
+        sel_registerName("setNeedsDisplay:"), YES);
+    fprintf(stderr,
+        "#### GLASS-BLUR-AB installed attempt=%u target=%s material=13 blending=1 effect=(%.1f %.1f %.1f %.1f) stripes=(%.1f %.1f %.1f %.1f) periods=8/32/96pt\n",
+        attempt, object_getClassName(target),
+        effectFrame.origin.x, effectFrame.origin.y,
+        effectFrame.size.width, effectFrame.size.height,
+        stripeFrame.origin.x, stripeFrame.origin.y,
+        stripeFrame.size.width, stripeFrame.size.height);
+    return;
+
+retry:
+    if (attempt >= 20) {
+        fprintf(stderr,
+            "#### GLASS-BLUR-AB failed: material=13 blending=1 view not found after %u attempts\n",
+            attempt);
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        macws_glass_blur_ab_attempt(attempt + 1);
+    });
+}
+
+static void macws_install_glass_blur_ab_if_requested(void) {
+    if (!getenv("MACWS_GLASS_BLUR_AB")) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "GlassDemo") != 0) {
+        fprintf(stderr,
+            "#### GLASS-BLUR-AB ignored for process=%s (GlassDemo only)\n",
+            program ?: "(null)");
+        return;
+    }
+    fprintf(stderr,
+        "#### GLASS-BLUR-AB armed: preserve material/blending/state; insert stripes below existing WithinWindow view\n");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        macws_glass_blur_ab_attempt(1);
+    });
+}
 
 // Exact logical length of the AGXBuffer currently being initialized on this
 // thread.  The macOS AGX args layout used by initFull can encode a VA-shaped
@@ -4114,6 +4337,7 @@ static void macws_install_osxvnc_hooks(void) {
 }
 
 __attribute__((constructor)) void InitStuff() {
+    macws_install_glass_blur_ab_if_requested();
     EnableJIT();
     macws_install_crash_diag();
     macws_install_osxvnc_hooks();
