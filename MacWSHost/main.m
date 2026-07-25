@@ -13,7 +13,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "macws_host_protocol.h"
@@ -21,6 +23,8 @@
 static NSString *const MacWSFramePath =
     @"/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static NSString *const MacWSLogPath = @"/var/mobile/Library/Logs/MacWSHost.log";
+static const char MacWSInputSocketPath[] =
+    "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 
 static void MacWSLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void MacWSLog(NSString *format, ...) {
@@ -39,6 +43,37 @@ static void MacWSLog(NSString *format, ...) {
         fclose(file);
     }
     pthread_mutex_unlock(&logLock);
+}
+
+static BOOL MacWSSendInputRecord(const MacWSInputRecord *record,
+                                 int *errorOut) {
+    static int socketFD = -1;
+    static pthread_mutex_t socketLock = PTHREAD_MUTEX_INITIALIZER;
+    BOOL sent = NO;
+    int savedError = 0;
+
+    pthread_mutex_lock(&socketLock);
+    if (socketFD < 0) {
+        socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (socketFD < 0) savedError = errno;
+    }
+    if (socketFD >= 0) {
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        _Static_assert(sizeof(MacWSInputSocketPath) <= sizeof(address.sun_path),
+                       "input socket path exceeds sockaddr_un.sun_path");
+        memcpy(address.sun_path, MacWSInputSocketPath,
+               sizeof(MacWSInputSocketPath));
+        ssize_t written = sendto(socketFD, record, sizeof(*record), 0,
+                                 (const struct sockaddr *)&address,
+                                 sizeof(address));
+        sent = written == (ssize_t)sizeof(*record);
+        if (!sent) savedError = written < 0 ? errno : EMSGSIZE;
+    }
+    pthread_mutex_unlock(&socketLock);
+
+    if (errorOut) *errorOut = savedError;
+    return sent;
 }
 
 // Read-only witness for Metal's RE-confirmed registration inputs.  The iOS
@@ -536,6 +571,8 @@ static void MacWSLogMetalRegistryState(void) {
         .y = (float)framePoint.y,
         .pressure = pressure,
         .contactID = (uint32_t)touch.hash,
+        .frameWidth = _frame.width,
+        .frameHeight = _frame.height,
     };
     _touchMarker.center = viewPoint;
     _touchMarker.hidden = kind == MacWSInputKindTouchUp ||
@@ -580,6 +617,8 @@ static void MacWSLogMetalRegistryState(void) {
         .timestamp = CACurrentMediaTime(),
         .x = (float)framePoint.x,
         .y = (float)framePoint.y,
+        .frameWidth = _frame.width,
+        .frameHeight = _frame.height,
     };
     _touchMarker.center = viewPoint;
     _touchMarker.hidden = recognizer.state == UIGestureRecognizerStateEnded;
@@ -711,11 +750,15 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
         case MacWSInputKindTouchCancel: phase = @"cancel"; break;
         case MacWSInputKindHover: phase = @"hover"; break;
     }
-    _inputLabel.text = [NSString stringWithFormat:@"触控桥 M0 · %@ · %.0f, %.0f",
-                        phase, record.x, record.y];
-    MacWSLog(@"input-v1 scene=%llx kind=%@ point=(%.2f,%.2f) pressure=%.3f contact=%u",
-             record.sceneID, phase, record.x, record.y, record.pressure,
-             record.contactID);
+    int sendError = 0;
+    BOOL sent = MacWSSendInputRecord(&record, &sendError);
+    _inputLabel.text = [NSString stringWithFormat:
+        @"触控桥 M2 %@ · %@ · %.0f, %.0f",
+        sent ? @"已发送" : @"离线", phase, record.x, record.y];
+    MacWSLog(@"input-v2 transport=%@ errno=%d scene=%llx kind=%@ point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u",
+             sent ? @"sent" : @"failed", sendError, record.sceneID, phase,
+             record.x, record.y, record.frameWidth, record.frameHeight,
+             record.pressure, record.contactID);
 }
 @end
 
@@ -745,9 +788,49 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
     for (UIOpenURLContext *context in URLContexts) {
-        if (![context.URL.host isEqualToString:@"new"]) continue;
-        MacWSRequestNewScene(scene, nil);
-        break;
+        if ([context.URL.host isEqualToString:@"new"]) {
+            MacWSRequestNewScene(scene, nil);
+            break;
+        }
+        if ([context.URL.host isEqualToString:@"test-input"]) {
+            // Explicit transport diagnostic. Query parameters allow two-point
+            // cursor A/Bs without fabricating UIKit touches:
+            // macwshost://test-input?x=1194&y=834&w=2388&h=1668
+            uint32_t frameWidth = 2388;
+            uint32_t frameHeight = 1668;
+            float x = 1194.0f;
+            float y = 834.0f;
+            NSURLComponents *components = [NSURLComponents
+                componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"x"]) x = item.value.floatValue;
+                else if ([item.name isEqualToString:@"y"]) y = item.value.floatValue;
+                else if ([item.name isEqualToString:@"w"]) frameWidth = item.value.intValue;
+                else if ([item.name isEqualToString:@"h"]) frameHeight = item.value.intValue;
+            }
+            if (frameWidth == 0) frameWidth = 2388;
+            if (frameHeight == 0) frameHeight = 1668;
+            x = fminf(fmaxf(x, 0.0f), frameWidth - 1.0f);
+            y = fminf(fmaxf(y, 0.0f), frameHeight - 1.0f);
+            MacWSInputRecord record = {
+                .magic = MACWS_INPUT_MAGIC,
+                .version = MACWS_INPUT_VERSION,
+                .kind = MacWSInputKindHover,
+                .sceneID = (uint64_t)scene.session.persistentIdentifier.hash,
+                .timestamp = CACurrentMediaTime(),
+                .x = x,
+                .y = y,
+                .contactID = MACWS_INPUT_CONTACT_DIAGNOSTIC,
+                .frameWidth = frameWidth,
+                .frameHeight = frameHeight,
+            };
+            int sendError = 0;
+            BOOL sent = MacWSSendInputRecord(&record, &sendError);
+            MacWSLog(@"input-v2 synthetic transport=%@ errno=%d scene=%llx point=(%.2f,%.2f) frame=%ux%u",
+                     sent ? @"sent" : @"failed", sendError, record.sceneID,
+                     record.x, record.y, record.frameWidth, record.frameHeight);
+            break;
+        }
     }
 }
 

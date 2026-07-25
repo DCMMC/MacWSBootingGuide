@@ -144,6 +144,7 @@ add_all_trustcache "/var/jb/usr/macOS/lib/libmachook.dylib"
 add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
+add_all_trustcache "/var/jb/usr/macOS/bin/macwsinputd"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
 cp -vf /var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer_macos /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
 add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
@@ -180,6 +181,15 @@ if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
 	rm -f /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	cp -vf /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
+fi
+
+# Native-host input bridge.  Keep the installed source and the chroot-visible
+# executable on fresh inodes so AMFI does not reuse a stale vnode signature.
+if [ -f /var/jb/usr/macOS/bin/macwsinputd ]; then
+	rm -f /var/mnt/rootfs/usr/local/bin/macwsinputd
+	cp -vf /var/jb/usr/macOS/bin/macwsinputd /var/mnt/rootfs/usr/local/bin/macwsinputd
+	chmod 755 /var/mnt/rootfs/usr/local/bin/macwsinputd
+	add_all_trustcache /var/mnt/rootfs/usr/local/bin/macwsinputd
 fi
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib

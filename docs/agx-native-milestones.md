@@ -1017,6 +1017,34 @@ or Jetsam report appeared.  Full disassembly excerpts, runtime samples, and
 artifact hashes are in
 [`docs/evidence/iosurface-release-abi-20260725.txt`](evidence/iosurface-release-abi-20260725.txt).
 
+## 2026-07-25: native iPadOS host has Apple M1 Metal + first input bridge
+
+The new `MacWSHost` is an arm64 iPadOS multi-scene application that reads the
+existing no-VNC shared BGRA frame. Its first dedicated entitlement build saw
+the AGX service/plugin/class but `MTLCreateSystemDefaultDevice()` returned nil.
+Live unified logs identified exact MACF denials for `AGXDeviceUserClient` and
+`IOSurfaceRootUserClient`. Adding only those two entries to the host's
+`com.apple.security.iokit-user-client-class` produced `Apple M1 GPU` and a
+completed render/present command buffer (`status=4 error=nil`). The broad
+WindowServer entitlement set and `platform-application` are not used.
+
+M2 adds `macwsinputd`, a macOS chroot receiver for a packed Unix-datagram
+input ABI. ABI v2 carries source frame dimensions because runtime showed a
+2388x1668 producer but 1194x834 Quartz display. Two no-VNC diagnostics mapped
+source `(240,300)` and `(1900,1300)` to Quartz `(120,150)` and `(950,650)`;
+`CGEventGetLocation` observed both posted cursor states. The LaunchDaemon path,
+single-instance lock, display startup refresh, package staging, and one-click
+cleanup were also runtime-tested.
+
+Multiple simultaneous UIKit scenes are not yet working. SpringBoard accepts
+the first scene but rejects the second with
+`SBSceneManagerCoordinatorDomain Code=1`; public request parameter variants
+and a `platform-application` A/B do not change it. The exact SpringBoard
+failure path and all verbatim evidence are in
+[`docs/evidence/ipados-native-host-m0-20260725.txt`](evidence/ipados-native-host-m0-20260725.txt)
+and
+[`docs/evidence/ipados-native-host-input-m2-20260725.txt`](evidence/ipados-native-host-input-m2-20260725.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator

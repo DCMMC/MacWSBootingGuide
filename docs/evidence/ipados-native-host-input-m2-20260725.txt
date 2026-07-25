@@ -1,0 +1,122 @@
+MacWSHost M2 input transport evidence -- 2026-07-25
+==================================================
+
+Scope
+-----
+
+This record covers the first real iPadOS-host to chroot input path.  It proves
+that a versioned record emitted by MacWSHost crosses a local Unix datagram
+socket, is validated by a macOS process, maps from the producer framebuffer to
+Quartz display coordinates, is posted as a CGEvent, and changes the observable
+system cursor position.  It does not yet claim a real UIKit finger click on a
+specific GlassDemo control or keyboard/scroll support.
+
+No VNC server was running.  WindowServer was started in coexist mode with
+`--no-terminal --no-vnc`; status reported `VNC: not running`.
+
+1. Transport and launch boundary
+--------------------------------
+
+`macwsinputd` is a thin arm64 macOS tool.  It is entered through
+`launchdchrootexec`, binds `/private/tmp/macws_host_input.sock`, and validates
+the exact packed ABI from `include/macws_host_protocol.h`.  MacWSHost sends to
+the same vnode from the iOS namespace at
+`/var/mnt/rootfs/private/tmp/macws_host_input.sock`.
+
+The receiver's launch witness with WindowServer active was:
+
+    MACWS-INPUT READY socket=/private/tmp/macws_host_input.sock abi=2 record=48 display=1 bounds=(0,0 1194x834) pixels=1194x834
+
+The tool is installed at `/usr/macOS/bin/macwsinputd`, copied to the fresh
+chroot inode `/usr/local/bin/macwsinputd`, signed/trustcached by `postinst.sh`,
+and has a `com.macwsguide.input` LaunchDaemon.  `cleanup_all.sh` explicitly
+kills it and the final cleanup contained no WindowServer or macwsinputd.
+
+The installed launch job reported:
+
+    77915  0  com.macwsguide.input
+
+A deliberate second start did not unlink or steal the live socket. It exited
+with:
+
+    macwsinputd singleton lock /private/tmp/macws_host_input.lock failed: Resource temporarily unavailable
+
+The process count remained exactly one. The lock is therefore part of the
+transport invariant, not just launchd convention.
+
+2. Why ABI v1 was insufficient
+------------------------------
+
+The first 40-byte record carried only x/y.  Runtime showed that MacWSHost's
+producer space was 2388x1668 while the active Quartz display bounds and pixel
+size were 1194x834:
+
+    host source frame nonzero 2388x1668 stride=9552
+    receiver bounds=(0,0 1194x834) pixels=1194x834
+
+Consequently the intended source center `(1194,834)` was interpreted as the
+Quartz bottom-right `(1194,834)`.  This is runtime-confirmed evidence that the
+receiver cannot safely infer the source coordinate space from
+`CGDisplayPixelsWide/High`.
+
+ABI v2 adds explicit `frameWidth` and `frameHeight`, increasing the packed
+record from 40 to 48 bytes.  The receiver rejects zero dimensions and
+out-of-range coordinates, then normalizes x/y by the declared source size.
+This fixes the invariant at the protocol producer, not with a guessed 2x
+constant.
+
+3. App-to-chroot and CGEvent witness
+------------------------------------
+
+MacWSHost's explicit `macwshost://test-input` diagnostic emitted two hover
+records.  Verbatim app log:
+
+    1784992515.590 input-v2 synthetic transport=sent errno=0 scene=b1fcb7e3489c9545 point=(240.00,300.00) frame=2388x1668
+    1784992517.668 input-v2 synthetic transport=sent errno=0 scene=b1fcb7e3489c9545 point=(1900.00,1300.00) frame=2388x1668
+
+Verbatim receiver log:
+
+    MACWS-INPUT RX seq=1 scene=b1fcb7e3489c9545 kind=hover frame=(240.00,300.00)/2388x1668 quartz=(120.00,150.00) event=5 created=YES post=issued cursor=observed(120.00,150.00) samples=1
+    MACWS-INPUT RX seq=2 scene=b1fcb7e3489c9545 kind=hover frame=(1900.00,1300.00)/2388x1668 quartz=(950.00,650.00) event=5 created=YES post=issued cursor=observed(950.00,650.00) samples=2
+
+The exact scene ID and source coordinates survive transport.  Both normalized
+coordinate pairs are arithmetically correct for a 2:1 source/display ratio.
+`CGEventCreateMouseEvent` returned non-null, and `CGEventPost(kCGHIDEventTap)`
+was issued.  More importantly, independent `CGEventCreate` +
+`CGEventGetLocation` state samples observed the two requested cursor locations.
+
+CGEvent delivery is asynchronous: the second diagnostic needed one additional
+5-ms state sample.  The bounded polling is enabled only when contactID is the
+explicit `DIAG` marker; real touch/hover records take one non-blocking sample
+and are not delayed.
+
+The production LaunchDaemon path was then exercised with WindowServer rather
+than the manual receiver. `com.macwsguide.input` and
+`com.apple.WindowServer` both had running PIDs, VNC remained not running, and
+the first received record forced a display-geometry refresh before posting:
+
+    MACWS-INPUT DISPLAY display=1 bounds=(0,0 1194x834) pixels=1194x834
+    MACWS-INPUT RX seq=1 scene=b1fcb7e3489c9545 kind=hover frame=(1194.00,834.00)/2388x1668 quartz=(597.00,417.00) event=5 created=YES post=issued cursor=observed(597.00,417.00) samples=1
+
+If launchd wins the race and starts the receiver before WindowServer publishes
+a display, it initially sees 0x0. The receiver re-reads geometry on the first
+record (and periodically); if it remains 0x0 it logs `DROP reason=no-display`
+and does not fabricate a `(0,0)` event.
+
+4. Production path and remaining boundary
+------------------------------------------
+
+Real UIKit touch records use the same `MacWSSendInputRecord` function and ABI.
+The receiver maps down/move/up/cancel to left-down/left-drag/left-up and hover
+to mouse-moved.  The diagnostic URL fabricates only a hover record and is
+labelled as such in source and logs.
+
+Still required before claiming interactive control:
+
+- perform a physical UIKit down/move/up sequence against a known GlassDemo
+  control and capture both receiver records and a visible control-state pixel
+  change;
+- define keyboard, modifiers, right-click/long-press, scroll, and Pencil
+  semantics;
+- associate events with a real per-window ID once the scene/window registry
+  replaces the current full-display mirror.

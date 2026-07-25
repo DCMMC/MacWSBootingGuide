@@ -24,14 +24,45 @@ It is an iOS application built by the root Theos aggregate.
   UIKit/CoreAnimation fallback displays a stable snapshot. This is a recovery
   path, not evidence of an App-local Metal present.
 - Touch and pointer coordinates are transformed from the aspect-fitted scene
-  into physical macOS framebuffer pixels. M0 logs version-1 input records; it
-  does not yet claim that these records reach macOS `CGEvent`/HID.
+  into physical macOS framebuffer pixels. M2 sends version-2 records to the
+  chroot `macwsinputd` over a local Unix datagram and maps them into Quartz
+  display coordinates. Two-point diagnostics confirm that posted mouse-move
+  events change the observed system cursor; a physical touch on a known macOS
+  control is still required before claiming complete interactive control.
 - Runtime evidence is appended to
   `/var/mobile/Library/Logs/MacWSHost.log`. A successful Metal presentation is
   only claimed after the corresponding iOS `MTLCommandBuffer` completion says
   `status=4 error=nil`.
 
 The shared C layouts live in `include/macws_host_protocol.h`.
+
+## Current input ABI
+
+MacWSHost sends packed 48-byte records to
+`/var/mnt/rootfs/private/tmp/macws_host_input.sock`; inside the chroot,
+`macwsinputd` binds the same vnode as `/private/tmp/macws_host_input.sock`.
+Each record contains:
+
+```text
+uint32 magic = 0x4d574556  // "MWEV"
+uint16 version = 2
+uint16 kind                 // down/move/up/cancel/hover
+uint64 sceneID
+double timestamp
+float  x, y, pressure
+uint32 contactID
+uint32 frameWidth, frameHeight
+```
+
+The source dimensions are load-bearing. The current producer is 2388x1668,
+while the coexistence Quartz display is 1194x834; v1 lacked these fields and
+incorrectly mapped the producer center to the display corner. No fixed Retina
+scale is assumed in v2.
+
+`macwsinputd` maps touch down/move/up/cancel to left mouse
+down/drag/up and hover to mouse moved. It rejects malformed versions, sizes,
+kinds, non-finite values, and out-of-bounds coordinates before creating a
+CGEvent.
 
 ## Current framebuffer ABI
 
@@ -65,6 +96,8 @@ After package installation and `uicache`, launch it from the Home Screen or:
 uiopen macwshost://
 # Diagnostic: ask the running app to create another scene session.
 uiopen macwshost://new
+# Diagnostic: send one synthetic hover through the real M2 transport.
+uiopen 'macwshost://test-input?x=1194&y=834&w=2388&h=1668'
 ```
 
 To exercise the current capture path without VNC, create the existing capture
@@ -106,7 +139,10 @@ Runtime on iPad13,6 / iOS 16.3.1 confirmed that:
   presents the nonzero frame on `Apple M1 GPU` and completes with no error;
 - `supportsMultipleScenes=YES` is not sufficient on this installation:
   SpringBoard accepts the first scene but rejects the second.  Public request
-  variants and `platform-application` A/Bs do not change that result.
+  variants and `platform-application` A/Bs do not change that result;
+- two synthetic M2 records sent by MacWSHost reached `macwsinputd`, mapped
+  `(240,300)` to `(120,150)` and `(1900,1300)` to `(950,650)`, and those exact
+  Quartz locations were read back from the system cursor state after posting.
 
 M0 is not the final per-application design. It still mirrors a full macOS
 display into every iPadOS scene. The next milestones are:
@@ -114,8 +150,8 @@ display into every iPadOS scene. The next milestones are:
 1. inspect the failed SpringBoard scene request's real persistence identifier
    and mapping with a stable early-attach/runtime probe; do not force its
    success branch;
-2. deliver versioned input records to a narrow macOS event bridge and confirm
-   real click/drag/key witnesses;
+2. use physical UIKit touches to confirm a visible GlassDemo click/drag
+   witness through the now-working v2 bridge, then add keyboard and scrolling;
 3. add a WindowServer-side window registry with stable window IDs, bounds,
    scale, z-order, and lifecycle events;
 4. replace the whole-frame mmap with a producer-owned IOSurface ring plus
