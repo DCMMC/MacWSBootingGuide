@@ -840,31 +840,119 @@ Post-fix artifacts under
 `7facd03b8bdeea50be352717b6953b8da94a66a99cbfcb26f340ec4f34400ba8`
 (WindowServer).
 
-## Next runtime experiment
+## 2026-07-25: native AGX WindowServer renders GlassDemo through VNC
 
-1. Start WindowServer without the debugger or suspend-at-exec flag, enable VNC,
-   and record the next production failure or first nonzero framebuffer witness.
-2. Require the completed pf550 descriptor to match the native
-   `layout=3 compressed=1` semantics and the shader-read command to complete
-   without a new GPU report; do not infer this merely from initializer success.
-3. Re-run the BGRA control and pf550 read into the VNC IOSurface, then capture
-   GlassDemo with title bar, controls, and visible
-   `NSVisualEffectView` backdrop blur.
-4. Replace both `TEMP-KCMD-ABI-FIX` paths with field-level subtype-1 and
-   subtype-3 translators backed by macOS/iOS producer and kernel-parser
-   disassembly; retain stages 4 and 5 as regression tests.
-5. Re-run WindowServer without the byte-deletion diagnostic scaffold and
-   reproduce the VNC and blur witnesses.
+Milestone source commit:
+`5fb13b8a5204c4b8710fa080b18be2597718661e`.
 
-## Success criteria
+### Runtime-confirmed: multi-segment KCMD storage was the `0x102` boundary
 
-Intermediate control witness:
+The previous command walker treated the trailer after the first vendor record
+as the next record.  Frozen two-segment and 28-segment WindowServer captures
+showed a different framing:
+
+- segment-list `+0x08` is the count and `+0x0c` is
+  `0x80000000 | listByteLength`;
+- each KCMD segment begins with type `0x10000` and carries its complete span at
+  record `+0x04`;
+- every derived `{start,end}` range occurs exactly once at an aligned location
+  in the actual segment list;
+- entries are variable-sized.  The initial fixed-`0x120` entry-stride THEORY
+  was disproved by the 28-segment capture.
+
+The complete 28-segment KCMD capture is 58,344 bytes with SHA-256
+`18d50b9b969b88d4024725495679da122347c62b6a1f20bf91249bcccd72a725`;
+its associated segment list is 9,232 bytes.  The new walker validates the
+entire contiguous record chain and all unique range pairs before changing any
+byte, then translates observed subtype-1/subtype-3 records from the end toward
+the beginning and shifts all later ranges.
+
+This is still explicitly named `TEMP-KCMD-MULTISEG-FIX` and gated by
+`/tmp/macws_kcmd_fix`.  It is a diagnostic ABI scaffold, not a production fix:
+byte deletion is only justified by the captured macOS/iOS layouts, not yet by
+a complete semantic producer/parser model.
+
+The A/B boundary is nevertheless exact.  Before multi-segment handling, every
+full-frame command completed as status 5 with
+`Internal Error (00000102)`.  With the validated multi-segment translation,
+the 28-segment main composite and at least 16 consecutive full-display command
+buffers completed as:
 
 ```text
-VNC-FINAL clear-control executed=YES pixel=OK center=804020ff
+#### VNC-ENDUPDATE-WAIT #0 ... pf=550 ... status=4 error=nil
+...
+#### VNC-ENDUPDATE-WAIT #15 ... pf=550 ... status=4 error=nil
 ```
 
-Final witness: a saved VNC image showing GlassDemo's title bar and controls,
-with background content visibly blurred through `NSVisualEffectView`. The
-image path, checksum, WindowServer log, and the exact build commit must be
-recorded here when achieved.
+Per-segment logs are now limited to the first four validated batches, but the
+translation itself remains enabled for every matching frame.  A previous
+one-shot throttle was removed because later frames are the GUI witness.
+
+### Runtime-confirmed: native control, pf550 read, mmap, and RFB all complete
+
+The scanout-read pipeline reflected exactly one fragment texture at slot zero,
+both independent BGRA8 controls produced their expected pixels, and the real
+pf550 frame was copied to the shared VNC mmap:
+
+```text
+#### VNC-FINAL pipeline ... contract=OK error=nil
+#### VNC-FINAL clear-control executed=YES pixel=OK center=804020ff
+#### VNC-FINAL control clear=OK draw=EXECUTED pixel=OK center=214365ff
+#### VNC-FINAL captured 2388x1668 BGRA8 ... bpr=9600 sampled_nonzero=2864
+```
+
+The dependency-free RFB client then reported:
+
+```text
+captured 1194x834 from 'macOS-iPad' in 1 raw rectangle(s)
+```
+
+The committed witness is
+[`docs/evidence/native-agx-glassdemo-20260725.png`](evidence/native-agx-glassdemo-20260725.png),
+SHA-256
+`2a1ef4b7897a4245385a982788c618d2d15f7f9cfcaad0009ebafbd127ae08e5`.
+It visibly contains GlassDemo's title bar, standard controls, rounded frosted
+material, and the inner HUD/vibrancy region.  It is neither the synthetic VNC
+gradient nor either known-color control texture.
+
+### RE-confirmed: the visible material comes from the actual test binary
+
+`otool -ov` identifies `VFXBox` as an `NSVisualEffectView` subclass.  Disassembly
+of the actual `/tmp/GlassDemo` binary (SHA-256
+`d8fb6da1192eda00ec1f9ecad0e54a0f387866b36deb150f92ec9bd349b6b1f3`)
+shows its main view setting material 7, blending mode 0, and state 1 at
+`0x100001134..0x100001160`.  A second effect sets material 13, blending mode 1,
+and state 1 at `0x100001f98..0x100001fc0`.  Thus the non-black frosted regions
+in the RFB frame are output from real `NSVisualEffectView` configurations, not
+labels drawn by a fake demo.
+
+The background behind the main material is mostly uniform, so this screenshot
+does not independently measure a blur radius or provide a high-frequency edge
+A/B.  Several attempts to add a striped background did not reach another pf550
+frame and therefore are not counted as success.
+
+### Stability boundary: screenshot success is not production stability
+
+The successful log later shows rapid type-`0x82` resource growth and a second
+WindowServer constructor.  The reason for that restart was not captured.
+Three later striped-background experiments produced real WindowServer crash
+reports with `EXC_BAD_ACCESS/SIGBUS` at `libobjc.A.dylib objc_msgSend`; their
+triggered threads were SystemStatus/NSXPC queues, not AGX command-completion
+threads.  This is runtime-confirmed, but its cause remains THEORY.  No new
+gpuEvent or panic was emitted.
+
+Full excerpts, artifact hashes, and the three crash-report hashes are in
+[`docs/evidence/native-agx-glassdemo-20260725.txt`](evidence/native-agx-glassdemo-20260725.txt).
+
+## Next milestones
+
+1. Replace subtype-1/subtype-3 byte deletion with a field-level translator
+   backed by disassembly of both macOS producers and the iOS kernel parser;
+   reproduce the VNC frame without `/tmp/macws_kcmd_fix`.
+2. RE the SystemStatus/NSXPC `objc_msgSend` SIGBUS using the saved reports and
+   the project's early-attach LLDB tooling; do not globally bypass XPC or
+   Objective-C release/encoding.
+3. Pair type-`0x82` creates/destroys and stop the long-run allocation growth;
+   require stable counters and repeated VNC frames, not process uptime.
+4. Obtain a high-frequency-background A/B that reaches pf550 and visibly
+   measures blur spread without changing GlassDemo's material implementation.
