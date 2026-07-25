@@ -1,6 +1,11 @@
 # MacWSBootingGuide
 Booting macOS's WindowServer on your jailbroken iDevice for real (WIP)
 
+The experimental native iPadOS multi-window frontend is documented in
+[`docs/ipados-native-host.md`](docs/ipados-native-host.md). It consumes the
+WindowServer shared framebuffer directly and does not require an RFB/VNC
+server.
+
 Some paths are currently hardcoded for rootless jailbreak, but you can change them to work with rootful jailbreak. Some tools are hardcoded for Dopamine jailbreak.
 
 You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementation.framework, MetalSerializer.framework

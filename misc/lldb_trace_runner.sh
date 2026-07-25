@@ -106,6 +106,7 @@ if [ -n "$IOS_SYMBOL_ROOT" ]; then
 fi
 LLDB_ARGS+=(
     -O "process connect --plugin gdb-remote connect://127.0.0.1:$DBG_PORT"
+    -O "settings set interpreter.stop-command-source-on-error false"
     --source "$CMDS_FILE"
     -o "process detach"
     -o "quit"

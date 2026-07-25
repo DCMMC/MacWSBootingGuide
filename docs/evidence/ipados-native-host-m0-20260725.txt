@@ -1,0 +1,149 @@
+MacWSHost M0 implementation evidence -- 2026-07-25
+====================================================
+
+Scope
+-----
+
+This record covers the first iPadOS-native host implementation.  It does not
+claim per-macOS-window transport or completed input injection.  The producer
+was native-AGX WindowServer; OSXvnc-server was not running.
+
+1. App structure and local build
+--------------------------------
+
+The root aggregate now builds MacWSHost.  Its Info.plist contains:
+
+    UIApplicationSceneManifest = {
+        UIApplicationSupportsMultipleScenes = true;
+        UISceneConfigurations = {
+            UIWindowSceneSessionRoleApplication = (... MacWSSceneDelegate ...);
+        };
+    };
+
+The host-side Theos build completed for arm64:
+
+    ==> Compiling main.m (arm64)...
+    ==> Linking application MacWSHost (arm64)...
+    ==> Generating debug symbols for MacWSHost...
+    ==> Signing MacWSHost...
+
+2. Why the application is arm64-only
+------------------------------------
+
+The first on-device fat arm64+arm64e build died before main.  Verbatim excerpt
+from `/var/mobile/Library/Logs/CrashReporter/MacWSHost-2026-07-25-210752.ips`:
+
+    "exception" : {"type":"EXC_BREAKPOINT","signal":"SIGTRAP"}
+    "esr" : {"description":"(Breakpoint) pointer authentication trap DA"}
+    frame 0: readClass(objc_class*, bool, bool) + 112
+    x0: OBJC_CLASS_$_MacWSMappedFrame
+
+The arm64-only build passed libobjc initialization on the same iPad13,6.  This
+is a build-tool ABI boundary, not justification for a global libobjc PAC
+bypass.
+
+3. Dedicated entitlements
+-------------------------
+
+Signing the app with the project's WindowServer/backboardd entitlement set
+made UIKit abort before the application delegate.  Verbatim excerpt from
+`MacWSHost-2026-07-25-210904.ips`:
+
+    EXC_CRASH / SIGABRT, "abort() called"
+    +[UIScreen mainScreen] + 408
+    -[_UIRemoteKeyboards _activeScreen] + 164
+    +[UIKeyboardSceneDelegate automaticKeyboardArbiterClient] + 60
+    _UIApplicationMainPreparations + 1296
+    UIApplicationMain + 320
+
+With MacWSHost's dedicated minimal entitlement file, the same binary remained
+running and connected its scene:
+
+    72682 ... /Applications/MacWSHost.app/MacWSHost
+
+Later persistent app-log witness:
+
+    1784985265.333 launched native-device=(null) frame-path=/var/mnt/rootfs/private/tmp/macws_vnc_fb
+    1784985265.347 scene-connected id=F7744CD1-31D6-4C18-BEB8-FA7DCE0FC30D role=UIWindowSceneSessionRoleApplication
+
+This A/B proves that the broad entitlement set as a whole caused the UIKit
+failure.  It does not identify one entitlement as the individual cause.
+
+4. No-VNC native-AGX producer witness
+-------------------------------------
+
+WindowServer was started with:
+
+    macos_gui.sh start coexist --no-terminal --no-vnc
+
+`macos_gui.sh status` reported `VNC: not running`.  GlassDemo and WindowServer
+remained present.  After explicitly arming the existing one-shot PF550 capture,
+WindowServer logged:
+
+    #### VNC-FINAL pipeline ... contract=OK error=nil
+    #### VNC-FINAL clear-control executed=YES pixel=OK center=804020ff
+    #### VNC-FINAL control clear=OK draw=EXECUTED pixel=OK center=214365ff
+    #### VNC-FINAL captured 2388x1668 BGRA8 cpu130=0x10c3dc000 base=0x10c3dc000 bpr=9600 sampled_nonzero=2864
+
+The resulting file was:
+
+    -rw-r--r-- 1 root wheel 15932752 ... /var/mnt/rootfs/private/tmp/macws_vnc_fb
+
+Thus the M0 producer can publish nonzero GlassDemo pixels without an RFB
+server.  This is still the explicitly gated PF550 diagnostic path, not the
+final continuous per-window transport.
+
+5. Current iOS Metal enumeration boundary
+------------------------------------------
+
+The first persistent host diagnostic logged:
+
+    launched native-device=(null)
+
+The existing iOS-native mtl_keepalive tool independently printed:
+
+    MTLCreateSystemDefaultDevice returned nil
+
+Stopping WindowServer and restoring SpringBoard/backboardd did not change
+either result.  Removing `platform-application` from the host entitlement set
+also did not change it.
+
+Remote LLDB used the actual installed binary's bind table (the device build's
+MTLCreateSystemDefaultDevice GOT slot was `base+0x10030`) and resolved the
+runtime entry to 0x191523584.  The first instructions were:
+
+    0x191523584: pacibsp
+    0x191523588: sub sp, sp, #0x80
+    ...
+    0x191523638: bl 0x19162a648
+    0x19152363c: ldr x8, [sp, #0x38]
+    0x191523640: ldr x19, [x8, #0x28]
+    0x191523650: mov x0, x19
+
+Disassembly of the exact iOS 16.3.1 Metal binary at
+`iOS DeviceSupport/iPad13,6 16.3.1 (20D67)/Symbols/.../Metal` confirms that
+`MTLRegisterDevices` matches `IOAcceleratorES`, iterates its services, calls
+`getMetalPluginClassForService`, constructs each device with
+`initWithAcceleratorPort:`, and passes successful objects to `MTLAddDevice`.
+The current process's resulting device array is empty.
+
+Correction preserved for future sessions: an intermediate THEORY said the
+Metal GOT slot pointed at memset.  That was false because the first LLDB read
+used the local-build offset (`+0x100c0`) against a differently laid-out
+device-build binary.  `llvm-objdump --macho --bind` proved that the device's
+`+0x100c0` slot really was memset and its Metal slot was `+0x10030`.  Reading
+the correct slot produced the real Metal function above.
+
+A userspace reboot was then requested to reset process-global Metal/device
+registration without a full power cycle.  Network access had not returned by
+the end of this evidence window; final Metal-present and multi-scene runtime
+witnesses therefore remain pending device unlock/network recovery.
+
+6. Explicit M0 limits
+---------------------
+
+- Every scene currently displays the complete 2388x1668 desktop.
+- The mmap header has no generation or atomic-publish state.
+- Input-v1 records are coordinate-validated/logged only.
+- UIKit fallback code is explicitly labelled and cannot satisfy the native
+  Metal command-buffer completion witness.
