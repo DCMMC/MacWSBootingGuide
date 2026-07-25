@@ -35,6 +35,8 @@ HOST=${1:-}
 PORT=${2:-2222}
 PROC_NAME=${3:-WindowServer}
 LLDB_SCRIPT=${4:-}
+SSH_USER=${SSH_USER:-root}
+SUDO_PASSWORD=${SUDO_PASSWORD:-}
 DBG_PORT=${DBG_PORT:-5555}
 
 if [ -z "$HOST" ]; then
@@ -42,8 +44,24 @@ if [ -z "$HOST" ]; then
     exit 1
 fi
 
+if [ "$SSH_USER" != root ] && [ -z "$SUDO_PASSWORD" ]; then
+    echo "error: set SUDO_PASSWORD when SSH_USER is not root" >&2
+    exit 2
+fi
+
+ssh_privileged() {
+    local remote_command="$1" quoted
+    if [ "$SSH_USER" = root ]; then
+        ssh -p "$PORT" "$SSH_USER@$HOST" "$remote_command"
+        return
+    fi
+    printf -v quoted '%q' "$remote_command"
+    printf '%s\n' "$SUDO_PASSWORD" | ssh -p "$PORT" "$SSH_USER@$HOST" \
+        "sudo -S bash -c $quoted"
+}
+
 # Resolve target PID on device.
-PID=$(ssh -p "$PORT" root@"$HOST" \
+PID=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
     "ps aux | grep -E '$PROC_NAME' | grep -v grep | head -1 | awk '{print \$2}'")
 if [ -z "$PID" ]; then
     echo "error: no process matching '$PROC_NAME' on $HOST" >&2
@@ -54,8 +72,8 @@ echo "[lldb_remote] target $PROC_NAME PID=$PID" >&2
 cleanup() {
     echo "[lldb_remote] cleanup" >&2
     pkill -f "ssh.*-L $DBG_PORT:127.0.0.1" 2>/dev/null || true
-    ssh -p "$PORT" root@"$HOST" \
-        'echo alpine | sudo -S bash -c '\''for p in $(ps aux | grep debugserver | grep -v grep | awk "{print \$2}"); do kill -9 $p 2>/dev/null; done'\''' \
+    ssh_privileged \
+        'for p in $(ps aux | grep debugserver | grep -v grep | awk "{print $2}"); do kill -9 $p 2>/dev/null; done' \
         >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
@@ -65,8 +83,8 @@ cleanup
 sleep 1
 
 # Start debugserver on device (in background via SSH).
-ssh -p "$PORT" root@"$HOST" \
-    "echo alpine | sudo -S /var/jb/usr/bin/debugserver 127.0.0.1:$DBG_PORT --attach=$PID" \
+ssh_privileged \
+    "/var/jb/usr/bin/debugserver 127.0.0.1:$DBG_PORT --attach=$PID" \
     >/tmp/debugserver_remote.log 2>&1 &
 DBG_SSH_PID=$!
 echo "[lldb_remote] debugserver SSH PID=$DBG_SSH_PID (logging to /tmp/debugserver_remote.log)" >&2
@@ -75,14 +93,14 @@ echo "[lldb_remote] debugserver SSH PID=$DBG_SSH_PID (logging to /tmp/debugserve
 sleep 3
 
 # Verify the device-side process is in state T (debugger-stopped).
-STATE=$(ssh -p "$PORT" root@"$HOST" \
+STATE=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
     "ps -o state= -p $PID 2>/dev/null | tr -d ' ' || echo MISS")
 if [ "${STATE:0:1}" != "T" ]; then
     echo "[lldb_remote] WARNING: target state is '$STATE' (expected T*) — debugserver attach may have failed" >&2
 fi
 
 # Set up SSH tunnel local:DBG_PORT → device:127.0.0.1:DBG_PORT.
-ssh -fN -p "$PORT" -L "$DBG_PORT:127.0.0.1:$DBG_PORT" root@"$HOST"
+ssh -fN -p "$PORT" -L "$DBG_PORT:127.0.0.1:$DBG_PORT" "$SSH_USER@$HOST"
 sleep 1
 
 echo "[lldb_remote] tunnel up: localhost:$DBG_PORT -> $HOST:127.0.0.1:$DBG_PORT" >&2

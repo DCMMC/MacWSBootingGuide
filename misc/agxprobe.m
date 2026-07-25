@@ -14,6 +14,31 @@
 @import IOSurface;
 #import <stdio.h>
 #import <stdlib.h>
+#import <signal.h>
+#import <string.h>
+#import <unistd.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+
+static void AGXProbePrintResourceAddresses(id resource, const char *label) {
+    SEL gpuSel = sel_registerName("gpuAddress");
+    SEL virtualSel = sel_registerName("virtualAddress");
+    SEL resourceIDSel = sel_registerName("resourceID");
+    uint64_t gpu = [resource respondsToSelector:gpuSel]
+        ? ((uint64_t (*)(id, SEL))objc_msgSend)(resource, gpuSel) : 0;
+    uintptr_t virtualAddress = [resource respondsToSelector:virtualSel]
+        ? ((uintptr_t (*)(id, SEL))objc_msgSend)(resource, virtualSel) : 0;
+    uint32_t resourceID = [resource respondsToSelector:resourceIDSel]
+        ? ((uint32_t (*)(id, SEL))objc_msgSend)(resource, resourceIDSel) : 0;
+    fprintf(stderr,
+        "AGXPROBE [%s] class=%s gpuAddress=0x%llx virtualAddress=0x%llx "
+        "resourceID=0x%x contents=%p\n",
+        label, object_getClassName(resource), (unsigned long long)gpu,
+        (unsigned long long)virtualAddress, resourceID,
+        [resource respondsToSelector:@selector(contents)]
+            ? ((void *(*)(id, SEL))objc_msgSend)(resource, @selector(contents))
+            : NULL);
+}
 
 int main(int argc, char **argv) {
     int maxStage = (argc > 1) ? atoi(argv[1]) : 3;
@@ -32,12 +57,62 @@ int main(int argc, char **argv) {
         id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
         fprintf(stderr, "AGXPROBE [1] device=%p name=%s\n", (void*)dev, dev ? [[dev name] UTF8String] : "NIL");
         if (!dev) { fprintf(stderr, "AGXPROBE FAIL stage1 (no device)\n"); return 1; }
+        // RE-only hold point: by now Metal has loaded AGXMetal13_3 and created
+        // the native device, but no resource or command submission has begun.
+        // SIGSTOP makes the short-lived probe attachable by the on-device LLDB.
+        // Default behavior is unchanged when AGXPROBE_HOLD is absent.
+        if (getenv("AGXPROBE_HOLD")) {
+            fprintf(stderr, "AGXPROBE HOLD after stage1 (pid=%d)\n", getpid());
+            raise(SIGSTOP);
+        }
+        // LLDB-only texture-initializer probe.  This deliberately stops before
+        // command submission: it exists to inspect AGXTexture's CPU/GPU address
+        // binding and device bind-table invariants without risking a GPU hang.
+        // Select exactly one constructor with AGXPROBE_TEXTURE_INIT=plain or
+        // =iosurface.  The normal staged probe is unchanged when the variable
+        // is absent.
+        const char *textureInit = getenv("AGXPROBE_TEXTURE_INIT");
+        if (textureInit && strcmp(textureInit, "plain") == 0) {
+            MTLTextureDescriptor *td =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                   width:64
+                                                                  height:64
+                                                               mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModeShared;
+            fprintf(stderr, "AGXPROBE [TEX-INIT] creating plain texture\n");
+            id<MTLTexture> texture = [dev newTextureWithDescriptor:td];
+            fprintf(stderr, "AGXPROBE [TEX-INIT] plain texture=%p\n", (void *)texture);
+        } else if (textureInit && strcmp(textureInit, "iosurface") == 0) {
+            NSDictionary *props = @{
+                (id)kIOSurfaceWidth: @64,
+                (id)kIOSurfaceHeight: @64,
+                (id)kIOSurfaceBytesPerElement: @4,
+                (id)kIOSurfacePixelFormat: @((unsigned int)'BGRA'),
+            };
+            IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)props);
+            MTLTextureDescriptor *td =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                   width:64
+                                                                  height:64
+                                                               mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModeShared;
+            fprintf(stderr, "AGXPROBE [TEX-INIT] creating IOSurface texture surface=%p\n",
+                    (void *)surface);
+            id<MTLTexture> texture = surface
+                ? [dev newTextureWithDescriptor:td iosurface:surface plane:0]
+                : nil;
+            fprintf(stderr, "AGXPROBE [TEX-INIT] IOSurface texture=%p\n", (void *)texture);
+            if (surface) CFRelease(surface);
+        }
         if (maxStage < 2) { fprintf(stderr, "AGXPROBE OK (stopped after stage1)\n"); return 0; }
 
         // Stage 2: buffer -> triggers AGX heap allocateImpl -> new_resource
         id<MTLBuffer> buf = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
         fprintf(stderr, "AGXPROBE [2] buffer=%p len=%lu\n", (void*)buf, buf ? (unsigned long)[buf length] : 0);
         if (!buf) { fprintf(stderr, "AGXPROBE FAIL stage2 (no buffer)\n"); return 2; }
+        AGXProbePrintResourceAddresses(buf, "2-addresses");
         if (maxStage < 3) { fprintf(stderr, "AGXPROBE OK (stopped after stage2)\n"); return 0; }
 
         // Stage 3: command queue (sel 0x8->0x7, the 0x408 struct)

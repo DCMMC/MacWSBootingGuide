@@ -4,3 +4,5 @@ packages/
 libmachook.dylib
 agxprobe/
 misc/sel9_test
+__pycache__/
+*.pyc

@@ -15,8 +15,16 @@ extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                     size_t plane);
 extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
     IOSurfaceRef surface, size_t plane);
+extern size_t IOSurfaceGetWidthInCompressedTilesOfPlane(
+    IOSurfaceRef surface, size_t plane);
 extern size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
                                              size_t plane);
+extern size_t IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
+                                                  size_t plane);
+extern size_t IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane);
+extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
+extern void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
+                                            size_t plane);
 extern uint32_t IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
                                                  size_t plane);
 
@@ -74,29 +82,50 @@ int main(void) {
             [creationValue isKindOfClass:[NSDictionary class]]
                 ? (NSDictionary *)creationValue : root;
         NSArray *planes = [creation objectForKey:@"IOSurfacePlaneInfo"];
+        IOSurfaceLock(surface, 0, NULL);
+        void *baseAddress = IOSurfaceGetBaseAddress(surface);
         for (size_t index = 0; index < 2; index++) {
             NSDictionary *actualPlane = index < [planes count]
                 ? [planes objectAtIndex:index] : nil;
             fprintf(stderr,
                 "IOSURFACE-COMPRESSION-PROBE plane=%zu propertyType=%s "
-                "propertyHeightInTiles=%s propertyBytesPerRow=%s "
+                "propertyHeightInTiles=%s propertyWidthInTiles=%s "
+                "propertyBytesPerTileData=%s propertyOffset=%s "
+                "propertyBytesPerRow=%s "
                 "propertyAddressFormat=%s apiType=%u apiHeightInTiles=%zu "
-                "apiBytesPerRow=%zu apiAddressFormat=%u\n",
+                "apiWidthInTiles=%zu apiBytesPerTileData=%zu "
+                "apiOffset=%zu apiBaseDelta=%lld apiBytesPerRow=%zu "
+                "apiAddressFormat=%u\n",
                 index,
                 [[[actualPlane objectForKey:@"IOSurfacePlaneCompressionType"]
                     description] UTF8String] ?: "(nil)",
                 [[[actualPlane objectForKey:
                     @"IOSurfacePlaneHeightInCompressedTiles"] description]
                     UTF8String] ?: "(nil)",
+                [[[actualPlane objectForKey:
+                    @"IOSurfacePlaneWidthInCompressedTiles"] description]
+                    UTF8String] ?: "(nil)",
+                [[[actualPlane objectForKey:
+                    @"IOSurfacePlaneBytesPerTileData"] description]
+                    UTF8String] ?: "(nil)",
+                [[[actualPlane objectForKey:@"IOSurfacePlaneOffset"]
+                    description] UTF8String] ?: "(nil)",
                 [[[actualPlane objectForKey:@"IOSurfacePlaneBytesPerRow"]
                     description] UTF8String] ?: "(nil)",
                 [[[actualPlane objectForKey:@"IOSurfaceAddressFormat"]
                     description] UTF8String] ?: "(nil)",
                 IOSurfaceGetCompressionTypeOfPlane(surface, index),
                 IOSurfaceGetHeightInCompressedTilesOfPlane(surface, index),
+                IOSurfaceGetWidthInCompressedTilesOfPlane(surface, index),
+                IOSurfaceGetBytesPerTileDataOfPlane(surface, index),
+                IOSurfaceGetOffsetOfPlane(surface, index),
+                (long long)((uintptr_t)
+                    IOSurfaceGetBaseAddressOfPlane(surface, index) -
+                    (uintptr_t)baseAddress),
                 IOSurfaceGetBytesPerRowOfPlane(surface, index),
                 IOSurfaceGetAddressFormatOfPlane(surface, index));
         }
+        IOSurfaceUnlock(surface, 0, NULL);
         if (actual) CFRelease(actual);
         CFRelease(surface);
     }

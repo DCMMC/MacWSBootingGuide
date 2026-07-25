@@ -2,9 +2,14 @@
 //
 // Build this as arm64e/iOS and temporarily place it in a foreground UIKit app
 // bundle.  A foreground app has the real iOS Metal/AGX setup that a headless
-// ad-hoc tool does not.  The program encodes one BGRA8 IOSurface clear, dumps
-// IOGPUMetalCommandBuffer's private kernel-command byte range before commit,
-// then proves execution with both command-buffer status and the exact pixel.
+// ad-hoc tool does not.  The default path encodes one BGRA8 IOSurface clear.
+// When /var/mobile/iosclear_draw_mode exists, it instead performs one
+// IOSurface-to-IOSurface textured draw using QuartzCore's own read_surf_vert /
+// read_surf_frag functions.  /var/mobile/iosclear_pf550_mode replaces the
+// source with an exact reconstruction of WindowServer's two-plane compressed
+// pf=550 scanout surface.  The BGRA modes prove execution with an exact pixel;
+// pf550 mode treats command status/error as the witness because its compressed
+// contents are intentionally uninitialized.
 //
 // This is diagnostic-only.  It does not load libmachook and does not patch any
 // driver or command bytes.
@@ -18,6 +23,11 @@
 #import <signal.h>
 #import <stdio.h>
 #import <unistd.h>
+
+extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
+                                                    size_t plane);
+extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
+    IOSurfaceRef surface, size_t plane);
 
 static os_log_t g_log;
 
@@ -100,8 +110,255 @@ static void macws_dump_commands(id<MTLCommandBuffer> commandBuffer,
     }
 }
 
+static IOSurfaceRef macws_create_bgra_surface(size_t width, size_t height) {
+    NSDictionary *properties = @{
+        (id)kIOSurfaceWidth: @(width),
+        (id)kIOSurfaceHeight: @(height),
+        (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+        (id)kIOSurfaceIsGlobal: @YES,
+    };
+    return IOSurfaceCreate((CFDictionaryRef)properties);
+}
+
+static IOSurfaceRef macws_create_pf550_surface(void) {
+    // Runtime-captured verbatim from IOSurfaceCopyAllValues on WindowServer's
+    // first 2388x1668 pf=550 CA framebuffer (2026-07-24).  This diagnostic
+    // reconstructs the producer's real two-plane lossless-compression layout
+    // rather than substituting a linear/zero-filled buffer.
+    NSDictionary *plane0 = @{
+        @"IOSurfaceAddressFormat": @5,
+        @"IOSurfacePlaneBytesPerCompressedTileHeader": @8,
+        @"IOSurfacePlaneBytesPerElement": @1024,
+        @"IOSurfacePlaneBytesPerRow": @153600,
+        @"IOSurfacePlaneBytesPerRowOfTileData": @153600,
+        @"IOSurfacePlaneBytesPerTileData": @1024,
+        @"IOSurfacePlaneCompressedTileDataRegionOffset": @0,
+        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @16128000,
+        @"IOSurfacePlaneCompressedTileHeight": @16,
+        @"IOSurfacePlaneCompressedTileWidth": @16,
+        @"IOSurfacePlaneCompressionFootprint": @0,
+        @"IOSurfacePlaneCompressionType": @3,
+        @"IOSurfacePlaneElementHeight": @16,
+        @"IOSurfacePlaneElementWidth": @16,
+        @"IOSurfacePlaneHeight": @1668,
+        @"IOSurfacePlaneHeightInCompressedTiles": @105,
+        @"IOSurfacePlaneOffset": @0,
+        @"IOSurfacePlaneSize": @16390144,
+        @"IOSurfacePlaneWidth": @2388,
+        @"IOSurfacePlaneWidthInCompressedTiles": @150,
+    };
+    NSDictionary *plane1 = @{
+        @"IOSurfaceAddressFormat": @5,
+        @"IOSurfacePlaneBytesPerCompressedTileHeader": @8,
+        @"IOSurfacePlaneBytesPerElement": @256,
+        @"IOSurfacePlaneBytesPerRow": @38400,
+        @"IOSurfacePlaneBytesPerRowOfTileData": @38400,
+        @"IOSurfacePlaneBytesPerTileData": @256,
+        @"IOSurfacePlaneCompressedTileDataRegionOffset": @16390144,
+        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @20422144,
+        @"IOSurfacePlaneCompressedTileHeight": @16,
+        @"IOSurfacePlaneCompressedTileWidth": @16,
+        @"IOSurfacePlaneCompressionFootprint": @0,
+        @"IOSurfacePlaneCompressionType": @3,
+        @"IOSurfacePlaneElementHeight": @16,
+        @"IOSurfacePlaneElementWidth": @16,
+        @"IOSurfacePlaneHeight": @1668,
+        @"IOSurfacePlaneHeightInCompressedTiles": @105,
+        @"IOSurfacePlaneOffset": @16390144,
+        @"IOSurfacePlaneSize": @4294144,
+        @"IOSurfacePlaneWidth": @2388,
+        @"IOSurfacePlaneWidthInCompressedTiles": @150,
+    };
+    NSDictionary *properties = @{
+        @"IOSurfaceAllocSize": @20684288,
+        @"IOSurfaceCacheMode": @1792,
+        @"IOSurfaceHeight": @1668,
+        @"IOSurfaceMapCacheAttribute": @0,
+        @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+        @"IOSurfaceName": @"IOSCLEAR native pf550 reference",
+        @"IOSurfacePixelFormat": @643969848,
+        @"IOSurfacePixelSizeCastingAllowed": @0,
+        @"IOSurfacePlaneInfo": @[plane0, plane1],
+        @"IOSurfaceWidth": @2388,
+    };
+    IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)properties);
+    fprintf(stderr,
+        "IOSCLEAR PF550 compression-api plane=0 type=%u heightInTiles=%zu\n",
+        surface ? IOSurfaceGetCompressionTypeOfPlane(surface, 0) : UINT32_MAX,
+        surface ? IOSurfaceGetHeightInCompressedTilesOfPlane(surface, 0)
+                : SIZE_MAX);
+    CFDictionaryRef actual = surface ? IOSurfaceCopyAllValues(surface) : NULL;
+    fprintf(stderr, "IOSCLEAR PF550 surface=%p actual=%s\n", (void *)surface,
+        actual ? [[(__bridge NSDictionary *)actual description] UTF8String]
+               : "(null)");
+    if (actual) CFRelease(actual);
+    return surface;
+}
+
+static id<MTLTexture> macws_create_surface_texture(
+    id<MTLDevice> device, IOSurfaceRef surface, size_t width, size_t height,
+    MTLPixelFormat pixelFormat, MTLTextureUsage usage) {
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:pixelFormat
+        width:width height:height mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = usage;
+    return surface ? [device newTextureWithDescriptor:descriptor
+                                        iosurface:surface plane:0] : nil;
+}
+
+static void macws_fill_surface(IOSurfaceRef surface, size_t width,
+                               size_t height, const unsigned char bgra[4]) {
+    IOSurfaceLock(surface, 0, NULL);
+    unsigned char *base = IOSurfaceGetBaseAddress(surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    for (size_t y = 0; base && y < height; y++) {
+        unsigned char *row = base + y * bytesPerRow;
+        for (size_t x = 0; x < width; x++) {
+            memcpy(row + x * 4, bgra, 4);
+        }
+    }
+    IOSurfaceUnlock(surface, 0, NULL);
+}
+
+static void macws_run_textured_draw(id<MTLDevice> device,
+                                    id<MTLCommandQueue> queue,
+                                    size_t width, size_t height) {
+    BOOL pf550Mode = getenv("IOSCLEAR_PF550_MODE") ||
+        access("/var/mobile/iosclear_pf550_mode", F_OK) == 0;
+    if (pf550Mode) {
+        width = 2388;
+        height = 1668;
+    }
+    IOSurfaceRef sourceSurface = pf550Mode
+        ? macws_create_pf550_surface()
+        : macws_create_bgra_surface(width, height);
+    IOSurfaceRef destinationSurface = macws_create_bgra_surface(width, height);
+    const unsigned char expected[4] = {0x21, 0x43, 0x65, 0xff};
+    if (sourceSurface && !pf550Mode) {
+        macws_fill_surface(sourceSurface, width, height, expected);
+    }
+
+    id<MTLTexture> sourceTexture = macws_create_surface_texture(
+        device, sourceSurface, width, height,
+        pf550Mode ? (MTLPixelFormat)550 : MTLPixelFormatBGRA8Unorm,
+        pf550Mode ? (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget)
+                  : MTLTextureUsageShaderRead);
+    id<MTLTexture> destinationTexture = macws_create_surface_texture(
+        device, destinationSurface, width, height,
+        MTLPixelFormatBGRA8Unorm,
+        MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    fprintf(stderr,
+        "IOSCLEAR DRAW mode=%s surfaces source=%p destination=%p "
+        "textures=%p/%p classes=%s/%s\n",
+        pf550Mode ? "pf550" : "BGRA8",
+        (void *)sourceSurface, (void *)destinationSurface,
+        (__bridge void *)sourceTexture, (__bridge void *)destinationTexture,
+        sourceTexture ? object_getClassName(sourceTexture) : "nil",
+        destinationTexture ? object_getClassName(destinationTexture) : "nil");
+
+    NSError *error = nil;
+    NSURL *libraryURL = [NSURL fileURLWithPath:
+        @"/System/Library/Frameworks/QuartzCore.framework/default.metallib"];
+    id<MTLLibrary> library = [device newLibraryWithURL:libraryURL error:&error];
+    id<MTLFunction> vertex = [library newFunctionWithName:@"read_surf_vert"];
+    id<MTLFunction> fragment = [library newFunctionWithName:@"read_surf_frag"];
+    MTLRenderPipelineDescriptor *pipelineDescriptor =
+        [MTLRenderPipelineDescriptor new];
+    pipelineDescriptor.label = @"IOSCLEAR QuartzCore read_surf reference";
+    pipelineDescriptor.vertexFunction = vertex;
+    pipelineDescriptor.fragmentFunction = fragment;
+    pipelineDescriptor.colorAttachments[0].pixelFormat =
+        MTLPixelFormatBGRA8Unorm;
+    id<MTLRenderPipelineState> pipeline = vertex && fragment
+        ? [device newRenderPipelineStateWithDescriptor:pipelineDescriptor
+                                                 error:&error] : nil;
+    fprintf(stderr,
+        "IOSCLEAR DRAW library=%p vertex=%p fragment=%p pipeline=%p error=%s\n",
+        (__bridge void *)library, (__bridge void *)vertex,
+        (__bridge void *)fragment, (__bridge void *)pipeline,
+        error ? [[error description] UTF8String] : "nil");
+    if (!sourceTexture || !destinationTexture || !pipeline) {
+        if (sourceSurface) CFRelease(sourceSurface);
+        if (destinationSurface) CFRelease(destinationSurface);
+        return;
+    }
+
+    MTLCommandBufferDescriptor *commandDescriptor =
+        [MTLCommandBufferDescriptor new];
+    commandDescriptor.retainedReferences = YES;
+    commandDescriptor.errorOptions =
+        MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    id<MTLCommandBuffer> commandBuffer =
+        [queue commandBufferWithDescriptor:commandDescriptor];
+    commandBuffer.label = @"IOSCLEAR native QuartzCore textured draw";
+
+    MTLRenderPassDescriptor *renderPass =
+        [MTLRenderPassDescriptor renderPassDescriptor];
+    renderPass.colorAttachments[0].texture = destinationTexture;
+    // Keep this a draw-only reference.  A clear load action produces its own
+    // render-state variant and obscures which subtype-1 fields belong to the
+    // textured operation being compared with WindowServer.
+    renderPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:renderPass];
+    encoder.label = @"IOSCLEAR native QuartzCore textured draw";
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setFragmentTexture:sourceTexture atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                vertexStart:0 vertexCount:4];
+    [encoder endEncoding];
+
+    macws_dump_commands(commandBuffer, "DRAW-PRE");
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+
+    IOSurfaceLock(destinationSurface, kIOSurfaceLockReadOnly, NULL);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(destinationSurface);
+    const unsigned char *base = IOSurfaceGetBaseAddress(destinationSurface);
+    const unsigned char *pixel = base
+        ? base + (height / 2) * bytesPerRow + (width / 2) * 4 : NULL;
+    BOOL match = !pf550Mode && pixel && memcmp(pixel, expected, 4) == 0;
+    BOOL commandOK = [commandBuffer status] == MTLCommandBufferStatusCompleted &&
+        [commandBuffer error] == nil;
+    fprintf(stderr,
+        "IOSCLEAR DRAW-RESULT mode=%s status=%ld error=%s commandOK=%s "
+        "bpr=%zu center=%02x%02x%02x%02x expected=%s match=%s\n",
+        pf550Mode ? "pf550" : "BGRA8",
+        (long)[commandBuffer status], [commandBuffer error]
+            ? [[[commandBuffer error] description] UTF8String] : "nil",
+        commandOK ? "YES" : "NO",
+        bytesPerRow, pixel ? pixel[0] : 0, pixel ? pixel[1] : 0,
+        pixel ? pixel[2] : 0, pixel ? pixel[3] : 0,
+        pf550Mode ? "uninitialized" : "214365ff",
+        match ? "YES" : "NO");
+    IOSurfaceUnlock(destinationSurface, kIOSurfaceLockReadOnly, NULL);
+    CFRelease(sourceSurface);
+    CFRelease(destinationSurface);
+}
+
 static void macws_run_clear(void) {
     @autoreleasepool {
+        // Some FrontBoard-launched diagnostics cannot be attached reliably
+        // while they are already stopped in raise(SIGSTOP): debugserver owns
+        // the task, but never reaches its remote-protocol listen state.  This
+        // opt-in bounded delay leaves the task runnable until LLDB attaches.
+        // It is diagnostic-only and does not alter the default execution path.
+        if (getenv("IOSCLEAR_EARLY_DELAY") ||
+            access("/var/mobile/iosclear_early_delay", F_OK) == 0) {
+            const char *configured = getenv("IOSCLEAR_EARLY_DELAY");
+            unsigned long seconds = configured ? strtoul(configured, NULL, 10)
+                                               : 8;
+            if (seconds < 1 || seconds > 15) seconds = 8;
+            fprintf(stderr,
+                "IOSCLEAR EARLY-DELAY %lu seconds before MTL device "
+                "creation pid=%d (attach project LLDB)\n",
+                seconds, getpid());
+            sleep((unsigned)seconds);
+        }
         // Diagnostic attach point: unlike IOSCLEAR_HOLD below, this stops
         // before MTLCreateSystemDefaultDevice so project LLDB can observe the
         // complete native IOGPU setup/resource-create sequence.  The sentinel
@@ -126,25 +383,29 @@ static void macws_run_clear(void) {
             (__bridge void *)queue);
         if (!device || !queue) return;
 
-        const size_t width = macws_dimension_from_env("IOSCLEAR_WIDTH", 64);
-        const size_t height = macws_dimension_from_env("IOSCLEAR_HEIGHT", 64);
-        NSDictionary *properties = @{
-            (id)kIOSurfaceWidth: @(width),
-            (id)kIOSurfaceHeight: @(height),
-            (id)kIOSurfaceBytesPerElement: @4,
-            (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
-            (id)kIOSurfaceIsGlobal: @YES,
-        };
-        IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)properties);
-        MTLTextureDescriptor *textureDescriptor = [MTLTextureDescriptor
-            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-            width:width height:height mipmapped:NO];
-        textureDescriptor.storageMode = MTLStorageModeShared;
-        textureDescriptor.usage = MTLTextureUsageRenderTarget |
-            MTLTextureUsageShaderRead;
-        id<MTLTexture> texture = surface
-            ? [device newTextureWithDescriptor:textureDescriptor
-                                     iosurface:surface plane:0] : nil;
+        size_t width = macws_dimension_from_env("IOSCLEAR_WIDTH", 64);
+        size_t height = macws_dimension_from_env("IOSCLEAR_HEIGHT", 64);
+        // FrontBoard launch does not offer a convenient per-run environment
+        // override.  This diagnostic sentinel selects the iPad13,6 native
+        // framebuffer dimensions used by the WindowServer/VNC comparison.
+        if (access("/var/mobile/iosclear_hires", F_OK) == 0) {
+            width = 2388;
+            height = 1668;
+        }
+        if (getenv("IOSCLEAR_DRAW_MODE") ||
+            access("/var/mobile/iosclear_draw_mode", F_OK) == 0) {
+            fprintf(stderr,
+                "IOSCLEAR DRAW-MODE QuartzCore read_surf %zux%zu\n",
+                width, height);
+            macws_run_textured_draw(device, queue, width, height);
+            return;
+        }
+
+        IOSurfaceRef surface = macws_create_bgra_surface(width, height);
+        id<MTLTexture> texture = macws_create_surface_texture(
+            device, surface, width, height,
+            MTLPixelFormatBGRA8Unorm,
+            MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
         fprintf(stderr, "IOSCLEAR surface=%p texture=%p class=%s\n",
             (void *)surface, (__bridge void *)texture,
             texture ? object_getClassName(texture) : "nil");

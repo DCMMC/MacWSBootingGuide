@@ -25,11 +25,31 @@ DBG_PORT=${DBG_PORT:-5555}
 RUN_LOG=${RUN_LOG:-/tmp/lldb_trace_run.log}
 LLDB_MEMORY_MODULE_LOAD_LEVEL=${LLDB_MEMORY_MODULE_LOAD_LEVEL:-}
 IOS_SYMBOL_ROOT=${IOS_SYMBOL_ROOT:-}
+SUDO_PASSWORD=${SUDO_PASSWORD:-}
+TRACE_CLEANUP_DELAY=${TRACE_CLEANUP_DELAY:-1}
+TRACE_ATTACH_DELAY=${TRACE_ATTACH_DELAY:-3}
+TRACE_TUNNEL_DELAY=${TRACE_TUNNEL_DELAY:-1}
 
 if [ -z "$HOST" ] || [ -z "$CMDS_FILE" ]; then
     echo "usage: bash $0 <host> [ssh-port] [process-name] <commands-file>" >&2
     exit 1
 fi
+
+if [ "$SSH_USER" != root ] && [ -z "$SUDO_PASSWORD" ]; then
+    echo "error: set SUDO_PASSWORD when SSH_USER is not root" >&2
+    exit 2
+fi
+
+ssh_privileged() {
+    local remote_command="$1" quoted
+    if [ "$SSH_USER" = root ]; then
+        ssh -p "$PORT" "$SSH_USER@$HOST" "$remote_command"
+        return
+    fi
+    printf -v quoted '%q' "$remote_command"
+    printf '%s\n' "$SUDO_PASSWORD" | ssh -p "$PORT" "$SSH_USER@$HOST" \
+        "sudo -S bash -c $quoted"
+}
 if [ ! -f "$CMDS_FILE" ]; then
     echo "error: commands file $CMDS_FILE not found" >&2
     exit 1
@@ -45,19 +65,19 @@ echo "[trace] $PROC_NAME PID=$PID" >&2
 
 cleanup() {
     pkill -f "ssh.*-L $DBG_PORT:127.0.0.1" 2>/dev/null || true
-    ssh -p "$PORT" "$SSH_USER@$HOST" \
-        'echo alpine | sudo -S bash -c '\''for p in $(ps aux | grep debugserver | grep -v grep | awk "{print \$2}"); do kill -9 $p 2>/dev/null; done'\''' \
+    ssh_privileged \
+        'for p in $(ps aux | grep debugserver | grep -v grep | awk "{print $2}"); do kill -9 $p 2>/dev/null; done' \
         >/dev/null 2>&1 || true
 }
 trap cleanup EXIT INT TERM
 
 cleanup
-sleep 1
+sleep "$TRACE_CLEANUP_DELAY"
 
-ssh -p "$PORT" "$SSH_USER@$HOST" \
-    "echo alpine | sudo -S /var/jb/usr/bin/debugserver 127.0.0.1:$DBG_PORT --attach=$PID" \
+ssh_privileged \
+    "/var/jb/usr/bin/debugserver 127.0.0.1:$DBG_PORT --attach=$PID" \
     >/tmp/debugserver_remote.log 2>&1 &
-sleep 3
+sleep "$TRACE_ATTACH_DELAY"
 
 STATE=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
     "ps -o state= -p $PID 2>/dev/null | tr -d ' ' || echo MISS")
@@ -66,7 +86,7 @@ if [ "${STATE:0:1}" != "T" ]; then
 fi
 
 ssh -fN -p "$PORT" -L "$DBG_PORT:127.0.0.1:$DBG_PORT" "$SSH_USER@$HOST"
-sleep 1
+sleep "$TRACE_TUNNEL_DELAY"
 
 # lldb runs the commands file via --source — that respects multi-line
 # `script ... DONE` blocks, lldb python heredocs, etc. (which `-o` would

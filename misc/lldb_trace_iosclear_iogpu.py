@@ -27,6 +27,8 @@ _queue_function_records = []
 _queue_function_results = []
 _return_contexts = {}
 _awaiting_agx_open = 0
+_stop_on_type82 = False
+_stop_on_compressed_type82 = False
 
 
 # Exact unslid function VAs from the iPad13,6 iOS 16.3.1 (20D67) binaries.
@@ -203,6 +205,26 @@ def print_summary():
                _resource_bytes.get(resource_type, 0)))
 
 
+def enable_type82_stop():
+    """Stop at the first native IOSurface resource request for RE/disasm."""
+    global _stop_on_type82
+    _stop_on_type82 = True
+    print("IOSCLEAR_IOGPU type82-stop enabled")
+
+
+def enable_compressed_type82_stop():
+    """Stop at the first compressed IOSurface resource request.
+
+    A BGRA destination texture is also represented by resource type 0x82 and
+    can be created before the pf550 source.  The native pf550 reference has a
+    non-zero compression-header span at +0x58, so use that observed ABI field
+    to select the source request without relying on resource ordering.
+    """
+    global _stop_on_compressed_type82
+    _stop_on_compressed_type82 = True
+    print("IOSCLEAR_IOGPU compressed-type82-stop enabled")
+
+
 def device_init_callback(frame, bp_location, internal_dict):
     del bp_location, internal_dict
     accelerator_port = _reg(frame, "x2")
@@ -301,7 +323,18 @@ def io_connect_callback(frame, bp_location, internal_dict):
         _install_return_breakpoint(
             frame, "queue-create", {"selector": "%#x" % selector})
     elif selector == 0x9 and 0x60 <= struct_length <= 0x1000:
-        _trace_resource(_read(process, struct_address, struct_length))
+        data = _read(process, struct_address, struct_length)
+        _trace_resource(data)
+        is_type82 = bool(data) and data[0] == 0x82
+        is_compressed_type82 = (is_type82 and len(data) >= 0x60 and
+                                _u64(data, 0x58) != 0)
+        if ((_stop_on_type82 and is_type82) or
+                (_stop_on_compressed_type82 and is_compressed_type82)):
+            print("IOSCLEAR_IOGPU TYPE82-STOP call=%d resource=%d "
+                  "compressed=%s" %
+                  (_calls, len(_resource_records),
+                   "YES" if is_compressed_type82 else "NO"))
+            return True
         _install_return_breakpoint(
             frame, "resource-create",
             {"index": str(len(_resource_records))})
