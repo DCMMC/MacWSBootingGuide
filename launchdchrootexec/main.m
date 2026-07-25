@@ -1,4 +1,5 @@
 @import Darwin;
+#include "macws_macho_arch.h"
 
 #define CS_LAUNCH_TYPE_SYSTEM_SERVICE 1
 int posix_spawnattr_set_launch_type_np(posix_spawnattr_t *attr, int launch_type);
@@ -42,13 +43,23 @@ int main(int argc, char *argv[], char *envp[]) {
         return 1;
     }
     
-    // Insert BOTH thin libmachook slices (colon-separated).  The device's dyld
-    // won't load a fat insert into a chrooted macOS process, so libmachook ships
-    // as two thin dylibs; each macOS process loads the slice matching its arch
-    // (arm64e or arm64) and dyld silently skips the non-matching one.  Children
-    // inherit this via the environment.  See misc/build_on_ios.sh.
-    setenv("DYLD_INSERT_LIBRARIES",
-           "/usr/local/lib/libmachook.dylib:/usr/local/lib/libmachook_arm64.dylib", 1);
+    // The iOS 16 dyld accepts BOTH thin ARM64/ALL and ARM64/E dylibs in an
+    // ARM64/ALL process.  Inserting both therefore runs every constructor and
+    // installs every hook twice.  Pick exactly one dylib from the executable's
+    // Mach-O subtype; exec_hooks.c repeats this normalization for descendants.
+    macws_macho_arch_t target_arch = macws_macho_arch_for_path(execPath);
+    const char *insert = macws_insert_dylib_for_arch(target_arch);
+    if (!insert) {
+        // launchdchrootexec itself is arm64, so arm64 is the least-surprising
+        // fallback for a malformed/non-Mach-O target.  Keep this visible.
+        target_arch = MACWS_ARCH_ARM64;
+        insert = macws_insert_dylib_for_arch(target_arch);
+        fprintf(stderr, "[launchdchrootexec] unknown target Mach-O subtype: %s; fallback arm64\n",
+                execPath);
+    }
+    setenv("DYLD_INSERT_LIBRARIES", insert, 1);
+    fprintf(stderr, "[launchdchrootexec] target=%s arch=%s insert=%s\n",
+            execPath, macws_arch_name(target_arch), insert);
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);

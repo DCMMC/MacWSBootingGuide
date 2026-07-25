@@ -115,11 +115,12 @@ sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook
 #   "fat file, but missing compatible architecture (have 'arm64,arm64e', need '')"
 # so the insert is silently dropped and the real
 # os_variant_has_internal_diagnostics() traps (brk 1) in libSystem_initializer.
-# A *thin* slice matching the process arch loads fine, and dyld silently SKIPS a
-# non-matching thin insert.  So we install both slices and launchdchrootexec
-# inserts both (libmachook.dylib:libmachook_arm64.dylib): each macOS process
-# loads the slice for its own arch — arm64e (bash, Terminal, git, python3) or
-# arm64 (WindowServer, claude, MacPorts tools like curl/bzip2).
+# A *thin* slice loads fine, so we install both slices. launchdchrootexec and
+# exec_hooks inspect the target Mach-O and insert exactly one: arm64e for bash,
+# Terminal, git, python3; arm64 for WindowServer and MacPorts ARM64/ALL tools.
+# Runtime evidence (WindowServer-2026-07-22-234833.ips) disproved the previous
+# claim that dyld silently skips the other subtype: it loaded BOTH, duplicated
+# constructors/stateful hooks, and started two VNC capture threads.
 LIB=/var/jb/usr/macOS/lib/libmachook.dylib
 LIB_ARM64=/var/jb/usr/macOS/lib/libmachook_arm64.dylib
 echo "==> Splitting fat libmachook into thin arm64e + thin arm64..."
@@ -136,8 +137,7 @@ sudo rm -f "/tmp/libmachook_fat.$$.dylib"
 # growing __LINKEDIT / LC_CODE_SIGNATURE for the just-split slice.  The cdhash
 # looks fine and trustcaches OK (postinst reads it back without complaint), but
 # AMFI rejects every mmap of the dylib with "Invalid Page" (SIGKILL CODESIGNING).
-# Because launchdchrootexec inserts BOTH slices and dyld validates both, a single
-# bad slice SIGKILLs *every* chrooted macOS process (bash, WindowServer, ...).
+# A bad slice SIGKILLs every chrooted process of that subtype.
 # Signing a second time settles the layout and yields page hashes that match the
 # bytes — verified: 2 signs -> chroot smoke test passes; 1 sign -> Killed: 9.
 # (`ldid -S` is not idempotent here, so the cdhash drifts between signs; that is

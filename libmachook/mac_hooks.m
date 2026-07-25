@@ -13,197 +13,66 @@
 #import <sys/mman.h>
 #import <sys/stat.h>
 #import <fcntl.h>
+#import <pthread.h>
+#import <limits.h>
 #import <ptrauth.h>
+
+// Exact logical length of the AGXBuffer currently being initialized on this
+// thread.  The macOS AGX args layout used by initFull can encode a VA-shaped
+// value at +0x58 (for example 0xc00000000 for a 24576-byte Mempool buffer),
+// so truncating +0x58 to uint32_t in the iOS sel=0x9 translator loses the
+// allocation size and used to fall back to 0x1000.
+//
+// Runtime-confirmed with project LLDB on 2026-07-23:
+//   initUntracked len=24576 -> sel=0x9 type=0 args+0x40=0,
+//   old translator sent +0x40=0x1000, kernel returned OUT+0x48=0x4000;
+//   ImageStateEncoderGen6::grow then wrote item 684 at byte offset 0x4008
+//   and faulted at +120.  This TLS bridge deliberately only applies when the
+//   resource call remains on the initFull thread; its diagnostic log is the
+//   runtime witness for that condition and it cannot race other WS threads.
+static _Thread_local uint64_t g_macws_agx_initfull_len = 0;
+
+// Armed only for WindowServer's coexistence mode after the exact macOS 13.4
+// kern_SwapEnd callsite has been verified. IOConnectCallStructMethod_new uses
+// this to translate physical-panel SwapEnd into SwapCancel while leaving the
+// rest of Apple's kern_SwapEnd cleanup intact.
+static _Atomic int g_macws_iomfb_coexist_swap_cancel = 0;
 
 // IOSurface
 typedef id IOSurfaceRef;
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
-extern IOSurfaceRef IOSurfaceLookupFromMachPort(mach_port_t port);
+extern CFDictionaryRef IOSurfaceCopyAllValues(IOSurfaceRef surface);
+extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
+                                                    size_t plane);
+extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
+    IOSurfaceRef surface, size_t plane);
+extern size_t IOSurfaceGetWidthInCompressedTilesOfPlane(
+    IOSurfaceRef surface, size_t plane);
+extern size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
+                                             size_t plane);
+extern size_t IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
+                                                  size_t plane);
+extern size_t IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef surface);
-extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
-
-// ─── Synthesized AGXG13GFamilyBuffer accessors (CODEHEAP-SHIM) ──────────────
-//
-// When the iOS-native macwsallocd hands us an IOSurface with CPU base address
-// X and size Y, we need a buffer-like object whose -resourceSize / -length /
-// -contents / -virtualAddress / -gpuAddress return values derived from
-// (X, Y, IOSurface). Direct re-implementation of MTLBuffer-protocol on a new
-// class is heavy; the lightweight alternative is to associate the values
-// onto the alloc'd instance and override the accessors so they read those
-// associated values when present, falling back to the original impl
-// otherwise.
-//
-// SAFE: an alloc'd-but-uninit'd instance has nil isa-ivars; the original
-// accessors would return 0/null on those. Our overrides check the
-// associated marker and only kick in for our synthesized objects.
-
-static const char kSynthMarkerKey = 0;
-static const char kSynthContentsKey = 0;
-static const char kSynthLengthKey = 0;
-static const char kSynthGpuAddrKey = 0;
-static const char kSynthDeviceKey = 0;
-static const char kSynthSurfaceKey = 0;
-
-static IMP s_orig_resourceSize = NULL;
-static IMP s_orig_length = NULL;
-static IMP s_orig_contents = NULL;
-static IMP s_orig_virtualAddress = NULL;
-static IMP s_orig_gpuAddress = NULL;
-static IMP s_orig_device = NULL;
-
-#define MACWS_SYNTH_MARKER ((__bridge id)(void *)0x53594E5448) /* "SYNTH" */
-
-static NSUInteger macws_synth_resourceSize(id self, SEL _cmd) {
-    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
-        id v = objc_getAssociatedObject(self, &kSynthLengthKey);
-        return v ? [v unsignedIntegerValue] : 0;
-    }
-    return ((NSUInteger(*)(id, SEL))s_orig_resourceSize)(self, _cmd);
-}
-static NSUInteger macws_synth_length(id self, SEL _cmd) {
-    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
-        id v = objc_getAssociatedObject(self, &kSynthLengthKey);
-        return v ? [v unsignedIntegerValue] : 0;
-    }
-    return ((NSUInteger(*)(id, SEL))s_orig_length)(self, _cmd);
-}
-static void *macws_synth_contents(id self, SEL _cmd) {
-    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
-        id v = objc_getAssociatedObject(self, &kSynthContentsKey);
-        return v ? [v pointerValue] : NULL;
-    }
-    return ((void *(*)(id, SEL))s_orig_contents)(self, _cmd);
-}
-static void *macws_synth_virtualAddress(id self, SEL _cmd) {
-    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
-        id v = objc_getAssociatedObject(self, &kSynthContentsKey);
-        return v ? [v pointerValue] : NULL;
-    }
-    return ((void *(*)(id, SEL))s_orig_virtualAddress)(self, _cmd);
-}
-static uint64_t macws_synth_gpuAddress(id self, SEL _cmd) {
-    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
-        id v = objc_getAssociatedObject(self, &kSynthGpuAddrKey);
-        return v ? [v unsignedLongLongValue] : 0;
-    }
-    return ((uint64_t(*)(id, SEL))s_orig_gpuAddress)(self, _cmd);
-}
-static id macws_synth_device(id self, SEL _cmd) {
-    if (objc_getAssociatedObject(self, &kSynthMarkerKey)) {
-        return objc_getAssociatedObject(self, &kSynthDeviceKey);
-    }
-    return ((id(*)(id, SEL))s_orig_device)(self, _cmd);
-}
-
-// Install the synth overrides on the given class. Idempotent — first call
-// captures orig IMPs, subsequent calls are no-ops.
-static void macws_install_synth_overrides(Class cls) {
-    if (!cls) return;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        SEL sels[] = {
-            @selector(resourceSize),
-            @selector(length),
-            @selector(contents),
-            @selector(virtualAddress),
-            @selector(gpuAddress),
-            @selector(device),
-        };
-        IMP newImps[] = {
-            (IMP)macws_synth_resourceSize,
-            (IMP)macws_synth_length,
-            (IMP)macws_synth_contents,
-            (IMP)macws_synth_virtualAddress,
-            (IMP)macws_synth_gpuAddress,
-            (IMP)macws_synth_device,
-        };
-        IMP *origSlots[] = {
-            &s_orig_resourceSize,
-            &s_orig_length,
-            &s_orig_contents,
-            &s_orig_virtualAddress,
-            &s_orig_gpuAddress,
-            &s_orig_device,
-        };
-        for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
-            Method m = class_getInstanceMethod(cls, sels[i]);
-            if (m) {
-                *origSlots[i] = method_getImplementation(m);
-                method_setImplementation(m, newImps[i]);
-                fprintf(stderr, "#### SYNTH override installed: %s\n",
-                    sel_getName(sels[i]));
-            } else {
-                fprintf(stderr, "#### SYNTH override SKIP %s — class %s has no method\n",
-                    sel_getName(sels[i]), class_getName(cls));
-            }
-        }
-    });
-}
-
-// ─── XPC client: ask iOS-native MTLSimDriverHost to allocate an IOSurface ──
-// for chroot CodeHeap use. The chroot kernel rejects sel=0xa heap-creates,
-// but an iOS-native helper opens AGX with the right userclient and CAN
-// allocate. Returns the IOSurface mach send-right (or MACH_PORT_NULL on
-// failure) plus the actual allocated size out-param. Caller is responsible
-// for mach_port_deallocate'ing the returned port.
-// See MTLSimDriverHost/main.x install_alloc_listener for the server side.
-// out_iosurf_id (optional) receives the global IOSurfaceID — used for
-// IOSurfaceLookup(int) cross-process lookup since the per-task
-// IOSurfaceClient.IOSurfaceLookupFromMachPort doesn't resolve send-rights
-// created in another task (runtime-confirmed 2026-06-19).
-static mach_port_t macws_alloc_iosurf_xpc(uint64_t size, uint64_t options,
-                                           uint64_t *out_alloc_size,
-                                           uint32_t *out_iosurf_id) {
-    static xpc_connection_t conn = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
-            dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");
-        if (!createMach) {
-            fprintf(stderr, "#### alloc-xpc: createMach symbol missing\n");
-            return;
-        }
-        // com.macwsguide.alloc is published by the dedicated launchd job
-        // /var/jb/Library/LaunchDaemons/com.macwsguide.alloc.plist, which
-        // launchd auto-spawns on first lookup. No bootstrap needed.
-        conn = createMach("com.macwsguide.alloc", NULL, 0);
-        if (!conn) {
-            fprintf(stderr, "#### alloc-xpc: createMach returned NULL\n");
-            return;
-        }
-        xpc_connection_set_event_handler(conn, ^(xpc_object_t event) { (void)event; });
-        xpc_connection_resume(conn);
-        fprintf(stderr, "#### alloc-xpc: opened connection to com.macwsguide.alloc\n");
-    });
-    if (!conn) return MACH_PORT_NULL;
-
-    xpc_object_t req = xpc_dictionary_create(NULL, NULL, 0);
-    xpc_dictionary_set_string(req, "op", "alloc-iosurf");
-    xpc_dictionary_set_uint64(req, "size", size);
-    xpc_dictionary_set_uint64(req, "options", options);
-    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(conn, req);
-    mach_port_t port = MACH_PORT_NULL;
-    if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
-        const char *result = xpc_dictionary_get_string(reply, "result");
-        if (result && strcmp(result, "ok") == 0) {
-            port = xpc_dictionary_copy_mach_send(reply, "surface");
-            if (out_alloc_size) *out_alloc_size = xpc_dictionary_get_uint64(reply, "alloc_size");
-            if (out_iosurf_id) *out_iosurf_id = (uint32_t)xpc_dictionary_get_uint64(reply, "iosurface_id");
-        }
-        static int once_log = 0;
-        if (once_log++ < 6) {
-            fprintf(stderr,
-                "#### alloc-xpc reply: result=%s port=%u alloc_size=%llu iosurface_id=%u\n",
-                result ?: "(none)", port,
-                out_alloc_size ? (unsigned long long)*out_alloc_size : 0ULL,
-                out_iosurf_id ? *out_iosurf_id : 0);
-        }
-    } else {
-        static int once_log = 0;
-        if (once_log++ < 6) fprintf(stderr, "#### alloc-xpc: no reply\n");
-    }
-    return port;
-}
+extern void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
+                                            size_t plane);
+extern uint32_t IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
+                                                 size_t plane);
+uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(
+    IOSurfaceRef surface, size_t plane);
+size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
+    IOSurfaceRef surface, size_t plane);
+size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
+    IOSurfaceRef surface, size_t plane);
+size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
+                                            size_t plane);
+size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
+                                                 size_t plane);
+size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane);
+void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
+                                           size_t plane);
+uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
+                                                size_t plane);
 
 // macws_make_mem_entry_xpc — ask iOS-native macwsallocd to allocate a
 // CPU buffer + mach_make_memory_entry_64-wrap it, return entry port +
@@ -311,12 +180,11 @@ void EnableJIT(void);
 // offsets hardcoded for macOS 13.4
 // IOMobileFramebuffer`kern_SwapEnd + 36
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_inputStructCnt 0x4400 + 0x24
-// IOMobileFramebuffer`kern_SwapEnd + 0x30: `bl IOConnectCallStructMethod` (sel=5) — the call
-// that presents WindowServer's composited surface to the PHYSICAL iPad panel. In coexistence
-// mode (iOS backboardd owns the panel, macOS viewed via VNC off-screen) we neutralize this so
-// WS never scans out to the panel -> no iOS/macOS flicker. Gated to WindowServer + auto-detection
-// of a running backboardd (coexistence); left intact in the original macOS-on-panel mode where
-// backboardd is unloaded. (/tmp/ws_headless still force-enables it for testing.)
+// IOMobileFramebuffer`kern_SwapEnd + 0x30: expected
+// `bl IOConnectCallStructMethod` callsite. We only READ this instruction to
+// validate the hardcoded ABI before arming the coexistence SwapCancel
+// translation; it must not be NOPed because SwapBegin's DCP object then has no
+// matching present/cancel operation.
 #define OFF_IOMobileFramebuffer_kern_SwapEnd_submit 0x4400 + 0x30
 // SkyLight`WS::Displays::CAWSManager::CAWSManager() + 560
 #define OFF_SkyLight_CAWSManager_register_abort 0x18013c
@@ -547,6 +415,60 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                 extern id objc_alloc_trace(Class);
                 if (!strcmp(lookup, "objc_alloc")) {
                     resolved = (void *)objc_alloc_trace;
+                    force_override = 1;
+                }
+                // macOS 13.4 IOSurfaceClient's per-plane fields are four bytes
+                // later than iOS 16.3's kernel-populated layout.
+                // AGXMetal13_3 is a standalone cache image here, so its
+                // already-populated GOT bypasses ordinary DYLD_INTERPOSE.
+                // Force only the RE-confirmed imports onto property-backed ABI
+                // compatibility wrappers below; these are semantic field
+                // recoveries, not constant check bypasses.
+                if (strstr(image_name, "AGXMetal13_3") &&
+                    !strcmp(lookup,
+                        "IOSurfaceGetCompressionTypeOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetCompressionTypeOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetHeightInCompressedTilesOfPlane")) {
+                    resolved = (void *)
+                        macws_IOSurfaceGetHeightInCompressedTilesOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetWidthInCompressedTilesOfPlane")) {
+                    resolved = (void *)
+                        macws_IOSurfaceGetWidthInCompressedTilesOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetBytesPerRowOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetBytesPerRowOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetBytesPerTileDataOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetBytesPerTileDataOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup, "IOSurfaceGetOffsetOfPlane")) {
+                    resolved = (void *)macws_IOSurfaceGetOffsetOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                                   "IOSurfaceGetBaseAddressOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetBaseAddressOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetAddressFormatOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetAddressFormatOfPlane;
                     force_override = 1;
                 }
                 uint64_t value = (uint64_t)resolved;
@@ -822,9 +744,10 @@ static int hooked_skylight_start_composite_ds(void *self, id target0, id target1
         return 0;
     }
     int rv = orig_skylight_start_composite_ds(self, target0, target1, load_action, store_action);
-    // WS-render-thread completion capture for VNC (gated /tmp/macws_vnc_share):
-    // getBytes the previous (complete) display frame -> shared surface -> OSXvnc.
-    { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(target0); }
+    if (rv != 0) {
+        extern void macws_vnc_stage_composite(void *, id);
+        macws_vnc_stage_composite(self, target0);
+    }
     return rv;
 }
 
@@ -971,15 +894,21 @@ int hooked_skylight_start_composite_wscd(void *self, void *dest,
         ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
     int rv = ((StartComposite_WSCD_t)orig_skylight_start_composite_wscd_ref)(
         self, dest, load_action, store_action);
-    // VNC completion-capture: map the WSCompositeDestination back to its
-    // MTLTexture (recorded at WSCompositeDestinationCreateWithMetalTexture)
-    // and feed it to the WS-render-thread capture.
-    { extern NSMutableDictionary *g_wscd_tex;
-      if (g_wscd_tex && dest) {
-          id tex = nil;
-          @synchronized(g_wscd_tex) { tex = g_wscd_tex[[NSValue valueWithPointer:dest]]; }
-          if (tex) { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(tex); }
-      } }
+    // Map only a successful StartComposite.  EndCurrentComposite performs
+    // the matching pop and selects the destination after endEncoding.
+    if (rv != 0) {
+        extern NSMutableDictionary *g_wscd_tex;
+        if (g_wscd_tex && dest) {
+            id tex = nil;
+            @synchronized(g_wscd_tex) {
+                tex = g_wscd_tex[[NSValue valueWithPointer:dest]];
+            }
+            if (tex) {
+                extern void macws_vnc_stage_composite(void *, id);
+                macws_vnc_stage_composite(self, tex);
+            }
+        }
+    }
     return macws_pop_on_startcomp_bail(self, before, rv);
 }
 
@@ -993,8 +922,41 @@ static int hooked_skylight_start_composite_mtltex(void *self, id texture,
         ? *(volatile uint64_t *)((char *)self + 0x28) : 0;
     int rv = orig_skylight_start_composite_mtltex(
         self, texture, load_action, store_action);
-    { extern void macws_vnc_on_composite(id); macws_vnc_on_composite(texture); }
+    if (rv != 0) {
+        extern void macws_vnc_stage_composite(void *, id);
+        macws_vnc_stage_composite(self, texture);
+    }
     return macws_pop_on_startcomp_bail(self, before, rv);
+}
+
+// RE-confirmed via device-local LLDB against the running macOS 13.4
+// SkyLight image (2026-07-25): MetalContext::EndCurrentComposite(bool) calls
+// -endEncoding at +0x80, StopEncoding at +0x94, then pops _state_stack at
+// +0x98.  Completing the VNC selection after %orig therefore observes the
+// destination at the real composite boundary rather than allocation time.
+typedef void (*EndCurrentComposite_t)(void *self, bool synchronize);
+static EndCurrentComposite_t orig_skylight_end_current_composite = NULL;
+static void hooked_skylight_end_current_composite(void *self, bool synchronize) {
+    orig_skylight_end_current_composite(self, synchronize);
+    extern void macws_vnc_complete_composite(void *);
+    macws_vnc_complete_composite(self);
+}
+
+// RE-confirmed via the same live SkyLight image: EndUpdate(bool) reaches
+// MetalContext::Flush at +0x78 only when _update_depth (self+0x178) drops from
+// one to zero.  Flush ends encoders, commits the command buffer, retains that
+// submitted buffer at self+0x68, and clears self+0x60.  The VNC worker waits on
+// that exact buffer off the render thread before reading the staged target.
+typedef void (*EndUpdate_t)(void *self, bool waitUntilSubmitted);
+static EndUpdate_t orig_skylight_end_update = NULL;
+static void hooked_skylight_end_update(void *self, bool waitUntilSubmitted) {
+    bool outermost = self &&
+        *(volatile int32_t *)((char *)self + 0x178) == 1;
+    orig_skylight_end_update(self, waitUntilSubmitted);
+    if (outermost) {
+        extern void macws_vnc_finish_update(void *);
+        macws_vnc_finish_update(self);
+    }
 }
 
 // SkyLight `WSCompositeDestinationCreateWithMetalTexture(MTLTexture*, MetalContext*, ...)`
@@ -1113,6 +1075,75 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
     } else {
         fprintf(stderr,
             "#### SkyLight StartComposite(MTLTex): symbol not found\n");
+    }
+
+    // This symbol is present in LLDB's shared-cache symbol table but stripped
+    // from the export table used by MSFindSymbol.  Prefer the symbol when it
+    // is available; otherwise accept the macOS 13.4 image-relative offset
+    // only when the exact first 12 instruction words captured from the live
+    // process match.  A different SkyLight build fails closed.
+    void *sym_end_composite = MSFindSymbol(sl,
+        "__ZN12MetalContext19EndCurrentCompositeEb");
+    if (!sym_end_composite && header) {
+        uint32_t *candidate = (uint32_t *)((uintptr_t)header + 0x14753c);
+        static const uint32_t expected[] = {
+            0xd503237f, 0xa9bd57f6, 0xa9014ff4, 0xa9027bfd,
+            0x910083fd, 0xf9401408, 0xb4000b28, 0xaa0003f3,
+            0x340002c1, 0xaa1303e0, 0x9400005d, 0xa9422269,
+        };
+        if (memcmp(candidate, expected, sizeof(expected)) == 0) {
+            sym_end_composite = candidate;
+            fprintf(stderr,
+                "#### SkyLight EndCurrentComposite(bool) RE-verified fallback at %p\n",
+                sym_end_composite);
+        } else {
+            fprintf(stderr,
+                "#### SkyLight EndCurrentComposite(bool) fallback rejected: "
+                "instruction signature mismatch at %p\n", candidate);
+        }
+    }
+    if (sym_end_composite) {
+        MSHookFunction(sym_end_composite,
+            (void *)hooked_skylight_end_current_composite,
+            (void **)&orig_skylight_end_current_composite);
+        fprintf(stderr,
+            "#### SkyLight EndCurrentComposite(bool) completion hook installed at %p\n",
+            sym_end_composite);
+    } else {
+        fprintf(stderr,
+            "#### SkyLight EndCurrentComposite(bool): symbol not found, skipped\n");
+    }
+
+    void *sym_end_update = MSFindSymbol(sl,
+        "__ZN12MetalContext9EndUpdateEb");
+    if (!sym_end_update && header) {
+        uint32_t *candidate = (uint32_t *)((uintptr_t)header + 0x1470b0);
+        static const uint32_t expected[] = {
+            0xd503237f, 0xa9be4ff4, 0xa9017bfd, 0x910043fd,
+            0xb9417808, 0x7100011f, 0x5400048d, 0xaa0003f3,
+            0x71000508, 0xb9017808, 0x540003a1, 0xaa0103f4,
+        };
+        if (memcmp(candidate, expected, sizeof(expected)) == 0) {
+            sym_end_update = candidate;
+            fprintf(stderr,
+                "#### SkyLight EndUpdate(bool) RE-verified fallback at %p\n",
+                sym_end_update);
+        } else {
+            fprintf(stderr,
+                "#### SkyLight EndUpdate(bool) fallback rejected: "
+                "instruction signature mismatch at %p\n", candidate);
+        }
+    }
+    if (sym_end_update) {
+        MSHookFunction(sym_end_update,
+            (void *)hooked_skylight_end_update,
+            (void **)&orig_skylight_end_update);
+        fprintf(stderr,
+            "#### SkyLight EndUpdate(bool) submission hook installed at %p\n",
+            sym_end_update);
+    } else {
+        fprintf(stderr,
+            "#### SkyLight EndUpdate(bool): symbol not found, skipped\n");
     }
 
     // 2026-06-20 — _state_stack pop_back resolution. MetalContext starts
@@ -1336,26 +1367,42 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         });
         // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
 
-        // COEXISTENCE (flicker fix): in WindowServer only, when iOS's backboardd is running
-        // (we're sharing the device with the iOS UI), neutralize kern_SwapEnd's panel present
-        // so WS renders to its framebuffer (VNC reads it) but never scans out to the physical
-        // iPad panel — iOS keeps the panel, eliminating the iOS/macOS flicker. When backboardd
-        // is NOT running (the original "unload SpringBoard+backboardd, macOS takes the panel"
-        // mode) the present is left intact. Auto-detecting backboardd makes this survive
-        // reboots with no flag file; /tmp/ws_headless still force-enables it for testing.
+        // COEXISTENCE: WindowServer must finish every SwapBegin without
+        // presenting over iOS's physical panel. The old patch changed
+        // kern_SwapEnd+0x30 from BL IOConnectCallStructMethod to `mov x0,#0`.
+        // Runtime-confirmed on 2026-07-23: that patch was active immediately
+        // before `DCP PANIC ... RTK_workloop_init:80000008 - additionThread`.
+        // It also violated the protocol invariant by reporting success without
+        // sending either SwapEnd or SwapCancel.
+        //
+        // RE-confirmed via project LLDB against the loaded macOS 13.4 binary:
+        //   kern_SwapBegin+60  loads io_connect_t from conn+0x14;
+        //   kern_SwapBegin+84  calls scalar selector 4;
+        //   kern_SwapBegin+140 stores the returned swap ID at conn+0x68;
+        //   kern_SwapEnd+48    calls struct selector 5 with conn+0x18, 0x46c;
+        //   kern_SwapCancel+32 copies w1 (swap ID), then +48/+64 calls scalar
+        //                       selector 0x34 with exactly one input scalar.
+        //
+        // Arm a narrow call-layer translation below. Unlike replacing the
+        // whole kern_SwapEnd function, it returns the real kernel status and
+        // lets kern_SwapEnd continue with its gain-map release/counters.
         {
             char exe[PATH_MAX]; uint32_t exelen = sizeof(exe);
             if(_NSGetExecutablePath(exe, &exelen) == 0 &&
                strstr(exe, "SkyLight.framework/Resources/WindowServer") != NULL &&
                (is_process_running("backboardd") || access("/tmp/ws_headless", F_OK) == 0)) {
-                uint32_t *swapSubmit = (uint32_t *)(OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
-                ModifyExecutableRegion(swapSubmit, sizeof(uint32_t), ^{
-                    if (*swapSubmit == 0x94001f64) { // bl IOConnectCallStructMethod (panel present)
-                        *swapSubmit = 0xd2800000;    // mov x0, #0  (skip present, return KERN_SUCCESS)
-                        fprintf(stderr,
-                            "#### COEXIST: kern_SwapEnd panel-present NOPed (backboardd detected)\n");
-                    }
-                });
+                const uint32_t *swapSubmit = (const uint32_t *)(
+                    OFF_IOMobileFramebuffer_kern_SwapEnd_submit + (uintptr_t)header);
+                if (*swapSubmit == 0x94001f64) {
+                    atomic_store(&g_macws_iomfb_coexist_swap_cancel, 1);
+                    fprintf(stderr,
+                        "#### COEXIST: verified kern_SwapEnd BL; SwapEnd(sel5) -> "
+                        "SwapCancel(sel0x34) translation armed\n");
+                } else {
+                    fprintf(stderr,
+                        "#### COEXIST: kern_SwapEnd callsite mismatch (%#x); "
+                        "SwapCancel translation NOT armed\n", *swapSubmit);
+                }
             }
         }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
@@ -1472,12 +1519,11 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // 2026-06-20 (lldb-confirmed) — AGXTexture init at static
             // 0x1e5a5b9cc calls `_objc_msgSend$isMemoryless` on the
             // result of super-init (x19 = IOGPUMetalTexture instance).
-            // For our synth AGXG13GFamilyBuffer-as-texture this method
-            // doesn't exist → forwarding → SIGTRAP. Add isMemoryless
-            // returning NO (IOSurface-backed = real memory, not memoryless)
-            // on IOGPUMetalTexture (the super class that AGXTexture
-            // queries) AND on AGXG13GFamilyBuffer (the synth that gets
-            // returned from CODEHEAP-SHIM).
+            // IOGPUMetalTexture in the iOS framework lacks this macOS-side
+            // selector, so provide the descriptor-backed semantic query on
+            // that superclass.  Do not add texture methods to AGXBuffer: a
+            // buffer receiving texture selectors is evidence that an
+            // initializer returned the wrong class and must fail visibly.
             // 2026-06-20 — Full cascade RE'd via otool on AGXTexture init.
             // Selectors AGXTexture init sends that need to resolve on the
             // synth buffer / chroot descriptor / texture:
@@ -1488,7 +1534,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             //   getAlignment          (descriptor)
             //   descriptorPrivate     (descriptor)
             //   getBytesPerRow        (descriptor)
-            //   finalizeTextureCreation (self) [already added on AGXG13GFamilyBuffer]
+            //   finalizeTextureCreation (self; must use AGXTexture's real implementation)
             //   updateBindDataWithAddresses:gpuVirtualAddress:
             //   updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:
             //   allocBufferSubDataWithLength:options:alignment:heapIndex:bufferIndex:bufferOffset:
@@ -1498,8 +1544,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // Each returns a safe value (NO, 0, nil, self) so the call site
             // continues past doesNotRecognizeSelector.
             struct stub { const char *sel; const char *enc; IMP imp; };
-            // BOOL stubs returning NO
-            IMP retNO = imp_implementationWithBlock(^BOOL(id s) { (void)s; return NO; });
             // 2026-06-20 — isMemoryless was previously stubbed to ALWAYS
             // return NO, breaking memoryless texture handling: AGXTexture
             // init at 0x1e5a5b9c0 sends `isMemoryless` to the IOGPUMetalTexture
@@ -1528,8 +1572,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // id stub returning self (for descriptorPrivate / initNewTextureData:)
             IMP retSelf = imp_implementationWithBlock(^id(id s) { (void)s; return s; });
             IMP retSelfArg = imp_implementationWithBlock(^id(id s, id a) { (void)s; (void)a; return s; });
-            // void no-op (for finalizeTextureCreation, updateBindData…)
-            IMP retVoid = imp_implementationWithBlock(^(id s) { (void)s; });
+            // void compatibility shims for the two bind-data selectors.
             IMP retVoid3 = imp_implementationWithBlock(^(id s, void *p, uint64_t va) { (void)s; (void)p; (void)va; });
             IMP retVoid4 = imp_implementationWithBlock(^(id s, void *p, uint64_t va, BOOL b) { (void)s; (void)p; (void)va; (void)b; });
             // nil stub for allocBufferSubData…
@@ -1544,7 +1587,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 { "getAlignment",                                  "Q@:",                retZeroSize },
                 { "descriptorPrivate",                             "@@:",                retSelf },
                 { "getBytesPerRow",                                "Q@:",                retZeroSize },
-                { "finalizeTextureCreation",                       "v@:",                retVoid },
                 { "updateBindDataWithAddresses:gpuVirtualAddress:", "v@:^vQ",            retVoid3 },
                 { "updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:", "v@:^vQc", retVoid4 },
                 { "allocBufferSubDataWithLength:options:alignment:heapIndex:bufferIndex:bufferOffset:",
@@ -1554,7 +1596,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             };
             const char *targets[] = {
                 "IOGPUMetalTexture",
-                "AGXG13GFamilyBuffer",
                 "AGXTexture",
                 "MTLTextureDescriptor",
                 "AGXG13GFamilyTexture",
@@ -1711,7 +1752,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
         // ──────────────────────────────────────────────────────────────────
-        // texBaseAddressesUpdated null-deref skip (env-gated).
+        // Historical texBaseAddressesUpdated crash reproducer (diagnostic only).
         //
         // Root cause (see memory [[agx-texbaseaddresses-nullderef]]):
         //   SkyLight's CompositorMetal::CreateShadowFromMask (window shadow
@@ -1733,7 +1774,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // path crashes. The crash is in a SHADOW texture path, not the
         // framebuffer-IOSurface path.
         //
-        // Patch: NOP the BL @ 0x1e5a5ba10 inside
+        // The old shipped patch NOPed the BL @ 0x1e5a5ba10 inside
         //   `-[AGXTexture initWithDevice:desc:isSuballocDisabled:]`. That
         // BL targets objc_msgSend$updateBindDataWithAddresses:gpuVirtual\
         // Address:shouldInitMetadata: (the stub @ 0x1e5ab1bc0). Skipping
@@ -1746,8 +1787,14 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // For SkyLight's shadow-mask use case the worst-case is window
         // chrome shadows render incorrectly — acceptable trade vs WS dying.
         //
-        // Gated by MACWS_AGX_SKIP_BIND_UPDATE=1 (default ON for AGX-native
-        // mode since AGX-native otherwise crashes on first shadow draw).
+        // 2026-07-23 project-LLDB correction: after the upstream AGXBuffer
+        // initFull/resource-size fixes, Texture+0x1c8 now owns three real
+        // AGXBuffer objects with non-NULL IOGPUMetalResource::_res fields.
+        // Keeping the BLs enabled completes the real initializer and stores
+        // Texture+0x130/+0x40.  The old default NOP directly caused
+        // writeRegion to call memmove with dst=NULL.  Normal AGX-native runs
+        // therefore never patch these calls.  MACWS_DIAG_SKIP_BIND_UPDATE is
+        // retained solely to reproduce the historical failure under LLDB.
 
         // DIAG: what class is in __objc_classrefs at offset 0x298?
         // -[AGXG13GFamilyDevice newTextureWithDescriptor:iosurface:plane:]
@@ -1792,8 +1839,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
 
-        if (getenv("MACWS_AGX_SKIP_BIND_UPDATE") ||
-            (getenv("MACWS_AGX_NATIVE") && !getenv("MACWS_AGX_KEEP_BIND_UPDATE"))) {
+        if (getenv("MACWS_DIAG_SKIP_BIND_UPDATE")) {
             // Two BL sites both target objc_msgSend$updateBindDataWith…
             // which calls AGX::TextureGen4<G13>::texBaseAddressesUpdated()
             // — that function +2932 does `ldr x11, [x11, #0x18]` where
@@ -1827,7 +1873,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     if (is_bl) {
                         *bl_at = NOP_INSN;
                         dprintf(2,
-                            "#### MACWS_AGX_SKIP_BIND_UPDATE: NOPed BL @%p "
+                            "#### MACWS_DIAG_SKIP_BIND_UPDATE: NOPed BL @%p "
                             "(static %#llx + slide=%#zx)\n",
                             bl_at, (unsigned long long)bl_static,
                             (size_t)slide);
@@ -1835,7 +1881,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                         /* already patched */
                     } else {
                         dprintf(2,
-                            "#### MACWS_AGX_SKIP_BIND_UPDATE: @%p got %#x "
+                            "#### MACWS_DIAG_SKIP_BIND_UPDATE: @%p got %#x "
                             "expected BL — SKIP\n",
                             bl_at, insn);
                     }
@@ -2567,6 +2613,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     IMP trace_full = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long align, unsigned long opt, int subDis, void *resInArgs, void *pinned) {
                         // Capture class BEFORE orig in case it releases self.
                         Class pre_cls_full = object_getClass(self);
+                        uint64_t previous_init_len = g_macws_agx_initfull_len;
+                        g_macws_agx_initfull_len = len;
                         // iOS IOGPU's kernel sub-resource creation rejects
                         // align=1 with kIOReturnExclusiveAccess (0xe00002c2)
                         // for every length tier — Mempool::grow's freelist
@@ -2699,310 +2747,58 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 "#### TRACE -[AGXBuffer initFull] self=%p dev=%p len=%lu align=%lu→%lu opt=%lu subDis=%d→%d resIn=%p pin=%p -> %p\n",
                                 self, dev, len, align, align_eff, opt, subDis, subDis_eff, resInArgs, pinned, r);
                         }
+                        g_macws_agx_initfull_len = previous_init_len;
                         return r;
                     });
                     method_setImplementation(m_full, trace_full);
                     fprintf(stderr, "#### MACWS_AGX_NATIVE swizzled initWithDevice:length:alignment:options:isSuballocDisabled:resourceInArgs:pinnedGPULocation:\n");
                 }
 
-                // 2026-06-19 — `finalizeTextureCreation` no-op on
-                // AGXG13GFamilyBuffer.
-                //
-                // lldb caught chroot WS dying via objc_exception_throw with
-                // reason `-[AGXG13GFamilyBuffer finalizeTextureCreation]:
-                // unrecognized selector`. Backtrace:
-                //   AGXTexture::initWithDevice:desc:isSuballocDisabled: +632
-                //   SkyLight MetalTiledBacking::PrepareForUse + 528
-                //   SkyLight CompositorMetal::composite ...
-                //
-                // RE shows AGXTexture +636 does `mov x0, x19; bl
-                // objc_msgSend$finalizeTextureCreation` where x19 came from
-                // an earlier `bl objc_msgSendSuper2` at +540. The super-init
-                // returned an AGXG13GFamilyBuffer (instead of an
-                // AGXG13GFamilyTexture) — probably because our PIN_FALLBACK
-                // or CODEHEAP-SHIM intercept of -[IOGPUMetalResource
-                // initWith...args:argsSize:] is sometimes also crossed by
-                // a texture super-init path (both share that 4-arg init in
-                // the AGXResource class hierarchy).
-                //
-                // `finalizeTextureCreation` is normally only declared on
-                // AGXTexture / AGXG13GFamilyTexture (image lookup confirmed
-                // — only two implementations in AGXMetal13_3). Adding a
-                // no-op to AGXG13GFamilyBuffer keeps the AGXTexture init
-                // moving forward when its super-init returns a Buffer-class
-                // instance instead of a Texture-class one. Real
-                // AGXG13GFamilyTexture instances STILL get the real method
-                // via normal dispatch.
-                {
-                    Class kBuf = objc_getClass("AGXG13GFamilyBuffer");
-                    if (kBuf) {
-                        SEL sel_ftc = sel_registerName("finalizeTextureCreation");
-                        IMP noop_ftc = imp_implementationWithBlock(^void(id self){
-                            static int once = 0;
-                            if (once++ < 6) {
-                                fprintf(stderr,
-                                    "#### finalizeTextureCreation no-op on AGXG13GFamilyBuffer self=%p cls=%s\n",
-                                    self, object_getClass(self) ? class_getName(object_getClass(self)) : "(nil)");
-                            }
-                        });
-                        BOOL added = class_addMethod(kBuf, sel_ftc, noop_ftc, "v@:");
-                        fprintf(stderr,
-                            "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyBuffer, finalizeTextureCreation) = %d\n",
-                            added);
-                    }
-                }
-
-                // -[AGXBuffer initWithDevice:options:args:argsSize:] — the
-                // 4-arg init called from inside `AGX::Heap<true>::allocateImpl`
-                // (setupCompiler:'s CodeHeap dispatch_sync block). Runtime
-                // lldb backtrace 2026-06-19:
-                //   frame#3 AGX::Heap<true>::allocateImpl block_invoke +596
-                //   frame#2 -[IOGPUMetalResource initWithDevice:remoteStorageResource:options:args:argsSize:] +460
-                //   frame#1 IOGPUResourceCreate +236
-                //   frame#0 IOConnectCallMethod sel=0xa → kernel 0xe00002c2
-                // Pin-fallback approach: when orig returns nil (cascading from
-                // IOConnect rejection), synthesize via the 6-arg `pinnedGPULocation:`
-                // selector PinnedVAProbe proved works in iOS-native userland.
-                // Size is extracted from args+0x58 sz32 field (the heap byte-
-                // count macOS writes there before this init).
+                // Observe the 4-argument IOGPU resource initializer without
+                // changing its contract.  An older diagnostic fallback returned
+                // a bare +alloc AGXG13GFamilyBuffer when this initializer failed.
+                // Project-LLDB caught the resulting object in
+                // IOGPUMetalCommandBufferStorageAllocResourceAtIndex: `_res`
+                // (ivar +0x18) was NULL, so ResourceInfo remained zero and
+                // RenderUSCStateLoader later wrote through address 0x7e0.  A
+                // failed real initializer must therefore remain nil; the
+                // upstream IOConnect failure is the boundary to diagnose.
                 {
                     SEL initArgs = sel_registerName("initWithDevice:options:args:argsSize:");
                     Method m_args = class_getInstanceMethod(agxbuf_after, initArgs);
                     if (m_args && getenv("MACWS_PIN_FALLBACK")) {
                         IMP orig_args = method_getImplementation(m_args);
-                        IMP shim_args = imp_implementationWithBlock(^id(
+                        IMP trace_args = imp_implementationWithBlock(^id(
                                 id self, id dev, unsigned long opt,
                                 void *args, unsigned long argsSize) {
-                            // Capture class BEFORE orig — orig may release self
-                            // and corrupt its isa on failure (object_getClass(self)
-                            // then returns nil), making the post-orig fallback
-                            // unable to identify the class.
                             Class pre_cls = object_getClass(self);
-                            static int entry_log = 0;
-                            if (entry_log++ < 4) {
-                                fprintf(stderr,
-                                    "#### CODEHEAP-SHIM entry self=%p cls=%s dev=%p opt=%#lx args=%p argsSize=%lu\n",
-                                    self, pre_cls ? class_getName(pre_cls) : "(nil)",
-                                    dev, opt, args, argsSize);
-                            }
                             id r = ((id (*)(id, SEL, id, unsigned long, void *, unsigned long))orig_args)(
                                 self, initArgs, dev, opt, args, argsSize);
-                            static int post_log = 0;
-                            if (post_log++ < 4) {
+                            static _Atomic unsigned int calls = 0;
+                            static _Atomic unsigned int failures = 0;
+                            unsigned int call_n = atomic_fetch_add(&calls, 1) + 1;
+                            if (!r) {
+                                unsigned int fail_n = atomic_fetch_add(&failures, 1) + 1;
                                 fprintf(stderr,
-                                    "#### CODEHEAP-SHIM post-orig: r=%p (orig %s)\n",
-                                    r, r ? "non-nil" : "nil — entering synth");
-                            }
-                            if (r) return r;
-                            // 2026-06-19 — texture super-init that reaches here
-                            // means even AFTER the widened VA-shape patch the
-                            // orig still returned nil. Log args ONCE per process
-                            // for follow-up RE so we know if the patch missed a
-                            // case. Then continue into the existing synth path
-                            // (best-effort). This rarely fires now.
-                            const char *pre_name = pre_cls ? class_getName(pre_cls) : "(nil)";
-                            if (pre_name && strstr(pre_name, "Texture")) {
-                                static int diag_once = 0;
-                                if (!diag_once++) {
-                                    fprintf(stderr,
-                                        "#### CODEHEAP-SHIM POST-VAFIX texture-orig-nil pre_cls=%s "
-                                        "args@%p argsSize=%lu — VA-shape patch did NOT cover this case\n",
-                                        pre_name, args, argsSize);
-                                    if (args && argsSize <= 0x200) {
-                                        const uint8_t *a = (const uint8_t *)args;
-                                        for (size_t i = 0; i < argsSize; i += 16) {
-                                            fprintf(stderr, "####   args+%#04zx:", i);
-                                            for (size_t j = 0; j < 16 && i + j < argsSize; j++) {
-                                                fprintf(stderr, " %02x", a[i + j]);
-                                            }
-                                            fprintf(stderr, "\n");
-                                        }
+                                    "#### AGX_INITARGS FAIL #%u/%u cls=%s dev=%p opt=%#lx args=%p argsSize=%lu — preserving nil\n",
+                                    fail_n, call_n,
+                                    pre_cls ? class_getName(pre_cls) : "(nil)",
+                                    dev, opt, args, argsSize);
+                                if (fail_n <= 8 && args && argsSize <= 0x200) {
+                                    const uint8_t *a = (const uint8_t *)args;
+                                    for (size_t i = 0; i < argsSize; i += 16) {
+                                        fprintf(stderr, "####   initargs+%#04zx:", i);
+                                        for (size_t j = 0; j < 16 && i + j < argsSize; j++)
+                                            fprintf(stderr, " %02x", a[i + j]);
+                                        fprintf(stderr, "\n");
                                     }
                                 }
                             }
-                            // PIN-FALLBACK path. Use pre_cls (captured before orig)
-                            // — orig consumed self, so object_getClass(self) now
-                            // returns nil.
-                            Class cls = pre_cls;
-                            Class kFam = objc_getClass("AGXG13GFamilyBuffer");
-                            Class target = kFam ?: cls;
-                            fprintf(stderr,
-                                "#### CODEHEAP-SHIM synth-step1: kFam=%p (%s) target=%s\n",
-                                kFam, kFam ? class_getName(kFam) : "(nil)",
-                                target ? class_getName(target) : "(nil)");
-                            static SEL pin5_sel = NULL;
-                            if (!pin5_sel) pin5_sel = sel_registerName(
-                                "initWithDevice:length:options:isSuballocDisabled:pinnedGPULocation:");
-                            BOOL responds = class_getInstanceMethod(target, pin5_sel) != NULL;
-                            fprintf(stderr,
-                                "#### CODEHEAP-SHIM synth-step2: %s responds to pin5? %d\n",
-                                target ? class_getName(target) : "(nil)", responds);
-                            if (!responds) {
-                                static int log_once = 0;
-                                if (!log_once++) {
-                                    fprintf(stderr,
-                                        "#### CODEHEAP-SHIM: %s does NOT respond to 5-colon pinnedGPULocation:\n",
-                                        target ? class_getName(target) : "(nil)");
-                                }
-                                return nil;
-                            }
-                            uint64_t sz = 0;
-                            if (args && argsSize >= 0x60) {
-                                const uint8_t *a = (const uint8_t *)args;
-                                // args+0x58 sz32 is what the existing heap fixup
-                                // reads as the requested byte-count. Confirmed by
-                                // runtime dump: args+0x58=0x38000000 for the
-                                // setupCompiler CodeHeap allocation.
-                                sz = (uint64_t)*(const uint32_t *)(a + 0x58);
-                                // Safety cap at 256 MB — even if 0x38000000 (939 MB)
-                                // is what macOS asks for, iOS-native CodeHeap rarely
-                                // exceeds 64 MB, and oversizing on the iOS path may
-                                // get rejected for separate reasons (kernel VA quota).
-                                // 2026-06-19 — Empirically iOS IOSurface backing
-                                // for >16MB allocations: macwsallocd creates the
-                                // surface and returns port+id, but chroot's
-                                // IOSurfaceLookup + IOSurfaceLookupFromMachPort
-                                // BOTH return nil. Smaller (<= 16MB) round-trip
-                                // fine. Cap at 16MB so synth-step3 reliably
-                                // succeeds and downstream gets a real IOSurface.
-                                if (sz > 0x1000000ULL) sz = 0x1000000ULL;
-                                if (sz < 0x10000ULL)    sz = 0x10000ULL;
-                            }
-                            if (!sz) sz = 0x10000;
-                            // pinnedGPULocation: ALSO routes through IOConnect
-                            // sel=0xa internally and the iOS kernel rejects it
-                            // the same way for chroot WS. Skip that path. The
-                            // working approach is: ask iOS-native helper to
-                            // allocate an IOSurface (kernel-blessed shared GPU
-                            // memory), receive the mach send-right back, then
-                            // wrap as a buffer using bytes/length init (which
-                            // takes a CPU pointer and doesn't need sel=0xa).
-                            fprintf(stderr,
-                                "#### CODEHEAP-SHIM synth-step3: requesting IOSurface from helper sz=%#llx\n",
-                                (unsigned long long)sz);
-                            uint64_t alloc_size = 0;
-                            uint32_t iosurfid = 0;
-                            mach_port_t surfPort = macws_alloc_iosurf_xpc(
-                                sz, opt, &alloc_size, &iosurfid);
-                            if (surfPort == MACH_PORT_NULL && iosurfid == 0) {
-                                fprintf(stderr,
-                                    "#### CODEHEAP-SHIM synth-step3 FAIL: alloc helper returned no surface\n");
-                                return ((id (*)(Class, SEL))objc_msgSend)(
-                                    target, sel_registerName("alloc"));
-                            }
-                            // 2026-06-19 — Per-task IOSurfaceClient's
-                            // IOSurfaceLookupFromMachPort does NOT resolve
-                            // send-rights created in a different task
-                            // (runtime-confirmed: chroot local-test
-                            // roundtrip works, cross-process returns nil).
-                            // The IsGlobal=YES surface is reachable via the
-                            // global IOSurfaceLookup(int id) table — try
-                            // that first.
-                            extern IOSurfaceRef IOSurfaceLookup(uint32_t id);
-                            IOSurfaceRef surf = NULL;
-                            if (iosurfid) {
-                                surf = IOSurfaceLookup(iosurfid);
-                                fprintf(stderr,
-                                    "#### CODEHEAP-SHIM IOSurfaceLookup(id=%u) -> %p\n",
-                                    iosurfid, (void *)surf);
-                            }
-                            if (!surf && surfPort != MACH_PORT_NULL) {
-                                surf = IOSurfaceLookupFromMachPort(surfPort);
-                                fprintf(stderr,
-                                    "#### CODEHEAP-SHIM fallback IOSurfaceLookupFromMachPort(port=%u) -> %p\n",
-                                    surfPort, (void *)surf);
-                            }
-                            if (surfPort != MACH_PORT_NULL)
-                                mach_port_deallocate(mach_task_self(), surfPort);
-                            if (!surf) {
-                                fprintf(stderr,
-                                    "#### CODEHEAP-SHIM synth-step3 FAIL: "
-                                    "IOSurfaceLookup id=%u + LookupFromMachPort port=%u both returned nil\n",
-                                    iosurfid, surfPort);
-                                return ((id (*)(Class, SEL))objc_msgSend)(
-                                    target, sel_registerName("alloc"));
-                            }
-                            void *baseAddr = IOSurfaceGetBaseAddress(surf);
-                            fprintf(stderr,
-                                "#### CODEHEAP-SHIM synth-step4: IOSurface=%p baseAddr=%p alloc_size=%llu\n",
-                                (void *)surf, baseAddr, (unsigned long long)alloc_size);
-                            // Install the class-wide synth overrides on the
-                            // target class once. From now on, instances tagged
-                            // with kSynthMarkerKey respond with our values to
-                            // -resourceSize / -length / -contents /
-                            // -virtualAddress / -gpuAddress / -device. Untagged
-                            // instances see the original impls (passthrough).
-                            macws_install_synth_overrides(target);
-                            // Alloc a bare instance — no init — so isa is the
-                            // target class but ivars are zero (we don't use
-                            // them, the overrides read associated objects).
-                            id pr = ((id (*)(Class, SEL))objc_msgSend)(
-                                target, sel_registerName("alloc"));
-                            if (!pr) {
-                                fprintf(stderr,
-                                    "#### CODEHEAP-SHIM synth-step5 FAIL: alloc returned nil\n");
-                                CFRelease((CFTypeRef)surf);
-                                return nil;
-                            }
-                            // Tag + attach backing values. We pretend gpuAddress
-                            // equals the CPU base address; chroot's GPU can't
-                            // reach this VA but downstream code will surface
-                            // the next cascade so we can plan from there.
-                            objc_setAssociatedObject(pr, &kSynthMarkerKey,
-                                @"SYNTH", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                            objc_setAssociatedObject(pr, &kSynthContentsKey,
-                                [NSValue valueWithPointer:baseAddr],
-                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                            objc_setAssociatedObject(pr, &kSynthLengthKey,
-                                @((NSUInteger)alloc_size),
-                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                            objc_setAssociatedObject(pr, &kSynthGpuAddrKey,
-                                @((uint64_t)(uintptr_t)baseAddr),
-                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                            objc_setAssociatedObject(pr, &kSynthDeviceKey,
-                                dev, OBJC_ASSOCIATION_ASSIGN);
-                            // Retain the IOSurface via association so it stays
-                            // alive as long as the buffer does.
-                            objc_setAssociatedObject(pr, &kSynthSurfaceKey,
-                                (__bridge id)surf,
-                                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                            CFRelease((CFTypeRef)surf);
-                            // Mempool::grow's freelist-init loop loads from
-                            // `*(buf + global + 0x18)` where global = 0x18
-                            // (confirmed via lldb 2026-06-19, value at
-                            // `IOGPU\`IOGPUMetalResource._res`). So the
-                            // freelist target is at ivar offset 0x30. For
-                            // a non-synth buffer this is set by the real init
-                            // to a chunk freelist pointer that the buf's
-                            // dealloc later free()s. The IOSurface base
-                            // can NOT go here (libmalloc detects non-malloc
-                            // address → checksum_botch → abort on dealloc).
-                            // AGX driver also writes sentinel values
-                            // (e.g. 0x1) into this buffer for its OWN freelist
-                            // tracking, which then corrupts the default
-                            // malloc free list when the buffer is dealloc'd.
-                            // Route through a private zone so the corruption
-                            // stays here — nothing else allocates from this
-                            // zone, so tiny_malloc_from_free_list iterations
-                            // in the DEFAULT zone never touch it.
-                            // 16 KB suffices for sequential-int freelist
-                            // init + later memcpy grow operations.
-                            malloc_zone_t *zone = macws_synth_scratch_zone();
-                            ((void **)pr)[6] = zone ?
-                                malloc_zone_calloc(zone, 1, 16384) :
-                                calloc(1, 16384);
-                            fprintf(stderr,
-                                "#### CODEHEAP-SHIM ivar+0x30 = scratch (%p, 16K, private-zone) — Mempool freelist target\n",
-                                ((void **)pr)[6]);
-                            fprintf(stderr,
-                                "#### CODEHEAP-SHIM (%s) iosurf-synth len=%llu base=%p -> %p\n",
-                                class_getName(target),
-                                (unsigned long long)alloc_size, baseAddr, (void *)pr);
-                            return pr;
+                            return r;
                         });
-                        method_setImplementation(m_args, shim_args);
+                        method_setImplementation(m_args, trace_args);
                         fprintf(stderr,
-                            "#### MACWS_PIN_FALLBACK swizzled -[AGXBuffer initWithDevice:options:args:argsSize:]\n");
+                            "#### MACWS_AGX_NATIVE tracing -[AGXBuffer initWithDevice:options:args:argsSize:] (nil preserved)\n");
                     }
                 }
             }
@@ -4180,10 +3976,9 @@ static void macws_install_iomfb_hid_bypass(void) {
 // (github.com/stweil/OSXvnc, OSXvnc-server/main.c): rfbGetFramebuffer() caches
 // frameBufferData and returns its .mutableBytes; rfbGetFramebufferUpdateInRect()
 // re-captures per frame INTO it. We hook both and overwrite frameBufferData with
-// OUR content, bypassing the black session-CreateImage.
-//   Phase 1 (this build): write a TEST GRADIENT to prove the delivery path
-//   end-to-end on VNC. Phase 2: read the detiled composite from a shared
-//   IOSurface instead of the gradient.
+// OUR content, bypassing the black session-CreateImage.  WindowServer writes
+// the native-AGX-detiled composite to /tmp/macws_vnc_fb; when that backend is
+// requested, the per-rectangle hook must not call the original capture path.
 // rfbScreenInfo (rfb.h): width@0 paddedWidthInBytes@+4 height@+8 depth@+12
 //   bitsPerPixel@+16 (all int32). Offsets from base 0x100000000 (otool of the
 //   device OSXvnc-server arm64): rfbGetFramebuffer @0xd9d4,
@@ -4194,14 +3989,17 @@ static void (*macws_orig_rfbGetFBRect)(int, int, int, int);
 static char *macws_vnc_fb = NULL;
 static int  *macws_rfbScreen = NULL;
 static int   macws_vnc_test_on = 0;
+static int   macws_vnc_share_on = 0;
 
 static IOSurfaceRef macws_vnc_src = NULL;
-static void macws_vnc_fill_test(void) {
-    if (!macws_vnc_fb || !macws_rfbScreen) return;
+// Returns true only when a complete mmap frame was copied.  A test gradient is
+// diagnostic output and deliberately does not count as a real shared frame.
+static bool macws_vnc_fill_test(void) {
+    if (!macws_vnc_fb || !macws_rfbScreen) return false;
     int padded = macws_rfbScreen[1];   // paddedWidthInBytes
     int height = macws_rfbScreen[2];   // height
     int bpp    = macws_rfbScreen[4];   // bitsPerPixel
-    if (padded <= 0 || height <= 0 || height > 8192 || padded > (1 << 20)) return;
+    if (padded <= 0 || height <= 0 || height > 8192 || padded > (1 << 20)) return false;
     int bytespp = (bpp > 0 ? bpp / 8 : 4); if (bytespp < 1) bytespp = 4;
     // 1) Preferred: the detiled composite WS writes to the mmap'd file
     //    /tmp/macws_vnc_fb (IOSurfaceIsGlobal+Lookup is NULL cross-process on
@@ -4225,16 +4023,31 @@ static void macws_vnc_fill_test(void) {
             size_t sh = hdr[2], sstride = hdr[3];
             char *data = (char *)rmap + 16;
             if (16 + sstride * sh <= rmap_sz) {
-                size_t cw = ((size_t)padded < sstride) ? (size_t)padded : sstride;
-                size_t rows = ((size_t)height < sh) ? (size_t)height : sh;
-                for (size_t y = 0; y < rows; y++)
-                    memcpy(macws_vnc_fb + y * (size_t)padded, data + y * sstride, cw);
-                return;
+                size_t sw = hdr[1];
+                size_t dw = (size_t)padded / (size_t)bytespp;
+                if (bytespp == 4 && sw > 0 && sh > 0 && dw > 0 && height > 0 &&
+                    (sw != dw || sh != (size_t)height)) {
+                    for (size_t y = 0; y < (size_t)height; y++) {
+                        size_t sy = y * sh / (size_t)height;
+                        const uint32_t *src = (const uint32_t *)(data + sy * sstride);
+                        uint32_t *dst = (uint32_t *)(macws_vnc_fb + y * (size_t)padded);
+                        for (size_t x = 0; x < dw; x++) {
+                            dst[x] = src[x * sw / dw];
+                        }
+                    }
+                } else {
+                    size_t cw = ((size_t)padded < sstride) ? (size_t)padded : sstride;
+                    size_t rows = ((size_t)height < sh) ? (size_t)height : sh;
+                    for (size_t y = 0; y < rows; y++)
+                        memcpy(macws_vnc_fb + y * (size_t)padded,
+                               data + y * sstride, cw);
+                }
+                return true;
             }
         }
     }
     // 2) Fallback: test gradient (only when /tmp/macws_vnc_test exists).
-    if (!macws_vnc_test_on) return;
+    if (!macws_vnc_test_on) return false;
     int pxw = padded / bytespp;
     for (int y = 0; y < height; y++) {
         unsigned char *row = (unsigned char *)macws_vnc_fb + (size_t)y * padded;
@@ -4246,6 +4059,7 @@ static void macws_vnc_fill_test(void) {
             if (bytespp >= 4) p[3] = 0xff;
         }
     }
+    return false;
 }
 
 static char *macws_new_rfbGetFB(void) {
@@ -4255,6 +4069,23 @@ static char *macws_new_rfbGetFB(void) {
     return p;
 }
 static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
+    // In shared-frame mode, rfbGetFramebuffer() has already allocated the
+    // server buffer. Calling the original rectangle updater would enter
+    // CGDisplayCreateImage/_XHWCaptureDesktop again. Runtime crash evidence:
+    // WSIOSurfaceDebugTallyAndAbort -> CreateCaptureSurface ->
+    // _XHWCaptureDesktop while a VNC update was in progress. The mmap is the
+    // selected capture backend, so deliver it directly. If its first frame is
+    // not ready yet, preserve the allocated buffer and wait for the next poll.
+    if (macws_vnc_share_on) {
+        bool copied = macws_vnc_fill_test();
+        static int lg = 0;
+        if (lg < 3) {
+            fprintf(stderr, "#### OSXVNC mmap rect delivery copied=%d rect=%d,%d %dx%d\n",
+                    copied ? 1 : 0, x, y, w, h);
+            lg++;
+        }
+        return;
+    }
     if (macws_orig_rfbGetFBRect) macws_orig_rfbGetFBRect(x, y, w, h);
     macws_vnc_fill_test();
 }
@@ -4263,6 +4094,8 @@ static void macws_install_osxvnc_hooks(void) {
     const char *prog = getprogname();
     if (!prog || !strstr(prog, "OSXvnc")) return;
     macws_vnc_test_on = (access("/tmp/macws_vnc_test", F_OK) == 0);
+    macws_vnc_share_on = (getenv("MACWS_VNC_SHARE") ||
+                          access("/tmp/macws_vnc_share", F_OK) == 0);
     const struct mach_header *mh = NULL;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
@@ -4275,8 +4108,9 @@ static void macws_install_osxvnc_hooks(void) {
     macws_rfbScreen = (int *)(base + 0x79bf8);
     MSHookFunction(base + 0xd9d4, (void *)macws_new_rfbGetFB,     (void **)&macws_orig_rfbGetFB);
     MSHookFunction(base + 0xdc28, (void *)macws_new_rfbGetFBRect, (void **)&macws_orig_rfbGetFBRect);
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d) base=%p rfbScreen=%p\n",
-            macws_vnc_test_on, (void *)mh, (void *)macws_rfbScreen);
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d) base=%p rfbScreen=%p\n",
+            macws_vnc_test_on, macws_vnc_share_on,
+            (void *)mh, (void *)macws_rfbScreen);
 }
 
 __attribute__((constructor)) void InitStuff() {
@@ -4637,6 +4471,262 @@ DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
 // resource pointer when it returns NULL) was tried + reverted — user
 // asked for structural understanding first, not whack-a-mole.
 
+// IOSurface per-plane-layout compatibility.
+//
+// RE-confirmed against the exact shipped binaries:
+//
+//   iOS 16.3 IOSurfaceClientGetCompressionTypeOfPlane
+//     client + plane*0x80 + 0x120
+//   macOS 13.4 equivalent
+//     client + plane*0x80 + 0x124
+//
+// HeightInCompressedTiles has the same four-byte drift (iOS +0x118 versus
+// macOS +0x11c). WidthInCompressedTiles is iOS +0x114 versus macOS +0x118;
+// BytesPerTileData is iOS +0x12c versus macOS +0x130. BytesPerRow has an
+// equivalent drift: iOS reads +0xdc while macOS reads +0xe0. PlaneOffset is
+// iOS +0xd8 versus macOS +0xdc. AddressFormat has the same drift: iOS reads
+// +0xe9 while macOS reads +0xed. On the captured pf550 surface +0xe0 is
+// PlaneSize, so the unmodified macOS BPR getter returned
+// 16390144 instead of the explicit plane-0 BytesPerRow value 153600
+// (runtime-confirmed at the real initImpl entry). The shifted AddressFormat
+// read made TextureGen4 set its internal compression-kind byte to zero, so it
+// never built Texture+0x1d8. The shifted width/tile-data reads later made the
+// compression-offset helper calculate 105*105*153600 instead of
+// 105*150*1024.
+//
+// Compression/height recover only a zero result. BytesPerRow must also repair
+// a non-zero mismatch because the shifted field is itself a legitimate nonzero
+// PlaneSize. In every case the replacement must come from the IOSurface's own
+// explicit creation properties; no format or compressibility answer is
+// synthesized here.
+static bool macws_iosurface_plane_property_value(IOSurfaceRef surface,
+                                                  size_t plane,
+                                                  NSString *shortKey,
+                                                  NSString *fullKey,
+                                                  uint64_t *valueOut) {
+    if (!surface || !valueOut) return false;
+    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    if (!copied) return false;
+    uint64_t value = 0;
+    bool found = false;
+    @try {
+        NSDictionary *root = (__bridge NSDictionary *)copied;
+        id creationValue = [root objectForKey:@"CreationProperties"];
+        NSDictionary *creation =
+            [creationValue isKindOfClass:[NSDictionary class]]
+                ? (NSDictionary *)creationValue : root;
+        id planeInfoValue = [creation objectForKey:@"IOSurfacePlaneInfo"];
+        if ([planeInfoValue isKindOfClass:[NSArray class]] &&
+            plane < [(NSArray *)planeInfoValue count]) {
+            id planeValue = [(NSArray *)planeInfoValue objectAtIndex:plane];
+            if ([planeValue isKindOfClass:[NSDictionary class]]) {
+                id number = [(NSDictionary *)planeValue objectForKey:shortKey]
+                    ?: [(NSDictionary *)planeValue objectForKey:fullKey];
+                if ([number respondsToSelector:@selector(unsignedLongLongValue)]) {
+                    value = [number unsignedLongLongValue];
+                    found = true;
+                }
+            }
+        }
+    } @catch (NSException *exception) {
+        static int exceptionLogs = 0;
+        if (exceptionLogs++ < 4) {
+            fprintf(stderr,
+                "#### IOSURFACE-COMPAT property parse exception: %s\n",
+                [[exception description] UTF8String] ?: "?");
+        }
+    }
+    CFRelease(copied);
+    if (found) *valueOut = value;
+    return found;
+}
+
+static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
+                                                size_t plane,
+                                                NSString *shortKey,
+                                                NSString *fullKey) {
+    uint64_t value = 0;
+    (void)macws_iosurface_plane_property_value(
+        surface, plane, shortKey, fullKey, &value);
+    return value;
+}
+
+uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
+                                                   size_t plane) {
+    uint32_t original = IOSurfaceGetCompressionTypeOfPlane(surface, plane);
+    if (original != 0 || !getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"CompressionType", @"IOSurfacePlaneCompressionType");
+    if (property == 0 || property > UINT32_MAX) return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT compression plane=%zu original=%u "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (uint32_t)property;
+}
+
+size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
+        IOSurfaceRef surface, size_t plane) {
+    size_t original = IOSurfaceGetHeightInCompressedTilesOfPlane(
+        surface, plane);
+    if (original != 0 || !getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"HeightInCompressedTiles",
+        @"IOSurfacePlaneHeightInCompressedTiles");
+    if (property == 0 || property > SIZE_MAX) return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT heightInTiles plane=%zu original=%zu "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (size_t)property;
+}
+
+size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
+        IOSurfaceRef surface, size_t plane) {
+    size_t original = IOSurfaceGetWidthInCompressedTilesOfPlane(
+        surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"WidthInCompressedTiles",
+        @"IOSurfacePlaneWidthInCompressedTiles");
+    if (property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT widthInTiles plane=%zu original=%zu "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (size_t)property;
+}
+
+size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
+                                            size_t plane) {
+    size_t original = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"BytesPerRow", @"IOSurfacePlaneBytesPerRow");
+    if (property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT bytesPerRow plane=%zu original=%zu "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (size_t)property;
+}
+
+size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
+                                                 size_t plane) {
+    size_t original = IOSurfaceGetBytesPerTileDataOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"BytesPerTileData", @"IOSurfacePlaneBytesPerTileData");
+    if (property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT bytesPerTileData plane=%zu original=%zu "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (size_t)property;
+}
+
+size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
+    size_t original = IOSurfaceGetOffsetOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = 0;
+    bool found = macws_iosurface_plane_property_value(surface, plane,
+        @"Offset", @"IOSurfacePlaneOffset", &property);
+    if (!found || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT offset plane=%zu original=%zu "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (size_t)property;
+}
+
+void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
+                                           size_t plane) {
+    void *original = IOSurfaceGetBaseAddressOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t propertyOffset = 0;
+    bool found = macws_iosurface_plane_property_value(surface, plane,
+        @"Offset", @"IOSurfacePlaneOffset", &propertyOffset);
+    void *base = IOSurfaceGetBaseAddress(surface);
+    if (!found || !base || propertyOffset > UINTPTR_MAX - (uintptr_t)base)
+        return original;
+    void *corrected = (void *)((uintptr_t)base + (uintptr_t)propertyOffset);
+    if (corrected == original) return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT baseAddress plane=%zu original=%p "
+            "base=%p propertyOffset=%llu corrected=%p recovery=%u\n",
+            plane, original, base, (unsigned long long)propertyOffset,
+            corrected, count);
+    }
+    return corrected;
+}
+
+uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
+                                                size_t plane) {
+    uint32_t original = IOSurfaceGetAddressFormatOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"AddressFormat", @"IOSurfaceAddressFormat");
+    if (property == 0 || property > UINT32_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT addressFormat plane=%zu original=%u "
+            "property=%llu recovery=%u\n",
+            plane, original, (unsigned long long)property, count);
+    }
+    return (uint32_t)property;
+}
+
+DYLD_INTERPOSE(macws_IOSurfaceGetCompressionTypeOfPlane,
+                IOSurfaceGetCompressionTypeOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetHeightInCompressedTilesOfPlane,
+                IOSurfaceGetHeightInCompressedTilesOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetWidthInCompressedTilesOfPlane,
+                IOSurfaceGetWidthInCompressedTilesOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetBytesPerRowOfPlane,
+                IOSurfaceGetBytesPerRowOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetBytesPerTileDataOfPlane,
+                IOSurfaceGetBytesPerTileDataOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetOffsetOfPlane,
+                IOSurfaceGetOffsetOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetBaseAddressOfPlane,
+                IOSurfaceGetBaseAddressOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetAddressFormatOfPlane,
+                IOSurfaceGetAddressFormatOfPlane);
+
 // Tightly-scoped IOSurfaceCreate interposer — only rewrites SkyLight's "CA
 // Framebuffer" 2-plane Apple-GPU-compressed BGRA10_XR surface (FourCC '&b38' /
 // 0x26623338). Without rewrite, MTLSimDriverHost cannot wrap this IOSurface in
@@ -4928,6 +5018,7 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
 // that offset to call find_iosurface_for_id (without it, returns
 // kIOReturnNoMemory).
 extern uint32_t macws_get_current_iosurface_id(void);
+extern uint64_t macws_get_current_iosurface_compression_header_span(void);
 
 // AGX ID-translation shim. The iOS kernel AUTO-ASSIGNS resource GIDs (IOGPUObject
 // atomic counter; getResource matches resource+0x28), but the macOS AGX driver uses
@@ -4936,8 +5027,158 @@ extern uint32_t macws_get_current_iosurface_id(void);
 // bridge the two id-spaces here: record each created resource's clientID -> the
 // iOS GID returned in its OUT struct, and rewrite parent-id references in 0x80
 // sub-resources from clientID to the iOS GID so getResource() finds the parent.
-static struct { uint64_t clientID, iosGID, size; } g_agxIdMap[128];
+static struct { uint64_t clientID, iosResourceID, size; } g_agxIdMap[128];
 static int g_agxIdMapCount;
+
+// Successful IOGPU resource lifecycle diagnostic.  The previous create-minus-
+// destroy counter included failed creates and did not compare resource IDs, so
+// it could not establish a leak.  This table is keyed by the iOS kernel GID
+// returned at IOGPUNewResourceOutArgs+0x1c and is removed by the scalar passed
+// to ioGPUResourceFinalize.  Logs report only kernel-accepted operations.
+//
+// RE-confirmed with the project LLDB on macOS 13.4 IOGPU:
+//   IOGPUResourceCreate+324 loads w8 from out+0x1c and stores wrapper+0x30;
+//   ioGPUResourceFinalize+24 loads wrapper+0x30 and passes it as selector 0xb's
+//   sole scalar. out+0x28 is copied to wrapper+0x50 and is NOT the resource ID.
+#define MACWS_AGX_LIFE_CAP 16384u
+struct macws_agx_life_entry {
+    uint64_t gid;       // 0 = empty, UINT64_MAX = tombstone
+    uint64_t bytes;     // kernel-reported allocation size (out+0x48)
+    uint32_t client_id; // macOS client field (in+0x48), diagnostic only
+    uint32_t surface_id;// type 0x82 IOSurface ID (translated in+0x30)
+    uint8_t type;
+};
+static struct macws_agx_life_entry g_agxLife[MACWS_AGX_LIFE_CAP];
+static pthread_mutex_t g_agxLifeLock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_agxLifeLive[256], g_agxLifeBytes[256];
+static uint64_t g_agxLifeCreateOK, g_agxLifeCreateFail;
+static uint64_t g_agxLifeDestroyOK, g_agxLifeDestroyFail;
+static uint64_t g_agxLifeUnmatchedDestroy, g_agxLifeTableFull;
+
+static unsigned macws_agx_life_hash(uint64_t gid) {
+    return (unsigned)((gid * 11400714819323198485ull) >> 50) &
+        (MACWS_AGX_LIFE_CAP - 1);
+}
+
+static void macws_agx_life_summary_locked(const char *event, uint64_t id,
+                                          uint8_t type, uint32_t surface_id,
+                                          uint64_t bytes,
+                                          IOReturn kr) {
+    uint64_t live_total = 0, bytes_total = 0;
+    for (unsigned i = 0; i < 256; i++) {
+        live_total += g_agxLifeLive[i];
+        bytes_total += g_agxLifeBytes[i];
+    }
+    fprintf(stderr,
+        "#### AGX_LIFE %s id=%#llx type=%#x surf=%#x bytes=%#llx kr=%#x "
+        "okC=%llu failC=%llu okD=%llu failD=%llu unmatchedD=%llu full=%llu "
+        "live=%llu/%lluMB [t0=%llu/%lluMB t80=%llu/%lluMB t82=%llu/%lluMB]\n",
+        event, (unsigned long long)id, type, surface_id,
+        (unsigned long long)bytes, kr,
+        (unsigned long long)g_agxLifeCreateOK,
+        (unsigned long long)g_agxLifeCreateFail,
+        (unsigned long long)g_agxLifeDestroyOK,
+        (unsigned long long)g_agxLifeDestroyFail,
+        (unsigned long long)g_agxLifeUnmatchedDestroy,
+        (unsigned long long)g_agxLifeTableFull,
+        (unsigned long long)live_total,
+        (unsigned long long)(bytes_total >> 20),
+        (unsigned long long)g_agxLifeLive[0],
+        (unsigned long long)(g_agxLifeBytes[0] >> 20),
+        (unsigned long long)g_agxLifeLive[0x80],
+        (unsigned long long)(g_agxLifeBytes[0x80] >> 20),
+        (unsigned long long)g_agxLifeLive[0x82],
+        (unsigned long long)(g_agxLifeBytes[0x82] >> 20));
+}
+
+static void macws_agx_life_create(uint64_t gid, uint8_t type,
+                                  uint32_t client_id, uint32_t surface_id,
+                                  uint64_t bytes) {
+    pthread_mutex_lock(&g_agxLifeLock);
+    g_agxLifeCreateOK++;
+    unsigned start = macws_agx_life_hash(gid), first_tomb = MACWS_AGX_LIFE_CAP;
+    unsigned slot = MACWS_AGX_LIFE_CAP;
+    for (unsigned probe = 0; probe < MACWS_AGX_LIFE_CAP; probe++) {
+        unsigned i = (start + probe) & (MACWS_AGX_LIFE_CAP - 1);
+        uint64_t here = g_agxLife[i].gid;
+        if (here == gid) { slot = i; break; }
+        if (here == UINT64_MAX && first_tomb == MACWS_AGX_LIFE_CAP)
+            first_tomb = i;
+        if (here == 0) {
+            slot = first_tomb != MACWS_AGX_LIFE_CAP ? first_tomb : i;
+            break;
+        }
+    }
+    if (slot == MACWS_AGX_LIFE_CAP || gid == 0 || gid == UINT64_MAX) {
+        g_agxLifeTableFull++;
+        macws_agx_life_summary_locked("CREATE-UNTRACKED", gid, type,
+                                      surface_id, bytes, 0);
+    } else {
+        if (g_agxLife[slot].gid == gid) {
+            uint8_t old_type = g_agxLife[slot].type;
+            g_agxLifeLive[old_type]--;
+            g_agxLifeBytes[old_type] -= g_agxLife[slot].bytes;
+        }
+        g_agxLife[slot] = (struct macws_agx_life_entry){
+            .gid = gid, .bytes = bytes, .client_id = client_id,
+            .surface_id = surface_id, .type = type
+        };
+        g_agxLifeLive[type]++;
+        g_agxLifeBytes[type] += bytes;
+        if (g_agxLifeCreateOK <= 16 ||
+            (type == 0x82 && g_agxLifeLive[0x82] <= 96) ||
+            (g_agxLifeCreateOK % 250) == 0)
+            macws_agx_life_summary_locked("CREATE", gid, type,
+                                          surface_id, bytes, 0);
+    }
+    pthread_mutex_unlock(&g_agxLifeLock);
+}
+
+static void macws_agx_life_create_failed(uint8_t type, uint64_t bytes,
+                                         IOReturn kr) {
+    pthread_mutex_lock(&g_agxLifeLock);
+    g_agxLifeCreateFail++;
+    macws_agx_life_summary_locked("CREATE-FAIL", 0, type, 0, bytes, kr);
+    pthread_mutex_unlock(&g_agxLifeLock);
+}
+
+static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
+    pthread_mutex_lock(&g_agxLifeLock);
+    if (kr != 0) {
+        g_agxLifeDestroyFail++;
+        macws_agx_life_summary_locked("DESTROY-FAIL", gid, 0xff, 0, 0, kr);
+        pthread_mutex_unlock(&g_agxLifeLock);
+        return;
+    }
+    g_agxLifeDestroyOK++;
+    unsigned start = macws_agx_life_hash(gid), slot = MACWS_AGX_LIFE_CAP;
+    for (unsigned probe = 0; probe < MACWS_AGX_LIFE_CAP; probe++) {
+        unsigned i = (start + probe) & (MACWS_AGX_LIFE_CAP - 1);
+        uint64_t here = g_agxLife[i].gid;
+        if (here == gid) { slot = i; break; }
+        if (here == 0) break;
+    }
+    if (slot == MACWS_AGX_LIFE_CAP) {
+        g_agxLifeUnmatchedDestroy++;
+        if (g_agxLifeUnmatchedDestroy <= 32 ||
+            (g_agxLifeUnmatchedDestroy % 250) == 0)
+            macws_agx_life_summary_locked("DESTROY-UNMATCHED", gid, 0xff,
+                                          0, 0, kr);
+    } else {
+        uint8_t type = g_agxLife[slot].type;
+        uint32_t surface_id = g_agxLife[slot].surface_id;
+        uint64_t bytes = g_agxLife[slot].bytes;
+        g_agxLifeLive[type]--;
+        g_agxLifeBytes[type] -= bytes;
+        g_agxLife[slot].gid = UINT64_MAX;
+        if (g_agxLifeDestroyOK <= 16 ||
+            (type == 0x82 && g_agxLifeLive[0x82] <= 96) ||
+            (g_agxLifeDestroyOK % 250) == 0)
+            macws_agx_life_summary_locked("DESTROY", gid, type,
+                                          surface_id, bytes, kr);
+    }
+    pthread_mutex_unlock(&g_agxLifeLock);
+}
 
 // 2026-06-19 — sel=0xa double-translation root cause:
 // `launchdchrootexec` DYLD_INSERTs BOTH `libmachook.dylib` (arm64e) and
@@ -4963,6 +5204,773 @@ static int caller_is_libmachook(void *ret) {
     const char *base = strrchr(di.dli_fname, '/');
     base = base ? base + 1 : di.dli_fname;
     return strncmp(base, "libmachook", 10) == 0;
+}
+
+// Bounded command-submit diagnostics for the native-AGX VNC control pass.
+//
+// Enable read-only capture by creating /tmp/macws_submit_diag in the chroot.
+// At most eight translated selector-0x1a submits are inspected per process,
+// and at most 0x300 command bytes are printed for each descriptor.  Each
+// structurally valid subtype-1 record is also copied verbatim to
+// /tmp/macws_submit_type1_<sequence>_<record>.bin.  The binary artifact is
+// needed for a byte-for-byte comparison with the native-iOS record; stderr's
+// bounded prefix is insufficient to locate a trailing ABI insertion.  This
+// is intentionally opt-in: ordinary WindowServer submits are far too frequent
+// for an unconditional deep dump.
+//
+// /tmp/macws_kcmd_fix enables a SEPARATE TEMPORARY ABI-TRANSLATION
+// EXPERIMENT.  It is not a production fix.  Historical native-iOS versus
+// macOS-chroot byte captures found a subtype-3 record whose macOS form had a
+// 16-byte zero pad before the same 12-byte terminal sentinel.  We only remove
+// that pad when every structural field and every signature byte matches.  A
+// successful IOConnect return is not evidence that this worked; the caller's
+// exact clear/control pixel remains the required execution witness.
+struct macws_submit_diag_result {
+    unsigned sequence;
+    unsigned records;
+    unsigned candidates;
+    unsigned fixed;
+};
+
+static _Atomic unsigned g_macws_submit_diag_sequence = 0;
+// The compositor submits multi-segment KCMD storage continuously.  Preserve
+// translation for every structurally validated submission (later frames are
+// the actual GUI witness), while bounding the per-segment diagnostic output.
+static _Atomic unsigned g_macws_multisegment_log_batches = 0;
+
+static uint64_t macws_strip_user_pointer(uint64_t raw) {
+    return raw & 0x0000ffffffffffffULL;
+}
+
+static int macws_plausible_agx_pointer(uint64_t raw, size_t bytes) {
+    uint64_t p = macws_strip_user_pointer(raw);
+    return p >= 0x100000000ULL && p < 0x280000000ULL &&
+        bytes <= 0x10000 && p + bytes >= p && p + bytes <= 0x280000000ULL;
+}
+
+static void macws_submit_hex(const char *what, unsigned sequence,
+                             const unsigned char *p, size_t length) {
+    fprintf(stderr, "#### AGX_SUBMIT_DIAG #%u %s bytes=%#zx\n",
+        sequence, what, length);
+    for (size_t off = 0; off < length; off += 32) {
+        fprintf(stderr, "####   +%04zx:", off);
+        for (size_t j = 0; j < 32 && off + j < length; j++)
+            fprintf(stderr, " %02x", p[off + j]);
+        fprintf(stderr, "\n");
+    }
+}
+
+static void macws_submit_save_type1(unsigned sequence, unsigned record,
+                                    const unsigned char *p, size_t length) {
+    if (!p || length < 0x38 || length > 0x10000) return;
+
+    char path[PATH_MAX];
+    int path_length = snprintf(path, sizeof(path),
+        "/tmp/macws_submit_type1_%u_%u.bin", sequence, record);
+    if (path_length <= 0 || (size_t)path_length >= sizeof(path)) return;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u record[%u] save %s failed errno=%d\n",
+            sequence, record, path, errno);
+        return;
+    }
+
+    size_t written = 0;
+    while (written < length) {
+        ssize_t amount = write(fd, p + written, length - written);
+        if (amount <= 0) break;
+        written += (size_t)amount;
+    }
+    int saved_errno = errno;
+    close(fd);
+    fprintf(stderr,
+        "#### AGX_SUBMIT_DIAG #%u record[%u] saved=%#zx/%#zx path=%s errno=%d\n",
+        sequence, record, written, length, path,
+        written == length ? 0 : saved_errno);
+}
+
+static void macws_submit_save_kcmd(unsigned sequence, unsigned descriptor,
+                                   const char *phase,
+                                   const unsigned char *p, size_t length) {
+    if (!phase || !p || length < 0x38 || length > 0x10000) return;
+
+    char path[PATH_MAX];
+    int path_length = snprintf(path, sizeof(path),
+        "/tmp/macws_submit_kcmd_%u_%u_%s.bin", sequence, descriptor, phase);
+    if (path_length <= 0 || (size_t)path_length >= sizeof(path)) return;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u descriptor[%u] KCMD-%s save %s "
+            "failed errno=%d\n",
+            sequence, descriptor, phase, path, errno);
+        return;
+    }
+
+    size_t written = 0;
+    while (written < length) {
+        ssize_t amount = write(fd, p + written, length - written);
+        if (amount <= 0) break;
+        written += (size_t)amount;
+    }
+    int saved_errno = errno;
+    close(fd);
+    fprintf(stderr,
+        "#### AGX_SUBMIT_DIAG #%u descriptor[%u] KCMD-%s "
+        "saved=%#zx/%#zx path=%s errno=%d\n",
+        sequence, descriptor, phase, written, length, path,
+        written == length ? 0 : saved_errno);
+}
+
+static void macws_submit_save_segment_list(unsigned sequence,
+                                           unsigned descriptor,
+                                           const unsigned char *p,
+                                           size_t length) {
+    if (!p || length < 0x10 || length > 0x10000) return;
+
+    char path[PATH_MAX];
+    int path_length = snprintf(path, sizeof(path),
+        "/tmp/macws_submit_segment_%u_%u.bin", sequence, descriptor);
+    if (path_length <= 0 || (size_t)path_length >= sizeof(path)) return;
+
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u descriptor[%u] segment save %s "
+            "failed errno=%d\n",
+            sequence, descriptor, path, errno);
+        return;
+    }
+
+    size_t written = 0;
+    while (written < length) {
+        ssize_t amount = write(fd, p + written, length - written);
+        if (amount <= 0) break;
+        written += (size_t)amount;
+    }
+    int saved_errno = errno;
+    close(fd);
+    fprintf(stderr,
+        "#### AGX_SUBMIT_DIAG #%u descriptor[%u] segment saved=%#zx/%#zx "
+        "path=%s errno=%d\n",
+        sequence, descriptor, written, length, path,
+        written == length ? 0 : saved_errno);
+}
+
+static int macws_submit_bytes_are_zero(const unsigned char *p,
+                                       size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        if (p[i] != 0) return 0;
+    }
+    return 1;
+}
+
+// TEMPORARY ABI-TRANSLATION EXPERIMENT for a storage object containing more
+// than one segment.  Runtime capture of WindowServer submit #9 established
+// the segment-list framing on this exact iOS 16.3 device:
+//
+//   list+0x08 = segment count
+//   list+0x0c = 0x80000000 | list byte length
+//   every KCMD segment starts with type 0x10000 and carries its complete
+//   segment span (vendor record plus trailer) at segment+0x04
+//   the segment list contains one aligned {start,end} u32 pair per KCMD
+//
+// The captured two-segment list had ranges [0,0x858) and
+// [0x858,0x10b0), and the KCMD storage contained a subtype-1 record at both
+// exact starts.  The old linear walker stopped on the first record's trailer,
+// so neither segment was translated and the command buffer completed with
+// kernel parser error 0x102.  Validate the complete range table before
+// changing anything, then work backwards so deleting 0x20 bytes from a later
+// segment cannot invalidate an earlier segment's original coordinates.
+//
+// A later 28-segment compositor capture disproved the initial THEORY that
+// every segment-list entry has a fixed 0x120 stride: resource-list payloads
+// make the entries variable-sized.  Its header count was 28, the KCMD chain
+// contained exactly 28 records, and each derived KCMD range occurred exactly
+// once as an 8-byte-aligned {start,end} pair in the actual segment list.
+// Use those cross-buffer invariants instead of assuming a C struct stride.
+//
+// This remains a diagnostic scaffold.  It deliberately handles only the
+// already-observed subtype-1 and subtype-3 macOS layouts and is still gated
+// by /tmp/macws_kcmd_fix at the caller.
+static unsigned macws_translate_agx_multisegment_subtype1(
+    unsigned sequence, unsigned char *commands, size_t *total_io,
+    unsigned char *segment_list, size_t segment_length) {
+    if (!commands || !total_io || !segment_list || segment_length < 0x250)
+        return 0;
+
+    size_t total = *total_io;
+    uint32_t count = *(uint32_t *)(segment_list + 0x08);
+    uint32_t encoded_length = *(uint32_t *)(segment_list + 0x0c);
+    if (count < 2 || count > 64 ||
+        encoded_length != (0x80000000U | (uint32_t)segment_length))
+        return 0;
+
+    uint32_t pair_offsets[64] = {0};
+    uint32_t cursor = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if ((size_t)cursor + 0x38 > total)
+            return 0;
+        unsigned char *record = commands + cursor;
+        uint32_t type = *(uint32_t *)(record + 0x00);
+        uint32_t span = *(uint32_t *)(record + 0x04);
+        if ((type != 0x10000 && type != 0x10001) || span < 0x38 ||
+            span > 0x2000 || (size_t)cursor + span > total)
+            return 0;
+        uint32_t end = cursor + span;
+
+        unsigned matches = 0;
+        for (size_t off = 0; off + 8 <= segment_length; off += 8) {
+            if (*(uint32_t *)(segment_list + off) == cursor &&
+                *(uint32_t *)(segment_list + off + 4) == end) {
+                pair_offsets[i] = (uint32_t)off;
+                matches++;
+            }
+        }
+        if (matches != 1)
+            return 0;
+        cursor = end;
+    }
+    if (cursor != total)
+        return 0;
+
+    int log_segments = atomic_fetch_add(
+        &g_macws_multisegment_log_batches, 1) < 4;
+
+    unsigned fixed = 0;
+    for (uint32_t reverse = count; reverse > 0; reverse--) {
+        uint32_t i = reverse - 1;
+        unsigned char *range = segment_list + pair_offsets[i];
+        uint32_t start = *(uint32_t *)(range + 0x00);
+        uint32_t end = *(uint32_t *)(range + 0x04);
+        size_t span = (size_t)end - start;
+        unsigned char *record = commands + start;
+
+        int subtype1 = span >= 0x818 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == span &&
+            *(uint32_t *)(record + 0x28) == 0x818 &&
+            *(uint32_t *)(record + 0x2c) == 0x7e8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 1;
+        int subtype1_anchors = subtype1 && span <= 0x1000 &&
+            memcmp(record + 0xd8,
+                "\x03\x00\x6b\x00\x12\x00\x3a\x00", 8) == 0 &&
+            macws_submit_bytes_are_zero(record + 0x1c0, 0x10) &&
+            *(uint32_t *)(record + 0x1e0) == 1 &&
+            *(uint32_t *)(record + 0x1e8) == 0x1c &&
+            memcmp(record + 0x1f8,
+                "\xff\xff\xff\xff\xff\xff\xff\xff"
+                "\xff\xff\xff\xff", 12) == 0 &&
+            macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
+            *(uint32_t *)(record + 0x4d0) == 0x3f800000 &&
+            (*(uint32_t *)(record + 0x4d4) == 0x100 ||
+             *(uint32_t *)(record + 0x4d4) == 0x300) &&
+            memcmp(record + 0x4e8,
+                "\xff\xff\xff\xff\xff\xff\xff\xff"
+                "\xff\xff\xff\xff", 12) == 0;
+
+        static const unsigned char subtype3_sentinel[12] = {
+            0x01, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff
+        };
+        int subtype3_anchors = span >= 0x1e8 && span <= 0x800 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == span &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x10) &&
+            memcmp(record + 0x1dc, subtype3_sentinel,
+                   sizeof(subtype3_sentinel)) == 0;
+        if (!subtype1_anchors && !subtype3_anchors)
+            continue;
+
+        uint32_t shrink = subtype1_anchors ? 0x20 : 0x10;
+        if (subtype1_anchors) {
+            // Delete both macOS-only zero windows from the complete remaining
+            // storage tail.  Later segments have already been normalized and
+            // are intentionally shifted together with that tail.
+            memmove(record + 0x4c0, record + 0x4d0,
+                    total - ((size_t)start + 0x4d0));
+            total -= 0x10;
+            memmove(record + 0x1c0, record + 0x1d0,
+                    total - ((size_t)start + 0x1d0));
+            total -= 0x10;
+            *(uint32_t *)(record + 0x28) = 0x7f8;
+            *(uint32_t *)(record + 0x2c) = 0x7c8;
+        } else {
+            memmove(record + 0x1cc, record + 0x1dc,
+                    total - ((size_t)start + 0x1dc));
+            total -= 0x10;
+            *(uint32_t *)(record + 0x28) = 0x1d8;
+            *(uint32_t *)(record + 0x2c) = 0x1a8;
+        }
+        memset(commands + total, 0, shrink);
+        *(uint32_t *)(record + 0x04) = (uint32_t)(span - shrink);
+
+        // This segment's end and every later segment's start/end are offsets
+        // into the same compacted KCMD storage.
+        *(uint32_t *)(range + 0x04) = end - shrink;
+        for (uint32_t later = i + 1; later < count; later++) {
+            unsigned char *later_range =
+                segment_list + pair_offsets[later];
+            *(uint32_t *)(later_range + 0x00) -= shrink;
+            *(uint32_t *)(later_range + 0x04) -= shrink;
+        }
+        fixed++;
+        if (log_segments) fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-MULTISEG-FIX "
+                "segment=%u/%u subtype=%u range=%#x..%#x->%#x "
+                "shrink=%#x storage=%#zx\n",
+                sequence, i, count, subtype1_anchors ? 1 : 3,
+                start, end, end - shrink, shrink, total);
+    }
+
+    *total_io = total;
+    return fixed;
+}
+
+static struct macws_submit_diag_result
+macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
+                         const void *inStruct, size_t inStructCnt,
+                         int allow_fix) {
+    struct macws_submit_diag_result result = {0};
+    result.sequence = atomic_fetch_add(&g_macws_submit_diag_sequence, 1) + 1;
+    if (!inStruct || inStructCnt < 0x20)
+        return result;
+
+    // Keep the expensive byte dumps bounded, but never let that diagnostic
+    // limit disable an explicitly requested ABI translation.  The previous
+    // `sequence > 8` early return meant WindowServer's later command buffers
+    // silently skipped TEMP-KCMD-ABI-FIX altogether.  Runtime witness:
+    // `VNC-FINAL clear-control` then completed with MTL internal error 0x102.
+    int verbose = result.sequence <= 8;
+
+    const unsigned char *submit = (const unsigned char *)inStruct;
+    if (verbose) {
+        size_t submit_dump = inStructCnt < 0x40 ? inStructCnt : 0x40;
+        macws_submit_hex("submit-struct", result.sequence, submit, submit_dump);
+        fprintf(stderr, "#### AGX_SUBMIT_DIAG #%u scalars[%u]:",
+            result.sequence, inCnt);
+        for (uint32_t i = 0; in && i < inCnt && i < 8; i++)
+            fprintf(stderr, " %#llx", (unsigned long long)in[i]);
+        fprintf(stderr, " fix-requested=%s\n", allow_fix ? "YES" : "NO");
+    }
+
+    uint64_t descriptor_raw[2] = {
+        *(const uint64_t *)(submit + 0x10),
+        *(const uint64_t *)(submit + 0x18)
+    };
+    uint64_t seen_state[2] = {0, 0};
+    for (unsigned descriptor_index = 0; descriptor_index < 2;
+         descriptor_index++) {
+        uint64_t descriptor = macws_strip_user_pointer(
+            descriptor_raw[descriptor_index]);
+        if (!macws_plausible_agx_pointer(descriptor_raw[descriptor_index],
+                                          0x28)) {
+            if (verbose) fprintf(stderr,
+                    "#### AGX_SUBMIT_DIAG #%u descriptor[%u]=%#llx invalid\n",
+                    result.sequence, descriptor_index,
+                    (unsigned long long)descriptor_raw[descriptor_index]);
+            continue;
+        }
+
+        const unsigned char *descriptor_bytes =
+            (const unsigned char *)(uintptr_t)descriptor;
+        uint64_t self_raw = *(const uint64_t *)(descriptor_bytes + 0x20);
+        uint64_t self = macws_strip_user_pointer(self_raw);
+        if (verbose) fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u descriptor[%u]=%#llx raw=%#llx "
+                "self=%#llx rawSelf=%#llx\n",
+                result.sequence, descriptor_index,
+                (unsigned long long)descriptor,
+                (unsigned long long)descriptor_raw[descriptor_index],
+                (unsigned long long)self, (unsigned long long)self_raw);
+        if (!macws_plausible_agx_pointer(self_raw, 0x258))
+            continue;
+
+        uint64_t state_raw = *(const uint64_t *)(uintptr_t)(self + 0x250);
+        uint64_t state = macws_strip_user_pointer(state_raw);
+        if (!macws_plausible_agx_pointer(state_raw, 0x348)) {
+            if (verbose) fprintf(stderr,
+                    "#### AGX_SUBMIT_DIAG #%u descriptor[%u] state=%#llx invalid\n",
+                    result.sequence, descriptor_index,
+                    (unsigned long long)state_raw);
+            continue;
+        }
+        if (state == seen_state[0] || state == seen_state[1]) {
+            if (verbose) fprintf(stderr,
+                    "#### AGX_SUBMIT_DIAG #%u descriptor[%u] state=%#llx duplicate\n",
+                    result.sequence, descriptor_index,
+                    (unsigned long long)state);
+            continue;
+        }
+        seen_state[descriptor_index] = state;
+
+        // RE-confirmed via the iOS 16.3 IOGPU implementations of
+        // IOGPUMetalCommandBufferStorageCreateExt and
+        // IOGPUMetalCommandBufferStorageFinalizeShmemHeader: +0x68 is the
+        // segment/resource-list mapping base, +0x70 its limit, +0x328 the
+        // finalized logical end, and +0x340 the active-header mode.  The
+        // kernel's process_command_buffer parser writes submission error
+        // 0x0a when this variable-length list fails its framing checks.  Dump
+        // it read-only so native iOS and chroot layouts can be compared.
+        uint64_t segment_start_raw =
+            *(const uint64_t *)(uintptr_t)(state + 0x68);
+        uint64_t segment_limit_raw =
+            *(const uint64_t *)(uintptr_t)(state + 0x70);
+        uint64_t segment_current_raw =
+            *(const uint64_t *)(uintptr_t)(state + 0x328);
+        uint64_t segment_start = macws_strip_user_pointer(segment_start_raw);
+        uint64_t segment_limit = macws_strip_user_pointer(segment_limit_raw);
+        uint64_t segment_current =
+            macws_strip_user_pointer(segment_current_raw);
+        int32_t segment_mode =
+            *(const int32_t *)(uintptr_t)(state + 0x340);
+        size_t segment_length = 0;
+        if (macws_plausible_agx_pointer(segment_start_raw, 1) &&
+            segment_current >= segment_start &&
+            segment_current <= segment_limit &&
+            segment_current - segment_start <= 0x10000) {
+            segment_length = (size_t)(segment_current - segment_start);
+        }
+        if (verbose) fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u descriptor[%u] segment "
+                "start=%#llx current=%#llx limit=%#llx length=%#zx mode=%d\n",
+                result.sequence, descriptor_index,
+                (unsigned long long)segment_start,
+                (unsigned long long)segment_current,
+                (unsigned long long)segment_limit, segment_length, segment_mode);
+        if (verbose && segment_length >= 0x10) {
+            macws_submit_hex("segment-list", result.sequence,
+                (const unsigned char *)(uintptr_t)segment_start,
+                segment_length < 0x300 ? segment_length : 0x300);
+            macws_submit_save_segment_list(result.sequence, descriptor_index,
+                (const unsigned char *)(uintptr_t)segment_start,
+                segment_length);
+        }
+
+        uint64_t start_raw = *(const uint64_t *)(uintptr_t)(state + 0x28);
+        uint64_t current_raw = *(const uint64_t *)(uintptr_t)(state + 0x30);
+        uint64_t end_raw = *(const uint64_t *)(uintptr_t)(state + 0x38);
+        uint64_t start = macws_strip_user_pointer(start_raw);
+        uint64_t current = macws_strip_user_pointer(current_raw);
+        uint64_t end = macws_strip_user_pointer(end_raw);
+        if (verbose) fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u descriptor[%u] state=%#llx "
+                "start=%#llx current=%#llx end=%#llx\n",
+                result.sequence, descriptor_index,
+                (unsigned long long)state, (unsigned long long)start,
+                (unsigned long long)current, (unsigned long long)end);
+        if (!macws_plausible_agx_pointer(start_raw, 1) ||
+            current <= start || current - start > 0x10000 || end < current) {
+            if (verbose) fprintf(stderr,
+                    "#### AGX_SUBMIT_DIAG #%u descriptor[%u] KCMD bounds invalid\n",
+                    result.sequence, descriptor_index);
+            continue;
+        }
+
+        unsigned char *commands = (unsigned char *)(uintptr_t)start;
+        size_t total = (size_t)(current - start);
+        size_t dump_length = total < 0x300 ? total : 0x300;
+        if (verbose) macws_submit_hex("kernel-commands", result.sequence,
+                                      commands, dump_length);
+        // Read-only evidence capture.  The existing type-1 dump stops at the
+        // AGX record's end_offset and therefore omits the 0x28-byte trailer
+        // that follows the clear record.  iOS IOGPU parses that trailer after
+        // the vendor command, so preserve the complete storage range before
+        // any temporary ABI translation.
+        if (verbose) macws_submit_save_kcmd(result.sequence, descriptor_index,
+                                            "pre", commands, total);
+
+        if (allow_fix && segment_length >= 0x250) {
+            unsigned multisegment_fixed =
+                macws_translate_agx_multisegment_subtype1(
+                    result.sequence, commands, &total,
+                    (unsigned char *)(uintptr_t)segment_start,
+                    segment_length);
+            if (multisegment_fixed) {
+                result.candidates += multisegment_fixed;
+                result.fixed += multisegment_fixed;
+                uint64_t new_current = start + total;
+                uint64_t new_current_raw =
+                    (current_raw & 0xffff000000000000ULL) | new_current;
+                *(uint64_t *)(uintptr_t)(state + 0x30) = new_current_raw;
+                current_raw = new_current_raw;
+                if (verbose) macws_submit_save_kcmd(
+                    result.sequence, descriptor_index,
+                    "multisegment-post", commands, total);
+            }
+        }
+
+        size_t off = 0;
+        unsigned walked = 0;
+        while (off + 0x38 <= total && walked++ < 16) {
+            uint32_t type = *(uint32_t *)(commands + off);
+            uint32_t end_offset = *(uint32_t *)(commands + off + 0x28);
+            uint32_t size = *(uint32_t *)(commands + off + 0x2c);
+            uint32_t inner = *(uint32_t *)(commands + off + 0x30);
+            uint32_t subtype = *(uint32_t *)(commands + off + 0x34);
+            unsigned record_index = result.records;
+            if (verbose) fprintf(stderr,
+                    "#### AGX_SUBMIT_DIAG #%u record[%u] off=%#zx type=%#x "
+                    "end=%#x size=%#x inner=%#x subtype=%u\n",
+                    result.sequence, record_index, off, type, end_offset,
+                    size, inner, subtype);
+            result.records++;
+
+            if ((type != 0x10000 && type != 0x10001) ||
+                end_offset < 0x38 || end_offset > total - off) {
+                if (verbose) fprintf(stderr,
+                        "#### AGX_SUBMIT_DIAG #%u record walk stopped: invalid framing\n",
+                        result.sequence);
+                break;
+            }
+
+            if (verbose && inner == 0x30 && subtype == 1)
+                macws_submit_save_type1(result.sequence, record_index,
+                                        commands + off, end_offset);
+
+            // TEMPORARY ABI-TRANSLATION EXPERIMENT — native-iOS clear only.
+            //
+            // Runtime captures on this exact iPad/iOS 16.3 combination show:
+            //
+            //   iOS AGX clear:   total=0x820, end=0x7f8, size=0x7c8
+            //   macOS AGX clear: total=0x840, end=0x818, size=0x7e8
+            //
+            // A byte alignment of the complete records found two independent
+            // 0x10 all-zero insertions in the macOS layout.  Removing the
+            // windows at original record offsets 0x1c0 and 0x4c0 and fixing
+            // the three size fields makes the header byte-identical and 2005
+            // of 2040 record bytes (98.28%) identical to the native capture.
+            // The native reference was rerun at the exact same 2388x1668
+            // dimensions, so there is no dimension mismatch.  The remaining
+            // 35 differing bytes form runtime-varying GPU virtual addresses,
+            // resource/segment identifiers, plus one opaque 32-bit token at
+            // +0x610.  This classification is descriptive only; it is not
+            // evidence that every remaining value is semantically valid.
+            //
+            // RE-confirmed against iPad13,6 com.apple.AGXG13G 227.2.43:
+            // processRender treats record+0x38 as its payload and reads
+            // payload+0x19c/+0x1a8/+0x1ae/+0x6a8.  All four windows become
+            // byte-identical to native iOS after this normalization.
+            //
+            // Keep the gate deliberately narrower than the generic subtype-1
+            // shape.  Runtime captures identify scalar[0]==3 for the VNC
+            // clear-only control and scalar[0]==1 for agxprobe stage 5's
+            // isolated IOSurface clear.  The complete storage range is 0x840
+            // with a 0x28 trailer in that probe, and 0x858 with a 0x40 trailer
+            // in WindowServer's VNC detile pass; the enclosed record is the
+            // same 0x818-byte subtype-1 layout.  Both forms must pass every
+            // framing, removable-window, and stable surrounding-anchor check
+            // below.  This remains a diagnostic ABI experiment, not a
+            // semantic translation of scalar[0] or of either trailer.
+            if (off == 0 && type == 0x10000 && inner == 0x30 &&
+                subtype == 1 && size == 0x7e8 && end_offset == 0x818 &&
+                total >= 0x818 && segment_length >= 0x20) {
+                uint64_t observed_scalar0 = in && inCnt >= 1
+                    ? in[0] : UINT64_MAX;
+                int check_scalar = in && inCnt >= 1 &&
+                    (in[0] == 1 || in[0] == 3);
+                int check_total = total == 0x840 || total == 0x858;
+                int check_segment_length = segment_length == 0x130;
+                int check_segment_header =
+                    *(uint32_t *)(uintptr_t)(segment_start + 0x08) == 1 &&
+                    *(uint32_t *)(uintptr_t)(segment_start + 0x0c) == 0x80000130 &&
+                    *(uint32_t *)(uintptr_t)(segment_start + 0x18) == 0 &&
+                    *(uint32_t *)(uintptr_t)(segment_start + 0x1c) == total;
+                int check_command_total =
+                    *(uint32_t *)(commands + 0x04) == total;
+                int check_d8 = memcmp(commands + 0xd8,
+                    "\x03\x00\x6b\x00\x12\x00\x3a\x00", 8) == 0;
+                int check_pad_1 =
+                    macws_submit_bytes_are_zero(commands + 0x1c0, 0x10);
+                int check_1e0 = *(uint32_t *)(commands + 0x1e0) == 1 &&
+                    *(uint32_t *)(commands + 0x1e8) == 0x1c;
+                int check_1f8 = memcmp(commands + 0x1f8,
+                    "\xff\xff\xff\xff\xff\xff\xff\xff"
+                    "\xff\xff\xff\xff", 12) == 0;
+                int check_pad_2 =
+                    macws_submit_bytes_are_zero(commands + 0x4c0, 0x10);
+                // Runtime captures show the same ABI padding around two
+                // legitimate operation-state values: 0x300 for a clear and
+                // 0x100 for a textured draw/detile.  Preserve the value; it
+                // is an operation field, not part of the layout delta.
+                uint32_t operation_state =
+                    *(uint32_t *)(commands + 0x4d4);
+                int check_4d0 =
+                    *(uint32_t *)(commands + 0x4d0) == 0x3f800000 &&
+                    (operation_state == 0x100 || operation_state == 0x300);
+                int check_4e8 = memcmp(commands + 0x4e8,
+                    "\xff\xff\xff\xff\xff\xff\xff\xff"
+                    "\xff\xff\xff\xff", 12) == 0;
+                static _Atomic unsigned subtype1_observed_count = 0;
+                unsigned subtype1_observed = atomic_fetch_add(
+                    &subtype1_observed_count, 1) + 1;
+                if (subtype1_observed <= 8) {
+                    fprintf(stderr,
+                        "#### AGX_SUBMIT_DIAG #%u subtype1-predicate "
+                        "scalar0=%#llx legacy-scalar-gate=%d "
+                        "total=%#zx/%d seglen=%#zx/%d "
+                        "seghdr=%d cmdtotal=%d d8=%d pad1=%d f1=%d "
+                        "sent1=%d pad2=%d f2=%d sent2=%d\n",
+                        result.sequence,
+                        (unsigned long long)observed_scalar0, check_scalar,
+                        total, check_total,
+                        segment_length, check_segment_length,
+                        check_segment_header, check_command_total, check_d8,
+                        check_pad_1, check_1e0, check_1f8, check_pad_2,
+                        check_4d0, check_4e8);
+                    if (!verbose) {
+                        macws_submit_save_kcmd(result.sequence,
+                            descriptor_index, "type1-observed", commands, total);
+                        macws_submit_save_segment_list(result.sequence,
+                            descriptor_index,
+                            (const unsigned char *)(uintptr_t)segment_start,
+                            segment_length);
+                    }
+                }
+            }
+            // scalar[0] deliberately does not participate in this gate.  It
+            // is outside the vendor record being translated, is not modified,
+            // and runtime-confirmed values differ between otherwise
+            // byte-identical stage-5 and WindowServer clear records.  Treating
+            // {1,3} as a semantic requirement was an unsupported diagnostic
+            // restriction; the parser-facing record and segment invariants
+            // below remain mandatory.
+            if (allow_fix && off == 0 &&
+                type == 0x10000 && inner == 0x30 && subtype == 1 &&
+                size == 0x7e8 && end_offset == 0x818 &&
+                (total == 0x840 || total == 0x858) &&
+                segment_length == 0x130 &&
+                *(uint32_t *)(uintptr_t)(segment_start + 0x08) == 1 &&
+                *(uint32_t *)(uintptr_t)(segment_start + 0x0c) == 0x80000130 &&
+                *(uint32_t *)(uintptr_t)(segment_start + 0x18) == 0 &&
+                *(uint32_t *)(uintptr_t)(segment_start + 0x1c) == total &&
+                *(uint32_t *)(commands + 0x04) == total &&
+                memcmp(commands + 0xd8,
+                    "\x03\x00\x6b\x00\x12\x00\x3a\x00", 8) == 0 &&
+                macws_submit_bytes_are_zero(commands + 0x1c0, 0x10) &&
+                *(uint32_t *)(commands + 0x1e0) == 1 &&
+                *(uint32_t *)(commands + 0x1e8) == 0x1c &&
+                memcmp(commands + 0x1f8,
+                    "\xff\xff\xff\xff\xff\xff\xff\xff"
+                    "\xff\xff\xff\xff", 12) == 0 &&
+                macws_submit_bytes_are_zero(commands + 0x4c0, 0x10) &&
+                *(uint32_t *)(commands + 0x4d0) == 0x3f800000 &&
+                (*(uint32_t *)(commands + 0x4d4) == 0x100 ||
+                 *(uint32_t *)(commands + 0x4d4) == 0x300) &&
+                memcmp(commands + 0x4e8,
+                    "\xff\xff\xff\xff\xff\xff\xff\xff"
+                    "\xff\xff\xff\xff", 12) == 0) {
+                result.candidates++;
+                size_t original_total = total;
+
+                // Work from the higher original offset downward so both
+                // deletion coordinates continue to refer to the captured
+                // macOS record.  Move the complete submit tail as well: the
+                // native command has a 0x28-byte trailer after record end.
+                memmove(commands + 0x4c0, commands + 0x4d0,
+                        total - 0x4d0);
+                total -= 0x10;
+                memmove(commands + 0x1c0, commands + 0x1d0,
+                        total - 0x1d0);
+                total -= 0x10;
+                memset(commands + total, 0, 0x20);
+
+                *(uint32_t *)(commands + 0x04) = (uint32_t)total;
+                *(uint32_t *)(commands + 0x28) = 0x7f8;
+                *(uint32_t *)(commands + 0x2c) = 0x7c8;
+
+                // IOGPUMetalCommandBufferStorageEndSegment writes the KCMD
+                // span into the first segment record at overall list+0x1c.
+                // The native iOS capture has the shortened complete KCMD span
+                // here, matching its storage current-start.  Leaving the
+                // macOS value after the KCMD deletion breaks that cross-shmem
+                // invariant.  The record shrinks by 0x20; its opaque trailer
+                // is preserved byte-for-byte by the memmoves above.
+                *(uint32_t *)(uintptr_t)(segment_start + 0x1c) =
+                    (uint32_t)total;
+
+                uint64_t new_current = start + total;
+                uint64_t new_current_raw =
+                    (current_raw & 0xffff000000000000ULL) | new_current;
+                *(uint64_t *)(uintptr_t)(state + 0x30) = new_current_raw;
+                current_raw = new_current_raw;
+                result.fixed++;
+                if (verbose) macws_submit_save_kcmd(
+                    result.sequence, descriptor_index, "post", commands, total);
+                static _Atomic unsigned subtype1_fix_log_count = 0;
+                unsigned subtype1_fix_log = atomic_fetch_add(
+                    &subtype1_fix_log_count, 1) + 1;
+                if (verbose || subtype1_fix_log <= 8) fprintf(stderr,
+                        "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-ABI-FIX "
+                        "subtype1-clear pads=0x1c0,0x4c0 total=%#zx->%#zx "
+                        "size=0x7e8->0x7c8 end=0x818->0x7f8 "
+                        "segment-span=%#zx\n",
+                        result.sequence, original_total, total, total);
+                off += 0x7f8;
+                continue;
+            }
+
+            if (inner == 0x30 && subtype == 3 && size == 0x1b8 &&
+                end_offset == 0x1e8 && off + 0x1e8 <= total) {
+                static const unsigned char sentinel[12] = {
+                    0x01, 0x00, 0x00, 0x00,
+                    0xff, 0xff, 0xff, 0xff,
+                    0xff, 0xff, 0xff, 0xff
+                };
+                int zero_pad = 1;
+                for (size_t i = 0x1cc; i < 0x1dc; i++) {
+                    if (commands[off + i] != 0) {
+                        zero_pad = 0;
+                        break;
+                    }
+                }
+                int sentinel_match = memcmp(commands + off + 0x1dc,
+                                            sentinel, sizeof(sentinel)) == 0;
+                result.candidates++;
+                if (verbose) fprintf(stderr,
+                        "#### AGX_SUBMIT_DIAG #%u subtype3-mac-layout off=%#zx "
+                        "zero-pad=%s sentinel=%s\n",
+                        result.sequence, off, zero_pad ? "YES" : "NO",
+                        sentinel_match ? "YES" : "NO");
+                if (allow_fix && zero_pad && sentinel_match) {
+                    size_t move_length = total - (off + 0x1dc);
+                    memmove(commands + off + 0x1cc,
+                            commands + off + 0x1dc, move_length);
+                    memset(commands + total - 0x10, 0, 0x10);
+                    *(uint32_t *)(commands + off + 0x28) = 0x1d8;
+                    *(uint32_t *)(commands + off + 0x2c) = 0x1a8;
+                    total -= 0x10;
+                    uint64_t new_current = start + total;
+                    uint64_t new_current_raw =
+                        (current_raw & 0xffff000000000000ULL) | new_current;
+                    *(uint64_t *)(uintptr_t)(state + 0x30) = new_current_raw;
+                    current_raw = new_current_raw;
+                    result.fixed++;
+                    static _Atomic unsigned subtype3_fix_log_count = 0;
+                    unsigned subtype3_fix_log = atomic_fetch_add(
+                        &subtype3_fix_log_count, 1) + 1;
+                    if (verbose || subtype3_fix_log <= 8) fprintf(stderr,
+                            "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-ABI-FIX off=%#zx "
+                            "size=0x1b8->0x1a8 end=0x1e8->0x1d8 "
+                            "moved=%#zx new-total=%#zx\n",
+                            result.sequence, off, move_length, total);
+                    off += 0x1d8;
+                    continue;
+                }
+            }
+            off += end_offset;
+        }
+    }
+    return result;
 }
 
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
@@ -5014,9 +6022,26 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     unsigned char shadowbuf[256];
     uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
+    uint32_t resDiagSequence = 0;
+    int resDiagActive = access("/tmp/macws_res_diag", F_OK) == 0;
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
     if(agxIsRes) {
         const unsigned char *src = (const unsigned char *)inStruct;
+        if (resDiagActive) {
+            static _Atomic uint32_t sequence = 0;
+            resDiagSequence = atomic_fetch_add(&sequence, 1) + 1;
+            if (resDiagSequence <= 64) {
+                fprintf(stderr,
+                    "#### AGX_RES_DIAG #%u RAW type=%#x len=%zu:",
+                    resDiagSequence, src[0], inStructCnt);
+                for (size_t offset = 0; offset + 8 <= inStructCnt;
+                     offset += 8) {
+                    fprintf(stderr, " +%02zx=%#llx", offset,
+                        (unsigned long long)*(const uint64_t *)(src + offset));
+                }
+                fprintf(stderr, "\n");
+            }
+        }
         agxType = src[0];
         uint8_t  f15  = src[0x15];                                // flag byte; bit-3 = "has parent"
         uint64_t bc   = *(const uint64_t *)(src + 0x40);          // for type=0: heap byte-count
@@ -5032,18 +6057,82 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // previous translator unconditionally clobbered args[0x48]
         // which corrupted the length on every client-buffer path.
         BOOL t80_has_parent = (agxType == 0x80) && (f15 & 0x08);
-        agxClientID = t80_has_parent ? *(const uint32_t *)(src + 0x48) : 0;
+        // type=0 owns a macOS client-assigned resource ID at +0x48.  type=0x80
+        // uses the same field as a parent reference only when f15.bit3 is set.
+        // The previous ternary accidentally forced every type=0 ID to zero,
+        // collapsing g_agxIdMap to one entry and making every real parent-ID
+        // translation miss. Runtime witness: thousands of lines read
+        // `heap clientID 0 -> GID ...` while the paired ResCreate dump showed
+        // `type=0 clientID=0x40000`.
+        agxClientID = (agxType == 0 || t80_has_parent)
+            ? *(const uint32_t *)(src + 0x48) : 0;
         int patched = 0;
         memcpy(shadowbuf, inStruct, inStructCnt);
         if(bc == 0 && agxType == 0) {
             // Heap byte-count fixup (only valid for type=0 heap creation;
             // type=0x80 client-buffer path uses args+0x40 as the end VA,
-            // not a size).
+            // not a size). Prefer the exact length captured at the upstream
+            // AGXBuffer initFull boundary. The old uint32_t(+0x58) fallback
+            // truncated VA-shaped values and underallocated growing Mempools.
             uint32_t sz32 = *(const uint32_t *)(src + 0x58);
-            uint64_t nb = sz32 ? sz32 : 0x1000;
+            uint64_t mac_span = *(const uint64_t *)(src + 0x48);
+            // RE-confirmed in iOS 16.3 IOGPUDevice::new_resource at
+            // 0xfffffe0009f0415c: type-0 allocation size is read from
+            // args+0x40.  Runtime comparison of matching AGX internal
+            // requests shows macOS leaves +0x40 zero and puts the intended
+            // span at +0x48, while +0x58 can be a much larger VA-shaped
+            // value (for example 0x48000000 beside a 0x8000 span).  The old
+            // low32(+0x58) fallback inflated five 0x8000 native buffers into
+            // 128 MiB--1.125 GiB allocations; the resulting resource VA
+            // 0x1558080000 faulted in hardware as 0x1158080000.
+            //
+            // A bit-3 parent request gives +0x48 a different kernel meaning,
+            // so only use it as the span on the no-parent type-0 path.  The
+            // upstream initFull length remains more precise for ordinary
+            // MTLBuffers whose allocation span is rounded to a larger page.
+            uint64_t fallback_span = (!(f15 & 0x08) && mac_span > 0 &&
+                mac_span <= 0x40000000ULL) ? mac_span :
+                (sz32 ? sz32 : 0x1000);
+            uint64_t nb = g_macws_agx_initfull_len ?
+                g_macws_agx_initfull_len : fallback_span;
             *(uint64_t *)(shadowbuf + 0x40) = nb;
+            if (!(f15 & 0x08)) {
+                // Full 0x68-byte LLDB captures of the matching iOS 16.3
+                // requests establish a tail-field ABI shift:
+                //
+                //   macOS: +0x48=span, +0x50=0, +0x58=arena<<24
+                //   iOS:   +0x48=0,    +0x50=arena<<24, +0x58=0
+                //
+                // Only the low 32 bits carry the arena value.  For example,
+                // f14=0x8430 uses 0x48000000 at iOS +0x50 and the kernel
+                // returns the special 0x18000/0x28000 VA windows.  Sending
+                // zero at +0x50 instead returned an ordinary 0x15... VA;
+                // the GPU then consumed that address with bit 34 clear and
+                // raised a BIF0 page fault.  Translate the request field at
+                // its source; do not rewrite the returned GPU VA.
+                uint32_t arena = *(const uint32_t *)(src + 0x58);
+                *(uint64_t *)(shadowbuf + 0x48) = 0;
+                *(uint64_t *)(shadowbuf + 0x50) = arena;
+                *(uint64_t *)(shadowbuf + 0x58) = 0;
+            }
             agxHeapSz = nb;
             patched = 1;
+            if (g_macws_agx_initfull_len) {
+                static _Atomic int exact_len_log_count = 0;
+                int exact_n = atomic_fetch_add(&exact_len_log_count, 1);
+                if (exact_n < 16) {
+                    fprintf(stderr,
+                        "#### AGXIOC type0 exact initFull length: +0x58=%#llx low32=%#x -> +0x40=%#llx\n",
+                        (unsigned long long)*(const uint64_t *)(src + 0x58),
+                        sz32, (unsigned long long)nb);
+                }
+            } else if (resDiagActive && resDiagSequence <= 64) {
+                fprintf(stderr,
+                    "#### AGX_RES_DIAG #%u type0 size source: "
+                    "+0x48 span=%#llx +0x58 low32=%#x -> +0x40=%#llx\n",
+                    resDiagSequence, (unsigned long long)mac_span, sz32,
+                    (unsigned long long)nb);
+            }
         }
         // type=0 with args+0x40 already set (high bit pattern = pinned-VA
         // shape — macOS used `pinnedGPULocation:` to request a specific
@@ -5176,10 +6265,10 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // Sub-resource carved from a tracked parent heap.
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
-                *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosGID;            // parent-id: client -> iOS GID
+                *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosResourceID;     // parent-id: client -> iOS resource ID
                 if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + g_agxIdMap[i].size;  // +0x30 = end-VA so size(=+0x30-+0x38) = parent size
                 patched = 1; mapped = 1;
-                fprintf(stderr, "#### AGXIOC subres parent %#x -> GID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosGID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
+                fprintf(stderr, "#### AGXIOC subres parent %#x -> resourceID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosResourceID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
                 break;
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
@@ -5249,23 +6338,22 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // 0x1eec5d33c: `ldr d0, [#0x1eec7e710]; str d0, [args]` loads the 8-
         // byte template `82 00 00 00 00 00 00 00` and writes it to args[0].
         //
-        // The chroot WS fails not because of the type byte, but because the
-        // macOS userland fills two extra fields that iOS init leaves zero:
+        // Runtime-confirmed type=0x82 tail-field ABI shift (2026-07-24).
+        // The exact same 2388x1668 BGRA8 IOSurface texture request was
+        // captured from both userlands:
         //
-        //   field      iOS userland sets                  macOS sets
-        //   args+0x40  0    (zero-initialised stack)      0x80888300 (flag mask)
-        //   args+0x58  0    (zero-initialised stack)      0x180888300 (pinned VA)
+        //   native iOS: +0x30=surfaceID, +0x38=0,
+        //               +0x50=0x180888f00, +0x58=0
+        //   macOS WS:   +0x30=0, +0x38=surfaceID,
+        //               +0x50=0, +0x58=0x180888f00
         //
-        // Both non-zero values trigger the iOS kernel's macOS-only
-        // "standalone with pinned GPU VA" code path which doesn't exist,
-        // returning kIOReturnNoMemory.
-        //
-        // Fix: for iosurface texture creates (detected by args+0x14 flag
-        // mask 0x430 — the iOS-set marker from IOGPUMetalResource init),
-        // zero args+0x40 and args+0x58. The iOS kernel then takes the same
-        // path as native iOS iosurface texture creation. The IOSurface
-        // identity is still bound by the follow-up sel=0x29→0x25
-        // (IOGPUResourceCreateIOSurface) call.
+        // Evidence: /tmp/lldb-iosdraw-native-2388.log res #15 and
+        // /tmp/ws-pf550-fault-20260724-190809/WindowServer.err res #16.
+        // Therefore the macOS +0x58 value is not a pinned VA to discard; it
+        // is the texture-layout word that iOS expects at +0x50.  BGRA8 happened
+        // to render with a zero layout word, but the first pf=550 read then
+        // faulted.  Translate the producer ABI before the request reaches the
+        // kernel: move both shifted fields and clear their old macOS slots.
         // 2026-06-18 disasm of iOS AGXG13G + IOGPUFamily kexts located the
         // exact kernel check that rejects our chroot args. IOGPUDevice::
         // new_resource() at fffffe0009f03bb4:
@@ -5279,41 +6367,81 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         //   stp w0, w21, [x24, #0x30]      ; +0x30 = IOSurfaceGetID(io)
         // before sel=0xa fires. macOS WS path leaves +0x30 = 0.
         //
-        // Fix: read the IOSurfaceID we stashed in TLS from Metal_hooks.x's
+        // Fix: read the IOSurfaceID and compression-header span stashed by
+        // Metal_hooks.x's
         // swizzled newTextureWithDescriptor:iosurface:plane: (we're called
         // synchronously from inside that swizzle's %orig), and inject it
-        // into args[+0x30]. Also keep the +0x40 / +0x58 zeroing because
-        // non-zero values there take the pinned-VA fast path which iOS
-        // doesn't recognise.
+        // into args[+0x30]. Keep +0x40 zero and move the macOS texture-layout
+        // word from +0x58 to iOS +0x50.
         // macOS chroot stores the IOSurfaceID at args+0x38 (where iOS puts
         // the plane index); iOS userland stores IOSurfaceID at args+0x30
         // (which macOS leaves zero). Swap them: write +0x38's value into
         // +0x30, and put the actual plane (always 0 in our path) at +0x38.
-        // Also zero +0x40 / +0x58 — the iOS kernel rejects non-zero values
-        // there (pinned-VA path that doesn't exist on iOS).
+        // Project-LLDB RE of the successful native pf550 path subsequently
+        // located the exact iOS producer, `-[AGXG13GFamilyDevice
+        // initNewTextureData:]` at runtime 0x2260cf0e0:
+        //   0x2260cf23c: orr x9, x9, #0x180000000
+        //   0x2260cf250: bfi x9, x11, #33, #1  // compression object exists
+        //   0x2260cf278: str x8, [x2, #0x58]   // aligned metadata span
+        // For the CA Framebuffer, IOSurfaceCopyAllValues reports the same
+        // per-plane reserved compression-header span (0x40000) that native
+        // iOS sends at +0x58.  Therefore +0x58 must be reconstructed from the
+        // current IOSurface's properties, not blindly zeroed.  Presence of
+        // that span also supplies native layout-word bit 33.
         if(agxType == 0x82) {
             uint32_t f14 = *(const uint32_t *)(src + 0x14);
             uint64_t old_40 = *(const uint64_t *)(src + 0x40);
+            uint64_t old_50 = *(const uint64_t *)(src + 0x50);
             uint64_t old_58 = *(const uint64_t *)(src + 0x58);
             uint32_t old_30 = *(const uint32_t *)(src + 0x30);
             uint32_t old_38 = *(const uint32_t *)(src + 0x38);
+            uint64_t compression_header_span =
+                macws_get_current_iosurface_compression_header_span();
             *(uint64_t *)(shadowbuf + 0x40) = 0;
-            *(uint64_t *)(shadowbuf + 0x58) = 0;
+            uint64_t translated_50 = old_50;
+            if (old_50 == 0 && old_58 != 0) {
+                translated_50 = old_58;
+            }
+            if (compression_header_span != 0) {
+                translated_50 |= (1ULL << 33);
+            }
+            *(uint64_t *)(shadowbuf + 0x50) = translated_50;
+            *(uint64_t *)(shadowbuf + 0x58) = compression_header_span;
             // If +0x30 is empty and +0x38 looks like an IOSurfaceID, swap.
             if (old_30 == 0 && old_38 != 0) {
                 *(uint32_t *)(shadowbuf + 0x30) = old_38;
                 *(uint32_t *)(shadowbuf + 0x38) = 0;
             }
             patched = 1;
-            fprintf(stderr,
-                "#### AGXIOC type=0x82 patch: f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
-                "+0x40 %#llx→0 +0x58 %#llx→0\n",
-                f14,
-                old_30, *(const uint32_t *)(shadowbuf + 0x30),
-                old_38, *(const uint32_t *)(shadowbuf + 0x38),
-                (unsigned long long)old_40, (unsigned long long)old_58);
+            static _Atomic unsigned int t82_patch_count = 0;
+            unsigned int t82_n = atomic_fetch_add(&t82_patch_count, 1) + 1;
+            if (t82_n <= 16 || (t82_n % 500) == 0) {
+                fprintf(stderr,
+                    "#### AGXIOC type=0x82 patch #%u: f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
+                    "+0x40 %#llx→0 +0x50 %#llx→%#llx +0x58 %#llx→%#llx\n",
+                    t82_n, f14,
+                    old_30, *(const uint32_t *)(shadowbuf + 0x30),
+                    old_38, *(const uint32_t *)(shadowbuf + 0x38),
+                    (unsigned long long)old_40,
+                    (unsigned long long)old_50,
+                    (unsigned long long)*(const uint64_t *)(shadowbuf + 0x50),
+                    (unsigned long long)old_58,
+                    (unsigned long long)*(const uint64_t *)(shadowbuf + 0x58));
+            }
         }
         if(patched) inStruct = shadowbuf;
+        if (resDiagActive && resDiagSequence <= 64) {
+            const unsigned char *sent = (const unsigned char *)inStruct;
+            fprintf(stderr,
+                "#### AGX_RES_DIAG #%u SENT type=%#x len=%zu:",
+                resDiagSequence, sent[0], inStructCnt);
+            for (size_t offset = 0; offset + 8 <= inStructCnt;
+                 offset += 8) {
+                fprintf(stderr, " +%02zx=%#llx", offset,
+                    (unsigned long long)*(const uint64_t *)(sent + offset));
+            }
+            fprintf(stderr, "\n");
+        }
         // POST-patch dump for sel=0x9 type=0x80: capture EXACT bytes that
         // hit the kernel — to compare against iOS-native probe args that
         // also fail kr=0xe00002be with all-zero-but-required-fields.
@@ -5334,7 +6462,69 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
         }
     }
+    struct macws_submit_diag_result submit_diag = {0};
+    int submit_diag_active = !skip && IOConnectIsIOGPU(client) &&
+        selector == 0x1a && access("/tmp/macws_submit_diag", F_OK) == 0;
+    if (submit_diag_active) {
+        int allow_fix = access("/tmp/macws_kcmd_fix", F_OK) == 0;
+        submit_diag = macws_inspect_agx_submit(
+            in, inCnt, inStruct, inStructCnt, allow_fix);
+    }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    if (agxIsRes && resDiagActive && resDiagSequence <= 64) {
+        size_t returned = (outStructCnt ? *outStructCnt : 0);
+        fprintf(stderr,
+            "#### AGX_RES_DIAG #%u RETURN kr=%#x outLen=%zu:",
+            resDiagSequence, r, returned);
+        if (outStruct) {
+            const unsigned char *bytes = (const unsigned char *)outStruct;
+            for (size_t offset = 0; offset + 8 <= returned; offset += 8) {
+                fprintf(stderr, " +%02zx=%#llx", offset,
+                    (unsigned long long)*(const uint64_t *)(bytes + offset));
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    if (submit_diag_active && submit_diag.sequence <= 8) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u result=%#x records=%u candidates=%u fixed=%u\n",
+            submit_diag.sequence, r, submit_diag.records,
+            submit_diag.candidates, submit_diag.fixed);
+    }
+    if (agxIsRes) {
+        const unsigned char *sent = (const unsigned char *)inStruct;
+        uint64_t requested = (sent && inStructCnt >= 0x48)
+            ? *(const uint64_t *)(sent + 0x40) : 0;
+        uint32_t client_id = (sent && inStructCnt >= 0x4c)
+            ? *(const uint32_t *)(sent + 0x48) : 0;
+        uint32_t surface_id = (agxType == 0x82 && sent && inStructCnt >= 0x34)
+            ? *(const uint32_t *)(sent + 0x30) : 0;
+        if (r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x50) {
+            const unsigned char *o = (const unsigned char *)outStruct;
+            uint64_t gid = *(const uint32_t *)(o + 0x1c);
+            uint64_t bytes = *(const uint64_t *)(o + 0x48);
+            macws_agx_life_create(gid, agxType, client_id, surface_id, bytes);
+            if (agxType == 0x82) {
+                static _Atomic unsigned int t82_bt_count = 0;
+                unsigned int bt_n = atomic_fetch_add(&t82_bt_count, 1);
+                if (bt_n < 4) {
+                    void *frames[16];
+                    int nf = backtrace(frames, 16);
+                    fprintf(stderr,
+                        "#### AGX_LIFE type82 CREATE stack #%u resourceID=%#llx surf=%#x (%d frames):\n",
+                        bt_n + 1, (unsigned long long)gid, surface_id, nf);
+                    backtrace_symbols_fd(frames, nf, STDERR_FILENO);
+                }
+            }
+        } else if (r != 0) {
+            macws_agx_life_create_failed(agxType, requested, r);
+        }
+    }
+    if (IOConnectIsIOGPU(client) && orig == 0xb && in && inCnt >= 1) {
+        // Runtime-correlate finalize's scalar against create out+0x1c.  The
+        // first matched AGX_LIFE DESTROY line is the direct ABI witness.
+        macws_agx_life_destroy(in[0], r);
+    }
     // Log the kr for sel=0x9 type=0x80 once so we can pair it with the
     // POST-PATCH dump above.
     if (agxIsRes && agxType == 0x80) {
@@ -5398,38 +6588,29 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     if(agxIsRes && r == 0 && agxType == 0 && outStruct && outStructCnt && *outStructCnt >= 0x30) {
         const unsigned char *o = (const unsigned char *)outStruct;
-        uint64_t gid = *(const uint64_t *)(o + 0x28);   // iOS GID: monotonic IOGPUObject counter, echoed at OUT+0x28
+        uint64_t gid = *(const uint32_t *)(o + 0x1c);   // RE-confirmed iOS resource ID; finalize uses this exact scalar
         int slot = -1;
         for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) { slot = i; break; }  // overwrite (clientID reused)
         if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
-        if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosGID = gid; g_agxIdMap[slot].size = agxHeapSz; }
-        fprintf(stderr, "#### AGXIOC heap clientID %#x -> GID %#llx size %#llx\n", agxClientID, (unsigned long long)gid, (unsigned long long)agxHeapSz);
+        if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosResourceID = gid; g_agxIdMap[slot].size = agxHeapSz; }
+        static _Atomic unsigned int heap_map_count = 0;
+        unsigned int heap_n = atomic_fetch_add(&heap_map_count, 1) + 1;
+        if (heap_n <= 16 || (heap_n % 500) == 0) {
+            fprintf(stderr,
+                "#### AGXIOC heap map #%u clientID %#x -> resourceID %#llx size %#llx\n",
+                heap_n, agxClientID, (unsigned long long)gid,
+                (unsigned long long)agxHeapSz);
+        }
     }
     if(IOConnectIsIOGPU(client)) {
-        // OOM leak diagnostic (2026-06-20): periodic per-caller sel=0xa vs
-        // sel=0xb delta — narrows which AGX upstream creates without
-        // matching releases.  We sample 1 in 50 of each (sel=0xa, sel=0xb)
-        // to bound log volume; cumulative counts always printed.
-        if (orig == 0xa || orig == 0xb) {
-            static _Atomic unsigned long s_a_count = 0;
-            static _Atomic unsigned long s_b_count = 0;
-            unsigned long me = (orig == 0xa)
-                ? atomic_fetch_add(&s_a_count, 1) + 1
-                : atomic_fetch_add(&s_b_count, 1) + 1;
-            if (me % 500 == 1) {
-                Dl_info di;
-                void *ra = __builtin_return_address(0);
-                const char *sym = "?";
-                if (dladdr(ra, &di) && di.dli_sname) sym = di.dli_sname;
-                fprintf(stderr,
-                    "#### AGX_LEAK sel=0x%x #%lu (cumA=%lu cumB=%lu delta=%ld) caller=%s\n",
-                    orig, me,
-                    atomic_load(&s_a_count), atomic_load(&s_b_count),
-                    (long)(atomic_load(&s_a_count) - atomic_load(&s_b_count)),
-                    sym);
-            }
+        // Resource create/destroy have their own structured AGX_LIFE logs;
+        // avoid multi-thousand-line-per-minute duplicate traffic here.
+        if ((orig != 0xa && orig != 0xb) || r != 0) {
+            fprintf(stderr,
+                "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n",
+                orig, selector, inCnt, inStructCnt,
+                outStructCnt ? *outStructCnt : 0, r);
         }
-        fprintf(stderr, "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
         // Diagnostic: dump the inStruct for sel=0x7/0x8 failures (queue
         // creation). 1032-byte args; the iOS kernel rejects with 0xe00002c2.
         // Dump first 128 bytes + scan for non-zero regions so we can RE the
@@ -5466,8 +6647,12 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // Diagnostic: dump the inStruct for ALL sel=0xa calls (resource
         // create). Compare successful heap (line A) vs failing texture
         // (line B) so we can identify what kernel rejects.
+        static _Atomic unsigned int res_verbose_count = 0;
+        unsigned int res_verbose_n = (orig == 0xa && selector == 0x9)
+            ? atomic_fetch_add(&res_verbose_count, 1) : UINT_MAX;
         if (orig == 0xa && selector == 0x9 &&
-            inStruct && inStructCnt >= 0x60) {
+            inStruct && inStructCnt >= 0x60 &&
+            (r != 0 || res_verbose_n < 48)) {
             const unsigned char *src = (const unsigned char *)inStruct;
             uint8_t type = src[0];
             uint32_t clientID = *(const uint32_t *)(src + 0x48);
@@ -5475,14 +6660,17 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t va38 = *(const uint64_t *)(src + 0x38);
             uint64_t bc40 = *(const uint64_t *)(src + 0x40);
             uint64_t va58 = *(const uint64_t *)(src + 0x58);
-            // 2026-06-19 diagnostic for outStruct[+0x10]: macOS userland
-            // copies outStruct[+0x10] → wrapper[+0x48] (the
-            // "client-shared-memory pointer" returned by
-            // _IOGPUResourceGetClientShared). If outStruct[+0x10] is
-            // NULL, IOGPUMetalResource init bails to error path.
-            uint64_t out10 = 0, out48 = 0;
+            // RE-confirmed via the actual iOS 16.3 and macOS 13.4
+            // IOGPUResourceCreate implementations: kernel output +0 is
+            // copied to IOGPUResource+0x38. IOGPUResourceGetGPUVirtualAddress
+            // returns that field, and IOGPUMetalResource init stores it in
+            // the ivar returned by -gpuAddress. Output +0x1c is resourceID;
+            // output +0x48 is the GPU-VA span. Keep +0x10 in the log because
+            // it is a distinct client-shared field, not the GPU address.
+            uint64_t out00 = 0, out10 = 0, out48 = 0;
             if (r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x18) {
                 const unsigned char *o = (const unsigned char *)outStruct;
+                out00 = *(const uint64_t *)(o + 0x00);
                 out10 = *(const uint64_t *)(o + 0x10);
                 if (*outStructCnt >= 0x50)
                     out48 = *(const uint64_t *)(o + 0x48);
@@ -5490,13 +6678,14 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             fprintf(stderr,
                 "####   ResCreate %s type=%#x clientID=%#x "
                 "+0x30=%#llx +0x38=%#llx +0x40=%#llx +0x58=%#llx "
-                "OUT[+0x10]=%#llx OUT[+0x48]=%#llx\n",
+                "OUT[+0]=%#llx OUT[+0x10]=%#llx OUT[+0x48]=%#llx\n",
                 r ? "FAIL" : "OK",
                 type, clientID,
                 (unsigned long long)f30, (unsigned long long)va38,
                 (unsigned long long)bc40,
                 (unsigned long long)va58,
-                (unsigned long long)out10, (unsigned long long)out48);
+                (unsigned long long)out00, (unsigned long long)out10,
+                (unsigned long long)out48);
             // Hex dump first 0x70 bytes
             fprintf(stderr, "####   inStruct[0..%zu]:", inStructCnt);
             for (size_t i = 0; i < inStructCnt && i < 0x70; i++) {
@@ -5544,8 +6733,29 @@ IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, c
 }
 IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
-    if (!caller_is_libmachook(__builtin_return_address(0)))
+    int struct_skip = caller_is_libmachook(__builtin_return_address(0));
+    if (!struct_skip)
         selector = IOConnectTranslateSelector(client, selector);
+    // macOS 13.4 kern_SwapEnd passes conn+0x18 as its 0x46c-byte selector-5
+    // input. SwapBegin stored the active swap ID at conn+0x68, hence input+0x50.
+    // In coexistence, cancel that exact swap through the RE-confirmed iOS ABI
+    // instead of presenting to the panel. Return the real cancel status; the
+    // caller then continues the remainder of kern_SwapEnd normally.
+    if (!struct_skip && atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
+        orig == 5 && selector == 5 && inStruct && inStructCnt == 0x46c) {
+        uint32_t swap_id = *(const volatile uint32_t *)((const char *)inStruct + 0x50);
+        uint64_t scalar = swap_id;
+        IOReturn cancel_r = IOConnectCallScalarMethod(
+            client, 0x34, &scalar, 1, NULL, NULL);
+        static _Atomic unsigned long cancel_count = 0;
+        unsigned long cancel_n = atomic_fetch_add(&cancel_count, 1) + 1;
+        if (cancel_n <= 8 || (cancel_n % 600) == 0 || cancel_r != KERN_SUCCESS) {
+            fprintf(stderr,
+                "#### COEXIST SwapCancel #%lu: conn=%u swapID=%u sel=0x34 -> %#x\n",
+                cancel_n, client, swap_id, cancel_r);
+        }
+        return cancel_r;
+    }
     // AGX GPU device-info query (method 256 / setupImmediate): macOS 13.4 asks for
     // a 0x78 (120-byte) output struct, but the iOS 16.x GPU userclient hard-checks
     // the output size at 0x70 (112). The 8-byte mismatch -> kIOReturnBadArgument and

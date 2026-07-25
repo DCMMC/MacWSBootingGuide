@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <sys/time.h>
 #include "interpose.h"
+#include "macws_macho_arch.h"
 
 #define SOCK_PATH "/tmp/autosignd.sock"   // as seen from inside the chroot
 
@@ -101,6 +102,101 @@ static void ensure_signed(const char *file) {
     if (abs) { request_sign(abs); free(abs); }
 }
 
+// ── keep exactly one architecture-matched libmachook across exec ───────────
+//
+// Runtime evidence from WindowServer-2026-07-22-234833.ips shows that this
+// device's dyld loads both the ARM64/ALL and ARM64/E thin inserts into the same
+// ARM64/ALL process.  That gives each dylib its own static state and installs
+// stateful Metal/VNC hooks twice.  launchdchrootexec selects one dylib for the
+// initial executable; these helpers preserve the same invariant when that
+// process launches a child of a different subtype.
+
+static const char *insert_for_target(const char *path, macws_macho_arch_t *out_arch) {
+    macws_macho_arch_t arch = macws_macho_arch_for_path(path);
+    const char *insert = macws_insert_dylib_for_arch(arch);
+    if (!insert) {
+#if defined(__arm64e__)
+        arch = MACWS_ARCH_ARM64E;
+#else
+        arch = MACWS_ARCH_ARM64;
+#endif
+        insert = macws_insert_dylib_for_arch(arch);
+        fprintf(stderr,
+            "#### exec arch-select: unknown Mach-O subtype for %s; keeping %s slice\n",
+            path ? path : "(null)", macws_arch_name(arch));
+    }
+    if (out_arch) *out_arch = arch;
+    return insert;
+}
+
+typedef struct {
+    char **items;
+    char *insert_entry;
+} selected_env_t;
+
+static selected_env_t env_select_insert(char *const envp[], const char *path) {
+    extern char **environ;
+    char *const *source = envp ? envp : environ;
+    size_t count = 0;
+    while (source && source[count]) count++;
+
+    selected_env_t selected = {0};
+    selected.items = calloc(count + 2, sizeof(char *));
+    const char *insert = insert_for_target(path, NULL);
+    if (!selected.items || asprintf(&selected.insert_entry,
+            "DYLD_INSERT_LIBRARIES=%s", insert) < 0) {
+        free(selected.items);
+        free(selected.insert_entry);
+        selected.items = NULL;
+        selected.insert_entry = NULL;
+        return selected;
+    }
+
+    static const char prefix[] = "DYLD_INSERT_LIBRARIES=";
+    size_t out = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (strncmp(source[i], prefix, sizeof(prefix) - 1) != 0)
+            selected.items[out++] = source[i];
+    }
+    selected.items[out++] = selected.insert_entry;
+    selected.items[out] = NULL;
+    return selected;
+}
+
+static void env_selected_free(selected_env_t *selected) {
+    if (!selected) return;
+    free(selected->insert_entry);
+    free(selected->items);
+    selected->insert_entry = NULL;
+    selected->items = NULL;
+}
+
+static pthread_mutex_t g_exec_env_lock = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    char *old_value;
+    int had_old_value;
+} saved_insert_t;
+
+static saved_insert_t process_env_select_insert(const char *path) {
+    saved_insert_t saved = {0};
+    const char *old = getenv("DYLD_INSERT_LIBRARIES");
+    if (old) {
+        saved.old_value = strdup(old);
+        saved.had_old_value = 1;
+    }
+    setenv("DYLD_INSERT_LIBRARIES", insert_for_target(path, NULL), 1);
+    return saved;
+}
+
+static void process_env_restore_insert(saved_insert_t *saved) {
+    if (saved->had_old_value && saved->old_value)
+        setenv("DYLD_INSERT_LIBRARIES", saved->old_value, 1);
+    else
+        unsetenv("DYLD_INSERT_LIBRARIES");
+    free(saved->old_value);
+}
+
 // ── interposed exec family ──────────────────────────────────────────────────
 // Under DYLD_INTERPOSE, a call to the original symbol from within this image is
 // NOT re-interposed by dyld, so calling e.g. execve() here invokes the real one
@@ -111,7 +207,11 @@ static int my_posix_spawn(pid_t *pid, const char *path,
                           const posix_spawnattr_t *attr,
                           char *const argv[], char *const envp[]) {
     ensure_signed(path);
-    return posix_spawn(pid, path, fa, attr, argv, envp);
+    selected_env_t selected = env_select_insert(envp, path);
+    int result = posix_spawn(pid, path, fa, attr, argv,
+        selected.items ? selected.items : envp);
+    env_selected_free(&selected);
+    return result;
 }
 
 static int my_posix_spawnp(pid_t *pid, const char *file,
@@ -119,22 +219,43 @@ static int my_posix_spawnp(pid_t *pid, const char *file,
                            const posix_spawnattr_t *attr,
                            char *const argv[], char *const envp[]) {
     ensure_signed(file);
-    return posix_spawnp(pid, file, fa, attr, argv, envp);
+    char *resolved = resolve(file);
+    selected_env_t selected = env_select_insert(envp, resolved ? resolved : file);
+    int result = posix_spawnp(pid, file, fa, attr, argv,
+        selected.items ? selected.items : envp);
+    env_selected_free(&selected);
+    free(resolved);
+    return result;
 }
 
 static int my_execve(const char *path, char *const argv[], char *const envp[]) {
     ensure_signed(path);
-    return execve(path, argv, envp);
+    selected_env_t selected = env_select_insert(envp, path);
+    int result = execve(path, argv, selected.items ? selected.items : envp);
+    env_selected_free(&selected);
+    return result;
 }
 
 static int my_execv(const char *path, char *const argv[]) {
     ensure_signed(path);
-    return execv(path, argv);
+    pthread_mutex_lock(&g_exec_env_lock);
+    saved_insert_t saved = process_env_select_insert(path);
+    int result = execv(path, argv);
+    process_env_restore_insert(&saved);
+    pthread_mutex_unlock(&g_exec_env_lock);
+    return result;
 }
 
 static int my_execvp(const char *file, char *const argv[]) {
     ensure_signed(file);
-    return execvp(file, argv);
+    char *resolved = resolve(file);
+    pthread_mutex_lock(&g_exec_env_lock);
+    saved_insert_t saved = process_env_select_insert(resolved ? resolved : file);
+    int result = execvp(file, argv);
+    process_env_restore_insert(&saved);
+    pthread_mutex_unlock(&g_exec_env_lock);
+    free(resolved);
+    return result;
 }
 
 DYLD_INTERPOSE(my_posix_spawn, posix_spawn);

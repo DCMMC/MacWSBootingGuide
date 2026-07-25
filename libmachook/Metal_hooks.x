@@ -50,8 +50,7 @@ static int macws_disp_mode(void) {
 // Cross-process VNC share: WS mirrors the composite into a GLOBAL IOSurface that
 // OSXvnc (a separate process) looks up by ID and blits into its frameBufferData
 // (see mac_hooks.m macws_install_osxvnc_hooks / macws_vnc_fill). Gated by
-// sentinel /tmp/macws_vnc_share. Content is still the tiled +0xa0 copy until the
-// detile lands — this first proves the WS->OSXvnc->VNC pipeline with REAL bytes.
+// sentinel /tmp/macws_vnc_share.
 extern uint32_t IOSurfaceGetID(IOSurfaceRef);
 static IOSurfaceRef g_vncSurf = NULL;
 static int macws_vnc_share_enabled(void) {
@@ -143,30 +142,62 @@ static inline uint8_t macws_half_to_u8(uint16_t h) {
 //   - render thread (WSCD StartComposite hook): only STASH the dest texture
 //     pointer (cheap, no read) — the big +0xa0 memcpy on the render thread
 //     destabilized WS (A/B-confirmed).
-//   - background thread: raw memcpy of the stashed dest's +0xa0 backing ->
-//     g_vncSurf. A bg-thread raw +0xa0 read is SAFE (proven by the bridge);
-//     reading the STASHED composite dest (not random tracked textures) makes
-//     it RELIABLE. Concurrent GPU writes -> tearing, not a crash. getBytes is
-//     unusable (hangs render / crashes bg). Backing is AGX-TILED -> g_vncSurf
-//     holds tiled bytes (CPU twiddle-detile is the remaining TODO).
-static id<MTLTexture> g_vnc_comp_tex = nil;   // stashed composite dest (ARC strong)
+//   - background thread: GPU-blit the stashed destination into a Shared texture,
+//     wait for completion, then read that destination's IOSurface mapping.
+//
+// LLDB/RE-confirmed for AGXG13GFamilyTexture on this image:
+//   impl+0xa0 = IOSurfaceRef, impl+0xa8 = plane,
+//   impl+0x130 = CPU mapping, impl+0x40 = GPU address.
+// updateBindDataWithAddresses:... writes +0x130/+0x40 before calling
+// texBaseAddressesUpdated.  Do not treat +0xa0 as a byte pointer.
+// libmachook is built under MRC.  Keep an explicit ownership reference: the
+// StartComposite argument may be released as soon as its hook returns.
+static id<MTLTexture> g_vnc_comp_tex = nil;
 static id g_vnc_lock = nil;
+static _Atomic int g_vnc_final_available = 0;
+static id macws_vnc_retain(id obj) {
+#if __has_feature(objc_arc)
+    return obj;
+#else
+    return [obj retain];
+#endif
+}
+static void macws_vnc_release(id obj) {
+#if !__has_feature(objc_arc)
+    [obj release];
+#else
+    (void)obj;
+#endif
+}
 void macws_vnc_on_composite(id<MTLTexture> dest) {
-    if (!macws_vnc_share_enabled() || !dest) return;
+    if (!macws_vnc_share_enabled() || !dest ||
+        atomic_load(&g_vnc_final_available)) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_vnc_lock = [NSObject new];
         [NSThread detachNewThreadWithBlock:^{
             for (;;) {
-                id<MTLTexture> t = nil;
-                @synchronized(g_vnc_lock) { t = g_vnc_comp_tex; }  // ARC retains into local
-                if (t) {
+                @autoreleasepool {
+                    id<MTLTexture> t = nil;
+                    if (!atomic_load(&g_vnc_final_available)) {
+                        @synchronized(g_vnc_lock) {
+                            t = macws_vnc_retain(g_vnc_comp_tex);
+                        }
+                    }
+                    if (t) {
                     size_t w = [t width], h = [t height];
                     unsigned long pf = (unsigned long)[t pixelFormat];
+                    static _Atomic int targetlog = 0;
+                    int targetn = atomic_fetch_add(&targetlog, 1);
+                    if (targetn < 24) {
+                        fprintf(stderr,
+                            "#### VNC-BLIT candidate #%d tex=%p class=%s %zux%zu pf=%lu\n",
+                            targetn, (void *)t, object_getClassName(t), w, h, pf);
+                    }
                     if (w >= 1000 && h >= 600 && (pf == 80 || pf == 115)) {
                         // GPU blit the (AGX-tiled) LIVE composite into an IDLE
                         // linear texture on our OWN queue (GPU detiles), then
-                        // CPU-read the idle dst's now-linear +0xa0 -> g_vncSurf.
+                        // CPU-read the idle dst's IOSurface mapping -> mmap.
                         // Avoids CPU-reading the live target (perturbs WS) and
                         // getBytes (hangs/crashes). The blit READS the live
                         // target on the GPU (tearing at worst, not a crash).
@@ -197,18 +228,35 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                             [cb waitUntilCompleted];
                             void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
                             if ((uintptr_t)impl > 0x1000) {
-                                void *backing = *(void **)((char *)impl + 0xa0);
-                                if (backing) {
+                                IOSurfaceRef boundSurface =
+                                    *(IOSurfaceRef *)((char *)impl + 0xa0);
+                                void *cpuMapping = *(void **)((char *)impl + 0x130);
+                                if (boundSurface && cpuMapping &&
+                                    IOSurfaceLock(boundSurface, kIOSurfaceLockReadOnly, NULL) == 0) {
+                                    void *surfaceBase = IOSurfaceGetBaseAddress(boundSurface);
+                                    size_t srcbpr = IOSurfaceGetBytesPerRow(boundSurface);
+                                    size_t surfaceHeight = IOSurfaceGetHeight(boundSurface);
+                                    static int maplog = 0;
+                                    if (maplog < 3) {
+                                        fprintf(stderr,
+                                            "#### VNC-BLIT mapping tex=%p impl=%p surface=%p "
+                                            "cpu130=%p base=%p bpr=%zu h=%zu%s\n",
+                                            (void *)dst, impl, (void *)boundSurface,
+                                            cpuMapping, surfaceBase, srcbpr, surfaceHeight,
+                                            cpuMapping == surfaceBase ? "" : " MISMATCH");
+                                        maplog++;
+                                    }
                                     void *vb = macws_vnc_mmap_data(w, h);  // cross-process mmap
                                     size_t vbpr = w * 4;
-                                    if (vb && pf == 80) {
-                                        size_t srcbpr = w * 4;
-                                        for (size_t y = 0; y < h; y++)
-                                            memcpy((char *)vb + y*vbpr, (char *)backing + y*srcbpr, vbpr);
-                                    } else if (vb) { // pf==115 RGBA16F -> BGRA8
-                                        size_t srcbpr = w * 8;
-                                        for (size_t y = 0; y < h; y++) {
-                                            uint16_t *src = (uint16_t *)((char *)backing + y*srcbpr);
+                                    size_t rows = h < surfaceHeight ? h : surfaceHeight;
+                                    if (vb && surfaceBase && pf == 80 && srcbpr >= vbpr) {
+                                        for (size_t y = 0; y < rows; y++)
+                                            memcpy((char *)vb + y*vbpr,
+                                                   (char *)surfaceBase + y*srcbpr, vbpr);
+                                    } else if (vb && surfaceBase && pf == 115 &&
+                                               srcbpr >= w * 8) { // RGBA16F -> BGRA8
+                                        for (size_t y = 0; y < rows; y++) {
+                                            uint16_t *src = (uint16_t *)((char *)surfaceBase + y*srcbpr);
                                             uint8_t  *d8  = (uint8_t  *)((char *)vb + y*vbpr);
                                             for (size_t x = 0; x < w; x++) {
                                                 d8[x*4+0] = macws_half_to_u8(src[x*4+2]);
@@ -218,21 +266,606 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                             }
                                         }
                                     }
-                                    if (vb) {
+                                    if (vb && surfaceBase) {
                                         static int lg = 0;
                                         if (lg < 3) { fprintf(stderr, "#### VNC-BLIT captured %zux%zu pf=%lu -> mmap (detiled)\n", w, h, pf); lg++; }
                                     }
+                                    IOSurfaceUnlock(boundSurface, kIOSurfaceLockReadOnly, NULL);
                                 }
                             }
                         }
                     }
+                    }
+                    macws_vnc_release(t);
                 }
                 usleep(50000);   // ~20 fps
             }
         }];
     });
-    @synchronized(g_vnc_lock) { g_vnc_comp_tex = dest; }   // cheap stash, render thread
+    @synchronized(g_vnc_lock) {
+        id old = g_vnc_comp_tex;
+        g_vnc_comp_tex = macws_vnc_retain(dest);
+        macws_vnc_release(old);
+    }
 }
+
+// Final-scanout capture. Runtime-confirmed in WindowServer: the textures
+// wrapped by CAWindowServerDisplay::currentSurface are 2388x1668, private
+// pixel format 550, backed by the 15.2 MiB compressed display IOSurfaces.
+// Their IOSurface rows are compressed (bpr=2432), so CPU copying is invalid.
+// Instead, a texture read lets AGX apply the texture descriptor's compression
+// metadata in hardware and writes ordinary BGRA8 into a Shared texture. Mesa's
+// Asahi libagx uses the same architectural primitive in libagx_decompress:
+// image-load the compressed descriptor, image-store an uncompressed
+// descriptor, then update metadata.
+//
+// Do not compile source here.  In this chroot `newLibraryWithSource:` returns a
+// macOS-format library that the iOS AGX device rejects.  QuartzCore's shipped
+// default.metallib is already loadable by this device and contains an exact
+// surface-copy pair.  llvm-dis of the actual macOS 13.4 blobs confirms:
+//
+//   read_surf_vert(ushort [[vertex_id]])
+//     vertex IDs 0..3 -> (-1,-1), (1,-1), (-1,1), (1,1)
+//   read_surf_frag(float4 [[position]], texture2d<half> [[texture(0)]])
+//     read_texture_2d(uint2(position.xy)) -> color(0)
+//
+// Consequently this is a four-vertex triangle strip, with no vertex buffers,
+// samplers, or uniforms.  The fragment coordinates are pixel coordinates, so
+// render at the source's full size; the VNC mmap consumer performs the Retina
+// half-size reduction.  Rendering directly to 1194x834 would only crop the
+// source's upper-left quarter.
+static id g_vnc_final_lock = nil;
+static id<MTLTexture> g_vnc_final_tex = nil;
+static IOSurfaceRef g_vnc_final_surface = NULL;
+
+static BOOL macws_vnc_submit_read_pass(id<MTLCommandQueue> queue,
+        id<MTLRenderPipelineState> pipeline, id<MTLTexture> src,
+        id<MTLTexture> dst, NSString *label, BOOL draw) {
+    MTLCommandBufferDescriptor *cbDescriptor =
+        [[MTLCommandBufferDescriptor alloc] init];
+    cbDescriptor.retainedReferences = YES;
+    cbDescriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    id<MTLCommandBuffer> commandBuffer =
+        [queue commandBufferWithDescriptor:cbDescriptor];
+    macws_vnc_release(cbDescriptor);
+    commandBuffer.label = label;
+
+    MTLRenderPassDescriptor *renderPass =
+        [MTLRenderPassDescriptor renderPassDescriptor];
+    renderPass.colorAttachments[0].texture = dst;
+    renderPass.colorAttachments[0].loadAction = draw
+        ? MTLLoadActionDontCare : MTLLoadActionClear;
+    renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0.125, 0.25, 0.5, 1.0);
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:renderPass];
+    encoder.label = label;
+    if (draw) {
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setFragmentTexture:src atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                    vertexStart:0 vertexCount:4];
+    }
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    NSError *error = [commandBuffer error];
+    if (!error) return YES;
+
+    fprintf(stderr, "#### VNC-FINAL pass %s error: %s\n",
+        [label UTF8String], [[error description] UTF8String]);
+    NSArray *encoderInfos = [[error userInfo]
+        objectForKey:MTLCommandBufferEncoderInfoErrorKey];
+    BOOL allCompleted = [encoderInfos count] > 0;
+    for (id<MTLCommandBufferEncoderInfo> info in encoderInfos) {
+        fprintf(stderr,
+            "#### VNC-FINAL encoder label=%s state=%ld signposts=%s\n",
+            [[info label] UTF8String], (long)[info errorState],
+            [[[info debugSignposts] description] UTF8String]);
+        if ([info errorState] != MTLCommandEncoderErrorStateCompleted)
+            allCompleted = NO;
+    }
+    // A command-buffer-level bookkeeping error is not proof that GPU work
+    // failed.  Return the explicitly requested per-encoder execution result;
+    // callers still validate the destination bytes before using any output.
+    return allCompleted;
+}
+
+static void macws_vnc_capture_final(id<MTLTexture> src) {
+    // Keep the expensive one-shot native-AGX capture experiment explicitly
+    // armed.  Tracking the live final texture continues before this file
+    // exists, so a debugger/test harness can let WindowServer settle and then
+    // create /tmp/macws_capture_final together with /tmp/macws_submit_diag;
+    // the first deep-dumped submit is then the clear-only control pass rather
+    // than an unrelated compositor frame.
+    if (access("/tmp/macws_capture_final", F_OK) != 0) return;
+    if (!src) return;
+    size_t srcw = [src width], srch = [src height];
+    unsigned long srcpf = (unsigned long)[src pixelFormat];
+    unsigned long usage = (unsigned long)[src usage];
+    if (srcw < 1000 || srch < 600 || srcpf != 550) return;
+
+    static int usageLog = 0;
+    if (usageLog < 3) {
+        fprintf(stderr,
+            "#### VNC-FINAL source tex=%p %zux%zu pf=%lu usage=%#lx "
+            "storage=%lu hazard=%lu\n",
+            (void *)src, srcw, srch, srcpf, usage,
+            (unsigned long)[src storageMode],
+            (unsigned long)[src hazardTrackingMode]);
+        usageLog++;
+    }
+    if ((usage & MTLTextureUsageShaderRead) == 0) {
+        static int noReadLog = 0;
+        if (noReadLog++ < 3) {
+            fprintf(stderr,
+                "#### VNC-FINAL source lacks MTLTextureUsageShaderRead; "
+                "capture dispatch not submitted\n");
+        }
+        return;
+    }
+
+    // Diagnostic circuit breaker: /tmp/macws_capture_final promises a
+    // one-shot experiment.  A failed pf=550 read causes WindowServer to
+    // create replacement scanout surfaces; without this guard every
+    // replacement re-entered the probe and generated another GPU fault.
+    // This does not alter normal rendering and does not reinterpret the
+    // command result; it only prevents the explicitly gated probe itself
+    // from amplifying one failure into a crash-report/resource storm.
+    static _Atomic int captureAttempted = 0;
+    if (atomic_exchange(&captureAttempted, 1)) return;
+
+    static id<MTLDevice> dev = nil;
+    static id<MTLCommandQueue> queue = nil;
+    static id<MTLRenderPipelineState> pipeline = nil;
+    static id<MTLTexture> dst = nil;
+    static size_t dstw = 0, dsth = 0;
+    static int pipelineAttempted = 0;
+
+    if (!dev) {
+        dev = (id<MTLDevice>)macws_vnc_retain([src device]);
+        queue = [dev newCommandQueue];
+    }
+    if (dev && !pipeline && !pipelineAttempted) {
+        pipelineAttempted = 1;
+        NSURL *url = [NSURL fileURLWithPath:
+            @"/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"];
+        NSError *error = nil;
+        id<MTLLibrary> library = [dev newLibraryWithURL:url error:&error];
+        id<MTLFunction> vertex =
+            library ? [library newFunctionWithName:@"read_surf_vert"] : nil;
+        id<MTLFunction> fragment =
+            library ? [library newFunctionWithName:@"read_surf_frag"] : nil;
+        MTLRenderPipelineReflection *reflection = nil;
+        id<MTLRenderPipelineState> built = nil;
+        BOOL contractOK = NO;
+        if (vertex && fragment) {
+            MTLRenderPipelineDescriptor *descriptor =
+                [[MTLRenderPipelineDescriptor alloc] init];
+            descriptor.label = @"MACWS final scanout read";
+            descriptor.vertexFunction = vertex;
+            descriptor.fragmentFunction = fragment;
+            descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            built = [dev newRenderPipelineStateWithDescriptor:descriptor
+                options:MTLPipelineOptionArgumentInfo
+                reflection:&reflection error:&error];
+            macws_vnc_release(descriptor);
+        }
+
+        // Runtime reflection is a second check on the AIR metadata above.  Do
+        // not draw unless the only active shader resource is texture slot 0.
+        if (built && reflection) {
+            BOOL sawTexture0 = NO;
+            BOOL unexpected = NO;
+            NSArray *vertexArguments = [reflection vertexArguments];
+            NSArray *fragmentArguments = [reflection fragmentArguments];
+            for (MTLArgument *arg in vertexArguments) {
+                if (![arg isActive]) continue;
+                unexpected = YES;
+                fprintf(stderr,
+                    "#### VNC-FINAL reflect vertex name=%s type=%lu index=%lu access=%lu\n",
+                    [[arg name] UTF8String], (unsigned long)[arg type],
+                    (unsigned long)[arg index], (unsigned long)[arg access]);
+            }
+            for (MTLArgument *arg in fragmentArguments) {
+                if (![arg isActive]) continue;
+                fprintf(stderr,
+                    "#### VNC-FINAL reflect fragment name=%s type=%lu index=%lu access=%lu\n",
+                    [[arg name] UTF8String], (unsigned long)[arg type],
+                    (unsigned long)[arg index], (unsigned long)[arg access]);
+                if ([arg type] == MTLArgumentTypeTexture && [arg index] == 0 &&
+                    !sawTexture0) {
+                    sawTexture0 = YES;
+                } else {
+                    unexpected = YES;
+                }
+            }
+            contractOK = sawTexture0 && !unexpected;
+        }
+        if (built && contractOK) {
+            pipeline = built;
+        } else {
+            macws_vnc_release(built);
+        }
+        fprintf(stderr,
+            "#### VNC-FINAL pipeline library=%p vertex=%p fragment=%p "
+            "pipeline=%p reflection=%p contract=%s error=%s\n",
+            (void *)library, (void *)vertex, (void *)fragment, (void *)pipeline,
+            (void *)reflection, contractOK ? "OK" : "REJECT",
+            error ? [[error description] UTF8String] : "nil");
+    }
+    if (!dev || !queue || !pipeline) return;
+
+    size_t outw = srcw;
+    size_t outh = srch;
+    if (!dst || dstw != outw || dsth != outh) {
+        macws_vnc_share_ensure(outw, outh);
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:outw height:outh mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        id<MTLTexture> newDst = g_vncSurf
+            ? [dev newTextureWithDescriptor:descriptor iosurface:g_vncSurf plane:0]
+            : nil;
+        macws_vnc_release(dst);
+        dst = newDst;
+        dstw = outw;
+        dsth = outh;
+        fprintf(stderr,
+            "#### VNC-FINAL dst=%p surface=%p %zux%zu pf=%lu storage=%lu\n",
+            (void *)dst, (void *)g_vncSurf, outw, outh,
+            (unsigned long)[dst pixelFormat],
+            (unsigned long)[dst storageMode]);
+    }
+    if (!dst) return;
+
+    // TEMPORARY DIAGNOSTIC, not a rendering fix: prove independently whether
+    // this queue/destination and this precompiled shader can execute before
+    // attributing an error to private pf550.  The known-color control is never
+    // copied into the VNC mmap and therefore cannot masquerade as a screenshot.
+    static int controlAttempted = 0;
+    static BOOL controlOK = NO;
+    static IOSurfaceRef controlSurface = NULL;
+    static id<MTLTexture> controlTexture = nil;
+    if (!controlAttempted) {
+        controlAttempted = 1;
+        BOOL clearExecuted = macws_vnc_submit_read_pass(queue, pipeline, nil, dst,
+            @"MACWS VNC clear-only control", NO);
+        BOOL clearPixelsOK = NO;
+        uint8_t clearPixel[4] = {0, 0, 0, 0};
+        if (clearExecuted &&
+            IOSurfaceLock(g_vncSurf, kIOSurfaceLockReadOnly, NULL) == 0) {
+            uint8_t *base = IOSurfaceGetBaseAddress(g_vncSurf);
+            size_t bpr = IOSurfaceGetBytesPerRow(g_vncSurf);
+            uint8_t *pixel = base ? base + (outh / 2) * bpr + (outw / 2) * 4 : NULL;
+            if (pixel) memcpy(clearPixel, pixel, sizeof(clearPixel));
+            // MTLClearColorMake(.125, .25, .5, 1) stored in BGRA8.
+            clearPixelsOK = pixel && pixel[0] >= 0x7f && pixel[0] <= 0x80 &&
+                pixel[1] >= 0x3f && pixel[1] <= 0x40 &&
+                pixel[2] >= 0x1f && pixel[2] <= 0x20 && pixel[3] == 0xff;
+            IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
+        }
+        fprintf(stderr,
+            "#### VNC-FINAL clear-control executed=%s pixel=%s "
+            "center=%02x%02x%02x%02x\n",
+            clearExecuted ? "YES" : "NO", clearPixelsOK ? "OK" : "FAIL",
+            clearPixel[0], clearPixel[1], clearPixel[2], clearPixel[3]);
+
+        // TEMPORARY DIAGNOSTIC CIRCUIT BREAKER, not a rendering fix.  A
+        // failed WindowServer frame currently keeps allocating replacement
+        // IOSurface resources (runtime capture reached tens of GB of virtual
+        // resource accounting).  When the one-shot test harness creates this
+        // sentinel, stop at the exact post-completion point so LLDB can inspect
+        // the process and the harness can copy evidence before cleanup.  This
+        // does not change the command result or pretend that pixels rendered.
+        if (access("/tmp/macws_stop_after_clear", F_OK) == 0) {
+            fprintf(stderr,
+                "#### VNC-FINAL DIAGNOSTIC-STOP after clear-control result\n");
+            raise(SIGSTOP);
+        }
+        NSDictionary *properties = @{
+            @"IOSurfaceWidth": @(outw),
+            @"IOSurfaceHeight": @(outh),
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+        };
+        controlSurface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
+        if (controlSurface &&
+            IOSurfaceLock(controlSurface, 0, NULL) == 0) {
+            uint8_t *controlBase = IOSurfaceGetBaseAddress(controlSurface);
+            size_t controlBpr = IOSurfaceGetBytesPerRow(controlSurface);
+            for (size_t y = 0; controlBase && y < outh; y++) {
+                uint8_t *row = controlBase + y * controlBpr;
+                for (size_t x = 0; x < outw; x++) {
+                    row[x * 4 + 0] = 0x21;
+                    row[x * 4 + 1] = 0x43;
+                    row[x * 4 + 2] = 0x65;
+                    row[x * 4 + 3] = 0xff;
+                }
+            }
+            IOSurfaceUnlock(controlSurface, 0, NULL);
+        }
+        MTLTextureDescriptor *controlDescriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:outw height:outh mipmapped:NO];
+        controlDescriptor.storageMode = MTLStorageModeShared;
+        controlDescriptor.usage = MTLTextureUsageShaderRead;
+        controlTexture = controlSurface
+            ? [dev newTextureWithDescriptor:controlDescriptor
+                iosurface:controlSurface plane:0]
+            : nil;
+        BOOL drawExecuted = clearPixelsOK && controlTexture &&
+            macws_vnc_submit_read_pass(queue, pipeline, controlTexture, dst,
+                @"MACWS VNC BGRA8 shader control", YES);
+        BOOL pixelsOK = NO;
+        if (drawExecuted &&
+            IOSurfaceLock(g_vncSurf, kIOSurfaceLockReadOnly, NULL) == 0) {
+            uint8_t *base = IOSurfaceGetBaseAddress(g_vncSurf);
+            size_t bpr = IOSurfaceGetBytesPerRow(g_vncSurf);
+            uint8_t *pixel = base ? base + (outh / 2) * bpr + (outw / 2) * 4 : NULL;
+            pixelsOK = pixel && pixel[0] == 0x21 && pixel[1] == 0x43 &&
+                pixel[2] == 0x65 && pixel[3] == 0xff;
+            fprintf(stderr,
+                "#### VNC-FINAL control clear=%s draw=%s pixel=%s "
+                "center=%02x%02x%02x%02x\n",
+                clearPixelsOK ? "OK" : "FAIL",
+                drawExecuted ? "EXECUTED" : "FAIL",
+                pixelsOK ? "OK" : "FAIL",
+                pixel ? pixel[0] : 0, pixel ? pixel[1] : 0,
+                pixel ? pixel[2] : 0, pixel ? pixel[3] : 0);
+            IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
+        } else {
+            fprintf(stderr,
+                "#### VNC-FINAL control clear=%s texture=%p draw=%s pixel=UNREAD\n",
+                clearPixelsOK ? "OK" : "FAIL", (void *)controlTexture,
+                drawExecuted ? "EXECUTED" : "FAIL");
+        }
+        controlOK = drawExecuted && pixelsOK;
+    }
+    if (!controlOK) return;
+
+    if (!macws_vnc_submit_read_pass(queue, pipeline, src, dst,
+            @"MACWS VNC pf550 scanout read", YES)) {
+        static int commandErrorLog = 0;
+        if (commandErrorLog++ == 0) {
+            fprintf(stderr,
+                "#### VNC-FINAL pf550 read rejected after BGRA8 control passed\n");
+        }
+        return;
+    }
+
+    void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
+    IOSurfaceRef boundSurface = (uintptr_t)impl > 0x1000
+        ? *(IOSurfaceRef *)((char *)impl + 0xa0) : NULL;
+    void *cpuMapping = (uintptr_t)impl > 0x1000
+        ? *(void **)((char *)impl + 0x130) : NULL;
+    if (!boundSurface || boundSurface != g_vncSurf || !cpuMapping ||
+        IOSurfaceLock(g_vncSurf, kIOSurfaceLockReadOnly, NULL) != 0) return;
+    void *base = IOSurfaceGetBaseAddress(g_vncSurf);
+    size_t bpr = IOSurfaceGetBytesPerRow(g_vncSurf);
+    size_t bh = IOSurfaceGetHeight(g_vncSurf);
+    void *shared = macws_vnc_mmap_data(outw, outh);
+    if (base && shared && bpr >= outw * 4 && bh >= outh) {
+        for (size_t y = 0; y < outh; y++) {
+            memcpy((char *)shared + y * outw * 4,
+                   (char *)base + y * bpr, outw * 4);
+        }
+        static int capturedLog = 0;
+        if (capturedLog++ < 6) {
+            size_t nonzero = 0;
+            for (size_t off = 0; off < outw * outh * 4; off += 4096) {
+                if (((uint8_t *)shared)[off]) nonzero++;
+            }
+            fprintf(stderr,
+                "#### VNC-FINAL captured %zux%zu BGRA8 cpu130=%p base=%p "
+                "bpr=%zu sampled_nonzero=%zu\n",
+                outw, outh, cpuMapping, base, bpr, nonzero);
+        }
+    }
+    IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
+}
+
+static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
+    if (!tex || !surface || !macws_vnc_share_enabled()) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_vnc_final_lock = [NSObject new];
+        [NSThread detachNewThreadWithBlock:^{
+            for (;;) {
+                @autoreleasepool {
+                    id<MTLTexture> snapshot = nil;
+                    IOSurfaceRef snapshotSurface = NULL;
+                    @synchronized(g_vnc_final_lock) {
+                        snapshot = macws_vnc_retain(g_vnc_final_tex);
+                        if (g_vnc_final_surface) {
+                            snapshotSurface = (IOSurfaceRef)CFRetain(g_vnc_final_surface);
+                        }
+                    }
+                    if (snapshot && snapshotSurface) {
+                        macws_vnc_capture_final(snapshot);
+                    }
+                    macws_vnc_release(snapshot);
+                    if (snapshotSurface) CFRelease(snapshotSurface);
+                }
+                usleep(200000); // static screenshot path: 5 fps avoids WS pressure
+            }
+        }];
+    });
+
+    atomic_store(&g_vnc_final_available, 1);
+    if (g_vnc_lock) {
+        @synchronized(g_vnc_lock) {
+            id oldComposite = g_vnc_comp_tex;
+            g_vnc_comp_tex = nil;
+            macws_vnc_release(oldComposite);
+        }
+    }
+    @synchronized(g_vnc_final_lock) {
+        id oldTexture = g_vnc_final_tex;
+        IOSurfaceRef oldSurface = g_vnc_final_surface;
+        g_vnc_final_tex = macws_vnc_retain(tex);
+        g_vnc_final_surface = (IOSurfaceRef)CFRetain(surface);
+        macws_vnc_release(oldTexture);
+        if (oldSurface) CFRelease(oldSurface);
+    }
+}
+
+// Pair a successful MetalContext::StartComposite* with the matching
+// EndCurrentComposite(bool).  A creation-time pf550 candidate is not a
+// completed frame: the iOS-native iosclear reference reads the same solid
+// ff00ffff value from a newly-created pf550 surface.  Keep a per-context
+// stack because SkyLight permits nested composites; selecting at the end of
+// the matching composite preserves that nesting instead of using the most
+// recently allocated display texture.
+static NSMutableDictionary *g_vnc_composite_stages = nil;
+static NSMutableDictionary *g_vnc_composite_pending = nil;
+
+void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
+    if (!macws_vnc_share_enabled() || !context || !texture) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_vnc_composite_stages = [NSMutableDictionary new];
+        g_vnc_composite_pending = [NSMutableDictionary new];
+    });
+    NSValue *key = [NSValue valueWithPointer:context];
+    @synchronized(g_vnc_composite_stages) {
+        NSMutableArray *stack = g_vnc_composite_stages[key];
+        if (!stack) {
+            stack = [NSMutableArray array];
+            g_vnc_composite_stages[key] = stack;
+        }
+        [stack addObject:texture];
+    }
+}
+
+void macws_vnc_complete_composite(void *context) {
+    if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_stages)
+        return;
+    id<MTLTexture> texture = nil;
+    NSValue *key = [NSValue valueWithPointer:context];
+    @synchronized(g_vnc_composite_stages) {
+        NSMutableArray *stack = g_vnc_composite_stages[key];
+        texture = macws_vnc_retain([stack lastObject]);
+        if (texture) [stack removeLastObject];
+        if ([stack count] == 0) [g_vnc_composite_stages removeObjectForKey:key];
+    }
+    if (!texture) return;
+
+    size_t width = [texture width], height = [texture height];
+    unsigned long pixelFormat = (unsigned long)[texture pixelFormat];
+    static _Atomic int completionLog = 0;
+    int n = atomic_fetch_add(&completionLog, 1);
+    if (n < 32) {
+        fprintf(stderr,
+            "#### VNC-ENDCOMPOSITE #%d context=%p tex=%p class=%s "
+            "%zux%zu pf=%lu\n",
+            n, context, (void *)texture, object_getClassName(texture),
+            width, height, pixelFormat);
+    }
+
+    // EndCurrentComposite has ended the encoder but has not submitted the
+    // MetalContext command buffer.  Preserve only the latest display-sized
+    // destination for this update.  EndUpdate/Flush will publish it after the
+    // matching command buffer at MetalContext+0x68 has actually completed.
+    if (width >= 1000 && height >= 600 &&
+        (pixelFormat == 550 || pixelFormat == 80 || pixelFormat == 115)) {
+        @synchronized(g_vnc_composite_stages) {
+            g_vnc_composite_pending[key] = texture;
+        }
+    }
+    macws_vnc_release(texture);
+}
+
+void macws_vnc_finish_update(void *context) {
+    if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_pending)
+        return;
+    NSValue *key = [NSValue valueWithPointer:context];
+    id<MTLTexture> texture = nil;
+    @synchronized(g_vnc_composite_stages) {
+        texture = macws_vnc_retain(g_vnc_composite_pending[key]);
+        [g_vnc_composite_pending removeObjectForKey:key];
+    }
+    if (!texture) return;
+
+    // Deep capture remains an explicit diagnostic.  Before it is armed we
+    // still pair the composite/update state correctly, but retain no frame or
+    // command buffer and impose no asynchronous wait load on WindowServer.
+    if (access("/tmp/macws_capture_final", F_OK) != 0) {
+        macws_vnc_release(texture);
+        return;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = macws_vnc_retain(
+        *(id<MTLCommandBuffer> *)((char *)context + 0x68));
+    if (!commandBuffer ||
+        ![commandBuffer respondsToSelector:@selector(waitUntilCompleted)]) {
+        static int missingLog = 0;
+        if (missingLog++ < 4) {
+            fprintf(stderr,
+                "#### VNC-ENDUPDATE no submitted command buffer context=%p "
+                "tex=%p cb=%p\n", context, (void *)texture,
+                (void *)commandBuffer);
+        }
+        macws_vnc_release(commandBuffer);
+        macws_vnc_release(texture);
+        return;
+    }
+
+    unsigned long pixelFormat = (unsigned long)[texture pixelFormat];
+    IOSurfaceRef surface = NULL;
+    if (pixelFormat == 550) {
+        void *impl = *(void **)((char *)(__bridge void *)texture + 0x208);
+        if ((uintptr_t)impl > 0x1000) {
+            surface = *(IOSurfaceRef *)((char *)impl + 0xa0);
+            if (surface) CFRetain(surface);
+        }
+    }
+
+    // One in-flight wait is enough for a screenshot and bounds retained
+    // display surfaces if WindowServer produces frames faster than the GPU.
+    static _Atomic int waitInFlight = 0;
+    if (atomic_exchange(&waitInFlight, 1)) {
+        if (surface) CFRelease(surface);
+        macws_vnc_release(commandBuffer);
+        macws_vnc_release(texture);
+        return;
+    }
+    static dispatch_queue_t waitQueue = NULL;
+    static dispatch_once_t waitOnce;
+    dispatch_once(&waitOnce, ^{
+        waitQueue = dispatch_queue_create(
+            "com.macwsguide.vnc-command-completion", DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(waitQueue, ^{
+        [commandBuffer waitUntilCompleted];
+        MTLCommandBufferStatus status = [commandBuffer status];
+        NSError *error = [commandBuffer error];
+        static _Atomic int waitLog = 0;
+        int n = atomic_fetch_add(&waitLog, 1);
+        if (n < 16) {
+            fprintf(stderr,
+                "#### VNC-ENDUPDATE-WAIT #%d context=%p tex=%p pf=%lu "
+                "cb=%p status=%ld error=%s surface=%p\n",
+                n, context, (void *)texture, pixelFormat,
+                (void *)commandBuffer, (long)status,
+                error ? [[error description] UTF8String] : "nil",
+                (void *)surface);
+        }
+        if (status == MTLCommandBufferStatusCompleted && !error) {
+            if (pixelFormat == 550 && surface) {
+                macws_vnc_track_final(texture, surface);
+            } else if (pixelFormat == 80 || pixelFormat == 115) {
+                macws_vnc_on_composite(texture);
+            }
+        }
+        if (surface) CFRelease(surface);
+        macws_vnc_release(commandBuffer);
+        macws_vnc_release(texture);
+        atomic_store(&waitInFlight, 0);
+    });
+}
+
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
 // thread on first use. The thread either fills the surface gray (mode 1) or
 // copies the texture's CPU-mapped GPU backing (+0xa0, which holds the real
@@ -243,9 +876,49 @@ static NSMutableArray *g_dispTexs = nil;   // id<MTLTexture>, ARC-retained
 static NSMutableArray *g_dispSurfs = nil;  // NSValue ptr, surface CFRetained
 static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
     int mode = macws_disp_mode();
-    if (!iosurface || mode == 0) return;
+    if (!iosurface) return;
     size_t iw = IOSurfaceGetWidth(iosurface);
     size_t ih = IOSurfaceGetHeight(iosurface);
+    unsigned long pf = tex ? (unsigned long)[tex pixelFormat] : 0;
+    if (macws_vnc_share_enabled() && tex && iw >= 1000 && ih >= 600) {
+        if (pf == 550) {
+            static _Atomic int pf550SurfaceDumped = 0;
+            if (!atomic_exchange(&pf550SurfaceDumped, 1)) {
+                OSType fourcc = IOSurfaceGetPixelFormat(iosurface);
+                size_t planes = IOSurfaceGetPlaneCount(iosurface);
+                CFDictionaryRef values = IOSurfaceCopyAllValues(iosurface);
+                NSString *description = values
+                    ? [(__bridge NSDictionary *)values
+                        descriptionWithLocale:nil indent:0]
+                    : @"(null)";
+                fprintf(stderr,
+                    "#### VNC-FINAL IOSURFACE pf550 id=%u alloc=%zu bpr=%zu "
+                    "bpe=%zu fourcc=%#x planes=%zu values=%s\n",
+                    IOSurfaceGetID(iosurface),
+                    IOSurfaceGetAllocSize(iosurface),
+                    IOSurfaceGetBytesPerRow(iosurface),
+                    IOSurfaceGetBytesPerElement(iosurface),
+                    (unsigned)fourcc, planes, [description UTF8String]);
+                if (values) CFRelease(values);
+            }
+        }
+        static _Atomic int finalLog = 0;
+        int n = atomic_fetch_add(&finalLog, 1);
+        if (n < 24) {
+            fprintf(stderr,
+                "#### VNC-FINAL candidate #%d tex=%p class=%s tex=%zux%zu pf=%lu "
+                "usage=%#lx storage=%lu hazard=%lu surface=%p %zux%zu bpr=%zu\n",
+                n, (void *)tex, object_getClassName(tex),
+                [tex width], [tex height], pf, (unsigned long)[tex usage],
+                (unsigned long)[tex storageMode],
+                (unsigned long)[tex hazardTrackingMode],
+                (void *)iosurface, iw, ih, IOSurfaceGetBytesPerRow(iosurface));
+        }
+        // Do not select pf550 here.  This callback runs when the texture is
+        // created/bound, before SkyLight has encoded its composite.  The
+        // matching EndCurrentComposite hook selects the completed target.
+    }
+    if (mode == 0) return;
     if (iw < 1000 || ih < 600) return;
     static dispatch_once_t dispOnce;
     dispatch_once(&dispOnce, ^{
@@ -370,54 +1043,63 @@ static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
     }
 }
 
-// 2026-06-20 — Wire IOSurface base address into AGX texture's writable
-// backing pointer ivar.
+typedef struct {
+    ptrdiff_t offset;
+    uint8_t bytes[24];
+    uint64_t address;
+    uint64_t acceleration_raw;
+    uint64_t acceleration_low36;
+    unsigned layout;
+    unsigned compressed;
+    unsigned extended;
+} macws_texture_descriptor_witness;
+
+// The iOS 16.3 AGX object placed the hardware descriptor at impl+0x180, while
+// the macOS 13.4 AGX object running in chroot placed the matching width/height
+// encoding later.  Locate it by invariant descriptor fields instead of
+// treating either private C++ offset as cross-OS ABI.
+static bool macws_find_texture_descriptor(void *impl, size_t width,
+                                          size_t height,
+                                          macws_texture_descriptor_witness *out) {
+    if (!impl || !out || width == 0 || height == 0) return false;
+    for (ptrdiff_t offset = 0x140; offset <= 0x240; offset++) {
+        uint64_t word0 = 0, word1 = 0, acceleration_raw = 0;
+        memcpy(&word0, (char *)impl + offset, sizeof(word0));
+        memcpy(&word1, (char *)impl + offset + 8, sizeof(word1));
+        size_t encoded_width = (size_t)((word0 >> 28) & 0x3fff) + 1;
+        size_t encoded_height = (size_t)((word0 >> 42) & 0x3fff) + 1;
+        if (encoded_width != width || encoded_height != height) continue;
+        memcpy(out->bytes, (char *)impl + offset, sizeof(out->bytes));
+        memcpy(&acceleration_raw, out->bytes + 16,
+               sizeof(acceleration_raw));
+        out->offset = offset;
+        out->address = ((word1 >> 2) & 0xfffffffffULL) << 4;
+        out->acceleration_raw = acceleration_raw;
+        out->acceleration_low36 =
+            (acceleration_raw & 0xfffffffffULL) << 4;
+        out->layout = (unsigned)((word0 >> 4) & 0x3);
+        out->compressed = (unsigned)((word1 >> 39) & 1);
+        out->extended = (unsigned)((word1 >> 63) & 1);
+        return true;
+    }
+    return false;
+}
+
+// Read-only audit of the AGX texture mapping established by Apple's real
+// initializer.  Project LLDB RE on AGXMetal13_3 UUID
+// 727C250E-554D-3921-A5B3-48DAE6195B79 corrected the old field attribution:
 //
-// Root cause (RE'd from chroot WS crash WindowServer-2026-06-20-144645.ips):
-//   CA's BackdropLayer renderer calls
-//   CA::OGL::MetalContext::create_texture, which builds a Metal texture
-//   then calls `-[IOGPUMetalTexture replaceRegion:mipmapLevel:withBytes:
-//   bytesPerRow:]` to upload pixel data.  That forwards to
-//   `-[AGXG13GFamilyTexture replaceRegion: ...]` which then calls
-//   `AGX::Texture<...>::writeRegion(...)`.  writeRegion computes the
-//   destination pointer as `[cpp+0xa0] + offset` and memmove's pixel
-//   data there.  On real Apple HW `[cpp+0xa0]` is the CPU-mapped GPU
-//   memory pointer set up by the AGX kernel driver during texture init.
-//   In chroot, AGX kernel returns kIOReturnNoBandwidth for the scanout
-//   path so the ivar stays NULL — writeRegion's memmove(dst=NULL, ...)
-//   SIGSEGVs.
+//   Texture+0xa0  = IOSurfaceRef
+//   Texture+0xa8  = IOSurface plane
+//   Texture+0x130 = CPU mapping consumed by getCPUPtr/writeRegion
 //
-// RE evidence (from ~/Downloads/agx-re/AGXMetal13_3 arm64e):
-//   - `-[AGXG13GFamilyTexture replaceRegion:...]` at +0x394a90 reads
-//     `_impl` ivar offset (file_addr 0x21a8a9884 → ivar offset 0x208)
-//     to dereference self → C++ AGX::Texture object.
-//   - `fn @0x1e5770000` (called from writeRegion +0x6c4): reads
-//     `[cpp+0x184]` (layout flag); if 0, returns `[cpp+0xa0]` (the
-//     writable backing pointer); if != 0 and != 3, returns 0.
-//   - `[cpp+0xa8]` is a 32-bit offset added to base for indexing.
-//
-// Fix: after our IOSurface-backed texture is created successfully,
-// reach into the C++ implementation object and set:
-//   - cpp+0xa0 = IOSurfaceGetBaseAddress(surface)  ← writable backing
-//   - cpp+0xa8 = 0                                  ← offset
-// This makes the texture's "linear backing" path point at the IOSurface
-// CPU mapping — replaceRegion now writes pixel bytes into the IOSurface
-// memory, which is the same memory the GPU later samples from.  Proper
-// upstream fix mirroring what AGX kernel driver does on real HW.  NOT a
-// NOP/return-bypass — it's the missing setup step.
-//
-// Layout sanity: only patches when `[cpp+0x184] == 0` (linear layout).
-// Compressed/heap-paged textures (layout=3) use a different ivar layout
-// we haven't RE'd — left untouched so they don't get corrupted.
-//
-// IOSurface lifetime: Metal's newTextureWithDescriptor:iosurface:
-// retains the IOSurface internally; base address stays valid as long
-// as the texture stays alive.  We lock the surface for
-// kIOSurfaceLockAvoidSync at first use to ensure base address is
-// mapped — IOSurfaceCreate without explicit cache mode may defer the
-// mapping until first lock.
-static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
-                                                   IOSurfaceRef surf) {
+// The old implementation wrote IOSurfaceGetBaseAddress() to +0xa0, corrupting
+// the IOSurfaceRef, and never populated +0x130.  Do not synthesize either
+// field here.  `updateBindDataWithAddresses:...` is the upstream owner and
+// stores the CPU/GPU mappings at +0x130/+0x40 before calling
+// texBaseAddressesUpdated().  This helper now only records the postcondition.
+static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
+                                                  IOSurfaceRef surf) {
     if (!tex || !surf) return;
     // Resolve _impl ivar offset dynamically (fallback to 0x208 from RE
     // if the class introspection fails — UUID-stable across 13.x).
@@ -433,81 +1115,137 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
         }
         if (s_impl_off == 0) s_impl_off = 0x208;  // RE-fallback
         fprintf(stderr,
-            "#### AGX_WIRE_IOSURF: _impl ivar offset = %#tx\n", s_impl_off);
+            "#### AGX_MAP_AUDIT: _impl ivar offset = %#tx\n", s_impl_off);
     });
-    // Lock the IOSurface to ensure base address is mapped into our VM.
-    // kIOSurfaceLockAvoidSync = no implicit GPU sync, just map.  Leave
-    // it locked — texture's IOSurface retain keeps it alive; pages
-    // unmap when surface is released (texture release path).
-    int lock_rc = IOSurfaceLock(surf, /*kIOSurfaceLockAvoidSync*/0, NULL);
-    void *base = IOSurfaceGetBaseAddress(surf);
-    if (!base) {
-        static int nolog = 0;
-        if (nolog++ < 3) {
-            fprintf(stderr,
-                "#### AGX_WIRE_IOSURF: IOSurfaceGetBaseAddress=NULL (lock_rc=%d) tex=%p surf=%p\n",
-                lock_rc, (void *)tex, (void *)surf);
-        }
-        return;
-    }
     void *impl = *(void **)((char *)(__bridge void *)tex + s_impl_off);
     if (!impl) {
         static int impllog = 0;
         if (impllog++ < 3) {
             fprintf(stderr,
-                "#### AGX_WIRE_IOSURF: _impl=NULL (uninit C++ obj) tex=%p\n",
-                (void *)tex);
+                "#### AGX_MAP_AUDIT: _impl=NULL tex=%p surf=%p\n",
+                (void *)tex, (void *)surf);
         }
         return;
     }
-    uint8_t layout = *(volatile uint8_t *)((char *)impl + 0x184);
-    if (layout != 0) {
-        static int layoutlog = 0;
-        if (layoutlog++ < 4) {
-            fprintf(stderr,
-                "#### AGX_WIRE_IOSURF: skip — layout=%d ≠ 0 (linear) tex=%p impl=%p\n",
-                layout, (void *)tex, impl);
-        }
-        return;
-    }
-    // Apply the wire-up ONLY when the existing backing pointer is NULL.
-    // RE evidence: on real Apple HW, AGX kernel driver populates +0xa0
-    // during texture init with a CPU-mapped GPU memory address.  In
-    // chroot, SOME textures get that init (prev_base non-NULL — leave
-    // them alone), OTHERS hit the kIOReturnNoBandwidth gate before
-    // init populates the ivar (prev_base NULL — these are the ones
-    // that crash replaceRegion).  Only fill the NULL case so we don't
-    // clobber AGX's legitimate setup.
-    void *prev_base = *(void **)((char *)impl + 0xa0);
-    if (prev_base != NULL) {
-        static int skiplog = 0;
-        if (skiplog++ < 16) {
-            // 2026-06-20 — CONFIRMED SEPARATE-MEMORY: texture's CPU
-            // backing (+0xa0) != IOSurface base.  Now sample the
-            // backing's first 4 KB to see if the GPU rendered content
-            // THERE (→ copy backing→IOSurface fixes VNC) or if it's
-            // also zero (→ GPU truly not executing).  4 KB is safe for
-            // any real texture backing.
-            int nz = 0; uint64_t acc = 0;
-            for (int i = 0; i < 4096; i++) {
-                uint8_t v = ((volatile uint8_t *)prev_base)[i];
-                if (v) nz++; acc += v;
-            }
-            fprintf(stderr,
-                "#### AGX_WIRE_IOSURF: skip(AGX-set) tex=%p backing=%p IOSurf=%p "
-                "SEPARATE backing[0:4K] nonzero=%d sum=%llu\n",
-                (void *)tex, prev_base, base, nz, (unsigned long long)acc);
-        }
-        return;
-    }
-    *(void * volatile *)((char *)impl + 0xa0) = base;
-    *(volatile uint32_t *)((char *)impl + 0xa8) = 0;
-    static _Atomic int wired_count = 0;
-    int n = atomic_fetch_add(&wired_count, 1);
-    if (n < 16) {
+    IOSurfaceRef bound_surface =
+        *(IOSurfaceRef volatile *)((char *)impl + 0xa0);
+    uint32_t bound_plane = *(volatile uint32_t *)((char *)impl + 0xa8);
+    void *cpu_mapping = *(void * volatile *)((char *)impl + 0x130);
+    uint64_t gpu_mapping = *(volatile uint64_t *)((char *)impl + 0x40);
+    macws_texture_descriptor_witness descriptor = {0};
+    bool has_descriptor = macws_find_texture_descriptor(
+        impl, IOSurfaceGetWidth(surf), IOSurfaceGetHeight(surf), &descriptor);
+    static _Atomic int audit_count = 0;
+    int n = atomic_fetch_add(&audit_count, 1);
+    if (n < 32 || bound_surface != surf || cpu_mapping == NULL) {
         fprintf(stderr,
-            "#### AGX_WIRE_IOSURF #%d: tex=%p impl=%p +0xa0: NULL→%p layout=%d (lock_rc=%d)\n",
-            n, (void *)tex, impl, base, layout, lock_rc);
+            "#### AGX_MAP_AUDIT #%d tex=%p impl=%p iosurface(arg=%p bound=%p) "
+            "plane=%u cpu130=%p gpu40=%#llx descriptorOff=%#tx "
+            "descriptorLayout=%u compressed=%u extended=%u match=%d\n",
+            n, (void *)tex, impl, (void *)surf, (void *)bound_surface,
+            bound_plane, cpu_mapping, (unsigned long long)gpu_mapping,
+            has_descriptor ? descriptor.offset : (ptrdiff_t)-1,
+            has_descriptor ? descriptor.layout : 0,
+            has_descriptor ? descriptor.compressed : 0,
+            has_descriptor ? descriptor.extended : 0,
+            bound_surface == surf);
+        if (cpu_mapping == NULL) {
+            fprintf(stderr,
+                "#### AGX_MAP_AUDIT INVARIANT FAIL: real initializer left "
+                "Texture+0x130 NULL; no field synthesis performed\n");
+        }
+        if (bound_surface != surf) {
+            fprintf(stderr,
+                "#### AGX_MAP_AUDIT INVARIANT FAIL: Texture+0xa0 does not "
+                "match constructor IOSurfaceRef; no field synthesis performed\n");
+        }
+    }
+}
+
+// One-shot, read-only witness for the hardware Texture descriptor produced by
+// Apple's real initializer.  The /tmp/macws_res_diag sentinel already gates
+// the controlled native-AGX test, so this cannot add per-frame production log
+// traffic.  No descriptor field is modified here.
+static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
+                                                MTLTextureDescriptor *desc,
+                                                IOSurfaceRef surf,
+                                                id device) {
+    if (!tex || !desc || !surf || !device ||
+        desc.pixelFormat != (MTLPixelFormat)550 ||
+        desc.width != 2388 || desc.height != 1668 ||
+        access("/tmp/macws_res_diag", F_OK) != 0) {
+        return;
+    }
+    static _Atomic int dumped = 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&dumped, &expected, 1)) return;
+
+    ptrdiff_t impl_offset = 0x208;
+    Ivar iv = class_getInstanceVariable([tex class], "_impl");
+    if (iv) impl_offset = ivar_getOffset(iv);
+    void *impl = *(void **)((char *)(__bridge void *)tex + impl_offset);
+    if (!impl) {
+        fprintf(stderr,
+            "#### AGX_TEX_DESC pf550 impl=NULL tex=%p implOff=%#tx\n",
+            (void *)tex, impl_offset);
+        return;
+    }
+
+    macws_texture_descriptor_witness descriptor = {0};
+    if (!macws_find_texture_descriptor(impl, desc.width, desc.height,
+                                       &descriptor)) {
+        fprintf(stderr,
+            "#### AGX_TEX_DESC pf550 NOT-FOUND tex=%p impl=%p "
+            "implOff=%#tx scan=[0x140,0x240]\n",
+            (void *)tex, impl, impl_offset);
+        return;
+    }
+    char hex[sizeof(descriptor.bytes) * 2 + 1];
+    for (size_t i = 0; i < sizeof(descriptor.bytes); i++) {
+        snprintf(hex + i * 2, 3, "%02x", descriptor.bytes[i]);
+    }
+    fprintf(stderr,
+        "#### AGX_TEX_DESC pf550 tex=%p impl=%p implOff=%#tx descOff=%#tx "
+        "gpu40=%#llx layout=%u compressed=%u extended=%u "
+        "address=%#llx accelerationLow36=%#llx "
+        "accelerationRaw=%#llx bytes=%s\n",
+        (void *)tex, impl, impl_offset, descriptor.offset,
+        (unsigned long long)*(volatile uint64_t *)((char *)impl + 0x40),
+        descriptor.layout, descriptor.compressed, descriptor.extended,
+        (unsigned long long)descriptor.address,
+        (unsigned long long)descriptor.acceleration_low36,
+        (unsigned long long)descriptor.acceleration_raw, hex);
+
+    // Runtime-to-static anchors for the exact macOS 13.4 AGX image.  dladdr
+    // establishes the loaded image base; subtracting it and adding the
+    // text-cache __TEXT base makes the ensuing capstone disassembly
+    // reproducible without depending on one process's ASLR slide.
+    struct {
+        id receiver;
+        const char *selector;
+    } methods[] = {
+        { device, "initNewTextureData:" },
+        { tex, "updateBindDataWithAddresses:cpuMetadataAddress:gpuVirtualAddress:isCompressible:shouldInitMetadata:" },
+        { tex, "updateBindDataWithAddresses:gpuVirtualAddress:" },
+        { tex, "updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:" },
+    };
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+        Class cls = [methods[i].receiver class];
+        SEL sel = sel_registerName(methods[i].selector);
+        Method method = class_getInstanceMethod(cls, sel);
+        IMP imp = method ? method_getImplementation(method) : NULL;
+        Dl_info image = {0};
+        bool located = imp && dladdr((const void *)imp, &image) != 0;
+        uintptr_t static_address = located
+            ? (uintptr_t)imp - (uintptr_t)image.dli_fbase + 0x1e53dd000ULL
+            : 0;
+        fprintf(stderr,
+            "#### AGX_TEX_METHOD class=%s selector=%s imp=%p imageBase=%p "
+            "static=%#llx image=%s\n",
+            class_getName(cls), methods[i].selector, (void *)imp,
+            located ? image.dli_fbase : NULL,
+            (unsigned long long)static_address,
+            located && image.dli_fname ? image.dli_fname : "(unresolved)");
     }
 }
 
@@ -524,6 +1262,7 @@ static void macws_wire_iosurface_base_into_texture(id<MTLTexture> tex,
 // just after; concurrent creates would see each other's IDs, but in
 // practice WS serialises scanout texture creation.
 static _Atomic uint32_t s_current_iosurface_id = 0;
+static _Atomic uint64_t s_current_iosurface_compression_header_span = 0;
 
 __attribute__((visibility("default")))
 uint32_t macws_get_current_iosurface_id(void) {
@@ -533,6 +1272,77 @@ uint32_t macws_get_current_iosurface_id(void) {
 __attribute__((visibility("default")))
 void macws_set_current_iosurface_id(uint32_t id) {
     s_current_iosurface_id = id;
+}
+
+__attribute__((visibility("default")))
+uint64_t macws_get_current_iosurface_compression_header_span(void) {
+    return s_current_iosurface_compression_header_span;
+}
+
+__attribute__((visibility("default")))
+void macws_set_current_iosurface_compression_header_span(uint64_t span) {
+    s_current_iosurface_compression_header_span = span;
+}
+
+// iOS 16.3 AGX `-[AGXG13GFamilyDevice initNewTextureData:]` writes
+// args+0x58 as align_up(compressionMetadata+0x160, textureData+0x138).
+// For IOSurface-backed compressed planes, the observable equivalent is the
+// reserved header tail of that plane: (plane Offset + Size) minus
+// CompressedTileHeaderRegionOffset.  The iPad CA Framebuffer reports
+// 0x40000 for both planes, exactly matching native iOS's args+0x58.
+//
+// Keep this property-driven: private display formats may use a different
+// header reservation, and a hard-coded 0x40000 would merely hide the ABI
+// mismatch for this one surface geometry.
+static uint64_t macws_iosurface_compression_header_span(
+    IOSurfaceRef surface, NSUInteger plane) {
+    if (!surface) return 0;
+    uint64_t span = 0;
+    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    if (!copied) return 0;
+    @try {
+        NSDictionary *root = (__bridge NSDictionary *)copied;
+        id creationValue = root[@"CreationProperties"];
+        NSDictionary *creation =
+            [creationValue isKindOfClass:[NSDictionary class]]
+                ? (NSDictionary *)creationValue : root;
+        id planeInfoValue = creation[@"IOSurfacePlaneInfo"];
+        if ([planeInfoValue isKindOfClass:[NSArray class]]) {
+            NSArray *planeInfo = (NSArray *)planeInfoValue;
+            if (plane < [planeInfo count]) {
+                id planeValue = planeInfo[plane];
+                if ([planeValue isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *info = (NSDictionary *)planeValue;
+                    uint64_t compressionType =
+                        [(info[@"CompressionType"] ?:
+                           info[@"IOSurfacePlaneCompressionType"])
+                            unsignedLongLongValue];
+                    uint64_t offset =
+                        [(info[@"Offset"] ?: info[@"IOSurfacePlaneOffset"])
+                            unsignedLongLongValue];
+                    uint64_t size =
+                        [(info[@"Size"] ?: info[@"IOSurfacePlaneSize"])
+                            unsignedLongLongValue];
+                    uint64_t headerOffset =
+                        [(info[@"CompressedTileHeaderRegionOffset"] ?:
+                           info[@"IOSurfacePlaneCompressedTileHeaderRegionOffset"])
+                            unsignedLongLongValue];
+                    uint64_t end = offset + size;
+                    if (compressionType != 0 && end >= offset &&
+                        headerOffset >= offset && headerOffset < end) {
+                        span = end - headerOffset;
+                    }
+                }
+            }
+        }
+    } @catch (NSException *exception) {
+        fprintf(stderr,
+            "#### MTL_TEX compression metadata parse exception: %s\n",
+            [[exception description] UTF8String] ?: "?");
+        span = 0;
+    }
+    CFRelease(copied);
+    return span;
 }
 
 // FORCE_M1_DRIVER auto-enabled for the arm64e on-device slice only (see
@@ -1257,13 +2067,22 @@ static void macws_sigabrt_trampoline(int sig) {
     // into args[+0x30] for the sel=0xa type=0x82 path. Save/restore the
     // previous value to handle re-entry (shadow IOSurface fallback path).
     uint32_t prev_iosurface_id = macws_get_current_iosurface_id();
+    uint64_t prev_compression_header_span =
+        macws_get_current_iosurface_compression_header_span();
+    uint64_t compression_header_span =
+        macws_iosurface_compression_header_span(iosurface, plane);
     macws_set_current_iosurface_id(iosurface ? IOSurfaceGetID(iosurface) : 0);
+    macws_set_current_iosurface_compression_header_span(
+        compression_header_span);
     static int tls_log = 0;
     if (tls_log < 8) {
         fprintf(stderr,
-            "#### MTL_TEX TLS set iosurface=%p id=%#x (thread=%p addr=%p)\n",
-            iosurface, macws_get_current_iosurface_id(), (void*)pthread_self(),
-            NULL);
+            "#### MTL_TEX TLS set iosurface=%p id=%#x plane=%lu "
+            "compressionHeaderSpan=%#llx (thread=%p addr=%p)\n",
+            iosurface, macws_get_current_iosurface_id(),
+            (unsigned long)plane,
+            (unsigned long long)compression_header_span,
+            (void*)pthread_self(), NULL);
         tls_log++;
     }
 
@@ -1417,14 +2236,11 @@ static void macws_sigabrt_trampoline(int sig) {
     } else if (!result) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.NIL");
     }
-    // 2026-06-20 — Wire IOSurface base address into texture's writable
-    // backing pointer ivar (cpp+0xa0) ONLY when the AGX-set pointer is
-    // NULL (the failing chroot-AGX case).  Most textures already have
-    // a non-NULL +0xa0 set by AGX init — leave those alone (overwriting
-    // would clobber AGX's legitimate setup).  See
-    // macws_wire_iosurface_base_into_texture comment at top of file.
+    // Verify the real initializer established its IOSurface and CPU/GPU
+    // mappings.  This is read-only; field ownership stays inside AGX.
     if (result && iosurface) {
-        macws_wire_iosurface_base_into_texture(result, iosurface);
+        macws_audit_iosurface_texture_mapping(result, iosurface);
+        macws_diag_pf550_texture_descriptor(result, desc, iosurface, self);
     }
     // 2026-06-20 — VNC read-path test on the IOSURFACE VARIANT.  Filling
     // our pooled ROUTE-IOSURF surfaces with gray did NOT change VNC
@@ -1526,6 +2342,8 @@ static void macws_sigabrt_trampoline(int sig) {
         }
     }
     macws_set_current_iosurface_id(prev_iosurface_id);
+    macws_set_current_iosurface_compression_header_span(
+        prev_compression_header_span);
     return result;
 }
 
@@ -1745,7 +2563,17 @@ static void macws_sigabrt_trampoline(int sig) {
         //   MTLPixelFormatBGRA8Unorm_sRGB   = 81
         //   MTLPixelFormatRGBA16Float       = 115  (8 bpp)
         //   MTLPixelFormatR8Unorm           = 10   (1 bpp)
-        if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
+        if (pf == 552 || pf == 553) {
+            // MTLPixelFormatBGRA10_XR[_sRGB] is a 64-bit extended-range
+            // format (four 10-bit values stored in the MSBs of 16-bit
+            // little-endian components).  Apple's SDK pairs that layout
+            // with kCVPixelFormatType_40ARGBLEWideGamut ('w40a').
+            // Runtime validation requires bytesPerRow >= width * 8; the
+            // old unknown-format default used 4 B/px and aborted at
+            // _mtlValidateStrideTextureParameters for 64x64 (256 < 512).
+            fmt4cc = 'w40a'; bpe = 8;
+        }
+        else if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
         else if (pf == 10) { fmt4cc = 'L008'; bpe = 1; }
         else if (pf == 70 || pf == 71) { fmt4cc = 'RGBA'; bpe = 4; }
         // 2026-06-20 — IOSurface pool keyed by (w,h,pf,fmt4cc,bpe) to
@@ -2017,18 +2845,9 @@ static void macws_sigabrt_trampoline(int sig) {
                 }
             }
         }
-        // 2026-06-20 — Wire IOSurface base into the texture's +0xa0
-        // ivar so AGX::Texture::writeRegion's memmove has a valid
-        // dest pointer for CA's replaceRegion pixel uploads.  The
-        // `[self hooked_newTextureWithDescriptor:iosurface:plane:]`
-        // call above goes through swizzle and lands in the ORIGINAL
-        // Apple AGXG13GFamilyDevice impl (not our iosurface variant
-        // hook epilogue), so we must wire here too — duplicating the
-        // wire from the iosurface variant hook epilogue does NOT
-        // double-write because wire is idempotent on the same
-        // (impl+0xa0, base) pair.
+        // Read-only postcondition audit for the original Apple initializer.
         if (tex) {
-            macws_wire_iosurface_base_into_texture(tex, surf);
+            macws_audit_iosurface_texture_mapping(tex, surf);
         }
         // Read-path probe: also track surfaces arriving via the
         // AGXG13GFamilyDevice swizzle (different entry point than the
@@ -3306,9 +4125,30 @@ static void install_agx_init_redirect(Class agx) {
         self.storageMode = MTLStorageModeShared;
         return MTLStorageModeShared;
     }
-    if(mode == 3) { // MTLStorageModeMemoryless (iOS support is narrower than macOS)
-                    // → Private. Without this, Memoryless textures cause AGX kernel
-                    // to return kIOReturnBadArgument and layers render BLACK.
+    if(mode == 3 && getenv("MACWS_AGX_NATIVE")) {
+        // Preserve the descriptor's real memoryless semantics for native AGX.
+        //
+        // Runtime-confirmed via device-side LLDB (2026-07-23): this getter
+        // received MTLStorageModeMemoryless from MetalContext::StartComposite,
+        // then the old code mutated the descriptor to Private.  The subsequent
+        // hooked_newTextureWithDescriptor: call therefore missed its
+        // storageMode==Memoryless branch and wrapped a fresh 2388x1668 RGBA16F
+        // IOSurface from CA::OGL::MetalContext::add_memoryless_textures on every
+        // update.  1500 such type=0x82 resources represented 28.9 GiB of create
+        // traffic before WindowServer hit the 5120 MB EXC_RESOURCE watermark.
+        // Native AGX on this device advertises memoryless render-target support;
+        // leave mode 3 intact so the native texture path can allocate tile-memory
+        // metadata rather than system-memory backing.
+        static int native_memoryless_log = 0;
+        if (native_memoryless_log++ < 4) {
+            fprintf(stderr,
+                "#### MTL_TEX storageMode=Memoryless preserved for AGX-native descriptor=%p\n",
+                (void *)self);
+        }
+        return mode;
+    }
+    if(mode == 3) { // MTLSim's memoryless support is narrower than native AGX.
+                    // Keep the legacy simulator compatibility translation.
         self.storageMode = MTLStorageModePrivate;
         return MTLStorageModePrivate;
     }
