@@ -18,6 +18,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#import "MacWSControlClient.h"
+#include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
 
 static NSString *const MacWSFramePath =
@@ -628,6 +630,7 @@ static void MacWSLogMetalRegistryState(void) {
 
 @interface MacWSViewController : UIViewController <MacWSMetalViewStatusDelegate>
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier;
+- (void)performURLAction:(NSString *)action;
 @end
 
 static void MacWSRequestNewScene(UIScene *requestingScene,
@@ -649,15 +652,110 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 
 @implementation MacWSViewController {
     NSString *_sceneIdentifier;
+    MacWSControlClient *_controlClient;
+    UIVisualEffectView *_controlPanel;
+    UIButton *_showControlsButton;
+    UILabel *_serviceLabel;
+    UILabel *_phaseLabel;
+    UILabel *_rootfsLabel;
+    UILabel *_windowServerLabel;
+    UILabel *_bridgeLabel;
+    UILabel *_frameLabel;
     UILabel *_statusLabel;
     UILabel *_inputLabel;
+    UILabel *_noticeLabel;
+    UIButton *_primaryButton;
+    UIButton *_repairButton;
+    UIButton *_recoverButton;
+    UIButton *_captureButton;
+    UIButton *_logsButton;
+    UIButton *_exportButton;
+    UITextView *_logsView;
+    UISwitch *_experimentalSwitch;
+    NSArray<UIButton *> *_applicationButtons;
     MacWSMetalView *_metalView;
+    NSTimer *_statusTimer;
+    NSDictionary<NSString *, id> *_latestStatus;
+    BOOL _experimentalTouched;
+    NSString *_lastLoggedControlSummary;
 }
 
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier {
     self = [super initWithNibName:nil bundle:nil];
-    if (self) _sceneIdentifier = [identifier copy];
+    if (self) {
+        _sceneIdentifier = [identifier copy];
+        _controlClient = [MacWSControlClient new];
+        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+        if ([defaults objectForKey:@"MacWSExperimentalMode"] == nil)
+            [defaults setBool:YES forKey:@"MacWSExperimentalMode"];
+        _experimentalTouched = YES;
+    }
     return self;
+}
+
+static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
+    UILabel *label = [UILabel new];
+    label.text = text;
+    label.font = font;
+    label.textColor = color;
+    label.numberOfLines = 0;
+    return label;
+}
+
+- (UIButton *)buttonWithTitle:(NSString *)title image:(NSString *)imageName
+                        action:(SEL)action prominent:(BOOL)prominent {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButtonConfiguration *configuration = prominent
+        ? [UIButtonConfiguration filledButtonConfiguration]
+        : [UIButtonConfiguration tintedButtonConfiguration];
+    configuration.title = title;
+    configuration.image = [UIImage systemImageNamed:imageName];
+    configuration.imagePadding = 8;
+    configuration.cornerStyle = UIButtonConfigurationCornerStyleMedium;
+    button.configuration = configuration;
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return button;
+}
+
+- (void)setButton:(UIButton *)button title:(NSString *)title image:(NSString *)imageName {
+    UIButtonConfiguration *configuration = [button.configuration copy];
+    configuration.title = title;
+    configuration.image = [UIImage systemImageNamed:imageName];
+    button.configuration = configuration;
+}
+
+- (UIStackView *)statusRowWithTitle:(NSString *)title
+                              value:(UILabel * __strong *)valueOut {
+    UILabel *name = MacWSMakeLabel(title,
+        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline],
+        UIColor.secondaryLabelColor);
+    UILabel *value = MacWSMakeLabel(@"检查中…",
+        [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightSemibold],
+        UIColor.tertiaryLabelColor);
+    value.textAlignment = NSTextAlignmentRight;
+    [value setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                           forAxis:UILayoutConstraintAxisHorizontal];
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[name, value]];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.distribution = UIStackViewDistributionFill;
+    if (valueOut) *valueOut = value;
+    return row;
+}
+
+- (UIView *)divider {
+    UIView *line = [UIView new];
+    line.backgroundColor = [UIColor.separatorColor colorWithAlphaComponent:0.45];
+    [line.heightAnchor constraintEqualToConstant:0.5].active = YES;
+    return line;
+}
+
+- (UILabel *)sectionTitle:(NSString *)title {
+    UILabel *label = MacWSMakeLabel(title.uppercaseString,
+        [UIFont systemFontOfSize:11 weight:UIFontWeightBold],
+        UIColor.secondaryLabelColor);
+    label.accessibilityTraits = UIAccessibilityTraitHeader;
+    return label;
 }
 
 - (void)loadView {
@@ -671,73 +769,486 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     _metalView.sceneID = (uint64_t)_sceneIdentifier.hash;
     [root addSubview:_metalView];
 
-    UIVisualEffectView *panel = [[UIVisualEffectView alloc]
+    _controlPanel = [[UIVisualEffectView alloc]
         initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
-    panel.translatesAutoresizingMaskIntoConstraints = NO;
-    panel.layer.cornerRadius = 14;
-    panel.clipsToBounds = YES;
-    [root addSubview:panel];
+    _controlPanel.translatesAutoresizingMaskIntoConstraints = NO;
+    _controlPanel.layer.cornerRadius = 22;
+    _controlPanel.layer.cornerCurve = kCACornerCurveContinuous;
+    _controlPanel.clipsToBounds = YES;
+    [root addSubview:_controlPanel];
 
-    UILabel *title = [UILabel new];
-    title.text = @"MacWS · 原生 AGX 画面";
-    title.textColor = UIColor.whiteColor;
-    title.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
-    title.translatesAutoresizingMaskIntoConstraints = NO;
+    UIScrollView *scroll = [UIScrollView new];
+    scroll.translatesAutoresizingMaskIntoConstraints = NO;
+    scroll.alwaysBounceVertical = YES;
+    scroll.showsVerticalScrollIndicator = YES;
+    [_controlPanel.contentView addSubview:scroll];
+
+    UILabel *title = MacWSMakeLabel(@"MacWS 控制中心",
+        [UIFont systemFontOfSize:23 weight:UIFontWeightBold], UIColor.labelColor);
+    UILabel *subtitle = MacWSMakeLabel(@"iPadOS 原生窗口 · macOS AGX 工作区",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote],
+        UIColor.secondaryLabelColor);
+    UIStackView *titleLabels = [[UIStackView alloc] initWithArrangedSubviews:@[title, subtitle]];
+    titleLabels.axis = UILayoutConstraintAxisVertical;
+    titleLabels.spacing = 1;
+
+    UIButton *hide = [self buttonWithTitle:@"" image:@"sidebar.left"
+                                    action:@selector(hideControls) prominent:NO];
+    UIButtonConfiguration *hideConfiguration = [hide.configuration copy];
+    hideConfiguration.contentInsets = NSDirectionalEdgeInsetsMake(8, 10, 8, 10);
+    hide.configuration = hideConfiguration;
+    [hide.widthAnchor constraintEqualToConstant:52].active = YES;
+    [hide setContentHuggingPriority:UILayoutPriorityRequired
+                           forAxis:UILayoutConstraintAxisHorizontal];
+    [hide setContentCompressionResistancePriority:UILayoutPriorityRequired
+                                           forAxis:UILayoutConstraintAxisHorizontal];
+    UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[titleLabels, hide]];
+    header.axis = UILayoutConstraintAxisHorizontal;
+    header.alignment = UIStackViewAlignmentCenter;
+    header.spacing = 12;
+
+    _serviceLabel = MacWSMakeLabel(@"正在连接 root 控制服务…",
+        [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightSemibold],
+        UIColor.systemOrangeColor);
+    _phaseLabel = MacWSMakeLabel(@"打开 App 后会自动检查重启恢复状态",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote],
+        UIColor.secondaryLabelColor);
+
+    UIStackView *serviceCard = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_serviceLabel, _phaseLabel]];
+    serviceCard.axis = UILayoutConstraintAxisVertical;
+    serviceCard.spacing = 5;
+    serviceCard.layoutMargins = UIEdgeInsetsMake(12, 13, 12, 13);
+    serviceCard.layoutMarginsRelativeArrangement = YES;
+    serviceCard.backgroundColor = [UIColor.secondarySystemFillColor colorWithAlphaComponent:0.48];
+    serviceCard.layer.cornerRadius = 12;
+
+    UIStackView *statusRows = [[UIStackView alloc] initWithArrangedSubviews:@[
+        [self statusRowWithTitle:@"macOS RootFS" value:&_rootfsLabel],
+        [self divider],
+        [self statusRowWithTitle:@"WindowServer" value:&_windowServerLabel],
+        [self divider],
+        [self statusRowWithTitle:@"触控桥" value:&_bridgeLabel],
+        [self divider],
+        [self statusRowWithTitle:@"共享帧" value:&_frameLabel],
+    ]];
+    statusRows.axis = UILayoutConstraintAxisVertical;
+    statusRows.spacing = 8;
+    statusRows.layoutMargins = UIEdgeInsetsMake(12, 13, 12, 13);
+    statusRows.layoutMarginsRelativeArrangement = YES;
+    statusRows.backgroundColor = [UIColor.tertiarySystemFillColor colorWithAlphaComponent:0.42];
+    statusRows.layer.cornerRadius = 12;
+
+    _primaryButton = [self buttonWithTitle:@"初始化并启动" image:@"play.fill"
+                                    action:@selector(primaryAction) prominent:YES];
+    [_primaryButton.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
+
+    UILabel *experimentalText = MacWSMakeLabel(@"实验兼容模式",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
+    UILabel *experimentalDetail = MacWSMakeLabel(
+        @"启用已记录的命令 ABI / completion 诊断脚手架；不是根因修复。",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
+        UIColor.systemOrangeColor);
+    UIStackView *experimentalLabels = [[UIStackView alloc]
+        initWithArrangedSubviews:@[experimentalText, experimentalDetail]];
+    experimentalLabels.axis = UILayoutConstraintAxisVertical;
+    experimentalLabels.spacing = 2;
+    _experimentalSwitch = [UISwitch new];
+    _experimentalSwitch.on = [NSUserDefaults.standardUserDefaults
+        boolForKey:@"MacWSExperimentalMode"];
+    [_experimentalSwitch addTarget:self action:@selector(experimentalChanged:)
+                  forControlEvents:UIControlEventValueChanged];
+    UIStackView *experimentalRow = [[UIStackView alloc]
+        initWithArrangedSubviews:@[experimentalLabels, _experimentalSwitch]];
+    experimentalRow.axis = UILayoutConstraintAxisHorizontal;
+    experimentalRow.alignment = UIStackViewAlignmentCenter;
+    experimentalRow.spacing = 10;
+
+    UIButton *glassDemo = [self buttonWithTitle:@"GlassDemo" image:@"sparkles.rectangle.stack"
+                                         action:@selector(launchApplication:) prominent:NO];
+    glassDemo.accessibilityIdentifier = @"glassdemo";
+    UIButton *terminal = [self buttonWithTitle:@"终端" image:@"terminal"
+                                        action:@selector(launchApplication:) prominent:NO];
+    terminal.accessibilityIdentifier = @"terminal";
+    UIButton *activity = [self buttonWithTitle:@"活动监视器" image:@"waveform.path.ecg.rectangle"
+                                        action:@selector(launchApplication:) prominent:NO];
+    activity.accessibilityIdentifier = @"activity-monitor";
+    UIButton *finder = [self buttonWithTitle:@"Finder" image:@"folder"
+                                      action:@selector(launchApplication:) prominent:NO];
+    finder.accessibilityIdentifier = @"finder";
+    _applicationButtons = @[glassDemo, terminal, activity, finder];
+    UIStackView *appRow1 = [[UIStackView alloc] initWithArrangedSubviews:@[glassDemo, terminal]];
+    UIStackView *appRow2 = [[UIStackView alloc] initWithArrangedSubviews:@[activity, finder]];
+    for (UIStackView *row in @[appRow1, appRow2]) {
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.distribution = UIStackViewDistributionFillEqually;
+        row.spacing = 8;
+    }
+
+    _captureButton = [self buttonWithTitle:@"刷新画面" image:@"camera.viewfinder"
+                                    action:@selector(captureAction) prominent:NO];
+    _repairButton = [self buttonWithTitle:@"修复环境" image:@"wrench.and.screwdriver"
+                                   action:@selector(repairAction) prominent:NO];
+    _recoverButton = [self buttonWithTitle:@"安全恢复" image:@"lifepreserver"
+                                    action:@selector(recoverAction) prominent:NO];
+    _logsButton = [self buttonWithTitle:@"查看日志" image:@"doc.text.magnifyingglass"
+                                 action:@selector(logsAction) prominent:NO];
+    _exportButton = [self buttonWithTitle:@"导出诊断" image:@"square.and.arrow.up"
+                                   action:@selector(exportDiagnostics) prominent:NO];
+    UIStackView *toolRow1 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_captureButton, _repairButton]];
+    UIStackView *toolRow2 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_recoverButton, _logsButton]];
+    for (UIStackView *row in @[toolRow1, toolRow2]) {
+        row.axis = UILayoutConstraintAxisHorizontal;
+        row.distribution = UIStackViewDistributionFillEqually;
+        row.spacing = 8;
+    }
 
     _statusLabel = [UILabel new];
-    _statusLabel.text = @"正在连接 WindowServer 共享帧…";
+    _statusLabel.text = @"画面：正在连接 WindowServer 共享帧…";
     _statusLabel.textColor = UIColor.secondaryLabelColor;
     _statusLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _statusLabel.numberOfLines = 0;
 
     _inputLabel = [UILabel new];
-    _inputLabel.text = @"触控桥：M0 坐标验证";
+    _inputLabel.text = @"触控：等待桥接服务";
     _inputLabel.textColor = UIColor.systemCyanColor;
     _inputLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
-    _inputLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _inputLabel.numberOfLines = 0;
 
-    UIButton *newWindow = [UIButton buttonWithType:UIButtonTypeSystem];
-    [newWindow setTitle:@"新建窗口" forState:UIControlStateNormal];
-    [newWindow addTarget:self action:@selector(openNewWindow)
-        forControlEvents:UIControlEventTouchUpInside];
-    newWindow.translatesAutoresizingMaskIntoConstraints = NO;
+    _noticeLabel = MacWSMakeLabel(@"",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote],
+        UIColor.systemCyanColor);
+    _noticeLabel.hidden = YES;
 
-    UIStackView *labels = [[UIStackView alloc]
-        initWithArrangedSubviews:@[title, _statusLabel, _inputLabel]];
-    labels.axis = UILayoutConstraintAxisVertical;
-    labels.spacing = 2;
-    labels.translatesAutoresizingMaskIntoConstraints = NO;
-    [panel.contentView addSubview:labels];
-    [panel.contentView addSubview:newWindow];
+    _logsView = [UITextView new];
+    _logsView.editable = NO;
+    _logsView.selectable = YES;
+    _logsView.backgroundColor = [UIColor.blackColor colorWithAlphaComponent:0.35];
+    _logsView.textColor = UIColor.systemGreenColor;
+    _logsView.font = [UIFont monospacedSystemFontOfSize:10 weight:UIFontWeightRegular];
+    _logsView.layer.cornerRadius = 10;
+    _logsView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    _logsView.hidden = YES;
+    [_logsView.heightAnchor constraintEqualToConstant:220].active = YES;
+
+    UIStackView *content = [[UIStackView alloc] initWithArrangedSubviews:@[
+        header,
+        serviceCard,
+        [self sectionTitle:@"系统状态"],
+        statusRows,
+        _primaryButton,
+        experimentalRow,
+        [self sectionTitle:@"macOS 应用"],
+        appRow1,
+        appRow2,
+        [self sectionTitle:@"工具与恢复"],
+        toolRow1,
+        toolRow2,
+        _exportButton,
+        _noticeLabel,
+        [self divider],
+        _statusLabel,
+        _inputLabel,
+        _logsView,
+    ]];
+    content.axis = UILayoutConstraintAxisVertical;
+    content.spacing = 10;
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    content.layoutMargins = UIEdgeInsetsMake(18, 18, 18, 18);
+    content.layoutMarginsRelativeArrangement = YES;
+    [scroll addSubview:content];
+
+    _showControlsButton = [self buttonWithTitle:@"控制中心" image:@"sidebar.left"
+                                         action:@selector(showControls) prominent:YES];
+    _showControlsButton.translatesAutoresizingMaskIntoConstraints = NO;
+    _showControlsButton.hidden = YES;
+    [root addSubview:_showControlsButton];
 
     UILayoutGuide *safe = root.safeAreaLayoutGuide;
+    NSLayoutConstraint *responsiveWidth = [_controlPanel.widthAnchor
+        constraintEqualToAnchor:safe.widthAnchor multiplier:0.92];
+    responsiveWidth.priority = 999;
     [NSLayoutConstraint activateConstraints:@[
         [_metalView.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
         [_metalView.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
         [_metalView.topAnchor constraintEqualToAnchor:root.topAnchor],
         [_metalView.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
-        [panel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [panel.trailingAnchor constraintLessThanOrEqualToAnchor:safe.trailingAnchor constant:-12],
-        [panel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
-        [labels.leadingAnchor constraintEqualToAnchor:panel.contentView.leadingAnchor constant:14],
-        [labels.topAnchor constraintEqualToAnchor:panel.contentView.topAnchor constant:10],
-        [labels.bottomAnchor constraintEqualToAnchor:panel.contentView.bottomAnchor constant:-10],
-        [newWindow.leadingAnchor constraintEqualToAnchor:labels.trailingAnchor constant:18],
-        [newWindow.trailingAnchor constraintEqualToAnchor:panel.contentView.trailingAnchor constant:-14],
-        [newWindow.centerYAnchor constraintEqualToAnchor:panel.contentView.centerYAnchor],
+        [_controlPanel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [_controlPanel.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
+        [_controlPanel.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
+        [_controlPanel.widthAnchor constraintLessThanOrEqualToConstant:420],
+        responsiveWidth,
+        [scroll.leadingAnchor constraintEqualToAnchor:_controlPanel.contentView.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:_controlPanel.contentView.trailingAnchor],
+        [scroll.topAnchor constraintEqualToAnchor:_controlPanel.contentView.topAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:_controlPanel.contentView.bottomAnchor],
+        [content.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
+        [content.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
+        [content.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
+        [content.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
+        [content.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
+        [_showControlsButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [_showControlsButton.topAnchor constraintEqualToAnchor:safe.topAnchor constant:12],
     ]];
 }
 
-- (void)openNewWindow {
-    MacWSRequestNewScene(self.view.window.windowScene, ^(NSError *error) {
-        self->_statusLabel.text = [NSString stringWithFormat:@"新建窗口失败: %@",
-                                   error.localizedDescription];
-    });
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self refreshStatus];
+    [_statusTimer invalidate];
+    _statusTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self
+        selector:@selector(refreshStatus) userInfo:nil repeats:YES];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [_statusTimer invalidate];
+    _statusTimer = nil;
+}
+
+- (void)hideControls {
+    _controlPanel.hidden = YES;
+    _showControlsButton.hidden = NO;
+}
+
+- (void)showControls {
+    _controlPanel.hidden = NO;
+    _showControlsButton.hidden = YES;
+}
+
+- (void)setNotice:(NSString *)notice success:(BOOL)success {
+    _noticeLabel.hidden = notice.length == 0;
+    _noticeLabel.text = notice;
+    _noticeLabel.textColor = success ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
+}
+
+- (void)setControlsEnabled:(BOOL)enabled {
+    _primaryButton.enabled = enabled;
+    _repairButton.enabled = enabled;
+    _recoverButton.enabled = enabled;
+    _captureButton.enabled = enabled;
+    _exportButton.enabled = enabled;
+    _experimentalSwitch.enabled = enabled;
+    for (UIButton *button in _applicationButtons) button.enabled = enabled;
+}
+
+- (void)refreshStatus {
+    [_controlClient fetchStatus:^(NSDictionary<NSString *,id> *reply) {
+        [self applyStatus:reply];
+    }];
+}
+
+- (void)applyStatus:(NSDictionary<NSString *, id> *)status {
+    _latestStatus = status;
+    BOOL connected = ![status[@"connection_error"] boolValue];
+    BOOL busy = [status[@"busy"] boolValue];
+    BOOL rootfs = [status[@"rootfs_ready"] boolValue];
+    BOOL ws = [status[@"windowserver_running"] boolValue];
+    BOOL input = [status[@"input_running"] boolValue];
+    BOOL frame = [status[@"frame_ready"] boolValue];
+    NSString *controlSummary = [NSString stringWithFormat:
+        @"connected=%@ busy=%@ rootfs=%@ ws=%@ input=%@ frame=%@ phase=%@ error=%@",
+        connected ? @"YES" : @"NO", busy ? @"YES" : @"NO",
+        rootfs ? @"YES" : @"NO", ws ? @"YES" : @"NO",
+        input ? @"YES" : @"NO", frame ? @"YES" : @"NO",
+        status[@"phase"] ?: @"", status[@"last_error"] ?: @""];
+    if (![_lastLoggedControlSummary isEqualToString:controlSummary]) {
+        _lastLoggedControlSummary = controlSummary;
+        MacWSLog(@"control-status %@", controlSummary);
+    }
+    _serviceLabel.text = connected ? @"● root 控制服务已连接" : @"● root 控制服务离线";
+    _serviceLabel.textColor = connected ? UIColor.systemGreenColor : UIColor.systemRedColor;
+    _phaseLabel.text = status[@"phase"] ?: status[@"message"] ?: @"等待状态";
+    _rootfsLabel.text = rootfs ? @"就绪" : @"缺失/未挂载";
+    _rootfsLabel.textColor = rootfs ? UIColor.systemGreenColor : UIColor.systemRedColor;
+    NSInteger wsPID = [status[@"windowserver_pid"] integerValue];
+    _windowServerLabel.text = ws ? [NSString stringWithFormat:@"运行中 · %ld", (long)wsPID] : @"已停止";
+    _windowServerLabel.textColor = ws ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
+    _bridgeLabel.text = input ? @"在线" : @"离线";
+    _bridgeLabel.textColor = input ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
+    if (frame) {
+        _frameLabel.text = [NSString stringWithFormat:@"%@×%@",
+                            status[@"frame_width"], status[@"frame_height"]];
+        _frameLabel.textColor = UIColor.systemGreenColor;
+    } else {
+        _frameLabel.text = @"等待首帧";
+        _frameLabel.textColor = UIColor.systemOrangeColor;
+    }
+    if (!_experimentalTouched || ws) {
+        _experimentalSwitch.on = [status[@"experimental_mode"] boolValue];
+    }
+    NSString *lastError = status[@"last_error"];
+    if (lastError.length) [self setNotice:lastError success:NO];
+
+    [self setControlsEnabled:connected && !busy];
+    if (busy) {
+        [self setButton:_primaryButton title:status[@"phase"] ?: @"处理中…"
+                   image:@"hourglass"];
+    } else if (ws) {
+        [self setButton:_primaryButton title:@"停止 macOS" image:@"stop.fill"];
+    } else {
+        [self setButton:_primaryButton
+                  title:rootfs ? @"启动 macOS 工作区" : @"初始化并启动"
+                  image:@"play.fill"];
+    }
+
+    NSDictionary<NSString *, NSString *> *availability = @{
+        @"glassdemo": @"glassdemo_available",
+        @"terminal": @"terminal_available",
+        @"activity-monitor": @"activity_monitor_available",
+        @"finder": @"finder_available",
+    };
+    for (UIButton *button in _applicationButtons) {
+        BOOL available = [status[availability[button.accessibilityIdentifier]] boolValue];
+        button.enabled = connected && !busy && ws && available;
+    }
+}
+
+- (void)runOperation:(NSString *)operation arguments:(NSDictionary *)arguments {
+    [self setControlsEnabled:NO];
+    [self setNotice:@"操作已提交，请保持 App 在前台…" success:YES];
+    [_controlClient performOperation:operation arguments:arguments
+        completion:^(NSDictionary<NSString *,id> *reply) {
+            BOOL ok = [reply[@"ok"] boolValue];
+            [self setNotice:reply[@"message"] ?: @"操作完成" success:ok];
+            [self applyStatus:reply];
+            [self refreshStatus];
+        }];
+}
+
+- (void)primaryAction {
+    if ([_latestStatus[@"windowserver_running"] boolValue]) {
+        [self runOperation:@MACWS_CONTROL_OP_STOP arguments:nil];
+    } else {
+        [self setControlsEnabled:NO];
+        [self setNotice:_experimentalSwitch.isOn
+            ? @"正在用实验兼容模式启动；诊断脚手架会写入日志。"
+            : @"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
+        [_controlClient startWithExperimentalMode:_experimentalSwitch.isOn
+            completion:^(NSDictionary<NSString *,id> *reply) {
+                BOOL ok = [reply[@"ok"] boolValue];
+                [self setNotice:reply[@"message"] ?: @"启动完成" success:ok];
+                [self applyStatus:reply];
+                [self refreshStatus];
+            }];
+    }
+}
+
+- (void)experimentalChanged:(UISwitch *)sender {
+    _experimentalTouched = YES;
+    [NSUserDefaults.standardUserDefaults setBool:sender.isOn
+                                          forKey:@"MacWSExperimentalMode"];
+    NSString *state = sender.isOn ? @"已选择实验兼容模式，将在下次启动时生效。" :
+        @"已选择标准模式，将在下次启动时移除诊断脚手架。";
+    [self setNotice:state success:!sender.isOn];
+}
+
+- (void)launchApplication:(UIButton *)sender {
+    [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
+             arguments:@{@MACWS_CONTROL_KEY_APP_ID: sender.accessibilityIdentifier ?: @""}];
+}
+
+- (void)captureAction {
+    [self runOperation:@MACWS_CONTROL_OP_CAPTURE arguments:nil];
+}
+
+- (void)repairAction {
+    [self runOperation:@MACWS_CONTROL_OP_REPAIR arguments:nil];
+}
+
+- (void)recoverAction {
+    [self runOperation:@MACWS_CONTROL_OP_RECOVER arguments:nil];
+}
+
+- (void)logsAction {
+    if (!_logsView.hidden) {
+        _logsView.hidden = YES;
+        [self setButton:_logsButton title:@"查看日志" image:@"doc.text.magnifyingglass"];
+        return;
+    }
+    [self setButton:_logsButton title:@"收起日志" image:@"doc.text.magnifyingglass"];
+    [_controlClient fetchLogs:^(NSDictionary<NSString *,id> *reply) {
+        NSString *text = [NSString stringWithFormat:
+            @"=== macwshostd ===\n%@\n\n=== WindowServer ===\n%@\n\n=== input ===\n%@\n\n=== postinst ===\n%@",
+            reply[@"hostd_log"] ?: @"", reply[@"windowserver_log"] ?: @"",
+            reply[@"input_log"] ?: @"", reply[@"postinst_log"] ?: @""];
+        self->_logsView.text = text;
+        self->_logsView.hidden = NO;
+        if (text.length) [self->_logsView scrollRangeToVisible:NSMakeRange(text.length - 1, 1)];
+    }];
+}
+
+- (NSURL *)writeHostUISnapshot {
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.scale = UIScreen.mainScreen.scale;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:self.view.bounds.size format:format];
+    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        (void)context;
+        [self.view drawViewHierarchyInRect:self.view.bounds afterScreenUpdates:YES];
+    }];
+    NSData *png = UIImagePNGRepresentation(image);
+    NSString *path = @"/var/mobile/Library/Logs/MacWSHost-ui.png";
+    BOOL written = [png writeToFile:path options:NSDataWritingAtomic error:nil];
+    MacWSLog(@"ui-snapshot written=%@ bytes=%lu path=%@",
+             written ? @"YES" : @"NO", (unsigned long)png.length, path);
+    return written ? [NSURL fileURLWithPath:path] : nil;
+}
+
+- (void)exportDiagnostics {
+    NSURL *snapshot = [self writeHostUISnapshot];
+    [_controlClient fetchLogs:^(NSDictionary<NSString *,id> *reply) {
+        NSString *text = [NSString stringWithFormat:
+            @"MacWS Host diagnostics\n%@\n\n=== macwshostd ===\n%@\n\n=== WindowServer ===\n%@\n\n=== input ===\n%@\n\n=== postinst ===\n%@",
+            self->_latestStatus ?: @{}, reply[@"hostd_log"] ?: @"",
+            reply[@"windowserver_log"] ?: @"", reply[@"input_log"] ?: @"",
+            reply[@"postinst_log"] ?: @""];
+        NSString *path = @"/var/mobile/Library/Logs/MacWSHost-diagnostics.txt";
+        [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSMutableArray *items = [NSMutableArray arrayWithObject:[NSURL fileURLWithPath:path]];
+        if (snapshot) [items addObject:snapshot];
+        UIActivityViewController *activity = [[UIActivityViewController alloc]
+            initWithActivityItems:items applicationActivities:nil];
+        activity.popoverPresentationController.sourceView = self->_exportButton;
+        activity.popoverPresentationController.sourceRect = self->_exportButton.bounds;
+        [self presentViewController:activity animated:YES completion:nil];
+    }];
+}
+
+- (void)performURLAction:(NSString *)action {
+    MacWSLog(@"url-control action=%@", action);
+    if ([action isEqualToString:@"status"] || action.length == 0) {
+        [self refreshStatus];
+    } else if ([action isEqualToString:@"start"] ||
+               [action isEqualToString:@"start-experimental"]) {
+        if (![_latestStatus[@"windowserver_running"] boolValue]) {
+            _experimentalSwitch.on = [action isEqualToString:@"start-experimental"];
+            [self experimentalChanged:_experimentalSwitch];
+            [self primaryAction];
+        } else {
+            [self setNotice:@"macOS 工作区已经在运行" success:YES];
+        }
+    } else if ([action isEqualToString:@"stop"]) {
+        [self runOperation:@MACWS_CONTROL_OP_STOP arguments:nil];
+    } else if ([action isEqualToString:@"glassdemo"]) {
+        [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
+                 arguments:@{@MACWS_CONTROL_KEY_APP_ID: @"glassdemo"}];
+    } else if ([action isEqualToString:@"recover"]) {
+        [self recoverAction];
+    } else if ([action isEqualToString:@"repair"]) {
+        [self repairAction];
+    } else if ([action isEqualToString:@"capture"]) {
+        [self captureAction];
+    } else if ([action isEqualToString:@"screenshot-ui"]) {
+        [self writeHostUISnapshot];
+    }
 }
 
 - (void)metalView:(MacWSMetalView *)view statusChanged:(NSString *)status {
     (void)view;
-    _statusLabel.text = status;
+    _statusLabel.text = [@"画面：" stringByAppendingString:status];
 }
 
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
@@ -771,7 +1282,6 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 - (void)scene:(UIScene *)scene
     willConnectToSession:(UISceneSession *)session
                  options:(UISceneConnectionOptions *)connectionOptions {
-    (void)connectionOptions;
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     UIWindowScene *windowScene = (UIWindowScene *)scene;
     NSString *shortID = session.persistentIdentifier;
@@ -784,6 +1294,12 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     [self.window makeKeyAndVisible];
     MacWSLog(@"scene-connected id=%@ role=%@", session.persistentIdentifier,
              session.role);
+    if (connectionOptions.URLContexts.count) {
+        NSSet<UIOpenURLContext *> *contexts = connectionOptions.URLContexts;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self scene:scene openURLContexts:contexts];
+        });
+    }
 }
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
@@ -829,6 +1345,14 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
             MacWSLog(@"input-v2 synthetic transport=%@ errno=%d scene=%llx point=(%.2f,%.2f) frame=%ux%u",
                      sent ? @"sent" : @"failed", sendError, record.sceneID,
                      record.x, record.y, record.frameWidth, record.frameHeight);
+            break;
+        }
+        NSString *host = context.URL.host ?: @"status";
+        if ([@[@"status", @"start", @"start-experimental", @"stop",
+               @"glassdemo", @"recover", @"repair", @"capture",
+               @"screenshot-ui"] containsObject:host]) {
+            MacWSViewController *controller = (MacWSViewController *)self.window.rootViewController;
+            [controller performURLAction:host];
             break;
         }
     }

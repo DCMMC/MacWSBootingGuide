@@ -78,6 +78,8 @@ WD_RESTART_LIMIT=12  # WindowServer restarts within WD_WINDOW that means "crash 
                      #  is annoying but not yet runaway — only stop if it's much worse)
 WD_WINDOW=45         # seconds — restart-counting window
 WD_POLL=5            # seconds between checks
+WD_LOAD_GRACE=90      # inherited 1-min load average is stale after userspace restart;
+                      # restart-storm protection remains active during this grace period
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
@@ -119,9 +121,10 @@ load1_int() {
 # Watchdog loop (runs iOS-side, backgrounded by `start`). Stops the GUI if
 # WindowServer crash-loops or the load average runs away.
 run_watchdog() {
-    local last_pid="" restarts=0 t0 now pid L
+    local last_pid="" restarts=0 t0 started now pid L load_runaway
     t0=$(date +%s)
-    log "watchdog: armed (load>=$WD_LOAD_LIMIT or >=$WD_RESTART_LIMIT WS restarts / ${WD_WINDOW}s -> auto-stop)"
+    started=$t0
+    log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace or >=$WD_RESTART_LIMIT WS restarts / ${WD_WINDOW}s -> auto-stop)"
     while :; do
         sleep "$WD_POLL"
         # Exit only when the GUI was actually torn down (the WindowServer launchd
@@ -140,7 +143,11 @@ run_watchdog() {
         now=$(date +%s)
         if [ $((now - t0)) -ge "$WD_WINDOW" ]; then restarts=0; t0=$now; fi
         L=$(load1_int); [ -z "$L" ] && L=0
-        if [ "$L" -ge "$WD_LOAD_LIMIT" ] || [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
+        load_runaway=0
+        if [ $((now - started)) -ge "$WD_LOAD_GRACE" ] && [ "$L" -ge "$WD_LOAD_LIMIT" ]; then
+            load_runaway=1
+        fi
+        if [ "$load_runaway" -eq 1 ] || [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
             log "watchdog: RUNAWAY detected (load=$L, WS restarts=$restarts) -> stopping GUI to protect the device"
             stop_all
             return 0

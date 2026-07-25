@@ -124,10 +124,18 @@ sudo python3 "$SCRIPT_DIR/set_macos_version.py" /var/jb/usr/macOS/lib/libmachook
 LIB=/var/jb/usr/macOS/lib/libmachook.dylib
 LIB_ARM64=/var/jb/usr/macOS/lib/libmachook_arm64.dylib
 echo "==> Splitting fat libmachook into thin arm64e + thin arm64..."
-sudo cp "$LIB" "/tmp/libmachook_fat.$$.dylib"
-sudo lipo "/tmp/libmachook_fat.$$.dylib" -thin arm64e -output "$LIB"
-sudo lipo "/tmp/libmachook_fat.$$.dylib" -thin arm64  -output "$LIB_ARM64"
-sudo rm -f "/tmp/libmachook_fat.$$.dylib"
+if lipo -info "$LIB" 2>&1 | grep -q 'Architectures in the fat file'; then
+    sudo cp "$LIB" "/tmp/libmachook_fat.$$.dylib"
+    sudo lipo "/tmp/libmachook_fat.$$.dylib" -thin arm64e -output "$LIB"
+    sudo lipo "/tmp/libmachook_fat.$$.dylib" -thin arm64  -output "$LIB_ARM64"
+    sudo rm -f "/tmp/libmachook_fat.$$.dylib"
+else
+    echo "==> Package postinst already installed thin slices; keeping them."
+    [ -f "$LIB_ARM64" ] || {
+        echo "Error: package postinst left no arm64 libmachook slice" >&2
+        exit 1
+    }
+fi
 
 # Re-sign both thin dylibs (signature was invalidated by set_macos_version + split).
 #

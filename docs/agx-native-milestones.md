@@ -1045,6 +1045,40 @@ failure path and all verbatim evidence are in
 and
 [`docs/evidence/ipados-native-host-input-m2-20260725.txt`](evidence/ipados-native-host-input-m2-20260725.txt).
 
+## 2026-07-26: M3 App control center owns cold start, repair, capture, and recovery
+
+`MacWSHost` 0.3 now talks to the root `com.macwsguide.host.control` XPC service
+through a typed, fixed-operation protocol. The matching `macwshostd`
+LaunchDaemon starts at bootstrap load and is the only component allowed to run
+the fixed GUI/recovery scripts or launch four compiled-in macOS application
+paths. The UIKit glass panel exposes live rootfs, WindowServer, input, and frame
+state plus start/stop, app launch, repair, safe recovery, log, screenshot, and
+diagnostic-export controls. VNC is not started.
+
+The first end-to-end package test caught two real cold-install bugs. The deb's
+fat hook still carried `platform IOS`, causing an arm64e bash SIGTRAP in
+`os_variant_has_internal_diagnostics`; after correcting the platform, dyld
+then exposed an asymmetric native-only declaration/call. The production fix
+puts the native call under its actual compile condition and makes package
+postinst/App repair perform platform conversion, thin arm64e+arm64 extraction,
+double signing, and trust registration at the upstream install boundary. A
+fresh package install emitted the thin-split witness before the build helper
+ran, and the helper correctly kept those already-installed slices.
+
+After a userspace reboot, only hostd was initially present. Cold-launching the
+App brought up WindowServer and `macwsinputd`, reported `ws=YES input=YES`, and
+presented a completed nonzero 2388x1668 frame on `Apple M1 GPU`. The App's
+version-2 input diagnostic mapped `(400,300)` to Quartz `(200,150)` and observed
+the posted cursor location. App-launched GlassDemo then produced a native tile
+pipeline with `contract=OK error=nil`, correct independent control pixels, and
+a 2388x1668 capture with 2,861 sampled nonzero pixels.
+
+The default-on compatibility switch remains explicitly labelled diagnostic
+scaffolding; M3 is a usable full-display host, not the final per-window native
+iPadOS architecture. Verbatim runtime lines, package hashes, and the reboot
+boundary are in
+[`docs/evidence/ipados-native-host-control-m3-20260726.txt`](evidence/ipados-native-host-control-m3-20260726.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator

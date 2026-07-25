@@ -1893,10 +1893,12 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // IOMFB's function or import slot.  Install that narrow observer only
         // when explicitly requested before this image loads; with no sentinel
         // the baseline is byte-for-byte untouched.
+#ifdef FORCE_M1_DRIVER
         if (atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
             access("/tmp/macws_cancel_completion", F_OK) == 0) {
             macws_install_quartzcore_frame_info_hook(header);
         }
+#endif
         // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
         // content gets a GPU surface instead of a CPU bitmap (see OFF_ comment above).
         // Patch `cbz w21, +852` (0x34000155) -> `b +840` (0x14000007).

@@ -2,6 +2,54 @@ cd $(realpath $HOME/../..)/usr/macOS
 
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 
+MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
+LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
+LIBMACHOOK_ARM64="/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
+LIPO="/var/jb/usr/bin/lipo"
+
+# Keep App-driven repair self-contained. Package installation normally fixes
+# this first, but running it here also repairs older installs. Do not re-sign
+# an already-correct thin library on every repair: this ldid build can change
+# its CDHash across passes, which would accumulate obsolete trustcache entries.
+split_libmachook=0
+if [ -f "$LIBMACHOOK" ] && [ -f "$MACHO_PATCHER" ]; then
+    if "$LIPO" -info "$LIBMACHOOK" 2>&1 | grep -q 'Architectures in the fat file'; then
+        /var/jb/usr/bin/python3 "$MACHO_PATCHER" "$LIBMACHOOK" || exit 1
+        tmp_arm64e="${LIBMACHOOK}.arm64e-new-$$"
+        tmp_arm64="${LIBMACHOOK_ARM64}.new-$$"
+        "$LIPO" "$LIBMACHOOK" -thin arm64e -output "$tmp_arm64e" || exit 1
+        "$LIPO" "$LIBMACHOOK" -thin arm64 -output "$tmp_arm64" || {
+            rm -f "$tmp_arm64e"
+            exit 1
+        }
+        chmod 755 "$tmp_arm64e" "$tmp_arm64"
+        mv "$tmp_arm64e" "$LIBMACHOOK"
+        mv "$tmp_arm64" "$LIBMACHOOK_ARM64"
+        split_libmachook=1
+        echo '[INFO] split libmachook into thin arm64e + arm64 libraries'
+    fi
+fi
+if [ ! -f "$LIBMACHOOK" ] || [ ! -f "$LIBMACHOOK_ARM64" ]; then
+    echo '[ERROR] both thin libmachook slices are required' >&2
+    exit 1
+fi
+for lib in "$LIBMACHOOK" "$LIBMACHOOK_ARM64"; do
+    must_sign=$split_libmachook
+    if [ -f "$MACHO_PATCHER" ]; then
+        patch_output=$(/var/jb/usr/bin/python3 "$MACHO_PATCHER" "$lib") || exit 1
+        echo "$patch_output"
+        case "$patch_output" in
+            *"patched $lib"*) must_sign=1 ;;
+        esac
+    fi
+    if [ "$must_sign" -eq 1 ]; then
+        # Two passes are required after lipo -thin; the first pass can leave
+        # page hashes describing the pre-growth __LINKEDIT layout.
+        /var/jb/usr/bin/ldid -S"$ENT" -M "$lib" || exit 1
+        /var/jb/usr/bin/ldid -S"$ENT" -M "$lib" || exit 1
+    fi
+done
+
 # ─── Trustcache optimization: cache existing hashes ─────────────────────────
 # Dump trustcache once at startup to avoid repeated jbctl calls
 TRUSTCACHE_FILE="/tmp/postinst_trustcache_$$"
@@ -96,6 +144,11 @@ add_all_trustcache() {
     add_arm64e_trustcache "$path"
     add_x86_64_trustcache "$path"
 }
+
+# The iOS-native control daemon is the reboot-safe entry point used by the
+# MacWSHost app.  Trust it here, but never unload it from this script: postinst
+# may itself be running as a request served by macwshostd.
+add_all_trustcache "/var/jb/usr/macOS/bin/macwshostd"
 
 # ─── LaunchDaemons plist ownership/permissions ─────────────────────────────
 # launchctl refuses to load any plist under a system LaunchDaemons dir unless

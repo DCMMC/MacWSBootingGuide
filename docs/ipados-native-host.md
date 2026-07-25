@@ -1,8 +1,80 @@
-# Native iPadOS host (M0/M1)
+# Native iPadOS host (M0–M3)
 
 `MacWSHost` is the first milestone toward presenting each chroot macOS window
 as an iPadOS `UIWindowScene` instead of viewing the whole desktop through VNC.
 It is an iOS application built by the root Theos aggregate.
+
+## What M3 adds: an App-owned control plane
+
+Version 0.3 makes the iPadOS app the normal entry point for the whole GUI
+stack. The data/control path is now:
+
+```text
+MacWSHost (UIKit + iOS Metal)
+    | typed XPC; fixed operations only
+    v
+macwshostd (root iOS LaunchDaemon, RunAtLoad)
+    | macos_gui.sh / launchctl / launchdchrootexec
+    v
+WindowServer + macwsinputd + allowlisted macOS apps
+    | completed BGRA frame + versioned input datagrams
+    v
+MacWSHost scene
+```
+
+The app shows the root service, rootfs, WindowServer PID, touch bridge, and
+frame dimensions in a native glass control panel. From there the user can:
+
+- initialize/start or stop the workspace;
+- launch GlassDemo, Terminal, Activity Monitor, or Finder;
+- refresh the completed GPU frame and interact with it using touch;
+- run the full signing/trustcache repair, perform bounded safe recovery, view
+  the three relevant logs, and export a diagnostic bundle;
+- collapse the panel so the macOS canvas remains unobstructed.
+
+The XPC service does not accept a command line, executable path, or shell
+text. Its protocol in `include/macws_control_protocol.h` exposes only status,
+start, stop, repair, recover, capture, logs, and an application identifier
+checked against a compiled allowlist.
+
+The package maintainer script now converts both libmachook slices from the iOS
+build tag to macOS 13, splits the fat artifact into thin arm64e and arm64
+injection libraries, signs each twice for the target ldid page-hash behavior,
+and registers the resulting hashes. App-driven repair repeats those steps only
+when needed and does not re-sign an already-correct thin library. This removes
+the old mandatory SSH post-install sequence.
+
+### First use after a restart
+
+After the jailbreak/bootstrap is active, open **MacWS Host** and tap **Start
+macOS workspace**. `macwshostd` is already loaded by launchd. Start probes a
+real chroot command; if a full reboot cleared the volatile trustcache, it runs
+the repair before launching WindowServer. A full repair scans the current
+MacPorts tree and took about 145 seconds for 116 files on the test rootfs, so
+the app deliberately remains in a visible busy state.
+
+A userspace reboot was runtime-tested: initially only
+`com.macwsguide.hostd` was present, then a cold `macwshost://start-experimental`
+launch brought up WindowServer and the input bridge in about three seconds.
+The watchdog ignores stale one-minute load for its first 90 seconds while
+still enforcing its WindowServer restart-count limit.
+
+A physical hardware reboot still requires Dopamine to reactivate the rootless
+bootstrap before any `/var/jb` app or LaunchDaemon can run. That pre-bootstrap
+step cannot be performed by this installed app. Once the bootstrap is active,
+no SSH command is required for MacWS initialization, repair, launch, capture,
+or recovery. A complete hardware reboot was not executed in the M3 validation
+because it would require that external reactivation step.
+
+The **Experimental compatibility mode** switch is intentionally explicit. It
+enables the recorded `macws_kcmd_fix` and cancelled-swap completion diagnostic
+scaffolds needed by the current native capture path; the UI states that these
+are not root-cause fixes. Standard mode removes both sentinels.
+
+M3 still mirrors one full macOS display inside one iPadOS scene. It does not
+yet claim independent native iPad windows for each macOS `CGSWindow`; that
+requires the window registry and per-window IOSurface transport milestones
+listed below.
 
 ## What M0 implements
 
@@ -90,10 +162,24 @@ THEOS=/var/jb/var/mobile/theos make -C MacWSHost clean all \
   FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1
 ```
 
-After package installation and `uicache`, launch it from the Home Screen or:
+For a native-AGX package, the canonical build is on-device because that path
+also produces the required chained fixups and thin injection libraries:
+
+```bash
+THEOS=/var/jb/var/mobile/theos bash misc/build_on_ios.sh
+```
+
+After package installation, normal use is entirely in the Home Screen app.
+These URLs remain useful for automation and diagnostics:
 
 ```bash
 uiopen macwshost://
+uiopen macwshost://start-experimental
+uiopen macwshost://glassdemo
+uiopen macwshost://capture
+uiopen macwshost://repair
+uiopen macwshost://recover
+uiopen macwshost://stop
 # Diagnostic: ask the running app to create another scene session.
 uiopen macwshost://new
 # Diagnostic: send one synthetic hover through the real M2 transport.
@@ -113,6 +199,7 @@ sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist \
 sudo launchctl start com.apple.WindowServer
 ```
 
+The App's experimental capture button manages these sentinels automatically.
 The compressed PF550 one-shot read additionally uses
 `/tmp/macws_capture_final`. The ordinary long-term transport must not depend on
 that diagnostic; it should publish completed per-window IOSurfaces from a
