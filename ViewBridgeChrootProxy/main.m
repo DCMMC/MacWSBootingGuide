@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <spawn.h>
+#include "macws_macho_arch.h"
 
 #define CS_LAUNCH_TYPE_SYSTEM_SERVICE 1
 int posix_spawnattr_set_launch_type_np(posix_spawnattr_t *attr, int launch_type);
@@ -30,8 +31,16 @@ int main(int argc, char *argv[], char *envp[]) {
     if (chroot(ROOTFS) < 0) { perror("chroot"); return 1; }
     if (chdir("/") < 0) { perror("chdir"); }
 
-    setenv("DYLD_INSERT_LIBRARIES",
-           "/usr/local/lib/libmachook.dylib:/usr/local/lib/libmachook_arm64.dylib", 1);
+    macws_macho_arch_t target_arch = macws_macho_arch_for_path(TARGET);
+    const char *insert = macws_insert_dylib_for_arch(target_arch);
+    if (!insert) {
+        target_arch = MACWS_ARCH_ARM64E; // this proxy and its Apple target are arm64e
+        insert = macws_insert_dylib_for_arch(target_arch);
+        fprintf(stderr, "[ViewBridgeChrootProxy] unknown target subtype; fallback arm64e\n");
+    }
+    setenv("DYLD_INSERT_LIBRARIES", insert, 1);
+    fprintf(stderr, "[ViewBridgeChrootProxy] target arch=%s insert=%s\n",
+            macws_arch_name(target_arch), insert);
     setenv("HOME", "/Users/root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);

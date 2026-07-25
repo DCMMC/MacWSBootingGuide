@@ -7,7 +7,7 @@ BUNDLE_NAME = ViewBridgeAuxiliary
 ViewBridgeAuxiliary_DYNAMIC_LIBRARY = 0
 ViewBridgeAuxiliary_BUNDLE_EXTENSION = xpc
 ViewBridgeAuxiliary_FILES = main.m
-ViewBridgeAuxiliary_CFLAGS = -fobjc-arc
+ViewBridgeAuxiliary_CFLAGS = -fobjc-arc -I$(CURDIR)/../include
 ViewBridgeAuxiliary_CODESIGN_FLAGS = -S../entitlements.plist
 ViewBridgeAuxiliary_INSTALL_PATH = /usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices
 
