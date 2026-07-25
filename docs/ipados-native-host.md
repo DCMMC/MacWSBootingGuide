@@ -1,4 +1,4 @@
-# Native iPadOS host (M0)
+# Native iPadOS host (M0/M1)
 
 `MacWSHost` is the first milestone toward presenting each chroot macOS window
 as an iPadOS `UIWindowScene` instead of viewing the whole desktop through VNC.
@@ -8,11 +8,18 @@ It is an iOS application built by the root Theos aggregate.
 
 - The application scene manifest sets `UIApplicationSupportsMultipleScenes`.
   The **New Window** button asks UIKit for another independent scene session.
+  The first scene is runtime-confirmed; iOS 16.3.1 SpringBoard currently
+  rejects the second request with `SBSceneManagerCoordinatorDomain Code=1`,
+  so multiple simultaneous scenes are not yet claimed.
 - Every scene reads the existing WindowServer capture at
   `/var/mnt/rootfs/private/tmp/macws_vnc_fb` directly. No `OSXvnc-server`, RFB
   encoding, network socket, or VNC client is involved.
 - When `MTLCreateSystemDefaultDevice()` succeeds, an iOS-native Metal render
   pipeline uploads the BGRA frame and presents an aspect-fitted quad.
+- The dedicated entitlement set names only the two runtime-denied IOKit
+  clients, `AGXDeviceUserClient` and `IOSurfaceRootUserClient`.  This changes
+  the device result from nil to `Apple M1 GPU`; a completed render/present
+  command buffer (`status=4 error=nil`) is the M1 witness.
 - If the iOS process cannot enumerate a Metal device, an explicitly labelled
   UIKit/CoreAnimation fallback displays a stable snapshot. This is a recovery
   path, not evidence of an App-local Metal present.
@@ -91,19 +98,30 @@ Runtime on iPad13,6 / iOS 16.3.1 confirmed that:
   on-device lld Objective-C fixup ABI, while the arm64-only application starts
   natively on the same M1 hardware;
 - WindowServer can publish a nonzero 2388 x 1668 frame while no VNC server is
-  running.
+  running;
+- the exact Metal registration inputs are present (`AGXAcceleratorG13G_B0`,
+  `AGXMetal13_3`, and `AGXG13GDevice`), while the old nil result was caused by
+  MACF denials for `AGXDeviceUserClient` and `IOSurfaceRootUserClient`;
+- after granting just those two IOKit classes, the iPadOS-native Metal path
+  presents the nonzero frame on `Apple M1 GPU` and completes with no error;
+- `supportsMultipleScenes=YES` is not sufficient on this installation:
+  SpringBoard accepts the first scene but rejects the second.  Public request
+  variants and `platform-application` A/Bs do not change that result.
 
 M0 is not the final per-application design. It still mirrors a full macOS
 display into every iPadOS scene. The next milestones are:
 
-1. deliver versioned input records to a narrow macOS event bridge and confirm
+1. inspect the failed SpringBoard scene request's real persistence identifier
+   and mapping with a stable early-attach/runtime probe; do not force its
+   success branch;
+2. deliver versioned input records to a narrow macOS event bridge and confirm
    real click/drag/key witnesses;
-2. add a WindowServer-side window registry with stable window IDs, bounds,
+3. add a WindowServer-side window registry with stable window IDs, bounds,
    scale, z-order, and lifecycle events;
-3. replace the whole-frame mmap with a producer-owned IOSurface ring plus
+4. replace the whole-frame mmap with a producer-owned IOSurface ring plus
    generation/fence metadata, and determine the valid cross-environment port
    transfer direction with runtime evidence;
-4. crop or render each registered macOS window into its own `UIWindowScene`,
+5. crop or render each registered macOS window into its own `UIWindowScene`,
    including independent resize and multiple simultaneous iPadOS windows;
-5. preserve the existing native-AGX blur witness through that per-window path
+6. preserve the existing native-AGX blur witness through that per-window path
    and run an interactive stability soak.

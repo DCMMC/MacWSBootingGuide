@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOKit/IOKitLib.h>
 #import <simd/simd.h>
 
 #include <errno.h>
@@ -38,6 +39,41 @@ static void MacWSLog(NSString *format, ...) {
         fclose(file);
     }
     pthread_mutex_unlock(&logLock);
+}
+
+// Read-only witness for Metal's RE-confirmed registration inputs.  The iOS
+// 16.3.1 Metal binary's MTLRegisterDevices matches IOAcceleratorES, reads
+// MetalPluginName/MetalPluginClassName, and then loads the named bundle.
+static void MacWSLogMetalRegistryState(void) {
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    kern_return_t kr = IOServiceGetMatchingServices(
+        kIOMasterPortDefault, IOServiceMatching("IOAcceleratorES"), &iterator);
+    NSUInteger count = 0;
+    io_service_t service;
+    while (kr == KERN_SUCCESS && (service = IOIteratorNext(iterator))) {
+        count++;
+        io_name_t serviceName = {0};
+        IORegistryEntryGetName(service, serviceName);
+        CFTypeRef pluginValue = IORegistryEntryCreateCFProperty(
+            service, CFSTR("MetalPluginName"), kCFAllocatorDefault, 0);
+        CFTypeRef classValue = IORegistryEntryCreateCFProperty(
+            service, CFSTR("MetalPluginClassName"), kCFAllocatorDefault, 0);
+        NSString *pluginName = CFBridgingRelease(pluginValue);
+        NSString *className = CFBridgingRelease(classValue);
+        NSString *bundlePath = pluginName.length
+            ? [@"/System/Library/Extensions" stringByAppendingPathComponent:
+                [pluginName stringByAppendingString:@".bundle"]]
+            : nil;
+        NSBundle *bundle = bundlePath ? [NSBundle bundleWithPath:bundlePath] : nil;
+        Class pluginClass = className.length ? NSClassFromString(className) : Nil;
+        MacWSLog(@"metal-registry service=%s plugin=%@ class=%@ bundle=%@ loaded=%@ realized=%@",
+                 serviceName, pluginName, className, bundlePath,
+                 bundle.isLoaded ? @"YES" : @"NO", pluginClass);
+        IOObjectRelease(service);
+    }
+    if (iterator) IOObjectRelease(iterator);
+    MacWSLog(@"metal-registry enumeration kr=0x%x count=%lu",
+             kr, (unsigned long)count);
 }
 
 @interface MacWSMappedFrame : NSObject
@@ -555,6 +591,23 @@ static void MacWSLog(NSString *format, ...) {
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier;
 @end
 
+static void MacWSRequestNewScene(UIScene *requestingScene,
+                                 void (^failureHandler)(NSError *error)) {
+    UIApplication *application = UIApplication.sharedApplication;
+    MacWSLog(@"scene-activation requested supportsMultiple=%@ connected=%lu open=%lu origin=%@ mode=all-nil",
+             application.supportsMultipleScenes ? @"YES" : @"NO",
+             (unsigned long)application.connectedScenes.count,
+             (unsigned long)application.openSessions.count,
+             requestingScene.session.persistentIdentifier);
+    [application requestSceneSessionActivation:nil
+                                  userActivity:nil
+                                       options:nil
+                                  errorHandler:^(NSError *error) {
+        MacWSLog(@"scene-activation failed: %@", error);
+        if (failureHandler) failureHandler(error);
+    }];
+}
+
 @implementation MacWSViewController {
     NSString *_sceneIdentifier;
     UILabel *_statusLabel;
@@ -637,15 +690,10 @@ static void MacWSLog(NSString *format, ...) {
 }
 
 - (void)openNewWindow {
-    NSUserActivity *activity = [[NSUserActivity alloc] initWithActivityType:@"com.macwsguide.host.window"];
-    activity.title = @"MacWS Window";
-    [[UIApplication sharedApplication] requestSceneSessionActivation:nil
-                                                        userActivity:activity
-                                                             options:nil
-                                                        errorHandler:^(NSError *error) {
+    MacWSRequestNewScene(self.view.window.windowScene, ^(NSError *error) {
         self->_statusLabel.text = [NSString stringWithFormat:@"新建窗口失败: %@",
                                    error.localizedDescription];
-    }];
+    });
 }
 
 - (void)metalView:(MacWSMetalView *)view statusChanged:(NSString *)status {
@@ -696,15 +744,9 @@ static void MacWSLog(NSString *format, ...) {
 }
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
-    (void)scene;
     for (UIOpenURLContext *context in URLContexts) {
         if (![context.URL.host isEqualToString:@"new"]) continue;
-        NSUserActivity *activity = [[NSUserActivity alloc]
-            initWithActivityType:@"com.macwsguide.host.window"];
-        [[UIApplication sharedApplication] requestSceneSessionActivation:nil
-            userActivity:activity options:nil errorHandler:^(NSError *error) {
-                MacWSLog(@"URL-requested scene activation failed: %@", error);
-            }];
+        MacWSRequestNewScene(scene, nil);
         break;
     }
 }
@@ -721,10 +763,13 @@ static void MacWSLog(NSString *format, ...) {
 @implementation MacWSAppDelegate
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey, id> *)launchOptions {
-    (void)application;
     (void)launchOptions;
-    MacWSLog(@"launched native-device=%@ frame-path=%@",
-             MTLCreateSystemDefaultDevice().name, MacWSFramePath);
+    id<MTLDevice> nativeDevice = MTLCreateSystemDefaultDevice();
+    MacWSLog(@"launched native-device=%@ supportsMultiple=%@ frame-path=%@",
+             nativeDevice.name,
+             application.supportsMultipleScenes ? @"YES" : @"NO",
+             MacWSFramePath);
+    MacWSLogMetalRegistryState();
     return YES;
 }
 

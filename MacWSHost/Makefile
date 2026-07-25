@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 APPLICATION_NAME = MacWSHost
 
 MacWSHost_FILES = main.m
-MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation
+MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation IOKit
 MacWSHost_CFLAGS = -fobjc-arc -Wall -Wextra -I$(CURDIR)/../include
 MacWSHost_CODESIGN_FLAGS = -Sentitlements.plist
 
