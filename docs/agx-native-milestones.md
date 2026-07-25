@@ -926,15 +926,66 @@ and state 1 at `0x100001f98..0x100001fc0`.  Thus the non-black frosted regions
 in the RFB frame are output from real `NSVisualEffectView` configurations, not
 labels drawn by a fake demo.
 
-The background behind the main material is mostly uniform, so this screenshot
-does not independently measure a blur radius or provide a high-frequency edge
-A/B.  Several attempts to add a striped background did not reach another pf550
-frame and therefore are not counted as success.
+The background behind the main material is mostly uniform, so that first
+screenshot alone did not independently measure a blur radius.  The multiscale
+A/B below closes that evidence gap without changing GlassDemo's material.
+
+### Runtime/quantitative-confirmed: the native effect performs backdrop blur
+
+Source commit `4a42d6d4ac59798e1339f8a2ca6a386b109a5367` adds an
+opt-in `MACWS_GLASS_BLUR_AB=1` diagnostic.  It recursively locates the existing
+material-13, blending-mode-1 `NSVisualEffectView` and inserts a three-frequency
+black/white source immediately below it.  It does not change the target's
+material, blending mode, state, or class.  The normal GlassDemo plist leaves
+the diagnostic disabled.
+
+The runtime target record is exact:
+
+```text
+#### GLASS-BLUR-AB installed attempt=1 target=NSVisualEffectView material=13 blending=1 effect=(60.0 60.0 820.0 100.0) stripes=(32.0 32.0 876.0 156.0) periods=8/32/96pt
+```
+
+The top and bottom 28-point margins expose the unfiltered source; the existing
+effect view covers the center.  In the 2x raw VNC framebuffer, the three full
+periods are 16, 64, and 192 physical pixels.  The native pf550 read completed
+with `contract=OK error=nil`, both independent control pixels matched, and the
+2388x1668 BGRA frame contained 2,844,662 non-black pixels.
+
+The committed A/B witness is
+[`docs/evidence/native-agx-glassdemo-blur-ab-20260725.png`](evidence/native-agx-glassdemo-blur-ab-20260725.png),
+SHA-256
+`f33d7f152e0894cd03148910022431f36ddf24f0ee9aae7ebbddce4fabd31197`.
+Its raw VNC framebuffer SHA-256 is
+`de72e367ddd903269047cd69875ec8637d98d49fdf11c25da18b8353d37dbc00`.
+
+Measured from the frozen raw BGRA pixels:
+
+| Source bars | Sharp fundamental | Effect fundamental | Effect range |
+|---|---:|---:|---:|
+| 4 pt (16 px period) | 163.386 | 0.207 | 173..191 |
+| 16 pt (64 px period) | 162.403 | 0.287 | 173..185 |
+| 48 pt (192 px period) | 162.345 | 18.414 | 157..201 |
+
+The 4-point frequency is attenuated by about 57.9 dB.  In the 48-point region,
+the covered output still has distinct black/white plateaus (160.660 vs
+197.396), while the input's one-pixel hard edge becomes a 54.58-pixel 10–90%
+transition.  This rules out both an unfiltered copy and a flat opaque tint:
+the backdrop influences the output, edges spread, and higher frequencies are
+suppressed.  Full coordinates, formulas, verbatim runtime excerpts, and hashes
+are in
+[`docs/evidence/native-agx-glassdemo-blur-ab-20260725.txt`](evidence/native-agx-glassdemo-blur-ab-20260725.txt).
 
 ### Stability boundary: screenshot success is not production stability
 
-The successful log later shows rapid type-`0x82` resource growth and a second
-WindowServer constructor.  The reason for that restart was not captured.
+The successful original log later shows rapid type-`0x82` resource growth and
+a second WindowServer constructor.  A later blur-A/B run made the resource
+boundary concrete: a memory-pressure event names WindowServer as
+`largestProcess`, with PID 9056 at 743,169 resident 16-KiB pages and reason
+`vm-compressor-space-shortage`.  The final automated witness therefore copied
+the VNC mmap and stopped the GUI immediately; it produced no newer crash report
+and restored the iOS GUI at load average 1.59.  This is a bounded proof, not a
+long-run fix.
+
 Three later striped-background experiments produced real WindowServer crash
 reports with `EXC_BAD_ACCESS/SIGBUS` at `libobjc.A.dylib objc_msgSend`; their
 triggered threads were SystemStatus/NSXPC queues, not AGX command-completion
@@ -954,5 +1005,3 @@ Full excerpts, artifact hashes, and the three crash-report hashes are in
    Objective-C release/encoding.
 3. Pair type-`0x82` creates/destroys and stop the long-run allocation growth;
    require stable counters and repeated VNC frames, not process uptime.
-4. Obtain a high-frequency-background A/B that reaches pf550 and visibly
-   measures blur spread without changing GlassDemo's material implementation.
