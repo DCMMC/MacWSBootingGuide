@@ -1110,6 +1110,36 @@ as a restart-conflicting orphan. Verbatim logs, disassembly, pixel bounds, and
 artifact hashes are in
 [`docs/evidence/ipados-native-host-input-m4-20260726.txt`](evidence/ipados-native-host-input-m4-20260726.txt).
 
+## 2026-07-26: coexistence VNC pacing, Terminal survival, and stable source selection
+
+The apparent one-click startup failure was three independent runtime-confirmed
+faults. Immediate synthetic cancelled-swap completion produced about 3,600
+completions per minute and held WindowServer at 98% CPU until the thermal
+watchdog stopped the whole stack. Pacing the one matching completion at the
+SwapEnd ownership boundary reduced the observed WindowServer load to 55.7%
+without changing the 70% safety threshold.
+
+Terminal then exposed a process-scope regression: its crash report faulted at
+`IOSurfaceCreate_safe` line 5076 while the diagnostic statistics block called
+`CFDictionaryGetValue`. The interposer already had a WindowServer-only
+contract, but the statistics block had been added before that gate. Moving the
+gate ahead of every dictionary access kept Terminal alive, invoked the
+RE-confirmed `-[TTApplication newShell:]` action, and returned eight windows
+in the final packaged run.
+
+Finally, the shared-frame publisher accepted every large composite. Runtime
+logs showed a correct 2388x1668 PF80 display destination followed by a
+1140x798 Terminal intermediate; the latter shrank the mmap and caused the VNC
+viewer to alternate between black/full/cropped frames. The publisher now
+allows its display-size maximum to grow but rejects smaller intermediates.
+Ten consecutive RFB captures were byte-identical, each with 488,707 non-black
+pixels, while the mmap header remained 2388x1668. `--experimental` now owns the
+VNC-share sentinel as well as the command/completion sentinels, and `stop` or
+the watchdog removes all three.
+
+Verbatim reports, logs, hashes, and the before/after mmap headers are in
+[`docs/evidence/coexist-vnc-stability-20260726.txt`](evidence/coexist-vnc-stability-20260726.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator

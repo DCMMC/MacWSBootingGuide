@@ -955,7 +955,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UILabel *experimentalText = MacWSMakeLabel(@"实验兼容模式",
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
     UILabel *experimentalDetail = MacWSMakeLabel(
-        @"启用命令 ABI / completion 诊断脚手架；受 90 秒与高 CPU 热保护，不是根因修复。",
+        @"启用命令 ABI / completion 诊断脚手架；受 5 分钟与高 CPU 热保护，不是根因修复。",
         [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
         UIColor.systemOrangeColor);
     UIStackView *experimentalLabels = [[UIStackView alloc]
@@ -1258,7 +1258,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else {
         [self setControlsEnabled:NO];
         [self setNotice:_experimentalSwitch.isOn
-            ? @"正在用实验兼容模式启动；已启用 90 秒与高 CPU 自动热保护。"
+            ? @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。"
             : @"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
         [_controlClient startWithExperimentalMode:_experimentalSwitch.isOn
             completion:^(NSDictionary<NSString *,id> *reply) {

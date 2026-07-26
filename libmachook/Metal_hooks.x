@@ -155,6 +155,7 @@ static inline uint8_t macws_half_to_u8(uint16_t h) {
 static id<MTLTexture> g_vnc_comp_tex = nil;
 static id g_vnc_lock = nil;
 static _Atomic int g_vnc_final_available = 0;
+static _Atomic uint64_t g_vnc_comp_max_area = 0;
 static id macws_vnc_retain(id obj) {
 #if __has_feature(objc_arc)
     return obj;
@@ -172,6 +173,40 @@ static void macws_vnc_release(id obj) {
 void macws_vnc_on_composite(id<MTLTexture> dest) {
     if (!macws_vnc_share_enabled() || !dest ||
         atomic_load(&g_vnc_final_available)) return;
+    size_t candidateWidth = [dest width];
+    size_t candidateHeight = [dest height];
+    unsigned long candidatePixelFormat = (unsigned long)[dest pixelFormat];
+    if (candidateWidth < 1000 || candidateHeight < 600 ||
+        candidateWidth > UINT32_MAX || candidateHeight > UINT32_MAX ||
+        (candidatePixelFormat != 80 && candidatePixelFormat != 115)) return;
+
+    // StartComposite is used for both the display destination and intermediate
+    // per-window composites.  Runtime evidence on iPad13,6 showed the correct
+    // 2388x1668 display target being replaced by Terminal's 1140x798 target;
+    // that also shrank /tmp/macws_vnc_fb and made RFB alternate between a full
+    // desktop and a magnified/cropped child surface.  The display target is the
+    // largest composite in a WindowServer lifetime.  Permit a larger target to
+    // establish/update that invariant, but never let a smaller intermediate
+    // target overwrite it.  Equal-area dimensions remain valid for rotation.
+    uint64_t candidateArea = (uint64_t)candidateWidth * candidateHeight;
+    uint64_t maxArea = atomic_load(&g_vnc_comp_max_area);
+    while (candidateArea > maxArea &&
+           !atomic_compare_exchange_weak(&g_vnc_comp_max_area,
+                                         &maxArea, candidateArea)) {}
+    maxArea = atomic_load(&g_vnc_comp_max_area);
+    if (candidateArea < maxArea) {
+        static _Atomic unsigned int rejected = 0;
+        unsigned int n = atomic_fetch_add(&rejected, 1) + 1;
+        if (n <= 8 || (n % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-BLIT reject intermediate #%u %zux%zu area=%llu "
+                "displayArea=%llu\n",
+                n, candidateWidth, candidateHeight,
+                (unsigned long long)candidateArea,
+                (unsigned long long)maxArea);
+        }
+        return;
+    }
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_vnc_lock = [NSObject new];
@@ -206,7 +241,9 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                             "#### VNC-BLIT candidate #%d tex=%p class=%s %zux%zu pf=%lu\n",
                             targetn, (void *)t, object_getClassName(t), w, h, pf);
                     }
-                    if (w >= 1000 && h >= 600 && (pf == 80 || pf == 115)) {
+                    uint64_t area = (uint64_t)w * h;
+                    if (w >= 1000 && h >= 600 && (pf == 80 || pf == 115) &&
+                        area >= atomic_load(&g_vnc_comp_max_area)) {
                         // GPU blit the (AGX-tiled) LIVE composite into an IDLE
                         // linear texture on our OWN queue (GPU detiles), then
                         // CPU-read the idle dst's IOSurface mapping -> mmap.

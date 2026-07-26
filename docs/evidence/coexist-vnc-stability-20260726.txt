@@ -1,0 +1,141 @@
+Coexistence VNC / Terminal stability evidence — 2026-07-26
+==========================================================
+
+Device: iPad13,6, iOS 16.3.1 (20D67)
+Guest: macOS 13.4 chroot
+Mode: MACWS_AGX_NATIVE=1, coexistence, real iOS AGX driver
+
+This record distinguishes three independent defects. It does not promote
+process uptime to rendering evidence: the final witnesses are on-wire RFB
+pixels, stable hashes, the mmap header, and advancing completion logs.
+
+1. Pre-fix watchdog stop (runtime-confirmed)
+------------------------------------------------
+
+The user's ordinary one-click invocation did start WindowServer, OSXvnc, and
+Terminal. It then disappeared because the safety watchdog recorded:
+
+    [macos_gui] watchdog: SAFETY TRIP: WindowServer 高 CPU 样本累计达到 30 秒（阈值 70%，当前 98%），已自动停止以防过热
+
+WindowServer logged about one immediate synthetic completion per display
+iteration, including:
+
+    #### COEXIST API SwapCancel #3600 ...
+    #### IOMFB CANCEL-COMPLETION schedule #3600 ...
+    #### IOMFB CANCEL-COMPLETION delivered #3600 ...
+
+The completion is now delayed synchronously by one 16,667-us interval at the
+SwapEnd ownership boundary. This preserves exactly one real SwapCancel and one
+matching completion; it does not force a success branch or raise the thermal
+threshold. The post-change sample was:
+
+    root 32105  55.7 ... WindowServer -virtualonly -daemon
+
+The watchdog remained armed at its original CPU policy:
+
+    WS CPU>=70% for 30s
+
+2. Terminal PAC crash (runtime-confirmed via crash report)
+----------------------------------------------------------
+
+Crash report:
+
+    /var/mobile/Library/Logs/CrashReporter/Terminal-2026-07-26-174442.ips
+
+Verbatim exception and top relevant frames:
+
+    EXC_BAD_ACCESS / SIGSEGV
+    KERN_INVALID_ADDRESS ... (possible pointer authentication failure)
+    objc_msgSend
+    -[__NSDictionaryM objectForKey:]
+    IOSurfaceCreate_safe, mac_hooks.m:5076
+    CreateCachedSurface
+    -[CIImage initWithCGImage:options:]
+
+The source at line 5076 was the IOSurface statistics diagnostic reading
+`IOSurfaceWidth`. The interposer's WindowServer-only gate followed that block,
+so Terminal's CoreImage dictionary reached an access that the existing source
+comment already documented as PAC-unsafe. The gate now precedes every
+dictionary read. Post-fix runtime evidence:
+
+    Terminal[15613] remained present
+    #### Terminal direct newShell: request
+    #### NSApp=... class=NSKVONotifying_TTApplication responds(newShell:)=1
+    #### Terminal newShell: returned windows=4
+
+A later packaged run returned eight windows and remained alive throughout the
+VNC sampling interval:
+
+    #### Terminal newShell: returned windows=8
+
+3. Flicker source attribution (runtime-confirmed)
+--------------------------------------------------
+
+Before source selection was fixed, WindowServer published the real full
+display and then overwrote it with a Terminal intermediate:
+
+    #### VNC-BLIT candidate #0 ... 2388x1668 pf=80
+    #### VNC-MMAP /tmp/macws_vnc_fb 2388x1668 sz=15932752
+    #### VNC-BLIT captured 2388x1668 pf=80 -> mmap (detiled)
+    #### VNC-BLIT candidate #2 ... 1140x798 pf=80
+    #### VNC-MMAP /tmp/macws_vnc_fb 1140x798 sz=3638896
+    #### VNC-BLIT captured 1140x798 pf=80 -> mmap (detiled)
+
+The actual pre-fix file header then read:
+
+    magic=1447969606 width=1140 height=798 stride=4560
+
+This is why a 1194x834 RFB desktop showed full-display content, a magnified
+Terminal subtexture, or black between updates. StartComposite owns both display
+and intermediate composites; a size threshold of 1000x600 was not a display
+identity.
+
+The corrected publisher keeps the largest accepted PF80/PF115 composite area
+for the WindowServer lifetime and rejects smaller intermediates. Post-fix log:
+
+    #### VNC-BLIT candidate #0 ... 2388x1668 pf=80
+    #### VNC-MMAP /tmp/macws_vnc_fb 2388x1668 sz=15932752
+    #### VNC-BLIT captured 2388x1668 pf=80 -> mmap (detiled)
+    #### VNC-BLIT reject intermediate #1 1140x798 area=909720 displayArea=3983184
+    #### VNC-BLIT reject intermediate #2 1140x798 area=909720 displayArea=3983184
+
+The file remained:
+
+    magic=1447969606 width=2388 height=1668 stride=9552
+    size=15932752
+
+OSXvnc confirmed the mmap backend and successful rectangle delivery:
+
+    #### OSXVNC delivery hooks installed (test=0 share=1) ...
+    #### OSXVNC mmap rect delivery copied=1 rect=0,0 1194x834
+
+4. Stable on-wire RFB witness
+-----------------------------
+
+The dependency-free RFB 3.8 client requested ten full raw updates over the
+post-fix interval. All ten reported exactly:
+
+    RFB name='macOS-iPad' size=1194x834
+    raw_sha256=951b4725b19a96b5086cdfebe8b491db29b362c88471203b951e4b702339c638
+    nonblack_pixels=488707/995796 (49.077%)
+
+The frame visibly contained the Terminal title bar, traffic-light controls,
+shell text, and bash prompt. There were no black or child-texture hashes in the
+ten-sample series.
+
+5. One-click and cleanup boundary
+---------------------------------
+
+The tested invocation is now:
+
+    sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist --experimental
+
+It starts WindowServer, persistent OSXvnc, and Terminal, and explicitly owns
+the three diagnostic sentinels: command ABI, cancelled-swap completion, and
+stable VNC mmap. The diagnostic cap is 300 seconds; CPU and restart guards
+remain enabled. `stop` produced:
+
+    [macos_gui] Stopped. The iPad is back on iOS.
+    ALL_DIAGNOSTIC_FLAGS_CLEARED
+
+No WindowServer, OSXvnc, or Terminal process remained after that check.

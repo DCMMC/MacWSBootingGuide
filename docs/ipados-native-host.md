@@ -101,7 +101,11 @@ because it would require that external reactivation step.
 The **Experimental compatibility mode** switch is intentionally explicit. It
 enables the recorded `macws_kcmd_fix` and cancelled-swap completion diagnostic
 scaffolds needed by the current native capture path; the UI states that these
-are not root-cause fixes. Standard mode removes both sentinels.
+are not root-cause fixes. The App always owns `macws_vnc_share` while running
+because that mmap is its current frame transport, independent of the switch.
+The CLI's explicit `--experimental` path groups all three flags for VNC tests.
+The diagnostic run is capped at five minutes while the unchanged high-CPU and
+restart-storm guards remain active.
 
 M3 still mirrors one full macOS display inside one iPadOS scene. It does not
 yet claim independent native iPad windows for each macOS `CGSWindow`; that
@@ -227,17 +231,13 @@ uiopen 'macwshost://test-input?x=1194&y=834&w=2388&h=1668'
 uiopen 'macwshost://test-input?kind=tap&x=640&y=703&w=2388&h=1668'
 ```
 
-To exercise the current capture path without VNC, create the existing capture
-sentinels before starting WindowServer in coexist mode. These switches are
-still diagnostic scaffolds, not production protocol fixes:
+To exercise the current capture path without VNC, use the same explicit
+experimental mode as the App. The script owns creation and cleanup of all
+three sentinels, including cleanup after a watchdog stop:
 
 ```bash
-touch /var/mnt/rootfs/private/tmp/macws_vnc_share
-touch /var/mnt/rootfs/private/tmp/macws_kcmd_fix
-touch /var/mnt/rootfs/private/tmp/macws_cancel_completion
 sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist \
-  --no-terminal --no-vnc
-sudo launchctl start com.apple.WindowServer
+  --experimental --no-terminal --no-vnc
 ```
 
 The App's experimental capture button manages these sentinels automatically.

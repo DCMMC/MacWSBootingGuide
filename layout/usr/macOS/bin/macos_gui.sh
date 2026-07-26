@@ -12,6 +12,7 @@
 #
 # Options for start/restart:
 #   coexist | exclusive   display mode (default: coexist)
+#   --experimental        enable the current command/completion diagnostics
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
 #
@@ -46,6 +47,9 @@ INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 VNC_LABEL=com.macwsguide.osxvnc
 TERM_LABEL=com.macwsguide.terminal
 INPUT_LABEL=com.macwsguide.input
+EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
+EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
+EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
@@ -87,7 +91,7 @@ WD_LOAD_GRACE=90      # inherited 1-min load average is stale after userspace re
                       # restart-storm protection remains active during this grace period
 WD_WS_CPU_LIMIT=70    # sustained one-core WindowServer use is the thermal failure signal
 WD_WS_CPU_STRIKES=6   # six 5-second samples = 30 seconds above the limit
-WD_DIAG_MAX_RUNTIME=90 # temporary cap while cancellation completion remains diagnostic
+WD_DIAG_MAX_RUNTIME=300 # bounded VNC test window; CPU/restart guards remain active
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 WD_TRIP="$LOGDIR/macws_safety_trip"
 
@@ -150,7 +154,7 @@ run_watchdog() {
     local ws_cpu=0 cpu_strikes=0 diagnostic=0
     t0=$(date +%s)
     started=$t0
-    [ -e "$ROOTFS/tmp/macws_cancel_completion" ] && diagnostic=1
+    [ -e "$EXPERIMENTAL_COMPLETION" ] && diagnostic=1
     log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace; WS CPU>=${WD_WS_CPU_LIMIT}% for $((WD_WS_CPU_STRIKES * WD_POLL))s; >=$WD_RESTART_LIMIT restarts/${WD_WINDOW}s; diagnostic cap=${WD_DIAG_MAX_RUNTIME}s)"
     while :; do
         sleep "$WD_POLL"
@@ -381,6 +385,11 @@ start_macos() {
 stop_all() {
     cleanup_macos
     rm -f "$FLAG"
+    # A watchdog stop does not pass back through macwshostd, so it must clear
+    # the diagnostic sentinels itself.  Otherwise the next ordinary CLI start
+    # silently inherits experimental protocol behavior.
+    rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
+        "$EXPERIMENTAL_VNC_SHARE"
     log "Restoring iOS (SpringBoard / backboardd)..."
     launchctl load "$BACKBOARDD"  2>/dev/null
     launchctl load "$SPRINGBOARD" 2>/dev/null
@@ -417,7 +426,7 @@ usage() {
 macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
-  sudo bash $0 start [coexist|exclusive] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 start [coexist|exclusive] [--experimental] [--no-terminal] [--no-vnc] [--no-watchdog]
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
@@ -429,6 +438,10 @@ Modes:
 Safety: `start` also launches a background watchdog that auto-stops the GUI if
 WindowServer crash-loops or the load average runs away (panic guard). Disable
 with --no-watchdog. Logs to $LOGDIR/macos_gui_watchdog.log.
+
+The current native VNC path still needs diagnostic command/completion adapters.
+Use --experimental explicitly for that path; it is bounded to
+${WD_DIAG_MAX_RUNTIME} seconds and remains protected by the high-CPU watchdog.
 
 Connect a VNC viewer to  vnc://<device-ip>:5900  (no password).
 USAGE
@@ -442,16 +455,25 @@ MODE=coexist
 WANT_VNC=1
 WANT_TERMINAL=1
 WANT_WATCHDOG=1
+WANT_EXPERIMENTAL=0
 for a in "$@"; do
     case "$a" in
         coexist|coexistence|co)  MODE=coexist ;;
         exclusive|full|excl)     MODE=exclusive ;;
+        --experimental)          WANT_EXPERIMENTAL=1 ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
         --no-vnc)                WANT_VNC=0 ;;
         --no-watchdog)           WANT_WATCHDOG=0 ;;
         *) echo "macos_gui.sh: ignoring unknown option '$a'" >&2 ;;
     esac
 done
+
+enable_experimental_if_requested() {
+    [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
+    touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
+        "$EXPERIMENTAL_VNC_SHARE"
+    log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + stable VNC mmap enabled."
+}
 
 # Launch the crash-loop watchdog in the background (iOS-side, survives SSH
 # disconnect via nohup). Re-invokes this script in `watchdog` mode.
@@ -469,6 +491,7 @@ case "$CMD" in
         write_plists
         ensure_chroot_works || exit 1
         cleanup_macos
+        enable_experimental_if_requested
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos
         start_watchdog
@@ -485,6 +508,7 @@ case "$CMD" in
         write_plists
         ensure_chroot_works || exit 1
         stop_all
+        enable_experimental_if_requested
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos
         start_watchdog

@@ -5064,8 +5064,26 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     if (getenv("MACWS_IOSURF_TRACE") != NULL) {
         fprintf(stderr, "#### IOSURF_HOOK call cf=%p\n", (void *)properties_cf);
     }
+    if (!properties_cf) {
+        return IOSurfaceCreate((NSDictionary *)properties_cf);
+    }
+    // This interposer's dictionary inspection is a WindowServer-only ABI
+    // translation.  Keep the process gate ahead of *every* dictionary access,
+    // including diagnostics.  CoreImage in arm64e applications such as Terminal
+    // supplies a CFDictionary whose key hashing PAC-faults when macOS
+    // CoreFoundation dispatches through the iOS-signed Objective-C runtime.
+    {
+        static int s_is_ws = -1;
+        if (s_is_ws < 0) {
+            const char *prog = getprogname();
+            s_is_ws = (prog && strstr(prog, "WindowServer")) ? 1 : 0;
+        }
+        if (!s_is_ws) {
+            return IOSurfaceCreate((NSDictionary *)properties_cf);
+        }
+    }
     // OOM leak diagnostic (2026-06-20): count creates + per-caller bytes.
-    // Every 25 calls, dump caller+size attribution so we can find who's
+    // Every 250 calls, dump caller+size attribution so we can find who's
     // accumulating IOSurfaces against the 5120 MB WS watermark.
     {
         static _Atomic unsigned long s_count = 0;
@@ -5093,26 +5111,6 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
             fprintf(stderr,
                 "#### IOSURF_STATS n=%lu cumulative_bytes=%lu MB this_size=%zu KB caller1=%s caller2=%s\n",
                 my_n, my_total / (1024*1024), my_bytes / 1024, sym1, sym2);
-        }
-    }
-    if (!properties_cf) {
-        return IOSurfaceCreate((NSDictionary *)properties_cf);
-    }
-    // Scope this rewrite to WindowServer ONLY. Other processes (Activity Monitor,
-    // Terminal, etc.) crash in CFDictionaryGetValue when properties_cf is a
-    // real NSMutableDictionary subclass — the toll-free bridge dispatches to
-    // -[NSDictionary objectForKey:], and on-device arm64e PAC-faults when
-    // hashing keys whose class pointer is iOS-signed. WindowServer is the only
-    // caller that creates the '&b38' Apple-compressed CA Framebuffer surface
-    // we need to rewrite anyway.
-    {
-        static int s_is_ws = -1;
-        if (s_is_ws < 0) {
-            const char *prog = getprogname();
-            s_is_ws = (prog && strstr(prog, "WindowServer")) ? 1 : 0;
-        }
-        if (!s_is_ws) {
-            return IOSurfaceCreate((NSDictionary *)properties_cf);
         }
     }
     // CoreImage sometimes passes a CFDictionary whose -objectForKey: is not a
@@ -7532,9 +7530,24 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
             sequence, framebuffer, swap_id, result);
     }
     if (result == KERN_SUCCESS) {
+        // Runtime-confirmed 2026-07-26: immediate synthetic completion drove
+        // 3,600 swaps/minute and held WindowServer at 98% CPU until the
+        // thermal watchdog stopped it.  The earlier asynchronous 200-ms FIFO
+        // did not pace submissions and grew without bound.  Block this exact
+        // SwapEnd ownership boundary for one 60-Hz interval before queueing
+        // its one matching completion.  Render work plus this interval yields
+        // roughly 30 presented virtual frames/s without accumulating pending
+        // callbacks or weakening the watchdog threshold.
+        enum { kMacWSCoexistCompletionPaceUS = 16667 };
+        usleep(kMacWSCoexistCompletionPaceUS);
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);
         macws_iomfb_complete_cancelled_swap(client, swap_id);
+        if (sequence <= 4) {
+            fprintf(stderr,
+                "#### COEXIST completion pace #%lu: %u us before swapID=%u\n",
+                sequence, kMacWSCoexistCompletionPaceUS, swap_id);
+        }
     }
     return result;
 }
