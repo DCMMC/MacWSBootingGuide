@@ -18,6 +18,9 @@
 #import <ptrauth.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <sys/socket.h>
+#import <sys/un.h>
+#import "macws_host_protocol.h"
 
 // GlassDemo blur A/B fixture.  This is deliberately a render-input diagnostic,
 // not a graphics-protocol patch: it inserts a high-frequency stripe view below
@@ -4311,6 +4314,89 @@ static int  *macws_rfbScreen = NULL;
 static int   macws_vnc_test_on = 0;
 static int   macws_vnc_share_on = 0;
 
+// The exact arm64 OSXvnc binary installed on the device was disassembled on
+// 2026-07-26. -[VNCServer handleMouseButtons:atPoint:forClient:] receives the
+// button mask in x2, the RFB point in d0/d1, and the client in x3; its ordinary
+// path ends in CGPostMouseEvent. Runtime CGPreflightPostEventAccess is NO in
+// this launchd session, so those events never reach an AppKit application.
+// Preserve the original method (it owns OSXvnc's client/button bookkeeping),
+// then mirror the same state transition into macwsinputd's versioned socket.
+typedef void (*MacWSVNCHandleMouse)(id, SEL, unsigned int, CGPoint, id);
+static MacWSVNCHandleMouse macws_orig_vnc_handle_mouse = NULL;
+static BOOL macws_vnc_left_down = NO;
+static CGPoint macws_vnc_last_point = {-1.0, -1.0};
+
+static double macws_vnc_monotonic_seconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+static void macws_vnc_forward_input(MacWSInputKind kind, CGPoint point) {
+    if (!macws_rfbScreen) return;
+    int width = macws_rfbScreen[0];
+    int height = macws_rfbScreen[2];
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return;
+
+    // RFB reports logical Retina coordinates (1194x834 on iPad13,6). Passing
+    // the point and its matching coordinate-space dimensions preserves the
+    // same normalized location used by the 2388x1668 shared frame.
+    if (point.x < 0.0) point.x = 0.0;
+    if (point.y < 0.0) point.y = 0.0;
+    if (point.x >= width) point.x = width - 1;
+    if (point.y >= height) point.y = height - 1;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = kind,
+        .sceneID = 0x564e430000000001ull,
+        .timestamp = macws_vnc_monotonic_seconds(),
+        .x = (float)point.x,
+        .y = (float)point.y,
+        .pressure = (kind == MacWSInputKindTouchDown ||
+                     kind == MacWSInputKindTouchMove) ? 1.0f : 0.0f,
+        .contactID = 1,
+        .frameWidth = (uint32_t)width,
+        .frameHeight = (uint32_t)height,
+        .targetPID = 0,
+    };
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) return;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, "/private/tmp/macws_host_input.sock",
+            sizeof(address.sun_path));
+    ssize_t sent = sendto(fd, &record, sizeof(record), 0,
+                          (const struct sockaddr *)&address, sizeof(address));
+    close(fd);
+    if (kind == MacWSInputKindTouchDown || kind == MacWSInputKindTouchUp) {
+        fprintf(stderr,
+            "#### OSXVNC INPUT kind=%u point=(%.1f,%.1f)/%dx%d sent=%zd\n",
+            kind, point.x, point.y, width, height, sent);
+    }
+}
+
+static void macws_new_vnc_handle_mouse(id self, SEL command,
+        unsigned int buttons, CGPoint point, id client) {
+    if (macws_orig_vnc_handle_mouse)
+        macws_orig_vnc_handle_mouse(self, command, buttons, point, client);
+
+    BOOL leftDown = (buttons & 1u) != 0;
+    BOOL moved = point.x != macws_vnc_last_point.x ||
+                 point.y != macws_vnc_last_point.y;
+    if (leftDown && !macws_vnc_left_down) {
+        macws_vnc_forward_input(MacWSInputKindTouchDown, point);
+    } else if (leftDown && moved) {
+        macws_vnc_forward_input(MacWSInputKindTouchMove, point);
+    } else if (!leftDown && macws_vnc_left_down) {
+        macws_vnc_forward_input(MacWSInputKindTouchUp, point);
+    } else if (moved) {
+        macws_vnc_forward_input(MacWSInputKindHover, point);
+    }
+    macws_vnc_left_down = leftDown;
+    macws_vnc_last_point = point;
+}
+
 static IOSurfaceRef macws_vnc_src = NULL;
 // Returns true only when a complete mmap frame was copied.  A test gradient is
 // diagnostic output and deliberately does not count as a real shared frame.
@@ -4344,7 +4430,17 @@ static bool macws_vnc_fill_test(void) {
             char *data = (char *)rmap + 16;
             if (16 + sstride * sh <= rmap_sz) {
                 size_t sw = hdr[1];
-                size_t dw = (size_t)padded / (size_t)bytespp;
+                // paddedWidthInBytes is the server buffer stride, not its RFB
+                // visible width. On the Retina iPad it is 2388*4 while the
+                // advertised framebuffer is 1194 pixels wide. Treating the
+                // stride as dw copied the physical frame 1:1, then libvncserver
+                // transmitted only its left 1194 pixels: runtime input x=101
+                // visibly landed at x~=203. Scale to screen.width while still
+                // advancing destination rows by the padded stride.
+                size_t capacityWidth = (size_t)padded / (size_t)bytespp;
+                size_t dw = macws_rfbScreen[0] > 0
+                    ? (size_t)macws_rfbScreen[0] : capacityWidth;
+                if (dw > capacityWidth) return false;
                 if (bytespp == 4 && sw > 0 && sh > 0 && dw > 0 && height > 0 &&
                     (sw != dw || sh != (size_t)height)) {
                     for (size_t y = 0; y < (size_t)height; y++) {
@@ -4428,8 +4524,17 @@ static void macws_install_osxvnc_hooks(void) {
     macws_rfbScreen = (int *)(base + 0x79bf8);
     MSHookFunction(base + 0xd9d4, (void *)macws_new_rfbGetFB,     (void **)&macws_orig_rfbGetFB);
     MSHookFunction(base + 0xdc28, (void *)macws_new_rfbGetFBRect, (void **)&macws_orig_rfbGetFBRect);
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d) base=%p rfbScreen=%p\n",
+    Class serverClass = objc_getClass("VNCServer");
+    Method mouseMethod = serverClass ? class_getInstanceMethod(serverClass,
+        sel_registerName("handleMouseButtons:atPoint:forClient:")) : NULL;
+    if (mouseMethod) {
+        macws_orig_vnc_handle_mouse =
+            (MacWSVNCHandleMouse)method_getImplementation(mouseMethod);
+        method_setImplementation(mouseMethod, (IMP)macws_new_vnc_handle_mouse);
+    }
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input=%s) base=%p rfbScreen=%p\n",
             macws_vnc_test_on, macws_vnc_share_on,
+            mouseMethod ? "YES" : "NO",
             (void *)mh, (void *)macws_rfbScreen);
 }
 
@@ -5953,6 +6058,109 @@ static int macws_submit_bytes_are_zero(const unsigned char *p,
     return 1;
 }
 
+// TEMPORARY ABI-TRANSLATION EXPERIMENT for the wrapped single-segment form.
+//
+// Project LLDB stopped at the first non-InnocentVictim IOGPU completion on
+// 2026-07-26, before IOGPUMetalCommandBuffer released its storage.  The raw
+// callback error was 0x102 and the submitted CoreAnimation command had:
+//
+//   KCMD 0x868 bytes:
+//     +0x00 type=9, span=0x10, count=1       (wrapper)
+//     +0x10 type=0x10000, span=0x858         (known subtype-1 segment)
+//   segment list 0x148 bytes:
+//     +0x08 count=1, +0x0c=0x40000001       (wrapper)
+//     +0x14 nested-list offset=0x10
+//     +0x20 count=1, +0x24=0x80000130       (known inner list)
+//     +0x30 range=[0x10,0x868)
+//
+// Artifacts `/tmp/macws-raw102-{kcmd,segments}-20260726.bin` have SHA-256
+// 486bd31db1f26b541bd40fb2b4b8eba4f33178ac8bb750ebf569646a2ec7fe87
+// and 17c887655f3d4c649203f4a23a2182de7f45f716c8409a99ba481dca01887597.
+// The old normalizer required the vendor record at KCMD offset zero and a
+// top-level 0x130-byte list, so it skipped this command completely.  Preserve
+// both wrappers and normalize only the already-validated macOS subtype-1
+// record at +0x10, then update its exact inner range.  This has its own
+// /tmp/macws_kcmd_wrapped_fix experiment gate: the first A/B removed raw
+// parser error 0x102, but also made the PF550 SwapCancel loop advance at about
+// 55% CPU and the only decoded full frame was a solid error color.  Therefore
+// it must not silently become part of the broader /tmp/macws_kcmd_fix mode.
+static unsigned macws_translate_agx_wrapped_single_subtype1(
+    unsigned sequence, unsigned char *commands, size_t *total_io,
+    unsigned char *segment_list, size_t segment_length) {
+    if (!commands || !total_io || !segment_list ||
+        *total_io != 0x868 || segment_length != 0x148)
+        return 0;
+
+    size_t total = *total_io;
+    unsigned char *record = commands + 0x10;
+    int wrapper_ok =
+        *(uint32_t *)(commands + 0x00) == 9 &&
+        *(uint32_t *)(commands + 0x04) == 0x10 &&
+        *(uint32_t *)(commands + 0x08) == 1 &&
+        *(uint32_t *)(segment_list + 0x08) == 1 &&
+        *(uint32_t *)(segment_list + 0x0c) == 0x40000001 &&
+        *(uint32_t *)(segment_list + 0x14) == 0x10 &&
+        *(uint32_t *)(segment_list + 0x20) == 1 &&
+        *(uint32_t *)(segment_list + 0x24) == 0x80000130 &&
+        *(uint32_t *)(segment_list + 0x30) == 0x10 &&
+        *(uint32_t *)(segment_list + 0x34) == total;
+    int subtype1_ok =
+        *(uint32_t *)(record + 0x00) == 0x10000 &&
+        *(uint32_t *)(record + 0x04) == 0x858 &&
+        *(uint32_t *)(record + 0x28) == 0x818 &&
+        *(uint32_t *)(record + 0x2c) == 0x7e8 &&
+        *(uint32_t *)(record + 0x30) == 0x30 &&
+        *(uint32_t *)(record + 0x34) == 1 &&
+        memcmp(record + 0xd8,
+            "\x03\x00\x6b\x00\x12\x00\x3a\x00", 8) == 0 &&
+        macws_submit_bytes_are_zero(record + 0x1c0, 0x10) &&
+        *(uint32_t *)(record + 0x1e0) == 1 &&
+        *(uint32_t *)(record + 0x1e8) == 0x1c &&
+        memcmp(record + 0x1f8,
+            "\xff\xff\xff\xff\xff\xff\xff\xff"
+            "\xff\xff\xff\xff", 12) == 0 &&
+        macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
+        *(uint32_t *)(record + 0x4d0) == 0x3f800000 &&
+        (*(uint32_t *)(record + 0x4d4) == 0x100 ||
+         *(uint32_t *)(record + 0x4d4) == 0x300) &&
+        memcmp(record + 0x4e8,
+            "\xff\xff\xff\xff\xff\xff\xff\xff"
+            "\xff\xff\xff\xff", 12) == 0;
+    if (!wrapper_ok || !subtype1_ok)
+        return 0;
+
+    // Delete the same two macOS-only windows proven for the unwrapped form.
+    // Move the complete storage tail so the segment's opaque 0x40-byte trailer
+    // is preserved.  Work from the higher original offset downward.
+    memmove(record + 0x4c0, record + 0x4d0,
+            total - (0x10 + 0x4d0));
+    total -= 0x10;
+    memmove(record + 0x1c0, record + 0x1d0,
+            total - (0x10 + 0x1d0));
+    total -= 0x10;
+    memset(commands + total, 0, 0x20);
+
+    *(uint32_t *)(record + 0x04) = 0x838;
+    *(uint32_t *)(record + 0x28) = 0x7f8;
+    *(uint32_t *)(record + 0x2c) = 0x7c8;
+    *(uint32_t *)(segment_list + 0x34) = (uint32_t)total;
+    *total_io = total;
+
+    // CA_VSYNC_OFF can submit this command continuously while a consumer is
+    // connected.  Keep enough witnesses to prove the path remains active,
+    // without turning the diagnostic itself into a stderr/CPU storm.
+    static unsigned match_count;
+    unsigned observed = __atomic_add_fetch(&match_count, 1, __ATOMIC_RELAXED);
+    if (observed <= 4 || (observed & (observed - 1)) == 0) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-WRAPPED-FIX match=%u "
+            "type9=0x10 subtype1@0x10 span=0x858->0x838 "
+            "range=0x10..0x868->0x848 storage=0x868->0x848\n",
+            sequence, observed);
+    }
+    return 1;
+}
+
 // TEMPORARY ABI-TRANSLATION EXPERIMENT for a storage object containing more
 // than one segment.  Runtime capture of WindowServer submit #9 established
 // the segment-list framing on this exact iOS 16.3 device:
@@ -6273,6 +6481,27 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         // any temporary ABI translation.
         if (verbose) macws_submit_save_kcmd(result.sequence, descriptor_index,
                                             "pre", commands, total);
+
+        if (allow_fix && segment_length == 0x148 &&
+            access("/tmp/macws_kcmd_wrapped_fix", F_OK) == 0) {
+            unsigned wrapped_fixed =
+                macws_translate_agx_wrapped_single_subtype1(
+                    result.sequence, commands, &total,
+                    (unsigned char *)(uintptr_t)segment_start,
+                    segment_length);
+            if (wrapped_fixed) {
+                result.candidates += wrapped_fixed;
+                result.fixed += wrapped_fixed;
+                uint64_t new_current = start + total;
+                uint64_t new_current_raw =
+                    (current_raw & 0xffff000000000000ULL) | new_current;
+                *(uint64_t *)(uintptr_t)(state + 0x30) = new_current_raw;
+                current_raw = new_current_raw;
+                if (verbose) macws_submit_save_kcmd(
+                    result.sequence, descriptor_index,
+                    "wrapped-post", commands, total);
+            }
+        }
 
         if (allow_fix && segment_length >= 0x250) {
             unsigned multisegment_fixed =

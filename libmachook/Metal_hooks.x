@@ -154,7 +154,6 @@ static inline uint8_t macws_half_to_u8(uint16_t h) {
 // StartComposite argument may be released as soon as its hook returns.
 static id<MTLTexture> g_vnc_comp_tex = nil;
 static id g_vnc_lock = nil;
-static _Atomic int g_vnc_final_available = 0;
 static _Atomic uint64_t g_vnc_comp_max_area = 0;
 static id macws_vnc_retain(id obj) {
 #if __has_feature(objc_arc)
@@ -171,8 +170,7 @@ static void macws_vnc_release(id obj) {
 #endif
 }
 void macws_vnc_on_composite(id<MTLTexture> dest) {
-    if (!macws_vnc_share_enabled() || !dest ||
-        atomic_load(&g_vnc_final_available)) return;
+    if (!macws_vnc_share_enabled() || !dest) return;
     size_t candidateWidth = [dest width];
     size_t candidateHeight = [dest height];
     unsigned long candidatePixelFormat = (unsigned long)[dest pixelFormat];
@@ -214,22 +212,20 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
             for (;;) {
                 @autoreleasepool {
                     id<MTLTexture> t = nil;
-                    if (!atomic_load(&g_vnc_final_available)) {
-                        @synchronized(g_vnc_lock) {
-                            t = macws_vnc_retain(g_vnc_comp_tex);
-                            // Consume each completed composite once.  The old
-                            // loop retained and re-blitted the same texture at
-                            // 20 fps forever; runtime lifecycle logs showed
-                            // that this eventually advanced IOMFB into a
-                            // PF550 SwapCancel/replacement-surface storm even
-                            // though no new VNC frame existed.  A later frame
-                            // replaces this slot in macws_vnc_on_composite,
-                            // naturally coalescing producers faster than the
-                            // background copy without dropping ownership.
-                            id consumed = g_vnc_comp_tex;
-                            g_vnc_comp_tex = nil;
-                            macws_vnc_release(consumed);
-                        }
+                    @synchronized(g_vnc_lock) {
+                        t = macws_vnc_retain(g_vnc_comp_tex);
+                        // Consume each completed composite once.  The old
+                        // loop retained and re-blitted the same texture at
+                        // 20 fps forever; runtime lifecycle logs showed
+                        // that this eventually advanced IOMFB into a
+                        // PF550 SwapCancel/replacement-surface storm even
+                        // though no new VNC frame existed.  A later frame
+                        // replaces this slot in macws_vnc_on_composite,
+                        // naturally coalescing producers faster than the
+                        // background copy without dropping ownership.
+                        id consumed = g_vnc_comp_tex;
+                        g_vnc_comp_tex = nil;
+                        macws_vnc_release(consumed);
                     }
                     if (t) {
                     size_t w = [t width], h = [t height];
@@ -450,10 +446,9 @@ static BOOL macws_vnc_submit_read_pass(id<MTLCommandQueue> queue,
 }
 
 static void macws_vnc_capture_final(id<MTLTexture> src) {
-    // Each request carries a unique generation. Consume exactly one attempt
-    // for that generation, then unlink the request before doing GPU work. This
-    // keeps a failed private-PF550 read from becoming an unbounded retry loop,
-    // while allowing a later explicit App refresh to request another frame.
+    // Each request carries a unique generation.  It remains armed until one
+    // validated frame is published, with the bounded retry budget below
+    // preventing a failed private-PF550 read from becoming an unbounded loop.
     uint64_t generation = macws_vnc_capture_generation();
     if (generation == 0) return;
     if (!src) return;
@@ -482,12 +477,32 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
         return;
     }
 
-    static _Atomic uint64_t attemptedGeneration = 0;
-    if (atomic_exchange(&attemptedGeneration, generation) == generation)
+    // A request is complete only when a validated frame is published and ACKed.
+    // The old one-attempt state unlinked the request before GPU work; one
+    // transient InnocentVictim completion then left VNC black forever. Keep a
+    // strict per-generation retry budget. The tracking thread runs at 5 Hz and
+    // only calls us for a new completed scanout serial, so four attempts are
+    // bounded in both rate and resource use.
+    static uint64_t activeGeneration = 0;
+    static unsigned activeAttempts = 0;
+    static uint64_t exhaustedGeneration = 0;
+    if (activeGeneration != generation) {
+        activeGeneration = generation;
+        activeAttempts = 0;
+    }
+    if (activeAttempts >= 4) {
+        if (exhaustedGeneration != generation) {
+            exhaustedGeneration = generation;
+            fprintf(stderr,
+                "#### VNC-FINAL generation=%llu exhausted 4 attempts "
+                "without a validated frame\n",
+                (unsigned long long)generation);
+        }
         return;
-    (void)unlink("/tmp/macws_capture_final");
-    fprintf(stderr, "#### VNC-FINAL consuming generation=%llu\n",
-            (unsigned long long)generation);
+    }
+    unsigned captureAttempt = ++activeAttempts;
+    fprintf(stderr, "#### VNC-FINAL consuming generation=%llu attempt=%u/4\n",
+            (unsigned long long)generation, captureAttempt);
 
     static id<MTLDevice> dev = nil;
     static id<MTLCommandQueue> queue = nil;
@@ -598,12 +613,12 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
     // this queue/destination and this precompiled shader can execute before
     // attributing an error to private pf550.  The known-color control is never
     // copied into the VNC mmap and therefore cannot masquerade as a screenshot.
-    static int controlAttempted = 0;
+    static int controlAttempts = 0;
     static BOOL controlOK = NO;
     static IOSurfaceRef controlSurface = NULL;
     static id<MTLTexture> controlTexture = nil;
-    if (!controlAttempted) {
-        controlAttempted = 1;
+    if (!controlOK && controlAttempts < 4) {
+        controlAttempts++;
         BOOL clearExecuted = macws_vnc_submit_read_pass(queue, pipeline, nil, dst,
             @"MACWS VNC clear-only control", NO);
         BOOL clearPixelsOK = NO;
@@ -644,6 +659,12 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
             @"IOSurfaceBytesPerElement": @4,
             @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
         };
+        macws_vnc_release(controlTexture);
+        controlTexture = nil;
+        if (controlSurface) {
+            CFRelease(controlSurface);
+            controlSurface = NULL;
+        }
         controlSurface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
         if (controlSurface &&
             IOSurfaceLock(controlSurface, 0, NULL) == 0) {
@@ -722,25 +743,68 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
     void *shared = macws_vnc_mmap_data(outw, outh);
     BOOL copied = NO;
     size_t nonzero = 0;
+    size_t different = 0;
+    uint32_t firstSample = 0;
+    BOOL haveFirstSample = NO;
     if (base && shared && bpr >= outw * 4 && bh >= outh) {
-        for (size_t y = 0; y < outh; y++) {
-            memcpy((char *)shared + y * outw * 4,
-                   (char *)base + y * bpr, outw * 4);
+        // Validate the GPU result before publishing it. Runtime capture on
+        // 2026-07-26 proved that a failed PF550 source can still complete this
+        // diagnostic shader pass with every output pixel set to solid magenta.
+        // Merely requiring nonzero bytes acknowledged that error color as a
+        // desktop frame. A real desktop may be mostly dark, but display-sized
+        // menu/window content must produce more than one sampled BGRA value.
+        for (size_t y = 0; y < outh; y += 16) {
+            const uint32_t *row = (const uint32_t *)((const char *)base + y * bpr);
+            for (size_t x = 0; x < outw; x += 16) {
+                uint32_t pixel = row[x];
+                if (pixel != 0) nonzero++;
+                if (!haveFirstSample) {
+                    firstSample = pixel;
+                    haveFirstSample = YES;
+                } else if (pixel != firstSample) {
+                    different++;
+                }
+            }
         }
-        copied = YES;
-        for (size_t off = 0; off < outw * outh * 4; off += 4096) {
-            if (((uint8_t *)shared)[off]) nonzero++;
+        if (different >= 4) {
+            for (size_t y = 0; y < outh; y++) {
+                memcpy((char *)shared + y * outw * 4,
+                       (char *)base + y * bpr, outw * 4);
+            }
+            copied = YES;
         }
         static int capturedLog = 0;
-        if (capturedLog++ < 6) {
+        if (capturedLog++ < 8) {
             fprintf(stderr,
                 "#### VNC-FINAL captured %zux%zu BGRA8 cpu130=%p base=%p "
-                "bpr=%zu sampled_nonzero=%zu\n",
-                outw, outh, cpuMapping, base, bpr, nonzero);
+                "bpr=%zu sampled_nonzero=%zu sampled_different=%zu "
+                "publish=%s\n",
+                outw, outh, cpuMapping, base, bpr, nonzero, different,
+                copied ? "YES" : "REJECT-SOLID");
         }
     }
     IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
-    if (copied && nonzero != 0) macws_vnc_ack_capture(generation);
+    if (copied && nonzero != 0) {
+        // PF550 is a one-shot high-quality snapshot, not a terminal state for
+        // the streaming bridge.  Runtime input testing on 2026-07-26 proved
+        // that turning the PF80/115 publisher off here permanently froze VNC
+        // on this frame even though the click reached Terminal and generated
+        // later composites.  Drop any already-queued older PF80 frame so it
+        // cannot immediately overwrite this snapshot, but keep accepting new
+        // completed PF80/115 frames after the next UI update.
+        if (g_vnc_lock) {
+            @synchronized(g_vnc_lock) {
+                id oldComposite = g_vnc_comp_tex;
+                g_vnc_comp_tex = nil;
+                macws_vnc_release(oldComposite);
+            }
+        }
+        // Do not remove a newer request that may have arrived while this GPU
+        // work was in flight.
+        if (macws_vnc_capture_generation() == generation)
+            (void)unlink("/tmp/macws_capture_final");
+        macws_vnc_ack_capture(generation);
+    }
 }
 
 static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
@@ -774,14 +838,6 @@ static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
         }];
     });
 
-    atomic_store(&g_vnc_final_available, 1);
-    if (g_vnc_lock) {
-        @synchronized(g_vnc_lock) {
-            id oldComposite = g_vnc_comp_tex;
-            g_vnc_comp_tex = nil;
-            macws_vnc_release(oldComposite);
-        }
-    }
     @synchronized(g_vnc_final_lock) {
         id oldTexture = g_vnc_final_tex;
         IOSurfaceRef oldSurface = g_vnc_final_surface;
@@ -852,8 +908,32 @@ void macws_vnc_complete_composite(void *context) {
     // matching command buffer at MetalContext+0x68 has actually completed.
     if (width >= 1000 && height >= 600 &&
         (pixelFormat == 550 || pixelFormat == 80 || pixelFormat == 115)) {
-        @synchronized(g_vnc_composite_stages) {
-            g_vnc_composite_pending[key] = texture;
+        // The same MetalContext also completes per-window intermediates. Keep
+        // the largest display-sized target invariant for PF550 as well as the
+        // PF80 blit path; otherwise a later 1140x798 Terminal composite can
+        // replace the completed 2388x1668 scanout before EndUpdate publishes
+        // it, producing the magnified/cropped VNC frame seen at runtime.
+        uint64_t candidateArea = (uint64_t)width * height;
+        uint64_t maxArea = atomic_load(&g_vnc_comp_max_area);
+        while (candidateArea > maxArea &&
+               !atomic_compare_exchange_weak(&g_vnc_comp_max_area,
+                                             &maxArea, candidateArea)) {}
+        maxArea = atomic_load(&g_vnc_comp_max_area);
+        if (candidateArea >= maxArea) {
+            @synchronized(g_vnc_composite_stages) {
+                g_vnc_composite_pending[key] = texture;
+            }
+        } else {
+            static _Atomic unsigned int rejectedFinal = 0;
+            unsigned int rejected = atomic_fetch_add(&rejectedFinal, 1) + 1;
+            if (rejected <= 8 || (rejected % 600) == 0) {
+                fprintf(stderr,
+                    "#### VNC-ENDCOMPOSITE reject intermediate #%u "
+                    "%zux%zu pf=%lu area=%llu displayArea=%llu\n",
+                    rejected, width, height, pixelFormat,
+                    (unsigned long long)candidateArea,
+                    (unsigned long long)maxArea);
+            }
         }
     }
     macws_vnc_release(texture);
@@ -928,6 +1008,8 @@ void macws_vnc_finish_update(void *context) {
             }
             NSError *error = status == MTLCommandBufferStatusError
                 ? [commandBuffer error] : nil;
+            NSInteger errorCode = error ? [error code] : 0;
+            NSString *errorDomain = error ? [error domain] : nil;
             unsigned long completedPF = (unsigned long)[texture pixelFormat];
             static _Atomic int pollLog = 0;
             int n = atomic_fetch_add(&pollLog, 1);
@@ -940,18 +1022,39 @@ void macws_vnc_finish_update(void *context) {
                 // an error object owned by the simulator compatibility layer.
                 fprintf(stderr,
                     "#### VNC-ENDUPDATE-POLL #%d context=%p tex=%p pf=%lu "
-                    "cb=%p status=%ld polls=%u error=%p\n",
+                    "cb=%p status=%ld polls=%u error=%p domain=%p code=%ld\n",
                     n, context, (void *)texture, completedPF,
                     (void *)commandBuffer, (long)status, polls,
-                    (void *)error);
+                    (void *)error, (void *)errorDomain, (long)errorCode);
             }
-            if (status == MTLCommandBufferStatusCompleted && !error) {
+            BOOL completedCleanly =
+                status == MTLCommandBufferStatusCompleted && !error;
+            // TEMPORARY DIAGNOSTIC, not a compositor fix.  A failed source is
+            // never eligible for the normal capture path: runtime input logs
+            // showed failed PF550 buffers replacing several clean buffers and
+            // decoding to the driver's solid ff00ffff error image.  Keep the
+            // old inspection facility behind its own explicit sentinel so a
+            // capture request alone cannot poison the completed-source slot.
+            BOOL inspectFailedPF550 = deepCapture && completedPF == 550 &&
+                status == MTLCommandBufferStatusError &&
+                access("/tmp/macws_inspect_failed_pf550", F_OK) == 0;
+            if (completedCleanly || inspectFailedPF550) {
                 if (completedPF == 550) {
                     void *impl = *(void **)((char *)(__bridge void *)texture + 0x208);
                     IOSurfaceRef surface = (uintptr_t)impl > 0x1000
                         ? *(IOSurfaceRef *)((char *)impl + 0xa0) : NULL;
-                    if (surface) macws_vnc_track_final(texture, surface);
-                } else if (completedPF == 80 || completedPF == 115) {
+                    if (surface) {
+                        if (inspectFailedPF550) {
+                            fprintf(stderr,
+                                "#### VNC-DIAGNOSTIC inspecting failed PF550 "
+                                "tex=%p cb=%p error=%p\n",
+                                (void *)texture, (void *)commandBuffer,
+                                (void *)error);
+                        }
+                        macws_vnc_track_final(texture, surface);
+                    }
+                } else if (completedCleanly &&
+                           (completedPF == 80 || completedPF == 115)) {
                     macws_vnc_on_composite(texture);
                 }
             }

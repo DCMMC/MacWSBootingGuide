@@ -1140,6 +1140,41 @@ the watchdog removes all three.
 Verbatim reports, logs, hashes, and the before/after mmap headers are in
 [`docs/evidence/coexist-vnc-stability-20260726.txt`](evidence/coexist-vnc-stability-20260726.txt).
 
+## 2026-07-26: undistorted VNC, dynamic refresh, and real AppKit control input
+
+The stretched image was an RFB metadata bug: the delivery hook used
+`paddedWidthInBytes / 4` (2400) as the visible width instead of rfbScreen's
+1194-pixel width.  The bridge now preserves the 1194x834 logical desktop while
+sampling the 2388x1668 Retina frame.  Largest-area source selection also keeps
+1140x798 Terminal intermediates from replacing the display composite.
+
+The apparent input failure had three independent, runtime-confirmed causes.
+`macwsinputd` originally forwarded targetPID zero even after resolving a live
+application; the AppKit bridge then rejected the record.  Separately queued
+CFRunLoop blocks reversed down/up on the device.  Finally, a synchronous
+mouse-down could enter AppKit control tracking before mouse-up was available.
+The route now writes the resolved PID, the application endpoint maintains an
+explicit FIFO, and complete RFB taps enter normal AppKit tracking with the
+matching up already queued.
+
+A non-destructive click on Terminal's top-right tab area changed the RFB raw
+frame SHA-256 from `cc00b054...` to `3dfa9dbb...`, activated the target window,
+and returned through `APP-INPUT POST kind=3`; Terminal stayed responsive.
+Clicking a close button also reached `NSControlTrackMouse → sendAction: →
+NSWindow __close`, but LLDB then found Terminal waiting in its own close
+cleanup at `objc_sync_enter`.  That application-specific deadlock remains an
+open issue and is not masked by invoking the close action directly.
+
+Dynamic refresh was independently frozen by a permanent
+`g_vnc_final_available` latch after the first PF550 screenshot.  The one-shot
+capture no longer disables the PF80/115 stream.  Failed PF550 command buffers
+are excluded from normal capture-source selection, and a diversity check
+rejects the driver's solid error colour.  The final post-input frame logged
+`sampled_different=15609 publish=YES` and acknowledged the exact input capture
+generation.  Full log excerpts, hashes, LLDB frames, and safety boundary are
+in
+[`docs/evidence/coexist-vnc-input-refresh-20260726.txt`](evidence/coexist-vnc-input-refresh-20260726.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator
@@ -1152,8 +1187,9 @@ Verbatim reports, logs, hashes, and the before/after mmap headers are in
    coexistence completion model, then repeat a substantially longer VNC/blur
    soak.  The catastrophic IOSurface accumulation is fixed; the remaining
    requirement is protocol confidence rather than process-uptime evidence.
-4. Add keyboard/scroll/right-click semantics to the M4 target-process input
-   route and capture a Terminal text-entry witness.
+4. RE Terminal's close-cleanup lock from the captured `__close` stack, then
+   add keyboard/scroll/right-click semantics to the target-process input route
+   and capture a Terminal text-entry witness.
 5. RE Activity Monitor and Finder's actual startup actions before adding any
    launch hook; do not guess selectors or force startup-success branches.
 6. Replace the full-display snapshot with a window registry and

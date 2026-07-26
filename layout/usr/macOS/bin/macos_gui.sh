@@ -50,6 +50,8 @@ INPUT_LABEL=com.macwsguide.input
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
 EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
+EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
+EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
@@ -389,7 +391,8 @@ stop_all() {
     # the diagnostic sentinels itself.  Otherwise the next ordinary CLI start
     # silently inherits experimental protocol behavior.
     rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_VNC_SHARE"
+        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_CAPTURE" \
+        "$EXPERIMENTAL_CAPTURE_DONE"
     log "Restoring iOS (SpringBoard / backboardd)..."
     launchctl load "$BACKBOARDD"  2>/dev/null
     launchctl load "$SPRINGBOARD" 2>/dev/null
@@ -475,6 +478,24 @@ enable_experimental_if_requested() {
     log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + stable VNC mmap enabled."
 }
 
+arm_initial_vnc_capture_if_requested() {
+    [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
+    [ "$WANT_VNC" = 1 ] || return 0
+    # A WindowServer-only diagnostic start deliberately has no app content to
+    # capture.  Besides being misleading, arming here consumes the one-shot on
+    # an empty desktop before a debugger can launch the test application.
+    [ "$WANT_TERMINAL" = 1 ] || return 0
+    # The initial completed PF80 surface is runtime-confirmed to contain only
+    # alpha on some starts.  Request a bounded PF550 read after Terminal has
+    # launched so a newly connected VNC client receives a real first frame
+    # without needing a blind pointer movement.  WindowServer consumes this
+    # generation once and writes macws_capture_done only after a validated,
+    # spatially non-uniform frame has been published.
+    sleep 1
+    date +%s > "$EXPERIMENTAL_CAPTURE"
+    log "VNC: requested the initial post-Terminal shared frame."
+}
+
 # Launch the crash-loop watchdog in the background (iOS-side, survives SSH
 # disconnect via nohup). Re-invokes this script in `watchdog` mode.
 start_watchdog() {
@@ -494,6 +515,7 @@ case "$CMD" in
         enable_experimental_if_requested
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos
+        arm_initial_vnc_capture_if_requested
         start_watchdog
         echo
         log "Started in $MODE mode."
@@ -511,6 +533,7 @@ case "$CMD" in
         enable_experimental_if_requested
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos
+        arm_initial_vnc_capture_if_requested
         start_watchdog
         echo
         log "Restarted in $MODE mode."

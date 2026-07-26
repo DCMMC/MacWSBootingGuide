@@ -1,0 +1,146 @@
+Coexistence VNC geometry, dynamic refresh, and AppKit input evidence
+===================================================================
+
+Date: 2026-07-26
+Device: iPad13,6, iOS 16.3.1; macOS 13.4 chroot; native AGX path
+Mode: macos_gui.sh start coexist --experimental
+
+This record separates fixes from diagnostic scaffolding.  The command ABI and
+cancelled-swap switches enabled by --experimental remain explicitly temporary.
+The results below do not promote those switches to production fixes.
+
+1. Geometry root cause and correction
+-------------------------------------
+
+RE of the exact installed OSXvnc-server identifies rfbScreenInfo fields as:
+
+  visible width          rfbScreen + 0x00
+  paddedWidthInBytes     rfbScreen + 0x04
+  visible height         rfbScreen + 0x08
+  bitsPerPixel           rfbScreen + 0x10
+
+The old bridge derived destination width from paddedWidthInBytes / 4.  On this
+device that is 2400 pixels, while the RFB desktop is 1194 logical pixels and
+the shared Retina frame is 2388 pixels.  The bridge now scales from the visible
+width and caps source selection to the largest display-sized composite.  This
+prevents a later 1140x798 Terminal intermediate from replacing the 2388x1668
+display source.
+
+Runtime RFB witness after the correction:
+
+  RFB name='macOS-iPad' size=1194x834
+
+Visual inspection of /tmp/macws-plus-before.png and
+/tmp/macws-plus-after.png showed correct, undistorted Terminal window geometry.
+
+2. Input routing and ordering
+-----------------------------
+
+The exact OSXvnc Objective-C method
+`-[VNCServer handleMouseButtons:atPoint:forClient:]` is swizzled while its
+original implementation is preserved.  Its RFB point is forwarded through
+macwsinputd.  Because CGWindowListCopyWindowInfo is runtime-confirmed NULL in
+the daemon's launchd session, a targetPID=0 record falls back only when exactly
+one live per-application socket exists.  The resolved PID is written into the
+forwarded ABI record.
+
+The first implementation scheduled one CFRunLoop block per datagram.  The
+device log proved that the run loop reversed a down/up pair:
+
+  APP-INPUT RX ... kind=1
+  APP-INPUT RX ... kind=3
+  APP-INPUT MAIN ... kind=3
+  APP-INPUT MAIN ... kind=1
+
+The receiver now has one explicit FIFO.  For an RFB tap, it holds mouse-down
+until mouse-up arrives, places mouse-up at the head of NSApplication's event
+queue, then sends mouse-down through normal AppKit dispatch.  This lets an
+NSControl nested tracking loop consume the matching up without directly
+invoking a target action.
+
+Successful non-destructive Terminal interaction at RFB (1178,67):
+
+  #### APP-INPUT RX pid=35828 bytes=52 kind=1 target=35828
+  #### APP-INPUT RX pid=35828 bytes=52 kind=3 target=35828
+  #### APP-INPUT MAIN pid=35828 kind=1 target=35828 thread-main=YES
+  #### APP-INPUT DEFER pid=35828 kind=1 window=15
+  #### APP-INPUT MAIN pid=35828 kind=3 target=35828 thread-main=YES
+  #### APP-INPUT POST pid=35828 kind=3 window=15 screen=(1178.00,767.00) local=(554.00,357.00)
+
+The top-right Terminal window changed from inactive to active and Terminal
+remained responsive.  The RFB captures were:
+
+  before raw-RGBA SHA-256: cc00b0541ce2f7b68850b3b5b466d9873d3ae5a84490b184813bf5ad9ef75395
+  after  raw-RGBA SHA-256: 3dfa9dbba4dc8ae36abe2f0285a5f161922975aeb230a6d4a65303f3c32bc79c
+  before non-black: 538688 / 995796 (54.096%)
+  after  non-black: 537821 / 995796 (54.009%)
+
+PNG development artifacts and hashes:
+
+  /tmp/macws-plus-before.png
+  SHA-256 68ed01aa27e333a6f2be2860d717e18e935b5fd37e3c4841d619ddf94900af1f
+  /tmp/macws-plus-after.png
+  SHA-256 8abfa41cd55d874f16f6fb86e107c08b481ed4db654db0a1ffdb66457c9ca0c9
+
+3. Dynamic frame freeze root cause and correction
+--------------------------------------------------
+
+Source inspection and runtime sequencing confirmed two independent bad state
+transitions in the VNC publisher:
+
+* Publishing one validated PF550 snapshot set g_vnc_final_available forever.
+  Both the PF80/115 producer and its worker then rejected every later dynamic
+  composite even though input reached Terminal.
+* While an explicit capture was armed, a status-Error PF550 buffer was allowed
+  to replace completed buffers in the capture slot.  The texture-read control
+  passed, but those failed sources decoded to a solid driver error colour and
+  exhausted the retry budget.
+
+The one-shot PF550 path no longer disables the continuous PF80/115 publisher.
+Failed command buffers are excluded from normal source selection; inspecting
+one now requires the separate diagnostic sentinel
+`/tmp/macws_inspect_failed_pf550`.  A frame is published only after a 16x16
+sample grid contains at least four pixels different from the first sample.
+
+The post-input runtime witness is a completed, diverse frame and exact capture
+acknowledgement:
+
+  #### VNC-FINAL captured 2388x1668 BGRA8 cpu130=0x1488d4000 base=0x1488d4000 bpr=9600 sampled_nonzero=15750 sampled_different=15609 publish=YES
+  #### VNC-FINAL acknowledged pid=35801 generation=1785071925696016000
+
+This is why the second RFB capture above changes instead of remaining on the
+first frame.  The solid-magenta diagnostic remains rejected; it is not used as
+a synthetic screenshot.
+
+4. Terminal close-button boundary (separate application deadlock)
+-----------------------------------------------------------------
+
+A close-button tap at RFB (101,126) reached the real control action.  LLDB was
+attached with misc/ios_lldb_tmux.sh after the app stopped responding.  The
+main-thread stack was copied verbatim:
+
+  frame #2:  libobjc.A.dylib`objc_sync_enter + 40
+  frame #3:  Terminal`___lldb_unnamed_symbol1365 + 48
+  frame #8:  AppKit`__19-[NSWindow __close]_block_invoke + 136
+  frame #9:  AppKit`-[NSWindow __close] + 272
+  frame #10: AppKit`-[NSApplication(NSResponder) sendAction:to:from:] + 440
+  frame #11: AppKit`-[NSControl sendAction:to:] + 72
+  frame #15: AppKit`NSControlTrackMouse + 1480
+  frame #18: AppKit`-[NSControl mouseDown:] + 448
+  frame #23: AppKit`-[NSApplication(NSEvent) sendEvent:] + 1556
+  frame #25: libmachook.dylib`MacWSPostInputOnMainThread ... AppInputBridge.m:276:9
+
+Runtime-confirmed conclusion: the input reached NSWindow's real close action;
+Terminal subsequently waited on its own close-cleanup synchronization.  The
+cause of that Terminal-specific lock remains unresolved.  It must not be
+described as a missing mouse-up or fixed with a direct close/action bypass.
+
+5. Safety boundary
+------------------
+
+During the final interaction test WindowServer remained near 52% CPU.  The
+test stack was therefore stopped after evidence capture with:
+
+  sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop
+
+No GUI/debug process was intentionally left running.

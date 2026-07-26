@@ -19,7 +19,10 @@
 #import "macws_host_protocol.h"
 
 typedef id (*MacWSMsgID)(id, SEL);
+typedef id (*MacWSMsgIDInteger)(id, SEL, NSInteger);
 typedef CGRect (*MacWSMsgRect)(id, SEL);
+typedef CGRect (*MacWSMsgRectRect)(id, SEL, CGRect);
+typedef CGRect (*MacWSMsgRectRectID)(id, SEL, CGRect, id);
 typedef CGPoint (*MacWSMsgPointPoint)(id, SEL, CGPoint);
 typedef NSInteger (*MacWSMsgInteger)(id, SEL);
 typedef BOOL (*MacWSMsgBool)(id, SEL);
@@ -27,10 +30,38 @@ typedef id (*MacWSMouseEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
                                      NSTimeInterval, NSInteger, id, NSInteger,
                                      NSInteger, float);
 typedef void (*MacWSPostEvent)(id, SEL, id, BOOL);
+typedef void (*MacWSSendEvent)(id, SEL, id);
 
 static int MacWSAppInputSocket = -1;
 static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static NSInteger MacWSAppInputEventNumber;
+static NSMutableArray *MacWSAppInputPending;
+static BOOL MacWSAppInputDrainScheduled;
+// Main-thread-only. RFB tap-down is held until its matching up arrives. The
+// pair can then be delivered with up already in NSApplication's queue before
+// sendEvent(down) enters an NSButton/NSControl nested tracking loop.
+static CFTypeRef MacWSAppInputDeferredRFBDownEvent;
+// Main-thread-only.  Retain the window selected by mouse-down until the
+// matching up/cancel.  Runtime evidence showed a title-bar down can close the
+// front Terminal window synchronously; re-hit-testing the up then targeted the
+// newly exposed window (23 -> 6), splitting one gesture across two windows.
+static CFTypeRef MacWSAppInputGestureWindow;
+
+static void MacWSSetAppInputGestureWindow(id window) {
+    CFTypeRef replacement = window
+        ? CFRetain((__bridge CFTypeRef)window) : NULL;
+    CFTypeRef previous = MacWSAppInputGestureWindow;
+    MacWSAppInputGestureWindow = replacement;
+    if (previous) CFRelease(previous);
+}
+
+static void MacWSSetDeferredRFBDownEvent(id event) {
+    CFTypeRef replacement = event
+        ? CFRetain((__bridge CFTypeRef)event) : NULL;
+    CFTypeRef previous = MacWSAppInputDeferredRFBDownEvent;
+    MacWSAppInputDeferredRFBDownEvent = replacement;
+    if (previous) CFRelease(previous);
+}
 
 static BOOL MacWSAppInputSupportedProcess(void) {
     const char *program = getprogname();
@@ -75,11 +106,13 @@ static id MacWSWindowForScreenPoint(id application, CGPoint screenPoint) {
     SEL frameSelector = sel_registerName("frame");
     id keyWindow = ((MacWSMsgID)objc_msgSend)(application,
         sel_registerName("keyWindow"));
-    if (keyWindow) {
-        CGRect frame = ((MacWSMsgRect)objc_msgSend)(keyWindow, frameSelector);
-        if (MacWSPointInRect(screenPoint, frame)) return keyWindow;
-    }
-
+    // orderedWindows is front-to-back. A restored Terminal session can have
+    // several overlapping windows while keyWindow still names a covered one.
+    // Runtime LLDB evidence for a click on the visible front close button:
+    // choosing keyWindow produced local x=116 and dispatched to
+    // NSTitlebarView, whereas the visible front window starts at x~=174 and
+    // the button is at local x~=29. Hit-test stacking order before using the
+    // key/main window as an off-point fallback.
     id windows = ((MacWSMsgID)objc_msgSend)(application,
         sel_registerName("orderedWindows"));
     NSUInteger count = [windows count];
@@ -133,17 +166,71 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         screenFrame.origin.x + normalizedX * screenFrame.size.width,
         screenFrame.origin.y + (1.0 - normalizedY) * screenFrame.size.height,
     };
-    id window = MacWSWindowForScreenPoint(application, screenPoint);
+    id window = nil;
+    if (record.kind != MacWSInputKindTouchDown &&
+        record.kind != MacWSInputKindHover && MacWSAppInputGestureWindow) {
+        window = (__bridge id)MacWSAppInputGestureWindow;
+    } else {
+        window = MacWSWindowForScreenPoint(application, screenPoint);
+    }
     if (!window) {
         fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=no-window screen=(%.2f,%.2f)\n",
                 getpid(), screenPoint.x, screenPoint.y);
         return;
     }
+    if (record.kind == MacWSInputKindTouchDown)
+        MacWSSetAppInputGestureWindow(window);
     NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(window,
         sel_registerName("windowNumber"));
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,
         sel_registerName("convertPointFromScreen:"), screenPoint);
+    if (record.kind == MacWSInputKindTouchDown) {
+        static unsigned geometryLogs;
+        if (geometryLogs++ < 3) {
+            id ordered = ((MacWSMsgID)objc_msgSend)(application,
+                sel_registerName("orderedWindows"));
+            NSUInteger orderedCount = [ordered count];
+            for (NSUInteger index = 0; index < orderedCount && index < 12;
+                 index++) {
+                id candidate = [ordered objectAtIndex:index];
+                CGRect candidateFrame = ((MacWSMsgRect)objc_msgSend)(candidate,
+                    sel_registerName("frame"));
+                NSInteger candidateNumber = ((MacWSMsgInteger)objc_msgSend)(candidate,
+                    sel_registerName("windowNumber"));
+                BOOL visible = ((MacWSMsgBool)objc_msgSend)(candidate,
+                    sel_registerName("isVisible"));
+                BOOL key = candidate == ((MacWSMsgID)objc_msgSend)(application,
+                    sel_registerName("keyWindow"));
+                fprintf(stderr,
+                    "#### APP-INPUT WINDOW index=%lu number=%ld visible=%s "
+                    "key=%s frame=(%.1f,%.1f %.1fx%.1f) selected=%s\n",
+                    (unsigned long)index, (long)candidateNumber,
+                    visible ? "YES" : "NO", key ? "YES" : "NO",
+                    candidateFrame.origin.x, candidateFrame.origin.y,
+                    candidateFrame.size.width, candidateFrame.size.height,
+                    candidate == window ? "YES" : "NO");
+            }
+            id closeButton = ((MacWSMsgIDInteger)objc_msgSend)(window,
+                sel_registerName("standardWindowButton:"), 0);
+            id buttonSuperview = closeButton
+                ? ((MacWSMsgID)objc_msgSend)(closeButton,
+                    sel_registerName("superview")) : nil;
+            if (closeButton && buttonSuperview) {
+                CGRect buttonFrame = ((MacWSMsgRect)objc_msgSend)(closeButton,
+                    sel_registerName("frame"));
+                CGRect inWindow = ((MacWSMsgRectRectID)objc_msgSend)(buttonSuperview,
+                    sel_registerName("convertRect:toView:"), buttonFrame, nil);
+                CGRect inScreen = ((MacWSMsgRectRect)objc_msgSend)(window,
+                    sel_registerName("convertRectToScreen:"), inWindow);
+                fprintf(stderr,
+                    "#### APP-INPUT CLOSE window=%ld screen=(%.1f,%.1f %.1fx%.1f)\n",
+                    (long)windowNumber, inScreen.origin.x, inScreen.origin.y,
+                    inScreen.size.width, inScreen.size.height);
+            }
+            fflush(stderr);
+        }
+    }
     NSUInteger eventType = MacWSNSEventType((MacWSInputKind)record.kind);
     float pressure = record.kind == MacWSInputKindTouchDown ||
                      record.kind == MacWSInputKindTouchMove
@@ -156,10 +243,51 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=event-create window=%ld\n",
                 getpid(), (long)windowNumber);
+        if (record.kind == MacWSInputKindTouchUp ||
+            record.kind == MacWSInputKindTouchCancel) {
+            MacWSSetAppInputGestureWindow(nil);
+        }
         return;
     }
-    ((MacWSPostEvent)objc_msgSend)(application,
-        sel_registerName("postEvent:atStart:"), event, NO);
+    BOOL isRFB = record.sceneID == 0x564e430000000001ull;
+    if (isRFB && record.kind == MacWSInputKindTouchDown) {
+        // Do not enter control tracking until the complete tap is available.
+        // The chroot application has no ordinary login-session event pump;
+        // runtime evidence showed two postEvent: calls remain unconsumed.
+        MacWSSetDeferredRFBDownEvent(event);
+        if (logEvent) {
+            fprintf(stderr,
+                "#### APP-INPUT DEFER pid=%d kind=%u window=%ld\n",
+                getpid(), record.kind, (long)windowNumber);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (isRFB &&
+        (record.kind == MacWSInputKindTouchUp ||
+         record.kind == MacWSInputKindTouchCancel) &&
+        MacWSAppInputDeferredRFBDownEvent) {
+        id downEvent = (__bridge id)MacWSAppInputDeferredRFBDownEvent;
+        // Put mouse-up at the front before mouse-down enters a nested control
+        // tracking loop. AppKit consumes the matching up using its normal
+        // nextEventMatchingMask path; no target action is invoked directly.
+        ((MacWSPostEvent)objc_msgSend)(application,
+            sel_registerName("postEvent:atStart:"), event, YES);
+        ((MacWSSendEvent)objc_msgSend)(application,
+            sel_registerName("sendEvent:"), downEvent);
+        MacWSSetDeferredRFBDownEvent(nil);
+    } else {
+        // Native-host gestures, hover, and RFB drags keep ordinary queue
+        // semantics. Flush a deferred tap-down before the first drag record.
+        if (isRFB && MacWSAppInputDeferredRFBDownEvent) {
+            id downEvent = (__bridge id)MacWSAppInputDeferredRFBDownEvent;
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), downEvent, NO);
+            MacWSSetDeferredRFBDownEvent(nil);
+        }
+        ((MacWSPostEvent)objc_msgSend)(application,
+            sel_registerName("postEvent:atStart:"), event, NO);
+    }
     if (logEvent) {
         fprintf(stderr,
                 "#### APP-INPUT POST pid=%d kind=%u window=%ld screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
@@ -167,6 +295,71 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 screenPoint.x, screenPoint.y, windowPoint.x, windowPoint.y);
         fflush(stderr);
     }
+    if (record.kind == MacWSInputKindTouchUp ||
+        record.kind == MacWSInputKindTouchCancel) {
+        MacWSSetAppInputGestureWindow(nil);
+    }
+}
+
+// CFRunLoopPerformBlock does not promise ordering between separately queued
+// blocks. Runtime VNC evidence on 2026-07-26 showed the datagram thread receive
+// down(1) then up(3), while AppKit executed the two blocks as up(3) then
+// down(1). Keep one scheduled drain and an explicit FIFO so a gesture's event
+// order is invariant even in nested AppKit tracking run loops.
+static void MacWSDrainOneAppInputOnMainThread(void);
+
+static void MacWSScheduleAppInputDrain(void) {
+    CFRunLoopRef mainRunLoop = CFRunLoopGetMain();
+    CFRunLoopPerformBlock(mainRunLoop, kCFRunLoopCommonModes, ^{
+        MacWSDrainOneAppInputOnMainThread();
+    });
+    CFRunLoopWakeUp(mainRunLoop);
+}
+
+static void MacWSDrainOneAppInputOnMainThread(void) {
+    NSData *data = nil;
+    BOOL scheduleNext = NO;
+    @synchronized(MacWSAppInputPending) {
+        if ([MacWSAppInputPending count] != 0) {
+            data = [[MacWSAppInputPending objectAtIndex:0] retain];
+            [MacWSAppInputPending removeObjectAtIndex:0];
+            if ([MacWSAppInputPending count] != 0) {
+                // Keep the scheduled token and enqueue the next block before
+                // dispatching this event. sendEvent(mouseDown) can enter a
+                // nested button-tracking run loop; that loop must be able to
+                // execute the already-ordered mouseUp block to let the first
+                // sendEvent return.
+                scheduleNext = YES;
+            } else {
+                MacWSAppInputDrainScheduled = NO;
+            }
+        } else {
+            MacWSAppInputDrainScheduled = NO;
+        }
+    }
+    if (scheduleNext) MacWSScheduleAppInputDrain();
+    if ([data length] == sizeof(MacWSInputRecord)) {
+        MacWSInputRecord record = {0};
+        [data getBytes:&record length:sizeof(record)];
+        @autoreleasepool {
+            MacWSPostInputOnMainThread(record);
+        }
+    }
+    [data release];
+}
+
+static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
+    BOOL scheduleDrain = NO;
+    NSData *data = [NSData dataWithBytes:&record length:sizeof(record)];
+    @synchronized(MacWSAppInputPending) {
+        [MacWSAppInputPending addObject:data];
+        if (!MacWSAppInputDrainScheduled) {
+            MacWSAppInputDrainScheduled = YES;
+            scheduleDrain = YES;
+        }
+    }
+    if (!scheduleDrain) return;
+    MacWSScheduleAppInputDrain();
 }
 
 static void *MacWSAppInputThread(void *unused) {
@@ -197,23 +390,17 @@ static void *MacWSAppInputThread(void *unused) {
             continue;
         }
         // AppKit can spend long periods in nested modal/event-tracking loops
-        // (GlassDemo's diagnostic context menu does exactly that).  Such a
-        // loop does not necessarily drain libdispatch's main queue.  Schedule
-        // against the main CFRunLoop common modes so input is serviced both by
-        // the ordinary application loop and nested AppKit tracking loops.
-        CFRunLoopRef mainRunLoop = CFRunLoopGetMain();
-        CFRunLoopPerformBlock(mainRunLoop, kCFRunLoopCommonModes, ^{
-            @autoreleasepool {
-                MacWSPostInputOnMainThread(record);
-            }
-        });
-        CFRunLoopWakeUp(mainRunLoop);
+        // (GlassDemo's diagnostic context menu does exactly that). Enqueue an
+        // ordered drain in common modes so both ordinary and nested loops
+        // service input without reordering a gesture.
+        MacWSEnqueueAppInputRecord(record);
     }
     return NULL;
 }
 
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     if (!MacWSAppInputSupportedProcess()) return;
+    MacWSAppInputPending = [NSMutableArray new];
     snprintf(MacWSAppInputPath, sizeof(MacWSAppInputPath),
              "/private/tmp/macws_app_input.%d.sock", getpid());
     MacWSAppInputSocket = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -240,6 +427,8 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
 }
 
 __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
+    MacWSSetDeferredRFBDownEvent(nil);
+    MacWSSetAppInputGestureWindow(nil);
     if (MacWSAppInputSocket >= 0) close(MacWSAppInputSocket);
     if (MacWSAppInputPath[0]) unlink(MacWSAppInputPath);
 }

@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
@@ -261,6 +262,46 @@ static bool SendToAppInputBridge(int socketFD,
     return sent == (ssize_t)sizeof(*record);
 }
 
+// Runtime-confirmed on the chroot launchd session: CGWindowListCopyWindowInfo
+// returns NULL even though a Terminal AppInputBridge socket is live.  When
+// there is exactly one healthy AppKit endpoint, it is an unambiguous target
+// for targetPID=0 producers such as OSXvnc. Never broadcast, and never guess
+// when multiple applications are running.
+static pid_t SoleAppInputBridgePID(void) {
+    static const char prefix[] = "macws_app_input.";
+    static const char suffix[] = ".sock";
+    DIR *directory = opendir("/private/tmp");
+    if (!directory) return 0;
+    pid_t result = 0;
+    unsigned matches = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        const char *name = entry->d_name;
+        size_t length = strlen(name);
+        size_t prefixLength = sizeof(prefix) - 1;
+        size_t suffixLength = sizeof(suffix) - 1;
+        if (length <= prefixLength + suffixLength ||
+            strncmp(name, prefix, prefixLength) != 0 ||
+            strcmp(name + length - suffixLength, suffix) != 0) {
+            continue;
+        }
+        char *end = NULL;
+        long parsed = strtol(name + prefixLength, &end, 10);
+        if (!end || strcmp(end, suffix) != 0 || parsed <= 1 ||
+            parsed > INT32_MAX || kill((pid_t)parsed, 0) != 0) {
+            continue;
+        }
+        matches++;
+        result = (pid_t)parsed;
+        if (matches > 1) {
+            result = 0;
+            break;
+        }
+    }
+    closedir(directory);
+    return result;
+}
+
 // Arm capture before posting input so the producer cannot miss a fast redraw
 // that completes between CGEventPost and a later control-plane round trip.
 // Drag updates are coalesced to at most 5 snapshots/s; down/up/cancel are never
@@ -404,11 +445,20 @@ int main(void) {
                 gestureTarget = eventTarget;
         } else {
             eventTarget = WindowTargetAtPoint(point);
+            if (eventTarget.pid <= 1) {
+                eventTarget.pid = SoleAppInputBridgePID();
+            }
             if (record.kind == MacWSInputKindTouchDown)
                 gestureTarget = eventTarget;
         }
         uint64_t captureGeneration = ArmCaptureForInput(&record);
-        bool appBridgeSent = SendToAppInputBridge(socketFD, &record);
+        // WindowTargetAtPoint resolves targetPID=0 producers (including RFB)
+        // to an actual layer-zero AppKit window. Send that resolved PID on the
+        // wire; passing the original zero-valued record made
+        // SendToAppInputBridge reject it before sendto(2).
+        MacWSInputRecord routedRecord = record;
+        routedRecord.targetPID = eventTarget.pid;
+        bool appBridgeSent = SendToAppInputBridge(socketFD, &routedRecord);
         CGEventRef event = appBridgeSent ? NULL :
             CGEventCreateMouseEvent(NULL, eventType, point,
                                     MacWSCGMouseButtonLeft);

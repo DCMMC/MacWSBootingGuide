@@ -14,6 +14,7 @@ import binascii
 import hashlib
 import socket
 import struct
+import time
 import zlib
 
 
@@ -71,20 +72,39 @@ def security_handshake(sock, server_version):
             raise RuntimeError(f"RFB 3.3 server selected unsupported security type {security_type}")
 
 
-def capture(host, port, timeout):
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        server_version = recv_exact(sock, 12)
-        if not server_version.startswith(b"RFB "):
-            raise RuntimeError(f"invalid RFB version: {server_version!r}")
-        sock.sendall(b"RFB 003.008\n")
-        security_handshake(sock, server_version)
+def connect_rfb(host, port, timeout):
+    sock = socket.create_connection((host, port), timeout=timeout)
+    sock.settimeout(timeout)
+    server_version = recv_exact(sock, 12)
+    if not server_version.startswith(b"RFB "):
+        sock.close()
+        raise RuntimeError(f"invalid RFB version: {server_version!r}")
+    sock.sendall(b"RFB 003.008\n")
+    security_handshake(sock, server_version)
+    sock.sendall(b"\x01")  # ClientInit: shared session
+    init = recv_exact(sock, 24)
+    width, height = struct.unpack(">HH", init[:4])
+    name_length = struct.unpack(">I", init[20:24])[0]
+    name = recv_exact(sock, name_length).decode("utf-8", "replace")
+    return sock, width, height, name
 
-        sock.sendall(b"\x01")  # ClientInit: shared session
-        init = recv_exact(sock, 24)
-        width, height = struct.unpack(">HH", init[:4])
-        name_length = struct.unpack(">I", init[20:24])[0]
-        name = recv_exact(sock, name_length).decode("utf-8", "replace")
+
+def click(host, port, timeout, x, y):
+    sock, width, height, _ = connect_rfb(host, port, timeout)
+    try:
+        if not (0 <= x < width and 0 <= y < height):
+            raise ValueError(f"click ({x},{y}) outside RFB {width}x{height}")
+        # RFB PointerEvent: type, button-mask, x-position, y-position.
+        sock.sendall(struct.pack(">BBHH", 5, 1, x, y))
+        time.sleep(0.05)
+        sock.sendall(struct.pack(">BBHH", 5, 0, x, y))
+    finally:
+        sock.close()
+
+
+def capture(host, port, timeout):
+    sock, width, height, name = connect_rfb(host, port, timeout)
+    with sock:
 
         # SetPixelFormat: little-endian 32bpp true-colour, R@16 G@8 B@0.
         pixel_format = struct.pack(">BBBBHHHBBBxxx", 32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
@@ -142,6 +162,11 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--port", type=int, default=5900)
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--click", nargs=2, type=int, metavar=("X", "Y"),
+                        help="send a left-button down/up after the first capture")
+    parser.add_argument("--after",
+                        help="capture this PNG after --click and a short settle")
+    parser.add_argument("--settle", type=float, default=2.0)
     args = parser.parse_args()
 
     width, height, name, rgba, nonblack = capture(args.host, args.port, args.timeout)
@@ -151,6 +176,20 @@ def main():
     print(f"RFB name={name!r} size={width}x{height} raw_sha256={digest}")
     print(f"nonblack_pixels={nonblack}/{pixels} ({100.0 * nonblack / pixels:.3f}%)")
     print(f"wrote {args.output}")
+    if args.click:
+        click(args.host, args.port, args.timeout, *args.click)
+        print(f"sent left click at ({args.click[0]},{args.click[1]})")
+        time.sleep(args.settle)
+        if args.after:
+            width, height, name, rgba, nonblack = capture(
+                args.host, args.port, args.timeout)
+            write_rgba_png(args.after, width, height, rgba)
+            digest = hashlib.sha256(rgba).hexdigest()
+            pixels = width * height
+            print(f"after RFB name={name!r} size={width}x{height} raw_sha256={digest}")
+            print(f"after nonblack_pixels={nonblack}/{pixels} "
+                  f"({100.0 * nonblack / pixels:.3f}%)")
+            print(f"wrote {args.after}")
 
 
 if __name__ == "__main__":
