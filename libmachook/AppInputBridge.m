@@ -41,6 +41,11 @@ static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static NSInteger MacWSAppInputEventNumber;
 static NSMutableArray *MacWSAppInputPending;
 static BOOL MacWSAppInputDrainScheduled;
+// Serializes the socket thread's enqueue-vs-live-post decision with the main
+// thread arming a real AppKit tracking loop. Without this lock an up record can
+// decide to enqueue just before live mode starts, then enter the pending array
+// just after the main thread checked it and leave NSControlTrackMouse waiting.
+static pthread_mutex_t MacWSAppInputRouteLock = PTHREAD_MUTEX_INITIALIZER;
 // Main-thread-only. RFB tap-down is held until its matching up arrives. The
 // pair can then be delivered with up already in NSApplication's queue before
 // sendEvent(down) enters an NSButton/NSControl nested tracking loop.
@@ -57,6 +62,24 @@ static NSMutableArray *MacWSAppInputDeferredRFBMoveEvents;
 // updates before AppKit receives mouseDown.
 static BOOL MacWSAppInputRFBTrackingActive;
 static MacWSPressedMouseButtons MacWSOriginalPressedMouseButtons;
+typedef struct {
+    BOOL accepting;
+    uint32_t contactID;
+    NSInteger windowNumber;
+    CGRect screenFrame;
+    CGPoint windowMinusScreen;
+    Class eventClass;
+    CFTypeRef application;
+} MacWSDirectTrackingContext;
+static MacWSDirectTrackingContext MacWSAppInputDirectContext;
+
+typedef struct {
+    NSInteger windowNumber;
+    CGRect screenFrame;
+    CGPoint windowMinusScreen;
+    Class eventClass;
+    CFTypeRef application;
+} MacWSDirectTrackingSnapshot;
 // Main-thread-only.  Retain the window selected by mouse-down until the
 // matching up/cancel.  Runtime evidence showed a title-bar down can close the
 // front Terminal window synchronously; re-hit-testing the up then targeted the
@@ -120,6 +143,46 @@ static void MacWSSetDeferredRFBDownEvent(id event) {
 
 static void MacWSClearDeferredRFBMoveEvents(void) {
     [MacWSAppInputDeferredRFBMoveEvents removeAllObjects];
+}
+
+static NSInteger MacWSNextAppInputEventNumber(void) {
+    return __sync_add_and_fetch(&MacWSAppInputEventNumber, 1);
+}
+
+// MacWSAppInputRouteLock must be held by the caller.
+static void MacWSClearDirectTrackingContextLocked(void) {
+    MacWSAppInputDirectContext.accepting = NO;
+    if (MacWSAppInputDirectContext.application) {
+        CFRelease(MacWSAppInputDirectContext.application);
+        MacWSAppInputDirectContext.application = NULL;
+    }
+    MacWSAppInputDirectContext.contactID = 0;
+    MacWSAppInputDirectContext.windowNumber = 0;
+    MacWSAppInputDirectContext.screenFrame = (CGRect){0};
+    MacWSAppInputDirectContext.windowMinusScreen = (CGPoint){0};
+    MacWSAppInputDirectContext.eventClass = Nil;
+}
+
+// MacWSAppInputRouteLock must be held by the caller.
+static void MacWSArmDirectTrackingContextLocked(id application,
+                                                Class eventClass,
+                                                uint32_t contactID,
+                                                NSInteger windowNumber,
+                                                CGRect screenFrame,
+                                                CGPoint screenPoint,
+                                                CGPoint windowPoint) {
+    MacWSClearDirectTrackingContextLocked();
+    MacWSAppInputDirectContext.accepting = YES;
+    MacWSAppInputDirectContext.contactID = contactID;
+    MacWSAppInputDirectContext.windowNumber = windowNumber;
+    MacWSAppInputDirectContext.screenFrame = screenFrame;
+    MacWSAppInputDirectContext.windowMinusScreen = (CGPoint){
+        windowPoint.x - screenPoint.x,
+        windowPoint.y - screenPoint.y,
+    };
+    MacWSAppInputDirectContext.eventClass = eventClass;
+    MacWSAppInputDirectContext.application = application
+        ? CFRetain((__bridge CFTypeRef)application) : NULL;
 }
 
 static NSUInteger MacWSAppInputPressedMouseButtons(id self, SEL command) {
@@ -195,6 +258,109 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
+}
+
+// The route lock closes the only dangerous transition: a socket record either
+// enters MacWSAppInputPending before the main thread arms live tracking (and is
+// visible to its fallback check), or snapshots the armed context and is posted
+// directly. It cannot fall between those two states.
+static BOOL MacWSPrepareDirectTrackingPostLocked(
+        MacWSInputRecord record, MacWSDirectTrackingSnapshot *snapshot) {
+    BOOL isRFB = record.sceneID == 0x564e430000000001ull;
+    BOOL isTrackingRecord = record.kind == MacWSInputKindTouchMove ||
+        record.kind == MacWSInputKindTouchUp ||
+        record.kind == MacWSInputKindTouchCancel;
+    if (!isRFB || !isTrackingRecord ||
+        !MacWSAppInputDirectContext.accepting ||
+        MacWSAppInputDirectContext.contactID != record.contactID ||
+        !MacWSAppInputDirectContext.application ||
+        !MacWSAppInputDirectContext.eventClass) {
+        return NO;
+    }
+    snapshot->windowNumber = MacWSAppInputDirectContext.windowNumber;
+    snapshot->screenFrame = MacWSAppInputDirectContext.screenFrame;
+    snapshot->windowMinusScreen =
+        MacWSAppInputDirectContext.windowMinusScreen;
+    snapshot->eventClass = MacWSAppInputDirectContext.eventClass;
+    snapshot->application =
+        CFRetain(MacWSAppInputDirectContext.application);
+    if (record.kind == MacWSInputKindTouchUp ||
+        record.kind == MacWSInputKindTouchCancel) {
+        // The release is now owned by AppKit's event queue. Do not allow a
+        // later hover or duplicate transition to enter the same tracker.
+        MacWSAppInputDirectContext.accepting = NO;
+    }
+    return YES;
+}
+
+static void MacWSPostDirectTrackingRecord(
+        MacWSInputRecord record, MacWSDirectTrackingSnapshot snapshot) {
+    @autoreleasepool {
+        CGFloat normalizedX = record.x / (CGFloat)record.frameWidth;
+        CGFloat normalizedY = record.y / (CGFloat)record.frameHeight;
+        CGPoint screenPoint = {
+            snapshot.screenFrame.origin.x +
+                normalizedX * snapshot.screenFrame.size.width,
+            snapshot.screenFrame.origin.y +
+                (1.0 - normalizedY) * snapshot.screenFrame.size.height,
+        };
+        CGPoint windowPoint = {
+            screenPoint.x + snapshot.windowMinusScreen.x,
+            screenPoint.y + snapshot.windowMinusScreen.y,
+        };
+        float pressure = record.kind == MacWSInputKindTouchMove ? 1.0f : 0.0f;
+        id event = ((MacWSMouseEventFactory)objc_msgSend)(
+            (id)snapshot.eventClass,
+            sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+            MacWSNSEventType((MacWSInputKind)record.kind), windowPoint, 0,
+            record.timestamp, snapshot.windowNumber, nil,
+            MacWSNextAppInputEventNumber(), 1, pressure);
+        if (event) {
+            // Apple documents that events posted from subthreads enter the
+            // main-thread event queue. Appending preserves socket arrival
+            // order while NSControlTrackMouse is synchronously tracking.
+            ((MacWSPostEvent)objc_msgSend)(
+                (__bridge id)snapshot.application,
+                sel_registerName("postEvent:atStart:"), event, NO);
+            static unsigned liveMoveLogs;
+            if (record.kind != MacWSInputKindTouchMove || liveMoveLogs++ < 12) {
+                fprintf(stderr,
+                    "#### APP-INPUT LIVE-POST pid=%d kind=%u gesture=%u "
+                    "window=%ld screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
+                    getpid(), record.kind, record.contactID,
+                    (long)snapshot.windowNumber, screenPoint.x, screenPoint.y,
+                    windowPoint.x, windowPoint.y);
+                fflush(stderr);
+            }
+        } else {
+            fprintf(stderr,
+                "#### APP-INPUT LIVE-DROP pid=%d kind=%u gesture=%u "
+                "reason=event-create\n",
+                getpid(), record.kind, record.contactID);
+            fflush(stderr);
+        }
+    }
+    if (snapshot.application) CFRelease(snapshot.application);
+}
+
+// The caller holds MacWSAppInputRouteLock, so a socket record cannot pass its
+// direct-post decision while this scan is in progress.
+static BOOL MacWSHasPendingRFBTrackingRecordLocked(uint32_t contactID) {
+    @synchronized(MacWSAppInputPending) {
+        for (NSData *data in MacWSAppInputPending) {
+            if ([data length] != sizeof(MacWSInputRecord)) continue;
+            MacWSInputRecord pending = {0};
+            [data getBytes:&pending length:sizeof(pending)];
+            if (pending.sceneID == 0x564e430000000001ull &&
+                pending.contactID == contactID &&
+                (pending.kind == MacWSInputKindTouchMove ||
+                 pending.kind == MacWSInputKindTouchUp ||
+                 pending.kind == MacWSInputKindTouchCancel)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
 }
 
 static id MacWSWindowForScreenPoint(id application, CGPoint screenPoint) {
@@ -362,7 +528,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     id event = ((MacWSMouseEventFactory)objc_msgSend)((id)eventClass,
         sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
         eventType, windowPoint, 0, record.timestamp, windowNumber, nil,
-        ++MacWSAppInputEventNumber, 1, pressure);
+        MacWSNextAppInputEventNumber(), 1, pressure);
     if (!event) {
         fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=event-create window=%ld\n",
@@ -383,7 +549,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
             2 /* NSEventTypeLeftMouseUp */, windowPoint, 0,
             record.timestamp + 0.001, windowNumber, nil,
-            ++MacWSAppInputEventNumber, 1, 0.0f);
+            MacWSNextAppInputEventNumber(), 1, 0.0f);
         if (!upEvent) {
             fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=tap-up-create window=%ld gesture=%u\n",
@@ -431,17 +597,69 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             sel_registerName("postEvent:atStart:"), event, YES);
     } else if (isRFB && record.kind == MacWSInputKindTouchMove &&
                MacWSAppInputDeferredRFBDownEvent) {
-        // CFRunLoop blocks scheduled after sendEvent(mouseDown) were not run by
-        // every NSControl tracking loop on this chroot. Buffer ordinary AppKit
-        // drag events until release so down never enters tracking with a
-        // temporarily incomplete sequence. Keep only the newest position.
-        // The macOS 13.4 _NSMouseTracker explicitly enables event coalescing;
-        // runtime LLDB evidence showed a prefilled four-move burst invokes
-        // continueTracking: only once at a middle sample, whereas a single
-        // latest move lands at the release coordinate. Historical samples are
-        // therefore not merely optional here; retaining them loses accuracy.
-        [MacWSAppInputDeferredRFBMoveEvents removeAllObjects];
-        [MacWSAppInputDeferredRFBMoveEvents addObject:event];
+        // Start the real AppKit tracker as soon as the gesture crosses VNC's
+        // drag slop. While sendEvent(mouseDown) owns the main thread, the
+        // socket thread posts subsequent ordinary NSEvents directly into the
+        // application queue. NSApplication explicitly supports subthread
+        // postEvent:atStart: and wakes the main event queue.
+        //
+        // A fast gesture may already have records in MacWSAppInputPending. Do
+        // not start live mode in that case: its pre-scheduled CFRunLoop block
+        // is not guaranteed to execute inside every NSControl tracking loop.
+        // The route lock makes this test race-free against socket enqueue.
+        BOOL useBufferedFallback = NO;
+        id downEvent = nil;
+        pthread_mutex_lock(&MacWSAppInputRouteLock);
+        MacWSArmDirectTrackingContextLocked(application, eventClass,
+            record.contactID, windowNumber, screenFrame,
+            screenPoint, windowPoint);
+        useBufferedFallback =
+            MacWSHasPendingRFBTrackingRecordLocked(record.contactID);
+        if (useBufferedFallback) {
+            MacWSClearDirectTrackingContextLocked();
+        } else {
+            downEvent = [(__bridge id)MacWSAppInputDeferredRFBDownEvent retain];
+            MacWSSetDeferredRFBDownEvent(nil);
+            MacWSAppInputRFBTrackingActive = YES;
+            // Seed the queue before dispatching down. Future socket records
+            // append at the tail, preserving move...up arrival order.
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), event, YES);
+        }
+        pthread_mutex_unlock(&MacWSAppInputRouteLock);
+
+        if (useBufferedFallback) {
+            // Keep only the newest position. The macOS 13.4 _NSMouseTracker
+            // explicitly enables event coalescing; runtime LLDB evidence
+            // showed a prefilled four-move burst invokes continueTracking:
+            // once at a middle sample, while one latest move lands exactly at
+            // release.
+            [MacWSAppInputDeferredRFBMoveEvents removeAllObjects];
+            [MacWSAppInputDeferredRFBMoveEvents addObject:event];
+            fprintf(stderr,
+                "#### APP-INPUT LIVE-FALLBACK pid=%d gesture=%u "
+                "reason=pending-record\n",
+                getpid(), record.contactID);
+            fflush(stderr);
+        } else {
+            ((MacWSSendEvent)objc_msgSend)(application,
+                sel_registerName("sendEvent:"), downEvent);
+            pthread_mutex_lock(&MacWSAppInputRouteLock);
+            MacWSAppInputRFBTrackingActive = NO;
+            MacWSClearDirectTrackingContextLocked();
+            pthread_mutex_unlock(&MacWSAppInputRouteLock);
+            fprintf(stderr,
+                "#### APP-INPUT LIVE-DISPATCH-RETURN pid=%d gesture=%u "
+                "window=%ld first-move=(%.2f,%.2f)\n",
+                getpid(), record.contactID, (long)windowNumber,
+                screenPoint.x, screenPoint.y);
+            fflush(stderr);
+            MacWSLogAppInputGestureHitResult("live-drag", record.contactID);
+            [downEvent release];
+            MacWSSetAppInputGestureWindow(nil);
+            MacWSClearDeferredRFBMoveEvents();
+            return;
+        }
     } else if (isRFB &&
         (record.kind == MacWSInputKindTouchUp ||
          record.kind == MacWSInputKindTouchCancel) &&
@@ -642,11 +860,19 @@ static void *MacWSAppInputThread(void *unused) {
             fflush(stderr);
             continue;
         }
-        // AppKit can spend long periods in nested modal/event-tracking loops
-        // (GlassDemo's diagnostic context menu does exactly that). Enqueue an
-        // ordered drain in common modes so both ordinary and nested loops
-        // service input without reordering a gesture.
-        MacWSEnqueueAppInputRecord(record);
+        // During a real NSControl tracking loop the main thread is synchronous
+        // inside sendEvent(mouseDown), and that private tracker does not run
+        // our CFRunLoop common-mode drain. NSApplication documents subthread
+        // postEvent:atStart: as feeding the main event queue, so route live
+        // move/up records there. The route lock makes this mutually exclusive
+        // with the ordinary pending queue at the live-mode boundary.
+        MacWSDirectTrackingSnapshot snapshot = {0};
+        pthread_mutex_lock(&MacWSAppInputRouteLock);
+        BOOL postedDirectly =
+            MacWSPrepareDirectTrackingPostLocked(record, &snapshot);
+        if (!postedDirectly) MacWSEnqueueAppInputRecord(record);
+        pthread_mutex_unlock(&MacWSAppInputRouteLock);
+        if (postedDirectly) MacWSPostDirectTrackingRecord(record, snapshot);
     }
     return NULL;
 }
@@ -681,6 +907,10 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
 }
 
 __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
+    pthread_mutex_lock(&MacWSAppInputRouteLock);
+    MacWSAppInputRFBTrackingActive = NO;
+    MacWSClearDirectTrackingContextLocked();
+    pthread_mutex_unlock(&MacWSAppInputRouteLock);
     MacWSSetDeferredRFBDownEvent(nil);
     MacWSClearDeferredRFBMoveEvents();
     MacWSSetAppInputGestureWindow(nil);
