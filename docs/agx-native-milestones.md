@@ -1079,6 +1079,37 @@ iPadOS architecture. Verbatim runtime lines, package hashes, and the reboot
 boundary are in
 [`docs/evidence/ipados-native-host-control-m3-20260726.txt`](evidence/ipados-native-host-control-m3-20260726.txt).
 
+## 2026-07-26: M4 target-process touch and visible Terminal
+
+The M2 CGEvent result was corrected after a frozen-frame A/B: global and
+per-PID posts changed the receiver's observable cursor state but did not
+change a GlassDemo checkbox, and the runtime permission probe returned
+`CGPreflightPostEventAccess=NO`. Input ABI v3 now includes the exact active
+application PID. `macwsinputd` forwards each validated record to a per-PID
+socket owned by the target AppKit process, where libmachook creates and posts
+an `NSEvent` on the main CFRunLoop's common modes.
+
+The project LLDB helper showed GlassDemo's main thread in its programmatically
+opened context-menu tracking loop. The first tap correctly dismisses that
+menu; the following tap changed 760 pixels in the checkbox's 28x28 region.
+This is the first visible control-state witness for iPadOS-hosted input.
+
+Testing non-demo apps also found two independent issues. A WindowServer crash
+report placed the fault in the observer's diagnostic
+`-[NSError description]` call, so error logging now treats the private object
+as opaque. RE of the actual Terminal image then showed that
+`-[TTApplication applicationShouldOpenUntitledFile:]` returns `NO` and its
+real action is `-[TTApplication newShell:]`. Invoking that application action
+after direct launch runtime-created three windows and produced an acknowledged
+shared frame containing a visible Terminal shell. No assertion/check or
+startup branch was bypassed.
+
+Continuous move/hover logging is now sampled while every down/up/cancel is
+kept, and cleanup closes the receiver socket from SIGTERM so it cannot remain
+as a restart-conflicting orphan. Verbatim logs, disassembly, pixel bounds, and
+artifact hashes are in
+[`docs/evidence/ipados-native-host-input-m4-20260726.txt`](evidence/ipados-native-host-input-m4-20260726.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator
@@ -1091,3 +1122,10 @@ boundary are in
    coexistence completion model, then repeat a substantially longer VNC/blur
    soak.  The catastrophic IOSurface accumulation is fixed; the remaining
    requirement is protocol confidence rather than process-uptime evidence.
+4. Add keyboard/scroll/right-click semantics to the M4 target-process input
+   route and capture a Terminal text-entry witness.
+5. RE Activity Monitor and Finder's actual startup actions before adding any
+   launch hook; do not guess selectors or force startup-success branches.
+6. Replace the full-display snapshot with a window registry and
+   producer-owned IOSurface ring so each macOS window can become an independent
+   iPadOS scene.

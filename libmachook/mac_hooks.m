@@ -262,6 +262,10 @@ static _Thread_local uint64_t g_macws_agx_initfull_len = 0;
 static _Atomic int g_macws_iomfb_coexist_swap_cancel = 0;
 static void macws_install_quartzcore_frame_info_hook(
     const struct mach_header *header);
+#if defined(LIBMACHOOK_ON_DEVICE_BUILD)
+static IOReturn (*g_macws_orig_iomfb_swap_end)(void *framebuffer) = NULL;
+static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer);
+#endif
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -1637,6 +1641,40 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         });
         // NSLog(@"#### debugbydcmmc loadImageCallback IOMobileFramebuffer modified");
+
+        // Hook the complete exported protocol operation, not the nested
+        // IOConnect call.  QuartzCore's chained binding is already fixed up by
+        // the time libmachook's interpose tuple is considered, so the tuple did
+        // not fire in the 2026-07-26 control run.  The actual image's wrapper
+        // is only four instructions; require all four before installing a
+        // Substrate trampoline.  A second libmachook slice sees the modified
+        // prologue and safely skips instead of stacking another hook.
+#if defined(LIBMACHOOK_ON_DEVICE_BUILD)
+        {
+            static const uint32_t expectedSwapEndWrapper[4] = {
+                0xb4000080, // cbz x0, +0x10
+                0xf9439401, // ldr x1, [x0, #0x728]
+                0xb4000041, // cbz x1, +0x8
+                0xd61f083f, // braaz x1
+            };
+            void *publicSwapEnd = (void *)((uintptr_t)header + 0x11cc);
+            if (memcmp(publicSwapEnd, expectedSwapEndWrapper,
+                       sizeof(expectedSwapEndWrapper)) == 0) {
+                MSHookFunction(publicSwapEnd,
+                    (void *)MacwsIOMobileFramebufferSwapEnd_new,
+                    (void **)&g_macws_orig_iomfb_swap_end);
+                fprintf(stderr,
+                    "#### COEXIST API SwapEnd hook installed target=%p trampoline=%p\n",
+                    publicSwapEnd, g_macws_orig_iomfb_swap_end);
+            } else {
+                const uint32_t *actual = (const uint32_t *)publicSwapEnd;
+                fprintf(stderr,
+                    "#### COEXIST API SwapEnd hook skipped: wrapper mismatch "
+                    "%#x %#x %#x %#x\n",
+                    actual[0], actual[1], actual[2], actual[3]);
+            }
+        }
+#endif
 
         // COEXISTENCE: WindowServer must finish every SwapBegin without
         // presenting over iOS's physical panel. The old patch changed
@@ -5592,9 +5630,15 @@ static void macws_enable_frame_info_tag_list(
     pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
     fprintf(stderr,
         "#### IOMFB CANCEL-COMPLETION observed enabled registration "
-        "fb=%p client=%u callback=%p context=%p flags=%#llx slot=%u\n",
+        "fb=%p client=%u callback=%p context=%p flags=%#llx slot=%u "
+        "vsync=%#x source=%#x displayTimer=%p fallbackTimer=%p runLoop=%p\n",
         framebuffer, client, callback, server,
-        (unsigned long long)flags, registration_slot);
+        (unsigned long long)flags, registration_slot,
+        *(const volatile uint8_t *)((const char *)server + 0x324),
+        *(const volatile uint8_t *)((const char *)server + 0x325),
+        *(void *const volatile *)((const char *)server + 0x298),
+        *(void *const volatile *)((const char *)server + 0x2a0),
+        *(void *const volatile *)((const char *)server + 0x278));
 }
 
 static void macws_install_quartzcore_frame_info_hook(
@@ -5702,6 +5746,13 @@ static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
         return;
     }
 
+    // Diagnostic scaffold only: the real cancelled-swap protocol still needs
+    // to be recovered from an iOS-native frame-info dictionary.  A 200-ms
+    // FIFO experiment was runtime-disproved on 2026-07-26: submissions were
+    // not completion-paced, so the FIFO grew without bound while WindowServer
+    // stayed at 83-86% CPU.  Deliver immediately to preserve the original
+    // one-submit/one-completion ownership invariant while that upstream
+    // protocol work continues.
     if (sequence <= 16 || (sequence % 600) == 0) {
         fprintf(stderr,
             "#### IOMFB CANCEL-COMPLETION schedule #%lu swapID=%u "
@@ -7294,9 +7345,19 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
     }
     if(IOConnectIsIOGPU(client)) {
-        // Resource create/destroy have their own structured AGX_LIFE logs;
-        // avoid multi-thousand-line-per-minute duplicate traffic here.
-        if ((orig != 0xa && orig != 0xb) || r != 0) {
+        // Resource create/destroy have their own structured AGX_LIFE logs.
+        // Successful submit/finalize calls are also a per-frame hot path: the
+        // previous unconditional line reached tens of thousands of writes in
+        // a two-minute idle session. Keep startup + periodic witnesses and
+        // every failure without turning stderr into part of the workload.
+        static _Atomic unsigned long methodSuccessCount[256];
+        unsigned index = orig < 256 ? orig : 255;
+        unsigned long successSequence = r == 0
+            ? atomic_fetch_add(&methodSuccessCount[index], 1) + 1 : 0;
+        BOOL logMethod = r != 0 ||
+            ((orig != 0xa && orig != 0xb) &&
+             (successSequence <= 8 || (successSequence % 1000) == 0));
+        if (logMethod) {
             fprintf(stderr,
                 "#### AGXIOC Method sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n",
                 orig, selector, inCnt, inStructCnt,
@@ -7419,9 +7480,65 @@ IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, c
     if (!caller_is_libmachook(__builtin_return_address(0)))
         selector = IOConnectTranslateSelector(client, selector);
     IOReturn r = IOConnectCallScalarMethod(client, selector, in, inCnt, out, outCnt);
-    if(IOConnectIsIOGPU(client) && orig != selector) fprintf(stderr, "#### AGXIOC Scalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
+    if(IOConnectIsIOGPU(client) && orig != selector) {
+        static _Atomic unsigned long scalarSuccessCount[256];
+        unsigned index = orig < 256 ? orig : 255;
+        unsigned long successSequence = r == 0
+            ? atomic_fetch_add(&scalarSuccessCount[index], 1) + 1 : 0;
+        if (r != 0 || successSequence <= 8 || (successSequence % 1000) == 0) {
+            fprintf(stderr,
+                "#### AGXIOC Scalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n",
+                orig, selector, inCnt, r);
+        }
+    }
     return r;
 }
+
+// RE-confirmed via the actual macOS 13.4 IOMobileFramebuffer image
+// 9485C742-B91F-3C6C-897C-AB2C8ACF7625:
+//
+//   kern_SwapEnd    0x18b026400..0x18b0264e0
+//     selector 5; then releases framebuffer+0xb00, increments +0x670, and
+//     periodically reports underrun analytics.
+//   kern_SwapCancel 0x18b026714..0x18b026778
+//     selector 0x34 with the swap ID; then returns directly.
+//
+// Translating only SwapEnd's nested IOConnect call to selector 0x34 therefore
+// ran the wrong user-space tail after a successful cancellation.  Interpose at
+// the exported protocol boundary instead: pair SwapBegin with the complete
+// public SwapCancel operation and never enter SwapEnd.  The narrow nested-call
+// adapter below remains only as a fail-safe for any direct kern_SwapEnd caller
+// that bypasses this exported API.
+extern IOReturn IOMobileFramebufferSwapEnd(MacwsIOMobileFramebufferRef framebuffer);
+extern IOReturn IOMobileFramebufferSwapCancel(
+    MacwsIOMobileFramebufferRef framebuffer, uint32_t swap_id);
+
+static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
+    if (!atomic_load(&g_macws_iomfb_coexist_swap_cancel) || !framebuffer) {
+        return g_macws_orig_iomfb_swap_end
+            ? g_macws_orig_iomfb_swap_end(framebuffer)
+            : IOMobileFramebufferSwapEnd(framebuffer);
+    }
+
+    uint32_t swap_id = *(const volatile uint32_t *)
+        ((const char *)framebuffer + 0x68);
+    IOReturn result = IOMobileFramebufferSwapCancel(framebuffer, swap_id);
+    static _Atomic unsigned long cancel_count = 0;
+    unsigned long sequence = atomic_fetch_add(&cancel_count, 1) + 1;
+    if (sequence <= 16 || (sequence % 600) == 0 || result != KERN_SUCCESS) {
+        fprintf(stderr,
+            "#### COEXIST API SwapCancel #%lu: fb=%p swapID=%u -> %#x "
+            "(SwapEnd tail skipped)\n",
+            sequence, framebuffer, swap_id, result);
+    }
+    if (result == KERN_SUCCESS) {
+        io_connect_t client = *(const volatile io_connect_t *)
+            ((const char *)framebuffer + 0x14);
+        macws_iomfb_complete_cancelled_swap(client, swap_id);
+    }
+    return result;
+}
+
 IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     int struct_skip = caller_is_libmachook(__builtin_return_address(0));

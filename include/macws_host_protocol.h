@@ -5,7 +5,7 @@
 
 #define MACWS_FRAME_MAGIC 0x564e4346u /* "VNCF" */
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
-#define MACWS_INPUT_VERSION 2u
+#define MACWS_INPUT_VERSION 3u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
 
 typedef struct __attribute__((packed)) {
@@ -38,14 +38,15 @@ typedef struct __attribute__((packed)) {
     uint32_t contactID;
     uint32_t frameWidth;
     uint32_t frameHeight;
+    int32_t targetPID;
 } MacWSInputRecord;
 
 #if defined(__cplusplus)
 static_assert(sizeof(MacWSFrameHeader) == 16, "MacWS frame header ABI");
-static_assert(sizeof(MacWSInputRecord) == 48, "MacWS input record ABI");
+static_assert(sizeof(MacWSInputRecord) == 52, "MacWS input record ABI");
 #else
 _Static_assert(sizeof(MacWSFrameHeader) == 16, "MacWS frame header ABI");
-_Static_assert(sizeof(MacWSInputRecord) == 48, "MacWS input record ABI");
+_Static_assert(sizeof(MacWSInputRecord) == 52, "MacWS input record ABI");
 #endif
 
 #endif

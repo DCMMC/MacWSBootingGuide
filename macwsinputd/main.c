@@ -4,6 +4,7 @@
 // this daemon is declared here and still linked against CoreGraphics.
 
 #include <errno.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <fcntl.h>
 #include <math.h>
 #include <signal.h>
@@ -16,6 +17,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "macws_host_protocol.h"
@@ -25,9 +27,8 @@ typedef uint32_t CGEventType;
 typedef uint32_t CGMouseButton;
 typedef uint32_t CGEventTapLocation;
 typedef uint32_t CGEventField;
-typedef struct { double x, y; } CGPoint;
-typedef struct { double width, height; } CGSize;
-typedef struct { CGPoint origin; CGSize size; } CGRect;
+typedef uint32_t CGWindowID;
+typedef uint32_t CGWindowListOption;
 typedef const void *CGEventRef;
 
 extern CGDirectDisplayID CGMainDisplayID(void);
@@ -41,7 +42,16 @@ extern CGPoint CGEventGetLocation(CGEventRef event);
 extern void CGEventSetIntegerValueField(CGEventRef event, CGEventField field,
                                         int64_t value);
 extern void CGEventPost(CGEventTapLocation tap, CGEventRef event);
-extern void CFRelease(const void *object);
+extern void CGEventPostToPid(pid_t pid, CGEventRef event);
+extern bool CGPreflightPostEventAccess(void);
+extern CFArrayRef CGWindowListCopyWindowInfo(CGWindowListOption option,
+                                             CGWindowID relativeToWindow);
+extern const CFStringRef kCGWindowNumber;
+extern const CFStringRef kCGWindowLayer;
+extern const CFStringRef kCGWindowBounds;
+extern const CFStringRef kCGWindowOwnerPID;
+extern bool CGRectMakeWithDictionaryRepresentation(CFDictionaryRef dictionary,
+                                                    CGRect *rect);
 
 enum {
     MacWSCGEventLeftMouseDown = 1,
@@ -51,15 +61,35 @@ enum {
     MacWSCGMouseButtonLeft = 0,
     MacWSCGHIDEventTap = 0,
     MacWSCGMouseEventClickState = 1,
+    MacWSCGMouseEventButtonNumber = 3,
+    MacWSCGMouseEventWindowUnderMousePointer = 91,
+    MacWSCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent = 92,
+    MacWSCGWindowListOptionOnScreenOnly = 1 << 0,
+    MacWSCGWindowListExcludeDesktopElements = 1 << 4,
 };
 
 static const char InputSocketPath[] = "/private/tmp/macws_host_input.sock";
 static const char InputLockPath[] = "/private/tmp/macws_host_input.lock";
+static const char CaptureRequestPath[] = "/tmp/macws_capture_final";
 static volatile sig_atomic_t StopRequested;
+static volatile sig_atomic_t InputSocketFD = -1;
+static uint64_t LastCaptureGeneration;
+static uint64_t LastContinuousCaptureNanoseconds;
+
+typedef struct {
+    pid_t pid;
+    int32_t windowID;
+} MacWSWindowTarget;
 
 static void HandleSignal(int signalNumber) {
     (void)signalNumber;
     StopRequested = 1;
+    // close(2) is async-signal-safe.  Closing the descriptor here makes a
+    // blocking recv(2) return even on systems where signal() installs a
+    // restarting handler, so launchd stop does not leave an orphan daemon.
+    int socketFD = (int)InputSocketFD;
+    InputSocketFD = -1;
+    if (socketFD >= 0) close(socketFD);
 }
 
 static const char *KindName(MacWSInputKind kind) {
@@ -79,7 +109,8 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         !isfinite(record->x) || !isfinite(record->y) ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
         record->x < 0.0f || record->y < 0.0f ||
-        record->x >= record->frameWidth || record->y >= record->frameHeight) {
+        record->x >= record->frameWidth || record->y >= record->frameHeight ||
+        record->targetPID < 0) {
         return false;
     }
     return record->kind >= MacWSInputKindTouchDown &&
@@ -133,6 +164,137 @@ static void ReadDisplayGeometry(CGDirectDisplayID *display, CGRect *bounds,
     *pixelHeight = CGDisplayPixelsHigh(*display);
 }
 
+static bool PointInRect(CGPoint point, CGRect rect) {
+    return point.x >= rect.origin.x && point.y >= rect.origin.y &&
+           point.x < rect.origin.x + rect.size.width &&
+           point.y < rect.origin.y + rect.size.height;
+}
+
+// CGEventPost(kCGHIDEventTap) updates the posting process's cursor state in
+// this chroot, but runtime capture proved that it does not route mouse events
+// into the frontmost AppKit process. Resolve the front-to-back, layer-zero
+// window containing the point and use CoreGraphics' public per-process route.
+// Window bounds and input points are both in Quartz logical coordinates.
+static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
+    MacWSWindowTarget target = {0};
+    static unsigned probeCount;
+    bool logProbe = probeCount++ < 2;
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        MacWSCGWindowListOptionOnScreenOnly |
+            MacWSCGWindowListExcludeDesktopElements,
+        0);
+    if (!windows) {
+        if (logProbe) {
+            fprintf(stderr,
+                    "MACWS-INPUT TARGET-LIST point=(%.2f,%.2f) result=NULL\n",
+                    point.x, point.y);
+            fflush(stderr);
+        }
+        return target;
+    }
+
+    CFIndex count = CFArrayGetCount(windows);
+    if (logProbe) {
+        fprintf(stderr,
+                "MACWS-INPUT TARGET-LIST point=(%.2f,%.2f) count=%ld\n",
+                point.x, point.y, (long)count);
+    }
+    for (CFIndex i = 0; i < count; i++) {
+        CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(windows, i);
+        CFNumberRef pidValue = (CFNumberRef)CFDictionaryGetValue(
+            info, kCGWindowOwnerPID);
+        CFNumberRef layerValue = (CFNumberRef)CFDictionaryGetValue(
+            info, kCGWindowLayer);
+        CFNumberRef windowValue = (CFNumberRef)CFDictionaryGetValue(
+            info, kCGWindowNumber);
+        CFDictionaryRef boundsValue = (CFDictionaryRef)CFDictionaryGetValue(
+            info, kCGWindowBounds);
+        int32_t pid = 0, layer = -1, windowID = 0;
+        CGRect bounds = {{0, 0}, {0, 0}};
+        bool decoded = pidValue && layerValue && windowValue && boundsValue &&
+            CFNumberGetValue(pidValue, kCFNumberSInt32Type, &pid) &&
+            CFNumberGetValue(layerValue, kCFNumberSInt32Type, &layer) &&
+            CFNumberGetValue(windowValue, kCFNumberSInt32Type, &windowID) &&
+            CGRectMakeWithDictionaryRepresentation(boundsValue, &bounds);
+        if (logProbe && i < 16) {
+            fprintf(stderr,
+                    "MACWS-INPUT TARGET-CANDIDATE index=%ld decoded=%s "
+                    "pid=%d layer=%d window=%d bounds=(%.1f,%.1f %.1fx%.1f) contains=%s\n",
+                    (long)i, decoded ? "YES" : "NO", pid, layer, windowID,
+                    bounds.origin.x, bounds.origin.y,
+                    bounds.size.width, bounds.size.height,
+                    decoded && PointInRect(point, bounds) ? "YES" : "NO");
+        }
+        if (!decoded) {
+            continue;
+        }
+        if (pid <= 1 || pid == getpid() || layer != 0 ||
+            !PointInRect(point, bounds)) {
+            continue;
+        }
+        target.pid = (pid_t)pid;
+        target.windowID = windowID;
+        break;
+    }
+    if (logProbe) fflush(stderr);
+    CFRelease(windows);
+    return target;
+}
+
+static uint64_t RealtimeNanoseconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static bool SendToAppInputBridge(int socketFD,
+                                 const MacWSInputRecord *record) {
+    if (record->targetPID <= 1) return false;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    int length = snprintf(address.sun_path, sizeof(address.sun_path),
+                          "/private/tmp/macws_app_input.%d.sock",
+                          record->targetPID);
+    if (length <= 0 || (size_t)length >= sizeof(address.sun_path)) return false;
+    ssize_t sent = sendto(socketFD, record, sizeof(*record), 0,
+                          (const struct sockaddr *)&address, sizeof(address));
+    return sent == (ssize_t)sizeof(*record);
+}
+
+// Arm capture before posting input so the producer cannot miss a fast redraw
+// that completes between CGEventPost and a later control-plane round trip.
+// Drag updates are coalesced to at most 5 snapshots/s; down/up/cancel are never
+// dropped.  This is a request for observation only and does not fabricate a
+// successful frame -- WindowServer still has to ACK the exact generation.
+static uint64_t ArmCaptureForInput(const MacWSInputRecord *record) {
+    uint64_t generation = RealtimeNanoseconds();
+    if (generation == 0) return 0;
+    bool continuous = record->kind == MacWSInputKindTouchMove ||
+                      record->kind == MacWSInputKindHover;
+    if (continuous && LastContinuousCaptureNanoseconds != 0 &&
+        generation - LastContinuousCaptureNanoseconds < 200000000ull) {
+        return 0;
+    }
+    if (generation <= LastCaptureGeneration)
+        generation = LastCaptureGeneration + 1;
+
+    char value[48];
+    int length = snprintf(value, sizeof(value), "%llu\n",
+                          (unsigned long long)generation);
+    int fd = open(CaptureRequestPath,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    ssize_t written = write(fd, value, (size_t)length);
+    close(fd);
+    if (written != length) {
+        unlink(CaptureRequestPath);
+        return 0;
+    }
+    LastCaptureGeneration = generation;
+    if (continuous) LastContinuousCaptureNanoseconds = generation;
+    return generation;
+}
+
 int main(void) {
     signal(SIGINT, HandleSignal);
     signal(SIGTERM, HandleSignal);
@@ -151,6 +313,7 @@ int main(void) {
         close(lockFD);
         return 1;
     }
+    InputSocketFD = socketFD;
 
     struct sockaddr_un address = {0};
     address.sun_family = AF_UNIX;
@@ -177,18 +340,24 @@ int main(void) {
     ReadDisplayGeometry(&display, &bounds, &pixelWidth, &pixelHeight);
     fprintf(stderr,
             "MACWS-INPUT READY socket=%s abi=%u record=%zu display=%u "
-            "bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu\n",
+            "bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu postAccess=%s\n",
             InputSocketPath, MACWS_INPUT_VERSION, sizeof(MacWSInputRecord),
             display, bounds.origin.x, bounds.origin.y,
-            bounds.size.width, bounds.size.height, pixelWidth, pixelHeight);
+            bounds.size.width, bounds.size.height, pixelWidth, pixelHeight,
+            CGPreflightPostEventAccess() ? "YES" : "NO");
     fflush(stderr);
 
     uint64_t sequence = 0;
     bool buttonDown = false;
+    MacWSWindowTarget gestureTarget = {0};
     while (!StopRequested) {
         MacWSInputRecord record = {0};
         ssize_t received = recv(socketFD, &record, sizeof(record), 0);
         if (received < 0) {
+            // SIGTERM closes InputSocketFD to wake this blocking recv.  EBADF
+            // is the expected half of that shutdown handshake, not a receiver
+            // failure worth surfacing to the App's diagnostics.
+            if (StopRequested || errno == EBADF) break;
             if (errno == EINTR) continue;
             fprintf(stderr, "MACWS-INPUT recv failed: %s\n", strerror(errno));
             break;
@@ -226,8 +395,23 @@ int main(void) {
 
         CGPoint point = QuartzPointForRecord(&record, bounds);
         CGEventType eventType = EventTypeForRecord(&record, &buttonDown);
-        CGEventRef event = CGEventCreateMouseEvent(NULL, eventType, point,
-                                                   MacWSCGMouseButtonLeft);
+        MacWSWindowTarget eventTarget = {0};
+        if (record.kind != MacWSInputKindHover && gestureTarget.pid > 1) {
+            eventTarget = gestureTarget;
+        } else if (record.targetPID > 1) {
+            eventTarget.pid = record.targetPID;
+            if (record.kind == MacWSInputKindTouchDown)
+                gestureTarget = eventTarget;
+        } else {
+            eventTarget = WindowTargetAtPoint(point);
+            if (record.kind == MacWSInputKindTouchDown)
+                gestureTarget = eventTarget;
+        }
+        uint64_t captureGeneration = ArmCaptureForInput(&record);
+        bool appBridgeSent = SendToAppInputBridge(socketFD, &record);
+        CGEventRef event = appBridgeSent ? NULL :
+            CGEventCreateMouseEvent(NULL, eventType, point,
+                                    MacWSCGMouseButtonLeft);
         bool created = event != NULL;
         CGPoint observed = {-1.0, -1.0};
         bool observedCursor = false;
@@ -238,7 +422,21 @@ int main(void) {
                 CGEventSetIntegerValueField(event,
                     MacWSCGMouseEventClickState, 1);
             }
-            CGEventPost(MacWSCGHIDEventTap, event);
+            CGEventSetIntegerValueField(event,
+                MacWSCGMouseEventButtonNumber, MacWSCGMouseButtonLeft);
+            if (eventTarget.pid > 1) {
+                if (eventTarget.windowID > 0) {
+                    CGEventSetIntegerValueField(event,
+                        MacWSCGMouseEventWindowUnderMousePointer,
+                        eventTarget.windowID);
+                    CGEventSetIntegerValueField(event,
+                        MacWSCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+                        eventTarget.windowID);
+                }
+                CGEventPostToPid(eventTarget.pid, event);
+            } else {
+                CGEventPost(MacWSCGHIDEventTap, event);
+            }
             CFRelease(event);
             unsigned sampleLimit =
                 record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC ? 21 : 1;
@@ -254,22 +452,41 @@ int main(void) {
             }
         }
         sequence++;
-        fprintf(stderr,
-                "MACWS-INPUT RX seq=%llu scene=%llx kind=%s "
-                "frame=(%.2f,%.2f)/%ux%u quartz=(%.2f,%.2f) event=%u "
-                "created=%s post=%s cursor=%s(%.2f,%.2f) samples=%u\n",
-                (unsigned long long)sequence,
-                (unsigned long long)record.sceneID,
-                KindName((MacWSInputKind)record.kind), record.x, record.y,
-                record.frameWidth, record.frameHeight, point.x, point.y,
-                eventType, created ? "YES" : "NO",
-                created ? "issued" : "not-issued",
-                observedCursor ? "observed" : "unavailable",
-                observed.x, observed.y, cursorSamples);
-        fflush(stderr);
+        bool continuous = record.kind == MacWSInputKindTouchMove ||
+                          record.kind == MacWSInputKindHover;
+        if (!continuous || (sequence % 60) == 0) {
+            fprintf(stderr,
+                    "MACWS-INPUT RX seq=%llu scene=%llx kind=%s "
+                    "target=%d frame=(%.2f,%.2f)/%ux%u quartz=(%.2f,%.2f) event=%u "
+                    "created=%s post=%s cursor=%s(%.2f,%.2f) samples=%u capture=%llu\n",
+                    (unsigned long long)sequence,
+                    (unsigned long long)record.sceneID,
+                    KindName((MacWSInputKind)record.kind), record.targetPID,
+                    record.x, record.y,
+                    record.frameWidth, record.frameHeight, point.x, point.y,
+                    eventType, created ? "YES" : "NO",
+                    appBridgeSent || created ? "issued" : "not-issued",
+                    observedCursor ? "observed" : "unavailable",
+                    observed.x, observed.y, cursorSamples,
+                    (unsigned long long)captureGeneration);
+            fprintf(stderr,
+                    "MACWS-INPUT ROUTE seq=%llu route=%s pid=%d window=%d\n",
+                    (unsigned long long)sequence,
+                    appBridgeSent ? "appkit-socket" :
+                        (eventTarget.pid > 1 ? "target-pid" : "global-fallback"),
+                    eventTarget.pid, eventTarget.windowID);
+            fflush(stderr);
+        }
+        if (record.kind == MacWSInputKindTouchUp ||
+            record.kind == MacWSInputKindTouchCancel) {
+            gestureTarget = (MacWSWindowTarget){0};
+        }
     }
 
-    close(socketFD);
+    if (InputSocketFD >= 0) {
+        close((int)InputSocketFD);
+        InputSocketFD = -1;
+    }
     flock(lockFD, LOCK_UN);
     close(lockFD);
     unlink(InputSocketPath);

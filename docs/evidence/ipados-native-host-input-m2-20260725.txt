@@ -120,3 +120,28 @@ Still required before claiming interactive control:
   semantics;
 - associate events with a real per-window ID once the scene/window registry
   replaces the current full-display mirror.
+
+5. 2026-07-26 correction: cursor state was not an AppKit-delivery witness
+---------------------------------------------------------------------------
+
+The M2 transport and coordinate arithmetic above remain valid, but the claim
+that cursor-state observation was progress toward target-application delivery
+was too strong.  A later exact before/after frame test sent down/up records to
+the GlassDemo checkbox: `CGEventPost(kCGHIDEventTap)` and
+`CGEventPostToPid()` both ran, yet the checkbox region did not change.
+
+The receiver's actual permission probe was:
+
+    MACWS-INPUT READY socket=/private/tmp/macws_host_input.sock abi=3 record=52 display=1 bounds=(0,0 1194x834) pixels=1194x834 postAccess=NO
+
+Adding PostEvent/Accessibility entitlement strings did not change that runtime
+result and those experimental entitlement edits were removed.  Therefore the
+M2 `CGEventCreate` + `CGEventGetLocation` sample proved only the posting
+process's observable cursor state, not that WindowServer routed an event into
+the target AppKit event queue.
+
+M4 supersedes the delivery half of this design with a PID-specific socket
+inside each supported AppKit process.  The unchanged validated ABI v3 record
+is converted to an `NSEvent` on that process's main CFRunLoop.  The corrected
+witness is a 760-pixel checkbox-state change and is recorded in
+`ipados-native-host-input-m4-20260726.txt`.

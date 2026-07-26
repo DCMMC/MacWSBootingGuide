@@ -24,6 +24,8 @@
 
 static NSString *const MacWSFramePath =
     @"/var/mnt/rootfs/private/tmp/macws_vnc_fb";
+static NSString *const MacWSCaptureAckPath =
+    @"/var/mnt/rootfs/private/tmp/macws_capture_done";
 static NSString *const MacWSLogPath = @"/var/mobile/Library/Logs/MacWSHost.log";
 static const char MacWSInputSocketPath[] =
     "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
@@ -76,6 +78,24 @@ static BOOL MacWSSendInputRecord(const MacWSInputRecord *record,
 
     if (errorOut) *errorOut = savedError;
     return sent;
+}
+
+static BOOL MacWSReadCaptureAck(uint64_t *generationOut) {
+    char value[96] = {0};
+    int fd = open(MacWSCaptureAckPath.fileSystemRepresentation,
+                  O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    ssize_t count = read(fd, value, sizeof(value) - 1);
+    close(fd);
+    if (count <= 0) return NO;
+    int producerPID = 0;
+    unsigned long long generation = 0;
+    if (sscanf(value, "%d %llu", &producerPID, &generation) != 2 ||
+        producerPID <= 0 || generation == 0) {
+        return NO;
+    }
+    if (generationOut) *generationOut = (uint64_t)generation;
+    return YES;
 }
 
 // Read-only witness for Metal's RE-confirmed registration inputs.  The iOS
@@ -239,6 +259,9 @@ static void MacWSLogMetalRegistryState(void) {
 @interface MacWSMetalView : MTKView <MTKViewDelegate>
 @property(nonatomic, weak) id<MacWSMetalViewStatusDelegate> statusDelegate;
 @property(nonatomic) uint64_t sceneID;
+@property(nonatomic) int32_t targetPID;
+@property(nonatomic, getter=isMacWSInputEnabled) BOOL macWSInputEnabled;
+- (void)setMacWSInputEnabled:(BOOL)enabled reason:(NSString *)reason;
 @end
 
 @implementation MacWSMetalView {
@@ -249,16 +272,18 @@ static void MacWSLogMetalRegistryState(void) {
     uint32_t _textureWidth;
     uint32_t _textureHeight;
     CGRect _contentRect;
-    CFTimeInterval _statusEpoch;
-    NSUInteger _framesSinceStatus;
     BOOL _reportedNonzeroFrame;
     BOOL _submittedPresentWitness;
     NSString *_lastStatus;
     UIView *_touchMarker;
+    UILabel *_inputUnavailableLabel;
     UIImageView *_fallbackImageView;
-    CADisplayLink *_fallbackDisplayLink;
+    CADisplayLink *_framePollDisplayLink;
     uint64_t _fallbackSignature;
     BOOL _reportedFallbackFrame;
+    uint64_t _pendingCaptureGeneration;
+    uint64_t _presentedCaptureGeneration;
+    BOOL _macWSInputEnabled;
 }
 
 - (instancetype)initWithFrame:(CGRect)frameRect {
@@ -269,18 +294,23 @@ static void MacWSLogMetalRegistryState(void) {
     self.delegate = self;
     self.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
     self.framebufferOnly = YES;
-    self.enableSetNeedsDisplay = NO;
-    self.paused = NO;
-    self.preferredFramesPerSecond = 20;
+    // The producer publishes acknowledged snapshots, not a live 20-fps pixel
+    // stream.  Continuous MTKView drawing uploaded the unchanged 15.2-MiB
+    // frame 20 times per second and runtime-measured as 13-15% App CPU.  Poll
+    // only the tiny generation ACK and draw exactly once per new snapshot.
+    self.enableSetNeedsDisplay = YES;
+    self.paused = YES;
     self.autoResizeDrawable = YES;
     self.clearColor = MTLClearColorMake(0.025, 0.028, 0.035, 1.0);
     self.multipleTouchEnabled = YES;
-    self.userInteractionEnabled = YES;
+    // Status polling enables interaction only after WindowServer, the input
+    // socket and an exact-PID acknowledged frame are all present.  A stale
+    // screenshot must never look like a live, touchable workspace.
+    self.userInteractionEnabled = NO;
 
     _frame = [MacWSMappedFrame new];
     _commandQueue = [device newCommandQueue];
     _commandQueue.label = @"MacWSHost display queue";
-    _statusEpoch = CACurrentMediaTime();
     _contentRect = CGRectZero;
 
     _touchMarker = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 22, 22)];
@@ -291,6 +321,29 @@ static void MacWSLogMetalRegistryState(void) {
     _touchMarker.userInteractionEnabled = NO;
     _touchMarker.hidden = YES;
     [self addSubview:_touchMarker];
+
+    _inputUnavailableLabel = [UILabel new];
+    _inputUnavailableLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _inputUnavailableLabel.text = @"触控暂不可用 · macOS 工作区未就绪";
+    _inputUnavailableLabel.textColor = UIColor.whiteColor;
+    _inputUnavailableLabel.backgroundColor =
+        [UIColor.systemOrangeColor colorWithAlphaComponent:0.88];
+    _inputUnavailableLabel.font =
+        [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote];
+    _inputUnavailableLabel.textAlignment = NSTextAlignmentCenter;
+    _inputUnavailableLabel.numberOfLines = 0;
+    _inputUnavailableLabel.layer.cornerRadius = 12;
+    _inputUnavailableLabel.clipsToBounds = YES;
+    _inputUnavailableLabel.userInteractionEnabled = NO;
+    [self addSubview:_inputUnavailableLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [_inputUnavailableLabel.centerXAnchor constraintEqualToAnchor:self.centerXAnchor],
+        [_inputUnavailableLabel.bottomAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.bottomAnchor
+                                                            constant:-18],
+        [_inputUnavailableLabel.widthAnchor constraintLessThanOrEqualToAnchor:self.widthAnchor
+                                                                    multiplier:0.82],
+        [_inputUnavailableLabel.heightAnchor constraintGreaterThanOrEqualToConstant:38],
+    ]];
 
     if (device) {
         [self buildPipeline];
@@ -303,13 +356,14 @@ static void MacWSLogMetalRegistryState(void) {
         _fallbackImageView.contentMode = UIViewContentModeScaleAspectFit;
         _fallbackImageView.userInteractionEnabled = NO;
         [self insertSubview:_fallbackImageView atIndex:0];
-        _fallbackDisplayLink = [CADisplayLink displayLinkWithTarget:self
-            selector:@selector(drawFallbackFrame:)];
-        _fallbackDisplayLink.preferredFramesPerSecond = 5;
-        [_fallbackDisplayLink addToRunLoop:NSRunLoop.mainRunLoop
-                                   forMode:NSRunLoopCommonModes];
         MacWSLog(@"native Metal device unavailable; UIKit fallback armed");
     }
+
+    _framePollDisplayLink = [CADisplayLink displayLinkWithTarget:self
+        selector:@selector(pollSharedFrame:)];
+    _framePollDisplayLink.preferredFramesPerSecond = 5;
+    [_framePollDisplayLink addToRunLoop:NSRunLoop.mainRunLoop
+                               forMode:NSRunLoopCommonModes];
 
     if (@available(iOS 13.4, *)) {
         UIHoverGestureRecognizer *hover =
@@ -321,7 +375,26 @@ static void MacWSLogMetalRegistryState(void) {
 }
 
 - (void)dealloc {
-    [_fallbackDisplayLink invalidate];
+    [_framePollDisplayLink invalidate];
+}
+
+- (void)setMacWSInputEnabled:(BOOL)enabled {
+    [self setMacWSInputEnabled:enabled reason:nil];
+}
+
+- (BOOL)isMacWSInputEnabled {
+    return _macWSInputEnabled;
+}
+
+- (void)setMacWSInputEnabled:(BOOL)enabled reason:(NSString *)reason {
+    _macWSInputEnabled = enabled;
+    self.userInteractionEnabled = enabled;
+    _inputUnavailableLabel.hidden = enabled;
+    if (!enabled) {
+        _touchMarker.hidden = YES;
+        _inputUnavailableLabel.text = [NSString stringWithFormat:
+            @"触控暂不可用 · %@", reason.length ? reason : @"工作区未就绪"];
+    }
 }
 
 - (void)buildPipeline {
@@ -438,8 +511,32 @@ static void MacWSLogMetalRegistryState(void) {
     return hash;
 }
 
-- (void)drawFallbackFrame:(CADisplayLink *)displayLink {
+- (void)pollSharedFrame:(CADisplayLink *)displayLink {
     (void)displayLink;
+    uint64_t generation = 0;
+    if (!MacWSReadCaptureAck(&generation)) {
+        if (_presentedCaptureGeneration != 0 ||
+            _pendingCaptureGeneration != 0) {
+            _presentedCaptureGeneration = 0;
+            _pendingCaptureGeneration = 0;
+            _fallbackImageView.image = nil;
+            (void)[_frame refresh];
+            if (self.device) [self setNeedsDisplay];
+            [self publishStatus:_frame.lastError ?: @"等待已确认的共享帧"];
+        }
+        return;
+    }
+    if (generation == _presentedCaptureGeneration) return;
+    if (generation != _pendingCaptureGeneration)
+        _pendingCaptureGeneration = generation;
+    if (self.device) {
+        [self setNeedsDisplay];
+    } else {
+        [self drawFallbackFrame];
+    }
+}
+
+- (void)drawFallbackFrame {
     if (![_frame refresh]) {
         [self publishStatus:_frame.lastError ?: @"等待共享帧"];
         return;
@@ -447,7 +544,15 @@ static void MacWSLogMetalRegistryState(void) {
     simd_float4 unusedVertices[4];
     [self updateContentRectAndVertices:unusedVertices];
     uint64_t signature = [self fallbackFrameSignature];
-    if (_fallbackImageView.image && signature == _fallbackSignature) return;
+    if (_fallbackImageView.image && signature == _fallbackSignature) {
+        _presentedCaptureGeneration = _pendingCaptureGeneration;
+        _pendingCaptureGeneration = 0;
+        [self publishStatus:[NSString stringWithFormat:
+            @"%u×%u  ·  快照 #%llu  ·  像素未变化",
+            _frame.width, _frame.height,
+            (unsigned long long)_presentedCaptureGeneration]];
+        return;
+    }
 
     size_t payloadSize = (size_t)_frame.stride * _frame.height;
     NSData *snapshot = [NSData dataWithBytes:_frame.pixels length:payloadSize];
@@ -463,6 +568,8 @@ static void MacWSLogMetalRegistryState(void) {
         _fallbackImageView.image = [UIImage imageWithCGImage:image];
         CGImageRelease(image);
         _fallbackSignature = signature;
+        _presentedCaptureGeneration = _pendingCaptureGeneration;
+        _pendingCaptureGeneration = 0;
         BOOL nonzero = [self frameHasSampledContent];
         if (nonzero && !_reportedFallbackFrame) {
             _reportedFallbackFrame = YES;
@@ -470,8 +577,9 @@ static void MacWSLogMetalRegistryState(void) {
                      _frame.width, _frame.height, _frame.stride);
         }
         [self publishStatus:[NSString stringWithFormat:
-            @"%u×%u  ·  UIKit fallback  ·  iOS Metal Device=nil",
-            _frame.width, _frame.height]];
+            @"%u×%u  ·  快照 #%llu  ·  UIKit fallback",
+            _frame.width, _frame.height,
+            (unsigned long long)_presentedCaptureGeneration]];
     } else {
         [self publishStatus:@"UIKit fallback 无法创建 BGRA 图像"];
     }
@@ -528,17 +636,13 @@ static void MacWSLogMetalRegistryState(void) {
         }];
     }
     [commandBuffer commit];
-
-    _framesSinceStatus++;
-    CFTimeInterval now = CACurrentMediaTime();
-    if (now - _statusEpoch >= 1.0) {
-        double fps = _framesSinceStatus / (now - _statusEpoch);
-        NSString *content = _reportedNonzeroFrame ? @"有效像素" : @"全黑/等待首帧";
-        [self publishStatus:[NSString stringWithFormat:@"%u×%u  ·  %.1f fps  ·  %@",
-                             _frame.width, _frame.height, fps, content]];
-        _statusEpoch = now;
-        _framesSinceStatus = 0;
-    }
+    _presentedCaptureGeneration = _pendingCaptureGeneration;
+    _pendingCaptureGeneration = 0;
+    NSString *content = _reportedNonzeroFrame ? @"有效像素" : @"全黑";
+    [self publishStatus:[NSString stringWithFormat:
+        @"%u×%u  ·  快照 #%llu  ·  %@",
+        _frame.width, _frame.height,
+        (unsigned long long)_presentedCaptureGeneration, content]];
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
@@ -559,6 +663,7 @@ static void MacWSLogMetalRegistryState(void) {
 }
 
 - (void)emitKind:(MacWSInputKind)kind touch:(UITouch *)touch point:(CGPoint)viewPoint {
+    if (!self.isMacWSInputEnabled) return;
     CGPoint framePoint;
     if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
     float pressure = touch.maximumPossibleForce > 0
@@ -575,6 +680,7 @@ static void MacWSLogMetalRegistryState(void) {
         .contactID = (uint32_t)touch.hash,
         .frameWidth = _frame.width,
         .frameHeight = _frame.height,
+        .targetPID = self.targetPID,
     };
     _touchMarker.center = viewPoint;
     _touchMarker.hidden = kind == MacWSInputKindTouchUp ||
@@ -608,6 +714,7 @@ static void MacWSLogMetalRegistryState(void) {
 }
 
 - (void)hovered:(UIHoverGestureRecognizer *)recognizer API_AVAILABLE(ios(13.4)) {
+    if (!self.isMacWSInputEnabled) return;
     CGPoint viewPoint = [recognizer locationInView:self];
     CGPoint framePoint;
     if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
@@ -621,6 +728,7 @@ static void MacWSLogMetalRegistryState(void) {
         .y = (float)framePoint.y,
         .frameWidth = _frame.width,
         .frameHeight = _frame.height,
+        .targetPID = self.targetPID,
     };
     _touchMarker.center = viewPoint;
     _touchMarker.hidden = recognizer.state == UIGestureRecognizerStateEnded;
@@ -677,6 +785,7 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     NSTimer *_statusTimer;
     NSDictionary<NSString *, id> *_latestStatus;
     BOOL _experimentalTouched;
+    uint64_t _inputLogSequence;
     NSString *_lastLoggedControlSummary;
 }
 
@@ -846,7 +955,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UILabel *experimentalText = MacWSMakeLabel(@"实验兼容模式",
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
     UILabel *experimentalDetail = MacWSMakeLabel(
-        @"启用已记录的命令 ABI / completion 诊断脚手架；不是根因修复。",
+        @"启用命令 ABI / completion 诊断脚手架；受 90 秒与高 CPU 热保护，不是根因修复。",
         [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
         UIColor.systemOrangeColor);
     UIStackView *experimentalLabels = [[UIStackView alloc]
@@ -1048,6 +1157,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL ws = [status[@"windowserver_running"] boolValue];
     BOOL input = [status[@"input_running"] boolValue];
     BOOL frame = [status[@"frame_ready"] boolValue];
+    BOOL appInput = [status[@"app_input_ready"] boolValue];
+    int32_t activeAppPID = (int32_t)[status[@"active_app_pid"] intValue];
     NSString *controlSummary = [NSString stringWithFormat:
         @"connected=%@ busy=%@ rootfs=%@ ws=%@ input=%@ frame=%@ phase=%@ error=%@",
         connected ? @"YES" : @"NO", busy ? @"YES" : @"NO",
@@ -1066,7 +1177,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSInteger wsPID = [status[@"windowserver_pid"] integerValue];
     _windowServerLabel.text = ws ? [NSString stringWithFormat:@"运行中 · %ld", (long)wsPID] : @"已停止";
     _windowServerLabel.textColor = ws ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
-    _bridgeLabel.text = input ? @"在线" : @"离线";
+    _bridgeLabel.text = input
+        ? (activeAppPID > 1 && appInput
+            ? [NSString stringWithFormat:@"在线 · 目标 PID %d", activeAppPID]
+            : (activeAppPID > 1 ? @"在线 · 等待应用输入端点" : @"在线 · 等待应用"))
+        : @"离线";
     _bridgeLabel.textColor = input ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
     if (frame) {
         _frameLabel.text = [NSString stringWithFormat:@"%@×%@",
@@ -1081,6 +1196,25 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
     NSString *lastError = status[@"last_error"];
     if (lastError.length) [self setNotice:lastError success:NO];
+
+    _metalView.targetPID = activeAppPID;
+    BOOL inputReady = connected && !busy && ws && input && frame &&
+        activeAppPID > 1 && appInput;
+    NSString *inputReason = nil;
+    if (!connected) inputReason = @"root 控制服务离线";
+    else if (busy) inputReason = @"macOS 正在启动或切换";
+    else if (!ws) inputReason = @"macOS 工作区已停止";
+    else if (!input) inputReason = @"触控桥离线";
+    else if (!frame) inputReason = @"等待已确认的共享帧";
+    else if (activeAppPID <= 1) inputReason = @"请先从控制中心启动一个 macOS 应用";
+    else if (!appInput) inputReason = @"目标应用输入端点尚未就绪";
+    [_metalView setMacWSInputEnabled:inputReady reason:inputReason];
+    _inputLabel.text = inputReady
+        ? @"触控：已就绪 · 直接点击或拖动 macOS 画面"
+        : [NSString stringWithFormat:@"触控：不可用 · %@",
+           inputReason ?: @"工作区未就绪"];
+    _inputLabel.textColor = inputReady
+        ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
 
     [self setControlsEnabled:connected && !busy];
     if (busy) {
@@ -1124,7 +1258,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else {
         [self setControlsEnabled:NO];
         [self setNotice:_experimentalSwitch.isOn
-            ? @"正在用实验兼容模式启动；诊断脚手架会写入日志。"
+            ? @"正在用实验兼容模式启动；已启用 90 秒与高 CPU 自动热保护。"
             : @"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
         [_controlClient startWithExperimentalMode:_experimentalSwitch.isOn
             completion:^(NSDictionary<NSString *,id> *reply) {
@@ -1235,6 +1369,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if ([action isEqualToString:@"glassdemo"]) {
         [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
                  arguments:@{@MACWS_CONTROL_KEY_APP_ID: @"glassdemo"}];
+    } else if ([action isEqualToString:@"terminal"] ||
+               [action isEqualToString:@"activity-monitor"] ||
+               [action isEqualToString:@"finder"]) {
+        [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
+                 arguments:@{@MACWS_CONTROL_KEY_APP_ID: action}];
     } else if ([action isEqualToString:@"recover"]) {
         [self recoverAction];
     } else if ([action isEqualToString:@"repair"]) {
@@ -1264,12 +1403,23 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     int sendError = 0;
     BOOL sent = MacWSSendInputRecord(&record, &sendError);
     _inputLabel.text = [NSString stringWithFormat:
-        @"触控桥 M2 %@ · %@ · %.0f, %.0f",
+        @"触控桥 M4 %@ · %@ · %.0f, %.0f",
         sent ? @"已发送" : @"离线", phase, record.x, record.y];
-    MacWSLog(@"input-v2 transport=%@ errno=%d scene=%llx kind=%@ point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u",
-             sent ? @"sent" : @"failed", sendError, record.sceneID, phase,
-             record.x, record.y, record.frameWidth, record.frameHeight,
-             record.pressure, record.contactID);
+    _inputLogSequence++;
+    BOOL continuous = record.kind == MacWSInputKindTouchMove ||
+                      record.kind == MacWSInputKindHover;
+    if (!continuous || (_inputLogSequence % 60) == 0) {
+        MacWSLog(@"input-v3 transport=%@ errno=%d scene=%llx target=%d kind=%@ point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u seq=%llu",
+                 sent ? @"sent" : @"failed", sendError, record.sceneID,
+                 record.targetPID, phase, record.x, record.y,
+                 record.frameWidth, record.frameHeight,
+                 record.pressure, record.contactID,
+                 (unsigned long long)_inputLogSequence);
+    }
+    if (!sent) {
+        [_metalView setMacWSInputEnabled:NO reason:@"触控桥连接已中断"];
+        [self refreshStatus];
+    }
 }
 @end
 
@@ -1310,12 +1460,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         }
         if ([context.URL.host isEqualToString:@"test-input"]) {
             // Explicit transport diagnostic. Query parameters allow two-point
-            // cursor A/Bs without fabricating UIKit touches:
-            // macwshost://test-input?x=1194&y=834&w=2388&h=1668
+            // cursor A/Bs or a complete down/up pair without fabricating UIKit
+            // touches:
+            // macwshost://test-input?kind=tap&x=1194&y=834&w=2388&h=1668
             uint32_t frameWidth = 2388;
             uint32_t frameHeight = 1668;
             float x = 1194.0f;
             float y = 834.0f;
+            NSString *requestedKind = @"hover";
             NSURLComponents *components = [NSURLComponents
                 componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
             for (NSURLQueryItem *item in components.queryItems) {
@@ -1323,6 +1475,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 else if ([item.name isEqualToString:@"y"]) y = item.value.floatValue;
                 else if ([item.name isEqualToString:@"w"]) frameWidth = item.value.intValue;
                 else if ([item.name isEqualToString:@"h"]) frameHeight = item.value.intValue;
+                else if ([item.name isEqualToString:@"kind"] && item.value.length)
+                    requestedKind = item.value.lowercaseString;
             }
             if (frameWidth == 0) frameWidth = 2388;
             if (frameHeight == 0) frameHeight = 1668;
@@ -1339,17 +1493,41 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 .contactID = MACWS_INPUT_CONTACT_DIAGNOSTIC,
                 .frameWidth = frameWidth,
                 .frameHeight = frameHeight,
+                .targetPID = 0,
             };
+            MacWSViewController *controller =
+                (MacWSViewController *)self.window.rootViewController;
+            NSDictionary *status = [controller valueForKey:@"latestStatus"];
+            record.targetPID = (int32_t)[status[@"active_app_pid"] intValue];
+            if ([requestedKind isEqualToString:@"tap"])
+                record.kind = MacWSInputKindTouchDown;
             int sendError = 0;
             BOOL sent = MacWSSendInputRecord(&record, &sendError);
-            MacWSLog(@"input-v2 synthetic transport=%@ errno=%d scene=%llx point=(%.2f,%.2f) frame=%ux%u",
+            MacWSLog(@"input-v3 synthetic kind=%@ transport=%@ errno=%d scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
+                     requestedKind,
                      sent ? @"sent" : @"failed", sendError, record.sceneID,
-                     record.x, record.y, record.frameWidth, record.frameHeight);
+                     record.targetPID, record.x, record.y,
+                     record.frameWidth, record.frameHeight);
+            if (sent && record.kind == MacWSInputKindTouchDown) {
+                record.kind = MacWSInputKindTouchUp;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                              60 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    int upError = 0;
+                    BOOL upSent = MacWSSendInputRecord(&record, &upError);
+                    MacWSLog(@"input-v3 synthetic kind=tap-up transport=%@ errno=%d scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
+                             upSent ? @"sent" : @"failed", upError,
+                             record.sceneID, record.targetPID,
+                             record.x, record.y,
+                             record.frameWidth, record.frameHeight);
+                });
+            }
             break;
         }
         NSString *host = context.URL.host ?: @"status";
         if ([@[@"status", @"start", @"start-experimental", @"stop",
-               @"glassdemo", @"recover", @"repair", @"capture",
+               @"glassdemo", @"terminal", @"activity-monitor", @"finder",
+               @"recover", @"repair", @"capture",
                @"screenshot-ui"] containsObject:host]) {
             MacWSViewController *controller = (MacWSViewController *)self.window.rootViewController;
             [controller performURLAction:host];

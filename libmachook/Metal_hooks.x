@@ -329,6 +329,35 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
 static id g_vnc_final_lock = nil;
 static id<MTLTexture> g_vnc_final_tex = nil;
 static IOSurfaceRef g_vnc_final_surface = NULL;
+static _Atomic uint64_t g_vnc_final_serial = 0;
+
+static uint64_t macws_vnc_capture_generation(void) {
+    char value[64] = {0};
+    int fd = open("/tmp/macws_capture_final", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    ssize_t count = read(fd, value, sizeof(value) - 1);
+    close(fd);
+    if (count <= 0) return 0;
+    char *end = NULL;
+    unsigned long long generation = strtoull(value, &end, 10);
+    return end != value && generation != 0 ? (uint64_t)generation : 0;
+}
+
+static void macws_vnc_ack_capture(uint64_t generation) {
+    char value[96];
+    int length = snprintf(value, sizeof(value), "%d %llu\n", getpid(),
+                          (unsigned long long)generation);
+    int fd = open("/tmp/macws_capture_done",
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    ssize_t written = write(fd, value, (size_t)length);
+    close(fd);
+    if (written == length) {
+        fprintf(stderr,
+            "#### VNC-FINAL acknowledged pid=%d generation=%llu\n",
+            getpid(), (unsigned long long)generation);
+    }
+}
 
 static BOOL macws_vnc_submit_read_pass(id<MTLCommandQueue> queue,
         id<MTLRenderPipelineState> pipeline, id<MTLTexture> src,
@@ -384,13 +413,12 @@ static BOOL macws_vnc_submit_read_pass(id<MTLCommandQueue> queue,
 }
 
 static void macws_vnc_capture_final(id<MTLTexture> src) {
-    // Keep the expensive one-shot native-AGX capture experiment explicitly
-    // armed.  Tracking the live final texture continues before this file
-    // exists, so a debugger/test harness can let WindowServer settle and then
-    // create /tmp/macws_capture_final together with /tmp/macws_submit_diag;
-    // the first deep-dumped submit is then the clear-only control pass rather
-    // than an unrelated compositor frame.
-    if (access("/tmp/macws_capture_final", F_OK) != 0) return;
+    // Each request carries a unique generation. Consume exactly one attempt
+    // for that generation, then unlink the request before doing GPU work. This
+    // keeps a failed private-PF550 read from becoming an unbounded retry loop,
+    // while allowing a later explicit App refresh to request another frame.
+    uint64_t generation = macws_vnc_capture_generation();
+    if (generation == 0) return;
     if (!src) return;
     size_t srcw = [src width], srch = [src height];
     unsigned long srcpf = (unsigned long)[src pixelFormat];
@@ -417,15 +445,12 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
         return;
     }
 
-    // Diagnostic circuit breaker: /tmp/macws_capture_final promises a
-    // one-shot experiment.  A failed pf=550 read causes WindowServer to
-    // create replacement scanout surfaces; without this guard every
-    // replacement re-entered the probe and generated another GPU fault.
-    // This does not alter normal rendering and does not reinterpret the
-    // command result; it only prevents the explicitly gated probe itself
-    // from amplifying one failure into a crash-report/resource storm.
-    static _Atomic int captureAttempted = 0;
-    if (atomic_exchange(&captureAttempted, 1)) return;
+    static _Atomic uint64_t attemptedGeneration = 0;
+    if (atomic_exchange(&attemptedGeneration, generation) == generation)
+        return;
+    (void)unlink("/tmp/macws_capture_final");
+    fprintf(stderr, "#### VNC-FINAL consuming generation=%llu\n",
+            (unsigned long long)generation);
 
     static id<MTLDevice> dev = nil;
     static id<MTLCommandQueue> queue = nil;
@@ -658,17 +683,19 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
     size_t bpr = IOSurfaceGetBytesPerRow(g_vncSurf);
     size_t bh = IOSurfaceGetHeight(g_vncSurf);
     void *shared = macws_vnc_mmap_data(outw, outh);
+    BOOL copied = NO;
+    size_t nonzero = 0;
     if (base && shared && bpr >= outw * 4 && bh >= outh) {
         for (size_t y = 0; y < outh; y++) {
             memcpy((char *)shared + y * outw * 4,
                    (char *)base + y * bpr, outw * 4);
         }
+        copied = YES;
+        for (size_t off = 0; off < outw * outh * 4; off += 4096) {
+            if (((uint8_t *)shared)[off]) nonzero++;
+        }
         static int capturedLog = 0;
         if (capturedLog++ < 6) {
-            size_t nonzero = 0;
-            for (size_t off = 0; off < outw * outh * 4; off += 4096) {
-                if (((uint8_t *)shared)[off]) nonzero++;
-            }
             fprintf(stderr,
                 "#### VNC-FINAL captured %zux%zu BGRA8 cpu130=%p base=%p "
                 "bpr=%zu sampled_nonzero=%zu\n",
@@ -676,6 +703,7 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
         }
     }
     IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
+    if (copied && nonzero != 0) macws_vnc_ack_capture(generation);
 }
 
 static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
@@ -684,17 +712,21 @@ static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
     dispatch_once(&once, ^{
         g_vnc_final_lock = [NSObject new];
         [NSThread detachNewThreadWithBlock:^{
+            uint64_t observedSerial = 0;
             for (;;) {
                 @autoreleasepool {
                     id<MTLTexture> snapshot = nil;
                     IOSurfaceRef snapshotSurface = NULL;
+                    uint64_t serial = atomic_load(&g_vnc_final_serial);
                     @synchronized(g_vnc_final_lock) {
                         snapshot = macws_vnc_retain(g_vnc_final_tex);
                         if (g_vnc_final_surface) {
                             snapshotSurface = (IOSurfaceRef)CFRetain(g_vnc_final_surface);
                         }
                     }
-                    if (snapshot && snapshotSurface) {
+                    if (snapshot && snapshotSurface &&
+                        serial != observedSerial) {
+                        observedSerial = serial;
                         macws_vnc_capture_final(snapshot);
                     }
                     macws_vnc_release(snapshot);
@@ -721,6 +753,7 @@ static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
         macws_vnc_release(oldTexture);
         if (oldSurface) CFRelease(oldSurface);
     }
+    atomic_fetch_add(&g_vnc_final_serial, 1);
 }
 
 // Pair a successful MetalContext::StartComposite* with the matching
@@ -862,12 +895,18 @@ void macws_vnc_finish_update(void *context) {
             static _Atomic int pollLog = 0;
             int n = atomic_fetch_add(&pollLog, 1);
             if (n < 16) {
+                // Runtime-confirmed by
+                // WindowServer-2026-07-26-161536.ips: formatting one private
+                // Metal NSError walked a damaged userInfo graph and crashed in
+                // _CFErrorFormatDebugDescriptionAux -> objc_msgSend at 0x10.
+                // The observer only needs completion status; do not traverse
+                // an error object owned by the simulator compatibility layer.
                 fprintf(stderr,
                     "#### VNC-ENDUPDATE-POLL #%d context=%p tex=%p pf=%lu "
-                    "cb=%p status=%ld polls=%u error=%s\n",
+                    "cb=%p status=%ld polls=%u error=%p\n",
                     n, context, (void *)texture, completedPF,
                     (void *)commandBuffer, (long)status, polls,
-                    error ? [[error description] UTF8String] : "nil");
+                    (void *)error);
             }
             if (status == MTLCommandBufferStatusCompleted && !error) {
                 if (completedPF == 550) {
@@ -4338,33 +4377,36 @@ __attribute__((constructor)) static void InitMetalHooks() {
 
         install_nsxpcsharedlistener_swizzle();
 
-        // If this is Terminal, force "New Window" via responder chain since AppKit's
-        // automatic startup-window-creation depends on hiservices/launchservices which
-        // are broken in chroot. Multiple selector attempts (Terminal uses
-        // newWindowWithProfile: typically, but newWindow: also responds).
+        // A direct executable launch does not carry LaunchServices' normal
+        // open-application AppleEvent.  This Terminal image also deliberately
+        // returns NO from -applicationShouldOpenUntitledFile:.  Its real user
+        // action is -[TTApplication newShell:] (RE-confirmed in the arm64e
+        // binary by dyld_info at VM offset 0x10006e6dc), so invoke that actual
+        // application method after didFinishLaunching instead of guessing
+        // responder-chain selectors that this image does not implement.
         const char *prog = getprogname();
         if (prog && strstr(prog, "Terminal")) {
             // Schedule slightly after main queue so app's didFinishLaunching has fired.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC),
                 dispatch_get_main_queue(), ^{
-                fprintf(stderr, "#### Forcing Terminal new-window via sendAction:\n");
-                SEL sels[] = {
-                    sel_registerName("newWindow:"),
-                    sel_registerName("newWindowWithProfile:"),
-                    sel_registerName("newTerminal:"),
-                    sel_registerName("newTerminalWithDefaultProfile:"),
-                };
+                fprintf(stderr, "#### Terminal direct newShell: request\n");
                 Class app_cls = objc_getClass("NSApplication");
                 id app = ((id (*)(Class, SEL))objc_msgSend)(app_cls, sel_registerName("sharedApplication"));
-                fprintf(stderr, "#### NSApp=%p\n", app);
-                if (app) {
-                    for (size_t i = 0; i < sizeof(sels) / sizeof(sels[0]); i++) {
-                        BOOL ok = ((BOOL (*)(id, SEL, SEL, id, id))objc_msgSend)(
-                            app, sel_registerName("sendAction:to:from:"),
-                            sels[i], nil, nil);
-                        fprintf(stderr, "####   sendAction %s -> %d\n", sel_getName(sels[i]), ok);
-                        if (ok) break;
-                    }
+                SEL newShell = sel_registerName("newShell:");
+                BOOL responds = app && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+                    app, sel_registerName("respondsToSelector:"), newShell);
+                fprintf(stderr, "#### NSApp=%p class=%s responds(newShell:)=%d\n",
+                    app, app ? object_getClassName(app) : "nil", responds);
+                if (responds) {
+                    ((void (*)(id, SEL, id))objc_msgSend)(app, newShell, nil);
+                    id windows = ((id (*)(id, SEL))objc_msgSend)(
+                        app, sel_registerName("windows"));
+                    NSUInteger count = windows
+                        ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+                            windows, sel_registerName("count")) : 0;
+                    fprintf(stderr,
+                        "#### Terminal newShell: returned windows=%lu\n",
+                        (unsigned long)count);
                 }
             });
         }

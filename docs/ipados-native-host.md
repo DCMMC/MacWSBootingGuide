@@ -1,8 +1,40 @@
-# Native iPadOS host (M0–M3)
+# Native iPadOS host (M0–M4)
 
 `MacWSHost` is the first milestone toward presenting each chroot macOS window
 as an iPadOS `UIWindowScene` instead of viewing the whole desktop through VNC.
 It is an iOS application built by the root Theos aggregate.
+
+## What M4 adds: target-process input and visible non-demo apps
+
+M4 fixes two separate failures that previously made the native host look
+ready while it was not usable:
+
+- `macwsinputd` now routes input ABI v3 records to a PID-specific Unix socket
+  owned by the selected AppKit process. `libmachook` converts the physical
+  top-left framebuffer point to the AppKit bottom-left screen/window point and
+  posts an `NSEvent` on that process's main CFRunLoop common modes. The run-loop
+  choice is load-bearing because GlassDemo starts inside a nested menu-tracking
+  loop that did not drain a libdispatch main-queue block.
+- Directly executing Terminal does not create an untitled window. RE of the
+  actual macOS 13.4 Terminal image found that
+  `-[TTApplication applicationShouldOpenUntitledFile:]` returns `NO` and that
+  the real New Shell action is `-[TTApplication newShell:]`. The injected hook
+  now invokes that method after launch; runtime reports three windows and the
+  shared frame contains a visible Terminal shell.
+
+Touch is enabled only when the control service, WindowServer, global receiver,
+an exact acknowledged frame, active application PID, and that PID's AppKit
+socket are all present. A stale snapshot is therefore never presented as a
+live interactive target.
+
+The visible control witness is a GlassDemo checkbox: after the startup menu is
+dismissed, one down/up pair changes exactly 760 pixels in bounding box
+`(638,702)..(665,729)` of the 2388x1668 shared frame. This supersedes the M2
+cursor-state observation, which did not prove AppKit event delivery.
+
+Continuous move/hover diagnostics are rate-limited at each of the UIKit,
+receiver, and AppKit layers. Down/up/cancel are always retained. This removes
+the previous roughly 120-lines/s logging amplification during a drag.
 
 ## What M3 adds: an App-owned control plane
 
@@ -96,11 +128,10 @@ listed below.
   UIKit/CoreAnimation fallback displays a stable snapshot. This is a recovery
   path, not evidence of an App-local Metal present.
 - Touch and pointer coordinates are transformed from the aspect-fitted scene
-  into physical macOS framebuffer pixels. M2 sends version-2 records to the
-  chroot `macwsinputd` over a local Unix datagram and maps them into Quartz
-  display coordinates. Two-point diagnostics confirm that posted mouse-move
-  events change the observed system cursor; a physical touch on a known macOS
-  control is still required before claiming complete interactive control.
+  into physical macOS framebuffer pixels. M4 sends version-3 records with the
+  active target PID to `macwsinputd`, which prefers the matching target-process
+  AppKit socket and uses CGEvent posting only as a fallback. A real checkbox
+  state/pixel change now confirms click delivery.
 - Runtime evidence is appended to
   `/var/mobile/Library/Logs/MacWSHost.log`. A successful Metal presentation is
   only claimed after the corresponding iOS `MTLCommandBuffer` completion says
@@ -110,31 +141,36 @@ The shared C layouts live in `include/macws_host_protocol.h`.
 
 ## Current input ABI
 
-MacWSHost sends packed 48-byte records to
+MacWSHost sends packed 52-byte records to
 `/var/mnt/rootfs/private/tmp/macws_host_input.sock`; inside the chroot,
 `macwsinputd` binds the same vnode as `/private/tmp/macws_host_input.sock`.
 Each record contains:
 
 ```text
 uint32 magic = 0x4d574556  // "MWEV"
-uint16 version = 2
+uint16 version = 3
 uint16 kind                 // down/move/up/cancel/hover
 uint64 sceneID
 double timestamp
 float  x, y, pressure
 uint32 contactID
 uint32 frameWidth, frameHeight
+int32  targetPID
 ```
 
 The source dimensions are load-bearing. The current producer is 2388x1668,
 while the coexistence Quartz display is 1194x834; v1 lacked these fields and
 incorrectly mapped the producer center to the display corner. No fixed Retina
-scale is assumed in v2.
+scale is assumed.
 
-`macwsinputd` maps touch down/move/up/cancel to left mouse
-down/drag/up and hover to mouse moved. It rejects malformed versions, sizes,
-kinds, non-finite values, and out-of-bounds coordinates before creating a
-CGEvent.
+`macwsinputd` rejects malformed versions, sizes, kinds, non-finite values,
+out-of-bounds coordinates, and invalid target PIDs. For supported applications,
+it forwards the unchanged validated record to
+`/private/tmp/macws_app_input.<targetPID>.sock`. The target process maps touch
+down/move/up/cancel to AppKit left-down/drag/up and hover to mouse-moved. If the
+target endpoint is absent, the receiver retains a per-PID/global CGEvent
+fallback, but runtime `CGPreflightPostEventAccess=NO` means that fallback is
+not considered an interactive-control witness.
 
 ## Current framebuffer ABI
 
@@ -176,14 +212,19 @@ These URLs remain useful for automation and diagnostics:
 uiopen macwshost://
 uiopen macwshost://start-experimental
 uiopen macwshost://glassdemo
+uiopen macwshost://terminal
+uiopen macwshost://activity-monitor
+uiopen macwshost://finder
 uiopen macwshost://capture
 uiopen macwshost://repair
 uiopen macwshost://recover
 uiopen macwshost://stop
 # Diagnostic: ask the running app to create another scene session.
 uiopen macwshost://new
-# Diagnostic: send one synthetic hover through the real M2 transport.
+# Diagnostic: send one synthetic hover through the real M4 transport.
 uiopen 'macwshost://test-input?x=1194&y=834&w=2388&h=1668'
+# Diagnostic: send a complete down/up pair to the active application.
+uiopen 'macwshost://test-input?kind=tap&x=640&y=703&w=2388&h=1668'
 ```
 
 To exercise the current capture path without VNC, create the existing capture
@@ -229,7 +270,17 @@ Runtime on iPad13,6 / iOS 16.3.1 confirmed that:
   variants and `platform-application` A/Bs do not change that result;
 - two synthetic M2 records sent by MacWSHost reached `macwsinputd`, mapped
   `(240,300)` to `(120,150)` and `(1900,1300)` to `(950,650)`, and those exact
-  Quartz locations were read back from the system cursor state after posting.
+  Quartz locations were read back from the posting process's cursor state;
+  later M4 A/B testing proved that this did **not** deliver a click to the
+  GlassDemo control;
+- runtime M4 records were received by the exact GlassDemo PID, executed on its
+  main thread, posted to AppKit window 4, and changed the checkbox pixels;
+- project LLDB showed the first GlassDemo tap is consumed by the demo's own
+  startup context-menu nested event loop. The App reports this behavior rather
+  than injecting a hidden bypass click;
+- RE-confirmed Terminal's real startup action and runtime-confirmed a visible
+  Terminal window in an acknowledged shared frame without restarting
+  WindowServer.
 
 M0 is not the final per-application design. It still mirrors a full macOS
 display into every iPadOS scene. The next milestones are:
@@ -237,14 +288,16 @@ display into every iPadOS scene. The next milestones are:
 1. inspect the failed SpringBoard scene request's real persistence identifier
    and mapping with a stable early-attach/runtime probe; do not force its
    success branch;
-2. use physical UIKit touches to confirm a visible GlassDemo click/drag
-   witness through the now-working v2 bridge, then add keyboard and scrolling;
-3. add a WindowServer-side window registry with stable window IDs, bounds,
+2. add keyboard, modifiers, right-click/long-press, scroll, and Pencil
+   semantics to the target-process bridge;
+3. make Activity Monitor and Finder startup-window behavior evidence-backed in
+   the same way as Terminal, without guessed selectors;
+4. add a WindowServer-side window registry with stable window IDs, bounds,
    scale, z-order, and lifecycle events;
-4. replace the whole-frame mmap with a producer-owned IOSurface ring plus
+5. replace the whole-frame mmap with a producer-owned IOSurface ring plus
    generation/fence metadata, and determine the valid cross-environment port
    transfer direction with runtime evidence;
-5. crop or render each registered macOS window into its own `UIWindowScene`,
+6. crop or render each registered macOS window into its own `UIWindowScene`,
    including independent resize and multiple simultaneous iPadOS windows;
-6. preserve the existing native-AGX blur witness through that per-window path
+7. preserve the existing native-AGX blur witness through that per-window path
    and run an interactive stability soak.

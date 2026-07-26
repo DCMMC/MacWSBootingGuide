@@ -1,0 +1,236 @@
+MacWSHost M4 target-process input and visible Terminal evidence -- 2026-07-26
+============================================================================
+
+Scope
+-----
+
+This record covers the first visible AppKit-control state change caused by the
+iPadOS host input path, the RE-backed Terminal startup-window fix, and a
+WindowServer crash found while testing non-demo applications.  It does not
+claim keyboard/scroll support, independent per-window iPad scenes, or that
+Activity Monitor/Finder startup is complete.
+
+1. Why global/per-PID CGEvent posting was insufficient
+-------------------------------------------------------
+
+The macOS-side receiver reported the following permission result at runtime:
+
+    MACWS-INPUT READY socket=/private/tmp/macws_host_input.sock abi=3 record=52 display=1 bounds=(0,0 1194x834) pixels=1194x834 postAccess=NO
+
+Both `CGEventPost(kCGHIDEventTap)` and `CGEventPostToPid()` returned after a
+down/up pair, but frozen before/after frames showed no change in the intended
+GlassDemo checkbox.  Adding PostEvent and Accessibility entitlement strings
+did not change `CGPreflightPostEventAccess=NO`; those experimental entitlement
+edits were removed.
+
+Runtime-confirmed conclusion: the old `CGEventCreate` +
+`CGEventGetLocation` witness observed cursor state visible to the posting
+process.  It did not prove that an event entered the target AppKit queue.  The
+M2 evidence file contains an explicit correction rather than silently
+rewriting the old record.
+
+2. ABI v3 and the target-process AppKit route
+---------------------------------------------
+
+Input ABI v3 is a packed 52-byte record.  It retains the physical framebuffer
+coordinates/dimensions from v2 and appends the exact `targetPID` returned by
+the fixed-operation host service.  Every supported AppKit process already
+loads libmachook and owns:
+
+    /private/tmp/macws_app_input.<pid>.sock
+
+`macwsinputd` validates the record and sends it to that socket before trying a
+CGEvent fallback.  Inside the exact target process, libmachook maps the
+2388x1668 top-left producer coordinate into the 1194x834 bottom-left AppKit
+screen coordinate, resolves the containing ordered window, creates an
+`NSEvent`, and calls `-[NSApplication postEvent:atStart:]`.
+
+The first implementation used `dispatch_async` to the main queue.  Runtime
+logged `APP-INPUT RX` but never `APP-INPUT MAIN`.  The working implementation
+uses `CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ...)`
+and wakes that run loop.  Verbatim working-process lines are:
+
+    #### APP-INPUT READY pid=39959 socket=/private/tmp/macws_app_input.39959.sock abi=3 record=52
+    #### APP-INPUT RX pid=39959 bytes=52 kind=1 target=39959
+    #### APP-INPUT MAIN pid=39959 kind=1 target=39959 thread-main=YES
+    #### APP-INPUT POST pid=39959 kind=1 window=4 screen=(320.00,482.50) local=(223.00,422.50)
+    #### APP-INPUT RX pid=39959 bytes=52 kind=3 target=39959
+    #### APP-INPUT MAIN pid=39959 kind=3 target=39959 thread-main=YES
+    #### APP-INPUT POST pid=39959 kind=3 window=4 screen=(320.00,482.50) local=(223.00,422.50)
+
+In the corresponding receiver run, the route witness was:
+
+    MACWS-INPUT ROUTE seq=1 route=appkit-socket pid=37808 window=0
+
+The PID differs because that line and the AppKit excerpt above came from two
+bounded restarts of the same build.  In each run the record PID and per-app
+socket PID were exact matches; mismatched PIDs are rejected by the target.
+
+3. Project LLDB identified GlassDemo's consumed first click
+------------------------------------------------------------
+
+The project helper was used as:
+
+    bash misc/ios_lldb_tmux.sh attach 192.168.1.5 22 GlassDemo
+
+Runtime-confirmed via the attached process's `thread backtrace all`: the main
+thread was not in the ordinary application loop.  Key frames were:
+
+    -[NSApplication(NSEvent) _nextEventMatching...]
+    _NSHLTBMenuEventProc
+    TrackMenuCommon
+    -[NSMenu popUpMenuPositioningItem:atLocation:inView:appearance:]
+    GlassDemo __45-[AppDelegate applicationDidFinishLaunching:]_block_invoke + 180
+
+GlassDemo itself logs:
+
+    [GlassDemo] programmatically popping context menu at vfx center
+
+Therefore the first left click dismisses the demo's startup diagnostic menu;
+it does not reach the checkbox.  The host now explains that behavior after
+launch.  It does not inject a hidden click or bypass the menu code.
+
+4. Visible checkbox witness
+----------------------------
+
+After dismissing that menu, a second down/up pair at physical framebuffer
+point approximately `(640,703)` toggled the checkbox.  Direct BGRA comparison
+of the two 2388x1668 shared-frame files produced:
+
+    checkbox ROI: changed=760 bbox=(638,702)..(665,729)
+    full frame:   changed=105809 bbox=(1,20)..(1694,1071)
+
+The after image visibly contains the check mark.  This is the stability/input
+witness: target-process events arrive, the real control changes state, and a
+new producer-acknowledged frame lands.  Process uptime is not used as proof.
+
+Artifacts and SHA-256:
+
+    ipados-native-host-glass-touch-before-20260726.png
+      5ef285ca09b4395c9dca8c3eaa0009cb1c27a089a4ada8fcb8b8abc3f717327d
+    ipados-native-host-glass-touch-after-20260726.png
+      7b76b476898fb28446a74c1f147d581a6c3762615683250f768b1e6328710a0e
+    raw before
+      7391aafb7d69887db7fd305cb905d545cb24292f8db81aa1bb4df73c4c00edf9
+    raw after
+      f3b848b96fe276ae14647bdd47758c1f37ef312c0510c11950be5a264ac59a02
+
+5. WindowServer observer crash while opening Terminal
+------------------------------------------------------
+
+The first non-demo run crashed WindowServer in diagnostic logging, not in
+Terminal rendering.  Runtime-confirmed via
+`WindowServer-2026-07-26-161536.ips`, faulting thread 16:
+
+    objc_msgSend + 32
+    _CFErrorFormatDebugDescriptionAux + 164
+    _CFErrorCreateDebugDescription + 88
+    -[NSError description] + 16
+    __macws_vnc_finish_update_block_invoke at Metal_hooks.x:903 + 556
+
+The exception was `EXC_BAD_ACCESS / KERN_INVALID_ADDRESS at 0x10`.  Line 903
+was only converting the private/simulator command-buffer error object's
+`description` to UTF-8 for a log line.  The fix logs the opaque error pointer
+and status without traversing that damaged private object graph.  Retest kept
+the same WindowServer alive and safely printed, for example:
+
+    #### VNC-ENDUPDATE-POLL #1 context=0x12172b3a0 tex=0x12178f450 pf=550 cb=0x12178fc90 status=5 polls=0 error=0x121744e00
+
+Crash-report SHA-256:
+
+    df13bb9450bf76e3c3cf35d7a8cfc2318448246c2d957f23756ff13ccb3ae1a6
+
+6. RE-confirmed Terminal startup action
+---------------------------------------
+
+Direct execution reached `TTApplication` but produced no visible window.
+Launching through chroot `/usr/bin/open -na` failed with
+`kLSNoExecutableErr Code=-10827`, so LaunchServices could not provide the
+normal open-application path.
+
+`xcrun dyld_info -arch arm64e -objc` on the actual macOS 13.4 Terminal binary
+identified:
+
+    0x10000A12C  -[TTApplication applicationShouldOpenUntitledFile:]
+    0x10006E6DC  -[TTApplication newShell:]
+
+RE-confirmed via `otool -arch arm64e -tvV`: the first method ends with:
+
+    000000010000a138  mov w2, #0x1
+    000000010000a13c  bl  0x1000949a0
+    000000010000a140  mov w0, #0x0
+    000000010000a144  ldp x29, x30, [sp], #0x10
+    000000010000a148  retab
+
+It deliberately returns `NO`; waiting longer cannot create an untitled
+window.  Instead of guessing responder selectors, the post-launch hook calls
+the real application action.  Runtime-confirmed:
+
+    #### Terminal direct newShell: request
+    #### NSApp=0x155910d60 class=TTApplication responds(newShell:)=1
+    #### Terminal newShell: returned windows=3
+
+The same WindowServer then acknowledged a capture containing a visible bash
+window:
+
+    CAPTURE_ACK:48519:1785055673333926000:7
+
+Artifact SHA-256:
+
+    ipados-native-host-terminal-20260726.png
+      dd6a75aba4617ce94e682c571b5e33eacac8bec291cce8a95322f5d77d4176c6
+    raw shared frame
+      d1d67a066ed057a3c6d3c21a5e0b1c6b046703c824abf8374b835d48ceecfe20
+
+7. Remaining boundaries
+-----------------------
+
+- A specific synthetic click on Terminal's yellow titlebar control did not
+  produce a pixel difference, so this record does not claim that action.
+  GlassDemo's checkbox is the decisive input witness.
+- Keyboard, modifiers, right-click, scroll, Pencil semantics, drag-result
+  evidence, and text focus are not implemented yet.
+- Activity Monitor and Finder have per-process input endpoints, but their
+  direct-launch window behavior has not yet received the same RE/runtime proof
+  as Terminal.
+- M4 still mirrors the complete macOS display into one iPadOS scene.  It is
+  not the final per-CGSWindow architecture.
+
+8. Final installed-package regression
+--------------------------------------
+
+After the complete 0.3.4 package install, a fresh App-driven experimental
+start produced WindowServer PID 80520 and its exact initial ACK in 33 seconds:
+
+    READY ws=80520 seconds=33 ack=80520 1785056866426469000
+
+GlassDemo PID 80877 created its target socket.  Two taps at `(640,703)` then
+produced these receiver routes without a CGEvent object:
+
+    MACWS-INPUT RX seq=1 scene=d789b1909c685edc kind=down target=80877 frame=(640.00,703.00)/2388x1668 quartz=(320.00,351.50) event=1 created=NO post=issued cursor=unavailable(-1.00,-1.00) samples=0 capture=1785056941056405000
+    MACWS-INPUT ROUTE seq=1 route=appkit-socket pid=80877 window=0
+    MACWS-INPUT RX seq=2 scene=d789b1909c685edc kind=up target=80877 frame=(640.00,703.00)/2388x1668 quartz=(320.00,351.50) event=2 created=NO post=issued cursor=unavailable(-1.00,-1.00) samples=0 capture=1785056941113653000
+    MACWS-INPUT ROUTE seq=2 route=appkit-socket pid=80877 window=0
+    MACWS-INPUT RX seq=3 scene=d789b1909c685edc kind=down target=80877 frame=(640.00,703.00)/2388x1668 quartz=(320.00,351.50) event=1 created=NO post=issued cursor=unavailable(-1.00,-1.00) samples=0 capture=1785056957569406000
+    MACWS-INPUT ROUTE seq=3 route=appkit-socket pid=80877 window=0
+    MACWS-INPUT RX seq=4 scene=d789b1909c685edc kind=up target=80877 frame=(640.00,703.00)/2388x1668 quartz=(320.00,351.50) event=2 created=NO post=issued cursor=unavailable(-1.00,-1.00) samples=0 capture=1785056957630967000
+    MACWS-INPUT ROUTE seq=4 route=appkit-socket pid=80877 window=0
+
+The same target process logged all four `APP-INPUT RX`, `MAIN
+thread-main=YES`, and `POST window=4` stages.  Final frame comparison was:
+
+    first_tap_checkbox  (0, None)
+    second_tap_checkbox (760, (638, 702, 665, 729))
+    second_tap_full     (105773, (1, 20, 1694, 1071))
+
+The first click therefore only dismissed the known modal menu; the second
+changed the real checkbox.  Raw SHA-256 values were:
+
+    pre-first   171fb1efb53908b8c8daa6459c40eabc3545f9da5e25220aa8ac169d69b7036e
+    after-first f10eff4a0a38418cb45400cdff9add57f3b30981eb657165cab27eea2e9e328f
+    after-second 575460b80bcc742b93e14cf1aead21e36444d535efca7b3651015d26b5291d14
+
+App stop removed WindowServer and inputd in one second.  A subsequent
+inputd-only launch/unload test ended with `MACWS-INPUT STOP`, removed the
+socket, and emitted no `recv failed` line; this validates the SIGTERM/close
+shutdown path independently of GUI teardown.

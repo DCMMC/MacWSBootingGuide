@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,8 +40,11 @@ static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 static const char *const kShareFlag = "/var/mnt/rootfs/private/tmp/macws_vnc_share";
 static const char *const kCaptureFlag = "/var/mnt/rootfs/tmp/macws_capture_final";
+static const char *const kCaptureAck = "/var/mnt/rootfs/tmp/macws_capture_done";
 static const char *const kExperimentalKCmd = "/var/mnt/rootfs/private/tmp/macws_kcmd_fix";
 static const char *const kExperimentalCompletion = "/var/mnt/rootfs/private/tmp/macws_cancel_completion";
+static const char *const kWindowServerLog = "/var/jb/var/mobile/WindowServer.err";
+static const char *const kSafetyTrip = "/var/jb/var/mobile/macws_safety_trip";
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
@@ -48,6 +52,8 @@ static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gBusy;
 static NSString *gPhase = @"就绪";
 static NSString *gLastError = @"";
+static pid_t gActiveAppPID;
+static NSString *gActiveAppID = @"";
 
 static void HostLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void HostLog(NSString *format, ...) {
@@ -84,6 +90,35 @@ static BOOL TouchPath(const char *path) {
     if (fd < 0) return NO;
     close(fd);
     return YES;
+}
+
+static uint64_t ArmCapture(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    static _Atomic uint64_t lastGeneration = 0;
+    uint64_t generation = (uint64_t)now.tv_sec * 1000000000ull +
+                          (uint64_t)now.tv_nsec;
+    uint64_t previous = atomic_load(&lastGeneration);
+    while (generation <= previous) generation = previous + 1;
+    atomic_store(&lastGeneration, generation);
+
+    char value[48];
+    int length = snprintf(value, sizeof(value), "%llu\n",
+                          (unsigned long long)generation);
+    int fd = open(kCaptureFlag,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return 0;
+    ssize_t written = write(fd, value, (size_t)length);
+    int savedErrno = errno;
+    close(fd);
+    if (written != length) {
+        errno = written < 0 ? savedErrno : EIO;
+        (void)unlink(kCaptureFlag);
+        return 0;
+    }
+    HostLog(@"capture armed generation=%llu",
+            (unsigned long long)generation);
+    return generation;
 }
 
 static void RemovePath(const char *path) {
@@ -192,13 +227,39 @@ static BOOL ReadFrame(uint32_t *width, uint32_t *height) {
     uint32_t header[4] = {0};
     int fd = open(kFrame, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return NO;
+    struct stat st = {0};
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return NO;
+    }
     ssize_t count = read(fd, header, sizeof(header));
     close(fd);
     if (count != sizeof(header) || header[0] != MACWS_FRAME_MAGIC ||
-        header[1] == 0 || header[2] == 0 || header[1] > 16384 || header[2] > 16384)
+        header[1] == 0 || header[2] == 0 || header[1] > 16384 ||
+        header[2] > 16384 || header[3] != header[1] * 4u)
         return NO;
+    uint64_t required = sizeof(header) + (uint64_t)header[3] * header[2];
+    if ((uint64_t)st.st_size < required) return NO;
     if (width) *width = header[1];
     if (height) *height = header[2];
+    return YES;
+}
+
+static BOOL ReadCaptureAck(int expectedPID, uint64_t expectedGeneration,
+                           uint64_t *generationOut) {
+    char value[96] = {0};
+    int fd = open(kCaptureAck, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    ssize_t count = read(fd, value, sizeof(value) - 1);
+    close(fd);
+    if (count <= 0) return NO;
+    int pid = 0;
+    unsigned long long generation = 0;
+    if (sscanf(value, "%d %llu", &pid, &generation) != 2 ||
+        pid != expectedPID || generation == 0 ||
+        (expectedGeneration != 0 && generation != expectedGeneration))
+        return NO;
+    if (generationOut) *generationOut = (uint64_t)generation;
     return YES;
 }
 
@@ -207,8 +268,30 @@ static BOOL IsSocket(const char *path) {
     return stat(path, &st) == 0 && S_ISSOCK(st.st_mode);
 }
 
+static BOOL IsAppInputSocket(pid_t pid) {
+    if (pid <= 1) return NO;
+    char path[128];
+    snprintf(path, sizeof(path),
+             "/var/mnt/rootfs/private/tmp/macws_app_input.%d.sock", pid);
+    return IsSocket(path);
+}
+
 static void SetString(xpc_object_t reply, const char *key, NSString *value) {
     xpc_dictionary_set_string(reply, key, value.UTF8String ?: "");
+}
+
+static NSString *ReadSmallTextFile(const char *path, NSUInteger limit) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return @"";
+    NSMutableData *data = [NSMutableData dataWithLength:limit];
+    ssize_t count = read(fd, data.mutableBytes, data.length);
+    close(fd);
+    if (count <= 0) return @"";
+    data.length = (NSUInteger)count;
+    NSString *text = [[NSString alloc] initWithData:data
+                                           encoding:NSUTF8StringEncoding];
+    return [text stringByTrimmingCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
 }
 
 static void AddStatus(xpc_object_t reply) {
@@ -217,7 +300,9 @@ static void AddStatus(xpc_object_t reply) {
     int inputPID = 0;
     BOOL inputJob = JobHasPID("com.macwsguide.input", &inputPID);
     uint32_t width = 0, height = 0;
-    BOOL frame = ReadFrame(&width, &height);
+    uint64_t frameGeneration = 0;
+    BOOL frame = ws && ReadFrame(&width, &height) &&
+        ReadCaptureAck(wsPID, 0, &frameGeneration);
     BOOL busy;
     NSString *phase;
     NSString *lastError;
@@ -225,20 +310,44 @@ static void AddStatus(xpc_object_t reply) {
     busy = gBusy;
     phase = gPhase;
     lastError = gLastError;
+    pid_t activeAppPID = gActiveAppPID;
+    NSString *activeAppID = gActiveAppID;
+    if (activeAppPID > 1 && kill(activeAppPID, 0) != 0 && errno == ESRCH) {
+        gActiveAppPID = 0;
+        gActiveAppID = @"";
+        activeAppPID = 0;
+        activeAppID = @"";
+    }
     os_unfair_lock_unlock(&gStateLock);
+
+    // macos_gui.sh runs its watchdog independently so it can still recover the
+    // device if this daemon or the App disconnects. Surface its durable reason
+    // through the typed status protocol instead of leaving the UI looking like
+    // an unexplained WindowServer exit.
+    NSString *safetyTrip = ReadSmallTextFile(kSafetyTrip, 1024);
+    if (!ws && !busy && safetyTrip.length) {
+        phase = @"安全保护已触发";
+        lastError = safetyTrip;
+    }
 
     xpc_dictionary_set_uint64(reply, "protocol_version", MACWS_CONTROL_VERSION);
     xpc_dictionary_set_bool(reply, "busy", busy);
     SetString(reply, "phase", phase);
     SetString(reply, "last_error", lastError);
+    SetString(reply, "safety_trip", safetyTrip);
     xpc_dictionary_set_bool(reply, "rootfs_ready", RootFSReady());
     xpc_dictionary_set_bool(reply, "windowserver_running", ws);
     xpc_dictionary_set_int64(reply, "windowserver_pid", wsPID);
     xpc_dictionary_set_bool(reply, "input_running", inputJob && IsSocket(kInputSocket));
     xpc_dictionary_set_int64(reply, "input_pid", inputPID);
-    xpc_dictionary_set_bool(reply, "frame_ready", ws && frame);
+    xpc_dictionary_set_int64(reply, "active_app_pid", activeAppPID);
+    SetString(reply, "active_app_id", activeAppID);
+    xpc_dictionary_set_bool(reply, "app_input_ready",
+                            IsAppInputSocket(activeAppPID));
+    xpc_dictionary_set_bool(reply, "frame_ready", frame);
     xpc_dictionary_set_uint64(reply, "frame_width", width);
     xpc_dictionary_set_uint64(reply, "frame_height", height);
+    xpc_dictionary_set_uint64(reply, "frame_generation", frameGeneration);
     xpc_dictionary_set_bool(reply, "experimental_mode",
         access(kExperimentalKCmd, F_OK) == 0 || access(kExperimentalCompletion, F_OK) == 0);
     xpc_dictionary_set_bool(reply, "glassdemo_available", access("/var/mnt/rootfs/tmp/GlassDemo", X_OK) == 0);
@@ -273,14 +382,44 @@ static void ReplyResult(xpc_object_t request, BOOL ok, NSString *message,
     xpc_connection_send_message(peer, reply);
 }
 
-static BOOL WaitForGUI(NSTimeInterval timeout) {
+static BOOL WaitForGUIComponents(NSTimeInterval timeout, int *wsPIDOut) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while (deadline.timeIntervalSinceNow > 0) {
-        if (JobHasPID("com.apple.WindowServer", NULL) && IsSocket(kInputSocket)) return YES;
+        int pid = 0;
+        if (JobHasPID("com.apple.WindowServer", &pid) &&
+            IsSocket(kInputSocket)) {
+            if (wsPIDOut) *wsPIDOut = pid;
+            return YES;
+        }
         usleep(250000);
     }
     return NO;
 }
+
+static BOOL WaitForCapture(int wsPID, uint64_t generation,
+                           NSTimeInterval timeout, BOOL *processExited) {
+    if (processExited) *processExited = NO;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (deadline.timeIntervalSinceNow > 0) {
+        if (kill(wsPID, 0) != 0 && errno == ESRCH) {
+            if (processExited) *processExited = YES;
+            return NO;
+        }
+        if (ReadCaptureAck(wsPID, generation, NULL) && ReadFrame(NULL, NULL))
+            return YES;
+        usleep(100000);
+    }
+    return NO;
+}
+
+static void RotateWindowServerLog(void) {
+    NSString *previous = [@(kWindowServerLog) stringByAppendingString:@".previous"];
+    (void)unlink(previous.fileSystemRepresentation);
+    if (rename(kWindowServerLog, previous.fileSystemRepresentation) == 0)
+        HostLog(@"rotated WindowServer log to %@", previous);
+}
+
+static BOOL StopGUI(NSString **message);
 
 static BOOL StartGUI(BOOL experimental, NSString **message) {
     if (!RootFSReady()) {
@@ -291,7 +430,10 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
         *message = [NSString stringWithFormat:@"无法准备共享帧标志: %s", strerror(errno)];
         return NO;
     }
+    RemovePath(kFrame);
     RemovePath(kCaptureFlag);
+    RemovePath(kCaptureAck);
+    RemovePath(kSafetyTrip);
     if (experimental) {
         // Explicitly diagnostic: these flags do not represent protocol fixes.
         if (!TouchPath(kExperimentalKCmd) || !TouchPath(kExperimentalCompletion)) {
@@ -304,6 +446,14 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
         RemovePath(kExperimentalCompletion);
     }
 
+    uint64_t captureGeneration = ArmCapture();
+    if (captureGeneration == 0) {
+        *message = [NSString stringWithFormat:@"无法请求首帧捕获: %s",
+                    strerror(errno)];
+        return NO;
+    }
+
+    RotateWindowServerLog();
     SetState(YES, @"检查并修复启动环境…", @"");
     const char *startArgv[] = {kBash, kGUI, "start", "coexist",
                                "--no-terminal", "--no-vnc", NULL};
@@ -319,11 +469,51 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
         *message = [NSString stringWithFormat:@"WindowServer 启动请求失败（退出码 %d）", rc];
         return NO;
     }
-    SetState(YES, @"等待画面与触控桥…", @"");
-    BOOL ready = WaitForGUI(25.0);
-    *message = ready ? @"macOS GUI 与触控桥已启动" :
-        @"启动命令已完成，但画面或触控桥尚未就绪；请查看诊断日志";
-    return ready;
+    // WindowServer still has a runtime-confirmed, intermittent Foundation
+    // SystemStatus XPC SIGBUS during startup. Do not pretend that crash is a
+    // healthy session: preserve its crash report/log, then retry the whole
+    // process at most twice. A live process that simply fails to publish a
+    // frame is not retried; it is stopped after the bounded 60-second wait.
+    for (unsigned attempt = 1; attempt <= 3; attempt++) {
+        if (attempt > 1) {
+            SetState(YES, [NSString stringWithFormat:
+                @"WindowServer 启动重试 %u/3…", attempt], @"");
+            const char *killArgv[] = {kKillall, "-9", "WindowServer", NULL};
+            (void)RunCommand(killArgv, YES);
+            RemovePath(kFrame);
+            RemovePath(kCaptureFlag);
+            RemovePath(kCaptureAck);
+            captureGeneration = ArmCapture();
+            if (captureGeneration == 0) break;
+            usleep(500000);
+            if (RunCommand(wsArgv, YES) != 0) continue;
+        }
+
+        SetState(YES, @"等待 WindowServer 与触控桥…", @"");
+        int wsPID = 0;
+        if (!WaitForGUIComponents(15.0, &wsPID)) {
+            HostLog(@"startup attempt %u/3 failed before GUI components", attempt);
+            continue;
+        }
+        SetState(YES, @"等待首个可显示帧…", @"");
+        BOOL processExited = NO;
+        if (WaitForCapture(wsPID, captureGeneration, 60.0,
+                           &processExited)) {
+            *message = attempt == 1
+                ? @"macOS GUI、触控桥与首帧均已就绪"
+                : [NSString stringWithFormat:
+                    @"macOS GUI 已在第 %u 次尝试完成首帧", attempt];
+            return YES;
+        }
+        HostLog(@"startup attempt %u/3 frame failed pid=%d exited=%@",
+                attempt, wsPID, processExited ? @"YES" : @"NO");
+        if (!processExited) break;
+    }
+
+    NSString *stopMessage = nil;
+    (void)StopGUI(&stopMessage);
+    *message = @"WindowServer 未能确认首帧，已在有界重试后自动停止以避免空转";
+    return NO;
 }
 
 static BOOL StopGUI(NSString **message) {
@@ -334,9 +524,14 @@ static BOOL StopGUI(NSString **message) {
         const char *killArgv[] = {kKillall, "-9", appNames[i], NULL};
         (void)RunCommand(killArgv, YES);
     }
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = 0;
+    gActiveAppID = @"";
+    os_unfair_lock_unlock(&gStateLock);
     RemovePath(kFrame);
     RemovePath(kShareFlag);
     RemovePath(kCaptureFlag);
+    RemovePath(kCaptureAck);
     RemovePath(kExperimentalKCmd);
     RemovePath(kExperimentalCompletion);
     if (rc != 0) {
@@ -401,17 +596,27 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         return NO;
     }
     HostLog(@"launch-app id=%s pid=%d executable=%s", identifier, pid, app->rootPath);
-    if (strcmp(identifier, "glassdemo") == 0) {
-        // The current PF550 readback is a one-shot diagnostic. Arm it only
-        // after GlassDemo has had time to create its window, rather than
-        // consuming the one shot on an unrelated compositor frame.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
-                       gControlQueue, ^{
-            if (TouchPath(kCaptureFlag))
-                HostLog(@"diagnostic one-shot capture armed after GlassDemo launch");
-        });
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = pid;
+    gActiveAppID = [@(identifier) copy];
+    os_unfair_lock_unlock(&gStateLock);
+    // Each launch requests one bounded post-launch snapshot.  The producer
+    // acknowledges the exact generation; a stale desktop frame cannot make
+    // this operation succeed.
+    usleep(3000000);
+    uint64_t generation = ArmCapture();
+    int wsPID = 0;
+    if (generation == 0 || !JobHasPID("com.apple.WindowServer", &wsPID) ||
+        !WaitForCapture(wsPID, generation, 60.0, NULL)) {
+        *message = [NSString stringWithFormat:
+            @"%s 已启动，但 WindowServer 未确认更新后的共享帧", identifier];
+        return NO;
     }
-    *message = [NSString stringWithFormat:@"已启动 %s", identifier];
+    if (strcmp(identifier, "glassdemo") == 0) {
+        *message = @"GlassDemo 已启动；首次轻触会关闭它的启动诊断菜单，随后可直接操作控件";
+    } else {
+        *message = [NSString stringWithFormat:@"已启动 %s 并刷新画面", identifier];
+    }
     return YES;
 }
 
@@ -481,8 +686,13 @@ static void ServeRequest(xpc_object_t request) {
             ok = LaunchAllowedApp(xpc_dictionary_get_string(request, MACWS_CONTROL_KEY_APP_ID), &message);
         } else if (strcmp(op, MACWS_CONTROL_OP_CAPTURE) == 0) {
             SetState(YES, @"请求刷新共享帧…", @"");
-            ok = TouchPath(kShareFlag) && TouchPath(kCaptureFlag);
-            message = ok ? @"已请求刷新共享帧" : @"无法创建捕获标志";
+            int wsPID = 0;
+            uint64_t generation = 0;
+            ok = JobHasPID("com.apple.WindowServer", &wsPID) &&
+                 TouchPath(kShareFlag) && (generation = ArmCapture()) != 0 &&
+                 WaitForCapture(wsPID, generation, 60.0, NULL);
+            message = ok ? @"共享帧已刷新并由 WindowServer 确认" :
+                @"WindowServer 未在 60 秒内确认刷新帧";
         }
 
         SetState(NO, ok ? @"就绪" : @"操作失败", ok ? @"" : message);

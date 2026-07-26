@@ -42,8 +42,10 @@ LOGDIR=/var/jb/var/mobile
 GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned at boot
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
+INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 VNC_LABEL=com.macwsguide.osxvnc
 TERM_LABEL=com.macwsguide.terminal
+INPUT_LABEL=com.macwsguide.input
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
@@ -59,6 +61,9 @@ P_LAUNCHSERVICESD='CoreServices/launchservicesd'
 P_OSXVNC='OSXvnc-server'
 P_TERMINAL='Utilities/Terminal.app/Contents/MacOS/Terminal'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
+P_GLASSDEMO='/tmp/GlassDemo'
+P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
+P_INPUTD='/usr/local/bin/macwsinputd'
 
 # ─── Watchdog (crash-loop safety net) ───────────────────────────────────────
 # WindowServer composites window content through the MTLSim Metal bridge, whose
@@ -80,7 +85,11 @@ WD_WINDOW=45         # seconds — restart-counting window
 WD_POLL=5            # seconds between checks
 WD_LOAD_GRACE=90      # inherited 1-min load average is stale after userspace restart;
                       # restart-storm protection remains active during this grace period
+WD_WS_CPU_LIMIT=70    # sustained one-core WindowServer use is the thermal failure signal
+WD_WS_CPU_STRIKES=6   # six 5-second samples = 30 seconds above the limit
+WD_DIAG_MAX_RUNTIME=90 # temporary cap while cancellation completion remains diagnostic
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
+WD_TRIP="$LOGDIR/macws_safety_trip"
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 log() { echo "[macos_gui] $*"; }
@@ -118,13 +127,31 @@ load1_int() {
     uptime 2>/dev/null | sed -E 's/.*load averages?:[[:space:]]*([0-9]+).*/\1/'
 }
 
+# Integer CPU percentage for one exact PID. Unlike load average this catches a
+# single WindowServer core spinning at 70-90%, which runtime-confirmed the
+# 2026-07-26 thermal incident while the whole-system load average stayed near 1.
+ws_cpu_int() {
+    local wanted="$1"
+    ps -ax -o pid=,%cpu= 2>/dev/null \
+        | awk -v wanted="$wanted" '$1 == wanted { printf "%d\n", $2 + 0; exit }'
+}
+
+trip_watchdog() {
+    local reason="$1"
+    echo "$reason" > "$WD_TRIP"
+    log "watchdog: SAFETY TRIP: $reason"
+    stop_all
+}
+
 # Watchdog loop (runs iOS-side, backgrounded by `start`). Stops the GUI if
 # WindowServer crash-loops or the load average runs away.
 run_watchdog() {
     local last_pid="" restarts=0 t0 started now pid L load_runaway
+    local ws_cpu=0 cpu_strikes=0 diagnostic=0
     t0=$(date +%s)
     started=$t0
-    log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace or >=$WD_RESTART_LIMIT WS restarts / ${WD_WINDOW}s -> auto-stop)"
+    [ -e "$ROOTFS/tmp/macws_cancel_completion" ] && diagnostic=1
+    log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace; WS CPU>=${WD_WS_CPU_LIMIT}% for $((WD_WS_CPU_STRIKES * WD_POLL))s; >=$WD_RESTART_LIMIT restarts/${WD_WINDOW}s; diagnostic cap=${WD_DIAG_MAX_RUNTIME}s)"
     while :; do
         sleep "$WD_POLL"
         # Exit only when the GUI was actually torn down (the WindowServer launchd
@@ -147,9 +174,33 @@ run_watchdog() {
         if [ $((now - started)) -ge "$WD_LOAD_GRACE" ] && [ "$L" -ge "$WD_LOAD_LIMIT" ]; then
             load_runaway=1
         fi
-        if [ "$load_runaway" -eq 1 ] || [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
-            log "watchdog: RUNAWAY detected (load=$L, WS restarts=$restarts) -> stopping GUI to protect the device"
-            stop_all
+
+        ws_cpu=0
+        if [ -n "$pid" ] && [ "$pid" != "-" ]; then
+            ws_cpu=$(ws_cpu_int "$pid"); [ -z "$ws_cpu" ] && ws_cpu=0
+        fi
+        if [ "$ws_cpu" -ge "$WD_WS_CPU_LIMIT" ]; then
+            cpu_strikes=$((cpu_strikes + 1))
+        elif [ "$cpu_strikes" -gt 0 ]; then
+            # One scheduler dip must not erase the preceding 25 seconds of
+            # 80-95% CPU. Decay one sample at a time (a small leaky bucket).
+            cpu_strikes=$((cpu_strikes - 1))
+        fi
+
+        if [ "$load_runaway" -eq 1 ]; then
+            trip_watchdog "系统负载达到 $L，已自动停止 macOS GUI"
+            return 0
+        fi
+        if [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
+            trip_watchdog "WindowServer 在 ${WD_WINDOW} 秒内重启 ${restarts} 次，已自动停止"
+            return 0
+        fi
+        if [ "$cpu_strikes" -ge "$WD_WS_CPU_STRIKES" ]; then
+            trip_watchdog "WindowServer 高 CPU 样本累计达到 $((WD_WS_CPU_STRIKES * WD_POLL)) 秒（阈值 ${WD_WS_CPU_LIMIT}%，当前 ${ws_cpu}%），已自动停止以防过热"
+            return 0
+        fi
+        if [ "$diagnostic" -eq 1 ] && [ $((now - started)) -ge "$WD_DIAG_MAX_RUNTIME" ]; then
+            trip_watchdog "实验兼容模式达到 ${WD_DIAG_MAX_RUNTIME} 秒安全上限，已自动停止；这仍是诊断脚手架"
             return 0
         fi
     done
@@ -263,10 +314,19 @@ cleanup_macos() {
     launchctl remove "$VNC_LABEL"  2>/dev/null
     launchctl remove "$TERM_LABEL" 2>/dev/null
 
+    # inputd blocks in recv(2), so tear its job down explicitly before the
+    # broader directory unload and verify no pre-fix binary remains alive.
+    launchctl unload "$INPUT_PLIST" 2>/dev/null
+    launchctl remove "$INPUT_LABEL" 2>/dev/null
+
     # 2) stray GUI clients (Terminal, VNC, Activity Monitor, ...)
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
     kill_by_pattern "$P_ACTIVITYMON"
+    kill_by_pattern "$P_GLASSDEMO"
+    kill_by_pattern "$P_FINDER"
+    kill_by_pattern "$P_INPUTD"
+    rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
 
     # 3) the WindowServer + launchservicesd daemons
     launchctl unload "$MACOS_DAEMONS" 2>/dev/null
@@ -398,6 +458,7 @@ done
 start_watchdog() {
     [ "$WANT_WATCHDOG" = 1 ] || { log "watchdog: disabled (--no-watchdog)"; return 0; }
     rm -f "$WD_LOG"
+    rm -f "$WD_TRIP"
     nohup bash "$0" watchdog > "$WD_LOG" 2>&1 < /dev/null &
     log "watchdog: started in background (log: $WD_LOG)"
 }

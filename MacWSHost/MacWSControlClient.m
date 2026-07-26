@@ -59,6 +59,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
     const char *boolKeys[] = {
         "ok", "busy", "rootfs_ready", "windowserver_running",
         "input_running", "frame_ready", "experimental_mode",
+        "app_input_ready",
         "glassdemo_available", "terminal_available",
         "activity_monitor_available", "finder_available",
     };
@@ -68,14 +69,14 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
             result[@(boolKeys[i])] = @(xpc_dictionary_get_bool(reply, boolKeys[i]));
     }
     const char *uintKeys[] = {
-        "protocol_version", "frame_width", "frame_height",
+        "protocol_version", "frame_width", "frame_height", "frame_generation",
     };
     for (NSUInteger i = 0; i < sizeof(uintKeys) / sizeof(uintKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, uintKeys[i]);
         if (value && xpc_get_type(value) == XPC_TYPE_UINT64)
             result[@(uintKeys[i])] = @(xpc_dictionary_get_uint64(reply, uintKeys[i]));
     }
-    const char *intKeys[] = {"windowserver_pid", "input_pid"};
+    const char *intKeys[] = {"windowserver_pid", "input_pid", "active_app_pid"};
     for (NSUInteger i = 0; i < sizeof(intKeys) / sizeof(intKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, intKeys[i]);
         if (value && xpc_get_type(value) == XPC_TYPE_INT64)
@@ -83,7 +84,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
     }
     const char *stringKeys[] = {
         "message", "phase", "last_error", "hostd_log",
-        "windowserver_log", "input_log", "postinst_log",
+        "safety_trip", "active_app_id", "windowserver_log", "input_log", "postinst_log",
     };
     for (NSUInteger i = 0; i < sizeof(stringKeys) / sizeof(stringKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, stringKeys[i]);
