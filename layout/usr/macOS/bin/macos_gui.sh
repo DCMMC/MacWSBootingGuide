@@ -54,6 +54,8 @@ EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
 EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
+WINDOWSERVER_READY_WAIT=45
+STARTED_WS_PID=""
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
@@ -130,6 +132,62 @@ proc_running() {
 ws_pid() {
     launchctl list com.apple.WindowServer 2>/dev/null \
         | awk -F'= ' '/"PID"/{gsub(/[ ";]/,"",$2); print $2}'
+}
+
+# Do not connect multiple CGS clients while WindowServer is still realizing
+# AGX classes, compiling its first pipelines, and publishing the first display
+# command buffer.  Runtime A/B on 2026-07-27 showed 2400/2400 clean producer
+# completions when clients were staggered, while the old simultaneous startup
+# let the first WindowServer die with SIGSEGV and left VNC attached to a dead
+# CGS session.  In experimental mode, a clean producer completion is the
+# strongest readiness witness; otherwise require a stable PID for eight
+# consecutive samples.
+wait_for_initial_ws_ready() {
+    local log_start_line="$1" current="" previous="" stable=0 waited=0
+    while [ "$waited" -lt "$WINDOWSERVER_READY_WAIT" ]; do
+        sleep 1
+        waited=$((waited + 1))
+        current=$(ws_pid)
+        if [ -z "$current" ] || [ "$current" = "-" ]; then
+            previous=""
+            stable=0
+            continue
+        fi
+        if [ "$current" = "$previous" ]; then
+            stable=$((stable + 1))
+        else
+            previous="$current"
+            stable=1
+        fi
+
+        if [ "$WANT_EXPERIMENTAL" = 1 ]; then
+            if [ "$stable" -ge 2 ] &&
+               sed -n "${log_start_line},\$p" "$LOGDIR/WindowServer.err" \
+                   2>/dev/null \
+                   | grep -qE 'VNC-FLOW poll-result.*status=4.*code=0'; then
+                STARTED_WS_PID="$current"
+                log "WindowServer graphics ready (pid=$current, clean producer observed)."
+                return 0
+            fi
+        elif [ "$stable" -ge 8 ]; then
+            STARTED_WS_PID="$current"
+            log "WindowServer ready (pid=$current, stable for ${stable}s)."
+            return 0
+        fi
+    done
+    log "ERROR: WindowServer did not reach graphics-ready state after ${WINDOWSERVER_READY_WAIT}s."
+    return 1
+}
+
+started_ws_unchanged() {
+    local stage="$1" current
+    current=$(ws_pid)
+    if [ -n "$STARTED_WS_PID" ] && [ "$current" = "$STARTED_WS_PID" ]; then
+        return 0
+    fi
+    log "ERROR: WindowServer changed during $stage (ready=$STARTED_WS_PID current=${current:--})."
+    log "       Refusing to leave VNC attached to a dead CGS session."
+    return 1
 }
 
 # 1-minute load average (integer part) from `uptime`.
@@ -469,23 +527,38 @@ mode_exclusive() {
 }
 
 start_macos() {
+    local ws_log_start_line=1 waited=0
+    if [ -f "$LOGDIR/WindowServer.err" ]; then
+        ws_log_start_line=$(( $(wc -l < "$LOGDIR/WindowServer.err") + 1 ))
+    fi
     log "Loading macOS WindowServer + launchservicesd..."
     launchctl load "$MACOS_DAEMONS"
+    log "Waiting for WindowServer graphics initialization before GUI clients..."
+    wait_for_initial_ws_ready "$ws_log_start_line" || return 1
 
     if [ "$WANT_VNC" = 1 ]; then
         log "Starting VNC server (launchd job '$VNC_LABEL', persistent)..."
         rm -f "$LOGDIR/osxvnc.log"
         launchctl load "$VNC_PLIST"
+        waited=0
+        while ! proc_running "$P_OSXVNC" && [ "$waited" -lt 10 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        proc_running "$P_OSXVNC" || {
+            log "ERROR: VNC process did not start."
+            return 1
+        }
+        sleep 2
+        started_ws_unchanged "VNC startup" || return 1
     fi
 
     if [ "$WANT_TERMINAL" = 1 ]; then
-        # Give WindowServer (triggered by the VNC lookup) a moment to check in
-        # before Terminal tries to connect to it.
-        log "Waiting for WindowServer to come up..."
-        sleep 5
         log "Starting Terminal (launchd job '$TERM_LABEL')..."
         rm -f "$LOGDIR/terminal.log"
         launchctl load "$TERM_PLIST"
+        sleep 5
+        started_ws_unchanged "Terminal startup" || return 1
     fi
 }
 
@@ -660,7 +733,7 @@ case "$CMD" in
         cleanup_macos
         enable_experimental_if_requested
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
-        start_macos
+        start_macos || { stop_all; exit 1; }
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
         start_watchdog
@@ -679,7 +752,7 @@ case "$CMD" in
         stop_all
         enable_experimental_if_requested
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
-        start_macos
+        start_macos || { stop_all; exit 1; }
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
         start_watchdog
