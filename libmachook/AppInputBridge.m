@@ -24,13 +24,17 @@ typedef CGRect (*MacWSMsgRect)(id, SEL);
 typedef CGRect (*MacWSMsgRectRect)(id, SEL, CGRect);
 typedef CGRect (*MacWSMsgRectRectID)(id, SEL, CGRect, id);
 typedef CGPoint (*MacWSMsgPointPoint)(id, SEL, CGPoint);
+typedef CGPoint (*MacWSMsgPointPointID)(id, SEL, CGPoint, id);
 typedef NSInteger (*MacWSMsgInteger)(id, SEL);
 typedef BOOL (*MacWSMsgBool)(id, SEL);
+typedef double (*MacWSMsgDouble)(id, SEL);
+typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
 typedef id (*MacWSMouseEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
                                      NSTimeInterval, NSInteger, id, NSInteger,
                                      NSInteger, float);
 typedef void (*MacWSPostEvent)(id, SEL, id, BOOL);
 typedef void (*MacWSSendEvent)(id, SEL, id);
+typedef NSUInteger (*MacWSPressedMouseButtons)(id, SEL);
 
 static int MacWSAppInputSocket = -1;
 static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
@@ -41,16 +45,29 @@ static BOOL MacWSAppInputDrainScheduled;
 // pair can then be delivered with up already in NSApplication's queue before
 // sendEvent(down) enters an NSButton/NSControl nested tracking loop.
 static CFTypeRef MacWSAppInputDeferredRFBDownEvent;
+// Main-thread-only. RFB can deliver motion before mouse-up over several socket
+// records. Keep those ordinary NSEvents until the matching release is present,
+// then put the complete sequence in NSApplication's real event queue before
+// dispatching down. This prevents a control tracker from observing a transient
+// empty queue and returning before a later CFRunLoop block posts mouse-up.
+static NSMutableArray *MacWSAppInputDeferredRFBMoveEvents;
 // Main-thread-only. True while sendEvent(mouseDown) owns an AppKit nested
-// tracking loop. Records scheduled by the socket thread during that interval
-// must enter NSApplication's event queue so the real control tracker, rather
-// than a synthetic direct action, consumes move/up in order.
+// tracking loop. In addition to selecting the queue path, this supplies the
+// matching global pressed-button state that a hardware CGEvent normally
+// updates before AppKit receives mouseDown.
 static BOOL MacWSAppInputRFBTrackingActive;
+static MacWSPressedMouseButtons MacWSOriginalPressedMouseButtons;
 // Main-thread-only.  Retain the window selected by mouse-down until the
 // matching up/cancel.  Runtime evidence showed a title-bar down can close the
 // front Terminal window synchronously; re-hit-testing the up then targeted the
 // newly exposed window (23 -> 6), splitting one gesture across two windows.
 static CFTypeRef MacWSAppInputGestureWindow;
+// Main-thread-only diagnostic witness for whether the real hit NSControl
+// changed state after AppKit dispatch. It is observational: no setter/action
+// is called by the bridge.
+static CFTypeRef MacWSAppInputGestureHitView;
+static double MacWSAppInputGestureHitValueBefore;
+static BOOL MacWSAppInputGestureHitHasValue;
 
 static void MacWSSetAppInputGestureWindow(id window) {
     CFTypeRef replacement = window
@@ -60,12 +77,84 @@ static void MacWSSetAppInputGestureWindow(id window) {
     if (previous) CFRelease(previous);
 }
 
+static void MacWSSetAppInputGestureHitView(id view) {
+    CFTypeRef replacement = view
+        ? CFRetain((__bridge CFTypeRef)view) : NULL;
+    CFTypeRef previous = MacWSAppInputGestureHitView;
+    MacWSAppInputGestureHitView = replacement;
+    MacWSAppInputGestureHitHasValue = view &&
+        [view respondsToSelector:sel_registerName("doubleValue")];
+    MacWSAppInputGestureHitValueBefore = MacWSAppInputGestureHitHasValue
+        ? ((MacWSMsgDouble)objc_msgSend)(view, sel_registerName("doubleValue"))
+        : 0.0;
+    if (previous) CFRelease(previous);
+}
+
+static void MacWSLogAppInputGestureHitResult(const char *phase,
+                                             uint32_t gesture) {
+    id view = (__bridge id)MacWSAppInputGestureHitView;
+    if (!view) return;
+    BOOL enabled = ![view respondsToSelector:sel_registerName("isEnabled")] ||
+        ((MacWSMsgBool)objc_msgSend)(view, sel_registerName("isEnabled"));
+    double after = MacWSAppInputGestureHitHasValue
+        ? ((MacWSMsgDouble)objc_msgSend)(view, sel_registerName("doubleValue"))
+        : 0.0;
+    fprintf(stderr,
+        "#### APP-INPUT CONTROL-RESULT pid=%d gesture=%u phase=%s "
+        "view=%s enabled=%s has-value=%s before=%.6f after=%.6f\n",
+        getpid(), gesture, phase, object_getClassName(view),
+        enabled ? "YES" : "NO",
+        MacWSAppInputGestureHitHasValue ? "YES" : "NO",
+        MacWSAppInputGestureHitValueBefore, after);
+    fflush(stderr);
+    MacWSSetAppInputGestureHitView(nil);
+}
+
 static void MacWSSetDeferredRFBDownEvent(id event) {
     CFTypeRef replacement = event
         ? CFRetain((__bridge CFTypeRef)event) : NULL;
     CFTypeRef previous = MacWSAppInputDeferredRFBDownEvent;
     MacWSAppInputDeferredRFBDownEvent = replacement;
     if (previous) CFRelease(previous);
+}
+
+static void MacWSClearDeferredRFBMoveEvents(void) {
+    [MacWSAppInputDeferredRFBMoveEvents removeAllObjects];
+}
+
+static NSUInteger MacWSAppInputPressedMouseButtons(id self, SEL command) {
+    NSUInteger buttons = MacWSOriginalPressedMouseButtons
+        ? MacWSOriginalPressedMouseButtons(self, command) : 0;
+    // RE-confirmed in the macOS 13.4 AppKit actually loaded on the device:
+    // NSControlTrackMouse+668 calls +[NSEvent pressedMouseButtons], and
+    // +672..720 immediately invokes _controlStopTracking when bit 0 is clear,
+    // before it constructs _NSMouseTracker/trackEvent:usingHandler:. Our
+    // per-process NSEvent transport has no CGEvent to update that global bit,
+    // so reflect the left-button state only for the synchronous synthetic
+    // gesture. All unrelated callers receive the real AppKit result unchanged.
+    if (MacWSAppInputRFBTrackingActive) buttons |= 1u;
+    return buttons;
+}
+
+static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
+    if (MacWSOriginalPressedMouseButtons) return;
+    SEL selector = sel_registerName("pressedMouseButtons");
+    Method method = class_getClassMethod(eventClass, selector);
+    if (!method) {
+        fprintf(stderr,
+            "#### APP-INPUT STATE-BRIDGE unavailable: +[NSEvent pressedMouseButtons]\n");
+        fflush(stderr);
+        return;
+    }
+    IMP implementation = method_getImplementation(method);
+    if (implementation == (IMP)MacWSAppInputPressedMouseButtons) return;
+    MacWSOriginalPressedMouseButtons =
+        (MacWSPressedMouseButtons)implementation;
+    method_setImplementation(method,
+        (IMP)MacWSAppInputPressedMouseButtons);
+    fprintf(stderr,
+        "#### APP-INPUT STATE-BRIDGE installed +[NSEvent pressedMouseButtons]\n");
+    fflush(stderr);
 }
 
 static BOOL MacWSAppInputSupportedProcess(void) {
@@ -152,6 +241,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 getpid());
         return;
     }
+    MacWSInstallPressedMouseButtonsBridge(eventClass);
     id application = ((MacWSMsgID)objc_msgSend)((id)applicationClass,
         sel_registerName("sharedApplication"));
     id screen = ((MacWSMsgID)objc_msgSend)((id)screenClass,
@@ -193,6 +283,31 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         sel_registerName("windowNumber"));
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,
         sel_registerName("convertPointFromScreen:"), screenPoint);
+    if (record.kind == MacWSInputKindTouchDown ||
+        record.kind == MacWSInputKindTap) {
+        id contentView = ((MacWSMsgID)objc_msgSend)(window,
+            sel_registerName("contentView"));
+        CGPoint contentPoint = contentView
+            ? ((MacWSMsgPointPointID)objc_msgSend)(contentView,
+                sel_registerName("convertPoint:fromView:"), windowPoint,
+                nil) : (CGPoint){0.0, 0.0};
+        id hitView = contentView
+            ? ((MacWSMsgIDPoint)objc_msgSend)(contentView,
+                sel_registerName("hitTest:"), contentPoint) : nil;
+        MacWSSetAppInputGestureHitView(hitView);
+        static unsigned hitLogs;
+        if (hitLogs++ < 12) {
+            fprintf(stderr,
+                "#### APP-INPUT HIT pid=%d gesture=%u kind=%u window=%ld "
+                "screen=(%.2f,%.2f) local=(%.2f,%.2f) content=(%.2f,%.2f) "
+                "view=%s\n",
+                getpid(), record.contactID, record.kind, (long)windowNumber,
+                screenPoint.x, screenPoint.y, windowPoint.x, windowPoint.y,
+                contentPoint.x, contentPoint.y,
+                hitView ? object_getClassName(hitView) : "nil");
+            fflush(stderr);
+        }
+    }
     if (record.kind == MacWSInputKindTouchDown) {
         static unsigned geometryLogs;
         if (geometryLogs++ < 3) {
@@ -288,13 +403,16 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             getpid(), record.contactID, (long)windowNumber,
             screenPoint.x, screenPoint.y, windowPoint.x, windowPoint.y);
         fflush(stderr);
+        MacWSLogAppInputGestureHitResult("tap", record.contactID);
         MacWSSetAppInputGestureWindow(nil);
+        MacWSClearDeferredRFBMoveEvents();
         return;
     }
     if (isRFB && record.kind == MacWSInputKindTouchDown) {
         // Do not enter control tracking until the complete tap is available.
         // The chroot application has no ordinary login-session event pump;
         // runtime evidence showed two postEvent: calls remain unconsumed.
+        MacWSClearDeferredRFBMoveEvents();
         MacWSSetDeferredRFBDownEvent(event);
         if (logEvent) {
             fprintf(stderr,
@@ -313,39 +431,53 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             sel_registerName("postEvent:atStart:"), event, YES);
     } else if (isRFB && record.kind == MacWSInputKindTouchMove &&
                MacWSAppInputDeferredRFBDownEvent) {
-        // The first meaningful move turns a held possible-tap into a drag. Put
-        // that move in the queue before entering control tracking; later move
-        // and up records run through the re-entrant branch above.
-        id downEvent = [(__bridge id)MacWSAppInputDeferredRFBDownEvent retain];
-        MacWSSetDeferredRFBDownEvent(nil);
-        MacWSAppInputRFBTrackingActive = YES;
-        ((MacWSPostEvent)objc_msgSend)(application,
-            sel_registerName("postEvent:atStart:"), event, YES);
-        ((MacWSSendEvent)objc_msgSend)(application,
-            sel_registerName("sendEvent:"), downEvent);
-        MacWSAppInputRFBTrackingActive = NO;
-        fprintf(stderr,
-            "#### APP-INPUT DRAG-DISPATCH-RETURN pid=%d gesture=%u window=%ld "
-            "first-move=(%.2f,%.2f)\n",
-            getpid(), record.contactID, (long)windowNumber,
-            screenPoint.x, screenPoint.y);
-        fflush(stderr);
-        [downEvent release];
+        // CFRunLoop blocks scheduled after sendEvent(mouseDown) were not run by
+        // every NSControl tracking loop on this chroot. Buffer ordinary AppKit
+        // drag events until release so down never enters tracking with a
+        // temporarily incomplete sequence. Keep only the newest position.
+        // The macOS 13.4 _NSMouseTracker explicitly enables event coalescing;
+        // runtime LLDB evidence showed a prefilled four-move burst invokes
+        // continueTracking: only once at a middle sample, whereas a single
+        // latest move lands at the release coordinate. Historical samples are
+        // therefore not merely optional here; retaining them loses accuracy.
+        [MacWSAppInputDeferredRFBMoveEvents removeAllObjects];
+        [MacWSAppInputDeferredRFBMoveEvents addObject:event];
     } else if (isRFB &&
         (record.kind == MacWSInputKindTouchUp ||
          record.kind == MacWSInputKindTouchCancel) &&
         MacWSAppInputDeferredRFBDownEvent) {
         id downEvent = [(__bridge id)MacWSAppInputDeferredRFBDownEvent retain];
         MacWSSetDeferredRFBDownEvent(nil);
-        // Put mouse-up at the front before mouse-down enters a nested control
-        // tracking loop. AppKit consumes the matching up using its normal
-        // nextEventMatchingMask path; no target action is invoked directly.
+        NSArray *moves = [MacWSAppInputDeferredRFBMoveEvents copy];
+        MacWSClearDeferredRFBMoveEvents();
+        // Build the real queue head in move[0]..move[n-1],up order. Runtime
+        // LLDB breakpoints on NSSliderCell showed that posting moves forward
+        // and then up with atStart:YES reached startTrackingAt: and
+        // stopTracking: but never continueTracking: -- every insertion is a
+        // push, so up became the first matching event. Appending at the tail
+        // also produced no continueTracking: call in this launchd-created
+        // session. Push up first, then moves in reverse order, leaving the
+        // complete gesture at the head in chronological order. No
+        // target/action/value setter is used.
         MacWSAppInputRFBTrackingActive = YES;
         ((MacWSPostEvent)objc_msgSend)(application,
             sel_registerName("postEvent:atStart:"), event, YES);
+        for (NSUInteger index = [moves count]; index > 0; index--) {
+            id moveEvent = [moves objectAtIndex:index - 1];
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), moveEvent, YES);
+        }
         ((MacWSSendEvent)objc_msgSend)(application,
             sel_registerName("sendEvent:"), downEvent);
         MacWSAppInputRFBTrackingActive = NO;
+        fprintf(stderr,
+            "#### APP-INPUT GESTURE-DISPATCH-RETURN pid=%d gesture=%u "
+            "window=%ld moves=%lu release=(%.2f,%.2f)\n",
+            getpid(), record.contactID, (long)windowNumber,
+            (unsigned long)[moves count], screenPoint.x, screenPoint.y);
+        fflush(stderr);
+        MacWSLogAppInputGestureHitResult("drag", record.contactID);
+        [moves release];
         [downEvent release];
     } else if (isRFB && record.kind == MacWSInputKindHover) {
         // The launchd-created applications do not consistently drain events
@@ -375,6 +507,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     if (record.kind == MacWSInputKindTouchUp ||
         record.kind == MacWSInputKindTouchCancel) {
         MacWSSetAppInputGestureWindow(nil);
+        MacWSSetAppInputGestureHitView(nil);
     }
 }
 
@@ -521,6 +654,7 @@ static void *MacWSAppInputThread(void *unused) {
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     if (!MacWSAppInputSupportedProcess()) return;
     MacWSAppInputPending = [NSMutableArray new];
+    MacWSAppInputDeferredRFBMoveEvents = [NSMutableArray new];
     snprintf(MacWSAppInputPath, sizeof(MacWSAppInputPath),
              "/private/tmp/macws_app_input.%d.sock", getpid());
     MacWSAppInputSocket = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -548,7 +682,9 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
 
 __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     MacWSSetDeferredRFBDownEvent(nil);
+    MacWSClearDeferredRFBMoveEvents();
     MacWSSetAppInputGestureWindow(nil);
+    MacWSSetAppInputGestureHitView(nil);
     if (MacWSAppInputSocket >= 0) close(MacWSAppInputSocket);
     if (MacWSAppInputPath[0]) unlink(MacWSAppInputPath);
 }
