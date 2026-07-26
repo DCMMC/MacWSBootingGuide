@@ -4379,6 +4379,13 @@ typedef void (*MacWSVNCHandleMouse)(id, SEL, unsigned int, CGPoint, id);
 static MacWSVNCHandleMouse macws_orig_vnc_handle_mouse = NULL;
 static BOOL macws_vnc_left_down = NO;
 static CGPoint macws_vnc_last_point = {-1.0, -1.0};
+static CGPoint macws_vnc_pending_down_point = {-1.0, -1.0};
+static BOOL macws_vnc_pending_down = NO;
+static BOOL macws_vnc_remote_down = NO;
+static BOOL macws_vnc_release_pending = NO;
+static uint32_t macws_vnc_gesture_id = 0;
+static int macws_vnc_input_fd = -1;
+static double macws_vnc_last_continuous_send = 0.0;
 
 static double macws_vnc_monotonic_seconds(void) {
     struct timespec now = {0};
@@ -4386,15 +4393,27 @@ static double macws_vnc_monotonic_seconds(void) {
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
-static void macws_vnc_forward_input(MacWSInputKind kind, CGPoint point) {
-    if (!macws_rfbScreen) return;
+static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
+                                    BOOL reliable) {
+    if (!macws_rfbScreen) return NO;
     int width = macws_rfbScreen[0];
     int height = macws_rfbScreen[2];
-    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return;
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192) return NO;
 
-    // RFB reports logical Retina coordinates (1194x834 on iPad13,6). Passing
-    // the point and its matching coordinate-space dimensions preserves the
-    // same normalized location used by the 2388x1668 shared frame.
+    double now = macws_vnc_monotonic_seconds();
+    BOOL continuous = kind == MacWSInputKindTouchMove ||
+                      kind == MacWSInputKindHover;
+    // libvncserver can deliver pointer motion much faster than an AppKit main
+    // thread can dispatch it.  Preserve up to 120 Hz, but do not let redundant
+    // motion fill both AF_UNIX receive queues ahead of a button transition.
+    if (continuous && !reliable && macws_vnc_last_continuous_send > 0.0 &&
+        now - macws_vnc_last_continuous_send < (1.0 / 120.0)) {
+        return YES;
+    }
+
+    // The Retina hook makes RFB advertise physical coordinates (2388x1668 on
+    // iPad13,6). Passing the point and its matching advertised dimensions
+    // preserves the normalized location even if a non-Retina server is used.
     if (point.x < 0.0) point.x = 0.0;
     if (point.y < 0.0) point.y = 0.0;
     if (point.x >= width) point.x = width - 1;
@@ -4404,30 +4423,61 @@ static void macws_vnc_forward_input(MacWSInputKind kind, CGPoint point) {
         .version = MACWS_INPUT_VERSION,
         .kind = kind,
         .sceneID = 0x564e430000000001ull,
-        .timestamp = macws_vnc_monotonic_seconds(),
+        .timestamp = now,
         .x = (float)point.x,
         .y = (float)point.y,
         .pressure = (kind == MacWSInputKindTouchDown ||
                      kind == MacWSInputKindTouchMove) ? 1.0f : 0.0f,
-        .contactID = 1,
+        .contactID = macws_vnc_gesture_id,
         .frameWidth = (uint32_t)width,
         .frameHeight = (uint32_t)height,
         .targetPID = 0,
     };
-    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (fd < 0) return;
     struct sockaddr_un address = {0};
     address.sun_family = AF_UNIX;
     strlcpy(address.sun_path, "/private/tmp/macws_host_input.sock",
             sizeof(address.sun_path));
-    ssize_t sent = sendto(fd, &record, sizeof(record), 0,
-                          (const struct sockaddr *)&address, sizeof(address));
-    close(fd);
-    if (kind == MacWSInputKindTouchDown || kind == MacWSInputKindTouchUp) {
-        fprintf(stderr,
-            "#### OSXVNC INPUT kind=%u point=(%.1f,%.1f)/%dx%d sent=%zd\n",
-            kind, point.x, point.y, width, height, sent);
+    ssize_t sent = -1;
+    int saved_errno = 0;
+    unsigned attempts = reliable ? 8 : 1;
+    unsigned attempted = 0;
+    for (unsigned attempt = 0; attempt < attempts; attempt++) {
+        attempted = attempt + 1;
+        if (macws_vnc_input_fd < 0)
+            macws_vnc_input_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (macws_vnc_input_fd < 0) {
+            saved_errno = errno;
+        } else {
+            sent = sendto(macws_vnc_input_fd, &record, sizeof(record),
+                          MSG_DONTWAIT, (const struct sockaddr *)&address,
+                          sizeof(address));
+            if (sent == (ssize_t)sizeof(record)) break;
+            saved_errno = sent < 0 ? errno : EMSGSIZE;
+            if (saved_errno == EBADF || saved_errno == ECONNREFUSED) {
+                close(macws_vnc_input_fd);
+                macws_vnc_input_fd = -1;
+            }
+        }
+        if (!reliable) break;
+        // A WS recovery removes and recreates macwsinputd's socket.  Button
+        // transitions can wait for that short namespace/queue race; motion is
+        // deliberately lossy and never sleeps the VNC client thread.
+        usleep((useconds_t)(1000u * (attempt + 1)));
     }
+    BOOL ok = sent == (ssize_t)sizeof(record);
+    if (ok && continuous) macws_vnc_last_continuous_send = now;
+    static unsigned continuous_failures = 0;
+    if (!continuous || !ok) {
+        unsigned failure = !ok ? ++continuous_failures : continuous_failures;
+        if (!continuous || failure <= 4 || (failure % 120) == 0) {
+        fprintf(stderr,
+            "#### OSXVNC INPUT kind=%u gesture=%u point=(%.1f,%.1f)/%dx%d "
+            "sent=%zd errno=%d attempts=%u reliable=%s\n",
+            kind, macws_vnc_gesture_id, point.x, point.y, width, height,
+            sent, ok ? 0 : saved_errno, attempted, reliable ? "YES" : "NO");
+        }
+    }
+    return ok;
 }
 
 static void macws_new_vnc_handle_mouse(id self, SEL command,
@@ -4439,13 +4489,53 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
     BOOL moved = point.x != macws_vnc_last_point.x ||
                  point.y != macws_vnc_last_point.y;
     if (leftDown && !macws_vnc_left_down) {
-        macws_vnc_forward_input(MacWSInputKindTouchDown, point);
+        // Hold a possible click until either movement crosses a small Retina-
+        // scaled slop radius or button-up arrives.  A stationary click is then
+        // one MacWSInputKindTap datagram, so down/up cannot be split by queue
+        // pressure as observed at runtime (down sent=-1, up sent=52).
+        macws_vnc_gesture_id++;
+        if (macws_vnc_gesture_id == 0) macws_vnc_gesture_id++;
+        macws_vnc_pending_down_point = point;
+        macws_vnc_pending_down = YES;
+        macws_vnc_remote_down = NO;
     } else if (leftDown && moved) {
-        macws_vnc_forward_input(MacWSInputKindTouchMove, point);
+        if (macws_vnc_pending_down) {
+            double dx = point.x - macws_vnc_pending_down_point.x;
+            double dy = point.y - macws_vnc_pending_down_point.y;
+            double scale = (double)macws_vnc_integral_backing_scale();
+            double slop = 3.0 * (scale > 0.0 ? scale : 1.0);
+            if (dx * dx + dy * dy > slop * slop &&
+                macws_vnc_forward_input(MacWSInputKindTouchDown,
+                                        macws_vnc_pending_down_point, YES)) {
+                macws_vnc_pending_down = NO;
+                macws_vnc_remote_down = YES;
+                (void)macws_vnc_forward_input(MacWSInputKindTouchMove,
+                                              point, YES);
+            }
+        } else if (macws_vnc_remote_down) {
+            (void)macws_vnc_forward_input(MacWSInputKindTouchMove, point, NO);
+        }
     } else if (!leftDown && macws_vnc_left_down) {
-        macws_vnc_forward_input(MacWSInputKindTouchUp, point);
+        if (macws_vnc_pending_down) {
+            (void)macws_vnc_forward_input(MacWSInputKindTap,
+                                          macws_vnc_pending_down_point, YES);
+            macws_vnc_pending_down = NO;
+        } else if (macws_vnc_remote_down) {
+            BOOL sent = macws_vnc_forward_input(MacWSInputKindTouchUp,
+                                                point, YES);
+            macws_vnc_release_pending = !sent;
+            if (sent) macws_vnc_remote_down = NO;
+        }
     } else if (moved) {
-        macws_vnc_forward_input(MacWSInputKindHover, point);
+        if (macws_vnc_release_pending) {
+            BOOL sent = macws_vnc_forward_input(MacWSInputKindTouchCancel,
+                                                point, YES);
+            if (sent) {
+                macws_vnc_release_pending = NO;
+                macws_vnc_remote_down = NO;
+            }
+        }
+        (void)macws_vnc_forward_input(MacWSInputKindHover, point, NO);
     }
     macws_vnc_left_down = leftDown;
     macws_vnc_last_point = point;
@@ -4454,7 +4544,8 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
 static IOSurfaceRef macws_vnc_src = NULL;
 // Returns true only when a complete mmap frame was copied.  A test gradient is
 // diagnostic output and deliberately does not count as a real shared frame.
-static bool macws_vnc_fill_test(void) {
+static bool macws_vnc_fill_test(int rectX, int rectY,
+                                int rectWidth, int rectHeight) {
     if (!macws_vnc_fb || !macws_rfbScreen) return false;
     int padded = macws_rfbScreen[1];   // paddedWidthInBytes
     int height = macws_rfbScreen[2];   // height
@@ -4495,22 +4586,45 @@ static bool macws_vnc_fill_test(void) {
                 size_t dw = macws_rfbScreen[0] > 0
                     ? (size_t)macws_rfbScreen[0] : capacityWidth;
                 if (dw > capacityWidth) return false;
+                size_t x0 = 0, y0 = 0, x1 = dw, y1 = (size_t)height;
+                if (rectWidth > 0 && rectHeight > 0) {
+                    int64_t requestedX0 = rectX;
+                    int64_t requestedY0 = rectY;
+                    int64_t requestedX1 = requestedX0 + (int64_t)rectWidth;
+                    int64_t requestedY1 = requestedY0 + (int64_t)rectHeight;
+                    if (requestedX0 < 0) requestedX0 = 0;
+                    if (requestedY0 < 0) requestedY0 = 0;
+                    if (requestedX1 > (int64_t)dw) requestedX1 = (int64_t)dw;
+                    if (requestedY1 > (int64_t)height)
+                        requestedY1 = (int64_t)height;
+                    if (requestedX1 <= requestedX0 ||
+                        requestedY1 <= requestedY0) return false;
+                    x0 = (size_t)requestedX0;
+                    y0 = (size_t)requestedY0;
+                    x1 = (size_t)requestedX1;
+                    y1 = (size_t)requestedY1;
+                }
+                if (sw > SIZE_MAX / 4 || sw * 4 > sstride) return false;
                 if (bytespp == 4 && sw > 0 && sh > 0 && dw > 0 && height > 0 &&
                     (sw != dw || sh != (size_t)height)) {
-                    for (size_t y = 0; y < (size_t)height; y++) {
+                    for (size_t y = y0; y < y1; y++) {
                         size_t sy = y * sh / (size_t)height;
                         const uint32_t *src = (const uint32_t *)(data + sy * sstride);
                         uint32_t *dst = (uint32_t *)(macws_vnc_fb + y * (size_t)padded);
-                        for (size_t x = 0; x < dw; x++) {
+                        for (size_t x = x0; x < x1; x++) {
                             dst[x] = src[x * sw / dw];
                         }
                     }
                 } else {
-                    size_t cw = ((size_t)padded < sstride) ? (size_t)padded : sstride;
                     size_t rows = ((size_t)height < sh) ? (size_t)height : sh;
-                    for (size_t y = 0; y < rows; y++)
-                        memcpy(macws_vnc_fb + y * (size_t)padded,
-                               data + y * sstride, cw);
+                    if (y1 > rows) y1 = rows;
+                    size_t byteX = x0 * (size_t)bytespp;
+                    size_t byteCount = (x1 - x0) * (size_t)bytespp;
+                    if (byteX + byteCount > (size_t)padded ||
+                        byteX + byteCount > sstride) return false;
+                    for (size_t y = y0; y < y1; y++)
+                        memcpy(macws_vnc_fb + y * (size_t)padded + byteX,
+                               data + y * sstride + byteX, byteCount);
                 }
                 return true;
             }
@@ -4519,9 +4633,17 @@ static bool macws_vnc_fill_test(void) {
     // 2) Fallback: test gradient (only when /tmp/macws_vnc_test exists).
     if (!macws_vnc_test_on) return false;
     int pxw = padded / bytespp;
-    for (int y = 0; y < height; y++) {
+    int x0 = rectWidth > 0 ? rectX : 0;
+    int y0 = rectHeight > 0 ? rectY : 0;
+    int x1 = rectWidth > 0 ? rectX + rectWidth : pxw;
+    int y1 = rectHeight > 0 ? rectY + rectHeight : height;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > pxw) x1 = pxw;
+    if (y1 > height) y1 = height;
+    for (int y = y0; y < y1; y++) {
         unsigned char *row = (unsigned char *)macws_vnc_fb + (size_t)y * padded;
-        for (int x = 0; x < pxw; x++) {
+        for (int x = x0; x < x1; x++) {
             unsigned char *p = row + (size_t)x * bytespp;
             p[0] = (unsigned char)((x * 255) / (pxw ? pxw : 1)); // X ramp
             p[1] = (unsigned char)((y * 255) / height);          // Y ramp
@@ -4535,7 +4657,7 @@ static bool macws_vnc_fill_test(void) {
 static char *macws_new_rfbGetFB(void) {
     char *p = macws_orig_rfbGetFB ? macws_orig_rfbGetFB() : NULL;
     macws_vnc_fb = p;
-    macws_vnc_fill_test();
+    macws_vnc_fill_test(0, 0, 0, 0);
     return p;
 }
 static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
@@ -4547,7 +4669,7 @@ static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
     // selected capture backend, so deliver it directly. If its first frame is
     // not ready yet, preserve the allocated buffer and wait for the next poll.
     if (macws_vnc_share_on) {
-        bool copied = macws_vnc_fill_test();
+        bool copied = macws_vnc_fill_test(x, y, w, h);
         static int lg = 0;
         if (lg < 3) {
             fprintf(stderr, "#### OSXVNC mmap rect delivery copied=%d rect=%d,%d %dx%d\n",
@@ -4557,7 +4679,7 @@ static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
         return;
     }
     if (macws_orig_rfbGetFBRect) macws_orig_rfbGetFBRect(x, y, w, h);
-    macws_vnc_fill_test();
+    macws_vnc_fill_test(x, y, w, h);
 }
 
 static void macws_install_osxvnc_hooks(void) {

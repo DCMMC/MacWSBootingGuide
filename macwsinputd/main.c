@@ -75,7 +75,6 @@ static const char CaptureRequestPath[] = "/tmp/macws_capture_final";
 static volatile sig_atomic_t StopRequested;
 static volatile sig_atomic_t InputSocketFD = -1;
 static uint64_t LastCaptureGeneration;
-static uint64_t LastContinuousCaptureNanoseconds;
 
 typedef struct {
     pid_t pid;
@@ -100,6 +99,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindTouchUp: return "up";
         case MacWSInputKindTouchCancel: return "cancel";
         case MacWSInputKindHover: return "hover";
+        case MacWSInputKindTap: return "tap";
     }
     return "invalid";
 }
@@ -115,7 +115,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return false;
     }
     return record->kind >= MacWSInputKindTouchDown &&
-           record->kind <= MacWSInputKindHover;
+           record->kind <= MacWSInputKindTap;
 }
 
 static CGPoint QuartzPointForRecord(const MacWSInputRecord *record,
@@ -145,6 +145,8 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
             return MacWSCGEventLeftMouseUp;
         case MacWSInputKindHover:
             return MacWSCGEventMouseMoved;
+        case MacWSInputKindTap:
+            return MacWSCGEventLeftMouseDown;
     }
     return 0;
 }
@@ -249,16 +251,36 @@ static uint64_t RealtimeNanoseconds(void) {
 }
 
 static bool SendToAppInputBridge(int socketFD,
-                                 const MacWSInputRecord *record) {
-    if (record->targetPID <= 1) return false;
+                                 const MacWSInputRecord *record,
+                                 int *errorOut) {
+    if (record->targetPID <= 1) {
+        if (errorOut) *errorOut = EDESTADDRREQ;
+        return false;
+    }
     struct sockaddr_un address = {0};
     address.sun_family = AF_UNIX;
     int length = snprintf(address.sun_path, sizeof(address.sun_path),
                           "/private/tmp/macws_app_input.%d.sock",
                           record->targetPID);
-    if (length <= 0 || (size_t)length >= sizeof(address.sun_path)) return false;
-    ssize_t sent = sendto(socketFD, record, sizeof(*record), 0,
-                          (const struct sockaddr *)&address, sizeof(address));
+    if (length <= 0 || (size_t)length >= sizeof(address.sun_path)) {
+        if (errorOut) *errorOut = ENAMETOOLONG;
+        return false;
+    }
+    bool continuous = record->kind == MacWSInputKindTouchMove ||
+                      record->kind == MacWSInputKindHover;
+    unsigned attempts = continuous ? 1 : 8;
+    ssize_t sent = -1;
+    int savedError = 0;
+    for (unsigned attempt = 0; attempt < attempts; attempt++) {
+        sent = sendto(socketFD, record, sizeof(*record), MSG_DONTWAIT,
+                      (const struct sockaddr *)&address, sizeof(address));
+        if (sent == (ssize_t)sizeof(*record)) break;
+        savedError = sent < 0 ? errno : EMSGSIZE;
+        if (continuous) break;
+        usleep((useconds_t)(1000u * (attempt + 1)));
+    }
+    if (errorOut) *errorOut = sent == (ssize_t)sizeof(*record)
+        ? 0 : savedError;
     return sent == (ssize_t)sizeof(*record);
 }
 
@@ -302,20 +324,20 @@ static pid_t SoleAppInputBridgePID(void) {
     return result;
 }
 
-// Arm capture before posting input so the producer cannot miss a fast redraw
-// that completes between CGEventPost and a later control-plane round trip.
-// Drag updates are coalesced to at most 5 snapshots/s; down/up/cancel are never
-// dropped.  This is a request for observation only and does not fabricate a
-// successful frame -- WindowServer still has to ACK the exact generation.
+// Arm one diagnostic capture for a completed gesture. Continuous PF80/PF115
+// publication is responsible for live hover/drag feedback; creating/truncating
+// this control file for every pointer sample previously forced up to five full
+// 2388x1668 PF550 observations per second in addition to ordinary compositing.
+// This remains a request for observation only: WindowServer must ACK the exact
+// generation after publishing a real frame.
 static uint64_t ArmCaptureForInput(const MacWSInputRecord *record) {
-    uint64_t generation = RealtimeNanoseconds();
-    if (generation == 0) return 0;
-    bool continuous = record->kind == MacWSInputKindTouchMove ||
-                      record->kind == MacWSInputKindHover;
-    if (continuous && LastContinuousCaptureNanoseconds != 0 &&
-        generation - LastContinuousCaptureNanoseconds < 200000000ull) {
+    if (record->kind != MacWSInputKindTouchUp &&
+        record->kind != MacWSInputKindTouchCancel &&
+        record->kind != MacWSInputKindTap) {
         return 0;
     }
+    uint64_t generation = RealtimeNanoseconds();
+    if (generation == 0) return 0;
     if (generation <= LastCaptureGeneration)
         generation = LastCaptureGeneration + 1;
 
@@ -332,7 +354,6 @@ static uint64_t ArmCaptureForInput(const MacWSInputRecord *record) {
         return 0;
     }
     LastCaptureGeneration = generation;
-    if (continuous) LastContinuousCaptureNanoseconds = generation;
     return generation;
 }
 
@@ -437,7 +458,8 @@ int main(void) {
         CGPoint point = QuartzPointForRecord(&record, bounds);
         CGEventType eventType = EventTypeForRecord(&record, &buttonDown);
         MacWSWindowTarget eventTarget = {0};
-        if (record.kind != MacWSInputKindHover && gestureTarget.pid > 1) {
+        if (record.kind != MacWSInputKindHover &&
+            record.kind != MacWSInputKindTap && gestureTarget.pid > 1) {
             eventTarget = gestureTarget;
         } else if (record.targetPID > 1) {
             eventTarget.pid = record.targetPID;
@@ -458,7 +480,9 @@ int main(void) {
         // SendToAppInputBridge reject it before sendto(2).
         MacWSInputRecord routedRecord = record;
         routedRecord.targetPID = eventTarget.pid;
-        bool appBridgeSent = SendToAppInputBridge(socketFD, &routedRecord);
+        int appBridgeError = 0;
+        bool appBridgeSent = SendToAppInputBridge(socketFD, &routedRecord,
+                                                  &appBridgeError);
         CGEventRef event = appBridgeSent ? NULL :
             CGEventCreateMouseEvent(NULL, eventType, point,
                                     MacWSCGMouseButtonLeft);
@@ -488,6 +512,32 @@ int main(void) {
                 CGEventPost(MacWSCGHIDEventTap, event);
             }
             CFRelease(event);
+            if (record.kind == MacWSInputKindTap) {
+                CGEventRef upEvent = CGEventCreateMouseEvent(
+                    NULL, MacWSCGEventLeftMouseUp, point,
+                    MacWSCGMouseButtonLeft);
+                if (upEvent) {
+                    CGEventSetIntegerValueField(upEvent,
+                        MacWSCGMouseEventClickState, 1);
+                    CGEventSetIntegerValueField(upEvent,
+                        MacWSCGMouseEventButtonNumber,
+                        MacWSCGMouseButtonLeft);
+                    if (eventTarget.pid > 1) {
+                        if (eventTarget.windowID > 0) {
+                            CGEventSetIntegerValueField(upEvent,
+                                MacWSCGMouseEventWindowUnderMousePointer,
+                                eventTarget.windowID);
+                            CGEventSetIntegerValueField(upEvent,
+                                MacWSCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent,
+                                eventTarget.windowID);
+                        }
+                        CGEventPostToPid(eventTarget.pid, upEvent);
+                    } else {
+                        CGEventPost(MacWSCGHIDEventTap, upEvent);
+                    }
+                    CFRelease(upEvent);
+                }
+            }
             unsigned sampleLimit =
                 record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC ? 21 : 1;
             for (unsigned sample = 0; sample < sampleLimit; sample++) {
@@ -508,7 +558,7 @@ int main(void) {
             fprintf(stderr,
                     "MACWS-INPUT RX seq=%llu scene=%llx kind=%s "
                     "target=%d frame=(%.2f,%.2f)/%ux%u quartz=(%.2f,%.2f) event=%u "
-                    "created=%s post=%s cursor=%s(%.2f,%.2f) samples=%u capture=%llu\n",
+                    "created=%s post=%s route_errno=%d cursor=%s(%.2f,%.2f) samples=%u capture=%llu\n",
                     (unsigned long long)sequence,
                     (unsigned long long)record.sceneID,
                     KindName((MacWSInputKind)record.kind), record.targetPID,
@@ -516,6 +566,7 @@ int main(void) {
                     record.frameWidth, record.frameHeight, point.x, point.y,
                     eventType, created ? "YES" : "NO",
                     appBridgeSent || created ? "issued" : "not-issued",
+                    appBridgeError,
                     observedCursor ? "observed" : "unavailable",
                     observed.x, observed.y, cursorSamples,
                     (unsigned long long)captureGeneration);
@@ -528,7 +579,8 @@ int main(void) {
             fflush(stderr);
         }
         if (record.kind == MacWSInputKindTouchUp ||
-            record.kind == MacWSInputKindTouchCancel) {
+            record.kind == MacWSInputKindTouchCancel ||
+            record.kind == MacWSInputKindTap) {
             gestureTarget = (MacWSWindowTarget){0};
         }
     }

@@ -1,0 +1,116 @@
+Coexistence Retina VNC atomic-input evidence — 2026-07-26
+===========================================================
+
+Device: iPad13,6, iOS 16.3.1; macOS 13.4 chroot; native AGX path
+Mode: macos_gui.sh start coexist --experimental --no-terminal
+Application: GlassDemo
+Source base: cd27d08 plus the input/dirty-rectangle changes described here
+
+This record separates a proved stationary-click fix from the still-incomplete
+drag and frame-rate work.  The command-ABI and cancelled-swap switches enabled
+by --experimental remain diagnostic scaffolding; process uptime is not used as
+a rendering witness.
+
+1. Runtime-confirmed lost transition before the change
+-------------------------------------------------------
+
+The pre-change VNC hook created a new nonblocking datagram socket for every
+pointer record.  Device logs contained a mouse-down send failure followed by a
+successful mouse-up.  AppKit therefore received an incomplete gesture.  The
+original OSXvnc CGEvent path is not a fallback in this launchd session because
+CGPreflightPostEventAccess returned NO at runtime.
+
+The replacement keeps one sender socket, bounds continuous motion to 120 Hz,
+and gives button transitions eight bounded nonblocking retries.  A stationary
+primary click is held inside OSXvnc until release and sent as one version-3,
+52-byte MacWSInputKindTap record.  The target-process bridge constructs the
+matching AppKit down/up pair locally, queues up before synchronously dispatching
+down, and never substitutes a direct control action.
+
+2. Visible control and 32/32 transport witness
+-----------------------------------------------
+
+The first two physical-Retina clicks at RFB (640,703) dismissed GlassDemo's
+programmatic context menu and then toggled the real NSButton checkbox.  The
+post-click PNG visibly contains the checked state while the native
+NSVisualEffectView blur remains rendered.
+
+On-wire raw-RGBA hashes:
+
+  before: f64af1501f99bf518778693104ccff1bfc4e15aa379994028b638c6a485a4a4c
+          (2388x1668; 2,952,352 RGB-nonblack pixels)
+  checked: 4b3fdb1baca010032a07f2ef7c9598ad9dddfafea6b7386c26c59c0c5ce81490
+           (2388x1668)
+
+Development PNG SHA-256 values:
+
+  before: 309fb944f90840461d6c005582be73acd2aea31935143df136a7a6c8d735966c
+  checked: 50b2dae2fb7620351edc92c3c8049dc7f2070518363aa798f0db86dd59e8eb0e
+
+The same RFB connection then sent 30 additional stationary clicks at 20 event
+pairs per second.  In this WindowServer lifetime, OSXvnc logged gestures 1..32,
+all with the same successful result:
+
+  #### OSXVNC INPUT kind=6 gesture=32 point=(640.0,703.0)/2388x1668 sent=52 errno=0 attempts=1 reliable=YES
+
+GlassDemo logged exactly 32 matching completions:
+
+  #### APP-INPUT TAP-COMPLETE pid=57517 gesture=32 window=4 screen=(320.00,482.50) local=(223.00,422.50)
+
+There were zero `OSXVNC INPUT` send errors.  WindowServer remained PID 57474,
+LastExitStatus remained 0 during this stress interval, and the final sample was
+about 39.2% CPU / 163648 KiB RSS.  These witnesses prove delivery and a visible
+control state change; they do not prove smooth animation.
+
+3. Ordered queue and bounded backpressure
+-----------------------------------------
+
+The per-application bridge now owns every queued NSData explicitly (the socket
+thread has no autorelease pool), coalesces adjacent move/hover samples for one
+gesture, and caps continuous backlog at 128 while never evicting a button
+transition.  macwsinputd uses one attempt for disposable motion and eight for
+down/up/cancel/tap.  A PF550 deep capture is armed only on gesture completion;
+the previous per-motion arming amplified a drag into repeated full-frame GPU
+captures.
+
+The VNC framebuffer hook also copies only the clamped rectangle requested by
+OSXvnc rather than copying all 15,932,736 Retina pixel bytes for every dirty
+rectangle callback.  The initial/full request remains a full copy.
+
+4. Drag boundary remains open
+------------------------------
+
+The first drag test used coordinates read from a scaled preview rather than
+the RFB's physical coordinate space and is not a control witness.  A second
+test used the physical slider-knob point (820,766) and released at (1120,766).
+Transport and the target-process run loop completed in order:
+
+  #### OSXVNC INPUT kind=1 gesture=2 point=(820.0,766.0)/2388x1668 sent=52 errno=0 attempts=1 reliable=YES
+  #### OSXVNC INPUT kind=3 gesture=2 point=(1120.0,766.0)/2388x1668 sent=52 errno=0 attempts=1 reliable=YES
+  #### APP-INPUT DEFER pid=73775 kind=1 window=4
+  #### APP-INPUT DRAG-COMPLETE pid=73775 gesture=2 window=4 first-move=(450.00,451.00)
+  #### APP-INPUT POST pid=73775 kind=3 window=4 screen=(560.00,451.00) local=(463.00,391.00)
+
+`DRAG-COMPLETE` was the exact diagnostic string in that deployed build; because
+it only meant that `sendEvent:` returned, the source immediately renamed it to
+`DRAG-DISPATCH-RETURN` to avoid promoting dispatch return to control success.
+Furthermore, a byte-for-byte PNG comparison found zero changed pixels in the
+slider ROI.  A stationary tap at the release point also produced no slider-ROI
+change.  The only later changes were in animated content.  Therefore the
+current evidence proves transport/order but NOT NSSlider tracking semantics.
+The next diagnostic must log the actual AppKit hit view / NSSlider mouseDown
+entry and must not replace the control action with a synthetic setter.
+
+5. Startup and safety observation
+---------------------------------
+
+After the second package install, the first WindowServer instance exited with
+launchd status -10 during AGX initialization.  No new CrashReporter file was
+created.  The existing watchdog requested one restart; PID 73840 then produced
+a validated 2388x1668 frame and stayed alive for the interaction test.  This is
+recorded as an unresolved startup instability, not hidden as a successful first
+start.
+
+The previous test reached its explicit 300-second diagnostic cap and stopped
+cleanly.  The second test was stopped manually with misc/cleanup_all.sh after
+evidence collection.  No GUI/debug process was intentionally left running.

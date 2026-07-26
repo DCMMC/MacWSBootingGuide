@@ -22,6 +22,10 @@ enum {
     MacWSInputKindTouchUp = 3,
     MacWSInputKindTouchCancel = 4,
     MacWSInputKindHover = 5,
+    // A complete stationary primary-button gesture.  Keeping the down/up pair
+    // in one datagram prevents an accepted mouse-up from being separated from
+    // a failed mouse-down when a local AF_UNIX queue is under pressure.
+    MacWSInputKindTap = 6,
 };
 
 // Versioned wire record for the iOS-host -> macOS event bridge.
