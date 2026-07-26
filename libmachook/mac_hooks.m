@@ -4305,14 +4305,68 @@ static void macws_install_iomfb_hid_bypass(void) {
 // rfbScreenInfo (rfb.h): width@0 paddedWidthInBytes@+4 height@+8 depth@+12
 //   bitsPerPixel@+16 (all int32). Offsets from base 0x100000000 (otool of the
 //   device OSXvnc-server arm64): rfbGetFramebuffer @0xd9d4,
-//   rfbGetFramebufferUpdateInRect @0xdc28, rfbScreen @0x79bf8.
-// Always installed inside OSXvnc but INERT unless /tmp/macws_vnc_test exists.
+//   rfbGetFramebufferUpdateInRect @0xdc28, rfbScreenInit @0xf040,
+//   rfbCheckForScreenResolutionChange @0xd668, rfbScreen @0x79bf8.
+// Always installed inside OSXvnc; framebuffer replacement and Retina geometry
+// stay inert unless the corresponding diagnostic sentinel is present.
 static char *(*macws_orig_rfbGetFB)(void);
 static void (*macws_orig_rfbGetFBRect)(int, int, int, int);
+static size_t (*macws_orig_CGDisplayPixelsWide)(uint32_t);
+static size_t (*macws_orig_CGDisplayPixelsHigh)(uint32_t);
 static char *macws_vnc_fb = NULL;
 static int  *macws_rfbScreen = NULL;
+static double *macws_rfbBackingScale = NULL;
 static int   macws_vnc_test_on = 0;
 static int   macws_vnc_share_on = 0;
+
+// RE-confirmed via the device OSXvnc-server arm64:
+//   * _rfbScreenInit+0xa0/+0xb8 stores CGDisplayPixelsWide/High in rfbScreen.
+//   * _rfbCheckForScreenResolutionChange+0x30/+0x48 calls those APIs again and
+//     compares their result to rfbScreen; a post-init field edit therefore
+//     caused an endless "Screen geometry changed - (1194,834)" loop that closed
+//     active clients.
+//   * backingScaleFactor is saved at image base+0x7a1e8 before the first width
+//     query. LLDB runtime-confirmed rfbScreen={1194,9600,834,...,32}; the
+//     9600-byte row safely contains 2388*4 bytes plus 48 bytes of alignment.
+// Return the physical Retina dimensions at the two source APIs so both init and
+// later change detection observe the same geometry. OSXvnc then allocates its
+// cached framebuffer at the correct size through its ordinary path.
+static int macws_vnc_integral_backing_scale(void) {
+    if (!macws_vnc_share_on || !macws_rfbBackingScale) return 1;
+    double savedScale = *macws_rfbBackingScale;
+    int scale = (int)(savedScale + 0.5);
+    if (scale < 2 || scale > 4 || savedScale < (double)scale - 0.01 ||
+        savedScale > (double)scale + 0.01) return 1;
+    return scale;
+}
+
+static size_t macws_new_CGDisplayPixelsWide(uint32_t display) {
+    size_t logical = macws_orig_CGDisplayPixelsWide
+        ? macws_orig_CGDisplayPixelsWide(display) : 0;
+    int scale = macws_vnc_integral_backing_scale();
+    if (logical == 0 || logical > 8192 || scale <= 1 ||
+        logical > 8192u / (size_t)scale) return logical;
+    size_t physical = logical * (size_t)scale;
+    static int logged = 0;
+    if (!logged++) fprintf(stderr,
+        "#### OSXVNC RETINA width API logical=%zu scale=%d physical=%zu\n",
+        logical, scale, physical);
+    return physical;
+}
+
+static size_t macws_new_CGDisplayPixelsHigh(uint32_t display) {
+    size_t logical = macws_orig_CGDisplayPixelsHigh
+        ? macws_orig_CGDisplayPixelsHigh(display) : 0;
+    int scale = macws_vnc_integral_backing_scale();
+    if (logical == 0 || logical > 8192 || scale <= 1 ||
+        logical > 8192u / (size_t)scale) return logical;
+    size_t physical = logical * (size_t)scale;
+    static int logged = 0;
+    if (!logged++) fprintf(stderr,
+        "#### OSXVNC RETINA height API logical=%zu scale=%d physical=%zu\n",
+        logical, scale, physical);
+    return physical;
+}
 
 // The exact arm64 OSXvnc binary installed on the device was disassembled on
 // 2026-07-26. -[VNCServer handleMouseButtons:atPoint:forClient:] receives the
@@ -4522,6 +4576,15 @@ static void macws_install_osxvnc_hooks(void) {
     if (!mh) return;
     char *base = (char *)mh;
     macws_rfbScreen = (int *)(base + 0x79bf8);
+    macws_rfbBackingScale = (double *)(base + 0x7a1e8);
+    void *cgWidth = dlsym(RTLD_DEFAULT, "CGDisplayPixelsWide");
+    void *cgHeight = dlsym(RTLD_DEFAULT, "CGDisplayPixelsHigh");
+    if (cgWidth) MSHookFunction(cgWidth,
+        (void *)macws_new_CGDisplayPixelsWide,
+        (void **)&macws_orig_CGDisplayPixelsWide);
+    if (cgHeight) MSHookFunction(cgHeight,
+        (void *)macws_new_CGDisplayPixelsHigh,
+        (void **)&macws_orig_CGDisplayPixelsHigh);
     MSHookFunction(base + 0xd9d4, (void *)macws_new_rfbGetFB,     (void **)&macws_orig_rfbGetFB);
     MSHookFunction(base + 0xdc28, (void *)macws_new_rfbGetFBRect, (void **)&macws_orig_rfbGetFBRect);
     Class serverClass = objc_getClass("VNCServer");

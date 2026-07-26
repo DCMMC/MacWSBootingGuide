@@ -52,6 +52,8 @@ EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
 EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
+ARMED_CAPTURE_GENERATION=""
+CAPTURE_READY_WAIT=60
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
@@ -96,6 +98,8 @@ WD_WS_CPU_STRIKES=6   # six 5-second samples = 30 seconds above the limit
 WD_DIAG_MAX_RUNTIME=300 # bounded VNC test window; CPU/restart guards remain active
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 WD_TRIP="$LOGDIR/macws_safety_trip"
+RECOVERED_WS_PID=""
+RECOVERY_EXTRA_RESTARTS=0
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 log() { echo "[macos_gui] $*"; }
@@ -142,6 +146,88 @@ ws_cpu_int() {
         | awk -v wanted="$wanted" '$1 == wanted { printf "%d\n", $2 + 0; exit }'
 }
 
+# A GUI client cannot reuse its WindowServer connection after that server dies.
+# Runtime evidence from OSXvnc is explicit:
+#   "received notification of WindowServer event port death"
+#   "port matched the WindowServer port created in BindCGSToRunLoop"
+# Keeping that old process alive therefore leaves a valid TCP listener backed by
+# a permanently dead CGS session.  Tear down only WS-dependent clients, wait for
+# launchd's replacement WS to stay alive for two samples, then reconnect them.
+stop_ws_dependents() {
+    launchctl unload "$VNC_PLIST"  2>/dev/null
+    launchctl unload "$TERM_PLIST" 2>/dev/null
+    launchctl remove "$VNC_LABEL"  2>/dev/null
+    launchctl remove "$TERM_LABEL" 2>/dev/null
+    launchctl unload "$INPUT_PLIST" 2>/dev/null
+    launchctl remove "$INPUT_LABEL" 2>/dev/null
+
+    kill_by_pattern "$P_OSXVNC"
+    kill_by_pattern "$P_TERMINAL"
+    kill_by_pattern "$P_ACTIVITYMON"
+    kill_by_pattern "$P_GLASSDEMO"
+    kill_by_pattern "$P_FINDER"
+    kill_by_pattern "$P_INPUTD"
+    rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
+}
+
+wait_for_replacement_ws() {
+    local expected="$1" current="" stable=0 tries=0
+    RECOVERY_EXTRA_RESTARTS=0
+    while [ "$tries" -lt 20 ]; do
+        sleep 1
+        tries=$((tries + 1))
+        current=$(ws_pid)
+        if [ -z "$current" ] || [ "$current" = "-" ]; then
+            stable=0
+            continue
+        fi
+        if [ "$current" != "$expected" ]; then
+            log "watchdog: replacement WindowServer changed again ($expected -> $current)"
+            expected="$current"
+            stable=1
+            RECOVERY_EXTRA_RESTARTS=$((RECOVERY_EXTRA_RESTARTS + 1))
+        else
+            stable=$((stable + 1))
+        fi
+        if [ "$stable" -ge 2 ]; then
+            RECOVERED_WS_PID="$current"
+            return 0
+        fi
+    done
+    RECOVERED_WS_PID=""
+    return 1
+}
+
+recover_ws_dependents() {
+    local old_pid="$1" observed_pid="$2"
+    log "watchdog: reconnecting GUI clients to replacement WindowServer $observed_pid"
+    stop_ws_dependents
+    rm -f "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
+
+    if ! wait_for_replacement_ws "$observed_pid"; then
+        log "watchdog: replacement WindowServer did not become stable within 20 seconds"
+        return 1
+    fi
+
+    if [ -f "$INPUT_PLIST" ]; then
+        launchctl load "$INPUT_PLIST" 2>/dev/null
+    fi
+    if [ "$WANT_VNC" = 1 ]; then
+        launchctl load "$VNC_PLIST" 2>/dev/null
+    fi
+    if [ "$WANT_TERMINAL" = 1 ]; then
+        sleep 2
+        launchctl load "$TERM_PLIST" 2>/dev/null
+    fi
+    if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_VNC" = 1 ] &&
+       [ "$WANT_TERMINAL" = 1 ]; then
+        arm_initial_vnc_capture_if_requested
+        wait_for_initial_vnc_capture_if_requested
+    fi
+    log "watchdog: GUI clients reconnected after WS $old_pid -> $RECOVERED_WS_PID (vnc=$WANT_VNC terminal=$WANT_TERMINAL)"
+    return 0
+}
+
 trip_watchdog() {
     local reason="$1"
     echo "$reason" > "$WD_TRIP"
@@ -153,7 +239,7 @@ trip_watchdog() {
 # WindowServer crash-loops or the load average runs away.
 run_watchdog() {
     local last_pid="" restarts=0 t0 started now pid L load_runaway
-    local ws_cpu=0 cpu_strikes=0 diagnostic=0
+    local ws_cpu=0 cpu_strikes=0 diagnostic=0 missing_samples=0
     t0=$(date +%s)
     started=$t0
     [ -e "$EXPERIMENTAL_COMPLETION" ] && diagnostic=1
@@ -168,9 +254,28 @@ run_watchdog() {
             return 0
         fi
         pid=$(ws_pid)
+        if [ -z "$pid" ] || [ "$pid" = "-" ]; then
+            missing_samples=$((missing_samples + 1))
+            if [ "$missing_samples" -eq 1 ] || [ "$missing_samples" -eq 3 ]; then
+                log "watchdog: WindowServer job is loaded but has no PID; requesting launchd start (sample=$missing_samples)"
+                launchctl start com.apple.WindowServer 2>/dev/null
+            fi
+            if [ "$missing_samples" -ge 4 ]; then
+                trip_watchdog "WindowServer 连续 $((missing_samples * WD_POLL)) 秒没有进程，已自动停止 macOS GUI"
+                return 0
+            fi
+        else
+            missing_samples=0
+        fi
         if [ -n "$pid" ] && [ "$pid" != "-" ] && [ -n "$last_pid" ] && [ "$pid" != "$last_pid" ]; then
             restarts=$((restarts + 1))
             log "watchdog: WindowServer restarted ($last_pid -> $pid), count=$restarts in window"
+            if ! recover_ws_dependents "$last_pid" "$pid"; then
+                trip_watchdog "WindowServer 重启后未能建立稳定会话，已自动停止 macOS GUI"
+                return 0
+            fi
+            restarts=$((restarts + RECOVERY_EXTRA_RESTARTS))
+            pid="$RECOVERED_WS_PID"
         fi
         [ -n "$pid" ] && [ "$pid" != "-" ] && last_pid="$pid"
         now=$(date +%s)
@@ -492,8 +597,42 @@ arm_initial_vnc_capture_if_requested() {
     # generation once and writes macws_capture_done only after a validated,
     # spatially non-uniform frame has been published.
     sleep 1
-    date +%s > "$EXPERIMENTAL_CAPTURE"
-    log "VNC: requested the initial post-Terminal shared frame."
+    rm -f "$EXPERIMENTAL_CAPTURE_DONE"
+    ARMED_CAPTURE_GENERATION=$(date +%s)
+    echo "$ARMED_CAPTURE_GENERATION" > "$EXPERIMENTAL_CAPTURE"
+    log "VNC: requested post-Terminal shared frame generation $ARMED_CAPTURE_GENERATION."
+}
+
+wait_for_initial_vnc_capture_if_requested() {
+    [ -n "$ARMED_CAPTURE_GENERATION" ] || return 0
+
+    # OSXvnc allocates its cached framebuffer before Terminal has necessarily
+    # produced the first usable scanout. Runtime evidence on 2026-07-26 showed
+    # an early client receiving a 2388x1668 all-zero update while WindowServer
+    # acknowledged the validated, non-uniform mmap a few seconds later. Do not
+    # advertise the session as ready until that exact generation is published.
+    # A newly connecting client then asks OSXvnc for a full rectangle and the
+    # existing mmap hook copies the completed frame into its ordinary buffer.
+    local waited=0 ack_generation="" ack_pid=""
+    log "VNC: waiting up to ${CAPTURE_READY_WAIT}s for a validated Retina first frame..."
+    while [ "$waited" -lt "$CAPTURE_READY_WAIT" ]; do
+        if [ -f "$EXPERIMENTAL_CAPTURE_DONE" ]; then
+            ack_pid=$(awk 'NR == 1 { print $1 }' "$EXPERIMENTAL_CAPTURE_DONE" 2>/dev/null)
+            ack_generation=$(awk 'NR == 1 { print $2 }' "$EXPERIMENTAL_CAPTURE_DONE" 2>/dev/null)
+            if [ "$ack_generation" = "$ARMED_CAPTURE_GENERATION" ]; then
+                log "VNC: Retina first frame ready (WindowServer pid=$ack_pid, generation=$ack_generation)."
+                ARMED_CAPTURE_GENERATION=""
+                return 0
+            fi
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    log "WARNING: no validated VNC first frame after ${CAPTURE_READY_WAIT}s; VNC remains available for diagnostics."
+    log "         Inspect $LOGDIR/WindowServer.err for 'VNC-FINAL generation=$ARMED_CAPTURE_GENERATION'."
+    ARMED_CAPTURE_GENERATION=""
+    return 0
 }
 
 # Launch the crash-loop watchdog in the background (iOS-side, survives SSH
@@ -502,8 +641,15 @@ start_watchdog() {
     [ "$WANT_WATCHDOG" = 1 ] || { log "watchdog: disabled (--no-watchdog)"; return 0; }
     rm -f "$WD_LOG"
     rm -f "$WD_TRIP"
-    nohup bash "$0" watchdog > "$WD_LOG" 2>&1 < /dev/null &
-    log "watchdog: started in background (log: $WD_LOG)"
+    # Re-exec with the exact session intent.  The recovery path needs these
+    # flags so a WS restart does not unexpectedly launch a VNC/Terminal job the
+    # user disabled, and so it knows whether to request a fresh shared frame.
+    set -- watchdog "$MODE"
+    [ "$WANT_VNC" = 1 ] || set -- "$@" --no-vnc
+    [ "$WANT_TERMINAL" = 1 ] || set -- "$@" --no-terminal
+    [ "$WANT_EXPERIMENTAL" = 1 ] && set -- "$@" --experimental
+    nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
+    log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL)"
 }
 
 case "$CMD" in
@@ -516,6 +662,7 @@ case "$CMD" in
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos
         arm_initial_vnc_capture_if_requested
+        wait_for_initial_vnc_capture_if_requested
         start_watchdog
         echo
         log "Started in $MODE mode."
@@ -534,6 +681,7 @@ case "$CMD" in
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos
         arm_initial_vnc_capture_if_requested
+        wait_for_initial_vnc_capture_if_requested
         start_watchdog
         echo
         log "Restarted in $MODE mode."

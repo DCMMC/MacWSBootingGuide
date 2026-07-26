@@ -356,9 +356,9 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
 //
 // Consequently this is a four-vertex triangle strip, with no vertex buffers,
 // samplers, or uniforms.  The fragment coordinates are pixel coordinates, so
-// render at the source's full size; the VNC mmap consumer performs the Retina
-// half-size reduction.  Rendering directly to 1194x834 would only crop the
-// source's upper-left quarter.
+// render at the source's full physical size. The VNC server now advertises the
+// same Retina dimensions (2388x1668 on this iPad); rendering directly to the
+// logical 1194x834 size would only crop the source's upper-left quarter.
 static id g_vnc_final_lock = nil;
 static id<MTLTexture> g_vnc_final_tex = nil;
 static IOSurfaceRef g_vnc_final_surface = NULL;
@@ -481,8 +481,8 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
     // The old one-attempt state unlinked the request before GPU work; one
     // transient InnocentVictim completion then left VNC black forever. Keep a
     // strict per-generation retry budget. The tracking thread runs at 5 Hz and
-    // only calls us for a new completed scanout serial, so four attempts are
-    // bounded in both rate and resource use.
+    // may retry the same completed scanout while this generation stays armed;
+    // four attempts are therefore bounded in both rate and resource use.
     static uint64_t activeGeneration = 0;
     static unsigned activeAttempts = 0;
     static uint64_t exhaustedGeneration = 0;
@@ -743,7 +743,9 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
     void *shared = macws_vnc_mmap_data(outw, outh);
     BOOL copied = NO;
     size_t nonzero = 0;
+    size_t rgbNonzero = 0;
     size_t different = 0;
+    size_t sampled = 0;
     uint32_t firstSample = 0;
     BOOL haveFirstSample = NO;
     if (base && shared && bpr >= outw * 4 && bh >= outh) {
@@ -757,7 +759,9 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
             const uint32_t *row = (const uint32_t *)((const char *)base + y * bpr);
             for (size_t x = 0; x < outw; x += 16) {
                 uint32_t pixel = row[x];
+                sampled++;
                 if (pixel != 0) nonzero++;
+                if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
                 if (!haveFirstSample) {
                     firstSample = pixel;
                     haveFirstSample = YES;
@@ -766,7 +770,14 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
                 }
             }
         }
-        if (different >= 4) {
+        // Opaque black is nonzero because alpha is 0xff. A post-restart frame
+        // containing only the menu bar and empty window outlines measured
+        // 2.111% RGB-nonblack pixels in the full RFB capture yet previously
+        // passed the alpha-inclusive test. Terminal's complete frame measured
+        // 54.890%. Require a conservative 5% sampled RGB coverage so ACK means
+        // visible application content, not merely compositor geometry.
+        BOOL contentVisible = sampled > 0 && rgbNonzero * 20 >= sampled;
+        if (different >= 4 && contentVisible) {
             for (size_t y = 0; y < outh; y++) {
                 memcpy((char *)shared + y * outw * 4,
                        (char *)base + y * bpr, outw * 4);
@@ -777,10 +788,12 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
         if (capturedLog++ < 8) {
             fprintf(stderr,
                 "#### VNC-FINAL captured %zux%zu BGRA8 cpu130=%p base=%p "
-                "bpr=%zu sampled_nonzero=%zu sampled_different=%zu "
+                "bpr=%zu sampled_nonzero=%zu sampled_rgb_nonzero=%zu/%zu "
+                "sampled_different=%zu "
                 "publish=%s\n",
-                outw, outh, cpuMapping, base, bpr, nonzero, different,
-                copied ? "YES" : "REJECT-SOLID");
+                outw, outh, cpuMapping, base, bpr, nonzero, rgbNonzero,
+                sampled, different,
+                copied ? "YES" : "REJECT-NO-CONTENT");
         }
     }
     IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
@@ -825,9 +838,20 @@ static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
                             snapshotSurface = (IOSurfaceRef)CFRetain(g_vnc_final_surface);
                         }
                     }
+                    // A completed command can be discarded as an
+                    // InnocentVictim during GPU recovery. Runtime evidence on
+                    // 2026-07-26 showed attempt 1/4 failing that way, followed
+                    // by no later attempt because the scanout serial stayed
+                    // unchanged. Once at least one completed scanout exists,
+                    // keep invoking the bounded per-generation retry state
+                    // machine while a request remains armed. A successful ACK
+                    // removes the request; an exhausted generation returns
+                    // immediately without submitting more GPU work.
+                    BOOL newSerial = serial != observedSerial;
+                    BOOL captureArmed = macws_vnc_capture_generation() != 0;
                     if (snapshot && snapshotSurface &&
-                        serial != observedSerial) {
-                        observedSerial = serial;
+                        (newSerial || captureArmed)) {
+                        if (newSerial) observedSerial = serial;
                         macws_vnc_capture_final(snapshot);
                     }
                     macws_vnc_release(snapshot);
@@ -4537,16 +4561,64 @@ __attribute__((constructor)) static void InitMetalHooks() {
                     app, sel_registerName("respondsToSelector:"), newShell);
                 fprintf(stderr, "#### NSApp=%p class=%s responds(newShell:)=%d\n",
                     app, app ? object_getClassName(app) : "nil", responds);
-                if (responds) {
+                id windows = app ? ((id (*)(id, SEL))objc_msgSend)(
+                    app, sel_registerName("windows")) : nil;
+                NSUInteger count = windows
+                    ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+                        windows, sel_registerName("count")) : 0;
+                NSUInteger visible = 0;
+                id visibleWindow = nil;
+                for (NSUInteger i = 0; i < count; i++) {
+                    id window = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(
+                        windows, sel_registerName("objectAtIndex:"), i);
+                    if (window && ((BOOL (*)(id, SEL))objc_msgSend)(
+                            window, sel_registerName("isVisible"))) {
+                        visible++;
+                        if (!visibleWindow) visibleWindow = window;
+                    }
+                }
+                fprintf(stderr,
+                    "#### Terminal direct newShell: existing windows=%lu visible=%lu\n",
+                    (unsigned long)count, (unsigned long)visible);
+                if (responds && visible == 0) {
                     ((void (*)(id, SEL, id))objc_msgSend)(app, newShell, nil);
-                    id windows = ((id (*)(id, SEL))objc_msgSend)(
+                    windows = ((id (*)(id, SEL))objc_msgSend)(
                         app, sel_registerName("windows"));
-                    NSUInteger count = windows
+                    count = windows
                         ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
                             windows, sel_registerName("count")) : 0;
                     fprintf(stderr,
                         "#### Terminal newShell: returned windows=%lu\n",
                         (unsigned long)count);
+                } else if (responds) {
+                    // Terminal restores its saved windows before this block.
+                    // Starting another shell on every launch accumulated 29
+                    // visible windows during repeated WS recovery tests. Keep
+                    // the restored session, but use ordinary AppKit ordering
+                    // and display APIs to generate a legitimate front-window
+                    // transaction for the first shared frame.
+                    id keyWindow = ((id (*)(id, SEL))objc_msgSend)(
+                        app, sel_registerName("keyWindow"));
+                    id target = keyWindow ?: visibleWindow;
+                    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+                        app, sel_registerName("activateIgnoringOtherApps:"), YES);
+                    if (target) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(
+                            target, sel_registerName("makeKeyAndOrderFront:"), nil);
+                        id content = ((id (*)(id, SEL))objc_msgSend)(
+                            target, sel_registerName("contentView"));
+                        if (content) {
+                            ((void (*)(id, SEL, BOOL))objc_msgSend)(
+                                content, sel_registerName("setNeedsDisplay:"), YES);
+                            ((void (*)(id, SEL))objc_msgSend)(
+                                content, sel_registerName("displayIfNeeded"));
+                        }
+                        ((void (*)(id, SEL))objc_msgSend)(
+                            target, sel_registerName("displayIfNeeded"));
+                    }
+                    fprintf(stderr,
+                        "#### Terminal direct newShell: reused visible window=%p key=%p\n",
+                        target, keyWindow);
                 }
             });
         }

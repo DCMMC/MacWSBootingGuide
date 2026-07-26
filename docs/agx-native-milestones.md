@@ -1175,6 +1175,40 @@ generation.  Full log excerpts, hashes, LLDB frames, and safety boundary are
 in
 [`docs/evidence/coexist-vnc-input-refresh-20260726.txt`](evidence/coexist-vnc-input-refresh-20260726.txt).
 
+## 2026-07-26: Retina RFB geometry and content-backed first-frame readiness
+
+The low-resolution VNC report was real rather than cosmetic. The known-good
+native-host PNG is 2388x1668, but LLDB read OSXvnc's `rfbScreen` as 1194x834
+with backing scale 2.0. Arm64 disassembly of the exact device binary showed
+that both `rfbScreenInit` and the later resolution checker call
+`CGDisplayPixelsWide/High`. Hooking those two APIs only in shared-frame OSXvnc
+mode makes both paths consistently observe 2388x1668; editing `rfbScreen`
+after init had instead caused a resolution-change/reconnect loop.
+
+The black first connection was a readiness race. OSXvnc could send its cached
+all-zero framebuffer before WindowServer published and ACKed the requested
+native-GPU frame. `macos_gui.sh` now waits up to the runtime-observed 60-second
+tail for the exact capture generation before reporting the session ready. The
+capture tracker also makes its advertised four retries reachable on a static
+scanout after an `InnocentVictim` completion.
+
+Readiness is now content-backed: opaque black no longer counts as a nonzero
+pixel, and a frame needs at least 5% sampled RGB coverage plus spatial
+diversity. The final generation logged 8,475/15,750 RGB-nonblack samples and an
+immediate RFB client received 2388x1668 with 2,186,992/3,983,184 (54.906%)
+non-black pixels. Existing Terminal windows are activated and redrawn through
+ordinary AppKit APIs instead of accumulating another `newShell:` per restart.
+
+WindowServer restart detection now also reconnects its VNC, Terminal, and
+input dependents; a single fault-injection recovery produced a 2388x1668 frame
+with 54.891% non-black pixels. A deliberately overlapping double restart
+exposed a remaining content-recovery edge case (window outlines without client
+content); the stricter RGB gate now refuses to label that state ready.
+
+Verbatim disassembly, LLDB memory, runtime logs, hashes, and build witnesses are
+in
+[`docs/evidence/coexist-vnc-retina-ready-20260726.txt`](evidence/coexist-vnc-retina-ready-20260726.txt).
+
 ## Next milestones
 
 1. Replace subtype-1/subtype-3 byte deletion with a field-level translator

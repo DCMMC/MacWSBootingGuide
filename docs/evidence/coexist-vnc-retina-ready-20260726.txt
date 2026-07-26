@@ -1,0 +1,208 @@
+MacWSBootingGuide — coexistence VNC Retina geometry and first-frame readiness
+Date: 2026-07-26
+Device: iPad13,6 / Apple M1 / iPadOS 16.3
+
+Scope
+=====
+
+This record covers two user-visible regressions in:
+
+    sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist --experimental
+
+1. RFB advertised 1194x834 although the native shared frame was 2388x1668.
+2. A client could receive an all-black first update before the validated
+   WindowServer frame was published.
+
+No Metal/AGX assertion, protocol check, or Objective-C validation was bypassed
+for these changes. The geometry fix is at OSXvnc's display-query boundary; the
+readiness fix waits for the existing validated native-GPU capture ACK.
+
+
+Reference image and broken runtime state
+========================================
+
+The earlier known-good native-host image is physically Retina sized:
+
+    $ sips -g pixelWidth -g pixelHeight \
+        docs/evidence/ipados-native-host-terminal-20260726.png
+      pixelWidth: 2388
+      pixelHeight: 1668
+
+    SHA-256:
+    dd6a75aba4617ce94e682c571b5e33eacac8bec291cce8a95322f5d77d4176c6
+
+Runtime-confirmed before the fix: RFB advertised 1194x834 while the mmap header
+was 2388x1668. The captured RFB frame contained only 74 non-black pixels out of
+995,796. LLDB attached with the project's iOS helper and read OSXvnc's exact
+rfbScreen global as:
+
+    0x102421bf8: 0x000004aa 0x00002580 0x00000342 0x00000018
+    0x102421c08: 0x00000020 ...
+
+Decoded fields are width=1194, paddedWidthInBytes=9600, height=834, depth=24,
+bitsPerPixel=32. The saved backing scale was 2.0. The 9600-byte row can contain
+2388*4=9552 bytes plus its normal 48-byte alignment.
+
+
+RE-confirmed OSXvnc geometry ownership
+======================================
+
+Binary: the exact arm64 slice of /usr/local/bin/OSXvnc-server installed on the
+device. Symbol offsets from image base:
+
+    _rfbCheckForScreenResolutionChange  0x0000d668
+    _rfbGetFramebuffer                  0x0000d9d4
+    _rfbGetFramebufferUpdateInRect      0x0000dc28
+    _rfbScreenInit                      0x0000f040
+    _rfbScreen                          0x00079bf8
+
+RE-confirmed via arm64 otool disassembly of _rfbScreenInit: backingScaleFactor
+is saved first, then CGDisplayPixelsWide/High populate rfbScreen width/height:
+
+    0x10000f0a4  bl   _objc_msgSend$backingScaleFactor
+    0x10000f0ac  str  d0, [x8, #0x1e8]
+    0x10000f0e0  bl   _CGDisplayPixelsWide
+    0x10000f0ec  str  w0, [x19]
+    0x10000f0f4  bl   _CGDisplayPixelsHigh
+    0x10000f0f8  str  w0, [x19, #0x8]
+
+RE-confirmed via arm64 otool disassembly of
+_rfbCheckForScreenResolutionChange: later checks call the same APIs and compare
+their results with rfbScreen:
+
+    0x10000d698  bl    _CGDisplayPixelsWide
+    0x10000d69c  cmp   x0, x19
+    0x10000d6a0  b.ne  0x10000d6fc
+    0x10000d6b0  bl    _CGDisplayPixelsHigh
+    0x10000d6b4  cmp   x0, x19
+
+This explains the failed diagnostic that edited rfbScreen only after init: the
+checker continued seeing 1194x834 and repeatedly logged:
+
+    Screen geometry changed - (1194,834)
+
+The production hook instead returns logical*savedBackingScale from both display
+APIs, only inside OSXvnc shared-frame mode. Init and change detection therefore
+observe the same physical geometry and OSXvnc uses its normal allocation path.
+
+Runtime-confirmed final geometry:
+
+    #### OSXVNC RETINA width API logical=1194 scale=2 physical=2388
+    #### OSXVNC RETINA height API logical=834 scale=2 physical=1668
+
+
+WindowServer death and dependent-session recovery
+=================================================
+
+Runtime-confirmed failure from the old surviving VNC process:
+
+    HIToolbox: received notification of WindowServer event port death.
+    port matched the WindowServer port created in BindCGSToRunLoop
+
+That process still listened on TCP 5900 but its CGS session could not be reused.
+The watchdog now stops VNC, Terminal, inputd, and known GUI clients; waits for a
+replacement WindowServer PID to remain stable for two samples; then reloads the
+clients and requests a new exact capture generation. It also asks launchd to
+start a loaded-but-missing WindowServer on samples 1 and 3.
+
+Runtime-confirmed fault injection before the final RGB gate:
+
+    [macos_gui] watchdog: WindowServer job is loaded but has no PID; requesting launchd start (sample=1)
+    [macos_gui] watchdog: WindowServer restarted (74167 -> 74293), count=1 in window
+    [macos_gui] watchdog: reconnecting GUI clients to replacement WindowServer 74293
+    [macos_gui] watchdog: GUI clients reconnected after WS 74167 -> 74293 (vnc=1 terminal=1)
+
+Recovered RFB witness:
+
+    RFB name='macOS-iPad' size=2388x1668
+    raw_sha256=e7c3c7ec8f3d88fe398ca375150431658f6a271e9d53a476f05bfa4e7ed88db5
+    nonblack_pixels=2186403/3983184 (54.891%)
+
+A later deliberately overlapping two-restart test produced only menu/window
+geometry (84,087/3,983,184 = 2.111% RGB-nonblack pixels). That exposed a false
+positive in the old alpha-inclusive readiness test and is not counted as a
+successful content recovery.
+
+
+First-frame race, bounded retry, and content gate
+=================================================
+
+Runtime-confirmed race before waiting for the ACK: a client connected while
+WindowServer was still producing the requested frame and received:
+
+    RFB name='macOS-iPad' size=2388x1668
+    raw_sha256=2a71fd00c4648425d28c2eebb8fde48932410ae0669ac13f04c8eb0f9e1f8cc0
+    nonblack_pixels=0/3983184 (0.000%)
+
+WindowServer later published a non-uniform frame and wrote macws_capture_done.
+macos_gui.sh now removes stale ACK state, writes a unique generation, and does
+not print "Started" until the exact PID/generation pair is acknowledged. The
+wait is 60 seconds because generation 1785077704 was requested at 22:55:04 and
+runtime-ACKed at 22:55:41.882, 37.9 seconds later; the earlier 35-second bound
+misreported that successful late frame as a timeout.
+
+Runtime-confirmed capture-state bug: generation 1785077023 logged only
+"attempt=1/4" and then an InnocentVictim command-buffer error. The tracker used
+to call the four-attempt state machine only when the scanout serial changed, so
+attempts 2-4 were unreachable for a static screen. While a request remains
+armed, the 5 Hz tracker now retries the same completed scanout; the existing
+per-generation counter still caps GPU submissions at four.
+
+The validator now counts sampled RGB bits separately from alpha. Opaque black
+is no longer content. It requires at least 5% sampled RGB coverage plus spatial
+diversity before copying and ACKing. Runtime-confirmed final generation:
+
+    [macos_gui] VNC: requested post-Terminal shared frame generation 1785078041.
+    [macos_gui] VNC: waiting up to 60s for a validated Retina first frame...
+    [macos_gui] VNC: Retina first frame ready (WindowServer pid=38658, generation=1785078041).
+
+    #### VNC-FINAL consuming generation=1785078041 attempt=1/4
+    #### VNC-FINAL captured 2388x1668 BGRA8 cpu130=0x11800c000 base=0x11800c000 bpr=9600 sampled_nonzero=15750 sampled_rgb_nonzero=8475/15750 sampled_different=10700 publish=YES
+    #### VNC-FINAL acknowledged pid=38658 generation=1785078041
+
+Immediate post-return RFB witness:
+
+    RFB name='macOS-iPad' size=2388x1668
+    raw_sha256=33cb7aed0c0c1221c9ef86f9ad1fc34a725ee2ecb7677f863eff433894b12c21
+    nonblack_pixels=2186992/3983184 (54.906%)
+
+PNG SHA-256 for /tmp/macws-final-rgb-gated.png:
+
+    bc08c22048c600883b621fbf784c89b4cd9cb9fd755453e2573010d36267b170
+
+
+Terminal window and high-resolution input witnesses
+===================================================
+
+Repeated direct newShell: calls had persisted 29 visible Terminal windows.
+The startup hook now counts existing visible windows. It calls the real
+RE-confirmed newShell: action only when none exist; otherwise it uses ordinary
+AppKit activate/makeKeyAndOrderFront/displayIfNeeded APIs on one restored
+window. Runtime-confirmed final log:
+
+    #### Terminal direct newShell: existing windows=31 visible=29
+    #### Terminal direct newShell: reused visible window=0x10ec63db0 key=0x10ec63db0
+
+Runtime-confirmed high-resolution pointer route from the preceding packaged
+build (the input code was unchanged by the final RGB gate):
+
+    #### OSXVNC INPUT kind=1 point=(600.0,600.0)/2388x1668 sent=52
+    #### OSXVNC INPUT kind=3 point=(600.0,600.0)/2388x1668 sent=52
+    MACWS-INPUT RX seq=1 ... frame=(600.00,600.00)/2388x1668 quartz=(300.00,300.00)
+    MACWS-INPUT ROUTE seq=1 route=appkit-socket pid=6947 window=0
+    #### APP-INPUT RX pid=6947 bytes=52 kind=1 target=6947
+    #### APP-INPUT MAIN pid=6947 kind=1 target=6947 thread-main=YES
+    #### APP-INPUT POST pid=6947 kind=3 window=5 screen=(300.00,534.00) local=(155.00,269.00)
+
+
+Build/install witness
+=====================
+
+Final full on-device Theos build, package install, platform conversion,
+thin-slice signing, trustcache registration, and postinst all completed:
+
+    [ADD] /var/jb/usr/macOS/lib/libmachook.dylib [arm64e]: 5fcc293ea6fdedf1f3c0f02ad930f456ffe09e49
+    [ADD] /var/jb/usr/macOS/lib/libmachook_arm64.dylib [arm64]: e2351bdbbbc8b92658178e155056a68a8e33e8d7
+    [INFO] Processed 116 MacPorts files
+    ==> Done! Package installed successfully.
+
