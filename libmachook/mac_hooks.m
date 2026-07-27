@@ -20,6 +20,7 @@
 #import <objc/message.h>
 #import <sys/socket.h>
 #import <sys/un.h>
+#include <execinfo.h>
 #import "macws_host_protocol.h"
 
 // GlassDemo blur A/B fixture.  This is deliberately a render-input diagnostic,
@@ -42,6 +43,131 @@ typedef void (*macws_msg_void_bool_t)(id, SEL, BOOL);
 typedef void (*macws_msg_void_uint_t)(id, SEL, NSUInteger);
 typedef void (*macws_msg_void_view_order_t)(id, SEL, id, NSInteger, id);
 typedef void (*macws_msg_void_rect_t)(id, SEL, CGRect);
+
+// Diagnostic-only ObjC method/IMP map for comparing the real macOS 13.4 AGX
+// command producer with the iOS 16.3 producer.  This does not swizzle or alter
+// any method.  It is armed by MACWS_AGX_DUMP_METHODS=1 or the one-shot
+// /private/tmp/macws_agx_dump_methods sentinel and writes inside the chroot.
+static BOOL macws_agx_method_map_class(const char *name) {
+    if (!name) return NO;
+    static const char *const wanted[] = {
+        "IOGPUMetalCommandBuffer",
+        "AGXG13GFamilyCommandBuffer",
+        "IOGPUMetalCommandQueue",
+        "AGXG13GFamilyCommandQueue",
+        "IOGPUMetalRenderCommandEncoder",
+        "AGXG13GFamilyRenderContext",
+    };
+    for (size_t i = 0; i < sizeof(wanted) / sizeof(wanted[0]); i++) {
+        if (!strcmp(name, wanted[i])) return YES;
+    }
+    return NO;
+}
+
+static void macws_agx_dump_method_list(int fd, Class cls, const char *kind) {
+    if (fd < 0 || !cls) return;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    const char *class_name = class_getName(cls);
+    Class superclass = class_getSuperclass(cls);
+    dprintf(fd,
+        "MACWS AGX-CLASS kind=%s class=%p name=%s super=%s methods=%u\n",
+        kind, (void *)cls, class_name ?: "(null)",
+        superclass ? class_getName(superclass) : "(none)", count);
+    for (unsigned int i = 0; i < count; i++) {
+        Method method = methods[i];
+        SEL selector = method_getName(method);
+        IMP signed_imp = method_getImplementation(method);
+        void *imp = ptrauth_strip((void *)signed_imp,
+                                  ptrauth_key_function_pointer);
+        Dl_info info = {0};
+        dladdr(imp, &info);
+        uintptr_t offset = info.dli_fbase
+            ? (uintptr_t)imp - (uintptr_t)info.dli_fbase : 0;
+        dprintf(fd,
+            "MACWS AGX-METHOD kind=%s class=%s index=%u imp=%p "
+            "image=%s base=%p offset=%#llx selector=%s types=%s\n",
+            kind, class_name ?: "(null)", i, imp,
+            info.dli_fname ?: "(unknown)", info.dli_fbase,
+            (unsigned long long)offset,
+            selector ? sel_getName(selector) : "(null)",
+            method_getTypeEncoding(method) ?: "(null)");
+    }
+    free(methods);
+}
+
+static void macws_dump_agx_method_map(void) {
+    int fd = open("/private/tmp/macws_agx_runtime_methods.log",
+                  O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return;
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    unsigned int matched = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = class_getName(classes[i]);
+        if (!macws_agx_method_map_class(name)) continue;
+        matched++;
+        macws_agx_dump_method_list(fd, classes[i], "instance");
+        macws_agx_dump_method_list(fd, object_getClass(classes[i]), "class");
+    }
+    dprintf(fd, "MACWS AGX-RUNTIME classes=%u matched=%u complete=YES\n",
+            count, matched);
+    free(classes);
+    close(fd);
+}
+
+// Diagnostic-only producer trace.  The submitted subtype-1 record is 0x20
+// bytes larger under the macOS 13.4 AGX bundle than under native iOS 16.3.
+// Trace the upstream AGX reservation API without changing its arguments or
+// return value, so the actual caller offsets identify which encoder decides
+// the record layout.  Armed only by /private/tmp/macws_agx_trace_reserve.
+typedef void *(*macws_agx_reserve_fn)(id, SEL, uint64_t);
+static macws_agx_reserve_fn g_macws_agx_orig_reserve = NULL;
+static _Atomic unsigned g_macws_agx_reserve_sequence = 0;
+
+static void *macws_agx_trace_reserve(id self, SEL cmd, uint64_t size) {
+    unsigned sequence = atomic_fetch_add(&g_macws_agx_reserve_sequence, 1) + 1;
+    if (sequence <= 256) {
+        void *frames[8] = {0};
+        int frame_count = backtrace(frames, 8);
+        fprintf(stderr,
+            "#### AGX-RESERVE-DIAG #%u self=%p size=%#llx frames=%d\n",
+            sequence, self, (unsigned long long)size, frame_count);
+        for (int i = 1; i < frame_count; i++) {
+            void *pc = ptrauth_strip(frames[i],
+                ptrauth_key_function_pointer);
+            Dl_info info = {0};
+            dladdr(pc, &info);
+            fprintf(stderr,
+                "#### AGX-RESERVE-DIAG #%u frame[%d]=%p image=%s "
+                "base=%p offset=%#llx symbol=%s\n",
+                sequence, i, pc, info.dli_fname ?: "(unknown)",
+                info.dli_fbase,
+                (unsigned long long)(info.dli_fbase
+                    ? (uintptr_t)pc - (uintptr_t)info.dli_fbase : 0),
+                info.dli_sname ?: "(unknown)");
+        }
+    }
+    return g_macws_agx_orig_reserve(self, cmd, size);
+}
+
+static void macws_install_agx_reserve_trace(void) {
+    Class cls = objc_getClass("AGXG13GFamilyCommandBuffer");
+    SEL selector = sel_registerName("reserveKernelCommandBufferSpace:");
+    Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
+    if (!method) {
+        fprintf(stderr,
+            "#### AGX-RESERVE-DIAG install failed: method unavailable\n");
+        return;
+    }
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)macws_agx_trace_reserve) return;
+    g_macws_agx_orig_reserve = (macws_agx_reserve_fn)current;
+    method_setImplementation(method, (IMP)macws_agx_trace_reserve);
+    fprintf(stderr,
+        "#### AGX-RESERVE-DIAG installed class=%p original=%p trace=%p\n",
+        (void *)cls, (void *)current, (void *)macws_agx_trace_reserve);
+}
 
 static BOOL macws_glass_blur_ab_is_opaque(id self, SEL _cmd) {
     (void)self;
@@ -2894,6 +3020,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             Class agxbuf_after = objc_getClass("AGXBuffer");
             fprintf(stderr, "#### MACWS_AGX_NATIVE AGXBuffer after register: %p\n",
                 (void *)agxbuf_after);
+            if (getenv("MACWS_AGX_DUMP_METHODS") ||
+                access("/private/tmp/macws_agx_dump_methods", F_OK) == 0) {
+                macws_dump_agx_method_map();
+            }
+            if (access("/private/tmp/macws_agx_trace_reserve", F_OK) == 0) {
+                macws_install_agx_reserve_trace();
+            }
             // Also try sending +alloc to verify the registered class is usable.
             if (agxbuf_after) {
                 @try {
@@ -5652,9 +5785,12 @@ static int g_agxIdMapCount;
 #define MACWS_AGX_LIFE_CAP 16384u
 struct macws_agx_life_entry {
     uint64_t gid;       // 0 = empty, UINT64_MAX = tombstone
+    uint64_t gpu_address; // kernel-returned GPU VA (out+0x00)
     uint64_t bytes;     // kernel-reported allocation size (out+0x48)
+    uint64_t request_50; // translated request layout/arena word
     uint32_t client_id; // macOS client field (in+0x48), diagnostic only
     uint32_t surface_id;// type 0x82 IOSurface ID (translated in+0x30)
+    uint32_t flags_14;  // translated request flags (in+0x14)
     uint8_t type;
 };
 static struct macws_agx_life_entry g_agxLife[MACWS_AGX_LIFE_CAP];
@@ -5663,6 +5799,29 @@ static uint64_t g_agxLifeLive[256], g_agxLifeBytes[256];
 static uint64_t g_agxLifeCreateOK, g_agxLifeCreateFail;
 static uint64_t g_agxLifeDestroyOK, g_agxLifeDestroyFail;
 static uint64_t g_agxLifeUnmatchedDestroy, g_agxLifeTableFull;
+
+// Resource flight recorder.  The live table proves bounded ownership, but a
+// GPU page fault also needs the recently-destroyed ranges: a KCMD can retain a
+// stale VA after its wrapper has already finalized.  Keep this diagnostic
+// metadata in a fixed ring; it neither retains resources nor changes any
+// create/finalize call.
+#define MACWS_AGX_LIFE_EVENT_CAP 4096u
+struct macws_agx_life_event {
+    uint64_t serial;
+    struct macws_agx_life_entry resource;
+    uint8_t action; // 1=create, 2=destroy
+};
+static struct macws_agx_life_event
+    g_agxLifeEvents[MACWS_AGX_LIFE_EVENT_CAP];
+static uint64_t g_agxLifeEventSerial;
+
+static void macws_agx_life_record_locked(
+    uint8_t action, const struct macws_agx_life_entry *resource) {
+    if (!resource) return;
+    uint64_t serial = ++g_agxLifeEventSerial;
+    g_agxLifeEvents[(serial - 1) % MACWS_AGX_LIFE_EVENT_CAP] =
+        (struct macws_agx_life_event){serial, *resource, action};
+}
 
 static unsigned macws_agx_life_hash(uint64_t gid) {
     return (unsigned)((gid * 11400714819323198485ull) >> 50) &
@@ -5702,7 +5861,8 @@ static void macws_agx_life_summary_locked(const char *event, uint64_t id,
 
 static void macws_agx_life_create(uint64_t gid, uint8_t type,
                                   uint32_t client_id, uint32_t surface_id,
-                                  uint64_t bytes) {
+                                  uint64_t gpu_address, uint64_t bytes,
+                                  uint32_t flags_14, uint64_t request_50) {
     pthread_mutex_lock(&g_agxLifeLock);
     g_agxLifeCreateOK++;
     unsigned start = macws_agx_life_hash(gid), first_tomb = MACWS_AGX_LIFE_CAP;
@@ -5729,9 +5889,11 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
             g_agxLifeBytes[old_type] -= g_agxLife[slot].bytes;
         }
         g_agxLife[slot] = (struct macws_agx_life_entry){
-            .gid = gid, .bytes = bytes, .client_id = client_id,
-            .surface_id = surface_id, .type = type
+            .gid = gid, .gpu_address = gpu_address, .bytes = bytes,
+            .request_50 = request_50, .client_id = client_id,
+            .surface_id = surface_id, .flags_14 = flags_14, .type = type
         };
+        macws_agx_life_record_locked(1, &g_agxLife[slot]);
         g_agxLifeLive[type]++;
         g_agxLifeBytes[type] += bytes;
         // The normal steady-state type-0x82 live set is only 4--6 entries, so
@@ -5779,11 +5941,13 @@ static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
             macws_agx_life_summary_locked("DESTROY-UNMATCHED", gid, 0xff,
                                           0, 0, kr);
     } else {
-        uint8_t type = g_agxLife[slot].type;
-        uint32_t surface_id = g_agxLife[slot].surface_id;
-        uint64_t bytes = g_agxLife[slot].bytes;
+        struct macws_agx_life_entry resource = g_agxLife[slot];
+        uint8_t type = resource.type;
+        uint32_t surface_id = resource.surface_id;
+        uint64_t bytes = resource.bytes;
         g_agxLifeLive[type]--;
         g_agxLifeBytes[type] -= bytes;
+        macws_agx_life_record_locked(2, &resource);
         g_agxLife[slot].gid = UINT64_MAX;
         if (g_agxLifeDestroyOK <= 16 ||
             getenv("MACWS_AGX_LIFE_VERBOSE") ||
@@ -5792,6 +5956,130 @@ static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
                                           surface_id, bytes, kr);
     }
     pthread_mutex_unlock(&g_agxLifeLock);
+}
+
+static const struct macws_agx_life_entry *
+macws_agx_life_find_active_va_locked(uint64_t address) {
+    for (unsigned i = 0; i < MACWS_AGX_LIFE_CAP; i++) {
+        const struct macws_agx_life_entry *entry = &g_agxLife[i];
+        if (entry->gid == 0 || entry->gid == UINT64_MAX ||
+            entry->gpu_address == 0 || entry->bytes == 0) continue;
+        if (address >= entry->gpu_address &&
+            address - entry->gpu_address < entry->bytes) return entry;
+    }
+    return NULL;
+}
+
+static const struct macws_agx_life_event *
+macws_agx_life_find_recent_destroyed_va_locked(uint64_t address) {
+    uint64_t newest = g_agxLifeEventSerial;
+    uint64_t oldest = newest > MACWS_AGX_LIFE_EVENT_CAP
+        ? newest - MACWS_AGX_LIFE_EVENT_CAP + 1 : 1;
+    for (uint64_t serial = newest; serial >= oldest && serial != 0; serial--) {
+        const struct macws_agx_life_event *event =
+            &g_agxLifeEvents[(serial - 1) % MACWS_AGX_LIFE_EVENT_CAP];
+        const struct macws_agx_life_entry *entry = &event->resource;
+        if (event->serial != serial || event->action != 2 ||
+            entry->gpu_address == 0 || entry->bytes == 0) continue;
+        if (address >= entry->gpu_address &&
+            address - entry->gpu_address < entry->bytes) return event;
+    }
+    return NULL;
+}
+
+// Read-only error artifact.  Correlate aligned 64-bit KCMD words against the
+// kernel-returned VA ranges, and preserve the complete active/recent resource
+// state.  A match is evidence; unmatched address-looking words remain opaque
+// and are deliberately not labelled as broken.
+static void macws_agx_life_dump_snapshot(const char *directory,
+                                         const unsigned char *commands,
+                                         size_t commands_length) {
+    if (!directory) return;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/resources.txt", directory);
+    FILE *output = fopen(path, "w");
+    if (!output) return;
+
+    pthread_mutex_lock(&g_agxLifeLock);
+    fprintf(output,
+        "create_ok=%llu destroy_ok=%llu create_fail=%llu destroy_fail=%llu "
+        "unmatched_destroy=%llu event_newest=%llu\n",
+        (unsigned long long)g_agxLifeCreateOK,
+        (unsigned long long)g_agxLifeDestroyOK,
+        (unsigned long long)g_agxLifeCreateFail,
+        (unsigned long long)g_agxLifeDestroyFail,
+        (unsigned long long)g_agxLifeUnmatchedDestroy,
+        (unsigned long long)g_agxLifeEventSerial);
+    fprintf(output, "[active]\n");
+    for (unsigned i = 0; i < MACWS_AGX_LIFE_CAP; i++) {
+        const struct macws_agx_life_entry *entry = &g_agxLife[i];
+        if (entry->gid == 0 || entry->gid == UINT64_MAX) continue;
+        fprintf(output,
+            "gid=%#llx va=%#llx bytes=%#llx type=%#x surface=%#x "
+            "client=%#x flags14=%#x request50=%#llx\n",
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->bytes, entry->type,
+            entry->surface_id, entry->client_id, entry->flags_14,
+            (unsigned long long)entry->request_50);
+    }
+    fprintf(output, "[kcmd-va-matches]\n");
+    for (size_t offset = 0; commands && offset + 8 <= commands_length;
+         offset += 8) {
+        uint64_t value = *(const uint64_t *)(commands + offset);
+        const struct macws_agx_life_entry *active =
+            macws_agx_life_find_active_va_locked(value);
+        if (active) {
+            fprintf(output,
+                "offset=%#zx value=%#llx state=ACTIVE gid=%#llx base=%#llx "
+                "delta=%#llx bytes=%#llx type=%#x surface=%#x\n",
+                offset, (unsigned long long)value,
+                (unsigned long long)active->gid,
+                (unsigned long long)active->gpu_address,
+                (unsigned long long)(value - active->gpu_address),
+                (unsigned long long)active->bytes, active->type,
+                active->surface_id);
+            continue;
+        }
+        const struct macws_agx_life_event *destroyed =
+            macws_agx_life_find_recent_destroyed_va_locked(value);
+        if (destroyed) {
+            const struct macws_agx_life_entry *entry = &destroyed->resource;
+            fprintf(output,
+                "offset=%#zx value=%#llx state=DESTROYED event=%llu "
+                "gid=%#llx base=%#llx delta=%#llx bytes=%#llx "
+                "type=%#x surface=%#x\n",
+                offset, (unsigned long long)value,
+                (unsigned long long)destroyed->serial,
+                (unsigned long long)entry->gid,
+                (unsigned long long)entry->gpu_address,
+                (unsigned long long)(value - entry->gpu_address),
+                (unsigned long long)entry->bytes, entry->type,
+                entry->surface_id);
+        }
+    }
+    fprintf(output, "[recent-events]\n");
+    uint64_t newest = g_agxLifeEventSerial;
+    uint64_t oldest = newest > MACWS_AGX_LIFE_EVENT_CAP
+        ? newest - MACWS_AGX_LIFE_EVENT_CAP + 1 : 1;
+    for (uint64_t serial = oldest; serial <= newest; serial++) {
+        const struct macws_agx_life_event *event =
+            &g_agxLifeEvents[(serial - 1) % MACWS_AGX_LIFE_EVENT_CAP];
+        if (event->serial != serial) continue;
+        const struct macws_agx_life_entry *entry = &event->resource;
+        fprintf(output,
+            "event=%llu action=%s gid=%#llx va=%#llx bytes=%#llx "
+            "type=%#x surface=%#x client=%#x flags14=%#x request50=%#llx\n",
+            (unsigned long long)serial,
+            event->action == 1 ? "CREATE" : "DESTROY",
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->bytes, entry->type,
+            entry->surface_id, entry->client_id, entry->flags_14,
+            (unsigned long long)entry->request_50);
+    }
+    pthread_mutex_unlock(&g_agxLifeLock);
+    fclose(output);
 }
 
 // 2026-06-19 — sel=0xa double-translation root cause:
@@ -5811,7 +6099,6 @@ static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
 // re-entry by inspecting the immediate caller via __builtin_return_address;
 // if the caller is inside ANY copy of libmachook, skip translation. Works
 // regardless of how many libmachook arch variants are loaded.
-#include <execinfo.h>
 static int caller_is_libmachook(void *ret) {
     Dl_info di;
     if (!dladdr(ret, &di) || !di.dli_fname) return 0;
@@ -6112,6 +6399,426 @@ static _Atomic unsigned g_macws_submit_diag_sequence = 0;
 // translation for every structurally validated submission (later frames are
 // the actual GUI witness), while bounding the per-segment diagnostic output.
 static _Atomic unsigned g_macws_multisegment_log_batches = 0;
+
+// Completion errors are asynchronous: by the time Metal exposes an NSError,
+// the selector-0x1a IOConnect call that supplied the offending bytes has long
+// returned and its command-storage object may already be recycled.  The old
+// "first eight submits" capture therefore missed the first Terminal workload
+// that runtime-reported `00000102` after more than 500 successful submissions.
+//
+// `/tmp/macws_submit_ring` enables a read-only, process-local flight recorder.
+// It retains the most recent 2048 descriptor snapshots in memory and writes them
+// only when `macws_dump_recent_agx_submits` is called by the Metal completion
+// observer.  This is diagnostic instrumentation, not an ABI patch: it neither
+// changes submission order nor modifies any additional command bytes.
+#define MACWS_SUBMIT_RING_COUNT 2048
+#define MACWS_SUBMIT_RING_MAX_BYTES 0x10000
+
+struct macws_submit_ring_entry {
+    uint64_t serial;
+    unsigned sequence;
+    unsigned descriptor;
+    unsigned fixed;
+    uintptr_t descriptor_pointer;
+    uintptr_t command_buffer;
+    uintptr_t storage;
+    size_t pre_commands_length;
+    size_t pre_segments_length;
+    size_t post_commands_length;
+    size_t post_segments_length;
+    unsigned char *pre_commands;
+    unsigned char *pre_segments;
+    unsigned char *post_commands;
+    unsigned char *post_segments;
+};
+
+struct macws_submit_ring_token {
+    uint64_t serial;
+    unsigned slot;
+    int active;
+};
+
+static pthread_mutex_t g_macws_submit_ring_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct macws_submit_ring_entry
+    g_macws_submit_ring[MACWS_SUBMIT_RING_COUNT];
+static _Atomic uint64_t g_macws_submit_ring_serial = 0;
+static _Atomic unsigned g_macws_submit_ring_dump_count = 0;
+
+// A diagnostic producer (currently the native tile-binding witness) can mark
+// the exact Metal command-buffer objects whose KCMD bytes must survive an
+// asynchronous error delay. Pointer values only: this does not retain or
+// message the object and therefore cannot extend a resource lifetime.
+#define MACWS_SUBMIT_MARK_COUNT 32u
+static _Atomic uintptr_t g_macws_submit_marks[MACWS_SUBMIT_MARK_COUNT];
+static _Atomic uint64_t g_macws_submit_mark_serial = 0;
+static _Atomic uint64_t g_macws_submit_serial_marks[MACWS_SUBMIT_MARK_COUNT];
+
+__attribute__((visibility("default")))
+void macws_mark_agx_submit_for_error_dump(const void *command_buffer) {
+    if (!command_buffer || access("/tmp/macws_submit_ring", F_OK) != 0)
+        return;
+    uint64_t serial = atomic_fetch_add(&g_macws_submit_mark_serial, 1) + 1;
+    atomic_store(&g_macws_submit_marks[
+        (serial - 1) % MACWS_SUBMIT_MARK_COUNT],
+        (uintptr_t)command_buffer);
+    if (serial <= 8) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_RING mark #%llu commandBuffer=%p "
+            "(pointer only; no retain)\n",
+            (unsigned long long)serial, command_buffer);
+    }
+}
+
+__attribute__((visibility("default")))
+void macws_mark_agx_submit_serial_for_error_dump(uint64_t submit_serial) {
+    if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
+        return;
+    uint64_t mark = atomic_fetch_add(&g_macws_submit_mark_serial, 1) + 1;
+    atomic_store(&g_macws_submit_serial_marks[
+        (mark - 1) % MACWS_SUBMIT_MARK_COUNT], submit_serial);
+}
+
+static BOOL macws_submit_ring_is_marked(uintptr_t command_buffer) {
+    if (!command_buffer) return NO;
+    for (size_t i = 0; i < MACWS_SUBMIT_MARK_COUNT; i++) {
+        if (atomic_load(&g_macws_submit_marks[i]) == command_buffer)
+            return YES;
+    }
+    return NO;
+}
+
+static BOOL macws_submit_ring_serial_is_marked(uint64_t submit_serial) {
+    if (!submit_serial) return NO;
+    for (size_t i = 0; i < MACWS_SUBMIT_MARK_COUNT; i++) {
+        if (atomic_load(&g_macws_submit_serial_marks[i]) == submit_serial)
+            return YES;
+    }
+    return NO;
+}
+
+__attribute__((visibility("default")))
+uint64_t macws_latest_agx_submit_serial(const void *command_buffer) {
+    if (!command_buffer || access("/tmp/macws_submit_ring", F_OK) != 0)
+        return 0;
+    uint64_t result = 0;
+    pthread_mutex_lock(&g_macws_submit_ring_lock);
+    uint64_t newest = atomic_load(&g_macws_submit_ring_serial);
+    uint64_t oldest = newest > MACWS_SUBMIT_RING_COUNT
+        ? newest - MACWS_SUBMIT_RING_COUNT + 1 : 1;
+    for (uint64_t serial = newest; serial >= oldest && serial != 0; serial--) {
+        unsigned slot = (unsigned)((serial - 1) % MACWS_SUBMIT_RING_COUNT);
+        struct macws_submit_ring_entry *entry = &g_macws_submit_ring[slot];
+        if (entry->serial == serial &&
+            entry->command_buffer == (uintptr_t)command_buffer) {
+            result = serial;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_submit_ring_lock);
+    return result;
+}
+
+__attribute__((visibility("default")))
+unsigned macws_agx_submit_fixed_count(uint64_t submit_serial) {
+    if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
+        return 0;
+    unsigned result = 0;
+    pthread_mutex_lock(&g_macws_submit_ring_lock);
+    unsigned slot = (unsigned)((submit_serial - 1) %
+                               MACWS_SUBMIT_RING_COUNT);
+    struct macws_submit_ring_entry *entry = &g_macws_submit_ring[slot];
+    if (entry->serial == submit_serial)
+        result = entry->fixed;
+    pthread_mutex_unlock(&g_macws_submit_ring_lock);
+    return result;
+}
+
+__attribute__((visibility("default")))
+int macws_agx_submit_dimensions(uint64_t submit_serial,
+                                uint32_t *width_out,
+                                uint32_t *height_out) {
+    if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
+        return 0;
+    int result = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    pthread_mutex_lock(&g_macws_submit_ring_lock);
+    unsigned slot = (unsigned)((submit_serial - 1) %
+                               MACWS_SUBMIT_RING_COUNT);
+    struct macws_submit_ring_entry *entry = &g_macws_submit_ring[slot];
+    // The first translated render record stores its target dimensions at
+    // record+0x3b0/+0x3b4 in both the pre- and post-normalized layouts.
+    if (entry->serial == submit_serial && entry->post_commands &&
+        entry->post_commands_length >= 0x3b8) {
+        memcpy(&width, entry->post_commands + 0x3b0, sizeof(width));
+        memcpy(&height, entry->post_commands + 0x3b4, sizeof(height));
+        result = width != 0 && height != 0;
+    }
+    pthread_mutex_unlock(&g_macws_submit_ring_lock);
+    if (result) {
+        if (width_out) *width_out = width;
+        if (height_out) *height_out = height;
+    }
+    return result;
+}
+
+static void macws_submit_ring_replace(unsigned char **destination,
+                                      size_t *destination_length,
+                                      const unsigned char *source,
+                                      size_t source_length) {
+    free(*destination);
+    *destination = NULL;
+    *destination_length = 0;
+    if (!source || source_length == 0 ||
+        source_length > MACWS_SUBMIT_RING_MAX_BYTES)
+        return;
+    unsigned char *copy = malloc(source_length);
+    if (!copy) return;
+    memcpy(copy, source, source_length);
+    *destination = copy;
+    *destination_length = source_length;
+}
+
+static struct macws_submit_ring_token macws_submit_ring_begin(
+        unsigned sequence, unsigned descriptor,
+        uintptr_t descriptor_pointer, uintptr_t command_buffer,
+        uintptr_t storage,
+        const unsigned char *commands, size_t commands_length,
+        const unsigned char *segments, size_t segments_length) {
+    struct macws_submit_ring_token token = {0};
+    if (access("/tmp/macws_submit_ring", F_OK) != 0)
+        return token;
+
+    token.serial = atomic_fetch_add(&g_macws_submit_ring_serial, 1) + 1;
+    token.slot = (unsigned)((token.serial - 1) % MACWS_SUBMIT_RING_COUNT);
+    token.active = 1;
+
+    pthread_mutex_lock(&g_macws_submit_ring_lock);
+    struct macws_submit_ring_entry *entry =
+        &g_macws_submit_ring[token.slot];
+    macws_submit_ring_replace(&entry->pre_commands,
+        &entry->pre_commands_length, commands, commands_length);
+    macws_submit_ring_replace(&entry->pre_segments,
+        &entry->pre_segments_length, segments, segments_length);
+    macws_submit_ring_replace(&entry->post_commands,
+        &entry->post_commands_length, NULL, 0);
+    macws_submit_ring_replace(&entry->post_segments,
+        &entry->post_segments_length, NULL, 0);
+    entry->sequence = sequence;
+    entry->descriptor = descriptor;
+    entry->fixed = 0;
+    entry->descriptor_pointer = descriptor_pointer;
+    entry->command_buffer = command_buffer;
+    entry->storage = storage;
+    // Publish serial last while holding the lock.  A concurrent error dumper
+    // can never observe new metadata paired with the overwritten slot's data.
+    entry->serial = token.serial;
+    pthread_mutex_unlock(&g_macws_submit_ring_lock);
+    return token;
+}
+
+static void macws_submit_ring_finish(
+        struct macws_submit_ring_token token, unsigned fixed,
+        const unsigned char *commands, size_t commands_length,
+        const unsigned char *segments, size_t segments_length) {
+    if (!token.active) return;
+    pthread_mutex_lock(&g_macws_submit_ring_lock);
+    struct macws_submit_ring_entry *entry =
+        &g_macws_submit_ring[token.slot];
+    if (entry->serial == token.serial) {
+        entry->fixed = fixed;
+        macws_submit_ring_replace(&entry->post_commands,
+            &entry->post_commands_length, commands, commands_length);
+        macws_submit_ring_replace(&entry->post_segments,
+            &entry->post_segments_length, segments, segments_length);
+    }
+    pthread_mutex_unlock(&g_macws_submit_ring_lock);
+}
+
+static size_t macws_submit_ring_write_file(const char *path,
+                                           const unsigned char *bytes,
+                                           size_t length) {
+    if (!path || !bytes || !length) return 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return 0;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t amount = write(fd, bytes + written, length - written);
+        if (amount <= 0) break;
+        written += (size_t)amount;
+    }
+    close(fd);
+    return written;
+}
+
+static void macws_dump_recent_agx_submits_impl(
+        const char *reason, const void *command_buffer,
+        uint64_t requested_serial) {
+    if (access("/tmp/macws_submit_ring", F_OK) != 0)
+        return;
+    unsigned dump = atomic_fetch_add(&g_macws_submit_ring_dump_count, 1) + 1;
+    // Keep the first generic completion error, the first raw page-fault
+    // callback, and one post-recovery clean control as separate witnesses.
+    // WindowServer currently reports an
+    // early Code=1/00000102 command-buffer error before the later Code=3
+    // address fault; a one-dump process limit let that startup error consume
+    // the only slot and hid the faulting submission.  The Metal observer uses
+    // independent one-shot latches for those classes.  The existing public
+    // Metal completion observer also consumes one slot immediately after the
+    // raw PageFault callback, so four directories are required to retain the
+    // later post-recovery clean control.  The bound still prevents a GPU
+    // recovery storm from writing indefinitely.
+    if (dump > 4) return;
+
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory),
+        "/tmp/macws_submit_error_%d_%u", getpid(), dump);
+    if (mkdir(directory, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_RING dump mkdir failed path=%s errno=%d\n",
+            directory, errno);
+        return;
+    }
+
+    char manifest_path[PATH_MAX];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt",
+        directory);
+    FILE *manifest = fopen(manifest_path, "w");
+    pthread_mutex_lock(&g_macws_submit_ring_lock);
+    uint64_t newest = atomic_load(&g_macws_submit_ring_serial);
+    uint64_t oldest = newest > MACWS_SUBMIT_RING_COUNT
+        ? newest - MACWS_SUBMIT_RING_COUNT + 1 : 1;
+    uint64_t matched_serial = 0;
+    struct macws_submit_ring_entry *matched_entry = NULL;
+    if (requested_serial >= oldest && requested_serial <= newest) {
+        unsigned slot = (unsigned)((requested_serial - 1) %
+                                   MACWS_SUBMIT_RING_COUNT);
+        struct macws_submit_ring_entry *entry = &g_macws_submit_ring[slot];
+        if (entry->serial == requested_serial) {
+            matched_serial = requested_serial;
+            matched_entry = entry;
+        }
+    }
+    for (uint64_t serial = oldest;
+         !matched_entry && serial <= newest; serial++) {
+        unsigned slot = (unsigned)((serial - 1) % MACWS_SUBMIT_RING_COUNT);
+        struct macws_submit_ring_entry *entry = &g_macws_submit_ring[slot];
+        if (entry->serial == serial &&
+            entry->command_buffer == (uintptr_t)command_buffer) {
+            matched_serial = serial;
+            matched_entry = entry;
+            break;
+        }
+    }
+    unsigned saved = 0;
+    if (manifest) fprintf(manifest,
+        "reason=%s pid=%d command_buffer=%p requested_serial=%llu "
+        "matched_serial=%llu "
+        "oldest=%llu newest=%llu\n",
+        reason ?: "(nil)", getpid(), command_buffer,
+        (unsigned long long)requested_serial,
+        (unsigned long long)matched_serial,
+        (unsigned long long)oldest, (unsigned long long)newest);
+    for (uint64_t serial = oldest; serial <= newest; serial++) {
+        unsigned slot = (unsigned)((serial - 1) % MACWS_SUBMIT_RING_COUNT);
+        struct macws_submit_ring_entry *entry =
+            &g_macws_submit_ring[slot];
+        if (entry->serial != serial) continue;
+        if (manifest) fprintf(manifest,
+            "serial=%llu sequence=%u descriptor=%u fixed=%u "
+            "descriptor_pointer=%#llx command_buffer=%#llx storage=%#llx "
+            "matched=%s marked=%s serial_marked=%s "
+            "pre_commands=%zu pre_segments=%zu "
+            "post_commands=%zu post_segments=%zu\n",
+            (unsigned long long)entry->serial, entry->sequence,
+            entry->descriptor, entry->fixed,
+            (unsigned long long)entry->descriptor_pointer,
+            (unsigned long long)entry->command_buffer,
+            (unsigned long long)entry->storage,
+            (requested_serial
+                ? entry->serial == requested_serial
+                : entry->command_buffer == (uintptr_t)command_buffer)
+                ? "YES" : "NO",
+            macws_submit_ring_is_marked(entry->command_buffer)
+                ? "YES" : "NO",
+            macws_submit_ring_serial_is_marked(entry->serial)
+                ? "YES" : "NO",
+            entry->pre_commands_length, entry->pre_segments_length,
+            entry->post_commands_length, entry->post_segments_length);
+
+        struct {
+            const char *phase;
+            const char *kind;
+            const unsigned char *bytes;
+            size_t length;
+        } files[] = {
+            {"pre", "kcmd", entry->pre_commands,
+                entry->pre_commands_length},
+            {"pre", "segments", entry->pre_segments,
+                entry->pre_segments_length},
+            {"post", "kcmd", entry->post_commands,
+                entry->post_commands_length},
+            {"post", "segments", entry->post_segments,
+                entry->post_segments_length},
+        };
+        // Retain all metadata, but write bytes only for the exact matching
+        // descriptor owner plus the most recent 64 submits.  A 2048-entry
+        // in-memory window is needed because WindowServer can have roughly
+        // 1000 producers outstanding before Metal reports the first error;
+        // writing four files for every entry would distort that timing and
+        // needlessly consume the chroot filesystem.
+        BOOL write_bytes =
+            (requested_serial && entry->serial == requested_serial) ||
+            entry->command_buffer == (uintptr_t)command_buffer ||
+            // Large translated compositor batches are rare, and an earlier
+            // clean batch is the strongest control for a later batch of the
+            // same shape that page-faults.  Save them directly instead of
+            // relying on the shared 32-slot tile mark ring, whose entries can
+            // be evicted during the roughly 100 submissions between control
+            // and fault.
+            entry->fixed >= 8 ||
+            macws_submit_ring_is_marked(entry->command_buffer) ||
+            macws_submit_ring_serial_is_marked(entry->serial) ||
+            serial + 64 > newest;
+        for (size_t i = 0; write_bytes &&
+             i < sizeof(files) / sizeof(files[0]); i++) {
+            if (!files[i].bytes || !files[i].length) continue;
+            char path[PATH_MAX];
+            snprintf(path, sizeof(path),
+                "%s/s%llu_q%u_d%u_%s_%s.bin", directory,
+                (unsigned long long)entry->serial, entry->sequence,
+                entry->descriptor, files[i].phase, files[i].kind);
+            macws_submit_ring_write_file(
+                path, files[i].bytes, files[i].length);
+        }
+        saved++;
+    }
+    macws_agx_life_dump_snapshot(directory,
+        matched_entry ? matched_entry->post_commands : NULL,
+        matched_entry ? matched_entry->post_commands_length : 0);
+    if (manifest) fclose(manifest);
+    pthread_mutex_unlock(&g_macws_submit_ring_lock);
+    fprintf(stderr,
+        "#### AGX_SUBMIT_RING dumped reason=%s commandBuffer=%p entries=%u "
+        "range=%llu..%llu path=%s\n",
+        reason ?: "(nil)", command_buffer, saved,
+        (unsigned long long)oldest,
+        (unsigned long long)newest, directory);
+}
+
+__attribute__((visibility("default")))
+void macws_dump_recent_agx_submits(const char *reason,
+                                   const void *command_buffer) {
+    macws_dump_recent_agx_submits_impl(reason, command_buffer, 0);
+}
+
+__attribute__((visibility("default")))
+void macws_dump_recent_agx_submit_serial(const char *reason,
+                                         const void *command_buffer,
+                                         uint64_t submit_serial) {
+    macws_dump_recent_agx_submits_impl(
+        reason, command_buffer, submit_serial);
+}
 
 static uint64_t macws_strip_user_pointer(uint64_t raw) {
     return raw & 0x0000ffffffffffffULL;
@@ -6656,6 +7363,13 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
 
         unsigned char *commands = (unsigned char *)(uintptr_t)start;
         size_t total = (size_t)(current - start);
+        unsigned fixed_before_descriptor = result.fixed;
+        struct macws_submit_ring_token ring_token =
+            macws_submit_ring_begin(result.sequence, descriptor_index,
+                (uintptr_t)descriptor, (uintptr_t)self, (uintptr_t)state,
+                commands, total,
+                (const unsigned char *)(uintptr_t)segment_start,
+                segment_length);
         size_t dump_length = total < 0x300 ? total : 0x300;
         if (verbose) macws_submit_hex("kernel-commands", result.sequence,
                                       commands, dump_length);
@@ -6763,13 +7477,17 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             // Keep the gate deliberately narrower than the generic subtype-1
             // shape.  Runtime captures identify scalar[0]==3 for the VNC
             // clear-only control and scalar[0]==1 for agxprobe stage 5's
-            // isolated IOSurface clear.  The complete storage range is 0x840
-            // with a 0x28 trailer in that probe, and 0x858 with a 0x40 trailer
-            // in WindowServer's VNC detile pass; the enclosed record is the
-            // same 0x818-byte subtype-1 layout.  Both forms must pass every
-            // framing, removable-window, and stable surrounding-anchor check
-            // below.  This remains a diagnostic ABI experiment, not a
-            // semantic translation of scalar[0] or of either trailer.
+            // isolated IOSurface clear.  The enclosed record is the same
+            // 0x818-byte subtype-1 macOS layout in every capture, but its
+            // complete command-storage span and resource-list length vary
+            // with the opaque trailer/resource count.  In particular, the
+            // first exactly correlated WindowServer error (submit serial 194,
+            // MTL error 00000102) was storage=0x870 and list=0x1f0.  Its list
+            // still had the RE-confirmed one-segment framing: count=1,
+            // encoded byte length, and range [0,total) at +0x18.  Validate
+            // those invariants instead of hard-coding the resource count.
+            // This remains a diagnostic ABI experiment, not a semantic
+            // translation of scalar[0] or of the opaque trailer.
             if (off == 0 && type == 0x10000 && inner == 0x30 &&
                 subtype == 1 && size == 0x7e8 && end_offset == 0x818 &&
                 total >= 0x818 && segment_length >= 0x20) {
@@ -6777,11 +7495,13 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     ? in[0] : UINT64_MAX;
                 int check_scalar = in && inCnt >= 1 &&
                     (in[0] == 1 || in[0] == 3);
-                int check_total = total == 0x840 || total == 0x858;
-                int check_segment_length = segment_length == 0x130;
+                int check_total = total >= 0x818 && total <= 0x1000;
+                int check_segment_length = segment_length >= 0x20 &&
+                    segment_length <= 0x10000;
                 int check_segment_header =
                     *(uint32_t *)(uintptr_t)(segment_start + 0x08) == 1 &&
-                    *(uint32_t *)(uintptr_t)(segment_start + 0x0c) == 0x80000130 &&
+                    *(uint32_t *)(uintptr_t)(segment_start + 0x0c) ==
+                        (0x80000000U | (uint32_t)segment_length) &&
                     *(uint32_t *)(uintptr_t)(segment_start + 0x18) == 0 &&
                     *(uint32_t *)(uintptr_t)(segment_start + 0x1c) == total;
                 int check_command_total =
@@ -6846,10 +7566,11 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             if (allow_fix && off == 0 &&
                 type == 0x10000 && inner == 0x30 && subtype == 1 &&
                 size == 0x7e8 && end_offset == 0x818 &&
-                (total == 0x840 || total == 0x858) &&
-                segment_length == 0x130 &&
+                total >= 0x818 && total <= 0x1000 &&
+                segment_length >= 0x20 && segment_length <= 0x10000 &&
                 *(uint32_t *)(uintptr_t)(segment_start + 0x08) == 1 &&
-                *(uint32_t *)(uintptr_t)(segment_start + 0x0c) == 0x80000130 &&
+                *(uint32_t *)(uintptr_t)(segment_start + 0x0c) ==
+                    (0x80000000U | (uint32_t)segment_length) &&
                 *(uint32_t *)(uintptr_t)(segment_start + 0x18) == 0 &&
                 *(uint32_t *)(uintptr_t)(segment_start + 0x1c) == total &&
                 *(uint32_t *)(commands + 0x04) == total &&
@@ -6968,6 +7689,11 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             }
             off += end_offset;
         }
+        macws_submit_ring_finish(ring_token,
+            result.fixed - fixed_before_descriptor,
+            commands, total,
+            (const unsigned char *)(uintptr_t)segment_start,
+            segment_length);
     }
     return result;
 }
@@ -7630,9 +8356,15 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             ? *(const uint32_t *)(sent + 0x30) : 0;
         if (r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x50) {
             const unsigned char *o = (const unsigned char *)outStruct;
+            uint64_t gpu_address = *(const uint64_t *)(o + 0x00);
             uint64_t gid = *(const uint32_t *)(o + 0x1c);
             uint64_t bytes = *(const uint64_t *)(o + 0x48);
-            macws_agx_life_create(gid, agxType, client_id, surface_id, bytes);
+            uint32_t flags_14 = inStructCnt >= 0x18
+                ? *(const uint32_t *)(sent + 0x14) : 0;
+            uint64_t request_50 = inStructCnt >= 0x58
+                ? *(const uint64_t *)(sent + 0x50) : 0;
+            macws_agx_life_create(gid, agxType, client_id, surface_id,
+                                  gpu_address, bytes, flags_14, request_50);
             if (agxType == 0x82) {
                 static _Atomic unsigned int t82_bt_count = 0;
                 unsigned int bt_n = atomic_fetch_add(&t82_bt_count, 1);
@@ -7925,6 +8657,68 @@ extern IOReturn IOMobileFramebufferSwapEnd(MacwsIOMobileFramebufferRef framebuff
 extern IOReturn IOMobileFramebufferSwapCancel(
     MacwsIOMobileFramebufferRef framebuffer, uint32_t swap_id);
 
+// Diagnostic-only pacing knob for the cancelled-swap completion scaffold.
+// The production default stays at one 60-Hz interval. A bounded slower value
+// lets an A/B test distinguish a producer/backpressure problem from a command
+// ABI or resource-lifetime problem without changing either command bytes or
+// completion semantics. This is intentionally not presented as a refresh-rate
+// implementation: the synthetic completion is still not a real display/GPU
+// completion signal.
+static uint32_t macws_coexist_completion_pace_us(void) {
+    enum {
+        kDefaultPaceUS = 16667,
+        kMinimumPaceUS = 8333,
+        kMaximumPaceUS = 100000,
+    };
+    static dispatch_once_t once;
+    static uint32_t pace_us = kDefaultPaceUS;
+    dispatch_once(&once, ^{
+        char file_value[32] = {0};
+        const char *value = getenv("MACWS_COEXIST_PACE_US");
+        const char *source = "default";
+        if (value && *value) {
+            source = "environment";
+        } else {
+            int fd = open("/private/tmp/macws_coexist_pace_us", O_RDONLY);
+            if (fd >= 0) {
+                ssize_t count = read(fd, file_value, sizeof(file_value) - 1);
+                close(fd);
+                if (count > 0) {
+                    file_value[count] = '\0';
+                    value = file_value;
+                    source = "diagnostic-file";
+                }
+            }
+        }
+
+        if (value && *value) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long parsed = strtoul(value, &end, 10);
+            while (end && (*end == ' ' || *end == '\t' ||
+                           *end == '\r' || *end == '\n')) {
+                end++;
+            }
+            if (errno == 0 && end && end != value && *end == '\0' &&
+                parsed >= kMinimumPaceUS && parsed <= kMaximumPaceUS) {
+                pace_us = (uint32_t)parsed;
+            } else {
+                fprintf(stderr,
+                    "#### COEXIST DIAGNOSTIC pace rejected: source=%s "
+                    "value='%s' valid=%u..%u us; using default=%u us\n",
+                    source, value, kMinimumPaceUS, kMaximumPaceUS,
+                    kDefaultPaceUS);
+                source = "default-after-invalid-value";
+            }
+        }
+        fprintf(stderr,
+            "#### COEXIST DIAGNOSTIC completion pace: %u us source=%s "
+            "(synthetic completion; not a refresh-rate implementation)\n",
+            pace_us, source);
+    });
+    return pace_us;
+}
+
 static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
     if (!atomic_load(&g_macws_iomfb_coexist_swap_cancel) || !framebuffer) {
         return g_macws_orig_iomfb_swap_end
@@ -7952,15 +8746,15 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
         // its one matching completion.  Render work plus this interval yields
         // roughly 30 presented virtual frames/s without accumulating pending
         // callbacks or weakening the watchdog threshold.
-        enum { kMacWSCoexistCompletionPaceUS = 16667 };
-        usleep(kMacWSCoexistCompletionPaceUS);
+        uint32_t pace_us = macws_coexist_completion_pace_us();
+        usleep(pace_us);
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);
         macws_iomfb_complete_cancelled_swap(client, swap_id);
         if (sequence <= 4) {
             fprintf(stderr,
                 "#### COEXIST completion pace #%lu: %u us before swapID=%u\n",
-                sequence, kMacWSCoexistCompletionPaceUS, swap_id);
+                sequence, pace_us, swap_id);
         }
     }
     return result;

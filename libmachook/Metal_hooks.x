@@ -52,6 +52,407 @@ static int macws_disp_mode(void) {
 // (see mac_hooks.m macws_install_osxvnc_hooks / macws_vnc_fill). Gated by
 // sentinel /tmp/macws_vnc_share.
 extern uint32_t IOSurfaceGetID(IOSurfaceRef);
+static uint64_t macws_vnc_capture_generation(void);
+static void macws_vnc_ack_capture(uint64_t generation);
+extern void macws_dump_recent_agx_submits(const char *reason,
+                                          const void *command_buffer);
+extern uint64_t macws_latest_agx_submit_serial(const void *command_buffer);
+extern unsigned macws_agx_submit_fixed_count(uint64_t submit_serial);
+extern int macws_agx_submit_dimensions(uint64_t submit_serial,
+                                       uint32_t *width_out,
+                                       uint32_t *height_out);
+extern void macws_dump_recent_agx_submit_serial(
+    const char *reason, const void *command_buffer, uint64_t submit_serial);
+extern void macws_mark_agx_submit_for_error_dump(const void *command_buffer);
+extern void macws_mark_agx_submit_serial_for_error_dump(
+    uint64_t submit_serial);
+static void macws_log_failed_texture_descriptor(
+    id texture, const void *command_buffer, uint64_t submit_serial);
+static void macws_observe_pf550_metadata(id texture, uint64_t submit_serial,
+                                         BOOL completed_cleanly);
+
+// Read-only completion callback diagnostic.  Runtime ObjC method enumeration
+// on the device established these exact private entry points and signatures:
+//
+//   -[IOGPUMetalCommandQueue didComplete:withStatus:]       v32@0:8@16q24
+//   -[IOGPUMetalCommandBuffer
+//       didCompleteWithStartTime:endTime:error:]            v40@0:8Q16Q24@32
+//
+// The queue hook observes the callback before IOGPU turns it into Metal's
+// public NSError and before the command buffer's `_storage` ivar is cleared.
+// No field is changed and both original implementations are always invoked.
+// Enable only with /tmp/macws_iogpu_error_diag.
+static void (*g_macws_orig_iogpu_queue_complete)(id, SEL, id, NSInteger) = NULL;
+static void (*g_macws_orig_iogpu_buffer_complete)(id, SEL, uint64_t, uint64_t,
+                                                  id) = NULL;
+static _Atomic int64_t g_macws_iogpu_clean_callback_status = INT64_MIN;
+static _Atomic uint64_t g_macws_iogpu_callback_count = 0;
+static _Atomic int g_macws_iogpu_error_dumped = 0;
+static _Atomic int g_macws_iogpu_buffer_error_dumped = 0;
+static _Atomic int g_macws_iogpu_buffer_page_fault_dumped = 0;
+static _Atomic int g_macws_iogpu_page_fault_seen = 0;
+static _Atomic int g_macws_iogpu_post_fault_clean_dumped = 0;
+static _Atomic uint32_t g_macws_iogpu_page_fault_width = 0;
+static _Atomic uint32_t g_macws_iogpu_page_fault_height = 0;
+
+static BOOL macws_iogpu_callback_diag_enabled(void) {
+    return access("/tmp/macws_iogpu_error_diag", F_OK) == 0;
+}
+
+static void macws_iogpu_dump_bytes(const char *role, const void *pointer,
+                                   size_t length) {
+    if (!pointer || (uintptr_t)pointer < 0x1000 || length == 0) return;
+    if (length > 0x300) length = 0x300;
+    const uint8_t *bytes = pointer;
+    for (size_t offset = 0; offset < length; offset += 32) {
+        char hex[65] = {0};
+        size_t count = length - offset < 32 ? length - offset : 32;
+        for (size_t i = 0; i < count; i++)
+            snprintf(hex + i * 2, 3, "%02x", bytes[offset + i]);
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-BYTES role=%s base=%p offset=%#zx "
+            "bytes=%s\n",
+            role, pointer, offset, hex);
+    }
+}
+
+static void macws_iogpu_dump_object(const char *role, id object) {
+    if (!object) {
+        fprintf(stderr, "#### IOGPU-CALLBACK-OBJECT role=%s object=nil\n",
+                role);
+        return;
+    }
+    Class dynamic_class = object_getClass(object);
+    size_t instance_size = dynamic_class
+        ? class_getInstanceSize(dynamic_class) : 0;
+    fprintf(stderr,
+        "#### IOGPU-CALLBACK-OBJECT role=%s object=%p dynamicClass=%s "
+        "instanceSize=%#zx\n",
+        role, (__bridge void *)object,
+        dynamic_class ? class_getName(dynamic_class) : "(nil)",
+        instance_size);
+    Class cls = dynamic_class;
+    for (unsigned depth = 0; cls && depth < 8;
+         depth++, cls = class_getSuperclass(cls)) {
+        unsigned count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-CLASS role=%s depth=%u class=%s "
+            "ivars=%u\n",
+            role, depth, class_getName(cls), count);
+        for (unsigned i = 0; ivars && i < count; i++) {
+            ptrdiff_t offset = ivar_getOffset(ivars[i]);
+            uint64_t raw = 0;
+            if (offset >= 0 && (size_t)offset + sizeof(raw) <= instance_size)
+                memcpy(&raw, (const char *)(__bridge void *)object + offset,
+                       sizeof(raw));
+            fprintf(stderr,
+                "#### IOGPU-CALLBACK-IVAR role=%s class=%s offset=%#tx "
+                "name=%s type=%s raw64=%#llx\n",
+                role, class_getName(cls), offset,
+                ivar_getName(ivars[i]) ?: "(nil)",
+                ivar_getTypeEncoding(ivars[i]) ?: "(nil)",
+                (unsigned long long)raw);
+        }
+        free(ivars);
+    }
+    size_t raw_length = instance_size < 0x100 ? instance_size : 0x100;
+    macws_iogpu_dump_bytes(role, (__bridge const void *)object, raw_length);
+}
+
+static void macws_iogpu_dump_command_storage(id command_buffer,
+                                             const char *role) {
+    if (!command_buffer) return;
+    Ivar storage_ivar = class_getInstanceVariable(
+        [command_buffer class], "_storage");
+    if (!storage_ivar) {
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-STORAGE role=%s commandBuffer=%p "
+            "storageIvar=missing\n",
+            role, (__bridge void *)command_buffer);
+        return;
+    }
+    ptrdiff_t offset = ivar_getOffset(storage_ivar);
+    void *storage = *(void **)((char *)(__bridge void *)command_buffer +
+                              offset);
+    fprintf(stderr,
+        "#### IOGPU-CALLBACK-STORAGE role=%s commandBuffer=%p class=%s "
+        "ivarOffset=%#tx storage=%p\n",
+        role, (__bridge void *)command_buffer,
+        class_getName([command_buffer class]), offset, storage);
+    macws_iogpu_dump_bytes("command-storage", storage, 0x300);
+}
+
+static void macws_iogpu_dump_error_user_info(id error) {
+    if (!error) return;
+    NSString *domain = nil;
+    NSDictionary *user_info = nil;
+    NSInteger code = 0;
+    @try {
+        domain = [error respondsToSelector:@selector(domain)]
+            ? [error domain] : nil;
+        code = [error respondsToSelector:@selector(code)]
+            ? (NSInteger)[error code] : 0;
+        user_info = [error respondsToSelector:@selector(userInfo)]
+            ? [error userInfo] : nil;
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    fprintf(stderr,
+        "#### IOGPU-CALLBACK-ERROR domain=%s code=%ld userInfo=%p "
+        "userInfoClass=%s\n",
+        domain ? [domain UTF8String] : "(nil)", (long)code,
+        (__bridge void *)user_info,
+        user_info ? class_getName([user_info class]) : "(nil)");
+    macws_iogpu_dump_object("buffer-error-user-info", user_info);
+    @try {
+        NSArray *keys = [user_info allKeys];
+        NSUInteger count = [keys count];
+        NSUInteger limit = count < 16 ? count : 16;
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-USERINFO count=%lu limit=%lu\n",
+            (unsigned long)count, (unsigned long)limit);
+        for (NSUInteger i = 0; i < limit; i++) {
+            id key = [keys objectAtIndex:i];
+            id value = [user_info objectForKey:key];
+            const char *key_text = [key isKindOfClass:[NSString class]]
+                ? [key UTF8String] : "(non-string)";
+            const char *value_class = value
+                ? class_getName([value class]) : "(nil)";
+            if ([value isKindOfClass:[NSNumber class]]) {
+                fprintf(stderr,
+                    "#### IOGPU-CALLBACK-USERINFO-ENTRY index=%lu key=%s "
+                    "value=%p class=%s uint64=%#llx\n",
+                    (unsigned long)i, key_text, (__bridge void *)value,
+                    value_class,
+                    (unsigned long long)[value unsignedLongLongValue]);
+            } else if ([value isKindOfClass:[NSString class]]) {
+                fprintf(stderr,
+                    "#### IOGPU-CALLBACK-USERINFO-ENTRY index=%lu key=%s "
+                    "value=%p class=%s string=%s\n",
+                    (unsigned long)i, key_text, (__bridge void *)value,
+                    value_class, [value UTF8String] ?: "(nil)");
+            } else if ([value isKindOfClass:[NSData class]]) {
+                fprintf(stderr,
+                    "#### IOGPU-CALLBACK-USERINFO-ENTRY index=%lu key=%s "
+                    "value=%p class=%s length=%lu\n",
+                    (unsigned long)i, key_text, (__bridge void *)value,
+                    value_class, (unsigned long)[value length]);
+                macws_iogpu_dump_bytes("buffer-error-user-info-data",
+                    [value bytes], [value length]);
+            } else {
+                fprintf(stderr,
+                    "#### IOGPU-CALLBACK-USERINFO-ENTRY index=%lu key=%s "
+                    "value=%p class=%s\n",
+                    (unsigned long)i, key_text, (__bridge void *)value,
+                    value_class);
+            }
+        }
+    } @catch (NSException *exception) {
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-USERINFO exception=%s\n",
+            [[exception description] UTF8String] ?: "(nil)");
+    }
+}
+
+static void macws_iogpu_queue_complete(id self, SEL selector,
+                                       id command_buffer, NSInteger status) {
+    if (macws_iogpu_callback_diag_enabled()) {
+        uint64_t count = atomic_fetch_add(&g_macws_iogpu_callback_count, 1) + 1;
+        int64_t expected = INT64_MIN;
+        (void)atomic_compare_exchange_strong(
+            &g_macws_iogpu_clean_callback_status, &expected,
+            (int64_t)status);
+        int64_t baseline = atomic_load(&g_macws_iogpu_clean_callback_status);
+        if (count <= 32 || (int64_t)status != baseline) {
+            fprintf(stderr,
+                "#### IOGPU-CALLBACK-QUEUE count=%llu queue=%p "
+                "commandBuffer=%p class=%s status=%ld baseline=%lld\n",
+                (unsigned long long)count, (__bridge void *)self,
+                (__bridge void *)command_buffer,
+                command_buffer ? class_getName([command_buffer class]) : "(nil)",
+                (long)status, (long long)baseline);
+        }
+        if ((int64_t)status != baseline) {
+            int expected_dump = 0;
+            if (atomic_compare_exchange_strong(
+                    &g_macws_iogpu_error_dumped, &expected_dump, 1)) {
+                macws_iogpu_dump_object("queue-error-command-buffer",
+                                        command_buffer);
+                macws_iogpu_dump_command_storage(command_buffer,
+                                                  "queue-before-original");
+            }
+        }
+    }
+    g_macws_orig_iogpu_queue_complete(self, selector, command_buffer, status);
+}
+
+static void macws_iogpu_buffer_complete(id self, SEL selector,
+                                        uint64_t start_time,
+                                        uint64_t end_time, id error) {
+    NSInteger error_code = 0;
+    if (error) {
+        @try {
+            if ([error respondsToSelector:@selector(code)])
+                error_code = (NSInteger)[error code];
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+    }
+    _Atomic int *dump_latch = error_code == 3
+        ? &g_macws_iogpu_buffer_page_fault_dumped
+        : &g_macws_iogpu_buffer_error_dumped;
+    uint64_t submit_serial = 0;
+    unsigned fixed_count = 0;
+    uint32_t submit_width = 0;
+    uint32_t submit_height = 0;
+    if (macws_iogpu_callback_diag_enabled()) {
+        submit_serial = macws_latest_agx_submit_serial(
+            (__bridge const void *)self);
+        fixed_count = macws_agx_submit_fixed_count(submit_serial);
+        (void)macws_agx_submit_dimensions(
+            submit_serial, &submit_width, &submit_height);
+        if (!error && fixed_count >= 8) {
+            fprintf(stderr,
+                "#### IOGPU-CALLBACK-BUFFER-CLEAN commandBuffer=%p "
+                "class=%s submitSerial=%llu fixed=%u target=%ux%u "
+                "start=%#llx end=%#llx\n",
+                (__bridge void *)self, class_getName([self class]),
+                (unsigned long long)submit_serial, fixed_count,
+                submit_width, submit_height,
+                (unsigned long long)start_time,
+                (unsigned long long)end_time);
+            int expected_clean_dump = 0;
+            uint32_t fault_width = atomic_load(
+                &g_macws_iogpu_page_fault_width);
+            uint32_t fault_height = atomic_load(
+                &g_macws_iogpu_page_fault_height);
+            if (atomic_load(&g_macws_iogpu_page_fault_seen) == 1 &&
+                submit_width == fault_width &&
+                submit_height == fault_height &&
+                atomic_compare_exchange_strong(
+                    &g_macws_iogpu_post_fault_clean_dumped,
+                    &expected_clean_dump, 1)) {
+                macws_dump_recent_agx_submit_serial(
+                    "iogpu-post-page-fault-clean",
+                    (__bridge const void *)self, submit_serial);
+            }
+        }
+    }
+    if (error && error_code == 3) {
+        int expected_fault_state = 0;
+        if (atomic_compare_exchange_strong(
+                &g_macws_iogpu_page_fault_seen,
+                &expected_fault_state, -1)) {
+            atomic_store(&g_macws_iogpu_page_fault_width, submit_width);
+            atomic_store(&g_macws_iogpu_page_fault_height, submit_height);
+            atomic_store(&g_macws_iogpu_page_fault_seen, 1);
+        }
+    }
+    int expected_dump = 0;
+    if (macws_iogpu_callback_diag_enabled() && error &&
+        atomic_compare_exchange_strong(
+            dump_latch, &expected_dump, 1)) {
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-BUFFER commandBuffer=%p class=%s "
+            "submitSerial=%llu fixed=%u target=%ux%u errorCode=%ld "
+            "start=%#llx end=%#llx error=%p "
+            "errorClass=%s\n",
+            (__bridge void *)self, class_getName([self class]),
+            (unsigned long long)submit_serial,
+            fixed_count,
+            submit_width, submit_height,
+            (long)error_code,
+            (unsigned long long)start_time, (unsigned long long)end_time,
+            (__bridge void *)error, class_getName([error class]));
+        macws_iogpu_dump_object("buffer-error", error);
+        macws_iogpu_dump_error_user_info(error);
+        macws_iogpu_dump_command_storage(self, "buffer-before-original");
+        if (submit_serial) {
+            macws_dump_recent_agx_submit_serial(
+                error_code == 3 ? "iogpu-raw-callback-page-fault"
+                                : "iogpu-raw-callback-error",
+                (__bridge const void *)self, submit_serial);
+        }
+    }
+    g_macws_orig_iogpu_buffer_complete(
+        self, selector, start_time, end_time, error);
+}
+
+static void macws_install_iogpu_callback_diagnostics(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class queue_class = objc_getClass("IOGPUMetalCommandQueue");
+        SEL queue_selector = sel_registerName("didComplete:withStatus:");
+        Method queue_method = queue_class
+            ? class_getInstanceMethod(queue_class, queue_selector) : NULL;
+        Class buffer_class = objc_getClass("IOGPUMetalCommandBuffer");
+        SEL buffer_selector = sel_registerName(
+            "didCompleteWithStartTime:endTime:error:");
+        Method buffer_method = buffer_class
+            ? class_getInstanceMethod(buffer_class, buffer_selector) : NULL;
+        if (queue_method) {
+            g_macws_orig_iogpu_queue_complete =
+                (void *)method_setImplementation(
+                    queue_method, (IMP)macws_iogpu_queue_complete);
+        }
+        if (buffer_method) {
+            g_macws_orig_iogpu_buffer_complete =
+                (void *)method_setImplementation(
+                    buffer_method, (IMP)macws_iogpu_buffer_complete);
+        }
+        fprintf(stderr,
+            "#### IOGPU-CALLBACK-DIAG installed queueClass=%p method=%p "
+            "orig=%p bufferClass=%p method=%p orig=%p (file-gated)\n",
+            queue_class, queue_method, g_macws_orig_iogpu_queue_complete,
+            buffer_class, buffer_method, g_macws_orig_iogpu_buffer_complete);
+    });
+}
+
+static void macws_log_command_buffer_ivars(id commandBuffer) {
+    if (!commandBuffer || access("/tmp/macws_submit_ring", F_OK) != 0)
+        return;
+    Class cls = object_getClass(commandBuffer);
+    fprintf(stderr,
+        "#### AGX_SUBMIT_RING error-object=%p dynamicClass=%s\n",
+        (__bridge void *)commandBuffer, cls ? class_getName(cls) : "(nil)");
+    for (unsigned depth = 0; cls && depth < 8; depth++, cls = class_getSuperclass(cls)) {
+        unsigned count = 0;
+        Ivar *ivars = class_copyIvarList(cls, &count);
+        size_t instanceSize = class_getInstanceSize(cls);
+        fprintf(stderr,
+            "#### AGX_SUBMIT_RING class[%u]=%s instanceSize=%#zx ivars=%u\n",
+            depth, class_getName(cls), instanceSize, count);
+        for (unsigned i = 0; ivars && i < count; i++) {
+            ptrdiff_t offset = ivar_getOffset(ivars[i]);
+            uint64_t raw = 0;
+            if (offset >= 0 && (size_t)offset + sizeof(raw) <= instanceSize)
+                memcpy(&raw, (const char *)(__bridge void *)commandBuffer + offset,
+                       sizeof(raw));
+            fprintf(stderr,
+                "####   ivar +%#tx name=%s type=%s raw64=%#llx\n",
+                offset, ivar_getName(ivars[i]) ?: "(nil)",
+                ivar_getTypeEncoding(ivars[i]) ?: "(nil)",
+                (unsigned long long)raw);
+        }
+        free(ivars);
+    }
+}
+
+// These registries must exist in both library slices. The code that creates
+// owned AGX textures is arm64-only on the on-device build, while VNC/AppKit
+// helpers are compiled in arm64e processes too and must safely observe an
+// empty registry there.
+static NSObject *g_macws_owned_scanout_lock = nil;
+static NSMutableDictionary *g_macws_owned_scanout_cache = nil;
+static NSMutableSet *g_macws_owned_scanout_surfaces = nil;
+static BOOL macws_is_owned_scanout_surface(IOSurfaceRef surface) {
+    if (!surface || !g_macws_owned_scanout_lock) return NO;
+    @synchronized(g_macws_owned_scanout_lock) {
+        return [g_macws_owned_scanout_surfaces containsObject:
+            [NSValue valueWithPointer:(void *)surface]];
+    }
+}
 static IOSurfaceRef g_vncSurf = NULL;
 static int macws_vnc_share_enabled(void) {
     static int c = -1;
@@ -169,14 +570,145 @@ static void macws_vnc_release(id obj) {
     (void)obj;
 #endif
 }
+
+static IOSurfaceRef macws_vnc_bound_surface(id<MTLTexture> texture) {
+    if (!texture) return NULL;
+    void *implementation =
+        *(void **)((char *)(__bridge void *)texture + 0x208);
+    return (uintptr_t)implementation > 0x1000
+        ? *(IOSurfaceRef *)((char *)implementation + 0xa0) : NULL;
+}
+
+// The owned scanout is already an uncompressed, linear BGRA IOSurface. Once
+// the producer command buffer has completed, copy its CPU mapping directly.
+// Submitting another GPU command buffer here would reintroduce the exact
+// cross-queue lifetime bug this path is designed to remove.
+static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
+    IOSurfaceRef surface = macws_vnc_bound_surface(texture);
+    if (!surface || !macws_is_owned_scanout_surface(surface)) return NO;
+    size_t width = [texture width], height = [texture height];
+
+    // Two narrow A/B probes isolate the first-frame-only failure without
+    // changing the producer command stream.  no_read proves whether texture
+    // substitution itself remains reusable; unlocked_read distinguishes an
+    // IOSurfaceLock coherency transition from a plain unified-memory read.
+    // Neither probe is a production synchronization policy.
+    if (access("/tmp/macws_owned_no_read", F_OK) == 0) {
+        static _Atomic uint64_t noReadCount = 0;
+        uint64_t n = atomic_fetch_add(&noReadCount, 1) + 1;
+        if (n <= 32 || (n % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-OWNED no-read #%llu tex=%p surface=%p id=%u\n",
+                (unsigned long long)n, (void *)texture, (void *)surface,
+                (unsigned)IOSurfaceGetID(surface));
+        }
+        return YES;
+    }
+    BOOL unlockedRead =
+        access("/tmp/macws_owned_unlocked_read", F_OK) == 0;
+    if ([texture pixelFormat] != MTLPixelFormatBGRA8Unorm ||
+        width < 1000 || height < 600 ||
+        (!unlockedRead &&
+         IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0)) {
+        return YES; // owned target: never fall back to a cross-queue GPU read
+    }
+    void *base = IOSurfaceGetBaseAddress(surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    size_t surfaceHeight = IOSurfaceGetHeight(surface);
+    BOOL readable = base && bytesPerRow >= width * 4 &&
+        surfaceHeight >= height;
+    size_t sampled = 0, rgbNonzero = 0, different = 0;
+    uint32_t first = 0;
+    BOOL haveFirst = NO;
+    if (readable) {
+        for (size_t y = 0; y < height; y += 16) {
+            const uint32_t *row = (const uint32_t *)
+                ((const char *)base + y * bytesPerRow);
+            for (size_t x = 0; x < width; x += 16) {
+                uint32_t pixel = row[x];
+                sampled++;
+                if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
+                if (!haveFirst) { first = pixel; haveFirst = YES; }
+                else if (pixel != first) different++;
+            }
+        }
+    }
+    BOOL valid = readable && sampled != 0 && different >= 4 &&
+        rgbNonzero * 20 >= sampled;
+    if (valid) {
+        void *shared = macws_vnc_mmap_data(width, height);
+        if (shared) {
+            for (size_t y = 0; y < height; y++) {
+                memcpy((char *)shared + y * width * 4,
+                       (const char *)base + y * bytesPerRow, width * 4);
+            }
+        } else {
+            valid = NO;
+        }
+    }
+    if (!unlockedRead)
+        IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
+    static _Atomic uint64_t publishCount = 0;
+    static _Atomic uint64_t rejectCount = 0;
+    uint64_t sequence = valid
+        ? atomic_fetch_add(&publishCount, 1) + 1
+        : atomic_fetch_add(&rejectCount, 1) + 1;
+    if (sequence <= 32 || (sequence % 600) == 0) {
+        fprintf(stderr,
+            "#### VNC-OWNED %s #%llu tex=%p surface=%p id=%u "
+            "%zux%zu rgb=%zu/%zu different=%zu unlocked=%d\n",
+            valid ? "published" : "reject-output",
+            (unsigned long long)sequence, (void *)texture, (void *)surface,
+            (unsigned)IOSurfaceGetID(surface), width, height,
+            rgbNonzero, sampled, different, unlockedRead);
+    }
+    if (valid) {
+        uint64_t generation = macws_vnc_capture_generation();
+        if (generation != 0) {
+            if (macws_vnc_capture_generation() == generation)
+                (void)unlink("/tmp/macws_capture_final");
+            macws_vnc_ack_capture(generation);
+        }
+    }
+    return YES;
+}
+
 void macws_vnc_on_composite(id<MTLTexture> dest) {
     if (!macws_vnc_share_enabled() || !dest) return;
+
+    // Strict A/B boundary for the owned-scanout experiment.  The first
+    // WindowServer display composite can be an ordinary PF80 texture before
+    // QuartzCore starts wrapping the compressed IOMFB page.  Letting that one
+    // frame enter the legacy worker still submits a second command queue and
+    // destroys its temporary AGX resources after owned rendering has begun,
+    // so a later producer error cannot be attributed to either path.  When
+    // owned scanout is requested, no texture at all may enter the legacy GPU
+    // capture path; owned textures are published at producer completion by
+    // macws_vnc_publish_owned_texture().
+    if (access("/tmp/macws_owned_scanout", F_OK) == 0) {
+        static _Atomic uint64_t ownedModeSkipCount = 0;
+        uint64_t n = atomic_fetch_add(&ownedModeSkipCount, 1) + 1;
+        if (n <= 8 || (n % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-OWNED legacy-blit blocked #%llu tex=%p\n",
+                (unsigned long long)n, (void *)dest);
+        }
+        return;
+    }
     size_t candidateWidth = [dest width];
     size_t candidateHeight = [dest height];
     unsigned long candidatePixelFormat = (unsigned long)[dest pixelFormat];
     if (candidateWidth < 1000 || candidateHeight < 600 ||
         candidateWidth > UINT32_MAX || candidateHeight > UINT32_MAX ||
         (candidatePixelFormat != 80 && candidatePixelFormat != 115)) return;
+
+    // Owned scanouts are published directly after their producer completes in
+    // macws_vnc_finish_update. Runtime A/B showed that feeding one into this
+    // legacy second-queue blit made the following WindowServer submissions
+    // fail with MTLCommandBuffer status=Error/code=1.
+    IOSurfaceRef candidateSurface = macws_vnc_bound_surface(dest);
+    if (macws_is_owned_scanout_surface(candidateSurface)) return;
 
     // StartComposite is used for both the display destination and intermediate
     // per-window composites.  Runtime evidence on iPad13,6 showed the correct
@@ -364,6 +896,26 @@ static id<MTLTexture> g_vnc_final_tex = nil;
 static IOSurfaceRef g_vnc_final_surface = NULL;
 static _Atomic uint64_t g_vnc_final_serial = 0;
 
+// Experimental producer-ordered PF550 bridge.  The old screenshot path read
+// WindowServer's compressed, hazard-untracked scanout from a second command
+// queue after the compositor submission completed.  Runtime A/B on 2026-07-27
+// observed 4,200/4,200 clean PF550 submissions before that cross-queue read,
+// then 176 failed WindowServer submissions immediately after one otherwise
+// successful readback.  The first same-command-buffer attempt also failed:
+// this texture is hazard-untracked and no producer fence was available after
+// EndCurrentComposite.  The current experiment submits a separate read buffer
+// immediately after the producer on that producer's own queue, where Metal's
+// queue-ordering contract supplies the missing dependency before SkyLight can
+// recycle the scanout. Gated by /tmp/macws_inband_pf550 until device-proven.
+static id g_vnc_inband_lock = nil;
+static id<MTLRenderPipelineState> g_vnc_inband_pipeline = nil;
+static id<MTLTexture> g_vnc_inband_destination = nil;
+static _Atomic int g_vnc_inband_busy = 0;
+static _Atomic int g_vnc_inband_faulted = 0;
+static _Atomic uint64_t g_vnc_inband_encoded_count = 0;
+static _Atomic uint64_t g_vnc_inband_skipped_count = 0;
+static _Atomic uint64_t g_vnc_inband_published_count = 0;
+
 static uint64_t macws_vnc_capture_generation(void) {
     char value[64] = {0};
     int fd = open("/tmp/macws_capture_final", O_RDONLY | O_CLOEXEC);
@@ -390,6 +942,274 @@ static void macws_vnc_ack_capture(uint64_t generation) {
             "#### VNC-FINAL acknowledged pid=%d generation=%llu\n",
             getpid(), (unsigned long long)generation);
     }
+}
+
+static id<MTLRenderPipelineState> macws_vnc_get_inband_pipeline(
+        id<MTLDevice> device) {
+    if (!device) return nil;
+    static dispatch_once_t lockOnce;
+    dispatch_once(&lockOnce, ^{ g_vnc_inband_lock = [NSObject new]; });
+    @synchronized(g_vnc_inband_lock) {
+        if (g_vnc_inband_pipeline) return g_vnc_inband_pipeline;
+
+        NSURL *url = [NSURL fileURLWithPath:
+            @"/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"];
+        NSError *error = nil;
+        id<MTLLibrary> library = [device newLibraryWithURL:url error:&error];
+        id<MTLFunction> vertex = library
+            ? [library newFunctionWithName:@"read_surf_vert"] : nil;
+        id<MTLFunction> fragment = library
+            ? [library newFunctionWithName:@"read_surf_frag"] : nil;
+        MTLRenderPipelineReflection *reflection = nil;
+        id<MTLRenderPipelineState> built = nil;
+        BOOL contractOK = NO;
+        if (vertex && fragment) {
+            MTLRenderPipelineDescriptor *descriptor =
+                [[MTLRenderPipelineDescriptor alloc] init];
+            descriptor.label = @"MACWS in-band PF550 conversion";
+            descriptor.vertexFunction = vertex;
+            descriptor.fragmentFunction = fragment;
+            descriptor.colorAttachments[0].pixelFormat =
+                MTLPixelFormatBGRA8Unorm;
+            built = [device newRenderPipelineStateWithDescriptor:descriptor
+                options:MTLPipelineOptionArgumentInfo
+                reflection:&reflection error:&error];
+            macws_vnc_release(descriptor);
+        }
+        if (built && reflection) {
+            BOOL sawTexture0 = NO;
+            BOOL unexpected = NO;
+            for (MTLArgument *argument in [reflection vertexArguments]) {
+                if ([argument isActive]) unexpected = YES;
+            }
+            for (MTLArgument *argument in [reflection fragmentArguments]) {
+                if (![argument isActive]) continue;
+                if ([argument type] == MTLArgumentTypeTexture &&
+                    [argument index] == 0 && !sawTexture0) {
+                    sawTexture0 = YES;
+                } else {
+                    unexpected = YES;
+                }
+            }
+            contractOK = sawTexture0 && !unexpected;
+        }
+        if (built && contractOK) {
+            g_vnc_inband_pipeline = built;
+        } else {
+            macws_vnc_release(built);
+        }
+        fprintf(stderr,
+            "#### VNC-INBAND pipeline library=%p vertex=%p fragment=%p "
+            "pipeline=%p reflection=%p contract=%s error=%s\n",
+            (void *)library, (void *)vertex, (void *)fragment,
+            (void *)g_vnc_inband_pipeline, (void *)reflection,
+            contractOK ? "OK" : "REJECT",
+            error ? [[error description] UTF8String] : "nil");
+        macws_vnc_release(fragment);
+        macws_vnc_release(vertex);
+        macws_vnc_release(library);
+        return g_vnc_inband_pipeline;
+    }
+}
+
+static void macws_vnc_clear_inband_busy(void) {
+    atomic_store(&g_vnc_inband_busy, 0);
+}
+
+// Submit the read immediately after SkyLight's producer on the producer's own
+// MTLCommandQueue. Metal command queues execute their command buffers in
+// submission order, which supplies the resource ordering missing from both the
+// cross-queue screenshot and the failed same-buffer/untracked-hazard attempt.
+// Returns an owned read command buffer and an owned destination snapshot.
+static id<MTLCommandBuffer> macws_vnc_submit_pf550_ordered(
+        id<MTLTexture> source, id<MTLCommandBuffer> producer,
+        id<MTLTexture> *destinationOut) {
+    if (destinationOut) *destinationOut = nil;
+    if (access("/tmp/macws_inband_pf550", F_OK) != 0 || !source || !producer ||
+        atomic_load(&g_vnc_inband_faulted) ||
+        [source pixelFormat] != (MTLPixelFormat)550 ||
+        [source width] < 1000 || [source height] < 600 ||
+        (([source usage] & MTLTextureUsageShaderRead) == 0)) {
+        return nil;
+    }
+    if (atomic_exchange(&g_vnc_inband_busy, 1)) {
+        uint64_t skipped = atomic_fetch_add(&g_vnc_inband_skipped_count, 1) + 1;
+        if (skipped <= 16 || (skipped % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-INBAND skip busy #%llu encoded=%llu published=%llu\n",
+                (unsigned long long)skipped,
+                (unsigned long long)atomic_load(&g_vnc_inband_encoded_count),
+                (unsigned long long)atomic_load(&g_vnc_inband_published_count));
+        }
+        return nil;
+    }
+
+    id<MTLCommandQueue> commandQueue = [producer commandQueue];
+    id<MTLDevice> device = [source device];
+    id<MTLRenderPipelineState> pipeline =
+        macws_vnc_get_inband_pipeline(device);
+    size_t width = [source width], height = [source height];
+    if (!commandQueue || !pipeline) {
+        fprintf(stderr,
+            "#### VNC-INBAND reject source=%p producer=%p queue=%p "
+            "pipeline=%p reason=precondition\n",
+            (void *)source, (void *)producer, (void *)commandQueue,
+            (void *)pipeline);
+        macws_vnc_clear_inband_busy();
+        return nil;
+    }
+
+    @synchronized(g_vnc_inband_lock) {
+        if (!g_vnc_inband_destination ||
+            [g_vnc_inband_destination width] != width ||
+            [g_vnc_inband_destination height] != height) {
+            macws_vnc_share_ensure(width, height);
+            MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+                texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                width:width height:height mipmapped:NO];
+            descriptor.storageMode = MTLStorageModeShared;
+            descriptor.usage = MTLTextureUsageRenderTarget |
+                MTLTextureUsageShaderRead;
+            id<MTLTexture> replacement = g_vncSurf
+                ? [device newTextureWithDescriptor:descriptor
+                    iosurface:g_vncSurf plane:0]
+                : nil;
+            macws_vnc_release(g_vnc_inband_destination);
+            g_vnc_inband_destination = replacement;
+            fprintf(stderr,
+                "#### VNC-INBAND destination=%p surface=%p %zux%zu\n",
+                (void *)g_vnc_inband_destination, (void *)g_vncSurf,
+                width, height);
+        }
+    }
+    if (!g_vnc_inband_destination) {
+        macws_vnc_clear_inband_busy();
+        return nil;
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    MTLRenderPassDescriptor *renderPass =
+        [MTLRenderPassDescriptor renderPassDescriptor];
+    renderPass.colorAttachments[0].texture = g_vnc_inband_destination;
+    renderPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> encoder =
+        [commandBuffer renderCommandEncoderWithDescriptor:renderPass];
+    if (!encoder) {
+        fprintf(stderr,
+            "#### VNC-INBAND reject source=%p producer=%p read=%p "
+            "reason=encoder\n", (void *)source, (void *)producer,
+            (void *)commandBuffer);
+        macws_vnc_clear_inband_busy();
+        return nil;
+    }
+    encoder.label = @"MACWS in-band PF550 conversion";
+    [encoder setRenderPipelineState:pipeline];
+    [encoder setFragmentTexture:source atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                vertexStart:0 vertexCount:4];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    if (destinationOut)
+        *destinationOut = macws_vnc_retain(g_vnc_inband_destination);
+    uint64_t encoded = atomic_fetch_add(&g_vnc_inband_encoded_count, 1) + 1;
+    if (encoded <= 16 || (encoded % 600) == 0) {
+        fprintf(stderr,
+            "#### VNC-INBAND ordered #%llu source=%p producer=%p read=%p "
+            "queue=%p %zux%zu skipped=%llu\n",
+            (unsigned long long)encoded, (void *)source, (void *)producer,
+            (void *)commandBuffer, (void *)commandQueue, width, height,
+            (unsigned long long)atomic_load(&g_vnc_inband_skipped_count));
+    }
+    return macws_vnc_retain(commandBuffer);
+}
+
+static BOOL macws_vnc_publish_inband_destination(id<MTLTexture> destination) {
+    if (!destination || [destination pixelFormat] != MTLPixelFormatBGRA8Unorm)
+        return NO;
+    size_t width = [destination width], height = [destination height];
+    void *implementation =
+        *(void **)((char *)(__bridge void *)destination + 0x208);
+    IOSurfaceRef surface = (uintptr_t)implementation > 0x1000
+        ? *(IOSurfaceRef *)((char *)implementation + 0xa0) : NULL;
+    void *cpuMapping = (uintptr_t)implementation > 0x1000
+        ? *(void **)((char *)implementation + 0x130) : NULL;
+    if (!surface || !cpuMapping ||
+        IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+        return NO;
+    }
+    void *base = IOSurfaceGetBaseAddress(surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    size_t surfaceHeight = IOSurfaceGetHeight(surface);
+    BOOL readable = base && bytesPerRow >= width * 4 &&
+        surfaceHeight >= height;
+    size_t sampled = 0, rgbNonzero = 0, different = 0;
+    uint32_t first = 0;
+    BOOL haveFirst = NO;
+    if (readable) {
+        for (size_t y = 0; y < height; y += 16) {
+            const uint32_t *row = (const uint32_t *)
+                ((const char *)base + y * bytesPerRow);
+            for (size_t x = 0; x < width; x += 16) {
+                uint32_t pixel = row[x];
+                sampled++;
+                if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
+                if (!haveFirst) { first = pixel; haveFirst = YES; }
+                else if (pixel != first) different++;
+            }
+        }
+        // The AGX recovery image is a spatially constant error colour. A
+        // completed command buffer is therefore necessary but not sufficient:
+        // never let that diagnostic colour overwrite the last real desktop.
+        // A valid blank macOS desktop still has a non-uniform menu bar/cursor.
+        if (different >= 4) {
+            void *shared = macws_vnc_mmap_data(width, height);
+            if (shared) {
+                for (size_t y = 0; y < height; y++) {
+                    memcpy((char *)shared + y * width * 4,
+                           (const char *)base + y * bytesPerRow, width * 4);
+                }
+            } else {
+                readable = NO;
+            }
+        } else {
+            readable = NO;
+        }
+    }
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    if (!readable) {
+        static _Atomic uint64_t rejected = 0;
+        uint64_t sequence = atomic_fetch_add(&rejected, 1) + 1;
+        if (sequence <= 16 || (sequence % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-INBAND reject-output #%llu dst=%p rgb=%zu/%zu "
+                "different=%zu\n",
+                (unsigned long long)sequence, (void *)destination,
+                rgbNonzero, sampled, different);
+        }
+        return NO;
+    }
+
+    uint64_t published =
+        atomic_fetch_add(&g_vnc_inband_published_count, 1) + 1;
+    if (published <= 32 || (published % 600) == 0) {
+        fprintf(stderr,
+            "#### VNC-INBAND published #%llu dst=%p %zux%zu "
+            "rgb=%zu/%zu different=%zu encoded=%llu skipped=%llu\n",
+            (unsigned long long)published, (void *)destination,
+            width, height, rgbNonzero, sampled, different,
+            (unsigned long long)atomic_load(&g_vnc_inband_encoded_count),
+            (unsigned long long)atomic_load(&g_vnc_inband_skipped_count));
+    }
+
+    uint64_t generation = macws_vnc_capture_generation();
+    BOOL contentVisible = sampled > 0 && rgbNonzero * 20 >= sampled;
+    if (generation && different >= 4 && contentVisible) {
+        if (macws_vnc_capture_generation() == generation)
+            (void)unlink("/tmp/macws_capture_final");
+        macws_vnc_ack_capture(generation);
+    }
+    return YES;
 }
 
 static BOOL macws_vnc_submit_read_pass(id<MTLCommandQueue> queue,
@@ -882,6 +1702,14 @@ static void macws_vnc_track_final(id<MTLTexture> tex, IOSurfaceRef surface) {
 // recently allocated display texture.
 static NSMutableDictionary *g_vnc_composite_stages = nil;
 static NSMutableDictionary *g_vnc_composite_pending = nil;
+static _Atomic uint64_t g_vnc_completed_display_count = 0;
+static _Atomic uint64_t g_vnc_pending_replace_count = 0;
+static _Atomic uint64_t g_vnc_finish_count = 0;
+static _Atomic uint64_t g_vnc_finish_without_texture_count = 0;
+static _Atomic uint64_t g_vnc_poll_accept_count = 0;
+static _Atomic uint64_t g_vnc_poll_drop_count = 0;
+static _Atomic uint64_t g_vnc_poll_clean_count = 0;
+static _Atomic uint64_t g_vnc_poll_error_count = 0;
 
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
     if (!macws_vnc_share_enabled() || !context || !texture) return;
@@ -944,8 +1772,24 @@ void macws_vnc_complete_composite(void *context) {
                                              &maxArea, candidateArea)) {}
         maxArea = atomic_load(&g_vnc_comp_max_area);
         if (candidateArea >= maxArea) {
+            BOOL replacedPending = NO;
             @synchronized(g_vnc_composite_stages) {
+                replacedPending = g_vnc_composite_pending[key] != nil;
                 g_vnc_composite_pending[key] = texture;
+            }
+            uint64_t completed =
+                atomic_fetch_add(&g_vnc_completed_display_count, 1) + 1;
+            uint64_t replaced = replacedPending
+                ? atomic_fetch_add(&g_vnc_pending_replace_count, 1) + 1
+                : atomic_load(&g_vnc_pending_replace_count);
+            if (completed <= 32 || (completed % 600) == 0) {
+                fprintf(stderr,
+                    "#### VNC-FLOW staged #%llu context=%p tex=%p "
+                    "%zux%zu pf=%lu replaced=%s replaceTotal=%llu\n",
+                    (unsigned long long)completed, context, (void *)texture,
+                    width, height, pixelFormat,
+                    replacedPending ? "YES" : "NO",
+                    (unsigned long long)replaced);
             }
         } else {
             static _Atomic unsigned int rejectedFinal = 0;
@@ -966,16 +1810,154 @@ void macws_vnc_complete_composite(void *context) {
 void macws_vnc_finish_update(void *context) {
     if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_pending)
         return;
+    uint64_t finish = atomic_fetch_add(&g_vnc_finish_count, 1) + 1;
     NSValue *key = [NSValue valueWithPointer:context];
     id<MTLTexture> texture = nil;
     @synchronized(g_vnc_composite_stages) {
         texture = macws_vnc_retain(g_vnc_composite_pending[key]);
         [g_vnc_composite_pending removeObjectForKey:key];
     }
-    if (!texture) return;
+    if (!texture) {
+        uint64_t missing =
+            atomic_fetch_add(&g_vnc_finish_without_texture_count, 1) + 1;
+        if (finish <= 32 || (finish % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-FLOW finish #%llu context=%p texture=NONE "
+                "missingTotal=%llu stagedTotal=%llu pollAccepted=%llu "
+                "pollDropped=%llu\n",
+                (unsigned long long)finish, context,
+                (unsigned long long)missing,
+                (unsigned long long)atomic_load(&g_vnc_completed_display_count),
+                (unsigned long long)atomic_load(&g_vnc_poll_accept_count),
+                (unsigned long long)atomic_load(&g_vnc_poll_drop_count));
+        }
+        return;
+    }
 
+    id<MTLCommandBuffer> commandBuffer = macws_vnc_retain(
+        *(id<MTLCommandBuffer> *)((char *)context + 0x68));
     unsigned long pixelFormat = (unsigned long)[texture pixelFormat];
-    BOOL deepCapture = access("/tmp/macws_capture_final", F_OK) == 0;
+
+    // Runtime-confirmed by the 2026-07-27 PF550 A/B run: the legacy
+    // macws_vnc_capture_final path submits its shader read on a second Metal
+    // queue. WindowServer completed 4,200/4,200 producer submissions before
+    // one such read, then immediately accumulated 176 producer errors. A
+    // normal input event creates /tmp/macws_capture_final, so allowing that
+    // request to reach the legacy path makes an ordinary click capable of
+    // destabilising the compositor. Never use it implicitly. Keep the old
+    // implementation available only behind an explicitly named unsafe RE
+    // sentinel, and acknowledge/disarm normal requests without touching the
+    // compressed scanout. This is a safety fix, not a working PF550 streamer.
+    BOOL captureRequested =
+        access("/tmp/macws_capture_final", F_OK) == 0;
+    BOOL unsafePF550Capture = pixelFormat == 550 && captureRequested &&
+        access("/tmp/macws_allow_unsafe_pf550_capture", F_OK) == 0;
+    if (pixelFormat == 550 && captureRequested && !unsafePF550Capture) {
+        uint64_t generation = macws_vnc_capture_generation();
+        (void)unlink("/tmp/macws_capture_final");
+        if (generation != 0) macws_vnc_ack_capture(generation);
+        static _Atomic uint64_t suppressedPF550CaptureCount = 0;
+        uint64_t suppressed =
+            atomic_fetch_add(&suppressedPF550CaptureCount, 1) + 1;
+        if (suppressed <= 8 || (suppressed % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-FINAL suppressed unsafe cross-queue PF550 "
+                "capture #%llu generation=%llu\n",
+                (unsigned long long)suppressed,
+                (unsigned long long)generation);
+        }
+    }
+
+    // Once the ordered PF550 experiment has rejected a frame, do not let a
+    // later input request fall through to the already-disproved legacy path.
+    // Preserve the last validated mmap frame and leave the producer alone for
+    // the rest of this WindowServer lifetime.
+    if (pixelFormat == 550 && atomic_load(&g_vnc_inband_faulted)) {
+        macws_vnc_release(commandBuffer);
+        macws_vnc_release(texture);
+        return;
+    }
+    if (pixelFormat == 550 &&
+        access("/tmp/macws_inband_pf550", F_OK) == 0) {
+        id<MTLTexture> orderedDestination = nil;
+        id<MTLCommandBuffer> orderedRead =
+            macws_vnc_submit_pf550_ordered(texture, commandBuffer,
+                                           &orderedDestination);
+        // The read was synchronously enqueued on the producer's exact queue
+        // before this EndUpdate hook returns. Retaining the source until that
+        // read completes prevents SkyLight from destroying its wrapper early;
+        // queue ordering prevents the next producer from recycling it early.
+        macws_vnc_release(commandBuffer);
+        if (!orderedRead || !orderedDestination) {
+            macws_vnc_release(orderedRead);
+            macws_vnc_release(orderedDestination);
+            macws_vnc_release(texture);
+            return;
+        }
+        // Do not return through EndUpdate while the compressed source is still
+        // being read. Runtime showed IOMFB can recycle/remap that scanout as
+        // soon as this hook returns, even though the wrapper remains retained.
+        // A bounded poll here owns the protocol lifetime; the ordinary case is
+        // 1-10 ms. This is intentionally not an uptime-masking wait: any error,
+        // timeout, or constant recovery image permanently trips the diagnostic
+        // circuit breaker for this WindowServer lifetime.
+        MTLCommandBufferStatus status = [orderedRead status];
+        unsigned polls = 0;
+        while (status != MTLCommandBufferStatusCompleted &&
+               status != MTLCommandBufferStatusError && polls < 200) {
+            usleep(500);
+            status = [orderedRead status];
+            polls++;
+        }
+        NSError *error = status == MTLCommandBufferStatusError
+            ? [orderedRead error] : nil;
+        NSInteger errorCode = error ? [error code] : 0;
+        BOOL clean = status == MTLCommandBufferStatusCompleted && !error;
+        static _Atomic uint64_t orderedCompletionCount = 0;
+        uint64_t completed =
+            atomic_fetch_add(&orderedCompletionCount, 1) + 1;
+        if (completed <= 32 || (completed % 600) == 0 || !clean) {
+            fprintf(stderr,
+                "#### VNC-INBAND completion #%llu context=%p source=%p "
+                "dst=%p read=%p status=%ld polls=%u error=%p code=%ld\n",
+                (unsigned long long)completed, context, (void *)texture,
+                (void *)orderedDestination, (void *)orderedRead,
+                (long)status, polls, (void *)error, (long)errorCode);
+        }
+        macws_vnc_release(orderedRead);
+        macws_vnc_release(texture);
+        if (!clean) {
+            atomic_store(&g_vnc_inband_faulted, 1);
+            (void)unlink("/tmp/macws_inband_pf550");
+            fprintf(stderr,
+                "#### VNC-INBAND CIRCUIT-BREAKER status=%ld code=%ld "
+                "after=%llu (stream disabled; last valid mmap preserved)\n",
+                (long)status, (long)errorCode,
+                (unsigned long long)completed);
+            macws_vnc_release(orderedDestination);
+            macws_vnc_clear_inband_busy();
+            return;
+        }
+        [NSThread detachNewThreadWithBlock:^{
+            @autoreleasepool {
+                BOOL published = macws_vnc_publish_inband_destination(
+                    orderedDestination);
+                if (!published) {
+                    atomic_store(&g_vnc_inband_faulted, 1);
+                    (void)unlink("/tmp/macws_inband_pf550");
+                    fprintf(stderr,
+                        "#### VNC-INBAND CIRCUIT-BREAKER invalid output "
+                        "after=%llu (stream disabled; last valid mmap preserved)\n",
+                        (unsigned long long)completed);
+                }
+                macws_vnc_release(orderedDestination);
+                macws_vnc_clear_inband_busy();
+            }
+        }];
+        return;
+    }
+
+    BOOL deepCapture = unsafePF550Capture;
 
     // The ordinary VNC bridge consumes the completed, uncompressed PF80/115
     // composite and never needs physical-display scanout.  PF550 remains an
@@ -983,14 +1965,21 @@ void macws_vnc_finish_update(void *context) {
     // or wait on compressed IOMFB page surfaces.  Runtime A/B on 2026-07-25
     // captured the complete blurred GlassDemo from PF80 with no VNC-FINAL
     // capture and a stable ~65 MiB type-82 footprint.
-    BOOL observeCurrent = deepCapture || pixelFormat == 80 || pixelFormat == 115;
+    // Diagnostic only: /tmp/macws_observe_pf550 observes every completed
+    // display-sized PF550 submission without issuing a readback command.  It
+    // distinguishes a broken WindowServer submission from interference caused
+    // by the one-shot PF550 shader capture itself.  Production still observes
+    // PF550 only while an explicit capture generation is armed.
+    BOOL observePF550 = pixelFormat == 550 &&
+        access("/tmp/macws_observe_pf550", F_OK) == 0;
+    BOOL observeCurrent = deepCapture || observePF550 ||
+        pixelFormat == 80 || pixelFormat == 115;
     if (!observeCurrent) {
+        macws_vnc_release(commandBuffer);
         macws_vnc_release(texture);
         return;
     }
 
-    id<MTLCommandBuffer> commandBuffer = macws_vnc_retain(
-        *(id<MTLCommandBuffer> *)((char *)context + 0x68));
     if (!commandBuffer || ![commandBuffer respondsToSelector:@selector(status)]) {
         static int missingLog = 0;
         if (missingLog++ < 4) {
@@ -1016,9 +2005,30 @@ void macws_vnc_finish_update(void *context) {
     // session would otherwise enter its IOMFB PF550 capture cycle.
     static _Atomic int pollInFlight = 0;
     if (atomic_exchange(&pollInFlight, 1)) {
+        uint64_t dropped = atomic_fetch_add(&g_vnc_poll_drop_count, 1) + 1;
+        if (dropped <= 32 || (dropped % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-FLOW poll-drop #%llu finish=%llu context=%p "
+                "tex=%p pf=%lu accepted=%llu\n",
+                (unsigned long long)dropped, (unsigned long long)finish,
+                context, (void *)texture, pixelFormat,
+                (unsigned long long)atomic_load(&g_vnc_poll_accept_count));
+        }
         macws_vnc_release(commandBuffer);
         macws_vnc_release(texture);
         return;
+    }
+    uint64_t accepted = atomic_fetch_add(&g_vnc_poll_accept_count, 1) + 1;
+    uint64_t submitSerial = macws_latest_agx_submit_serial(
+        (__bridge const void *)commandBuffer);
+    if (accepted <= 32 || (accepted % 600) == 0) {
+        fprintf(stderr,
+            "#### VNC-FLOW poll-accept #%llu finish=%llu context=%p "
+            "tex=%p pf=%lu submitSerial=%llu dropped=%llu\n",
+            (unsigned long long)accepted, (unsigned long long)finish,
+            context, (void *)texture, pixelFormat,
+            (unsigned long long)submitSerial,
+            (unsigned long long)atomic_load(&g_vnc_poll_drop_count));
     }
     [NSThread detachNewThreadWithBlock:^{
         @autoreleasepool {
@@ -1053,6 +2063,51 @@ void macws_vnc_finish_update(void *context) {
             }
             BOOL completedCleanly =
                 status == MTLCommandBufferStatusCompleted && !error;
+            if (completedPF == 550) {
+                macws_observe_pf550_metadata(texture, submitSerial,
+                                             completedCleanly);
+            }
+            if (completedCleanly && completedPF == 550 && submitSerial) {
+                macws_mark_agx_submit_serial_for_error_dump(submitSerial);
+            }
+            uint64_t cleanTotal = completedCleanly
+                ? atomic_fetch_add(&g_vnc_poll_clean_count, 1) + 1
+                : atomic_load(&g_vnc_poll_clean_count);
+            uint64_t errorTotal = !completedCleanly
+                ? atomic_fetch_add(&g_vnc_poll_error_count, 1) + 1
+                : atomic_load(&g_vnc_poll_error_count);
+            uint64_t observedTotal = cleanTotal + errorTotal;
+            if (observedTotal <= 32 || (observedTotal % 600) == 0) {
+                fprintf(stderr,
+                    "#### VNC-FLOW poll-result observed=%llu clean=%llu "
+                    "error=%llu pf=%lu submitSerial=%llu status=%ld "
+                    "code=%ld polls=%u\n",
+                    (unsigned long long)observedTotal,
+                    (unsigned long long)cleanTotal,
+                    (unsigned long long)errorTotal, completedPF,
+                    (unsigned long long)submitSerial,
+                    (long)status, (long)errorCode, polls);
+            }
+            if (!completedCleanly && error && errorTotal <= 4) {
+                macws_log_failed_texture_descriptor(
+                    texture, (__bridge const void *)commandBuffer,
+                    submitSerial);
+                NSString *errorDescription = [error description];
+                NSDictionary *errorUserInfo = [error userInfo];
+                fprintf(stderr,
+                    "#### VNC-FLOW command-error #%llu description=%s "
+                    "userInfo=%s\n",
+                    (unsigned long long)errorTotal,
+                    [errorDescription UTF8String] ?: "(nil)",
+                    [[errorUserInfo description] UTF8String] ?: "(nil)");
+                if (errorTotal == 1)
+                    macws_log_command_buffer_ivars(commandBuffer);
+                if (errorTotal == 1)
+                    macws_dump_recent_agx_submit_serial(
+                        "first-Metal-command-buffer-error",
+                        (__bridge const void *)commandBuffer,
+                        submitSerial);
+            }
             // TEMPORARY DIAGNOSTIC, not a compositor fix.  A failed source is
             // never eligible for the normal capture path: runtime input logs
             // showed failed PF550 buffers replacing several clean buffers and
@@ -1079,7 +2134,14 @@ void macws_vnc_finish_update(void *context) {
                     }
                 } else if (completedCleanly &&
                            (completedPF == 80 || completedPF == 115)) {
-                    macws_vnc_on_composite(texture);
+                    // Process-owned scanouts are already linear and this is
+                    // the producer-completion boundary. Publish them by CPU
+                    // copy here. The helper returns YES for every owned
+                    // target, including an invalid/blank one, so no rejected
+                    // owned frame can fall through to the unsafe legacy GPU
+                    // blit on another queue.
+                    if (!macws_vnc_publish_owned_texture(texture))
+                        macws_vnc_on_composite(texture);
                 }
             }
             macws_vnc_release(commandBuffer);
@@ -1306,6 +2368,339 @@ static bool macws_find_texture_descriptor(void *impl, size_t width,
         return true;
     }
     return false;
+}
+
+// Diagnostic-only PF550 compression metadata witness.  The GPU mapping and
+// IOSurface property recovery have already been established upstream by the
+// real AGX initializer; this code never modifies or retains either object.  It
+// copies a bounded sample only after Metal reports the producer command buffer
+// completed (or failed), then compares the first failure with the most recent
+// clean PF550 submission.  Enable with /tmp/macws_pf550_metadata_diag.
+typedef struct {
+    BOOL valid;
+    uint64_t submit_serial;
+    uint32_t surface_id;
+    uint32_t width;
+    uint32_t height;
+    uint64_t alloc_size;
+    uintptr_t cpu_mapping;
+    uint64_t gpu_mapping;
+    uint64_t descriptor_address;
+    uint64_t acceleration_address;
+    uint64_t acceleration_offset;
+    uint64_t plane_offset;
+    uint64_t plane_size;
+    uint64_t bytes_per_row;
+    uint64_t compression_type;
+    uint64_t width_in_tiles;
+    uint64_t height_in_tiles;
+    uint64_t bytes_per_tile_data;
+    uint64_t address_format;
+    uint64_t header_offset;
+    uint64_t header_span;
+    uint64_t acceleration_hash;
+    uint64_t header_hash;
+    uint32_t acceleration_nonzero;
+    uint32_t header_nonzero;
+    uint8_t acceleration_head[64];
+    uint8_t acceleration_tail[64];
+    uint8_t header_head[64];
+} macws_pf550_metadata_snapshot;
+
+static pthread_mutex_t g_macws_pf550_metadata_lock = PTHREAD_MUTEX_INITIALIZER;
+static macws_pf550_metadata_snapshot g_macws_pf550_last_clean_metadata;
+
+static uint64_t macws_pf550_dict_uint64(NSDictionary *dictionary,
+                                        NSString *short_key,
+                                        NSString *full_key) {
+    if (!dictionary) return 0;
+    id value = dictionary[short_key] ?: dictionary[full_key];
+    return [value respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [value unsignedLongLongValue] : 0;
+}
+
+static void macws_pf550_sample_region(const uint8_t *base, uint64_t alloc_size,
+                                      uint64_t offset, uint64_t span,
+                                      uint64_t *hash_out,
+                                      uint32_t *nonzero_out,
+                                      uint8_t head[64], uint8_t tail[64]) {
+    if (!base || offset >= alloc_size || span == 0) return;
+    uint64_t available = alloc_size - offset;
+    if (span > available) span = available;
+    size_t sampled = (size_t)(span > 4096 ? 4096 : span);
+    const uint8_t *source = base + offset;
+    uint64_t hash = 1469598103934665603ULL;
+    uint32_t nonzero = 0;
+    for (size_t i = 0; i < sampled; i++) {
+        uint8_t byte = source[i];
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+        if (byte) nonzero++;
+    }
+    size_t head_size = span < 64 ? (size_t)span : 64;
+    if (head && head_size) memcpy(head, source, head_size);
+    if (tail && head_size) memcpy(tail, source + span - head_size, head_size);
+    if (hash_out) *hash_out = hash;
+    if (nonzero_out) *nonzero_out = nonzero;
+}
+
+static macws_pf550_metadata_snapshot macws_pf550_capture_metadata(
+        id texture, uint64_t submit_serial) {
+    macws_pf550_metadata_snapshot snapshot = {0};
+    if (!texture) return snapshot;
+
+    NSUInteger width = 0, height = 0, pixel_format = 0;
+    IOSurfaceRef surface = NULL;
+    @try {
+        width = [texture respondsToSelector:@selector(width)]
+            ? (NSUInteger)[texture width] : 0;
+        height = [texture respondsToSelector:@selector(height)]
+            ? (NSUInteger)[texture height] : 0;
+        pixel_format = [texture respondsToSelector:@selector(pixelFormat)]
+            ? (NSUInteger)[texture pixelFormat] : 0;
+        if ([texture respondsToSelector:@selector(iosurface)])
+            surface = (IOSurfaceRef)[texture iosurface];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (!surface || pixel_format != 550) return snapshot;
+
+    ptrdiff_t impl_offset = 0x208;
+    Ivar ivar = class_getInstanceVariable([texture class], "_impl");
+    if (ivar) impl_offset = ivar_getOffset(ivar);
+    void *impl = *(void **)((char *)(__bridge void *)texture + impl_offset);
+    if (!impl) return snapshot;
+
+    macws_texture_descriptor_witness descriptor = {0};
+    if (!macws_find_texture_descriptor(impl, width, height, &descriptor))
+        return snapshot;
+
+    snapshot.submit_serial = submit_serial;
+    snapshot.surface_id = IOSurfaceGetID(surface);
+    snapshot.width = (uint32_t)width;
+    snapshot.height = (uint32_t)height;
+    snapshot.alloc_size = IOSurfaceGetAllocSize(surface);
+    snapshot.cpu_mapping =
+        (uintptr_t)*(void * volatile *)((char *)impl + 0x130);
+    snapshot.gpu_mapping =
+        *(const volatile uint64_t *)((const char *)impl + 0x40);
+    snapshot.descriptor_address = descriptor.address;
+    snapshot.acceleration_address = descriptor.acceleration_low36;
+    if (descriptor.acceleration_low36 >= descriptor.address) {
+        snapshot.acceleration_offset =
+            descriptor.acceleration_low36 - descriptor.address;
+    }
+
+    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    if (copied) {
+        @try {
+            NSDictionary *root = (__bridge NSDictionary *)copied;
+            id creation_value = root[@"CreationProperties"];
+            NSDictionary *creation =
+                [creation_value isKindOfClass:[NSDictionary class]]
+                    ? (NSDictionary *)creation_value : root;
+            id plane_info_value = creation[@"IOSurfacePlaneInfo"];
+            if ([plane_info_value isKindOfClass:[NSArray class]] &&
+                [(NSArray *)plane_info_value count] != 0) {
+                id plane_value = [(NSArray *)plane_info_value objectAtIndex:0];
+                if ([plane_value isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *plane = (NSDictionary *)plane_value;
+                    snapshot.plane_offset = macws_pf550_dict_uint64(
+                        plane, @"Offset", @"IOSurfacePlaneOffset");
+                    snapshot.plane_size = macws_pf550_dict_uint64(
+                        plane, @"Size", @"IOSurfacePlaneSize");
+                    snapshot.bytes_per_row = macws_pf550_dict_uint64(
+                        plane, @"BytesPerRow", @"IOSurfacePlaneBytesPerRow");
+                    snapshot.compression_type = macws_pf550_dict_uint64(
+                        plane, @"CompressionType",
+                        @"IOSurfacePlaneCompressionType");
+                    snapshot.width_in_tiles = macws_pf550_dict_uint64(
+                        plane, @"WidthInCompressedTiles",
+                        @"IOSurfacePlaneWidthInCompressedTiles");
+                    snapshot.height_in_tiles = macws_pf550_dict_uint64(
+                        plane, @"HeightInCompressedTiles",
+                        @"IOSurfacePlaneHeightInCompressedTiles");
+                    snapshot.bytes_per_tile_data = macws_pf550_dict_uint64(
+                        plane, @"BytesPerTileData",
+                        @"IOSurfacePlaneBytesPerTileData");
+                    snapshot.address_format = macws_pf550_dict_uint64(
+                        plane, @"AddressFormat",
+                        @"IOSurfaceAddressFormat");
+                    snapshot.header_offset = macws_pf550_dict_uint64(
+                        plane, @"CompressedTileHeaderRegionOffset",
+                        @"IOSurfacePlaneCompressedTileHeaderRegionOffset");
+                    uint64_t plane_end = snapshot.plane_offset +
+                        snapshot.plane_size;
+                    if (plane_end >= snapshot.plane_offset &&
+                        snapshot.header_offset >= snapshot.plane_offset &&
+                        snapshot.header_offset < plane_end) {
+                        snapshot.header_span =
+                            plane_end - snapshot.header_offset;
+                    }
+                }
+            }
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        CFRelease(copied);
+    }
+
+    const uint8_t *cpu = (const uint8_t *)snapshot.cpu_mapping;
+    macws_pf550_sample_region(cpu, snapshot.alloc_size,
+        snapshot.acceleration_offset,
+        snapshot.header_span ? snapshot.header_span : 4096,
+        &snapshot.acceleration_hash, &snapshot.acceleration_nonzero,
+        snapshot.acceleration_head, snapshot.acceleration_tail);
+    macws_pf550_sample_region(cpu, snapshot.alloc_size,
+        snapshot.header_offset,
+        snapshot.header_span ? snapshot.header_span : 4096,
+        &snapshot.header_hash, &snapshot.header_nonzero,
+        snapshot.header_head, NULL);
+    snapshot.valid = snapshot.cpu_mapping != 0 && snapshot.alloc_size != 0;
+    return snapshot;
+}
+
+static void macws_pf550_hex64(const uint8_t bytes[64], char output[129]) {
+    for (size_t i = 0; i < 64; i++)
+        snprintf(output + i * 2, 3, "%02x", bytes[i]);
+}
+
+static void macws_pf550_log_metadata(const char *role,
+                                     const macws_pf550_metadata_snapshot *s) {
+    if (!s || !s->valid) {
+        fprintf(stderr, "#### PF550-META role=%s valid=0\n", role);
+        return;
+    }
+    char acceleration_head[129], acceleration_tail[129], header_head[129];
+    macws_pf550_hex64(s->acceleration_head, acceleration_head);
+    macws_pf550_hex64(s->acceleration_tail, acceleration_tail);
+    macws_pf550_hex64(s->header_head, header_head);
+    fprintf(stderr,
+        "#### PF550-META role=%s serial=%llu surface=%u %ux%u alloc=%#llx "
+        "cpu=%#llx gpu=%#llx address=%#llx acceleration=%#llx "
+        "accelerationOffset=%#llx planeOffset=%#llx planeSize=%#llx "
+        "headerOffset=%#llx headerSpan=%#llx bpr=%#llx compression=%#llx "
+        "tiles=%llux%llu bytesPerTile=%#llx addressFormat=%#llx\n",
+        role, (unsigned long long)s->submit_serial, s->surface_id,
+        s->width, s->height, (unsigned long long)s->alloc_size,
+        (unsigned long long)s->cpu_mapping,
+        (unsigned long long)s->gpu_mapping,
+        (unsigned long long)s->descriptor_address,
+        (unsigned long long)s->acceleration_address,
+        (unsigned long long)s->acceleration_offset,
+        (unsigned long long)s->plane_offset,
+        (unsigned long long)s->plane_size,
+        (unsigned long long)s->header_offset,
+        (unsigned long long)s->header_span,
+        (unsigned long long)s->bytes_per_row,
+        (unsigned long long)s->compression_type,
+        (unsigned long long)s->width_in_tiles,
+        (unsigned long long)s->height_in_tiles,
+        (unsigned long long)s->bytes_per_tile_data,
+        (unsigned long long)s->address_format);
+    fprintf(stderr,
+        "#### PF550-META-BYTES role=%s accelerationHash=%#llx "
+        "accelerationNZ4K=%u headerHash=%#llx headerNZ4K=%u "
+        "accelerationHead=%s accelerationTail=%s headerHead=%s\n",
+        role, (unsigned long long)s->acceleration_hash,
+        s->acceleration_nonzero, (unsigned long long)s->header_hash,
+        s->header_nonzero, acceleration_head, acceleration_tail, header_head);
+}
+
+static void macws_observe_pf550_metadata(id texture, uint64_t submit_serial,
+                                         BOOL completed_cleanly) {
+    if (!texture || access("/tmp/macws_pf550_metadata_diag", F_OK) != 0)
+        return;
+    macws_pf550_metadata_snapshot current =
+        macws_pf550_capture_metadata(texture, submit_serial);
+    if (!current.valid) return;
+    if (completed_cleanly) {
+        static _Atomic uint64_t clean_count = 0;
+        uint64_t count = atomic_fetch_add(&clean_count, 1) + 1;
+        pthread_mutex_lock(&g_macws_pf550_metadata_lock);
+        g_macws_pf550_last_clean_metadata = current;
+        pthread_mutex_unlock(&g_macws_pf550_metadata_lock);
+        if (count == 1) macws_pf550_log_metadata("first-clean", &current);
+        return;
+    }
+
+    macws_pf550_metadata_snapshot previous = {0};
+    pthread_mutex_lock(&g_macws_pf550_metadata_lock);
+    previous = g_macws_pf550_last_clean_metadata;
+    pthread_mutex_unlock(&g_macws_pf550_metadata_lock);
+    macws_pf550_log_metadata("last-clean", &previous);
+    macws_pf550_log_metadata("error", &current);
+    fprintf(stderr,
+        "#### PF550-META-COMPARE cleanSerial=%llu errorSerial=%llu "
+        "sameGeometry=%d sameLayout=%d sameAccelerationOffset=%d "
+        "samePropertyHeaderOffset=%d sameAccelerationSample=%d "
+        "sameHeaderSample=%d\n",
+        (unsigned long long)previous.submit_serial,
+        (unsigned long long)current.submit_serial,
+        previous.width == current.width && previous.height == current.height,
+        previous.plane_offset == current.plane_offset &&
+            previous.plane_size == current.plane_size &&
+            previous.header_span == current.header_span,
+        previous.acceleration_offset == current.acceleration_offset,
+        previous.header_offset == current.header_offset,
+        previous.acceleration_hash == current.acceleration_hash &&
+            previous.acceleration_nonzero == current.acceleration_nonzero,
+        previous.header_hash == current.header_hash &&
+            previous.header_nonzero == current.header_nonzero);
+}
+
+// Read-only snapshot at the exact command-buffer error observation boundary.
+// Unlike the creation-time PF550 witness, this records the descriptor after
+// all updateBindData/metadata initialization has run and correlates it with the
+// submission serial captured before the background status poll began.
+static void macws_log_failed_texture_descriptor(
+        id texture, const void *command_buffer, uint64_t submit_serial) {
+    if (!texture) return;
+    NSUInteger width = 0, height = 0, pixel_format = 0;
+    IOSurfaceRef surface = NULL;
+    @try {
+        width = [texture respondsToSelector:@selector(width)]
+            ? (NSUInteger)[texture width] : 0;
+        height = [texture respondsToSelector:@selector(height)]
+            ? (NSUInteger)[texture height] : 0;
+        pixel_format = [texture respondsToSelector:@selector(pixelFormat)]
+            ? (NSUInteger)[texture pixelFormat] : 0;
+        if ([texture respondsToSelector:@selector(iosurface)])
+            surface = (IOSurfaceRef)[texture iosurface];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    ptrdiff_t impl_offset = 0x208;
+    Ivar ivar = class_getInstanceVariable([texture class], "_impl");
+    if (ivar) impl_offset = ivar_getOffset(ivar);
+    void *impl = *(void **)((char *)(__bridge void *)texture + impl_offset);
+    macws_texture_descriptor_witness descriptor = {0};
+    BOOL found = impl && macws_find_texture_descriptor(
+        impl, width, height, &descriptor);
+    char hex[sizeof(descriptor.bytes) * 2 + 1];
+    for (size_t i = 0; i < sizeof(descriptor.bytes); i++)
+        snprintf(hex + i * 2, 3, "%02x", descriptor.bytes[i]);
+    fprintf(stderr,
+        "#### VNC-FAULT-TEX commandBuffer=%p submitSerial=%llu tex=%p "
+        "class=%s impl=%p implOff=%#tx %lux%lu pf=%lu surface=%u "
+        "cpu130=%p gpu40=%#llx found=%d descOff=%#tx layout=%u "
+        "compressed=%u extended=%u address=%#llx "
+        "accelerationLow36=%#llx accelerationRaw=%#llx bytes=%s\n",
+        command_buffer, (unsigned long long)submit_serial,
+        (__bridge void *)texture, class_getName([texture class]), impl,
+        impl_offset, (unsigned long)width, (unsigned long)height,
+        (unsigned long)pixel_format,
+        surface ? IOSurfaceGetID(surface) : 0,
+        impl ? *(void **)((char *)impl + 0x130) : NULL,
+        (unsigned long long)(impl
+            ? *(const volatile uint64_t *)((const char *)impl + 0x40) : 0),
+        found, found ? descriptor.offset : (ptrdiff_t)-1,
+        found ? descriptor.layout : 0,
+        found ? descriptor.compressed : 0,
+        found ? descriptor.extended : 0,
+        (unsigned long long)(found ? descriptor.address : 0),
+        (unsigned long long)(found ? descriptor.acceleration_low36 : 0),
+        (unsigned long long)(found ? descriptor.acceleration_raw : 0), hex);
 }
 
 // Read-only audit of the AGX texture mapping established by Apple's real
@@ -2220,6 +3615,78 @@ static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
     0
 };
 
+// Coexistence does not present the macOS frame to DCP: SwapEnd is paired with
+// SwapCancel so iPadOS keeps ownership of the panel.  Rendering the virtual
+// desktop into DCP's compressed '&b38' page anyway leaves VNC with a resource
+// that cannot be read safely after the page is recycled.  The gated owned-
+// scanout experiment substitutes one ordinary BGRA IOSurface for each IOMFB
+// page at texture-wrap time.  It preserves QuartzCore's real page/swap state
+// (the original IOSurface is still returned by currentSurface and cancelled),
+// but makes the Metal render destination process-owned and CPU-readable.
+//
+// This is diagnostic until the full render/present lifecycle and memory bound
+// are runtime-proven.  It does not bypass a validation check: Apple's native
+// AGX initializer must successfully construct the replacement texture.
+static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
+                                                      size_t width,
+                                                      size_t height) {
+    if (!original || width < 1000 || height < 600 ||
+        access("/tmp/macws_owned_scanout", F_OK) != 0) {
+        return NULL;
+    }
+    uint32_t format = IOSurfaceGetPixelFormat(original);
+    if ((format & 0xff000000u) != 0x26000000u) return NULL;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_macws_owned_scanout_lock = [NSObject new];
+        g_macws_owned_scanout_cache = [NSMutableDictionary new];
+        g_macws_owned_scanout_surfaces = [NSMutableSet new];
+    });
+    uint32_t originalID = IOSurfaceGetID(original);
+    NSNumber *key = [NSNumber numberWithUnsignedInt:originalID];
+    @synchronized(g_macws_owned_scanout_lock) {
+        IOSurfaceRef existing = (IOSurfaceRef)
+            [g_macws_owned_scanout_cache[key] pointerValue];
+        if (existing) return existing;
+
+        NSDictionary *properties = @{
+            @"IOSurfaceWidth": @(width),
+            @"IOSurfaceHeight": @(height),
+            @"IOSurfaceBytesPerElement": @4,
+            @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+            // This target is consumed by WindowServer itself and copied to the
+            // VNC mmap in the same process; it never needs a global IOSurface
+            // namespace entry.  The project's established AGX scratch-surface
+            // path uses the same non-global/default-cache policy because
+            // global/display-like surfaces can enter DCP bookkeeping even
+            // though coexist mode cancels the physical swap.
+            @"IOSurfaceIsGlobal": @NO,
+            @"IOSurfaceCacheMode": @0,
+        };
+        IOSurfaceRef owned = IOSurfaceCreate(
+            (__bridge CFDictionaryRef)properties);
+        if (!owned) {
+            fprintf(stderr,
+                "#### VNC-OWNED IOSurfaceCreate FAILED original=%p "
+                "%zux%zu format=%#x\n",
+                (void *)original, width, height, format);
+            return NULL;
+        }
+        NSValue *ownedValue = [NSValue valueWithPointer:(void *)owned];
+        g_macws_owned_scanout_cache[key] = ownedValue;
+        [g_macws_owned_scanout_surfaces addObject:ownedValue];
+        fprintf(stderr,
+            "#### VNC-OWNED allocated original=%p id=%u -> owned=%p "
+            "id=%u %zux%zu bpr=%zu alloc=%zu cache=%lu\n",
+            (void *)original, (unsigned)originalID,
+            (void *)owned, (unsigned)IOSurfaceGetID(owned), width, height,
+            IOSurfaceGetBytesPerRow(owned), IOSurfaceGetAllocSize(owned),
+            (unsigned long)[g_macws_owned_scanout_cache count]);
+        return owned;
+    }
+}
+
 // SIGABRT survival scope. MTLSimDriver's sendXPCMessageWithReplySync.cold.1
 // calls abort() on any XPC reply error — there is NO return path. We install a
 // thread-local SIGABRT handler around the %orig call so abort()-via-pthread_kill
@@ -2310,6 +3777,7 @@ static void macws_sigabrt_trampoline(int sig) {
     }
 
     id<MTLTexture> result = nil;
+    IOSurfaceRef auditSurface = iosurface;
     struct sigaction old_sa, new_sa;
     memset(&new_sa, 0, sizeof(new_sa));
     new_sa.sa_handler = macws_sigabrt_trampoline;
@@ -2318,7 +3786,41 @@ static void macws_sigabrt_trampoline(int sig) {
     sigaction(SIGABRT, &new_sa, &old_sa);
     macws_in_protected = 1;
     if (sigsetjmp(macws_abort_env, 1) == 0) {
-        result = [self hooked_newTextureWithDescriptor:desc iosurface:iosurface plane:plane];
+        IOSurfaceRef owned = desc && iosurface
+            ? macws_owned_scanout_for_original(iosurface, desc.width,
+                                                desc.height)
+            : NULL;
+        if (owned) {
+            auditSurface = owned;
+            MTLPixelFormat originalFormat = desc.pixelFormat;
+            uint32_t originalCurrentID = macws_get_current_iosurface_id();
+            uint64_t originalCompressionSpan =
+                macws_get_current_iosurface_compression_header_span();
+            desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
+            macws_set_current_iosurface_id(IOSurfaceGetID(owned));
+            macws_set_current_iosurface_compression_header_span(0);
+            result = [self hooked_newTextureWithDescriptor:desc
+                                                  iosurface:owned plane:0];
+            macws_set_current_iosurface_id(originalCurrentID);
+            macws_set_current_iosurface_compression_header_span(
+                originalCompressionSpan);
+            desc.pixelFormat = originalFormat;
+            static _Atomic uint64_t ownedWrapCount = 0;
+            uint64_t wrapped = atomic_fetch_add(&ownedWrapCount, 1) + 1;
+            if (wrapped <= 24 || (wrapped % 600) == 0 || !result) {
+                fprintf(stderr,
+                    "#### VNC-OWNED wrap #%llu original=%p id=%u "
+                    "owned=%p id=%u texture=%p result=%s\n",
+                    (unsigned long long)wrapped, (void *)iosurface,
+                    (unsigned)IOSurfaceGetID(iosurface), (void *)owned,
+                    (unsigned)IOSurfaceGetID(owned), (void *)result,
+                    result ? "OK" : "NIL");
+            }
+        } else {
+            result = [self hooked_newTextureWithDescriptor:desc
+                                                  iosurface:iosurface
+                                                      plane:plane];
+        }
     } else {
         fprintf(stderr, "#### MTL_TEX/iosurf CAUGHT SIGABRT (XPC reply error) "
             "— recovered, will fall back (w=%lu h=%lu pf=%lu ios=%p)\n",
@@ -2462,7 +3964,7 @@ static void macws_sigabrt_trampoline(int sig) {
     // Verify the real initializer established its IOSurface and CPU/GPU
     // mappings.  This is read-only; field ownership stays inside AGX.
     if (result && iosurface) {
-        macws_audit_iosurface_texture_mapping(result, iosurface);
+        macws_audit_iosurface_texture_mapping(result, auditSurface);
         macws_diag_pf550_texture_descriptor(result, desc, iosurface, self);
     }
     // 2026-06-20 — VNC read-path test on the IOSURFACE VARIANT.  Filling
@@ -3849,10 +5351,325 @@ static void macws_install_pipeline_fallback(Class agx) {
 }
 #endif // 0 — disabled shader-substitution fallback
 
+// Read-only tile/blur descriptor witness. Runtime method-map evidence from the
+// actual macOS 13.4 AGXMetal13_3 image (UUID
+// 727C250E-554D-3921-A5B3-48DAE6195B79) anchors the observed entry points:
+//
+//   AGXG13GFamilyCommandBuffer::renderCommandEncoderWithDescriptor: +0x23008c
+//   AGXG13GFamilyRenderContext::setTileTexture:atIndex:              +0x3025a8
+//   AGXG13GFamilyRenderContext::setTileTextures:withRange:           +0x302294
+//
+// The diagnostic is armed only by /private/tmp/macws_tile_descriptor_diag.
+// It copies metadata into a fixed ring and calls every original IMP with the
+// original arguments. It does not retain textures, mutate descriptors, or
+// substitute any protocol result.
+typedef struct {
+    uintptr_t texture;
+    uintptr_t impl;
+    uint64_t gpu_mapping;
+    uint64_t address;
+    uint64_t acceleration_raw;
+    uint64_t acceleration_low36;
+    uint32_t width;
+    uint32_t height;
+    uint32_t pixel_format;
+    uint32_t surface_id;
+    int32_t descriptor_offset;
+    uint8_t layout;
+    uint8_t compressed;
+    uint8_t extended;
+    uint8_t found;
+    uint8_t descriptor_bytes[24];
+} macws_tile_texture_snapshot;
+
+typedef struct {
+    uint64_t serial;
+    uintptr_t encoder;
+    uintptr_t command_buffer;
+    macws_tile_texture_snapshot target;
+} macws_tile_target_entry;
+
+#define MACWS_TILE_TARGET_CAP 512u
+static macws_tile_target_entry g_macws_tile_targets[MACWS_TILE_TARGET_CAP];
+static pthread_mutex_t g_macws_tile_target_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic uint64_t g_macws_tile_target_serial = 0;
+static _Atomic uint32_t g_macws_tile_binding_sequence = 0;
+static _Atomic uintptr_t g_macws_tile_observed_command_buffers[32];
+static _Atomic uint64_t g_macws_tile_observer_serial = 0;
+
+typedef id (*macws_native_render_encoder_fn)(id, SEL, id);
+typedef void (*macws_native_set_tile_texture_fn)(id, SEL, id, NSUInteger);
+typedef void (*macws_native_set_tile_textures_fn)(id, SEL, const id *, NSRange);
+static macws_native_render_encoder_fn g_macws_native_render_encoder_orig = NULL;
+static macws_native_set_tile_texture_fn g_macws_native_set_tile_texture_orig = NULL;
+static macws_native_set_tile_textures_fn g_macws_native_set_tile_textures_orig = NULL;
+
+static macws_tile_texture_snapshot macws_tile_snapshot_texture(id texture) {
+    macws_tile_texture_snapshot snapshot = {0};
+    snapshot.texture = (uintptr_t)(__bridge void *)texture;
+    snapshot.descriptor_offset = -1;
+    if (!texture) return snapshot;
+
+    NSUInteger width = 0, height = 0, pixel_format = 0;
+    IOSurfaceRef surface = NULL;
+    @try {
+        width = [texture respondsToSelector:@selector(width)]
+            ? (NSUInteger)[texture width] : 0;
+        height = [texture respondsToSelector:@selector(height)]
+            ? (NSUInteger)[texture height] : 0;
+        pixel_format = [texture respondsToSelector:@selector(pixelFormat)]
+            ? (NSUInteger)[texture pixelFormat] : 0;
+        if ([texture respondsToSelector:@selector(iosurface)]) {
+            surface = (IOSurfaceRef)[texture iosurface];
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    snapshot.width = (uint32_t)width;
+    snapshot.height = (uint32_t)height;
+    snapshot.pixel_format = (uint32_t)pixel_format;
+    snapshot.surface_id = surface ? IOSurfaceGetID(surface) : 0;
+
+    ptrdiff_t impl_offset = 0x208;
+    Ivar ivar = class_getInstanceVariable([texture class], "_impl");
+    if (ivar) impl_offset = ivar_getOffset(ivar);
+    void *impl = *(void **)((char *)(__bridge void *)texture + impl_offset);
+    snapshot.impl = (uintptr_t)impl;
+    if (!impl) return snapshot;
+    snapshot.gpu_mapping = *(const volatile uint64_t *)((const char *)impl + 0x40);
+
+    macws_texture_descriptor_witness descriptor = {0};
+    if (macws_find_texture_descriptor(impl, width, height, &descriptor)) {
+        snapshot.found = 1;
+        snapshot.descriptor_offset = (int32_t)descriptor.offset;
+        snapshot.address = descriptor.address;
+        snapshot.acceleration_raw = descriptor.acceleration_raw;
+        snapshot.acceleration_low36 = descriptor.acceleration_low36;
+        snapshot.layout = (uint8_t)descriptor.layout;
+        snapshot.compressed = (uint8_t)descriptor.compressed;
+        snapshot.extended = (uint8_t)descriptor.extended;
+        memcpy(snapshot.descriptor_bytes, descriptor.bytes,
+               sizeof(snapshot.descriptor_bytes));
+    }
+    return snapshot;
+}
+
+static void macws_tile_log_snapshot(uint32_t sequence, const char *role,
+                                    uintptr_t encoder, NSUInteger index,
+                                    macws_tile_texture_snapshot snapshot,
+                                    uint64_t target_serial,
+                                    uintptr_t command_buffer) {
+    char hex[sizeof(snapshot.descriptor_bytes) * 2 + 1];
+    for (size_t i = 0; i < sizeof(snapshot.descriptor_bytes); i++) {
+        snprintf(hex + i * 2, 3, "%02x", snapshot.descriptor_bytes[i]);
+    }
+    fprintf(stderr,
+        "#### TILE-DESC #%u role=%s encoder=%#llx index=%lu "
+        "targetSerial=%llu commandBuffer=%#llx tex=%#llx impl=%#llx "
+        "%ux%u pf=%u surface=%u "
+        "gpu40=%#llx found=%u descOff=%#x layout=%u compressed=%u "
+        "extended=%u address=%#llx accelerationLow36=%#llx "
+        "accelerationRaw=%#llx bytes=%s\n",
+        sequence, role, (unsigned long long)encoder, (unsigned long)index,
+        (unsigned long long)target_serial,
+        (unsigned long long)command_buffer,
+        (unsigned long long)snapshot.texture,
+        (unsigned long long)snapshot.impl,
+        snapshot.width, snapshot.height, snapshot.pixel_format,
+        snapshot.surface_id, (unsigned long long)snapshot.gpu_mapping,
+        snapshot.found, snapshot.descriptor_offset,
+        snapshot.layout, snapshot.compressed, snapshot.extended,
+        (unsigned long long)snapshot.address,
+        (unsigned long long)snapshot.acceleration_low36,
+        (unsigned long long)snapshot.acceleration_raw, hex);
+}
+
+static void macws_tile_store_target(id command_buffer, id encoder,
+                                    id pass_descriptor) {
+    if (!command_buffer || !encoder || !pass_descriptor) return;
+    id texture = nil;
+    @try {
+        id attachments = [pass_descriptor valueForKey:@"colorAttachments"];
+        id attachment = [attachments objectAtIndexedSubscript:0];
+        texture = [attachment valueForKey:@"texture"];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    if (!texture) return;
+
+    uint64_t serial = atomic_fetch_add(&g_macws_tile_target_serial, 1) + 1;
+    macws_tile_target_entry entry = {
+        .serial = serial,
+        .encoder = (uintptr_t)(__bridge void *)encoder,
+        .command_buffer = (uintptr_t)(__bridge void *)command_buffer,
+        .target = macws_tile_snapshot_texture(texture),
+    };
+    pthread_mutex_lock(&g_macws_tile_target_lock);
+    g_macws_tile_targets[serial % MACWS_TILE_TARGET_CAP] = entry;
+    pthread_mutex_unlock(&g_macws_tile_target_lock);
+}
+
+static BOOL macws_tile_find_target(uintptr_t encoder,
+                                   macws_tile_target_entry *result) {
+    if (!encoder || !result) return NO;
+    BOOL found = NO;
+    uint64_t best_serial = 0;
+    pthread_mutex_lock(&g_macws_tile_target_lock);
+    for (size_t i = 0; i < MACWS_TILE_TARGET_CAP; i++) {
+        macws_tile_target_entry entry = g_macws_tile_targets[i];
+        if (entry.encoder == encoder && entry.serial >= best_serial) {
+            *result = entry;
+            best_serial = entry.serial;
+            found = YES;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_tile_target_lock);
+    return found;
+}
+
+// Completion witness for the exact tile command buffer. Adding a handler is
+// diagnostic-only and is installed only under macws_tile_descriptor_diag. The
+// block captures no texture/encoder/command-buffer object; Metal supplies the
+// completed object as its argument. On error it triggers the existing bounded
+// flight dump immediately, before later PF550 work can reuse ObjC pointers.
+static void macws_tile_observe_command_buffer(uintptr_t command_buffer) {
+    if (!command_buffer) return;
+    for (size_t i = 0;
+         i < sizeof(g_macws_tile_observed_command_buffers) /
+             sizeof(g_macws_tile_observed_command_buffers[0]);
+         i++) {
+        if (atomic_load(&g_macws_tile_observed_command_buffers[i]) ==
+            command_buffer) {
+            return;
+        }
+    }
+    uint64_t serial = atomic_fetch_add(&g_macws_tile_observer_serial, 1) + 1;
+    atomic_store(&g_macws_tile_observed_command_buffers[
+        (serial - 1) % 32], command_buffer);
+
+    id<MTLCommandBuffer> object =
+        (__bridge id<MTLCommandBuffer>)((void *)command_buffer);
+    [object addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        NSError *error = [completed error];
+        fprintf(stderr,
+            "#### TILE-CB-COMPLETE observer=%llu commandBuffer=%p "
+            "status=%lu errorDomain=%s errorCode=%ld description=%s "
+            "userInfo=%s\n",
+            (unsigned long long)serial, (__bridge void *)completed,
+            (unsigned long)[completed status],
+            error ? [[error domain] UTF8String] : "(nil)",
+            error ? (long)[error code] : 0L,
+            error ? [[error localizedDescription] UTF8String] : "(nil)",
+            error ? [[[error userInfo] description] UTF8String] : "(nil)");
+        if (error) {
+            macws_dump_recent_agx_submits(
+                "tile-command-buffer-error", (__bridge const void *)completed);
+        }
+    }];
+    fprintf(stderr,
+        "#### TILE-CB observer installed #%llu commandBuffer=%#llx "
+        "(completion-only; captures no Metal objects)\n",
+        (unsigned long long)serial,
+        (unsigned long long)command_buffer);
+}
+
+static void macws_tile_record_binding(id encoder, id texture,
+                                      NSUInteger index) {
+    uint32_t sequence = atomic_fetch_add(&g_macws_tile_binding_sequence, 1) + 1;
+    if (sequence > 128) return;
+    uintptr_t encoder_pointer = (uintptr_t)(__bridge void *)encoder;
+    macws_tile_target_entry target = {0};
+    BOOL has_target = macws_tile_find_target(encoder_pointer, &target);
+    if (has_target) {
+        macws_mark_agx_submit_for_error_dump(
+            (const void *)target.command_buffer);
+        macws_tile_observe_command_buffer(target.command_buffer);
+        macws_tile_log_snapshot(sequence, "target", encoder_pointer, 0,
+                                target.target, target.serial,
+                                target.command_buffer);
+    } else {
+        fprintf(stderr,
+            "#### TILE-DESC #%u role=target encoder=%#llx NOT-MAPPED\n",
+            sequence, (unsigned long long)encoder_pointer);
+    }
+    macws_tile_log_snapshot(sequence, "source", encoder_pointer, index,
+                            macws_tile_snapshot_texture(texture),
+                            has_target ? target.serial : 0,
+                            has_target ? target.command_buffer : 0);
+}
+
+static id macws_native_render_encoder_diag(id self, SEL selector,
+                                           id descriptor) {
+    id encoder = g_macws_native_render_encoder_orig
+        ? g_macws_native_render_encoder_orig(self, selector, descriptor) : nil;
+    macws_tile_store_target(self, encoder, descriptor);
+    return encoder;
+}
+
+static void macws_native_set_tile_texture_diag(id self, SEL selector,
+                                               id texture,
+                                               NSUInteger index) {
+    macws_tile_record_binding(self, texture, index);
+    if (g_macws_native_set_tile_texture_orig) {
+        g_macws_native_set_tile_texture_orig(self, selector, texture, index);
+    }
+}
+
+static void macws_native_set_tile_textures_diag(id self, SEL selector,
+                                                const id *textures,
+                                                NSRange range) {
+    if (textures) {
+        for (NSUInteger i = 0; i < range.length; i++) {
+            macws_tile_record_binding(self, textures[i], range.location + i);
+        }
+    }
+    if (g_macws_native_set_tile_textures_orig) {
+        g_macws_native_set_tile_textures_orig(self, selector, textures, range);
+    }
+}
+
+static void macws_install_tile_descriptor_diagnostic(void) {
+    if (access("/private/tmp/macws_tile_descriptor_diag", F_OK) != 0) return;
+    Class command_buffer = objc_getClass("AGXG13GFamilyCommandBuffer");
+    Class render_context = objc_getClass("AGXG13GFamilyRenderContext");
+    SEL render_selector = sel_registerName("renderCommandEncoderWithDescriptor:");
+    SEL texture_selector = sel_registerName("setTileTexture:atIndex:");
+    SEL textures_selector = sel_registerName("setTileTextures:withRange:");
+    Method render_method = command_buffer
+        ? class_getInstanceMethod(command_buffer, render_selector) : NULL;
+    Method texture_method = render_context
+        ? class_getInstanceMethod(render_context, texture_selector) : NULL;
+    Method textures_method = render_context
+        ? class_getInstanceMethod(render_context, textures_selector) : NULL;
+    if (render_method) {
+        g_macws_native_render_encoder_orig =
+            (macws_native_render_encoder_fn)method_getImplementation(render_method);
+        method_setImplementation(render_method,
+                                 (IMP)macws_native_render_encoder_diag);
+    }
+    if (texture_method) {
+        g_macws_native_set_tile_texture_orig =
+            (macws_native_set_tile_texture_fn)method_getImplementation(texture_method);
+        method_setImplementation(texture_method,
+                                 (IMP)macws_native_set_tile_texture_diag);
+    }
+    if (textures_method) {
+        g_macws_native_set_tile_textures_orig =
+            (macws_native_set_tile_textures_fn)method_getImplementation(textures_method);
+        method_setImplementation(textures_method,
+                                 (IMP)macws_native_set_tile_textures_diag);
+    }
+    fprintf(stderr,
+        "#### TILE-DESC diagnostic installed render=%d texture=%d textures=%d "
+        "(read-only fixed ring; original IMPs preserved)\n",
+        render_method != NULL, texture_method != NULL, textures_method != NULL);
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
     install_cbri_probe();         // log commandBufferResourceInfo returns
+    macws_install_tile_descriptor_diagnostic();
     // (no pipeline fallback — see removed block above)
 
     SEL sel = @selector(initWithAcceleratorPort:);
@@ -4539,6 +6356,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         // for the black-tab fix — it DEADLOCKED chroot AppKit startup. Revisit via
         // a background queue load or hook on NSWindow display time.)
 
+        macws_install_iogpu_callback_diagnostics();
         install_nsxpcsharedlistener_swizzle();
 
         // A direct executable launch does not carry LaunchServices' normal

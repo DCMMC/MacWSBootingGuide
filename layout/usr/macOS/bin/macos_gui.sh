@@ -15,6 +15,7 @@
 #   --experimental        enable the current command/completion diagnostics
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
+#   --pace-us=N           diagnostic synthetic-completion pace (8333..100000)
 #
 # Why launchd jobs (and not just `OSXvnc &`):
 #   launchdchrootexec posix_spawn()s the target with POSIX_SPAWN_SETEXEC, so it
@@ -50,6 +51,9 @@ INPUT_LABEL=com.macwsguide.input
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
 EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
+EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
+EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
+EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
 EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
 EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 ARMED_CAPTURE_GENERATION=""
@@ -569,8 +573,9 @@ stop_all() {
     # the diagnostic sentinels itself.  Otherwise the next ordinary CLI start
     # silently inherits experimental protocol behavior.
     rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_CAPTURE" \
-        "$EXPERIMENTAL_CAPTURE_DONE"
+        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+        "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_CAPTURE" \
+        "$EXPERIMENTAL_CAPTURE_DONE" "$EXPERIMENTAL_PACE"
     log "Restoring iOS (SpringBoard / backboardd)..."
     launchctl load "$BACKBOARDD"  2>/dev/null
     launchctl load "$SPRINGBOARD" 2>/dev/null
@@ -607,7 +612,7 @@ usage() {
 macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
-  sudo bash $0 start [coexist|exclusive] [--experimental] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 start [coexist|exclusive] [--experimental] [--pace-us=N] [--no-terminal] [--no-vnc] [--no-watchdog]
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
@@ -637,11 +642,13 @@ WANT_VNC=1
 WANT_TERMINAL=1
 WANT_WATCHDOG=1
 WANT_EXPERIMENTAL=0
+COEXIST_PACE_US=""
 for a in "$@"; do
     case "$a" in
         coexist|coexistence|co)  MODE=coexist ;;
         exclusive|full|excl)     MODE=exclusive ;;
         --experimental)          WANT_EXPERIMENTAL=1 ;;
+        --pace-us=*)             COEXIST_PACE_US="${a#--pace-us=}" ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
         --no-vnc)                WANT_VNC=0 ;;
         --no-watchdog)           WANT_WATCHDOG=0 ;;
@@ -649,11 +656,36 @@ for a in "$@"; do
     esac
 done
 
+if [ -n "$COEXIST_PACE_US" ]; then
+    if [ "$WANT_EXPERIMENTAL" != 1 ]; then
+        echo "macos_gui.sh: --pace-us requires --experimental" >&2
+        exit 1
+    fi
+    case "$COEXIST_PACE_US" in
+        *[!0-9]*|'')
+            echo "macos_gui.sh: --pace-us must be an integer from 8333 to 100000" >&2
+            exit 1
+            ;;
+    esac
+    if [ "$COEXIST_PACE_US" -lt 8333 ] || [ "$COEXIST_PACE_US" -gt 100000 ]; then
+        echo "macos_gui.sh: --pace-us must be from 8333 to 100000" >&2
+        exit 1
+    fi
+fi
+
 enable_experimental_if_requested() {
     [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
     touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_VNC_SHARE"
-    log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + stable VNC mmap enabled."
+        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+        "$EXPERIMENTAL_SUBMIT_RING"
+    rm -f "$EXPERIMENTAL_PACE"
+    if [ -n "$COEXIST_PACE_US" ]; then
+        echo "$COEXIST_PACE_US" > "$EXPERIMENTAL_PACE"
+    fi
+    log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + read-only PF550 completion observer + bounded submit flight recorder + stable VNC mmap enabled."
+    if [ -n "$COEXIST_PACE_US" ]; then
+        log "DIAGNOSTIC-SCAFFOLD: synthetic completion pace=${COEXIST_PACE_US} us (not a refresh-rate implementation)."
+    fi
 }
 
 arm_initial_vnc_capture_if_requested() {

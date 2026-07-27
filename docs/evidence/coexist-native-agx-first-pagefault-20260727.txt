@@ -1,0 +1,180 @@
+# Native-AGX coexistence: exact first PageFault correlation (2026-07-27)
+
+Scope
+-----
+
+This is a bounded diagnostic milestone.  It does not claim that coexistence
+VNC is stable.  Every device run used `--no-vnc --no-watchdog`, started only
+WindowServer plus Terminal, and was stopped with `misc/cleanup_all.sh` after
+the evidence was captured.
+
+The deployed incremental build command was:
+
+    FAST=1 FAST_FORCE=1 THEOS=/var/jb/var/mobile/theos \
+      bash misc/build_on_ios.sh
+
+The build still converted both thin dylibs to macOS platform, signed them,
+copied them into the rootfs, and updated the trust cache.  Its explicit mode
+witness was:
+
+    ==> FAST_FORCE: explicitly shipping libmachook only; non-libmachook changes are not packaged
+    ==> FAST mode: skipping make clean (incremental build)
+    ==> FAST postinst: cp libmachook → /var/mnt/rootfs/usr/local/lib/
+    ==> FAST postinst done
+
+Raw IOGPU completion hook
+-------------------------
+
+Runtime ObjC enumeration had identified the private buffer completion entry
+point as:
+
+    -[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]
+
+The file-gated diagnostic swizzles that method, reads the command buffer and
+NSError before the original clears `_storage`, and always calls the original.
+It does not modify completion status or command bytes.
+
+The first error in a fresh WindowServer is not the later address fault:
+
+    #### IOGPU-CALLBACK-BUFFER commandBuffer=0x11d8777c0 class=AGXG13GFamilyCommandBuffer submitSerial=1 errorCode=1 ...
+    #### IOGPU-CALLBACK-ERROR domain=MTLCommandBufferErrorDomain code=1 ...
+    #### IOGPU-CALLBACK-USERINFO-ENTRY index=0 key=NSLocalizedDescription ... string=Internal Error (00000102:Internal Error)
+
+The diagnostic therefore uses independent one-shot latches for the first
+non-PageFault error and the first Code=3 error.  A later controlled run then
+correlated the first actual GPU address fault before the PF550 completion
+observer saw its downstream error:
+
+    #### IOGPU-CALLBACK-BUFFER commandBuffer=0x11d930a70 class=AGXG13GFamilyCommandBuffer submitSerial=296 errorCode=3 ...
+    #### IOGPU-CALLBACK-ERROR domain=MTLCommandBufferErrorDomain code=3 ...
+    #### IOGPU-CALLBACK-USERINFO-ENTRY index=0 key=NSLocalizedDescription ... string=Caused GPU Address Fault Error (0000000b:kIOGPUCommandBufferCallbackErrorPageFault)
+    #### VNC-FAULT-TEX commandBuffer=0x11c7553a0 submitSerial=298 ... 2388x1668 pf=550 ...
+
+This runtime-confirms that the PF550 observer was reporting a later command
+buffer.  Attributing the first fault to that PF550 destination was wrong.
+
+Exact faulting large batch
+--------------------------
+
+The final reproducible capture used WindowServer PID 58459.  Its raw callback
+and bounded flight recorder reported:
+
+    #### IOGPU-CALLBACK-BUFFER-CLEAN commandBuffer=0x158fea420 class=AGXG13GFamilyCommandBuffer submitSerial=261 fixed=9 ...
+    #### IOGPU-CALLBACK-BUFFER-CLEAN commandBuffer=0x15a04fb50 class=AGXG13GFamilyCommandBuffer submitSerial=277 fixed=8 ...
+    #### IOGPU-CALLBACK-BUFFER commandBuffer=0x15a05d670 class=AGXG13GFamilyCommandBuffer submitSerial=390 fixed=8 errorCode=3 ...
+    #### AGX_SUBMIT_RING dumped reason=iogpu-raw-callback-page-fault commandBuffer=0x15a05d670 entries=392 range=1..392 path=/tmp/macws_submit_error_58459_2
+
+The manifest gives the exact clean control and faulting shapes:
+
+    serial=277 ... fixed=8 ... pre_commands=17112 pre_segments=2768 post_commands=16856 post_segments=2768
+    serial=390 ... fixed=8 ... pre_commands=17112 pre_segments=2576 post_commands=16856 post_segments=2576
+
+Both contain eight subtype-1 records.  The faulting batch parses as:
+
+    pre:  KCMD=0x42d8, segment-list=0xa10, count=8
+          segment 0 span=0x870; segments 1..7 span=0x858
+    post: KCMD=0x41d8, segment-list=0xa10, count=8
+          segment 0 span=0x850; segments 1..7 span=0x838
+
+Every post-translation record has `end=0x7f8`, `size=0x7c8`, `inner=0x30`,
+`subtype=1`.  Each of the eight updated `{start,end}` pairs occurs exactly
+once in the segment list and the chain ends exactly at `0x41d8`.  This rules
+out an unadjusted outer length or range pair as the immediate cause.
+
+The same translator is not unconditionally broken: serial 261 and 277
+completed cleanly before serial 390 faulted.  A separate run also observed
+post-recovery `fixed=8` submissions completing cleanly:
+
+    #### IOGPU-CALLBACK-BUFFER-CLEAN ... submitSerial=832 fixed=8 ...
+    #### IOGPU-CALLBACK-BUFFER-CLEAN ... submitSerial=834 fixed=8 ...
+
+Resource/address cross-check
+----------------------------
+
+The faulting record fields identify a 1140x798 Terminal intermediate, while
+the earlier clean control is the 2388x1668 display composite:
+
+    record+0x3b0: clean=0x954, fault=0x474
+    record+0x3b4: clean=0x684, fault=0x31e
+
+The corresponding active output allocation in the fault snapshot was:
+
+    gid=0x2 va=0x1501d40000 bytes=0x384000 type=0x82 surface=0xbc request50=0x180888300
+
+`1140 * 798 * 4 = 3,638,880`, which is below the aligned `0x384000`
+allocation.  A simple output-size overrun is therefore not supported by this
+evidence.
+
+Scanning every aligned 64-bit KCMD word and masking it to the 48-bit GPU VA
+found that every high-address-looking value in fault serial 390 was inside an
+active tracked resource.  Cross-checking those high-address owners against
+the matching variable-sized segment entry found each corresponding gid in
+that segment's resource list.  No direct dangling high VA or omitted high-VA
+resource was found.  Low values such as `0x20200` and `0x100000` were excluded
+from this conclusion: clean records show they can be ordinary packed scalar
+fields rather than addresses.
+
+This narrows the next check to an indirect address/texture descriptor, a
+resource-generation timing issue, or another field in the macOS-to-iOS render
+record that the current byte-deletion scaffold does not semantically
+translate.  Which of those is responsible remains THEORY until a fault VA or
+a clean post-recovery command of the same 1140x798 shape is captured.
+
+Artifacts retained on the device
+--------------------------------
+
+Directory:
+
+    /var/mnt/rootfs/private/tmp/macws_submit_error_58459_2
+
+SHA-256:
+
+    4748221fa108ddec14d3c2cf29f67b06e900fb9af2f94311bcccd52bc9ade214  manifest.txt
+    f047176885967d850efd26ff831b4b58bd8c93384dd2d68f86dbd808cd55df32  resources.txt
+    607c492dfe2ea92cd71f8babc2be46d3ffff6c7027e166fb008d7220503c6199  s277_q277_d0_pre_kcmd.bin
+    7e97c218017c6ff11223feecf8b7ca446674ad80af3e021f1c4c199316518b32  s277_q277_d0_post_kcmd.bin
+    308e521c9cfc327e3c5089d9a885bdce8a94a0be3b7e8012405ccb4766dcb4f0  s277_q277_d0_pre_segments.bin
+    d6184249ed85b778da1ba8babdc3a31a4d914b70306f3846a5897111a2be876e  s277_q277_d0_post_segments.bin
+    97156f3c3a8e266972d7b413c945d199d629a1b000c8890de6bc804021621ff7  s390_q390_d0_pre_kcmd.bin
+    4c6d8ec3a23451789d205e9c80dac114b0fb9c7ca57d44e3f07f954fa3129601  s390_q390_d0_post_kcmd.bin
+    9795b07ecff578ea0d75ece0990521cf81c95316a8165721c32a58617c1766e2  s390_q390_d0_pre_segments.bin
+    315c4e43c39f84f8e0f9f0f4833e53056fc3648014673590e3c078500a7191d3  s390_q390_d0_post_segments.bin
+
+Same-geometry recovery control and safety
+-----------------------------------------
+
+An initial post-fault-clean diagnostic was too broad.  It saved serial 712 as
+the fourth dump even though the runtime dimensions did not match the first
+PageFault:
+
+    #### IOGPU-CALLBACK-BUFFER ... submitSerial=366 fixed=8 target=1140x798 errorCode=3 ...
+    #### IOGPU-CALLBACK-BUFFER-CLEAN ... submitSerial=712 fixed=8 target=2388x1668 ...
+    #### AGX_SUBMIT_RING dumped reason=iogpu-post-page-fault-clean ... path=/tmp/macws_submit_error_68152_4
+
+The logs and source inspection exposed a diagnostic-state bug: only the first
+Code=3 callback was printed, but every later Code=3 callback overwrote the
+stored width and height.  The latch now has three states (unclaimed,
+initializing, ready); only the callback that atomically claims the first
+PageFault publishes its dimensions.  This changes no command, resource, or
+completion result.
+
+A fresh FAST build deployed at 08:42 runtime-confirmed the corrected filter:
+
+    #### IOGPU-CALLBACK-BUFFER-CLEAN ... submitSerial=307 fixed=8 target=2388x1668 ...
+    #### IOGPU-CALLBACK-BUFFER ... submitSerial=382 fixed=8 target=1140x798 errorCode=3 ...
+    #### AGX_SUBMIT_RING dumped reason=iogpu-raw-callback-page-fault ... path=/tmp/macws_submit_error_71028_2
+    #### IOGPU-CALLBACK-BUFFER-CLEAN ... submitSerial=742 fixed=8 target=2388x1668 ...
+    #### IOGPU-CALLBACK-BUFFER-CLEAN ... submitSerial=744 fixed=8 target=2388x1668 ...
+
+No `/tmp/macws_submit_error_71028_4` appeared during the bounded 40-second
+post-fault window.  Therefore the full-screen recovery frames are no longer
+misclassified, but this run did not supply a clean 1140x798 control.  It is
+evidence that the observed Terminal-sized path remains consistently distinct,
+not evidence for which indirect field or resource generation caused the
+fault.
+
+Every follow-up used `--no-vnc --no-watchdog`; the final process list was
+checked after `misc/cleanup_all.sh`, and both diagnostic sentinel files were
+removed.  One earlier startup attempt never issued an AGX submit and timed out
+after 45 seconds; with no submit, error, or crash witness, no cause is assigned
+to that unrelated timeout.

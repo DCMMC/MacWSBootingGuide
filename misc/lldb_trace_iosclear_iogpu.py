@@ -402,3 +402,26 @@ def install(debugger):
               "runtime=%#x breakpoint=%d locations=%d" %
               (name, file_address, runtime_address, fallback.GetID(),
                fallback.GetNumLocations()))
+
+
+def install_submit_only(debugger):
+    """Install only the selector-0x1a capture breakpoint by address.
+
+    This avoids BreakpointCreateByName(), which makes host LLDB parse every
+    remote shared-cache symbol table when no matching local cache is
+    available.  The address is RE-confirmed for iPad13,6 iOS 16.3.1 (20D67),
+    and the runtime slide is derived from the loaded IOKit image header.
+    """
+    target = debugger.GetSelectedTarget()
+    slide = _ios_20d67_shared_cache_slide(target)
+    if slide is None:
+        raise RuntimeError("IOKit image unavailable; cannot derive slide")
+    file_address = _IOS_20D67_FALLBACKS["IOConnectCallMethod"]
+    runtime_address = file_address + slide
+    breakpoint = target.BreakpointCreateByAddress(runtime_address)
+    breakpoint.SetScriptCallbackFunction(
+        "lldb_trace_iosclear_iogpu.io_connect_callback")
+    print("IOSCLEAR_IOGPU submit-only file=%#x runtime=%#x "
+          "breakpoint=%d locations=%d" %
+          (file_address, runtime_address, breakpoint.GetID(),
+           breakpoint.GetNumLocations()))

@@ -17,7 +17,9 @@ cd "$PROJECT_DIR"
 # should still be a full one; subsequent edits to libmachook/*.m can use
 # the fast path to cut build time from ~20s to ~3s.
 FAST=${FAST:-0}
+FAST_FORCE=${FAST_FORCE:-0}
 for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
+for arg in "$@"; do [ "$arg" = "--fast-force" ] && FAST=1 && FAST_FORCE=1; done
 
 # Guardrail: FAST only copies libmachook.{arm64,arm64e}.dylib to the rootfs.
 # Any other build artefact (CydiaSubstrate tweak under TweakInject, iOS-side
@@ -27,14 +29,20 @@ for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
 # the device runs stale code (most painful case: MTLCompilerBypassOSCheck/Tweak.x
 # changes never reach /var/jb/usr/lib/TweakInject/, so MTLCompilerService keeps
 # failing the OS check). Detect that and force FAST=0 with a warning.
-if [ "$FAST" = "1" ]; then
+if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
     MARKER=/var/jb/usr/lib/TweakInject/MTLCompilerBypassOSCheck.dylib
     if [ -f "$MARKER" ]; then
-        STALE=$(find MTLCompilerBypassOSCheck launchdchrootexec autosignd \
-                     MTLSimDriverHost launchservicesd mountdevfs \
+        STALE=$(find MTLCompilerBypassOSCheck MTLSimDriverHost \
+                     launchdchrootexec autosignd macwsallocd macwshostd \
+                     mountdevfs ViewBridgeChrootProxy mtl_keepalive \
+                     MacWSHost macwsinputd launchservicesd \
                      Makefile control layout \
                      -type f -newer "$MARKER" 2>/dev/null \
                 | grep -v '/\._' | head -3)
+        if [ -z "$STALE" ] && [ -f misc/iosclear_ref.m ] &&
+           [ misc/iosclear_ref.m -nt "$MARKER" ]; then
+            STALE=misc/iosclear_ref.m
+        fi
         if [ -n "$STALE" ]; then
             echo "==> FAST guardrail tripped: source files newer than last dpkg-installed tweak:"
             echo "$STALE" | sed 's/^/      /'
@@ -45,6 +53,9 @@ if [ "$FAST" = "1" ]; then
         echo "==> FAST guardrail: no installed tweak found at $MARKER — forcing full build"
         FAST=0
     fi
+fi
+if [ "$FAST" = "1" ] && [ "$FAST_FORCE" = "1" ]; then
+    echo "==> FAST_FORCE: explicitly shipping libmachook only; non-libmachook changes are not packaged"
 fi
 
 if [ "$FAST" != "1" ]; then

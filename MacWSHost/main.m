@@ -1545,6 +1545,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 @interface MacWSAppDelegate : UIResponder <UIApplicationDelegate>
 @end
 
+extern void MacWSRunIOSClearReference(void);
+
 @implementation MacWSAppDelegate
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey, id> *)launchOptions {
@@ -1555,6 +1557,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
              application.supportsMultipleScenes ? @"YES" : @"NO",
              MacWSFramePath);
     MacWSLogMetalRegistryState();
+    // Diagnostic-only native AGX reference.  Keeping this behind a sentinel
+    // lets the established, FrontBoard-launched host provide the foreground
+    // GPU context needed for a trustworthy iOS command-ABI capture without
+    // changing normal host startup or its scene lifecycle.
+    if (access("/var/mobile/iosclear_run", F_OK) == 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            MacWSLog(@"IOSCLEAR reference requested by sentinel");
+            MacWSRunIOSClearReference();
+        });
+    }
     return YES;
 }
 

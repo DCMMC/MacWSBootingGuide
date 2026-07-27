@@ -20,8 +20,14 @@
 @import UIKit;
 
 #import <os/log.h>
+#import <objc/runtime.h>
+#import <errno.h>
+#import <fcntl.h>
+#import <limits.h>
 #import <signal.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
 #import <unistd.h>
 
 extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
@@ -30,6 +36,87 @@ extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
     IOSurfaceRef surface, size_t plane);
 
 static os_log_t g_log;
+
+static BOOL macws_is_relevant_agx_class(const char *name) {
+    if (!name) return NO;
+    if (strncmp(name, "AGX", 3) != 0 &&
+        strncmp(name, "IOGPU", 5) != 0) return NO;
+    return strstr(name, "Command") || strstr(name, "Render") ||
+           strstr(name, "Context") || strstr(name, "Queue");
+}
+
+static void macws_dump_agx_method_list(FILE *output, Class cls,
+                                       const char *kind) {
+    if (!cls) return;
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    const char *name = class_getName(cls);
+    Class superclass = class_getSuperclass(cls);
+    fprintf(output,
+        "IOSCLEAR AGX-CLASS kind=%s class=%p name=%s super=%s methods=%u\n",
+        kind, (__bridge void *)cls, name ?: "(null)",
+        superclass ? class_getName(superclass) : "(none)", count);
+    unsigned int limit = count < 512 ? count : 512;
+    for (unsigned int i = 0; i < limit; i++) {
+        SEL selector = method_getName(methods[i]);
+        IMP implementation = method_getImplementation(methods[i]);
+        const char *types = method_getTypeEncoding(methods[i]);
+        fprintf(output,
+            "IOSCLEAR AGX-METHOD kind=%s class=%s index=%u imp=%p "
+            "selector=%s types=%s\n",
+            kind, name ?: "(null)", i, (void *)implementation,
+            selector ? sel_getName(selector) : "(null)",
+            types ?: "(null)");
+    }
+    free(methods);
+}
+
+static void macws_dump_agx_runtime(void) {
+    FILE *output = fopen("/var/mobile/iosclear-agx-runtime.log", "w");
+    if (!output) output = stderr;
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    unsigned int matched = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = class_getName(classes[i]);
+        if (!macws_is_relevant_agx_class(name)) continue;
+        matched++;
+        macws_dump_agx_method_list(output, classes[i], "instance");
+        macws_dump_agx_method_list(output, object_getClass(classes[i]),
+                                   "class");
+    }
+    fprintf(output,
+        "IOSCLEAR AGX-RUNTIME classes=%u matched=%u complete=YES\n",
+        count, matched);
+    fflush(output);
+    if (output != stderr) fclose(output);
+    free(classes);
+}
+
+static void macws_save_commands(const char *phase, const void *bytes,
+                                size_t length) {
+    if (!phase || !bytes || !length || length > 0x10000) return;
+    char path[PATH_MAX];
+    int pathLength = snprintf(path, sizeof(path),
+        "/var/mobile/iosclear-%s-kcmd.bin", phase);
+    if (pathLength <= 0 || (size_t)pathLength >= sizeof(path)) return;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "IOSCLEAR %s KCMD save failed errno=%d\n",
+            phase, errno);
+        return;
+    }
+    const unsigned char *cursor = bytes;
+    size_t written = 0;
+    while (written < length) {
+        ssize_t amount = write(fd, cursor + written, length - written);
+        if (amount <= 0) break;
+        written += (size_t)amount;
+    }
+    close(fd);
+    fprintf(stderr, "IOSCLEAR %s KCMD saved=%zu/%zu path=%s\n",
+        phase, written, length, path);
+}
 
 static size_t macws_dimension_from_env(const char *name, size_t fallback) {
     const char *value = getenv(name);
@@ -79,6 +166,8 @@ static void macws_dump_commands(id<MTLCommandBuffer> commandBuffer,
         "IOSCLEAR %s KCMD start=%p current=%p end=%p length=%#zx\n",
         phase, start, current, end, length);
     if (!start || !length || length > 0x10000) return;
+
+    macws_save_commands(phase, start, length);
 
     const unsigned char *p = start;
     for (size_t off = 0; off < length; off += 32) {
@@ -340,7 +429,7 @@ static void macws_run_textured_draw(id<MTLDevice> device,
     CFRelease(destinationSurface);
 }
 
-static void macws_run_clear(void) {
+void MacWSRunIOSClearReference(void) {
     @autoreleasepool {
         // Some FrontBoard-launched diagnostics cannot be attached reliably
         // while they are already stopped in raise(SIGSTOP): debugserver owns
@@ -382,6 +471,10 @@ static void macws_run_clear(void) {
             device ? [[device name] UTF8String] : "nil",
             (__bridge void *)queue);
         if (!device || !queue) return;
+        if (getenv("IOSCLEAR_DUMP_AGX_METHODS") ||
+            access("/var/mobile/iosclear_dump_agx_methods", F_OK) == 0) {
+            macws_dump_agx_runtime();
+        }
 
         size_t width = macws_dimension_from_env("IOSCLEAR_WIDTH", 64);
         size_t height = macws_dimension_from_env("IOSCLEAR_HEIGHT", 64);
@@ -463,6 +556,7 @@ static void macws_run_clear(void) {
     }
 }
 
+#if !defined(IOSCLEAR_LIBRARY_MODE)
 @interface IOSClearAppDelegate : UIResponder <UIApplicationDelegate>
 @property(nonatomic, strong) UIWindow *window;
 @end
@@ -479,7 +573,7 @@ static void macws_run_clear(void) {
     [self.window makeKeyAndVisible];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
         dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-            macws_run_clear();
+            MacWSRunIOSClearReference();
         });
     return YES;
 }
@@ -500,7 +594,7 @@ int main(int argc, char **argv) {
     // required; the normal UIKit path remains the authoritative reference.
     if (getenv("IOSCLEAR_HEADLESS")) {
         fprintf(stderr, "IOSCLEAR entering headless fallback\n");
-        macws_run_clear();
+        MacWSRunIOSClearReference();
         sleep(2);
         return 0;
     }
@@ -509,3 +603,4 @@ int main(int argc, char **argv) {
             NSStringFromClass(IOSClearAppDelegate.class));
     }
 }
+#endif

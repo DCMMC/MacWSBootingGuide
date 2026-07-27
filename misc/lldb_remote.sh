@@ -38,6 +38,15 @@ LLDB_SCRIPT=${4:-}
 SSH_USER=${SSH_USER:-root}
 SUDO_PASSWORD=${SUDO_PASSWORD:-}
 DBG_PORT=${DBG_PORT:-5555}
+LLDB_MODULE_LOAD_LEVEL=${LLDB_MODULE_LOAD_LEVEL:-minimal}
+
+case "$LLDB_MODULE_LOAD_LEVEL" in
+    minimal|partial|complete) ;;
+    *)
+        echo "error: LLDB_MODULE_LOAD_LEVEL must be minimal, partial, or complete" >&2
+        exit 2
+        ;;
+esac
 
 if [ -z "$HOST" ]; then
     echo "usage: bash $0 <host> [ssh-port] [process-name] [lldb-script-file]" >&2
@@ -52,7 +61,7 @@ fi
 ssh_privileged() {
     local remote_command="$1" quoted
     if [ "$SSH_USER" = root ]; then
-        ssh -p "$PORT" "$SSH_USER@$HOST" "$remote_command"
+        ssh -n -p "$PORT" "$SSH_USER@$HOST" "$remote_command"
         return
     fi
     printf -v quoted '%q' "$remote_command"
@@ -61,7 +70,7 @@ ssh_privileged() {
 }
 
 # Resolve target PID on device.
-PID=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
+PID=$(ssh -n -p "$PORT" "$SSH_USER@$HOST" \
     "ps aux | grep -E '$PROC_NAME' | grep -v grep | head -1 | awk '{print \$2}'")
 if [ -z "$PID" ]; then
     echo "error: no process matching '$PROC_NAME' on $HOST" >&2
@@ -93,7 +102,7 @@ echo "[lldb_remote] debugserver SSH PID=$DBG_SSH_PID (logging to /tmp/debugserve
 sleep 3
 
 # Verify the device-side process is in state T (debugger-stopped).
-STATE=$(ssh -p "$PORT" "$SSH_USER@$HOST" \
+STATE=$(ssh -n -p "$PORT" "$SSH_USER@$HOST" \
     "ps -o state= -p $PID 2>/dev/null | tr -d ' ' || echo MISS")
 if [ "${STATE:0:1}" != "T" ]; then
     echo "[lldb_remote] WARNING: target state is '$STATE' (expected T*) — debugserver attach may have failed" >&2
@@ -108,6 +117,7 @@ echo "[lldb_remote] launching local lldb" >&2
 
 # Build lldb args. If a script file is given, source it AFTER connecting.
 LLDB_ARGS=(
+    -O "settings set target.memory-module-load-level $LLDB_MODULE_LOAD_LEVEL"
     -O "process connect --plugin gdb-remote connect://127.0.0.1:$DBG_PORT"
 )
 if [ -n "$LLDB_SCRIPT" ]; then
@@ -120,4 +130,4 @@ fi
 
 # Run lldb interactively (no --batch) so user can control the session.
 # When user types `quit` or Ctrl-D, trap cleans up debugserver.
-exec /usr/bin/lldb "${LLDB_ARGS[@]}"
+/usr/bin/lldb "${LLDB_ARGS[@]}"

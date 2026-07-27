@@ -1209,23 +1209,70 @@ Verbatim disassembly, LLDB memory, runtime logs, hashes, and build witnesses are
 in
 [`docs/evidence/coexist-vnc-retina-ready-20260726.txt`](evidence/coexist-vnc-retina-ready-20260726.txt).
 
+## 2026-07-27: first native-AGX PageFault is an earlier 8-pass batch, not PF550
+
+A file-gated hook on the runtime-enumerated
+`-[IOGPUMetalCommandBuffer didCompleteWithStartTime:endTime:error:]` now
+correlates the private raw completion with the exact bounded submit-ring
+serial before IOGPU clears command-buffer storage.  It showed that serial 1's
+`Code=1 / 00000102` startup error and the later `Code=3 / PageFault` are
+different failures.  In a controlled Terminal run, the first PageFault was
+serial 390; the PF550 observer did not report its first failed display command
+until serial 392.  The earlier attribution to PF550 was therefore corrected.
+
+The exact serial-390 payload is an eight-segment subtype-1 batch translated
+from 17,112 to 16,856 bytes (`fixed=8`).  Every translated segment span,
+record size, and variable-list `{start,end}` pair is internally consistent.
+More importantly, serials 261 (`fixed=9`) and 277 (`fixed=8`) reached the same
+raw callback with no NSError, and later recovered `fixed=8` serials also
+completed cleanly.  This disproves the theory that every large multi-segment
+translation necessarily faults.
+
+The fault batch targets the first 1140x798 Terminal intermediate rather than
+the 2388x1668 display.  Its `0x384000` output allocation is large enough for
+BGRA8.  Every direct high GPU VA in its KCMD lands in an active resource, and
+each corresponding gid appears in that segment's resource list.  No direct
+dangling VA, missing high-VA resource, or outer-length mismatch was found.
+The remaining candidates—an indirect texture address, resource-generation
+timing, or an untranslated semantic field—remain explicitly THEORY pending a
+fault-VA witness or a post-recovery clean 1140x798 capture.
+
+The first post-recovery recorder incorrectly accepted a 2388x1668 full-screen
+success after a 1140x798 fault.  Runtime logs exposed that later Code=3
+callbacks could overwrite the stored dimensions even though their verbose log
+was one-shot.  The diagnostic now atomically publishes only the first
+PageFault dimensions.  In the corrected bounded run, serial 382 faulted at
+1140x798 while recovered serials 742 and 744 succeeded at 2388x1668; neither
+created the same-geometry dump.  No clean 1140x798 control appeared within 40
+seconds, so the comparison remains pending rather than being inferred from a
+different render path.
+
+Verbatim callback lines, parsed layouts, scope limitations, and all retained
+artifact hashes are in
+[`docs/evidence/coexist-native-agx-first-pagefault-20260727.txt`](evidence/coexist-native-agx-first-pagefault-20260727.txt).
+
 ## Next milestones
 
-1. Replace subtype-1/subtype-3 byte deletion with a field-level translator
+1. Recover the actual GPU fault VA from the IOGPU completion/kernel path, then
+   resolve it against the submit-ring resource generation and indirect texture
+   descriptors.  In parallel, retain the exact-dimension recorder for a real
+   clean 1140x798 control; do not substitute a recovered 2388x1668 display
+   composite.
+2. Replace subtype-1/subtype-3 byte deletion with a field-level translator
    backed by disassembly of both macOS producers and the iOS kernel parser;
    reproduce the VNC frame without `/tmp/macws_kcmd_fix`.
-2. RE the SystemStatus/NSXPC `objc_msgSend` SIGBUS using the saved reports and
+3. RE the SystemStatus/NSXPC `objc_msgSend` SIGBUS using the saved reports and
    the project's early-attach LLDB tooling; do not globally bypass XPC or
    Objective-C release/encoding.
-3. Replace the opt-in cancelled-swap completion shim with a production-quality
+4. Replace the opt-in cancelled-swap completion shim with a production-quality
    coexistence completion model, then repeat a substantially longer VNC/blur
    soak.  The catastrophic IOSurface accumulation is fixed; the remaining
    requirement is protocol confidence rather than process-uptime evidence.
-4. RE Terminal's close-cleanup lock from the captured `__close` stack, then
+5. RE Terminal's close-cleanup lock from the captured `__close` stack, then
    add keyboard/scroll/right-click semantics to the target-process input route
    and capture a Terminal text-entry witness.
-5. RE Activity Monitor and Finder's actual startup actions before adding any
+6. RE Activity Monitor and Finder's actual startup actions before adding any
    launch hook; do not guess selectors or force startup-success branches.
-6. Replace the full-display snapshot with a window registry and
+7. Replace the full-display snapshot with a window registry and
    producer-owned IOSurface ring so each macOS window can become an independent
    iPadOS scene.
