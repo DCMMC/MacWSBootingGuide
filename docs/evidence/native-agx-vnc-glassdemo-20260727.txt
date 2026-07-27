@@ -1,0 +1,147 @@
+# Native-AGX Retina VNC GlassDemo + backdrop-blur validation (2026-07-27)
+
+## Scope
+
+This milestone deliberately uses OSXvnc as both the interaction path and the
+acceptance witness. MacWS Host did not launch the application, transport
+pixels, inject the clicks, or decide whether the result passed.
+
+Device: iPad13,6, iOS 16.3.1 (20D67), macOS 13.4 chroot. The application log
+runtime-confirms the real native Metal device:
+
+    [GlassDemo] MTLDevice = 0x120808600 (AGXG13GFamilyDevice) name=Apple M1
+
+The deployed libmachook was built incrementally on-device with:
+
+    THEOS=/var/jb/var/mobile/theos bash misc/build_on_ios.sh --fast-force
+
+The complete build, platform conversion, signing, trust-cache update, and
+rootfs deployment took 7.6 seconds and ended with:
+
+    ==> FAST postinst: cp libmachook → /var/mnt/rootfs/usr/local/lib/
+    ==> FAST postinst done
+    ==> Done! Package installed successfully.
+
+## RE-confirmed CPU mapping boundary
+
+The exact macOS 13.4 dyld cache at
+`dyld_shared_cache_arm64e` was disassembled at static VM
+`0x19d1560a0`. `_IOGPUResourceCreate` copies the kernel-returned output as
+follows:
+
+    0x19d1561d4  ldr x8, [x21, #8]
+    0x19d1561d8  str x8, [x20, #24]
+    ...
+    0x19d156214  ldr x8, [x21, #72]
+    0x19d156218  ldr x9, [x21, #16]
+    0x19d15621c  stp x8, x9, [x20, #64]
+
+A read-only chroot `dlopen`/`dlsym` probe then resolved the actual exports:
+
+    IOGPU_SYMBOL_PROBE symbol=IOGPUResourceCreate ... offset=0x160a0
+    IOGPU_SYMBOL_PROBE symbol=IOGPUResourceGetDataBytes ... offset=0x162e0
+    IOGPU_SYMBOL_PROBE symbol=IOGPUResourceGetClientShared ... offset=0x16388
+    IOGPU_SYMBOL_PROBE symbol=IOGPUResourceGetGPUVirtualAddress ... offset=0x16360
+
+The exact getters establish the field meanings: GetDataBytes returns wrapper
+`+0x18`, sourced from output `+0x08`; GetClientShared returns wrapper `+0x48`,
+sourced from output `+0x10`. Thus output `+0x10` is not the Metal buffer's
+contents pointer.
+
+Runtime resource creation independently confirmed both are distinct mapped
+addresses:
+
+    ####   ResCreate OK type=0 clientID=0 +0x30=0 +0x38=0 +0x40=0x8000 +0x58=0 OUT[+0]=0x1501168000 OUT[+0x08]=0x10ac24000 OUT[+0x10]=0x1047115c0 OUT[+0x48]=0x8000
+
+The PageFault flight recorder now retains both fields and uses
+`mach_vm_read_overwrite` only for directly referenced type-0 resources, with a
+64-resource / 64-KiB-each bound. Its first live exercise selected eight
+resources; all eight reads returned `vm_read_kr=0` and wrote their exact byte
+counts. This is diagnostic capture, not a resource-lifetime extension or a GPU
+protocol patch.
+
+## Retina VNC output and real input
+
+The dependency-free RFB client negotiated desktop `macOS-iPad` at exactly
+2388x1668. A normal GlassDemo frame contained the title bar, standard controls,
+the main frosted material, and the HUD vibrancy material. The committed VNC
+PNG is:
+
+    254871cb48e499f362f4176ab1f66f49ae49ee5293a19e2fa0d7ac791d933e42  native-agx-vnc-glassdemo-20260727.png
+
+Successive full RFB captures around two VNC clicks had three distinct raw BGRX
+hashes, proving that the served framebuffer advanced:
+
+    before  7db05f2ae37921d3daa2bb1aa0bf7907ff9f7c37033aba6930c3135bb714e0bf
+    click 1 96f0cd697698adee790f760a9a60ecb3f4e556d9e2b4a41bdd77ad5d39af12cc
+    click 2 e4c3457dd549225b61f1084d919ec44fb99d8bfb0c297a9250b54a4272baaf05
+
+All frames remained 2388x1668 and roughly 74.1% of pixels had nonzero RGB.
+The application received the clicks through the RFB/AppKit bridge and changed
+the real control state in both directions:
+
+    #### APP-INPUT CONTROL-RESULT pid=59607 gesture=1 phase=tap view=NSButton enabled=YES has-value=YES before=0.000000 after=1.000000
+    #### APP-INPUT CONTROL-RESULT pid=59607 gesture=2 phase=tap view=NSButton enabled=YES has-value=YES before=1.000000 after=0.000000
+
+The same WindowServer completed native PF550 work continuously. Selected
+verbatim checkpoints from its final log are:
+
+    #### VNC-FLOW poll-result observed=32 clean=32 error=0 pf=550 submitSerial=76 status=4 code=0 polls=1
+    #### VNC-FLOW poll-result observed=1200 clean=1200 error=0 pf=550 submitSerial=2416 status=4 code=0 polls=1
+    #### VNC-FLOW poll-result observed=6000 clean=6000 error=0 pf=550 submitSerial=12025 status=4 code=0 polls=1
+    #### VNC-FLOW poll-result observed=12000 clean=12000 error=0 pf=550 submitSerial=24026 status=4 code=0 polls=1
+
+There is no `IOGPU-CALLBACK-BUFFER ... errorCode=` line in this run.
+
+## Quantitative NSVisualEffectView blur result
+
+The opt-in fixture preserved the existing material, blending mode, state, and
+class. It inserted black/white stripes immediately below the actual HUD
+NSVisualEffectView. The app emitted this exact target witness:
+
+    #### GLASS-BLUR-AB installed attempt=1 target=NSVisualEffectView material=13 blending=1 effect=(60.0 60.0 820.0 100.0) stripes=(32.0 32.0 876.0 156.0) periods=8/32/96pt
+
+The full-resolution on-wire evidence files are:
+
+    ec6590c83caf8ee69e944b838afedc251e28cc53db3c3bdf0df53a7206afd83e  native-agx-vnc-glassdemo-blur-ab-20260727.png
+    003a77f9516ff45817236461d83f4a6c269a9dd5bd38b3a0bc168edffa71800d  raw 2388x1668 BGRX capture (retained outside git)
+
+`misc/analyze_blur_ab.py` averages grayscale over exposed sharp rows and rows
+covered by the real effect, then measures the source-frequency Fourier
+fundamental. It reported:
+
+    high-4pt sharp fundamental=163.386; effect fundamental=0.201; suppression=58.21 dB
+    mid-16pt  sharp fundamental=162.403; effect fundamental=0.259; suppression=55.94 dB
+    low-48pt  sharp fundamental=162.345; effect fundamental=17.162; suppression=19.52 dB
+    BLUR_AB_RESULT source_sharp=True high_filtered=True low_backdrop_influence=True low_filtered=True pass=True
+
+The exposed source still reaches black 0 and white 255. The 4pt/16pt patterns
+are almost completely removed under the effect, while the 48pt pattern still
+changes the material output from 158 to 201. Therefore the result is neither
+unfiltered passthrough nor a flat opaque tint: it is a spatial low-pass blur of
+the backdrop.
+
+## Boundary and cleanup
+
+This closes the requested GlassDemo/native-AGX/VNC/blur acceptance target. It
+does not claim that every macOS application is now stable: a separate Terminal
+run delivered its click to AppKit but served the same raw frame hash before and
+after, and produced only the earlier Code=1 startup error. That path remains a
+separate investigation.
+
+The successful run used the explicitly file-gated `/tmp/macws_kcmd_fix` and
+`/tmp/macws_cancel_completion` adapters. They remain diagnostic scaffolds, not
+production protocol fixes. The visual/native-GPU acceptance target is closed;
+removing those adapters is still a hardening milestone.
+
+The successful GlassDemo/blur WindowServer remained at about 55% of one CPU
+core and 232480 KiB RSS during the bounded run. `misc/cleanup_all.sh` then
+unloaded the jobs, restored SpringBoard/backboardd, cleared the diagnostic
+environment, and left no WindowServer, OSXvnc-server, GlassDemo, Terminal, or
+debugserver process. Final device load averages were 2.78, 2.44, 2.20.
+
+External raw-log hashes:
+
+    73f01d966662e63d2cbae119c477ac76ca78a547da72aa59574bb6602cc608bb  WindowServer.err
+    a7caeca783d7a27b8d30f921918955be44248b606c7195efd3d57ec58bce3515  glassdemo-native.log
+    19065cdacc300365e43b569142e6e1820689acc4fd8ff5c16f56dd00f13beacd  cleanup.log

@@ -34,7 +34,7 @@ def capture_base(debugger, storage_offset=0x1F0):
           (command_buffer, storage_offset, storage, _start, current, end))
 
 
-def arm(debugger, offset):
+def arm(debugger, offset, expected=None):
     target = debugger.GetSelectedTarget()
     if not _start:
         print("IOSCLEAR_FIELD_WATCH arm-failed no-base")
@@ -42,8 +42,14 @@ def arm(debugger, offset):
     error = lldb.SBError()
     watchpoint = target.WatchAddress(_start + offset, 4, False, True, error)
     if error.Success():
-        print("IOSCLEAR_FIELD_WATCH armed id=%d offset=%#x address=%#x" %
-              (watchpoint.GetID(), offset, _start + offset))
+        if expected is not None:
+            watchpoint.SetCondition(
+                "*(unsigned int *)%#x == %#x" %
+                (_start + offset, expected))
+        print("IOSCLEAR_FIELD_WATCH armed id=%d offset=%#x address=%#x "
+              "expected=%s" %
+              (watchpoint.GetID(), offset, _start + offset,
+               "ANY" if expected is None else "%#x" % expected))
     else:
         print("IOSCLEAR_FIELD_WATCH arm-failed offset=%#x error=%s" %
               (offset, error))

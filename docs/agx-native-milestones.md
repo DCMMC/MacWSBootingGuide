@@ -1289,9 +1289,58 @@ Full runtime excerpts, disassembly, negative-result scope, and artifact hashes
 are in
 [`docs/evidence/coexist-native-agx-completion-re-20260727.txt`](evidence/coexist-native-agx-completion-re-20260727.txt).
 
+## 2026-07-27: native-AGX GlassDemo passes Retina VNC, input, and blur acceptance
+
+The requested final witness is now runtime-confirmed through VNC without
+MacWS Host. The real GlassDemo reported `AGXG13GFamilyDevice / Apple M1`, and
+the RFB client negotiated the full 2388x1668 desktop. Consecutive captures
+around two VNC clicks had distinct raw hashes; GlassDemo's real NSButton state
+changed `0→1→0`. The native PF550 completion counter reached 12,000 with
+`clean=12000 error=0 status=4 code=0` and no raw IOGPU error callback.
+
+Before that success, exact macOS cache disassembly traced two remaining
+semantic differences upstream. Normalized record `+0x5e3` comes from a byte
+in the macOS encoder state copied from `state+0xed8`; normalized `+0x6bc`
+comes from `state+0xbec`, which both macOS and iOS compute as
+`(state[0x178] >> 16) & 0x1ff`. A file-gated diagnostic changed the observed
+macOS values `+0x5e3 1→0`, `+0x6bc 16→8`, and the older `+0x3a0 8→4` in one
+run. All three changes hit, but the same PageFault and frozen VNC hash
+remained. They are therefore retained only as diagnostics; the combined known
+deltas are not sufficient and are not shipped as a field-forcing fix.
+
+The resource recorder was extended at the correct CPU mapping boundary.
+RE of the actual IOGPU image proves kernel output `+0x08` feeds
+`IOGPUResourceGetDataBytes`, while output `+0x10` feeds the distinct
+`IOGPUResourceGetClientShared`. A live bounded dump read all eight selected
+type-0 resources successfully with `mach_vm_read_overwrite`; it neither
+retains nor modifies the resources.
+
+The decisive blur test left GlassDemo's real material-13 WithinWindow
+NSVisualEffectView untouched and inserted three stripe frequencies below it.
+The on-wire BGRX analysis measured 58.21 dB suppression at 4pt, 55.94 dB at
+16pt, and 19.52 dB at 48pt. The 48pt component remained measurable
+(`fundamental=17.162`, output range 158..201), proving backdrop influence;
+the high-frequency components were almost eliminated, proving spatial blur
+rather than unfiltered passthrough or an opaque flat tint.
+
+Committed full-Retina witnesses:
+
+- [`docs/evidence/native-agx-vnc-glassdemo-20260727.png`](evidence/native-agx-vnc-glassdemo-20260727.png)
+- [`docs/evidence/native-agx-vnc-glassdemo-blur-ab-20260727.png`](evidence/native-agx-vnc-glassdemo-blur-ab-20260727.png)
+- [`docs/evidence/native-agx-vnc-glassdemo-20260727.txt`](evidence/native-agx-vnc-glassdemo-20260727.txt)
+
+The run ended with `misc/cleanup_all.sh`; no WindowServer, VNC, GlassDemo,
+Terminal, or debugger process remained. This closes the stated final target,
+but does not generalize to Terminal: a separate Terminal session still served
+an unchanged VNC frame after an AppKit-confirmed click and remains an explicit
+hardening task.
+
 ## Next milestones
 
-1. Recover the actual GPU fault VA from a kernel gpuEvent or capture the
+The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
+items are hardening and application-coverage work:
+
+1. Recover the actual Terminal GPU fault VA from a kernel gpuEvent or capture the
    second-level descriptor/buffer contents referenced by the faulting KCMD;
    selector 0x107 and the 0x20-byte userspace completion record are now ruled
    out.  In parallel, retain the exact-dimension recorder for a real clean

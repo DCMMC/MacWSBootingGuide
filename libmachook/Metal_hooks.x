@@ -809,8 +809,11 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                             [bl endEncoding];
                             [cb commit];
                             [cb waitUntilCompleted];
+                            BOOL commandClean =
+                                [cb status] == MTLCommandBufferStatusCompleted &&
+                                [cb error] == nil;
                             void *impl = *(void **)((char *)(__bridge void *)dst + 0x208);
-                            if ((uintptr_t)impl > 0x1000) {
+                            if (commandClean && (uintptr_t)impl > 0x1000) {
                                 IOSurfaceRef boundSurface =
                                     *(IOSurfaceRef *)((char *)impl + 0xa0);
                                 void *cpuMapping = *(void **)((char *)impl + 0x130);
@@ -829,16 +832,65 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                             cpuMapping == surfaceBase ? "" : " MISMATCH");
                                         maplog++;
                                     }
-                                    void *vb = macws_vnc_mmap_data(w, h);  // cross-process mmap
                                     size_t vbpr = w * 4;
-                                    size_t rows = h < surfaceHeight ? h : surfaceHeight;
-                                    if (vb && surfaceBase && pf == 80 && srcbpr >= vbpr) {
-                                        for (size_t y = 0; y < rows; y++)
+                                    BOOL readable = surfaceBase &&
+                                        surfaceHeight >= h &&
+                                        ((pf == 80 && srcbpr >= vbpr) ||
+                                         (pf == 115 && srcbpr >= w * 8));
+                                    size_t sampled = 0, rgbNonzero = 0,
+                                        different = 0;
+                                    uint32_t firstSample = 0;
+                                    BOOL haveFirstSample = NO;
+                                    if (readable) {
+                                        for (size_t y = 0; y < h; y += 16) {
+                                            for (size_t x = 0; x < w; x += 16) {
+                                                uint32_t pixel = 0;
+                                                if (pf == 80) {
+                                                    const uint32_t *row =
+                                                        (const uint32_t *)
+                                                        ((const char *)surfaceBase +
+                                                         y * srcbpr);
+                                                    pixel = row[x];
+                                                } else {
+                                                    const uint16_t *row =
+                                                        (const uint16_t *)
+                                                        ((const char *)surfaceBase +
+                                                         y * srcbpr);
+                                                    const uint16_t *source = row + x * 4;
+                                                    uint32_t blue =
+                                                        macws_half_to_u8(source[2]);
+                                                    uint32_t green =
+                                                        macws_half_to_u8(source[1]);
+                                                    uint32_t red =
+                                                        macws_half_to_u8(source[0]);
+                                                    pixel = blue | (green << 8) |
+                                                        (red << 16) | 0xff000000u;
+                                                }
+                                                sampled++;
+                                                if ((pixel & 0x00ffffffu) != 0)
+                                                    rgbNonzero++;
+                                                if (!haveFirstSample) {
+                                                    firstSample = pixel;
+                                                    haveFirstSample = YES;
+                                                } else if (pixel != firstSample) {
+                                                    different++;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    BOOL contentVisible = sampled > 0 &&
+                                        different >= 4 &&
+                                        rgbNonzero * 20 >= sampled;
+                                    void *vb = contentVisible
+                                        ? macws_vnc_mmap_data(w, h) : NULL;
+                                    BOOL published = NO;
+                                    if (vb && pf == 80) {
+                                        for (size_t y = 0; y < h; y++)
                                             memcpy((char *)vb + y*vbpr,
                                                    (char *)surfaceBase + y*srcbpr, vbpr);
-                                    } else if (vb && surfaceBase && pf == 115 &&
-                                               srcbpr >= w * 8) { // RGBA16F -> BGRA8
-                                        for (size_t y = 0; y < rows; y++) {
+                                        published = YES;
+                                    } else if (vb && pf == 115) { // RGBA16F -> BGRA8
+                                        for (size_t y = 0; y < h; y++) {
                                             uint16_t *src = (uint16_t *)((char *)surfaceBase + y*srcbpr);
                                             uint8_t  *d8  = (uint8_t  *)((char *)vb + y*vbpr);
                                             for (size_t x = 0; x < w; x++) {
@@ -848,10 +900,32 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                                 d8[x*4+3] = 0xff;
                                             }
                                         }
+                                        published = YES;
                                     }
-                                    if (vb && surfaceBase) {
-                                        static int lg = 0;
-                                        if (lg < 3) { fprintf(stderr, "#### VNC-BLIT captured %zux%zu pf=%lu -> mmap (detiled)\n", w, h, pf); lg++; }
+                                    static _Atomic uint64_t publishLog = 0;
+                                    static _Atomic uint64_t rejectLog = 0;
+                                    uint64_t sequence = published
+                                        ? atomic_fetch_add(&publishLog, 1) + 1
+                                        : atomic_fetch_add(&rejectLog, 1) + 1;
+                                    if (sequence <= 16 || (sequence % 600) == 0) {
+                                        fprintf(stderr,
+                                            "#### VNC-BLIT %s #%llu %zux%zu "
+                                            "pf=%lu rgb=%zu/%zu different=%zu\n",
+                                            published ? "published" : "reject-output",
+                                            (unsigned long long)sequence, w, h, pf,
+                                            rgbNonzero, sampled, different);
+                                    }
+                                    if (published) {
+                                        uint64_t generation =
+                                            macws_vnc_capture_generation();
+                                        if (generation != 0) {
+                                            if (macws_vnc_capture_generation() ==
+                                                generation) {
+                                                (void)unlink(
+                                                    "/tmp/macws_capture_final");
+                                            }
+                                            macws_vnc_ack_capture(generation);
+                                        }
                                     }
                                     IOSurfaceUnlock(boundSurface, kIOSurfaceLockReadOnly, NULL);
                                 }
@@ -1852,16 +1926,15 @@ void macws_vnc_finish_update(void *context) {
     // request to reach the legacy path makes an ordinary click capable of
     // destabilising the compositor. Never use it implicitly. Keep the old
     // implementation available only behind an explicitly named unsafe RE
-    // sentinel, and acknowledge/disarm normal requests without touching the
-    // compressed scanout. This is a safety fix, not a working PF550 streamer.
+    // sentinel. A suppressed request must remain armed and unacknowledged:
+    // only a content-validated PF80/115 or ordered PF550 publication may ACK
+    // readiness. This is a safety fix, not a working PF550 streamer.
     BOOL captureRequested =
         access("/tmp/macws_capture_final", F_OK) == 0;
     BOOL unsafePF550Capture = pixelFormat == 550 && captureRequested &&
         access("/tmp/macws_allow_unsafe_pf550_capture", F_OK) == 0;
     if (pixelFormat == 550 && captureRequested && !unsafePF550Capture) {
         uint64_t generation = macws_vnc_capture_generation();
-        (void)unlink("/tmp/macws_capture_final");
-        if (generation != 0) macws_vnc_ack_capture(generation);
         static _Atomic uint64_t suppressedPF550CaptureCount = 0;
         uint64_t suppressed =
             atomic_fetch_add(&suppressedPF550CaptureCount, 1) + 1;

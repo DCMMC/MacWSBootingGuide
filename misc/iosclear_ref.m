@@ -309,70 +309,88 @@ static IOSurfaceRef macws_create_bgra_surface(size_t width, size_t height) {
     return IOSurfaceCreate((CFDictionaryRef)properties);
 }
 
-static IOSurfaceRef macws_create_pf550_surface(void) {
+static IOSurfaceRef macws_create_pf550_surface(size_t width, size_t height) {
     // Runtime-captured verbatim from IOSurfaceCopyAllValues on WindowServer's
-    // first 2388x1668 pf=550 CA framebuffer (2026-07-24).  This diagnostic
-    // reconstructs the producer's real two-plane lossless-compression layout
-    // rather than substituting a linear/zero-filled buffer.
+    // first 2388x1668 pf=550 CA framebuffer (2026-07-24).  The captured
+    // values establish a 16x16 tile grid, 1024/256 data bytes per tile for
+    // planes 0/1, and a 0x40000-byte header reservation after each plane's
+    // tile-data region.  Parameterize that same layout so the native control
+    // can match WindowServer's recurrent 1140x798 intermediate exactly.  A
+    // successful native command completion is required before treating a new
+    // geometry as a valid compressed-surface witness.
+    size_t widthInTiles = (width + 15) / 16;
+    size_t heightInTiles = (height + 15) / 16;
+    size_t plane0BytesPerRow = widthInTiles * 1024;
+    size_t plane1BytesPerRow = widthInTiles * 256;
+    size_t plane0DataSize = plane0BytesPerRow * heightInTiles;
+    size_t plane1DataSize = plane1BytesPerRow * heightInTiles;
+    size_t plane0Size = plane0DataSize + 0x40000;
+    size_t plane1Offset = plane0Size;
+    size_t plane1HeaderOffset = plane1Offset + plane1DataSize;
+    size_t plane1Size = plane1DataSize + 0x40000;
+    size_t allocSize = plane0Size + plane1Size;
     NSDictionary *plane0 = @{
         @"IOSurfaceAddressFormat": @5,
         @"IOSurfacePlaneBytesPerCompressedTileHeader": @8,
         @"IOSurfacePlaneBytesPerElement": @1024,
-        @"IOSurfacePlaneBytesPerRow": @153600,
-        @"IOSurfacePlaneBytesPerRowOfTileData": @153600,
+        @"IOSurfacePlaneBytesPerRow": @(plane0BytesPerRow),
+        @"IOSurfacePlaneBytesPerRowOfTileData": @(plane0BytesPerRow),
         @"IOSurfacePlaneBytesPerTileData": @1024,
         @"IOSurfacePlaneCompressedTileDataRegionOffset": @0,
-        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @16128000,
+        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @(plane0DataSize),
         @"IOSurfacePlaneCompressedTileHeight": @16,
         @"IOSurfacePlaneCompressedTileWidth": @16,
         @"IOSurfacePlaneCompressionFootprint": @0,
         @"IOSurfacePlaneCompressionType": @3,
         @"IOSurfacePlaneElementHeight": @16,
         @"IOSurfacePlaneElementWidth": @16,
-        @"IOSurfacePlaneHeight": @1668,
-        @"IOSurfacePlaneHeightInCompressedTiles": @105,
+        @"IOSurfacePlaneHeight": @(height),
+        @"IOSurfacePlaneHeightInCompressedTiles": @(heightInTiles),
         @"IOSurfacePlaneOffset": @0,
-        @"IOSurfacePlaneSize": @16390144,
-        @"IOSurfacePlaneWidth": @2388,
-        @"IOSurfacePlaneWidthInCompressedTiles": @150,
+        @"IOSurfacePlaneSize": @(plane0Size),
+        @"IOSurfacePlaneWidth": @(width),
+        @"IOSurfacePlaneWidthInCompressedTiles": @(widthInTiles),
     };
     NSDictionary *plane1 = @{
         @"IOSurfaceAddressFormat": @5,
         @"IOSurfacePlaneBytesPerCompressedTileHeader": @8,
         @"IOSurfacePlaneBytesPerElement": @256,
-        @"IOSurfacePlaneBytesPerRow": @38400,
-        @"IOSurfacePlaneBytesPerRowOfTileData": @38400,
+        @"IOSurfacePlaneBytesPerRow": @(plane1BytesPerRow),
+        @"IOSurfacePlaneBytesPerRowOfTileData": @(plane1BytesPerRow),
         @"IOSurfacePlaneBytesPerTileData": @256,
-        @"IOSurfacePlaneCompressedTileDataRegionOffset": @16390144,
-        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @20422144,
+        @"IOSurfacePlaneCompressedTileDataRegionOffset": @(plane1Offset),
+        @"IOSurfacePlaneCompressedTileHeaderRegionOffset":
+            @(plane1HeaderOffset),
         @"IOSurfacePlaneCompressedTileHeight": @16,
         @"IOSurfacePlaneCompressedTileWidth": @16,
         @"IOSurfacePlaneCompressionFootprint": @0,
         @"IOSurfacePlaneCompressionType": @3,
         @"IOSurfacePlaneElementHeight": @16,
         @"IOSurfacePlaneElementWidth": @16,
-        @"IOSurfacePlaneHeight": @1668,
-        @"IOSurfacePlaneHeightInCompressedTiles": @105,
-        @"IOSurfacePlaneOffset": @16390144,
-        @"IOSurfacePlaneSize": @4294144,
-        @"IOSurfacePlaneWidth": @2388,
-        @"IOSurfacePlaneWidthInCompressedTiles": @150,
+        @"IOSurfacePlaneHeight": @(height),
+        @"IOSurfacePlaneHeightInCompressedTiles": @(heightInTiles),
+        @"IOSurfacePlaneOffset": @(plane1Offset),
+        @"IOSurfacePlaneSize": @(plane1Size),
+        @"IOSurfacePlaneWidth": @(width),
+        @"IOSurfacePlaneWidthInCompressedTiles": @(widthInTiles),
     };
     NSDictionary *properties = @{
-        @"IOSurfaceAllocSize": @20684288,
+        @"IOSurfaceAllocSize": @(allocSize),
         @"IOSurfaceCacheMode": @1792,
-        @"IOSurfaceHeight": @1668,
+        @"IOSurfaceHeight": @(height),
         @"IOSurfaceMapCacheAttribute": @0,
         @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
         @"IOSurfaceName": @"IOSCLEAR native pf550 reference",
         @"IOSurfacePixelFormat": @643969848,
         @"IOSurfacePixelSizeCastingAllowed": @0,
         @"IOSurfacePlaneInfo": @[plane0, plane1],
-        @"IOSurfaceWidth": @2388,
+        @"IOSurfaceWidth": @(width),
     };
     IOSurfaceRef surface = IOSurfaceCreate((CFDictionaryRef)properties);
     fprintf(stderr,
-        "IOSCLEAR PF550 compression-api plane=0 type=%u heightInTiles=%zu\n",
+        "IOSCLEAR PF550 geometry=%zux%zu tiles=%zux%zu alloc=%#zx "
+        "compression-api plane=0 type=%u heightInTiles=%zu\n",
+        width, height, widthInTiles, heightInTiles, allocSize,
         surface ? IOSurfaceGetCompressionTypeOfPlane(surface, 0) : UINT32_MAX,
         surface ? IOSurfaceGetHeightInCompressedTilesOfPlane(surface, 0)
                 : SIZE_MAX);
@@ -415,16 +433,12 @@ static void macws_run_textured_draw(id<MTLDevice> device,
                                     size_t width, size_t height) {
     BOOL pf550Mode = getenv("IOSCLEAR_PF550_MODE") ||
         access("/var/mobile/iosclear_pf550_mode", F_OK) == 0;
-    if (pf550Mode) {
-        width = 2388;
-        height = 1668;
-    }
     macws_reference_log("DRAW enter mode=%s width=%zu height=%zu device=%p queue=%p",
         pf550Mode ? "pf550" : "BGRA8", width, height,
         (__bridge void *)device, (__bridge void *)queue);
     macws_reference_log("DRAW before-source-surface");
     IOSurfaceRef sourceSurface = pf550Mode
-        ? macws_create_pf550_surface()
+        ? macws_create_pf550_surface(width, height)
         : macws_create_bgra_surface(width, height);
     macws_reference_log("DRAW after-source-surface source=%p", sourceSurface);
     macws_reference_log("DRAW before-destination-surface");

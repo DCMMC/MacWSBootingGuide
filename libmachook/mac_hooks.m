@@ -5783,9 +5783,13 @@ static int g_agxIdMapCount;
 //   ioGPUResourceFinalize+24 loads wrapper+0x30 and passes it as selector 0xb's
 //   sole scalar. out+0x28 is copied to wrapper+0x50 and is NOT the resource ID.
 #define MACWS_AGX_LIFE_CAP 16384u
+#define MACWS_AGX_CPU_DUMP_CAP 64u
+#define MACWS_AGX_CPU_DUMP_BYTES 0x10000u
 struct macws_agx_life_entry {
     uint64_t gid;       // 0 = empty, UINT64_MAX = tombstone
     uint64_t gpu_address; // kernel-returned GPU VA (out+0x00)
+    uint64_t data_bytes; // CPU mapping returned by GetDataBytes (out+0x08)
+    uint64_t client_shared; // client-shared state returned from out+0x10
     uint64_t bytes;     // kernel-reported allocation size (out+0x48)
     uint64_t request_50; // translated request layout/arena word
     uint32_t client_id; // macOS client field (in+0x48), diagnostic only
@@ -5875,7 +5879,8 @@ static void macws_agx_life_summary_locked(const char *event, uint64_t id,
 
 static void macws_agx_life_create(uint64_t gid, uint8_t type,
                                   uint32_t client_id, uint32_t surface_id,
-                                  uint64_t gpu_address, uint64_t bytes,
+                                  uint64_t gpu_address, uint64_t data_bytes,
+                                  uint64_t client_shared, uint64_t bytes,
                                   uint32_t flags_14, uint64_t request_50) {
     pthread_mutex_lock(&g_agxLifeLock);
     g_agxLifeCreateOK++;
@@ -5903,7 +5908,9 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
             g_agxLifeBytes[old_type] -= g_agxLife[slot].bytes;
         }
         g_agxLife[slot] = (struct macws_agx_life_entry){
-            .gid = gid, .gpu_address = gpu_address, .bytes = bytes,
+            .gid = gid, .gpu_address = gpu_address,
+            .data_bytes = data_bytes, .client_shared = client_shared,
+            .bytes = bytes,
             .request_50 = request_50, .client_id = client_id,
             .surface_id = surface_id, .flags_14 = flags_14, .type = type
         };
@@ -6014,6 +6021,15 @@ static void macws_agx_life_dump_snapshot(const char *directory,
     FILE *output = fopen(path, "w");
     if (!output) return;
 
+    // The actual macOS 13.4 IOGPU cache image establishes these meanings:
+    // IOGPUResourceCreate+0x134 copies kernel output +0x08 to wrapper+0x18,
+    // IOGPUResourceGetDataBytes returns wrapper+0x18, while output +0x10 is
+    // copied to wrapper+0x48 and returned by GetClientShared.  Preserve both
+    // fields, but only read DataBytes for directly referenced type-0 resources.
+    // The fixed count and per-resource byte cap keep a PageFault storm bounded.
+    struct macws_agx_life_entry cpu_dumps[MACWS_AGX_CPU_DUMP_CAP];
+    unsigned cpu_dump_count = 0;
+
     pthread_mutex_lock(&g_agxLifeLock);
     fprintf(output,
         "create_ok=%llu destroy_ok=%llu create_fail=%llu destroy_fail=%llu "
@@ -6029,10 +6045,13 @@ static void macws_agx_life_dump_snapshot(const char *directory,
         const struct macws_agx_life_entry *entry = &g_agxLife[i];
         if (entry->gid == 0 || entry->gid == UINT64_MAX) continue;
         fprintf(output,
-            "gid=%#llx va=%#llx bytes=%#llx type=%#x surface=%#x "
+            "gid=%#llx va=%#llx data=%#llx shared=%#llx bytes=%#llx "
+            "type=%#x surface=%#x "
             "client=%#x flags14=%#x request50=%#llx\n",
             (unsigned long long)entry->gid,
             (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->data_bytes,
+            (unsigned long long)entry->client_shared,
             (unsigned long long)entry->bytes, entry->type,
             entry->surface_id, entry->client_id, entry->flags_14,
             (unsigned long long)entry->request_50);
@@ -6053,6 +6072,17 @@ static void macws_agx_life_dump_snapshot(const char *directory,
                 (unsigned long long)(value - active->gpu_address),
                 (unsigned long long)active->bytes, active->type,
                 active->surface_id);
+            if (active->type == 0 && active->data_bytes != 0 &&
+                cpu_dump_count < MACWS_AGX_CPU_DUMP_CAP) {
+                BOOL duplicate = NO;
+                for (unsigned i = 0; i < cpu_dump_count; i++) {
+                    if (cpu_dumps[i].gid == active->gid) {
+                        duplicate = YES;
+                        break;
+                    }
+                }
+                if (!duplicate) cpu_dumps[cpu_dump_count++] = *active;
+            }
             continue;
         }
         const struct macws_agx_life_event *destroyed =
@@ -6082,17 +6112,60 @@ static void macws_agx_life_dump_snapshot(const char *directory,
         if (event->serial != serial) continue;
         const struct macws_agx_life_entry *entry = &event->resource;
         fprintf(output,
-            "event=%llu action=%s gid=%#llx va=%#llx bytes=%#llx "
-            "type=%#x surface=%#x client=%#x flags14=%#x request50=%#llx\n",
+            "event=%llu action=%s gid=%#llx va=%#llx data=%#llx "
+            "shared=%#llx bytes=%#llx type=%#x surface=%#x client=%#x "
+            "flags14=%#x request50=%#llx\n",
             (unsigned long long)serial,
             event->action == 1 ? "CREATE" : "DESTROY",
             (unsigned long long)entry->gid,
             (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->data_bytes,
+            (unsigned long long)entry->client_shared,
             (unsigned long long)entry->bytes, entry->type,
             entry->surface_id, entry->client_id, entry->flags_14,
             (unsigned long long)entry->request_50);
     }
     pthread_mutex_unlock(&g_agxLifeLock);
+
+    fprintf(output,
+        "[direct-type0-cpu-dumps] selected=%u max_resources=%u "
+        "max_bytes_each=%#x\n",
+        cpu_dump_count, MACWS_AGX_CPU_DUMP_CAP, MACWS_AGX_CPU_DUMP_BYTES);
+    for (unsigned i = 0; i < cpu_dump_count; i++) {
+        const struct macws_agx_life_entry *entry = &cpu_dumps[i];
+        size_t wanted = entry->bytes < MACWS_AGX_CPU_DUMP_BYTES
+            ? (size_t)entry->bytes : MACWS_AGX_CPU_DUMP_BYTES;
+        unsigned char *copy = wanted ? malloc(wanted) : NULL;
+        mach_vm_size_t received = 0;
+        kern_return_t kr = copy ? mach_vm_read_overwrite(
+            mach_task_self(), (mach_vm_address_t)entry->data_bytes,
+            (mach_vm_size_t)wanted, (mach_vm_address_t)copy,
+            &received) : KERN_RESOURCE_SHORTAGE;
+        char dump_path[PATH_MAX];
+        snprintf(dump_path, sizeof(dump_path),
+            "%s/resource_gid%llx_va%llx_cpu%llx.bin", directory,
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->data_bytes);
+        size_t written = 0;
+        if (kr == KERN_SUCCESS && received != 0) {
+            FILE *dump = fopen(dump_path, "wb");
+            if (dump) {
+                written = fwrite(copy, 1, (size_t)received, dump);
+                fclose(dump);
+            }
+        }
+        fprintf(output,
+            "gid=%#llx va=%#llx data=%#llx bytes=%#llx wanted=%#zx "
+            "vm_read_kr=%#x received=%#llx written=%#zx file=%s\n",
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->data_bytes,
+            (unsigned long long)entry->bytes, wanted, kr,
+            (unsigned long long)received, written,
+            written ? dump_path : "(none)");
+        free(copy);
+    }
     fclose(output);
 }
 
@@ -6974,6 +7047,103 @@ static int macws_submit_bytes_are_zero(const unsigned char *p,
     return 1;
 }
 
+// DIAGNOSTIC-ONLY semantic-field A/B for the macOS-13.4 -> iOS-16.3
+// subtype-1 command ABI.  This is deliberately not part of the default KCMD
+// normalizer and is not a fix.
+//
+// Runtime hardware-watchpoint evidence from the exact 1140x798 PF550 control:
+//
+//   native iOS 16.3 AGX, normalized record+0x3a0:
+//     0x221ac9618 ldr w9, [x20, #0xa4]   ; runtime value 4
+//     0x221ac961c str w9, [x8]
+//
+//   macOS 13.4 AGX, original record+0x3b0 (normalized +0x3a0):
+//     0x1ee0cf3a4 ldr x9, [x19, #0x570]
+//     0x1ee0cf3a8 bfxil x9, x8, #1, #6
+//     0x1ee0cf3b4 str x9, [x8, #0x378]   ; runtime value 8
+//
+// The macOS function has no counterpart to the following native iOS +0xa4
+// store.  The experiment tests only whether this one proven producer-version
+// delta explains the first multi-segment PageFault.  A positive result still
+// requires locating/deriving the native field semantically before shipping.
+static void macws_subtype1_field_a4_diagnostic(unsigned sequence,
+                                                unsigned segment,
+                                                unsigned char *record) {
+    if (!record ||
+        access("/tmp/macws_kcmd_field_a4_diag", F_OK) != 0)
+        return;
+
+    uint32_t old_value = *(uint32_t *)(record + 0x3a0);
+    if (old_value != 8)
+        return;
+
+    uint32_t width = *(uint32_t *)(record + 0x3b0);
+    uint32_t height = *(uint32_t *)(record + 0x3b4);
+    *(uint32_t *)(record + 0x3a0) = 4;
+
+    static _Atomic unsigned log_count = 0;
+    unsigned observed = atomic_fetch_add(&log_count, 1) + 1;
+    if (observed <= 32 || (observed & (observed - 1)) == 0) {
+        fprintf(stderr,
+            "#### AGX-KCMD-FIELD-A4-DIAG #%u segment=%u "
+            "normalized+0x3a0=%u->4 target=%ux%u observed=%u\n",
+            sequence, segment, old_value, width, height, observed);
+    }
+}
+
+// DIAGNOSTIC-ONLY A/B for two additional subtype-1 semantic fields.  These
+// switches test causality; they are not ABI fixes and remain inert unless the
+// matching sentinel exists.
+//
+// normalized record+0x5e3:
+//   macOS 13.4 copies byte 8 of q0 from state+0xed0 through [sp+0x80], then
+//   stores that byte at original record+0x603 (normalized +0x5e3).  Runtime
+//   hardware-watchpoint evidence measured 1.  iOS 16.3 computes the
+//   corresponding field from state+0xbc2 and the exact native PF550 control
+//   contains zero.
+//
+// normalized record+0x6bc:
+//   Both actual binaries compute state+0xbec identically as
+//       (state_word_at_0x178 >> 16) & 0x1ff
+//   and copy it into the command record.  Runtime captures measured 16 for
+//   macOS and 8 for the exact native 1140x798 PF550 control.  Because this is
+//   a real upstream state difference rather than a layout mismatch, forcing
+//   it is especially unsuitable for production; the experiment only answers
+//   whether that difference participates in the current PageFault.
+static void macws_subtype1_semantic_field_diagnostic(
+    unsigned sequence, unsigned segment, unsigned char *record) {
+    macws_subtype1_field_a4_diagnostic(sequence, segment, record);
+    if (!record)
+        return;
+
+    BOOL test5e3 =
+        access("/tmp/macws_kcmd_field_5e3_diag", F_OK) == 0;
+    BOOL test6bc =
+        access("/tmp/macws_kcmd_field_6bc_diag", F_OK) == 0;
+    unsigned char old5e3 = record[0x5e3];
+    uint32_t old6bc = *(uint32_t *)(record + 0x6bc);
+    BOOL changed5e3 = test5e3 && old5e3 == 1;
+    BOOL changed6bc = test6bc && old6bc == 16;
+    if (changed5e3)
+        record[0x5e3] = 0;
+    if (changed6bc)
+        *(uint32_t *)(record + 0x6bc) = 8;
+    if (!test5e3 && !test6bc)
+        return;
+
+    static _Atomic unsigned log_count = 0;
+    unsigned observed = atomic_fetch_add(&log_count, 1) + 1;
+    if (observed <= 32 || (observed & (observed - 1)) == 0) {
+        fprintf(stderr,
+            "#### AGX-KCMD-SEMANTIC-FIELD-DIAG #%u segment=%u "
+            "+0x5e3=%u%s +0x603=%u +0x6bc=%u%s +0x6dc=%u "
+            "observed=%u\n",
+            sequence, segment, old5e3, changed5e3 ? "->0" : "",
+            record[0x603], old6bc, changed6bc ? "->8" : "",
+            *(uint32_t *)(record + 0x6dc), observed);
+    }
+}
+
 // TEMPORARY ABI-TRANSLATION EXPERIMENT for the wrapped single-segment form.
 //
 // Project LLDB stopped at the first non-InnocentVictim IOGPU completion on
@@ -7059,6 +7229,7 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
     *(uint32_t *)(record + 0x04) = 0x838;
     *(uint32_t *)(record + 0x28) = 0x7f8;
     *(uint32_t *)(record + 0x2c) = 0x7c8;
+    macws_subtype1_semantic_field_diagnostic(sequence, 0, record);
     *(uint32_t *)(segment_list + 0x34) = (uint32_t)total;
     *total_io = total;
 
@@ -7213,6 +7384,7 @@ static unsigned macws_translate_agx_multisegment_subtype1(
             total -= 0x10;
             *(uint32_t *)(record + 0x28) = 0x7f8;
             *(uint32_t *)(record + 0x2c) = 0x7c8;
+            macws_subtype1_semantic_field_diagnostic(sequence, i, record);
         } else {
             memmove(record + 0x1cc, record + 0x1dc,
                     total - ((size_t)start + 0x1dc));
@@ -7631,6 +7803,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 *(uint32_t *)(commands + 0x04) = (uint32_t)total;
                 *(uint32_t *)(commands + 0x28) = 0x7f8;
                 *(uint32_t *)(commands + 0x2c) = 0x7c8;
+                macws_subtype1_semantic_field_diagnostic(
+                    result.sequence, 0, commands);
 
                 // IOGPUMetalCommandBufferStorageEndSegment writes the KCMD
                 // span into the first segment record at overall list+0x1c.
@@ -8381,6 +8555,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         if (r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x50) {
             const unsigned char *o = (const unsigned char *)outStruct;
             uint64_t gpu_address = *(const uint64_t *)(o + 0x00);
+            uint64_t data_bytes = *(const uint64_t *)(o + 0x08);
+            uint64_t client_shared = *(const uint64_t *)(o + 0x10);
             uint64_t gid = *(const uint32_t *)(o + 0x1c);
             uint64_t bytes = *(const uint64_t *)(o + 0x48);
             uint32_t flags_14 = inStructCnt >= 0x18
@@ -8388,7 +8564,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t request_50 = inStructCnt >= 0x58
                 ? *(const uint64_t *)(sent + 0x50) : 0;
             macws_agx_life_create(gid, agxType, client_id, surface_id,
-                                  gpu_address, bytes, flags_14, request_50);
+                                  gpu_address, data_bytes, client_shared,
+                                  bytes, flags_14, request_50);
             if (agxType == 0x82) {
                 static _Atomic unsigned int t82_bt_count = 0;
                 unsigned int bt_n = atomic_fetch_add(&t82_bt_count, 1);
@@ -8587,10 +8764,11 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // the ivar returned by -gpuAddress. Output +0x1c is resourceID;
             // output +0x48 is the GPU-VA span. Keep +0x10 in the log because
             // it is a distinct client-shared field, not the GPU address.
-            uint64_t out00 = 0, out10 = 0, out48 = 0;
+            uint64_t out00 = 0, out08 = 0, out10 = 0, out48 = 0;
             if (r == 0 && outStruct && outStructCnt && *outStructCnt >= 0x18) {
                 const unsigned char *o = (const unsigned char *)outStruct;
                 out00 = *(const uint64_t *)(o + 0x00);
+                out08 = *(const uint64_t *)(o + 0x08);
                 out10 = *(const uint64_t *)(o + 0x10);
                 if (*outStructCnt >= 0x50)
                     out48 = *(const uint64_t *)(o + 0x48);
@@ -8598,14 +8776,15 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             fprintf(stderr,
                 "####   ResCreate %s type=%#x clientID=%#x "
                 "+0x30=%#llx +0x38=%#llx +0x40=%#llx +0x58=%#llx "
-                "OUT[+0]=%#llx OUT[+0x10]=%#llx OUT[+0x48]=%#llx\n",
+                "OUT[+0]=%#llx OUT[+0x08]=%#llx OUT[+0x10]=%#llx "
+                "OUT[+0x48]=%#llx\n",
                 r ? "FAIL" : "OK",
                 type, clientID,
                 (unsigned long long)f30, (unsigned long long)va38,
                 (unsigned long long)bc40,
                 (unsigned long long)va58,
-                (unsigned long long)out00, (unsigned long long)out10,
-                (unsigned long long)out48);
+                (unsigned long long)out00, (unsigned long long)out08,
+                (unsigned long long)out10, (unsigned long long)out48);
             // Hex dump first 0x70 bytes
             fprintf(stderr, "####   inStruct[0..%zu]:", inStructCnt);
             for (size_t i = 0; i < inStructCnt && i < 0x70; i++) {
