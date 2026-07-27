@@ -1330,21 +1330,62 @@ Committed full-Retina witnesses:
 - [`docs/evidence/native-agx-vnc-glassdemo-20260727.txt`](evidence/native-agx-vnc-glassdemo-20260727.txt)
 
 The run ended with `misc/cleanup_all.sh`; no WindowServer, VNC, GlassDemo,
-Terminal, or debugger process remained. This closes the stated final target,
-but does not generalize to Terminal: a separate Terminal session still served
-an unchanged VNC frame after an AppKit-confirmed click and remains an explicit
-hardening task.
+Terminal, or debugger process remained. This closes the stated final target.
+
+## 2026-07-28: Terminal PF550 invariant and live VNC incremental refresh
+
+The separate Terminal hardening failure is now fixed in a bounded VNC run.
+The first 300x210 PF550 resource had been allocated through the generic
+four-byte BGRA fallback; the exact producer callback then failed with Code=3
+at `target=300x210`. Plain pixel format 550 now receives the same two-plane,
+16x16-tiled compressed IOSurface layout used by native AGX. A delayed GPU probe
+read 15,006/15,750 RGB samples with 15,688 spatial differences and produced a
+complete Terminal PNG. The same texture was runtime-observed at fragment slot
+3 of clean, full-screen PF550 compositor submissions.
+
+The first valid full-screen readback then revealed an upstream AppKit state
+issue: Terminal's saved 150x105-point window began at y=-77 with only
+4,200/15,750 square points intersecting the visible screen. Startup now clamps
+only windows with less than 50% visible intersection into `visibleFrame`.
+Readiness moved from an area percentage to a spatial row classifier: the
+title-only frame had four dense rows, while the complete small Terminal had
+thirteen, so a real small window passes without admitting an outline-only
+frame.
+
+Finally, same-connection RFB testing exposed why reconnecting appeared healthy
+while a live viewer froze. RE of the exact device OSXvnc arm64 slice shows
+`_refreshCallback+0xec` unions CoreGraphics rectangles into each client's
+`modifiedRegion(+0xf8)`; `_clientOutput+0x11c` intersects that state with
+`requestedRegion(+0x108)`. The mmap publisher bypassed this notification and
+only cursor-sized rectangles reached an incremental client.
+
+The shared file now appends an atomic odd/even publication sequence. A
+validated WindowServer writer serializes and release-commits a complete frame;
+OSXvnc acquire-checks reads and passes one full Retina CGRect through its own
+RE-confirmed `_refreshCallback` for every new even generation. On one
+persistent connection, the green-button click traversed
+`OSXVNC INPUT → APP-INPUT RX/MAIN/HIT/TAP-COMPLETE`; the same client then
+received a 2388x1668 raw incremental rectangle. Its accumulated BGRX hash
+changed from `a8c23045...` to `2312254b...`, and the final image was a sharp,
+correctly oriented full-screen Terminal. The isolated current WindowServer
+segment contained no new PageFault or `AGX_SUBMIT_ERROR`.
+
+The persistent regression client and full RE/runtime record are in
+[`misc/vnc_live_click.py`](../misc/vnc_live_click.py) and
+[`docs/evidence/native-agx-terminal-vnc-refresh-20260728.txt`](evidence/native-agx-terminal-vnc-refresh-20260728.txt).
+The test ended with `misc/cleanup_all.sh` and restored iOS.
 
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
 items are hardening and application-coverage work:
 
-1. Recover the actual Terminal GPU fault VA from a kernel gpuEvent or capture the
-   second-level descriptor/buffer contents referenced by the faulting KCMD;
-   selector 0x107 and the 0x20-byte userspace completion record are now ruled
-   out.  In parallel, retain the exact-dimension recorder for a real clean
-   1140x798 control; do not substitute a recovered 2388x1668 display composite.
+1. Run a longer Terminal/GlassDemo soak. If the historical 1140x798 fault
+   reappears, recover its actual GPU fault VA from a kernel gpuEvent or capture
+   the second-level descriptor/buffer contents referenced by that KCMD;
+   selector 0x107 and the 0x20-byte userspace completion record are ruled out.
+   Keep the exact-dimension recorder and do not substitute a recovered
+   2388x1668 display composite for a 1140x798 control.
 2. Replace subtype-1/subtype-3 byte deletion with a field-level translator
    backed by disassembly of both macOS producers and the iOS kernel parser;
    reproduce the VNC frame without `/tmp/macws_kcmd_fix`.

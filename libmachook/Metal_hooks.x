@@ -2,6 +2,7 @@
 @import Darwin;
 @import Foundation;
 @import Metal;
+@import CoreGraphics;
 #import <rootless.h>
 #import <xpc/xpc.h>
 #import <dlfcn.h>
@@ -52,6 +53,10 @@ static int macws_disp_mode(void) {
 // (see mac_hooks.m macws_install_osxvnc_hooks / macws_vnc_fill). Gated by
 // sentinel /tmp/macws_vnc_share.
 extern uint32_t IOSurfaceGetID(IOSurfaceRef);
+extern uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef,
+                                                          size_t);
+extern size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(IOSurfaceRef,
+                                                                size_t);
 static uint64_t macws_vnc_capture_generation(void);
 static void macws_vnc_ack_capture(uint64_t generation);
 extern void macws_dump_recent_agx_submits(const char *reason,
@@ -505,16 +510,28 @@ static void macws_vnc_share_mirror(void *base, size_t sbpr, size_t sh, size_t w)
 // returns NULL across processes on this iOS — RE-confirmed). Both WS and OSXvnc
 // are in the chroot and see /tmp/macws_vnc_fb. WS writes the detiled BGRA8 frame
 // here; OSXvnc mmaps it read-only and blits into frameBufferData. Header (16B):
-// [0]=magic 'VNCF', [1]=w, [2]=h, [3]=stride(=w*4); pixel data follows.
+// [0]=magic 'VNCF', [1]=w, [2]=h, [3]=stride(=w*4); pixel data follows and an
+// atomic uint64_t publication sequence follows the pixels. Odd means a writer
+// owns the frame; even/nonzero means a complete frame. OSXvnc watches that
+// sequence and feeds a full-display rectangle through its ordinary
+// refreshCallback, which is the missing modifiedRegion notification for a
+// producer that bypasses CoreGraphics capture.
 #import <sys/mman.h>
 #import <fcntl.h>
 static void *g_vnc_mmap = NULL;       // base (header + data)
 static size_t g_vnc_mmap_w = 0, g_vnc_mmap_h = 0;
+static _Atomic uint64_t *g_vnc_mmap_sequence = NULL;
+static pthread_mutex_t g_vnc_mmap_write_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *macws_vnc_mmap_data(size_t w, size_t h) {
     if (g_vnc_mmap && g_vnc_mmap_w == w && g_vnc_mmap_h == h)
         return (char *)g_vnc_mmap + 16;
-    size_t stride = w * 4, sz = 16 + stride * h;
-    int fd = open("/tmp/macws_vnc_fb", O_RDWR | O_CREAT, 0666);
+    size_t stride = w * 4, pixelBytes = stride * h;
+    size_t sz = 16 + pixelBytes + sizeof(uint64_t);
+    // This is the first mapping made by this WindowServer producer.  Truncate
+    // even when the dimensions match the previous session: same-size
+    // ftruncate alone preserves all old pixel pages and allowed OSXvnc to show
+    // a stale GlassDemo while the current Terminal session had no valid frame.
+    int fd = open("/tmp/macws_vnc_fb", O_RDWR | O_CREAT | O_TRUNC, 0666);
     if (fd < 0) return NULL;
     if (ftruncate(fd, sz) != 0) { close(fd); return NULL; }
     void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -522,9 +539,45 @@ static void *macws_vnc_mmap_data(size_t w, size_t h) {
     if (m == MAP_FAILED) return NULL;
     uint32_t *hdr = (uint32_t *)m;
     hdr[0] = 0x564E4346u; hdr[1] = (uint32_t)w; hdr[2] = (uint32_t)h; hdr[3] = (uint32_t)stride;
+    g_vnc_mmap_sequence = (_Atomic uint64_t *)((char *)m + 16 + pixelBytes);
+    atomic_store_explicit(g_vnc_mmap_sequence, 0, memory_order_relaxed);
     g_vnc_mmap = m; g_vnc_mmap_w = w; g_vnc_mmap_h = h;
     fprintf(stderr, "#### VNC-MMAP /tmp/macws_vnc_fb %zux%zu sz=%zu\n", w, h, sz);
     return (char *)m + 16;
+}
+
+static void *macws_vnc_mmap_begin_frame(size_t w, size_t h) {
+    pthread_mutex_lock(&g_vnc_mmap_write_lock);
+    void *data = macws_vnc_mmap_data(w, h);
+    if (!data || !g_vnc_mmap_sequence) {
+        pthread_mutex_unlock(&g_vnc_mmap_write_lock);
+        return NULL;
+    }
+    uint64_t sequence = atomic_load_explicit(g_vnc_mmap_sequence,
+                                             memory_order_relaxed);
+    if (sequence & 1u) sequence++;
+    atomic_store_explicit(g_vnc_mmap_sequence, sequence + 1,
+                          memory_order_release);
+    return data;
+}
+
+static uint64_t macws_vnc_mmap_commit_frame(void) {
+    uint64_t sequence = 0;
+    if (g_vnc_mmap_sequence) {
+        atomic_thread_fence(memory_order_release);
+        sequence = atomic_fetch_add_explicit(g_vnc_mmap_sequence, 1,
+                                             memory_order_release) + 1;
+    }
+    pthread_mutex_unlock(&g_vnc_mmap_write_lock);
+    static _Atomic uint64_t committed = 0;
+    uint64_t count = atomic_fetch_add(&committed, 1) + 1;
+    if (count <= 16 || (count % 600) == 0) {
+        fprintf(stderr,
+            "#### VNC-MMAP committed #%llu sequence=%llu %zux%zu\n",
+            (unsigned long long)count, (unsigned long long)sequence,
+            g_vnc_mmap_w, g_vnc_mmap_h);
+    }
+    return sequence;
 }
 // Half (IEEE binary16) -> u8 [0,255], clamped to [0,1]. For RGBA16Float composites.
 static inline uint8_t macws_half_to_u8(uint16_t h) {
@@ -585,6 +638,23 @@ static IOSurfaceRef macws_vnc_bound_surface(id<MTLTexture> texture) {
         ? *(IOSurfaceRef *)((char *)implementation + 0xa0) : NULL;
 }
 
+// Content-backed first-frame classifier. Percentage coverage rejected a
+// legitimate 150x105-point Terminal because its complete Retina backing covers
+// only ~1.6% of the desktop. Runtime A/B on 2026-07-27 produced two exact
+// 2388x1668 GPU readbacks:
+//
+//   offscreen/title-only: 231 RGB samples, 4 dense rows below the menu bar
+//   clamped/full Terminal: 392 RGB samples, 13 dense rows below the menu bar
+//
+// A dense row has at least four RGB samples (64 physical pixels at this 16px
+// sampling interval). Requiring six such non-menu rows admits a small real
+// window but rejects a title bar or thin window outline. The diversity check
+// independently rejects AGX's spatially constant recovery image.
+static BOOL macws_vnc_content_ready(size_t sampled, size_t different,
+                                    size_t denseContentRows) {
+    return sampled > 0 && different >= 4 && denseContentRows >= 6;
+}
+
 // The owned scanout is already an uncompressed, linear BGRA IOSurface. Once
 // the producer command buffer has completed, copy its CPU mapping directly.
 // Submitting another GPU command buffer here would reintroduce the exact
@@ -624,30 +694,37 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     BOOL readable = base && bytesPerRow >= width * 4 &&
         surfaceHeight >= height;
     size_t sampled = 0, rgbNonzero = 0, different = 0;
+    size_t denseContentRows = 0;
     uint32_t first = 0;
     BOOL haveFirst = NO;
     if (readable) {
         for (size_t y = 0; y < height; y += 16) {
             const uint32_t *row = (const uint32_t *)
                 ((const char *)base + y * bytesPerRow);
+            size_t rowRGB = 0;
             for (size_t x = 0; x < width; x += 16) {
                 uint32_t pixel = row[x];
                 sampled++;
-                if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
+                if ((pixel & 0x00ffffffu) != 0) {
+                    rgbNonzero++;
+                    rowRGB++;
+                }
                 if (!haveFirst) { first = pixel; haveFirst = YES; }
                 else if (pixel != first) different++;
             }
+            if (y >= 64 && rowRGB >= 4) denseContentRows++;
         }
     }
-    BOOL valid = readable && sampled != 0 && different >= 4 &&
-        rgbNonzero * 20 >= sampled;
+    BOOL valid = readable && macws_vnc_content_ready(
+        sampled, different, denseContentRows);
     if (valid) {
-        void *shared = macws_vnc_mmap_data(width, height);
+        void *shared = macws_vnc_mmap_begin_frame(width, height);
         if (shared) {
             for (size_t y = 0; y < height; y++) {
                 memcpy((char *)shared + y * width * 4,
                        (const char *)base + y * bytesPerRow, width * 4);
             }
+            macws_vnc_mmap_commit_frame();
         } else {
             valid = NO;
         }
@@ -663,11 +740,11 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     if (sequence <= 32 || (sequence % 600) == 0) {
         fprintf(stderr,
             "#### VNC-OWNED %s #%llu tex=%p surface=%p id=%u "
-            "%zux%zu rgb=%zu/%zu different=%zu unlocked=%d\n",
+            "%zux%zu rgb=%zu/%zu different=%zu denseRows=%zu unlocked=%d\n",
             valid ? "published" : "reject-output",
             (unsigned long long)sequence, (void *)texture, (void *)surface,
             (unsigned)IOSurfaceGetID(surface), width, height,
-            rgbNonzero, sampled, different, unlockedRead);
+            rgbNonzero, sampled, different, denseContentRows, unlockedRead);
     }
     if (valid) {
         uint64_t generation = macws_vnc_capture_generation();
@@ -838,11 +915,12 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                         ((pf == 80 && srcbpr >= vbpr) ||
                                          (pf == 115 && srcbpr >= w * 8));
                                     size_t sampled = 0, rgbNonzero = 0,
-                                        different = 0;
+                                        different = 0, denseContentRows = 0;
                                     uint32_t firstSample = 0;
                                     BOOL haveFirstSample = NO;
                                     if (readable) {
                                         for (size_t y = 0; y < h; y += 16) {
+                                            size_t rowRGB = 0;
                                             for (size_t x = 0; x < w; x += 16) {
                                                 uint32_t pixel = 0;
                                                 if (pf == 80) {
@@ -867,8 +945,10 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                                         (red << 16) | 0xff000000u;
                                                 }
                                                 sampled++;
-                                                if ((pixel & 0x00ffffffu) != 0)
+                                                if ((pixel & 0x00ffffffu) != 0) {
                                                     rgbNonzero++;
+                                                    rowRGB++;
+                                                }
                                                 if (!haveFirstSample) {
                                                     firstSample = pixel;
                                                     haveFirstSample = YES;
@@ -876,18 +956,22 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                                     different++;
                                                 }
                                             }
+                                            if (y >= 64 && rowRGB >= 4)
+                                                denseContentRows++;
                                         }
                                     }
-                                    BOOL contentVisible = sampled > 0 &&
-                                        different >= 4 &&
-                                        rgbNonzero * 20 >= sampled;
+                                    BOOL contentVisible =
+                                        macws_vnc_content_ready(
+                                            sampled, different,
+                                            denseContentRows);
                                     void *vb = contentVisible
-                                        ? macws_vnc_mmap_data(w, h) : NULL;
+                                        ? macws_vnc_mmap_begin_frame(w, h) : NULL;
                                     BOOL published = NO;
                                     if (vb && pf == 80) {
                                         for (size_t y = 0; y < h; y++)
                                             memcpy((char *)vb + y*vbpr,
                                                    (char *)surfaceBase + y*srcbpr, vbpr);
+                                        macws_vnc_mmap_commit_frame();
                                         published = YES;
                                     } else if (vb && pf == 115) { // RGBA16F -> BGRA8
                                         for (size_t y = 0; y < h; y++) {
@@ -900,6 +984,7 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                                 d8[x*4+3] = 0xff;
                                             }
                                         }
+                                        macws_vnc_mmap_commit_frame();
                                         published = YES;
                                     }
                                     static _Atomic uint64_t publishLog = 0;
@@ -910,10 +995,12 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                     if (sequence <= 16 || (sequence % 600) == 0) {
                                         fprintf(stderr,
                                             "#### VNC-BLIT %s #%llu %zux%zu "
-                                            "pf=%lu rgb=%zu/%zu different=%zu\n",
+                                            "pf=%lu rgb=%zu/%zu different=%zu "
+                                            "denseRows=%zu\n",
                                             published ? "published" : "reject-output",
                                             (unsigned long long)sequence, w, h, pf,
-                                            rgbNonzero, sampled, different);
+                                            rgbNonzero, sampled, different,
+                                            denseContentRows);
                                     }
                                     if (published) {
                                         uint64_t generation =
@@ -1224,31 +1311,38 @@ static BOOL macws_vnc_publish_inband_destination(id<MTLTexture> destination) {
     BOOL readable = base && bytesPerRow >= width * 4 &&
         surfaceHeight >= height;
     size_t sampled = 0, rgbNonzero = 0, different = 0;
+    size_t denseContentRows = 0;
     uint32_t first = 0;
     BOOL haveFirst = NO;
     if (readable) {
         for (size_t y = 0; y < height; y += 16) {
             const uint32_t *row = (const uint32_t *)
                 ((const char *)base + y * bytesPerRow);
+            size_t rowRGB = 0;
             for (size_t x = 0; x < width; x += 16) {
                 uint32_t pixel = row[x];
                 sampled++;
-                if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
+                if ((pixel & 0x00ffffffu) != 0) {
+                    rgbNonzero++;
+                    rowRGB++;
+                }
                 if (!haveFirst) { first = pixel; haveFirst = YES; }
                 else if (pixel != first) different++;
             }
+            if (y >= 64 && rowRGB >= 4) denseContentRows++;
         }
         // The AGX recovery image is a spatially constant error colour. A
         // completed command buffer is therefore necessary but not sufficient:
         // never let that diagnostic colour overwrite the last real desktop.
         // A valid blank macOS desktop still has a non-uniform menu bar/cursor.
         if (different >= 4) {
-            void *shared = macws_vnc_mmap_data(width, height);
+            void *shared = macws_vnc_mmap_begin_frame(width, height);
             if (shared) {
                 for (size_t y = 0; y < height; y++) {
                     memcpy((char *)shared + y * width * 4,
                            (const char *)base + y * bytesPerRow, width * 4);
                 }
+                macws_vnc_mmap_commit_frame();
             } else {
                 readable = NO;
             }
@@ -1263,9 +1357,9 @@ static BOOL macws_vnc_publish_inband_destination(id<MTLTexture> destination) {
         if (sequence <= 16 || (sequence % 600) == 0) {
             fprintf(stderr,
                 "#### VNC-INBAND reject-output #%llu dst=%p rgb=%zu/%zu "
-                "different=%zu\n",
+                "different=%zu denseRows=%zu\n",
                 (unsigned long long)sequence, (void *)destination,
-                rgbNonzero, sampled, different);
+                rgbNonzero, sampled, different, denseContentRows);
         }
         return NO;
     }
@@ -1275,16 +1369,19 @@ static BOOL macws_vnc_publish_inband_destination(id<MTLTexture> destination) {
     if (published <= 32 || (published % 600) == 0) {
         fprintf(stderr,
             "#### VNC-INBAND published #%llu dst=%p %zux%zu "
-            "rgb=%zu/%zu different=%zu encoded=%llu skipped=%llu\n",
+            "rgb=%zu/%zu different=%zu denseRows=%zu "
+            "encoded=%llu skipped=%llu\n",
             (unsigned long long)published, (void *)destination,
             width, height, rgbNonzero, sampled, different,
+            denseContentRows,
             (unsigned long long)atomic_load(&g_vnc_inband_encoded_count),
             (unsigned long long)atomic_load(&g_vnc_inband_skipped_count));
     }
 
     uint64_t generation = macws_vnc_capture_generation();
-    BOOL contentVisible = sampled > 0 && rgbNonzero * 20 >= sampled;
-    if (generation && different >= 4 && contentVisible) {
+    BOOL contentVisible = macws_vnc_content_ready(
+        sampled, different, denseContentRows);
+    if (generation && contentVisible) {
         if (macws_vnc_capture_generation() == generation)
             (void)unlink("/tmp/macws_capture_final");
         macws_vnc_ack_capture(generation);
@@ -1343,6 +1440,154 @@ static BOOL macws_vnc_submit_read_pass(id<MTLCommandQueue> queue,
     // failed.  Return the explicitly requested per-encoder execution result;
     // callers still validate the destination bytes before using any output.
     return allCompleted;
+}
+
+// Diagnostic only: determine whether Terminal's completed 300x210 pf550
+// intermediate contains pixels before the full-display compositor consumes
+// it.  The source is retained and sampled once, ten seconds after creation,
+// through QuartzCore's already runtime-validated read_surf shader.  This does
+// not publish a VNC frame and does not alter the producer command stream.
+//
+// The probe deliberately lives behind an explicit sentinel because it creates
+// a second Metal queue and reads a resource owned by SkyLight.  That queue
+// topology is not a production fix; the result only distinguishes an empty
+// upstream render target from a later compositor/drop problem.
+static void macws_schedule_small_pf550_probe(id<MTLTexture> source) {
+    if (!source || access("/tmp/macws_probe_small_pf550", F_OK) != 0)
+        return;
+    if ([source pixelFormat] != 550 || [source width] != 300 ||
+        [source height] != 210)
+        return;
+    static _Atomic int scheduled = 0;
+    if (atomic_exchange(&scheduled, 1)) return;
+
+    id<MTLTexture> retainedSource = macws_vnc_retain(source);
+    fprintf(stderr,
+        "#### PF550-SMALL-PROBE scheduled source=%p 300x210 usage=%#lx "
+        "storage=%lu delay=10s\n",
+        (void *)source, (unsigned long)[source usage],
+        (unsigned long)[source storageMode]);
+    [NSThread detachNewThreadWithBlock:^{
+        @autoreleasepool {
+            sleep(10);
+            id<MTLDevice> device = (id<MTLDevice>)
+                macws_vnc_retain([retainedSource device]);
+            id<MTLCommandQueue> queue = device ? [device newCommandQueue] : nil;
+            NSURL *url = [NSURL fileURLWithPath:
+                @"/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"];
+            NSError *pipelineError = nil;
+            id<MTLLibrary> library = device
+                ? [device newLibraryWithURL:url error:&pipelineError] : nil;
+            id<MTLFunction> vertex = library
+                ? [library newFunctionWithName:@"read_surf_vert"] : nil;
+            id<MTLFunction> fragment = library
+                ? [library newFunctionWithName:@"read_surf_frag"] : nil;
+            id<MTLRenderPipelineState> pipeline = nil;
+            if (vertex && fragment) {
+                MTLRenderPipelineDescriptor *descriptor =
+                    [[MTLRenderPipelineDescriptor alloc] init];
+                descriptor.label = @"MACWS small pf550 diagnostic";
+                descriptor.vertexFunction = vertex;
+                descriptor.fragmentFunction = fragment;
+                descriptor.colorAttachments[0].pixelFormat =
+                    MTLPixelFormatBGRA8Unorm;
+                pipeline = [device
+                    newRenderPipelineStateWithDescriptor:descriptor
+                    error:&pipelineError];
+                macws_vnc_release(descriptor);
+            }
+
+            NSDictionary *properties = @{
+                @"IOSurfaceWidth": @300,
+                @"IOSurfaceHeight": @210,
+                @"IOSurfaceBytesPerElement": @4,
+                @"IOSurfacePixelFormat": @((uint32_t)'BGRA'),
+                @"IOSurfaceName": @"MacWS pf550 diagnostic destination",
+            };
+            IOSurfaceRef destinationSurface = IOSurfaceCreate(
+                (__bridge CFDictionaryRef)properties);
+            MTLTextureDescriptor *destinationDescriptor =
+                [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:
+                        MTLPixelFormatBGRA8Unorm
+                    width:300 height:210 mipmapped:NO];
+            destinationDescriptor.storageMode = MTLStorageModeShared;
+            destinationDescriptor.usage = MTLTextureUsageRenderTarget;
+            id<MTLTexture> destination = destinationSurface && device
+                ? [device newTextureWithDescriptor:destinationDescriptor
+                    iosurface:destinationSurface plane:0]
+                : nil;
+            BOOL executed = queue && pipeline && destination &&
+                macws_vnc_submit_read_pass(queue, pipeline, retainedSource,
+                    destination, @"MACWS small pf550 diagnostic read", YES);
+
+            size_t sampled = 0, rgbNonzero = 0, different = 0;
+            uint32_t first = 0;
+            BOOL haveFirst = NO;
+            BOOL readable = NO;
+            size_t bytesPerRow = 0;
+            if (executed && destinationSurface &&
+                IOSurfaceLock(destinationSurface,
+                    kIOSurfaceLockReadOnly, NULL) == 0) {
+                uint8_t *base = IOSurfaceGetBaseAddress(destinationSurface);
+                bytesPerRow = IOSurfaceGetBytesPerRow(destinationSurface);
+                readable = base && bytesPerRow >= 300 * 4;
+                if (readable) {
+                    for (size_t y = 0; y < 210; y += 2) {
+                        const uint32_t *row = (const uint32_t *)
+                            (base + y * bytesPerRow);
+                        for (size_t x = 0; x < 300; x += 2) {
+                            uint32_t pixel = row[x];
+                            sampled++;
+                            if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
+                            if (!haveFirst) {
+                                first = pixel;
+                                haveFirst = YES;
+                            } else if (pixel != first) {
+                                different++;
+                            }
+                        }
+                    }
+                    int output = open("/tmp/macws_pf550_small_probe.bgra",
+                        O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    if (output >= 0) {
+                        for (size_t y = 0; y < 210; y++) {
+                            const uint8_t *row = base + y * bytesPerRow;
+                            size_t remaining = 300 * 4;
+                            while (remaining) {
+                                ssize_t wrote = write(output, row, remaining);
+                                if (wrote <= 0) break;
+                                row += wrote;
+                                remaining -= (size_t)wrote;
+                            }
+                        }
+                        close(output);
+                    }
+                }
+                IOSurfaceUnlock(destinationSurface,
+                    kIOSurfaceLockReadOnly, NULL);
+            }
+            fprintf(stderr,
+                "#### PF550-SMALL-PROBE result source=%p executed=%s "
+                "readable=%s bpr=%zu rgb=%zu/%zu different=%zu "
+                "first=%#x pipelineError=%s\n",
+                (void *)retainedSource, executed ? "YES" : "NO",
+                readable ? "YES" : "NO", bytesPerRow, rgbNonzero, sampled,
+                different, first,
+                pipelineError ? [[pipelineError description] UTF8String]
+                              : "nil");
+
+            macws_vnc_release(destination);
+            if (destinationSurface) CFRelease(destinationSurface);
+            macws_vnc_release(pipeline);
+            macws_vnc_release(fragment);
+            macws_vnc_release(vertex);
+            macws_vnc_release(library);
+            macws_vnc_release(queue);
+            macws_vnc_release(device);
+            macws_vnc_release(retainedSource);
+        }
+    }];
 }
 
 static void macws_vnc_capture_final(id<MTLTexture> src) {
@@ -1640,15 +1885,15 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
     void *base = IOSurfaceGetBaseAddress(g_vncSurf);
     size_t bpr = IOSurfaceGetBytesPerRow(g_vncSurf);
     size_t bh = IOSurfaceGetHeight(g_vncSurf);
-    void *shared = macws_vnc_mmap_data(outw, outh);
     BOOL copied = NO;
     size_t nonzero = 0;
     size_t rgbNonzero = 0;
     size_t different = 0;
     size_t sampled = 0;
+    size_t denseContentRows = 0;
     uint32_t firstSample = 0;
     BOOL haveFirstSample = NO;
-    if (base && shared && bpr >= outw * 4 && bh >= outh) {
+    if (base && bpr >= outw * 4 && bh >= outh) {
         // Validate the GPU result before publishing it. Runtime capture on
         // 2026-07-26 proved that a failed PF550 source can still complete this
         // diagnostic shader pass with every output pixel set to solid magenta.
@@ -1657,11 +1902,15 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
         // menu/window content must produce more than one sampled BGRA value.
         for (size_t y = 0; y < outh; y += 16) {
             const uint32_t *row = (const uint32_t *)((const char *)base + y * bpr);
+            size_t rowRGB = 0;
             for (size_t x = 0; x < outw; x += 16) {
                 uint32_t pixel = row[x];
                 sampled++;
                 if (pixel != 0) nonzero++;
-                if ((pixel & 0x00ffffffu) != 0) rgbNonzero++;
+                if ((pixel & 0x00ffffffu) != 0) {
+                    rgbNonzero++;
+                    rowRGB++;
+                }
                 if (!haveFirstSample) {
                     firstSample = pixel;
                     haveFirstSample = YES;
@@ -1669,31 +1918,69 @@ static void macws_vnc_capture_final(id<MTLTexture> src) {
                     different++;
                 }
             }
+            if (y >= 64 && rowRGB >= 4) denseContentRows++;
         }
-        // Opaque black is nonzero because alpha is 0xff. A post-restart frame
-        // containing only the menu bar and empty window outlines measured
-        // 2.111% RGB-nonblack pixels in the full RFB capture yet previously
-        // passed the alpha-inclusive test. Terminal's complete frame measured
-        // 54.890%. Require a conservative 5% sampled RGB coverage so ACK means
-        // visible application content, not merely compositor geometry.
-        BOOL contentVisible = sampled > 0 && rgbNonzero * 20 >= sampled;
-        if (different >= 4 && contentVisible) {
-            for (size_t y = 0; y < outh; y++) {
-                memcpy((char *)shared + y * outw * 4,
-                       (char *)base + y * bpr, outw * 4);
+        // Use spatial content structure rather than total area. A complete
+        // small Terminal is below the old 5% threshold, while a title-only or
+        // outline-only frame does not span enough dense non-menu rows.
+        BOOL contentVisible = macws_vnc_content_ready(
+            sampled, different, denseContentRows);
+        if (contentVisible) {
+            void *shared = macws_vnc_mmap_begin_frame(outw, outh);
+            if (shared) {
+                for (size_t y = 0; y < outh; y++) {
+                    memcpy((char *)shared + y * outw * 4,
+                           (char *)base + y * bpr, outw * 4);
+                }
+                macws_vnc_mmap_commit_frame();
+                copied = YES;
             }
-            copied = YES;
         }
         static int capturedLog = 0;
         if (capturedLog++ < 8) {
             fprintf(stderr,
                 "#### VNC-FINAL captured %zux%zu BGRA8 cpu130=%p base=%p "
                 "bpr=%zu sampled_nonzero=%zu sampled_rgb_nonzero=%zu/%zu "
-                "sampled_different=%zu "
+                "sampled_different=%zu denseRows=%zu "
                 "publish=%s\n",
                 outw, outh, cpuMapping, base, bpr, nonzero, rgbNonzero,
-                sampled, different,
+                sampled, different, denseContentRows,
                 copied ? "YES" : "REJECT-NO-CONTENT");
+        }
+        // One-shot visual witness for tuning the readiness classifier.  A
+        // 300x210 Terminal occupies only ~1.6% of the 2388x1668 display, so
+        // the historical 5% RGB threshold may reject a real small window.
+        // Dump the exact GPU-read destination before publication while the
+        // explicit diagnostic sentinel is armed; never copy it into VNC or
+        // acknowledge readiness from this path.
+        if (!copied &&
+            access("/tmp/macws_dump_rejected_vnc", F_OK) == 0) {
+            static _Atomic int rejectedDumped = 0;
+            if (!atomic_exchange(&rejectedDumped, 1)) {
+                int output = open("/tmp/macws_vnc_rejected.bgra",
+                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                size_t totalWritten = 0;
+                if (output >= 0) {
+                    for (size_t y = 0; y < outh; y++) {
+                        const uint8_t *row = (const uint8_t *)base + y * bpr;
+                        size_t remaining = outw * 4;
+                        while (remaining) {
+                            ssize_t wrote = write(output, row, remaining);
+                            if (wrote <= 0) break;
+                            row += wrote;
+                            remaining -= (size_t)wrote;
+                            totalWritten += (size_t)wrote;
+                        }
+                    }
+                    close(output);
+                }
+                fprintf(stderr,
+                    "#### VNC-FINAL rejected-dump path="
+                    "/tmp/macws_vnc_rejected.bgra bytes=%zu geometry=%zux%zu "
+                    "rgb=%zu/%zu different=%zu denseRows=%zu\n",
+                    totalWritten, outw, outh, rgbNonzero, sampled,
+                    different, denseContentRows);
+            }
         }
     }
     IOSurfaceUnlock(g_vncSurf, kIOSurfaceLockReadOnly, NULL);
@@ -3773,6 +4060,130 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
     }
 }
 
+// Create the private two-plane surface required by MTLPixelFormat 550.
+//
+// Runtime evidence, 2026-07-27:
+//   - WindowServer's first Terminal PageFault target was the plain-texture
+//     pool entry 300x210-pf550-bpe4-fcc'BGRA'.  The corresponding raw type
+//     0x82 resource request had byte +0x13 == 2, while the synthesized
+//     IOSurface reported BGRA / 4 bytes per element.
+//   - An iOS-native control using this exact property layout emitted a
+//     pf550 type-0x82 request with f14=0x430 and completed with status=4 and
+//     error=nil at 1140x798.  IOSurfaceCopyAllValues on WindowServer's native
+//     display surface established the same 16x16 tile geometry and 1024/256
+//     bytes of tile data for planes 0/1.
+//
+// Keep this fix at the resource-creation layer: the AGX request and command
+// stream must describe the surface that actually exists.  In particular, do
+// not make the later resource translator or PageFault callback pretend that a
+// linear BGRA allocation is a compressed pf550 allocation.
+static IOSurfaceRef macws_create_pf550_scratch_surface(size_t width,
+                                                        size_t height) {
+    size_t widthInTiles = (width + 15) / 16;
+    size_t heightInTiles = (height + 15) / 16;
+    size_t plane0BytesPerRow = widthInTiles * 1024;
+    size_t plane1BytesPerRow = widthInTiles * 256;
+    size_t plane0DataSize = plane0BytesPerRow * heightInTiles;
+    size_t plane1DataSize = plane1BytesPerRow * heightInTiles;
+    size_t plane0Size = plane0DataSize + 0x40000;
+    size_t plane1Offset = plane0Size;
+    size_t plane1HeaderOffset = plane1Offset + plane1DataSize;
+    size_t plane1Size = plane1DataSize + 0x40000;
+    size_t allocSize = plane0Size + plane1Size;
+
+    NSDictionary *plane0 = @{
+        @"IOSurfaceAddressFormat": @5,
+        @"IOSurfacePlaneBytesPerCompressedTileHeader": @8,
+        @"IOSurfacePlaneBytesPerElement": @1024,
+        @"IOSurfacePlaneBytesPerRow": @(plane0BytesPerRow),
+        @"IOSurfacePlaneBytesPerRowOfTileData": @(plane0BytesPerRow),
+        @"IOSurfacePlaneBytesPerTileData": @1024,
+        @"IOSurfacePlaneCompressedTileDataRegionOffset": @0,
+        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @(plane0DataSize),
+        @"IOSurfacePlaneCompressedTileHeight": @16,
+        @"IOSurfacePlaneCompressedTileWidth": @16,
+        @"IOSurfacePlaneCompressionFootprint": @0,
+        @"IOSurfacePlaneCompressionType": @3,
+        @"IOSurfacePlaneElementHeight": @16,
+        @"IOSurfacePlaneElementWidth": @16,
+        @"IOSurfacePlaneHeight": @(height),
+        @"IOSurfacePlaneHeightInCompressedTiles": @(heightInTiles),
+        @"IOSurfacePlaneOffset": @0,
+        @"IOSurfacePlaneSize": @(plane0Size),
+        @"IOSurfacePlaneWidth": @(width),
+        @"IOSurfacePlaneWidthInCompressedTiles": @(widthInTiles),
+    };
+    NSDictionary *plane1 = @{
+        @"IOSurfaceAddressFormat": @5,
+        @"IOSurfacePlaneBytesPerCompressedTileHeader": @8,
+        @"IOSurfacePlaneBytesPerElement": @256,
+        @"IOSurfacePlaneBytesPerRow": @(plane1BytesPerRow),
+        @"IOSurfacePlaneBytesPerRowOfTileData": @(plane1BytesPerRow),
+        @"IOSurfacePlaneBytesPerTileData": @256,
+        @"IOSurfacePlaneCompressedTileDataRegionOffset": @(plane1Offset),
+        @"IOSurfacePlaneCompressedTileHeaderRegionOffset": @(plane1HeaderOffset),
+        @"IOSurfacePlaneCompressedTileHeight": @16,
+        @"IOSurfacePlaneCompressedTileWidth": @16,
+        @"IOSurfacePlaneCompressionFootprint": @0,
+        @"IOSurfacePlaneCompressionType": @3,
+        @"IOSurfacePlaneElementHeight": @16,
+        @"IOSurfacePlaneElementWidth": @16,
+        @"IOSurfacePlaneHeight": @(height),
+        @"IOSurfacePlaneHeightInCompressedTiles": @(heightInTiles),
+        @"IOSurfacePlaneOffset": @(plane1Offset),
+        @"IOSurfacePlaneSize": @(plane1Size),
+        @"IOSurfacePlaneWidth": @(width),
+        @"IOSurfacePlaneWidthInCompressedTiles": @(widthInTiles),
+    };
+    NSDictionary *properties = @{
+        @"IOSurfaceAllocSize": @(allocSize),
+        @"IOSurfaceCacheMode": @1792,
+        @"IOSurfaceHeight": @(height),
+        @"IOSurfaceMapCacheAttribute": @0,
+        @"IOSurfaceMemoryRegion": @"PurpleGfxMem",
+        // IOSurfaceCreate_safe only rewrites the exact name "CA Framebuffer".
+        // This is a native-AGX scratch resource, not a physical scanout.
+        @"IOSurfaceName": @"MacWS native pf550 scratch",
+        @"IOSurfacePixelFormat": @643969848, // private '&b38' surface format
+        @"IOSurfacePixelSizeCastingAllowed": @0,
+        @"IOSurfacePlaneInfo": @[plane0, plane1],
+        @"IOSurfaceWidth": @(width),
+    };
+    IOSurfaceRef surface = IOSurfaceCreate(
+        (__bridge CFDictionaryRef)properties);
+
+    if (access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+        extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef, size_t)
+            __attribute__((weak_import));
+        extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
+            IOSurfaceRef, size_t) __attribute__((weak_import));
+        uint32_t rawCompressionType =
+            surface && IOSurfaceGetCompressionTypeOfPlane
+            ? IOSurfaceGetCompressionTypeOfPlane(surface, 0) : UINT32_MAX;
+        size_t rawHeightInTiles =
+            surface && IOSurfaceGetHeightInCompressedTilesOfPlane
+                ? IOSurfaceGetHeightInCompressedTilesOfPlane(surface, 0)
+                : SIZE_MAX;
+        uint32_t compatibleCompressionType = surface
+            ? macws_IOSurfaceGetCompressionTypeOfPlane(surface, 0)
+            : UINT32_MAX;
+        size_t compatibleHeightInTiles = surface
+            ? macws_IOSurfaceGetHeightInCompressedTilesOfPlane(surface, 0)
+            : SIZE_MAX;
+        fprintf(stderr,
+            "#### MTL_TEX PF550-SURFACE: %zux%zu tiles=%zux%zu "
+            "surface=%p id=%u alloc=%#zx actualAlloc=%#zx "
+            "rawCompressionType=%u rawHeightInTiles=%zu "
+            "compatibleCompressionType=%u compatibleHeightInTiles=%zu\n",
+            width, height, widthInTiles, heightInTiles, (void *)surface,
+            surface ? IOSurfaceGetID(surface) : 0, allocSize,
+            surface ? IOSurfaceGetAllocSize(surface) : 0,
+            rawCompressionType, rawHeightInTiles,
+            compatibleCompressionType, compatibleHeightInTiles);
+    }
+    return surface;
+}
+
 // SIGABRT survival scope. MTLSimDriver's sendXPCMessageWithReplySync.cold.1
 // calls abort() on any XPC reply error — there is NO return path. We install a
 // thread-local SIGABRT handler around the %orig call so abort()-via-pthread_kill
@@ -4363,18 +4774,27 @@ static void macws_sigabrt_trampoline(int sig) {
                     (unsigned long)width, (unsigned long)height);
             return nil;
         }
-        // Map MTLPixelFormat → IOSurface bytes-per-element + format4cc.
-        // For now assume BGRA8/RGBA8 (4 bpp) which covers SkyLight's
-        // composite path. More formats can be added as needed.
+        // Map MTLPixelFormat → IOSurface layout.  Unknown ordinary formats
+        // retain the historical BGRA8 fallback, but private pf550 must use its
+        // real two-plane compressed layout: a linear BGRA allocation produces
+        // a resource request whose format metadata disagrees with its backing.
         uint32_t fmt4cc  = 'BGRA';
         NSUInteger bpe   = 4;
+        BOOL compressedPF550 = (pf == 550);
         // Common cases:
         //   MTLPixelFormatBGRA8Unorm        = 80   (default)
         //   MTLPixelFormatRGBA8Unorm        = 70
         //   MTLPixelFormatBGRA8Unorm_sRGB   = 81
         //   MTLPixelFormatRGBA16Float       = 115  (8 bpp)
         //   MTLPixelFormatR8Unorm           = 10   (1 bpp)
-        if (pf == 552 || pf == 553) {
+        if (compressedPF550) {
+            fmt4cc = 643969848; // private '&b38' IOSurface format
+            // Used only to make the pool key reflect the captured type-0x82
+            // request's +0x13 field.  The actual allocation is plane/tile
+            // based and is constructed by macws_create_pf550_scratch_surface.
+            bpe = 2;
+        }
+        else if (pf == 552 || pf == 553) {
             // MTLPixelFormatBGRA10_XR[_sRGB] is a 64-bit extended-range
             // format (four 10-bit values stored in the MSBs of 16-bit
             // little-endian components).  Apple's SDK pairs that layout
@@ -4455,15 +4875,19 @@ static void macws_sigabrt_trampoline(int sig) {
             // kernel manage them and keeps pmap pressure down.  Also
             // removed the speculative ElementWidth/Height:1 hints (no
             // measured effect on DCP registration).
-            NSDictionary *props = @{
-                @"IOSurfaceWidth":           @(width),
-                @"IOSurfaceHeight":          @(height),
-                @"IOSurfaceBytesPerElement": @(bpe),
-                @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
-                @"IOSurfaceIsGlobal":        @NO,
-                @"IOSurfaceCacheMode":       @0,
-            };
-            surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            if (compressedPF550) {
+                surf = macws_create_pf550_scratch_surface(width, height);
+            } else {
+                NSDictionary *props = @{
+                    @"IOSurfaceWidth":           @(width),
+                    @"IOSurfaceHeight":          @(height),
+                    @"IOSurfaceBytesPerElement": @(bpe),
+                    @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
+                    @"IOSurfaceIsGlobal":        @NO,
+                    @"IOSurfaceCacheMode":       @0,
+                };
+                surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+            }
             if (surf) {
                 @synchronized(surfPool) {
                     // Re-check (double-checked locking) — another
@@ -4482,11 +4906,17 @@ static void macws_sigabrt_trampoline(int sig) {
                         surfPool[poolKey] = [NSValue valueWithPointer:(const void *)surf];
                     }
                 }
-                if (route_log++ < 16) {
+                if (route_log++ < 16 ||
+                    access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
                     fprintf(stderr,
-                        "#### MTL_TEX POOL-NEW: key=%s → IOSurface=%p (size~%lu KB)\n",
+                        "#### MTL_TEX POOL-NEW: key=%s → IOSurface=%p "
+                        "(alloc=%zu KB, map=%s)\n",
                         [poolKey UTF8String], (void *)surf,
-                        (unsigned long)(width * height * bpe / 1024));
+                        IOSurfaceGetAllocSize(surf) / 1024,
+                        compressedPF550 ? "PF550-COMPRESSED" :
+                        (pf == 552 || pf == 553 || pf == 115 || pf == 10 ||
+                         pf == 70 || pf == 71 || pf == 80 || pf == 81)
+                            ? "EXPLICIT" : "UNKNOWN-FALLBACK-BGRA4");
                 }
             }
         } else {
@@ -4659,6 +5089,8 @@ static void macws_sigabrt_trampoline(int sig) {
         // Read-only postcondition audit for the original Apple initializer.
         if (tex) {
             macws_audit_iosurface_texture_mapping(tex, surf);
+            if (compressedPF550)
+                macws_schedule_small_pf550_probe(tex);
         }
         // Read-path probe: also track surfaces arriving via the
         // AGXG13GFamilyDevice swizzle (different entry point than the
@@ -6198,6 +6630,52 @@ static void install_agx_init_redirect(Class agx) {
                 for (Class c = cls; c && !orig; c = class_getSuperclass(c))
                     orig = (set_tex_t)CFDictionaryGetValue(origMap2,
                                                            (__bridge const void *)c);
+                // Read-only compositor-binding witness.  The delayed GPU
+                // probe proved that the 300x210 pf550 texture contains a
+                // complete Terminal window, while the display-sized result
+                // contains only chrome.  Record whether that exact geometry
+                // enters a fragment binding, and join it to the render target
+                // captured by renderCommandEncoderWithDescriptor:.  Every
+                // original argument is forwarded unchanged below.
+                if (side == 0 && tex &&
+                    access("/tmp/macws_trace_small_pf550_bind", F_OK) == 0) {
+                    macws_tile_texture_snapshot source =
+                        macws_tile_snapshot_texture(tex);
+                    if (source.width == 300 && source.height == 210 &&
+                        source.pixel_format == 550) {
+                        static _Atomic uint32_t bindSequence = 0;
+                        uint32_t sequence =
+                            atomic_fetch_add(&bindSequence, 1) + 1;
+                        if (sequence <= 64) {
+                            uintptr_t encoder = (uintptr_t)
+                                (__bridge void *)self_;
+                            macws_tile_target_entry target = {0};
+                            BOOL hasTarget =
+                                macws_tile_find_target(encoder, &target);
+                            fprintf(stderr,
+                                "#### PF550-SMALL-BIND #%u encoder=%#llx "
+                                "index=%lu source=%p targetMapped=%s "
+                                "targetSerial=%llu commandBuffer=%#llx\n",
+                                sequence, (unsigned long long)encoder,
+                                (unsigned long)idx, (void *)tex,
+                                hasTarget ? "YES" : "NO",
+                                (unsigned long long)
+                                    (hasTarget ? target.serial : 0),
+                                (unsigned long long)
+                                    (hasTarget ? target.command_buffer : 0));
+                            if (hasTarget) {
+                                macws_tile_log_snapshot(sequence,
+                                    "fragment-target", encoder, 0,
+                                    target.target, target.serial,
+                                    target.command_buffer);
+                            }
+                            macws_tile_log_snapshot(sequence,
+                                "fragment-source", encoder, idx, source,
+                                hasTarget ? target.serial : 0,
+                                hasTarget ? target.command_buffer : 0);
+                        }
+                    }
+                }
                 if (!tex) {
                     static int nil_guard_log[2] = {0, 0};
                     int slot = (strstr(sel_name_copy, "Fragment") != NULL) ? 0 : 1;
@@ -6383,13 +6861,31 @@ static void install_agx_init_redirect(Class agx) {
                             deallocator(bytes, length);
                         }
                         if (redirect_log < 12) {
+                            SEL gpu_address_sel =
+                                sel_registerName("gpuAddress");
+                            uint64_t gpu_address = 0;
+                            BOOL queried_gpu_address =
+                                access("/tmp/macws_iogpu_error_diag",
+                                    F_OK) == 0 &&
+                                [(id)ios_buf respondsToSelector:
+                                    gpu_address_sel];
+                            if (queried_gpu_address) {
+                                typedef uint64_t (*gpu_address_fn)(id, SEL);
+                                gpu_address_fn fn = (gpu_address_fn)
+                                    [(id)ios_buf methodForSelector:
+                                        gpu_address_sel];
+                                if (fn) gpu_address =
+                                    fn((id)ios_buf, gpu_address_sel);
+                            }
                             fprintf(stderr,
                                 "#### AGXBuffer init-bytes REDIRECT-iOS-NATIVE result: "
-                                "%p class=%s len=%lu gpuAddr=%#llx\n",
+                                "%p class=%s len=%lu gpuAddr=%#llx "
+                                "queried=%s\n",
                                 (void *)ios_buf,
                                 class_getName([(id)ios_buf class]),
                                 (unsigned long)[ios_buf length],
-                                (unsigned long long)0ULL);
+                                (unsigned long long)gpu_address,
+                                queried_gpu_address ? "YES" : "NO");
                         }
                     }
                     return (id)ios_buf;
@@ -6640,6 +7136,114 @@ static void install_nsxpcsharedlistener_swizzle(void) {
     }
 }
 
+// Direct Terminal launches restore saved NSWindow state without the normal
+// LaunchServices display-reconfiguration pass.  A runtime VNC dump on
+// 2026-07-27 showed the reused 300x210 window with only its title bar at the
+// physical display's bottom edge; a GPU read of its backing simultaneously
+// showed the complete Terminal contents.  Keep a normally positioned restored
+// window untouched, but clamp a mostly-offscreen one into NSScreen.visibleFrame
+// before asking AppKit to order and redraw it.
+static void macws_terminal_order_window_onscreen(id app, id target,
+                                                  id keyWindow) {
+    if (!app || !target) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(
+        app, sel_registerName("activateIgnoringOtherApps:"), YES);
+
+    id screen = nil;
+    if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            target, sel_registerName("respondsToSelector:"),
+            sel_registerName("screen"))) {
+        screen = ((id (*)(id, SEL))objc_msgSend)(
+            target, sel_registerName("screen"));
+    }
+    if (!screen) {
+        Class screenClass = objc_getClass("NSScreen");
+        if (screenClass) {
+            screen = ((id (*)(Class, SEL))objc_msgSend)(
+                screenClass, sel_registerName("mainScreen"));
+        }
+    }
+
+    BOOL moved = NO;
+    CGRect frame = CGRectZero;
+    CGRect visibleFrame = CGRectZero;
+    double intersectionArea = 0;
+    double frameArea = 0;
+    if (screen) {
+        frame = ((CGRect (*)(id, SEL))objc_msgSend)(
+            target, sel_registerName("frame"));
+        visibleFrame = ((CGRect (*)(id, SEL))objc_msgSend)(
+            screen, sel_registerName("visibleFrame"));
+        double left = frame.origin.x > visibleFrame.origin.x
+            ? frame.origin.x : visibleFrame.origin.x;
+        double bottom = frame.origin.y > visibleFrame.origin.y
+            ? frame.origin.y : visibleFrame.origin.y;
+        double frameRight = frame.origin.x + frame.size.width;
+        double visibleRight = visibleFrame.origin.x + visibleFrame.size.width;
+        double right = frameRight < visibleRight ? frameRight : visibleRight;
+        double frameTop = frame.origin.y + frame.size.height;
+        double visibleTop = visibleFrame.origin.y + visibleFrame.size.height;
+        double top = frameTop < visibleTop ? frameTop : visibleTop;
+        double intersectionWidth = right > left ? right - left : 0;
+        double intersectionHeight = top > bottom ? top - bottom : 0;
+        intersectionArea = intersectionWidth * intersectionHeight;
+        frameArea = frame.size.width > 0 && frame.size.height > 0
+            ? frame.size.width * frame.size.height : 0;
+
+        // Reposition only when less than half of a valid window is visible.
+        // This preserves ordinary user placement, including intentionally
+        // partial windows, while repairing the runtime-confirmed restored
+        // state whose title bar alone intersected the display.
+        if (frameArea > 0 && visibleFrame.size.width > 0 &&
+            visibleFrame.size.height > 0 &&
+            intersectionArea * 2 < frameArea) {
+            CGPoint origin = frame.origin;
+            double maxX = visibleFrame.origin.x + visibleFrame.size.width -
+                frame.size.width;
+            double maxY = visibleFrame.origin.y + visibleFrame.size.height -
+                frame.size.height;
+            if (maxX < visibleFrame.origin.x) maxX = visibleFrame.origin.x;
+            if (maxY < visibleFrame.origin.y) maxY = visibleFrame.origin.y;
+            if (origin.x < visibleFrame.origin.x)
+                origin.x = visibleFrame.origin.x;
+            if (origin.x > maxX) origin.x = maxX;
+            if (origin.y < visibleFrame.origin.y)
+                origin.y = visibleFrame.origin.y;
+            if (origin.y > maxY) origin.y = maxY;
+            ((void (*)(id, SEL, CGPoint))objc_msgSend)(
+                target, sel_registerName("setFrameOrigin:"), origin);
+            moved = YES;
+            fprintf(stderr,
+                "#### Terminal geometry: repositioned target=%p "
+                "origin=(%.1f,%.1f)->(%.1f,%.1f)\n",
+                target, frame.origin.x, frame.origin.y,
+                origin.x, origin.y);
+        }
+    }
+    fprintf(stderr,
+        "#### Terminal geometry: target=%p key=%p frame=(%.1f,%.1f "
+        "%.1fx%.1f) visible=(%.1f,%.1f %.1fx%.1f) "
+        "intersection=%.1f/%.1f moved=%s\n",
+        target, keyWindow, frame.origin.x, frame.origin.y,
+        frame.size.width, frame.size.height, visibleFrame.origin.x,
+        visibleFrame.origin.y, visibleFrame.size.width,
+        visibleFrame.size.height, intersectionArea, frameArea,
+        moved ? "YES" : "NO");
+
+    ((void (*)(id, SEL, id))objc_msgSend)(
+        target, sel_registerName("makeKeyAndOrderFront:"), nil);
+    id content = ((id (*)(id, SEL))objc_msgSend)(
+        target, sel_registerName("contentView"));
+    if (content) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(
+            content, sel_registerName("setNeedsDisplay:"), YES);
+        ((void (*)(id, SEL))objc_msgSend)(
+            content, sel_registerName("displayIfNeeded"));
+    }
+    ((void (*)(id, SEL))objc_msgSend)(
+        target, sel_registerName("displayIfNeeded"));
+}
+
 __attribute__((constructor)) static void InitMetalHooks() {
     // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
     // at first invocation and decides whether to return AGXG13GFamilyDevice or Nil.
@@ -6731,6 +7335,15 @@ __attribute__((constructor)) static void InitMetalHooks() {
                     fprintf(stderr,
                         "#### Terminal newShell: returned windows=%lu\n",
                         (unsigned long)count);
+                    id keyWindow = ((id (*)(id, SEL))objc_msgSend)(
+                        app, sel_registerName("keyWindow"));
+                    id target = keyWindow;
+                    if (!target && count != 0) {
+                        target = ((id (*)(id, SEL, NSUInteger))objc_msgSend)(
+                            windows, sel_registerName("objectAtIndex:"), 0);
+                    }
+                    macws_terminal_order_window_onscreen(
+                        app, target, keyWindow);
                 } else if (responds) {
                     // Terminal restores its saved windows before this block.
                     // Starting another shell on every launch accumulated 29
@@ -6741,22 +7354,8 @@ __attribute__((constructor)) static void InitMetalHooks() {
                     id keyWindow = ((id (*)(id, SEL))objc_msgSend)(
                         app, sel_registerName("keyWindow"));
                     id target = keyWindow ?: visibleWindow;
-                    ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                        app, sel_registerName("activateIgnoringOtherApps:"), YES);
-                    if (target) {
-                        ((void (*)(id, SEL, id))objc_msgSend)(
-                            target, sel_registerName("makeKeyAndOrderFront:"), nil);
-                        id content = ((id (*)(id, SEL))objc_msgSend)(
-                            target, sel_registerName("contentView"));
-                        if (content) {
-                            ((void (*)(id, SEL, BOOL))objc_msgSend)(
-                                content, sel_registerName("setNeedsDisplay:"), YES);
-                            ((void (*)(id, SEL))objc_msgSend)(
-                                content, sel_registerName("displayIfNeeded"));
-                        }
-                        ((void (*)(id, SEL))objc_msgSend)(
-                            target, sel_registerName("displayIfNeeded"));
-                    }
+                    macws_terminal_order_window_onscreen(
+                        app, target, keyWindow);
                     fprintf(stderr,
                         "#### Terminal direct newShell: reused visible window=%p key=%p\n",
                         target, keyWindow);

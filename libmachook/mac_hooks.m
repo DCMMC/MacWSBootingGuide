@@ -399,7 +399,20 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer);
 // IOSurface
 typedef id IOSurfaceRef;
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
+extern IOSurfaceRef IOSurfaceLookup(uint32_t surface_id);
 extern CFDictionaryRef IOSurfaceCopyAllValues(IOSurfaceRef surface);
+extern uint32_t IOSurfaceGetID(IOSurfaceRef surface);
+extern size_t IOSurfaceGetWidth(IOSurfaceRef surface);
+extern size_t IOSurfaceGetHeight(IOSurfaceRef surface);
+extern size_t IOSurfaceGetAllocSize(IOSurfaceRef surface);
+extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
+extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef surface);
+extern size_t IOSurfaceGetPlaneCount(IOSurfaceRef surface);
+extern OSType IOSurfaceGetPixelFormat(IOSurfaceRef surface);
+extern int IOSurfaceLock(IOSurfaceRef surface, uint32_t options,
+                         uint32_t *seed);
+extern int IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options,
+                           uint32_t *seed);
 extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                     size_t plane);
 extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
@@ -4520,6 +4533,89 @@ static uint32_t macws_vnc_gesture_id = 0;
 static int macws_vnc_input_fd = -1;
 static double macws_vnc_last_continuous_send = 0.0;
 
+// RE-confirmed via the installed arm64 OSXvnc-server (2026-07-27):
+//
+//   refreshCallback+0xec unions each CoreGraphics refresh rectangle into
+//   client->modifiedRegion at +0xf8 and signals client->updateCond at +0xc8.
+//   clientOutput+0x154 intersects that region with requestedRegion (+0x108)
+//   and passes only the intersection to rfbSendFramebufferUpdate.
+//
+// Our mmap publisher bypasses CoreGraphics, so a completed full frame did not
+// enter modifiedRegion; a live VNC connection received only cursor-sized CG
+// rectangles even though a reconnect could fetch the new full frame.  The
+// producer now commits an even/nonzero sequence after its validated pixel
+// copy. Watch that sequence and feed one full-display CGRect through OSXvnc's
+// own refreshCallback, preserving its region locks and wakeup protocol.
+typedef void (*MacWSVNCRefreshCallback)(uint32_t, const CGRect *, void *);
+static MacWSVNCRefreshCallback macws_vnc_refresh_callback = NULL;
+
+static void *macws_vnc_generation_watcher(void *unused) {
+    (void)unused;
+    void *mapping = NULL;
+    size_t mappingSize = 0;
+    uint64_t observed = 0;
+    for (;;) {
+        if (!mapping) {
+            int fd = open("/tmp/macws_vnc_fb", O_RDONLY);
+            if (fd >= 0) {
+                struct stat st = {0};
+                if (fstat(fd, &st) == 0 && st.st_size >= 24) {
+                    void *candidate = mmap(NULL, (size_t)st.st_size, PROT_READ,
+                                           MAP_SHARED, fd, 0);
+                    if (candidate != MAP_FAILED) {
+                        mapping = candidate;
+                        mappingSize = (size_t)st.st_size;
+                    }
+                }
+                close(fd);
+            }
+        }
+
+        if (mapping && macws_vnc_refresh_callback && macws_rfbScreen) {
+            const uint32_t *header = (const uint32_t *)mapping;
+            size_t height = header[2];
+            size_t stride = header[3];
+            if (header[0] == 0x564E4346u && height > 0 && stride > 0 &&
+                height <= (SIZE_MAX - 24) / stride) {
+                size_t sequenceOffset = 16 + height * stride;
+                if (sequenceOffset + sizeof(uint64_t) <= mappingSize) {
+                    const _Atomic uint64_t *sequenceAddress =
+                        (const _Atomic uint64_t *)
+                        ((const char *)mapping + sequenceOffset);
+                    uint64_t sequence = atomic_load_explicit(
+                        sequenceAddress, memory_order_acquire);
+                    if (sequence != 0 && !(sequence & 1u) &&
+                        sequence != observed) {
+                        observed = sequence;
+                        int width = macws_rfbScreen[0];
+                        int screenHeight = macws_rfbScreen[2];
+                        if (width > 0 && screenHeight > 0 && width <= 8192 &&
+                            screenHeight <= 8192) {
+                            CGRect full = {
+                                .origin = {0.0, 0.0},
+                                .size = {(CGFloat)width, (CGFloat)screenHeight},
+                            };
+                            macws_vnc_refresh_callback(1, &full, NULL);
+                            static _Atomic uint64_t notified = 0;
+                            uint64_t count = atomic_fetch_add(&notified, 1) + 1;
+                            if (count <= 16 || (count % 600) == 0) {
+                                fprintf(stderr,
+                                    "#### OSXVNC mmap generation #%llu "
+                                    "sequence=%llu dirty=0,0 %dx%d\n",
+                                    (unsigned long long)count,
+                                    (unsigned long long)sequence,
+                                    width, screenHeight);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        usleep(16000);
+    }
+    return NULL;
+}
+
 static double macws_vnc_monotonic_seconds(void) {
     struct timespec now = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
@@ -4688,7 +4784,8 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
     // 1) Preferred: the detiled composite WS writes to the mmap'd file
     //    /tmp/macws_vnc_fb (IOSurfaceIsGlobal+Lookup is NULL cross-process on
     //    this iOS, so we use a shared mmap instead). Header (16B): magic 'VNCF',
-    //    w, h, stride; BGRA8 data follows. Gradient is the fallback.
+    //    w, h, stride; BGRA8 data follows, then an atomic publication sequence.
+    //    Gradient is the fallback.
     static void *rmap = NULL; static size_t rmap_sz = 0;
     if (!rmap) {
         int fd = open("/tmp/macws_vnc_fb", O_RDONLY);
@@ -4706,7 +4803,10 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
         if (hdr[0] == 0x564E4346u) {
             size_t sh = hdr[2], sstride = hdr[3];
             char *data = (char *)rmap + 16;
-            if (16 + sstride * sh <= rmap_sz) {
+            if (sstride > 0 && sh > 0 && sh <= (SIZE_MAX - 24) / sstride &&
+                16 + sstride * sh + sizeof(uint64_t) <= rmap_sz) {
+                const _Atomic uint64_t *sequenceAddress =
+                    (const _Atomic uint64_t *)(data + sstride * sh);
                 size_t sw = hdr[1];
                 // paddedWidthInBytes is the server buffer stride, not its RFB
                 // visible width. On the Retina iPad it is 2388*4 while the
@@ -4738,28 +4838,53 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
                     y1 = (size_t)requestedY1;
                 }
                 if (sw > SIZE_MAX / 4 || sw * 4 > sstride) return false;
-                if (bytespp == 4 && sw > 0 && sh > 0 && dw > 0 && height > 0 &&
-                    (sw != dw || sh != (size_t)height)) {
-                    for (size_t y = y0; y < y1; y++) {
-                        size_t sy = y * sh / (size_t)height;
-                        const uint32_t *src = (const uint32_t *)(data + sy * sstride);
-                        uint32_t *dst = (uint32_t *)(macws_vnc_fb + y * (size_t)padded);
-                        for (size_t x = x0; x < x1; x++) {
-                            dst[x] = src[x * sw / dw];
-                        }
+                for (unsigned attempt = 0; attempt < 4; attempt++) {
+                    uint64_t before = atomic_load_explicit(
+                        sequenceAddress, memory_order_acquire);
+                    if (before == 0 || (before & 1u)) {
+                        usleep(1000);
+                        continue;
                     }
-                } else {
-                    size_t rows = ((size_t)height < sh) ? (size_t)height : sh;
-                    if (y1 > rows) y1 = rows;
-                    size_t byteX = x0 * (size_t)bytespp;
-                    size_t byteCount = (x1 - x0) * (size_t)bytespp;
-                    if (byteX + byteCount > (size_t)padded ||
-                        byteX + byteCount > sstride) return false;
-                    for (size_t y = y0; y < y1; y++)
-                        memcpy(macws_vnc_fb + y * (size_t)padded + byteX,
-                               data + y * sstride + byteX, byteCount);
+                    if (bytespp == 4 && sw > 0 && sh > 0 && dw > 0 &&
+                        height > 0 &&
+                        (sw != dw || sh != (size_t)height)) {
+                        for (size_t y = y0; y < y1; y++) {
+                            size_t sy = y * sh / (size_t)height;
+                            const uint32_t *src = (const uint32_t *)
+                                (data + sy * sstride);
+                            uint32_t *dst = (uint32_t *)
+                                (macws_vnc_fb + y * (size_t)padded);
+                            for (size_t x = x0; x < x1; x++) {
+                                dst[x] = src[x * sw / dw];
+                            }
+                        }
+                    } else {
+                        size_t rows = ((size_t)height < sh)
+                            ? (size_t)height : sh;
+                        if (y1 > rows) y1 = rows;
+                        size_t byteX = x0 * (size_t)bytespp;
+                        size_t byteCount = (x1 - x0) * (size_t)bytespp;
+                        if (byteX + byteCount > (size_t)padded ||
+                            byteX + byteCount > sstride) return false;
+                        for (size_t y = y0; y < y1; y++)
+                            memcpy(macws_vnc_fb + y * (size_t)padded + byteX,
+                                   data + y * sstride + byteX, byteCount);
+                    }
+                    atomic_thread_fence(memory_order_acquire);
+                    uint64_t after = atomic_load_explicit(
+                        sequenceAddress, memory_order_acquire);
+                    if (after == before && !(after & 1u)) return true;
+                    usleep(1000);
                 }
-                return true;
+                static _Atomic uint64_t unstable = 0;
+                uint64_t count = atomic_fetch_add(&unstable, 1) + 1;
+                if (count <= 8 || (count % 600) == 0) {
+                    fprintf(stderr,
+                        "#### OSXVNC mmap unstable #%llu rect=%d,%d %dx%d\n",
+                        (unsigned long long)count,
+                        rectX, rectY, rectWidth, rectHeight);
+                }
+                return false;
             }
         }
     }
@@ -4832,6 +4957,8 @@ static void macws_install_osxvnc_hooks(void) {
     char *base = (char *)mh;
     macws_rfbScreen = (int *)(base + 0x79bf8);
     macws_rfbBackingScale = (double *)(base + 0x7a1e8);
+    macws_vnc_refresh_callback =
+        (MacWSVNCRefreshCallback)(base + 0xd114);
     void *cgWidth = dlsym(RTLD_DEFAULT, "CGDisplayPixelsWide");
     void *cgHeight = dlsym(RTLD_DEFAULT, "CGDisplayPixelsHigh");
     if (cgWidth) MSHookFunction(cgWidth,
@@ -4849,6 +4976,15 @@ static void macws_install_osxvnc_hooks(void) {
         macws_orig_vnc_handle_mouse =
             (MacWSVNCHandleMouse)method_getImplementation(mouseMethod);
         method_setImplementation(mouseMethod, (IMP)macws_new_vnc_handle_mouse);
+    }
+    if (macws_vnc_share_on && macws_vnc_refresh_callback) {
+        pthread_t watcher;
+        int watcherError = pthread_create(
+            &watcher, NULL, macws_vnc_generation_watcher, NULL);
+        if (watcherError == 0) pthread_detach(watcher);
+        else fprintf(stderr,
+            "#### OSXVNC mmap generation watcher failed error=%d\n",
+            watcherError);
     }
     fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input=%s) base=%p rfbScreen=%p\n",
             macws_vnc_test_on, macws_vnc_share_on,
@@ -5785,6 +5921,10 @@ static int g_agxIdMapCount;
 #define MACWS_AGX_LIFE_CAP 16384u
 #define MACWS_AGX_CPU_DUMP_CAP 64u
 #define MACWS_AGX_CPU_DUMP_BYTES 0x10000u
+#define MACWS_AGX_T82_REQUEST_CAP 512u
+#define MACWS_AGX_T82_REQUEST_BYTES 0x100u
+#define MACWS_AGX_SURFACE_DUMP_CAP 16u
+#define MACWS_AGX_SURFACE_DUMP_BYTES 0x100000u
 struct macws_agx_life_entry {
     uint64_t gid;       // 0 = empty, UINT64_MAX = tombstone
     uint64_t gpu_address; // kernel-returned GPU VA (out+0x00)
@@ -5818,6 +5958,26 @@ struct macws_agx_life_event {
 static struct macws_agx_life_event
     g_agxLifeEvents[MACWS_AGX_LIFE_EVENT_CAP];
 static uint64_t g_agxLifeEventSerial;
+
+// Exact producer/kernel request bytes for recently-created type-0x82
+// resources.  This is populated only while the raw IOGPU error sentinel is
+// present.  The lifecycle table intentionally stores only compact metadata;
+// a separate bounded ring avoids adding half a kilobyte to every one of its
+// 16K slots during ordinary WindowServer runs.
+struct macws_agx_t82_request {
+    uint64_t sequence;
+    uint64_t life_event_serial;
+    uint64_t gid;
+    uint64_t gpu_address;
+    uint32_t surface_id;
+    uint16_t raw_length;
+    uint16_t sent_length;
+    unsigned char raw[MACWS_AGX_T82_REQUEST_BYTES];
+    unsigned char sent[MACWS_AGX_T82_REQUEST_BYTES];
+};
+static struct macws_agx_t82_request
+    g_macwsAgxT82Requests[MACWS_AGX_T82_REQUEST_CAP];
+static uint64_t g_macwsAgxT82RequestSequence;
 
 // Read the resource-generation boundary without exposing the lifecycle
 // table's lock ordering to the submit recorder.  The returned serial is the
@@ -5881,7 +6041,11 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
                                   uint32_t client_id, uint32_t surface_id,
                                   uint64_t gpu_address, uint64_t data_bytes,
                                   uint64_t client_shared, uint64_t bytes,
-                                  uint32_t flags_14, uint64_t request_50) {
+                                  uint32_t flags_14, uint64_t request_50,
+                                  const void *raw_request,
+                                  size_t raw_request_length,
+                                  const void *sent_request,
+                                  size_t sent_request_length) {
     pthread_mutex_lock(&g_agxLifeLock);
     g_agxLifeCreateOK++;
     unsigned start = macws_agx_life_hash(gid), first_tomb = MACWS_AGX_LIFE_CAP;
@@ -5915,6 +6079,29 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
             .surface_id = surface_id, .flags_14 = flags_14, .type = type
         };
         macws_agx_life_record_locked(1, &g_agxLife[slot]);
+        if (type == 0x82 &&
+            access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+            uint64_t request_sequence = ++g_macwsAgxT82RequestSequence;
+            struct macws_agx_t82_request *request =
+                &g_macwsAgxT82Requests[(request_sequence - 1) %
+                                       MACWS_AGX_T82_REQUEST_CAP];
+            memset(request, 0, sizeof(*request));
+            request->sequence = request_sequence;
+            request->life_event_serial = g_agxLifeEventSerial;
+            request->gid = gid;
+            request->gpu_address = gpu_address;
+            request->surface_id = surface_id;
+            request->raw_length = (uint16_t)MIN(raw_request_length,
+                (size_t)MACWS_AGX_T82_REQUEST_BYTES);
+            request->sent_length = (uint16_t)MIN(sent_request_length,
+                (size_t)MACWS_AGX_T82_REQUEST_BYTES);
+            if (raw_request && request->raw_length != 0) {
+                memcpy(request->raw, raw_request, request->raw_length);
+            }
+            if (sent_request && request->sent_length != 0) {
+                memcpy(request->sent, sent_request, request->sent_length);
+            }
+        }
         g_agxLifeLive[type]++;
         g_agxLifeBytes[type] += bytes;
         // The normal steady-state type-0x82 live set is only 4--6 entries, so
@@ -6008,6 +6195,33 @@ macws_agx_life_find_recent_destroyed_va_locked(uint64_t address) {
     return NULL;
 }
 
+static const struct macws_agx_t82_request *
+macws_agx_find_t82_request_locked(
+        const struct macws_agx_life_entry *resource) {
+    if (!resource || resource->type != 0x82) return NULL;
+    uint64_t newest = g_macwsAgxT82RequestSequence;
+    uint64_t oldest = newest > MACWS_AGX_T82_REQUEST_CAP
+        ? newest - MACWS_AGX_T82_REQUEST_CAP + 1 : 1;
+    for (uint64_t sequence = newest;
+         sequence >= oldest && sequence != 0; sequence--) {
+        const struct macws_agx_t82_request *request =
+            &g_macwsAgxT82Requests[(sequence - 1) %
+                                   MACWS_AGX_T82_REQUEST_CAP];
+        if (request->sequence != sequence ||
+            request->gid != resource->gid ||
+            request->gpu_address != resource->gpu_address ||
+            request->surface_id != resource->surface_id) continue;
+        return request;
+    }
+    return NULL;
+}
+
+struct macws_agx_surface_dump {
+    struct macws_agx_life_entry resource;
+    struct macws_agx_t82_request request;
+    BOOL has_request;
+};
+
 // Read-only error artifact.  Correlate aligned 64-bit KCMD words against the
 // kernel-returned VA ranges, and preserve the complete active/recent resource
 // state.  A match is evidence; unmatched address-looking words remain opaque
@@ -6029,6 +6243,9 @@ static void macws_agx_life_dump_snapshot(const char *directory,
     // The fixed count and per-resource byte cap keep a PageFault storm bounded.
     struct macws_agx_life_entry cpu_dumps[MACWS_AGX_CPU_DUMP_CAP];
     unsigned cpu_dump_count = 0;
+    struct macws_agx_surface_dump
+        surface_dumps[MACWS_AGX_SURFACE_DUMP_CAP];
+    unsigned surface_dump_count = 0;
 
     pthread_mutex_lock(&g_agxLifeLock);
     fprintf(output,
@@ -6082,6 +6299,32 @@ static void macws_agx_life_dump_snapshot(const char *directory,
                     }
                 }
                 if (!duplicate) cpu_dumps[cpu_dump_count++] = *active;
+            }
+            if (active->type == 0x82 && active->surface_id != 0 &&
+                surface_dump_count < MACWS_AGX_SURFACE_DUMP_CAP) {
+                BOOL duplicate = NO;
+                for (unsigned i = 0; i < surface_dump_count; i++) {
+                    const struct macws_agx_life_entry *saved =
+                        &surface_dumps[i].resource;
+                    if (saved->gid == active->gid &&
+                        saved->gpu_address == active->gpu_address &&
+                        saved->surface_id == active->surface_id) {
+                        duplicate = YES;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    struct macws_agx_surface_dump *selected =
+                        &surface_dumps[surface_dump_count++];
+                    memset(selected, 0, sizeof(*selected));
+                    selected->resource = *active;
+                    const struct macws_agx_t82_request *request =
+                        macws_agx_find_t82_request_locked(active);
+                    if (request) {
+                        selected->request = *request;
+                        selected->has_request = YES;
+                    }
+                }
             }
             continue;
         }
@@ -6165,6 +6408,141 @@ static void macws_agx_life_dump_snapshot(const char *directory,
             (unsigned long long)received, written,
             written ? dump_path : "(none)");
         free(copy);
+    }
+
+    fprintf(output,
+        "[direct-type82-iosurface-dumps] selected=%u max_resources=%u "
+        "max_head_bytes_each=%#x\n",
+        surface_dump_count, MACWS_AGX_SURFACE_DUMP_CAP,
+        MACWS_AGX_SURFACE_DUMP_BYTES);
+    for (unsigned i = 0; i < surface_dump_count; i++) {
+        const struct macws_agx_surface_dump *selected = &surface_dumps[i];
+        const struct macws_agx_life_entry *entry = &selected->resource;
+        char raw_path[PATH_MAX], sent_path[PATH_MAX];
+        snprintf(raw_path, sizeof(raw_path),
+            "%s/resource_gid%llx_va%llx_surf%x_request_raw.bin", directory,
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address, entry->surface_id);
+        snprintf(sent_path, sizeof(sent_path),
+            "%s/resource_gid%llx_va%llx_surf%x_request_sent.bin", directory,
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address, entry->surface_id);
+        size_t raw_written = 0, sent_written = 0;
+        if (selected->has_request) {
+            FILE *request_file = fopen(raw_path, "wb");
+            if (request_file) {
+                raw_written = fwrite(selected->request.raw, 1,
+                    selected->request.raw_length, request_file);
+                fclose(request_file);
+            }
+            request_file = fopen(sent_path, "wb");
+            if (request_file) {
+                sent_written = fwrite(selected->request.sent, 1,
+                    selected->request.sent_length, request_file);
+                fclose(request_file);
+            }
+        }
+
+        IOSurfaceRef surface = IOSurfaceLookup(entry->surface_id);
+        fprintf(output,
+            "gid=%#llx va=%#llx bytes=%#llx surface=%#x request50=%#llx "
+            "request_found=%s request_seq=%llu request_event=%llu "
+            "raw=%u/%#zx sent=%u/%#zx lookup=%p",
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->bytes, entry->surface_id,
+            (unsigned long long)entry->request_50,
+            selected->has_request ? "YES" : "NO",
+            (unsigned long long)selected->request.sequence,
+            (unsigned long long)selected->request.life_event_serial,
+            selected->request.raw_length, raw_written,
+            selected->request.sent_length, sent_written,
+            (__bridge void *)surface);
+        if (!surface) {
+            fprintf(output, "\n");
+            continue;
+        }
+
+        size_t width = IOSurfaceGetWidth(surface);
+        size_t height = IOSurfaceGetHeight(surface);
+        size_t alloc_size = IOSurfaceGetAllocSize(surface);
+        size_t bytes_per_row = IOSurfaceGetBytesPerRow(surface);
+        size_t bytes_per_element = IOSurfaceGetBytesPerElement(surface);
+        size_t plane_count = IOSurfaceGetPlaneCount(surface);
+        OSType pixel_format = IOSurfaceGetPixelFormat(surface);
+        uint32_t actual_id = IOSurfaceGetID(surface);
+
+        char properties_path[PATH_MAX];
+        snprintf(properties_path, sizeof(properties_path),
+            "%s/resource_gid%llx_va%llx_surf%x_properties.plist", directory,
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address, entry->surface_id);
+        size_t properties_written = 0;
+        CFDictionaryRef properties = IOSurfaceCopyAllValues(surface);
+        if (properties) {
+            CFErrorRef property_error = NULL;
+            CFDataRef property_data = CFPropertyListCreateData(
+                kCFAllocatorDefault, properties,
+                kCFPropertyListXMLFormat_v1_0, 0, &property_error);
+            if (property_data) {
+                FILE *properties_file = fopen(properties_path, "wb");
+                if (properties_file) {
+                    properties_written = fwrite(CFDataGetBytePtr(property_data),
+                        1, (size_t)CFDataGetLength(property_data),
+                        properties_file);
+                    fclose(properties_file);
+                }
+                CFRelease(property_data);
+            }
+            if (property_error) CFRelease(property_error);
+            CFRelease(properties);
+        }
+
+        uint32_t seed = 0;
+        int lock_result = IOSurfaceLock(surface, 1u, &seed);
+        void *base = lock_result == 0 ? IOSurfaceGetBaseAddress(surface) : NULL;
+        size_t head_wanted = alloc_size < MACWS_AGX_SURFACE_DUMP_BYTES
+            ? alloc_size : MACWS_AGX_SURFACE_DUMP_BYTES;
+        char head_path[PATH_MAX], tail_path[PATH_MAX];
+        snprintf(head_path, sizeof(head_path),
+            "%s/resource_gid%llx_va%llx_surf%x_surface_head.bin", directory,
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address, entry->surface_id);
+        snprintf(tail_path, sizeof(tail_path),
+            "%s/resource_gid%llx_va%llx_surf%x_surface_tail.bin", directory,
+            (unsigned long long)entry->gid,
+            (unsigned long long)entry->gpu_address, entry->surface_id);
+        size_t head_written = 0, tail_written = 0;
+        if (base && head_wanted != 0) {
+            FILE *surface_file = fopen(head_path, "wb");
+            if (surface_file) {
+                head_written = fwrite(base, 1, head_wanted, surface_file);
+                fclose(surface_file);
+            }
+            if (alloc_size > head_wanted) {
+                size_t tail_wanted = alloc_size - head_wanted;
+                if (tail_wanted > 0x10000) tail_wanted = 0x10000;
+                surface_file = fopen(tail_path, "wb");
+                if (surface_file) {
+                    tail_written = fwrite((const unsigned char *)base +
+                        alloc_size - tail_wanted, 1, tail_wanted,
+                        surface_file);
+                    fclose(surface_file);
+                }
+            }
+        }
+        int unlock_result = lock_result == 0
+            ? IOSurfaceUnlock(surface, 1u, &seed) : -1;
+        fprintf(output,
+            " actual_id=%#x width=%#zx height=%#zx alloc=%#zx bpr=%#zx "
+            "bpe=%#zx planes=%#zx pixel_format=%#x properties=%#zx "
+            "lock=%d base=%p seed=%u head=%#zx/%#zx tail=%#zx "
+            "unlock=%d\n",
+            actual_id, width, height, alloc_size, bytes_per_row,
+            bytes_per_element, plane_count, (unsigned)pixel_format,
+            properties_written, lock_result, base, seed,
+            head_written, head_wanted, tail_written, unlock_result);
+        CFRelease((CFTypeRef)surface);
     }
     fclose(output);
 }
@@ -8065,6 +8443,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     unsigned char shadowbuf[256];
     uint8_t  agxType = 0; uint32_t agxClientID = 0; uint64_t agxHeapSz = 0;
+    const void *agxRawRequest = NULL;
+    size_t agxRawRequestLength = 0;
     uint32_t resDiagSequence = 0;
     int resDiagActive = access("/tmp/macws_res_diag", F_OK) == 0;
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
@@ -8086,6 +8466,11 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
         }
         agxType = src[0];
+        if (agxType == 0x82 &&
+            access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+            agxRawRequest = src;
+            agxRawRequestLength = inStructCnt;
+        }
         uint8_t  f15  = src[0x15];                                // flag byte; bit-3 = "has parent"
         uint64_t bc   = *(const uint64_t *)(src + 0x40);          // for type=0: heap byte-count
         uint64_t f30  = *(const uint64_t *)(src + 0x30);
@@ -8565,7 +8950,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 ? *(const uint64_t *)(sent + 0x50) : 0;
             macws_agx_life_create(gid, agxType, client_id, surface_id,
                                   gpu_address, data_bytes, client_shared,
-                                  bytes, flags_14, request_50);
+                                  bytes, flags_14, request_50,
+                                  agxRawRequest, agxRawRequestLength,
+                                  inStruct, inStructCnt);
             if (agxType == 0x82) {
                 static _Atomic unsigned int t82_bt_count = 0;
                 unsigned int bt_n = atomic_fetch_add(&t82_bt_count, 1);

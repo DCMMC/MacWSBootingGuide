@@ -56,6 +56,8 @@ EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
 EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
 EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
+VNC_SHARED_FRAME="$ROOTFS/private/tmp/macws_vnc_fb"
+VNC_SHARED_SURFID="$ROOTFS/private/tmp/macws_vnc_surfid"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
 WINDOWSERVER_READY_WAIT=45
@@ -507,6 +509,14 @@ cleanup_macos() {
     # 4) anything still lingering
     kill_by_pattern "$P_WINDOWSERVER"
     kill_by_pattern "$P_LAUNCHSERVICESD"
+
+    # The mmap is a producer-owned WindowServer artifact, not persistent
+    # session state.  Keeping it after the producer exits lets a fresh OSXvnc
+    # process advertise pixels from an earlier application even when the new
+    # WindowServer has not published a frame.  Remove it only after every old
+    # producer/client has been stopped so no live mapping is invalidated.
+    rm -f "$VNC_SHARED_FRAME" "$VNC_SHARED_SURFID" \
+        "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
 
     sleep 1
     log "Cleanup done."
