@@ -38,6 +38,8 @@ typedef NSUInteger (*MacWSPressedMouseButtons)(id, SEL);
 
 static int MacWSAppInputSocket = -1;
 static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static const char MacWSInputTargetReplyPath[] =
+    "/private/tmp/macws_input_target.sock";
 static NSInteger MacWSAppInputEventNumber;
 static NSMutableArray *MacWSAppInputPending;
 static BOOL MacWSAppInputDrainScheduled;
@@ -833,18 +835,142 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
     if (scheduleDrain) MacWSScheduleAppInputDrain();
 }
 
+// macwsinputd's launchd session has no CoreGraphics window list.  A target
+// probe performs only a read-only AppKit hit test in each application; the
+// broker sends the real input record to exactly one selected PID afterward.
+// Keeping this on the main thread is required because orderedWindows and
+// keyWindow are AppKit state, not socket-thread APIs.
+static void MacWSReplyToTargetProbeOnMainThread(
+        MacWSInputTargetProbe probe) {
+    MacWSInputTargetReply reply = {
+        .magic = MACWS_TARGET_REPLY_MAGIC,
+        .version = MACWS_TARGET_VERSION,
+        .size = sizeof(MacWSInputTargetReply),
+        .nonce = probe.nonce,
+        .pid = getpid(),
+    };
+    Class applicationClass = objc_getClass("NSApplication");
+    Class screenClass = objc_getClass("NSScreen");
+    id application = applicationClass
+        ? ((MacWSMsgID)objc_msgSend)((id)applicationClass,
+                                    sel_registerName("sharedApplication"))
+        : nil;
+    id screen = screenClass
+        ? ((MacWSMsgID)objc_msgSend)((id)screenClass,
+                                    sel_registerName("mainScreen"))
+        : nil;
+    id hitWindow = nil;
+    CGRect hitWindowFrame = {{0.0, 0.0}, {0.0, 0.0}};
+    id keyWindow = application
+        ? ((MacWSMsgID)objc_msgSend)(application,
+                                    sel_registerName("keyWindow"))
+        : nil;
+    if (application && screen && probe.frameWidth != 0 &&
+        probe.frameHeight != 0) {
+        CGRect screenFrame = ((MacWSMsgRect)objc_msgSend)(
+            screen, sel_registerName("frame"));
+        CGPoint screenPoint = {
+            screenFrame.origin.x +
+                (probe.x / (CGFloat)probe.frameWidth) *
+                    screenFrame.size.width,
+            screenFrame.origin.y +
+                (1.0 - probe.y / (CGFloat)probe.frameHeight) *
+                    screenFrame.size.height,
+        };
+        id windows = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("orderedWindows"));
+        NSUInteger count = [windows count];
+        for (NSUInteger index = 0; index < count; index++) {
+            id candidate = [windows objectAtIndex:index];
+            BOOL visible = ((MacWSMsgBool)objc_msgSend)(
+                candidate, sel_registerName("isVisible"));
+            CGRect frame = ((MacWSMsgRect)objc_msgSend)(
+                candidate, sel_registerName("frame"));
+            if (visible && MacWSPointInRect(screenPoint, frame)) {
+                hitWindow = candidate;
+                hitWindowFrame = frame;
+                break;
+            }
+        }
+    }
+    if (hitWindow) {
+        reply.flags |= MacWSInputTargetHit;
+        reply.windowNumber = (int32_t)((MacWSMsgInteger)objc_msgSend)(
+            hitWindow, sel_registerName("windowNumber"));
+        if (hitWindow == keyWindow)
+            reply.flags |= MacWSInputTargetKeyWindow;
+    }
+    if (application && ((MacWSMsgBool)objc_msgSend)(
+            application, sel_registerName("isActive"))) {
+        reply.flags |= MacWSInputTargetApplicationActive;
+    }
+
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    ssize_t sent = -1;
+    int savedError = 0;
+    if (socketFD >= 0) {
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        strlcpy(address.sun_path, MacWSInputTargetReplyPath,
+                sizeof(address.sun_path));
+        sent = sendto(socketFD, &reply, sizeof(reply), MSG_DONTWAIT,
+                      (const struct sockaddr *)&address, sizeof(address));
+        if (sent != (ssize_t)sizeof(reply)) savedError = errno;
+        close(socketFD);
+    } else {
+        savedError = errno;
+    }
+    static unsigned probeLogs;
+    if (probeLogs++ < 24) {
+        fprintf(stderr,
+                "#### APP-INPUT TARGET-REPLY pid=%d nonce=%llu "
+                "window=%d flags=%#x frame=(%.1f,%.1f %.1fx%.1f) "
+                "sent=%zd errno=%d\n",
+                getpid(), (unsigned long long)probe.nonce,
+                reply.windowNumber, reply.flags,
+                hitWindowFrame.origin.x, hitWindowFrame.origin.y,
+                hitWindowFrame.size.width, hitWindowFrame.size.height, sent,
+                sent == (ssize_t)sizeof(reply) ? 0 : savedError);
+        fflush(stderr);
+    }
+}
+
+static void MacWSScheduleTargetProbeReply(MacWSInputTargetProbe probe) {
+    CFRunLoopRef mainRunLoop = CFRunLoopGetMain();
+    CFRunLoopPerformBlock(mainRunLoop, kCFRunLoopCommonModes, ^{
+        @autoreleasepool {
+            MacWSReplyToTargetProbeOnMainThread(probe);
+        }
+    });
+    CFRunLoopWakeUp(mainRunLoop);
+}
+
 static void *MacWSAppInputThread(void *unused) {
     (void)unused;
     fprintf(stderr, "#### APP-INPUT THREAD pid=%d socket=%d\n",
             getpid(), MacWSAppInputSocket);
     fflush(stderr);
     while (MacWSAppInputSocket >= 0) {
-        MacWSInputRecord record = {0};
-        ssize_t count = recv(MacWSAppInputSocket, &record, sizeof(record), 0);
+        union {
+            MacWSInputRecord record;
+            MacWSInputTargetProbe probe;
+        } message = {0};
+        ssize_t count = recv(MacWSAppInputSocket, &message, sizeof(message), 0);
         if (count < 0) {
             if (errno == EINTR) continue;
             break;
         }
+        if (count == sizeof(MacWSInputTargetProbe) &&
+            message.probe.magic == MACWS_TARGET_PROBE_MAGIC &&
+            message.probe.version == MACWS_TARGET_VERSION &&
+            message.probe.size == sizeof(MacWSInputTargetProbe) &&
+            isfinite(message.probe.x) && isfinite(message.probe.y) &&
+            message.probe.frameWidth != 0 &&
+            message.probe.frameHeight != 0) {
+            MacWSScheduleTargetProbeReply(message.probe);
+            continue;
+        }
+        MacWSInputRecord record = message.record;
         if (record.kind != MacWSInputKindTouchMove &&
             record.kind != MacWSInputKindHover) {
             fprintf(stderr,

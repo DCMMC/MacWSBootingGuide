@@ -232,6 +232,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
+    rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 }
 
 wait_for_replacement_ws() {
@@ -502,6 +503,7 @@ cleanup_macos() {
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
+    rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 
     # 3) the WindowServer + launchservicesd daemons
     launchctl unload "$MACOS_DAEMONS" 2>/dev/null

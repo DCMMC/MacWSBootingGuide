@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -71,10 +72,13 @@ enum {
 
 static const char InputSocketPath[] = "/private/tmp/macws_host_input.sock";
 static const char InputLockPath[] = "/private/tmp/macws_host_input.lock";
+static const char TargetSocketPath[] = "/private/tmp/macws_input_target.sock";
 static const char CaptureRequestPath[] = "/tmp/macws_capture_final";
 static volatile sig_atomic_t StopRequested;
 static volatile sig_atomic_t InputSocketFD = -1;
+static volatile sig_atomic_t TargetSocketFD = -1;
 static uint64_t LastCaptureGeneration;
+static uint64_t TargetProbeNonce;
 
 typedef struct {
     pid_t pid;
@@ -90,6 +94,9 @@ static void HandleSignal(int signalNumber) {
     int socketFD = (int)InputSocketFD;
     InputSocketFD = -1;
     if (socketFD >= 0) close(socketFD);
+    int targetSocketFD = (int)TargetSocketFD;
+    TargetSocketFD = -1;
+    if (targetSocketFD >= 0) close(targetSocketFD);
 }
 
 static const char *KindName(MacWSInputKind kind) {
@@ -284,18 +291,12 @@ static bool SendToAppInputBridge(int socketFD,
     return sent == (ssize_t)sizeof(*record);
 }
 
-// Runtime-confirmed on the chroot launchd session: CGWindowListCopyWindowInfo
-// returns NULL even though a Terminal AppInputBridge socket is live.  When
-// there is exactly one healthy AppKit endpoint, it is an unambiguous target
-// for targetPID=0 producers such as OSXvnc. Never broadcast, and never guess
-// when multiple applications are running.
-static pid_t SoleAppInputBridgePID(void) {
+static size_t AppInputBridgePIDs(pid_t *pids, size_t capacity) {
     static const char prefix[] = "macws_app_input.";
     static const char suffix[] = ".sock";
     DIR *directory = opendir("/private/tmp");
     if (!directory) return 0;
-    pid_t result = 0;
-    unsigned matches = 0;
+    size_t matches = 0;
     struct dirent *entry;
     while ((entry = readdir(directory)) != NULL) {
         const char *name = entry->d_name;
@@ -313,15 +314,140 @@ static pid_t SoleAppInputBridgePID(void) {
             parsed > INT32_MAX || kill((pid_t)parsed, 0) != 0) {
             continue;
         }
+        if (matches < capacity) pids[matches] = (pid_t)parsed;
         matches++;
-        result = (pid_t)parsed;
-        if (matches > 1) {
-            result = 0;
-            break;
-        }
     }
     closedir(directory);
-    return result;
+    return matches;
+}
+
+// Runtime-confirmed on the chroot launchd session: CGWindowListCopyWindowInfo
+// returns NULL even though an AppInputBridge socket is live. When there is
+// exactly one healthy AppKit endpoint, it remains an unambiguous fallback.
+static pid_t SoleAppInputBridgePID(void) {
+    pid_t pids[2] = {0};
+    return AppInputBridgePIDs(pids, 2) == 1 ? pids[0] : 0;
+}
+
+static bool PIDInList(pid_t pid, const pid_t *pids, size_t count) {
+    for (size_t index = 0; index < count; index++) {
+        if (pids[index] == pid) return true;
+    }
+    return false;
+}
+
+// Ask every live AppKit process to hit-test on its own main thread, then send
+// the real event only to the unique best reply. This is a query broadcast,
+// not an event broadcast: probes cannot create NSEvents. Active/key state
+// disambiguates overlapping windows; equal-ranked overlaps remain unresolved
+// rather than delivering one click to multiple applications.
+static MacWSWindowTarget ProbeAppInputTarget(
+        int targetSocketFD, const MacWSInputRecord *record) {
+    MacWSWindowTarget target = {0};
+    if (targetSocketFD < 0 || record->frameWidth == 0 ||
+        record->frameHeight == 0) return target;
+
+    pid_t pids[64] = {0};
+    size_t discovered = AppInputBridgePIDs(pids, 64);
+    size_t pidCount = discovered < 64 ? discovered : 64;
+    if (pidCount == 0) return target;
+
+    // Replies from a timed-out older probe must not influence this decision.
+    MacWSInputTargetReply stale;
+    while (recv(targetSocketFD, &stale, sizeof(stale), MSG_DONTWAIT) > 0) {}
+
+    uint64_t nonce = ++TargetProbeNonce;
+    if (nonce == 0) nonce = ++TargetProbeNonce;
+    MacWSInputTargetProbe probe = {
+        .magic = MACWS_TARGET_PROBE_MAGIC,
+        .version = MACWS_TARGET_VERSION,
+        .size = sizeof(MacWSInputTargetProbe),
+        .nonce = nonce,
+        .x = record->x,
+        .y = record->y,
+        .frameWidth = record->frameWidth,
+        .frameHeight = record->frameHeight,
+    };
+
+    size_t sentCount = 0;
+    for (size_t index = 0; index < pidCount; index++) {
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        int length = snprintf(address.sun_path, sizeof(address.sun_path),
+                              "/private/tmp/macws_app_input.%d.sock",
+                              pids[index]);
+        if (length <= 0 || (size_t)length >= sizeof(address.sun_path)) continue;
+        ssize_t sent = sendto(targetSocketFD, &probe, sizeof(probe),
+                              MSG_DONTWAIT,
+                              (const struct sockaddr *)&address,
+                              sizeof(address));
+        if (sent == (ssize_t)sizeof(probe)) sentCount++;
+    }
+    if (sentCount == 0) return target;
+
+    uint64_t deadline = RealtimeNanoseconds() + 150000000ull;
+    size_t replies = 0;
+    int bestScore = -1;
+    bool ambiguous = false;
+    while (replies < sentCount) {
+        uint64_t now = RealtimeNanoseconds();
+        if (now >= deadline) break;
+        int remainingMilliseconds = (int)((deadline - now + 999999ull) /
+                                          1000000ull);
+        struct pollfd descriptor = {
+            .fd = targetSocketFD,
+            .events = POLLIN,
+        };
+        int pollResult = poll(&descriptor, 1, remainingMilliseconds);
+        if (pollResult <= 0) break;
+        MacWSInputTargetReply reply = {0};
+        ssize_t received = recv(targetSocketFD, &reply, sizeof(reply), 0);
+        if (received != sizeof(reply) ||
+            reply.magic != MACWS_TARGET_REPLY_MAGIC ||
+            reply.version != MACWS_TARGET_VERSION ||
+            reply.size != sizeof(MacWSInputTargetReply) ||
+            reply.nonce != nonce || reply.pid <= 1 ||
+            !PIDInList((pid_t)reply.pid, pids, pidCount)) {
+            continue;
+        }
+        replies++;
+        static unsigned replyLogs;
+        if (replyLogs++ < 48) {
+            fprintf(stderr,
+                    "MACWS-INPUT TARGET-REPLY nonce=%llu pid=%d window=%d "
+                    "flags=%#x\n",
+                    (unsigned long long)nonce, reply.pid,
+                    reply.windowNumber, reply.flags);
+        }
+        if (!(reply.flags & MacWSInputTargetHit)) continue;
+        int score = 0;
+        if (reply.flags & MacWSInputTargetApplicationActive) score += 2;
+        if (reply.flags & MacWSInputTargetKeyWindow) score += 1;
+        if (score > bestScore) {
+            bestScore = score;
+            target.pid = (pid_t)reply.pid;
+            target.windowID = reply.windowNumber;
+            ambiguous = false;
+        } else if (score == bestScore && target.pid != reply.pid) {
+            ambiguous = true;
+        }
+    }
+    // If an endpoint missed the deadline, only an active application's hit is
+    // authoritative. Otherwise a responsive covered app could steal a click
+    // from an unresponsive front app.
+    if (ambiguous || (replies < sentCount && bestScore < 2))
+        target = (MacWSWindowTarget){0};
+    static unsigned resultLogs;
+    if (resultLogs++ < 32) {
+        fprintf(stderr,
+                "MACWS-INPUT TARGET-PROBE nonce=%llu endpoints=%zu sent=%zu "
+                "replies=%zu selected=%d window=%d score=%d ambiguous=%s\n",
+                (unsigned long long)nonce, pidCount, sentCount, replies,
+                target.pid, target.windowID, bestScore,
+                ambiguous ? "YES" : "NO");
+        fflush(stderr);
+    }
+    return target;
 }
 
 // Arm one diagnostic capture for a completed gesture. Continuous PF80/PF115
@@ -395,6 +521,30 @@ int main(void) {
                 InputSocketPath, strerror(errno));
     }
 
+    int targetSocketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (targetSocketFD >= 0) {
+        struct sockaddr_un targetAddress = {0};
+        targetAddress.sun_family = AF_UNIX;
+        memcpy(targetAddress.sun_path, TargetSocketPath,
+               sizeof(TargetSocketPath));
+        unlink(TargetSocketPath);
+        if (bind(targetSocketFD,
+                 (const struct sockaddr *)&targetAddress,
+                 sizeof(targetAddress)) < 0) {
+            fprintf(stderr, "macwsinputd bind %s failed: %s\n",
+                    TargetSocketPath, strerror(errno));
+            close(targetSocketFD);
+            targetSocketFD = -1;
+        } else if (chmod(TargetSocketPath, 0666) < 0) {
+            fprintf(stderr, "macwsinputd chmod %s failed: %s\n",
+                    TargetSocketPath, strerror(errno));
+        }
+    } else {
+        fprintf(stderr, "macwsinputd target socket failed: %s\n",
+                strerror(errno));
+    }
+    TargetSocketFD = targetSocketFD;
+
     CGDirectDisplayID display;
     CGRect bounds;
     size_t pixelWidth;
@@ -402,11 +552,13 @@ int main(void) {
     ReadDisplayGeometry(&display, &bounds, &pixelWidth, &pixelHeight);
     fprintf(stderr,
             "MACWS-INPUT READY socket=%s abi=%u record=%zu display=%u "
-            "bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu postAccess=%s\n",
+            "bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu postAccess=%s "
+            "targetSocket=%s\n",
             InputSocketPath, MACWS_INPUT_VERSION, sizeof(MacWSInputRecord),
             display, bounds.origin.x, bounds.origin.y,
             bounds.size.width, bounds.size.height, pixelWidth, pixelHeight,
-            CGPreflightPostEventAccess() ? "YES" : "NO");
+            CGPreflightPostEventAccess() ? "YES" : "NO",
+            targetSocketFD >= 0 ? "READY" : "UNAVAILABLE");
     fflush(stderr);
 
     uint64_t sequence = 0;
@@ -467,6 +619,12 @@ int main(void) {
                 gestureTarget = eventTarget;
         } else {
             eventTarget = WindowTargetAtPoint(point);
+            if (eventTarget.pid <= 1) {
+                if (record.kind == MacWSInputKindTouchDown ||
+                    record.kind == MacWSInputKindTap) {
+                    eventTarget = ProbeAppInputTarget(targetSocketFD, &record);
+                }
+            }
             if (eventTarget.pid <= 1) {
                 eventTarget.pid = SoleAppInputBridgePID();
             }
@@ -589,9 +747,14 @@ int main(void) {
         close((int)InputSocketFD);
         InputSocketFD = -1;
     }
+    if (TargetSocketFD >= 0) {
+        close((int)TargetSocketFD);
+        TargetSocketFD = -1;
+    }
     flock(lockFD, LOCK_UN);
     close(lockFD);
     unlink(InputSocketPath);
+    unlink(TargetSocketPath);
     fprintf(stderr, "MACWS-INPUT STOP\n");
     return 0;
 }

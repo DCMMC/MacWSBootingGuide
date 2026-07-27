@@ -33,8 +33,21 @@ for p in $(jobs -p); do kill -9 $p 2>/dev/null; done
 
 echo === killing chroot processes ===
 for pat in WindowServer launchservicesd OSXvnc-server Terminal GlassDemo \
-           "Activity Monitor" launchdchrootexec MTLSimDriverHost macwsinputd; do
+           "Activity Monitor" launchdchrootexec MTLSimDriverHost macwsinputd \
+           MacWSHost; do
   pkill -9 -f "$pat" 2>/dev/null
+done
+
+# A running UIKit application is owned by mobile and may survive root's
+# procursus pkill on this jailbreak. Remove its exact dynamic launchd label,
+# then kill only the executable path if SpringBoard has not reaped it yet.
+for label in $(launchctl list 2>/dev/null \
+    | awk '/UIKitApplication:com\.macwsguide\.host/{print $3}'); do
+  launchctl remove "$label" 2>/dev/null
+done
+for pid in $(ps aux 2>/dev/null \
+    | awk '/Applications\/MacWSHost\.app\/MacWSHost/ && !/awk/{print $2}'); do
+  kill -9 "$pid" 2>/dev/null
 done
 
 echo === killing all autosignd zombies ===
@@ -56,7 +69,7 @@ sleep 2
 echo
 echo === final state ===
 ps aux | grep -iE \
-  "WindowServer|macwsallocd|macwsinputd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd" \
+  "WindowServer|macwsallocd|macwsinputd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|MacWSHost" \
   | grep -v grep | head -10 || echo "(none)"
 echo
 uptime

@@ -1375,12 +1375,46 @@ The persistent regression client and full RE/runtime record are in
 [`docs/evidence/native-agx-terminal-vnc-refresh-20260728.txt`](evidence/native-agx-terminal-vnc-refresh-20260728.txt).
 The test ended with `misc/cleanup_all.sh` and restored iOS.
 
+## 2026-07-28: multi-application VNC target resolution and 20-click soak
+
+A longer persistent-client run exposed a separate input invariant. With both
+Terminal and GlassDemo alive, macwsinputd's launchd session still returned
+`CGWindowListCopyWindowInfo = NULL`; the sole-endpoint fallback therefore had
+no legal target, and logs showed `route=global-fallback pid=0` even though
+OSXvnc had sent the complete record.
+
+The broker now broadcasts only a nonce-bound, versioned hit-test query to live
+AppKit endpoints. Each application answers from its main thread with the first
+visible local window containing the point plus active/key flags. The original
+input event is then sent to exactly one uniquely ranked PID; it is never
+broadcast, and equal-ranked overlaps remain unresolved. Runtime with Terminal
+behind GlassDemo produced two replies (`flags=0` versus `flags=0x7`) and
+selected only GlassDemo's real window.
+
+On one retained 2388x1668 RFB connection, twenty checkbox taps completed in
+224.9 seconds. All twenty target probes selected GlassDemo, all twenty events
+used the AppKit socket, and the real NSButton value alternated exactly ten
+times `0→1` and ten times `1→0`. Every iteration received a changed full Retina
+dirty frame. Native PF550 reached `clean=12000 error=0`; the isolated run
+segment contained no PageFault, `AGX_SUBMIT_ERROR`, or raw IOGPU error callback.
+WindowServer stayed on one PID. Its RSS spot samples increased by about 15 MiB,
+so the result is a bounded interaction soak, not a long-term leak/thermal
+claim.
+
+The reusable client can now optionally require a changed crop around the click
+to reject unrelated animation updates. Full wire protocol, runtime excerpts,
+hashes, resource samples, the corrected preview-coordinate false lead, and
+cleanup proof are in
+[`misc/vnc_interactive_soak.py`](../misc/vnc_interactive_soak.py) and
+[`docs/evidence/native-agx-vnc-multiapp-soak-20260728.txt`](evidence/native-agx-vnc-multiapp-soak-20260728.txt).
+
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
 items are hardening and application-coverage work:
 
-1. Run a longer Terminal/GlassDemo soak. If the historical 1140x798 fault
+1. Extend the completed 225-second, 20-click GlassDemo soak to a substantially
+   longer thermal/resource run. If the historical 1140x798 fault
    reappears, recover its actual GPU fault VA from a kernel gpuEvent or capture
    the second-level descriptor/buffer contents referenced by that KCMD;
    selector 0x107 and the 0x20-byte userspace completion record are ruled out.
