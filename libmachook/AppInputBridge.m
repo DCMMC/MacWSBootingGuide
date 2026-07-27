@@ -12,6 +12,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <stdatomic.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
@@ -26,7 +27,10 @@ typedef CGRect (*MacWSMsgRectRectID)(id, SEL, CGRect, id);
 typedef CGPoint (*MacWSMsgPointPoint)(id, SEL, CGPoint);
 typedef CGPoint (*MacWSMsgPointPointID)(id, SEL, CGPoint, id);
 typedef NSInteger (*MacWSMsgInteger)(id, SEL);
+typedef NSUInteger (*MacWSMsgUInteger)(id, SEL);
 typedef BOOL (*MacWSMsgBool)(id, SEL);
+typedef BOOL (*MacWSMsgBoolSEL)(id, SEL, SEL);
+typedef void (*MacWSMsgVoidBool)(id, SEL, BOOL);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
 typedef id (*MacWSMouseEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
@@ -93,6 +97,205 @@ static CFTypeRef MacWSAppInputGestureWindow;
 static CFTypeRef MacWSAppInputGestureHitView;
 static double MacWSAppInputGestureHitValueBefore;
 static BOOL MacWSAppInputGestureHitHasValue;
+static MacWSSendEvent MacWSOriginalApplicationSendEvent;
+static _Atomic uint64_t MacWSApplicationDisplaySettleSerial;
+static uint32_t MacWSApplicationDisplaySettleMilliseconds;
+
+static double MacWSAppInputMonotonicSeconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+// Narrow usability scaffold at a runtime-confirmed Terminal race.  With fast
+// commands, the pty model can advance after Return's delayed AppKit redraw has
+// already been consumed, leaving the result one transaction behind.  LLDB also
+// proved that Terminal normally calls -[NSView setNeedsDisplayInRect:] from an
+// NSFireDelayedPerform callback, and output deliberately delayed by two seconds
+// renders without this callback.  Therefore this is NOT a replacement display
+// clock and must not be installed globally: only an application whose launch
+// environment explicitly sets MACWS_APP_DISPLAY_SETTLE_MS gets one debounced
+// post-key-up invalidation.  A 250-ms displayIfNeeded-only A/B observed
+// viewsNeedDisplay=NO and did not recover the fast-output race; the forced
+// responder invalidation is intentionally labelled a scaffold, not a root fix.
+static void MacWSScheduleApplicationDisplaySettle(void) {
+    uint64_t serial = atomic_fetch_add_explicit(
+        &MacWSApplicationDisplaySettleSerial, 1,
+        memory_order_acq_rel) + 1;
+    uint64_t delayNanoseconds =
+        (uint64_t)MacWSApplicationDisplaySettleMilliseconds * NSEC_PER_MSEC;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanoseconds),
+                   dispatch_get_main_queue(), ^{
+        if (atomic_load_explicit(&MacWSApplicationDisplaySettleSerial,
+                                 memory_order_acquire) != serial) return;
+        Class applicationClass = objc_getClass("NSApplication");
+        id application = applicationClass ? ((MacWSMsgID)objc_msgSend)(
+            applicationClass, sel_registerName("sharedApplication")) : nil;
+        id window = application ? ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("keyWindow")) : nil;
+        id responder = window ? ((MacWSMsgID)objc_msgSend)(
+            window, sel_registerName("firstResponder")) : nil;
+        SEL setNeedsDisplay = sel_registerName("setNeedsDisplay:");
+        BOOL canInvalidate = responder && ((MacWSMsgBoolSEL)objc_msgSend)(
+            responder, sel_registerName("respondsToSelector:"),
+            setNeedsDisplay);
+        BOOL hasString = responder && ((MacWSMsgBoolSEL)objc_msgSend)(
+            responder, sel_registerName("respondsToSelector:"),
+            sel_registerName("string"));
+        id string = hasString ? ((MacWSMsgID)objc_msgSend)(
+            responder, sel_registerName("string")) : nil;
+        NSUInteger stringLength = string ? ((MacWSMsgUInteger)objc_msgSend)(
+            string, sel_registerName("length")) : 0;
+        BOOL neededBefore = window && ((MacWSMsgBool)objc_msgSend)(
+            window, sel_registerName("viewsNeedDisplay"));
+        double started = MacWSAppInputMonotonicSeconds();
+        if (canInvalidate) ((MacWSMsgVoidBool)objc_msgSend)(
+            responder, setNeedsDisplay, YES);
+        if (window) ((void (*)(id, SEL))objc_msgSend)(
+            window, sel_registerName("displayIfNeeded"));
+        Class transactionClass = objc_getClass("CATransaction");
+        SEL flushSelector = sel_registerName("flush");
+        if (transactionClass && class_respondsToSelector(
+                object_getClass(transactionClass), flushSelector)) {
+            ((void (*)(id, SEL))objc_msgSend)(
+                transactionClass, flushSelector);
+        }
+        BOOL neededAfter = window && ((MacWSMsgBool)objc_msgSend)(
+            window, sel_registerName("viewsNeedDisplay"));
+        static _Atomic uint64_t settleCount;
+        uint64_t count = atomic_fetch_add_explicit(
+            &settleCount, 1, memory_order_relaxed) + 1;
+        if (count <= 24) {
+            fprintf(stderr,
+                "#### APP-INPUT DISPLAY-SETTLE pid=%d serial=%llu "
+                "window=%ld responder=%s string-length=%lu "
+                "forced=%s needed-before=%s needed-after=%s "
+                "delay=%ums elapsed=%.3fms at=%.6f\n",
+                getpid(), (unsigned long long)serial,
+                window ? (long)((MacWSMsgInteger)objc_msgSend)(
+                    window, sel_registerName("windowNumber")) : -1L,
+                responder ? object_getClassName(responder) : "(null)",
+                (unsigned long)stringLength,
+                canInvalidate ? "YES" : "NO",
+                neededBefore ? "YES" : "NO",
+                neededAfter ? "YES" : "NO",
+                MacWSApplicationDisplaySettleMilliseconds,
+                (MacWSAppInputMonotonicSeconds() - started) * 1000.0,
+                started);
+            fflush(stderr);
+        }
+    });
+}
+
+// Observational witness for the boundary between CoreGraphics' event queue
+// and the target AppKit main thread. OSXvnc logs the same monotonic clock at
+// handleKeyboard entry. Comparing the two proves whether delay occurs before
+// or after NSApplication receives the event; this hook never creates,
+// suppresses, or rewrites an event.
+static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
+    NSUInteger type = event ? ((MacWSMsgUInteger)objc_msgSend)(
+        event, sel_registerName("type")) : 0;
+    uint64_t serial = 0;
+    double started = 0.0;
+    id keyWindow = nil;
+    id responder = nil;
+    if (type == 10 || type == 11) { // NSEventTypeKeyDown / KeyUp
+        static _Atomic uint64_t keyEvents;
+        serial = atomic_fetch_add_explicit(
+            &keyEvents, 1, memory_order_relaxed) + 1;
+        started = MacWSAppInputMonotonicSeconds();
+        keyWindow = ((MacWSMsgID)objc_msgSend)(
+            self, sel_registerName("keyWindow"));
+        responder = keyWindow ? ((MacWSMsgID)objc_msgSend)(
+            keyWindow, sel_registerName("firstResponder")) : nil;
+        if (serial <= 48) {
+            NSInteger keyCode = ((MacWSMsgInteger)objc_msgSend)(
+                event, sel_registerName("keyCode"));
+            id characters = ((MacWSMsgID)objc_msgSend)(
+                event, sel_registerName("characters"));
+            const char *utf8 = characters
+                ? ((const char *(*)(id, SEL))objc_msgSend)(
+                    characters, sel_registerName("UTF8String")) : NULL;
+            fprintf(stderr,
+                "#### APP-INPUT KEY-EVENT pid=%d serial=%llu type=%lu "
+                "keycode=%ld chars=%s active=%s window=%ld responder=%s "
+                "at=%.6f\n",
+                getpid(), (unsigned long long)serial, (unsigned long)type,
+                (long)keyCode, utf8 ?: "(null)",
+                ((MacWSMsgBool)objc_msgSend)(
+                    self, sel_registerName("isActive")) ? "YES" : "NO",
+                keyWindow ? (long)((MacWSMsgInteger)objc_msgSend)(
+                    keyWindow, sel_registerName("windowNumber")) : -1L,
+                responder ? object_getClassName(responder) : "(null)",
+                started);
+            fflush(stderr);
+        }
+    }
+    if (MacWSOriginalApplicationSendEvent)
+        MacWSOriginalApplicationSendEvent(self, command, event);
+    if (type == 11 && MacWSApplicationDisplaySettleMilliseconds != 0)
+        MacWSScheduleApplicationDisplaySettle();
+    if (serial != 0 && serial <= 48) {
+        double finished = MacWSAppInputMonotonicSeconds();
+        BOOL hasString = responder && ((MacWSMsgBoolSEL)objc_msgSend)(
+            responder, sel_registerName("respondsToSelector:"),
+            sel_registerName("string"));
+        id string = hasString ? ((MacWSMsgID)objc_msgSend)(
+            responder, sel_registerName("string")) : nil;
+        NSUInteger length = string ? ((MacWSMsgUInteger)objc_msgSend)(
+            string, sel_registerName("length")) : 0;
+        fprintf(stderr,
+            "#### APP-INPUT KEY-RETURN pid=%d serial=%llu elapsed=%.3fms "
+            "active=%s responder=%s has-string=%s length=%lu\n",
+            getpid(), (unsigned long long)serial,
+            (finished - started) * 1000.0,
+            ((MacWSMsgBool)objc_msgSend)(
+                self, sel_registerName("isActive")) ? "YES" : "NO",
+            responder ? object_getClassName(responder) : "(null)",
+            hasString ? "YES" : "NO", (unsigned long)length);
+        fflush(stderr);
+    }
+}
+
+static void MacWSInstallApplicationKeyWitness(void) {
+    const char *settleValue = getenv("MACWS_APP_DISPLAY_SETTLE_MS");
+    if (!settleValue || !*settleValue) return;
+    char *settleEnd = NULL;
+    errno = 0;
+    unsigned long settleMilliseconds = strtoul(
+        settleValue, &settleEnd, 10);
+    if (errno != 0 || settleEnd == settleValue || *settleEnd != '\0' ||
+        settleMilliseconds < 16 || settleMilliseconds > 2000) {
+        fprintf(stderr,
+            "#### APP-INPUT DISPLAY-SETTLE disabled invalid "
+            "MACWS_APP_DISPLAY_SETTLE_MS='%s' (valid=16..2000)\n",
+            settleValue);
+        fflush(stderr);
+        return;
+    }
+    MacWSApplicationDisplaySettleMilliseconds =
+        (uint32_t)settleMilliseconds;
+    // This constructor runs while dyld is still executing initializers.
+    // NSClassFromString builds an NSString and entered Foundation before its
+    // ObjC initialization was complete on arm64e (runtime crash witness:
+    // Terminal-2026-07-28-021535.ips, NSClassFromString+52). The ObjC runtime
+    // lookup takes a plain C string and is already used by the bridge's event
+    // path for these AppKit classes.
+    Class applicationClass = objc_getClass("NSApplication");
+    Method method = applicationClass ? class_getInstanceMethod(
+        applicationClass, sel_registerName("sendEvent:")) : NULL;
+    if (!method) return;
+    IMP implementation = method_getImplementation(method);
+    if (implementation == (IMP)MacWSAppInputApplicationSendEvent) return;
+    MacWSOriginalApplicationSendEvent = (MacWSSendEvent)implementation;
+    method_setImplementation(method,
+        (IMP)MacWSAppInputApplicationSendEvent);
+    fprintf(stderr,
+        "#### APP-INPUT KEY-WITNESS installed -[NSApplication sendEvent:] "
+        "display-settle=%ums (diagnostic scaffold)\n",
+        MacWSApplicationDisplaySettleMilliseconds);
+    fflush(stderr);
+}
 
 static void MacWSSetAppInputGestureWindow(id window) {
     CFTypeRef replacement = window
@@ -1005,6 +1208,7 @@ static void *MacWSAppInputThread(void *unused) {
 
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     if (!MacWSAppInputSupportedProcess()) return;
+    MacWSInstallApplicationKeyWitness();
     MacWSAppInputPending = [NSMutableArray new];
     MacWSAppInputDeferredRFBMoveEvents = [NSMutableArray new];
     snprintf(MacWSAppInputPath, sizeof(MacWSAppInputPath),

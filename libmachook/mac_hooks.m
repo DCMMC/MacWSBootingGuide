@@ -4516,13 +4516,34 @@ static size_t macws_new_CGDisplayPixelsHigh(uint32_t display) {
 
 // The exact arm64 OSXvnc binary installed on the device was disassembled on
 // 2026-07-26. -[VNCServer handleMouseButtons:atPoint:forClient:] receives the
-// button mask in x2, the RFB point in d0/d1, and the client in x3; its ordinary
-// path ends in CGPostMouseEvent. Runtime CGPreflightPostEventAccess is NO in
-// this launchd session, so those events never reach an AppKit application.
-// Preserve the original method (it owns OSXvnc's client/button bookkeeping),
-// then mirror the same state transition into macwsinputd's versioned socket.
+// button mask in x2, the RFB point in d0/d1, and the client in x3.  The
+// non-scroll path stores the point at client+0x6e78/+0x6e80, derives all three
+// button states directly from x2, then calls CGPostMouseEvent without applying
+// backingScaleFactor.  There is no retained mouse-button state in this method.
+//
+// Runtime LLDB-confirmed on 2026-07-28 that CGPostMouseEvent DOES reach the
+// chroot AppKit process despite CGPreflightPostEventAccess returning NO.  A
+// Terminal text-selection drag then nested that native mouseDown underneath
+// AppInputBridge.m:647's second mouseDown; the inner call hit AppKit's exact
+// "Periodic events are already being generated" branch at NSEvent.m:4276.
+// Under Retina sharing the unscaled native event also used a 2388x1668 RFB
+// point in the logical 1194x834 Quartz space, explaining the visible cursor /
+// AppInputBridge click displacement.
+//
+// Keep OSXvnc's original point bookkeeping, cursor motion, all buttons,
+// dimming behavior, and scroll-wheel path, but supply logical Quartz
+// coordinates. Runtime title-bar testing after the duplicate fix established
+// that this native path is also the one that drives NSWindow's modal move
+// tracker; AppInputBridge's synthetic title-bar sequence returned without
+// moving the window. VNC must therefore have one owner per gesture, never two:
+// stationary left taps use the process-targeted AppInput path, while drags,
+// hover, other buttons, and cursor bookkeeping use OSXvnc's native path.
+// AppInputBridge also remains the full fallback when the native implementation
+// is unavailable and remains the input path for the native iPad host.
 typedef void (*MacWSVNCHandleMouse)(id, SEL, unsigned int, CGPoint, id);
 static MacWSVNCHandleMouse macws_orig_vnc_handle_mouse = NULL;
+typedef void (*MacWSVNCHandleKeyboard)(id, SEL, BOOL, unsigned int, id);
+static MacWSVNCHandleKeyboard macws_orig_vnc_handle_keyboard = NULL;
 static BOOL macws_vnc_left_down = NO;
 static CGPoint macws_vnc_last_point = {-1.0, -1.0};
 static CGPoint macws_vnc_pending_down_point = {-1.0, -1.0};
@@ -4532,6 +4553,9 @@ static BOOL macws_vnc_release_pending = NO;
 static uint32_t macws_vnc_gesture_id = 0;
 static int macws_vnc_input_fd = -1;
 static double macws_vnc_last_continuous_send = 0.0;
+static _Atomic uint64_t macws_vnc_keyboard_serial = 0;
+static _Atomic uint64_t macws_vnc_keyboard_last_progress_ns = 0;
+static _Atomic uint64_t macws_vnc_pointer_capture_serial = 0;
 
 // RE-confirmed via the installed arm64 OSXvnc-server (2026-07-27):
 //
@@ -4544,16 +4568,84 @@ static double macws_vnc_last_continuous_send = 0.0;
 // enter modifiedRegion; a live VNC connection received only cursor-sized CG
 // rectangles even though a reconnect could fetch the new full frame.  The
 // producer now commits an even/nonzero sequence after its validated pixel
-// copy. Watch that sequence and feed one full-display CGRect through OSXvnc's
-// own refreshCallback, preserving its region locks and wakeup protocol.
+// copy. Watch that sequence and feed pixel-difference rectangles through
+// OSXvnc's own refreshCallback, preserving its region locks and wakeup
+// protocol.
 typedef void (*MacWSVNCRefreshCallback)(uint32_t, const CGRect *, void *);
 static MacWSVNCRefreshCallback macws_vnc_refresh_callback = NULL;
+
+// OSXvnc registers refreshCallback directly with CoreGraphics.  RE-confirmed
+// at refreshCallback+0xec: its incoming CGRects are copied verbatim into the
+// RFB modifiedRegion.  Once the RFB framebuffer is promoted from logical
+// 1194x834 to Retina 2388x1668, those ordinary CG damage rectangles cover only
+// the upper-left quarter and, more importantly, describe a capture backend we
+// deliberately bypass.  Shared mode defers them to the mmap generation
+// watcher. The watcher calls the original trampoline with validated physical
+// rectangles and therefore bypasses this wrapper.
+static void macws_new_vnc_refresh_callback(uint32_t count,
+        const CGRect *rectangles, void *context) {
+    if (!macws_vnc_refresh_callback || !rectangles || count == 0) return;
+    if (macws_vnc_share_on) {
+        // The ordinary callback describes pixels in OSXvnc's disabled
+        // CGDisplayCreateImage backend. rfbGetFBRect intentionally reads the
+        // mmap producer instead, which has not necessarily committed that
+        // frame yet. Let the generation watcher notify only after its seqlock
+        // validates the matching mmap pixels; forwarding this callback sent
+        // stale rectangles and duplicated every later mmap notification.
+        static unsigned deferredLogs;
+        if (deferredLogs++ < 8) {
+            fprintf(stderr,
+                "#### OSXVNC CG-DAMAGE deferred-to-mmap count=%u "
+                "logical=%.0f,%.0f %.0fx%.0f\n",
+                count, rectangles[0].origin.x, rectangles[0].origin.y,
+                rectangles[0].size.width, rectangles[0].size.height);
+        }
+        return;
+    }
+    int scale = macws_vnc_integral_backing_scale();
+    if (scale <= 1) {
+        macws_vnc_refresh_callback(count, rectangles, context);
+        return;
+    }
+
+    CGRect inlineRectangles[64];
+    CGRect *scaled = count <= 64 ? inlineRectangles
+                                 : calloc(count, sizeof(CGRect));
+    if (!scaled) {
+        macws_vnc_refresh_callback(count, rectangles, context);
+        return;
+    }
+    for (uint32_t index = 0; index < count; index++) {
+        scaled[index].origin.x = rectangles[index].origin.x * scale;
+        scaled[index].origin.y = rectangles[index].origin.y * scale;
+        scaled[index].size.width = rectangles[index].size.width * scale;
+        scaled[index].size.height = rectangles[index].size.height * scale;
+    }
+    static unsigned scaleLogs;
+    if (scaleLogs++ < 8) {
+        fprintf(stderr,
+            "#### OSXVNC CG-DAMAGE scale=%d count=%u "
+            "logical=%.0f,%.0f %.0fx%.0f physical=%.0f,%.0f %.0fx%.0f\n",
+            scale, count,
+            rectangles[0].origin.x, rectangles[0].origin.y,
+            rectangles[0].size.width, rectangles[0].size.height,
+            scaled[0].origin.x, scaled[0].origin.y,
+            scaled[0].size.width, scaled[0].size.height);
+    }
+    macws_vnc_refresh_callback(count, scaled, context);
+    if (scaled != inlineRectangles) free(scaled);
+}
 
 static void *macws_vnc_generation_watcher(void *unused) {
     (void)unused;
     void *mapping = NULL;
     size_t mappingSize = 0;
     uint64_t observed = 0;
+    uint8_t *previousPixels = NULL;
+    size_t previousPixelsSize = 0;
+    size_t previousWidth = 0;
+    size_t previousHeight = 0;
+    BOOL previousValid = NO;
     for (;;) {
         if (!mapping) {
             int fd = open("/tmp/macws_vnc_fb", O_RDONLY);
@@ -4586,25 +4678,201 @@ static void *macws_vnc_generation_watcher(void *unused) {
                         sequenceAddress, memory_order_acquire);
                     if (sequence != 0 && !(sequence & 1u) &&
                         sequence != observed) {
-                        observed = sequence;
                         int width = macws_rfbScreen[0];
                         int screenHeight = macws_rfbScreen[2];
                         if (width > 0 && screenHeight > 0 && width <= 8192 &&
                             screenHeight <= 8192) {
-                            CGRect full = {
+                            size_t sourceWidth = header[1];
+                            size_t visibleRowBytes = sourceWidth <= SIZE_MAX / 4
+                                ? sourceWidth * 4 : 0;
+                            size_t pixelBytes = visibleRowBytes > 0 &&
+                                height <= SIZE_MAX / visibleRowBytes
+                                ? height * visibleRowBytes : 0;
+                            BOOL geometryMatches =
+                                sourceWidth == (size_t)width &&
+                                height == (size_t)screenHeight &&
+                                visibleRowBytes <= stride && pixelBytes > 0;
+                            BOOL forceFull = !geometryMatches;
+                            BOOL changed = forceFull;
+                            size_t minX = sourceWidth;
+                            size_t minY = height;
+                            size_t maxX = 0;
+                            size_t maxY = 0;
+                            enum { MacWSDamageTile = 64,
+                                   MacWSMaxTileAxis = 128,
+                                   MacWSMaxDamageRects = 512 };
+                            uint8_t dirtyTiles[
+                                MacWSMaxTileAxis * MacWSMaxTileAxis] = {0};
+                            size_t tileColumns = sourceWidth > 0
+                                ? (sourceWidth + MacWSDamageTile - 1) /
+                                    MacWSDamageTile : 0;
+                            size_t tileRows = height > 0
+                                ? (height + MacWSDamageTile - 1) /
+                                    MacWSDamageTile : 0;
+                            const uint8_t *sourcePixels =
+                                (const uint8_t *)mapping + 16;
+
+                            if (geometryMatches &&
+                                (previousPixelsSize != pixelBytes ||
+                                 previousWidth != sourceWidth ||
+                                 previousHeight != height)) {
+                                uint8_t *replacement = realloc(
+                                    previousPixels, pixelBytes);
+                                if (replacement) {
+                                    previousPixels = replacement;
+                                    previousPixelsSize = pixelBytes;
+                                    previousWidth = sourceWidth;
+                                    previousHeight = height;
+                                    previousValid = NO;
+                                } else {
+                                    forceFull = YES;
+                                    changed = YES;
+                                }
+                            }
+
+                            if (geometryMatches && previousPixels &&
+                                previousPixelsSize == pixelBytes) {
+                                if (!previousValid) {
+                                    for (size_t y = 0; y < height; y++) {
+                                        memcpy(previousPixels +
+                                                   y * visibleRowBytes,
+                                               sourcePixels + y * stride,
+                                               visibleRowBytes);
+                                    }
+                                    forceFull = YES;
+                                    changed = YES;
+                                } else {
+                                    for (size_t y = 0; y < height; y++) {
+                                        const uint32_t *sourceRow =
+                                            (const uint32_t *)(sourcePixels +
+                                                y * stride);
+                                        uint32_t *previousRow =
+                                            (uint32_t *)(previousPixels +
+                                                y * visibleRowBytes);
+                                        if (memcmp(sourceRow, previousRow,
+                                                   visibleRowBytes) == 0) {
+                                            continue;
+                                        }
+                                        size_t left = sourceWidth;
+                                        size_t right = 0;
+                                        for (size_t x = 0; x < sourceWidth;
+                                             x++) {
+                                            if (sourceRow[x] == previousRow[x])
+                                                continue;
+                                            if (left == sourceWidth) left = x;
+                                            right = x + 1;
+                                            if (tileColumns <=
+                                                    MacWSMaxTileAxis &&
+                                                tileRows <= MacWSMaxTileAxis) {
+                                                dirtyTiles[
+                                                    (y / MacWSDamageTile) *
+                                                        tileColumns +
+                                                    x / MacWSDamageTile] = 1;
+                                            }
+                                        }
+                                        if (left < minX) minX = left;
+                                        if (right > maxX) maxX = right;
+                                        if (y < minY) minY = y;
+                                        if (y + 1 > maxY) maxY = y + 1;
+                                        memcpy(previousRow, sourceRow,
+                                               visibleRowBytes);
+                                        changed = YES;
+                                    }
+                                }
+                            }
+
+                            atomic_thread_fence(memory_order_acquire);
+                            uint64_t after = atomic_load_explicit(
+                                sequenceAddress, memory_order_acquire);
+                            if (after != sequence || (after & 1u)) {
+                                // The snapshot may now contain a mix of two
+                                // publications.  Invalidate it and make the
+                                // next stable generation a full refresh.
+                                previousValid = NO;
+                                usleep(1000);
+                                continue;
+                            }
+                            previousValid = geometryMatches && previousPixels;
+                            observed = sequence;
+
+                            CGRect dirty = {
                                 .origin = {0.0, 0.0},
-                                .size = {(CGFloat)width, (CGFloat)screenHeight},
+                                .size = {(CGFloat)width,
+                                         (CGFloat)screenHeight},
                             };
-                            macws_vnc_refresh_callback(1, &full, NULL);
+                            if (!forceFull && changed && minX < maxX &&
+                                minY < maxY) {
+                                dirty.origin.x = (CGFloat)minX;
+                                dirty.origin.y = (CGFloat)minY;
+                                dirty.size.width = (CGFloat)(maxX - minX);
+                                dirty.size.height = (CGFloat)(maxY - minY);
+                            }
+                            CGRect damageRects[MacWSMaxDamageRects];
+                            uint32_t damageCount = 0;
+                            BOOL damageOverflow = NO;
+                            if (!forceFull && changed &&
+                                tileColumns <= MacWSMaxTileAxis &&
+                                tileRows <= MacWSMaxTileAxis) {
+                                for (size_t tileY = 0; tileY < tileRows;
+                                     tileY++) {
+                                    size_t tileX = 0;
+                                    while (tileX < tileColumns) {
+                                        while (tileX < tileColumns &&
+                                               !dirtyTiles[
+                                                   tileY * tileColumns + tileX])
+                                            tileX++;
+                                        if (tileX == tileColumns) break;
+                                        size_t runStart = tileX;
+                                        while (tileX < tileColumns &&
+                                               dirtyTiles[
+                                                   tileY * tileColumns + tileX])
+                                            tileX++;
+                                        if (damageCount >=
+                                                MacWSMaxDamageRects) {
+                                            damageOverflow = YES;
+                                            break;
+                                        }
+                                        size_t x0 = runStart * MacWSDamageTile;
+                                        size_t x1 = tileX * MacWSDamageTile;
+                                        size_t y0 = tileY * MacWSDamageTile;
+                                        size_t y1 = y0 + MacWSDamageTile;
+                                        if (x1 > sourceWidth) x1 = sourceWidth;
+                                        if (y1 > height) y1 = height;
+                                        damageRects[damageCount++] = (CGRect){
+                                            .origin = {(CGFloat)x0,
+                                                       (CGFloat)y0},
+                                            .size = {(CGFloat)(x1 - x0),
+                                                     (CGFloat)(y1 - y0)},
+                                        };
+                                    }
+                                    if (damageOverflow) break;
+                                }
+                            }
+                            if (changed) {
+                                if (forceFull || damageOverflow ||
+                                    damageCount == 0) {
+                                    macws_vnc_refresh_callback(1, &dirty, NULL);
+                                    damageCount = 1;
+                                } else {
+                                    macws_vnc_refresh_callback(
+                                        damageCount, damageRects, NULL);
+                                }
+                            }
                             static _Atomic uint64_t notified = 0;
                             uint64_t count = atomic_fetch_add(&notified, 1) + 1;
                             if (count <= 16 || (count % 600) == 0) {
                                 fprintf(stderr,
                                     "#### OSXVNC mmap generation #%llu "
-                                    "sequence=%llu dirty=0,0 %dx%d\n",
+                                    "sequence=%llu changed=%s "
+                                    "dirty=%.0f,%.0f %.0fx%.0f rects=%u "
+                                    "overflow=%s\n",
                                     (unsigned long long)count,
                                     (unsigned long long)sequence,
-                                    width, screenHeight);
+                                    changed ? "YES" : "NO",
+                                    dirty.origin.x, dirty.origin.y,
+                                    dirty.size.width, dirty.size.height,
+                                    damageCount,
+                                    damageOverflow ? "YES" : "NO");
                             }
                         }
                     }
@@ -4620,6 +4888,155 @@ static double macws_vnc_monotonic_seconds(void) {
     struct timespec now = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0.0;
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+// Cross-process interaction hint for the cancelled-swap pacing diagnostic.
+// OSXvnc writes one boot-relative timestamp (at most 120 Hz); WindowServer
+// reads it at its existing SwapEnd boundary.  This does not fabricate a GPU
+// completion or acknowledge work early.  It only selects the bounded sleep
+// interval below so an idle VNC desktop can stay cool without imposing the
+// same latency while a user is actively typing or dragging.
+static int macws_vnc_activity_fd = -1;
+static _Atomic uint64_t macws_vnc_last_activity_write_ns = 0;
+static void macws_vnc_note_interaction(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    uint64_t nanoseconds = (uint64_t)now.tv_sec * NSEC_PER_SEC +
+        (uint64_t)now.tv_nsec;
+    const uint64_t minimumInterval = 8ull * NSEC_PER_MSEC;
+    uint64_t previous = atomic_load_explicit(
+        &macws_vnc_last_activity_write_ns, memory_order_acquire);
+    for (;;) {
+        if (previous != 0 && nanoseconds > previous &&
+            nanoseconds - previous < minimumInterval) return;
+        if (atomic_compare_exchange_weak_explicit(
+                &macws_vnc_last_activity_write_ns, &previous, nanoseconds,
+                memory_order_acq_rel, memory_order_acquire)) break;
+    }
+    if (macws_vnc_activity_fd < 0) {
+        macws_vnc_activity_fd = open(
+            "/tmp/macws_vnc_activity", O_WRONLY | O_CREAT | O_TRUNC |
+            O_CLOEXEC, 0644);
+    }
+    if (macws_vnc_activity_fd >= 0 &&
+        pwrite(macws_vnc_activity_fd, &nanoseconds,
+               sizeof(nanoseconds), 0) != sizeof(nanoseconds)) {
+        close(macws_vnc_activity_fd);
+        macws_vnc_activity_fd = -1;
+    }
+}
+
+static uint64_t macws_vnc_realtime_nanoseconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static void macws_vnc_write_capture_request(const char *reason,
+                                            uint64_t serial,
+                                            unsigned int detail) {
+    if (!macws_vnc_share_on) return;
+    uint64_t generation = macws_vnc_realtime_nanoseconds();
+    if (generation == 0) return;
+    char value[48];
+    int length = snprintf(value, sizeof(value), "%llu\n",
+                          (unsigned long long)generation);
+    int fd = open("/tmp/macws_capture_final",
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    ssize_t written = write(fd, value, (size_t)length);
+    close(fd);
+    if (written == length) {
+        fprintf(stderr,
+            "#### OSXVNC %s-CAPTURE serial=%llu detail=%#x "
+            "generation=%llu\n",
+            reason, (unsigned long long)serial, detail,
+            (unsigned long long)generation);
+    }
+}
+
+static void macws_vnc_request_keyboard_progress_frame(uint64_t keySerial,
+                                                      unsigned int keySym) {
+    if (!macws_vnc_share_on) return;
+    uint64_t now = macws_vnc_realtime_nanoseconds();
+    if (now == 0) return;
+    const uint64_t minimumInterval = 150ull * NSEC_PER_MSEC;
+    uint64_t previous = atomic_load_explicit(
+        &macws_vnc_keyboard_last_progress_ns, memory_order_acquire);
+    for (;;) {
+        if (previous != 0 && now > previous &&
+            now - previous < minimumInterval) return;
+        if (atomic_compare_exchange_weak_explicit(
+                &macws_vnc_keyboard_last_progress_ns, &previous, now,
+                memory_order_acq_rel, memory_order_acquire)) break;
+    }
+    macws_vnc_write_capture_request("KEY-PROGRESS", keySerial, keySym);
+}
+
+static void macws_vnc_request_keyboard_final_frame(uint64_t keySerial,
+                                                   unsigned int keySym) {
+    if (!macws_vnc_share_on ||
+        atomic_load_explicit(&macws_vnc_keyboard_serial,
+                             memory_order_acquire) != keySerial) return;
+    macws_vnc_write_capture_request("KEY-FINAL", keySerial, keySym);
+}
+
+static void macws_vnc_request_keyboard_settled_frame(uint64_t keySerial,
+                                                      unsigned int keySym) {
+    if (!macws_vnc_share_on ||
+        atomic_load_explicit(&macws_vnc_keyboard_serial,
+                             memory_order_acquire) != keySerial) return;
+    macws_vnc_write_capture_request("KEY-SETTLED", keySerial, keySym);
+}
+
+static void macws_new_vnc_handle_keyboard(id self, SEL command, BOOL down,
+        unsigned int keySym, id client) {
+    macws_vnc_note_interaction();
+    double started = macws_vnc_monotonic_seconds();
+    if (macws_orig_vnc_handle_keyboard)
+        macws_orig_vnc_handle_keyboard(self, command, down, keySym, client);
+    double elapsedMilliseconds =
+        (macws_vnc_monotonic_seconds() - started) * 1000.0;
+    static _Atomic uint64_t handlerCount = 0;
+    uint64_t handled = atomic_fetch_add_explicit(
+        &handlerCount, 1, memory_order_relaxed) + 1;
+    if (handled <= 16 || elapsedMilliseconds >= 50.0) {
+        fprintf(stderr,
+            "#### OSXVNC KEY-HANDLER event=%llu down=%d sym=%#x "
+            "at=%.6f elapsed=%.3fms\n",
+            (unsigned long long)handled, down, keySym,
+            started,
+            elapsedMilliseconds);
+    }
+    if (!down || !macws_vnc_share_on) return;
+
+    uint64_t serial = atomic_fetch_add_explicit(&macws_vnc_keyboard_serial, 1,
+                                                 memory_order_acq_rel) + 1;
+    // Publish progress while a user is still typing instead of treating every
+    // newer key as a reason to cancel the preceding frame. Requests are
+    // throttled to 150 ms and the producer naturally coalesces file updates,
+    // bounding GPU work. A separate trailing request waits for AppKit to drain
+    // a fast key burst: runtime boundary logs measured 14 events ("abcdef" +
+    // Return) reaching Terminal over 188 ms after OSXvnc returned in 4.6 ms.
+    // A separate 2026-07-28 retained-session trace then showed Terminal's
+    // env-gated 750 ms display settle at monotonic 221589.493, after the old
+    // 350 ms KEY-FINAL request. The complete command/output remained one
+    // composite behind until the next key generated another capture request.
+    // Keep the early request for responsive echo, and add one debounced request
+    // after that observed application-settle boundary. This asks the existing
+    // producer for a frame; it does not fabricate pixels or completion state.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        macws_vnc_request_keyboard_progress_frame(serial, keySym);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        macws_vnc_request_keyboard_final_frame(serial, keySym);
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1100 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        macws_vnc_request_keyboard_settled_frame(serial, keySym);
+    });
 }
 
 static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
@@ -4711,10 +5128,128 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
 
 static void macws_new_vnc_handle_mouse(id self, SEL command,
         unsigned int buttons, CGPoint point, id client) {
-    if (macws_orig_vnc_handle_mouse)
-        macws_orig_vnc_handle_mouse(self, command, buttons, point, client);
-
+    macws_vnc_note_interaction();
     BOOL leftDown = (buttons & 1u) != 0;
+    BOOL completedLeftGesture = !leftDown && macws_vnc_left_down;
+    if (macws_orig_vnc_handle_mouse) {
+        int scale = macws_vnc_integral_backing_scale();
+        if (scale < 1) scale = 1;
+        CGPoint quartzPoint = {
+            point.x / (CGFloat)scale,
+            point.y / (CGFloat)scale,
+        };
+        BOOL moved = point.x != macws_vnc_last_point.x ||
+                     point.y != macws_vnc_last_point.y;
+        BOOL otherButton = (buttons & ~1u) != 0;
+        const double slop = 3.0 * (double)scale;
+
+        // A stationary left click and a window drag have different proven
+        // delivery owners on this system. Runtime evidence on 2026-07-28:
+        // OSXvnc's CGPostMouseEvent path moved an NSWindow through AppKit's
+        // modal move tracker, while a click at the exact Retina checkbox
+        // coordinate reached this handler but left the checkbox unchanged.
+        // The per-process AppInput tap path previously toggled that same real
+        // NSButton. Buffer only the possible left-down until motion crosses a
+        // small slop radius: then replay the down + moves through OSXvnc; on a
+        // stationary release send one atomic AppInput tap. This also prevents
+        // the duplicate nested mouseDown that AppKit rejected with "Periodic
+        // events are already being generated" during the earlier dual-owner
+        // implementation.
+        if (otherButton) {
+            macws_orig_vnc_handle_mouse(self, command, buttons,
+                                        quartzPoint, client);
+        } else if (leftDown && !macws_vnc_left_down) {
+            macws_vnc_gesture_id++;
+            if (macws_vnc_gesture_id == 0) macws_vnc_gesture_id++;
+            macws_vnc_pending_down_point = point;
+            macws_vnc_pending_down = YES;
+            macws_vnc_remote_down = NO;
+            // Preserve OSXvnc's cursor bookkeeping without posting a native
+            // down that would duplicate the later AppInput tap.
+            macws_orig_vnc_handle_mouse(self, command, 0,
+                                        quartzPoint, client);
+        } else if (leftDown && moved) {
+            if (macws_vnc_pending_down) {
+                double dx = point.x - macws_vnc_pending_down_point.x;
+                double dy = point.y - macws_vnc_pending_down_point.y;
+                if (dx * dx + dy * dy > slop * slop) {
+                    CGPoint pendingQuartz = {
+                        macws_vnc_pending_down_point.x / (CGFloat)scale,
+                        macws_vnc_pending_down_point.y / (CGFloat)scale,
+                    };
+                    macws_orig_vnc_handle_mouse(self, command, 1,
+                                                pendingQuartz, client);
+                    macws_vnc_pending_down = NO;
+                    macws_vnc_remote_down = YES;
+                    macws_orig_vnc_handle_mouse(self, command, 1,
+                                                quartzPoint, client);
+                } else {
+                    macws_orig_vnc_handle_mouse(self, command, 0,
+                                                quartzPoint, client);
+                }
+            } else if (macws_vnc_remote_down) {
+                macws_orig_vnc_handle_mouse(self, command, 1,
+                                            quartzPoint, client);
+            }
+        } else if (!leftDown && macws_vnc_left_down) {
+            if (macws_vnc_pending_down) {
+                BOOL sent = macws_vnc_forward_input(
+                    MacWSInputKindTap, macws_vnc_pending_down_point, YES);
+                fprintf(stderr,
+                    "#### OSXVNC CLICK-OWNER route=app-input gesture=%u "
+                    "point=(%.1f,%.1f) sent=%s\n",
+                    macws_vnc_gesture_id,
+                    macws_vnc_pending_down_point.x,
+                    macws_vnc_pending_down_point.y,
+                    sent ? "YES" : "NO");
+                macws_vnc_pending_down = NO;
+                macws_orig_vnc_handle_mouse(self, command, 0,
+                                            quartzPoint, client);
+            } else if (macws_vnc_remote_down) {
+                macws_orig_vnc_handle_mouse(self, command, 0,
+                                            quartzPoint, client);
+                macws_vnc_remote_down = NO;
+                fprintf(stderr,
+                    "#### OSXVNC DRAG-OWNER route=native gesture=%u "
+                    "point=(%.1f,%.1f)\n",
+                    macws_vnc_gesture_id, point.x, point.y);
+            } else {
+                macws_orig_vnc_handle_mouse(self, command, 0,
+                                            quartzPoint, client);
+            }
+        } else {
+            macws_orig_vnc_handle_mouse(self, command, 0,
+                                        quartzPoint, client);
+        }
+        static unsigned ownershipLogs;
+        if (ownershipLogs++ < 8) {
+            fprintf(stderr,
+                "#### OSXVNC INPUT-OWNER rfb=(%.1f,%.1f) quartz=(%.1f,%.1f) "
+                "buttons=%#x pending=%s drag=%s scale=%d\n",
+                point.x, point.y, quartzPoint.x, quartzPoint.y,
+                buttons, macws_vnc_pending_down ? "YES" : "NO",
+                macws_vnc_remote_down ? "YES" : "NO", scale);
+        }
+        macws_vnc_left_down = leftDown;
+        macws_vnc_last_point = point;
+        if (completedLeftGesture && macws_vnc_share_on) {
+            uint64_t serial = atomic_fetch_add_explicit(
+                &macws_vnc_pointer_capture_serial, 1,
+                memory_order_acq_rel) + 1;
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+                dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                    if (atomic_load_explicit(
+                            &macws_vnc_pointer_capture_serial,
+                            memory_order_acquire) == serial) {
+                        macws_vnc_write_capture_request(
+                            "POINTER", serial, buttons);
+                    }
+                });
+        }
+        return;
+    }
+
     BOOL moved = point.x != macws_vnc_last_point.x ||
                  point.y != macws_vnc_last_point.y;
     if (leftDown && !macws_vnc_left_down) {
@@ -4957,8 +5492,9 @@ static void macws_install_osxvnc_hooks(void) {
     char *base = (char *)mh;
     macws_rfbScreen = (int *)(base + 0x79bf8);
     macws_rfbBackingScale = (double *)(base + 0x7a1e8);
-    macws_vnc_refresh_callback =
-        (MacWSVNCRefreshCallback)(base + 0xd114);
+    MSHookFunction(base + 0xd114,
+        (void *)macws_new_vnc_refresh_callback,
+        (void **)&macws_vnc_refresh_callback);
     void *cgWidth = dlsym(RTLD_DEFAULT, "CGDisplayPixelsWide");
     void *cgHeight = dlsym(RTLD_DEFAULT, "CGDisplayPixelsHigh");
     if (cgWidth) MSHookFunction(cgWidth,
@@ -4977,6 +5513,14 @@ static void macws_install_osxvnc_hooks(void) {
             (MacWSVNCHandleMouse)method_getImplementation(mouseMethod);
         method_setImplementation(mouseMethod, (IMP)macws_new_vnc_handle_mouse);
     }
+    Method keyboardMethod = serverClass ? class_getInstanceMethod(serverClass,
+        sel_registerName("handleKeyboard:forSym:forClient:")) : NULL;
+    if (keyboardMethod) {
+        macws_orig_vnc_handle_keyboard =
+            (MacWSVNCHandleKeyboard)method_getImplementation(keyboardMethod);
+        method_setImplementation(keyboardMethod,
+                                 (IMP)macws_new_vnc_handle_keyboard);
+    }
     if (macws_vnc_share_on && macws_vnc_refresh_callback) {
         pthread_t watcher;
         int watcherError = pthread_create(
@@ -4986,9 +5530,10 @@ static void macws_install_osxvnc_hooks(void) {
             "#### OSXVNC mmap generation watcher failed error=%d\n",
             watcherError);
     }
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input=%s) base=%p rfbScreen=%p\n",
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input=%s keyboard=%s) base=%p rfbScreen=%p\n",
             macws_vnc_test_on, macws_vnc_share_on,
             mouseMethod ? "YES" : "NO",
+            keyboardMethod ? "YES" : "NO",
             (void *)mh, (void *)macws_rfbScreen);
 }
 
@@ -9309,6 +9854,47 @@ static uint32_t macws_coexist_completion_pace_us(void) {
     return pace_us;
 }
 
+static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
+    enum {
+        kInteractivePaceUS = 16667,
+        kInteractionWindowNS = 1000 * NSEC_PER_MSEC,
+    };
+    if (idle_pace_us <= kInteractivePaceUS) return idle_pace_us;
+
+    static int activity_fd = -1;
+    if (activity_fd < 0) {
+        activity_fd = open("/private/tmp/macws_vnc_activity",
+                           O_RDONLY | O_CLOEXEC);
+    }
+    uint64_t activity_ns = 0;
+    BOOL interactive = NO;
+    if (activity_fd >= 0 &&
+        pread(activity_fd, &activity_ns,
+              sizeof(activity_ns), 0) == sizeof(activity_ns)) {
+        struct timespec now = {0};
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+            uint64_t now_ns = (uint64_t)now.tv_sec * NSEC_PER_SEC +
+                (uint64_t)now.tv_nsec;
+            interactive = now_ns >= activity_ns &&
+                now_ns - activity_ns <= kInteractionWindowNS;
+        }
+    }
+
+    static _Atomic int prior_mode = -1;
+    int mode = interactive ? 1 : 0;
+    int prior = atomic_exchange_explicit(
+        &prior_mode, mode, memory_order_acq_rel);
+    if (prior != mode) {
+        fprintf(stderr,
+            "#### COEXIST DIAGNOSTIC activity pace: mode=%s "
+            "pace=%u us idle=%u us window=1000ms\n",
+            interactive ? "interactive" : "idle",
+            interactive ? kInteractivePaceUS : idle_pace_us,
+            idle_pace_us);
+    }
+    return interactive ? kInteractivePaceUS : idle_pace_us;
+}
+
 static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
     if (!atomic_load(&g_macws_iomfb_coexist_swap_cancel) || !framebuffer) {
         return g_macws_orig_iomfb_swap_end
@@ -9336,7 +9922,8 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
         // its one matching completion.  Render work plus this interval yields
         // roughly 30 presented virtual frames/s without accumulating pending
         // callbacks or weakening the watchdog threshold.
-        uint32_t pace_us = macws_coexist_completion_pace_us();
+        uint32_t pace_us = macws_coexist_activity_pace_us(
+            macws_coexist_completion_pace_us());
         usleep(pace_us);
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);

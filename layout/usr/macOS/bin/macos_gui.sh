@@ -53,11 +53,13 @@ EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
 EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
+EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
 EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
 EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 VNC_SHARED_FRAME="$ROOTFS/private/tmp/macws_vnc_fb"
 VNC_SHARED_SURFID="$ROOTFS/private/tmp/macws_vnc_surfid"
+VNC_ACTIVITY="$ROOTFS/private/tmp/macws_vnc_activity"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
 WINDOWSERVER_READY_WAIT=45
@@ -470,6 +472,31 @@ PLIST
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <!--
+      Terminal is a CoreAnimation client as well as an AppKit application.
+      Runtime A/B on 2026-07-28: with the same producer-owned scanout and the
+      same paced RFB input, the client advanced through nearly the entire
+      command with CA_VSYNC_OFF=1; without it, the completed WindowServer
+      surface stopped changing after the first character.  The chroot has no
+      working display-vblank handoff, so client commits must not wait for it.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CA_VSYNC_OFF</key>
+        <string>1</string>
+        <!--
+          Terminal's fast pty output can race its one delayed AppKit redraw in
+          this virtual-display session.  This narrowly enables libmachook's
+          debounced responder invalidation for Terminal only.  It is a bounded
+          usability scaffold, not a substitute for a real display clock. A
+          device A/B showed 120ms firing after the text model was complete but
+          before TTView's pixels stabilized (VNC stopped at "echo dyna");
+          750ms produced the command, output, and new prompt with no later
+          input event.
+        -->
+        <key>MACWS_APP_DISPLAY_SETTLE_MS</key>
+        <string>750</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>${LOGDIR}/terminal.log</string>
     <key>StandardErrorPath</key>
@@ -517,8 +544,9 @@ cleanup_macos() {
     # process advertise pixels from an earlier application even when the new
     # WindowServer has not published a frame.  Remove it only after every old
     # producer/client has been stopped so no live mapping is invalidated.
-    rm -f "$VNC_SHARED_FRAME" "$VNC_SHARED_SURFID" \
-        "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
+    rm -f "$VNC_SHARED_FRAME" "$VNC_SHARED_SURFID" "$VNC_ACTIVITY" \
+        "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE" \
+        "$EXPERIMENTAL_OWNED_SCANOUT"
 
     sleep 1
     log "Cleanup done."
@@ -586,7 +614,8 @@ stop_all() {
     # silently inherits experimental protocol behavior.
     rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
         "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
-        "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_CAPTURE" \
+        "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT" \
+        "$EXPERIMENTAL_CAPTURE" \
         "$EXPERIMENTAL_CAPTURE_DONE" "$EXPERIMENTAL_PACE"
     log "Restoring iOS (SpringBoard / backboardd)..."
     launchctl load "$BACKBOARDD"  2>/dev/null
@@ -668,6 +697,15 @@ for a in "$@"; do
     esac
 done
 
+# The stable interactive A/B uses a 100 ms idle completion interval and lets
+# VNC activity temporarily select 16.667 ms for one second.  Make that tested
+# pair the experimental default so the one-click command does not silently
+# fall back to the hot, fixed 60 Hz scaffold. An explicit --pace-us still
+# selects a different idle value.
+if [ "$WANT_EXPERIMENTAL" = 1 ] && [ -z "$COEXIST_PACE_US" ]; then
+    COEXIST_PACE_US=100000
+fi
+
 if [ -n "$COEXIST_PACE_US" ]; then
     if [ "$WANT_EXPERIMENTAL" != 1 ]; then
         echo "macos_gui.sh: --pace-us requires --experimental" >&2
@@ -689,12 +727,12 @@ enable_experimental_if_requested() {
     [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
     touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
         "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
-        "$EXPERIMENTAL_SUBMIT_RING"
+        "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT"
     rm -f "$EXPERIMENTAL_PACE"
     if [ -n "$COEXIST_PACE_US" ]; then
         echo "$COEXIST_PACE_US" > "$EXPERIMENTAL_PACE"
     fi
-    log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + read-only PF550 completion observer + bounded submit flight recorder + stable VNC mmap enabled."
+    log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + read-only PF550 completion observer + bounded submit flight recorder + owned BGRA scanout + stable VNC mmap enabled."
     if [ -n "$COEXIST_PACE_US" ]; then
         log "DIAGNOSTIC-SCAFFOLD: synthetic completion pace=${COEXIST_PACE_US} us (not a refresh-rate implementation)."
     fi
@@ -765,6 +803,7 @@ start_watchdog() {
     [ "$WANT_VNC" = 1 ] || set -- "$@" --no-vnc
     [ "$WANT_TERMINAL" = 1 ] || set -- "$@" --no-terminal
     [ "$WANT_EXPERIMENTAL" = 1 ] && set -- "$@" --experimental
+    [ -n "$COEXIST_PACE_US" ] && set -- "$@" "--pace-us=$COEXIST_PACE_US"
     nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
     log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL)"
 }

@@ -2,13 +2,14 @@
 
 Unlike vnc_capture.py's reconnecting --after mode, this client keeps the
 initial framebuffer, applies every incremental rectangle to it, and succeeds
-only after OSXvnc sends a full physical-resolution dirty rectangle following
-the click.  That catches a frozen live session which a fresh full-frame request
-would hide.
+only after OSXvnc sends changed pixels following the click.  That catches a
+frozen live session which a fresh full-frame request would hide while also
+accepting the mmap producer's physical-resolution tile damage.
 """
 
 import argparse
 import hashlib
+import select
 import socket
 import struct
 import time
@@ -88,10 +89,15 @@ def main():
     parser.add_argument("after")
     parser.add_argument("--port", type=int, default=5900)
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--settle-seconds", type=float, default=1.5,
+                        help="retain later incremental frames after the first "
+                             "changed update (default: 1.5)")
     parser.add_argument("--click", nargs=2, required=True, type=int,
                         metavar=("X", "Y"))
     parser.add_argument("--max-updates", type=int, default=12)
     args = parser.parse_args()
+    if args.timeout <= 0 or args.settle_seconds < 0 or args.max_updates < 1:
+        parser.error("timeout/max-updates must be positive and settle nonnegative")
 
     sock, width, height, name = vnc_capture.connect_rfb(
         args.host, args.port, args.timeout)
@@ -120,32 +126,58 @@ def main():
         sock.sendall(struct.pack(">BBHH", 5, 0, x, y))
 
         deadline = time.monotonic() + args.timeout
-        full_dirty = False
+        changed_update = False
         update_count = 0
         while (time.monotonic() < deadline and
                update_count < args.max_updates):
             rectangles = receive_update(sock, width, framebuffer)
             update_count += 1
             print(f"incremental[{update_count}]={rectangles}")
-            full_dirty = any(
-                encoding == 0 and x0 == 0 and y0 == 0 and
-                rect_width == width and rect_height == height
-                for x0, y0, rect_width, rect_height, encoding in rectangles)
-            if (full_dirty and
-                hashlib.sha256(framebuffer).hexdigest() != before_digest):
+            changed_update = (
+                hashlib.sha256(framebuffer).hexdigest() != before_digest)
+            if changed_update:
                 break
-            if full_dirty:
-                print("full dirty rectangle was unchanged; waiting for the "
-                      "next committed generation")
-                full_dirty = False
+            print("dirty rectangles were unchanged; waiting for the next "
+                  "committed generation")
             request_update(sock, width, height, True)
+
+        # A cursor tile is often the first response to a click. Saving it and
+        # closing immediately concealed whether the target control repainted.
+        # Keep the same RFB framebuffer and retain every later complete update
+        # during a quiet interval. select() avoids timing out in the middle of
+        # an RFB rectangle and corrupting the stream.
+        settled_updates = 0
+        settle_changes = 0
+        if changed_update and args.settle_seconds > 0:
+            settle_digest = hashlib.sha256(framebuffer).hexdigest()
+            settle_deadline = time.monotonic() + args.settle_seconds
+            request_update(sock, width, height, True)
+            while update_count < args.max_updates:
+                remaining = settle_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select([sock], [], [], remaining)
+                if not readable:
+                    break
+                rectangles = receive_update(sock, width, framebuffer)
+                update_count += 1
+                settled_updates += 1
+                current_digest = hashlib.sha256(framebuffer).hexdigest()
+                if current_digest != settle_digest:
+                    settle_changes += 1
+                    settle_digest = current_digest
+                if time.monotonic() < settle_deadline:
+                    request_update(sock, width, height, True)
+            print(
+                f"settle seconds={args.settle_seconds:.3f} "
+                f"updates={settled_updates} changed={settle_changes}")
 
         after_digest = save_frame(
             args.after, width, height, framebuffer, "after")
         changed = before_digest != after_digest
-        print(f"result full_dirty={full_dirty} changed={changed} "
+        print(f"result changed_update={changed_update} changed={changed} "
               f"updates={update_count}")
-        if not full_dirty or not changed:
+        if not changed_update or not changed:
             raise SystemExit(2)
     except socket.timeout as error:
         print(f"result timeout={error}")

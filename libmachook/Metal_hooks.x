@@ -579,6 +579,70 @@ static uint64_t macws_vnc_mmap_commit_frame(void) {
     }
     return sequence;
 }
+
+// Producer-side unchanged-frame suppression for the linear owned scanout.
+// Runtime evidence on 2026-07-28 showed OSXvnc reaching mmap generation #600
+// with changed=NO while WindowServer still copied all 15.2 MiB and advanced
+// the seqlock for every synthetic completion.  Besides wasting unified-memory
+// bandwidth, those no-op publications can overtake OSXvnc's local 15.2-MiB
+// comparison and make it invalidate its snapshot, forcing a later full-screen
+// raw update.  Compare before making the sequence odd; an identical frame is
+// left completely unpublished.  A changed frame retains the established
+// odd/copy/even seqlock protocol and copies the full coherent snapshot.
+static BOOL macws_vnc_mmap_publish_bgra_if_changed(
+        const void *source, size_t sourceBytesPerRow,
+        size_t width, size_t height, BOOL *didCommit) {
+    if (didCommit) *didCommit = NO;
+    if (!source || width == 0 || height == 0 ||
+        width > SIZE_MAX / 4 || sourceBytesPerRow < width * 4) return NO;
+
+    pthread_mutex_lock(&g_vnc_mmap_write_lock);
+    void *shared = macws_vnc_mmap_data(width, height);
+    if (!shared || !g_vnc_mmap_sequence) {
+        pthread_mutex_unlock(&g_vnc_mmap_write_lock);
+        return NO;
+    }
+
+    size_t visibleRowBytes = width * 4;
+    uint64_t sequence = atomic_load_explicit(
+        g_vnc_mmap_sequence, memory_order_acquire);
+    BOOL changed = sequence == 0 || (sequence & 1u) != 0;
+    if (!changed) {
+        for (size_t y = 0; y < height; y++) {
+            if (memcmp((const char *)source + y * sourceBytesPerRow,
+                       (const char *)shared + y * visibleRowBytes,
+                       visibleRowBytes) != 0) {
+                changed = YES;
+                break;
+            }
+        }
+    }
+    if (!changed) {
+        pthread_mutex_unlock(&g_vnc_mmap_write_lock);
+        static _Atomic uint64_t unchangedCount = 0;
+        uint64_t count = atomic_fetch_add(&unchangedCount, 1) + 1;
+        if (count <= 8 || (count % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-MMAP unchanged skip #%llu sequence=%llu "
+                "%zux%zu\n",
+                (unsigned long long)count,
+                (unsigned long long)sequence, width, height);
+        }
+        return YES;
+    }
+
+    if (sequence & 1u) sequence++;
+    atomic_store_explicit(g_vnc_mmap_sequence, sequence + 1,
+                          memory_order_release);
+    for (size_t y = 0; y < height; y++) {
+        memcpy((char *)shared + y * visibleRowBytes,
+               (const char *)source + y * sourceBytesPerRow,
+               visibleRowBytes);
+    }
+    (void)macws_vnc_mmap_commit_frame();
+    if (didCommit) *didCommit = YES;
+    return YES;
+}
 // Half (IEEE binary16) -> u8 [0,255], clamped to [0,1]. For RGBA16Float composites.
 static inline uint8_t macws_half_to_u8(uint16_t h) {
     uint16_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
@@ -717,15 +781,10 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     }
     BOOL valid = readable && macws_vnc_content_ready(
         sampled, different, denseContentRows);
+    BOOL committed = NO;
     if (valid) {
-        void *shared = macws_vnc_mmap_begin_frame(width, height);
-        if (shared) {
-            for (size_t y = 0; y < height; y++) {
-                memcpy((char *)shared + y * width * 4,
-                       (const char *)base + y * bytesPerRow, width * 4);
-            }
-            macws_vnc_mmap_commit_frame();
-        } else {
+        if (!macws_vnc_mmap_publish_bgra_if_changed(
+                base, bytesPerRow, width, height, &committed)) {
             valid = NO;
         }
     }
@@ -740,11 +799,13 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     if (sequence <= 32 || (sequence % 600) == 0) {
         fprintf(stderr,
             "#### VNC-OWNED %s #%llu tex=%p surface=%p id=%u "
-            "%zux%zu rgb=%zu/%zu different=%zu denseRows=%zu unlocked=%d\n",
+            "%zux%zu rgb=%zu/%zu different=%zu denseRows=%zu "
+            "unlocked=%d committed=%d\n",
             valid ? "published" : "reject-output",
             (unsigned long long)sequence, (void *)texture, (void *)surface,
             (unsigned)IOSurfaceGetID(surface), width, height,
-            rgbNonzero, sampled, different, denseContentRows, unlockedRead);
+            rgbNonzero, sampled, different, denseContentRows, unlockedRead,
+            committed);
     }
     if (valid) {
         uint64_t generation = macws_vnc_capture_generation();

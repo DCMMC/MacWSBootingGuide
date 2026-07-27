@@ -42,10 +42,10 @@ def send_click(sock, x, y):
     sock.sendall(struct.pack(">BBHH", 5, 0, x, y))
 
 
-def wait_for_changed_full_frame(sock, width, height, framebuffer,
-                                previous_digest, previous_region_digest,
-                                click_x, click_y, region_radius, deadline,
-                                max_updates):
+def wait_for_changed_frame(sock, width, height, framebuffer,
+                           previous_digest, previous_region_digest,
+                           click_x, click_y, region_radius, deadline,
+                           max_updates):
     update_count = 0
     all_rectangles = []
     while time.monotonic() < deadline and update_count < max_updates:
@@ -56,19 +56,14 @@ def wait_for_changed_full_frame(sock, width, height, framebuffer,
         current_digest = digest(framebuffer)
         current_region_digest = region_digest(
             framebuffer, width, height, click_x, click_y, region_radius)
-        full_dirty = any(
-            encoding == 0 and x == 0 and y == 0 and
-            rect_width == width and rect_height == height
-            for x, y, rect_width, rect_height, encoding in rectangles)
         region_changed = (region_radius <= 0 or
                           current_region_digest != previous_region_digest)
-        if (full_dirty and current_digest != previous_digest and
-                region_changed):
+        if current_digest != previous_digest and region_changed:
             return (current_digest, current_region_digest, update_count,
                     all_rectangles)
         vnc_live_click.request_update(sock, width, height, True)
     raise RuntimeError(
-        f"no changed full frame after {update_count} updates; "
+        f"no changed frame after {update_count} updates; "
         f"rectangles={all_rectangles}")
 
 
@@ -127,7 +122,7 @@ def main():
             click_started = time.monotonic()
             send_click(sock, x, y)
             (current_digest, current_region_digest, updates,
-             rectangles) = wait_for_changed_full_frame(
+             rectangles) = wait_for_changed_frame(
                 sock, width, height, framebuffer, previous_digest,
                 previous_region_digest, x, y,
                 args.require_click_region_radius,

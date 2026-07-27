@@ -1408,6 +1408,42 @@ cleanup proof are in
 [`misc/vnc_interactive_soak.py`](../misc/vnc_interactive_soak.py) and
 [`docs/evidence/native-agx-vnc-multiapp-soak-20260728.txt`](evidence/native-agx-vnc-multiapp-soak-20260728.txt).
 
+## 2026-07-28: VNC click/drag ownership, dynamic pacing, and Terminal final frames
+
+The remaining VNC usability failures were independent. First, WindowServer
+published a full 2388x1668 BGRA mmap generation for identical frames; the
+producer now compares before opening the seqlock and skips both the 15.2-MiB
+copy and sequence advance. A static run reached `unchanged skip #600` while
+the shared sequence remained 48. Second, a 100-ms completion interval was
+cooler but imposed idle latency on interaction. OSXvnc now writes a throttled
+monotonic activity timestamp, selecting 16.667 ms for one second of activity
+and returning to the explicit 100-ms idle interval without changing command
+bytes or completion semantics.
+
+Pointer delivery now has exactly one owner per gesture. A possible left down
+is held within a three-logical-point slop radius. A stationary release becomes
+one per-process AppInput tap; crossing the radius replays the down and drag
+through OSXvnc's RE/runtime-confirmed native NSWindow move path. The real
+GlassDemo NSButton logged `before=0 after=1`, while a title drag remained
+native and delivered its first changed tile in 0.450 seconds. This avoids the
+previous duplicate mouseDown that entered AppKit's `Periodic events are
+already being generated` branch.
+
+Terminal's last stale frame was a measured ordering error rather than lost
+keys. All 36 events for `echo settledproof` reached its TTView; the 750-ms
+Terminal-only AppKit display settle ran after OSXvnc's old 350-ms final capture
+request. A second debounced request at 1100 ms produced an acknowledged native
+frame containing the complete command, output, and prompt without another
+input. The first changed keyboard tile arrived in 0.274 seconds.
+
+Finally, `start coexist --experimental` now creates the owned BGRA scanout
+sentinel and uses the tested dynamic 100-ms-idle/16.667-ms-interactive pair by
+default. A clean stop proved both sentinels absent; the following one-command
+start reached a validated Retina first frame. The path remains explicitly
+diagnostic, and a 40-52% WindowServer CPU / 350-430 MiB RSS sample prevents any
+thermal or long-term leak claim. Full logs and classification are in
+[`docs/evidence/native-agx-vnc-interactive-pacing-20260728.txt`](evidence/native-agx-vnc-interactive-pacing-20260728.txt).
+
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
@@ -1431,8 +1467,8 @@ items are hardening and application-coverage work:
    soak.  The catastrophic IOSurface accumulation is fixed; the remaining
    requirement is protocol confidence rather than process-uptime evidence.
 5. RE Terminal's close-cleanup lock from the captured `__close` stack, then
-   add keyboard/scroll/right-click semantics to the target-process input route
-   and capture a Terminal text-entry witness.
+   add scroll/right-click semantics to the target-process input route. The
+   retained native VNC text-entry witness is now complete.
 6. RE Activity Monitor and Finder's actual startup actions before adding any
    launch hook; do not guess selectors or force startup-success branches.
 7. Replace the full-display snapshot with a window registry and
