@@ -657,9 +657,11 @@ The project LLDB tooling captured the same 2388x1668 private pixel-format-550
 IOSurface texture in an iOS-native reference and in chroot WindowServer.  Mesa
 Asahi's generated texture XML provides the independent field map for the
 24-byte hardware descriptor: layout is bits 4..5, address is bits 66..101
-shifted by four, compressed is bit 103, extended is bit 127, and the low 36
-bits of the final word encode the acceleration/metadata address shifted by
-four.
+shifted by four, compressed is bit 103, and extended is bit 127.  A later
+2026-07-27 audit corrected one important overstatement here: the low 36 bits
+of the extended word encode an acceleration-buffer address only when the
+descriptor is compressed.  For a linear descriptor the same union contains
+linear depth/layer-stride fields; it must not be decoded as a GPU VA.
 
 The native iOS texture finished initialization with:
 
@@ -685,14 +687,14 @@ private-object layout and, more importantly, different descriptor semantics:
 descriptor offset in macOS impl = +0x190
 layout=0 compressed=0 extended=1
 address=0x1500070000
-accelerationLow36=0x1500053e00
+extendedRawLow36=0x1500053e00 (not an acceleration address for layout=linear)
 bytes=02b30a36950c1a0000c0014005c05fa8e0530050f1850100
 ```
 
-The previous GPU fault at `0x150006c500` is below the primary base by
-`0x3b00`; the malformed acceleration address is below that same base by
-`0x1c200`.  This numerical relationship explains why the descriptor is the
-immediate read-fault boundary, but it does not by itself identify the owner.
+The former attribution of the previous GPU fault at `0x150006c500` to a
+"malformed acceleration address" is therefore retracted.  The descriptor is
+linear (`layout=0`, `compressed=0`), so that numerical comparison decoded the
+wrong member of a conditional hardware union and is not fault evidence.
 
 The upstream owner was then observed at the actual five-argument macOS AGX
 method, static `0x1e57716b4`.  At entry for this exact texture, its 24-byte
@@ -1251,13 +1253,49 @@ Verbatim callback lines, parsed layouts, scope limitations, and all retained
 artifact hashes are in
 [`docs/evidence/coexist-native-agx-first-pagefault-20260727.txt`](evidence/coexist-native-agx-first-pagefault-20260727.txt).
 
+## 2026-07-27: completion-path RE and a true libmachook-only FAST loop
+
+Runtime type encodings established the exact private PF550 producer ABI, and a
+forwarding-only observer captured the first 1140x798 texture call with
+`cpuMetadata=0`, `gpuVA=0x1500070000`, `compressible=0`, and
+`initMetadata=0`.  Project-LLDB disassembly then followed the original
+five-argument implementation through its primary-object stores and
+`texBaseAddressesUpdated` virtual call.
+
+This pass also corrected a false lead. Current Mesa Asahi source makes the
+last texture-descriptor word conditional: it is an acceleration-buffer
+address for compressed layouts, but overlapping linear depth/layer-stride
+fields for `layout=0`.  The earlier interpretation of the 1140x798 raw low 36
+bits as an unmapped metadata VA was therefore wrong and has been retracted;
+the descriptor is not patched.
+
+The actual IOGPU userspace completion pipeline was disassembled at a Code=3
+breakpoint. Selector `0x107` is a separate device-notification callback and
+does not carry command fault data. The command queue itself consumes a
+0x20-byte record containing a callback object, two timestamps, and a 32-bit
+status; IOGPU creates NSError from that status and has no userspace fault-VA
+field. A fresh crash-report reset reproduced the 1140x798 PageFault but emitted
+no new gpuEvent report, so the fault address remains unresolved rather than
+guessed. Every aligned direct VA in the retained fault KCMD still maps to an
+active resource; the next boundary is second-level data inside those
+resources.
+
+Finally, `build_on_ios.sh --fast-force` now invokes only the `libmachook`
+subproject while retaining the root Theos project/build directories. A real
+device run completed compile, merge, platform conversion, signing, trustcache,
+postinst, and rootfs deployment in 5.998 seconds.
+
+Full runtime excerpts, disassembly, negative-result scope, and artifact hashes
+are in
+[`docs/evidence/coexist-native-agx-completion-re-20260727.txt`](evidence/coexist-native-agx-completion-re-20260727.txt).
+
 ## Next milestones
 
-1. Recover the actual GPU fault VA from the IOGPU completion/kernel path, then
-   resolve it against the submit-ring resource generation and indirect texture
-   descriptors.  In parallel, retain the exact-dimension recorder for a real
-   clean 1140x798 control; do not substitute a recovered 2388x1668 display
-   composite.
+1. Recover the actual GPU fault VA from a kernel gpuEvent or capture the
+   second-level descriptor/buffer contents referenced by the faulting KCMD;
+   selector 0x107 and the 0x20-byte userspace completion record are now ruled
+   out.  In parallel, retain the exact-dimension recorder for a real clean
+   1140x798 control; do not substitute a recovered 2388x1668 display composite.
 2. Replace subtype-1/subtype-3 byte deletion with a field-level translator
    backed by disassembly of both macOS producers and the iOS kernel parser;
    reproduce the VNC frame without `/tmp/macws_kcmd_fix`.

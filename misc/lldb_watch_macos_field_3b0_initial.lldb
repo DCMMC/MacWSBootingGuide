@@ -1,0 +1,18 @@
+settings set target.process.stop-on-sharedlibrary-events false
+command script import misc/lldb_watch_native_kcmd_field.py
+# Current-boot macOS 13.4 AGXG13GFamilyCommandBuffer
+# -renderCommandEncoderWithDescriptor: (runtime-enumerated).
+breakpoint set --address 0x1fa54d08c --one-shot true
+continue
+# RE-confirmed macOS IOGPUMetalCommandBuffer storage ivar is self+0x250.
+script lldb_watch_native_kcmd_field.capture_base(lldb.debugger, 0x250)
+# macOS original +0x3b0 maps to normalized iOS-layout +0x3a0 after removal
+# of the first 0x10-byte ABI insertion.
+script lldb_watch_native_kcmd_field.arm(lldb.debugger, 0x3b0)
+continue
+watchpoint list
+register read x0 x1 x2 x3 x8 x9 x10 x19 x20 x21 x22 x23 x24 x25 x26 x27 x28 x29 x30 pc
+thread backtrace -c 50
+disassemble --start-address '$pc-0x50' --count 96
+detach
+quit

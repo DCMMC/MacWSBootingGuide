@@ -70,6 +70,8 @@ static void macws_log_failed_texture_descriptor(
     id texture, const void *command_buffer, uint64_t submit_serial);
 static void macws_observe_pf550_metadata(id texture, uint64_t submit_serial,
                                          BOOL completed_cleanly);
+static void macws_tile_dump_command_buffer_targets(
+    const void *command_buffer);
 
 // Read-only completion callback diagnostic.  Runtime ObjC method enumeration
 // on the device established these exact private entry points and signatures:
@@ -368,6 +370,10 @@ static void macws_iogpu_buffer_complete(id self, SEL selector,
         macws_iogpu_dump_object("buffer-error", error);
         macws_iogpu_dump_error_user_info(error);
         macws_iogpu_dump_command_storage(self, "buffer-before-original");
+        if (error_code == 3) {
+            macws_tile_dump_command_buffer_targets(
+                (__bridge const void *)self);
+        }
         if (submit_serial) {
             macws_dump_recent_agx_submit_serial(
                 error_code == 3 ? "iogpu-raw-callback-page-fault"
@@ -2332,8 +2338,11 @@ typedef struct {
     ptrdiff_t offset;
     uint8_t bytes[24];
     uint64_t address;
-    uint64_t acceleration_raw;
-    uint64_t acceleration_low36;
+    // The extended word is a conditional union.  It carries an acceleration
+    // buffer only for compressed layouts; linear layouts reuse these bits for
+    // depth/layer-stride fields (Mesa Asahi cmdbuf.xml, audited 2026-07-27).
+    uint64_t extended_raw;
+    uint64_t extended_low36;
     unsigned layout;
     unsigned compressed;
     unsigned extended;
@@ -2348,20 +2357,18 @@ static bool macws_find_texture_descriptor(void *impl, size_t width,
                                           macws_texture_descriptor_witness *out) {
     if (!impl || !out || width == 0 || height == 0) return false;
     for (ptrdiff_t offset = 0x140; offset <= 0x240; offset++) {
-        uint64_t word0 = 0, word1 = 0, acceleration_raw = 0;
+        uint64_t word0 = 0, word1 = 0, extended_raw = 0;
         memcpy(&word0, (char *)impl + offset, sizeof(word0));
         memcpy(&word1, (char *)impl + offset + 8, sizeof(word1));
         size_t encoded_width = (size_t)((word0 >> 28) & 0x3fff) + 1;
         size_t encoded_height = (size_t)((word0 >> 42) & 0x3fff) + 1;
         if (encoded_width != width || encoded_height != height) continue;
         memcpy(out->bytes, (char *)impl + offset, sizeof(out->bytes));
-        memcpy(&acceleration_raw, out->bytes + 16,
-               sizeof(acceleration_raw));
+        memcpy(&extended_raw, out->bytes + 16, sizeof(extended_raw));
         out->offset = offset;
         out->address = ((word1 >> 2) & 0xfffffffffULL) << 4;
-        out->acceleration_raw = acceleration_raw;
-        out->acceleration_low36 =
-            (acceleration_raw & 0xfffffffffULL) << 4;
+        out->extended_raw = extended_raw;
+        out->extended_low36 = (extended_raw & 0xfffffffffULL) << 4;
         out->layout = (unsigned)((word0 >> 4) & 0x3);
         out->compressed = (unsigned)((word1 >> 39) & 1);
         out->extended = (unsigned)((word1 >> 63) & 1);
@@ -2485,10 +2492,12 @@ static macws_pf550_metadata_snapshot macws_pf550_capture_metadata(
     snapshot.gpu_mapping =
         *(const volatile uint64_t *)((const char *)impl + 0x40);
     snapshot.descriptor_address = descriptor.address;
-    snapshot.acceleration_address = descriptor.acceleration_low36;
-    if (descriptor.acceleration_low36 >= descriptor.address) {
+    snapshot.acceleration_address = descriptor.compressed
+        ? descriptor.extended_low36 : 0;
+    if (descriptor.compressed &&
+        descriptor.extended_low36 >= descriptor.address) {
         snapshot.acceleration_offset =
-            descriptor.acceleration_low36 - descriptor.address;
+            descriptor.extended_low36 - descriptor.address;
     }
 
     CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
@@ -2685,7 +2694,7 @@ static void macws_log_failed_texture_descriptor(
         "class=%s impl=%p implOff=%#tx %lux%lu pf=%lu surface=%u "
         "cpu130=%p gpu40=%#llx found=%d descOff=%#tx layout=%u "
         "compressed=%u extended=%u address=%#llx "
-        "accelerationLow36=%#llx accelerationRaw=%#llx bytes=%s\n",
+        "extendedLow36=%#llx extendedRaw=%#llx bytes=%s\n",
         command_buffer, (unsigned long long)submit_serial,
         (__bridge void *)texture, class_getName([texture class]), impl,
         impl_offset, (unsigned long)width, (unsigned long)height,
@@ -2699,8 +2708,8 @@ static void macws_log_failed_texture_descriptor(
         found ? descriptor.compressed : 0,
         found ? descriptor.extended : 0,
         (unsigned long long)(found ? descriptor.address : 0),
-        (unsigned long long)(found ? descriptor.acceleration_low36 : 0),
-        (unsigned long long)(found ? descriptor.acceleration_raw : 0), hex);
+        (unsigned long long)(found ? descriptor.extended_low36 : 0),
+        (unsigned long long)(found ? descriptor.extended_raw : 0), hex);
 }
 
 // Read-only audit of the AGX texture mapping established by Apple's real
@@ -2781,17 +2790,19 @@ static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
 }
 
 // One-shot, read-only witness for the hardware Texture descriptor produced by
-// Apple's real initializer.  The /tmp/macws_res_diag sentinel already gates
-// the controlled native-AGX test, so this cannot add per-frame production log
-// traffic.  No descriptor field is modified here.
+// Apple's real initializer.  Either texture diagnostic sentinel gates the
+// controlled native-AGX test, so this cannot add per-frame production log
+// traffic.  No descriptor field is modified here.  The runtime type encoding
+// is recorded with the IMP so later argument tracing does not guess a private
+// Objective-C ABI.
 static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
                                                 MTLTextureDescriptor *desc,
                                                 IOSurfaceRef surf,
                                                 id device) {
     if (!tex || !desc || !surf || !device ||
         desc.pixelFormat != (MTLPixelFormat)550 ||
-        desc.width != 2388 || desc.height != 1668 ||
-        access("/tmp/macws_res_diag", F_OK) != 0) {
+        (access("/tmp/macws_res_diag", F_OK) != 0 &&
+         access("/private/tmp/macws_tile_descriptor_diag", F_OK) != 0)) {
         return;
     }
     static _Atomic int dumped = 0;
@@ -2825,14 +2836,14 @@ static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
     fprintf(stderr,
         "#### AGX_TEX_DESC pf550 tex=%p impl=%p implOff=%#tx descOff=%#tx "
         "gpu40=%#llx layout=%u compressed=%u extended=%u "
-        "address=%#llx accelerationLow36=%#llx "
-        "accelerationRaw=%#llx bytes=%s\n",
+        "address=%#llx extendedLow36=%#llx "
+        "extendedRaw=%#llx bytes=%s\n",
         (void *)tex, impl, impl_offset, descriptor.offset,
         (unsigned long long)*(volatile uint64_t *)((char *)impl + 0x40),
         descriptor.layout, descriptor.compressed, descriptor.extended,
         (unsigned long long)descriptor.address,
-        (unsigned long long)descriptor.acceleration_low36,
-        (unsigned long long)descriptor.acceleration_raw, hex);
+        (unsigned long long)descriptor.extended_low36,
+        (unsigned long long)descriptor.extended_raw, hex);
 
     // Runtime-to-static anchors for the exact macOS 13.4 AGX image.  dladdr
     // establishes the loaded image base; subtracting it and adding the
@@ -2852,6 +2863,7 @@ static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
         SEL sel = sel_registerName(methods[i].selector);
         Method method = class_getInstanceMethod(cls, sel);
         IMP imp = method ? method_getImplementation(method) : NULL;
+        const char *types = method ? method_getTypeEncoding(method) : NULL;
         Dl_info image = {0};
         bool located = imp && dladdr((const void *)imp, &image) != 0;
         uintptr_t static_address = located
@@ -2859,10 +2871,11 @@ static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
             : 0;
         fprintf(stderr,
             "#### AGX_TEX_METHOD class=%s selector=%s imp=%p imageBase=%p "
-            "static=%#llx image=%s\n",
+            "static=%#llx types=%s image=%s\n",
             class_getName(cls), methods[i].selector, (void *)imp,
             located ? image.dli_fbase : NULL,
             (unsigned long long)static_address,
+            types ? types : "(missing)",
             located && image.dli_fname ? image.dli_fname : "(unresolved)");
     }
 }
@@ -5368,8 +5381,13 @@ typedef struct {
     uintptr_t impl;
     uint64_t gpu_mapping;
     uint64_t address;
-    uint64_t acceleration_raw;
-    uint64_t acceleration_low36;
+    uint64_t extended_raw;
+    uint64_t extended_low36;
+    uint64_t alloc_size;
+    uint64_t plane_offset;
+    uint64_t plane_size;
+    uint64_t header_offset;
+    uint64_t header_span;
     uint32_t width;
     uint32_t height;
     uint32_t pixel_format;
@@ -5400,9 +5418,57 @@ static _Atomic uint64_t g_macws_tile_observer_serial = 0;
 typedef id (*macws_native_render_encoder_fn)(id, SEL, id);
 typedef void (*macws_native_set_tile_texture_fn)(id, SEL, id, NSUInteger);
 typedef void (*macws_native_set_tile_textures_fn)(id, SEL, const id *, NSRange);
+typedef void (*macws_native_update_bind_five_fn)(id, SEL, void *, void *,
+                                                 uint64_t, BOOL, BOOL);
 static macws_native_render_encoder_fn g_macws_native_render_encoder_orig = NULL;
 static macws_native_set_tile_texture_fn g_macws_native_set_tile_texture_orig = NULL;
 static macws_native_set_tile_textures_fn g_macws_native_set_tile_textures_orig = NULL;
+static macws_native_update_bind_five_fn g_macws_native_update_bind_five_orig = NULL;
+
+static void macws_tile_log_private_texture_methods_once(id texture) {
+    if (!texture) return;
+    static _Atomic int logged = 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&logged, &expected, 1)) return;
+
+    id device = nil;
+    @try {
+        if ([texture respondsToSelector:@selector(device)]) {
+            device = [texture device];
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    struct {
+        id receiver;
+        const char *selector;
+    } methods[] = {
+        { device, "initNewTextureData:" },
+        { texture, "updateBindDataWithAddresses:cpuMetadataAddress:gpuVirtualAddress:isCompressible:shouldInitMetadata:" },
+        { texture, "updateBindDataWithAddresses:gpuVirtualAddress:" },
+        { texture, "updateBindDataWithAddresses:gpuVirtualAddress:shouldInitMetadata:" },
+    };
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+        Class cls = methods[i].receiver ? [methods[i].receiver class] : Nil;
+        SEL selector = sel_registerName(methods[i].selector);
+        Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
+        IMP imp = method ? method_getImplementation(method) : NULL;
+        const char *types = method ? method_getTypeEncoding(method) : NULL;
+        Dl_info image = {0};
+        bool located = imp && dladdr((const void *)imp, &image) != 0;
+        uintptr_t static_address = located
+            ? (uintptr_t)imp - (uintptr_t)image.dli_fbase + 0x1e53dd000ULL
+            : 0;
+        fprintf(stderr,
+            "#### TILE-PRIVATE-METHOD class=%s selector=%s imp=%p "
+            "imageBase=%p static=%#llx types=%s image=%s\n",
+            cls ? class_getName(cls) : "(nil)", methods[i].selector,
+            (void *)imp, located ? image.dli_fbase : NULL,
+            (unsigned long long)static_address,
+            types ? types : "(missing)",
+            located && image.dli_fname ? image.dli_fname : "(unresolved)");
+    }
+}
 
 static macws_tile_texture_snapshot macws_tile_snapshot_texture(id texture) {
     macws_tile_texture_snapshot snapshot = {0};
@@ -5429,6 +5495,49 @@ static macws_tile_texture_snapshot macws_tile_snapshot_texture(id texture) {
     snapshot.height = (uint32_t)height;
     snapshot.pixel_format = (uint32_t)pixel_format;
     snapshot.surface_id = surface ? IOSurfaceGetID(surface) : 0;
+    snapshot.alloc_size = surface ? IOSurfaceGetAllocSize(surface) : 0;
+
+    if (pixel_format == 550) {
+        macws_tile_log_private_texture_methods_once(texture);
+    }
+    if (surface && pixel_format == 550) {
+        CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+        if (copied) {
+            @try {
+                NSDictionary *root = (__bridge NSDictionary *)copied;
+                id creation_value = root[@"CreationProperties"];
+                NSDictionary *creation =
+                    [creation_value isKindOfClass:[NSDictionary class]]
+                        ? (NSDictionary *)creation_value : root;
+                id planes_value = creation[@"IOSurfacePlaneInfo"];
+                if ([planes_value isKindOfClass:[NSArray class]] &&
+                    [(NSArray *)planes_value count] != 0) {
+                    id plane_value = [(NSArray *)planes_value objectAtIndex:0];
+                    if ([plane_value isKindOfClass:[NSDictionary class]]) {
+                        NSDictionary *plane = (NSDictionary *)plane_value;
+                        snapshot.plane_offset = macws_pf550_dict_uint64(
+                            plane, @"Offset", @"IOSurfacePlaneOffset");
+                        snapshot.plane_size = macws_pf550_dict_uint64(
+                            plane, @"Size", @"IOSurfacePlaneSize");
+                        snapshot.header_offset = macws_pf550_dict_uint64(
+                            plane, @"CompressedTileHeaderRegionOffset",
+                            @"IOSurfacePlaneCompressedTileHeaderRegionOffset");
+                        uint64_t plane_end = snapshot.plane_offset +
+                            snapshot.plane_size;
+                        if (plane_end >= snapshot.plane_offset &&
+                            snapshot.header_offset >= snapshot.plane_offset &&
+                            snapshot.header_offset < plane_end) {
+                            snapshot.header_span =
+                                plane_end - snapshot.header_offset;
+                        }
+                    }
+                }
+            } @catch (NSException *exception) {
+                (void)exception;
+            }
+            CFRelease(copied);
+        }
+    }
 
     ptrdiff_t impl_offset = 0x208;
     Ivar ivar = class_getInstanceVariable([texture class], "_impl");
@@ -5443,8 +5552,8 @@ static macws_tile_texture_snapshot macws_tile_snapshot_texture(id texture) {
         snapshot.found = 1;
         snapshot.descriptor_offset = (int32_t)descriptor.offset;
         snapshot.address = descriptor.address;
-        snapshot.acceleration_raw = descriptor.acceleration_raw;
-        snapshot.acceleration_low36 = descriptor.acceleration_low36;
+        snapshot.extended_raw = descriptor.extended_raw;
+        snapshot.extended_low36 = descriptor.extended_low36;
         snapshot.layout = (uint8_t)descriptor.layout;
         snapshot.compressed = (uint8_t)descriptor.compressed;
         snapshot.extended = (uint8_t)descriptor.extended;
@@ -5452,6 +5561,76 @@ static macws_tile_texture_snapshot macws_tile_snapshot_texture(id texture) {
                sizeof(snapshot.descriptor_bytes));
     }
     return snapshot;
+}
+
+// Observe the actual private producer ABI established by
+// method_getTypeEncoding (`v48@0:8^v16^v24Q32B40B44`).  This wrapper forwards
+// every original argument unchanged, then copies the finished descriptor.  It
+// is installed only with macws_tile_descriptor_diag and is therefore a
+// diagnostic witness, not a protocol fix.
+static void macws_native_update_bind_five_diag(
+        id self, SEL selector, void *cpu_address, void *cpu_metadata_address,
+        uint64_t gpu_virtual_address, BOOL is_compressible,
+        BOOL should_init_metadata) {
+    void *caller = __builtin_return_address(0);
+    macws_tile_texture_snapshot before = macws_tile_snapshot_texture(self);
+    if (g_macws_native_update_bind_five_orig) {
+        g_macws_native_update_bind_five_orig(
+            self, selector, cpu_address, cpu_metadata_address,
+            gpu_virtual_address, is_compressible, should_init_metadata);
+    }
+
+    macws_tile_texture_snapshot snapshot = macws_tile_snapshot_texture(self);
+    if (snapshot.pixel_format != 550 ||
+        !((snapshot.width == 1140 && snapshot.height == 798) ||
+          (snapshot.width == 2388 && snapshot.height == 1668))) {
+        return;
+    }
+    BOOL target_geometry = snapshot.width == 1140 && snapshot.height == 798;
+    static _Atomic uint32_t target_logged = 0;
+    static _Atomic uint32_t control_logged = 0;
+    uint32_t sequence = target_geometry
+        ? atomic_fetch_add(&target_logged, 1) + 1
+        : atomic_fetch_add(&control_logged, 1) + 1;
+    if ((target_geometry && sequence > 32) ||
+        (!target_geometry && sequence > 4)) {
+        return;
+    }
+
+    Dl_info image = {0};
+    bool located = caller && dladdr(caller, &image) != 0;
+    uintptr_t caller_static = located && image.dli_fname &&
+            strstr(image.dli_fname, "AGXMetal13_3")
+        ? (uintptr_t)caller - (uintptr_t)image.dli_fbase + 0x1e53dd000ULL
+        : 0;
+    fprintf(stderr,
+        "#### UPDATEBIND-FIVE role=%s #%u tex=%p %ux%u pf=%u surface=%u "
+        "cpuAddress=%p cpuMetadata=%p gpuVA=%#llx compressible=%u "
+        "initMetadata=%u caller=%p callerStatic=%#llx "
+        "gpu40=%#llx address=%#llx extendedLow36=%#llx extendedRaw=%#llx "
+        "layout=%u compressed=%u extended=%u alloc=%#llx "
+        "headerOffset=%#llx headerSpan=%#llx "
+        "beforeFound=%u beforeAddress=%#llx beforeExtendedLow36=%#llx "
+        "beforeExtendedRaw=%#llx beforeLayout=%u beforeCompressed=%u "
+        "beforeExtended=%u\n",
+        target_geometry ? "target-1140" : "control-2388", sequence,
+        (__bridge void *)self, snapshot.width, snapshot.height,
+        snapshot.pixel_format, snapshot.surface_id, cpu_address,
+        cpu_metadata_address, (unsigned long long)gpu_virtual_address,
+        (unsigned)is_compressible, (unsigned)should_init_metadata, caller,
+        (unsigned long long)caller_static,
+        (unsigned long long)snapshot.gpu_mapping,
+        (unsigned long long)snapshot.address,
+        (unsigned long long)snapshot.extended_low36,
+        (unsigned long long)snapshot.extended_raw,
+        snapshot.layout, snapshot.compressed, snapshot.extended,
+        (unsigned long long)snapshot.alloc_size,
+        (unsigned long long)snapshot.header_offset,
+        (unsigned long long)snapshot.header_span, before.found,
+        (unsigned long long)before.address,
+        (unsigned long long)before.extended_low36,
+        (unsigned long long)before.extended_raw,
+        before.layout, before.compressed, before.extended);
 }
 
 static void macws_tile_log_snapshot(uint32_t sequence, const char *role,
@@ -5468,8 +5647,9 @@ static void macws_tile_log_snapshot(uint32_t sequence, const char *role,
         "targetSerial=%llu commandBuffer=%#llx tex=%#llx impl=%#llx "
         "%ux%u pf=%u surface=%u "
         "gpu40=%#llx found=%u descOff=%#x layout=%u compressed=%u "
-        "extended=%u address=%#llx accelerationLow36=%#llx "
-        "accelerationRaw=%#llx bytes=%s\n",
+        "extended=%u address=%#llx extendedLow36=%#llx "
+        "extendedRaw=%#llx alloc=%#llx planeOffset=%#llx "
+        "planeSize=%#llx headerOffset=%#llx headerSpan=%#llx bytes=%s\n",
         sequence, role, (unsigned long long)encoder, (unsigned long)index,
         (unsigned long long)target_serial,
         (unsigned long long)command_buffer,
@@ -5480,8 +5660,13 @@ static void macws_tile_log_snapshot(uint32_t sequence, const char *role,
         snapshot.found, snapshot.descriptor_offset,
         snapshot.layout, snapshot.compressed, snapshot.extended,
         (unsigned long long)snapshot.address,
-        (unsigned long long)snapshot.acceleration_low36,
-        (unsigned long long)snapshot.acceleration_raw, hex);
+        (unsigned long long)snapshot.extended_low36,
+        (unsigned long long)snapshot.extended_raw,
+        (unsigned long long)snapshot.alloc_size,
+        (unsigned long long)snapshot.plane_offset,
+        (unsigned long long)snapshot.plane_size,
+        (unsigned long long)snapshot.header_offset,
+        (unsigned long long)snapshot.header_span, hex);
 }
 
 static void macws_tile_store_target(id command_buffer, id encoder,
@@ -5507,6 +5692,56 @@ static void macws_tile_store_target(id command_buffer, id encoder,
     pthread_mutex_lock(&g_macws_tile_target_lock);
     g_macws_tile_targets[serial % MACWS_TILE_TARGET_CAP] = entry;
     pthread_mutex_unlock(&g_macws_tile_target_lock);
+}
+
+// Join the render-target metadata captured at encoder creation to the exact
+// private IOGPU command buffer that later reports PageFault.  Snapshots contain
+// only copied scalar/descriptor bytes; neither the texture nor encoder is
+// retained, messaged, or dereferenced from the completion callback.  Keep the
+// ring walk bounded and copy matches out before logging so the producer is not
+// blocked behind stderr while holding the target lock.
+static void macws_tile_dump_command_buffer_targets(
+        const void *command_buffer) {
+    if (!command_buffer ||
+        access("/private/tmp/macws_tile_descriptor_diag", F_OK) != 0) {
+        return;
+    }
+    macws_tile_target_entry matches[64] = {0};
+    size_t match_count = 0;
+    pthread_mutex_lock(&g_macws_tile_target_lock);
+    for (size_t i = 0; i < MACWS_TILE_TARGET_CAP; i++) {
+        macws_tile_target_entry entry = g_macws_tile_targets[i];
+        if (entry.serial == 0 ||
+            entry.command_buffer != (uintptr_t)command_buffer) {
+            continue;
+        }
+        if (match_count < sizeof(matches) / sizeof(matches[0])) {
+            matches[match_count++] = entry;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_tile_target_lock);
+
+    // The fixed ring is indexed by serial modulo its capacity, so sort the
+    // small copied set into encoder-creation order for direct comparison with
+    // the KCMD segment chain.
+    for (size_t i = 1; i < match_count; i++) {
+        macws_tile_target_entry value = matches[i];
+        size_t j = i;
+        while (j > 0 && matches[j - 1].serial > value.serial) {
+            matches[j] = matches[j - 1];
+            j--;
+        }
+        matches[j] = value;
+    }
+    fprintf(stderr,
+        "#### TILE-PAGEFAULT commandBuffer=%p renderTargets=%zu "
+        "ringCapacity=%u\n",
+        command_buffer, match_count, MACWS_TILE_TARGET_CAP);
+    for (size_t i = 0; i < match_count; i++) {
+        macws_tile_log_snapshot((uint32_t)(i + 1), "pagefault-target",
+            matches[i].encoder, i, matches[i].target,
+            matches[i].serial, matches[i].command_buffer);
+    }
 }
 
 static BOOL macws_tile_find_target(uintptr_t encoder,
@@ -5641,6 +5876,12 @@ static void macws_install_tile_descriptor_diagnostic(void) {
         ? class_getInstanceMethod(render_context, texture_selector) : NULL;
     Method textures_method = render_context
         ? class_getInstanceMethod(render_context, textures_selector) : NULL;
+    Class texture_class = objc_getClass("AGXG13GFamilyTexture");
+    SEL update_bind_selector = sel_registerName(
+        "updateBindDataWithAddresses:cpuMetadataAddress:gpuVirtualAddress:"
+        "isCompressible:shouldInitMetadata:");
+    Method update_bind_method = texture_class
+        ? class_getInstanceMethod(texture_class, update_bind_selector) : NULL;
     if (render_method) {
         g_macws_native_render_encoder_orig =
             (macws_native_render_encoder_fn)method_getImplementation(render_method);
@@ -5659,10 +5900,19 @@ static void macws_install_tile_descriptor_diagnostic(void) {
         method_setImplementation(textures_method,
                                  (IMP)macws_native_set_tile_textures_diag);
     }
+    if (update_bind_method && !g_macws_native_update_bind_five_orig) {
+        g_macws_native_update_bind_five_orig =
+            (macws_native_update_bind_five_fn)
+                method_getImplementation(update_bind_method);
+        method_setImplementation(update_bind_method,
+                                 (IMP)macws_native_update_bind_five_diag);
+    }
     fprintf(stderr,
         "#### TILE-DESC diagnostic installed render=%d texture=%d textures=%d "
+        "updateBindFive=%d "
         "(read-only fixed ring; original IMPs preserved)\n",
-        render_method != NULL, texture_method != NULL, textures_method != NULL);
+        render_method != NULL, texture_method != NULL,
+        textures_method != NULL, update_bind_method != NULL);
 }
 
 static void install_agx_init_redirect(Class agx) {

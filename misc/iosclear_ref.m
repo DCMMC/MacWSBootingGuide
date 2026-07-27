@@ -25,6 +25,7 @@
 #import <fcntl.h>
 #import <limits.h>
 #import <signal.h>
+#import <stdarg.h>
 #import <stdio.h>
 #import <stdlib.h>
 #import <string.h>
@@ -36,6 +37,104 @@ extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
     IOSurfaceRef surface, size_t plane);
 
 static os_log_t g_log;
+
+// MacWSHost links this file in library mode, so the standalone main() below
+// does not get a chance to redirect stderr into os_log.  Keep a separate,
+// opt-in diagnostic transcript for the native reference path.  Stage markers
+// are deliberately written before and after each Metal call that can allocate,
+// compile, submit, or wait; that makes a foreground-app stall attributable to
+// a concrete API instead of process uptime or an un-symbolicated worker stack.
+static const char *kMacWSReferenceLogPath =
+    "/var/mobile/iosclear-reference.log";
+
+static void macws_reference_log_reset(void) {
+    int fd = open(kMacWSReferenceLogPath,
+                  O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) close(fd);
+}
+
+static void macws_reference_log(const char *format, ...) {
+    int fd = open(kMacWSReferenceLogPath,
+                  O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return;
+    char line[2048];
+    va_list arguments;
+    va_start(arguments, format);
+    int length = vsnprintf(line, sizeof(line), format, arguments);
+    va_end(arguments);
+    if (length < 0) {
+        close(fd);
+        return;
+    }
+    size_t used = (size_t)length < sizeof(line) - 2
+        ? (size_t)length : sizeof(line) - 2;
+    line[used++] = '\n';
+    (void)write(fd, line, used);
+    close(fd);
+}
+
+// Read-only native texture-descriptor control.  The same width/height
+// invariant and address decoding are used by libmachook's WindowServer
+// PageFault observer, so a compressed PF550 target can be compared without
+// assuming that its auxiliary/acceleration address belongs to an ordinary
+// IOGPU resource.  No descriptor byte or private ivar is modified.
+static void macws_reference_log_texture_descriptor(id<MTLTexture> texture,
+                                                    const char *role) {
+    if (!texture) {
+        macws_reference_log("TEXTURE-DESC role=%s texture=nil", role);
+        return;
+    }
+    @try {
+        size_t width = texture.width;
+        size_t height = texture.height;
+        ptrdiff_t impl_offset = 0x208;
+        Ivar ivar = class_getInstanceVariable([texture class], "_impl");
+        if (ivar) impl_offset = ivar_getOffset(ivar);
+        void *impl = *(void **)((char *)(__bridge void *)texture + impl_offset);
+        uint64_t gpu_mapping = impl
+            ? *(const volatile uint64_t *)((const char *)impl + 0x40) : 0;
+        for (ptrdiff_t offset = 0x140; impl && offset <= 0x240; offset++) {
+            uint64_t word0 = 0, word1 = 0, extended_raw = 0;
+            memcpy(&word0, (const char *)impl + offset, sizeof(word0));
+            memcpy(&word1, (const char *)impl + offset + 8, sizeof(word1));
+            size_t encoded_width = (size_t)((word0 >> 28) & 0x3fff) + 1;
+            size_t encoded_height = (size_t)((word0 >> 42) & 0x3fff) + 1;
+            if (encoded_width != width || encoded_height != height) continue;
+            uint8_t bytes[24] = {0};
+            memcpy(bytes, (const char *)impl + offset, sizeof(bytes));
+            memcpy(&extended_raw, bytes + 16, sizeof(extended_raw));
+            uint64_t address = ((word1 >> 2) & 0xfffffffffULL) << 4;
+            uint64_t extended_low36 =
+                (extended_raw & 0xfffffffffULL) << 4;
+            char hex[sizeof(bytes) * 2 + 1] = {0};
+            for (size_t index = 0; index < sizeof(bytes); index++) {
+                snprintf(hex + index * 2, 3, "%02x", bytes[index]);
+            }
+            macws_reference_log(
+                "TEXTURE-DESC role=%s texture=%p impl=%p %zux%zu pf=%lu "
+                "gpu40=%#llx descOff=%#tx layout=%u compressed=%u "
+                "extended=%u address=%#llx extendedLow36=%#llx "
+                "extendedRaw=%#llx bytes=%s",
+                role, (__bridge void *)texture, impl, width, height,
+                (unsigned long)texture.pixelFormat,
+                (unsigned long long)gpu_mapping, offset,
+                (unsigned)((word0 >> 4) & 0x3),
+                (unsigned)((word1 >> 39) & 1),
+                (unsigned)((word1 >> 63) & 1),
+                (unsigned long long)address,
+                (unsigned long long)extended_low36,
+                (unsigned long long)extended_raw, hex);
+            return;
+        }
+        macws_reference_log(
+            "TEXTURE-DESC role=%s texture=%p impl=%p %zux%zu pf=%lu NOT-FOUND",
+            role, (__bridge void *)texture, impl, width, height,
+            (unsigned long)texture.pixelFormat);
+    } @catch (NSException *exception) {
+        macws_reference_log("TEXTURE-DESC role=%s exception=%s", role,
+            exception.description.UTF8String ?: "(nil)");
+    }
+}
 
 static BOOL macws_is_relevant_agx_class(const char *name) {
     if (!name) return NO;
@@ -320,24 +419,44 @@ static void macws_run_textured_draw(id<MTLDevice> device,
         width = 2388;
         height = 1668;
     }
+    macws_reference_log("DRAW enter mode=%s width=%zu height=%zu device=%p queue=%p",
+        pf550Mode ? "pf550" : "BGRA8", width, height,
+        (__bridge void *)device, (__bridge void *)queue);
+    macws_reference_log("DRAW before-source-surface");
     IOSurfaceRef sourceSurface = pf550Mode
         ? macws_create_pf550_surface()
         : macws_create_bgra_surface(width, height);
+    macws_reference_log("DRAW after-source-surface source=%p", sourceSurface);
+    macws_reference_log("DRAW before-destination-surface");
     IOSurfaceRef destinationSurface = macws_create_bgra_surface(width, height);
+    macws_reference_log("DRAW after-destination-surface destination=%p",
+        destinationSurface);
     const unsigned char expected[4] = {0x21, 0x43, 0x65, 0xff};
     if (sourceSurface && !pf550Mode) {
+        macws_reference_log("DRAW before-fill-source");
         macws_fill_surface(sourceSurface, width, height, expected);
+        macws_reference_log("DRAW after-fill-source");
     }
 
+    macws_reference_log("DRAW before-source-texture");
     id<MTLTexture> sourceTexture = macws_create_surface_texture(
         device, sourceSurface, width, height,
         pf550Mode ? (MTLPixelFormat)550 : MTLPixelFormatBGRA8Unorm,
         pf550Mode ? (MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget)
                   : MTLTextureUsageShaderRead);
+    macws_reference_log("DRAW after-source-texture texture=%p class=%s",
+        (__bridge void *)sourceTexture,
+        sourceTexture ? object_getClassName(sourceTexture) : "nil");
+    macws_reference_log("DRAW before-destination-texture");
     id<MTLTexture> destinationTexture = macws_create_surface_texture(
         device, destinationSurface, width, height,
         MTLPixelFormatBGRA8Unorm,
         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    macws_reference_log("DRAW after-destination-texture texture=%p class=%s",
+        (__bridge void *)destinationTexture,
+        destinationTexture ? object_getClassName(destinationTexture) : "nil");
+    macws_reference_log_texture_descriptor(sourceTexture, "source");
+    macws_reference_log_texture_descriptor(destinationTexture, "destination");
     fprintf(stderr,
         "IOSCLEAR DRAW mode=%s surfaces source=%p destination=%p "
         "textures=%p/%p classes=%s/%s\n",
@@ -350,9 +469,17 @@ static void macws_run_textured_draw(id<MTLDevice> device,
     NSError *error = nil;
     NSURL *libraryURL = [NSURL fileURLWithPath:
         @"/System/Library/Frameworks/QuartzCore.framework/default.metallib"];
+    macws_reference_log("DRAW before-library path=%s",
+        libraryURL.path.fileSystemRepresentation);
     id<MTLLibrary> library = [device newLibraryWithURL:libraryURL error:&error];
+    macws_reference_log("DRAW after-library library=%p error=%s",
+        (__bridge void *)library,
+        error ? error.description.UTF8String : "nil");
+    macws_reference_log("DRAW before-functions");
     id<MTLFunction> vertex = [library newFunctionWithName:@"read_surf_vert"];
     id<MTLFunction> fragment = [library newFunctionWithName:@"read_surf_frag"];
+    macws_reference_log("DRAW after-functions vertex=%p fragment=%p",
+        (__bridge void *)vertex, (__bridge void *)fragment);
     MTLRenderPipelineDescriptor *pipelineDescriptor =
         [MTLRenderPipelineDescriptor new];
     pipelineDescriptor.label = @"IOSCLEAR QuartzCore read_surf reference";
@@ -360,15 +487,24 @@ static void macws_run_textured_draw(id<MTLDevice> device,
     pipelineDescriptor.fragmentFunction = fragment;
     pipelineDescriptor.colorAttachments[0].pixelFormat =
         MTLPixelFormatBGRA8Unorm;
+    macws_reference_log("DRAW before-pipeline");
     id<MTLRenderPipelineState> pipeline = vertex && fragment
         ? [device newRenderPipelineStateWithDescriptor:pipelineDescriptor
                                                  error:&error] : nil;
+    macws_reference_log("DRAW after-pipeline pipeline=%p error=%s",
+        (__bridge void *)pipeline,
+        error ? error.description.UTF8String : "nil");
     fprintf(stderr,
         "IOSCLEAR DRAW library=%p vertex=%p fragment=%p pipeline=%p error=%s\n",
         (__bridge void *)library, (__bridge void *)vertex,
         (__bridge void *)fragment, (__bridge void *)pipeline,
         error ? [[error description] UTF8String] : "nil");
     if (!sourceTexture || !destinationTexture || !pipeline) {
+        macws_reference_log(
+            "DRAW early-return sourceTexture=%p destinationTexture=%p pipeline=%p",
+            (__bridge void *)sourceTexture,
+            (__bridge void *)destinationTexture,
+            (__bridge void *)pipeline);
         if (sourceSurface) CFRelease(sourceSurface);
         if (destinationSurface) CFRelease(destinationSurface);
         return;
@@ -379,8 +515,11 @@ static void macws_run_textured_draw(id<MTLDevice> device,
     commandDescriptor.retainedReferences = YES;
     commandDescriptor.errorOptions =
         MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    macws_reference_log("DRAW before-command-buffer");
     id<MTLCommandBuffer> commandBuffer =
         [queue commandBufferWithDescriptor:commandDescriptor];
+    macws_reference_log("DRAW after-command-buffer commandBuffer=%p",
+        (__bridge void *)commandBuffer);
     commandBuffer.label = @"IOSCLEAR native QuartzCore textured draw";
 
     MTLRenderPassDescriptor *renderPass =
@@ -392,18 +531,32 @@ static void macws_run_textured_draw(id<MTLDevice> device,
     renderPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
     renderPass.colorAttachments[0].storeAction = MTLStoreActionStore;
     renderPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+    macws_reference_log("DRAW before-render-encoder");
     id<MTLRenderCommandEncoder> encoder =
         [commandBuffer renderCommandEncoderWithDescriptor:renderPass];
+    macws_reference_log("DRAW after-render-encoder encoder=%p",
+        (__bridge void *)encoder);
     encoder.label = @"IOSCLEAR native QuartzCore textured draw";
     [encoder setRenderPipelineState:pipeline];
     [encoder setFragmentTexture:sourceTexture atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                 vertexStart:0 vertexCount:4];
     [encoder endEncoding];
+    macws_reference_log("DRAW after-end-encoding");
 
+    macws_reference_log("DRAW before-command-dump");
     macws_dump_commands(commandBuffer, "DRAW-PRE");
+    macws_reference_log("DRAW after-command-dump");
+    macws_reference_log("DRAW before-commit");
     [commandBuffer commit];
+    macws_reference_log("DRAW after-commit status=%ld",
+        (long)commandBuffer.status);
+    macws_reference_log("DRAW before-wait");
     [commandBuffer waitUntilCompleted];
+    macws_reference_log("DRAW after-wait status=%ld error=%s",
+        (long)commandBuffer.status,
+        commandBuffer.error ? commandBuffer.error.description.UTF8String
+                            : "nil");
 
     IOSurfaceLock(destinationSurface, kIOSurfaceLockReadOnly, NULL);
     size_t bytesPerRow = IOSurfaceGetBytesPerRow(destinationSurface);
@@ -413,6 +566,12 @@ static void macws_run_textured_draw(id<MTLDevice> device,
     BOOL match = !pf550Mode && pixel && memcmp(pixel, expected, 4) == 0;
     BOOL commandOK = [commandBuffer status] == MTLCommandBufferStatusCompleted &&
         [commandBuffer error] == nil;
+    macws_reference_log(
+        "DRAW result status=%ld commandOK=%s bpr=%zu center=%02x%02x%02x%02x match=%s",
+        (long)commandBuffer.status, commandOK ? "YES" : "NO", bytesPerRow,
+        pixel ? pixel[0] : 0, pixel ? pixel[1] : 0,
+        pixel ? pixel[2] : 0, pixel ? pixel[3] : 0,
+        match ? "YES" : "NO");
     fprintf(stderr,
         "IOSCLEAR DRAW-RESULT mode=%s status=%ld error=%s commandOK=%s "
         "bpr=%zu center=%02x%02x%02x%02x expected=%s match=%s\n",
@@ -431,6 +590,8 @@ static void macws_run_textured_draw(id<MTLDevice> device,
 
 void MacWSRunIOSClearReference(void) {
     @autoreleasepool {
+        macws_reference_log_reset();
+        macws_reference_log("REFERENCE enter pid=%d", getpid());
         // Some FrontBoard-launched diagnostics cannot be attached reliably
         // while they are already stopped in raise(SIGSTOP): debugserver owns
         // the task, but never reaches its remote-protocol listen state.  This
@@ -463,14 +624,27 @@ void MacWSRunIOSClearReference(void) {
                 getpid());
             raise(SIGSTOP);
         }
+        macws_reference_log("REFERENCE before-device");
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        macws_reference_log("REFERENCE after-device device=%p class=%s name=%s",
+            (__bridge void *)device,
+            device ? object_getClassName(device) : "nil",
+            device ? device.name.UTF8String : "nil");
+        macws_reference_log("REFERENCE before-queue");
         id<MTLCommandQueue> queue = [device newCommandQueue];
+        macws_reference_log("REFERENCE after-queue queue=%p class=%s",
+            (__bridge void *)queue,
+            queue ? object_getClassName(queue) : "nil");
         fprintf(stderr, "IOSCLEAR device=%p class=%s name=%s queue=%p\n",
             (__bridge void *)device,
             device ? object_getClassName(device) : "nil",
             device ? [[device name] UTF8String] : "nil",
             (__bridge void *)queue);
-        if (!device || !queue) return;
+        if (!device || !queue) {
+            macws_reference_log("REFERENCE early-return device=%p queue=%p",
+                (__bridge void *)device, (__bridge void *)queue);
+            return;
+        }
         if (getenv("IOSCLEAR_DUMP_AGX_METHODS") ||
             access("/var/mobile/iosclear_dump_agx_methods", F_OK) == 0) {
             macws_dump_agx_runtime();
@@ -485,12 +659,24 @@ void MacWSRunIOSClearReference(void) {
             width = 2388;
             height = 1668;
         }
+        // Exact WindowServer Terminal intermediate geometry.  FrontBoard
+        // launches do not inherit a convenient per-run environment, so keep
+        // this as an explicit diagnostic sentinel just like iosclear_hires.
+        // It allows the native iOS textured record to be compared against the
+        // recurrent 1140x798 chroot PageFault without a geometry confounder.
+        if (access("/var/mobile/iosclear_terminal_size", F_OK) == 0) {
+            width = 1140;
+            height = 798;
+        }
+        macws_reference_log("REFERENCE dimensions width=%zu height=%zu", width,
+            height);
         if (getenv("IOSCLEAR_DRAW_MODE") ||
             access("/var/mobile/iosclear_draw_mode", F_OK) == 0) {
             fprintf(stderr,
                 "IOSCLEAR DRAW-MODE QuartzCore read_surf %zux%zu\n",
                 width, height);
             macws_run_textured_draw(device, queue, width, height);
+            macws_reference_log("REFERENCE draw-returned");
             return;
         }
 

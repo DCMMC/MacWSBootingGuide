@@ -5815,6 +5815,20 @@ static struct macws_agx_life_event
     g_agxLifeEvents[MACWS_AGX_LIFE_EVENT_CAP];
 static uint64_t g_agxLifeEventSerial;
 
+// Read the resource-generation boundary without exposing the lifecycle
+// table's lock ordering to the submit recorder.  The returned serial is the
+// newest successful create/finalize event that completed before this call.
+// A later error dump can therefore distinguish a resource that stayed in the
+// same generation from a GID that was destroyed and reused while the GPU work
+// was outstanding.  This is observation only; it does not retain a resource
+// or delay its finalizer.
+static uint64_t macws_agx_life_current_event_serial(void) {
+    pthread_mutex_lock(&g_agxLifeLock);
+    uint64_t serial = g_agxLifeEventSerial;
+    pthread_mutex_unlock(&g_agxLifeLock);
+    return serial;
+}
+
 static void macws_agx_life_record_locked(
     uint8_t action, const struct macws_agx_life_entry *resource) {
     if (!resource) return;
@@ -6416,6 +6430,7 @@ static _Atomic unsigned g_macws_multisegment_log_batches = 0;
 
 struct macws_submit_ring_entry {
     uint64_t serial;
+    uint64_t life_event_serial;
     unsigned sequence;
     unsigned descriptor;
     unsigned fixed;
@@ -6593,6 +6608,12 @@ static struct macws_submit_ring_token macws_submit_ring_begin(
     token.slot = (unsigned)((token.serial - 1) % MACWS_SUBMIT_RING_COUNT);
     token.active = 1;
 
+    // Take the lifecycle boundary before the ring lock.  Error dumping uses
+    // ring -> lifecycle lock order; never invert that order here.  Other
+    // threads may create resources after this point, but every event at or
+    // below this serial was visible when the segment list was captured.
+    uint64_t life_event_serial = macws_agx_life_current_event_serial();
+
     pthread_mutex_lock(&g_macws_submit_ring_lock);
     struct macws_submit_ring_entry *entry =
         &g_macws_submit_ring[token.slot];
@@ -6610,6 +6631,7 @@ static struct macws_submit_ring_token macws_submit_ring_begin(
     entry->descriptor_pointer = descriptor_pointer;
     entry->command_buffer = command_buffer;
     entry->storage = storage;
+    entry->life_event_serial = life_event_serial;
     // Publish serial last while holding the lock.  A concurrent error dumper
     // can never observe new metadata paired with the overwritten slot's data.
     entry->serial = token.serial;
@@ -6725,12 +6747,14 @@ static void macws_dump_recent_agx_submits_impl(
             &g_macws_submit_ring[slot];
         if (entry->serial != serial) continue;
         if (manifest) fprintf(manifest,
-            "serial=%llu sequence=%u descriptor=%u fixed=%u "
+            "serial=%llu life_event_serial=%llu "
+            "sequence=%u descriptor=%u fixed=%u "
             "descriptor_pointer=%#llx command_buffer=%#llx storage=%#llx "
             "matched=%s marked=%s serial_marked=%s "
             "pre_commands=%zu pre_segments=%zu "
             "post_commands=%zu post_segments=%zu\n",
-            (unsigned long long)entry->serial, entry->sequence,
+            (unsigned long long)entry->serial,
+            (unsigned long long)entry->life_event_serial, entry->sequence,
             entry->descriptor, entry->fixed,
             (unsigned long long)entry->descriptor_pointer,
             (unsigned long long)entry->command_buffer,
@@ -8837,6 +8861,37 @@ IOReturn IOConnectCallAsyncMethod_new(io_connect_t client, uint32_t selector, ma
 IOReturn IOConnectCallAsyncScalarMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
     uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
+    if (IOConnectIsIOGPU(client) && orig == 0x107 &&
+        access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+        static _Atomic unsigned registration_count = 0;
+        unsigned sequence = atomic_fetch_add(&registration_count, 1) + 1;
+        if (sequence <= 8) {
+            void *caller = __builtin_return_address(0);
+            Dl_info caller_info = {0};
+            (void)dladdr(caller, &caller_info);
+            fprintf(stderr,
+                "#### AGXIOC ASYNC-REGISTER #%u conn=%u sel=0x%x->0x%x "
+                "wake=%u ref=%p refCnt=%u inCnt=%u caller=%p image=%s "
+                "symbol=%s\n",
+                sequence, client, orig, selector, wake_port, ref, refCnt,
+                inCnt, caller,
+                caller_info.dli_fname ?: "(unknown)",
+                caller_info.dli_sname ?: "(unknown)");
+            uint32_t limit = refCnt < 8 ? refCnt : 8;
+            for (uint32_t index = 0; ref && index < limit; index++) {
+                void *candidate = (void *)(uintptr_t)ref[index];
+                Dl_info info = {0};
+                int resolved = candidate ? dladdr(candidate, &info) : 0;
+                fprintf(stderr,
+                    "#### AGXIOC ASYNC-REFERENCE registration=%u index=%u "
+                    "value=%#llx image=%s symbol=%s symbolAddress=%p\n",
+                    sequence, index, (unsigned long long)ref[index],
+                    resolved && info.dli_fname ? info.dli_fname : "(none)",
+                    resolved && info.dli_sname ? info.dli_sname : "(none)",
+                    resolved ? info.dli_saddr : NULL);
+            }
+        }
+    }
     IOReturn r = IOConnectCallAsyncScalarMethod(client, selector, wake_port, ref, refCnt, in, inCnt, out, outCnt);
     if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncScalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
     return r;

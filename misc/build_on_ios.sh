@@ -15,7 +15,7 @@ cd "$PROJECT_DIR"
 # Incremental mode: skip `make clean` and only rebuild changed files.
 # Triggered by env FAST=1 or argument --fast. The first build of the day
 # should still be a full one; subsequent edits to libmachook/*.m can use
-# the fast path to cut build time from ~20s to ~3s.
+# the fast path to cut build time from ~20s to a few seconds.
 FAST=${FAST:-0}
 FAST_FORCE=${FAST_FORCE:-0}
 for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
@@ -81,8 +81,20 @@ echo "==> Building..."
 # (Theos would otherwise default to iOS 9.0 / LC_VERSION_MIN_IPHONEOS, rejected
 # by macOS dyld).  The macOS cross-compile (misc/build.sh) uses ld64 and must
 # NOT get the flag.
-make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
-	LIBMACHOOK_ON_DEVICE_BUILD=1
+if [ "$FAST" = "1" ]; then
+    # The aggregate Makefile walks every subproject even when FAST will ship
+    # only libmachook.  Build the library subproject directly while preserving
+    # the root project/build directories that the aggregate invocation uses;
+    # this both keeps `interpose.h` on the project include path and reuses the
+    # existing root .theos object cache.
+    THEOS_PROJECT_DIR="$PROJECT_DIR" THEOS_BUILD_DIR="$PROJECT_DIR" \
+        make -C libmachook \
+        FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless \
+        GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
+else
+    make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless \
+        GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
+fi
 
 if [ "$FAST" = "1" ]; then
     BUILT=$(find .theos/obj -name libmachook.dylib | head -1)
