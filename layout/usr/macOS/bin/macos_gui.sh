@@ -48,7 +48,11 @@ INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 VNC_LABEL=com.macwsguide.osxvnc
 TERM_LABEL=com.macwsguide.terminal
 INPUT_LABEL=com.macwsguide.input
+VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
+VSCODE_LABEL=com.macwsguide.vscode
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
+EXPERIMENTAL_WRAPPED_KCMD="$ROOTFS/private/tmp/macws_kcmd_wrapped_fix"
+EXPERIMENTAL_COMMAND_ERROR="$ROOTFS/private/tmp/macws_command_error_diag"
 EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
@@ -82,6 +86,7 @@ P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_INPUTD='/usr/local/bin/macwsinputd'
+P_VSCODE='Visual Studio Code.app/Contents/'
 
 # ─── Watchdog (crash-loop safety net) ───────────────────────────────────────
 # WindowServer composites window content through the MTLSim Metal bridge, whose
@@ -226,6 +231,8 @@ stop_ws_dependents() {
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl unload "$INPUT_PLIST" 2>/dev/null
     launchctl remove "$INPUT_LABEL" 2>/dev/null
+    launchctl unload "$VSCODE_PLIST" 2>/dev/null
+    launchctl remove "$VSCODE_LABEL" 2>/dev/null
 
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
@@ -233,6 +240,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
+    kill_by_pattern "$P_VSCODE"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 }
@@ -522,6 +530,14 @@ cleanup_macos() {
     launchctl unload "$INPUT_PLIST" 2>/dev/null
     launchctl remove "$INPUT_LABEL" 2>/dev/null
 
+    # VS Code is launched separately from this script, but it is still a CGS
+    # client of this WindowServer.  Runtime-confirmed after the 300-second
+    # safety stop: the GUI jobs were gone while Electron and several Code
+    # Helper processes retained hundreds of MiB and a dead WS connection.
+    # Unload the exact optional job whenever its owning GUI stack is torn down.
+    launchctl unload "$VSCODE_PLIST" 2>/dev/null
+    launchctl remove "$VSCODE_LABEL" 2>/dev/null
+
     # 2) stray GUI clients (Terminal, VNC, Activity Monitor, ...)
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
@@ -529,6 +545,7 @@ cleanup_macos() {
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
+    kill_by_pattern "$P_VSCODE"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 
@@ -613,6 +630,7 @@ stop_all() {
     # the diagnostic sentinels itself.  Otherwise the next ordinary CLI start
     # silently inherits experimental protocol behavior.
     rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
+        "$EXPERIMENTAL_WRAPPED_KCMD" "$EXPERIMENTAL_COMMAND_ERROR" \
         "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT" \
         "$EXPERIMENTAL_CAPTURE" \

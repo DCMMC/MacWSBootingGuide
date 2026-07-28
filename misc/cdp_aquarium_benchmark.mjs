@@ -16,6 +16,8 @@ const durationSeconds = Number(option("--duration", "15"));
 const requestTimeoutMilliseconds = Number(option("--request-timeout", "30000"));
 const shouldNavigate = process.argv.includes("--navigate");
 const shouldTrace = process.argv.includes("--trace");
+const shouldIgnoreCertificateErrors =
+  process.argv.includes("--ignore-certificate-errors");
 const trace = message => {
   if (shouldTrace) console.error(`[aquarium-benchmark] ${message}`);
 };
@@ -114,6 +116,13 @@ async function delay(milliseconds) {
 
 await call("Runtime.enable");
 await call("Page.enable");
+if (shouldIgnoreCertificateErrors) {
+  // Benchmark-only transport accommodation.  The macOS Security framework is
+  // not reachable from this chroot, and Chromium's network service therefore
+  // cannot load the system trust store (runtime log: certificate error 206).
+  // Keep this explicit and out of the production VS Code launch arguments.
+  await call("Security.setIgnoreCertificateErrors", {ignore: true});
+}
 trace("CDP runtime/page enabled");
 if (shouldNavigate) {
   // Electron destroys the original renderer/CDP execution context while
@@ -185,6 +194,7 @@ const setup = await evaluate(`(() => {
   const canvas = document.getElementById("canvas");
   const benchmark = {
     samples: [],
+    frameCallbacks: 0,
     done: false,
     startedAt: null,
     stoppedAt: null,
@@ -197,6 +207,7 @@ const setup = await evaluate(`(() => {
     originalFPSUpdate(elapsedTime);
     const now = performance.now();
     if (now < benchmark.measurementStartAt || benchmark.done) return;
+    benchmark.frameCallbacks++;
     if (benchmark.startedAt === null) {
       benchmark.startedAt = now;
     }
@@ -211,6 +222,7 @@ const setup = await evaluate(`(() => {
       benchmark.done = true;
       const published = {
         samples: benchmark.samples,
+        frameCallbacks: benchmark.frameCallbacks,
         startedAt: benchmark.startedAt,
         stoppedAt: benchmark.stoppedAt,
         done: true
@@ -226,6 +238,14 @@ const setup = await evaluate(`(() => {
   // object directly: requesting another context from the canvas contaminates
   // the sample and can make webgl-debug report an incompatible context type.
   const gl = globalThis.gl || null;
+  const selectedFishIndex = globalThis.g && g.globals
+    ? Number(g.globals.fishSetting) : null;
+  const selectedFish = Number.isInteger(selectedFishIndex) &&
+    Array.isArray(globalThis.g_numFish)
+      ? Number(g_numFish[selectedFishIndex]) : null;
+  const perSpeciesFish = Number.isInteger(selectedFishIndex) &&
+    Array.isArray(globalThis.g_fishTable)
+      ? g_fishTable.map(info => Number(info.num[selectedFishIndex])) : null;
   return {
     title: document.title,
     canvasWidth: canvas.width,
@@ -233,6 +253,11 @@ const setup = await evaluate(`(() => {
     contextType: gl && typeof WebGL2RenderingContext !== "undefined" &&
       gl instanceof WebGL2RenderingContext ? "webgl2" : gl ? "webgl" : null,
     contextConstructor: gl && gl.constructor ? gl.constructor.name : null,
+    selectedFishIndex,
+    selectedFish,
+    perSpeciesFish,
+    totalFishFromDrawTable: perSpeciesFish
+      ? perSpeciesFish.reduce((total, value) => total + value, 0) : null,
     // Chromium's synchronous getParameter/getExtension path can wait for a
     // GPU round-trip on this experimental native-AGX stack.  It is outside
     // the workload and must not stall or bias the FPS interval.
@@ -261,8 +286,22 @@ const collection = publishedTarget
       publishedTarget.title.slice(resultPrefix.length), "base64").toString("utf8"))
   : null;
 if (!collection || !collection.done) {
+  let failureProbe = null;
+  try {
+    failureProbe = await evaluate(`({
+      visibilityState: document.visibilityState,
+      hasFocus: document.hasFocus(),
+      frameCount: typeof frameCount === "number" ? frameCount : null,
+      pageFPS: globalThis.g_fpsTimer ? g_fpsTimer.averageFPS : null,
+      benchmark: globalThis.__macwsAquariumBenchmark || null,
+      title: document.title
+    })`);
+  } catch (error) {
+    failureProbe = {evaluationError: String(error)};
+  }
   throw new Error(
-    `in-page FPS collection did not publish: ${JSON.stringify(discoveryTargets)}`);
+    `in-page FPS collection did not publish: targets=${JSON.stringify(discoveryTargets)} ` +
+    `probe=${JSON.stringify(failureProbe)}`);
 }
 const samples = collection.samples;
 samples.forEach((value, index) =>
@@ -277,6 +316,11 @@ const result = {
   durationSeconds,
   setup,
   samples,
+  frameCallbacks: collection.frameCallbacks,
+  measuredCallbackFPS: collection.frameCallbacks &&
+      collection.stoppedAt > collection.startedAt
+    ? collection.frameCallbacks * 1000 /
+      (collection.stoppedAt - collection.startedAt) : null,
   sampleCount: samples.length,
   averageFPS: samples.length ? sum / samples.length : null,
   medianFPS: samples.length ? sorted[Math.floor(sorted.length / 2)] : null,

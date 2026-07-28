@@ -1589,6 +1589,48 @@ The exact samples, screenshots, CDP version, complete iPad log, and clean-stop
 record are in the evidence directory above; the harness is
 [`misc/cdp_aquarium_benchmark.mjs`](../misc/cdp_aquarium_benchmark.mjs).
 
+## 2026-07-28: uncapped M1 curve and Chromium presentation-backpressure attribution
+
+The old M1 1,000-fish result was refresh capped and materially understated the
+gap.  A new five-second-warm-up/ten-sample sweep stayed at 60 FPS through
+10,000 fish, then measured 47.0/33.9/26.6/21.5 FPS at
+15,000/20,000/25,000/30,000 fish.  The 15,000-fish point is the first fair,
+non-refresh-capped M1 comparison workload.
+
+On the iPad, reduced-diagnostic 1,000- and 5,000-fish runs measured 15.2 and
+15.47 FPS, while a clean 100-fish control measured 13.0 FPS.  The selected
+fish index and per-species draw-table counts were read directly from the page;
+the 15,000-fish control summed to exactly 15,000.  Fixing the cancelled-swap
+pace at 16.667 ms did not improve 1,000 fish (14.6 FPS).  A native chroot
+CoreVideo probe separately reported 119.952 Hz nominal and 114.74 measured
+callbacks/s, ruling out both tested clocks as the fixed approximately 15-FPS
+limit.
+
+An eight-second sample of Chromium's actual GPU process found its main thread
+in the run loop for roughly half the samples; the active path was principally
+`GL_DrawElements`/AGX state encoding.  Selector translation appeared on the
+Metal submit queue but was not the dominant sampled CPU path.  This is direct
+runtime evidence that normal Chromium presentation/backpressure, not a
+15-Hz CoreVideo source or a fully saturated KCMD translator, is pacing the
+low-load result.
+
+The exact Chromium 148 framework contains its diagnostic
+`disable-frame-rate-limit` and `disable-gpu-vsync` switches.  With both enabled,
+a bounded 100-fish run completed 999 rAF callbacks in about five seconds
+(199.13 callbacks/s, page average 220 FPS) without 0x102/0x103 in that run.
+That proves the page and native AGX are not intrinsically capped at 15 FPS.
+It is not a shippable fix: a separate run produced repeated real
+`00000102:Internal Error` completions, GPU-process CPU exceeded one core, and a
+15,000-fish diagnostic still measured only 12.6 FPS.  Both switches and all
+error/flight-recorder sentinels were removed, VS Code was unloaded, and the
+device was returned to iOS.
+
+Full samples, the CoreVideo probe, the GPU-process sample, and verbatim 0x102
+lines are in
+[`docs/evidence/webgl2-performance-optimization-20260728/`](evidence/webgl2-performance-optimization-20260728/).
+The next optimization must fix the presentation/in-flight-work and temporary
+KCMD/resource-lifetime interaction rather than bypass Chromium's limiter.
+
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
@@ -1619,8 +1661,14 @@ items are hardening and application-coverage work:
 7. Replace the full-display snapshot with a window registry and
    producer-owned IOSurface ring so each macOS window can become an independent
    iPadOS scene.
-8. Extend the completed Chromium 148 WebGL2 result to a bounded thermal soak
-   and additional modern WebGL/WebGPU feature probes. Fix the synchronous
-   `gl.getParameter`/CDP starvation path before treating browser developer
-   tooling as usable, and keep the still-temporary KCMD translation visible in
-   every browser stability claim.
+8. Replace Chromium's current approximately 15-FPS presentation/backpressure
+   ceiling with a correct in-flight-work/completion model.  Reproduce the
+   unthrottled 0x102 with the retained submit ring, correlate the first failing
+   KCMD/resource generation, and do not ship `disable-frame-rate-limit` or
+   `disable-gpu-vsync` as a bypass.  Re-run the 15,000-fish M1 comparison and a
+   bounded thermal soak only after the command-error count stays zero.
+9. Extend the completed Chromium 148 WebGL2 result to additional modern
+   WebGL/WebGPU feature probes. Fix the synchronous `gl.getParameter`/CDP
+   starvation path before treating browser developer tooling as usable, and
+   keep the still-temporary KCMD translation visible in every browser
+   stability claim.
