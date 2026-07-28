@@ -1631,6 +1631,57 @@ lines are in
 The next optimization must fix the presentation/in-flight-work and temporary
 KCMD/resource-lifetime interaction rather than bypass Chromium's limiter.
 
+## 2026-07-28: validated submit wrapper, cold thermal control, and same-VS-Code M1 baseline
+
+The retained low-disturbance submit ring captured Chromium's first unthrottled
+failure. Submit serial 2 returned Metal command error `0x102` when its validated
+KCMD contained a subtype-1 span plus two 0x18-byte wrapper records and the
+segment's trailing wrapper was not translated. Enabling the already-bounded
+wrapper translator removed observed `0x102`, `0x103`, and `0x0a` errors during
+the benchmark run. It improved 15,000-fish rAF throughput from approximately
+23.6 to 32.7 callback/s, about 39%. The byte deletion remains explicitly
+diagnostic ABI scaffolding until the producer and kernel parser fields are
+semantically named.
+
+The recorder now uses a fixed 1024-entry memory ring and performs no producer
+allocation, mutex acquisition, or file I/O. It freezes and writes evidence only
+after the first observed completion error. The experimental start path enables
+this recorder and the validated direct/wrapper KCMD sentinels, while leaving
+the old heap-allocating deep recorder off the hot path.
+
+A new CDP runner then measured a genuinely GPU-heavy control: Aquarium at
+60,000 fish, fixed 1024x1024, eight-second warm-up, and fifteen-second wall-time
+sampling. The cold, unlocked iPad reached 8.828 rAF callbacks/s. The M1 reached
+36.722 in Chrome 150 and 37.679 in the official VS Code 1.130.0 build, which
+uses the exact Electron 42.6.0 / Chromium 148.0.7778.280 version present on the
+iPad. The same-version gap is therefore 4.27x, and browser-version mismatch is
+runtime-disproved as the principal cause.
+
+The iPad thermal sampler stayed `Nominal`. Its GPU requested and entered bins
+through 1278 MHz, while active residency remained only about 15-21%. This
+runtime-disproves heat, screen lock, and a fixed minimum-frequency request as
+the primary cause of the controlled gap. The GPU-process sample instead shows
+the command-generation path consuming roughly one CPU core while the GPU is
+underfed. An identical one-billion-iteration native integer probe measured
+348.926 million iterations/s on the M1 and 355.029 million/s on the iPad, so gross
+single-core integer throughput is also ruled out.
+
+There is one remaining correlated user-driver difference. The identical
+Chromium/ANGLE `libGLESv2` offsets feed the macOS 13.4
+`AGX::ArgumentTable` render-state encoder on the iPad, while macOS 26.3.1 uses
+`AGX::G13::CommandEncoding` and `FixedLayoutUserArgumentTable` on the M1.
+Actual iOS 16.3 AGXG13G disassembly also confirms that the effective queue
+priority at `AGXCommandQueue+0x44c` is propagated into its channels and
+firmware state, so treating the observed foreground queue as a silently
+ignored background priority is not supported. Neither observation yet proves
+the encoding path is causal; the next experiment must isolate per-draw CPU
+cost or test a kernel-matched iOS AGX user driver without bypassing protocol
+validation.
+
+The exact benchmark values, thermal/DVFS lines, AGX symbols, and priority
+disassembly are in
+[`docs/evidence/webgl2-performance-optimization-20260728/`](evidence/webgl2-performance-optimization-20260728/).
+
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
@@ -1661,12 +1712,15 @@ items are hardening and application-coverage work:
 7. Replace the full-display snapshot with a window registry and
    producer-owned IOSurface ring so each macOS window can become an independent
    iPadOS scene.
-8. Replace Chromium's current approximately 15-FPS presentation/backpressure
-   ceiling with a correct in-flight-work/completion model.  Reproduce the
-   unthrottled 0x102 with the retained submit ring, correlate the first failing
-   KCMD/resource generation, and do not ship `disable-frame-rate-limit` or
-   `disable-gpu-vsync` as a bypass.  Re-run the 15,000-fish M1 comparison and a
-   bounded thermal soak only after the command-error count stays zero.
+8. Close the remaining 4.27x same-VS-Code WebGL2 gap. The low-load
+   presentation ceiling and first unthrottled `0x102` are now isolated; the
+   validated wrapper translator removes the observed command errors and gives
+   a 39% 15,000-fish gain. Build a per-draw CDP microbenchmark and Chromium
+   trace to split ANGLE CPU, AGX user-driver encoding, kernel submission, and
+   GPU execution time. Then compare the current macOS 13.4 AGXMetal producer
+   with the kernel-matched iOS 16.3 producer before considering a user-driver
+   substitution. Do not ship the byte-deletion translator, frame-limit flags,
+   or forced priority as a production fix.
 9. Extend the completed Chromium 148 WebGL2 result to additional modern
    WebGL/WebGPU feature probes. Fix the synchronous `gl.getParameter`/CDP
    starvation path before treating browser developer tooling as usable, and

@@ -50,6 +50,30 @@ and its interaction with the temporary KCMD/resource-lifetime translators.
 The unthrottled switches must remain diagnostic until a long bounded run is
 free of command errors, runaway CPU, and resource growth.
 
+## Cold/unlocked 60,000-fish comparison
+
+The repeatable CDP runner in `misc/aquarium_cdp_benchmark.mjs` removes the
+Aquarium one-second display counter and refresh-cap ambiguity. It measures rAF
+callbacks over elapsed wall time after an eight-second warm-up. At 60,000 fish
+and a fixed 1024x1024 canvas, the cold/unlocked iPad produced 8.828 callback/s.
+The M1 produced 36.722 callback/s in Chrome 150 and 37.679 callback/s in the
+official VS Code 1.130.0 build. The latter is the exact same Electron 42.6.0 /
+Chromium 148.0.7778.280 stack used on the iPad, so Chromium version mismatch is
+runtime-disproved as the principal 4.27x gap.
+
+Concurrent `powermetrics` samples reported `Current pressure level: Nominal`
+throughout. The GPU requested and entered bins through 1278 MHz, but active
+residency stayed roughly 15-21%. Heat, screen lock and a fixed 396-MHz request
+are therefore runtime-disproved as the primary cause in this controlled run.
+They remain stability confounders for future long soaks.
+
+Samples of the same VS Code GPU process show identical Chromium/ANGLE
+`libGLESv2` offsets on both machines. The downstream driver differs: macOS
+13.4 uses `AGX::ArgumentTable`, while macOS 26.3.1 uses
+`AGX::G13::CommandEncoding` and `FixedLayoutUserArgumentTable`. This is a
+runtime-confirmed version-path difference, not yet proof that the newer
+encoding path causes the performance delta.
+
 Runtime artifacts:
 
 - `ipad-aquarium-results.json` — all bounded iPad samples and context witnesses.
@@ -57,6 +81,17 @@ Runtime artifacts:
 - `ipad-vscode-gpu-process-15000.sample.txt` — eight-second GPU-process sample.
 - `unthrottled-102-runtime-excerpt.txt` — verbatim ANGLE error lines from the
   unstable unthrottled run.
+- `aquarium-cdp-60000-comparison.json` — same-workload iPad, Chrome 150 M1,
+  and same-version VS Code M1 results.
+- `ipad-60000-thermal-and-agx-runtime-excerpt.txt` — verbatim thermal/DVFS
+  samples and the observed old/new AGX argument-encoding symbols.
+- `ios16-agx-priority-re-excerpt.txt` — actual iOS 16.3 AGXG13G priority
+  propagation disassembly excerpts.
+- `cpu-singlethread-probe.txt` — identical optimized integer-loop outputs from
+  the M1 MacBook Air and iPad, including matching checksums.
+- `fast-submit-error-20260728-2245/` — first-error fixed-ring manifests,
+  complete KCMD/segment snapshots, and bounded referenced-resource captures
+  for the WindowServer and Chromium `0x102` witnesses.
 
 Device cleanup removed 188 generated `macws_submit_*` diagnostic files and all
 files under CrashReporter after their relevant evidence had already been

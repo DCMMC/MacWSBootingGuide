@@ -68,6 +68,11 @@ extern int macws_agx_submit_dimensions(uint64_t submit_serial,
                                        uint32_t *height_out);
 extern void macws_dump_recent_agx_submit_serial(
     const char *reason, const void *command_buffer, uint64_t submit_serial);
+extern uint64_t macws_fast_latest_agx_submit_serial(
+    const void *command_buffer);
+extern unsigned macws_fast_agx_submit_fixed_count(uint64_t submit_serial);
+extern void macws_dump_fast_agx_submit_serial(
+    const char *reason, const void *command_buffer, uint64_t submit_serial);
 extern void macws_mark_agx_submit_for_error_dump(const void *command_buffer);
 extern void macws_mark_agx_submit_serial_for_error_dump(
     uint64_t submit_serial);
@@ -315,11 +320,17 @@ static void macws_iogpu_buffer_complete(id self, SEL selector,
     uint32_t submit_width = 0;
     uint32_t submit_height = 0;
     if (macws_iogpu_callback_diag_enabled()) {
-        submit_serial = macws_latest_agx_submit_serial(
+        submit_serial = macws_fast_latest_agx_submit_serial(
             (__bridge const void *)self);
-        fixed_count = macws_agx_submit_fixed_count(submit_serial);
-        (void)macws_agx_submit_dimensions(
-            submit_serial, &submit_width, &submit_height);
+        if (submit_serial) {
+            fixed_count = macws_fast_agx_submit_fixed_count(submit_serial);
+        } else {
+            submit_serial = macws_latest_agx_submit_serial(
+                (__bridge const void *)self);
+            fixed_count = macws_agx_submit_fixed_count(submit_serial);
+            (void)macws_agx_submit_dimensions(
+                submit_serial, &submit_width, &submit_height);
+        }
         if (!error && fixed_count >= 8) {
             fprintf(stderr,
                 "#### IOGPU-CALLBACK-BUFFER-CLEAN commandBuffer=%p "
@@ -381,6 +392,10 @@ static void macws_iogpu_buffer_complete(id self, SEL selector,
                 (__bridge const void *)self);
         }
         if (submit_serial) {
+            macws_dump_fast_agx_submit_serial(
+                error_code == 3 ? "iogpu-raw-callback-page-fault"
+                                : "iogpu-raw-callback-error",
+                (__bridge const void *)self, submit_serial);
             macws_dump_recent_agx_submit_serial(
                 error_code == 3 ? "iogpu-raw-callback-page-fault"
                                 : "iogpu-raw-callback-error",
@@ -412,9 +427,13 @@ static id macws_iogpu_command_buffer_error(id self, SEL selector) {
     static _Atomic int dumped_103 = 0;
     static _Atomic int dumped_other = 0;
     unsigned observation = atomic_fetch_add(&observation_count, 1) + 1;
-    uint64_t submit_serial = macws_latest_agx_submit_serial(
+    uint64_t fast_submit_serial = macws_fast_latest_agx_submit_serial(
         (__bridge const void *)self);
-    unsigned fixed = macws_agx_submit_fixed_count(submit_serial);
+    uint64_t submit_serial = fast_submit_serial ?: macws_latest_agx_submit_serial(
+        (__bridge const void *)self);
+    unsigned fixed = fast_submit_serial
+        ? macws_fast_agx_submit_fixed_count(fast_submit_serial)
+        : macws_agx_submit_fixed_count(submit_serial);
     NSString *description = nil;
     NSString *domain = nil;
     NSInteger code = 0;
@@ -449,6 +468,8 @@ static id macws_iogpu_command_buffer_error(id self, SEL selector) {
     }
     int expected = 0;
     if (atomic_compare_exchange_strong(dump_latch, &expected, 1)) {
+        macws_dump_fast_agx_submit_serial(
+            reason, (__bridge const void *)self, fast_submit_serial);
         if (submit_serial) {
             macws_dump_recent_agx_submit_serial(
                 reason, (__bridge const void *)self, submit_serial);

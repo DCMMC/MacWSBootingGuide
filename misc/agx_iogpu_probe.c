@@ -96,8 +96,44 @@ typedef enum {
     kProbeExercise,
 } probe_mode_t;
 
+static void dump_registered_queues(uint64_t kernel_queue, int target_pid) {
+    // RE-confirmed via IOGPUCommandQueue::init and
+    // IOGPUScheduler::registerCommandQueue in the iOS 16.3 IOGPUFamily:
+    // queue+0x538 is the scheduler; scheduler+0x48 is an array of 24-byte
+    // records; scheduler+0x50 is the record count; each record begins with
+    // an IOGPUCommandQueue*.  Queue fields below are likewise direct loads
+    // in IOGPUCommandQueue::updatePriority/isOpportunisticWorkload.
+    if (!kernel_queue) return;
+    uint64_t scheduler = p_kread64(kernel_queue + 0x538);
+    uint64_t records = scheduler ? p_kread64(scheduler + 0x48) : 0;
+    uint32_t count = scheduler ? p_kread32(scheduler + 0x50) : 0;
+    fprintf(stderr,
+            "    scheduler=%#llx records=%#llx count=%u target_pid=%d\n",
+            (unsigned long long)scheduler, (unsigned long long)records,
+            count, target_pid);
+    // A corrupt count should never be allowed to turn a diagnostic into a
+    // long kernel-memory walk.
+    if (!records || count > 4096) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint64_t queue = p_kread64(records + (uint64_t)i * 24);
+        if (!queue) continue;
+        uint32_t pid = p_kread32(queue + 0x490);
+        if (target_pid >= 0 && pid != (uint32_t)target_pid) continue;
+        uint32_t requested = p_kread32(queue + 0x444);
+        uint32_t background = p_kread32(queue + 0x448);
+        uint32_t effective = p_kread32(queue + 0x44c);
+        uint32_t qos = p_kread32(queue + 0x450);
+        uint32_t error = p_kread32(queue + 0x520);
+        fprintf(stderr,
+                "      record[%u] queue=%#llx pid=%u requested=%u "
+                "background=%u effective=%u qos=%u error=%u\n",
+                i, (unsigned long long)queue, pid, requested, background,
+                effective, qos, error);
+    }
+}
+
 static void probe_one(const char *match_class, uint32_t type,
-                      probe_mode_t mode) {
+                      probe_mode_t mode, int target_pid) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
         IOServiceMatching(match_class));
     if (!svc) {
@@ -391,6 +427,9 @@ static void probe_one(const char *match_class, uint32_t type,
                 fprintf(stderr,
                         "    accelerator config +0x1870=%u +0x56c=%u\n",
                         cfg_1870, cfg_56c);
+                if (target_pid >= 0) {
+                    dump_registered_queues(kernel_queue, target_pid);
+                }
             }
         }
     }
@@ -427,6 +466,8 @@ int main(int argc, char **argv) {
     } else if (argc > 3 && strcmp(argv[3], "exercise") == 0) {
         mode = kProbeExercise;
     }
-    probe_one(match_class, type, mode);
+    int target_pid = -1;
+    if (argc > 4) target_pid = (int)strtol(argv[4], NULL, 0);
+    probe_one(match_class, type, mode, target_pid);
     return 0;
 }

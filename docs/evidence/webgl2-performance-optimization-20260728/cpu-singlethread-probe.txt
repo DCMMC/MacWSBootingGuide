@@ -1,0 +1,13 @@
+Source: misc/cpu_singlethread_probe.c
+Build on both devices: clang -O3 -arch arm64
+Iterations: 1,000,000,000
+
+MacBookAir10,1 / M1 / macOS 26.3.1:
+iterations=1000000000 elapsed_seconds=2.865934709 million_iterations_per_second=348.926 checksum=0x2bebb9d998aa541d
+
+iPad13,6 / M1 / iOS 16.3 native process:
+iterations=1000000000 elapsed_seconds=2.816672625 million_iterations_per_second=355.029 checksum=0x2bebb9d998aa541d
+
+The matching checksum verifies that both optimized binaries completed the same
+integer recurrence. This probe measures a narrow integer/branch loop and does
+not claim equivalence for Objective-C, Metal driver, memory, or IPC workloads.

@@ -1,0 +1,93 @@
+create_ok=34 destroy_ok=0 create_fail=0 destroy_fail=0 unmatched_destroy=0 event_newest=34
+[active]
+gid=0x22 va=0x90000 data=0x108ddc000 shared=0x1026dd980 bytes=0x28000 type=0 surface=0 client=0 flags14=0x8430 request50=0x38000000
+gid=0xd va=0x1500068000 data=0x102750000 shared=0x1026dc9c0 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x1a va=0x1501138000 data=0x108bcc000 shared=0x1026dd380 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x5 va=0x1500018000 data=0x102724000 shared=0x1026dc3c0 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x12 va=0x1500fe0000 data=0x1027cc000 shared=0x1026dcd80 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x1f va=0x1501188000 data=0x108bf4000 shared=0x1026dd740 bytes=0x10000 type=0 surface=0 client=0 flags14=0x430 request50=0x18000000
+gid=0xa va=0x1500040000 data=0x102738000 shared=0x1026dc780 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x17 va=0x1501010000 data=0x108ac4000 shared=0x1026dd140 bytes=0x100000 type=0 surface=0 client=0 flags14=0x430 request50=0x18000000
+gid=0x2 va=0x1500000000 data=0x102714000 shared=0x1026dc180 bytes=0x4000 type=0 surface=0 client=0 flags14=0x430 request50=0
+gid=0xf va=0x18000 data=0x10276c000 shared=0x1026dcb40 bytes=0x50000 type=0 surface=0 client=0 flags14=0x8430 request50=0x38000000
+gid=0x1c va=0x1501158000 data=0x108bdc000 shared=0x1026dd500 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x7 va=0x1500028000 data=0x10272c000 shared=0x1026dc540 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x14 va=0x1501000000 data=0x1027dc000 shared=0x1026dcf00 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x21 va=0x1501268000 data=0x108d9c000 shared=0x1026dd8c0 bytes=0x40000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0xc va=0x1500060000 data=0x10274c000 shared=0x1026dc900 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x19 va=0x1501128000 data=0x108bc4000 shared=0x1026dd2c0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x18000000
+gid=0x4 va=0x1500010000 data=0x102720000 shared=0x1026dc300 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x11 va=0x1500fd0000 data=0x1027c4000 shared=0x1026dccc0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x1e va=0x1501178000 data=0x108bec000 shared=0x1026dd680 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x9 va=0x1500038000 data=0x102734000 shared=0x1026dc6c0 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x16 va=0x80000 data=0x1027ec000 shared=0x1026dd080 bytes=0x8000 type=0 surface=0 client=0 flags14=0x8430 request50=0x48000000
+gid=0x1 va=0 data=0x1026ec000 shared=0x1026dc0c0 bytes=0x10000 type=0 surface=0 client=0 flags14=0x8430 request50=0x38000000
+gid=0xe va=0x1500070000 data=0 shared=0x1026dca80 bytes=0xf48000 type=0x82 surface=0x16 client=0 flags14=0x430 request50=0x180888f00
+gid=0x1b va=0x1501148000 data=0x108bd4000 shared=0x1026dd440 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x6 va=0x1500020000 data=0x102728000 shared=0x1026dc480 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x13 va=0x1500ff0000 data=0x1027d4000 shared=0x1026dce40 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x20 va=0x15011a0000 data=0x108c04000 shared=0x1026dd800 bytes=0xc0000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0xb va=0x1500048000 data=0x10273c000 shared=0x1026dc840 bytes=0x10000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x18 va=0x1501118000 data=0x1027f4000 shared=0x1026dd200 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x3 va=0x1500008000 data=0x10271c000 shared=0x1026dc240 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x10 va=0x1500fc0000 data=0x1027bc000 shared=0x1026dcc00 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x1d va=0x1501168000 data=0x108be4000 shared=0x1026dd5c0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+gid=0x8 va=0x1500030000 data=0x102730000 shared=0x1026dc600 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+gid=0x15 va=0x70000 data=0x1027e4000 shared=0x1026dcfc0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x8430 request50=0x48000000
+[kcmd-va-matches]
+offset=0x48 value=0x1500fc0000 state=ACTIVE gid=0x10 base=0x1500fc0000 delta=0 bytes=0x8000 type=0 surface=0
+offset=0xa8 value=0x15011882a0 state=ACTIVE gid=0x1f base=0x1501188000 delta=0x2a0 bytes=0x10000 type=0 surface=0
+offset=0xb0 value=0x1501188020 state=ACTIVE gid=0x1f base=0x1501188000 delta=0x20 bytes=0x10000 type=0 surface=0
+offset=0x1e8 value=0x1501188000 state=ACTIVE gid=0x1f base=0x1501188000 delta=0 bytes=0x10000 type=0 surface=0
+offset=0x2c0 value=0x80044 state=ACTIVE gid=0x16 base=0x80000 delta=0x44 bytes=0x8000 type=0 surface=0
+offset=0x2e0 value=0x800c4 state=ACTIVE gid=0x16 base=0x80000 delta=0xc4 bytes=0x8000 type=0 surface=0
+offset=0x2e8 value=0x1501010000 state=ACTIVE gid=0x17 base=0x1501010000 delta=0 bytes=0x100000 type=0 surface=0
+offset=0x2f0 value=0x15011a0000 state=ACTIVE gid=0x20 base=0x15011a0000 delta=0 bytes=0xc0000 type=0 surface=0
+offset=0x3e0 value=0x1501128000 state=ACTIVE gid=0x19 base=0x1501128000 delta=0 bytes=0x8000 type=0 surface=0
+offset=0x538 value=0x80004 state=ACTIVE gid=0x16 base=0x80000 delta=0x4 bytes=0x8000 type=0 surface=0
+offset=0x558 value=0x80084 state=ACTIVE gid=0x16 base=0x80000 delta=0x84 bytes=0x8000 type=0 surface=0
+offset=0x850 value=0x1500070000 state=ACTIVE gid=0xe base=0x1500070000 delta=0 bytes=0xf48000 type=0x82 surface=0x16
+[recent-events]
+event=1 action=CREATE gid=0x1 va=0 data=0x1026ec000 shared=0x1026dc0c0 bytes=0x10000 type=0 surface=0 client=0 flags14=0x8430 request50=0x38000000
+event=2 action=CREATE gid=0x2 va=0x1500000000 data=0x102714000 shared=0x1026dc180 bytes=0x4000 type=0 surface=0 client=0 flags14=0x430 request50=0
+event=3 action=CREATE gid=0x3 va=0x1500008000 data=0x10271c000 shared=0x1026dc240 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=4 action=CREATE gid=0x4 va=0x1500010000 data=0x102720000 shared=0x1026dc300 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=5 action=CREATE gid=0x5 va=0x1500018000 data=0x102724000 shared=0x1026dc3c0 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=6 action=CREATE gid=0x6 va=0x1500020000 data=0x102728000 shared=0x1026dc480 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=7 action=CREATE gid=0x7 va=0x1500028000 data=0x10272c000 shared=0x1026dc540 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=8 action=CREATE gid=0x8 va=0x1500030000 data=0x102730000 shared=0x1026dc600 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=9 action=CREATE gid=0x9 va=0x1500038000 data=0x102734000 shared=0x1026dc6c0 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=10 action=CREATE gid=0xa va=0x1500040000 data=0x102738000 shared=0x1026dc780 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=11 action=CREATE gid=0xb va=0x1500048000 data=0x10273c000 shared=0x1026dc840 bytes=0x10000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=12 action=CREATE gid=0xc va=0x1500060000 data=0x10274c000 shared=0x1026dc900 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=13 action=CREATE gid=0xd va=0x1500068000 data=0x102750000 shared=0x1026dc9c0 bytes=0x4000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=14 action=CREATE gid=0xe va=0x1500070000 data=0 shared=0x1026dca80 bytes=0xf48000 type=0x82 surface=0x16 client=0 flags14=0x430 request50=0x180888f00
+event=15 action=CREATE gid=0xf va=0x18000 data=0x10276c000 shared=0x1026dcb40 bytes=0x50000 type=0 surface=0 client=0 flags14=0x8430 request50=0x38000000
+event=16 action=CREATE gid=0x10 va=0x1500fc0000 data=0x1027bc000 shared=0x1026dcc00 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=17 action=CREATE gid=0x11 va=0x1500fd0000 data=0x1027c4000 shared=0x1026dccc0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=18 action=CREATE gid=0x12 va=0x1500fe0000 data=0x1027cc000 shared=0x1026dcd80 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=19 action=CREATE gid=0x13 va=0x1500ff0000 data=0x1027d4000 shared=0x1026dce40 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=20 action=CREATE gid=0x14 va=0x1501000000 data=0x1027dc000 shared=0x1026dcf00 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=21 action=CREATE gid=0x15 va=0x70000 data=0x1027e4000 shared=0x1026dcfc0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x8430 request50=0x48000000
+event=22 action=CREATE gid=0x16 va=0x80000 data=0x1027ec000 shared=0x1026dd080 bytes=0x8000 type=0 surface=0 client=0 flags14=0x8430 request50=0x48000000
+event=23 action=CREATE gid=0x17 va=0x1501010000 data=0x108ac4000 shared=0x1026dd140 bytes=0x100000 type=0 surface=0 client=0 flags14=0x430 request50=0x18000000
+event=24 action=CREATE gid=0x18 va=0x1501118000 data=0x1027f4000 shared=0x1026dd200 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=25 action=CREATE gid=0x19 va=0x1501128000 data=0x108bc4000 shared=0x1026dd2c0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x18000000
+event=26 action=CREATE gid=0x1a va=0x1501138000 data=0x108bcc000 shared=0x1026dd380 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=27 action=CREATE gid=0x1b va=0x1501148000 data=0x108bd4000 shared=0x1026dd440 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=28 action=CREATE gid=0x1c va=0x1501158000 data=0x108bdc000 shared=0x1026dd500 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=29 action=CREATE gid=0x1d va=0x1501168000 data=0x108be4000 shared=0x1026dd5c0 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=30 action=CREATE gid=0x1e va=0x1501178000 data=0x108bec000 shared=0x1026dd680 bytes=0x8000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=31 action=CREATE gid=0x1f va=0x1501188000 data=0x108bf4000 shared=0x1026dd740 bytes=0x10000 type=0 surface=0 client=0 flags14=0x430 request50=0x18000000
+event=32 action=CREATE gid=0x20 va=0x15011a0000 data=0x108c04000 shared=0x1026dd800 bytes=0xc0000 type=0 surface=0 client=0 flags14=0x430 request50=0x8000000
+event=33 action=CREATE gid=0x21 va=0x1501268000 data=0x108d9c000 shared=0x1026dd8c0 bytes=0x40000 type=0 surface=0 client=0 flags14=0x470 request50=0
+event=34 action=CREATE gid=0x22 va=0x90000 data=0x108ddc000 shared=0x1026dd980 bytes=0x28000 type=0 surface=0 client=0 flags14=0x8430 request50=0x38000000
+[direct-type0-cpu-dumps] selected=6 max_resources=64 max_bytes_each=0x10000
+gid=0x10 va=0x1500fc0000 data=0x1027bc000 bytes=0x8000 wanted=0x8000 vm_read_kr=0 received=0x8000 written=0x8000 file=/tmp/macws_fast_submit_error_85876_1/resource_gid10_va1500fc0000_cpu1027bc000.bin
+gid=0x1f va=0x1501188000 data=0x108bf4000 bytes=0x10000 wanted=0x10000 vm_read_kr=0 received=0x10000 written=0x10000 file=/tmp/macws_fast_submit_error_85876_1/resource_gid1f_va1501188000_cpu108bf4000.bin
+gid=0x16 va=0x80000 data=0x1027ec000 bytes=0x8000 wanted=0x8000 vm_read_kr=0 received=0x8000 written=0x8000 file=/tmp/macws_fast_submit_error_85876_1/resource_gid16_va80000_cpu1027ec000.bin
+gid=0x17 va=0x1501010000 data=0x108ac4000 bytes=0x100000 wanted=0x10000 vm_read_kr=0 received=0x10000 written=0x10000 file=/tmp/macws_fast_submit_error_85876_1/resource_gid17_va1501010000_cpu108ac4000.bin
+gid=0x20 va=0x15011a0000 data=0x108c04000 bytes=0xc0000 wanted=0x10000 vm_read_kr=0 received=0x10000 written=0x10000 file=/tmp/macws_fast_submit_error_85876_1/resource_gid20_va15011a0000_cpu108c04000.bin
+gid=0x19 va=0x1501128000 data=0x108bc4000 bytes=0x8000 wanted=0x8000 vm_read_kr=0 received=0x8000 written=0x8000 file=/tmp/macws_fast_submit_error_85876_1/resource_gid19_va1501128000_cpu108bc4000.bin
+[direct-type82-iosurface-dumps] selected=1 max_resources=16 max_head_bytes_each=0x100000
+gid=0xe va=0x1500070000 bytes=0xf48000 surface=0x16 request50=0x180888f00 request_found=NO request_seq=0 request_event=0 raw=0/0 sent=0/0 lookup=0x1277922c0 actual_id=0x16 width=0x954 height=0x684 alloc=0xf48000 bpr=0x2580 bpe=0x4 planes=0 pixel_format=0x42475241 properties=0x2f9 lock=0 base=0x10bbbc000 seed=0 head=0x100000/0x100000 tail=0x10000 unlock=0

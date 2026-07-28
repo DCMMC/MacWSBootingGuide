@@ -8445,6 +8445,363 @@ void macws_dump_recent_agx_submit_serial(const char *reason,
         reason, command_buffer, submit_serial);
 }
 
+// Low-disturbance first-error flight recorder for high-rate Chromium submits.
+//
+// The older /tmp/macws_submit_ring recorder intentionally retains complete
+// pre/post command and segment blobs, but it does so with four heap operations
+// while holding one process-wide mutex for every descriptor.  A runtime CPU
+// sample from the VS Code GPU process caught macws_submit_ring_begin on that
+// hot path, and the first 0x102 error reproducibly disappeared when the deep
+// ring was enabled.  That makes the deep ring unsuitable for finding a timing-
+// sensitive high-concurrency failure.
+//
+// /tmp/macws_submit_fast_ring selects this separate recorder.  Its producer
+// path has no allocation, file I/O, or mutex: a descriptor copies only its
+// post-translation bytes into a preallocated slot.  The error observer freezes
+// the recorder before reading it, waits for every in-flight producer to leave,
+// and only then writes the first snapshot.  The bounded payload is deliberate:
+// existing VS Code failure witnesses are 0x858-byte commands with 0x188-byte
+// segment lists, while the larger multi-record batches remain represented by
+// their full lengths and a truncated prefix.
+#define MACWS_FAST_SUBMIT_RING_COUNT 1024u
+#define MACWS_FAST_SUBMIT_COMMAND_CAP 0x3000u
+#define MACWS_FAST_SUBMIT_SEGMENT_CAP 0x1000u
+
+struct macws_fast_submit_entry {
+    _Atomic uint64_t guard;
+    _Atomic uint64_t serial;
+    _Atomic uintptr_t command_buffer;
+    uint64_t life_event_serial;
+    unsigned sequence;
+    unsigned descriptor;
+    _Atomic unsigned fixed;
+    uintptr_t descriptor_pointer;
+    uintptr_t storage;
+    size_t commands_length;
+    size_t commands_saved;
+    size_t segments_length;
+    size_t segments_saved;
+    unsigned char commands[MACWS_FAST_SUBMIT_COMMAND_CAP];
+    unsigned char segments[MACWS_FAST_SUBMIT_SEGMENT_CAP];
+};
+
+struct macws_fast_submit_token {
+    uint64_t serial;
+    uint64_t life_event_serial;
+    unsigned slot;
+    unsigned sequence;
+    unsigned descriptor;
+    uintptr_t descriptor_pointer;
+    uintptr_t command_buffer;
+    uintptr_t storage;
+    int active;
+};
+
+static struct macws_fast_submit_entry
+    g_macws_fast_submit_ring[MACWS_FAST_SUBMIT_RING_COUNT];
+static _Atomic int g_macws_fast_submit_enabled = -1;
+static _Atomic int g_macws_fast_submit_frozen = 0;
+static _Atomic unsigned g_macws_fast_submit_active = 0;
+static _Atomic unsigned g_macws_fast_submit_dump_count = 0;
+static _Atomic uint64_t g_macws_fast_submit_serial = 0;
+
+static int macws_fast_submit_is_enabled(void) {
+    int enabled = atomic_load_explicit(
+        &g_macws_fast_submit_enabled, memory_order_acquire);
+    if (enabled >= 0) return enabled;
+    int detected = getenv("MACWS_SUBMIT_FAST_RING") != NULL ||
+        access("/tmp/macws_submit_fast_ring", F_OK) == 0;
+    int expected = -1;
+    atomic_compare_exchange_strong_explicit(
+        &g_macws_fast_submit_enabled, &expected, detected,
+        memory_order_release, memory_order_relaxed);
+    return atomic_load_explicit(
+        &g_macws_fast_submit_enabled, memory_order_acquire);
+}
+
+static struct macws_fast_submit_token macws_fast_submit_begin(
+        unsigned sequence, unsigned descriptor,
+        uintptr_t descriptor_pointer, uintptr_t command_buffer,
+        uintptr_t storage) {
+    struct macws_fast_submit_token token = {0};
+    if (!macws_fast_submit_is_enabled() ||
+        atomic_load_explicit(&g_macws_fast_submit_frozen,
+                             memory_order_acquire)) {
+        return token;
+    }
+
+    atomic_fetch_add_explicit(&g_macws_fast_submit_active, 1,
+                              memory_order_acq_rel);
+    // Close the race with the error thread: once frozen is published, that
+    // thread waits for this active count before touching any non-atomic slot
+    // payload.  A producer that entered concurrently simply backs out.
+    if (atomic_load_explicit(&g_macws_fast_submit_frozen,
+                             memory_order_acquire)) {
+        atomic_fetch_sub_explicit(&g_macws_fast_submit_active, 1,
+                                  memory_order_acq_rel);
+        return token;
+    }
+
+    token.serial = atomic_fetch_add_explicit(
+        &g_macws_fast_submit_serial, 1, memory_order_relaxed) + 1;
+    token.life_event_serial = macws_agx_life_current_event_serial();
+    token.slot = (unsigned)((token.serial - 1) %
+                            MACWS_FAST_SUBMIT_RING_COUNT);
+    token.sequence = sequence;
+    token.descriptor = descriptor;
+    token.descriptor_pointer = descriptor_pointer;
+    token.command_buffer = command_buffer;
+    token.storage = storage;
+    token.active = 1;
+    return token;
+}
+
+static void macws_fast_submit_finish(
+        struct macws_fast_submit_token token, unsigned fixed,
+        const unsigned char *commands, size_t commands_length,
+        const unsigned char *segments, size_t segments_length) {
+    if (!token.active) return;
+    struct macws_fast_submit_entry *entry =
+        &g_macws_fast_submit_ring[token.slot];
+    uint64_t writing_guard = token.serial * 2 + 1;
+    atomic_store_explicit(&entry->guard, writing_guard,
+                          memory_order_release);
+
+    entry->life_event_serial = token.life_event_serial;
+    entry->sequence = token.sequence;
+    entry->descriptor = token.descriptor;
+    atomic_store_explicit(&entry->fixed, fixed, memory_order_relaxed);
+    entry->descriptor_pointer = token.descriptor_pointer;
+    entry->storage = token.storage;
+    entry->commands_length = commands_length;
+    entry->commands_saved = commands && commands_length
+        ? (commands_length < MACWS_FAST_SUBMIT_COMMAND_CAP
+            ? commands_length : MACWS_FAST_SUBMIT_COMMAND_CAP) : 0;
+    entry->segments_length = segments_length;
+    entry->segments_saved = segments && segments_length
+        ? (segments_length < MACWS_FAST_SUBMIT_SEGMENT_CAP
+            ? segments_length : MACWS_FAST_SUBMIT_SEGMENT_CAP) : 0;
+    if (entry->commands_saved)
+        memcpy(entry->commands, commands, entry->commands_saved);
+    if (entry->segments_saved)
+        memcpy(entry->segments, segments, entry->segments_saved);
+
+    atomic_store_explicit(&entry->command_buffer, token.command_buffer,
+                          memory_order_relaxed);
+    atomic_store_explicit(&entry->serial, token.serial,
+                          memory_order_relaxed);
+    atomic_store_explicit(&entry->guard, token.serial * 2,
+                          memory_order_release);
+    atomic_fetch_sub_explicit(&g_macws_fast_submit_active, 1,
+                              memory_order_acq_rel);
+}
+
+__attribute__((used, visibility("default")))
+uint64_t macws_fast_latest_agx_submit_serial(const void *command_buffer) {
+    if (!command_buffer || !macws_fast_submit_is_enabled()) return 0;
+    uint64_t newest = atomic_load_explicit(
+        &g_macws_fast_submit_serial, memory_order_acquire);
+    uint64_t oldest = newest > MACWS_FAST_SUBMIT_RING_COUNT
+        ? newest - MACWS_FAST_SUBMIT_RING_COUNT + 1 : 1;
+    for (uint64_t serial = newest; serial >= oldest && serial != 0; serial--) {
+        struct macws_fast_submit_entry *entry =
+            &g_macws_fast_submit_ring[(serial - 1) %
+                                      MACWS_FAST_SUBMIT_RING_COUNT];
+        uint64_t guard_before = atomic_load_explicit(
+            &entry->guard, memory_order_acquire);
+        if (guard_before != serial * 2) continue;
+        uint64_t entry_serial = atomic_load_explicit(
+            &entry->serial, memory_order_relaxed);
+        uintptr_t entry_command_buffer = atomic_load_explicit(
+            &entry->command_buffer, memory_order_relaxed);
+        uint64_t guard_after = atomic_load_explicit(
+            &entry->guard, memory_order_acquire);
+        if (guard_before == guard_after && entry_serial == serial &&
+            entry_command_buffer == (uintptr_t)command_buffer) {
+            return serial;
+        }
+    }
+    return 0;
+}
+
+__attribute__((used, visibility("default")))
+unsigned macws_fast_agx_submit_fixed_count(uint64_t submit_serial) {
+    if (!submit_serial || !macws_fast_submit_is_enabled()) return 0;
+    struct macws_fast_submit_entry *entry =
+        &g_macws_fast_submit_ring[(submit_serial - 1) %
+                                  MACWS_FAST_SUBMIT_RING_COUNT];
+    uint64_t guard_before = atomic_load_explicit(
+        &entry->guard, memory_order_acquire);
+    if (guard_before != submit_serial * 2) return 0;
+    unsigned fixed = atomic_load_explicit(&entry->fixed,
+                                          memory_order_relaxed);
+    uint64_t guard_after = atomic_load_explicit(
+        &entry->guard, memory_order_acquire);
+    return guard_before == guard_after ? fixed : 0;
+}
+
+__attribute__((used, visibility("default")))
+void macws_dump_fast_agx_submit_serial(const char *reason,
+                                       const void *command_buffer,
+                                       uint64_t requested_serial) {
+    if (!macws_fast_submit_is_enabled()) return;
+    unsigned dump = atomic_fetch_add_explicit(
+        &g_macws_fast_submit_dump_count, 1, memory_order_acq_rel) + 1;
+    if (dump != 1) return;
+
+    atomic_store_explicit(&g_macws_fast_submit_frozen, 1,
+                          memory_order_release);
+    unsigned waits = 0;
+    while (atomic_load_explicit(&g_macws_fast_submit_active,
+                                memory_order_acquire) != 0 && waits < 500) {
+        usleep(1000);
+        waits++;
+    }
+    unsigned active = atomic_load_explicit(
+        &g_macws_fast_submit_active, memory_order_acquire);
+    if (active != 0) {
+        fprintf(stderr,
+            "#### AGX_FAST_RING freeze timed out reason=%s active=%u "
+            "waited_ms=%u; refusing a racy payload dump\n",
+            reason ?: "(nil)", active, waits);
+        return;
+    }
+
+    uint64_t newest = atomic_load_explicit(
+        &g_macws_fast_submit_serial, memory_order_acquire);
+    uint64_t oldest = newest > MACWS_FAST_SUBMIT_RING_COUNT
+        ? newest - MACWS_FAST_SUBMIT_RING_COUNT + 1 : 1;
+    uint64_t matched_serial = 0;
+    struct macws_fast_submit_entry *matched_entry = NULL;
+    if (requested_serial >= oldest && requested_serial <= newest) {
+        struct macws_fast_submit_entry *candidate =
+            &g_macws_fast_submit_ring[(requested_serial - 1) %
+                                      MACWS_FAST_SUBMIT_RING_COUNT];
+        if (atomic_load_explicit(&candidate->serial,
+                                 memory_order_relaxed) == requested_serial) {
+            matched_serial = requested_serial;
+            matched_entry = candidate;
+        }
+    }
+    for (uint64_t serial = newest;
+         !matched_entry && serial >= oldest && serial != 0; serial--) {
+        struct macws_fast_submit_entry *candidate =
+            &g_macws_fast_submit_ring[(serial - 1) %
+                                      MACWS_FAST_SUBMIT_RING_COUNT];
+        if (atomic_load_explicit(&candidate->serial,
+                                 memory_order_relaxed) == serial &&
+            atomic_load_explicit(&candidate->command_buffer,
+                                 memory_order_relaxed) ==
+                (uintptr_t)command_buffer) {
+            matched_serial = serial;
+            matched_entry = candidate;
+            break;
+        }
+    }
+
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory),
+             "/tmp/macws_fast_submit_error_%d_%u", getpid(), dump);
+    if (mkdir(directory, 0700) != 0 && errno != EEXIST) {
+        fprintf(stderr,
+            "#### AGX_FAST_RING dump mkdir failed path=%s errno=%d\n",
+            directory, errno);
+        return;
+    }
+    char manifest_path[PATH_MAX];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.txt",
+             directory);
+    FILE *manifest = fopen(manifest_path, "w");
+    if (manifest) {
+        fprintf(manifest,
+            "reason=%s pid=%d command_buffer=%p requested_serial=%llu "
+            "matched_serial=%llu oldest=%llu newest=%llu "
+            "freeze_wait_ms=%u\n",
+            reason ?: "(nil)", getpid(), command_buffer,
+            (unsigned long long)requested_serial,
+            (unsigned long long)matched_serial,
+            (unsigned long long)oldest, (unsigned long long)newest, waits);
+    }
+
+    unsigned entries = 0;
+    unsigned byte_entries = 0;
+    unsigned same_shape_controls = 0;
+    size_t matched_commands_length = matched_entry
+        ? matched_entry->commands_length : 0;
+    size_t matched_segments_length = matched_entry
+        ? matched_entry->segments_length : 0;
+    unsigned matched_fixed = matched_entry ? atomic_load_explicit(
+        &matched_entry->fixed, memory_order_relaxed) : 0;
+    for (uint64_t serial = oldest; serial <= newest; serial++) {
+        struct macws_fast_submit_entry *entry =
+            &g_macws_fast_submit_ring[(serial - 1) %
+                                      MACWS_FAST_SUBMIT_RING_COUNT];
+        if (atomic_load_explicit(&entry->serial,
+                                 memory_order_relaxed) != serial) continue;
+        entries++;
+        BOOL exact = serial == matched_serial;
+        BOOL same_shape = matched_entry && serial < matched_serial &&
+            entry->commands_length == matched_commands_length &&
+            entry->segments_length == matched_segments_length &&
+            atomic_load_explicit(&entry->fixed, memory_order_relaxed) ==
+                matched_fixed && same_shape_controls < 8;
+        BOOL recent = serial + 16 > newest;
+        BOOL write_bytes = exact || same_shape || recent;
+        if (same_shape) same_shape_controls++;
+        if (manifest) {
+            fprintf(manifest,
+                "serial=%llu life_event_serial=%llu sequence=%u "
+                "descriptor=%u fixed=%u descriptor_pointer=%#llx "
+                "command_buffer=%#llx storage=%#llx matched=%s "
+                "same_shape=%s commands=%zu saved=%zu truncated=%s "
+                "segments=%zu saved=%zu truncated=%s\n",
+                (unsigned long long)serial,
+                (unsigned long long)entry->life_event_serial,
+                entry->sequence, entry->descriptor,
+                atomic_load_explicit(&entry->fixed, memory_order_relaxed),
+                (unsigned long long)entry->descriptor_pointer,
+                (unsigned long long)atomic_load_explicit(
+                    &entry->command_buffer, memory_order_relaxed),
+                (unsigned long long)entry->storage,
+                exact ? "YES" : "NO", same_shape ? "YES" : "NO",
+                entry->commands_length, entry->commands_saved,
+                entry->commands_saved < entry->commands_length ? "YES" : "NO",
+                entry->segments_length, entry->segments_saved,
+                entry->segments_saved < entry->segments_length ? "YES" : "NO");
+        }
+        if (!write_bytes) continue;
+        char path[PATH_MAX];
+        if (entry->commands_saved) {
+            snprintf(path, sizeof(path), "%s/s%llu_q%u_d%u_post_kcmd.bin",
+                directory, (unsigned long long)serial,
+                entry->sequence, entry->descriptor);
+            macws_submit_ring_write_file(
+                path, entry->commands, entry->commands_saved);
+        }
+        if (entry->segments_saved) {
+            snprintf(path, sizeof(path),
+                "%s/s%llu_q%u_d%u_post_segments.bin",
+                directory, (unsigned long long)serial,
+                entry->sequence, entry->descriptor);
+            macws_submit_ring_write_file(
+                path, entry->segments, entry->segments_saved);
+        }
+        byte_entries++;
+    }
+    if (manifest) fclose(manifest);
+    macws_agx_life_dump_snapshot(directory,
+        matched_entry ? matched_entry->commands : NULL,
+        matched_entry ? matched_entry->commands_saved : 0);
+    fprintf(stderr,
+        "#### AGX_FAST_RING dumped reason=%s commandBuffer=%p "
+        "requested=%llu matched=%llu entries=%u byteEntries=%u "
+        "range=%llu..%llu path=%s\n",
+        reason ?: "(nil)", command_buffer,
+        (unsigned long long)requested_serial,
+        (unsigned long long)matched_serial, entries, byte_entries,
+        (unsigned long long)oldest, (unsigned long long)newest, directory);
+}
+
 static uint64_t macws_strip_user_pointer(uint64_t raw) {
     return raw & 0x0000ffffffffffffULL;
 }
@@ -9306,6 +9663,9 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         unsigned char *commands = (unsigned char *)(uintptr_t)start;
         size_t total = (size_t)(current - start);
         unsigned fixed_before_descriptor = result.fixed;
+        struct macws_fast_submit_token fast_ring_token =
+            macws_fast_submit_begin(result.sequence, descriptor_index,
+                (uintptr_t)descriptor, (uintptr_t)self, (uintptr_t)state);
         struct macws_submit_ring_token ring_token =
             macws_submit_ring_begin(result.sequence, descriptor_index,
                 (uintptr_t)descriptor, (uintptr_t)self, (uintptr_t)state,
@@ -9641,6 +10001,11 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             off += end_offset;
         }
         macws_submit_ring_finish(ring_token,
+            result.fixed - fixed_before_descriptor,
+            commands, total,
+            (const unsigned char *)(uintptr_t)segment_start,
+            segment_length);
+        macws_fast_submit_finish(fast_ring_token,
             result.fixed - fixed_before_descriptor,
             commands, total,
             (const unsigned char *)(uintptr_t)segment_start,
@@ -10364,7 +10729,69 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             in, inCnt, inStruct, inStructCnt,
             submit_fix_active, submit_diag_active);
     }
+    unsigned queue_qos_diag_sequence = 0;
+    if (IOConnectIsIOGPU(client) &&
+        access("/tmp/macws_queue_qos_diag", F_OK) == 0 &&
+        ((orig == 0x8 && selector == 0x7 && inStruct &&
+          inStructCnt == 0x408) ||
+         (orig == 0x1f && selector == 0x1b))) {
+        static _Atomic unsigned queue_qos_diag_count = 0;
+        queue_qos_diag_sequence = atomic_fetch_add(
+            &queue_qos_diag_count, 1) + 1;
+        if (queue_qos_diag_sequence <= 8) {
+            if (orig == 0x8) {
+                const unsigned char *queue = inStruct;
+                char path_prefix[65] = {0};
+                size_t path_length = strnlen((const char *)queue, 64);
+                memcpy(path_prefix, queue, path_length);
+                fprintf(stderr,
+                    "#### AGX_QUEUE_QOS #%u CREATE orig=%#x sent=%#x "
+                    "path='%s' qos=%u flag404=%u tail405=%02x%02x%02x "
+                    "inCnt=%u\n",
+                    queue_qos_diag_sequence, orig, selector, path_prefix,
+                    *(const uint32_t *)(queue + 0x400), queue[0x404],
+                    queue[0x405], queue[0x406], queue[0x407], inCnt);
+            } else {
+                const unsigned char *bytes = inStruct;
+                fprintf(stderr,
+                    "#### AGX_QUEUE_QOS #%u SET orig=%#x sent=%#x "
+                    "scalar0=%#llx inCnt=%u inSC=%zu bytes=%s%02x%02x%02x%02x"
+                    "%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                    queue_qos_diag_sequence, orig, selector,
+                    (unsigned long long)(in && inCnt ? in[0] : 0),
+                    inCnt, inStructCnt,
+                    inStruct && inStructCnt >= 12 ? "" : "(short)",
+                    inStruct && inStructCnt > 0 ? bytes[0] : 0,
+                    inStruct && inStructCnt > 1 ? bytes[1] : 0,
+                    inStruct && inStructCnt > 2 ? bytes[2] : 0,
+                    inStruct && inStructCnt > 3 ? bytes[3] : 0,
+                    inStruct && inStructCnt > 4 ? bytes[4] : 0,
+                    inStruct && inStructCnt > 5 ? bytes[5] : 0,
+                    inStruct && inStructCnt > 6 ? bytes[6] : 0,
+                    inStruct && inStructCnt > 7 ? bytes[7] : 0,
+                    inStruct && inStructCnt > 8 ? bytes[8] : 0,
+                    inStruct && inStructCnt > 9 ? bytes[9] : 0,
+                    inStruct && inStructCnt > 10 ? bytes[10] : 0,
+                    inStruct && inStructCnt > 11 ? bytes[11] : 0);
+            }
+        }
+    }
     IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    if (queue_qos_diag_sequence && queue_qos_diag_sequence <= 8) {
+        uint32_t queue_id = 0;
+        uint64_t queue_token = 0;
+        if (r == 0 && orig == 0x8 && outStruct && outStructCnt &&
+            *outStructCnt >= 0x10) {
+            queue_id = *(const uint32_t *)outStruct;
+            queue_token = *(const uint64_t *)((const unsigned char *)outStruct + 8);
+        }
+        fprintf(stderr,
+            "#### AGX_QUEUE_QOS #%u RETURN kr=%#x outSC=%zu "
+            "queueID=%#x token=%#llx\n",
+            queue_qos_diag_sequence, r,
+            outStructCnt ? *outStructCnt : 0, queue_id,
+            (unsigned long long)queue_token);
+    }
     if (agxIsRes && resDiagActive && resDiagSequence <= 64) {
         size_t returned = (outStructCnt ? *outStructCnt : 0);
         fprintf(stderr,

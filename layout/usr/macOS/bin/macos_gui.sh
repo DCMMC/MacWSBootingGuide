@@ -57,6 +57,8 @@ EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
 EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
+EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
+EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
 EXPERIMENTAL_CAPTURE="$ROOTFS/private/tmp/macws_capture_final"
@@ -563,7 +565,8 @@ cleanup_macos() {
     # producer/client has been stopped so no live mapping is invalidated.
     rm -f "$VNC_SHARED_FRAME" "$VNC_SHARED_SURFID" "$VNC_ACTIVITY" \
         "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE" \
-        "$EXPERIMENTAL_OWNED_SCANOUT"
+        "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
+        "$EXPERIMENTAL_QUEUE_QOS"
 
     sleep 1
     log "Cleanup done."
@@ -633,6 +636,8 @@ stop_all() {
         "$EXPERIMENTAL_WRAPPED_KCMD" "$EXPERIMENTAL_COMMAND_ERROR" \
         "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT" \
+        "$EXPERIMENTAL_FAST_SUBMIT_RING" \
+        "$EXPERIMENTAL_QUEUE_QOS" \
         "$EXPERIMENTAL_CAPTURE" \
         "$EXPERIMENTAL_CAPTURE_DONE" "$EXPERIMENTAL_PACE"
     log "Restoring iOS (SpringBoard / backboardd)..."
@@ -743,14 +748,21 @@ fi
 
 enable_experimental_if_requested() {
     [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
-    touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
-        "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT"
+    touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
+        "$EXPERIMENTAL_COMPLETION" \
+        "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_VNC_SHARE" \
+        "$EXPERIMENTAL_OBSERVE_PF550" \
+        "$EXPERIMENTAL_FAST_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT"
+    # Keep the old heap-allocating, mutex-protected deep recorder off the hot
+    # path.  A VS Code GPU-process sample caught it in submission, and it can
+    # perturb the timing-sensitive 0x102 failure.  The fixed-memory recorder
+    # above preserves the first failing submit without that producer overhead.
+    rm -f "$EXPERIMENTAL_SUBMIT_RING"
     rm -f "$EXPERIMENTAL_PACE"
     if [ -n "$COEXIST_PACE_US" ]; then
         echo "$COEXIST_PACE_US" > "$EXPERIMENTAL_PACE"
     fi
-    log "DIAGNOSTIC-SCAFFOLD: command ABI + cancelled-swap completion + read-only PF550 completion observer + bounded submit flight recorder + owned BGRA scanout + stable VNC mmap enabled."
+    log "DIAGNOSTIC-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + read-only PF550 completion observer + low-disturbance fixed-memory submit recorder + owned BGRA scanout + stable VNC mmap enabled."
     if [ -n "$COEXIST_PACE_US" ]; then
         log "DIAGNOSTIC-SCAFFOLD: synthetic completion pace=${COEXIST_PACE_US} us (not a refresh-rate implementation)."
     fi
