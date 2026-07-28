@@ -6,6 +6,7 @@
 #import <rootless.h>
 #import <xpc/xpc.h>
 #import <dlfcn.h>
+#import <execinfo.h>
 #import <stdatomic.h>
 #import <objc/runtime.h>
 #import "utils.h"
@@ -564,8 +565,9 @@ static void macws_log_command_buffer_ivars(id commandBuffer) {
 // helpers are compiled in arm64e processes too and must safely observe an
 // empty registry there.
 static NSObject *g_macws_owned_scanout_lock = nil;
-static NSMutableDictionary *g_macws_owned_scanout_cache = nil;
-static NSMutableArray *g_macws_owned_scanout_lru = nil;
+static NSMutableDictionary *g_macws_owned_scanout_pool = nil;
+static NSUInteger g_macws_owned_scanout_pool_bytes = 0;
+static uint64_t g_macws_owned_scanout_clock = 0;
 static char g_macws_owned_texture_association_key;
 static BOOL macws_is_owned_scanout_texture(id<MTLTexture> texture) {
     return texture && objc_getAssociatedObject(
@@ -4176,6 +4178,13 @@ static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
 // (the original IOSurface is still returned by currentSurface and cancelled),
 // but makes the Metal render destination process-owned and CPU-readable.
 //
+// The returned IOSurface carries a temporary reservation retain.  The caller
+// must release that retain only after the native AGX texture initializer has
+// either retained the surface or failed.  Without that reservation, a second
+// wrapping thread can observe the pool-only retain in the gap between this
+// function returning and Metal retaining the surface, then lease the same
+// render target concurrently.
+//
 // This is diagnostic until the full render/present lifecycle and memory bound
 // are runtime-proven.  It does not bypass a validation check: Apple's native
 // AGX initializer must successfully construct the replacement texture.
@@ -4192,18 +4201,40 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_macws_owned_scanout_lock = [NSObject new];
-        g_macws_owned_scanout_cache = [NSMutableDictionary new];
-        g_macws_owned_scanout_lru = [NSMutableArray new];
+        g_macws_owned_scanout_pool = [NSMutableDictionary new];
     });
     uint32_t originalID = IOSurfaceGetID(original);
-    NSNumber *key = [NSNumber numberWithUnsignedInt:originalID];
+    NSString *key = [NSString stringWithFormat:@"%zux%zu", width, height];
     @synchronized(g_macws_owned_scanout_lock) {
-        IOSurfaceRef existing = (IOSurfaceRef)
-            [g_macws_owned_scanout_cache[key] pointerValue];
-        if (existing) {
-            [g_macws_owned_scanout_lru removeObject:key];
-            [g_macws_owned_scanout_lru addObject:key];
-            return existing;
+        g_macws_owned_scanout_clock++;
+        NSMutableArray *shapeEntries = g_macws_owned_scanout_pool[key];
+        for (NSMutableDictionary *entry in shapeEntries) {
+            IOSurfaceRef existing = (IOSurfaceRef)
+                [entry[@"surface"] pointerValue];
+            CFIndex baseline = [entry[@"baseline"] longLongValue];
+            CFIndex retainCount = existing
+                ? CFGetRetainCount(existing) : 0;
+            if (existing && retainCount <= baseline) {
+                // Reserve before dropping the lock.  Metal takes its own
+                // retain in hooked_newTextureWithDescriptor:iosurface:plane:.
+                CFRetain(existing);
+                entry[@"last"] = @(g_macws_owned_scanout_clock);
+                static _Atomic uint64_t hits = 0;
+                uint64_t hit = atomic_fetch_add(&hits, 1) + 1;
+                if (hit <= 32 || (hit % 600) == 0) {
+                    fprintf(stderr,
+                        "#### VNC-OWNED lease-hit #%llu key=%s "
+                        "originalID=%u surface=%p id=%u retain=%ld "
+                        "baseline=%ld entries=%lu pool=%luMB\n",
+                        (unsigned long long)hit, [key UTF8String], originalID,
+                        (void *)existing, (unsigned)IOSurfaceGetID(existing),
+                        (long)retainCount, (long)baseline,
+                        (unsigned long)[shapeEntries count],
+                        (unsigned long)(g_macws_owned_scanout_pool_bytes /
+                                        (1024 * 1024)));
+                }
+                return existing;
+            }
         }
 
         NSDictionary *properties = @{
@@ -4230,52 +4261,108 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
             return NULL;
         }
 
-        NSValue *ownedValue = [NSValue valueWithPointer:(void *)owned];
-        g_macws_owned_scanout_cache[key] = ownedValue;
-        [g_macws_owned_scanout_lru addObject:key];
-        // The initial IOMFB page ring on this exact device contains eight
-        // display surfaces. Long menu/VS Code sessions previously grew this
-        // dictionary without bound (runtime: 8 -> 27, ~16 MiB each). The real
-        // AGX texture retains its IOSurface (runtime CF retain witness 1->2),
-        // so dropping only our cache retain cannot invalidate an in-flight
-        // texture. Texture association, rather than a raw-pointer set, marks
-        // outstanding old textures as owned until they deallocate naturally.
-        enum { MacWSOwnedScanoutCacheLimit = 8 };
-        while ([g_macws_owned_scanout_lru count] >
-               MacWSOwnedScanoutCacheLimit) {
-            NSNumber *evictedKey = [[g_macws_owned_scanout_lru
-                objectAtIndex:0] retain];
-            NSValue *evictedValue = [g_macws_owned_scanout_cache
-                objectForKey:evictedKey];
-            IOSurfaceRef evictedSurface = (IOSurfaceRef)
-                [evictedValue pointerValue];
-            [g_macws_owned_scanout_lru removeObjectAtIndex:0];
-            [g_macws_owned_scanout_cache removeObjectForKey:evictedKey];
+        if (!shapeEntries) {
+            shapeEntries = [NSMutableArray array];
+            g_macws_owned_scanout_pool[key] = shapeEntries;
+        }
+        NSUInteger allocation = IOSurfaceGetAllocSize(owned);
+        CFIndex baseline = CFGetRetainCount(owned);
+        NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+        entry[@"surface"] = [NSValue valueWithPointer:(void *)owned];
+        entry[@"baseline"] = @(baseline);
+        entry[@"bytes"] = @(allocation);
+        entry[@"last"] = @(g_macws_owned_scanout_clock);
+        [shapeEntries addObject:entry];
+        g_macws_owned_scanout_pool_bytes += allocation;
+
+        // This retain is the caller's reservation, separate from the create
+        // retain owned by the pool entry.
+        CFRetain(owned);
+        static _Atomic uint64_t allocations = 0;
+        uint64_t allocated = atomic_fetch_add(&allocations, 1) + 1;
+        fprintf(stderr,
+            "#### VNC-OWNED lease-new #%llu key=%s original=%p id=%u "
+            "-> owned=%p id=%u %zux%zu bpr=%zu alloc=%zu "
+            "entries=%lu pool=%luMB baseline=%ld reserved-retain=%ld\n",
+            (unsigned long long)allocated, [key UTF8String],
+            (void *)original, originalID,
+            (void *)owned, (unsigned)IOSurfaceGetID(owned), width, height,
+            IOSurfaceGetBytesPerRow(owned), allocation,
+            (unsigned long)[shapeEntries count],
+            (unsigned long)(g_macws_owned_scanout_pool_bytes /
+                            (1024 * 1024)),
+            (long)baseline,
+            (long)CFGetRetainCount(owned));
+
+        // Evict only idle older entries.  Live textures may temporarily push
+        // the pool over budget; freeing or aliasing one would violate the
+        // render-target lifetime contract.
+        const NSUInteger budget = 256U * 1024U * 1024U;
+        while (g_macws_owned_scanout_pool_bytes > budget) {
+            NSString *oldestKey = nil;
+            NSMutableArray *oldestArray = nil;
+            NSMutableDictionary *oldestEntry = nil;
+            uint64_t oldestUse = UINT64_MAX;
+            for (NSString *candidateKey in g_macws_owned_scanout_pool) {
+                NSMutableArray *candidateArray =
+                    g_macws_owned_scanout_pool[candidateKey];
+                for (NSMutableDictionary *candidateEntry in candidateArray) {
+                    if (candidateEntry == entry) continue;
+                    IOSurfaceRef candidate = (IOSurfaceRef)
+                        [candidateEntry[@"surface"] pointerValue];
+                    CFIndex candidateBaseline =
+                        [candidateEntry[@"baseline"] longLongValue];
+                    CFIndex candidateRetain = candidate
+                        ? CFGetRetainCount(candidate) : 0;
+                    uint64_t candidateUse =
+                        [candidateEntry[@"last"] unsignedLongLongValue];
+                    if (candidate && candidateRetain <= candidateBaseline &&
+                        candidateUse < oldestUse) {
+                        oldestUse = candidateUse;
+                        oldestKey = candidateKey;
+                        oldestArray = candidateArray;
+                        oldestEntry = candidateEntry;
+                    }
+                }
+            }
+            if (!oldestEntry) {
+                static _Atomic uint64_t overBudget = 0;
+                uint64_t count = atomic_fetch_add(&overBudget, 1) + 1;
+                if (count <= 8 || (count % 300) == 0) {
+                    fprintf(stderr,
+                        "#### VNC-OWNED lease-over-budget #%llu pool=%luMB "
+                        "all older surfaces busy\n",
+                        (unsigned long long)count,
+                        (unsigned long)(g_macws_owned_scanout_pool_bytes /
+                                        (1024 * 1024)));
+                }
+                break;
+            }
+            IOSurfaceRef evicted = (IOSurfaceRef)
+                [oldestEntry[@"surface"] pointerValue];
+            NSUInteger evictedBytes =
+                [oldestEntry[@"bytes"] unsignedIntegerValue];
+            [oldestArray removeObjectIdenticalTo:oldestEntry];
+            if ([oldestArray count] == 0)
+                [g_macws_owned_scanout_pool removeObjectForKey:oldestKey];
+            g_macws_owned_scanout_pool_bytes =
+                evictedBytes > g_macws_owned_scanout_pool_bytes
+                    ? 0 : g_macws_owned_scanout_pool_bytes - evictedBytes;
             static _Atomic uint64_t evictions = 0;
             uint64_t eviction = atomic_fetch_add(&evictions, 1) + 1;
-            if (eviction <= 24 || (eviction % 600) == 0) {
+            if (eviction <= 16 || (eviction % 600) == 0) {
                 fprintf(stderr,
-                    "#### VNC-OWNED evict #%llu originalID=%u "
-                    "surface=%p id=%u retain-before=%ld cache=%lu\n",
+                    "#### VNC-OWNED lease-evict #%llu key=%s surface=%p "
+                    "id=%u bytes=%luKB pool=%luMB\n",
                     (unsigned long long)eviction,
-                    [evictedKey unsignedIntValue], (void *)evictedSurface,
-                    evictedSurface ? (unsigned)IOSurfaceGetID(evictedSurface)
-                                   : 0,
-                    evictedSurface
-                        ? (long)CFGetRetainCount(evictedSurface) : 0L,
-                    (unsigned long)[g_macws_owned_scanout_cache count]);
+                    [oldestKey UTF8String], (void *)evicted,
+                    evicted ? (unsigned)IOSurfaceGetID(evicted) : 0,
+                    (unsigned long)(evictedBytes / 1024),
+                    (unsigned long)(g_macws_owned_scanout_pool_bytes /
+                                    (1024 * 1024)));
             }
-            if (evictedSurface) CFRelease(evictedSurface);
-            [evictedKey release];
+            if (evicted) CFRelease(evicted);
         }
-        fprintf(stderr,
-            "#### VNC-OWNED allocated original=%p id=%u -> owned=%p "
-            "id=%u %zux%zu bpr=%zu alloc=%zu cache=%lu retain=%ld\n",
-            (void *)original, (unsigned)originalID,
-            (void *)owned, (unsigned)IOSurfaceGetID(owned), width, height,
-            IOSurfaceGetBytesPerRow(owned), IOSurfaceGetAllocSize(owned),
-            (unsigned long)[g_macws_owned_scanout_cache count],
-            (long)CFGetRetainCount(owned));
         return owned;
     }
 }
@@ -4495,6 +4582,10 @@ static void macws_sigabrt_trampoline(int sig) {
 
     id<MTLTexture> result = nil;
     IOSurfaceRef auditSurface = iosurface;
+    // macws_owned_scanout_for_original returns a temporary reservation retain
+    // which spans the gap until Metal has either retained the IOSurface or
+    // failed.  Volatile keeps the value defined across the SIGABRT siglongjmp.
+    volatile IOSurfaceRef ownedReservation = NULL;
     struct sigaction old_sa, new_sa;
     memset(&new_sa, 0, sizeof(new_sa));
     new_sa.sa_handler = macws_sigabrt_trampoline;
@@ -4507,6 +4598,7 @@ static void macws_sigabrt_trampoline(int sig) {
             ? macws_owned_scanout_for_original(iosurface, desc.width,
                                                 desc.height)
             : NULL;
+        ownedReservation = owned;
         if (owned) {
             auditSurface = owned;
             MTLPixelFormat originalFormat = desc.pixelFormat;
@@ -4555,6 +4647,10 @@ static void macws_sigabrt_trampoline(int sig) {
     }
     macws_in_protected = 0;
     sigaction(SIGABRT, &old_sa, NULL);
+    if (ownedReservation) {
+        CFRelease((IOSurfaceRef)ownedReservation);
+        ownedReservation = NULL;
+    }
     if (!result && desc) {
         NSUInteger orig_fmt = desc.pixelFormat;
         // Try fallback translations only for the private 550 format (and nearby
@@ -4801,36 +4897,20 @@ static void macws_sigabrt_trampoline(int sig) {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
     }
-    // The native AGX allocator is the WindowServer production path for
-    // ordinary textures.
-    // A historical compatibility path below pooled one IOSurface *and one
-    // MTLTexture object* per (width,height,format), assuming equal-sized
-    // SkyLight intermediates were serial. Runtime A/B on 2026-07-29 disproved
-    // that invariant: menu/backdrop passes use equal-sized intermediates at
-    // the same time, so the shared object aliases their contents and produces
-    // stable 64-pixel tile holes. With the pool disabled, native AGX allocation
-    // booted the complete desktop, kept WindowServer near 109 MiB RSS, and
-    // rendered all menu hover/context-menu frames without the holes.
-    //
-    // Chromium/ANGLE helpers are not switched yet: runtime on the same build
-    // shows the GPU helper's 128x16 R8 texture reaches AGXTexture init but the
-    // cross-image init args are rejected, then Skia loses the GPU context as
-    // OOM. The Electron main/AppKit process does not own that ANGLE device; it
-    // does own application menu/backing windows, where the same shape-aliasing
-    // bug is visible as two blue tiles instead of a complete hover row.
-    // Therefore main GUI processes use native lifetime together with
-    // WindowServer, while Helper/Renderer/GPU subprocesses retain the
-    // compatibility allocator until their separate ABI issue is fixed. Keep
-    // MACWS_AGX_LEGACY_POOLED_PLAIN_TEXTURES as an explicit per-process A/B
-    // fallback.
-    const char *plain_texture_program = getprogname();
-    BOOL plain_texture_helper = plain_texture_program &&
-        (strstr(plain_texture_program, "Helper") != NULL ||
-         strstr(plain_texture_program, "Renderer") != NULL ||
-         strstr(plain_texture_program, "GPU") != NULL);
-    BOOL use_legacy_plain_texture_pool = plain_texture_helper ||
-        getenv("MACWS_AGX_LEGACY_POOLED_PLAIN_TEXTURES") != NULL;
-    if (getenv("MACWS_AGX_NATIVE") && use_legacy_plain_texture_pool) {
+    // Ordinary plain textures use the IOSurface compatibility initializer on
+    // every native-AGX process.  The cross-image native initializer still
+    // rejects common descriptors (runtime: repeated AGX_INITARGS FAIL and a
+    // Chromium 128x16 R8 Skia OOM).  The historical compatibility allocator
+    // was also incorrect because it returned exactly one texture per shape:
+    // concurrent equal-shape menu/backdrop intermediates aliased each other.
+    // The implementation below now leases distinct cached entries according
+    // to their real retain lifetime, so compatibility no longer implies
+    // aliasing.  MACWS_AGX_NATIVE_PLAIN remains a controlled A/B escape hatch,
+    // not the production policy.
+    BOOL use_lease_plain_texture_pool =
+        getenv("MACWS_AGX_NATIVE") != NULL &&
+        getenv("MACWS_AGX_NATIVE_PLAIN") == NULL;
+    if (use_lease_plain_texture_pool) {
         // 2026-06-20 — Route plain newTextureWithDescriptor through the
         // iosurface variant (the known-working path). Create a chroot-
         // local IOSurface sized to the descriptor, then delegate to
@@ -4874,6 +4954,46 @@ static void macws_sigabrt_trampoline(int sig) {
                                  ? [desc storageMode] : 0;
         NSUInteger pf = [desc respondsToSelector:@selector(pixelFormat)]
                         ? [desc pixelFormat] : 80; // MTLPixelFormatBGRA8Unorm default
+
+        // Metal's IOSurface initializer structurally forbids mipmapped
+        // textures.  Chromium/Skia requests a 2048x2048 R8 texture with 12
+        // levels on the Apple iPad page; sending that descriptor into the
+        // compatibility initializer aborts the entire GPU process in
+        // _mtlValidateStrideTextureParameters.  Preserve the descriptor and
+        // try the real AGX plain allocator instead.  This is not a mip-count
+        // bypass: a nil result is propagated so the caller can take its own
+        // fallback rather than receiving an object with a false layout.
+        NSUInteger mipmapLevelCount =
+            [desc respondsToSelector:@selector(mipmapLevelCount)]
+                ? [desc mipmapLevelCount] : 1;
+        if (mipmapLevelCount > 1) {
+            static _Atomic uint64_t mipNativeAttempts = 0;
+            uint64_t attempt = atomic_fetch_add_explicit(
+                &mipNativeAttempts, 1, memory_order_relaxed) + 1;
+            if (attempt <= 12) {
+                fprintf(stderr,
+                    "#### MTL_TEX MIP-NATIVE attempt=%llu w=%lu h=%lu "
+                    "pf=%lu mips=%lu storage=%lu usage=%#lx\n",
+                    (unsigned long long)attempt,
+                    (unsigned long)([desc respondsToSelector:@selector(width)]
+                        ? [desc width] : 0),
+                    (unsigned long)([desc respondsToSelector:@selector(height)]
+                        ? [desc height] : 0),
+                    (unsigned long)pf, (unsigned long)mipmapLevelCount,
+                    (unsigned long)storageMode,
+                    (unsigned long)([desc respondsToSelector:@selector(usage)]
+                        ? [desc usage] : 0));
+                void *frames[20] = {0};
+                int count = backtrace(frames, 20);
+                backtrace_symbols_fd(frames, count, STDERR_FILENO);
+            }
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            fprintf(stderr,
+                "#### MTL_TEX MIP-NATIVE result attempt=%llu tex=%p class=%s\n",
+                (unsigned long long)attempt, (void *)tex,
+                tex ? class_getName([tex class]) : "(nil)");
+            return tex;
+        }
 
         // Memoryless textures are tile-memory allocations and cannot have an
         // IOSurface backing.  Route them before the non-2D compatibility gate
@@ -5104,286 +5224,199 @@ static void macws_sigabrt_trampoline(int sig) {
         }
         else if (pf == 10) { fmt4cc = 'L008'; bpe = 1; }
         else if (pf == 70 || pf == 71) { fmt4cc = 'RGBA'; bpe = 4; }
-        // 2026-06-20 — IOSurface pool keyed by (w,h,pf,fmt4cc,bpe) to
-        // bound WS memory growth.  Previously ROUTE-IOSURF allocated a
-        // fresh 31 MB IOSurface per newTextureWithDescriptor call,
-        // accumulating ~25 MB/sec → 5 GB in ~3 min → iOS Jetsam fires
-        // → WS killed.  Pool ensures repeated requests for same
-        // (w,h,pf) reuse the same surface (bounded by # unique
-        // dimensions, typically 10-30 for SkyLight compositor —
-        // ~300-900 MB total cap).
+        // Lifetime-aware compatibility pool.  The former implementation
+        // cached one surface and one texture per key forever.  Runtime A/B
+        // proved that equal-shaped SkyLight/AppKit intermediates overlap in
+        // time; returning the same object gave two independent render passes
+        // one storage allocation and produced deterministic 64-pixel holes.
         //
-        // Aliasing concern: multiple textures wrapping the same
-        // IOSurface alias its memory.  For SkyLight's compositor, the
-        // SAME (w,h,pf) is the canonical scratch surface (one per layer
-        // type) and textures are used serially — last-write-wins is
-        // acceptable.  If concurrent access causes visual tearing, the
-        // tradeoff (tearing vs OOM-kill) still favors pooling.
+        // Each entry below owns one IOSurface and one Metal texture.  The
+        // dictionary is the texture's stable pool retain.  At insertion the
+        // `new...` result also has exactly one caller-owned retain, so
+        // baseline = current retain count - 1.  An entry is reusable only
+        // after its count returns to that measured baseline.  A cache hit adds
+        // one CFRetain, preserving the Objective-C `new` ownership contract.
+        // If all entries are busy we allocate another entry; aliasing is never
+        // used as a memory-pressure fallback.
         //
-        // Lifetime: IOSurfaces stay in pool forever (WS process
-        // lifetime).  Metal retains them via texture-internal refs;
-        // pool holds an extra retain to keep them stable across
-        // texture release cycles.  CFBridgingRetain to make ObjC
-        // retain the IOSurfaceRef in a NSValue wrapper.
+        // Idle entries are globally LRU-evicted above 512 MiB.  Busy entries
+        // may temporarily exceed the budget because destroying or aliasing a
+        // live Metal object would violate the caller's lifetime contract.
         NSString *poolKey = [NSString stringWithFormat:@"%lux%lu-pf%lu-bpe%lu-fcc%u",
             (unsigned long)width, (unsigned long)height,
             (unsigned long)pf, (unsigned long)bpe, (unsigned)fmt4cc];
-        static NSMutableDictionary<NSString *, NSValue *> *surfPool = nil;
-        static dispatch_once_t surfPoolOnce;
-        dispatch_once(&surfPoolOnce, ^{ surfPool = [NSMutableDictionary new]; });
+        static NSMutableDictionary<NSString *, NSMutableArray *> *leasePool = nil;
+        static dispatch_once_t leasePoolOnce;
+        static NSUInteger leasePoolBytes = 0;
+        static uint64_t leaseClock = 0;
+        static uint64_t leaseHitCount = 0;
+        static uint64_t leaseNewCount = 0;
+        static uint64_t leaseEvictCount = 0;
+        dispatch_once(&leasePoolOnce, ^{
+            leasePool = [NSMutableDictionary new];
+        });
+
         IOSurfaceRef surf = NULL;
-        @synchronized(surfPool) {
-            NSValue *v = surfPool[poolKey];
-            if (v) {
-                surf = (IOSurfaceRef)[v pointerValue];
-            }
-        }
-        static int route_log = 0;
-        if (!surf) {
-            // 2026-06-20 17:16 — IOSurface props with NON-SCANOUT hints
-            // to prevent DCP (Display Coprocessor) RTKit firmware OOM
-            // panic (panic-full-2026-06-20-171622.000.ips: DCP PANIC
-            // CXXnew:2208 - iomfb_ap_callee_0(21)).
-            //
-            // Each IOSurface registered via AGXIOC sel=0xa type=0x82
-            // can be added to DCP's scanout-source registry — DCP's
-            // bounded RTKit heap fills up with our chroot's IOSurfaces
-            // and panics, rebooting the device.  IOSurfaceIsGlobal:NO
-            // keeps the surface out of the cross-process / DCP path.
-            //
-            //   IOSurfaceIsGlobal: NO         — not cross-process; AGX
-            //                                  doesn't need to share it
-            //                                  with DCP for display
-            //   IOSurfaceCacheMode: 0         — default cached (NOT
-            //                                  WriteCombineCache 0x700,
-            //                                  which signals "for display
-            //                                  engine consumption")
-            //
-            // 2026-06-20 17:56 — REMOVED IOSurfaceNonPurgeable:YES.
-            // RE'd from WindowServer-2026-06-20-175357.ips
-            // (MTLPipelineDataCache::getElement → malloc → memmove(NULL)
-            // crash with ktriageinfo "pmap_enter retried due to resource
-            // shortage" x4).  vm_stat showed 1.76 GB free but 983 MB
-            // WIRED — the NonPurgeable hint wired every pooled 31 MB
-            // IOSurface permanently, exhausting pmap PTE-page resources
-            // so a small Metal pipeline-cache malloc returned NULL and
-            // Metal's getElement memmove'd into it unchecked.  The
-            // surfaces don't need wiring; purgeable (default) lets the
-            // kernel manage them and keeps pmap pressure down.  Also
-            // removed the speculative ElementWidth/Height:1 hints (no
-            // measured effect on DCP registration).
-            if (compressedPF550) {
-                surf = macws_create_pf550_scratch_surface(width, height);
-            } else {
-                NSDictionary *props = @{
-                    @"IOSurfaceWidth":           @(width),
-                    @"IOSurfaceHeight":          @(height),
-                    @"IOSurfaceBytesPerElement": @(bpe),
-                    @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
-                    @"IOSurfaceIsGlobal":        @NO,
-                    @"IOSurfaceCacheMode":       @0,
-                };
-                surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-            }
-            if (surf) {
-                @synchronized(surfPool) {
-                    // Re-check (double-checked locking) — another
-                    // thread may have raced and inserted.
-                    NSValue *vNow = surfPool[poolKey];
-                    if (vNow) {
-                        // Lost the race — release our surf and use the
-                        // pooled one.
-                        CFRelease(surf);
-                        surf = (IOSurfaceRef)[vNow pointerValue];
-                    } else {
-                        // We're the inserter — surf already has +1 ref
-                        // from IOSurfaceCreate; pool holds that ref for
-                        // process lifetime.  Don't CFRelease later in
-                        // this branch.
-                        surfPool[poolKey] = [NSValue valueWithPointer:(const void *)surf];
-                    }
-                }
-                if (route_log++ < 16 ||
-                    access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
-                    fprintf(stderr,
-                        "#### MTL_TEX POOL-NEW: key=%s → IOSurface=%p "
-                        "(bpr=%zu alloc=%zu KB, map=%s)\n",
-                        [poolKey UTF8String], (void *)surf,
-                        IOSurfaceGetBytesPerRow(surf),
-                        IOSurfaceGetAllocSize(surf) / 1024,
-                        compressedPF550 ? "PF550-COMPRESSED" :
-                        (pf == 552 || pf == 553 || pf == 115 || pf == 125 || pf == 10 ||
-                         pf == 70 || pf == 71 || pf == 80 || pf == 81)
-                            ? "EXPLICIT" : "UNKNOWN-FALLBACK-BGRA4");
-                }
-            }
-        } else {
-            if (route_log++ < 16) {
-                fprintf(stderr,
-                    "#### MTL_TEX POOL-HIT: key=%s → IOSurface=%p\n",
-                    [poolKey UTF8String], (void *)surf);
-            }
-        }
-        if (!surf) return nil;
-        // 2026-06-20 17:20 — MTLTexture cache by IOSurface (DCP-OOM fix
-        // companion).  Each newTextureWithDescriptor:iosurface:plane:
-        // call triggers fresh AGXIOC sel=0x9/0xa type=0x82 — visible in
-        // WindowServer.err: every POOL-HIT is still followed by another
-        // AGXIOC type=0x82 patch + ResCreate.  Each sel=0xa registers
-        // a fresh IOGPUMetalResource for the same IOSurface, which AGX
-        // may forward to DCP's scanout-source registry (root cause of
-        // panic-full-2026-06-20-171622.000.ips).
-        //
-        // Cache the MTLTexture by IOSurfaceRef.  Since pool guarantees
-        // same surface → same dimensions, returning the cached texture
-        // for the same surf is shape-safe.  Repeated creates → ZERO
-        // additional AGXIOC sel=0xa → ZERO DCP-registry growth.
-        //
-        // 2026-06-20 17:46 — ARC-correct retain on cache HIT.  Naming
-        // convention: methods starting with "new" return +1 retain.
-        // Without explicit retain, callers ARC-release → texture
-        // refcount drops past 0 → next [MTLResourceList
-        // releaseAllObjectsAndReset] → objc_release on dangling ptr →
-        // SIGSEGV (WindowServer-2026-06-20-174649.ips faultingThread
-        // crash at FAR=0x20 inside objc_release+16, called from
-        // MTLResourceListChunkFreeEntries).  Fix: CFRetain on cache
-        // HIT so each caller still gets +1 it can release.  On
-        // CACHE-NEW the texture comes from %orig at +1 already (Apple
-        // ARC convention).
-        static NSMutableDictionary<NSValue *, id<MTLTexture>> *texCache = nil;
-        static dispatch_once_t texCacheOnce;
-        dispatch_once(&texCacheOnce, ^{ texCache = [NSMutableDictionary new]; });
-        NSValue *texKey = [NSValue valueWithPointer:(const void *)surf];
         id<MTLTexture> tex = nil;
-        @synchronized(texCache) {
-            tex = texCache[texKey];
-        }
-        static int texCacheLog = 0;
-        if (tex) {
-            // Cache hit — give caller its expected +1 ARC retain.  The
-            // dictionary's retain keeps tex alive across the
-            // CFRetain → ARC-balanced via CFBridgingRelease at autorelease
-            // / explicit release sites downstream.
-            CFRetain((__bridge CFTypeRef)tex);
-            if (texCacheLog++ < 8) {
-                fprintf(stderr,
-                    "#### MTL_TEX TEX-CACHE-HIT: surf=%p → tex=%p (no sel=0xa, +1 retain)\n",
-                    (void *)surf, (void *)tex);
-            }
-            // 2026-06-20 — GPU-execution decisive diagnostic.  VNC is
-            // black despite WS alive + composites succeeding.  Either the
-            // GPU isn't executing (composite produces no pixels) or the
-            // VNC read path reads a different surface.  Sample this
-            // pooled surface's center pixels: if they ever become
-            // non-black, the GPU IS writing rendered content → black-VNC
-            // is a read-path problem.  Gated MACWS_SURF_SAMPLE.
-            // 2026-06-20 — VNC read-path test.  GPU renders to the
-            // texture's separate backing (confirmed: backing has
-            // content, IOSurface all-zero).  Before building a real
-            // backing→IOSurface bridge, confirm VNC actually READS this
-            // IOSurface by filling it with a solid pattern.  If VNC
-            // turns white/gray, the read path is correct and the fix is
-            // to route rendered content here.  Gated MACWS_SURF_FILL.
-            // Only fill the large (display-sized) surfaces.
-            if (getenv("MACWS_SURF_FILL") && width >= 1000 && height >= 600) {
-                // Fill RARELY (every 240th hit).  GPU writes to the
-                // texture's SEPARATE backing, never this IOSurface, so
-                // the gray fill PERSISTS until we fill again — one fill
-                // is enough for VNC to show it.  Filling every hit
-                // (31 MB memset × hundreds/frame) thrashed the device.
-                static _Atomic int fillN = 0;
-                if ((atomic_fetch_add(&fillN, 1) % 240) == 0) {
-                    IOSurfaceLock(surf, 0, NULL);
-                    uint8_t *fb = (uint8_t *)IOSurfaceGetBaseAddress(surf);
-                    if (fb) {
-                        memset(fb, 0x80, (size_t)width * height * bpe);
-                        static int filllog = 0;
-                        if (filllog++ < 4)
-                            fprintf(stderr,
-                                "#### SURF-FILL surf=%p %lux%lu bpe=%lu filled 0x80\n",
-                                (void*)surf,(unsigned long)width,
-                                (unsigned long)height,(unsigned long)bpe);
+        @synchronized(leasePool) {
+            leaseClock++;
+            NSMutableArray *shapeEntries = leasePool[poolKey];
+            for (NSMutableDictionary *entry in shapeEntries) {
+                id<MTLTexture> candidate = entry[@"texture"];
+                CFIndex baseline = [entry[@"baseline"] longLongValue];
+                CFIndex current = candidate
+                    ? CFGetRetainCount((__bridge CFTypeRef)candidate) : 0;
+                if (candidate && current <= baseline) {
+                    // Give this invocation the +1 promised by the `new`
+                    // method family before another thread can inspect it.
+                    CFRetain((__bridge CFTypeRef)candidate);
+                    entry[@"last"] = @(leaseClock);
+                    tex = candidate;
+                    surf = (IOSurfaceRef)[entry[@"surface"] pointerValue];
+                    leaseHitCount++;
+                    if (leaseHitCount <= 48 || (leaseHitCount % 1200) == 0) {
+                        fprintf(stderr,
+                            "#### MTL_TEX LEASE-HIT #%llu key=%s entry=%p "
+                            "surf=%p tex=%p retain=%ld baseline=%ld "
+                            "shapeEntries=%lu pool=%luMB\n",
+                            (unsigned long long)leaseHitCount,
+                            [poolKey UTF8String], (void *)entry, (void *)surf,
+                            (void *)tex, (long)current, (long)baseline,
+                            (unsigned long)[shapeEntries count],
+                            (unsigned long)(leasePoolBytes / (1024 * 1024)));
                     }
-                    IOSurfaceUnlock(surf, 0, NULL);
+                    break;
                 }
             }
-            if (getenv("MACWS_SURF_SAMPLE")) {
-                static _Atomic int sampN = 0;
-                int sn = atomic_fetch_add(&sampN, 1);
-                if ((sn % 240) == 0 && width >= 64 && height >= 64) {
-                    IOSurfaceLock(surf, 0x1 /*kIOSurfaceLockReadOnly*/, NULL);
-                    uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(surf);
-                    if (base) {
-                        size_t bpr = width * bpe;
-                        // Scan a sparse grid across the WHOLE surface:
-                        // 32 rows × 32 cols = 1024 sample points.  If ANY
-                        // is non-zero, the GPU wrote visible content
-                        // somewhere → it's a VNC read-path issue, not a
-                        // GPU-execution issue.  All-zero across the whole
-                        // surface = GPU not writing to this IOSurface.
-                        uint64_t acc = 0; int nz = 0; int total = 0;
-                        size_t firstnz_off = (size_t)-1;
-                        for (int ry = 0; ry < 32; ry++) {
-                            size_t y = (size_t)ry * (height-1) / 31;
-                            for (int rx = 0; rx < 32; rx++) {
-                                size_t x = (size_t)rx * (width-1) / 31;
-                                size_t off = y * bpr + x * bpe;
-                                for (size_t b = 0; b < bpe; b++) {
-                                    uint8_t v = base[off + b];
-                                    acc += v; total++;
-                                    if (v) { nz++; if (firstnz_off==(size_t)-1) firstnz_off=off+b; }
+            if (!tex) {
+                // Preserve the proven non-scanout IOSurface properties.  The
+                // surface's create retain becomes the pool entry's ownership;
+                // Metal takes its own independent retain while wrapping it.
+                if (compressedPF550) {
+                    surf = macws_create_pf550_scratch_surface(width, height);
+                } else {
+                    NSDictionary *props = @{
+                        @"IOSurfaceWidth":           @(width),
+                        @"IOSurfaceHeight":          @(height),
+                        @"IOSurfaceBytesPerElement": @(bpe),
+                        @"IOSurfacePixelFormat":     @((uint32_t)fmt4cc),
+                        @"IOSurfaceIsGlobal":        @NO,
+                        @"IOSurfaceCacheMode":       @0,
+                    };
+                    surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+                }
+                if (surf) {
+                    tex = [self hooked_newTextureWithDescriptor:desc
+                                                      iosurface:surf
+                                                          plane:0];
+                }
+                if (!tex) {
+                    if (surf) CFRelease(surf);
+                    surf = NULL;
+                } else {
+                    if (!shapeEntries) {
+                        shapeEntries = [NSMutableArray array];
+                        leasePool[poolKey] = shapeEntries;
+                    }
+                    NSMutableDictionary *entry = [NSMutableDictionary dictionary];
+                    entry[@"surface"] = [NSValue valueWithPointer:(void *)surf];
+                    entry[@"texture"] = tex; // stable pool retain
+                    CFIndex measured =
+                        CFGetRetainCount((__bridge CFTypeRef)tex);
+                    CFIndex baseline = measured > 1 ? measured - 1 : 1;
+                    NSUInteger allocation = IOSurfaceGetAllocSize(surf);
+                    entry[@"baseline"] = @(baseline);
+                    entry[@"bytes"] = @(allocation);
+                    entry[@"last"] = @(leaseClock);
+                    [shapeEntries addObject:entry];
+                    leasePoolBytes += allocation;
+                    leaseNewCount++;
+                    if (leaseNewCount <= 64 || (leaseNewCount % 600) == 0) {
+                        fprintf(stderr,
+                            "#### MTL_TEX LEASE-NEW #%llu key=%s entry=%p "
+                            "surf=%p tex=%p retain=%ld baseline=%ld bpr=%zu "
+                            "alloc=%luKB shapeEntries=%lu pool=%luMB map=%s\n",
+                            (unsigned long long)leaseNewCount,
+                            [poolKey UTF8String], (void *)entry, (void *)surf,
+                            (void *)tex, (long)measured, (long)baseline,
+                            IOSurfaceGetBytesPerRow(surf),
+                            (unsigned long)(allocation / 1024),
+                            (unsigned long)[shapeEntries count],
+                            (unsigned long)(leasePoolBytes / (1024 * 1024)),
+                            compressedPF550 ? "PF550-COMPRESSED" : "LINEAR");
+                    }
+
+                    const NSUInteger budget = 512U * 1024U * 1024U;
+                    while (leasePoolBytes > budget) {
+                        NSString *oldestKey = nil;
+                        NSMutableArray *oldestArray = nil;
+                        NSMutableDictionary *oldestEntry = nil;
+                        uint64_t oldestUse = UINT64_MAX;
+                        for (NSString *candidateKey in leasePool) {
+                            NSMutableArray *candidateArray = leasePool[candidateKey];
+                            for (NSMutableDictionary *candidateEntry in candidateArray) {
+                                if (candidateEntry == entry) continue;
+                                id candidateTexture = candidateEntry[@"texture"];
+                                CFIndex candidateBaseline =
+                                    [candidateEntry[@"baseline"] longLongValue];
+                                CFIndex candidateCount = candidateTexture
+                                    ? CFGetRetainCount((__bridge CFTypeRef)
+                                                       candidateTexture) : 0;
+                                uint64_t candidateUse =
+                                    [candidateEntry[@"last"] unsignedLongLongValue];
+                                if (candidateTexture &&
+                                    candidateCount <= candidateBaseline &&
+                                    candidateUse < oldestUse) {
+                                    oldestUse = candidateUse;
+                                    oldestKey = candidateKey;
+                                    oldestArray = candidateArray;
+                                    oldestEntry = candidateEntry;
                                 }
                             }
                         }
-                        fprintf(stderr,
-                            "#### SURF-SAMPLE surf=%p %lux%lu bpe=%lu GRID32x32: "
-                            "nonzero=%d/%d sum=%llu firstNZ@%#zx\n",
-                            (void *)surf, (unsigned long)width,
-                            (unsigned long)height, (unsigned long)bpe,
-                            nz, total, (unsigned long long)acc, firstnz_off);
-                    } else {
-                        fprintf(stderr, "#### SURF-SAMPLE surf=%p base=NULL\n", (void*)surf);
+                        if (!oldestEntry) {
+                            static uint64_t overBudgetCount = 0;
+                            overBudgetCount++;
+                            if (overBudgetCount <= 12 ||
+                                (overBudgetCount % 300) == 0) {
+                                fprintf(stderr,
+                                    "#### MTL_TEX LEASE-OVER-BUDGET #%llu "
+                                    "pool=%luMB: every older entry is busy; "
+                                    "preserving lifetime correctness\n",
+                                    (unsigned long long)overBudgetCount,
+                                    (unsigned long)(leasePoolBytes /
+                                                    (1024 * 1024)));
+                            }
+                            break;
+                        }
+                        IOSurfaceRef evictedSurface = (IOSurfaceRef)
+                            [oldestEntry[@"surface"] pointerValue];
+                        NSUInteger evictedBytes =
+                            [oldestEntry[@"bytes"] unsignedIntegerValue];
+                        leaseEvictCount++;
+                        if (leaseEvictCount <= 32 ||
+                            (leaseEvictCount % 600) == 0) {
+                            fprintf(stderr,
+                                "#### MTL_TEX LEASE-EVICT #%llu key=%s "
+                                "entry=%p surf=%p bytes=%luKB pool-before=%luMB\n",
+                                (unsigned long long)leaseEvictCount,
+                                [oldestKey UTF8String], (void *)oldestEntry,
+                                (void *)evictedSurface,
+                                (unsigned long)(evictedBytes / 1024),
+                                (unsigned long)(leasePoolBytes / (1024 * 1024)));
+                        }
+                        [oldestArray removeObjectIdenticalTo:oldestEntry];
+                        if ([oldestArray count] == 0)
+                            [leasePool removeObjectForKey:oldestKey];
+                        leasePoolBytes = evictedBytes > leasePoolBytes
+                            ? 0 : leasePoolBytes - evictedBytes;
+                        if (evictedSurface) CFRelease(evictedSurface);
                     }
-                    IOSurfaceUnlock(surf, 0x1, NULL);
-                }
-            }
-        } else {
-            tex = [self hooked_newTextureWithDescriptor:desc
-                                              iosurface:surf
-                                                  plane:0];
-            if (tex) {
-                @synchronized(texCache) {
-                    id<MTLTexture> cached = texCache[texKey];
-                    if (cached) {
-                        // Lost the race — drop our fresh tex (let ARC
-                        // release it via end-of-scope autorelease) and
-                        // hand caller the cached one with +1.
-                        CFRetain((__bridge CFTypeRef)cached);
-                        tex = cached;
-                    } else {
-                        // Insert into dict.  Dict retains; %orig +1
-                        // already belongs to caller.  Bump retain once
-                        // more to keep dict's reference matched to the
-                        // explicit retain we'll add on every HIT — this
-                        // way dict ref == sum of (HITs we'll service).
-                        // Without this extra retain, dict→tex link is
-                        // the only thing holding tex; first HIT's
-                        // CFRetain still works (refcount goes 1→2 then
-                        // back to 1 on caller's release), but if dict
-                        // is ever cleared, tex dies even though HITs
-                        // were still expected.  Conservative: keep tex
-                        // alive for process lifetime.
-                        CFRetain((__bridge CFTypeRef)tex);
-                        texCache[texKey] = tex;
-                    }
-                }
-                if (texCacheLog++ < 8) {
-                    fprintf(stderr,
-                        "#### MTL_TEX TEX-CACHE-NEW: surf=%p → tex=%p\n",
-                        (void *)surf, (void *)tex);
                 }
             }
         }
+        if (!surf || !tex) return nil;
+
         // Read-only postcondition audit for the original Apple initializer.
         if (tex) {
             macws_audit_iosurface_texture_mapping(tex, surf);
@@ -5394,18 +5427,8 @@ static void macws_sigabrt_trampoline(int sig) {
         // AGXG13GFamilyDevice swizzle (different entry point than the
         // IOGPUMetalDevice iosurface variant). See macws_disp_fill_track.
         macws_disp_fill_track(tex, surf);
-        // 2026-06-20 — DO NOT CFRelease(surf): the pool retains the
-        // surface for process lifetime (see POOL-NEW/POOL-HIT branches
-        // above).  Metal's internal IOSurface retain comes on top.
-        // CFRelease here would over-balance for POOL-HIT (returned ref
-        // from [v pointerValue] is borrowed, no +1) and also dropping
-        // the pool's strong ref on POOL-NEW would cause the surface to
-        // be freed once Metal releases it.
-        if (route_log < 16) {
-            fprintf(stderr,
-                "#### MTL_TEX plain ROUTE-IOSURF result: %p\n",
-                (void *)tex);
-        }
+        // Do not release `surf` here.  Its create retain is owned by the pool
+        // entry and released exactly once when that idle entry is evicted.
         return tex;
     }
     id<MTLTexture> result = [self hooked_newTextureWithDescriptor:desc];
