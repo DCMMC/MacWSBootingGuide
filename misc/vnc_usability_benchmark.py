@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import os
+import select
 import socket
 import statistics
 import struct
@@ -52,6 +53,24 @@ def region_digest(framebuffer, width, rect, masked_points=(), radius=None):
                         relative_right - relative_left)
         hasher.update(line)
     return hasher.hexdigest()
+
+
+def region_changed_pixels(before, after, width, rect, masked_points=(),
+                          radius=None):
+    if radius is None:
+        radius = CURSOR_MASK_RADIUS
+    x, y, rect_width, rect_height = rect
+    changed = 0
+    for row in range(y, y + rect_height):
+        for column in range(x, x + rect_width):
+            if any(abs(column - point_x) <= radius and
+                   abs(row - point_y) <= radius
+                   for point_x, point_y in masked_points):
+                continue
+            offset = (row * width + column) * 4
+            if before[offset:offset + 4] != after[offset:offset + 4]:
+                changed += 1
+    return changed
 
 
 def pointer(sock, mask, point):
@@ -97,7 +116,8 @@ def wait_for_region(sock, width, height, framebuffer, rect, masks,
 
 
 def measured_action(sock, width, height, framebuffer, label, rect, masks,
-                    action, timeout, max_updates):
+                    action, timeout, max_updates, settle_seconds):
+    baseline = bytes(framebuffer)
     before = region_digest(framebuffer, width, rect, masks)
     vnc_live_click.request_update(sock, width, height, True)
     started = time.monotonic()
@@ -106,6 +126,39 @@ def measured_action(sock, width, height, framebuffer, label, rect, masks,
         sock, width, height, framebuffer, rect, masks, before, started,
         timeout, max_updates)
     result["operation"] = label
+    settled_updates = 0
+    settled_changes = 0
+    if result["passed"] and settle_seconds > 0:
+        # The first changed rectangle can be cursor/traffic-light feedback
+        # that precedes the actual menu composite. Keep the RFB request stream
+        # alive for a short bounded interval and retain the newest complete
+        # frame. This mirrors a real VNC viewer, which immediately asks for
+        # the next incremental update instead of stopping after one tile.
+        settle_deadline = time.monotonic() + settle_seconds
+        settled_digest = result["digest"]
+        vnc_live_click.request_update(sock, width, height, True)
+        while True:
+            remaining = settle_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([sock], [], [], remaining)
+            if not readable:
+                break
+            rectangles = vnc_live_click.receive_update(
+                sock, width, framebuffer)
+            result["rectangles"].extend(rectangles)
+            settled_updates += 1
+            current_digest = region_digest(framebuffer, width, rect, masks)
+            if current_digest != settled_digest:
+                settled_changes += 1
+                settled_digest = current_digest
+            if time.monotonic() < settle_deadline:
+                vnc_live_click.request_update(sock, width, height, True)
+        result["digest"] = settled_digest
+    result["settled_updates"] = settled_updates
+    result["settled_changes"] = settled_changes
+    result["changed_pixels_from_action_baseline"] = region_changed_pixels(
+        baseline, framebuffer, width, rect, masks)
     latency = result["latency_seconds"]
     latency_label = "MISS" if latency is None else f"{latency:.3f}s"
     print(
@@ -139,6 +192,9 @@ def main():
                         default="raw")
     parser.add_argument("--timeout", type=float, default=6.0)
     parser.add_argument("--max-updates", type=int, default=16)
+    parser.add_argument("--settle-seconds", type=float, default=0.35,
+                        help="retain post-action incremental frames before "
+                             "the next operation (default: 0.35)")
     parser.add_argument("--cursor-mask-radius", type=int, default=32)
     parser.add_argument("--menu-click", nargs=2, type=int, default=(235, 20),
                         metavar=("X", "Y"))
@@ -161,10 +217,14 @@ def main():
                         metavar=("X", "Y", "WIDTH", "HEIGHT"))
     parser.add_argument("--snapshots")
     parser.add_argument("--json")
+    parser.add_argument("--skip-menu", action="store_true")
+    parser.add_argument("--skip-context", action="store_true")
+    parser.add_argument("--skip-drag", action="store_true")
     args = parser.parse_args()
     CURSOR_MASK_RADIUS = args.cursor_mask_radius
 
     if (args.timeout <= 0 or args.max_updates < 1 or
+            args.settle_seconds < 0 or
             args.cursor_mask_radius < 0):
         parser.error("timeout/max-updates must be positive and mask nonnegative")
     hover_points = args.hover or [
@@ -203,66 +263,81 @@ def main():
         # Normalize any menu state left by an interactive client.
         key(sock, 0xFF1B)
         time.sleep(0.15)
-
-        menu_click = tuple(args.menu_click)
-        result = measured_action(
-            sock, width, height, framebuffer, "menu-open", menu_rect,
-            (menu_click,),
-            lambda: (pointer(sock, 1, menu_click), time.sleep(0.04),
-                     pointer(sock, 0, menu_click)),
-            args.timeout, args.max_updates)
-        results.append(result)
-        save_snapshot(args.snapshots, "01-menu-open", width, height,
+        # The Escape key can itself close a menu and queue one framebuffer
+        # update.  Starting the first measured action from the older retained
+        # pixels made that queued close satisfy `menu-open`, shifting every
+        # screenshot/result by one UI state.  A non-incremental request gives
+        # this benchmark an exact post-normalization baseline.
+        vnc_live_click.request_update(sock, width, height, False)
+        normalized_rectangles = vnc_live_click.receive_update(
+            sock, width, framebuffer)
+        print(
+            f"USABILITY normalized={normalized_rectangles}", flush=True)
+        save_snapshot(args.snapshots, "00-normalized", width, height,
                       framebuffer)
 
-        previous_point = menu_click
-        for index, next_point in enumerate(hover_points, 1):
-            next_point = tuple(next_point)
+        if not args.skip_menu:
+            menu_click = tuple(args.menu_click)
             result = measured_action(
                 sock, width, height, framebuffer,
-                f"menu-hover-{index}", menu_rect,
-                (previous_point, next_point),
-                lambda point=next_point: pointer(sock, 0, point),
-                args.timeout, args.max_updates)
+                "menu-open", menu_rect, (menu_click,),
+                lambda: (pointer(sock, 1, menu_click), time.sleep(0.04),
+                         pointer(sock, 0, menu_click)),
+                args.timeout, args.max_updates, args.settle_seconds)
             results.append(result)
-            previous_point = next_point
-            save_snapshot(args.snapshots, f"hover-{index:02d}", width,
-                          height, framebuffer)
+            save_snapshot(args.snapshots, "01-menu-open", width, height,
+                          framebuffer)
 
-        result = measured_action(
-            sock, width, height, framebuffer, "menu-close", menu_rect,
-            (previous_point,), lambda: key(sock, 0xFF1B),
-            args.timeout, args.max_updates)
-        results.append(result)
+            previous_point = menu_click
+            for index, next_point in enumerate(hover_points, 1):
+                next_point = tuple(next_point)
+                result = measured_action(
+                    sock, width, height, framebuffer,
+                    f"menu-hover-{index}", menu_rect,
+                    (previous_point, next_point),
+                    lambda point=next_point: pointer(sock, 0, point),
+                    args.timeout, args.max_updates, args.settle_seconds)
+                results.append(result)
+                previous_point = next_point
+                save_snapshot(args.snapshots, f"hover-{index:02d}", width,
+                              height, framebuffer)
 
-        context_point = tuple(args.context_click)
-        result = measured_action(
-            sock, width, height, framebuffer, "context-menu", context_rect,
-            (context_point,),
-            lambda: (pointer(sock, 4, context_point), time.sleep(0.04),
-                     pointer(sock, 0, context_point)),
-            args.timeout, args.max_updates)
-        results.append(result)
-        save_snapshot(args.snapshots, "context-menu", width, height,
-                      framebuffer)
+            result = measured_action(
+                sock, width, height, framebuffer, "menu-close", menu_rect,
+                (previous_point,), lambda: key(sock, 0xFF1B),
+                args.timeout, args.max_updates, args.settle_seconds)
+            results.append(result)
 
-        result = measured_action(
-            sock, width, height, framebuffer, "context-close", context_rect,
-            (context_point,), lambda: key(sock, 0xFF1B),
-            args.timeout, args.max_updates)
-        results.append(result)
+        if not args.skip_context:
+            context_point = tuple(args.context_click)
+            result = measured_action(
+                sock, width, height, framebuffer, "context-menu", context_rect,
+                (context_point,),
+                lambda: (pointer(sock, 4, context_point), time.sleep(0.04),
+                         pointer(sock, 0, context_point)),
+                args.timeout, args.max_updates, args.settle_seconds)
+            results.append(result)
+            save_snapshot(args.snapshots, "context-menu", width, height,
+                          framebuffer)
 
-        drag_start = tuple(args.title_drag[:2])
-        drag_end = tuple(args.title_drag[2:])
-        result = measured_action(
-            sock, width, height, framebuffer, "title-drag", drag_rect,
-            (drag_start, drag_end),
-            lambda: vnc_native_input_test.send_drag(
-                sock, drag_start, drag_end, 12, 0.015),
-            args.timeout, args.max_updates)
-        results.append(result)
-        save_snapshot(args.snapshots, "title-drag", width, height,
-                      framebuffer)
+            result = measured_action(
+                sock, width, height, framebuffer, "context-close", context_rect,
+                (context_point,), lambda: key(sock, 0xFF1B),
+                args.timeout, args.max_updates, args.settle_seconds)
+            results.append(result)
+
+        if not args.skip_drag:
+            drag_start = tuple(args.title_drag[:2])
+            drag_end = tuple(args.title_drag[2:])
+            result = measured_action(
+                sock, width, height, framebuffer, "title-drag", drag_rect,
+                (drag_start, drag_end),
+                lambda: vnc_native_input_test.send_drag(
+                    sock, drag_start, drag_end, 12, 0.015),
+                args.timeout, args.max_updates, args.settle_seconds)
+            results.append(result)
+            save_snapshot(args.snapshots, "title-drag", width, height,
+                          framebuffer)
 
         latencies = [result["latency_seconds"] for result in results
                      if result["latency_seconds"] is not None]

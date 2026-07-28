@@ -80,6 +80,13 @@ def send_key(sock, keysym):
     sock.sendall(struct.pack(">BBxxI", 4, 0, keysym))
 
 
+def send_pointer_click(sock, point, button_mask, hold_seconds=0.04):
+    sock.sendall(struct.pack(">BBHH", 5, button_mask, point[0], point[1]))
+    if hold_seconds:
+        time.sleep(hold_seconds)
+    sock.sendall(struct.pack(">BBHH", 5, 0, point[0], point[1]))
+
+
 def send_text(sock, text, key_delay):
     for character in text:
         send_key(sock, ord(character))
@@ -150,13 +157,21 @@ def main():
                         metavar=("X1", "Y1", "X2", "Y2"))
     parser.add_argument("--content-drag", nargs=4, type=int,
                         metavar=("X1", "Y1", "X2", "Y2"))
+    parser.add_argument("--right-click", nargs=2, type=int,
+                        metavar=("X", "Y"),
+                        help="send one RFB secondary-button down/up pair")
+    parser.add_argument("--left-click", nargs=2, type=int,
+                        metavar=("X", "Y"),
+                        help="send one RFB primary-button down/up pair")
     parser.add_argument("--text")
     parser.add_argument("--output", help="save the final retained framebuffer")
     args = parser.parse_args()
 
     title_drag = parse_drag(parser, args.title_drag, "--title-drag")
     content_drag = parse_drag(parser, args.content_drag, "--content-drag")
-    if title_drag is None and content_drag is None and args.text is None:
+    if (title_drag is None and content_drag is None and
+            args.right_click is None and args.left_click is None and
+            args.text is None):
         parser.error("select at least one input operation")
     if (args.timeout <= 0 or args.max_updates < 1 or args.drag_steps < 1 or
             args.drag_step_delay < 0 or args.key_delay < 0 or
@@ -191,6 +206,28 @@ def main():
             digest, _ = request_and_wait(
                 sock, width, height, framebuffer, digest, label, started,
                 args.timeout, args.max_updates)
+            completed += 1
+
+        if args.right_click is not None:
+            right_click = tuple(args.right_click)
+            check_point(width, height, *right_click)
+            vnc_live_click.request_update(sock, width, height, True)
+            started = time.monotonic()
+            send_pointer_click(sock, right_click, 4)
+            digest, _ = request_and_wait(
+                sock, width, height, framebuffer, digest, "right-click",
+                started, args.timeout, args.max_updates)
+            completed += 1
+
+        if args.left_click is not None:
+            left_click = tuple(args.left_click)
+            check_point(width, height, *left_click)
+            vnc_live_click.request_update(sock, width, height, True)
+            started = time.monotonic()
+            send_pointer_click(sock, left_click, 1)
+            digest, _ = request_and_wait(
+                sock, width, height, framebuffer, digest, "left-click",
+                started, args.timeout, args.max_updates)
             completed += 1
 
         if args.text is not None:

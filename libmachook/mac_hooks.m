@@ -4868,6 +4868,8 @@ static BOOL macws_vnc_native_all = NO;
 static _Atomic uint64_t macws_vnc_keyboard_serial = 0;
 static _Atomic uint64_t macws_vnc_keyboard_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_capture_serial = 0;
+static _Atomic uint64_t macws_vnc_pointer_settle_serial = 0;
+static _Atomic unsigned int macws_vnc_native_buttons = 0;
 
 // RE-confirmed via the installed arm64 OSXvnc-server (2026-07-27):
 //
@@ -5335,6 +5337,50 @@ static void macws_vnc_request_keyboard_settled_frame(uint64_t keySerial,
     macws_vnc_write_capture_request("KEY-SETTLED", keySerial, keySym);
 }
 
+// The original OSXvnc pointer path posts a coherent system-wide mouse stream,
+// but shared-VNC mode deliberately ignores CoreGraphics' display-refresh
+// callback and publishes only WindowServer's stable mmap generations.  A menu
+// or contextual-menu transition can therefore reach AppKit without producing
+// a VNC-visible generation until the next pointer event.  Runtime evidence on
+// 2026-07-29 showed exactly that boundary: VS Code received rightDown/rightUp
+// (NSEvent 3/4, pressed=0x2), while the first menu-open framebuffer still had
+// no menu and the following hover delivered the already-open menu.
+//
+// Request an early observation after the pointer becomes quiet, plus a later
+// observation after button transitions.  This does not synthesize an event or
+// fabricate a frame: Metal_hooks still accepts only a real, stable
+// WindowServer composite and ACKs its generation.  Motion is debounced so a
+// 120-Hz VNC client cannot create 120 full-display observations per second.
+static void macws_vnc_schedule_native_pointer_frames(
+        unsigned int buttons, BOOL buttonTransition) {
+    if (!macws_vnc_share_on) return;
+    uint64_t serial = atomic_fetch_add_explicit(
+        &macws_vnc_pointer_capture_serial, 1,
+        memory_order_acq_rel) + 1;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 24 * NSEC_PER_MSEC),
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            if (atomic_load_explicit(&macws_vnc_pointer_capture_serial,
+                                     memory_order_acquire) == serial) {
+                macws_vnc_write_capture_request(
+                    "POINTER-PROGRESS", serial, buttons);
+            }
+        });
+    if (!buttonTransition) return;
+    uint64_t settleSerial = atomic_fetch_add_explicit(
+        &macws_vnc_pointer_settle_serial, 1,
+        memory_order_acq_rel) + 1;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            if (atomic_load_explicit(&macws_vnc_pointer_settle_serial,
+                                     memory_order_acquire) == settleSerial) {
+                macws_vnc_write_capture_request(
+                    "POINTER-SETTLED", settleSerial, buttons);
+            }
+        });
+}
+
 static void macws_new_vnc_handle_keyboard(id self, SEL command, BOOL down,
         unsigned int keySym, id client) {
     macws_vnc_note_interaction();
@@ -5485,6 +5531,33 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
             point.y / (CGFloat)scale,
         };
         if (macws_vnc_native_all) {
+            unsigned int previousButtons = atomic_load_explicit(
+                &macws_vnc_native_buttons, memory_order_acquire);
+            BOOL secondaryRelease = (previousButtons & 4u) != 0 &&
+                                    (buttons & 4u) == 0;
+            if (secondaryRelease) {
+                // Runtime-confirmed on Terminal's real contextual menu: a
+                // fast RFB secondary release could be queued before AppKit's
+                // rightMouseDown handler entered its nested NSMenu tracker.
+                // Failed sample: both NSEvent 3 and 4 returned through
+                // -[NSApplication sendEvent:]. Successful samples: type 3
+                // entered the tracker and type 4 was consumed there. Keep the
+                // original system CGPostMouseEvent owner and serialize only
+                // this transition long enough for the down to establish that
+                // tracker. This is an input-transport compatibility delay,
+                // not a menu action or state bypass.
+                usleep(120000);
+                static _Atomic uint64_t serializedRightUps;
+                uint64_t serialized = atomic_fetch_add_explicit(
+                    &serializedRightUps, 1,
+                    memory_order_relaxed) + 1;
+                if (serialized <= 24 || (serialized % 100) == 0) {
+                    fprintf(stderr,
+                        "#### OSXVNC RIGHT-UP-SERIALIZE event=%llu "
+                        "delay=120ms rfb=(%.1f,%.1f)\n",
+                        (unsigned long long)serialized, point.x, point.y);
+                }
+            }
             macws_orig_vnc_handle_mouse(self, command, buttons,
                                         quartzPoint, client);
             static _Atomic uint64_t nativeEvents;
@@ -5497,6 +5570,10 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     (unsigned long long)nativeEvent, buttons,
                     point.x, point.y, quartzPoint.x, quartzPoint.y, scale);
             }
+            atomic_store_explicit(&macws_vnc_native_buttons, buttons,
+                                  memory_order_release);
+            macws_vnc_schedule_native_pointer_frames(
+                buttons, buttons != previousButtons);
             macws_vnc_left_down = leftDown;
             macws_vnc_last_point = point;
             return;

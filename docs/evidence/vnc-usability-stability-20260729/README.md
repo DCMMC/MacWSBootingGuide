@@ -139,13 +139,16 @@ millisecond, so the remaining tail is downstream of socket parsing.  It still
 needs to be split between WindowServer frame production and mmap dirty-region
 publication before being called fixed.
 
-The native-allocation A/B is not a general performance fix.  A later live
-sample still showed WindowServer at 54.5% CPU and 290,352 KiB RSS.  Its trace
-also contained repeated ordinary-texture `AGX_INITARGS FAIL` results.  The
-clean menus establish the equal-shape-alias diagnosis, but a lifetime-aware
-multi-entry compatibility pool is still preferable to routing every ordinary
-WindowServer texture through the failing native initializer.  That follow-up
-belongs to the remaining smoothness/stability milestone.
+The native-allocation A/B was not a general performance fix.  A later live
+sample still showed WindowServer at 54.5% CPU and 290,352 KiB RSS, and its
+trace contained repeated ordinary-texture `AGX_INITARGS FAIL` results.  The
+follow-up therefore implemented a lifetime-aware multi-entry compatibility
+pool instead of routing every ordinary WindowServer texture through that
+failing native initializer.  Runtime recorded five 2388x1668 owned targets
+serving at least 39,600 reuse hits, with a bounded live WindowServer sample at
+214,240 KiB RSS.  The ownership invariant, exact log lines and limitations are
+recorded in `owned-lease-pool/README.md`; this is not yet a long-soak leak
+proof.
 
 VS Code starts and its main window renders with the process-specific policy;
 `gui-native-helper-compat/vscode-before-file.png` is the final-policy witness.
@@ -162,3 +165,107 @@ system-input and WebGL/JIT work, matching the requested priority order.
 - The watchdog has one PID-owned instance and no default 300-second kill cap.
 - OSXvnc's `MACWS_VNC_NATIVE_ALL=1` setting is emitted by the generated launchd
   plist, so reboot/startup does not depend on a leftover `/tmp` sentinel.
+
+## 7. System input is not complete until its WindowServer frame is published
+
+A later retained-client test corrected an overclaim in the original
+changed-region benchmark.  A system event could be accepted while the first
+RFB update contained only cursor/window-control feedback.  The actual menu
+composite arrived on the following pointer request.  Thus an arbitrary region
+digest change was not by itself a semantic menu-success witness.
+
+The boundary was runtime-confirmed in current VS Code.  The original
+system-wide path delivered a real secondary-button pair to AppKit:
+
+```text
+#### APP-INPUT MOUSE-EVENT pid=67206 serial=2 type=3 window=25 local=(500.00,475.00) pressed=0x2 at=317301.413506
+#### APP-INPUT MOUSE-EVENT pid=67206 serial=3 type=4 window=25 local=(500.00,475.00) pressed=0 at=317301.492351
+```
+
+For a menu-bar click, the old native-all early return skipped the pointer
+capture request.  After closing that gap, the event, two real observation
+requests, stable mmap publication and WindowServer acknowledgements were all
+visible in one run:
+
+```text
+#### OSXVNC NATIVE-ALL event=1 buttons=0x1 rfb=(235.0,20.0) quartz=(117.5,10.0) scale=2
+#### OSXVNC POINTER-PROGRESS-CAPTURE serial=1 detail=0x1 generation=1785279999829998000
+#### OSXVNC NATIVE-ALL event=2 buttons=0 rfb=(235.0,20.0) quartz=(117.5,10.0) scale=2
+#### OSXVNC POINTER-PROGRESS-CAPTURE serial=2 detail=0 generation=1785279999880159000
+#### OSXVNC mmap generation #3 sequence=808 changed=YES dirty=147,0 626x1084 rects=17 overflow=NO
+#### OSXVNC POINTER-SETTLED-CAPTURE serial=2 detail=0 generation=1785280000030095000
+#### VNC-FINAL acknowledged pid=65992 generation=1785279999829998000
+#### VNC-FINAL acknowledged pid=65992 generation=1785279999880159000
+#### VNC-FINAL acknowledged pid=65992 generation=1785280000030095000
+```
+
+The test client now obtains a non-incremental post-Escape baseline and retains
+post-action incremental frames for a bounded settle interval.  A real Terminal
+menu run completed open, four hover transitions and close, 6/6, with each blue
+hover state present in the retained framebuffer:
+
+- `system-input-publish-fix-b/terminal-menu/results.json`
+- `system-input-publish-fix-b/terminal-menu/01-menu-open.png`
+- `system-input-publish-fix-b/terminal-menu/hover-04.png`
+
+## 8. Secondary-button release serialization
+
+The stricter framebuffer test then exposed an independent right-click race.
+In a failed Terminal sample, both `rightMouseDown` and `rightMouseUp` returned
+through ordinary `-[NSApplication sendEvent:]`; in successful samples, the
+down entered NSMenu's nested tracker and that tracker consumed the up.  The
+RFB transport now keeps OSXvnc's original system `CGPostMouseEvent` owner but
+delays only the secondary-button release by 120 ms, allowing the down to
+establish the real AppKit tracker.  No menu action, selector return value, or
+window state is synthesized.
+
+Runtime witness:
+
+```text
+#### OSXVNC NATIVE-ALL event=1 buttons=0x4 rfb=(1000.0,700.0) quartz=(500.0,350.0) scale=2
+#### OSXVNC RIGHT-UP-SERIALIZE event=1 delay=120ms rfb=(1000.0,700.0)
+#### OSXVNC NATIVE-ALL event=2 buttons=0 rfb=(1000.0,700.0) quartz=(500.0,350.0) scale=2
+#### APP-INPUT MOUSE-EVENT pid=69267 serial=12 type=3 window=29 local=(419.00,356.00) pressed=0x2 at=318001.959555
+```
+
+Five isolated right-click/open/close rounds retained five visibly complete
+Terminal contextual menus.  Open latency ranged from 0.290 to 1.021 seconds;
+the remaining long tail is a real smoothness problem, so this is a stability
+milestone rather than a claim of final responsiveness:
+
+- `system-input-publish-fix-b/right-serialized-1/results.json`
+- `system-input-publish-fix-b/right-serialized-1/context-menu.png`
+- `system-input-publish-fix-b/right-serialized-2/results.json`
+- `system-input-publish-fix-b/right-serialized-3/results.json`
+- `system-input-publish-fix-b/right-serialized-4/results.json`
+- `system-input-publish-fix-b/right-serialized-5/results.json`
+- `system-input-publish-fix-b/right-serialized-5/context-menu.png`
+
+The same installed hook was then tested against a freshly restarted official
+VS Code 1.130.0 workbench, rather than a stale full-screen benchmark target.
+Its real macOS File menu completed open/hover/close 3/3 with 0.564/0.308/0.251
+second first-change latencies.  A secondary click on the editor tab produced
+the complete Electron contextual menu in 0.303 seconds and closed in 0.626
+seconds.  The screenshots—not merely the changed-region counters—were
+inspected for the expected menu contents:
+
+- `system-input-publish-fix-b/vscode-menu-live/results.json`
+- `system-input-publish-fix-b/vscode-menu-live/01-menu-open.png`
+- `system-input-publish-fix-b/vscode-menu-live/hover-01.png`
+- `system-input-publish-fix-b/vscode-context-live/results.json`
+- `system-input-publish-fix-b/vscode-context-live/context-menu.png`
+
+After rebuilding and restarting OSXvnc with the final atomic button-state
+update, the same VS Code contextual-menu operation remained visually complete
+but took 1.037 seconds to open and 1.036 seconds to close.  This repeat is the
+current deployed-binary witness and also demonstrates that the long-tail
+latency is still unresolved:
+
+- `system-input-publish-fix-b/vscode-context-final/results.json`
+- `system-input-publish-fix-b/vscode-context-final/context-menu.png`
+
+This also fixes the terminology boundary: per-process `AppInputBridge` remains
+appropriate for the iPad-native host and targeted AppKit content.  VNC menu
+bar, contextual-menu and cross-process window input must remain one coherent
+system event stream; broadcasting private NSEvents to every process would
+duplicate gestures and cannot represent WindowServer-owned UI.

@@ -1869,3 +1869,38 @@ sub-millisecond while median rAF interval remained 78.5 ms, so presentation
 pacing—not event lifetime—is still the next performance target.  Exact bytes,
 hashes, counters, and the external-test-interference boundary are in
 [`chrome150-event-lifecycle-selector-20260729.txt`](evidence/chrome150-event-lifecycle-selector-20260729.txt).
+
+## 2026-07-29: system menus close the input-to-frame loop
+
+The system-wide OSXvnc path was already delivering correct AppKit event types,
+but the native-all branch returned before requesting a shared-frame
+observation.  Runtime captured VS Code receiving secondary NSEvent types 3/4
+with `pressed=0x2` while the VNC client remained on the pre-menu framebuffer;
+the next hover exposed the already-open menu.  Pointer activity now requests
+an early real WindowServer observation plus a settled observation after button
+transitions.  The producer still publishes only stable compositor output.
+
+A stricter client-side test also corrected the earlier arbitrary-region-change
+criterion: it now synchronizes a post-Escape full baseline and retains later
+incremental updates before judging the screenshot.  Terminal then completed a
+menu open, four distinct hover states and close (6/6), with complete menu rows
+and blue hover output in the retained 2388x1668 frames.
+
+That test exposed one separate right-click race.  Failed runs returned both
+rightDown/rightUp through ordinary `NSApplication sendEvent:`; successful
+runs entered NSMenu's nested tracker on rightDown and consumed rightUp there.
+Serializing only the RFB secondary release by 120 ms retained the original
+system `CGPostMouseEvent` owner and produced five visibly complete contextual
+menus in five isolated rounds.  Open latency was still 0.290-1.021 seconds and
+WindowServer remained around 48% CPU in a live sample, so responsiveness and
+presentation cost remain open.  Exact logs, screenshots, JSON and the
+per-process-vs-system input ownership boundary are recorded in
+[`vnc-usability-stability-20260729/README.md`](evidence/vnc-usability-stability-20260729/README.md#7-system-input-is-not-complete-until-its-windowserver-frame-is-published).
+
+A cross-process control restarted the real VS Code 1.130.0 workbench and
+visually confirmed both its WindowServer-owned File menu (open/hover/close
+3/3) and its Electron editor-tab contextual menu (open/close 2/2).  Their
+first-change latencies were 0.251-0.626 seconds.  This validates the single
+system-event owner across AppKit and Electron.  A repeat after the final
+OSXvnc rebuild remained visually correct but required 1.037 seconds, leaving
+the latency/WindowServer CPU milestone explicit.
