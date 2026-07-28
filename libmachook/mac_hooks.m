@@ -7030,6 +7030,18 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
                        // 0xe00002c2 and forced the incomplete newSharedEvent
                        // fallback on every Chromium frame.
                 return 0x14;
+            case 0x19: // IOGPUMTLEvent dealloc
+                       // RE-confirmed 2026-07-29 from both live framework
+                       // implementations. macOS 13.4 IOGPU UUID
+                       // CE2B5551-857F-3EDD-9E4F-435215CC8C27 at
+                       // IOGPU+0x15488 loads object+0x10 as the sole scalar
+                       // input and executes `mov w1, #0x19`. iOS 16.3 at
+                       // live IOGPU+0x17190 has the same call ABI but executes
+                       // `mov w1, #0x15`. This is the destructor paired with
+                       // the adjacent 0x18 -> 0x14 event constructor above;
+                       // leaving it untranslated makes every attempted
+                       // kernel-event destruction return 0xe00002c2.
+                return 0x15;
             case 0x1d: // IOGPUCommandQueueCreateWithQoS + 516
                 return 0x19;
             case 0x1e: // IOGPUCommandQueueSubmitCommandBuffers

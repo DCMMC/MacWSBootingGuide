@@ -1849,3 +1849,23 @@ text=`vncinput150187`, active element=`field`.  Renderer and GPU helpers remain
 excluded to avoid ambiguous endpoint selection.  Full hashes, counters, A/B
 logs, and bounded-test limitations are in
 [`chrome150-secondary-partitionalloc-20260729.txt`](evidence/chrome150-secondary-partitionalloc-20260729.txt).
+
+## 2026-07-29: Chrome 150 event destruction uses the native iOS selector
+
+The remaining repeated Chrome 150 `IOConnectCallMethod` selector 0x19 failure
+was resolved at the protocol boundary.  Live method bytes from the exact
+macOS 13.4 and iOS 16.3 IOGPU images prove that
+`-[IOGPUMTLEvent dealloc]` uses the same one-scalar ABI but selector 0x19 on
+macOS and 0x15 on iOS.  The adjacent constructor pair is 0x18 and 0x14.  The
+new 0x19 -> 0x15 mapping therefore completes the event lifecycle instead of
+suppressing destructor errors.
+
+A forced-release standalone chroot probe logged the translated destroy call
+returning zero.  The current broad-stable Chrome 150.0.7871.187 then completed
+91/91 WebGL2 timer queries and 9,100 draws; the isolated log window had eight
+sampled create successes, eight sampled destroy successes, zero selector 0x19
+failures, and no command-buffer or protection error.  Raw GPU time remained
+sub-millisecond while median rAF interval remained 78.5 ms, so presentation
+pacing—not event lifetime—is still the next performance target.  Exact bytes,
+hashes, counters, and the external-test-interference boundary are in
+[`chrome150-event-lifecycle-selector-20260729.txt`](evidence/chrome150-event-lifecycle-selector-20260729.txt).

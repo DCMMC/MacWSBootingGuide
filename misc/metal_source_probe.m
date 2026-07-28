@@ -85,6 +85,43 @@ static void DumpNewEventImplementation(id device) {
             fprintf(stderr, " %02x", initImplementation[offset + byte]);
         fputc('\n', stderr);
     }
+
+    // Event creation and destruction are adjacent external-method ABI
+    // operations, but their selector deltas differ across the macOS 13.4 and
+    // iOS 16.3 IOGPU builds.  Dump the concrete dealloc IMP as a second,
+    // independent byte witness so the translation table can be derived from
+    // both producers instead of inferred from selector numbering.
+    SEL deallocSelector = sel_registerName("dealloc");
+    Method deallocMethod = eventClass
+        ? class_getInstanceMethod(eventClass, deallocSelector) : NULL;
+    IMP signedDealloc = deallocMethod
+        ? method_getImplementation(deallocMethod) : NULL;
+    const unsigned char *deallocImplementation = signedDealloc
+        ? (const unsigned char *)ptrauth_strip(
+              signedDealloc, ptrauth_key_function_pointer)
+        : NULL;
+    Dl_info deallocImageInfo = {0};
+    BOOL hasDeallocImage = deallocImplementation &&
+        dladdr(deallocImplementation, &deallocImageInfo);
+    fprintf(stderr,
+            "METAL_SOURCE_PROBE eventDeallocIMP class=%s imp=%p image=%s "
+            "imageBase=%p symbol=%s symbolBase=%p\n",
+            eventClass ? class_getName(eventClass) : "(none)",
+            deallocImplementation,
+            hasDeallocImage && deallocImageInfo.dli_fname
+                ? deallocImageInfo.dli_fname : "(unknown)",
+            hasDeallocImage ? deallocImageInfo.dli_fbase : NULL,
+            hasDeallocImage && deallocImageInfo.dli_sname
+                ? deallocImageInfo.dli_sname : "(unknown)",
+            hasDeallocImage ? deallocImageInfo.dli_saddr : NULL);
+    if (!deallocImplementation) return;
+    for (size_t offset = 0; offset < 160; offset += 16) {
+        fprintf(stderr,
+                "METAL_SOURCE_PROBE eventDeallocCode +0x%03zx:", offset);
+        for (size_t byte = 0; byte < 16; byte++)
+            fprintf(stderr, " %02x", deallocImplementation[offset + byte]);
+        fputc('\n', stderr);
+    }
 }
 
 // Minimal chroot-side witness for the MTLCompilerService bridge.  It avoids
@@ -194,6 +231,18 @@ int main(void) {
             fprintf(stderr,
                     "METAL_SOURCE_PROBE eventOnlyResult=%s\n",
                     eventOnlyOK ? "PASS" : "FAIL");
+            // Force ARC to run both event destructors while libmachook's
+            // IOKit interposer and stderr are still live.  Returning from
+            // main can let process teardown reclaim VM mappings before the
+            // external-method result is observable in the probe log.
+#if __has_feature(objc_arc)
+            legacyEvent = nil;
+            sharedEvent = nil;
+#else
+            [legacyEvent release];
+            [sharedEvent release];
+#endif
+            fprintf(stderr, "METAL_SOURCE_PROBE eventOnlyReleased=YES\n");
             return eventOnlyOK ? 0 : 5;
         }
 
