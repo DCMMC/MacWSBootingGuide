@@ -86,13 +86,22 @@ def wait_for_region(sock, width, height, framebuffer, rect, masks,
                     previous_digest, started, timeout, max_updates):
     rectangles_seen = []
     deadline = started + timeout
+    first_readable_seconds = None
+    receive_seconds = 0.0
     for update_index in range(1, max_updates + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        readable, _, _ = select.select([sock], [], [], remaining)
+        if not readable:
+            break
+        if first_readable_seconds is None:
+            first_readable_seconds = time.monotonic() - started
         sock.settimeout(remaining)
+        receive_started = time.monotonic()
         rectangles = vnc_live_click.receive_update(
             sock, width, framebuffer)
+        receive_seconds += time.monotonic() - receive_started
         rectangles_seen.extend(rectangles)
         current_digest = region_digest(
             framebuffer, width, rect, masks)
@@ -103,6 +112,8 @@ def wait_for_region(sock, width, height, framebuffer, rect, masks,
                 "updates": update_index,
                 "rectangles": rectangles_seen,
                 "digest": current_digest,
+                "first_readable_seconds": first_readable_seconds,
+                "receive_seconds": receive_seconds,
             }
         if time.monotonic() < deadline:
             vnc_live_click.request_update(sock, width, height, True)
@@ -112,6 +123,8 @@ def wait_for_region(sock, width, height, framebuffer, rect, masks,
         "updates": len(rectangles_seen),
         "rectangles": rectangles_seen,
         "digest": previous_digest,
+        "first_readable_seconds": first_readable_seconds,
+        "receive_seconds": receive_seconds,
     }
 
 
@@ -164,6 +177,8 @@ def measured_action(sock, width, height, framebuffer, label, rect, masks,
     print(
         f"USABILITY {'PASS' if result['passed'] else 'MISS'} "
         f"operation={label} latency={latency_label} "
+        f"readable={result['first_readable_seconds']} "
+        f"receive={result['receive_seconds']:.3f}s "
         f"updates={result['updates']}", flush=True)
     return result
 

@@ -5371,7 +5371,11 @@ static void macws_vnc_schedule_native_pointer_frames(
         &macws_vnc_pointer_settle_serial, 1,
         memory_order_acq_rel) + 1;
     dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
+        // Secondary release is serialized by 120 ms below.  Keep this below
+        // that boundary so rightDown gets one observation while NSMenu's
+        // nested tracker is active instead of having its 180-ms observation
+        // cancelled by the subsequent rightUp transition.
+        dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             if (atomic_load_explicit(&macws_vnc_pointer_settle_serial,
                                      memory_order_acquire) == settleSerial) {

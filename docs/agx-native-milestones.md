@@ -1904,3 +1904,21 @@ first-change latencies were 0.251-0.626 seconds.  This validates the single
 system-event owner across AppKit and Electron.  A repeat after the final
 OSXvnc rebuild remained visually correct but required 1.037 seconds, leaving
 the latency/WindowServer CPU milestone explicit.
+
+The next input-timing pass split a 1.314-second raw contextual-menu result into
+0.521 seconds before first readable RFB data and 0.790 seconds in receive/decode
+for 3.64 MiB of rectangles.  It also found an ordering error in the new
+transition observations: a 180-ms right-down observation was cancelled by the
+serialized 120-ms right-up.  Moving it to 80 ms produced an actual down-state
+observation before release and five visibly complete VS Code contextual menus
+in five repetitions.  Open latency remained 0.580–1.293 seconds (median
+0.781), so this fixes ordering but not the transport tail.
+
+A proposed wakeup for the historical 200-ms PF550 retry thread was removed
+after runtime disproved its relevance: the current session continuously used
+the owned-BGRA publisher, never created the PF550 wake socket, and emitted no
+successful wake datagram.  Full lifecycle testing also reconfirmed that plain
+`start coexist` is currently non-Retina `share=0`; native 2388x1668 VNC still
+requires `start coexist --experimental`.  These timing distributions and the
+productization boundary are recorded in
+[`vnc-usability-stability-20260729/README.md`](evidence/vnc-usability-stability-20260729/README.md#9-secondary-down-observation-and-remaining-rfb-latency).

@@ -269,3 +269,55 @@ appropriate for the iPad-native host and targeted AppKit content.  VNC menu
 bar, contextual-menu and cross-process window input must remain one coherent
 system event stream; broadcasting private NSEvents to every process would
 duplicate gestures and cannot represent WindowServer-owned UI.
+
+## 9. Secondary-down observation and remaining RFB latency
+
+The first timing-instrumented raw control split one 1.314-second VS Code
+contextual-menu result into 0.521 seconds before the socket first became
+readable and 0.790 seconds receiving/decoding the update.  Its rectangle list
+represented 3.64 MiB of raw pixels.  This runtime-confirms that the remaining
+tail is not one undifferentiated input delay: both frame availability and RFB
+delivery contribute.
+
+The original 180-ms transition observation was also ordered incorrectly for
+the now-serialized secondary click.  Right release occurs at 120 ms and
+incremented the transition serial, cancelling the pending right-down
+observation before it ran.  Moving that observation to 80 ms lets it execute
+while NSMenu's nested tracker owns the gesture.  Current logs show
+`POINTER-SETTLED-CAPTURE` before `RIGHT-UP-SERIALIZE` for the same click.
+
+Five raw VS Code open/close repetitions retained five visibly complete editor
+tab contextual menus.  Open latency was 0.580–1.293 seconds (median 0.781);
+median time to first readable byte was 0.455 seconds and median receive time
+was 0.258 seconds.  Thus the ordering invariant is fixed, while wireless/raw
+delivery still has a substantial tail.  A hextile control completed open in
+0.661 seconds and close in 0.613 seconds, but one sample is not enough to make
+it the universal default.
+
+- `system-input-publish-fix-b/vscode-context-timing-raw/results.json`
+- `system-input-publish-fix-b/settle80-1/results.json`
+- `system-input-publish-fix-b/settle80-1/context-menu.png`
+- `system-input-publish-fix-b/settle80-2/results.json`
+- `system-input-publish-fix-b/settle80-3/results.json`
+- `system-input-publish-fix-b/settle80-4/results.json`
+- `system-input-publish-fix-b/settle80-5/results.json`
+- `system-input-publish-fix-b/settle80-5/context-menu.png`
+- `system-input-publish-fix-b/settle80-hextile/results.json`
+
+A candidate Unix-datagram wakeup for the historical 200-ms PF550 retry worker
+was explicitly disproved and removed.  The current WindowServer produced
+continuous `VNC-OWNED published` records, never initialized that PF550 worker's
+wake socket, and OSXvnc recorded no successful wake datagram.  Promoting that
+inactive code to a latency fix would have violated the runtime evidence.
+
+Finally, the full lifecycle A/B established that native Retina VNC still
+requires the explicitly labelled scaffold command:
+
+```sh
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist --experimental
+```
+
+Plain `start coexist` runtime-logged `share=0` and exposed an all-black
+1194x834 framebuffer.  The experimental start logged `share=1`, waited for a
+validated frame, and restored the 2388x1668 workbench.  This is an explicit
+remaining productization issue, not something hidden by the input fix.
