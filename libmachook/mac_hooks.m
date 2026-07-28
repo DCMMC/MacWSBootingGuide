@@ -9053,7 +9053,8 @@ static void macws_subtype1_semantic_field_diagnostic(
     }
 }
 
-// TEMPORARY ABI-TRANSLATION EXPERIMENT for the wrapped single-segment form.
+// Validated ABI translation for the wrapped single-segment form.  It remains
+// behind the explicit /tmp/macws_kcmd_wrapped_fix experimental-mode gate.
 //
 // Project LLDB stopped at the first non-InnocentVictim IOGPU completion on
 // 2026-07-26, before IOGPUMetalCommandBuffer released its storage.  The raw
@@ -9072,13 +9073,11 @@ static void macws_subtype1_semantic_field_diagnostic(
 // 486bd31db1f26b541bd40fb2b4b8eba4f33178ac8bb750ebf569646a2ec7fe87
 // and 17c887655f3d4c649203f4a23a2182de7f45f716c8409a99ba481dca01887597.
 // The old normalizer required the vendor record at KCMD offset zero and a
-// top-level 0x130-byte list, so it skipped this command completely.  Preserve
-// both wrappers and normalize only the already-validated macOS subtype-1
-// record at +0x10, then update its exact inner range.  This has its own
-// /tmp/macws_kcmd_wrapped_fix experiment gate: the first A/B removed raw
-// parser error 0x102, but also made the PF550 SwapCancel loop advance at about
-// 55% CPU and the only decoded full frame was a solid error color.  Therefore
-// it must not silently become part of the broader /tmp/macws_kcmd_fix mode.
+// top-level 0x130-byte list, so it skipped this command completely.  The first
+// A/B normalized the nested record while retaining both wrappers: that
+// removed parser error 0x102 but exposed a repeatable ProtectionViolation.
+// The 2026-07-29 native-layout A/B below identified the retained macOS wrapper
+// as the remaining mismatch and supplied output/completion/input witnesses.
 static unsigned macws_translate_agx_wrapped_single_subtype1(
     unsigned sequence, unsigned char *commands, size_t *total_io,
     unsigned char *segment_list, size_t segment_length) {
@@ -9125,8 +9124,10 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
         return 0;
 
     // Delete the same two macOS-only windows proven for the unwrapped form.
-    // Move the complete storage tail so the segment's opaque 0x40-byte trailer
-    // is preserved.  Work from the higher original offset downward.
+    // First move the complete storage tail so no bytes are lost while the two
+    // windows overlap; the wrapper-specific 0x18-byte suffix is removed only
+    // by the independently validated flattening step below.  Work from the
+    // higher original offset downward.
     memmove(record + 0x4c0, record + 0x4d0,
             total - (0x10 + 0x4d0));
     total -= 0x10;
@@ -9139,7 +9140,30 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
     *(uint32_t *)(record + 0x28) = 0x7f8;
     *(uint32_t *)(record + 0x2c) = 0x7c8;
     macws_subtype1_semantic_field_diagnostic(sequence, 0, record);
-    *(uint32_t *)(segment_list + 0x34) = (uint32_t)total;
+
+    // The exact iOS-native PF550 control captured with the project LLDB on
+    // 2026-07-29 is a direct subtype-1 KCMD of 0x820 bytes and a direct
+    // 0x130-byte segment list
+    // (SHA-256 b0e11e0d0177749a... / ffb991a1c94f9b4e...).  The failing
+    // WindowServer submit has the same normalized record end (0x7f8), but
+    // carries a 0x10 type-9 leading wrapper, a 0x18 larger record trailer,
+    // and the matching 0x18 segment-list wrapper.  Runtime-confirmed A/B on
+    // the actual arm64 WindowServer: retaining the wrappers produced 68
+    // ProtectionViolation observations in the first bounded sample;
+    // flattening exactly these three framing differences produced zero, then
+    // delivered 4,200/4,200 clean PF80 VNC-copy completions, a full Retina
+    // Terminal frame, and 16/16 visibly acknowledged keyboard events.  This
+    // is protocol translation to the observed iOS-native layout, not an error
+    // or completion bypass.
+    memmove(commands, record, 0x820);
+    memset(commands + 0x820, 0, total - 0x820);
+    *(uint32_t *)(commands + 0x04) = 0x820;
+
+    memmove(segment_list, segment_list + 0x18, 0x130);
+    memset(segment_list + 0x130, 0, 0x18);
+    *(uint32_t *)(segment_list + 0x18) = 0;
+    *(uint32_t *)(segment_list + 0x1c) = 0x820;
+    total = 0x820;
     *total_io = total;
 
     // CA_VSYNC_OFF can submit this command continuously while a consumer is
@@ -9151,8 +9175,9 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
         fprintf(stderr,
             "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-WRAPPED-FIX match=%u "
             "type9=0x10 subtype1@0x10 span=0x858->0x838 "
-            "range=0x10..0x868->0x848 storage=0x868->0x848\n",
-            sequence, observed);
+            "range=0x10..0x868->0x848 storage=0x868->0x848 "
+            "flatten=iOS-direct final=0x%zx\n",
+            sequence, observed, total);
     }
     return 1;
 }
@@ -9203,6 +9228,7 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
         return 0;
     unsigned char *wrapper_list = segment_list + encoded_length;
     uint32_t wrapper_opcode = *(uint32_t *)(commands + 0x848);
+    uint32_t list_generation = *(uint32_t *)(segment_list + 0x04);
     unsigned wrapper_count = (unsigned)((total - 0x840) / 0x18);
     int wrapper_records_ok = wrapper_count >= 1 && wrapper_count <= 2;
     for (unsigned i = 0; wrapper_records_ok && i < wrapper_count; i++) {
@@ -9217,7 +9243,18 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
         *(uint32_t *)(segment_list + 0x18) == 0 &&
         *(uint32_t *)(segment_list + 0x1c) == 0x840 &&
         *(uint32_t *)(wrapper_list + 0x00) == list_magic &&
-        *(uint32_t *)(wrapper_list + 0x04) == 2 &&
+        // Runtime-confirmed 2026-07-29 from the exact first failing VS Code
+        // submit after a clean restart (KCMD SHA-256 bf14ff937dcf789a...;
+        // segment SHA-256 c4ba7fbea0b64f21...).  This dword is not a fixed
+        // wrapper type: both the outer list and its trailing record changed
+        // together from 2 in every earlier capture to 3 in this capture.
+        // The remaining framing stayed identical and the actual blob was
+        // 0x148 bytes while list+0x0c remained the base-list offset 0x130.
+        // Validate the observed generation relationship rather than forcing
+        // the historical value.  Keep the known 2/3 bound so an unrelated
+        // list layout cannot enter this temporary translator.
+        (list_generation == 2 || list_generation == 3) &&
+        *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
         *(uint32_t *)(wrapper_list + 0x08) == 1 &&
         *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
         *(uint32_t *)(wrapper_list + 0x10) == 0x840 &&
@@ -9386,9 +9423,11 @@ static unsigned macws_translate_agx_multisegment_subtype1(
         }
         unsigned char *wrapper_list = segment_list + encoded_length;
         uint32_t list_magic = *(uint32_t *)(segment_list + 0x00);
+        uint32_t list_generation = *(uint32_t *)(segment_list + 0x04);
         BOOL wrapper_list_ok =
             *(uint32_t *)(wrapper_list + 0x00) == list_magic &&
-            *(uint32_t *)(wrapper_list + 0x04) == 2 &&
+            (list_generation == 2 || list_generation == 3) &&
+            *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
             *(uint32_t *)(wrapper_list + 0x08) == 1 &&
             *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
             *(uint32_t *)(wrapper_list + 0x10) == cursor &&

@@ -1794,3 +1794,28 @@ the M1 target for this microbenchmark; the large remaining user-visible gap is
 in Chromium/WindowServer visible-frame and in-flight presentation scheduling.
 Exact inputs, distributions and bounded-test limitations are recorded in
 [`presentation-scheduler-split-20260729.txt`](evidence/webgl2-performance-optimization-20260728/presentation-scheduler-split-20260729.txt).
+
+## 2026-07-29: generation-3 Chromium and native-layout WindowServer wrapper
+
+The first failing latest-VS-Code submit proved that its trailing segment-list
+wrapper generation is not fixed at 2: both the outer and trailing records were
+3 while all other framing remained unchanged.  Replacing the literal check
+with a bounded 2/3 equality invariant restored a controlled 1,539/1,539-query
+WebGL2 run at 191,456.011 draws/s with zero command errors.
+
+WindowServer had a separate leading-wrapper failure.  The project LLDB saved
+an iOS-native PF550 command as direct 0x820-byte subtype-1 plus a direct
+0x130-byte segment list.  WindowServer's failing normalized command retained a
+0x10 type-9 wrapper, a wrapper-specific 0x18 suffix, and a matching 0x18 list
+wrapper, then returned real IOGPU ProtectionViolation completions.  Translating
+that exact validated form to the captured iOS layout produced zero protection
+errors, 6,600 clean VNC-copy completions, a full 2388x1668 Terminal frame, and
+visible acknowledgement of all 16 VNC keyboard events.
+
+This is also the strongest current thermal attribution.  The error loop drove
+roughly 75-88% WindowServer CPU; after removing it, CPU declined to 43.4% by
+bounded cleanup and battery temperature was 29.59 C.  Remaining compositor
+cost is still material.  Screen lock remains an unmeasured confounder, but it
+cannot explain the whole rAF gap because the earlier unlocked,
+Thermal-Nominal control still had a 49.3-ms median.  Full evidence is in
+[`windowserver-wrapper-generation3-20260729.txt`](evidence/webgl2-performance-optimization-20260728/windowserver-wrapper-generation3-20260729.txt).

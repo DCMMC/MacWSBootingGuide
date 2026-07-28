@@ -40,6 +40,7 @@ CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
 LOGDIR=/var/jb/var/mobile
+TEST_LEASE="$LOGDIR/macws_test_lease"
 
 GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned at boot
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
@@ -108,6 +109,34 @@ if [ -f "$LOGDIR/macws_trace_gui_invocations" ]; then
         printf '\n'
     } >> "$LOGDIR/macos_gui_invocations.log" 2>&1
 fi
+
+# A controlled performance run can hold an explicit lease so a stale SSH
+# script cannot silently tear down its WindowServer and replace the pacing or
+# client set mid-sample.  Runtime-confirmed 2026-07-29: an unrelated deferred
+# `ssh ... bash -s` invoked `start coexist --no-terminal --no-watchdog` during
+# a VS Code cold-start regression; the invocation audit captured the exact
+# command and parent after it replaced the measured WindowServer PID.  Normal
+# interactive use is unchanged because the lease file is absent.  Test owners
+# create the file and pass the same token through sudo:
+#
+#   sudo env MACWS_TEST_LEASE_TOKEN=<token> bash macos_gui.sh start ...
+#
+# `status` remains read-only and is always allowed.
+case "${1:-}" in
+    start|restart|stop)
+        if [ -f "$TEST_LEASE" ]; then
+            expected_lease=$(awk 'NR == 1 { print; exit }' "$TEST_LEASE" 2>/dev/null)
+            provided_lease="${MACWS_TEST_LEASE_TOKEN:-}"
+            if [ -z "$expected_lease" ] || [ "$provided_lease" != "$expected_lease" ]; then
+                log_line="REFUSED: active test lease blocks '$1' (pid=$$ ppid=$PPID)"
+                echo "[macos_gui] $log_line" >&2
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $log_line" \
+                    >> "$LOGDIR/macos_gui_invocations.log" 2>&1
+                exit 75
+            fi
+        fi
+        ;;
+esac
 
 # ─── Watchdog (crash-loop safety net) ───────────────────────────────────────
 # WindowServer composites window content through the MTLSim Metal bridge, whose

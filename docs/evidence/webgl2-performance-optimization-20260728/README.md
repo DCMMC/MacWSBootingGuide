@@ -158,3 +158,29 @@ and kill only the Visual Studio Code/Code Helper executable paths.  A deployed
 test ended with no VS Code, WindowServer, or VNC job/process and removed both
 the wrapped-KCMD and command-error sentinels; the verbatim result is in
 `vscode-lifecycle-cleanup-proof.txt`.
+
+## VS Code generation 3 and WindowServer leading-wrapper fix (2026-07-29)
+
+A clean VS Code cold start exposed a third trailing-wrapper generation.  The
+old translator incorrectly required the literal generation 2 even though the
+outer and trailing records advanced together to 3.  Validating equality over
+the observed 2/3 range restored the latest VS Code run: 1,539/1,539 WebGL2 GPU
+queries completed at 191,456.011 draws/s with zero command errors.
+
+The same run separated a WindowServer-only problem.  Its nested subtype-1
+record was normalized, but the macOS type-9/list wrappers were retained and
+produced repeatable IOGPU ProtectionViolation errors.  The project LLDB
+captured the equivalent iOS-native PF550 command as a direct 0x820-byte KCMD
+plus direct 0x130-byte list.  Translating the exact wrapped form to that native
+layout changed a bounded A/B from 68 early protection observations to zero,
+then delivered 6,600/6,600 clean VNC-copy completions, a full Retina Terminal
+frame, and 16/16 visible keyboard acknowledgements.
+
+This also narrows the heat report: the erroring WindowServer consumed roughly
+75-88% of one CPU, so it was a heat source, not evidence that heat caused the
+protocol error.  WindowServer still used 43.4% at the end of the clean bounded
+run; presentation/compositor CPU work remains.  The prior unlocked,
+Thermal-Nominal rAF result still had a 49.3-ms median, so screen lock cannot be
+the entire performance gap.  Exact records, hashes, log excerpts, temperature,
+and the pending locked/unlocked A/B are in
+`windowserver-wrapper-generation3-20260729.txt`.
