@@ -468,6 +468,14 @@ static id macws_iogpu_command_buffer_error(id self, SEL selector) {
     }
     int expected = 0;
     if (atomic_compare_exchange_strong(dump_latch, &expected, 1)) {
+        // The command-buffer getter can synthesize an NSError even when the
+        // earlier raw IOGPU completion callback received error=nil.  Preserve
+        // the actual getter-side object, userInfo and still-readable storage
+        // before the flight recorder freezes; this is read-only evidence for
+        // distinguishing parser status 0x100 from a stale public NSError.
+        macws_iogpu_dump_object("getter-error", error);
+        macws_iogpu_dump_error_user_info(error);
+        macws_iogpu_dump_command_storage(self, "getter-error");
         macws_dump_fast_agx_submit_serial(
             reason, (__bridge const void *)self, fast_submit_serial);
         if (submit_serial) {
@@ -557,13 +565,11 @@ static void macws_log_command_buffer_ivars(id commandBuffer) {
 // empty registry there.
 static NSObject *g_macws_owned_scanout_lock = nil;
 static NSMutableDictionary *g_macws_owned_scanout_cache = nil;
-static NSMutableSet *g_macws_owned_scanout_surfaces = nil;
-static BOOL macws_is_owned_scanout_surface(IOSurfaceRef surface) {
-    if (!surface || !g_macws_owned_scanout_lock) return NO;
-    @synchronized(g_macws_owned_scanout_lock) {
-        return [g_macws_owned_scanout_surfaces containsObject:
-            [NSValue valueWithPointer:(void *)surface]];
-    }
+static NSMutableArray *g_macws_owned_scanout_lru = nil;
+static char g_macws_owned_texture_association_key;
+static BOOL macws_is_owned_scanout_texture(id<MTLTexture> texture) {
+    return texture && objc_getAssociatedObject(
+        texture, &g_macws_owned_texture_association_key) != nil;
 }
 static IOSurfaceRef g_vncSurf = NULL;
 static int macws_vnc_share_enabled(void) {
@@ -826,7 +832,7 @@ static BOOL macws_vnc_content_ready(size_t sampled, size_t different,
 // cross-queue lifetime bug this path is designed to remove.
 static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     IOSurfaceRef surface = macws_vnc_bound_surface(texture);
-    if (!surface || !macws_is_owned_scanout_surface(surface)) return NO;
+    if (!surface || !macws_is_owned_scanout_texture(texture)) return NO;
     size_t width = [texture width], height = [texture height];
 
     // Two narrow A/B probes isolate the first-frame-only failure without
@@ -952,8 +958,7 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
     // macws_vnc_finish_update. Runtime A/B showed that feeding one into this
     // legacy second-queue blit made the following WindowServer submissions
     // fail with MTLCommandBuffer status=Error/code=1.
-    IOSurfaceRef candidateSurface = macws_vnc_bound_surface(dest);
-    if (macws_is_owned_scanout_surface(candidateSurface)) return;
+    if (macws_is_owned_scanout_texture(dest)) return;
 
     // StartComposite is used for both the display destination and intermediate
     // per-window composites.  Runtime evidence on iPad13,6 showed the correct
@@ -4188,14 +4193,18 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
     dispatch_once(&once, ^{
         g_macws_owned_scanout_lock = [NSObject new];
         g_macws_owned_scanout_cache = [NSMutableDictionary new];
-        g_macws_owned_scanout_surfaces = [NSMutableSet new];
+        g_macws_owned_scanout_lru = [NSMutableArray new];
     });
     uint32_t originalID = IOSurfaceGetID(original);
     NSNumber *key = [NSNumber numberWithUnsignedInt:originalID];
     @synchronized(g_macws_owned_scanout_lock) {
         IOSurfaceRef existing = (IOSurfaceRef)
             [g_macws_owned_scanout_cache[key] pointerValue];
-        if (existing) return existing;
+        if (existing) {
+            [g_macws_owned_scanout_lru removeObject:key];
+            [g_macws_owned_scanout_lru addObject:key];
+            return existing;
+        }
 
         NSDictionary *properties = @{
             @"IOSurfaceWidth": @(width),
@@ -4220,16 +4229,53 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
                 (void *)original, width, height, format);
             return NULL;
         }
+
         NSValue *ownedValue = [NSValue valueWithPointer:(void *)owned];
         g_macws_owned_scanout_cache[key] = ownedValue;
-        [g_macws_owned_scanout_surfaces addObject:ownedValue];
+        [g_macws_owned_scanout_lru addObject:key];
+        // The initial IOMFB page ring on this exact device contains eight
+        // display surfaces. Long menu/VS Code sessions previously grew this
+        // dictionary without bound (runtime: 8 -> 27, ~16 MiB each). The real
+        // AGX texture retains its IOSurface (runtime CF retain witness 1->2),
+        // so dropping only our cache retain cannot invalidate an in-flight
+        // texture. Texture association, rather than a raw-pointer set, marks
+        // outstanding old textures as owned until they deallocate naturally.
+        enum { MacWSOwnedScanoutCacheLimit = 8 };
+        while ([g_macws_owned_scanout_lru count] >
+               MacWSOwnedScanoutCacheLimit) {
+            NSNumber *evictedKey = [[g_macws_owned_scanout_lru
+                objectAtIndex:0] retain];
+            NSValue *evictedValue = [g_macws_owned_scanout_cache
+                objectForKey:evictedKey];
+            IOSurfaceRef evictedSurface = (IOSurfaceRef)
+                [evictedValue pointerValue];
+            [g_macws_owned_scanout_lru removeObjectAtIndex:0];
+            [g_macws_owned_scanout_cache removeObjectForKey:evictedKey];
+            static _Atomic uint64_t evictions = 0;
+            uint64_t eviction = atomic_fetch_add(&evictions, 1) + 1;
+            if (eviction <= 24 || (eviction % 600) == 0) {
+                fprintf(stderr,
+                    "#### VNC-OWNED evict #%llu originalID=%u "
+                    "surface=%p id=%u retain-before=%ld cache=%lu\n",
+                    (unsigned long long)eviction,
+                    [evictedKey unsignedIntValue], (void *)evictedSurface,
+                    evictedSurface ? (unsigned)IOSurfaceGetID(evictedSurface)
+                                   : 0,
+                    evictedSurface
+                        ? (long)CFGetRetainCount(evictedSurface) : 0L,
+                    (unsigned long)[g_macws_owned_scanout_cache count]);
+            }
+            if (evictedSurface) CFRelease(evictedSurface);
+            [evictedKey release];
+        }
         fprintf(stderr,
             "#### VNC-OWNED allocated original=%p id=%u -> owned=%p "
-            "id=%u %zux%zu bpr=%zu alloc=%zu cache=%lu\n",
+            "id=%u %zux%zu bpr=%zu alloc=%zu cache=%lu retain=%ld\n",
             (void *)original, (unsigned)originalID,
             (void *)owned, (unsigned)IOSurfaceGetID(owned), width, height,
             IOSurfaceGetBytesPerRow(owned), IOSurfaceGetAllocSize(owned),
-            (unsigned long)[g_macws_owned_scanout_cache count]);
+            (unsigned long)[g_macws_owned_scanout_cache count],
+            (long)CFGetRetainCount(owned));
         return owned;
     }
 }
@@ -4470,8 +4516,15 @@ static void macws_sigabrt_trampoline(int sig) {
             desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
             macws_set_current_iosurface_id(IOSurfaceGetID(owned));
             macws_set_current_iosurface_compression_header_span(0);
+            CFIndex retainBeforeTexture = CFGetRetainCount(owned);
             result = [self hooked_newTextureWithDescriptor:desc
                                                   iosurface:owned plane:0];
+            CFIndex retainAfterTexture = CFGetRetainCount(owned);
+            if (result) {
+                objc_setAssociatedObject(
+                    result, &g_macws_owned_texture_association_key,
+                    @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
             macws_set_current_iosurface_id(originalCurrentID);
             macws_set_current_iosurface_compression_header_span(
                 originalCompressionSpan);
@@ -4481,11 +4534,12 @@ static void macws_sigabrt_trampoline(int sig) {
             if (wrapped <= 24 || (wrapped % 600) == 0 || !result) {
                 fprintf(stderr,
                     "#### VNC-OWNED wrap #%llu original=%p id=%u "
-                    "owned=%p id=%u texture=%p result=%s\n",
+                    "owned=%p id=%u texture=%p result=%s retain=%ld->%ld\n",
                     (unsigned long long)wrapped, (void *)iosurface,
                     (unsigned)IOSurfaceGetID(iosurface), (void *)owned,
                     (unsigned)IOSurfaceGetID(owned), (void *)result,
-                    result ? "OK" : "NIL");
+                    result ? "OK" : "NIL", (long)retainBeforeTexture,
+                    (long)retainAfterTexture);
             }
         } else {
             result = [self hooked_newTextureWithDescriptor:desc
@@ -4747,25 +4801,36 @@ static void macws_sigabrt_trampoline(int sig) {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
     }
-    // 2026-06-20 — Block the plain newTextureWithDescriptor path from
-    // entering AGX kernel. -[AGXTexture init...] has a cascade of
-    // missing selectors (validateWithDevice:, isMemoryless,
-    // protectionOptions, getCPUSizeBytes, getAlignment, descriptorPrivate,
-    // getBytesPerRow, finalizeTextureCreation, updateBindData...,
-    // allocBufferSubData..., initNewTextureData:) that chroot's loaded
-    // class hierarchy doesn't fully implement. Even with 22 stubs added
-    // via class_addMethod the cascade still cascades because some
-    // receivers are internal subclasses. Plus the synth-buffer-as-texture
-    // pattern triggers iOS kernel panics. Returning nil here is SAFER —
-    // SkyLight's PrepareForUse tolerate-nil + WSCompositeDestination
-    // CreateWithMetalTexture nil-tolerate hooks handle the nil cascade
-    // gracefully; that composite layer is skipped instead of crashing WS.
-    // The iosurface variant (hooked_newTextureWithDescriptor:iosurface:plane:)
-    // still works because the descriptor + IOSurface together fully define
-    // the texture and AGXTexture init's checks pass for that path.
-    // Env opt-out via MACWS_AGX_KEEP_PLAIN_NEWTEX=1 for A/B testing.
-    if (getenv("MACWS_AGX_NATIVE") &&
-        !getenv("MACWS_AGX_KEEP_PLAIN_NEWTEX")) {
+    // The native AGX allocator is the WindowServer production path for
+    // ordinary textures.
+    // A historical compatibility path below pooled one IOSurface *and one
+    // MTLTexture object* per (width,height,format), assuming equal-sized
+    // SkyLight intermediates were serial. Runtime A/B on 2026-07-29 disproved
+    // that invariant: menu/backdrop passes use equal-sized intermediates at
+    // the same time, so the shared object aliases their contents and produces
+    // stable 64-pixel tile holes. With the pool disabled, native AGX allocation
+    // booted the complete desktop, kept WindowServer near 109 MiB RSS, and
+    // rendered all menu hover/context-menu frames without the holes.
+    //
+    // Chromium/ANGLE helpers are not switched yet: runtime on the same build
+    // shows the GPU helper's 128x16 R8 texture reaches AGXTexture init but the
+    // cross-image init args are rejected, then Skia loses the GPU context as
+    // OOM. The Electron main/AppKit process does not own that ANGLE device; it
+    // does own application menu/backing windows, where the same shape-aliasing
+    // bug is visible as two blue tiles instead of a complete hover row.
+    // Therefore main GUI processes use native lifetime together with
+    // WindowServer, while Helper/Renderer/GPU subprocesses retain the
+    // compatibility allocator until their separate ABI issue is fixed. Keep
+    // MACWS_AGX_LEGACY_POOLED_PLAIN_TEXTURES as an explicit per-process A/B
+    // fallback.
+    const char *plain_texture_program = getprogname();
+    BOOL plain_texture_helper = plain_texture_program &&
+        (strstr(plain_texture_program, "Helper") != NULL ||
+         strstr(plain_texture_program, "Renderer") != NULL ||
+         strstr(plain_texture_program, "GPU") != NULL);
+    BOOL use_legacy_plain_texture_pool = plain_texture_helper ||
+        getenv("MACWS_AGX_LEGACY_POOLED_PLAIN_TEXTURES") != NULL;
+    if (getenv("MACWS_AGX_NATIVE") && use_legacy_plain_texture_pool) {
         // 2026-06-20 — Route plain newTextureWithDescriptor through the
         // iosurface variant (the known-working path). Create a chroot-
         // local IOSurface sized to the descriptor, then delegate to
@@ -4873,6 +4938,33 @@ static void macws_sigabrt_trampoline(int sig) {
         // AGXG13GFamilyDevice path (which handles the type correctly).
         NSUInteger texType = [desc respondsToSelector:@selector(textureType)]
                              ? [desc textureType] : 2 /* default 2D */;
+        // MTLTextureType2DMultisample (4) and
+        // MTLTextureType2DMultisampleArray (8) have a hard semantic link to
+        // sampleCount > 1.  Downgrading either descriptor to plain 2D while
+        // retaining sampleCount creates an invalid descriptor and aborts in
+        // -[MTLTextureDescriptorInternal validateWithDevice:].  These are
+        // render-target allocations rather than shareable display surfaces,
+        // so preserve the descriptor verbatim and let the native AGX device
+        // allocate the multisample storage.
+        if (texType == 4 /* MTLTextureType2DMultisample */ ||
+            texType == 8 /* MTLTextureType2DMultisampleArray */) {
+            static int multisample_native_log = 0;
+            if (multisample_native_log++ < 8) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MULTISAMPLE: texType=%lu sampleCount=%lu "
+                    "routing to native AGX path (descriptor preserved)\n",
+                    (unsigned long)texType,
+                    (unsigned long)([desc respondsToSelector:@selector(sampleCount)]
+                        ? [desc sampleCount] : 0));
+            }
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            if (multisample_native_log < 10) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MULTISAMPLE native result: %p class=%s\n",
+                    (void *)tex, tex ? class_getName([tex class]) : "(nil)");
+            }
+            return tex;
+        }
         if (texType != 2 /* 2D */ && texType != 3 /* 2DArray */) {
             // 2026-06-20 evening — Native path attempt for non-2D textures.
             //
@@ -6384,10 +6476,16 @@ static void macws_tile_store_target(id command_buffer, id encoder,
                                     id pass_descriptor) {
     if (!command_buffer || !encoder || !pass_descriptor) return;
     id texture = nil;
+    NSUInteger load_action = NSUIntegerMax;
+    NSUInteger store_action = NSUIntegerMax;
+    MTLClearColor clear_color = MTLClearColorMake(0, 0, 0, 0);
     @try {
         id attachments = [pass_descriptor valueForKey:@"colorAttachments"];
         id attachment = [attachments objectAtIndexedSubscript:0];
         texture = [attachment valueForKey:@"texture"];
+        load_action = (NSUInteger)[attachment loadAction];
+        store_action = (NSUInteger)[attachment storeAction];
+        clear_color = [attachment clearColor];
     } @catch (NSException *exception) {
         (void)exception;
     }
@@ -6403,6 +6501,32 @@ static void macws_tile_store_target(id command_buffer, id encoder,
     pthread_mutex_lock(&g_macws_tile_target_lock);
     g_macws_tile_targets[serial % MACWS_TILE_TARGET_CAP] = entry;
     pthread_mutex_unlock(&g_macws_tile_target_lock);
+
+    // Read-only witness for the actual persistence contract SkyLight gives
+    // the substituted full-display IOSurface.  A loadAction of DontCare would
+    // permit AGX to discard untouched tiles, while Load requires the prior
+    // pixels to survive.  Log the real descriptor instead of forcing either
+    // behavior; the latter would only hide an upstream lifecycle mismatch.
+    if (macws_is_owned_scanout_texture(texture)) {
+        static _Atomic uint64_t owned_passes = 0;
+        uint64_t owned_pass = atomic_fetch_add(&owned_passes, 1) + 1;
+        if (owned_pass <= 64 || (owned_pass % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-OWNED render-pass #%llu serial=%llu command=%p "
+                "encoder=%p target=%p %lux%lu loadAction=%lu "
+                "storeAction=%lu clear=(%.6f,%.6f,%.6f,%.6f)\n",
+                (unsigned long long)owned_pass,
+                (unsigned long long)serial,
+                (__bridge void *)command_buffer,
+                (__bridge void *)encoder, (__bridge void *)texture,
+                (unsigned long)[texture width],
+                (unsigned long)[texture height],
+                (unsigned long)load_action,
+                (unsigned long)store_action,
+                clear_color.red, clear_color.green, clear_color.blue,
+                clear_color.alpha);
+        }
+    }
 }
 
 // Join the render-target metadata captured at encoder creation to the exact
@@ -6577,12 +6701,25 @@ static void macws_native_set_tile_textures_diag(id self, SEL selector,
 static void macws_install_tile_descriptor_diagnostic(void) {
     if (access("/private/tmp/macws_tile_descriptor_diag", F_OK) != 0) return;
     Class command_buffer = objc_getClass("AGXG13GFamilyCommandBuffer");
-    Class render_context = objc_getClass("AGXG13GFamilyRenderContext");
     SEL render_selector = sel_registerName("renderCommandEncoderWithDescriptor:");
-    SEL texture_selector = sel_registerName("setTileTexture:atIndex:");
-    SEL textures_selector = sel_registerName("setTileTextures:withRange:");
     Method render_method = command_buffer
         ? class_getInstanceMethod(command_buffer, render_selector) : NULL;
+    if (render_method && !g_macws_native_render_encoder_orig) {
+        g_macws_native_render_encoder_orig =
+            (macws_native_render_encoder_fn)
+                method_getImplementation(render_method);
+        method_setImplementation(render_method,
+                                 (IMP)macws_native_render_encoder_diag);
+        fprintf(stderr,
+            "#### TILE-DESC render descriptor hook installed class=%s "
+            "original=%p\n",
+            class_getName(command_buffer),
+            (void *)g_macws_native_render_encoder_orig);
+    }
+
+    Class render_context = objc_getClass("AGXG13GFamilyRenderContext");
+    SEL texture_selector = sel_registerName("setTileTexture:atIndex:");
+    SEL textures_selector = sel_registerName("setTileTextures:withRange:");
     Method texture_method = render_context
         ? class_getInstanceMethod(render_context, texture_selector) : NULL;
     Method textures_method = render_context
@@ -6593,12 +6730,6 @@ static void macws_install_tile_descriptor_diagnostic(void) {
         "isCompressible:shouldInitMetadata:");
     Method update_bind_method = texture_class
         ? class_getInstanceMethod(texture_class, update_bind_selector) : NULL;
-    if (render_method) {
-        g_macws_native_render_encoder_orig =
-            (macws_native_render_encoder_fn)method_getImplementation(render_method);
-        method_setImplementation(render_method,
-                                 (IMP)macws_native_render_encoder_diag);
-    }
     if (texture_method) {
         g_macws_native_set_tile_texture_orig =
             (macws_native_set_tile_texture_fn)method_getImplementation(texture_method);
@@ -6842,44 +6973,45 @@ static void install_agx_init_redirect(Class agx) {
     BOOL ok = class_addMethod(agx, sel, (IMP)agx_initWithAcceleratorPort_impl, "@@:i");
     fprintf(stderr, "#### MACWS_AGX_NATIVE class_addMethod(AGXG13GFamilyDevice, initWithAcceleratorPort:) = %d\n", (int)ok);
 
-    // 2026-06-20 — supportsMemorylessRenderTargets: make our AGXG13GFamilyDevice
-    // return YES so CA::OGL::MetalContext init sets bit 3 of [self+0xcb0] (the
-    // memoryless-supported flag).  When that bit is set, CA::OGL::MetalContext::
-    // add_memoryless_textures (QuartzCore 0x1897c0a28) passes a descriptor with
-    // storageMode=MTLStorageModeMemoryless(3) instead of downgrading to Private(2)
-    // up-front.  Then our hooked_newTextureWithDescriptor: detects storageMode==3
-    // and routes via the native AGXG13GFamilyDevice path (no IOSurface alloc).
-    //
-    // The M1/A14+ hardware natively supports memoryless render targets; the
-    // chroot's AGXG13GFamilyDevice may already implement this method
-    // correctly, but if it returns NO (because some chroot-only fragile init
-    // path failed), CA downgrades and we waste 31 MB per "memoryless" call.
-    //
-    // class_addMethod only adds when the class doesn't already implement.
-    // If AGXG13GFamilyDevice already has supportsMemorylessRenderTargets,
-    // class_addMethod fails and we trust the native value (which on iOS
-    // hardware should be YES).  No swizzle / forced override — we let
-    // the native impl run if present; only install our YES-stub as a
-    // fallback for missing-selector case.
-    {
+    // Preserve the driver's real memoryless capability result. The previous
+    // implementation replaced every AGX implementation with `return YES`,
+    // even though its own comment claimed it only supplied a missing method.
+    // That is a protocol-check bypass: QuartzCore uses this result to choose
+    // its tile/backdrop resource topology. Wrap only methods implemented by
+    // the class itself, call their original IMP unchanged, and log the result
+    // needed to correlate menu/blur rendering. Do not add a missing method.
+    static dispatch_once_t smrtOnce;
+    dispatch_once(&smrtOnce, ^{
         SEL smrt_sel = sel_registerName("supportsMemorylessRenderTargets");
-        IMP smrtYes = imp_implementationWithBlock(^BOOL(id s) {
-            static int smrt_call_log = 0;
-            if (smrt_call_log++ < 6) {
-                fprintf(stderr,
-                    "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets CALLED on instance=%p class=%s -> YES\n",
-                    (void *)s, s ? class_getName([s class]) : "(nil)");
+        typedef BOOL (*smrt_fn)(id, SEL);
+        __block CFMutableDictionaryRef origMap =
+            CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+        IMP witness = imp_implementationWithBlock(^BOOL(id instance) {
+            smrt_fn original = NULL;
+            for (Class c = object_getClass(instance); c && !original;
+                 c = class_getSuperclass(c)) {
+                original = (smrt_fn)CFDictionaryGetValue(
+                    origMap, (__bridge const void *)c);
             }
-            return YES;
+            BOOL supported = original
+                ? original(instance, smrt_sel) : NO;
+            static _Atomic uint32_t callCount = 0;
+            uint32_t call = atomic_fetch_add(&callCount, 1) + 1;
+            if (call <= 16 || (call % 600) == 0) {
+                fprintf(stderr,
+                    "#### MACWS_AGX_NATIVE memoryless witness #%u "
+                    "instance=%p class=%s original=%p -> %s\n",
+                    call, (void *)instance,
+                    instance ? class_getName([instance class]) : "(nil)",
+                    (void *)original, supported ? "YES" : "NO");
+            }
+            return supported;
         });
-        // Apply to AGXG13GFamilyDevice AND any subclasses (chroot may have
-        // AGXG13GMobileFamilyDevice etc. that override supportsMemoryless to NO).
         unsigned int n = 0;
         Class *all = objc_copyClassList(&n);
-        int applied = 0;
+        int wrapped = 0;
         for (unsigned int i = 0; i < n; i++) {
             Class c = all[i];
-            // walk superclasses; if any ancestor == agx, this is a subclass (or itself)
             Class p = c;
             BOOL match = NO;
             while (p) {
@@ -6887,26 +7019,33 @@ static void install_agx_init_redirect(Class agx) {
                 p = class_getSuperclass(p);
             }
             if (!match) continue;
-            Method m = class_getInstanceMethod(c, smrt_sel);
-            if (m) {
-                method_setImplementation(m, smrtYes);
-                applied++;
-                fprintf(stderr,
-                    "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets: overrode on %s\n",
-                    class_getName(c));
-            } else {
-                BOOL added = class_addMethod(c, smrt_sel, smrtYes, "c@:");
-                if (added) applied++;
-                fprintf(stderr,
-                    "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets: added on %s = %d\n",
-                    class_getName(c), (int)added);
+            unsigned int methodCount = 0;
+            Method *methods = class_copyMethodList(c, &methodCount);
+            Method ownMethod = NULL;
+            for (unsigned int methodIndex = 0;
+                 methodIndex < methodCount; methodIndex++) {
+                if (method_getName(methods[methodIndex]) == smrt_sel) {
+                    ownMethod = methods[methodIndex];
+                    break;
+                }
             }
+            free(methods);
+            if (!ownMethod) continue;
+            IMP original = method_getImplementation(ownMethod);
+            CFDictionarySetValue(origMap, (__bridge const void *)c,
+                                 (const void *)original);
+            method_setImplementation(ownMethod, witness);
+            wrapped++;
+            fprintf(stderr,
+                "#### MACWS_AGX_NATIVE memoryless witness installed "
+                "class=%s original=%p\n",
+                class_getName(c), (void *)original);
         }
         free(all);
         fprintf(stderr,
-            "#### MACWS_AGX_NATIVE supportsMemorylessRenderTargets: total class overrides=%d\n",
-            applied);
-    }
+            "#### MACWS_AGX_NATIVE memoryless witness total=%d "
+            "(original results preserved)\n", wrapped);
+    });
 
     // 2026-06-20 — Tile pipeline diagnostic for MACWS_AGX_NATIVE blur path.
     //

@@ -1,0 +1,30 @@
+#### OSXVNC NATIVE-ALL event=11 buttons=0x4 rfb=(1000.0,700.0) quartz=(500.0,350.0) scale=2
+#### OSXVNC NATIVE-ALL event=12 buttons=0 rfb=(1000.0,700.0) quartz=(500.0,350.0) scale=2
+#### OSXVNC KEY-FINAL-CAPTURE serial=2 detail=0xff1b generation=1785274296178513000
+#### OSXVNC KEY-SETTLED-CAPTURE serial=2 detail=0xff1b generation=1785274296961413000
+#### OSXVNC KEY-HANDLER event=5 down=1 sym=0xff1b at=311767.316302 elapsed=0.412ms
+#### OSXVNC KEY-HANDLER event=6 down=0 sym=0xff1b at=311767.316832 elapsed=0.230ms
+#### OSXVNC KEY-PROGRESS-CAPTURE serial=3 detail=0xff1b generation=1785274297786769000
+#### OSXVNC NATIVE-ALL event=13 buttons=0x1 rfb=(1000.0,185.0) quartz=(500.0,92.5) scale=2
+#### OSXVNC NATIVE-ALL event=14 buttons=0x1 rfb=(1021.0,193.0) quartz=(510.5,96.5) scale=2
+#### OSXVNC NATIVE-ALL event=15 buttons=0x1 rfb=(1042.0,202.0) quartz=(521.0,101.0) scale=2
+#### OSXVNC NATIVE-ALL event=16 buttons=0x1 rfb=(1062.0,210.0) quartz=(531.0,105.0) scale=2
+#### OSXVNC NATIVE-ALL event=17 buttons=0x1 rfb=(1083.0,218.0) quartz=(541.5,109.0) scale=2
+#### OSXVNC KEY-FINAL-CAPTURE serial=3 detail=0xff1b generation=1785274298031385000
+#### OSXVNC NATIVE-ALL event=18 buttons=0x1 rfb=(1104.0,227.0) quartz=(552.0,113.5) scale=2
+#### OSXVNC NATIVE-ALL event=19 buttons=0x1 rfb=(1125.0,235.0) quartz=(562.5,117.5) scale=2
+#### OSXVNC NATIVE-ALL event=20 buttons=0x1 rfb=(1146.0,243.0) quartz=(573.0,121.5) scale=2
+#### OSXVNC NATIVE-ALL event=21 buttons=0x1 rfb=(1167.0,252.0) quartz=(583.5,126.0) scale=2
+#### OSXVNC NATIVE-ALL event=22 buttons=0x1 rfb=(1188.0,260.0) quartz=(594.0,130.0) scale=2
+#### OSXVNC NATIVE-ALL event=23 buttons=0x1 rfb=(1208.0,268.0) quartz=(604.0,134.0) scale=2
+#### OSXVNC NATIVE-ALL event=24 buttons=0x1 rfb=(1229.0,277.0) quartz=(614.5,138.5) scale=2
+#### OSXVNC NATIVE-ALL event=25 buttons=0x1 rfb=(1250.0,285.0) quartz=(625.0,142.5) scale=2
+#### OSXVNC NATIVE-ALL event=26 buttons=0 rfb=(1250.0,285.0) quartz=(625.0,142.5) scale=2
+#### OSXVNC KEY-SETTLED-CAPTURE serial=3 detail=0xff1b generation=1785274298777353000
+2026-07-28 14:31:39.607 OSXvnc-server[44897:9168419] Client 192.168.1.14 disconnected
+2026-07-28 14:31:39.607 OSXvnc-server[44897:9168419] Statistics:
+2026-07-28 14:31:39.607 OSXvnc-server[44897:9168419]   key events received 6, pointer events 26
+2026-07-28 14:31:39.607 OSXvnc-server[44897:9168419]   framebuffer updates 14, rectangles 140, bytes 37413840
+2026-07-28 14:31:39.607 OSXvnc-server[44897:9168419]     Raw rectangles 140, bytes 37413840
+2026-07-28 14:31:39.607 OSXvnc-server[44897:9168419]   raw bytes equivalent 37413840, compression ratio 1.000000
+2026-07-28 14:31:39.614 OSXvnc-server[44897:9167656] UnRegistering screen update notification - waiting for clients

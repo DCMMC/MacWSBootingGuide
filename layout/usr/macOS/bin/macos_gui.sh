@@ -45,9 +45,11 @@ TEST_LEASE="$LOGDIR/macws_test_lease"
 GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned at boot
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
+PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 VNC_LABEL=com.macwsguide.osxvnc
 TERM_LABEL=com.macwsguide.terminal
+PBOARD_LABEL=com.macwsguide.pboard
 INPUT_LABEL=com.macwsguide.input
 VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
 VSCODE_LABEL=com.macwsguide.vscode
@@ -76,6 +78,7 @@ STARTED_WS_PID=""
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
+PBOARD_BIN=/usr/libexec/pboard
 VNC_DESKTOP=macOS-iPad
 
 SPRINGBOARD=/System/Library/LaunchDaemons/com.apple.SpringBoard.plist
@@ -87,6 +90,7 @@ P_WINDOWSERVER='SkyLight.framework/Resources/WindowServer'
 P_LAUNCHSERVICESD='CoreServices/launchservicesd'
 P_OSXVNC='OSXvnc-server'
 P_TERMINAL='Utilities/Terminal.app/Contents/MacOS/Terminal'
+P_PBOARD='/usr/libexec/pboard'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
@@ -160,9 +164,15 @@ WD_LOAD_GRACE=90      # inherited 1-min load average is stale after userspace re
                       # restart-storm protection remains active during this grace period
 WD_WS_CPU_LIMIT=70    # sustained one-core WindowServer use is the thermal failure signal
 WD_WS_CPU_STRIKES=6   # six 5-second samples = 30 seconds above the limit
-WD_DIAG_MAX_RUNTIME=300 # bounded VNC test window; CPU/restart guards remain active
+# Interactive VNC sessions must not disappear at an arbitrary test deadline.
+# The old unconditional 300-second limit runtime-confirmed the user's abrupt
+# shutdown: the watchdog logged the cap trip while VS Code logged SIGTERM.
+# Crash-loop/load/sustained-CPU guards remain armed. Bounded automation can
+# opt back into a wall-clock limit with --runtime-cap=SECONDS.
+WD_DIAG_MAX_RUNTIME=0
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 WD_TRIP="$LOGDIR/macws_safety_trip"
+WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
 RECOVERED_WS_PID=""
 RECOVERY_EXTRA_RESTARTS=0
 
@@ -377,15 +387,31 @@ trip_watchdog() {
     stop_all
 }
 
+watchdog_pidfile_cleanup() {
+    local owner=""
+    [ -f "$WD_PIDFILE" ] || return 0
+    owner=$(awk 'NR == 1 { print $1 }' "$WD_PIDFILE" 2>/dev/null)
+    [ "$owner" = "$$" ] && rm -f "$WD_PIDFILE"
+    return 0
+}
+
 # Watchdog loop (runs iOS-side, backgrounded by `start`). Stops the GUI if
 # WindowServer crash-loops or the load average runs away.
 run_watchdog() {
     local last_pid="" restarts=0 t0 started now pid L load_runaway
     local ws_cpu=0 cpu_strikes=0 diagnostic=0 missing_samples=0
+    local runtime_cap_label="disabled"
+    # The parent records $! as soon as it forks us, and the child records $$
+    # again here after exec.  The ownership-aware EXIT trap cannot erase a
+    # replacement watchdog's pidfile if launch timing overlaps.
+    echo "$$" > "$WD_PIDFILE"
+    trap watchdog_pidfile_cleanup EXIT
     t0=$(date +%s)
     started=$t0
     [ -e "$EXPERIMENTAL_COMPLETION" ] && diagnostic=1
-    log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace; WS CPU>=${WD_WS_CPU_LIMIT}% for $((WD_WS_CPU_STRIKES * WD_POLL))s; >=$WD_RESTART_LIMIT restarts/${WD_WINDOW}s; diagnostic cap=${WD_DIAG_MAX_RUNTIME}s)"
+    [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
+        runtime_cap_label="${WD_DIAG_MAX_RUNTIME}s"
+    log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace; WS CPU>=${WD_WS_CPU_LIMIT}% for $((WD_WS_CPU_STRIKES * WD_POLL))s; >=$WD_RESTART_LIMIT restarts/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
     while :; do
         sleep "$WD_POLL"
         # Exit only when the GUI was actually torn down (the WindowServer launchd
@@ -452,7 +478,9 @@ run_watchdog() {
             trip_watchdog "WindowServer 高 CPU 样本累计达到 $((WD_WS_CPU_STRIKES * WD_POLL)) 秒（阈值 ${WD_WS_CPU_LIMIT}%，当前 ${ws_cpu}%），已自动停止以防过热"
             return 0
         fi
-        if [ "$diagnostic" -eq 1 ] && [ $((now - started)) -ge "$WD_DIAG_MAX_RUNTIME" ]; then
+        if [ "$diagnostic" -eq 1 ] &&
+           [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
+           [ $((now - started)) -ge "$WD_DIAG_MAX_RUNTIME" ]; then
             trip_watchdog "实验兼容模式达到 ${WD_DIAG_MAX_RUNTIME} 秒安全上限，已自动停止；这仍是诊断脚手架"
             return 0
         fi
@@ -518,10 +546,66 @@ write_plists() {
     <true/>
     <key>ThrottleInterval</key>
     <integer>5</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!--
+          System-wide pointer ownership belongs to OSXvnc's native
+          CGPostMouseEvent path. Runtime tests cover AppKit's global menu,
+          contextual menu, NSWindow modal drag tracker, and application
+          content through this one coherent stream. libmachook only fixes the
+          Retina RFB-pixel -> Quartz-point scale before calling the original.
+          AppInputBridge remains a fallback for non-VNC/native-host input; it
+          must not duplicate an active VNC gesture in one target process.
+        -->
+        <key>MACWS_VNC_NATIVE_ALL</key>
+        <string>1</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>${LOGDIR}/osxvnc.log</string>
     <key>StandardErrorPath</key>
     <string>${LOGDIR}/osxvnc.log</string>
+</dict>
+</plist>
+PLIST
+
+    # The chroot has no ordinary macOS loginwindow/LaunchAgent bootstrap, so
+    # com.apple.pboard is otherwise absent. Runtime evidence was explicit:
+    # OSXvnc logged "Pasteboard Inaccessible" and Electron aborted a drag with
+    # "0 items on the pasteboard, but 1 drag images". Register the real macOS
+    # pboard binary through the same chroot launcher and expose its original
+    # Mach service names in the outer launchd domain.
+    cat > "$PBOARD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PBOARD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string>
+        <string>0</string>
+        <string>0</string>
+        <string>${ROOTFS}</string>
+        <string>${PBOARD_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.pasteboard.1</key>
+        <true/>
+        <key>com.apple.coreservices.uauseractivitypasteboardclient.xpc</key>
+        <true/>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>${LOGDIR}/pboard.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOGDIR}/pboard.log</string>
 </dict>
 </plist>
 PLIST
@@ -583,14 +667,40 @@ PLIST
 
 # Tear down every macOS GUI service we may have started.  Idempotent: unloading a
 # job that is not loaded / killing a process that is gone are harmless no-ops.
+stop_watchdogs() {
+    local watchdog_pid="" candidate=""
+    if [ -f "$WD_PIDFILE" ]; then
+        watchdog_pid=$(awk 'NR == 1 { print $1 }' "$WD_PIDFILE" 2>/dev/null)
+        case "$watchdog_pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                [ "$watchdog_pid" = "$$" ] || kill "$watchdog_pid" 2>/dev/null
+                ;;
+        esac
+    fi
+    # Migration cleanup for watchdogs started by versions that had no pidfile.
+    # Runtime evidence on 2026-07-29 found two simultaneous loops; the older
+    # one reloaded VNC/Terminal during a manual restart and launchctl reported
+    # both jobs "service already loaded". Match the complete script+subcommand
+    # rather than a broad process name.
+    for candidate in $(ps -ax -o pid=,command= 2>/dev/null | awk \
+        -v needle="bash $0 watchdog " 'index($0, needle) { print $1 }'); do
+        [ "$candidate" = "$$" ] || kill "$candidate" 2>/dev/null
+    done
+    rm -f "$WD_PIDFILE"
+}
+
 cleanup_macos() {
     log "Cleaning up previous macOS GUI services..."
+    stop_watchdogs
 
     # 1) our VNC / Terminal launchd jobs (by plist, then by label as a fallback)
     launchctl unload "$VNC_PLIST"  2>/dev/null
     launchctl unload "$TERM_PLIST" 2>/dev/null
+    launchctl unload "$PBOARD_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
     launchctl remove "$TERM_LABEL" 2>/dev/null
+    launchctl remove "$PBOARD_LABEL" 2>/dev/null
 
     # inputd blocks in recv(2), so tear its job down explicitly before the
     # broader directory unload and verify no pre-fix binary remains alive.
@@ -608,6 +718,7 @@ cleanup_macos() {
     # 2) stray GUI clients (Terminal, VNC, Activity Monitor, ...)
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
+    kill_by_pattern "$P_PBOARD"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
@@ -664,6 +775,19 @@ start_macos() {
     launchctl load "$MACOS_DAEMONS"
     log "Waiting for WindowServer graphics initialization before GUI clients..."
     wait_for_initial_ws_ready "$ws_log_start_line" || return 1
+
+    log "Starting macOS pasteboard service (launchd job '$PBOARD_LABEL')..."
+    rm -f "$LOGDIR/pboard.log"
+    launchctl load "$PBOARD_PLIST" || return 1
+    waited=0
+    while ! proc_running "$P_PBOARD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_PBOARD" || {
+        log "ERROR: macOS pboard process did not start."
+        return 1
+    }
 
     if [ "$WANT_VNC" = 1 ]; then
         log "Starting VNC server (launchd job '$VNC_LABEL', persistent)..."
@@ -741,7 +865,7 @@ usage() {
 macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
-  sudo bash $0 start [coexist|exclusive] [--experimental] [--pace-us=N] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 start [coexist|exclusive] [--experimental] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc] [--no-watchdog]
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
@@ -755,8 +879,9 @@ WindowServer crash-loops or the load average runs away (panic guard). Disable
 with --no-watchdog. Logs to $LOGDIR/macos_gui_watchdog.log.
 
 The current native VNC path still needs diagnostic command/completion adapters.
-Use --experimental explicitly for that path; it is bounded to
-${WD_DIAG_MAX_RUNTIME} seconds and remains protected by the high-CPU watchdog.
+Use --experimental explicitly for that path. Interactive sessions have no
+arbitrary wall-clock timeout, while crash-loop/load/high-CPU protection stays
+armed. Automated runs may add --runtime-cap=300 (minimum 60 seconds).
 
 Connect a VNC viewer to  vnc://<device-ip>:5900  (no password).
 USAGE
@@ -778,12 +903,25 @@ for a in "$@"; do
         exclusive|full|excl)     MODE=exclusive ;;
         --experimental)          WANT_EXPERIMENTAL=1 ;;
         --pace-us=*)             COEXIST_PACE_US="${a#--pace-us=}" ;;
+        --runtime-cap=*)         WD_DIAG_MAX_RUNTIME="${a#--runtime-cap=}" ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
         --no-vnc)                WANT_VNC=0 ;;
         --no-watchdog)           WANT_WATCHDOG=0 ;;
         *) echo "macos_gui.sh: ignoring unknown option '$a'" >&2 ;;
     esac
 done
+
+case "$WD_DIAG_MAX_RUNTIME" in
+    *[!0-9]*|'')
+        echo "macos_gui.sh: --runtime-cap must be an integer (0 or at least 60 seconds)" >&2
+        exit 1
+        ;;
+esac
+if [ "$WD_DIAG_MAX_RUNTIME" -ne 0 ] &&
+   [ "$WD_DIAG_MAX_RUNTIME" -lt 60 ]; then
+    echo "macos_gui.sh: --runtime-cap must be 0 or at least 60 seconds" >&2
+    exit 1
+fi
 
 # The stable interactive A/B uses a 100 ms idle completion interval and lets
 # VNC activity temporarily select 16.667 ms for one second.  Make that tested
@@ -902,6 +1040,7 @@ wait_for_initial_vnc_capture_if_requested() {
 # disconnect via nohup). Re-invokes this script in `watchdog` mode.
 start_watchdog() {
     [ "$WANT_WATCHDOG" = 1 ] || { log "watchdog: disabled (--no-watchdog)"; return 0; }
+    stop_watchdogs
     rm -f "$WD_LOG"
     rm -f "$WD_TRIP"
     # Re-exec with the exact session intent.  The recovery path needs these
@@ -912,7 +1051,10 @@ start_watchdog() {
     [ "$WANT_TERMINAL" = 1 ] || set -- "$@" --no-terminal
     [ "$WANT_EXPERIMENTAL" = 1 ] && set -- "$@" --experimental
     [ -n "$COEXIST_PACE_US" ] && set -- "$@" "--pace-us=$COEXIST_PACE_US"
+    [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
+        set -- "$@" "--runtime-cap=$WD_DIAG_MAX_RUNTIME"
     nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
+    echo "$!" > "$WD_PIDFILE"
     log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL)"
 }
 

@@ -24,6 +24,13 @@ def configure_raw(sock):
     sock.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
 
 
+def configure_hextile(sock):
+    pixel_format = struct.pack(
+        ">BBBBHHHBBBxxx", 32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
+    sock.sendall(b"\x00\x00\x00\x00" + pixel_format)
+    sock.sendall(struct.pack(">BBHi", 2, 0, 1, 5))
+
+
 def request_update(sock, width, height, incremental):
     sock.sendall(struct.pack(
         ">BBHHHH", 3, 1 if incremental else 0, 0, 0, width, height))
@@ -51,6 +58,10 @@ def receive_update(sock, width, framebuffer):
                         destination = ((y + row) * width + x) * 4
                         framebuffer[destination:destination + row_bytes] = \
                             pixels[source:source + row_bytes]
+                elif encoding == 5:
+                    receive_hextile_rectangle(
+                        sock, width, framebuffer, x, y,
+                        rect_width, rect_height)
                 elif encoding not in (-223, -224):
                     raise RuntimeError(
                         f"unexpected RFB encoding {encoding}")
@@ -65,6 +76,68 @@ def receive_update(sock, width, framebuffer):
             continue
         raise RuntimeError(
             f"unexpected RFB server message {message_type}")
+
+
+def receive_hextile_rectangle(sock, width, framebuffer, x, y,
+                              rect_width, rect_height):
+    """Decode RFB Hextile into the retained 32-bit BGRX framebuffer."""
+    background = None
+    foreground = None
+    for tile_y in range(0, rect_height, 16):
+        tile_height = min(16, rect_height - tile_y)
+        for tile_x in range(0, rect_width, 16):
+            tile_width = min(16, rect_width - tile_x)
+            subencoding = vnc_capture.recv_exact(sock, 1)[0]
+            if subencoding & 1:
+                pixels = vnc_capture.recv_exact(
+                    sock, tile_width * tile_height * 4)
+                for row in range(tile_height):
+                    source = row * tile_width * 4
+                    destination = (
+                        ((y + tile_y + row) * width + x + tile_x) * 4)
+                    framebuffer[
+                        destination:destination + tile_width * 4] = \
+                        pixels[source:source + tile_width * 4]
+                continue
+
+            if subencoding & 2:
+                background = vnc_capture.recv_exact(sock, 4)
+            if background is None:
+                raise RuntimeError("Hextile tile has no background colour")
+            filled_row = background * tile_width
+            for row in range(tile_height):
+                destination = (
+                    ((y + tile_y + row) * width + x + tile_x) * 4)
+                framebuffer[
+                    destination:destination + tile_width * 4] = filled_row
+
+            if subencoding & 4:
+                foreground = vnc_capture.recv_exact(sock, 4)
+            if not (subencoding & 8):
+                continue
+            subrect_count = vnc_capture.recv_exact(sock, 1)[0]
+            coloured = bool(subencoding & 16)
+            for _ in range(subrect_count):
+                colour = (vnc_capture.recv_exact(sock, 4)
+                          if coloured else foreground)
+                if colour is None:
+                    raise RuntimeError(
+                        "Hextile subrectangle has no foreground colour")
+                packed_xy, packed_wh = vnc_capture.recv_exact(sock, 2)
+                sub_x = packed_xy >> 4
+                sub_y = packed_xy & 0x0F
+                sub_width = (packed_wh >> 4) + 1
+                sub_height = (packed_wh & 0x0F) + 1
+                if (sub_x + sub_width > tile_width or
+                        sub_y + sub_height > tile_height):
+                    raise RuntimeError("Hextile subrectangle outside tile")
+                sub_row = colour * sub_width
+                for row in range(sub_height):
+                    destination = (
+                        ((y + tile_y + sub_y + row) * width +
+                         x + tile_x + sub_x) * 4)
+                    framebuffer[
+                        destination:destination + sub_width * 4] = sub_row
 
 
 def save_frame(path, width, height, framebuffer, prefix):

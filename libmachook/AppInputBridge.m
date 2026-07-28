@@ -24,6 +24,7 @@ typedef id (*MacWSMsgIDInteger)(id, SEL, NSInteger);
 typedef CGRect (*MacWSMsgRect)(id, SEL);
 typedef CGRect (*MacWSMsgRectRect)(id, SEL, CGRect);
 typedef CGRect (*MacWSMsgRectRectID)(id, SEL, CGRect, id);
+typedef CGPoint (*MacWSMsgPoint)(id, SEL);
 typedef CGPoint (*MacWSMsgPointPoint)(id, SEL, CGPoint);
 typedef CGPoint (*MacWSMsgPointPointID)(id, SEL, CGPoint, id);
 typedef NSInteger (*MacWSMsgInteger)(id, SEL);
@@ -231,6 +232,34 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
                 started);
             fflush(stderr);
         }
+    } else if (type >= 1 && type <= 7) {
+        // Observational boundary witness for the native-VNC A/B.  These are
+        // the ordinary AppKit mouse event types (left/right down/up, moved,
+        // left/right dragged).  Logging their real window/location/button
+        // state proves whether CGPostMouseEvent delivered a coherent stream;
+        // this hook never creates, changes, or suppresses an event.
+        static _Atomic uint64_t mouseEvents;
+        uint64_t mouseSerial = atomic_fetch_add_explicit(
+            &mouseEvents, 1, memory_order_relaxed) + 1;
+        if (mouseSerial <= 128 || (mouseSerial % 600) == 0) {
+            NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(
+                event, sel_registerName("windowNumber"));
+            CGPoint location = ((MacWSMsgPoint)objc_msgSend)(
+                event, sel_registerName("locationInWindow"));
+            Class eventClass = object_getClass(event);
+            NSUInteger pressed = eventClass
+                ? ((MacWSPressedMouseButtons)objc_msgSend)(
+                    (id)eventClass, sel_registerName("pressedMouseButtons"))
+                : 0;
+            fprintf(stderr,
+                "#### APP-INPUT MOUSE-EVENT pid=%d serial=%llu type=%lu "
+                "window=%ld local=(%.2f,%.2f) pressed=%#lx at=%.6f\n",
+                getpid(), (unsigned long long)mouseSerial,
+                (unsigned long)type, (long)windowNumber,
+                location.x, location.y, (unsigned long)pressed,
+                MacWSAppInputMonotonicSeconds());
+            fflush(stderr);
+        }
     }
     if (MacWSOriginalApplicationSendEvent)
         MacWSOriginalApplicationSendEvent(self, command, event);
@@ -260,22 +289,23 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
 
 static void MacWSInstallApplicationKeyWitness(void) {
     const char *settleValue = getenv("MACWS_APP_DISPLAY_SETTLE_MS");
-    if (!settleValue || !*settleValue) return;
-    char *settleEnd = NULL;
-    errno = 0;
-    unsigned long settleMilliseconds = strtoul(
-        settleValue, &settleEnd, 10);
-    if (errno != 0 || settleEnd == settleValue || *settleEnd != '\0' ||
-        settleMilliseconds < 16 || settleMilliseconds > 2000) {
-        fprintf(stderr,
-            "#### APP-INPUT DISPLAY-SETTLE disabled invalid "
-            "MACWS_APP_DISPLAY_SETTLE_MS='%s' (valid=16..2000)\n",
-            settleValue);
-        fflush(stderr);
-        return;
+    if (settleValue && *settleValue) {
+        char *settleEnd = NULL;
+        errno = 0;
+        unsigned long settleMilliseconds = strtoul(
+            settleValue, &settleEnd, 10);
+        if (errno != 0 || settleEnd == settleValue || *settleEnd != '\0' ||
+            settleMilliseconds < 16 || settleMilliseconds > 2000) {
+            fprintf(stderr,
+                "#### APP-INPUT DISPLAY-SETTLE disabled invalid "
+                "MACWS_APP_DISPLAY_SETTLE_MS='%s' (valid=16..2000)\n",
+                settleValue);
+            fflush(stderr);
+        } else {
+            MacWSApplicationDisplaySettleMilliseconds =
+                (uint32_t)settleMilliseconds;
+        }
     }
-    MacWSApplicationDisplaySettleMilliseconds =
-        (uint32_t)settleMilliseconds;
     // This constructor runs while dyld is still executing initializers.
     // NSClassFromString builds an NSString and entered Foundation before its
     // ObjC initialization was complete on arm64e (runtime crash witness:
@@ -428,18 +458,18 @@ static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
 
 static BOOL MacWSAppInputSupportedProcess(void) {
     const char *program = getprogname();
-    // Keep Chromium's renderer/GPU helpers out of the endpoint set.  The real
-    // AppKit browser window belongs to the main "Google Chrome" process; an
-    // endpoint in every helper would make macwsinputd's hit-test broadcast
-    // ambiguous.  Runtime-confirmed 2026-07-29: before this main-process entry,
-    // a VNC click logged TARGET-LIST result=NULL and route=global-fallback,
-    // while macwsinputd had already measured postAccess=NO.
-    return program &&
-        (strcmp(program, "GlassDemo") == 0 ||
-         strcmp(program, "Terminal") == 0 ||
-         strcmp(program, "Activity Monitor") == 0 ||
-         strcmp(program, "Finder") == 0 ||
-         strcmp(program, "Google Chrome") == 0);
+    // A finite application-name allowlist cannot cover Finder panels, menu
+    // extras, newly installed GUI applications, or future Electron shells.
+    // Install in every real AppKit application.  Chromium helpers are kept
+    // out because they can load AppKit without owning a window/run loop; a
+    // non-replying helper would unnecessarily consume the target-probe
+    // deadline.  Processes that do not load NSApplication are not endpoints.
+    if (!program || !objc_getClass("NSApplication")) return NO;
+    if (strstr(program, "Helper") || strstr(program, "Renderer") ||
+        strstr(program, "GPU") || strcmp(program, "WindowServer") == 0 ||
+        strstr(program, "OSXvnc") || strcmp(program, "launchservicesd") == 0)
+        return NO;
+    return YES;
 }
 
 static BOOL MacWSPointInRect(CGPoint point, CGRect rect) {

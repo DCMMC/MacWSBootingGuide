@@ -711,6 +711,8 @@ extern size_t IOSurfaceGetBytesPerRow(IOSurfaceRef surface);
 extern size_t IOSurfaceGetBytesPerElement(IOSurfaceRef surface);
 extern size_t IOSurfaceGetPlaneCount(IOSurfaceRef surface);
 extern OSType IOSurfaceGetPixelFormat(IOSurfaceRef surface);
+extern size_t IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane);
+extern size_t IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane);
 extern int IOSurfaceLock(IOSurfaceRef surface, uint32_t options,
                          uint32_t *seed);
 extern int IOSurfaceUnlock(IOSurfaceRef surface, uint32_t options,
@@ -733,6 +735,8 @@ extern uint32_t IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
                                                  size_t plane);
 uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(
     IOSurfaceRef surface, size_t plane);
+size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane);
+size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane);
 size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
     IOSurfaceRef surface, size_t plane);
 size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
@@ -2093,7 +2097,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // is only four instructions; require all four before installing a
         // Substrate trampoline.  A second libmachook slice sees the modified
         // prologue and safely skips instead of stacking another hook.
-#if defined(LIBMACHOOK_ON_DEVICE_BUILD)
         {
             static const uint32_t expectedSwapEndWrapper[4] = {
                 0xb4000080, // cbz x0, +0x10
@@ -2118,7 +2121,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     actual[0], actual[1], actual[2], actual[3]);
             }
         }
-#endif
 
         // COEXISTENCE: WindowServer must finish every SwapBegin without
         // presenting over iOS's physical panel. The old patch changed
@@ -4855,6 +4857,14 @@ static BOOL macws_vnc_release_pending = NO;
 static uint32_t macws_vnc_gesture_id = 0;
 static int macws_vnc_input_fd = -1;
 static double macws_vnc_last_continuous_send = 0.0;
+// System-wide route for the exact installed OSXvnc CGPostMouseEvent path. The
+// split owner (AppInput taps, native drags/right buttons) cannot cover AppKit's
+// global menu and drag state machine coherently. Runtime tests on 2026-07-29
+// exercised menu open/hover/close, contextual menu, and NSWindow title drag
+// through this single stream (13/13 region-change witnesses). The generated
+// VNC launchd job enables this path; the file/env gate remains for controlled
+// A/Bs and compatibility with manually launched OSXvnc.
+static BOOL macws_vnc_native_all = NO;
 static _Atomic uint64_t macws_vnc_keyboard_serial = 0;
 static _Atomic uint64_t macws_vnc_keyboard_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_capture_serial = 0;
@@ -4944,6 +4954,7 @@ static void *macws_vnc_generation_watcher(void *unused) {
     size_t mappingSize = 0;
     uint64_t observed = 0;
     uint8_t *previousPixels = NULL;
+    uint8_t *currentPixels = NULL;
     size_t previousPixelsSize = 0;
     size_t previousWidth = 0;
     size_t previousHeight = 0;
@@ -5018,36 +5029,80 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                 (previousPixelsSize != pixelBytes ||
                                  previousWidth != sourceWidth ||
                                  previousHeight != height)) {
-                                uint8_t *replacement = realloc(
-                                    previousPixels, pixelBytes);
-                                if (replacement) {
-                                    previousPixels = replacement;
+                                uint8_t *replacementPrevious =
+                                    malloc(pixelBytes);
+                                uint8_t *replacementCurrent =
+                                    malloc(pixelBytes);
+                                if (replacementPrevious &&
+                                    replacementCurrent) {
+                                    free(previousPixels);
+                                    free(currentPixels);
+                                    previousPixels = replacementPrevious;
+                                    currentPixels = replacementCurrent;
                                     previousPixelsSize = pixelBytes;
                                     previousWidth = sourceWidth;
                                     previousHeight = height;
                                     previousValid = NO;
                                 } else {
+                                    free(replacementPrevious);
+                                    free(replacementCurrent);
                                     forceFull = YES;
                                     changed = YES;
                                 }
                             }
 
+                            // Copy one seqlock-stable generation first, then
+                            // diff private memory. The old code compared the
+                            // live mmap row by row and mutated previousPixels
+                            // at the same time. During interactive 10-60 Hz
+                            // publication, a newer frame often arrived during
+                            // that scan; it invalidated the snapshot and made
+                            // the following generation a 15.2-MiB full-screen
+                            // raw update. A bounded memcpy+validate retry keeps
+                            // both the diff baseline and dirty rectangles
+                            // coherent without slowing the producer.
+                            BOOL snapshotStable = NO;
                             if (geometryMatches && previousPixels &&
+                                currentPixels &&
                                 previousPixelsSize == pixelBytes) {
-                                if (!previousValid) {
+                                for (unsigned attempt = 0; attempt < 4;
+                                     attempt++) {
+                                    uint64_t before = atomic_load_explicit(
+                                        sequenceAddress,
+                                        memory_order_acquire);
+                                    if (before == 0 || (before & 1u)) {
+                                        usleep(1000);
+                                        continue;
+                                    }
                                     for (size_t y = 0; y < height; y++) {
-                                        memcpy(previousPixels +
+                                        memcpy(currentPixels +
                                                    y * visibleRowBytes,
                                                sourcePixels + y * stride,
                                                visibleRowBytes);
                                     }
+                                    atomic_thread_fence(memory_order_acquire);
+                                    uint64_t after = atomic_load_explicit(
+                                        sequenceAddress,
+                                        memory_order_acquire);
+                                    if (before == after && !(after & 1u)) {
+                                        sequence = after;
+                                        snapshotStable = YES;
+                                        break;
+                                    }
+                                    usleep(1000);
+                                }
+                                if (!snapshotStable) continue;
+
+                                if (!previousValid) {
+                                    memcpy(previousPixels, currentPixels,
+                                           pixelBytes);
                                     forceFull = YES;
                                     changed = YES;
                                 } else {
                                     for (size_t y = 0; y < height; y++) {
                                         const uint32_t *sourceRow =
-                                            (const uint32_t *)(sourcePixels +
-                                                y * stride);
+                                            (const uint32_t *)(currentPixels +
+                                                y * visibleRowBytes);
                                         uint32_t *previousRow =
                                             (uint32_t *)(previousPixels +
                                                 y * visibleRowBytes);
@@ -5082,19 +5137,8 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                     }
                                 }
                             }
-
-                            atomic_thread_fence(memory_order_acquire);
-                            uint64_t after = atomic_load_explicit(
-                                sequenceAddress, memory_order_acquire);
-                            if (after != sequence || (after & 1u)) {
-                                // The snapshot may now contain a mix of two
-                                // publications.  Invalidate it and make the
-                                // next stable generation a full refresh.
-                                previousValid = NO;
-                                usleep(1000);
-                                continue;
-                            }
-                            previousValid = geometryMatches && previousPixels;
+                            previousValid = geometryMatches && previousPixels &&
+                                currentPixels && snapshotStable;
                             observed = sequence;
 
                             CGRect dirty = {
@@ -5440,6 +5484,23 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
             point.x / (CGFloat)scale,
             point.y / (CGFloat)scale,
         };
+        if (macws_vnc_native_all) {
+            macws_orig_vnc_handle_mouse(self, command, buttons,
+                                        quartzPoint, client);
+            static _Atomic uint64_t nativeEvents;
+            uint64_t nativeEvent = atomic_fetch_add_explicit(
+                &nativeEvents, 1, memory_order_relaxed) + 1;
+            if (nativeEvent <= 96 || (nativeEvent % 600) == 0) {
+                fprintf(stderr,
+                    "#### OSXVNC NATIVE-ALL event=%llu buttons=%#x "
+                    "rfb=(%.1f,%.1f) quartz=(%.1f,%.1f) scale=%d\n",
+                    (unsigned long long)nativeEvent, buttons,
+                    point.x, point.y, quartzPoint.x, quartzPoint.y, scale);
+            }
+            macws_vnc_left_down = leftDown;
+            macws_vnc_last_point = point;
+            return;
+        }
         BOOL moved = point.x != macws_vnc_last_point.x ||
                      point.y != macws_vnc_last_point.y;
         BOOL otherButton = (buttons & ~1u) != 0;
@@ -5783,6 +5844,8 @@ static void macws_install_osxvnc_hooks(void) {
     macws_vnc_test_on = (access("/tmp/macws_vnc_test", F_OK) == 0);
     macws_vnc_share_on = (getenv("MACWS_VNC_SHARE") ||
                           access("/tmp/macws_vnc_share", F_OK) == 0);
+    macws_vnc_native_all = getenv("MACWS_VNC_NATIVE_ALL") != NULL ||
+        access("/tmp/macws_vnc_native_all", F_OK) == 0;
     const struct mach_header *mh = NULL;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
@@ -5832,8 +5895,8 @@ static void macws_install_osxvnc_hooks(void) {
             "#### OSXVNC mmap generation watcher failed error=%d\n",
             watcherError);
     }
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input=%s keyboard=%s) base=%p rfbScreen=%p\n",
-            macws_vnc_test_on, macws_vnc_share_on,
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d native-all=%d input=%s keyboard=%s) base=%p rfbScreen=%p\n",
+            macws_vnc_test_on, macws_vnc_share_on, macws_vnc_native_all,
             mouseMethod ? "YES" : "NO",
             keyboardMethod ? "YES" : "NO",
             (void *)mh, (void *)macws_rfbScreen);
@@ -6012,6 +6075,27 @@ int csr_get_active_config_new(uint32_t *configuration) {
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags, const char **params, char **errorbuf);
 int sandbox_init_with_parameters_new(const char *profile, uint64_t flags, const char **params, char **errorbuf) {
     // printf("debugbydcmmc Calling interposed sandbox_init_with_parameters\n");
+    if (errorbuf) *errorbuf = NULL;
+    return 0;
+}
+
+extern int sandbox_init(const char *profile, uint64_t flags, char **errorbuf);
+int sandbox_init_new(const char *profile, uint64_t flags, char **errorbuf) {
+    // RE-confirmed via the actual macOS 13.4 /usr/libexec/pboard at
+    // main+0x44: it calls sandbox_init("com.apple.pboard", 1, &error) and
+    // exits 1 when the iOS host rejects that macOS named profile. The chroot
+    // already cannot enforce macOS sandbox profiles (the parameterized entry
+    // point above is the established compatibility boundary), so cover the
+    // deprecated three-argument API as the same boundary and leave no stale
+    // error object for the caller to free.
+    if (errorbuf) *errorbuf = NULL;
+    static _Atomic bool logged = false;
+    if (!atomic_exchange_explicit(&logged, true, memory_order_relaxed)) {
+        fprintf(stderr,
+            "#### SANDBOX-COMPAT sandbox_init profile=%s flags=%#llx -> 0 "
+            "(macOS named profiles unavailable on iOS host)\n",
+            profile ?: "(null)", (unsigned long long)flags);
+    }
     return 0;
 }
 
@@ -6087,8 +6171,42 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
             }
         }
     }
-    return mach_msg(message, option, send_size, receive_limit, receive_name,
-                    timeout, notify);
+    // RE-confirmed via SkyLight`_SLSCopyWindowGroup: the failing request is a
+    // 0x24-byte send whose header bits are 0x1513.  Query only this request so
+    // the diagnostic does not add a mach_port_type() round trip to every IPC.
+    bool trace_sls_window_group =
+        macws_mach_msg_trace_enabled() && message &&
+        (option & MACH_SEND_MSG) && message->msgh_bits == 0x1513 &&
+        send_size == 0x24;
+    mach_port_type_t destination_types = 0;
+    kern_return_t destination_type_kr = KERN_INVALID_ARGUMENT;
+    if (trace_sls_window_group) {
+        destination_type_kr = mach_port_type(
+            mach_task_self(), message->msgh_remote_port,
+            &destination_types);
+    }
+
+    mach_msg_return_t result = mach_msg(
+        message, option, send_size, receive_limit, receive_name,
+        timeout, notify);
+    if (trace_sls_window_group && result == MACH_SEND_INVALID_DEST) {
+        char line[320];
+        int length = snprintf(
+            line, sizeof(line),
+            "#### MACH-MSG-INVALID-DEST pid=%d id=0x%x bits=0x%x "
+            "remote=%u local=%u send=%u option=0x%x "
+            "rights_before=0x%x type_kr=0x%x result=0x%x\n",
+            getpid(), message->msgh_id, message->msgh_bits,
+            message->msgh_remote_port, message->msgh_local_port,
+            send_size, option, destination_types,
+            destination_type_kr, result);
+        if (length > 0) {
+            size_t write_length = (size_t)length < sizeof(line) ?
+                (size_t)length : sizeof(line) - 1;
+            write(STDERR_FILENO, line, write_length);
+        }
+    }
+    return result;
 }
 
 // Simulate functions that are not implemented in iOS kernel
@@ -6404,6 +6522,7 @@ DYLD_INTERPOSE(sysctlbyname_new, sysctlbyname);
 DYLD_INTERPOSE(__mac_syscall_new, __mac_syscall);
 DYLD_INTERPOSE(csr_get_active_config_new, csr_get_active_config);
 DYLD_INTERPOSE(sandbox_init_with_parameters_new, sandbox_init_with_parameters);
+DYLD_INTERPOSE(sandbox_init_new, sandbox_init);
 DYLD_INTERPOSE(mach_port_construct_new, mach_port_construct);
 DYLD_INTERPOSE(mach_msg_new, mach_msg);
 DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
@@ -6581,6 +6700,53 @@ static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
     return value;
 }
 
+// Chromium 148.0.7778.280 validates both per-plane dimensions before it
+// imports a VideoToolbox IOSurface.  Runtime logs from its exact
+// bfe29217d60b6ee25ce4e4b2c0abcd6361ae6eb6 build reached
+// iosurface_image_backing_factory.mm:501 while this compatibility layer was
+// already recovering that same surface's BPR/offset from IOSurfacePlaneInfo.
+// Width/height are adjacent members of the same iOS-vs-macOS IOSurfaceClient
+// layout, but were missing from the original recovery set.  Recover their
+// explicit creation-property values too; never infer dimensions from pixel
+// format or return a constant merely to pass Chromium's bounds check.
+size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
+    size_t original = IOSurfaceGetWidthOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"Width", @"IOSurfacePlaneWidth");
+    if (property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT width plane=%zu original=%zu "
+            "property=%llu surfaceID=%u recovery=%u\n",
+            plane, original, (unsigned long long)property,
+            IOSurfaceGetID(surface), count);
+    }
+    return (size_t)property;
+}
+
+size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
+    size_t original = IOSurfaceGetHeightOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(surface, plane,
+        @"Height", @"IOSurfacePlaneHeight");
+    if (property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
+    if (count <= 16 || (count % 500) == 0) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT height plane=%zu original=%zu "
+            "property=%llu surfaceID=%u recovery=%u\n",
+            plane, original, (unsigned long long)property,
+            IOSurfaceGetID(surface), count);
+    }
+    return (size_t)property;
+}
+
 uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                    size_t plane) {
     uint32_t original = IOSurfaceGetCompressionTypeOfPlane(surface, plane);
@@ -6742,6 +6908,10 @@ uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
 
 DYLD_INTERPOSE(macws_IOSurfaceGetCompressionTypeOfPlane,
                 IOSurfaceGetCompressionTypeOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetWidthOfPlane,
+                IOSurfaceGetWidthOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetHeightOfPlane,
+                IOSurfaceGetHeightOfPlane);
 DYLD_INTERPOSE(macws_IOSurfaceGetHeightInCompressedTilesOfPlane,
                 IOSurfaceGetHeightInCompressedTilesOfPlane);
 DYLD_INTERPOSE(macws_IOSurfaceGetWidthInCompressedTilesOfPlane,
@@ -7773,6 +7943,7 @@ struct macws_iomfb_frame_registration {
     io_connect_t client;
     MacwsIOMFBFrameInfoCallback callback;
     void *context;
+    uint64_t last_presentation_time;
 };
 
 static pthread_mutex_t g_macws_iomfb_frame_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -7838,9 +8009,13 @@ static void macws_enable_frame_info_tag_list(
     }
     if (registration_slot < sizeof(g_macws_iomfb_frame_regs) /
                                 sizeof(g_macws_iomfb_frame_regs[0])) {
+        uint64_t last_presentation_time =
+            g_macws_iomfb_frame_regs[registration_slot]
+                .last_presentation_time;
         g_macws_iomfb_frame_regs[registration_slot] =
             (struct macws_iomfb_frame_registration){
-                framebuffer, client, callback, server};
+                framebuffer, client, callback, server,
+                last_presentation_time};
     }
     pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
     fprintf(stderr,
@@ -7934,8 +8109,9 @@ static void macws_install_quartzcore_frame_info_hook(
         (void *)(g_macws_quartzcore_header + 0x29209c));
 }
 
-static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
-                                                 uint32_t swap_id) {
+static void macws_iomfb_complete_cancelled_swap(
+    io_connect_t client, uint32_t swap_id,
+    uint64_t requested_presentation_time) {
     if (access("/tmp/macws_cancel_completion", F_OK) != 0)
         return;
 
@@ -7961,13 +8137,10 @@ static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
         return;
     }
 
-    // Diagnostic scaffold only: the real cancelled-swap protocol still needs
-    // to be recovered from an iOS-native frame-info dictionary.  A 200-ms
-    // FIFO experiment was runtime-disproved on 2026-07-26: submissions were
-    // not completion-paced, so the FIFO grew without bound while WindowServer
-    // stayed at 83-86% CPU.  Deliver immediately to preserve the original
-    // one-submit/one-completion ownership invariant while that upstream
-    // protocol work continues.
+    // A 200-ms FIFO experiment was runtime-disproved on 2026-07-26:
+    // submissions were not completion-paced, so the FIFO grew without bound
+    // while WindowServer stayed at 83-86% CPU.  Keep one completion per
+    // successful cancellation and let the caller pace the ownership boundary.
     if (sequence <= 16 || (sequence % 600) == 0) {
         fprintf(stderr,
             "#### IOMFB CANCEL-COMPLETION schedule #%lu swapID=%u "
@@ -7975,11 +8148,42 @@ static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
             sequence, swap_id, client, registration.framebuffer);
     }
     dispatch_async(dispatch_get_main_queue(), ^{
-        // The real callback dictionary contains presentation timing fields.
-        // A cancelled virtual-only frame was never scanned out, so an empty
-        // immutable dictionary truthfully supplies no fabricated timestamps;
-        // QuartzCore still performs its normal collect_frame_info(swap_id)
-        // ownership transition before reading those optional fields.
+        // RE-confirmed from the exact macOS 13.4 QuartzCore image
+        // CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC. frame_info_callback at
+        // 0x187c5009c reads Presentation_time, Vbl_FrameTime (falling back to
+        // Presentation_time only when zero), Requested_presentation,
+        // Min_FrameTime, and Max_FrameTime.  It converts the first three raw
+        // mach_absolute_time ticks and uses them in its presentation cadence
+        // calculation.  The prior empty dictionary therefore did not merely
+        // omit optional telemetry: it supplied zero scheduler timestamps.
+        //
+        // Runtime-confirmed in native iOS 16.3 backboardd at QuartzCore
+        // 0x19d41717c: these keys are NSNumber values in raw absolute-time
+        // ticks; Vbl_FrameTime was Presentation_time-3 in the captured real
+        // frame, and Min/Max were zero.  A cancelled coexistence frame has no
+        // physical scanout, so its paced delivery slot is the virtual vblank
+        // and both presentation fields use that same honest delivery time.
+        uint64_t presentation_time = mach_absolute_time();
+        uint64_t presentation_delta = 0;
+        pthread_mutex_lock(&g_macws_iomfb_frame_lock);
+        for (unsigned i = 0; i < g_macws_iomfb_frame_reg_count; i++) {
+            if (g_macws_iomfb_frame_regs[i].client == client) {
+                uint64_t prior = g_macws_iomfb_frame_regs[i]
+                    .last_presentation_time;
+                if (prior && presentation_time >= prior)
+                    presentation_delta = presentation_time - prior;
+                g_macws_iomfb_frame_regs[i].last_presentation_time =
+                    presentation_time;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
+        if (!presentation_delta &&
+            presentation_time >= requested_presentation_time) {
+            presentation_delta =
+                presentation_time - requested_presentation_time;
+        }
+
         void *display_holder = registration.context
             ? *(void **)((char *)registration.context + 0x58) : NULL;
         uintptr_t pending_begin_before = display_holder
@@ -7988,7 +8192,14 @@ static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
             ? *(const volatile uintptr_t *)((char *)display_holder + 0x518) : 0;
         size_t pending_before = pending_end_before >= pending_begin_before
             ? (pending_end_before - pending_begin_before) / sizeof(void *) : 0;
-        NSDictionary *cancelInfo = @{};
+        NSDictionary *cancelInfo = @{
+            @"Presentation_delta": @(presentation_delta),
+            @"Presentation_time": @(presentation_time),
+            @"Requested_presentation": @(requested_presentation_time),
+            @"Vbl_FrameTime": @(presentation_time),
+            @"Min_FrameTime": @0ull,
+            @"Max_FrameTime": @0ull,
+        };
         registration.callback(registration.framebuffer, swap_id,
             (__bridge CFDictionaryRef)cancelInfo, registration.context);
         uintptr_t pending_begin_after = display_holder
@@ -8002,8 +8213,13 @@ static void macws_iomfb_complete_cancelled_swap(io_connect_t client,
         if (delivered <= 16 || (delivered % 600) == 0) {
             fprintf(stderr,
                 "#### IOMFB CANCEL-COMPLETION delivered #%lu swapID=%u "
-                "client=%u pending=%zu->%zu\n",
-                delivered, swap_id, client, pending_before, pending_after);
+                "client=%u requested=%llu presentation=%llu delta=%llu "
+                "pending=%zu->%zu\n",
+                delivered, swap_id, client,
+                (unsigned long long)requested_presentation_time,
+                (unsigned long long)presentation_time,
+                (unsigned long long)presentation_delta,
+                pending_before, pending_after);
         }
     });
 }
@@ -9092,7 +9308,8 @@ static void macws_subtype1_semantic_field_diagnostic(
 // as the remaining mismatch and supplied output/completion/input witnesses.
 static unsigned macws_translate_agx_wrapped_single_subtype1(
     unsigned sequence, unsigned char *commands, size_t *total_io,
-    unsigned char *segment_list, size_t segment_length) {
+    unsigned char *segment_list, size_t *segment_length_io) {
+    size_t segment_length = segment_length_io ? *segment_length_io : 0;
     if (!commands || !total_io || !segment_list ||
         *total_io != 0x868 || segment_length != 0x148)
         return 0;
@@ -9175,6 +9392,7 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
     memset(segment_list + 0x130, 0, 0x18);
     *(uint32_t *)(segment_list + 0x18) = 0;
     *(uint32_t *)(segment_list + 0x1c) = 0x820;
+    *segment_length_io = 0x130;
     total = 0x820;
     *total_io = total;
 
@@ -9758,7 +9976,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 macws_translate_agx_wrapped_single_subtype1(
                     result.sequence, commands, &total,
                     (unsigned char *)(uintptr_t)segment_start,
-                    segment_length);
+                    &segment_length);
             if (!wrapped_fixed) {
                 wrapped_fixed =
                     macws_translate_agx_trailing_wrapped_subtype1(
@@ -9774,6 +9992,24 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     (current_raw & 0xffff000000000000ULL) | new_current;
                 *(uint64_t *)(uintptr_t)(state + 0x30) = new_current_raw;
                 current_raw = new_current_raw;
+                // Runtime-confirmed by the first clean-log VS Code-triggered
+                // WindowServer 0x100 flight record (PID 17741, submit 1): the
+                // leading-wrapper translator produced the native 0x820 KCMD
+                // and moved the direct list bytes to a 0x130 layout, but the
+                // finalized logical list end at state+0x328 still made the
+                // submitted span 0x148.  The captured list consequently had
+                // header length 0x80000130 inside an actual 0x148-byte span.
+                // Keep the RE-confirmed IOGPU storage logical-end field in
+                // lockstep with the list bytes, just as state+0x30 is updated
+                // for the shortened KCMD above.
+                uint64_t new_segment_current =
+                    segment_start + segment_length;
+                uint64_t new_segment_current_raw =
+                    (segment_current_raw & 0xffff000000000000ULL) |
+                    new_segment_current;
+                *(uint64_t *)(uintptr_t)(state + 0x328) =
+                    new_segment_current_raw;
+                segment_current_raw = new_segment_current_raw;
                 if (verbose) macws_submit_save_kcmd(
                     result.sequence, descriptor_index,
                     "wrapped-post", commands, total);
@@ -10060,6 +10296,16 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     *(uint32_t *)(commands + off + 0x28) = 0x1d8;
                     *(uint32_t *)(commands + off + 0x2c) = 0x1a8;
                     total -= 0x10;
+                    // Runtime-confirmed by the first Aquarium Internal Error
+                    // flight recorder (GPU process 9392, submit 5936): the
+                    // translated blob and its direct segment range were both
+                    // 0x1e0 bytes, but this outer KCMD header still declared
+                    // the pre-deletion 0x1f0 span.  The iOS parser therefore
+                    // walked ten bytes beyond the submitted command.  Keep
+                    // the command's own complete-span field synchronized with
+                    // the storage current pointer and segment range, just as
+                    // the subtype-1 normalization above already does.
+                    *(uint32_t *)(commands + 0x04) = (uint32_t)total;
                     *(uint32_t *)(uintptr_t)(segment_start + 0x1c) =
                         (uint32_t)total;
                     uint64_t new_current = start + total;
@@ -11367,6 +11613,7 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
 
     uint32_t swap_id = *(const volatile uint32_t *)
         ((const char *)framebuffer + 0x68);
+    uint64_t requested_presentation_time = mach_absolute_time();
     IOReturn result = IOMobileFramebufferSwapCancel(framebuffer, swap_id);
     static _Atomic unsigned long cancel_count = 0;
     unsigned long sequence = atomic_fetch_add(&cancel_count, 1) + 1;
@@ -11391,7 +11638,8 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
             macws_coexist_wait_for_completion_slot(pace_us);
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);
-        macws_iomfb_complete_cancelled_swap(client, swap_id);
+        macws_iomfb_complete_cancelled_swap(
+            client, swap_id, requested_presentation_time);
         if (sequence <= 4) {
             fprintf(stderr,
                 "#### COEXIST completion pace #%lu: interval=%u us "
@@ -11424,6 +11672,7 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
         orig == 5 && selector == 5 && inStruct && inStructCnt == 0x46c) {
         uint32_t swap_id = *(const volatile uint32_t *)((const char *)inStruct + 0x50);
         uint64_t scalar = swap_id;
+        uint64_t requested_presentation_time = mach_absolute_time();
         IOReturn cancel_r = IOConnectCallScalarMethod(
             client, 0x34, &scalar, 1, NULL, NULL);
         static _Atomic unsigned long cancel_count = 0;
@@ -11434,8 +11683,27 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
                 cancel_n, client, swap_id, cancel_r);
         }
 
-        if (cancel_r == KERN_SUCCESS)
-            macws_iomfb_complete_cancelled_swap(client, swap_id);
+        if (cancel_r == KERN_SUCCESS) {
+            // The public SwapEnd trampoline normally owns this pacing.  This
+            // branch is its exact-call-shape fallback, so it must preserve the
+            // same one-submit/one-paced-completion invariant.  Runtime-
+            // confirmed 2026-07-29: the Mac cross-build had compiled the
+            // public hook out, this unpaced path delivered 4,200 completions
+            // in a bounded run and kept WindowServer hot even at an intended
+            // 100-ms idle pace.
+            uint32_t pace_us = macws_coexist_activity_pace_us(
+                macws_coexist_completion_pace_us());
+            uint32_t slept_us =
+                macws_coexist_wait_for_completion_slot(pace_us);
+            macws_iomfb_complete_cancelled_swap(
+                client, swap_id, requested_presentation_time);
+            if (cancel_n <= 4) {
+                fprintf(stderr,
+                    "#### COEXIST fallback completion pace #%lu: "
+                    "interval=%u us slept=%u us before swapID=%u\n",
+                    cancel_n, pace_us, slept_us, swap_id);
+            }
+        }
 
         return cancel_r;
     }
@@ -11521,6 +11789,246 @@ IOReturn IOConnectCallAsyncStructMethod_new(io_connect_t client, uint32_t select
     if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncStruct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
     return r;
 }
+
+// Read-only CVDisplayLink protocol witness for the Chromium/WebGL pacing
+// investigation.  Chromium creates its link with an explicit
+// CGDirectDisplayID, whereas the control probe that remains near 120 Hz uses
+// CVDisplayLinkCreateWithActiveCGDisplays.  When the sentinel exists, retain
+// Chromium's callback unchanged and log the exact requested/current display
+// IDs plus the `now` and `outputTime` values delivered by CoreVideo.  This is
+// deliberately not a timestamp correction: it establishes which layer first
+// produces the negative callback_timebase_to_display value seen in Chromium's
+// trace before an adapter is considered.
+typedef int32_t MacwsCVReturn;
+typedef void *MacwsCVDisplayLinkRef;
+typedef uint32_t MacwsCGDirectDisplayID;
+typedef uint64_t MacwsCVOptionFlags;
+typedef struct {
+    uint32_t version;
+    int32_t videoTimeScale;
+    int64_t videoTime;
+    uint64_t hostTime;
+    double rateScalar;
+    int64_t videoRefreshPeriod;
+} MacwsCVTimeStampPrefix;
+typedef MacwsCVReturn (*MacwsCVDisplayLinkOutputCallback)(
+    MacwsCVDisplayLinkRef display_link,
+    const MacwsCVTimeStampPrefix *now,
+    const MacwsCVTimeStampPrefix *output_time,
+    MacwsCVOptionFlags flags_in,
+    MacwsCVOptionFlags *flags_out,
+    void *user_info);
+
+extern MacwsCVReturn CVDisplayLinkCreateWithCGDisplay(
+    MacwsCGDirectDisplayID display_id, MacwsCVDisplayLinkRef *display_link_out);
+extern MacwsCVReturn CVDisplayLinkSetOutputCallback(
+    MacwsCVDisplayLinkRef display_link,
+    MacwsCVDisplayLinkOutputCallback callback,
+    void *user_info);
+extern MacwsCGDirectDisplayID CVDisplayLinkGetCurrentCGDisplay(
+    MacwsCVDisplayLinkRef display_link);
+extern uint64_t CVGetCurrentHostTime(void);
+
+struct macws_cvdisplaylink_trace_slot {
+    MacwsCVDisplayLinkRef display_link;
+    MacwsCGDirectDisplayID requested_display_id;
+    MacwsCVDisplayLinkOutputCallback callback;
+    void *user_info;
+    _Atomic unsigned long callback_count;
+};
+
+static pthread_mutex_t g_macws_cvdisplaylink_trace_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static struct macws_cvdisplaylink_trace_slot
+    g_macws_cvdisplaylink_trace_slots[8];
+
+static bool macws_cvdisplaylink_trace_enabled(void) {
+    return access("/tmp/macws_cvdl_trace", F_OK) == 0;
+}
+
+static int64_t macws_cvdisplaylink_tick_delta(uint64_t later,
+                                              uint64_t earlier) {
+    return later >= earlier
+        ? (int64_t)(later - earlier)
+        : -(int64_t)(earlier - later);
+}
+
+static struct macws_cvdisplaylink_trace_slot *
+macws_cvdisplaylink_trace_find_or_allocate(MacwsCVDisplayLinkRef display_link) {
+    struct macws_cvdisplaylink_trace_slot *empty = NULL;
+    for (unsigned index = 0;
+         index < sizeof(g_macws_cvdisplaylink_trace_slots) /
+                     sizeof(g_macws_cvdisplaylink_trace_slots[0]);
+         index++) {
+        struct macws_cvdisplaylink_trace_slot *slot =
+            &g_macws_cvdisplaylink_trace_slots[index];
+        if (slot->display_link == display_link) return slot;
+        if (!slot->display_link && !empty) empty = slot;
+    }
+    if (empty) {
+        empty->display_link = display_link;
+        empty->requested_display_id = UINT32_MAX;
+        atomic_store_explicit(&empty->callback_count, 0,
+                              memory_order_relaxed);
+    }
+    return empty;
+}
+
+static MacwsCVReturn macws_cvdisplaylink_trace_callback(
+    MacwsCVDisplayLinkRef display_link,
+    const MacwsCVTimeStampPrefix *now,
+    const MacwsCVTimeStampPrefix *output_time,
+    MacwsCVOptionFlags flags_in,
+    MacwsCVOptionFlags *flags_out,
+    void *slot_context) {
+    struct macws_cvdisplaylink_trace_slot *slot = slot_context;
+    MacwsCVDisplayLinkOutputCallback callback = NULL;
+    void *user_info = NULL;
+    MacwsCGDirectDisplayID requested_display_id = UINT32_MAX;
+    pthread_mutex_lock(&g_macws_cvdisplaylink_trace_lock);
+    if (slot) {
+        callback = slot->callback;
+        user_info = slot->user_info;
+        requested_display_id = slot->requested_display_id;
+    }
+    pthread_mutex_unlock(&g_macws_cvdisplaylink_trace_lock);
+
+    unsigned long sequence = slot
+        ? atomic_fetch_add_explicit(&slot->callback_count, 1,
+                                    memory_order_relaxed) + 1
+        : 0;
+    const bool should_log = sequence <= 24 || (sequence % 600) == 0;
+    const uint64_t callback_entry_host_time = should_log
+        ? CVGetCurrentHostTime() : 0;
+    if (should_log) {
+        const uint64_t current_host_time = callback_entry_host_time;
+        const uint64_t now_host_time = now ? now->hostTime : 0;
+        const uint64_t output_host_time = output_time
+            ? output_time->hostTime : 0;
+        const MacwsCGDirectDisplayID current_display_id =
+            CVDisplayLinkGetCurrentCGDisplay(display_link);
+        fprintf(stderr,
+            "#### CVDL-TRACE callback #%lu link=%p requested=%#x "
+            "current=%#x now.host=%llu output.host=%llu current.host=%llu "
+            "output-now=%lld output-current=%lld current-now=%lld "
+            "now.video=%lld/%d output.video=%lld/%d refresh=%lld "
+            "flags=%#llx\n",
+            sequence, display_link, requested_display_id,
+            current_display_id,
+            (unsigned long long)now_host_time,
+            (unsigned long long)output_host_time,
+            (unsigned long long)current_host_time,
+            (long long)macws_cvdisplaylink_tick_delta(
+                output_host_time, now_host_time),
+            (long long)macws_cvdisplaylink_tick_delta(
+                output_host_time, current_host_time),
+            (long long)macws_cvdisplaylink_tick_delta(
+                current_host_time, now_host_time),
+            (long long)(now ? now->videoTime : 0),
+            now ? now->videoTimeScale : 0,
+            (long long)(output_time ? output_time->videoTime : 0),
+            output_time ? output_time->videoTimeScale : 0,
+            (long long)(output_time ? output_time->videoRefreshPeriod : 0),
+            (unsigned long long)flags_in);
+    }
+
+    MacwsCVReturn result = callback
+        ? callback(display_link, now, output_time, flags_in, flags_out,
+                   user_info)
+        : 0;
+    if (should_log) {
+        const uint64_t callback_return_host_time = CVGetCurrentHostTime();
+        fprintf(stderr,
+            "#### CVDL-TRACE callback-return #%lu link=%p result=%d "
+            "entry.host=%llu return.host=%llu duration.ticks=%lld\n",
+            sequence, display_link, result,
+            (unsigned long long)callback_entry_host_time,
+            (unsigned long long)callback_return_host_time,
+            (long long)macws_cvdisplaylink_tick_delta(
+                callback_return_host_time, callback_entry_host_time));
+    }
+    return result;
+}
+
+static MacwsCVReturn CVDisplayLinkCreateWithCGDisplay_new(
+    MacwsCGDirectDisplayID display_id,
+    MacwsCVDisplayLinkRef *display_link_out) {
+    MacwsCVReturn result = CVDisplayLinkCreateWithCGDisplay(
+        display_id, display_link_out);
+    if (!macws_cvdisplaylink_trace_enabled()) return result;
+
+    MacwsCVDisplayLinkRef display_link =
+        result == 0 && display_link_out ? *display_link_out : NULL;
+    if (display_link) {
+        pthread_mutex_lock(&g_macws_cvdisplaylink_trace_lock);
+        struct macws_cvdisplaylink_trace_slot *slot =
+            macws_cvdisplaylink_trace_find_or_allocate(display_link);
+        if (slot) slot->requested_display_id = display_id;
+        pthread_mutex_unlock(&g_macws_cvdisplaylink_trace_lock);
+    }
+
+    static _Atomic unsigned long create_count = 0;
+    unsigned long sequence = atomic_fetch_add_explicit(
+        &create_count, 1, memory_order_relaxed) + 1;
+    void *caller = __builtin_return_address(0);
+    Dl_info caller_info = {0};
+    (void)dladdr(caller, &caller_info);
+    MacwsCGDirectDisplayID current_display_id = display_link
+        ? CVDisplayLinkGetCurrentCGDisplay(display_link) : UINT32_MAX;
+    fprintf(stderr,
+        "#### CVDL-TRACE create #%lu requested=%#x result=%d link=%p "
+        "current=%#x caller=%p image=%s symbol=%s\n",
+        sequence, display_id, result, display_link, current_display_id,
+        caller, caller_info.dli_fname ?: "(unknown)",
+        caller_info.dli_sname ?: "(unknown)");
+    return result;
+}
+
+static MacwsCVReturn CVDisplayLinkSetOutputCallback_new(
+    MacwsCVDisplayLinkRef display_link,
+    MacwsCVDisplayLinkOutputCallback callback,
+    void *user_info) {
+    if (!macws_cvdisplaylink_trace_enabled() || !callback) {
+        return CVDisplayLinkSetOutputCallback(
+            display_link, callback, user_info);
+    }
+
+    pthread_mutex_lock(&g_macws_cvdisplaylink_trace_lock);
+    struct macws_cvdisplaylink_trace_slot *slot =
+        macws_cvdisplaylink_trace_find_or_allocate(display_link);
+    if (slot) {
+        slot->callback = callback;
+        slot->user_info = user_info;
+        atomic_store_explicit(&slot->callback_count, 0,
+                              memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_macws_cvdisplaylink_trace_lock);
+
+    if (!slot) {
+        fprintf(stderr,
+            "#### CVDL-TRACE callback slot table full link=%p; pass-through\n",
+            display_link);
+        return CVDisplayLinkSetOutputCallback(
+            display_link, callback, user_info);
+    }
+
+    MacwsCVReturn result = CVDisplayLinkSetOutputCallback(
+        display_link, macws_cvdisplaylink_trace_callback, slot);
+    fprintf(stderr,
+        "#### CVDL-TRACE set-callback link=%p requested=%#x result=%d "
+        "original=%p user=%p wrapper=%p\n",
+        display_link, slot->requested_display_id, result,
+        (void *)callback, user_info,
+        (void *)macws_cvdisplaylink_trace_callback);
+    if (result != 0) {
+        pthread_mutex_lock(&g_macws_cvdisplaylink_trace_lock);
+        slot->callback = NULL;
+        slot->user_info = NULL;
+        pthread_mutex_unlock(&g_macws_cvdisplaylink_trace_lock);
+    }
+    return result;
+}
+
 DYLD_INTERPOSE(IOConnectCallMethod_new, IOConnectCallMethod);
 DYLD_INTERPOSE(IOConnectCallScalarMethod_new, IOConnectCallScalarMethod);
 DYLD_INTERPOSE(IOConnectCallStructMethod_new, IOConnectCallStructMethod);
@@ -11529,6 +12037,10 @@ DYLD_INTERPOSE(IOConnectCallAsyncScalarMethod_new, IOConnectCallAsyncScalarMetho
 DYLD_INTERPOSE(IOConnectCallAsyncStructMethod_new, IOConnectCallAsyncStructMethod);
 DYLD_INTERPOSE(IOConnectTrap1_new, IOConnectTrap1);
 DYLD_INTERPOSE(dyld_get_active_platform_new, dyld_get_active_platform);
+DYLD_INTERPOSE(CVDisplayLinkCreateWithCGDisplay_new,
+               CVDisplayLinkCreateWithCGDisplay);
+DYLD_INTERPOSE(CVDisplayLinkSetOutputCallback_new,
+               CVDisplayLinkSetOutputCallback);
 
 // XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
 // signed-equivalent so the kernel runs the full privileged UC-init (sets
