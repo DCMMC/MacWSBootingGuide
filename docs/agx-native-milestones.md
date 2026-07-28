@@ -1444,6 +1444,31 @@ diagnostic, and a 40-52% WindowServer CPU / 350-430 MiB RSS sample prevents any
 thermal or long-term leak claim. Full logs and classification are in
 [`docs/evidence/native-agx-vnc-interactive-pacing-20260728.txt`](evidence/native-agx-vnc-interactive-pacing-20260728.txt).
 
+## 2026-07-28: Chrome 150 startup isolated from AGX at PartitionAlloc VA geometry
+
+The first official arm64 Chrome launch now has a causal startup diagnosis. It
+traps in Chrome Framework static initialization before ANGLE or Metal device
+creation. LLDB captured a 32-GiB `mmap` aligned to 32 GiB: the kernel returned
+an unaligned range at `0x280000000`, Chrome discarded it, and its near-64-GiB
+fallback failed with `ENOMEM`. The exact binary's failure handler then reached
+the observed `BRK` with error value 12.
+
+One source file was compiled for both native iOS and macOS-chroot execution.
+Both contexts reject a 32-GiB/32-GiB-aligned `mach_vm_map`, while 8-GiB and
+16-GiB aligned reservations succeed. Two adjacent 16-GiB ranges also succeed,
+but start at 16 GiB and therefore do not meet Chrome macOS's encoded 32-GiB
+pool-base invariant. This runtime comparison rules out chroot translation,
+AGX, and a missing macOS-binary entitlement as causes of this first failure.
+
+A scan of the exact arm64 framework found thousands of 16-GiB immediate-mask
+uses, so patching only the allocation call would knowingly break inline pool
+address calculations. The next application-coverage experiment is an official
+native-arm64 Chromium build from before macOS PartitionAlloc-Everywhere, not a
+forced-success allocator patch. Exact crash offsets, disassembly, LLDB mmap
+arguments, identical dual-context probe output, and source links are retained
+in [`misc/va_alignment_probe.c`](../misc/va_alignment_probe.c) and
+[`docs/evidence/chrome-partitionalloc-va-limit-20260728.txt`](evidence/chrome-partitionalloc-va-limit-20260728.txt).
+
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
@@ -1474,3 +1499,7 @@ items are hardening and application-coverage work:
 7. Replace the full-display snapshot with a window registry and
    producer-owned IOSurface ring so each macOS window can become an independent
    iPadOS scene.
+8. Establish native-AGX browser coverage with a native-arm64 Chromium build
+   whose allocator geometry fits the measured iPadOS virtual-address map, then
+   capture `chrome://gpu`, a minimal WebGL probe, and Fish Tank over VNC. Keep
+   allocator startup failures separate from ANGLE/Metal results.

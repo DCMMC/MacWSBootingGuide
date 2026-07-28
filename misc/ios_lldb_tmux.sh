@@ -55,12 +55,10 @@ load_state() {
 }
 
 save_state() {
-    cat >"$STATE_FILE" <<EOF
-HOST=$HOST
-PORT=$PORT
-PROC=$PROC
-PID=$PID
-EOF
+    # Shell-quote values because process names such as "Google Chrome" contain
+    # spaces.  The state file is sourced by later invocations of this helper.
+    printf 'HOST=%q\nPORT=%q\nPROC=%q\nPID=%q\n' \
+        "$HOST" "$PORT" "$PROC" "$PID" >"$STATE_FILE"
 }
 
 ssh_run() {
@@ -159,7 +157,10 @@ cmd() {
     # Send the command + Enter. tmux send-keys with literal newlines via "Enter".
     # Escape inner double quotes for the SSH/sudo/tmux chain.
     local escaped_cmd
-    escaped_cmd=$(printf '%s' "$cmd" | sed 's/"/\\"/g')
+    # The command is parsed once more by the remote shell. Preserve LLDB
+    # register references such as $x1 instead of letting that shell expand
+    # them, and preserve quotes used by breakpoint conditions.
+    escaped_cmd=$(printf '%s' "$cmd" | sed 's/[$"]/\\&/g')
     ssh_sudo "/var/jb/usr/bin/tmux send-keys -t $SESSION \"$escaped_cmd\" Enter" >/dev/null
 
     if ! wait_for_prompt 30; then
@@ -180,7 +181,7 @@ cmd_multi() {
 
     while IFS= read -r line; do
         local escaped
-        escaped=$(printf '%s' "$line" | sed 's/"/\\"/g')
+        escaped=$(printf '%s' "$line" | sed 's/[$"]/\\&/g')
         ssh_sudo "/var/jb/usr/bin/tmux send-keys -t $SESSION \"$escaped\" Enter" >/dev/null
         sleep 0.2  # small spacing so lldb doesn't merge keystrokes
     done
