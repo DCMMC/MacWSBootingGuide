@@ -1819,3 +1819,33 @@ cost is still material.  Screen lock remains an unmeasured confounder, but it
 cannot explain the whole rAF gap because the earlier unlocked,
 Thermal-Nominal control still had a 49.3-ms median.  Full evidence is in
 [`windowserver-wrapper-generation3-20260729.txt`](evidence/webgl2-performance-optimization-20260728/windowserver-wrapper-generation3-20260729.txt).
+
+## 2026-07-29: current Chrome 150 launches, renders WebGL2, and accepts VNC input
+
+The target was moved from the earlier Chromium 148/VS Code coverage to the
+current broad-stable official Google Chrome 150.0.7871.187 arm64 build.  Its
+main Framework and independently embedded optimization-guide PartitionAlloc
+copies both required complete UUID-locked pool-geometry ports; neither failure
+trap was bypassed.  The secondary 1-GiB-core port removed the real
+`HandlePoolAllocFailure` BRK at library +0xb4a7a8 (x2=12/ENOMEM after the
+primary allocator had reserved 24 GiB).
+
+A fixed-PID experimental coexistence run then produced a full 2388x1668 Chrome
+window over VNC.  CDP identified the exact build, WebGL2 visibly rendered a
+Metal canvas, and two controls completed 205/205 and 115/115 real GPU timer
+queries.  The final control's log window had native AGX command translations,
+eight event selector 0x18 -> 0x14 calls, and no command-buffer error or
+ProtectionViolation.  Repeated selector 0x19 -> 0xe00002c2 returns remain an
+explicit unresolved RE item; the test also remains dependent on the labelled
+experimental WindowServer command/completion scaffolds.
+
+VNC input initially failed for a separate, runtime-confirmed reason:
+AppInputBridge only created per-process endpoints for four older test apps, so
+Chrome fell through to a global CGEvent route even though macwsinputd had
+measured postAccess=NO.  Registering only the main `Google Chrome` process and
+restoring AppKit's normal make-key/activate actions before the NSEvent pair
+made a controlled DOM probe change from clicks=0/text empty to clicks=1,
+text=`vncinput150187`, active element=`field`.  Renderer and GPU helpers remain
+excluded to avoid ambiguous endpoint selection.  Full hashes, counters, A/B
+logs, and bounded-test limitations are in
+[`chrome150-secondary-partitionalloc-20260729.txt`](evidence/chrome150-secondary-partitionalloc-20260729.txt).

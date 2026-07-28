@@ -1,0 +1,62 @@
+{
+  "date": "2026-07-29",
+  "device": "iPad13,6 / iPadOS 16.3",
+  "browser": {
+    "cdp": "Chrome/150.0.7871.187",
+    "v8": "15.0.245.21",
+    "webkitRevision": "30f6543ae91e6a860e73b76e3216b663b050f4e5"
+  },
+  "fixedProcesses": {
+    "windowServerPid": 99972,
+    "finalChromePid": 2383,
+    "vncPid": 275
+  },
+  "vnc": {
+    "width": 2388,
+    "height": 1668,
+    "initialFrameSha256": "3a6e166220ec09f76de69433847c44f7f840b09fe9dabfc3b72e3edb819a1bc3",
+    "visibleWebglFrameSha256": "f4fb7a83294da0a2a083cf3ddd33a94b0443c3edb14cf9351636f4be6fd098e0",
+    "inputResultFrameSha256": "b262734270607ccd760246fcc7964330f178cdd19dd7f35659eb08fc0b2ba49b"
+  },
+  "webglFirstVisibleRun": {
+    "requestedSeconds": 12,
+    "elapsedSeconds": 12.196,
+    "webglVersion": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+    "draws": 20500,
+    "batches": 205,
+    "gpuTimerSupported": true,
+    "gpuQueriesCompleted": 205,
+    "gpuQueriesPending": 0,
+    "gpuP50Milliseconds": 0.860583,
+    "gpuP95Milliseconds": 0.873125
+  },
+  "webglFinalInputFixedRun": {
+    "requestedSeconds": 8,
+    "elapsedSeconds": 8.1809,
+    "webglVersion": "WebGL 2.0 (OpenGL ES 3.0 Chromium)",
+    "draws": 11500,
+    "batches": 115,
+    "gpuTimerSupported": true,
+    "gpuQueriesCompleted": 115,
+    "gpuQueriesPending": 0,
+    "gpuP50Milliseconds": 0.897291,
+    "gpuP95Milliseconds": 0.914333,
+    "postMarkerCommandBufferErrors": 0,
+    "postMarkerProtectionViolations": 0,
+    "translatedEventSelectorCalls": 8,
+    "unresolvedSelector19Return": "0xe00002c2"
+  },
+  "inputProbe": {
+    "expectedText": "vncinput150187",
+    "clicks": 1,
+    "text": "vncinput150187",
+    "activeElement": "field",
+    "success": true
+  },
+  "limitations": [
+    "bounded validation rather than a long soak",
+    "experimental WindowServer command/completion scaffolds enabled",
+    "six Internal Error 0000000a failures occurred in earlier startup work",
+    "selector 0x19 meaning and repeated 0xe00002c2 return remain unproven"
+  ]
+}

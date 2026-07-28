@@ -30,6 +30,7 @@ typedef NSInteger (*MacWSMsgInteger)(id, SEL);
 typedef NSUInteger (*MacWSMsgUInteger)(id, SEL);
 typedef BOOL (*MacWSMsgBool)(id, SEL);
 typedef BOOL (*MacWSMsgBoolSEL)(id, SEL, SEL);
+typedef void (*MacWSMsgVoid)(id, SEL);
 typedef void (*MacWSMsgVoidBool)(id, SEL, BOOL);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
@@ -427,11 +428,18 @@ static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
 
 static BOOL MacWSAppInputSupportedProcess(void) {
     const char *program = getprogname();
+    // Keep Chromium's renderer/GPU helpers out of the endpoint set.  The real
+    // AppKit browser window belongs to the main "Google Chrome" process; an
+    // endpoint in every helper would make macwsinputd's hit-test broadcast
+    // ambiguous.  Runtime-confirmed 2026-07-29: before this main-process entry,
+    // a VNC click logged TARGET-LIST result=NULL and route=global-fallback,
+    // while macwsinputd had already measured postAccess=NO.
     return program &&
         (strcmp(program, "GlassDemo") == 0 ||
          strcmp(program, "Terminal") == 0 ||
          strcmp(program, "Activity Monitor") == 0 ||
-         strcmp(program, "Finder") == 0);
+         strcmp(program, "Finder") == 0 ||
+         strcmp(program, "Google Chrome") == 0);
 }
 
 static BOOL MacWSPointInRect(CGPoint point, CGRect rect) {
@@ -650,6 +658,44 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     if (record.kind == MacWSInputKindTouchDown ||
         record.kind == MacWSInputKindTap)
         MacWSSetAppInputGestureWindow(window);
+    if (record.kind == MacWSInputKindTouchDown ||
+        record.kind == MacWSInputKindTap) {
+        id oldKeyWindow = ((MacWSMsgID)objc_msgSend)(application,
+            sel_registerName("keyWindow"));
+        BOOL wasActive = ((MacWSMsgBool)objc_msgSend)(application,
+            sel_registerName("isActive"));
+        if (window != oldKeyWindow && ((MacWSMsgBoolSEL)objc_msgSend)(
+                window, sel_registerName("respondsToSelector:"),
+                sel_registerName("makeKeyWindow"))) {
+            ((MacWSMsgVoid)objc_msgSend)(window,
+                sel_registerName("makeKeyWindow"));
+        }
+        if (!wasActive && ((MacWSMsgBoolSEL)objc_msgSend)(
+                application, sel_registerName("respondsToSelector:"),
+                sel_registerName("activateIgnoringOtherApps:"))) {
+            ((MacWSMsgVoidBool)objc_msgSend)(application,
+                sel_registerName("activateIgnoringOtherApps:"), YES);
+        }
+        BOOL isActive = ((MacWSMsgBool)objc_msgSend)(application,
+            sel_registerName("isActive"));
+        id keyWindow = ((MacWSMsgID)objc_msgSend)(application,
+            sel_registerName("keyWindow"));
+        static unsigned focusLogs;
+        if (focusLogs++ < 12) {
+            fprintf(stderr,
+                "#### APP-INPUT FOCUS pid=%d gesture=%u active=%s->%s "
+                "key=%ld->%ld selected=%ld\n",
+                getpid(), record.contactID,
+                wasActive ? "YES" : "NO", isActive ? "YES" : "NO",
+                oldKeyWindow ? (long)((MacWSMsgInteger)objc_msgSend)(
+                    oldKeyWindow, sel_registerName("windowNumber")) : -1L,
+                keyWindow ? (long)((MacWSMsgInteger)objc_msgSend)(
+                    keyWindow, sel_registerName("windowNumber")) : -1L,
+                (long)((MacWSMsgInteger)objc_msgSend)(window,
+                    sel_registerName("windowNumber")));
+            fflush(stderr);
+        }
+    }
     NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(window,
         sel_registerName("windowNumber"));
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,

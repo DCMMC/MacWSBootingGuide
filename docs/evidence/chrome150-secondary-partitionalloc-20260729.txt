@@ -92,14 +92,79 @@ The signed output was installed at Chrome 150's original library path and its
 CDHash was added to the device trust cache.  The pre-port signed library is
 retained on the device so this change is reversible.
 
-Runtime-validation status
--------------------------
+Runtime validation: passed on current Chrome 150
+------------------------------------------------
 
-Pending a clean fixed-WindowServer launch after deployment.  Success requires
-all of the following witnesses from the same run: the exact Chrome 150 CDP
-version, survival beyond the former background-initializer crash, a live
-ANGLE/Metal WebGL context with native AGX trace evidence, changing VNC pixels,
-and VNC mouse/keyboard acknowledgement.  Process uptime alone is not success.
+The signed secondary port was tested in a clean experimental coexistence
+session on 2026-07-29.  WindowServer remained the same PID 99972 for the whole
+Chrome test; Chrome remained PID 2383 after the final input-bridge restart.
+There was no new Chrome crash report (the newest remained the pre-fix 01:55
+debugger artifact).  This is a bounded validation, not a long soak.
+
+Exact-browser witness:
+
+  CDP Browser: Chrome/150.0.7871.187
+  V8-Version: 15.0.245.21
+  WebKit revision: 30f6543ae91e6a860e73b76e3216b663b050f4e5
+
+VNC produced a full 2388x1668 Retina frame containing Chrome's real new-tab
+window.  It was neither a black frame nor a stretched low-resolution surface:
+
+  initial frame SHA-256:
+    3a6e166220ec09f76de69433847c44f7f840b09fe9dabfc3b72e3edb819a1bc3
+
+The first 12-second WebGL2 control visibly placed its blue 512x512 Metal canvas
+in that same VNC frame (SHA-256
+f4fb7a83294da0a2a083cf3ddd33a94b0443c3edb14cf9351636f4be6fd098e0) and
+returned:
+
+  WebGL version: WebGL 2.0 (OpenGL ES 3.0 Chromium)
+  batches / draws: 205 / 20,500
+  EXT_disjoint_timer_query_webgl2: supported
+  GPU queries: 205 completed, 0 pending
+  GPU time: p50 0.860583 ms, p95 0.873125 ms
+
+After the Chrome input fix was rebuilt and loaded, a second 8-second WebGL2
+control in the same final Chrome process returned 115/115 completed GPU timer
+queries, zero pending, and the same WebGL2 identity.  The corresponding log
+window contained validated subtype-1 command translations and eight real
+macOS selector 0x18 -> iOS selector 0x14 event translations.  It contained no
+IOGPU-ERROR-GETTER, failed MTLCommandBuffer, ProtectionViolation, or command
+error.  Earlier Chrome startup work in the same log did contain six
+`Internal Error (0000000a)` command-buffer failures, so the session is not
+being represented as globally error-free.
+
+The log also contains repeated untranslated selector 0x19 calls returning
+0xe00002c2 during the timer-query workload.  All 115 GPU queries nevertheless
+completed.  The meaning of selector 0x19 remains unproven and is a separate RE
+item; no success claim depends on treating those returns as harmless.
+
+VNC input was first disproved and then fixed with a controlled A/B.  Before the
+change, `AppInputBridge.m` excluded Google Chrome, macwsinputd logged
+`TARGET-LIST ... result=NULL`, fell back globally despite `postAccess=NO`, and
+the DOM remained at clicks=0/text empty.  The fix registers an endpoint only
+for the `Google Chrome` main process (not its renderer/GPU helpers) and restores
+the public AppKit focus actions a real click establishes before sending the
+ordinary NSEvent pair.  The controlled page then visibly showed `CLICKED 1`
+and `vncinput150187`; the CDP observer, which did not synthesize input, returned:
+
+  clicks: 1
+  text: vncinput150187
+  active element: field
+  success: true
+
+macwsinputd independently recorded Retina RFB coordinates (724,900) and
+(1064,1270), routed both to Chrome PID 2383 via `appkit-socket`, and Chrome
+logged main-thread `HIT` / `TAP-COMPLETE` events on
+RenderWidgetHostViewCocoa.  The final input frame SHA-256 was:
+
+  b262734270607ccd760246fcc7964330f178cdd19dd7f35659eb08fc0b2ba49b
+
+The exact structured outcomes are retained in
+`chrome150-current-stable-vnc-webgl-input-20260729.json`.  This result still
+uses the repository's explicitly labelled experimental WindowServer command
+and cancelled-swap completion scaffolds; it does not promote those diagnostics
+to production protocol fixes.
 
 Official source references
 --------------------------
