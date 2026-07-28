@@ -86,6 +86,22 @@ CORE_POOL_BASE_MASK_MATERIALIZATIONS = {
     0x0135BD28: (0xFFFFFFFC00000000, 0xFFFFFFFE00000000),
 }
 
+# Some ReservationOffsetTable inlines materialize CorePoolSize() - 1 with a
+# MOV/ORR alias and then apply it through a register-form AND.  The generic
+# logical-immediate pass cannot see the semantic mask on the later register
+# instruction, while rewriting every equal MOV would corrupt unrelated packed
+# constants.  Per-binary manifests may therefore lock the exact PA sites here.
+# Electron 39 did not need an additional set beyond its existing folded UBFX
+# sites; Chrome 150 supplies its own map from the wrapper module.
+CORE_POOL_OFFSET_MASK_MATERIALIZATIONS: dict[int, tuple[int, int]] = {}
+
+# PartitionAddressSpace::Init() can also materialize a negative core-pool
+# size through the MOV/ORR alias form.  It is not a mask even though it has
+# the same bit pattern as one: InitMetadataRegionAndOffsets() subtracts the
+# BRP pool base from the external metadata mapping.  Keep these sites in a
+# separate, per-binary manifest so their arithmetic meaning is explicit.
+INIT_LOGICAL_IMMEDIATE_PATCHES: dict[int, tuple[int, int]] = {}
+
 # File/VM offsets are identical in this Mach-O's __TEXT segment.  These are
 # the six positive constants in PartitionAddressSpace::Init.  The adjacent
 # negative masks are covered by LOGICAL_IMMEDIATE_MAP.
@@ -371,6 +387,8 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
     logical_counts: Counter[int] = Counter()
     retained_logical_counts: Counter[int] = Counter()
     base_mask_materializations: list[dict[str, str]] = []
+    offset_mask_materializations: list[dict[str, str]] = []
+    init_logical_patches: list[dict[str, str]] = []
     changed_offsets: list[int] = []
     for offset in range(text_offset, text_offset + text_size, 4):
         word = struct.unpack_from("<I", data, offset)[0]
@@ -393,6 +411,50 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
                 struct.pack_into("<I", data, offset, replacement)
                 changed_offsets.append(offset)
                 base_mask_materializations.append(
+                    {
+                        "offset": f"{offset:#x}",
+                        "old": f"{old_value:#018x}",
+                        "new": f"{new_value:#018x}",
+                    }
+                )
+                continue
+            materialization = CORE_POOL_OFFSET_MASK_MATERIALIZATIONS.get(offset)
+            if materialization is not None:
+                old_value, new_value = materialization
+                opcode = (word >> 29) & 3
+                source_register = (word >> 5) & 31
+                if immediate != old_value or opcode != 1 or source_register != 31:
+                    raise ValueError(
+                        f"offset {offset:#x}: expected MOV/ORR Xd, XZR, "
+                        f"{old_value:#018x}, got word {word:#010x} "
+                        f"immediate {immediate:#018x}"
+                    )
+                replacement = rewrite_logical_immediate(word, new_value)
+                struct.pack_into("<I", data, offset, replacement)
+                changed_offsets.append(offset)
+                offset_mask_materializations.append(
+                    {
+                        "offset": f"{offset:#x}",
+                        "old": f"{old_value:#018x}",
+                        "new": f"{new_value:#018x}",
+                    }
+                )
+                continue
+            materialization = INIT_LOGICAL_IMMEDIATE_PATCHES.get(offset)
+            if materialization is not None:
+                old_value, new_value = materialization
+                opcode = (word >> 29) & 3
+                source_register = (word >> 5) & 31
+                if immediate != old_value or opcode != 1 or source_register != 31:
+                    raise ValueError(
+                        f"offset {offset:#x}: expected MOV/ORR Xd, XZR, "
+                        f"{old_value:#018x}, got word {word:#010x} "
+                        f"immediate {immediate:#018x}"
+                    )
+                replacement = rewrite_logical_immediate(word, new_value)
+                struct.pack_into("<I", data, offset, replacement)
+                changed_offsets.append(offset)
+                init_logical_patches.append(
                     {
                         "offset": f"{offset:#x}",
                         "old": f"{old_value:#018x}",
@@ -436,6 +498,26 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
         expected = {f"{offset:#x}" for offset in CORE_POOL_BASE_MASK_MATERIALIZATIONS}
         raise ValueError(
             "core-pool base-mask materialization mismatch: "
+            f"found {sorted(found)}, expected {sorted(expected)}"
+        )
+
+    if len(offset_mask_materializations) != len(
+        CORE_POOL_OFFSET_MASK_MATERIALIZATIONS
+    ):
+        found = {entry["offset"] for entry in offset_mask_materializations}
+        expected = {
+            f"{offset:#x}" for offset in CORE_POOL_OFFSET_MASK_MATERIALIZATIONS
+        }
+        raise ValueError(
+            "core-pool offset-mask materialization mismatch: "
+            f"found {sorted(found)}, expected {sorted(expected)}"
+        )
+
+    if len(init_logical_patches) != len(INIT_LOGICAL_IMMEDIATE_PATCHES):
+        found = {entry["offset"] for entry in init_logical_patches}
+        expected = {f"{offset:#x}" for offset in INIT_LOGICAL_IMMEDIATE_PATCHES}
+        raise ValueError(
+            "init logical-immediate materialization mismatch: "
             f"found {sorted(found)}, expected {sorted(expected)}"
         )
 
@@ -534,6 +616,8 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
             for key in LOGICAL_IMMEDIATE_MAP
         },
         "core_pool_base_mask_materializations": base_mask_materializations,
+        "core_pool_offset_mask_materializations": offset_mask_materializations,
+        "init_logical_immediate_patches": init_logical_patches,
         "move_wide_patches": move_patches,
         "cppgc_cage_move_wide_patches": cppgc_move_patches,
         "cppgc_cage_word_patches": cppgc_word_patches,

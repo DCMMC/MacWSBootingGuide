@@ -126,19 +126,25 @@ local two-instruction size patch cannot preserve the allocator invariant.
 Replacing the constants globally would also alter unrelated code and is not
 a viable fix.
 
-Next test paths
----------------
+Implemented current-version path (2026-07-29 update)
+----------------------------------------------------
 
-* Preferred: test an official native-arm64 Chromium build predating macOS
-  PartitionAlloc-Everywhere, while retaining ANGLE's Metal backend. This
-  avoids modifying allocator invariants and can expose the actual AGX/WebGL
-  behavior.
-* Diagnostic only: make Chrome's allocator bootstrap observe an already
-  registered PartitionAlloc-named malloc zone, solely to discover the next
-  failure. This is not a fix unless all allocation/free ownership and direct
-  PartitionAlloc users are proved compatible.
-* Long term: rebuild Chromium for macOS UI with the iOS-sized PartitionAlloc
-  geometry. This preserves semantics but is substantially larger work.
+The test target remains the current official stable build identified above:
+Chrome 150.0.7871.187.  An older Chromium build is not an accepted fallback.
+
+The exact Framework UUID is now handled by
+`misc/patch_chrome150_pa_ios_va.py`.  Its UUID-locked manifest ports the full
+primary allocator geometry from a 16-GiB core to an 8-GiB core, including the
+glued allocation, root masks, reservation-table indices, external metadata,
+and Oilpan cage invariants.  It does not accept an unaligned mapping or skip
+PartitionAlloc's failure path.
+
+A later runtime crash exposed an independent PartitionAlloc copy in
+`liboptimization_guide_internal.dylib`.  Its evidence and a second
+UUID-locked geometry port are recorded in
+`chrome150-secondary-partitionalloc-20260729.txt`.  Device runtime validation
+of that second change is intentionally kept separate from this original
+failure record.
 
 Official source references
 --------------------------
