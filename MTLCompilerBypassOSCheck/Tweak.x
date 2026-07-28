@@ -5,6 +5,16 @@
 #include <time.h>
 #include <syslog.h>
 #include <mach-o/dyld.h>
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+// The rootless iOS 16 Theos SDK used by this project omits xpc/xpc.h.  This
+// is the exact public C ABI needed by the UUID-locked reply observer.
+extern void *xpc_data_create(const void *bytes, size_t length);
 
 // NOTE: do NOT take an ObjC block here. Under -fobjc-arc the on-device lld
 // arm64e build mis-signs the block's metadata pointer, so ARC's objc_storeStrong
@@ -135,6 +145,483 @@ static void MTLPatchLog(const char *fmt, ...) {
             return;
         }
     }
+}
+
+// MTLCompilerService runs in the iOS host namespace, while the macOS Metal
+// client constructs its clang module-cache path from the chroot's
+// /var/folders tree.  Sharing that tree with bindfs is insufficient: the
+// service's seatbelt evaluates the original /var/folders pathname and rejects
+// creation of monolithic_metal.pcm with EPERM.  Adapt only paths below a
+// com.apple.metalfe cache directory to the rootless mobile tree.  That exact
+// namespace is runtime-confirmed writable by this process because
+// MTLPatchLog's /var/jb/var/mobile log survives every compiler request;
+// /var/mobile/Library/Caches was separately tried and returned EPERM.  This
+// preserves the file operation and its real result; it does not
+// turn a failed check into success or synthesize compiler output.
+//
+// Runtime witness before this adapter (vscode.log, 2026-07-28):
+//   unable to open output file '/var/folders/.../com.apple.metalfe/
+//   F0DURH57MFZX/monolithic_metal.pcm': 'Operation not permitted'
+//
+// The wrappers also log each translated operation and errno so a future path
+// or libc call-site change fails visibly rather than becoming a silent cache
+// bypass.
+static const char *kMetalCacheRoot =
+    "/var/jb/var/mobile/Library/Caches/macws-metalfe";
+static const char *kMetalCacheMarker = "/com.apple.metalfe/";
+
+static bool TranslateMetalCachePath(const char *path,
+                                    char translated[PATH_MAX]) {
+    if (!path || strncmp(path, "/var/folders/zz/", 16) != 0) return false;
+    const char *marker = strstr(path, kMetalCacheMarker);
+    if (!marker) return false;
+    const char *suffix = marker + strlen(kMetalCacheMarker);
+    int n = snprintf(translated, PATH_MAX, "%s/%s", kMetalCacheRoot, suffix);
+    return n > 0 && n < PATH_MAX;
+}
+
+static int (*OrigOpen)(const char *, int, ...) = NULL;
+static int (*OrigOpenAt)(int, const char *, int, ...) = NULL;
+static int (*OrigStat)(const char *, struct stat *) = NULL;
+static int (*OrigMkdir)(const char *, mode_t) = NULL;
+static int (*OrigMkdirAt)(int, const char *, mode_t) = NULL;
+static int (*OrigRename)(const char *, const char *) = NULL;
+static int (*OrigRenameAt)(int, const char *, int, const char *) = NULL;
+static int (*OrigUnlink)(const char *) = NULL;
+static int (*OrigUnlinkAt)(int, const char *, int) = NULL;
+
+static int MetalCacheOpen(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
+    }
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    const char *actual = changed ? mapped : path;
+    int result = (flags & O_CREAT) ? OrigOpen(actual, flags, mode)
+                                   : OrigOpen(actual, flags);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache open flags=%#x '%s' -> '%s' result=%d errno=%d",
+                             flags, path, actual, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheOpenAt(int fd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
+    }
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    const char *actual = changed ? mapped : path;
+    int result = (flags & O_CREAT) ? OrigOpenAt(fd, actual, flags, mode)
+                                   : OrigOpenAt(fd, actual, flags);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache openat fd=%d flags=%#x '%s' -> '%s' result=%d errno=%d",
+                             fd, flags, path, actual, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheStat(const char *path, struct stat *st) {
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    const char *actual = changed ? mapped : path;
+    int result = OrigStat(actual, st);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache stat '%s' -> '%s' result=%d errno=%d",
+                             path, actual, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheMkdir(const char *path, mode_t mode) {
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    int result = OrigMkdir(changed ? mapped : path, mode);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache mkdir '%s' -> '%s' result=%d errno=%d",
+                             path, mapped, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheMkdirAt(int fd, const char *path, mode_t mode) {
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    int result = OrigMkdirAt(fd, changed ? mapped : path, mode);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache mkdirat fd=%d '%s' -> '%s' result=%d errno=%d",
+                             fd, path, mapped, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheRename(const char *from, const char *to) {
+    char mappedFrom[PATH_MAX], mappedTo[PATH_MAX];
+    bool changedFrom = TranslateMetalCachePath(from, mappedFrom);
+    bool changedTo = TranslateMetalCachePath(to, mappedTo);
+    int result = OrigRename(changedFrom ? mappedFrom : from,
+                            changedTo ? mappedTo : to);
+    int saved = errno;
+    if (changedFrom || changedTo)
+        MTLPatchLog("metal-cache rename '%s' -> '%s' result=%d errno=%d",
+                    changedFrom ? mappedFrom : from,
+                    changedTo ? mappedTo : to,
+                    result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheRenameAt(int fromFD, const char *from,
+                              int toFD, const char *to) {
+    char mappedFrom[PATH_MAX], mappedTo[PATH_MAX];
+    bool changedFrom = TranslateMetalCachePath(from, mappedFrom);
+    bool changedTo = TranslateMetalCachePath(to, mappedTo);
+    int result = OrigRenameAt(fromFD, changedFrom ? mappedFrom : from,
+                              toFD, changedTo ? mappedTo : to);
+    int saved = errno;
+    if (changedFrom || changedTo)
+        MTLPatchLog("metal-cache renameat '%s' -> '%s' result=%d errno=%d",
+                    changedFrom ? mappedFrom : from,
+                    changedTo ? mappedTo : to,
+                    result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheUnlink(const char *path) {
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    int result = OrigUnlink(changed ? mapped : path);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache unlink '%s' -> '%s' result=%d errno=%d",
+                             path, mapped, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static int MetalCacheUnlinkAt(int fd, const char *path, int flags) {
+    char mapped[PATH_MAX];
+    bool changed = TranslateMetalCachePath(path, mapped);
+    int result = OrigUnlinkAt(fd, changed ? mapped : path, flags);
+    int saved = errno;
+    if (changed) MTLPatchLog("metal-cache unlinkat fd=%d '%s' -> '%s' result=%d errno=%d",
+                             fd, path, mapped, result, result < 0 ? saved : 0);
+    errno = saved;
+    return result;
+}
+
+static void InstallMetalCachePathAdapter(void) {
+    // Parent exists in the stock mobile container; errors are left visible in
+    // the operation logs below.  The benchmark setup creates the final root
+    // once, while translated mkdir calls create per-compiler hash directories.
+    mkdir(kMetalCacheRoot, 0755);
+#define HOOK_LIBC(name, replacement, original) do { \
+    void *symbol = dlsym(RTLD_DEFAULT, name); \
+    if (symbol) MSHookFunction(symbol, (void *)(replacement), (void **)&(original)); \
+} while (0)
+    HOOK_LIBC("open", MetalCacheOpen, OrigOpen);
+    HOOK_LIBC("openat", MetalCacheOpenAt, OrigOpenAt);
+    HOOK_LIBC("stat", MetalCacheStat, OrigStat);
+    HOOK_LIBC("mkdir", MetalCacheMkdir, OrigMkdir);
+    HOOK_LIBC("mkdirat", MetalCacheMkdirAt, OrigMkdirAt);
+    HOOK_LIBC("rename", MetalCacheRename, OrigRename);
+    HOOK_LIBC("renameat", MetalCacheRenameAt, OrigRenameAt);
+    HOOK_LIBC("unlink", MetalCacheUnlink, OrigUnlink);
+    HOOK_LIBC("unlinkat", MetalCacheUnlinkAt, OrigUnlinkAt);
+#undef HOOK_LIBC
+    MTLPatchLog("metal-cache adapter installed root=%s open=%p openat=%p stat=%p mkdir=%p rename=%p unlink=%p",
+                kMetalCacheRoot, OrigOpen, OrigOpenAt, OrigStat, OrigMkdir,
+                OrigRename, OrigUnlink);
+}
+
+// The chroot's macOS Metal client sends source requests to the iOS-hosted
+// MTLCompilerService.  Runtime LLDB at MTLCodeGenServiceBuildRequest captured
+// the complete request ABI:
+//
+//   uint64_t sourceLength; uint64_t argumentLength;
+//   char source[sourceLength]; padding-to-8; char arguments[argumentLength];
+//
+// The arguments omit a target platform.  Consequently the iOS service emits
+// an iOS MTLB (header 0x0001/0x8200), which the unmodified macOS Metal loader
+// rejects at MTLLibraryDataWithArchive::parseArchiveSync+680.  LLDB replacing
+// the complete `-working-directory "..."` argument with
+// `-active-platform=macos` plus length-preserving padding advanced the same
+// request through the archive-format check and into real module compilation.
+// The runtime adapter additionally requires the chroot-only /var/folders
+// module-cache argument before making that replacement.  It then calls the
+// original compiler entry point; no compiler result or loader validation is
+// bypassed.
+//
+// MTLCompilerService 6D2CFE56-8D88-39AA-BC25-7FFE5058ED4E has two calls to
+// the same service-vtable slot: __TEXT+0x25f0 when the hang timer is active,
+// and __TEXT+0x2628 when MTL_HANG_TIMER_LENGTH_IN_SECONDS is less than one.
+// Both are `blraaz x8` (0xd63f091f).  Patching only +0x25f0 produced a
+// runtime-confirmed mixture of macOS MTLB headers (0x8001) and unadapted iOS
+// headers (0x0001) in a cold Chromium shader-cache run.  Replacing both
+// authenticated indirect calls with direct BLs avoids the arm64e
+// Substrate-trampoline PAC failure while leaving the exported function itself
+// untouched.
+typedef uintptr_t (*MTLCodeGenServiceBuildRequestFn)(
+    uintptr_t, uintptr_t, uintptr_t, void *, size_t, void *);
+static MTLCodeGenServiceBuildRequestFn OrigMTLCodeGenServiceBuildRequest = NULL;
+static uintptr_t StripPAC(const void *p);
+
+static uint64_t MacWSFNV1a64(const void *data, size_t length) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < length; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+// Read-only compiler-result witness.  MTLCompilerService's exact executable
+// reply block calls xpc_data_create at UUID-locked __TEXT+0x2770 with the
+// compiler result bytes and length.  The adapter redirects only that BL here,
+// records the returned container verbatim, then calls the real XPC API.  No
+// result bytes or status are changed.
+static void *MacWSCompilerReplyDataCreate(const void *bytes, size_t length) {
+    static _Atomic uint32_t replySequence = 0;
+    uint32_t sequence = atomic_fetch_add(&replySequence, 1) + 1;
+    uint64_t hash = MacWSFNV1a64(bytes, length);
+    uint8_t head[24] = {0};
+    size_t headLength = length < sizeof(head) ? length : sizeof(head);
+    if (bytes && headLength) memcpy(head, bytes, headLength);
+    MTLPatchLog("compiler reply #%u length=%zu hash=%016llx head=%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x",
+                sequence, length, (unsigned long long)hash,
+                head[0], head[1], head[2], head[3],
+                head[4], head[5], head[6], head[7],
+                head[8], head[9], head[10], head[11],
+                head[12], head[13], head[14], head[15],
+                head[16], head[17], head[18], head[19],
+                head[20], head[21], head[22], head[23]);
+
+    if (bytes && length && sequence <= 64) {
+        const char *directory = "/var/jb/var/mobile/mtlcompiler_replies";
+        mkdir(directory, 0755);
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/reply-%d-%03u-%zu-%016llx.bin",
+                 directory, getpid(), sequence, length,
+                 (unsigned long long)hash);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) {
+            const uint8_t *cursor = (const uint8_t *)bytes;
+            size_t remaining = length;
+            while (remaining) {
+                ssize_t written = write(fd, cursor, remaining);
+                if (written <= 0) break;
+                cursor += written;
+                remaining -= (size_t)written;
+            }
+            close(fd);
+            MTLPatchLog("compiler reply #%u dump=%s written=%zu/%zu",
+                        sequence, path, length - remaining, length);
+        } else {
+            MTLPatchLog("compiler reply #%u dump open failed path=%s errno=%d",
+                        sequence, path, errno);
+        }
+    }
+    return xpc_data_create(bytes, length);
+}
+
+static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
+    uintptr_t a0, uintptr_t a1, uintptr_t a2,
+    void *request, size_t requestSize, void *a5) {
+    static const char workingDirectoryPrefix[] = "-working-directory \"";
+    static const char targetArgument[] = "-active-platform=macos";
+    static _Atomic uint32_t requestSequence = 0;
+    uint32_t sequence = atomic_fetch_add(&requestSequence, 1) + 1;
+    if (sequence <= 256) {
+        uint8_t head[16] = {0};
+        size_t headLength = requestSize < sizeof(head)
+            ? requestSize : sizeof(head);
+        if (request && headLength) memcpy(head, request, headLength);
+        MTLPatchLog("target adapter entry #%u requestType=%#llx total=%zu request=%p head=%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x",
+                    sequence, (unsigned long long)a2, requestSize, request,
+                    head[0], head[1], head[2], head[3],
+                    head[4], head[5], head[6], head[7],
+                    head[8], head[9], head[10], head[11],
+                    head[12], head[13], head[14], head[15]);
+    }
+
+    bool adapted = false;
+    if (request && requestSize >= 16 && a2 == 0xd) {
+        // Chromium's MSL requests use two closely related serializations.
+        // Most are exactly 16 + source + 8-byte padding + arguments.  Others
+        // declare the same source/argument lengths but are four bytes shorter
+        // than that formula.  Both carry the literal compiler arguments, so
+        // locate the two exact chroot-only tokens in the bounded request blob
+        // instead of guessing which serializer produced it.
+        static const char cacheMarker[] =
+            "-fmodules-cache-path=\"/var/folders/zz/";
+        uint8_t *bytes = (uint8_t *)request;
+        size_t prefixLength = sizeof(workingDirectoryPrefix) - 1;
+        size_t markerLength = sizeof(cacheMarker) - 1;
+        size_t workingOffset = (size_t)-1;
+        size_t cacheOffset = (size_t)-1;
+        for (size_t i = 0; i + prefixLength <= requestSize; i++) {
+            if (memcmp(bytes + i, workingDirectoryPrefix,
+                       prefixLength) == 0) {
+                workingOffset = i;
+                break;
+            }
+        }
+        for (size_t i = 0; i + markerLength <= requestSize; i++) {
+            if (memcmp(bytes + i, cacheMarker, markerLength) == 0) {
+                cacheOffset = i;
+                break;
+            }
+        }
+        if (workingOffset != (size_t)-1 && cacheOffset != (size_t)-1) {
+            size_t closingQuote = workingOffset + prefixLength;
+            while (closingQuote < requestSize &&
+                   bytes[closingQuote] != '"') {
+                closingQuote++;
+            }
+            size_t targetLength = sizeof(targetArgument) - 1;
+            if (closingQuote < requestSize) {
+                size_t tokenLength = closingQuote - workingOffset + 1;
+                if (tokenLength >= targetLength) {
+                    memcpy(bytes + workingOffset, targetArgument,
+                           targetLength);
+                    memset(bytes + workingOffset + targetLength, ' ',
+                           tokenLength - targetLength);
+                    adapted = true;
+                }
+            }
+        }
+
+        uint64_t sourceLength = 0, argumentLength = 0;
+        memcpy(&sourceLength, bytes, sizeof(sourceLength));
+        memcpy(&argumentLength, bytes + 8, sizeof(argumentLength));
+        if (sourceLength <= requestSize - 16) {
+            size_t hashLength = (size_t)sourceLength;
+            if (hashLength && bytes[16 + hashLength - 1] == 0)
+                hashLength--;
+            uint64_t sourceHash = MacWSFNV1a64(bytes + 16, hashLength);
+            uint64_t expectedSize =
+                ((UINT64_C(16) + sourceLength + 7) & ~UINT64_C(7)) +
+                argumentLength;
+            long long layoutDelta = expectedSize <= LLONG_MAX
+                ? (long long)expectedSize - (long long)requestSize
+                : LLONG_MAX;
+            MTLPatchLog("target adapter request=%p total=%zu source=%llu sourceHash=%016llx args=%llu layoutDelta=%lld workingOffset=%lld cacheOffset=%lld adapted=%d",
+                        request, requestSize,
+                        (unsigned long long)sourceLength,
+                        (unsigned long long)sourceHash,
+                        (unsigned long long)argumentLength, layoutDelta,
+                        workingOffset == (size_t)-1 ? -1LL
+                            : (long long)workingOffset,
+                        cacheOffset == (size_t)-1 ? -1LL
+                            : (long long)cacheOffset,
+                        adapted);
+        }
+    }
+    return OrigMTLCodeGenServiceBuildRequest
+        ? OrigMTLCodeGenServiceBuildRequest(a0, a1, a2, request,
+                                            requestSize, a5)
+        : (uintptr_t)-1;
+}
+
+static void InstallMacOSMetalTargetAdapter(void) {
+    static const uint8_t expectedUUID[16] = {
+        0x6d, 0x2c, 0xfe, 0x56, 0x8d, 0x88, 0x39, 0xaa,
+        0xbc, 0x25, 0x7f, 0xfe, 0x50, 0x58, 0xed, 0x4e,
+    };
+    const struct mach_header_64 *mh = NULL;
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t i = 0; i < imageCount; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name,
+                "MTLCompilerService.xpc/MTLCompilerService")) {
+            mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            break;
+        }
+    }
+    if (!mh || mh->magic != MH_MAGIC_64 || mh->filetype != MH_EXECUTE) {
+        MTLPatchLog("target adapter: executable Mach-O header unavailable mh=%p magic=%#x filetype=%#x",
+                    mh, mh ? mh->magic : 0, mh ? mh->filetype : 0);
+        return;
+    }
+    const struct load_command *lc =
+        (const struct load_command *)((const uint8_t *)mh + sizeof(*mh));
+    bool uuidMatches = false;
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_UUID) {
+            const struct uuid_command *uc = (const struct uuid_command *)lc;
+            uuidMatches = memcmp(uc->uuid, expectedUUID, 16) == 0;
+            break;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    if (!uuidMatches) {
+        MTLPatchLog("target adapter: MTLCompilerService UUID mismatch");
+        return;
+    }
+
+    OrigMTLCodeGenServiceBuildRequest =
+        (MTLCodeGenServiceBuildRequestFn)dlsym(
+            RTLD_DEFAULT, "MTLCodeGenServiceBuildRequest");
+    static const uintptr_t callOffsets[] = {0x25f0, 0x2628};
+    const uint32_t expected = 0xd63f091f; // blraaz x8
+    if (!OrigMTLCodeGenServiceBuildRequest) {
+        MTLPatchLog("target adapter: symbol unavailable");
+        OrigMTLCodeGenServiceBuildRequest = NULL;
+        return;
+    }
+
+    uintptr_t target = StripPAC((const void *)MacWSMTLCodeGenServiceBuildRequest);
+    uint32_t branches[sizeof(callOffsets) / sizeof(callOffsets[0])] = {0};
+    for (size_t i = 0; i < sizeof(callOffsets) / sizeof(callOffsets[0]); i++) {
+        uint32_t *callSite = (uint32_t *)((uintptr_t)mh + callOffsets[i]);
+        intptr_t delta = (intptr_t)target - (intptr_t)callSite;
+        if (*callSite != expected) {
+            MTLPatchLog("target adapter: validation failed offset=%#lx site=%p insn=%#x",
+                        (unsigned long)callOffsets[i], callSite, *callSite);
+            OrigMTLCodeGenServiceBuildRequest = NULL;
+            return;
+        }
+        if ((delta & 3) != 0 || delta < -(1LL << 27) ||
+            delta >= (1LL << 27)) {
+            MTLPatchLog("target adapter: wrapper out of BL range offset=%#lx site=%p target=%#lx delta=%#lx",
+                        (unsigned long)callOffsets[i], callSite,
+                        (unsigned long)target, (unsigned long)delta);
+            OrigMTLCodeGenServiceBuildRequest = NULL;
+            return;
+        }
+        branches[i] = 0x94000000u |
+            ((uint32_t)((uint64_t)(delta >> 2) & 0x03ffffffu));
+    }
+    for (size_t i = 0; i < sizeof(callOffsets) / sizeof(callOffsets[0]); i++) {
+        uint32_t *callSite = (uint32_t *)((uintptr_t)mh + callOffsets[i]);
+        PatchInstruction(callSite, branches[i]);
+        MTLPatchLog("target adapter installed offset=%#lx site=%p old=%#x new=%#x wrapper=%#lx orig=%p",
+                    (unsigned long)callOffsets[i], callSite, expected,
+                    *callSite, (unsigned long)target,
+                    OrigMTLCodeGenServiceBuildRequest);
+    }
+
+    uint32_t *replyDataSite = (uint32_t *)((uintptr_t)mh + 0x2770);
+    const uint32_t expectedReplyCall = 0x9400047c; // bl _xpc_data_create stub
+    uintptr_t replyTarget = StripPAC((const void *)MacWSCompilerReplyDataCreate);
+    intptr_t replyDelta = (intptr_t)replyTarget - (intptr_t)replyDataSite;
+    if (*replyDataSite != expectedReplyCall || (replyDelta & 3) != 0 ||
+        replyDelta < -(1LL << 27) || replyDelta >= (1LL << 27)) {
+        MTLPatchLog("compiler reply observer validation failed site=%p insn=%#x target=%#lx delta=%#lx",
+                    replyDataSite, *replyDataSite,
+                    (unsigned long)replyTarget, (unsigned long)replyDelta);
+        return;
+    }
+    uint32_t replyBranch = 0x94000000u |
+        ((uint32_t)((uint64_t)(replyDelta >> 2) & 0x03ffffffu));
+    PatchInstruction(replyDataSite, replyBranch);
+    MTLPatchLog("compiler reply observer installed site=%p old=%#x new=%#x wrapper=%#lx",
+                replyDataSite, expectedReplyCall, *replyDataSite,
+                (unsigned long)replyTarget);
 }
 
 // Strip arm64e PAC bits from a pointer. dlsym/MSFindSymbol on arm64e
@@ -364,12 +851,15 @@ static void PatchAGXVerifyLoweredIR(void) {
 }
 
 %ctor {
+    InstallMetalCachePathAdapter();
     // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck start");
     dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_GLOBAL);
     MSImageRef image = MSGetImageByName("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler");
     if (image) {
     uint32_t *symbol = MSFindSymbol(image, "__ZN17MTLCompilerObject27readModuleFromBinaryRequestERK20ReadModuleParametersRN4llvm11LLVMContextEP15MTLFunctionTypePPvPmb");
     if (symbol) {
+    MTLPatchLog("readModuleFromBinaryRequest symbol=%p stripped=%#lx",
+                symbol, (unsigned long)StripPAC(symbol));
 
     // The OS check is the triplet:
     //   0xb94087e8  ldr w8, [sp, #0x84]
@@ -392,6 +882,10 @@ static void PatchAGXVerifyLoweredIR(void) {
             symbol[i+1] == SIG_CMP &&
             symbol[i+2] == SIG_BNE) {
             PatchInstruction(&symbol[i + 2], 0xd503201f); // nop the b.ne
+            MTLPatchLog("readModule OS check exact hit index=%d branch=%p "
+                        "ldr=%#x cmp=%#x oldBranch=%#x newBranch=%#x",
+                        i, &symbol[i + 2], symbol[i], symbol[i + 1],
+                        SIG_BNE, symbol[i + 2]);
             hit = 1;
             break;
         }
@@ -404,13 +898,24 @@ static void PatchAGXVerifyLoweredIR(void) {
                 symbol[i+1] == SIG_CMP &&
                 ((symbol[i+2] & 0xff00001fu) == 0x54000001u)) {
                 PatchInstruction(&symbol[i + 2], 0xd503201f);
+                MTLPatchLog("readModule OS check fallback hit index=%d "
+                            "branch=%p ldr=%#x cmp=%#x newBranch=%#x",
+                            i, &symbol[i + 2], symbol[i], symbol[i + 1],
+                            symbol[i + 2]);
+                hit = 1;
                 break;
             }
         }
     }
 
+    if (!hit) {
+        MTLPatchLog("readModule OS check signature NOT found in 16KB");
+    }
+
     } // if (symbol)
     } // if (image)
+
+    InstallMacOSMetalTargetAdapter();
 
     // Originally tried: PatchAGXVerifyLoweredIR() — bypass the
     // AGCLLVMUserObject::verifyLoweredIR check that surfaces the
@@ -472,4 +977,8 @@ static void PatchAGXVerifyLoweredIR(void) {
     // an unknown DSC version safely no-ops instead of corrupting code.
     MTLPatchLog("%%ctor: OS-check patched; running renamer patch now");
     PatchAGXRenamerSkipAgxPrefix();
+    if (access("/var/jb/var/mobile/macws_mtlcompiler_hold", F_OK) == 0) {
+        MTLPatchLog("diagnostic hold: SIGSTOP before accepting compiler requests");
+        raise(SIGSTOP);
+    }
 }

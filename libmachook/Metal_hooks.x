@@ -92,6 +92,7 @@ static void macws_tile_dump_command_buffer_targets(
 static void (*g_macws_orig_iogpu_queue_complete)(id, SEL, id, NSInteger) = NULL;
 static void (*g_macws_orig_iogpu_buffer_complete)(id, SEL, uint64_t, uint64_t,
                                                   id) = NULL;
+static id (*g_macws_orig_iogpu_command_buffer_error)(id, SEL) = NULL;
 static _Atomic int64_t g_macws_iogpu_clean_callback_status = INT64_MIN;
 static _Atomic uint64_t g_macws_iogpu_callback_count = 0;
 static _Atomic int g_macws_iogpu_error_dumped = 0;
@@ -390,6 +391,75 @@ static void macws_iogpu_buffer_complete(id self, SEL selector,
         self, selector, start_time, end_time, error);
 }
 
+// The raw IOGPU completion callback is not the final source of every NSError
+// exposed by an AGX command buffer.  Chromium 148 receives repeated
+// `Internal Error (00000102:Internal Error)` objects even when
+// -didCompleteWithStartTime:endTime:error: was called with error=nil.  Observe
+// the public/private command-buffer error getter at the point ANGLE reads it,
+// then join that exact object to the selector-0x1a flight recorder.  This is a
+// read-only diagnostic: it returns the original NSError unchanged and is
+// inert unless /tmp/macws_command_error_diag exists.
+static id macws_iogpu_command_buffer_error(id self, SEL selector) {
+    id error = g_macws_orig_iogpu_command_buffer_error
+        ? g_macws_orig_iogpu_command_buffer_error(self, selector) : nil;
+    if (!error ||
+        access("/tmp/macws_command_error_diag", F_OK) != 0) {
+        return error;
+    }
+
+    static _Atomic unsigned observation_count = 0;
+    static _Atomic int dumped_102 = 0;
+    static _Atomic int dumped_103 = 0;
+    static _Atomic int dumped_other = 0;
+    unsigned observation = atomic_fetch_add(&observation_count, 1) + 1;
+    uint64_t submit_serial = macws_latest_agx_submit_serial(
+        (__bridge const void *)self);
+    unsigned fixed = macws_agx_submit_fixed_count(submit_serial);
+    NSString *description = nil;
+    NSString *domain = nil;
+    NSInteger code = 0;
+    @try {
+        description = [error localizedDescription];
+        domain = [error domain];
+        code = [error code];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    const char *description_text = description
+        ? [description UTF8String] : "(nil)";
+    if (observation <= 64 || (observation & (observation - 1)) == 0) {
+        fprintf(stderr,
+            "#### IOGPU-ERROR-GETTER observation=%u commandBuffer=%p "
+            "class=%s submitSerial=%llu fixed=%u domain=%s code=%ld "
+            "description=%s\n",
+            observation, (__bridge void *)self, class_getName([self class]),
+            (unsigned long long)submit_serial, fixed,
+            domain ? [domain UTF8String] : "(nil)", (long)code,
+            description_text);
+    }
+
+    _Atomic int *dump_latch = &dumped_other;
+    const char *reason = "iogpu-error-getter-other";
+    if (description_text && strstr(description_text, "00000102")) {
+        dump_latch = &dumped_102;
+        reason = "iogpu-error-getter-102";
+    } else if (description_text && strstr(description_text, "00000103")) {
+        dump_latch = &dumped_103;
+        reason = "iogpu-error-getter-103";
+    }
+    int expected = 0;
+    if (atomic_compare_exchange_strong(dump_latch, &expected, 1)) {
+        if (submit_serial) {
+            macws_dump_recent_agx_submit_serial(
+                reason, (__bridge const void *)self, submit_serial);
+        } else {
+            macws_dump_recent_agx_submits(
+                reason, (__bridge const void *)self);
+        }
+    }
+    return error;
+}
+
 static void macws_install_iogpu_callback_diagnostics(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -402,6 +472,9 @@ static void macws_install_iogpu_callback_diagnostics(void) {
             "didCompleteWithStartTime:endTime:error:");
         Method buffer_method = buffer_class
             ? class_getInstanceMethod(buffer_class, buffer_selector) : NULL;
+        SEL error_selector = @selector(error);
+        Method error_method = buffer_class
+            ? class_getInstanceMethod(buffer_class, error_selector) : NULL;
         if (queue_method) {
             g_macws_orig_iogpu_queue_complete =
                 (void *)method_setImplementation(
@@ -412,11 +485,18 @@ static void macws_install_iogpu_callback_diagnostics(void) {
                 (void *)method_setImplementation(
                     buffer_method, (IMP)macws_iogpu_buffer_complete);
         }
+        if (error_method) {
+            g_macws_orig_iogpu_command_buffer_error =
+                (void *)method_setImplementation(
+                    error_method, (IMP)macws_iogpu_command_buffer_error);
+        }
         fprintf(stderr,
             "#### IOGPU-CALLBACK-DIAG installed queueClass=%p method=%p "
-            "orig=%p bufferClass=%p method=%p orig=%p (file-gated)\n",
+            "orig=%p bufferClass=%p method=%p orig=%p errorMethod=%p "
+            "errorOrig=%p (file-gated)\n",
             queue_class, queue_method, g_macws_orig_iogpu_queue_complete,
-            buffer_class, buffer_method, g_macws_orig_iogpu_buffer_complete);
+            buffer_class, buffer_method, g_macws_orig_iogpu_buffer_complete,
+            error_method, g_macws_orig_iogpu_command_buffer_error);
     });
 }
 
@@ -3149,6 +3229,18 @@ static void macws_log_failed_texture_descriptor(
 static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
                                                   IOSurfaceRef surf) {
     if (!tex || !surf) return;
+    // This witness describes the private AGXG13GFamilyTexture layout below;
+    // it is not a generic MTLTexture ABI.  The MTLSim path returns an
+    // MTLSimTexture whose object is only 0x58 bytes in the Chromium 148 GPU
+    // process.  Treating its bytes at +0x208 as AGX's `_impl` produced a PAC-
+    // shaped value and made this read-only diagnostic itself crash at
+    // impl+0xa0.  Runtime-confirmed by LLDB on Code Helper PID 13662, with the
+    // caller `-[MTLFakeDevice hooked_newTextureWithDescriptor:iosurface:plane:]`.
+    Class agx_texture_class = objc_getClass("AGXG13GFamilyTexture");
+    if (!agx_texture_class ||
+        ![(id)tex isKindOfClass:agx_texture_class]) {
+        return;
+    }
     // Resolve _impl ivar offset dynamically (fallback to 0x208 from RE
     // if the class introspection fails — UUID-stable across 13.x).
     static ptrdiff_t s_impl_off = 0;
@@ -4694,6 +4786,61 @@ static void macws_sigabrt_trampoline(int sig) {
         // tile-memory metadata (handled by iOS AGX kernel at render time).
         NSUInteger storageMode = [desc respondsToSelector:@selector(storageMode)]
                                  ? [desc storageMode] : 0;
+        NSUInteger pf = [desc respondsToSelector:@selector(pixelFormat)]
+                        ? [desc pixelFormat] : 80; // MTLPixelFormatBGRA8Unorm default
+
+        // Memoryless textures are tile-memory allocations and cannot have an
+        // IOSurface backing.  Route them before the non-2D compatibility gate
+        // so a multisample descriptor keeps its required texture type and
+        // sampleCount pairing intact.
+        if (storageMode == 3 /* MTLStorageModeMemoryless */) {
+            static int memless_native_log = 0;
+            if (memless_native_log++ < 4) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MEMORYLESS: routing to native AGX path "
+                    "(no IOSurface — tile-memory-only) w=%lu h=%lu pf=%lu\n",
+                    (unsigned long)([desc respondsToSelector:@selector(width)] ? [desc width] : 0),
+                    (unsigned long)([desc respondsToSelector:@selector(height)] ? [desc height] : 0),
+                    (unsigned long)pf);
+            }
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            if (memless_native_log < 6) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain MEMORYLESS native result: %p "
+                    "(class=%s storageMode=%lu length=%lu)\n",
+                    (void *)tex,
+                    tex ? class_getName([tex class]) : "(nil)",
+                    tex && [tex respondsToSelector:@selector(storageMode)]
+                        ? (unsigned long)[tex storageMode] : 999UL,
+                    tex && [tex respondsToSelector:@selector(length)]
+                        ? (unsigned long)[(id)tex length] : 999UL);
+            }
+            return tex;
+        }
+
+        // Metal forbids IOSurface-backed depth and stencil textures.  ANGLE
+        // requests these for WebGL framebuffer attachments, so preserve the
+        // caller's descriptor and let the real AGX device allocate them.
+        // Values are the public MTLPixelFormat depth/stencil family.
+        BOOL depthOrStencil =
+            (pf == 250 || pf == 252 || pf == 253 || pf == 255 ||
+             pf == 260 || pf == 261 || pf == 262);
+        if (depthOrStencil) {
+            static int depth_stencil_log = 0;
+            if (depth_stencil_log++ < 8) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain DEPTH-STENCIL: pf=%lu routing to "
+                    "native AGX path (IOSurface backing is invalid)\n",
+                    (unsigned long)pf);
+            }
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            if (depth_stencil_log < 10) {
+                fprintf(stderr,
+                    "#### MTL_TEX plain DEPTH-STENCIL native result: %p class=%s\n",
+                    (void *)tex, tex ? class_getName([tex class]) : "(nil)");
+            }
+            return tex;
+        }
         // 2026-06-20 — Texture-type gate: ROUTE-IOSURF can ONLY back
         // MTLTextureType2D or MTLTextureType2DArray (Metal's IOSurface
         // texture validation enforces this with assertion
@@ -4788,44 +4935,10 @@ static void macws_sigabrt_trampoline(int sig) {
             }
             // Continue down to the ROUTE-IOSURF path below.
         }
-        if (storageMode == 3 /* MTLStorageModeMemoryless */) {
-            static int memless_native_log = 0;
-            if (memless_native_log++ < 4) {
-                fprintf(stderr,
-                    "#### MTL_TEX plain MEMORYLESS: routing to native AGX path "
-                    "(no IOSurface — tile-memory-only) w=%lu h=%lu pf=%lu\n",
-                    (unsigned long)([desc respondsToSelector:@selector(width)] ? [desc width] : 0),
-                    (unsigned long)([desc respondsToSelector:@selector(height)] ? [desc height] : 0),
-                    (unsigned long)([desc respondsToSelector:@selector(pixelFormat)] ? [desc pixelFormat] : 0));
-            }
-            // Call the original AGXG13GFamilyDevice IMP via the
-            // swizzle-renamed selector.  This is the only branch where
-            // the chroot's plain newTextureWithDescriptor: actually
-            // delegates to the real AGX texture-creation path — for
-            // all other storageModes we still need the IOSurface
-            // shim below because AGXTexture init's selector cascade
-            // currently doesn't fully resolve for IOSurface-less
-            // Private/Shared/Managed allocations.
-            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-            if (memless_native_log < 6) {
-                fprintf(stderr,
-                    "#### MTL_TEX plain MEMORYLESS native result: %p "
-                    "(class=%s storageMode=%lu length=%lu)\n",
-                    (void *)tex,
-                    tex ? class_getName([tex class]) : "(nil)",
-                    tex && [tex respondsToSelector:@selector(storageMode)]
-                        ? (unsigned long)[tex storageMode] : 999UL,
-                    tex && [tex respondsToSelector:@selector(length)]
-                        ? (unsigned long)[(id)tex length] : 999UL);
-            }
-            return tex;
-        }
         NSUInteger width  = [desc respondsToSelector:@selector(width)]
                             ? [desc width] : 0;
         NSUInteger height = [desc respondsToSelector:@selector(height)]
                             ? [desc height] : 0;
-        NSUInteger pf     = [desc respondsToSelector:@selector(pixelFormat)]
-                            ? [desc pixelFormat] : 80; // MTLPixelFormatBGRA8Unorm default
         if (width == 0 || height == 0) {
             static int bad_log = 0;
             if (bad_log++ < 4)
@@ -4847,6 +4960,7 @@ static void macws_sigabrt_trampoline(int sig) {
         //   MTLPixelFormatRGBA8Unorm        = 70
         //   MTLPixelFormatBGRA8Unorm_sRGB   = 81
         //   MTLPixelFormatRGBA16Float       = 115  (8 bpp)
+        //   MTLPixelFormatRGBA32Float       = 125  (16 bpp)
         //   MTLPixelFormatR8Unorm           = 10   (1 bpp)
         if (compressedPF550) {
             fmt4cc = 643969848; // private '&b38' IOSurface format
@@ -4866,6 +4980,15 @@ static void macws_sigabrt_trampoline(int sig) {
             fmt4cc = 'w40a'; bpe = 8;
         }
         else if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
+        else if (pf == 125) {
+            // Chromium 148 creates a 16x16 RGBA32Float Viz texture during
+            // GPU-process initialization.  Treating this as the historical
+            // BGRA8 fallback gives the IOSurface a 128-byte stride, while
+            // Metal correctly requires 16 pixels * 16 B/px = 256 bytes and
+            // aborts in _mtlValidateStrideTextureParameters.  'RGfA' is the
+            // CoreVideo/IOSurface 128-bit RGBA-float layout.
+            fmt4cc = 'RGfA'; bpe = 16;
+        }
         else if (pf == 10) { fmt4cc = 'L008'; bpe = 1; }
         else if (pf == 70 || pf == 71) { fmt4cc = 'RGBA'; bpe = 4; }
         // 2026-06-20 — IOSurface pool keyed by (w,h,pf,fmt4cc,bpe) to
@@ -4971,11 +5094,12 @@ static void macws_sigabrt_trampoline(int sig) {
                     access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
                     fprintf(stderr,
                         "#### MTL_TEX POOL-NEW: key=%s → IOSurface=%p "
-                        "(alloc=%zu KB, map=%s)\n",
+                        "(bpr=%zu alloc=%zu KB, map=%s)\n",
                         [poolKey UTF8String], (void *)surf,
+                        IOSurfaceGetBytesPerRow(surf),
                         IOSurfaceGetAllocSize(surf) / 1024,
                         compressedPF550 ? "PF550-COMPRESSED" :
-                        (pf == 552 || pf == 553 || pf == 115 || pf == 10 ||
+                        (pf == 552 || pf == 553 || pf == 115 || pf == 125 || pf == 10 ||
                          pf == 70 || pf == 71 || pf == 80 || pf == 81)
                             ? "EXPLICIT" : "UNKNOWN-FALLBACK-BGRA4");
                 }
@@ -6481,11 +6605,216 @@ static void macws_install_tile_descriptor_diagnostic(void) {
         textures_method != NULL, update_bind_method != NULL);
 }
 
+// Read-only source-library compilation witness. Chromium/ANGLE reports
+// "This library format is not supported on this platform" after handing MSL
+// to the real AGX device.  Capture the public compile options and the NSError
+// returned by the actual device method so the compiler-target mismatch can be
+// fixed upstream in MTLCompilerService rather than hidden by a retry or a
+// validation bypass. Enable with /private/tmp/macws_mtl_library_diag.
+typedef id (*macws_new_library_source_fn)(id, SEL, NSString *, id, NSError **);
+static macws_new_library_source_fn g_macws_new_library_source_orig = NULL;
+static _Atomic uint32_t g_macws_new_library_source_count = 0;
+
+static uint64_t macws_source_fnv1a64(const void *data, size_t length) {
+    const uint8_t *bytes = (const uint8_t *)data;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < length; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static unsigned long long macws_objc_unsigned_property(id object,
+                                                       const char *name,
+                                                       BOOL *present) {
+    if (present) *present = NO;
+    if (!object) return 0;
+    SEL selector = sel_registerName(name);
+    if (![object respondsToSelector:selector]) return 0;
+    if (present) *present = YES;
+    return ((unsigned long long (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static id macws_new_library_source_diag(id self, SEL selector,
+                                        NSString *source, id options,
+                                        NSError **error) {
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_new_library_source_count, 1) + 1;
+    BOOL log_this = sequence <= 32;
+    const char *source_utf8 = source.UTF8String ?: "";
+    size_t source_utf8_length = strlen(source_utf8);
+    uint64_t source_hash = macws_source_fnv1a64(source_utf8,
+                                                source_utf8_length);
+    if (log_this) {
+        BOOL has_language = NO, has_library_type = NO;
+        BOOL has_fast_math = NO, has_optimization = NO;
+        unsigned long long language = macws_objc_unsigned_property(
+            options, "languageVersion", &has_language);
+        unsigned long long library_type = macws_objc_unsigned_property(
+            options, "libraryType", &has_library_type);
+        unsigned long long fast_math = macws_objc_unsigned_property(
+            options, "fastMathEnabled", &has_fast_math);
+        unsigned long long optimization = macws_objc_unsigned_property(
+            options, "optimizationLevel", &has_optimization);
+        NSString *prefix = source.length
+            ? [source substringToIndex:MIN((NSUInteger)240, source.length)] : @"";
+        prefix = [[prefix stringByReplacingOccurrencesOfString:@"\n"
+                                                   withString:@"\\n"]
+                       stringByReplacingOccurrencesOfString:@"\r"
+                                                   withString:@"\\r"];
+        fprintf(stderr,
+            "#### MTL-LIB-SOURCE in #%u pid=%d device=%s sourceLength=%lu "
+            "sourceUTF8Length=%zu sourceHash=%016llx "
+            "optionsClass=%s languageVersion=%s%llu libraryType=%s%llu "
+            "fastMath=%s%llu optimizationLevel=%s%llu prefix=%s\n",
+            sequence, getpid(), class_getName([self class]),
+            (unsigned long)source.length,
+            source_utf8_length, (unsigned long long)source_hash,
+            options ? class_getName([options class]) : "(nil)",
+            has_language ? "" : "NA/", language,
+            has_library_type ? "" : "NA/", library_type,
+            has_fast_math ? "" : "NA/", fast_math,
+            has_optimization ? "" : "NA/", optimization,
+            prefix.UTF8String ?: "");
+    }
+
+    NSError *local_error = nil;
+    NSError **error_pointer = error ? error : &local_error;
+    *error_pointer = nil;
+    id result = g_macws_new_library_source_orig
+        ? g_macws_new_library_source_orig(self, selector, source, options,
+                                          error_pointer)
+        : nil;
+    if (log_this) {
+        NSError *returned_error = *error_pointer;
+        fprintf(stderr,
+            "#### MTL-LIB-SOURCE out #%u sourceHash=%016llx library=%p class=%s "
+            "errorDomain=%s errorCode=%ld description=%s userInfo=%s\n",
+            sequence, (unsigned long long)source_hash, (void *)result,
+            result ? class_getName([result class]) : "(nil)",
+            returned_error ? returned_error.domain.UTF8String : "(nil)",
+            returned_error ? (long)returned_error.code : 0L,
+            returned_error ? returned_error.localizedDescription.UTF8String
+                           : "(nil)",
+            returned_error ? returned_error.userInfo.description.UTF8String
+                           : "(nil)");
+    }
+    return result;
+}
+
+static void macws_install_source_library_diagnostic(Class agx) {
+    if (access("/private/tmp/macws_mtl_library_diag", F_OK) != 0) return;
+    SEL selector = sel_registerName("newLibraryWithSource:options:error:");
+    Method method = class_getInstanceMethod(agx, selector);
+    if (!method) {
+        fprintf(stderr,
+            "#### MTL-LIB-SOURCE diagnostic missing selector on %s\n",
+            class_getName(agx));
+        return;
+    }
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)macws_new_library_source_diag) return;
+    g_macws_new_library_source_orig =
+        (macws_new_library_source_fn)current;
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(agx, selector, (IMP)macws_new_library_source_diag,
+                         types)) {
+        Method own_method = class_getInstanceMethod(agx, selector);
+        method_setImplementation(own_method,
+                                 (IMP)macws_new_library_source_diag);
+    }
+    fprintf(stderr,
+        "#### MTL-LIB-SOURCE diagnostic installed on %s orig=%p\n",
+        class_getName(agx), (void *)current);
+}
+
+// macOS Metal's private -[MTLDevice newEvent] contract is still used by
+// Chromium 148's ANGLE Metal backend.  The exact VS Code 1.130 libGLESv2
+// binary calls -newEvent at arm64 __TEXT+0x2db888, retains the result, then
+// passes it to encodeSignalEvent:value: without a nil check.  On the chroot's
+// iOS AGXG13GFamilyDevice the inherited method exists but returns nil, while
+// public -newSharedEvent returns a working native _MTLSharedEvent.  The same
+// probe on real M1 macOS returns _IOGPUMetalMTLEvent from -newEvent.
+//
+// Both event objects implement the operations ANGLE uses: signaledValue,
+// encodeSignalEvent:value:, and encodeWaitForEvent:value:.  The standalone
+// probe submits a signal-then-wait pair through the native AGX queue before
+// this adapter is installed.  Adapt only this device subclass and only after
+// the original method returned nil; no event validation or command is
+// skipped.
+typedef id (*macws_new_event_fn)(id, SEL)
+    __attribute__((ns_returns_retained));
+static macws_new_event_fn g_macws_new_event_orig = NULL;
+static _Atomic uint32_t g_macws_new_event_fallback_count = 0;
+
+static id macws_new_event_compat(id self, SEL selector)
+    __attribute__((ns_returns_retained));
+static id macws_new_event_compat(id self, SEL selector) {
+    id event = g_macws_new_event_orig
+        ? g_macws_new_event_orig(self, selector) : nil;
+    if (event || !getenv("MACWS_AGX_NATIVE")) return event;
+
+    id<MTLSharedEvent> shared_event = nil;
+    if ([self respondsToSelector:@selector(newSharedEvent)])
+        shared_event = [(id<MTLDevice>)self newSharedEvent];
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_new_event_fallback_count, 1) + 1;
+    if (sequence <= 32 || (sequence % 500) == 0) {
+        fprintf(stderr,
+            "#### MACWS-NEW-EVENT #%u original=nil sharedEvent=%p class=%s "
+            "device=%p deviceClass=%s\n",
+            sequence, (__bridge void *)shared_event,
+            shared_event ? class_getName([shared_event class]) : "(nil)",
+            (__bridge void *)self, class_getName([self class]));
+    }
+    return shared_event;
+}
+
+static void macws_install_new_event_compat(Class agx) {
+    SEL selector = sel_registerName("newEvent");
+    Method inherited_method = class_getInstanceMethod(agx, selector);
+    IMP current = inherited_method
+        ? method_getImplementation(inherited_method) : NULL;
+    const char *types = inherited_method
+        ? method_getTypeEncoding(inherited_method) : "@@:";
+    if (current == (IMP)macws_new_event_compat) return;
+
+    Class owner = Nil;
+    for (Class candidate = agx; candidate && !owner;
+         candidate = class_getSuperclass(candidate)) {
+        unsigned count = 0;
+        Method *methods = class_copyMethodList(candidate, &count);
+        for (unsigned i = 0; methods && i < count; i++) {
+            if (method_getName(methods[i]) == selector) {
+                owner = candidate;
+                break;
+            }
+        }
+        free(methods);
+    }
+
+    g_macws_new_event_orig = (macws_new_event_fn)current;
+    BOOL added = class_addMethod(agx, selector,
+                                 (IMP)macws_new_event_compat, types);
+    if (!added) {
+        Method own_method = class_getInstanceMethod(agx, selector);
+        method_setImplementation(own_method, (IMP)macws_new_event_compat);
+    }
+    fprintf(stderr,
+        "#### MACWS-NEW-EVENT adapter installed deviceClass=%s owner=%s "
+        "orig=%p added=%d\n",
+        class_getName(agx), owner ? class_getName(owner) : "(none)",
+        (void *)current, added);
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
     install_cbri_probe();         // log commandBufferResourceInfo returns
     macws_install_tile_descriptor_diagnostic();
+    macws_install_source_library_diagnostic(agx);
+    macws_install_new_event_compat(agx);
     // (no pipeline fallback — see removed block above)
 
     SEL sel = @selector(initWithAcceleratorPort:);

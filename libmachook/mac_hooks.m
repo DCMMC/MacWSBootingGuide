@@ -23,6 +23,310 @@
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 
+// The iOS kernel cannot service macOS arm64's MAP_JIT/APRR contract for the
+// chroot process, even though CS_DEBUGGED permits ordinary W^X mprotect
+// transitions.  Keep this adapter opt-in and use it only for programs that
+// were compiled with pthread_jit_write_protect_np support (currently the
+// latest VS Code Electron framework).
+//
+// Unlike a check bypass, this preserves the executable-memory invariant:
+// MAP_JIT reservations are retried as normal anonymous reservations, RWX
+// requests become writable-only, and the existing V8 write-scope transitions
+// flip the recorded ranges between RW and RX.  A mach_vm_remap optimization
+// that loses execute permission on iOS is declined before it overwrites the
+// writable destination, allowing V8's existing copy fallback to run.
+typedef struct {
+    uintptr_t base;
+    size_t size;
+} MacWSJITRange;
+
+static MacWSJITRange g_macws_jit_ranges[32];
+static _Atomic unsigned g_macws_jit_range_count = 0;
+static pthread_mutex_t g_macws_jit_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic unsigned g_macws_jit_active_writers = 0;
+static _Thread_local bool g_macws_jit_thread_writable = false;
+static _Atomic unsigned g_macws_jit_remap_declines = 0;
+static _Atomic unsigned g_macws_jit_permission_flips = 0;
+static _Atomic unsigned g_macws_jit_mprotect_calls = 0;
+static _Atomic unsigned g_macws_jit_exec_waits = 0;
+static _Atomic unsigned g_macws_jit_late_fetch_retries = 0;
+static _Atomic unsigned g_macws_jit_handler_checks = 0;
+static pthread_mutex_t g_macws_jit_handler_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct sigaction g_macws_jit_downstream_sigbus;
+static bool g_macws_jit_downstream_sigbus_valid = false;
+
+static void macws_jit_ensure_exec_barrier_handler(void);
+
+static bool macws_jit_mprotect_compat_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = getenv("MACWS_JIT_MPROTECT_COMPAT") ? 1 : 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_jit_range_overlaps(uintptr_t base, size_t size) {
+    if (size == 0 || base > UINTPTR_MAX - size) return false;
+    uintptr_t end = base + size;
+    bool overlaps = false;
+    pthread_mutex_lock(&g_macws_jit_state_lock);
+    unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
+                                           memory_order_acquire);
+    for (unsigned i = 0; i < count; i++) {
+        uintptr_t range_base = g_macws_jit_ranges[i].base;
+        size_t range_size = g_macws_jit_ranges[i].size;
+        if (range_size == 0 || range_base > UINTPTR_MAX - range_size) continue;
+        if (base < range_base + range_size && range_base < end) {
+            overlaps = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_jit_state_lock);
+    return overlaps;
+}
+
+static void macws_jit_record_range(void *address, size_t size) {
+    if (!address || address == MAP_FAILED || size == 0) return;
+    pthread_mutex_lock(&g_macws_jit_state_lock);
+    unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
+                                           memory_order_relaxed);
+    if (count < sizeof(g_macws_jit_ranges) / sizeof(g_macws_jit_ranges[0])) {
+        g_macws_jit_ranges[count].base = (uintptr_t)address;
+        g_macws_jit_ranges[count].size = size;
+        atomic_store_explicit(&g_macws_jit_range_count, count + 1,
+                              memory_order_release);
+        fprintf(stderr,
+            "#### JIT-MPROTECT range[%u]=[%p,%p) source=MAP_JIT-EINVAL\n",
+            count, address, (void *)((uintptr_t)address + size));
+    }
+    pthread_mutex_unlock(&g_macws_jit_state_lock);
+    macws_jit_ensure_exec_barrier_handler();
+}
+
+static void macws_jit_remove_range(void *address, size_t size) {
+    if (!address || size == 0 || (uintptr_t)address > UINTPTR_MAX - size) return;
+    uintptr_t removed_base = (uintptr_t)address;
+    uintptr_t removed_end = removed_base + size;
+
+    pthread_mutex_lock(&g_macws_jit_state_lock);
+    unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
+                                           memory_order_relaxed);
+    for (unsigned i = 0; i < count;) {
+        uintptr_t range_base = g_macws_jit_ranges[i].base;
+        size_t range_size = g_macws_jit_ranges[i].size;
+        uintptr_t range_end = range_base + range_size;
+        if (range_size == 0 || removed_base >= range_end ||
+            range_base >= removed_end) {
+            i++;
+            continue;
+        }
+
+        if (removed_base <= range_base && removed_end >= range_end) {
+            memmove(&g_macws_jit_ranges[i], &g_macws_jit_ranges[i + 1],
+                    (count - i - 1) * sizeof(g_macws_jit_ranges[0]));
+            count--;
+            continue;
+        }
+        if (removed_base <= range_base) {
+            g_macws_jit_ranges[i].base = removed_end;
+            g_macws_jit_ranges[i].size = range_end - removed_end;
+            i++;
+            continue;
+        }
+        if (removed_end >= range_end) {
+            g_macws_jit_ranges[i].size = removed_base - range_base;
+            i++;
+            continue;
+        }
+
+        // A middle slice was unmapped.  Preserve both live pieces when the
+        // fixed table has room; this path is not expected for V8 CodeRange,
+        // whose reservation and release are both page-aligned whole ranges.
+        if (count < sizeof(g_macws_jit_ranges) /
+                        sizeof(g_macws_jit_ranges[0])) {
+            memmove(&g_macws_jit_ranges[i + 2],
+                    &g_macws_jit_ranges[i + 1],
+                    (count - i - 1) * sizeof(g_macws_jit_ranges[0]));
+            g_macws_jit_ranges[i].size = removed_base - range_base;
+            g_macws_jit_ranges[i + 1].base = removed_end;
+            g_macws_jit_ranges[i + 1].size = range_end - removed_end;
+            count++;
+            i += 2;
+        } else {
+            // Retain the larger live side rather than tracking an unmapped
+            // hole that a future unrelated allocation could reuse.
+            size_t left_size = removed_base - range_base;
+            size_t right_size = range_end - removed_end;
+            if (right_size > left_size) {
+                g_macws_jit_ranges[i].base = removed_end;
+                g_macws_jit_ranges[i].size = right_size;
+            } else {
+                g_macws_jit_ranges[i].size = left_size;
+            }
+            i++;
+        }
+    }
+    atomic_store_explicit(&g_macws_jit_range_count, count,
+                          memory_order_release);
+    pthread_mutex_unlock(&g_macws_jit_state_lock);
+}
+
+static bool macws_jit_pc_in_recorded_range(uintptr_t pc) {
+    unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
+                                           memory_order_acquire);
+    if (count > sizeof(g_macws_jit_ranges) / sizeof(g_macws_jit_ranges[0])) {
+        count = sizeof(g_macws_jit_ranges) / sizeof(g_macws_jit_ranges[0]);
+    }
+    for (unsigned i = 0; i < count; i++) {
+        uintptr_t base = g_macws_jit_ranges[i].base;
+        size_t size = g_macws_jit_ranges[i].size;
+        if (size && base <= pc && pc - base < size) return true;
+    }
+    return false;
+}
+
+static void macws_jit_forward_sigbus(int signo, siginfo_t *info,
+                                     void *context) {
+    if (g_macws_jit_downstream_sigbus_valid) {
+        struct sigaction downstream = g_macws_jit_downstream_sigbus;
+        if ((downstream.sa_flags & SA_SIGINFO) &&
+            downstream.sa_sigaction &&
+            downstream.sa_sigaction != (void *)SIG_DFL &&
+            downstream.sa_sigaction != (void *)SIG_IGN) {
+            downstream.sa_sigaction(signo, info, context);
+            return;
+        }
+        if (!(downstream.sa_flags & SA_SIGINFO) &&
+            downstream.sa_handler == SIG_IGN) {
+            return;
+        }
+        if (!(downstream.sa_flags & SA_SIGINFO) &&
+            downstream.sa_handler && downstream.sa_handler != SIG_DFL) {
+            downstream.sa_handler(signo);
+            return;
+        }
+    }
+
+    // Preserve the ordinary crash path (CrashReporter/Mach exception handling)
+    // for every SIGBUS that is not an instruction fetch temporarily blocked by
+    // our W^X transition.
+    struct sigaction default_action;
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    sigaction(SIGBUS, &default_action, NULL);
+    raise(SIGBUS);
+}
+
+static void macws_jit_exec_barrier_sigbus(int signo, siginfo_t *info,
+                                          void *context) {
+    uintptr_t pc = 0;
+#if defined(__arm64__) || defined(__arm64e__)
+    ucontext_t *ucontext = (ucontext_t *)context;
+    if (ucontext && ucontext->uc_mcontext) {
+        pc = (uintptr_t)arm_thread_state64_get_pc(
+            ucontext->uc_mcontext->__ss);
+    }
+#else
+    (void)context;
+#endif
+
+    // A writer always executes this hook and V8's surrounding C++ from signed
+    // __TEXT, never from CodeRange.  If it does try to execute JIT code while
+    // its own write scope is open, waiting would self-deadlock, so preserve the
+    // original fault instead of hiding that invariant violation.
+    // The exception is raised when the fetch observes RW, but signal delivery
+    // can occur after the last writer has already restored RX and published a
+    // zero writer count.  Treat both states as retryable.  Requiring si_addr
+    // to equal PC is important: a genuine data SIGBUS raised by JIT-generated
+    // code must still follow Chromium's ordinary crash path.
+    if (signo == SIGBUS && pc && info &&
+        (uintptr_t)info->si_addr == pc && !g_macws_jit_thread_writable &&
+        macws_jit_pc_in_recorded_range(pc)) {
+        unsigned writers = atomic_load_explicit(
+            &g_macws_jit_active_writers, memory_order_acquire);
+        if (writers != 0) {
+            atomic_fetch_add_explicit(&g_macws_jit_exec_waits, 1,
+                                      memory_order_relaxed);
+            while (atomic_load_explicit(&g_macws_jit_active_writers,
+                                        memory_order_acquire) != 0) {
+                __asm__ volatile("yield" ::: "memory");
+            }
+        } else {
+            atomic_fetch_add_explicit(&g_macws_jit_late_fetch_retries, 1,
+                                      memory_order_relaxed);
+        }
+        // Returning retries the same faulting PC after the last writer has
+        // restored the complete CodeRange to RX.
+        return;
+    }
+
+    macws_jit_forward_sigbus(signo, info, context);
+}
+
+static void macws_jit_ensure_exec_barrier_handler(void) {
+    if (!macws_jit_mprotect_compat_enabled()) return;
+
+    pthread_mutex_lock(&g_macws_jit_handler_lock);
+    struct sigaction current;
+    memset(&current, 0, sizeof(current));
+    if (sigaction(SIGBUS, NULL, &current) != 0) {
+        pthread_mutex_unlock(&g_macws_jit_handler_lock);
+        return;
+    }
+    bool already_installed =
+        (current.sa_flags & SA_SIGINFO) &&
+        current.sa_sigaction == macws_jit_exec_barrier_sigbus;
+    if (!already_installed) {
+        g_macws_jit_downstream_sigbus = current;
+        g_macws_jit_downstream_sigbus_valid = true;
+
+        struct sigaction barrier;
+        memset(&barrier, 0, sizeof(barrier));
+        barrier.sa_sigaction = macws_jit_exec_barrier_sigbus;
+        barrier.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&barrier.sa_mask);
+        if (sigaction(SIGBUS, &barrier, NULL) == 0) {
+            fprintf(stderr,
+                "#### JIT-MPROTECT execution barrier installed "
+                "(W^X fetch-wait compatibility)\n");
+        }
+    }
+    pthread_mutex_unlock(&g_macws_jit_handler_lock);
+}
+
+static void macws_jit_set_all_permissions(int protection) {
+    unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
+                                           memory_order_acquire);
+    for (unsigned i = 0; i < count; i++) {
+        void *base = (void *)g_macws_jit_ranges[i].base;
+        size_t size = g_macws_jit_ranges[i].size;
+        if (mprotect(base, size, protection) != 0) {
+            fprintf(stderr,
+                "#### JIT-MPROTECT flip FAIL range=%u base=%p size=%#zx "
+                "prot=%#x errno=%d\n",
+                i, base, size, protection, errno);
+        }
+    }
+    unsigned sequence = atomic_fetch_add_explicit(
+        &g_macws_jit_permission_flips, 1, memory_order_relaxed) + 1;
+    if (sequence <= 32 || (sequence % 1024) == 0) {
+        fprintf(stderr,
+            "#### JIT-MPROTECT flip #%u ranges=%u prot=%s writers=%u "
+            "exec_waits=%u late_retries=%u\n",
+            sequence, count,
+            protection == (PROT_READ | PROT_WRITE) ? "RW" : "RX",
+            atomic_load_explicit(&g_macws_jit_active_writers,
+                                 memory_order_relaxed),
+            atomic_load_explicit(&g_macws_jit_exec_waits,
+                                 memory_order_relaxed),
+            atomic_load_explicit(&g_macws_jit_late_fetch_retries,
+                                 memory_order_relaxed));
+    }
+}
+
 // GlassDemo blur A/B fixture.  This is deliberately a render-input diagnostic,
 // not a graphics-protocol patch: it inserts a high-frequency stripe view below
 // the demo's existing material=13 / WithinWindow NSVisualEffectView.  The
@@ -391,10 +695,8 @@ static _Thread_local uint64_t g_macws_agx_initfull_len = 0;
 static _Atomic int g_macws_iomfb_coexist_swap_cancel = 0;
 static void macws_install_quartzcore_frame_info_hook(
     const struct mach_header *header);
-#if defined(LIBMACHOOK_ON_DEVICE_BUILD)
 static IOReturn (*g_macws_orig_iomfb_swap_end)(void *framebuffer) = NULL;
 static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer);
-#endif
 
 // IOSurface
 typedef id IOSurfaceRef;
@@ -5659,6 +5961,54 @@ int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, 
     return sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
+extern int __mac_syscall(const char *policy, int operation, void *argument);
+extern int csr_get_active_config(uint32_t *configuration);
+int __mac_syscall_new(const char *policy, int operation, void *argument) {
+    // Chromium 148 queries this macOS AMFI policy specifically to decide
+    // whether child task-control ports are movable.  The iOS 16.3 kernel
+    // returns ENOSYS for the macOS policy operation, while its task control
+    // ports are in fact hard-immovable.  Chromium treats query failure as
+    // "movable" and asks every helper to MOVE_SEND mach_task_self(), which the
+    // kernel terminates with EXC_GUARD/ILLEGAL_MOVE.
+    //
+    // Report the equivalent `amfi_get_out_of_my_way` bit so Chromium uses its
+    // own documented no-task-port fallback (crbug.com/1291789).  This is a
+    // narrow system-policy compatibility result, not a mach_msg rewrite or a
+    // guard bypass.  Keep it opt-in for macOS applications that need it.
+    if (getenv("MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT") && policy && argument &&
+        strcmp(policy, "AMFI") == 0 && operation == 0x60) {
+        *(uint64_t *)argument = 1ULL << 2;
+        static _Atomic bool logged = false;
+        if (!atomic_exchange_explicit(&logged, true, memory_order_relaxed)) {
+            fprintf(stderr,
+                "#### AMFI-POLICY-COMPAT policy=AMFI op=0x60 status=0x4 "
+                "(iOS task ports are hard-immovable)\n");
+        }
+        return 0;
+    }
+    return __mac_syscall(policy, operation, argument);
+}
+
+int csr_get_active_config_new(uint32_t *configuration) {
+    // iOS has no macOS System Integrity Protection configuration and returns
+    // ENOSYS from this compatibility symbol.  Chromium 148 queries it only for
+    // its system-policy crash key immediately after the AMFI task-port query.
+    // Expose the conservative macOS value (no CSR exceptions enabled) instead
+    // of leaving the API absent.  Keeping all permission bits clear avoids
+    // granting or advertising capabilities that this shim does not provide.
+    if (getenv("MACWS_MACOS_SYSTEM_POLICY_COMPAT") && configuration) {
+        *configuration = 0;
+        static _Atomic bool logged = false;
+        if (!atomic_exchange_explicit(&logged, true, memory_order_relaxed)) {
+            fprintf(stderr,
+                "#### CSR-POLICY-COMPAT active_config=0x0 "
+                "(conservative iOS compatibility value)\n");
+        }
+        return 0;
+    }
+    return csr_get_active_config(configuration);
+}
+
 extern int sandbox_init_with_parameters(const char *profile, uint64_t flags, const char **params, char **errorbuf);
 int sandbox_init_with_parameters_new(const char *profile, uint64_t flags, const char **params, char **errorbuf) {
     // printf("debugbydcmmc Calling interposed sandbox_init_with_parameters\n");
@@ -5668,6 +6018,77 @@ int sandbox_init_with_parameters_new(const char *profile, uint64_t flags, const 
 kern_return_t mach_port_construct_new(ipc_space_t task, mach_port_options_ptr_t options, uint64_t context, mach_port_name_t *name) {
     options->flags &= ~MPO_TG_BLOCK_TRACKING;
     return mach_port_construct(task, options, context, name);
+}
+
+// Diagnostic only: Chromium's Mojo channel is being terminated by the iOS
+// kernel with EXC_GUARD/ILLEGAL_MOVE while sending a complex `MOJO` message.
+// The crash report preserves the disposition (MOVE_SEND), but not the message
+// buffer itself.  Capture the exact descriptor and current right types before
+// entering the kernel.  This deliberately does not rewrite the message or
+// suppress the guard exception; enable it only with MACWS_MACH_MSG_TRACE=1.
+static bool macws_mach_msg_trace_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = getenv("MACWS_MACH_MSG_TRACE") ? 1 : 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
+                               mach_msg_option_t option,
+                               mach_msg_size_t send_size,
+                               mach_msg_size_t receive_limit,
+                               mach_port_name_t receive_name,
+                               mach_msg_timeout_t timeout,
+                               mach_port_name_t notify) {
+    if (macws_mach_msg_trace_enabled() && message &&
+        (option & MACH_SEND_MSG) &&
+        (message->msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+        message->msgh_id == (mach_msg_id_t)'MOJO' &&
+        send_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        const mach_msg_body_t *body =
+            (const mach_msg_body_t *)(message + 1);
+        uint32_t count = body->msgh_descriptor_count;
+        const mach_msg_port_descriptor_t *descriptors =
+            (const mach_msg_port_descriptor_t *)(body + 1);
+        size_t descriptor_bytes =
+            (size_t)count * sizeof(mach_msg_port_descriptor_t);
+        size_t required = sizeof(mach_msg_header_t) +
+                          sizeof(mach_msg_body_t) + descriptor_bytes;
+        if (count <= 64 && required <= send_size) {
+            char line[768];
+            int used = snprintf(line, sizeof(line),
+                "#### MACH-MSG-SEND pid=%d id=0x%x bits=0x%x remote=%u "
+                "local=%u size=%u descriptors=%u",
+                getpid(), message->msgh_id, message->msgh_bits,
+                message->msgh_remote_port, message->msgh_local_port,
+                send_size, count);
+            for (uint32_t i = 0; i < count && used > 0 &&
+                 (size_t)used < sizeof(line); i++) {
+                const mach_msg_port_descriptor_t *descriptor =
+                    &descriptors[i];
+                mach_port_type_t right_types = 0;
+                kern_return_t type_kr = mach_port_type(
+                    mach_task_self(), descriptor->name, &right_types);
+                int appended = snprintf(line + used, sizeof(line) - used,
+                    " d%u={name=%u,disp=%u,type=%u,rights=0x%x,type_kr=0x%x}",
+                    i, descriptor->name, descriptor->disposition,
+                    descriptor->type, right_types, type_kr);
+                if (appended < 0) break;
+                used += appended;
+            }
+            if (used > 0) {
+                size_t length = (size_t)used < sizeof(line) ?
+                    (size_t)used : sizeof(line) - 1;
+                if (length + 1 < sizeof(line)) line[length++] = '\n';
+                write(STDERR_FILENO, line, length);
+            }
+        }
+    }
+    return mach_msg(message, option, send_size, receive_limit, receive_name,
+                    timeout, notify);
 }
 
 // Simulate functions that are not implemented in iOS kernel
@@ -5749,6 +6170,181 @@ int getaudit_addr_new(auditinfo_addr_t *auditinfo_addr, u_int length) {
     return 0;
 }
 
+void *mmap_new(void *address, size_t size, int protection, int flags, int fd,
+               off_t offset) {
+    void *result = mmap(address, size, protection, flags, fd, offset);
+    if (!macws_jit_mprotect_compat_enabled() ||
+        (flags & MAP_JIT) == 0 || result != MAP_FAILED || errno != EINVAL) {
+        return result;
+    }
+
+    // Runtime-confirmed on iOS 16.3: every MAP_JIT shape returns EINVAL,
+    // including the first 16-KiB request from an iOS-platform probe carrying
+    // dynamic-codesigning, allow-jit, unsigned-executable-memory, and
+    // verified-jit entitlements.  The same process can perform RW -> RX
+    // mprotect transitions after EnableJIT(), so retain that W^X model.
+    result = mmap(address, size, protection, flags & ~MAP_JIT, fd, offset);
+    if (result != MAP_FAILED) {
+        macws_jit_record_range(result, size);
+    }
+    return result;
+}
+
+int mprotect_new(void *address, size_t size, int protection) {
+    int effective = protection;
+    bool jit_overlap = macws_jit_mprotect_compat_enabled() &&
+        macws_jit_range_overlaps((uintptr_t)address, size);
+    if (jit_overlap &&
+        protection == (PROT_READ | PROT_WRITE | PROT_EXEC)) {
+        // iOS's VM_MAP_POLICY_WX_STRIP_X performs this same reduction for a
+        // normal mapping.  Make it explicit so V8 receives the writable half
+        // of the contract; pthread_jit_write_protect_np_new supplies RX.
+        effective = PROT_READ | PROT_WRITE;
+    }
+    int result = mprotect(address, size, effective);
+    if (jit_overlap && getenv("MACWS_JIT_MPROTECT_TRACE")) {
+        unsigned sequence = atomic_fetch_add_explicit(
+            &g_macws_jit_mprotect_calls, 1, memory_order_relaxed) + 1;
+        if (sequence <= 256 || (sequence % 1024) == 0) {
+            void *caller = __builtin_return_address(0);
+            Dl_info image = {0};
+            dladdr(caller, &image);
+            fprintf(stderr,
+                "#### JIT-MPROTECT call #%u addr=%p size=%#zx "
+                "requested=%#x effective=%#x result=%d errno=%d "
+                "caller=%p image=%s offset=%#llx\n",
+                sequence, address, size, protection, effective, result,
+                result == 0 ? 0 : errno, caller,
+                image.dli_fname ?: "(unknown)",
+                (unsigned long long)(image.dli_fbase
+                    ? (uintptr_t)caller - (uintptr_t)image.dli_fbase : 0));
+        }
+    }
+    return result;
+}
+
+int munmap_new(void *address, size_t size) {
+    int result = munmap(address, size);
+    if (result == 0 && macws_jit_mprotect_compat_enabled()) {
+        macws_jit_remove_range(address, size);
+    }
+    return result;
+}
+
+extern kern_return_t mach_vm_remap(
+    vm_map_t target_task, mach_vm_address_t *target_address,
+    mach_vm_size_t size, mach_vm_offset_t mask, int flags,
+    vm_map_t source_task, mach_vm_address_t source_address, boolean_t copy,
+    vm_prot_t *current_protection, vm_prot_t *maximum_protection,
+    vm_inherit_t inheritance);
+
+kern_return_t mach_vm_remap_new(
+    vm_map_t target_task, mach_vm_address_t *target_address,
+    mach_vm_size_t size, mach_vm_offset_t mask, int flags,
+    vm_map_t source_task, mach_vm_address_t source_address, boolean_t copy,
+    vm_prot_t *current_protection, vm_prot_t *maximum_protection,
+    vm_inherit_t inheritance) {
+    vm_prot_t requested = current_protection ? *current_protection : VM_PROT_NONE;
+    if (macws_jit_mprotect_compat_enabled() && target_address &&
+        (requested & VM_PROT_EXECUTE) != 0 &&
+        macws_jit_range_overlaps((uintptr_t)*target_address, (size_t)size)) {
+        // RE/runtime evidence: on this kernel a successful remap from an r-x
+        // Electron __TEXT source changes both returned protections and the
+        // destination to r--.  Decline the optional optimization before it
+        // overwrites V8's writable destination; V8 then copies the blob under
+        // its normal RwxMemoryWriteScope.
+        unsigned sequence = atomic_fetch_add_explicit(
+            &g_macws_jit_remap_declines, 1, memory_order_relaxed) + 1;
+        fprintf(stderr,
+            "#### JIT-MPROTECT remap decline #%u dst=%p size=%#llx "
+            "src=%p requested=%#x -> V8 copy fallback\n",
+            sequence, (void *)(uintptr_t)*target_address,
+            (unsigned long long)size, (void *)(uintptr_t)source_address,
+            requested);
+        return KERN_NOT_SUPPORTED;
+    }
+    return mach_vm_remap(target_task, target_address, size, mask, flags,
+                         source_task, source_address, copy,
+                         current_protection, maximum_protection, inheritance);
+}
+
+// pthread.h marks this API unavailable for iOS even though the symbol is in
+// libSystem and macOS Electron imports it.  Name the same Mach-O symbol through
+// an undecorated declaration so the iOS SDK availability attribute does not
+// prevent building the chroot compatibility interposer.
+extern void macws_pthread_jit_write_protect_original(int enabled)
+    __asm("_pthread_jit_write_protect_np");
+void pthread_jit_write_protect_np_new(int enabled) {
+    if (!macws_jit_mprotect_compat_enabled()) {
+        macws_pthread_jit_write_protect_original(enabled);
+        return;
+    }
+
+    // Runtime-confirmed by Code-2026-07-28-135327.ips: the iOS 16.3
+    // libsystem_pthread symbol exists but ends in brk #1 (+516) when called by
+    // this macOS process.  In compatibility mode the process-wide mprotect
+    // transitions below are the complete W^X implementation; do not enter the
+    // unavailable APRR/thread-local system stub.  Calls made before V8 records
+    // its first MAP_JIT range have no pages to transition.
+    if (atomic_load_explicit(&g_macws_jit_range_count,
+                             memory_order_acquire) == 0) {
+        return;
+    }
+
+    // Chromium installs and refreshes crash plumbing while its child
+    // processes start.  Reassert the SIGBUS fetch barrier frequently during
+    // startup, then only periodically once V8 is warm.  This is deliberately
+    // outside g_macws_jit_state_lock: sigaction() may take libc locks and the
+    // handler itself must never wait for our state mutex.
+    unsigned handler_check = atomic_fetch_add_explicit(
+        &g_macws_jit_handler_checks, 1, memory_order_relaxed) + 1;
+    if (handler_check <= 64 || (handler_check % 1024) == 0) {
+        macws_jit_ensure_exec_barrier_handler();
+    }
+
+    pthread_mutex_lock(&g_macws_jit_state_lock);
+    if (!enabled) {
+        if (!g_macws_jit_thread_writable) {
+            unsigned writers = atomic_load_explicit(
+                &g_macws_jit_active_writers, memory_order_relaxed);
+            if (writers == 0) {
+                // Publish the writer before removing execute permission.  A
+                // racing fetch that faults after the mprotect must know it can
+                // wait; publishing early is harmless while the range is RX.
+                atomic_store_explicit(&g_macws_jit_active_writers, 1,
+                                      memory_order_release);
+                macws_jit_set_all_permissions(PROT_READ | PROT_WRITE);
+            } else {
+                atomic_store_explicit(&g_macws_jit_active_writers,
+                                      writers + 1, memory_order_release);
+            }
+            g_macws_jit_thread_writable = true;
+        }
+    } else {
+        if (g_macws_jit_thread_writable) {
+            g_macws_jit_thread_writable = false;
+            unsigned writers = atomic_load_explicit(
+                &g_macws_jit_active_writers, memory_order_relaxed);
+            if (writers == 1) {
+                // Keep active_writers nonzero until every range is executable
+                // again.  Waiting fetches retry only after the release store.
+                macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+                atomic_store_explicit(&g_macws_jit_active_writers, 0,
+                                      memory_order_release);
+            } else if (writers > 1) {
+                atomic_store_explicit(&g_macws_jit_active_writers,
+                                      writers - 1, memory_order_release);
+            }
+        } else if (atomic_load_explicit(&g_macws_jit_active_writers,
+                                        memory_order_acquire) == 0) {
+            // Establish executable state for a newly recorded range even if
+            // V8's first observed transition is an enable operation.
+            macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+        }
+    }
+    pthread_mutex_unlock(&g_macws_jit_state_lock);
+}
+
 IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
     // WindowServer composites window content into Apple-GPU LOSSLESS-COMPRESSED / TILED
     // IOSurfaces (IOSurfacePlaneCompressionType != 0, pf 0x26425241, 16x16 tiles). The
@@ -5805,12 +6401,21 @@ IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
 }
 
 DYLD_INTERPOSE(sysctlbyname_new, sysctlbyname);
+DYLD_INTERPOSE(__mac_syscall_new, __mac_syscall);
+DYLD_INTERPOSE(csr_get_active_config_new, csr_get_active_config);
 DYLD_INTERPOSE(sandbox_init_with_parameters_new, sandbox_init_with_parameters);
 DYLD_INTERPOSE(mach_port_construct_new, mach_port_construct);
+DYLD_INTERPOSE(mach_msg_new, mach_msg);
 DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
 DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
+DYLD_INTERPOSE(mmap_new, mmap);
+DYLD_INTERPOSE(mprotect_new, mprotect);
+DYLD_INTERPOSE(munmap_new, munmap);
+DYLD_INTERPOSE(mach_vm_remap_new, mach_vm_remap);
+DYLD_INTERPOSE(pthread_jit_write_protect_np_new,
+               macws_pthread_jit_write_protect_original);
 
 // ─── objc_alloc tracer for AGX classes ──────────────────────────────────────
 // When AGXMetal13_3's AGX::Mempool::grow lambda calls objc_alloc(AGXBuffer),
@@ -7464,7 +8069,7 @@ static _Atomic uintptr_t g_macws_submit_marks[MACWS_SUBMIT_MARK_COUNT];
 static _Atomic uint64_t g_macws_submit_mark_serial = 0;
 static _Atomic uint64_t g_macws_submit_serial_marks[MACWS_SUBMIT_MARK_COUNT];
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void macws_mark_agx_submit_for_error_dump(const void *command_buffer) {
     if (!command_buffer || access("/tmp/macws_submit_ring", F_OK) != 0)
         return;
@@ -7480,7 +8085,7 @@ void macws_mark_agx_submit_for_error_dump(const void *command_buffer) {
     }
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void macws_mark_agx_submit_serial_for_error_dump(uint64_t submit_serial) {
     if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
         return;
@@ -7507,7 +8112,7 @@ static BOOL macws_submit_ring_serial_is_marked(uint64_t submit_serial) {
     return NO;
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 uint64_t macws_latest_agx_submit_serial(const void *command_buffer) {
     if (!command_buffer || access("/tmp/macws_submit_ring", F_OK) != 0)
         return 0;
@@ -7529,7 +8134,7 @@ uint64_t macws_latest_agx_submit_serial(const void *command_buffer) {
     return result;
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 unsigned macws_agx_submit_fixed_count(uint64_t submit_serial) {
     if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
         return 0;
@@ -7544,7 +8149,7 @@ unsigned macws_agx_submit_fixed_count(uint64_t submit_serial) {
     return result;
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 int macws_agx_submit_dimensions(uint64_t submit_serial,
                                 uint32_t *width_out,
                                 uint32_t *height_out) {
@@ -7826,13 +8431,13 @@ static void macws_dump_recent_agx_submits_impl(
         (unsigned long long)newest, directory);
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void macws_dump_recent_agx_submits(const char *reason,
                                    const void *command_buffer) {
     macws_dump_recent_agx_submits_impl(reason, command_buffer, 0);
 }
 
-__attribute__((visibility("default")))
+__attribute__((used, visibility("default")))
 void macws_dump_recent_agx_submit_serial(const char *reason,
                                          const void *command_buffer,
                                          uint64_t submit_serial) {
@@ -7846,8 +8451,19 @@ static uint64_t macws_strip_user_pointer(uint64_t raw) {
 
 static int macws_plausible_agx_pointer(uint64_t raw, size_t bytes) {
     uint64_t p = macws_strip_user_pointer(raw);
-    return p >= 0x100000000ULL && p < 0x280000000ULL &&
-        bytes <= 0x10000 && p + bytes >= p && p + bytes <= 0x280000000ULL;
+    // The previous upper bound (0x280000000) happened to cover
+    // WindowServer's allocator zones, but it is not an IOGPU ABI boundary.
+    // Runtime LLDB capture from VS Code 1.130 / Chromium 148 showed the live
+    // selector-0x1e descriptor chain in readable GPU-process regions at
+    // 0x601128040 -> command buffer 0x601be1c00 -> storage 0x6001adc00.
+    // Rejecting those ordinary 0x600... heap addresses made the existing
+    // structurally validated KCMD translator silently skip every Chromium
+    // submission.  Keep a bounded process-user range and retain the overflow
+    // and per-object size checks; downstream descriptor/self/storage anchors
+    // still have to validate before any byte is inspected or translated.
+    const uint64_t user_limit = 0x800000000ULL;
+    return p >= 0x100000000ULL && p < user_limit &&
+        bytes <= 0x10000 && p + bytes >= p && p + bytes <= user_limit;
 }
 
 static void macws_submit_hex(const char *what, unsigned sequence,
@@ -8171,6 +8787,127 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
     return 1;
 }
 
+// TEMPORARY ABI-TRANSLATION EXPERIMENT for Chromium's trailing-wrapper form.
+//
+// The raw IOGPU callback correlated VS Code submit serial 2 with
+// MTLCommandBufferErrorDomain/1 and internal status 0x102.  Its retained
+// pre-submit artifacts (SHA-256 KCMD
+// 8df48a8ed24efd35bf27a4623d182214c303d6e983138159b37f58da9a060820,
+// segment list
+// 6ab4552a490b4eecfc5fca1456d18212deae23be580a9c91f185845d9f82189d)
+// have a third framing variant:
+//
+//   KCMD 0x858 or 0x870 bytes:
+//     +0x000 subtype-1 span 0x840 (known macOS record + trailer)
+//     +0x840 one or two 0x18-byte type-3 wrapper records
+//   segment list (captured sizes 0x148 and 0x188 bytes):
+//     +0x008 inner count=1, encoded length=L, range=[0,0x840)
+//     +L trailing wrapper, range=[0x840,total)
+//
+// A later Chromium GPU-process capture (submit serial 18, retained under
+// docs/evidence/vscode-trailing-wrapper-fix-20260728-2105) has the exact
+// same command framing with L=0x170 instead of 0x130.  The intervening bytes
+// are resource-list payload, so validate L and the wrapper record rather than
+// assuming one fixed resource count.
+//
+// The existing direct translator rejected it because the complete KCMD span
+// is deliberately larger than the inner subtype-1 range.  Preserve the two
+// wrapper records byte-for-byte, normalize only the same two RE-confirmed
+// macOS-only subtype-1 padding windows, then shift both exact ranges.  This is
+// diagnostic scaffolding under /tmp/macws_kcmd_wrapped_fix, not a claim that
+// type-3 wrapper semantics have been fully reconstructed.
+static unsigned macws_translate_agx_trailing_wrapped_subtype1(
+    unsigned sequence, unsigned char *commands, size_t *total_io,
+    unsigned char *segment_list, size_t segment_length) {
+    if (!commands || !total_io || !segment_list ||
+        (*total_io != 0x858 && *total_io != 0x870) ||
+        segment_length < 0x38)
+        return 0;
+
+    size_t total = *total_io;
+    unsigned char *record = commands;
+    uint32_t list_magic = *(uint32_t *)(segment_list + 0x00);
+    uint32_t encoded_length = *(uint32_t *)(segment_list + 0x0c);
+    if (encoded_length < 0x20 ||
+        (size_t)encoded_length + 0x18 != segment_length)
+        return 0;
+    unsigned char *wrapper_list = segment_list + encoded_length;
+    uint32_t wrapper_opcode = *(uint32_t *)(commands + 0x848);
+    unsigned wrapper_count = (unsigned)((total - 0x840) / 0x18);
+    int wrapper_records_ok = wrapper_count >= 1 && wrapper_count <= 2;
+    for (unsigned i = 0; wrapper_records_ok && i < wrapper_count; i++) {
+        size_t offset = 0x840 + (size_t)i * 0x18;
+        wrapper_records_ok =
+            *(uint32_t *)(commands + offset + 0x00) == 3 &&
+            *(uint32_t *)(commands + offset + 0x04) == 0x18 &&
+            *(uint32_t *)(commands + offset + 0x08) == wrapper_opcode;
+    }
+    int wrapper_ok =
+        *(uint32_t *)(segment_list + 0x08) == 1 &&
+        *(uint32_t *)(segment_list + 0x18) == 0 &&
+        *(uint32_t *)(segment_list + 0x1c) == 0x840 &&
+        *(uint32_t *)(wrapper_list + 0x00) == list_magic &&
+        *(uint32_t *)(wrapper_list + 0x04) == 2 &&
+        *(uint32_t *)(wrapper_list + 0x08) == 1 &&
+        *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
+        *(uint32_t *)(wrapper_list + 0x10) == 0x840 &&
+        *(uint32_t *)(wrapper_list + 0x14) == total &&
+        wrapper_opcode < 0x10000 && (wrapper_opcode & 0xff) == 3 &&
+        wrapper_records_ok;
+    int subtype1_ok =
+        *(uint32_t *)(record + 0x00) == 0x10000 &&
+        *(uint32_t *)(record + 0x04) == 0x840 &&
+        *(uint32_t *)(record + 0x28) == 0x818 &&
+        *(uint32_t *)(record + 0x2c) == 0x7e8 &&
+        *(uint32_t *)(record + 0x30) == 0x30 &&
+        *(uint32_t *)(record + 0x34) == 1 &&
+        memcmp(record + 0xd8,
+            "\x03\x00\x6b\x00\x12\x00\x3a\x00", 8) == 0 &&
+        macws_submit_bytes_are_zero(record + 0x1c0, 0x10) &&
+        *(uint32_t *)(record + 0x1e0) == 1 &&
+        *(uint32_t *)(record + 0x1e8) == 0x1c &&
+        memcmp(record + 0x1f8,
+            "\xff\xff\xff\xff\xff\xff\xff\xff"
+            "\xff\xff\xff\xff", 12) == 0 &&
+        macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
+        *(uint32_t *)(record + 0x4d0) == 0x3f800000 &&
+        (*(uint32_t *)(record + 0x4d4) == 0x100 ||
+         *(uint32_t *)(record + 0x4d4) == 0x300) &&
+        memcmp(record + 0x4e8,
+            "\xff\xff\xff\xff\xff\xff\xff\xff"
+            "\xff\xff\xff\xff", 12) == 0;
+    if (!wrapper_ok || !subtype1_ok)
+        return 0;
+
+    // Delete from high to low so offsets still refer to the captured macOS
+    // record. Both moves include the complete 0x30-byte wrapper tail.
+    memmove(record + 0x4c0, record + 0x4d0, total - 0x4d0);
+    total -= 0x10;
+    memmove(record + 0x1c0, record + 0x1d0, total - 0x1d0);
+    total -= 0x10;
+    memset(commands + total, 0, 0x20);
+
+    *(uint32_t *)(record + 0x04) = 0x820;
+    *(uint32_t *)(record + 0x28) = 0x7f8;
+    *(uint32_t *)(record + 0x2c) = 0x7c8;
+    macws_subtype1_semantic_field_diagnostic(sequence, 0, record);
+    *(uint32_t *)(segment_list + 0x1c) = 0x820;
+    *(uint32_t *)(wrapper_list + 0x10) = 0x820;
+    *(uint32_t *)(wrapper_list + 0x14) = (uint32_t)total;
+    *total_io = total;
+
+    static _Atomic unsigned match_count = 0;
+    unsigned observed = atomic_fetch_add(&match_count, 1) + 1;
+    if (observed <= 8 || (observed & (observed - 1)) == 0) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-TRAILING-WRAPPER-FIX "
+            "match=%u subtype1=0..0x840->0..0x820 "
+            "wrappers=%u range=0x840..%#zx->0x820..%#zx\n",
+            sequence, observed, wrapper_count, total + 0x20, total);
+    }
+    return 1;
+}
+
 // TEMPORARY ABI-TRANSLATION EXPERIMENT for a storage object containing more
 // than one segment.  Runtime capture of WindowServer submit #9 established
 // the segment-list framing on this exact iOS 16.3 device:
@@ -8202,14 +8939,26 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
 static unsigned macws_translate_agx_multisegment_subtype1(
     unsigned sequence, unsigned char *commands, size_t *total_io,
     unsigned char *segment_list, size_t segment_length) {
-    if (!commands || !total_io || !segment_list || segment_length < 0x250)
+    if (!commands || !total_io || !segment_list || segment_length < 0x20)
         return 0;
 
     size_t total = *total_io;
     uint32_t count = *(uint32_t *)(segment_list + 0x08);
     uint32_t encoded_length = *(uint32_t *)(segment_list + 0x0c);
+    BOOL direct_list =
+        encoded_length == (0x80000000U | (uint32_t)segment_length);
+    // Chromium also emits the same trailing type-3 wrapper already captured
+    // for a single subtype-1 segment, but after a variable-length list of two
+    // or more vendor segments.  In that framing list+0x0c is the byte offset
+    // of a final 0x18-byte wrapper-list record, not the high-bit-tagged total
+    // list size.  Exact runtime witnesses:
+    //   error 0x102 serial 12: KCMD 0x1098, list 0x2a8, base list 0x290
+    //   error 0x0a  serial 13: KCMD 0x0a68, list 0x268, base list 0x250
+    BOOL trailing_wrapper_list =
+        encoded_length >= 0x20 &&
+        (size_t)encoded_length + 0x18 == segment_length;
     if (count < 2 || count > 64 ||
-        encoded_length != (0x80000000U | (uint32_t)segment_length))
+        (!direct_list && !trailing_wrapper_list))
         return 0;
 
     uint32_t pair_offsets[64] = {0};
@@ -8237,8 +8986,42 @@ static unsigned macws_translate_agx_multisegment_subtype1(
             return 0;
         cursor = end;
     }
-    if (cursor != total)
-        return 0;
+    uint32_t wrapper_pair_offset = UINT32_MAX;
+    if (direct_list) {
+        if (cursor != total)
+            return 0;
+    } else {
+        if (cursor > total)
+            return 0;
+        size_t wrapper_bytes = total - cursor;
+        if (wrapper_bytes != 0x18 && wrapper_bytes != 0x30) {
+            return 0;
+        }
+        unsigned wrapper_count = (unsigned)(wrapper_bytes / 0x18);
+        uint32_t wrapper_opcode =
+            *(uint32_t *)(commands + cursor + 0x08);
+        BOOL wrapper_commands_ok = wrapper_opcode < 0x10000 &&
+            (wrapper_opcode & 0xff) == 3;
+        for (unsigned i = 0; wrapper_commands_ok && i < wrapper_count; i++) {
+            size_t offset = cursor + (size_t)i * 0x18;
+            wrapper_commands_ok =
+                *(uint32_t *)(commands + offset + 0x00) == 3 &&
+                *(uint32_t *)(commands + offset + 0x04) == 0x18 &&
+                *(uint32_t *)(commands + offset + 0x08) == wrapper_opcode;
+        }
+        unsigned char *wrapper_list = segment_list + encoded_length;
+        uint32_t list_magic = *(uint32_t *)(segment_list + 0x00);
+        BOOL wrapper_list_ok =
+            *(uint32_t *)(wrapper_list + 0x00) == list_magic &&
+            *(uint32_t *)(wrapper_list + 0x04) == 2 &&
+            *(uint32_t *)(wrapper_list + 0x08) == 1 &&
+            *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
+            *(uint32_t *)(wrapper_list + 0x10) == cursor &&
+            *(uint32_t *)(wrapper_list + 0x14) == total;
+        if (!wrapper_commands_ok || !wrapper_list_ok)
+            return 0;
+        wrapper_pair_offset = encoded_length + 0x10;
+    }
 
     int log_segments = atomic_fetch_add(
         &g_macws_multisegment_log_batches, 1) < 4;
@@ -8327,13 +9110,20 @@ static unsigned macws_translate_agx_multisegment_subtype1(
             *(uint32_t *)(later_range + 0x00) -= shrink;
             *(uint32_t *)(later_range + 0x04) -= shrink;
         }
+        if (wrapper_pair_offset != UINT32_MAX) {
+            unsigned char *wrapper_range =
+                segment_list + wrapper_pair_offset;
+            *(uint32_t *)(wrapper_range + 0x00) -= shrink;
+            *(uint32_t *)(wrapper_range + 0x04) -= shrink;
+        }
         fixed++;
         if (log_segments) fprintf(stderr,
                 "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-MULTISEG-FIX "
                 "segment=%u/%u subtype=%u range=%#x..%#x->%#x "
-                "shrink=%#x storage=%#zx\n",
+                "shrink=%#x storage=%#zx wrappedTail=%s\n",
                 sequence, i, count, subtype1_anchors ? 1 : 3,
-                start, end, end - shrink, shrink, total);
+                start, end, end - shrink, shrink, total,
+                wrapper_pair_offset == UINT32_MAX ? "NO" : "YES");
     }
 
     *total_io = total;
@@ -8367,21 +9157,46 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         fprintf(stderr, " fix-requested=%s\n", allow_fix ? "YES" : "NO");
     }
 
-    uint64_t descriptor_raw[2] = {
-        *(const uint64_t *)(submit + 0x10),
-        *(const uint64_t *)(submit + 0x18)
-    };
-    uint64_t seen_state[2] = {0, 0};
-    for (unsigned descriptor_index = 0; descriptor_index < 2;
-         descriptor_index++) {
+    // IOGPUMetalDevice::cmdBufArgsSize returns 0x38 on this exact image, and
+    // runtime selector-0x1e captures show inStructCnt=56/112/224 for batches
+    // of 1/2/4 command buffers.  The previous parser inspected only offsets
+    // +0x10/+0x18 of the first 0x38-byte entry.  Chromium's first 0x102
+    // completion witnesses consequently had submitSerial=0 while another
+    // command buffer from the same batch was present in the flight recorder.
+    // Walk every complete args entry; the queue splits batches at 32 in
+    // -[IOGPUMetalCommandQueue submitCommandBuffers:count:].
+    const size_t command_buffer_args_size = 0x38;
+    size_t submit_entry_count = inStructCnt / command_buffer_args_size;
+    if (submit_entry_count == 0 ||
+        inStructCnt % command_buffer_args_size != 0) {
+        submit_entry_count = 1;
+    }
+    if (submit_entry_count > 32) submit_entry_count = 32;
+    uint64_t seen_state[64] = {0};
+    unsigned seen_state_count = 0;
+    if (verbose) fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u argsSize=%#zx submitEntries=%zu\n",
+            result.sequence, inStructCnt, submit_entry_count);
+    for (size_t submit_entry = 0; submit_entry < submit_entry_count;
+         submit_entry++) {
+        const unsigned char *entry =
+            submit + submit_entry * command_buffer_args_size;
+        uint64_t descriptor_raw[2] = {
+            *(const uint64_t *)(entry + 0x10),
+            *(const uint64_t *)(entry + 0x18)
+        };
+        for (unsigned descriptor_slot = 0; descriptor_slot < 2;
+             descriptor_slot++) {
+        unsigned descriptor_index =
+            (unsigned)(submit_entry * 2 + descriptor_slot);
         uint64_t descriptor = macws_strip_user_pointer(
-            descriptor_raw[descriptor_index]);
-        if (!macws_plausible_agx_pointer(descriptor_raw[descriptor_index],
+            descriptor_raw[descriptor_slot]);
+        if (!macws_plausible_agx_pointer(descriptor_raw[descriptor_slot],
                                           0x28)) {
             if (verbose) fprintf(stderr,
                     "#### AGX_SUBMIT_DIAG #%u descriptor[%u]=%#llx invalid\n",
                     result.sequence, descriptor_index,
-                    (unsigned long long)descriptor_raw[descriptor_index]);
+                    (unsigned long long)descriptor_raw[descriptor_slot]);
             continue;
         }
 
@@ -8394,7 +9209,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 "self=%#llx rawSelf=%#llx\n",
                 result.sequence, descriptor_index,
                 (unsigned long long)descriptor,
-                (unsigned long long)descriptor_raw[descriptor_index],
+                (unsigned long long)descriptor_raw[descriptor_slot],
                 (unsigned long long)self, (unsigned long long)self_raw);
         if (!macws_plausible_agx_pointer(self_raw, 0x258))
             continue;
@@ -8408,14 +9223,22 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     (unsigned long long)state_raw);
             continue;
         }
-        if (state == seen_state[0] || state == seen_state[1]) {
+        BOOL duplicate_state = NO;
+        for (unsigned seen = 0; seen < seen_state_count; seen++) {
+            if (seen_state[seen] == state) {
+                duplicate_state = YES;
+                break;
+            }
+        }
+        if (duplicate_state) {
             if (verbose) fprintf(stderr,
                     "#### AGX_SUBMIT_DIAG #%u descriptor[%u] state=%#llx duplicate\n",
                     result.sequence, descriptor_index,
                     (unsigned long long)state);
             continue;
         }
-        seen_state[descriptor_index] = state;
+        if (seen_state_count < sizeof(seen_state) / sizeof(seen_state[0]))
+            seen_state[seen_state_count++] = state;
 
         // RE-confirmed via the iOS 16.3 IOGPU implementations of
         // IOGPUMetalCommandBufferStorageCreateExt and
@@ -8500,13 +9323,20 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         if (verbose) macws_submit_save_kcmd(result.sequence, descriptor_index,
                                             "pre", commands, total);
 
-        if (allow_fix && segment_length == 0x148 &&
+        if (allow_fix && segment_length >= 0x38 &&
             access("/tmp/macws_kcmd_wrapped_fix", F_OK) == 0) {
             unsigned wrapped_fixed =
                 macws_translate_agx_wrapped_single_subtype1(
                     result.sequence, commands, &total,
                     (unsigned char *)(uintptr_t)segment_start,
                     segment_length);
+            if (!wrapped_fixed) {
+                wrapped_fixed =
+                    macws_translate_agx_trailing_wrapped_subtype1(
+                        result.sequence, commands, &total,
+                        (unsigned char *)(uintptr_t)segment_start,
+                        segment_length);
+            }
             if (wrapped_fixed) {
                 result.candidates += wrapped_fixed;
                 result.fixed += wrapped_fixed;
@@ -8521,7 +9351,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             }
         }
 
-        if (allow_fix && segment_length >= 0x250) {
+        if (allow_fix && segment_length >= 0x20) {
             unsigned multisegment_fixed =
                 macws_translate_agx_multisegment_subtype1(
                     result.sequence, commands, &total,
@@ -8815,6 +9645,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             commands, total,
             (const unsigned char *)(uintptr_t)segment_start,
             segment_length);
+        }
     }
     return result;
 }
@@ -8867,6 +9698,86 @@ static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
         command_bytes += command->cmdsize;
     }
     return NO;
+}
+
+// Metal 310.37 (macOS 13.4) chooses the target platform for source-built
+// libraries by calling dyld_get_active_platform() from five call sites in
+// MTLLibraryBuilder::newLibraryWithSource.  In the chroot that correctly
+// reports macOS (1), but the resulting library is then loaded by the native
+// iOS AGX driver, which rejects the macOS library format.  Translate only the
+// five RE-confirmed calls in the exact Metal image below to iOS (2).  Every
+// other caller, including the rest of Metal and all other frameworks, keeps
+// the real chroot platform.
+//
+// RE-confirmed with misc/ios_lldb_tmux.sh against the loaded binary:
+//   UUID 2BAB169C-42DA-36E3-955A-F30B709EC2AD
+//   image base                         Metal[0x0000000189848000]
+//   MTLLibraryBuilder::newLibrary...   Metal[0x000000018993572c]
+//   dyld_get_active_platform LR offsets from image base:
+//       0x0edf14 0x0edf28 0x0ee018 0x0ee654 0x0ee690
+// Runtime success still has to be witnessed by a non-nil MTLLibrary and a
+// rendered WebGL frame; this translator is not labelled a completed fix yet.
+extern uint32_t dyld_get_active_platform(void);
+
+static uint32_t dyld_get_active_platform_new(void) {
+    uint32_t actual = dyld_get_active_platform();
+    // Diagnostic A/B only.  The first runtime trial proved that forcing these
+    // calls to iOS makes MTLCompilerService emit an iOS MTLB container
+    // (0x0001/0x8200), which the macOS Metal loader rejects.  Keep it opt-in
+    // while the unmodified macOS-platform request is measured with the now
+    // working compiler cache path.
+    if (!getenv("MACWS_AGX_NATIVE") ||
+        !getenv("MACWS_METAL_SOURCE_FORCE_IOS"))
+        return actual;
+
+    void *signed_return_address = __builtin_return_address(0);
+    void *return_address = ptrauth_strip(signed_return_address,
+                                         ptrauth_key_return_address);
+    Dl_info info = {0};
+    if (!return_address || !dladdr(return_address, &info) ||
+        !info.dli_fbase || !info.dli_fname)
+        return actual;
+
+    const char *basename = strrchr(info.dli_fname, '/');
+    basename = basename ? basename + 1 : info.dli_fname;
+    static const uint8_t metal_13_4_uuid[16] = {
+        0x2b, 0xab, 0x16, 0x9c, 0x42, 0xda, 0x36, 0xe3,
+        0x95, 0x5a, 0xf3, 0x0b, 0x70, 0x9e, 0xc2, 0xad,
+    };
+    if (strcmp(basename, "Metal") != 0 ||
+        !macws_macho_uuid_matches(
+            (const struct mach_header_64 *)info.dli_fbase,
+            metal_13_4_uuid))
+        return actual;
+
+    uintptr_t offset = (uintptr_t)return_address - (uintptr_t)info.dli_fbase;
+    static const uintptr_t source_builder_platform_returns[] = {
+        0x0edf14, 0x0edf28, 0x0ee018, 0x0ee654, 0x0ee690,
+    };
+    BOOL exact_callsite = NO;
+    for (size_t i = 0;
+         i < sizeof(source_builder_platform_returns) /
+             sizeof(source_builder_platform_returns[0]);
+         i++) {
+        if (offset == source_builder_platform_returns[i]) {
+            exact_callsite = YES;
+            break;
+        }
+    }
+    if (!exact_callsite)
+        return actual;
+
+    static _Atomic unsigned long translation_count = 0;
+    unsigned long sequence =
+        atomic_fetch_add_explicit(&translation_count, 1,
+                                  memory_order_relaxed) + 1;
+    if (sequence <= 32 || (sequence % 500) == 0) {
+        fprintf(stderr,
+            "#### METAL-SOURCE-PLATFORM #%lu callerOffset=%#lx "
+            "actual=%u -> ios=2\n",
+            sequence, (unsigned long)offset, actual);
+    }
+    return 2; // PLATFORM_IOS
 }
 
 kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
@@ -10063,6 +10974,7 @@ DYLD_INTERPOSE(IOConnectCallAsyncMethod_new, IOConnectCallAsyncMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncScalarMethod_new, IOConnectCallAsyncScalarMethod);
 DYLD_INTERPOSE(IOConnectCallAsyncStructMethod_new, IOConnectCallAsyncStructMethod);
 DYLD_INTERPOSE(IOConnectTrap1_new, IOConnectTrap1);
+DYLD_INTERPOSE(dyld_get_active_platform_new, dyld_get_active_platform);
 
 // XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
 // signed-equivalent so the kernel runs the full privileged UC-init (sets

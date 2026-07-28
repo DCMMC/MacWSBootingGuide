@@ -1469,6 +1469,126 @@ arguments, identical dual-context probe output, and source links are retained
 in [`misc/va_alignment_probe.c`](../misc/va_alignment_probe.c) and
 [`docs/evidence/chrome-partitionalloc-va-limit-20260728.txt`](evidence/chrome-partitionalloc-va-limit-20260728.txt).
 
+## 2026-07-28: latest VS Code Chromium renders WebGL2 Aquarium on native AGX
+
+### Runtime-confirmed: current Chromium and full WebGL2 pixels
+
+The current native-arm64 Visual Studio Code build now gets through its real
+Chromium/ANGLE Metal path. CDP reported the exact versions below; this is not
+the older Chrome binary whose PartitionAlloc geometry failed before Metal:
+
+```text
+Browser: Chrome/148.0.7778.280
+User-Agent: Code/1.130.0 Chrome/148.0.7778.280 Electron/42.6.0
+V8-Version: 14.8.178.38
+```
+
+The formal page-side probe found the already-created Aquarium context to be
+`WebGL2RenderingContext` with a 1024x1024 drawing buffer. A 2388x1668 macOS
+capture visibly contains the complete textured aquarium, fish, water, plants,
+bubbles, and controls at the selected 1000-fish setting. This is the required
+pixel witness: process uptime and an empty canvas are not counted.
+
+The process log independently proves that the execution path is the real
+AGXG13G stack rather than MTLSim:
+
+```text
+#### PREREGISTER image[627] AGXMetal13_3: 52/52 realized
+#### MACWS_AGX_NATIVE setupCompiler:0x30010 fired (Device=0x600282000)
+```
+
+Immediately before the bounded run was stopped, the read-only command-buffer
+error observer had zero occurrences of all three previously correlated parser
+statuses:
+
+```text
+FORMAL_AGX_ERRORS
+00000102=0
+00000103=0
+0000000a=0
+```
+
+This is runtime-confirmed by
+[`docs/evidence/webgl-aquarium-native-agx-20260728/`](evidence/webgl-aquarium-native-agx-20260728/).
+It is a bounded application-coverage result, not a thermal or long-soak claim.
+
+### RE/runtime-confirmed blockers and the upstream adaptations
+
+Chromium's exact `libGLESv2.dylib` uses private `-[MTLDevice newEvent]`.
+Disassembly of the loaded binaries showed that `-[IOGPUMetalDevice newEvent]`
+selects `_IOGPUMetalMTLEvent`, whose `-[IOGPUMTLEvent initWithDevice:]` calls
+IOConnect selector `0x18` and returns nil on failure. The formal runtime log
+records the same kernel result and the narrow fallback:
+
+```text
+#### AGXIOC Method sel=0x18->0x18 inCnt=0 inSC=0 outSC=0 -> 0xe00002c2
+#### MACWS-NEW-EVENT #1 original=nil sharedEvent=... class=_MTLSharedEvent ... deviceClass=AGXG13GFamilyDevice
+```
+
+Only a nil original result is replaced, using the same real device's
+`newSharedEvent`; successful original events are untouched. A standalone
+signal/wait probe completed before enabling the adapter for Chromium.
+
+The shader compiler had a separate cross-platform request mismatch.
+LLDB/runtime captures of `MTLCodeGenServiceBuildRequest` proved that the chroot
+request omitted the macOS active-platform argument, causing the iOS-hosted
+service to emit an iOS MTLB rejected by the real macOS loader. The adapter now
+requires both the chroot-only module-cache argument and working-directory
+argument, replaces only the latter with a length-preserving
+`-active-platform=macos`, and calls the real compiler. Both observed request
+serializations and both authenticated service call sites are covered; compiler
+results and loader validation are not bypassed. The MetalFE cache path is
+translated to the service's runtime-confirmed writable rootless cache while
+preserving each real libc operation and errno.
+
+Finally, the command-error observer correlated Chromium errors with exact
+retained submit serials. Selector `0x1e→0x1a` accepts an array of 0x38-byte
+descriptor entries; inspecting only entry zero left later batched descriptors
+untranslated. Walking every complete entry removed `0x103` and exposed two
+strictly validated trailing-wrapper forms:
+
+- a single subtype-1 command whose variable resource list ends with one
+  0x18-byte wrapper-list record;
+- two or more subtype-1/subtype-3 vendor segments followed by the same wrapper,
+  including observed segment-list lengths below the former hard-coded 0x250
+  threshold.
+
+The retained pre-submit KCMD and segment lists prove the ranges and list magic;
+the translator validates those complete invariants and updates every affected
+range after compaction. The formal run reached more than 18,000 submit
+observations without a command-error getter entry. These subtype-1/subtype-3
+deletions remain **temporary ABI-translation scaffolding**, not a field-level
+semantic fix.
+
+### Formal performance comparison
+
+Both devices ran the same URL, 1000-fish preset, 1024x1024 drawing buffer,
+five-second warm-up, and fifteen one-second samples of Aquarium's own
+`g_fpsTimer.averageFPS`:
+
+| Environment | Average FPS | Median | Min | Max |
+|---|---:|---:|---:|---:|
+| iPad13,6, chroot VS Code/Chromium 148, native AGX | 14.4 | 14 | 11 | 18 |
+| MacBook Air M1, local browser | 60.07 | 60 | 60 | 61 |
+
+The measured iPad rate is 23.97% of the M1 rate; M1 is 4.17x faster in this
+comparison. The M1 result is display-refresh capped, so the ratio is a lower
+bound on the uncapped performance gap. The iPad's render loop also starved
+ordinary timers/CDP work while continuing to draw at 11-18 FPS. The reusable
+harness therefore samples from the page's actual per-frame `g_fpsTimer.update`
+callback and publishes only after the full interval; it does not count the
+post-measurement stopped frame.
+
+The initial blank VS Code workbench was not an AGX failure. A one-second system
+sample found Electron's main thread in
+`OptimizingCompileTaskExecutor::WaitUntilCompilationJobsDoneForIsolate` for
+every sample while the launch plist forced three `--no-concurrent-*` V8
+switches. Removing those diagnostic switches restored the renderer, GPU and
+CDP processes while retaining production JIT and the existing W^X adapter.
+The exact samples, screenshots, CDP version, complete iPad log, and clean-stop
+record are in the evidence directory above; the harness is
+[`misc/cdp_aquarium_benchmark.mjs`](../misc/cdp_aquarium_benchmark.mjs).
+
 ## Next milestones
 
 The final GlassDemo/native-AGX/VNC/blur target above is complete. Remaining
@@ -1499,7 +1619,8 @@ items are hardening and application-coverage work:
 7. Replace the full-display snapshot with a window registry and
    producer-owned IOSurface ring so each macOS window can become an independent
    iPadOS scene.
-8. Establish native-AGX browser coverage with a native-arm64 Chromium build
-   whose allocator geometry fits the measured iPadOS virtual-address map, then
-   capture `chrome://gpu`, a minimal WebGL probe, and Fish Tank over VNC. Keep
-   allocator startup failures separate from ANGLE/Metal results.
+8. Extend the completed Chromium 148 WebGL2 result to a bounded thermal soak
+   and additional modern WebGL/WebGPU feature probes. Fix the synchronous
+   `gl.getParameter`/CDP starvation path before treating browser developer
+   tooling as usable, and keep the still-temporary KCMD translation visible in
+   every browser stability claim.

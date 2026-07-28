@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Launch job for the UUID-locked arm64 Visual Studio Code build. -->
+    <key>Label</key>
+    <string>com.macwsguide.vscode</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/macOS/bin/launchdchrootexec</string>
+        <string>0</string>
+        <string>0</string>
+        <string>/var/mnt/rootfs</string>
+        <string>/Applications/Visual Studio Code.app/Contents/MacOS/Electron</string>
+		<string>--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix11</string>
+        <string>--extensions-dir=/tmp/macws-vscode-extensions</string>
+        <string>--disable-updates</string>
+        <string>--no-sandbox</string>
+        <string>--disable-gpu-sandbox</string>
+        <string>--remote-debugging-port=9222</string>
+        <string>--remote-allow-origins=*</string>
+        <string>--use-angle=metal</string>
+        <string>--ignore-gpu-blocklist</string>
+        <!-- Skia Graphite is independent of WebGL/ANGLE.  Chromium 148's
+             Graphite pipeline compiler currently rejects its generated MSL
+             against the macOS 13/iOS 16 Metal stack, then Chromium disables
+             the whole GPU process after repeated exits.  Keep ANGLE Metal
+             enabled while isolating only Graphite. -->
+        <string>--disable-features=SkiaGraphite</string>
+        <string>--enable-logging=stderr</string>
+        <string>--v=1</string>
+        <!-- Keep Chromium's production JIT scheduling.  The W^X adapter now
+             reports successful RX transitions without late retries, while a
+             runtime sample with the old --no-concurrent-* group found the
+             Electron main thread permanently waiting in
+             OptimizingCompileTaskExecutor::WaitUntilCompilationJobsDoneForIsolate. -->
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CA_VSYNC_OFF</key>
+        <string>1</string>
+        <key>CA_DISABLE_SWAP_ICC</key>
+        <string>1</string>
+        <key>ELECTRON_ENABLE_LOGGING</key>
+        <string>1</string>
+        <key>MACWS_AGX_NATIVE</key>
+        <string>1</string>
+        <key>MACWS_AGX_REGISTER_CLASSES</key>
+        <string>1</string>
+        <key>MACWS_PIN_FALLBACK</key>
+        <string>1</string>
+        <key>MACWS_JIT_MPROTECT_COMPAT</key>
+        <string>1</string>
+        <key>MACWS_JIT_MPROTECT_TRACE</key>
+        <string>1</string>
+        <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>
+        <string>1</string>
+        <key>MACWS_MACOS_SYSTEM_POLICY_COMPAT</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/var/jb/var/mobile/vscode.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/jb/var/mobile/vscode.log</string>
+</dict>
+</plist>

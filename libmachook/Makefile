@@ -17,7 +17,14 @@ libmachook_FILES = jit.m objc_hooks.c mac_hooks.m AppInputBridge.m os_variant_ho
 libmachook_FRAMEWORKS = IOKit IOSurface Metal
 # -isystem: use the vendored iOS xpc headers (the theos iPhoneOS SDK ships
 # without xpc/). See ../vendor/ios-xpc/README.md.
-libmachook_CFLAGS = -isystem $(CURDIR)/../vendor/ios-xpc -I$(CURDIR)/../include
+# Native AGX is the production target of this tree.  mac_hooks.m keeps the
+# selector/command ABI implementation behind FORCE_M1_DRIVER; without this
+# compile definition a cross-build still links because undefined symbols are
+# permitted, but dyld aborts at injection time when Metal_hooks.x resolves the
+# missing native-AGX witnesses.  Define it in the owning target rather than
+# relying on an interactive shell's CFLAGS.
+libmachook_CFLAGS = -DFORCE_M1_DRIVER=1 \
+  -isystem $(CURDIR)/../vendor/ios-xpc -I$(CURDIR)/../include
 libmachook_LDFLAGS = -undefined dynamic_lookup
 
 # On-device builds (misc/build_on_ios.sh passes LIBMACHOOK_ON_DEVICE_BUILD=1)
