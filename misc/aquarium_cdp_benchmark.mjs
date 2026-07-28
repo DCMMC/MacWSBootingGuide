@@ -46,6 +46,7 @@ class CDP {
     this.nextId = 1;
     this.pending = new Map();
     this.events = new Map();
+    this.closedError = null;
     this.socket = new WebSocket(url);
     this.socket.addEventListener("message", (event) => {
       const message = JSON.parse(event.data);
@@ -53,6 +54,7 @@ class CDP {
         const waiter = this.pending.get(message.id);
         if (!waiter) return;
         this.pending.delete(message.id);
+        clearTimeout(waiter.timer);
         if (message.error) waiter.reject(new Error(JSON.stringify(message.error)));
         else waiter.resolve(message.result);
         return;
@@ -60,7 +62,31 @@ class CDP {
       const waiters = this.events.get(message.method);
       if (!waiters) return;
       this.events.delete(message.method);
-      for (const resolve of waiters) resolve(message.params);
+      for (const waiter of waiters) waiter.resolve(message.params);
+    });
+    const failPending = (error) => {
+      if (this.closedError) return;
+      this.closedError = error;
+      for (const waiter of this.pending.values()) {
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      }
+      this.pending.clear();
+      for (const waiters of this.events.values()) {
+        for (const waiter of waiters) {
+          clearTimeout(waiter.timer);
+          waiter.reject(error);
+        }
+      }
+      this.events.clear();
+    };
+    this.socket.addEventListener("error", () => {
+      failPending(new Error(`CDP WebSocket error: ${url}`));
+    });
+    this.socket.addEventListener("close", (event) => {
+      failPending(new Error(
+        `CDP WebSocket closed: code=${event.code} reason=${event.reason || "none"}`,
+      ));
     });
   }
 
@@ -72,24 +98,54 @@ class CDP {
     });
   }
 
-  send(method, params = {}) {
+  send(method, params = {}, timeoutMs = 30000) {
+    if (this.closedError) return Promise.reject(this.closedError);
     const id = this.nextId++;
     const result = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        reject(new Error(`timeout waiting for CDP ${method} (${timeoutMs} ms)`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timer });
     });
-    this.socket.send(JSON.stringify({ id, method, params }));
+    try {
+      this.socket.send(JSON.stringify({ id, method, params }));
+    } catch (error) {
+      const waiter = this.pending.get(id);
+      if (waiter) {
+        this.pending.delete(id);
+        clearTimeout(waiter.timer);
+        waiter.reject(error);
+      }
+    }
     return result;
   }
 
   waitFor(method, timeoutMs = 30000) {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`timeout waiting for ${method}`)), timeoutMs);
-      const wrappedResolve = (params) => {
-        clearTimeout(timer);
-        resolve(params);
-      };
+      if (this.closedError) {
+        reject(this.closedError);
+        return;
+      }
       const waiters = this.events.get(method) ?? [];
-      waiters.push(wrappedResolve);
+      const waiter = {
+        timer: null,
+        resolve: (params) => {
+          clearTimeout(waiter.timer);
+          resolve(params);
+        },
+        reject,
+      };
+      waiter.timer = setTimeout(() => {
+        const current = this.events.get(method);
+        if (current) {
+          const index = current.indexOf(waiter);
+          if (index !== -1) current.splice(index, 1);
+          if (current.length === 0) this.events.delete(method);
+        }
+        reject(new Error(`timeout waiting for ${method}`));
+      }, timeoutMs);
+      waiters.push(waiter);
       this.events.set(method, waiters);
     });
   }
@@ -148,9 +204,13 @@ while (Date.now() < deadline) {
         // are collected independently.
         ready: true,
         fps,
-        contextType: globalThis.g?.gl?.constructor?.name || null,
+        contextType: typeof gl !== 'undefined' ? gl?.constructor?.name || null : null,
+        contextLost: typeof gl !== 'undefined' && typeof gl?.isContextLost === 'function'
+          ? gl.isContextLost() : null,
         canvas: [canvas.width, canvas.height],
-        fishSetting: globalThis.g?.globals?.fishSetting ?? null,
+        fishSettingIndex: typeof g !== 'undefined' ? g?.globals?.fishSetting ?? null : null,
+        fishCount: typeof g_numFish !== 'undefined' && Array.isArray(g_numFish) &&
+          typeof g !== 'undefined' ? g_numFish[g?.globals?.fishSetting] ?? null : null,
         finalUrl: location.href,
         title: document.title,
       };
@@ -163,25 +223,79 @@ while (Date.now() < deadline) {
 }
 if (!readiness?.ready) throw new Error(`Aquarium did not become ready: ${JSON.stringify(readiness)}`);
 
+// aquarium.js consumes numFish by replacing g_numFish[0], then
+// setupCountButtons() selects fishSetting index 0.  g_numFish must remain an
+// array: replacing it with the requested count would only corrupt the page
+// after its per-species tables had already been built and could create a false
+// benchmark witness.  Validate both the selected entry and the independently
+// precomputed per-species totals before accepting a run.
+const configuredResponse = await cdp.send("Runtime.evaluate", {
+  expression: `(() => {
+    const canvas = document.querySelector('#canvas');
+    const fishSettingIndex = typeof g !== 'undefined' ? g?.globals?.fishSetting ?? null : null;
+    const fishCount = typeof g_numFish !== 'undefined' && Array.isArray(g_numFish)
+      ? g_numFish[fishSettingIndex] ?? null : null;
+    const modelFishCount = typeof g_fishTable !== 'undefined' && Array.isArray(g_fishTable)
+      ? g_fishTable.reduce((total, fishInfo) =>
+          total + (fishInfo?.num?.[fishSettingIndex] ?? 0), 0)
+      : null;
+    return {
+      fishSettingIndex,
+      fishCount,
+      modelFishCount,
+      canvas: canvas ? [canvas.width, canvas.height] : null,
+      contextType: typeof gl !== 'undefined' ? gl?.constructor?.name || null : null,
+      contextLost: typeof gl !== 'undefined' && typeof gl?.isContextLost === 'function'
+        ? gl.isContextLost() : null,
+    };
+  })()`,
+  returnByValue: true,
+});
+const configured = configuredResponse.result.value;
+if (configured?.fishCount !== args.fish ||
+    configured?.modelFishCount !== args.fish ||
+    configured?.canvas?.[0] !== args.width ||
+    configured?.canvas?.[1] !== args.height) {
+  throw new Error(`Aquarium fish count was not applied: ${JSON.stringify(configured)}`);
+}
+
 await new Promise((resolve) => setTimeout(resolve, args.warmup * 1000));
 const benchmark = await cdp.send("Runtime.evaluate", {
   expression: `new Promise((resolve) => {
     const durationMs = ${args.seconds * 1000};
     const started = performance.now();
     const stamps = [];
-    function frame(now) {
-      stamps.push(now);
-      if (now - started < durationMs) requestAnimationFrame(frame);
-      else resolve({started, ended: now, stamps});
+    const timer = globalThis.g_fpsTimer;
+    if (!timer || typeof timer.update !== 'function') {
+      resolve({started, ended: performance.now(), stamps, error: 'missing g_fpsTimer'});
+      return;
     }
-    requestAnimationFrame(frame);
+    const originalUpdate = timer.update;
+    let settled = false;
+    function finish(timedOut) {
+      if (settled) return;
+      settled = true;
+      timer.update = originalUpdate;
+      resolve({started, ended: performance.now(), stamps, timedOut});
+    }
+    timer.update = function(...callArgs) {
+      const now = performance.now();
+      stamps.push(now);
+      const result = originalUpdate.apply(this, callArgs);
+      if (now - started >= durationMs) finish(false);
+      return result;
+    };
+    setTimeout(() => finish(true), durationMs + 10000);
   })`,
   awaitPromise: true,
   returnByValue: true,
-  timeout: (args.seconds + 30) * 1000,
-});
+}, (args.seconds + 30) * 1000);
 
 const raw = benchmark.result.value;
+if (raw.error) throw new Error(`Aquarium frame instrumentation failed: ${raw.error}`);
+if (raw.timedOut || raw.stamps.length < 2) {
+  throw new Error(`Aquarium render loop stalled: ${JSON.stringify(raw)}`);
+}
 const intervals = raw.stamps.slice(1).map((stamp, index) => stamp - raw.stamps[index]);
 const sortedIntervals = [...intervals].sort((left, right) => left - right);
 const elapsedSeconds = (raw.ended - raw.started) / 1000;
@@ -196,8 +310,8 @@ const result = {
   fish: args.fish,
   requestedSeconds: args.seconds,
   elapsedSeconds,
-  callbacks: raw.stamps.length,
-  callbackFps,
+  pageFrames: raw.stamps.length,
+  pageFrameFps: callbackFps,
   frameIntervalMs: {
     min: sortedIntervals[0] ?? null,
     p50: percentile(sortedIntervals, 0.50),
@@ -211,7 +325,7 @@ const result = {
     max: sortedFps.at(-1) ?? null,
     average: instantaneousFps.reduce((sum, value) => sum + value, 0) / instantaneousFps.length,
   },
-  webgl: readiness,
+  webgl: { ...readiness, ...configured },
 };
 
 console.log(JSON.stringify(result, null, 2));

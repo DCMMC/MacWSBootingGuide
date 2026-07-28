@@ -184,3 +184,40 @@ Thermal-Nominal rAF result still had a 49.3-ms median, so screen lock cannot be
 the entire performance gap.  Exact records, hashes, log excerpts, temperature,
 and the pending locked/unlocked A/B are in
 `windowserver-wrapper-generation3-20260729.txt`.
+
+## Coexistence / VNC / exclusive attribution (2026-07-29)
+
+The official VS Code 1.130.0 build (Electron 42.6.0, Chromium
+148.0.7778.280) was run on both the iPad and M1 MacBook Air with the exact
+same 60,000-fish Aquarium URL, 1024x1024 canvas, eight-second warm-up, and
+15-second wall-clock rAF measurement. All runs reported WebGL2, the requested
+60,000 model fish, and no context loss.
+
+| iPad mode | VNC | Page FPS | p50 frame interval |
+|---|---:|---:|---:|
+| coexist | on | 12.368 | 81.2 ms |
+| coexist | off | 12.625 | 79.3 ms |
+| exclusive, repeat 1 | off | 12.092 | 83.0 ms |
+| exclusive, repeat 2 | off | 12.238 | 82.0 ms |
+| M1 macOS control | n/a | 36.615 | 27.1 ms |
+
+Disabling VNC improved the coexist run by only 2.08%. More importantly,
+unloading SpringBoard and backboardd and switching to exclusive mode did not
+improve the result: its two-run mean was 12.165 FPS, 3.64% below the controlled
+coexist/no-VNC run. The exclusive run had no SpringBoard/backboardd launchd
+jobs, while the active GPU process used about 106% CPU, the renderer 86%, and
+WindowServer 67%. This runtime-disproves iOS foreground UI work and VNC as
+the principal explanation for the remaining 2.90x gap to the M1. The current
+target remains per-frame Chromium/ANGLE command encoding and WindowServer
+composition/submission CPU work.
+
+Chromium also logs that `TASK_CATEGORY_POLICY` foreground promotion returns
+`KERN_INVALID_ARGUMENT`. A native iOS probe tested every SDK task role 0
+through 8 in fresh child processes; all were rejected and the read-back role
+stayed zero. A bounded compatibility experiment translated the exact failed
+self/foreground request into user-interactive pthread QoS and runtime-confirmed
+the calling thread changed from QoS 21 to 33. It nevertheless measured only
+12.230 FPS. Renicing the renderer to -20 measured 12.320 FPS. Both were below
+the 12.625-FPS control, so the compatibility hook was removed rather than
+shipped as a symptom-level patch. `misc/task_category_policy_probe.c` is kept
+as the reproducible kernel witness.

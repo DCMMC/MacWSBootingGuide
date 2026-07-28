@@ -1,0 +1,63 @@
+{
+  "workload": {
+    "url": "https://webglsamples.org/aquarium/aquarium.html?numFish=60000&canvasWidth=1024&canvasHeight=1024&fitWindow=false",
+    "fish": 60000,
+    "canvas": [1024, 1024],
+    "warmup_seconds": 8,
+    "sample_seconds": 15,
+    "application": "VS Code 1.130.0 / Electron 42.6.0 / Chromium 148.0.7778.280",
+    "api": "WebGL2",
+    "context_lost": false
+  },
+  "results": [
+    {
+      "environment": "iPad13,6, coexist, VNC on",
+      "elapsed_seconds": 15.03919999998808,
+      "page_frames": 186,
+      "page_fps": 12.36767913187852,
+      "frame_interval_ms": {"p50": 81.2}
+    },
+    {
+      "environment": "iPad13,6, coexist, VNC off",
+      "elapsed_seconds": 15.049100000023842,
+      "page_frames": 190,
+      "page_fps": 12.625339721292237,
+      "frame_interval_ms": {"p50": 79.3}
+    },
+    {
+      "environment": "iPad13,6, exclusive, VNC off, repeat 1",
+      "elapsed_seconds": 15.050800000011922,
+      "page_frames": 182,
+      "page_fps": 12.092380471460377,
+      "frame_interval_ms": {"p50": 83.0, "p95": 86.19999998807907}
+    },
+    {
+      "environment": "iPad13,6, exclusive, VNC off, repeat 2",
+      "elapsed_seconds": 15.035199999988079,
+      "page_frames": 184,
+      "page_fps": 12.237948281376097,
+      "frame_interval_ms": {"p50": 82.0, "p95": 85.60000002384186}
+    },
+    {
+      "environment": "MacBookAir10,1, M1, macOS 26.3.1",
+      "elapsed_seconds": 15.02119999998808,
+      "page_frames": 550,
+      "page_fps": 36.614917583178205,
+      "frame_interval_ms": {"p50": 27.099999994039536, "p95": 28.80000001192093}
+    }
+  ],
+  "derived": {
+    "coexist_no_vnc_vs_vnc_percent": 2.0833382453267157,
+    "exclusive_two_run_mean_fps": 12.165164376418236,
+    "exclusive_vs_coexist_no_vnc_percent": -3.644855148712789,
+    "coexist_no_vnc_percent_of_m1": 34.48140964024081,
+    "exclusive_percent_of_m1": 33.22461220561975
+  },
+  "exclusive_runtime_witness": {
+    "springboard_launchd_job": false,
+    "backboardd_launchd_job": false,
+    "gpu_process_cpu_percent": 105.6,
+    "renderer_cpu_percent": 86.2,
+    "windowserver_cpu_percent": 67.4
+  }
+}
