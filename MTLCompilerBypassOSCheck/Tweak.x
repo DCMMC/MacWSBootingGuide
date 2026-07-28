@@ -355,15 +355,23 @@ static void InstallMetalCachePathAdapter(void) {
 // original compiler entry point; no compiler result or loader validation is
 // bypassed.
 //
-// MTLCompilerService 6D2CFE56-8D88-39AA-BC25-7FFE5058ED4E has two calls to
-// the same service-vtable slot: __TEXT+0x25f0 when the hang timer is active,
-// and __TEXT+0x2628 when MTL_HANG_TIMER_LENGTH_IN_SECONDS is less than one.
-// Both are `blraaz x8` (0xd63f091f).  Patching only +0x25f0 produced a
-// runtime-confirmed mixture of macOS MTLB headers (0x8001) and unadapted iOS
-// headers (0x0001) in a cold Chromium shader-cache run.  Replacing both
-// authenticated indirect calls with direct BLs avoids the arm64e
-// Substrate-trampoline PAC failure while leaving the exported function itself
-// untouched.
+// MTLCompilerService 6D2CFE56-8D88-39AA-BC25-7FFE5058ED4E has three calls to
+// the same service-vtable +0x18 build slot.  `_compileRequestMain` calls it at
+// __TEXT+0x20e8 through `blraaz x9` (0xd63f093f).  The XPC handler calls it at
+// __TEXT+0x25f0 when the hang timer is active and at __TEXT+0x2628 when
+// MTL_HANG_TIMER_LENGTH_IN_SECONDS is less than one; those two instructions
+// are `blraaz x8` (0xd63f091f).  The worker entry loads the same six-argument
+// ABI from its context before the call: service, plugin/request identifiers,
+// request bytes, request length, and result storage.
+//
+// Runtime-confirmed 2026-07-28: adapting only +0x25f0/+0x2628 let Chromium's
+// more complex MSL take `_compileRequestMain`.  The reply contained the exact
+// target string `air64-apple-ios16.3.0`, then macOS Metal rejected it with
+// "This library format is not supported on this platform".  Replacing all
+// three authenticated indirect calls with validated direct BLs keeps every
+// source request on the same macOS-target adapter and avoids the arm64e
+// Substrate-trampoline PAC failure while leaving compiler results and loader
+// validation untouched.
 typedef uintptr_t (*MTLCodeGenServiceBuildRequestFn)(
     uintptr_t, uintptr_t, uintptr_t, void *, size_t, void *);
 static MTLCodeGenServiceBuildRequestFn OrigMTLCodeGenServiceBuildRequest = NULL;
@@ -566,8 +574,15 @@ static void InstallMacOSMetalTargetAdapter(void) {
     OrigMTLCodeGenServiceBuildRequest =
         (MTLCodeGenServiceBuildRequestFn)dlsym(
             RTLD_DEFAULT, "MTLCodeGenServiceBuildRequest");
-    static const uintptr_t callOffsets[] = {0x25f0, 0x2628};
-    const uint32_t expected = 0xd63f091f; // blraaz x8
+    struct MacWSTargetAdapterCallSite {
+        uintptr_t offset;
+        uint32_t expected;
+    };
+    static const struct MacWSTargetAdapterCallSite callSites[] = {
+        {0x20e8, 0xd63f093f}, // _compileRequestMain: blraaz x9
+        {0x25f0, 0xd63f091f}, // XPC handler, hang timer: blraaz x8
+        {0x2628, 0xd63f091f}, // XPC handler, no timer: blraaz x8
+    };
     if (!OrigMTLCodeGenServiceBuildRequest) {
         MTLPatchLog("target adapter: symbol unavailable");
         OrigMTLCodeGenServiceBuildRequest = NULL;
@@ -575,20 +590,22 @@ static void InstallMacOSMetalTargetAdapter(void) {
     }
 
     uintptr_t target = StripPAC((const void *)MacWSMTLCodeGenServiceBuildRequest);
-    uint32_t branches[sizeof(callOffsets) / sizeof(callOffsets[0])] = {0};
-    for (size_t i = 0; i < sizeof(callOffsets) / sizeof(callOffsets[0]); i++) {
-        uint32_t *callSite = (uint32_t *)((uintptr_t)mh + callOffsets[i]);
+    uint32_t branches[sizeof(callSites) / sizeof(callSites[0])] = {0};
+    for (size_t i = 0; i < sizeof(callSites) / sizeof(callSites[0]); i++) {
+        uint32_t *callSite =
+            (uint32_t *)((uintptr_t)mh + callSites[i].offset);
         intptr_t delta = (intptr_t)target - (intptr_t)callSite;
-        if (*callSite != expected) {
+        if (*callSite != callSites[i].expected) {
             MTLPatchLog("target adapter: validation failed offset=%#lx site=%p insn=%#x",
-                        (unsigned long)callOffsets[i], callSite, *callSite);
+                        (unsigned long)callSites[i].offset, callSite,
+                        *callSite);
             OrigMTLCodeGenServiceBuildRequest = NULL;
             return;
         }
         if ((delta & 3) != 0 || delta < -(1LL << 27) ||
             delta >= (1LL << 27)) {
             MTLPatchLog("target adapter: wrapper out of BL range offset=%#lx site=%p target=%#lx delta=%#lx",
-                        (unsigned long)callOffsets[i], callSite,
+                        (unsigned long)callSites[i].offset, callSite,
                         (unsigned long)target, (unsigned long)delta);
             OrigMTLCodeGenServiceBuildRequest = NULL;
             return;
@@ -596,12 +613,13 @@ static void InstallMacOSMetalTargetAdapter(void) {
         branches[i] = 0x94000000u |
             ((uint32_t)((uint64_t)(delta >> 2) & 0x03ffffffu));
     }
-    for (size_t i = 0; i < sizeof(callOffsets) / sizeof(callOffsets[0]); i++) {
-        uint32_t *callSite = (uint32_t *)((uintptr_t)mh + callOffsets[i]);
+    for (size_t i = 0; i < sizeof(callSites) / sizeof(callSites[0]); i++) {
+        uint32_t *callSite =
+            (uint32_t *)((uintptr_t)mh + callSites[i].offset);
         PatchInstruction(callSite, branches[i]);
         MTLPatchLog("target adapter installed offset=%#lx site=%p old=%#x new=%#x wrapper=%#lx orig=%p",
-                    (unsigned long)callOffsets[i], callSite, expected,
-                    *callSite, (unsigned long)target,
+                    (unsigned long)callSites[i].offset, callSite,
+                    callSites[i].expected, *callSite, (unsigned long)target,
                     OrigMTLCodeGenServiceBuildRequest);
     }
 

@@ -12,7 +12,12 @@
         <string>0</string>
         <string>/var/mnt/rootfs</string>
         <string>/Applications/Visual Studio Code.app/Contents/MacOS/Electron</string>
-		<string>--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix11</string>
+		<!-- targetfix12 invalidates Chromium's targetfix11 GPUCache, which
+		     contains iOS-target MTLB files compiled before the
+		     _compileRequestMain target-adapter fix.  Keep user data isolated
+		     from this disposable benchmark profile; do not delete a user's
+		     normal VS Code profile to migrate the Metal cache. -->
+		<string>--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix12</string>
         <string>--extensions-dir=/tmp/macws-vscode-extensions</string>
         <string>--disable-updates</string>
         <string>--no-sandbox</string>

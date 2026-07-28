@@ -98,6 +98,61 @@ files under CrashReporter after their relevant evidence had already been
 curated.  The stable VS Code launch arguments and stopped iOS state were
 restored at the end of the run.
 
+## Complex Metal worker path and exact completion-pace control (2026-07-29)
+
+Chromium 148's complex WebGL2 fragment shader exposed a third real
+`MTLCompilerService` build call. RE of UUID
+`6D2CFE56-8D88-39AA-BC25-7FFE5058ED4E` found `_compileRequestMain` loading the
+same six-argument service-vtable +0x18 ABI and calling it at `__TEXT+0x20e8`
+through `blraaz x9`. The older two-site adapter missed that worker path, so its
+reply retained `air64-apple-ios16.3.0` and macOS Metal rejected the library.
+
+The UUID-locked installer now validates and redirects all three call sites
+(`+0x20e8`, `+0x25f0`, `+0x2628`) into the existing target adapter while still
+calling the real compiler and loader. A standalone source probe returned a
+real `_MTLLibrary` and `_MTLFunctionInternal`; the exact VS Code 1.130.0 /
+Chromium 148 complex shader produced a 9,184-byte accepted reply containing
+`air64-apple-ios19.0.0-macabi`. This removes the complex-source library-format
+failure without bypassing validation.
+
+A separately rotated, unlocked, Thermal-Nominal headless run proved both the
+on-device sentinel and WindowServer completion logs stayed at exactly 16,667
+us. The 512x512 fill control nevertheless measured 16.756 rAF callbacks/s,
+with a 62.012-ms average rAF interval, while CPU issue time was only 0.0417 ms
+per draw. Thus the earlier approximately 15-FPS result was not contamination
+from the 100-ms idle default. That controlled run still exposed repeated
+`newEvent` / AGX selector `0x18` failures (`0xe00002c2`). Subsequent
+binary/runtime comparison found the actual iOS 16.3 initializer uses selector
+`0x14` with the same input/output ABI. Translating `0x18->0x14` now returns a
+real `_IOGPUMetalMTLEvent`; a bounded VS Code run completed all 64 explicit GPU
+timer queries with zero pending queries and a 0.377-ms GPU-time median. The rAF
+median nevertheless remained 39.8 ms, moving the active target from event
+construction to presentation scheduling.
+
+The exact disassembly, compiler logs, target strings, pacing lines, benchmark
+values, and limitation are in
+`metal-target-worker-and-controlled-pace-20260729.txt` and
+`private-metal-event-selector-20260729.txt`.
+
+## Native-AGX throughput is near M1; rAF/presentation is not (2026-07-29)
+
+The corrected event path made GPU timer queries usable as a real boundary.
+The exact same official VS Code 1.130.0 / Chromium 148 build then ran 1,000
+draws per batch on both systems with either requestAnimationFrame or
+setTimeout(0) driving the next batch. In the timeout control, the iPad reached
+191,788.885 draws/s versus the M1's 202,055.133 draws/s: 94.919% of M1. All
+391 iPad and 409 M1 GPU queries completed, with zero pending. CPU issue
+throughput reached 91.063% of M1, and iPad GPU-time p50 was 0.322 ms versus
+0.375 ms on M1.
+
+The same iPad reached only 41.686% of M1 under rAF, with a 49.3-ms median
+interval versus 16.7 ms. Switching only the producer from rAF to timeout made
+the iPad 9.43x faster while preserving the WebGL commands, flushes and timer
+queries. This runtime-isolates the remaining large gap to visible-frame /
+presentation scheduling rather than shader execution or AGX command
+throughput. Exact values, histograms, integrity counters and limitations are
+in `presentation-scheduler-split-20260729.txt`.
+
 `macos_gui.sh stop` and `cleanup_all.sh` now also unload the exact VS Code job
 and kill only the Visual Studio Code/Code Helper executable paths.  A deployed
 test ended with no VS Code, WindowServer, or VNC job/process and removed both

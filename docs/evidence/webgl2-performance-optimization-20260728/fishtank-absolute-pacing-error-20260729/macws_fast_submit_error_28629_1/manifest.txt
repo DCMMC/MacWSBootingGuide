@@ -1,0 +1,3 @@
+reason=iogpu-error-getter-other pid=28629 command_buffer=0x600224980 requested_serial=2 matched_serial=2 oldest=1 newest=2 freeze_wait_ms=0
+serial=1 life_event_serial=32 sequence=1 descriptor=0 fixed=1 descriptor_pointer=0x60095d740 command_buffer=0x600222300 storage=0x6001a6800 matched=NO same_shape=NO commands=2080 saved=2080 truncated=NO segments=304 saved=304 truncated=NO
+serial=2 life_event_serial=41 sequence=2 descriptor=0 fixed=1 descriptor_pointer=0x600a6d260 command_buffer=0x600224980 storage=0x6001a6800 matched=YES same_shape=NO commands=2672 saved=2672 truncated=NO segments=616 saved=616 truncated=NO

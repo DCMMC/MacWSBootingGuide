@@ -1515,19 +1515,34 @@ It is a bounded application-coverage result, not a thermal or long-soak claim.
 ### RE/runtime-confirmed blockers and the upstream adaptations
 
 Chromium's exact `libGLESv2.dylib` uses private `-[MTLDevice newEvent]`.
-Disassembly of the loaded binaries showed that `-[IOGPUMetalDevice newEvent]`
-selects `_IOGPUMetalMTLEvent`, whose `-[IOGPUMTLEvent initWithDevice:]` calls
-IOConnect selector `0x18` and returns nil on failure. The formal runtime log
-records the same kernel result and the narrow fallback:
+Disassembly of macOS 13.4 IOGPU (UUID
+`CE2B5551-857F-3EDD-9E4F-435215CC8C27`) showed that
+`-[IOGPUMetalDevice newEvent]` selects `_IOGPUMetalMTLEvent`, whose
+`-[IOGPUMTLEvent initWithDevice:]` calls IOConnect selector `0x18` and returns
+nil on failure. The pre-fix runtime log recorded the same kernel result and
+the diagnostic fallback:
 
 ```text
 #### AGXIOC Method sel=0x18->0x18 inCnt=0 inSC=0 outSC=0 -> 0xe00002c2
 #### MACWS-NEW-EVENT #1 original=nil sharedEvent=... class=_MTLSharedEvent ... deviceClass=AGXG13GFamilyDevice
 ```
 
-Only a nil original result is replaced, using the same real device's
-`newSharedEvent`; successful original events are untouched. A standalone
-signal/wait probe completed before enabling the adapter for Chromium.
+The actual iOS 16.3 implementation was then located in the live shared cache
+at image offset `+0x170b0`. Its runtime bytes decode to the same zero-input,
+two-scalar-output ABI but `mov w1, #0x14`. The translation table now maps only
+this macOS selector `0x18` to iOS selector `0x14`. A native event-only probe
+and a fresh chroot probe both exited 0 with real `_IOGPUMetalMTLEvent`
+instances and completed signal/wait command buffers. The chroot log now says:
+
+```text
+#### AGXIOC Method sel=0x18->0x14 inCnt=0 inSC=0 outSC=0 -> 0x0
+METAL_SOURCE_PROBE newEvent responds=1 event=... class=_IOGPUMetalMTLEvent
+METAL_SOURCE_PROBE sharedEventCommands signalStatus=4 waitStatus=4 eventValue=1 signalError=(nil) waitError=(nil)
+```
+
+The nil-result shared-event adapter remains a diagnostic safety net, but a
+post-fix VS Code run had zero fallback invocations. Exact evidence is in
+[`private-metal-event-selector-20260729.txt`](evidence/webgl2-performance-optimization-20260728/private-metal-event-selector-20260729.txt).
 
 The shader compiler had a separate cross-platform request mismatch.
 LLDB/runtime captures of `MTLCodeGenServiceBuildRequest` proved that the chroot
@@ -1715,14 +1730,67 @@ items are hardening and application-coverage work:
 8. Close the remaining 4.27x same-VS-Code WebGL2 gap. The low-load
    presentation ceiling and first unthrottled `0x102` are now isolated; the
    validated wrapper translator removes the observed command errors and gives
-   a 39% 15,000-fish gain. Build a per-draw CDP microbenchmark and Chromium
-   trace to split ANGLE CPU, AGX user-driver encoding, kernel submission, and
-   GPU execution time. Then compare the current macOS 13.4 AGXMetal producer
-   with the kernel-matched iOS 16.3 producer before considering a user-driver
-   substitution. Do not ship the byte-deletion translator, frame-limit flags,
-   or forced priority as a production fix.
+   a 39% 15,000-fish gain. The corrected private event path now completes
+   explicit GPU queries with a 0.377-ms median while rAF remains tens of
+   milliseconds, so trace Chromium in-flight/presentation waits and correlate
+   them with WindowServer completion timestamps. Then compare the current
+   macOS 13.4 AGXMetal producer with the kernel-matched iOS 16.3 producer before
+   considering a user-driver substitution. Do not ship the byte-deletion
+   translator, frame-limit flags, or forced priority as a production fix.
 9. Extend the completed Chromium 148 WebGL2 result to additional modern
    WebGL/WebGPU feature probes. Fix the synchronous `gl.getParameter`/CDP
    starvation path before treating browser developer tooling as usable, and
    keep the still-temporary KCMD translation visible in every browser
    stability claim.
+
+## 2026-07-29: complex source compiler path fixed; event/presentation split
+
+RE of the actual iOS 16.3 `MTLCompilerService` binary found that Chromium's
+complex WebGL2 MSL took `_compileRequestMain` at `__TEXT+0x20e8`, not either of
+the two previously covered XPC-handler calls. All three load the same real
+service-vtable +0x18 build function. The UUID-locked patch now validates and
+redirects those three authenticated indirect calls into one target adapter;
+it does not replace compiler results or loader validation. A standalone probe
+returned a real `_MTLLibrary`, and VS Code/Chromium's 7,366-byte source built
+an accepted 9,184-byte `air64-apple-ios19.0.0-macabi` reply instead of the
+rejected `air64-apple-ios16.3.0` library.
+
+The presentation limit was then retested with a fresh WindowServer log, VNC
+disabled, the device unlocked, Thermal pressure `Nominal`, and both the
+sentinel and completion-hook log proving `interval=16667 us`. The 512x512 fill
+control still reached only 16.756 callbacks/s with a 62.012-ms average rAF
+interval, so neither a stale 100-ms pace nor current thermal throttling is the
+cause of the 15–17-FPS ceiling.
+
+The private event contract is now reconstructed rather than bypassed. macOS
+13.4 uses selector 0x18; live iOS 16.3 code uses 0x14 with the same
+zero-input/two-output ABI and object-field stores. Translating only that
+selector returns real `_IOGPUMetalMTLEvent` instances. A post-fix VS Code run
+completed 64/64 explicit GPU timer queries, left zero pending, and measured a
+0.377-ms GPU-time median without invoking the shared-event fallback. Its rAF
+median was still 39.8 ms, so the active blocker is now presentation/in-flight
+scheduling rather than event creation or fragment execution. This is a
+bounded run; a deferred external debug command stopped the GUI after the JSON
+had returned, so it is not a long-soak witness.
+
+## 2026-07-29: raw VS Code WebGL2 reaches 94.9% of M1; presentation isolated
+
+The event fix enabled a same-build, same-workload GPU-timed comparison between
+the iPad and M1. Official VS Code 1.130.0 / Electron 42.6.0 / Chromium
+148.0.7778.280 issued 1,000 WebGL2 draws per batch. With setTimeout(0) driving
+the next batch instead of requestAnimationFrame, the iPad completed 391/391
+queries at 191,788.885 draws/s; the M1 completed 409/409 at 202,055.133
+draws/s. The iPad therefore reached 94.919% of M1 wall throughput and 91.063%
+of its CPU issue throughput. Its GPU timer p50 was 0.321750 ms versus 0.375375
+ms on M1. The iPad log had zero event fallbacks and zero command errors, and
+its post-test thermal state was `Nominal`.
+
+Under the real visible-frame rAF path, the iPad reached only 20,345.233
+draws/s versus M1's 48,805.883, or 41.686%. Median callback intervals were
+49.3 ms and 16.7 ms respectively. Changing only the producer to timeout made
+the iPad 9.43x faster, while every GPU query still completed. This
+runtime-confirms that native AGX command generation/execution is now close to
+the M1 target for this microbenchmark; the large remaining user-visible gap is
+in Chromium/WindowServer visible-frame and in-flight presentation scheduling.
+Exact inputs, distributions and bounded-test limitations are recorded in
+[`presentation-scheduler-split-20260729.txt`](evidence/webgl2-performance-optimization-20260728/presentation-scheduler-split-20260729.txt).

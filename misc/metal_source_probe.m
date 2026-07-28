@@ -2,7 +2,90 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
+#include <ptrauth.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include <unistd.h>
+
+static void DumpNewEventImplementation(id device) {
+    if (!getenv("MACWS_METAL_PROBE_DUMP_EVENT_IMP")) return;
+
+    SEL selector = sel_registerName("newEvent");
+    Class concreteClass = object_getClass(device);
+    Method resolved = class_getInstanceMethod(concreteClass, selector);
+    IMP signedImplementation = resolved ? method_getImplementation(resolved) : NULL;
+    const unsigned char *implementation = signedImplementation
+        ? (const unsigned char *)ptrauth_strip(
+              signedImplementation, ptrauth_key_function_pointer)
+        : NULL;
+    Class owner = Nil;
+    for (Class candidate = concreteClass; candidate && !owner;
+         candidate = class_getSuperclass(candidate)) {
+        unsigned count = 0;
+        Method *methods = class_copyMethodList(candidate, &count);
+        for (unsigned index = 0; methods && index < count; index++) {
+            if (method_getName(methods[index]) == selector) {
+                owner = candidate;
+                break;
+            }
+        }
+        free(methods);
+    }
+
+    Dl_info imageInfo = {0};
+    BOOL hasImage = implementation && dladdr(implementation, &imageInfo);
+    fprintf(stderr,
+            "METAL_SOURCE_PROBE newEventIMP class=%s owner=%s imp=%p "
+            "image=%s imageBase=%p symbol=%s symbolBase=%p\n",
+            class_getName(concreteClass),
+            owner ? class_getName(owner) : "(none)", implementation,
+            hasImage && imageInfo.dli_fname ? imageInfo.dli_fname : "(unknown)",
+            hasImage ? imageInfo.dli_fbase : NULL,
+            hasImage && imageInfo.dli_sname ? imageInfo.dli_sname : "(unknown)",
+            hasImage ? imageInfo.dli_saddr : NULL);
+    if (!implementation) return;
+
+    // A bounded byte witness avoids debugger/shared-cache symbol dependence.
+    // The executable mapping is readable on both tested arm64e systems.
+    for (size_t offset = 0; offset < 192; offset += 16) {
+        fprintf(stderr, "METAL_SOURCE_PROBE newEventCode +0x%03zx:", offset);
+        for (size_t byte = 0; byte < 16; byte++)
+            fprintf(stderr, " %02x", implementation[offset + byte]);
+        fputc('\n', stderr);
+    }
+
+    Class eventClass = objc_getClass("IOGPUMTLEvent");
+    SEL initSelector = sel_registerName("initWithDevice:");
+    Method initMethod = eventClass
+        ? class_getInstanceMethod(eventClass, initSelector) : NULL;
+    IMP signedInit = initMethod ? method_getImplementation(initMethod) : NULL;
+    const unsigned char *initImplementation = signedInit
+        ? (const unsigned char *)ptrauth_strip(
+              signedInit, ptrauth_key_function_pointer)
+        : NULL;
+    Dl_info initImageInfo = {0};
+    BOOL hasInitImage = initImplementation &&
+        dladdr(initImplementation, &initImageInfo);
+    fprintf(stderr,
+            "METAL_SOURCE_PROBE eventInitIMP class=%s imp=%p image=%s "
+            "imageBase=%p symbol=%s symbolBase=%p\n",
+            eventClass ? class_getName(eventClass) : "(none)",
+            initImplementation,
+            hasInitImage && initImageInfo.dli_fname
+                ? initImageInfo.dli_fname : "(unknown)",
+            hasInitImage ? initImageInfo.dli_fbase : NULL,
+            hasInitImage && initImageInfo.dli_sname
+                ? initImageInfo.dli_sname : "(unknown)",
+            hasInitImage ? initImageInfo.dli_saddr : NULL);
+    if (!initImplementation) return;
+    for (size_t offset = 0; offset < 256; offset += 16) {
+        fprintf(stderr, "METAL_SOURCE_PROBE eventInitCode +0x%03zx:", offset);
+        for (size_t byte = 0; byte < 16; byte++)
+            fprintf(stderr, " %02x", initImplementation[offset + byte]);
+        fputc('\n', stderr);
+    }
+}
 
 // Minimal chroot-side witness for the MTLCompilerService bridge.  It avoids
 // WindowServer, Electron and Aquarium so one source compile can be tested
@@ -15,6 +98,24 @@ int main(void) {
                 device ? object_getClassName(device) : "(nil)",
                 device ? device.name.UTF8String : "(nil)");
         if (!device) return 2;
+
+        DumpNewEventImplementation(device);
+
+        // Optional bounded LLDB attach window.  Pause only after Metal and the
+        // concrete AGX/IOGPU classes are loaded, but before either event
+        // constructor is called.  This is a read-only diagnostic aid; normal
+        // probe invocations do not set the variable and remain unchanged.
+        const char *pauseText = getenv("MACWS_METAL_PROBE_PAUSE_SECONDS");
+        if (pauseText) {
+            unsigned long pauseSeconds = strtoul(pauseText, NULL, 10);
+            if (pauseSeconds > 120) pauseSeconds = 120;
+            if (pauseSeconds) {
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE lldbPauseSeconds=%lu pid=%d\n",
+                        pauseSeconds, getpid());
+                sleep((unsigned)pauseSeconds);
+            }
+        }
 
         // Chromium/ANGLE uses MTLSharedEvent for EGL fences before the
         // Aquarium draw loop starts.  Keep this as an independent witness:
@@ -44,6 +145,7 @@ int main(void) {
                 respondsToNewEvent, legacyEvent,
                 legacyEvent ? object_getClassName(legacyEvent) : "(nil)");
 
+        BOOL sharedEventCommandsOK = NO;
         if (sharedEvent) {
             id<MTLCommandQueue> queue = [device newCommandQueue];
             id<MTLCommandBuffer> signalBuffer = [queue commandBuffer];
@@ -67,6 +169,11 @@ int main(void) {
                         waitBuffer.error
                             ? waitBuffer.error.localizedDescription.UTF8String
                             : "(nil)");
+                sharedEventCommandsOK =
+                    signalBuffer.status == MTLCommandBufferStatusCompleted &&
+                    waitBuffer.status == MTLCommandBufferStatusCompleted &&
+                    sharedEvent.signaledValue == 1 &&
+                    signalBuffer.error == nil && waitBuffer.error == nil;
             } @catch (NSException *exception) {
                 fprintf(stderr,
                         "METAL_SOURCE_PROBE sharedEventCommand exception=%s "
@@ -74,6 +181,20 @@ int main(void) {
                         exception.name.UTF8String,
                         exception.reason.UTF8String);
             }
+        }
+
+        // The iOS-native event ABI witness must not depend on the separate
+        // chroot MTLCompilerService experiment below.  In particular, a
+        // native iOS process has no reason to request or validate a macOS AIR
+        // target.  This opt-in endpoint gives the event probe a strict exit
+        // status after both the public shared-event commands and the private
+        // -newEvent constructor have been exercised.
+        if (getenv("MACWS_METAL_PROBE_EVENT_ONLY")) {
+            BOOL eventOnlyOK = legacyEvent != nil && sharedEventCommandsOK;
+            fprintf(stderr,
+                    "METAL_SOURCE_PROBE eventOnlyResult=%s\n",
+                    eventOnlyOK ? "PASS" : "FAIL");
+            return eventOnlyOK ? 0 : 5;
         }
 
         // Include a per-process comment so each invocation proves a fresh XPC

@@ -1,0 +1,134 @@
+Private Metal event selector translation — 2026-07-29
+=====================================================
+
+Scope
+-----
+
+This closes the private `-[MTLDevice newEvent]` constructor failure seen in
+Chromium 148/ANGLE. It is a cross-version IOGPU selector translation backed by
+the actual macOS 13.4 binary and iOS 16.3 runtime code. It does not force a
+kernel return value, replace an event object, or bypass event completion.
+
+
+macOS 13.4 producer (RE-confirmed)
+---------------------------------
+
+The IOGPU image extracted from the macOS 13.4 shared cache has UUID:
+
+  CE2B5551-857F-3EDD-9E4F-435215CC8C27
+
+`otool -tvV` of `-[IOGPUMTLEvent initWithDevice:]` at static address
+0x19d1553a4 shows the complete call ABI around the external method:
+
+  000000019d1553fc  mov     w8, #0x2
+  000000019d155400  str     w8, [sp, #0x14]
+  000000019d155404  ldr     x8, [x19, #0x8]
+  000000019d155408  ldr     w0, [x8, #0x14]
+  000000019d15540c  stp     xzr, xzr, [sp]
+  000000019d155410  add     x6, sp, #0x28
+  000000019d155414  add     x7, sp, #0x14
+  000000019d155418  mov     w1, #0x18
+  000000019d15541c  mov     x2, #0x0
+  000000019d155420  mov     w3, #0x0
+  000000019d155424  mov     x4, #0x0
+  000000019d155428  mov     x5, #0x0
+  000000019d15542c  bl      0x19d15ea90 ; _IOConnectCallMethod
+  000000019d155430  cbz     w0, 0x19d155444
+  000000019d155444  ldp     x8, x9, [sp, #0x28]
+  000000019d155448  str     w8, [x19, #0x10]
+  000000019d15544c  str     x9, [x19, #0x18]
+  000000019d155450  mov     w8, #0x1
+  000000019d155454  strb    w8, [x19, #0x20]
+
+Thus macOS passes no scalar or struct input, requests two scalar outputs, and
+uses selector 0x18. A nonzero IOReturn releases the object and returns nil.
+
+
+iOS 16.3 producer (runtime-confirmed)
+-------------------------------------
+
+The gated iOS-native probe resolved the concrete implementations from the
+live shared-cache mapping:
+
+  METAL_SOURCE_PROBE newEventIMP class=AGXG13GDevice owner=IOGPUMetalDevice imp=0x203ae65e4 image=/System/Library/PrivateFrameworks/IOGPU.framework/IOGPU imageBase=0x203ad6000 symbol=<redacted> symbolBase=0x203ae65e4
+  METAL_SOURCE_PROBE eventInitIMP class=IOGPUMTLEvent imp=0x203aed0b0 image=/System/Library/PrivateFrameworks/IOGPU.framework/IOGPU imageBase=0x203ad6000 symbol=<redacted> symbolBase=0x203aed0b0
+
+The event initializer's live bytes at +0x70 are:
+
+  eventInitCode +0x070: e7 53 00 91 81 02 80 52 02 00 80 d2 03 00 80 52
+  eventInitCode +0x080: 04 00 80 d2 05 00 80 d2 6a da 0e 95 80 00 00 34
+
+Decoding those bytes with LLVM's arm64 disassembler gives:
+
+  add     x7, sp, #20
+  mov     w1, #20                         ; =0x14
+  mov     x2, #0
+  mov     w3, #0
+  mov     x4, #0
+  mov     x5, #0
+  bl      <IOConnectCallMethod>
+  cbz     w0, <success>
+
+The surrounding live bytes use the same two-output layout and store the
+returned values to object +0x10/+0x18 before setting byte +0x20. The only
+external-method ABI difference relevant to this call is selector 0x14.
+
+The event-only native run exited 0 after exercising both constructors and
+real signal/wait command buffers:
+
+  METAL_SOURCE_PROBE sharedEvent=0x100d1a330 class=_MTLSharedEvent signaledValue=0
+  METAL_SOURCE_PROBE newEvent responds=1 event=0x100d0e660 class=_IOGPUMetalMTLEvent
+  METAL_SOURCE_PROBE sharedEventCommands signalStatus=4 waitStatus=4 eventValue=1 signalError=(nil) waitError=(nil)
+  METAL_SOURCE_PROBE eventOnlyResult=PASS
+
+
+Adapter and chroot regression (runtime-confirmed)
+-------------------------------------------------
+
+`IOConnectTranslateSelector` now maps 0x18 to 0x14 only in the existing
+macOS-to-iOS IOGPU translation table. A fresh standalone chroot process exited
+0 and used the real private event; the nil-result `_MTLSharedEvent` fallback
+did not fire:
+
+  METAL_SOURCE_PROBE device=0x153823e00 class=AGXG13GFamilyDevice name=Apple M1
+  #### AGXIOC Method sel=0x18->0x14 inCnt=0 inSC=0 outSC=0 -> 0x0
+  METAL_SOURCE_PROBE newEvent responds=1 event=0x152e62b70 class=_IOGPUMetalMTLEvent
+  METAL_SOURCE_PROBE sharedEventCommands signalStatus=4 waitStatus=4 eventValue=1 signalError=(nil) waitError=(nil)
+  METAL_SOURCE_PROBE library=0x152f24ac0 class=_MTLLibrary errorDomain=(nil) errorCode=0 description=(nil)
+  METAL_SOURCE_PROBE function=0x152f24eb0 class=_MTLFunctionInternal
+
+The exact VS Code build under test was Code 1.130.0 / Electron 42.6.0 /
+Chromium 148.0.7778.280. Its post-fix log recorded eight sampled successful
+0x18->0x14 calls, zero failed translated calls, and zero
+`MACWS-NEW-EVENT #N` fallback invocations.
+
+A 512x512 WebGL2 fill control with explicit timer queries disabled completed
+86 frames in 5.0275 seconds (17.1059 rAF draws/s). Enabling
+`EXT_disjoint_timer_query_webgl2`, which previously caused the CDP run to stop
+completing, now produced:
+
+  elapsedSeconds=3.1756
+  batches=64
+  wallDrawsPerSecond=20.1537
+  completedQueries=64
+  pendingQueries=0
+  gpuTimerAverageMilliseconds=0.386564
+  gpuTimerP50Milliseconds=0.377083
+  gpuTimerP95Milliseconds=0.393374
+
+This is a bounded correctness/stability witness, not a long soak. It also
+separates the remaining bottleneck: GPU queries complete in about 0.38 ms,
+while observed rAF intervals remain tens of milliseconds. The next target is
+the Chromium/WindowServer presentation and in-flight scheduling path, not the
+private event constructor or raw fragment workload.
+
+
+Test-control incident
+---------------------
+
+An unrelated deferred debug command later stopped the GUI and launched a
+suspended Chrome under `tmux -> lldb -> debugserver`. Invocation auditing in
+`macos_gui.sh` captured the exact `stop` command at 00:46:41. The timer-query
+JSON had already been returned at 00:46:38.047Z, so the bounded result above is
+complete, but no long-soak claim is made. The stale debug tree was identified
+by PID and terminated; it must not be attributed to an AGX or thermal failure.

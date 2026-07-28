@@ -15,6 +15,7 @@ function parseArgs(argv) {
     width: 1024,
     height: 1024,
     warmup: 8,
+    url: "https://webglsamples.org/fishtank/fishtank.html",
   };
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index]?.replace(/^--/, "");
@@ -22,7 +23,7 @@ function parseArgs(argv) {
     if (!(key in args) || value === undefined) {
       throw new Error(`unknown or incomplete argument: ${argv[index]}`);
     }
-    args[key] = key === "host" ? value : Number(value);
+    args[key] = ["host", "url"].includes(key) ? value : Number(value);
   }
   for (const key of ["port", "fish", "seconds", "width", "height", "warmup"]) {
     if (!Number.isFinite(args[key]) || args[key] <= 0) {
@@ -121,7 +122,7 @@ await cdp.open();
 await cdp.send("Page.enable");
 await cdp.send("Runtime.enable");
 
-const aquariumUrl = new URL("https://webglsamples.org/aquarium/aquarium.html");
+const aquariumUrl = new URL(args.url);
 aquariumUrl.searchParams.set("numFish", String(args.fish));
 aquariumUrl.searchParams.set("canvasWidth", String(args.width));
 aquariumUrl.searchParams.set("canvasHeight", String(args.height));
@@ -139,14 +140,19 @@ while (Date.now() < deadline) {
       const canvas = document.querySelector('#canvas');
       const fps = document.querySelector('#fps')?.textContent?.trim() || '';
       if (!canvas || !fps) return {ready:false, fps};
-      const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
       return {
-        ready: Boolean(gl),
+        // Do not call getContext/getParameter here. On the cross-version AGX
+        // stack those synchronous GPU IPC calls can starve CDP even while the
+        // page is visibly animating. Canvas + the page's live FPS element are
+        // sufficient readiness witnesses; command-error logs and VNC pixels
+        // are collected independently.
+        ready: true,
         fps,
-        version: gl?.getParameter(gl.VERSION) || null,
-        renderer: gl?.getParameter(gl.RENDERER) || null,
+        contextType: globalThis.g?.gl?.constructor?.name || null,
         canvas: [canvas.width, canvas.height],
         fishSetting: globalThis.g?.globals?.fishSetting ?? null,
+        finalUrl: location.href,
+        title: document.title,
       };
     })()`,
     returnByValue: true,

@@ -7017,6 +7017,19 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
                 return 0xf;
             case 0x12: // ioGPUNotificationQueueFinalize
                 return 0x10;
+            case 0x18: // IOGPUMTLEvent initWithDevice:
+                       // RE-confirmed 2026-07-29 from the actual framework
+                       // binaries and an iOS-native runtime byte dump. macOS
+                       // 13.4 IOGPU UUID CE2B5551-857F-3EDD-9E4F-435215CC8C27
+                       // calls IOConnectCallMethod with selector 0x18; iOS
+                       // 16.3 IOGPU at runtime offset +0x170b0 uses 0x14.
+                       // Both functions otherwise pass zero scalar/struct
+                       // input, request exactly two scalar outputs, and store
+                       // the returned event ID/value into the same object
+                       // fields. Leaving 0x18 untranslated returns
+                       // 0xe00002c2 and forced the incomplete newSharedEvent
+                       // fallback on every Chromium frame.
+                return 0x14;
             case 0x1d: // IOGPUCommandQueueCreateWithQoS + 516
                 return 0x19;
             case 0x1e: // IOGPUCommandQueueSubmitCommandBuffers
@@ -9209,7 +9222,7 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
         *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
         *(uint32_t *)(wrapper_list + 0x10) == 0x840 &&
         *(uint32_t *)(wrapper_list + 0x14) == total &&
-        wrapper_opcode < 0x10000 && (wrapper_opcode & 0xff) == 3 &&
+        wrapper_opcode < 0x10000 &&
         wrapper_records_ok;
     int subtype1_ok =
         *(uint32_t *)(record + 0x00) == 0x10000 &&
@@ -9357,8 +9370,13 @@ static unsigned macws_translate_agx_multisegment_subtype1(
         unsigned wrapper_count = (unsigned)(wrapper_bytes / 0x18);
         uint32_t wrapper_opcode =
             *(uint32_t *)(commands + cursor + 0x08);
-        BOOL wrapper_commands_ok = wrapper_opcode < 0x10000 &&
-            (wrapper_opcode & 0xff) == 3;
+        // The wrapper record type is the dword at +0x00 (3); the opaque
+        // operation token at +0x08 is not another type tag.  Chromium 148
+        // Fish Tank runtime-captured two otherwise valid, identical wrapper
+        // records with token 0x9207.  The former low-byte==3 requirement
+        // rejected that list, after which the single-record fallback shifted
+        // KCMD bytes without its multi-segment ranges and produced error 0x0a.
+        BOOL wrapper_commands_ok = wrapper_opcode < 0x10000;
         for (unsigned i = 0; wrapper_commands_ok && i < wrapper_count; i++) {
             size_t offset = cursor + (size_t)i * 0x18;
             wrapper_commands_ok =
@@ -9731,6 +9749,12 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             }
         }
 
+        BOOL single_direct_segment = segment_length >= 0x20 &&
+            *(uint32_t *)(uintptr_t)(segment_start + 0x08) == 1 &&
+            *(uint32_t *)(uintptr_t)(segment_start + 0x0c) ==
+                (0x80000000U | (uint32_t)segment_length) &&
+            *(uint32_t *)(uintptr_t)(segment_start + 0x18) == 0 &&
+            *(uint32_t *)(uintptr_t)(segment_start + 0x1c) == total;
         size_t off = 0;
         unsigned walked = 0;
         while (off + 0x38 <= total && walked++ < 16) {
@@ -9950,7 +9974,12 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 continue;
             }
 
-            if (inner == 0x30 && subtype == 3 && size == 0x1b8 &&
+            // The linear fallback updates only the one direct range at
+            // list+0x18.  Never apply it to a multi-segment or trailing-
+            // wrapper list: shifting its KCMD tail without updating every
+            // later range is a malformed command, not a compatibility fix.
+            if (single_direct_segment &&
+                inner == 0x30 && subtype == 3 && size == 0x1b8 &&
                 end_offset == 0x1e8 && off + 0x1e8 <= total) {
                 static const unsigned char sentinel[12] = {
                     0x01, 0x00, 0x00, 0x00,
@@ -9980,6 +10009,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     *(uint32_t *)(commands + off + 0x28) = 0x1d8;
                     *(uint32_t *)(commands + off + 0x2c) = 0x1a8;
                     total -= 0x10;
+                    *(uint32_t *)(uintptr_t)(segment_start + 0x1c) =
+                        (uint32_t)total;
                     uint64_t new_current = start + total;
                     uint64_t new_current_raw =
                         (current_raw & 0xffff000000000000ULL) | new_current;
@@ -11233,6 +11264,49 @@ static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
     return interactive ? kInteractivePaceUS : idle_pace_us;
 }
 
+// Pace completion timestamps, not post-render delays.  The former fixed
+// usleep(interval) below made the virtual frame period equal to
+// render_time + interval; the 2026-07-28 Chromium 148 control consequently
+// produced an average 55-ms rAF interval while each 100-draw issue took only
+// 0.09 ms.  Keep one synchronous completion per swap (so no callback FIFO can
+// accumulate), but subtract time already spent rendering since the preceding
+// completion.  This remains a virtual-display timing scaffold, not a claim
+// that a synthetic callback is a hardware vblank or GPU fence.
+static uint32_t macws_coexist_wait_for_completion_slot(uint32_t interval_us) {
+    static pthread_mutex_t pace_lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t last_completion_ns = 0;
+    const uint64_t interval_ns = (uint64_t)interval_us * 1000u;
+    uint32_t slept_us = 0;
+
+    pthread_mutex_lock(&pace_lock);
+    struct timespec now_ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now_ts) == 0) {
+        uint64_t now_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
+            (uint64_t)now_ts.tv_nsec;
+        uint64_t target_ns = last_completion_ns
+            ? last_completion_ns + interval_ns : now_ns + interval_ns;
+        if (target_ns > now_ns) {
+            uint64_t remaining_us = (target_ns - now_ns + 999u) / 1000u;
+            if (remaining_us > UINT32_MAX) remaining_us = UINT32_MAX;
+            slept_us = (uint32_t)remaining_us;
+            usleep((useconds_t)slept_us);
+        }
+        if (clock_gettime(CLOCK_MONOTONIC, &now_ts) == 0) {
+            last_completion_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
+                (uint64_t)now_ts.tv_nsec;
+        } else {
+            last_completion_ns = target_ns;
+        }
+    } else {
+        // Preserve the established bounded behavior if the monotonic clock is
+        // unexpectedly unavailable on a future target.
+        slept_us = interval_us;
+        usleep((useconds_t)interval_us);
+    }
+    pthread_mutex_unlock(&pace_lock);
+    return slept_us;
+}
+
 static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
     if (!atomic_load(&g_macws_iomfb_coexist_swap_cancel) || !framebuffer) {
         return g_macws_orig_iomfb_swap_end
@@ -11257,19 +11331,21 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
         // thermal watchdog stopped it.  The earlier asynchronous 200-ms FIFO
         // did not pace submissions and grew without bound.  Block this exact
         // SwapEnd ownership boundary for one 60-Hz interval before queueing
-        // its one matching completion.  Render work plus this interval yields
-        // roughly 30 presented virtual frames/s without accumulating pending
-        // callbacks or weakening the watchdog threshold.
+        // its one matching completion.  Pace against the preceding completion
+        // timestamp so render work counts toward (rather than being added to)
+        // the requested interval.
         uint32_t pace_us = macws_coexist_activity_pace_us(
             macws_coexist_completion_pace_us());
-        usleep(pace_us);
+        uint32_t slept_us =
+            macws_coexist_wait_for_completion_slot(pace_us);
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);
         macws_iomfb_complete_cancelled_swap(client, swap_id);
         if (sequence <= 4) {
             fprintf(stderr,
-                "#### COEXIST completion pace #%lu: %u us before swapID=%u\n",
-                sequence, pace_us, swap_id);
+                "#### COEXIST completion pace #%lu: interval=%u us "
+                "slept=%u us before swapID=%u\n",
+                sequence, pace_us, slept_us, swap_id);
         }
     }
     return result;

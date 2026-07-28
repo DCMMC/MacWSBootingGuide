@@ -1,0 +1,2 @@
+reason=iogpu-error-getter-102 pid=28606 command_buffer=0x600226580 requested_serial=4 matched_serial=4 oldest=1 newest=4 freeze_wait_ms=0
+serial=1 life_event_serial=31 sequence=1 descriptor=0 fixed=1 descriptor_pointer=0x60095b490 command_buffer=0x600222300 storage=0x6001a6800 matched=NO same_shape=NO commands=2080 saved=2080 truncated=NO segments=304 saved=304 truncated=NO

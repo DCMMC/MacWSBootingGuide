@@ -50,6 +50,8 @@ TERM_LABEL=com.macwsguide.terminal
 INPUT_LABEL=com.macwsguide.input
 VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
 VSCODE_LABEL=com.macwsguide.vscode
+CHROME150_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist
+CHROME150_LABEL=com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
 EXPERIMENTAL_WRAPPED_KCMD="$ROOTFS/private/tmp/macws_kcmd_wrapped_fix"
 EXPERIMENTAL_COMMAND_ERROR="$ROOTFS/private/tmp/macws_command_error_diag"
@@ -89,6 +91,23 @@ P_GLASSDEMO='/tmp/GlassDemo'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_INPUTD='/usr/local/bin/macwsinputd'
 P_VSCODE='Visual Studio Code.app/Contents/'
+P_CHROME150='Google Chrome.app/Contents/'
+
+# Opt-in invocation audit for tracking an unexpected second start/stop without
+# leaving permanent command logging in normal use.  The 2026-07-29 controlled
+# browser run had its 16,667-us sentinel overwritten to 100,000 us by another
+# invocation; process uptime alone could not identify its already-exited
+# parent.  Touch $LOGDIR/macws_trace_gui_invocations before a diagnostic run.
+if [ -f "$LOGDIR/macws_trace_gui_invocations" ]; then
+    {
+        printf '%s pid=%s ppid=%s uid=%s args=' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$PPID" "$(id -u)"
+        printf '%q ' "$@"
+        printf ' parent='
+        ps -o command= -p "$PPID" 2>/dev/null || true
+        printf '\n'
+    } >> "$LOGDIR/macos_gui_invocations.log" 2>&1
+fi
 
 # ─── Watchdog (crash-loop safety net) ───────────────────────────────────────
 # WindowServer composites window content through the MTLSim Metal bridge, whose
@@ -175,7 +194,7 @@ wait_for_initial_ws_ready() {
             stable=1
         fi
 
-        if [ "$WANT_EXPERIMENTAL" = 1 ]; then
+        if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_VNC" = 1 ]; then
             if [ "$stable" -ge 2 ] &&
                sed -n "${log_start_line},\$p" "$LOGDIR/WindowServer.err" \
                    2>/dev/null \
@@ -185,8 +204,12 @@ wait_for_initial_ws_ready() {
                 return 0
             fi
         elif [ "$stable" -ge 8 ]; then
+            # A --no-vnc run intentionally has no VNC completion observer, so
+            # it cannot emit the VNC-FLOW readiness witness above.  Only call
+            # this process readiness; the subsequent CDP/WebGL test supplies
+            # the actual graphics witness for headless measurements.
             STARTED_WS_PID="$current"
-            log "WindowServer ready (pid=$current, stable for ${stable}s)."
+            log "WindowServer process ready (pid=$current, stable for ${stable}s; graphics not yet witnessed)."
             return 0
         fi
     done
@@ -235,6 +258,18 @@ stop_ws_dependents() {
     launchctl remove "$INPUT_LABEL" 2>/dev/null
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl unload "$CHROME150_PLIST" 2>/dev/null
+    launchctl remove "$CHROME150_LABEL" 2>/dev/null
+    # A root SSH shell on this jailbreak can still submit `launchctl load`
+    # into mobile's user/501 domain.  A system-domain unload then reports
+    # success/no-op while the browser job survives and contaminates the next
+    # supposedly clean benchmark.  Runtime-confirmed 2026-07-29 via
+    # `launchctl print user/501/com.macwsguide.chrome150`.  Remove both
+    # disposable browser jobs in that actual domain as well.
+    launchctl asuser 501 launchctl unload "$VSCODE_PLIST" 2>/dev/null
+    launchctl asuser 501 launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl asuser 501 launchctl unload "$CHROME150_PLIST" 2>/dev/null
+    launchctl asuser 501 launchctl remove "$CHROME150_LABEL" 2>/dev/null
 
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
@@ -243,6 +278,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_VSCODE"
+    kill_by_pattern "$P_CHROME150"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 }
@@ -750,9 +786,18 @@ enable_experimental_if_requested() {
     [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
     touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
         "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_VNC_SHARE" \
-        "$EXPERIMENTAL_OBSERVE_PF550" \
-        "$EXPERIMENTAL_FAST_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT"
+        "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_FAST_SUBMIT_RING"
+    if [ "$WANT_VNC" = 1 ]; then
+        touch "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+            "$EXPERIMENTAL_OWNED_SCANOUT"
+    else
+        # A headless/CDP performance run must not allocate and publish a
+        # 15.2-MiB VNC scanout every WindowServer frame.  Keeping these
+        # producer hooks enabled without an RFB consumer perturbs the very
+        # presentation cadence the run is intended to measure.
+        rm -f "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+            "$EXPERIMENTAL_OWNED_SCANOUT"
+    fi
     # Keep the old heap-allocating, mutex-protected deep recorder off the hot
     # path.  A VS Code GPU-process sample caught it in submission, and it can
     # perturb the timing-sensitive 0x102 failure.  The fixed-memory recorder
@@ -762,7 +807,11 @@ enable_experimental_if_requested() {
     if [ -n "$COEXIST_PACE_US" ]; then
         echo "$COEXIST_PACE_US" > "$EXPERIMENTAL_PACE"
     fi
-    log "DIAGNOSTIC-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + read-only PF550 completion observer + low-disturbance fixed-memory submit recorder + owned BGRA scanout + stable VNC mmap enabled."
+    if [ "$WANT_VNC" = 1 ]; then
+        log "DIAGNOSTIC-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + read-only PF550 completion observer + low-disturbance fixed-memory submit recorder + owned BGRA scanout + stable VNC mmap enabled."
+    else
+        log "DIAGNOSTIC-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + low-disturbance fixed-memory submit recorder enabled; VNC scanout bridge disabled for headless measurement."
+    fi
     if [ -n "$COEXIST_PACE_US" ]; then
         log "DIAGNOSTIC-SCAFFOLD: synthetic completion pace=${COEXIST_PACE_US} us (not a refresh-rate implementation)."
     fi
