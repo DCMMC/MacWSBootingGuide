@@ -20,8 +20,6 @@
         <string>1</string>
         <key>CA_VSYNC_OFF</key>
         <string>1</string>
-        <key>MACWS_ABORT_TRACE</key>
-        <string>1</string>
         <key>MACWS_AGX_NATIVE</key>
         <string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key>

@@ -1949,3 +1949,23 @@ pixels, negotiated encoding and native-AGX path are unchanged. Live
 intermediate title motion and occasional full-frame socket backpressure remain
 open. Exact runtime logs and screenshots are in
 [`system-wide-input-current/results.md`](evidence/vnc-usability-stability-20260729/system-wide-input-current/results.md).
+
+## 2026-07-29: production runs no longer carry the RE flight recorders
+
+The retained-symbol on-device build was unexpectedly compiling libmachook at
+`-O0`: Theos selects that default whenever `STRIP=0`, even with
+`FINALPACKAGE=1`.  Full and FAST builds now explicitly use `-O2` while keeping
+LLDB symbols.  High-frequency AGX lifecycle, submit-ring, method-trace,
+AppInputBridge and VNC flow instrumentation is also disabled by default and
+can only be armed with `--experimental --diagnostics`.  Functional native-AGX
+command/completion and owned-scanout compatibility remains enabled by
+`--experimental` alone.
+
+Startup readiness now uses a one-shot, PID-validated producer-completion file
+instead of depending on a removed diagnostic log line.  A bounded production
+smoke produced a nonblack 2388x1668 Terminal frame with zero submit artifacts
+and zero diagnostic sentinels.  iOS reported `thermal-state=nominal` before
+and after both validation runs.  This establishes the measurement boundary;
+the remaining short-run WindowServer CPU cost is explicitly still open.  The
+exact runtime lines, codegen evidence and thermal rule are recorded in
+[`debug-overhead-removal-20260729/README.md`](evidence/debug-overhead-removal-20260729/README.md).

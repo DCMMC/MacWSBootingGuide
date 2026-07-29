@@ -16,6 +16,55 @@
 #import <sys/socket.h>
 #import <sys/un.h>
 
+// Match mac_hooks.m's production/diagnostic boundary. This is intentionally
+// process-start state: enabling method swizzles or flight recorders halfway
+// through a frame would itself make a performance trace incoherent.
+static BOOL macws_runtime_diagnostics_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
+            access("/tmp/macws_runtime_diagnostics", F_OK) == 0 ||
+            access("/tmp/macws_submit_diag", F_OK) == 0 ||
+            access("/tmp/macws_submit_ring", F_OK) == 0 ||
+            access("/tmp/macws_submit_fast_ring", F_OK) == 0 ||
+            access("/tmp/macws_iogpu_error_diag", F_OK) == 0 ||
+            access("/tmp/macws_command_error_diag", F_OK) == 0 ||
+            access("/tmp/macws_observe_pf550", F_OK) == 0 ||
+            access("/tmp/macws_probe_small_pf550", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static BOOL macws_owned_scanout_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = access("/tmp/macws_owned_scanout", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+// Production readiness must not depend on a diagnostic stderr line. Publish
+// one tiny process-owned witness after the first actually completed display
+// producer. The launcher validates the PID and removes the file whenever the
+// producer is stopped, so a stale frame from an earlier WindowServer cannot
+// satisfy the next session.
+static void macws_publish_graphics_ready_once(void) {
+    static _Atomic int published = 0;
+    if (atomic_exchange_explicit(&published, 1, memory_order_acq_rel)) return;
+    int fd = open("/tmp/macws_graphics_ready",
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        atomic_store_explicit(&published, 0, memory_order_release);
+        return;
+    }
+    dprintf(fd, "%d\n", getpid());
+    close(fd);
+}
+
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
 extern int IOSurfaceLock(IOSurfaceRef, uint32_t options, uint32_t *seed);
@@ -764,12 +813,15 @@ static void macws_vnc_notify_damage(uint64_t sequence, size_t width,
                           (const struct sockaddr *)&address, sizeof(address));
     static _Atomic uint64_t sentCount = 0;
     static _Atomic uint64_t failureCount = 0;
-    uint64_t count = sent == (ssize_t)messageBytes
-        ? atomic_fetch_add(&sentCount, 1) + 1
-        : atomic_fetch_add(&failureCount, 1) + 1;
-    if ((sent == (ssize_t)messageBytes &&
+    uint64_t count = 0;
+    if (macws_runtime_diagnostics_enabled()) {
+        count = sent == (ssize_t)messageBytes
+            ? atomic_fetch_add(&sentCount, 1) + 1
+            : atomic_fetch_add(&failureCount, 1) + 1;
+    }
+    if (count && ((sent == (ssize_t)messageBytes &&
          (count <= 16 || (count % 600) == 0)) ||
-        (sent != (ssize_t)messageBytes && count <= 4)) {
+        (sent != (ssize_t)messageBytes && count <= 4))) {
         fprintf(stderr,
             "#### VNC-DAMAGE %s #%llu sequence=%llu rects=%u "
             "tiles=%u changed=%llu bounds=%zu,%zu %zux%zu "
@@ -803,7 +855,9 @@ static void *macws_vnc_mmap_data(size_t w, size_t h) {
     atomic_store_explicit(g_vnc_mmap_sequence, 0, memory_order_relaxed);
     g_vnc_mmap_fd = fd;
     g_vnc_mmap = m; g_vnc_mmap_w = w; g_vnc_mmap_h = h;
-    fprintf(stderr, "#### VNC-MMAP /tmp/macws_vnc_fb %zux%zu sz=%zu\n", w, h, sz);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr, "#### VNC-MMAP /tmp/macws_vnc_fb %zux%zu sz=%zu\n", w, h, sz);
+    }
     return (char *)m + 16;
 }
 
@@ -817,7 +871,7 @@ static void *macws_vnc_mmap_begin_frame(size_t w, size_t h) {
     if (g_vnc_mmap_fd >= 0 && flock(g_vnc_mmap_fd, LOCK_EX) != 0) {
         static _Atomic uint64_t lockFailures = 0;
         uint64_t count = atomic_fetch_add(&lockFailures, 1) + 1;
-        if (count <= 8 || (count % 600) == 0) {
+        if (count && (count <= 8 || (count % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-MMAP producer flock failed #%llu errno=%d\n",
                 (unsigned long long)count, errno);
@@ -841,8 +895,9 @@ static uint64_t macws_vnc_mmap_commit_frame(void) {
     if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
     pthread_mutex_unlock(&g_vnc_mmap_write_lock);
     static _Atomic uint64_t committed = 0;
-    uint64_t count = atomic_fetch_add(&committed, 1) + 1;
-    if (count <= 16 || (count % 600) == 0) {
+    uint64_t count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&committed, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 600) == 0)) {
         fprintf(stderr,
             "#### VNC-MMAP committed #%llu sequence=%llu %zux%zu\n",
             (unsigned long long)count, (unsigned long long)sequence,
@@ -876,7 +931,7 @@ static BOOL macws_vnc_mmap_publish_bgra_if_changed(
     if (g_vnc_mmap_fd >= 0 && flock(g_vnc_mmap_fd, LOCK_EX) != 0) {
         static _Atomic uint64_t lockFailures = 0;
         uint64_t count = atomic_fetch_add(&lockFailures, 1) + 1;
-        if (count <= 8 || (count % 600) == 0) {
+        if (count && (count <= 8 || (count % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-MMAP publish flock failed #%llu errno=%d\n",
                 (unsigned long long)count, errno);
@@ -929,8 +984,9 @@ static BOOL macws_vnc_mmap_publish_bgra_if_changed(
         if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
         pthread_mutex_unlock(&g_vnc_mmap_write_lock);
         static _Atomic uint64_t unchangedCount = 0;
-        uint64_t count = atomic_fetch_add(&unchangedCount, 1) + 1;
-        if (count <= 8 || (count % 600) == 0) {
+        uint64_t count = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&unchangedCount, 1) + 1 : 0;
+        if (count && (count <= 8 || (count % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-MMAP unchanged skip #%llu sequence=%llu "
                 "%zux%zu\n",
@@ -962,8 +1018,9 @@ static BOOL macws_vnc_mmap_publish_bgra_if_changed(
     if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
     pthread_mutex_unlock(&g_vnc_mmap_write_lock);
     static _Atomic uint64_t committedCount = 0;
-    uint64_t committed = atomic_fetch_add(&committedCount, 1) + 1;
-    if (committed <= 8 || (committed % 600) == 0) {
+    uint64_t committed = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&committedCount, 1) + 1 : 0;
+    if (committed && (committed <= 8 || (committed % 600) == 0)) {
         fprintf(stderr,
             "#### VNC-MMAP sparse committed #%llu sequence=%llu "
             "%zux%zu changed=%llu\n",
@@ -1124,10 +1181,13 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
 
     static _Atomic uint64_t publishCount = 0;
     static _Atomic uint64_t rejectCount = 0;
-    uint64_t sequence = valid
-        ? atomic_fetch_add(&publishCount, 1) + 1
-        : atomic_fetch_add(&rejectCount, 1) + 1;
-    if (sequence <= 32 || (sequence % 600) == 0) {
+    uint64_t sequence = 0;
+    if (macws_runtime_diagnostics_enabled()) {
+        sequence = valid
+            ? atomic_fetch_add(&publishCount, 1) + 1
+            : atomic_fetch_add(&rejectCount, 1) + 1;
+    }
+    if (sequence && (sequence <= 32 || (sequence % 600) == 0)) {
         fprintf(stderr,
             "#### VNC-OWNED %s #%llu tex=%p surface=%p id=%u "
             "%zux%zu rgb=%zu/%zu different=%zu denseRows=%zu "
@@ -1161,10 +1221,11 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
     // owned scanout is requested, no texture at all may enter the legacy GPU
     // capture path; owned textures are published at producer completion by
     // macws_vnc_publish_owned_texture().
-    if (access("/tmp/macws_owned_scanout", F_OK) == 0) {
+    if (macws_owned_scanout_enabled()) {
         static _Atomic uint64_t ownedModeSkipCount = 0;
-        uint64_t n = atomic_fetch_add(&ownedModeSkipCount, 1) + 1;
-        if (n <= 8 || (n % 600) == 0) {
+        uint64_t n = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&ownedModeSkipCount, 1) + 1 : 0;
+        if (n && (n <= 8 || (n % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-OWNED legacy-blit blocked #%llu tex=%p\n",
                 (unsigned long long)n, (void *)dest);
@@ -1200,8 +1261,9 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
     maxArea = atomic_load(&g_vnc_comp_max_area);
     if (candidateArea < maxArea) {
         static _Atomic unsigned int rejected = 0;
-        unsigned int n = atomic_fetch_add(&rejected, 1) + 1;
-        if (n <= 8 || (n % 600) == 0) {
+        unsigned int n = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&rejected, 1) + 1 : 0;
+        if (n && (n <= 8 || (n % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-BLIT reject intermediate #%u %zux%zu area=%llu "
                 "displayArea=%llu\n",
@@ -1237,7 +1299,8 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                     size_t w = [t width], h = [t height];
                     unsigned long pf = (unsigned long)[t pixelFormat];
                     static _Atomic int targetlog = 0;
-                    int targetn = atomic_fetch_add(&targetlog, 1);
+                    int targetn = macws_runtime_diagnostics_enabled()
+                        ? atomic_fetch_add(&targetlog, 1) : INT_MAX;
                     if (targetn < 24) {
                         fprintf(stderr,
                             "#### VNC-BLIT candidate #%d tex=%p class=%s %zux%zu pf=%lu\n",
@@ -1265,7 +1328,9 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                             d.usage = MTLTextureUsageShaderRead;
                             dst = [dev newTextureWithDescriptor:d];
                             dstpf = pf; dstw = w; dsth = h;
-                            fprintf(stderr, "#### VNC-BLIT dst=%p %zux%zu pf=%lu\n", (void*)dst, w, h, pf);
+                            if (macws_runtime_diagnostics_enabled()) {
+                                fprintf(stderr, "#### VNC-BLIT dst=%p %zux%zu pf=%lu\n", (void*)dst, w, h, pf);
+                            }
                         }
                         if (dst && q) {
                             id<MTLCommandBuffer> cb = [q commandBuffer];
@@ -1380,10 +1445,14 @@ void macws_vnc_on_composite(id<MTLTexture> dest) {
                                     }
                                     static _Atomic uint64_t publishLog = 0;
                                     static _Atomic uint64_t rejectLog = 0;
-                                    uint64_t sequence = published
-                                        ? atomic_fetch_add(&publishLog, 1) + 1
-                                        : atomic_fetch_add(&rejectLog, 1) + 1;
-                                    if (sequence <= 16 || (sequence % 600) == 0) {
+                                    uint64_t sequence = 0;
+                                    if (macws_runtime_diagnostics_enabled()) {
+                                        sequence = published
+                                            ? atomic_fetch_add(&publishLog, 1) + 1
+                                            : atomic_fetch_add(&rejectLog, 1) + 1;
+                                    }
+                                    if (sequence &&
+                                        (sequence <= 16 || (sequence % 600) == 0)) {
                                         fprintf(stderr,
                                             "#### VNC-BLIT %s #%llu %zux%zu "
                                             "pf=%lu rgb=%zu/%zu different=%zu "
@@ -1495,7 +1564,7 @@ static void macws_vnc_ack_capture(uint64_t generation) {
     if (fd < 0) return;
     ssize_t written = write(fd, value, (size_t)length);
     close(fd);
-    if (written == length) {
+    if (written == length && macws_runtime_diagnostics_enabled()) {
         fprintf(stderr,
             "#### VNC-FINAL acknowledged pid=%d generation=%llu\n",
             getpid(), (unsigned long long)generation);
@@ -2492,10 +2561,12 @@ static BOOL macws_vnc_admit_owned_observer(void) {
     for (;;) {
         if (previous != 0 && nanoseconds >= previous &&
             nanoseconds - previous < minimumInterval) {
-            uint64_t throttled = atomic_fetch_add_explicit(
-                &g_vnc_owned_observer_throttle_count, 1,
-                memory_order_relaxed) + 1;
-            if (throttled <= 16 || (throttled % 600) == 0) {
+            uint64_t throttled = macws_runtime_diagnostics_enabled()
+                ? atomic_fetch_add_explicit(
+                    &g_vnc_owned_observer_throttle_count, 1,
+                    memory_order_relaxed) + 1 : 0;
+            if (throttled &&
+                (throttled <= 16 || (throttled % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-OWNED observer-throttle #%llu "
                     "admitted=%llu delta=%llu us\n",
@@ -2510,10 +2581,12 @@ static BOOL macws_vnc_admit_owned_observer(void) {
         if (atomic_compare_exchange_weak_explicit(
                 &g_vnc_owned_observer_last_ns, &previous, nanoseconds,
                 memory_order_acq_rel, memory_order_acquire)) {
-            uint64_t admitted = atomic_fetch_add_explicit(
-                &g_vnc_owned_observer_admit_count, 1,
-                memory_order_relaxed) + 1;
-            if (admitted <= 16 || (admitted % 600) == 0) {
+            uint64_t admitted = macws_runtime_diagnostics_enabled()
+                ? atomic_fetch_add_explicit(
+                    &g_vnc_owned_observer_admit_count, 1,
+                    memory_order_relaxed) + 1 : 0;
+            if (admitted &&
+                (admitted <= 16 || (admitted % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-OWNED observer-admit #%llu throttled=%llu\n",
                     (unsigned long long)admitted,
@@ -2560,7 +2633,8 @@ void macws_vnc_complete_composite(void *context) {
     size_t width = [texture width], height = [texture height];
     unsigned long pixelFormat = (unsigned long)[texture pixelFormat];
     static _Atomic int completionLog = 0;
-    int n = atomic_fetch_add(&completionLog, 1);
+    int n = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&completionLog, 1) : INT_MAX;
     if (n < 32) {
         fprintf(stderr,
             "#### VNC-ENDCOMPOSITE #%d context=%p tex=%p class=%s "
@@ -2592,12 +2666,16 @@ void macws_vnc_complete_composite(void *context) {
                 replacedPending = g_vnc_composite_pending[key] != nil;
                 g_vnc_composite_pending[key] = texture;
             }
-            uint64_t completed =
-                atomic_fetch_add(&g_vnc_completed_display_count, 1) + 1;
-            uint64_t replaced = replacedPending
-                ? atomic_fetch_add(&g_vnc_pending_replace_count, 1) + 1
-                : atomic_load(&g_vnc_pending_replace_count);
-            if (completed <= 32 || (completed % 600) == 0) {
+            uint64_t completed = 0, replaced = 0;
+            if (macws_runtime_diagnostics_enabled()) {
+                completed =
+                    atomic_fetch_add(&g_vnc_completed_display_count, 1) + 1;
+                replaced = replacedPending
+                    ? atomic_fetch_add(&g_vnc_pending_replace_count, 1) + 1
+                    : atomic_load(&g_vnc_pending_replace_count);
+            }
+            if (completed &&
+                (completed <= 32 || (completed % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-FLOW staged #%llu context=%p tex=%p "
                     "%zux%zu pf=%lu replaced=%s replaceTotal=%llu\n",
@@ -2608,8 +2686,10 @@ void macws_vnc_complete_composite(void *context) {
             }
         } else {
             static _Atomic unsigned int rejectedFinal = 0;
-            unsigned int rejected = atomic_fetch_add(&rejectedFinal, 1) + 1;
-            if (rejected <= 8 || (rejected % 600) == 0) {
+            unsigned int rejected = macws_runtime_diagnostics_enabled()
+                ? atomic_fetch_add(&rejectedFinal, 1) + 1 : 0;
+            if (rejected &&
+                (rejected <= 8 || (rejected % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-ENDCOMPOSITE reject intermediate #%u "
                     "%zux%zu pf=%lu area=%llu displayArea=%llu\n",
@@ -2625,7 +2705,9 @@ void macws_vnc_complete_composite(void *context) {
 void macws_vnc_finish_update(void *context) {
     if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_pending)
         return;
-    uint64_t finish = atomic_fetch_add(&g_vnc_finish_count, 1) + 1;
+    BOOL diagnostics = macws_runtime_diagnostics_enabled();
+    uint64_t finish = diagnostics
+        ? atomic_fetch_add(&g_vnc_finish_count, 1) + 1 : 0;
     NSValue *key = [NSValue valueWithPointer:context];
     id<MTLTexture> texture = nil;
     @synchronized(g_vnc_composite_stages) {
@@ -2633,9 +2715,9 @@ void macws_vnc_finish_update(void *context) {
         [g_vnc_composite_pending removeObjectForKey:key];
     }
     if (!texture) {
-        uint64_t missing =
-            atomic_fetch_add(&g_vnc_finish_without_texture_count, 1) + 1;
-        if (finish <= 32 || (finish % 600) == 0) {
+        uint64_t missing = diagnostics
+            ? atomic_fetch_add(&g_vnc_finish_without_texture_count, 1) + 1 : 0;
+        if (finish && (finish <= 32 || (finish % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-FLOW finish #%llu context=%p texture=NONE "
                 "missingTotal=%llu stagedTotal=%llu pollAccepted=%llu "
@@ -2671,9 +2753,10 @@ void macws_vnc_finish_update(void *context) {
     if (pixelFormat == 550 && captureRequested && !unsafePF550Capture) {
         uint64_t generation = macws_vnc_capture_generation();
         static _Atomic uint64_t suppressedPF550CaptureCount = 0;
-        uint64_t suppressed =
-            atomic_fetch_add(&suppressedPF550CaptureCount, 1) + 1;
-        if (suppressed <= 8 || (suppressed % 600) == 0) {
+        uint64_t suppressed = diagnostics
+            ? atomic_fetch_add(&suppressedPF550CaptureCount, 1) + 1 : 0;
+        if (suppressed &&
+            (suppressed <= 8 || (suppressed % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-FINAL suppressed unsafe cross-queue PF550 "
                 "capture #%llu generation=%llu\n",
@@ -2804,7 +2887,7 @@ void macws_vnc_finish_update(void *context) {
 
     if (!commandBuffer || ![commandBuffer respondsToSelector:@selector(status)]) {
         static int missingLog = 0;
-        if (missingLog++ < 4) {
+        if (diagnostics && missingLog++ < 4) {
             fprintf(stderr,
                 "#### VNC-ENDUPDATE no submitted command buffer context=%p "
                 "tex=%p cb=%p\n", context, (void *)texture,
@@ -2827,8 +2910,9 @@ void macws_vnc_finish_update(void *context) {
     // session would otherwise enter its IOMFB PF550 capture cycle.
     static _Atomic int pollInFlight = 0;
     if (atomic_exchange(&pollInFlight, 1)) {
-        uint64_t dropped = atomic_fetch_add(&g_vnc_poll_drop_count, 1) + 1;
-        if (dropped <= 32 || (dropped % 600) == 0) {
+        uint64_t dropped = diagnostics
+            ? atomic_fetch_add(&g_vnc_poll_drop_count, 1) + 1 : 0;
+        if (dropped && (dropped <= 32 || (dropped % 600) == 0)) {
             fprintf(stderr,
                 "#### VNC-FLOW poll-drop #%llu finish=%llu context=%p "
                 "tex=%p pf=%lu accepted=%llu\n",
@@ -2840,10 +2924,12 @@ void macws_vnc_finish_update(void *context) {
         macws_vnc_release(texture);
         return;
     }
-    uint64_t accepted = atomic_fetch_add(&g_vnc_poll_accept_count, 1) + 1;
-    uint64_t submitSerial = macws_latest_agx_submit_serial(
-        (__bridge const void *)commandBuffer);
-    if (accepted <= 32 || (accepted % 600) == 0) {
+    uint64_t accepted = diagnostics
+        ? atomic_fetch_add(&g_vnc_poll_accept_count, 1) + 1 : 0;
+    uint64_t submitSerial = diagnostics
+        ? macws_latest_agx_submit_serial(
+            (__bridge const void *)commandBuffer) : 0;
+    if (accepted && (accepted <= 32 || (accepted % 600) == 0)) {
         fprintf(stderr,
             "#### VNC-FLOW poll-accept #%llu finish=%llu context=%p "
             "tex=%p pf=%lu submitSerial=%llu dropped=%llu\n",
@@ -2868,7 +2954,7 @@ void macws_vnc_finish_update(void *context) {
             NSString *errorDomain = error ? [error domain] : nil;
             unsigned long completedPF = (unsigned long)[texture pixelFormat];
             static _Atomic int pollLog = 0;
-            int n = atomic_fetch_add(&pollLog, 1);
+            int n = diagnostics ? atomic_fetch_add(&pollLog, 1) : INT_MAX;
             if (n < 16) {
                 // Runtime-confirmed by
                 // WindowServer-2026-07-26-161536.ips: formatting one private
@@ -2885,6 +2971,8 @@ void macws_vnc_finish_update(void *context) {
             }
             BOOL completedCleanly =
                 status == MTLCommandBufferStatusCompleted && !error;
+            if (completedCleanly)
+                macws_publish_graphics_ready_once();
             if (completedPF == 550) {
                 macws_observe_pf550_metadata(texture, submitSerial,
                                              completedCleanly);
@@ -2892,14 +2980,15 @@ void macws_vnc_finish_update(void *context) {
             if (completedCleanly && completedPF == 550 && submitSerial) {
                 macws_mark_agx_submit_serial_for_error_dump(submitSerial);
             }
-            uint64_t cleanTotal = completedCleanly
+            uint64_t cleanTotal = diagnostics && completedCleanly
                 ? atomic_fetch_add(&g_vnc_poll_clean_count, 1) + 1
-                : atomic_load(&g_vnc_poll_clean_count);
-            uint64_t errorTotal = !completedCleanly
+                : (diagnostics ? atomic_load(&g_vnc_poll_clean_count) : 0);
+            uint64_t errorTotal = diagnostics && !completedCleanly
                 ? atomic_fetch_add(&g_vnc_poll_error_count, 1) + 1
-                : atomic_load(&g_vnc_poll_error_count);
+                : (diagnostics ? atomic_load(&g_vnc_poll_error_count) : 0);
             uint64_t observedTotal = cleanTotal + errorTotal;
-            if (observedTotal <= 32 || (observedTotal % 600) == 0) {
+            if (observedTotal &&
+                (observedTotal <= 32 || (observedTotal % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-FLOW poll-result observed=%llu clean=%llu "
                     "error=%llu pf=%lu submitSerial=%llu status=%ld "
@@ -2910,7 +2999,8 @@ void macws_vnc_finish_update(void *context) {
                     (unsigned long long)submitSerial,
                     (long)status, (long)errorCode, polls);
             }
-            if (!completedCleanly && error && errorTotal <= 4) {
+            if (diagnostics && !completedCleanly && error &&
+                errorTotal <= 4) {
                 macws_log_failed_texture_descriptor(
                     texture, (__bridge const void *)commandBuffer,
                     submitSerial);
@@ -2988,7 +3078,7 @@ static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
     size_t ih = IOSurfaceGetHeight(iosurface);
     unsigned long pf = tex ? (unsigned long)[tex pixelFormat] : 0;
     if (macws_vnc_share_enabled() && tex && iw >= 1000 && ih >= 600) {
-        if (pf == 550) {
+        if (pf == 550 && macws_runtime_diagnostics_enabled()) {
             static _Atomic int pf550SurfaceDumped = 0;
             if (!atomic_exchange(&pf550SurfaceDumped, 1)) {
                 OSType fourcc = IOSurfaceGetPixelFormat(iosurface);
@@ -3010,7 +3100,8 @@ static void macws_disp_fill_track(id<MTLTexture> tex, IOSurfaceRef iosurface) {
             }
         }
         static _Atomic int finalLog = 0;
-        int n = atomic_fetch_add(&finalLog, 1);
+        int n = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&finalLog, 1) : INT_MAX;
         if (n < 24) {
             fprintf(stderr,
                 "#### VNC-FINAL candidate #%d tex=%p class=%s tex=%zux%zu pf=%lu "
@@ -3543,6 +3634,7 @@ static void macws_log_failed_texture_descriptor(
 // texBaseAddressesUpdated().  This helper now only records the postcondition.
 static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
                                                   IOSurfaceRef surf) {
+    if (!macws_runtime_diagnostics_enabled()) return;
     if (!tex || !surf) return;
     // This witness describes the private AGXG13GFamilyTexture layout below;
     // it is not a generic MTLTexture ABI.  The MTLSim path returns an
@@ -4479,7 +4571,7 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
                                                       size_t width,
                                                       size_t height) {
     if (!original || width < 1000 || height < 600 ||
-        access("/tmp/macws_owned_scanout", F_OK) != 0) {
+        !macws_owned_scanout_enabled()) {
         return NULL;
     }
     uint32_t format = IOSurfaceGetPixelFormat(original);
@@ -4507,8 +4599,9 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
                 CFRetain(existing);
                 entry[@"last"] = @(g_macws_owned_scanout_clock);
                 static _Atomic uint64_t hits = 0;
-                uint64_t hit = atomic_fetch_add(&hits, 1) + 1;
-                if (hit <= 32 || (hit % 600) == 0) {
+                uint64_t hit = macws_runtime_diagnostics_enabled()
+                    ? atomic_fetch_add(&hits, 1) + 1 : 0;
+                if (hit && (hit <= 32 || (hit % 600) == 0)) {
                     fprintf(stderr,
                         "#### VNC-OWNED lease-hit #%llu key=%s "
                         "originalID=%u surface=%p id=%u retain=%ld "
@@ -4566,20 +4659,23 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
         // retain owned by the pool entry.
         CFRetain(owned);
         static _Atomic uint64_t allocations = 0;
-        uint64_t allocated = atomic_fetch_add(&allocations, 1) + 1;
-        fprintf(stderr,
-            "#### VNC-OWNED lease-new #%llu key=%s original=%p id=%u "
-            "-> owned=%p id=%u %zux%zu bpr=%zu alloc=%zu "
-            "entries=%lu pool=%luMB baseline=%ld reserved-retain=%ld\n",
-            (unsigned long long)allocated, [key UTF8String],
-            (void *)original, originalID,
-            (void *)owned, (unsigned)IOSurfaceGetID(owned), width, height,
-            IOSurfaceGetBytesPerRow(owned), allocation,
-            (unsigned long)[shapeEntries count],
-            (unsigned long)(g_macws_owned_scanout_pool_bytes /
-                            (1024 * 1024)),
-            (long)baseline,
-            (long)CFGetRetainCount(owned));
+        uint64_t allocated = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&allocations, 1) + 1 : 0;
+        if (allocated) {
+            fprintf(stderr,
+                "#### VNC-OWNED lease-new #%llu key=%s original=%p id=%u "
+                "-> owned=%p id=%u %zux%zu bpr=%zu alloc=%zu "
+                "entries=%lu pool=%luMB baseline=%ld reserved-retain=%ld\n",
+                (unsigned long long)allocated, [key UTF8String],
+                (void *)original, originalID,
+                (void *)owned, (unsigned)IOSurfaceGetID(owned), width, height,
+                IOSurfaceGetBytesPerRow(owned), allocation,
+                (unsigned long)[shapeEntries count],
+                (unsigned long)(g_macws_owned_scanout_pool_bytes /
+                                (1024 * 1024)),
+                (long)baseline,
+                (long)CFGetRetainCount(owned));
+        }
 
         // Evict only idle older entries.  Live textures may temporarily push
         // the pool over budget; freeing or aliasing one would violate the
@@ -4614,8 +4710,9 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
             }
             if (!oldestEntry) {
                 static _Atomic uint64_t overBudget = 0;
-                uint64_t count = atomic_fetch_add(&overBudget, 1) + 1;
-                if (count <= 8 || (count % 300) == 0) {
+                uint64_t count = macws_runtime_diagnostics_enabled()
+                    ? atomic_fetch_add(&overBudget, 1) + 1 : 0;
+                if (count && (count <= 8 || (count % 300) == 0)) {
                     fprintf(stderr,
                         "#### VNC-OWNED lease-over-budget #%llu pool=%luMB "
                         "all older surfaces busy\n",
@@ -4636,8 +4733,10 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
                 evictedBytes > g_macws_owned_scanout_pool_bytes
                     ? 0 : g_macws_owned_scanout_pool_bytes - evictedBytes;
             static _Atomic uint64_t evictions = 0;
-            uint64_t eviction = atomic_fetch_add(&evictions, 1) + 1;
-            if (eviction <= 16 || (eviction % 600) == 0) {
+            uint64_t eviction = macws_runtime_diagnostics_enabled()
+                ? atomic_fetch_add(&evictions, 1) + 1 : 0;
+            if (eviction &&
+                (eviction <= 16 || (eviction % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-OWNED lease-evict #%llu key=%s surface=%p "
                     "id=%u bytes=%luKB pool=%luMB\n",
@@ -4801,7 +4900,7 @@ static void macws_sigabrt_trampoline(int sig) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.IN");
     }
     static int classlog = 0;
-    if (classlog < 3) {
+    if (macws_runtime_diagnostics_enabled() && classlog < 3) {
         fprintf(stderr, "#### MTL_TEX entry self class=%s\n", class_getName([self class]));
         classlog++;
     }
@@ -4856,7 +4955,7 @@ static void macws_sigabrt_trampoline(int sig) {
     macws_set_current_iosurface_compression_header_span(
         compression_header_span);
     static int tls_log = 0;
-    if (tls_log < 8) {
+    if (macws_runtime_diagnostics_enabled() && tls_log < 8) {
         fprintf(stderr,
             "#### MTL_TEX TLS set iosurface=%p id=%#x plane=%lu "
             "compressionHeaderSpan=%#llx (thread=%p addr=%p)\n",
@@ -4909,8 +5008,10 @@ static void macws_sigabrt_trampoline(int sig) {
                 originalCompressionSpan);
             desc.pixelFormat = originalFormat;
             static _Atomic uint64_t ownedWrapCount = 0;
-            uint64_t wrapped = atomic_fetch_add(&ownedWrapCount, 1) + 1;
-            if (wrapped <= 24 || (wrapped % 600) == 0 || !result) {
+            uint64_t wrapped = macws_runtime_diagnostics_enabled()
+                ? atomic_fetch_add(&ownedWrapCount, 1) + 1 : 0;
+            if ((wrapped &&
+                 (wrapped <= 24 || (wrapped % 600) == 0)) || !result) {
                 fprintf(stderr,
                     "#### VNC-OWNED wrap #%llu original=%p id=%u "
                     "owned=%p id=%u texture=%p result=%s retain=%ld->%ld\n",
@@ -5255,9 +5356,11 @@ static void macws_sigabrt_trampoline(int sig) {
                 ? [desc mipmapLevelCount] : 1;
         if (mipmapLevelCount > 1) {
             static _Atomic uint64_t mipNativeAttempts = 0;
-            uint64_t attempt = atomic_fetch_add_explicit(
-                &mipNativeAttempts, 1, memory_order_relaxed) + 1;
-            if (attempt <= 12) {
+            BOOL diagnostics = macws_runtime_diagnostics_enabled();
+            uint64_t attempt = diagnostics
+                ? atomic_fetch_add_explicit(
+                    &mipNativeAttempts, 1, memory_order_relaxed) + 1 : 0;
+            if (attempt && attempt <= 12) {
                 fprintf(stderr,
                     "#### MTL_TEX MIP-NATIVE attempt=%llu w=%lu h=%lu "
                     "pf=%lu mips=%lu storage=%lu usage=%#lx\n",
@@ -5275,10 +5378,12 @@ static void macws_sigabrt_trampoline(int sig) {
                 backtrace_symbols_fd(frames, count, STDERR_FILENO);
             }
             id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-            fprintf(stderr,
-                "#### MTL_TEX MIP-NATIVE result attempt=%llu tex=%p class=%s\n",
-                (unsigned long long)attempt, (void *)tex,
-                tex ? class_getName([tex class]) : "(nil)");
+            if (diagnostics) {
+                fprintf(stderr,
+                    "#### MTL_TEX MIP-NATIVE result attempt=%llu tex=%p class=%s\n",
+                    (unsigned long long)attempt, (void *)tex,
+                    tex ? class_getName([tex class]) : "(nil)");
+            }
             return tex;
         }
 
@@ -5288,7 +5393,8 @@ static void macws_sigabrt_trampoline(int sig) {
         // sampleCount pairing intact.
         if (storageMode == 3 /* MTLStorageModeMemoryless */) {
             static int memless_native_log = 0;
-            if (memless_native_log++ < 4) {
+            BOOL diagnostics = macws_runtime_diagnostics_enabled();
+            if (diagnostics && memless_native_log++ < 4) {
                 fprintf(stderr,
                     "#### MTL_TEX plain MEMORYLESS: routing to native AGX path "
                     "(no IOSurface — tile-memory-only) w=%lu h=%lu pf=%lu\n",
@@ -5297,7 +5403,7 @@ static void macws_sigabrt_trampoline(int sig) {
                     (unsigned long)pf);
             }
             id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-            if (memless_native_log < 6) {
+            if (diagnostics && memless_native_log < 6) {
                 fprintf(stderr,
                     "#### MTL_TEX plain MEMORYLESS native result: %p "
                     "(class=%s storageMode=%lu length=%lu)\n",
@@ -5320,14 +5426,15 @@ static void macws_sigabrt_trampoline(int sig) {
              pf == 260 || pf == 261 || pf == 262);
         if (depthOrStencil) {
             static int depth_stencil_log = 0;
-            if (depth_stencil_log++ < 8) {
+            BOOL diagnostics = macws_runtime_diagnostics_enabled();
+            if (diagnostics && depth_stencil_log++ < 8) {
                 fprintf(stderr,
                     "#### MTL_TEX plain DEPTH-STENCIL: pf=%lu routing to "
                     "native AGX path (IOSurface backing is invalid)\n",
                     (unsigned long)pf);
             }
             id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-            if (depth_stencil_log < 10) {
+            if (diagnostics && depth_stencil_log < 10) {
                 fprintf(stderr,
                     "#### MTL_TEX plain DEPTH-STENCIL native result: %p class=%s\n",
                     (void *)tex, tex ? class_getName([tex class]) : "(nil)");
@@ -5356,7 +5463,8 @@ static void macws_sigabrt_trampoline(int sig) {
         if (texType == 4 /* MTLTextureType2DMultisample */ ||
             texType == 8 /* MTLTextureType2DMultisampleArray */) {
             static int multisample_native_log = 0;
-            if (multisample_native_log++ < 8) {
+            BOOL diagnostics = macws_runtime_diagnostics_enabled();
+            if (diagnostics && multisample_native_log++ < 8) {
                 fprintf(stderr,
                     "#### MTL_TEX plain MULTISAMPLE: texType=%lu sampleCount=%lu "
                     "routing to native AGX path (descriptor preserved)\n",
@@ -5365,7 +5473,7 @@ static void macws_sigabrt_trampoline(int sig) {
                         ? [desc sampleCount] : 0));
             }
             id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-            if (multisample_native_log < 10) {
+            if (diagnostics && multisample_native_log < 10) {
                 fprintf(stderr,
                     "#### MTL_TEX plain MULTISAMPLE native result: %p class=%s\n",
                     (void *)tex, tex ? class_getName([tex class]) : "(nil)");
@@ -5398,13 +5506,14 @@ static void macws_sigabrt_trampoline(int sig) {
             // Default OFF until proven safe.
             if (getenv("MACWS_AGX_NATIVE_NON2D")) {
                 static int native_log = 0;
-                if (native_log++ < 6) {
+                BOOL diagnostics = macws_runtime_diagnostics_enabled();
+                if (diagnostics && native_log++ < 6) {
                     fprintf(stderr,
                         "#### MTL_TEX plain NON-2D native attempt: texType=%lu\n",
                         (unsigned long)texType);
                 }
                 id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-                if (native_log < 8) {
+                if (diagnostics && native_log < 8) {
                     fprintf(stderr,
                         "#### MTL_TEX plain NON-2D native result: %p class=%s\n",
                         (void *)tex, tex ? class_getName([tex class]) : "(nil)");
@@ -5440,7 +5549,7 @@ static void macws_sigabrt_trampoline(int sig) {
             // right trade-off for chroot — visual correctness for non-2D
             // effects is a separate fix beyond plain texture creation.
             static int nontex2d_log = 0;
-            if (nontex2d_log++ < 6) {
+            if (macws_runtime_diagnostics_enabled() && nontex2d_log++ < 6) {
                 fprintf(stderr,
                     "#### MTL_TEX plain NON-2D: texType=%lu → downgrading to 2D "
                     "(IOSurface backing is 2D-only; native AGXTexture init's "
@@ -5560,8 +5669,10 @@ static void macws_sigabrt_trampoline(int sig) {
                     entry[@"last"] = @(leaseClock);
                     tex = candidate;
                     surf = (IOSurfaceRef)[entry[@"surface"] pointerValue];
-                    leaseHitCount++;
-                    if (leaseHitCount <= 48 || (leaseHitCount % 1200) == 0) {
+                    if (macws_runtime_diagnostics_enabled()) leaseHitCount++;
+                    if (leaseHitCount &&
+                        (leaseHitCount <= 48 ||
+                         (leaseHitCount % 1200) == 0)) {
                         fprintf(stderr,
                             "#### MTL_TEX LEASE-HIT #%llu key=%s entry=%p "
                             "surf=%p tex=%p retain=%ld baseline=%ld "
@@ -5617,8 +5728,10 @@ static void macws_sigabrt_trampoline(int sig) {
                     entry[@"last"] = @(leaseClock);
                     [shapeEntries addObject:entry];
                     leasePoolBytes += allocation;
-                    leaseNewCount++;
-                    if (leaseNewCount <= 64 || (leaseNewCount % 600) == 0) {
+                    if (macws_runtime_diagnostics_enabled()) leaseNewCount++;
+                    if (leaseNewCount &&
+                        (leaseNewCount <= 64 ||
+                         (leaseNewCount % 600) == 0)) {
                         fprintf(stderr,
                             "#### MTL_TEX LEASE-NEW #%llu key=%s entry=%p "
                             "surf=%p tex=%p retain=%ld baseline=%ld bpr=%zu "
@@ -5663,9 +5776,11 @@ static void macws_sigabrt_trampoline(int sig) {
                         }
                         if (!oldestEntry) {
                             static uint64_t overBudgetCount = 0;
-                            overBudgetCount++;
-                            if (overBudgetCount <= 12 ||
-                                (overBudgetCount % 300) == 0) {
+                            if (macws_runtime_diagnostics_enabled())
+                                overBudgetCount++;
+                            if (overBudgetCount &&
+                                (overBudgetCount <= 12 ||
+                                 (overBudgetCount % 300) == 0)) {
                                 fprintf(stderr,
                                     "#### MTL_TEX LEASE-OVER-BUDGET #%llu "
                                     "pool=%luMB: every older entry is busy; "
@@ -5680,9 +5795,11 @@ static void macws_sigabrt_trampoline(int sig) {
                             [oldestEntry[@"surface"] pointerValue];
                         NSUInteger evictedBytes =
                             [oldestEntry[@"bytes"] unsignedIntegerValue];
-                        leaseEvictCount++;
-                        if (leaseEvictCount <= 32 ||
-                            (leaseEvictCount % 600) == 0) {
+                        if (macws_runtime_diagnostics_enabled())
+                            leaseEvictCount++;
+                        if (leaseEvictCount &&
+                            (leaseEvictCount <= 32 ||
+                             (leaseEvictCount % 600) == 0)) {
                             fprintf(stderr,
                                 "#### MTL_TEX LEASE-EVICT #%llu key=%s "
                                 "entry=%p surf=%p bytes=%luKB pool-before=%luMB\n",
@@ -6159,7 +6276,8 @@ static id macws_hook_cbri(id self, SEL _cmd) {
 }
 
 static void install_cbri_probe(void) {
-    if (!getenv("MACWS_AGX_NATIVE")) return;
+    if (!getenv("MACWS_AGX_NATIVE") ||
+        !macws_runtime_diagnostics_enabled()) return;
     // The method lives on IOGPUMetalCommandBuffer (super class). Hook there
     // — AGXG13GFamilyCommandBuffer doesn't override.
     Class cb_cls = objc_getClass("IOGPUMetalCommandBuffer");
@@ -7220,9 +7338,11 @@ static id macws_new_event_compat(id self, SEL selector) {
     id<MTLSharedEvent> shared_event = nil;
     if ([self respondsToSelector:@selector(newSharedEvent)])
         shared_event = [(id<MTLDevice>)self newSharedEvent];
-    uint32_t sequence =
-        atomic_fetch_add(&g_macws_new_event_fallback_count, 1) + 1;
-    if (sequence <= 32 || (sequence % 500) == 0) {
+    uint32_t sequence = 0;
+    if (macws_runtime_diagnostics_enabled()) {
+        sequence = atomic_fetch_add(&g_macws_new_event_fallback_count, 1) + 1;
+    }
+    if (sequence != 0 && (sequence <= 32 || (sequence % 500) == 0)) {
         fprintf(stderr,
             "#### MACWS-NEW-EVENT #%u original=nil sharedEvent=%p class=%s "
             "device=%p deviceClass=%s\n",
@@ -7291,7 +7411,7 @@ static void install_agx_init_redirect(Class agx) {
     // the class itself, call their original IMP unchanged, and log the result
     // needed to correlate menu/blur rendering. Do not add a missing method.
     static dispatch_once_t smrtOnce;
-    dispatch_once(&smrtOnce, ^{
+    if (macws_runtime_diagnostics_enabled()) dispatch_once(&smrtOnce, ^{
         SEL smrt_sel = sel_registerName("supportsMemorylessRenderTargets");
         typedef BOOL (*smrt_fn)(id, SEL);
         __block CFMutableDictionaryRef origMap =
@@ -7641,7 +7761,8 @@ static void install_agx_init_redirect(Class agx) {
                     uint64_t pinnedGPUAddress) {
                 static int rmap_log = 0;
                 static int seen_log = 0;
-                if (seen_log < 4) {
+                BOOL diagnostics = macws_runtime_diagnostics_enabled();
+                if (diagnostics && seen_log < 4) {
                     fprintf(stderr,
                         "#### AGXBuffer init-bytes ENTRY self=%p dev=%p bytes=%p len=%lu opt=%lu pin=%#llx malloc_size=%zu\n",
                         self, dev, bytes, (unsigned long)length, (unsigned long)opt,
@@ -7698,7 +7819,7 @@ static void install_agx_init_redirect(Class agx) {
                     // immediately since we no longer need the original
                     // pointer.
                     static int redirect_log = 0;
-                    if (redirect_log++ < 8) {
+                    if (diagnostics && redirect_log++ < 8) {
                         fprintf(stderr,
                             "#### AGXBuffer init-bytes REDIRECT-iOS-NATIVE: "
                             "self=%p dev=%p len=%lu opt=%#lx pin=%#llx "
@@ -7720,7 +7841,7 @@ static void install_agx_init_redirect(Class agx) {
                             // We've copied; release them now.
                             deallocator(bytes, length);
                         }
-                        if (redirect_log < 12) {
+                        if (diagnostics && redirect_log < 12) {
                             SEL gpu_address_sel =
                                 sel_registerName("gpuAddress");
                             uint64_t gpu_address = 0;
@@ -7859,7 +7980,8 @@ static void install_agx_init_redirect(Class agx) {
         // leave mode 3 intact so the native texture path can allocate tile-memory
         // metadata rather than system-memory backing.
         static int native_memoryless_log = 0;
-        if (native_memoryless_log++ < 4) {
+        if (macws_runtime_diagnostics_enabled() &&
+            native_memoryless_log++ < 4) {
             fprintf(stderr,
                 "#### MTL_TEX storageMode=Memoryless preserved for AGX-native descriptor=%p\n",
                 (void *)self);
@@ -8143,7 +8265,10 @@ __attribute__((constructor)) static void InitMetalHooks() {
         // for the black-tab fix — it DEADLOCKED chroot AppKit startup. Revisit via
         // a background queue load or hook on NSWindow display time.)
 
-        macws_install_iogpu_callback_diagnostics();
+        if (macws_runtime_diagnostics_enabled() ||
+            macws_iogpu_callback_diag_enabled()) {
+            macws_install_iogpu_callback_diagnostics();
+        }
         install_nsxpcsharedlistener_swizzle();
 
         // A direct executable launch does not carry LaunchServices' normal

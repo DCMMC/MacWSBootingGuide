@@ -29,7 +29,7 @@ if ! ls "$THEOS"/sdks/MacOSX*.sdk >/dev/null 2>&1; then
 fi
 
 # Build, package, and install
-gmake FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless package install \
+gmake FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless package install \
   THEOS_DEVICE_IP=$DEVICE_IP THEOS_DEVICE_PORT=$DEVICE_PORT GO_EASY_ON_ME=1
 
 # Post-process libmachook.dylib with macOS build version

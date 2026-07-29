@@ -12,7 +12,8 @@
 #
 # Options for start/restart:
 #   coexist | exclusive   display mode (default: coexist)
-#   --experimental        enable the current command/completion diagnostics
+#   --experimental        enable the current native-AGX compatibility path
+#   --diagnostics         also enable high-overhead AGX flight recorders/traces
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
 #   --pace-us=N           diagnostic synthetic-completion pace (8333..100000)
@@ -65,6 +66,7 @@ EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
 EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
 EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
+EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
@@ -73,6 +75,7 @@ EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 VNC_SHARED_FRAME="$ROOTFS/private/tmp/macws_vnc_fb"
 VNC_SHARED_SURFID="$ROOTFS/private/tmp/macws_vnc_surfid"
 VNC_ACTIVITY="$ROOTFS/private/tmp/macws_vnc_activity"
+GRAPHICS_READY="$ROOTFS/private/tmp/macws_graphics_ready"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
 WINDOWSERVER_READY_WAIT=45
@@ -216,11 +219,12 @@ ws_pid() {
 # command buffer.  Runtime A/B on 2026-07-27 showed 2400/2400 clean producer
 # completions when clients were staggered, while the old simultaneous startup
 # let the first WindowServer die with SIGSEGV and left VNC attached to a dead
-# CGS session.  In experimental mode, a clean producer completion is the
-# strongest readiness witness; otherwise require a stable PID for eight
-# consecutive samples.
+# CGS session. In experimental mode, the first clean producer completion writes
+# a one-shot PID witness; production readiness must not depend on diagnostic
+# stderr traffic. Otherwise require a stable PID for eight consecutive samples.
 wait_for_initial_ws_ready() {
-    local log_start_line="$1" current="" previous="" stable=0 waited=0
+    local log_start_line="$1" current="" previous="" stable=0 waited=0 ready_pid=""
+    : "$log_start_line"
     while [ "$waited" -lt "$WINDOWSERVER_READY_WAIT" ]; do
         sleep 1
         waited=$((waited + 1))
@@ -238,10 +242,9 @@ wait_for_initial_ws_ready() {
         fi
 
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_VNC" = 1 ]; then
-            if [ "$stable" -ge 2 ] &&
-               sed -n "${log_start_line},\$p" "$LOGDIR/WindowServer.err" \
-                   2>/dev/null \
-                   | grep -qE 'VNC-FLOW poll-result.*status=4.*code=0'; then
+            ready_pid=$(awk 'NR == 1 { print; exit }' "$GRAPHICS_READY" \
+                2>/dev/null)
+            if [ "$stable" -ge 2 ] && [ "$ready_pid" = "$current" ]; then
                 STARTED_WS_PID="$current"
                 log "WindowServer graphics ready (pid=$current, clean producer observed)."
                 return 0
@@ -814,9 +817,26 @@ cleanup_macos() {
     # WindowServer has not published a frame.  Remove it only after every old
     # producer/client has been stopped so no live mapping is invalidated.
     rm -f "$VNC_SHARED_FRAME" "$VNC_SHARED_SURFID" "$VNC_ACTIVITY" \
+        "$GRAPHICS_READY" \
         "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE" \
-        "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
-        "$EXPERIMENTAL_QUEUE_QOS"
+        "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
+        "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_COMPLETION" \
+        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+        "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
+        "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_QUEUE_QOS" \
+        "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" "$EXPERIMENTAL_PACE"
+    # Remove bounded binary/text artifacts from earlier diagnostic sessions.
+    # None of these names is runtime state for a future GUI session.
+    rm -f "$ROOTFS"/private/tmp/macws_submit_*.bin \
+        "$ROOTFS"/private/tmp/macws_pf550_small_probe.bgra \
+        "$ROOTFS"/private/tmp/macws_iogpu_error_diag \
+        "$ROOTFS"/private/tmp/macws_submit_diag \
+        "$ROOTFS"/private/tmp/macws_probe_small_pf550 \
+        "$ROOTFS"/private/tmp/macws_kcmd_field_a4_diag \
+        "$ROOTFS"/private/tmp/macws_kcmd_field_5e3_diag \
+        "$ROOTFS"/private/tmp/macws_kcmd_field_6bc_diag \
+        "$ROOTFS"/private/tmp/macws_agx_trace_reserve \
+        "$ROOTFS"/private/tmp/macws_real_swapend
 
     sleep 1
     log "Cleanup done."
@@ -913,7 +933,7 @@ stop_all() {
         "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT" \
         "$EXPERIMENTAL_FAST_SUBMIT_RING" \
-        "$EXPERIMENTAL_QUEUE_QOS" \
+        "$EXPERIMENTAL_QUEUE_QOS" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \
         "$EXPERIMENTAL_CAPTURE" \
         "$EXPERIMENTAL_CAPTURE_DONE" "$EXPERIMENTAL_PACE"
     log "Restoring iOS (SpringBoard / backboardd)..."
@@ -952,7 +972,7 @@ usage() {
 macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
-  sudo bash $0 start [coexist|exclusive] [--experimental] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 start [coexist|exclusive] [--experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc] [--no-watchdog]
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
@@ -965,10 +985,12 @@ Safety: `start` also launches a background watchdog that auto-stops the GUI if
 WindowServer crash-loops or the load average runs away (panic guard). Disable
 with --no-watchdog. Logs to $LOGDIR/macos_gui_watchdog.log.
 
-The current native VNC path still needs diagnostic command/completion adapters.
-Use --experimental explicitly for that path. Interactive sessions have no
-arbitrary wall-clock timeout, while crash-loop/load/high-CPU protection stays
-armed. Automated runs may add --runtime-cap=300 (minimum 60 seconds).
+The current native VNC path still needs command/completion compatibility
+adapters. Use --experimental explicitly for that path. High-overhead flight
+recorders and read-only method tracing remain off unless --diagnostics is also
+present. Interactive sessions have no arbitrary wall-clock timeout, while
+crash-loop/load/high-CPU protection stays armed. Automated runs may add
+--runtime-cap=300 (minimum 60 seconds).
 
 Connect a VNC viewer to  vnc://<device-ip>:5900  (no password).
 USAGE
@@ -983,12 +1005,14 @@ WANT_VNC=1
 WANT_TERMINAL=1
 WANT_WATCHDOG=1
 WANT_EXPERIMENTAL=0
+WANT_DIAGNOSTICS=0
 COEXIST_PACE_US=""
 for a in "$@"; do
     case "$a" in
         coexist|coexistence|co)  MODE=coexist ;;
         exclusive|full|excl)     MODE=exclusive ;;
         --experimental)          WANT_EXPERIMENTAL=1 ;;
+        --diagnostics)           WANT_DIAGNOSTICS=1 ;;
         --pace-us=*)             COEXIST_PACE_US="${a#--pace-us=}" ;;
         --runtime-cap=*)         WD_DIAG_MAX_RUNTIME="${a#--runtime-cap=}" ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
@@ -997,6 +1021,11 @@ for a in "$@"; do
         *) echo "macos_gui.sh: ignoring unknown option '$a'" >&2 ;;
     esac
 done
+
+if [ "$WANT_DIAGNOSTICS" = 1 ] && [ "$WANT_EXPERIMENTAL" != 1 ]; then
+    echo "macos_gui.sh: --diagnostics requires --experimental" >&2
+    exit 1
+fi
 
 case "$WD_DIAG_MAX_RUNTIME" in
     *[!0-9]*|'')
@@ -1039,11 +1068,9 @@ fi
 enable_experimental_if_requested() {
     [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
     touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
-        "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_FAST_SUBMIT_RING"
+        "$EXPERIMENTAL_COMPLETION"
     if [ "$WANT_VNC" = 1 ]; then
-        touch "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
-            "$EXPERIMENTAL_OWNED_SCANOUT"
+        touch "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OWNED_SCANOUT"
     else
         # A headless/CDP performance run must not allocate and publish a
         # 15.2-MiB VNC scanout every WindowServer frame.  Keeping these
@@ -1055,19 +1082,30 @@ enable_experimental_if_requested() {
     # Keep the old heap-allocating, mutex-protected deep recorder off the hot
     # path.  A VS Code GPU-process sample caught it in submission, and it can
     # perturb the timing-sensitive 0x102 failure.  The fixed-memory recorder
-    # above preserves the first failing submit without that producer overhead.
+    # remains available only under the explicit diagnostic mode below.
     rm -f "$EXPERIMENTAL_SUBMIT_RING"
+    rm -f "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
+        "$EXPERIMENTAL_OBSERVE_PF550" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS"
+    if [ "$WANT_DIAGNOSTICS" = 1 ]; then
+        touch "$EXPERIMENTAL_COMMAND_ERROR" \
+            "$EXPERIMENTAL_FAST_SUBMIT_RING" \
+            "$EXPERIMENTAL_OBSERVE_PF550" \
+            "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS"
+    fi
     rm -f "$EXPERIMENTAL_PACE"
     if [ -n "$COEXIST_PACE_US" ]; then
         echo "$COEXIST_PACE_US" > "$EXPERIMENTAL_PACE"
     fi
     if [ "$WANT_VNC" = 1 ]; then
-        log "DIAGNOSTIC-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + read-only PF550 completion observer + low-disturbance fixed-memory submit recorder + owned BGRA scanout + stable VNC mmap enabled."
+        log "NATIVE-AGX-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + owned BGRA scanout + stable VNC mmap enabled."
     else
-        log "DIAGNOSTIC-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + low-disturbance fixed-memory submit recorder enabled; VNC scanout bridge disabled for headless measurement."
+        log "NATIVE-AGX-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion enabled; VNC scanout bridge disabled for headless measurement."
+    fi
+    if [ "$WANT_DIAGNOSTICS" = 1 ]; then
+        log "DIAGNOSTICS: AGX fast submit recorder, lifecycle witnesses, PF550 observer, and command-error hooks enabled."
     fi
     if [ -n "$COEXIST_PACE_US" ]; then
-        log "DIAGNOSTIC-SCAFFOLD: synthetic completion pace=${COEXIST_PACE_US} us (not a refresh-rate implementation)."
+        log "VIRTUAL-DISPLAY-COMPAT: completion pace=${COEXIST_PACE_US} us (not a hardware refresh signal)."
     fi
 }
 
@@ -1137,12 +1175,13 @@ start_watchdog() {
     [ "$WANT_VNC" = 1 ] || set -- "$@" --no-vnc
     [ "$WANT_TERMINAL" = 1 ] || set -- "$@" --no-terminal
     [ "$WANT_EXPERIMENTAL" = 1 ] && set -- "$@" --experimental
+    [ "$WANT_DIAGNOSTICS" = 1 ] && set -- "$@" --diagnostics
     [ -n "$COEXIST_PACE_US" ] && set -- "$@" "--pace-us=$COEXIST_PACE_US"
     [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
         set -- "$@" "--runtime-cap=$WD_DIAG_MAX_RUNTIME"
     nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
     echo "$!" > "$WD_PIDFILE"
-    log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL)"
+    log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL diagnostics=$WANT_DIAGNOSTICS)"
 }
 
 case "$CMD" in

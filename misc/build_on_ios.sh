@@ -81,6 +81,11 @@ echo "==> Building..."
 # (Theos would otherwise default to iOS 9.0 / LC_VERSION_MIN_IPHONEOS, rejected
 # by macOS dyld).  The macOS cross-compile (misc/build.sh) uses ld64 and must
 # NOT get the flag.
+#
+# Keep symbols for the project's LLDB workflow, but do not let Theos infer
+# -O0 from STRIP=0.  FINALPACKAGE does not override that rule: common.mk picks
+# OPTFLAG=-O0 whenever stripping is disabled.  Pass -O2 explicitly so both a
+# full build and every later FAST incremental object use production codegen.
 if [ "$FAST" = "1" ]; then
     # The aggregate Makefile walks every subproject even when FAST will ship
     # only libmachook.  Build the library subproject directly while preserving
@@ -89,10 +94,10 @@ if [ "$FAST" = "1" ]; then
     # existing root .theos object cache.
     THEOS_PROJECT_DIR="$PROJECT_DIR" THEOS_BUILD_DIR="$PROJECT_DIR" \
         make -C libmachook \
-        FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless \
+        FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
         GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
 else
-    make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless \
+    make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
         GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
 fi
 
@@ -112,7 +117,7 @@ fi
 
 if [ "$FAST" != "1" ]; then
 echo "==> Packaging..."
-make FINALPACKAGE=1 STRIP=0 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
 	LIBMACHOOK_ON_DEVICE_BUILD=1 package
 
 # Find the built .deb

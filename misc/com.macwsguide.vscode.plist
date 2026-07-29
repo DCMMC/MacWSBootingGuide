@@ -32,8 +32,6 @@
              the whole GPU process after repeated exits.  Keep ANGLE Metal
              enabled while isolating only Graphite. -->
         <string>--disable-features=SkiaGraphite</string>
-        <string>--enable-logging=stderr</string>
-        <string>--v=1</string>
         <!-- Keep Chromium's production JIT scheduling.  The W^X adapter now
              reports successful RX transitions without late retries, while a
              runtime sample with the old --no-concurrent-* group found the
@@ -46,8 +44,6 @@
         <string>1</string>
         <key>CA_DISABLE_SWAP_ICC</key>
         <string>1</string>
-        <key>ELECTRON_ENABLE_LOGGING</key>
-        <string>1</string>
         <key>MACWS_AGX_NATIVE</key>
         <string>1</string>
         <key>MACWS_AGX_REGISTER_CLASSES</key>
@@ -55,8 +51,6 @@
         <key>MACWS_PIN_FALLBACK</key>
         <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
-        <string>1</string>
-        <key>MACWS_JIT_MPROTECT_TRACE</key>
         <string>1</string>
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>
         <string>1</string>
@@ -67,6 +61,14 @@
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <!-- VS Code is a foreground GUI workload even though the chroot bridge
+         must submit it as a launchd job.  Without this declaration launchd
+         assigns the job the adaptive daemon spawn type; the controlled
+         CVDisplayLink witness then receives callbacks tens of milliseconds
+         after their output timestamps while an interactive-shell control on
+         the same display remains at 119 Hz. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>/var/jb/var/mobile/vscode.log</string>
     <key>StandardErrorPath</key>

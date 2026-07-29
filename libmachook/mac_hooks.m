@@ -24,6 +24,70 @@
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 
+// Expensive observation must never ride along with the normal interactive
+// path. The launcher creates this sentinel before process start only when the
+// operator explicitly passes --diagnostics, so cache the answer once and keep
+// every production hot path to a single predictable branch.
+static bool macws_runtime_diagnostics_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
+            access("/tmp/macws_runtime_diagnostics", F_OK) == 0 ||
+            access("/tmp/macws_submit_diag", F_OK) == 0 ||
+            access("/tmp/macws_submit_ring", F_OK) == 0 ||
+            access("/tmp/macws_submit_fast_ring", F_OK) == 0 ||
+            access("/tmp/macws_iogpu_error_diag", F_OK) == 0 ||
+            access("/tmp/macws_command_error_diag", F_OK) == 0 ||
+            access("/tmp/macws_queue_qos_diag", F_OK) == 0 ||
+            access("/tmp/macws_kcmd_field_a4_diag", F_OK) == 0 ||
+            access("/tmp/macws_kcmd_field_5e3_diag", F_OK) == 0 ||
+            access("/tmp/macws_kcmd_field_6bc_diag", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_kcmd_fix_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = access("/tmp/macws_kcmd_fix", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_kcmd_wrapped_fix_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = access("/tmp/macws_kcmd_wrapped_fix", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_cancel_completion_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = access("/tmp/macws_cancel_completion", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_real_swapend_diagnostic_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = access("/tmp/macws_real_swapend", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
 // The iOS kernel cannot service macOS arm64's MAP_JIT/APRR contract for the
 // chroot process, even though CS_DEBUGGED permits ordinary W^X mprotect
 // transitions.  Keep this adapter opt-in and use it only for programs that
@@ -1014,13 +1078,16 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
         fprintf(stderr, "#### MACWS_GOT %s: missing LC_SYMTAB/LC_DYSYMTAB/LC_SEGMENT\n", image_name);
         return;
     }
+    BOOL diagnostics = macws_runtime_diagnostics_enabled();
     int64_t linkedit_runtime_base = (int64_t)linkedit_vmaddr + slide - (int64_t)linkedit_fileoff;
     const struct nlist_64 *symtab    = (const struct nlist_64 *)(linkedit_runtime_base + st->symoff);
     const char            *strtab    = (const char           *)(linkedit_runtime_base + st->stroff);
     const uint32_t        *indirect  = (const uint32_t        *)(linkedit_runtime_base + dt->indirectsymoff);
 
-    fprintf(stderr, "#### MACWS_GOT %s: symtab=%u syms, strtab=%u bytes, indirect=%u entries\n",
-        image_name, st->nsyms, st->strsize, dt->nindirectsyms);
+    if (diagnostics) {
+        fprintf(stderr, "#### MACWS_GOT %s: symtab=%u syms, strtab=%u bytes, indirect=%u entries\n",
+            image_name, st->nsyms, st->strsize, dt->nindirectsyms);
+    }
 
     int total_indirect_slots = 0, patched = 0, failed = 0;
     for (int s = 0; s < seg_count; s++) {
@@ -1179,16 +1246,17 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                         *slot = value;
                     });
                     patched++;
-                    if (patched < 12 || force_override) {
+                    if (diagnostics && (patched < 12 || force_override)) {
                         fprintf(stderr, "####   bind[%d] %s -> %p (slot=%p auth=%d%s)\n",
                             patched, name, resolved, slot, is_auth,
                             force_override ? " FORCE" : "");
                     }
                     // Dump IOGPU-related symbols specifically — these are the
                     // pool allocator helpers we need to know about.
-                    if (strstr(name, "IOGPU") || strstr(name, "iogpu") ||
+                    if (diagnostics &&
+                        (strstr(name, "IOGPU") || strstr(name, "iogpu") ||
                         strstr(name, "MetalCommon") || strstr(name, "PoolAlloc") ||
-                        strstr(name, "Pool") || strstr(name, "Heap")) {
+                        strstr(name, "Pool") || strstr(name, "Heap"))) {
                         fprintf(stderr, "####   IOGPU-CRITICAL %s = %p (slot=%p auth=%d)\n",
                             name, resolved, slot, is_auth);
                     }
@@ -1196,8 +1264,10 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
             }
         }
     }
-    fprintf(stderr, "#### MACWS_GOT %s: indirect_slots=%d patched=%d failed=%d\n",
-        image_name, total_indirect_slots, patched, failed);
+    if (diagnostics) {
+        fprintf(stderr, "#### MACWS_GOT %s: indirect_slots=%d patched=%d failed=%d\n",
+            image_name, total_indirect_slots, patched, failed);
+    }
 }
 
 static void macws_walk_chained_fixups(const struct mach_header_64 *header,
@@ -1596,15 +1666,16 @@ int hooked_skylight_start_composite_wscd(void *self, void *dest,
                 // leaves its mapping available for a legitimate retry.
                 NSUInteger before = 0, after = 0;
                 BOOL consumed = NO;
+                BOOL diagnostics = macws_runtime_diagnostics_enabled();
                 @synchronized(g_wscd_tex) {
-                    before = g_wscd_tex.count;
+                    if (diagnostics) before = g_wscd_tex.count;
                     if (g_wscd_tex[key] == tex) {
                         [g_wscd_tex removeObjectForKey:key];
                         consumed = YES;
                     }
-                    after = g_wscd_tex.count;
+                    if (diagnostics) after = g_wscd_tex.count;
                 }
-                if (consumed) {
+                if (consumed && diagnostics) {
                     static _Atomic unsigned long consume_count = 0;
                     unsigned long n =
                         atomic_fetch_add(&consume_count, 1) + 1;
@@ -1704,13 +1775,15 @@ static void *hooked_skylight_wsccd_with_tex(id texture, void *ctx, void *protect
         dispatch_once(&o, ^{ m = [NSMutableDictionary new]; });
         extern NSMutableDictionary *g_wscd_tex; g_wscd_tex = m;
         NSUInteger count = 0;
+        BOOL diagnostics = macws_runtime_diagnostics_enabled();
         @synchronized(m) {
             m[[NSValue valueWithPointer:wscd]] = texture;
-            count = m.count;
+            if (diagnostics) count = m.count;
         }
         static _Atomic unsigned long insert_count = 0;
-        unsigned long n = atomic_fetch_add(&insert_count, 1) + 1;
-        if (n <= 24 || (n % 600) == 0) {
+        unsigned long n = diagnostics
+            ? atomic_fetch_add(&insert_count, 1) + 1 : 0;
+        if (n && (n <= 24 || (n % 600) == 0)) {
             fprintf(stderr,
                 "#### WSCD-MAP insert #%lu dest=%p tex=%p count=%lu\n",
                 n, wscd, (void *)texture, (unsigned long)count);
@@ -2250,7 +2323,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // returning YES on MTLTextureDescriptor (and any subclass), so the
         // AGXTexture init's cbz w0 check (at 0x1e5a5b7d8) passes and the
         // init proceeds.
-        if (getenv("MACWS_AGX_NATIVE")) {
+        if (getenv("MACWS_AGX_NATIVE") &&
+            macws_runtime_diagnostics_enabled()) {
             Class kDesc = objc_getClass("MTLTextureDescriptor");
             if (kDesc) {
                 SEL valSel = sel_registerName("validateWithDevice:");
@@ -2380,7 +2454,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // the baseline is byte-for-byte untouched.
 #ifdef FORCE_M1_DRIVER
         if (atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
-            access("/tmp/macws_cancel_completion", F_OK) == 0) {
+            macws_cancel_completion_enabled()) {
             macws_install_quartzcore_frame_info_hook(header);
         }
 #endif
@@ -2570,8 +2644,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // The init's `[self initImplWith...]` dispatch goes to the alloc'd
         // class's impl. If the class is AGXTexture (base, returns 0) the
         // texture wrap fails. If it's AGXG13GFamilyTexture (subclass with
-        // the real impl), the wrap should work. Log which one.
-        if (getenv("MACWS_AGX_NATIVE")) {
+        // the real impl), the wrap should work. Log which one only when the
+        // explicit runtime diagnostics profile is armed.
+        if (getenv("MACWS_AGX_NATIVE") &&
+            macws_runtime_diagnostics_enabled()) {
             void **classref_slot = (void **)(0x21a8a9298 + slide);
             void *cls = *classref_slot;
             const char *clsname = cls ? class_getName((Class)cls) : "(nil)";
@@ -3367,14 +3443,16 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 // resource creation fails).
                 SEL initUntracked = sel_registerName("initUntrackedInternalBufferWithDevice:length:options:");
                 Method m_unt = class_getInstanceMethod(agxbuf_after, initUntracked);
-                if (m_unt) {
+                if (m_unt && macws_runtime_diagnostics_enabled()) {
                     IMP orig_unt = method_getImplementation(m_unt);
                     IMP trace_unt = imp_implementationWithBlock(^id(id self, id dev, unsigned long len, unsigned long opt) {
                         id r = ((id (*)(id, SEL, id, unsigned long, unsigned long))orig_unt)(
                             self, initUntracked, dev, len, opt);
-                        fprintf(stderr,
-                            "#### TRACE -[AGXBuffer initUntracked] self=%p dev=%p len=%lu opt=%lu -> %p\n",
-                            self, dev, len, opt, r);
+                        if (macws_runtime_diagnostics_enabled()) {
+                            fprintf(stderr,
+                                "#### TRACE -[AGXBuffer initUntracked] self=%p dev=%p len=%lu opt=%lu -> %p\n",
+                                self, dev, len, opt, r);
+                        }
                         return r;
                     });
                     method_setImplementation(m_unt, trace_unt);
@@ -3501,7 +3579,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                 Pin5Fn pin5 = (Pin5Fn)objc_msgSend;
                                 id pr = pin5(raw, pin5_sel, dev, len, opt, 1, &pinVA);
                                 static int fb_log = 0;
-                                if (fb_log++ < 12) {
+                                if (macws_runtime_diagnostics_enabled() &&
+                                    fb_log++ < 12) {
                                     fprintf(stderr,
                                         "#### PIN_FALLBACK %s len=%lu opt=%lu -> %p (pinVA=%#llx)\n",
                                         class_getName(cls), len, opt,
@@ -3516,7 +3595,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                             }
                         }
                         static int trace_cnt = 0;
-                        if (trace_cnt++ < 12) {
+                        if (macws_runtime_diagnostics_enabled() &&
+                            trace_cnt++ < 12) {
                             fprintf(stderr,
                                 "#### TRACE -[AGXBuffer initFull] self=%p dev=%p len=%lu align=%lu→%lu opt=%lu subDis=%d→%d resIn=%p pin=%p -> %p\n",
                                 self, dev, len, align, align_eff, opt, subDis, subDis_eff, resInArgs, pinned, r);
@@ -3540,7 +3620,8 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 {
                     SEL initArgs = sel_registerName("initWithDevice:options:args:argsSize:");
                     Method m_args = class_getInstanceMethod(agxbuf_after, initArgs);
-                    if (m_args && getenv("MACWS_PIN_FALLBACK")) {
+                    if (m_args && getenv("MACWS_PIN_FALLBACK") &&
+                        macws_runtime_diagnostics_enabled()) {
                         IMP orig_args = method_getImplementation(m_args);
                         IMP trace_args = imp_implementationWithBlock(^id(
                                 id self, id dev, unsigned long opt,
@@ -3583,6 +3664,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             // to gdb_objc_realized_classes (name → class map). Without that
             // table entry, objc_getClass(name) returns NULL even though the
             // class data exists at a known pointer.
+            if (macws_runtime_diagnostics_enabled()) {
             const char *libobjc_apis[] = {
                 "objc_addClass",
                 "_objc_addClass",
@@ -3628,10 +3710,12 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     "#### CLASS_DETAIL [%zu] %p name=%s super=%p (%s) meta=%d\n",
                     i, (void *)c, name ?: "?", (void *)sc, scname ?: "?", meta);
             }
+            }
         } else {
             fprintf(stderr, "#### MACWS_AGX_NATIVE __objc_classlist NOT FOUND\n");
         }
         // Walk __objc_classrefs section: read each pointer entry.
+        if (macws_runtime_diagnostics_enabled()) {
         unsigned long classrefs_sz = 0;
         uint64_t *classrefs = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
             "__DATA", "__objc_classrefs", &classrefs_sz);
@@ -3698,6 +3782,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                     i, (void *)&classrefs[i], (void *)cp, nm);
             }
         }
+        }
 
         // Walk LC_DYLD_CHAINED_FIXUPS and patch each null import bind by
         // resolving the symbol via dlsym(RTLD_DEFAULT). This repairs the
@@ -3710,6 +3795,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // If null entries are present → cross-image binding failed in chroot dyld
         // and we'd need the chained-fixup walker to repair. If all are populated
         // → binding worked and the lambda crash is from a different cause.
+        if (macws_runtime_diagnostics_enabled()) {
         unsigned long auth_got_sz = 0;
         uint64_t *auth_got = (uint64_t *)getsectiondata((const struct mach_header_64 *)header,
             "__DATA_CONST", "__auth_got", &auth_got_sz);
@@ -3752,6 +3838,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 entries, nulls, nonnull);
         } else {
             fprintf(stderr, "#### MACWS_AGX_NATIVE __got section NOT FOUND\n");
+        }
         }
 
     }
@@ -4848,6 +4935,15 @@ typedef void (*MacWSVNCHandleMouse)(id, SEL, unsigned int, CGPoint, id);
 static MacWSVNCHandleMouse macws_orig_vnc_handle_mouse = NULL;
 typedef void (*MacWSVNCHandleKeyboard)(id, SEL, BOOL, unsigned int, id);
 static MacWSVNCHandleKeyboard macws_orig_vnc_handle_keyboard = NULL;
+typedef void (*MacWSVNCSendKeyEvent)(id, SEL, unsigned short, BOOL, uint64_t);
+static MacWSVNCSendKeyEvent macws_orig_vnc_send_key_event = NULL;
+typedef void (*MacWSVNCSetKeyModifiers)(id, SEL, uint64_t);
+static MacWSVNCSetKeyModifiers macws_orig_vnc_set_key_modifiers = NULL;
+static ptrdiff_t macws_vnc_current_modifiers_offset = -1;
+// handleKeyboard owns one libvncserver client thread at a time. Preserve its
+// original keysym while OSXvnc's own key table calls sendKeyEvent with the
+// translated keycode and modifier flags.
+static __thread unsigned int macws_vnc_current_keysym;
 static BOOL macws_vnc_left_down = NO;
 static CGPoint macws_vnc_last_point = {-1.0, -1.0};
 static CGPoint macws_vnc_pending_down_point = {-1.0, -1.0};
@@ -4871,6 +4967,16 @@ static _Atomic uint64_t macws_vnc_pointer_capture_serial = 0;
 static _Atomic uint64_t macws_vnc_pointer_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_settle_serial = 0;
 static _Atomic unsigned int macws_vnc_native_buttons = 0;
+static double macws_vnc_last_hover_target_probe = 0.0;
+static BOOL macws_vnc_secondary_pending = NO;
+static CGPoint macws_vnc_secondary_down_point;
+// VNC's native CGPostMouseEvent remains the sole button owner.  Remember only
+// the bounded interval in which that real down opened a system menu so
+// button-free motion can also enter a Carbon menu tracker when required.
+static double macws_vnc_menu_hover_until = 0.0;
+
+static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
+                                  uint64_t modifiers, unsigned int keySym);
 
 // RE-confirmed via the installed arm64 OSXvnc-server (2026-07-27):
 //
@@ -4894,7 +5000,64 @@ static MacWSRFBSendFramebufferUpdate
 static __thread double macws_vnc_rfb_copy_milliseconds = 0.0;
 static __thread uint64_t macws_vnc_rfb_copy_pixels = 0;
 static __thread uint32_t macws_vnc_rfb_copy_calls = 0;
+static __thread BOOL macws_vnc_rfb_prefetched = NO;
 static double macws_vnc_monotonic_seconds(void);
+static bool macws_vnc_fill_test(int rectX, int rectY,
+                                int rectWidth, int rectHeight);
+typedef int (*MacWSVNCReadExact)(void *, void *, int);
+typedef void (*MacWSVNCProcessNormalMessage)(void *);
+static MacWSVNCReadExact macws_orig_vnc_read_exact = NULL;
+static MacWSVNCProcessNormalMessage
+    macws_orig_vnc_process_normal_message = NULL;
+static __thread BOOL macws_vnc_tracing_normal_message = NO;
+static __thread BOOL macws_vnc_awaiting_message_type = NO;
+static __thread uint8_t macws_vnc_normal_message_type = UINT8_MAX;
+
+// RE-confirmed via the installed OSXvnc-server arm64 at __TEXT+0x14380:
+// clientInput calls rfbProcessClientNormalMessage once per wire message. Its
+// first ReadExact is exactly one byte (the RFB type); type 3 later unions the
+// requested rectangle at +0x14968 and signals client+0xc8, while type 5 calls
+// PtrAddEvent at +0x147a0 on the same serial thread. Trace this boundary so a
+// delayed update can be attributed to input-queue latency or output wakeup
+// from runtime timestamps instead of inference. No message bytes or return
+// values are changed.
+static int macws_new_vnc_read_exact(void *client, void *bytes, int length) {
+    int result = macws_orig_vnc_read_exact
+        ? macws_orig_vnc_read_exact(client, bytes, length) : -1;
+    if (result > 0 && bytes && length == 1 &&
+        macws_vnc_tracing_normal_message &&
+        macws_vnc_awaiting_message_type) {
+        macws_vnc_normal_message_type = *(const uint8_t *)bytes;
+        macws_vnc_awaiting_message_type = NO;
+    }
+    return result;
+}
+
+static void macws_new_vnc_process_normal_message(void *client) {
+    macws_vnc_tracing_normal_message = YES;
+    macws_vnc_awaiting_message_type = YES;
+    macws_vnc_normal_message_type = UINT8_MAX;
+    double started = macws_vnc_monotonic_seconds();
+    if (macws_orig_vnc_process_normal_message)
+        macws_orig_vnc_process_normal_message(client);
+    double finished = macws_vnc_monotonic_seconds();
+    uint8_t type = macws_vnc_normal_message_type;
+    macws_vnc_tracing_normal_message = NO;
+    macws_vnc_awaiting_message_type = NO;
+    static _Atomic uint64_t tracedMessages = 0;
+    uint64_t count = atomic_fetch_add_explicit(
+        &tracedMessages, 1, memory_order_relaxed) + 1;
+    double elapsedMilliseconds = (finished - started) * 1000.0;
+    if ((type == 3 || type == 5) &&
+        (count <= 400 || elapsedMilliseconds >= 50.0 ||
+         (count % 600) == 0)) {
+        fprintf(stderr,
+            "#### OSXVNC CLIENT-MESSAGE event=%llu type=%u "
+            "finished=%.6f elapsed=%.3fms\n",
+            (unsigned long long)count, type, finished,
+            elapsedMilliseconds);
+    }
+}
 
 enum {
     MacWSVNCDamageMagic = 0x564E444Du,
@@ -5065,6 +5228,28 @@ static int macws_new_rfb_send_framebuffer_update(
     macws_vnc_rfb_copy_milliseconds = 0.0;
     macws_vnc_rfb_copy_pixels = 0;
     macws_vnc_rfb_copy_calls = 0;
+    macws_vnc_rfb_prefetched = NO;
+    // rfbSendFramebufferUpdate asks rfbGetFramebufferUpdateInRect for every
+    // RegionRec.  With producer damage this is commonly 40-100 rectangles.
+    // Taking and dropping the mmap flock for each rectangle lets the producer
+    // begin a new publication between pieces of one RFB update, and a blocked
+    // piece was runtime-observed to stretch one send past eight seconds.
+    // Snapshot the complete bounding box once while the producer is excluded;
+    // the per-rectangle callbacks below then encode that same coherent frame.
+    // This preserves all RFB regions and pixels; it changes only the lock
+    // lifetime of the selected mmap capture backend.
+    if (macws_vnc_share_on && boundsX1 != INT32_MAX &&
+        boundsX2 > boundsX1 && boundsY2 > boundsY1) {
+        double copyStarted = macws_vnc_monotonic_seconds();
+        macws_vnc_rfb_prefetched = macws_vnc_fill_test(
+            boundsX1, boundsY1, boundsX2 - boundsX1, boundsY2 - boundsY1);
+        macws_vnc_rfb_copy_milliseconds +=
+            (macws_vnc_monotonic_seconds() - copyStarted) * 1000.0;
+        macws_vnc_rfb_copy_calls = 1;
+        macws_vnc_rfb_copy_pixels =
+            (uint64_t)(boundsX2 - boundsX1) *
+            (uint64_t)(boundsY2 - boundsY1);
+    }
     int encoding = client
         ? *(const int *)((const char *)client + 0x580) : INT_MIN;
     if (client && getenv("MACWS_VNC_LOW_LATENCY_COMPRESSION")) {
@@ -5098,6 +5283,7 @@ static int macws_new_rfb_send_framebuffer_update(
     int result = macws_orig_rfb_send_framebuffer_update
         ? macws_orig_rfb_send_framebuffer_update(
             client, regionExtents, regionData) : 0;
+    macws_vnc_rfb_prefetched = NO;
     double elapsedMilliseconds =
         (macws_vnc_monotonic_seconds() - started) * 1000.0;
     static _Atomic uint64_t sendCount = 0;
@@ -5608,6 +5794,14 @@ static void macws_vnc_write_capture_request(const char *reason,
     ssize_t written = write(fd, value, (size_t)length);
     close(fd);
     if (written == length) {
+        BOOL pointerProgress = strcmp(reason, "POINTER-PROGRESS") == 0;
+        static _Atomic uint64_t pointerProgressLogs;
+        uint64_t progressLog = pointerProgress
+            ? atomic_fetch_add_explicit(&pointerProgressLogs, 1,
+                                        memory_order_relaxed) + 1
+            : 0;
+        if (pointerProgress && progressLog > 16 &&
+            (progressLog % 600) != 0) return;
         fprintf(stderr,
             "#### OSXVNC %s-CAPTURE serial=%llu detail=%#x "
             "generation=%llu\n",
@@ -5718,10 +5912,9 @@ static void macws_vnc_schedule_native_pointer_frames(
         &macws_vnc_pointer_settle_serial, 1,
         memory_order_acq_rel) + 1;
     dispatch_after(
-        // Secondary release is serialized by 120 ms below.  Keep this below
-        // that boundary so rightDown gets one observation while NSMenu's
-        // nested tracker is active instead of having its 180-ms observation
-        // cancelled by the subsequent rightUp transition.
+        // Observe the post-transition state after the immediate pointer
+        // progress frame. Secondary clicks now use one atomic AppInput record;
+        // their menu-specific trailing observations are scheduled below.
         dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             if (atomic_load_explicit(&macws_vnc_pointer_settle_serial,
@@ -5732,12 +5925,39 @@ static void macws_vnc_schedule_native_pointer_frames(
         });
 }
 
+// Runtime-confirmed on 2026-07-29: with the atomic secondary transport, the
+// target process entered its real NSCarbonMenuImpl tracker immediately, but
+// the generic 80-ms pointer observation sometimes preceded the first menu
+// composite. The retained framebuffer then showed no menu until a later hover
+// requested another observation. Ask for two bounded trailing observations
+// after each secondary tap. Metal_hooks still publishes only a completed,
+// stable WindowServer generation; these requests neither fabricate pixels nor
+// mutate menu state.
+static void macws_vnc_schedule_secondary_tap_frames(uint64_t gesture) {
+    if (!macws_vnc_share_on) return;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            macws_vnc_write_capture_request(
+                "SECONDARY-OPEN", gesture, 0);
+        });
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, 360 * NSEC_PER_MSEC),
+        dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            macws_vnc_write_capture_request(
+                "SECONDARY-FINAL", gesture, 0);
+        });
+}
+
 static void macws_new_vnc_handle_keyboard(id self, SEL command, BOOL down,
         unsigned int keySym, id client) {
     macws_vnc_note_interaction();
     double started = macws_vnc_monotonic_seconds();
+    unsigned int previousKeySym = macws_vnc_current_keysym;
+    macws_vnc_current_keysym = keySym;
     if (macws_orig_vnc_handle_keyboard)
         macws_orig_vnc_handle_keyboard(self, command, down, keySym, client);
+    macws_vnc_current_keysym = previousKeySym;
     double elapsedMilliseconds =
         (macws_vnc_monotonic_seconds() - started) * 1000.0;
     static _Atomic uint64_t handlerCount = 0;
@@ -5782,6 +6002,64 @@ static void macws_new_vnc_handle_keyboard(id self, SEL command, BOOL down,
     });
 }
 
+static void macws_new_vnc_send_key_event(id self, SEL command,
+        unsigned short keyCode, BOOL down, uint64_t modifiers) {
+    unsigned int keySym = macws_vnc_current_keysym;
+    BOOL routed = macws_vnc_native_all &&
+        macws_vnc_forward_key(keyCode, down, modifiers, keySym);
+    static _Atomic uint64_t routedKeys;
+    uint64_t serial = atomic_fetch_add_explicit(
+        &routedKeys, 1, memory_order_relaxed) + 1;
+    if (serial <= 64 || !routed || (serial % 600) == 0) {
+        fprintf(stderr,
+            "#### OSXVNC KEY-ROUTE event=%llu down=%d keycode=%u "
+            "keysym=%#x modifiers=%#llx route=%s\n",
+            (unsigned long long)serial, down, keyCode, keySym,
+            (unsigned long long)modifiers,
+            routed ? "app-input" : "native-fallback");
+        fflush(stderr);
+    }
+    if (!routed && macws_orig_vnc_send_key_event) {
+        macws_orig_vnc_send_key_event(
+            self, command, keyCode, down, modifiers);
+    }
+}
+
+static void macws_new_vnc_set_key_modifiers(id self, SEL command,
+                                            uint64_t modifiers) {
+    if (!macws_vnc_native_all || macws_vnc_current_modifiers_offset < 0) {
+        if (macws_orig_vnc_set_key_modifiers)
+            macws_orig_vnc_set_key_modifiers(self, command, modifiers);
+        return;
+    }
+
+    // RE-confirmed via installed arm64 OSXvnc-server
+    // -[VNCServer setKeyModifiers:] at __TEXT+0xa2e8: after reconciling its
+    // modifier key events through sendKeyEvent, it unconditionally calls
+    // usleep(self->modifierDelay) at +0xa420 before storing currentModifiers.
+    // That synchronization is required only because the stock downstream
+    // path posts into the asynchronous global CGEvent state. Native-all sends
+    // one NSEvent containing the already-computed modifierFlags directly to
+    // the selected application's queue, so waiting for a global state that we
+    // deliberately do not mutate adds 20-210 ms to every RFB key. Preserve
+    // OSXvnc's upstream state machine by committing its real ivar here; the
+    // original implementation remains the fallback for the stock CG path.
+    uint64_t *current = (uint64_t *)((char *)(__bridge void *)self +
+                                     macws_vnc_current_modifiers_offset);
+    *current = modifiers;
+    static _Atomic uint64_t syncCount;
+    uint64_t serial = atomic_fetch_add_explicit(
+        &syncCount, 1, memory_order_relaxed) + 1;
+    if (serial <= 16) {
+        fprintf(stderr,
+            "#### OSXVNC KEY-MODIFIERS event=%llu value=%#llx "
+            "route=app-input-state\n",
+            (unsigned long long)serial,
+            (unsigned long long)modifiers);
+        fflush(stderr);
+    }
+}
+
 static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
                                     BOOL reliable) {
     if (!macws_rfbScreen) return NO;
@@ -5791,7 +6069,8 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
 
     double now = macws_vnc_monotonic_seconds();
     BOOL continuous = kind == MacWSInputKindTouchMove ||
-                      kind == MacWSInputKindHover;
+                      kind == MacWSInputKindHover ||
+                      kind == MacWSInputKindMenuHover;
     // libvncserver can deliver pointer motion much faster than an AppKit main
     // thread can dispatch it.  Preserve up to 120 Hz, but do not let redundant
     // motion fill both AF_UNIX receive queues ahead of a button transition.
@@ -5869,6 +6148,75 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
     return ok;
 }
 
+static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
+                                  uint64_t modifiers, unsigned int keySym) {
+    if (!macws_rfbScreen) return NO;
+    int width = macws_rfbScreen[0];
+    int height = macws_rfbScreen[2];
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
+        return NO;
+    CGPoint point = macws_vnc_last_point;
+    if (point.x < 0.0 || point.x >= width ||
+        point.y < 0.0 || point.y >= height) {
+        point = (CGPoint){width * 0.5, height * 0.5};
+    }
+    double now = macws_vnc_monotonic_seconds();
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = down ? MacWSInputKindKeyDown : MacWSInputKindKeyUp,
+        // "VNCK" distinguishes this union encoding from the pointer scene;
+        // AppInput reads only the low 32 flag bits for a key record.
+        .sceneID = 0x564e434b00000000ull |
+                   (modifiers & 0xffffffffull),
+        .timestamp = now,
+        .x = (float)point.x,
+        .y = (float)point.y,
+        .pressure = (float)keyCode,
+        .contactID = keySym,
+        .frameWidth = (uint32_t)width,
+        .frameHeight = (uint32_t)height,
+        .targetPID = 0,
+    };
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, "/private/tmp/macws_host_input.sock",
+            sizeof(address.sun_path));
+    ssize_t sent = -1;
+    int savedError = 0;
+    unsigned attempted = 0;
+    for (unsigned attempt = 0; attempt < 8; attempt++) {
+        attempted = attempt + 1;
+        if (macws_vnc_input_fd < 0)
+            macws_vnc_input_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (macws_vnc_input_fd < 0) {
+            savedError = errno;
+        } else {
+            sent = sendto(macws_vnc_input_fd, &record, sizeof(record),
+                          MSG_DONTWAIT,
+                          (const struct sockaddr *)&address,
+                          sizeof(address));
+            if (sent == (ssize_t)sizeof(record)) break;
+            savedError = sent < 0 ? errno : EMSGSIZE;
+            if (savedError == EBADF || savedError == ECONNREFUSED) {
+                close(macws_vnc_input_fd);
+                macws_vnc_input_fd = -1;
+            }
+        }
+        usleep((useconds_t)(1000u * (attempt + 1)));
+    }
+    BOOL ok = sent == (ssize_t)sizeof(record);
+    if (!ok) {
+        fprintf(stderr,
+            "#### OSXVNC KEY-INPUT down=%d keycode=%u keysym=%#x "
+            "modifiers=%#llx sent=%zd errno=%d attempts=%u\n",
+            down, keyCode, keySym, (unsigned long long)modifiers,
+            sent, savedError, attempted);
+        fflush(stderr);
+    }
+    return ok;
+}
+
 static void macws_new_vnc_handle_mouse(id self, SEL command,
         unsigned int buttons, CGPoint point, id client) {
     macws_vnc_note_interaction();
@@ -5884,20 +6232,64 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
         if (macws_vnc_native_all) {
             unsigned int previousButtons = atomic_load_explicit(
                 &macws_vnc_native_buttons, memory_order_acquire);
+            BOOL buttonTransition = buttons != previousButtons;
+            double now = macws_vnc_monotonic_seconds();
+            BOOL secondaryDown = previousButtons == 0 &&
+                                 (buttons & 4u) != 0;
+            BOOL primaryDown = previousButtons == 0 &&
+                               (buttons & 1u) != 0;
+            BOOL topBarDown = primaryDown && macws_rfbScreen[2] > 0 &&
+                point.y <= (CGFloat)macws_rfbScreen[2] * 0.04;
+            if (secondaryDown || topBarDown) {
+                if (secondaryDown) {
+                    macws_vnc_secondary_pending = YES;
+                    macws_vnc_secondary_down_point = point;
+                }
+                macws_vnc_menu_hover_until = now + 12.0;
+                fprintf(stderr,
+                    "#### OSXVNC MENU-HOVER-ARM source=%s "
+                    "now=%.6f until=%.6f point=(%.1f,%.1f)\n",
+                    secondaryDown ? "secondary" : "top-bar",
+                    now, macws_vnc_menu_hover_until, point.x, point.y);
+            } else if (primaryDown &&
+                       now < macws_vnc_menu_hover_until) {
+                // The next primary down selects or dismisses the already
+                // tracked menu. Its native CG event is authoritative; stop
+                // supplementing subsequent ordinary-window motion.
+                macws_vnc_menu_hover_until = 0.0;
+                fprintf(stderr,
+                    "#### OSXVNC MENU-HOVER-DISARM source=primary "
+                    "now=%.6f point=(%.1f,%.1f)\n",
+                    now, point.x, point.y);
+            }
+            if (buttonTransition && previousButtons == 0 && buttons != 0) {
+                // Coordinate the target before OSXvnc posts the native down.
+                // RE-confirmed in AppKit 13.4: activateIgnoringOtherApps:
+                // tail-calls _NXActivateSelf, whose effective operation is
+                // SetFrontProcessWithOptions. Runtime evidence from Electron
+                // showed that doing this after its native down was too late:
+                // the process already owned the global front/menu state but
+                // never received _handleActivatedEvent: and stayed inactive.
+                // The RFB button packet is already a real user action here;
+                // this control record creates no NSEvent. A short bounded
+                // handoff lets macwsinputd query the still-responsive target
+                // before a synchronous contextual-menu tracker can occupy its
+                // main thread. The original OSXvnc path below remains the sole
+                // owner and dispatcher of the actual down event.
+                (void)macws_vnc_forward_input(
+                    MacWSInputKindActivateTarget, point, YES);
+                usleep(20000);
+            }
             BOOL secondaryRelease = (previousButtons & 4u) != 0 &&
                                     (buttons & 4u) == 0;
             if (secondaryRelease) {
-                // Runtime-confirmed on Terminal's real contextual menu: a
-                // fast RFB secondary release could be queued before AppKit's
-                // rightMouseDown handler entered its nested NSMenu tracker.
-                // Failed sample: both NSEvent 3 and 4 returned through
-                // -[NSApplication sendEvent:]. Successful samples: type 3
-                // entered the tracker and type 4 was consumed there. Keep the
-                // original system CGPostMouseEvent owner and serialize only
-                // this transition long enough for the down to establish that
-                // tracker. This is an input-transport compatibility delay,
-                // not a menu action or state bypass.
-                usleep(120000);
+                // Runtime-confirmed on 2026-07-29: separate OSXvnc CG right-
+                // down/up posts were scheduler-dependent. Some clicks entered
+                // rightMouseDown after release and tracked; others returned in
+                // under 1 ms without a menu. Emit one SecondaryTap record on
+                // release so the selected process constructs the complete
+                // AppKit pair atomically, matching the proven primary Tap
+                // transport instead of tuning an arbitrary sleep.
                 static _Atomic uint64_t serializedRightUps;
                 uint64_t serialized = atomic_fetch_add_explicit(
                     &serializedRightUps, 1,
@@ -5905,12 +6297,73 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                 if (serialized <= 24 || (serialized % 100) == 0) {
                     fprintf(stderr,
                         "#### OSXVNC RIGHT-UP-SERIALIZE event=%llu "
-                        "delay=120ms rfb=(%.1f,%.1f)\n",
+                        "route=app-input-secondary-tap rfb=(%.1f,%.1f)\n",
                         (unsigned long long)serialized, point.x, point.y);
                 }
             }
-            macws_orig_vnc_handle_mouse(self, command, buttons,
-                                        quartzPoint, client);
+            BOOL secondaryGesture = ((previousButtons | buttons) & 4u) != 0;
+            if (secondaryGesture) {
+                // Keep OSXvnc's cursor/client bookkeeping but leave the right
+                // button out of its asynchronous global CG stream.
+                macws_orig_vnc_handle_mouse(self, command, buttons & ~4u,
+                                            quartzPoint, client);
+                if (secondaryRelease && macws_vnc_secondary_pending) {
+                    macws_vnc_gesture_id++;
+                    if (macws_vnc_gesture_id == 0) macws_vnc_gesture_id++;
+                    BOOL sent = macws_vnc_forward_input(
+                        MacWSInputKindSecondaryTap,
+                        macws_vnc_secondary_down_point, YES);
+                    fprintf(stderr,
+                        "#### OSXVNC CLICK-OWNER route=app-input-secondary "
+                        "gesture=%u point=(%.1f,%.1f) sent=%s\n",
+                        macws_vnc_gesture_id,
+                        macws_vnc_secondary_down_point.x,
+                        macws_vnc_secondary_down_point.y,
+                        sent ? "YES" : "NO");
+                    if (sent)
+                        macws_vnc_schedule_secondary_tap_frames(
+                            macws_vnc_gesture_id);
+                    macws_vnc_secondary_pending = NO;
+                }
+            } else {
+                macws_orig_vnc_handle_mouse(self, command, buttons,
+                                            quartzPoint, client);
+            }
+            // OSXvnc remains the owner of cursor state and primary native
+            // drags; an atomic AppInput record owns secondary clicks. After
+            // the cursor bookkeeping update, send a query-only target refresh
+            // and then a button-free AppKit hover.
+            // This reproduces the runtime-confirmed native-move + scoped
+            // NSEvent.mouseLocation sequence required by macOS 13.4 menu
+            // presentation without duplicating a button event.
+            BOOL targetRefreshDue = buttonTransition ||
+                macws_vnc_last_hover_target_probe <= 0.0 ||
+                now - macws_vnc_last_hover_target_probe >= 2.0;
+            if (targetRefreshDue && macws_vnc_forward_input(
+                    MacWSInputKindTargetProbe, point, YES)) {
+                macws_vnc_last_hover_target_probe = now;
+            }
+            if (buttons == 0) {
+                MacWSInputKind hoverKind =
+                    now < macws_vnc_menu_hover_until
+                        ? MacWSInputKindMenuHover
+                        : MacWSInputKindHover;
+                (void)macws_vnc_forward_input(
+                    hoverKind, point, NO);
+                if (hoverKind == MacWSInputKindMenuHover) {
+                    static _Atomic uint64_t menuHoverRoutes;
+                    uint64_t route = atomic_fetch_add_explicit(
+                        &menuHoverRoutes, 1, memory_order_relaxed) + 1;
+                    if (route <= 64 || (route % 600) == 0) {
+                        fprintf(stderr,
+                            "#### OSXVNC MENU-HOVER-ROUTE event=%llu "
+                            "now=%.6f until=%.6f point=(%.1f,%.1f)\n",
+                            (unsigned long long)route, now,
+                            macws_vnc_menu_hover_until,
+                            point.x, point.y);
+                    }
+                }
+            }
             static _Atomic uint64_t nativeEvents;
             uint64_t nativeEvent = atomic_fetch_add_explicit(
                 &nativeEvents, 1, memory_order_relaxed) + 1;
@@ -5924,7 +6377,7 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
             atomic_store_explicit(&macws_vnc_native_buttons, buttons,
                                   memory_order_release);
             macws_vnc_schedule_native_pointer_frames(
-                buttons, buttons != previousButtons);
+                buttons, buttonTransition);
             macws_vnc_left_down = leftDown;
             macws_vnc_last_point = point;
             return;
@@ -6271,6 +6724,7 @@ static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
     // selected capture backend, so deliver it directly. If its first frame is
     // not ready yet, preserve the allocated buffer and wait for the next poll.
     if (macws_vnc_share_on) {
+        if (macws_vnc_rfb_prefetched) return;
         double started = macws_vnc_monotonic_seconds();
         bool copied = macws_vnc_fill_test(x, y, w, h);
         macws_vnc_rfb_copy_milliseconds +=
@@ -6309,6 +6763,16 @@ static void macws_install_osxvnc_hooks(void) {
     char *base = (char *)mh;
     macws_rfbScreen = (int *)(base + 0x79bf8);
     macws_rfbBackingScale = (double *)(base + 0x7a1e8);
+    BOOL traceClientMessages =
+        getenv("MACWS_VNC_TRACE_CLIENT_MESSAGES") != NULL;
+    if (traceClientMessages) {
+        MSHookFunction(base + 0x169d8,
+            (void *)macws_new_vnc_read_exact,
+            (void **)&macws_orig_vnc_read_exact);
+        MSHookFunction(base + 0x14380,
+            (void *)macws_new_vnc_process_normal_message,
+            (void **)&macws_orig_vnc_process_normal_message);
+    }
     MSHookFunction(base + 0xd114,
         (void *)macws_new_vnc_refresh_callback,
         (void **)&macws_vnc_refresh_callback);
@@ -6332,6 +6796,27 @@ static void macws_install_osxvnc_hooks(void) {
         macws_orig_vnc_handle_mouse =
             (MacWSVNCHandleMouse)method_getImplementation(mouseMethod);
         method_setImplementation(mouseMethod, (IMP)macws_new_vnc_handle_mouse);
+    }
+    Method sendKeyMethod = serverClass ? class_getInstanceMethod(serverClass,
+        sel_registerName("sendKeyEvent:down:modifiers:")) : NULL;
+    if (sendKeyMethod) {
+        macws_orig_vnc_send_key_event =
+            (MacWSVNCSendKeyEvent)method_getImplementation(sendKeyMethod);
+        method_setImplementation(sendKeyMethod,
+                                 (IMP)macws_new_vnc_send_key_event);
+    }
+    Method setKeyModifiersMethod = serverClass ? class_getInstanceMethod(
+        serverClass, sel_registerName("setKeyModifiers:")) : NULL;
+    Ivar currentModifiersIvar = serverClass ? class_getInstanceVariable(
+        serverClass, "currentModifiers") : NULL;
+    if (setKeyModifiersMethod && currentModifiersIvar) {
+        macws_vnc_current_modifiers_offset =
+            ivar_getOffset(currentModifiersIvar);
+        macws_orig_vnc_set_key_modifiers =
+            (MacWSVNCSetKeyModifiers)method_getImplementation(
+                setKeyModifiersMethod);
+        method_setImplementation(setKeyModifiersMethod,
+                                 (IMP)macws_new_vnc_set_key_modifiers);
     }
     Method keyboardMethod = serverClass ? class_getInstanceMethod(serverClass,
         sel_registerName("handleKeyboard:forSym:forClient:")) : NULL;
@@ -6357,10 +6842,14 @@ static void macws_install_osxvnc_hooks(void) {
             "#### OSXVNC mmap generation watcher failed error=%d\n",
             watcherError);
     }
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d native-all=%d input=%s keyboard=%s) base=%p rfbScreen=%p\n",
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d native-all=%d client-trace=%d input=%s keyboard=%s key-map=%s key-modifiers=%s modifiers-offset=%td) base=%p rfbScreen=%p\n",
             macws_vnc_test_on, macws_vnc_share_on, macws_vnc_native_all,
+            traceClientMessages,
             mouseMethod ? "YES" : "NO",
             keyboardMethod ? "YES" : "NO",
+            sendKeyMethod ? "YES" : "NO",
+            setKeyModifiersMethod && currentModifiersIvar ? "YES" : "NO",
+            macws_vnc_current_modifiers_offset,
             (void *)mh, (void *)macws_rfbScreen);
 }
 
@@ -6671,17 +7160,31 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
     return result;
 }
 
-// Simulate functions that are not implemented in iOS kernel
+// Simulate functions that are not implemented in iOS kernel.
+//
+// A macOS GUI login session has one audit-session ID shared by WindowServer,
+// LaunchServices, and every application in that session.  iOS leaves
+// audit_token_t.val[6] at zero for these chroot processes.  The historical
+// fallback copied val[5] (pid), which silently created one LaunchServices
+// session per process.  Runtime watchpoints then showed WindowServer writing
+// Terminal as CGXSessionProcessData::frontProcess, followed by
+// GetFrontProcessRecCheckingEligibility replacing it with Code after
+// _LSCopyFrontApplication consulted the pid-scoped session.  Use one stable,
+// positive synthetic ASID for the entire chroot instead.  Preserve a real
+// non-zero ASID if a future kernel supplies one.
+static const au_asid_t MacWSSharedAuditSessionID =
+    (au_asid_t)0x004d5753; // "MWS"
+
 au_asid_t audit_token_to_asid_new(audit_token_t atoken) {
-    // fake asid to pid
-    return atoken.val[6] = atoken.val[5];
+    return atoken.val[6] != 0
+        ? (au_asid_t)atoken.val[6] : MacWSSharedAuditSessionID;
 }
 uid_t audit_token_to_auid_new(audit_token_t atoken) {
     return atoken.val[0] = 501;
 }
 void auditinfo_fill(auditinfo_addr_t *addr) {
     if(addr->ai_asid == 0) {
-        addr->ai_asid = getpid();
+        addr->ai_asid = MacWSSharedAuditSessionID;
     }
     addr->ai_auid = 501;
     if(getuid() == 0) {
@@ -6711,7 +7214,7 @@ void auditpinfo_fill(auditpinfo_addr_t *addr) {
     addr->ap_termid.at_port = 0x3000002;
     addr->ap_termid.at_type = 0x4;
     memset(addr->ap_termid.at_addr, 0, sizeof(addr->ap_termid.at_addr));
-    addr->ap_asid = addr->ap_pid;
+    addr->ap_asid = MacWSSharedAuditSessionID;
     addr->ap_flags = 0x6030;
 }
 int auditon_new(int cmd, void *data, uint32_t length) {
@@ -6745,7 +7248,7 @@ int getaudit_addr_new(auditinfo_addr_t *auditinfo_addr, u_int length) {
     if(auditinfo_addr == NULL || length < sizeof(auditinfo_addr_t)) {
         return EINVAL;
     }
-    auditinfo_addr->ai_asid = getpid();
+    auditinfo_addr->ai_asid = MacWSSharedAuditSessionID;
     auditinfo_fill(auditinfo_addr);
     return 0;
 }
@@ -7012,7 +7515,8 @@ DYLD_INTERPOSE(pthread_jit_write_protect_np_new,
 extern id objc_alloc(Class);
 id objc_alloc_trace(Class cls) {
     id r = objc_alloc(cls);
-    if (!getenv("MACWS_AGX_REGISTER_CLASSES")) return r;
+    if (!getenv("MACWS_AGX_REGISTER_CLASSES") ||
+        !macws_runtime_diagnostics_enabled()) return r;
     if (cls) {
         const char *n = class_getName(cls);
         if (n && strncmp(n, "AGX", 3) == 0) {
@@ -7179,8 +7683,9 @@ size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT width plane=%zu original=%zu "
             "property=%llu surfaceID=%u recovery=%u\n",
@@ -7198,8 +7703,9 @@ size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT height plane=%zu original=%zu "
             "property=%llu surfaceID=%u recovery=%u\n",
@@ -7217,8 +7723,9 @@ uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
         @"CompressionType", @"IOSurfacePlaneCompressionType");
     if (property == 0 || property > UINT32_MAX) return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT compression plane=%zu original=%u "
             "property=%llu recovery=%u\n",
@@ -7237,8 +7744,9 @@ size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
         @"IOSurfacePlaneHeightInCompressedTiles");
     if (property == 0 || property > SIZE_MAX) return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT heightInTiles plane=%zu original=%zu "
             "property=%llu recovery=%u\n",
@@ -7258,8 +7766,9 @@ size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT widthInTiles plane=%zu original=%zu "
             "property=%llu recovery=%u\n",
@@ -7277,8 +7786,9 @@ size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT bytesPerRow plane=%zu original=%zu "
             "property=%llu recovery=%u\n",
@@ -7296,8 +7806,9 @@ size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT bytesPerTileData plane=%zu original=%zu "
             "property=%llu recovery=%u\n",
@@ -7315,8 +7826,9 @@ size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
     if (!found || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT offset plane=%zu original=%zu "
             "property=%llu recovery=%u\n",
@@ -7338,8 +7850,9 @@ void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
     void *corrected = (void *)((uintptr_t)base + (uintptr_t)propertyOffset);
     if (corrected == original) return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT baseAddress plane=%zu original=%p "
             "base=%p propertyOffset=%llu corrected=%p recovery=%u\n",
@@ -7358,8 +7871,9 @@ uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
     if (property == 0 || property > UINT32_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
-    unsigned int count = atomic_fetch_add(&recoveryCount, 1) + 1;
-    if (count <= 16 || (count % 500) == 0) {
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 16 || (count % 500) == 0)) {
         fprintf(stderr,
             "#### IOSURFACE-COMPAT addressFormat plane=%zu original=%u "
             "property=%llu recovery=%u\n",
@@ -7426,7 +7940,7 @@ IOSurfaceRef IOSurfaceCreate_safe(CFDictionaryRef properties_cf) {
     // OOM leak diagnostic (2026-06-20): count creates + per-caller bytes.
     // Every 250 calls, dump caller+size attribution so we can find who's
     // accumulating IOSurfaces against the 5120 MB WS watermark.
-    {
+    if (macws_runtime_diagnostics_enabled()) {
         static _Atomic unsigned long s_count = 0;
         static _Atomic unsigned long s_total_bytes = 0;
         unsigned long my_n = atomic_fetch_add(&s_count, 1) + 1;
@@ -7786,6 +8300,20 @@ static struct macws_agx_t82_request
     g_macwsAgxT82Requests[MACWS_AGX_T82_REQUEST_CAP];
 static uint64_t g_macwsAgxT82RequestSequence;
 
+static bool macws_agx_life_diagnostics_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = macws_runtime_diagnostics_enabled() ||
+            getenv("MACWS_AGX_LIFE_VERBOSE") != NULL ||
+            access("/tmp/macws_iogpu_error_diag", F_OK) == 0 ||
+            access("/tmp/macws_submit_ring", F_OK) == 0 ||
+            access("/tmp/macws_submit_fast_ring", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
 // Read the resource-generation boundary without exposing the lifecycle
 // table's lock ordering to the submit recorder.  The returned serial is the
 // newest successful create/finalize event that completed before this call.
@@ -7794,6 +8322,7 @@ static uint64_t g_macwsAgxT82RequestSequence;
 // was outstanding.  This is observation only; it does not retain a resource
 // or delay its finalizer.
 static uint64_t macws_agx_life_current_event_serial(void) {
+    if (!macws_agx_life_diagnostics_enabled()) return 0;
     pthread_mutex_lock(&g_agxLifeLock);
     uint64_t serial = g_agxLifeEventSerial;
     pthread_mutex_unlock(&g_agxLifeLock);
@@ -7853,6 +8382,7 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
                                   size_t raw_request_length,
                                   const void *sent_request,
                                   size_t sent_request_length) {
+    if (!macws_agx_life_diagnostics_enabled()) return;
     pthread_mutex_lock(&g_agxLifeLock);
     g_agxLifeCreateOK++;
     unsigned start = macws_agx_life_hash(gid), first_tomb = MACWS_AGX_LIFE_CAP;
@@ -7927,6 +8457,7 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
 
 static void macws_agx_life_create_failed(uint8_t type, uint64_t bytes,
                                          IOReturn kr) {
+    if (!macws_agx_life_diagnostics_enabled()) return;
     pthread_mutex_lock(&g_agxLifeLock);
     g_agxLifeCreateFail++;
     macws_agx_life_summary_locked("CREATE-FAIL", 0, type, 0, bytes, kr);
@@ -7934,6 +8465,7 @@ static void macws_agx_life_create_failed(uint8_t type, uint64_t bytes,
 }
 
 static void macws_agx_life_destroy(uint64_t gid, IOReturn kr) {
+    if (!macws_agx_life_diagnostics_enabled()) return;
     pthread_mutex_lock(&g_agxLifeLock);
     if (kr != 0) {
         g_agxLifeDestroyFail++;
@@ -8480,17 +9012,19 @@ static void macws_enable_frame_info_tag_list(
                 last_presentation_time};
     }
     pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
-    fprintf(stderr,
-        "#### IOMFB CANCEL-COMPLETION observed enabled registration "
-        "fb=%p client=%u callback=%p context=%p flags=%#llx slot=%u "
-        "vsync=%#x source=%#x displayTimer=%p fallbackTimer=%p runLoop=%p\n",
-        framebuffer, client, callback, server,
-        (unsigned long long)flags, registration_slot,
-        *(const volatile uint8_t *)((const char *)server + 0x324),
-        *(const volatile uint8_t *)((const char *)server + 0x325),
-        *(void *const volatile *)((const char *)server + 0x298),
-        *(void *const volatile *)((const char *)server + 0x2a0),
-        *(void *const volatile *)((const char *)server + 0x278));
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### IOMFB CANCEL-COMPLETION observed enabled registration "
+            "fb=%p client=%u callback=%p context=%p flags=%#llx slot=%u "
+            "vsync=%#x source=%#x displayTimer=%p fallbackTimer=%p runLoop=%p\n",
+            framebuffer, client, callback, server,
+            (unsigned long long)flags, registration_slot,
+            *(const volatile uint8_t *)((const char *)server + 0x324),
+            *(const volatile uint8_t *)((const char *)server + 0x325),
+            *(void *const volatile *)((const char *)server + 0x298),
+            *(void *const volatile *)((const char *)server + 0x2a0),
+            *(void *const volatile *)((const char *)server + 0x278));
+    }
 }
 
 static void macws_install_quartzcore_frame_info_hook(
@@ -8574,7 +9108,7 @@ static void macws_install_quartzcore_frame_info_hook(
 static void macws_iomfb_complete_cancelled_swap(
     io_connect_t client, uint32_t swap_id,
     uint64_t requested_presentation_time) {
-    if (access("/tmp/macws_cancel_completion", F_OK) != 0)
+    if (!macws_cancel_completion_enabled())
         return;
 
     struct macws_iomfb_frame_registration registration = {0};
@@ -8587,10 +9121,12 @@ static void macws_iomfb_complete_cancelled_swap(
     }
     pthread_mutex_unlock(&g_macws_iomfb_frame_lock);
 
+    BOOL diagnostics = macws_runtime_diagnostics_enabled();
     static _Atomic unsigned long scheduled_count = 0;
-    unsigned long sequence = atomic_fetch_add(&scheduled_count, 1) + 1;
+    unsigned long sequence = diagnostics
+        ? atomic_fetch_add(&scheduled_count, 1) + 1 : 0;
     if (!registration.callback) {
-        if (sequence <= 16 || (sequence % 600) == 0) {
+        if (sequence && (sequence <= 16 || (sequence % 600) == 0)) {
             fprintf(stderr,
                 "#### IOMFB CANCEL-COMPLETION schedule #%lu swapID=%u "
                 "client=%u FAIL no registration\n",
@@ -8603,7 +9139,7 @@ static void macws_iomfb_complete_cancelled_swap(
     // submissions were not completion-paced, so the FIFO grew without bound
     // while WindowServer stayed at 83-86% CPU.  Keep one completion per
     // successful cancellation and let the caller pace the ownership boundary.
-    if (sequence <= 16 || (sequence % 600) == 0) {
+    if (sequence && (sequence <= 16 || (sequence % 600) == 0)) {
         fprintf(stderr,
             "#### IOMFB CANCEL-COMPLETION schedule #%lu swapID=%u "
             "client=%u fb=%p\n",
@@ -8646,7 +9182,7 @@ static void macws_iomfb_complete_cancelled_swap(
                 presentation_time - requested_presentation_time;
         }
 
-        void *display_holder = registration.context
+        void *display_holder = diagnostics && registration.context
             ? *(void **)((char *)registration.context + 0x58) : NULL;
         uintptr_t pending_begin_before = display_holder
             ? *(const volatile uintptr_t *)((char *)display_holder + 0x510) : 0;
@@ -8671,8 +9207,9 @@ static void macws_iomfb_complete_cancelled_swap(
         size_t pending_after = pending_end_after >= pending_begin_after
             ? (pending_end_after - pending_begin_after) / sizeof(void *) : 0;
         static _Atomic unsigned long delivered_count = 0;
-        unsigned long delivered = atomic_fetch_add(&delivered_count, 1) + 1;
-        if (delivered <= 16 || (delivered % 600) == 0) {
+        unsigned long delivered = diagnostics
+            ? atomic_fetch_add(&delivered_count, 1) + 1 : 0;
+        if (delivered && (delivered <= 16 || (delivered % 600) == 0)) {
             fprintf(stderr,
                 "#### IOMFB CANCEL-COMPLETION delivered #%lu swapID=%u "
                 "client=%u requested=%llu presentation=%llu delta=%llu "
@@ -9711,6 +10248,8 @@ static void macws_subtype1_field_a4_diagnostic(unsigned sequence,
 //   whether that difference participates in the current PageFault.
 static void macws_subtype1_semantic_field_diagnostic(
     unsigned sequence, unsigned segment, unsigned char *record) {
+    if (!macws_runtime_diagnostics_enabled())
+        return;
     macws_subtype1_field_a4_diagnostic(sequence, segment, record);
     if (!record)
         return;
@@ -9861,15 +10400,18 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
     // CA_VSYNC_OFF can submit this command continuously while a consumer is
     // connected.  Keep enough witnesses to prove the path remains active,
     // without turning the diagnostic itself into a stderr/CPU storm.
-    static unsigned match_count;
-    unsigned observed = __atomic_add_fetch(&match_count, 1, __ATOMIC_RELAXED);
-    if (observed <= 4 || (observed & (observed - 1)) == 0) {
-        fprintf(stderr,
-            "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-WRAPPED-FIX match=%u "
-            "type9=0x10 subtype1@0x10 span=0x858->0x838 "
-            "range=0x10..0x868->0x848 storage=0x868->0x848 "
-            "flatten=iOS-direct final=0x%zx\n",
-            sequence, observed, total);
+    if (macws_runtime_diagnostics_enabled()) {
+        static unsigned match_count;
+        unsigned observed =
+            __atomic_add_fetch(&match_count, 1, __ATOMIC_RELAXED);
+        if (observed <= 4 || (observed & (observed - 1)) == 0) {
+            fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-WRAPPED-FIX match=%u "
+                "type9=0x10 subtype1@0x10 span=0x858->0x838 "
+                "range=0x10..0x868->0x848 storage=0x868->0x848 "
+                "flatten=iOS-direct final=0x%zx\n",
+                sequence, observed, total);
+        }
     }
     return 1;
 }
@@ -9995,14 +10537,16 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
     *(uint32_t *)(wrapper_list + 0x14) = (uint32_t)total;
     *total_io = total;
 
-    static _Atomic unsigned match_count = 0;
-    unsigned observed = atomic_fetch_add(&match_count, 1) + 1;
-    if (observed <= 8 || (observed & (observed - 1)) == 0) {
-        fprintf(stderr,
-            "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-TRAILING-WRAPPER-FIX "
-            "match=%u subtype1=0..0x840->0..0x820 "
-            "wrappers=%u range=0x840..%#zx->0x820..%#zx\n",
-            sequence, observed, wrapper_count, total + 0x20, total);
+    if (macws_runtime_diagnostics_enabled()) {
+        static _Atomic unsigned match_count = 0;
+        unsigned observed = atomic_fetch_add(&match_count, 1) + 1;
+        if (observed <= 8 || (observed & (observed - 1)) == 0) {
+            fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-TRAILING-WRAPPER-FIX "
+                "match=%u subtype1=0..0x840->0..0x820 "
+                "wrappers=%u range=0x840..%#zx->0x820..%#zx\n",
+                sequence, observed, wrapper_count, total + 0x20, total);
+        }
     }
     return 1;
 }
@@ -10129,8 +10673,8 @@ static unsigned macws_translate_agx_multisegment_subtype1(
         wrapper_pair_offset = encoded_length + 0x10;
     }
 
-    int log_segments = atomic_fetch_add(
-        &g_macws_multisegment_log_batches, 1) < 4;
+    int log_segments = macws_runtime_diagnostics_enabled() &&
+        atomic_fetch_add(&g_macws_multisegment_log_batches, 1) < 4;
 
     unsigned fixed = 0;
     for (uint32_t reverse = count; reverse > 0; reverse--) {
@@ -10241,7 +10785,11 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                          const void *inStruct, size_t inStructCnt,
                          int allow_fix, int verbose_requested) {
     struct macws_submit_diag_result result = {0};
-    result.sequence = atomic_fetch_add(&g_macws_submit_diag_sequence, 1) + 1;
+    int diagnostics = macws_runtime_diagnostics_enabled() || verbose_requested;
+    if (diagnostics) {
+        result.sequence =
+            atomic_fetch_add(&g_macws_submit_diag_sequence, 1) + 1;
+    }
     if (!inStruct || inStructCnt < 0x20)
         return result;
 
@@ -10412,15 +10960,18 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         unsigned char *commands = (unsigned char *)(uintptr_t)start;
         size_t total = (size_t)(current - start);
         unsigned fixed_before_descriptor = result.fixed;
-        struct macws_fast_submit_token fast_ring_token =
-            macws_fast_submit_begin(result.sequence, descriptor_index,
-                (uintptr_t)descriptor, (uintptr_t)self, (uintptr_t)state);
-        struct macws_submit_ring_token ring_token =
-            macws_submit_ring_begin(result.sequence, descriptor_index,
-                (uintptr_t)descriptor, (uintptr_t)self, (uintptr_t)state,
-                commands, total,
+        struct macws_fast_submit_token fast_ring_token = {0};
+        struct macws_submit_ring_token ring_token = {0};
+        if (diagnostics) {
+            fast_ring_token = macws_fast_submit_begin(
+                result.sequence, descriptor_index, (uintptr_t)descriptor,
+                (uintptr_t)self, (uintptr_t)state);
+            ring_token = macws_submit_ring_begin(
+                result.sequence, descriptor_index, (uintptr_t)descriptor,
+                (uintptr_t)self, (uintptr_t)state, commands, total,
                 (const unsigned char *)(uintptr_t)segment_start,
                 segment_length);
+        }
         size_t dump_length = total < 0x300 ? total : 0x300;
         if (verbose) macws_submit_hex("kernel-commands", result.sequence,
                                       commands, dump_length);
@@ -10433,7 +10984,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                                             "pre", commands, total);
 
         if (allow_fix && segment_length >= 0x38 &&
-            access("/tmp/macws_kcmd_wrapped_fix", F_OK) == 0) {
+            macws_kcmd_wrapped_fix_enabled()) {
             unsigned wrapped_fixed =
                 macws_translate_agx_wrapped_single_subtype1(
                     result.sequence, commands, &total,
@@ -10611,10 +11162,11 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 int check_4e8 = memcmp(commands + 0x4e8,
                     "\xff\xff\xff\xff\xff\xff\xff\xff"
                     "\xff\xff\xff\xff", 12) == 0;
-                static _Atomic unsigned subtype1_observed_count = 0;
-                unsigned subtype1_observed = atomic_fetch_add(
-                    &subtype1_observed_count, 1) + 1;
-                if (subtype1_observed <= 8) {
+                if (diagnostics) {
+                    static _Atomic unsigned subtype1_observed_count = 0;
+                    unsigned subtype1_observed = atomic_fetch_add(
+                        &subtype1_observed_count, 1) + 1;
+                    if (subtype1_observed <= 8) {
                     fprintf(stderr,
                         "#### AGX_SUBMIT_DIAG #%u subtype1-predicate "
                         "scalar0=%#llx legacy-scalar-gate=%d "
@@ -10635,6 +11187,7 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                             descriptor_index,
                             (const unsigned char *)(uintptr_t)segment_start,
                             segment_length);
+                    }
                     }
                 }
             }
@@ -10711,9 +11264,10 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 if (verbose) macws_submit_save_kcmd(
                     result.sequence, descriptor_index, "post", commands, total);
                 static _Atomic unsigned subtype1_fix_log_count = 0;
-                unsigned subtype1_fix_log = atomic_fetch_add(
-                    &subtype1_fix_log_count, 1) + 1;
-                if (verbose || subtype1_fix_log <= 8) fprintf(stderr,
+                unsigned subtype1_fix_log = diagnostics
+                    ? atomic_fetch_add(&subtype1_fix_log_count, 1) + 1 : 0;
+                if (verbose || (diagnostics && subtype1_fix_log <= 8))
+                    fprintf(stderr,
                         "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-ABI-FIX "
                         "subtype1-clear pads=0x1c0,0x4c0 total=%#zx->%#zx "
                         "size=0x7e8->0x7c8 end=0x818->0x7f8 "
@@ -10777,9 +11331,10 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     current_raw = new_current_raw;
                     result.fixed++;
                     static _Atomic unsigned subtype3_fix_log_count = 0;
-                    unsigned subtype3_fix_log = atomic_fetch_add(
-                        &subtype3_fix_log_count, 1) + 1;
-                    if (verbose || subtype3_fix_log <= 8) fprintf(stderr,
+                    unsigned subtype3_fix_log = diagnostics
+                        ? atomic_fetch_add(&subtype3_fix_log_count, 1) + 1 : 0;
+                    if (verbose || (diagnostics && subtype3_fix_log <= 8))
+                        fprintf(stderr,
                             "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-ABI-FIX off=%#zx "
                             "size=0x1b8->0x1a8 end=0x1e8->0x1d8 "
                             "moved=%#zx new-total=%#zx\n",
@@ -10790,16 +11345,18 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
             }
             off += end_offset;
         }
-        macws_submit_ring_finish(ring_token,
-            result.fixed - fixed_before_descriptor,
-            commands, total,
-            (const unsigned char *)(uintptr_t)segment_start,
-            segment_length);
-        macws_fast_submit_finish(fast_ring_token,
-            result.fixed - fixed_before_descriptor,
-            commands, total,
-            (const unsigned char *)(uintptr_t)segment_start,
-            segment_length);
+        if (diagnostics) {
+            macws_submit_ring_finish(ring_token,
+                result.fixed - fixed_before_descriptor,
+                commands, total,
+                (const unsigned char *)(uintptr_t)segment_start,
+                segment_length);
+            macws_fast_submit_finish(fast_ring_token,
+                result.fixed - fixed_before_descriptor,
+                commands, total,
+                (const unsigned char *)(uintptr_t)segment_start,
+                segment_length);
+        }
         }
     }
     return result;
@@ -10986,8 +11543,10 @@ kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
         kern_return_t result = IOConnectCallScalarMethod(
             connect, 1, &surface_id, 1, NULL, NULL);
         static _Atomic unsigned long release_count = 0;
-        unsigned long release_n = atomic_fetch_add(&release_count, 1) + 1;
-        if (release_n <= 16 || (release_n % 250) == 0 ||
+        unsigned long release_n = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&release_count, 1) + 1 : 0;
+        if ((release_n &&
+             (release_n <= 16 || (release_n % 250) == 0)) ||
             result != KERN_SUCCESS) {
             fprintf(stderr,
                 "#### IOSURFACE-RELEASE-ABI pair #%lu: conn=%u "
@@ -11156,7 +11715,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             agxHeapSz = nb;
             patched = 1;
-            if (g_macws_agx_initfull_len) {
+            if (g_macws_agx_initfull_len &&
+                macws_runtime_diagnostics_enabled()) {
                 static _Atomic int exact_len_log_count = 0;
                 int exact_n = atomic_fetch_add(&exact_len_log_count, 1);
                 if (exact_n < 16) {
@@ -11212,7 +11772,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // the call away from the wrap path.  Dump the ORIGINAL macOS
         // args to see what +0x34 / +0x15 / +0x40 / +0x58 actually hold
         // before we touch them.
-        if (agxType == 0x82) {
+        if (agxType == 0x82 && macws_runtime_diagnostics_enabled()) {
             static int t82_pre = 0;
             if (!t82_pre) {
                 t82_pre = 1;
@@ -11245,7 +11805,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t va38 = *(const uint64_t *)(src + 0x38);
             if (va38 > 0x40000000ULL && agxType != 0x82) {
                 static int log_once_38 = 0;
-                if (log_once_38++ < 4) {
+                if (macws_runtime_diagnostics_enabled() &&
+                    log_once_38++ < 4) {
                     fprintf(stderr,
                         "#### AGXIOC sel=0x9 type=%#x VA-shape +0x38=%#llx → 0\n",
                         agxType, (unsigned long long)va38);
@@ -11262,7 +11823,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint32_t f14_clean = f14 & ~0x2800u;
             if (f14_clean != f14) {
                 static int log_once_14 = 0;
-                if (log_once_14++ < 4) {
+                if (macws_runtime_diagnostics_enabled() &&
+                    log_once_14++ < 4) {
                     fprintf(stderr,
                         "#### AGXIOC sel=0x9 type=%#x args+0x14=%#x → %#x "
                         "(stripped macOS-only bits 0x2800)\n",
@@ -11277,11 +11839,14 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t va58 = *(const uint64_t *)(src + 0x58);
             // Only swap if the length looks reasonable (<= 2 GB).
             if (len_field > 0 && len_field < 0x80000000ULL) {
-                fprintf(stderr,
-                    "#### AGXIOC sel=0x9 type=0 VA-shape detected: "
-                    "args+0x40=%#llx (>1GB) → using args+0x48=%#llx as size, +0x58 %#llx → 0\n",
-                    (unsigned long long)bc, (unsigned long long)len_field,
-                    (unsigned long long)va58);
+                if (macws_runtime_diagnostics_enabled()) {
+                    fprintf(stderr,
+                        "#### AGXIOC sel=0x9 type=0 VA-shape detected: "
+                        "args+0x40=%#llx (>1GB) → using args+0x48=%#llx as size, +0x58 %#llx → 0\n",
+                        (unsigned long long)bc,
+                        (unsigned long long)len_field,
+                        (unsigned long long)va58);
+                }
                 *(uint64_t *)(shadowbuf + 0x40) = len_field;
                 // SLCADisplay scanout: macOS leaves args+0x58 set to a tagged
                 // GPU-VA (e.g. 0x380888f00). On iOS the kernel reads this as
@@ -11307,7 +11872,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosResourceID;     // parent-id: client -> iOS resource ID
                 if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + g_agxIdMap[i].size;  // +0x30 = end-VA so size(=+0x30-+0x38) = parent size
                 patched = 1; mapped = 1;
-                fprintf(stderr, "#### AGXIOC subres parent %#x -> resourceID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosResourceID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
+                if (macws_runtime_diagnostics_enabled()) {
+                    fprintf(stderr, "#### AGXIOC subres parent %#x -> resourceID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosResourceID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
+                }
                 break;
             }
             if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
@@ -11319,7 +11886,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // structural; if they diverge, the differing field IS the
             // rejection trigger.
             static int t80_dumped = 0;
-            if (!t80_dumped) {
+            if (macws_runtime_diagnostics_enabled() && !t80_dumped) {
                 t80_dumped = 1;
                 fprintf(stderr,
                     "#### AGXIOC RAW DUMP sel=0x9 type=0x80 inStructCnt=%zu (pre-patch):\n",
@@ -11453,8 +12020,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             patched = 1;
             static _Atomic unsigned int t82_patch_count = 0;
-            unsigned int t82_n = atomic_fetch_add(&t82_patch_count, 1) + 1;
-            if (t82_n <= 16 || (t82_n % 500) == 0) {
+            unsigned int t82_n = macws_runtime_diagnostics_enabled()
+                ? atomic_fetch_add(&t82_patch_count, 1) + 1 : 0;
+            if (t82_n && (t82_n <= 16 || (t82_n % 500) == 0)) {
                 fprintf(stderr,
                     "#### AGXIOC type=0x82 patch #%u: f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
                     "+0x40 %#llx→0 +0x50 %#llx→%#llx +0x58 %#llx→%#llx\n",
@@ -11484,7 +12052,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // POST-patch dump for sel=0x9 type=0x80: capture EXACT bytes that
         // hit the kernel — to compare against iOS-native probe args that
         // also fail kr=0xe00002be with all-zero-but-required-fields.
-        if (agxType == 0x80) {
+        if (agxType == 0x80 && macws_runtime_diagnostics_enabled()) {
             static int t80_post_dumped = 0;
             if (!t80_post_dumped) {
                 t80_post_dumped = 1;
@@ -11507,7 +12075,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int submit_diag_active = translated_agx_submit &&
         access("/tmp/macws_submit_diag", F_OK) == 0;
     int submit_fix_active = translated_agx_submit &&
-        access("/tmp/macws_kcmd_fix", F_OK) == 0;
+        macws_kcmd_fix_enabled();
     // The ABI translator and the byte-dump diagnostic are independent gates.
     // Previously, macws_kcmd_fix was silently inert unless submit_diag also
     // existed, which made the same PF80 submit complete in exclusive tests but
@@ -11626,7 +12194,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                                   bytes, flags_14, request_50,
                                   agxRawRequest, agxRawRequestLength,
                                   inStruct, inStructCnt);
-            if (agxType == 0x82) {
+            if (agxType == 0x82 && macws_runtime_diagnostics_enabled()) {
                 static _Atomic unsigned int t82_bt_count = 0;
                 unsigned int bt_n = atomic_fetch_add(&t82_bt_count, 1);
                 if (bt_n < 4) {
@@ -11674,7 +12242,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     // Log the kr for sel=0x9 type=0x80 once so we can pair it with the
     // POST-PATCH dump above.
-    if (agxIsRes && agxType == 0x80) {
+    if (agxIsRes && agxType == 0x80 &&
+        macws_runtime_diagnostics_enabled()) {
         static int t80_kr_logged = 0;
         if (!t80_kr_logged) {
             t80_kr_logged = 1;
@@ -11741,15 +12310,16 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         if(slot < 0 && g_agxIdMapCount < 128) slot = g_agxIdMapCount++;
         if(slot >= 0) { g_agxIdMap[slot].clientID = agxClientID; g_agxIdMap[slot].iosResourceID = gid; g_agxIdMap[slot].size = agxHeapSz; }
         static _Atomic unsigned int heap_map_count = 0;
-        unsigned int heap_n = atomic_fetch_add(&heap_map_count, 1) + 1;
-        if (heap_n <= 16 || (heap_n % 500) == 0) {
+        unsigned int heap_n = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&heap_map_count, 1) + 1 : 0;
+        if (heap_n && (heap_n <= 16 || (heap_n % 500) == 0)) {
             fprintf(stderr,
                 "#### AGXIOC heap map #%u clientID %#x -> resourceID %#llx size %#llx\n",
                 heap_n, agxClientID, (unsigned long long)gid,
                 (unsigned long long)agxHeapSz);
         }
     }
-    if(IOConnectIsIOGPU(client)) {
+    if(IOConnectIsIOGPU(client) && macws_runtime_diagnostics_enabled()) {
         // Resource create/destroy have their own structured AGX_LIFE logs.
         // Successful submit/finalize calls are also a per-frame hot path: the
         // previous unconditional line reached tens of thousands of writes in
@@ -11887,7 +12457,8 @@ IOReturn IOConnectCallScalarMethod_new(io_connect_t client, uint32_t selector, c
     if (!caller_is_libmachook(__builtin_return_address(0)))
         selector = IOConnectTranslateSelector(client, selector);
     IOReturn r = IOConnectCallScalarMethod(client, selector, in, inCnt, out, outCnt);
-    if(IOConnectIsIOGPU(client) && orig != selector) {
+    if(IOConnectIsIOGPU(client) && orig != selector &&
+        macws_runtime_diagnostics_enabled()) {
         static _Atomic unsigned long scalarSuccessCount[256];
         unsigned index = orig < 256 ? orig : 255;
         unsigned long successSequence = r == 0
@@ -11974,10 +12545,12 @@ static uint32_t macws_coexist_completion_pace_us(void) {
                 source = "default-after-invalid-value";
             }
         }
-        fprintf(stderr,
-            "#### COEXIST DIAGNOSTIC completion pace: %u us source=%s "
-            "(synthetic completion; not a refresh-rate implementation)\n",
-            pace_us, source);
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                "#### VIRTUAL-DISPLAY-COMPAT completion pace: %u us source=%s "
+                "(synthetic completion; not a refresh-rate implementation)\n",
+                pace_us, source);
+        }
     });
     return pace_us;
 }
@@ -12008,17 +12581,19 @@ static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
         }
     }
 
-    static _Atomic int prior_mode = -1;
-    int mode = interactive ? 1 : 0;
-    int prior = atomic_exchange_explicit(
-        &prior_mode, mode, memory_order_acq_rel);
-    if (prior != mode) {
-        fprintf(stderr,
-            "#### COEXIST DIAGNOSTIC activity pace: mode=%s "
-            "pace=%u us idle=%u us window=1000ms\n",
-            interactive ? "interactive" : "idle",
-            interactive ? kInteractivePaceUS : idle_pace_us,
-            idle_pace_us);
+    if (macws_runtime_diagnostics_enabled()) {
+        static _Atomic int prior_mode = -1;
+        int mode = interactive ? 1 : 0;
+        int prior = atomic_exchange_explicit(
+            &prior_mode, mode, memory_order_acq_rel);
+        if (prior != mode) {
+            fprintf(stderr,
+                "#### COEXIST DIAGNOSTIC activity pace: mode=%s "
+                "pace=%u us idle=%u us window=1000ms\n",
+                interactive ? "interactive" : "idle",
+                interactive ? kInteractivePaceUS : idle_pace_us,
+                idle_pace_us);
+        }
     }
     return interactive ? kInteractivePaceUS : idle_pace_us;
 }
@@ -12078,8 +12653,11 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
     uint64_t requested_presentation_time = mach_absolute_time();
     IOReturn result = IOMobileFramebufferSwapCancel(framebuffer, swap_id);
     static _Atomic unsigned long cancel_count = 0;
-    unsigned long sequence = atomic_fetch_add(&cancel_count, 1) + 1;
-    if (sequence <= 16 || (sequence % 600) == 0 || result != KERN_SUCCESS) {
+    unsigned long sequence = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&cancel_count, 1) + 1 : 0;
+    if ((sequence &&
+         (sequence <= 16 || (sequence % 600) == 0)) ||
+        result != KERN_SUCCESS) {
         fprintf(stderr,
             "#### COEXIST API SwapCancel #%lu: fb=%p swapID=%u -> %#x "
             "(SwapEnd tail skipped)\n",
@@ -12102,7 +12680,7 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
             ((const char *)framebuffer + 0x14);
         macws_iomfb_complete_cancelled_swap(
             client, swap_id, requested_presentation_time);
-        if (sequence <= 4) {
+        if (sequence && sequence <= 4) {
             fprintf(stderr,
                 "#### COEXIST completion pace #%lu: interval=%u us "
                 "slept=%u us before swapID=%u\n",
@@ -12128,7 +12706,7 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
     // Do not ship the sentinel: a real SwapEnd can contend with backboardd for
     // the physical panel in coexistence mode.
     BOOL realSwapEndDiagnostic =
-        access("/tmp/macws_real_swapend", F_OK) == 0;
+        macws_real_swapend_diagnostic_enabled();
     if (!struct_skip && !realSwapEndDiagnostic &&
         atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
         orig == 5 && selector == 5 && inStruct && inStructCnt == 0x46c) {
@@ -12138,8 +12716,11 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
         IOReturn cancel_r = IOConnectCallScalarMethod(
             client, 0x34, &scalar, 1, NULL, NULL);
         static _Atomic unsigned long cancel_count = 0;
-        unsigned long cancel_n = atomic_fetch_add(&cancel_count, 1) + 1;
-        if (cancel_n <= 8 || (cancel_n % 600) == 0 || cancel_r != KERN_SUCCESS) {
+        unsigned long cancel_n = macws_runtime_diagnostics_enabled()
+            ? atomic_fetch_add(&cancel_count, 1) + 1 : 0;
+        if ((cancel_n &&
+             (cancel_n <= 8 || (cancel_n % 600) == 0)) ||
+            cancel_r != KERN_SUCCESS) {
             fprintf(stderr,
                 "#### COEXIST SwapCancel #%lu: conn=%u swapID=%u sel=0x34 -> %#x\n",
                 cancel_n, client, swap_id, cancel_r);
@@ -12159,7 +12740,7 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
                 macws_coexist_wait_for_completion_slot(pace_us);
             macws_iomfb_complete_cancelled_swap(
                 client, swap_id, requested_presentation_time);
-            if (cancel_n <= 4) {
+            if (cancel_n && cancel_n <= 4) {
                 fprintf(stderr,
                     "#### COEXIST fallback completion pace #%lu: "
                     "interval=%u us slept=%u us before swapID=%u\n",
@@ -12196,20 +12777,24 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
                 swap_n, client, swap_id, r);
         }
     }
-    if(IOConnectIsIOGPU(client) && orig != selector) fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    if(IOConnectIsIOGPU(client) && orig != selector &&
+       macws_runtime_diagnostics_enabled())
+        fprintf(stderr, "#### AGXIOC Struct sel=0x%x->0x%x inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inStructCnt, outStructCnt?*outStructCnt:0, r);
     return r;
 }
 IOReturn IOConnectCallAsyncMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
     IOReturn r = IOConnectCallAsyncMethod(client, selector, wake_port, ref, refCnt, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
-    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncMethod sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
+    if(IOConnectIsIOGPU(client) && macws_runtime_diagnostics_enabled())
+        fprintf(stderr, "#### AGXIOC AsyncMethod sel=0x%x->0x%x inCnt=%u inSC=%zu outSC=%zu -> 0x%x\n", orig, selector, inCnt, inStructCnt, outStructCnt?*outStructCnt:0, r);
     return r;
 }
 IOReturn IOConnectCallAsyncScalarMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const uint64_t *in, uint32_t inCnt, uint64_t *out, uint32_t *outCnt) {
     uint32_t orig = selector;
     selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && orig == 0x107 &&
+        macws_runtime_diagnostics_enabled() &&
         access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
         static _Atomic unsigned registration_count = 0;
         unsigned sequence = atomic_fetch_add(&registration_count, 1) + 1;
@@ -12241,7 +12826,8 @@ IOReturn IOConnectCallAsyncScalarMethod_new(io_connect_t client, uint32_t select
         }
     }
     IOReturn r = IOConnectCallAsyncScalarMethod(client, selector, wake_port, ref, refCnt, in, inCnt, out, outCnt);
-    if(IOConnectIsIOGPU(client)) fprintf(stderr, "#### AGXIOC AsyncScalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
+    if(IOConnectIsIOGPU(client) && macws_runtime_diagnostics_enabled())
+        fprintf(stderr, "#### AGXIOC AsyncScalar sel=0x%x->0x%x inCnt=%u -> 0x%x\n", orig, selector, inCnt, r);
     return r;
 }
 IOReturn IOConnectCallAsyncStructMethod_new(io_connect_t client, uint32_t selector, mach_port_t wake_port, uint64_t *ref, uint32_t refCnt, const void *inStruct, size_t inStructCnt, void *outStruct, size_t *outStructCnt) {

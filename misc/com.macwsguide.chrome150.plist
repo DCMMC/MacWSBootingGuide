@@ -29,8 +29,6 @@
         <string>--use-angle=metal</string>
         <string>--ignore-gpu-blocklist</string>
         <string>--disable-features=SkiaGraphite</string>
-        <string>--enable-logging=stderr</string>
-        <string>--v=1</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -46,19 +44,21 @@
         <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
         <string>1</string>
-        <key>MACWS_JIT_MPROTECT_TRACE</key>
-        <string>1</string>
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>
         <string>1</string>
         <key>MACWS_MACOS_SYSTEM_POLICY_COMPAT</key>
-        <string>1</string>
-        <key>MACWS_MACH_MSG_TRACE</key>
         <string>1</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <false/>
+    <!-- This launchd job hosts a foreground AppKit browser.  Match the
+         interactive process class used by a normal GUI launch instead of
+         inheriting launchd's adaptive daemon scheduling policy.  The exact
+         Chrome 150 FishTank A/B must still validate the resulting cadence. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>StandardOutPath</key>
     <string>/var/jb/var/mobile/chrome150.log</string>
     <key>StandardErrorPath</key>

@@ -12,7 +12,26 @@
 # on this jailbreak. Always invoke as `bash cleanup_all.sh`.
 
 echo === stopping GUI stack ===
-bash /var/jb/usr/macOS/bin/macos_gui.sh stop 2>&1 | head -5
+# This script is the explicit thermal/crash-loop emergency stop.  A test lease
+# must protect a controlled measurement from an unrelated ordinary start/stop,
+# but it must not make emergency recovery partial.  Runtime-confirmed
+# 2026-07-29: a stale Chrome test lease made macos_gui.sh refuse this stop;
+# cleanup later killed the processes but left ws_headless/mode state behind
+# while the orphan workload had already held the device near 5.2 W.
+# Authenticate with the exact current token, then clear the now-stopped lease
+# so a dead test owner cannot block the next deliberate session.
+cleanup_lease_file=/var/jb/var/mobile/macws_test_lease
+cleanup_lease_token=""
+if [ -f "$cleanup_lease_file" ]; then
+  cleanup_lease_token=$(awk 'NR == 1 { print; exit }' "$cleanup_lease_file" 2>/dev/null)
+fi
+if [ -n "$cleanup_lease_token" ]; then
+  MACWS_TEST_LEASE_TOKEN="$cleanup_lease_token" \
+    bash /var/jb/usr/macOS/bin/macos_gui.sh stop 2>&1 | head -5
+else
+  bash /var/jb/usr/macOS/bin/macos_gui.sh stop 2>&1 | head -5
+fi
+rm -f "$cleanup_lease_file"
 
 echo === unloading all macwsguide jobs ===
 for plist in /var/jb/Library/LaunchDaemons/com.macwsguide.*.plist \
@@ -34,7 +53,8 @@ for p in $(jobs -p); do kill -9 $p 2>/dev/null; done
 echo === killing chroot processes ===
 for pat in WindowServer launchservicesd OSXvnc-server Terminal GlassDemo \
            "Activity Monitor" launchdchrootexec MTLSimDriverHost macwsinputd \
-           "Visual Studio Code.app" "Code Helper" MacWSHost; do
+           "Visual Studio Code.app" "Code Helper" \
+           "Google Chrome.app" "Chrome Helper" MacWSHost; do
   pkill -9 -f "$pat" 2>/dev/null
 done
 
@@ -64,12 +84,18 @@ for pat in 'sh /tmp/' oslog build_on_ios.sh find_crash.sh '/var/jb/usr/bin/lldb'
            debugserver tmux; do
   pkill -9 -f "$pat" 2>/dev/null
 done
+# procursus pkill has occasionally missed an already-orphaned oslog process.
+# Resolve only the exact debug executables from ps and terminate their PIDs.
+for pid in $(ps aux 2>/dev/null \
+    | awk '/\/oslog( |$)|\/debugserver( |$)|\/lldb( |$)/ && !/awk/{print $2}'); do
+  kill -9 "$pid" 2>/dev/null
+done
 
 sleep 2
 echo
 echo === final state ===
 ps aux | grep -iE \
-  "WindowServer|macwsallocd|macwsinputd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|MacWSHost" \
+  "WindowServer|macwsallocd|macwsinputd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|MacWSHost" \
   | grep -v grep | head -10 || echo "(none)"
 echo
 uptime
