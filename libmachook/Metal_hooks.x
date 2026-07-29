@@ -8001,9 +8001,11 @@ const char *metalSimService = "com.apple.metal.simulator";
 xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, dispatch_queue_t targetq, uint64_t flags);
 xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, dispatch_queue_t targetq, uint64_t flags) {
     flags &= ~XPC_CONNECTION_MACH_SERVICE_PRIVILEGED;
-    // Log every mach-service connection attempt so we can spot the hiservices /
-    // AppKit window-creation flow in chroot. Filter to Terminal process to limit noise.
-    if (getenv("MACWS_XPC_DEBUG") || strstr(getprogname() ?: "", "Terminal")) {
+    // Connection tracing is a diagnostic flight recorder.  Terminal used to
+    // enable it implicitly, making an ordinary production shell write every
+    // XPC lookup to stderr.  Keep the functional privileged-flag translation
+    // below, but emit the trace only under the explicit debug environment.
+    if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr, "#### XPC_TRACE mach_service create: '%s' flags=%#llx\n",
             name ?: "(null)", (unsigned long long)flags);
     }
@@ -8016,7 +8018,7 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 // Also trace xpc_connection_create (the XPC service / bundle-name style)
 xpc_connection_t (*orig_xpc_connection_create)(const char *name, dispatch_queue_t queue);
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
-    if (name && (getenv("MACWS_XPC_DEBUG") || strstr(getprogname() ?: "", "Terminal"))) {
+    if (name && getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr, "#### XPC_TRACE service create: '%s'\n", name);
     }
     return orig_xpc_connection_create(name, queue);

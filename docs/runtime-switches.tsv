@@ -1,0 +1,140 @@
+# kind	name	production	scope	purpose
+# production is one of: on, off, auto, transient. This is the authoritative inventory.
+env	AGXPROBE_HOLD	off	standalone probe	Keeps the AGX API probe alive for debugger attachment.
+env	AGXPROBE_TEXTURE_INIT	off	standalone probe	Selects the texture-initializer probe variant.
+env	CA_DISABLE_SWAP_ICC	on	WindowServer,GUI clients	Required CoreAnimation compatibility; not a diagnostic.
+env	CA_VSYNC_OFF	on	WindowServer,GUI clients	No working chroot vblank handoff; commits use the virtual completion path.
+env	DYLD_INSERT_LIBRARIES	auto	launchdchrootexec	Launcher selects the matching thin libmachook slice.
+env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
+env	IOSCLEAR_DRAW_MODE	off	standalone probe	Selects an iosclear reference draw experiment.
+env	IOSCLEAR_DUMP_AGX_METHODS	off	standalone probe	Dumps AGX methods from iosclear_ref.
+env	IOSCLEAR_EARLY_DELAY	off	standalone probe	Delays the early iosclear reference path.
+env	IOSCLEAR_EARLY_HOLD	off	standalone probe	Holds the early iosclear reference path for a debugger.
+env	IOSCLEAR_HEADLESS	off	standalone probe	Runs the iosclear reference without a visible window.
+env	IOSCLEAR_HOLD	off	standalone probe	Keeps iosclear_ref alive for debugger attachment.
+env	IOSCLEAR_PF550_MODE	off	standalone probe	Selects the PF550 iosclear experiment.
+env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
+env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
+env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
+env	MACWS_AGXIOC_FUZZ	off	diagnostic	Mutates AGX selector-9 arguments.
+env	MACWS_AGX_BORROW_CONN	off	disproved experiment	Guarded IOKit port transfer experiment.
+env	MACWS_AGX_CRASH_DIAG	off	diagnostic	SIGSEGV register and memory dumper.
+env	MACWS_AGX_DUMP_METHODS	off	diagnostic	Objective-C AGX method inventory.
+env	MACWS_AGX_FORCE_TYPE	off	disproved experiment	Overrides IOServiceOpen type.
+env	MACWS_AGX_INITIMPL_TRACE	off	diagnostic	Texture initializer trace.
+env	MACWS_AGX_KEEP_PINNED_ALLOC	off	A/B control	Absent selects the production iOS-native allocation redirect.
+env	MACWS_AGX_KEEP_VALIDATE	off	A/B control	Retains an old validation branch when explicitly set.
+env	MACWS_AGX_LIFE_STACK_LARGE	off	diagnostic	Large lifecycle backtraces.
+env	MACWS_AGX_LIFE_VERBOSE	off	diagnostic	Per-resource lifecycle logging.
+env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo	Select the real iOS AGX driver path; mandatory production invariant.
+env	MACWS_AGX_NATIVE_NON2D	off	A/B control	Broad non-2D native texture allocation experiment.
+env	MACWS_AGX_NATIVE_PLAIN	off	inverse A/B control	Variable is absent in production; absence enables the validated native-plain policy.
+env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo	Realize cross-image AGX Objective-C classes.
+env	MACWS_AGX_RENAMER_PATCH	off	legacy diagnostic	Superseded AIR renamer patch.
+env	MACWS_AGX_STRIP_OPEN_OPTIONS	off	A/B control	IOServiceOpen option mutation.
+env	MACWS_AGX_TEX_BYPASS_GATE	off	diagnostic scaffold	Texture gate bypass.
+env	MACWS_AGX_ZERO_QUEUE_ARGS	off	disproved experiment	Zeroes command-queue arguments.
+env	MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT	on	VS Code,Chrome	Narrow Chromium task-policy compatibility.
+env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settlement; not enabled for benchmarks.
+env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
+env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
+env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
+env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bind failure.
+env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
+env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
+env	MACWS_DUMP_BACKING	off	diagnostic	Texture backing dump.
+env	MACWS_GLASS_BLUR_AB	off	diagnostic	GlassDemo blur A/B hook.
+env	MACWS_GOT_RAW_AUTH	off	diagnostic	Raw authenticated GOT inspection.
+env	MACWS_GOT_SKIP_AUTH	off	diagnostic	Skips authenticated GOT repair entries.
+env	MACWS_HID_BYPASS	off	diagnostic/A-B	Broad HID compatibility hooks are not production-safe.
+env	MACWS_IOMFB_SWAP_TRACE	off	diagnostic	Swap ABI trace.
+env	MACWS_IOSURF_TRACE	off	diagnostic	Per-IOSurface creation trace.
+env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome	Chromium MAP_JIT/W^X compatibility without verbose trace.
+env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace.
+env	MACWS_KEEP_ASSERT_BYPASS	off	safety invariant	Real assertions remain enabled.
+env	MACWS_KEEP_FORCE_ACCEL	off	legacy simulator control	Simulator force-accelerator shim remains disabled.
+env	MACWS_KEEP_RENDER_UPDATE_CBZ	off	A/B control	Restores historical SkyLight render-update branch.
+env	MACWS_KEEP_VALIDATE_ALWAYS	off	diagnostic scaffold	Forces historical validate bypass behavior.
+env	MACWS_MACH_MSG_TRACE	off	diagnostic	Mach-message trace.
+env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-policy compatibility.
+env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
+env	MACWS_METAL_PROBE_EVENT_ONLY	off	standalone probe	Restricts metal_source_probe to its event test.
+env	MACWS_METAL_PROBE_PAUSE_SECONDS	off	standalone probe	Pauses metal_source_probe for debugger attachment.
+env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source target.
+env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
+env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
+env	MACWS_RESTORE_OUTBUMP	off	A/B control	Restores historical selector output-count mutation.
+env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight recorders.
+env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
+env	MACWS_SURF_FILL_IOS	off	diagnostic	IOSurface fill probe.
+env	MACWS_SUSPEND_AT_EXEC	off	diagnostic	SIGSTOP immediately after injection for LLDB attach.
+env	MACWS_TEX_TRACE	off	diagnostic	Texture call trace.
+env	MACWS_VNC_LOW_LATENCY_COMPRESSION	on	OSXvnc	Clamp negotiated compression work factor to measured level 1.
+env	MACWS_VNC_NATIVE_ALL	on	OSXvnc	Single system-wide CoreGraphics input owner.
+env	MACWS_VNC_SHARE	off	environment override	Production enables the equivalent /tmp/macws_vnc_share session flag.
+env	MACWS_VNC_TRACE_CLIENT_MESSAGES	off	diagnostic	RFB client-message trace.
+env	MACWS_XPC_DEBUG	off	diagnostic	XPC connection trace; no process enables it implicitly.
+env	NSRunningFromLaunchd	on	pbs	Matches the real macOS Services daemon launch contract.
+env	PATH	auto	chroot launcher	Explicit standard chroot executable search path.
+env	PINPROBE_HOLD_BEFORE_PIN	off	standalone probe	Holds PinnedVAProbe before pinning for debugger attachment.
+env	REDWIN_DELAY	off	standalone probe	Delays the red-window rendering probe.
+env	REDWIN_LOOP	off	standalone probe	Keeps the red-window rendering probe repainting.
+env	TOY_DELAY	off	standalone probe	Delays the ToyGUI rendering probe.
+env	MallocScribble	off	allocator diagnostic	Forbidden in every production launch plist.
+flag	/private/tmp/macws_agx_dump_methods	off	diagnostic	AGX Objective-C method dump.
+flag	/private/tmp/macws_agx_trace_reserve	off	diagnostic	AGX reserve trace.
+flag	/private/tmp/macws_mtl_library_diag	off	diagnostic	Metal library target/compile trace.
+flag	/private/tmp/macws_tile_descriptor_diag	off	diagnostic	Tile descriptor and completion observer.
+flag	/tmp/macws_allow_unsafe_pf550_capture	off	unsafe diagnostic	Cross-queue compressed-scanout capture.
+flag	/tmp/macws_cancel_completion	on	WindowServer	Required virtual-display cancelled-swap completion adapter.
+flag	/tmp/macws_capture_final	transient	VNC startup	One-shot validated post-client frame request; removed after acknowledgement.
+flag	/tmp/macws_command_error_diag	off	diagnostic	Metal command-buffer error introspection.
+flag	/tmp/macws_cvdl_trace	off	diagnostic	CVDisplayLink callback trace.
+flag	/tmp/macws_disp_copy	off	legacy diagnostic	Display CPU-copy probe.
+flag	/tmp/macws_disp_dump	off	diagnostic	Display backing raw dump.
+flag	/tmp/macws_disp_fill	off	legacy diagnostic	Display gray-fill loop.
+flag	/tmp/macws_dump_rejected_vnc	off	diagnostic	Rejected VNC frame dump.
+flag	/tmp/macws_inband_pf550	off	unsafe diagnostic	Ordered PF550 readback experiment.
+flag	/tmp/macws_inspect_failed_pf550	off	unsafe diagnostic	Inspect failed compressed frame.
+flag	/tmp/macws_iogpu_error_diag	off	diagnostic	Raw IOGPU completion/error introspection.
+flag	/tmp/macws_kcmd_field_5e3_diag	off	diagnostic	KCMD field trace.
+flag	/tmp/macws_kcmd_field_6bc_diag	off	diagnostic	KCMD field trace.
+flag	/tmp/macws_kcmd_field_a4_diag	off	diagnostic	KCMD field trace.
+flag	/tmp/macws_kcmd_fix	on	WindowServer	Required direct native-AGX command ABI adapter.
+flag	/tmp/macws_kcmd_wrapped_fix	on	WindowServer	Required validated wrapped command ABI adapter.
+flag	/tmp/macws_observe_pf550	off	diagnostic	Compressed display submission observer.
+flag	/tmp/macws_owned_no_read	off	A/B control	Disables owned scanout read.
+flag	/tmp/macws_owned_scanout	on	WindowServer/VNC	Process-owned linear BGRA scanout transport.
+flag	/tmp/macws_owned_unlocked_read	off	unsafe A/B	Reads IOSurface without ownership lock.
+flag	/tmp/macws_pf550_metadata_diag	off	diagnostic	PF550 metadata observer.
+flag	/tmp/macws_probe_small_pf550	off	diagnostic	Small compressed-texture probe.
+flag	/tmp/macws_queue_qos_diag	off	diagnostic	Command-queue QoS trace.
+flag	/tmp/macws_real_swapend	off	unsafe A/B	Lets macOS contend for the physical panel in coexistence.
+flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
+flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
+flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
+flag	/tmp/macws_submit_diag	off	diagnostic	Submit translation trace and raw dumps.
+flag	/tmp/macws_submit_fast_ring	off	diagnostic	Fixed-memory submit flight recorder.
+flag	/tmp/macws_submit_ring	off	diagnostic	Heap/mutex submit flight recorder.
+flag	/tmp/macws_trace_small_pf550_bind	off	diagnostic	Small compressed bind trace.
+flag	/tmp/macws_vnc_native_all	off	redundant override	Production owns this setting through OSXvnc environment.
+flag	/tmp/macws_vnc_share	on	WindowServer/VNC	Enable shared Retina framebuffer publication.
+flag	/tmp/macws_vnc_test	off	diagnostic	Synthetic VNC gradient.
+state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion interval, currently 100000 us.
+state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
+state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.
+state	/tmp/macws_vnc_activity	transient	VNC input	Monotonic input timestamp selecting the 16.667 ms interactive interval.
+state	/tmp/macws_vnc_damage.sock	transient	VNC transport	Damage notification datagram socket.
+state	/tmp/macws_vnc_fb	transient	VNC transport	Retina mmap pixel transport and publication sequence.
+state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
+state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.
+socket	/private/tmp/macws_app_input.%d.sock	transient	GUI client	Per-process AppInputBridge endpoint.
+socket	/private/tmp/macws_host_input.lock	transient	native host	Single broker ownership lock.
+socket	/private/tmp/macws_host_input.sock	transient	native host	Native-host input datagram endpoint.
+socket	/private/tmp/macws_input_target.sock	transient	macwsinputd	System input target-selection endpoint.
+artifact	/tmp/macws_fast_submit_error_%d_%u	off	diagnostic	Bounded fast-ring error dump directory; production cleanup removes all.
+artifact	/tmp/macws_submit_error_%d_%u	off	diagnostic	Heap-ring error dump directory; production cleanup removes all.
+artifact	/tmp/macws_submit_kcmd_%u_%u_%s.bin	off	diagnostic	Raw translated command dump.
+artifact	/tmp/macws_submit_segment_%u_%u.bin	off	diagnostic	Raw segment dump.
+artifact	/tmp/macws_submit_type1_%u_%u.bin	off	diagnostic	Raw type-1 command dump.
+artifact	/tmp/macws_vnc_rejected.bgra	off	diagnostic	Rejected VNC frame dump.

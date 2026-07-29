@@ -4,7 +4,8 @@
 #
 # Run as root from the iOS shell (NOT inside the chroot):
 #
-#   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist     # iOS keeps the panel, macOS -> VNC only
+#   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh production        # one-click production profile
+#   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist     # same production defaults, explicit command
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start exclusive   # macOS takes the physical panel + VNC
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop              # tear everything down, return to iOS
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh restart coexist   # stop, then start in the given mode
@@ -12,7 +13,8 @@
 #
 # Options for start/restart:
 #   coexist | exclusive   display mode (default: coexist)
-#   --experimental        enable the current native-AGX compatibility path
+#   --experimental        compatibility alias; native-AGX path is now the default
+#   --no-experimental     explicit control run without the native-AGX VNC adapters
 #   --diagnostics         also enable high-overhead AGX flight recorders/traces
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
@@ -37,6 +39,7 @@ set -u
 ROOTFS=/var/mnt/rootfs
 FLAG="$ROOTFS/tmp/ws_headless"                 # coexistence flag (chroot /tmp/ws_headless)
 MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + launchservicesd
+WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
@@ -176,7 +179,7 @@ WD_WS_CPU_STRIKES=6   # six 5-second samples = 30 seconds above the limit
 # shutdown: the watchdog logged the cap trip while VS Code logged SIGTERM.
 # Crash-loop/load/sustained-CPU guards remain armed. Bounded automation can
 # opt back into a wall-clock limit with --runtime-cap=SECONDS.
-WD_DIAG_MAX_RUNTIME=0
+WD_MAX_RUNTIME=0
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 WD_TRIP="$LOGDIR/macws_safety_trip"
 WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
@@ -406,7 +409,7 @@ watchdog_pidfile_cleanup() {
 # WindowServer crash-loops or the load average runs away.
 run_watchdog() {
     local last_pid="" restarts=0 t0 started now pid L load_runaway
-    local ws_cpu=0 cpu_strikes=0 diagnostic=0 missing_samples=0
+    local ws_cpu=0 cpu_strikes=0 missing_samples=0
     local runtime_cap_label="disabled"
     # The parent records $! as soon as it forks us, and the child records $$
     # again here after exec.  The ownership-aware EXIT trap cannot erase a
@@ -415,9 +418,8 @@ run_watchdog() {
     trap watchdog_pidfile_cleanup EXIT
     t0=$(date +%s)
     started=$t0
-    [ -e "$EXPERIMENTAL_COMPLETION" ] && diagnostic=1
-    [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
-        runtime_cap_label="${WD_DIAG_MAX_RUNTIME}s"
+    [ "$WD_MAX_RUNTIME" -gt 0 ] &&
+        runtime_cap_label="${WD_MAX_RUNTIME}s"
     log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace; WS CPU>=${WD_WS_CPU_LIMIT}% for $((WD_WS_CPU_STRIKES * WD_POLL))s; >=$WD_RESTART_LIMIT restarts/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
     while :; do
         sleep "$WD_POLL"
@@ -485,10 +487,9 @@ run_watchdog() {
             trip_watchdog "WindowServer 高 CPU 样本累计达到 $((WD_WS_CPU_STRIKES * WD_POLL)) 秒（阈值 ${WD_WS_CPU_LIMIT}%，当前 ${ws_cpu}%），已自动停止以防过热"
             return 0
         fi
-        if [ "$diagnostic" -eq 1 ] &&
-           [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
-           [ $((now - started)) -ge "$WD_DIAG_MAX_RUNTIME" ]; then
-            trip_watchdog "实验兼容模式达到 ${WD_DIAG_MAX_RUNTIME} 秒安全上限，已自动停止；这仍是诊断脚手架"
+        if [ "$WD_MAX_RUNTIME" -gt 0 ] &&
+           [ $((now - started)) -ge "$WD_MAX_RUNTIME" ]; then
+            trip_watchdog "自动化运行达到 ${WD_MAX_RUNTIME} 秒显式上限，已自动停止"
             return 0
         fi
     done
@@ -764,6 +765,134 @@ stop_watchdogs() {
     rm -f "$WD_PIDFILE"
 }
 
+# Every sentinel below changes code paths, installs tracing, records submit
+# payloads, or performs an unsafe A/B readback.  Production startup removes the
+# complete list before it creates the small set of required functional flags.
+# Keep this list in sync with docs/runtime-switches.tsv; the host-side
+# misc/audit_runtime_switches.py check fails when a newly-added source sentinel
+# is not recorded there.
+diagnostic_flag_paths() {
+    printf '%s\n' \
+        /private/tmp/macws_agx_dump_methods \
+        /private/tmp/macws_agx_trace_reserve \
+        /private/tmp/macws_mtl_library_diag \
+        /private/tmp/macws_tile_descriptor_diag \
+        /tmp/macws_allow_unsafe_pf550_capture \
+        /tmp/macws_command_error_diag \
+        /tmp/macws_cvdl_trace \
+        /tmp/macws_disp_copy \
+        /tmp/macws_disp_dump \
+        /tmp/macws_disp_fill \
+        /tmp/macws_dump_rejected_vnc \
+        /tmp/macws_inband_pf550 \
+        /tmp/macws_inspect_failed_pf550 \
+        /tmp/macws_iogpu_error_diag \
+        /tmp/macws_kcmd_field_5e3_diag \
+        /tmp/macws_kcmd_field_6bc_diag \
+        /tmp/macws_kcmd_field_a4_diag \
+        /tmp/macws_observe_pf550 \
+        /tmp/macws_owned_no_read \
+        /tmp/macws_owned_unlocked_read \
+        /tmp/macws_pf550_metadata_diag \
+        /tmp/macws_probe_small_pf550 \
+        /tmp/macws_queue_qos_diag \
+        /tmp/macws_real_swapend \
+        /tmp/macws_res_diag \
+        /tmp/macws_runtime_diagnostics \
+        /tmp/macws_stop_after_clear \
+        /tmp/macws_submit_diag \
+        /tmp/macws_submit_fast_ring \
+        /tmp/macws_submit_ring \
+        /tmp/macws_trace_small_pf550_bind \
+        /tmp/macws_vnc_native_all \
+        /tmp/macws_vnc_test
+}
+
+clear_diagnostic_state() {
+    local path
+    diagnostic_flag_paths | while IFS= read -r path; do
+        rm -f "$ROOTFS$path"
+    done
+
+    # Bounded dump directories are historical evidence, not session state.
+    # Match only exact MacWS prefixes one directory below the chroot tmp root.
+    find "$ROOTFS/private/tmp" -maxdepth 1 -type d \
+        \( -name 'macws_fast_submit_error_[0-9]*_[0-9]*' \
+        -o -name 'macws_submit_error_[0-9]*_[0-9]*' \) \
+        -exec rm -rf {} \; 2>/dev/null
+    find "$ROOTFS/private/tmp" -maxdepth 1 -type f \
+        \( -name 'macws_submit_*.bin' \
+        -o -name 'macws_submit_kcmd_*.bin' \
+        -o -name 'macws_submit_segment_*.bin' \
+        -o -name 'macws_submit_type1_*.bin' \
+        -o -name 'macws_pf550_small_probe.bgra' \
+        -o -name 'macws_vnc_rejected.bgra' \
+        -o -name 'macws_back115.raw' \
+        -o -name 'macws_backdense.raw' \
+        -o -name 'macws_agx_runtime_methods.log' \
+        -o -name 'macws_disp.log' \) \
+        -exec rm -f {} \; 2>/dev/null
+}
+
+production_preflight() {
+    local path plist key bad=0
+    clear_diagnostic_state
+
+    # No production launch job may enable allocator/debug flight recorders via
+    # environment.  Functional compatibility variables are documented and
+    # intentionally excluded from this deny-list.
+    for plist in "$WINDOWSERVER_PLIST" "$VNC_PLIST" "$TERM_PLIST" \
+                 "$VSCODE_PLIST" "$CHROME150_PLIST"; do
+        [ -f "$plist" ] || continue
+        if plutil "$plist" 2>/dev/null | grep -Eq \
+            '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG)"?[[:space:]]*='; then
+            log "ERROR: production debug environment found in $plist"
+            bad=1
+        fi
+    done
+    for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES MACWS_PIN_FALLBACK; do
+        if ! plutil "$WINDOWSERVER_PLIST" 2>/dev/null |
+             grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+            log "ERROR: required native-AGX environment $key=1 missing from $WINDOWSERVER_PLIST"
+            bad=1
+        fi
+    done
+    for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
+                /tmp/macws_cancel_completion; do
+        if [ ! -e "$ROOTFS$path" ]; then
+            log "ERROR: required native-AGX production flag missing: $path"
+            bad=1
+        fi
+    done
+    if [ "$WANT_VNC" = 1 ]; then
+        for path in /tmp/macws_vnc_share /tmp/macws_owned_scanout; do
+            if [ ! -e "$ROOTFS$path" ]; then
+                log "ERROR: required production VNC flag missing: $path"
+                bad=1
+            fi
+        done
+        for key in MACWS_VNC_NATIVE_ALL MACWS_VNC_LOW_LATENCY_COMPRESSION; do
+            if ! plutil "$VNC_PLIST" 2>/dev/null |
+                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+                log "ERROR: required production VNC environment $key=1 missing from $VNC_PLIST"
+                bad=1
+            fi
+        done
+    fi
+    diagnostic_flag_paths | while IFS= read -r path; do
+        [ ! -e "$ROOTFS$path" ] || echo "$path"
+    done > "$ROOTFS/private/tmp/macws_production_preflight.bad"
+    if [ -s "$ROOTFS/private/tmp/macws_production_preflight.bad" ]; then
+        log "ERROR: diagnostic flag survived production cleanup:"
+        sed 's/^/       /' "$ROOTFS/private/tmp/macws_production_preflight.bad"
+        bad=1
+    fi
+    rm -f "$ROOTFS/private/tmp/macws_production_preflight.bad"
+    [ "$bad" = 0 ] || return 1
+    log "PRODUCTION-PREFLIGHT: native AGX required; diagnostics/env traces/dump sentinels OFF."
+    return 0
+}
+
 cleanup_macos() {
     log "Cleaning up previous macOS GUI services..."
     stop_watchdogs
@@ -811,6 +940,8 @@ cleanup_macos() {
     kill_by_pattern "$P_WINDOWSERVER"
     kill_by_pattern "$P_LAUNCHSERVICESD"
 
+    clear_diagnostic_state
+
     # The mmap is a producer-owned WindowServer artifact, not persistent
     # session state.  Keeping it after the producer exits lets a fresh OSXvnc
     # process advertise pixels from an earlier application even when the new
@@ -825,19 +956,6 @@ cleanup_macos() {
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
         "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_QUEUE_QOS" \
         "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" "$EXPERIMENTAL_PACE"
-    # Remove bounded binary/text artifacts from earlier diagnostic sessions.
-    # None of these names is runtime state for a future GUI session.
-    rm -f "$ROOTFS"/private/tmp/macws_submit_*.bin \
-        "$ROOTFS"/private/tmp/macws_pf550_small_probe.bgra \
-        "$ROOTFS"/private/tmp/macws_iogpu_error_diag \
-        "$ROOTFS"/private/tmp/macws_submit_diag \
-        "$ROOTFS"/private/tmp/macws_probe_small_pf550 \
-        "$ROOTFS"/private/tmp/macws_kcmd_field_a4_diag \
-        "$ROOTFS"/private/tmp/macws_kcmd_field_5e3_diag \
-        "$ROOTFS"/private/tmp/macws_kcmd_field_6bc_diag \
-        "$ROOTFS"/private/tmp/macws_agx_trace_reserve \
-        "$ROOTFS"/private/tmp/macws_real_swapend
-
     sleep 1
     log "Cleanup done."
 }
@@ -967,12 +1085,44 @@ status() {
     echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/pboard.log  $LOGDIR/pbs.log  $LOGDIR/WindowServer.err"
 }
 
+switch_status() {
+    local path actual
+    echo "=== MacWS production switch audit ==="
+    echo "profile defaults: AGX-native=ON compatibility=ON diagnostics=OFF mode=coexist"
+    echo
+    echo "-- required functional flags --"
+    for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
+                /tmp/macws_cancel_completion /tmp/macws_vnc_share \
+                /tmp/macws_owned_scanout /tmp/macws_coexist_pace_us; do
+        if [ -e "$ROOTFS$path" ]; then actual=ON; else actual=OFF; fi
+        printf '%-48s actual=%s\n' "$path" "$actual"
+    done
+    echo
+    echo "-- diagnostic/A-B flags (production expected OFF) --"
+    diagnostic_flag_paths | while IFS= read -r path; do
+        if [ -e "$ROOTFS$path" ]; then actual=ON; else actual=OFF; fi
+        printf '%-48s expected=OFF actual=%s\n' "$path" "$actual"
+    done
+    echo
+    echo "-- configured launch environments --"
+    for path in "$WINDOWSERVER_PLIST" "$VNC_PLIST" "$TERM_PLIST" \
+                "$VSCODE_PLIST" "$CHROME150_PLIST"; do
+        [ -f "$path" ] || continue
+        echo "[$path]"
+        plutil "$path" 2>/dev/null | sed -n '/EnvironmentVariables =/,/^    };/p'
+    done
+    echo
+    echo "authoritative inventory: docs/runtime-switches.tsv"
+}
+
 usage() {
     cat <<USAGE
 macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
-  sudo bash $0 start [coexist|exclusive] [--experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 production
+  sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 switches
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
@@ -985,10 +1135,11 @@ Safety: `start` also launches a background watchdog that auto-stops the GUI if
 WindowServer crash-loops or the load average runs away (panic guard). Disable
 with --no-watchdog. Logs to $LOGDIR/macos_gui_watchdog.log.
 
-The current native VNC path still needs command/completion compatibility
-adapters. Use --experimental explicitly for that path. High-overhead flight
-recorders and read-only method tracing remain off unless --diagnostics is also
-present. Interactive sessions have no arbitrary wall-clock timeout, while
+The production profile enables native AGX and its required command/completion
+compatibility adapters by default. High-overhead flight recorders and read-only
+method tracing remain off unless --diagnostics is explicitly present. Use
+--no-experimental only for an intentional control experiment. Interactive
+sessions have no arbitrary wall-clock timeout, while
 crash-loop/load/high-CPU protection stays armed. Automated runs may add
 --runtime-cap=300 (minimum 60 seconds).
 
@@ -1000,11 +1151,17 @@ USAGE
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
+FORCE_PRODUCTION=0
+if [ "$CMD" = production ]; then
+    CMD=start
+    FORCE_PRODUCTION=1
+fi
+
 MODE=coexist
 WANT_VNC=1
 WANT_TERMINAL=1
 WANT_WATCHDOG=1
-WANT_EXPERIMENTAL=0
+WANT_EXPERIMENTAL=1
 WANT_DIAGNOSTICS=0
 COEXIST_PACE_US=""
 for a in "$@"; do
@@ -1012,9 +1169,10 @@ for a in "$@"; do
         coexist|coexistence|co)  MODE=coexist ;;
         exclusive|full|excl)     MODE=exclusive ;;
         --experimental)          WANT_EXPERIMENTAL=1 ;;
+        --no-experimental)       WANT_EXPERIMENTAL=0 ;;
         --diagnostics)           WANT_DIAGNOSTICS=1 ;;
         --pace-us=*)             COEXIST_PACE_US="${a#--pace-us=}" ;;
-        --runtime-cap=*)         WD_DIAG_MAX_RUNTIME="${a#--runtime-cap=}" ;;
+        --runtime-cap=*)         WD_MAX_RUNTIME="${a#--runtime-cap=}" ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
         --no-vnc)                WANT_VNC=0 ;;
         --no-watchdog)           WANT_WATCHDOG=0 ;;
@@ -1022,19 +1180,25 @@ for a in "$@"; do
     esac
 done
 
+if [ "$FORCE_PRODUCTION" = 1 ] &&
+   { [ "$WANT_EXPERIMENTAL" != 1 ] || [ "$WANT_DIAGNOSTICS" = 1 ]; }; then
+    echo "macos_gui.sh: production requires native compatibility ON and diagnostics OFF" >&2
+    exit 1
+fi
+
 if [ "$WANT_DIAGNOSTICS" = 1 ] && [ "$WANT_EXPERIMENTAL" != 1 ]; then
     echo "macos_gui.sh: --diagnostics requires --experimental" >&2
     exit 1
 fi
 
-case "$WD_DIAG_MAX_RUNTIME" in
+case "$WD_MAX_RUNTIME" in
     *[!0-9]*|'')
         echo "macos_gui.sh: --runtime-cap must be an integer (0 or at least 60 seconds)" >&2
         exit 1
         ;;
 esac
-if [ "$WD_DIAG_MAX_RUNTIME" -ne 0 ] &&
-   [ "$WD_DIAG_MAX_RUNTIME" -lt 60 ]; then
+if [ "$WD_MAX_RUNTIME" -ne 0 ] &&
+   [ "$WD_MAX_RUNTIME" -lt 60 ]; then
     echo "macos_gui.sh: --runtime-cap must be 0 or at least 60 seconds" >&2
     exit 1
 fi
@@ -1177,8 +1341,8 @@ start_watchdog() {
     [ "$WANT_EXPERIMENTAL" = 1 ] && set -- "$@" --experimental
     [ "$WANT_DIAGNOSTICS" = 1 ] && set -- "$@" --diagnostics
     [ -n "$COEXIST_PACE_US" ] && set -- "$@" "--pace-us=$COEXIST_PACE_US"
-    [ "$WD_DIAG_MAX_RUNTIME" -gt 0 ] &&
-        set -- "$@" "--runtime-cap=$WD_DIAG_MAX_RUNTIME"
+    [ "$WD_MAX_RUNTIME" -gt 0 ] &&
+        set -- "$@" "--runtime-cap=$WD_MAX_RUNTIME"
     nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
     echo "$!" > "$WD_PIDFILE"
     log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL diagnostics=$WANT_DIAGNOSTICS)"
@@ -1191,6 +1355,9 @@ case "$CMD" in
         ensure_chroot_works || exit 1
         cleanup_macos
         enable_experimental_if_requested
+        if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
+            production_preflight || { stop_all; exit 1; }
+        fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos || { stop_all; exit 1; }
         arm_initial_vnc_capture_if_requested
@@ -1210,6 +1377,9 @@ case "$CMD" in
         ensure_chroot_works || exit 1
         stop_all
         enable_experimental_if_requested
+        if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
+            production_preflight || { stop_all; exit 1; }
+        fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
         start_macos || { stop_all; exit 1; }
         arm_initial_vnc_capture_if_requested
@@ -1221,6 +1391,9 @@ case "$CMD" in
         ;;
     status)
         status
+        ;;
+    switches)
+        switch_status
         ;;
     watchdog)
         require_root "$@"

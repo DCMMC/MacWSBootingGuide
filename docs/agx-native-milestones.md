@@ -1969,3 +1969,24 @@ and after both validation runs.  This establishes the measurement boundary;
 the remaining short-run WindowServer CPU cost is explicitly still open.  The
 exact runtime lines, codegen evidence and thermal rule are recorded in
 [`debug-overhead-removal-20260729/README.md`](evidence/debug-overhead-removal-20260729/README.md).
+
+## 2026-07-30: native AGX becomes the audited one-click production default
+
+`macos_gui.sh production` now starts the coexistence Retina VNC stack with
+native AGX and the validated command/completion/input compatibility enabled by
+default. Plain `start` has the same default; `--experimental` remains a
+compatibility alias and `--no-experimental` is the explicit control. Production
+preflight clears every known diagnostic sentinel and bounded dump, rejects
+debug/allocator variables in launch plists, and verifies the native-AGX and VNC
+functional invariants before WindowServer is loaded.
+
+The new machine-readable inventory records 138 environment variables, files,
+sockets and artifacts with their exact production state. A source audit covers
+79 environment names and 39 source file gates and fails if a future switch is
+not recorded. The deployed profile runtime-confirmed every required flag on,
+all 33 diagnostic/A-B flags off, zero XPC trace lines, zero submit artifacts,
+nominal thermal state and a non-black 2388x1668 VNC frame. WindowServer still
+used roughly 45–53% of one core in the live idle sample, so transport and
+presentation cost remain open rather than being attributed to debug overhead.
+Exact commands, environments, counters and the measurement boundary are in
+[`production-profile-20260730/README.md`](evidence/production-profile-20260730/README.md).
