@@ -23,6 +23,7 @@ import vnc_live_click
 import vnc_native_input_test
 
 CURSOR_MASK_RADIUS = 32
+MIN_CHANGED_PIXELS = 2048
 
 
 def check_rect(width, height, rect, label):
@@ -172,6 +173,19 @@ def measured_action(sock, width, height, framebuffer, label, rect, masks,
     result["settled_changes"] = settled_changes
     result["changed_pixels_from_action_baseline"] = region_changed_pixels(
         baseline, framebuffer, width, rect, masks)
+    # A digest mismatch alone is too weak for this benchmark. Runtime A/Bs on
+    # 2026-07-29 showed a failed contextual click change only 492 pixels from
+    # cursor/caret activity while a real menu/hover/close changed 9k-264k and
+    # a real title drag changed 788k. Reject small incidental refreshes after
+    # the settle window so they cannot be reported as usable UI state.
+    if (result["passed"] and
+            result["changed_pixels_from_action_baseline"] <
+            MIN_CHANGED_PIXELS):
+        result["passed"] = False
+        result["rejected_small_change"] = True
+        result["latency_seconds"] = None
+    else:
+        result["rejected_small_change"] = False
     latency = result["latency_seconds"]
     latency_label = "MISS" if latency is None else f"{latency:.3f}s"
     print(
@@ -179,7 +193,9 @@ def measured_action(sock, width, height, framebuffer, label, rect, masks,
         f"operation={label} latency={latency_label} "
         f"readable={result['first_readable_seconds']} "
         f"receive={result['receive_seconds']:.3f}s "
-        f"updates={result['updates']}", flush=True)
+        f"updates={result['updates']} "
+        f"changed={result['changed_pixels_from_action_baseline']}",
+        flush=True)
     return result
 
 
@@ -199,18 +215,21 @@ def percentile(values, fraction):
 
 
 def main():
-    global CURSOR_MASK_RADIUS
+    global CURSOR_MASK_RADIUS, MIN_CHANGED_PIXELS
     parser = argparse.ArgumentParser()
     parser.add_argument("host")
     parser.add_argument("--port", type=int, default=5900)
-    parser.add_argument("--encoding", choices=("raw", "hextile"),
-                        default="raw")
+    parser.add_argument("--encoding", choices=("raw", "hextile", "zlib"),
+                        default="zlib")
     parser.add_argument("--timeout", type=float, default=6.0)
     parser.add_argument("--max-updates", type=int, default=16)
     parser.add_argument("--settle-seconds", type=float, default=0.35,
                         help="retain post-action incremental frames before "
                              "the next operation (default: 0.35)")
     parser.add_argument("--cursor-mask-radius", type=int, default=32)
+    parser.add_argument("--min-changed-pixels", type=int, default=2048,
+                        help="minimum non-cursor ROI pixels required for a "
+                             "PASS after settling (default: 2048)")
     parser.add_argument("--menu-click", nargs=2, type=int, default=(235, 20),
                         metavar=("X", "Y"))
     parser.add_argument("--menu-roi", nargs=4, type=int,
@@ -219,11 +238,31 @@ def main():
     parser.add_argument("--hover", nargs=2, type=int, action="append",
                         metavar=("X", "Y"),
                         help="menu hover point; repeat for a trajectory")
+    parser.add_argument("--menu-select", nargs=2, type=int,
+                        metavar=("X", "Y"),
+                        help="click this menu item after the hover trajectory "
+                             "instead of closing with Escape")
     parser.add_argument("--context-click", nargs=2, type=int,
                         default=(1000, 700), metavar=("X", "Y"))
     parser.add_argument("--context-roi", nargs=4, type=int,
                         default=(750, 450, 900, 900),
                         metavar=("X", "Y", "WIDTH", "HEIGHT"))
+    parser.add_argument("--context-hover", nargs=2, type=int,
+                        action="append", metavar=("X", "Y"),
+                        help="context-menu hover point; repeat for a "
+                             "trajectory before Escape closes the menu")
+    parser.add_argument("--context-select", nargs=2, type=int,
+                        metavar=("X", "Y"),
+                        help="click this context-menu item after the hover "
+                             "trajectory instead of closing with Escape")
+    parser.add_argument("--context-hold-seconds", type=float, default=0.04,
+                        help="client-side right-button hold before release "
+                             "(default: 0.04)")
+    parser.add_argument("--context-button-mask", type=int, choices=(2, 4),
+                        default=4,
+                        help="RFB button mask for contextual click; 4 is the "
+                             "protocol secondary button, 2 diagnoses legacy "
+                             "OSXvnc button swapping")
     parser.add_argument("--title-drag", nargs=4, type=int,
                         default=(1000, 185, 1250, 285),
                         metavar=("X1", "Y1", "X2", "Y2"))
@@ -237,10 +276,13 @@ def main():
     parser.add_argument("--skip-drag", action="store_true")
     args = parser.parse_args()
     CURSOR_MASK_RADIUS = args.cursor_mask_radius
+    MIN_CHANGED_PIXELS = args.min_changed_pixels
 
     if (args.timeout <= 0 or args.max_updates < 1 or
             args.settle_seconds < 0 or
-            args.cursor_mask_radius < 0):
+            args.context_hold_seconds < 0 or
+            args.cursor_mask_radius < 0 or
+            args.min_changed_pixels < 1):
         parser.error("timeout/max-updates must be positive and mask nonnegative")
     hover_points = args.hover or [
         (180, 65), (180, 115), (180, 150), (180, 200),
@@ -264,6 +306,8 @@ def main():
 
         if args.encoding == "hextile":
             vnc_live_click.configure_hextile(sock)
+        elif args.encoding == "zlib":
+            vnc_live_click.configure_zlib(sock)
         else:
             vnc_live_click.configure_raw(sock)
         vnc_live_click.request_update(sock, width, height, False)
@@ -317,10 +361,24 @@ def main():
                 save_snapshot(args.snapshots, f"hover-{index:02d}", width,
                               height, framebuffer)
 
-            result = measured_action(
-                sock, width, height, framebuffer, "menu-close", menu_rect,
-                (previous_point,), lambda: key(sock, 0xFF1B),
-                args.timeout, args.max_updates, args.settle_seconds)
+            if args.menu_select:
+                select_point = tuple(args.menu_select)
+                result = measured_action(
+                    sock, width, height, framebuffer, "menu-select",
+                    menu_rect, (previous_point, select_point),
+                    lambda: (pointer(sock, 1, select_point),
+                             time.sleep(0.04),
+                             pointer(sock, 0, select_point)),
+                    args.timeout, args.max_updates, args.settle_seconds)
+                save_snapshot(args.snapshots, "menu-select", width, height,
+                              framebuffer)
+            else:
+                result = measured_action(
+                    sock, width, height, framebuffer, "menu-close", menu_rect,
+                    (previous_point,), lambda: key(sock, 0xFF1B),
+                    args.timeout, args.max_updates, args.settle_seconds)
+                save_snapshot(args.snapshots, "menu-close", width, height,
+                              framebuffer)
             results.append(result)
 
         if not args.skip_context:
@@ -328,17 +386,49 @@ def main():
             result = measured_action(
                 sock, width, height, framebuffer, "context-menu", context_rect,
                 (context_point,),
-                lambda: (pointer(sock, 4, context_point), time.sleep(0.04),
+                lambda: (pointer(sock, args.context_button_mask,
+                                 context_point),
+                         time.sleep(args.context_hold_seconds),
                          pointer(sock, 0, context_point)),
                 args.timeout, args.max_updates, args.settle_seconds)
             results.append(result)
             save_snapshot(args.snapshots, "context-menu", width, height,
                           framebuffer)
 
-            result = measured_action(
-                sock, width, height, framebuffer, "context-close", context_rect,
-                (context_point,), lambda: key(sock, 0xFF1B),
-                args.timeout, args.max_updates, args.settle_seconds)
+            previous_point = context_point
+            for index, next_point in enumerate(args.context_hover or (), 1):
+                next_point = tuple(next_point)
+                result = measured_action(
+                    sock, width, height, framebuffer,
+                    f"context-hover-{index}", context_rect,
+                    (previous_point, next_point),
+                    lambda point=next_point: pointer(sock, 0, point),
+                    args.timeout, args.max_updates, args.settle_seconds)
+                results.append(result)
+                previous_point = next_point
+                save_snapshot(args.snapshots,
+                              f"context-hover-{index:02d}", width,
+                              height, framebuffer)
+
+            if args.context_select:
+                select_point = tuple(args.context_select)
+                result = measured_action(
+                    sock, width, height, framebuffer, "context-select",
+                    context_rect, (previous_point, select_point),
+                    lambda: (pointer(sock, 1, select_point),
+                             time.sleep(0.04),
+                             pointer(sock, 0, select_point)),
+                    args.timeout, args.max_updates, args.settle_seconds)
+                save_snapshot(args.snapshots, "context-select", width, height,
+                              framebuffer)
+            else:
+                result = measured_action(
+                    sock, width, height, framebuffer, "context-close",
+                    context_rect, (previous_point,),
+                    lambda: key(sock, 0xFF1B),
+                    args.timeout, args.max_updates, args.settle_seconds)
+                save_snapshot(args.snapshots, "context-close", width, height,
+                              framebuffer)
             results.append(result)
 
         if not args.skip_drag:
@@ -362,6 +452,7 @@ def main():
             "width": width,
             "height": height,
             "encoding": args.encoding,
+            "min_changed_pixels": args.min_changed_pixels,
             "passed": passed,
             "total": len(results),
             "missed": len(results) - passed,

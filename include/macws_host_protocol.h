@@ -29,6 +29,39 @@ enum {
     // in one datagram prevents an accepted mouse-up from being separated from
     // a failed mouse-down when a local AF_UNIX queue is under pressure.
     MacWSInputKindTap = 6,
+    // Refresh macwsinputd's unique AppKit hover owner without creating an
+    // NSEvent.  OSXvnc sends this after its native pointer path has updated
+    // WindowServer's global cursor/application state; the following hover can
+    // then supplement AppKit menu tracking in that one selected process.
+    MacWSInputKindTargetProbe = 7,
+    // Control-plane records used only for a real VNC button-down. The producer
+    // sends ActivateTarget after receiving that user packet but immediately
+    // before posting its native down, so the broker can resolve the still-
+    // responsive target even when the down enters a synchronous menu tracker.
+    // The broker deactivates every other endpoint and activates the selected
+    // endpoint. Neither control record constructs an NSEvent.
+    MacWSInputKindActivateTarget = 8,
+    MacWSInputKindDeactivateApplication = 9,
+    // A button-free pointer update during a native menu lifecycle. macOS
+    // 13.4's NSCarbonMenuImpl ultimately waits in NSApplication's NSEvent
+    // queue through _NSHLTBMenuEventProc, so this kind lets the selected app
+    // feed that queue from its socket thread while the main thread is inside
+    // the synchronous menu tracker. It remains distinct from normal-window
+    // hover so the route is bounded to an actual menu candidate lifetime.
+    MacWSInputKindMenuHover = 10,
+    // OSXvnc's own key-table/state machine has already translated the RFB
+    // keysym when these records are emitted.  For key records, pressure is
+    // the translated 16-bit CGKeyCode, contactID is the original 32-bit RFB
+    // keysym, and sceneID's low 32 bits carry NSEvent/CG modifier flags.  The
+    // record size stays unchanged so native-host pointer ABI v3 remains
+    // compatible.
+    MacWSInputKindKeyDown = 11,
+    MacWSInputKindKeyUp = 12,
+    // A complete stationary secondary-button gesture. Like Tap, the pair is
+    // transported in one datagram and materialized inside the selected
+    // AppKit process, so a fast RFB release cannot overtake its down before
+    // rightMouseDown enters the native contextual-menu tracker.
+    MacWSInputKindSecondaryTap = 13,
 };
 
 // Versioned wire record for the iOS-host -> macOS event bridge.
@@ -67,6 +100,12 @@ enum {
     MacWSInputTargetHit = 1u << 0,
     MacWSInputTargetApplicationActive = 1u << 1,
     MacWSInputTargetKeyWindow = 1u << 2,
+    // The global menu bar and application-owned transient surfaces follow
+    // Process Manager's front UI process, which can diverge from
+    // NSApplication.isActive when the chroot misses a LaunchServices
+    // lifecycle update.  This flag is observational and lets the broker
+    // request a real activation transaction when that divergence exists.
+    MacWSInputTargetFrontUIProcess = 1u << 3,
 };
 
 typedef struct __attribute__((packed)) {

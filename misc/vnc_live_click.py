@@ -31,6 +31,14 @@ def configure_encoding(sock, encoding):
     sock.sendall(b"\x00\x00\x00\x00" + pixel_format)
     sock.sendall(struct.pack(
         ">BBHi", 2, 0, 1, encoding_numbers[encoding]))
+    # A zlib stream belongs to one RFB client connection. File descriptors are
+    # routinely reused by the benchmark process, so retaining the decoder by
+    # fd across configure/connect cycles feeds a new stream into stale zlib
+    # state and makes otherwise valid rectangles undecodable.
+    if encoding == "zlib":
+        _zlib_decoders[sock.fileno()] = zlib.decompressobj()
+    else:
+        _zlib_decoders.pop(sock.fileno(), None)
 
 
 def configure_raw(sock):

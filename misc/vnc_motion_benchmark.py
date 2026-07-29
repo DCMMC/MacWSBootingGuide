@@ -101,6 +101,30 @@ def trajectory_point(start, end, progress):
     )
 
 
+def rectangle_pixels_in_roi(rectangles, roi):
+    """Cheap wire-level damage area for latency tests.
+
+    This intentionally measures transmitted rectangle coverage rather than
+    comparing every framebuffer pixel.  The latter takes ~1.5 seconds for the
+    1500x1500 test ROI in CPython and, if performed before the next incremental
+    request, turns the test client itself into the RFB frame-rate limiter.
+    """
+    roi_x, roi_y, roi_width, roi_height = roi
+    roi_x2 = roi_x + roi_width
+    roi_y2 = roi_y + roi_height
+    pixels = 0
+    for x, y, width, height, encoding in rectangles:
+        if encoding in (-223, -224):
+            continue
+        x1 = max(x, roi_x)
+        y1 = max(y, roi_y)
+        x2 = min(x + width, roi_x2)
+        y2 = min(y + height, roi_y2)
+        if x2 > x1 and y2 > y1:
+            pixels += (x2 - x1) * (y2 - y1)
+    return pixels
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("host")
@@ -128,6 +152,10 @@ def main():
     parser.add_argument("--pipeline-requests", action="store_true",
                         help="send an incremental request with each motion "
                              "event instead of waiting for client decode")
+    parser.add_argument("--fast-wire", action="store_true",
+                        help="classify meaningful updates by transmitted ROI "
+                             "area, avoiding a per-pixel CPython scan in the "
+                             "RFB request hot path")
     parser.add_argument("--snapshot")
     parser.add_argument("--json")
     parser.add_argument("--escape-at-end", action="store_true")
@@ -235,20 +263,28 @@ def main():
             received = time.monotonic()
             update_times.append(received)
             rectangles_seen += len(rectangles)
-            with state_lock:
-                masks = tuple(recent_points)
-            changed_pixels = region_changed_pixels(
-                prior_frame, framebuffer, width, roi, masks,
-                args.cursor_mask_radius)
-            changed_pixel_counts.append(changed_pixels)
-            digest = region_digest(
-                framebuffer, width, roi, masks, args.cursor_mask_radius)
-            digests.add(digest)
-            if changed_pixels >= args.meaningful_pixels:
-                meaningful_times.append(received)
-            prior_frame = bytes(framebuffer)
+            # Keep one incremental request outstanding before doing any local
+            # classification. Runtime client-message tracing on 2026-07-29
+            # showed that the old order delayed type-3 requests by ~1.49 s:
+            # region_changed_pixels scanned 2.25 million pixels in Python
+            # while the server correctly waited for the next RFB request.
             if time.monotonic() < receive_deadline:
                 send(update_message(width, height, True))
+            with state_lock:
+                masks = tuple(recent_points)
+            changed_pixels = (rectangle_pixels_in_roi(rectangles, roi)
+                              if args.fast_wire else region_changed_pixels(
+                                  prior_frame, framebuffer, width, roi, masks,
+                                  args.cursor_mask_radius))
+            changed_pixel_counts.append(changed_pixels)
+            if not args.fast_wire:
+                digest = region_digest(
+                    framebuffer, width, roi, masks, args.cursor_mask_radius)
+                digests.add(digest)
+            if changed_pixels >= args.meaningful_pixels:
+                meaningful_times.append(received)
+            if not args.fast_wire:
+                prior_frame = bytes(framebuffer)
 
         thread.join(timeout=max(1.0, args.timeout))
         if thread.is_alive():
@@ -275,12 +311,15 @@ def main():
             "settle_seconds": args.settle_seconds,
             "requested_hz": args.hz,
             "pipelined_requests": args.pipeline_requests,
+            "classification": ("transmitted_roi_area" if args.fast_wire
+                               else "changed_framebuffer_pixels"),
             "sent_events": sent_events,
             "framebuffer_updates": len(update_times),
             "update_fps": len(update_times) / observation_seconds,
             "meaningful_updates": len(meaningful_times),
             "meaningful_fps": len(meaningful_times) / observation_seconds,
-            "unique_masked_roi_frames": len(digests),
+            "unique_masked_roi_frames": (None if args.fast_wire
+                                         else len(digests)),
             "rectangles_seen": rectangles_seen,
             "receive_seconds": receive_seconds,
             "first_update_seconds": (update_times[0] - measurement_started)
@@ -298,8 +337,9 @@ def main():
             if changed_pixel_counts else 0,
             "changed_pixels_max": max(changed_pixel_counts)
             if changed_pixel_counts else 0,
-            "changed_pixels_from_baseline": region_changed_pixels(
-                baseline, framebuffer, width, roi, (), 0),
+            "changed_pixels_from_baseline": (None if args.fast_wire else
+                region_changed_pixels(
+                    baseline, framebuffer, width, roi, (), 0)),
             "initial_rectangles": initial_rectangles,
         }
         print(

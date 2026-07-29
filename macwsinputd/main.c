@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/file.h>
@@ -58,9 +59,12 @@ extern bool CGRectMakeWithDictionaryRepresentation(CFDictionaryRef dictionary,
 enum {
     MacWSCGEventLeftMouseDown = 1,
     MacWSCGEventLeftMouseUp = 2,
+    MacWSCGEventRightMouseDown = 3,
+    MacWSCGEventRightMouseUp = 4,
     MacWSCGEventMouseMoved = 5,
     MacWSCGEventLeftMouseDragged = 6,
     MacWSCGMouseButtonLeft = 0,
+    MacWSCGMouseButtonRight = 1,
     MacWSCGHIDEventTap = 0,
     MacWSCGMouseEventClickState = 1,
     MacWSCGMouseEventButtonNumber = 3,
@@ -80,9 +84,22 @@ static volatile sig_atomic_t TargetSocketFD = -1;
 static uint64_t LastCaptureGeneration;
 static uint64_t TargetProbeNonce;
 
+static bool RuntimeDiagnosticsEnabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
+            access("/tmp/macws_runtime_diagnostics", F_OK) == 0;
+    }
+    return cached != 0;
+}
+
 typedef struct {
     pid_t pid;
     int32_t windowID;
+    bool selectedWasActive;
+    bool selectedWasFrontUIProcess;
+    bool competingActiveOwner;
+    bool responseIncomplete;
 } MacWSWindowTarget;
 
 static void HandleSignal(int signalNumber) {
@@ -107,6 +124,13 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindTouchCancel: return "cancel";
         case MacWSInputKindHover: return "hover";
         case MacWSInputKindTap: return "tap";
+        case MacWSInputKindTargetProbe: return "target-probe";
+        case MacWSInputKindActivateTarget: return "activate-target";
+        case MacWSInputKindDeactivateApplication: return "deactivate-app";
+        case MacWSInputKindMenuHover: return "menu-hover";
+        case MacWSInputKindKeyDown: return "key-down";
+        case MacWSInputKindKeyUp: return "key-up";
+        case MacWSInputKindSecondaryTap: return "secondary-tap";
     }
     return "invalid";
 }
@@ -122,7 +146,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return false;
     }
     return record->kind >= MacWSInputKindTouchDown &&
-           record->kind <= MacWSInputKindTap;
+           record->kind <= MacWSInputKindSecondaryTap;
 }
 
 static CGPoint QuartzPointForRecord(const MacWSInputRecord *record,
@@ -151,9 +175,19 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
             *buttonDown = false;
             return MacWSCGEventLeftMouseUp;
         case MacWSInputKindHover:
+        case MacWSInputKindMenuHover:
             return MacWSCGEventMouseMoved;
         case MacWSInputKindTap:
             return MacWSCGEventLeftMouseDown;
+        case MacWSInputKindSecondaryTap:
+            return MacWSCGEventRightMouseDown;
+        case MacWSInputKindTargetProbe:
+        case MacWSInputKindActivateTarget:
+        case MacWSInputKindDeactivateApplication:
+        case MacWSInputKindKeyDown:
+        case MacWSInputKindKeyUp:
+            // Consumed before event construction in main().
+            return 0;
     }
     return 0;
 }
@@ -188,7 +222,7 @@ static bool PointInRect(CGPoint point, CGRect rect) {
 static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
     MacWSWindowTarget target = {0};
     static unsigned probeCount;
-    bool logProbe = probeCount++ < 2;
+    bool logProbe = RuntimeDiagnosticsEnabled() && probeCount++ < 2;
     CFArrayRef windows = CGWindowListCopyWindowInfo(
         MacWSCGWindowListOptionOnScreenOnly |
             MacWSCGWindowListExcludeDesktopElements,
@@ -274,7 +308,8 @@ static bool SendToAppInputBridge(int socketFD,
         return false;
     }
     bool continuous = record->kind == MacWSInputKindTouchMove ||
-                      record->kind == MacWSInputKindHover;
+                      record->kind == MacWSInputKindHover ||
+                      record->kind == MacWSInputKindMenuHover;
     unsigned attempts = continuous ? 1 : 8;
     ssize_t sent = -1;
     int savedError = 0;
@@ -289,6 +324,35 @@ static bool SendToAppInputBridge(int socketFD,
     if (errorOut) *errorOut = sent == (ssize_t)sizeof(*record)
         ? 0 : savedError;
     return sent == (ssize_t)sizeof(*record);
+}
+
+static size_t AppInputBridgePIDs(pid_t *pids, size_t capacity);
+
+// The normal Workspace activation broadcast is absent in the chroot. A real
+// native click can consequently leave both the old and new NSApplication
+// reporting isActive=YES; runtime target replies then become ambiguous and the
+// visible global menu bar remains owned by the old app. Send control records,
+// never NSEvents, to make every non-target endpoint resign before the selected
+// endpoint receives its matching activation control.
+static size_t DeactivateOtherAppInputBridges(
+        int socketFD, pid_t targetPID, const MacWSInputRecord *source) {
+    pid_t pids[64] = {0};
+    size_t discovered = AppInputBridgePIDs(pids, 64);
+    size_t count = discovered < 64 ? discovered : 64;
+    size_t sentCount = 0;
+    for (size_t index = 0; index < count; index++) {
+        if (pids[index] <= 1 || pids[index] == targetPID) continue;
+        MacWSInputRecord control = *source;
+        control.kind = MacWSInputKindDeactivateApplication;
+        control.targetPID = pids[index];
+        int error = 0;
+        bool sent = SendToAppInputBridge(socketFD, &control, &error);
+        if (sent) sentCount++;
+        else fprintf(stderr,
+                "MACWS-INPUT ACTIVATE deactivate-send pid=%d errno=%d\n",
+                pids[index], error);
+    }
+    return sentCount;
 }
 
 static size_t AppInputBridgePIDs(pid_t *pids, size_t capacity) {
@@ -344,6 +408,8 @@ static bool PIDInList(pid_t pid, const pid_t *pids, size_t count) {
 static MacWSWindowTarget ProbeAppInputTarget(
         int targetSocketFD, const MacWSInputRecord *record) {
     MacWSWindowTarget target = {0};
+    MacWSWindowTarget activeTarget = {0};
+    MacWSWindowTarget frontTarget = {0};
     if (targetSocketFD < 0 || record->frameWidth == 0 ||
         record->frameHeight == 0) return target;
 
@@ -389,6 +455,8 @@ static MacWSWindowTarget ProbeAppInputTarget(
     size_t replies = 0;
     int bestScore = -1;
     bool ambiguous = false;
+    bool activeAmbiguous = false;
+    bool frontAmbiguous = false;
     while (replies < sentCount) {
         uint64_t now = RealtimeNanoseconds();
         if (now >= deadline) break;
@@ -412,21 +480,48 @@ static MacWSWindowTarget ProbeAppInputTarget(
         }
         replies++;
         static unsigned replyLogs;
-        if (replyLogs++ < 48) {
+        if (RuntimeDiagnosticsEnabled() && replyLogs++ < 48) {
             fprintf(stderr,
                     "MACWS-INPUT TARGET-REPLY nonce=%llu pid=%d window=%d "
                     "flags=%#x\n",
                     (unsigned long long)nonce, reply.pid,
                     reply.windowNumber, reply.flags);
         }
+        if (reply.flags & MacWSInputTargetApplicationActive) {
+            if (activeTarget.pid <= 1) {
+                activeTarget.pid = (pid_t)reply.pid;
+                activeTarget.windowID = reply.windowNumber;
+                activeTarget.selectedWasActive = true;
+                activeTarget.selectedWasFrontUIProcess =
+                    (reply.flags & MacWSInputTargetFrontUIProcess) != 0;
+            } else if (activeTarget.pid != reply.pid) {
+                activeAmbiguous = true;
+            }
+        }
+        if (reply.flags & MacWSInputTargetFrontUIProcess) {
+            if (frontTarget.pid <= 1) {
+                frontTarget.pid = (pid_t)reply.pid;
+                frontTarget.windowID = reply.windowNumber;
+                frontTarget.selectedWasActive =
+                    (reply.flags & MacWSInputTargetApplicationActive) != 0;
+                frontTarget.selectedWasFrontUIProcess = true;
+            } else if (frontTarget.pid != reply.pid) {
+                frontAmbiguous = true;
+            }
+        }
         if (!(reply.flags & MacWSInputTargetHit)) continue;
         int score = 0;
+        if (reply.flags & MacWSInputTargetFrontUIProcess) score += 4;
         if (reply.flags & MacWSInputTargetApplicationActive) score += 2;
         if (reply.flags & MacWSInputTargetKeyWindow) score += 1;
         if (score > bestScore) {
             bestScore = score;
             target.pid = (pid_t)reply.pid;
             target.windowID = reply.windowNumber;
+            target.selectedWasActive =
+                (reply.flags & MacWSInputTargetApplicationActive) != 0;
+            target.selectedWasFrontUIProcess =
+                (reply.flags & MacWSInputTargetFrontUIProcess) != 0;
             ambiguous = false;
         } else if (score == bestScore && target.pid != reply.pid) {
             ambiguous = true;
@@ -437,17 +532,106 @@ static MacWSWindowTarget ProbeAppInputTarget(
     // from an unresponsive front app.
     if (ambiguous || (replies < sentCount && bestScore < 2))
         target = (MacWSWindowTarget){0};
+    // Menu-bar and contextual-menu presentation surfaces are not ordinary
+    // ordered NSWindows.  Use the unique application whose real AppKit state
+    // reports active when no authoritative window hit exists.  Ordinary
+    // click/down routing retains the stricter hit rule; the sole exception is
+    // an ActivateTarget control in the physical top 4% of the framebuffer.
+    // Runtime evidence at 2388x1668 showed the native menu-bar down at y=20
+    // returning no hit from either AppKit endpoint and being dropped as PID 0,
+    // even though Terminal was the unique active owner.  This control record
+    // carries no NSEvent and therefore only repairs ownership; OSXvnc still
+    // delivers the real native menu click.
+    bool systemMenuActivation =
+        record->kind == MacWSInputKindActivateTarget &&
+        record->frameHeight > 0 &&
+        record->y >= 0.0f &&
+        record->y <= (float)record->frameHeight * 0.04f;
+    bool allowActiveFallback =
+        record->kind == MacWSInputKindTargetProbe ||
+        record->kind == MacWSInputKindHover ||
+        record->kind == MacWSInputKindMenuHover ||
+        record->kind == MacWSInputKindKeyDown ||
+        record->kind == MacWSInputKindKeyUp ||
+        systemMenuActivation;
+    if (target.pid <= 1 && allowActiveFallback) {
+        if (!frontAmbiguous && frontTarget.pid > 1) {
+            target = frontTarget;
+        } else if (!activeAmbiguous && activeTarget.pid > 1) {
+            target = activeTarget;
+        }
+    }
+    if (target.pid > 1) {
+        target.competingActiveOwner = activeAmbiguous;
+        // A native click may make the hit application active before a covered
+        // application drains its main-thread target probe.  Runtime evidence
+        // from a Terminal-over-GlassDemo switch showed nonce 1 receiving only
+        // Terminal within the bounded 150-ms probe, followed immediately by
+        // nonce 2 receiving both endpoints and reporting two active owners.
+        // Treat an unanswered live endpoint as unresolved activation state;
+        // the activation transaction will resign every non-target endpoint
+        // and rebuild the selected application's real AppKit lifecycle.
+        target.responseIncomplete = replies < sentCount;
+    }
     static unsigned resultLogs;
-    if (resultLogs++ < 32) {
+    if (RuntimeDiagnosticsEnabled() && resultLogs++ < 32) {
         fprintf(stderr,
                 "MACWS-INPUT TARGET-PROBE nonce=%llu endpoints=%zu sent=%zu "
-                "replies=%zu selected=%d window=%d score=%d ambiguous=%s\n",
+                "replies=%zu selected=%d window=%d score=%d "
+                "selected-active=%s selected-front=%s "
+                "competing-active=%s incomplete=%s ambiguous=%s "
+                "system-menu=%s\n",
                 (unsigned long long)nonce, pidCount, sentCount, replies,
                 target.pid, target.windowID, bestScore,
-                ambiguous ? "YES" : "NO");
+                target.selectedWasActive ? "YES" : "NO",
+                target.selectedWasFrontUIProcess ? "YES" : "NO",
+                target.competingActiveOwner ? "YES" : "NO",
+                target.responseIncomplete ? "YES" : "NO",
+                (ambiguous || activeAmbiguous || frontAmbiguous)
+                    ? "YES" : "NO",
+                systemMenuActivation ? "YES" : "NO");
         fflush(stderr);
     }
     return target;
+}
+
+// A native OSXvnc button-down is delivered before this control record.  The
+// target AppKit main thread can therefore be inside its synchronous mouseDown
+// dispatch while the first target probe is drained.  Runtime evidence from a
+// Terminal-over-GlassDemo switch showed nonce 7 receiving only Terminal with
+// no authoritative hit, followed immediately by nonce 8 receiving both live
+// endpoints and the correct Terminal hit.  Retry only the button-triggered
+// activation query; periodic hover probes must never activate an application.
+static MacWSWindowTarget ProbeActivationTarget(
+        int targetSocketFD, const MacWSInputRecord *record) {
+    MacWSWindowTarget first = ProbeAppInputTarget(targetSocketFD, record);
+    if (first.pid > 1 && !first.responseIncomplete) return first;
+
+    usleep(10000);
+    MacWSWindowTarget second = ProbeAppInputTarget(targetSocketFD, record);
+    if (second.pid > 1) {
+        if (RuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "MACWS-INPUT ACTIVATE-PROBE-RETRY first=%d incomplete=%s "
+                "second=%d competing=%s\n",
+                first.pid, first.responseIncomplete ? "YES" : "NO",
+                second.pid,
+                second.competingActiveOwner ? "YES" : "NO");
+        fflush(stderr);
+        }
+        return second;
+    }
+    if (first.pid > 1) {
+        if (RuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "MACWS-INPUT ACTIVATE-PROBE-RETRY first=%d incomplete=%s "
+                "second=0 preserve-first=YES\n",
+                first.pid, first.responseIncomplete ? "YES" : "NO");
+        fflush(stderr);
+        }
+        return first;
+    }
+    return second;
 }
 
 // Arm one diagnostic capture for a completed gesture. Continuous PF80/PF115
@@ -564,6 +748,12 @@ int main(void) {
     uint64_t sequence = 0;
     bool buttonDown = false;
     MacWSWindowTarget gestureTarget = {0};
+    MacWSWindowTarget hoverTarget = {0};
+    // A native menu enters a synchronous event loop in the selected process,
+    // so later target probes cannot be serviced until the menu closes.  Keep
+    // the authoritative target resolved for the real button-down; OSXvnc only
+    // emits MenuHover during its bounded native-menu candidate lifetime.
+    MacWSWindowTarget menuTarget = {0};
     while (!StopRequested) {
         MacWSInputRecord record = {0};
         ssize_t received = recv(socketFD, &record, sizeof(record), 0);
@@ -578,8 +768,14 @@ int main(void) {
         }
         if (received != (ssize_t)sizeof(record) || !RecordIsValid(&record)) {
             fprintf(stderr,
-                    "MACWS-INPUT REJECT bytes=%zd magic=%#x version=%u kind=%u\n",
-                    received, record.magic, record.version, record.kind);
+                    "MACWS-INPUT REJECT bytes=%zd magic=%#x version=%u "
+                    "kind=%u point=(%.3f,%.3f) frame=%ux%u target=%d "
+                    "finite=%s\n",
+                    received, record.magic, record.version, record.kind,
+                    record.x, record.y, record.frameWidth,
+                    record.frameHeight, record.targetPID,
+                    (isfinite(record.x) && isfinite(record.y))
+                        ? "YES" : "NO");
             fflush(stderr);
             continue;
         }
@@ -590,12 +786,14 @@ int main(void) {
         if (sequence == 0 || bounds.size.width <= 0.0 ||
             bounds.size.height <= 0.0 || (sequence % 120) == 0) {
             ReadDisplayGeometry(&display, &bounds, &pixelWidth, &pixelHeight);
-            fprintf(stderr,
-                    "MACWS-INPUT DISPLAY display=%u bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu\n",
-                    display, bounds.origin.x, bounds.origin.y,
-                    bounds.size.width, bounds.size.height,
-                    pixelWidth, pixelHeight);
-            fflush(stderr);
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                        "MACWS-INPUT DISPLAY display=%u bounds=(%.0f,%.0f %.0fx%.0f) pixels=%zux%zu\n",
+                        display, bounds.origin.x, bounds.origin.y,
+                        bounds.size.width, bounds.size.height,
+                        pixelWidth, pixelHeight);
+                fflush(stderr);
+            }
         }
         if (bounds.size.width <= 0.0 || bounds.size.height <= 0.0) {
             fprintf(stderr,
@@ -608,9 +806,55 @@ int main(void) {
         }
 
         CGPoint point = QuartzPointForRecord(&record, bounds);
+        if (record.kind == MacWSInputKindTargetProbe) {
+            hoverTarget = ProbeAppInputTarget(targetSocketFD, &record);
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                        "MACWS-INPUT HOVER-OWNER seq=%llu pid=%d window=%d "
+                        "frame=(%.2f,%.2f)/%ux%u quartz=(%.2f,%.2f)\n",
+                        (unsigned long long)sequence,
+                        hoverTarget.pid, hoverTarget.windowID,
+                        record.x, record.y, record.frameWidth,
+                        record.frameHeight, point.x, point.y);
+                fflush(stderr);
+            }
+            continue;
+        }
         CGEventType eventType = EventTypeForRecord(&record, &buttonDown);
         MacWSWindowTarget eventTarget = {0};
-        if (record.kind != MacWSInputKindHover &&
+        bool keyRecord = record.kind == MacWSInputKindKeyDown ||
+                         record.kind == MacWSInputKindKeyUp;
+        if (keyRecord && menuTarget.pid > 1) {
+            // ActivateTarget is resolved before the authoritative native
+            // mouse-down and remains the front application target after the
+            // menu candidate ends.  Keyboard focus follows that application,
+            // including while its AppKit main thread is inside a nested menu
+            // loop and cannot answer another target probe.
+            eventTarget = menuTarget;
+        } else if (record.kind == MacWSInputKindSecondaryTap &&
+                   menuTarget.pid > 1) {
+            // OSXvnc resolves and activates the hit owner on right-button
+            // down, then emits the atomic tap on release. Reuse that exact
+            // owner instead of starting a second main-thread probe just as
+            // the application is about to enter its contextual-menu loop.
+            eventTarget = menuTarget;
+        } else if (keyRecord && hoverTarget.pid > 1) {
+            eventTarget = hoverTarget;
+        } else if (record.kind == MacWSInputKindMenuHover &&
+            menuTarget.pid > 1) {
+            eventTarget = menuTarget;
+        } else if ((record.kind == MacWSInputKindHover ||
+                    record.kind == MacWSInputKindMenuHover) &&
+            hoverTarget.pid > 1) {
+            eventTarget = hoverTarget;
+        } else if (record.kind == MacWSInputKindActivateTarget) {
+            // Window content requires an authoritative hit.  The target probe
+            // itself recognizes the system menu-bar surface, which has no
+            // ordinary NSWindow, and may select its unique active owner.
+            eventTarget = ProbeActivationTarget(targetSocketFD, &record);
+        } else if (record.kind != MacWSInputKindHover &&
+            record.kind != MacWSInputKindMenuHover &&
             record.kind != MacWSInputKindTap && gestureTarget.pid > 1) {
             eventTarget = gestureTarget;
         } else if (record.targetPID > 1) {
@@ -621,8 +865,17 @@ int main(void) {
             eventTarget = WindowTargetAtPoint(point);
             if (eventTarget.pid <= 1) {
                 if (record.kind == MacWSInputKindTouchDown ||
-                    record.kind == MacWSInputKindTap) {
+                    record.kind == MacWSInputKindTap ||
+                    record.kind == MacWSInputKindSecondaryTap || keyRecord) {
                     eventTarget = ProbeAppInputTarget(targetSocketFD, &record);
+                } else if ((record.kind == MacWSInputKindHover ||
+                            record.kind == MacWSInputKindMenuHover) &&
+                           hoverTarget.pid <= 1) {
+                    // Recover if the cached endpoint exited between periodic
+                    // target refreshes. Probe records themselves never enter
+                    // an application's event stream.
+                    eventTarget = ProbeAppInputTarget(targetSocketFD, &record);
+                    hoverTarget = eventTarget;
                 }
             }
             if (eventTarget.pid <= 1) {
@@ -631,6 +884,8 @@ int main(void) {
             if (record.kind == MacWSInputKindTouchDown)
                 gestureTarget = eventTarget;
         }
+        if (record.kind == MacWSInputKindActivateTarget)
+            menuTarget = eventTarget;
         uint64_t captureGeneration = ArmCaptureForInput(&record);
         // WindowTargetAtPoint resolves targetPID=0 producers (including RFB)
         // to an actual layer-zero AppKit window. Send that resolved PID on the
@@ -638,24 +893,100 @@ int main(void) {
         // SendToAppInputBridge reject it before sendto(2).
         MacWSInputRecord routedRecord = record;
         routedRecord.targetPID = eventTarget.pid;
+        size_t deactivated = 0;
+        bool activationRepairNeeded =
+            record.kind == MacWSInputKindActivateTarget &&
+            eventTarget.pid > 1 &&
+            (!eventTarget.selectedWasActive ||
+             !eventTarget.selectedWasFrontUIProcess ||
+             eventTarget.competingActiveOwner ||
+             eventTarget.responseIncomplete);
+        // A freshly launched application can visibly own the system menu bar
+        // while HIToolbox's long-lived menu presentation has not recalculated
+        // its root menu under that ownership.  A top-bar down therefore needs
+        // a control-plane preflight even when the target already reports both
+        // active and front.  The target process runs its real SetRootMenu /
+        // RecalcBar path before OSXvnc posts the native down; no mouse NSEvent
+        // is synthesized here.  Do not deactivate other applications for this
+        // already-consistent case.
+        bool systemMenuPreflightNeeded =
+            record.kind == MacWSInputKindActivateTarget &&
+            eventTarget.pid > 1 && record.frameHeight > 0 &&
+            record.y >= 0.0f &&
+            record.y <= (float)record.frameHeight * 0.04f;
+        if (activationRepairNeeded) {
+            deactivated = DeactivateOtherAppInputBridges(
+                socketFD, eventTarget.pid, &record);
+        }
         int appBridgeError = 0;
-        bool appBridgeSent = SendToAppInputBridge(socketFD, &routedRecord,
-                                                  &appBridgeError);
+        bool appBridgeAttempted =
+            record.kind != MacWSInputKindActivateTarget ||
+            activationRepairNeeded || systemMenuPreflightNeeded;
+        bool appBridgeSent = appBridgeAttempted &&
+            SendToAppInputBridge(socketFD, &routedRecord, &appBridgeError);
+        if ((record.kind == MacWSInputKindHover ||
+             record.kind == MacWSInputKindMenuHover) &&
+            !appBridgeSent &&
+            eventTarget.pid == hoverTarget.pid) {
+            hoverTarget = (MacWSWindowTarget){0};
+        }
+        if (record.kind == MacWSInputKindMenuHover &&
+            !appBridgeSent && eventTarget.pid == menuTarget.pid) {
+            menuTarget = (MacWSWindowTarget){0};
+        }
+        if (record.kind == MacWSInputKindActivateTarget ||
+            record.kind == MacWSInputKindDeactivateApplication) {
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) fprintf(stderr,
+                    "MACWS-INPUT ACTIVATE seq=%llu kind=%s target=%d "
+                    "window=%d repair=%s menu-preflight=%s deactivated=%zu "
+                    "sent=%s errno=%d\n",
+                    (unsigned long long)sequence,
+                    KindName((MacWSInputKind)record.kind),
+                    eventTarget.pid, eventTarget.windowID,
+                    activationRepairNeeded ? "YES" : "NO",
+                    systemMenuPreflightNeeded ? "YES" : "NO", deactivated,
+                    !appBridgeAttempted ? "SKIPPED" :
+                        (appBridgeSent ? "YES" : "NO"), appBridgeError);
+            if (RuntimeDiagnosticsEnabled()) fflush(stderr);
+            continue;
+        }
+        if (keyRecord) {
+            // The chroot's global CG keyboard route is the failed transport
+            // that this record replaces.  A key is meaningful only inside an
+            // AppKit application, so never reinterpret eventType=0 as a mouse
+            // event when target selection or the per-app socket is absent.
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) fprintf(stderr,
+                    "MACWS-INPUT KEY seq=%llu kind=%s target=%d "
+                    "keycode=%.0f keysym=%#x modifiers=%#llx sent=%s errno=%d\n",
+                    (unsigned long long)sequence,
+                    KindName((MacWSInputKind)record.kind), eventTarget.pid,
+                    record.pressure, record.contactID,
+                    (unsigned long long)(record.sceneID & 0xffffffffull),
+                    appBridgeSent ? "YES" : "NO", appBridgeError);
+            if (RuntimeDiagnosticsEnabled()) fflush(stderr);
+            continue;
+        }
+        CGMouseButton mouseButton =
+            record.kind == MacWSInputKindSecondaryTap
+                ? MacWSCGMouseButtonRight : MacWSCGMouseButtonLeft;
         CGEventRef event = appBridgeSent ? NULL :
-            CGEventCreateMouseEvent(NULL, eventType, point,
-                                    MacWSCGMouseButtonLeft);
+            CGEventCreateMouseEvent(NULL, eventType, point, mouseButton);
         bool created = event != NULL;
         CGPoint observed = {-1.0, -1.0};
         bool observedCursor = false;
         unsigned cursorSamples = 0;
         if (event) {
             if (eventType == MacWSCGEventLeftMouseDown ||
-                eventType == MacWSCGEventLeftMouseUp) {
+                eventType == MacWSCGEventLeftMouseUp ||
+                eventType == MacWSCGEventRightMouseDown ||
+                eventType == MacWSCGEventRightMouseUp) {
                 CGEventSetIntegerValueField(event,
                     MacWSCGMouseEventClickState, 1);
             }
             CGEventSetIntegerValueField(event,
-                MacWSCGMouseEventButtonNumber, MacWSCGMouseButtonLeft);
+                MacWSCGMouseEventButtonNumber, mouseButton);
             if (eventTarget.pid > 1) {
                 if (eventTarget.windowID > 0) {
                     CGEventSetIntegerValueField(event,
@@ -670,16 +1001,20 @@ int main(void) {
                 CGEventPost(MacWSCGHIDEventTap, event);
             }
             CFRelease(event);
-            if (record.kind == MacWSInputKindTap) {
+            if (record.kind == MacWSInputKindTap ||
+                record.kind == MacWSInputKindSecondaryTap) {
                 CGEventRef upEvent = CGEventCreateMouseEvent(
-                    NULL, MacWSCGEventLeftMouseUp, point,
-                    MacWSCGMouseButtonLeft);
+                    NULL,
+                    record.kind == MacWSInputKindSecondaryTap
+                        ? MacWSCGEventRightMouseUp
+                        : MacWSCGEventLeftMouseUp,
+                    point, mouseButton);
                 if (upEvent) {
                     CGEventSetIntegerValueField(upEvent,
                         MacWSCGMouseEventClickState, 1);
                     CGEventSetIntegerValueField(upEvent,
                         MacWSCGMouseEventButtonNumber,
-                        MacWSCGMouseButtonLeft);
+                        mouseButton);
                     if (eventTarget.pid > 1) {
                         if (eventTarget.windowID > 0) {
                             CGEventSetIntegerValueField(upEvent,
@@ -711,8 +1046,10 @@ int main(void) {
         }
         sequence++;
         bool continuous = record.kind == MacWSInputKindTouchMove ||
-                          record.kind == MacWSInputKindHover;
-        if (!continuous || (sequence % 60) == 0) {
+                          record.kind == MacWSInputKindHover ||
+                          record.kind == MacWSInputKindMenuHover;
+        if (RuntimeDiagnosticsEnabled() &&
+            (!continuous || (sequence % 60) == 0)) {
             fprintf(stderr,
                     "MACWS-INPUT RX seq=%llu scene=%llx kind=%s "
                     "target=%d frame=(%.2f,%.2f)/%ux%u quartz=(%.2f,%.2f) event=%u "
@@ -738,7 +1075,8 @@ int main(void) {
         }
         if (record.kind == MacWSInputKindTouchUp ||
             record.kind == MacWSInputKindTouchCancel ||
-            record.kind == MacWSInputKindTap) {
+            record.kind == MacWSInputKindTap ||
+            record.kind == MacWSInputKindSecondaryTap) {
             gestureTarget = (MacWSWindowTarget){0};
         }
     }

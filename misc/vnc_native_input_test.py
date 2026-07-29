@@ -35,8 +35,21 @@ def check_point(width, height, x, y):
 def request_and_wait(sock, width, height, framebuffer, previous_digest,
                      operation, started, timeout, max_updates):
     rectangles_seen = []
-    for update_index in range(1, max_updates + 1):
+    nonempty_updates = 0
+    empty_updates = 0
+    deadline = started + timeout
+    while nonempty_updates < max_updates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        readable, _, _ = select.select([sock], [], [], remaining)
+        if not readable:
+            break
         rectangles = vnc_live_click.receive_update(sock, width, framebuffer)
+        if rectangles:
+            nonempty_updates += 1
+        else:
+            empty_updates += 1
         rectangles_seen.extend(rectangles)
         current_digest = frame_digest(framebuffer)
         if current_digest != previous_digest:
@@ -47,15 +60,24 @@ def request_and_wait(sock, width, height, framebuffer, previous_digest,
                              for rectangle in raw_rectangles)
             print(
                 f"INPUT PASS operation={operation} latency={latency:.3f}s "
-                f"updates={update_index} raw_rectangles={len(raw_rectangles)} "
+                f"updates={nonempty_updates} empty_updates={empty_updates} "
+                f"raw_rectangles={len(raw_rectangles)} "
                 f"raw_pixels={raw_pixels} digest={current_digest}",
                 flush=True)
             return current_digest, latency
-        if time.monotonic() - started >= timeout:
-            break
+        # OSXvnc legitimately replies with a zero-rectangle update when the
+        # application has accepted a key but WindowServer's next composite is
+        # not ready yet. Runtime evidence on 2026-07-29 showed 20 such replies
+        # arrive before the 80-ms KEY-PROGRESS capture, causing the old for-
+        # loop to fail in under one second despite Terminal already processing
+        # the key. Empty replies do not consume the nonempty-update budget;
+        # pace the next request so the loop remains bounded by the deadline.
+        if not rectangles:
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         vnc_live_click.request_update(sock, width, height, True)
     raise RuntimeError(
         f"no changed incremental frame for {operation}; "
+        f"nonempty_updates={nonempty_updates} empty_updates={empty_updates} "
         f"rectangles={rectangles_seen}")
 
 
