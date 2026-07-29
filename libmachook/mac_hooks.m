@@ -5165,10 +5165,11 @@ static void *macws_vnc_damage_listener(void *unused) {
                               message.sequence, memory_order_release);
         atomic_store_explicit(&macws_vnc_damage_callback_busy, NO,
                               memory_order_release);
-        static _Atomic uint64_t notificationCount = 0;
-        uint64_t count = atomic_fetch_add_explicit(
-            &notificationCount, 1, memory_order_relaxed) + 1;
-        if (count <= 16 || (count % 60) == 0) {
+        if (macws_runtime_diagnostics_enabled()) {
+            static _Atomic uint64_t notificationCount = 0;
+            uint64_t count = atomic_fetch_add_explicit(
+                &notificationCount, 1, memory_order_relaxed) + 1;
+            if (count <= 16 || (count % 60) == 0) {
             fprintf(stderr,
                 "#### OSXVNC DAMAGE notify #%llu sequence=%llu "
                 "rects=%u tiles=%u changed=%llu first=%u,%u %ux%u "
@@ -5181,6 +5182,7 @@ static void *macws_vnc_damage_listener(void *unused) {
                 message.rectangles[0].rectWidth,
                 message.rectangles[0].rectHeight,
                 (message.flags & 1u) ? "YES" : "NO");
+            }
         }
     }
     return NULL;
@@ -5238,17 +5240,21 @@ static int macws_new_rfb_send_framebuffer_update(
     // the per-rectangle callbacks below then encode that same coherent frame.
     // This preserves all RFB regions and pixels; it changes only the lock
     // lifetime of the selected mmap capture backend.
+    BOOL diagnostics = macws_runtime_diagnostics_enabled();
     if (macws_vnc_share_on && boundsX1 != INT32_MAX &&
         boundsX2 > boundsX1 && boundsY2 > boundsY1) {
-        double copyStarted = macws_vnc_monotonic_seconds();
+        double copyStarted = diagnostics
+            ? macws_vnc_monotonic_seconds() : 0.0;
         macws_vnc_rfb_prefetched = macws_vnc_fill_test(
             boundsX1, boundsY1, boundsX2 - boundsX1, boundsY2 - boundsY1);
-        macws_vnc_rfb_copy_milliseconds +=
-            (macws_vnc_monotonic_seconds() - copyStarted) * 1000.0;
-        macws_vnc_rfb_copy_calls = 1;
-        macws_vnc_rfb_copy_pixels =
-            (uint64_t)(boundsX2 - boundsX1) *
-            (uint64_t)(boundsY2 - boundsY1);
+        if (diagnostics) {
+            macws_vnc_rfb_copy_milliseconds +=
+                (macws_vnc_monotonic_seconds() - copyStarted) * 1000.0;
+            macws_vnc_rfb_copy_calls = 1;
+            macws_vnc_rfb_copy_pixels =
+                (uint64_t)(boundsX2 - boundsX1) *
+                (uint64_t)(boundsY2 - boundsY1);
+        }
     }
     int encoding = client
         ? *(const int *)((const char *)client + 0x580) : INT_MIN;
@@ -5279,18 +5285,19 @@ static int macws_new_rfb_send_framebuffer_update(
                 encoding, requestedLevel);
         }
     }
-    double started = macws_vnc_monotonic_seconds();
+    double started = diagnostics ? macws_vnc_monotonic_seconds() : 0.0;
     int result = macws_orig_rfb_send_framebuffer_update
         ? macws_orig_rfb_send_framebuffer_update(
             client, regionExtents, regionData) : 0;
     macws_vnc_rfb_prefetched = NO;
-    double elapsedMilliseconds =
-        (macws_vnc_monotonic_seconds() - started) * 1000.0;
-    static _Atomic uint64_t sendCount = 0;
-    uint64_t count = atomic_fetch_add_explicit(
-        &sendCount, 1, memory_order_relaxed) + 1;
-    if (count <= 32 || elapsedMilliseconds >= 20.0 ||
-        (count % 600) == 0) {
+    if (diagnostics) {
+        double elapsedMilliseconds =
+            (macws_vnc_monotonic_seconds() - started) * 1000.0;
+        static _Atomic uint64_t sendCount = 0;
+        uint64_t count = atomic_fetch_add_explicit(
+            &sendCount, 1, memory_order_relaxed) + 1;
+        if (count <= 32 || elapsedMilliseconds >= 20.0 ||
+            (count % 600) == 0) {
         fprintf(stderr,
             "#### OSXVNC RFB-SEND #%llu encoding=%d regions=%llu "
             "pixels=%llu bounds=%d,%d %dx%d copy=%u/%llu/%.3fms "
@@ -5306,6 +5313,7 @@ static int macws_new_rfb_send_framebuffer_update(
             (unsigned long long)macws_vnc_rfb_copy_pixels,
             macws_vnc_rfb_copy_milliseconds,
             elapsedMilliseconds, result);
+        }
     }
     return result;
 }
@@ -5329,7 +5337,7 @@ static void macws_new_vnc_refresh_callback(uint32_t count,
         // validates the matching mmap pixels; forwarding this callback sent
         // stale rectangles and duplicated every later mmap notification.
         static unsigned deferredLogs;
-        if (deferredLogs++ < 8) {
+        if (macws_runtime_diagnostics_enabled() && deferredLogs++ < 8) {
             fprintf(stderr,
                 "#### OSXVNC CG-DAMAGE deferred-to-mmap count=%u "
                 "logical=%.0f,%.0f %.0fx%.0f\n",
@@ -5358,7 +5366,7 @@ static void macws_new_vnc_refresh_callback(uint32_t count,
         scaled[index].size.height = rectangles[index].size.height * scale;
     }
     static unsigned scaleLogs;
-    if (scaleLogs++ < 8) {
+    if (macws_runtime_diagnostics_enabled() && scaleLogs++ < 8) {
         fprintf(stderr,
             "#### OSXVNC CG-DAMAGE scale=%d count=%u "
             "logical=%.0f,%.0f %.0fx%.0f physical=%.0f,%.0f %.0fx%.0f\n",
@@ -5444,11 +5452,13 @@ static void *macws_vnc_generation_watcher(void *unused) {
                             previousValid = NO;
                             pendingFallbackSequence = 0;
                             pendingFallbackSince = 0.0;
-                            static _Atomic uint64_t skippedScans = 0;
-                            uint64_t skipped = atomic_fetch_add_explicit(
-                                &skippedScans, 1,
-                                memory_order_relaxed) + 1;
-                            if (skipped <= 16 || (skipped % 600) == 0) {
+                            if (macws_runtime_diagnostics_enabled()) {
+                                static _Atomic uint64_t skippedScans = 0;
+                                uint64_t skipped = atomic_fetch_add_explicit(
+                                    &skippedScans, 1,
+                                    memory_order_relaxed) + 1;
+                                if (skipped <= 16 ||
+                                    (skipped % 600) == 0) {
                                 fprintf(stderr,
                                     "#### OSXVNC mmap scan skipped #%llu "
                                     "sequence=%llu producer-received=%llu "
@@ -5458,6 +5468,7 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                     (unsigned long long)producerReceived,
                                     (unsigned long long)producerNotified,
                                     damageCallbackBusy ? "YES" : "NO");
+                                }
                             }
                             usleep(16000);
                             continue;
@@ -5702,9 +5713,11 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                         damageCount, damageRects, NULL);
                                 }
                             }
-                            static _Atomic uint64_t notified = 0;
-                            uint64_t count = atomic_fetch_add(&notified, 1) + 1;
-                            if (count <= 16 || (count % 60) == 0) {
+                            if (macws_runtime_diagnostics_enabled()) {
+                                static _Atomic uint64_t notified = 0;
+                                uint64_t count = atomic_fetch_add(
+                                    &notified, 1) + 1;
+                                if (count <= 16 || (count % 60) == 0) {
                                 fprintf(stderr,
                                     "#### OSXVNC mmap generation #%llu "
                                     "sequence=%llu changed=%s "
@@ -5717,6 +5730,7 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                     dirty.size.width, dirty.size.height,
                                     damageCount,
                                     damageOverflow ? "YES" : "NO");
+                                }
                             }
                         }
                     }
@@ -5793,7 +5807,7 @@ static void macws_vnc_write_capture_request(const char *reason,
     if (fd < 0) return;
     ssize_t written = write(fd, value, (size_t)length);
     close(fd);
-    if (written == length) {
+    if (written == length && macws_runtime_diagnostics_enabled()) {
         BOOL pointerProgress = strcmp(reason, "POINTER-PROGRESS") == 0;
         static _Atomic uint64_t pointerProgressLogs;
         uint64_t progressLog = pointerProgress
@@ -5929,20 +5943,22 @@ static void macws_vnc_schedule_native_pointer_frames(
 // target process entered its real NSCarbonMenuImpl tracker immediately, but
 // the generic 80-ms pointer observation sometimes preceded the first menu
 // composite. The retained framebuffer then showed no menu until a later hover
-// requested another observation. Ask for two bounded trailing observations
-// after each secondary tap. Metal_hooks still publishes only a completed,
-// stable WindowServer generation; these requests neither fabricate pixels nor
-// mutate menu state.
+// requested another observation.  A threshold-aware 2026-07-30 timing run
+// measured AppInput delivery 34 ms after the RFB down and a valid contextual
+// frame at 324 ms with the old 180/360-ms pair. Move the same two bounded
+// observations to 120/240 ms; this is an observation-cadence A/B, not an input
+// event or fabricated frame. Metal_hooks still publishes only a completed,
+// stable WindowServer generation.
 static void macws_vnc_schedule_secondary_tap_frames(uint64_t gesture) {
     if (!macws_vnc_share_on) return;
     dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
+        dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC),
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             macws_vnc_write_capture_request(
                 "SECONDARY-OPEN", gesture, 0);
         });
     dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, 360 * NSEC_PER_MSEC),
+        dispatch_time(DISPATCH_TIME_NOW, 240 * NSEC_PER_MSEC),
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             macws_vnc_write_capture_request(
                 "SECONDARY-FINAL", gesture, 0);
@@ -5952,24 +5968,27 @@ static void macws_vnc_schedule_secondary_tap_frames(uint64_t gesture) {
 static void macws_new_vnc_handle_keyboard(id self, SEL command, BOOL down,
         unsigned int keySym, id client) {
     macws_vnc_note_interaction();
-    double started = macws_vnc_monotonic_seconds();
+    BOOL diagnostics = macws_runtime_diagnostics_enabled();
+    double started = diagnostics ? macws_vnc_monotonic_seconds() : 0.0;
     unsigned int previousKeySym = macws_vnc_current_keysym;
     macws_vnc_current_keysym = keySym;
     if (macws_orig_vnc_handle_keyboard)
         macws_orig_vnc_handle_keyboard(self, command, down, keySym, client);
     macws_vnc_current_keysym = previousKeySym;
-    double elapsedMilliseconds =
-        (macws_vnc_monotonic_seconds() - started) * 1000.0;
-    static _Atomic uint64_t handlerCount = 0;
-    uint64_t handled = atomic_fetch_add_explicit(
-        &handlerCount, 1, memory_order_relaxed) + 1;
-    if (handled <= 16 || elapsedMilliseconds >= 50.0) {
+    if (diagnostics) {
+        double elapsedMilliseconds =
+            (macws_vnc_monotonic_seconds() - started) * 1000.0;
+        static _Atomic uint64_t handlerCount = 0;
+        uint64_t handled = atomic_fetch_add_explicit(
+            &handlerCount, 1, memory_order_relaxed) + 1;
+        if (handled <= 16 || elapsedMilliseconds >= 50.0) {
         fprintf(stderr,
             "#### OSXVNC KEY-HANDLER event=%llu down=%d sym=%#x "
             "at=%.6f elapsed=%.3fms\n",
             (unsigned long long)handled, down, keySym,
             started,
             elapsedMilliseconds);
+        }
     }
     if (!down || !macws_vnc_share_on) return;
 
@@ -6007,10 +6026,11 @@ static void macws_new_vnc_send_key_event(id self, SEL command,
     unsigned int keySym = macws_vnc_current_keysym;
     BOOL routed = macws_vnc_native_all &&
         macws_vnc_forward_key(keyCode, down, modifiers, keySym);
-    static _Atomic uint64_t routedKeys;
-    uint64_t serial = atomic_fetch_add_explicit(
-        &routedKeys, 1, memory_order_relaxed) + 1;
-    if (serial <= 64 || !routed || (serial % 600) == 0) {
+    if (macws_runtime_diagnostics_enabled()) {
+        static _Atomic uint64_t routedKeys;
+        uint64_t serial = atomic_fetch_add_explicit(
+            &routedKeys, 1, memory_order_relaxed) + 1;
+        if (serial <= 64 || !routed || (serial % 600) == 0) {
         fprintf(stderr,
             "#### OSXVNC KEY-ROUTE event=%llu down=%d keycode=%u "
             "keysym=%#x modifiers=%#llx route=%s\n",
@@ -6018,6 +6038,7 @@ static void macws_new_vnc_send_key_event(id self, SEL command,
             (unsigned long long)modifiers,
             routed ? "app-input" : "native-fallback");
         fflush(stderr);
+        }
     }
     if (!routed && macws_orig_vnc_send_key_event) {
         macws_orig_vnc_send_key_event(
@@ -6047,16 +6068,18 @@ static void macws_new_vnc_set_key_modifiers(id self, SEL command,
     uint64_t *current = (uint64_t *)((char *)(__bridge void *)self +
                                      macws_vnc_current_modifiers_offset);
     *current = modifiers;
-    static _Atomic uint64_t syncCount;
-    uint64_t serial = atomic_fetch_add_explicit(
-        &syncCount, 1, memory_order_relaxed) + 1;
-    if (serial <= 16) {
+    if (macws_runtime_diagnostics_enabled()) {
+        static _Atomic uint64_t syncCount;
+        uint64_t serial = atomic_fetch_add_explicit(
+            &syncCount, 1, memory_order_relaxed) + 1;
+        if (serial <= 16) {
         fprintf(stderr,
             "#### OSXVNC KEY-MODIFIERS event=%llu value=%#llx "
             "route=app-input-state\n",
             (unsigned long long)serial,
             (unsigned long long)modifiers);
         fflush(stderr);
+        }
     }
 }
 
@@ -6134,16 +6157,23 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
     }
     BOOL ok = sent == (ssize_t)sizeof(record);
     if (ok && continuous) macws_vnc_last_continuous_send = now;
-    static unsigned continuous_failures = 0;
-    if (!continuous || !ok) {
-        unsigned failure = !ok ? ++continuous_failures : continuous_failures;
-        if (!continuous || failure <= 4 || (failure % 120) == 0) {
+    if (!ok) {
+        static _Atomic unsigned failures = 0;
+        unsigned failure = atomic_fetch_add_explicit(
+            &failures, 1, memory_order_relaxed) + 1;
+        if (failure <= 4 || (failure % 120) == 0) {
         fprintf(stderr,
             "#### OSXVNC INPUT kind=%u gesture=%u point=(%.1f,%.1f)/%dx%d "
             "sent=%zd errno=%d attempts=%u reliable=%s\n",
             kind, macws_vnc_gesture_id, point.x, point.y, width, height,
             sent, ok ? 0 : saved_errno, attempted, reliable ? "YES" : "NO");
         }
+    } else if (!continuous && macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### OSXVNC INPUT kind=%u gesture=%u point=(%.1f,%.1f)/%dx%d "
+            "sent=%zd errno=0 attempts=%u reliable=%s\n",
+            kind, macws_vnc_gesture_id, point.x, point.y, width, height,
+            sent, attempted, reliable ? "YES" : "NO");
     }
     return ok;
 }
@@ -6246,21 +6276,25 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     macws_vnc_secondary_down_point = point;
                 }
                 macws_vnc_menu_hover_until = now + 12.0;
-                fprintf(stderr,
-                    "#### OSXVNC MENU-HOVER-ARM source=%s "
-                    "now=%.6f until=%.6f point=(%.1f,%.1f)\n",
-                    secondaryDown ? "secondary" : "top-bar",
-                    now, macws_vnc_menu_hover_until, point.x, point.y);
+                if (macws_runtime_diagnostics_enabled()) {
+                    fprintf(stderr,
+                        "#### OSXVNC MENU-HOVER-ARM source=%s "
+                        "now=%.6f until=%.6f point=(%.1f,%.1f)\n",
+                        secondaryDown ? "secondary" : "top-bar",
+                        now, macws_vnc_menu_hover_until, point.x, point.y);
+                }
             } else if (primaryDown &&
                        now < macws_vnc_menu_hover_until) {
                 // The next primary down selects or dismisses the already
                 // tracked menu. Its native CG event is authoritative; stop
                 // supplementing subsequent ordinary-window motion.
                 macws_vnc_menu_hover_until = 0.0;
-                fprintf(stderr,
-                    "#### OSXVNC MENU-HOVER-DISARM source=primary "
-                    "now=%.6f point=(%.1f,%.1f)\n",
-                    now, point.x, point.y);
+                if (macws_runtime_diagnostics_enabled()) {
+                    fprintf(stderr,
+                        "#### OSXVNC MENU-HOVER-DISARM source=primary "
+                        "now=%.6f point=(%.1f,%.1f)\n",
+                        now, point.x, point.y);
+                }
             }
             if (buttonTransition && previousButtons == 0 && buttons != 0) {
                 // Coordinate the target before OSXvnc posts the native down.
@@ -6290,15 +6324,17 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                 // release so the selected process constructs the complete
                 // AppKit pair atomically, matching the proven primary Tap
                 // transport instead of tuning an arbitrary sleep.
-                static _Atomic uint64_t serializedRightUps;
-                uint64_t serialized = atomic_fetch_add_explicit(
-                    &serializedRightUps, 1,
-                    memory_order_relaxed) + 1;
-                if (serialized <= 24 || (serialized % 100) == 0) {
+                if (macws_runtime_diagnostics_enabled()) {
+                    static _Atomic uint64_t serializedRightUps;
+                    uint64_t serialized = atomic_fetch_add_explicit(
+                        &serializedRightUps, 1,
+                        memory_order_relaxed) + 1;
+                    if (serialized <= 24 || (serialized % 100) == 0) {
                     fprintf(stderr,
                         "#### OSXVNC RIGHT-UP-SERIALIZE event=%llu "
                         "route=app-input-secondary-tap rfb=(%.1f,%.1f)\n",
                         (unsigned long long)serialized, point.x, point.y);
+                    }
                 }
             }
             BOOL secondaryGesture = ((previousButtons | buttons) & 4u) != 0;
@@ -6313,13 +6349,16 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     BOOL sent = macws_vnc_forward_input(
                         MacWSInputKindSecondaryTap,
                         macws_vnc_secondary_down_point, YES);
-                    fprintf(stderr,
-                        "#### OSXVNC CLICK-OWNER route=app-input-secondary "
-                        "gesture=%u point=(%.1f,%.1f) sent=%s\n",
-                        macws_vnc_gesture_id,
-                        macws_vnc_secondary_down_point.x,
-                        macws_vnc_secondary_down_point.y,
-                        sent ? "YES" : "NO");
+                    if (macws_runtime_diagnostics_enabled()) {
+                        fprintf(stderr,
+                            "#### OSXVNC CLICK-OWNER "
+                            "route=app-input-secondary gesture=%u "
+                            "point=(%.1f,%.1f) sent=%s\n",
+                            macws_vnc_gesture_id,
+                            macws_vnc_secondary_down_point.x,
+                            macws_vnc_secondary_down_point.y,
+                            sent ? "YES" : "NO");
+                    }
                     if (sent)
                         macws_vnc_schedule_secondary_tap_frames(
                             macws_vnc_gesture_id);
@@ -6350,7 +6389,8 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                         : MacWSInputKindHover;
                 (void)macws_vnc_forward_input(
                     hoverKind, point, NO);
-                if (hoverKind == MacWSInputKindMenuHover) {
+                if (hoverKind == MacWSInputKindMenuHover &&
+                    macws_runtime_diagnostics_enabled()) {
                     static _Atomic uint64_t menuHoverRoutes;
                     uint64_t route = atomic_fetch_add_explicit(
                         &menuHoverRoutes, 1, memory_order_relaxed) + 1;
@@ -6364,15 +6404,17 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     }
                 }
             }
-            static _Atomic uint64_t nativeEvents;
-            uint64_t nativeEvent = atomic_fetch_add_explicit(
-                &nativeEvents, 1, memory_order_relaxed) + 1;
-            if (nativeEvent <= 96 || (nativeEvent % 600) == 0) {
+            if (macws_runtime_diagnostics_enabled()) {
+                static _Atomic uint64_t nativeEvents;
+                uint64_t nativeEvent = atomic_fetch_add_explicit(
+                    &nativeEvents, 1, memory_order_relaxed) + 1;
+                if (nativeEvent <= 96 || (nativeEvent % 600) == 0) {
                 fprintf(stderr,
                     "#### OSXVNC NATIVE-ALL event=%llu buttons=%#x "
                     "rfb=(%.1f,%.1f) quartz=(%.1f,%.1f) scale=%d\n",
                     (unsigned long long)nativeEvent, buttons,
                     point.x, point.y, quartzPoint.x, quartzPoint.y, scale);
+                }
             }
             atomic_store_explicit(&macws_vnc_native_buttons, buttons,
                                   memory_order_release);
@@ -6439,13 +6481,15 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
             if (macws_vnc_pending_down) {
                 BOOL sent = macws_vnc_forward_input(
                     MacWSInputKindTap, macws_vnc_pending_down_point, YES);
-                fprintf(stderr,
-                    "#### OSXVNC CLICK-OWNER route=app-input gesture=%u "
-                    "point=(%.1f,%.1f) sent=%s\n",
-                    macws_vnc_gesture_id,
-                    macws_vnc_pending_down_point.x,
-                    macws_vnc_pending_down_point.y,
-                    sent ? "YES" : "NO");
+                if (macws_runtime_diagnostics_enabled()) {
+                    fprintf(stderr,
+                        "#### OSXVNC CLICK-OWNER route=app-input gesture=%u "
+                        "point=(%.1f,%.1f) sent=%s\n",
+                        macws_vnc_gesture_id,
+                        macws_vnc_pending_down_point.x,
+                        macws_vnc_pending_down_point.y,
+                        sent ? "YES" : "NO");
+                }
                 macws_vnc_pending_down = NO;
                 macws_orig_vnc_handle_mouse(self, command, 0,
                                             quartzPoint, client);
@@ -6453,10 +6497,12 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                 macws_orig_vnc_handle_mouse(self, command, 0,
                                             quartzPoint, client);
                 macws_vnc_remote_down = NO;
-                fprintf(stderr,
-                    "#### OSXVNC DRAG-OWNER route=native gesture=%u "
-                    "point=(%.1f,%.1f)\n",
-                    macws_vnc_gesture_id, point.x, point.y);
+                if (macws_runtime_diagnostics_enabled()) {
+                    fprintf(stderr,
+                        "#### OSXVNC DRAG-OWNER route=native gesture=%u "
+                        "point=(%.1f,%.1f)\n",
+                        macws_vnc_gesture_id, point.x, point.y);
+                }
             } else {
                 macws_orig_vnc_handle_mouse(self, command, 0,
                                             quartzPoint, client);
@@ -6466,7 +6512,7 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                                         quartzPoint, client);
         }
         static unsigned ownershipLogs;
-        if (ownershipLogs++ < 8) {
+        if (macws_runtime_diagnostics_enabled() && ownershipLogs++ < 8) {
             fprintf(stderr,
                 "#### OSXVNC INPUT-OWNER rfb=(%.1f,%.1f) quartz=(%.1f,%.1f) "
                 "buttons=%#x pending=%s drag=%s scale=%d\n",
@@ -6733,7 +6779,7 @@ static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
         if (w > 0 && h > 0)
             macws_vnc_rfb_copy_pixels += (uint64_t)w * (uint64_t)h;
         static int lg = 0;
-        if (lg < 3) {
+        if (macws_runtime_diagnostics_enabled() && lg < 3) {
             fprintf(stderr, "#### OSXVNC mmap rect delivery copied=%d rect=%d,%d %dx%d\n",
                     copied ? 1 : 0, x, y, w, h);
             lg++;

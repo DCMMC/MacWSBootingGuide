@@ -1,0 +1,49 @@
+Runtime capture: iOS-local LLDB attached to Terminal PID 10252 while the
+secondary-click call had not returned.  macOS 13.4 AppKit/HIToolbox symbols
+were resolved from the running process.  Frames unrelated to the menu path
+are omitted below; `thread backtrace all` showed the remaining threads idle in
+their ordinary receive/select loops.
+
+thread #1, queue = 'com.apple.main-thread', stop reason = signal SIGSTOP
+  frame #4:  libmachook.dylib`mach_msg_new at mac_hooks.m:7184
+  frame #5:  CoreFoundation`__CFRunLoopServiceMachPort
+  frame #6:  CoreFoundation`__CFRunLoopRun
+  frame #8:  HIToolbox`RunCurrentEventLoopInMode
+  frame #9:  HIToolbox`ReceiveNextEventCommon
+  frame #10: HIToolbox`_BlockUntilNextEventMatchingListInModeWithFilter
+  frame #11: AppKit`_DPSNextEvent
+  frame #12: AppKit`-[NSApplication(NSEvent) _nextEventMatchingEventMask:untilDate:inMode:dequeue:]
+  frame #13: AppKit`_NSHLTBMenuEventProc
+  frame #14: HIToolbox`IsUserStillTracking(MenuSelectData*, unsigned char*)
+  frame #15: HIToolbox`TrackMenuCommon(MenuSelectData&, unsigned char*, SelectionData*, MenuResult*, MenuResult*)
+  frame #16: HIToolbox`PopUpMenuSelectCore(...)
+  frame #17: HIToolbox`_HandlePopUpMenuSelection8(...)
+  frame #18: HIToolbox`_HandlePopUpMenuSelectionWithDictionary
+  frame #19: AppKit`SLMPerformPopUpCarbonMenu
+  frame #20: AppKit`_NSSLMPopUpCarbonMenu4
+  frame #21: AppKit`-[NSCarbonMenuImpl _popUpContextMenu:withEvent:forView:withFont:]
+  frame #22: AppKit`-[NSMenu _popUpContextMenu:withEvent:forView:withFont:]
+  frame #23: AppKit`-[NSView _showMenuForEvent:]
+  frame #24: AppKit`-[NSView rightMouseDown:]
+  frame #26: AppKit`_routeRightMouseDownEvent
+  frame #27: AppKit`-[NSWindow(NSEventRouting) _reallySendEvent:isDelayedEvent:]
+  frame #28: AppKit`-[NSWindow(NSEventRouting) sendEvent:]
+  frame #30: AppKit`-[NSApplication(NSEvent) sendEvent:]
+  frame #31: libmachook.dylib`MacWSAppInputApplicationSendEvent at AppInputBridge.m:740
+  frame #33: libmachook.dylib`__MacWSScheduleAppInputDrain_block_invoke at AppInputBridge.m:2490
+  frame #34: libmachook.dylib`__MacWSScheduleAppInputDrain_block_invoke at AppInputBridge.m:2779
+  frame #36: CoreFoundation`__CFRUNLOOP_IS_CALLING_OUT_TO_A_BLOCK__
+  frame #38: CoreFoundation`__CFRunLoopRun
+  frame #40: HIToolbox`RunCurrentEventLoopInMode
+  frame #43: AppKit`_DPSNextEvent
+  frame #45: AppKit`-[NSApplication run]
+
+This stack runtime-confirms that the AppInputBridge event entered Terminal's
+normal AppKit routing and that the native Carbon contextual-menu tracker was
+active.  It rules out "rightMouseDown never reached AppKit" and "the tracker
+was never entered" as explanations.
+
+A full non-incremental RFB capture taken while this exact stack was stopped is
+`context-menu-lldb-active.png`; it visibly contains Terminal's contextual
+menu.  Therefore the remaining usability issue is publication latency and/or
+incremental-damage notification, not absence of a native context menu.

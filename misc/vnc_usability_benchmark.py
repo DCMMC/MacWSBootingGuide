@@ -57,20 +57,53 @@ def region_digest(framebuffer, width, rect, masked_points=(), radius=None):
 
 
 def region_changed_pixels(before, after, width, rect, masked_points=(),
-                          radius=None):
+                          radius=None, stop_after=None):
+    """Count changed pixels, skipping equal row spans in C.
+
+    The former per-pixel `any()` loop examined the complete ROI even when the
+    first framebuffer update was only a cursor tile.  A 1200x1100 context-menu
+    ROI took about 1.2 seconds on the benchmark Mac and that local work was
+    incorrectly included in the device latency.  Compare unmasked row spans as
+    byte strings first, then inspect pixels only inside spans that differ.  A
+    threshold caller can stop as soon as it has enough evidence.
+    """
     if radius is None:
         radius = CURSOR_MASK_RADIUS
     x, y, rect_width, rect_height = rect
     changed = 0
     for row in range(y, y + rect_height):
-        for column in range(x, x + rect_width):
-            if any(abs(column - point_x) <= radius and
-                   abs(row - point_y) <= radius
-                   for point_x, point_y in masked_points):
+        masked_intervals = []
+        for point_x, point_y in masked_points:
+            if abs(row - point_y) > radius:
                 continue
-            offset = (row * width + column) * 4
-            if before[offset:offset + 4] != after[offset:offset + 4]:
-                changed += 1
+            left = max(x, point_x - radius)
+            right = min(x + rect_width, point_x + radius + 1)
+            if left < right:
+                masked_intervals.append((left, right))
+        masked_intervals.sort()
+        spans = []
+        cursor = x
+        for left, right in masked_intervals:
+            if left > cursor:
+                spans.append((cursor, left))
+            if right > cursor:
+                cursor = right
+        if cursor < x + rect_width:
+            spans.append((cursor, x + rect_width))
+
+        for left, right in spans:
+            byte_start = (row * width + left) * 4
+            byte_end = (row * width + right) * 4
+            before_span = before[byte_start:byte_end]
+            after_span = after[byte_start:byte_end]
+            if before_span == after_span:
+                continue
+            for offset in range(0, len(before_span), 4):
+                if before_span[offset:offset + 4] != \
+                        after_span[offset:offset + 4]:
+                    changed += 1
+                    if stop_after is not None and changed >= stop_after:
+                        return changed
     return changed
 
 
@@ -84,7 +117,8 @@ def key(sock, keysym):
 
 
 def wait_for_region(sock, width, height, framebuffer, rect, masks,
-                    previous_digest, started, timeout, max_updates):
+                    baseline, previous_digest, minimum_changed_pixels,
+                    started, timeout, max_updates):
     rectangles_seen = []
     deadline = started + timeout
     first_readable_seconds = None
@@ -107,15 +141,20 @@ def wait_for_region(sock, width, height, framebuffer, rect, masks,
         current_digest = region_digest(
             framebuffer, width, rect, masks)
         if current_digest != previous_digest:
-            return {
-                "passed": True,
-                "latency_seconds": time.monotonic() - started,
-                "updates": update_index,
-                "rectangles": rectangles_seen,
-                "digest": current_digest,
-                "first_readable_seconds": first_readable_seconds,
-                "receive_seconds": receive_seconds,
-            }
+            changed_pixels = region_changed_pixels(
+                baseline, framebuffer, width, rect, masks,
+                stop_after=minimum_changed_pixels)
+            if changed_pixels >= minimum_changed_pixels:
+                return {
+                    "passed": True,
+                    "latency_seconds": time.monotonic() - started,
+                    "updates": update_index,
+                    "rectangles": rectangles_seen,
+                    "digest": current_digest,
+                    "first_readable_seconds": first_readable_seconds,
+                    "receive_seconds": receive_seconds,
+                    "first_valid_changed_pixels": changed_pixels,
+                }
         if time.monotonic() < deadline:
             vnc_live_click.request_update(sock, width, height, True)
     return {
@@ -126,6 +165,7 @@ def wait_for_region(sock, width, height, framebuffer, rect, masks,
         "digest": previous_digest,
         "first_readable_seconds": first_readable_seconds,
         "receive_seconds": receive_seconds,
+        "first_valid_changed_pixels": None,
     }
 
 
@@ -137,8 +177,8 @@ def measured_action(sock, width, height, framebuffer, label, rect, masks,
     started = time.monotonic()
     action()
     result = wait_for_region(
-        sock, width, height, framebuffer, rect, masks, before, started,
-        timeout, max_updates)
+        sock, width, height, framebuffer, rect, masks, baseline, before,
+        MIN_CHANGED_PIXELS, started, timeout, max_updates)
     result["operation"] = label
     settled_updates = 0
     settled_changes = 0

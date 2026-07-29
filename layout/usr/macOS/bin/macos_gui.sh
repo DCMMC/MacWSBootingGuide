@@ -1131,7 +1131,7 @@ Modes:
   coexist     (default) iPad panel keeps showing iOS; macOS renders to VNC only.
   exclusive   macOS takes over the physical panel as well as VNC.
 
-Safety: `start` also launches a background watchdog that auto-stops the GUI if
+Safety: start also launches a background watchdog that auto-stops the GUI if
 WindowServer crash-loops or the load average runs away (panic guard). Disable
 with --no-watchdog. Logs to $LOGDIR/macos_gui_watchdog.log.
 

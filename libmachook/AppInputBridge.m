@@ -259,7 +259,9 @@ static MacWSFrontUISnapshot MacWSCaptureFrontUISnapshot(void) {
 // transactions only after the broker has observed a real cross-process native
 // click whose normal activation transaction did not converge.
 static BOOL MacWSRepairFrontUIApplication(id application, const char *phase) {
-    MacWSFrontUISnapshot before = MacWSCaptureFrontUISnapshot();
+    BOOL diagnostics = MacWSRuntimeDiagnosticsEnabled();
+    MacWSFrontUISnapshot before = diagnostics
+        ? MacWSCaptureFrontUISnapshot() : (MacWSFrontUISnapshot){0};
     MacWSProcessSerialNumber currentProcess = {0};
     MacWSProcessSerialNumber keyFocusBefore = {0};
     MacWSProcessSerialNumber keyFocusAfter = {0};
@@ -331,7 +333,7 @@ static BOOL MacWSRepairFrontUIApplication(id application, const char *phase) {
         recalcBar = (MacWSRecalcBar)MacWSResolveHIToolboxLocal(
             0x11878, recalcBarPrologue, sizeof(recalcBarPrologue));
     });
-    if (getKeyFocusProcess) {
+    if (diagnostics && getKeyFocusProcess) {
         keyFocusBeforeStatus = getKeyFocusProcess(
             &keyFocusBefore, &keyFocusBeforeValid);
     }
@@ -466,12 +468,13 @@ static BOOL MacWSRepairFrontUIApplication(id application, const char *phase) {
         setMenuBarObscured(0);
         unobscuredMenuBar = "CALLED";
     }
-    if (getKeyFocusProcess) {
+    if (diagnostics && getKeyFocusProcess) {
         keyFocusAfterStatus = getKeyFocusProcess(
             &keyFocusAfter, &keyFocusAfterValid);
     }
     MacWSFrontUISnapshot after = MacWSCaptureFrontUISnapshot();
-    fprintf(stderr,
+    if (diagnostics) {
+        fprintf(stderr,
         "#### APP-INPUT FRONT-UI pid=%d phase=%s "
         "before=%s get=%d same=%d psn=%#x-%#x "
         "current=%d:%#x-%#x sky-set=%d steal-key=%d window=%u "
@@ -495,8 +498,9 @@ static BOOL MacWSRepairFrontUIApplication(id application, const char *phase) {
         installedMainMenuBar, recalculatedMainMenuBar, unobscuredMenuBar,
         after.ownsFrontUIProcess ? "OWNED" : "OTHER",
         after.getStatus, after.sameStatus,
-        after.front.highLongOfPSN, after.front.lowLongOfPSN);
-    fflush(stderr);
+            after.front.highLongOfPSN, after.front.lowLongOfPSN);
+        fflush(stderr);
+    }
     return after.ownsFrontUIProcess;
 }
 
@@ -518,18 +522,20 @@ static void MacWSSetLastSystemActivationEvent(id event) {
 
 static void MacWSAppInputHandleActivatedEvent(id self, SEL command, id event) {
     MacWSSetLastSystemActivationEvent(event);
-    NSInteger windowNumber = event ? ((MacWSMsgInteger)objc_msgSend)(
-        event, sel_registerName("windowNumber")) : 0;
-    NSInteger data1 = event ? ((MacWSMsgInteger)objc_msgSend)(
-        event, sel_registerName("data1")) : 0;
-    NSInteger data2 = event ? ((MacWSMsgInteger)objc_msgSend)(
-        event, sel_registerName("data2")) : 0;
-    fprintf(stderr,
-        "#### APP-INPUT SYSTEM-ACTIVATE-EVENT pid=%d window=%ld "
-        "data1=%ld data2=%ld retained=%s\n",
-        getpid(), (long)windowNumber, (long)data1, (long)data2,
-        event ? "YES" : "NO");
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        NSInteger windowNumber = event ? ((MacWSMsgInteger)objc_msgSend)(
+            event, sel_registerName("windowNumber")) : 0;
+        NSInteger data1 = event ? ((MacWSMsgInteger)objc_msgSend)(
+            event, sel_registerName("data1")) : 0;
+        NSInteger data2 = event ? ((MacWSMsgInteger)objc_msgSend)(
+            event, sel_registerName("data2")) : 0;
+        fprintf(stderr,
+            "#### APP-INPUT SYSTEM-ACTIVATE-EVENT pid=%d window=%ld "
+            "data1=%ld data2=%ld retained=%s\n",
+            getpid(), (long)windowNumber, (long)data1, (long)data2,
+            event ? "YES" : "NO");
+        fflush(stderr);
+    }
     if (MacWSOriginalHandleActivatedEvent)
         MacWSOriginalHandleActivatedEvent(self, command, event);
 }
@@ -566,16 +572,20 @@ static void MacWSScheduleApplicationDisplaySettle(void) {
         BOOL canInvalidate = responder && ((MacWSMsgBoolSEL)objc_msgSend)(
             responder, sel_registerName("respondsToSelector:"),
             setNeedsDisplay);
-        BOOL hasString = responder && ((MacWSMsgBoolSEL)objc_msgSend)(
-            responder, sel_registerName("respondsToSelector:"),
-            sel_registerName("string"));
+        BOOL diagnostics = MacWSRuntimeDiagnosticsEnabled();
+        BOOL hasString = diagnostics && responder &&
+            ((MacWSMsgBoolSEL)objc_msgSend)(
+                responder, sel_registerName("respondsToSelector:"),
+                sel_registerName("string"));
         id string = hasString ? ((MacWSMsgID)objc_msgSend)(
             responder, sel_registerName("string")) : nil;
         NSUInteger stringLength = string ? ((MacWSMsgUInteger)objc_msgSend)(
             string, sel_registerName("length")) : 0;
-        BOOL neededBefore = window && ((MacWSMsgBool)objc_msgSend)(
-            window, sel_registerName("viewsNeedDisplay"));
-        double started = MacWSAppInputMonotonicSeconds();
+        BOOL neededBefore = diagnostics && window &&
+            ((MacWSMsgBool)objc_msgSend)(
+                window, sel_registerName("viewsNeedDisplay"));
+        double started = diagnostics
+            ? MacWSAppInputMonotonicSeconds() : 0.0;
         if (canInvalidate) ((MacWSMsgVoidBool)objc_msgSend)(
             responder, setNeedsDisplay, YES);
         if (window) ((void (*)(id, SEL))objc_msgSend)(
@@ -587,12 +597,13 @@ static void MacWSScheduleApplicationDisplaySettle(void) {
             ((void (*)(id, SEL))objc_msgSend)(
                 transactionClass, flushSelector);
         }
-        BOOL neededAfter = window && ((MacWSMsgBool)objc_msgSend)(
-            window, sel_registerName("viewsNeedDisplay"));
-        static _Atomic uint64_t settleCount;
-        uint64_t count = atomic_fetch_add_explicit(
-            &settleCount, 1, memory_order_relaxed) + 1;
-        if (count <= 24) {
+        if (diagnostics) {
+            BOOL neededAfter = window && ((MacWSMsgBool)objc_msgSend)(
+                window, sel_registerName("viewsNeedDisplay"));
+            static _Atomic uint64_t settleCount;
+            uint64_t count = atomic_fetch_add_explicit(
+                &settleCount, 1, memory_order_relaxed) + 1;
+            if (count <= 24) {
             fprintf(stderr,
                 "#### APP-INPUT DISPLAY-SETTLE pid=%d serial=%llu "
                 "window=%ld responder=%s string-length=%lu "
@@ -610,6 +621,7 @@ static void MacWSScheduleApplicationDisplaySettle(void) {
                 (MacWSAppInputMonotonicSeconds() - started) * 1000.0,
                 started);
             fflush(stderr);
+            }
         }
     });
 }
@@ -713,13 +725,15 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
                 activateSelector)) {
             ((MacWSMsgVoidBool)objc_msgSend)(
                 self, activateSelector, YES);
-            fprintf(stderr,
-                "#### APP-INPUT SYSTEM-ACTIVATE pid=%d window=%ld "
-                "active-before=NO active-after=%s\n",
-                getpid(), (long)eventWindow,
-                ((MacWSMsgBool)objc_msgSend)(
-                    self, sel_registerName("isActive")) ? "YES" : "NO");
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT SYSTEM-ACTIVATE pid=%d window=%ld "
+                    "active-before=NO active-after=%s\n",
+                    getpid(), (long)eventWindow,
+                    ((MacWSMsgBool)objc_msgSend)(
+                        self, sel_registerName("isActive")) ? "YES" : "NO");
+                fflush(stderr);
+            }
         }
     }
     if (MacWSOriginalApplicationSendEvent)
@@ -797,12 +811,14 @@ static void MacWSInstallApplicationKeyWitness(void) {
             MacWSOriginalApplicationSendEvent = (MacWSSendEvent)implementation;
             method_setImplementation(method,
                 (IMP)MacWSAppInputApplicationSendEvent);
-            fprintf(stderr,
-                "#### APP-INPUT KEY-WITNESS installed "
-                "-[NSApplication sendEvent:] display-settle=%ums "
-                "(diagnostic scaffold)\n",
-                MacWSApplicationDisplaySettleMilliseconds);
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT KEY-WITNESS installed "
+                    "-[NSApplication sendEvent:] display-settle=%ums "
+                    "(diagnostic scaffold)\n",
+                    MacWSApplicationDisplaySettleMilliseconds);
+                fflush(stderr);
+            }
         }
     }
     Method activationMethod = applicationClass ? class_getInstanceMethod(
@@ -815,10 +831,12 @@ static void MacWSInstallApplicationKeyWitness(void) {
                 (MacWSHandleApplicationEvent)implementation;
             method_setImplementation(activationMethod,
                 (IMP)MacWSAppInputHandleActivatedEvent);
-            fprintf(stderr,
-                "#### APP-INPUT ACTIVATION-WITNESS installed "
-                "-[NSApplication _handleActivatedEvent:]\n");
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT ACTIVATION-WITNESS installed "
+                    "-[NSApplication _handleActivatedEvent:]\n");
+                fflush(stderr);
+            }
         }
     }
 }
@@ -861,6 +879,7 @@ static void MacWSSetAppInputGestureHitView(id view) {
 
 static void MacWSLogAppInputGestureHitResult(const char *phase,
                                              uint32_t gesture) {
+    if (!MacWSRuntimeDiagnosticsEnabled()) return;
     id view = (__bridge id)MacWSAppInputGestureHitView;
     if (!view) return;
     BOOL enabled = ![view respondsToSelector:sel_registerName("isEnabled")] ||
@@ -1035,10 +1054,12 @@ static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
                 (MacWSPressedMouseButtons)implementation;
             method_setImplementation(method,
                 (IMP)MacWSAppInputPressedMouseButtons);
-            fprintf(stderr,
-                "#### APP-INPUT STATE-BRIDGE installed "
-                "+[NSEvent pressedMouseButtons]\n");
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT STATE-BRIDGE installed "
+                    "+[NSEvent pressedMouseButtons]\n");
+                fflush(stderr);
+            }
         }
     }
 
@@ -1051,10 +1072,12 @@ static void MacWSInstallPressedMouseButtonsBridge(Class eventClass) {
             MacWSOriginalMouseLocation = (MacWSMouseLocation)implementation;
             method_setImplementation(locationMethod,
                 (IMP)MacWSAppInputCurrentMouseLocation);
-            fprintf(stderr,
-                "#### APP-INPUT STATE-BRIDGE installed "
-                "+[NSEvent mouseLocation]\n");
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT STATE-BRIDGE installed "
+                    "+[NSEvent mouseLocation]\n");
+                fflush(stderr);
+            }
         }
     }
 }
@@ -1112,10 +1135,12 @@ static void MacWSMenuEventLoopWitness(id self, SEL command, BOOL track,
                                       id mode) {
     id previous = MacWSAppInputTrackingMenuPresentation;
     MacWSAppInputTrackingMenuPresentation = self;
-    fprintf(stderr,
-            "#### APP-INPUT MENU-TRACK-BEGIN pid=%d presentation=%s\n",
-            getpid(), object_getClassName(self));
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "#### APP-INPUT MENU-TRACK-BEGIN pid=%d presentation=%s\n",
+                getpid(), object_getClassName(self));
+        fflush(stderr);
+    }
     MacWSMenuEventLoop original = NULL;
     for (Class candidate = object_getClass(self); candidate && !original;
          candidate = class_getSuperclass(candidate)) {
@@ -1135,10 +1160,12 @@ static void MacWSMenuEventLoopWitness(id self, SEL command, BOOL track,
                 getpid(), object_getClassName(self));
         fflush(stderr);
     }
-    fprintf(stderr,
-            "#### APP-INPUT MENU-TRACK-END pid=%d presentation=%s\n",
-            getpid(), object_getClassName(self));
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "#### APP-INPUT MENU-TRACK-END pid=%d presentation=%s\n",
+                getpid(), object_getClassName(self));
+        fflush(stderr);
+    }
     MacWSAppInputTrackingMenuPresentation = previous;
 }
 
@@ -1206,16 +1233,20 @@ static void MacWSInstallMenuEventLoopWitness(void) {
             };
         method_setImplementation(directMethod,
                                  (IMP)MacWSMenuEventLoopWitness);
-        fprintf(stderr,
-                "#### APP-INPUT MENU-TRACK-WITNESS hook class=%s types=%s\n",
-                class_getName(candidate), types);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                    "#### APP-INPUT MENU-TRACK-WITNESS hook class=%s types=%s\n",
+                    class_getName(candidate), types);
+            fflush(stderr);
+        }
     }
     free(classes);
-    fprintf(stderr,
-            "#### APP-INPUT MENU-TRACK-WITNESS installed hooks=%zu\n",
-            MacWSMenuEventLoopHookCount);
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+                "#### APP-INPUT MENU-TRACK-WITNESS installed hooks=%zu\n",
+                MacWSMenuEventLoopHookCount);
+        fflush(stderr);
+    }
 }
 
 static id MacWSActiveMenuPresentationInstance(void) {
@@ -1284,13 +1315,15 @@ static void MacWSOrderOutObservedMenuWindow(id application,
                     orderOut);
             if (canOrderOut)
                 ((MacWSMsgVoid)objc_msgSend)(manager, orderOut);
-            fprintf(stderr,
-                "#### APP-INPUT KEY-MENU-UPDATE pid=%d "
-                "window=%ld manager=%s route=%s\n",
-                getpid(), (long)windowNumber,
-                manager ? object_getClassName(manager) : "nil",
-                canOrderOut ? "native-manager-order-out" : "no-manager");
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT KEY-MENU-UPDATE pid=%d "
+                    "window=%ld manager=%s route=%s\n",
+                    getpid(), (long)windowNumber,
+                    manager ? object_getClassName(manager) : "nil",
+                    canOrderOut ? "native-manager-order-out" : "no-manager");
+                fflush(stderr);
+            }
             CFRelease(retainedApplication);
         });
 }
@@ -1310,10 +1343,12 @@ static BOOL MacWSCancelCarbonMenuTrackingForEscape(id application,
     dispatch_once(&cancelOnce, ^{
         cancelMenuTracking = (MacWSCancelMenuTrackingPrivate)dlsym(
             RTLD_DEFAULT, "_CancelMenuTracking");
-        fprintf(stderr,
-            "#### APP-INPUT CARBON-MENU-CANCEL resolve=%p\n",
-            (void *)cancelMenuTracking);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT CARBON-MENU-CANCEL resolve=%p\n",
+                (void *)cancelMenuTracking);
+            fflush(stderr);
+        }
     });
     if (!cancelMenuTracking) return NO;
 
@@ -1326,11 +1361,13 @@ static BOOL MacWSCancelCarbonMenuTrackingForEscape(id application,
         int32_t status = cancelMenuTracking(1);
         id app = retainedApplication ? (__bridge id)retainedApplication : nil;
         MacWSOrderOutObservedMenuWindow(app, windowNumber);
-        fprintf(stderr,
-            "#### APP-INPUT CARBON-MENU-CANCEL pid=%d window=%ld "
-            "immediate=YES status=%d route=hitoolbox-active-tracker\n",
-            getpid(), (long)windowNumber, status);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT CARBON-MENU-CANCEL pid=%d window=%ld "
+                "immediate=YES status=%d route=hitoolbox-active-tracker\n",
+                getpid(), (long)windowNumber, status);
+            fflush(stderr);
+        }
         if (retainedApplication) CFRelease(retainedApplication);
         CFRelease(mainRunLoop);
     });
@@ -1359,12 +1396,14 @@ static BOOL MacWSCancelActiveMenuForEscape(id application,
     if ((menuSurface || secondaryTracker) &&
         MacWSCancelCarbonMenuTrackingForEscape(
             application, menuSurface ? windowNumber : 0)) {
-        fprintf(stderr,
-            "#### APP-INPUT KEY-MENU-CANCEL pid=%d window=%ld "
-            "source=%s route=hitoolbox-active-tracker\n",
-            getpid(), (long)windowNumber,
-            menuSurface ? "menu-window" : "secondary-tracker");
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT KEY-MENU-CANCEL pid=%d window=%ld "
+                "source=%s route=hitoolbox-active-tracker\n",
+                getpid(), (long)windowNumber,
+                menuSurface ? "menu-window" : "secondary-tracker");
+            fflush(stderr);
+        }
         return YES;
     }
 
@@ -1403,12 +1442,14 @@ static BOOL MacWSCancelActiveMenuForEscape(id application,
     // real windowID, while -orderOut sends orderOut: to that manager's retained
     // window. Ordinary application windows can never enter this route.
     MacWSOrderOutObservedMenuWindow(application, windowNumber);
-    fprintf(stderr,
-        "#### APP-INPUT KEY-MENU-CANCEL pid=%d presentation=%s "
-        "window=%ld source=%s route=close-root-impl-no-animation\n",
-        getpid(), object_getClassName(presentation), (long)windowNumber,
-        source);
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT KEY-MENU-CANCEL pid=%d presentation=%s "
+            "window=%ld source=%s route=close-root-impl-no-animation\n",
+            getpid(), object_getClassName(presentation), (long)windowNumber,
+            source);
+        fflush(stderr);
+    }
     return YES;
 }
 
@@ -1534,10 +1575,12 @@ static BOOL MacWSPostKeyRecord(MacWSInputRecord record, id application,
         if (record.kind == MacWSInputKindKeyUp &&
             atomic_exchange_explicit(&MacWSAppInputConsumeEscapeUp, NO,
                                      memory_order_acq_rel)) {
-            fprintf(stderr,
-                "#### APP-INPUT KEY-MENU-CANCEL pid=%d route=consume-key-up\n",
-                getpid());
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT KEY-MENU-CANCEL pid=%d route=consume-key-up\n",
+                    getpid());
+                fflush(stderr);
+            }
             return YES;
         }
         if (record.kind == MacWSInputKindKeyDown &&
@@ -1798,7 +1841,8 @@ static id MacWSWindowForScreenPoint(id application, CGPoint screenPoint) {
             application, applicationWindowSelector, globalWindowNumber);
         if (globalWindow) {
             static unsigned transientWindowLogs;
-            if (transientWindowLogs++ < 24) {
+            if (MacWSRuntimeDiagnosticsEnabled() &&
+                transientWindowLogs++ < 24) {
                 CGRect frame = ((MacWSMsgRect)objc_msgSend)(
                     globalWindow, frameSelector);
                 fprintf(stderr,
@@ -1940,11 +1984,13 @@ static BOOL MacWSCompleteFrontUILostLifecycle(void) {
                     0x4d608, frontUILostPrologue,
                     sizeof(frontUILostPrologue));
         }
-        fprintf(stderr,
-            "#### APP-INPUT FRONT-UI-LOST-RESOLVE pid=%d "
-            "get-app-object=%p front-ui-lost=%p\n",
-            getpid(), getAppObject, frontUILost);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT FRONT-UI-LOST-RESOLVE pid=%d "
+                "get-app-object=%p front-ui-lost=%p\n",
+                getpid(), getAppObject, frontUILost);
+            fflush(stderr);
+        }
     });
     if (!getAppObject || !frontUILost) return NO;
     void *application = getAppObject();
@@ -2026,22 +2072,26 @@ static BOOL MacWSDeliverMissingActivateEvent(id application) {
     BOOL authenticWindowlessSystemEvent =
         eventWindowNumber == 0 && eventData2 == 64;
     if (!recentOwnedWindowEvent && !authenticWindowlessSystemEvent) {
-        fprintf(stderr,
-            "#### APP-INPUT SYSTEM-ACTIVATE-REPLAY-REJECT pid=%d "
-            "age=%.3f window=%ld owned=%s data1=%ld data2=%ld\n",
-            getpid(), age, (long)eventWindowNumber,
-            eventWindow ? "YES" : "NO", (long)eventData1,
-            (long)eventData2);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT SYSTEM-ACTIVATE-REPLAY-REJECT pid=%d "
+                "age=%.3f window=%ld owned=%s data1=%ld data2=%ld\n",
+                getpid(), age, (long)eventWindowNumber,
+                eventWindow ? "YES" : "NO", (long)eventData1,
+                (long)eventData2);
+            fflush(stderr);
+        }
         return NO;
     }
-    fprintf(stderr,
-        "#### APP-INPUT SYSTEM-ACTIVATE-REPLAY pid=%d age=%.3f "
-        "window=%ld data1=%ld data2=%ld provenance=%s\n",
-        getpid(), age, (long)eventWindowNumber, (long)eventData1,
-        (long)eventData2, recentOwnedWindowEvent
-            ? "RECENT-OWNED-WINDOW" : "AUTHENTIC-WINDOWLESS-SYSTEM");
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT SYSTEM-ACTIVATE-REPLAY pid=%d age=%.3f "
+            "window=%ld data1=%ld data2=%ld provenance=%s\n",
+            getpid(), age, (long)eventWindowNumber, (long)eventData1,
+            (long)eventData2, recentOwnedWindowEvent
+                ? "RECENT-OWNED-WINDOW" : "AUTHENTIC-WINDOWLESS-SYSTEM");
+        fflush(stderr);
+    }
     CFRetain((__bridge CFTypeRef)event);
     MacWSOriginalHandleActivatedEvent(
         application, sel_registerName("_handleActivatedEvent:"), event);
@@ -2115,17 +2165,19 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             MacWSCompleteFrontUILostLifecycle();
         const char *clearedMainMenuBar =
             MacWSClearMainMenuBar(application);
-        fprintf(stderr,
-            "#### APP-INPUT SYSTEM-DEACTIVATE pid=%d active=%s->%s->%s "
-            "missing-event=%s front-ui-lost=%s clear-menu=%s\n",
-            getpid(), before ? "YES" : "NO",
-            afterPublicDeactivate ? "YES" : "NO",
-            ((MacWSMsgBool)objc_msgSend)(
-                application, sel_registerName("isActive")) ? "YES" : "NO",
-            repairedMissingEvent ? "DELIVERED" : "NO",
-            completedFrontUILost ? "COMPLETED" : "UNAVAILABLE",
-            clearedMainMenuBar);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT SYSTEM-DEACTIVATE pid=%d active=%s->%s->%s "
+                "missing-event=%s front-ui-lost=%s clear-menu=%s\n",
+                getpid(), before ? "YES" : "NO",
+                afterPublicDeactivate ? "YES" : "NO",
+                ((MacWSMsgBool)objc_msgSend)(
+                    application, sel_registerName("isActive")) ? "YES" : "NO",
+                repairedMissingEvent ? "DELIVERED" : "NO",
+                completedFrontUILost ? "COMPLETED" : "UNAVAILABLE",
+                clearedMainMenuBar);
+            fflush(stderr);
+        }
         return;
     }
     if (record.kind == MacWSInputKindActivateTarget) {
@@ -2144,11 +2196,13 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             // native down enters a current tracker.  This creates no NSEvent.
             preflightOwner = MacWSRepairFrontUIApplication(
                 application, "system-menu-preflight");
-            fprintf(stderr,
-                "#### APP-INPUT SYSTEM-MENU-PREFLIGHT pid=%d active=YES "
-                "front-owner=%s native-down=pending\n",
-                getpid(), preflightOwner ? "YES" : "NO");
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT SYSTEM-MENU-PREFLIGHT pid=%d active=YES "
+                    "front-owner=%s native-down=pending\n",
+                    getpid(), preflightOwner ? "YES" : "NO");
+                fflush(stderr);
+            }
         }
         SEL activateSelector = sel_registerName("activateIgnoringOtherApps:");
         if (((MacWSMsgBoolSEL)objc_msgSend)(
@@ -2190,29 +2244,33 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                                 MacWSRepairFrontUIApplication(
                                     application, before
                                         ? "native-active" : "direct");
-                            fprintf(stderr,
-                                "#### APP-INPUT SYSTEM-ACTIVATE-SETTLED "
-                                "pid=%d active=%s lifecycle-rebuilt=%s "
-                                "missing-event=%s front-owner=%s\n",
-                                getpid(),
-                                ((MacWSMsgBool)objc_msgSend)(
-                                    application,
-                                    sel_registerName("isActive"))
-                                    ? "YES" : "NO",
-                                "NO",
-                                missingActivationDelivered
-                                    ? "DELIVERED" : "NO",
-                                ownsFrontUIProcess ? "YES" : "NO");
-                            fflush(stderr);
+                            if (MacWSRuntimeDiagnosticsEnabled()) {
+                                fprintf(stderr,
+                                    "#### APP-INPUT SYSTEM-ACTIVATE-SETTLED "
+                                    "pid=%d active=%s lifecycle-rebuilt=%s "
+                                    "missing-event=%s front-owner=%s\n",
+                                    getpid(),
+                                    ((MacWSMsgBool)objc_msgSend)(
+                                        application,
+                                        sel_registerName("isActive"))
+                                        ? "YES" : "NO",
+                                    "NO",
+                                    missingActivationDelivered
+                                        ? "DELIVERED" : "NO",
+                                    ownsFrontUIProcess ? "YES" : "NO");
+                                fflush(stderr);
+                            }
                         });
                 });
         }
-        fprintf(stderr,
-            "#### APP-INPUT SYSTEM-ACTIVATE-CONTROL pid=%d active=%s "
-            "coordination=%s\n",
-            getpid(), before ? "YES" : "NO",
-            before ? "PRESERVE-NATIVE" : "DIRECT");
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT SYSTEM-ACTIVATE-CONTROL pid=%d active=%s "
+                "coordination=%s\n",
+                getpid(), before ? "YES" : "NO",
+                before ? "PRESERVE-NATIVE" : "DIRECT");
+            fflush(stderr);
+        }
         return;
     }
 
@@ -2289,7 +2347,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         id keyWindow = ((MacWSMsgID)objc_msgSend)(application,
             sel_registerName("keyWindow"));
         static unsigned focusLogs;
-        if (focusLogs++ < 12) {
+        if (MacWSRuntimeDiagnosticsEnabled() && focusLogs++ < 12) {
             fprintf(stderr,
                 "#### APP-INPUT FOCUS pid=%d gesture=%u active=%s->%s "
                 "key=%ld->%ld selected=%ld\n",
@@ -2308,8 +2366,9 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         sel_registerName("windowNumber"));
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,
         sel_registerName("convertPointFromScreen:"), screenPoint);
-    if (record.kind == MacWSInputKindTouchDown ||
-        record.kind == MacWSInputKindTap) {
+    if (MacWSRuntimeDiagnosticsEnabled() &&
+        (record.kind == MacWSInputKindTouchDown ||
+         record.kind == MacWSInputKindTap)) {
         id contentView = ((MacWSMsgID)objc_msgSend)(window,
             sel_registerName("contentView"));
         CGPoint contentPoint = contentView
@@ -2333,7 +2392,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             fflush(stderr);
         }
     }
-    if (record.kind == MacWSInputKindTouchDown) {
+    if (MacWSRuntimeDiagnosticsEnabled() &&
+        record.kind == MacWSInputKindTouchDown) {
         static unsigned geometryLogs;
         if (geometryLogs++ < 3) {
             id ordered = ((MacWSMsgID)objc_msgSend)(application,
@@ -2434,13 +2494,15 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             memory_order_release);
         MacWSAppInputRFBTrackingActive = NO;
         MacWSAppInputRFBTrackingButtons = 0;
-        fprintf(stderr,
-            "#### APP-INPUT TAP-COMPLETE pid=%d button=%s gesture=%u window=%ld "
-            "screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
-            getpid(), secondary ? "secondary" : "primary",
-            record.contactID, (long)windowNumber,
-            screenPoint.x, screenPoint.y, windowPoint.x, windowPoint.y);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT TAP-COMPLETE pid=%d button=%s gesture=%u window=%ld "
+                "screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
+                getpid(), secondary ? "secondary" : "primary",
+                record.contactID, (long)windowNumber,
+                screenPoint.x, screenPoint.y, windowPoint.x, windowPoint.y);
+            fflush(stderr);
+        }
         MacWSLogAppInputGestureHitResult("tap", record.contactID);
         MacWSSetAppInputGestureWindow(nil);
         MacWSClearDeferredRFBMoveEvents();
@@ -2509,11 +2571,13 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             // release.
             [MacWSAppInputDeferredRFBMoveEvents removeAllObjects];
             [MacWSAppInputDeferredRFBMoveEvents addObject:event];
-            fprintf(stderr,
-                "#### APP-INPUT LIVE-FALLBACK pid=%d gesture=%u "
-                "reason=pending-record\n",
-                getpid(), record.contactID);
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT LIVE-FALLBACK pid=%d gesture=%u "
+                    "reason=pending-record\n",
+                    getpid(), record.contactID);
+                fflush(stderr);
+            }
         } else {
             ((MacWSSendEvent)objc_msgSend)(application,
                 sel_registerName("sendEvent:"), downEvent);
@@ -2522,12 +2586,14 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             MacWSAppInputRFBTrackingButtons = 0;
             MacWSClearDirectTrackingContextLocked();
             pthread_mutex_unlock(&MacWSAppInputRouteLock);
-            fprintf(stderr,
-                "#### APP-INPUT LIVE-DISPATCH-RETURN pid=%d gesture=%u "
-                "window=%ld first-move=(%.2f,%.2f)\n",
-                getpid(), record.contactID, (long)windowNumber,
-                screenPoint.x, screenPoint.y);
-            fflush(stderr);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT LIVE-DISPATCH-RETURN pid=%d gesture=%u "
+                    "window=%ld first-move=(%.2f,%.2f)\n",
+                    getpid(), record.contactID, (long)windowNumber,
+                    screenPoint.x, screenPoint.y);
+                fflush(stderr);
+            }
             MacWSLogAppInputGestureHitResult("live-drag", record.contactID);
             [downEvent release];
             MacWSSetAppInputGestureWindow(nil);
@@ -2564,12 +2630,14 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             sel_registerName("sendEvent:"), downEvent);
         MacWSAppInputRFBTrackingActive = NO;
         MacWSAppInputRFBTrackingButtons = 0;
-        fprintf(stderr,
-            "#### APP-INPUT GESTURE-DISPATCH-RETURN pid=%d gesture=%u "
-            "window=%ld moves=%lu release=(%.2f,%.2f)\n",
-            getpid(), record.contactID, (long)windowNumber,
-            (unsigned long)[moves count], screenPoint.x, screenPoint.y);
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT GESTURE-DISPATCH-RETURN pid=%d gesture=%u "
+                "window=%ld moves=%lu release=(%.2f,%.2f)\n",
+                getpid(), record.contactID, (long)windowNumber,
+                (unsigned long)[moves count], screenPoint.x, screenPoint.y);
+            fflush(stderr);
+        }
         MacWSLogAppInputGestureHitResult("drag", record.contactID);
         [moves release];
         [downEvent release];
@@ -2950,9 +3018,11 @@ static void MacWSScheduleTargetProbeReply(MacWSInputTargetProbe probe) {
 
 static void *MacWSAppInputThread(void *unused) {
     (void)unused;
-    fprintf(stderr, "#### APP-INPUT THREAD pid=%d socket=%d\n",
-            getpid(), MacWSAppInputSocket);
-    fflush(stderr);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr, "#### APP-INPUT THREAD pid=%d socket=%d\n",
+                getpid(), MacWSAppInputSocket);
+        fflush(stderr);
+    }
     while (MacWSAppInputSocket >= 0) {
         union {
             MacWSInputRecord record;
@@ -3055,10 +3125,12 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     pthread_t thread;
     if (pthread_create(&thread, NULL, MacWSAppInputThread, NULL) == 0) {
         pthread_detach(thread);
-        fprintf(stderr, "#### APP-INPUT READY pid=%d socket=%s abi=%u record=%zu\n",
-                getpid(), MacWSAppInputPath, MACWS_INPUT_VERSION,
-                sizeof(MacWSInputRecord));
-        fflush(stderr);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr, "#### APP-INPUT READY pid=%d socket=%s abi=%u record=%zu\n",
+                    getpid(), MacWSAppInputPath, MACWS_INPUT_VERSION,
+                    sizeof(MacWSInputRecord));
+            fflush(stderr);
+        }
     }
 }
 
