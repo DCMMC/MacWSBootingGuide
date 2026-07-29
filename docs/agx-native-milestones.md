@@ -1922,3 +1922,30 @@ successful wake datagram.  Full lifecycle testing also reconfirmed that plain
 requires `start coexist --experimental`.  These timing distributions and the
 productization boundary are recorded in
 [`vnc-usability-stability-20260729/README.md`](evidence/vnc-usability-stability-20260729/README.md#9-secondary-down-observation-and-remaining-rfb-latency).
+
+## 2026-07-29: one system input owner covers menu bar, nested menus and drag
+
+VNC input is now deliberately owned by one system-wide CoreGraphics stream,
+not broadcast through every process-local AppInputBridge endpoint. This
+ownership boundary is required for WindowServer's menu bar, nested NSMenu
+trackers, cross-process contextual menus and NSWindow title drag. AppInputBridge
+remains the native-host/process fallback and now provides observational mouse
+entry/return timing even in Electron processes that realize NSApplication
+after injection. The GUI lifecycle also starts the real macOS pboard and pbs;
+launchd runtime-confirmed an active `com.apple.pbs.fetch_services` endpoint.
+
+The current deployed build visually completed a Terminal contextual menu in
+0.295 seconds, opened Shell in 0.298 seconds, switched Shell to Edit in 0.028
+seconds, and opened the nested New Window profile submenu. VS Code completed
+three consecutive contextual-menu opens, its menu bar switched correctly, and
+a Terminal keyboard burst visibly completed its command and output.
+
+The remaining drag delay was independently traced to the real RFB encoder: one
+pre-fix Zlib frame spent 1583.618 ms sending while copying the 3,983,184 pixels
+took 1.868 ms. RE of the installed encoder established the Zlib/Tight
+compression fields. Clamping only their work factor to level 1 reduced the
+same visible title-drag completion from 1.949 to 0.485 seconds; the rendered
+pixels, negotiated encoding and native-AGX path are unchanged. Live
+intermediate title motion and occasional full-frame socket backpressure remain
+open. Exact runtime logs and screenshots are in
+[`system-wide-input-current/results.md`](evidence/vnc-usability-stability-20260729/system-wide-input-current/results.md).

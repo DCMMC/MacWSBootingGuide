@@ -321,3 +321,35 @@ Plain `start coexist` runtime-logged `share=0` and exposed an all-black
 1194x834 framebuffer.  The experimental start logged `share=1`, waited for a
 validated frame, and restored the 2388x1668 workbench.  This is an explicit
 remaining productization issue, not something hidden by the input fix.
+
+## 10. One system input owner, nested menus, and low-latency compression
+
+The final ownership pass removed the remaining conceptual split: VNC does not
+attempt to make AppInputBridge broadcast private NSEvents into every process.
+The generated OSXvnc job enables its original system CoreGraphics path for all
+pointer actions, after Retina coordinate normalization. This is the only route
+that coherently reaches the WindowServer menu bar, NSMenu's nested event
+trackers, cross-process contextual menus, and NSWindow's title-drag tracker.
+AppInputBridge remains the process fallback/native-host route and now supplies
+an observational `sendEvent:` entry/return witness even when Electron realizes
+NSApplication after dylib construction.
+
+On the current installed build, Terminal's contextual menu appeared in 0.295
+seconds, its Shell menu in 0.298 seconds, Shell-to-Edit hover switched in 0.028
+seconds, and hovering New Window opened the real nested profile submenu. VS
+Code's editor contextual menu opened visibly in 3/3 repetitions. A keyboard
+burst visibly completed `echo system-menu-ok` and its output. The lifecycle
+now starts both the real `pboard` and `pbs`; launchd showed an active
+`com.apple.pbs.fetch_services` endpoint.
+
+RE of the exact arm64 RFB encoders then separated a major latency source from
+input. A pre-fix moved-window update spent 1583.618 ms in
+`rfbSendFramebufferUpdate` while mmap copying took 1.868 ms. The server now
+preserves the negotiated Zlib/Tight encoding but clamps its compression work
+factor to level 1. The same title drag's visible completion fell from 1.949 to
+0.485 seconds, and two changed frames at the new setting took 116.163 and
+100.851 ms at the actual send boundary.
+
+The full screenshots, verbatim logs, RE offsets and remaining live-drag
+limitation are recorded in
+[`system-wide-input-current/results.md`](system-wide-input-current/results.md).

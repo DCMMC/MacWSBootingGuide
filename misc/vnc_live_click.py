@@ -13,22 +13,39 @@ import select
 import socket
 import struct
 import time
+import zlib
 
 import vnc_capture
 
 
-def configure_raw(sock):
+def configure_encoding(sock, encoding):
+    encoding_numbers = {
+        "raw": 0,
+        "hextile": 5,
+        "zlib": 6,
+    }
+    if encoding not in encoding_numbers:
+        raise ValueError(f"unsupported encoding {encoding!r}")
     pixel_format = struct.pack(
         ">BBBBHHHBBBxxx", 32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
     sock.sendall(b"\x00\x00\x00\x00" + pixel_format)
-    sock.sendall(struct.pack(">BBHi", 2, 0, 1, 0))
+    sock.sendall(struct.pack(
+        ">BBHi", 2, 0, 1, encoding_numbers[encoding]))
+
+
+def configure_raw(sock):
+    configure_encoding(sock, "raw")
 
 
 def configure_hextile(sock):
-    pixel_format = struct.pack(
-        ">BBBBHHHBBBxxx", 32, 24, 0, 1, 255, 255, 255, 16, 8, 0)
-    sock.sendall(b"\x00\x00\x00\x00" + pixel_format)
-    sock.sendall(struct.pack(">BBHi", 2, 0, 1, 5))
+    configure_encoding(sock, "hextile")
+
+
+def configure_zlib(sock):
+    configure_encoding(sock, "zlib")
+
+
+_zlib_decoders = {}
 
 
 def request_update(sock, width, height, incremental):
@@ -62,6 +79,10 @@ def receive_update(sock, width, framebuffer):
                     receive_hextile_rectangle(
                         sock, width, framebuffer, x, y,
                         rect_width, rect_height)
+                elif encoding == 6:
+                    receive_zlib_rectangle(
+                        sock, width, framebuffer, x, y,
+                        rect_width, rect_height)
                 elif encoding not in (-223, -224):
                     raise RuntimeError(
                         f"unexpected RFB encoding {encoding}")
@@ -76,6 +97,26 @@ def receive_update(sock, width, framebuffer):
             continue
         raise RuntimeError(
             f"unexpected RFB server message {message_type}")
+
+
+def receive_zlib_rectangle(sock, width, framebuffer, x, y,
+                           rect_width, rect_height):
+    """Decode LibVNCServer's persistent Zlib encoding stream."""
+    compressed_length = struct.unpack(
+        ">I", vnc_capture.recv_exact(sock, 4))[0]
+    compressed = vnc_capture.recv_exact(sock, compressed_length)
+    decoder = _zlib_decoders.setdefault(sock.fileno(), zlib.decompressobj())
+    pixels = decoder.decompress(compressed)
+    expected = rect_width * rect_height * 4
+    if len(pixels) != expected:
+        raise RuntimeError(
+            f"zlib rectangle decoded {len(pixels)} bytes, expected {expected}")
+    row_bytes = rect_width * 4
+    for row in range(rect_height):
+        source = row * row_bytes
+        destination = ((y + row) * width + x) * 4
+        framebuffer[destination:destination + row_bytes] = \
+            pixels[source:source + row_bytes]
 
 
 def receive_hextile_rectangle(sock, width, framebuffer, x, y,

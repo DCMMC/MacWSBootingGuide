@@ -143,6 +143,10 @@ def main():
     parser.add_argument("host")
     parser.add_argument("--port", type=int, default=5900)
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument("--encoding", choices=("raw", "hextile", "zlib"),
+                        default="zlib",
+                        help="RFB encoding used for retained updates "
+                             "(default: zlib)")
     parser.add_argument("--max-updates", type=int, default=20)
     parser.add_argument("--drag-steps", type=int, default=8)
     parser.add_argument("--drag-step-delay", type=float, default=0.02)
@@ -163,6 +167,9 @@ def main():
     parser.add_argument("--left-click", nargs=2, type=int,
                         metavar=("X", "Y"),
                         help="send one RFB primary-button down/up pair")
+    parser.add_argument("--move", nargs=2, type=int,
+                        metavar=("X", "Y"),
+                        help="send one button-free RFB pointer move")
     parser.add_argument("--text")
     parser.add_argument("--output", help="save the final retained framebuffer")
     args = parser.parse_args()
@@ -171,7 +178,7 @@ def main():
     content_drag = parse_drag(parser, args.content_drag, "--content-drag")
     if (title_drag is None and content_drag is None and
             args.right_click is None and args.left_click is None and
-            args.text is None):
+            args.move is None and args.text is None):
         parser.error("select at least one input operation")
     if (args.timeout <= 0 or args.max_updates < 1 or args.drag_steps < 1 or
             args.drag_step_delay < 0 or args.key_delay < 0 or
@@ -183,13 +190,17 @@ def main():
     framebuffer = bytearray(width * height * 4)
     completed = 0
     try:
-        vnc_live_click.configure_raw(sock)
+        vnc_live_click.configure_encoding(sock, args.encoding)
         vnc_live_click.request_update(sock, width, height, False)
         initial = vnc_live_click.receive_update(sock, width, framebuffer)
         digest = frame_digest(framebuffer)
         initial_digest = digest
+        initial_pixels = sum(rect[2] * rect[3] for rect in initial
+                             if rect[4] >= 0)
         print(f"INPUT start name={name!r} size={width}x{height} "
-              f"initial={initial} digest={digest}", flush=True)
+              f"initial_rectangles={len(initial)} "
+              f"initial_pixels={initial_pixels} digest={digest}",
+              flush=True)
 
         operations = []
         if title_drag is not None:
@@ -227,6 +238,17 @@ def main():
             send_pointer_click(sock, left_click, 1)
             digest, _ = request_and_wait(
                 sock, width, height, framebuffer, digest, "left-click",
+                started, args.timeout, args.max_updates)
+            completed += 1
+
+        if args.move is not None:
+            move = tuple(args.move)
+            check_point(width, height, *move)
+            vnc_live_click.request_update(sock, width, height, True)
+            started = time.monotonic()
+            sock.sendall(struct.pack(">BBHH", 5, 0, move[0], move[1]))
+            digest, _ = request_and_wait(
+                sock, width, height, framebuffer, digest, "move",
                 started, args.timeout, args.max_updates)
             completed += 1
 

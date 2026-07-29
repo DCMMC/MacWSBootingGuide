@@ -46,10 +46,12 @@ GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
+PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
 INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 VNC_LABEL=com.macwsguide.osxvnc
 TERM_LABEL=com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
+PBS_LABEL=com.macwsguide.pbs
 INPUT_LABEL=com.macwsguide.input
 VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
 VSCODE_LABEL=com.macwsguide.vscode
@@ -79,6 +81,7 @@ STARTED_WS_PID=""
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
 PBOARD_BIN=/usr/libexec/pboard
+PBS_BIN=/System/Library/CoreServices/pbs
 VNC_DESKTOP=macOS-iPad
 
 SPRINGBOARD=/System/Library/LaunchDaemons/com.apple.SpringBoard.plist
@@ -91,6 +94,7 @@ P_LAUNCHSERVICESD='CoreServices/launchservicesd'
 P_OSXVNC='OSXvnc-server'
 P_TERMINAL='Utilities/Terminal.app/Contents/MacOS/Terminal'
 P_PBOARD='/usr/libexec/pboard'
+P_PBS='/System/Library/CoreServices/pbs'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
@@ -537,6 +541,17 @@ write_plists() {
         <string>${ROOTFS}</string>
         <string>${VNC_BIN}</string>
         <string>-rfbnoauth</string>
+        <!--
+          The installed OSXvnc-server defaults rfbDeferUpdateTime to 40 ms.
+          RE-confirmed at arm64 clientOutput+0xec: it unlocks the client mutex,
+          sleeps defer*1000, then relocks before intersecting damage and
+          calling rfbSendFramebufferUpdate. The shared-frame producer and
+          generation watcher already coalesce at a bounded frame cadence, so
+          this second fixed delay only lengthens menu/drag feedback and holds
+          the single clientOutput stream behind later damage.
+        -->
+        <string>-deferupdate</string>
+        <string>0</string>
         <string>-desktop</string>
         <string>${VNC_DESKTOP}</string>
     </array>
@@ -558,6 +573,18 @@ write_plists() {
           must not duplicate an active VNC gesture in one target process.
         -->
         <key>MACWS_VNC_NATIVE_ALL</key>
+        <string>1</string>
+        <!--
+          The Retina desktop is 15.2 MiB uncompressed. Runtime timing at the
+          actual rfbSendFramebufferUpdate boundary showed a moved-window Zlib
+          frame spending 1584 ms in encoding/socket output while mmap copy
+          used 1.87 ms. Controlled Tight full-frame requests on this device
+          made compression level 1 the lowest-latency measured setting
+          (343 ms versus 544 ms at level 6 and 1184 ms at level 9). libmachook
+          preserves the client-selected encoding but clamps its compression
+          work factor to level 1 before the stream is initialized.
+        -->
+        <key>MACWS_VNC_LOW_LATENCY_COMPRESSION</key>
         <string>1</string>
     </dict>
     <key>StandardOutPath</key>
@@ -606,6 +633,50 @@ PLIST
     <string>${LOGDIR}/pboard.log</string>
     <key>StandardErrorPath</key>
     <string>${LOGDIR}/pboard.log</string>
+</dict>
+</plist>
+PLIST
+
+    # AppKit does not build the Services submenu in-process. Runtime evidence
+    # on 2026-07-29 showed Terminal requesting
+    # com.apple.pbs.fetch_services twice while launchctl had no provider; the
+    # visible submenu remained at "Building...". The actual macOS 13.4
+    # com.apple.pbs LaunchAgent maps that Mach service to
+    # /System/Library/CoreServices/pbs. Recreate that service in the outer
+    # launchd domain and execute the real binary in the chroot.
+    cat > "$PBS_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PBS_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string>
+        <string>0</string>
+        <string>0</string>
+        <string>${ROOTFS}</string>
+        <string>${PBS_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.pbs.fetch_services</key>
+        <true/>
+    </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NSRunningFromLaunchd</key>
+        <string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>${LOGDIR}/pbs.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOGDIR}/pbs.log</string>
 </dict>
 </plist>
 PLIST
@@ -698,9 +769,11 @@ cleanup_macos() {
     launchctl unload "$VNC_PLIST"  2>/dev/null
     launchctl unload "$TERM_PLIST" 2>/dev/null
     launchctl unload "$PBOARD_PLIST" 2>/dev/null
+    launchctl unload "$PBS_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl remove "$PBOARD_LABEL" 2>/dev/null
+    launchctl remove "$PBS_LABEL" 2>/dev/null
 
     # inputd blocks in recv(2), so tear its job down explicitly before the
     # broader directory unload and verify no pre-fix binary remains alive.
@@ -719,6 +792,7 @@ cleanup_macos() {
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
     kill_by_pattern "$P_PBOARD"
+    kill_by_pattern "$P_PBS"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
@@ -789,6 +863,19 @@ start_macos() {
         return 1
     }
 
+    log "Starting macOS Services database service (launchd job '$PBS_LABEL')..."
+    rm -f "$LOGDIR/pbs.log"
+    launchctl load "$PBS_PLIST" || return 1
+    waited=0
+    while ! proc_running "$P_PBS" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_PBS" || {
+        log "ERROR: macOS pbs process did not start."
+        return 1
+    }
+
     if [ "$WANT_VNC" = 1 ]; then
         log "Starting VNC server (launchd job '$VNC_LABEL', persistent)..."
         rm -f "$LOGDIR/osxvnc.log"
@@ -844,7 +931,7 @@ status() {
     fi
     echo
     echo "-- processes --"
-    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD" \
+    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_PBOARD|$P_PBS" \
         | grep -v grep || echo "(none running)"
     echo
     echo "-- launchd jobs --"
@@ -857,7 +944,7 @@ status() {
         echo "VNC: not running"
     fi
     echo
-    echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/WindowServer.err"
+    echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/pboard.log  $LOGDIR/pbs.log  $LOGDIR/WindowServer.err"
 }
 
 usage() {

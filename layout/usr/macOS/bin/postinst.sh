@@ -287,6 +287,7 @@ add_all_trustcache /var/mnt/rootfs/sbin/mount
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
 add_all_trustcache /var/mnt/rootfs/usr/local/bin/OSXvnc-server
 sign_and_trustcache /var/mnt/rootfs/usr/libexec/pboard
+sign_and_trustcache /var/mnt/rootfs/System/Library/CoreServices/pbs
 if [ -d /var/mnt/rootfs/var/jb ] && [ ! "$(ls -A /var/mnt/rootfs/var/jb)" ]; then
 	/var/jb/usr/local/bin/mount_bindfs /var/jb /var/mnt/rootfs/var/jb
 fi

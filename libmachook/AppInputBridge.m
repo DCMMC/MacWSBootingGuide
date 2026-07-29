@@ -199,6 +199,9 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
         event, sel_registerName("type")) : 0;
     uint64_t serial = 0;
     double started = 0.0;
+    uint64_t mouseSerial = 0;
+    double mouseStarted = 0.0;
+    BOOL logMouseReturn = NO;
     id keyWindow = nil;
     id responder = nil;
     if (type == 10 || type == 11) { // NSEventTypeKeyDown / KeyUp
@@ -239,9 +242,11 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
         // state proves whether CGPostMouseEvent delivered a coherent stream;
         // this hook never creates, changes, or suppresses an event.
         static _Atomic uint64_t mouseEvents;
-        uint64_t mouseSerial = atomic_fetch_add_explicit(
+        mouseSerial = atomic_fetch_add_explicit(
             &mouseEvents, 1, memory_order_relaxed) + 1;
-        if (mouseSerial <= 128 || (mouseSerial % 600) == 0) {
+        mouseStarted = MacWSAppInputMonotonicSeconds();
+        logMouseReturn = mouseSerial <= 128 || (mouseSerial % 600) == 0;
+        if (logMouseReturn) {
             NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(
                 event, sel_registerName("windowNumber"));
             CGPoint location = ((MacWSMsgPoint)objc_msgSend)(
@@ -257,12 +262,27 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
                 getpid(), (unsigned long long)mouseSerial,
                 (unsigned long)type, (long)windowNumber,
                 location.x, location.y, (unsigned long)pressed,
-                MacWSAppInputMonotonicSeconds());
+                mouseStarted);
             fflush(stderr);
         }
     }
     if (MacWSOriginalApplicationSendEvent)
         MacWSOriginalApplicationSendEvent(self, command, event);
+    if (logMouseReturn) {
+        double finished = MacWSAppInputMonotonicSeconds();
+        Class eventClass = object_getClass(event);
+        NSUInteger pressed = eventClass
+            ? ((MacWSPressedMouseButtons)objc_msgSend)(
+                (id)eventClass, sel_registerName("pressedMouseButtons"))
+            : 0;
+        fprintf(stderr,
+            "#### APP-INPUT MOUSE-RETURN pid=%d serial=%llu type=%lu "
+            "pressed=%#lx elapsed=%.3fms at=%.6f\n",
+            getpid(), (unsigned long long)mouseSerial,
+            (unsigned long)type, (unsigned long)pressed,
+            (finished - mouseStarted) * 1000.0, finished);
+        fflush(stderr);
+    }
     if (type == 11 && MacWSApplicationDisplaySettleMilliseconds != 0)
         MacWSScheduleApplicationDisplaySettle();
     if (serial != 0 && serial <= 48) {
@@ -326,6 +346,20 @@ static void MacWSInstallApplicationKeyWitness(void) {
         "display-settle=%ums (diagnostic scaffold)\n",
         MacWSApplicationDisplaySettleMilliseconds);
     fflush(stderr);
+}
+
+// Electron injects libmachook before AppKit has necessarily realized
+// NSApplication.  The constructor's immediate lookup can therefore miss the
+// observational sendEvent witness even though the same process later creates
+// native menus. Retry only on the main queue, with a finite five-second
+// window; the bridge's socket/event delivery does not depend on this witness.
+static void MacWSScheduleApplicationKeyWitnessInstall(unsigned attempt) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        MacWSInstallApplicationKeyWitness();
+        if (!MacWSOriginalApplicationSendEvent && attempt < 19)
+            MacWSScheduleApplicationKeyWitnessInstall(attempt + 1);
+    });
 }
 
 static void MacWSSetAppInputGestureWindow(id window) {
@@ -1285,6 +1319,8 @@ static void *MacWSAppInputThread(void *unused) {
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     if (!MacWSAppInputSupportedProcess()) return;
     MacWSInstallApplicationKeyWitness();
+    if (!MacWSOriginalApplicationSendEvent)
+        MacWSScheduleApplicationKeyWitnessInstall(0);
     MacWSAppInputPending = [NSMutableArray new];
     MacWSAppInputDeferredRFBMoveEvents = [NSMutableArray new];
     snprintf(MacWSAppInputPath, sizeof(MacWSAppInputPath),

@@ -12,6 +12,9 @@
 #import "utils.h"
 
 #import <IOSurface/IOSurfaceRef.h>
+#import <sys/file.h>
+#import <sys/socket.h>
+#import <sys/un.h>
 
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
@@ -621,16 +624,165 @@ static void macws_vnc_share_mirror(void *base, size_t sbpr, size_t sh, size_t w)
 // here; OSXvnc mmaps it read-only and blits into frameBufferData. Header (16B):
 // [0]=magic 'VNCF', [1]=w, [2]=h, [3]=stride(=w*4); pixel data follows and an
 // atomic uint64_t publication sequence follows the pixels. Odd means a writer
-// owns the frame; even/nonzero means a complete frame. OSXvnc watches that
-// sequence and feeds a full-display rectangle through its ordinary
-// refreshCallback, which is the missing modifiedRegion notification for a
-// producer that bypasses CoreGraphics capture.
+// owns the frame; even/nonzero means a complete frame. The file descriptor is
+// retained so producer writes can also hold an advisory exclusive flock.
+// OSXvnc takes the matching shared lock while copying a snapshot; this avoids
+// repeatedly discarding a 15.2-MiB copy merely because the next 60-Hz frame
+// began before its sequence validation. The sequence remains the corruption
+// witness and generation notification protocol.
 #import <sys/mman.h>
 #import <fcntl.h>
 static void *g_vnc_mmap = NULL;       // base (header + data)
 static size_t g_vnc_mmap_w = 0, g_vnc_mmap_h = 0;
 static _Atomic uint64_t *g_vnc_mmap_sequence = NULL;
+static int g_vnc_mmap_fd = -1;
 static pthread_mutex_t g_vnc_mmap_write_lock = PTHREAD_MUTEX_INITIALIZER;
+// Protected by g_vnc_mmap_write_lock. 8192/16 = 512 tiles per dimension,
+// matching the validated maximum framebuffer geometry below.
+static uint8_t g_vnc_dirty_tiles[512 * 512];
+
+enum {
+    MacWSVNCDamageMagic = 0x564E444Du,
+    MacWSVNCDamageTile = 16,
+    MacWSVNCDamageMaxRectangles = 256,
+    MacWSVNCDamageMaxTileColumns = 512,
+    MacWSVNCDamageMaxTileRows = 512,
+};
+typedef struct {
+    uint32_t x;
+    uint32_t y;
+    uint32_t rectWidth;
+    uint32_t rectHeight;
+} MacWSVNCDamageRect;
+typedef struct {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t rectCount;
+    uint64_t sequence;
+    uint64_t changedPixels;
+    uint32_t dirtyTileCount;
+    uint32_t flags; // bit 0: rectangle-cap overflow, bounding fallback used
+    MacWSVNCDamageRect rectangles[MacWSVNCDamageMaxRectangles];
+} MacWSVNCDamageMessage;
+
+// The mmap remains the pixel transport. This datagram is only a committed
+// generation's damage notification, replacing the lossy need for OSXvnc to
+// rediscover damage by copying/diffing 15.2 MiB after every producer frame.
+// sendto is nonblocking; the existing mmap generation watcher remains the
+// fallback when the VNC process has not bound its socket yet.
+static void macws_vnc_notify_damage(uint64_t sequence, size_t width,
+        size_t height, size_t minX, size_t minY, size_t maxX, size_t maxY,
+        const uint8_t *dirtyTiles, size_t tileColumns, size_t tileRows,
+        uint64_t changedPixels) {
+    if (sequence == 0 || minX >= maxX || minY >= maxY ||
+        width > UINT32_MAX || height > UINT32_MAX ||
+        maxX > width || maxY > height) return;
+    static int damageFD = -1;
+    if (damageFD < 0) damageFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (damageFD < 0) return;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, "/tmp/macws_vnc_damage.sock",
+            sizeof(address.sun_path));
+    MacWSVNCDamageMessage message = {
+        .magic = MacWSVNCDamageMagic,
+        .width = (uint32_t)width,
+        .height = (uint32_t)height,
+        .sequence = sequence,
+        .changedPixels = changedPixels,
+    };
+    int16_t active[MacWSVNCDamageMaxTileColumns];
+    int16_t nextActive[MacWSVNCDamageMaxTileColumns];
+    BOOL overflow = !dirtyTiles || tileColumns == 0 || tileRows == 0 ||
+        tileColumns > MacWSVNCDamageMaxTileColumns ||
+        tileRows > MacWSVNCDamageMaxTileRows;
+    uint32_t dirtyTileCount = 0;
+    if (!overflow) {
+        memset(active, 0xff, sizeof(active));
+        for (size_t tileY = 0; tileY < tileRows && !overflow; tileY++) {
+            memset(nextActive, 0xff, sizeof(nextActive));
+            size_t tileX = 0;
+            while (tileX < tileColumns) {
+                if (!dirtyTiles[tileY * tileColumns + tileX]) {
+                    tileX++;
+                    continue;
+                }
+                size_t runStart = tileX;
+                while (tileX < tileColumns &&
+                       dirtyTiles[tileY * tileColumns + tileX]) {
+                    dirtyTileCount++;
+                    tileX++;
+                }
+                size_t runEnd = tileX;
+                uint32_t x = (uint32_t)(runStart * MacWSVNCDamageTile);
+                uint32_t y = (uint32_t)(tileY * MacWSVNCDamageTile);
+                uint32_t rectWidth = (uint32_t)MIN(
+                    width - x, (runEnd - runStart) * MacWSVNCDamageTile);
+                uint32_t rectHeight = (uint32_t)MIN(
+                    height - y, (size_t)MacWSVNCDamageTile);
+                int rectangleIndex = active[runStart];
+                if (rectangleIndex >= 0 &&
+                    (uint32_t)rectangleIndex < message.rectCount) {
+                    MacWSVNCDamageRect *existing =
+                        &message.rectangles[rectangleIndex];
+                    if (existing->x != x || existing->rectWidth != rectWidth ||
+                        existing->y + existing->rectHeight != y) {
+                        rectangleIndex = -1;
+                    }
+                }
+                if (rectangleIndex < 0) {
+                    if (message.rectCount >=
+                        MacWSVNCDamageMaxRectangles) {
+                        overflow = YES;
+                        break;
+                    }
+                    rectangleIndex = (int)message.rectCount++;
+                    message.rectangles[rectangleIndex] =
+                        (MacWSVNCDamageRect){x, y, rectWidth, rectHeight};
+                } else {
+                    message.rectangles[rectangleIndex].rectHeight +=
+                        rectHeight;
+                }
+                nextActive[runStart] = (int16_t)rectangleIndex;
+            }
+            memcpy(active, nextActive, sizeof(active));
+        }
+    }
+    if (overflow || message.rectCount == 0) {
+        message.flags |= 1u;
+        message.rectCount = 1;
+        message.rectangles[0] = (MacWSVNCDamageRect){
+            (uint32_t)minX, (uint32_t)minY,
+            (uint32_t)(maxX - minX), (uint32_t)(maxY - minY),
+        };
+    }
+    message.dirtyTileCount = dirtyTileCount;
+    size_t messageBytes = offsetof(MacWSVNCDamageMessage, rectangles) +
+        (size_t)message.rectCount * sizeof(message.rectangles[0]);
+    ssize_t sent = sendto(damageFD, &message, messageBytes, MSG_DONTWAIT,
+                          (const struct sockaddr *)&address, sizeof(address));
+    static _Atomic uint64_t sentCount = 0;
+    static _Atomic uint64_t failureCount = 0;
+    uint64_t count = sent == (ssize_t)messageBytes
+        ? atomic_fetch_add(&sentCount, 1) + 1
+        : atomic_fetch_add(&failureCount, 1) + 1;
+    if ((sent == (ssize_t)messageBytes &&
+         (count <= 16 || (count % 600) == 0)) ||
+        (sent != (ssize_t)messageBytes && count <= 4)) {
+        fprintf(stderr,
+            "#### VNC-DAMAGE %s #%llu sequence=%llu rects=%u "
+            "tiles=%u changed=%llu bounds=%zu,%zu %zux%zu "
+            "overflow=%s errno=%d\n",
+            sent == (ssize_t)messageBytes ? "sent" : "miss",
+            (unsigned long long)count, (unsigned long long)sequence,
+            message.rectCount, message.dirtyTileCount,
+            (unsigned long long)message.changedPixels,
+            minX, minY, maxX - minX, maxY - minY,
+            (message.flags & 1u) ? "YES" : "NO",
+            sent == (ssize_t)messageBytes ? 0 : errno);
+    }
+}
 static void *macws_vnc_mmap_data(size_t w, size_t h) {
     if (g_vnc_mmap && g_vnc_mmap_w == w && g_vnc_mmap_h == h)
         return (char *)g_vnc_mmap + 16;
@@ -644,12 +796,12 @@ static void *macws_vnc_mmap_data(size_t w, size_t h) {
     if (fd < 0) return NULL;
     if (ftruncate(fd, sz) != 0) { close(fd); return NULL; }
     void *m = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) return NULL;
+    if (m == MAP_FAILED) { close(fd); return NULL; }
     uint32_t *hdr = (uint32_t *)m;
     hdr[0] = 0x564E4346u; hdr[1] = (uint32_t)w; hdr[2] = (uint32_t)h; hdr[3] = (uint32_t)stride;
     g_vnc_mmap_sequence = (_Atomic uint64_t *)((char *)m + 16 + pixelBytes);
     atomic_store_explicit(g_vnc_mmap_sequence, 0, memory_order_relaxed);
+    g_vnc_mmap_fd = fd;
     g_vnc_mmap = m; g_vnc_mmap_w = w; g_vnc_mmap_h = h;
     fprintf(stderr, "#### VNC-MMAP /tmp/macws_vnc_fb %zux%zu sz=%zu\n", w, h, sz);
     return (char *)m + 16;
@@ -661,6 +813,15 @@ static void *macws_vnc_mmap_begin_frame(size_t w, size_t h) {
     if (!data || !g_vnc_mmap_sequence) {
         pthread_mutex_unlock(&g_vnc_mmap_write_lock);
         return NULL;
+    }
+    if (g_vnc_mmap_fd >= 0 && flock(g_vnc_mmap_fd, LOCK_EX) != 0) {
+        static _Atomic uint64_t lockFailures = 0;
+        uint64_t count = atomic_fetch_add(&lockFailures, 1) + 1;
+        if (count <= 8 || (count % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-MMAP producer flock failed #%llu errno=%d\n",
+                (unsigned long long)count, errno);
+        }
     }
     uint64_t sequence = atomic_load_explicit(g_vnc_mmap_sequence,
                                              memory_order_relaxed);
@@ -677,6 +838,7 @@ static uint64_t macws_vnc_mmap_commit_frame(void) {
         sequence = atomic_fetch_add_explicit(g_vnc_mmap_sequence, 1,
                                              memory_order_release) + 1;
     }
+    if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
     pthread_mutex_unlock(&g_vnc_mmap_write_lock);
     static _Atomic uint64_t committed = 0;
     uint64_t count = atomic_fetch_add(&committed, 1) + 1;
@@ -711,22 +873,60 @@ static BOOL macws_vnc_mmap_publish_bgra_if_changed(
         pthread_mutex_unlock(&g_vnc_mmap_write_lock);
         return NO;
     }
+    if (g_vnc_mmap_fd >= 0 && flock(g_vnc_mmap_fd, LOCK_EX) != 0) {
+        static _Atomic uint64_t lockFailures = 0;
+        uint64_t count = atomic_fetch_add(&lockFailures, 1) + 1;
+        if (count <= 8 || (count % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-MMAP publish flock failed #%llu errno=%d\n",
+                (unsigned long long)count, errno);
+        }
+    }
 
     size_t visibleRowBytes = width * 4;
     uint64_t sequence = atomic_load_explicit(
         g_vnc_mmap_sequence, memory_order_acquire);
     BOOL changed = sequence == 0 || (sequence & 1u) != 0;
+    size_t minX = changed ? 0 : width;
+    size_t minY = changed ? 0 : height;
+    size_t maxX = changed ? width : 0;
+    size_t maxY = changed ? height : 0;
+    size_t tileColumns = (width + MacWSVNCDamageTile - 1u) /
+        MacWSVNCDamageTile;
+    size_t tileRows = (height + MacWSVNCDamageTile - 1u) /
+        MacWSVNCDamageTile;
+    size_t tileCount = tileColumns * tileRows;
+    uint64_t changedPixels = changed ? (uint64_t)width * height : 0;
+    if (tileColumns > MacWSVNCDamageMaxTileColumns ||
+        tileRows > MacWSVNCDamageMaxTileRows ||
+        tileCount > sizeof(g_vnc_dirty_tiles)) {
+        if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
+        pthread_mutex_unlock(&g_vnc_mmap_write_lock);
+        return NO;
+    }
+    memset(g_vnc_dirty_tiles, changed ? 1 : 0, tileCount);
     if (!changed) {
         for (size_t y = 0; y < height; y++) {
-            if (memcmp((const char *)source + y * sourceBytesPerRow,
-                       (const char *)shared + y * visibleRowBytes,
-                       visibleRowBytes) != 0) {
+            const uint32_t *sourceRow = (const uint32_t *)
+                ((const char *)source + y * sourceBytesPerRow);
+            const uint32_t *sharedRow = (const uint32_t *)
+                ((const char *)shared + y * visibleRowBytes);
+            if (memcmp(sourceRow, sharedRow, visibleRowBytes) == 0) continue;
+            for (size_t x = 0; x < width; x++) {
+                if (sourceRow[x] == sharedRow[x]) continue;
+                g_vnc_dirty_tiles[(y / MacWSVNCDamageTile) * tileColumns +
+                                  x / MacWSVNCDamageTile] = 1;
+                if (x < minX) minX = x;
+                if (x + 1 > maxX) maxX = x + 1;
+                if (y < minY) minY = y;
+                if (y + 1 > maxY) maxY = y + 1;
+                changedPixels++;
                 changed = YES;
-                break;
             }
         }
     }
     if (!changed) {
+        if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
         pthread_mutex_unlock(&g_vnc_mmap_write_lock);
         static _Atomic uint64_t unchangedCount = 0;
         uint64_t count = atomic_fetch_add(&unchangedCount, 1) + 1;
@@ -748,7 +948,29 @@ static BOOL macws_vnc_mmap_publish_bgra_if_changed(
                (const char *)source + y * sourceBytesPerRow,
                visibleRowBytes);
     }
-    (void)macws_vnc_mmap_commit_frame();
+    // Publish the even sequence before the datagram, but keep both the local
+    // writer mutex and file lock until the compact rectangle message has been
+    // built from g_vnc_dirty_tiles. This preserves the seqlock invariant and
+    // prevents a second publisher from replacing the shared scratch map while
+    // the notification is being serialized.
+    uint64_t committedSequence = atomic_fetch_add_explicit(
+        g_vnc_mmap_sequence, 1, memory_order_release) + 1;
+    macws_vnc_notify_damage(committedSequence, width, height,
+                            minX, minY, maxX, maxY,
+                            g_vnc_dirty_tiles, tileColumns, tileRows,
+                            changedPixels);
+    if (g_vnc_mmap_fd >= 0) (void)flock(g_vnc_mmap_fd, LOCK_UN);
+    pthread_mutex_unlock(&g_vnc_mmap_write_lock);
+    static _Atomic uint64_t committedCount = 0;
+    uint64_t committed = atomic_fetch_add(&committedCount, 1) + 1;
+    if (committed <= 8 || (committed % 600) == 0) {
+        fprintf(stderr,
+            "#### VNC-MMAP sparse committed #%llu sequence=%llu "
+            "%zux%zu changed=%llu\n",
+            (unsigned long long)committed,
+            (unsigned long long)committedSequence,
+            width, height, (unsigned long long)changedPixels);
+    }
     if (didCommit) *didCommit = YES;
     return YES;
 }
@@ -2246,6 +2468,63 @@ static _Atomic uint64_t g_vnc_poll_accept_count = 0;
 static _Atomic uint64_t g_vnc_poll_drop_count = 0;
 static _Atomic uint64_t g_vnc_poll_clean_count = 0;
 static _Atomic uint64_t g_vnc_poll_error_count = 0;
+static _Atomic uint64_t g_vnc_owned_observer_last_ns = 0;
+static _Atomic uint64_t g_vnc_owned_observer_admit_count = 0;
+static _Atomic uint64_t g_vnc_owned_observer_throttle_count = 0;
+
+// EndUpdate can expose multiple display-sized PF80/115 composites inside one
+// virtual display interval.  Every accepted source below creates an observer
+// thread and, after producer completion, samples then compares as much as one
+// full 15.2-MiB Retina scanout. Runtime WindowServer logs on 2026-07-29 showed
+// successive `VNC-OWNED published ... committed=0` entries for these duplicate
+// sources while the actual SwapCancel completion boundary was paced at 60 Hz.
+// Select at most one already-owned source per 16 ms. This does not fabricate a
+// completion or skip GPU work: it only avoids observing/copying intermediate
+// sources more often than the VNC stream can present them.
+static BOOL macws_vnc_admit_owned_observer(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return YES;
+    uint64_t nanoseconds = (uint64_t)now.tv_sec * 1000000000ull +
+        (uint64_t)now.tv_nsec;
+    const uint64_t minimumInterval = 16ull * NSEC_PER_MSEC;
+    uint64_t previous = atomic_load_explicit(
+        &g_vnc_owned_observer_last_ns, memory_order_acquire);
+    for (;;) {
+        if (previous != 0 && nanoseconds >= previous &&
+            nanoseconds - previous < minimumInterval) {
+            uint64_t throttled = atomic_fetch_add_explicit(
+                &g_vnc_owned_observer_throttle_count, 1,
+                memory_order_relaxed) + 1;
+            if (throttled <= 16 || (throttled % 600) == 0) {
+                fprintf(stderr,
+                    "#### VNC-OWNED observer-throttle #%llu "
+                    "admitted=%llu delta=%llu us\n",
+                    (unsigned long long)throttled,
+                    (unsigned long long)atomic_load_explicit(
+                        &g_vnc_owned_observer_admit_count,
+                        memory_order_relaxed),
+                    (unsigned long long)((nanoseconds - previous) / 1000u));
+            }
+            return NO;
+        }
+        if (atomic_compare_exchange_weak_explicit(
+                &g_vnc_owned_observer_last_ns, &previous, nanoseconds,
+                memory_order_acq_rel, memory_order_acquire)) {
+            uint64_t admitted = atomic_fetch_add_explicit(
+                &g_vnc_owned_observer_admit_count, 1,
+                memory_order_relaxed) + 1;
+            if (admitted <= 16 || (admitted % 600) == 0) {
+                fprintf(stderr,
+                    "#### VNC-OWNED observer-admit #%llu throttled=%llu\n",
+                    (unsigned long long)admitted,
+                    (unsigned long long)atomic_load_explicit(
+                        &g_vnc_owned_observer_throttle_count,
+                        memory_order_relaxed));
+            }
+            return YES;
+        }
+    }
+}
 
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
     if (!macws_vnc_share_enabled() || !context || !texture) return;
@@ -2510,6 +2789,14 @@ void macws_vnc_finish_update(void *context) {
     BOOL observeCurrent = deepCapture || observePF550 ||
         pixelFormat == 80 || pixelFormat == 115;
     if (!observeCurrent) {
+        macws_vnc_release(commandBuffer);
+        macws_vnc_release(texture);
+        return;
+    }
+
+    if ((pixelFormat == 80 || pixelFormat == 115) &&
+        macws_is_owned_scanout_texture(texture) &&
+        !macws_vnc_admit_owned_observer()) {
         macws_vnc_release(commandBuffer);
         macws_vnc_release(texture);
         return;

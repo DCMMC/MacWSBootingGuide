@@ -6,6 +6,7 @@
 #import <IOKit/IOKitLib.h>
 #import <xpc/xpc.h>
 #import <sys/sysctl.h>
+#import <sys/file.h>
 #import <malloc/malloc.h>
 #import <stdatomic.h>
 #import "interpose.h"
@@ -4839,11 +4840,10 @@ static size_t macws_new_CGDisplayPixelsHigh(uint32_t display) {
 // coordinates. Runtime title-bar testing after the duplicate fix established
 // that this native path is also the one that drives NSWindow's modal move
 // tracker; AppInputBridge's synthetic title-bar sequence returned without
-// moving the window. VNC must therefore have one owner per gesture, never two:
-// stationary left taps use the process-targeted AppInput path, while drags,
-// hover, other buttons, and cursor bookkeeping use OSXvnc's native path.
-// AppInputBridge also remains the full fallback when the native implementation
-// is unavailable and remains the input path for the native iPad host.
+// moving the window. The generated VNC job therefore gives every VNC pointer
+// gesture one system owner through MACWS_VNC_NATIVE_ALL. AppInputBridge remains
+// the full fallback when the native implementation is unavailable and remains
+// the input path for the native iPad host.
 typedef void (*MacWSVNCHandleMouse)(id, SEL, unsigned int, CGPoint, id);
 static MacWSVNCHandleMouse macws_orig_vnc_handle_mouse = NULL;
 typedef void (*MacWSVNCHandleKeyboard)(id, SEL, BOOL, unsigned int, id);
@@ -4868,6 +4868,7 @@ static BOOL macws_vnc_native_all = NO;
 static _Atomic uint64_t macws_vnc_keyboard_serial = 0;
 static _Atomic uint64_t macws_vnc_keyboard_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_capture_serial = 0;
+static _Atomic uint64_t macws_vnc_pointer_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_settle_serial = 0;
 static _Atomic unsigned int macws_vnc_native_buttons = 0;
 
@@ -4887,6 +4888,241 @@ static _Atomic unsigned int macws_vnc_native_buttons = 0;
 // protocol.
 typedef void (*MacWSVNCRefreshCallback)(uint32_t, const CGRect *, void *);
 static MacWSVNCRefreshCallback macws_vnc_refresh_callback = NULL;
+typedef int (*MacWSRFBSendFramebufferUpdate)(void *, void *, void *);
+static MacWSRFBSendFramebufferUpdate
+    macws_orig_rfb_send_framebuffer_update = NULL;
+static __thread double macws_vnc_rfb_copy_milliseconds = 0.0;
+static __thread uint64_t macws_vnc_rfb_copy_pixels = 0;
+static __thread uint32_t macws_vnc_rfb_copy_calls = 0;
+static double macws_vnc_monotonic_seconds(void);
+
+enum {
+    MacWSVNCDamageMagic = 0x564E444Du,
+    MacWSVNCDamageMaxRectangles = 256,
+};
+typedef struct {
+    uint32_t x;
+    uint32_t y;
+    uint32_t rectWidth;
+    uint32_t rectHeight;
+} MacWSVNCDamageRect;
+typedef struct {
+    uint32_t magic;
+    uint32_t width;
+    uint32_t height;
+    uint32_t rectCount;
+    uint64_t sequence;
+    uint64_t changedPixels;
+    uint32_t dirtyTileCount;
+    uint32_t flags;
+    MacWSVNCDamageRect rectangles[MacWSVNCDamageMaxRectangles];
+} MacWSVNCDamageMessage;
+
+// Published only after the producer-derived rectangle has been handed to
+// OSXvnc's original refresh callback.  The generation watcher uses this as an
+// acknowledgement that it need not copy/diff the same 15.2-MiB generation a
+// second time.  It is deliberately process-local: loss of the datagram leaves
+// the sequence behind and the mmap watcher remains the fallback.
+static _Atomic uint64_t macws_vnc_damage_notified_sequence = 0;
+static _Atomic uint64_t macws_vnc_damage_received_sequence = 0;
+static _Atomic BOOL macws_vnc_damage_callback_busy = NO;
+
+// WindowServer already compares the completed owned scanout against the mmap
+// before committing it. Receive that producer-derived bounding damage here so
+// OSXvnc does not have to rediscover the same information with a second full
+// 15.2-MiB snapshot/diff. The mmap remains the only pixel source; this socket
+// carries no pixels and cannot acknowledge or fabricate a frame.
+static void *macws_vnc_damage_listener(void *unused) {
+    (void)unused;
+    const char *path = "/tmp/macws_vnc_damage.sock";
+    int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        fprintf(stderr,
+            "#### OSXVNC DAMAGE socket failed errno=%d\n", errno);
+        return NULL;
+    }
+    int receiveBuffer = 1024 * 1024;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                     &receiveBuffer, sizeof(receiveBuffer));
+    (void)unlink(path);
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, path, sizeof(address.sun_path));
+    if (bind(fd, (const struct sockaddr *)&address, sizeof(address)) != 0) {
+        fprintf(stderr,
+            "#### OSXVNC DAMAGE bind failed errno=%d\n", errno);
+        close(fd);
+        return NULL;
+    }
+    (void)chmod(path, 0666);
+    fprintf(stderr, "#### OSXVNC DAMAGE listener ready path=%s\n", path);
+    uint64_t priorSequence = 0;
+    for (;;) {
+        MacWSVNCDamageMessage message = {0};
+        ssize_t received = recv(fd, &message, sizeof(message), 0);
+        if (received < 0 && errno == EINTR) continue;
+        if (received < 0) { usleep(10000); continue; }
+        int screenWidth = macws_rfbScreen ? macws_rfbScreen[0] : 0;
+        int screenHeight = macws_rfbScreen ? macws_rfbScreen[2] : 0;
+        size_t headerBytes = offsetof(MacWSVNCDamageMessage, rectangles);
+        size_t expectedBytes = message.rectCount <=
+            MacWSVNCDamageMaxRectangles
+            ? headerBytes + (size_t)message.rectCount *
+                sizeof(message.rectangles[0])
+            : SIZE_MAX;
+        BOOL valid = message.magic == MacWSVNCDamageMagic &&
+            message.sequence > priorSequence &&
+            message.width == (uint32_t)screenWidth &&
+            message.height == (uint32_t)screenHeight &&
+            message.rectCount > 0 &&
+            message.rectCount <= MacWSVNCDamageMaxRectangles &&
+            received == (ssize_t)expectedBytes;
+        CGRect rectangles[MacWSVNCDamageMaxRectangles];
+        for (uint32_t index = 0; valid && index < message.rectCount;
+             index++) {
+            const MacWSVNCDamageRect *source = &message.rectangles[index];
+            uint64_t x1 = (uint64_t)source->x + source->rectWidth;
+            uint64_t y1 = (uint64_t)source->y + source->rectHeight;
+            valid = source->rectWidth > 0 && source->rectHeight > 0 &&
+                x1 <= message.width && y1 <= message.height;
+            rectangles[index] = (CGRect){
+                .origin = {(CGFloat)source->x, (CGFloat)source->y},
+                .size = {(CGFloat)source->rectWidth,
+                         (CGFloat)source->rectHeight},
+            };
+        }
+        if (!valid || !macws_vnc_refresh_callback) continue;
+        priorSequence = message.sequence;
+        atomic_store_explicit(&macws_vnc_damage_received_sequence,
+                              message.sequence, memory_order_release);
+        atomic_store_explicit(&macws_vnc_damage_callback_busy, YES,
+                              memory_order_release);
+        macws_vnc_refresh_callback(message.rectCount, rectangles, NULL);
+        atomic_store_explicit(&macws_vnc_damage_notified_sequence,
+                              message.sequence, memory_order_release);
+        atomic_store_explicit(&macws_vnc_damage_callback_busy, NO,
+                              memory_order_release);
+        static _Atomic uint64_t notificationCount = 0;
+        uint64_t count = atomic_fetch_add_explicit(
+            &notificationCount, 1, memory_order_relaxed) + 1;
+        if (count <= 16 || (count % 60) == 0) {
+            fprintf(stderr,
+                "#### OSXVNC DAMAGE notify #%llu sequence=%llu "
+                "rects=%u tiles=%u changed=%llu first=%u,%u %ux%u "
+                "overflow=%s\n",
+                (unsigned long long)count,
+                (unsigned long long)message.sequence,
+                message.rectCount, message.dirtyTileCount,
+                (unsigned long long)message.changedPixels,
+                message.rectangles[0].x, message.rectangles[0].y,
+                message.rectangles[0].rectWidth,
+                message.rectangles[0].rectHeight,
+                (message.flags & 1u) ? "YES" : "NO");
+        }
+    }
+    return NULL;
+}
+
+// RE-confirmed via the installed arm64 OSXvnc-server at
+// __TEXT+0x14e38 (2026-07-29): rfbSendFramebufferUpdate receives the client in
+// x0 and the RegionRec pair in x1/x2, increments client+0x1e4, reads the
+// selected encoding at client+0x580, encodes each region, then flushes the
+// update buffer. Time this exact boundary so capture/notification latency can
+// be separated from server encoding/socket backpressure. Observation only;
+// every argument and the original return value are preserved.
+static int macws_new_rfb_send_framebuffer_update(
+        void *client, void *regionExtents, void *regionData) {
+    typedef struct {
+        int16_t x1;
+        int16_t y1;
+        int16_t x2;
+        int16_t y2;
+    } MacWSRFBBox;
+    uint64_t regionCount = regionData
+        ? *(const uint64_t *)((const char *)regionData + 0x8) : 1;
+    // RE-confirmed at installed OSXvnc-server __TEXT+0x14e38: when the region
+    // data pointer is NULL, x1 itself contains the one 8-byte BoxRec by value
+    // and the function spills x1/x2 to sp+0x40 before iterating. It is not a
+    // pointer. Preserve that ABI here by viewing our local x1-sized argument.
+    const MacWSRFBBox *boxes = regionData
+        ? (const MacWSRFBBox *)((const char *)regionData + 0x10)
+        : (const MacWSRFBBox *)&regionExtents;
+    uint64_t regionPixels = 0;
+    int32_t boundsX1 = INT32_MAX, boundsY1 = INT32_MAX;
+    int32_t boundsX2 = INT32_MIN, boundsY2 = INT32_MIN;
+    if (boxes && regionCount > 0 && regionCount <= 32768) {
+        for (uint64_t index = 0; index < regionCount; index++) {
+            int32_t width = (int32_t)boxes[index].x2 - boxes[index].x1;
+            int32_t height = (int32_t)boxes[index].y2 - boxes[index].y1;
+            if (width <= 0 || height <= 0) continue;
+            regionPixels += (uint64_t)width * (uint64_t)height;
+            if (boxes[index].x1 < boundsX1) boundsX1 = boxes[index].x1;
+            if (boxes[index].y1 < boundsY1) boundsY1 = boxes[index].y1;
+            if (boxes[index].x2 > boundsX2) boundsX2 = boxes[index].x2;
+            if (boxes[index].y2 > boundsY2) boundsY2 = boxes[index].y2;
+        }
+    }
+    macws_vnc_rfb_copy_milliseconds = 0.0;
+    macws_vnc_rfb_copy_pixels = 0;
+    macws_vnc_rfb_copy_calls = 0;
+    int encoding = client
+        ? *(const int *)((const char *)client + 0x580) : INT_MIN;
+    if (client && getenv("MACWS_VNC_LOW_LATENCY_COMPRESSION")) {
+        // RE-confirmed via the installed arm64 OSXvnc-server
+        // rfbProcessClientNormalMessage+0x63c/+0x84c: compression-level
+        // pseudo-encodings are stored at client+0x26c (Zlib) and
+        // client+0x558 (Tight). rfbSendOneRectEncodingZlib+0x248 consumes
+        // +0x26c at deflateInit2_, while rfbSendRectEncodingTight+0x34
+        // snapshots +0x558 for every rectangle.
+        //
+        // On the real 2388x1668 Terminal frame, controlled full-frame Tight
+        // requests measured level 1 at 343 ms versus level 6 at 544 ms and
+        // level 9 at 1184 ms.  A moved-window Zlib frame at the default level
+        // took 1584 ms while framebuffer copy took 1.87 ms.  Clamp only the
+        // compression work factor; the negotiated encoding, pixels, region,
+        // and protocol stream remain unchanged.
+        int *zlibLevel = (int *)((char *)client + 0x26c);
+        int *tightLevel = (int *)((char *)client + 0x558);
+        int *selectedLevel = encoding == 6 ? zlibLevel
+                              : encoding == 7 ? tightLevel : NULL;
+        if (selectedLevel && *selectedLevel != 1) {
+            int requestedLevel = *selectedLevel;
+            *selectedLevel = 1;
+            fprintf(stderr,
+                "#### OSXVNC LOW-LATENCY-COMPRESSION encoding=%d "
+                "requested=%d effective=1\n",
+                encoding, requestedLevel);
+        }
+    }
+    double started = macws_vnc_monotonic_seconds();
+    int result = macws_orig_rfb_send_framebuffer_update
+        ? macws_orig_rfb_send_framebuffer_update(
+            client, regionExtents, regionData) : 0;
+    double elapsedMilliseconds =
+        (macws_vnc_monotonic_seconds() - started) * 1000.0;
+    static _Atomic uint64_t sendCount = 0;
+    uint64_t count = atomic_fetch_add_explicit(
+        &sendCount, 1, memory_order_relaxed) + 1;
+    if (count <= 32 || elapsedMilliseconds >= 20.0 ||
+        (count % 600) == 0) {
+        fprintf(stderr,
+            "#### OSXVNC RFB-SEND #%llu encoding=%d regions=%llu "
+            "pixels=%llu bounds=%d,%d %dx%d copy=%u/%llu/%.3fms "
+            "elapsed=%.3fms result=%d\n",
+            (unsigned long long)count, encoding,
+            (unsigned long long)regionCount,
+            (unsigned long long)regionPixels,
+            boundsX1 == INT32_MAX ? 0 : boundsX1,
+            boundsY1 == INT32_MAX ? 0 : boundsY1,
+            boundsX1 == INT32_MAX ? 0 : boundsX2 - boundsX1,
+            boundsY1 == INT32_MAX ? 0 : boundsY2 - boundsY1,
+            macws_vnc_rfb_copy_calls,
+            (unsigned long long)macws_vnc_rfb_copy_pixels,
+            macws_vnc_rfb_copy_milliseconds,
+            elapsedMilliseconds, result);
+    }
+    return result;
+}
 
 // OSXvnc registers refreshCallback directly with CoreGraphics.  RE-confirmed
 // at refreshCallback+0xec: its incoming CGRects are copied verbatim into the
@@ -4953,6 +5189,7 @@ static void macws_new_vnc_refresh_callback(uint32_t count,
 static void *macws_vnc_generation_watcher(void *unused) {
     (void)unused;
     void *mapping = NULL;
+    int mappingFD = -1;
     size_t mappingSize = 0;
     uint64_t observed = 0;
     uint8_t *previousPixels = NULL;
@@ -4961,20 +5198,25 @@ static void *macws_vnc_generation_watcher(void *unused) {
     size_t previousWidth = 0;
     size_t previousHeight = 0;
     BOOL previousValid = NO;
+    uint64_t pendingFallbackSequence = 0;
+    double pendingFallbackSince = 0.0;
     for (;;) {
         if (!mapping) {
             int fd = open("/tmp/macws_vnc_fb", O_RDONLY);
             if (fd >= 0) {
+                BOOL retainedFD = NO;
                 struct stat st = {0};
                 if (fstat(fd, &st) == 0 && st.st_size >= 24) {
                     void *candidate = mmap(NULL, (size_t)st.st_size, PROT_READ,
                                            MAP_SHARED, fd, 0);
                     if (candidate != MAP_FAILED) {
                         mapping = candidate;
+                        mappingFD = fd;
+                        retainedFD = YES;
                         mappingSize = (size_t)st.st_size;
                     }
                 }
-                close(fd);
+                if (!retainedFD) close(fd);
             }
         }
 
@@ -4993,6 +5235,66 @@ static void *macws_vnc_generation_watcher(void *unused) {
                         sequenceAddress, memory_order_acquire);
                     if (sequence != 0 && !(sequence & 1u) &&
                         sequence != observed) {
+                        uint64_t producerNotified = atomic_load_explicit(
+                            &macws_vnc_damage_notified_sequence,
+                            memory_order_acquire);
+                        uint64_t producerReceived = atomic_load_explicit(
+                            &macws_vnc_damage_received_sequence,
+                            memory_order_acquire);
+                        BOOL damageCallbackBusy = atomic_load_explicit(
+                            &macws_vnc_damage_callback_busy,
+                            memory_order_acquire);
+                        if (producerNotified >= sequence ||
+                            producerReceived >= sequence ||
+                            damageCallbackBusy) {
+                            // The listener has already inserted this exact
+                            // committed generation's producer-derived damage
+                            // into modifiedRegion.  Keeping the old snapshot
+                            // as a diff baseline would be unsafe if the socket
+                            // later disappears, so invalidate it; the first
+                            // fallback generation will conservatively publish
+                            // a full frame.
+                            observed = sequence;
+                            previousValid = NO;
+                            pendingFallbackSequence = 0;
+                            pendingFallbackSince = 0.0;
+                            static _Atomic uint64_t skippedScans = 0;
+                            uint64_t skipped = atomic_fetch_add_explicit(
+                                &skippedScans, 1,
+                                memory_order_relaxed) + 1;
+                            if (skipped <= 16 || (skipped % 600) == 0) {
+                                fprintf(stderr,
+                                    "#### OSXVNC mmap scan skipped #%llu "
+                                    "sequence=%llu producer-received=%llu "
+                                    "producer-notified=%llu busy=%s\n",
+                                    (unsigned long long)skipped,
+                                    (unsigned long long)sequence,
+                                    (unsigned long long)producerReceived,
+                                    (unsigned long long)producerNotified,
+                                    damageCallbackBusy ? "YES" : "NO");
+                            }
+                            usleep(16000);
+                            continue;
+                        }
+                        // The datagram listener and this polling thread can
+                        // observe the same commit in either order.  Scanning
+                        // immediately when the poll wins that race produced a
+                        // conservative full-frame fallback (and multi-second
+                        // Hextile encode) even though the real damage message
+                        // arrived a few milliseconds later. Give the local
+                        // socket four poll intervals to catch up. Preserve the
+                        // first-miss timestamp while newer generations arrive
+                        // so a genuinely absent producer still falls back.
+                        double fallbackNow = macws_vnc_monotonic_seconds();
+                        if (pendingFallbackSequence == 0) {
+                            pendingFallbackSince = fallbackNow;
+                        }
+                        pendingFallbackSequence = sequence;
+                        if (pendingFallbackSince > 0.0 &&
+                            fallbackNow - pendingFallbackSince < 0.064) {
+                            usleep(16000);
+                            continue;
+                        }
                         int width = macws_rfbScreen[0];
                         int screenHeight = macws_rfbScreen[2];
                         if (width > 0 && screenHeight > 0 && width <= 8192 &&
@@ -5053,27 +5355,31 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                 }
                             }
 
-                            // Copy one seqlock-stable generation first, then
-                            // diff private memory. The old code compared the
-                            // live mmap row by row and mutated previousPixels
-                            // at the same time. During interactive 10-60 Hz
-                            // publication, a newer frame often arrived during
-                            // that scan; it invalidated the snapshot and made
-                            // the following generation a 15.2-MiB full-screen
-                            // raw update. A bounded memcpy+validate retry keeps
-                            // both the diff baseline and dirty rectangles
-                            // coherent without slowing the producer.
+                            // Copy one coherent generation before diffing
+                            // private memory. Runtime counts on 2026-07-29
+                            // measured 112 producer commits but only 8 RFB
+                            // updates during one continuous four-second menu
+                            // trajectory: the former seqlock-only copy was
+                            // repeatedly invalidated by the next 60-Hz writer.
+                            // The producer now holds LOCK_EX while updating the
+                            // mmap; take LOCK_SH for the 15.2-MiB copy. Keep the
+                            // bounded seqlock retry as compatibility fallback
+                            // when an older producer does not expose a usable
+                            // file descriptor/lock.
                             BOOL snapshotStable = NO;
                             if (geometryMatches && previousPixels &&
                                 currentPixels &&
                                 previousPixelsSize == pixelBytes) {
-                                for (unsigned attempt = 0; attempt < 4;
+                                BOOL sharedLocked = mappingFD >= 0 &&
+                                    flock(mappingFD, LOCK_SH) == 0;
+                                unsigned attempts = sharedLocked ? 1 : 4;
+                                for (unsigned attempt = 0; attempt < attempts;
                                      attempt++) {
                                     uint64_t before = atomic_load_explicit(
                                         sequenceAddress,
                                         memory_order_acquire);
                                     if (before == 0 || (before & 1u)) {
-                                        usleep(1000);
+                                        if (!sharedLocked) usleep(1000);
                                         continue;
                                     }
                                     for (size_t y = 0; y < height; y++) {
@@ -5091,8 +5397,10 @@ static void *macws_vnc_generation_watcher(void *unused) {
                                         snapshotStable = YES;
                                         break;
                                     }
-                                    usleep(1000);
+                                    if (!sharedLocked) usleep(1000);
                                 }
+                                if (sharedLocked)
+                                    (void)flock(mappingFD, LOCK_UN);
                                 if (!snapshotStable) continue;
 
                                 if (!previousValid) {
@@ -5142,6 +5450,8 @@ static void *macws_vnc_generation_watcher(void *unused) {
                             previousValid = geometryMatches && previousPixels &&
                                 currentPixels && snapshotStable;
                             observed = sequence;
+                            pendingFallbackSequence = 0;
+                            pendingFallbackSince = 0.0;
 
                             CGRect dirty = {
                                 .origin = {0.0, 0.0},
@@ -5208,7 +5518,7 @@ static void *macws_vnc_generation_watcher(void *unused) {
                             }
                             static _Atomic uint64_t notified = 0;
                             uint64_t count = atomic_fetch_add(&notified, 1) + 1;
-                            if (count <= 16 || (count % 600) == 0) {
+                            if (count <= 16 || (count % 60) == 0) {
                                 fprintf(stderr,
                                     "#### OSXVNC mmap generation #%llu "
                                     "sequence=%llu changed=%s "
@@ -5227,6 +5537,9 @@ static void *macws_vnc_generation_watcher(void *unused) {
                 }
             }
         }
+        // The producer-derived damage socket is the low-latency path. Keep the
+        // mmap generation scan as a conservative 16-ms fallback for an older
+        // producer or a transient socket failure.
         usleep(16000);
     }
     return NULL;
@@ -5346,24 +5659,58 @@ static void macws_vnc_request_keyboard_settled_frame(uint64_t keySerial,
 // (NSEvent 3/4, pressed=0x2), while the first menu-open framebuffer still had
 // no menu and the following hover delivered the already-open menu.
 //
-// Request an early observation after the pointer becomes quiet, plus a later
-// observation after button transitions.  This does not synthesize an event or
-// fabricate a frame: Metal_hooks still accepts only a real, stable
-// WindowServer composite and ACKs its generation.  Motion is debounced so a
-// 120-Hz VNC client cannot create 120 full-display observations per second.
+// Request rate-limited observations while the pointer is moving, plus a
+// trailing observation when it becomes quiet and a later observation after
+// button transitions.  This does not synthesize an event or fabricate a
+// frame: Metal_hooks still accepts only a real, stable WindowServer composite
+// and ACKs its generation.
+//
+// The old implementation debounced every progress request by 24 ms and
+// discarded it whenever a newer pointer event arrived.  A normal 60/120-Hz
+// menu sweep or title drag therefore cancelled every request until motion
+// stopped. Runtime OSXVNC logs contained only the final POINTER-PROGRESS for a
+// continuous trajectory even though NATIVE-ALL recorded every input event.
+// Throttle admission instead of cancelling admitted work: at most one leading
+// observation per 16 ms can be queued, independent of subsequent events.  A
+// serial-checked 48-ms quiet observation preserves the final state.
 static void macws_vnc_schedule_native_pointer_frames(
         unsigned int buttons, BOOL buttonTransition) {
     if (!macws_vnc_share_on) return;
     uint64_t serial = atomic_fetch_add_explicit(
         &macws_vnc_pointer_capture_serial, 1,
         memory_order_acq_rel) + 1;
+    uint64_t now = macws_vnc_realtime_nanoseconds();
+    if (now != 0) {
+        const uint64_t minimumInterval = 16ull * NSEC_PER_MSEC;
+        uint64_t previous = atomic_load_explicit(
+            &macws_vnc_pointer_last_progress_ns, memory_order_acquire);
+        BOOL admitted = NO;
+        for (;;) {
+            if (previous != 0 && now > previous &&
+                now - previous < minimumInterval) break;
+            if (atomic_compare_exchange_weak_explicit(
+                    &macws_vnc_pointer_last_progress_ns, &previous, now,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                admitted = YES;
+                break;
+            }
+        }
+        if (admitted) {
+            dispatch_after(
+                dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_MSEC),
+                dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                    macws_vnc_write_capture_request(
+                        "POINTER-PROGRESS", serial, buttons);
+                });
+        }
+    }
     dispatch_after(
-        dispatch_time(DISPATCH_TIME_NOW, 24 * NSEC_PER_MSEC),
+        dispatch_time(DISPATCH_TIME_NOW, 48 * NSEC_PER_MSEC),
         dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             if (atomic_load_explicit(&macws_vnc_pointer_capture_serial,
                                      memory_order_acquire) == serial) {
                 macws_vnc_write_capture_request(
-                    "POINTER-PROGRESS", serial, buttons);
+                    "POINTER-QUIET", serial, buttons);
             }
         });
     if (!buttonTransition) return;
@@ -5766,15 +6113,22 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
     //    w, h, stride; BGRA8 data follows, then an atomic publication sequence.
     //    Gradient is the fallback.
     static void *rmap = NULL; static size_t rmap_sz = 0;
+    static int rmap_fd = -1;
     if (!rmap) {
         int fd = open("/tmp/macws_vnc_fb", O_RDONLY);
         if (fd >= 0) {
+            BOOL retainedFD = NO;
             struct stat st;
             if (fstat(fd, &st) == 0 && st.st_size >= 16) {
                 void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-                if (m != MAP_FAILED) { rmap = m; rmap_sz = (size_t)st.st_size; }
+                if (m != MAP_FAILED) {
+                    rmap = m;
+                    rmap_fd = fd;
+                    retainedFD = YES;
+                    rmap_sz = (size_t)st.st_size;
+                }
             }
-            close(fd);
+            if (!retainedFD) close(fd);
         }
     }
     if (rmap && rmap_sz >= 16) {
@@ -5817,16 +6171,28 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
                     y1 = (size_t)requestedY1;
                 }
                 if (sw > SIZE_MAX / 4 || sw * 4 > sstride) return false;
-                for (unsigned attempt = 0; attempt < 4; attempt++) {
+                BOOL scaleCopy = bytespp == 4 && sw > 0 && sh > 0 &&
+                    dw > 0 && height > 0 &&
+                    (sw != dw || sh != (size_t)height);
+                size_t rows = ((size_t)height < sh)
+                    ? (size_t)height : sh;
+                size_t byteX = x0 * (size_t)bytespp;
+                size_t byteCount = (x1 - x0) * (size_t)bytespp;
+                if (!scaleCopy &&
+                    (byteX + byteCount > (size_t)padded ||
+                     byteX + byteCount > sstride)) return false;
+
+                BOOL sharedLocked = rmap_fd >= 0 &&
+                    flock(rmap_fd, LOCK_SH) == 0;
+                unsigned attempts = sharedLocked ? 1 : 4;
+                for (unsigned attempt = 0; attempt < attempts; attempt++) {
                     uint64_t before = atomic_load_explicit(
                         sequenceAddress, memory_order_acquire);
                     if (before == 0 || (before & 1u)) {
-                        usleep(1000);
+                        if (!sharedLocked) usleep(1000);
                         continue;
                     }
-                    if (bytespp == 4 && sw > 0 && sh > 0 && dw > 0 &&
-                        height > 0 &&
-                        (sw != dw || sh != (size_t)height)) {
+                    if (scaleCopy) {
                         for (size_t y = y0; y < y1; y++) {
                             size_t sy = y * sh / (size_t)height;
                             const uint32_t *src = (const uint32_t *)
@@ -5838,13 +6204,7 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
                             }
                         }
                     } else {
-                        size_t rows = ((size_t)height < sh)
-                            ? (size_t)height : sh;
                         if (y1 > rows) y1 = rows;
-                        size_t byteX = x0 * (size_t)bytespp;
-                        size_t byteCount = (x1 - x0) * (size_t)bytespp;
-                        if (byteX + byteCount > (size_t)padded ||
-                            byteX + byteCount > sstride) return false;
                         for (size_t y = y0; y < y1; y++)
                             memcpy(macws_vnc_fb + y * (size_t)padded + byteX,
                                    data + y * sstride + byteX, byteCount);
@@ -5852,9 +6212,14 @@ static bool macws_vnc_fill_test(int rectX, int rectY,
                     atomic_thread_fence(memory_order_acquire);
                     uint64_t after = atomic_load_explicit(
                         sequenceAddress, memory_order_acquire);
-                    if (after == before && !(after & 1u)) return true;
-                    usleep(1000);
+                    if (after == before && !(after & 1u)) {
+                        if (sharedLocked)
+                            (void)flock(rmap_fd, LOCK_UN);
+                        return true;
+                    }
+                    if (!sharedLocked) usleep(1000);
                 }
+                if (sharedLocked) (void)flock(rmap_fd, LOCK_UN);
                 static _Atomic uint64_t unstable = 0;
                 uint64_t count = atomic_fetch_add(&unstable, 1) + 1;
                 if (count <= 8 || (count % 600) == 0) {
@@ -5906,7 +6271,13 @@ static void macws_new_rfbGetFBRect(int x, int y, int w, int h) {
     // selected capture backend, so deliver it directly. If its first frame is
     // not ready yet, preserve the allocated buffer and wait for the next poll.
     if (macws_vnc_share_on) {
+        double started = macws_vnc_monotonic_seconds();
         bool copied = macws_vnc_fill_test(x, y, w, h);
+        macws_vnc_rfb_copy_milliseconds +=
+            (macws_vnc_monotonic_seconds() - started) * 1000.0;
+        macws_vnc_rfb_copy_calls++;
+        if (w > 0 && h > 0)
+            macws_vnc_rfb_copy_pixels += (uint64_t)w * (uint64_t)h;
         static int lg = 0;
         if (lg < 3) {
             fprintf(stderr, "#### OSXVNC mmap rect delivery copied=%d rect=%d,%d %dx%d\n",
@@ -5951,6 +6322,9 @@ static void macws_install_osxvnc_hooks(void) {
         (void **)&macws_orig_CGDisplayPixelsHigh);
     MSHookFunction(base + 0xd9d4, (void *)macws_new_rfbGetFB,     (void **)&macws_orig_rfbGetFB);
     MSHookFunction(base + 0xdc28, (void *)macws_new_rfbGetFBRect, (void **)&macws_orig_rfbGetFBRect);
+    MSHookFunction(base + 0x14e38,
+        (void *)macws_new_rfb_send_framebuffer_update,
+        (void **)&macws_orig_rfb_send_framebuffer_update);
     Class serverClass = objc_getClass("VNCServer");
     Method mouseMethod = serverClass ? class_getInstanceMethod(serverClass,
         sel_registerName("handleMouseButtons:atPoint:forClient:")) : NULL;
@@ -5968,6 +6342,13 @@ static void macws_install_osxvnc_hooks(void) {
                                  (IMP)macws_new_vnc_handle_keyboard);
     }
     if (macws_vnc_share_on && macws_vnc_refresh_callback) {
+        pthread_t damageListener;
+        int damageError = pthread_create(
+            &damageListener, NULL, macws_vnc_damage_listener, NULL);
+        if (damageError == 0) pthread_detach(damageListener);
+        else fprintf(stderr,
+            "#### OSXVNC DAMAGE listener thread failed error=%d\n",
+            damageError);
         pthread_t watcher;
         int watcherError = pthread_create(
             &watcher, NULL, macws_vnc_generation_watcher, NULL);
