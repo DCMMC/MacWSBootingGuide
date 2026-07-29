@@ -48,6 +48,43 @@ static bool macws_runtime_diagnostics_enabled(void) {
     return value != 0;
 }
 
+// Diagnostic sentinels are a process-start contract.  macos_gui.sh creates or
+// removes them before launch, and production_preflight rejects any survivor.
+// Never stat them from the IOGPU submit/completion hot path: a production
+// sample of VS Code's 60,000-fish GPU process caught 39 access(2) calls at the
+// top of stack in six seconds.  Keep the individual gates (rather than folding
+// them into the broad runtime-diagnostics bit) so diagnostic runs retain their
+// existing selectivity.
+#define MACWS_DEFINE_STARTUP_FLAG(function_name, path_literal) \
+    static bool function_name(void) { \
+        static _Atomic int cached = -1; \
+        int value = atomic_load_explicit(&cached, memory_order_acquire); \
+        if (value < 0) { \
+            value = access(path_literal, F_OK) == 0; \
+            atomic_store_explicit(&cached, value, memory_order_release); \
+        } \
+        return value != 0; \
+    }
+
+MACWS_DEFINE_STARTUP_FLAG(macws_res_diag_enabled,
+                          "/tmp/macws_res_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_iogpu_error_diag_enabled,
+                          "/tmp/macws_iogpu_error_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_submit_diag_enabled,
+                          "/tmp/macws_submit_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_submit_ring_enabled,
+                          "/tmp/macws_submit_ring")
+MACWS_DEFINE_STARTUP_FLAG(macws_queue_qos_diag_enabled,
+                          "/tmp/macws_queue_qos_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_a4_diag_enabled,
+                          "/tmp/macws_kcmd_field_a4_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_5e3_diag_enabled,
+                          "/tmp/macws_kcmd_field_5e3_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_6bc_diag_enabled,
+                          "/tmp/macws_kcmd_field_6bc_diag")
+
+#undef MACWS_DEFINE_STARTUP_FLAG
+
 static bool macws_jit_trace_enabled(void) {
     return macws_runtime_diagnostics_enabled() ||
         getenv("MACWS_JIT_MPROTECT_TRACE") != NULL;
@@ -8637,8 +8674,8 @@ static bool macws_agx_life_diagnostics_enabled(void) {
     if (value < 0) {
         value = macws_runtime_diagnostics_enabled() ||
             getenv("MACWS_AGX_LIFE_VERBOSE") != NULL ||
-            access("/tmp/macws_iogpu_error_diag", F_OK) == 0 ||
-            access("/tmp/macws_submit_ring", F_OK) == 0 ||
+            macws_iogpu_error_diag_enabled() ||
+            macws_submit_ring_enabled() ||
             access("/tmp/macws_submit_fast_ring", F_OK) == 0;
         atomic_store_explicit(&cached, value, memory_order_release);
     }
@@ -8748,7 +8785,7 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
         };
         macws_agx_life_record_locked(1, &g_agxLife[slot]);
         if (type == 0x82 &&
-            access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+            macws_iogpu_error_diag_enabled()) {
             uint64_t request_sequence = ++g_macwsAgxT82RequestSequence;
             struct macws_agx_t82_request *request =
                 &g_macwsAgxT82Requests[(request_sequence - 1) %
@@ -9642,7 +9679,7 @@ static _Atomic uint64_t g_macws_submit_serial_marks[MACWS_SUBMIT_MARK_COUNT];
 
 __attribute__((used, visibility("default")))
 void macws_mark_agx_submit_for_error_dump(const void *command_buffer) {
-    if (!command_buffer || access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!command_buffer || !macws_submit_ring_enabled())
         return;
     uint64_t serial = atomic_fetch_add(&g_macws_submit_mark_serial, 1) + 1;
     atomic_store(&g_macws_submit_marks[
@@ -9658,7 +9695,7 @@ void macws_mark_agx_submit_for_error_dump(const void *command_buffer) {
 
 __attribute__((used, visibility("default")))
 void macws_mark_agx_submit_serial_for_error_dump(uint64_t submit_serial) {
-    if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!submit_serial || !macws_submit_ring_enabled())
         return;
     uint64_t mark = atomic_fetch_add(&g_macws_submit_mark_serial, 1) + 1;
     atomic_store(&g_macws_submit_serial_marks[
@@ -9685,7 +9722,7 @@ static BOOL macws_submit_ring_serial_is_marked(uint64_t submit_serial) {
 
 __attribute__((used, visibility("default")))
 uint64_t macws_latest_agx_submit_serial(const void *command_buffer) {
-    if (!command_buffer || access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!command_buffer || !macws_submit_ring_enabled())
         return 0;
     uint64_t result = 0;
     pthread_mutex_lock(&g_macws_submit_ring_lock);
@@ -9707,7 +9744,7 @@ uint64_t macws_latest_agx_submit_serial(const void *command_buffer) {
 
 __attribute__((used, visibility("default")))
 unsigned macws_agx_submit_fixed_count(uint64_t submit_serial) {
-    if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!submit_serial || !macws_submit_ring_enabled())
         return 0;
     unsigned result = 0;
     pthread_mutex_lock(&g_macws_submit_ring_lock);
@@ -9724,7 +9761,7 @@ __attribute__((used, visibility("default")))
 int macws_agx_submit_dimensions(uint64_t submit_serial,
                                 uint32_t *width_out,
                                 uint32_t *height_out) {
-    if (!submit_serial || access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!submit_serial || !macws_submit_ring_enabled())
         return 0;
     int result = 0;
     uint32_t width = 0;
@@ -9773,7 +9810,7 @@ static struct macws_submit_ring_token macws_submit_ring_begin(
         const unsigned char *commands, size_t commands_length,
         const unsigned char *segments, size_t segments_length) {
     struct macws_submit_ring_token token = {0};
-    if (access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!macws_submit_ring_enabled())
         return token;
 
     token.serial = atomic_fetch_add(&g_macws_submit_ring_serial, 1) + 1;
@@ -9848,7 +9885,7 @@ static size_t macws_submit_ring_write_file(const char *path,
 static void macws_dump_recent_agx_submits_impl(
         const char *reason, const void *command_buffer,
         uint64_t requested_serial) {
-    if (access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!macws_submit_ring_enabled())
         return;
     unsigned dump = atomic_fetch_add(&g_macws_submit_ring_dump_count, 1) + 1;
     // Keep the first generic completion error, the first raw page-fault
@@ -10564,7 +10601,7 @@ static void macws_subtype1_field_a4_diagnostic(unsigned sequence,
                                                 unsigned segment,
                                                 unsigned char *record) {
     if (!record ||
-        access("/tmp/macws_kcmd_field_a4_diag", F_OK) != 0)
+        !macws_kcmd_field_a4_diag_enabled())
         return;
 
     uint32_t old_value = *(uint32_t *)(record + 0x3a0);
@@ -10613,9 +10650,9 @@ static void macws_subtype1_semantic_field_diagnostic(
         return;
 
     BOOL test5e3 =
-        access("/tmp/macws_kcmd_field_5e3_diag", F_OK) == 0;
+        macws_kcmd_field_5e3_diag_enabled();
     BOOL test6bc =
-        access("/tmp/macws_kcmd_field_6bc_diag", F_OK) == 0;
+        macws_kcmd_field_6bc_diag_enabled();
     unsigned char old5e3 = record[0x5e3];
     uint32_t old6bc = *(uint32_t *)(record + 0x6bc);
     BOOL changed5e3 = test5e3 && old5e3 == 1;
@@ -12155,7 +12192,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     const void *agxRawRequest = NULL;
     size_t agxRawRequestLength = 0;
     uint32_t resDiagSequence = 0;
-    int resDiagActive = access("/tmp/macws_res_diag", F_OK) == 0;
+    int resDiagActive = macws_res_diag_enabled();
     int agxIsRes = (IOConnectIsIOGPU(client) && selector == 0x9 && inStruct && inStructCnt >= 0x60 && inStructCnt <= sizeof(shadowbuf));
     if(agxIsRes) {
         const unsigned char *src = (const unsigned char *)inStruct;
@@ -12176,7 +12213,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
         agxType = src[0];
         if (agxType == 0x82 &&
-            access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+            macws_iogpu_error_diag_enabled()) {
             agxRawRequest = src;
             agxRawRequestLength = inStructCnt;
         }
@@ -12648,7 +12685,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     int translated_agx_submit = !skip && IOConnectIsIOGPU(client) &&
         selector == 0x1a;
     int submit_diag_active = translated_agx_submit &&
-        access("/tmp/macws_submit_diag", F_OK) == 0;
+        macws_submit_diag_enabled();
     int submit_fix_active = translated_agx_submit &&
         macws_kcmd_fix_enabled();
     // The ABI translator and the byte-dump diagnostic are independent gates.
@@ -12664,7 +12701,7 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
     }
     unsigned queue_qos_diag_sequence = 0;
     if (IOConnectIsIOGPU(client) &&
-        access("/tmp/macws_queue_qos_diag", F_OK) == 0 &&
+        macws_queue_qos_diag_enabled() &&
         ((orig == 0x8 && selector == 0x7 && inStruct &&
           inStructCnt == 0x408) ||
          (orig == 0x1f && selector == 0x1b))) {
@@ -13370,7 +13407,7 @@ IOReturn IOConnectCallAsyncScalarMethod_new(io_connect_t client, uint32_t select
     selector = IOConnectTranslateSelector(client, selector);
     if (IOConnectIsIOGPU(client) && orig == 0x107 &&
         macws_runtime_diagnostics_enabled() &&
-        access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+        macws_iogpu_error_diag_enabled()) {
         static _Atomic unsigned registration_count = 0;
         unsigned sequence = atomic_fetch_add(&registration_count, 1) + 1;
         if (sequence <= 8) {

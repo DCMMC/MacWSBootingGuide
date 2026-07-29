@@ -83,7 +83,13 @@ VNC_ACTIVITY="$ROOTFS/private/tmp/macws_vnc_activity"
 GRAPHICS_READY="$ROOTFS/private/tmp/macws_graphics_ready"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
-WINDOWSERVER_READY_WAIT=45
+# A cold native-AGX start may spend more than 45 seconds realizing classes and
+# compiling the first compositor pipelines before the first clean producer
+# completion.  Keep the real completion/PID witness mandatory, but allow that
+# evidence enough time to arrive; runtime sampling on 2026-07-30 saw a healthy
+# WindowServer actively render before the old deadline, then publish the exact
+# clean-producer witness shortly after the launcher had returned failure.
+WINDOWSERVER_READY_WAIT=90
 STARTED_WS_PID=""
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path

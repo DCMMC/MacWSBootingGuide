@@ -9,6 +9,13 @@ It validates one restored Aquarium tab, a working ptyHost, no optional
 AgentHost, quiet production JIT bookkeeping, full Retina VNC, 118.949 FPS at
 1,000 fish, and a still-open 12.056-vs-37.679 FPS gap at 60,000 fish.
 
+The follow-up production hot-path and cold-start run is documented in
+[`production-hotpath-cache-20260730/README.md`](production-hotpath-cache-20260730/README.md).
+It removes every sampled diagnostic `access(2)` call from the 60,000-fish GPU
+process, confirms that the remaining 12.289 FPS result is still dominated by
+ANGLE/AGX command encoding, and makes the strict one-click Retina VNC startup
+survive the observed cold native-AGX initialization delay.
+
 The preceding large-command failure and duplicate-webview ownership boundary
 are documented separately in
 [`vscode-production-error-20260730/README.md`](vscode-production-error-20260730/README.md).

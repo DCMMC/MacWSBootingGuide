@@ -37,6 +37,33 @@ static BOOL macws_runtime_diagnostics_enabled(void) {
     return value != 0;
 }
 
+// These diagnostics are selected before process launch.  Cache their exact
+// state once so command-buffer completion and resource creation never perform
+// filesystem probes in production.
+#define MACWS_DEFINE_STARTUP_FLAG(function_name, path_literal) \
+    static BOOL function_name(void) { \
+        static _Atomic int cached = -1; \
+        int value = atomic_load_explicit(&cached, memory_order_acquire); \
+        if (value < 0) { \
+            value = access(path_literal, F_OK) == 0; \
+            atomic_store_explicit(&cached, value, memory_order_release); \
+        } \
+        return value != 0; \
+    }
+
+MACWS_DEFINE_STARTUP_FLAG(macws_iogpu_error_diag_enabled,
+                          "/tmp/macws_iogpu_error_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_command_error_diag_enabled,
+                          "/tmp/macws_command_error_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_submit_ring_enabled,
+                          "/tmp/macws_submit_ring")
+MACWS_DEFINE_STARTUP_FLAG(macws_res_diag_enabled,
+                          "/tmp/macws_res_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_trace_small_pf550_bind_enabled,
+                          "/tmp/macws_trace_small_pf550_bind")
+
+#undef MACWS_DEFINE_STARTUP_FLAG
+
 static BOOL macws_owned_scanout_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
@@ -162,7 +189,7 @@ static _Atomic uint32_t g_macws_iogpu_page_fault_width = 0;
 static _Atomic uint32_t g_macws_iogpu_page_fault_height = 0;
 
 static BOOL macws_iogpu_callback_diag_enabled(void) {
-    return access("/tmp/macws_iogpu_error_diag", F_OK) == 0;
+    return macws_iogpu_error_diag_enabled();
 }
 
 static void macws_iogpu_dump_bytes(const char *role, const void *pointer,
@@ -471,7 +498,7 @@ static id macws_iogpu_command_buffer_error(id self, SEL selector) {
     id error = g_macws_orig_iogpu_command_buffer_error
         ? g_macws_orig_iogpu_command_buffer_error(self, selector) : nil;
     if (!error ||
-        access("/tmp/macws_command_error_diag", F_OK) != 0) {
+        !macws_command_error_diag_enabled()) {
         return error;
     }
 
@@ -593,7 +620,7 @@ static void macws_install_iogpu_callback_diagnostics(void) {
 }
 
 static void macws_log_command_buffer_ivars(id commandBuffer) {
-    if (!commandBuffer || access("/tmp/macws_submit_ring", F_OK) != 0)
+    if (!commandBuffer || !macws_submit_ring_enabled())
         return;
     Class cls = object_getClass(commandBuffer);
     fprintf(stderr,
@@ -3750,7 +3777,7 @@ static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
                                                 id device) {
     if (!tex || !desc || !surf || !device ||
         desc.pixelFormat != (MTLPixelFormat)550 ||
-        (access("/tmp/macws_res_diag", F_OK) != 0 &&
+        (!macws_res_diag_enabled() &&
          access("/private/tmp/macws_tile_descriptor_diag", F_OK) != 0)) {
         return;
     }
@@ -4874,7 +4901,7 @@ static IOSurfaceRef macws_create_pf550_scratch_surface(size_t width,
     IOSurfaceRef surface = IOSurfaceCreate(
         (__bridge CFDictionaryRef)properties);
 
-    if (access("/tmp/macws_iogpu_error_diag", F_OK) == 0) {
+    if (macws_iogpu_error_diag_enabled()) {
         extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef, size_t)
             __attribute__((weak_import));
         extern size_t IOSurfaceGetHeightInCompressedTilesOfPlane(
@@ -7681,7 +7708,7 @@ static void install_agx_init_redirect(Class agx) {
                 // captured by renderCommandEncoderWithDescriptor:.  Every
                 // original argument is forwarded unchanged below.
                 if (side == 0 && tex &&
-                    access("/tmp/macws_trace_small_pf550_bind", F_OK) == 0) {
+                    macws_trace_small_pf550_bind_enabled()) {
                     macws_tile_texture_snapshot source =
                         macws_tile_snapshot_texture(tex);
                     if (source.width == 300 && source.height == 210 &&
@@ -7909,8 +7936,7 @@ static void install_agx_init_redirect(Class agx) {
                                 sel_registerName("gpuAddress");
                             uint64_t gpu_address = 0;
                             BOOL queried_gpu_address =
-                                access("/tmp/macws_iogpu_error_diag",
-                                    F_OK) == 0 &&
+                                macws_iogpu_error_diag_enabled() &&
                                 [(id)ios_buf respondsToSelector:
                                     gpu_address_sel];
                             if (queried_gpu_address) {

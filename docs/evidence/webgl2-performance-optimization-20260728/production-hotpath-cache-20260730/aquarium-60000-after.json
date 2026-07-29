@@ -1,0 +1,21 @@
+{
+  "info": {
+    "url": "https://webglsamples.org/aquarium/aquarium.html?numFish=60000&canvasWidth=1024&canvasHeight=1024&fitWindow=false",
+    "fish": 60000,
+    "modelFish": 60000,
+    "canvas": [
+      1024,
+      1024
+    ],
+    "context": "WebGL2RenderingContext",
+    "contextLost": false,
+    "hidden": false
+  },
+  "callbacks": 186,
+  "elapsedSeconds": 15.135099999964238,
+  "callbackFps": 12.289314243079959,
+  "intervalMs": {
+    "p50": 80,
+    "p95": 93.80000001192093
+  }
+}
