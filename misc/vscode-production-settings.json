@@ -1,0 +1,4 @@
+{
+    "chat.agentHost.enabled": false,
+    "terminal.integrated.enablePersistentSessions": false
+}

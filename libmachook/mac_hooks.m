@@ -48,6 +48,11 @@ static bool macws_runtime_diagnostics_enabled(void) {
     return value != 0;
 }
 
+static bool macws_jit_trace_enabled(void) {
+    return macws_runtime_diagnostics_enabled() ||
+        getenv("MACWS_JIT_MPROTECT_TRACE") != NULL;
+}
+
 static bool macws_kcmd_fix_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
@@ -162,9 +167,12 @@ static void macws_jit_record_range(void *address, size_t size) {
         g_macws_jit_ranges[count].size = size;
         atomic_store_explicit(&g_macws_jit_range_count, count + 1,
                               memory_order_release);
-        fprintf(stderr,
-            "#### JIT-MPROTECT range[%u]=[%p,%p) source=MAP_JIT-EINVAL\n",
-            count, address, (void *)((uintptr_t)address + size));
+        if (macws_jit_trace_enabled()) {
+            fprintf(stderr,
+                "#### JIT-MPROTECT range[%u]=[%p,%p) "
+                "source=MAP_JIT-EINVAL\n",
+                count, address, (void *)((uintptr_t)address + size));
+        }
     }
     pthread_mutex_unlock(&g_macws_jit_state_lock);
     macws_jit_ensure_exec_barrier_handler();
@@ -353,7 +361,8 @@ static void macws_jit_ensure_exec_barrier_handler(void) {
         barrier.sa_sigaction = macws_jit_exec_barrier_sigbus;
         barrier.sa_flags = SA_SIGINFO | SA_RESTART;
         sigemptyset(&barrier.sa_mask);
-        if (sigaction(SIGBUS, &barrier, NULL) == 0) {
+        if (sigaction(SIGBUS, &barrier, NULL) == 0 &&
+            macws_jit_trace_enabled()) {
             fprintf(stderr,
                 "#### JIT-MPROTECT execution barrier installed "
                 "(W^X fetch-wait compatibility)\n");
@@ -375,20 +384,22 @@ static void macws_jit_set_all_permissions(int protection) {
                 i, base, size, protection, errno);
         }
     }
-    unsigned sequence = atomic_fetch_add_explicit(
-        &g_macws_jit_permission_flips, 1, memory_order_relaxed) + 1;
-    if (sequence <= 32 || (sequence % 1024) == 0) {
-        fprintf(stderr,
-            "#### JIT-MPROTECT flip #%u ranges=%u prot=%s writers=%u "
-            "exec_waits=%u late_retries=%u\n",
-            sequence, count,
-            protection == (PROT_READ | PROT_WRITE) ? "RW" : "RX",
-            atomic_load_explicit(&g_macws_jit_active_writers,
-                                 memory_order_relaxed),
-            atomic_load_explicit(&g_macws_jit_exec_waits,
-                                 memory_order_relaxed),
-            atomic_load_explicit(&g_macws_jit_late_fetch_retries,
-                                 memory_order_relaxed));
+    if (macws_jit_trace_enabled()) {
+        unsigned sequence = atomic_fetch_add_explicit(
+            &g_macws_jit_permission_flips, 1, memory_order_relaxed) + 1;
+        if (sequence <= 32 || (sequence % 1024) == 0) {
+            fprintf(stderr,
+                "#### JIT-MPROTECT flip #%u ranges=%u prot=%s writers=%u "
+                "exec_waits=%u late_retries=%u\n",
+                sequence, count,
+                protection == (PROT_READ | PROT_WRITE) ? "RW" : "RX",
+                atomic_load_explicit(&g_macws_jit_active_writers,
+                                     memory_order_relaxed),
+                atomic_load_explicit(&g_macws_jit_exec_waits,
+                                     memory_order_relaxed),
+                atomic_load_explicit(&g_macws_jit_late_fetch_retries,
+                                     memory_order_relaxed));
+        }
     }
 }
 
@@ -485,23 +496,35 @@ static void macws_dump_agx_method_map(void) {
     close(fd);
 }
 
-// Diagnostic-only producer trace.  The submitted subtype-1 record is 0x20
-// bytes larger under the macOS 13.4 AGX bundle than under native iOS 16.3.
-// Trace the upstream AGX reservation API without changing its arguments or
-// return value, so the actual caller offsets identify which encoder decides
-// the record layout.  Armed only by /private/tmp/macws_agx_trace_reserve.
+// Diagnostic-only producer trace.  Trace both layers which can reserve KCMD
+// storage without changing their arguments or return values.  The public AGX
+// method does not cover Chromium's subtype-2 records: a runtime run reached
+// repeated IOGPU 0x102/0x103 completions while that method recorded no target
+// sized calls.  IOGPUMetalCommandBuffer's private underscored method is the
+// base allocator observed in production samples, so hook it independently.
+// Armed only by /private/tmp/macws_agx_trace_reserve.
 typedef void *(*macws_agx_reserve_fn)(id, SEL, uint64_t);
-static macws_agx_reserve_fn g_macws_agx_orig_reserve = NULL;
+static macws_agx_reserve_fn g_macws_agx_orig_public_reserve = NULL;
+static macws_agx_reserve_fn g_macws_agx_orig_base_reserve = NULL;
 static _Atomic unsigned g_macws_agx_reserve_sequence = 0;
 
-static void *macws_agx_trace_reserve(id self, SEL cmd, uint64_t size) {
-    unsigned sequence = atomic_fetch_add(&g_macws_agx_reserve_sequence, 1) + 1;
-    if (sequence <= 256) {
-        void *frames[8] = {0};
-        int frame_count = backtrace(frames, 8);
+static void macws_agx_log_reserve(const char *layer, id self, uint64_t size) {
+    // The full Chromium trace reaches the first failing Aquarium submission
+    // after hundreds of smaller compute/render reservations.  Counting those
+    // first made the producer invisible before the old 256-entry cap.  The
+    // submitted record is 0x418 bytes with a 0x3c0 payload-size field.  Include
+    // a bounded margin around that family because the private allocator's
+    // argument need not include the common header/padding.
+    BOOL interesting = size >= 0x300 && size <= 0x500;
+    unsigned sequence = interesting
+        ? atomic_fetch_add(&g_macws_agx_reserve_sequence, 1) + 1 : 0;
+    if (interesting && sequence <= 64) {
+        void *frames[12] = {0};
+        int frame_count = backtrace(frames, 12);
         fprintf(stderr,
-            "#### AGX-RESERVE-DIAG #%u self=%p size=%#llx frames=%d\n",
-            sequence, self, (unsigned long long)size, frame_count);
+            "#### AGX-RESERVE-DIAG #%u layer=%s self=%p size=%#llx "
+            "frames=%d\n",
+            sequence, layer, self, (unsigned long long)size, frame_count);
         for (int i = 1; i < frame_count; i++) {
             void *pc = ptrauth_strip(frames[i],
                 ptrauth_key_function_pointer);
@@ -517,25 +540,66 @@ static void *macws_agx_trace_reserve(id self, SEL cmd, uint64_t size) {
                 info.dli_sname ?: "(unknown)");
         }
     }
-    return g_macws_agx_orig_reserve(self, cmd, size);
+}
+
+static void *macws_agx_trace_public_reserve(id self, SEL cmd,
+                                             uint64_t size) {
+    macws_agx_log_reserve("AGX-public", self, size);
+    return g_macws_agx_orig_public_reserve(self, cmd, size);
+}
+
+static void *macws_agx_trace_base_reserve(id self, SEL cmd, uint64_t size) {
+    macws_agx_log_reserve("IOGPU-base", self, size);
+    return g_macws_agx_orig_base_reserve(self, cmd, size);
 }
 
 static void macws_install_agx_reserve_trace(void) {
-    Class cls = objc_getClass("AGXG13GFamilyCommandBuffer");
-    SEL selector = sel_registerName("reserveKernelCommandBufferSpace:");
-    Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
-    if (!method) {
+    Class public_cls = objc_getClass("AGXG13GFamilyCommandBuffer");
+    SEL public_selector =
+        sel_registerName("reserveKernelCommandBufferSpace:");
+    Method public_method = public_cls
+        ? class_getInstanceMethod(public_cls, public_selector) : NULL;
+    if (public_method) {
+        IMP current = method_getImplementation(public_method);
+        if (current != (IMP)macws_agx_trace_public_reserve) {
+            g_macws_agx_orig_public_reserve =
+                (macws_agx_reserve_fn)current;
+            method_setImplementation(public_method,
+                (IMP)macws_agx_trace_public_reserve);
+            fprintf(stderr,
+                "#### AGX-RESERVE-DIAG installed layer=AGX-public "
+                "class=%p original=%p trace=%p\n",
+                (void *)public_cls, (void *)current,
+                (void *)macws_agx_trace_public_reserve);
+        }
+    } else {
         fprintf(stderr,
-            "#### AGX-RESERVE-DIAG install failed: method unavailable\n");
-        return;
+            "#### AGX-RESERVE-DIAG install failed layer=AGX-public: "
+            "method unavailable\n");
     }
-    IMP current = method_getImplementation(method);
-    if (current == (IMP)macws_agx_trace_reserve) return;
-    g_macws_agx_orig_reserve = (macws_agx_reserve_fn)current;
-    method_setImplementation(method, (IMP)macws_agx_trace_reserve);
-    fprintf(stderr,
-        "#### AGX-RESERVE-DIAG installed class=%p original=%p trace=%p\n",
-        (void *)cls, (void *)current, (void *)macws_agx_trace_reserve);
+
+    Class base_cls = objc_getClass("IOGPUMetalCommandBuffer");
+    SEL base_selector =
+        sel_registerName("_reserveKernelCommandBufferSpace:");
+    Method base_method = base_cls
+        ? class_getInstanceMethod(base_cls, base_selector) : NULL;
+    if (base_method) {
+        IMP current = method_getImplementation(base_method);
+        if (current != (IMP)macws_agx_trace_base_reserve) {
+            g_macws_agx_orig_base_reserve = (macws_agx_reserve_fn)current;
+            method_setImplementation(base_method,
+                (IMP)macws_agx_trace_base_reserve);
+            fprintf(stderr,
+                "#### AGX-RESERVE-DIAG installed layer=IOGPU-base "
+                "class=%p original=%p trace=%p\n",
+                (void *)base_cls, (void *)current,
+                (void *)macws_agx_trace_base_reserve);
+        }
+    } else {
+        fprintf(stderr,
+            "#### AGX-RESERVE-DIAG install failed layer=IOGPU-base: "
+            "method unavailable\n");
+    }
 }
 
 static BOOL macws_glass_blur_ab_is_opaque(id self, SEL _cmd) {
@@ -6375,9 +6439,21 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
             // This reproduces the runtime-confirmed native-move + scoped
             // NSEvent.mouseLocation sequence required by macOS 13.4 menu
             // presentation without duplicating a button event.
-            BOOL targetRefreshDue = buttonTransition ||
-                macws_vnc_last_hover_target_probe <= 0.0 ||
-                now - macws_vnc_last_hover_target_probe >= 2.0;
+            // A secondary gesture already resolves and stores menuTarget via
+            // ActivateTarget before the atomic SecondaryTap is delivered.
+            // Do not queue another query after either right-button edge.
+            // Runtime-confirmed on 2026-07-30: immediately after Terminal
+            // accepted SecondaryTap and entered its real synchronous menu
+            // tracker, the redundant TargetProbe received 0/1 replies and
+            // blocked macwsinputd's single routing loop for its full 150-ms
+            // deadline. Menu hover and Escape were therefore delayed behind
+            // a query whose authoritative answer was already cached. The
+            // actual right-click event and activation transaction are
+            // unchanged; this only removes the duplicate control-plane query.
+            BOOL targetRefreshDue = !secondaryGesture &&
+                (buttonTransition ||
+                 macws_vnc_last_hover_target_probe <= 0.0 ||
+                 now - macws_vnc_last_hover_target_probe >= 2.0);
             if (targetRefreshDue && macws_vnc_forward_input(
                     MacWSInputKindTargetProbe, point, YES)) {
                 macws_vnc_last_hover_target_probe = now;
@@ -6900,6 +6976,21 @@ static void macws_install_osxvnc_hooks(void) {
 }
 
 __attribute__((constructor)) void InitStuff() {
+    // VS Code 1.130 marks both its login shell and the Electron-as-Node
+    // environment printer with this exact value.  Runtime-confirmed: running
+    // the normal GUI/JIT initialization in the printer aborts while reserving
+    // Oilpan's CagedHeap; skipping only this constructor leaves Metal's
+    // constructor to SIGBUS in libroot.  All four heavy constructors honor the
+    // same narrow marker, while this dylib's dyld interposes (notably
+    // os_variant) remain active.  VS Code deletes the marker from the parsed
+    // result before launching its real main/render/GPU processes.
+    const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
+    if (shell_env && strcmp(shell_env, "1") == 0) {
+        fprintf(stderr,
+            "#### VSCODE-SHELL-ENV minimal compatibility mode: "
+            "GUI/JIT/AGX constructors disabled\n");
+        return;
+    }
     macws_install_glass_blur_ab_if_requested();
     EnableJIT();
     macws_install_crash_diag();
@@ -7382,14 +7473,16 @@ kern_return_t mach_vm_remap_new(
         // destination to r--.  Decline the optional optimization before it
         // overwrites V8's writable destination; V8 then copies the blob under
         // its normal RwxMemoryWriteScope.
-        unsigned sequence = atomic_fetch_add_explicit(
-            &g_macws_jit_remap_declines, 1, memory_order_relaxed) + 1;
-        fprintf(stderr,
-            "#### JIT-MPROTECT remap decline #%u dst=%p size=%#llx "
-            "src=%p requested=%#x -> V8 copy fallback\n",
-            sequence, (void *)(uintptr_t)*target_address,
-            (unsigned long long)size, (void *)(uintptr_t)source_address,
-            requested);
+        if (macws_jit_trace_enabled()) {
+            unsigned sequence = atomic_fetch_add_explicit(
+                &g_macws_jit_remap_declines, 1, memory_order_relaxed) + 1;
+            fprintf(stderr,
+                "#### JIT-MPROTECT remap decline #%u dst=%p size=%#llx "
+                "src=%p requested=%#x -> V8 copy fallback\n",
+                sequence, (void *)(uintptr_t)*target_address,
+                (unsigned long long)size, (void *)(uintptr_t)source_address,
+                requested);
+        }
         return KERN_NOT_SUPPORTED;
     }
     return mach_vm_remap(target_task, target_address, size, mask, flags,
@@ -9941,9 +10034,34 @@ void macws_dump_recent_agx_submit_serial(const char *reason,
 // existing VS Code failure witnesses are 0x858-byte commands with 0x188-byte
 // segment lists, while the larger multi-record batches remain represented by
 // their full lengths and a truncated prefix.
-#define MACWS_FAST_SUBMIT_RING_COUNT 1024u
-#define MACWS_FAST_SUBMIT_COMMAND_CAP 0x3000u
-#define MACWS_FAST_SUBMIT_SEGMENT_CAP 0x1000u
+// Chromium's 60,000-fish workload runtime-captured a 21-segment submission
+// with 0x4a58 command bytes and a 0x3270 resource list.  The former
+// 0x3000/0x1000 caps truncated both before the first error could be decoded.
+// The VS Code Simple Browser Aquarium follow-up reached a 13-segment,
+// post-translation 0x69e8-byte KCMD; the 0x6000 cap then hid its last two
+// records and wrapper. Keep the diagnostic footprint bounded by trading
+// history depth for complete payload width:
+// A later VS Code raw IOGPU completion witness exposed the next local limit:
+// its failing command-buffer storage had start=0x12958c000 and
+// current=0x1295a34c0 (0x174c0 command bytes), plus an 0x8000-byte segment
+// list.  The old inspector rejected every KCMD over 0x10000 before either
+// translation or recording, so that submit reached iOS with all macOS ABI
+// records untouched and the completion returned 0x103.  This 64-KiB boundary
+// was ours, not IOGPU's: RE of the exact iOS 16.3
+// IOGPUMetalCommandBufferStorageGrowKernelCommandBuffer shows the storage
+// doubling below 2 MiB and then growing in 1-MiB increments.
+//
+// Preserve the same 18-MiB explicit-diagnostic footprint while exchanging
+// history depth for enough width to hold the complete observed batch:
+// 48 * (0x40000 + 0x20000) = 18 MiB.  The inspector and translator remain
+// bounded; these are evidence-backed workload ceilings, not protocol claims.
+// The pages are written only when /tmp/macws_submit_fast_ring explicitly
+// enables this diagnostic recorder; production preflight removes that flag.
+#define MACWS_AGX_KCMD_INSPECT_MAX 0x40000u
+#define MACWS_AGX_SEGMENT_INSPECT_MAX 0x20000u
+#define MACWS_FAST_SUBMIT_RING_COUNT 48u
+#define MACWS_FAST_SUBMIT_COMMAND_CAP MACWS_AGX_KCMD_INSPECT_MAX
+#define MACWS_FAST_SUBMIT_SEGMENT_CAP MACWS_AGX_SEGMENT_INSPECT_MAX
 
 struct macws_fast_submit_entry {
     _Atomic uint64_t guard;
@@ -10347,7 +10465,8 @@ static void macws_submit_save_type1(unsigned sequence, unsigned record,
 static void macws_submit_save_kcmd(unsigned sequence, unsigned descriptor,
                                    const char *phase,
                                    const unsigned char *p, size_t length) {
-    if (!phase || !p || length < 0x38 || length > 0x10000) return;
+    if (!phase || !p || length < 0x38 ||
+        length > MACWS_AGX_KCMD_INSPECT_MAX) return;
 
     char path[PATH_MAX];
     int path_length = snprintf(path, sizeof(path),
@@ -10382,7 +10501,8 @@ static void macws_submit_save_segment_list(unsigned sequence,
                                            unsigned descriptor,
                                            const unsigned char *p,
                                            size_t length) {
-    if (!p || length < 0x10 || length > 0x10000) return;
+    if (!p || length < 0x10 ||
+        length > MACWS_AGX_SEGMENT_INSPECT_MAX) return;
 
     char path[PATH_MAX];
     int path_length = snprintf(path, sizeof(path),
@@ -10722,10 +10842,14 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
         // together from 2 in every earlier capture to 3 in this capture.
         // The remaining framing stayed identical and the actual blob was
         // 0x148 bytes while list+0x0c remained the base-list offset 0x130.
-        // Validate the observed generation relationship rather than forcing
-        // the historical value.  Keep the known 2/3 bound so an unrelated
-        // list layout cannot enter this temporary translator.
-        (list_generation == 2 || list_generation == 3) &&
+        // A clean production VS Code 1.130 launch on 2026-07-30 then captured
+        // the same 0x870 KCMD / 0x148 list shape with both generation fields
+        // equal to 4. The pre-submit ring recorded fixed=0 and that exact
+        // command buffer subsequently reported error 0x102. No other framing
+        // field changed. Validate the observed equality and retain the known
+        // 2..4 bound so an unrelated list layout cannot enter this temporary
+        // translator.
+        (list_generation >= 2 && list_generation <= 4) &&
         *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
         *(uint32_t *)(wrapper_list + 0x08) == 1 &&
         *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
@@ -10789,8 +10913,8 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
     return 1;
 }
 
-// TEMPORARY ABI-TRANSLATION EXPERIMENT for a storage object containing more
-// than one segment.  Runtime capture of WindowServer submit #9 established
+// TEMPORARY ABI-TRANSLATION EXPERIMENT for a storage object containing one or
+// more validated segments. Runtime capture of WindowServer submit #9 established
 // the segment-list framing on this exact iOS 16.3 device:
 //
 //   list+0x08 = segment count
@@ -10815,12 +10939,26 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
 // Use those cross-buffer invariants instead of assuming a C struct stride.
 //
 // This remains a diagnostic scaffold.  It deliberately handles only the
-// already-observed subtype-1 and subtype-3 macOS layouts and is still gated
+// already-observed subtype-1, subtype-2 and subtype-3 macOS layouts and is
+// still gated
 // by /tmp/macws_kcmd_fix at the caller.
-static unsigned macws_translate_agx_multisegment_subtype1(
+//
+// The original minimum count of two was correct for the direct-list cases
+// that motivated this walker, but too strict for an independently framed
+// trailing-wrapper list. Runtime evidence from VS Code GPU-process submit 480
+// on 2026-07-30 is exactly one subtype-3 segment followed by one type-3 KCMD
+// wrapper: KCMD 0x240, base span/range 0..0x228, list 0x108 with wrapper-list
+// offset 0xf0, and matching generation 4 tail range 0x228..0x240. It returned
+// 0x103 with fixed=0. Permit count=1 only for that already-validated trailing
+// wrapper contract; a direct one-segment list remains owned by the narrower
+// linear translator below.
+#define MACWS_AGX_SEGMENT_LIST_MAX_RECORDS 256u
+static unsigned macws_translate_agx_segment_list_records(
     unsigned sequence, unsigned char *commands, size_t *total_io,
-    unsigned char *segment_list, size_t segment_length) {
-    if (!commands || !total_io || !segment_list || segment_length < 0x20)
+    unsigned char *segment_list, size_t *segment_length_io) {
+    size_t segment_length = segment_length_io ? *segment_length_io : 0;
+    if (!commands || !total_io || !segment_list || !segment_length_io ||
+        segment_length < 0x20)
         return 0;
 
     size_t total = *total_io;
@@ -10838,11 +10976,21 @@ static unsigned macws_translate_agx_multisegment_subtype1(
     BOOL trailing_wrapper_list =
         encoded_length >= 0x20 &&
         (size_t)encoded_length + 0x18 == segment_length;
-    if (count < 2 || count > 64 ||
+    // Runtime-confirmed by VS Code 1.130 Aquarium submit serial 155 on
+    // 2026-07-30: the direct list contains 69 individually well-framed,
+    // uniquely ranged records (KCMD length 0xee60, list length 0x3cf0).  The
+    // former diagnostic-era limit of 64 rejected the entire batch before the
+    // ABI walk and the completion returned 0x103 with fixed=0.  This is a
+    // local parser-capacity bound, not an AGX protocol limit.  Keep a bounded
+    // stack array but size it for the observed Chromium workload plus ample
+    // headroom; all existing record, total-span and unique-range validation
+    // still runs before any byte is changed.
+    if (count < 1 || count > MACWS_AGX_SEGMENT_LIST_MAX_RECORDS ||
+        (direct_list && count < 2) ||
         (!direct_list && !trailing_wrapper_list))
         return 0;
 
-    uint32_t pair_offsets[64] = {0};
+    uint32_t pair_offsets[MACWS_AGX_SEGMENT_LIST_MAX_RECORDS] = {0};
     uint32_t cursor = 0;
     for (uint32_t i = 0; i < count; i++) {
         if ((size_t)cursor + 0x38 > total)
@@ -10868,6 +11016,10 @@ static unsigned macws_translate_agx_multisegment_subtype1(
         cursor = end;
     }
     uint32_t wrapper_pair_offset = UINT32_MAX;
+    unsigned wrapper_count = 0;
+    uint32_t wrapper_type = 0;
+    uint32_t wrapper_opcode = 0;
+    uint32_t list_generation = 0;
     if (direct_list) {
         if (cursor != total)
             return 0;
@@ -10878,16 +11030,17 @@ static unsigned macws_translate_agx_multisegment_subtype1(
         if (wrapper_bytes != 0x18 && wrapper_bytes != 0x30) {
             return 0;
         }
-        unsigned wrapper_count = (unsigned)(wrapper_bytes / 0x18);
-        uint32_t wrapper_opcode =
-            *(uint32_t *)(commands + cursor + 0x08);
+        wrapper_count = (unsigned)(wrapper_bytes / 0x18);
+        wrapper_type = *(uint32_t *)(commands + cursor + 0x00);
+        wrapper_opcode = *(uint32_t *)(commands + cursor + 0x08);
         // The wrapper record type is the dword at +0x00 (3); the opaque
         // operation token at +0x08 is not another type tag.  Chromium 148
         // Fish Tank runtime-captured two otherwise valid, identical wrapper
         // records with token 0x9207.  The former low-byte==3 requirement
         // rejected that list, after which the single-record fallback shifted
         // KCMD bytes without its multi-segment ranges and produced error 0x0a.
-        BOOL wrapper_commands_ok = wrapper_opcode < 0x10000;
+        BOOL wrapper_commands_ok = wrapper_type == 3 &&
+            wrapper_opcode < 0x10000;
         for (unsigned i = 0; wrapper_commands_ok && i < wrapper_count; i++) {
             size_t offset = cursor + (size_t)i * 0x18;
             wrapper_commands_ok =
@@ -10895,12 +11048,42 @@ static unsigned macws_translate_agx_multisegment_subtype1(
                 *(uint32_t *)(commands + offset + 0x04) == 0x18 &&
                 *(uint32_t *)(commands + offset + 0x08) == wrapper_opcode;
         }
+        // Runtime-confirmed by the first independent VS Code Simple Browser
+        // Aquarium failure (GPU PID 56040, matched submit serial 108): a
+        // subtype-3 segment [0,0x210) was followed by this exact type-5
+        // 0x18-byte record and a generation-4 wrapper list covering
+        // [0x210,0x228).  The iOS 16.3 AGX kernel parser rejects the preceding
+        // subtype-3 body at 0xfffffe00086e2408 because its macOS size is
+        // 0x1b8 instead of 0x1a8, then returns 0x103 at
+        // 0xfffffe00086e4108.  Preserve the type-5 record byte-for-byte while
+        // shortening only that RE-confirmed vendor segment and its ranges.
+        // The first witness above carried ordinal 1 at +0x08.  A complete
+        // fast-ring capture from the next clean VS Code launch correlated
+        // error 0x103 with serial 101 / queue sequence 149 / descriptor 2:
+        // its otherwise identical wrapper carried ordinal 2, while the next
+        // retained queue sequence carried ordinal 3.  In all three records
+        // the remaining dwords are exactly {5,0x18,N,0,1,0}.  Treat the
+        // runtime-observed 1..3 field as an ordinal, retain the other five
+        // anchors, and preserve the complete wrapper byte-for-byte.
+        uint32_t type5_ordinal =
+            *(uint32_t *)(commands + cursor + 0x08);
+        if (wrapper_type == 5 && wrapper_count == 1 &&
+            *(uint32_t *)(commands + cursor + 0x04) == 0x18 &&
+            type5_ordinal >= 1 && type5_ordinal <= 3 &&
+            *(uint32_t *)(commands + cursor + 0x0c) == 0 &&
+            *(uint32_t *)(commands + cursor + 0x10) == 1 &&
+            *(uint32_t *)(commands + cursor + 0x14) == 0) {
+            wrapper_commands_ok = YES;
+        }
         unsigned char *wrapper_list = segment_list + encoded_length;
         uint32_t list_magic = *(uint32_t *)(segment_list + 0x00);
-        uint32_t list_generation = *(uint32_t *)(segment_list + 0x04);
+        list_generation = *(uint32_t *)(segment_list + 0x04);
         BOOL wrapper_list_ok =
             *(uint32_t *)(wrapper_list + 0x00) == list_magic &&
-            (list_generation == 2 || list_generation == 3) &&
+            // Runtime-observed generations 2, 3 and 4 all use this exact
+            // trailing-wrapper list contract. Keep the outer/tail equality
+            // and bounded range instead of treating the field as a constant.
+            (list_generation >= 2 && list_generation <= 4) &&
             *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
             *(uint32_t *)(wrapper_list + 0x08) == 1 &&
             *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
@@ -10947,11 +11130,52 @@ static unsigned macws_translate_agx_multisegment_subtype1(
                 "\xff\xff\xff\xff\xff\xff\xff\xff"
                 "\xff\xff\xff\xff", 12) == 0;
 
+        // RE-confirmed macOS 13.4 -> iOS 16.3 fast-2D command ABI delta.
+        // The paired AGXMetal13_3 producers call ContextCommon::newCommand
+        // with 0x3f8 (macOS) vs 0x3e8 (iOS), then clear a 0x3c0 vs 0x3b0-byte
+        // subtype-2 body.  Crucially, both setupSpillBuffer implementations
+        // pass body+0x1e0 to the paired allocateUSCSpillBuffer routine.  That
+        // routine writes through descriptor offset +0x74 and the descriptor
+        // has an aligned size of 0x78, so the common AGXSpillDesc occupies
+        // body[0x1e0..0x258), or record[0x210..0x288).  The former deletion at
+        // record+0x208 cut across that common descriptor and was structurally
+        // invalid.  Every following AGX3DCommandCommonRec field is exactly
+        // 0x10 earlier in iOS (+0x2cc -> +0x2bc, +0x2d0 -> +0x2c0,
+        // +0x358 -> +0x348 and +0x3b0 -> +0x3a0), placing the macOS-only
+        // aligned member immediately after AGXSpillDesc at
+        // record[0x288..0x298).  A native-iOS generateMipmapsForTexture
+        // control produced two successful subtype-2 records with the expected
+        // 0x408/0x3b0 layout.
+        int subtype2_anchors = span == 0x418 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x418 &&
+            *(uint32_t *)(record + 0x24) == 0x18 &&
+            *(uint32_t *)(record + 0x28) == 0x3f0 &&
+            *(uint32_t *)(record + 0x2c) == 0x3c0 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 2 &&
+            *(uint64_t *)(record + 0x1e8) == 0x4000 &&
+            *(uint64_t *)(record + 0x1f8) == 0x100000 &&
+            *(uint64_t *)(record + 0x200) != 0 &&
+            macws_submit_bytes_are_zero(record + 0x288, 0x10) &&
+            *(uint32_t *)(record + 0x304) == 0x100 &&
+            // Do not constrain +0x308: runtime controls have now observed
+            // 0, 1 and 0x10291939 here.  Paired producer disassembly places
+            // it after the deleted window, so it is payload to shift rather
+            // than a record-layout anchor.
+            *(uint32_t *)(record + 0x318) == 0xffffffff &&
+            *(uint32_t *)(record + 0x31c) == 0xffffffff &&
+            *(uint32_t *)(record + 0x320) == 0xffffffff;
+
         static const unsigned char subtype3_sentinel[12] = {
             0x01, 0x00, 0x00, 0x00,
             0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff
         };
+        // This mode dword is after the macOS-only window, so its original
+        // location is 0x10 later than the normalized iOS record.
+        uint32_t subtype3_mode = span >= 0x1f8
+            ? *(uint32_t *)(record + 0x1f4) : 0;
         int subtype3_anchors = span >= 0x1e8 && span <= 0x800 &&
             *(uint32_t *)(record + 0x00) == 0x10000 &&
             *(uint32_t *)(record + 0x04) == span &&
@@ -10962,7 +11186,7 @@ static unsigned macws_translate_agx_multisegment_subtype1(
             macws_submit_bytes_are_zero(record + 0x1cc, 0x10) &&
             memcmp(record + 0x1dc, subtype3_sentinel,
                    sizeof(subtype3_sentinel)) == 0;
-        if (!subtype1_anchors && !subtype3_anchors)
+        if (!subtype1_anchors && !subtype2_anchors && !subtype3_anchors)
             continue;
 
         uint32_t shrink = subtype1_anchors ? 0x20 : 0x10;
@@ -10979,9 +11203,27 @@ static unsigned macws_translate_agx_multisegment_subtype1(
             *(uint32_t *)(record + 0x28) = 0x7f8;
             *(uint32_t *)(record + 0x2c) = 0x7c8;
             macws_subtype1_semantic_field_diagnostic(sequence, i, record);
+        } else if (subtype2_anchors) {
+            memmove(record + 0x288, record + 0x298,
+                    total - ((size_t)start + 0x298));
+            total -= 0x10;
+            *(uint32_t *)(record + 0x28) = 0x3e0;
+            *(uint32_t *)(record + 0x2c) = 0x3b0;
         } else {
-            memmove(record + 0x1cc, record + 0x1dc,
-                    total - ((size_t)start + 0x1dc));
+            // Four native-iOS controls provide a paired semantic witness for
+            // this boundary.  Successful blit/blittexture commands have
+            // normalized mode=1 and dword +0x1cc=1; successful MPS
+            // compute/scale commands have mode=2 and +0x1cc=0.  Deleting the
+            // macOS window at 0x1cc preserves the mode-1 flag, while mode 2
+            // must retain the preceding zero and delete [0x1d0,0x1e0).
+            // Everything from normalized +0x1d0 onward is identical between
+            // the two moves.  The former unconditional 0x1cc deletion made
+            // every Aquarium mode-2 record carry the impossible {2,1}
+            // mode/flag pair and the completed command buffer returned 0x103.
+            size_t delete_offset =
+                subtype3_mode == 2 ? 0x1d0 : 0x1cc;
+            memmove(record + delete_offset, record + delete_offset + 0x10,
+                    total - ((size_t)start + delete_offset + 0x10));
             total -= 0x10;
             *(uint32_t *)(record + 0x28) = 0x1d8;
             *(uint32_t *)(record + 0x2c) = 0x1a8;
@@ -11006,15 +11248,59 @@ static unsigned macws_translate_agx_multisegment_subtype1(
         }
         fixed++;
         if (log_segments) fprintf(stderr,
-                "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-MULTISEG-FIX "
+                "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-SEGMENT-LIST-FIX "
                 "segment=%u/%u subtype=%u range=%#x..%#x->%#x "
                 "shrink=%#x storage=%#zx wrappedTail=%s\n",
-                sequence, i, count, subtype1_anchors ? 1 : 3,
+                sequence, i, count,
+                subtype1_anchors ? 1 : (subtype2_anchors ? 2 : 3),
                 start, end, end - shrink, shrink, total,
                 wrapper_pair_offset == UINT32_MAX ? "NO" : "YES");
     }
 
+    // Runtime-confirmed native framing A/B for the first fully matched VS
+    // Code Aquarium error after the 256-record capacity fix.  The failing
+    // macOS submit (GPU PID 70010, serial 162) normalized all thirteen vendor
+    // records but retained a generation-4 trailing wrapper:
+    //
+    //   KCMD 0x69e8 = base records 0x69d0 + {3,0x18,0x9203,0,0x78,0}
+    //   list 0x1088 = base list 0x1070 + range [0x69d0,0x69e8)
+    //
+    // The project LLDB then captured the selector-0x1a payload of an iOS-
+    // native thirteen-render-pass control on this same iPad/iOS build.  It
+    // completed status=4/error=nil and used a direct count-13 list with no
+    // final type-3 command or list wrapper (KCMD SHA-256 bb9d3663..., list
+    // SHA-256 26ba9e8c...).  Flatten only that exact observed macOS wrapper
+    // generation/opcode/count after every vendor record has independently
+    // passed the ABI anchors above.  This is a bounded protocol A/B, not an
+    // error/completion bypass; the thirteen GPU commands and their resource
+    // descriptors remain byte-for-byte intact.
+    if (wrapper_pair_offset != UINT32_MAX && fixed == count && count == 13 &&
+        wrapper_count == 1 && wrapper_type == 3 &&
+        wrapper_opcode == 0x9203 && list_generation == 4) {
+        unsigned char *wrapper_range =
+            segment_list + wrapper_pair_offset;
+        uint32_t wrapper_start = *(uint32_t *)(wrapper_range + 0x00);
+        uint32_t wrapper_end = *(uint32_t *)(wrapper_range + 0x04);
+        if ((size_t)wrapper_start + 0x18 == total &&
+            wrapper_end == total && encoded_length + 0x18 == segment_length) {
+            memset(commands + wrapper_start, 0, 0x18);
+            total = wrapper_start;
+            memset(segment_list + encoded_length, 0, 0x18);
+            *(uint32_t *)(segment_list + 0x0c) =
+                0x80000000U | encoded_length;
+            segment_length = encoded_length;
+            fixed++;
+            if (log_segments) fprintf(stderr,
+                "#### AGX_SUBMIT_DIAG #%u TEMP-KCMD-SEGMENT-LIST-FLATTEN "
+                "count=13 generation=4 opcode=0x9203 "
+                "kcmd=%#x->%#zx list=%#x->%#zx\n",
+                sequence, wrapper_end, total,
+                encoded_length + 0x18, segment_length);
+        }
+    }
+
     *total_io = total;
+    *segment_length_io = segment_length;
     return fixed;
 }
 
@@ -11156,7 +11442,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
         if (macws_plausible_agx_pointer(segment_start_raw, 1) &&
             segment_current >= segment_start &&
             segment_current <= segment_limit &&
-            segment_current - segment_start <= 0x10000) {
+            segment_current - segment_start <=
+                MACWS_AGX_SEGMENT_INSPECT_MAX) {
             segment_length = (size_t)(segment_current - segment_start);
         }
         if (verbose) fprintf(stderr,
@@ -11188,7 +11475,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 (unsigned long long)state, (unsigned long long)start,
                 (unsigned long long)current, (unsigned long long)end);
         if (!macws_plausible_agx_pointer(start_raw, 1) ||
-            current <= start || current - start > 0x10000 || end < current) {
+            current <= start ||
+            current - start > MACWS_AGX_KCMD_INSPECT_MAX || end < current) {
             if (verbose) fprintf(stderr,
                     "#### AGX_SUBMIT_DIAG #%u descriptor[%u] KCMD bounds invalid\n",
                     result.sequence, descriptor_index);
@@ -11269,10 +11557,10 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
 
         if (allow_fix && segment_length >= 0x20) {
             unsigned multisegment_fixed =
-                macws_translate_agx_multisegment_subtype1(
+                macws_translate_agx_segment_list_records(
                     result.sequence, commands, &total,
                     (unsigned char *)(uintptr_t)segment_start,
-                    segment_length);
+                    &segment_length);
             if (multisegment_fixed) {
                 result.candidates += multisegment_fixed;
                 result.fixed += multisegment_fixed;
@@ -11281,6 +11569,19 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     (current_raw & 0xffff000000000000ULL) | new_current;
                 *(uint64_t *)(uintptr_t)(state + 0x30) = new_current_raw;
                 current_raw = new_current_raw;
+                // The exact native-framing A/B above can shorten the segment
+                // list as well as KCMD storage. Keep IOGPU's RE-confirmed
+                // finalized list end synchronized with the in-place header;
+                // otherwise selector 0x1a would still submit the zeroed
+                // wrapper bytes past the new high-bit-tagged direct length.
+                uint64_t new_segment_current =
+                    segment_start + segment_length;
+                uint64_t new_segment_current_raw =
+                    (segment_current_raw & 0xffff000000000000ULL) |
+                    new_segment_current;
+                *(uint64_t *)(uintptr_t)(state + 0x328) =
+                    new_segment_current_raw;
+                segment_current_raw = new_segment_current_raw;
                 if (verbose) macws_submit_save_kcmd(
                     result.sequence, descriptor_index,
                     "multisegment-post", commands, total);
@@ -12041,7 +12342,14 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // pinned-VA, args+0x14=0x0c30 has bit 11 (macOS-only) set.
         {
             uint64_t va38 = *(const uint64_t *)(src + 0x38);
-            if (va38 > 0x40000000ULL && agxType != 0x82) {
+            // A parent-backed type-0x80 request is the exception to the
+            // generic pinned-VA removal.  The native-iOS 6x1 mip texture
+            // witness captured with LLDB on 2026-07-30 returned success with
+            // the same base VA at both +0x30 and +0x38.  Its +0x40 held the
+            // 0x20000 parent span.  Zeroing +0x38 here made the later parent
+            // translator construct a layout that no native producer sends.
+            if (va38 > 0x40000000ULL && agxType != 0x82 &&
+                !t80_has_parent) {
                 static int log_once_38 = 0;
                 if (macws_runtime_diagnostics_enabled() &&
                     log_once_38++ < 4) {
@@ -12107,15 +12415,44 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             // Sub-resource carved from a tracked parent heap.
             int mapped = 0;
             for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
-                *(uint32_t *)(shadowbuf + 0x48) = (uint32_t)g_agxIdMap[i].iosResourceID;     // parent-id: client -> iOS resource ID
-                if(f30 == 0 && va38) *(uint64_t *)(shadowbuf + 0x30) = va38 + g_agxIdMap[i].size;  // +0x30 = end-VA so size(=+0x30-+0x38) = parent size
+                // Runtime-confirmed with the exact native iOS 16.3 producer
+                // through IOGPUResourceCreate+0xf0 (w0=0):
+                //
+                //   native: +0x30=base, +0x38=base,
+                //           +0x40=parent span, +0x48=kernel resource ID
+                //   macOS:  +0x30=0,    +0x38=base,
+                //           +0x40=base, +0x48=client parent ID
+                //
+                // The old translation sent base+span / 0 / base / ID.
+                // Once base crossed 3*(IOGPU+0x108)/4, that VA in +0x40
+                // hit the RE-confirmed size gate and returned 0xe00002c2.
+                // Translate the producer ABI itself; do not bypass the
+                // kernel check or manufacture a texture on failure.
+                *(uint64_t *)(shadowbuf + 0x30) = va38;
+                *(uint64_t *)(shadowbuf + 0x38) = va38;
+                *(uint64_t *)(shadowbuf + 0x40) = g_agxIdMap[i].size;
+                *(uint32_t *)(shadowbuf + 0x48) =
+                    (uint32_t)g_agxIdMap[i].iosResourceID;
                 patched = 1; mapped = 1;
                 if (macws_runtime_diagnostics_enabled()) {
-                    fprintf(stderr, "#### AGXIOC subres parent %#x -> resourceID %#llx, +0x30=%#llx (sz %#llx)\n", agxClientID, (unsigned long long)g_agxIdMap[i].iosResourceID, (unsigned long long)(va38 + g_agxIdMap[i].size), (unsigned long long)g_agxIdMap[i].size);
+                    fprintf(stderr,
+                        "#### AGXIOC subres parent %#x -> resourceID %#llx, "
+                        "base=%#llx span=%#llx\n",
+                        agxClientID,
+                        (unsigned long long)g_agxIdMap[i].iosResourceID,
+                        (unsigned long long)va38,
+                        (unsigned long long)g_agxIdMap[i].size);
                 }
                 break;
             }
-            if(!mapped && f30 == 0 && va38) { *(uint64_t *)(shadowbuf + 0x30) = va38; patched = 1; }  // fallback: nonzero
+            if(!mapped && f30 == 0 && va38) {
+                // Preserve the native base/base relationship, but leave the
+                // unresolved parent ID and span untouched so the real call
+                // fails observably instead of being synthesized as valid.
+                *(uint64_t *)(shadowbuf + 0x30) = va38;
+                *(uint64_t *)(shadowbuf + 0x38) = va38;
+                patched = 1;
+            }
         } else if(agxType == 0x80) {
             // ONE-SHOT raw-bytes dump: capture the EXACT inStruct bytes
             // macOS WS sends for sel=0x9 type=0x80 BEFORE any libmachook

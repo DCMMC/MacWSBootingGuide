@@ -1,0 +1,8 @@
+2026-07-29 15:43:48.271 [info] StorageMainService: creating application shared storage
+2026-07-29 15:43:48.277 [info] [shared storage] Creating shared storage database at '/Users/root/.vscode-shared/sharedStorage/state.vscdb' (wasCreated: false)
+2026-07-29 15:43:48.277 [info] [shared storage] Initializing fallback application storage (path: /tmp/macws-vscode-profile-agx-native-targetfix12/User/globalStorage/state.vscdb)
+2026-07-29 15:43:48.292 [info] [shared storage] Fallback application storage initialized with 80 items
+2026-07-29 15:43:48.478 [info] update#setState disabled
+2026-07-29 15:43:48.478 [info] update#ctor - updates are disabled by the environment
+2026-07-29 15:43:58.792 [error] ProxyResolver#loadSystemCertificates error 206
+2026-07-29 15:45:18.071 [info] Extension host with pid 86415 exited with code: 0, signal: unknown.

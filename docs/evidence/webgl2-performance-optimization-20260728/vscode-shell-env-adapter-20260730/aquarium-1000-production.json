@@ -1,0 +1,43 @@
+{
+  "timestamp": "2026-07-29T22:44:59.889Z",
+  "target": "http://127.0.0.1:19222",
+  "url": "https://webglsamples.org/aquarium/aquarium.html?numFish=1000&canvasWidth=1024&canvasHeight=1024&fitWindow=false",
+  "fish": 1000,
+  "mode": "full",
+  "driver": "raf",
+  "requestedSeconds": 15,
+  "elapsedSeconds": 15.006399999976159,
+  "pageFrames": 1785,
+  "pageFrameFps": 118.94924832090547,
+  "frameIntervalMs": {
+    "min": 7.199999988079071,
+    "p50": 8.399999976158142,
+    "p95": 9.099999964237213,
+    "max": 9.700000047683716
+  },
+  "instantaneousFps": {
+    "min": 103.09278299836629,
+    "p50": 119.04761938551385,
+    "p95": 126.5822788630325,
+    "max": 138.88888911884507,
+    "average": 119.04377523624484
+  },
+  "webgl": {
+    "ready": true,
+    "fps": "119",
+    "contextType": "WebGL2RenderingContext",
+    "contextLost": false,
+    "canvas": [
+      1024,
+      1024
+    ],
+    "fishSettingIndex": 0,
+    "fishCount": 1000,
+    "finalUrl": "https://webglsamples.org/aquarium/aquarium.html?numFish=1000&canvasWidth=1024&canvasHeight=1024&fitWindow=false",
+    "title": "WebGL Aquarium",
+    "modelFishCount": 1000,
+    "mode": "full",
+    "requestedPatchCount": 0,
+    "patchedMethods": []
+  }
+}

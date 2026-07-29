@@ -11,8 +11,12 @@
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <ptrauth.h>
+#import <signal.h>
 #import <stdint.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
+#import <unistd.h>
 
 int main(void) {
     @autoreleasepool {
@@ -45,6 +49,47 @@ int main(void) {
             (unsigned long long)(strippedImplementation && image.dli_fbase
                 ? (uintptr_t)strippedImplementation - (uintptr_t)image.dli_fbase
                 : 0));
+
+        // Opt-in runtime ABI witness for the Chromium failure captured on
+        // 2026-07-30.  The default invocation above remains read-only.  With
+        // MACWS_IOS_MIP_TEXTURE_PROBE=1, create the exact small mipmapped
+        // shape that made macOS AGXMetal13_3 request a parent type-0x80
+        // resource.  MACWS_IOS_MIP_TEXTURE_HOLD=1 stops after the native
+        // device is ready so the project's LLDB resource-return tracer can
+        // be installed before any texture resource is created.
+        if (getenv("MACWS_IOS_MIP_TEXTURE_PROBE")) {
+            if (getenv("MACWS_IOS_MIP_TEXTURE_HOLD")) {
+                fprintf(stderr,
+                    "IOS-AGX-TEXTURE-RE mip hold pid=%d before texture\n",
+                    getpid());
+                raise(SIGSTOP);
+            }
+            MTLTextureDescriptor *descriptor =
+                [MTLTextureDescriptor
+                    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                    width:6
+                    height:1
+                    mipmapped:YES];
+            descriptor.storageMode = MTLStorageModeShared;
+            descriptor.usage = MTLTextureUsageShaderRead |
+                MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+            fprintf(stderr,
+                "IOS-AGX-TEXTURE-RE mip create size=%lux%lu pf=%lu "
+                "mips=%lu storage=%lu usage=%#lx\n",
+                (unsigned long)descriptor.width,
+                (unsigned long)descriptor.height,
+                (unsigned long)descriptor.pixelFormat,
+                (unsigned long)descriptor.mipmapLevelCount,
+                (unsigned long)descriptor.storageMode,
+                (unsigned long)descriptor.usage);
+            id<MTLTexture> texture =
+                [device newTextureWithDescriptor:descriptor];
+            fprintf(stderr,
+                "IOS-AGX-TEXTURE-RE mip result=%p class=%s\n",
+                (void *)texture,
+                texture ? object_getClassName(texture) : "(nil)");
+            if (!texture) return 4;
+        }
         return implementation ? 0 : 3;
     }
 }

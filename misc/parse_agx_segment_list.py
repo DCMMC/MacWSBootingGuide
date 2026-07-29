@@ -199,7 +199,10 @@ def main() -> None:
         list_generation = u32(list_bytes, 4)
         wrapper_start = u32(wrapper, 0x10)
         wrapper_end = u32(wrapper, 0x14)
-        if list_generation not in (2, 3):
+        # Runtime-confirmed by VS Code Simple Browser Aquarium GPU submit 108
+        # on 2026-07-30: generation 4 retains the same trailing-wrapper list
+        # framing and carries the range [0x210,0x228).
+        if list_generation not in (2, 3, 4):
             raise ValueError(
                 f"unobserved trailing-wrapper list generation {list_generation}"
             )
@@ -221,21 +224,34 @@ def main() -> None:
             raise ValueError(
                 f"trailing-wrapper KCMD size {wrapper_bytes:#x} is not one/two records"
             )
+        wrapper_type = u32(commands, wrapper_start)
         wrapper_opcode = u32(commands, wrapper_start + 8)
-        for wrapper_index in range(wrapper_bytes // 0x18):
-            offset = wrapper_start + wrapper_index * 0x18
-            if (
-                u32(commands, offset) != 3
-                or u32(commands, offset + 4) != 0x18
-                or u32(commands, offset + 8) != wrapper_opcode
-            ):
-                raise ValueError(
-                    f"trailing KCMD wrapper {wrapper_index} framing is unknown"
-                )
+        if wrapper_type == 3:
+            for wrapper_index in range(wrapper_bytes // 0x18):
+                offset = wrapper_start + wrapper_index * 0x18
+                if (
+                    u32(commands, offset) != 3
+                    or u32(commands, offset + 4) != 0x18
+                    or u32(commands, offset + 8) != wrapper_opcode
+                ):
+                    raise ValueError(
+                        f"trailing KCMD wrapper {wrapper_index} framing is unknown"
+                    )
+        elif not (
+            wrapper_bytes == 0x18
+            and wrapper_type == 5
+            and u32(commands, wrapper_start + 4) == 0x18
+            and 1 <= wrapper_opcode <= 3
+            and u32(commands, wrapper_start + 0x0C) == 0
+            and u32(commands, wrapper_start + 0x10) == 1
+            and u32(commands, wrapper_start + 0x14) == 0
+        ):
+            raise ValueError("trailing type-5 KCMD wrapper framing is unknown")
         print(
             f"trailing_wrapper generation={list_generation} "
             f"kcmd={wrapper_start:#x}..{wrapper_end:#x} "
-            f"records={wrapper_bytes // 0x18} opcode={wrapper_opcode:#x}"
+            f"records={wrapper_bytes // 0x18} type={wrapper_type:#x} "
+            f"opcode_or_ordinal={wrapper_opcode:#x}"
         )
         expected_command_end = wrapper_start
 

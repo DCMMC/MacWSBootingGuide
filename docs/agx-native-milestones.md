@@ -1990,3 +1990,63 @@ used roughly 45–53% of one core in the live idle sample, so transport and
 presentation cost remain open rather than being attributed to debug overhead.
 Exact commands, environments, counters and the measurement boundary are in
 [`production-profile-20260730/README.md`](evidence/production-profile-20260730/README.md).
+
+## 2026-07-30: latest VS Code shell environment and duplicate WebGL owners fixed
+
+Exact RE of VS Code 1.130's installed `main.js` found that its shell resolver
+execs Electron only to print a random 12-hex token around
+`JSON.stringify(process.env)`, then deletes its three temporary marker
+variables. The ptyHost call site intentionally supplies `{_:[]}`, so the
+supported main-process `--force-disable-user-env` argument cannot suppress that
+second probe.
+
+Runtime controls established the compatibility boundary. Removing libmachook
+entirely trapped in `os_variant_has_internal_diagnostics`; skipping only the
+main constructor SIGBUSed in the independent Metal constructor; keeping only
+the required interposes still let Electron reserve 24.5 GiB before Oilpan's
+CagedHeap reservation failed. The final adapter matches the exact VS Code
+Electron path, both official Node/environment markers and its exact `-p`
+expression, then emits the login shell's already-resolved environment using
+the real token+JSON protocol. The shell exits zero. Ordinary VS Code
+main/renderer/GPU/extension-host processes never carry the marker and retain
+Chromium JIT plus native AGX.
+
+The benchmark extension also now converges asynchronous workbench restoration
+to one `WebGL Aquarium` tab instead of opening one new Chromium/native-AGX
+resource graph per restart. Disabling the optional VS Code 1.130 AgentHost in
+the disposable profile removed one helper plus its failing Copilot CLI child;
+ptyHost remained operational. Successful JIT permission-flip counters/logs are
+now diagnostic-only instead of touching production's hottest W^X path.
+
+The final coexistence/VNC production run captured a nonblack 2388x1668 frame,
+one WebGL target, and no context loss, texture-allocation nil, IOGPU completion
+error, Oilpan error, shell-environment error or production JIT flip log. At
+1,000 fish it reached 118.949 FPS (p50 8.4 ms). At the controlled 60,000-fish
+load it reached 12.056 FPS (p50 82.1 ms), versus the same VS Code build's
+37.679 FPS on the M1 MacBook Air. The remaining 3.125x gap is therefore still
+the high-load presentation/command-encoding milestone, not this fixed startup
+ownership path. Exact crashes, logs, screenshots and JSON are in
+[`vscode-shell-env-adapter-20260730/`](evidence/webgl2-performance-optimization-20260728/vscode-shell-env-adapter-20260730/README.md).
+
+## 2026-07-30: the 64-KiB large-KCMD failure was project-local
+
+A raw Chromium completion returned `0x103` with command-buffer storage pointers
+whose runtime-dumped difference was `0x174c0`, plus an `0x8000` segment list.
+The project's previous `0x10000` inspector bound rejected the complete
+descriptor before the existing ABI translator ran, so the native driver saw
+untranslated macOS records. The exact iOS 16.3 IOGPU growth function disproves
+that bound as a protocol limit: it doubles storage below 2 MiB and grows in
+1-MiB increments thereafter.
+
+The bounded validator and allocation-free fast recorder now use `0x40000`
+KCMD, `0x20000` segment and 48-slot limits, retaining the same explicit 18-MiB
+diagnostic footprint. No command format or completion result is bypassed.
+After the correction, the diagnostic run recorded clean translated
+completions through a 142-record batch. The next production failure was a
+separate ANGLE `MakeTexture` host-memory allocation error while five restored
+Aquarium webviews owned five Chromium/native-AGX graphs. Bounded extension
+convergence now leaves exactly one benchmark tab; the final controlled
+one-tab production runs contained no texture nil, GL out-of-memory, IOGPU
+completion error or context loss. Exact logs, the actual iOS disassembly and
+screenshots are in
+[`vscode-production-error-20260730/`](evidence/webgl2-performance-optimization-20260728/vscode-production-error-20260730/README.md).

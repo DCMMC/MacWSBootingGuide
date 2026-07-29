@@ -23,6 +23,9 @@ DYLD_INTERPOSE(NXGetClickSpace_new, NXGetClickSpace)
 // "Patch Discipline".)
 
 __attribute__((constructor)) static void InitQuartzCoreHooks() {
+    const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
+    if (shell_env && strcmp(shell_env, "1") == 0) return;
+
     const char *quartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
     void *handle = dlopen(quartzCorePath, RTLD_GLOBAL);
     assert(handle);

@@ -127,3 +127,37 @@ a pass.  Title-drag targeting remains open.
 - THEORY: the observed interactive failure is now in the VNC publication or
   incremental-damage path.  A clean full-vs-incremental timing run is the next
   discriminator; no event-delay workaround is retained.
+
+## Targeted secondary-routing correction
+
+A later targeted run used the current Terminal frame and the verified content
+coordinate `(1000,800)`. Five pre-change repetitions all rendered the real
+context menu: open latency was 217-322 ms (median 285 ms) and close latency was
+13-97 ms. This corrects the older false “right click lost” attribution for
+that coordinate; the input and compositor path works, but remains slower than
+a normal M1 desktop.
+
+Runtime diagnostics then found a separate routing stall after the successful
+click. `macwsinputd` accepted `SecondaryTap`, after which OSXvnc sent a
+redundant `TargetProbe`. Terminal was already inside its synchronous Carbon
+menu tracker, so the probe got zero of one replies and occupied the routing
+loop until its source-level 150-ms deadline. The exact before/after lines are
+in [`context-routing-stall-excerpt.txt`](context-routing-stall-excerpt.txt).
+
+OSXvnc now omits target refreshes on both edges of a secondary gesture. The
+pre-down `ActivateTarget` transaction still resolves and stores the exact
+`menuTarget`; `SecondaryTap`, menu hover and Escape continue to use that
+authoritative target. No NSEvent, frame or success result is fabricated.
+
+Six post-change repetitions passed 6/6. Menu-open latency was 206-315 ms
+(median 253 ms), versus 217-322 ms (median 285 ms) in the five immediately
+preceding repetitions. The small distribution change is not by itself a
+strong compositor-performance claim. The important deterministic result is
+that the post-tap zero-reply probe and its 150-ms event-router blockage are
+absent, so keyboard/menu events are no longer queued behind it.
+
+The five before-change measurements are
+`context-targeted-repeat-{1..5}.json`; the six after-change measurements are
+`context-no-redundant-probe-round{1..6}.json`. They retain the negotiated
+2388x1668 Zlib framebuffer geometry, rectangle lists, changed-pixel counts and
+first-readable/receive latency components for every operation.

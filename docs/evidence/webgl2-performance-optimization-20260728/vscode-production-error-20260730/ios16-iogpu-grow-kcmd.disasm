@@ -1,0 +1,51 @@
+Source binary: iOS 16.3 (20D47/20D67-era device image)
+/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU
+Function: _IOGPUMetalCommandBufferStorageGrowKernelCommandBuffer
+Unslid address: 0x19d1447a4
+Tool: otool -tvV
+
+000000019d1447a4 pacibsp
+000000019d1447a8 stp x24, x23, [sp, #-0x40]!
+000000019d1447ac stp x22, x21, [sp, #0x10]
+000000019d1447b0 stp x20, x19, [sp, #0x20]
+000000019d1447b4 stp x29, x30, [sp, #0x30]
+000000019d1447b8 add x29, sp, #0x30
+000000019d1447bc ldr x20, [x0, #0x20]
+000000019d1447c0 cbz x20, 0x19d1448cc
+000000019d1447c4 mov x19, x0
+000000019d1447c8 ldr x8, [x0, #0x28]
+000000019d1447cc cbz x8, 0x19d1448c8
+000000019d1447d0 ldr x9, [x19, #0x38]
+000000019d1447d4 cbz x9, 0x19d1448c8
+000000019d1447d8 ldr x10, [x19, #0x30]
+000000019d1447dc cbz x10, 0x19d1448c8
+000000019d1447e0 cmp x9, x8
+000000019d1447e4 b.lo 0x19d1448d0
+000000019d1447e8 subs x22, x10, x8
+000000019d1447ec b.lo 0x19d1448d4
+000000019d1447f0 add w10, w1, #0x18
+000000019d1447f4 sub w8, w9, w8
+000000019d1447f8 add w23, w10, w8
+000000019d1447fc adrp x8, 245806 ; 0x1d9172000
+000000019d144800 add x8, x8, #0xa60
+000000019d144804 ldrsw x8, [x8]
+000000019d144808 ldr x21, [x20, x8]
+000000019d14480c adrp x8, 245806 ; 0x1d9172000
+000000019d144810 add x8, x8, #0xa78
+000000019d144814 ldrsw x8, [x8]
+000000019d144818 add x8, x21, x8
+000000019d14481c ldr w2, [x8, #0x28]
+000000019d144820 cmp w2, w23
+000000019d144824 b.hs 0x19d14483c
+000000019d144828 lsl w8, w2, #1
+000000019d14482c add w9, w2, #0x100, lsl #12
+000000019d144830 cmp w2, #0x200, lsl #12
+000000019d144834 csel w2, w8, w9, lo
+000000019d144838 b 0x19d144820
+000000019d14483c mov x0, x21
+000000019d144840 bl "_objc_msgSend$setShmemSize:"
+
+Interpretation of the exact growth loop at 0x19d144820..0x19d144838:
+while the current size is below the required size, it doubles sizes below
+0x200000 and adds 0x100000 at or above 0x200000. Therefore 0x10000 was not
+an IOGPU command-buffer protocol limit.

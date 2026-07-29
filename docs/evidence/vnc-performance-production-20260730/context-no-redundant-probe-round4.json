@@ -1,0 +1,210 @@
+{
+  "name": "macOS-iPad",
+  "width": 2388,
+  "height": 1668,
+  "encoding": "zlib",
+  "min_changed_pixels": 1024,
+  "passed": 2,
+  "total": 2,
+  "missed": 0,
+  "latency_min_seconds": 0.15395941596943885,
+  "latency_mean_seconds": 0.2013202704838477,
+  "latency_p50_seconds": 0.15395941596943885,
+  "latency_p95_seconds": 0.24868112499825656,
+  "latency_max_seconds": 0.24868112499825656,
+  "results": [
+    {
+      "passed": true,
+      "latency_seconds": 0.24868112499825656,
+      "updates": 14,
+      "rectangles": [
+        [
+          992,
+          784,
+          16,
+          16,
+          6
+        ],
+        [
+          992,
+          800,
+          32,
+          16,
+          6
+        ],
+        [
+          992,
+          816,
+          48,
+          16,
+          6
+        ],
+        [
+          992,
+          832,
+          32,
+          16,
+          6
+        ],
+        [
+          992,
+          752,
+          304,
+          16,
+          6
+        ],
+        [
+          976,
+          768,
+          336,
+          16,
+          6
+        ],
+        [
+          784,
+          784,
+          1600,
+          20,
+          6
+        ],
+        [
+          784,
+          804,
+          1600,
+          20,
+          6
+        ],
+        [
+          784,
+          824,
+          1600,
+          8,
+          6
+        ],
+        [
+          960,
+          832,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          921,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          1010,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          1099,
+          368,
+          37,
+          6
+        ],
+        [
+          960,
+          1136,
+          352,
+          16,
+          6
+        ],
+        [
+          976,
+          1152,
+          336,
+          16,
+          6
+        ]
+      ],
+      "digest": "789b9d80144cf2e68b961c4452eaec9d2a51a2f11426816fa99739bebbf39589",
+      "first_readable_seconds": 0.0450664579984732,
+      "receive_seconds": 0.013396164926234633,
+      "first_valid_changed_pixels": 1024,
+      "operation": "context-menu",
+      "settled_updates": 9,
+      "settled_changes": 0,
+      "changed_pixels_from_action_baseline": 161433,
+      "rejected_small_change": false
+    },
+    {
+      "passed": true,
+      "latency_seconds": 0.15395941596943885,
+      "updates": 5,
+      "rectangles": [
+        [
+          992,
+          752,
+          304,
+          16,
+          6
+        ],
+        [
+          976,
+          768,
+          336,
+          16,
+          6
+        ],
+        [
+          960,
+          784,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          873,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          962,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          1051,
+          368,
+          85,
+          6
+        ],
+        [
+          960,
+          1136,
+          352,
+          16,
+          6
+        ],
+        [
+          976,
+          1152,
+          336,
+          16,
+          6
+        ]
+      ],
+      "digest": "3307d64fafb689018937662c1a86161b8c1844ff8f871bbbaccf231b24b7b10a",
+      "first_readable_seconds": 0.09787766600493342,
+      "receive_seconds": 0.002737667062319815,
+      "first_valid_changed_pixels": 1024,
+      "operation": "context-close",
+      "settled_updates": 30,
+      "settled_changes": 0,
+      "changed_pixels_from_action_baseline": 128820,
+      "rejected_small_change": false
+    }
+  ]
+}

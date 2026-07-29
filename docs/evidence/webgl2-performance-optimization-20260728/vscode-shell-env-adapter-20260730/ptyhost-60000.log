@@ -1,0 +1,3 @@
+2026-07-29 15:47:31.042 [warning] Persistent process reconnection "1" failed Could not find pty 1 on pty host
+2026-07-29 15:47:31.044 [error] [RPC Response] PtyService#attachToProcess Could not find pty 1 on pty host
+2026-07-29 15:47:31.377 [warning] Shell integration cannot be enabled for executable "/bin/sh" and args undefined

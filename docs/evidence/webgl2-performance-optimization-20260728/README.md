@@ -3,6 +3,19 @@
 This directory records the new performance/stability campaign after the
 latest VS Code / Electron / Chromium native-AGX WebGL2 rendering milestone.
 
+The 2026-07-30 shell-environment/resource hardening run is documented in
+[`vscode-shell-env-adapter-20260730/README.md`](vscode-shell-env-adapter-20260730/README.md).
+It validates one restored Aquarium tab, a working ptyHost, no optional
+AgentHost, quiet production JIT bookkeeping, full Retina VNC, 118.949 FPS at
+1,000 fish, and a still-open 12.056-vs-37.679 FPS gap at 60,000 fish.
+
+The preceding large-command failure and duplicate-webview ownership boundary
+are documented separately in
+[`vscode-production-error-20260730/README.md`](vscode-production-error-20260730/README.md).
+It includes the raw `0x103` completion, decoded `0x174c0` KCMD witness, exact
+iOS IOGPU growth-function disassembly, post-fix clean completion, and the
+separate five-tab texture-memory case.
+
 ## M1 reference workload sweep
 
 The old 1,000-fish result was refresh-rate capped and is not suitable for a

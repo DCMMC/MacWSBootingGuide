@@ -1,0 +1,231 @@
+{
+  "name": "macOS-iPad",
+  "width": 2388,
+  "height": 1668,
+  "encoding": "zlib",
+  "min_changed_pixels": 1024,
+  "passed": 2,
+  "total": 2,
+  "missed": 0,
+  "latency_min_seconds": 0.08094583300407976,
+  "latency_mean_seconds": 0.1692078335036058,
+  "latency_p50_seconds": 0.08094583300407976,
+  "latency_p95_seconds": 0.25746983400313184,
+  "latency_max_seconds": 0.25746983400313184,
+  "results": [
+    {
+      "passed": true,
+      "latency_seconds": 0.25746983400313184,
+      "updates": 9,
+      "rectangles": [
+        [
+          992,
+          784,
+          16,
+          16,
+          6
+        ],
+        [
+          992,
+          800,
+          32,
+          16,
+          6
+        ],
+        [
+          992,
+          816,
+          48,
+          16,
+          6
+        ],
+        [
+          992,
+          832,
+          32,
+          16,
+          6
+        ],
+        [
+          992,
+          752,
+          304,
+          16,
+          6
+        ],
+        [
+          976,
+          768,
+          336,
+          16,
+          6
+        ],
+        [
+          784,
+          784,
+          1600,
+          20,
+          6
+        ],
+        [
+          784,
+          804,
+          1600,
+          20,
+          6
+        ],
+        [
+          784,
+          824,
+          1600,
+          8,
+          6
+        ],
+        [
+          960,
+          832,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          921,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          1010,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          1099,
+          368,
+          37,
+          6
+        ],
+        [
+          960,
+          1136,
+          352,
+          16,
+          6
+        ],
+        [
+          976,
+          1152,
+          336,
+          16,
+          6
+        ]
+      ],
+      "digest": "4e6c0e614cac1d93eee069d68e672c94105b7a838f2e87bd50b94a35aefc53c0",
+      "first_readable_seconds": 0.04513229202711955,
+      "receive_seconds": 0.016837333037983626,
+      "first_valid_changed_pixels": 1024,
+      "operation": "context-menu",
+      "settled_updates": 24,
+      "settled_changes": 0,
+      "changed_pixels_from_action_baseline": 161538,
+      "rejected_small_change": false
+    },
+    {
+      "passed": true,
+      "latency_seconds": 0.08094583300407976,
+      "updates": 11,
+      "rectangles": [
+        [
+          992,
+          768,
+          32,
+          48,
+          6
+        ],
+        [
+          992,
+          816,
+          48,
+          16,
+          6
+        ],
+        [
+          992,
+          832,
+          32,
+          16,
+          6
+        ],
+        [
+          992,
+          752,
+          304,
+          16,
+          6
+        ],
+        [
+          976,
+          768,
+          336,
+          16,
+          6
+        ],
+        [
+          960,
+          784,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          873,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          962,
+          368,
+          89,
+          6
+        ],
+        [
+          960,
+          1051,
+          368,
+          85,
+          6
+        ],
+        [
+          960,
+          1136,
+          352,
+          16,
+          6
+        ],
+        [
+          976,
+          1152,
+          336,
+          16,
+          6
+        ]
+      ],
+      "digest": "3307d64fafb689018937662c1a86161b8c1844ff8f871bbbaccf231b24b7b10a",
+      "first_readable_seconds": 1.679197885096073e-05,
+      "receive_seconds": 0.009403000003658235,
+      "first_valid_changed_pixels": 1024,
+      "operation": "context-close",
+      "settled_updates": 46,
+      "settled_changes": 0,
+      "changed_pixels_from_action_baseline": 128945,
+      "rejected_small_change": false
+    }
+  ]
+}

@@ -20,6 +20,14 @@
 		<string>--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix12</string>
         <string>--extensions-dir=/tmp/macws-vscode-extensions</string>
         <string>--disable-updates</string>
+        <!-- launchdchrootexec already supplies the complete chroot HOME, USER,
+             TMPDIR, SHELL and executable environment.  Use VS Code's supported
+             switch to skip the main service's redundant login-shell probe.
+             VS Code 1.130's ptyHost deliberately does not inherit these CLI
+             arguments; libmachook implements that service's exact
+             VSCODE_RESOLVING_ENVIRONMENT token+JSON printer protocol without
+             starting a second full Chromium instance. -->
+        <string>--force-disable-user-env</string>
         <string>--no-sandbox</string>
         <string>--disable-gpu-sandbox</string>
         <string>--remote-debugging-port=9222</string>

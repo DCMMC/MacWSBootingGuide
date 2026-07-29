@@ -1,0 +1,112 @@
+{"app_name":"Electron","timestamp":"2026-07-30 06:33:39.00 +0800","app_version":"","slice_uuid":"4c4c4481-5555-3144-a17f-6d017b81906c","build_version":"","platform":1,"share_with_app_devs":0,"is_first_party":1,"bug_type":"309","os_version":"iPhone OS 16.3.1 (20D67)","roots_installed":0,"incident_id":"438F7203-D16D-4E30-ACF1-FCA8A57FBD0C","name":"Electron"}
+{
+  "uptime" : 370000,
+  "procRole" : "Unspecified",
+  "version" : 2,
+  "userID" : 0,
+  "deployVersion" : 210,
+  "modelCode" : "iPad13,6",
+  "coalitionID" : 56514,
+  "osVersion" : {
+    "isEmbedded" : true,
+    "train" : "iPhone OS 16.3.1",
+    "releaseType" : "User",
+    "build" : "20D67"
+  },
+  "captureTime" : "2026-07-30 06:33:33.6658 +0800",
+  "incident" : "438F7203-D16D-4E30-ACF1-FCA8A57FBD0C",
+  "pid" : 83728,
+  "cpuType" : "ARM-64",
+  "roots_installed" : 0,
+  "bug_type" : "309",
+  "procLaunch" : "2026-07-30 06:33:33.3800 +0800",
+  "procStartAbsTime" : 8903909646015,
+  "procExitAbsTime" : 8903916502208,
+  "procName" : "Electron",
+  "procPath" : "\/Applications\/Visual Studio Code.app\/Contents\/MacOS\/Electron",
+  "parentProc" : "sshd",
+  "parentPid" : 83727,
+  "coalitionName" : "com.openssh.sshd.DD236D4B-DFCF-4A65-91E3-5A4EE392E945",
+  "crashReporterKey" : "1500aba40c9dcd15b743fc39efe555c209d877de",
+  "basebandVersion" : "",
+  "exception" : {"codes":"0x0000000000000000, 0x0000000000000000","rawCodes":[0,0],"type":"EXC_CRASH","signal":"SIGABRT"},
+  "faultingThread" : 0,
+  "threads" : [{"triggered":true,"id":12378849,"threadState":{"x":[{"value":0},{"value":0},{"value":0},{"value":0},{"value":6652529263,"symbolLocation":0,"symbol":"__vfprintf.xdigs_lower"},{"value":6099529824},{"value":56},{"value":6099528972},{"value":6360569844037220297},{"value":6360569845690542537},{"value":2},{"value":4294967293},{"value":1099511627776},{"value":0},{"value":0},{"value":0},{"value":328},{"value":8259014496},{"value":0},{"value":6},{"value":8180227584,"symbolLocation":0,"symbol":"_main_thread"},{"value":259},{"value":8180227808,"symbolLocation":224,"symbol":"_main_thread"},{"value":47244640256},{"value":17181386584},{"value":6099530896},{"value":17180530936},{"value":17180530936},{"value":0}],"flavor":"ARM_THREAD_STATE64","lr":{"value":6653508648},"cpsr":{"value":1073745920},"fp":{"value":6099529728},"sp":{"value":6099529696},"esr":{"value":1442840704,"description":" Address size fault"},"pc":{"value":6653282084,"matchesCrashFrame":1},"far":{"value":4773181544}},"queue":"com.apple.main-thread","frames":[{"imageOffset":38692,"symbol":"__pthread_kill","symbolLocation":8,"imageIndex":0},{"imageOffset":27688,"symbol":"pthread_kill","symbolLocation":288,"imageIndex":1},{"imageOffset":486120,"symbol":"abort","symbolLocation":180,"imageIndex":2},{"imageOffset":102580600,"symbol":"ares_llist_node_next","symbolLocation":7201664,"imageIndex":3},{"imageOffset":102568152,"symbol":"ares_llist_node_next","symbolLocation":7189216,"imageIndex":3},{"imageOffset":64858652,"symbol":"cppgc::internal::Fatal(std::__Cr::basic_string<char, std::__Cr::char_traits<char>, std::__Cr::allocator<char> > const&, v8::SourceLocation)","symbolLocation":96,"imageIndex":3},{"imageOffset":33277000,"symbol":"cppgc::InitializeProcess(v8::PageAllocator*, unsigned long)","symbolLocation":1208,"imageIndex":3},{"imageOffset":33275976,"symbol":"cppgc::InitializeProcess(v8::PageAllocator*, unsigned long)","symbolLocation":184,"imageIndex":3},{"imageOffset":29705884,"symbol":"node_module_register","symbolLocation":2324,"imageIndex":3},{"imageOffset":37731212,"symbol":"node::InitializeOncePerProcess(std::__Cr::vector<std::__Cr::basic_string<char, std::__Cr::char_traits<char>, std::__Cr::allocator<char> >, std::__Cr::allocator<std::__Cr::basic_string<char, std::__Cr::char_traits<char>, std::__Cr::allocator<char> > > > const&, node::ProcessInitializationFlags::Flags)","symbolLocation":28,"imageIndex":3},{"imageOffset":43227472,"symbol":"ElectronInitializeICUandStartNode","symbolLocation":10180,"imageIndex":3},{"imageOffset":43217620,"symbol":"ElectronInitializeICUandStartNode","symbolLocation":328,"imageIndex":3},{"imageOffset":24360,"symbol":"start","symbolLocation":2236,"imageIndex":4}]},{"id":12378850,"frames":[{"imageOffset":7564,"symbol":"start_wqthread","symbolLocation":0,"imageIndex":1}]}],
+  "usedImages" : [
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6653243392,
+    "size" : 237544,
+    "uuid" : "42f503e2-9273-360a-a086-c1b19bbd3962",
+    "path" : "\/usr\/lib\/system\/libsystem_kernel.dylib",
+    "name" : "libsystem_kernel.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6653480960,
+    "size" : 53248,
+    "uuid" : "46d35233-a051-3f4f-bba4-ba56dddc4d1a",
+    "path" : "\/usr\/lib\/system\/libsystem_pthread.dylib",
+    "name" : "libsystem_pthread.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6652030976,
+    "size" : 520184,
+    "uuid" : "95a70e20-1df3-3ddf-900c-315ed0b2c067",
+    "path" : "\/usr\/lib\/system\/libsystem_c.dylib",
+    "name" : "libsystem_c.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64",
+    "base" : 4584849408,
+    "size" : 179224576,
+    "uuid" : "4c4c4442-5555-3144-a1a8-564169f3ff00",
+    "path" : "\/Applications\/Visual Studio Code.app\/Contents\/Frameworks\/Electron Framework.framework\/Versions\/A\/Electron Framework",
+    "name" : "Electron Framework"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6649978880,
+    "size" : 582996,
+    "uuid" : "bd993f39-c902-37d6-8bd8-6d827c7f121e",
+    "path" : "\/usr\/lib\/dyld",
+    "name" : "dyld"
+  }
+],
+  "vmSummary" : "ReadOnly portion of Libraries: Total=178.4M resident=0K(0%) swapped_out_or_unallocated=178.4M(100%)\nWritable regions: Total=238.9M written=0K(0%) resident=0K(0%) swapped_out=0K(0%) unallocated=238.9M(100%)\n\n                                VIRTUAL   REGION \nREGION TYPE                        SIZE    COUNT (non-coalesced) \n===========                     =======  ======= \nActivity Tracing                   256K        1 \nDispatch continuations            64.0M        1 \nKernel Alloc Once                   32K        1 \nMALLOC                           146.2M       13 \nMALLOC guard page                   96K        6 \nMemory Tag 253                    24.0G       60 \nMemory Tag 255                     496K        1 \nMemory Tag 255 (reserved)           16K        1         reserved VM address space (unallocated)\nPROTECTED_MEMORY                    16K        1 \nSTACK GUARD                         32K        2 \nStack                             1552K        2 \nVM_ALLOCATE                         16K        1 \n__DATA                            24.1M       10 \n__DATA_CONST                      6544K        8 \n__LINKEDIT                        5120K        8 \n__TEXT                           173.4M        8 \ndyld private memory                272K        2 \nmapped file                       39.5M        3 \nshared memory                       32K        2 \n===========                     =======  ======= \nTOTAL                             24.5G      131 \nTOTAL, minus reserved VM space    24.5G      131 \n",
+  "legacyInfo" : {
+  "threadTriggered" : {
+    "queue" : "com.apple.main-thread"
+  }
+},
+  "trialInfo" : {
+  "rollouts" : [
+    {
+      "rolloutId" : "6101c13693ebac18231ac9a1",
+      "factorPackIds" : {
+
+      },
+      "deploymentId" : 240000791
+    },
+    {
+      "rolloutId" : "63a0a6cfd1cdb67d083006d0",
+      "factorPackIds" : {
+
+      },
+      "deploymentId" : 240000003
+    }
+  ],
+  "experiments" : [
+
+  ]
+},
+  "reportNotes" : [
+  "dyld_process_snapshot_create_for_process failed with 5"
+]
+}

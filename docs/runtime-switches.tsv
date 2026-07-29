@@ -6,6 +6,7 @@ env	CA_DISABLE_SWAP_ICC	on	WindowServer,GUI clients	Required CoreAnimation compa
 env	CA_VSYNC_OFF	on	WindowServer,GUI clients	No working chroot vblank handoff; commits use the virtual completion path.
 env	DYLD_INSERT_LIBRARIES	auto	launchdchrootexec	Launcher selects the matching thin libmachook slice.
 env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
+env	ELECTRON_RUN_AS_NODE	transient	VS Code shell environment resolver	Official VS Code marker paired with VSCODE_RESOLVING_ENVIRONMENT; never set by a production plist.
 env	IOSCLEAR_DRAW_MODE	off	standalone probe	Selects an iosclear reference draw experiment.
 env	IOSCLEAR_DUMP_AGX_METHODS	off	standalone probe	Dumps AGX methods from iosclear_ref.
 env	IOSCLEAR_EARLY_DELAY	off	standalone probe	Delays the early iosclear reference path.
@@ -13,6 +14,10 @@ env	IOSCLEAR_EARLY_HOLD	off	standalone probe	Holds the early iosclear reference 
 env	IOSCLEAR_HEADLESS	off	standalone probe	Runs the iosclear reference without a visible window.
 env	IOSCLEAR_HOLD	off	standalone probe	Keeps iosclear_ref alive for debugger attachment.
 env	IOSCLEAR_PF550_MODE	off	standalone probe	Selects the PF550 iosclear experiment.
+env	MACWS_IOS_KCMD_HOLD	off	standalone probe	Stops the native iOS AGX command encoder before commit for LLDB capture.
+env	MACWS_IOS_KCMD_MODE	off	standalone probe	Selects the native iOS AGX command-encoder workload.
+env	MACWS_IOS_MIP_TEXTURE_HOLD	off	standalone probe	Keeps the native iOS mipmapped-texture probe alive for LLDB inspection.
+env	MACWS_IOS_MIP_TEXTURE_PROBE	off	standalone probe	Selects the native iOS mipmapped-texture descriptor workload.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
 env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
@@ -80,7 +85,11 @@ env	PINPROBE_HOLD_BEFORE_PIN	off	standalone probe	Holds PinnedVAProbe before pin
 env	REDWIN_DELAY	off	standalone probe	Delays the red-window rendering probe.
 env	REDWIN_LOOP	off	standalone probe	Keeps the red-window rendering probe repainting.
 env	TOY_DELAY	off	standalone probe	Delays the ToyGUI rendering probe.
+env	VSCODE_RESOLVING_ENVIRONMENT	transient	VS Code shell environment resolver	Exact official marker selecting the token-plus-JSON exec adapter and minimal constructor mode.
 env	MallocScribble	off	allocator diagnostic	Forbidden in every production launch plist.
+cli	--force-disable-user-env	on	VS Code main service	Supported VS Code switch avoids the redundant main-service login-shell environment probe.
+setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid optional Copilot/Claude AgentHost processes unrelated to native-AGX WebGL measurement.
+setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code benchmark profile	Avoid reviving stale benchmark-profile PTYs across isolated runs.
 flag	/private/tmp/macws_agx_dump_methods	off	diagnostic	AGX Objective-C method dump.
 flag	/private/tmp/macws_agx_trace_reserve	off	diagnostic	AGX reserve trace.
 flag	/private/tmp/macws_mtl_library_diag	off	diagnostic	Metal library target/compile trace.

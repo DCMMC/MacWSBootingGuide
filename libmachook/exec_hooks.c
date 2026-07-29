@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <spawn.h>
@@ -197,6 +199,135 @@ static void process_env_restore_insert(saved_insert_t *saved) {
     free(saved->old_value);
 }
 
+// VS Code's macOS shell-environment resolver starts an interactive login
+// shell, then asks that shell to exec the full Electron binary in Node mode
+// solely to print:
+//
+//     <12-hex-token> + JSON.stringify(process.env) + <same-token>
+//
+// Runtime evidence on this iPad shows the otherwise non-GUI Electron child
+// reserves 24.5 GiB of VM before aborting at Oilpan's CagedHeap reservation.
+// Preserve the exact resolver protocol at the exec boundary, after the login
+// shell has made all of its environment changes, without starting Chromium.
+// The four independent predicates below keep normal VS Code main/render/GPU
+// execs on the ordinary libmachook + native-AGX path.
+static bool env_has_exact(char *const envp[], const char *entry) {
+    extern char **environ;
+    char *const *source = envp ? envp : environ;
+    for (size_t i = 0; source && source[i]; i++) {
+        if (strcmp(source[i], entry) == 0) return true;
+    }
+    return false;
+}
+
+static bool path_has_suffix(const char *path, const char *suffix) {
+    if (!path || !suffix) return false;
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    return path_len >= suffix_len &&
+        strcmp(path + path_len - suffix_len, suffix) == 0;
+}
+
+static bool vscode_shell_env_printer_request(
+    const char *path, char *const argv[], char *const envp[], char token[13]) {
+    static const char electron_suffix[] =
+        "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
+    if (!path_has_suffix(path, electron_suffix) ||
+        !env_has_exact(envp, "VSCODE_RESOLVING_ENVIRONMENT=1") ||
+        !env_has_exact(envp, "ELECTRON_RUN_AS_NODE=1")) {
+        return false;
+    }
+
+    const char *expression = NULL;
+    for (size_t i = 0; argv && argv[i]; i++) {
+        if (strcmp(argv[i], "-p") == 0 && argv[i + 1]) {
+            expression = argv[i + 1];
+            break;
+        }
+    }
+    if (!expression || !strstr(expression, "JSON.stringify(process.env)"))
+        return false;
+
+    for (const char *p = expression; *p; p++) {
+        if (!isxdigit((unsigned char)*p) ||
+            (p != expression && isxdigit((unsigned char)p[-1]))) {
+            continue;
+        }
+        size_t run = 0;
+        while (isxdigit((unsigned char)p[run])) run++;
+        if (run >= 12) {
+            memcpy(token, p, 12);
+            token[12] = '\0';
+            return true;
+        }
+    }
+    return false;
+}
+
+static void write_all(int fd, const char *bytes, size_t length) {
+    while (length) {
+        ssize_t written = write(fd, bytes, length);
+        if (written <= 0) _exit(125);
+        bytes += (size_t)written;
+        length -= (size_t)written;
+    }
+}
+
+static void write_json_string(int fd, const char *bytes, size_t length) {
+    static const char hex[] = "0123456789abcdef";
+    write_all(fd, "\"", 1);
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        switch (c) {
+            case '\"': write_all(fd, "\\\"", 2); break;
+            case '\\': write_all(fd, "\\\\", 2); break;
+            case '\b': write_all(fd, "\\b", 2); break;
+            case '\f': write_all(fd, "\\f", 2); break;
+            case '\n': write_all(fd, "\\n", 2); break;
+            case '\r': write_all(fd, "\\r", 2); break;
+            case '\t': write_all(fd, "\\t", 2); break;
+            default:
+                if (c < 0x20) {
+                    char escaped[6] = {'\\', 'u', '0', '0',
+                                       hex[c >> 4], hex[c & 0xf]};
+                    write_all(fd, escaped, sizeof(escaped));
+                } else {
+                    write_all(fd, (const char *)&bytes[i], 1);
+                }
+                break;
+        }
+    }
+    write_all(fd, "\"", 1);
+}
+
+__attribute__((noreturn)) static void vscode_shell_env_print(
+    char *const envp[], const char token[13]) {
+    extern char **environ;
+    char *const *source = envp ? envp : environ;
+    fprintf(stderr,
+        "#### VSCODE-SHELL-ENV exec adapter: emitting login-shell JSON "
+        "without Chromium startup\n");
+    fflush(stderr);
+
+    write_all(STDOUT_FILENO, token, 12);
+    write_all(STDOUT_FILENO, "{", 1);
+    bool first = true;
+    for (size_t i = 0; source && source[i]; i++) {
+        const char *equals = strchr(source[i], '=');
+        if (!equals) continue;
+        if (!first) write_all(STDOUT_FILENO, ",", 1);
+        first = false;
+        write_json_string(STDOUT_FILENO, source[i],
+                          (size_t)(equals - source[i]));
+        write_all(STDOUT_FILENO, ":", 1);
+        write_json_string(STDOUT_FILENO, equals + 1, strlen(equals + 1));
+    }
+    write_all(STDOUT_FILENO, "}", 1);
+    write_all(STDOUT_FILENO, token, 12);
+    write_all(STDOUT_FILENO, "\n", 1);
+    _exit(0);
+}
+
 // ── interposed exec family ──────────────────────────────────────────────────
 // Under DYLD_INTERPOSE, a call to the original symbol from within this image is
 // NOT re-interposed by dyld, so calling e.g. execve() here invokes the real one
@@ -229,6 +360,9 @@ static int my_posix_spawnp(pid_t *pid, const char *file,
 }
 
 static int my_execve(const char *path, char *const argv[], char *const envp[]) {
+    char token[13];
+    if (vscode_shell_env_printer_request(path, argv, envp, token))
+        vscode_shell_env_print(envp, token);
     ensure_signed(path);
     selected_env_t selected = env_select_insert(envp, path);
     int result = execve(path, argv, selected.items ? selected.items : envp);
@@ -237,6 +371,9 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
 }
 
 static int my_execv(const char *path, char *const argv[]) {
+    char token[13];
+    if (vscode_shell_env_printer_request(path, argv, NULL, token))
+        vscode_shell_env_print(NULL, token);
     ensure_signed(path);
     pthread_mutex_lock(&g_exec_env_lock);
     saved_insert_t saved = process_env_select_insert(path);
@@ -247,8 +384,12 @@ static int my_execv(const char *path, char *const argv[]) {
 }
 
 static int my_execvp(const char *file, char *const argv[]) {
-    ensure_signed(file);
     char *resolved = resolve(file);
+    char token[13];
+    if (vscode_shell_env_printer_request(
+            resolved ? resolved : file, argv, NULL, token))
+        vscode_shell_env_print(NULL, token);
+    ensure_signed(file);
     pthread_mutex_lock(&g_exec_env_lock);
     saved_insert_t saved = process_env_select_insert(resolved ? resolved : file);
     int result = execvp(file, argv);

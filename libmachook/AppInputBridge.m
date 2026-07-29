@@ -3099,6 +3099,9 @@ static void *MacWSAppInputThread(void *unused) {
 }
 
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
+    const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
+    if (shell_env && strcmp(shell_env, "1") == 0) return;
+
     if (!MacWSAppInputSupportedProcess()) return;
     MacWSInstallApplicationKeyWitness();
     MacWSInstallMenuEventLoopWitness();

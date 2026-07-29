@@ -519,6 +519,16 @@ static id macws_iogpu_command_buffer_error(id self, SEL selector) {
         dump_latch = &dumped_103;
         reason = "iogpu-error-getter-103";
     }
+    // Chromium can expose an NSError for a command-buffer object before the
+    // selector-0x1a submit observer has joined that object to a flight-recorder
+    // serial.  Freezing the one-shot ring for submitSerial=0 captured no exact
+    // payload and prevented the next, runtime-confirmed mapped 0x103 from being
+    // recorded (2026-07-30: observation 1 serial=0, then observation 2
+    // serial=94 fixed=8).  An unmapped observation remains logged above, but it
+    // cannot be the evidence-bearing one-shot: wait for a nonzero serial whose
+    // bytes can be matched and validated.  This changes diagnostics only; the
+    // NSError and command submission are untouched.
+    if (!submit_serial) return error;
     int expected = 0;
     if (atomic_compare_exchange_strong(dump_latch, &expected, 1)) {
         // The command-buffer getter can synthesize an NSError even when the
@@ -5403,6 +5413,13 @@ static void macws_sigabrt_trampoline(int sig) {
                     (unsigned long long)attempt, (void *)tex,
                     tex ? class_getName([tex class]) : "(nil)");
             }
+            if (!tex) {
+                // Failure-only in production: Chromium reports this as the
+                // generic GL_OUT_OF_MEMORY/MakeTexture error, which otherwise
+                // loses the descriptor that selected this native path.
+                macws_log_mtldesc(desc, NULL, 0,
+                    "plain.MIP-NATIVE.NIL");
+            }
             return tex;
         }
 
@@ -5433,6 +5450,10 @@ static void macws_sigabrt_trampoline(int sig) {
                     tex && [tex respondsToSelector:@selector(length)]
                         ? (unsigned long)[(id)tex length] : 999UL);
             }
+            if (!tex) {
+                macws_log_mtldesc(desc, NULL, 0,
+                    "plain.MEMORYLESS.NIL");
+            }
             return tex;
         }
 
@@ -5457,6 +5478,10 @@ static void macws_sigabrt_trampoline(int sig) {
                 fprintf(stderr,
                     "#### MTL_TEX plain DEPTH-STENCIL native result: %p class=%s\n",
                     (void *)tex, tex ? class_getName([tex class]) : "(nil)");
+            }
+            if (!tex) {
+                macws_log_mtldesc(desc, NULL, 0,
+                    "plain.DEPTH-STENCIL.NIL");
             }
             return tex;
         }
@@ -5496,6 +5521,10 @@ static void macws_sigabrt_trampoline(int sig) {
                 fprintf(stderr,
                     "#### MTL_TEX plain MULTISAMPLE native result: %p class=%s\n",
                     (void *)tex, tex ? class_getName([tex class]) : "(nil)");
+            }
+            if (!tex) {
+                macws_log_mtldesc(desc, NULL, 0,
+                    "plain.MULTISAMPLE.NIL");
             }
             return tex;
         }
@@ -5538,6 +5567,8 @@ static void macws_sigabrt_trampoline(int sig) {
                         (void *)tex, tex ? class_getName([tex class]) : "(nil)");
                 }
                 if (tex) return tex;
+                macws_log_mtldesc(desc, NULL, 0,
+                    "plain.NON-2D-NATIVE.NIL");
                 // fall through to 2D downgrade if nil
             }
             // 2026-06-20 — Real implementation for non-2D textures (Cube, 3D, etc.).
@@ -5728,6 +5759,19 @@ static void macws_sigabrt_trampoline(int sig) {
                                                           plane:0];
                 }
                 if (!tex) {
+                    // Failure-only evidence for the compatibility allocator.
+                    // Keep it before CFRelease so the IOSurface geometry and
+                    // properties remain readable.  This does not substitute a
+                    // resource or suppress the caller-visible nil.
+                    fprintf(stderr,
+                        "#### MTL_TEX LEASE-ALLOC-NIL key=%s stage=%s "
+                        "shapeEntries=%lu pool=%luMB\n",
+                        [poolKey UTF8String],
+                        surf ? "metal-wrap" : "iosurface-create",
+                        (unsigned long)[shapeEntries count],
+                        (unsigned long)(leasePoolBytes / (1024 * 1024)));
+                    macws_log_mtldesc(desc, surf, 0,
+                        "plain.LEASE-ALLOC.NIL");
                     if (surf) CFRelease(surf);
                     surf = NULL;
                 } else {
@@ -8275,6 +8319,9 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
+    const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
+    if (shell_env && strcmp(shell_env, "1") == 0) return;
+
     // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
     // at first invocation and decides whether to return AGXG13GFamilyDevice or Nil.
     MSImageRef sys = MSGetImageByName("/System/Library/Frameworks/Metal.framework/Metal");
