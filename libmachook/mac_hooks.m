@@ -8139,10 +8139,202 @@ DYLD_INTERPOSE(setegid_new, setegid);
 DYLD_INTERPOSE(seteuid_new, seteuid);
 
 // utilities
+//
+// vm_protect applies at page granularity.  The old implementation therefore
+// made every function sharing the target's 16-KiB page non-executable while
+// the callback wrote a four-byte instruction.  That is not safe after a
+// process has started worker threads.  Runtime witness:
+//
+//   WindowServer-2026-07-30-013455.ips
+//   faulting queue: com.apple.NSXPCConnection.m-user.com.apple.systemstatus
+//   PC/FAR: objc_msgSend (0x188341c00), KERN_PROTECTION_FAILURE
+//
+// The AGX class-registration callback was patching objc_msgSendSuper2+0x10 on
+// that same libobjc page at the time.  Suspend peer threads across the W^X
+// transition so no peer can fetch from the temporarily RW/non-X page.  This
+// fixes the patching invariant; it does not bypass the faulting ObjC call.
+static pthread_mutex_t g_macws_executable_patch_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+
+static bool macws_same_thread_id(thread_t candidate,
+                                 const thread_identifier_info_data_t *current) {
+    thread_identifier_info_data_t info = {0};
+    mach_msg_type_number_t count = THREAD_IDENTIFIER_INFO_COUNT;
+    kern_return_t kr = thread_info(candidate, THREAD_IDENTIFIER_INFO,
+        (thread_info_t)&info, &count);
+    return kr == KERN_SUCCESS && info.thread_id == current->thread_id;
+}
+
+static vm_prot_t macws_macho_execute_protection_for_address(void *address) {
+    Dl_info image = {0};
+    if (!dladdr(address, &image) || !image.dli_fbase) return 0;
+
+    const struct mach_header_64 *header = image.dli_fbase;
+    if (header->magic != MH_MAGIC_64) return 0;
+
+    const uint8_t *commands = (const uint8_t *)(header + 1);
+    const struct segment_command_64 *text = NULL;
+    const uint8_t *cursor = commands;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *command =
+            (const struct load_command *)cursor;
+        if (command->cmdsize < sizeof(*command) ||
+            cursor + command->cmdsize < cursor) return 0;
+        if (command->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if (!strncmp(segment->segname, SEG_TEXT,
+                         sizeof(segment->segname))) {
+                text = segment;
+                break;
+            }
+        }
+        cursor += command->cmdsize;
+    }
+    if (!text) return 0;
+
+    intptr_t slide = (intptr_t)header - (intptr_t)text->vmaddr;
+    uintptr_t target = (uintptr_t)address;
+    cursor = commands;
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command *command =
+            (const struct load_command *)cursor;
+        if (command->cmdsize < sizeof(*command) ||
+            cursor + command->cmdsize < cursor) return 0;
+        if (command->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            uintptr_t start = (uintptr_t)((intptr_t)segment->vmaddr + slide);
+            uintptr_t end = start + (uintptr_t)segment->vmsize;
+            if (end >= start && target >= start && target < end)
+                return segment->initprot & VM_PROT_EXECUTE;
+        }
+        cursor += command->cmdsize;
+    }
+    return 0;
+}
+
 void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
-    vm_protect(mach_task_self(), (vm_address_t)addr, size, false, PROT_READ | PROT_WRITE | VM_PROT_COPY);
+    if (!addr || !size || !callback) return;
+
+    pthread_mutex_lock(&g_macws_executable_patch_lock);
+
+    // This helper also patches authenticated GOT/class-reference slots in
+    // __DATA_CONST.  Preserve the actual region permission instead of the old
+    // unconditional RX "restore" (which the kernel rejects for non-X data
+    // regions).  All current patches are smaller than one page; refuse a
+    // future cross-region write until it is split by its caller.
+    mach_vm_address_t region_address = (mach_vm_address_t)addr;
+    mach_vm_size_t region_size = 0;
+    vm_region_basic_info_data_64_t region_info = {0};
+    mach_msg_type_number_t region_info_count =
+        VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t region_object = MACH_PORT_NULL;
+    kern_return_t region_kr = mach_vm_region(mach_task_self(),
+        &region_address, &region_size, VM_REGION_BASIC_INFO_64,
+        (vm_region_info_t)&region_info, &region_info_count, &region_object);
+    if (region_object != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), region_object);
+    if (region_kr != KERN_SUCCESS ||
+        (mach_vm_address_t)addr < region_address ||
+        (mach_vm_address_t)addr > UINT64_MAX - size ||
+        (mach_vm_address_t)addr + size > region_address + region_size) {
+        fprintf(stderr,
+            "#### ModifyExecutableRegion refused unknown/cross-region patch "
+            "addr=%p size=%zu region=%#llx+%#llx kr=%#x\n",
+            addr, size, (unsigned long long)region_address,
+            (unsigned long long)region_size, region_kr);
+        pthread_mutex_unlock(&g_macws_executable_patch_lock);
+        return;
+    }
+    vm_prot_t original_protection = region_info.protection;
+    // The macOS shared cache mapped by this iOS kernel can report its __TEXT
+    // region as read-only even while instruction fetch is allowed by the
+    // original mapping.  Calling vm_protect(R) on that page removes execute:
+    // the validation run then faulted at IOMobileFramebufferOpen with an
+    // instruction-abort permission failure.  Recover X from the actual loaded
+    // Mach-O segment and restore it after the write; __DATA_CONST remains R.
+    original_protection |=
+        macws_macho_execute_protection_for_address(addr);
+
+    thread_act_array_t threads = NULL;
+    mach_msg_type_number_t thread_count = 0;
+    kern_return_t threads_kr = task_threads(mach_task_self(), &threads,
+                                             &thread_count);
+    uint8_t *suspended = threads_kr == KERN_SUCCESS && thread_count
+        ? calloc(thread_count, sizeof(*suspended)) : NULL;
+
+    thread_identifier_info_data_t current_info = {0};
+    mach_msg_type_number_t current_info_count = THREAD_IDENTIFIER_INFO_COUNT;
+    thread_t current = mach_thread_self();
+    kern_return_t current_kr = thread_info(current, THREAD_IDENTIFIER_INFO,
+        (thread_info_t)&current_info, &current_info_count);
+    mach_port_deallocate(mach_task_self(), current);
+
+    if (threads_kr != KERN_SUCCESS || !suspended ||
+        current_kr != KERN_SUCCESS) {
+        fprintf(stderr,
+            "#### ModifyExecutableRegion refused unsafe patch addr=%p "
+            "size=%zu task_threads=%#x current_info=%#x\n",
+            addr, size, threads_kr, current_kr);
+        goto cleanup;
+    }
+
+    bool found_current = false;
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+        if (macws_same_thread_id(threads[i], &current_info)) {
+            found_current = true;
+            continue;
+        }
+        if (thread_suspend(threads[i]) == KERN_SUCCESS)
+            suspended[i] = 1;
+    }
+    if (!found_current) {
+        fprintf(stderr,
+            "#### ModifyExecutableRegion refused patch: current thread "
+            "missing from task_threads (addr=%p size=%zu)\n", addr, size);
+        goto resume;
+    }
+
+    kern_return_t writable_kr = vm_protect(mach_task_self(),
+        (vm_address_t)addr, size, false,
+        PROT_READ | PROT_WRITE | VM_PROT_COPY);
+    if (writable_kr != KERN_SUCCESS) {
+        fprintf(stderr,
+            "#### ModifyExecutableRegion vm_protect RW failed addr=%p "
+            "size=%zu kr=%#x\n", addr, size, writable_kr);
+        goto resume;
+    }
+
     callback();
-    vm_protect(mach_task_self(), (vm_address_t)addr, size, false, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char *)addr, (char *)addr + size);
+
+    kern_return_t restore_kr = vm_protect(mach_task_self(),
+        (vm_address_t)addr, size, false, original_protection);
+    if (restore_kr != KERN_SUCCESS) {
+        // Keep peers suspended: resuming them onto a non-executable code page
+        // would recreate the exact production crash this function prevents.
+        fprintf(stderr,
+            "#### ModifyExecutableRegion FATAL vm_protect restore failed "
+            "addr=%p size=%zu protection=%#x kr=%#x\n",
+            addr, size, original_protection, restore_kr);
+        abort();
+    }
+
+resume:
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+        if (suspended[i]) thread_resume(threads[i]);
+    }
+
+cleanup:
+    free(suspended);
+    if (threads_kr == KERN_SUCCESS && threads) {
+        for (mach_msg_type_number_t i = 0; i < thread_count; i++)
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        vm_deallocate(mach_task_self(), (vm_address_t)threads,
+            (vm_size_t)thread_count * sizeof(*threads));
+    }
+    pthread_mutex_unlock(&g_macws_executable_patch_lock);
 }
 
 #ifdef FORCE_M1_DRIVER

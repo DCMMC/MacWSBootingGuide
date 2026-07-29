@@ -2702,6 +2702,25 @@ void macws_vnc_complete_composite(void *context) {
     macws_vnc_release(texture);
 }
 
+// Producer completions arrive continuously, including for an unchanged
+// desktop.  The old code called +detachNewThreadWithBlock: for every admitted
+// completion.  A 10-second production sample accumulated 69 short-lived
+// __macws_vnc_finish_update_block_invoke threads, most sleeping/pixel-scanning
+// for only one or two samples before exit.  pollInFlight already guarantees a
+// single ordinary observer, so a serial libdispatch queue preserves that
+// invariant while reusing the process worker pool instead of creating ~10
+// NSThreads per second.
+static dispatch_queue_t macws_vnc_completion_observer_queue(void) {
+    static dispatch_once_t once;
+    static dispatch_queue_t queue;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create(
+            "com.macwsguide.vnc-completion-observer",
+            DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
 void macws_vnc_finish_update(void *context) {
     if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_pending)
         return;
@@ -2835,7 +2854,7 @@ void macws_vnc_finish_update(void *context) {
             macws_vnc_clear_inband_busy();
             return;
         }
-        [NSThread detachNewThreadWithBlock:^{
+        dispatch_async(macws_vnc_completion_observer_queue(), ^{
             @autoreleasepool {
                 BOOL published = macws_vnc_publish_inband_destination(
                     orderedDestination);
@@ -2850,7 +2869,7 @@ void macws_vnc_finish_update(void *context) {
                 macws_vnc_release(orderedDestination);
                 macws_vnc_clear_inband_busy();
             }
-        }];
+        });
         return;
     }
 
@@ -2938,7 +2957,7 @@ void macws_vnc_finish_update(void *context) {
             (unsigned long long)submitSerial,
             (unsigned long long)atomic_load(&g_vnc_poll_drop_count));
     }
-    [NSThread detachNewThreadWithBlock:^{
+    dispatch_async(macws_vnc_completion_observer_queue(), ^{
         @autoreleasepool {
             MTLCommandBufferStatus status = [commandBuffer status];
             unsigned polls = 0;
@@ -3060,7 +3079,7 @@ void macws_vnc_finish_update(void *context) {
             macws_vnc_release(texture);
             atomic_store(&pollInFlight, 0);
         }
-    }];
+    });
 }
 
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
@@ -7998,18 +8017,45 @@ static void install_agx_init_redirect(Class agx) {
 %end
 
 const char *metalSimService = "com.apple.metal.simulator";
+
+// macOS SystemStatus and iOS SystemStatus publish the same three bootstrap
+// names.  Runtime-confirmed on iPadOS 16.3 (2026-07-30): after unloading our
+// chroot com.apple.systemstatusd job, launchctl print user/501 still reported
+// all three original names active.  A direct launch with MACWS_XPC_DEBUG=1
+// also proved that both macOS server listeners (flags=0x1) and clients enter
+// this exact xpc_connection_create_mach_service hook.  Give the chroot graph a
+// private namespace on both sides rather than connecting macOS protocol
+// objects to iOS's endpoints.
+static const char *macws_systemstatus_service_name(const char *name) {
+    if (!name) return name;
+    if (!strcmp(name, "com.apple.systemstatus"))
+        return "com.apple.macosbooter.systemstatus";
+    if (!strcmp(name, "com.apple.systemstatus.publisher"))
+        return "com.apple.macosbooter.systemstatus.publisher";
+    if (!strcmp(name, "com.apple.systemstatus.activityattribution"))
+        return "com.apple.macosbooter.systemstatus.activityattribution";
+    return name;
+}
+
 xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, dispatch_queue_t targetq, uint64_t flags);
 xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, dispatch_queue_t targetq, uint64_t flags) {
     flags &= ~XPC_CONNECTION_MACH_SERVICE_PRIVILEGED;
+    const char *originalName = name;
+    name = macws_systemstatus_service_name(name);
     // Connection tracing is a diagnostic flight recorder.  Terminal used to
     // enable it implicitly, making an ordinary production shell write every
     // XPC lookup to stderr.  Keep the functional privileged-flag translation
     // below, but emit the trace only under the explicit debug environment.
     if (getenv("MACWS_XPC_DEBUG")) {
-        fprintf(stderr, "#### XPC_TRACE mach_service create: '%s' flags=%#llx\n",
-            name ?: "(null)", (unsigned long long)flags);
+        fprintf(stderr,
+            "#### XPC_TRACE mach_service create: '%s'%s%s%s flags=%#llx\n",
+            originalName ?: "(null)",
+            name != originalName ? " -> '" : "",
+            name != originalName ? name : "",
+            name != originalName ? "'" : "",
+            (unsigned long long)flags);
     }
-    if(!strncmp(name, metalSimService, strlen(metalSimService))) {
+    if(name && !strncmp(name, metalSimService, strlen(metalSimService))) {
         return xpc_connection_create(metalSimService, 0);
     }
     return orig_xpc_connection_create_mach_service(name, targetq, flags);

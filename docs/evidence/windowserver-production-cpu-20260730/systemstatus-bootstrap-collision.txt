@@ -1,0 +1,28 @@
+Runtime capture, iPad13,6 / iPadOS 16.3, 2026-07-30.
+
+The first block was captured while the chroot com.apple.systemstatusd job was
+running with the stock macOS MachServices names.  The second block was captured
+immediately after `macos_gui.sh stop` unloaded that job.  The three endpoints
+remain active, proving that they belong to (or are reserved by) the iOS user
+bootstrap namespace rather than the chroot job.
+
+BEFORE
+           27017      -  com.apple.systemstatusd
+         0xca67b    M   A   com.apple.systemstatus.activityattribution
+         0xcadb3    M   A   com.apple.systemstatus
+         0xd1997    M   A   com.apple.systemstatus.publisher
+
+AFTER_STOP
+         0xca67b    M   A   com.apple.systemstatus.activityattribution
+         0xcadb3    M   A   com.apple.systemstatus
+         0xd1997    M   A   com.apple.systemstatus.publisher
+
+JOB_AFTER
+Could not find service "com.apple.systemstatusd" in domain for uid: 501
+
+After deploying the private-name rewrite, `launchctl print user/501` showed a
+second, independent set of active endpoints:
+
+         0xa3773    M   A   com.apple.macosbooter.systemstatus
+         0xb39df    M   A   com.apple.macosbooter.systemstatus.activityattribution
+         0x33a0b    M   A   com.apple.macosbooter.systemstatus.publisher

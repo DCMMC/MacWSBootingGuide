@@ -38,8 +38,10 @@ set -u
 # ─── Paths ──────────────────────────────────────────────────────────────────
 ROOTFS=/var/mnt/rootfs
 FLAG="$ROOTFS/tmp/ws_headless"                 # coexistence flag (chroot /tmp/ws_headless)
-MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + launchservicesd
+MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + required macOS services
 WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
+LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
+SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
@@ -97,6 +99,7 @@ BACKBOARDD=/System/Library/LaunchDaemons/com.apple.backboardd.plist
 # never hit an iOS process by accident — iOS has no WindowServer/launchservicesd).
 P_WINDOWSERVER='SkyLight.framework/Resources/WindowServer'
 P_LAUNCHSERVICESD='CoreServices/launchservicesd'
+P_SYSTEMSTATUSD='SystemStatusServer.framework/Support/systemstatusd'
 P_OSXVNC='OSXvnc-server'
 P_TERMINAL='Utilities/Terminal.app/Contents/MacOS/Terminal'
 P_PBOARD='/usr/libexec/pboard'
@@ -933,12 +936,13 @@ cleanup_macos() {
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 
-    # 3) the WindowServer + launchservicesd daemons
+    # 3) WindowServer and the macOS service daemons loaded with it
     launchctl unload "$MACOS_DAEMONS" 2>/dev/null
 
     # 4) anything still lingering
     kill_by_pattern "$P_WINDOWSERVER"
     kill_by_pattern "$P_LAUNCHSERVICESD"
+    kill_by_pattern "$P_SYSTEMSTATUSD"
 
     clear_diagnostic_state
 
@@ -983,8 +987,29 @@ start_macos() {
     if [ -f "$LOGDIR/WindowServer.err" ]; then
         ws_log_start_line=$(( $(wc -l < "$LOGDIR/WindowServer.err") + 1 ))
     fi
-    log "Loading macOS WindowServer + launchservicesd..."
-    launchctl load "$MACOS_DAEMONS"
+    # SystemStatus clients immediately enumerate and register every subscribed
+    # domain. Runtime sampling showed that starting WindowServer before
+    # the private macOS SystemStatus endpoints exist leaves several NSXPC
+    # queues serializing registrations to a disconnected endpoint. Register
+    # and prove the stock macOS daemon under its collision-free private names
+    # first; this is dependency ordering, not a client bypass.
+    log "Starting macOS systemstatusd before WindowServer clients..."
+    rm -f "$LOGDIR/systemstatusd.out" "$LOGDIR/systemstatusd.err"
+    launchctl load "$SYSTEMSTATUSD_PLIST" || return 1
+    waited=0
+    while ! proc_running "$P_SYSTEMSTATUSD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_SYSTEMSTATUSD" || {
+        log "ERROR: macOS systemstatusd did not start. See $LOGDIR/systemstatusd.err"
+        return 1
+    }
+
+    log "Loading macOS launchservicesd, input bridge, and WindowServer..."
+    launchctl load "$LAUNCHSERVICESD_PLIST" || return 1
+    launchctl load "$INPUT_PLIST" || return 1
+    launchctl load "$WINDOWSERVER_PLIST" || return 1
     log "Waiting for WindowServer graphics initialization before GUI clients..."
     wait_for_initial_ws_ready "$ws_log_start_line" || return 1
 
@@ -1069,11 +1094,11 @@ status() {
     fi
     echo
     echo "-- processes --"
-    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_PBOARD|$P_PBS" \
+    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SYSTEMSTATUSD|$P_PBOARD|$P_PBS" \
         | grep -v grep || echo "(none running)"
     echo
     echo "-- launchd jobs --"
-    launchctl list 2>/dev/null | grep -iE "WindowServer|launchservices|macwsguide" \
+    launchctl list 2>/dev/null | grep -iE "WindowServer|launchservices|systemstatus|macwsguide" \
         || echo "(none loaded)"
     echo
     if proc_running "$P_OSXVNC"; then

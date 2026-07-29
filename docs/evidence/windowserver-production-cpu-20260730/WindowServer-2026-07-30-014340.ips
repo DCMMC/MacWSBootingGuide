@@ -1,0 +1,134 @@
+{"app_name":"WindowServer","timestamp":"2026-07-30 01:43:40.00 +0800","app_version":"","slice_uuid":"465422c7-3cfc-3e9f-9c04-813f3a265aa6","build_version":"","platform":1,"share_with_app_devs":0,"is_first_party":1,"bug_type":"309","os_version":"iPhone OS 16.3.1 (20D67)","roots_installed":0,"incident_id":"387B9585-CB9C-4D7D-8EE4-B6E90AC305EA","name":"WindowServer"}
+{
+  "uptime" : 350000,
+  "procRole" : "Unspecified",
+  "version" : 2,
+  "userID" : 0,
+  "deployVersion" : 210,
+  "modelCode" : "iPad13,6",
+  "coalitionID" : 53708,
+  "osVersion" : {
+    "isEmbedded" : true,
+    "train" : "iPhone OS 16.3.1",
+    "releaseType" : "User",
+    "build" : "20D67"
+  },
+  "captureTime" : "2026-07-30 01:43:37.1582 +0800",
+  "incident" : "387B9585-CB9C-4D7D-8EE4-B6E90AC305EA",
+  "pid" : 19818,
+  "cpuType" : "ARM-64",
+  "roots_installed" : 0,
+  "bug_type" : "309",
+  "procLaunch" : "2026-07-30 01:43:36.9733 +0800",
+  "procStartAbsTime" : 8527456202646,
+  "procExitAbsTime" : 8527460624533,
+  "procName" : "WindowServer",
+  "procPath" : "\/System\/Library\/PrivateFrameworks\/SkyLight.framework\/Versions\/A\/Resources\/WindowServer",
+  "parentProc" : "launchd",
+  "parentPid" : 1,
+  "coalitionName" : "com.apple.WindowServer",
+  "crashReporterKey" : "1500aba40c9dcd15b743fc39efe555c209d877de",
+  "basebandVersion" : "",
+  "vmRegionInfo" : "0x18dd24a5c is in 0x18dd24000-0x18dd28000;  bytes after start: 2652  bytes before end: 13731\n      REGION TYPE                 START - END      [ VSIZE] PRT\/MAX SHRMOD  REGION DETAIL\n      __TEXT                   18dd22000-18dd24000 [    8K] r-x\/rwx SM=COW  ...leFramebuffer\n--->  __TEXT                   18dd24000-18dd28000 [   16K] r--\/rwx SM=COW  ...leFramebuffer\n      __TEXT                   18dd28000-18dd30000 [   32K] r-x\/r-x SM=COW  ...leFramebuffer",
+  "exception" : {"codes":"0x0000000000000002, 0x000000018dd24a5c","rawCodes":[2,6674336348],"type":"EXC_BAD_ACCESS","signal":"SIGBUS","subtype":"KERN_PROTECTION_FAILURE at 0x000000018dd24a5c"},
+  "termination" : {"flags":0,"code":10,"namespace":"SIGNAL","indicator":"Bus error: 10","byProc":"exc handler","byPid":19818},
+  "vmregioninfo" : "0x18dd24a5c is in 0x18dd24000-0x18dd28000;  bytes after start: 2652  bytes before end: 13731\n      REGION TYPE                 START - END      [ VSIZE] PRT\/MAX SHRMOD  REGION DETAIL\n      __TEXT                   18dd22000-18dd24000 [    8K] r-x\/rwx SM=COW  ...leFramebuffer\n--->  __TEXT                   18dd24000-18dd28000 [   16K] r--\/rwx SM=COW  ...leFramebuffer\n      __TEXT                   18dd28000-18dd30000 [   32K] r-x\/r-x SM=COW  ...leFramebuffer",
+  "faultingThread" : 0,
+  "threads" : [{"triggered":true,"id":11908692,"threadState":{"x":[{"value":43779},{"value":515},{"value":0},{"value":6088779544},{"value":0},{"value":0},{"value":7},{"value":0},{"value":8020593184,"symbolLocation":0,"symbol":"mach_task_self_"},{"value":782693085804888241},{"value":0},{"value":0},{"value":7},{"value":0},{"value":7},{"value":1},{"value":6088778416},{"value":0},{"value":0},{"value":6088779544},{"value":8021102200,"symbolLocation":0,"symbol":"s_display_infos"},{"value":8021102200,"symbolLocation":0,"symbol":"s_display_infos"},{"value":3758097085},{"value":0},{"value":8021102200,"symbolLocation":0,"symbol":"s_display_infos"},{"value":5301636004},{"value":8055700552,"symbolLocation":0,"symbol":"-[CAWindowServer _detectDisplays]::count_funcs"},{"value":7978725376,"symbolLocation":7360,"symbol":"threadList"},{"value":6618137504,"symbolLocation":0,"symbol":"CA::WindowServer::AppleCLCDDisplay::open(unsigned long)"}],"flavor":"ARM_THREAD_STATE64","lr":{"value":6674357688},"cpsr":{"value":2147487744},"fp":{"value":6088779408},"sp":{"value":6088779376},"esr":{"value":2181038095,"description":"(Instruction Abort) Permission fault"},"pc":{"value":6674336348,"matchesCrashFrame":1},"far":{"value":6674336348}},"name":"ws_main_thread","queue":"com.apple.main-thread","frames":[{"imageOffset":10844,"symbol":"IOMobileFramebufferOpen","symbolLocation":0,"imageIndex":0},{"imageOffset":32184,"symbol":"iomfb_get_display","symbolLocation":56,"imageIndex":0},{"imageOffset":31544,"symbol":"IOMobileFramebufferOpenByName","symbolLocation":1064,"imageIndex":0},{"imageOffset":839008,"symbol":"CA::WindowServer::AppleDisplay::AppleDisplay(__CFString const*, unsigned int, unsigned int, IOMFBDisplayType)","symbolLocation":856,"imageIndex":1},{"imageOffset":845508,"symbol":"invocation function for block in CA::WindowServer::AppleCLCDDisplay::open(unsigned long)","symbolLocation":56,"imageIndex":1},{"imageOffset":845300,"symbol":"CA::WindowServer::create_display_of_type(IOMFBDisplayType, unsigned long, CA::WindowServer::AppleDisplay* (__CFString const*) block_pointer)","symbolLocation":336,"imageIndex":1},{"imageOffset":2532404,"symbol":"-[CAWindowServer _detectDisplays]","symbolLocation":92,"imageIndex":1},{"imageOffset":2577496,"symbol":"shared_server_init(void*)","symbolLocation":172,"imageIndex":1},{"imageOffset":17408,"symbol":"_dispatch_client_callout","symbolLocation":20,"imageIndex":2},{"imageOffset":23616,"symbol":"_dispatch_once_callout","symbolLocation":32,"imageIndex":2},{"imageOffset":2577320,"symbol":"+[CAWindowServer serverWithOptions:]","symbolLocation":92,"imageIndex":1},{"imageOffset":1763352,"symbol":"__WSCAWindowServerInitialize_block_invoke","symbolLocation":120,"imageIndex":3},{"imageOffset":17408,"symbol":"_dispatch_client_callout","symbolLocation":20,"imageIndex":2},{"imageOffset":23616,"symbol":"_dispatch_once_callout","symbolLocation":32,"imageIndex":2},{"imageOffset":2309960,"symbol":"WSInitialize","symbolLocation":10800,"imageIndex":3},{"imageOffset":3396564,"symbol":"SLXServer","symbolLocation":1028,"imageIndex":3},{"imageOffset":13244,"imageIndex":4},{"imageOffset":24360,"symbol":"start","symbolLocation":2236,"imageIndex":5}]},{"id":11908695,"frames":[{"imageOffset":7564,"symbol":"start_wqthread","symbolLocation":0,"imageIndex":6}]}],
+  "usedImages" : [
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6674325504,
+    "size" : 57336,
+    "uuid" : "9485c742-b91f-3c6c-897c-ab2c8acf7625",
+    "path" : "\/System\/Library\/PrivateFrameworks\/IOMobileFramebuffer.framework\/Versions\/A\/IOMobileFramebuffer",
+    "name" : "IOMobileFramebuffer"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6617292800,
+    "size" : 3661824,
+    "uuid" : "cf853bbd-01b6-3f46-ada1-ec70fd2dc9dc",
+    "path" : "\/System\/Library\/Frameworks\/QuartzCore.framework\/Versions\/A\/QuartzCore",
+    "name" : "QuartzCore"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6492045312,
+    "size" : 294912,
+    "uuid" : "c2fd3094-b465-39a4-b774-16583ff53c4b",
+    "path" : "\/usr\/lib\/system\/libdispatch.dylib",
+    "name" : "libdispatch.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6574460928,
+    "size" : 4374528,
+    "uuid" : "96676a53-b1e0-3d7e-b98b-b73873cd1880",
+    "path" : "\/System\/Library\/PrivateFrameworks\/SkyLight.framework\/Versions\/A\/SkyLight",
+    "name" : "SkyLight"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64",
+    "base" : 4378099712,
+    "size" : 16384,
+    "uuid" : "465422c7-3cfc-3e9f-9c04-813f3a265aa6",
+    "path" : "\/System\/Library\/PrivateFrameworks\/SkyLight.framework\/Versions\/A\/Resources\/WindowServer",
+    "name" : "WindowServer"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6490300416,
+    "size" : 582996,
+    "uuid" : "bd993f39-c902-37d6-8bd8-6d827c7f121e",
+    "path" : "\/usr\/lib\/dyld",
+    "name" : "dyld"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6493802496,
+    "size" : 53248,
+    "uuid" : "46d35233-a051-3f4f-bba4-ba56dddc4d1a",
+    "path" : "\/usr\/lib\/system\/libsystem_pthread.dylib",
+    "name" : "libsystem_pthread.dylib"
+  }
+],
+  "vmSummary" : "ReadOnly portion of Libraries: Total=804.0M resident=0K(0%) swapped_out_or_unallocated=804.0M(100%)\nWritable regions: Total=250.0M written=0K(0%) resident=0K(0%) swapped_out=0K(0%) unallocated=250.0M(100%)\n\n                                VIRTUAL   REGION \nREGION TYPE                        SIZE    COUNT (non-coalesced) \n===========                     =======  ======= \nActivity Tracing                   256K        1 \nDispatch continuations            64.0M        1 \nKernel Alloc Once                   32K        1 \nMALLOC                           165.3M       21 \nMALLOC guard page                  192K       12 \nMach message                       512K       32 \nSTACK GUARD                         32K        2 \nStack                             1552K        2 \nVM_ALLOCATE                        256K       16 \n__AUTH                              120        1 \n__AUTH_CONST                         6K        3 \n__CGSERVER                          16K        1 \n__DATA                            18.3M        9 \n__DATA_CONST                       116K        9 \n__DATA_DIRTY                        24K        5 \n__LINKEDIT                       802.3M        5 \n__OBJC_RO                         66.3M        1 \n__OBJC_RW                         2011K        1 \n__SLSERVER                          16K        1 \n__TEXT                            1744K       15 \ndyld private memory                272K        2 \nmapped file                         64K        1 \nshared memory                       96K        5 \n===========                     =======  ======= \nTOTAL                              1.1G      147 \n",
+  "legacyInfo" : {
+  "threadTriggered" : {
+    "name" : "ws_main_thread",
+    "queue" : "com.apple.main-thread"
+  }
+},
+  "trialInfo" : {
+  "rollouts" : [
+    {
+      "rolloutId" : "6101c13693ebac18231ac9a1",
+      "factorPackIds" : {
+
+      },
+      "deploymentId" : 240000791
+    },
+    {
+      "rolloutId" : "63a0a6cfd1cdb67d083006d0",
+      "factorPackIds" : {
+
+      },
+      "deploymentId" : 240000003
+    }
+  ],
+  "experiments" : [
+
+  ]
+},
+  "reportNotes" : [
+  "dyld_process_snapshot_create_for_process failed with 5"
+]
+}

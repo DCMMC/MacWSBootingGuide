@@ -210,6 +210,16 @@ jbctl trustcache add b5da39409492ac85e5a8e8ab618fe77e2d7a2980
 jbctl trustcache add bbb765988e2677b98d47a549d612fa0d4af25f69
 add_all_trustcache "/var/mnt/rootfs/bin/bash"
 add_all_trustcache "/var/mnt/rootfs/System/Library/CoreServices/launchservicesd"
+SYSTEMSTATUSD="/var/mnt/rootfs/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd"
+if [ -f "$SYSTEMSTATUSD" ] &&
+   ! ldid -e "$SYSTEMSTATUSD" 2>/dev/null | grep -q '<key>com.apple.systemstatus.domains</key>'; then
+    # A stock macOS systemstatusd only carries com.apple.rootless.critical.
+    # macOS executables launched in the iOS chroot must use the same project
+    # entitlement set as WindowServer before AMFI will admit the injected
+    # libmachook image.  Do this once; repeated ldid passes can change CDHash.
+    ldid -S"$ENT" -M "$SYSTEMSTATUSD" || exit 1
+fi
+add_all_trustcache "$SYSTEMSTATUSD"
 if [ ! -e "/var/mnt/rootfs/System/Library/CoreServices/launchservicesd.dylib" ]; then
 	cp -vf /var/jb/usr/macOS/Frameworks/launchservicesd.dylib "/var/mnt/rootfs/System/Library/CoreServices/launchservicesd.dylib"
 fi
