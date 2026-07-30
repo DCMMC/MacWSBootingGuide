@@ -201,8 +201,11 @@ def main() -> None:
         wrapper_end = u32(wrapper, 0x14)
         # Runtime-confirmed by VS Code Simple Browser Aquarium GPU submit 108
         # on 2026-07-30: generation 4 retains the same trailing-wrapper list
-        # framing and carries the range [0x210,0x228).
-        if list_generation not in (2, 3, 4):
+        # framing and carries the range [0x210,0x228).  The first mapped submit
+        # from an empty post-reboot profile uses the same framing with both
+        # generation fields zero and range [0x840,0x870).  Generation 1 has
+        # not been observed and remains rejected.
+        if list_generation not in (0, 2, 3, 4):
             raise ValueError(
                 f"unobserved trailing-wrapper list generation {list_generation}"
             )

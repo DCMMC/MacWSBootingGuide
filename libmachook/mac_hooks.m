@@ -11068,14 +11068,17 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
         // together from 2 in every earlier capture to 3 in this capture.
         // The remaining framing stayed identical and the actual blob was
         // 0x148 bytes while list+0x0c remained the base-list offset 0x130.
-        // A clean production VS Code 1.130 launch on 2026-07-30 then captured
-        // the same 0x870 KCMD / 0x148 list shape with both generation fields
-        // equal to 4. The pre-submit ring recorded fixed=0 and that exact
-        // command buffer subsequently reported error 0x102. No other framing
-        // field changed. Validate the observed equality and retain the known
-        // 2..4 bound so an unrelated list layout cannot enter this temporary
-        // translator.
-        (list_generation >= 2 && list_generation <= 4) &&
+        // A clean production VS Code 1.130 launch on 2026-07-30 captured the
+        // same 0x870 KCMD / 0x148 list shape with both generation fields equal
+        // to 4.  The first mapped failure from a genuinely empty profile after
+        // reboot captured the identical structure with generation 0, opcode
+        // 0x9903 and two type-3 records: fast-ring serial 2 had fixed=0 and
+        // then returned 0x102.  The outer/tail generation equality, exact
+        // ranges and every other wrapper anchor still match.  Admit the two
+        // runtime-observed generation families only; generation 1 remains
+        // unobserved and rejected.
+        (list_generation == 0 ||
+         (list_generation >= 2 && list_generation <= 4)) &&
         *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
         *(uint32_t *)(wrapper_list + 0x08) == 1 &&
         *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
@@ -11283,14 +11286,16 @@ static unsigned macws_translate_agx_segment_list_records(
         // 0x1b8 instead of 0x1a8, then returns 0x103 at
         // 0xfffffe00086e4108.  Preserve the type-5 record byte-for-byte while
         // shortening only that RE-confirmed vendor segment and its ranges.
-        // The first witness above carried ordinal 1 at +0x08.  A complete
-        // fast-ring capture from the next clean VS Code launch correlated
-        // error 0x103 with serial 101 / queue sequence 149 / descriptor 2:
-        // its otherwise identical wrapper carried ordinal 2, while the next
-        // retained queue sequence carried ordinal 3.  In all three records
-        // the remaining dwords are exactly {5,0x18,N,0,1,0}.  Treat the
-        // runtime-observed 1..3 field as an ordinal, retain the other five
-        // anchors, and preserve the complete wrapper byte-for-byte.
+        //
+        // RE of the macOS signal-event producer proves record+0x0c is
+        // unwritten padding, but that fact alone is not a sufficient framing
+        // contract for translating the preceding vendor record.  A runtime
+        // A/B that accepted every {type=5,size=0x18} wrapper produced 0x102/
+        // 0x103 from the first second of VS Code startup and more than ten
+        // thousand failed completions in one session.  Keep the narrower
+        // previously clean runtime shape here until the additional
+        // relationship is identified; accepting arbitrary padding is
+        // explicitly runtime-disproved as a production fix.
         uint32_t type5_ordinal =
             *(uint32_t *)(commands + cursor + 0x08);
         if (wrapper_type == 5 && wrapper_count == 1 &&
@@ -11307,9 +11312,15 @@ static unsigned macws_translate_agx_segment_list_records(
         BOOL wrapper_list_ok =
             *(uint32_t *)(wrapper_list + 0x00) == list_magic &&
             // Runtime-observed generations 2, 3 and 4 all use this exact
-            // trailing-wrapper list contract. Keep the outer/tail equality
-            // and bounded range instead of treating the field as a constant.
-            (list_generation >= 2 && list_generation <= 4) &&
+            // trailing-wrapper list contract.  After admitting the exact
+            // cold-start single-segment generation-0 form above, fast-ring
+            // serial 12 exposed the same generation-0 contract around two
+            // subtype-1 segments and one type-3 opcode 0x9b03 wrapper
+            // (KCMD 0x1098, list 0x2a8, range 0x1080..0x1098, fixed=0,
+            // completion 0x102).  Keep the outer/tail equality and exact
+            // ranges; admit only observed 0 and 2..4, not generation 1.
+            (list_generation == 0 ||
+             (list_generation >= 2 && list_generation <= 4)) &&
             *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
             *(uint32_t *)(wrapper_list + 0x08) == 1 &&
             *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&

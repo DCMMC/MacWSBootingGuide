@@ -1,0 +1,3 @@
+before-round2 0x102=1 0x103=1 oom=0
+after-round2 0x102=1 0x103=1 oom=0
+sampled-at=1785387324 thermal-state=serious raw=2 low-power=no battery-temp-centic=4089 virtual-temp-centic=4089 effective-temp-centic=4089 uptime=5688.372
