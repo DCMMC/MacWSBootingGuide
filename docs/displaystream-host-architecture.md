@@ -23,6 +23,7 @@
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
 | 缩放与精确操控 | 双指双击在 1× 与用户配置的 1.5×/2× 间切换；放大后默认移动视口，输入坐标同步映射到裁剪后的源纹理 | 已实现并有数学单测；原生 magnify 待验证 |
 | 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 已实现；设备兼容性待验证 |
+| 全屏桌面手势 | 全屏工作区的屏幕虚拟触控板识别三指方向手势，发送一次性 macOS 桌面命令；外接妙控板保留 iPadOS 系统三指手势 | 规划；桌面命令路径与设备输入边界待验证 |
 | Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 全屏入口已实现；Scene 语义菜单待实现 |
 | 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
 | 性能与稳定性 | 每客户端最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 已实现；性能目标待实测 |
@@ -47,7 +48,7 @@ MacWSHost（iPadOS）
   ├─ 一个 macOS 窗口对应一个 UIWindowScene
   ├─ IOSurface → MTLTexture → MTKView
   ├─ 无黑边视口、缩放、遮罩、密度选择
-  └─ Scene 顶部语义菜单 / 触摸 / 妙控键盘 / 拖放 / 剪贴板
+  └─ Scene 顶部语义菜单 / 触摸 / 全屏桌面手势 / 妙控键盘 / 拖放 / 剪贴板
              │ 52-byte 有版本输入记录
              ▼
 macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
@@ -149,6 +150,22 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 - USB HID usage 映射为 macOS keycode，同时保留字符、修饰键、方向键、功能键和组合快捷键。
 - 软键盘与硬键盘共享同一个目标窗口和 owner PID；Scene 遮罩或流未就绪时都不能注入。
 - 硬件键盘出现不应强制切换密度，以免用户正在触控时布局跳动；控制面板显式选择并持久化模式。后续可提供一次性建议，而不是自动改动。
+
+**全屏工作区的三指桌面手势**
+
+- 只在 `windowID == 0` 的全屏工作区启用；单窗 Scene 中三指不改变 macOS 桌面，避免与台前调度窗口组织和应用自身手势混淆。
+- 正式支持目标首先是“iPad 屏幕作为虚拟触控板”的三根直接触点：三指上滑 → Mission Control，三指下滑 → App Exposé，三指左/右滑 → 切换 macOS Space。三指轻点 → 显示桌面作为默认关闭的可配置动作。
+- 手势只发送一次语义桌面命令，不把三根触点转译成高频鼠标事件，也不向当前应用留下 down/cancel 状态。
+- 第三根手指加入时，先取消尚未判定的单指候选和双指滚动；若左键拖动已经开始则发送 cancel。只有三指同时落在 Metal/虚拟触控板区域内才可进入候选，菜单栏、软键盘、控制面板和系统边缘区域不参与。
+- 达到方向/距离/速度阈值后锁定一个轴并只触发一次；识别过程中显示半透明 HUD，成功时给轻触觉反馈，未达阈值抬起则无副作用。具体阈值必须集中在纯策略函数并由 iPad 手感测试决定。
+- macOS Mission Control、App Exposé、Space 和显示桌面的执行必须走独立桌面命令控制面；不能伪造成发送给某个前台应用的普通鼠标事件。实际 SkyLight/Dock/系统快捷键路径尚未 RE/runtime-confirmed，未确认前均为产品目标，不得标记已实现。
+
+外接 Magic Trackpad/妙控键盘触控板必须单独处理。Apple 的 iPad 使用说明把三指上滑定义为 Home/应用切换器、三指左右滑定义为切换 iPad App；因此方案默认这些手势由 iPadOS 所有，不尝试私有 hook 抢占系统导航：<https://support.apple.com/guide/ipad/ipad66ce6358/ipados>。
+
+- UIKit 可以区分 indirect pointer 输入并对部分触控板 gesture recognizer 作响应，但这不能证明 iPadOS 会把系统三指手势的原始触点交给本应用：<https://developer.apple.com/documentation/uikit/pointer-interactions>。
+- 设备验证若确认某个三指事件能稳定到达 Host，可作为可选映射启用；验证前不能让 UI 暗示它可用。
+- 外接妙控板的可靠替代方案预留为“Control + 双指上/下/左/右滑”，对应同一组桌面命令；修饰键可配置，且不得覆盖普通双指滚动。键盘还保留直接快捷键入口。
+- 若桌面命令后端不可用，Host 明确显示“桌面手势不可用”，不能静默改为 iPadOS 切 App、Host 自制总览或向当前应用发送近似按键。
 
 ### 7. 菜单栏
 
@@ -312,7 +329,26 @@ Metal 顶点始终覆盖 `[-1, 1] × [-1, 1]`，纹理坐标使用 `visibleSourc
 - AppInputBridge 每次事件都根据目标窗口当前 AppKit frame 做转换，不能缓存一个跨 resize 的旧 origin。
 - 控制记录、键盘、滚动和指针都先验证 magic/version/finite/范围/owner PID；失败需有可归因日志。
 
-### 6. 菜单快照与动作协议（规划）
+### 6. 桌面命令控制面（规划）
+
+全屏三指手势的输出是低频、一次性的 desktop command，而不是指针 ABI 的连续事件。建议定义固定长度、版本化的 `MacWSDesktopCommandRecord`：
+
+```text
+Host gesture recognizer
+  → desktop command(kind, sequence, timestamp, source, modifiers)
+  → 精确系统控制服务
+  → SkyLight / Dock / 已验证系统快捷键路径
+  → result(sequence, status, backend)
+```
+
+- `kind` 第一阶段只允许 Mission Control、App Exposé、previous/next Space 和 Show Desktop；未知命令必须拒绝。
+- 记录包含 magic、version、size、单调 sequence、Mach timestamp、输入来源和修饰键；坐标、触点轨迹和任意字符串不进入协议。
+- 后端必须明确报告实际使用的执行路径，且每条路径要有 macOS 13.4 RE 或运行证据。不能在 SkyLight 调用失败后静默注入一组未经验证的快捷键。
+- 同一 gesture sequence 最多执行一次；服务断线、超时、重复 sequence 或全屏 Scene 已失焦时拒绝。结果返回前不阻塞 Metal、DisplayStream 或输入接收线程。
+- Host HUD 分别显示“识别中 / 已执行 / 不可用”，而不是用动画假装桌面状态已经改变。成功证据是可见桌面/Space 变化和对应 result，不是服务进程存活。
+- 第一阶段可以只实现经设备验证的一部分命令；不可用命令从设置中隐藏，并在能力握手中返回明确 bitset。
+
+### 7. 菜单快照与动作协议（规划）
 
 菜单是低频、可变长控制面，不能塞进 52-byte 输入热路径，也不能为方便而复制未定稿结构体到 Host 和 AppInputBridge。建议单独定义版本化协议：
 
@@ -331,7 +367,7 @@ NSMainMenu
 - Host 只在本 Scene 前台且 owner PID/window 与实时目录一致时接受快照；目标退出、PID 复用、窗口关闭或 generation 回退都使缓存立即失效。
 - 展开动画必须本地立即开始；菜单子树响应 p95 目标不高于 100 ms。超时显示可取消的加载态并保留全屏菜单入口，不能冻结渲染或输入线程。
 
-### 7. 协议边界
+### 8. 协议边界
 
 | 协议 | 版本与固定结构 | 重要上限 |
 |---|---|---|
@@ -339,11 +375,12 @@ NSMainMenu
 | Metrics | header 24 B；entry 16 B | 256 entry；原子 sidecar |
 | Input | v3 record 52 B | 精确 PID/window；所有 float finite |
 | Interop | item descriptor 56 B | 8 MiB inline；32 items；path 4096 B |
+| Desktop（规划） | 独立固定 command/result 版本 | enum allowlist；单调 sequence；能力 bitset；一次执行 |
 | Menu（规划） | 独立 snapshot + action 版本；结构待实现时确定 | 有界树深/node/字符串/payload；opaque item ID + generation |
 
 协议变更必须：提升相应 version、保留旧端可诊断失败、更新 `_Static_assert`、增加 malformed-length/overflow 单测。不能只修改发送端和接收端之一。
 
-### 8. 场景恢复与失效处理
+### 9. 场景恢复与失效处理
 
 - `NSUserActivity` 保存 mode、window ID、PID、最小尺寸、resizable、density。
 - 恢复后立即重新请求窗口目录；目录中的实时 PID/约束覆盖持久化快照。
@@ -351,8 +388,9 @@ NSMainMenu
 - surface 序号必须单调；旧 stream/window 的迟到帧释放但不呈现。
 - 前后台切换、旋转和台前调度档位变化都必须使未执行的 resize 防抖任务失效。
 - Scene 失焦、恢复、目标 PID/window 改变或尺寸变化时收起触屏菜单；持久化层不保存展开菜单、item ID 或旧 generation。
+- 全屏 Scene 失焦、后台、旋转或退出全屏时取消三指候选和 HUD；不重放未确认的桌面命令。
 
-### 9. 文件与模块所有权
+### 10. 文件与模块所有权
 
 为避免后续多个 agent 同时改变同一不变量，按下表分工。一次集成周期内，同一行只指定一个 owner；其他 agent 通过协议或测试提交建议。
 
@@ -365,12 +403,13 @@ NSMainMenu
 | Input owner | `macwsinputd/` | 记录校验、PID/window 路由、CGEvent/AppInput 分流 |
 | Interop owner | `macwsinteropd/`、`MacWSInteropClient.*` | 剪贴板、文件暂存、权限、去重 |
 | Menu owner（规划） | 新 `macws_menu_protocol.h`、AppInputBridge 菜单端、Host 菜单视图 | 快照上限、generation、精确窗口、两阶段布局和动作重验证 |
+| Desktop owner（规划） | 新 `macws_desktop_protocol.h`、系统控制服务、Host 三指识别器 | capability、一次执行、全屏门控、系统后端证据和结果回执 |
 | Bootstrap owner | `layout/usr/macOS/`、根 Makefile | launchd 顺序、清理、签名、打包 |
 | Evidence owner | `misc/`、`docs/evidence/` | probe、基准、日志索引、结果判定 |
 
 建议集成顺序：协议与纯函数 → producer/AppKit → input/interop → Host → bootstrap → 设备证据。上游协议未合并前，下游 agent 不复制临时结构体到自己的模块。
 
-### 10. Patch 与证据纪律
+### 11. Patch 与证据纪律
 
 - 不能用 NOP、强制条件跳转、always-YES hook、全局 assert bypass、零 buffer stub 作为正式修复。
 - 若为了定位临时绕过，必须标为 `DIAGNOSTIC`，默认关闭，并在同一问题记录中写出尚未恢复的 invariant。
@@ -415,6 +454,7 @@ NSMainMenu
 - 四个前台 Scene 在台前调度下持续稳定。
 - AppKit 动态最小尺寸、固定尺寸窗口和 density resize 的实际行为。
 - 缩放后的四角点击、拖动、滚动、软键盘和妙控键盘输入一致性。
+- 全屏屏幕三指候选、桌面命令 capability/result，以及外接妙控板三指是否被 iPadOS 截获的输入日志。
 - pboard 通知、rootfs 权限、安全作用域 URL、iPad 拖入/拖出。
 - 菜单栏 content-shape 和全屏工作区的焦点切换。
 - Scene 顶部紧凑菜单、触摸展开、精确 NSWindow 激活、generation 失效和原动作执行。
@@ -478,7 +518,18 @@ git diff --check
 - 四个 Scene 同时前台反复开关菜单 30 分钟：无跨 PID 动作、无快照泄漏、无主线程卡死；点击到本地展开动画应在一帧内开始，子树响应 p95 目标不高于 100 ms。
 - `NSMenuItem.view`、Services 等未支持项目必须明确导向全屏菜单栏，不能静默丢失或错误执行。
 
-### 5. IOSurface 与四窗稳定性
+### 5. 全屏三指桌面手势矩阵
+
+- 只在全屏 `windowID == 0` 生效；相同三指动作在单窗 Scene、菜单、软键盘、控制面板和系统边缘区域不得发送 desktop command。
+- 屏幕虚拟触控板分别验证上、下、左、右、短距离、低速度、斜向和反向手势；每个有效 gesture sequence 只执行一次，无效手势不产生副作用。
+- 第三指加入单指候选、左键拖动和双指滚动的各个阶段，验证候选取消、mouse cancel 和滚动停止，不得留下卡住的按钮或额外 scroll。
+- Mission Control、App Exposé、previous/next Space、Show Desktop 分别保存 command、result 和可见桌面变化；没有可见变化的 success 回执判为失败。
+- 后端断线、命令超时、不支持 capability、全屏 Scene 中途失焦时，HUD 必须显示不可用/取消，不能静默降级或重复执行。
+- 外接 Magic Trackpad 在目标 iPadOS 16 上记录三指上/下/左/右是否到达 UIKit；未到达视为系统所有的预期结果，不以私有 hook 绕过。
+- Control + 双指替代入口验证四个方向、修饰键抬起和普通双指滚动；没有 Control 时不得触发桌面命令。
+- VoiceOver/AssistiveTouch 开启时重新验证或自动禁用冲突映射，不能抢占辅助功能手势。
+
+### 6. IOSurface 与四窗稳定性
 
 1. 一个 60 fps 动态窗口连续 10 分钟；日志中不得出现 mmap upload，outstanding lease 永远不超过 3。
 2. 四个不同 macOS 窗口同时前台，持续 resize、重叠、旋转、后台/前台 30 分钟。
@@ -486,7 +537,7 @@ git diff --check
 4. 故意让 Host 慢消费：producer 只增加 drop，不阻塞 WindowServer、不无限分配。
 5. 停止 macwsdisplayd：Host 明确显示回退/断开状态；VNC 保留为诊断入口。
 
-### 6. 性能产品门槛
+### 7. 性能产品门槛
 
 以下是验收目标，不是当前实测结论：
 
@@ -500,7 +551,7 @@ git diff --check
 
 所有时延都从共享 Mach clock 的 capture、XPC receipt、Metal submit/completion 和 input sequence 计算。无法关联到同一 sequence 的样本不得混入结果。
 
-### 7. 互操作验收
+### 8. 互操作验收
 
 - 双向文本：空串、中文、emoji、多行、8 MiB 边界。
 - PNG/JPEG：透明通道、大图、重复内容、方向 metadata。
@@ -532,6 +583,7 @@ git diff --check
 ### M3：妙控键盘与四窗
 
 - 键鼠高密度、指针、键盘、滚动、快捷键通过。
+- 全屏屏幕三指桌面命令与外接妙控板修饰键替代入口通过；外接原生三指能力按设备证据启用。
 - 四个 Scene 达到稳定性和性能门槛。
 
 ### M4：互操作与菜单
