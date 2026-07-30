@@ -68,6 +68,7 @@ PBS_LABEL=com.macwsguide.pbs
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
 VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
+VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
 CHROME150_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist
 CHROME150_LABEL=UIKitApplication:com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
@@ -193,6 +194,7 @@ WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 WD_TRIP="$LOGDIR/macws_safety_trip"
 WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
 WD_READY="$LOGDIR/macos_gui_watchdog.ready"
+WD_THERMAL_SNAPSHOT="$LOGDIR/macos_gui_thermal_snapshot"
 RECOVERED_WS_PID=""
 RECOVERY_EXTRA_RESTARTS=0
 
@@ -321,6 +323,12 @@ thermal_snapshot() {
         *) return 1 ;;
     esac
     return 0
+}
+
+record_thermal_snapshot() {
+    local payload="$1" snapshot_tmp="${WD_THERMAL_SNAPSHOT}.$$"
+    printf 'sampled-at=%s %s\n' "$(date +%s)" "$payload" > "$snapshot_tmp"
+    mv "$snapshot_tmp" "$WD_THERMAL_SNAPSHOT"
 }
 
 # A GUI client cannot reuse its WindowServer connection after that server dies.
@@ -464,12 +472,14 @@ run_watchdog() {
     # telemetry is logged but does not block work: thermal intervention is
     # deliberately limited to an explicitly observed `critical` state.
     if thermal_snapshot; then
+        record_thermal_snapshot "$THERMAL_LINE"
         log "watchdog: initial thermal sample: $THERMAL_LINE"
         if [ "$THERMAL_STATE" = critical ]; then
             trip_watchdog "启动时 iPadOS 温度状态为 critical，已拒绝启动 macOS GUI"
             return 0
         fi
     else
+        record_thermal_snapshot "unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'"
         log "watchdog: WARNING: initial thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; continuing because only an observed critical state may intervene"
     fi
     echo "$$" > "$WD_READY"
@@ -480,12 +490,14 @@ run_watchdog() {
         if [ "$now" -ge "$next_thermal" ]; then
             next_thermal=$((now + WD_THERMAL_POLL))
             if thermal_snapshot; then
+                record_thermal_snapshot "$THERMAL_LINE"
                 log "watchdog: thermal sample: $THERMAL_LINE"
                 if [ "$THERMAL_STATE" = critical ]; then
                     trip_watchdog "iPadOS 温度状态达到 critical，已停止 macOS GUI"
                     return 0
                 fi
             else
+                record_thermal_snapshot "unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'"
                 log "watchdog: WARNING: thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; no intervention without an observed critical state"
             fi
         fi
@@ -553,26 +565,49 @@ chroot_works() {
     esac
 }
 
-# Self-heal the most common post-reboot failure: the trustcache is volatile
-# (code signatures persist across reboots, the trustcache does NOT), so after a
-# reboot AMFI SIGKILLs every chroot process (exit 137) until postinst.sh
-# re-registers all CDHashes. Detect that and run postinst.sh automatically.
+# The executable signature persists across a reboot, but Dopamine's dynamic
+# trustcache does not.  Checking only /bin/bash is insufficient for a GUI app:
+# runtime-confirmed after the 2026-07-30 reboot, bash and VS Code's main
+# executable ran while dyld rejected Electron Framework before libmachook or
+# autosignd could execute.  Use that early dependency as a second sentinel.
+vscode_bundle_trusted() {
+    local hash=""
+
+    # VS Code is optional.  Its absence must not block the generic GUI stack.
+    [ -e "$VSCODE_TRUST_SENTINEL" ] || return 0
+    hash=$(/var/jb/usr/bin/ldid -arch arm64 -h "$VSCODE_TRUST_SENTINEL" 2>/dev/null |
+        /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
+    [ -n "$hash" ] || return 1
+    /var/jb/usr/bin/jbctl trustcache info 2>/dev/null |
+        /var/jb/usr/bin/grep -Fqi "$hash"
+}
+
+# Self-heal both post-reboot failure classes before starting WindowServer.
+# One postinst pass restores the base chroot plus every persistent executable
+# signature in VS Code's nested frameworks; both witnesses must pass afterward.
 ensure_chroot_works() {
+    local chroot_ok=0 vscode_ok=0
+
     log "Checking the macOS chroot is runnable..."
-    if chroot_works; then
-        log "chroot OK."
+    chroot_works && chroot_ok=1
+    vscode_bundle_trusted && vscode_ok=1
+    if [ "$chroot_ok" -eq 1 ] && [ "$vscode_ok" -eq 1 ]; then
+        log "chroot and VS Code trust sentinels OK."
         return 0
     fi
-    log "chroot not runnable (trustcache was likely wiped by a reboot)."
+    [ "$chroot_ok" -eq 1 ] ||
+        log "chroot not runnable (base trustcache is incomplete)."
+    [ "$vscode_ok" -eq 1 ] ||
+        log "VS Code Electron Framework is not trusted (application trustcache is incomplete)."
     if [ -f "$POSTINST" ]; then
         log "Re-registering trustcaches via postinst.sh (~1 min)..."
         bash "$POSTINST" > "$LOGDIR/postinst.log" 2>&1
-        if chroot_works; then
-            log "chroot OK after postinst."
+        if chroot_works && vscode_bundle_trusted; then
+            log "chroot and VS Code trust sentinels OK after postinst."
             return 0
         fi
     fi
-    log "ERROR: macOS chroot still not runnable after postinst — aborting."
+    log "ERROR: chroot or VS Code trust sentinel still fails after postinst — aborting."
     log "       Inspect: $LOGDIR/postinst.log  and  sudo dmesg | grep AMFI"
     return 1
 }
@@ -1138,10 +1173,10 @@ stop_all() {
 
 status() {
     echo "=== macOS GUI status ==="
-    if thermal_snapshot; then
-        echo "thermal   : $THERMAL_LINE"
+    if [ -f "$WD_THERMAL_SNAPSHOT" ]; then
+        echo "thermal   : $(awk 'NR == 1 { print; exit }' "$WD_THERMAL_SNAPSHOT" 2>/dev/null)"
     else
-        echo "thermal   : unavailable (helper=$THERMAL_HELPER rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}')"
+        echo "thermal   : not sampled (watchdog is stopped or has not armed yet)"
     fi
     if [ -e "$FLAG" ]; then
         echo "mode flag : present  -> COEXISTENCE (panel = iOS, macOS = VNC)"
@@ -1418,7 +1453,7 @@ wait_for_initial_vnc_capture_if_requested() {
 start_watchdog() {
     local child="" ready_owner="" waited=0
     stop_watchdogs
-    rm -f "$WD_LOG" "$WD_TRIP" "$WD_READY"
+    rm -f "$WD_LOG" "$WD_TRIP" "$WD_READY" "$WD_THERMAL_SNAPSHOT"
     # Re-exec with the exact session intent.  The recovery path needs these
     # flags so a WS restart does not unexpectedly launch a VNC/Terminal job the
     # user disabled, and so it knows whether to request a fresh shared frame.

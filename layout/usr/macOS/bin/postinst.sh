@@ -145,6 +145,34 @@ add_all_trustcache() {
     add_x86_64_trustcache "$path"
 }
 
+# Re-register every already-signed executable Mach-O in an application bundle.
+#
+# Dynamic jailbreak trustcaches are lost across a device reboot, while the
+# ad-hoc signatures stored in the macOS rootfs persist.  launchdchrootexec can
+# repair the process it directly execs, but dyld validates dependent
+# frameworks before libmachook/autosignd can run.  Runtime evidence from the
+# first VS Code launch after the 2026-07-30 reboot showed exactly that split:
+# Contents/MacOS/Code was trusted, then dyld rejected Electron Framework and,
+# after that hash was added, Squirrel.framework.  Restoring the 44 signed
+# executable files in the bundle made the unchanged VS Code 1.130 build reach
+# CDP in four seconds.
+#
+# Do not call sign_and_trustcache here.  Re-signing a nested framework changes
+# its CDHash and can invalidate the bundle's existing nested-code relationship.
+# Reading and re-registering the persistent signatures is sufficient and keeps
+# the installed application byte-for-byte unchanged.
+trust_existing_app_bundle() {
+    local bundle="$1"
+    local name="$2"
+    [ -d "$bundle" ] || return 0
+
+    echo "[INFO] Restoring signed Mach-O trustcache entries for $name..."
+    find "$bundle/Contents" -type f -perm -111 -print0 2>/dev/null |
+        while IFS= read -r -d '' path; do
+            add_all_trustcache "$path"
+        done
+}
+
 # The iOS-native control daemon is the reboot-safe entry point used by the
 # MacWSHost app.  Trust it here, but never unload it from this script: postinst
 # may itself be running as a request served by macwshostd.
@@ -276,6 +304,13 @@ add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fra
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/.jbroot/usr/lib/libroot.dylib
+# VS Code's main executable is not enough after a reboot: dyld must admit its
+# Electron/Squirrel/Mantle/ReactiveObjC frameworks before any injected repair
+# code can execute.  Keep this in postinst so macos_gui.sh's existing
+# post-reboot self-heal restores the complete benchmark application too.
+trust_existing_app_bundle \
+    "/var/mnt/rootfs/Applications/Visual Studio Code.app" \
+    "Visual Studio Code"
 # vnc server
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent

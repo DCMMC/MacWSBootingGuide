@@ -58,6 +58,15 @@ session, then samples once every 300 seconds. Only an explicitly observed
 `critical` iPadOS thermal state stops or refuses the GUI. `nominal`, `fair`,
 `serious`, numeric temperatures and unreadable samples are log-only.
 `--no-watchdog` is rejected; the monitor itself is not a production switch.
+`macos_gui.sh status` reads the watchdog's timestamped cached snapshot and does
+not perform an extra sensor read.
+
+At startup, production mode validates two independent trustcache witnesses:
+the base chroot shell and VS Code's early-loaded Electron Framework. If either
+is missing after a reboot, it runs `postinst.sh` once and requires both checks
+to pass before WindowServer starts. `postinst.sh` re-registers the persistent
+per-architecture signatures of executable files inside the existing VS Code
+bundle; it deliberately does not re-sign nested frameworks.
 
 MacBook reference measurements use the matching guarded entry point:
 
