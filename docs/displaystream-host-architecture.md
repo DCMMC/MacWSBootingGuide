@@ -23,7 +23,7 @@
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
 | 缩放与精确操控 | 双指双击在 1× 与用户配置的 1.5×/2× 间切换；放大后默认移动视口，输入坐标同步映射到裁剪后的源纹理 | 已实现并有数学单测；原生 magnify 待验证 |
 | 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 已实现；设备兼容性待验证 |
-| 菜单栏 | 第一阶段保留原生 macOS 菜单语义，通过专用全屏工作区访问；后续增加触屏菜单面板 | 全屏入口已实现；语义面板待实现 |
+| Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 全屏入口已实现；Scene 语义菜单待实现 |
 | 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
 | 性能与稳定性 | 每客户端最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 已实现；性能目标待实测 |
 
@@ -33,6 +33,7 @@
 macOS 应用进程
   ├─ NSWindow / NSApplication
   ├─ AppInputBridge：真实最小尺寸、原生重排、应用内输入
+  ├─ 菜单桥：NSMainMenu 语义快照、generation 校验、原动作执行（规划）
   └─ metrics.<pid>.bin（低频控制面）
              │
              ▼
@@ -46,7 +47,7 @@ MacWSHost（iPadOS）
   ├─ 一个 macOS 窗口对应一个 UIWindowScene
   ├─ IOSurface → MTLTexture → MTKView
   ├─ 无黑边视口、缩放、遮罩、密度选择
-  └─ 触摸 / 妙控键盘 / 拖放 / 剪贴板
+  └─ Scene 顶部语义菜单 / 触摸 / 妙控键盘 / 拖放 / 剪贴板
              │ 52-byte 有版本输入记录
              ▼
 macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
@@ -151,22 +152,42 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 
 ### 7. 菜单栏
 
-菜单栏不能简单复制一张位图贴在每个窗口顶部，否则会产生错误焦点、错误启用状态和不可访问的子菜单。
+菜单栏放在每个 iPadOS Scene 内容区的 safe area 顶部，不替换、覆盖或依赖台前调度自己的系统标题栏。它不是从 macOS 全屏画面裁剪出来的位图，而是目标应用菜单语义的 UIKit 表达；否则会产生错误焦点、错误 enabled/state、模糊文字和不可访问的子菜单。
 
-第一阶段：
+**两阶段触屏布局**
 
-- 每个单窗 Scene 的控制面板提供“菜单栏 / 全屏工作区”。
-- 全屏工作区呈现真实 macOS 全局菜单栏，所有菜单仍由目标 AppKit 进程处理。
-- 不声称把 macOS 原生 menu bar 合成进每个 UIKit Scene。
+- 紧凑显示态固定占用约 26–30 pt，字体约 12–13 pt；目标只是清晰可读，不要求把每个标题画成常驻大按钮。Metal 内容从紧凑栏下方开始，避免覆盖 macOS 标题栏。
+- 视觉标题可以紧凑，但命中区域按相邻标题中线分割并覆盖标题间空白。用户点击“文件”附近即可选中“文件”，不必精确点击字形。
+- 第一次点击只选择顶层分类并展开，绝不执行菜单命令。菜单栏以点击标题为锚点，在约 150 ms 内切换为稀疏触摸态。
+- 展开后顶栏约 48–52 pt，菜单项行高约 44–48 pt；文字、勾选、快捷键和层级标记同步使用触屏尺寸。
+- 第二次点击才执行菜单项。这样即使第一次命中邻近标题，也只有分类展开，不会误触破坏性命令。
+- 展开层覆盖在 Metal 内容上，不改变 Scene 的稳定内容尺寸、不触发 macOS 窗口 resize，也不改变当前 1×/放大视口。
+- 点击画面空白、再次点击当前标题、按 `Esc`、Scene 失焦/后台化、旋转或台前调度尺寸变化时收起。展开状态不跨 Scene 恢复。
+- 在展开态横向滑过其他标题可直接切换分类。子菜单在同一面板内推进并提供返回/面包屑，不采用容易越出 Scene 的桌面横向级联菜单。
+- 菜单内容超过可用高度时只让菜单面板内部滚动，最大高度受 Scene safe area 约束；不能扩大 iPadOS 窗口或裁剪到相邻 Scene。
 
-第二阶段建议实现“触屏菜单面板”：
+**窄窗口和遮罩状态**
 
-- AppInputBridge 在应用主线程只读导出当前 `NSMainMenu` 的标题、层级、enabled、state 和快捷键。
-- iPadOS 用大触控目标呈现顶层菜单和列表；选择项目后，把稳定的菜单路径/标识发回原 owner PID，由 AppKit 主线程执行原菜单项动作。
-- 激活前再次核对 owner PID、当前菜单 generation 和 enabled，避免对过期菜单执行动作。
-- 菜单弹出层不受“右键菜单越界无需支持”的要求约束；它是 iPadOS 原生面板，不依赖窗口纹理越界捕获。
+- 台前调度窗口过窄时降级为“应用名 / 文件 / 编辑 / 更多…”，`更多…` 打开完整分类列表；不能把不可见标题留在屏幕外。
+- macOS 内容因最小尺寸不足而显示整窗遮罩时，紧凑菜单栏和 Host 控制入口仍保持可用，允许用户执行关闭窗口、偏好设置等操作。
+- 语义菜单弹出层不受“右键菜单超出单窗 capture 范围无需支持”的限制，因为它是 Scene 内 UIKit 视图，不依赖窗口纹理捕获。
 
-这一语义菜单桥目前尚未实现，也没有运行证据，必须作为独立里程碑开发。
+**妙控键盘与指针**
+
+- 键鼠模式保持紧凑菜单栏；指针点击直接打开普通密度菜单，不进入触屏放大动画。
+- hover 可在顶层分类之间切换；方向键、Enter、Esc 和 macOS 原快捷键必须继续工作。
+- 输入模式由 Host 当前直接触控/触控板设置决定，不因一次偶然 pointer event 改变菜单布局，避免界面来回跳动。
+
+**语义与动作一致性**
+
+- 第一次点击时先激活该 Scene 对应的精确 owner PID 和 `NSWindow`，再由 AppInputBridge 在应用主线程读取最新 `NSMainMenu`。
+- 快照包含标题、层级、enabled、state、分隔线、快捷键和本 generation 内有效的 opaque item ID；不能把 ObjC 指针或 selector 当跨进程稳定标识。
+- 选择项目后发送 owner PID、window ID、generation 和 item ID。目标应用必须在主线程重新定位菜单项、再次验证 enabled/state，然后通过 AppKit 原菜单动作路径执行。
+- generation 过期、窗口不再是目标、菜单项消失或 disabled 时拒绝执行并刷新面板，不能对旧快照“尽力执行”。
+- 紧凑态只缓存低频顶层标题；第一次点击立即播放本地展开动画，同时请求被选分类的最新子树。这样不需要持续高频同步整棵 `NSMainMenu`，也能用动画覆盖一次控制面往返。
+- 第一阶段支持普通项目、分隔线、多级子菜单、enabled、勾选/混合状态和快捷键。`NSMenuItem.view`、Services 等复杂内容显示“在全屏菜单栏中打开”，不能伪装为已兼容。
+
+全屏工作区继续保留真实 macOS 全局菜单栏，作为语义桥未就绪、复杂菜单和调试时的兼容入口。Scene 语义菜单目前尚未实现，也没有设备运行证据；上述尺寸和动画时间是产品目标，必须在 iPad 上调优后才能标记稳定。
 
 ### 8. 剪贴板、图片、文件与拖放
 
@@ -291,7 +312,26 @@ Metal 顶点始终覆盖 `[-1, 1] × [-1, 1]`，纹理坐标使用 `visibleSourc
 - AppInputBridge 每次事件都根据目标窗口当前 AppKit frame 做转换，不能缓存一个跨 resize 的旧 origin。
 - 控制记录、键盘、滚动和指针都先验证 magic/version/finite/范围/owner PID；失败需有可归因日志。
 
-### 6. 协议边界
+### 6. 菜单快照与动作协议（规划）
+
+菜单是低频、可变长控制面，不能塞进 52-byte 输入热路径，也不能为方便而复制未定稿结构体到 Host 和 AppInputBridge。建议单独定义版本化协议：
+
+```text
+NSMainMenu
+  → bounded snapshot(header + nodes + UTF-8 string table)
+  → MacWSHost 当前 Scene
+  → action(ownerPID, windowID, generation, itemID)
+  → AppKit 主线程重新验证并执行
+```
+
+- snapshot header 至少包含 magic、version、总长度、owner PID、window ID、generation、node count 和 string-table length。
+- 每个 node 至少包含 opaque item ID、parent ID、同级顺序、flags、state、title range 和 shortcut range；所有 offset/length 必须做溢出与 UTF-8 边界校验。
+- 对 node 数、树深、单字符串、总 payload 和单进程缓存设置明确上限；循环 parent、重复 item ID、越界字符串和未知必需 flag 全部拒绝。
+- action 使用独立固定长度记录，只表达精确身份和选择，不传 selector、target 地址或任意对象归档。
+- Host 只在本 Scene 前台且 owner PID/window 与实时目录一致时接受快照；目标退出、PID 复用、窗口关闭或 generation 回退都使缓存立即失效。
+- 展开动画必须本地立即开始；菜单子树响应 p95 目标不高于 100 ms。超时显示可取消的加载态并保留全屏菜单入口，不能冻结渲染或输入线程。
+
+### 7. 协议边界
 
 | 协议 | 版本与固定结构 | 重要上限 |
 |---|---|---|
@@ -299,18 +339,20 @@ Metal 顶点始终覆盖 `[-1, 1] × [-1, 1]`，纹理坐标使用 `visibleSourc
 | Metrics | header 24 B；entry 16 B | 256 entry；原子 sidecar |
 | Input | v3 record 52 B | 精确 PID/window；所有 float finite |
 | Interop | item descriptor 56 B | 8 MiB inline；32 items；path 4096 B |
+| Menu（规划） | 独立 snapshot + action 版本；结构待实现时确定 | 有界树深/node/字符串/payload；opaque item ID + generation |
 
 协议变更必须：提升相应 version、保留旧端可诊断失败、更新 `_Static_assert`、增加 malformed-length/overflow 单测。不能只修改发送端和接收端之一。
 
-### 7. 场景恢复与失效处理
+### 8. 场景恢复与失效处理
 
 - `NSUserActivity` 保存 mode、window ID、PID、最小尺寸、resizable、density。
 - 恢复后立即重新请求窗口目录；目录中的实时 PID/约束覆盖持久化快照。
 - 目标窗口关闭、PID 改变或 AppInput socket 消失时，Scene 显示“目标不可用”，停止输入并允许重新选择。
 - surface 序号必须单调；旧 stream/window 的迟到帧释放但不呈现。
 - 前后台切换、旋转和台前调度档位变化都必须使未执行的 resize 防抖任务失效。
+- Scene 失焦、恢复、目标 PID/window 改变或尺寸变化时收起触屏菜单；持久化层不保存展开菜单、item ID 或旧 generation。
 
-### 8. 文件与模块所有权
+### 9. 文件与模块所有权
 
 为避免后续多个 agent 同时改变同一不变量，按下表分工。一次集成周期内，同一行只指定一个 owner；其他 agent 通过协议或测试提交建议。
 
@@ -322,12 +364,13 @@ Metal 顶点始终覆盖 `[-1, 1] × [-1, 1]`，纹理坐标使用 `visibleSourc
 | Host owner | `MacWSHost/` | Scene 生命周期、Metal、遮罩、缩放、密度和 UIKit 交互 |
 | Input owner | `macwsinputd/` | 记录校验、PID/window 路由、CGEvent/AppInput 分流 |
 | Interop owner | `macwsinteropd/`、`MacWSInteropClient.*` | 剪贴板、文件暂存、权限、去重 |
+| Menu owner（规划） | 新 `macws_menu_protocol.h`、AppInputBridge 菜单端、Host 菜单视图 | 快照上限、generation、精确窗口、两阶段布局和动作重验证 |
 | Bootstrap owner | `layout/usr/macOS/`、根 Makefile | launchd 顺序、清理、签名、打包 |
 | Evidence owner | `misc/`、`docs/evidence/` | probe、基准、日志索引、结果判定 |
 
 建议集成顺序：协议与纯函数 → producer/AppKit → input/interop → Host → bootstrap → 设备证据。上游协议未合并前，下游 agent 不复制临时结构体到自己的模块。
 
-### 9. Patch 与证据纪律
+### 10. Patch 与证据纪律
 
 - 不能用 NOP、强制条件跳转、always-YES hook、全局 assert bypass、零 buffer stub 作为正式修复。
 - 若为了定位临时绕过，必须标为 `DIAGNOSTIC`，默认关闭，并在同一问题记录中写出尚未恢复的 invariant。
@@ -374,6 +417,7 @@ Metal 顶点始终覆盖 `[-1, 1] × [-1, 1]`，纹理坐标使用 `visibleSourc
 - 缩放后的四角点击、拖动、滚动、软键盘和妙控键盘输入一致性。
 - pboard 通知、rootfs 权限、安全作用域 URL、iPad 拖入/拖出。
 - 菜单栏 content-shape 和全屏工作区的焦点切换。
+- Scene 顶部紧凑菜单、触摸展开、精确 NSWindow 激活、generation 失效和原动作执行。
 
 ## 五、测试与验收方案
 
@@ -420,7 +464,21 @@ git diff --check
 - Photos/Safari 原生 magnify 单列为待验证项；在取得 macOS 13.4 gesture event 的 RE 与运行证据前不得判为通过。
 - 妙控键盘 pointer 在缩放视口边缘触发跟随后，hover 与 click 仍落在同一控件。
 
-### 4. IOSurface 与四窗稳定性
+### 4. Scene 顶部菜单栏矩阵
+
+- 紧凑态文字在所有台前调度档位清晰可读，固定栏高不因菜单内容变化而抖动，也不覆盖 macOS 标题栏。
+- 点击每个标题的字形、两侧空白和相邻标题中线两边，命中必须确定且可重复；第一次点击只能展开分类，不能执行任何菜单项。
+- 展开态尺寸达到触摸目标，第二次点击准确执行；展开/收起不发送 configure-window、不改变纹理视口和输入映射。
+- 展开时在所有顶层标题间连续滑动，内容、选中态和 generation 保持同一个精确 owner PID/window，不能串到其他前台 Scene。
+- disabled、勾选、混合状态、快捷键、分隔线和三级子菜单与目标 AppKit 菜单一致；过期 generation 和已关闭窗口必须拒绝动作并刷新。
+- Terminal、Finder/系统应用和 Electron 各验证一次动态 responder 菜单；切换目标窗口后 enabled/state 在下一次展开时更新。
+- 极窄窗口只显示受控的顶层子集和“更多…”，长菜单内部滚动；子菜单、中文长标题和超大字体不能越出 safe area。
+- 内容过小遮罩出现时菜单仍能执行关闭/偏好设置；Scene 失焦、后台、旋转和 resize 必须自动收起。
+- 妙控键盘下验证点击、hover、方向键、Enter、Esc 和快捷键；不能触发触屏稀疏布局。
+- 四个 Scene 同时前台反复开关菜单 30 分钟：无跨 PID 动作、无快照泄漏、无主线程卡死；点击到本地展开动画应在一帧内开始，子树响应 p95 目标不高于 100 ms。
+- `NSMenuItem.view`、Services 等未支持项目必须明确导向全屏菜单栏，不能静默丢失或错误执行。
+
+### 5. IOSurface 与四窗稳定性
 
 1. 一个 60 fps 动态窗口连续 10 分钟；日志中不得出现 mmap upload，outstanding lease 永远不超过 3。
 2. 四个不同 macOS 窗口同时前台，持续 resize、重叠、旋转、后台/前台 30 分钟。
@@ -428,7 +486,7 @@ git diff --check
 4. 故意让 Host 慢消费：producer 只增加 drop，不阻塞 WindowServer、不无限分配。
 5. 停止 macwsdisplayd：Host 明确显示回退/断开状态；VNC 保留为诊断入口。
 
-### 5. 性能产品门槛
+### 6. 性能产品门槛
 
 以下是验收目标，不是当前实测结论：
 
@@ -442,7 +500,7 @@ git diff --check
 
 所有时延都从共享 Mach clock 的 capture、XPC receipt、Metal submit/completion 和 input sequence 计算。无法关联到同一 sequence 的样本不得混入结果。
 
-### 6. 互操作验收
+### 7. 互操作验收
 
 - 双向文本：空串、中文、emoji、多行、8 MiB 边界。
 - PNG/JPEG：透明通道、大图、重复内容、方向 metadata。
@@ -479,7 +537,8 @@ git diff --check
 ### M4：互操作与菜单
 
 - 文本、图片、文件、拖放通过。
-- 先验证全屏真实菜单栏；再独立开发带 generation 的触屏语义菜单面板。
+- 保留全屏真实菜单栏兼容入口；实现带 generation 的 Scene 顶部语义菜单桥。
+- 触屏“紧凑可读 → 首次点击展开 → 第二次点击执行”和妙控键盘紧凑逻辑分别通过菜单栏矩阵。
 
 ### M5：发布候选
 
