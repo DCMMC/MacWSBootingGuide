@@ -4,7 +4,7 @@
 <dict>
     <!-- Launch job for the UUID-locked arm64 Visual Studio Code build. -->
     <key>Label</key>
-    <string>com.macwsguide.vscode</string>
+    <string>UIKitApplication:com.macwsguide.vscode</string>
     <key>ProgramArguments</key>
     <array>
         <string>/var/jb/usr/macOS/bin/launchdchrootexec</string>

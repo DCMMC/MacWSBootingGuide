@@ -1,0 +1,26 @@
+{
+  "timestamp": "2026-07-30T02:00:16.588Z",
+  "target": "http://127.0.0.1:19222",
+  "setup": {
+    "ready": true,
+    "url": "https://webglsamples.org/aquarium/aquarium.html?numFish=60000&canvasWidth=1024&canvasHeight=1024&fitWindow=false",
+    "canvas": [
+      1024,
+      1024
+    ],
+    "fish": 60000,
+    "modelFish": 60000,
+    "context": "WebGL2RenderingContext",
+    "contextLost": false
+  },
+  "callbacks": 484,
+  "elapsedSeconds": 14.98369999998808,
+  "callbackFps": 32.30176792116667,
+  "intervalMilliseconds": {
+    "minimum": 24,
+    "p50": 29.30000001192093,
+    "p95": 32.90000003576279,
+    "maximum": 263
+  },
+  "contextLost": false
+}

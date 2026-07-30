@@ -54,15 +54,16 @@ TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
 INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
-VNC_LABEL=com.macwsguide.osxvnc
-TERM_LABEL=com.macwsguide.terminal
+WINDOWSERVER_LABEL=UIKitApplication:com.macwsguide.windowserver
+VNC_LABEL=UIKitApplication:com.macwsguide.osxvnc
+TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
 PBS_LABEL=com.macwsguide.pbs
-INPUT_LABEL=com.macwsguide.input
+INPUT_LABEL=UIKitApplication:com.macwsguide.input
 VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
-VSCODE_LABEL=com.macwsguide.vscode
+VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 CHROME150_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist
-CHROME150_LABEL=com.macwsguide.chrome150
+CHROME150_LABEL=UIKitApplication:com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
 EXPERIMENTAL_WRAPPED_KCMD="$ROOTFS/private/tmp/macws_kcmd_wrapped_fix"
 EXPERIMENTAL_COMMAND_ERROR="$ROOTFS/private/tmp/macws_command_error_diag"
@@ -222,7 +223,7 @@ proc_running() {
 
 # launchd's current PID for WindowServer (empty / "-" when not running).
 ws_pid() {
-    launchctl list com.apple.WindowServer 2>/dev/null \
+    launchctl list "$WINDOWSERVER_LABEL" 2>/dev/null \
         | awk -F'= ' '/"PID"/{gsub(/[ ";]/,"",$2); print $2}'
 }
 
@@ -435,7 +436,7 @@ run_watchdog() {
         # Exit only when the GUI was actually torn down (the WindowServer launchd
         # job is unloaded). A momentarily-absent PROCESS just means launchd is
         # relaunching it after a crash — keep guarding (and count it as a restart).
-        if ! launchctl list com.apple.WindowServer >/dev/null 2>&1; then
+        if ! launchctl list "$WINDOWSERVER_LABEL" >/dev/null 2>&1; then
             log "watchdog: WindowServer job unloaded (GUI stopped) — exiting."
             return 0
         fi
@@ -444,7 +445,7 @@ run_watchdog() {
             missing_samples=$((missing_samples + 1))
             if [ "$missing_samples" -eq 1 ] || [ "$missing_samples" -eq 3 ]; then
                 log "watchdog: WindowServer job is loaded but has no PID; requesting launchd start (sample=$missing_samples)"
-                launchctl start com.apple.WindowServer 2>/dev/null
+                launchctl start "$WINDOWSERVER_LABEL" 2>/dev/null
             fi
             if [ "$missing_samples" -ge 4 ]; then
                 trip_watchdog "WindowServer 连续 $((missing_samples * WD_POLL)) 秒没有进程，已自动停止 macOS GUI"
@@ -546,6 +547,8 @@ write_plists() {
 <dict>
     <key>Label</key>
     <string>${VNC_LABEL}</string>
+    <key>POSIXSpawnType</key>
+    <string>Interactive</string>
     <key>ProgramArguments</key>
     <array>
         <string>${CHROOTEXEC}</string>
@@ -703,6 +706,8 @@ PLIST
 <dict>
     <key>Label</key>
     <string>${TERM_LABEL}</string>
+    <key>POSIXSpawnType</key>
+    <string>Interactive</string>
     <key>ProgramArguments</key>
     <array>
         <string>${CHROOTEXEC}</string>

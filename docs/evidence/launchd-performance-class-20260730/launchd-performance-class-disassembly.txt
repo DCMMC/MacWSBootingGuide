@@ -1,0 +1,72 @@
+Source: /sbin/launchd from the actual iPadOS 16.3 device
+Command: ipsw macho disass /private/tmp/macws-launchd-ios16
+
+EnergyEfficiencyMode value parser:
+
+10000fc44 pacibsp
+10000fc48 sub sp, sp, #0x40
+10000fc4c stp x22, x21, [sp, #0x10]
+10000fc50 stp x20, x19, [sp, #0x20]
+10000fc54 stp x29, x30, [sp, #0x30]
+10000fc58 add x29, sp, #0x30
+10000fc5c mov x19, x3
+10000fc60 mov x20, x2
+10000fc64 mov x21, x1
+10000fc68 adr x1, #293124 ; literal pool for: "Efficient"
+10000fc6c nop
+10000fc70 mov x0, x2
+10000fc74 bl 0x100015b50
+10000fc78 cbz w0, 0x10000fc88
+10000fc7c mov w8, #0x1
+10000fc80 str x8, [x21, #0x3a8]
+10000fc84 b 0x10000fcb4
+10000fc88 adr x1, #293102 ; literal pool for: "UserInterface"
+10000fc8c nop
+10000fc90 mov x0, x20
+10000fc94 bl 0x100015b50
+10000fc98 tbnz w0, #0x0, 0x10000fcb4
+10000fc9c str x20, [sp]
+10000fca0 adr x2, #293092 ; literal pool for: "Unsupported value for EnergyEfficiencyMode: %s"
+
+Launchd job-class parser (relevant label branch):
+
+10000f330 adr x1, #278318 ; literal pool for: "Label"
+10000f334 nop
+10000f338 mov x0, x19
+10000f33c bl 0x100052584 ; _xpc_dictionary_get_string
+10000f340 adr x1, #296005 ; literal pool for: "lockdown."
+10000f344 nop
+10000f348 bl 0x100015a4c
+10000f34c cbnz w0, 0x10000f3c0
+10000f350 adr x1, #278286 ; literal pool for: "Label"
+10000f354 nop
+10000f358 mov x0, x19
+10000f35c bl 0x100052584 ; _xpc_dictionary_get_string
+10000f360 adr x1, #295983 ; literal pool for: "UIKitApplication:"
+10000f364 nop
+10000f368 bl 0x100015a4c
+10000f36c tbnz w0, #0x0, 0x10000f390
+10000f370 adr x1, #278254 ; literal pool for: "Label"
+10000f374 nop
+10000f378 mov x0, x19
+10000f37c bl 0x100052584 ; _xpc_dictionary_get_string
+10000f380 adr x1, #295969 ; literal pool for: "AlternateSystemApplication:"
+10000f384 nop
+10000f388 bl 0x100015a4c
+10000f38c cbz w0, 0x10000f3c0
+10000f390 adr x1, #277924 ; literal pool for: "SystemApp"
+10000f394 nop
+10000f398 mov x0, x20
+10000f39c bl 0x100015b10
+10000f3a0 adr x8, #405728
+10000f3a4 nop
+10000f3a8 adr x9, #405680
+10000f3ac nop
+10000f3b0 cmp w0, #0x0
+10000f3b4 csel x8, x8, x9, ne
+10000f3b8 ldr x20, [x8]
+10000f3bc b 0x10000f3c8
+
+The first function proves that "Efficient" sets the job configuration field
+at +0x3a8 to one while "UserInterface" leaves it clear. The second proves that
+the `UIKitApplication:` label prefix selects launchd's application job class.

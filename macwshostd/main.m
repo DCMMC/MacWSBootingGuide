@@ -45,6 +45,10 @@ static const char *const kExperimentalKCmd = "/var/mnt/rootfs/private/tmp/macws_
 static const char *const kExperimentalCompletion = "/var/mnt/rootfs/private/tmp/macws_cancel_completion";
 static const char *const kWindowServerLog = "/var/jb/var/mobile/WindowServer.err";
 static const char *const kSafetyTrip = "/var/jb/var/mobile/macws_safety_trip";
+static const char *const kWindowServerLabel =
+    "UIKitApplication:com.macwsguide.windowserver";
+static const char *const kInputLabel =
+    "UIKitApplication:com.macwsguide.input";
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
@@ -296,9 +300,9 @@ static NSString *ReadSmallTextFile(const char *path, NSUInteger limit) {
 
 static void AddStatus(xpc_object_t reply) {
     int wsPID = 0;
-    BOOL ws = JobHasPID("com.apple.WindowServer", &wsPID);
+    BOOL ws = JobHasPID(kWindowServerLabel, &wsPID);
     int inputPID = 0;
-    BOOL inputJob = JobHasPID("com.macwsguide.input", &inputPID);
+    BOOL inputJob = JobHasPID(kInputLabel, &inputPID);
     uint32_t width = 0, height = 0;
     uint64_t frameGeneration = 0;
     BOOL frame = ws && ReadFrame(&width, &height) &&
@@ -386,7 +390,7 @@ static BOOL WaitForGUIComponents(NSTimeInterval timeout, int *wsPIDOut) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
     while (deadline.timeIntervalSinceNow > 0) {
         int pid = 0;
-        if (JobHasPID("com.apple.WindowServer", &pid) &&
+        if (JobHasPID(kWindowServerLabel, &pid) &&
             IsSocket(kInputSocket)) {
             if (wsPIDOut) *wsPIDOut = pid;
             return YES;
@@ -463,7 +467,7 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
         return NO;
     }
     SetState(YES, @"启动 WindowServer…", @"");
-    const char *wsArgv[] = {kLaunchctl, "start", "com.apple.WindowServer", NULL};
+    const char *wsArgv[] = {kLaunchctl, "start", kWindowServerLabel, NULL};
     rc = RunCommand(wsArgv, YES);
     if (rc != 0) {
         *message = [NSString stringWithFormat:@"WindowServer 启动请求失败（退出码 %d）", rc];
@@ -572,7 +576,7 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         *message = [NSString stringWithFormat:@"应用不存在: %s", app->rootPath];
         return NO;
     }
-    if (!JobHasPID("com.apple.WindowServer", NULL)) {
+    if (!JobHasPID(kWindowServerLabel, NULL)) {
         *message = @"请先启动 macOS GUI";
         return NO;
     }
@@ -606,7 +610,7 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
     usleep(3000000);
     uint64_t generation = ArmCapture();
     int wsPID = 0;
-    if (generation == 0 || !JobHasPID("com.apple.WindowServer", &wsPID) ||
+    if (generation == 0 || !JobHasPID(kWindowServerLabel, &wsPID) ||
         !WaitForCapture(wsPID, generation, 60.0, NULL)) {
         *message = [NSString stringWithFormat:
             @"%s 已启动，但 WindowServer 未确认更新后的共享帧", identifier];
@@ -661,7 +665,7 @@ static void ServeRequest(xpc_object_t request) {
             ok = StopGUI(&message);
         } else if (strcmp(op, MACWS_CONTROL_OP_REPAIR) == 0) {
             SetState(YES, @"停止工作区并修复启动环境…", @"");
-            if (JobHasPID("com.apple.WindowServer", NULL)) {
+            if (JobHasPID(kWindowServerLabel, NULL)) {
                 NSString *stopMessage = nil;
                 if (!StopGUI(&stopMessage)) {
                     message = [NSString stringWithFormat:@"修复前无法安全停止工作区：%@",
@@ -688,7 +692,7 @@ static void ServeRequest(xpc_object_t request) {
             SetState(YES, @"请求刷新共享帧…", @"");
             int wsPID = 0;
             uint64_t generation = 0;
-            ok = JobHasPID("com.apple.WindowServer", &wsPID) &&
+            ok = JobHasPID(kWindowServerLabel, &wsPID) &&
                  TouchPath(kShareFlag) && (generation = ArmCapture()) != 0 &&
                  WaitForCapture(wsPID, generation, 60.0, NULL);
             message = ok ? @"共享帧已刷新并由 WindowServer 确认" :

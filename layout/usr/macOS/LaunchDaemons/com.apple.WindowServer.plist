@@ -16,7 +16,11 @@
 		<string>1</string>
 	</dict>
 	<key>Label</key>
-	<string>com.apple.WindowServer</string>
+	<!-- iOS launchd's Daemon jetsam class is EnergyEfficiencyMode=Efficient
+	     on this device and pins the whole WindowServer thread group to E cores.
+	     A UIKitApplication label selects launchd's non-efficient App class;
+	     the actual WindowServer bootstrap identity remains its MachServices. -->
+	<string>UIKitApplication:com.macwsguide.windowserver</string>
 	<key>MachServices</key>
 	<dict>
 		<key>com.apple.CARenderServer</key>

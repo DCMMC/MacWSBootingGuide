@@ -1,0 +1,17 @@
+[ {
+   "description": "",
+   "devtoolsFrontendUrl": "https://chrome-devtools-frontend.appspot.com/serve_rev/@bfe29217d60b6ee25ce4e4b2c0abcd6361ae6eb6/inspector.html?ws=127.0.0.1:19222/devtools/page/6B03A6863258608EFE8F758696E0AFD0",
+   "id": "6B03A6863258608EFE8F758696E0AFD0",
+   "title": "WebGL Aquarium",
+   "type": "page",
+   "url": "https://webglsamples.org/aquarium/aquarium.html?numFish=60000&canvasWidth=1024&canvasHeight=1024&fitWindow=false",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:19222/devtools/page/6B03A6863258608EFE8F758696E0AFD0"
+}, {
+   "description": "",
+   "devtoolsFrontendUrl": "https://chrome-devtools-frontend.appspot.com/serve_rev/@bfe29217d60b6ee25ce4e4b2c0abcd6361ae6eb6/inspector.html?ws=127.0.0.1:19222/devtools/page/68D7D656F83D0B67F29B736E133F91DB",
+   "id": "68D7D656F83D0B67F29B736E133F91DB",
+   "title": "WebGL Aquarium (webglsamples.org)",
+   "type": "page",
+   "url": "vscode-file://vscode-app/Applications/Visual%20Studio%20Code.app/Contents/Resources/app/out/vs/code/electron-browser/workbench/workbench.html",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:19222/devtools/page/68D7D656F83D0B67F29B736E133F91DB"
+} ]

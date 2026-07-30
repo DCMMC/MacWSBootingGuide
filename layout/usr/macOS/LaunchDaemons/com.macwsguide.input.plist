@@ -3,7 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.macwsguide.input</string>
+	<string>UIKitApplication:com.macwsguide.input</string>
+	<key>POSIXSpawnType</key>
+	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/var/jb/usr/macOS/bin/launchdchrootexec</string>

@@ -8,7 +8,7 @@
       profile and from Electron's GPU cache.
     -->
     <key>Label</key>
-    <string>com.macwsguide.chrome150</string>
+    <string>UIKitApplication:com.macwsguide.chrome150</string>
     <key>ProgramArguments</key>
     <array>
         <string>/var/jb/usr/macOS/bin/launchdchrootexec</string>

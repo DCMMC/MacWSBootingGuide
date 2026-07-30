@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CreationProperties</key>
+	<dict>
+		<key>IOSurfaceBytesPerElement</key>
+		<integer>1</integer>
+		<key>IOSurfaceCacheMode</key>
+		<integer>0</integer>
+		<key>IOSurfaceHeight</key>
+		<integer>64</integer>
+		<key>IOSurfaceIsGlobal</key>
+		<false/>
+		<key>IOSurfaceName</key>
+		<string>libmachook_arm64.dylib</string>
+		<key>IOSurfacePixelFormat</key>
+		<integer>1278226488</integer>
+		<key>IOSurfacePixelSizeCastingAllowed</key>
+		<true/>
+		<key>IOSurfaceWidth</key>
+		<integer>256</integer>
+	</dict>
+	<key>IOSurfaceName</key>
+	<string>libmachook_arm64.dylib</string>
+</dict>
+</plist>

@@ -2087,3 +2087,24 @@ stress, and two appeared with trace enabled; M1-level stability is therefore
 explicitly still open. Exact counters, results, failure boundaries and VNC
 screenshots are in
 [`jit-page-wx-20260730/`](evidence/webgl2-performance-optimization-20260728/jit-page-wx-20260730/README.md).
+
+## 2026-07-30: iOS launchd application class removes the E-core ceiling
+
+The remaining 3x arithmetic gap was upstream of V8. Disassembly of the actual
+iPadOS 16.3 launchd shows that `EnergyEfficiencyMode=Efficient` stores one in
+the job configuration at +0x3a8, while `UserInterface` leaves it clear. A
+separate launchd branch recognizes labels beginning with `UIKitApplication:`
+and assigns its application job class. Runtime per-performance-level counters
+then separated the old launchd daemons from controlled application-class jobs;
+`POSIXSpawnType=Interactive` alone did not change the old coalition.
+
+WindowServer, the system input bridge, OSXvnc, Terminal, VS Code and Chrome now
+use the native launchd application label class. The same VS Code 1.130 WebGL2
+Aquarium load at 60,000 fish and 1024x1024 reached 32.302 FPS with a 29.3-ms
+p50 interval and no context loss, up from the prior 11.812/11.594-FPS rounds.
+Retina VNC also completed three context-menu open/close repetitions. Title drag
+still failed, and sustained load exposed one independent native-AGX `0x103`
+completion error, so neither input nor GPU stability is declared complete.
+The launchd bytes, benchmark JSON, screenshots, probes and the next error ring
+are recorded in
+[`launchd-performance-class-20260730/`](evidence/launchd-performance-class-20260730/README.md).
