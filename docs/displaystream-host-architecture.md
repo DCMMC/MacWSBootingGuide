@@ -18,6 +18,7 @@
 |---|---|---|
 | DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 已实现；iPad 待验证 |
 | macOS 窗口 → iPadOS Scene | 每个 Scene 保存一个真实 `CGWindowID` 和 owner PID，独立订阅、恢复和释放 | 已实现；四窗待验证 |
+| 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | iPadOS 16.3.1 二进制 RE-confirmed；运行待验证 |
 | 无黑边显示 | 正常状态始终 edge-to-edge；宽高比短暂不一致时裁剪源纹理，不使用 aspect-fit | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
@@ -72,6 +73,20 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 - 全屏工作区使用 `windowID == 0`，用于桌面、全局菜单栏和尚未适配成独立 Scene 的窗口。
 - Scene 进入后台时取消订阅；Metal fence 完成后释放所有 IOSurface lease。恢复前不把旧截图当成可交互画面。
 - 第一阶段必须避免同一 `CGWindowID` 被两个前台 Scene 同时控制。后续应加入跨 Scene 的窗口所有权登记；重复打开时优先激活已有 Scene。
+
+#### 台前调度尺寸档位突破
+
+iPadOS 16 的固定尺寸档位不是本方案必须接受的产品边界。开源项目 [TrollPad](https://github.com/khanhduytran0/TrollPad) 已包含直接证据：其 SpringBoard tweak hook `SBSwitcherChamoisLayoutAttributes` 的 `setGridWidths:` 和 `setGridHeights:`，把系统传入的少量候选值替换为从 150 point 起、每 20 point 一档的密集数组。参考实现见不可变的 [TrollPad 1.3 `TweakSB.x` 第 145–166 行](https://github.com/khanhduytran0/TrollPad/blob/1.3/TweakSB.x#L145-L166)；功能由提交 [`bc31c3a`](https://github.com/khanhduytran0/TrollPad/commit/bc31c3a7344576cfa7bb6a6db3136578e0f094ee) 引入并进入 1.3 正式版，README 明确把 Stage Manager 标为 iOS 16 及以上能力。
+
+目标 `iPad13,6 / iPadOS 16.3.1 (20D67)` 的真实 SpringBoard 二进制进一步确认：该版本确实包含这个类、两个 setter、宽高数组 ivar，以及逐项寻找最接近请求尺寸的 `_nearestGridSizeForSize:gridWidths:gridHeights:bounds:`。因此“iPadOS 16.3.1 可以把少量系统档位扩展为密集离散档位”是 RE-confirmed，不再只是第三方源码推断。它仍不能自动证明 tweak 已在当前关机设备上成功注入，也不等于逐 point 连续自由缩放已经成立。正式实现采用以下边界：
+
+- 第一阶段增加密集档位，不绕过最终 geometry 校验，不用 CALayer transform、截图裁剪或伪造 `UIWindowScene.bounds` 形成假窗口。
+- TrollPad 的 150 point 下限和 20 point 步长是参考实现参数，不是 MacWS 已确认的安全常量。目标值由设备原始候选数组、系统标题栏/safe area、AppKit 最小尺寸和运行稳定性共同确定。
+- 直接 hook 上述两个 setter 会改变全系统台前调度候选数组。MacWS 专用策略需要继续追踪具有 Scene/application identity 的候选选择或 geometry 提交层；在找到该层前，不能声称现有 hook 已能按 bundle/Scene 隔离。
+- 若先提供全局实验开关，必须默认关闭、可从安全模式恢复，并保证所有生成值 finite、单调、在显示边界内且保留系统原始最大档位。
+- 产品优先采用 16–20 point 的密集档位。只有密集档位仍明显妨碍使用时，才继续研究逐点连续缩放；连续拖动同样必须落到真实 Scene geometry，而不是把旧 surface 作为最终画面拉伸。
+- Scene 尺寸变化可以连续反馈给 Host，但传向 AppKit/DisplayStream 的重排请求必须合并和防抖；拖动结束再提交一次最终精确尺寸，避免 resize storm 和 IOSurface 池反复重建。
+- 新档位低于 macOS 应用要求时，沿用下一节的整窗遮罩和输入冻结；不得为了“支持小窗口”绕过 AppKit 最小尺寸。
 
 ### 2. 小尺寸窗口：整窗遮罩，不使用 aspect-fit
 
@@ -421,6 +436,7 @@ NSMainMenu
 | Interop owner | `macwsinteropd/`、`MacWSInteropClient.*` | 剪贴板、文件暂存、权限、去重 |
 | Menu owner（规划） | 新 `macws_menu_protocol.h`、AppInputBridge 菜单端、Host 菜单视图 | 快照上限、generation、精确窗口、两阶段布局和动作重验证 |
 | Desktop owner（规划） | 新 `macws_desktop_protocol.h`、系统控制服务、Host 三指识别器 | capability、一次执行、全屏门控、系统后端证据和结果回执 |
+| Windowing owner（规划） | 新 SpringBoard tweak（路径待定）、对应 iPadOS 16 私有头与 probe | Chamois 候选数组、Scene 隔离、geometry 提交、恢复开关与版本门控 |
 | Bootstrap owner | `layout/usr/macOS/`、根 Makefile | launchd 顺序、清理、签名、打包 |
 | Evidence owner | `misc/`、`docs/evidence/` | probe、基准、日志索引、结果判定 |
 
@@ -458,17 +474,38 @@ NSMainMenu
 
 以上是二进制逆向事实。content shape 是否精确包含标题栏、阴影以及与 `NSWindow.frame` 的像素偏移，仍然是设备运行门槛，不由这段 RE 自动证明。
 
-### 3. 本地运行 probe 的边界
+### 3. iPadOS 16.3.1 台前调度档位的 Source 与 RE 证据
+
+**开源实现证据**
+
+- Source-confirmed via TrollPad tag `1.3` / commit `bc31c3a7344576cfa7bb6a6db3136578e0f094ee`：`SBSwitcherChamoisLayoutAttributes` 的 `setGridWidths:` / `setGridHeights:` hook 用 20 point 步长重建两个数组，并保留系统原数组的最大值。
+- TrollPad 1.3 的 Theos target 为 `iphone:clang:16.5:15.0`，tweak 注入 `com.apple.springboard`；README 把 Stage Manager 支持范围写为 iOS 16 及以上。[1.3 发布说明](https://github.com/khanhduytran0/TrollPad/releases/tag/1.3)明确列出 “resize window more freely”。
+- 外部用户报告 [TrollPad issue #33](https://github.com/khanhduytran0/TrollPad/issues/33) 表明 iPad 上可以更自由地改变尺寸，但缩到最小时可能崩溃；该报告没有给出精确 OS build，只能作为风险提示，不能作为目标 16.3.1 的 runtime-confirmed 证据。
+
+**目标二进制逆向证据**
+
+证据文件：`~/Library/Developer/Xcode/iOS DeviceSupport/iPad13,6 16.3.1 (20D67)/Symbols/System/Library/PrivateFrameworks/SpringBoard.framework/SpringBoard`；Mach-O `LC_BUILD_VERSION minos 16.3`，UUID `13B37E5E-5290-3E2E-91B9-4378BD2E8312`，SHA-256 `ecb1612c4116a01b4ccb363d24be7c4df0e54a24922478234a09224dd819092c`。
+
+- RE-confirmed via SpringBoard `0x1c7bd5264` / `0x1c7bd5274`：`-[SBSwitcherChamoisLayoutAttributes setGridWidths:]` 与 `setGridHeights:` 调用 `_objc_setProperty_nonatomic_copy`，分别写入对象偏移 `0xb0` / `0xb8`。
+- RE-confirmed via `-[SBSwitcherChamoisSettings layoutAttributesForContainerBounds:…]` `0x1c7bd2448`：生成的宽高数组分别在 `0x1c7bd2cb8` / `0x1c7bd2cc4` 通过上述 setter 写入 layout attributes。
+- RE-confirmed via `-[SBSwitcherChamoisSettings _nearestGridSizeForSize:gridWidths:gridHeights:bounds:]` `0x1c7bd311c`：函数分别对两个数组执行 `count → objectAtIndex: → doubleValue`，用 `fabd` 计算候选值与请求宽/高的绝对差，并保留差值最小的候选。这证明数组内容参与真实 Stage Manager 尺寸量化，而不是只影响窗口装饰或截图比例。
+- RE-confirmed 的能力是“任意提供一组合法候选值并由系统吸附到最近值”。TrollPad 实际提供 20 point 密集离散网格；每 1 point 连续档位、低于系统/应用安全下限以及最终 Scene geometry 提交仍未 runtime-confirmed。
+
+因此当前把密集尺寸档位列为高可行性、RE-confirmed 工作项，同时保留设备运行门槛：记录原始数组、证明 hook 命中、证明 `UIWindowScene.bounds` 采用新增档位，并完成 safe area、输入坐标、键盘、拖放和四窗稳定性回归。TrollPad 的 150 point 下限不能提升为 MacWS 的已证实安全不变量。
+
+### 4. 本地运行 probe 的边界
 
 开发 Mac 为 macOS 26.3.1，不是目标 macOS 13.4 chroot。两种 private flag 的 create/start 都返回 `CGDisplayStreamStart == 0`，但三秒内没有 frame callback。
 
 这个结果只确认本机接受当前参数形状；它不能证明 macOS 13.4 chroot 会出帧，不能证明 IOSurface 能跨到 iPad Host，也不能用于推断性能。
 
-### 4. 等待 iPad 的运行确认
+### 5. 等待 iPad 的运行确认
 
 - macOS 13.4 单窗 stream 在目标 bootstrap/session 下开始并持续回调。
 - IOSurface Mach right 从 chroot 进入 iPadOS Host，且在原生 AGX device 上成功创建纹理。
 - 四个前台 Scene 在台前调度下持续稳定。
+- 记录原始 `gridWidths` / `gridHeights`，启用密集档位后确认最终 `UIWindowScene.bounds` 采用新增尺寸，而不是只有窗口装饰或 surface 发生缩放。
+- 验证密集档位的系统级影响和 Scene 隔离；非 MacWS 应用不得因全局候选数组修改出现布局、safe area、键盘、拖放或触摸命中回归。
 - AppKit 动态最小尺寸、固定尺寸窗口和 density resize 的实际行为。
 - 缩放后的四角点击、拖动、滚动、软键盘和妙控键盘输入一致性。
 - 全屏屏幕三指候选、桌面命令 capability/result，以及外接妙控板三指是否被 iPadOS 截获的输入日志。
@@ -509,6 +546,9 @@ git diff --check
 5. 固定尺寸窗口：不发送 resize；Scene 过小时遮罩。
 6. 应用运行中改变 `contentMinSize`：500–1000 ms 内目录和遮罩更新。
 7. 快速拖过所有台前调度档位：不能形成 resize 循环、日志风暴或持续裁剪。
+8. 在原始档位之间选择一个新增密集档位：窗口装饰、`UIWindowScene.bounds`、Host drawable、macOS 目标 frame 和输入坐标必须最终一致；不能只是拉伸旧画面。
+9. 新增档位小于当前应用门槛：只出现整窗遮罩，菜单和 Host 控制入口仍可用；放大到门槛后只发生一次合并后的最终重排。
+10. 同时打开 MacWS 与普通 iPad 应用反复 resize：若实现尚为全局实验开关，必须单列记录普通应用的 geometry/safe-area 回归；实现 Scene 隔离后则验证普通应用仍只使用系统原始策略。
 
 ### 3. 缩放与输入矩阵
 
@@ -604,6 +644,7 @@ git diff --check
 
 - 键鼠高密度、指针、键盘、滚动、快捷键通过。
 - 全屏屏幕三指桌面命令与外接妙控板修饰键替代入口通过；外接原生三指能力按设备证据启用。
+- iPadOS 16 密集台前调度档位使用真实 Scene geometry，通过新增档位几何一致性、普通应用隔离和安全恢复测试。
 - 四个 Scene 达到稳定性和性能门槛。
 
 ### M4：互操作与菜单
