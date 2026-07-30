@@ -55,6 +55,7 @@ env	MACWS_HID_BYPASS	off	diagnostic/A-B	Broad HID compatibility hooks are not pr
 env	MACWS_IOMFB_SWAP_TRACE	off	diagnostic	Swap ABI trace.
 env	MACWS_IOSURF_TRACE	off	diagnostic	Per-IOSurface creation trace.
 env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome	Chromium MAP_JIT/W^X compatibility without verbose trace.
+env	MACWS_JIT_FAULT_WRITE_COMPAT	on	VS Code	Page-granular V8 W^X adapter; only faulted 16-KiB writer pages become RW before RX restore.
 env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace.
 env	MACWS_KEEP_ASSERT_BYPASS	off	safety invariant	Real assertions remain enabled.
 env	MACWS_KEEP_FORCE_ACCEL	off	legacy simulator control	Simulator force-accelerator shim remains disabled.

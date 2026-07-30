@@ -16,6 +16,14 @@ process, confirms that the remaining 12.289 FPS result is still dominated by
 ANGLE/AGX command encoding, and makes the strict one-click Retina VNC startup
 survive the observed cold native-AGX initialization delay.
 
+The page-granular V8 W^X experiment and same-version CPU decomposition are in
+[`jit-page-wx-20260730/README.md`](jit-page-wx-20260730/README.md). Runtime
+controls prove direct RWX is unavailable, validate faulted-page RW-to-RX
+restoration, reduce a representative process from thousands of whole-range
+fetch waits to hundreds of page-scoped waits, and prove TurboFan is active on
+both machines. It does not improve steady 60,000-fish FPS or close the
+remaining native-AGX `0x103` stress error.
+
 The preceding large-command failure and duplicate-webview ownership boundary
 are documented separately in
 [`vscode-production-error-20260730/README.md`](vscode-production-error-20260730/README.md).

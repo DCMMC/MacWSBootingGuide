@@ -23,4 +23,6 @@ the macOS root before loading `com.macwsguide.vscode`. It disables VS Code
 1.130's optional AgentHost (Copilot/Claude background providers) and terminal
 process persistence for this disposable graphics benchmark profile. Neither
 setting disables the extension host, Simple Browser, WebGL2, Chromium JIT, or
-native AGX.
+native AGX. The tracked production settings also pin the comparison workload
+to 60,000 fish at 1024 x 1024; every recorded run must verify the page's
+`fish` and `modelFish` counters instead of trusting the URL alone.

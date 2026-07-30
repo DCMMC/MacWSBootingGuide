@@ -2050,3 +2050,40 @@ one-tab production runs contained no texture nil, GL out-of-memory, IOGPU
 completion error or context loss. Exact logs, the actual iOS disassembly and
 screenshots are in
 [`vscode-production-error-20260730/`](evidence/webgl2-performance-optimization-20260728/vscode-production-error-20260730/README.md).
+
+## 2026-07-30: VS Code JIT W^X becomes page-granular; 3x CPU gap isolated
+
+Runtime controls proved that this iOS 16.3 chroot cannot execute a requested
+RWX mapping: the kernel exposes it as `rw-/rwx`, and execution dies with a
+SIGBUS instruction-abort permission fault. A standalone probe then proved the
+usable invariant on the real device: generated code returned 42 from RX, a
+trusted writer's store fault changed only one 16-KiB page RW, the page was
+restored RX, and the modified code returned 43.
+
+The opt-in VS Code adapter now keeps V8 CodeRanges RX, makes only writer-faulted
+pages RW, and restores the dirty set RX before publishing zero writers. The
+legacy process-wide trace reached 23,552 complete 256-MiB flips and 7,272
+instruction-fetch waits in one representative process; a page-mode trace
+initialized the range RX once and reached 12,318 write faults, 11,264 restores
+and 442 fetch waits. Unknown SIGBUS events keep their ordinary downstream
+handler/crash path. Production trace output remains disabled, and Chrome does
+not enable the new mode yet.
+
+This does not close performance. The exact same VS Code 1.130 build reported
+V8 optimization status 41 (`IsFunction | Optimized | TurboFanned`) on iPad and
+M1. Project LLDB disassembled inline AArch64 floating-point/modulo code in the
+iPad RX JIT range, ruling out `--jitless` and an old-libm call in the hottest
+`pseudoRandom` path. Removing all WebGL draws and uniform calls still measured
+47.4-ms iPad versus 15.3-ms M1 direct-frame p50, while CPU profiles measured
+789.632-ms versus 248.050-ms self time in `pseudoRandom`. Renice and an
+interactive-QoS control did not change the arithmetic result, so the QoS
+experiment was removed.
+
+Two final 60,000-fish production rAF rounds rendered through native AGX at
+11.812 and 11.594 FPS with intact WebGL2 contexts. Retina VNC captured the
+complete frame and opened VS Code's native File menu from an RFB click. One
+real `MTLCommandBuffer` `0x103` still appeared during sustained production
+stress, and two appeared with trace enabled; M1-level stability is therefore
+explicitly still open. Exact counters, results, failure boundaries and VNC
+screenshots are in
+[`jit-page-wx-20260730/`](evidence/webgl2-performance-optimization-20260728/jit-page-wx-20260730/README.md).

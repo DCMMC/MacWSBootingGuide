@@ -158,17 +158,41 @@ static _Atomic unsigned g_macws_jit_mprotect_calls = 0;
 static _Atomic unsigned g_macws_jit_exec_waits = 0;
 static _Atomic unsigned g_macws_jit_late_fetch_retries = 0;
 static _Atomic unsigned g_macws_jit_handler_checks = 0;
+static _Atomic unsigned g_macws_jit_write_faults = 0;
+static _Atomic unsigned g_macws_jit_dirty_restores = 0;
+static _Atomic bool g_macws_jit_needs_initial_rx = false;
 static pthread_mutex_t g_macws_jit_handler_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct sigaction g_macws_jit_downstream_sigbus;
 static bool g_macws_jit_downstream_sigbus_valid = false;
 
+// V8 reserves one 256-MiB arm64 CodeRange (16,384 pages on this device).  A
+// writer scope normally touches only a handful of those pages.  Keep enough
+// slots for several ranges plus duplicate-fault headroom; overflow falls back
+// to restoring every recorded range RX, so it cannot leave writable code.
+#define MACWS_JIT_DIRTY_PAGE_CAPACITY 65536u
+static uintptr_t g_macws_jit_dirty_pages[MACWS_JIT_DIRTY_PAGE_CAPACITY];
+static _Atomic unsigned g_macws_jit_dirty_page_count = 0;
+static _Atomic bool g_macws_jit_dirty_page_overflow = false;
+static _Atomic size_t g_macws_jit_page_size = 0;
+
 static void macws_jit_ensure_exec_barrier_handler(void);
+static void macws_jit_set_all_permissions(int protection);
 
 static bool macws_jit_mprotect_compat_enabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         value = getenv("MACWS_JIT_MPROTECT_COMPAT") ? 1 : 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_jit_fault_write_compat_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = getenv("MACWS_JIT_FAULT_WRITE_COMPAT") ? 1 : 0;
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
@@ -196,6 +220,15 @@ static bool macws_jit_range_overlaps(uintptr_t base, size_t size) {
 
 static void macws_jit_record_range(void *address, size_t size) {
     if (!address || address == MAP_FAILED || size == 0) return;
+    // The SIGBUS handler must never perform its first getenv/cache setup.
+    (void)macws_jit_fault_write_compat_enabled();
+    if (atomic_load_explicit(&g_macws_jit_page_size,
+                             memory_order_relaxed) == 0) {
+        atomic_store_explicit(&g_macws_jit_page_size, (size_t)getpagesize(),
+                              memory_order_release);
+    }
+    atomic_store_explicit(&g_macws_jit_needs_initial_rx, true,
+                          memory_order_release);
     pthread_mutex_lock(&g_macws_jit_state_lock);
     unsigned count = atomic_load_explicit(&g_macws_jit_range_count,
                                            memory_order_relaxed);
@@ -297,6 +330,84 @@ static bool macws_jit_pc_in_recorded_range(uintptr_t pc) {
     return false;
 }
 
+static bool macws_jit_make_fault_page_writable(uintptr_t fault_address) {
+    size_t page_size = atomic_load_explicit(&g_macws_jit_page_size,
+                                            memory_order_acquire);
+    if (page_size == 0 || (page_size & (page_size - 1)) != 0 ||
+        !macws_jit_pc_in_recorded_range(fault_address)) {
+        return false;
+    }
+    uintptr_t page = fault_address & ~(uintptr_t)(page_size - 1);
+    kern_return_t kr = vm_protect(mach_task_self(), page, page_size, false,
+                                  VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) return false;
+
+    unsigned slot = atomic_fetch_add_explicit(&g_macws_jit_dirty_page_count,
+                                               1, memory_order_relaxed);
+    if (slot < MACWS_JIT_DIRTY_PAGE_CAPACITY) {
+        g_macws_jit_dirty_pages[slot] = page;
+        atomic_thread_fence(memory_order_release);
+    } else {
+        atomic_store_explicit(&g_macws_jit_dirty_page_overflow, true,
+                              memory_order_release);
+    }
+    atomic_fetch_add_explicit(&g_macws_jit_write_faults, 1,
+                              memory_order_relaxed);
+    return true;
+}
+
+static void macws_jit_restore_dirty_pages(void) {
+    unsigned count = atomic_load_explicit(&g_macws_jit_dirty_page_count,
+                                          memory_order_acquire);
+    bool overflow = atomic_load_explicit(&g_macws_jit_dirty_page_overflow,
+                                         memory_order_acquire);
+    unsigned bounded = count < MACWS_JIT_DIRTY_PAGE_CAPACITY
+        ? count : MACWS_JIT_DIRTY_PAGE_CAPACITY;
+    size_t page_size = atomic_load_explicit(&g_macws_jit_page_size,
+                                            memory_order_acquire);
+
+    if (overflow || page_size == 0) {
+        macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+    } else {
+        atomic_thread_fence(memory_order_acquire);
+        for (unsigned i = 0; i < bounded; i++) {
+            uintptr_t page = g_macws_jit_dirty_pages[i];
+            kern_return_t kr = vm_protect(mach_task_self(), page, page_size,
+                                          false,
+                                          VM_PROT_READ | VM_PROT_EXECUTE);
+            if (kr != KERN_SUCCESS) {
+                fprintf(stderr,
+                    "#### JIT-FAULT-WRITE restore FAIL page=%p kr=%#x\n",
+                    (void *)page, kr);
+                // A failed page restore is a W^X invariant failure.  Restore
+                // every CodeRange rather than allowing that page to stay RW.
+                macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+                break;
+            }
+        }
+    }
+
+    atomic_store_explicit(&g_macws_jit_dirty_page_count, 0,
+                          memory_order_release);
+    atomic_store_explicit(&g_macws_jit_dirty_page_overflow, false,
+                          memory_order_release);
+    unsigned restores = atomic_fetch_add_explicit(
+        &g_macws_jit_dirty_restores, 1, memory_order_relaxed) + 1;
+    if (macws_jit_trace_enabled() &&
+        (restores <= 32 || (restores % 1024) == 0)) {
+        fprintf(stderr,
+            "#### JIT-FAULT-WRITE restore #%u pages=%u overflow=%d "
+            "write_faults=%u exec_waits=%u late_retries=%u\n",
+            restores, bounded, overflow,
+            atomic_load_explicit(&g_macws_jit_write_faults,
+                                 memory_order_relaxed),
+            atomic_load_explicit(&g_macws_jit_exec_waits,
+                                 memory_order_relaxed),
+            atomic_load_explicit(&g_macws_jit_late_fetch_retries,
+                                 memory_order_relaxed));
+    }
+}
+
 static void macws_jit_forward_sigbus(int signo, siginfo_t *info,
                                      void *context) {
     if (g_macws_jit_downstream_sigbus_valid) {
@@ -342,6 +453,20 @@ static void macws_jit_exec_barrier_sigbus(int signo, siginfo_t *info,
 #else
     (void)context;
 #endif
+
+    // iOS has no usable APRR/MAP_JIT contract for this macOS process.  In the
+    // page-fault adapter an authorized V8 writer therefore starts with every
+    // CodeRange page RX.  Its first store to a page lands here as a data abort;
+    // make only that 16-KiB page RW and remember it for the last writer's RX
+    // restore.  An instruction abort has si_addr == PC and must take the fetch
+    // barrier below instead.  The writer executes this handler from signed
+    // Electron __TEXT, so accepting a JIT-resident PC would hide a real fault.
+    if (macws_jit_fault_write_compat_enabled() && signo == SIGBUS && info &&
+        g_macws_jit_thread_writable && (uintptr_t)info->si_addr != pc &&
+        !macws_jit_pc_in_recorded_range(pc) &&
+        macws_jit_make_fault_page_writable((uintptr_t)info->si_addr)) {
+        return;
+    }
 
     // A writer always executes this hook and V8's surrounding C++ from signed
     // __TEXT, never from CodeRange.  If it does try to execute JIT code while
@@ -7453,10 +7578,18 @@ int mprotect_new(void *address, size_t size, int protection) {
         macws_jit_range_overlaps((uintptr_t)address, size);
     if (jit_overlap &&
         protection == (PROT_READ | PROT_WRITE | PROT_EXEC)) {
-        // iOS's VM_MAP_POLICY_WX_STRIP_X performs this same reduction for a
-        // normal mapping.  Make it explicit so V8 receives the writable half
-        // of the contract; pthread_jit_write_protect_np_new supplies RX.
-        effective = PROT_READ | PROT_WRITE;
+        if (macws_jit_fault_write_compat_enabled()) {
+            // Start executable.  A scoped writer receives RW only on the
+            // individual pages it actually touches via the SIGBUS data-fault
+            // path, preserving W^X without invalidating the full CodeRange.
+            effective = PROT_READ | PROT_EXEC;
+        } else {
+            // Legacy whole-range adapter: iOS's VM_MAP_POLICY_WX_STRIP_X
+            // performs this same reduction for a normal mapping.  Make it
+            // explicit so V8 receives the writable half of the contract;
+            // pthread_jit_write_protect_np_new supplies RX.
+            effective = PROT_READ | PROT_WRITE;
+        }
     }
     int result = mprotect(address, size, effective);
     if (jit_overlap && getenv("MACWS_JIT_MPROTECT_TRACE")) {
@@ -7559,6 +7692,62 @@ void pthread_jit_write_protect_np_new(int enabled) {
         &g_macws_jit_handler_checks, 1, memory_order_relaxed) + 1;
     if (handler_check <= 64 || (handler_check % 1024) == 0) {
         macws_jit_ensure_exec_barrier_handler();
+    }
+
+    if (macws_jit_fault_write_compat_enabled()) {
+        pthread_mutex_lock(&g_macws_jit_state_lock);
+        if (!enabled) {
+            if (!g_macws_jit_thread_writable) {
+                // The fallback mmap can initially be RW because iOS strips X
+                // from a requested RWX mapping.  Establish RX exactly once
+                // before the first scoped write so that touched pages fault
+                // into the dirty-page list.
+                if (atomic_exchange_explicit(&g_macws_jit_needs_initial_rx,
+                                             false,
+                                             memory_order_acq_rel)) {
+                    macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+                }
+                unsigned writers = atomic_load_explicit(
+                    &g_macws_jit_active_writers, memory_order_relaxed);
+                atomic_store_explicit(&g_macws_jit_active_writers,
+                                      writers + 1, memory_order_release);
+                g_macws_jit_thread_writable = true;
+            }
+        } else if (g_macws_jit_thread_writable) {
+            g_macws_jit_thread_writable = false;
+            unsigned writers = atomic_load_explicit(
+                &g_macws_jit_active_writers, memory_order_relaxed);
+            if (writers == 1) {
+                // Keep the writer published until every dirtied page is RX;
+                // an instruction fetch on one of those pages waits in the
+                // SIGBUS barrier and retries only after the release store.
+                if (atomic_exchange_explicit(&g_macws_jit_needs_initial_rx,
+                                             false,
+                                             memory_order_acq_rel)) {
+                    macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+                    atomic_store_explicit(&g_macws_jit_dirty_page_count, 0,
+                                          memory_order_release);
+                    atomic_store_explicit(
+                        &g_macws_jit_dirty_page_overflow, false,
+                        memory_order_release);
+                } else {
+                    macws_jit_restore_dirty_pages();
+                }
+                atomic_store_explicit(&g_macws_jit_active_writers, 0,
+                                      memory_order_release);
+            } else if (writers > 1) {
+                atomic_store_explicit(&g_macws_jit_active_writers,
+                                      writers - 1, memory_order_release);
+            }
+        } else if (atomic_load_explicit(&g_macws_jit_active_writers,
+                                        memory_order_acquire) == 0 &&
+                   atomic_exchange_explicit(&g_macws_jit_needs_initial_rx,
+                                            false,
+                                            memory_order_acq_rel)) {
+            macws_jit_set_all_permissions(PROT_READ | PROT_EXEC);
+        }
+        pthread_mutex_unlock(&g_macws_jit_state_lock);
+        return;
     }
 
     pthread_mutex_lock(&g_macws_jit_state_lock);

@@ -60,6 +60,13 @@
         <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
         <string>1</string>
+        <!-- iOS 16 cannot provide macOS MAP_JIT/APRR.  Keep the V8 CodeRange
+             RX and turn only the 16-KiB page hit by a scoped writer's data
+             SIGBUS into RW; the last writer restores those pages RX.  This
+             replaces the legacy 256-MiB whole-range flip, which runtime logs
+             measured at 23k flips / 6.7k instruction-fetch waits in 30s. -->
+        <key>MACWS_JIT_FAULT_WRITE_COMPAT</key>
+        <string>1</string>
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>
         <string>1</string>
         <key>MACWS_MACOS_SYSTEM_POLICY_COMPAT</key>
