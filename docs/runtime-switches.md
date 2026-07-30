@@ -68,6 +68,15 @@ to pass before WindowServer starts. `postinst.sh` re-registers the persistent
 per-architecture signatures of executable files inside the existing VS Code
 bundle; it deliberately does not re-sign nested frameworks.
 
+The deb installs the optional VS Code launch job under
+`/var/jb/usr/macOS/gui-launchd`, which is intentionally not auto-scanned by
+launchd. `macos_gui.sh production` synchronizes the packaged 60,000-fish
+settings and Aquarium extension into the project-owned `targetfix13` profile
+before starting WindowServer. It preserves Chromium caches/session state and
+never reads or writes the user's normal VS Code profile. VS Code itself is
+still loaded explicitly after the GUI is ready; package installation or
+re-jailbreak cannot launch Electron prematurely.
+
 MacBook reference measurements use the matching guarded entry point:
 
 ```bash

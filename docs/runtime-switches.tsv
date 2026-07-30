@@ -92,6 +92,9 @@ cli	--force-disable-user-env	on	VS Code main service	Supported VS Code switch av
 cli	--no-watchdog	off	safety invariant	Removed option; iPad temperature protection cannot be disabled.
 setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid optional Copilot/Claude AgentHost processes unrelated to native-AGX WebGL measurement.
 setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code benchmark profile	Avoid reviving stale benchmark-profile PTYs across isolated runs.
+artifact	/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist	on	VS Code production launcher	Packaged outside auto-scanned LaunchDaemons; loaded explicitly only after the GUI is ready.
+artifact	/var/jb/usr/macOS/share/vscode	on	VS Code production assets	Authoritative targetfix13 settings and Aquarium extension copied into the isolated benchmark profile.
+state	/tmp/macws-vscode-profile-agx-native-targetfix13	on	dedicated VS Code benchmark profile	Project-owned profile; normal user profile is untouched and Chromium caches persist across warm starts.
 flag	/private/tmp/macws_agx_dump_methods	off	diagnostic	AGX Objective-C method dump.
 flag	/private/tmp/macws_agx_trace_reserve	off	diagnostic	AGX reserve trace.
 flag	/private/tmp/macws_mtl_library_diag	off	diagnostic	Metal library target/compile trace.
@@ -112,7 +115,7 @@ flag	/tmp/macws_kcmd_field_5e3_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_field_6bc_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_field_a4_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_fix	on	WindowServer	Required direct native-AGX command ABI adapter.
-flag	/tmp/macws_kcmd_wrapped_fix	on	WindowServer	Required validated wrapped command ABI adapter.
+flag	/tmp/macws_kcmd_wrapped_fix	on	WindowServer	Required validated wrapped command ABI adapter, including runtime-confirmed cold generation 0 and warm generations 2 through 4.
 flag	/tmp/macws_observe_pf550	off	diagnostic	Compressed display submission observer.
 flag	/tmp/macws_owned_no_read	off	A/B control	Disables owned scanout read.
 flag	/tmp/macws_owned_scanout	on	WindowServer/VNC	Process-owned linear BGRA scanout transport.

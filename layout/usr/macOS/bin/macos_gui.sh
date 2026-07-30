@@ -55,6 +55,7 @@ LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
 
 GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned at boot
+VSCODE_ASSET_DIR=/var/jb/usr/macOS/share/vscode
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
@@ -66,9 +67,11 @@ TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
 PBS_LABEL=com.macwsguide.pbs
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
-VSCODE_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.vscode.plist
+VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+VSCODE_PROFILE_DIR="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-targetfix13"
+VSCODE_EXTENSIONS_DIR="$ROOTFS/private/tmp/macws-vscode-extensions"
 CHROME150_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist
 CHROME150_LABEL=UIKitApplication:com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
@@ -612,6 +615,36 @@ ensure_chroot_works() {
     return 1
 }
 
+# Materialize only the project-owned benchmark profile. The user's normal VS
+# Code profile is never read, removed or rewritten. These small authoritative
+# files are copied on each GUI start so package upgrades cannot leave an old
+# plist, workload URL or extension behind; Chromium caches and session storage
+# remain intact for normal warm starts.
+prepare_vscode_production_assets() {
+    local extension_source="$VSCODE_ASSET_DIR/macwsguide.macws-aquarium-runner-0.0.1"
+    local extension_target="$VSCODE_EXTENSIONS_DIR/macwsguide.macws-aquarium-runner-0.0.1"
+
+    [ -d "$ROOTFS/Applications/Visual Studio Code.app" ] || return 0
+    if [ ! -f "$VSCODE_PLIST" ] ||
+       [ ! -f "$VSCODE_ASSET_DIR/settings.json" ] ||
+       [ ! -f "$VSCODE_ASSET_DIR/extensions.json" ] ||
+       [ ! -d "$extension_source" ]; then
+        log "ERROR: packaged VS Code production assets are incomplete."
+        return 1
+    fi
+
+    if ! mkdir -p "$VSCODE_PROFILE_DIR/User" "$extension_target" ||
+       ! cp "$VSCODE_ASSET_DIR/settings.json" "$VSCODE_PROFILE_DIR/User/settings.json" ||
+       ! cp "$VSCODE_ASSET_DIR/extensions.json" "$VSCODE_EXTENSIONS_DIR/extensions.json" ||
+       ! cp "$extension_source/package.json" "$extension_target/package.json" ||
+       ! cp "$extension_source/extension.js" "$extension_target/extension.js" ||
+       ! cp "$extension_source/README.md" "$extension_target/README.md"; then
+        log "ERROR: failed to materialize the VS Code production profile."
+        return 1
+    fi
+    log "VS Code production assets ready (isolated profile=targetfix13)."
+}
+
 write_plists() {
     mkdir -p "$GUI_LAUNCHD_DIR"
 
@@ -946,6 +979,29 @@ production_preflight() {
             bad=1
         fi
     done
+    if [ -d "$ROOTFS/Applications/Visual Studio Code.app" ]; then
+        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
+                   MACWS_PIN_FALLBACK MACWS_JIT_MPROTECT_COMPAT \
+                   MACWS_JIT_FAULT_WRITE_COMPAT \
+                   MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
+                   MACWS_MACOS_SYSTEM_POLICY_COMPAT; do
+            if ! plutil "$VSCODE_PLIST" 2>/dev/null |
+                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+                log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"
+                bad=1
+            fi
+        done
+        for path in \
+            '--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix13' \
+            '--extensions-dir=/tmp/macws-vscode-extensions' \
+            '--use-angle=metal' '--ignore-gpu-blocklist' \
+            '--disable-features=SkiaGraphite'; do
+            if ! plutil "$VSCODE_PLIST" 2>/dev/null | grep -Fq -- "$path"; then
+                log "ERROR: required VS Code production argument missing: $path"
+                bad=1
+            fi
+        done
+    fi
     for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
                 /tmp/macws_cancel_completion; do
         if [ ! -e "$ROOTFS$path" ]; then
@@ -1490,8 +1546,9 @@ start_watchdog() {
 case "$CMD" in
     start)
         require_root "$@"
-        write_plists
+        write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
         cleanup_macos
+        prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
             production_preflight || { stop_all; exit 1; }
@@ -1512,8 +1569,9 @@ case "$CMD" in
         ;;
     restart)
         require_root "$@"
-        write_plists
+        write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
         stop_all
+        prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
             production_preflight || { stop_all; exit 1; }
