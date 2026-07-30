@@ -2103,8 +2103,11 @@ use the native launchd application label class. The same VS Code 1.130 WebGL2
 Aquarium load at 60,000 fish and 1024x1024 reached 32.302 FPS with a 29.3-ms
 p50 interval and no context loss, up from the prior 11.812/11.594-FPS rounds.
 Retina VNC also completed three context-menu open/close repetitions. Title drag
-still failed, and sustained load exposed one independent native-AGX `0x103`
-completion error, so neither input nor GPU stability is declared complete.
+was not validly exercised: the fixed test point was on the black desktop, not
+the title bar visible much lower in that frame. The benchmark now derives and
+records a real light-title-bar trajectory before testing. Sustained load also
+exposed one independent native-AGX `0x103` completion error, so neither the
+corrected input run nor GPU stability is declared complete.
 The launchd bytes, benchmark JSON, screenshots, probes and the next error ring
 are recorded in
 [`launchd-performance-class-20260730/`](evidence/launchd-performance-class-20260730/README.md).

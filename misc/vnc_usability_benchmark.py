@@ -5,7 +5,9 @@ For pointer motion it hashes a fixed region while masking both the old and new
 cursor positions; a cursor tile by itself therefore cannot satisfy a test.
 
 The defaults target Terminal on the iPad13,6 2388x1668 desktop used by this
-project. Coordinates are physical RFB pixels, not AppKit points.
+project. Coordinates are physical RFB pixels, not AppKit points. Unless an
+explicit --title-drag is supplied, the drag starts from the first wide light
+title bar found in the normalized framebuffer instead of a stale fixed point.
 """
 
 import argparse
@@ -32,6 +34,78 @@ def check_rect(width, height, rect, label):
             x + rect_width > width or y + rect_height > height):
         raise ValueError(
             f"{label} {rect} outside framebuffer {width}x{height}")
+
+
+def check_point(width, height, x, y):
+    if x < 0 or y < 0 or x >= width or y >= height:
+        raise ValueError(f"point {(x, y)} outside framebuffer {width}x{height}")
+
+
+def longest_light_run(framebuffer, width, y, threshold=232):
+    """Return the longest nearly-white BGRX run on one framebuffer row."""
+    best_start = None
+    best_length = 0
+    run_start = None
+    for x in range(width):
+        offset = (y * width + x) * 4
+        blue, green, red = framebuffer[offset:offset + 3]
+        light = (blue >= threshold and green >= threshold and
+                 red >= threshold and
+                 max(blue, green, red) - min(blue, green, red) <= 20)
+        if light and run_start is None:
+            run_start = x
+        if not light and run_start is not None:
+            length = x - run_start
+            if length > best_length:
+                best_start, best_length = run_start, length
+            run_start = None
+    if run_start is not None and width - run_start > best_length:
+        best_start, best_length = run_start, width - run_start
+    return best_start, best_length
+
+
+def detect_light_title_drag(framebuffer, width, height):
+    """Find Terminal's actual title-bar top edge and a safe drag trajectory.
+
+    This is deliberately a visual test precondition, not an input workaround.
+    It requires a wide nearly-white run preceded by several rows without one,
+    so a white document body cannot be mistaken for its own title bar.
+    """
+    minimum_run = max(320, width // 5)
+    first_row = max(80, height // 20)
+    recent_lengths = []
+    for y in range(first_row, height - 120):
+        run_start, run_length = longest_light_run(framebuffer, width, y)
+        if (run_start is not None and run_length >= minimum_run and
+                len(recent_lengths) >= 4 and
+                max(recent_lengths[-4:]) < minimum_run):
+            # Confirm that this is a horizontal surface, not one bright row.
+            confirmations = []
+            for confirm_y in range(y + 1, min(y + 9, height)):
+                confirm_start, confirm_length = longest_light_run(
+                    framebuffer, width, confirm_y)
+                confirmations.append(
+                    confirm_start is not None and
+                    confirm_length >= minimum_run and
+                    confirm_start < run_start + run_length and
+                    confirm_start + confirm_length > run_start)
+            if sum(confirmations) < 6:
+                recent_lengths.append(run_length)
+                continue
+            start_x = run_start + (run_length * 2) // 3
+            start_y = y + 20
+            end_x = min(width - 2, start_x + 220)
+            end_y = min(height - 2, start_y + 100)
+            return {
+                "source": "auto-light-titlebar",
+                "light_run": [run_start, y, run_length],
+                "start": [start_x, start_y],
+                "end": [end_x, end_y],
+            }
+        recent_lengths.append(run_length)
+    raise RuntimeError(
+        "no wide light title bar found; pass --title-drag X1 Y1 X2 Y2 "
+        "or --skip-drag")
 
 
 def region_digest(framebuffer, width, rect, masked_points=(), radius=None):
@@ -304,7 +378,7 @@ def main():
                              "protocol secondary button, 2 diagnoses legacy "
                              "OSXvnc button swapping")
     parser.add_argument("--title-drag", nargs=4, type=int,
-                        default=(1000, 185, 1250, 285),
+                        default=None,
                         metavar=("X1", "Y1", "X2", "Y2"))
     parser.add_argument("--drag-roi", nargs=4, type=int,
                         default=(80, 100, 1600, 1200),
@@ -374,6 +448,26 @@ def main():
             f"USABILITY normalized={normalized_rectangles}", flush=True)
         save_snapshot(args.snapshots, "00-normalized", width, height,
                       framebuffer)
+
+        drag_plan = None
+        if not args.skip_drag:
+            if args.title_drag is None:
+                drag_plan = detect_light_title_drag(
+                    framebuffer, width, height)
+            else:
+                drag_plan = {
+                    "source": "explicit",
+                    "light_run": None,
+                    "start": list(args.title_drag[:2]),
+                    "end": list(args.title_drag[2:]),
+                }
+            check_point(width, height, *drag_plan["start"])
+            check_point(width, height, *drag_plan["end"])
+            print(
+                f"USABILITY title-drag source={drag_plan['source']} "
+                f"light_run={drag_plan['light_run']} "
+                f"start={drag_plan['start']} end={drag_plan['end']}",
+                flush=True)
 
         if not args.skip_menu:
             menu_click = tuple(args.menu_click)
@@ -472,14 +566,18 @@ def main():
             results.append(result)
 
         if not args.skip_drag:
-            drag_start = tuple(args.title_drag[:2])
-            drag_end = tuple(args.title_drag[2:])
+            drag_start = tuple(drag_plan["start"])
+            drag_end = tuple(drag_plan["end"])
             result = measured_action(
                 sock, width, height, framebuffer, "title-drag", drag_rect,
                 (drag_start, drag_end),
                 lambda: vnc_native_input_test.send_drag(
                     sock, drag_start, drag_end, 12, 0.015),
                 args.timeout, args.max_updates, args.settle_seconds)
+            result["coordinate_source"] = drag_plan["source"]
+            result["light_title_run"] = drag_plan["light_run"]
+            result["input_start"] = drag_plan["start"]
+            result["input_end"] = drag_plan["end"]
             results.append(result)
             save_snapshot(args.snapshots, "title-drag", width, height,
                           framebuffer)
@@ -492,6 +590,7 @@ def main():
             "width": width,
             "height": height,
             "encoding": args.encoding,
+            "title_drag": drag_plan,
             "min_changed_pixels": args.min_changed_pixels,
             "passed": passed,
             "total": len(results),

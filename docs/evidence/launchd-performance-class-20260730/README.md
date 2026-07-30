@@ -35,8 +35,11 @@ is not used in the comparison above.
   threads of WindowServer, VNC and Chromium processes.
 - `ipad-60k-round3.json` is the post-change WebGL2 workload result.
 - `vnc-context-round1` through `round3` visibly complete context-menu
-  open/close. `vnc-title-drag/results.json` records the still-open drag failure;
-  application performance class does not by itself fix all input semantics.
+  open/close. The apparent miss in `vnc-title-drag/results.json` is not product
+  evidence: the retained frame puts Terminal's title bar around y=464 while
+  the old benchmark default dragged from y=185, on the black desktop. The
+  benchmark now detects the real light title bar from its normalized frame and
+  records the selected coordinates before testing.
 - `first-error-diag` records a separate native-AGX `0x103` completion error
   reached only under sustained load. Its root-cause correction is RE-backed
   but pending deployment validation while the iPad is offline.
@@ -44,5 +47,5 @@ is not used in the comparison above.
 ## Remaining work
 
 This milestone fixes the scheduler-class bottleneck, not the whole target.
-Sustained native-AGX command stability, title dragging, production soak time,
-and a new unlocked/foreground M1 baseline remain open.
+Sustained native-AGX command stability, a corrected on-device title-drag run,
+production soak time, and a new unlocked/foreground M1 baseline remain open.
