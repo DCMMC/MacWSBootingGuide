@@ -4,7 +4,7 @@ ARCHS = arm64
 include $(THEOS)/makefiles/common.mk
 
 # iOS subprojects
-SUBPROJECTS += MTLCompilerBypassOSCheck MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd mountdevfs ViewBridgeChrootProxy mtl_keepalive MacWSHost
+SUBPROJECTS += MTLCompilerBypassOSCheck MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwsthermal mountdevfs ViewBridgeChrootProxy mtl_keepalive MacWSHost
 # macOS subprojects
 SUBPROJECTS += launchservicesd libmachook macwsinputd
 

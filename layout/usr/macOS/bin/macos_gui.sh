@@ -19,6 +19,11 @@
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
 #   --pace-us=N           diagnostic synthetic-completion pace (8333..100000)
+#   --runtime-cap=N        optional automation wall-clock cap (minimum 60s)
+#
+# The iOS-native temperature watchdog is mandatory.  There is deliberately no
+# option to disable it: every GUI mode and benchmark stays inside the same
+# thermal safety envelope.
 #
 # Why launchd jobs (and not just `OSXvnc &`):
 #   launchdchrootexec posix_spawn()s the target with POSIX_SPAWN_SETEXEC, so it
@@ -45,6 +50,7 @@ SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
+THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
 LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
 
@@ -163,16 +169,13 @@ case "${1:-}" in
 esac
 
 # ─── Watchdog (crash-loop safety net) ───────────────────────────────────────
-# WindowServer composites window content through the MTLSim Metal bridge, whose
-# host (MTLSimDriverHost) can NULL-deref under heavy compositing. When it dies,
-# SkyLight asserts on the resulting nil texture and WindowServer aborts; launchd
-# relaunches it on-demand, it re-inits, crashes again — a restart storm that
-# drives the 1-min load average toward ~44 and risks a kernel panic/reboot.
-# The watchdog auto-stops the GUI when it sees that runaway, protecting the device.
-WD_LOAD_LIMIT=60     # 1-min load average that triggers a protective stop
-                     # (raised from 25: Firefox software WebRender legitimately runs hot
-                     #  without crashlooping; the WS-restart counter still catches real
-                     #  crashloops)
+# The native-AGX workload is distributed across WindowServer, application GPU
+# processes and the kernel driver. A single process's CPU percentage therefore
+# cannot establish whether the iPad is thermally safe. The primary guard reads
+# iPadOS's NSProcessInfo thermal state and AppleSmartBattery temperature through
+# an iOS-native helper. Temperature values and non-critical states are evidence
+# only; per policy, thermal intervention occurs only at `critical`.
+WD_THERMAL_POLL=300  # temperature sensors are sampled every 5 minutes
 WD_RESTART_LIMIT=12  # WindowServer restarts within WD_WINDOW that means "crash loop"
                      # (raised from 4: Firefox triggers some SkyLight CAWSBackend asserts
                      #  we haven't byte-patched yet (render_update composite_destination
@@ -180,10 +183,6 @@ WD_RESTART_LIMIT=12  # WindowServer restarts within WD_WINDOW that means "crash 
                      #  is annoying but not yet runaway — only stop if it's much worse)
 WD_WINDOW=45         # seconds — restart-counting window
 WD_POLL=5            # seconds between checks
-WD_LOAD_GRACE=90      # inherited 1-min load average is stale after userspace restart;
-                      # restart-storm protection remains active during this grace period
-WD_WS_CPU_LIMIT=70    # sustained one-core WindowServer use is the thermal failure signal
-WD_WS_CPU_STRIKES=6   # six 5-second samples = 30 seconds above the limit
 # Interactive VNC sessions must not disappear at an arbitrary test deadline.
 # The old unconditional 300-second limit runtime-confirmed the user's abrupt
 # shutdown: the watchdog logged the cap trip while VS Code logged SIGTERM.
@@ -193,6 +192,7 @@ WD_MAX_RUNTIME=0
 WD_LOG="$LOGDIR/macos_gui_watchdog.log"
 WD_TRIP="$LOGDIR/macws_safety_trip"
 WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
+WD_READY="$LOGDIR/macos_gui_watchdog.ready"
 RECOVERED_WS_PID=""
 RECOVERY_EXTRA_RESTARTS=0
 
@@ -287,18 +287,40 @@ started_ws_unchanged() {
     return 1
 }
 
-# 1-minute load average (integer part) from `uptime`.
-load1_int() {
-    uptime 2>/dev/null | sed -E 's/.*load averages?:[[:space:]]*([0-9]+).*/\1/'
+# Extract one key=value field from the helper's single-line output.  The helper
+# uses integer centi-degrees specifically so policy never depends on locale or
+# floating-point parsing in the shell.
+thermal_field() {
+    local line="$1" wanted="$2"
+    printf '%s\n' "$line" | awk -v wanted="$wanted" '
+        {
+            for (i = 1; i <= NF; i++) {
+                split($i, pair, "=")
+                if (pair[1] == wanted) { print pair[2]; exit }
+            }
+        }'
 }
 
-# Integer CPU percentage for one exact PID. Unlike load average this catches a
-# single WindowServer core spinning at 70-90%, which runtime-confirmed the
-# 2026-07-26 thermal incident while the whole-system load average stayed near 1.
-ws_cpu_int() {
-    local wanted="$1"
-    ps -ax -o pid=,%cpu= 2>/dev/null \
-        | awk -v wanted="$wanted" '$1 == wanted { printf "%d\n", $2 + 0; exit }'
+# Populate THERMAL_* globals from one iOS-native sensor snapshot.  A nonzero
+# helper exit status is expected for fair/serious/critical states, so validity
+# is determined from its structured output rather than command success alone.
+thermal_snapshot() {
+    THERMAL_LINE=""
+    THERMAL_STATE=""
+    THERMAL_TEMP_CENTIC=""
+    THERMAL_HELPER_RC=127
+
+    [ -x "$THERMAL_HELPER" ] || return 1
+    THERMAL_LINE=$("$THERMAL_HELPER" 2>&1)
+    THERMAL_HELPER_RC=$?
+    THERMAL_STATE=$(thermal_field "$THERMAL_LINE" thermal-state)
+    THERMAL_TEMP_CENTIC=$(thermal_field "$THERMAL_LINE" effective-temp-centic)
+
+    case "$THERMAL_STATE" in
+        nominal|fair|serious|critical) ;;
+        *) return 1 ;;
+    esac
+    return 0
 }
 
 # A GUI client cannot reuse its WindowServer connection after that server dies.
@@ -411,16 +433,22 @@ watchdog_pidfile_cleanup() {
     local owner=""
     [ -f "$WD_PIDFILE" ] || return 0
     owner=$(awk 'NR == 1 { print $1 }' "$WD_PIDFILE" 2>/dev/null)
-    [ "$owner" = "$$" ] && rm -f "$WD_PIDFILE"
+    [ "$owner" = "$$" ] && rm -f "$WD_PIDFILE" "$WD_READY"
     return 0
 }
 
-# Watchdog loop (runs iOS-side, backgrounded by `start`). Stops the GUI if
-# WindowServer crash-loops or the load average runs away.
+# Watchdog loop (runs iOS-side, backgrounded by `start`). Thermal intervention
+# is critical-only; WindowServer lifecycle and explicit runtime caps are
+# independent non-thermal trip paths.
 run_watchdog() {
-    local last_pid="" restarts=0 t0 started now pid L load_runaway
-    local ws_cpu=0 cpu_strikes=0 missing_samples=0
+    local last_pid="" restarts=0 t0 started now pid
+    local missing_samples=0 next_thermal=0
+    local ws_seen=0 startup_wait_logged=0
+    local startup_owner="${MACWS_WATCHDOG_STARTUP_OWNER:-}"
     local runtime_cap_label="disabled"
+    case "$startup_owner" in
+        ''|*[!0-9]*) startup_owner="" ;;
+    esac
     # The parent records $! as soon as it forks us, and the child records $$
     # again here after exec.  The ownership-aware EXIT trap cannot erase a
     # replacement watchdog's pidfile if launch timing overlaps.
@@ -428,18 +456,56 @@ run_watchdog() {
     trap watchdog_pidfile_cleanup EXIT
     t0=$(date +%s)
     started=$t0
+    next_thermal=$((started + WD_THERMAL_POLL))
     [ "$WD_MAX_RUNTIME" -gt 0 ] &&
         runtime_cap_label="${WD_MAX_RUNTIME}s"
-    log "watchdog: armed (load>=$WD_LOAD_LIMIT after ${WD_LOAD_GRACE}s grace; WS CPU>=${WD_WS_CPU_LIMIT}% for $((WD_WS_CPU_STRIKES * WD_POLL))s; >=$WD_RESTART_LIMIT restarts/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
+
+    # Handshake proves that the independent watchdog process is alive. Missing
+    # telemetry is logged but does not block work: thermal intervention is
+    # deliberately limited to an explicitly observed `critical` state.
+    if thermal_snapshot; then
+        log "watchdog: initial thermal sample: $THERMAL_LINE"
+        if [ "$THERMAL_STATE" = critical ]; then
+            trip_watchdog "启动时 iPadOS 温度状态为 critical，已拒绝启动 macOS GUI"
+            return 0
+        fi
+    else
+        log "watchdog: WARNING: initial thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; continuing because only an observed critical state may intervene"
+    fi
+    echo "$$" > "$WD_READY"
+    log "watchdog: armed (temperature every ${WD_THERMAL_POLL}s; only critical intervenes; nominal/fair/serious and numeric temperatures are log-only; restarts>=$WD_RESTART_LIMIT/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
     while :; do
         sleep "$WD_POLL"
+        now=$(date +%s)
+        if [ "$now" -ge "$next_thermal" ]; then
+            next_thermal=$((now + WD_THERMAL_POLL))
+            if thermal_snapshot; then
+                log "watchdog: thermal sample: $THERMAL_LINE"
+                if [ "$THERMAL_STATE" = critical ]; then
+                    trip_watchdog "iPadOS 温度状态达到 critical，已停止 macOS GUI"
+                    return 0
+                fi
+            else
+                log "watchdog: WARNING: thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; no intervention without an observed critical state"
+            fi
+        fi
+
         # Exit only when the GUI was actually torn down (the WindowServer launchd
         # job is unloaded). A momentarily-absent PROCESS just means launchd is
         # relaunching it after a crash — keep guarding (and count it as a restart).
         if ! launchctl list "$WINDOWSERVER_LABEL" >/dev/null 2>&1; then
+            if [ "$ws_seen" = 0 ] && [ -n "$startup_owner" ] &&
+               kill -0 "$startup_owner" 2>/dev/null; then
+                if [ "$startup_wait_logged" = 0 ]; then
+                    log "watchdog: thermal guard active while launcher pid=$startup_owner prepares WindowServer."
+                    startup_wait_logged=1
+                fi
+                continue
+            fi
             log "watchdog: WindowServer job unloaded (GUI stopped) — exiting."
             return 0
         fi
+        ws_seen=1
         pid=$(ws_pid)
         if [ -z "$pid" ] || [ "$pid" = "-" ]; then
             missing_samples=$((missing_samples + 1))
@@ -467,34 +533,8 @@ run_watchdog() {
         [ -n "$pid" ] && [ "$pid" != "-" ] && last_pid="$pid"
         now=$(date +%s)
         if [ $((now - t0)) -ge "$WD_WINDOW" ]; then restarts=0; t0=$now; fi
-        L=$(load1_int); [ -z "$L" ] && L=0
-        load_runaway=0
-        if [ $((now - started)) -ge "$WD_LOAD_GRACE" ] && [ "$L" -ge "$WD_LOAD_LIMIT" ]; then
-            load_runaway=1
-        fi
-
-        ws_cpu=0
-        if [ -n "$pid" ] && [ "$pid" != "-" ]; then
-            ws_cpu=$(ws_cpu_int "$pid"); [ -z "$ws_cpu" ] && ws_cpu=0
-        fi
-        if [ "$ws_cpu" -ge "$WD_WS_CPU_LIMIT" ]; then
-            cpu_strikes=$((cpu_strikes + 1))
-        elif [ "$cpu_strikes" -gt 0 ]; then
-            # One scheduler dip must not erase the preceding 25 seconds of
-            # 80-95% CPU. Decay one sample at a time (a small leaky bucket).
-            cpu_strikes=$((cpu_strikes - 1))
-        fi
-
-        if [ "$load_runaway" -eq 1 ]; then
-            trip_watchdog "系统负载达到 $L，已自动停止 macOS GUI"
-            return 0
-        fi
         if [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
             trip_watchdog "WindowServer 在 ${WD_WINDOW} 秒内重启 ${restarts} 次，已自动停止"
-            return 0
-        fi
-        if [ "$cpu_strikes" -ge "$WD_WS_CPU_STRIKES" ]; then
-            trip_watchdog "WindowServer 高 CPU 样本累计达到 $((WD_WS_CPU_STRIKES * WD_POLL)) 秒（阈值 ${WD_WS_CPU_LIMIT}%，当前 ${ws_cpu}%），已自动停止以防过热"
             return 0
         fi
         if [ "$WD_MAX_RUNTIME" -gt 0 ] &&
@@ -776,7 +816,7 @@ stop_watchdogs() {
         -v needle="bash $0 watchdog " 'index($0, needle) { print $1 }'); do
         [ "$candidate" = "$$" ] || kill "$candidate" 2>/dev/null
     done
-    rm -f "$WD_PIDFILE"
+    rm -f "$WD_PIDFILE" "$WD_READY"
 }
 
 # Every sentinel below changes code paths, installs tracing, records submit
@@ -1098,6 +1138,11 @@ stop_all() {
 
 status() {
     echo "=== macOS GUI status ==="
+    if thermal_snapshot; then
+        echo "thermal   : $THERMAL_LINE"
+    else
+        echo "thermal   : unavailable (helper=$THERMAL_HELPER rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}')"
+    fi
     if [ -e "$FLAG" ]; then
         echo "mode flag : present  -> COEXISTENCE (panel = iOS, macOS = VNC)"
     else
@@ -1157,7 +1202,7 @@ macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
   sudo bash $0 production
-  sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc] [--no-watchdog]
+  sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc]
   sudo bash $0 switches
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
@@ -1167,16 +1212,20 @@ Modes:
   coexist     (default) iPad panel keeps showing iOS; macOS renders to VNC only.
   exclusive   macOS takes over the physical panel as well as VNC.
 
-Safety: start also launches a background watchdog that auto-stops the GUI if
-WindowServer crash-loops or the load average runs away (panic guard). Disable
-with --no-watchdog. Logs to $LOGDIR/macos_gui_watchdog.log.
+Safety: start launches a mandatory iOS-native thermal watchdog before the GUI.
+It records a startup snapshot, then samples temperature every five minutes and
+stops for thermal reasons only when iPadOS explicitly reports `critical`.
+Nominal/fair/serious states, numeric temperatures, and unreadable samples are
+logged without intervention. Crash-loop and explicit runtime-cap guards remain
+separate. The thermal watchdog cannot be disabled. Logs to
+$LOGDIR/macos_gui_watchdog.log.
 
 The production profile enables native AGX and its required command/completion
 compatibility adapters by default. High-overhead flight recorders and read-only
 method tracing remain off unless --diagnostics is explicitly present. Use
 --no-experimental only for an intentional control experiment. Interactive
 sessions have no arbitrary wall-clock timeout, while
-crash-loop/load/high-CPU protection stays armed. Automated runs may add
+thermal/crash-loop protection stays armed. Automated runs may add
 --runtime-cap=300 (minimum 60 seconds).
 
 Connect a VNC viewer to  vnc://<device-ip>:5900  (no password).
@@ -1196,7 +1245,6 @@ fi
 MODE=coexist
 WANT_VNC=1
 WANT_TERMINAL=1
-WANT_WATCHDOG=1
 WANT_EXPERIMENTAL=1
 WANT_DIAGNOSTICS=0
 COEXIST_PACE_US=""
@@ -1211,7 +1259,10 @@ for a in "$@"; do
         --runtime-cap=*)         WD_MAX_RUNTIME="${a#--runtime-cap=}" ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
         --no-vnc)                WANT_VNC=0 ;;
-        --no-watchdog)           WANT_WATCHDOG=0 ;;
+        --no-watchdog)
+            echo "macos_gui.sh: --no-watchdog was removed; thermal safety cannot be disabled" >&2
+            exit 64
+            ;;
         *) echo "macos_gui.sh: ignoring unknown option '$a'" >&2 ;;
     esac
 done
@@ -1361,13 +1412,13 @@ wait_for_initial_vnc_capture_if_requested() {
     return 0
 }
 
-# Launch the crash-loop watchdog in the background (iOS-side, survives SSH
-# disconnect via nohup). Re-invokes this script in `watchdog` mode.
+# Launch the mandatory thermal/crash-loop watchdog in the background (iOS-side,
+# survives SSH disconnect via nohup). Re-invokes this script in `watchdog` mode
+# and waits for its independent temperature-sensor handshake before returning.
 start_watchdog() {
-    [ "$WANT_WATCHDOG" = 1 ] || { log "watchdog: disabled (--no-watchdog)"; return 0; }
+    local child="" ready_owner="" waited=0
     stop_watchdogs
-    rm -f "$WD_LOG"
-    rm -f "$WD_TRIP"
+    rm -f "$WD_LOG" "$WD_TRIP" "$WD_READY"
     # Re-exec with the exact session intent.  The recovery path needs these
     # flags so a WS restart does not unexpectedly launch a VNC/Terminal job the
     # user disabled, and so it knows whether to request a fresh shared frame.
@@ -1379,26 +1430,43 @@ start_watchdog() {
     [ -n "$COEXIST_PACE_US" ] && set -- "$@" "--pace-us=$COEXIST_PACE_US"
     [ "$WD_MAX_RUNTIME" -gt 0 ] &&
         set -- "$@" "--runtime-cap=$WD_MAX_RUNTIME"
-    nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
-    echo "$!" > "$WD_PIDFILE"
-    log "watchdog: started in background (log: $WD_LOG; vnc=$WANT_VNC terminal=$WANT_TERMINAL experimental=$WANT_EXPERIMENTAL diagnostics=$WANT_DIAGNOSTICS)"
+    MACWS_WATCHDOG_STARTUP_OWNER="$$" \
+        nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
+    child=$!
+    echo "$child" > "$WD_PIDFILE"
+    while [ "$waited" -lt 10 ]; do
+        ready_owner=$(awk 'NR == 1 { print $1 }' "$WD_READY" 2>/dev/null)
+        if [ "$ready_owner" = "$child" ]; then
+            log "watchdog: mandatory thermal guard ready (temperature interval=${WD_THERMAL_POLL}s; log=$WD_LOG)."
+            return 0
+        fi
+        if [ -f "$WD_TRIP" ] || ! kill -0 "$child" 2>/dev/null; then
+            log "ERROR: mandatory thermal watchdog failed to arm."
+            [ -f "$WD_TRIP" ] && sed 's/^/[macos_gui]        /' "$WD_TRIP"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    log "ERROR: mandatory thermal watchdog did not acknowledge within 10 seconds."
+    return 1
 }
 
 case "$CMD" in
     start)
         require_root "$@"
         write_plists
-        ensure_chroot_works || exit 1
         cleanup_macos
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
             production_preflight || { stop_all; exit 1; }
         fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
+        start_watchdog || { stop_all; exit 1; }
+        ensure_chroot_works || { stop_all; exit 1; }
         start_macos || { stop_all; exit 1; }
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
-        start_watchdog
         echo
         log "Started in $MODE mode."
         status
@@ -1410,17 +1478,17 @@ case "$CMD" in
     restart)
         require_root "$@"
         write_plists
-        ensure_chroot_works || exit 1
         stop_all
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
             production_preflight || { stop_all; exit 1; }
         fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
+        start_watchdog || { stop_all; exit 1; }
+        ensure_chroot_works || { stop_all; exit 1; }
         start_macos || { stop_all; exit 1; }
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
-        start_watchdog
         echo
         log "Restarted in $MODE mode."
         status

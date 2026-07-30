@@ -34,6 +34,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
     if [ -f "$MARKER" ]; then
         STALE=$(find MTLCompilerBypassOSCheck MTLSimDriverHost \
                      launchdchrootexec autosignd macwsallocd macwshostd \
+                     macwsthermal \
                      mountdevfs ViewBridgeChrootProxy mtl_keepalive \
                      MacWSHost macwsinputd launchservicesd \
                      Makefile control layout \

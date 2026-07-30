@@ -14,7 +14,8 @@ sudo bash /var/jb/usr/macOS/bin/macos_gui.sh production
 
 `start` now has the same defaults: coexistence display mode, native AGX and
 the required command/completion/VNC compatibility enabled, VNC and Terminal
-started, watchdog enabled, and diagnostics disabled. `--experimental` remains
+started, the mandatory thermal watchdog armed, and diagnostics disabled.
+`--experimental` remains
 an accepted compatibility alias. Only an intentional control run should use
 `--no-experimental`; only an evidence-gathering run should add
 `--diagnostics`.
@@ -46,7 +47,32 @@ variables. `MallocScribble` is explicitly forbidden.
   16,667 us for one second after real VNC input. This is compatibility pacing,
   not a hardware-vblank claim.
 - Performance comparisons are valid only when the iOS thermal helper reports
-  `nominal` immediately before and after the isolated run.
+  its startup and five-minute snapshots. Per current policy, only `critical`
+  intervenes; `nominal`, `fair`, `serious`, numeric temperatures and missing
+  samples are recorded without stopping the run.
+
+## Mandatory thermal guards
+
+The iPad launcher runs `/var/jb/usr/macOS/bin/macwsthermal` before any GUI
+session, then samples once every 300 seconds. Only an explicitly observed
+`critical` iPadOS thermal state stops or refuses the GUI. `nominal`, `fair`,
+`serious`, numeric temperatures and unreadable samples are log-only.
+`--no-watchdog` is rejected; the monitor itself is not a production switch.
+
+MacBook reference measurements use the matching guarded entry point:
+
+```bash
+bash misc/run_aquarium_benchmark_safe.sh \
+  --host 127.0.0.1 --port 9222 --fish 60000 --seconds 15
+```
+
+`misc/macbook_thermal_watchdog.sh` performs the same immediate snapshot and
+300-second sampling around any supplied command, with intervention restricted
+to `critical`. On macOS it uses
+`AppleSmartBattery.Temperature` as the physical battery-temperature field and
+records `VirtualTemperature` separately; the two are not interchangeable on
+the M1 reference machine. The watchdog log defaults to
+`${TMPDIR}/macws_macbook_thermal_watchdog.log`.
 
 ## Inventory format
 

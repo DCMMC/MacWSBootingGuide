@@ -2111,3 +2111,26 @@ corrected input run nor GPU stability is declared complete.
 The launchd bytes, benchmark JSON, screenshots, probes and the next error ring
 are recorded in
 [`launchd-performance-class-20260730/`](evidence/launchd-performance-class-20260730/README.md).
+
+## 2026-07-30: mandatory whole-device thermal monitoring on both endpoints
+
+The post-benchmark iPad heat/reboot incident invalidated the old
+WindowServer-only CPU heuristic: native-AGX load is distributed across
+WindowServer, Chromium renderer/GPU processes and the kernel driver. The
+launcher now arms an iOS-native `NSProcessInfo.thermalState` plus
+AppleSmartBattery probe before starting WindowServer, then samples it every
+300 seconds. `--no-watchdog` is rejected. Per the final user-selected policy,
+only an explicitly observed `critical` state causes thermal intervention;
+`nominal`, `fair`, `serious`, numeric temperatures and missing readings are
+logged without stopping the session. Crash-loop and explicit runtime-cap
+guards remain separate, while the old CPU/load-as-temperature trips are gone.
+
+The same critical-only/300-second policy now wraps M1 MacBook reference
+commands. Runtime IOKit showed `Temperature=3133` and
+`VirtualTemperature=4009`, so the host probe records the physical battery
+field as its effective numeric evidence rather than treating the virtual value
+as the pack temperature. The iPad helper runtime-reported `nominal` at 35.19 C;
+a no-GUI watchdog invocation later armed at `nominal`/34.39 C, exited cleanly
+when no WindowServer job existed, left no residual process/state, and confirmed
+that the disable option returns 64. Exact output and policy history are in
+[`thermal-watchdogs-20260730/`](evidence/thermal-watchdogs-20260730/README.md).
