@@ -2629,13 +2629,13 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         return;
     }
     BOOL isRFB = record.sceneID == 0x564e430000000001ull;
-    if (isRFB && (record.kind == MacWSInputKindTap ||
-                  record.kind == MacWSInputKindSecondaryTap)) {
-        // VNC holds a stationary button until release and emits this one-
-        // record gesture. Construct the matching pair in the target process,
-        // queue up first, then let AppKit's real synchronous control/menu
-        // tracking consume it while dispatching down. There is no split
-        // transport window and no scheduler-dependent release delay.
+    if (record.kind == MacWSInputKindTap ||
+        record.kind == MacWSInputKindSecondaryTap) {
+        // Both VNC and the native Host express a stationary click as one
+        // record. Construct the matching pair in the target process, queue up
+        // first, then let AppKit's real synchronous control/menu tracker
+        // consume it while dispatching down. Splitting this pair across two
+        // datagrams previously allowed a nested tracker to starve the up.
         BOOL secondary = record.kind == MacWSInputKindSecondaryTap;
         id upEvent = ((MacWSMouseEventFactory)objc_msgSend)((id)eventClass,
             sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),

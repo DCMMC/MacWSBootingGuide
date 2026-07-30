@@ -26,6 +26,7 @@
 #import "MacWSStreamClient.h"
 #include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
+#include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
 
 static NSString *const MacWSFramePath =
@@ -383,6 +384,13 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
 
 @class MacWSMetalView;
 
+typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
+    MacWSDirectTouchStateIdle = 0,
+    MacWSDirectTouchStateCandidate,
+    MacWSDirectTouchStateDragging,
+    MacWSDirectTouchStateSecondaryClicked,
+};
+
 @protocol MacWSMetalViewStatusDelegate <NSObject>
 - (void)metalView:(MacWSMetalView *)view statusChanged:(NSString *)status;
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record;
@@ -399,6 +407,7 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
 @property(nonatomic, getter=isMacWSInputEnabled) BOOL macWSInputEnabled;
 @property(nonatomic) MacWSHostInputMode inputMode;
 @property(nonatomic) MacWSHostDisplayDensity displayDensity;
+@property(nonatomic) CGFloat fixedZoomScale;
 @property(nonatomic) CGSize minimumLogicalSize;
 @property(nonatomic) BOOL targetWindowResizable;
 @property(nonatomic, readonly) BOOL hasDirectSurfaceFrame;
@@ -427,6 +436,9 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
     UILabel *_inputUnavailableLabel;
     UIView *_tooSmallOverlay;
     UILabel *_tooSmallLabel;
+    UIVisualEffectView *_zoomHUD;
+    UILabel *_zoomHUDLabel;
+    UISegmentedControl *_zoomGestureControl;
     UIImageView *_fallbackImageView;
     CADisplayLink *_framePollDisplayLink;
     uint64_t _fallbackSignature;
@@ -450,11 +462,15 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
     BOOL _trackpadHadMultipleTouches;
     UITouch *_directTouch;
     BOOL _directGestureBlocked;
+    MacWSDirectTouchState _directTouchState;
+    CGPoint _directTouchStartPoint;
+    NSTimeInterval _directTouchStartTimestamp;
+    uint64_t _directTouchSerial;
+    UIImpactFeedbackGenerator *_directTouchFeedback;
     CGFloat _viewportZoom;
     CGPoint _viewportCenter;
-    CGFloat _pinchStartZoom;
-    CGPoint _pinchAnchorSource;
-    CGPoint _pinchAnchorView;
+    CGFloat _fixedZoomScale;
+    BOOL _contentGesturesPassthrough;
     UIPanGestureRecognizer *_twoFingerPanRecognizer;
     uint64_t _windowConfigurationSerial;
     CGSize _lastRequestedWindowSize;
@@ -479,6 +495,7 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
     self.clearColor = MTLClearColorMake(0.025, 0.028, 0.035, 1.0);
     self.multipleTouchEnabled = YES;
     self.inputMode = MacWSHostInputModeDirect;
+    self.fixedZoomScale = 1.5;
     self.displayDensity = MacWSHostDisplayDensityTouchComfort;
     // Status polling enables interaction only after WindowServer, the input
     // socket and an exact-PID acknowledged frame are all present.  A stale
@@ -495,6 +512,9 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
     _visibleSourceRect = CGRectMake(0, 0, 1, 1);
     _viewportZoom = 1.0;
     _viewportCenter = CGPointMake(0.5, 0.5);
+    _directTouchState = MacWSDirectTouchStateIdle;
+    _directTouchFeedback = [[UIImpactFeedbackGenerator alloc]
+        initWithStyle:UIImpactFeedbackStyleMedium];
 
     _touchMarker = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 22, 22)];
     _touchMarker.backgroundColor = UIColor.clearColor;
@@ -553,6 +573,44 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
                                                              multiplier:0.82],
     ]];
 
+    _zoomHUD = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
+    _zoomHUD.translatesAutoresizingMaskIntoConstraints = NO;
+    _zoomHUD.layer.cornerRadius = 13;
+    _zoomHUD.clipsToBounds = YES;
+    _zoomHUD.hidden = YES;
+    [self addSubview:_zoomHUD];
+    _zoomHUDLabel = [UILabel new];
+    _zoomHUDLabel.font = [UIFont monospacedDigitSystemFontOfSize:12
+                                                         weight:UIFontWeightSemibold];
+    _zoomHUDLabel.textColor = UIColor.labelColor;
+    _zoomHUDLabel.textAlignment = NSTextAlignmentCenter;
+    [_zoomHUDLabel.widthAnchor constraintGreaterThanOrEqualToConstant:42].active = YES;
+    _zoomGestureControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"移动视图", @"操作内容"]];
+    _zoomGestureControl.selectedSegmentIndex = 0;
+    [_zoomGestureControl addTarget:self action:@selector(zoomGestureModeChanged:)
+                  forControlEvents:UIControlEventValueChanged];
+    UIStackView *zoomHUDContent = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_zoomHUDLabel, _zoomGestureControl]];
+    zoomHUDContent.translatesAutoresizingMaskIntoConstraints = NO;
+    zoomHUDContent.axis = UILayoutConstraintAxisHorizontal;
+    zoomHUDContent.alignment = UIStackViewAlignmentCenter;
+    zoomHUDContent.spacing = 7;
+    zoomHUDContent.layoutMargins = UIEdgeInsetsMake(7, 9, 7, 9);
+    zoomHUDContent.layoutMarginsRelativeArrangement = YES;
+    [_zoomHUD.contentView addSubview:zoomHUDContent];
+    [NSLayoutConstraint activateConstraints:@[
+        [_zoomHUD.trailingAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.trailingAnchor
+                                                 constant:-12],
+        [_zoomHUD.topAnchor constraintEqualToAnchor:self.safeAreaLayoutGuide.topAnchor
+                                            constant:12],
+        [zoomHUDContent.leadingAnchor constraintEqualToAnchor:_zoomHUD.contentView.leadingAnchor],
+        [zoomHUDContent.trailingAnchor constraintEqualToAnchor:_zoomHUD.contentView.trailingAnchor],
+        [zoomHUDContent.topAnchor constraintEqualToAnchor:_zoomHUD.contentView.topAnchor],
+        [zoomHUDContent.bottomAnchor constraintEqualToAnchor:_zoomHUD.contentView.bottomAnchor],
+    ]];
+
     if (device) {
         [self buildPipeline];
     } else {
@@ -581,19 +639,14 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         [self addGestureRecognizer:hover];
     }
     _twoFingerPanRecognizer = [[UIPanGestureRecognizer alloc]
-        initWithTarget:self action:@selector(trackpadScrolled:)];
+        initWithTarget:self action:@selector(twoFingerPanned:)];
     _twoFingerPanRecognizer.minimumNumberOfTouches = 2;
     _twoFingerPanRecognizer.maximumNumberOfTouches = 2;
     _twoFingerPanRecognizer.cancelsTouchesInView = YES;
     _twoFingerPanRecognizer.delegate = self;
     [self addGestureRecognizer:_twoFingerPanRecognizer];
-    UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
-        initWithTarget:self action:@selector(viewportPinched:)];
-    pinch.cancelsTouchesInView = YES;
-    pinch.delegate = self;
-    [self addGestureRecognizer:pinch];
     UITapGestureRecognizer *resetZoom = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(viewportResetTapped:)];
+        initWithTarget:self action:@selector(viewportZoomToggled:)];
     resetZoom.numberOfTouchesRequired = 2;
     resetZoom.numberOfTapsRequired = 2;
     resetZoom.cancelsTouchesInView = YES;
@@ -681,6 +734,36 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
     [self refreshPresentationPolicy];
 }
 
+- (void)setFixedZoomScale:(CGFloat)fixedZoomScale {
+    CGFloat normalized = fixedZoomScale >= 1.75 ? 2.0 : 1.5;
+    BOOL wasZoomed = _viewportZoom > 1.001;
+    _fixedZoomScale = normalized;
+    if (wasZoomed) {
+        _viewportZoom = normalized;
+        [self setNeedsDisplay];
+    }
+    [self updateZoomHUD];
+}
+
+- (BOOL)isViewportZoomed {
+    return _viewportZoom > 1.001;
+}
+
+- (void)updateZoomHUD {
+    BOOL visible = [self isViewportZoomed] && !_windowTooSmall;
+    _zoomHUD.hidden = !visible;
+    _zoomHUDLabel.text = [NSString stringWithFormat:@"%.1f×", _viewportZoom];
+    _zoomGestureControl.selectedSegmentIndex =
+        _contentGesturesPassthrough ? 1 : 0;
+}
+
+- (void)zoomGestureModeChanged:(UISegmentedControl *)sender {
+    _contentGesturesPassthrough = sender.selectedSegmentIndex == 1;
+    [self publishStatus:_contentGesturesPassthrough
+        ? @"放大视角：双指手势发送给 macOS 内容"
+        : @"放大视角：双指滑动移动视图"];
+}
+
 - (void)setMinimumLogicalSize:(CGSize)minimumLogicalSize {
     _minimumLogicalSize = (CGSize){
         isfinite(minimumLogicalSize.width) && minimumLogicalSize.width > 0
@@ -720,6 +803,7 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
             self.minimumLogicalSize.height,
             densityName, requiredWidth, requiredHeight];
     }
+    [self updateZoomHUD];
 }
 
 - (void)scheduleWindowConfiguration {
@@ -803,6 +887,8 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
     _trackpadHadMultipleTouches = NO;
     _directTouch = nil;
     _directGestureBlocked = NO;
+    _directTouchState = MacWSDirectTouchStateIdle;
+    _directTouchSerial++;
     _touchMarker.hidden = YES;
 }
 
@@ -1234,6 +1320,47 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         [self emitKind:kind touch:touch point:[touch locationInView:self]];
 }
 
+- (void)cancelDirectTouchForMultitouch {
+    _directTouchSerial++;
+    if (_directTouch && _directTouchState == MacWSDirectTouchStateDragging) {
+        [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
+                 point:[_directTouch locationInView:self]];
+    }
+    _directTouch = nil;
+    _directTouchState = MacWSDirectTouchStateIdle;
+    _touchMarker.hidden = YES;
+}
+
+- (void)beginDirectTouchCandidate:(UITouch *)touch {
+    _directTouch = touch;
+    _directTouchState = MacWSDirectTouchStateCandidate;
+    _directTouchStartPoint = [touch locationInView:self];
+    _directTouchStartTimestamp = touch.timestamp;
+    uint64_t serial = ++_directTouchSerial;
+    [_directTouchFeedback prepare];
+    _touchMarker.center = _directTouchStartPoint;
+    _touchMarker.hidden = NO;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+        (int64_t)(MACWS_DIRECT_LONG_PRESS_SECONDS * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (serial != self->_directTouchSerial ||
+            self->_directTouch != touch ||
+            self->_directTouchState != MacWSDirectTouchStateCandidate)
+            return;
+        CGPoint point = [touch locationInView:self];
+        double travel = hypot(point.x - self->_directTouchStartPoint.x,
+                              point.y - self->_directTouchStartPoint.y);
+        if (MacWSDecideTouchCandidate(MACWS_DIRECT_LONG_PRESS_SECONDS,
+                                      travel, false) !=
+            MacWSTouchCandidateDecisionSecondaryTap)
+            return;
+        [self emitKind:MacWSInputKindSecondaryTap touch:touch point:point];
+        self->_directTouchState = MacWSDirectTouchStateSecondaryClicked;
+        [self->_directTouchFeedback impactOccurred];
+        [self publishStatus:@"已发送右键单击"];
+    });
+}
+
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     [self becomeFirstResponder];
     UITouch *touch = touches.anyObject;
@@ -1242,17 +1369,10 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         [self emitTouches:touches kind:MacWSInputKindTouchDown];
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (event.allTouches.count > 1) {
-            if (_directTouch) {
-                [self emitKind:MacWSInputKindTouchCancel
-                         touch:_directTouch
-                         point:[_directTouch locationInView:self]];
-            }
-            _directTouch = nil;
+            [self cancelDirectTouchForMultitouch];
             _directGestureBlocked = YES;
         } else if (!_directGestureBlocked && !_directTouch && touch) {
-            _directTouch = touch;
-            [self emitKind:MacWSInputKindTouchDown touch:touch
-                     point:[touch locationInView:self]];
+            [self beginDirectTouchCandidate:touch];
         }
     } else if (!_trackpadTouch && touch) {
         _trackpadTouch = touch;
@@ -1292,8 +1412,33 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         [self emitTouches:touches kind:MacWSInputKindTouchMove];
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
-            [self emitKind:MacWSInputKindTouchMove touch:_directTouch
-                     point:[_directTouch locationInView:self]];
+            CGPoint point = [_directTouch locationInView:self];
+            CGFloat travel = hypot(point.x - _directTouchStartPoint.x,
+                                   point.y - _directTouchStartPoint.y);
+            if (_directTouchState == MacWSDirectTouchStateCandidate &&
+                MacWSDecideTouchCandidate(
+                    _directTouch.timestamp - _directTouchStartTimestamp,
+                    travel, false) == MacWSTouchCandidateDecisionDrag) {
+                _directTouchSerial++;
+                _directTouchState = MacWSDirectTouchStateDragging;
+                CGPoint startFrame = CGPointZero;
+                if ([self framePointForViewPoint:_directTouchStartPoint
+                                          output:&startFrame]) {
+                    [self emitKind:MacWSInputKindTouchDown
+                        framePoint:startFrame pressure:1.0f
+                         contactID:(uint32_t)_directTouch.hash
+                          timestamp:_directTouchStartTimestamp];
+                }
+                [self emitKind:MacWSInputKindTouchMove touch:_directTouch
+                         point:point];
+            } else if (_directTouchState == MacWSDirectTouchStateDragging) {
+                [self emitKind:MacWSInputKindTouchMove touch:_directTouch
+                         point:point];
+            } else if (_directTouchState ==
+                       MacWSDirectTouchStateSecondaryClicked) {
+                [self emitKind:MacWSInputKindMenuHover touch:_directTouch
+                         point:point];
+            }
         }
     } else if (_trackpadTouch && [touches containsObject:_trackpadTouch]) {
         if (event.allTouches.count > 1) _trackpadHadMultipleTouches = YES;
@@ -1356,9 +1501,45 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         [self emitTouches:touches kind:MacWSInputKindTouchUp];
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
-            [self emitKind:MacWSInputKindTouchUp touch:_directTouch
-                     point:[_directTouch locationInView:self]];
+            CGPoint point = [_directTouch locationInView:self];
+            if (_directTouchState == MacWSDirectTouchStateCandidate) {
+                MacWSTouchCandidateDecision decision = MacWSDecideTouchCandidate(
+                    _directTouch.timestamp - _directTouchStartTimestamp,
+                    hypot(point.x - _directTouchStartPoint.x,
+                          point.y - _directTouchStartPoint.y), true);
+                if (decision == MacWSTouchCandidateDecisionSecondaryTap) {
+                    [self emitKind:MacWSInputKindSecondaryTap
+                             touch:_directTouch point:point];
+                    [_directTouchFeedback impactOccurred];
+                } else if (decision == MacWSTouchCandidateDecisionTap) {
+                    [self emitKind:MacWSInputKindTap
+                             touch:_directTouch point:point];
+                } else if (decision == MacWSTouchCandidateDecisionDrag) {
+                    // UIKit normally reports the threshold crossing through
+                    // touchesMoved. Preserve the gesture if coalescing leaves
+                    // only its final sample.
+                    CGPoint startFrame = CGPointZero;
+                    if ([self framePointForViewPoint:_directTouchStartPoint
+                                              output:&startFrame]) {
+                        [self emitKind:MacWSInputKindTouchDown
+                            framePoint:startFrame pressure:1.0f
+                             contactID:(uint32_t)_directTouch.hash
+                              timestamp:_directTouchStartTimestamp];
+                        [self emitKind:MacWSInputKindTouchMove
+                                 touch:_directTouch point:point];
+                        [self emitKind:MacWSInputKindTouchUp
+                                 touch:_directTouch point:point];
+                    }
+                }
+            } else if (_directTouchState ==
+                       MacWSDirectTouchStateDragging) {
+                [self emitKind:MacWSInputKindTouchUp touch:_directTouch
+                         point:point];
+            }
+            _directTouchSerial++;
             _directTouch = nil;
+            _directTouchState = MacWSDirectTouchStateIdle;
+            _touchMarker.hidden = YES;
         }
         if (event.allTouches.count <= touches.count)
             _directGestureBlocked = NO;
@@ -1387,9 +1568,14 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         [self emitTouches:touches kind:MacWSInputKindTouchCancel];
     } else if (self.inputMode == MacWSHostInputModeDirect) {
         if (_directTouch && [touches containsObject:_directTouch]) {
-            [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
-                     point:[_directTouch locationInView:self]];
+            if (_directTouchState == MacWSDirectTouchStateDragging) {
+                [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
+                         point:[_directTouch locationInView:self]];
+            }
+            _directTouchSerial++;
             _directTouch = nil;
+            _directTouchState = MacWSDirectTouchStateIdle;
+            _touchMarker.hidden = YES;
         }
         if (event.allTouches.count <= touches.count)
             _directGestureBlocked = NO;
@@ -1410,53 +1596,63 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
 - (void)resetViewportZoom {
     _viewportZoom = 1.0;
     _viewportCenter = CGPointMake(0.5, 0.5);
+    _contentGesturesPassthrough = NO;
+    [self updateZoomHUD];
     [self setNeedsDisplay];
 }
 
-- (void)viewportResetTapped:(UITapGestureRecognizer *)recognizer {
+- (void)viewportZoomToggled:(UITapGestureRecognizer *)recognizer {
     if (recognizer.state != UIGestureRecognizerStateRecognized) return;
-    [self resetViewportZoom];
-    [self publishStatus:@"视图缩放已恢复"];
-}
-
-- (void)viewportPinched:(UIPinchGestureRecognizer *)recognizer {
-    if ([self currentFrameWidth] == 0 || [self currentFrameHeight] == 0)
-        return;
-    CGPoint location = [recognizer locationInView:self];
-    if (recognizer.state == UIGestureRecognizerStateBegan) {
+    if ([self isViewportZoomed]) {
+        [self resetViewportZoom];
+        [self publishStatus:@"已退出放大视角"];
+    } else {
+        if ([self currentFrameWidth] == 0 || [self currentFrameHeight] == 0)
+            return;
         simd_float4 unusedVertices[4];
         [self updateContentRectAndVertices:unusedVertices];
-        _pinchStartZoom = _viewportZoom;
-        _pinchAnchorView = CGPointMake(
-            self.bounds.size.width > 0 ? location.x / self.bounds.size.width : 0.5,
-            self.bounds.size.height > 0 ? location.y / self.bounds.size.height : 0.5);
-        _pinchAnchorSource = CGPointMake(
+        CGPoint location = [recognizer locationInView:self];
+        CGPoint normalized = CGPointMake(
+            self.bounds.size.width > 0
+                ? location.x / self.bounds.size.width : 0.5,
+            self.bounds.size.height > 0
+                ? location.y / self.bounds.size.height : 0.5);
+        CGPoint sourcePoint = CGPointMake(
             CGRectGetMinX(_visibleSourceRect) +
-                _pinchAnchorView.x * CGRectGetWidth(_visibleSourceRect),
+                normalized.x * CGRectGetWidth(_visibleSourceRect),
             CGRectGetMinY(_visibleSourceRect) +
-                _pinchAnchorView.y * CGRectGetHeight(_visibleSourceRect));
-    }
-    if (recognizer.state == UIGestureRecognizerStateBegan ||
-        recognizer.state == UIGestureRecognizerStateChanged) {
-        _viewportZoom = fmin(fmax(_pinchStartZoom * recognizer.scale, 1.0), 4.0);
-        simd_float4 unusedVertices[4];
+                normalized.y * CGRectGetHeight(_visibleSourceRect));
+        _viewportZoom = _fixedZoomScale;
+        // First derive the enlarged visible size, then choose a center that
+        // keeps the tapped source point under the same two-finger centroid.
+        // The viewport clamp may adjust this only near texture boundaries.
         [self updateContentRectAndVertices:unusedVertices];
-        _viewportCenter = CGPointMake(
-            _pinchAnchorSource.x +
-                (0.5 - _pinchAnchorView.x) * CGRectGetWidth(_visibleSourceRect),
-            _pinchAnchorSource.y +
-                (0.5 - _pinchAnchorView.y) * CGRectGetHeight(_visibleSourceRect));
+        MacWSNormalizedPoint requestedCenter = MacWSViewportCenterKeepingAnchor(
+            (MacWSNormalizedRect){
+                .x = CGRectGetMinX(_visibleSourceRect),
+                .y = CGRectGetMinY(_visibleSourceRect),
+                .width = CGRectGetWidth(_visibleSourceRect),
+                .height = CGRectGetHeight(_visibleSourceRect),
+            },
+            (MacWSNormalizedPoint){sourcePoint.x, sourcePoint.y},
+            normalized.x, normalized.y);
+        _viewportCenter = CGPointMake(requestedCenter.x, requestedCenter.y);
         [self updateContentRectAndVertices:unusedVertices];
+        [self updateZoomHUD];
         [self setNeedsDisplay];
+        [self publishStatus:[NSString stringWithFormat:
+            @"已进入 %.1f× 放大视角", _fixedZoomScale]];
     }
 }
 
-- (void)trackpadScrolled:(UIPanGestureRecognizer *)recognizer {
+- (void)twoFingerPanned:(UIPanGestureRecognizer *)recognizer {
     if (!self.isMacWSInputEnabled) return;
     CGPoint translation = [recognizer translationInView:self];
     [recognizer setTranslation:CGPointZero inView:self];
     if (translation.x == 0 && translation.y == 0) return;
-    if (self.inputMode == MacWSHostInputModeDirect) {
+    BOOL moveViewport = self.inputMode == MacWSHostInputModeDirect &&
+        [self isViewportZoomed] && !_contentGesturesPassthrough;
+    if (moveViewport) {
         if (self.bounds.size.width > 0 && self.bounds.size.height > 0) {
             _viewportCenter.x -= translation.x / self.bounds.size.width *
                 CGRectGetWidth(_visibleSourceRect);
@@ -1468,15 +1664,21 @@ static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
         }
         return;
     }
-    uint32_t width = [self currentFrameWidth];
-    uint32_t height = [self currentFrameHeight];
-    if (_trackpadCursor.x < 0 || _trackpadCursor.y < 0 ||
-        _trackpadCursor.x >= width || _trackpadCursor.y >= height)
-        _trackpadCursor = CGPointMake(width * 0.5, height * 0.5);
+    CGPoint scrollPoint = _trackpadCursor;
+    if (self.inputMode == MacWSHostInputModeDirect) {
+        if (![self framePointForViewPoint:[recognizer locationInView:self]
+                                   output:&scrollPoint]) return;
+    } else {
+        uint32_t width = [self currentFrameWidth];
+        uint32_t height = [self currentFrameHeight];
+        if (scrollPoint.x < 0 || scrollPoint.y < 0 ||
+            scrollPoint.x >= width || scrollPoint.y >= height)
+            scrollPoint = CGPointMake(width * 0.5, height * 0.5);
+    }
     float horizontal = (float)(-translation.x * 2.0);
     uint32_t horizontalBits = 0;
     memcpy(&horizontalBits, &horizontal, sizeof(horizontalBits));
-    [self emitKind:MacWSInputKindScroll framePoint:_trackpadCursor
+    [self emitKind:MacWSInputKindScroll framePoint:scrollPoint
          pressure:(float)(-translation.y * 2.0) contactID:horizontalBits
          timestamp:CACurrentMediaTime()];
 }
@@ -1679,6 +1881,7 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     UISwitch *_experimentalSwitch;
     UISegmentedControl *_inputModeControl;
     UISegmentedControl *_densityControl;
+    UISegmentedControl *_zoomScaleControl;
     UIButton *_resetZoomButton;
     NSArray<UIButton *> *_applicationButtons;
     MacWSMetalView *_metalView;
@@ -1798,6 +2001,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (savedDensity != MacWSHostDisplayDensityKeyboard)
         savedDensity = MacWSHostDisplayDensityTouchComfort;
     _metalView.displayDensity = savedDensity;
+    CGFloat savedZoomScale =
+        [NSUserDefaults.standardUserDefaults doubleForKey:@"MacWSFixedZoomScale"];
+    _metalView.fixedZoomScale = savedZoomScale >= 1.75 ? 2.0 : 1.5;
     [_metalView configureStreamMode:_streamMode windowID:_windowID];
     [root addSubview:_metalView];
 
@@ -2004,7 +2210,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _metalView.displayDensity == MacWSHostDisplayDensityKeyboard ? 1 : 0;
     [_densityControl addTarget:self action:@selector(densityChanged:)
                forControlEvents:UIControlEventValueChanged];
-    _resetZoomButton = [self buttonWithTitle:@"恢复视图缩放"
+    _zoomScaleControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"双指双击 1.5×", @"双指双击 2.0×"]];
+    _zoomScaleControl.selectedSegmentIndex =
+        _metalView.fixedZoomScale >= 1.75 ? 1 : 0;
+    [_zoomScaleControl addTarget:self action:@selector(zoomScaleChanged:)
+                 forControlEvents:UIControlEventValueChanged];
+    _resetZoomButton = [self buttonWithTitle:@"退出放大视角"
         image:@"arrow.counterclockwise"
         action:@selector(resetZoomAction) prominent:NO];
 
@@ -2048,8 +2260,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _statusLabel,
         _inputLabel,
         _inputModeControl,
-        [self sectionTitle:@"显示密度与缩放"],
+        [self sectionTitle:@"显示密度与放大"],
         _densityControl,
+        _zoomScaleControl,
         _resetZoomButton,
         _interopLabel,
         _logsView,
@@ -2141,6 +2354,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _experimentalSwitch.enabled = enabled;
     _inputModeControl.enabled = enabled;
     _densityControl.enabled = enabled;
+    _zoomScaleControl.enabled = enabled;
     _resetZoomButton.enabled = enabled;
     for (UIButton *button in _applicationButtons) button.enabled = enabled;
 }
@@ -2152,7 +2366,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [NSUserDefaults.standardUserDefaults setInteger:mode forKey:@"MacWSInputMode"];
     _inputLabel.text = mode == MacWSHostInputModeTrackpad
         ? @"输入：单指移动指针，轻点单击，长按拖动，双指滚动/右击"
-        : @"输入：手指位置直接映射 macOS；妙控键盘指针保持原生绝对定位";
+        : @"输入：轻点单击、长按右击、移动拖动；双指滚动或移动放大视图";
 }
 
 - (void)densityChanged:(UISegmentedControl *)sender {
@@ -2167,9 +2381,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         : @"显示：触屏舒适；窗口按 1.35 iPad 点/macOS 点重排";
 }
 
+- (void)zoomScaleChanged:(UISegmentedControl *)sender {
+    CGFloat scale = sender.selectedSegmentIndex == 1 ? 2.0 : 1.5;
+    _metalView.fixedZoomScale = scale;
+    [NSUserDefaults.standardUserDefaults setDouble:scale
+                                             forKey:@"MacWSFixedZoomScale"];
+    [self setNotice:[NSString stringWithFormat:
+        @"双指双击放大倍率已设为 %.1f×", scale] success:YES];
+}
+
 - (void)resetZoomAction {
     [_metalView resetViewportZoom];
-    [self setNotice:@"视图缩放和位置已恢复" success:YES];
+    [self setNotice:@"已退出放大视角并恢复中心位置" success:YES];
 }
 
 - (void)syncClipboardAction {

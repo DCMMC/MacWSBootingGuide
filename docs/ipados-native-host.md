@@ -2,7 +2,7 @@
 
 > This is the historical M0-M4 framebuffer milestone record. The current
 > multi-window DisplayStream/IOSurface design, including the no-letterbox
-> small-window mask, pinch zoom, and per-window density policy, is maintained
+> small-window mask, binary two-finger-double-tap zoom, and per-window density policy, is maintained
 > in [`displaystream-host-architecture.md`](displaystream-host-architecture.md).
 > Any M0 aspect-fit behavior described below is superseded.
 

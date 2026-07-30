@@ -5,6 +5,7 @@
 #include "macws_interop_protocol.h"
 #include "macws_host_protocol.h"
 #include "macws_stream_protocol.h"
+#include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
 
 static int Near(float lhs, float rhs) {
@@ -12,6 +13,17 @@ static int Near(float lhs, float rhs) {
 }
 
 int main(void) {
+    assert(MacWSDecideTouchCandidate(0.10, 0.0, false) ==
+           MacWSTouchCandidateDecisionWait);
+    assert(MacWSDecideTouchCandidate(0.44, 5.99, true) ==
+           MacWSTouchCandidateDecisionTap);
+    assert(MacWSDecideTouchCandidate(0.10, 6.0, false) ==
+           MacWSTouchCandidateDecisionDrag);
+    assert(MacWSDecideTouchCandidate(0.45, 5.99, false) ==
+           MacWSTouchCandidateDecisionSecondaryTap);
+    assert(MacWSDecideTouchCandidate(0.45, 6.0, false) ==
+           MacWSTouchCandidateDecisionSecondaryTap);
+
     MacWSViewport viewport = {0};
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 1, 0.5, 0.5,
                                 &viewport));
@@ -19,6 +31,20 @@ int main(void) {
     assert(Near(viewport.visibleSource.height, 1.0f));
     assert(Near(viewport.visibleSource.x, 0.265625f));
     assert(Near(viewport.visibleSource.y, 0.0f));
+    assert(MacWSComputeViewport(1600, 1000, 600, 800, 1.5, 0.5, 0.5,
+                                &viewport));
+    assert(Near(viewport.visibleSource.width, 0.3125f));
+    assert(Near(viewport.visibleSource.height, 2.0f / 3.0f));
+    MacWSNormalizedPoint sourceAnchor = {0.42f, 0.55f};
+    MacWSNormalizedPoint requestedCenter = MacWSViewportCenterKeepingAnchor(
+        viewport.visibleSource, sourceAnchor, 0.35f, 0.60f);
+    assert(MacWSComputeViewport(1600, 1000, 600, 800, 1.5,
+                                requestedCenter.x, requestedCenter.y,
+                                &viewport));
+    MacWSNormalizedPoint preservedAnchor =
+        MacWSViewportMapPoint(&viewport, 0.35f, 0.60f);
+    assert(Near(preservedAnchor.x, sourceAnchor.x));
+    assert(Near(preservedAnchor.y, sourceAnchor.y));
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 2, 0.5, 0.5,
                                 &viewport));
     assert(Near(viewport.visibleSource.width, 0.234375f));
@@ -29,7 +55,7 @@ int main(void) {
                           viewport.visibleSource.height));
     assert(MacWSComputeViewport(1000, 1600, 1200, 600, 10, -1, 2,
                                 &viewport));
-    assert(Near(viewport.zoom, 4.0f));
+    assert(Near(viewport.zoom, 2.0f));
     assert(Near(viewport.visibleSource.x, 0.0f));
     assert(Near(viewport.visibleSource.y + viewport.visibleSource.height,
                 1.0f));

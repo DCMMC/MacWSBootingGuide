@@ -53,7 +53,10 @@ static inline bool MacWSComputeViewport(float sourceWidth, float sourceHeight,
     else
         visibleHeight = sourceAspect / viewAspect;
 
-    float zoom = MacWSClampFloat(requestedZoom, 1.0f, 4.0f);
+    // Product interaction is binary: 1x or one configured enlarged view.
+    // Current settings expose 1.5x and 2x, so never admit an accidental
+    // continuous-pinch scale outside that range.
+    float zoom = MacWSClampFloat(requestedZoom, 1.0f, 2.0f);
     visibleWidth /= zoom;
     visibleHeight /= zoom;
     float centerX = MacWSClampFloat(requestedCenterX, visibleWidth * 0.5f,
@@ -83,6 +86,23 @@ static inline MacWSNormalizedPoint MacWSViewportMapPoint(
     return (MacWSNormalizedPoint){
         .x = viewport->visibleSource.x + x * viewport->visibleSource.width,
         .y = viewport->visibleSource.y + y * viewport->visibleSource.height,
+    };
+}
+
+// Returns the requested viewport center that keeps sourceAnchor under the
+// same normalized point after changing zoom. Pass the visibleSource size
+// computed at the new zoom; MacWSComputeViewport performs final edge clamps.
+static inline MacWSNormalizedPoint MacWSViewportCenterKeepingAnchor(
+        MacWSNormalizedRect enlargedVisibleSource,
+        MacWSNormalizedPoint sourceAnchor, float normalizedViewX,
+        float normalizedViewY) {
+    float viewX = MacWSClampFloat(normalizedViewX, 0.0f, 1.0f);
+    float viewY = MacWSClampFloat(normalizedViewY, 0.0f, 1.0f);
+    return (MacWSNormalizedPoint){
+        .x = sourceAnchor.x +
+             (0.5f - viewX) * enlargedVisibleSource.width,
+        .y = sourceAnchor.y +
+             (0.5f - viewY) * enlargedVisibleSource.height,
     };
 }
 
