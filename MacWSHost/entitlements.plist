@@ -11,6 +11,8 @@
 	<key>com.apple.security.exception.mach-lookup.global-name</key>
 	<array>
 		<string>com.macwsguide.host.control</string>
+		<string>com.macwsguide.display</string>
+		<string>com.macwsguide.interop</string>
 	</array>
 	<key>com.apple.security.iokit-user-client-class</key>
 	<array>

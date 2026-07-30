@@ -226,6 +226,8 @@ add_all_trustcache "/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
 add_all_trustcache "/var/jb/usr/macOS/bin/macwsinputd"
+add_all_trustcache "/var/jb/usr/macOS/bin/macwsdisplayd"
+add_all_trustcache "/var/jb/usr/macOS/bin/macwsinteropd"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
 cp -vf /var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer_macos /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
 add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
@@ -282,6 +284,21 @@ if [ -f /var/jb/usr/macOS/bin/macwsinputd ]; then
 	chmod 755 /var/mnt/rootfs/usr/local/bin/macwsinputd
 	add_all_trustcache /var/mnt/rootfs/usr/local/bin/macwsinputd
 fi
+for bridge in macwsdisplayd macwsinteropd; do
+	if [ -f "/var/jb/usr/macOS/bin/$bridge" ]; then
+		rm -f "/var/mnt/rootfs/usr/local/bin/$bridge"
+		cp -vf "/var/jb/usr/macOS/bin/$bridge" "/var/mnt/rootfs/usr/local/bin/$bridge"
+		chmod 755 "/var/mnt/rootfs/usr/local/bin/$bridge"
+		add_all_trustcache "/var/mnt/rootfs/usr/local/bin/$bridge"
+	fi
+done
+# MacWSHost runs as the iOS mobile user while the chroot apps currently run as
+# root.  A shared staging directory owned by mobile lets the Host copy
+# security-scoped imports into the mounted rootfs; root can then publish the
+# same native file URLs through macOS pboard without a second copy.
+mkdir -p "/var/mnt/rootfs/Users/Shared/MacWS Imports"
+chown mobile:mobile "/var/mnt/rootfs/Users/Shared/MacWS Imports" 2>/dev/null || true
+chmod 0770 "/var/mnt/rootfs/Users/Shared/MacWS Imports"
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld

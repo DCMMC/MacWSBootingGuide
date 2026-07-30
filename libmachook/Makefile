@@ -24,7 +24,8 @@ libmachook_FRAMEWORKS = IOKit IOSurface Metal
 # missing native-AGX witnesses.  Define it in the owning target rather than
 # relying on an interactive shell's CFLAGS.
 libmachook_CFLAGS = -DFORCE_M1_DRIVER=1 \
-  -isystem $(CURDIR)/../vendor/ios-xpc -I$(CURDIR)/../include
+  -isystem $(CURDIR)/../vendor/ios-xpc -I$(CURDIR)/../include \
+  -I$(CURDIR)/..
 libmachook_LDFLAGS = -undefined dynamic_lookup
 
 # On-device builds (misc/build_on_ios.sh passes LIBMACHOOK_ON_DEVICE_BUILD=1)

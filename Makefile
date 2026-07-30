@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 # iOS subprojects
 SUBPROJECTS += MTLCompilerBypassOSCheck MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwsthermal mountdevfs ViewBridgeChrootProxy mtl_keepalive MacWSHost
 # macOS subprojects
-SUBPROJECTS += launchservicesd libmachook macwsinputd
+SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd
 
 include $(THEOS_MAKE_PATH)/aggregate.mk
 

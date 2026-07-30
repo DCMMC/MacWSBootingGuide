@@ -7,6 +7,7 @@
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
 #define MACWS_INPUT_VERSION 3u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
+#define MACWS_INPUT_WINDOW_SCENE_FLAG UINT64_C(0x0000000080000000)
 #define MACWS_TARGET_PROBE_MAGIC 0x4d575450u /* "MWTP" */
 #define MACWS_TARGET_REPLY_MAGIC 0x4d575452u /* "MWTR" */
 #define MACWS_TARGET_VERSION 1u
@@ -62,6 +63,36 @@ enum {
     // AppKit process, so a fast RFB release cannot overtake its down before
     // rightMouseDown enters the native contextual-menu tracker.
     MacWSInputKindSecondaryTap = 13,
+    // Two-axis precision scrolling. x/y remain the cursor location in frame
+    // pixels, pressure carries vertical pixel delta, and contactID carries
+    // the IEEE-754 bits of the horizontal float delta.  This keeps ABI v3's
+    // fixed 52-byte datagram intact for already deployed input endpoints.
+    MacWSInputKindScroll = 14,
+    // Control-plane request for one captured AppKit window. sceneID carries
+    // its exact window number, x/y are the desired frame size in macOS
+    // logical points, and pressure carries iPad points per macOS point.
+    // AppInputBridge clamps against the real NSWindow minimum before calling
+    // the native frame setter; it never bypasses AppKit validation.
+    MacWSInputKindConfigureWindow = 15,
+};
+
+typedef uint16_t MacWSHostInputMode;
+enum {
+    // Finger location maps directly to the macOS backing surface. Best for
+    // large controls and is the default for a touch-first iPad experience.
+    MacWSHostInputModeDirect = 1,
+    // The iPad glass acts as a relative precision touchpad. Magic Keyboard
+    // pointer events remain absolute and are not converted to relative input.
+    MacWSHostInputModeTrackpad = 2,
+};
+
+typedef uint16_t MacWSHostDisplayDensity;
+enum {
+    // A macOS logical point occupies more iPad points, making controls and
+    // text larger. The Host requests a smaller logical AppKit viewport.
+    MacWSHostDisplayDensityTouchComfort = 1,
+    // More macOS logical points fit into the Scene for pointer/keyboard use.
+    MacWSHostDisplayDensityKeyboard = 2,
 };
 
 // Versioned wire record for the iOS-host -> macOS event bridge.
@@ -80,6 +111,28 @@ typedef struct __attribute__((packed)) {
     uint32_t frameHeight;
     int32_t targetPID;
 } MacWSInputRecord;
+
+// ABI v3 originally used sceneID as an opaque scene token, while key records
+// reserved its low 32 bits for modifier flags. A window Scene needs both an
+// exact CGWindowID and those modifiers. UIKit's modifier flags occupy bits
+// 16..21, so unused bit 31 marks this encoding, bits 32..63 retain the full
+// 32-bit macOS window number, and bits 0..30 retain modifier flags.
+// Fullscreen/RFB records keep the marker bit clear.
+static inline uint64_t MacWSInputSceneForWindow(uint32_t windowID,
+                                                uint32_t modifiers) {
+    return MACWS_INPUT_WINDOW_SCENE_FLAG |
+        ((uint64_t)windowID << 32) |
+        (modifiers & UINT32_C(0x7fffffff));
+}
+
+static inline uint32_t MacWSInputWindowIDForScene(uint64_t sceneID) {
+    if ((sceneID & MACWS_INPUT_WINDOW_SCENE_FLAG) == 0) return 0;
+    return (uint32_t)(sceneID >> 32);
+}
+
+static inline uint32_t MacWSInputModifiersForScene(uint64_t sceneID) {
+    return (uint32_t)sceneID & UINT32_C(0x7fffffff);
+}
 
 // macwsinputd has no usable CoreGraphics window list in its launchd session.
 // Before routing an untargeted RFB down/tap, it asks every live AppKit endpoint

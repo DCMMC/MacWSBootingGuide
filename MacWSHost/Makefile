@@ -10,8 +10,10 @@ include $(THEOS)/makefiles/common.mk
 
 APPLICATION_NAME = MacWSHost
 
-MacWSHost_FILES = main.m MacWSControlClient.m ../misc/iosclear_ref.m
-MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation IOKit
+MacWSHost_FILES = main.m MacWSControlClient.m MacWSStreamClient.m \
+	MacWSInteropClient.m ../misc/iosclear_ref.m
+MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation \
+	IOKit IOSurface UniformTypeIdentifiers
 MacWSHost_CFLAGS = -fobjc-arc -Wall -Wextra -I$(CURDIR)/../include \
 	-isystem $(CURDIR)/../vendor/ios-xpc -DIOSCLEAR_LIBRARY_MODE=1
 MacWSHost_CODESIGN_FLAGS = -Sentitlements.plist

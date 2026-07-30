@@ -1,10 +1,12 @@
 # MacWSBootingGuide
 Booting macOS's WindowServer on your jailbroken iDevice for real (WIP)
 
-The experimental native iPadOS multi-window frontend is documented in
-[`docs/ipados-native-host.md`](docs/ipados-native-host.md). It consumes the
-WindowServer shared framebuffer directly and does not require an RFB/VNC
-server.
+The current iPadOS multi-window, DisplayStream/IOSurface, touch, density, and
+interop design is documented in
+[`docs/displaystream-host-architecture.md`](docs/displaystream-host-architecture.md).
+The older [`docs/ipados-native-host.md`](docs/ipados-native-host.md) is retained
+as the historical M0-M4 framebuffer milestone record. The direct presentation
+path does not require RFB/VNC; VNC remains a diagnostic fallback.
 
 Some paths are currently hardcoded for rootless jailbreak, but you can change them to work with rootful jailbreak. Some tools are hardcoded for Dopamine jailbreak.
 

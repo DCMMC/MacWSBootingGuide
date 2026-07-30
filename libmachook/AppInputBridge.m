@@ -22,6 +22,7 @@
 #import <sys/un.h>
 
 #import "macws_host_protocol.h"
+#import "macws_stream_protocol.h"
 
 typedef id (*MacWSMsgID)(id, SEL);
 typedef id (*MacWSMsgIDInteger)(id, SEL, NSInteger);
@@ -34,11 +35,13 @@ typedef CGPoint (*MacWSMsgPointPointID)(id, SEL, CGPoint, id);
 typedef NSInteger (*MacWSMsgInteger)(id, SEL);
 typedef NSInteger (*MacWSMsgIntegerPointInteger)(id, SEL, CGPoint, NSInteger);
 typedef NSUInteger (*MacWSMsgUInteger)(id, SEL);
+typedef CGSize (*MacWSMsgSize)(id, SEL);
 typedef BOOL (*MacWSMsgBool)(id, SEL);
 typedef BOOL (*MacWSMsgBoolSEL)(id, SEL, SEL);
 typedef BOOL (*MacWSMsgBoolID)(id, SEL, id);
 typedef void (*MacWSMsgVoid)(id, SEL);
 typedef void (*MacWSMsgVoidBool)(id, SEL, BOOL);
+typedef void (*MacWSMsgVoidRectBoolBool)(id, SEL, CGRect, BOOL, BOOL);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
 typedef id (*MacWSMouseEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
@@ -65,6 +68,9 @@ typedef int32_t (*MacWSCancelMenuTrackingPrivate)(uint8_t);
 
 static int MacWSAppInputSocket = -1;
 static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
+static char MacWSWindowMetricsPath[PATH_MAX];
+static NSData *MacWSLastWindowMetricsEntries;
+static uint64_t MacWSWindowMetricsGeneration;
 static const char MacWSInputTargetReplyPath[] =
     "/private/tmp/macws_input_target.sock";
 static NSInteger MacWSAppInputEventNumber;
@@ -1093,7 +1099,9 @@ static BOOL MacWSAppInputSupportedProcess(void) {
     if (!program || !objc_getClass("NSApplication")) return NO;
     if (strstr(program, "Helper") || strstr(program, "Renderer") ||
         strstr(program, "GPU") || strcmp(program, "WindowServer") == 0 ||
-        strstr(program, "OSXvnc") || strcmp(program, "launchservicesd") == 0)
+        strstr(program, "OSXvnc") || strcmp(program, "launchservicesd") == 0 ||
+        strcmp(program, "macwsdisplayd") == 0 ||
+        strcmp(program, "macwsinteropd") == 0)
         return NO;
     return YES;
 }
@@ -1119,6 +1127,8 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindDeactivateApplication:
         case MacWSInputKindKeyDown:
         case MacWSInputKindKeyUp:
+        case MacWSInputKindScroll:
+        case MacWSInputKindConfigureWindow:
             return 0; // control-plane only; handled before event construction
     }
     return 0;
@@ -1454,13 +1464,23 @@ static BOOL MacWSCancelActiveMenuForEscape(id application,
 }
 
 static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
-    return record->magic == MACWS_INPUT_MAGIC &&
+    if (record->magic != MACWS_INPUT_MAGIC ||
+        record->version != MACWS_INPUT_VERSION ||
+        record->targetPID != getpid() ||
+        record->frameWidth == 0 || record->frameHeight == 0 ||
+        !isfinite(record->x) || !isfinite(record->y)) return NO;
+    if (record->kind == MacWSInputKindConfigureWindow) {
+        return MacWSInputWindowIDForScene(record->sceneID) != 0 &&
+            record->x >= 64.0f && record->y >= 64.0f &&
+            record->x <= MACWS_STREAM_MAX_DIMENSION &&
+            record->y <= MACWS_STREAM_MAX_DIMENSION &&
+            isfinite(record->pressure) &&
+            record->pressure >= 0.5f && record->pressure <= 4.0f;
+    }
+    return
         record->version == MACWS_INPUT_VERSION &&
-        record->targetPID == getpid() &&
         record->kind >= MacWSInputKindTouchDown &&
         record->kind <= MacWSInputKindSecondaryTap &&
-        record->frameWidth > 0 && record->frameHeight > 0 &&
-        isfinite(record->x) && isfinite(record->y) &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -1608,7 +1628,8 @@ static BOOL MacWSPostKeyRecord(MacWSInputRecord record, id application,
     NSString *charactersIgnoring =
         MacWSCharactersForRFBKeySym(keySym, YES);
     NSUInteger eventType = record.kind == MacWSInputKindKeyDown ? 10 : 11;
-    NSUInteger modifiers = (NSUInteger)(record.sceneID & 0xffffffffull);
+    NSUInteger modifiers = (NSUInteger)
+        MacWSInputModifiersForScene(record.sceneID);
     id event = nil;
     const char *eventRoute = "FACTORY";
     static MacWSCreateKeyboardCGEvent createKeyboardCGEvent;
@@ -1876,6 +1897,66 @@ static id MacWSWindowForScreenPoint(id application, CGPoint screenPoint) {
     }
     return keyWindow ?: ((MacWSMsgID)objc_msgSend)(application,
         sel_registerName("mainWindow"));
+}
+
+static id MacWSWindowWithNumber(id application, uint32_t windowNumber) {
+    if (!application || windowNumber == 0) return nil;
+    SEL selector = sel_registerName("windowWithWindowNumber:");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(
+            application, sel_registerName("respondsToSelector:"), selector)) {
+        id window = ((MacWSMsgIDInteger)objc_msgSend)(
+            application, selector, (NSInteger)windowNumber);
+        if (window) return window;
+    }
+    id windows = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("windows"));
+    for (id window in windows) {
+        NSInteger candidate = ((MacWSMsgInteger)objc_msgSend)(
+            window, sel_registerName("windowNumber"));
+        if (candidate == (NSInteger)windowNumber) return window;
+    }
+    return nil;
+}
+
+static CGSize MacWSEffectiveMinimumFrameSize(id window, CGRect frame,
+                                              BOOL *resizableOut) {
+    NSUInteger styleMask = ((MacWSMsgUInteger)objc_msgSend)(
+        window, sel_registerName("styleMask"));
+    BOOL resizable = (styleMask & (1u << 3)) != 0;
+    if (resizableOut) *resizableOut = resizable;
+    if (!resizable) return frame.size;
+
+    CGSize frameMinimum = {0};
+    CGSize contentMinimum = {0};
+    SEL minSizeSelector = sel_registerName("minSize");
+    SEL contentMinSelector = sel_registerName("contentMinSize");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), minSizeSelector))
+        frameMinimum = ((MacWSMsgSize)objc_msgSend)(window,
+                                                      minSizeSelector);
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"), contentMinSelector))
+        contentMinimum = ((MacWSMsgSize)objc_msgSend)(window,
+                                                       contentMinSelector);
+    CGRect contentRect = frame;
+    SEL contentRectSelector = sel_registerName("contentRectForFrameRect:");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(window,
+            sel_registerName("respondsToSelector:"),
+            contentRectSelector)) {
+        contentRect = ((MacWSMsgRectRect)objc_msgSend)(
+            window, contentRectSelector, frame);
+    }
+    CGFloat width = fmax(frameMinimum.width,
+        contentMinimum.width + fmax(0.0,
+            frame.size.width - contentRect.size.width));
+    CGFloat height = fmax(frameMinimum.height,
+        contentMinimum.height + fmax(0.0,
+            frame.size.height - contentRect.size.height));
+    if (!isfinite(width) || width < 0.0 ||
+        width > MACWS_STREAM_MAX_DIMENSION) width = 0.0;
+    if (!isfinite(height) || height < 0.0 ||
+        height > MACWS_STREAM_MAX_DIMENSION) height = 0.0;
+    return (CGSize){width, height};
 }
 
 // Complete the real AppKit lifecycle when CGS deactivation succeeded but the
@@ -2274,10 +2355,73 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         return;
     }
 
+    if (record.kind == MacWSInputKindConfigureWindow) {
+        uint32_t windowNumber =
+            MacWSInputWindowIDForScene(record.sceneID);
+        id window = MacWSWindowWithNumber(application, windowNumber);
+        if (!window) {
+            fprintf(stderr,
+                "#### APP-INPUT CONFIGURE-DROP pid=%d reason=no-window "
+                "window=%u\n", getpid(), windowNumber);
+            fflush(stderr);
+            return;
+        }
+        CGRect oldFrame = ((MacWSMsgRect)objc_msgSend)(
+            window, sel_registerName("frame"));
+        BOOL resizable = NO;
+        CGSize minimum = MacWSEffectiveMinimumFrameSize(
+            window, oldFrame, &resizable);
+        if (!resizable) {
+            fprintf(stderr,
+                "#### APP-INPUT CONFIGURE-DROP pid=%d reason=fixed-window "
+                "window=%u frame=%.1fx%.1f\n",
+                getpid(), windowNumber,
+                oldFrame.size.width, oldFrame.size.height);
+            fflush(stderr);
+            return;
+        }
+        CGSize requested = {
+            fmax(record.x, minimum.width),
+            fmax(record.y, minimum.height),
+        };
+        CGRect newFrame = oldFrame;
+        newFrame.origin.y += oldFrame.size.height - requested.height;
+        newFrame.size = requested;
+        SEL setter = sel_registerName("setFrame:display:animate:");
+        if (!((MacWSMsgBoolSEL)objc_msgSend)(window,
+                sel_registerName("respondsToSelector:"), setter)) return;
+        ((MacWSMsgVoidRectBoolBool)objc_msgSend)(
+            window, setter, newFrame, YES, NO);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT CONFIGURE pid=%d window=%u "
+                "old=%.1fx%.1f requested=%.1fx%.1f minimum=%.1fx%.1f "
+                "applied=%.1fx%.1f density=%.2f\n",
+                getpid(), windowNumber,
+                oldFrame.size.width, oldFrame.size.height,
+                record.x, record.y, minimum.width, minimum.height,
+                requested.width, requested.height, record.pressure);
+            fflush(stderr);
+        }
+        return;
+    }
+
     if (record.kind == MacWSInputKindKeyDown ||
         record.kind == MacWSInputKindKeyUp) {
-        id keyWindow = ((MacWSMsgID)objc_msgSend)(
-            application, sel_registerName("keyWindow"));
+        uint32_t requestedWindowNumber =
+            MacWSInputWindowIDForScene(record.sceneID);
+        id keyWindow = requestedWindowNumber
+            ? MacWSWindowWithNumber(application, requestedWindowNumber)
+            : ((MacWSMsgID)objc_msgSend)(
+                application, sel_registerName("keyWindow"));
+        if (requestedWindowNumber && !keyWindow) {
+            fprintf(stderr,
+                "#### APP-INPUT DROP pid=%d reason=target-window-closed "
+                "window=%u kind=%u\n",
+                getpid(), requestedWindowNumber, record.kind);
+            fflush(stderr);
+            return;
+        }
         if (!keyWindow) keyWindow = ((MacWSMsgID)objc_msgSend)(
             application, sel_registerName("mainWindow"));
         NSInteger keyWindowNumber = keyWindow
@@ -2294,23 +2438,49 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         return;
     }
 
-    CGRect screenFrame = ((MacWSMsgRect)objc_msgSend)(screen,
-        sel_registerName("frame"));
     CGFloat normalizedX = record.x / (CGFloat)record.frameWidth;
     CGFloat normalizedY = record.y / (CGFloat)record.frameHeight;
-    CGPoint screenPoint = {
-        screenFrame.origin.x + normalizedX * screenFrame.size.width,
-        screenFrame.origin.y + (1.0 - normalizedY) * screenFrame.size.height,
-    };
+    CGRect screenFrame = ((MacWSMsgRect)objc_msgSend)(screen,
+        sel_registerName("frame"));
+    uint32_t requestedWindowNumber =
+        MacWSInputWindowIDForScene(record.sceneID);
     id window = nil;
-    if (record.kind != MacWSInputKindTouchDown &&
+    CGPoint screenPoint = {0};
+    if (requestedWindowNumber != 0) {
+        window = MacWSWindowWithNumber(application, requestedWindowNumber);
+        if (!window) {
+            fprintf(stderr,
+                "#### APP-INPUT DROP pid=%d reason=target-window-closed "
+                "window=%u kind=%u\n",
+                getpid(), requestedWindowNumber, record.kind);
+            fflush(stderr);
+            return;
+        }
+        // Window DisplayStream coordinates are top-left pixels. Map them to
+        // the current AppKit frame on every event so Stage Manager resizing
+        // and macOS-side window moves do not leave a stale transform.
+        CGRect windowFrame = ((MacWSMsgRect)objc_msgSend)(
+            window, sel_registerName("frame"));
+        screenPoint = (CGPoint){
+            windowFrame.origin.x + normalizedX * windowFrame.size.width,
+            windowFrame.origin.y +
+                (1.0 - normalizedY) * windowFrame.size.height,
+        };
+    } else {
+        screenPoint = (CGPoint){
+            screenFrame.origin.x + normalizedX * screenFrame.size.width,
+            screenFrame.origin.y +
+                (1.0 - normalizedY) * screenFrame.size.height,
+        };
+    }
+    if (!window && record.kind != MacWSInputKindTouchDown &&
         record.kind != MacWSInputKindHover &&
         record.kind != MacWSInputKindMenuHover &&
         record.kind != MacWSInputKindTap &&
         record.kind != MacWSInputKindSecondaryTap &&
         MacWSAppInputGestureWindow) {
         window = (__bridge id)MacWSAppInputGestureWindow;
-    } else {
+    } else if (!window) {
         window = MacWSWindowForScreenPoint(application, screenPoint);
     }
     if (!window) {
@@ -2788,7 +2958,8 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
     @synchronized(MacWSAppInputPending) {
     BOOL continuous = record.kind == MacWSInputKindTouchMove ||
                           record.kind == MacWSInputKindHover ||
-                          record.kind == MacWSInputKindMenuHover;
+                          record.kind == MacWSInputKindMenuHover ||
+                          record.kind == MacWSInputKindConfigureWindow;
         BOOL replaced = NO;
         NSUInteger pendingCount = [MacWSAppInputPending count];
         if (continuous && pendingCount != 0) {
@@ -3098,6 +3269,78 @@ static void *MacWSAppInputThread(void *unused) {
     return NULL;
 }
 
+// Runs on the application main thread. This reports the real AppKit
+// constraints; macwsdisplayd must not invent a product-wide minimum width.
+static void MacWSPublishWindowMetrics(void) {
+    Class applicationClass = objc_getClass("NSApplication");
+    if (!applicationClass || !MacWSWindowMetricsPath[0]) return;
+    id application = ((MacWSMsgID)objc_msgSend)(
+        (id)applicationClass, sel_registerName("sharedApplication"));
+    if (!application) return;
+    id windows = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("windows"));
+    NSMutableData *entries = [NSMutableData data];
+    NSUInteger count = [windows count];
+    for (NSUInteger index = 0;
+         index < count && entries.length / sizeof(MacWSWindowMetricsEntry) <
+             MACWS_STREAM_MAX_WINDOWS;
+         index++) {
+        id window = [windows objectAtIndex:index];
+        NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+            window, sel_registerName("windowNumber"));
+        if (number <= 0 || (uint64_t)number > UINT32_MAX) continue;
+        CGRect frame = ((MacWSMsgRect)objc_msgSend)(
+            window, sel_registerName("frame"));
+        if (!isfinite(frame.size.width) || !isfinite(frame.size.height) ||
+            frame.size.width <= 0.0 || frame.size.height <= 0.0) continue;
+
+        BOOL resizable = NO;
+        CGSize minimum = MacWSEffectiveMinimumFrameSize(
+            window, frame, &resizable);
+        MacWSWindowMetricsEntry entry = {
+            .windowID = (uint32_t)number,
+            .flags = resizable
+                ? MacWSStreamWindowResizable : 0,
+            .minimumLogicalWidth = (float)minimum.width,
+            .minimumLogicalHeight = (float)minimum.height,
+        };
+        [entries appendBytes:&entry length:sizeof(entry)];
+    }
+    if (MacWSLastWindowMetricsEntries &&
+        [MacWSLastWindowMetricsEntries isEqualToData:entries]) return;
+    [MacWSLastWindowMetricsEntries release];
+    MacWSLastWindowMetricsEntries = [entries copy];
+    MacWSWindowMetricsHeader header = {
+        .magic = MACWS_WINDOW_METRICS_MAGIC,
+        .version = MACWS_WINDOW_METRICS_VERSION,
+        .size = sizeof(MacWSWindowMetricsHeader),
+        .entrySize = sizeof(MacWSWindowMetricsEntry),
+        .entryCount = (uint32_t)(entries.length /
+                                 sizeof(MacWSWindowMetricsEntry)),
+        .generation = ++MacWSWindowMetricsGeneration,
+    };
+    NSMutableData *file = [NSMutableData dataWithBytes:&header
+                                                 length:sizeof(header)];
+    [file appendData:entries];
+    NSError *error = nil;
+    NSString *path = [NSString stringWithUTF8String:MacWSWindowMetricsPath];
+    if (![file writeToFile:path
+                   options:NSDataWritingAtomic error:&error] &&
+        MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr, "#### APP-INPUT METRICS-WRITE pid=%d error=%s\n",
+                getpid(), error.localizedDescription.UTF8String ?: "unknown");
+        fflush(stderr);
+    }
+}
+
+static void MacWSScheduleWindowMetricsPublish(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool { MacWSPublishWindowMetrics(); }
+        MacWSScheduleWindowMetricsPublish();
+    });
+}
+
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
@@ -3112,6 +3355,9 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     MacWSAppInputDeferredRFBMoveEvents = [NSMutableArray new];
     snprintf(MacWSAppInputPath, sizeof(MacWSAppInputPath),
              "/private/tmp/macws_app_input.%d.sock", getpid());
+    snprintf(MacWSWindowMetricsPath, sizeof(MacWSWindowMetricsPath),
+             "/private/tmp/macws_window_metrics.%d.bin", getpid());
+    unlink(MacWSWindowMetricsPath);
     MacWSAppInputSocket = socket(AF_UNIX, SOCK_DGRAM, 0);
     if (MacWSAppInputSocket < 0) return;
     struct sockaddr_un address = {0};
@@ -3128,6 +3374,7 @@ __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
     pthread_t thread;
     if (pthread_create(&thread, NULL, MacWSAppInputThread, NULL) == 0) {
         pthread_detach(thread);
+        MacWSScheduleWindowMetricsPublish();
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr, "#### APP-INPUT READY pid=%d socket=%s abi=%u record=%zu\n",
                     getpid(), MacWSAppInputPath, MACWS_INPUT_VERSION,
@@ -3152,4 +3399,7 @@ __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     MacWSSetLastSystemActivationEvent(nil);
     if (MacWSAppInputSocket >= 0) close(MacWSAppInputSocket);
     if (MacWSAppInputPath[0]) unlink(MacWSAppInputPath);
+    if (MacWSWindowMetricsPath[0]) unlink(MacWSWindowMetricsPath);
+    [MacWSLastWindowMetricsEntries release];
+    MacWSLastWindowMetricsEntries = nil;
 }

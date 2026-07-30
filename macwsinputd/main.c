@@ -46,6 +46,9 @@ extern void CGEventSetIntegerValueField(CGEventRef event, CGEventField field,
                                         int64_t value);
 extern void CGEventPost(CGEventTapLocation tap, CGEventRef event);
 extern void CGEventPostToPid(pid_t pid, CGEventRef event);
+extern CGEventRef CGEventCreateScrollWheelEvent(const void *source,
+                                                uint32_t units,
+                                                uint32_t wheelCount, ...);
 extern bool CGPreflightPostEventAccess(void);
 extern CFArrayRef CGWindowListCopyWindowInfo(CGWindowListOption option,
                                              CGWindowID relativeToWindow);
@@ -131,6 +134,8 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindKeyDown: return "key-down";
         case MacWSInputKindKeyUp: return "key-up";
         case MacWSInputKindSecondaryTap: return "secondary-tap";
+        case MacWSInputKindScroll: return "scroll";
+        case MacWSInputKindConfigureWindow: return "configure-window";
     }
     return "invalid";
 }
@@ -140,13 +145,25 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->version != MACWS_INPUT_VERSION ||
         !isfinite(record->x) || !isfinite(record->y) ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
-        record->x < 0.0f || record->y < 0.0f ||
-        record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->targetPID < 0) {
         return false;
     }
-    return record->kind >= MacWSInputKindTouchDown &&
-           record->kind <= MacWSInputKindSecondaryTap;
+    if (record->kind == MacWSInputKindConfigureWindow) {
+        return record->targetPID > 1 &&
+               MacWSInputWindowIDForScene(record->sceneID) != 0 &&
+               record->x >= 64.0f && record->y >= 64.0f &&
+               record->x <= 16384.0f && record->y <= 16384.0f &&
+               isfinite(record->pressure) &&
+               record->pressure >= 0.5f && record->pressure <= 4.0f;
+    }
+    if (
+        record->x < 0.0f || record->y < 0.0f ||
+        record->x >= record->frameWidth || record->y >= record->frameHeight ||
+        record->kind < MacWSInputKindTouchDown ||
+        record->kind > MacWSInputKindScroll) {
+        return false;
+    }
+    return true;
 }
 
 static CGPoint QuartzPointForRecord(const MacWSInputRecord *record,
@@ -186,6 +203,8 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindDeactivateApplication:
         case MacWSInputKindKeyDown:
         case MacWSInputKindKeyUp:
+        case MacWSInputKindScroll:
+        case MacWSInputKindConfigureWindow:
             // Consumed before event construction in main().
             return 0;
     }
@@ -553,6 +572,7 @@ static MacWSWindowTarget ProbeAppInputTarget(
         record->kind == MacWSInputKindMenuHover ||
         record->kind == MacWSInputKindKeyDown ||
         record->kind == MacWSInputKindKeyUp ||
+        record->kind == MacWSInputKindScroll ||
         systemMenuActivation;
     if (target.pid <= 1 && allowActiveFallback) {
         if (!frontAmbiguous && frontTarget.pid > 1) {
@@ -780,6 +800,27 @@ int main(void) {
             continue;
         }
 
+        // Window configuration is an exact-PID control-plane transaction.
+        // It has no Quartz point and must remain usable while WindowServer is
+        // still publishing or reconfiguring display geometry.
+        if (record.kind == MacWSInputKindConfigureWindow) {
+            int appBridgeError = 0;
+            bool appBridgeSent = SendToAppInputBridge(
+                socketFD, &record, &appBridgeError);
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT CONFIGURE seq=%llu target=%d window=%u "
+                    "size=%.1fx%.1f density=%.2f sent=%s errno=%d\n",
+                    (unsigned long long)sequence, record.targetPID,
+                    MacWSInputWindowIDForScene(record.sceneID),
+                    record.x, record.y, record.pressure,
+                    appBridgeSent ? "YES" : "NO", appBridgeError);
+                fflush(stderr);
+            }
+            continue;
+        }
+
         // launchd can start this job before WindowServer has published its
         // display. Refresh on the first record, whenever geometry is zero,
         // and periodically so later display reconfiguration is not frozen.
@@ -825,7 +866,8 @@ int main(void) {
         MacWSWindowTarget eventTarget = {0};
         bool keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
-        if (keyRecord && menuTarget.pid > 1) {
+        bool scrollRecord = record.kind == MacWSInputKindScroll;
+        if ((keyRecord || scrollRecord) && menuTarget.pid > 1) {
             // ActivateTarget is resolved before the authoritative native
             // mouse-down and remains the front application target after the
             // menu candidate ends.  Keyboard focus follows that application,
@@ -839,7 +881,7 @@ int main(void) {
             // owner instead of starting a second main-thread probe just as
             // the application is about to enter its contextual-menu loop.
             eventTarget = menuTarget;
-        } else if (keyRecord && hoverTarget.pid > 1) {
+        } else if ((keyRecord || scrollRecord) && hoverTarget.pid > 1) {
             eventTarget = hoverTarget;
         } else if (record.kind == MacWSInputKindMenuHover &&
             menuTarget.pid > 1) {
@@ -866,7 +908,8 @@ int main(void) {
             if (eventTarget.pid <= 1) {
                 if (record.kind == MacWSInputKindTouchDown ||
                     record.kind == MacWSInputKindTap ||
-                    record.kind == MacWSInputKindSecondaryTap || keyRecord) {
+                    record.kind == MacWSInputKindSecondaryTap || keyRecord ||
+                    scrollRecord) {
                     eventTarget = ProbeAppInputTarget(targetSocketFD, &record);
                 } else if ((record.kind == MacWSInputKindHover ||
                             record.kind == MacWSInputKindMenuHover) &&
@@ -922,6 +965,11 @@ int main(void) {
         bool appBridgeAttempted =
             record.kind != MacWSInputKindActivateTarget ||
             activationRepairNeeded || systemMenuPreflightNeeded;
+        // Scroll uses CoreGraphics' public per-process wheel-event route
+        // below.  Do not also enqueue the same ABI-v3 record into the AppKit
+        // mouse bridge, whose event factory intentionally handles buttons and
+        // pointer motion only.
+        if (scrollRecord) appBridgeAttempted = false;
         bool appBridgeSent = appBridgeAttempted &&
             SendToAppInputBridge(socketFD, &routedRecord, &appBridgeError);
         if ((record.kind == MacWSInputKindHover ||
@@ -966,6 +1014,33 @@ int main(void) {
                     (unsigned long long)(record.sceneID & 0xffffffffull),
                     appBridgeSent ? "YES" : "NO", appBridgeError);
             if (RuntimeDiagnosticsEnabled()) fflush(stderr);
+            continue;
+        }
+        if (scrollRecord) {
+            uint32_t horizontalBits = record.contactID;
+            float horizontal = 0.0f;
+            memcpy(&horizontal, &horizontalBits, sizeof(horizontal));
+            int32_t verticalPixels = (int32_t)lrintf(record.pressure);
+            int32_t horizontalPixels = isfinite(horizontal)
+                ? (int32_t)lrintf(horizontal) : 0;
+            CGEventRef scrollEvent = eventTarget.pid > 1
+                ? CGEventCreateScrollWheelEvent(NULL, 0 /* pixel */, 2,
+                                                verticalPixels,
+                                                horizontalPixels)
+                : NULL;
+            if (scrollEvent) {
+                CGEventPostToPid(eventTarget.pid, scrollEvent);
+                CFRelease(scrollEvent);
+            }
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT SCROLL seq=%llu target=%d delta=(%d,%d) posted=%s\n",
+                    (unsigned long long)sequence, eventTarget.pid,
+                    horizontalPixels, verticalPixels,
+                    scrollEvent ? "YES" : "NO");
+                fflush(stderr);
+            }
             continue;
         }
         CGMouseButton mouseButton =

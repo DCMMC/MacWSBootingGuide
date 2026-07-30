@@ -53,6 +53,7 @@ for p in $(jobs -p); do kill -9 $p 2>/dev/null; done
 echo === killing chroot processes ===
 for pat in WindowServer launchservicesd OSXvnc-server Terminal GlassDemo \
            "Activity Monitor" launchdchrootexec MTLSimDriverHost macwsinputd \
+           macwsdisplayd macwsinteropd \
            "Visual Studio Code.app" "Code Helper" \
            "Google Chrome.app" "Chrome Helper" MacWSHost; do
   pkill -9 -f "$pat" 2>/dev/null
@@ -78,6 +79,10 @@ killall -9 macwsallocd 2>/dev/null
 
 echo === killing macwsinputd ===
 killall -9 macwsinputd 2>/dev/null
+echo === killing display and interop bridges ===
+killall -9 macwsdisplayd 2>/dev/null
+killall -9 macwsinteropd 2>/dev/null
+rm -f /var/mnt/rootfs/private/tmp/macws_window_metrics.*.bin 2>/dev/null
 
 echo === killing orphan build/debug scripts ===
 for pat in 'sh /tmp/' oslog build_on_ios.sh find_crash.sh '/var/jb/usr/bin/lldb' \
@@ -95,7 +100,7 @@ sleep 2
 echo
 echo === final state ===
 ps aux | grep -iE \
-  "WindowServer|macwsallocd|macwsinputd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|MacWSHost" \
+  "WindowServer|macwsallocd|macwsinputd|macwsdisplayd|macwsinteropd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|MacWSHost" \
   | grep -v grep | head -10 || echo "(none)"
 echo
 uptime

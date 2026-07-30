@@ -3,10 +3,13 @@
 #import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <IOKit/IOKitLib.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <simd/simd.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach/mach_time.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -19,8 +22,11 @@
 #include <unistd.h>
 
 #import "MacWSControlClient.h"
+#import "MacWSInteropClient.h"
+#import "MacWSStreamClient.h"
 #include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
+#include "macws_viewport_math.h"
 
 static NSString *const MacWSFramePath =
     @"/var/mnt/rootfs/private/tmp/macws_vnc_fb";
@@ -29,6 +35,32 @@ static NSString *const MacWSCaptureAckPath =
 static NSString *const MacWSLogPath = @"/var/mobile/Library/Logs/MacWSHost.log";
 static const char MacWSInputSocketPath[] =
     "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
+
+static BOOL MacWSAppInputEndpointReady(int32_t pid) {
+    if (pid <= 1) return NO;
+    char path[PATH_MAX] = {0};
+    int length = snprintf(path, sizeof(path),
+        "/var/mnt/rootfs/private/tmp/macws_app_input.%d.sock", pid);
+    return length > 0 && (size_t)length < sizeof(path) &&
+        access(path, F_OK) == 0;
+}
+
+static double MacWSMachMilliseconds(uint64_t start, uint64_t end) {
+    if (!start || end < start) return -1.0;
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        (void)mach_timebase_info(&timebase);
+    });
+    if (!timebase.denom) return -1.0;
+    long double nanoseconds = (long double)(end - start) *
+        timebase.numer / timebase.denom;
+    return (double)(nanoseconds / 1000000.0L);
+}
+
+static CGFloat MacWSDensityScale(MacWSHostDisplayDensity density) {
+    return density == MacWSHostDisplayDensityKeyboard ? 1.0 : 1.35;
+}
 
 static void MacWSLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void MacWSLog(NSString *format, ...) {
@@ -249,19 +281,134 @@ static void MacWSLogMetalRegistryState(void) {
 - (NSString *)lastError { return _lastError; }
 @end
 
+static uint16_t MacWSMacKeyCodeForHIDUsage(NSInteger usage) {
+    static const uint16_t letterCodes[] = {
+        0, 11, 8, 2, 14, 3, 5, 4, 34, 38, 40, 37, 46,
+        45, 31, 35, 12, 15, 1, 17, 32, 9, 13, 7, 16, 6,
+    };
+    if (usage >= 4 && usage <= 29) return letterCodes[usage - 4];
+    static const uint16_t digitCodes[] = {18, 19, 20, 21, 23, 22, 26, 28, 25, 29};
+    if (usage >= 30 && usage <= 39) return digitCodes[usage - 30];
+    switch (usage) {
+        case 40: return 36;  // Return
+        case 41: return 53;  // Escape
+        case 42: return 51;  // Delete backward
+        case 43: return 48;  // Tab
+        case 44: return 49;  // Space
+        case 45: return 27;  // -
+        case 46: return 24;  // =
+        case 47: return 33;  // [
+        case 48: return 30;  // ]
+        case 49: return 42;  // backslash
+        case 51: return 41;  // ;
+        case 52: return 39;  // quote
+        case 53: return 50;  // grave
+        case 54: return 43;  // comma
+        case 55: return 47;  // period
+        case 56: return 44;  // slash
+        case 57: return 57;  // Caps Lock
+        case 58: return 122; // F1
+        case 59: return 120; // F2
+        case 60: return 99;  // F3
+        case 61: return 118; // F4
+        case 62: return 96;  // F5
+        case 63: return 97;  // F6
+        case 64: return 98;  // F7
+        case 65: return 100; // F8
+        case 66: return 101; // F9
+        case 67: return 109; // F10
+        case 68: return 103; // F11
+        case 69: return 111; // F12
+        case 74: return 115; // Home
+        case 75: return 116; // Page Up
+        case 76: return 117; // Delete forward
+        case 77: return 119; // End
+        case 78: return 121; // Page Down
+        case 79: return 124; // Right
+        case 80: return 123; // Left
+        case 81: return 125; // Down
+        case 82: return 126; // Up
+        case 224: return 59; // Left Control
+        case 225: return 56; // Left Shift
+        case 226: return 58; // Left Option
+        case 227: return 55; // Left Command
+        case 228: return 62; // Right Control
+        case 229: return 60; // Right Shift
+        case 230: return 61; // Right Option
+        case 231: return 54; // Right Command
+        default: return UINT16_MAX;
+    }
+}
+
+static uint32_t MacWSKeySymForHIDUsage(NSInteger usage, NSString *characters) {
+    switch (usage) {
+        case 40: return 0xff0d;
+        case 41: return 0xff1b;
+        case 42: return 0xff08;
+        case 43: return 0xff09;
+        case 58 ... 69: return 0xffbeu + (uint32_t)(usage - 58);
+        case 74: return 0xff50;
+        case 75: return 0xff55;
+        case 76: return 0xffff;
+        case 77: return 0xff57;
+        case 78: return 0xff56;
+        case 79: return 0xff53;
+        case 80: return 0xff51;
+        case 81: return 0xff54;
+        case 82: return 0xff52;
+        case 224: return 0xffe3;
+        case 225: return 0xffe1;
+        case 226: return 0xffe9;
+        case 227: return 0xffe7;
+        case 228: return 0xffe4;
+        case 229: return 0xffe2;
+        case 230: return 0xffea;
+        case 231: return 0xffe8;
+    }
+    if (characters.length == 0) return 0;
+    __block uint32_t scalar = 0;
+    [characters.lowercaseString enumerateSubstringsInRange:
+        NSMakeRange(0, characters.length)
+        options:NSStringEnumerationByComposedCharacterSequences
+        usingBlock:^(NSString *substring, NSRange substringRange,
+                     NSRange enclosingRange, BOOL *stop) {
+            (void)substringRange;
+            (void)enclosingRange;
+            NSData *data = [substring dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+            if (data.length >= sizeof(scalar)) memcpy(&scalar, data.bytes, sizeof(scalar));
+            *stop = YES;
+        }];
+    return scalar;
+}
+
 @class MacWSMetalView;
 
 @protocol MacWSMetalViewStatusDelegate <NSObject>
 - (void)metalView:(MacWSMetalView *)view statusChanged:(NSString *)status;
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record;
+- (void)metalView:(MacWSMetalView *)view
+  receivedWindows:(NSArray<MacWSStreamWindow *> *)windows;
 @end
 
-@interface MacWSMetalView : MTKView <MTKViewDelegate>
+@interface MacWSMetalView : MTKView
+    <MTKViewDelegate, MacWSStreamClientDelegate, UIGestureRecognizerDelegate>
 @property(nonatomic, weak) id<MacWSMetalViewStatusDelegate> statusDelegate;
 @property(nonatomic) uint64_t sceneID;
+@property(nonatomic) uint32_t targetWindowID;
 @property(nonatomic) int32_t targetPID;
 @property(nonatomic, getter=isMacWSInputEnabled) BOOL macWSInputEnabled;
+@property(nonatomic) MacWSHostInputMode inputMode;
+@property(nonatomic) MacWSHostDisplayDensity displayDensity;
+@property(nonatomic) CGSize minimumLogicalSize;
+@property(nonatomic) BOOL targetWindowResizable;
+@property(nonatomic, readonly) BOOL hasDirectSurfaceFrame;
+@property(nonatomic, readonly) BOOL streamServiceConnected;
 - (void)setMacWSInputEnabled:(BOOL)enabled reason:(NSString *)reason;
+- (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID;
+- (void)requestStreamWindowList;
+- (void)refreshPresentationPolicy;
+- (void)resetViewportZoom;
+- (void)suspendStream;
 @end
 
 @implementation MacWSMetalView {
@@ -272,11 +419,14 @@ static void MacWSLogMetalRegistryState(void) {
     uint32_t _textureWidth;
     uint32_t _textureHeight;
     CGRect _contentRect;
+    CGRect _visibleSourceRect;
     BOOL _reportedNonzeroFrame;
     BOOL _submittedPresentWitness;
     NSString *_lastStatus;
     UIView *_touchMarker;
     UILabel *_inputUnavailableLabel;
+    UIView *_tooSmallOverlay;
+    UILabel *_tooSmallLabel;
     UIImageView *_fallbackImageView;
     CADisplayLink *_framePollDisplayLink;
     uint64_t _fallbackSignature;
@@ -284,6 +434,31 @@ static void MacWSLogMetalRegistryState(void) {
     uint64_t _pendingCaptureGeneration;
     uint64_t _presentedCaptureGeneration;
     BOOL _macWSInputEnabled;
+    BOOL _windowTooSmall;
+    MacWSStreamClient *_streamClient;
+    MacWSSurfaceFrame *_surfaceFrame;
+    id<MTLTexture> _surfaceTexture;
+    NSMutableArray<MacWSSurfaceFrame *> *_retiredSurfaceFrames;
+    uint64_t _submittedSurfaceSequence;
+    BOOL _streamConnected;
+    UITouch *_trackpadTouch;
+    CGPoint _trackpadCursor;
+    CGPoint _trackpadPreviousPoint;
+    CGFloat _trackpadTravel;
+    NSTimeInterval _trackpadBeganAt;
+    BOOL _trackpadButtonDown;
+    BOOL _trackpadHadMultipleTouches;
+    UITouch *_directTouch;
+    BOOL _directGestureBlocked;
+    CGFloat _viewportZoom;
+    CGPoint _viewportCenter;
+    CGFloat _pinchStartZoom;
+    CGPoint _pinchAnchorSource;
+    CGPoint _pinchAnchorView;
+    UIPanGestureRecognizer *_twoFingerPanRecognizer;
+    uint64_t _windowConfigurationSerial;
+    CGSize _lastRequestedWindowSize;
+    CGFloat _lastRequestedDensityScale;
 }
 
 - (instancetype)initWithFrame:(CGRect)frameRect {
@@ -303,15 +478,23 @@ static void MacWSLogMetalRegistryState(void) {
     self.autoResizeDrawable = YES;
     self.clearColor = MTLClearColorMake(0.025, 0.028, 0.035, 1.0);
     self.multipleTouchEnabled = YES;
+    self.inputMode = MacWSHostInputModeDirect;
+    self.displayDensity = MacWSHostDisplayDensityTouchComfort;
     // Status polling enables interaction only after WindowServer, the input
     // socket and an exact-PID acknowledged frame are all present.  A stale
     // screenshot must never look like a live, touchable workspace.
     self.userInteractionEnabled = NO;
 
     _frame = [MacWSMappedFrame new];
+    _streamClient = [MacWSStreamClient new];
+    _streamClient.delegate = self;
+    _retiredSurfaceFrames = [NSMutableArray array];
     _commandQueue = [device newCommandQueue];
     _commandQueue.label = @"MacWSHost display queue";
     _contentRect = CGRectZero;
+    _visibleSourceRect = CGRectMake(0, 0, 1, 1);
+    _viewportZoom = 1.0;
+    _viewportCenter = CGPointMake(0.5, 0.5);
 
     _touchMarker = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 22, 22)];
     _touchMarker.backgroundColor = UIColor.clearColor;
@@ -345,6 +528,31 @@ static void MacWSLogMetalRegistryState(void) {
         [_inputUnavailableLabel.heightAnchor constraintGreaterThanOrEqualToConstant:38],
     ]];
 
+    _tooSmallOverlay = [UIView new];
+    _tooSmallOverlay.translatesAutoresizingMaskIntoConstraints = NO;
+    _tooSmallOverlay.backgroundColor =
+        [UIColor.systemBackgroundColor colorWithAlphaComponent:0.98];
+    _tooSmallOverlay.hidden = YES;
+    _tooSmallOverlay.userInteractionEnabled = NO;
+    [self addSubview:_tooSmallOverlay];
+    _tooSmallLabel = [UILabel new];
+    _tooSmallLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _tooSmallLabel.numberOfLines = 0;
+    _tooSmallLabel.textAlignment = NSTextAlignmentCenter;
+    _tooSmallLabel.textColor = UIColor.labelColor;
+    _tooSmallLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
+    [_tooSmallOverlay addSubview:_tooSmallLabel];
+    [NSLayoutConstraint activateConstraints:@[
+        [_tooSmallOverlay.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+        [_tooSmallOverlay.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+        [_tooSmallOverlay.topAnchor constraintEqualToAnchor:self.topAnchor],
+        [_tooSmallOverlay.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+        [_tooSmallLabel.centerXAnchor constraintEqualToAnchor:_tooSmallOverlay.centerXAnchor],
+        [_tooSmallLabel.centerYAnchor constraintEqualToAnchor:_tooSmallOverlay.centerYAnchor],
+        [_tooSmallLabel.widthAnchor constraintLessThanOrEqualToAnchor:_tooSmallOverlay.widthAnchor
+                                                             multiplier:0.82],
+    ]];
+
     if (device) {
         [self buildPipeline];
     } else {
@@ -353,7 +561,8 @@ static void MacWSLogMetalRegistryState(void) {
         _fallbackImageView.autoresizingMask =
             UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         _fallbackImageView.backgroundColor = UIColor.blackColor;
-        _fallbackImageView.contentMode = UIViewContentModeScaleAspectFit;
+        _fallbackImageView.contentMode = UIViewContentModeScaleAspectFill;
+        _fallbackImageView.clipsToBounds = YES;
         _fallbackImageView.userInteractionEnabled = NO;
         [self insertSubview:_fallbackImageView atIndex:0];
         MacWSLog(@"native Metal device unavailable; UIKit fallback armed");
@@ -371,11 +580,199 @@ static void MacWSLogMetalRegistryState(void) {
                                                        action:@selector(hovered:)];
         [self addGestureRecognizer:hover];
     }
+    _twoFingerPanRecognizer = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(trackpadScrolled:)];
+    _twoFingerPanRecognizer.minimumNumberOfTouches = 2;
+    _twoFingerPanRecognizer.maximumNumberOfTouches = 2;
+    _twoFingerPanRecognizer.cancelsTouchesInView = YES;
+    _twoFingerPanRecognizer.delegate = self;
+    [self addGestureRecognizer:_twoFingerPanRecognizer];
+    UIPinchGestureRecognizer *pinch = [[UIPinchGestureRecognizer alloc]
+        initWithTarget:self action:@selector(viewportPinched:)];
+    pinch.cancelsTouchesInView = YES;
+    pinch.delegate = self;
+    [self addGestureRecognizer:pinch];
+    UITapGestureRecognizer *resetZoom = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(viewportResetTapped:)];
+    resetZoom.numberOfTouchesRequired = 2;
+    resetZoom.numberOfTapsRequired = 2;
+    resetZoom.cancelsTouchesInView = YES;
+    [self addGestureRecognizer:resetZoom];
+    UITapGestureRecognizer *secondaryTap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(trackpadSecondaryTapped:)];
+    secondaryTap.numberOfTouchesRequired = 2;
+    secondaryTap.cancelsTouchesInView = NO;
+    [secondaryTap requireGestureRecognizerToFail:resetZoom];
+    [self addGestureRecognizer:secondaryTap];
     return self;
 }
 
 - (void)dealloc {
     [_framePollDisplayLink invalidate];
+    if (_surfaceFrame) [_streamClient releaseFrame:_surfaceFrame];
+    for (MacWSSurfaceFrame *frame in _retiredSurfaceFrames)
+        [_streamClient releaseFrame:frame];
+    [_streamClient invalidate];
+}
+
+- (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
+    self.targetWindowID = mode == MacWSStreamModeWindow ? windowID : 0;
+    [_streamClient subscribeToMode:mode windowID:windowID];
+    [self refreshPresentationPolicy];
+}
+
+- (uint64_t)inputSceneIDWithModifiers:(uint32_t)modifiers {
+    if (self.targetWindowID != 0)
+        return MacWSInputSceneForWindow(self.targetWindowID, modifiers);
+    return modifiers ? (uint64_t)modifiers : self.sceneID;
+}
+
+- (void)requestStreamWindowList {
+    [_streamClient requestWindowList];
+}
+
+- (void)suspendStream {
+    [_streamClient unsubscribe];
+    NSMutableArray<MacWSSurfaceFrame *> *leases =
+        [_retiredSurfaceFrames mutableCopy];
+    [_retiredSurfaceFrames removeAllObjects];
+    if (_surfaceFrame) [leases addObject:_surfaceFrame];
+    _surfaceFrame = nil;
+    _surfaceTexture = nil;
+    _sourceTexture = nil;
+    _textureWidth = 0;
+    _textureHeight = 0;
+    if (leases.count && _commandQueue) {
+        id<MTLCommandBuffer> fence = [_commandQueue commandBuffer];
+        __weak MacWSStreamClient *weakClient = _streamClient;
+        [fence addCompletedHandler:^(__unused id<MTLCommandBuffer> completed) {
+            for (MacWSSurfaceFrame *frame in leases)
+                [weakClient releaseFrame:frame];
+        }];
+        [fence commit];
+    } else {
+        for (MacWSSurfaceFrame *frame in leases)
+            [_streamClient releaseFrame:frame];
+    }
+}
+
+- (uint32_t)currentFrameWidth {
+    return _surfaceFrame ? _surfaceFrame.descriptor.width : _frame.width;
+}
+
+- (uint32_t)currentFrameHeight {
+    return _surfaceFrame ? _surfaceFrame.descriptor.height : _frame.height;
+}
+
+- (BOOL)hasDirectSurfaceFrame { return _surfaceFrame != nil; }
+- (BOOL)streamServiceConnected { return _streamClient.isConnected; }
+
+- (void)setTargetPID:(int32_t)targetPID {
+    _targetPID = targetPID;
+    [self refreshPresentationPolicy];
+}
+
+- (void)setDisplayDensity:(MacWSHostDisplayDensity)displayDensity {
+    if (displayDensity != MacWSHostDisplayDensityTouchComfort &&
+        displayDensity != MacWSHostDisplayDensityKeyboard) return;
+    _displayDensity = displayDensity;
+    _lastRequestedWindowSize = CGSizeZero;
+    [self resetViewportZoom];
+    [self refreshPresentationPolicy];
+}
+
+- (void)setMinimumLogicalSize:(CGSize)minimumLogicalSize {
+    _minimumLogicalSize = (CGSize){
+        isfinite(minimumLogicalSize.width) && minimumLogicalSize.width > 0
+            ? minimumLogicalSize.width : 0,
+        isfinite(minimumLogicalSize.height) && minimumLogicalSize.height > 0
+            ? minimumLogicalSize.height : 0,
+    };
+    [self refreshPresentationPolicy];
+}
+
+- (void)setTargetWindowResizable:(BOOL)targetWindowResizable {
+    _targetWindowResizable = targetWindowResizable;
+    [self refreshPresentationPolicy];
+}
+
+- (void)updateWindowTooSmallState {
+    CGFloat density = MacWSDensityScale(self.displayDensity);
+    CGSize available = self.bounds.size;
+    CGFloat requiredWidth = self.minimumLogicalSize.width * density;
+    CGFloat requiredHeight = self.minimumLogicalSize.height * density;
+    BOOL hasRequirement = self.targetWindowID != 0 &&
+        (requiredWidth > 0 || requiredHeight > 0);
+    _windowTooSmall = hasRequirement &&
+        ((requiredWidth > 0 && available.width + 0.5 < requiredWidth) ||
+         (requiredHeight > 0 && available.height + 0.5 < requiredHeight));
+    _tooSmallOverlay.hidden = !_windowTooSmall;
+    _inputUnavailableLabel.hidden = _windowTooSmall || _macWSInputEnabled;
+    self.userInteractionEnabled = _macWSInputEnabled && !_windowTooSmall;
+    if (_windowTooSmall) {
+        NSString *densityName = self.displayDensity ==
+            MacWSHostDisplayDensityKeyboard ? @"键鼠高密度" : @"触屏舒适";
+        _tooSmallLabel.text = [NSString stringWithFormat:
+            @"窗口太小\n\n此 macOS 应用至少需要 %.0f × %.0f 点\n"
+             "当前 %@ 模式需要约 %.0f × %.0f iPad 点\n\n"
+             "请放大 iPadOS 窗口，或切换到键鼠高密度模式。",
+            self.minimumLogicalSize.width,
+            self.minimumLogicalSize.height,
+            densityName, requiredWidth, requiredHeight];
+    }
+}
+
+- (void)scheduleWindowConfiguration {
+    uint64_t serial = ++_windowConfigurationSerial;
+    if (self.targetWindowID == 0 || self.targetPID <= 1 ||
+        !self.targetWindowResizable || _windowTooSmall ||
+        self.bounds.size.width < 64 || self.bounds.size.height < 64) return;
+    CGFloat density = MacWSDensityScale(self.displayDensity);
+    CGSize requested = {
+        self.bounds.size.width / density,
+        self.bounds.size.height / density,
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 180 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (serial != self->_windowConfigurationSerial ||
+            self->_windowTooSmall || self.targetPID <= 1) return;
+        if (fabs(requested.width - self->_lastRequestedWindowSize.width) < 1.0 &&
+            fabs(requested.height - self->_lastRequestedWindowSize.height) < 1.0 &&
+            fabs(density - self->_lastRequestedDensityScale) < 0.001) return;
+        self->_lastRequestedWindowSize = requested;
+        self->_lastRequestedDensityScale = density;
+        MacWSInputRecord record = {
+            .magic = MACWS_INPUT_MAGIC,
+            .version = MACWS_INPUT_VERSION,
+            .kind = MacWSInputKindConfigureWindow,
+            .sceneID = MacWSInputSceneForWindow(self.targetWindowID, 0),
+            .timestamp = CACurrentMediaTime(),
+            .x = (float)requested.width,
+            .y = (float)requested.height,
+            .pressure = (float)density,
+            .frameWidth = (uint32_t)ceil(requested.width) + 1,
+            .frameHeight = (uint32_t)ceil(requested.height) + 1,
+            .targetPID = self.targetPID,
+        };
+        [self.statusDelegate metalView:self emittedInput:record];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     650 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (serial == self->_windowConfigurationSerial)
+                [self requestStreamWindowList];
+        });
+    });
+}
+
+- (void)refreshPresentationPolicy {
+    [self updateWindowTooSmallState];
+    [self scheduleWindowConfiguration];
+    [self setNeedsDisplay];
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [self refreshPresentationPolicy];
 }
 
 - (void)setMacWSInputEnabled:(BOOL)enabled {
@@ -383,18 +780,85 @@ static void MacWSLogMetalRegistryState(void) {
 }
 
 - (BOOL)isMacWSInputEnabled {
-    return _macWSInputEnabled;
+    return _macWSInputEnabled && !_windowTooSmall;
 }
 
 - (void)setMacWSInputEnabled:(BOOL)enabled reason:(NSString *)reason {
     _macWSInputEnabled = enabled;
-    self.userInteractionEnabled = enabled;
-    _inputUnavailableLabel.hidden = enabled;
     if (!enabled) {
         _touchMarker.hidden = YES;
         _inputUnavailableLabel.text = [NSString stringWithFormat:
             @"触控暂不可用 · %@", reason.length ? reason : @"工作区未就绪"];
     }
+    [self updateWindowTooSmallState];
+}
+
+- (void)setInputMode:(MacWSHostInputMode)inputMode {
+    if (inputMode != MacWSHostInputModeDirect &&
+        inputMode != MacWSHostInputModeTrackpad) return;
+    _inputMode = inputMode;
+    _trackpadTouch = nil;
+    _trackpadButtonDown = NO;
+    _trackpadTravel = 0;
+    _trackpadHadMultipleTouches = NO;
+    _directTouch = nil;
+    _directGestureBlocked = NO;
+    _touchMarker.hidden = YES;
+}
+
+- (BOOL)canBecomeFirstResponder { return YES; }
+
+- (void)emitKeyPresses:(NSSet<UIPress *> *)presses kind:(MacWSInputKind)kind {
+    if (!self.isMacWSInputEnabled) return;
+    uint32_t width = [self currentFrameWidth];
+    uint32_t height = [self currentFrameHeight];
+    if (width == 0 || height == 0) return;
+    for (UIPress *press in presses) {
+        UIKey *key = press.key;
+        if (!key) continue;
+        uint16_t keyCode = MacWSMacKeyCodeForHIDUsage(key.keyCode);
+        if (keyCode == UINT16_MAX) continue;
+        uint32_t keySym = MacWSKeySymForHIDUsage(
+            key.keyCode, key.charactersIgnoringModifiers);
+        CGPoint keyPoint = _trackpadCursor;
+        if (keyPoint.x < 0 || keyPoint.y < 0 ||
+            keyPoint.x >= width || keyPoint.y >= height)
+            keyPoint = CGPointMake(width * 0.5, height * 0.5);
+        MacWSInputRecord record = {
+            .magic = MACWS_INPUT_MAGIC,
+            .version = MACWS_INPUT_VERSION,
+            .kind = kind,
+            // AppInputBridge's established v3 keyboard ABI stores AppKit-
+            // compatible modifier bits in sceneID's low 32 bits.
+            .sceneID = [self inputSceneIDWithModifiers:
+                (uint32_t)key.modifierFlags],
+            .timestamp = press.timestamp,
+            .x = (float)keyPoint.x,
+            .y = (float)keyPoint.y,
+            .pressure = (float)keyCode,
+            .contactID = keySym,
+            .frameWidth = width,
+            .frameHeight = height,
+            .targetPID = self.targetPID,
+        };
+        [self.statusDelegate metalView:self emittedInput:record];
+    }
+}
+
+- (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self emitKeyPresses:presses kind:MacWSInputKindKeyDown];
+    [super pressesBegan:presses withEvent:event];
+}
+
+- (void)pressesEnded:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)event {
+    [self emitKeyPresses:presses kind:MacWSInputKindKeyUp];
+    [super pressesEnded:presses withEvent:event];
+}
+
+- (void)pressesCancelled:(NSSet<UIPress *> *)presses
+                withEvent:(UIPressesEvent *)event {
+    [self emitKeyPresses:presses kind:MacWSInputKindKeyUp];
+    [super pressesCancelled:presses withEvent:event];
 }
 
 - (void)buildPipeline {
@@ -467,23 +931,36 @@ static void MacWSLogMetalRegistryState(void) {
 - (void)updateContentRectAndVertices:(simd_float4 [4])vertices {
     CGFloat viewWidth = self.bounds.size.width;
     CGFloat viewHeight = self.bounds.size.height;
-    CGFloat sourceAspect = (CGFloat)_frame.width / (CGFloat)_frame.height;
-    CGFloat viewAspect = viewHeight > 0 ? viewWidth / viewHeight : sourceAspect;
-    CGFloat sx = 1.0, sy = 1.0;
-    if (sourceAspect > viewAspect) {
-        sy = viewAspect / sourceAspect;
-    } else {
-        sx = sourceAspect / viewAspect;
+    uint32_t frameWidth = [self currentFrameWidth];
+    uint32_t frameHeight = [self currentFrameHeight];
+    MacWSViewport viewport = {0};
+    BOOL valid = MacWSComputeViewport(
+        frameWidth, frameHeight, viewWidth, viewHeight, _viewportZoom,
+        _viewportCenter.x, _viewportCenter.y, &viewport);
+    if (!valid) {
+        viewport = (MacWSViewport){
+            .visibleSource = {0, 0, 1, 1},
+            .centerX = 0.5,
+            .centerY = 0.5,
+            .zoom = 1.0,
+        };
     }
-    CGFloat contentWidth = viewWidth * sx;
-    CGFloat contentHeight = viewHeight * sy;
-    _contentRect = CGRectMake((viewWidth - contentWidth) * 0.5,
-                              (viewHeight - contentHeight) * 0.5,
-                              contentWidth, contentHeight);
-    vertices[0] = (simd_float4){-sx, -sy, 0, 1};
-    vertices[1] = (simd_float4){ sx, -sy, 1, 1};
-    vertices[2] = (simd_float4){-sx,  sy, 0, 0};
-    vertices[3] = (simd_float4){ sx,  sy, 1, 0};
+    _viewportZoom = viewport.zoom;
+    _viewportCenter = CGPointMake(viewport.centerX, viewport.centerY);
+    _visibleSourceRect = CGRectMake(
+        viewport.visibleSource.x, viewport.visibleSource.y,
+        viewport.visibleSource.width, viewport.visibleSource.height);
+    _contentRect = self.bounds;
+    CGFloat minX = CGRectGetMinX(_visibleSourceRect);
+    CGFloat maxX = CGRectGetMaxX(_visibleSourceRect);
+    CGFloat minY = CGRectGetMinY(_visibleSourceRect);
+    CGFloat maxY = CGRectGetMaxY(_visibleSourceRect);
+    // Fill the Scene edge-to-edge. Aspect mismatch is represented by a
+    // bounded source crop, never by letterboxing.
+    vertices[0] = (simd_float4){-1, -1, minX, maxY};
+    vertices[1] = (simd_float4){ 1, -1, maxX, maxY};
+    vertices[2] = (simd_float4){-1,  1, minX, minY};
+    vertices[3] = (simd_float4){ 1,  1, maxX, minY};
 }
 
 - (BOOL)frameHasSampledContent {
@@ -589,23 +1066,28 @@ static void MacWSLogMetalRegistryState(void) {
 
 - (void)drawInMTKView:(MTKView *)view {
     if (!_pipeline || !_commandQueue) return;
-    if (![_frame refresh]) {
-        [self publishStatus:_frame.lastError ?: @"等待共享帧"];
-        return;
-    }
-    if (![self ensureSourceTexture]) {
-        [self publishStatus:@"无法创建帧上传纹理"];
-        return;
-    }
+    BOOL directSurface = _surfaceFrame != nil && _surfaceTexture != nil;
+    if (directSurface) {
+        _sourceTexture = _surfaceTexture;
+    } else {
+        if (![_frame refresh]) {
+            [self publishStatus:_frame.lastError ?: @"等待共享帧"];
+            return;
+        }
+        if (![self ensureSourceTexture]) {
+            [self publishStatus:@"无法创建帧上传纹理"];
+            return;
+        }
 
-    MTLRegion region = MTLRegionMake2D(0, 0, _frame.width, _frame.height);
-    [_sourceTexture replaceRegion:region mipmapLevel:0 withBytes:_frame.pixels
-                      bytesPerRow:_frame.stride];
+        MTLRegion region = MTLRegionMake2D(0, 0, _frame.width, _frame.height);
+        [_sourceTexture replaceRegion:region mipmapLevel:0 withBytes:_frame.pixels
+                          bytesPerRow:_frame.stride];
 
-    if (!_reportedNonzeroFrame && [self frameHasSampledContent]) {
-        _reportedNonzeroFrame = YES;
-        MacWSLog(@"runtime-confirmed source frame nonzero %ux%u stride=%u path=%@",
-                 _frame.width, _frame.height, _frame.stride, MacWSFramePath);
+        if (!_reportedNonzeroFrame && [self frameHasSampledContent]) {
+            _reportedNonzeroFrame = YES;
+            MacWSLog(@"runtime-confirmed source frame nonzero %ux%u stride=%u path=%@",
+                     _frame.width, _frame.height, _frame.stride, MacWSFramePath);
+        }
     }
 
     MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
@@ -623,26 +1105,68 @@ static void MacWSLogMetalRegistryState(void) {
                 vertexStart:0 vertexCount:4];
     [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];
-    if (_reportedNonzeroFrame && !_submittedPresentWitness) {
+    uint64_t submitTime = mach_absolute_time();
+    uint32_t presentedWidth = [self currentFrameWidth];
+    uint32_t presentedHeight = [self currentFrameHeight];
+    MacWSSurfaceFrame *submittedFrame = directSurface ? _surfaceFrame : nil;
+    NSArray<MacWSSurfaceFrame *> *framesToRelease =
+        _retiredSurfaceFrames.count ? [_retiredSurfaceFrames copy] : @[];
+    [_retiredSurfaceFrames removeAllObjects];
+    if (submittedFrame) _submittedSurfaceSequence = submittedFrame.descriptor.sequence;
+    if (submittedFrame && (submittedFrame.descriptor.sequence % 120) == 0) {
+        uint64_t captureTime = submittedFrame.descriptor.displayTime;
+        uint64_t receiptTime = submittedFrame.receiptTime;
+        uint64_t sequence = submittedFrame.descriptor.sequence;
+        uint64_t streamID = submittedFrame.descriptor.streamID;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            uint64_t completeTime = mach_absolute_time();
+            MacWSLog(@"display-perf stream=%llu sequence=%llu "
+                     "capture-to-receipt-ms=%.3f receipt-to-submit-ms=%.3f "
+                     "submit-to-complete-ms=%.3f status=%ld error=%@",
+                     (unsigned long long)streamID,
+                     (unsigned long long)sequence,
+                     MacWSMachMilliseconds(captureTime, receiptTime),
+                     MacWSMachMilliseconds(receiptTime, submitTime),
+                     MacWSMachMilliseconds(submitTime, completeTime),
+                     (long)completed.status, completed.error ?: @"nil");
+        }];
+    }
+    if ((directSurface || _reportedNonzeroFrame) && !_submittedPresentWitness) {
         _submittedPresentWitness = YES;
-        uint32_t witnessWidth = _frame.width;
-        uint32_t witnessHeight = _frame.height;
+        uint32_t witnessWidth = presentedWidth;
+        uint32_t witnessHeight = presentedHeight;
         uint64_t witnessScene = self.sceneID;
         [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
             NSError *error = completed.error;
-            MacWSLog(@"runtime-confirmed native Metal present scene=%llx frame=%ux%u status=%ld error=%@",
+            MacWSLog(@"runtime-confirmed native Metal present scene=%llx frame=%ux%u source=%@ status=%ld error=%@",
                      witnessScene, witnessWidth, witnessHeight,
+                     directSurface ? @"IOSurface" : @"mmap-upload",
                      (long)completed.status, error ?: @"nil");
         }];
     }
+    if (framesToRelease.count) {
+        __weak MacWSStreamClient *weakClient = _streamClient;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            (void)completed;
+            for (MacWSSurfaceFrame *frame in framesToRelease)
+                [weakClient releaseFrame:frame];
+        }];
+    }
     [commandBuffer commit];
-    _presentedCaptureGeneration = _pendingCaptureGeneration;
-    _pendingCaptureGeneration = 0;
-    NSString *content = _reportedNonzeroFrame ? @"有效像素" : @"全黑";
-    [self publishStatus:[NSString stringWithFormat:
-        @"%u×%u  ·  快照 #%llu  ·  %@",
-        _frame.width, _frame.height,
-        (unsigned long long)_presentedCaptureGeneration, content]];
+    if (directSurface) {
+        [self publishStatus:[NSString stringWithFormat:
+            @"%u×%u  ·  DisplayStream #%llu  ·  IOSurface 直传",
+            presentedWidth, presentedHeight,
+            (unsigned long long)submittedFrame.descriptor.sequence]];
+    } else {
+        _presentedCaptureGeneration = _pendingCaptureGeneration;
+        _pendingCaptureGeneration = 0;
+        NSString *content = _reportedNonzeroFrame ? @"有效像素" : @"全黑";
+        [self publishStatus:[NSString stringWithFormat:
+            @"%u×%u  ·  快照 #%llu  ·  %@",
+            _frame.width, _frame.height,
+            (unsigned long long)_presentedCaptureGeneration, content]];
+    }
 }
 
 - (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size {
@@ -651,41 +1175,58 @@ static void MacWSLogMetalRegistryState(void) {
 }
 
 - (BOOL)framePointForViewPoint:(CGPoint)viewPoint output:(CGPoint *)framePoint {
-    if (_frame.width == 0 || _frame.height == 0 ||
+    uint32_t frameWidth = [self currentFrameWidth];
+    uint32_t frameHeight = [self currentFrameHeight];
+    if (frameWidth == 0 || frameHeight == 0 ||
         CGRectIsEmpty(_contentRect) || !CGRectContainsPoint(_contentRect, viewPoint)) {
         return NO;
     }
-    CGFloat nx = (viewPoint.x - CGRectGetMinX(_contentRect)) / _contentRect.size.width;
-    CGFloat ny = (viewPoint.y - CGRectGetMinY(_contentRect)) / _contentRect.size.height;
-    framePoint->x = fmin(fmax(nx, 0.0), 1.0) * (_frame.width - 1);
-    framePoint->y = fmin(fmax(ny, 0.0), 1.0) * (_frame.height - 1);
+    CGFloat nx = (viewPoint.x - CGRectGetMinX(_contentRect)) /
+        _contentRect.size.width;
+    CGFloat ny = (viewPoint.y - CGRectGetMinY(_contentRect)) /
+        _contentRect.size.height;
+    CGFloat sourceX = CGRectGetMinX(_visibleSourceRect) +
+        fmin(fmax(nx, 0.0), 1.0) * CGRectGetWidth(_visibleSourceRect);
+    CGFloat sourceY = CGRectGetMinY(_visibleSourceRect) +
+        fmin(fmax(ny, 0.0), 1.0) * CGRectGetHeight(_visibleSourceRect);
+    framePoint->x = sourceX * (frameWidth - 1);
+    framePoint->y = sourceY * (frameHeight - 1);
     return YES;
 }
 
-- (void)emitKind:(MacWSInputKind)kind touch:(UITouch *)touch point:(CGPoint)viewPoint {
+- (void)emitKind:(MacWSInputKind)kind
+      framePoint:(CGPoint)framePoint
+        pressure:(float)pressure
+       contactID:(uint32_t)contactID
+       timestamp:(NSTimeInterval)timestamp {
     if (!self.isMacWSInputEnabled) return;
-    CGPoint framePoint;
-    if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
-    float pressure = touch.maximumPossibleForce > 0
-        ? touch.force / touch.maximumPossibleForce : 0.0f;
     MacWSInputRecord record = {
         .magic = MACWS_INPUT_MAGIC,
         .version = MACWS_INPUT_VERSION,
         .kind = kind,
-        .sceneID = self.sceneID,
-        .timestamp = touch.timestamp,
+        .sceneID = [self inputSceneIDWithModifiers:0],
+        .timestamp = timestamp,
         .x = (float)framePoint.x,
         .y = (float)framePoint.y,
         .pressure = pressure,
-        .contactID = (uint32_t)touch.hash,
-        .frameWidth = _frame.width,
-        .frameHeight = _frame.height,
+        .contactID = contactID,
+        .frameWidth = [self currentFrameWidth],
+        .frameHeight = [self currentFrameHeight],
         .targetPID = self.targetPID,
     };
+    [self.statusDelegate metalView:self emittedInput:record];
+}
+
+- (void)emitKind:(MacWSInputKind)kind touch:(UITouch *)touch point:(CGPoint)viewPoint {
+    CGPoint framePoint;
+    if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
+    float pressure = touch.maximumPossibleForce > 0
+        ? touch.force / touch.maximumPossibleForce : 0.0f;
+    [self emitKind:kind framePoint:framePoint pressure:pressure
+          contactID:(uint32_t)touch.hash timestamp:touch.timestamp];
     _touchMarker.center = viewPoint;
     _touchMarker.hidden = kind == MacWSInputKindTouchUp ||
                           kind == MacWSInputKindTouchCancel;
-    [self.statusDelegate metalView:self emittedInput:record];
 }
 
 - (void)emitTouches:(NSSet<UITouch *> *)touches kind:(MacWSInputKind)kind {
@@ -694,23 +1235,263 @@ static void MacWSLogMetalRegistryState(void) {
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self emitTouches:touches kind:MacWSInputKindTouchDown];
+    [self becomeFirstResponder];
+    UITouch *touch = touches.anyObject;
+    BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
+    if (pointerTouch) {
+        [self emitTouches:touches kind:MacWSInputKindTouchDown];
+    } else if (self.inputMode == MacWSHostInputModeDirect) {
+        if (event.allTouches.count > 1) {
+            if (_directTouch) {
+                [self emitKind:MacWSInputKindTouchCancel
+                         touch:_directTouch
+                         point:[_directTouch locationInView:self]];
+            }
+            _directTouch = nil;
+            _directGestureBlocked = YES;
+        } else if (!_directGestureBlocked && !_directTouch && touch) {
+            _directTouch = touch;
+            [self emitKind:MacWSInputKindTouchDown touch:touch
+                     point:[touch locationInView:self]];
+        }
+    } else if (!_trackpadTouch && touch) {
+        _trackpadTouch = touch;
+        _trackpadPreviousPoint = [touch locationInView:self];
+        _trackpadTravel = 0;
+        _trackpadBeganAt = touch.timestamp;
+        _trackpadHadMultipleTouches = event.allTouches.count > 1;
+        uint32_t width = [self currentFrameWidth];
+        uint32_t height = [self currentFrameHeight];
+        if (_trackpadCursor.x < 0 || _trackpadCursor.y < 0 ||
+            _trackpadCursor.x >= width || _trackpadCursor.y >= height) {
+            _trackpadCursor = CGPointMake(width * 0.5, height * 0.5);
+        }
+        uint32_t contactID = (uint32_t)touch.hash;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (self->_trackpadTouch == touch &&
+                self->_trackpadTravel < 6.0 &&
+                !self->_trackpadHadMultipleTouches &&
+                !self->_trackpadButtonDown) {
+                self->_trackpadButtonDown = YES;
+                [self emitKind:MacWSInputKindTouchDown
+                     framePoint:self->_trackpadCursor pressure:1.0f
+                      contactID:contactID timestamp:CACurrentMediaTime()];
+            }
+        });
+    } else if (event.allTouches.count > 1) {
+        _trackpadHadMultipleTouches = YES;
+    }
     [super touchesBegan:touches withEvent:event];
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self emitTouches:touches kind:MacWSInputKindTouchMove];
+    UITouch *touch = touches.anyObject;
+    BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
+    if (pointerTouch) {
+        [self emitTouches:touches kind:MacWSInputKindTouchMove];
+    } else if (self.inputMode == MacWSHostInputModeDirect) {
+        if (_directTouch && [touches containsObject:_directTouch]) {
+            [self emitKind:MacWSInputKindTouchMove touch:_directTouch
+                     point:[_directTouch locationInView:self]];
+        }
+    } else if (_trackpadTouch && [touches containsObject:_trackpadTouch]) {
+        if (event.allTouches.count > 1) _trackpadHadMultipleTouches = YES;
+        CGPoint point = [_trackpadTouch locationInView:self];
+        CGFloat dx = point.x - _trackpadPreviousPoint.x;
+        CGFloat dy = point.y - _trackpadPreviousPoint.y;
+        _trackpadPreviousPoint = point;
+        _trackpadTravel += hypot(dx, dy);
+        // The two-finger pan recognizer intentionally does not cancel raw
+        // touches. Once a gesture becomes multi-touch, keep its translation
+        // exclusively on the scroll route so scrolling cannot also move or
+        // drag the macOS pointer.
+        if (!_trackpadHadMultipleTouches) {
+            CGFloat scaleX = CGRectGetWidth(_contentRect) > 0
+                ? [self currentFrameWidth] / CGRectGetWidth(_contentRect) : 1.0;
+            CGFloat scaleY = CGRectGetHeight(_contentRect) > 0
+                ? [self currentFrameHeight] / CGRectGetHeight(_contentRect) : 1.0;
+            _trackpadCursor.x = fmin(fmax(_trackpadCursor.x + dx * scaleX * 0.82,
+                                          0.0), [self currentFrameWidth] - 1.0);
+            _trackpadCursor.y = fmin(fmax(_trackpadCursor.y + dy * scaleY * 0.82,
+                                          0.0), [self currentFrameHeight] - 1.0);
+            [self emitKind:_trackpadButtonDown ? MacWSInputKindTouchMove
+                                                : MacWSInputKindHover
+                 framePoint:_trackpadCursor pressure:_trackpadButtonDown ? 1.0f : 0.0f
+                  contactID:(uint32_t)_trackpadTouch.hash
+                   timestamp:_trackpadTouch.timestamp];
+            CGFloat sourceX = _trackpadCursor.x /
+                MAX([self currentFrameWidth] - 1, 1u);
+            CGFloat sourceY = _trackpadCursor.y /
+                MAX([self currentFrameHeight] - 1, 1u);
+            if (sourceX < CGRectGetMinX(_visibleSourceRect))
+                _viewportCenter.x -= CGRectGetMinX(_visibleSourceRect) - sourceX;
+            else if (sourceX > CGRectGetMaxX(_visibleSourceRect))
+                _viewportCenter.x += sourceX - CGRectGetMaxX(_visibleSourceRect);
+            if (sourceY < CGRectGetMinY(_visibleSourceRect))
+                _viewportCenter.y -= CGRectGetMinY(_visibleSourceRect) - sourceY;
+            else if (sourceY > CGRectGetMaxY(_visibleSourceRect))
+                _viewportCenter.y += sourceY - CGRectGetMaxY(_visibleSourceRect);
+            simd_float4 unusedVertices[4];
+            [self updateContentRectAndVertices:unusedVertices];
+            CGPoint marker = CGPointMake(
+                CGRectGetMinX(_contentRect) +
+                    (sourceX - CGRectGetMinX(_visibleSourceRect)) /
+                    CGRectGetWidth(_visibleSourceRect) * CGRectGetWidth(_contentRect),
+                CGRectGetMinY(_contentRect) +
+                    (sourceY - CGRectGetMinY(_visibleSourceRect)) /
+                    CGRectGetHeight(_visibleSourceRect) * CGRectGetHeight(_contentRect));
+            _touchMarker.center = marker;
+            _touchMarker.hidden = NO;
+            [self setNeedsDisplay];
+        }
+    }
     [super touchesMoved:touches withEvent:event];
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self emitTouches:touches kind:MacWSInputKindTouchUp];
+    UITouch *touch = touches.anyObject;
+    BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
+    if (pointerTouch) {
+        [self emitTouches:touches kind:MacWSInputKindTouchUp];
+    } else if (self.inputMode == MacWSHostInputModeDirect) {
+        if (_directTouch && [touches containsObject:_directTouch]) {
+            [self emitKind:MacWSInputKindTouchUp touch:_directTouch
+                     point:[_directTouch locationInView:self]];
+            _directTouch = nil;
+        }
+        if (event.allTouches.count <= touches.count)
+            _directGestureBlocked = NO;
+    } else if (_trackpadTouch && [touches containsObject:_trackpadTouch]) {
+        MacWSInputKind kind = _trackpadButtonDown ? MacWSInputKindTouchUp
+            : MacWSInputKindTap;
+        if (_trackpadButtonDown ||
+            (!_trackpadHadMultipleTouches && _trackpadTravel < 10.0 &&
+             touch.timestamp - _trackpadBeganAt < 0.40)) {
+            [self emitKind:kind framePoint:_trackpadCursor pressure:0
+                  contactID:(uint32_t)_trackpadTouch.hash
+                   timestamp:touch.timestamp];
+        }
+        _trackpadTouch = nil;
+        _trackpadButtonDown = NO;
+        _trackpadHadMultipleTouches = NO;
+        _touchMarker.hidden = YES;
+    }
     [super touchesEnded:touches withEvent:event];
 }
 
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    [self emitTouches:touches kind:MacWSInputKindTouchCancel];
+    UITouch *touch = touches.anyObject;
+    BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
+    if (pointerTouch) {
+        [self emitTouches:touches kind:MacWSInputKindTouchCancel];
+    } else if (self.inputMode == MacWSHostInputModeDirect) {
+        if (_directTouch && [touches containsObject:_directTouch]) {
+            [self emitKind:MacWSInputKindTouchCancel touch:_directTouch
+                     point:[_directTouch locationInView:self]];
+            _directTouch = nil;
+        }
+        if (event.allTouches.count <= touches.count)
+            _directGestureBlocked = NO;
+    } else if (_trackpadTouch && [touches containsObject:_trackpadTouch]) {
+        if (_trackpadButtonDown) {
+            [self emitKind:MacWSInputKindTouchCancel framePoint:_trackpadCursor
+                 pressure:0 contactID:(uint32_t)_trackpadTouch.hash
+                 timestamp:touch.timestamp];
+        }
+        _trackpadTouch = nil;
+        _trackpadButtonDown = NO;
+        _trackpadHadMultipleTouches = NO;
+        _touchMarker.hidden = YES;
+    }
     [super touchesCancelled:touches withEvent:event];
+}
+
+- (void)resetViewportZoom {
+    _viewportZoom = 1.0;
+    _viewportCenter = CGPointMake(0.5, 0.5);
+    [self setNeedsDisplay];
+}
+
+- (void)viewportResetTapped:(UITapGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateRecognized) return;
+    [self resetViewportZoom];
+    [self publishStatus:@"视图缩放已恢复"];
+}
+
+- (void)viewportPinched:(UIPinchGestureRecognizer *)recognizer {
+    if ([self currentFrameWidth] == 0 || [self currentFrameHeight] == 0)
+        return;
+    CGPoint location = [recognizer locationInView:self];
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        simd_float4 unusedVertices[4];
+        [self updateContentRectAndVertices:unusedVertices];
+        _pinchStartZoom = _viewportZoom;
+        _pinchAnchorView = CGPointMake(
+            self.bounds.size.width > 0 ? location.x / self.bounds.size.width : 0.5,
+            self.bounds.size.height > 0 ? location.y / self.bounds.size.height : 0.5);
+        _pinchAnchorSource = CGPointMake(
+            CGRectGetMinX(_visibleSourceRect) +
+                _pinchAnchorView.x * CGRectGetWidth(_visibleSourceRect),
+            CGRectGetMinY(_visibleSourceRect) +
+                _pinchAnchorView.y * CGRectGetHeight(_visibleSourceRect));
+    }
+    if (recognizer.state == UIGestureRecognizerStateBegan ||
+        recognizer.state == UIGestureRecognizerStateChanged) {
+        _viewportZoom = fmin(fmax(_pinchStartZoom * recognizer.scale, 1.0), 4.0);
+        simd_float4 unusedVertices[4];
+        [self updateContentRectAndVertices:unusedVertices];
+        _viewportCenter = CGPointMake(
+            _pinchAnchorSource.x +
+                (0.5 - _pinchAnchorView.x) * CGRectGetWidth(_visibleSourceRect),
+            _pinchAnchorSource.y +
+                (0.5 - _pinchAnchorView.y) * CGRectGetHeight(_visibleSourceRect));
+        [self updateContentRectAndVertices:unusedVertices];
+        [self setNeedsDisplay];
+    }
+}
+
+- (void)trackpadScrolled:(UIPanGestureRecognizer *)recognizer {
+    if (!self.isMacWSInputEnabled) return;
+    CGPoint translation = [recognizer translationInView:self];
+    [recognizer setTranslation:CGPointZero inView:self];
+    if (translation.x == 0 && translation.y == 0) return;
+    if (self.inputMode == MacWSHostInputModeDirect) {
+        if (self.bounds.size.width > 0 && self.bounds.size.height > 0) {
+            _viewportCenter.x -= translation.x / self.bounds.size.width *
+                CGRectGetWidth(_visibleSourceRect);
+            _viewportCenter.y -= translation.y / self.bounds.size.height *
+                CGRectGetHeight(_visibleSourceRect);
+            simd_float4 unusedVertices[4];
+            [self updateContentRectAndVertices:unusedVertices];
+            [self setNeedsDisplay];
+        }
+        return;
+    }
+    uint32_t width = [self currentFrameWidth];
+    uint32_t height = [self currentFrameHeight];
+    if (_trackpadCursor.x < 0 || _trackpadCursor.y < 0 ||
+        _trackpadCursor.x >= width || _trackpadCursor.y >= height)
+        _trackpadCursor = CGPointMake(width * 0.5, height * 0.5);
+    float horizontal = (float)(-translation.x * 2.0);
+    uint32_t horizontalBits = 0;
+    memcpy(&horizontalBits, &horizontal, sizeof(horizontalBits));
+    [self emitKind:MacWSInputKindScroll framePoint:_trackpadCursor
+         pressure:(float)(-translation.y * 2.0) contactID:horizontalBits
+         timestamp:CACurrentMediaTime()];
+}
+
+- (void)trackpadSecondaryTapped:(UITapGestureRecognizer *)recognizer {
+    if (self.inputMode != MacWSHostInputModeTrackpad ||
+        !self.isMacWSInputEnabled ||
+        recognizer.state != UIGestureRecognizerStateEnded) return;
+    uint32_t width = [self currentFrameWidth];
+    uint32_t height = [self currentFrameHeight];
+    if (_trackpadCursor.x < 0 || _trackpadCursor.y < 0 ||
+        _trackpadCursor.x >= width || _trackpadCursor.y >= height)
+        _trackpadCursor = CGPointMake(width * 0.5, height * 0.5);
+    [self emitKind:MacWSInputKindSecondaryTap framePoint:_trackpadCursor
+         pressure:0 contactID:0x53454332u timestamp:CACurrentMediaTime()];
 }
 
 - (void)hovered:(UIHoverGestureRecognizer *)recognizer API_AVAILABLE(ios(13.4)) {
@@ -722,35 +1503,139 @@ static void MacWSLogMetalRegistryState(void) {
         .magic = MACWS_INPUT_MAGIC,
         .version = MACWS_INPUT_VERSION,
         .kind = MacWSInputKindHover,
-        .sceneID = self.sceneID,
+        .sceneID = [self inputSceneIDWithModifiers:0],
         .timestamp = CACurrentMediaTime(),
         .x = (float)framePoint.x,
         .y = (float)framePoint.y,
-        .frameWidth = _frame.width,
-        .frameHeight = _frame.height,
+        .frameWidth = [self currentFrameWidth],
+        .frameHeight = [self currentFrameHeight],
         .targetPID = self.targetPID,
     };
     _touchMarker.center = viewPoint;
     _touchMarker.hidden = recognizer.state == UIGestureRecognizerStateEnded;
     [self.statusDelegate metalView:self emittedInput:record];
 }
+
+- (void)streamClient:(MacWSStreamClient *)client
+       statusChanged:(NSString *)status
+           connected:(BOOL)connected {
+    (void)client;
+    _streamConnected = connected;
+    if (!connected && _surfaceFrame) {
+        if (_surfaceFrame.descriptor.sequence == _submittedSurfaceSequence)
+            [_retiredSurfaceFrames addObject:_surfaceFrame];
+        else
+            [_streamClient releaseFrame:_surfaceFrame];
+        _surfaceFrame = nil;
+        _surfaceTexture = nil;
+        _sourceTexture = nil;
+        _textureWidth = 0;
+        _textureHeight = 0;
+        [self setNeedsDisplay];
+    }
+    if (!_surfaceFrame) [self publishStatus:status];
+}
+
+- (void)streamClient:(MacWSStreamClient *)client
+      receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
+    (void)client;
+    MacWSLog(@"display-stream window-list count=%lu",
+             (unsigned long)windows.count);
+    [self.statusDelegate metalView:self receivedWindows:windows];
+}
+
+- (void)streamClient:(MacWSStreamClient *)client
+        receivedFrame:(MacWSSurfaceFrame *)frame {
+    uint32_t format = frame.descriptor.pixelFormat;
+    // SkyLight/CGDisplayStream is requested as 32BGRA.  Reject another
+    // explicit FourCC instead of silently interpreting it with the wrong
+    // Metal pixel format.  A zero FourCC is accepted for older IOSurfaces
+    // whose pixel-format property is absent.
+    if (format != 0 && format != 0x42475241u) {
+        [client releaseFrame:frame];
+        [self publishStatus:@"DisplayStream 返回了非 BGRA IOSurface"];
+        return;
+    }
+    if (!self.device) {
+        [client releaseFrame:frame];
+        return;
+    }
+    MTLTextureDescriptor *descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:frame.descriptor.width
+                                                          height:frame.descriptor.height
+                                                       mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [self.device newTextureWithDescriptor:descriptor
+                                                         iosurface:frame.surface
+                                                             plane:0];
+    if (!texture) {
+        [client releaseFrame:frame];
+        [self publishStatus:@"无法从 DisplayStream IOSurface 创建 Metal 纹理"];
+        return;
+    }
+    texture.label = [NSString stringWithFormat:@"MacWS stream %llu frame %llu",
+        (unsigned long long)frame.descriptor.streamID,
+        (unsigned long long)frame.descriptor.sequence];
+
+    MacWSSurfaceFrame *previous = _surfaceFrame;
+    if (previous) {
+        if (previous.descriptor.sequence == _submittedSurfaceSequence)
+            [_retiredSurfaceFrames addObject:previous];
+        else
+            [client releaseFrame:previous];
+    }
+    _surfaceFrame = frame;
+    _surfaceTexture = texture;
+    _streamConnected = YES;
+    [self setNeedsDisplay];
+}
 @end
 
-@interface MacWSViewController : UIViewController <MacWSMetalViewStatusDelegate>
-- (instancetype)initWithSceneIdentifier:(NSString *)identifier;
+@interface MacWSViewController : UIViewController
+    <MacWSMetalViewStatusDelegate, MacWSInteropClientDelegate,
+     UIDocumentPickerDelegate, UIDragInteractionDelegate,
+     UIDropInteractionDelegate>
+- (instancetype)initWithSceneIdentifier:(NSString *)identifier
+                              streamMode:(MacWSStreamMode)streamMode
+                                windowID:(uint32_t)windowID
+                                ownerPID:(int32_t)ownerPID
+                             minimumSize:(CGSize)minimumSize
+                               resizable:(BOOL)resizable;
 - (void)performURLAction:(NSString *)action;
+- (NSUserActivity *)streamRestorationActivity;
+- (void)suspendSceneStream;
+- (void)resumeSceneStream;
 @end
 
 static void MacWSRequestNewScene(UIScene *requestingScene,
+                                 uint32_t windowID,
+                                 int32_t ownerPID,
+                                 CGSize minimumSize,
+                                 BOOL resizable,
+                                 NSString *title,
                                  void (^failureHandler)(NSError *error)) {
     UIApplication *application = UIApplication.sharedApplication;
-    MacWSLog(@"scene-activation requested supportsMultiple=%@ connected=%lu open=%lu origin=%@ mode=all-nil",
+    NSUserActivity *activity = [[NSUserActivity alloc]
+        initWithActivityType:@"com.macwsguide.host.window"];
+    activity.title = title.length ? title : @"MacWS Workspace";
+    activity.userInfo = @{
+        @"mode": @(windowID ? MacWSStreamModeWindow : MacWSStreamModeFullscreen),
+        @"window_id": @(windowID),
+        @"owner_pid": @(windowID ? ownerPID : 0),
+        @"minimum_width": @(windowID ? minimumSize.width : 0),
+        @"minimum_height": @(windowID ? minimumSize.height : 0),
+        @"resizable": @(windowID ? resizable : NO),
+        @"title": activity.title,
+    };
+    MacWSLog(@"scene-activation requested supportsMultiple=%@ connected=%lu open=%lu origin=%@ window=%u",
              application.supportsMultipleScenes ? @"YES" : @"NO",
              (unsigned long)application.connectedScenes.count,
              (unsigned long)application.openSessions.count,
-             requestingScene.session.persistentIdentifier);
+             requestingScene.session.persistentIdentifier, windowID);
     [application requestSceneSessionActivation:nil
-                                  userActivity:nil
+                                  userActivity:activity
                                        options:nil
                                   errorHandler:^(NSError *error) {
         MacWSLog(@"scene-activation failed: %@", error);
@@ -760,7 +1645,13 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 
 @implementation MacWSViewController {
     NSString *_sceneIdentifier;
+    MacWSStreamMode _streamMode;
+    uint32_t _windowID;
+    int32_t _windowOwnerPID;
+    CGSize _windowMinimumSize;
+    BOOL _windowResizable;
     MacWSControlClient *_controlClient;
+    MacWSInteropClient *_interopClient;
     UIVisualEffectView *_controlPanel;
     UIButton *_showControlsButton;
     UILabel *_serviceLabel;
@@ -771,6 +1662,7 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     UILabel *_frameLabel;
     UILabel *_statusLabel;
     UILabel *_inputLabel;
+    UILabel *_interopLabel;
     UILabel *_noticeLabel;
     UIButton *_primaryButton;
     UIButton *_repairButton;
@@ -778,8 +1670,16 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     UIButton *_captureButton;
     UIButton *_logsButton;
     UIButton *_exportButton;
+    UIButton *_windowPickerButton;
+    UIButton *_menuBarButton;
+    UIButton *_clipboardButton;
+    UIButton *_importButton;
+    UIButton *_macFilesButton;
     UITextView *_logsView;
     UISwitch *_experimentalSwitch;
+    UISegmentedControl *_inputModeControl;
+    UISegmentedControl *_densityControl;
+    UIButton *_resetZoomButton;
     NSArray<UIButton *> *_applicationButtons;
     MacWSMetalView *_metalView;
     NSTimer *_statusTimer;
@@ -787,13 +1687,27 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     BOOL _experimentalTouched;
     uint64_t _inputLogSequence;
     NSString *_lastLoggedControlSummary;
+    NSArray<MacWSStreamWindow *> *_streamWindows;
+    NSArray<NSURL *> *_receivedMacOSFiles;
 }
 
-- (instancetype)initWithSceneIdentifier:(NSString *)identifier {
+- (instancetype)initWithSceneIdentifier:(NSString *)identifier
+                              streamMode:(MacWSStreamMode)streamMode
+                                windowID:(uint32_t)windowID
+                                ownerPID:(int32_t)ownerPID
+                             minimumSize:(CGSize)minimumSize
+                               resizable:(BOOL)resizable {
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
         _sceneIdentifier = [identifier copy];
+        _streamMode = streamMode;
+        _windowID = windowID;
+        _windowOwnerPID = windowID ? ownerPID : 0;
+        _windowMinimumSize = windowID ? minimumSize : CGSizeZero;
+        _windowResizable = windowID ? resizable : NO;
         _controlClient = [MacWSControlClient new];
+        _interopClient = [MacWSInteropClient new];
+        _interopClient.delegate = self;
         NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
         if ([defaults objectForKey:@"MacWSExperimentalMode"] == nil)
             [defaults setBool:YES forKey:@"MacWSExperimentalMode"];
@@ -875,7 +1789,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView = [[MacWSMetalView alloc] initWithFrame:CGRectZero];
     _metalView.translatesAutoresizingMaskIntoConstraints = NO;
     _metalView.statusDelegate = self;
-    _metalView.sceneID = (uint64_t)_sceneIdentifier.hash;
+    _metalView.sceneID = ((uint64_t)_sceneIdentifier.hash) &
+        ~MACWS_INPUT_WINDOW_SCENE_FLAG;
+    _metalView.minimumLogicalSize = _windowMinimumSize;
+    _metalView.targetWindowResizable = _windowResizable;
+    MacWSHostDisplayDensity savedDensity = (MacWSHostDisplayDensity)
+        [NSUserDefaults.standardUserDefaults integerForKey:@"MacWSDisplayDensity"];
+    if (savedDensity != MacWSHostDisplayDensityKeyboard)
+        savedDensity = MacWSHostDisplayDensityTouchComfort;
+    _metalView.displayDensity = savedDensity;
+    [_metalView configureStreamMode:_streamMode windowID:_windowID];
     [root addSubview:_metalView];
 
     _controlPanel = [[UIVisualEffectView alloc]
@@ -1004,6 +1927,36 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                  action:@selector(logsAction) prominent:NO];
     _exportButton = [self buttonWithTitle:@"导出诊断" image:@"square.and.arrow.up"
                                    action:@selector(exportDiagnostics) prominent:NO];
+    _windowPickerButton = [self buttonWithTitle:@"打开 macOS 窗口"
+                                          image:@"macwindow.on.rectangle"
+                                         action:@selector(openWindowPicker)
+                                      prominent:NO];
+    _menuBarButton = [self buttonWithTitle:@"菜单栏 / 全屏工作区"
+                                     image:@"menubar.rectangle"
+                                    action:@selector(openFullscreenWorkspace)
+                                 prominent:NO];
+    _clipboardButton = [self buttonWithTitle:@"同步剪贴板到 macOS"
+                                       image:@"doc.on.clipboard"
+                                      action:@selector(syncClipboardAction)
+                                   prominent:NO];
+    _importButton = [self buttonWithTitle:@"导入文件到 macOS"
+                                    image:@"square.and.arrow.down.on.square"
+                                   action:@selector(importFilesAction)
+                                prominent:NO];
+    _macFilesButton = [self buttonWithTitle:@"macOS 文件"
+                                      image:@"arrow.up.doc"
+                                     action:@selector(shareMacOSFiles)
+                                  prominent:NO];
+    _macFilesButton.enabled = NO;
+    UIStackView *interopRow = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_clipboardButton, _importButton]];
+    interopRow.axis = UILayoutConstraintAxisHorizontal;
+    interopRow.distribution = UIStackViewDistributionFillEqually;
+    interopRow.spacing = 8;
+    [_macFilesButton addInteraction:[[UIDragInteraction alloc]
+        initWithDelegate:self]];
+    [_metalView addInteraction:[[UIDropInteraction alloc]
+        initWithDelegate:self]];
     UIStackView *toolRow1 = [[UIStackView alloc]
         initWithArrangedSubviews:@[_captureButton, _repairButton]];
     UIStackView *toolRow2 = [[UIStackView alloc]
@@ -1025,6 +1978,35 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _inputLabel.textColor = UIColor.systemCyanColor;
     _inputLabel.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
     _inputLabel.numberOfLines = 0;
+
+    _interopLabel = [UILabel new];
+    _interopLabel.text = @"互操作：等待 macOS 剪贴板与文件桥";
+    _interopLabel.textColor = UIColor.systemIndigoColor;
+    _interopLabel.font = [UIFont monospacedSystemFontOfSize:11
+                                                     weight:UIFontWeightRegular];
+    _interopLabel.numberOfLines = 0;
+
+    _inputModeControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"直接触控", @"精确触控板"]];
+    MacWSHostInputMode savedInputMode = (MacWSHostInputMode)
+        [NSUserDefaults.standardUserDefaults integerForKey:@"MacWSInputMode"];
+    if (savedInputMode != MacWSHostInputModeTrackpad)
+        savedInputMode = MacWSHostInputModeDirect;
+    _inputModeControl.selectedSegmentIndex =
+        savedInputMode == MacWSHostInputModeTrackpad ? 1 : 0;
+    _metalView.inputMode = savedInputMode;
+    [_inputModeControl addTarget:self action:@selector(inputModeChanged:)
+                forControlEvents:UIControlEventValueChanged];
+
+    _densityControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"触屏舒适 135%", @"键鼠高密度 100%"]];
+    _densityControl.selectedSegmentIndex =
+        _metalView.displayDensity == MacWSHostDisplayDensityKeyboard ? 1 : 0;
+    [_densityControl addTarget:self action:@selector(densityChanged:)
+               forControlEvents:UIControlEventValueChanged];
+    _resetZoomButton = [self buttonWithTitle:@"恢复视图缩放"
+        image:@"arrow.counterclockwise"
+        action:@selector(resetZoomAction) prominent:NO];
 
     _noticeLabel = MacWSMakeLabel(@"",
         [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote],
@@ -1055,11 +2037,21 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self sectionTitle:@"工具与恢复"],
         toolRow1,
         toolRow2,
+        _windowPickerButton,
+        _menuBarButton,
+        [self sectionTitle:@"iOS / macOS 互操作"],
+        interopRow,
+        _macFilesButton,
         _exportButton,
         _noticeLabel,
         [self divider],
         _statusLabel,
         _inputLabel,
+        _inputModeControl,
+        [self sectionTitle:@"显示密度与缩放"],
+        _densityControl,
+        _resetZoomButton,
+        _interopLabel,
         _logsView,
     ]];
     content.axis = UILayoutConstraintAxisVertical;
@@ -1109,6 +2101,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_statusTimer invalidate];
     _statusTimer = [NSTimer scheduledTimerWithTimeInterval:3.0 target:self
         selector:@selector(refreshStatus) userInfo:nil repeats:YES];
+    [_metalView requestStreamWindowList];
+    [_interopClient connect];
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -1139,8 +2133,228 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _recoverButton.enabled = enabled;
     _captureButton.enabled = enabled;
     _exportButton.enabled = enabled;
+    _windowPickerButton.enabled = enabled;
+    _menuBarButton.enabled = enabled;
+    _clipboardButton.enabled = enabled;
+    _importButton.enabled = enabled;
+    _macFilesButton.enabled = _receivedMacOSFiles.count > 0;
     _experimentalSwitch.enabled = enabled;
+    _inputModeControl.enabled = enabled;
+    _densityControl.enabled = enabled;
+    _resetZoomButton.enabled = enabled;
     for (UIButton *button in _applicationButtons) button.enabled = enabled;
+}
+
+- (void)inputModeChanged:(UISegmentedControl *)sender {
+    MacWSHostInputMode mode = sender.selectedSegmentIndex == 1
+        ? MacWSHostInputModeTrackpad : MacWSHostInputModeDirect;
+    _metalView.inputMode = mode;
+    [NSUserDefaults.standardUserDefaults setInteger:mode forKey:@"MacWSInputMode"];
+    _inputLabel.text = mode == MacWSHostInputModeTrackpad
+        ? @"输入：单指移动指针，轻点单击，长按拖动，双指滚动/右击"
+        : @"输入：手指位置直接映射 macOS；妙控键盘指针保持原生绝对定位";
+}
+
+- (void)densityChanged:(UISegmentedControl *)sender {
+    MacWSHostDisplayDensity density = sender.selectedSegmentIndex == 1
+        ? MacWSHostDisplayDensityKeyboard
+        : MacWSHostDisplayDensityTouchComfort;
+    _metalView.displayDensity = density;
+    [NSUserDefaults.standardUserDefaults setInteger:density
+                                              forKey:@"MacWSDisplayDensity"];
+    _inputLabel.text = density == MacWSHostDisplayDensityKeyboard
+        ? @"显示：键鼠高密度；窗口按 1.0 iPad 点/macOS 点重排"
+        : @"显示：触屏舒适；窗口按 1.35 iPad 点/macOS 点重排";
+}
+
+- (void)resetZoomAction {
+    [_metalView resetViewportZoom];
+    [self setNotice:@"视图缩放和位置已恢复" success:YES];
+}
+
+- (void)syncClipboardAction {
+    [_interopClient publishGeneralPasteboard];
+}
+
+- (void)importFilesAction {
+    UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
+        initForOpeningContentTypes:@[UTTypeItem] asCopy:YES];
+    picker.allowsMultipleSelection = YES;
+    picker.delegate = self;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController *)controller
+  didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    (void)controller;
+    [_interopClient stageAndPublishFiles:urls
+        completion:^(NSArray<NSURL *> *stagedURLs, NSError *error) {
+            [self setNotice:error ? error.localizedDescription :
+                [NSString stringWithFormat:@"已导入 %lu 个文件；macOS 应用可直接粘贴。",
+                 (unsigned long)stagedURLs.count]
+                success:error == nil];
+        }];
+}
+
+- (void)shareMacOSFiles {
+    if (!_receivedMacOSFiles.count) {
+        [self setNotice:@"macOS 剪贴板中还没有可导出的文件" success:NO];
+        return;
+    }
+    UIActivityViewController *activity = [[UIActivityViewController alloc]
+        initWithActivityItems:_receivedMacOSFiles applicationActivities:nil];
+    activity.popoverPresentationController.sourceView = _macFilesButton;
+    activity.popoverPresentationController.sourceRect = _macFilesButton.bounds;
+    [self presentViewController:activity animated:YES completion:nil];
+}
+
+- (void)interopClient:(MacWSInteropClient *)client
+        statusChanged:(NSString *)status
+            connected:(BOOL)connected {
+    (void)client;
+    _interopLabel.text = [@"互操作：" stringByAppendingString:status];
+    _interopLabel.textColor = connected ? UIColor.systemGreenColor
+                                        : UIColor.systemOrangeColor;
+}
+
+- (void)interopClient:(MacWSInteropClient *)client
+ receivedMacOSFilesAtURLs:(NSArray<NSURL *> *)urls {
+    (void)client;
+    _receivedMacOSFiles = [urls copy];
+    _macFilesButton.enabled = urls.count > 0;
+    [self setButton:_macFilesButton
+              title:[NSString stringWithFormat:@"拖出/分享 macOS 文件 · %lu",
+                     (unsigned long)urls.count]
+              image:@"arrow.up.doc"];
+}
+
+- (NSArray<UIDragItem *> *)dragInteraction:(UIDragInteraction *)interaction
+                     itemsForBeginningSession:(id<UIDragSession>)session {
+    (void)interaction;
+    (void)session;
+    NSMutableArray<UIDragItem *> *items = [NSMutableArray array];
+    for (NSURL *url in _receivedMacOSFiles) {
+        NSItemProvider *provider = [[NSItemProvider alloc] initWithContentsOfURL:url];
+        if (provider) [items addObject:[[UIDragItem alloc]
+            initWithItemProvider:provider]];
+    }
+    return items;
+}
+
+- (BOOL)dropInteraction:(UIDropInteraction *)interaction
+        canHandleSession:(id<UIDropSession>)session {
+    (void)interaction;
+    return [session hasItemsConformingToTypeIdentifiers:@[
+        @"public.item", @"public.image", @"public.text"
+    ]];
+}
+
+- (UIDropProposal *)dropInteraction:(UIDropInteraction *)interaction
+                    sessionDidUpdate:(id<UIDropSession>)session {
+    (void)interaction;
+    (void)session;
+    return [[UIDropProposal alloc] initWithDropOperation:UIDropOperationCopy];
+}
+
+- (void)dropInteraction:(UIDropInteraction *)interaction
+      performDrop:(id<UIDropSession>)session {
+    (void)interaction;
+    for (UIDragItem *dragItem in session.items) {
+        NSItemProvider *provider = dragItem.itemProvider;
+        if ([provider hasItemConformingToTypeIdentifier:@"public.item"]) {
+            [provider loadFileRepresentationForTypeIdentifier:@"public.item"
+                completionHandler:^(NSURL *url, NSError *error) {
+                    if (!url || error) return;
+                    NSString *cacheDirectory = [@"/var/mobile/Library/Caches/MacWSDrops"
+                        stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
+                    [NSFileManager.defaultManager
+                        createDirectoryAtPath:cacheDirectory
+                  withIntermediateDirectories:YES attributes:nil error:nil];
+                    NSString *name = url.lastPathComponent.length
+                        ? url.lastPathComponent : @"Dropped Item";
+                    NSURL *copy = [NSURL fileURLWithPath:
+                        [cacheDirectory stringByAppendingPathComponent:name]];
+                    NSError *copyError = nil;
+                    if (![NSFileManager.defaultManager copyItemAtURL:url
+                                                               toURL:copy
+                                                               error:&copyError]) return;
+                    [self->_interopClient stageAndPublishFiles:@[copy]
+                        completion:^(NSArray<NSURL *> *staged, NSError *stageError) {
+                            [self setNotice:stageError ? stageError.localizedDescription :
+                                [NSString stringWithFormat:@"已拖入 %lu 个文件到 macOS",
+                                 (unsigned long)staged.count]
+                                success:stageError == nil];
+                        }];
+                }];
+        } else if ([provider canLoadObjectOfClass:UIImage.class]) {
+            [provider loadObjectOfClass:UIImage.class
+                completionHandler:^(UIImage *image, NSError *error) {
+                    if (!image || error) return;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        UIPasteboard.generalPasteboard.image = image;
+                        [self->_interopClient publishGeneralPasteboard];
+                    });
+                }];
+        } else if ([provider canLoadObjectOfClass:NSString.class]) {
+            [provider loadObjectOfClass:NSString.class
+                completionHandler:^(NSString *text, NSError *error) {
+                    if (!text || error) return;
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        UIPasteboard.generalPasteboard.string = text;
+                        [self->_interopClient publishGeneralPasteboard];
+                    });
+                }];
+        }
+    }
+}
+
+- (void)openWindowPicker {
+    [_metalView requestStreamWindowList];
+    if (_streamWindows.count == 0) {
+        [self setNotice:@"正在读取 macOS 窗口；DisplayStream 服务就绪后请再试一次。"
+                 success:YES];
+        return;
+    }
+    UIAlertController *picker = [UIAlertController
+        alertControllerWithTitle:@"在新 iPadOS 窗口中打开"
+                         message:@"每个 Scene 只订阅一个 macOS 窗口的 IOSurface 流。"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    NSUInteger limit = MIN(_streamWindows.count, 24);
+    for (NSUInteger index = 0; index < limit; index++) {
+        MacWSStreamWindow *window = _streamWindows[index];
+        NSString *title = window.title.length ? window.title :
+            [NSString stringWithFormat:@"Window %u", window.descriptor.windowID];
+        [picker addAction:[UIAlertAction actionWithTitle:title
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+                MacWSRequestNewScene(self.view.window.windowScene,
+                    window.descriptor.windowID, window.descriptor.ownerPID,
+                    CGSizeMake(window.descriptor.minimumLogicalWidth,
+                               window.descriptor.minimumLogicalHeight),
+                    (window.descriptor.flags & MacWSStreamWindowResizable) != 0,
+                    title, ^(NSError *error) {
+                        [self setNotice:error.localizedDescription success:NO];
+                    });
+            }]];
+    }
+    [picker addAction:[UIAlertAction actionWithTitle:@"全屏工作区"
+        style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            MacWSRequestNewScene(self.view.window.windowScene, 0, 0,
+                                 CGSizeZero, NO,
+                                 @"MacWS Workspace", nil);
+        }]];
+    [picker addAction:[UIAlertAction actionWithTitle:@"取消"
+        style:UIAlertActionStyleCancel handler:nil]];
+    picker.popoverPresentationController.sourceView = _windowPickerButton;
+    picker.popoverPresentationController.sourceRect = _windowPickerButton.bounds;
+    [self presentViewController:picker animated:YES completion:nil];
+}
+
+- (void)openFullscreenWorkspace {
+    MacWSRequestNewScene(self.view.window.windowScene, 0, 0,
+                         CGSizeZero, NO,
+                         @"MacWS Workspace", ^(NSError *error) {
+        [self setNotice:error.localizedDescription success:NO];
+    });
 }
 
 - (void)refreshStatus {
@@ -1157,8 +2371,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL ws = [status[@"windowserver_running"] boolValue];
     BOOL input = [status[@"input_running"] boolValue];
     BOOL frame = [status[@"frame_ready"] boolValue];
-    BOOL appInput = [status[@"app_input_ready"] boolValue];
+    BOOL renderableFrame = frame || _metalView.hasDirectSurfaceFrame;
+    BOOL activeAppInput = [status[@"app_input_ready"] boolValue];
     int32_t activeAppPID = (int32_t)[status[@"active_app_pid"] intValue];
+    int32_t targetPID = _streamMode == MacWSStreamModeWindow
+        ? _windowOwnerPID : activeAppPID;
+    BOOL appInput = _streamMode == MacWSStreamModeWindow
+        ? MacWSAppInputEndpointReady(targetPID) : activeAppInput;
     NSString *controlSummary = [NSString stringWithFormat:
         @"connected=%@ busy=%@ rootfs=%@ ws=%@ input=%@ frame=%@ phase=%@ error=%@",
         connected ? @"YES" : @"NO", busy ? @"YES" : @"NO",
@@ -1178,12 +2397,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _windowServerLabel.text = ws ? [NSString stringWithFormat:@"运行中 · %ld", (long)wsPID] : @"已停止";
     _windowServerLabel.textColor = ws ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
     _bridgeLabel.text = input
-        ? (activeAppPID > 1 && appInput
-            ? [NSString stringWithFormat:@"在线 · 目标 PID %d", activeAppPID]
-            : (activeAppPID > 1 ? @"在线 · 等待应用输入端点" : @"在线 · 等待应用"))
+        ? (targetPID > 1 && appInput
+            ? [NSString stringWithFormat:@"在线 · 目标 PID %d", targetPID]
+            : (targetPID > 1 ? @"在线 · 等待应用输入端点" : @"在线 · 等待应用"))
         : @"离线";
     _bridgeLabel.textColor = input ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
-    if (frame) {
+    if (_metalView.hasDirectSurfaceFrame) {
+        _frameLabel.text = @"DisplayStream · IOSurface";
+        _frameLabel.textColor = UIColor.systemGreenColor;
+    } else if (frame) {
         _frameLabel.text = [NSString stringWithFormat:@"%@×%@",
                             status[@"frame_width"], status[@"frame_height"]];
         _frameLabel.textColor = UIColor.systemGreenColor;
@@ -1197,16 +2419,21 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSString *lastError = status[@"last_error"];
     if (lastError.length) [self setNotice:lastError success:NO];
 
-    _metalView.targetPID = activeAppPID;
-    BOOL inputReady = connected && !busy && ws && input && frame &&
-        activeAppPID > 1 && appInput;
+    if (ws && !_metalView.streamServiceConnected)
+        [_metalView configureStreamMode:_streamMode windowID:_windowID];
+    if (ws && !_interopClient.isConnected) [_interopClient connect];
+
+    _metalView.targetPID = targetPID;
+    BOOL inputReady = connected && !busy && ws && input && renderableFrame &&
+        targetPID > 1 && appInput;
     NSString *inputReason = nil;
     if (!connected) inputReason = @"root 控制服务离线";
     else if (busy) inputReason = @"macOS 正在启动或切换";
     else if (!ws) inputReason = @"macOS 工作区已停止";
     else if (!input) inputReason = @"触控桥离线";
-    else if (!frame) inputReason = @"等待已确认的共享帧";
-    else if (activeAppPID <= 1) inputReason = @"请先从控制中心启动一个 macOS 应用";
+    else if (!renderableFrame) inputReason = @"等待 DisplayStream 或兼容帧";
+    else if (targetPID <= 1) inputReason = _streamMode == MacWSStreamModeWindow
+        ? @"等待该窗口的所属应用" : @"请先从控制中心启动一个 macOS 应用";
     else if (!appInput) inputReason = @"目标应用输入端点尚未就绪";
     [_metalView setMacWSInputEnabled:inputReady reason:inputReason];
     _inputLabel.text = inputReady
@@ -1390,6 +2617,61 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _statusLabel.text = [@"画面：" stringByAppendingString:status];
 }
 
+- (void)metalView:(MacWSMetalView *)view
+  receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
+    (void)view;
+    _streamWindows = [windows copy];
+    if (_windowID != 0) {
+        for (MacWSStreamWindow *window in windows) {
+            if (window.descriptor.windowID == _windowID) {
+                _windowOwnerPID = window.descriptor.ownerPID;
+                _windowMinimumSize = CGSizeMake(
+                    window.descriptor.minimumLogicalWidth,
+                    window.descriptor.minimumLogicalHeight);
+                _windowResizable =
+                    (window.descriptor.flags & MacWSStreamWindowResizable) != 0;
+                _metalView.minimumLogicalSize = _windowMinimumSize;
+                _metalView.targetWindowResizable = _windowResizable;
+                break;
+            }
+        }
+    }
+    [self setButton:_windowPickerButton
+              title:windows.count
+                ? [NSString stringWithFormat:@"打开 macOS 窗口 · %lu",
+                   (unsigned long)windows.count]
+                : @"打开 macOS 窗口"
+              image:@"macwindow.on.rectangle"];
+}
+
+- (NSUserActivity *)streamRestorationActivity {
+    NSUserActivity *activity = [[NSUserActivity alloc]
+        initWithActivityType:@"com.macwsguide.host.window"];
+    activity.title = _windowID
+        ? [NSString stringWithFormat:@"MacWS Window %u", _windowID]
+        : @"MacWS Workspace";
+    activity.userInfo = @{
+        @"mode": @(_streamMode),
+        @"window_id": @(_windowID),
+        @"owner_pid": @(_windowOwnerPID),
+        @"minimum_width": @(_windowMinimumSize.width),
+        @"minimum_height": @(_windowMinimumSize.height),
+        @"resizable": @(_windowResizable),
+        @"title": activity.title,
+    };
+    return activity;
+}
+
+- (void)suspendSceneStream {
+    [_metalView suspendStream];
+}
+
+- (void)resumeSceneStream {
+    [_metalView configureStreamMode:_streamMode windowID:_windowID];
+    [_metalView requestStreamWindowList];
+    [_interopClient connect];
+}
+
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
     (void)view;
     NSString *phase = @"?";
@@ -1399,6 +2681,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindTouchUp: phase = @"up"; break;
         case MacWSInputKindTouchCancel: phase = @"cancel"; break;
         case MacWSInputKindHover: phase = @"hover"; break;
+        case MacWSInputKindTap: phase = @"tap"; break;
+        case MacWSInputKindSecondaryTap: phase = @"secondary"; break;
+        case MacWSInputKindScroll: phase = @"scroll"; break;
+        case MacWSInputKindKeyDown: phase = @"key-down"; break;
+        case MacWSInputKindKeyUp: phase = @"key-up"; break;
+        case MacWSInputKindConfigureWindow: phase = @"configure-window"; break;
+        default: break;
     }
     int sendError = 0;
     BOOL sent = MacWSSendInputRecord(&record, &sendError);
@@ -1407,7 +2696,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         sent ? @"已发送" : @"离线", phase, record.x, record.y];
     _inputLogSequence++;
     BOOL continuous = record.kind == MacWSInputKindTouchMove ||
-                      record.kind == MacWSInputKindHover;
+                      record.kind == MacWSInputKindHover ||
+                      record.kind == MacWSInputKindScroll;
     if (!continuous || (_inputLogSequence % 60) == 0) {
         MacWSLog(@"input-v3 transport=%@ errno=%d scene=%llx target=%d kind=%@ point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u seq=%llu",
                  sent ? @"sent" : @"failed", sendError, record.sceneID,
@@ -1434,16 +2724,38 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                  options:(UISceneConnectionOptions *)connectionOptions {
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     UIWindowScene *windowScene = (UIWindowScene *)scene;
+    NSUserActivity *activity = connectionOptions.userActivities.anyObject;
+    if (!activity) activity = session.stateRestorationActivity;
+    MacWSStreamMode streamMode = (MacWSStreamMode)
+        [activity.userInfo[@"mode"] unsignedIntValue];
+    uint32_t windowID = [activity.userInfo[@"window_id"] unsignedIntValue];
+    int32_t ownerPID = (int32_t)[activity.userInfo[@"owner_pid"] intValue];
+    CGSize minimumSize = CGSizeMake(
+        [activity.userInfo[@"minimum_width"] doubleValue],
+        [activity.userInfo[@"minimum_height"] doubleValue]);
+    BOOL resizable = [activity.userInfo[@"resizable"] boolValue];
+    if (streamMode != MacWSStreamModeWindow || windowID == 0) {
+        streamMode = MacWSStreamModeFullscreen;
+        windowID = 0;
+        ownerPID = 0;
+        minimumSize = CGSizeZero;
+        resizable = NO;
+    }
     NSString *shortID = session.persistentIdentifier;
     if (shortID.length > 8) shortID = [shortID substringToIndex:8];
-    windowScene.title = [NSString stringWithFormat:@"MacWS %@", shortID];
+    NSString *requestedTitle = activity.userInfo[@"title"];
+    windowScene.title = requestedTitle.length ? requestedTitle :
+        [NSString stringWithFormat:@"MacWS %@", shortID];
     MacWSViewController *controller = [[MacWSViewController alloc]
-        initWithSceneIdentifier:session.persistentIdentifier];
+        initWithSceneIdentifier:session.persistentIdentifier
+                     streamMode:streamMode windowID:windowID
+                       ownerPID:ownerPID minimumSize:minimumSize
+                      resizable:resizable];
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.rootViewController = controller;
     [self.window makeKeyAndVisible];
-    MacWSLog(@"scene-connected id=%@ role=%@", session.persistentIdentifier,
-             session.role);
+    MacWSLog(@"scene-connected id=%@ role=%@ mode=%u window=%u",
+             session.persistentIdentifier, session.role, streamMode, windowID);
     if (connectionOptions.URLContexts.count) {
         NSSet<UIOpenURLContext *> *contexts = connectionOptions.URLContexts;
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1452,10 +2764,34 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
 }
 
+- (void)sceneWillEnterForeground:(UIScene *)scene {
+    (void)scene;
+    [(MacWSViewController *)self.window.rootViewController resumeSceneStream];
+}
+
+- (void)sceneDidEnterBackground:(UIScene *)scene {
+    (void)scene;
+    [(MacWSViewController *)self.window.rootViewController suspendSceneStream];
+}
+
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
     for (UIOpenURLContext *context in URLContexts) {
         if ([context.URL.host isEqualToString:@"new"]) {
-            MacWSRequestNewScene(scene, nil);
+            uint32_t windowID = 0;
+            int32_t ownerPID = 0;
+            NSString *title = nil;
+            NSURLComponents *components = [NSURLComponents
+                componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"window"])
+                    windowID = item.value.intValue;
+                else if ([item.name isEqualToString:@"pid"])
+                    ownerPID = item.value.intValue;
+                else if ([item.name isEqualToString:@"title"])
+                    title = item.value;
+            }
+            MacWSRequestNewScene(scene, windowID, ownerPID,
+                                 CGSizeZero, NO, title, nil);
             break;
         }
         if ([context.URL.host isEqualToString:@"test-input"]) {
@@ -1486,7 +2822,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 .magic = MACWS_INPUT_MAGIC,
                 .version = MACWS_INPUT_VERSION,
                 .kind = MacWSInputKindHover,
-                .sceneID = (uint64_t)scene.session.persistentIdentifier.hash,
+                .sceneID = ((uint64_t)scene.session.persistentIdentifier.hash) &
+                    ~MACWS_INPUT_WINDOW_SCENE_FLAG,
                 .timestamp = CACurrentMediaTime(),
                 .x = x,
                 .y = y,
@@ -1498,7 +2835,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             MacWSViewController *controller =
                 (MacWSViewController *)self.window.rootViewController;
             NSDictionary *status = [controller valueForKey:@"latestStatus"];
-            record.targetPID = (int32_t)[status[@"active_app_pid"] intValue];
+            uint32_t targetWindowID = (uint32_t)[[controller
+                valueForKey:@"windowID"] unsignedIntValue];
+            int32_t targetOwnerPID = (int32_t)[[controller
+                valueForKey:@"windowOwnerPID"] intValue];
+            record.targetPID = targetWindowID != 0
+                ? targetOwnerPID
+                : (int32_t)[status[@"active_app_pid"] intValue];
+            if (targetWindowID != 0)
+                record.sceneID = MacWSInputSceneForWindow(targetWindowID, 0);
             if ([requestedKind isEqualToString:@"tap"])
                 record.kind = MacWSInputKindTouchDown;
             int sendError = 0;
@@ -1538,7 +2883,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (NSUserActivity *)stateRestorationActivityForScene:(UIScene *)scene {
     (void)scene;
-    return [[NSUserActivity alloc] initWithActivityType:@"com.macwsguide.host.window"];
+    MacWSViewController *controller =
+        (MacWSViewController *)self.window.rootViewController;
+    return [controller streamRestorationActivity];
 }
 @end
 

@@ -1,5 +1,11 @@
 # Native iPadOS host (M0–M4)
 
+> This is the historical M0-M4 framebuffer milestone record. The current
+> multi-window DisplayStream/IOSurface design, including the no-letterbox
+> small-window mask, pinch zoom, and per-window density policy, is maintained
+> in [`displaystream-host-architecture.md`](displaystream-host-architecture.md).
+> Any M0 aspect-fit behavior described below is superseded.
+
 `MacWSHost` is the first milestone toward presenting each chroot macOS window
 as an iPadOS `UIWindowScene` instead of viewing the whole desktop through VNC.
 It is an iOS application built by the root Theos aggregate.
@@ -121,8 +127,9 @@ listed below.
 - Every scene reads the existing WindowServer capture at
   `/var/mnt/rootfs/private/tmp/macws_vnc_fb` directly. No `OSXvnc-server`, RFB
   encoding, network socket, or VNC client is involved.
-- When `MTLCreateSystemDefaultDevice()` succeeds, an iOS-native Metal render
-  pipeline uploads the BGRA frame and presents an aspect-fitted quad.
+- Historical M0 behavior: when `MTLCreateSystemDefaultDevice()` succeeds, an
+  iOS-native Metal render pipeline uploads the BGRA frame. The current Host
+  uses edge-to-edge source cropping and never presents an aspect-fit quad.
 - The dedicated entitlement set names only the two runtime-denied IOKit
   clients, `AGXDeviceUserClient` and `IOSurfaceRootUserClient`.  This changes
   the device result from nil to `Apple M1 GPU`; a completed render/present
@@ -130,8 +137,9 @@ listed below.
 - If the iOS process cannot enumerate a Metal device, an explicitly labelled
   UIKit/CoreAnimation fallback displays a stable snapshot. This is a recovery
   path, not evidence of an App-local Metal present.
-- Touch and pointer coordinates are transformed from the aspect-fitted scene
-  into physical macOS framebuffer pixels. M4 sends version-3 records with the
+- Historical M0 touch coordinates were transformed from the aspect-fitted
+  scene. The current Host maps the shared no-letterbox viewport rectangle into
+  physical macOS pixels. M4 sends version-3 records with the
   active target PID to `macwsinputd`, which prefers the matching target-process
   AppKit socket and uses CGEvent posting only as a fallback. A real checkbox
   state/pixel change now confirms click delivery.

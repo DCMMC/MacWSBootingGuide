@@ -61,12 +61,16 @@ TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
 INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
+DISPLAY_PLIST="$MACOS_DAEMONS/com.macwsguide.display.plist"
+INTEROP_PLIST="$MACOS_DAEMONS/com.macwsguide.interop.plist"
 WINDOWSERVER_LABEL=UIKitApplication:com.macwsguide.windowserver
 VNC_LABEL=UIKitApplication:com.macwsguide.osxvnc
 TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
 PBS_LABEL=com.macwsguide.pbs
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
+DISPLAY_LABEL=UIKitApplication:com.macwsguide.display
+INTEROP_LABEL=UIKitApplication:com.macwsguide.interop
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
@@ -125,6 +129,8 @@ P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_INPUTD='/usr/local/bin/macwsinputd'
+P_DISPLAYD='/usr/local/bin/macwsdisplayd'
+P_INTEROPD='/usr/local/bin/macwsinteropd'
 P_VSCODE='Visual Studio Code.app/Contents/'
 P_CHROME150='Google Chrome.app/Contents/'
 
@@ -348,6 +354,10 @@ stop_ws_dependents() {
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl unload "$INPUT_PLIST" 2>/dev/null
     launchctl remove "$INPUT_LABEL" 2>/dev/null
+    launchctl unload "$DISPLAY_PLIST" 2>/dev/null
+    launchctl remove "$DISPLAY_LABEL" 2>/dev/null
+    launchctl unload "$INTEROP_PLIST" 2>/dev/null
+    launchctl remove "$INTEROP_LABEL" 2>/dev/null
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
     launchctl unload "$CHROME150_PLIST" 2>/dev/null
@@ -369,9 +379,12 @@ stop_ws_dependents() {
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
+    kill_by_pattern "$P_DISPLAYD"
+    kill_by_pattern "$P_INTEROPD"
     kill_by_pattern "$P_VSCODE"
     kill_by_pattern "$P_CHROME150"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
+    rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 }
 
@@ -417,6 +430,8 @@ recover_ws_dependents() {
     if [ -f "$INPUT_PLIST" ]; then
         launchctl load "$INPUT_PLIST" 2>/dev/null
     fi
+    [ ! -f "$DISPLAY_PLIST" ] || launchctl load "$DISPLAY_PLIST" 2>/dev/null
+    [ ! -f "$INTEROP_PLIST" ] || launchctl load "$INTEROP_PLIST" 2>/dev/null
     if [ "$WANT_VNC" = 1 ]; then
         launchctl load "$VNC_PLIST" 2>/dev/null
     fi
@@ -1056,6 +1071,10 @@ cleanup_macos() {
     # broader directory unload and verify no pre-fix binary remains alive.
     launchctl unload "$INPUT_PLIST" 2>/dev/null
     launchctl remove "$INPUT_LABEL" 2>/dev/null
+    launchctl unload "$DISPLAY_PLIST" 2>/dev/null
+    launchctl remove "$DISPLAY_LABEL" 2>/dev/null
+    launchctl unload "$INTEROP_PLIST" 2>/dev/null
+    launchctl remove "$INTEROP_LABEL" 2>/dev/null
 
     # VS Code is launched separately from this script, but it is still a CGS
     # client of this WindowServer.  Runtime-confirmed after the 300-second
@@ -1074,8 +1093,11 @@ cleanup_macos() {
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_INPUTD"
+    kill_by_pattern "$P_DISPLAYD"
+    kill_by_pattern "$P_INTEROPD"
     kill_by_pattern "$P_VSCODE"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
+    rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 
     # 3) WindowServer and the macOS service daemons loaded with it
@@ -1155,6 +1177,9 @@ start_macos() {
     log "Waiting for WindowServer graphics initialization before GUI clients..."
     wait_for_initial_ws_ready "$ws_log_start_line" || return 1
 
+    log "Starting DisplayStream IOSurface bridge..."
+    launchctl load "$DISPLAY_PLIST" || return 1
+
     log "Starting macOS pasteboard service (launchd job '$PBOARD_LABEL')..."
     rm -f "$LOGDIR/pboard.log"
     launchctl load "$PBOARD_PLIST" || return 1
@@ -1167,6 +1192,9 @@ start_macos() {
         log "ERROR: macOS pboard process did not start."
         return 1
     }
+
+    log "Starting iOS/macOS clipboard and file bridge..."
+    launchctl load "$INTEROP_PLIST" || return 1
 
     log "Starting macOS Services database service (launchd job '$PBS_LABEL')..."
     rm -f "$LOGDIR/pbs.log"
