@@ -160,6 +160,22 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 - 达到方向/距离/速度阈值后锁定一个轴并只触发一次；识别过程中显示半透明 HUD，成功时给轻触觉反馈，未达阈值抬起则无副作用。具体阈值必须集中在纯策略函数并由 iPad 手感测试决定。
 - macOS Mission Control、App Exposé、Space 和显示桌面的执行必须走独立桌面命令控制面；不能伪造成发送给某个前台应用的普通鼠标事件。实际 SkyLight/Dock/系统快捷键路径尚未 RE/runtime-confirmed，未确认前均为产品目标，不得标记已实现。
 
+iPadOS 的三指左/右滑撤销/重做属于 UIKit 标准编辑交互，应用可以在当前 responder 上显式退出，不必把屏幕中央的横向桌面手势永久标为实验功能。Apple 在 iOS 13 的 UIKit 说明中给出的控制点是 `UIResponder.editingInteractionConfiguration`：<https://developer.apple.com/videos/play/wwdc2019/224/>。
+
+```objc
+- (UIEditingInteractionConfiguration)editingInteractionConfiguration {
+    return self.fullScreenDesktopGestureMode && !self.softKeyboardActive
+        ? UIEditingInteractionConfigurationNone
+        : UIEditingInteractionConfigurationDefault;
+}
+```
+
+- 只由全屏 `MacWSMetalView` 在桌面手势模式下返回 `None`，让自定义三指 pan 拥有左右方向；设置页、文件选择器、Scene 语义菜单等普通 UIKit responder 保持 `Default`。
+- `editingInteractionConfiguration = None` 只关闭当前 responder 的 UIKit 编辑手势，不代表取得 iPadOS 边缘导航、辅助功能或外接妙控板系统手势的所有权。
+- 软键盘显示或隐藏 `UITextInput` 代理成为 first responder 时，禁用桌面三指 recognizer，并让输入代理保持 `Default`；键盘收起且 Metal View 恢复 first responder 后再启用。不能让一次横向 Space 切换同时对输入代理执行 undo/redo。
+- responder、软键盘、菜单和 Scene 状态切换必须通过一个统一策略更新 recognizer enabled 与 editing configuration，不能由多个通知各自修改一半状态。
+- 三指 pinch 仍保留给 UIKit copy/paste，不纳入桌面命令；当前只接管三指方向 pan。
+
 外接 Magic Trackpad/妙控键盘触控板必须单独处理。Apple 的 iPad 使用说明把三指上滑定义为 Home/应用切换器、三指左右滑定义为切换 iPad App；因此方案默认这些手势由 iPadOS 所有，不尝试私有 hook 抢占系统导航：<https://support.apple.com/guide/ipad/ipad66ce6358/ipados>。
 
 - UIKit 可以区分 indirect pointer 输入并对部分触控板 gesture recognizer 作响应，但这不能证明 iPadOS 会把系统三指手势的原始触点交给本应用：<https://developer.apple.com/documentation/uikit/pointer-interactions>。
@@ -347,6 +363,7 @@ Host gesture recognizer
 - 同一 gesture sequence 最多执行一次；服务断线、超时、重复 sequence 或全屏 Scene 已失焦时拒绝。结果返回前不阻塞 Metal、DisplayStream 或输入接收线程。
 - Host HUD 分别显示“识别中 / 已执行 / 不可用”，而不是用动画假装桌面状态已经改变。成功证据是可见桌面/Space 变化和对应 result，不是服务进程存活。
 - 第一阶段可以只实现经设备验证的一部分命令；不可用命令从设置中隐藏，并在能力握手中返回明确 bitset。
+- Host 侧必须以一个纯策略函数同时决定：是否为全屏、是否有软键盘/输入代理、是否展开菜单、是否处于系统边缘、辅助功能状态、`editingInteractionConfiguration` 返回值和三指 recognizer 是否 enabled。协议层不能修补一个本应在 UIKit responder 层拒绝的手势。
 
 ### 7. 菜单快照与动作协议（规划）
 
@@ -528,6 +545,9 @@ git diff --check
 - 外接 Magic Trackpad 在目标 iPadOS 16 上记录三指上/下/左/右是否到达 UIKit；未到达视为系统所有的预期结果，不以私有 hook 绕过。
 - Control + 双指替代入口验证四个方向、修饰键抬起和普通双指滚动；没有 Control 时不得触发桌面命令。
 - VoiceOver/AssistiveTouch 开启时重新验证或自动禁用冲突映射，不能抢占辅助功能手势。
+- 全屏 Metal View、单窗 Metal View、软键盘输入代理、设置文本框和文件选择器分别读取 `editingInteractionConfiguration`：只有“全屏 + 键盘关闭 + 桌面手势可用”的 Metal responder 返回 `None`。
+- 在全屏 Metal View 三指左右滑时，Host desktop command 只能触发一次，UIKit `undoManager` 的 undo/redo 计数不得变化；退出全屏或打开软键盘后，普通 UIKit 编辑控件的三指撤销/重做必须恢复。
+- 三指 pinch 在全屏下不得被方向 recognizer 误判；普通 UIKit 编辑 responder 的 copy/paste 行为保持系统默认。
 
 ### 6. IOSurface 与四窗稳定性
 
