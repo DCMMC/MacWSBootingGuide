@@ -19,7 +19,7 @@
 | DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 精确基础窗和同 owner 瞬态层已在 iPad runtime-confirmed；全屏直传待修复 |
 | macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放 | 单窗、四标签身份跟随、重复 Scene 去重和进程复用已实现；关闭 Scene 的真实窗口关闭待设备回归 |
 | 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | RE-confirmed；设备已记录宽 109/高 36 个候选及多种 Scene geometry，物理拖动手感待复测 |
-| 无黑边显示 | 正常状态始终 edge-to-edge；宽高比短暂不一致时裁剪源纹理，不使用 aspect-fit | 已实现并有纯 C 单测 |
+| 比例稳定显示 | 1× 始终完整等比；重排交接期允许短暂边距，不拉伸、不裁边 | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
 | 缩放与精确操控 | 双指双击在 1× 与用户配置的 1.5×/2× 间切换；放大后默认移动视口，输入坐标同步映射到裁剪后的源纹理 | 已实现并有数学单测；原生 magnify 待验证 |
@@ -49,7 +49,7 @@ macwsdisplayd（macOS 13.4 chroot）
 MacWSHost（iPadOS）
   ├─ 一个 macOS 窗口对应一个 UIWindowScene
   ├─ 多个 IOSurface → 多个 MTLTexture → 按 SkyLight level 合成到 MTKView
-  ├─ 无黑边视口、缩放、遮罩、密度选择
+  ├─ 等比视口、缩放、遮罩、密度选择
   └─ Scene 顶部语义菜单 / 触摸 / 全屏桌面手势 / 妙控键盘 / 拖放 / 剪贴板
              │ 84-byte v4 有版本输入记录
              ▼
@@ -91,31 +91,32 @@ iPadOS 16 的固定尺寸档位不是本方案必须接受的产品边界。开�
 - Scene 尺寸变化可以连续反馈给 Host，但传向 AppKit/DisplayStream 的重排请求必须合并和防抖；拖动结束再提交一次最终精确尺寸，避免 resize storm 和 IOSurface 池反复重建。
 - 新档位低于 macOS 应用要求时，沿用下一节的整窗遮罩和输入冻结；不得为了“支持小窗口”绕过 AppKit 最小尺寸。
 
-### 2. 小尺寸窗口：整窗遮罩，不使用 aspect-fit
+### 2. 小尺寸窗口：整窗遮罩
 
 判定公式：
 
 ```text
-触屏模式所需 iPad 宽高 = macOS 最小 frame 宽高 × 1.35
-键鼠模式所需 iPad 宽高 = macOS 最小 frame 宽高 × 1.00
+像素匹配密度 = macOS surface backingScale / (MTK drawable pixels / Scene points)
+像素匹配所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度
+更多空间所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度 × 0.85
 ```
 
 只要 Scene 的可用宽度或高度低于当前模式要求：
 
 - 用接近不透明的系统背景覆盖整个渲染区域；不显示黑边和被挤坏的 macOS UI。
-- 文案同时显示应用要求、当前模式要求，并引导“放大 iPadOS 窗口”或“切换键鼠高密度”。
+- 文案同时显示应用要求、当前模式要求，并引导“放大 iPadOS 窗口”或“切换更多空间”。
 - 禁止该 Scene 的触摸、指针和键盘注入，防止用户在不可见位置误操作。
 - 保留 Host 控制面板入口，用户仍可切换密度、选择其他窗口或进入全屏工作区。
-- 当窗口重新达到要求时自动撤去遮罩，并以 180 ms 防抖向 AppKit 请求重排。
+- 当窗口重新达到要求时自动撤去遮罩，并按 33 ms geometry 合并策略向 AppKit 请求重排。
 
 如果最小尺寸尚未从应用进程发布，协议中的值为 0，含义是“未知”，不是“没有最小尺寸”。Host 不猜一个全局常量；AppKit 仍会钳制实际 resize，下一次窗口目录刷新后再做遮罩判定。
 
-### 3. 正常显示：无黑边铺满
+### 3. 正常显示：始终保持宽高比
 
-- Host 的目标是让 macOS 窗口按 `SceneSize / densityScale` 重排，使源窗口与 Scene 尽量同宽高比。
-- 窗口重排期间、旋转期间或 DisplayStream 尺寸更新尚未到达时，Metal 使用 aspect-fill：目的区域永远铺满，差异由规范化源纹理裁剪承担。
-- 不允许 aspect-fit，也不生成上下或左右黑边。
-- aspect-fill 是短暂过渡和缩放基础，不是长期替代原生重排。持续裁剪过多必须通过日志和设备测试暴露。
+- Host 让 macOS 窗口按 `SceneSize / densityScale` 重排，使新 IOSurface 与 Scene 收敛到同一宽高比。
+- UIKit 会先提交 Scene geometry，AppKit 和 DisplayStream 随后才产生新尺寸的 IOSurface。在这段有界交接期，上一帧必须用 aspect-fit 保持完整比例；允许短暂出现边距，但禁止把旧帧拉伸成新比例，也禁止裁掉标题栏和窗口边缘。
+- Metal 的目标矩形按当前 drawable 的物理像素网格取整，避免原生 Retina 模式仍落在半像素边界上。
+- 新 IOSurface 到达后重新计算显示、输入和悬浮指针的同一组变换。持续边距说明 AppKit 重排没有收敛，必须作为 resize 故障暴露，不能用永久拉伸掩盖。
 
 ### 4. 双指缩放、移动与恢复
 
@@ -138,9 +139,9 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 
 当前实现采用“逐窗口有效密度”：
 
-- **触屏舒适 135%**：一个 macOS 逻辑点占约 1.35 个 iPad 点。对同一个 Scene 请求更小的 macOS 逻辑 frame，应用通过原生 Auto Layout/AppKit 布局把文字和控件显示得更大。
-- **键鼠高密度 100%**：一个 macOS 逻辑点占 1 个 iPad 点，容纳更多内容，适合妙控键盘和精确指针。
-- DisplayStream 的真实 `backingScale` 仍用于 HiDPI 像素传输；密度模式不伪造 IOSurface 尺寸，也不对最终画面做低质量二次位图放大。
+- **像素匹配 Retina（默认）**：动态使用 `macOS backingScale / UIKit effectiveDrawableScale`。最终安装二进制的 runtime witness 为 `frame=1728x1302 backing=2.000 drawable=1726x1302 content=(0.00,0.58 1004.00x755.84) density=1.16`：高度完全相等，宽度差异限制在两个物理取整像素内。同一几何版本还记录过 AppKit 收敛到 `1027x651 logical point`、surface `2054x1302`、drawable `2053x1302` 的一像素差证据。全屏或其他 Scene 合成比例变化后会重新计算，不能把 100% 或 135% 当成所有窗口状态下的固定答案。
+- **更多空间 +18%**：在动态像素匹配密度上乘 0.85，使逻辑画布扩大约 `1 / 0.85 = 1.176`，再做一次受控等比缩小。它明确是可选缩放，不宣称是 1:1 原生 HiDPI。
+- DisplayStream 的真实 `backingScale` 仍用于 HiDPI 像素传输；密度模式不伪造 IOSurface 尺寸。原生 Retina 模式的验收必须记录 surface backing scale、drawable 像素尺寸和最终内容矩形三者，而不能只看控制面板的百分比文案。
 - 切换模式会恢复视口缩放、重新计算小窗口门槛，然后防抖请求 AppKit 重排。
 
 因此，这里实现的是“每个 Scene 的有效信息密度”，不是修改 macOS 全局 DPI。将来若验证出 macOS 13.4 可安全逐窗口设置 backing scale，必须先证明窗口纹理、命中测试、菜单和跨屏拖动四者一致，才能替换当前方案。
@@ -151,8 +152,9 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 
 - 单指落下先进入候选状态，不立即发送 mouse-down；位置直接对应当前可见纹理中的 macOS 像素。
 - 450 ms 内抬起且移动不足 6 pt：发送一个原子左键单击。
-- 450 ms 前移动达到 6 pt：补发起点的左键 down，随后发送 move，抬起发送 up，形成 macOS 左键按住拖动。
-- 保持 450 ms 且移动不足 6 pt：发送一个原子右键单击并触发轻触觉反馈；之后移动只更新菜单 hover，不维持一个跨数据报的右键按下状态。
+- 450 ms 前移动达到 6 pt：进入原生滚动序列，发送 began/changed/ended 和有界惯性；单指滑动因此成为默认页面滚动手势。
+- 保持 450 ms 且移动不足 6 pt：只武装左键拖动并触发轻触觉反馈，不提前发送右键。之后移动达到阈值才发送 down/move，抬起发送 up。
+- 武装后不移动直接抬起：发送一个原子右键单击。这样长按右键与长按后拖动共享前半段，但不会互相抢占。
 - 第二根手指加入会取消候选；若左键拖动已经开始，Host 发送 cancel。这样双指滚动/放大不会留下卡住的按钮状态。
 - 适合经过触屏密度放大的按钮、列表、标签页、拖动目标和右键菜单。450 ms 与 6 pt 是产品阈值，设备测试后可以统一调整，不能在各手势回调里复制不同常量。
 
@@ -160,6 +162,7 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 
 - 单指相对移动鼠标；轻点为原子左键点击；长按后移动为拖动。
 - 双指轻点为原子右键；双指移动发送横向和纵向 pixel scroll。
+- Host 在 macOS 内容上持续显示一个 iPadOS 风格的圆形材质指针；按住时收缩，Scene 改尺寸或旋转时使用与画面相同的变换重新定位。
 - 右键 down/up 在一个数据报内表达，避免拥塞时 up 越过 down。
 
 **妙控键盘**
@@ -315,7 +318,7 @@ IOSurfaceLookupFromMachPort
 
 ### 3. 窗口重排控制面
 
-Host 在 Scene 布局稳定 180 ms 后发送 `MacWSInputKindConfigureWindow`：
+Host 以 33 ms 合并窗口拖动期间的 Scene geometry，并在 350/1200/3000 ms 三个有界收敛点重申同一最终尺寸：
 
 ```text
 sceneID  = 精确 CGWindowID 编码
@@ -328,11 +331,11 @@ pressure = densityScale
 
 这是一条 AppKit 正常 resize 路径，不是 hook 验证函数、强制分支或跳过约束。任何应用仍可拒绝或重新调整请求；Host 必须以随后发布的窗口目录为准。
 
-### 4. 无黑边视口与坐标公式
+### 4. 等比视口与坐标公式
 
 纯函数位于 `include/macws_viewport_math.h`，输入源纹理宽高、Scene 宽高、zoom 和 center，输出规范化 `visibleSource`。
 
-基础 aspect-fill：
+1× 使用完整窗口 aspect-fit；只有用户显式进入 1.5×/2× 放大视角时，纯函数才计算下列有界裁剪视口：
 
 ```text
 sourceAspect > viewAspect:
@@ -467,7 +470,7 @@ NSMainMenu
 - macwsdisplayd、macwsinputd arm64 macOS 13 target 编译、链接、签名通过。
 - libmachook/AppInputBridge arm64 + arm64e 编译、合并、签名通过。
 - Stream/Input/Interop/Metrics 描述符校验测试通过。
-- 无黑边 aspect-fill、1×/1.5×/2× 视口、中心钳制、触摸映射纯 C 测试通过。
+- 完整窗口 aspect-fit、1.5×/2× 放大视口、中心钳制、触摸映射纯 C 测试通过。
 - shell/plist/完整 package 验证命令列在后文；最终结果以当前变更的 QA 记录为准。
 
 “本地构建确认”只代表类型、ABI 和链接可成立，不代表 iPad 上能够收到帧或达到性能目标。
@@ -563,12 +566,12 @@ git diff --check
 至少选择 Terminal、Finder/系统应用、Electron、固定尺寸面板各一个：
 
 1. 记录应用发布的真实 min frame。
-2. 在触屏 135% 下，把 Scene 调到门槛 `+1 point`：不得遮罩，应用布局完整。
+2. 在像素匹配 Retina 下，把 Scene 调到门槛 `+1 point`：不得遮罩，应用布局完整，并记录 source/drawable 像素是否 1:1。
 3. 调到门槛 `-1 point`：必须整窗遮罩，所有 macOS 输入停止。
-4. 切换键鼠 100%：若达到新门槛，遮罩撤下，AppKit 发生一次防抖重排。
+4. 切换更多空间 +18%：若达到新门槛，遮罩撤下，AppKit 发生一次合并后的重排。
 5. 固定尺寸窗口：不发送 resize；Scene 过小时遮罩。
 6. 应用运行中改变 `contentMinSize`：500–1000 ms 内目录和遮罩更新。
-7. 快速拖过所有台前调度档位：不能形成 resize 循环、日志风暴或持续裁剪。
+7. 快速拖过所有台前调度档位：不能形成 resize 循环、日志风暴或持续边距；交接期旧帧可以短暂留边，但任何一帧都不能拉伸变形。
 8. 在原始档位之间选择一个新增密集档位：窗口装饰、`UIWindowScene.bounds`、Host drawable、macOS 目标 frame 和输入坐标必须最终一致；不能只是拉伸旧画面。
 9. 新增档位小于当前应用门槛：只出现整窗遮罩，菜单和 Host 控制入口仍可用；放大到门槛后只发生一次合并后的最终重排。
 10. 同时打开 MacWS 与普通 iPad 应用反复 resize：若实现尚为全局实验开关，必须单列记录普通应用的 geometry/safe-area 回归；实现 Scene 隔离后则验证普通应用仍只使用系统原始策略。
@@ -576,7 +579,7 @@ git diff --check
 ### 3. 缩放与输入矩阵
 
 - 在 1×、1.5×、2×分别点击可见区域四角、中心和窗口标题栏控件；目标偏差不得随 zoom 增大。
-- 单指在 450 ms 与 6 pt 阈值的两侧分别验证：短按只点击一次，越过移动阈值形成连续左键拖动，越过时间阈值只右键一次。
+- 单指在 450 ms 与 6 pt 阈值的两侧分别验证：短按只点击一次，先越过移动阈值形成滚动，先越过时间阈值后移动才形成连续左键拖动，长按不移动释放只右键一次。
 - 第二指在候选阶段加入时不得产生左/右键；在左键拖动阶段加入时，macOS 必须收到 cancel，不能留下卡住的 mouse-down。
 - 1× 双指滑动必须滚动 macOS 内容；进入放大后默认移动视口，规范化 visible rect 始终在 `[0,1]` 内。
 - 放大 HUD 切到“操作内容”后，双指滑动必须滚动内容而不移动视口；切回“移动视图”后行为相反。
@@ -659,13 +662,13 @@ git diff --check
 
 ### M2：触屏可用
 
-- 最小尺寸遮罩、触屏密度、二段式放大、双指路由和单指点击/拖动/长按右键在三类应用通过。
+- 最小尺寸遮罩、原生 Retina 密度、二段式放大、单指滚动、单指点击、长按拖动/右键在三类应用通过。
 - Photos/Safari 的原生 magnify 在真实事件注入路径确认后作为独立增量验收，不阻塞 Host 视口放大能力。
 - 修复只能发生在产生错误状态的上游，不接受输入常量偏移补丁掩盖几何问题。
 
 ### M3：妙控键盘与四窗
 
-- 键鼠高密度、指针、键盘、滚动、快捷键通过。
+- 更多空间密度、圆形相对指针、键盘、双指滚动、快捷键通过。
 - 全屏屏幕三指桌面命令与外接妙控板修饰键替代入口通过；外接原生三指能力按设备证据启用。
 - iPadOS 16 密集台前调度档位使用真实 Scene geometry，通过新增档位几何一致性、普通应用隔离和安全恢复测试。
 - 四个 Scene 达到稳定性和性能门槛。

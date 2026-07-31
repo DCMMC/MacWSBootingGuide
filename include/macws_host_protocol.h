@@ -96,10 +96,13 @@ enum {
 
 typedef uint16_t MacWSHostDisplayDensity;
 enum {
-    // A macOS logical point occupies more iPad points, making controls and
-    // text larger. The Host requests a smaller logical AppKit viewport.
+    // Pixel-matched Retina mode. The Host derives density from the exported
+    // AppKit backing scale divided by the current MTK drawable/Scene scale;
+    // this remains correct when Stage Manager changes UIKit's render scale.
     MacWSHostDisplayDensityTouchComfort = 1,
-    // More macOS logical points fit into the Scene for pointer/keyboard use.
+    // Optional more-space mode. It applies a 0.85 factor to the dynamic native
+    // density so about 18% more macOS logical points fit into the Scene, at the
+    // cost of a controlled downsample.
     MacWSHostDisplayDensityKeyboard = 2,
 };
 

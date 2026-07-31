@@ -22,11 +22,13 @@ int main(void) {
     assert(MacWSDecideTouchCandidate(0.44, 5.99, true) ==
            MacWSTouchCandidateDecisionTap);
     assert(MacWSDecideTouchCandidate(0.10, 6.0, false) ==
-           MacWSTouchCandidateDecisionDrag);
+           MacWSTouchCandidateDecisionScroll);
     assert(MacWSDecideTouchCandidate(0.45, 5.99, false) ==
-           MacWSTouchCandidateDecisionSecondaryTap);
+           MacWSTouchCandidateDecisionLongPress);
+    // Movement wins when timer delivery and the touch sample arrive together;
+    // an already-moving finger must not become a delayed long press.
     assert(MacWSDecideTouchCandidate(0.45, 6.0, false) ==
-           MacWSTouchCandidateDecisionSecondaryTap);
+           MacWSTouchCandidateDecisionScroll);
 
     MacWSViewport viewport = {0};
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 1, 0.5, 0.5,
