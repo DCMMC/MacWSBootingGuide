@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define MACWS_MENU_MAGIC 0x4d4e574du /* "MWNM" */
-#define MACWS_MENU_VERSION 1u
+#define MACWS_MENU_VERSION 2u
 
 #define MACWS_MENU_XPC_OP_SNAPSHOT "menu_snapshot"
 #define MACWS_MENU_XPC_OP_ACTION "menu_action"
@@ -52,6 +52,16 @@ enum {
     MacWSMenuNodeRequiresWorkspace = 1u << 7,
 };
 
+// The semantic iPadOS menu is rendered by Host, but its appearance belongs to
+// the represented macOS window. Carry the resolved AppKit appearance in the
+// snapshot instead of inheriting the unrelated iPadOS Scene appearance.
+typedef uint32_t MacWSMenuAppearance;
+enum {
+    MacWSMenuAppearanceUnspecified = 0,
+    MacWSMenuAppearanceLight = 1,
+    MacWSMenuAppearanceDark = 2,
+};
+
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t version;
@@ -75,6 +85,7 @@ typedef struct __attribute__((packed)) {
     int32_t ownerPID;
     uint32_t windowID;
     uint64_t generation;
+    uint32_t appearance;
     uint32_t nodeCount;
     uint32_t stringBytes;
     uint32_t totalBytes;
@@ -115,6 +126,7 @@ static inline bool MacWSMenuResponseIsValid(
         header->size != sizeof(*header) || header->reserved != 0 ||
         header->nonce == 0 || header->ownerPID <= 1 ||
         header->windowID == 0 || header->generation == 0 ||
+        header->appearance > MacWSMenuAppearanceDark ||
         header->status < MacWSMenuStatusOK ||
         header->status > MacWSMenuStatusInternalError ||
         header->nodeCount > MACWS_MENU_MAX_NODES ||
@@ -145,12 +157,12 @@ static inline bool MacWSMenuResponseIsValid(
 
 #if defined(__cplusplus)
 static_assert(sizeof(MacWSMenuRequest) == 44, "MacWS menu request ABI");
-static_assert(sizeof(MacWSMenuResponseHeader) == 48,
+static_assert(sizeof(MacWSMenuResponseHeader) == 52,
               "MacWS menu response ABI");
 static_assert(sizeof(MacWSMenuNode) == 44, "MacWS menu node ABI");
 #else
 _Static_assert(sizeof(MacWSMenuRequest) == 44, "MacWS menu request ABI");
-_Static_assert(sizeof(MacWSMenuResponseHeader) == 48,
+_Static_assert(sizeof(MacWSMenuResponseHeader) == 52,
                "MacWS menu response ABI");
 _Static_assert(sizeof(MacWSMenuNode) == 44, "MacWS menu node ABI");
 #endif

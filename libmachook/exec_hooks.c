@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -24,6 +25,12 @@
 #include <sys/time.h>
 #include "interpose.h"
 #include "macws_macho_arch.h"
+
+// The macOS 13 SDK shipped with this Theos setup omits libproc.h, while the
+// libSystem symbol is present on the target. Keep the public ABI declaration
+// local instead of importing a private SDK header.
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+#define MACWS_PROC_PIDPATH_MAX 4096
 
 #define SOCK_PATH "/tmp/autosignd.sock"   // as seen from inside the chroot
 
@@ -143,14 +150,60 @@ typedef struct {
     char *insert_entry;
 } selected_env_t;
 
+static bool terminal_direct_bash_child(
+    const char *path, char *const envp[]) {
+    if (!path || (strcmp(path, "/bin/bash") != 0 &&
+                  strcmp(path, "/bin/sh") != 0)) {
+        return false;
+    }
+    // TERM_PROGRAM is inherited by commands run inside a terminal. Pair it
+    // with the actual parent executable so a user's later `bash` command is
+    // never rewritten.
+    static const char terminal_suffix[] =
+        "/Terminal.app/Contents/MacOS/Terminal";
+    // The hook executes in Terminal's forkpty child immediately before exec.
+    // Runtime `ps` proves that child's PPID is the live Terminal PID, while a
+    // later user-launched bash has a shell PPID. Resolve that kernel process
+    // relationship directly instead of consulting SETEXEC-stale libc/dyld
+    // identity caches in the fork child.
+    char parent_path[MACWS_PROC_PIDPATH_MAX];
+    int parent_path_len = proc_pidpath(
+        getppid(), parent_path, sizeof(parent_path));
+    if (parent_path_len <= 0) return false;
+    parent_path[sizeof(parent_path) - 1] = '\0';
+    size_t parent_len = strlen(parent_path);
+    size_t suffix_len = sizeof(terminal_suffix) - 1;
+    if (parent_len < suffix_len ||
+        strcmp(parent_path + parent_len - suffix_len, terminal_suffix) != 0) {
+        return false;
+    }
+
+    extern char **environ;
+    char *const *source = envp ? envp : environ;
+    for (size_t i = 0; source && source[i]; i++) {
+        if (strcmp(source[i], "TERM_PROGRAM=Apple_Terminal") == 0)
+            return true;
+    }
+    return false;
+}
+
 static selected_env_t env_select_insert(char *const envp[], const char *path) {
     extern char **environ;
     char *const *source = envp ? envp : environ;
     size_t count = 0;
     while (source && source[count]) count++;
 
+    // Runtime-confirmed on iPadOS 16.3 with Terminal 447: Terminal's direct
+    // /bin/bash children receive TERM_PROGRAM=Apple_Terminal but no HOME,
+    // USER, SHELL, or useful chroot PATH. With HOME absent, bash cannot select
+    // either /Users/root/.bashrc or the root account's login profile. Repair
+    // that launch contract here, at the parent/child exec boundary, rather
+    // than changing bash itself or relying on a particular Terminal profile.
+    bool terminal_bash = terminal_direct_bash_child(path, envp);
+
     selected_env_t selected = {0};
-    selected.items = calloc(count + 2, sizeof(char *));
+    // insert dylib + four Terminal shell entries + trailing NULL.
+    selected.items = calloc(count + (terminal_bash ? 6 : 2), sizeof(char *));
     const char *insert = insert_for_target(path, NULL);
     if (!selected.items || asprintf(&selected.insert_entry,
             "DYLD_INSERT_LIBRARIES=%s", insert) < 0) {
@@ -164,8 +217,24 @@ static selected_env_t env_select_insert(char *const envp[], const char *path) {
     static const char prefix[] = "DYLD_INSERT_LIBRARIES=";
     size_t out = 0;
     for (size_t i = 0; i < count; i++) {
-        if (strncmp(source[i], prefix, sizeof(prefix) - 1) != 0)
-            selected.items[out++] = source[i];
+        if (strncmp(source[i], prefix, sizeof(prefix) - 1) == 0)
+            continue;
+        if (terminal_bash &&
+            (strncmp(source[i], "HOME=", 5) == 0 ||
+             strncmp(source[i], "USER=", 5) == 0 ||
+             strncmp(source[i], "SHELL=", 6) == 0 ||
+             strncmp(source[i], "PATH=", 5) == 0)) {
+            continue;
+        }
+        selected.items[out++] = source[i];
+    }
+    if (terminal_bash) {
+        selected.items[out++] = "HOME=/Users/root";
+        selected.items[out++] = "USER=root";
+        selected.items[out++] = "SHELL=/bin/bash";
+        selected.items[out++] =
+            "PATH=/usr/local/bin:/opt/local/bin:/opt/local/sbin:"
+            "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin";
     }
     selected.items[out++] = selected.insert_entry;
     selected.items[out] = NULL;
@@ -348,7 +417,21 @@ static int my_posix_spawn(pid_t *pid, const char *path,
                           char *const argv[], char *const envp[]) {
     ensure_signed(path);
     selected_env_t selected = env_select_insert(envp, path);
-    int result = posix_spawn(pid, path, fa, attr, argv,
+    char *terminal_argv[] = {
+        argv && argv[0] ? argv[0] : (char *)"/bin/bash",
+        (char *)"-c",
+        (char *)". /Users/root/.bashrc; exec /bin/bash -i",
+        NULL
+    };
+    // Terminal 447's direct shell is runtime-confirmed as argv={/bin/bash}
+    // with no HOME and with bash startup-file processing inactive. Execute
+    // the requested file explicitly in a short-lived parent shell, then exec
+    // the real interactive shell in-place. Exported environment from .bashrc
+    // survives the exec; later user-launched bash processes are untouched.
+    char *const *selected_argv = argv;
+    if (terminal_direct_bash_child(path, envp) && argv && !argv[1])
+        selected_argv = terminal_argv;
+    int result = posix_spawn(pid, path, fa, attr, selected_argv,
         selected.items ? selected.items : envp);
     env_selected_free(&selected);
     return result;
@@ -374,7 +457,19 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
         vscode_shell_env_print(envp, token);
     ensure_signed(path);
     selected_env_t selected = env_select_insert(envp, path);
-    int result = execve(path, argv, selected.items ? selected.items : envp);
+    char *terminal_argv[] = {
+        argv && argv[0] ? argv[0] : (char *)"/bin/bash",
+        (char *)"-c",
+        (char *)". /Users/root/.bashrc; exec /bin/bash -i",
+        NULL
+    };
+    char *const *selected_argv = argv;
+    // Terminal uses forkpty + execve (not posix_spawn) for its live shell on
+    // this build; the posix_spawn branch above remains for other profiles.
+    if (terminal_direct_bash_child(path, envp) && argv && !argv[1])
+        selected_argv = terminal_argv;
+    int result = execve(path, selected_argv,
+                        selected.items ? selected.items : envp);
     env_selected_free(&selected);
     return result;
 }

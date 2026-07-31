@@ -404,6 +404,43 @@ fi
 
 ROOTFS=/var/mnt/rootfs
 
+# Runtime `ps eww` on a fresh Terminal session shows that Terminal launches
+# `/bin/bash` without `--login` and strips HOME/USER/SHELL from the child
+# environment. This bash build did not consume a user startup file even when
+# tested with explicit `--rcfile`; exec_hooks therefore sources the requested
+# /Users/root/.bashrc in Terminal's direct shell prelude. Install loaders in
+# root's ordinary non-login/login files as a fallback for sessions that do use
+# standard bash startup processing after a reboot or a preference change.
+TERMINAL_LOGIN_HOME="$ROOTFS/var/root"
+TERMINAL_BASHRC_MARKER='# MacWS: load the interactive bash configuration'
+mkdir -p "$TERMINAL_LOGIN_HOME"
+# 0.3.4 briefly used BASH_ENV for this handoff. The production exec adapter
+# now uses a Terminal-parent-scoped explicit prelude, so non-interactive child
+# scripts remain untouched; remove only that exact obsolete managed file.
+rm -f "$TERMINAL_LOGIN_HOME/.macws-terminal-env"
+
+for TERMINAL_STARTUP_FILE in \
+	"$TERMINAL_LOGIN_HOME/.bashrc" \
+	"$TERMINAL_LOGIN_HOME/.bash_profile"
+do
+	if grep -Fq "$TERMINAL_BASHRC_MARKER" "$TERMINAL_STARTUP_FILE" 2>/dev/null; then
+		continue
+	fi
+	if grep -Eq '(^|[[:space:]])(\.|source)[[:space:]]+/Users/root/\.bashrc' \
+			"$TERMINAL_STARTUP_FILE" 2>/dev/null; then
+		# Respect an existing user-owned integration. Appending our managed
+		# block would source .bashrc twice and repeat aliases/PATH edits.
+		continue
+	fi
+	{
+		printf '\n%s\n' "$TERMINAL_BASHRC_MARKER"
+		printf 'if [ -f /Users/root/.bashrc ]; then\n'
+		printf '    . /Users/root/.bashrc\n'
+		printf 'fi\n'
+	} >> "$TERMINAL_STARTUP_FILE"
+done
+echo '[INFO] Terminal shells now source /Users/root/.bashrc'
+
 # Core shell / execution helpers
 sign_and_trustcache "$ROOTFS/bin/sh"
 sign_and_trustcache "$ROOTFS/bin/chmod"

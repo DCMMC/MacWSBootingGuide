@@ -25,6 +25,7 @@ static char MacWSMenuClientQueueKey;
 @property(nonatomic, readwrite) int32_t ownerPID;
 @property(nonatomic, readwrite) uint32_t windowID;
 @property(nonatomic, readwrite) uint64_t generation;
+@property(nonatomic, readwrite) MacWSMenuAppearance appearance;
 @property(nonatomic, readwrite) NSArray<MacWSMenuItem *> *items;
 @property(nonatomic) NSDictionary<NSNumber *, MacWSMenuItem *> *itemsByID;
 @property(nonatomic) NSDictionary<NSNumber *, NSArray<MacWSMenuItem *> *> *childrenByID;
@@ -241,6 +242,7 @@ typedef void (^MacWSMenuRawCompletion)(NSData * _Nullable,
     snapshot.ownerPID = header->ownerPID;
     snapshot.windowID = header->windowID;
     snapshot.generation = header->generation;
+    snapshot.appearance = header->appearance;
     snapshot.items = items;
     snapshot.itemsByID = byID;
     snapshot.childrenByID = children;

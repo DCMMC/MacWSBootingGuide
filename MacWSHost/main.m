@@ -573,6 +573,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     uint32_t _inputSampleSequence;
     CGSize _lastRequestedWindowSize;
     CGFloat _lastRequestedDensityScale;
+    uint64_t _windowConfigurationSettlementSerial;
 }
 
 - (instancetype)initWithFrame:(CGRect)frameRect {
@@ -768,6 +769,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
+    _windowConfigurationSettlementSerial++;
+    _lastRequestedWindowSize = CGSizeZero;
     self.targetWindowID = mode == MacWSStreamModeWindow ? windowID : 0;
     // A window Scene must only display the IOSurface exported for that window.
     // The mmap framebuffer is a full-desktop compatibility path and would show
@@ -907,8 +910,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)scheduleWindowConfiguration {
     if (self.targetWindowID == 0 || self.targetPID <= 1 ||
-        !self.targetWindowResizable || _windowTooSmall ||
-        self.bounds.size.width < 64 || self.bounds.size.height < 64) return;
+        _windowTooSmall || self.bounds.size.width < 64 ||
+        self.bounds.size.height < 64) return;
     CGFloat density = MacWSDensityScale(self.displayDensity);
     CGSize requested = {
         self.bounds.size.width / density,
@@ -927,7 +930,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                    dispatch_get_main_queue(), ^{
         self->_windowConfigurationDispatchPending = NO;
         if (self->_windowTooSmall || self.targetPID <= 1 ||
-            self.targetWindowID == 0 || !self.targetWindowResizable) return;
+            self.targetWindowID == 0) return;
         CGSize requested = self->_pendingRequestedWindowSize;
         CGFloat density = self->_pendingRequestedDensityScale;
         if (fabs(requested.width - self->_lastRequestedWindowSize.width) < 1.0 &&
@@ -948,9 +951,44 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             .frameHeight = (uint32_t)ceil(requested.height) + 1,
             .targetPID = self.targetPID,
             .source = MacWSInputSourceUnknown,
+            .flags = MacWSInputFlagConfigureAnchorTopRight,
             .sampleSequence = ++self->_inputSampleSequence,
         };
         [self.statusDelegate metalView:self emittedInput:record];
+        // Electron restores its persisted NSWindow frame after the first
+        // DisplayStream/Scene transaction. A single datagram can therefore be
+        // accepted and then legitimately superseded. Re-assert the same native
+        // frame invariant at three bounded settlement points. A new Scene size,
+        // density, target, or suspension changes the serial and cancels these
+        // retries; this is not a periodic poll and does not touch WindowServer.
+        uint64_t settlementSerial = ++self->_windowConfigurationSettlementSerial;
+        const int64_t retryNanoseconds[] = {
+            350 * NSEC_PER_MSEC,
+            1200 * NSEC_PER_MSEC,
+            3000 * NSEC_PER_MSEC,
+        };
+        for (NSUInteger index = 0;
+             index < sizeof(retryNanoseconds) / sizeof(retryNanoseconds[0]);
+             index++) {
+            int64_t delay = retryNanoseconds[index];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay),
+                           dispatch_get_main_queue(), ^{
+                if (self->_windowConfigurationSettlementSerial !=
+                        settlementSerial ||
+                    self->_windowTooSmall || self.targetPID <= 1 ||
+                    self.targetWindowID == 0 ||
+                    fabs(self->_pendingRequestedWindowSize.width -
+                         requested.width) >= 1.0 ||
+                    fabs(self->_pendingRequestedWindowSize.height -
+                         requested.height) >= 1.0 ||
+                    fabs(self->_pendingRequestedDensityScale - density) >=
+                         0.001) return;
+                MacWSInputRecord retry = record;
+                retry.timestamp = CACurrentMediaTime();
+                retry.sampleSequence = ++self->_inputSampleSequence;
+                [self.statusDelegate metalView:self emittedInput:retry];
+            });
+        }
     });
 }
 
@@ -2596,6 +2634,165 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
     return sent;
 }
 
+typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
+
+// UIAlertController action sheets have a fixed iOS row metric and do not
+// relayout reliably when actions are appended after presentation. A macOS menu
+// snapshot is already a complete immutable tree, so render one compact table
+// only after that tree arrives. This keeps every row present on the first
+// frame and gives the semantic menu macOS-like density without private UIKit
+// APIs.
+@interface MacWSCompactMenuController : UIViewController
+    <UITableViewDataSource, UITableViewDelegate>
+- (instancetype)initWithItems:(NSArray<MacWSMenuItem *> *)items
+                    appearance:(MacWSMenuAppearance)appearance
+                     selection:(MacWSCompactMenuSelection)selection;
+@end
+
+@implementation MacWSCompactMenuController {
+    NSArray<MacWSMenuItem *> *_items;
+    MacWSCompactMenuSelection _selection;
+    UITableView *_tableView;
+}
+
+- (instancetype)initWithItems:(NSArray<MacWSMenuItem *> *)items
+                    appearance:(MacWSMenuAppearance)appearance
+                     selection:(MacWSCompactMenuSelection)selection {
+    self = [super initWithNibName:nil bundle:nil];
+    if (!self) return nil;
+    _items = [items copy];
+    _selection = [selection copy];
+    self.modalPresentationStyle = UIModalPresentationPopover;
+    if (appearance == MacWSMenuAppearanceDark)
+        self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    else if (appearance == MacWSMenuAppearanceLight)
+        self.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+
+    CGFloat width = 168.0;
+    CGFloat height = 2.0;
+    NSDictionary *titleAttributes = @{
+        NSFontAttributeName: [UIFont systemFontOfSize:13.0]
+    };
+    NSDictionary *shortcutAttributes = @{
+        NSFontAttributeName: [UIFont systemFontOfSize:11.0]
+    };
+    for (MacWSMenuItem *item in _items) {
+        if (item.flags & MacWSMenuNodeHidden) continue;
+        if (item.flags & MacWSMenuNodeSeparator) {
+            height += 8.0;
+            continue;
+        }
+        CGFloat titleWidth = [item.title sizeWithAttributes:titleAttributes].width;
+        CGFloat shortcutWidth = [item.shortcut
+            sizeWithAttributes:shortcutAttributes].width;
+        width = MAX(width, titleWidth + shortcutWidth +
+            ((item.flags & MacWSMenuNodeHasSubmenu) ? 60.0 : 48.0));
+        height += 29.0;
+    }
+    self.preferredContentSize = CGSizeMake(MIN(320.0, ceil(width)),
+                                            MIN(380.0, ceil(height)));
+    return self;
+}
+
+- (void)loadView {
+    _tableView = [[UITableView alloc] initWithFrame:CGRectZero
+                                               style:UITableViewStylePlain];
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.backgroundColor = UIColor.clearColor;
+    _tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
+    _tableView.contentInset = UIEdgeInsetsMake(1, 0, 1, 0);
+    _tableView.scrollEnabled = self.preferredContentSize.height >= 380.0;
+    _tableView.showsVerticalScrollIndicator = _tableView.scrollEnabled;
+    self.view = _tableView;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView
+  numberOfRowsInSection:(NSInteger)section {
+    (void)tableView;
+    (void)section;
+    return (NSInteger)_items.count;
+}
+
+- (CGFloat)tableView:(UITableView *)tableView
+  heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    (void)tableView;
+    MacWSMenuItem *item = _items[(NSUInteger)indexPath.row];
+    return (item.flags & MacWSMenuNodeSeparator) ? 8.0 : 29.0;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView
+         cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    MacWSMenuItem *item = _items[(NSUInteger)indexPath.row];
+    if (item.flags & MacWSMenuNodeSeparator) {
+        UITableViewCell *cell = [tableView
+            dequeueReusableCellWithIdentifier:@"MacWSMenuSeparator"];
+        if (!cell) {
+            cell = [[UITableViewCell alloc]
+                initWithStyle:UITableViewCellStyleDefault
+              reuseIdentifier:@"MacWSMenuSeparator"];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            cell.backgroundColor = UIColor.clearColor;
+            UIView *line = [UIView new];
+            line.tag = 91;
+            line.translatesAutoresizingMaskIntoConstraints = NO;
+            line.backgroundColor = UIColor.separatorColor;
+            [cell.contentView addSubview:line];
+            [NSLayoutConstraint activateConstraints:@[
+                [line.leadingAnchor constraintEqualToAnchor:
+                    cell.contentView.leadingAnchor constant:8],
+                [line.trailingAnchor constraintEqualToAnchor:
+                    cell.contentView.trailingAnchor constant:-8],
+                [line.centerYAnchor constraintEqualToAnchor:
+                    cell.contentView.centerYAnchor],
+                [line.heightAnchor constraintEqualToConstant:0.5],
+            ]];
+        }
+        return cell;
+    }
+
+    UITableViewCell *cell = [tableView
+        dequeueReusableCellWithIdentifier:@"MacWSMenuItem"];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
+                                       reuseIdentifier:@"MacWSMenuItem"];
+        cell.backgroundColor = UIColor.clearColor;
+        cell.textLabel.font = [UIFont systemFontOfSize:13.0];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:11.0];
+        UIView *selection = [UIView new];
+        selection.backgroundColor = UIColor.systemBlueColor;
+        cell.selectedBackgroundView = selection;
+    }
+    NSString *prefix = @"";
+    if (item.flags & MacWSMenuNodeChecked) prefix = @"✓  ";
+    else if (item.flags & MacWSMenuNodeMixed) prefix = @"—  ";
+    cell.textLabel.text = [prefix stringByAppendingString:item.title ?: @""];
+    NSString *suffix = item.shortcut ?: @"";
+    if (item.flags & MacWSMenuNodeHasSubmenu)
+        suffix = suffix.length ? [suffix stringByAppendingString:@"   ›"] : @"›";
+    cell.detailTextLabel.text = suffix;
+    BOOL enabled = (item.flags & MacWSMenuNodeEnabled) != 0;
+    cell.textLabel.enabled = enabled;
+    cell.detailTextLabel.enabled = enabled;
+    cell.selectionStyle = enabled ? UITableViewCellSelectionStyleDefault
+                                  : UITableViewCellSelectionStyleNone;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView
+ didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:NO];
+    MacWSMenuItem *item = _items[(NSUInteger)indexPath.row];
+    if ((item.flags & (MacWSMenuNodeHidden | MacWSMenuNodeSeparator)) ||
+        (item.flags & MacWSMenuNodeEnabled) == 0) return;
+    MacWSCompactMenuSelection selection = _selection;
+    [self dismissViewControllerAnimated:NO completion:^{
+        if (selection) selection(item);
+    }];
+}
+
+@end
+
 @implementation MacWSViewController {
     NSString *_sceneIdentifier;
     MacWSStreamMode _streamMode;
@@ -2611,7 +2808,7 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
     UIVisualEffectView *_semanticMenuBar;
     UIScrollView *_semanticMenuScroll;
     UIStackView *_semanticMenuTitles;
-    UIAlertController *_semanticMenuPanel;
+    UIViewController *_semanticMenuPanel;
     UIVisualEffectView *_controlPanel;
     UIControl *_controlDismissLayer;
     UIButton *_showControlsButton;
@@ -2914,6 +3111,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
 }
 
+- (void)applyMacOSMenuAppearance:(MacWSMenuAppearance)appearance {
+    UIUserInterfaceStyle style = UIUserInterfaceStyleUnspecified;
+    if (appearance == MacWSMenuAppearanceDark)
+        style = UIUserInterfaceStyleDark;
+    else if (appearance == MacWSMenuAppearanceLight)
+        style = UIUserInterfaceStyleLight;
+    _semanticMenuBar.overrideUserInterfaceStyle = style;
+    [_semanticMenuBar setNeedsLayout];
+}
+
 - (void)refreshSemanticMenuWithCompletion:(void (^ _Nullable)(
         MacWSMenuSnapshot * _Nullable, NSError * _Nullable))completion {
     if (_windowID == 0 || _windowOwnerPID <= 1) {
@@ -2927,53 +3134,48 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             if (snapshot && snapshot.windowID == self->_windowID &&
                 snapshot.ownerPID == self->_windowOwnerPID) {
                 self->_menuSnapshot = snapshot;
+                [self applyMacOSMenuAppearance:snapshot.appearance];
                 [self renderSemanticMenuTitles];
             }
             if (completion) completion(snapshot, error);
         }];
 }
 
-- (NSString *)semanticMenuTitleForItem:(MacWSMenuItem *)item {
-    NSString *prefix = @"";
-    if (item.flags & MacWSMenuNodeChecked) prefix = @"✓ ";
-    else if (item.flags & MacWSMenuNodeMixed) prefix = @"— ";
-    NSString *suffix = item.shortcut.length
-        ? [@"    " stringByAppendingString:item.shortcut] : @"";
-    if (item.flags & MacWSMenuNodeHasSubmenu)
-        suffix = [suffix stringByAppendingString:@"  ›"];
-    return [NSString stringWithFormat:@"%@%@%@", prefix, item.title, suffix];
-}
-
-- (void)populateSemanticMenuPanel:(UIAlertController *)panel
-                          parentID:(uint64_t)parentID
-                           snapshot:(MacWSMenuSnapshot *)snapshot
-                              source:(UIView *)source {
-    NSArray<MacWSMenuItem *> *children = [snapshot childrenOfItemID:parentID];
-    for (MacWSMenuItem *item in children) {
-        if (item.flags & MacWSMenuNodeHidden) continue;
-        if (item.flags & MacWSMenuNodeSeparator) continue;
-        UIAlertAction *action = [UIAlertAction
-            actionWithTitle:[self semanticMenuTitleForItem:item]
-                      style:UIAlertActionStyleDefault
-                    handler:^(__unused UIAlertAction *selected) {
+- (void)presentSemanticMenuForParent:(uint64_t)parentID
+                             snapshot:(MacWSMenuSnapshot *)snapshot
+                               source:(UIView *)source
+                                title:(NSString *)title {
+    NSMutableArray<MacWSMenuItem *> *items = [NSMutableArray array];
+    for (MacWSMenuItem *item in [snapshot childrenOfItemID:parentID]) {
+        if ((item.flags & MacWSMenuNodeHidden) == 0) [items addObject:item];
+    }
+    if (items.count == 0) {
+        [self setNotice:[NSString stringWithFormat:@"“%@”菜单当前没有可见项目。",
+            title.length ? title : @"macOS"] success:NO];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    MacWSCompactMenuController *panel = [[MacWSCompactMenuController alloc]
+        initWithItems:items appearance:snapshot.appearance
+        selection:^(MacWSMenuItem *item) {
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
             if (item.flags & MacWSMenuNodeRequiresWorkspace) {
                 [self setNotice:@"此菜单项包含 macOS 自定义视图，请在全屏工作区中使用。"
                          success:NO];
                 return;
             }
             if (item.flags & MacWSMenuNodeHasSubmenu) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [self presentSemanticMenuForParent:item.itemID
-                                              snapshot:snapshot source:source
-                                                 title:item.title];
-                });
+                [self presentSemanticMenuForParent:item.itemID
+                                          snapshot:snapshot source:source
+                                             title:item.title];
                 return;
             }
             [self->_menuClient performItem:item inSnapshot:snapshot
                 completion:^(MacWSMenuStatus status, NSError *error) {
                     if (status == MacWSMenuStatusOK) {
                         [self setNotice:[NSString stringWithFormat:
-                            @"已执行“%@”", item.title] success:YES];
+                            @"已发送“%@”", item.title] success:YES];
                     } else {
                         [self setNotice:error.localizedDescription ?: @"菜单项无法执行"
                                  success:NO];
@@ -2981,52 +3183,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                     }
                 }];
         }];
-        action.enabled = (item.flags & MacWSMenuNodeEnabled) != 0;
-        [panel addAction:action];
-    }
-    [panel addAction:[UIAlertAction actionWithTitle:@"取消"
-        style:UIAlertActionStyleCancel handler:nil]];
-}
-
-- (void)presentSemanticMenuForParent:(uint64_t)parentID
-                             snapshot:(MacWSMenuSnapshot *)snapshot
-                               source:(UIView *)source
-                                title:(NSString *)title {
-    UIAlertController *panel = [UIAlertController
-        alertControllerWithTitle:title.length ? title : @"macOS 菜单"
-                         message:nil
-                  preferredStyle:UIAlertControllerStyleActionSheet];
-    [self populateSemanticMenuPanel:panel parentID:parentID
-                           snapshot:snapshot source:source];
-    panel.popoverPresentationController.sourceView = source;
-    panel.popoverPresentationController.sourceRect = source.bounds;
+    UIPopoverPresentationController *popover = panel.popoverPresentationController;
+    popover.sourceView = source;
+    popover.sourceRect = source.bounds;
+    popover.permittedArrowDirections = UIPopoverArrowDirectionUp |
+        UIPopoverArrowDirectionDown;
     _semanticMenuPanel = panel;
     [self presentViewController:panel animated:YES completion:nil];
 }
 
 - (void)semanticMenuTitleTapped:(UIButton *)sender {
     uint32_t siblingIndex = UINT32_MAX;
-    NSString *requestedTitle = nil;
     if (sender.tag >= 0) {
         MacWSMenuItem *old = [_menuSnapshot itemWithID:(uint64_t)sender.tag];
         siblingIndex = old.siblingIndex;
-        requestedTitle = old.title;
     }
-    UIAlertController *loading = [UIAlertController
-        alertControllerWithTitle:requestedTitle ?: @"macOS 菜单"
-                         message:@"正在同步目标窗口菜单…"
-                  preferredStyle:UIAlertControllerStyleActionSheet];
-    loading.popoverPresentationController.sourceView = sender;
-    loading.popoverPresentationController.sourceRect = sender.bounds;
-    _semanticMenuPanel = loading;
-    [self presentViewController:loading animated:YES completion:nil];
+    sender.enabled = NO;
     [self refreshSemanticMenuWithCompletion:^(MacWSMenuSnapshot *snapshot,
                                                NSError *error) {
-        if (self->_semanticMenuPanel != loading) return;
+        sender.enabled = YES;
         if (error || !snapshot) {
-            loading.message = error.localizedDescription ?: @"菜单暂不可用";
-            [loading addAction:[UIAlertAction actionWithTitle:@"关闭"
-                style:UIAlertActionStyleCancel handler:nil]];
+            [self setNotice:error.localizedDescription ?: @"菜单暂不可用"
+                     success:NO];
             return;
         }
         uint64_t parentID = 0;
@@ -3040,10 +3218,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 }
             }
         }
-        loading.title = title;
-        loading.message = nil;
-        [self populateSemanticMenuPanel:loading parentID:parentID
-                               snapshot:snapshot source:sender];
+        [self presentSemanticMenuForParent:parentID snapshot:snapshot
+                                    source:sender title:title];
     }];
 }
 
@@ -3907,9 +4083,45 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
 }
 
+- (NSArray<MacWSStreamWindow *> *)logicalWindowRepresentatives {
+    NSMutableArray<NSString *> *order = [NSMutableArray array];
+    NSMutableDictionary<NSString *, MacWSStreamWindow *> *representatives =
+        [NSMutableDictionary dictionary];
+    for (MacWSStreamWindow *window in _streamWindows) {
+        MacWSStreamWindowDescriptor descriptor = window.descriptor;
+        NSString *identity = MacWSWindowIdentity(descriptor.ownerPID,
+            descriptor.windowID, descriptor.logicalGroupID);
+        if (!identity) continue;
+        MacWSStreamWindow *current = representatives[identity];
+        if (!current) {
+            representatives[identity] = window;
+            [order addObject:identity];
+            continue;
+        }
+        MacWSStreamWindowFlags flags = descriptor.flags;
+        MacWSStreamWindowFlags currentFlags = current.descriptor.flags;
+        NSUInteger score = ((flags & MacWSStreamWindowFocused) ? 4 : 0) |
+            ((flags & MacWSStreamWindowOnScreen) ? 2 : 0) |
+            ((descriptor.windowID == _windowID) ? 1 : 0);
+        NSUInteger currentScore =
+            ((currentFlags & MacWSStreamWindowFocused) ? 4 : 0) |
+            ((currentFlags & MacWSStreamWindowOnScreen) ? 2 : 0) |
+            ((current.descriptor.windowID == _windowID) ? 1 : 0);
+        if (score > currentScore) representatives[identity] = window;
+    }
+    NSMutableArray<MacWSStreamWindow *> *result = [NSMutableArray array];
+    for (NSString *identity in order) {
+        MacWSStreamWindow *window = representatives[identity];
+        if (window) [result addObject:window];
+    }
+    return result;
+}
+
 - (void)openWindowPicker {
     [_metalView requestStreamWindowList];
-    if (_streamWindows.count == 0) {
+    NSArray<MacWSStreamWindow *> *logicalWindows =
+        [self logicalWindowRepresentatives];
+    if (logicalWindows.count == 0) {
         [self setNotice:@"正在读取 macOS 窗口；DisplayStream 服务就绪后请再试一次。"
                  success:YES];
         return;
@@ -3918,9 +4130,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         alertControllerWithTitle:@"在新 iPadOS 窗口中打开"
                          message:@"每个 Scene 只订阅一个 macOS 窗口的 IOSurface 流。"
                   preferredStyle:UIAlertControllerStyleActionSheet];
-    NSUInteger limit = MIN(_streamWindows.count, 24);
+    NSUInteger limit = MIN(logicalWindows.count, 24);
     for (NSUInteger index = 0; index < limit; index++) {
-        MacWSStreamWindow *window = _streamWindows[index];
+        MacWSStreamWindow *window = logicalWindows[index];
         NSString *title = window.title.length ? window.title :
             [NSString stringWithFormat:@"Window %u", window.descriptor.windowID];
         [picker addAction:[UIAlertAction actionWithTitle:title
@@ -4649,10 +4861,35 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             } else if (_windowGroupID != 0 &&
                        window.descriptor.ownerPID == _windowOwnerPID &&
                        window.descriptor.logicalGroupID == _windowGroupID) {
-                groupReplacement = window;
+                MacWSStreamWindowFlags flags = window.descriptor.flags;
+                MacWSStreamWindowFlags oldFlags =
+                    groupReplacement ? groupReplacement.descriptor.flags : 0;
+                NSUInteger score =
+                    ((flags & MacWSStreamWindowFocused) ? 2 : 0) |
+                    ((flags & MacWSStreamWindowOnScreen) ? 1 : 0);
+                NSUInteger oldScore =
+                    ((oldFlags & MacWSStreamWindowFocused) ? 2 : 0) |
+                    ((oldFlags & MacWSStreamWindowOnScreen) ? 1 : 0);
+                if (!groupReplacement || score > oldScore)
+                    groupReplacement = window;
             }
         }
-        MacWSStreamWindow *resolvedWindow = exactWindow ?: groupReplacement;
+        // CGWindowListOptionAll intentionally retains Terminal's inactive tab
+        // members. Selecting a tab can therefore leave the old exact ID in the
+        // catalog even though a focused/on-screen member of the same native
+        // NSWindowTabGroup is now the only visible representation. Resolve the
+        // logical group by real screen state before falling back to exact ID.
+        BOOL exactOnScreen = exactWindow &&
+            (exactWindow.descriptor.flags & MacWSStreamWindowOnScreen) != 0;
+        BOOL replacementFocused = groupReplacement &&
+            (groupReplacement.descriptor.flags & MacWSStreamWindowFocused) != 0;
+        BOOL replacementOnScreen = groupReplacement &&
+            (groupReplacement.descriptor.flags & MacWSStreamWindowOnScreen) != 0;
+        MacWSStreamWindow *resolvedWindow = exactWindow;
+        if (groupReplacement && (replacementFocused ||
+                (!exactOnScreen && replacementOnScreen)))
+            resolvedWindow = groupReplacement;
+        if (!resolvedWindow) resolvedWindow = groupReplacement;
         if (resolvedWindow) {
             uint32_t resolvedID = resolvedWindow.descriptor.windowID;
             _windowOwnerPID = resolvedWindow.descriptor.ownerPID;
@@ -4664,7 +4901,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 (resolvedWindow.descriptor.flags & MacWSStreamWindowResizable) != 0;
             _metalView.minimumLogicalSize = _windowMinimumSize;
             _metalView.targetWindowResizable = _windowResizable;
-            if (!exactWindow && resolvedID != _windowID) {
+            if (resolvedID != _windowID) {
                 uint32_t oldID = _windowID;
                 [_metalView suspendStream];
                 _windowID = resolvedID;
@@ -4681,10 +4918,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             }
         }
     }
+    NSUInteger logicalWindowCount = [self logicalWindowRepresentatives].count;
     [self setButton:_windowPickerButton
-              title:windows.count
+              title:logicalWindowCount
                 ? [NSString stringWithFormat:@"打开 macOS 窗口 · %lu",
-                   (unsigned long)windows.count]
+                   (unsigned long)logicalWindowCount]
                 : @"打开 macOS 窗口"
               image:@"macwindow.on.rectangle"];
 }

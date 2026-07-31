@@ -129,6 +129,16 @@ enum {
     MacWSInputFlagScrollEnded = 1u << 10,
     MacWSInputFlagScrollCancelled = 1u << 11,
     MacWSInputFlagScrollMomentum = 1u << 12,
+    // ConfigureWindow requests from an exact native Host Scene anchor the
+    // represented AppKit window at the upper-left of its real NSScreen. This
+    // makes AppKit constrain popovers against the same screen edge that bounds
+    // the Scene capture instead of an arbitrary restored desktop position.
+    MacWSInputFlagConfigureAnchorTopLeft = 1u << 13,
+    // Keep the captured window's upper-right corner on the real NSScreen edge.
+    // AppKit constrains popup-menu windows to NSScreen, not to their owner's
+    // frame; right anchoring therefore keeps a right-edge popup inside the
+    // exact-window DisplayStream instead of clipping it past the Scene edge.
+    MacWSInputFlagConfigureAnchorTopRight = 1u << 14,
 };
 
 // Versioned wire record for the iOS-host -> macOS event bridge.

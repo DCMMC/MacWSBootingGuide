@@ -18,6 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) int32_t ownerPID;
 @property(nonatomic, readonly) uint32_t windowID;
 @property(nonatomic, readonly) uint64_t generation;
+@property(nonatomic, readonly) MacWSMenuAppearance appearance;
 @property(nonatomic, readonly) NSArray<MacWSMenuItem *> *items;
 - (NSArray<MacWSMenuItem *> *)childrenOfItemID:(uint64_t)itemID;
 - (nullable MacWSMenuItem *)itemWithID:(uint64_t)itemID;
