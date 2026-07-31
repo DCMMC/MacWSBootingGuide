@@ -25,6 +25,7 @@
 
 #include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
+#include "macws_stream_protocol.h"
 
 extern char **environ;
 
@@ -49,6 +50,12 @@ static const char *const kWindowServerLabel =
     "UIKitApplication:com.macwsguide.windowserver";
 static const char *const kInputLabel =
     "UIKitApplication:com.macwsguide.input";
+static const char *const kDisplayLabel =
+    "UIKitApplication:com.macwsguide.display";
+static const char *const kVSCodeLabel =
+    "UIKitApplication:com.macwsguide.vscode";
+static const char *const kVSCodePlist =
+    "/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist";
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
@@ -358,6 +365,9 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_bool(reply, "terminal_available", access("/var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "activity_monitor_available", access("/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "finder_available", access("/var/mnt/rootfs/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", X_OK) == 0);
+    xpc_dictionary_set_bool(reply, "vscode_available",
+        access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron", X_OK) == 0 &&
+        access(kVSCodePlist, R_OK) == 0);
 }
 
 static NSString *TailFile(const char *path, NSUInteger limit) {
@@ -391,6 +401,8 @@ static BOOL WaitForGUIComponents(NSTimeInterval timeout, int *wsPIDOut) {
     while (deadline.timeIntervalSinceNow > 0) {
         int pid = 0;
         if (JobHasPID(kWindowServerLabel, &pid) &&
+            JobHasPID(kInputLabel, NULL) &&
+            JobHasPID(kDisplayLabel, NULL) &&
             IsSocket(kInputSocket)) {
             if (wsPIDOut) *wsPIDOut = pid;
             return YES;
@@ -450,13 +462,6 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
         RemovePath(kExperimentalCompletion);
     }
 
-    uint64_t captureGeneration = ArmCapture();
-    if (captureGeneration == 0) {
-        *message = [NSString stringWithFormat:@"无法请求首帧捕获: %s",
-                    strerror(errno)];
-        return NO;
-    }
-
     RotateWindowServerLog();
     SetState(YES, @"检查并修复启动环境…", @"");
     const char *startArgv[] = {kBash, kGUI, "start", "coexist",
@@ -466,57 +471,27 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
         *message = [NSString stringWithFormat:@"GUI 启动脚本失败（退出码 %d）", rc];
         return NO;
     }
-    SetState(YES, @"启动 WindowServer…", @"");
-    const char *wsArgv[] = {kLaunchctl, "start", kWindowServerLabel, NULL};
-    rc = RunCommand(wsArgv, YES);
-    if (rc != 0) {
-        *message = [NSString stringWithFormat:@"WindowServer 启动请求失败（退出码 %d）", rc];
-        return NO;
-    }
-    // WindowServer still has a runtime-confirmed, intermittent Foundation
-    // SystemStatus XPC SIGBUS during startup. Do not pretend that crash is a
-    // healthy session: preserve its crash report/log, then retry the whole
-    // process at most twice. A live process that simply fails to publish a
-    // frame is not retried; it is stopped after the bounded 60-second wait.
-    for (unsigned attempt = 1; attempt <= 3; attempt++) {
-        if (attempt > 1) {
-            SetState(YES, [NSString stringWithFormat:
-                @"WindowServer 启动重试 %u/3…", attempt], @"");
-            const char *killArgv[] = {kKillall, "-9", "WindowServer", NULL};
-            (void)RunCommand(killArgv, YES);
-            RemovePath(kFrame);
-            RemovePath(kCaptureFlag);
-            RemovePath(kCaptureAck);
-            captureGeneration = ArmCapture();
-            if (captureGeneration == 0) break;
-            usleep(500000);
-            if (RunCommand(wsArgv, YES) != 0) continue;
-        }
-
-        SetState(YES, @"等待 WindowServer 与触控桥…", @"");
-        int wsPID = 0;
-        if (!WaitForGUIComponents(15.0, &wsPID)) {
-            HostLog(@"startup attempt %u/3 failed before GUI components", attempt);
-            continue;
-        }
-        SetState(YES, @"等待首个可显示帧…", @"");
-        BOOL processExited = NO;
-        if (WaitForCapture(wsPID, captureGeneration, 60.0,
-                           &processExited)) {
-            *message = attempt == 1
-                ? @"macOS GUI、触控桥与首帧均已就绪"
-                : [NSString stringWithFormat:
-                    @"macOS GUI 已在第 %u 次尝试完成首帧", attempt];
-            return YES;
-        }
-        HostLog(@"startup attempt %u/3 frame failed pid=%d exited=%@",
-                attempt, wsPID, processExited ? @"YES" : @"NO");
-        if (!processExited) break;
+    // The script has already loaded and validated WindowServer, inputd and
+    // displayd.  In the native window architecture there is intentionally no
+    // AppKit window yet (`--no-terminal --no-vnc`), so requiring a framebuffer
+    // acknowledgement here creates a circular dependency: the user cannot
+    // launch an app until a frame exists, while no frame can exist until an
+    // app is launched.  Runtime-confirmed on 2026-07-31: all three services
+    // remained healthy for a minute with a zero-window DisplayStream, then the
+    // old 60-second capture deadline tore them down.  Establish workspace
+    // readiness from the actual service endpoints; LaunchAllowedApp separately
+    // requires that process's real NSWindow metrics before reporting success.
+    SetState(YES, @"等待 WindowServer、触控与窗口流…", @"");
+    int wsPID = 0;
+    if (WaitForGUIComponents(15.0, &wsPID)) {
+        *message = @"macOS 工作区、触控桥与窗口流已就绪";
+        return YES;
     }
 
+    HostLog(@"workspace endpoints unavailable after launcher success");
     NSString *stopMessage = nil;
     (void)StopGUI(&stopMessage);
-    *message = @"WindowServer 未能确认首帧，已在有界重试后自动停止以避免空转";
+    *message = @"macOS 工作区服务未能完成就绪，已安全停止";
     return NO;
 }
 
@@ -559,7 +534,217 @@ static const AllowedApp kAllowedApps[] = {
     {"finder", "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", "/var/mobile/Library/Logs/Finder.host.log"},
 };
 
+// A native Host launch is complete when AppInputBridge has published at least
+// one real NSWindow descriptor. This replaces the VNC framebuffer
+// acknowledgement, which is intentionally absent under `start --no-vnc`.
+static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
+                                 int *exitStatusOut) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path),
+             "/var/mnt/rootfs/private/tmp/macws_window_metrics.%d.bin", pid);
+    // AppInputBridge removes this PID-scoped sidecar in the target process's
+    // constructor before it starts publishing.  Removing it here races a
+    // process that is already running (notably a reused VS Code launch): its
+    // unchanged-window fast path would then have no reason to recreate the
+    // file, turning a healthy window into a 30-second false timeout.
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (deadline.timeIntervalSinceNow > 0) {
+        int status = 0;
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) {
+            if (exitStatusOut) *exitStatusOut = status;
+            return NO;
+        }
+
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            struct stat st = {0};
+            MacWSWindowMetricsHeader header = {0};
+            ssize_t count = read(fd, &header, sizeof(header));
+            BOOL ready = fstat(fd, &st) == 0 &&
+                count == (ssize_t)sizeof(header) &&
+                st.st_size >= (off_t)sizeof(header) &&
+                MacWSWindowMetricsAreValid(&header, (size_t)st.st_size) &&
+                header.entryCount > 0;
+            close(fd);
+            if (ready) return YES;
+        }
+        usleep(100000);
+    }
+    return NO;
+}
+
+static BOOL LaunchVSCode(NSString **message) {
+    if (access(kVSCodePlist, R_OK) != 0 ||
+        access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+               X_OK) != 0) {
+        *message = @"VS Code 或生产启动配置不存在";
+        return NO;
+    }
+    int pid = 0;
+    if (!JobHasPID(kVSCodeLabel, &pid)) {
+        const char *loadArgv[] = {kLaunchctl, "load", kVSCodePlist, NULL};
+        int rc = RunCommand(loadArgv, YES);
+        if (rc != 0) {
+            // A loaded but dormant one-shot job rejects a second load. Ask
+            // launchd to start that exact production job; never fall back to
+            // a bare Electron spawn that would lose the validated JIT/AGX
+            // environment and isolated profile.
+            const char *startArgv[] = {kLaunchctl, "start", kVSCodeLabel, NULL};
+            (void)RunCommand(startArgv, YES);
+        }
+        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
+        while (deadline.timeIntervalSinceNow > 0 &&
+               !JobHasPID(kVSCodeLabel, &pid)) {
+            usleep(100000);
+        }
+    }
+    if (pid <= 1) {
+        *message = @"VS Code 生产任务未取得进程";
+        return NO;
+    }
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = pid;
+    gActiveAppID = @"vscode";
+    os_unfair_lock_unlock(&gStateLock);
+    int exitStatus = -1;
+    if (!WaitForWindowMetrics(pid, 30.0, &exitStatus)) {
+        *message = @"VS Code 正在运行，但 30 秒内没有发布 AppKit 窗口";
+        return NO;
+    }
+    HostLog(@"launch-app window-ready id=vscode pid=%d path=DisplayStream", pid);
+    *message = @"VS Code 已通过生产 AGX/JIT 配置启动，窗口已进入列表";
+    return YES;
+}
+
+static BOOL LaunchRootExecutable(const char *identifier,
+                                 NSString *rootPath,
+                                 const char *logPath,
+                                 NSTimeInterval timeout,
+                                 NSString **message) {
+    NSString *hostPath = [@("/var/mnt/rootfs") stringByAppendingString:rootPath];
+    if (access(hostPath.fileSystemRepresentation, X_OK) != 0) {
+        *message = [NSString stringWithFormat:@"应用不存在或不可执行: %@",
+                    rootPath];
+        return NO;
+    }
+    if (!JobHasPID(kWindowServerLabel, NULL)) {
+        *message = @"请先启动 macOS GUI";
+        return NO;
+    }
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    int logFD = open(logPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (logFD >= 0) {
+        posix_spawn_file_actions_adddup2(&actions, logFD, STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&actions, logFD, STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&actions, logFD);
+    }
+    const char *rootExecutable = rootPath.fileSystemRepresentation;
+    const char *argv[] = {kChrootExec, "0", "0", kRootFS,
+                          rootExecutable, NULL};
+    pid_t pid = 0;
+    int error = posix_spawn(&pid, kChrootExec, &actions, NULL,
+                            (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (logFD >= 0) close(logFD);
+    if (error != 0) {
+        *message = [NSString stringWithFormat:@"拉起应用失败: %s", strerror(error)];
+        return NO;
+    }
+    HostLog(@"launch-app id=%s pid=%d executable=%@", identifier, pid,
+            rootPath);
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = pid;
+    gActiveAppID = [@(identifier) copy];
+    os_unfair_lock_unlock(&gStateLock);
+    if (JobHasPID(kDisplayLabel, NULL)) {
+        int exitStatus = -1;
+        if (!WaitForWindowMetrics(pid, timeout, &exitStatus)) {
+            os_unfair_lock_lock(&gStateLock);
+            if (gActiveAppPID == pid) {
+                gActiveAppPID = 0;
+                gActiveAppID = @"";
+            }
+            os_unfair_lock_unlock(&gStateLock);
+            if (exitStatus >= 0 && WIFEXITED(exitStatus)) {
+                *message = [NSString stringWithFormat:
+                    @"%s 在发布 AppKit 窗口前退出（状态 %d）",
+                    identifier, WEXITSTATUS(exitStatus)];
+            } else if (exitStatus >= 0 && WIFSIGNALED(exitStatus)) {
+                *message = [NSString stringWithFormat:
+                    @"%s 在发布 AppKit 窗口前被信号 %d 终止",
+                    identifier, WTERMSIG(exitStatus)];
+            } else {
+                *message = [NSString stringWithFormat:
+                    @"%s 已启动，但 %.0f 秒内没有发布可捕获的 AppKit 窗口",
+                    identifier, timeout];
+            }
+            return NO;
+        }
+        HostLog(@"launch-app window-ready id=%s pid=%d path=DisplayStream",
+                identifier, pid);
+    } else {
+        *message = @"DisplayStream 服务未运行";
+        return NO;
+    }
+    return YES;
+}
+
+static NSString *ResolveExecutableRootPath(const char *requestedPath,
+                                           NSString **errorOut) {
+    if (!requestedPath || requestedPath[0] != '/' ||
+        strlen(requestedPath) >= PATH_MAX) {
+        if (errorOut) *errorOut = @"请输入 macOS 绝对路径";
+        return nil;
+    }
+    NSString *rootPath = [@(requestedPath) stringByStandardizingPath];
+    NSString *hostPath = [@("/var/mnt/rootfs") stringByAppendingString:rootPath];
+    BOOL directory = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:hostPath
+                                            isDirectory:&directory]) {
+        if (errorOut) *errorOut = @"路径不存在";
+        return nil;
+    }
+    if (directory) {
+        NSString *plistPath = [hostPath stringByAppendingPathComponent:
+            @"Contents/Info.plist"];
+        NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:plistPath];
+        NSString *executable = plist[@"CFBundleExecutable"];
+        if (!executable.length) {
+            if (errorOut) *errorOut = @"该目录不是可启动的 macOS App";
+            return nil;
+        }
+        rootPath = [[rootPath stringByAppendingPathComponent:@"Contents/MacOS"]
+            stringByAppendingPathComponent:executable];
+        hostPath = [@("/var/mnt/rootfs") stringByAppendingString:rootPath];
+    }
+    char resolved[PATH_MAX] = {0};
+    static const char hostRootPrefix[] = "/var/mnt/rootfs/";
+    if (!realpath(hostPath.fileSystemRepresentation, resolved) ||
+        strncmp(resolved, hostRootPrefix, sizeof(hostRootPrefix) - 1) != 0 ||
+        access(resolved, X_OK) != 0) {
+        if (errorOut) *errorOut = @"解析后的文件不可执行";
+        return nil;
+    }
+    return [NSString stringWithUTF8String:resolved + strlen("/var/mnt/rootfs")];
+}
+
+static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
+    NSString *error = nil;
+    NSString *rootPath = ResolveExecutableRootPath(requestedPath, &error);
+    if (!rootPath) {
+        *message = error ?: @"无法解析路径";
+        return NO;
+    }
+    return LaunchRootExecutable("custom-path", rootPath,
+        "/var/mobile/Library/Logs/CustomApp.host.log", 30.0, message);
+}
+
 static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
+    if (identifier && strcmp(identifier, "vscode") == 0)
+        return LaunchVSCode(message);
     const AllowedApp *app = NULL;
     for (NSUInteger i = 0; i < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); i++) {
         if (identifier && strcmp(identifier, kAllowedApps[i].identifier) == 0) {
@@ -571,55 +756,13 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         *message = @"应用标识不在白名单中";
         return NO;
     }
-    NSString *hostPath = [@("/var/mnt/rootfs") stringByAppendingString:@(app->rootPath)];
-    if (access(hostPath.fileSystemRepresentation, X_OK) != 0) {
-        *message = [NSString stringWithFormat:@"应用不存在: %s", app->rootPath];
-        return NO;
-    }
-    if (!JobHasPID(kWindowServerLabel, NULL)) {
-        *message = @"请先启动 macOS GUI";
-        return NO;
-    }
-
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    int logFD = open(app->logPath, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (logFD >= 0) {
-        posix_spawn_file_actions_adddup2(&actions, logFD, STDOUT_FILENO);
-        posix_spawn_file_actions_adddup2(&actions, logFD, STDERR_FILENO);
-        posix_spawn_file_actions_addclose(&actions, logFD);
-    }
-    const char *argv[] = {kChrootExec, "0", "0", kRootFS, app->rootPath, NULL};
-    pid_t pid = 0;
-    int error = posix_spawn(&pid, kChrootExec, &actions, NULL,
-                            (char *const *)argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (logFD >= 0) close(logFD);
-    if (error != 0) {
-        *message = [NSString stringWithFormat:@"拉起应用失败: %s", strerror(error)];
-        return NO;
-    }
-    HostLog(@"launch-app id=%s pid=%d executable=%s", identifier, pid, app->rootPath);
-    os_unfair_lock_lock(&gStateLock);
-    gActiveAppPID = pid;
-    gActiveAppID = [@(identifier) copy];
-    os_unfair_lock_unlock(&gStateLock);
-    // Each launch requests one bounded post-launch snapshot.  The producer
-    // acknowledges the exact generation; a stale desktop frame cannot make
-    // this operation succeed.
-    usleep(3000000);
-    uint64_t generation = ArmCapture();
-    int wsPID = 0;
-    if (generation == 0 || !JobHasPID(kWindowServerLabel, &wsPID) ||
-        !WaitForCapture(wsPID, generation, 60.0, NULL)) {
-        *message = [NSString stringWithFormat:
-            @"%s 已启动，但 WindowServer 未确认更新后的共享帧", identifier];
-        return NO;
-    }
+    if (!LaunchRootExecutable(identifier, @(app->rootPath), app->logPath,
+                              30.0, message)) return NO;
     if (strcmp(identifier, "glassdemo") == 0) {
-        *message = @"GlassDemo 已启动；首次轻触会关闭它的启动诊断菜单，随后可直接操作控件";
+        *message = @"GlassDemo 窗口已就绪；从窗口列表打开后即可直接触控";
     } else {
-        *message = [NSString stringWithFormat:@"已启动 %s 并刷新画面", identifier];
+        *message = [NSString stringWithFormat:
+            @"已启动 %s，AppKit 窗口已进入 DisplayStream 列表", identifier];
     }
     return YES;
 }
@@ -657,6 +800,7 @@ static void ServeRequest(xpc_object_t request) {
 
         NSString *message = @"不支持的操作";
         BOOL ok = NO;
+        pid_t launchedAppPID = 0;
         if (strcmp(op, MACWS_CONTROL_OP_START) == 0) {
             BOOL experimental = xpc_dictionary_get_bool(request, MACWS_CONTROL_KEY_EXPERIMENTAL);
             ok = StartGUI(experimental, &message);
@@ -688,6 +832,16 @@ static void ServeRequest(xpc_object_t request) {
         } else if (strcmp(op, MACWS_CONTROL_OP_LAUNCH_APP) == 0) {
             SetState(YES, @"启动 macOS 应用…", @"");
             ok = LaunchAllowedApp(xpc_dictionary_get_string(request, MACWS_CONTROL_KEY_APP_ID), &message);
+            if (ok) {
+                os_unfair_lock_lock(&gStateLock);
+                launchedAppPID = gActiveAppPID;
+                os_unfair_lock_unlock(&gStateLock);
+            }
+        } else if (strcmp(op, MACWS_CONTROL_OP_LAUNCH_PATH) == 0) {
+            SetState(YES, @"启动 macOS 路径…", @"");
+            ok = LaunchRequestedPath(
+                xpc_dictionary_get_string(request, MACWS_CONTROL_KEY_APP_PATH),
+                &message);
         } else if (strcmp(op, MACWS_CONTROL_OP_CAPTURE) == 0) {
             SetState(YES, @"请求刷新共享帧…", @"");
             int wsPID = 0;
@@ -700,7 +854,12 @@ static void ServeRequest(xpc_object_t request) {
         }
 
         SetState(NO, ok ? @"就绪" : @"操作失败", ok ? @"" : message);
-        ReplyResult(request, ok, message, ^(xpc_object_t reply) { AddStatus(reply); });
+        ReplyResult(request, ok, message, ^(xpc_object_t reply) {
+            AddStatus(reply);
+            if (launchedAppPID > 1)
+                xpc_dictionary_set_int64(reply, "launched_app_pid",
+                                         launchedAppPID);
+        });
     });
 }
 

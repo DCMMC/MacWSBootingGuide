@@ -27,6 +27,11 @@
 
 #define SOCK_PATH "/tmp/autosignd.sock"   // as seen from inside the chroot
 
+static bool exec_diagnostics_enabled(void) {
+    return getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
+           access("/tmp/macws_runtime_diagnostics", F_OK) == 0;
+}
+
 // ── in-process cache of paths already sent to the daemon ────────────────────
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static char **g_cache = NULL;
@@ -123,9 +128,11 @@ static const char *insert_for_target(const char *path, macws_macho_arch_t *out_a
         arch = MACWS_ARCH_ARM64;
 #endif
         insert = macws_insert_dylib_for_arch(arch);
-        fprintf(stderr,
-            "#### exec arch-select: unknown Mach-O subtype for %s; keeping %s slice\n",
-            path ? path : "(null)", macws_arch_name(arch));
+        if (exec_diagnostics_enabled()) {
+            fprintf(stderr,
+                "#### exec arch-select: unknown Mach-O subtype for %s; keeping %s slice\n",
+                path ? path : "(null)", macws_arch_name(arch));
+        }
     }
     if (out_arch) *out_arch = arch;
     return insert;
@@ -304,10 +311,12 @@ __attribute__((noreturn)) static void vscode_shell_env_print(
     char *const envp[], const char token[13]) {
     extern char **environ;
     char *const *source = envp ? envp : environ;
-    fprintf(stderr,
-        "#### VSCODE-SHELL-ENV exec adapter: emitting login-shell JSON "
-        "without Chromium startup\n");
-    fflush(stderr);
+    if (exec_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### VSCODE-SHELL-ENV exec adapter: emitting login-shell JSON "
+            "without Chromium startup\n");
+        fflush(stderr);
+    }
 
     write_all(STDOUT_FILENO, token, 12);
     write_all(STDOUT_FILENO, "{", 1);

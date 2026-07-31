@@ -46,6 +46,9 @@
 @property(nonatomic, readwrite, getter=isConnected) BOOL connected;
 @property(nonatomic, readwrite) MacWSStreamMode mode;
 @property(nonatomic, readwrite) uint32_t windowID;
+@property(nonatomic) MacWSStreamMode subscribedMode;
+@property(nonatomic) uint32_t subscribedWindowID;
+@property(nonatomic) BOOL subscriptionActive;
 @end
 
 @implementation MacWSStreamClient
@@ -101,6 +104,10 @@
 
 - (void)sendSubscription {
     if (![self ensureConnection]) return;
+    uint32_t desiredWindowID = self.mode == MacWSStreamModeWindow
+        ? self.windowID : 0;
+    if (self.subscriptionActive && self.subscribedMode == self.mode &&
+        self.subscribedWindowID == desiredWindowID) return;
     xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_string(request, MACWS_STREAM_KEY_OP,
                               MACWS_STREAM_OP_SUBSCRIBE);
@@ -110,6 +117,9 @@
     xpc_dictionary_set_uint64(request, MACWS_STREAM_KEY_WINDOW_ID,
                               self.windowID);
     xpc_connection_send_message(self.connection, request);
+    self.subscribedMode = self.mode;
+    self.subscribedWindowID = desiredWindowID;
+    self.subscriptionActive = YES;
 }
 
 - (void)subscribeToMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
@@ -138,6 +148,7 @@
 
 - (void)unsubscribe {
     dispatch_async(self.queue, ^{
+        self.subscriptionActive = NO;
         if (!self.connection) return;
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, MACWS_STREAM_KEY_OP,
@@ -167,6 +178,7 @@
     xpc_connection_t connection = self.connection;
     self.connection = nil;
     self.connected = NO;
+    self.subscriptionActive = NO;
     if (connection) xpc_connection_cancel(connection);
 }
 
@@ -175,10 +187,11 @@
         event == XPC_ERROR_CONNECTION_INTERRUPTED) {
         xpc_connection_t connection = self.connection;
         self.connection = nil;
+        self.subscriptionActive = NO;
         if (connection) xpc_connection_cancel(connection);
         [self publishStatus:event == XPC_ERROR_CONNECTION_INTERRUPTED
-            ? @"DisplayStream 连接中断，将使用兼容帧源"
-            : @"DisplayStream 服务离线，将使用兼容帧源"
+            ? @"DisplayStream 连接中断，等待重新连接"
+            : @"DisplayStream 服务离线"
                   connected:NO];
         return;
     }
@@ -202,6 +215,7 @@
         [self handleWindowsEvent:event];
     } else if (strcmp(eventName, MACWS_STREAM_EVENT_STOPPED) == 0 ||
                strcmp(eventName, MACWS_STREAM_EVENT_ERROR) == 0) {
+        self.subscriptionActive = NO;
         const char *message = xpc_dictionary_get_string(
             event, MACWS_STREAM_KEY_MESSAGE);
         NSString *status = message ? [NSString stringWithUTF8String:message]

@@ -5,12 +5,18 @@
 
 #define MACWS_FRAME_MAGIC 0x564e4346u /* "VNCF" */
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
-#define MACWS_INPUT_VERSION 3u
+#define MACWS_INPUT_VERSION 4u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
 #define MACWS_INPUT_WINDOW_SCENE_FLAG UINT64_C(0x0000000080000000)
 #define MACWS_TARGET_PROBE_MAGIC 0x4d575450u /* "MWTP" */
 #define MACWS_TARGET_REPLY_MAGIC 0x4d575452u /* "MWTR" */
 #define MACWS_TARGET_VERSION 1u
+#define MACWS_INPUT_ACK_MAGIC 0x4d574941u /* "MWIA" */
+#define MACWS_INPUT_ACK_VERSION 1u
+#define MACWS_INTERACTION_WAKE_SOCKET_PATH \
+    "/private/tmp/macws_interaction_wake.sock"
+#define MACWS_VNC_ACTIVATION_REPLY_SOCKET_PATH \
+    "/private/tmp/macws_vnc_activation_reply.sock"
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -54,8 +60,7 @@ enum {
     // keysym when these records are emitted.  For key records, pressure is
     // the translated 16-bit CGKeyCode, contactID is the original 32-bit RFB
     // keysym, and sceneID's low 32 bits carry NSEvent/CG modifier flags.  The
-    // record size stays unchanged so native-host pointer ABI v3 remains
-    // compatible.
+    // v4 receivers validate the complete record before using these fields.
     MacWSInputKindKeyDown = 11,
     MacWSInputKindKeyUp = 12,
     // A complete stationary secondary-button gesture. Like Tap, the pair is
@@ -65,8 +70,7 @@ enum {
     MacWSInputKindSecondaryTap = 13,
     // Two-axis precision scrolling. x/y remain the cursor location in frame
     // pixels, pressure carries vertical pixel delta, and contactID carries
-    // the IEEE-754 bits of the horizontal float delta.  This keeps ABI v3's
-    // fixed 52-byte datagram intact for already deployed input endpoints.
+    // the IEEE-754 bits of the horizontal float delta.
     MacWSInputKindScroll = 14,
     // Control-plane request for one captured AppKit window. sceneID carries
     // its exact window number, x/y are the desired frame size in macOS
@@ -74,6 +78,10 @@ enum {
     // AppInputBridge clamps against the real NSWindow minimum before calling
     // the native frame setter; it never bypasses AppKit validation.
     MacWSInputKindConfigureWindow = 15,
+    // A user discarded the iPad window Scene representing one exact AppKit
+    // window. The target process performs the ordinary NSWindow close action;
+    // backgrounding or stream disconnection never emits this control record.
+    MacWSInputKindCloseWindow = 16,
 };
 
 typedef uint16_t MacWSHostInputMode;
@@ -95,6 +103,29 @@ enum {
     MacWSHostDisplayDensityKeyboard = 2,
 };
 
+// Physical source of an input sample. Version 4 keeps this explicit instead
+// of inferring Pencil, finger and indirect-pointer semantics from pressure or
+// contact IDs. Producers that cannot identify the device (for example the
+// legacy VNC bridge) use Unknown and retain ordinary mouse behavior.
+typedef uint16_t MacWSInputSource;
+enum {
+    MacWSInputSourceUnknown = 0,
+    MacWSInputSourceFinger = 1,
+    MacWSInputSourcePencil = 2,
+    MacWSInputSourceIndirectPointer = 3,
+    MacWSInputSourceHardwareKeyboard = 4,
+    MacWSInputSourceSoftwareKeyboard = 5,
+    MacWSInputSourceVNC = 6,
+};
+
+enum {
+    MacWSInputFlagPreciseLocation = 1u << 0,
+    MacWSInputFlagEstimatedLocation = 1u << 1,
+    MacWSInputFlagEstimatedPressure = 1u << 2,
+    MacWSInputFlagExpectingLocationUpdate = 1u << 3,
+    MacWSInputFlagExpectingPressureUpdate = 1u << 4,
+};
+
 // Versioned wire record for the iOS-host -> macOS event bridge.
 // Coordinates are physical pixels in the producer's MacWSFrameHeader space.
 typedef struct __attribute__((packed)) {
@@ -110,6 +141,18 @@ typedef struct __attribute__((packed)) {
     uint32_t frameWidth;
     uint32_t frameHeight;
     int32_t targetPID;
+    uint16_t source;
+    uint16_t flags;
+    uint32_t buttons;
+    // Raw UIKit Pencil geometry in radians plus normalized Cartesian tilt.
+    // Non-Pencil producers write zero. tiltX/tiltY are in [-1, 1].
+    float altitude;
+    float azimuth;
+    float tiltX;
+    float tiltY;
+    // Monotonic per-producer sequence. Zero means the producer has no sequence.
+    uint32_t sampleSequence;
+    uint32_t reserved;
 } MacWSInputRecord;
 
 // ABI v3 originally used sceneID as an opaque scene token, while key records
@@ -171,20 +214,41 @@ typedef struct __attribute__((packed)) {
     uint32_t flags;
 } MacWSInputTargetReply;
 
+enum {
+    MacWSInputAckTargetReady = 1u << 0,
+    MacWSInputAckRepairQueued = 1u << 1,
+    MacWSInputAckRouteFailed = 1u << 2,
+    MacWSInputAckMenuPreflight = 1u << 3,
+};
+
+// Bounded control-plane acknowledgement used only before OSXvnc emits a real
+// native mouse-down. It reports whether the broker found the already-active
+// target or had to queue an activation repair; it never acknowledges the
+// subsequent NSEvent and therefore cannot create duplicate event ownership.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint32_t sampleSequence;
+    uint32_t flags;
+} MacWSInputAck;
+
 #if defined(__cplusplus)
 static_assert(sizeof(MacWSFrameHeader) == 16, "MacWS frame header ABI");
-static_assert(sizeof(MacWSInputRecord) == 52, "MacWS input record ABI");
+static_assert(sizeof(MacWSInputRecord) == 84, "MacWS input record ABI");
 static_assert(sizeof(MacWSInputTargetProbe) == 32,
               "MacWS target probe ABI");
 static_assert(sizeof(MacWSInputTargetReply) == 28,
               "MacWS target reply ABI");
+static_assert(sizeof(MacWSInputAck) == 16, "MacWS input ack ABI");
 #else
 _Static_assert(sizeof(MacWSFrameHeader) == 16, "MacWS frame header ABI");
-_Static_assert(sizeof(MacWSInputRecord) == 52, "MacWS input record ABI");
+_Static_assert(sizeof(MacWSInputRecord) == 84, "MacWS input record ABI");
 _Static_assert(sizeof(MacWSInputTargetProbe) == 32,
                "MacWS target probe ABI");
 _Static_assert(sizeof(MacWSInputTargetReply) == 28,
                "MacWS target reply ABI");
+_Static_assert(sizeof(MacWSInputAck) == 16, "MacWS input ack ABI");
 #endif
 
 #endif

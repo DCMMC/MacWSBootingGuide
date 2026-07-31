@@ -15,7 +15,10 @@ function parseArgs(argv) {
     width: 1024,
     height: 1024,
     warmup: 8,
-    url: "https://webglsamples.org/fishtank/fishtank.html",
+    mode: "full",
+    driver: "raf",
+    directFrames: 12,
+    url: "https://webglsamples.org/aquarium/aquarium.html",
   };
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index]?.replace(/^--/, "");
@@ -23,12 +26,22 @@ function parseArgs(argv) {
     if (!(key in args) || value === undefined) {
       throw new Error(`unknown or incomplete argument: ${argv[index]}`);
     }
-    args[key] = ["host", "url"].includes(key) ? value : Number(value);
+    args[key] = ["host", "mode", "driver", "url"].includes(key)
+      ? value : Number(value);
   }
   for (const key of ["port", "fish", "seconds", "width", "height", "warmup"]) {
     if (!Number.isFinite(args[key]) || args[key] <= 0) {
       throw new Error(`invalid --${key}: ${args[key]}`);
     }
+  }
+  if (!["full", "no-draw", "no-uniforms", "js-only"].includes(args.mode)) {
+    throw new Error(`invalid --mode: ${args.mode}`);
+  }
+  if (!["raf", "direct"].includes(args.driver)) {
+    throw new Error(`invalid --driver: ${args.driver}`);
+  }
+  if (!Number.isInteger(args.directFrames) || args.directFrames <= 0) {
+    throw new Error(`invalid --directFrames: ${args.directFrames}`);
   }
   return args;
 }
@@ -184,9 +197,15 @@ aquariumUrl.searchParams.set("canvasWidth", String(args.width));
 aquariumUrl.searchParams.set("canvasHeight", String(args.height));
 aquariumUrl.searchParams.set("fitWindow", "false");
 
-const loaded = cdp.waitFor("Page.loadEventFired", 60000);
-await cdp.send("Page.navigate", { url: aquariumUrl.href });
-await loaded;
+// A VS Code Simple Browser page is a dedicated DevTools target, but navigating
+// that target destroys and recreates the webview guest even when the URL is
+// unchanged.  Reuse an already-correct target so its WebSocket and renderer
+// remain stable; ordinary Chrome/blank targets still take the navigation path.
+if (page.url !== aquariumUrl.href) {
+  const loaded = cdp.waitFor("Page.loadEventFired", 60000);
+  await cdp.send("Page.navigate", { url: aquariumUrl.href });
+  await loaded;
+}
 
 const deadline = Date.now() + 90000;
 let readiness;
@@ -239,6 +258,28 @@ const configuredResponse = await cdp.send("Runtime.evaluate", {
       ? g_fishTable.reduce((total, fishInfo) =>
           total + (fishInfo?.num?.[fishSettingIndex] ?? 0), 0)
       : null;
+    const uniformMethods = [
+      'uniform1f', 'uniform1fv', 'uniform1i', 'uniform1iv',
+      'uniform2f', 'uniform2fv', 'uniform2i', 'uniform2iv',
+      'uniform3f', 'uniform3fv', 'uniform3i', 'uniform3iv',
+      'uniform4f', 'uniform4fv', 'uniform4i', 'uniform4iv',
+      'uniformMatrix2fv', 'uniformMatrix3fv', 'uniformMatrix4fv',
+    ];
+    const methodsByMode = {
+      'full': [],
+      'no-draw': ['drawArrays', 'drawElements'],
+      'no-uniforms': uniformMethods,
+      'js-only': [...uniformMethods, 'drawArrays', 'drawElements'],
+    };
+    const requestedMethods = methodsByMode[${JSON.stringify(args.mode)}];
+    const patchedMethods = [];
+    for (const name of requestedMethods) {
+      if (typeof gl?.[name] !== 'function') continue;
+      try {
+        gl[name] = () => undefined;
+        if (Object.prototype.hasOwnProperty.call(gl, name)) patchedMethods.push(name);
+      } catch (_) {}
+    }
     return {
       fishSettingIndex,
       fishCount,
@@ -247,6 +288,9 @@ const configuredResponse = await cdp.send("Runtime.evaluate", {
       contextType: typeof gl !== 'undefined' ? gl?.constructor?.name || null : null,
       contextLost: typeof gl !== 'undefined' && typeof gl?.isContextLost === 'function'
         ? gl.isContextLost() : null,
+      mode: ${JSON.stringify(args.mode)},
+      requestedPatchCount: requestedMethods.length,
+      patchedMethods,
     };
   })()`,
   returnByValue: true,
@@ -255,13 +299,30 @@ const configured = configuredResponse.result.value;
 if (configured?.fishCount !== args.fish ||
     configured?.modelFishCount !== args.fish ||
     configured?.canvas?.[0] !== args.width ||
-    configured?.canvas?.[1] !== args.height) {
+    configured?.canvas?.[1] !== args.height ||
+    configured?.contextLost !== false ||
+    configured?.patchedMethods?.length !== configured?.requestedPatchCount) {
   throw new Error(`Aquarium fish count was not applied: ${JSON.stringify(configured)}`);
 }
 
 await new Promise((resolve) => setTimeout(resolve, args.warmup * 1000));
-const benchmark = await cdp.send("Runtime.evaluate", {
-  expression: `new Promise((resolve) => {
+const benchmarkExpression = args.driver === "direct" ? `(() => {
+    if (typeof g_onAnimationFrame !== 'function') {
+      return {error: 'missing g_onAnimationFrame', durations: []};
+    }
+    cancelAnimationFrame(g_requestId);
+    const durations = [];
+    const started = performance.now();
+    for (let index = 0; index < ${args.directFrames}; ++index) {
+      const frameStarted = performance.now();
+      g_onAnimationFrame();
+      cancelAnimationFrame(g_requestId);
+      durations.push(performance.now() - frameStarted);
+    }
+    const ended = performance.now();
+    g_requestId = requestAnimationFrame(g_onAnimationFrame);
+    return {started, ended, durations, timedOut: false};
+  })()` : `new Promise((resolve) => {
     const durationMs = ${args.seconds * 1000};
     const started = performance.now();
     const stamps = [];
@@ -286,20 +347,25 @@ const benchmark = await cdp.send("Runtime.evaluate", {
       return result;
     };
     setTimeout(() => finish(true), durationMs + 10000);
-  })`,
+  })`;
+const benchmark = await cdp.send("Runtime.evaluate", {
+  expression: benchmarkExpression,
   awaitPromise: true,
   returnByValue: true,
 }, (args.seconds + 30) * 1000);
 
 const raw = benchmark.result.value;
 if (raw.error) throw new Error(`Aquarium frame instrumentation failed: ${raw.error}`);
-if (raw.timedOut || raw.stamps.length < 2) {
+const frameSamples = args.driver === "direct" ? raw.durations : raw.stamps;
+if (raw.timedOut || !Array.isArray(frameSamples) || frameSamples.length < 2) {
   throw new Error(`Aquarium render loop stalled: ${JSON.stringify(raw)}`);
 }
-const intervals = raw.stamps.slice(1).map((stamp, index) => stamp - raw.stamps[index]);
+const intervals = args.driver === "direct"
+  ? raw.durations
+  : raw.stamps.slice(1).map((stamp, index) => stamp - raw.stamps[index]);
 const sortedIntervals = [...intervals].sort((left, right) => left - right);
 const elapsedSeconds = (raw.ended - raw.started) / 1000;
-const callbackFps = raw.stamps.length / elapsedSeconds;
+const callbackFps = frameSamples.length / elapsedSeconds;
 const instantaneousFps = intervals.map((interval) => 1000 / interval).filter(Number.isFinite);
 const sortedFps = [...instantaneousFps].sort((left, right) => left - right);
 
@@ -308,9 +374,11 @@ const result = {
   target: endpoint,
   url: aquariumUrl.href,
   fish: args.fish,
+  mode: args.mode,
+  driver: args.driver,
   requestedSeconds: args.seconds,
   elapsedSeconds,
-  pageFrames: raw.stamps.length,
+  pageFrames: frameSamples.length,
   pageFrameFps: callbackFps,
   frameIntervalMs: {
     min: sortedIntervals[0] ?? null,

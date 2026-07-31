@@ -9,6 +9,7 @@
 #import <sys/file.h>
 #import <malloc/malloc.h>
 #import <stdatomic.h>
+#import <stdarg.h>
 #import "interpose.h"
 #import "utils.h"
 #import <sys/mman.h>
@@ -16,11 +17,13 @@
 #import <fcntl.h>
 #import <pthread.h>
 #import <limits.h>
+#import <math.h>
 #import <ptrauth.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <sys/socket.h>
 #import <sys/un.h>
+#import <poll.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 
@@ -47,6 +50,23 @@ static bool macws_runtime_diagnostics_enabled(void) {
     }
     return value != 0;
 }
+
+// libmachook is inherited by every chroot application, including shells
+// launched by Terminal. Its historical "####" traces therefore appeared as
+// command output and also added synchronous stderr I/O to production startup.
+// Keep the instrumentation available behind the existing diagnostics switch,
+// while leaving non-stderr file output untouched.
+static int macws_filtered_fprintf(FILE *stream, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+static int macws_filtered_fprintf(FILE *stream, const char *format, ...) {
+    if (stream == stderr && !macws_runtime_diagnostics_enabled()) return 0;
+    va_list args;
+    va_start(args, format);
+    int result = vfprintf(stream, format, args);
+    va_end(args);
+    return result;
+}
+#define fprintf macws_filtered_fprintf
 
 // Diagnostic sentinels are a process-start contract.  macos_gui.sh creates or
 // removes them before launch, and production_preflight rejects any survivor.
@@ -2210,9 +2230,229 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
     }
 }
 
+// The macOS LaunchServices database cannot successfully seed CoreTypes.bundle
+// while running inside the iOS-hosted chroot (`lsregister -f` returns -50).
+// UniformTypeIdentifiers consequently returns nil for some types that are
+// nevertheless declared by the installed macOS CoreTypes bundle.  Finder's
+// VoiceShortcut provider requests three such declarations while constructing
+// its quick-action list and NSArray then raises when one of those entries is
+// nil.
+//
+// RE-confirmed on the installed macOS 13.4 frameworks:
+//   +[UTType typeWithIdentifier:] tail-calls
+//   _UTTypeGetForIdentifier(identifier, false).  The hidden true branch asks
+//   +[UTTypeRecord typeRecordWithPotentiallyUndeclaredIdentifier:] and turns
+//   the resulting real record into a UTType with
+//   +[UTType _typeWithTypeRecord:detachTypeRecord:findConstant:].
+//
+// Preserve the normal lookup first.  The compatibility path is restricted to
+// identifiers explicitly present in the installed CoreTypes Info.plist, then
+// follows that framework-owned record/conversion path.  Unknown identifiers
+// remain nil; this is not a blanket non-nil stub.
+typedef id (*MacWSUTTypeWithIdentifierFn)(id, SEL, NSString *);
+static MacWSUTTypeWithIdentifierFn g_macws_orig_uttype_with_identifier;
+static CFSetRef g_macws_coretypes_identifiers;
+static _Thread_local bool g_macws_uttype_fallback_active;
+
+static id macws_uttype_with_identifier(id cls, SEL cmd,
+                                        NSString *identifier) {
+    id result = g_macws_orig_uttype_with_identifier
+        ? g_macws_orig_uttype_with_identifier(cls, cmd, identifier) : nil;
+    if (result || !identifier || g_macws_uttype_fallback_active ||
+        !g_macws_coretypes_identifiers ||
+        !CFSetContainsValue(g_macws_coretypes_identifiers,
+                            (__bridge CFStringRef)identifier)) {
+        return result;
+    }
+
+    Class recordClass = objc_getClass("UTTypeRecord");
+    Class typeClass = objc_getClass("UTType");
+    SEL recordSelector =
+        sel_registerName("typeRecordWithPotentiallyUndeclaredIdentifier:");
+    SEL typeSelector =
+        sel_registerName("_typeWithTypeRecord:detachTypeRecord:findConstant:");
+    if (!recordClass || !typeClass ||
+        !class_respondsToSelector(object_getClass(recordClass),
+                                  recordSelector) ||
+        !class_respondsToSelector(object_getClass(typeClass), typeSelector)) {
+        return nil;
+    }
+
+    g_macws_uttype_fallback_active = true;
+    id record = ((id (*)(id, SEL, id))objc_msgSend)(
+        recordClass, recordSelector, identifier);
+    if (record) {
+        result = ((id (*)(id, SEL, id, BOOL, BOOL))objc_msgSend)(
+            typeClass, typeSelector, record, YES, NO);
+    }
+    g_macws_uttype_fallback_active = false;
+
+    if (result && macws_runtime_diagnostics_enabled()) {
+        char identifierBytes[256] = {0};
+        CFStringGetCString((__bridge CFStringRef)identifier,
+                           identifierBytes, sizeof(identifierBytes),
+                           kCFStringEncodingUTF8);
+        fprintf(stderr,
+                "#### MACWS_UTTYPE restored CoreTypes declaration '%s'\n",
+                identifierBytes[0] ? identifierBytes : "(non-UTF8)");
+    }
+    return result;
+}
+
+static CFSetRef macws_copy_coretypes_identifiers(void) {
+    static const char path[] =
+        "/System/Library/CoreServices/CoreTypes.bundle/Contents/Info.plist";
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat status = {0};
+    if (fstat(fd, &status) != 0 || status.st_size <= 0 ||
+        status.st_size > 1024 * 1024) {
+        close(fd);
+        return NULL;
+    }
+    size_t length = (size_t)status.st_size;
+    UInt8 *bytes = malloc(length);
+    if (!bytes) {
+        close(fd);
+        return NULL;
+    }
+    size_t offset = 0;
+    while (offset < length) {
+        ssize_t count = read(fd, bytes + offset, length - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(fd);
+    if (offset != length) {
+        free(bytes);
+        return NULL;
+    }
+
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, bytes,
+                                  (CFIndex)length);
+    free(bytes);
+    if (!data) return NULL;
+    CFErrorRef error = NULL;
+    CFPropertyListRef root = CFPropertyListCreateWithData(
+        kCFAllocatorDefault, data, kCFPropertyListImmutable, NULL, &error);
+    CFRelease(data);
+    if (error) CFRelease(error);
+    if (!root || CFGetTypeID(root) != CFDictionaryGetTypeID()) {
+        if (root) CFRelease(root);
+        return NULL;
+    }
+
+    CFMutableSetRef identifiers = CFSetCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeSetCallBacks);
+    CFStringRef identifierKey = CFStringCreateWithCString(
+        kCFAllocatorDefault, "UTTypeIdentifier", kCFStringEncodingUTF8);
+    static const char *declarationNames[] = {
+        "UTExportedTypeDeclarations", "UTImportedTypeDeclarations",
+    };
+    if (!identifiers || !identifierKey) {
+        if (identifiers) CFRelease(identifiers);
+        if (identifierKey) CFRelease(identifierKey);
+        CFRelease(root);
+        return NULL;
+    }
+    for (size_t nameIndex = 0;
+         nameIndex < sizeof(declarationNames) / sizeof(declarationNames[0]);
+         nameIndex++) {
+        CFStringRef declarationKey = CFStringCreateWithCString(
+            kCFAllocatorDefault, declarationNames[nameIndex],
+            kCFStringEncodingUTF8);
+        CFTypeRef value = declarationKey
+            ? CFDictionaryGetValue((CFDictionaryRef)root, declarationKey)
+            : NULL;
+        if (value && CFGetTypeID(value) == CFArrayGetTypeID()) {
+            CFArrayRef declarations = (CFArrayRef)value;
+            CFIndex declarationCount = CFArrayGetCount(declarations);
+            for (CFIndex index = 0; index < declarationCount; index++) {
+                CFTypeRef declaration = CFArrayGetValueAtIndex(
+                    declarations, index);
+                if (!declaration ||
+                    CFGetTypeID(declaration) != CFDictionaryGetTypeID())
+                    continue;
+                CFTypeRef identifier = CFDictionaryGetValue(
+                    (CFDictionaryRef)declaration, identifierKey);
+                if (identifier &&
+                    CFGetTypeID(identifier) == CFStringGetTypeID()) {
+                    CFSetAddValue(identifiers, identifier);
+                }
+            }
+        }
+        if (declarationKey) CFRelease(declarationKey);
+    }
+    CFRelease(identifierKey);
+    CFRelease(root);
+    if (CFSetGetCount(identifiers) == 0) {
+        CFRelease(identifiers);
+        return NULL;
+    }
+    return identifiers;
+}
+
+static void macws_install_uttype_coretypes_compatibility(void) {
+    static _Atomic bool installed = false;
+    bool expected = false;
+    if (!atomic_compare_exchange_strong(&installed, &expected, true)) return;
+
+    CFSetRef identifiers = macws_copy_coretypes_identifiers();
+
+    Class typeClass = objc_getClass("UTType");
+    Method method = typeClass
+        ? class_getClassMethod(typeClass, sel_registerName("typeWithIdentifier:"))
+        : NULL;
+    if (!method || !identifiers) {
+        if (identifiers) CFRelease(identifiers);
+        atomic_store(&installed, false);
+        return;
+    }
+
+    g_macws_coretypes_identifiers = identifiers;
+    g_macws_orig_uttype_with_identifier =
+        (MacWSUTTypeWithIdentifierFn)method_getImplementation(method);
+    method_setImplementation(method, (IMP)macws_uttype_with_identifier);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS_UTTYPE installed CoreTypes compatibility (%lu IDs)\n",
+                (unsigned long)CFSetGetCount(g_macws_coretypes_identifiers));
+    }
+}
+
+// dyld invokes add-image callbacks while Objective-C realization for the new
+// image is still in flight.  Runtime-confirmed on the device by
+// bash-2026-07-31-110902.ips: parsing the plist synchronously from that
+// callback reached _NSIsNSString -> object_getMethodImplementation and trapped
+// with a PAC DA fault before bash main().  The compatibility is only consumed
+// by GUI applications, so enqueue the real Foundation/UTType work onto the
+// application main queue after image initialization has unwound. The deferred
+// worker intentionally uses POSIX I/O plus CoreFoundation's C property-list
+// APIs: pbs-2026-07-31-112112.ips proved that even a later
+// +[NSDictionary dictionaryWithContentsOfFile:] still authenticates a broken
+// arm64e constant-NSString bridge in this chroot. This fixes both invariants;
+// it does not bypass the UTType lookup.
+static void macws_schedule_uttype_coretypes_compatibility(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            macws_install_uttype_coretypes_compatibility();
+        });
+    });
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
     dladdr(header, &info);
+    if (info.dli_fname &&
+        strstr(info.dli_fname,
+               "/UniformTypeIdentifiers.framework/") != NULL) {
+        macws_schedule_uttype_coretypes_compatibility();
+    }
     if(!strncmp(info.dli_fname, SkyLightPath, strlen(SkyLightPath))) {
         // allow coexist with backboardd in WS::Displays::CAWSManager::CAWSManager() + 560
         // if backboardd is running, WindowServer switches to offscreen rendering
@@ -5178,6 +5418,8 @@ static BOOL macws_vnc_remote_down = NO;
 static BOOL macws_vnc_release_pending = NO;
 static uint32_t macws_vnc_gesture_id = 0;
 static int macws_vnc_input_fd = -1;
+static int macws_vnc_activation_fd = -1;
+static _Atomic uint32_t macws_vnc_activation_sequence = 0;
 static double macws_vnc_last_continuous_send = 0.0;
 // System-wide route for the exact installed OSXvnc CGPostMouseEvent path. The
 // split owner (AppInput taps, native drags/right buttons) cannot cover AppKit's
@@ -5187,12 +5429,25 @@ static double macws_vnc_last_continuous_send = 0.0;
 // VNC launchd job enables this path; the file/env gate remains for controlled
 // A/Bs and compatibility with manually launched OSXvnc.
 static BOOL macws_vnc_native_all = NO;
+typedef enum {
+    MacWSVNCInputModeStock = 0,
+    MacWSVNCInputModeScaleOnly = 1,
+    MacWSVNCInputModeHybrid = 2,
+} MacWSVNCInputMode;
+// Input A/B mode is deliberately independent from the mmap framebuffer and
+// native-AGX presentation hooks.  "stock" leaves every OSXvnc input method
+// untouched; "scale-only" corrects Retina RFB pixels to Quartz points and
+// immediately calls the original mouse method; "hybrid" retains the current
+// AppInput/target/menu compatibility path.  This lets one running AGX desktop
+// distinguish an input regression from a rendering/session regression.
+static MacWSVNCInputMode macws_vnc_input_mode = MacWSVNCInputModeStock;
 static _Atomic uint64_t macws_vnc_keyboard_serial = 0;
 static _Atomic uint64_t macws_vnc_keyboard_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_capture_serial = 0;
 static _Atomic uint64_t macws_vnc_pointer_last_progress_ns = 0;
 static _Atomic uint64_t macws_vnc_pointer_settle_serial = 0;
 static _Atomic unsigned int macws_vnc_native_buttons = 0;
+static _Atomic BOOL macws_vnc_caps_lock_active = NO;
 static double macws_vnc_last_hover_target_probe = 0.0;
 static BOOL macws_vnc_secondary_pending = NO;
 static CGPoint macws_vnc_secondary_down_point;
@@ -5228,6 +5483,7 @@ static __thread uint64_t macws_vnc_rfb_copy_pixels = 0;
 static __thread uint32_t macws_vnc_rfb_copy_calls = 0;
 static __thread BOOL macws_vnc_rfb_prefetched = NO;
 static double macws_vnc_monotonic_seconds(void);
+static double macws_vnc_event_timestamp_seconds(void);
 static bool macws_vnc_fill_test(int rectX, int rectY,
                                 int rectWidth, int rectHeight);
 typedef int (*MacWSVNCReadExact)(void *, void *, int);
@@ -5977,6 +6233,16 @@ static double macws_vnc_monotonic_seconds(void) {
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
+// NSEvent.timestamp and UIKit's CACurrentMediaTime use boot uptime, while
+// Darwin CLOCK_MONOTONIC on this iOS build includes suspended time.  Runtime
+// InputLab evidence measured the two clocks 6,080 seconds apart; placing the
+// latter in an NSEvent made every synthetic right/key/scroll latency invalid.
+// Keep CLOCK_MONOTONIC for cross-process activity pacing, but use the same
+// public uptime clock as the native Host for input records.
+static double macws_vnc_event_timestamp_seconds(void) {
+    return NSProcessInfo.processInfo.systemUptime;
+}
+
 // Cross-process interaction hint for the cancelled-swap pacing diagnostic.
 // OSXvnc writes one boot-relative timestamp (at most 120 Hz); WindowServer
 // reads it at its existing SwapEnd boundary.  This does not fabricate a GPU
@@ -5985,6 +6251,37 @@ static double macws_vnc_monotonic_seconds(void) {
 // same latency while a user is actively typing or dragging.
 static int macws_vnc_activity_fd = -1;
 static _Atomic uint64_t macws_vnc_last_activity_write_ns = 0;
+static int macws_vnc_interaction_wake_fd = -1;
+
+static void macws_vnc_signal_interaction_wake(void) {
+    if (macws_vnc_interaction_wake_fd < 0) {
+        macws_vnc_interaction_wake_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (macws_vnc_interaction_wake_fd >= 0) {
+            (void)fcntl(macws_vnc_interaction_wake_fd, F_SETFD, FD_CLOEXEC);
+            int flags = fcntl(macws_vnc_interaction_wake_fd, F_GETFL, 0);
+            if (flags >= 0) {
+                (void)fcntl(macws_vnc_interaction_wake_fd, F_SETFL,
+                            flags | O_NONBLOCK);
+            }
+        }
+    }
+    if (macws_vnc_interaction_wake_fd < 0) return;
+
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    address.sun_len = sizeof(address);
+    strlcpy(address.sun_path, MACWS_INTERACTION_WAKE_SOCKET_PATH,
+            sizeof(address.sun_path));
+    const uint8_t token = 1;
+    if (sendto(macws_vnc_interaction_wake_fd, &token, sizeof(token),
+               MSG_DONTWAIT, (const struct sockaddr *)&address,
+               sizeof(address)) < 0 &&
+        (errno == EBADF || errno == ENOTSOCK)) {
+        close(macws_vnc_interaction_wake_fd);
+        macws_vnc_interaction_wake_fd = -1;
+    }
+}
+
 static void macws_vnc_note_interaction(void) {
     struct timespec now = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
@@ -6011,6 +6308,7 @@ static void macws_vnc_note_interaction(void) {
         close(macws_vnc_activity_fd);
         macws_vnc_activity_fd = -1;
     }
+    macws_vnc_signal_interaction_wake();
 }
 
 static uint64_t macws_vnc_realtime_nanoseconds(void) {
@@ -6194,6 +6492,12 @@ static void macws_vnc_schedule_secondary_tap_frames(uint64_t gesture) {
 static void macws_new_vnc_handle_keyboard(id self, SEL command, BOOL down,
         unsigned int keySym, id client) {
     macws_vnc_note_interaction();
+    if (down && keySym == 0xffe5u) {
+        BOOL active = atomic_load_explicit(
+            &macws_vnc_caps_lock_active, memory_order_acquire);
+        atomic_store_explicit(
+            &macws_vnc_caps_lock_active, !active, memory_order_release);
+    }
     BOOL diagnostics = macws_runtime_diagnostics_enabled();
     double started = diagnostics ? macws_vnc_monotonic_seconds() : 0.0;
     unsigned int previousKeySym = macws_vnc_current_keysym;
@@ -6309,6 +6613,158 @@ static void macws_new_vnc_set_key_modifiers(id self, SEL command,
     }
 }
 
+static BOOL macws_vnc_send_input_record(const MacWSInputRecord *record,
+                                        BOOL reliable, int *errorOut,
+                                        unsigned *attemptedOut) {
+    if (!record) return NO;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, "/private/tmp/macws_host_input.sock",
+            sizeof(address.sun_path));
+    ssize_t sent = -1;
+    int savedError = 0;
+    unsigned attempts = reliable ? 2 : 1;
+    unsigned attempted = 0;
+    for (unsigned attempt = 0; attempt < attempts; attempt++) {
+        attempted = attempt + 1;
+        if (macws_vnc_input_fd < 0)
+            macws_vnc_input_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (macws_vnc_input_fd < 0) {
+            savedError = errno;
+        } else {
+            sent = sendto(macws_vnc_input_fd, record, sizeof(*record),
+                          MSG_DONTWAIT, (const struct sockaddr *)&address,
+                          sizeof(address));
+            if (sent == (ssize_t)sizeof(*record)) break;
+            savedError = sent < 0 ? errno : EMSGSIZE;
+            if (savedError == EBADF || savedError == ECONNREFUSED) {
+                close(macws_vnc_input_fd);
+                macws_vnc_input_fd = -1;
+            }
+        }
+        if (!reliable || (savedError != EAGAIN && savedError != ENOBUFS &&
+                          savedError != ENOENT &&
+                          savedError != ECONNREFUSED)) break;
+        usleep(2000);
+    }
+    if (errorOut) *errorOut = savedError;
+    if (attemptedOut) *attemptedOut = attempted;
+    return sent == (ssize_t)sizeof(*record);
+}
+
+static int macws_vnc_activation_reply_socket(void) {
+    if (macws_vnc_activation_fd >= 0) return macws_vnc_activation_fd;
+    int candidate = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (candidate < 0) return -1;
+    (void)fcntl(candidate, F_SETFD, FD_CLOEXEC);
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    address.sun_len = sizeof(address);
+    strlcpy(address.sun_path, MACWS_VNC_ACTIVATION_REPLY_SOCKET_PATH,
+            sizeof(address.sun_path));
+    (void)unlink(MACWS_VNC_ACTIVATION_REPLY_SOCKET_PATH);
+    if (bind(candidate, (const struct sockaddr *)&address,
+             sizeof(address)) != 0) {
+        close(candidate);
+        return -1;
+    }
+    (void)chmod(MACWS_VNC_ACTIVATION_REPLY_SOCKET_PATH, 0600);
+    macws_vnc_activation_fd = candidate;
+    return candidate;
+}
+
+// Coordinate only the control-plane ownership transaction. The real button
+// event remains OSXvnc's original CG/AppKit route. A ready acknowledgement
+// lets an already-active target proceed immediately; repair/timeout preserves
+// the historical 20-ms upper bound instead of sleeping blindly on every
+// click. sampleSequence prevents a late reply from satisfying a newer down.
+static BOOL macws_vnc_coordinate_activation(CGPoint point) {
+    const double maximumWaitSeconds = 0.020;
+    double started = macws_vnc_monotonic_seconds();
+    BOOL targetReady = NO;
+    uint32_t replyFlags = 0;
+    if (!macws_rfbScreen) goto finish;
+    int width = macws_rfbScreen[0];
+    int height = macws_rfbScreen[2];
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
+        goto finish;
+    if (point.x < 0.0) point.x = 0.0;
+    if (point.y < 0.0) point.y = 0.0;
+    if (point.x >= width) point.x = width - 1;
+    if (point.y >= height) point.y = height - 1;
+
+    uint32_t sequence = atomic_fetch_add_explicit(
+        &macws_vnc_activation_sequence, 1, memory_order_relaxed) + 1;
+    if (sequence == 0) {
+        sequence = atomic_fetch_add_explicit(
+            &macws_vnc_activation_sequence, 1, memory_order_relaxed) + 1;
+    }
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindActivateTarget,
+        .sceneID = 0x564e430000000001ull,
+        .timestamp = macws_vnc_event_timestamp_seconds(),
+        .x = (float)point.x,
+        .y = (float)point.y,
+        .contactID = macws_vnc_gesture_id,
+        .frameWidth = (uint32_t)width,
+        .frameHeight = (uint32_t)height,
+        .source = MacWSInputSourceVNC,
+        .sampleSequence = sequence,
+    };
+    int socketFD = macws_vnc_activation_reply_socket();
+    if (socketFD < 0) goto finish;
+    MacWSInputAck stale = {0};
+    while (recv(socketFD, &stale, sizeof(stale), MSG_DONTWAIT) > 0) {
+    }
+    struct sockaddr_un broker = {0};
+    broker.sun_family = AF_UNIX;
+    broker.sun_len = sizeof(broker);
+    strlcpy(broker.sun_path, "/private/tmp/macws_host_input.sock",
+            sizeof(broker.sun_path));
+    if (sendto(socketFD, &record, sizeof(record), MSG_DONTWAIT,
+               (const struct sockaddr *)&broker, sizeof(broker)) !=
+        (ssize_t)sizeof(record)) goto finish;
+
+    for (;;) {
+        double elapsed = macws_vnc_monotonic_seconds() - started;
+        double remaining = maximumWaitSeconds - elapsed;
+        if (remaining <= 0.0) break;
+        struct pollfd descriptor = {.fd = socketFD, .events = POLLIN};
+        int timeoutMS = (int)ceil(remaining * 1000.0);
+        int pollResult;
+        do {
+            pollResult = poll(&descriptor, 1, timeoutMS);
+        } while (pollResult < 0 && errno == EINTR);
+        if (pollResult <= 0) break;
+        MacWSInputAck acknowledgement = {0};
+        ssize_t received = recv(socketFD, &acknowledgement,
+                                sizeof(acknowledgement), 0);
+        if (received != sizeof(acknowledgement) ||
+            acknowledgement.magic != MACWS_INPUT_ACK_MAGIC ||
+            acknowledgement.version != MACWS_INPUT_ACK_VERSION ||
+            acknowledgement.size != sizeof(acknowledgement) ||
+            acknowledgement.sampleSequence != sequence) continue;
+        replyFlags = acknowledgement.flags;
+        targetReady = (replyFlags & MacWSInputAckTargetReady) != 0;
+        break;
+    }
+
+finish:;
+    double elapsed = macws_vnc_monotonic_seconds() - started;
+    if (!targetReady && elapsed < maximumWaitSeconds) {
+        usleep((useconds_t)((maximumWaitSeconds - elapsed) * 1000000.0));
+        elapsed = macws_vnc_monotonic_seconds() - started;
+    }
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### OSXVNC ACTIVATE-ACK ready=%s flags=%#x elapsed=%.3fms\n",
+            targetReady ? "YES" : "NO", replyFlags, elapsed * 1000.0);
+    }
+    return targetReady;
+}
+
 static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
                                     BOOL reliable) {
     if (!macws_rfbScreen) return NO;
@@ -6340,7 +6796,7 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
         .version = MACWS_INPUT_VERSION,
         .kind = kind,
         .sceneID = 0x564e430000000001ull,
-        .timestamp = now,
+        .timestamp = macws_vnc_event_timestamp_seconds(),
         .x = (float)point.x,
         .y = (float)point.y,
         .pressure = (kind == MacWSInputKindTouchDown ||
@@ -6349,39 +6805,12 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
         .frameWidth = (uint32_t)width,
         .frameHeight = (uint32_t)height,
         .targetPID = 0,
+        .source = MacWSInputSourceVNC,
     };
-    struct sockaddr_un address = {0};
-    address.sun_family = AF_UNIX;
-    strlcpy(address.sun_path, "/private/tmp/macws_host_input.sock",
-            sizeof(address.sun_path));
-    ssize_t sent = -1;
     int saved_errno = 0;
-    unsigned attempts = reliable ? 8 : 1;
     unsigned attempted = 0;
-    for (unsigned attempt = 0; attempt < attempts; attempt++) {
-        attempted = attempt + 1;
-        if (macws_vnc_input_fd < 0)
-            macws_vnc_input_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-        if (macws_vnc_input_fd < 0) {
-            saved_errno = errno;
-        } else {
-            sent = sendto(macws_vnc_input_fd, &record, sizeof(record),
-                          MSG_DONTWAIT, (const struct sockaddr *)&address,
-                          sizeof(address));
-            if (sent == (ssize_t)sizeof(record)) break;
-            saved_errno = sent < 0 ? errno : EMSGSIZE;
-            if (saved_errno == EBADF || saved_errno == ECONNREFUSED) {
-                close(macws_vnc_input_fd);
-                macws_vnc_input_fd = -1;
-            }
-        }
-        if (!reliable) break;
-        // A WS recovery removes and recreates macwsinputd's socket.  Button
-        // transitions can wait for that short namespace/queue race; motion is
-        // deliberately lossy and never sleeps the VNC client thread.
-        usleep((useconds_t)(1000u * (attempt + 1)));
-    }
-    BOOL ok = sent == (ssize_t)sizeof(record);
+    BOOL ok = macws_vnc_send_input_record(
+        &record, reliable, &saved_errno, &attempted);
     if (ok && continuous) macws_vnc_last_continuous_send = now;
     if (!ok) {
         static _Atomic unsigned failures = 0;
@@ -6390,16 +6819,17 @@ static BOOL macws_vnc_forward_input(MacWSInputKind kind, CGPoint point,
         if (failure <= 4 || (failure % 120) == 0) {
         fprintf(stderr,
             "#### OSXVNC INPUT kind=%u gesture=%u point=(%.1f,%.1f)/%dx%d "
-            "sent=%zd errno=%d attempts=%u reliable=%s\n",
+            "sent=%s errno=%d attempts=%u reliable=%s\n",
             kind, macws_vnc_gesture_id, point.x, point.y, width, height,
-            sent, ok ? 0 : saved_errno, attempted, reliable ? "YES" : "NO");
+            ok ? "YES" : "NO", ok ? 0 : saved_errno, attempted,
+            reliable ? "YES" : "NO");
         }
     } else if (!continuous && macws_runtime_diagnostics_enabled()) {
         fprintf(stderr,
             "#### OSXVNC INPUT kind=%u gesture=%u point=(%.1f,%.1f)/%dx%d "
-            "sent=%zd errno=0 attempts=%u reliable=%s\n",
+            "sent=YES errno=0 attempts=%u reliable=%s\n",
             kind, macws_vnc_gesture_id, point.x, point.y, width, height,
-            sent, attempted, reliable ? "YES" : "NO");
+            attempted, reliable ? "YES" : "NO");
     }
     return ok;
 }
@@ -6416,7 +6846,13 @@ static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
         point.y < 0.0 || point.y >= height) {
         point = (CGPoint){width * 0.5, height * 0.5};
     }
-    double now = macws_vnc_monotonic_seconds();
+    // OSXvnc KEY-ROUTE runtime evidence shows private/non-coalesced bit 0x100
+    // on every ordinary key; it is not Caps Lock. The server sends Caps with
+    // keyCode 57 but modifiers=0, so preserve its real key translation and add
+    // only the state toggled by the raw XK_Caps_Lock down edge above.
+    if (atomic_load_explicit(
+            &macws_vnc_caps_lock_active, memory_order_acquire))
+        modifiers |= 0x10000ull;
     MacWSInputRecord record = {
         .magic = MACWS_INPUT_MAGIC,
         .version = MACWS_INPUT_VERSION,
@@ -6425,7 +6861,7 @@ static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
         // AppInput reads only the low 32 flag bits for a key record.
         .sceneID = 0x564e434b00000000ull |
                    (modifiers & 0xffffffffull),
-        .timestamp = now,
+        .timestamp = macws_vnc_event_timestamp_seconds(),
         .x = (float)point.x,
         .y = (float)point.y,
         .pressure = (float)keyCode,
@@ -6433,42 +6869,60 @@ static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
         .frameWidth = (uint32_t)width,
         .frameHeight = (uint32_t)height,
         .targetPID = 0,
+        .source = MacWSInputSourceVNC,
     };
-    struct sockaddr_un address = {0};
-    address.sun_family = AF_UNIX;
-    strlcpy(address.sun_path, "/private/tmp/macws_host_input.sock",
-            sizeof(address.sun_path));
-    ssize_t sent = -1;
     int savedError = 0;
     unsigned attempted = 0;
-    for (unsigned attempt = 0; attempt < 8; attempt++) {
-        attempted = attempt + 1;
-        if (macws_vnc_input_fd < 0)
-            macws_vnc_input_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
-        if (macws_vnc_input_fd < 0) {
-            savedError = errno;
-        } else {
-            sent = sendto(macws_vnc_input_fd, &record, sizeof(record),
-                          MSG_DONTWAIT,
-                          (const struct sockaddr *)&address,
-                          sizeof(address));
-            if (sent == (ssize_t)sizeof(record)) break;
-            savedError = sent < 0 ? errno : EMSGSIZE;
-            if (savedError == EBADF || savedError == ECONNREFUSED) {
-                close(macws_vnc_input_fd);
-                macws_vnc_input_fd = -1;
-            }
-        }
-        usleep((useconds_t)(1000u * (attempt + 1)));
-    }
-    BOOL ok = sent == (ssize_t)sizeof(record);
+    BOOL ok = macws_vnc_send_input_record(
+        &record, YES, &savedError, &attempted);
     if (!ok) {
         fprintf(stderr,
             "#### OSXVNC KEY-INPUT down=%d keycode=%u keysym=%#x "
-            "modifiers=%#llx sent=%zd errno=%d attempts=%u\n",
+            "modifiers=%#llx sent=NO errno=%d attempts=%u\n",
             down, keyCode, keySym, (unsigned long long)modifiers,
-            sent, savedError, attempted);
+            savedError, attempted);
         fflush(stderr);
+    }
+    return ok;
+}
+
+static BOOL macws_vnc_forward_scroll(CGPoint point, float horizontal,
+                                     float vertical) {
+    if (!macws_rfbScreen || (!isfinite(horizontal) || !isfinite(vertical)))
+        return NO;
+    int width = macws_rfbScreen[0];
+    int height = macws_rfbScreen[2];
+    if (width <= 0 || height <= 0 || width > 8192 || height > 8192)
+        return NO;
+    if (point.x < 0.0 || point.x >= width ||
+        point.y < 0.0 || point.y >= height)
+        point = (CGPoint){width * 0.5, height * 0.5};
+    uint32_t horizontalBits = 0;
+    memcpy(&horizontalBits, &horizontal, sizeof(horizontalBits));
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindScroll,
+        .sceneID = 0x564e430000000001ull,
+        .timestamp = macws_vnc_event_timestamp_seconds(),
+        .x = (float)point.x,
+        .y = (float)point.y,
+        .pressure = vertical,
+        .contactID = horizontalBits,
+        .frameWidth = (uint32_t)width,
+        .frameHeight = (uint32_t)height,
+        .targetPID = 0,
+        .source = MacWSInputSourceVNC,
+    };
+    int savedError = 0;
+    unsigned attempted = 0;
+    BOOL ok = macws_vnc_send_input_record(
+        &record, YES, &savedError, &attempted);
+    if (!ok) {
+        fprintf(stderr,
+            "#### OSXVNC SCROLL-INPUT delta=(%.1f,%.1f) sent=NO "
+            "errno=%d attempts=%u\n",
+            horizontal, vertical, savedError, attempted);
     }
     return ok;
 }
@@ -6476,6 +6930,19 @@ static BOOL macws_vnc_forward_key(unsigned short keyCode, BOOL down,
 static void macws_new_vnc_handle_mouse(id self, SEL command,
         unsigned int buttons, CGPoint point, id client) {
     macws_vnc_note_interaction();
+    if (macws_vnc_input_mode == MacWSVNCInputModeScaleOnly) {
+        int scale = macws_vnc_integral_backing_scale();
+        if (scale < 1) scale = 1;
+        CGPoint quartzPoint = {
+            point.x / (CGFloat)scale,
+            point.y / (CGFloat)scale,
+        };
+        if (macws_orig_vnc_handle_mouse) {
+            macws_orig_vnc_handle_mouse(self, command, buttons,
+                                        quartzPoint, client);
+        }
+        return;
+    }
     BOOL leftDown = (buttons & 1u) != 0;
     BOOL completedLeftGesture = !leftDown && macws_vnc_left_down;
     if (macws_orig_vnc_handle_mouse) {
@@ -6488,12 +6955,19 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
         if (macws_vnc_native_all) {
             unsigned int previousButtons = atomic_load_explicit(
                 &macws_vnc_native_buttons, memory_order_acquire);
-            BOOL buttonTransition = buttons != previousButtons;
+            const unsigned int wheelMask = 8u | 16u | 32u | 64u;
+            unsigned int pointerButtons = buttons & ~wheelMask;
+            unsigned int previousPointerButtons =
+                previousButtons & ~wheelMask;
+            unsigned int wheelPressed =
+                (buttons & ~previousButtons) & wheelMask;
+            BOOL buttonTransition =
+                pointerButtons != previousPointerButtons;
             double now = macws_vnc_monotonic_seconds();
-            BOOL secondaryDown = previousButtons == 0 &&
-                                 (buttons & 4u) != 0;
-            BOOL primaryDown = previousButtons == 0 &&
-                               (buttons & 1u) != 0;
+            BOOL secondaryDown = previousPointerButtons == 0 &&
+                                 (pointerButtons & 4u) != 0;
+            BOOL primaryDown = previousPointerButtons == 0 &&
+                               (pointerButtons & 1u) != 0;
             BOOL topBarDown = primaryDown && macws_rfbScreen[2] > 0 &&
                 point.y <= (CGFloat)macws_rfbScreen[2] * 0.04;
             if (secondaryDown || topBarDown) {
@@ -6522,7 +6996,8 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                         now, point.x, point.y);
                 }
             }
-            if (buttonTransition && previousButtons == 0 && buttons != 0) {
+            if (buttonTransition && previousPointerButtons == 0 &&
+                pointerButtons != 0) {
                 // Coordinate the target before OSXvnc posts the native down.
                 // RE-confirmed in AppKit 13.4: activateIgnoringOtherApps:
                 // tail-calls _NXActivateSelf, whose effective operation is
@@ -6536,12 +7011,11 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                 // before a synchronous contextual-menu tracker can occupy its
                 // main thread. The original OSXvnc path below remains the sole
                 // owner and dispatcher of the actual down event.
-                (void)macws_vnc_forward_input(
-                    MacWSInputKindActivateTarget, point, YES);
-                usleep(20000);
+                (void)macws_vnc_coordinate_activation(point);
             }
-            BOOL secondaryRelease = (previousButtons & 4u) != 0 &&
-                                    (buttons & 4u) == 0;
+            BOOL secondaryRelease =
+                (previousPointerButtons & 4u) != 0 &&
+                (pointerButtons & 4u) == 0;
             if (secondaryRelease) {
                 // Runtime-confirmed on 2026-07-29: separate OSXvnc CG right-
                 // down/up posts were scheduler-dependent. Some clicks entered
@@ -6563,11 +7037,13 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     }
                 }
             }
-            BOOL secondaryGesture = ((previousButtons | buttons) & 4u) != 0;
+            BOOL secondaryGesture =
+                ((previousPointerButtons | pointerButtons) & 4u) != 0;
             if (secondaryGesture) {
                 // Keep OSXvnc's cursor/client bookkeeping but leave the right
                 // button out of its asynchronous global CG stream.
-                macws_orig_vnc_handle_mouse(self, command, buttons & ~4u,
+                macws_orig_vnc_handle_mouse(
+                    self, command, pointerButtons & ~4u,
                                             quartzPoint, client);
                 if (secondaryRelease && macws_vnc_secondary_pending) {
                     macws_vnc_gesture_id++;
@@ -6591,8 +7067,23 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     macws_vnc_secondary_pending = NO;
                 }
             } else {
-                macws_orig_vnc_handle_mouse(self, command, buttons,
+                // RFB buttons 4..7 are wheel impulses, not persistent mouse
+                // buttons. The stock CG route receives them but, runtime-
+                // confirmed by InputLab, produces zero scrollWheel events in
+                // this coexist session. Keep cursor/primary state native and
+                // give each wheel impulse one AppInput semantic owner below.
+                macws_orig_vnc_handle_mouse(self, command, pointerButtons,
                                             quartzPoint, client);
+            }
+            if (wheelPressed != 0) {
+                float horizontal = 0.0f;
+                float vertical = 0.0f;
+                if (wheelPressed & 8u) vertical += 40.0f;
+                if (wheelPressed & 16u) vertical -= 40.0f;
+                if (wheelPressed & 32u) horizontal += 40.0f;
+                if (wheelPressed & 64u) horizontal -= 40.0f;
+                (void)macws_vnc_forward_scroll(
+                    point, horizontal, vertical);
             }
             // OSXvnc remains the owner of cursor state and primary native
             // drags; an atomic AppInput record owns secondary clicks. After
@@ -6620,7 +7111,7 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                     MacWSInputKindTargetProbe, point, YES)) {
                 macws_vnc_last_hover_target_probe = now;
             }
-            if (buttons == 0) {
+            if (pointerButtons == 0 && wheelPressed == 0) {
                 MacWSInputKind hoverKind =
                     now < macws_vnc_menu_hover_until
                         ? MacWSInputKindMenuHover
@@ -6649,15 +7140,27 @@ static void macws_new_vnc_handle_mouse(id self, SEL command,
                 if (nativeEvent <= 96 || (nativeEvent % 600) == 0) {
                 fprintf(stderr,
                     "#### OSXVNC NATIVE-ALL event=%llu buttons=%#x "
-                    "rfb=(%.1f,%.1f) quartz=(%.1f,%.1f) scale=%d\n",
+                    "pointer=%#x wheel=%#x rfb=(%.1f,%.1f) "
+                    "quartz=(%.1f,%.1f) scale=%d\n",
                     (unsigned long long)nativeEvent, buttons,
+                    pointerButtons, wheelPressed,
                     point.x, point.y, quartzPoint.x, quartzPoint.y, scale);
                 }
             }
             atomic_store_explicit(&macws_vnc_native_buttons, buttons,
                                   memory_order_release);
-            macws_vnc_schedule_native_pointer_frames(
-                buttons, buttonTransition);
+            // The producer-completion bridge now keeps a bounded latest-state
+            // slot, so a final static composite cannot be dropped behind an
+            // older observer.  The historical 12/48/80-ms capture-file burst
+            // never caused AppKit to draw; it merely sampled whichever frame
+            // happened to exist and added six file/GPU-observation races to a
+            // simple click. Retain it only as an explicit diagnostic A/B.
+            // Contextual menus keep their separate bounded open/final probes
+            // until their nested tracking lifecycle has its own test witness.
+            if (macws_runtime_diagnostics_enabled()) {
+                macws_vnc_schedule_native_pointer_frames(
+                    pointerButtons, buttonTransition || wheelPressed != 0);
+            }
             macws_vnc_left_down = leftDown;
             macws_vnc_last_point = point;
             return;
@@ -7034,8 +7537,24 @@ static void macws_install_osxvnc_hooks(void) {
     macws_vnc_test_on = (access("/tmp/macws_vnc_test", F_OK) == 0);
     macws_vnc_share_on = (getenv("MACWS_VNC_SHARE") ||
                           access("/tmp/macws_vnc_share", F_OK) == 0);
+    const char *inputMode = getenv("MACWS_VNC_INPUT_MODE");
     macws_vnc_native_all = getenv("MACWS_VNC_NATIVE_ALL") != NULL ||
         access("/tmp/macws_vnc_native_all", F_OK) == 0;
+    if (inputMode && strcmp(inputMode, "stock") == 0) {
+        macws_vnc_input_mode = MacWSVNCInputModeStock;
+        macws_vnc_native_all = NO;
+    } else if (inputMode && strcmp(inputMode, "scale-only") == 0) {
+        macws_vnc_input_mode = MacWSVNCInputModeScaleOnly;
+        macws_vnc_native_all = NO;
+    } else if ((inputMode && strcmp(inputMode, "hybrid") == 0) ||
+               macws_vnc_native_all) {
+        macws_vnc_input_mode = MacWSVNCInputModeHybrid;
+        macws_vnc_native_all = YES;
+    } else {
+        // Preserve the pre-input-hook baseline when no input policy was
+        // requested. Framebuffer delivery remains installed below.
+        macws_vnc_input_mode = MacWSVNCInputModeStock;
+    }
     const struct mach_header *mh = NULL;
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
@@ -7076,14 +7595,14 @@ static void macws_install_osxvnc_hooks(void) {
     Class serverClass = objc_getClass("VNCServer");
     Method mouseMethod = serverClass ? class_getInstanceMethod(serverClass,
         sel_registerName("handleMouseButtons:atPoint:forClient:")) : NULL;
-    if (mouseMethod) {
+    if (mouseMethod && macws_vnc_input_mode != MacWSVNCInputModeStock) {
         macws_orig_vnc_handle_mouse =
             (MacWSVNCHandleMouse)method_getImplementation(mouseMethod);
         method_setImplementation(mouseMethod, (IMP)macws_new_vnc_handle_mouse);
     }
     Method sendKeyMethod = serverClass ? class_getInstanceMethod(serverClass,
         sel_registerName("sendKeyEvent:down:modifiers:")) : NULL;
-    if (sendKeyMethod) {
+    if (sendKeyMethod && macws_vnc_input_mode == MacWSVNCInputModeHybrid) {
         macws_orig_vnc_send_key_event =
             (MacWSVNCSendKeyEvent)method_getImplementation(sendKeyMethod);
         method_setImplementation(sendKeyMethod,
@@ -7093,7 +7612,8 @@ static void macws_install_osxvnc_hooks(void) {
         serverClass, sel_registerName("setKeyModifiers:")) : NULL;
     Ivar currentModifiersIvar = serverClass ? class_getInstanceVariable(
         serverClass, "currentModifiers") : NULL;
-    if (setKeyModifiersMethod && currentModifiersIvar) {
+    if (setKeyModifiersMethod && currentModifiersIvar &&
+        macws_vnc_input_mode == MacWSVNCInputModeHybrid) {
         macws_vnc_current_modifiers_offset =
             ivar_getOffset(currentModifiersIvar);
         macws_orig_vnc_set_key_modifiers =
@@ -7104,7 +7624,7 @@ static void macws_install_osxvnc_hooks(void) {
     }
     Method keyboardMethod = serverClass ? class_getInstanceMethod(serverClass,
         sel_registerName("handleKeyboard:forSym:forClient:")) : NULL;
-    if (keyboardMethod) {
+    if (keyboardMethod && macws_vnc_input_mode == MacWSVNCInputModeHybrid) {
         macws_orig_vnc_handle_keyboard =
             (MacWSVNCHandleKeyboard)method_getImplementation(keyboardMethod);
         method_setImplementation(keyboardMethod,
@@ -7126,13 +7646,21 @@ static void macws_install_osxvnc_hooks(void) {
             "#### OSXVNC mmap generation watcher failed error=%d\n",
             watcherError);
     }
-    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d native-all=%d client-trace=%d input=%s keyboard=%s key-map=%s key-modifiers=%s modifiers-offset=%td) base=%p rfbScreen=%p\n",
-            macws_vnc_test_on, macws_vnc_share_on, macws_vnc_native_all,
+    const char *inputModeName = macws_vnc_input_mode == MacWSVNCInputModeStock
+        ? "stock" : (macws_vnc_input_mode == MacWSVNCInputModeScaleOnly
+            ? "scale-only" : "hybrid");
+    fprintf(stderr, "#### OSXVNC delivery hooks installed (test=%d share=%d input-mode=%s native-all=%d client-trace=%d input=%s keyboard=%s key-map=%s key-modifiers=%s modifiers-offset=%td) base=%p rfbScreen=%p\n",
+            macws_vnc_test_on, macws_vnc_share_on, inputModeName,
+            macws_vnc_native_all,
             traceClientMessages,
-            mouseMethod ? "YES" : "NO",
-            keyboardMethod ? "YES" : "NO",
-            sendKeyMethod ? "YES" : "NO",
-            setKeyModifiersMethod && currentModifiersIvar ? "YES" : "NO",
+            mouseMethod && macws_vnc_input_mode != MacWSVNCInputModeStock
+                ? "YES" : "NO",
+            keyboardMethod && macws_vnc_input_mode == MacWSVNCInputModeHybrid
+                ? "YES" : "NO",
+            sendKeyMethod && macws_vnc_input_mode == MacWSVNCInputModeHybrid
+                ? "YES" : "NO",
+            setKeyModifiersMethod && currentModifiersIvar &&
+                macws_vnc_input_mode == MacWSVNCInputModeHybrid ? "YES" : "NO",
             macws_vnc_current_modifiers_offset,
             (void *)mh, (void *)macws_rfbScreen);
 }
@@ -7848,7 +8376,145 @@ IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
     return result;
 }
 
+// CarbonCore's LMGetBootDrive still backs DesktopServices' boot-volume
+// identity on macOS 13.  In the iOS-hosted chroot its compatibility shim
+// returns zero, while CFURL's volume resource property correctly reports the
+// mounted root's signed 16-bit vRefNum.  Finder consequently fails to mark the
+// root TFSVolumeInfo as the boot volume and asks the not-yet-populated global
+// volume map for it during that same object's initialization.
+//
+// Keep the native answer whenever CarbonCore has one.  Only repair the
+// unsupported zero result, deriving the value through the exact
+// _kCFURLVolumeRefNumKey mechanism used by
+// DesktopServicesPriv::TCFURLInfo::GetVRefNum(CFURLRef).
+extern int16_t LMGetBootDrive(void);
+extern const CFStringRef _kCFURLVolumeRefNumKey;
+
+static int16_t macws_root_volume_refnum(void) {
+    CFURLRef rootURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
+                                                     CFSTR("/"),
+                                                     kCFURLPOSIXPathStyle,
+                                                     true);
+    if (!rootURL) return 0;
+
+    CFTypeRef value = NULL;
+    CFErrorRef error = NULL;
+    Boolean copied = CFURLCopyResourcePropertyForKey(rootURL,
+                                                      _kCFURLVolumeRefNumKey,
+                                                      &value,
+                                                      &error);
+    int16_t result = 0;
+    if (copied && value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+        (void)CFNumberGetValue((CFNumberRef)value,
+                               kCFNumberSInt16Type,
+                               &result);
+    }
+    if (value) CFRelease(value);
+    if (error) CFRelease(error);
+    CFRelease(rootURL);
+    return result;
+}
+
+static int16_t LMGetBootDrive_new(void) {
+    int16_t native = LMGetBootDrive();
+    if (native != 0) return native;
+
+    int16_t repaired = macws_root_volume_refnum();
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS_BOOT_VREF CarbonCore=%d root-CFURL=%d\n",
+                (int)native, (int)repaired);
+    }
+    return repaired;
+}
+
+// A chroot changes pathname lookup's process root but does not turn that vnode
+// into the APFS mount's kernel-level root.  CoreServices therefore reports the
+// chroot's "/" with a valid file ID but without its is-volume bit.  The macOS
+// DesktopServices consumer maps bit 3 of the second flags result directly to
+// TFSInfo's no-parent/volume-root flag.  Without it, walking the parent of "/"
+// repeatedly resolves the same file-reference URL and Finder spins forever in
+// THFSPlusPropertyStore::IsInPackage.
+//
+// Recognize only the process root.  CFURLGetString is side-effect free and the
+// file-reference form carries the inode (runtime example:
+// file:///.file/id=6684248.22434439/); matching it to stat("/") avoids calling
+// back into resource-property resolution from this interposer.
+extern Boolean _CFURLCopyResourcePropertyValuesAndFlags(
+    CFURLRef url,
+    uint64_t requestedValues,
+    uint64_t *returnedValues,
+    void *filePropertyValues,
+    uint64_t requestedFlags,
+    uint64_t *returnedFlags,
+    CFErrorRef *error);
+
+static bool macws_cfurl_is_process_root(CFURLRef url) {
+    if (!url) return false;
+    CFStringRef string = CFURLGetString(url);
+    if (!string) return false;
+
+    char text[PATH_MAX];
+    if (!CFStringGetCString(string, text, sizeof(text),
+                            kCFStringEncodingUTF8)) {
+        return false;
+    }
+    if (strcmp(text, "file:///") == 0 ||
+        strcmp(text, "file://localhost/") == 0) {
+        return true;
+    }
+
+    static _Atomic uint64_t cachedRootInode = 0;
+    uint64_t rootInode = atomic_load_explicit(&cachedRootInode,
+                                               memory_order_acquire);
+    if (rootInode == 0) {
+        struct stat st = {0};
+        if (stat("/", &st) != 0 || st.st_ino == 0) return false;
+        rootInode = (uint64_t)st.st_ino;
+        atomic_store_explicit(&cachedRootInode, rootInode,
+                              memory_order_release);
+    }
+
+    static const char prefix[] = "file:///.file/id=";
+    if (strncmp(text, prefix, sizeof(prefix) - 1) != 0) return false;
+    char *dot = strrchr(text, '.');
+    if (!dot || dot[1] == '\0') return false;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long inode = strtoull(dot + 1, &end, 10);
+    return errno == 0 && inode == rootInode && end &&
+        strcmp(end, "/") == 0;
+}
+
+static Boolean macws_CFURLCopyResourcePropertyValuesAndFlags(
+    CFURLRef url,
+    uint64_t requestedValues,
+    uint64_t *returnedValues,
+    void *filePropertyValues,
+    uint64_t requestedFlags,
+    uint64_t *returnedFlags,
+    CFErrorRef *error) {
+    Boolean result = _CFURLCopyResourcePropertyValuesAndFlags(
+        url, requestedValues, returnedValues, filePropertyValues,
+        requestedFlags, returnedFlags, error);
+    const uint64_t isVolumeFlag = 1ULL << 3;
+    if (result && returnedFlags &&
+        (requestedFlags & isVolumeFlag) != 0 &&
+        ((*returnedFlags & isVolumeFlag) == 0) &&
+        macws_cfurl_is_process_root(url)) {
+        *returnedFlags |= isVolumeFlag;
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### MACWS_CHROOT_ROOT marked CFURL as volume root\n");
+        }
+    }
+    return result;
+}
+
 DYLD_INTERPOSE(sysctlbyname_new, sysctlbyname);
+DYLD_INTERPOSE(LMGetBootDrive_new, LMGetBootDrive);
+DYLD_INTERPOSE(macws_CFURLCopyResourcePropertyValuesAndFlags,
+               _CFURLCopyResourcePropertyValuesAndFlags);
 DYLD_INTERPOSE(__mac_syscall_new, __mac_syscall);
 DYLD_INTERPOSE(csr_get_active_config_new, csr_get_active_config);
 DYLD_INTERPOSE(sandbox_init_with_parameters_new, sandbox_init_with_parameters);
@@ -13418,28 +14084,104 @@ static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
 // accumulate), but subtract time already spent rendering since the preceding
 // completion.  This remains a virtual-display timing scaffold, not a claim
 // that a synthetic callback is a hardware vblank or GPU fence.
+static int macws_coexist_interaction_wake_socket(void) {
+    static dispatch_once_t once;
+    static int socket_fd = -1;
+    dispatch_once(&once, ^{
+        int candidate = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (candidate < 0) return;
+
+        (void)fcntl(candidate, F_SETFD, FD_CLOEXEC);
+        int flags = fcntl(candidate, F_GETFL, 0);
+        if (flags >= 0) {
+            (void)fcntl(candidate, F_SETFL, flags | O_NONBLOCK);
+        }
+        struct sockaddr_un address = {0};
+        address.sun_family = AF_UNIX;
+        address.sun_len = sizeof(address);
+        strlcpy(address.sun_path, MACWS_INTERACTION_WAKE_SOCKET_PATH,
+                sizeof(address.sun_path));
+        (void)unlink(MACWS_INTERACTION_WAKE_SOCKET_PATH);
+        if (bind(candidate, (const struct sockaddr *)&address,
+                 sizeof(address)) != 0) {
+            close(candidate);
+            return;
+        }
+        (void)chmod(MACWS_INTERACTION_WAKE_SOCKET_PATH, 0666);
+        socket_fd = candidate;
+    });
+    return socket_fd;
+}
+
+static void macws_coexist_drain_interaction_wake(int socket_fd) {
+    uint8_t tokens[64];
+    while (recv(socket_fd, tokens, sizeof(tokens), MSG_DONTWAIT) > 0) {
+    }
+}
+
 static uint32_t macws_coexist_wait_for_completion_slot(uint32_t interval_us) {
     static pthread_mutex_t pace_lock = PTHREAD_MUTEX_INITIALIZER;
     static uint64_t last_completion_ns = 0;
-    const uint64_t interval_ns = (uint64_t)interval_us * 1000u;
     uint32_t slept_us = 0;
 
     pthread_mutex_lock(&pace_lock);
     struct timespec now_ts = {0};
     if (clock_gettime(CLOCK_MONOTONIC, &now_ts) == 0) {
-        uint64_t now_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
+        uint64_t start_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
             (uint64_t)now_ts.tv_nsec;
-        uint64_t target_ns = last_completion_ns
-            ? last_completion_ns + interval_ns : now_ns + interval_ns;
-        if (target_ns > now_ns) {
-            uint64_t remaining_us = (target_ns - now_ns + 999u) / 1000u;
-            if (remaining_us > UINT32_MAX) remaining_us = UINT32_MAX;
-            slept_us = (uint32_t)remaining_us;
-            usleep((useconds_t)slept_us);
+        uint64_t base_ns = last_completion_ns ? last_completion_ns : start_ns;
+        uint32_t effective_interval_us = interval_us;
+        uint64_t target_ns = base_ns +
+            (uint64_t)effective_interval_us * 1000u;
+        uint64_t now_ns = start_ns;
+        int wake_fd = macws_coexist_interaction_wake_socket();
+
+        while (target_ns > now_ns) {
+            uint64_t remaining_ns = target_ns - now_ns;
+            uint64_t remaining_ms = (remaining_ns + NSEC_PER_MSEC - 1) /
+                NSEC_PER_MSEC;
+            if (remaining_ms > INT_MAX) remaining_ms = INT_MAX;
+            bool interaction_wake = false;
+            if (wake_fd >= 0) {
+                struct pollfd descriptor = {
+                    .fd = wake_fd,
+                    .events = POLLIN,
+                };
+                int poll_result;
+                do {
+                    poll_result = poll(&descriptor, 1, (int)remaining_ms);
+                } while (poll_result < 0 && errno == EINTR);
+                if (poll_result > 0 && (descriptor.revents & POLLIN)) {
+                    macws_coexist_drain_interaction_wake(wake_fd);
+                    interaction_wake = true;
+                } else if (poll_result < 0) {
+                    uint64_t remaining_us = (remaining_ns + 999u) / 1000u;
+                    usleep((useconds_t)MIN(remaining_us, UINT32_MAX));
+                }
+            } else {
+                uint64_t remaining_us = (remaining_ns + 999u) / 1000u;
+                usleep((useconds_t)MIN(remaining_us, UINT32_MAX));
+            }
+
+            if (clock_gettime(CLOCK_MONOTONIC, &now_ts) != 0) break;
+            now_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
+                (uint64_t)now_ts.tv_nsec;
+            if (interaction_wake) {
+                uint32_t interactive_interval =
+                    macws_coexist_activity_pace_us(interval_us);
+                if (interactive_interval < effective_interval_us) {
+                    effective_interval_us = interactive_interval;
+                    target_ns = base_ns +
+                        (uint64_t)effective_interval_us * 1000u;
+                }
+            }
         }
         if (clock_gettime(CLOCK_MONOTONIC, &now_ts) == 0) {
             last_completion_ns = (uint64_t)now_ts.tv_sec * NSEC_PER_SEC +
                 (uint64_t)now_ts.tv_nsec;
+            uint64_t elapsed_us =
+                (last_completion_ns - start_ns + 999u) / 1000u;
+            slept_us = (uint32_t)MIN(elapsed_us, UINT32_MAX);
         } else {
             last_completion_ns = target_ns;
         }

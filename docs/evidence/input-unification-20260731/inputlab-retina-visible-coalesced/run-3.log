@@ -1,0 +1,4 @@
+INPUT start name='macOS-iPad' size=2388x1668 initial_rectangles=129 initial_pixels=3983184 digest=8f65902bc056bf596f42c21c7d21d0bfa2e13e882716f6b1902e910cefb31548
+INPUT PASS operation=left-click latency=0.043s updates=1 empty_updates=0 rectangles=7 encoded_pixels=199360 encoded_bounds=608,48,1780,112 raw_rectangles=0 raw_pixels=0 digest=667b8ef417edba29a80c5b82ab9902313606fc83d753a1939eb79f2e5928935d
+SETTLE retained=0.100s updates=3 changed_updates=1 final_digest=2c7e9cdfd8e4a58299f8e95f28facc04ec0fe9daed008aecb6815e0a60b132bb
+INPUT PASS operations=1 final_digest=2c7e9cdfd8e4a58299f8e95f28facc04ec0fe9daed008aecb6815e0a60b132bb

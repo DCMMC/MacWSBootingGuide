@@ -76,6 +76,7 @@ env	MACWS_SURF_FILL_IOS	off	diagnostic	IOSurface fill probe.
 env	MACWS_SUSPEND_AT_EXEC	off	diagnostic	SIGSTOP immediately after injection for LLDB attach.
 env	MACWS_TEX_TRACE	off	diagnostic	Texture call trace.
 env	MACWS_VNC_LOW_LATENCY_COMPRESSION	on	OSXvnc	Clamp negotiated compression work factor to measured level 1.
+env	MACWS_VNC_INPUT_MODE	off	OSXvnc A/B control	Explicitly selects stock, scale-only, or hybrid input ownership; production leaves it unset and obtains hybrid behavior from MACWS_VNC_NATIVE_ALL=1.
 env	MACWS_VNC_NATIVE_ALL	on	OSXvnc	Single system-wide CoreGraphics input owner.
 env	MACWS_VNC_SHARE	off	environment override	Production enables the equivalent /tmp/macws_vnc_share session flag.
 env	MACWS_VNC_TRACE_CLIENT_MESSAGES	off	diagnostic	RFB client-message trace.
@@ -138,8 +139,11 @@ state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion inte
 state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
 state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.
 state	/tmp/macws_vnc_activity	transient	VNC input	Monotonic input timestamp selecting the 16.667 ms interactive interval.
+state	/tmp/macws_interaction_wake.sock	transient	VNC/Host input	WindowServer-owned datagram wakeup for interrupting the current 100 ms idle completion wait; event producers only signal it after publishing macws_vnc_activity.
+state	/tmp/macws_vnc_activation_reply.sock	transient	VNC input	Bound OSXvnc acknowledgement endpoint; skips the historical fixed 20 ms wait only when macwsinputd proves the hit target is already active/frontmost.
 state	/tmp/macws_vnc_damage.sock	transient	VNC transport	Damage notification datagram socket.
 state	/tmp/macws_vnc_fb	transient	VNC transport	Retina mmap pixel transport and publication sequence.
+preference	MacWSLegacyFramebufferFallback	off	MacWSHost compatibility	Explicitly permits the historical full-display mmap upload when DisplayStream is unavailable; production Host defaults to IOSurface-only. Enable only for an A/B with `defaults write com.macwsguide.host MacWSLegacyFramebufferFallback -bool YES` and relaunch Host.
 state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
 state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.
 socket	/private/tmp/macws_app_input.%d.sock	transient	GUI client	Per-process AppInputBridge endpoint.

@@ -1,7 +1,9 @@
 #include <CoreVideo/CoreVideo.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static _Atomic uint64_t callback_count;
@@ -17,11 +19,12 @@ static CVReturn display_link_callback(CVDisplayLinkRef display_link,
                                       CVOptionFlags *flags_out,
                                       void *context) {
     (void)display_link;
-    (void)now;
     (void)flags_in;
     (void)flags_out;
     (void)context;
-    uint64_t host_time = output ? output->hostTime : CVGetCurrentHostTime();
+    uint64_t current_host_time = CVGetCurrentHostTime();
+    uint64_t now_host_time = now ? now->hostTime : 0;
+    uint64_t host_time = output ? output->hostTime : current_host_time;
     uint64_t previous = atomic_exchange(&last_host_time, host_time);
     uint64_t sequence = atomic_fetch_add(&callback_count, 1) + 1;
     if (sequence == 1) atomic_store(&first_host_time, host_time);
@@ -36,24 +39,63 @@ static CVReturn display_link_callback(CVDisplayLinkRef display_link,
                !atomic_compare_exchange_weak(&maximum_delta, &old_max, delta)) {
         }
         if (sequence <= 16) {
+            double frequency = CVGetHostClockFrequency();
             fprintf(stderr,
-                    "CVDL callback=%llu host=%llu delta_ms=%.3f "
-                    "videoTime=%lld scale=%d refreshPeriod=%lld flags=%#llx\n",
+                    "CVDL callback=%llu now=%llu output=%llu current=%llu "
+                    "output_minus_now_ms=%.3f current_minus_now_ms=%.3f "
+                    "output_minus_current_ms=%.3f delta_ms=%.3f "
+                    "nowVideoTime=%lld outputVideoTime=%lld scale=%d "
+                    "refreshPeriod=%lld nowFlags=%#llx outputFlags=%#llx\n",
                     (unsigned long long)sequence,
+                    (unsigned long long)now_host_time,
                     (unsigned long long)host_time,
-                    (double)delta * 1000.0 / CVGetHostClockFrequency(),
+                    (unsigned long long)current_host_time,
+                    (double)((int64_t)host_time - (int64_t)now_host_time) *
+                        1000.0 / frequency,
+                    (double)((int64_t)current_host_time -
+                             (int64_t)now_host_time) * 1000.0 / frequency,
+                    (double)((int64_t)host_time -
+                             (int64_t)current_host_time) * 1000.0 / frequency,
+                    (double)delta * 1000.0 / frequency,
+                    now ? now->videoTime : 0,
                     output ? output->videoTime : 0,
                     output ? output->videoTimeScale : 0,
                     output ? output->videoRefreshPeriod : 0,
+                    (unsigned long long)(now ? now->flags : 0),
                     (unsigned long long)(output ? output->flags : 0));
         }
     }
     return kCVReturnSuccess;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    CGDirectDisplayID displays[16] = {0};
+    uint32_t display_count = 0;
+    CGError display_result = CGGetActiveDisplayList(
+        (uint32_t)(sizeof(displays) / sizeof(displays[0])), displays,
+        &display_count);
+    fprintf(stderr, "CVDL displays result=%d count=%u main=%u ids=",
+            display_result, display_count, CGMainDisplayID());
+    for (uint32_t index = 0; index < display_count; index++)
+        fprintf(stderr, "%s%u", index ? "," : "", displays[index]);
+    fputc('\n', stderr);
+
     CVDisplayLinkRef link = NULL;
-    CVReturn result = CVDisplayLinkCreateWithActiveCGDisplays(&link);
+    CVReturn result;
+    if (argc > 1) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(argv[1], &end, 0);
+        if (!end || end == argv[1] || *end != '\0' || parsed > UINT32_MAX) {
+            fprintf(stderr, "CVDL invalid display id: %s\n", argv[1]);
+            return 3;
+        }
+        fprintf(stderr, "CVDL create mode=explicit display=%lu\n", parsed);
+        result = CVDisplayLinkCreateWithCGDisplay(
+            (CGDirectDisplayID)parsed, &link);
+    } else {
+        fprintf(stderr, "CVDL create mode=active-displays\n");
+        result = CVDisplayLinkCreateWithActiveCGDisplays(&link);
+    }
     if (result != kCVReturnSuccess || !link) {
         fprintf(stderr, "CVDL create failed result=%d link=%p\n", result, link);
         return 1;

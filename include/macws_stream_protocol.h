@@ -18,7 +18,7 @@
 #define MACWS_STREAM_MAX_WINDOWS 256u
 #define MACWS_STREAM_MAX_DAMAGE_RECTS 64u
 #define MACWS_WINDOW_METRICS_MAGIC 0x4d57474du /* "MWGM" */
-#define MACWS_WINDOW_METRICS_VERSION 1u
+#define MACWS_WINDOW_METRICS_VERSION 2u
 
 #define MACWS_STREAM_KEY_OP "op"
 #define MACWS_STREAM_KEY_EVENT "event"
@@ -83,7 +83,11 @@ typedef struct __attribute__((packed)) {
     uint32_t windowID;
     int32_t ownerPID;
     uint32_t flags;
-    uint32_t reserved;
+    // Stable identity for one user-visible AppKit window group.  AppKit tabs
+    // are separate NSWindow/CGWindow objects and selecting a tab changes the
+    // on-screen window number.  All members of a tab group publish the same
+    // nonzero ID so an iPadOS Scene can follow that native identity change.
+    uint32_t logicalGroupID;
     float logicalX;
     float logicalY;
     float logicalWidth;
@@ -139,6 +143,7 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint32_t windowID;
     uint32_t flags;
+    uint32_t logicalGroupID;
     float minimumLogicalWidth;
     float minimumLogicalHeight;
 } MacWSWindowMetricsEntry;
@@ -210,7 +215,7 @@ static_assert(sizeof(MacWSStreamDamageRect) == 16,
               "MacWS damage rect ABI");
 static_assert(sizeof(MacWSWindowMetricsHeader) == 24,
               "MacWS window metrics header ABI");
-static_assert(sizeof(MacWSWindowMetricsEntry) == 16,
+static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
               "MacWS window metrics entry ABI");
 #else
 _Static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
@@ -221,7 +226,7 @@ _Static_assert(sizeof(MacWSStreamDamageRect) == 16,
                "MacWS damage rect ABI");
 _Static_assert(sizeof(MacWSWindowMetricsHeader) == 24,
                "MacWS window metrics header ABI");
-_Static_assert(sizeof(MacWSWindowMetricsEntry) == 16,
+_Static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
                "MacWS window metrics entry ABI");
 #endif
 

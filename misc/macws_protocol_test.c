@@ -4,6 +4,7 @@
 
 #include "macws_interop_protocol.h"
 #include "macws_host_protocol.h"
+#include "macws_menu_protocol.h"
 #include "macws_stream_protocol.h"
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
@@ -13,6 +14,9 @@ static int Near(float lhs, float rhs) {
 }
 
 int main(void) {
+    assert(MACWS_INPUT_VERSION == 4u);
+    assert(sizeof(MacWSInputRecord) == 84);
+    assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSDecideTouchCandidate(0.10, 0.0, false) ==
            MacWSTouchCandidateDecisionWait);
     assert(MacWSDecideTouchCandidate(0.44, 5.99, true) ==
@@ -109,6 +113,7 @@ int main(void) {
         .size = sizeof(*window),
         .windowID = 12,
         .ownerPID = 99,
+        .logicalGroupID = 12,
         .logicalWidth = 800,
         .logicalHeight = 600,
         .pixelWidth = 1600,
@@ -133,6 +138,45 @@ int main(void) {
     assert(MacWSInteropItemDescriptorIsValid(&item, sizeof(item)));
     item.flags |= MacWSInteropStagedFile;
     assert(!MacWSInteropItemDescriptorIsValid(&item, sizeof(item)));
+
+    MacWSMenuRequest menuRequest = {
+        .magic = MACWS_MENU_MAGIC,
+        .version = MACWS_MENU_VERSION,
+        .size = sizeof(menuRequest),
+        .operation = MacWSMenuOperationSnapshot,
+        .nonce = 1,
+        .ownerPID = 99,
+        .windowID = 12,
+    };
+    assert(MacWSMenuRequestIsValid(&menuRequest, sizeof(menuRequest)));
+    menuRequest.itemID = 1;
+    assert(!MacWSMenuRequestIsValid(&menuRequest, sizeof(menuRequest)));
+
+    unsigned char menuBytes[sizeof(MacWSMenuResponseHeader) +
+                            sizeof(MacWSMenuNode) + 4] = {0};
+    MacWSMenuResponseHeader *menu = (void *)menuBytes;
+    *menu = (MacWSMenuResponseHeader){
+        .magic = MACWS_MENU_MAGIC,
+        .version = MACWS_MENU_VERSION,
+        .size = sizeof(*menu),
+        .status = MacWSMenuStatusOK,
+        .nonce = 1,
+        .ownerPID = 99,
+        .windowID = 12,
+        .generation = 2,
+        .nodeCount = 1,
+        .stringBytes = 4,
+        .totalBytes = sizeof(menuBytes),
+    };
+    MacWSMenuNode *menuNode = (void *)(menuBytes + sizeof(*menu));
+    *menuNode = (MacWSMenuNode){
+        .itemID = 1,
+        .titleLength = 4,
+    };
+    memcpy(menuBytes + sizeof(*menu) + sizeof(*menuNode), "File", 4);
+    assert(MacWSMenuResponseIsValid(menu, sizeof(menuBytes)));
+    menuNode->titleLength = 5;
+    assert(!MacWSMenuResponseIsValid(menu, sizeof(menuBytes)));
 
     puts("macws protocol validators: PASS");
     return 0;

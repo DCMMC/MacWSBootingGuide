@@ -62,6 +62,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
         "app_input_ready",
         "glassdemo_available", "terminal_available",
         "activity_monitor_available", "finder_available",
+        "vscode_available",
     };
     for (NSUInteger i = 0; i < sizeof(boolKeys) / sizeof(boolKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, boolKeys[i]);
@@ -76,7 +77,10 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
         if (value && xpc_get_type(value) == XPC_TYPE_UINT64)
             result[@(uintKeys[i])] = @(xpc_dictionary_get_uint64(reply, uintKeys[i]));
     }
-    const char *intKeys[] = {"windowserver_pid", "input_pid", "active_app_pid"};
+    const char *intKeys[] = {
+        "windowserver_pid", "input_pid", "active_app_pid",
+        "launched_app_pid",
+    };
     for (NSUInteger i = 0; i < sizeof(intKeys) / sizeof(intKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, intKeys[i]);
         if (value && xpc_get_type(value) == XPC_TYPE_INT64)

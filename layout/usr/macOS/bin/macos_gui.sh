@@ -95,6 +95,8 @@ EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 VNC_SHARED_FRAME="$ROOTFS/private/tmp/macws_vnc_fb"
 VNC_SHARED_SURFID="$ROOTFS/private/tmp/macws_vnc_surfid"
 VNC_ACTIVITY="$ROOTFS/private/tmp/macws_vnc_activity"
+INTERACTION_WAKE="$ROOTFS/private/tmp/macws_interaction_wake.sock"
+VNC_ACTIVATION_REPLY="$ROOTFS/private/tmp/macws_vnc_activation_reply.sock"
 GRAPHICS_READY="$ROOTFS/private/tmp/macws_graphics_ready"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
@@ -385,6 +387,8 @@ stop_ws_dependents() {
     kill_by_pattern "$P_CHROME150"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
+    rm -f "$ROOTFS"/private/tmp/macws_menu_client.*.sock
+    rm -f "$ROOTFS"/private/tmp/macws_menu_snapshot.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 }
 
@@ -1098,6 +1102,8 @@ cleanup_macos() {
     kill_by_pattern "$P_VSCODE"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
+    rm -f "$ROOTFS"/private/tmp/macws_menu_client.*.sock
+    rm -f "$ROOTFS"/private/tmp/macws_menu_snapshot.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 
     # 3) WindowServer and the macOS service daemons loaded with it
@@ -1116,6 +1122,7 @@ cleanup_macos() {
     # WindowServer has not published a frame.  Remove it only after every old
     # producer/client has been stopped so no live mapping is invalidated.
     rm -f "$VNC_SHARED_FRAME" "$VNC_SHARED_SURFID" "$VNC_ACTIVITY" \
+        "$INTERACTION_WAKE" "$VNC_ACTIVATION_REPLY" \
         "$GRAPHICS_READY" \
         "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE" \
         "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \

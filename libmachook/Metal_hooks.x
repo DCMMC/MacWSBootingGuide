@@ -8,6 +8,7 @@
 #import <dlfcn.h>
 #import <execinfo.h>
 #import <stdatomic.h>
+#import <stdarg.h>
 #import <objc/runtime.h>
 #import "utils.h"
 
@@ -36,6 +37,18 @@ static BOOL macws_runtime_diagnostics_enabled(void) {
     }
     return value != 0;
 }
+
+static int macws_filtered_fprintf(FILE *stream, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+static int macws_filtered_fprintf(FILE *stream, const char *format, ...) {
+    if (stream == stderr && !macws_runtime_diagnostics_enabled()) return 0;
+    va_list args;
+    va_start(args, format);
+    int result = vfprintf(stream, format, args);
+    va_end(args);
+    return result;
+}
+#define fprintf macws_filtered_fprintf
 
 // These diagnostics are selected before process launch.  Cache their exact
 // state once so command-buffer completion and resource creation never perform
@@ -752,6 +765,13 @@ typedef struct {
     MacWSVNCDamageRect rectangles[MacWSVNCDamageMaxRectangles];
 } MacWSVNCDamageMessage;
 
+// RFB Zlib owns one deflate operation per rectangle. Runtime InputLab capture
+// measured a 95-Kpixel button update split into 57 sixteen-pixel-high runs;
+// the update took 99-224 ms even though the pixel payload itself was small.
+// Coalesce nearby horizontal runs into vertical bands only when a cost model
+// predicts that the extra pixels are cheaper than the eliminated encoders.
+// Widely separated bands remain independent, so a cursor and a distant
+// control never force a full-desktop rectangle.
 // The mmap remains the pixel transport. This datagram is only a committed
 // generation's damage notification, replacing the lossy need for OSXvnc to
 // rediscover damage by copying/diffing 15.2 MiB after every producer frame.
@@ -2574,68 +2594,6 @@ static _Atomic uint64_t g_vnc_poll_accept_count = 0;
 static _Atomic uint64_t g_vnc_poll_drop_count = 0;
 static _Atomic uint64_t g_vnc_poll_clean_count = 0;
 static _Atomic uint64_t g_vnc_poll_error_count = 0;
-static _Atomic uint64_t g_vnc_owned_observer_last_ns = 0;
-static _Atomic uint64_t g_vnc_owned_observer_admit_count = 0;
-static _Atomic uint64_t g_vnc_owned_observer_throttle_count = 0;
-
-// EndUpdate can expose multiple display-sized PF80/115 composites inside one
-// virtual display interval.  Every accepted source below creates an observer
-// thread and, after producer completion, samples then compares as much as one
-// full 15.2-MiB Retina scanout. Runtime WindowServer logs on 2026-07-29 showed
-// successive `VNC-OWNED published ... committed=0` entries for these duplicate
-// sources while the actual SwapCancel completion boundary was paced at 60 Hz.
-// Select at most one already-owned source per 16 ms. This does not fabricate a
-// completion or skip GPU work: it only avoids observing/copying intermediate
-// sources more often than the VNC stream can present them.
-static BOOL macws_vnc_admit_owned_observer(void) {
-    struct timespec now = {0};
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return YES;
-    uint64_t nanoseconds = (uint64_t)now.tv_sec * 1000000000ull +
-        (uint64_t)now.tv_nsec;
-    const uint64_t minimumInterval = 16ull * NSEC_PER_MSEC;
-    uint64_t previous = atomic_load_explicit(
-        &g_vnc_owned_observer_last_ns, memory_order_acquire);
-    for (;;) {
-        if (previous != 0 && nanoseconds >= previous &&
-            nanoseconds - previous < minimumInterval) {
-            uint64_t throttled = macws_runtime_diagnostics_enabled()
-                ? atomic_fetch_add_explicit(
-                    &g_vnc_owned_observer_throttle_count, 1,
-                    memory_order_relaxed) + 1 : 0;
-            if (throttled &&
-                (throttled <= 16 || (throttled % 600) == 0)) {
-                fprintf(stderr,
-                    "#### VNC-OWNED observer-throttle #%llu "
-                    "admitted=%llu delta=%llu us\n",
-                    (unsigned long long)throttled,
-                    (unsigned long long)atomic_load_explicit(
-                        &g_vnc_owned_observer_admit_count,
-                        memory_order_relaxed),
-                    (unsigned long long)((nanoseconds - previous) / 1000u));
-            }
-            return NO;
-        }
-        if (atomic_compare_exchange_weak_explicit(
-                &g_vnc_owned_observer_last_ns, &previous, nanoseconds,
-                memory_order_acq_rel, memory_order_acquire)) {
-            uint64_t admitted = macws_runtime_diagnostics_enabled()
-                ? atomic_fetch_add_explicit(
-                    &g_vnc_owned_observer_admit_count, 1,
-                    memory_order_relaxed) + 1 : 0;
-            if (admitted &&
-                (admitted <= 16 || (admitted % 600) == 0)) {
-                fprintf(stderr,
-                    "#### VNC-OWNED observer-admit #%llu throttled=%llu\n",
-                    (unsigned long long)admitted,
-                    (unsigned long long)atomic_load_explicit(
-                        &g_vnc_owned_observer_throttle_count,
-                        memory_order_relaxed));
-            }
-            return YES;
-        }
-    }
-}
-
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
     if (!macws_vnc_share_enabled() || !context || !texture) return;
     static dispatch_once_t once;
@@ -2743,10 +2701,11 @@ void macws_vnc_complete_composite(void *context) {
 // desktop.  The old code called +detachNewThreadWithBlock: for every admitted
 // completion.  A 10-second production sample accumulated 69 short-lived
 // __macws_vnc_finish_update_block_invoke threads, most sleeping/pixel-scanning
-// for only one or two samples before exit.  pollInFlight already guarantees a
-// single ordinary observer, so a serial libdispatch queue preserves that
+// for only one or two samples before exit. A serial libdispatch queue preserves
+// the single-observer invariant and
 // invariant while reusing the process worker pool instead of creating ~10
-// NSThreads per second.
+// NSThreads per second. The one-deep latest-state queue below now provides the
+// ownership/in-flight invariant.
 static dispatch_queue_t macws_vnc_completion_observer_queue(void) {
     static dispatch_once_t once;
     static dispatch_queue_t queue;
@@ -2756,6 +2715,220 @@ static dispatch_queue_t macws_vnc_completion_observer_queue(void) {
             DISPATCH_QUEUE_SERIAL);
     });
     return queue;
+}
+
+// Completion observation is a latest-state stream, not a FIFO.  A static UI
+// action can submit its final display composite while the preceding source is
+// still being polled.  The former pollInFlight branch dropped that final
+// source outright; if no animation followed, VNC could remain on the old
+// pixels indefinitely even though AppKit had already handled the click.
+// Keep exactly one retained pending pair and replace it with newer state.
+// The serial worker samples at most once per 16 ms, bounding CPU/memory while
+// guaranteeing that the latest quiescent composite is eventually observed.
+static NSObject *g_vnc_completion_pending_lock = nil;
+static id<MTLCommandBuffer> g_vnc_completion_pending_command = nil;
+static id<MTLTexture> g_vnc_completion_pending_texture = nil;
+static void *g_vnc_completion_pending_context = NULL;
+static BOOL g_vnc_completion_pending_deep_capture = NO;
+static BOOL g_vnc_completion_pending_diagnostics = NO;
+static uint64_t g_vnc_completion_pending_submit_serial = 0;
+static _Atomic int g_vnc_completion_worker_running = 0;
+
+static void macws_vnc_process_completion_observation(
+        id<MTLCommandBuffer> commandBuffer, id<MTLTexture> texture,
+        void *context, BOOL deepCapture, BOOL diagnostics,
+        uint64_t submitSerial) {
+    MTLCommandBufferStatus status = [commandBuffer status];
+    unsigned polls = 0;
+    while (status != MTLCommandBufferStatusCompleted &&
+           status != MTLCommandBufferStatusError && polls < 400) {
+        usleep(5000);
+        status = [commandBuffer status];
+        polls++;
+    }
+    NSError *error = status == MTLCommandBufferStatusError
+        ? [commandBuffer error] : nil;
+    NSInteger errorCode = error ? [error code] : 0;
+    NSString *errorDomain = error ? [error domain] : nil;
+    unsigned long completedPF = (unsigned long)[texture pixelFormat];
+    static _Atomic int pollLog = 0;
+    int n = diagnostics ? atomic_fetch_add(&pollLog, 1) : INT_MAX;
+    if (n < 16) {
+        // Runtime-confirmed by WindowServer-2026-07-26-161536.ips:
+        // formatting one private Metal NSError walked a damaged userInfo
+        // graph.  The observer only needs completion status.
+        fprintf(stderr,
+            "#### VNC-ENDUPDATE-POLL #%d context=%p tex=%p pf=%lu "
+            "cb=%p status=%ld polls=%u error=%p domain=%p code=%ld\n",
+            n, context, (void *)texture, completedPF,
+            (void *)commandBuffer, (long)status, polls,
+            (void *)error, (void *)errorDomain, (long)errorCode);
+    }
+    BOOL completedCleanly =
+        status == MTLCommandBufferStatusCompleted && !error;
+    if (completedCleanly) macws_publish_graphics_ready_once();
+    if (completedPF == 550) {
+        macws_observe_pf550_metadata(texture, submitSerial,
+                                     completedCleanly);
+    }
+    if (completedCleanly && completedPF == 550 && submitSerial) {
+        macws_mark_agx_submit_serial_for_error_dump(submitSerial);
+    }
+    uint64_t cleanTotal = diagnostics && completedCleanly
+        ? atomic_fetch_add(&g_vnc_poll_clean_count, 1) + 1
+        : (diagnostics ? atomic_load(&g_vnc_poll_clean_count) : 0);
+    uint64_t errorTotal = diagnostics && !completedCleanly
+        ? atomic_fetch_add(&g_vnc_poll_error_count, 1) + 1
+        : (diagnostics ? atomic_load(&g_vnc_poll_error_count) : 0);
+    uint64_t observedTotal = cleanTotal + errorTotal;
+    if (observedTotal &&
+        (observedTotal <= 32 || (observedTotal % 600) == 0)) {
+        fprintf(stderr,
+            "#### VNC-FLOW poll-result observed=%llu clean=%llu "
+            "error=%llu pf=%lu submitSerial=%llu status=%ld "
+            "code=%ld polls=%u\n",
+            (unsigned long long)observedTotal,
+            (unsigned long long)cleanTotal,
+            (unsigned long long)errorTotal, completedPF,
+            (unsigned long long)submitSerial,
+            (long)status, (long)errorCode, polls);
+    }
+    if (diagnostics && !completedCleanly && error && errorTotal <= 4) {
+        macws_log_failed_texture_descriptor(
+            texture, (__bridge const void *)commandBuffer, submitSerial);
+        NSString *errorDescription = [error description];
+        NSDictionary *errorUserInfo = [error userInfo];
+        fprintf(stderr,
+            "#### VNC-FLOW command-error #%llu description=%s "
+            "userInfo=%s\n",
+            (unsigned long long)errorTotal,
+            [errorDescription UTF8String] ?: "(nil)",
+            [[errorUserInfo description] UTF8String] ?: "(nil)");
+        if (errorTotal == 1)
+            macws_log_command_buffer_ivars(commandBuffer);
+        if (errorTotal == 1)
+            macws_dump_recent_agx_submit_serial(
+                "first-Metal-command-buffer-error",
+                (__bridge const void *)commandBuffer, submitSerial);
+    }
+    BOOL inspectFailedPF550 = deepCapture && completedPF == 550 &&
+        status == MTLCommandBufferStatusError &&
+        access("/tmp/macws_inspect_failed_pf550", F_OK) == 0;
+    if (completedCleanly || inspectFailedPF550) {
+        if (completedPF == 550) {
+            void *implementation =
+                *(void **)((char *)(__bridge void *)texture + 0x208);
+            IOSurfaceRef surface = (uintptr_t)implementation > 0x1000
+                ? *(IOSurfaceRef *)((char *)implementation + 0xa0) : NULL;
+            if (surface) {
+                if (inspectFailedPF550) {
+                    fprintf(stderr,
+                        "#### VNC-DIAGNOSTIC inspecting failed PF550 "
+                        "tex=%p cb=%p error=%p\n",
+                        (void *)texture, (void *)commandBuffer,
+                        (void *)error);
+                }
+                macws_vnc_track_final(texture, surface);
+            }
+        } else if (completedCleanly &&
+                   (completedPF == 80 || completedPF == 115)) {
+            if (!macws_vnc_publish_owned_texture(texture))
+                macws_vnc_on_composite(texture);
+        }
+    }
+    macws_vnc_release(commandBuffer);
+    macws_vnc_release(texture);
+}
+
+static void macws_vnc_enqueue_completion_observation(
+        id<MTLCommandBuffer> commandBuffer, id<MTLTexture> texture,
+        void *context, BOOL deepCapture, BOOL diagnostics,
+        uint64_t submitSerial) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_vnc_completion_pending_lock = [NSObject new];
+    });
+
+    BOOL replaced = NO;
+    @synchronized(g_vnc_completion_pending_lock) {
+        id oldCommand = g_vnc_completion_pending_command;
+        id oldTexture = g_vnc_completion_pending_texture;
+        replaced = oldCommand != nil || oldTexture != nil;
+        g_vnc_completion_pending_command = commandBuffer;
+        g_vnc_completion_pending_texture = texture;
+        g_vnc_completion_pending_context = context;
+        g_vnc_completion_pending_deep_capture = deepCapture;
+        g_vnc_completion_pending_diagnostics = diagnostics;
+        g_vnc_completion_pending_submit_serial = submitSerial;
+        macws_vnc_release(oldCommand);
+        macws_vnc_release(oldTexture);
+    }
+    if (diagnostics && replaced) {
+        uint64_t coalesced = atomic_fetch_add(&g_vnc_poll_drop_count, 1) + 1;
+        if (coalesced <= 32 || (coalesced % 600) == 0) {
+            fprintf(stderr,
+                "#### VNC-FLOW coalesced-latest #%llu context=%p "
+                "tex=%p\n",
+                (unsigned long long)coalesced, context, (void *)texture);
+        }
+    }
+    if (atomic_exchange(&g_vnc_completion_worker_running, 1)) return;
+
+    dispatch_async(macws_vnc_completion_observer_queue(), ^{
+        uint64_t lastObservationNS = 0;
+        for (;;) {
+            @autoreleasepool {
+                if (lastObservationNS != 0) {
+                    struct timespec now = {0};
+                    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+                        uint64_t nowNS = (uint64_t)now.tv_sec * NSEC_PER_SEC +
+                            (uint64_t)now.tv_nsec;
+                        uint64_t nextNS =
+                            lastObservationNS + 16ull * NSEC_PER_MSEC;
+                        if (nextNS > nowNS) {
+                            usleep((useconds_t)((nextNS - nowNS + 999u) /
+                                               1000u));
+                        }
+                    }
+                }
+
+                id<MTLCommandBuffer> pendingCommand = nil;
+                id<MTLTexture> pendingTexture = nil;
+                void *pendingContext = NULL;
+                BOOL pendingDeepCapture = NO;
+                BOOL pendingDiagnostics = NO;
+                uint64_t pendingSubmitSerial = 0;
+                @synchronized(g_vnc_completion_pending_lock) {
+                    if (!g_vnc_completion_pending_command ||
+                        !g_vnc_completion_pending_texture) {
+                        atomic_store(&g_vnc_completion_worker_running, 0);
+                        return;
+                    }
+                    pendingCommand = g_vnc_completion_pending_command;
+                    pendingTexture = g_vnc_completion_pending_texture;
+                    pendingContext = g_vnc_completion_pending_context;
+                    pendingDeepCapture =
+                        g_vnc_completion_pending_deep_capture;
+                    pendingDiagnostics =
+                        g_vnc_completion_pending_diagnostics;
+                    pendingSubmitSerial =
+                        g_vnc_completion_pending_submit_serial;
+                    g_vnc_completion_pending_command = nil;
+                    g_vnc_completion_pending_texture = nil;
+                }
+                struct timespec started = {0};
+                if (clock_gettime(CLOCK_MONOTONIC, &started) == 0) {
+                    lastObservationNS =
+                        (uint64_t)started.tv_sec * NSEC_PER_SEC +
+                        (uint64_t)started.tv_nsec;
+                }
+                macws_vnc_process_completion_observation(
+                    pendingCommand, pendingTexture, pendingContext,
+                    pendingDeepCapture, pendingDiagnostics,
+                    pendingSubmitSerial);
+            }
+        }
+    });
 }
 
 void macws_vnc_finish_update(void *context) {
@@ -2933,14 +3106,6 @@ void macws_vnc_finish_update(void *context) {
         return;
     }
 
-    if ((pixelFormat == 80 || pixelFormat == 115) &&
-        macws_is_owned_scanout_texture(texture) &&
-        !macws_vnc_admit_owned_observer()) {
-        macws_vnc_release(commandBuffer);
-        macws_vnc_release(texture);
-        return;
-    }
-
     if (!commandBuffer || ![commandBuffer respondsToSelector:@selector(status)]) {
         static int missingLog = 0;
         if (diagnostics && missingLog++ < 4) {
@@ -2964,22 +3129,6 @@ void macws_vnc_finish_update(void *context) {
     // seconds, but never waits, commits, or registers a post-commit handler.
     // This lets the initial PF80 frame reach the mmap before the VNC-only
     // session would otherwise enter its IOMFB PF550 capture cycle.
-    static _Atomic int pollInFlight = 0;
-    if (atomic_exchange(&pollInFlight, 1)) {
-        uint64_t dropped = diagnostics
-            ? atomic_fetch_add(&g_vnc_poll_drop_count, 1) + 1 : 0;
-        if (dropped && (dropped <= 32 || (dropped % 600) == 0)) {
-            fprintf(stderr,
-                "#### VNC-FLOW poll-drop #%llu finish=%llu context=%p "
-                "tex=%p pf=%lu accepted=%llu\n",
-                (unsigned long long)dropped, (unsigned long long)finish,
-                context, (void *)texture, pixelFormat,
-                (unsigned long long)atomic_load(&g_vnc_poll_accept_count));
-        }
-        macws_vnc_release(commandBuffer);
-        macws_vnc_release(texture);
-        return;
-    }
     uint64_t accepted = diagnostics
         ? atomic_fetch_add(&g_vnc_poll_accept_count, 1) + 1 : 0;
     uint64_t submitSerial = diagnostics
@@ -2994,129 +3143,12 @@ void macws_vnc_finish_update(void *context) {
             (unsigned long long)submitSerial,
             (unsigned long long)atomic_load(&g_vnc_poll_drop_count));
     }
-    dispatch_async(macws_vnc_completion_observer_queue(), ^{
-        @autoreleasepool {
-            MTLCommandBufferStatus status = [commandBuffer status];
-            unsigned polls = 0;
-            while (status != MTLCommandBufferStatusCompleted &&
-                   status != MTLCommandBufferStatusError && polls < 400) {
-                usleep(5000);
-                status = [commandBuffer status];
-                polls++;
-            }
-            NSError *error = status == MTLCommandBufferStatusError
-                ? [commandBuffer error] : nil;
-            NSInteger errorCode = error ? [error code] : 0;
-            NSString *errorDomain = error ? [error domain] : nil;
-            unsigned long completedPF = (unsigned long)[texture pixelFormat];
-            static _Atomic int pollLog = 0;
-            int n = diagnostics ? atomic_fetch_add(&pollLog, 1) : INT_MAX;
-            if (n < 16) {
-                // Runtime-confirmed by
-                // WindowServer-2026-07-26-161536.ips: formatting one private
-                // Metal NSError walked a damaged userInfo graph and crashed in
-                // _CFErrorFormatDebugDescriptionAux -> objc_msgSend at 0x10.
-                // The observer only needs completion status; do not traverse
-                // an error object owned by the simulator compatibility layer.
-                fprintf(stderr,
-                    "#### VNC-ENDUPDATE-POLL #%d context=%p tex=%p pf=%lu "
-                    "cb=%p status=%ld polls=%u error=%p domain=%p code=%ld\n",
-                    n, context, (void *)texture, completedPF,
-                    (void *)commandBuffer, (long)status, polls,
-                    (void *)error, (void *)errorDomain, (long)errorCode);
-            }
-            BOOL completedCleanly =
-                status == MTLCommandBufferStatusCompleted && !error;
-            if (completedCleanly)
-                macws_publish_graphics_ready_once();
-            if (completedPF == 550) {
-                macws_observe_pf550_metadata(texture, submitSerial,
-                                             completedCleanly);
-            }
-            if (completedCleanly && completedPF == 550 && submitSerial) {
-                macws_mark_agx_submit_serial_for_error_dump(submitSerial);
-            }
-            uint64_t cleanTotal = diagnostics && completedCleanly
-                ? atomic_fetch_add(&g_vnc_poll_clean_count, 1) + 1
-                : (diagnostics ? atomic_load(&g_vnc_poll_clean_count) : 0);
-            uint64_t errorTotal = diagnostics && !completedCleanly
-                ? atomic_fetch_add(&g_vnc_poll_error_count, 1) + 1
-                : (diagnostics ? atomic_load(&g_vnc_poll_error_count) : 0);
-            uint64_t observedTotal = cleanTotal + errorTotal;
-            if (observedTotal &&
-                (observedTotal <= 32 || (observedTotal % 600) == 0)) {
-                fprintf(stderr,
-                    "#### VNC-FLOW poll-result observed=%llu clean=%llu "
-                    "error=%llu pf=%lu submitSerial=%llu status=%ld "
-                    "code=%ld polls=%u\n",
-                    (unsigned long long)observedTotal,
-                    (unsigned long long)cleanTotal,
-                    (unsigned long long)errorTotal, completedPF,
-                    (unsigned long long)submitSerial,
-                    (long)status, (long)errorCode, polls);
-            }
-            if (diagnostics && !completedCleanly && error &&
-                errorTotal <= 4) {
-                macws_log_failed_texture_descriptor(
-                    texture, (__bridge const void *)commandBuffer,
-                    submitSerial);
-                NSString *errorDescription = [error description];
-                NSDictionary *errorUserInfo = [error userInfo];
-                fprintf(stderr,
-                    "#### VNC-FLOW command-error #%llu description=%s "
-                    "userInfo=%s\n",
-                    (unsigned long long)errorTotal,
-                    [errorDescription UTF8String] ?: "(nil)",
-                    [[errorUserInfo description] UTF8String] ?: "(nil)");
-                if (errorTotal == 1)
-                    macws_log_command_buffer_ivars(commandBuffer);
-                if (errorTotal == 1)
-                    macws_dump_recent_agx_submit_serial(
-                        "first-Metal-command-buffer-error",
-                        (__bridge const void *)commandBuffer,
-                        submitSerial);
-            }
-            // TEMPORARY DIAGNOSTIC, not a compositor fix.  A failed source is
-            // never eligible for the normal capture path: runtime input logs
-            // showed failed PF550 buffers replacing several clean buffers and
-            // decoding to the driver's solid ff00ffff error image.  Keep the
-            // old inspection facility behind its own explicit sentinel so a
-            // capture request alone cannot poison the completed-source slot.
-            BOOL inspectFailedPF550 = deepCapture && completedPF == 550 &&
-                status == MTLCommandBufferStatusError &&
-                access("/tmp/macws_inspect_failed_pf550", F_OK) == 0;
-            if (completedCleanly || inspectFailedPF550) {
-                if (completedPF == 550) {
-                    void *impl = *(void **)((char *)(__bridge void *)texture + 0x208);
-                    IOSurfaceRef surface = (uintptr_t)impl > 0x1000
-                        ? *(IOSurfaceRef *)((char *)impl + 0xa0) : NULL;
-                    if (surface) {
-                        if (inspectFailedPF550) {
-                            fprintf(stderr,
-                                "#### VNC-DIAGNOSTIC inspecting failed PF550 "
-                                "tex=%p cb=%p error=%p\n",
-                                (void *)texture, (void *)commandBuffer,
-                                (void *)error);
-                        }
-                        macws_vnc_track_final(texture, surface);
-                    }
-                } else if (completedCleanly &&
-                           (completedPF == 80 || completedPF == 115)) {
-                    // Process-owned scanouts are already linear and this is
-                    // the producer-completion boundary. Publish them by CPU
-                    // copy here. The helper returns YES for every owned
-                    // target, including an invalid/blank one, so no rejected
-                    // owned frame can fall through to the unsafe legacy GPU
-                    // blit on another queue.
-                    if (!macws_vnc_publish_owned_texture(texture))
-                        macws_vnc_on_composite(texture);
-                }
-            }
-            macws_vnc_release(commandBuffer);
-            macws_vnc_release(texture);
-            atomic_store(&pollInFlight, 0);
-        }
-    });
+    // Ownership of both retained objects transfers to the one-deep latest
+    // queue.  Replacing a pending source releases it immediately; the worker
+    // releases the selected pair after observing producer completion.
+    macws_vnc_enqueue_completion_observation(
+        commandBuffer, texture, context, deepCapture, diagnostics,
+        submitSerial);
 }
 
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge

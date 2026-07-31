@@ -83,6 +83,8 @@ echo === killing display and interop bridges ===
 killall -9 macwsdisplayd 2>/dev/null
 killall -9 macwsinteropd 2>/dev/null
 rm -f /var/mnt/rootfs/private/tmp/macws_window_metrics.*.bin 2>/dev/null
+rm -f /var/mnt/rootfs/private/tmp/macws_menu_client.*.sock 2>/dev/null
+rm -f /var/mnt/rootfs/private/tmp/macws_menu_snapshot.*.bin 2>/dev/null
 
 echo === killing orphan build/debug scripts ===
 for pat in 'sh /tmp/' oslog build_on_ios.sh find_crash.sh '/var/jb/usr/bin/lldb' \

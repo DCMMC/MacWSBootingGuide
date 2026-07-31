@@ -1,0 +1,40 @@
+[macos_gui] watchdog: thermal sample: thermal-state=nominal raw=0 low-power=no battery-temp-centic=3129 virtual-temp-centic=3129 effective-temp-centic=3129 uptime=43328.385
+[macos_gui] watchdog: thermal sample: thermal-state=nominal raw=0 low-power=no battery-temp-centic=3150 virtual-temp-centic=3150 effective-temp-centic=3150 uptime=43617.773
+[macos_gui] watchdog: thermal sample: thermal-state=nominal raw=0 low-power=no battery-temp-centic=3319 virtual-temp-centic=3319 effective-temp-centic=3319 uptime=43917.404
+{
+  "result": "PASS",
+  "transport": "MacWSInputRecord-v4 (no RFB)",
+  "pid": 47545,
+  "window": 37,
+  "requested_hz": 60.0,
+  "duration_s": 10.003220796585083,
+  "move_records_sent": 600,
+  "drag_events_received": 599,
+  "drag_delivery_hz": 59.88071364019953,
+  "coalesced_or_missing_moves": 1,
+  "latency_ms": {
+    "p50": 0.5647090001730248,
+    "p95": 0.8062089982558973,
+    "maximum": 11.386542006221134
+  },
+  "ordered_boundaries": [
+    "left_down",
+    "left_up"
+  ]
+}
+MACWS-DISPLAY throughput stream=6 window=15 frames=1800 elapsed=364.318 fps=4.94 outstanding=2 dropped=1644
+MACWS-DISPLAY throughput stream=6 window=15 frames=1920 elapsed=389.770 fps=4.92 outstanding=2 dropped=1763
+MACWS-DISPLAY throughput stream=6 window=15 frames=2040 elapsed=410.070 fps=4.97 outstanding=2 dropped=1828
+MACWS-DISPLAY throughput stream=6 window=37 frames=120 elapsed=16.142 fps=7.37 outstanding=3 dropped=15
+MACWS-DISPLAY throughput stream=6 window=37 frames=240 elapsed=37.743 fps=6.33 outstanding=2 dropped=51
+MACWS-DISPLAY throughput stream=6 window=37 frames=360 elapsed=71.199 fps=5.04 outstanding=3 dropped=86
+MACWS-DISPLAY throughput stream=6 window=37 frames=480 elapsed=74.462 fps=6.43 outstanding=3 dropped=128
+MACWS-DISPLAY throughput stream=6 window=37 frames=600 elapsed=77.678 fps=7.71 outstanding=3 dropped=161
+1785424436.257 display-perf stream=6 sequence=1680 capture-to-receipt-ms=101.529 receipt-to-submit-ms=3.282 submit-to-complete-ms=2.054 status=4 error=nil
+1785424462.917 display-perf stream=6 sequence=1800 capture-to-receipt-ms=101.157 receipt-to-submit-ms=3.087 submit-to-complete-ms=2.363 status=4 error=nil
+1785424488.368 display-perf stream=6 sequence=1920 capture-to-receipt-ms=101.087 receipt-to-submit-ms=2.549 submit-to-complete-ms=1.804 status=4 error=nil
+1785483578.574 display-perf stream=6 sequence=120 capture-to-receipt-ms=1.454 receipt-to-submit-ms=7.567 submit-to-complete-ms=1.913 status=4 error=nil
+1785483600.167 display-perf stream=6 sequence=240 capture-to-receipt-ms=1.067 receipt-to-submit-ms=0.718 submit-to-complete-ms=1.463 status=4 error=nil
+1785483633.695 display-perf stream=6 sequence=360 capture-to-receipt-ms=72.041 receipt-to-submit-ms=2.268 submit-to-complete-ms=1.579 status=4 error=nil
+1785483636.889 display-perf stream=6 sequence=480 capture-to-receipt-ms=0.863 receipt-to-submit-ms=4.685 submit-to-complete-ms=1.544 status=4 error=nil
+1785483640.156 display-perf stream=6 sequence=600 capture-to-receipt-ms=52.917 receipt-to-submit-ms=3.804 submit-to-complete-ms=1.325 status=4 error=nil

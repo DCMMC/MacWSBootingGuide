@@ -6,6 +6,7 @@
 
 #define MACWS_CONTROL_KEY_OP "op"
 #define MACWS_CONTROL_KEY_APP_ID "app_id"
+#define MACWS_CONTROL_KEY_APP_PATH "app_path"
 #define MACWS_CONTROL_KEY_EXPERIMENTAL "experimental"
 
 #define MACWS_CONTROL_OP_STATUS "status"
@@ -14,6 +15,7 @@
 #define MACWS_CONTROL_OP_REPAIR "repair"
 #define MACWS_CONTROL_OP_RECOVER "recover"
 #define MACWS_CONTROL_OP_LAUNCH_APP "launch-app"
+#define MACWS_CONTROL_OP_LAUNCH_PATH "launch-path"
 #define MACWS_CONTROL_OP_CAPTURE "capture"
 #define MACWS_CONTROL_OP_LOGS "logs"
 

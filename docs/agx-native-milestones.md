@@ -2134,3 +2134,29 @@ a no-GUI watchdog invocation later armed at `nominal`/34.39 C, exited cleanly
 when no WindowServer job existed, left no residual process/state, and confirmed
 that the disable option returns 64. Exact output and policy history are in
 [`thermal-watchdogs-20260730/`](evidence/thermal-watchdogs-20260730/README.md).
+
+## 2026-07-31: native Host follows AppKit tab-window identity
+
+The apparently ignored Terminal tab clicks were not failed AppKit input.
+Runtime diagnostics hit the real `NSTabBar`, returned from mouse-down in
+50.405 ms and completed the atomic tap; the CoreGraphics catalog then showed a
+different tab-member `NSWindow` on screen. Terminal implements selection by
+swapping its front CGWindowID, while the iPad Scene had continued capturing
+and targeting the old ID. LLDB found the supposedly frozen main thread waiting
+normally in `_DPSNextEvent`.
+
+Window-metrics protocol v2 now publishes a stable identity derived from the
+real `NSWindowTabGroup`; `macwsdisplayd` carries it into the catalog and every
+Scene persists it. After a completed input, a Scene resolves the current
+on-screen member and changes both DisplayStream subscription and input target
+together. Forty-two production tab transitions followed all four native
+windows with mean 84.881-ms identity-update latency, no post-fix transport
+failure and stable Host/display-daemon RSS. Restarting the input daemon and
+clicking again also succeeded after a bounded Host datagram reconnect.
+
+The package post-install now copies the signed libraries and bridge daemons
+from package storage into the mounted rootfs on fresh inodes, eliminating the
+observed cold-deployment split where a newly installed protocol v2 package
+still ran protocol v1 from the chroot. Full logs, LLDB frames, resource
+measurements and thermal evidence are in
+[`terminal-tab-window-identity.md`](evidence/input-unification-20260731/terminal-tab-window-identity.md).

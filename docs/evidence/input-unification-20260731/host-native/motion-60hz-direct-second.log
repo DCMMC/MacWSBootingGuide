@@ -1,0 +1,41 @@
+{
+  "result": "PASS",
+  "transport": "MacWSInputRecord-v4 (no RFB)",
+  "pid": 47545,
+  "window": 37,
+  "requested_hz": 60.0,
+  "duration_s": 4.003443002700806,
+  "move_records_sent": 240,
+  "drag_events_received": 240,
+  "drag_delivery_hz": 59.94839937476093,
+  "coalesced_or_missing_moves": 0,
+  "latency_ms": {
+    "p50": 0.6003756716381758,
+    "p95": 0.8405003318330273,
+    "maximum": 8.297333668451756
+  },
+  "ordered_boundaries": [
+    "left_down",
+    "left_up"
+  ]
+}
+/var/mobile/Library/Logs/MacWSHost.log:1785424118.747 display-perf stream=6 sequence=120 capture-to-receipt-ms=1.774 receipt-to-submit-ms=3.484 submit-to-complete-ms=1.901 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424141.773 display-perf stream=6 sequence=240 capture-to-receipt-ms=2.206 receipt-to-submit-ms=3.994 submit-to-complete-ms=1.837 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424164.291 display-perf stream=6 sequence=360 capture-to-receipt-ms=202.825 receipt-to-submit-ms=1.404 submit-to-complete-ms=1.406 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424164.683 display-perf stream=6 sequence=360 capture-to-receipt-ms=202.825 receipt-to-submit-ms=393.038 submit-to-complete-ms=1.633 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424189.143 display-perf stream=6 sequence=480 capture-to-receipt-ms=206.465 receipt-to-submit-ms=1.323 submit-to-complete-ms=2.424 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424212.578 display-perf stream=6 sequence=600 capture-to-receipt-ms=1.638 receipt-to-submit-ms=7.096 submit-to-complete-ms=2.990 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424212.667 display-perf stream=6 sequence=600 capture-to-receipt-ms=1.638 receipt-to-submit-ms=97.839 submit-to-complete-ms=1.373 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424237.220 display-perf stream=6 sequence=720 capture-to-receipt-ms=101.431 receipt-to-submit-ms=6.249 submit-to-complete-ms=2.350 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424262.953 display-perf stream=6 sequence=840 capture-to-receipt-ms=202.750 receipt-to-submit-ms=1.749 submit-to-complete-ms=1.827 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424286.985 display-perf stream=6 sequence=960 capture-to-receipt-ms=304.634 receipt-to-submit-ms=4.830 submit-to-complete-ms=1.852 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424311.220 display-perf stream=6 sequence=1080 capture-to-receipt-ms=304.708 receipt-to-submit-ms=1.104 submit-to-complete-ms=2.185 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424336.367 display-perf stream=6 sequence=1200 capture-to-receipt-ms=1.317 receipt-to-submit-ms=0.499 submit-to-complete-ms=1.403 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424360.710 display-perf stream=6 sequence=1320 capture-to-receipt-ms=202.680 receipt-to-submit-ms=3.385 submit-to-complete-ms=1.951 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424385.054 display-perf stream=6 sequence=1440 capture-to-receipt-ms=205.210 receipt-to-submit-ms=2.655 submit-to-complete-ms=2.171 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424410.208 display-perf stream=6 sequence=1560 capture-to-receipt-ms=202.353 receipt-to-submit-ms=8.654 submit-to-complete-ms=4.160 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424436.257 display-perf stream=6 sequence=1680 capture-to-receipt-ms=101.529 receipt-to-submit-ms=3.282 submit-to-complete-ms=2.054 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424462.917 display-perf stream=6 sequence=1800 capture-to-receipt-ms=101.157 receipt-to-submit-ms=3.087 submit-to-complete-ms=2.363 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785424488.368 display-perf stream=6 sequence=1920 capture-to-receipt-ms=101.087 receipt-to-submit-ms=2.549 submit-to-complete-ms=1.804 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785483578.574 display-perf stream=6 sequence=120 capture-to-receipt-ms=1.454 receipt-to-submit-ms=7.567 submit-to-complete-ms=1.913 status=4 error=nil
+/var/mobile/Library/Logs/MacWSHost.log:1785483600.167 display-perf stream=6 sequence=240 capture-to-receipt-ms=1.067 receipt-to-submit-ms=0.718 submit-to-complete-ms=1.463 status=4 error=nil

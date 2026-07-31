@@ -14,6 +14,7 @@ Example for a 2388x1668 Terminal desktop::
 
 import argparse
 import hashlib
+import os
 import select
 import socket
 import struct
@@ -58,9 +59,30 @@ def request_and_wait(sock, width, height, framebuffer, previous_digest,
                               if rectangle[4] == 0]
             raw_pixels = sum(rectangle[2] * rectangle[3]
                              for rectangle in raw_rectangles)
+            encoded_pixels = sum(rectangle[2] * rectangle[3]
+                                 for rectangle in rectangles_seen
+                                 if rectangle[4] >= 0)
+            encoded = [rectangle for rectangle in rectangles_seen
+                       if rectangle[4] >= 0]
+            if encoded:
+                x1 = min(rectangle[0] for rectangle in encoded)
+                y1 = min(rectangle[1] for rectangle in encoded)
+                x2 = max(rectangle[0] + rectangle[2]
+                         for rectangle in encoded)
+                y2 = max(rectangle[1] + rectangle[3]
+                         for rectangle in encoded)
+                encoded_bounds = f"{x1},{y1},{x2 - x1},{y2 - y1}"
+            else:
+                encoded_bounds = "none"
+            if os.environ.get("MACWS_TRACE_RECTS"):
+                print(f"RECTANGLES operation={operation} values={encoded}",
+                      flush=True)
             print(
                 f"INPUT PASS operation={operation} latency={latency:.3f}s "
                 f"updates={nonempty_updates} empty_updates={empty_updates} "
+                f"rectangles={len(rectangles_seen)} "
+                f"encoded_pixels={encoded_pixels} "
+                f"encoded_bounds={encoded_bounds} "
                 f"raw_rectangles={len(raw_rectangles)} "
                 f"raw_pixels={raw_pixels} digest={current_digest}",
                 flush=True)
@@ -173,6 +195,8 @@ def main():
     parser.add_argument("--drag-steps", type=int, default=8)
     parser.add_argument("--drag-step-delay", type=float, default=0.02)
     parser.add_argument("--key-delay", type=float, default=0.015)
+    parser.add_argument("--click-hold", type=float, default=0.04,
+                        help="seconds between pointer down/up (default: 0.04)")
     parser.add_argument("--settle-seconds", type=float, default=1.5,
                         help="retain later incremental frames before saving "
                              "the result (default: 1.5)")
@@ -193,6 +217,9 @@ def main():
                         metavar=("X", "Y"),
                         help="send one button-free RFB pointer move")
     parser.add_argument("--text")
+    parser.add_argument("--capture-only", action="store_true",
+                        help="save/describe one fresh non-incremental frame "
+                             "without sending input")
     parser.add_argument("--output", help="save the final retained framebuffer")
     args = parser.parse_args()
 
@@ -200,10 +227,12 @@ def main():
     content_drag = parse_drag(parser, args.content_drag, "--content-drag")
     if (title_drag is None and content_drag is None and
             args.right_click is None and args.left_click is None and
-            args.move is None and args.text is None):
+            args.move is None and args.text is None and
+            not args.capture_only):
         parser.error("select at least one input operation")
     if (args.timeout <= 0 or args.max_updates < 1 or args.drag_steps < 1 or
             args.drag_step_delay < 0 or args.key_delay < 0 or
+            args.click_hold < 0 or
             args.settle_seconds < 0):
         parser.error("timeouts/steps must be positive and delays nonnegative")
 
@@ -223,6 +252,14 @@ def main():
               f"initial_rectangles={len(initial)} "
               f"initial_pixels={initial_pixels} digest={digest}",
               flush=True)
+
+        if args.capture_only:
+            if args.output:
+                vnc_live_click.save_frame(
+                    args.output, width, height, framebuffer, "capture")
+            print(f"INPUT PASS operations=0 capture_only=YES "
+                  f"final_digest={digest}", flush=True)
+            return
 
         operations = []
         if title_drag is not None:
@@ -246,7 +283,7 @@ def main():
             check_point(width, height, *right_click)
             vnc_live_click.request_update(sock, width, height, True)
             started = time.monotonic()
-            send_pointer_click(sock, right_click, 4)
+            send_pointer_click(sock, right_click, 4, args.click_hold)
             digest, _ = request_and_wait(
                 sock, width, height, framebuffer, digest, "right-click",
                 started, args.timeout, args.max_updates)
@@ -257,7 +294,7 @@ def main():
             check_point(width, height, *left_click)
             vnc_live_click.request_update(sock, width, height, True)
             started = time.monotonic()
-            send_pointer_click(sock, left_click, 1)
+            send_pointer_click(sock, left_click, 1, args.click_hold)
             digest, _ = request_and_wait(
                 sock, width, height, framebuffer, digest, "left-click",
                 started, args.timeout, args.max_updates)

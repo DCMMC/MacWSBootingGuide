@@ -145,6 +145,19 @@ add_all_trustcache() {
     add_x86_64_trustcache "$path"
 }
 
+# Give a stock macOS image the project code-signing policy once, then restore
+# only its persistent CDHashes on subsequent repairs/reboots.  The entitlement
+# marker avoids repeatedly changing the file and accumulating obsolete hashes.
+ensure_project_signature_and_trustcache() {
+    local path="$1"
+    [ -f "$path" ] || return 0
+    if ! ldid -e "$path" 2>/dev/null |
+         grep -q '<key>com.apple.private.graphics-restart-no-kill</key>'; then
+        ldid -S"$ENT" -M "$path" || return 1
+    fi
+    add_all_trustcache "$path"
+}
+
 # Re-register every already-signed executable Mach-O in an application bundle.
 #
 # Dynamic jailbreak trustcaches are lost across a device reboot, while the
@@ -300,6 +313,20 @@ mkdir -p "/var/mnt/rootfs/Users/Shared/MacWS Imports"
 chown mobile:mobile "/var/mnt/rootfs/Users/Shared/MacWS Imports" 2>/dev/null || true
 chmod 0770 "/var/mnt/rootfs/Users/Shared/MacWS Imports"
 add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor'
+# Finder keeps its stock macOS Apple signature on a fresh rootfs.  The iOS
+# kernel runtime-confirmed that signature is rejected with
+# "unsuitable CT policy 0x8 for this platform/device" before Finder reaches
+# AppKit.  Sign it once with the same project entitlement profile used by the
+# other chroot applications, then only restore the persistent CDHash on later
+# postinst/cold-start repairs.  The entitlement probe avoids repeatedly
+# changing the signed file and accumulating obsolete trustcache entries.
+FINDER_BIN='/var/mnt/rootfs/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder'
+ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
+# Finder's TimelineUI dependency is not present in the iOS dyld shared cache.
+# Once Finder itself passed AMFI, dyld runtime-confirmed this exact on-disk
+# image was the next rejected arm64e dependency.
+ensure_project_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI' || exit 1
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
 add_all_trustcache /var/mnt/rootfs/bin/ps
@@ -320,6 +347,10 @@ add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fra
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset_base
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+# GlassDemo is launched directly by macwshostd before libmachook can ask
+# autosignd for help. Its persistent signature survives reboot, while
+# Dopamine's dynamic trustcache does not.
+add_all_trustcache /var/mnt/rootfs/tmp/GlassDemo
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/.jbroot/usr/lib/libroot.dylib
 # VS Code's main executable is not enough after a reboot: dyld must admit its
 # Electron/Squirrel/Mantle/ReactiveObjC frameworks before any injected repair

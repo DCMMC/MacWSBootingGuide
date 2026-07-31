@@ -1,0 +1,76 @@
+INPUTLAB_PID=47545
+{
+  "result": "PASS",
+  "transport": "MacWSInputRecord-v4 (no RFB)",
+  "pid": 47545,
+  "window": 37,
+  "frame": [
+    1728,
+    1312
+  ],
+  "records_sent": 31,
+  "events_received": 33,
+  "events": [
+    "entered",
+    "left_down",
+    "left_up",
+    "left_down",
+    "left_drag",
+    "left_drag",
+    "left_drag",
+    "left_drag",
+    "left_drag",
+    "left_drag",
+    "left_drag",
+    "left_drag",
+    "left_up",
+    "right_down",
+    "right_up",
+    "scroll",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_up",
+    "key_down",
+    "key_up"
+  ],
+  "keyboard_characters": [
+    "a",
+    "A",
+    "B",
+    "c",
+    "m",
+    "\t",
+    "",
+    "\r",
+    "\u001b"
+  ],
+  "keyboard_modifiers": [
+    0,
+    131072,
+    65536,
+    262144,
+    1048576,
+    0,
+    0,
+    0,
+    0
+  ],
+  "command_key_up": "delivered to NSApplication; consumed before responder",
+  "latency_ms": {
+    "minimum": 0.03762499545700848,
+    "maximum": 57.067959001869895,
+    "average": 17.722596365880843
+  }
+}

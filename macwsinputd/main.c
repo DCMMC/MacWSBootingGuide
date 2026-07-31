@@ -46,9 +46,6 @@ extern void CGEventSetIntegerValueField(CGEventRef event, CGEventField field,
                                         int64_t value);
 extern void CGEventPost(CGEventTapLocation tap, CGEventRef event);
 extern void CGEventPostToPid(pid_t pid, CGEventRef event);
-extern CGEventRef CGEventCreateScrollWheelEvent(const void *source,
-                                                uint32_t units,
-                                                uint32_t wheelCount, ...);
 extern bool CGPreflightPostEventAccess(void);
 extern CFArrayRef CGWindowListCopyWindowInfo(CGWindowListOption option,
                                              CGWindowID relativeToWindow);
@@ -136,6 +133,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindSecondaryTap: return "secondary-tap";
         case MacWSInputKindScroll: return "scroll";
         case MacWSInputKindConfigureWindow: return "configure-window";
+        case MacWSInputKindCloseWindow: return "close-window";
     }
     return "invalid";
 }
@@ -145,7 +143,12 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->version != MACWS_INPUT_VERSION ||
         !isfinite(record->x) || !isfinite(record->y) ||
         record->frameWidth == 0 || record->frameHeight == 0 ||
-        record->targetPID < 0) {
+        record->targetPID < 0 ||
+        record->source > MacWSInputSourceVNC ||
+        !isfinite(record->altitude) || !isfinite(record->azimuth) ||
+        !isfinite(record->tiltX) || !isfinite(record->tiltY) ||
+        record->tiltX < -1.0f || record->tiltX > 1.0f ||
+        record->tiltY < -1.0f || record->tiltY > 1.0f) {
         return false;
     }
     if (record->kind == MacWSInputKindConfigureWindow) {
@@ -155,6 +158,17 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
                record->x <= 16384.0f && record->y <= 16384.0f &&
                isfinite(record->pressure) &&
                record->pressure >= 0.5f && record->pressure <= 4.0f;
+    }
+    if (record->kind == MacWSInputKindCloseWindow) {
+        return record->targetPID > 1 &&
+               MacWSInputWindowIDForScene(record->sceneID) != 0;
+    }
+    if (record->kind == MacWSInputKindScroll) {
+        float horizontal = 0.0f;
+        memcpy(&horizontal, &record->contactID, sizeof(horizontal));
+        if (!isfinite(record->pressure) || !isfinite(horizontal) ||
+            fabsf(record->pressure) > 16384.0f ||
+            fabsf(horizontal) > 16384.0f) return false;
     }
     if (
         record->x < 0.0f || record->y < 0.0f ||
@@ -205,6 +219,7 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindKeyUp:
         case MacWSInputKindScroll:
         case MacWSInputKindConfigureWindow:
+        case MacWSInputKindCloseWindow:
             // Consumed before event construction in main().
             return 0;
     }
@@ -310,6 +325,87 @@ static uint64_t RealtimeNanoseconds(void) {
     return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
 }
 
+static void SignalInteractionWake(void) {
+    static int wakeFD = -1;
+    if (wakeFD < 0) {
+        wakeFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (wakeFD >= 0) {
+            (void)fcntl(wakeFD, F_SETFD, FD_CLOEXEC);
+            int flags = fcntl(wakeFD, F_GETFL, 0);
+            if (flags >= 0) {
+                (void)fcntl(wakeFD, F_SETFL, flags | O_NONBLOCK);
+            }
+        }
+    }
+    if (wakeFD < 0) return;
+
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    address.sun_len = sizeof(address);
+    strlcpy(address.sun_path, MACWS_INTERACTION_WAKE_SOCKET_PATH,
+            sizeof(address.sun_path));
+    const uint8_t token = 1;
+    if (sendto(wakeFD, &token, sizeof(token), MSG_DONTWAIT,
+               (const struct sockaddr *)&address, sizeof(address)) < 0 &&
+        (errno == EBADF || errno == ENOTSOCK)) {
+        close(wakeFD);
+        wakeFD = -1;
+    }
+}
+
+// WindowServer's coexistence completion scaffold deliberately idles at 10 Hz
+// to avoid holding the native AGX stack hot while nothing is changing.  VNC
+// already publishes this boot-relative activity witness, but the iPad-native
+// Host used to leave it untouched, so a live touch/keyboard session remained
+// stuck at the idle 100-ms interval.  Publish the same transport-neutral
+// interaction timestamp from the central broker.  Writes are bounded to 120
+// Hz and happen before target probing, so even the first click selects the
+// 16.667-ms interactive interval at WindowServer's next SwapEnd boundary.
+static void NoteUserInteraction(void) {
+    static int activityFD = -1;
+    static uint64_t lastWriteNanoseconds = 0;
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    uint64_t nanoseconds = (uint64_t)now.tv_sec * 1000000000ull +
+        (uint64_t)now.tv_nsec;
+    const uint64_t minimumInterval = 8ull * 1000000ull;
+    if (lastWriteNanoseconds != 0 && nanoseconds > lastWriteNanoseconds &&
+        nanoseconds - lastWriteNanoseconds < minimumInterval) return;
+    lastWriteNanoseconds = nanoseconds;
+
+    if (activityFD < 0) {
+        activityFD = open("/private/tmp/macws_vnc_activity",
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    }
+    if (activityFD >= 0 &&
+        pwrite(activityFD, &nanoseconds, sizeof(nanoseconds), 0) !=
+            (ssize_t)sizeof(nanoseconds)) {
+        close(activityFD);
+        activityFD = -1;
+    }
+    SignalInteractionWake();
+}
+
+static void SendInputAcknowledgement(
+        int socketFD, const struct sockaddr_un *sender,
+        socklen_t senderLength, const MacWSInputRecord *record,
+        uint32_t flags) {
+    if (!sender || !record || senderLength <= sizeof(sa_family_t) ||
+        sender->sun_family != AF_UNIX || sender->sun_path[0] == '\0' ||
+        record->source != MacWSInputSourceVNC ||
+        record->sampleSequence == 0) return;
+    MacWSInputAck acknowledgement = {
+        .magic = MACWS_INPUT_ACK_MAGIC,
+        .version = MACWS_INPUT_ACK_VERSION,
+        .size = sizeof(MacWSInputAck),
+        .sampleSequence = record->sampleSequence,
+        .flags = flags,
+    };
+    (void)sendto(socketFD, &acknowledgement, sizeof(acknowledgement),
+                 MSG_DONTWAIT, (const struct sockaddr *)sender,
+                 senderLength);
+}
+
 static bool SendToAppInputBridge(int socketFD,
                                  const MacWSInputRecord *record,
                                  int *errorOut) {
@@ -329,7 +425,7 @@ static bool SendToAppInputBridge(int socketFD,
     bool continuous = record->kind == MacWSInputKindTouchMove ||
                       record->kind == MacWSInputKindHover ||
                       record->kind == MacWSInputKindMenuHover;
-    unsigned attempts = continuous ? 1 : 8;
+    unsigned attempts = continuous ? 1 : 2;
     ssize_t sent = -1;
     int savedError = 0;
     for (unsigned attempt = 0; attempt < attempts; attempt++) {
@@ -337,8 +433,12 @@ static bool SendToAppInputBridge(int socketFD,
                       (const struct sockaddr *)&address, sizeof(address));
         if (sent == (ssize_t)sizeof(*record)) break;
         savedError = sent < 0 ? errno : EMSGSIZE;
-        if (continuous) break;
-        usleep((useconds_t)(1000u * (attempt + 1)));
+        if (continuous || (savedError != EAGAIN && savedError != ENOBUFS) ||
+            attempt + 1 >= attempts) break;
+        // A transition must not sit behind a 1+2+...+8 ms blind retry loop.
+        // Wait once for actual socket writability, bounded to 2 ms, then retry.
+        struct pollfd descriptor = {.fd = socketFD, .events = POLLOUT};
+        if (poll(&descriptor, 1, 2) <= 0) break;
     }
     if (errorOut) *errorOut = sent == (ssize_t)sizeof(*record)
         ? 0 : savedError;
@@ -661,6 +761,13 @@ static MacWSWindowTarget ProbeActivationTarget(
 // This remains a request for observation only: WindowServer must ACK the exact
 // generation after publishing a real frame.
 static uint64_t ArmCaptureForInput(const MacWSInputRecord *record) {
+    // This file drives an expensive compositor observation path. Production
+    // DisplayStream delivery already publishes completed IOSurfaces and must
+    // not request another full-frame observation for every click/release.
+    // Metal_hooks.x:2807-2817 records the runtime-confirmed PF550 instability
+    // caused by an ordinary input creating this request. Keep it strictly as
+    // an opt-in diagnostic witness.
+    if (!RuntimeDiagnosticsEnabled()) return 0;
     if (record->kind != MacWSInputKindTouchUp &&
         record->kind != MacWSInputKindTouchCancel &&
         record->kind != MacWSInputKindTap) {
@@ -706,6 +813,9 @@ int main(void) {
         return 1;
     }
     InputSocketFD = socketFD;
+    int inputReceiveBuffer = 512 * 1024;
+    (void)setsockopt(socketFD, SOL_SOCKET, SO_RCVBUF,
+                     &inputReceiveBuffer, sizeof(inputReceiveBuffer));
 
     struct sockaddr_un address = {0};
     address.sun_family = AF_UNIX;
@@ -776,7 +886,11 @@ int main(void) {
     MacWSWindowTarget menuTarget = {0};
     while (!StopRequested) {
         MacWSInputRecord record = {0};
-        ssize_t received = recv(socketFD, &record, sizeof(record), 0);
+        struct sockaddr_un sender = {0};
+        socklen_t senderLength = sizeof(sender);
+        ssize_t received = recvfrom(socketFD, &record, sizeof(record), 0,
+                                    (struct sockaddr *)&sender,
+                                    &senderLength);
         if (received < 0) {
             // SIGTERM closes InputSocketFD to wake this blocking recv.  EBADF
             // is the expected half of that shutdown handshake, not a receiver
@@ -800,18 +914,22 @@ int main(void) {
             continue;
         }
 
+        NoteUserInteraction();
+
         // Window configuration is an exact-PID control-plane transaction.
         // It has no Quartz point and must remain usable while WindowServer is
         // still publishing or reconfiguring display geometry.
-        if (record.kind == MacWSInputKindConfigureWindow) {
+        if (record.kind == MacWSInputKindConfigureWindow ||
+            record.kind == MacWSInputKindCloseWindow) {
             int appBridgeError = 0;
             bool appBridgeSent = SendToAppInputBridge(
                 socketFD, &record, &appBridgeError);
             sequence++;
             if (RuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
-                    "MACWS-INPUT CONFIGURE seq=%llu target=%d window=%u "
-                    "size=%.1fx%.1f density=%.2f sent=%s errno=%d\n",
+                    "MACWS-INPUT WINDOW-CONTROL kind=%s seq=%llu target=%d "
+                    "window=%u size=%.1fx%.1f density=%.2f sent=%s errno=%d\n",
+                    KindName(record.kind),
                     (unsigned long long)sequence, record.targetPID,
                     MacWSInputWindowIDForScene(record.sceneID),
                     record.x, record.y, record.pressure,
@@ -864,10 +982,18 @@ int main(void) {
         }
         CGEventType eventType = EventTypeForRecord(&record, &buttonDown);
         MacWSWindowTarget eventTarget = {0};
+        uint32_t exactWindowID = MacWSInputWindowIDForScene(record.sceneID);
+        bool exactWindowRecord = record.targetPID > 1 && exactWindowID != 0;
         bool keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
         bool scrollRecord = record.kind == MacWSInputKindScroll;
-        if ((keyRecord || scrollRecord) && menuTarget.pid > 1) {
+        if (exactWindowRecord) {
+            // A native iPadOS Scene is permanently bound to one AppKit owner
+            // and window. Do not let a stale fullscreen hover/menu cache route
+            // its pointer or keyboard record into another application.
+            eventTarget.pid = record.targetPID;
+            eventTarget.windowID = (int32_t)exactWindowID;
+        } else if ((keyRecord || scrollRecord) && menuTarget.pid > 1) {
             // ActivateTarget is resolved before the authoritative native
             // mouse-down and remains the front application target after the
             // menu candidate ends.  Keyboard focus follows that application,
@@ -965,11 +1091,6 @@ int main(void) {
         bool appBridgeAttempted =
             record.kind != MacWSInputKindActivateTarget ||
             activationRepairNeeded || systemMenuPreflightNeeded;
-        // Scroll uses CoreGraphics' public per-process wheel-event route
-        // below.  Do not also enqueue the same ABI-v3 record into the AppKit
-        // mouse bridge, whose event factory intentionally handles buttons and
-        // pointer motion only.
-        if (scrollRecord) appBridgeAttempted = false;
         bool appBridgeSent = appBridgeAttempted &&
             SendToAppInputBridge(socketFD, &routedRecord, &appBridgeError);
         if ((record.kind == MacWSInputKindHover ||
@@ -984,6 +1105,27 @@ int main(void) {
         }
         if (record.kind == MacWSInputKindActivateTarget ||
             record.kind == MacWSInputKindDeactivateApplication) {
+            if (record.kind == MacWSInputKindActivateTarget) {
+                uint32_t acknowledgementFlags = 0;
+                if (eventTarget.pid <= 1) {
+                    acknowledgementFlags |= MacWSInputAckRouteFailed;
+                } else if (!activationRepairNeeded &&
+                           !systemMenuPreflightNeeded) {
+                    acknowledgementFlags |= MacWSInputAckTargetReady;
+                } else {
+                    acknowledgementFlags |= MacWSInputAckRepairQueued;
+                    if (systemMenuPreflightNeeded) {
+                        acknowledgementFlags |=
+                            MacWSInputAckMenuPreflight;
+                    }
+                    if (appBridgeAttempted && !appBridgeSent) {
+                        acknowledgementFlags |= MacWSInputAckRouteFailed;
+                    }
+                }
+                SendInputAcknowledgement(
+                    socketFD, &sender, senderLength, &record,
+                    acknowledgementFlags);
+            }
             sequence++;
             if (RuntimeDiagnosticsEnabled()) fprintf(stderr,
                     "MACWS-INPUT ACTIVATE seq=%llu kind=%s target=%d "
@@ -1023,22 +1165,14 @@ int main(void) {
             int32_t verticalPixels = (int32_t)lrintf(record.pressure);
             int32_t horizontalPixels = isfinite(horizontal)
                 ? (int32_t)lrintf(horizontal) : 0;
-            CGEventRef scrollEvent = eventTarget.pid > 1
-                ? CGEventCreateScrollWheelEvent(NULL, 0 /* pixel */, 2,
-                                                verticalPixels,
-                                                horizontalPixels)
-                : NULL;
-            if (scrollEvent) {
-                CGEventPostToPid(eventTarget.pid, scrollEvent);
-                CFRelease(scrollEvent);
-            }
             sequence++;
             if (RuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
-                    "MACWS-INPUT SCROLL seq=%llu target=%d delta=(%d,%d) posted=%s\n",
+                    "MACWS-INPUT SCROLL seq=%llu target=%d delta=(%d,%d) "
+                    "app-bridge=%s errno=%d\n",
                     (unsigned long long)sequence, eventTarget.pid,
                     horizontalPixels, verticalPixels,
-                    scrollEvent ? "YES" : "NO");
+                    appBridgeSent ? "YES" : "NO", appBridgeError);
                 fflush(stderr);
             }
             continue;

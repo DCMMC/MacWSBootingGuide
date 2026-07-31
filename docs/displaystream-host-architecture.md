@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-07-30；区分“已实现并本地构建确认”和“等待 iPad 运行确认”。
+> 文档状态：2026-07-31；单窗 IOSurface 直传和原生输入已在目标 iPad 运行确认，四窗、全屏直传与性能门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -16,18 +16,18 @@
 
 | 核心工作 | 非常简要的工作原理 | 当前状态 |
 |---|---|---|
-| DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 已实现；iPad 待验证 |
-| macOS 窗口 → iPadOS Scene | 每个 Scene 保存一个真实 `CGWindowID` 和 owner PID，独立订阅、恢复和释放 | 已实现；四窗待验证 |
+| DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 单窗已在 iPad runtime-confirmed；全屏直传待修复 |
+| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放 | 单窗、四标签身份跟随均已在 iPad runtime-confirmed |
 | 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | iPadOS 16.3.1 二进制 RE-confirmed；运行待验证 |
 | 无黑边显示 | 正常状态始终 edge-to-edge；宽高比短暂不一致时裁剪源纹理，不使用 aspect-fit | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
 | 缩放与精确操控 | 双指双击在 1× 与用户配置的 1.5×/2× 间切换；放大后默认移动视口，输入坐标同步映射到裁剪后的源纹理 | 已实现并有数学单测；原生 magnify 待验证 |
-| 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 已实现；设备兼容性待验证 |
+| 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 原生协议语义矩阵与 60 Hz 拖动已在 iPad 通过；真实 UI 手感继续回归 |
 | 全屏桌面手势 | 全屏工作区的屏幕虚拟触控板识别三指方向手势，发送一次性 macOS 桌面命令；外接妙控板保留 iPadOS 系统三指手势 | 规划；桌面命令路径与设备输入边界待验证 |
 | Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 全屏入口已实现；Scene 语义菜单待实现 |
 | 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
-| 性能与稳定性 | 每客户端最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 已实现；性能目标待实测 |
+| 性能与稳定性 | 每客户端最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 输入约 60 Hz/亚毫秒；画面当前约 38–40 个接受帧/秒，租约背压待优化 |
 
 ### 3. 端到端结构
 
@@ -40,7 +40,7 @@ macOS 应用进程
              │
              ▼
 macwsdisplayd（macOS 13.4 chroot）
-  ├─ 窗口目录：CGWindowID + owner PID + AppKit 最小尺寸
+  ├─ 窗口目录：CGWindowID + owner PID + logical group + AppKit 最小尺寸
   ├─ 全屏：CGDisplayStream
   └─ 单窗：SLSHWCaptureStreamCreateWithWindow
              │ IOSurface Mach right + 帧描述符；无 RFB 编解码
@@ -50,7 +50,7 @@ MacWSHost（iPadOS）
   ├─ IOSurface → MTLTexture → MTKView
   ├─ 无黑边视口、缩放、遮罩、密度选择
   └─ Scene 顶部语义菜单 / 触摸 / 全屏桌面手势 / 妙控键盘 / 拖放 / 剪贴板
-             │ 52-byte 有版本输入记录
+             │ 84-byte v4 有版本输入记录
              ▼
 macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 ```
@@ -69,7 +69,8 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 ### 1. Scene 与 macOS 窗口的关系
 
 - “新建窗口”面板列出当前可捕获的 macOS 顶层窗口。
-- 选择后创建一个新 `UIWindowScene`，Scene 的 `NSUserActivity` 持久化 `CGWindowID`、owner PID、最小尺寸、是否可缩放以及显示密度。
+- 选择后创建一个新 `UIWindowScene`，Scene 的 `NSUserActivity` 持久化当前 `CGWindowID`、owner PID、稳定逻辑窗口组、最小尺寸、是否可缩放以及显示密度。
+- AppKit 的标签页是多个 `NSWindow`，选中标签会更换前台 `CGWindowID`。AppInputBridge 从真实 `NSWindowTabGroup` 发布稳定逻辑组；一次输入完成后 Scene 刷新小型窗口目录，并在旧 ID 离屏时改订阅同 owner/组的前台成员。不能把 capture ID 当成用户窗口身份。
 - 全屏工作区使用 `windowID == 0`，用于桌面、全局菜单栏和尚未适配成独立 Scene 的窗口。
 - Scene 进入后台时取消订阅；Metal fence 完成后释放所有 IOSurface lease。恢复前不把旧截图当成可交互画面。
 - 第一阶段必须避免同一 `CGWindowID` 被两个前台 Scene 同时控制。后续应加入跨 Scene 的窗口所有权登记；重复打开时优先激活已有 Scene。
@@ -353,9 +354,9 @@ Metal 顶点始终覆盖 `[-1, 1] × [-1, 1]`，纹理坐标使用 `visibleSourc
 
 ### 5. 输入 ABI 与路由
 
-- `MacWSInputRecord` 保持 v3、固定 52 bytes。
+- `MacWSInputRecord` 当前为 v4、固定 84 bytes；接收端先校验 magic、version 与完整长度，不能把 v3/v4 数据报混读。
 - window Scene 使用 `sceneID` 的 bit 31 作为标记，高 32 位保存完整 `CGWindowID`，低 31 位保留修饰键。
-- configure-window 沿用固定记录的新 kind 15，没有改变旧接收端的结构长度。
+- configure-window 使用 v4 固定记录的 kind 15；旧 v3 接收端不属于兼容目标，必须由版本校验明确拒绝。
 - 坐标始终是当前 producer frame 的物理像素，不是 iPad point 或全桌面坐标。
 - AppInputBridge 每次事件都根据目标窗口当前 AppKit frame 做转换，不能缓存一个跨 resize 的旧 origin。
 - 控制记录、键盘、滚动和指针都先验证 magic/version/finite/范围/owner PID；失败需有可归因日志。
@@ -382,7 +383,7 @@ Host gesture recognizer
 
 ### 7. 菜单快照与动作协议（规划）
 
-菜单是低频、可变长控制面，不能塞进 52-byte 输入热路径，也不能为方便而复制未定稿结构体到 Host 和 AppInputBridge。建议单独定义版本化协议：
+菜单是低频、可变长控制面，不能塞进 84-byte v4 输入热路径，也不能为方便而复制未定稿结构体到 Host 和 AppInputBridge。建议单独定义版本化协议：
 
 ```text
 NSMainMenu
@@ -499,10 +500,19 @@ NSMainMenu
 
 这个结果只确认本机接受当前参数形状；它不能证明 macOS 13.4 chroot 会出帧，不能证明 IOSurface 能跨到 iPad Host，也不能用于推断性能。
 
-### 5. 等待 iPad 的运行确认
+### 5. iPad 运行确认与剩余门槛
 
-- macOS 13.4 单窗 stream 在目标 bootstrap/session 下开始并持续回调。
-- IOSurface Mach right 从 chroot 进入 iPadOS Host，且在原生 AGX device 上成功创建纹理。
+已确认（2026-07-31，`iPad13,6 / iPadOS 16.3.1`）：
+
+- runtime-confirmed via `MacWSHost.log`：窗口 37 的新 Scene 第一帧为 `frame=1770x1156 source=IOSurface status=4 error=nil`。它由 `macwsdisplayd` 的 `stream-start id=10 mode=2 window=37` 对应，不经过 RFB 编解码或全屏 mmap 上传。
+- Host 生产默认只接受 DisplayStream IOSurface。历史 `/tmp/macws_vnc_fb` 上传由 `MacWSLegacyFramebufferFallback` 显式偏好控制，默认关闭；单窗口模式即使打开该偏好也不会回退到全桌面截图。
+- runtime-confirmed via `host-native/motion-60hz-direct-10s.log`：600 个 move 中 599 个成为真实 AppKit drag，59.88 Hz，延迟 p50 0.565 ms、p95 0.806 ms；down/up 顺序完整。该测试直接发送 `MacWSInputRecord-v4`，没有 VNC 客户端。
+- runtime-confirmed via `host-native/semantic-matrix.json`：左键、拖动、右键、双轴滚动、普通/Shift/Caps/Control/Command 键与 Tab/Backspace/Return/Escape 的语义矩阵通过。
+- 当前画面性能尚未达标：关闭 `OSXvnc-server` 和全屏 mmap producer 后，同一动态窗口的接受序号 120→240 用时 3.210 秒（37.4 fps），240→360 用时 3.106 秒（38.6 fps）；producer 同期记录 `outstanding=2/3` 和持续 drop。带 VNC 会话的同负载为约 38–40 fps，因此 RFB/mmap 已被 A/B 排除为主因。这里只把剩余瓶颈归到 DisplayStream/lease/presentation 边界，具体根因仍需新的运行或 RE 证据。
+
+仍待确认或修复：
+
+- 全屏 `CGDisplayStream` 当前能成功 start，但本次订阅没有发布帧；生产 Host 不再用 mmap 静默掩盖这个缺口。
 - 四个前台 Scene 在台前调度下持续稳定。
 - 记录原始 `gridWidths` / `gridHeights`，启用密集档位后确认最终 `UIWindowScene.bounds` 采用新增尺寸，而不是只有窗口装饰或 surface 发生缩放。
 - 验证密集档位的系统级影响和 Scene 隔离；非 MacWS 应用不得因全局候选数组修改出现布局、safe area、键盘、拖放或触摸命中回归。
