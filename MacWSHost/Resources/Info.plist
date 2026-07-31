@@ -39,6 +39,15 @@
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>16.0</string>
+	<!--
+	  MacWS does not ship a compiled launch storyboard. An empty UILaunchScreen
+	  dictionary is the schema-defined launch interface and uses the adaptive
+	  system background. Do not nest another UILaunchScreen key here: that key
+	  is the dictionary itself, while its optional children are UIColorName,
+	  UIImageName, and the documented launch-bar entries.
+	-->
+	<key>UILaunchScreen</key>
+	<dict/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -87,6 +87,8 @@ static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static char MacWSWindowMetricsPath[PATH_MAX];
 static NSData *MacWSLastWindowMetricsEntries;
 static uint64_t MacWSWindowMetricsGeneration;
+static void MacWSPublishWindowMetrics(void);
+static void MacWSNotifyDisplayCatalogChanged(uint8_t reason);
 // Main-thread-only semantic menu snapshot cache. ObjC objects never cross the
 // process boundary: Host receives generation-scoped integer IDs, while the
 // target process retains the corresponding item and index path solely long
@@ -1099,8 +1101,35 @@ static void MacWSCacheMenuContextLocked(id application, Class eventClass,
 // MacWSAppInputRouteLock must be held by the caller.
 static BOOL MacWSPrepareDirectMenuPostLocked(
         MacWSInputRecord record, MacWSDirectTrackingSnapshot *snapshot) {
-    if (record.sceneID != 0x564e430000000001ull ||
-        record.kind != MacWSInputKindMenuHover ||
+    BOOL isMenuMotion = record.kind == MacWSInputKindMenuHover ||
+                        record.kind == MacWSInputKindHover;
+    BOOL carbonTrackerActive = atomic_load_explicit(
+        &MacWSAppInputSecondaryTrackingActive, memory_order_acquire);
+    BOOL legacyVNCMenuMotion =
+        record.sceneID == 0x564e430000000001ull &&
+        record.kind == MacWSInputKindMenuHover;
+    if (!isMenuMotion ||
+        (!carbonTrackerActive && !legacyVNCMenuMotion) ||
+        !MacWSAppInputMenuContextValid ||
+        !MacWSAppInputMenuContext.application ||
+        !MacWSAppInputMenuContext.eventClass) return NO;
+    *snapshot = MacWSAppInputMenuContext;
+    snapshot->application = CFRetain(MacWSAppInputMenuContext.application);
+    return YES;
+}
+
+// A contextual menu owns the application main thread synchronously inside
+// HIToolbox TrackMenuCommon. A later Host tap therefore cannot be constructed
+// by the ordinary main-run-loop drain: that drain is exactly what the tracker
+// is blocking. Use the application/window geometry captured immediately
+// before rightMouseDown entered the tracker and put the ordinary NSEvent pair
+// into the queue that _NSHLTBMenuEventProc is already consuming.
+// MacWSAppInputRouteLock must be held by the caller.
+static BOOL MacWSPrepareDirectMenuTapPostLocked(
+        MacWSInputRecord record, MacWSDirectTrackingSnapshot *snapshot) {
+    if (record.kind != MacWSInputKindTap ||
+        !atomic_load_explicit(&MacWSAppInputSecondaryTrackingActive,
+                              memory_order_acquire) ||
         !MacWSAppInputMenuContextValid ||
         !MacWSAppInputMenuContext.application ||
         !MacWSAppInputMenuContext.eventClass) return NO;
@@ -1699,12 +1728,27 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
     if (setLocation) setLocation(cgEvent, cgWindowPoint);
     if (setFlags) setFlags(cgEvent,
         MacWSInputModifiersForScene(record.sceneID));
-    if (setInteger && windowNumber > 0) {
-        setInteger(cgEvent, 91 /* kCGMouseEventWindowUnderMousePointer */,
-                   windowNumber);
-        setInteger(cgEvent,
-                   92 /* ...WindowUnderMousePointerThatCanHandleThisEvent */,
-                   windowNumber);
+    if (setInteger) {
+        uint64_t phase = 0;
+        if (record.flags & MacWSInputFlagScrollBegan) phase = 1;
+        else if (record.flags & MacWSInputFlagScrollChanged) phase = 4;
+        else if (record.flags & MacWSInputFlagScrollEnded) phase = 8;
+        else if (record.flags & MacWSInputFlagScrollCancelled) phase = 16;
+        setInteger(cgEvent, 88 /* kCGScrollWheelEventIsContinuous */, 1);
+        if (record.flags & MacWSInputFlagScrollMomentum) {
+            setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */, 0);
+            setInteger(cgEvent, 123 /* ...MomentumPhase */, phase);
+        } else {
+            setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */, phase);
+            setInteger(cgEvent, 123 /* ...MomentumPhase */, 0);
+        }
+        if (windowNumber > 0) {
+            setInteger(cgEvent, 91 /* kCGMouseEventWindowUnderMousePointer */,
+                       windowNumber);
+            setInteger(cgEvent,
+                       92 /* ...WindowUnderMousePointerThatCanHandleThisEvent */,
+                       windowNumber);
+        }
     }
     id event = ((MacWSEventFromCGEvent)objc_msgSend)(
         (id)eventClass, eventWithCGEvent, cgEvent);
@@ -1712,14 +1756,12 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
     return event;
 }
 
-// Diagnostic A/B for title-frame controls. Content controls already consume
-// the public NSEvent factory objects below, while Terminal's visible tab/plus
-// region receives the same coherent window-local coordinates but performs no
-// action. Build the ordinary CoreGraphics mouse record inside the selected
-// process, attach the real target-window fields, then wrap it as an NSEvent;
-// no cross-process or global event post occurs. The caller validates the
-// wrapped window/local coordinates and falls back to the public factory if
-// this runtime cannot construct an equivalent event.
+// Diagnostic probe: build an ordinary CoreGraphics mouse record inside the
+// selected process, attach target-window fields, then wrap it as an NSEvent.
+// Runtime InputLab evidence on 2026-07-31 shows macOS 13.4 in this chroot
+// discards those fields (windowNumber=0 and screen-space location), so the
+// strict equivalence check deliberately rejects it and production does not
+// pay this probe's cost. No cross-process/global event post occurs.
 static id MacWSCreateAppMouseEvent(Class eventClass,
                                    MacWSInputRecord record,
                                    NSUInteger eventType,
@@ -2166,7 +2208,10 @@ static void MacWSPostDirectTrackingRecord(
             // at the queue head; otherwise it can remain behind Chromium's
             // traffic until after the menu closes.  Gesture move/up records
             // keep FIFO tail ordering because their chronology is semantic.
-            BOOL atStart = record.kind == MacWSInputKindMenuHover;
+            BOOL atStart = record.kind == MacWSInputKindMenuHover ||
+                (record.kind == MacWSInputKindHover &&
+                 atomic_load_explicit(&MacWSAppInputSecondaryTrackingActive,
+                                      memory_order_acquire));
             ((MacWSPostEvent)objc_msgSend)(
                 (__bridge id)snapshot.application,
                 sel_registerName("postEvent:atStart:"), event, atStart);
@@ -2198,6 +2243,67 @@ static void MacWSPostDirectTrackingRecord(
             fprintf(stderr,
                 "#### APP-INPUT LIVE-DROP pid=%d kind=%u gesture=%u "
                 "reason=event-create\n",
+                getpid(), record.kind, record.contactID);
+            fflush(stderr);
+        }
+    }
+    if (snapshot.application) CFRelease(snapshot.application);
+}
+
+static void MacWSPostDirectMenuTapRecord(
+        MacWSInputRecord record, MacWSDirectTrackingSnapshot snapshot) {
+    @autoreleasepool {
+        CGFloat normalizedX = record.x / (CGFloat)record.frameWidth;
+        CGFloat normalizedY = record.y / (CGFloat)record.frameHeight;
+        CGPoint screenPoint = {
+            snapshot.screenFrame.origin.x +
+                normalizedX * snapshot.screenFrame.size.width,
+            snapshot.screenFrame.origin.y +
+                (1.0 - normalizedY) * snapshot.screenFrame.size.height,
+        };
+        CGPoint windowPoint = {
+            screenPoint.x + snapshot.windowMinusScreen.x,
+            screenPoint.y + snapshot.windowMinusScreen.y,
+        };
+        id downEvent = ((MacWSMouseEventFactory)objc_msgSend)(
+            (id)snapshot.eventClass,
+            sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+            1 /* NSEventTypeLeftMouseDown */, windowPoint, 0,
+            record.timestamp, snapshot.windowNumber, nil,
+            MacWSNextAppInputEventNumber(), 1, 1.0f);
+        id upEvent = ((MacWSMouseEventFactory)objc_msgSend)(
+            (id)snapshot.eventClass,
+            sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+            2 /* NSEventTypeLeftMouseUp */, windowPoint, 0,
+            record.timestamp + 0.001, snapshot.windowNumber, nil,
+            MacWSNextAppInputEventNumber(), 1, 0.0f);
+        if (downEvent && upEvent) {
+            MacWSApplyTabletMetadata(downEvent, record);
+            MacWSInputRecord upRecord = record;
+            upRecord.kind = MacWSInputKindTouchUp;
+            upRecord.pressure = 0.0f;
+            MacWSApplyTabletMetadata(upEvent, upRecord);
+            // atStart is a stack. Push up first so the tracker dequeues the
+            // complete gesture in down -> up order.
+            id application = (__bridge id)snapshot.application;
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), upEvent, YES);
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), downEvent, YES);
+            MacWSNotifyDisplayCatalogChanged('t');
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT MENU-TAP-QUEUE pid=%d gesture=%u "
+                    "window=%ld screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
+                    getpid(), record.contactID, (long)snapshot.windowNumber,
+                    screenPoint.x, screenPoint.y,
+                    windowPoint.x, windowPoint.y);
+                fflush(stderr);
+            }
+        } else {
+            fprintf(stderr,
+                "#### APP-INPUT LIVE-DROP pid=%d kind=%u gesture=%u "
+                "reason=menu-tap-event-create\n",
                 getpid(), record.kind, record.contactID);
             fflush(stderr);
         }
@@ -2795,6 +2901,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 sel_registerName("respondsToSelector:"), setter)) return;
         ((MacWSMsgVoidRectBoolBool)objc_msgSend)(
             window, setter, newFrame, YES, NO);
+        // setFrame:display:animate: is synchronous with AppKit's accepted
+        // geometry. Publish that committed size now instead of making Host
+        // wait for the 500-ms recovery timer or issue a blind catalog poll.
+        MacWSPublishWindowMetrics();
+        MacWSNotifyDisplayCatalogChanged('g');
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
                 "#### APP-INPUT CONFIGURE pid=%d window=%u "
@@ -2848,6 +2959,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     uint32_t requestedWindowNumber =
         MacWSInputWindowIDForScene(record.sceneID);
     id window = nil;
+    id requestedBaseWindow = nil;
+    BOOL routedToTransientWindow = NO;
     CGPoint screenPoint = {0};
     if (requestedWindowNumber != 0) {
         window = MacWSWindowWithNumber(application, requestedWindowNumber);
@@ -2859,6 +2972,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             fflush(stderr);
             return;
         }
+        requestedBaseWindow = window;
         // Window DisplayStream coordinates are top-left pixels. Map them to
         // the current AppKit frame on every event so Stage Manager resizing
         // and macOS-side window moves do not leave a stale transform.
@@ -2869,6 +2983,27 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             windowFrame.origin.y +
                 (1.0 - normalizedY) * windowFrame.size.height,
         };
+
+        // A menu, sheet, tooltip, or popover is a real higher-level NSWindow
+        // owned by the same application. Exact-window streaming still uses
+        // the base window as its coordinate space, but AppKit must receive the
+        // event in whichever of its own stacked windows is actually under the
+        // mapped screen point. Restrict this to a visible window above the
+        // requested base level so another ordinary same-process document
+        // window cannot steal input from its Scene.
+        id hitWindow = MacWSWindowForScreenPoint(application, screenPoint);
+        if (hitWindow && hitWindow != requestedBaseWindow) {
+            NSInteger baseLevel = ((MacWSMsgInteger)objc_msgSend)(
+                requestedBaseWindow, sel_registerName("level"));
+            NSInteger hitLevel = ((MacWSMsgInteger)objc_msgSend)(
+                hitWindow, sel_registerName("level"));
+            BOOL hitVisible = ((MacWSMsgBool)objc_msgSend)(
+                hitWindow, sel_registerName("isVisible"));
+            if (hitVisible && hitLevel > baseLevel) {
+                window = hitWindow;
+                routedToTransientWindow = YES;
+            }
+        }
     } else {
         screenPoint = (CGPoint){
             screenFrame.origin.x + normalizedX * screenFrame.size.width,
@@ -2896,9 +3031,10 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         record.kind == MacWSInputKindTap ||
         record.kind == MacWSInputKindSecondaryTap)
         MacWSSetAppInputGestureWindow(window);
-    if (record.kind == MacWSInputKindTouchDown ||
+    if (!routedToTransientWindow &&
+        (record.kind == MacWSInputKindTouchDown ||
         record.kind == MacWSInputKindTap ||
-        record.kind == MacWSInputKindSecondaryTap) {
+        record.kind == MacWSInputKindSecondaryTap)) {
         id oldKeyWindow = ((MacWSMsgID)objc_msgSend)(application,
             sel_registerName("keyWindow"));
         BOOL wasActive = ((MacWSMsgBool)objc_msgSend)(application,
@@ -2937,6 +3073,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     }
     NSInteger windowNumber = ((MacWSMsgInteger)objc_msgSend)(window,
         sel_registerName("windowNumber"));
+    id keyWindowBeforeEvent = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("keyWindow"));
+    NSInteger keyWindowNumberBeforeEvent = keyWindowBeforeEvent
+        ? ((MacWSMsgInteger)objc_msgSend)(keyWindowBeforeEvent,
+            sel_registerName("windowNumber")) : 0;
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,
         sel_registerName("convertPointFromScreen:"), screenPoint);
     if (record.kind == MacWSInputKindScroll) {
@@ -3119,6 +3260,39 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         }
         upRecord.kind = MacWSInputKindTouchUp;
         MacWSApplyTabletMetadata(upEvent, upRecord);
+        id activeMenuPresentation = MacWSActiveMenuPresentationInstance();
+        if (activeMenuPresentation && routedToTransientWindow) {
+            // NSMenuPresentationInstance owns a nested nextEvent loop and does
+            // not receive mouse input through NSApplication.sendEvent:. Put a
+            // complete down/up pair in its real queue in chronological order.
+            // AppKit remains responsible for hit testing and invoking the
+            // selected item's action.
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), upEvent, YES);
+            ((MacWSPostEvent)objc_msgSend)(application,
+                sel_registerName("postEvent:atStart:"), event, YES);
+            MacWSNotifyDisplayCatalogChanged('t');
+            MacWSSetAppInputGestureWindow(nil);
+            MacWSClearDeferredRFBMoveEvents();
+            return;
+        }
+        if (secondary) {
+            // The exact rightMouseDown below can synchronously enter Carbon's
+            // TrackMenuCommon and stop servicing our main-run-loop drain. Save
+            // the source-to-AppKit transform before that happens. Window
+            // DisplayStreams use the requested base window's pixel rectangle;
+            // full-display/RFB input uses the NSScreen rectangle.
+            CGRect inputMappingFrame = screenFrame;
+            if (requestedBaseWindow) {
+                inputMappingFrame = ((MacWSMsgRect)objc_msgSend)(
+                    requestedBaseWindow, sel_registerName("frame"));
+            }
+            pthread_mutex_lock(&MacWSAppInputRouteLock);
+            MacWSCacheMenuContextLocked(
+                application, eventClass, windowNumber, inputMappingFrame,
+                screenPoint, windowPoint, NO);
+            pthread_mutex_unlock(&MacWSAppInputRouteLock);
+        }
         MacWSAppInputRFBTrackingActive = YES;
         MacWSAppInputRFBTrackingButtons = secondary ? 2u : 1u;
         if (secondary) atomic_store_explicit(
@@ -3143,6 +3317,17 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             fflush(stderr);
         }
         MacWSLogAppInputGestureHitResult("tap", record.contactID);
+        id keyWindowAfterEvent = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("keyWindow"));
+        NSInteger keyWindowNumberAfterEvent = keyWindowAfterEvent
+            ? ((MacWSMsgInteger)objc_msgSend)(keyWindowAfterEvent,
+                sel_registerName("windowNumber")) : 0;
+        if (keyWindowNumberAfterEvent != keyWindowNumberBeforeEvent)
+            MacWSNotifyDisplayCatalogChanged('k');
+        // A secondary click can create a separate AppKit menu window even
+        // while the key window is unchanged. Notify displayd so its transient
+        // surface reconciler can attach/detach that surface to this Scene.
+        if (secondary) MacWSNotifyDisplayCatalogChanged('t');
         MacWSSetAppInputGestureWindow(nil);
         MacWSClearDeferredRFBMoveEvents();
         return;
@@ -3280,8 +3465,9 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         MacWSLogAppInputGestureHitResult("drag", record.contactID);
         [moves release];
         [downEvent release];
-    } else if (isRFB && (record.kind == MacWSInputKindHover ||
-                         record.kind == MacWSInputKindMenuHover)) {
+    } else if ((isRFB || requestedWindowNumber != 0) &&
+               (record.kind == MacWSInputKindHover ||
+                record.kind == MacWSInputKindMenuHover)) {
         id menuPresentation = MacWSActiveMenuPresentationInstance();
         if (menuPresentation) {
             // The active menu's nested nextEvent loop is the queue consumer.
@@ -3425,9 +3611,10 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
     BOOL scheduleDrain = NO;
     NSData *data = [[NSData alloc] initWithBytes:&record length:sizeof(record)];
     @synchronized(MacWSAppInputPending) {
-    BOOL continuous = record.kind == MacWSInputKindTouchMove ||
+        BOOL continuous = record.kind == MacWSInputKindTouchMove ||
                           record.kind == MacWSInputKindHover ||
                           record.kind == MacWSInputKindMenuHover ||
+                          record.kind == MacWSInputKindScroll ||
                           record.kind == MacWSInputKindConfigureWindow;
         BOOL replaced = NO;
         NSUInteger pendingCount = [MacWSAppInputPending count];
@@ -3438,8 +3625,30 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                 [lastData getBytes:&last length:sizeof(last)];
                 if (last.kind == record.kind &&
                     last.sceneID == record.sceneID &&
-                    last.contactID == record.contactID &&
+                    (record.kind == MacWSInputKindScroll ||
+                     last.contactID == record.contactID) &&
+                    (record.kind != MacWSInputKindScroll ||
+                     last.flags == record.flags) &&
                     last.targetPID == record.targetPID) {
+                    if (record.kind == MacWSInputKindScroll) {
+                        float previousHorizontal = 0.0f;
+                        float incomingHorizontal = 0.0f;
+                        memcpy(&previousHorizontal, &last.contactID,
+                               sizeof(previousHorizontal));
+                        memcpy(&incomingHorizontal, &record.contactID,
+                               sizeof(incomingHorizontal));
+                        record.pressure = fmaxf(-16384.0f,
+                            fminf(16384.0f,
+                                last.pressure + record.pressure));
+                        incomingHorizontal = fmaxf(-16384.0f,
+                            fminf(16384.0f,
+                                previousHorizontal + incomingHorizontal));
+                        memcpy(&record.contactID, &incomingHorizontal,
+                               sizeof(record.contactID));
+                        [data release];
+                        data = [[NSData alloc] initWithBytes:&record
+                                                     length:sizeof(record)];
+                    }
                     [MacWSAppInputPending replaceObjectAtIndex:pendingCount - 1
                                                     withObject:data];
                     replaced = YES;
@@ -3461,7 +3670,9 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                     [candidateData getBytes:&candidate length:sizeof(candidate)];
                     if (candidate.kind == MacWSInputKindTouchMove ||
                         candidate.kind == MacWSInputKindHover ||
-                        candidate.kind == MacWSInputKindMenuHover) {
+                        candidate.kind == MacWSInputKindMenuHover ||
+                        candidate.kind == MacWSInputKindScroll ||
+                        candidate.kind == MacWSInputKindConfigureWindow) {
                         removable = index;
                         break;
                     }
@@ -4049,14 +4260,19 @@ static void *MacWSAppInputThread(void *unused) {
         pthread_mutex_lock(&MacWSAppInputRouteLock);
         BOOL keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
-        BOOL postedDirectly = keyRecord
+        BOOL directMenuTap = MacWSPrepareDirectMenuTapPostLocked(
+            record, &snapshot);
+        BOOL postedDirectly = directMenuTap || (keyRecord
             ? MacWSPrepareDirectKeyPostLocked(record, &snapshot)
-            : (record.kind == MacWSInputKindMenuHover
+            : ((record.kind == MacWSInputKindMenuHover ||
+                record.kind == MacWSInputKindHover)
                 ? MacWSPrepareDirectMenuPostLocked(record, &snapshot)
-                : MacWSPrepareDirectTrackingPostLocked(record, &snapshot));
+                : MacWSPrepareDirectTrackingPostLocked(record, &snapshot)));
         if (!postedDirectly) MacWSEnqueueAppInputRecord(record);
         pthread_mutex_unlock(&MacWSAppInputRouteLock);
-        if (postedDirectly && keyRecord) {
+        if (directMenuTap) {
+            MacWSPostDirectMenuTapRecord(record, snapshot);
+        } else if (postedDirectly && keyRecord) {
             BOOL posted = MacWSPostKeyRecord(
                 record, (__bridge id)snapshot.application,
                 snapshot.eventClass, snapshot.windowNumber, YES,
@@ -4156,6 +4372,18 @@ static uint32_t MacWSLogicalWindowGroupID(id window) {
     return groupID;
 }
 
+static void MacWSNotifyDisplayCatalogChanged(uint8_t reason) {
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0) return;
+    struct sockaddr_un target = {0};
+    target.sun_family = AF_UNIX;
+    strlcpy(target.sun_path, MACWS_STREAM_INVALIDATE_SOCKET_PATH,
+            sizeof(target.sun_path));
+    (void)sendto(socketFD, &reason, sizeof(reason), MSG_DONTWAIT,
+                 (const struct sockaddr *)&target, sizeof(target));
+    close(socketFD);
+}
+
 static void MacWSPublishWindowMetrics(void) {
     Class applicationClass = objc_getClass("NSApplication");
     if (!applicationClass || !MacWSWindowMetricsPath[0]) return;
@@ -4217,13 +4445,15 @@ static void MacWSPublishWindowMetrics(void) {
                                                  length:sizeof(header)];
     [file appendData:entries];
     NSError *error = nil;
-    if (![file writeToFile:path
-                   options:NSDataWritingAtomic error:&error] &&
-        MacWSRuntimeDiagnosticsEnabled()) {
+    BOOL written = [file writeToFile:path
+                             options:NSDataWritingAtomic error:&error];
+    if (!written && MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr, "#### APP-INPUT METRICS-WRITE pid=%d error=%s\n",
                 getpid(), error.localizedDescription.UTF8String ?: "unknown");
         fflush(stderr);
     }
+    if (written && entriesChanged)
+        MacWSNotifyDisplayCatalogChanged('m');
 }
 
 static void MacWSScheduleWindowMetricsPublish(void) {

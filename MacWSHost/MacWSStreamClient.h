@@ -33,6 +33,8 @@ NS_ASSUME_NONNULL_BEGIN
       receivedWindows:(NSArray<MacWSStreamWindow *> *)windows;
 - (void)streamClient:(MacWSStreamClient *)client
         receivedFrame:(MacWSSurfaceFrame *)frame;
+- (void)streamClient:(MacWSStreamClient *)client
+ removedLayerWindowID:(uint32_t)layerWindowID;
 @end
 
 @interface MacWSStreamClient : NSObject

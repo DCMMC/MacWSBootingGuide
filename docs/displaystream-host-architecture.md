@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-07-31；单窗 IOSurface 直传和原生输入已在目标 iPad 运行确认，四窗、全屏直传与性能门槛仍单列为未完成。
+> 文档状态：2026-07-31；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入和 Carbon 右键菜单选择已在目标 iPad 运行确认，四窗、全屏直传与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -16,18 +16,18 @@
 
 | 核心工作 | 非常简要的工作原理 | 当前状态 |
 |---|---|---|
-| DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 单窗已在 iPad runtime-confirmed；全屏直传待修复 |
-| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放 | 单窗、四标签身份跟随均已在 iPad runtime-confirmed |
-| 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | iPadOS 16.3.1 二进制 RE-confirmed；运行待验证 |
+| DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 精确基础窗和同 owner 瞬态层已在 iPad runtime-confirmed；全屏直传待修复 |
+| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放 | 单窗、四标签身份跟随、重复 Scene 去重和进程复用已实现；关闭 Scene 的真实窗口关闭待设备回归 |
+| 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | RE-confirmed；设备已记录宽 109/高 36 个候选及多种 Scene geometry，物理拖动手感待复测 |
 | 无黑边显示 | 正常状态始终 edge-to-edge；宽高比短暂不一致时裁剪源纹理，不使用 aspect-fit | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
 | 缩放与精确操控 | 双指双击在 1× 与用户配置的 1.5×/2× 间切换；放大后默认移动视口，输入坐标同步映射到裁剪后的源纹理 | 已实现并有数学单测；原生 magnify 待验证 |
-| 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 原生协议语义矩阵与 60 Hz 拖动已在 iPad 通过；真实 UI 手感继续回归 |
+| 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 原生协议语义矩阵、60 Hz 拖动、Carbon 右键菜单点击和滚动压力已在 iPad 通过；真实 UI 手感继续回归 |
 | 全屏桌面手势 | 全屏工作区的屏幕虚拟触控板识别三指方向手势，发送一次性 macOS 桌面命令；外接妙控板保留 iPadOS 系统三指手势 | 规划；桌面命令路径与设备输入边界待验证 |
-| Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 全屏入口已实现；Scene 语义菜单待实现 |
+| Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 精确 PID/window、generation 快照和动作桥已实现；macOS 外观、hover/键盘导航与复杂菜单仍待完善 |
 | 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
-| 性能与稳定性 | 每客户端最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 输入约 60 Hz/亚毫秒；画面当前约 38–40 个接受帧/秒，租约背压待优化 |
+| 性能与稳定性 | 每个基础/瞬态 producer 独立最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 输入约 60 Hz/亚毫秒；120 次滚动压力中最后一帧 capture→Metal complete 约 10.0 ms、drop=0，完整可见响应和四窗仍待验收 |
 
 ### 3. 端到端结构
 
@@ -35,19 +35,20 @@
 macOS 应用进程
   ├─ NSWindow / NSApplication
   ├─ AppInputBridge：真实最小尺寸、原生重排、应用内输入
-  ├─ 菜单桥：NSMainMenu 语义快照、generation 校验、原动作执行（规划）
+  ├─ 菜单桥：NSMainMenu 语义快照、generation 校验、原动作执行
   └─ metrics.<pid>.bin（低频控制面）
              │
              ▼
 macwsdisplayd（macOS 13.4 chroot）
   ├─ 窗口目录：CGWindowID + owner PID + logical group + AppKit 最小尺寸
   ├─ 全屏：CGDisplayStream
-  └─ 单窗：SLSHWCaptureStreamCreateWithWindow
+  └─ 单窗：精确基础窗口 + 同 owner 菜单/弹窗/Sheet 各自的
+           SLSHWCaptureStreamCreateWithWindow
              │ IOSurface Mach right + 帧描述符；无 RFB 编解码
              ▼
 MacWSHost（iPadOS）
   ├─ 一个 macOS 窗口对应一个 UIWindowScene
-  ├─ IOSurface → MTLTexture → MTKView
+  ├─ 多个 IOSurface → 多个 MTLTexture → 按 SkyLight level 合成到 MTKView
   ├─ 无黑边视口、缩放、遮罩、密度选择
   └─ Scene 顶部语义菜单 / 触摸 / 全屏桌面手势 / 妙控键盘 / 拖放 / 剪贴板
              │ 84-byte v4 有版本输入记录
@@ -73,7 +74,8 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 - AppKit 的标签页是多个 `NSWindow`，选中标签会更换前台 `CGWindowID`。AppInputBridge 从真实 `NSWindowTabGroup` 发布稳定逻辑组；一次输入完成后 Scene 刷新小型窗口目录，并在旧 ID 离屏时改订阅同 owner/组的前台成员。不能把 capture ID 当成用户窗口身份。
 - 全屏工作区使用 `windowID == 0`，用于桌面、全局菜单栏和尚未适配成独立 Scene 的窗口。
 - Scene 进入后台时取消订阅；Metal fence 完成后释放所有 IOSurface lease。恢复前不把旧截图当成可交互画面。
-- 第一阶段必须避免同一 `CGWindowID` 被两个前台 Scene 同时控制。后续应加入跨 Scene 的窗口所有权登记；重复打开时优先激活已有 Scene。
+- Host 以 `owner PID + logical group`（无 group 时为精确 `CGWindowID`）作为 Scene 身份。重复打开优先激活既有 Scene；连接后若仍发现重复，保留前台优先级最高的一份并销毁其余 Scene，且销毁去重副本时明确保留 macOS 原窗口。
+- 启动 allowlist 应用前，hostd 用 `proc_pidpath` 与解析后的 chroot 可执行文件绝对路径做精确身份匹配。已有进程若已发布窗口 metrics 就直接复用；若尚无可捕获窗口则拒绝生成第二个实例并返回明确状态。
 
 #### 台前调度尺寸档位突破
 
@@ -167,6 +169,12 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 - 软键盘与硬键盘共享同一个目标窗口和 owner PID；Scene 遮罩或流未就绪时都不能注入。
 - 硬件键盘出现不应强制切换密度，以免用户正在触控时布局跳动；控制面板显式选择并持久化模式。后续可提供一次性建议，而不是自动改动。
 
+**浮动键盘与快捷键栏的布局边界**
+
+- iPad 浮动软件键盘由用户拖动，不参与 macOS 内容避让；Host 不绑定 `keyboardLayoutGuide`，也不因浮动键盘 frame 改变而 resize macOS 窗口。
+- `Ctrl / Option / Command / Shift / Esc / Tab / 方向键` 是 Host 自己的 52 pt 底部快捷键栏。只有该栏显示时，Metal 内容的底边约束到快捷键栏顶边，真实减少内容高度；收起后高度恢复为 0。
+- 快捷键栏不是 `inputAccessoryView`，不会覆盖 Metal 内容。触摸 Metal 时若键盘输入代理仍激活，不抢走 first responder，避免浮动键盘刚弹出又自动关闭。
+
 **全屏工作区的三指桌面手势**
 
 - 只在 `windowID == 0` 的全屏工作区启用；单窗 Scene 中三指不改变 macOS 桌面，避免与台前调度窗口组织和应用自身手势混淆。
@@ -236,7 +244,7 @@ iPadOS 的三指左/右滑撤销/重做属于 UIKit 标准编辑交互，应用�
 - 紧凑态只缓存低频顶层标题；第一次点击立即播放本地展开动画，同时请求被选分类的最新子树。这样不需要持续高频同步整棵 `NSMainMenu`，也能用动画覆盖一次控制面往返。
 - 第一阶段支持普通项目、分隔线、多级子菜单、enabled、勾选/混合状态和快捷键。`NSMenuItem.view`、Services 等复杂内容显示“在全屏菜单栏中打开”，不能伪装为已兼容。
 
-全屏工作区继续保留真实 macOS 全局菜单栏，作为语义桥未就绪、复杂菜单和调试时的兼容入口。Scene 语义菜单目前尚未实现，也没有设备运行证据；上述尺寸和动画时间是产品目标，必须在 iPad 上调优后才能标记稳定。
+全屏工作区继续保留真实 macOS 全局菜单栏，作为复杂菜单和调试时的兼容入口。Scene 语义快照、generation 校验和原动作执行桥已经实现；当前顶层标题已使用紧凑的 macOS 风格玻璃栏，但展开面板仍需替换 UIKit alert 外观，并补齐 hover、方向键/Enter/Esc、复杂 `NSMenuItem.view` 和多级菜单的设备矩阵。因此本节的完整交互仍不能标记稳定。
 
 ### 8. 剪贴板、图片、文件与拖放
 
@@ -508,20 +516,25 @@ NSMainMenu
 - Host 生产默认只接受 DisplayStream IOSurface。历史 `/tmp/macws_vnc_fb` 上传由 `MacWSLegacyFramebufferFallback` 显式偏好控制，默认关闭；单窗口模式即使打开该偏好也不会回退到全桌面截图。
 - runtime-confirmed via `host-native/motion-60hz-direct-10s.log`：600 个 move 中 599 个成为真实 AppKit drag，59.88 Hz，延迟 p50 0.565 ms、p95 0.806 ms；down/up 顺序完整。该测试直接发送 `MacWSInputRecord-v4`，没有 VNC 客户端。
 - runtime-confirmed via `host-native/semantic-matrix.json`：左键、拖动、右键、双轴滚动、普通/Shift/Caps/Control/Command 键与 Tab/Backspace/Return/Escape 的语义矩阵通过。
+- runtime-confirmed via LLDB：Terminal 的右键路径进入 `rightMouseDown:` → `NSCarbonMenuImpl _popUpContextMenu` → `SLMPerformPopUpCarbonMenu` → `TrackMenuCommon` → `_NSHLTBMenuEventProc`，主线程在同步嵌套 tracker 中等待。因此后续 menu hover/click 不能依赖被阻塞的普通 main-CFRunLoop 输入 drain。
+- runtime-confirmed via `macwsdisplayd.err` 和可见截图：Terminal 基础窗口 26 打开菜单时创建 `layer-start stream=17 base=26 layer=32 level=101 destination=(726,566 282x328)`；选择 Copy 后记录 `layer-remove base=26 layer=32`，菜单像素从 Host 画面消失，Terminal 保持存活。修复在 tracker 激活期间把普通 `NSEvent` 放入实际应用队列，仍由 AppKit/HIToolbox 做命中和动作，没有硬编码菜单项。
+- runtime-confirmed via `MacWSHostd.log` / `MacWSHost.log`：再次打开 Terminal 命中 `launch-app reuse id=terminal pid=99577 ... identity=proc_pidpath`，随后 Host 记录 `launch-auto-window app=terminal pid=99577 window=15 group=15`；测试前后只有一个该可执行文件进程。
+- runtime-confirmed via SpringBoard witness：dense-grid height 为 `original=4 expanded=36 minimum=603 maximum=922`，width 为 `original=8 expanded=109 minimum=327 maximum=1341`；Host 同期收到 `710x810`、`1004x670`、`1004x807`、`1052x671` 等 Scene geometry。该证据确认新增候选和多种真实 Scene bounds 已到运行系统，但用户手指拖过全部档位的最终手感仍待复测。
+- runtime-confirmed via Terminal diagnostics：一条 420-point scroll change 命中精确窗口 54 并记录 `route=NSWindow.sendEvent`，截图显示内容实际滚动。120 个约 60 Hz scroll change 在 2.003 秒内发送；第 120 帧记录 capture→receipt 1.615 ms、receipt→submit 5.755 ms、submit→complete 2.633 ms，producer `outstanding=1 dropped=0`。这不是整段交互的 input-to-visible p95，不能据此宣称完整 60 fps 验收已通过。
 - 当前画面性能尚未达标：关闭 `OSXvnc-server` 和全屏 mmap producer 后，同一动态窗口的接受序号 120→240 用时 3.210 秒（37.4 fps），240→360 用时 3.106 秒（38.6 fps）；producer 同期记录 `outstanding=2/3` 和持续 drop。带 VNC 会话的同负载为约 38–40 fps，因此 RFB/mmap 已被 A/B 排除为主因。这里只把剩余瓶颈归到 DisplayStream/lease/presentation 边界，具体根因仍需新的运行或 RE 证据。
 
 仍待确认或修复：
 
 - 全屏 `CGDisplayStream` 当前能成功 start，但本次订阅没有发布帧；生产 Host 不再用 mmap 静默掩盖这个缺口。
 - 四个前台 Scene 在台前调度下持续稳定。
-- 记录原始 `gridWidths` / `gridHeights`，启用密集档位后确认最终 `UIWindowScene.bounds` 采用新增尺寸，而不是只有窗口装饰或 surface 发生缩放。
-- 验证密集档位的系统级影响和 Scene 隔离；非 MacWS 应用不得因全局候选数组修改出现布局、safe area、键盘、拖放或触摸命中回归。
+- 用手指连续拖过密集档位，逐档确认 `UIWindowScene.bounds`、drawable、AppKit frame 和输入坐标一致；已有运行 witness 只证明新增候选和多种 Scene geometry 已出现，不能替代该交互回归。
+- 验证密集档位的系统级影响和 Scene 隔离；当前 setter hook 仍改变全局候选数组，非 MacWS 应用不得因此出现布局、safe area、键盘、拖放或触摸命中回归。
 - AppKit 动态最小尺寸、固定尺寸窗口和 density resize 的实际行为。
 - 缩放后的四角点击、拖动、滚动、软键盘和妙控键盘输入一致性。
 - 全屏屏幕三指候选、桌面命令 capability/result，以及外接妙控板三指是否被 iPadOS 截获的输入日志。
 - pboard 通知、rootfs 权限、安全作用域 URL、iPad 拖入/拖出。
-- 菜单栏 content-shape 和全屏工作区的焦点切换。
-- Scene 顶部紧凑菜单、触摸展开、精确 NSWindow 激活、generation 失效和原动作执行。
+- 全屏工作区的焦点切换与复杂菜单兼容入口。
+- Scene 菜单展开面板的 macOS 原生外观、hover/键盘导航、复杂 view/submenu 和四 Scene 跨 PID 隔离压力；基础快照、generation 和原动作桥不再列为未实现。
 
 ## 五、测试与验收方案
 
@@ -674,6 +687,6 @@ git diff --check
 - 不支持 macOS 13.4 之外版本的私有 SkyLight offset 兼容。
 - 不依赖 RFB 压缩来呈现 iPad UI；RFB/VNC 只作诊断和兼容。
 - 不通过全局 DPI 频繁切换实现逐窗口密度。
-- 不为超出单窗 capture 范围的右键菜单做视口追踪。
+- 不把全桌面截图裁成单窗来伪造菜单；同 owner、与基础窗口相交的真实 SkyLight 瞬态窗口必须作为独立 IOSurface layer 传输并由 Host Metal 合成。
 - 不突破 iPadOS 同时四个前台窗口的产品上限。
 - 不用跳过 assert、伪造成功返回或零对象 stub 换取表面“稳定”。

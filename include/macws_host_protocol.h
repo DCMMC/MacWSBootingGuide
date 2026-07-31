@@ -124,6 +124,11 @@ enum {
     MacWSInputFlagEstimatedPressure = 1u << 2,
     MacWSInputFlagExpectingLocationUpdate = 1u << 3,
     MacWSInputFlagExpectingPressureUpdate = 1u << 4,
+    MacWSInputFlagScrollBegan = 1u << 8,
+    MacWSInputFlagScrollChanged = 1u << 9,
+    MacWSInputFlagScrollEnded = 1u << 10,
+    MacWSInputFlagScrollCancelled = 1u << 11,
+    MacWSInputFlagScrollMomentum = 1u << 12,
 };
 
 // Versioned wire record for the iOS-host -> macOS event bridge.

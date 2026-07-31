@@ -10,8 +10,10 @@
 // message self-describing: the two processes are built against different SDKs
 // and can temporarily be on different package revisions during development.
 #define MACWS_STREAM_SERVICE "com.macwsguide.display"
+#define MACWS_STREAM_INVALIDATE_SOCKET_PATH \
+    "/private/tmp/macws_display_invalidate.sock"
 #define MACWS_STREAM_MAGIC 0x4d575354u /* "MWST" */
-#define MACWS_STREAM_VERSION 1u
+#define MACWS_STREAM_VERSION 3u
 
 #define MACWS_STREAM_MAX_DIMENSION 16384u
 #define MACWS_STREAM_MAX_BYTES_PER_ROW (MACWS_STREAM_MAX_DIMENSION * 16u)
@@ -25,6 +27,7 @@
 #define MACWS_STREAM_KEY_PROTOCOL_VERSION "protocol_version"
 #define MACWS_STREAM_KEY_MODE "mode"
 #define MACWS_STREAM_KEY_WINDOW_ID "window_id"
+#define MACWS_STREAM_KEY_LAYER_WINDOW_ID "layer_window_id"
 #define MACWS_STREAM_KEY_DESCRIPTOR "descriptor"
 #define MACWS_STREAM_KEY_WINDOWS "windows"
 #define MACWS_STREAM_KEY_SURFACE_PORT "surface_port"
@@ -43,6 +46,7 @@
 #define MACWS_STREAM_EVENT_READY "ready"
 #define MACWS_STREAM_EVENT_WINDOWS "windows"
 #define MACWS_STREAM_EVENT_FRAME "frame"
+#define MACWS_STREAM_EVENT_LAYER_REMOVED "layer_removed"
 #define MACWS_STREAM_EVENT_STOPPED "stopped"
 #define MACWS_STREAM_EVENT_ERROR "error"
 
@@ -72,6 +76,7 @@ enum {
     MacWSStreamFrameHasDamage = 1u << 1,
     MacWSStreamFrameSizeChanged = 1u << 2,
     MacWSStreamFrameOccluded = 1u << 3,
+    MacWSStreamFrameOverlay = 1u << 4,
 };
 
 // Title bytes immediately follow this descriptor in a window-list item.  The
@@ -119,6 +124,24 @@ typedef struct __attribute__((packed)) {
     uint32_t pixelFormat;
     float backingScale;
     uint32_t damageRectCount;
+    // Select the useful pixel rectangle in this exact-window IOSurface. The
+    // current SkyLight producer uses the complete surface; keeping the fields
+    // explicit makes padding/plane changes forward-compatible without changing
+    // input or Scene geometry.
+    uint32_t contentX;
+    uint32_t contentY;
+    uint32_t contentWidth;
+    uint32_t contentHeight;
+    // Every window Scene has one base layer and zero or more AppKit-owned
+    // transient layers (menus, popovers, sheets). Each layer is transported
+    // as its own native SkyLight window IOSurface and composed by Host Metal.
+    // destination* is expressed in the base window's top-left backing pixels.
+    uint32_t layerWindowID;
+    int32_t layerLevel;
+    int32_t destinationX;
+    int32_t destinationY;
+    uint32_t destinationWidth;
+    uint32_t destinationHeight;
 } MacWSStreamFrameDescriptor;
 
 typedef struct __attribute__((packed)) {
@@ -200,7 +223,21 @@ static inline bool MacWSStreamFrameDescriptorIsValid(
         descriptor->bytesPerRow > MACWS_STREAM_MAX_BYTES_PER_ROW ||
         descriptor->backingScale <= 0.0f ||
         descriptor->backingScale > 8.0f ||
-        descriptor->damageRectCount > MACWS_STREAM_MAX_DAMAGE_RECTS) {
+        descriptor->damageRectCount > MACWS_STREAM_MAX_DAMAGE_RECTS ||
+        descriptor->contentWidth == 0 || descriptor->contentHeight == 0 ||
+        descriptor->contentX > descriptor->width ||
+        descriptor->contentY > descriptor->height ||
+        descriptor->contentWidth > descriptor->width - descriptor->contentX ||
+        descriptor->contentHeight > descriptor->height - descriptor->contentY ||
+        descriptor->layerWindowID == 0 ||
+        descriptor->destinationWidth == 0 ||
+        descriptor->destinationHeight == 0 ||
+        descriptor->destinationWidth > MACWS_STREAM_MAX_DIMENSION ||
+        descriptor->destinationHeight > MACWS_STREAM_MAX_DIMENSION ||
+        descriptor->destinationX < -(int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        descriptor->destinationY < -(int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        descriptor->destinationX > (int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        descriptor->destinationY > (int32_t)MACWS_STREAM_MAX_DIMENSION) {
         return false;
     }
     return (uint64_t)descriptor->bytesPerRow * descriptor->height <= SIZE_MAX;
@@ -209,7 +246,7 @@ static inline bool MacWSStreamFrameDescriptorIsValid(
 #if defined(__cplusplus)
 static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
               "MacWS window descriptor ABI");
-static_assert(sizeof(MacWSStreamFrameDescriptor) == 72,
+static_assert(sizeof(MacWSStreamFrameDescriptor) == 112,
               "MacWS frame descriptor ABI");
 static_assert(sizeof(MacWSStreamDamageRect) == 16,
               "MacWS damage rect ABI");
@@ -220,7 +257,7 @@ static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
 #else
 _Static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
                "MacWS window descriptor ABI");
-_Static_assert(sizeof(MacWSStreamFrameDescriptor) == 72,
+_Static_assert(sizeof(MacWSStreamFrameDescriptor) == 112,
                "MacWS frame descriptor ABI");
 _Static_assert(sizeof(MacWSStreamDamageRect) == 16,
                "MacWS damage rect ABI");

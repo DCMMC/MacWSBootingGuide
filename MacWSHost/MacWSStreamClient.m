@@ -211,6 +211,19 @@
         [self requestWindowList];
     } else if (strcmp(eventName, MACWS_STREAM_EVENT_FRAME) == 0) {
         [self handleFrameEvent:event];
+    } else if (strcmp(eventName, MACWS_STREAM_EVENT_LAYER_REMOVED) == 0) {
+        uint64_t baseWindowID = xpc_dictionary_get_uint64(
+            event, MACWS_STREAM_KEY_WINDOW_ID);
+        uint64_t layerWindowID = xpc_dictionary_get_uint64(
+            event, MACWS_STREAM_KEY_LAYER_WINDOW_ID);
+        if (self.mode != MacWSStreamModeWindow ||
+            baseWindowID != self.windowID || layerWindowID == 0 ||
+            layerWindowID > UINT32_MAX || layerWindowID == baseWindowID)
+            return;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.delegate streamClient:self
+                   removedLayerWindowID:(uint32_t)layerWindowID];
+        });
     } else if (strcmp(eventName, MACWS_STREAM_EVENT_WINDOWS) == 0) {
         [self handleWindowsEvent:event];
     } else if (strcmp(eventName, MACWS_STREAM_EVENT_STOPPED) == 0 ||
@@ -244,6 +257,14 @@
     }
     if (self.mode == MacWSStreamModeWindow &&
         descriptor.windowID != self.windowID) {
+        [self releaseToken:descriptor.leaseToken];
+        return;
+    }
+    BOOL overlay = (descriptor.flags & MacWSStreamFrameOverlay) != 0;
+    if ((overlay && (self.mode != MacWSStreamModeWindow ||
+                     descriptor.layerWindowID == descriptor.windowID)) ||
+        (!overlay && self.mode == MacWSStreamModeWindow &&
+         descriptor.layerWindowID != descriptor.windowID)) {
         [self releaseToken:descriptor.leaseToken];
         return;
     }

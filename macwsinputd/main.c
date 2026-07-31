@@ -424,7 +424,9 @@ static bool SendToAppInputBridge(int socketFD,
     }
     bool continuous = record->kind == MacWSInputKindTouchMove ||
                       record->kind == MacWSInputKindHover ||
-                      record->kind == MacWSInputKindMenuHover;
+                      record->kind == MacWSInputKindMenuHover ||
+                      (record->kind == MacWSInputKindScroll &&
+                       (record->flags & MacWSInputFlagScrollChanged));
     unsigned attempts = continuous ? 1 : 2;
     ssize_t sent = -1;
     int savedError = 0;

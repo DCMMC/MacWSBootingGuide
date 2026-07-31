@@ -574,6 +574,57 @@ static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
     return NO;
 }
 
+// Return an already-running instance of this exact chroot executable. App
+// identity is the resolved executable path, not a display name or p_comm:
+// those can collide and would make a different application steal the Scene.
+// proc_pidpath may expose either the process's chroot-relative macOS path or
+// the iOS host path, depending on which kernel image supplied the caller.
+static pid_t FindRunningRootExecutable(NSString *rootPath) {
+    if (!rootPath.length) return 0;
+    typedef int (*MacWSProcListPIDs)(uint32_t, uint32_t, void *, int);
+    typedef int (*MacWSProcPIDPath)(int, void *, uint32_t);
+    static MacWSProcListPIDs procListPIDs;
+    static MacWSProcPIDPath procPIDPath;
+    static dispatch_once_t procOnce;
+    dispatch_once(&procOnce, ^{
+        procListPIDs = (MacWSProcListPIDs)dlsym(
+            RTLD_DEFAULT, "proc_listpids");
+        procPIDPath = (MacWSProcPIDPath)dlsym(
+            RTLD_DEFAULT, "proc_pidpath");
+    });
+    if (!procListPIDs || !procPIDPath) return 0;
+    NSString *hostPath = [@("/var/mnt/rootfs")
+        stringByAppendingString:rootPath];
+    char canonicalHostPath[PATH_MAX] = {0};
+    if (realpath(hostPath.fileSystemRepresentation, canonicalHostPath)) {
+        hostPath = [NSString stringWithUTF8String:canonicalHostPath];
+    }
+    const uint32_t allPIDs = 1; // PROC_ALL_PIDS from Darwin libproc.h
+    int capacity = procListPIDs(allPIDs, 0, NULL, 0);
+    if (capacity <= 0) return 0;
+    pid_t *pids = calloc(1, (size_t)capacity);
+    if (!pids) return 0;
+    int bytes = procListPIDs(allPIDs, 0, pids, capacity);
+    int count = bytes > 0 ? bytes / (int)sizeof(pid_t) : 0;
+    pid_t found = 0;
+    for (int index = 0; index < count; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 1 || pid == getpid()) continue;
+        char processPath[4096] = {0};
+        if (procPIDPath(pid, processPath, sizeof(processPath)) <= 0)
+            continue;
+        NSString *candidate = [NSString stringWithUTF8String:processPath];
+        if (![candidate isEqualToString:rootPath] &&
+            ![candidate isEqualToString:hostPath]) continue;
+        if (kill(pid, 0) == 0 || errno == EPERM) {
+            found = pid;
+            break;
+        }
+    }
+    free(pids);
+    return found;
+}
+
 static BOOL LaunchVSCode(NSString **message) {
     if (access(kVSCodePlist, R_OK) != 0 ||
         access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
@@ -631,6 +682,31 @@ static BOOL LaunchRootExecutable(const char *identifier,
     if (!JobHasPID(kWindowServerLabel, NULL)) {
         *message = @"请先启动 macOS GUI";
         return NO;
+    }
+
+
+    pid_t existingPID = FindRunningRootExecutable(rootPath);
+    if (existingPID > 1) {
+        int exitStatus = -1;
+        if (!WaitForWindowMetrics(existingPID, 3.0, &exitStatus)) {
+            HostLog(@"launch-app reuse-blocked id=%s pid=%d executable=%@ "
+                    "reason=no-window-metrics",
+                    identifier, existingPID, rootPath);
+            *message = [NSString stringWithFormat:
+                @"%s 已在运行（PID %d），但尚未发布可捕获窗口；为避免重复实例，未再次启动",
+                identifier, existingPID];
+            return NO;
+        }
+        os_unfair_lock_lock(&gStateLock);
+        gActiveAppPID = existingPID;
+        gActiveAppID = [@(identifier) copy];
+        os_unfair_lock_unlock(&gStateLock);
+        HostLog(@"launch-app reuse id=%s pid=%d executable=%@ "
+                "identity=proc_pidpath",
+                identifier, existingPID, rootPath);
+        *message = [NSString stringWithFormat:
+            @"%s 已在运行，正在打开现有窗口", identifier];
+        return YES;
     }
 
     posix_spawn_file_actions_t actions;

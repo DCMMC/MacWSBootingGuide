@@ -3,10 +3,12 @@
 #import <IOSurface/IOSurfaceRef.h>
 
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <xpc/xpc.h>
 
@@ -36,6 +38,11 @@ static NSMutableSet *Clients;
 static NSMutableDictionary<NSNumber *, id> *Leases;
 static uint64_t NextStreamID = 1;
 static uint64_t NextLeaseToken = 1;
+static int InvalidationSocket = -1;
+static dispatch_source_t InvalidationSource;
+static BOOL TransientReconcilePending;
+static CGFloat ObservedWindowBackingScale;
+static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void DisplayLog(NSString *format, ...) {
@@ -51,10 +58,39 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t token;
 @property(nonatomic) IOSurfaceRef surface;
 @property(nonatomic, weak) id owner;
+@property(nonatomic) uint32_t layerWindowID;
 @end
 
 @implementation MacWSDisplayLease
 - (void)dealloc { if (_surface) CFRelease(_surface); }
+@end
+
+@class MacWSDisplayClient;
+
+@interface MacWSTransientLayer : NSObject
+@property(nonatomic, weak) MacWSDisplayClient *client;
+@property(nonatomic) uint32_t windowID;
+@property(nonatomic) int32_t level;
+@property(nonatomic) CGRect destinationBounds;
+@property(nonatomic) uint64_t streamID;
+@property(nonatomic) uint64_t sequence;
+@property(nonatomic) uint64_t firstDisplayTime;
+@property(nonatomic) uint64_t droppedFrames;
+@property(nonatomic) NSUInteger missCount;
+@property(nonatomic) CGDisplayStreamRef stream;
+- (void)stopStream;
+@end
+
+@implementation MacWSTransientLayer
+- (void)dealloc { [self stopStream]; }
+- (void)stopStream {
+    if (_stream) {
+        CGDisplayStreamStop(_stream);
+        CFRelease(_stream);
+        _stream = NULL;
+    }
+    _sequence = 0;
+}
 @end
 
 @interface MacWSDisplayClient : NSObject
@@ -64,14 +100,25 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t streamID;
 @property(nonatomic) uint64_t sequence;
 @property(nonatomic) CGDisplayStreamRef stream;
-@property(nonatomic) NSUInteger outstandingFrames;
 @property(nonatomic) uint64_t droppedFrames;
 @property(nonatomic) uint64_t firstDisplayTime;
+@property(nonatomic) CGFloat windowBackingScale;
+@property(nonatomic) NSMutableDictionary<NSNumber *, MacWSTransientLayer *> *transientLayers;
+@property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *outstandingByLayer;
 - (void)stopStream;
+- (void)stopTransientLayers;
 @end
 
 @implementation MacWSDisplayClient
-- (void)dealloc { [self stopStream]; }
+- (void)dealloc {
+    [self stopTransientLayers];
+    [self stopStream];
+}
+- (void)stopTransientLayers {
+    for (MacWSTransientLayer *layer in _transientLayers.allValues)
+        [layer stopStream];
+    [_transientLayers removeAllObjects];
+}
 - (void)stopStream {
     if (_stream) {
         CGDisplayStreamStop(_stream);
@@ -219,6 +266,9 @@ static NSArray<NSDictionary *> *CopyWindowInfo(void) {
 }
 
 static CGFloat MainDisplayBackingScale(void) {
+    if (ObservedWindowBackingScale >= 0.5 &&
+        ObservedWindowBackingScale <= 8.0)
+        return ObservedWindowBackingScale;
     CGDirectDisplayID display = CGMainDisplayID();
     CGRect bounds = CGDisplayBounds(display);
     size_t pixelWidth = CGDisplayPixelsWide(display);
@@ -342,6 +392,55 @@ static void SendWindowList(MacWSDisplayClient *client) {
     xpc_connection_send_message(client.connection, event);
 }
 
+static void BroadcastWindowList(void) {
+    for (MacWSDisplayClient *client in [Clients copy])
+        SendWindowList(client);
+}
+
+// AppKit processes publish their window metrics in a shared sidecar. This
+// datagram is only an invalidation edge: displayd remains the single process
+// that reads the real CGWindow catalog and broadcasts a validated snapshot.
+// A dispatch source drains every queued byte before one broadcast, so a tab
+// switch plus its metrics update cannot turn into repeated catalog scans.
+static void StartInvalidationListener(void) {
+    InvalidationSocket = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (InvalidationSocket < 0) {
+        DisplayLog(@"catalog-invalidation socket-create failed errno=%d", errno);
+        return;
+    }
+    int flags = fcntl(InvalidationSocket, F_GETFL);
+    if (flags >= 0) (void)fcntl(InvalidationSocket, F_SETFL,
+                                flags | O_NONBLOCK);
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, MACWS_STREAM_INVALIDATE_SOCKET_PATH,
+            sizeof(address.sun_path));
+    unlink(MACWS_STREAM_INVALIDATE_SOCKET_PATH);
+    if (bind(InvalidationSocket, (const struct sockaddr *)&address,
+             sizeof(address)) != 0) {
+        DisplayLog(@"catalog-invalidation bind failed errno=%d", errno);
+        close(InvalidationSocket);
+        InvalidationSocket = -1;
+        return;
+    }
+    chmod(MACWS_STREAM_INVALIDATE_SOCKET_PATH, 0666);
+    InvalidationSource = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_READ, (uintptr_t)InvalidationSocket, 0,
+        DisplayQueue);
+    dispatch_source_set_event_handler(InvalidationSource, ^{
+        uint8_t bytes[128];
+        while (recv(InvalidationSocket, bytes, sizeof(bytes), 0) > 0) {}
+        BroadcastWindowList();
+        ScheduleTransientReconcile(0);
+    });
+    dispatch_source_set_cancel_handler(InvalidationSource, ^{
+        if (InvalidationSocket >= 0) close(InvalidationSocket);
+        InvalidationSocket = -1;
+        unlink(MACWS_STREAM_INVALIDATE_SOCKET_PATH);
+    });
+    dispatch_resume(InvalidationSource);
+}
+
 static NSDictionary *StreamProperties(void) {
     NSMutableDictionary *properties = [@{
         (__bridge id)kCGDisplayStreamQueueDepth: @3,
@@ -360,21 +459,41 @@ static NSDictionary *StreamProperties(void) {
     return properties;
 }
 
-static void PublishFrame(MacWSDisplayClient *client, uint64_t displayTime,
-                         IOSurfaceRef surface) {
+static NSUInteger OutstandingFramesForLayer(MacWSDisplayClient *client,
+                                             uint32_t layerWindowID) {
+    return [client.outstandingByLayer[@(layerWindowID)] unsignedIntegerValue];
+}
+
+static void SetOutstandingFramesForLayer(MacWSDisplayClient *client,
+                                         uint32_t layerWindowID,
+                                         NSUInteger count) {
+    if (!client.outstandingByLayer)
+        client.outstandingByLayer = [NSMutableDictionary dictionary];
+    if (count == 0) [client.outstandingByLayer removeObjectForKey:@(layerWindowID)];
+    else client.outstandingByLayer[@(layerWindowID)] = @(count);
+}
+
+static void PublishFrame(MacWSDisplayClient *client,
+                         MacWSTransientLayer *layer,
+                         uint64_t displayTime, IOSurfaceRef surface) {
     if (!surface || ![Clients containsObject:client]) return;
+    uint32_t layerWindowID = layer ? layer.windowID
+        : (client.windowID ? client.windowID : UINT32_MAX);
+    uint64_t producerStreamID = layer ? layer.streamID : client.streamID;
     // With a stream queue depth of three, retaining more than three surfaces
-    // can pin every compositor buffer. Drop instead of blocking SkyLight or
-    // allocating an unbounded compatibility pool.
-    if (client.outstandingFrames >= 3) {
-        client.droppedFrames++;
-        if (client.droppedFrames == 1 ||
-            (client.droppedFrames % 120) == 0) {
-            DisplayLog(@"backpressure stream=%llu window=%u outstanding=%lu "
+    // from one producer can pin that producer's compositor buffers. Bound
+    // base and each transient independently so a static menu cannot stall the
+    // continuously updating document stream.
+    NSUInteger outstanding = OutstandingFramesForLayer(client, layerWindowID);
+    if (outstanding >= 3) {
+        uint64_t dropped = layer ? ++layer.droppedFrames
+                                 : ++client.droppedFrames;
+        if (dropped == 1 || (dropped % 120) == 0) {
+            DisplayLog(@"backpressure stream=%llu window=%u layer=%u outstanding=%lu "
                        "dropped=%llu",
-                (unsigned long long)client.streamID, client.windowID,
-                (unsigned long)client.outstandingFrames,
-                (unsigned long long)client.droppedFrames);
+                (unsigned long long)producerStreamID, client.windowID,
+                layerWindowID, (unsigned long)outstanding,
+                (unsigned long long)dropped);
         }
         return;
     }
@@ -386,56 +505,120 @@ static void PublishFrame(MacWSDisplayClient *client, uint64_t displayTime,
         width > MACWS_STREAM_MAX_DIMENSION ||
         height > MACWS_STREAM_MAX_DIMENSION ||
         bytesPerRow > UINT32_MAX) return;
+    if (!layer && client.mode == MacWSStreamModeWindow &&
+        client.windowBackingScale <= 0.0) {
+        for (NSDictionary *info in CopyWindowInfo()) {
+            if ([info[(id)kCGWindowNumber] unsignedIntValue] !=
+                client.windowID) continue;
+            CGRect bounds = CGRectZero;
+            if (!CGRectMakeWithDictionaryRepresentation(
+                    (__bridge CFDictionaryRef)info[(id)kCGWindowBounds],
+                    &bounds) || bounds.size.width <= 0.0 ||
+                bounds.size.height <= 0.0) break;
+            CGFloat scaleX = width / bounds.size.width;
+            CGFloat scaleY = height / bounds.size.height;
+            CGFloat measured = (scaleX + scaleY) * 0.5;
+            if (isfinite(measured) && measured >= 0.5 && measured <= 8.0 &&
+                fabs(scaleX - scaleY) <= 0.08) {
+                client.windowBackingScale = measured;
+                ObservedWindowBackingScale = measured;
+                DisplayLog(@"runtime-confirmed backing-scale window=%u surface=%zux%zu bounds=%.1fx%.1f scale=%.3f",
+                           client.windowID, width, height,
+                           bounds.size.width, bounds.size.height, measured);
+            }
+            break;
+        }
+    }
+    uint32_t contentWidth = (uint32_t)width;
+    uint32_t contentHeight = (uint32_t)height;
+    int32_t destinationX = layer
+        ? (int32_t)llround(layer.destinationBounds.origin.x) : 0;
+    int32_t destinationY = layer
+        ? (int32_t)llround(layer.destinationBounds.origin.y) : 0;
+    uint32_t destinationWidth = layer
+        ? (uint32_t)llround(layer.destinationBounds.size.width)
+        : contentWidth;
+    uint32_t destinationHeight = layer
+        ? (uint32_t)llround(layer.destinationBounds.size.height)
+        : contentHeight;
+    if (destinationWidth == 0 || destinationHeight == 0) return;
 
     MacWSDisplayLease *lease = [MacWSDisplayLease new];
     lease.token = NextLeaseToken++;
     if (lease.token == 0) lease.token = NextLeaseToken++;
     lease.surface = (IOSurfaceRef)CFRetain(surface);
     lease.owner = client;
+    lease.layerWindowID = layerWindowID;
     Leases[@(lease.token)] = lease;
-    client.outstandingFrames++;
+    SetOutstandingFramesForLayer(client, layerWindowID, outstanding + 1);
 
-    CGFloat scale = MainDisplayBackingScale();
+    CGFloat scale = client.windowBackingScale > 0.0
+        ? client.windowBackingScale : MainDisplayBackingScale();
     MacWSStreamFrameDescriptor descriptor = {
         .magic = MACWS_STREAM_MAGIC,
         .version = MACWS_STREAM_VERSION,
         .size = sizeof(MacWSStreamFrameDescriptor),
-        .streamID = client.streamID,
+        .streamID = producerStreamID,
         .windowID = client.windowID,
-        .flags = MacWSStreamFrameComplete,
+        .flags = MacWSStreamFrameComplete |
+                 (layer ? MacWSStreamFrameOverlay : 0),
         .leaseToken = lease.token,
-        .sequence = ++client.sequence,
+        .sequence = layer ? ++layer.sequence : ++client.sequence,
         .displayTime = displayTime,
         .width = (uint32_t)width,
         .height = (uint32_t)height,
         .bytesPerRow = (uint32_t)bytesPerRow,
         .pixelFormat = IOSurfaceGetPixelFormat(surface),
         .backingScale = scale,
+        .contentX = 0,
+        .contentY = 0,
+        .contentWidth = contentWidth,
+        .contentHeight = contentHeight,
+        .layerWindowID = layerWindowID,
+        .layerLevel = layer ? layer.level : 0,
+        .destinationX = destinationX,
+        .destinationY = destinationY,
+        .destinationWidth = destinationWidth,
+        .destinationHeight = destinationHeight,
     };
-    if (descriptor.sequence == 1) client.firstDisplayTime = displayTime;
+    if (descriptor.sequence == 1) {
+        if (layer) layer.firstDisplayTime = displayTime;
+        else client.firstDisplayTime = displayTime;
+        DisplayLog(@"frame-first stream=%llu window=%u layer=%u overlay=%s "
+                   "surface=%ux%u destination=(%d,%d %ux%u)",
+            (unsigned long long)producerStreamID, client.windowID,
+            layerWindowID, layer ? "YES" : "NO",
+            descriptor.width, descriptor.height, descriptor.destinationX,
+            descriptor.destinationY, descriptor.destinationWidth,
+            descriptor.destinationHeight);
+    }
+    uint64_t firstDisplayTime = layer ? layer.firstDisplayTime
+                                      : client.firstDisplayTime;
     if ((descriptor.sequence % 120) == 0 &&
-        displayTime >= client.firstDisplayTime) {
+        displayTime >= firstDisplayTime) {
         static mach_timebase_info_data_t timebase;
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{ (void)mach_timebase_info(&timebase); });
         double elapsed = timebase.denom
-            ? (double)(displayTime - client.firstDisplayTime) *
+            ? (double)(displayTime - firstDisplayTime) *
                 timebase.numer / timebase.denom / 1.0e9
             : 0.0;
-        DisplayLog(@"throughput stream=%llu window=%u frames=%llu "
+        DisplayLog(@"throughput stream=%llu window=%u layer=%u frames=%llu "
                    "elapsed=%.3f fps=%.2f outstanding=%lu dropped=%llu",
-            (unsigned long long)client.streamID, client.windowID,
+            (unsigned long long)producerStreamID, client.windowID,
+            layerWindowID,
             (unsigned long long)descriptor.sequence, elapsed,
             elapsed > 0.0 ? (descriptor.sequence - 1) / elapsed : 0.0,
-            (unsigned long)client.outstandingFrames,
-            (unsigned long long)client.droppedFrames);
+            (unsigned long)outstanding,
+            (unsigned long long)(layer ? layer.droppedFrames
+                                      : client.droppedFrames));
     }
     if (descriptor.pixelFormat == 0) descriptor.pixelFormat = 0x42475241u;
 
     mach_port_t port = IOSurfaceCreateMachPort(surface);
     if (!MACH_PORT_VALID(port)) {
         [Leases removeObjectForKey:@(lease.token)];
-        client.outstandingFrames--;
+        SetOutstandingFramesForLayer(client, layerWindowID, outstanding);
         return;
     }
     xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
@@ -455,14 +638,18 @@ static void PublishFrame(MacWSDisplayClient *client, uint64_t displayTime,
 static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
     NSDictionary *properties = StreamProperties();
     __weak MacWSDisplayClient *weakClient = client;
+    uint64_t generation = client.streamID;
     CGDisplayStreamFrameAvailableHandler handler =
         ^(CGDisplayStreamFrameStatus status, uint64_t displayTime,
           IOSurfaceRef frameSurface, CGDisplayStreamUpdateRef updateRef) {
             (void)updateRef;
             MacWSDisplayClient *strongClient = weakClient;
-            if (!strongClient) return;
+            // CGDisplayStreamStop is asynchronous. A terminal callback from
+            // the previous exact/composite stream must not be relabelled with
+            // the new streamID and overwrite the Host with stale pixels.
+            if (!strongClient || strongClient.streamID != generation) return;
             if (status == kCGDisplayStreamFrameStatusFrameComplete) {
-                PublishFrame(strongClient, displayTime, frameSurface);
+                PublishFrame(strongClient, nil, displayTime, frameSurface);
             } else if (status == kCGDisplayStreamFrameStatusStopped) {
                 SendStatus(strongClient, MACWS_STREAM_EVENT_STOPPED,
                            @"DisplayStream stopped", YES);
@@ -485,11 +672,65 @@ static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
                         DisplayQueue, handler);
 }
 
-static void StartSubscription(MacWSDisplayClient *client,
-                              MacWSStreamMode mode, uint32_t windowID) {
+static void SendLayerRemoved(MacWSDisplayClient *client,
+                             uint32_t layerWindowID) {
+    xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT,
+                              MACWS_STREAM_EVENT_LAYER_REMOVED);
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_PROTOCOL_VERSION,
+                              MACWS_STREAM_VERSION);
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_WINDOW_ID,
+                              client.windowID);
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_LAYER_WINDOW_ID,
+                              layerWindowID);
+    xpc_connection_send_message(client.connection, event);
+}
+
+static void StartTransientLayer(MacWSTransientLayer *layer) {
+    MacWSDisplayClient *client = layer.client;
+    if (!client || layer.windowID == 0) return;
+    [layer stopStream];
+    layer.streamID = NextStreamID++;
+    if (layer.streamID == 0) layer.streamID = NextStreamID++;
+    layer.droppedFrames = 0;
+    layer.firstDisplayTime = 0;
+    uint64_t generation = layer.streamID;
+    __weak MacWSTransientLayer *weakLayer = layer;
+    CGDisplayStreamFrameAvailableHandler handler =
+        ^(CGDisplayStreamFrameStatus status, uint64_t displayTime,
+          IOSurfaceRef frameSurface, CGDisplayStreamUpdateRef updateRef) {
+            (void)updateRef;
+            MacWSTransientLayer *strongLayer = weakLayer;
+            MacWSDisplayClient *strongClient = strongLayer.client;
+            if (!strongLayer || !strongClient ||
+                strongLayer.streamID != generation) return;
+            if (status == kCGDisplayStreamFrameStatusFrameComplete)
+                PublishFrame(strongClient, strongLayer, displayTime,
+                             frameSurface);
+        };
+    MacWSSLSWindowStreamCreate createWindow = dlsym(
+        RTLD_DEFAULT, "SLSHWCaptureStreamCreateWithWindow");
+    if (!createWindow) return;
+    layer.stream = createWindow(layer.windowID, false,
+        (__bridge CFDictionaryRef)StreamProperties(), DisplayQueue, handler);
+    if (!layer.stream) return;
+    CGError error = CGDisplayStreamStart(layer.stream);
+    if (error != kCGErrorSuccess) {
+        [layer stopStream];
+        DisplayLog(@"layer-start failed base=%u layer=%u error=%d",
+                   client.windowID, layer.windowID, error);
+        return;
+    }
+    DisplayLog(@"layer-start stream=%llu base=%u layer=%u level=%d "
+               "destination=(%.0f,%.0f %.0fx%.0f)",
+        (unsigned long long)layer.streamID, client.windowID, layer.windowID,
+        layer.level, layer.destinationBounds.origin.x,
+        layer.destinationBounds.origin.y, layer.destinationBounds.size.width,
+        layer.destinationBounds.size.height);
+}
+
+static void StartClientStream(MacWSDisplayClient *client) {
     [client stopStream];
-    client.mode = mode;
-    client.windowID = mode == MacWSStreamModeWindow ? windowID : 0;
     client.streamID = NextStreamID++;
     if (client.streamID == 0) client.streamID = NextStreamID++;
     client.droppedFrames = 0;
@@ -497,7 +738,7 @@ static void StartSubscription(MacWSDisplayClient *client,
     client.stream = CreateStream(client);
     if (!client.stream) {
         SendStatus(client, MACWS_STREAM_EVENT_ERROR,
-            mode == MacWSStreamModeWindow
+            client.mode == MacWSStreamModeWindow
                 ? @"无法创建 SkyLight window DisplayStream"
                 : @"无法创建 fullscreen CGDisplayStream", NO);
         return;
@@ -510,18 +751,133 @@ static void StartSubscription(MacWSDisplayClient *client,
         SendStatus(client, MACWS_STREAM_EVENT_ERROR, message, NO);
         return;
     }
-    DisplayLog(@"stream-start id=%llu mode=%u window=%u",
-        (unsigned long long)client.streamID, mode, client.windowID);
+    DisplayLog(@"stream-start id=%llu mode=%u window=%u exact=%s",
+        (unsigned long long)client.streamID, client.mode, client.windowID,
+        client.mode == MacWSStreamModeWindow ? "YES" : "NO");
+}
+
+static void StartSubscription(MacWSDisplayClient *client,
+                              MacWSStreamMode mode, uint32_t windowID) {
+    client.mode = mode;
+    client.windowID = mode == MacWSStreamModeWindow ? windowID : 0;
+    client.windowBackingScale = 0.0;
+    [client stopTransientLayers];
+    StartClientStream(client);
+    if (mode == MacWSStreamModeWindow) ScheduleTransientReconcile(0);
+}
+
+// Menus, popovers and sheets are real nonzero-layer SkyLight windows. Runtime
+// evidence on the target iPad shows their exact window capture streams produce
+// Retina IOSurfaces, while the full-display CGDisplayStream produces no first
+// frame under WindowServer -virtualonly. Keep the base stream permanently
+// exact and attach each same-owner transient as an independent native layer.
+// Host composites the layers with Metal; no RFB, CPU copy, or stream-mode
+// restart is involved.
+static void ReconcileTransientStreams(void) {
+    TransientReconcilePending = NO;
+    NSArray<NSDictionary *> *windowInfo = CopyWindowInfo();
+    BOOL needsFollowup = NO;
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (client.mode != MacWSStreamModeWindow || client.windowID == 0)
+            continue;
+        NSDictionary *baseInfo = nil;
+        for (NSDictionary *info in windowInfo) {
+            if ([info[(id)kCGWindowNumber] unsignedIntValue] ==
+                client.windowID) {
+                baseInfo = info;
+                break;
+            }
+        }
+        CGRect baseBounds = CGRectZero;
+        if (!baseInfo || !CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)baseInfo[(id)kCGWindowBounds],
+                &baseBounds) || CGRectIsEmpty(baseBounds)) continue;
+        int32_t ownerPID = [baseInfo[(id)kCGWindowOwnerPID] intValue];
+        CGFloat scale = client.windowBackingScale > 0.0
+            ? client.windowBackingScale : MainDisplayBackingScale();
+        if (!isfinite(scale) || scale < 0.5 || scale > 8.0) continue;
+
+        if (!client.transientLayers)
+            client.transientLayers = [NSMutableDictionary dictionary];
+        NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
+        NSUInteger attached = 0;
+        for (NSDictionary *info in windowInfo) {
+            uint32_t candidateWindowID =
+                [info[(id)kCGWindowNumber] unsignedIntValue];
+            NSInteger level = [info[(id)kCGWindowLayer] integerValue];
+            if (attached >= 8 || candidateWindowID == 0 ||
+                candidateWindowID == client.windowID || level == 0 ||
+                [info[(id)kCGWindowOwnerPID] intValue] != ownerPID ||
+                [info[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
+            CGRect candidateBounds = CGRectZero;
+            if (!CGRectMakeWithDictionaryRepresentation(
+                    (__bridge CFDictionaryRef)info[(id)kCGWindowBounds],
+                    &candidateBounds) || CGRectIsEmpty(candidateBounds) ||
+                !CGRectIntersectsRect(baseBounds, candidateBounds)) continue;
+
+            NSNumber *key = @(candidateWindowID);
+            [seen addObject:key];
+            attached++;
+            CGRect destination = CGRectMake(
+                (candidateBounds.origin.x - baseBounds.origin.x) * scale,
+                (candidateBounds.origin.y - baseBounds.origin.y) * scale,
+                candidateBounds.size.width * scale,
+                candidateBounds.size.height * scale);
+            MacWSTransientLayer *layer = client.transientLayers[key];
+            BOOL isNew = layer == nil;
+            if (isNew) {
+                layer = [MacWSTransientLayer new];
+                layer.client = client;
+                layer.windowID = candidateWindowID;
+                client.transientLayers[key] = layer;
+            }
+            layer.level = (int32_t)MAX(INT32_MIN,
+                MIN((NSInteger)INT32_MAX, level));
+            layer.destinationBounds = destination;
+            layer.missCount = 0;
+            if (isNew || !layer.stream) StartTransientLayer(layer);
+        }
+
+        for (NSNumber *key in [client.transientLayers.allKeys copy]) {
+            MacWSTransientLayer *layer = client.transientLayers[key];
+            if ([seen containsObject:key]) continue;
+            // A transient can briefly disappear from the on-screen catalog
+            // while AppKit swaps its selection/shadow surface. Three misses
+            // bound detach latency to 300 ms without a one-sample flicker.
+            layer.missCount++;
+            if (layer.missCount < 3) continue;
+            DisplayLog(@"layer-remove base=%u layer=%u",
+                       client.windowID, layer.windowID);
+            SendLayerRemoved(client, layer.windowID);
+            [layer stopStream];
+            [client.transientLayers removeObjectForKey:key];
+        }
+        if (client.transientLayers.count) needsFollowup = YES;
+    }
+    if (needsFollowup)
+        ScheduleTransientReconcile(100 * NSEC_PER_MSEC);
+}
+
+static void ScheduleTransientReconcile(uint64_t delayNanoseconds) {
+    if (TransientReconcilePending) return;
+    TransientReconcilePending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanoseconds),
+                   DisplayQueue, ^{ ReconcileTransientStreams(); });
 }
 
 static void ReleaseLease(uint64_t token, MacWSDisplayClient *client) {
     MacWSDisplayLease *lease = Leases[@(token)];
     if (!lease || lease.owner != client) return;
-    if (client.outstandingFrames) client.outstandingFrames--;
+    NSUInteger outstanding = OutstandingFramesForLayer(
+        client, lease.layerWindowID);
+    if (outstanding)
+        SetOutstandingFramesForLayer(client, lease.layerWindowID,
+                                     outstanding - 1);
     [Leases removeObjectForKey:@(token)];
 }
 
 static void RemoveClient(MacWSDisplayClient *client) {
+    [client stopTransientLayers];
     [client stopStream];
     NSArray<NSNumber *> *tokens = [Leases.allKeys copy];
     for (NSNumber *token in tokens) {
@@ -567,6 +923,7 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
         }
         StartSubscription(client, mode, (uint32_t)windowID);
     } else if (strcmp(operation, MACWS_STREAM_OP_UNSUBSCRIBE) == 0) {
+        [client stopTransientLayers];
         [client stopStream];
     } else if (strcmp(operation, MACWS_STREAM_OP_RELEASE_FRAME) == 0) {
         ReleaseLease(xpc_dictionary_get_uint64(
@@ -589,6 +946,8 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
 static void AcceptConnection(xpc_connection_t connection) {
     MacWSDisplayClient *client = [MacWSDisplayClient new];
     client.connection = connection;
+    client.transientLayers = [NSMutableDictionary dictionary];
+    client.outstandingByLayer = [NSMutableDictionary dictionary];
     [Clients addObject:client];
     xpc_connection_set_target_queue(connection, DisplayQueue);
     xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {
@@ -605,6 +964,7 @@ int main(void) {
                                           DISPATCH_QUEUE_CONCURRENT);
         Clients = [NSMutableSet set];
         Leases = [NSMutableDictionary dictionary];
+        StartInvalidationListener();
         xpc_connection_t listener = xpc_connection_create_mach_service(
             MACWS_STREAM_SERVICE, DisplayQueue,
             XPC_CONNECTION_MACH_SERVICE_LISTENER);

@@ -98,9 +98,18 @@ int main(void) {
         .bytesPerRow = 2732 * 4,
         .pixelFormat = 0x42475241u,
         .backingScale = 2.0f,
+        .contentWidth = 2732,
+        .contentHeight = 2048,
+        .layerWindowID = 42,
+        .destinationWidth = 2732,
+        .destinationHeight = 2048,
     };
     assert(MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
     frame.bytesPerRow = 1;
+    assert(!MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
+    frame.bytesPerRow = 2732 * 4;
+    frame.contentX = 1000;
+    frame.contentWidth = 2000;
     assert(!MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
 
     const char title[] = "Terminal";
