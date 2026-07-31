@@ -226,7 +226,7 @@ static _Atomic BOOL MacWSAppInputConsumeEscapeUp;
 // returns. The socket thread uses this lifecycle witness to cancel the real
 // HIToolbox tracker even if a main-thread target probe cannot publish the
 // transient NSMenuWindowManagerWindow while that tracker is nested.
-static _Atomic BOOL MacWSAppInputSecondaryTrackingActive;
+static _Atomic BOOL MacWSAppInputSynchronousTrackingActive;
 // Main-thread-only observational witness. The wrapped AppKit method owns the
 // real nested menu event loop for the complete lifetime of this pointer.
 // AppInput uses it only to put mouse-moved NSEvents into NSApplication's real
@@ -1104,7 +1104,7 @@ static BOOL MacWSPrepareDirectMenuPostLocked(
     BOOL isMenuMotion = record.kind == MacWSInputKindMenuHover ||
                         record.kind == MacWSInputKindHover;
     BOOL carbonTrackerActive = atomic_load_explicit(
-        &MacWSAppInputSecondaryTrackingActive, memory_order_acquire);
+        &MacWSAppInputSynchronousTrackingActive, memory_order_acquire);
     BOOL legacyVNCMenuMotion =
         record.sceneID == 0x564e430000000001ull &&
         record.kind == MacWSInputKindMenuHover;
@@ -1128,7 +1128,7 @@ static BOOL MacWSPrepareDirectMenuPostLocked(
 static BOOL MacWSPrepareDirectMenuTapPostLocked(
         MacWSInputRecord record, MacWSDirectTrackingSnapshot *snapshot) {
     if (record.kind != MacWSInputKindTap ||
-        !atomic_load_explicit(&MacWSAppInputSecondaryTrackingActive,
+        !atomic_load_explicit(&MacWSAppInputSynchronousTrackingActive,
                               memory_order_acquire) ||
         !MacWSAppInputMenuContextValid ||
         !MacWSAppInputMenuContext.application ||
@@ -1305,6 +1305,15 @@ static void MacWSMenuEventLoopWitness(id self, SEL command, BOOL track,
                                       id mode) {
     id previous = MacWSAppInputTrackingMenuPresentation;
     MacWSAppInputTrackingMenuPresentation = self;
+    // This is the authoritative AppKit nested-event-loop boundary. Electron
+    // can schedule a native menu after the originating leftMouseDown has
+    // already returned, so button-specific prediction cannot cover it. Keep
+    // the socket-side direct queue route active for the exact lifetime of
+    // _doMenuEventLoop: itself; the cached transform still comes from the
+    // real preceding target-window click.
+    BOOL previousSynchronousTracking = atomic_exchange_explicit(
+        &MacWSAppInputSynchronousTrackingActive, YES,
+        memory_order_acq_rel);
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,
                 "#### APP-INPUT MENU-TRACK-BEGIN pid=%d presentation=%s\n",
@@ -1337,6 +1346,9 @@ static void MacWSMenuEventLoopWitness(id self, SEL command, BOOL track,
         fflush(stderr);
     }
     MacWSAppInputTrackingMenuPresentation = previous;
+    atomic_store_explicit(&MacWSAppInputSynchronousTrackingActive,
+                          previousSynchronousTracking,
+                          memory_order_release);
 }
 
 static void MacWSInstallMenuEventLoopWitness(void) {
@@ -1562,7 +1574,7 @@ static BOOL MacWSCancelActiveMenuForEscape(id application,
     // Prefer HIToolbox's own active-session cancellation whenever the target
     // probe observed an exact NSMenuWindowManagerWindow.
     BOOL secondaryTracker = atomic_load_explicit(
-        &MacWSAppInputSecondaryTrackingActive, memory_order_acquire);
+        &MacWSAppInputSynchronousTrackingActive, memory_order_acquire);
     if ((menuSurface || secondaryTracker) &&
         MacWSCancelCarbonMenuTrackingForEscape(
             application, menuSurface ? windowNumber : 0)) {
@@ -2210,7 +2222,7 @@ static void MacWSPostDirectTrackingRecord(
             // keep FIFO tail ordering because their chronology is semantic.
             BOOL atStart = record.kind == MacWSInputKindMenuHover ||
                 (record.kind == MacWSInputKindHover &&
-                 atomic_load_explicit(&MacWSAppInputSecondaryTrackingActive,
+                 atomic_load_explicit(&MacWSAppInputSynchronousTrackingActive,
                                       memory_order_acquire));
             ((MacWSPostEvent)objc_msgSend)(
                 (__bridge id)snapshot.application,
@@ -2854,6 +2866,16 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 window, sel_registerName("respondsToSelector:"),
                 performClose)) {
             ((void (*)(id, SEL, id))objc_msgSend)(window, performClose, nil);
+            // performClose: can run delegate validation synchronously, while
+            // the final NSApplication.windows mutation lands on the next main
+            // loop turn. Publish the committed catalog after that turn so
+            // every Host Scene observes the close without a polling delay.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                          100 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                MacWSPublishWindowMetrics();
+                MacWSNotifyDisplayCatalogChanged('c');
+            });
             if (MacWSRuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
                     "#### APP-INPUT CLOSE-WINDOW pid=%d window=%u\n",
@@ -3276,35 +3298,33 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             MacWSClearDeferredRFBMoveEvents();
             return;
         }
-        if (secondary) {
-            // The exact rightMouseDown below can synchronously enter Carbon's
-            // TrackMenuCommon and stop servicing our main-run-loop drain. Save
-            // the source-to-AppKit transform before that happens. Window
-            // DisplayStreams use the requested base window's pixel rectangle;
-            // full-display/RFB input uses the NSScreen rectangle.
-            CGRect inputMappingFrame = screenFrame;
-            if (requestedBaseWindow) {
-                inputMappingFrame = ((MacWSMsgRect)objc_msgSend)(
-                    requestedBaseWindow, sel_registerName("frame"));
-            }
-            pthread_mutex_lock(&MacWSAppInputRouteLock);
-            MacWSCacheMenuContextLocked(
-                application, eventClass, windowNumber, inputMappingFrame,
-                screenPoint, windowPoint, NO);
-            pthread_mutex_unlock(&MacWSAppInputRouteLock);
+        // Either mouse button can synchronously enter AppKit/Carbon tracking:
+        // a primary click can open an Electron toolbar menu just as a
+        // secondary click opens a context menu. Cache the exact source/window
+        // transform before sendEvent: and expose the synchronous interval to
+        // the socket thread. If sendEvent: returns normally this interval is
+        // only a few microseconds; if it enters TrackMenuCommon, later taps go
+        // straight into the event queue that the nested tracker consumes.
+        CGRect inputMappingFrame = screenFrame;
+        if (requestedBaseWindow) {
+            inputMappingFrame = ((MacWSMsgRect)objc_msgSend)(
+                requestedBaseWindow, sel_registerName("frame"));
         }
+        pthread_mutex_lock(&MacWSAppInputRouteLock);
+        MacWSCacheMenuContextLocked(
+            application, eventClass, windowNumber, inputMappingFrame,
+            screenPoint, windowPoint, NO);
+        pthread_mutex_unlock(&MacWSAppInputRouteLock);
         MacWSAppInputRFBTrackingActive = YES;
         MacWSAppInputRFBTrackingButtons = secondary ? 2u : 1u;
-        if (secondary) atomic_store_explicit(
-            &MacWSAppInputSecondaryTrackingActive, YES,
-            memory_order_release);
+        atomic_store_explicit(&MacWSAppInputSynchronousTrackingActive, YES,
+                              memory_order_release);
         ((MacWSPostEvent)objc_msgSend)(application,
             sel_registerName("postEvent:atStart:"), upEvent, YES);
         ((MacWSSendEvent)objc_msgSend)(application,
             sel_registerName("sendEvent:"), event);
-        if (secondary) atomic_store_explicit(
-            &MacWSAppInputSecondaryTrackingActive, NO,
-            memory_order_release);
+        atomic_store_explicit(&MacWSAppInputSynchronousTrackingActive, NO,
+                              memory_order_release);
         MacWSAppInputRFBTrackingActive = NO;
         MacWSAppInputRFBTrackingButtons = 0;
         if (MacWSRuntimeDiagnosticsEnabled()) {
@@ -3324,10 +3344,14 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 sel_registerName("windowNumber")) : 0;
         if (keyWindowNumberAfterEvent != keyWindowNumberBeforeEvent)
             MacWSNotifyDisplayCatalogChanged('k');
-        // A secondary click can create a separate AppKit menu window even
-        // while the key window is unchanged. Notify displayd so its transient
-        // surface reconciler can attach/detach that surface to this Scene.
-        if (secondary) MacWSNotifyDisplayCatalogChanged('t');
+        // Any atomic click can create or dismiss a separate AppKit/Electron
+        // popover window while the key window remains unchanged. Runtime on
+        // VSCode's Simple Browser showed the outside click completed in the
+        // base NSWindow, but Host kept compositing the closed transient's last
+        // IOSurface because this edge was previously emitted only for right
+        // clicks. Reconcile after every semantic click; displayd still reads
+        // the real on-screen CGWindow catalog and owns attach/detach policy.
+        MacWSNotifyDisplayCatalogChanged('t');
         MacWSSetAppInputGestureWindow(nil);
         MacWSClearDeferredRFBMoveEvents();
         return;
@@ -4392,6 +4416,8 @@ static void MacWSPublishWindowMetrics(void) {
     if (!application) return;
     id windows = ((MacWSMsgID)objc_msgSend)(
         application, sel_registerName("windows"));
+    id keyWindow = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("keyWindow"));
     NSMutableData *entries = [NSMutableData data];
     NSUInteger count = [windows count];
     for (NSUInteger index = 0;
@@ -4410,10 +4436,24 @@ static void MacWSPublishWindowMetrics(void) {
         BOOL resizable = NO;
         CGSize minimum = MacWSEffectiveMinimumFrameSize(
             window, frame, &resizable);
+        BOOL orderedVisible = ((MacWSMsgBool)objc_msgSend)(
+            window, sel_registerName("isVisible"));
+        NSInteger windowLevel = ((MacWSMsgInteger)objc_msgSend)(
+            window, sel_registerName("level"));
+        // `Visible` is the cross-process contract for a window that may own
+        // an iPad Scene, not merely AppKit's ordered-in bit. Runtime evidence
+        // for Terminal's Low Disk Space alert was exact: metrics advertised
+        // window 138 as Visible while displayd observed the same CGWindow at
+        // level 8 and correctly attached it as window 137's transient layer.
+        // Publish only ordinary level-0 windows here; panels/alerts continue
+        // through displayd's transient stream and cannot satisfy launcher
+        // readiness or create their own Scene.
+        BOOL visible = orderedVisible && windowLevel == 0;
         MacWSWindowMetricsEntry entry = {
             .windowID = (uint32_t)number,
-            .flags = resizable
-                ? MacWSStreamWindowResizable : 0,
+            .flags = (resizable ? MacWSStreamWindowResizable : 0) |
+                (visible ? MacWSStreamWindowVisible : 0) |
+                (window == keyWindow ? MacWSStreamWindowFocused : 0),
             .logicalGroupID = MacWSLogicalWindowGroupID(window),
             .minimumLogicalWidth = (float)minimum.width,
             .minimumLogicalHeight = (float)minimum.height,
@@ -4561,7 +4601,7 @@ __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     pthread_mutex_lock(&MacWSAppInputRouteLock);
     MacWSAppInputRFBTrackingActive = NO;
     MacWSAppInputRFBTrackingButtons = 0;
-    atomic_store_explicit(&MacWSAppInputSecondaryTrackingActive, NO,
+    atomic_store_explicit(&MacWSAppInputSynchronousTrackingActive, NO,
                           memory_order_release);
     MacWSClearDirectTrackingContextLocked();
     pthread_mutex_unlock(&MacWSAppInputRouteLock);

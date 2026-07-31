@@ -56,6 +56,9 @@ static const char *const kVSCodeLabel =
     "UIKitApplication:com.macwsguide.vscode";
 static const char *const kVSCodePlist =
     "/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist";
+static const char *const kVSCodeLog = "/var/jb/var/mobile/vscode.log";
+static const char *const kVSCodeHealthMarker =
+    "/var/jb/var/mobile/vscode-health-marker";
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
@@ -537,8 +540,9 @@ static const AllowedApp kAllowedApps[] = {
 // A native Host launch is complete when AppInputBridge has published at least
 // one real NSWindow descriptor. This replaces the VNC framebuffer
 // acknowledgement, which is intentionally absent under `start --no-vnc`.
-static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
-                                 int *exitStatusOut) {
+static BOOL WaitForWindowMetricsFlags(pid_t pid, NSTimeInterval timeout,
+                                      uint32_t requiredFlags,
+                                      int *exitStatusOut) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path),
              "/var/mnt/rootfs/private/tmp/macws_window_metrics.%d.bin", pid);
@@ -561,16 +565,120 @@ static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
             struct stat st = {0};
             MacWSWindowMetricsHeader header = {0};
             ssize_t count = read(fd, &header, sizeof(header));
-            BOOL ready = fstat(fd, &st) == 0 &&
+            BOOL valid = fstat(fd, &st) == 0 &&
                 count == (ssize_t)sizeof(header) &&
                 st.st_size >= (off_t)sizeof(header) &&
-                MacWSWindowMetricsAreValid(&header, (size_t)st.st_size) &&
-                header.entryCount > 0;
+                MacWSWindowMetricsAreValid(&header, (size_t)st.st_size);
+            BOOL ready = NO;
+            if (valid) {
+                // NSApplication.windows retains ordered-out panels and other
+                // invisible objects after the last user window closes.
+                // Runtime-confirmed with Terminal after Scene discard: the
+                // sidecar still had entries while displayd's validated
+                // catalog had no window for that PID. A launch is reusable
+                // only when at least one real AppKit window is visible.
+                for (uint32_t index = 0; index < header.entryCount; index++) {
+                    MacWSWindowMetricsEntry entry = {0};
+                    off_t offset = (off_t)header.size +
+                        (off_t)index * header.entrySize;
+                    if (pread(fd, &entry, sizeof(entry), offset) !=
+                            (ssize_t)sizeof(entry))
+                        break;
+                    if ((entry.flags & requiredFlags) == requiredFlags) {
+                        ready = YES;
+                        break;
+                    }
+                }
+            }
             close(fd);
             if (ready) return YES;
         }
         usleep(100000);
     }
+    return NO;
+}
+
+static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
+                                 int *exitStatusOut) {
+    return WaitForWindowMetricsFlags(pid, timeout,
+                                     MacWSStreamWindowVisible,
+                                     exitStatusOut);
+}
+
+static off_t FileSizeAtPath(const char *path) {
+    struct stat st = {0};
+    return stat(path, &st) == 0 && st.st_size > 0 ? st.st_size : 0;
+}
+
+// Associate Electron's own renderer-health diagnostics with one launch.  The
+// production log is append-only, so a byte boundary avoids both stale alerts
+// from a prior PID and assumptions about wall-clock/time-zone formatting.
+static void WriteVSCodeHealthMarker(pid_t pid, off_t logOffset) {
+    char value[96];
+    int length = snprintf(value, sizeof(value), "%d %lld\n", pid,
+                          (long long)MAX(logOffset, (off_t)0));
+    int fd = open(kVSCodeHealthMarker,
+                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    (void)write(fd, value, (size_t)length);
+    close(fd);
+}
+
+static BOOL ReadVSCodeHealthMarker(pid_t *pidOut, off_t *logOffsetOut) {
+    char value[96] = {0};
+    int fd = open(kVSCodeHealthMarker, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    ssize_t count = read(fd, value, sizeof(value) - 1);
+    close(fd);
+    int pid = 0;
+    long long offset = 0;
+    if (count <= 0 || sscanf(value, "%d %lld", &pid, &offset) != 2 ||
+        pid <= 1 || offset < 0)
+        return NO;
+    if (pidOut) *pidOut = (pid_t)pid;
+    if (logOffsetOut) *logOffsetOut = (off_t)offset;
+    return YES;
+}
+
+static BOOL VSCodeLogContainsUnresponsiveAfter(off_t startOffset) {
+    static const char needle[] = "CodeWindow: detected unresponsive";
+    const NSUInteger overlap = sizeof(needle) - 2;
+    int fd = open(kVSCodeLog, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    struct stat st = {0};
+    if (fstat(fd, &st) != 0 || startOffset < 0 || startOffset > st.st_size) {
+        close(fd);
+        return NO;
+    }
+    if (lseek(fd, startOffset, SEEK_SET) < 0) {
+        close(fd);
+        return NO;
+    }
+    NSData *needleData = [NSData dataWithBytes:needle length:sizeof(needle) - 1];
+    NSMutableData *window = [NSMutableData data];
+    uint8_t buffer[32768];
+    for (;;) {
+        ssize_t count = read(fd, buffer, sizeof(buffer));
+        if (count > 0) {
+            [window appendBytes:buffer length:(NSUInteger)count];
+            if ([window rangeOfData:needleData options:0
+                              range:NSMakeRange(0, window.length)].location !=
+                    NSNotFound) {
+                close(fd);
+                return YES;
+            }
+            if (window.length > overlap) {
+                NSData *tail = [window subdataWithRange:
+                    NSMakeRange(window.length - overlap, overlap)];
+                [window setData:tail];
+            }
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    close(fd);
     return NO;
 }
 
@@ -625,6 +733,61 @@ static pid_t FindRunningRootExecutable(NSString *rootPath) {
     return found;
 }
 
+// An AppKit application can outlive its last NSWindow.  That is the normal
+// result after an iPad Scene asks AppInputBridge to performClose:, but such a
+// process cannot satisfy a later launch request by merely being "reused".
+// Gracefully retire only the exact executable whose metrics sidecar remained
+// empty for the complete WaitForWindowMetrics grace period.  This keeps the
+// single-instance invariant without treating process uptime as a window.
+static BOOL TerminateWindowlessRootExecutable(pid_t pid, NSString *rootPath,
+                                              NSString **message) {
+    if (pid <= 1 || !rootPath.length) return NO;
+    HostLog(@"launch-app windowless-retire pid=%d executable=%@ signal=TERM",
+            pid, rootPath);
+    if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+        *message = [NSString stringWithFormat:
+            @"无窗口实例无法正常退出（PID %d，errno=%d）", pid, errno];
+        return NO;
+    }
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    while (deadline.timeIntervalSinceNow > 0) {
+        errno = 0;
+        if (kill(pid, 0) != 0 && errno == ESRCH) {
+            HostLog(@"launch-app windowless-retired pid=%d executable=%@",
+                    pid, rootPath);
+            return YES;
+        }
+        usleep(50000);
+    }
+    // Runtime-confirmed with Terminal on 2026-07-31: after its last NSWindow
+    // performed the ordinary close action, SIGTERM left the zero-window
+    // process alive indefinitely. At this point the exact executable has had
+    // both a three-second zero-window witness and a three-second graceful
+    // termination grace period. Force-retiring that UI-less instance is the
+    // bounded final step of this launch transaction, not a process-uptime
+    // substitute for window health.
+    HostLog(@"launch-app windowless-retire pid=%d executable=%@ signal=KILL "
+            "reason=term-timeout", pid, rootPath);
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        *message = [NSString stringWithFormat:
+            @"无窗口实例无法清理（PID %d，errno=%d）", pid, errno];
+        return NO;
+    }
+    deadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
+    while (deadline.timeIntervalSinceNow > 0) {
+        errno = 0;
+        if (kill(pid, 0) != 0 && errno == ESRCH) {
+            HostLog(@"launch-app windowless-retired pid=%d executable=%@ "
+                    "after=KILL", pid, rootPath);
+            return YES;
+        }
+        usleep(50000);
+    }
+    *message = [NSString stringWithFormat:
+        @"无窗口实例清理超时（PID %d），未创建重复进程", pid];
+    return NO;
+}
+
 static BOOL LaunchVSCode(NSString **message) {
     if (access(kVSCodePlist, R_OK) != 0 ||
         access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
@@ -633,7 +796,9 @@ static BOOL LaunchVSCode(NSString **message) {
         return NO;
     }
     int pid = 0;
-    if (!JobHasPID(kVSCodeLabel, &pid)) {
+    off_t launchLogOffset = FileSizeAtPath(kVSCodeLog);
+    BOOL reusedJob = JobHasPID(kVSCodeLabel, &pid);
+    if (!reusedJob) {
         const char *loadArgv[] = {kLaunchctl, "load", kVSCodePlist, NULL};
         int rc = RunCommand(loadArgv, YES);
         if (rc != 0) {
@@ -654,13 +819,62 @@ static BOOL LaunchVSCode(NSString **message) {
         *message = @"VS Code 生产任务未取得进程";
         return NO;
     }
+    if (!reusedJob) WriteVSCodeHealthMarker(pid, launchLogOffset);
+    if (reusedJob) {
+        int reuseExitStatus = -1;
+        uint32_t workspaceFlags = MacWSStreamWindowVisible |
+                                  MacWSStreamWindowResizable;
+        pid_t markerPID = 0;
+        off_t markerOffset = 0;
+        BOOL markerMatches = ReadVSCodeHealthMarker(&markerPID, &markerOffset) &&
+                             markerPID == pid;
+        BOOL electronUnresponsive = markerMatches &&
+            VSCodeLogContainsUnresponsiveAfter(markerOffset);
+        BOOL workspaceReady = WaitForWindowMetricsFlags(
+            pid, 3.0, workspaceFlags, &reuseExitStatus);
+        if (!markerMatches)
+            WriteVSCodeHealthMarker(pid, FileSizeAtPath(kVSCodeLog));
+        if (!workspaceReady || electronUnresponsive) {
+            // Runtime-confirmed on 2026-07-31: Electron logged
+            // `CodeWindow: detected unresponsive`; its metrics sidecar then
+            // continued to describe a visible/resizable base NSWindow under
+            // the recovery sheet. Window geometry therefore cannot establish
+            // renderer health. Use Electron's exact per-launch health witness;
+            // the production launchd job remains the restart boundary.
+            HostLog(@"launch-app vscode-restart pid=%d "
+                    "reason=%@", pid,
+                    electronUnresponsive ? @"electron-unresponsive" :
+                                           @"no-resizable-workspace");
+            const char *unloadArgv[] = {kLaunchctl, "unload", kVSCodePlist, NULL};
+            (void)RunCommand(unloadArgv, YES);
+            launchLogOffset = FileSizeAtPath(kVSCodeLog);
+            const char *loadArgv[] = {kLaunchctl, "load", kVSCodePlist, NULL};
+            if (RunCommand(loadArgv, YES) != 0) {
+                *message = @"VS Code 无响应实例已停止，但生产任务重启失败";
+                return NO;
+            }
+            pid = 0;
+            NSDate *restartDeadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
+            while (restartDeadline.timeIntervalSinceNow > 0 &&
+                   !JobHasPID(kVSCodeLabel, &pid)) {
+                usleep(100000);
+            }
+            if (pid <= 1) {
+                *message = @"VS Code 生产任务重启后未取得进程";
+                return NO;
+            }
+            WriteVSCodeHealthMarker(pid, launchLogOffset);
+        }
+    }
     os_unfair_lock_lock(&gStateLock);
     gActiveAppPID = pid;
     gActiveAppID = @"vscode";
     os_unfair_lock_unlock(&gStateLock);
     int exitStatus = -1;
-    if (!WaitForWindowMetrics(pid, 30.0, &exitStatus)) {
-        *message = @"VS Code 正在运行，但 30 秒内没有发布 AppKit 窗口";
+    if (!WaitForWindowMetricsFlags(pid, 30.0,
+            MacWSStreamWindowVisible | MacWSStreamWindowResizable,
+            &exitStatus)) {
+        *message = @"VS Code 正在运行，但 30 秒内没有发布可调尺寸的工作区窗口";
         return NO;
     }
     HostLog(@"launch-app window-ready id=vscode pid=%d path=DisplayStream", pid);
@@ -689,24 +903,28 @@ static BOOL LaunchRootExecutable(const char *identifier,
     if (existingPID > 1) {
         int exitStatus = -1;
         if (!WaitForWindowMetrics(existingPID, 3.0, &exitStatus)) {
-            HostLog(@"launch-app reuse-blocked id=%s pid=%d executable=%@ "
-                    "reason=no-window-metrics",
+            // Runtime-confirmed on the default Terminal bootstrap: closing
+            // its last represented iPad Scene leaves a healthy process with
+            // a valid zero-entry metrics header. Reusing that process can
+            // never produce a Scene; spawning beside it violates the user's
+            // one-application-instance model. Retire the windowless instance
+            // first, then continue through the ordinary launch path below.
+            if (!TerminateWindowlessRootExecutable(existingPID, rootPath,
+                                                    message))
+                return NO;
+            existingPID = 0;
+        } else {
+            os_unfair_lock_lock(&gStateLock);
+            gActiveAppPID = existingPID;
+            gActiveAppID = [@(identifier) copy];
+            os_unfair_lock_unlock(&gStateLock);
+            HostLog(@"launch-app reuse id=%s pid=%d executable=%@ "
+                    "identity=proc_pidpath",
                     identifier, existingPID, rootPath);
             *message = [NSString stringWithFormat:
-                @"%s 已在运行（PID %d），但尚未发布可捕获窗口；为避免重复实例，未再次启动",
-                identifier, existingPID];
-            return NO;
+                @"%s 已在运行，正在打开现有窗口", identifier];
+            return YES;
         }
-        os_unfair_lock_lock(&gStateLock);
-        gActiveAppPID = existingPID;
-        gActiveAppID = [@(identifier) copy];
-        os_unfair_lock_unlock(&gStateLock);
-        HostLog(@"launch-app reuse id=%s pid=%d executable=%@ "
-                "identity=proc_pidpath",
-                identifier, existingPID, rootPath);
-        *message = [NSString stringWithFormat:
-            @"%s 已在运行，正在打开现有窗口", identifier];
-        return YES;
     }
 
     posix_spawn_file_actions_t actions;

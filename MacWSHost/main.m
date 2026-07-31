@@ -37,6 +37,12 @@ static NSString *const MacWSCaptureAckPath =
     @"/var/mnt/rootfs/private/tmp/macws_capture_done";
 static NSString *const MacWSLogPath = @"/var/mobile/Library/Logs/MacWSHost.log";
 static NSMutableSet<NSString *> *MacWSSceneSessionsPreservingMacWindow;
+static NSMutableDictionary<NSString *, NSUserActivity *> *MacWSSceneBindings;
+static NSMutableSet<NSString *> *MacWSSceneCloseRequestsSent;
+static NSMutableSet<NSString *> *MacWSObservedWindowIdentities;
+static NSMutableSet<NSString *> *MacWSPendingWindowSceneIdentities;
+static NSString *const MacWSSceneBindingsDefaultsKey =
+    @"MacWSPersistedSceneWindowBindings";
 static const char MacWSInputSocketPath[] =
     "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 
@@ -2065,7 +2071,24 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                           flags:(uint16_t)flags
                       timestamp:(NSTimeInterval)timestamp {
     if (!self.isMacWSInputEnabled) return;
-    float horizontal = (float)(-translation.x * 2.0);
+    // UIKit translation is measured in Host points, while AppKit precise
+    // scrollingDelta is measured in target logical points. The old fixed 2x
+    // multiplier made a Retina 1770px/885pt Terminal move roughly twice the
+    // finger distance. Derive the transform from the current exact surface,
+    // viewport and backing scale so scrolling stays 1:1 at every Scene size.
+    CGFloat backingScale = _surfaceFrame.descriptor.backingScale;
+    if (!isfinite(backingScale) || backingScale < 0.5) backingScale = 1.0;
+    CGFloat contentWidth = CGRectGetWidth(_contentRect);
+    CGFloat contentHeight = CGRectGetHeight(_contentRect);
+    CGFloat sourceWidth = [self currentFrameWidth] *
+        CGRectGetWidth(_visibleSourceRect) / backingScale;
+    CGFloat sourceHeight = [self currentFrameHeight] *
+        CGRectGetHeight(_visibleSourceRect) / backingScale;
+    CGFloat scaleX = contentWidth > 1.0 ? sourceWidth / contentWidth : 1.0;
+    CGFloat scaleY = contentHeight > 1.0 ? sourceHeight / contentHeight : 1.0;
+    scaleX = fmin(fmax(scaleX, 0.25), 4.0);
+    scaleY = fmin(fmax(scaleY, 0.25), 4.0);
+    float horizontal = (float)(-translation.x * scaleX);
     uint32_t horizontalBits = 0;
     memcpy(&horizontalBits, &horizontal, sizeof(horizontalBits));
     MacWSInputRecord record = {
@@ -2076,7 +2099,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .timestamp = timestamp,
         .x = (float)framePoint.x,
         .y = (float)framePoint.y,
-        .pressure = (float)(-translation.y * 2.0),
+        .pressure = (float)(-translation.y * scaleY),
         .contactID = horizontalBits,
         .frameWidth = [self currentFrameWidth],
         .frameHeight = [self currentFrameHeight],
@@ -2374,6 +2397,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (NSUserActivity *)streamRestorationActivity;
 - (void)suspendSceneStream;
 - (void)resumeSceneStream;
+- (void)cancelBootstrapTerminal;
 @end
 
 static void MacWSRequestNewScene(UIScene *requestingScene,
@@ -2466,6 +2490,112 @@ static BOOL MacWSSendCloseWindow(uint32_t windowID, int32_t ownerPID,
     return MacWSSendInputRecord(&record, errorOut);
 }
 
+static NSString *MacWSWindowIdentity(int32_t ownerPID, uint32_t windowID,
+                                     uint32_t logicalGroupID) {
+    if (ownerPID <= 1 || windowID == 0) return nil;
+    return logicalGroupID != 0
+        ? [NSString stringWithFormat:@"%d:g:%u", ownerPID, logicalGroupID]
+        : [NSString stringWithFormat:@"%d:w:%u", ownerPID, windowID];
+}
+
+static NSDictionary *MacWSPersistedSceneBinding(NSString *identifier) {
+    if (!identifier.length) return nil;
+    NSDictionary *bindings = [NSUserDefaults.standardUserDefaults
+        dictionaryForKey:MacWSSceneBindingsDefaultsKey];
+    id value = bindings[identifier];
+    return [value isKindOfClass:NSDictionary.class] ? value : nil;
+}
+
+static void MacWSSetPersistedSceneBinding(NSString *identifier,
+                                          NSDictionary *info) {
+    if (!identifier.length) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSMutableDictionary *bindings = [[defaults
+        dictionaryForKey:MacWSSceneBindingsDefaultsKey] mutableCopy] ?:
+        [NSMutableDictionary dictionary];
+    if (info) bindings[identifier] = info;
+    else [bindings removeObjectForKey:identifier];
+    [defaults setObject:bindings forKey:MacWSSceneBindingsDefaultsKey];
+    // Binding changes are rare lifecycle transactions. Flush them before a
+    // possible FrontBoard process eviction so a reconnected Scene does not
+    // regress to its original bootstrap activity.
+    [defaults synchronize];
+}
+
+static NSUserActivity *MacWSPersistedSceneActivity(NSString *identifier) {
+    NSDictionary *info = MacWSPersistedSceneBinding(identifier);
+    if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow ||
+        [info[@"window_id"] unsignedIntValue] == 0 ||
+        [info[@"owner_pid"] intValue] <= 1) return nil;
+    NSUserActivity *activity = [[NSUserActivity alloc]
+        initWithActivityType:@"com.macwsguide.host.window"];
+    activity.title = [info[@"title"] isKindOfClass:NSString.class]
+        ? info[@"title"] : @"MacWS Window";
+    activity.userInfo = info;
+    return activity;
+}
+
+// UISceneSession.stateRestorationActivity is not updated continuously while a
+// Scene changes from the bootstrap workspace to an exact macOS window. Keep
+// the live binding by persistent session identifier, and make closing a
+// transaction that is idempotent across the explicit close button,
+// didDiscardSceneSessions:, and a late sceneDidDisconnect: callback.
+static void MacWSRememberSceneBinding(UISceneSession *session,
+                                      NSUserActivity *activity) {
+    NSString *identifier = session.persistentIdentifier;
+    if (!identifier.length) return;
+    if (!MacWSSceneBindings) MacWSSceneBindings = [NSMutableDictionary dictionary];
+    if (!MacWSSceneCloseRequestsSent)
+        MacWSSceneCloseRequestsSent = [NSMutableSet set];
+    // Once this session has committed a close transaction, a late state
+    // restoration callback must not resurrect the binding and send a second
+    // performClose: while UIKit is tearing the Scene down.
+    if ([MacWSSceneCloseRequestsSent containsObject:identifier]) return;
+    NSDictionary *info = activity.userInfo;
+    uint32_t windowID = [info[@"window_id"] unsignedIntValue];
+    int32_t ownerPID = [info[@"owner_pid"] intValue];
+    if ([info[@"mode"] unsignedIntValue] == MacWSStreamModeWindow &&
+        windowID != 0 && ownerPID > 1) {
+        MacWSSceneBindings[identifier] = activity;
+        [MacWSSceneCloseRequestsSent removeObject:identifier];
+        MacWSSetPersistedSceneBinding(identifier, info);
+    } else {
+        [MacWSSceneBindings removeObjectForKey:identifier];
+        MacWSSetPersistedSceneBinding(identifier, nil);
+    }
+}
+
+static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
+                                                NSString *source) {
+    NSString *identifier = session.persistentIdentifier;
+    if (!identifier.length) return NO;
+    if ([MacWSSceneSessionsPreservingMacWindow containsObject:identifier])
+        return NO;
+    if (!MacWSSceneBindings) MacWSSceneBindings = [NSMutableDictionary dictionary];
+    if (!MacWSSceneCloseRequestsSent)
+        MacWSSceneCloseRequestsSent = [NSMutableSet set];
+    if ([MacWSSceneCloseRequestsSent containsObject:identifier]) return YES;
+    NSUserActivity *activity = MacWSSceneBindings[identifier] ?:
+        MacWSPersistedSceneActivity(identifier) ?:
+        session.stateRestorationActivity;
+    NSDictionary *info = activity.userInfo;
+    uint32_t windowID = [info[@"window_id"] unsignedIntValue];
+    int32_t ownerPID = [info[@"owner_pid"] intValue];
+    if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow ||
+        windowID == 0 || ownerPID <= 1) return NO;
+    int sendError = 0;
+    BOOL sent = MacWSSendCloseWindow(windowID, ownerPID, &sendError);
+    if (sent) {
+        [MacWSSceneCloseRequestsSent addObject:identifier];
+        [MacWSSceneBindings removeObjectForKey:identifier];
+        MacWSSetPersistedSceneBinding(identifier, nil);
+    }
+    MacWSLog(@"scene-close source=%@ id=%@ window=%u target=%d sent=%@ errno=%d",
+             source ?: @"unknown", identifier, windowID, ownerPID,
+             sent ? @"YES" : @"NO", sendError);
+    return sent;
+}
+
 @implementation MacWSViewController {
     NSString *_sceneIdentifier;
     MacWSStreamMode _streamMode;
@@ -2483,6 +2613,7 @@ static BOOL MacWSSendCloseWindow(uint32_t windowID, int32_t ownerPID,
     UIStackView *_semanticMenuTitles;
     UIAlertController *_semanticMenuPanel;
     UIVisualEffectView *_controlPanel;
+    UIControl *_controlDismissLayer;
     UIButton *_showControlsButton;
     UILabel *_serviceLabel;
     UILabel *_phaseLabel;
@@ -2535,6 +2666,8 @@ static BOOL MacWSSendCloseWindow(uint32_t windowID, int32_t ownerPID,
     NSString *_pendingApplicationIdentifier;
     NSUInteger _pendingApplicationWindowAttempts;
     BOOL _pendingApplicationWindowRetryScheduled;
+    BOOL _bootstrapTerminalPending;
+    BOOL _bootstrapWorkspaceStartInFlight;
 }
 
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier
@@ -2553,6 +2686,8 @@ static BOOL MacWSSendCloseWindow(uint32_t windowID, int32_t ownerPID,
         _windowGroupID = windowID ? logicalGroupID : 0;
         _windowMinimumSize = windowID ? minimumSize : CGSizeZero;
         _windowResizable = windowID ? resizable : NO;
+        _bootstrapTerminalPending = streamMode != MacWSStreamModeWindow ||
+            windowID == 0;
         _controlClient = [MacWSControlClient new];
         _interopClient = [MacWSInteropClient new];
         _interopClient.delegate = self;
@@ -2939,9 +3074,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetPID = _windowOwnerPID;
     [root addSubview:_metalView];
 
-    if (_windowID != 0) {
-        _semanticMenuBar = [[UIVisualEffectView alloc] initWithEffect:
-            [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
+    // The iPadOS Scene exists before its default Terminal window is launched.
+    // Keep a native menu bar during that short bootstrap interval too, so an
+    // empty DisplayStream never presents as an unexplained black workspace
+    // with a detached control button in the upper-left corner.
+    _semanticMenuBar = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
         _semanticMenuBar.translatesAutoresizingMaskIntoConstraints = NO;
         _semanticMenuBar.clipsToBounds = YES;
         _semanticMenuBar.overrideUserInterfaceStyle = UIUserInterfaceStyleUnspecified;
@@ -2988,8 +3126,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 _semanticMenuBar.contentView.bottomAnchor],
             [menuSeparator.heightAnchor constraintEqualToConstant:0.5],
         ]];
-        [self renderSemanticMenuTitles];
-    }
+    [self renderSemanticMenuTitles];
 
     _keyboardProxy = [UITextField new];
     _keyboardProxy.translatesAutoresizingMaskIntoConstraints = NO;
@@ -3012,6 +3149,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [root addSubview:_softwareKeyBar];
     _softwareKeyBarHeightConstraint = [_softwareKeyBar.heightAnchor
         constraintEqualToConstant:0];
+
+    _controlDismissLayer = [UIControl new];
+    _controlDismissLayer.translatesAutoresizingMaskIntoConstraints = NO;
+    _controlDismissLayer.backgroundColor = UIColor.clearColor;
+    _controlDismissLayer.hidden = YES;
+    [_controlDismissLayer addTarget:self action:@selector(hideControls)
+                   forControlEvents:UIControlEventTouchUpInside];
+    [root addSubview:_controlDismissLayer];
 
     _controlPanel = [[UIVisualEffectView alloc]
         initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
@@ -3346,6 +3491,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [_keyboardProxy.heightAnchor constraintEqualToConstant:1],
         [_keyboardProxy.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
         [_keyboardProxy.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+        [_controlDismissLayer.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+        [_controlDismissLayer.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+        [_controlDismissLayer.topAnchor constraintEqualToAnchor:root.topAnchor],
+        [_controlDismissLayer.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
         [_controlPanel.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [_controlPanel.topAnchor constraintEqualToAnchor:controlTop constant:12],
         [_controlPanel.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-12],
@@ -3394,7 +3543,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [super viewDidAppear:animated];
     UISceneActivationState activation = self.view.window.windowScene.activationState;
     if (activation != UISceneActivationStateBackground &&
-        activation != UISceneActivationStateUnattached) {
+        activation != UISceneActivationStateUnattached &&
+        !(_bootstrapTerminalPending && _windowID == 0)) {
         [_metalView configureStreamMode:_streamMode windowID:_windowID];
     }
     if (_windowID != 0) [self refreshSemanticMenuWithCompletion:nil];
@@ -3414,10 +3564,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)hideControls {
     _controlPanel.hidden = YES;
+    _controlDismissLayer.hidden = YES;
     _showControlsButton.hidden = NO;
 }
 
 - (void)showControls {
+    _controlDismissLayer.hidden = NO;
     _controlPanel.hidden = NO;
     _showControlsButton.hidden = YES;
 }
@@ -3453,14 +3605,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self setNotice:@"当前是工作区，不对应单独的 macOS 窗口。" success:NO];
         return;
     }
-    int sendError = 0;
-    if (!MacWSSendCloseWindow(_windowID, _windowOwnerPID, &sendError)) {
-        [self setNotice:[NSString stringWithFormat:
-            @"关闭请求发送失败（errno=%d）", sendError] success:NO];
-        return;
-    }
     UISceneSession *session = self.view.window.windowScene.session;
     if (!session) return;
+    MacWSRememberSceneBinding(session, [self streamRestorationActivity]);
+    if (!MacWSCloseMacWindowForSceneSession(session, @"control-center")) {
+        [self setNotice:@"关闭请求发送失败；macOS 窗口保持打开。" success:NO];
+        return;
+    }
     [UIApplication.sharedApplication
         requestSceneSessionDestruction:session
                               options:nil
@@ -3834,6 +3985,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [NSString stringWithFormat:@"MacWS Window %u", windowID];
     [_metalView configureStreamMode:_streamMode windowID:_windowID];
     [_metalView requestStreamWindowList];
+    MacWSRememberSceneBinding(self.view.window.windowScene.session,
+                              [self streamRestorationActivity]);
     if (_semanticMenuBar) [self refreshSemanticMenuWithCompletion:nil];
     [self refreshStatus];
     [self setNotice:reason.length ? reason : @"已在当前 iPadOS 窗口中打开 macOS 窗口"
@@ -3914,7 +4067,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSString *lastError = status[@"last_error"];
     if (lastError.length) [self setNotice:lastError success:NO];
 
-    if (ws && !_metalView.streamServiceConnected)
+    if (ws && !_metalView.streamServiceConnected &&
+        !(_bootstrapTerminalPending && _windowID == 0))
         [_metalView configureStreamMode:_streamMode windowID:_windowID];
     if (ws && !_interopClient.isConnected) [_interopClient connect];
 
@@ -3960,6 +4114,31 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     for (UIButton *button in _applicationButtons) {
         BOOL available = [status[availability[button.accessibilityIdentifier]] boolValue];
         button.enabled = connected && !busy && ws && available;
+    }
+
+    // A new Host Scene is a launcher for one concrete macOS window, not a
+    // full-display workspace. Start production macOS if needed, then launch
+    // Terminal exactly once. The first catalog entry replaces this Scene
+    // in-place, so no redundant black Scene survives startup.
+    if (_bootstrapTerminalPending && connected && !busy) {
+        if (ws) {
+            _bootstrapTerminalPending = NO;
+            [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
+                     arguments:@{@MACWS_CONTROL_KEY_APP_ID: @"terminal"}];
+        } else if (!_bootstrapWorkspaceStartInFlight) {
+            _bootstrapWorkspaceStartInFlight = YES;
+            [self setNotice:@"正在启动 macOS，并准备默认终端窗口…" success:YES];
+            [_controlClient startWithExperimentalMode:YES
+                completion:^(NSDictionary<NSString *,id> *reply) {
+                    self->_bootstrapWorkspaceStartInFlight = NO;
+                    BOOL ok = [reply[@"ok"] boolValue];
+                    [self applyStatus:reply];
+                    if (!ok) {
+                        [self setNotice:reply[@"message"] ?:
+                            @"macOS 工作区启动失败" success:NO];
+                    }
+                }];
+        }
     }
 }
 
@@ -4129,6 +4308,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self repairAction];
     } else if ([action isEqualToString:@"capture"]) {
         [self captureAction];
+    } else if ([action isEqualToString:@"close-window"]) {
+        [self closeCurrentWindow];
     } else if ([action isEqualToString:@"screenshot-ui"]) {
         [self writeHostUISnapshot];
     } else if ([action isEqualToString:@"hide-controls"]) {
@@ -4287,6 +4468,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     MacWSLog(@"launch-auto-window app=%@ pid=%d window=%u group=%u",
              identifier, ownerPID, target.descriptor.windowID,
              target.descriptor.logicalGroupID);
+    NSString *targetIdentity = MacWSWindowIdentity(
+        target.descriptor.ownerPID, target.descriptor.windowID,
+        target.descriptor.logicalGroupID);
+    if (!MacWSObservedWindowIdentities)
+        MacWSObservedWindowIdentities = [NSMutableSet set];
+    if (targetIdentity) [MacWSObservedWindowIdentities addObject:targetIdentity];
+    if (_windowID == 0) {
+        NSString *reason = [identifier isEqualToString:@"terminal"]
+            ? @"默认终端已经就绪。"
+            : [NSString stringWithFormat:@"%@ 已经就绪。", identifier];
+        [self openWindowInCurrentScene:target reason:reason];
+        return;
+    }
     MacWSRequestNewScene(self.view.window.windowScene,
         target.descriptor.windowID, target.descriptor.ownerPID,
         target.descriptor.logicalGroupID,
@@ -4304,12 +4498,148 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         });
 }
 
+- (BOOL)isWindowDiscoveryCoordinator {
+    UIScene *candidate = self.view.window.windowScene;
+    if (!candidate || candidate.activationState !=
+            UISceneActivationStateForegroundActive) return NO;
+    NSString *candidateID = candidate.session.persistentIdentifier;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene == candidate || scene.activationState !=
+                UISceneActivationStateForegroundActive) continue;
+        NSString *identifier = scene.session.persistentIdentifier;
+        if ([identifier compare:candidateID] == NSOrderedAscending) return NO;
+    }
+    return YES;
+}
+
+- (void)openNewMacWindowsFromCatalog:
+    (NSArray<MacWSStreamWindow *> *)windows {
+    if (![self isWindowDiscoveryCoordinator]) return;
+    if (!MacWSPendingWindowSceneIdentities)
+        MacWSPendingWindowSceneIdentities = [NSMutableSet set];
+    NSMutableDictionary<NSString *, MacWSStreamWindow *> *current =
+        [NSMutableDictionary dictionary];
+    for (MacWSStreamWindow *window in windows) {
+        MacWSStreamWindowDescriptor descriptor = window.descriptor;
+        if ((descriptor.flags & MacWSStreamWindowVisible) == 0) continue;
+        NSString *identity = MacWSWindowIdentity(descriptor.ownerPID,
+            descriptor.windowID, descriptor.logicalGroupID);
+        if (identity) current[identity] = window;
+    }
+    if (!MacWSObservedWindowIdentities) {
+        MacWSObservedWindowIdentities = [NSMutableSet setWithArray:current.allKeys];
+        MacWSPendingWindowSceneIdentities = [NSMutableSet set];
+        return;
+    }
+
+    NSMutableSet<NSString *> *occupied = [NSMutableSet set];
+    for (UISceneSession *session in UIApplication.sharedApplication.openSessions) {
+        NSUserActivity *activity = MacWSSceneBindings[
+            session.persistentIdentifier] ?:
+            MacWSPersistedSceneActivity(session.persistentIdentifier) ?:
+            session.stateRestorationActivity;
+        NSDictionary *info = activity.userInfo;
+        NSString *identity = MacWSWindowIdentity(
+            [info[@"owner_pid"] intValue],
+            [info[@"window_id"] unsignedIntValue],
+            [info[@"logical_group_id"] unsignedIntValue]);
+        if (identity) [occupied addObject:identity];
+    }
+
+    NSMutableArray<MacWSStreamWindow *> *newWindows = [NSMutableArray array];
+    for (NSString *identity in current) {
+        if ([MacWSObservedWindowIdentities containsObject:identity] ||
+            [MacWSPendingWindowSceneIdentities containsObject:identity] ||
+            [occupied containsObject:identity]) continue;
+        MacWSStreamWindow *window = current[identity];
+        BOOL relevantOwner = _windowOwnerPID > 1 &&
+            window.descriptor.ownerPID == _windowOwnerPID;
+        BOOL focused = (window.descriptor.flags & MacWSStreamWindowFocused) != 0;
+        if (relevantOwner || focused) [newWindows addObject:window];
+    }
+    [MacWSObservedWindowIdentities setSet:[NSSet setWithArray:current.allKeys]];
+
+    // A user gesture normally creates one native window. Bound a pathological
+    // application burst so one catalog invalidation cannot flood FrontBoard.
+    NSUInteger limit = MIN(newWindows.count, 3);
+    for (NSUInteger index = 0; index < limit; index++) {
+        MacWSStreamWindow *window = newWindows[index];
+        NSString *identity = MacWSWindowIdentity(window.descriptor.ownerPID,
+            window.descriptor.windowID, window.descriptor.logicalGroupID);
+        if (!identity) continue;
+        [MacWSPendingWindowSceneIdentities addObject:identity];
+        // AppKit dialogs can briefly appear as a layer-0 catalog window and
+        // then become the base window's transient layer on the next commit.
+        // Runtime-confirmed with Terminal's Low Disk Space alert: requesting
+        // a Scene on the first edge created both an exact iPad window and the
+        // correct in-window overlay. Require the identity to remain a real
+        // visible catalog entry after one short ordering interval. Ordinary
+        // new windows remain in _streamWindows; alerts disappear from it when
+        // displayd's real CGWindow layer reconciliation runs.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSStreamWindow *stableWindow = nil;
+            for (MacWSStreamWindow *candidate in self->_streamWindows) {
+                NSString *candidateIdentity = MacWSWindowIdentity(
+                    candidate.descriptor.ownerPID,
+                    candidate.descriptor.windowID,
+                    candidate.descriptor.logicalGroupID);
+                if ([candidateIdentity isEqualToString:identity] &&
+                    (candidate.descriptor.flags & MacWSStreamWindowVisible)) {
+                    stableWindow = candidate;
+                    break;
+                }
+            }
+            if (!stableWindow) {
+                [MacWSPendingWindowSceneIdentities removeObject:identity];
+                MacWSLog(@"window-auto-scene cancelled identity=%@ reason=transient",
+                         identity);
+                return;
+            }
+            NSString *title = stableWindow.title.length
+                ? stableWindow.title : @"macOS Window";
+            MacWSLog(@"window-auto-scene identity=%@ title=%@ stable-ms=250",
+                     identity, title);
+            MacWSRequestNewScene(self.view.window.windowScene,
+                stableWindow.descriptor.windowID,
+                stableWindow.descriptor.ownerPID,
+                stableWindow.descriptor.logicalGroupID,
+                CGSizeMake(stableWindow.descriptor.minimumLogicalWidth,
+                           stableWindow.descriptor.minimumLogicalHeight),
+                (stableWindow.descriptor.flags & MacWSStreamWindowResizable) != 0,
+                title, ^(NSError *error) {
+                    [MacWSPendingWindowSceneIdentities removeObject:identity];
+                    [MacWSObservedWindowIdentities removeObject:identity];
+                    [self setNotice:error.localizedDescription success:NO];
+                });
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            [MacWSPendingWindowSceneIdentities removeObject:identity];
+        });
+    }
+}
+
 - (void)metalView:(MacWSMetalView *)view
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
     (void)view;
     _streamWindows = [windows copy];
+    // Establish the first complete catalog as a baseline before an explicit
+    // launch transaction consumes it. This prevents restoring Host from
+    // opening every pre-existing macOS window at once; subsequent identities
+    // are the actual native windows created after Host became live.
+    if (!MacWSObservedWindowIdentities) {
+        MacWSObservedWindowIdentities = [NSMutableSet set];
+        for (MacWSStreamWindow *window in windows) {
+            NSString *identity = MacWSWindowIdentity(
+                window.descriptor.ownerPID, window.descriptor.windowID,
+                window.descriptor.logicalGroupID);
+            if (identity) [MacWSObservedWindowIdentities addObject:identity];
+        }
+    }
     [self openInitialFinderBrowserWindowIfNeeded:windows];
     [self openPendingApplicationWindowFromCatalog:windows];
+    [self openNewMacWindowsFromCatalog:windows];
     if (_windowID != 0) {
         MacWSStreamWindow *exactWindow = nil;
         MacWSStreamWindow *groupReplacement = nil;
@@ -4346,6 +4676,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                     : [NSString stringWithFormat:@"MacWS Window %u", _windowID];
                 MacWSLog(@"window-identity-follow owner=%d group=%u old=%u new=%u",
                          _windowOwnerPID, _windowGroupID, oldID, _windowID);
+                MacWSRememberSceneBinding(self.view.window.windowScene.session,
+                                          [self streamRestorationActivity]);
             }
         }
     }
@@ -4383,10 +4715,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)resumeSceneStream {
-    [_metalView configureStreamMode:_streamMode windowID:_windowID];
+    if (!(_bootstrapTerminalPending && _windowID == 0))
+        [_metalView configureStreamMode:_streamMode windowID:_windowID];
     [_metalView requestStreamWindowList];
     [_interopClient connect];
     if (_windowID != 0) [self refreshSemanticMenuWithCompletion:nil];
+}
+
+- (void)cancelBootstrapTerminal {
+    _bootstrapTerminalPending = NO;
 }
 
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
@@ -4476,16 +4813,53 @@ static void MacWSPruneDeadWindowSceneSessions(void) {
     }
 }
 
+static void MacWSPruneDormantWorkspaceSessions(void) {
+    UIApplication *application = UIApplication.sharedApplication;
+    if (!MacWSSceneSessionsPreservingMacWindow)
+        MacWSSceneSessionsPreservingMacWindow = [NSMutableSet set];
+    for (UISceneSession *session in [application.openSessions copy]) {
+        NSUserActivity *activity = session.stateRestorationActivity;
+        UIScene *connectedScene = nil;
+        for (UIScene *scene in application.connectedScenes) {
+            if (scene.session != session) continue;
+            connectedScene = scene;
+            activity = MacWSLiveRestorationActivity(scene);
+            break;
+        }
+        // FrontBoard can retain restoration metadata after its corresponding
+        // scene handle has already disappeared. Public destruction returns
+        // SBApplicationSupportService/2 for those metadata-only entries, so
+        // leave them to UIKit's persistence cleanup and prune only live,
+        // dormant workspace Scenes.
+        if (!connectedScene) continue;
+        NSDictionary *info = activity.userInfo;
+        BOOL exactWindow = [info[@"mode"] unsignedIntValue] ==
+            MacWSStreamModeWindow &&
+            [info[@"window_id"] unsignedIntValue] != 0;
+        if (exactWindow || (connectedScene && connectedScene.activationState ==
+                UISceneActivationStateForegroundActive)) continue;
+        NSString *identifier = session.persistentIdentifier;
+        if ([MacWSSceneSessionsPreservingMacWindow containsObject:identifier])
+            continue;
+        [MacWSSceneSessionsPreservingMacWindow addObject:identifier];
+        MacWSLog(@"workspace-scene-prune id=%@ state=%ld",
+                 identifier, (long)connectedScene.activationState);
+        [application requestSceneSessionDestruction:session options:nil
+            errorHandler:^(NSError *error) {
+                [MacWSSceneSessionsPreservingMacWindow removeObject:identifier];
+                MacWSLog(@"workspace-scene-prune failed id=%@ error=%@",
+                         identifier, error);
+            }];
+    }
+}
+
 static NSString *MacWSSceneWindowIdentity(NSUserActivity *activity) {
     NSDictionary *info = activity.userInfo;
     if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow) return nil;
     int32_t ownerPID = [info[@"owner_pid"] intValue];
     uint32_t windowID = [info[@"window_id"] unsignedIntValue];
     uint32_t groupID = [info[@"logical_group_id"] unsignedIntValue];
-    if (ownerPID <= 1 || windowID == 0) return nil;
-    return groupID != 0
-        ? [NSString stringWithFormat:@"%d:g:%u", ownerPID, groupID]
-        : [NSString stringWithFormat:@"%d:w:%u", ownerPID, windowID];
+    return MacWSWindowIdentity(ownerPID, windowID, groupID);
 }
 
 static NSInteger MacWSSceneRetentionRank(UIScene *scene) {
@@ -4556,7 +4930,15 @@ static void MacWSDeduplicateWindowScenes(void) {
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     UIWindowScene *windowScene = (UIWindowScene *)scene;
     NSUserActivity *activity = connectionOptions.userActivities.anyObject;
-    if (!activity) activity = session.stateRestorationActivity;
+    BOOL connectionHasExactWindow =
+        [activity.userInfo[@"mode"] unsignedIntValue] ==
+            MacWSStreamModeWindow &&
+        [activity.userInfo[@"window_id"] unsignedIntValue] != 0;
+    if (!connectionHasExactWindow) {
+        NSUserActivity *persisted = MacWSPersistedSceneActivity(
+            session.persistentIdentifier);
+        activity = persisted ?: activity ?: session.stateRestorationActivity;
+    }
     MacWSStreamMode streamMode = (MacWSStreamMode)
         [activity.userInfo[@"mode"] unsignedIntValue];
     uint32_t windowID = [activity.userInfo[@"window_id"] unsignedIntValue];
@@ -4589,6 +4971,7 @@ static void MacWSDeduplicateWindowScenes(void) {
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.rootViewController = controller;
     [self.window makeKeyAndVisible];
+    MacWSRememberSceneBinding(session, [controller streamRestorationActivity]);
     MacWSLog(@"scene-connected id=%@ role=%@ mode=%u window=%u",
              session.persistentIdentifier, session.role, streamMode, windowID);
     SEL restrictionsSelector = NSSelectorFromString(@"sizeRestrictions");
@@ -4614,6 +4997,7 @@ static void MacWSDeduplicateWindowScenes(void) {
         MacWSDeduplicateWindowScenes();
     });
     if (connectionOptions.URLContexts.count) {
+        [controller cancelBootstrapTerminal];
         NSSet<UIOpenURLContext *> *contexts = connectionOptions.URLContexts;
         dispatch_async(dispatch_get_main_queue(), ^{
             [self scene:scene openURLContexts:contexts];
@@ -4629,6 +5013,18 @@ static void MacWSDeduplicateWindowScenes(void) {
 - (void)sceneDidEnterBackground:(UIScene *)scene {
     (void)scene;
     [(MacWSViewController *)self.window.rootViewController suspendSceneStream];
+}
+
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    // Disconnect alone can be ordinary resource reclamation. Close only after
+    // UIKit has actually removed the persistent session from openSessions.
+    UISceneSession *session = scene.session;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if ([UIApplication.sharedApplication.openSessions containsObject:session])
+            return;
+        MacWSCloseMacWindowForSceneSession(session, @"disconnect-discarded");
+    });
 }
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
@@ -4749,6 +5145,7 @@ static void MacWSDeduplicateWindowScenes(void) {
         if ([@[@"status", @"start", @"start-experimental", @"stop",
                @"glassdemo", @"terminal", @"vscode", @"activity-monitor", @"finder",
                @"recover", @"repair", @"capture",
+               @"close-window",
                @"screenshot-ui", @"hide-controls", @"show-controls"]
               containsObject:host]) {
             MacWSViewController *controller = (MacWSViewController *)self.window.rootViewController;
@@ -4759,10 +5156,11 @@ static void MacWSDeduplicateWindowScenes(void) {
 }
 
 - (NSUserActivity *)stateRestorationActivityForScene:(UIScene *)scene {
-    (void)scene;
     MacWSViewController *controller =
         (MacWSViewController *)self.window.rootViewController;
-    return [controller streamRestorationActivity];
+    NSUserActivity *activity = [controller streamRestorationActivity];
+    MacWSRememberSceneBinding(scene.session, activity);
+    return activity;
 }
 @end
 
@@ -4786,6 +5184,7 @@ extern void MacWSRunIOSClearReference(void);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         MacWSPruneDeadWindowSceneSessions();
+        MacWSPruneDormantWorkspaceSessions();
     });
     // Diagnostic-only native AGX reference.  Keeping this behind a sentinel
     // lets the established, FrontBoard-launched host provide the foreground
@@ -4822,23 +5221,12 @@ extern void MacWSRunIOSClearReference(void);
                 containsObject:session.persistentIdentifier]) {
             [MacWSSceneSessionsPreservingMacWindow
                 removeObject:session.persistentIdentifier];
+            MacWSSetPersistedSceneBinding(session.persistentIdentifier, nil);
             MacWSLog(@"scene-discard duplicate-only id=%@ mac-window=preserved",
                      session.persistentIdentifier);
             continue;
         }
-        NSUserActivity *activity = session.stateRestorationActivity;
-        if (![activity.activityType isEqualToString:
-                @"com.macwsguide.host.window"])
-            continue;
-        uint32_t windowID = [activity.userInfo[@"window_id"] unsignedIntValue];
-        int32_t ownerPID = [activity.userInfo[@"owner_pid"] intValue];
-        if (windowID == 0 || ownerPID <= 1) continue;
-        int sendError = 0;
-        BOOL sent = MacWSSendCloseWindow(windowID, ownerPID, &sendError);
-        if (MacWSHostDiagnosticsEnabled()) {
-            MacWSLog(@"scene-discard close-window=%u target=%d sent=%@ errno=%d",
-                     windowID, ownerPID, sent ? @"YES" : @"NO", sendError);
-        }
+        MacWSCloseMacWindowForSceneSession(session, @"did-discard");
     }
 }
 @end

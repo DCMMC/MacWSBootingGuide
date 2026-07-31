@@ -257,9 +257,17 @@ static void RelayMenuRequest(MacWSDisplayClient *client,
     });
 }
 
-static NSArray<NSDictionary *> *CopyWindowInfo(void) {
+static NSArray<NSDictionary *> *CopyOnScreenWindowInfo(void) {
     CFArrayRef raw = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!raw) return @[];
+    return CFBridgingRelease(raw);
+}
+
+static NSArray<NSDictionary *> *CopyCatalogWindowInfo(void) {
+    CFArrayRef raw = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID);
     if (!raw) return @[];
     return CFBridgingRelease(raw);
@@ -319,8 +327,7 @@ static MacWSStreamWindowDescriptor WindowDescriptor(
         .size = sizeof(MacWSStreamWindowDescriptor),
         .windowID = windowID,
         .ownerPID = ownerPID,
-        .flags = MacWSStreamWindowVisible | MacWSStreamWindowOnScreen |
-                 MacWSStreamWindowResizable,
+        .flags = 0,
         .logicalGroupID = metrics ? metrics->logicalGroupID : windowID,
         .logicalX = bounds.origin.x,
         .logicalY = bounds.origin.y,
@@ -335,9 +342,12 @@ static MacWSStreamWindowDescriptor WindowDescriptor(
         .backingScale = scale,
     };
     if (metrics) {
-        descriptor.flags &= ~MacWSStreamWindowResizable;
-        descriptor.flags |= metrics->flags & MacWSStreamWindowResizable;
+        descriptor.flags |= metrics->flags &
+            (MacWSStreamWindowVisible | MacWSStreamWindowResizable |
+             MacWSStreamWindowFocused);
     }
+    if ([info[(id)kCGWindowIsOnscreen] boolValue])
+        descriptor.flags |= MacWSStreamWindowOnScreen;
     return descriptor;
 }
 
@@ -349,7 +359,7 @@ static void SendWindowList(MacWSDisplayClient *client) {
     NSUInteger emitted = 0;
     NSMutableDictionary<NSNumber *, NSDictionary *> *metricsByPID =
         [NSMutableDictionary dictionary];
-    for (NSDictionary *info in CopyWindowInfo()) {
+    for (NSDictionary *info in CopyCatalogWindowInfo()) {
         if (emitted >= MACWS_STREAM_MAX_WINDOWS) break;
         int32_t ownerPID = [info[(id)kCGWindowOwnerPID] intValue];
         NSNumber *pidKey = @(ownerPID);
@@ -368,9 +378,9 @@ static void SendWindowList(MacWSDisplayClient *client) {
         // Quartz layers. Excluding both categories removes the black phantom
         // Scene without guessing from localized titles.
         NSInteger layer = [info[(id)kCGWindowLayer] integerValue];
-        CGFloat alpha = [info[(id)kCGWindowAlpha] doubleValue];
-        if (!metricsValue || layer != 0 || alpha <= 0.01) continue;
+        if (!metricsValue || layer != 0) continue;
         [metricsValue getValue:&metrics];
+        if ((metrics.flags & MacWSStreamWindowVisible) == 0) continue;
         MacWSStreamWindowDescriptor descriptor = WindowDescriptor(
             info, &metrics);
         if (descriptor.windowID == 0 || descriptor.ownerPID <= 1 ||
@@ -507,7 +517,7 @@ static void PublishFrame(MacWSDisplayClient *client,
         bytesPerRow > UINT32_MAX) return;
     if (!layer && client.mode == MacWSStreamModeWindow &&
         client.windowBackingScale <= 0.0) {
-        for (NSDictionary *info in CopyWindowInfo()) {
+        for (NSDictionary *info in CopyOnScreenWindowInfo()) {
             if ([info[(id)kCGWindowNumber] unsignedIntValue] !=
                 client.windowID) continue;
             CGRect bounds = CGRectZero;
@@ -775,7 +785,7 @@ static void StartSubscription(MacWSDisplayClient *client,
 // restart is involved.
 static void ReconcileTransientStreams(void) {
     TransientReconcilePending = NO;
-    NSArray<NSDictionary *> *windowInfo = CopyWindowInfo();
+    NSArray<NSDictionary *> *windowInfo = CopyOnScreenWindowInfo();
     BOOL needsFollowup = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
         if (client.mode != MacWSStreamModeWindow || client.windowID == 0)

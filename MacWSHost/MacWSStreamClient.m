@@ -49,6 +49,7 @@
 @property(nonatomic) MacWSStreamMode subscribedMode;
 @property(nonatomic) uint32_t subscribedWindowID;
 @property(nonatomic) BOOL subscriptionActive;
+@property(nonatomic) NSData *lastWindowCatalog;
 @end
 
 @implementation MacWSStreamClient
@@ -137,6 +138,12 @@
 - (void)requestWindowList {
     dispatch_async(self.queue, ^{
         if (![self ensureConnection]) return;
+        // Callers use an explicit list request as a synchronization barrier
+        // after launch/reopen. The bytes may equal the last unsolicited
+        // catalog, but the newly-installed pending PID transaction still
+        // needs that snapshot. Keep deduplication for broadcasts and force
+        // only this user/control-plane query to reach the delegate.
+        self.lastWindowCatalog = nil;
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, MACWS_STREAM_KEY_OP,
                                   MACWS_STREAM_OP_LIST_WINDOWS);
@@ -179,6 +186,7 @@
     self.connection = nil;
     self.connected = NO;
     self.subscriptionActive = NO;
+    self.lastWindowCatalog = nil;
     if (connection) xpc_connection_cancel(connection);
 }
 
@@ -188,6 +196,7 @@
         xpc_connection_t connection = self.connection;
         self.connection = nil;
         self.subscriptionActive = NO;
+        self.lastWindowCatalog = nil;
         if (connection) xpc_connection_cancel(connection);
         [self publishStatus:event == XPC_ERROR_CONNECTION_INTERRUPTED
             ? @"DisplayStream 连接中断，等待重新连接"
@@ -317,6 +326,7 @@
                                                    MACWS_STREAM_KEY_WINDOWS);
     if (!array || xpc_get_type(array) != XPC_TYPE_ARRAY) return;
     NSMutableArray<MacWSStreamWindow *> *windows = [NSMutableArray array];
+    NSMutableData *fingerprint = [NSMutableData data];
     xpc_array_apply(array, ^bool(size_t index, xpc_object_t value) {
         (void)index;
         if (windows.count >= MACWS_STREAM_MAX_WINDOWS ||
@@ -324,6 +334,10 @@
         size_t byteCount = xpc_data_get_length(value);
         const void *bytes = xpc_data_get_bytes_ptr(value);
         if (!MacWSStreamWindowDescriptorIsValid(bytes, byteCount)) return true;
+        uint32_t stableByteCount = byteCount <= UINT32_MAX
+            ? (uint32_t)byteCount : 0;
+        [fingerprint appendBytes:&stableByteCount length:sizeof(stableByteCount)];
+        [fingerprint appendBytes:bytes length:byteCount];
         MacWSStreamWindowDescriptor descriptor;
         memcpy(&descriptor, bytes, sizeof(descriptor));
         NSData *titleData = [NSData dataWithBytes:(const uint8_t *)bytes +
@@ -335,6 +349,8 @@
             initWithDescriptor:descriptor title:title]];
         return true;
     });
+    if ([self.lastWindowCatalog isEqualToData:fingerprint]) return;
+    self.lastWindowCatalog = [fingerprint copy];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self.delegate streamClient:self receivedWindows:windows];
     });
