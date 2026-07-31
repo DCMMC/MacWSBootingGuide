@@ -111,9 +111,12 @@ The screenshot is a native 2560x1760 capture. SHA-256:
 d57d0aa87ed11bd45464b63deebf405ccda32a7e5636d4cf87db3f8b211f10f2
 ```
 
-It visibly confirms the production default is direct touch, the density
-choices are `像素匹配 Retina` and `更多空间 +18%`, the fullscreen-workspace
-button is present, and the current macOS window remains proportionally fitted.
+It visibly confirms the production default is direct touch, the exact
+`像素匹配 Retina` and optional `更多空间 +18%` paths, the fullscreen-workspace
+button, and proportional fitting of the current macOS window. The later
+three-choice UI also offers `放大 +10%`, but documents it as an optional Metal
+upsample rather than exact Retina; a one-time V2 migration restores pixel
+matching as the installed default.
 
 ## Evidence boundary
 

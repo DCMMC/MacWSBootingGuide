@@ -29,6 +29,16 @@ int main(void) {
     // an already-moving finger must not become a delayed long press.
     assert(MacWSDecideTouchCandidate(0.45, 6.0, false) ==
            MacWSTouchCandidateDecisionScroll);
+    assert(MacWSChooseDirectScrollAxis(2.0, 6.0) ==
+           MacWSDirectScrollAxisVertical);
+    assert(MacWSChooseDirectScrollAxis(6.0, 4.6) ==
+           MacWSDirectScrollAxisVertical);
+    assert(MacWSChooseDirectScrollAxis(6.0, 4.4) ==
+           MacWSDirectScrollAxisHorizontal);
+    double constrainedX = 2.0, constrainedY = -9.0;
+    MacWSConstrainDirectScrollDelta(MacWSDirectScrollAxisVertical,
+                                    &constrainedX, &constrainedY);
+    assert(constrainedX == 0.0 && constrainedY == -9.0);
 
     MacWSViewport viewport = {0};
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 1, 0.5, 0.5,
@@ -113,6 +123,20 @@ int main(void) {
     frame.contentX = 1000;
     frame.contentWidth = 2000;
     assert(!MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
+
+    MacWSGeometryInvalidation geometry = {
+        .magic = MACWS_GEOMETRY_INVALIDATION_MAGIC,
+        .version = MACWS_GEOMETRY_INVALIDATION_VERSION,
+        .size = sizeof(geometry),
+        .windowID = 42,
+        .pixelWidth = 1868,
+        .pixelHeight = 1184,
+    };
+    assert(MacWSGeometryInvalidationIsValid(&geometry, sizeof(geometry)));
+    assert(!MacWSGeometryInvalidationIsValid(&geometry,
+                                              sizeof(geometry) - 1));
+    geometry.pixelWidth = MACWS_STREAM_MAX_DIMENSION + 1;
+    assert(!MacWSGeometryInvalidationIsValid(&geometry, sizeof(geometry)));
 
     const char title[] = "Terminal";
     unsigned char windowBytes[sizeof(MacWSStreamWindowDescriptor) + sizeof(title) - 1];

@@ -10,6 +10,7 @@
 
 #import <stdint.h>
 #import <stdio.h>
+#import <stdlib.h>
 
 extern uint32_t IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                     size_t plane);
@@ -55,7 +56,7 @@ static NSDictionary *plane(BOOL second) {
     };
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     @autoreleasepool {
         NSDictionary *properties = @{
             @"IOSurfaceAllocSize": @20684288,
@@ -69,13 +70,19 @@ int main(void) {
             @"IOSurfacePlaneInfo": @[plane(NO), plane(YES)],
             @"IOSurfaceWidth": @2388,
         };
-        IOSurfaceRef surface = IOSurfaceCreate(
-            (__bridge CFDictionaryRef)properties);
+        BOOL lookedUp = argc > 1;
+        IOSurfaceRef surface = lookedUp
+            ? IOSurfaceLookup((IOSurfaceID)strtoul(argv[1], NULL, 0))
+            : IOSurfaceCreate((__bridge CFDictionaryRef)properties);
         if (!surface) {
-            fprintf(stderr, "IOSURFACE-COMPRESSION-PROBE create failed\n");
+            fprintf(stderr, "IOSURFACE-COMPRESSION-PROBE %s failed id=%s\n",
+                lookedUp ? "lookup" : "create", argc > 1 ? argv[1] : "-");
             return 2;
         }
         CFDictionaryRef actual = IOSurfaceCopyAllValues(surface);
+        fprintf(stderr, "IOSURFACE-COMPRESSION-PROBE id=%u properties=",
+                IOSurfaceGetID(surface));
+        CFShow(actual);
         NSDictionary *root = (__bridge NSDictionary *)actual;
         id creationValue = [root objectForKey:@"CreationProperties"];
         NSDictionary *creation =

@@ -89,7 +89,9 @@ static double MacWSMachMilliseconds(uint64_t start, uint64_t end) {
 }
 
 static CGFloat MacWSDensityModeFactor(MacWSHostDisplayDensity density) {
-    return density == MacWSHostDisplayDensityKeyboard ? 0.85 : 1.0;
+    if (density == MacWSHostDisplayDensityKeyboard) return 0.85;
+    if (density == MacWSHostDisplayDensityComfort) return 1.10;
+    return 1.0;
 }
 
 static void MacWSLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -531,6 +533,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSString *_lastStatus;
     UIView *_directTouchIndicator;
     UIView *_trackpadCursorView;
+    UIView *_pencilCursorView;
     UILabel *_inputUnavailableLabel;
     UIView *_tooSmallOverlay;
     UILabel *_tooSmallLabel;
@@ -561,6 +564,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     BOOL _trackpadHadMultipleTouches;
     BOOL _trackpadCursorWasTouched;
     BOOL _externalPointerHoverActive;
+    BOOL _pencilHoverActive;
+    UITouch *_pencilTouch;
+    CGPoint _pencilTouchStartPoint;
+    CGFloat _pencilTouchTravel;
+    NSTimeInterval _pencilTouchBeganAt;
     UITouch *_directTouch;
     UITouch *_secondaryPointerTouch;
     BOOL _directGestureBlocked;
@@ -569,6 +577,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGPoint _directTouchPreviousPoint;
     CGPoint _directScrollVelocity;
     CGPoint _directScrollFramePoint;
+    MacWSDirectScrollAxis _directScrollAxis;
     NSTimeInterval _directTouchStartTimestamp;
     NSTimeInterval _directTouchPreviousTimestamp;
     uint64_t _directTouchSerial;
@@ -658,24 +667,55 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [_directTouchIndicator addSubview:contactDot];
     [self addSubview:_directTouchIndicator];
 
-    // iPad's indirect pointer is a material circle rather than a desktop
-    // arrow.  Keep it visible in trackpad mode between gestures, with a fine
-    // rim and a small shadow so it remains legible over light and dark apps.
+    // A finger-driven relative trackpad controls a macOS desktop, so represent
+    // its persistent position with the familiar macOS arrow rather than the
+    // iPad direct-manipulation circle. Hardware Magic Keyboard pointers keep
+    // UIKit's native adaptive pointer and do not draw this overlay.
     _trackpadCursorView = [[UIView alloc]
-        initWithFrame:CGRectMake(0, 0, 24, 24)];
-    _trackpadCursorView.backgroundColor =
-        [UIColor colorWithWhite:0.68 alpha:0.92];
-    _trackpadCursorView.layer.borderWidth = 0.75;
-    _trackpadCursorView.layer.borderColor =
-        [UIColor.whiteColor colorWithAlphaComponent:0.92].CGColor;
-    _trackpadCursorView.layer.cornerRadius = 12;
+        initWithFrame:CGRectMake(0, 0, 22, 28)];
+    _trackpadCursorView.backgroundColor = UIColor.clearColor;
     _trackpadCursorView.layer.shadowColor = UIColor.blackColor.CGColor;
-    _trackpadCursorView.layer.shadowOpacity = 0.34;
-    _trackpadCursorView.layer.shadowRadius = 4.5;
-    _trackpadCursorView.layer.shadowOffset = CGSizeMake(0, 1.5);
+    _trackpadCursorView.layer.shadowOpacity = 0.42;
+    _trackpadCursorView.layer.shadowRadius = 2.5;
+    _trackpadCursorView.layer.shadowOffset = CGSizeMake(0, 1.0);
     _trackpadCursorView.userInteractionEnabled = NO;
     _trackpadCursorView.hidden = YES;
+    CAShapeLayer *arrow = [CAShapeLayer layer];
+    UIBezierPath *arrowPath = [UIBezierPath bezierPath];
+    [arrowPath moveToPoint:CGPointMake(2.0, 1.5)];
+    [arrowPath addLineToPoint:CGPointMake(2.0, 22.5)];
+    [arrowPath addLineToPoint:CGPointMake(7.6, 17.1)];
+    [arrowPath addLineToPoint:CGPointMake(11.5, 26.0)];
+    [arrowPath addLineToPoint:CGPointMake(15.0, 24.4)];
+    [arrowPath addLineToPoint:CGPointMake(11.1, 15.8)];
+    [arrowPath addLineToPoint:CGPointMake(19.0, 15.4)];
+    [arrowPath closePath];
+    arrow.path = arrowPath.CGPath;
+    arrow.fillColor = UIColor.blackColor.CGColor;
+    arrow.strokeColor = UIColor.whiteColor.CGColor;
+    arrow.lineWidth = 1.25;
+    arrow.lineJoin = kCALineJoinRound;
+    [_trackpadCursorView.layer addSublayer:arrow];
     [self addSubview:_trackpadCursorView];
+
+    // Pencil hover follows iPad's precise-pointer visual language. Native
+    // in-air updates arrive only on hover-capable hardware; contact movement
+    // remains a non-clicking preview on older iPads until a short tap ends.
+    _pencilCursorView = [[UIView alloc]
+        initWithFrame:CGRectMake(0, 0, 20, 20)];
+    _pencilCursorView.backgroundColor =
+        [UIColor.systemGrayColor colorWithAlphaComponent:0.72];
+    _pencilCursorView.layer.borderWidth = 1.0;
+    _pencilCursorView.layer.borderColor =
+        [UIColor.whiteColor colorWithAlphaComponent:0.90].CGColor;
+    _pencilCursorView.layer.cornerRadius = 10;
+    _pencilCursorView.layer.shadowColor = UIColor.blackColor.CGColor;
+    _pencilCursorView.layer.shadowOpacity = 0.28;
+    _pencilCursorView.layer.shadowRadius = 4;
+    _pencilCursorView.layer.shadowOffset = CGSizeMake(0, 1.5);
+    _pencilCursorView.userInteractionEnabled = NO;
+    _pencilCursorView.hidden = YES;
+    [self addSubview:_pencilCursorView];
 
     _inputUnavailableLabel = [UILabel new];
     _inputUnavailableLabel.translatesAutoresizingMaskIntoConstraints = NO;
@@ -784,7 +824,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         UIHoverGestureRecognizer *hover =
             [[UIHoverGestureRecognizer alloc] initWithTarget:self
                                                        action:@selector(hovered:)];
+        hover.allowedTouchTypes = @[@(UITouchTypeIndirectPointer)];
         [self addGestureRecognizer:hover];
+        UIHoverGestureRecognizer *pencilHover =
+            [[UIHoverGestureRecognizer alloc] initWithTarget:self
+                                                       action:@selector(pencilHovered:)];
+        pencilHover.allowedTouchTypes = @[@(UITouchTypePencil)];
+        [self addGestureRecognizer:pencilHover];
     }
     _twoFingerPanRecognizer = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(twoFingerPanned:)];
@@ -913,7 +959,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)setDisplayDensity:(MacWSHostDisplayDensity)displayDensity {
     if (displayDensity != MacWSHostDisplayDensityTouchComfort &&
-        displayDensity != MacWSHostDisplayDensityKeyboard) return;
+        displayDensity != MacWSHostDisplayDensityKeyboard &&
+        displayDensity != MacWSHostDisplayDensityComfort) return;
     _displayDensity = displayDensity;
     _lastRequestedWindowSize = CGSizeZero;
     [self resetViewportZoom];
@@ -971,7 +1018,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     self.userInteractionEnabled = _macWSInputEnabled && !_windowTooSmall;
     if (_windowTooSmall) {
         NSString *densityName = self.displayDensity ==
-            MacWSHostDisplayDensityKeyboard ? @"更多空间" : @"像素匹配 Retina";
+            MacWSHostDisplayDensityKeyboard ? @"更多空间" :
+            (self.displayDensity == MacWSHostDisplayDensityComfort
+                ? @"放大 +10%" : @"像素匹配 Retina");
         _tooSmallLabel.text = [NSString stringWithFormat:
             @"窗口太小\n\n此 macOS 应用至少需要 %.0f × %.0f 点\n"
              "当前 %@ 模式需要约 %.0f × %.0f iPad 点\n\n"
@@ -1866,10 +1915,17 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         CGPoint pointerCenter = CGPointZero;
         showTrackpad = [self viewPointForFramePoint:_trackpadCursor
                                              output:&pointerCenter];
-        if (showTrackpad) _trackpadCursorView.center = pointerCenter;
+        if (showTrackpad) {
+            // Keep the arrow's 2,1.5 path vertex as the macOS hot spot.
+            _trackpadCursorView.frame = CGRectMake(pointerCenter.x - 2.0,
+                pointerCenter.y - 1.5, 22.0, 28.0);
+        }
     }
     _trackpadCursorView.hidden = !showTrackpad;
     if (showTrackpad) [self bringSubviewToFront:_trackpadCursorView];
+    BOOL showPencil = available && (_pencilHoverActive || _pencilTouch != nil);
+    _pencilCursorView.hidden = !showPencil;
+    if (showPencil) [self bringSubviewToFront:_pencilCursorView];
 }
 
 - (void)setTrackpadPointerPressed:(BOOL)pressed animated:(BOOL)animated {
@@ -1961,7 +2017,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .sampleSequence = ++_inputSampleSequence,
     };
     [self.statusDelegate metalView:self emittedInput:record];
-    if (source != MacWSInputSourceIndirectPointer &&
+    if (source == MacWSInputSourceFinger &&
         self.inputMode == MacWSHostInputModeDirect) {
         _directTouchIndicator.center = viewPoint;
         _directTouchIndicator.hidden = kind == MacWSInputKindTouchUp ||
@@ -1974,6 +2030,15 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)emitTouches:(NSSet<UITouch *> *)touches kind:(MacWSInputKind)kind {
     for (UITouch *touch in touches)
         [self emitKind:kind touch:touch point:[touch locationInView:self]];
+}
+
+- (void)emitPencilHoverForTouch:(UITouch *)touch point:(CGPoint)viewPoint {
+    if (!touch) return;
+    viewPoint = [touch preciseLocationInView:self];
+    [self emitKind:MacWSInputKindHover touch:touch point:viewPoint];
+    _pencilCursorView.center = viewPoint;
+    _pencilCursorView.hidden = NO;
+    [self bringSubviewToFront:_pencilCursorView];
 }
 
 - (void)cancelDirectTouchForMultitouch {
@@ -1990,6 +2055,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
     _directTouch = nil;
     _directTouchState = MacWSDirectTouchStateIdle;
+    _directScrollAxis = MacWSDirectScrollAxisNone;
     _directTouchIndicator.hidden = YES;
 }
 
@@ -2000,6 +2066,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _directTouchPreviousPoint = _directTouchStartPoint;
     _directScrollVelocity = CGPointZero;
     _directScrollFramePoint = CGPointZero;
+    _directScrollAxis = MacWSDirectScrollAxisNone;
     _directTouchStartTimestamp = touch.timestamp;
     _directTouchPreviousTimestamp = touch.timestamp;
     uint64_t serial = ++_directTouchSerial;
@@ -2044,7 +2111,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!self.softwareKeyboardActive) [self becomeFirstResponder];
     UITouch *touch = touches.anyObject;
     BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
-    if (pointerTouch) {
+    if (touch.type == UITouchTypePencil) {
+        _pencilTouch = touch;
+        _pencilHoverActive = NO;
+        _pencilTouchStartPoint = [touch preciseLocationInView:self];
+        _pencilTouchTravel = 0;
+        _pencilTouchBeganAt = touch.timestamp;
+        [self emitPencilHoverForTouch:touch point:_pencilTouchStartPoint];
+    } else if (pointerTouch) {
         if (@available(iOS 13.4, *)) {
             if ((event.buttonMask & UIEventButtonMaskSecondary) != 0) {
                 _secondaryPointerTouch = touch;
@@ -2101,7 +2175,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *touch = touches.anyObject;
     BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
-    if (pointerTouch) {
+    if (_pencilTouch && [touches containsObject:_pencilTouch]) {
+        CGPoint point = [_pencilTouch preciseLocationInView:self];
+        _pencilTouchTravel = MAX(_pencilTouchTravel,
+            hypot(point.x - _pencilTouchStartPoint.x,
+                  point.y - _pencilTouchStartPoint.y));
+        [self emitPencilHoverForTouch:_pencilTouch point:point];
+    } else if (pointerTouch) {
         if (touch != _secondaryPointerTouch)
             [self emitTouches:touches kind:MacWSInputKindTouchMove];
     } else if (self.inputMode == MacWSHostInputModeDirect) {
@@ -2117,6 +2197,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 decision == MacWSTouchCandidateDecisionScroll) {
                 _directTouchSerial++;
                 _directTouchState = MacWSDirectTouchStateScrolling;
+                _directScrollAxis = MacWSChooseDirectScrollAxis(
+                    point.x - _directTouchStartPoint.x,
+                    point.y - _directTouchStartPoint.y);
                 [self stopScrollMomentumWithTerminalPhase:YES];
                 CGPoint framePoint = CGPointZero;
                 if ([self framePointForViewPoint:point output:&framePoint]) {
@@ -2128,6 +2211,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                     CGPoint delta = CGPointMake(
                         point.x - _directTouchPreviousPoint.x,
                         point.y - _directTouchPreviousPoint.y);
+                    double deltaX = delta.x, deltaY = delta.y;
+                    MacWSConstrainDirectScrollDelta(_directScrollAxis,
+                                                    &deltaX, &deltaY);
+                    delta = CGPointMake(deltaX, deltaY);
                     [self emitScrollAtFramePoint:framePoint translation:delta
                                            flags:MacWSInputFlagScrollChanged
                                        timestamp:_directTouch.timestamp];
@@ -2166,6 +2253,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                     CGPoint delta = CGPointMake(
                         point.x - _directTouchPreviousPoint.x,
                         point.y - _directTouchPreviousPoint.y);
+                    double deltaX = delta.x, deltaY = delta.y;
+                    MacWSConstrainDirectScrollDelta(_directScrollAxis,
+                                                    &deltaX, &deltaY);
+                    delta = CGPointMake(deltaX, deltaY);
                     if (delta.x != 0 || delta.y != 0) {
                         [self emitScrollAtFramePoint:framePoint translation:delta
                                                flags:MacWSInputFlagScrollChanged
@@ -2205,9 +2296,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 ? [self currentFrameWidth] / CGRectGetWidth(_contentRect) : 1.0;
             CGFloat scaleY = CGRectGetHeight(_contentRect) > 0
                 ? [self currentFrameHeight] / CGRectGetHeight(_contentRect) : 1.0;
-            _trackpadCursor.x = fmin(fmax(_trackpadCursor.x + dx * scaleX * 0.82,
+            _trackpadCursor.x = fmin(fmax(_trackpadCursor.x + dx * scaleX * 1.25,
                                           0.0), [self currentFrameWidth] - 1.0);
-            _trackpadCursor.y = fmin(fmax(_trackpadCursor.y + dy * scaleY * 0.82,
+            _trackpadCursor.y = fmin(fmax(_trackpadCursor.y + dy * scaleY * 1.25,
                                           0.0), [self currentFrameHeight] - 1.0);
             [self emitKind:_trackpadButtonDown ? MacWSInputKindTouchMove
                                                 : MacWSInputKindHover
@@ -2238,7 +2329,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *touch = touches.anyObject;
     BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
-    if (pointerTouch) {
+    if (_pencilTouch && [touches containsObject:_pencilTouch]) {
+        CGPoint point = [_pencilTouch preciseLocationInView:self];
+        _pencilTouchTravel = MAX(_pencilTouchTravel,
+            hypot(point.x - _pencilTouchStartPoint.x,
+                  point.y - _pencilTouchStartPoint.y));
+        // On pre-hover iPads contact movement is a precise, non-clicking
+        // preview. A short stationary contact retains normal Pencil tap.
+        if (_pencilTouchTravel < MACWS_DIRECT_GESTURE_THRESHOLD_POINTS &&
+            touch.timestamp - _pencilTouchBeganAt < 0.45) {
+            [self emitKind:MacWSInputKindTap touch:_pencilTouch point:point];
+        }
+        _pencilTouch = nil;
+        _pencilCursorView.hidden = !_pencilHoverActive;
+    } else if (pointerTouch) {
         if (touch == _secondaryPointerTouch)
             _secondaryPointerTouch = nil;
         else
@@ -2267,6 +2371,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                         CGPoint delta = CGPointMake(
                             point.x - _directTouchStartPoint.x,
                             point.y - _directTouchStartPoint.y);
+                        _directScrollAxis = MacWSChooseDirectScrollAxis(
+                            delta.x, delta.y);
+                        double deltaX = delta.x, deltaY = delta.y;
+                        MacWSConstrainDirectScrollDelta(_directScrollAxis,
+                                                        &deltaX, &deltaY);
+                        delta = CGPointMake(deltaX, deltaY);
                         [self emitScrollAtFramePoint:framePoint
                                          translation:CGPointZero
                                                flags:MacWSInputFlagScrollBegan
@@ -2320,6 +2430,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                     CGPoint delta = CGPointMake(
                         point.x - _directTouchPreviousPoint.x,
                         point.y - _directTouchPreviousPoint.y);
+                    double deltaX = delta.x, deltaY = delta.y;
+                    MacWSConstrainDirectScrollDelta(_directScrollAxis,
+                                                    &deltaX, &deltaY);
+                    delta = CGPointMake(deltaX, deltaY);
                     if (delta.x != 0 || delta.y != 0) {
                         [self emitScrollAtFramePoint:framePoint translation:delta
                                                flags:MacWSInputFlagScrollChanged
@@ -2337,6 +2451,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             _directTouchSerial++;
             _directTouch = nil;
             _directTouchState = MacWSDirectTouchStateIdle;
+            _directScrollAxis = MacWSDirectScrollAxisNone;
             _directTouchIndicator.transform = CGAffineTransformIdentity;
             _directTouchIndicator.hidden = YES;
         }
@@ -2364,7 +2479,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     UITouch *touch = touches.anyObject;
     BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
-    if (pointerTouch) {
+    if (_pencilTouch && [touches containsObject:_pencilTouch]) {
+        _pencilTouch = nil;
+        _pencilCursorView.hidden = !_pencilHoverActive;
+    } else if (pointerTouch) {
         if (touch == _secondaryPointerTouch)
             _secondaryPointerTouch = nil;
         else
@@ -2384,6 +2502,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             _directTouchSerial++;
             _directTouch = nil;
             _directTouchState = MacWSDirectTouchStateIdle;
+            _directScrollAxis = MacWSDirectScrollAxisNone;
             _directTouchIndicator.transform = CGAffineTransformIdentity;
             _directTouchIndicator.hidden = YES;
         }
@@ -2495,7 +2614,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGFloat scaleY = contentHeight > 1.0 ? sourceHeight / contentHeight : 1.0;
     scaleX = fmin(fmax(scaleX, 0.25), 4.0);
     scaleY = fmin(fmax(scaleY, 0.25), 4.0);
-    float horizontal = (float)(-translation.x * scaleX);
+    // Direct manipulation follows iOS: moving content down requests a
+    // positive AppKit scroll delta. The relative trackpad keeps MacBook-style
+    // natural scrolling, whose UIKit translation is inverted at this bridge.
+    CGFloat direction = self.inputMode == MacWSHostInputModeDirect ? 1.0 : -1.0;
+    float horizontal = (float)(direction * translation.x * scaleX);
     uint32_t horizontalBits = 0;
     memcpy(&horizontalBits, &horizontal, sizeof(horizontalBits));
     MacWSInputRecord record = {
@@ -2506,7 +2629,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .timestamp = timestamp,
         .x = (float)framePoint.x,
         .y = (float)framePoint.y,
-        .pressure = (float)(-translation.y * scaleY),
+        .pressure = (float)(direction * translation.y * scaleY),
         .contactID = horizontalBits,
         .frameWidth = [self currentFrameWidth],
         .frameHeight = [self currentFrameHeight],
@@ -2677,6 +2800,35 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _trackpadCursor = framePoint;
     if (self.inputMode == MacWSHostInputModeTrackpad)
         [self updatePointerVisibility];
+    [self.statusDelegate metalView:self emittedInput:record];
+}
+
+- (void)pencilHovered:(UIHoverGestureRecognizer *)recognizer
+    API_AVAILABLE(ios(13.4)) {
+    if (!self.isMacWSInputEnabled) return;
+    CGPoint viewPoint = [recognizer locationInView:self];
+    CGPoint framePoint = CGPointZero;
+    if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
+    BOOL active = recognizer.state == UIGestureRecognizerStateBegan ||
+                  recognizer.state == UIGestureRecognizerStateChanged;
+    _pencilHoverActive = active;
+    _pencilCursorView.center = viewPoint;
+    [self updatePointerVisibility];
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindHover,
+        .sceneID = [self inputSceneIDWithModifiers:0],
+        .timestamp = CACurrentMediaTime(),
+        .x = (float)framePoint.x,
+        .y = (float)framePoint.y,
+        .frameWidth = [self currentFrameWidth],
+        .frameHeight = [self currentFrameHeight],
+        .targetPID = self.targetPID,
+        .source = MacWSInputSourcePencil,
+        .flags = MacWSInputFlagPreciseLocation,
+        .sampleSequence = ++_inputSampleSequence,
+    };
     [self.statusDelegate metalView:self emittedInput:record];
 }
 
@@ -3085,6 +3237,8 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     _tableView.contentInset = UIEdgeInsetsMake(1, 0, 1, 0);
     _tableView.scrollEnabled = self.preferredContentSize.height >= 380.0;
     _tableView.showsVerticalScrollIndicator = _tableView.scrollEnabled;
+    _tableView.layer.cornerRadius = 8.0;
+    _tableView.clipsToBounds = YES;
     self.view = _tableView;
 }
 
@@ -3167,9 +3321,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     if ((item.flags & (MacWSMenuNodeHidden | MacWSMenuNodeSeparator)) ||
         (item.flags & MacWSMenuNodeEnabled) == 0) return;
     MacWSCompactMenuSelection selection = _selection;
-    [self dismissViewControllerAnimated:NO completion:^{
-        if (selection) selection(item);
-    }];
+    if (selection) selection(item);
 }
 
 @end
@@ -3190,6 +3342,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UIScrollView *_semanticMenuScroll;
     UIStackView *_semanticMenuTitles;
     UIViewController *_semanticMenuPanel;
+    UIControl *_semanticMenuDismissLayer;
     UIVisualEffectView *_controlPanel;
     UIControl *_controlDismissLayer;
     UIButton *_showControlsButton;
@@ -3246,6 +3399,10 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     BOOL _pendingApplicationWindowRetryScheduled;
     BOOL _bootstrapTerminalPending;
     BOOL _bootstrapWorkspaceStartInFlight;
+    BOOL _targetWindowObservedInCatalog;
+    BOOL _targetWindowMissingCheckPending;
+    BOOL _sceneDestructionRequested;
+    uint64_t _targetWindowMissingSerial;
 }
 
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier
@@ -3522,6 +3679,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         }];
 }
 
+- (void)dismissSemanticMenu {
+    [_semanticMenuDismissLayer removeFromSuperview];
+    _semanticMenuDismissLayer = nil;
+    if (!_semanticMenuPanel) return;
+    [_semanticMenuPanel willMoveToParentViewController:nil];
+    [_semanticMenuPanel.view removeFromSuperview];
+    [_semanticMenuPanel removeFromParentViewController];
+    _semanticMenuPanel = nil;
+}
+
 - (void)presentSemanticMenuForParent:(uint64_t)parentID
                              snapshot:(MacWSMenuSnapshot *)snapshot
                                source:(UIView *)source
@@ -3541,6 +3708,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         selection:^(MacWSMenuItem *item) {
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
+            [self dismissSemanticMenu];
             if (item.flags & MacWSMenuNodeRequiresWorkspace) {
                 [self setNotice:@"此菜单项包含 macOS 自定义视图，请在全屏工作区中使用。"
                          success:NO];
@@ -3564,13 +3732,51 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                     }
                 }];
         }];
-    UIPopoverPresentationController *popover = panel.popoverPresentationController;
-    popover.sourceView = source;
-    popover.sourceRect = source.bounds;
-    popover.permittedArrowDirections = UIPopoverArrowDirectionUp |
-        UIPopoverArrowDirectionDown;
+    [self dismissSemanticMenu];
+    [self.view layoutIfNeeded];
+    CGRect sourceRect = [source convertRect:source.bounds toView:self.view];
+    CGRect safeBounds = UIEdgeInsetsInsetRect(self.view.bounds,
+                                               self.view.safeAreaInsets);
+    CGSize preferred = panel.preferredContentSize;
+    CGFloat width = MIN(preferred.width, MAX(120.0, safeBounds.size.width));
+    CGFloat height = MIN(preferred.height,
+                         MAX(80.0, safeBounds.size.height - 4.0));
+    CGFloat x = MIN(MAX(CGRectGetMinX(sourceRect), CGRectGetMinX(safeBounds)),
+        MAX(CGRectGetMinX(safeBounds), CGRectGetMaxX(safeBounds) - width));
+    CGFloat y = CGRectGetMaxY(sourceRect) + 1.0;
+    if (y + height > CGRectGetMaxY(safeBounds))
+        y = MAX(CGRectGetMinY(safeBounds),
+                CGRectGetMinY(sourceRect) - height - 1.0);
+
+    UIControl *dismissLayer = [[UIControl alloc] initWithFrame:self.view.bounds];
+    dismissLayer.autoresizingMask = UIViewAutoresizingFlexibleWidth |
+                                    UIViewAutoresizingFlexibleHeight;
+    dismissLayer.backgroundColor = UIColor.clearColor;
+    [dismissLayer addTarget:self action:@selector(dismissSemanticMenu)
+          forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:dismissLayer];
+    _semanticMenuDismissLayer = dismissLayer;
+
+    [self addChildViewController:panel];
+    panel.view.frame = CGRectMake(x, y, width, height);
+    panel.view.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    panel.view.layer.cornerRadius = 8.0;
+    panel.view.layer.borderWidth = 0.5;
+    panel.view.layer.borderColor =
+        [UIColor.separatorColor colorWithAlphaComponent:0.7].CGColor;
+    panel.view.layer.shadowColor = UIColor.blackColor.CGColor;
+    panel.view.layer.shadowOpacity = 0.25;
+    panel.view.layer.shadowRadius = 10;
+    panel.view.layer.shadowOffset = CGSizeMake(0, 4);
+    [self.view addSubview:panel.view];
+    [panel didMoveToParentViewController:self];
     _semanticMenuPanel = panel;
-    [self presentViewController:panel animated:YES completion:nil];
+    if (MacWSHostDiagnosticsEnabled()) {
+        MacWSLog(@"menu-present parent=%llu source=(%.1f,%.1f %.1fx%.1f) panel=(%.1f,%.1f %.1fx%.1f)",
+                 parentID, sourceRect.origin.x, sourceRect.origin.y,
+                 sourceRect.size.width, sourceRect.size.height,
+                 x, y, width, height);
+    }
 }
 
 - (void)semanticMenuTitleTapped:(UIButton *)sender {
@@ -3618,8 +3824,23 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetWindowResizable = _windowResizable;
     MacWSHostDisplayDensity savedDensity = (MacWSHostDisplayDensity)
         [NSUserDefaults.standardUserDefaults integerForKey:@"MacWSDisplayDensity"];
-    if (savedDensity != MacWSHostDisplayDensityKeyboard)
+    if (savedDensity != MacWSHostDisplayDensityTouchComfort &&
+        savedDensity != MacWSHostDisplayDensityKeyboard &&
+        savedDensity != MacWSHostDisplayDensityComfort)
         savedDensity = MacWSHostDisplayDensityTouchComfort;
+    // The first comfort-mode experiment migrated exact pixel matching to a
+    // 10% host-side upsample. That makes controls larger, but it cannot retain
+    // one-source-pixel-to-one-drawable-pixel sharpness. Restore the exact mode
+    // once for existing installations; Comfort remains an explicit choice.
+    if (![NSUserDefaults.standardUserDefaults
+            boolForKey:@"MacWSDensityPixelMatchMigrationV2"]) {
+        if (savedDensity == MacWSHostDisplayDensityComfort)
+            savedDensity = MacWSHostDisplayDensityTouchComfort;
+        [NSUserDefaults.standardUserDefaults setBool:YES
+            forKey:@"MacWSDensityPixelMatchMigrationV2"];
+        [NSUserDefaults.standardUserDefaults setInteger:savedDensity
+            forKey:@"MacWSDisplayDensity"];
+    }
     _metalView.displayDensity = savedDensity;
     CGFloat savedZoomScale =
         [NSUserDefaults.standardUserDefaults doubleForKey:@"MacWSFixedZoomScale"];
@@ -3941,9 +4162,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 forControlEvents:UIControlEventValueChanged];
 
     _densityControl = [[UISegmentedControl alloc]
-        initWithItems:@[@"像素匹配 Retina", @"更多空间 +18%"]];
+        initWithItems:@[@"像素匹配", @"放大 +10%", @"更多空间 +18%"]];
     _densityControl.selectedSegmentIndex =
-        _metalView.displayDensity == MacWSHostDisplayDensityKeyboard ? 1 : 0;
+        _metalView.displayDensity == MacWSHostDisplayDensityKeyboard ? 2 :
+        (_metalView.displayDensity == MacWSHostDisplayDensityComfort ? 1 : 0);
     [_densityControl addTarget:self action:@selector(densityChanged:)
                forControlEvents:UIControlEventValueChanged];
     _zoomScaleControl = [[UISegmentedControl alloc]
@@ -4117,6 +4339,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (void)viewWillTransitionToSize:(CGSize)size
        withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
     [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    [self dismissSemanticMenu];
     [_metalView geometryDidChange];
     [coordinator animateAlongsideTransition:nil completion:^(
         id<UIViewControllerTransitionCoordinatorContext> context) {
@@ -4130,6 +4353,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // updates, while ordinary split/full-screen transitions arrive through
     // view-controller layout.  Converge both on one transform/configuration
     // boundary so input and pixels never use different generations.
+    [self dismissSemanticMenu];
     [self.view setNeedsLayout];
     [self.view layoutIfNeeded];
     [_metalView geometryDidChange];
@@ -4325,19 +4549,27 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)densityChanged:(UISegmentedControl *)sender {
-    MacWSHostDisplayDensity density = sender.selectedSegmentIndex == 1
+    MacWSHostDisplayDensity density = sender.selectedSegmentIndex == 2
         ? MacWSHostDisplayDensityKeyboard
-        : MacWSHostDisplayDensityTouchComfort;
+        : (sender.selectedSegmentIndex == 1
+            ? MacWSHostDisplayDensityComfort
+            : MacWSHostDisplayDensityTouchComfort);
     _metalView.displayDensity = density;
     [NSUserDefaults.standardUserDefaults setInteger:density
                                               forKey:@"MacWSDisplayDensity"];
-    _inputLabel.text = density == MacWSHostDisplayDensityKeyboard
-        ? [NSString stringWithFormat:
+    if (density == MacWSHostDisplayDensityKeyboard) {
+        _inputLabel.text = [NSString stringWithFormat:
             @"显示：更多空间；当前有效密度 %.0f%%，画布比像素匹配模式多约 18%%",
-            _metalView.effectiveDensityScale * 100.0]
-        : [NSString stringWithFormat:
+            _metalView.effectiveDensityScale * 100.0];
+    } else if (density == MacWSHostDisplayDensityComfort) {
+        _inputLabel.text = [NSString stringWithFormat:
+            @"显示：放大 +10%%；有效密度 %.0f%%，使用 Metal 高质量重采样；如需逐像素锐利请切换像素匹配",
+            _metalView.effectiveDensityScale * 100.0];
+    } else {
+        _inputLabel.text = [NSString stringWithFormat:
             @"显示：像素匹配 Retina；当前有效密度 %.0f%%（随 iPadOS 合成比例自动调整）",
             _metalView.effectiveDensityScale * 100.0];
+    }
 }
 
 - (void)zoomScaleChanged:(UISegmentedControl *)sender {
@@ -4595,6 +4827,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _windowID = windowID;
     _windowOwnerPID = ownerPID;
     _windowGroupID = logicalGroupID;
+    _targetWindowObservedInCatalog = NO;
+    _targetWindowMissingCheckPending = NO;
+    _sceneDestructionRequested = NO;
+    _targetWindowMissingSerial++;
     _windowMinimumSize = CGSizeZero;
     _windowResizable = NO;
     _metalView.minimumLogicalSize = CGSizeZero;
@@ -5298,6 +5534,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             resolvedWindow = groupReplacement;
         if (!resolvedWindow) resolvedWindow = groupReplacement;
         if (resolvedWindow) {
+            _targetWindowObservedInCatalog = YES;
+            _targetWindowMissingCheckPending = NO;
+            _targetWindowMissingSerial++;
             uint32_t resolvedID = resolvedWindow.descriptor.windowID;
             _windowOwnerPID = resolvedWindow.descriptor.ownerPID;
             _windowGroupID = resolvedWindow.descriptor.logicalGroupID;
@@ -5323,6 +5562,65 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 MacWSRememberSceneBinding(self.view.window.windowScene.session,
                                           [self streamRestorationActivity]);
             }
+        } else if (_targetWindowObservedInCatalog &&
+                   !_targetWindowMissingCheckPending &&
+                   !_sceneDestructionRequested) {
+            // The catalog is authoritative, but one transient refresh can
+            // occur while AppKit replaces a tab-group member. Re-query once
+            // and require the exact ID and its logical group to remain absent
+            // for a bounded interval before removing the corresponding Scene.
+            _targetWindowMissingCheckPending = YES;
+            uint64_t serial = ++_targetWindowMissingSerial;
+            uint32_t expectedWindowID = _windowID;
+            uint32_t expectedGroupID = _windowGroupID;
+            int32_t expectedOwnerPID = _windowOwnerPID;
+            [_metalView requestStreamWindowList];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         650 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (serial != self->_targetWindowMissingSerial ||
+                    !self->_targetWindowMissingCheckPending ||
+                    self->_sceneDestructionRequested ||
+                    self->_windowID != expectedWindowID) return;
+                BOOL present = NO;
+                for (MacWSStreamWindow *candidate in self->_streamWindows) {
+                    if (candidate.descriptor.windowID == expectedWindowID ||
+                        (expectedGroupID != 0 &&
+                         candidate.descriptor.ownerPID == expectedOwnerPID &&
+                         candidate.descriptor.logicalGroupID == expectedGroupID)) {
+                        present = YES;
+                        break;
+                    }
+                }
+                self->_targetWindowMissingCheckPending = NO;
+                if (present) return;
+                UISceneSession *session = self.view.window.windowScene.session;
+                NSString *identifier = session.persistentIdentifier;
+                if (!session || !identifier.length) return;
+                if (!MacWSSceneSessionsPreservingMacWindow)
+                    MacWSSceneSessionsPreservingMacWindow = [NSMutableSet set];
+                if (!MacWSSceneCloseRequestsSent)
+                    MacWSSceneCloseRequestsSent = [NSMutableSet set];
+                [MacWSSceneSessionsPreservingMacWindow addObject:identifier];
+                [MacWSSceneCloseRequestsSent addObject:identifier];
+                [MacWSSceneBindings removeObjectForKey:identifier];
+                MacWSSetPersistedSceneBinding(identifier, nil);
+                self->_sceneDestructionRequested = YES;
+                MacWSLog(@"runtime-confirmed mac-window-removed id=%@ owner=%d window=%u group=%u catalog-count=%lu",
+                         identifier, expectedOwnerPID, expectedWindowID,
+                         expectedGroupID,
+                         (unsigned long)self->_streamWindows.count);
+                [UIApplication.sharedApplication
+                    requestSceneSessionDestruction:session options:nil
+                    errorHandler:^(NSError *error) {
+                        self->_sceneDestructionRequested = NO;
+                        [MacWSSceneSessionsPreservingMacWindow
+                            removeObject:identifier];
+                        [MacWSSceneCloseRequestsSent removeObject:identifier];
+                        MacWSLog(@"mac-window-removed scene-destruction failed id=%@ error=%@",
+                                 identifier, error);
+                    }];
+            });
         }
     }
     NSUInteger logicalWindowCount = [self logicalWindowRepresentatives].count;
@@ -5354,8 +5652,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)suspendSceneStream {
-    [_semanticMenuPanel dismissViewControllerAnimated:NO completion:nil];
-    _semanticMenuPanel = nil;
+    [self dismissSemanticMenu];
     [_metalView suspendStream];
 }
 

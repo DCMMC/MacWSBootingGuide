@@ -83,6 +83,7 @@ typedef NSUInteger (*MacWSPressedMouseButtons)(id, SEL);
 typedef CGPoint (*MacWSMouseLocation)(id, SEL);
 typedef int32_t (*MacWSCancelMenuTrackingPrivate)(uint8_t);
 typedef int32_t (*MacWSCGWindowLevelForKey)(int32_t);
+typedef void (*MacWSOrderWindow)(id, SEL, NSInteger, NSInteger);
 
 static int MacWSAppInputSocket = -1;
 static _Atomic int MacWSAppInputInstallState;
@@ -92,6 +93,8 @@ static NSData *MacWSLastWindowMetricsEntries;
 static uint64_t MacWSWindowMetricsGeneration;
 static void MacWSPublishWindowMetrics(void);
 static void MacWSNotifyDisplayCatalogChanged(uint8_t reason);
+static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
+                                              CGRect appliedFrame);
 // Main-thread-only semantic menu snapshot cache. ObjC objects never cross the
 // process boundary: Host receives generation-scoped integer IDs, while the
 // target process retains the corresponding item and index path solely long
@@ -126,6 +129,14 @@ static BOOL MacWSAppInputRFBTrackingActive;
 // NSEvent.pressedMouseButtons bit(s) represented by the one atomic gesture
 // currently dispatched through AppKit (left=1, right=2).
 static NSUInteger MacWSAppInputRFBTrackingButtons;
+// NSApplication.windows is not a complete ownership registry: runtime on the
+// current VSCode/Electron build captured a live level-101 CGWindow while both
+// windows and orderedWindows contained only the document window. Keep weak
+// references to real NSWindow instances when AppKit orders them, so routing
+// can resolve the exact transient object instead of treating its pixels as an
+// outside click on the base window.
+static NSHashTable *MacWSOrderedWindowRegistry;
+static MacWSOrderWindow MacWSOriginalOrderWindow;
 static MacWSPressedMouseButtons MacWSOriginalPressedMouseButtons;
 static MacWSMouseLocation MacWSOriginalMouseLocation;
 // Main-thread scoped. AppKit's menu-bar tracker ignores the passed NSEvent's
@@ -153,6 +164,62 @@ static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
+}
+
+static void MacWSTrackOrderedWindow(id window) {
+    if (!window || !MacWSOrderedWindowRegistry) return;
+    [MacWSOrderedWindowRegistry addObject:window];
+}
+
+static void MacWSAppInputOrderWindow(id self, SEL selector,
+                                     NSInteger place,
+                                     NSInteger relativeTo) {
+    MacWSOriginalOrderWindow(self, selector, place, relativeTo);
+    MacWSTrackOrderedWindow(self);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+            self, sel_registerName("windowNumber"));
+        NSInteger level = ((MacWSMsgInteger)objc_msgSend)(
+            self, sel_registerName("level"));
+        if (level > 0) {
+            CGRect frame = ((MacWSMsgRect)objc_msgSend)(
+                self, sel_registerName("frame"));
+            fprintf(stderr,
+                "#### APP-INPUT WINDOW-REGISTRY pid=%d number=%ld class=%s "
+                "place=%ld relative=%ld level=%ld frame=(%.1f,%.1f %.1fx%.1f)\n",
+                getpid(), (long)number, object_getClassName(self),
+                (long)place, (long)relativeTo, (long)level,
+                frame.origin.x, frame.origin.y,
+                frame.size.width, frame.size.height);
+            fflush(stderr);
+        }
+    }
+}
+
+static void MacWSInstallOrderedWindowRegistry(void) {
+    if (!MacWSOrderedWindowRegistry) {
+        Class hashTableClass = objc_getClass("NSHashTable");
+        if (hashTableClass) {
+            MacWSOrderedWindowRegistry = [((id (*)(id, SEL))objc_msgSend)(
+                (id)hashTableClass,
+                sel_registerName("weakObjectsHashTable")) retain];
+        }
+    }
+    Class windowClass = objc_getClass("NSWindow");
+    SEL selector = sel_registerName("orderWindow:relativeTo:");
+    Method method = windowClass
+        ? class_getInstanceMethod(windowClass, selector) : NULL;
+    if (!method || MacWSOriginalOrderWindow) return;
+    IMP implementation = method_getImplementation(method);
+    if (implementation == (IMP)MacWSAppInputOrderWindow) return;
+    MacWSOriginalOrderWindow = (MacWSOrderWindow)implementation;
+    method_setImplementation(method, (IMP)MacWSAppInputOrderWindow);
+    // This runs from libmachook's initializer, before AppKit has registered
+    // the process. Do not call +[NSApplication sharedApplication] here:
+    // runtime on Electron PID 72595 showed that doing so aborts in
+    // _RegisterApplication. Existing document windows remain discoverable
+    // through the request-time application.windows scan; this registry is
+    // specifically for later transient windows crossing orderWindow:.
 }
 
 // Objective-C constant-string objects emitted into this injected arm64e dylib
@@ -2470,6 +2537,16 @@ static id MacWSWindowForScreenPoint(id application, CGPoint screenPoint) {
             applicationWindowSelector)) {
         id globalWindow = ((MacWSMsgIDInteger)objc_msgSend)(
             application, applicationWindowSelector, globalWindowNumber);
+        if (!globalWindow) {
+            for (id candidate in [MacWSOrderedWindowRegistry allObjects]) {
+                NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+                    candidate, sel_registerName("windowNumber"));
+                if (number == globalWindowNumber) {
+                    globalWindow = candidate;
+                    break;
+                }
+            }
+        }
         if (globalWindow) {
             static unsigned transientWindowLogs;
             if (MacWSRuntimeDiagnosticsEnabled() &&
@@ -2505,6 +2582,22 @@ static id MacWSWindowForScreenPoint(id application, CGPoint screenPoint) {
         CGRect frame = ((MacWSMsgRect)objc_msgSend)(window, frameSelector);
         if (visible && MacWSPointInRect(screenPoint, frame)) return window;
     }
+    id trackedHit = nil;
+    NSInteger trackedLevel = NSIntegerMin;
+    for (id candidate in [MacWSOrderedWindowRegistry allObjects]) {
+        BOOL visible = ((MacWSMsgBool)objc_msgSend)(
+            candidate, sel_registerName("isVisible"));
+        CGRect frame = ((MacWSMsgRect)objc_msgSend)(
+            candidate, frameSelector);
+        NSInteger level = ((MacWSMsgInteger)objc_msgSend)(
+            candidate, sel_registerName("level"));
+        if (visible && MacWSPointInRect(screenPoint, frame) &&
+            (!trackedHit || level > trackedLevel)) {
+            trackedHit = candidate;
+            trackedLevel = level;
+        }
+    }
+    if (trackedHit) return trackedHit;
     return keyWindow ?: ((MacWSMsgID)objc_msgSend)(application,
         sel_registerName("mainWindow"));
 }
@@ -2521,6 +2614,11 @@ static id MacWSWindowWithNumber(id application, uint32_t windowNumber) {
     id windows = ((MacWSMsgID)objc_msgSend)(
         application, sel_registerName("windows"));
     for (id window in windows) {
+        NSInteger candidate = ((MacWSMsgInteger)objc_msgSend)(
+            window, sel_registerName("windowNumber"));
+        if (candidate == (NSInteger)windowNumber) return window;
+    }
+    for (id window in [MacWSOrderedWindowRegistry allObjects]) {
         NSInteger candidate = ((MacWSMsgInteger)objc_msgSend)(
             window, sel_registerName("windowNumber"));
         if (candidate == (NSInteger)windowNumber) return window;
@@ -2577,13 +2675,16 @@ static id MacWSOutsidePopupWindow(id application, id baseWindow,
     NSMutableOrderedSet *windowSet = [NSMutableOrderedSet orderedSet];
     if (orderedWindows) [windowSet addObjectsFromArray:orderedWindows];
     if (applicationWindows) [windowSet addObjectsFromArray:applicationWindows];
+    NSArray *trackedWindows = [MacWSOrderedWindowRegistry allObjects];
+    if (trackedWindows) [windowSet addObjectsFromArray:trackedWindows];
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,
             "#### APP-INPUT POPUP-SCAN pid=%d api=%p level=%ld ordered=%lu "
-            "all=%lu unique=%lu point=(%.1f,%.1f)\n",
+            "all=%lu tracked=%lu unique=%lu point=(%.1f,%.1f)\n",
             getpid(), levelForKey, (long)popupLevel,
             (unsigned long)[orderedWindows count],
             (unsigned long)[applicationWindows count],
+            (unsigned long)[trackedWindows count],
             (unsigned long)[windowSet count], screenPoint.x, screenPoint.y);
     }
     for (id candidate in windowSet) {
@@ -3119,21 +3220,30 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 sel_registerName("respondsToSelector:"), setter)) return;
         ((MacWSMsgVoidRectBoolBool)objc_msgSend)(
             window, setter, newFrame, YES, NO);
+        CGRect appliedFrame = ((MacWSMsgRect)objc_msgSend)(
+            window, sel_registerName("frame"));
+        BOOL geometryChanged =
+            fabs(appliedFrame.origin.x - oldFrame.origin.x) > 0.25 ||
+            fabs(appliedFrame.origin.y - oldFrame.origin.y) > 0.25 ||
+            fabs(appliedFrame.size.width - oldFrame.size.width) > 0.25 ||
+            fabs(appliedFrame.size.height - oldFrame.size.height) > 0.25;
         // setFrame:display:animate: is synchronous with AppKit's accepted
         // geometry. Publish that committed size now instead of making Host
         // wait for the 500-ms recovery timer or issue a blind catalog poll.
         MacWSPublishWindowMetrics();
-        MacWSNotifyDisplayCatalogChanged('g');
+        if (geometryChanged) MacWSNotifyDisplayGeometryChanged(
+            windowNumber, window, appliedFrame);
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
                 "#### APP-INPUT CONFIGURE pid=%d window=%u "
                 "old=%.1fx%.1f requested=%.1fx%.1f minimum=%.1fx%.1f "
-                "applied=(%.1f,%.1f %.1fx%.1f) density=%.2f anchor=%s\n",
+                "applied=(%.1f,%.1f %.1fx%.1f) changed=%s density=%.2f anchor=%s\n",
                 getpid(), windowNumber,
                 oldFrame.size.width, oldFrame.size.height,
                 record.x, record.y, minimum.width, minimum.height,
-                newFrame.origin.x, newFrame.origin.y,
-                requested.width, requested.height, record.pressure,
+                appliedFrame.origin.x, appliedFrame.origin.y,
+                appliedFrame.size.width, appliedFrame.size.height,
+                geometryChanged ? "YES" : "NO", record.pressure,
                 anchorTopRight ? "top-right" :
                     (anchorTopLeft ? "top-left" : "preserve"));
             fflush(stderr);
@@ -4775,6 +4885,37 @@ static void MacWSNotifyDisplayCatalogChanged(uint8_t reason) {
     close(socketFD);
 }
 
+static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
+                                              CGRect appliedFrame) {
+    if (windowID == 0 || !window || appliedFrame.size.width <= 0.0 ||
+        appliedFrame.size.height <= 0.0) return;
+    CGFloat scale = ((MacWSMsgDouble)objc_msgSend)(
+        window, sel_registerName("backingScaleFactor"));
+    if (!isfinite(scale) || scale <= 0.0 || scale > 8.0) return;
+    uint64_t pixelWidth = (uint64_t)llround(appliedFrame.size.width * scale);
+    uint64_t pixelHeight = (uint64_t)llround(appliedFrame.size.height * scale);
+    if (pixelWidth == 0 || pixelHeight == 0 ||
+        pixelWidth > MACWS_STREAM_MAX_DIMENSION ||
+        pixelHeight > MACWS_STREAM_MAX_DIMENSION) return;
+    MacWSGeometryInvalidation record = {
+        .magic = MACWS_GEOMETRY_INVALIDATION_MAGIC,
+        .version = MACWS_GEOMETRY_INVALIDATION_VERSION,
+        .size = sizeof(record),
+        .windowID = windowID,
+        .pixelWidth = (uint32_t)pixelWidth,
+        .pixelHeight = (uint32_t)pixelHeight,
+    };
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0) return;
+    struct sockaddr_un target = {0};
+    target.sun_family = AF_UNIX;
+    strlcpy(target.sun_path, MACWS_STREAM_INVALIDATE_SOCKET_PATH,
+            sizeof(target.sun_path));
+    (void)sendto(socketFD, &record, sizeof(record), MSG_DONTWAIT,
+                 (const struct sockaddr *)&target, sizeof(target));
+    close(socketFD);
+}
+
 static void MacWSPublishWindowMetrics(void) {
     Class applicationClass = objc_getClass("NSApplication");
     if (!applicationClass || !MacWSWindowMetricsPath[0]) return;
@@ -4879,6 +5020,7 @@ static void MacWSInstallAppInputBridgeNow(void) {
             memory_order_acq_rel, memory_order_acquire)) return;
     MacWSInstallApplicationKeyWitness();
     MacWSInstallMenuEventLoopWitness();
+    MacWSInstallOrderedWindowRegistry();
     if (!MacWSOriginalApplicationSendEvent ||
         !MacWSOriginalHandleActivatedEvent)
         MacWSScheduleApplicationKeyWitnessInstall(0);
@@ -4984,4 +5126,6 @@ __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     MacWSLastWindowMetricsEntries = nil;
     [MacWSMenuCaches release];
     MacWSMenuCaches = nil;
+    [MacWSOrderedWindowRegistry release];
+    MacWSOrderedWindowRegistry = nil;
 }

@@ -190,26 +190,46 @@ if [ "$FAST" = "1" ]; then
     set +e
     ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 
-    sign_and_trust() {
+    trust_existing() {
         local p="$1"
-        sudo ldid -S"$ENT" -M "$p" 2>/dev/null || true
         for arch in arm64 arm64e x86_64; do
             local h=$(ldid -arch "$arch" -h "$p" 2>/dev/null | grep CDHash= | cut -c8-)
             [ -n "$h" ] && sudo /var/jb/usr/bin/jbctl trustcache add "$h" >/dev/null 2>&1
         done
         return 0
     }
-    sign_and_trust /var/jb/usr/macOS/lib/libmachook.dylib
-    [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ] && sign_and_trust /var/jb/usr/macOS/lib/libmachook_arm64.dylib
+    sign_and_trust() {
+        local p="$1"
+        # The first ldid pass may grow/rewrite __LINKEDIT.  On the device's
+        # ldid build its page hashes can still describe the pre-growth file,
+        # so a second pass is required after the layout has settled.  This
+        # must also be true for FAST builds; signing once here used to undo
+        # the valid two-pass signature produced immediately above.
+        sudo ldid -S"$ENT" -M "$p" || return 1
+        sudo ldid -S"$ENT" -M "$p" || return 1
+        trust_existing "$p"
+    }
+    sign_and_trust /var/jb/usr/macOS/lib/libmachook.dylib || {
+        echo "Error: failed to sign arm64e libmachook for FAST install" >&2
+        exit 1
+    }
+    if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
+        sign_and_trust /var/jb/usr/macOS/lib/libmachook_arm64.dylib || {
+            echo "Error: failed to sign arm64 libmachook for FAST install" >&2
+            exit 1
+        }
+    fi
 
     echo "==> FAST postinst: cp libmachook → /var/mnt/rootfs/usr/local/lib/"
     sudo rm -f /var/mnt/rootfs/usr/local/lib/libmachook.dylib
     sudo cp /var/jb/usr/macOS/lib/libmachook.dylib /var/mnt/rootfs/usr/local/lib/libmachook.dylib
-    sign_and_trust /var/mnt/rootfs/usr/local/lib/libmachook.dylib
+    # Preserve the already-verified bytes.  Re-signing the copy once would
+    # recreate the invalid-page signature and SIGKILL every injected process.
+    trust_existing /var/mnt/rootfs/usr/local/lib/libmachook.dylib
     if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
         sudo rm -f /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
         sudo cp /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
-        sign_and_trust /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
+        trust_existing /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
     fi
     ls -la /var/mnt/rootfs/usr/local/lib/libmachook*.dylib 2>/dev/null | head -3
     echo "==> FAST postinst done"

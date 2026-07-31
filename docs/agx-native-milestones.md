@@ -2160,3 +2160,60 @@ observed cold-deployment split where a newly installed protocol v2 package
 still ran protocol v1 from the chroot. Full logs, LLDB frames, resource
 measurements and thermal evidence are in
 [`terminal-tab-window-identity.md`](evidence/input-unification-20260731/terminal-tab-window-identity.md).
+
+## 2026-08-01: native video planes, cold signatures, and memory-reset containment
+
+Chromium's real VideoToolbox path requested an R8 texture for IOSurface plane
+0 and an RG8 texture for plane 1. Runtime `MACWS_TEX_TRACE` lines captured both
+calls and both successful texture objects. The type-0x82 macOS-to-iOS resource
+translation nevertheless wrote the iOS plane field at `args+0x38` as a
+constant zero, so both textures wrapped the Y plane. That runtime-confirmed
+protocol violation explains the otherwise successful green/magenta video.
+The translation now carries the actual IOSurface ID and plane from the Metal
+wrapper scope. Because AGX may issue the IOKit call on a worker thread, the ID,
+plane and compression-header tuple is protected by one recursive process-wide
+scope lock rather than an unsafe thread-local or racy global assumption.
+
+LLDB disassembly of the exact macOS 13.4 and iOS 16.3 IOSurface binaries also
+confirmed the adjacent per-plane field drift for bytes-per-element, element
+width/height, plane size and component count. Those getters now recover only
+the explicit value stored in that IOSurface's `CreationProperties`; no pixel
+format, dimension or validation result is fabricated. Before the plane fix,
+the Bilibili control already advanced from 0.49 to 4.68 seconds with 123 new
+frames, zero dropped/corrupted frames and no new AGX 0x102 errors, isolating
+the remaining fault to texture interpretation rather than network, codec or
+command completion.
+The bounded CDP samples and the exact two-plane texture log excerpt are in
+[`video-playback-20260801/`](evidence/video-playback-20260801/README.md). A
+post-fix correct-color screenshot is still required before declaring Bilibili
+or the first seconds of Apple's product animation fixed.
+
+The on-device FAST installer had a separate cold-start invariant violation:
+it produced valid twice-signed thin libraries, then signed them again once
+while trustcaching the copy, recreating the known ldid/lipo invalid-page
+signature. FAST now signs each final thin slice twice, trustcaches the settled
+bytes, and copies those bytes to the rootfs without another signing mutation.
+A full production build installed both slices, verified their final CDHashes
+in trustcache, verified macOS platform 13.0, and passed an arm64e chroot smoke
+test.
+
+A follow-up direct `make package` intentionally exercised the path outside
+`build_on_ios.sh` and exposed another cold-build hole: without
+`LIBMACHOOK_ON_DEVICE_BUILD=1`, the installed arm64e image trapped in
+`libobjc readClass` while mapping `MTLFakeDevice`. The actual crash report
+records `EXC_BREAKPOINT`, pointer-authentication trap DA and the
+`readClass → map_images → libSystem_initializer` stack. `libmachook/Makefile`
+now auto-detects the iPad's rootless Theos tree and enables chained fixups even
+when the caller forgets the variable. A package built without passing the
+variable contained `LC_DYLD_CHAINED_FIXUPS=1`; reinstalling that exact package
+then passed `packaged-chroot-smoke-ok`. Evidence is in
+[`cold-start-signing-20260801/`](evidence/cold-start-signing-20260801/README.md).
+
+During the media run iPadOS emitted a real `SystemMemoryReset` report at 56%
+user-reclaimable memory. WindowServer and MacWSHost were substantial residents,
+but two Reynard Helper processes were larger, so this is recorded as a
+whole-system event rather than blamed on one process. Production now keeps the
+300-second, critical-only thermal rule and separately samples XNU's available
+memory every 30 seconds, stopping the GUI at or below the evidence-derived 58%
+safety margin. Full report and policy rationale are in
+[`memory-reset-20260801/`](evidence/memory-reset-20260801/README.md).

@@ -21,6 +21,8 @@
 #define MACWS_STREAM_MAX_DAMAGE_RECTS 64u
 #define MACWS_WINDOW_METRICS_MAGIC 0x4d57474du /* "MWGM" */
 #define MACWS_WINDOW_METRICS_VERSION 2u
+#define MACWS_GEOMETRY_INVALIDATION_MAGIC 0x4d574749u /* "MWGI" */
+#define MACWS_GEOMETRY_INVALIDATION_VERSION 1u
 
 #define MACWS_STREAM_KEY_OP "op"
 #define MACWS_STREAM_KEY_EVENT "event"
@@ -151,6 +153,30 @@ typedef struct __attribute__((packed)) {
     uint32_t height;
 } MacWSStreamDamageRect;
 
+// AppInputBridge sends this datagram only after AppKit has accepted a real
+// NSWindow geometry change. Carry the committed target in pixels so displayd
+// does not race an asynchronously updated CGWindow catalog when deciding
+// whether an exact-window DisplayStream must be recreated.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint32_t windowID;
+    uint32_t pixelWidth;
+    uint32_t pixelHeight;
+} MacWSGeometryInvalidation;
+
+static inline bool MacWSGeometryInvalidationIsValid(
+    const MacWSGeometryInvalidation *record, size_t byteCount) {
+    return record && byteCount == sizeof(*record) &&
+        record->magic == MACWS_GEOMETRY_INVALIDATION_MAGIC &&
+        record->version == MACWS_GEOMETRY_INVALIDATION_VERSION &&
+        record->size == sizeof(*record) && record->windowID != 0 &&
+        record->pixelWidth != 0 && record->pixelHeight != 0 &&
+        record->pixelWidth <= MACWS_STREAM_MAX_DIMENSION &&
+        record->pixelHeight <= MACWS_STREAM_MAX_DIMENSION;
+}
+
 // AppInputBridge publishes this small per-process sidecar under
 // /private/tmp/macws_window_metrics.<pid>.bin. macwsdisplayd reads it only
 // while building the window catalog; it is never on the per-frame path.
@@ -250,6 +276,8 @@ static_assert(sizeof(MacWSStreamFrameDescriptor) == 112,
               "MacWS frame descriptor ABI");
 static_assert(sizeof(MacWSStreamDamageRect) == 16,
               "MacWS damage rect ABI");
+static_assert(sizeof(MacWSGeometryInvalidation) == 20,
+              "MacWS geometry invalidation ABI");
 static_assert(sizeof(MacWSWindowMetricsHeader) == 24,
               "MacWS window metrics header ABI");
 static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
@@ -261,6 +289,8 @@ _Static_assert(sizeof(MacWSStreamFrameDescriptor) == 112,
                "MacWS frame descriptor ABI");
 _Static_assert(sizeof(MacWSStreamDamageRect) == 16,
                "MacWS damage rect ABI");
+_Static_assert(sizeof(MacWSGeometryInvalidation) == 20,
+               "MacWS geometry invalidation ABI");
 _Static_assert(sizeof(MacWSWindowMetricsHeader) == 24,
                "MacWS window metrics header ABI");
 _Static_assert(sizeof(MacWSWindowMetricsEntry) == 20,

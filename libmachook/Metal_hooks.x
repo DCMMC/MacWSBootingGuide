@@ -3896,12 +3896,32 @@ static void macws_diag_pf550_texture_descriptor(id<MTLTexture> tex,
 // to inject args[+0x30] = IOSurfaceID for sel=0xa type=0x82 — the iOS
 // kernel AGX dispatcher requires this for IOSurface-backed textures.
 //
-// Race risk: WS may have concurrent texture creates from different
-// threads. Mitigate by capturing the value just before %orig and restoring
-// just after; concurrent creates would see each other's IDs, but in
-// practice WS serialises scanout texture creation.
+// The three values form one semantic tuple.  The underlying initializer may
+// issue its IOKit call from a worker thread, so thread-local storage cannot
+// carry the tuple.  Serialize the complete wrapper scope with a recursive
+// mutex instead: worker threads can read the atomics without taking the lock,
+// concurrent texture imports cannot overwrite the tuple, and the owned-
+// scanout fallback may re-enter this method on the same caller thread.
 static _Atomic uint32_t s_current_iosurface_id = 0;
+static _Atomic uint32_t s_current_iosurface_plane = 0;
 static _Atomic uint64_t s_current_iosurface_compression_header_span = 0;
+static pthread_mutex_t s_current_iosurface_scope_lock;
+static dispatch_once_t s_current_iosurface_scope_lock_once;
+
+static void macws_lock_current_iosurface_scope(void) {
+    dispatch_once(&s_current_iosurface_scope_lock_once, ^{
+        pthread_mutexattr_t attributes;
+        pthread_mutexattr_init(&attributes);
+        pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&s_current_iosurface_scope_lock, &attributes);
+        pthread_mutexattr_destroy(&attributes);
+    });
+    pthread_mutex_lock(&s_current_iosurface_scope_lock);
+}
+
+static void macws_unlock_current_iosurface_scope(void) {
+    pthread_mutex_unlock(&s_current_iosurface_scope_lock);
+}
 
 __attribute__((visibility("default")))
 uint32_t macws_get_current_iosurface_id(void) {
@@ -3911,6 +3931,16 @@ uint32_t macws_get_current_iosurface_id(void) {
 __attribute__((visibility("default")))
 void macws_set_current_iosurface_id(uint32_t id) {
     s_current_iosurface_id = id;
+}
+
+__attribute__((visibility("default")))
+uint32_t macws_get_current_iosurface_plane(void) {
+    return s_current_iosurface_plane;
+}
+
+__attribute__((visibility("default")))
+void macws_set_current_iosurface_plane(uint32_t plane) {
+    s_current_iosurface_plane = plane;
 }
 
 __attribute__((visibility("default")))
@@ -4984,6 +5014,7 @@ static void macws_sigabrt_trampoline(int sig) {
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc
                                         iosurface:(IOSurfaceRef)iosurface
                                             plane:(NSUInteger)plane {
+    macws_lock_current_iosurface_scope();
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.IN");
     }
@@ -5031,15 +5062,18 @@ static void macws_sigabrt_trampoline(int sig) {
             probelog++;
         }
     }
-    // Stash the IOSurfaceID into TLS so IOConnectCallMethod_new can inject it
+    // Stash one lock-protected process-wide IOSurface tuple so
+    // IOConnectCallMethod_new can inject it
     // into args[+0x30] for the sel=0xa type=0x82 path. Save/restore the
     // previous value to handle re-entry (shadow IOSurface fallback path).
     uint32_t prev_iosurface_id = macws_get_current_iosurface_id();
+    uint32_t prev_iosurface_plane = macws_get_current_iosurface_plane();
     uint64_t prev_compression_header_span =
         macws_get_current_iosurface_compression_header_span();
     uint64_t compression_header_span =
         macws_iosurface_compression_header_span(iosurface, plane);
     macws_set_current_iosurface_id(iosurface ? IOSurfaceGetID(iosurface) : 0);
+    macws_set_current_iosurface_plane((uint32_t)plane);
     macws_set_current_iosurface_compression_header_span(
         compression_header_span);
     static int tls_log = 0;
@@ -5077,10 +5111,13 @@ static void macws_sigabrt_trampoline(int sig) {
             auditSurface = owned;
             MTLPixelFormat originalFormat = desc.pixelFormat;
             uint32_t originalCurrentID = macws_get_current_iosurface_id();
+            uint32_t originalCurrentPlane =
+                macws_get_current_iosurface_plane();
             uint64_t originalCompressionSpan =
                 macws_get_current_iosurface_compression_header_span();
             desc.pixelFormat = MTLPixelFormatBGRA8Unorm;
             macws_set_current_iosurface_id(IOSurfaceGetID(owned));
+            macws_set_current_iosurface_plane(0);
             macws_set_current_iosurface_compression_header_span(0);
             CFIndex retainBeforeTexture = CFGetRetainCount(owned);
             result = [self hooked_newTextureWithDescriptor:desc
@@ -5092,6 +5129,7 @@ static void macws_sigabrt_trampoline(int sig) {
                     @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
             macws_set_current_iosurface_id(originalCurrentID);
+            macws_set_current_iosurface_plane(originalCurrentPlane);
             macws_set_current_iosurface_compression_header_span(
                 originalCompressionSpan);
             desc.pixelFormat = originalFormat;
@@ -5364,8 +5402,10 @@ static void macws_sigabrt_trampoline(int sig) {
         }
     }
     macws_set_current_iosurface_id(prev_iosurface_id);
+    macws_set_current_iosurface_plane(prev_iosurface_plane);
     macws_set_current_iosurface_compression_header_span(
         prev_compression_header_span);
+    macws_unlock_current_iosurface_scope();
     return result;
 }
 

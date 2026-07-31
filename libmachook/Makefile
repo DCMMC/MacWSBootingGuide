@@ -28,6 +28,17 @@ libmachook_CFLAGS = -DFORCE_M1_DRIVER=1 \
   -I$(CURDIR)/..
 libmachook_LDFLAGS = -undefined dynamic_lookup
 
+# A direct `make package` on the iPad must be just as safe as the documented
+# build_on_ios.sh entry point. Detect the target's rootless Theos installation
+# when the caller omitted the variable, so the arm64e slice cannot silently be
+# emitted with classic fixups and then trap in libSystem_initializer. The
+# macOS cross-build has no /var/jb tree and retains Xcode ld64's native path.
+ifeq ($(origin LIBMACHOOK_ON_DEVICE_BUILD),undefined)
+ifneq ($(wildcard /var/jb/var/mobile/theos/makefiles/common.mk),)
+LIBMACHOOK_ON_DEVICE_BUILD := 1
+endif
+endif
+
 # On-device builds (misc/build_on_ios.sh passes LIBMACHOOK_ON_DEVICE_BUILD=1)
 # use the on-device lld.  For the arm64e slice, lld emits the __interpose tuples
 # (and ObjC class_t->data) as arm64e *authenticated* pointers but under the

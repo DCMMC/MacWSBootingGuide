@@ -1036,6 +1036,15 @@ extern size_t IOSurfaceGetWidthInCompressedTilesOfPlane(
     IOSurfaceRef surface, size_t plane);
 extern size_t IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
                                              size_t plane);
+extern size_t IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef surface,
+                                                 size_t plane);
+extern size_t IOSurfaceGetElementWidthOfPlane(IOSurfaceRef surface,
+                                              size_t plane);
+extern size_t IOSurfaceGetElementHeightOfPlane(IOSurfaceRef surface,
+                                               size_t plane);
+extern size_t IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane);
+extern size_t IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
+                                                     size_t plane);
 extern size_t IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
                                                   size_t plane);
 extern size_t IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane);
@@ -1054,6 +1063,15 @@ size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
     IOSurfaceRef surface, size_t plane);
 size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
                                             size_t plane);
+size_t macws_IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef surface,
+                                                size_t plane);
+size_t macws_IOSurfaceGetElementWidthOfPlane(IOSurfaceRef surface,
+                                             size_t plane);
+size_t macws_IOSurfaceGetElementHeightOfPlane(IOSurfaceRef surface,
+                                              size_t plane);
+size_t macws_IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane);
+size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
+                                                    size_t plane);
 size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
                                                  size_t plane);
 size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane);
@@ -1438,6 +1456,34 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                             "IOSurfaceGetBytesPerRowOfPlane")) {
                     resolved =
                         (void *)macws_IOSurfaceGetBytesPerRowOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetBytesPerElementOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetBytesPerElementOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetElementWidthOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetElementWidthOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetElementHeightOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetElementHeightOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup, "IOSurfaceGetSizeOfPlane")) {
+                    resolved = (void *)macws_IOSurfaceGetSizeOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetNumberOfComponentsOfPlane")) {
+                    resolved = (void *)
+                        macws_IOSurfaceGetNumberOfComponentsOfPlane;
                     force_override = 1;
                 } else if (strstr(image_name, "AGXMetal13_3") &&
                            !strcmp(lookup,
@@ -8687,6 +8733,57 @@ static bool macws_iosurface_plane_property_value(IOSurfaceRef surface,
     return found;
 }
 
+static bool macws_iosurface_plane_component_count(IOSurfaceRef surface,
+                                                   size_t plane,
+                                                   uint64_t *valueOut) {
+    if (!surface || !valueOut) return false;
+    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    if (!copied) return false;
+    uint64_t value = 0;
+    bool found = false;
+    @try {
+        NSDictionary *root = (__bridge NSDictionary *)copied;
+        id creationValue = [root objectForKey:@"CreationProperties"];
+        NSDictionary *creation =
+            [creationValue isKindOfClass:[NSDictionary class]]
+                ? (NSDictionary *)creationValue : root;
+        id planeInfoValue = [creation objectForKey:@"IOSurfacePlaneInfo"];
+        if ([planeInfoValue isKindOfClass:[NSArray class]] &&
+            plane < [(NSArray *)planeInfoValue count]) {
+            id planeValue = [(NSArray *)planeInfoValue objectAtIndex:plane];
+            if ([planeValue isKindOfClass:[NSDictionary class]]) {
+                id number = [(NSDictionary *)planeValue
+                    objectForKey:@"NumberOfComponents"] ?:
+                    [(NSDictionary *)planeValue
+                    objectForKey:@"IOSurfacePlaneNumberOfComponents"];
+                if ([number respondsToSelector:@selector(unsignedLongLongValue)]) {
+                    value = [number unsignedLongLongValue];
+                    found = true;
+                } else {
+                    id components = [(NSDictionary *)planeValue
+                        objectForKey:@"ComponentInfo"] ?:
+                        [(NSDictionary *)planeValue
+                        objectForKey:@"IOSurfacePlaneComponentInfo"];
+                    if ([components isKindOfClass:[NSArray class]] &&
+                        [(NSArray *)components count] != 0) {
+                        value = [(NSArray *)components count];
+                        found = true;
+                    }
+                }
+            }
+        }
+    } @catch (NSException *exception) {
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                "#### IOSURFACE-COMPAT component parse exception: %s\n",
+                [[exception description] UTF8String] ?: "?");
+        }
+    }
+    CFRelease(copied);
+    if (found) *valueOut = value;
+    return found;
+}
+
 static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
                                                 size_t plane,
                                                 NSString *shortKey,
@@ -8828,6 +8925,87 @@ size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
     return (size_t)property;
 }
 
+// The adjacent non-compression plane fields have the same ABI drift. Exact
+// shipped-binary disassembly (macOS 13.4 / iOS 16.3) shows:
+//
+//   field                 macOS offset   iOS offset
+//   BytesPerElement       +0xe8          +0xe4
+//   ElementWidth          +0xea          +0xe6
+//   ElementHeight         +0xeb          +0xe7
+//   PlaneSize             +0xe4          +0xe0
+//   NumberOfComponents    +0xec          +0xe8
+//
+// This matters for VideoToolbox's two-plane NV12 IOSurfaces: reading the next
+// field as BPE/element geometry creates a texture with a valid allocation but
+// the wrong texel layout. Recover only values explicitly recorded in that
+// IOSurface's own CreationProperties.
+static size_t macws_iosurface_explicit_plane_size(
+        IOSurfaceRef surface, size_t plane, size_t original,
+        NSString *shortKey, NSString *fullKey, const char *field) {
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, shortKey, fullKey);
+    if (property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    static _Atomic unsigned int recoveryCount = 0;
+    unsigned int count = macws_runtime_diagnostics_enabled()
+        ? atomic_fetch_add(&recoveryCount, 1) + 1 : 0;
+    if (count && (count <= 24 || (count % 500) == 0)) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT %s plane=%zu original=%zu "
+            "property=%llu surfaceID=%u recovery=%u\n",
+            field, plane, original, (unsigned long long)property,
+            IOSurfaceGetID(surface), count);
+    }
+    return (size_t)property;
+}
+
+size_t macws_IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef surface,
+                                                size_t plane) {
+    size_t original = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
+    return macws_iosurface_explicit_plane_size(surface, plane, original,
+        @"BytesPerElement", @"IOSurfacePlaneBytesPerElement",
+        "bytesPerElement");
+}
+
+size_t macws_IOSurfaceGetElementWidthOfPlane(IOSurfaceRef surface,
+                                             size_t plane) {
+    size_t original = IOSurfaceGetElementWidthOfPlane(surface, plane);
+    return macws_iosurface_explicit_plane_size(surface, plane, original,
+        @"ElementWidth", @"IOSurfacePlaneElementWidth", "elementWidth");
+}
+
+size_t macws_IOSurfaceGetElementHeightOfPlane(IOSurfaceRef surface,
+                                              size_t plane) {
+    size_t original = IOSurfaceGetElementHeightOfPlane(surface, plane);
+    return macws_iosurface_explicit_plane_size(surface, plane, original,
+        @"ElementHeight", @"IOSurfacePlaneElementHeight", "elementHeight");
+}
+
+size_t macws_IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane) {
+    size_t original = IOSurfaceGetSizeOfPlane(surface, plane);
+    return macws_iosurface_explicit_plane_size(surface, plane, original,
+        @"Size", @"IOSurfacePlaneSize", "size");
+}
+
+size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
+                                                    size_t plane) {
+    size_t original = IOSurfaceGetNumberOfComponentsOfPlane(surface, plane);
+    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    uint64_t property = 0;
+    if (!macws_iosurface_plane_component_count(surface, plane, &property) ||
+        property == 0 || property > SIZE_MAX || property == original)
+        return original;
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### IOSURFACE-COMPAT componentCount plane=%zu original=%zu "
+            "property=%llu surfaceID=%u\n",
+            plane, original, (unsigned long long)property,
+            IOSurfaceGetID(surface));
+    }
+    return (size_t)property;
+}
+
 size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
                                                  size_t plane) {
     size_t original = IOSurfaceGetBytesPerTileDataOfPlane(surface, plane);
@@ -8925,6 +9103,16 @@ DYLD_INTERPOSE(macws_IOSurfaceGetWidthInCompressedTilesOfPlane,
                 IOSurfaceGetWidthInCompressedTilesOfPlane);
 DYLD_INTERPOSE(macws_IOSurfaceGetBytesPerRowOfPlane,
                 IOSurfaceGetBytesPerRowOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetBytesPerElementOfPlane,
+                IOSurfaceGetBytesPerElementOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetElementWidthOfPlane,
+                IOSurfaceGetElementWidthOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetElementHeightOfPlane,
+                IOSurfaceGetElementHeightOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetSizeOfPlane,
+                IOSurfaceGetSizeOfPlane);
+DYLD_INTERPOSE(macws_IOSurfaceGetNumberOfComponentsOfPlane,
+                IOSurfaceGetNumberOfComponentsOfPlane);
 DYLD_INTERPOSE(macws_IOSurfaceGetBytesPerTileDataOfPlane,
                 IOSurfaceGetBytesPerTileDataOfPlane);
 DYLD_INTERPOSE(macws_IOSurfaceGetOffsetOfPlane,
@@ -9440,6 +9628,7 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
 // that offset to call find_iosurface_for_id (without it, returns
 // kIOReturnNoMemory).
 extern uint32_t macws_get_current_iosurface_id(void);
+extern uint32_t macws_get_current_iosurface_plane(void);
 extern uint64_t macws_get_current_iosurface_compression_header_span(void);
 
 // AGX ID-translation shim. The iOS kernel AUTO-ASSIGNS resource GIDs (IOGPUObject
@@ -11848,6 +12037,148 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
 // wrapper contract; a direct one-segment list remains owned by the narrower
 // linear translator below.
 #define MACWS_AGX_SEGMENT_LIST_MAX_RECORDS 256u
+
+static BOOL macws_agx_fragment_entry_length(
+    const unsigned char *entry, size_t available,
+    size_t *length_out) {
+    if (!entry || !length_out || available < 0x20)
+        return NO;
+    uint32_t resource_count = *(uint32_t *)(entry + 0x18);
+    uint32_t group_count = *(uint32_t *)(entry + 0x1c);
+    if (group_count > 64 ||
+        (size_t)group_count > (SIZE_MAX - 0x20) / 0x40)
+        return NO;
+    size_t length = 0x20 + (size_t)group_count * 0x40;
+    if (length > available)
+        return NO;
+
+    uint32_t decoded_resources = 0;
+    for (uint32_t group = 0; group < group_count; group++) {
+        uint16_t valid = *(uint16_t *)(
+            entry + 0x20 + (size_t)group * 0x40 + 0x3e);
+        if (valid > 6 || decoded_resources > UINT32_MAX - valid)
+            return NO;
+        decoded_resources += valid;
+    }
+    if (decoded_resources != resource_count)
+        return NO;
+    *length_out = length;
+    return YES;
+}
+
+// Parse, but do not flatten, the segmented signal-event contract.  A paired
+// selector-0x1a capture from this exact iPad/iOS build now proves that native
+// IOGPU uses the same framing for both _MTLSharedEvent (type 3) and the legacy
+// IOGPUMTLEvent (type 5): one or more descriptor chunks are separated by
+// 0x18-byte signal commands and matching 0x18-byte range records.  The legacy
+// draw -> signal -> blit -> signal control completed status=4/error=nil with
+// KCMD 0xa50 and list 0x250 (SHA-256 8524e33e... / 83899e58...).  Signal
+// removal therefore destroys a real synchronization invariant.  Collect the
+// vendor and signal range locations so the ordinary ABI translator can shrink
+// only vendor records and update every downstream range in place.
+static BOOL macws_collect_agx_fragmented_list_ranges(
+    const unsigned char *commands, size_t total,
+    const unsigned char *segment_list, size_t list_length,
+    uint32_t *vendor_pair_offsets, uint32_t *vendor_count_out,
+    uint32_t *signal_pair_offsets, uint32_t *signal_count_out) {
+    if (!commands || !segment_list || !vendor_pair_offsets ||
+        !vendor_count_out || !signal_pair_offsets || !signal_count_out ||
+        total < 0x100 || list_length < 0x60)
+        return NO;
+
+    uint64_t list_token = *(uint64_t *)(segment_list + 0x00);
+    uint32_t vendor_count = 0;
+    uint32_t signal_count = 0;
+    uint32_t fragment_count = 0;
+    uint32_t command_cursor = 0;
+    size_t list_cursor = 0;
+
+    while (list_cursor + 0x10 <= list_length) {
+        const unsigned char *chunk = segment_list + list_cursor;
+        if (*(uint64_t *)(chunk + 0x00) != list_token)
+            return NO;
+        uint32_t count = *(uint32_t *)(chunk + 0x08);
+        uint32_t encoded_length = *(uint32_t *)(chunk + 0x0c);
+        BOOL terminal_direct = (encoded_length & 0x80000000U) != 0;
+        uint32_t chunk_length = encoded_length & 0x7fffffffU;
+        if (count < 1 ||
+            count > MACWS_AGX_SEGMENT_LIST_MAX_RECORDS - vendor_count ||
+            chunk_length < 0x30 ||
+            (size_t)chunk_length > list_length - list_cursor)
+            return NO;
+
+        size_t entry_cursor = 0x10;
+        for (uint32_t index = 0; index < count; index++) {
+            size_t entry_length = 0;
+            if (!macws_agx_fragment_entry_length(
+                    chunk + entry_cursor, chunk_length - entry_cursor,
+                    &entry_length))
+                return NO;
+            const unsigned char *entry = chunk + entry_cursor;
+            uint32_t start = *(uint32_t *)(entry + 0x08);
+            uint32_t end = *(uint32_t *)(entry + 0x0c);
+            if (start != command_cursor || end <= start || end > total ||
+                end - start < 0x38 ||
+                (*(uint32_t *)(commands + start) != 0x10000 &&
+                 *(uint32_t *)(commands + start) != 0x10001) ||
+                *(uint32_t *)(commands + start + 0x04) != end - start)
+                return NO;
+            vendor_pair_offsets[vendor_count++] =
+                (uint32_t)(list_cursor + entry_cursor + 0x08);
+            command_cursor = end;
+            entry_cursor += entry_length;
+        }
+        if (entry_cursor != chunk_length)
+            return NO;
+        fragment_count++;
+        list_cursor += chunk_length;
+
+        if (terminal_direct) {
+            if (list_cursor != list_length)
+                return NO;
+            break;
+        }
+        if (list_cursor + 0x18 > list_length ||
+            signal_count >= MACWS_AGX_SEGMENT_LIST_MAX_RECORDS)
+            return NO;
+
+        const unsigned char *signal_list = segment_list + list_cursor;
+        uint32_t signal_flags = *(uint32_t *)(signal_list + 0x0c);
+        uint32_t signal_start = *(uint32_t *)(signal_list + 0x10);
+        uint32_t signal_end = *(uint32_t *)(signal_list + 0x14);
+        if (*(uint64_t *)(signal_list + 0x00) != list_token ||
+            *(uint32_t *)(signal_list + 0x08) != 1 ||
+            (signal_flags != 0x40000001U &&
+             signal_flags != 0xc0000001U) ||
+            signal_start != command_cursor ||
+            signal_end != signal_start + 0x18 || signal_end > total)
+            return NO;
+
+        const unsigned char *signal = commands + signal_start;
+        uint32_t signal_type = *(uint32_t *)(signal + 0x00);
+        uint32_t event_id = *(uint32_t *)(signal + 0x08);
+        if ((signal_type != 3 && signal_type != 5) ||
+            *(uint32_t *)(signal + 0x04) != 0x18 || event_id == 0 ||
+            // iOS _MTLSharedEvent explicitly zeroes this word; legacy
+            // IOGPUMTLEvent does not write it, so type 5 padding is opaque.
+            (signal_type == 3 && *(uint32_t *)(signal + 0x0c) != 0))
+            return NO;
+        signal_pair_offsets[signal_count++] =
+            (uint32_t)(list_cursor + 0x10);
+        command_cursor = signal_end;
+        list_cursor += 0x18;
+        if (list_cursor == list_length)
+            break;
+    }
+
+    if (fragment_count < 2 || signal_count < 1 || vendor_count < 2 ||
+        command_cursor != total || list_cursor != list_length)
+        return NO;
+    *vendor_count_out = vendor_count;
+    *signal_count_out = signal_count;
+    return YES;
+}
+
 static unsigned macws_translate_agx_segment_list_records(
     unsigned sequence, unsigned char *commands, size_t *total_io,
     unsigned char *segment_list, size_t *segment_length_io) {
@@ -11857,7 +12188,13 @@ static unsigned macws_translate_agx_segment_list_records(
         return 0;
 
     size_t total = *total_io;
+    uint32_t pair_offsets[MACWS_AGX_SEGMENT_LIST_MAX_RECORDS] = {0};
+    uint32_t signal_pair_offsets[MACWS_AGX_SEGMENT_LIST_MAX_RECORDS] = {0};
+    uint32_t signal_pair_count = 0;
     uint32_t count = *(uint32_t *)(segment_list + 0x08);
+    BOOL fragmented_list = macws_collect_agx_fragmented_list_ranges(
+        commands, total, segment_list, segment_length,
+        pair_offsets, &count, signal_pair_offsets, &signal_pair_count);
     uint32_t encoded_length = *(uint32_t *)(segment_list + 0x0c);
     BOOL direct_list =
         encoded_length == (0x80000000U | (uint32_t)segment_length);
@@ -11880,12 +12217,18 @@ static unsigned macws_translate_agx_segment_list_records(
     // stack array but size it for the observed Chromium workload plus ample
     // headroom; all existing record, total-span and unique-range validation
     // still runs before any byte is changed.
-    if (count < 1 || count > MACWS_AGX_SEGMENT_LIST_MAX_RECORDS ||
-        (direct_list && count < 2) ||
-        (!direct_list && !trailing_wrapper_list))
+    if (!fragmented_list &&
+        (count < 1 || count > MACWS_AGX_SEGMENT_LIST_MAX_RECORDS ||
+         (direct_list && count < 2) ||
+         (!direct_list && !trailing_wrapper_list)))
         return 0;
 
-    uint32_t pair_offsets[MACWS_AGX_SEGMENT_LIST_MAX_RECORDS] = {0};
+    uint32_t wrapper_pair_offset = UINT32_MAX;
+    unsigned wrapper_count = 0;
+    uint32_t wrapper_type = 0;
+    uint32_t wrapper_opcode = 0;
+    uint32_t list_generation = 0;
+    if (!fragmented_list) {
     uint32_t cursor = 0;
     for (uint32_t i = 0; i < count; i++) {
         if ((size_t)cursor + 0x38 > total)
@@ -11910,11 +12253,6 @@ static unsigned macws_translate_agx_segment_list_records(
             return 0;
         cursor = end;
     }
-    uint32_t wrapper_pair_offset = UINT32_MAX;
-    unsigned wrapper_count = 0;
-    uint32_t wrapper_type = 0;
-    uint32_t wrapper_opcode = 0;
-    uint32_t list_generation = 0;
     if (direct_list) {
         if (cursor != total)
             return 0;
@@ -11962,12 +12300,19 @@ static unsigned macws_translate_agx_segment_list_records(
         // previously clean runtime shape here until the additional
         // relationship is identified; accepting arbitrary padding is
         // explicitly runtime-disproved as a production fix.
-        uint32_t type5_ordinal =
+        // RE-confirmed via the actual macOS 13.4 IOGPU implementation of
+        // -[IOGPUMTLEvent _encodeIOGPUKernelSignalEventCommandArgs:value:].
+        // The dword at +0x08 is the event identifier, +0x10 is the 64-bit
+        // signal value, and +0x0c is never written by the producer.  It is
+        // therefore padding, not an opcode/ordinal or a protocol field.  Two
+        // independently captured failing submissions contain 0x15 there
+        // while retaining every structural list/range invariant.  Do not
+        // reject a valid signal record based on stale contents in padding.
+        uint32_t type5_event_id =
             *(uint32_t *)(commands + cursor + 0x08);
         if (wrapper_type == 5 && wrapper_count == 1 &&
             *(uint32_t *)(commands + cursor + 0x04) == 0x18 &&
-            type5_ordinal >= 1 && type5_ordinal <= 3 &&
-            *(uint32_t *)(commands + cursor + 0x0c) == 0 &&
+            type5_event_id != 0 &&
             *(uint32_t *)(commands + cursor + 0x10) == 1 &&
             *(uint32_t *)(commands + cursor + 0x14) == 0) {
             wrapper_commands_ok = YES;
@@ -11995,6 +12340,7 @@ static unsigned macws_translate_agx_segment_list_records(
         if (!wrapper_commands_ok || !wrapper_list_ok)
             return 0;
         wrapper_pair_offset = encoded_length + 0x10;
+    }
     }
 
     int log_segments = macws_runtime_diagnostics_enabled() &&
@@ -12142,6 +12488,20 @@ static unsigned macws_translate_agx_segment_list_records(
                 segment_list + pair_offsets[later];
             *(uint32_t *)(later_range + 0x00) -= shrink;
             *(uint32_t *)(later_range + 0x04) -= shrink;
+        }
+        // Fragmented native IOGPU lists retain signal events between vendor
+        // records.  A shrink in an earlier vendor record shifts the matching
+        // signal and every later signal in the shared KCMD storage.  Earlier
+        // signal ranges have already completed before this record and must
+        // remain unchanged.
+        for (uint32_t signal_index = 0;
+             signal_index < signal_pair_count; signal_index++) {
+            unsigned char *signal_range =
+                segment_list + signal_pair_offsets[signal_index];
+            if (*(uint32_t *)(signal_range + 0x00) >= end) {
+                *(uint32_t *)(signal_range + 0x00) -= shrink;
+                *(uint32_t *)(signal_range + 0x04) -= shrink;
+            }
         }
         if (wrapper_pair_offset != UINT32_MAX) {
             unsigned char *wrapper_range =
@@ -13451,16 +13811,20 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         //   stp w0, w21, [x24, #0x30]      ; +0x30 = IOSurfaceGetID(io)
         // before sel=0xa fires. macOS WS path leaves +0x30 = 0.
         //
-        // Fix: read the IOSurfaceID and compression-header span stashed by
-        // Metal_hooks.x's
-        // swizzled newTextureWithDescriptor:iosurface:plane: (we're called
+        // Fix: read the IOSurfaceID, plane and compression-header span from
+        // Metal_hooks.x's lock-protected wrapper scope. The scope is process-
+        // wide because the initializer may issue this call on a worker thread.
+        // The swizzled newTextureWithDescriptor:iosurface:plane: (we're called
         // synchronously from inside that swizzle's %orig), and inject it
         // into args[+0x30]. Keep +0x40 zero and move the macOS texture-layout
         // word from +0x58 to iOS +0x50.
         // macOS chroot stores the IOSurfaceID at args+0x38 (where iOS puts
         // the plane index); iOS userland stores IOSurfaceID at args+0x30
-        // (which macOS leaves zero). Swap them: write +0x38's value into
-        // +0x30, and put the actual plane (always 0 in our path) at +0x38.
+        // (which macOS leaves zero). The swizzled Metal entry has both exact
+        // semantic values, so write its IOSurfaceID at +0x30 and its plane at
+        // +0x38. Chromium's VideoToolbox path uses plane 1 for the RG8 UV
+        // texture; the former hard-coded zero silently wrapped plane 0 twice,
+        // producing green/magenta video despite both texture creates succeeding.
         // Project-LLDB RE of the successful native pf550 path subsequently
         // located the exact iOS producer, `-[AGXG13GFamilyDevice
         // initNewTextureData:]` at runtime 0x2260cf0e0:
@@ -13479,6 +13843,8 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t old_58 = *(const uint64_t *)(src + 0x58);
             uint32_t old_30 = *(const uint32_t *)(src + 0x30);
             uint32_t old_38 = *(const uint32_t *)(src + 0x38);
+            uint32_t current_surface_id = macws_get_current_iosurface_id();
+            uint32_t current_plane = macws_get_current_iosurface_plane();
             uint64_t compression_header_span =
                 macws_get_current_iosurface_compression_header_span();
             *(uint64_t *)(shadowbuf + 0x40) = 0;
@@ -13491,8 +13857,13 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
             *(uint64_t *)(shadowbuf + 0x50) = translated_50;
             *(uint64_t *)(shadowbuf + 0x58) = compression_header_span;
-            // If +0x30 is empty and +0x38 looks like an IOSurfaceID, swap.
-            if (old_30 == 0 && old_38 != 0) {
+            if (current_surface_id != 0) {
+                *(uint32_t *)(shadowbuf + 0x30) = current_surface_id;
+                *(uint32_t *)(shadowbuf + 0x38) = current_plane;
+            } else if (old_30 == 0 && old_38 != 0) {
+                // Legacy callers outside the Metal swizzle still carry the
+                // macOS surface ID at +0x38. Preserve their observed plane-0
+                // behavior when no semantic wrapper scope exists.
                 *(uint32_t *)(shadowbuf + 0x30) = old_38;
                 *(uint32_t *)(shadowbuf + 0x38) = 0;
             }
@@ -13500,11 +13871,16 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             static _Atomic unsigned int t82_patch_count = 0;
             unsigned int t82_n = macws_runtime_diagnostics_enabled()
                 ? atomic_fetch_add(&t82_patch_count, 1) + 1 : 0;
-            if (t82_n && (t82_n <= 16 || (t82_n % 500) == 0)) {
+            static _Atomic unsigned int t82_plane_log_count = 0;
+            unsigned int plane_log = t82_n && current_plane != 0
+                ? atomic_fetch_add(&t82_plane_log_count, 1) + 1 : 0;
+            if (t82_n && (t82_n <= 16 || (t82_n % 500) == 0 ||
+                          (plane_log != 0 && plane_log <= 8))) {
                 fprintf(stderr,
-                    "#### AGXIOC type=0x82 patch #%u: f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
+                    "#### AGXIOC type=0x82 patch #%u: scopeID=%#x scopePlane=%u "
+                    "f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
                     "+0x40 %#llx→0 +0x50 %#llx→%#llx +0x58 %#llx→%#llx\n",
-                    t82_n, f14,
+                    t82_n, current_surface_id, current_plane, f14,
                     old_30, *(const uint32_t *)(shadowbuf + 0x30),
                     old_38, *(const uint32_t *)(shadowbuf + 0x38),
                     (unsigned long long)old_40,

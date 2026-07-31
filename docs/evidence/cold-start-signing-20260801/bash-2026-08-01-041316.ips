@@ -1,0 +1,107 @@
+{"app_name":"bash","timestamp":"2026-08-01 04:13:16.00 +0800","app_version":"","slice_uuid":"67b4e39c-f463-3e91-88d4-e5342265deaa","build_version":"","platform":1,"share_with_app_devs":0,"is_first_party":1,"bug_type":"309","os_version":"iPhone OS 16.3.1 (20D67)","roots_installed":0,"incident_id":"2CF20FC9-CD02-4876-9876-D0683D22BB68","name":"bash"}
+{
+  "uptime" : 88000,
+  "procRole" : "Unspecified",
+  "version" : 2,
+  "userID" : 0,
+  "deployVersion" : 210,
+  "modelCode" : "iPad13,6",
+  "coalitionID" : 6869,
+  "osVersion" : {
+    "isEmbedded" : true,
+    "train" : "iPhone OS 16.3.1",
+    "releaseType" : "User",
+    "build" : "20D67"
+  },
+  "captureTime" : "2026-08-01 04:13:16.1164 +0800",
+  "incident" : "2CF20FC9-CD02-4876-9876-D0683D22BB68",
+  "pid" : 27486,
+  "cpuType" : "ARM-64",
+  "roots_installed" : 0,
+  "bug_type" : "309",
+  "procLaunch" : "2026-08-01 04:13:15.4074 +0800",
+  "procStartAbsTime" : 2133294767440,
+  "procExitAbsTime" : 2133311775388,
+  "procName" : "bash",
+  "procPath" : "\/bin\/bash",
+  "parentProc" : "Exited process",
+  "parentPid" : 27485,
+  "coalitionName" : "com.openssh.sshd.97CE1436-5936-44AA-95E7-EBC5147AB38B",
+  "crashReporterKey" : "1500aba40c9dcd15b743fc39efe555c209d877de",
+  "wasUnlockedSinceBoot" : 1,
+  "isLocked" : 1,
+  "basebandVersion" : "",
+  "exception" : {"codes":"0x0000000000000001, 0x000000018b3cc360","rawCodes":[1,6630982496],"type":"EXC_BREAKPOINT","signal":"SIGTRAP"},
+  "termination" : {"flags":0,"code":5,"namespace":"SIGNAL","indicator":"Trace\/BPT trap: 5","byProc":"exc handler","byPid":27486},
+  "os_fault" : {"process":"bash"},
+  "faultingThread" : 0,
+  "threads" : [{"triggered":true,"id":2179146,"threadState":{"x":[{"value":4342548520,"symbolLocation":0,"symbol":"OBJC_CLASS_$_MTLFakeDevice"},{"value":0},{"value":0},{"value":18446744073709551612},{"value":0},{"value":0},{"value":2},{"value":576},{"value":4342546592,"symbolLocation":24,"symbol":"_OBJC_CLASS_RO_$_MTLFakeDevice"},{"value":8118056264,"symbolLocation":0,"symbol":"objc::disableEnforceClassRXPtrAuth"},{"value":6128164696},{"value":4340727808},{"value":4340711424,"symbolLocation":0,"symbol":"_METACLASS_DATA__TtC7ellekit3ret"},{"value":108},{"value":3283705265079735255},{"value":122498715772259},{"value":9007207421926872,"symbolLocation":9007199254740992,"symbol":"OBJC_CLASS_$__MTLDevice"},{"value":8167185880,"symbolLocation":0,"symbol":"OBJC_CLASS_$__MTLDevice"},{"value":0},{"value":4342548520,"symbolLocation":0,"symbol":"OBJC_CLASS_$_MTLFakeDevice"},{"value":0},{"value":4342528127},{"value":0},{"value":4342548552,"symbolLocation":32,"symbol":"OBJC_CLASS_$_MTLFakeDevice"},{"value":6},{"value":109},{"value":0},{"value":4342548528,"symbolLocation":8,"symbol":"OBJC_CLASS_$_MTLFakeDevice"},{"value":6631157181}],"flavor":"ARM_THREAD_STATE64","lr":{"value":6630982444},"cpsr":{"value":536875008},"fp":{"value":6128164736},"sp":{"value":6128164640},"esr":{"value":4060136562,"description":"(Breakpoint) pointer authentication trap DA"},"pc":{"value":6630982496,"matchesCrashFrame":1},"far":{"value":8029110644}},"queue":"com.apple.main-thread","frames":[{"imageOffset":99168,"symbol":"readClass(objc_class*, bool, bool)","symbolLocation":112,"imageIndex":0},{"imageOffset":99116,"symbol":"readClass(objc_class*, bool, bool)","symbolLocation":60,"imageIndex":0},{"imageOffset":14512,"symbol":"map_images_nolock","symbolLocation":4000,"imageIndex":0},{"imageOffset":10380,"symbol":"map_images","symbolLocation":100,"imageIndex":0},{"imageOffset":94236,"symbol":"invocation function for block in dyld4::RuntimeState::setObjCNotifiers(void (*)(unsigned int, char const* const*, mach_header const* const*), void (*)(char const*, mach_header const*), void (*)(char const*, mach_header const*), void (*)(mach_header const*, void*, mach_header const*, void const*), void (*)(unsigned int, _dyld_objc_notify_mapped_info const*))::$_8::operator()() const","symbolLocation":604,"imageIndex":1},{"imageOffset":56460,"symbol":"dyld4::RuntimeState::withLoadersReadLock(void () block_pointer)","symbolLocation":92,"imageIndex":1},{"imageOffset":79380,"symbol":"dyld4::RuntimeState::setObjCNotifiers(void (*)(unsigned int, char const* const*, mach_header const* const*), void (*)(char const*, mach_header const*), void (*)(char const*, mach_header const*), void (*)(mach_header const*, void*, mach_header const*, void const*), void (*)(unsigned int, _dyld_objc_notify_mapped_info const*))","symbolLocation":424,"imageIndex":1},{"imageOffset":243656,"symbol":"dyld4::APIs::_dyld_objc_register_callbacks(_dyld_objc_callbacks const*)","symbolLocation":144,"imageIndex":1},{"imageOffset":9720,"symbol":"_objc_init","symbolLocation":1524,"imageIndex":0},{"imageOffset":14240,"symbol":"_os_object_init","symbolLocation":24,"imageIndex":2},{"imageOffset":78372,"symbol":"libdispatch_init","symbolLocation":452,"imageIndex":2},{"imageOffset":5744,"symbol":"libSystem_initializer","symbolLocation":236,"imageIndex":3},{"imageOffset":139744,"symbol":"invocation function for block in dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&) const::$_0::operator()() const","symbolLocation":168,"imageIndex":1},{"imageOffset":409236,"symbol":"invocation function for block in dyld3::MachOAnalyzer::forEachInitializer(Diagnostics&, dyld3::MachOAnalyzer::VMAddrConverter const&, void (unsigned int) block_pointer, void const*) const","symbolLocation":340,"imageIndex":1},{"imageOffset":356772,"symbol":"invocation function for block in dyld3::MachOFile::forEachSection(void (dyld3::MachOFile::SectionInfo const&, bool, bool&) block_pointer) const","symbolLocation":528,"imageIndex":1},{"imageOffset":8920,"symbol":"dyld3::MachOFile::forEachLoadCommand(Diagnostics&, void (load_command const*, bool&) block_pointer) const","symbolLocation":296,"imageIndex":1},{"imageOffset":352716,"symbol":"dyld3::MachOFile::forEachSection(void (dyld3::MachOFile::SectionInfo const&, bool, bool&) block_pointer) const","symbolLocation":192,"imageIndex":1},{"imageOffset":407896,"symbol":"dyld3::MachOAnalyzer::forEachInitializer(Diagnostics&, dyld3::MachOAnalyzer::VMAddrConverter const&, void (unsigned int) block_pointer, void const*) const","symbolLocation":516,"imageIndex":1},{"imageOffset":125028,"symbol":"dyld4::Loader::findAndRunAllInitializers(dyld4::RuntimeState&) const","symbolLocation":448,"imageIndex":1},{"imageOffset":163700,"symbol":"dyld4::PrebuiltLoader::runInitializers(dyld4::RuntimeState&) const","symbolLocation":44,"imageIndex":1},{"imageOffset":272380,"symbol":"dyld4::APIs::runAllInitializersForMain()","symbolLocation":76,"imageIndex":1},{"imageOffset":29392,"symbol":"dyld4::prepare(dyld4::APIs&, dyld3::MachOAnalyzer const*)","symbolLocation":3480,"imageIndex":1},{"imageOffset":24088,"symbol":"start","symbolLocation":1964,"imageIndex":1}]}],
+  "usedImages" : [
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6630883328,
+    "size" : 286528,
+    "uuid" : "5beafa2b-3af4-3ed2-b054-1f58a7c851ef",
+    "path" : "\/usr\/lib\/libobjc.A.dylib",
+    "name" : "libobjc.A.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 4341121024,
+    "size" : 589824,
+    "uuid" : "bd993f39-c902-37d6-8bd8-6d827c7f121e",
+    "path" : "\/usr\/lib\/dyld",
+    "name" : "dyld"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6632914944,
+    "size" : 294912,
+    "uuid" : "c2fd3094-b465-39a4-b774-16583ff53c4b",
+    "path" : "\/usr\/lib\/system\/libdispatch.dylib",
+    "name" : "libdispatch.dylib"
+  },
+  {
+    "source" : "P",
+    "arch" : "arm64e",
+    "base" : 6829252608,
+    "size" : 8192,
+    "uuid" : "4bebcd61-9e62-39be-bfd2-c7d0689a826d",
+    "path" : "\/usr\/lib\/libSystem.B.dylib",
+    "name" : "libSystem.B.dylib"
+  }
+],
+  "vmSummary" : "ReadOnly portion of Libraries: Total=2512K resident=0K(0%) swapped_out_or_unallocated=2512K(100%)\nWritable regions: Total=31.1M written=0K(0%) resident=0K(0%) swapped_out=0K(0%) unallocated=31.1M(100%)\n\n                                VIRTUAL   REGION \nREGION TYPE                        SIZE    COUNT (non-coalesced) \n===========                     =======  ======= \nKernel Alloc Once                   32K        1 \nMALLOC                            9360K        8 \nMALLOC guard page                   96K        6 \nSTACK GUARD                         16K        1 \nStack                             1008K        1 \n__DATA                            20.8M        6 \n__DATA_CONST                        80K        4 \n__DATA_DIRTY                        16K        1 \n__LINKEDIT                         832K        4 \n__TEXT                            1680K        4 \ndyld private memory                272K        2 \nshared memory                       16K        1 \n===========                     =======  ======= \nTOTAL                             33.9M       39 \n",
+  "legacyInfo" : {
+  "threadTriggered" : {
+    "queue" : "com.apple.main-thread"
+  }
+},
+  "trialInfo" : {
+  "rollouts" : [
+    {
+      "rolloutId" : "6101c13693ebac18231ac9a1",
+      "factorPackIds" : {
+
+      },
+      "deploymentId" : 240000791
+    },
+    {
+      "rolloutId" : "63a0a6cfd1cdb67d083006d0",
+      "factorPackIds" : {
+
+      },
+      "deploymentId" : 240000003
+    }
+  ],
+  "experiments" : [
+
+  ]
+},
+  "reportNotes" : [
+  "dyld_process_snapshot_create_for_process failed with 5"
+]
+}

@@ -90,7 +90,7 @@ env	TOY_DELAY	off	standalone probe	Delays the ToyGUI rendering probe.
 env	VSCODE_RESOLVING_ENVIRONMENT	transient	VS Code shell environment resolver	Exact official marker selecting the token-plus-JSON exec adapter and minimal constructor mode.
 env	MallocScribble	off	allocator diagnostic	Forbidden in every production launch plist.
 cli	--force-disable-user-env	on	VS Code main service	Supported VS Code switch avoids the redundant main-service login-shell environment probe.
-cli	--no-watchdog	off	safety invariant	Removed option; iPad temperature protection cannot be disabled.
+cli	--no-watchdog	off	safety invariant	Removed option; iPad thermal, memory-pressure and crash-loop protection cannot be disabled.
 setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid optional Copilot/Claude AgentHost processes unrelated to native-AGX WebGL measurement.
 setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code benchmark profile	Avoid reviving stale benchmark-profile PTYs across isolated runs.
 artifact	/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist	on	VS Code production launcher	Packaged outside auto-scanned LaunchDaemons; loaded explicitly only after the GUI is ready.

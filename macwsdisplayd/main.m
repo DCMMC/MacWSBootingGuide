@@ -41,8 +41,11 @@ static uint64_t NextLeaseToken = 1;
 static int InvalidationSocket = -1;
 static dispatch_source_t InvalidationSource;
 static BOOL TransientReconcilePending;
+static _Atomic uint64_t GeometryRestartSerial;
+static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
 static CGFloat ObservedWindowBackingScale;
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
+static void ScheduleGeometryStreamRestart(void);
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void DisplayLog(NSString *format, ...) {
@@ -103,6 +106,8 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t droppedFrames;
 @property(nonatomic) uint64_t firstDisplayTime;
 @property(nonatomic) CGFloat windowBackingScale;
+@property(nonatomic) size_t lastSurfaceWidth;
+@property(nonatomic) size_t lastSurfaceHeight;
 @property(nonatomic) NSMutableDictionary<NSNumber *, MacWSTransientLayer *> *transientLayers;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *outstandingByLayer;
 - (void)stopStream;
@@ -285,6 +290,22 @@ static CGFloat MainDisplayBackingScale(void) {
     return scale > 0 && scale <= 8.0 ? scale : 1.0;
 }
 
+static BOOL CopyWindowBounds(uint32_t windowID, CGRect *result) {
+    if (windowID == 0 || !result) return NO;
+    for (NSDictionary *info in CopyOnScreenWindowInfo()) {
+        if ([info[(id)kCGWindowNumber] unsignedIntValue] != windowID)
+            continue;
+        CGRect bounds = CGRectZero;
+        if (!CGRectMakeWithDictionaryRepresentation(
+                (__bridge CFDictionaryRef)info[(id)kCGWindowBounds],
+                &bounds) || bounds.size.width <= 0.0 ||
+            bounds.size.height <= 0.0) return NO;
+        *result = bounds;
+        return YES;
+    }
+    return NO;
+}
+
 static NSDictionary<NSNumber *, NSValue *> *CopyWindowMetrics(int32_t pid) {
     if (pid <= 1) return @{};
     NSString *path = [NSString stringWithFormat:
@@ -439,9 +460,31 @@ static void StartInvalidationListener(void) {
         DisplayQueue);
     dispatch_source_set_event_handler(InvalidationSource, ^{
         uint8_t bytes[128];
-        while (recv(InvalidationSocket, bytes, sizeof(bytes), 0) > 0) {}
+        BOOL geometryChanged = NO;
+        ssize_t count = 0;
+        while ((count = recv(InvalidationSocket, bytes,
+                             sizeof(bytes), 0)) > 0) {
+            MacWSGeometryInvalidation geometry = {0};
+            if ((size_t)count == sizeof(geometry)) {
+                memcpy(&geometry, bytes, sizeof(geometry));
+            }
+            if (MacWSGeometryInvalidationIsValid(&geometry,
+                                                  (size_t)count)) {
+                @synchronized (GeometryTargets) {
+                    GeometryTargets[@(geometry.windowID)] =
+                        [NSValue valueWithBytes:&geometry
+                            objCType:@encode(MacWSGeometryInvalidation)];
+                }
+                geometryChanged = YES;
+            } else {
+                for (ssize_t index = 0; index < count; index++) {
+                    if (bytes[index] == 'g') geometryChanged = YES;
+                }
+            }
+        }
         BroadcastWindowList();
         ScheduleTransientReconcile(0);
+        if (geometryChanged) ScheduleGeometryStreamRestart();
     });
     dispatch_source_set_cancel_handler(InvalidationSource, ^{
         if (InvalidationSocket >= 0) close(InvalidationSocket);
@@ -515,6 +558,10 @@ static void PublishFrame(MacWSDisplayClient *client,
         width > MACWS_STREAM_MAX_DIMENSION ||
         height > MACWS_STREAM_MAX_DIMENSION ||
         bytesPerRow > UINT32_MAX) return;
+    if (!layer) {
+        client.lastSurfaceWidth = width;
+        client.lastSurfaceHeight = height;
+    }
     if (!layer && client.mode == MacWSStreamModeWindow &&
         client.windowBackingScale <= 0.0) {
         for (NSDictionary *info in CopyOnScreenWindowInfo()) {
@@ -766,6 +813,68 @@ static void StartClientStream(MacWSDisplayClient *client) {
         client.mode == MacWSStreamModeWindow ? "YES" : "NO");
 }
 
+// SLSHWCaptureStreamCreateWithWindow fixes its output shape when the stream is
+// created. Runtime evidence on VSCode window 512 was unambiguous: AppKit
+// accepted 934x592 -> 785x592, while stream 255 continued publishing a
+// 1868x1184 IOSurface, producing portrait black bars and a stale input map.
+// Recreate exact-window streams after the final geometry invalidation. The
+// serial is a debounce boundary for live Stage Manager resizing; no frame-time
+// polling or aspect stretching is involved.
+static void ScheduleGeometryStreamRestart(void) {
+    uint64_t serial = atomic_fetch_add_explicit(
+        &GeometryRestartSerial, 1, memory_order_relaxed) + 1;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                   DisplayQueue, ^{
+        if (serial != atomic_load_explicit(
+                &GeometryRestartSerial, memory_order_relaxed)) return;
+        for (MacWSDisplayClient *client in [Clients copy]) {
+            if (client.mode != MacWSStreamModeWindow || client.windowID == 0)
+                continue;
+            uint32_t expectedWidth = 0, expectedHeight = 0;
+            NSValue *targetValue = nil;
+            @synchronized (GeometryTargets) {
+                targetValue = GeometryTargets[@(client.windowID)];
+                if (targetValue)
+                    [GeometryTargets removeObjectForKey:@(client.windowID)];
+            }
+            if (targetValue) {
+                MacWSGeometryInvalidation target = {0};
+                [targetValue getValue:&target];
+                expectedWidth = target.pixelWidth;
+                expectedHeight = target.pixelHeight;
+            } else {
+                CGRect bounds = CGRectZero;
+                CGFloat scale = client.windowBackingScale > 0.0
+                    ? client.windowBackingScale : MainDisplayBackingScale();
+                if (CopyWindowBounds(client.windowID, &bounds) && scale > 0.0) {
+                    expectedWidth = (uint32_t)llround(
+                        bounds.size.width * scale);
+                    expectedHeight = (uint32_t)llround(
+                        bounds.size.height * scale);
+                }
+            }
+            // A stale Scene subscription can briefly outlive its CGWindow.
+            // With no committed target and no catalog bounds there is no
+            // geometry invariant to restore, so leave it alone rather than
+            // blindly restarting an already-orphaned capture stream.
+            if (expectedWidth == 0 || expectedHeight == 0) continue;
+            if (client.lastSurfaceWidth == expectedWidth &&
+                client.lastSurfaceHeight == expectedHeight) {
+                continue;
+            }
+            DisplayLog(@"geometry-stream-restart window=%u old-stream=%llu current=%zux%zu expected=%ux%u",
+                       client.windowID,
+                       (unsigned long long)client.streamID,
+                       client.lastSurfaceWidth, client.lastSurfaceHeight,
+                       expectedWidth, expectedHeight);
+            client.windowBackingScale = 0.0;
+            [client stopTransientLayers];
+            StartClientStream(client);
+        }
+        ScheduleTransientReconcile(0);
+    });
+}
+
 static void StartSubscription(MacWSDisplayClient *client,
                               MacWSStreamMode mode, uint32_t windowID) {
     client.mode = mode;
@@ -974,6 +1083,7 @@ int main(void) {
                                           DISPATCH_QUEUE_CONCURRENT);
         Clients = [NSMutableSet set];
         Leases = [NSMutableDictionary dictionary];
+        GeometryTargets = [NSMutableDictionary dictionary];
         StartInvalidationListener();
         xpc_connection_t listener = xpc_connection_create_mach_service(
             MACWS_STREAM_SERVICE, DisplayQueue,

@@ -14,7 +14,7 @@ sudo bash /var/jb/usr/macOS/bin/macos_gui.sh production
 
 `start` now has the same defaults: coexistence display mode, native AGX and
 the required command/completion/VNC compatibility enabled, VNC and Terminal
-started, the mandatory thermal watchdog armed, and diagnostics disabled.
+started, the mandatory health watchdog armed, and diagnostics disabled.
 `--experimental` remains
 an accepted compatibility alias. Only an intentional control run should use
 `--no-experimental`; only an evidence-gathering run should add
@@ -51,7 +51,7 @@ variables. `MallocScribble` is explicitly forbidden.
   intervenes; `nominal`, `fair`, `serious`, numeric temperatures and missing
   samples are recorded without stopping the run.
 
-## Mandatory thermal guards
+## Mandatory health guards
 
 The iPad launcher runs `/var/jb/usr/macOS/bin/macwsthermal` before any GUI
 session, then samples once every 300 seconds. Only an explicitly observed
@@ -60,6 +60,15 @@ session, then samples once every 300 seconds. Only an explicitly observed
 `--no-watchdog` is rejected; the monitor itself is not a production switch.
 `macos_gui.sh status` reads the watchdog's timestamped cached snapshot and does
 not perform an extra sensor read.
+
+Memory pressure is an independent safety input. The launcher reads XNU's
+system-wide available-memory percentage through `memory_pressure -Q` at
+startup and every 30 seconds. It refuses or stops the disposable GUI stack at
+or below 58%, while unavailable telemetry remains log-only. This threshold is
+the project safety margin between the recovered 61–62% device witness and the
+56% `SystemMemoryReset` witness; it is not presented as an Apple-defined
+pressure class. Exact evidence and the largest resident processes are recorded
+in [`memory-reset-20260801/`](evidence/memory-reset-20260801/README.md).
 
 At startup, production mode validates two independent trustcache witnesses:
 the base chroot shell and VS Code's early-loaded Electron Framework. If either

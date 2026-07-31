@@ -104,6 +104,11 @@ enum {
     // density so about 18% more macOS logical points fit into the Scene, at the
     // cost of a controlled downsample.
     MacWSHostDisplayDensityKeyboard = 2,
+    // Optional larger touch presentation. The Host applies a mild 10%
+    // high-quality upsample, so this is deliberately not described as exact
+    // Retina. TouchComfort remains the default one-source-pixel-to-one-
+    // drawable-pixel mode.
+    MacWSHostDisplayDensityComfort = 3,
 };
 
 // Physical source of an input sample. Version 4 keeps this explicit instead

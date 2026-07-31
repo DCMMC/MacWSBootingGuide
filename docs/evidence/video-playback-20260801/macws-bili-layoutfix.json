@@ -1,0 +1,3018 @@
+{
+  "capturedAt": "2026-07-31T19:35:59.369Z",
+  "requestedURL": "https://www.bilibili.com/video/BV1ps4y18729/",
+  "targetID": "0CD838CF60B7651645D49AE637355177",
+  "mediaDomainEnabled": true,
+  "playResult": [
+    {
+      "index": 0,
+      "ok": true
+    }
+  ],
+  "diagnosticEvents": [
+    {
+      "elapsedMilliseconds": 18,
+      "method": "Media.playerPropertiesChanged",
+      "params": {
+        "playerId": "90BC6732EA6BA6080DFC94C412C592BA",
+        "properties": [
+          {
+            "name": "kVideoDecoderName",
+            "value": "Dav1dVideoDecoder"
+          },
+          {
+            "name": "kAudioDecoderName",
+            "value": "FFmpegAudioDecoder"
+          },
+          {
+            "name": "kVideoTracks",
+            "value": "[{\"alpha mode\":\"is_opaque\",\"codec\":\"av1\",\"coded size\":\"640x360\",\"color space\":{\"matrix\":\"BT709\",\"primaries\":\"BT709\",\"range\":\"LIMITED\",\"transfer\":\"BT709\"},\"encryption scheme\":\"Unencrypted\",\"has extra data\":false,\"hdr metadata\":{},\"natural size\":\"640x360\",\"orientation\":\"0°\",\"profile\":\"av1 profile main\",\"visible rect\":\"0,0 640x360\"}]"
+          },
+          {
+            "name": "kFrameUrl",
+            "value": "https://www.bilibili.com/video/BV1ps4y18729/"
+          },
+          {
+            "name": "kAudioTracks",
+            "value": "[{\"bytes per channel\":2,\"bytes per frame\":4,\"channel layout\":\"STEREO\",\"channels\":2,\"codec\":\"aac\",\"codec delay\":0,\"discard decoder delay\":false,\"encryption scheme\":\"Unencrypted\",\"has extra data\":true,\"profile\":\"unknown\",\"sample format\":\"Signed 16-bit\",\"samples per second\":48000,\"seek preroll\":\"0us\"}]"
+          },
+          {
+            "name": "kIsVideoDecryptingDemuxerStream",
+            "value": "false"
+          },
+          {
+            "name": "kResolution",
+            "value": "853x480"
+          },
+          {
+            "name": "kRendererName",
+            "value": "RendererImpl"
+          },
+          {
+            "name": "kIsPlatformVideoDecoder",
+            "value": "false"
+          },
+          {
+            "name": "kIsAudioDecryptingDemuxerStream",
+            "value": "false"
+          },
+          {
+            "name": "kFrameTitle",
+            "value": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili"
+          },
+          {
+            "name": "kIsPlatformAudioDecoder",
+            "value": "false"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 18,
+      "method": "Media.playerMessagesLogged",
+      "params": {
+        "playerId": "90BC6732EA6BA6080DFC94C412C592BA",
+        "messages": [
+          {
+            "level": "info",
+            "message": "ChunkDemuxer"
+          },
+          {
+            "level": "info",
+            "message": "Selected FFmpegAudioDecoder for audio decoding, config: codec: aac, profile: unknown, bytes_per_channel: 2, channel_layout: STEREO, channels: 2, samples_per_second: 48000, sample_format: Signed 16-bit, bytes_per_frame: 4, seek_preroll: 0us, codec_delay: 0, has extra data: true, encryption scheme: Unencrypted, discard decoder delay: false, target_output_channel_layout: STEREO, target_output_sample_format: Unknown sample format"
+          },
+          {
+            "level": "info",
+            "message": "Cannot select DecryptingVideoDecoder for video decoding. status=DecoderStatus::Codes::kUnsupportedEncryptionMode"
+          },
+          {
+            "level": "info",
+            "message": "Cannot select VideoToolboxVideoDecoder for video decoding. status=DecoderStatus::Codes::kUnsupportedConfig"
+          },
+          {
+            "level": "info",
+            "message": "Cannot select VpxVideoDecoder for video decoding. status=DecoderStatus::Codes::kUnsupportedConfig"
+          },
+          {
+            "level": "info",
+            "message": "Selected Dav1dVideoDecoder for video decoding, config: codec: av1, profile: av1 profile main, level: not available, alpha_mode: is_opaque, coded size: [640,360], visible rect: [0,0,640,360], natural size: [640,360], has extra data: false, encryption scheme: Unencrypted, rotation: 0°, flipped: 0, color space: {primaries:BT709, transfer:BT709, matrix:BT709, range:LIMITED}"
+          },
+          {
+            "level": "info",
+            "message": "Effective playback rate changed from 0 to 1"
+          },
+          {
+            "level": "info",
+            "message": "video decoder config changed midstream, new config: codec: av1, profile: av1 profile main, level: not available, alpha_mode: is_opaque, coded size: [852,480], visible rect: [0,0,852,480], natural size: [853,480], has extra data: false, encryption scheme: Unencrypted, rotation: 0°, flipped: 0, color space: {primaries:BT709, transfer:BT709, matrix:BT709, range:LIMITED}"
+          },
+          {
+            "level": "info",
+            "message": "Selected Dav1dVideoDecoder for video decoding, config: codec: av1, profile: av1 profile main, level: not available, alpha_mode: is_opaque, coded size: [852,480], visible rect: [0,0,852,480], natural size: [853,480], has extra data: false, encryption scheme: Unencrypted, rotation: 0°, flipped: 0, color space: {primaries:BT709, transfer:BT709, matrix:BT709, range:LIMITED}"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 18,
+      "method": "Media.playerEventsAdded",
+      "params": {
+        "playerId": "90BC6732EA6BA6080DFC94C412C592BA",
+        "events": [
+          {
+            "timestamp": 86700.515191,
+            "value": "{\"created\":\"2026-07-31 19:35:32.171553 UTC\",\"event\":\"kMediaLogCreated\"}"
+          },
+          {
+            "timestamp": 86700.515997,
+            "value": "{\"event\":\"kWebMediaPlayerCreated\",\"origin_url\":\"https://www.bilibili.com/\"}"
+          },
+          {
+            "timestamp": 86700.516184,
+            "value": "{\"event\":\"kLoad\",\"url\":\"blob:https://www.bilibili.com/d612e744-5351-4b1a-849a-8f01061afd13\"}"
+          },
+          {
+            "timestamp": 86700.517536,
+            "value": "{\"event\":\"kPipelineStateChange\",\"pipeline_state\":\"kStarting\"}"
+          },
+          {
+            "timestamp": 86701.533529,
+            "value": "{\"event\":\"kPipelineStateChange\",\"pipeline_state\":\"kPlaying\"}"
+          },
+          {
+            "timestamp": 86700.519375,
+            "value": "{\"duration\":342.0,\"event\":\"kDurationChanged\"}"
+          },
+          {
+            "timestamp": 86701.534007,
+            "value": "{\"audio_buffering_state\":{\"state\":\"BUFFERING_HAVE_ENOUGH\"},\"event\":\"kBufferingStateChanged\"}"
+          },
+          {
+            "timestamp": 86701.617004,
+            "value": "{\"dimensions\":\"640x360\",\"event\":\"kVideoSizeChanged\"}"
+          },
+          {
+            "timestamp": 86701.618024,
+            "value": "{\"event\":\"kBufferingStateChanged\",\"video_buffering_state\":{\"state\":\"BUFFERING_HAVE_ENOUGH\"}}"
+          },
+          {
+            "timestamp": 86701.618036,
+            "value": "{\"event\":\"kBufferingStateChanged\",\"pipeline_buffering_state\":{\"for_suspended_start\":false,\"state\":\"BUFFERING_HAVE_ENOUGH\"}}"
+          },
+          {
+            "timestamp": 86701.621548,
+            "value": "{\"event\":\"kPlay\"}"
+          },
+          {
+            "timestamp": 86712.061149,
+            "value": "{\"dimensions\":\"853x480\",\"event\":\"kVideoSizeChanged\"}"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 18,
+      "method": "Media.playerErrorsRaised",
+      "params": {
+        "playerId": "90BC6732EA6BA6080DFC94C412C592BA",
+        "errors": []
+      }
+    },
+    {
+      "elapsedMilliseconds": 1514,
+      "method": "Media.playerEventsAdded",
+      "params": {
+        "playerId": "06DD3E4A27FAEA11FFB3FB027969E457",
+        "events": [
+          {
+            "timestamp": 86715.787044,
+            "value": "{\"created\":\"2026-07-31 19:35:47.443132 UTC\",\"event\":\"kMediaLogCreated\"}"
+          },
+          {
+            "timestamp": 86715.787092,
+            "value": "{\"event\":\"kWebMediaPlayerCreated\",\"origin_url\":\"https://www.bilibili.com/\"}"
+          },
+          {
+            "timestamp": 86715.787146,
+            "value": "{\"event\":\"kLoad\",\"url\":\"blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88\"}"
+          },
+          {
+            "timestamp": 86715.787172,
+            "value": "{\"event\":\"kPipelineStateChange\",\"pipeline_state\":\"kStarting\"}"
+          },
+          {
+            "timestamp": 86716.07074,
+            "value": "{\"event\":\"kPipelineStateChange\",\"pipeline_state\":\"kPlaying\"}"
+          },
+          {
+            "timestamp": 86716.201718,
+            "value": "{\"dimensions\":\"640x360\",\"event\":\"kVideoSizeChanged\"}"
+          },
+          {
+            "timestamp": 86715.805132,
+            "value": "{\"duration\":342.0,\"event\":\"kDurationChanged\"}"
+          },
+          {
+            "timestamp": 86716.109495,
+            "value": "{\"event\":\"kBufferingStateChanged\",\"video_buffering_state\":{\"state\":\"BUFFERING_HAVE_ENOUGH\"}}"
+          },
+          {
+            "timestamp": 86716.210051,
+            "value": "{\"audio_buffering_state\":{\"state\":\"BUFFERING_HAVE_ENOUGH\"},\"event\":\"kBufferingStateChanged\"}"
+          },
+          {
+            "timestamp": 86716.224278,
+            "value": "{\"event\":\"kBufferingStateChanged\",\"pipeline_buffering_state\":{\"for_suspended_start\":false,\"state\":\"BUFFERING_HAVE_ENOUGH\"}}"
+          },
+          {
+            "timestamp": 86716.230681,
+            "value": "{\"event\":\"kPlay\"}"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 1515,
+      "method": "Media.playerPropertiesChanged",
+      "params": {
+        "playerId": "06DD3E4A27FAEA11FFB3FB027969E457",
+        "properties": [
+          {
+            "name": "kVideoDecoderName",
+            "value": "Dav1dVideoDecoder"
+          },
+          {
+            "name": "kAudioDecoderName",
+            "value": "FFmpegAudioDecoder"
+          },
+          {
+            "name": "kVideoTracks",
+            "value": "[{\"alpha mode\":\"is_opaque\",\"codec\":\"av1\",\"coded size\":\"640x360\",\"color space\":{\"matrix\":\"BT709\",\"primaries\":\"BT709\",\"range\":\"LIMITED\",\"transfer\":\"BT709\"},\"encryption scheme\":\"Unencrypted\",\"has extra data\":false,\"hdr metadata\":{},\"natural size\":\"640x360\",\"orientation\":\"0°\",\"profile\":\"av1 profile main\",\"visible rect\":\"0,0 640x360\"}]"
+          },
+          {
+            "name": "kFrameUrl",
+            "value": "https://www.bilibili.com/video/BV1ps4y18729/"
+          },
+          {
+            "name": "kAudioTracks",
+            "value": "[{\"bytes per channel\":2,\"bytes per frame\":4,\"channel layout\":\"STEREO\",\"channels\":2,\"codec\":\"aac\",\"codec delay\":0,\"discard decoder delay\":false,\"encryption scheme\":\"Unencrypted\",\"has extra data\":true,\"profile\":\"unknown\",\"sample format\":\"Signed 16-bit\",\"samples per second\":48000,\"seek preroll\":\"0us\"}]"
+          },
+          {
+            "name": "kIsVideoDecryptingDemuxerStream",
+            "value": "false"
+          },
+          {
+            "name": "kResolution",
+            "value": "640x360"
+          },
+          {
+            "name": "kRendererName",
+            "value": "RendererImpl"
+          },
+          {
+            "name": "kIsPlatformVideoDecoder",
+            "value": "false"
+          },
+          {
+            "name": "kIsAudioDecryptingDemuxerStream",
+            "value": "false"
+          },
+          {
+            "name": "kFrameTitle",
+            "value": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili"
+          },
+          {
+            "name": "kIsPlatformAudioDecoder",
+            "value": "false"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 1515,
+      "method": "Media.playerMessagesLogged",
+      "params": {
+        "playerId": "06DD3E4A27FAEA11FFB3FB027969E457",
+        "messages": [
+          {
+            "level": "info",
+            "message": "ChunkDemuxer"
+          },
+          {
+            "level": "info",
+            "message": "Selected FFmpegAudioDecoder for audio decoding, config: codec: aac, profile: unknown, bytes_per_channel: 2, channel_layout: STEREO, channels: 2, samples_per_second: 48000, sample_format: Signed 16-bit, bytes_per_frame: 4, seek_preroll: 0us, codec_delay: 0, has extra data: true, encryption scheme: Unencrypted, discard decoder delay: false, target_output_channel_layout: STEREO, target_output_sample_format: Unknown sample format"
+          },
+          {
+            "level": "info",
+            "message": "Cannot select DecryptingVideoDecoder for video decoding. status=DecoderStatus::Codes::kUnsupportedEncryptionMode"
+          },
+          {
+            "level": "info",
+            "message": "Cannot select VideoToolboxVideoDecoder for video decoding. status=DecoderStatus::Codes::kUnsupportedConfig"
+          },
+          {
+            "level": "info",
+            "message": "Cannot select VpxVideoDecoder for video decoding. status=DecoderStatus::Codes::kUnsupportedConfig"
+          },
+          {
+            "level": "info",
+            "message": "Selected Dav1dVideoDecoder for video decoding, config: codec: av1, profile: av1 profile main, level: not available, alpha_mode: is_opaque, coded size: [640,360], visible rect: [0,0,640,360], natural size: [640,360], has extra data: false, encryption scheme: Unencrypted, rotation: 0°, flipped: 0, color space: {primaries:BT709, transfer:BT709, matrix:BT709, range:LIMITED}"
+          },
+          {
+            "level": "info",
+            "message": "Effective playback rate changed from 0 to 1"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 7644,
+      "method": "Media.playerEventsAdded",
+      "params": {
+        "playerId": "06DD3E4A27FAEA11FFB3FB027969E457",
+        "events": [
+          {
+            "timestamp": 86722.920401,
+            "value": "{\"event\":\"kSeek\",\"seek_target\":0.0}"
+          }
+        ]
+      }
+    },
+    {
+      "elapsedMilliseconds": 8647,
+      "method": "Media.playerEventsAdded",
+      "params": {
+        "playerId": "06DD3E4A27FAEA11FFB3FB027969E457",
+        "events": [
+          {
+            "timestamp": 86722.92067,
+            "value": "{\"event\":\"kPipelineStateChange\",\"pipeline_state\":\"kSeeking\"}"
+          },
+          {
+            "timestamp": 86722.921405,
+            "value": "{\"event\":\"kPipelineStateChange\",\"pipeline_state\":\"kPlaying\"}"
+          },
+          {
+            "timestamp": 86722.93281,
+            "value": "{\"event\":\"kBufferingStateChanged\",\"video_buffering_state\":{\"state\":\"BUFFERING_HAVE_ENOUGH\"}}"
+          },
+          {
+            "timestamp": 86722.924129,
+            "value": "{\"audio_buffering_state\":{\"state\":\"BUFFERING_HAVE_ENOUGH\"},\"event\":\"kBufferingStateChanged\"}"
+          },
+          {
+            "timestamp": 86722.932905,
+            "value": "{\"event\":\"kBufferingStateChanged\",\"pipeline_buffering_state\":{\"for_suspended_start\":false,\"state\":\"BUFFERING_HAVE_ENOUGH\"}}"
+          }
+        ]
+      }
+    }
+  ],
+  "samples": [
+    {
+      "elapsedSeconds": 0,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 67.29999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 0.49101,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 216,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 0.5,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 67.29999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 1.010473,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 232,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 1,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 67.29999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 1.529437,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 247,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 1.5,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 67.29999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 2.059741,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 262,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 2,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 76.59999999403954,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 2.574624,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 278,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 2.5,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 76.59999999403954,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 3.103223,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 293,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 3,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 76.59999999403954,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 3.628333,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 308,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 3.5,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 20.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 76.59999999403954,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 4.153555,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 323,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    },
+    {
+      "elapsedSeconds": 4,
+      "url": "https://www.bilibili.com/video/BV1ps4y18729/",
+      "title": "【测试】画质对比让你爱上AV1！_哔哩哔哩_bilibili",
+      "visibility": "hidden",
+      "scrollY": 0,
+      "viewport": {
+        "width": 640,
+        "height": 520,
+        "dpr": 2
+      },
+      "codecSupport": {
+        "h264": "probably",
+        "hevc": "probably",
+        "vp9": "probably",
+        "av1": "probably",
+        "mseH264": true,
+        "mseHevc": true,
+        "mseVp9": true,
+        "mseAv1": true
+      },
+      "bilibili": {
+        "hasPlayInfo": true,
+        "code": 0,
+        "message": "OK",
+        "dashVideo": [
+          {
+            "id": 32,
+            "codecid": 7,
+            "codecs": "avc1.64001F",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 32,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 852,
+            "height": 480,
+            "host": "upos-sz-estgcos.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 12,
+            "codecs": "hev1.1.6.L120.90",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-estgoss.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 7,
+            "codecs": "avc1.64001E",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirrorbd.bilivideo.com"
+          },
+          {
+            "id": 16,
+            "codecid": 13,
+            "codecs": "av01.0.08M.08.0.110.01.01.01.0",
+            "mimeType": "video/mp4",
+            "width": 640,
+            "height": 360,
+            "host": "upos-sz-mirror08c.bilivideo.com"
+          }
+        ],
+        "mediaResources": [
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=1&versionId=1782109272785",
+            "duration": 16.69999998807907,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/click-interface/click/web/h5?w_aid=949998141&w_part=1&w_ftime=1785526547&w_stime=1785526548&w_type=3&web_location=1315873&w_rid=bc536c977e9125dfefe6d0d8a69c9a35&wts=1785526548",
+            "duration": 62.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/kv-frontend/namespace/data?appKey=457.19&nscode=5&versionId=1761016074476",
+            "duration": 15.199999988079071,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/web-interface/broadcast/servers?platform=web",
+            "duration": 59.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 68.40000000596046,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://api.bilibili.com/x/player/online/total?aid=949998141&cid=1022397665&bvid=BV1ps4y18729&ts=59517552",
+            "duration": 71.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://api.bilibili.com/x/internal/gaia-gateway/ExGetAxe",
+            "duration": 61.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 62.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488391785526547890|Default:Ugc:0|4.9.90-5d85e7cd|smart_abr_info|{%22realtime%22:{%22display%22:{%22width%22:2388,%22height%22:1668},%22cpuCores%22:8,%22nowTs%22:1785526547430,%22nowHour%22:12,",
+            "duration": 24,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265488421785526548036|Default:Ugc:0|4.9.90-5d85e7cd|cdnTime|{%22val%22:5,%22initErr%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivid",
+            "duration": 24.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265490401785526548036|Default:Ugc:0|4.9.90-5d85e7cd|showTime|{%22val%22:30.3,%22initErr%22:0,%22tag%22:%22%E5%B8%B8%E8%A7%84%22}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|",
+            "duration": 21.099999994039536,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490421785526548266|Default:Ugc:0|4.9.90-5d85e7cd|codec_prefer_type_init|{%22TBD%22:0}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivide",
+            "duration": 22,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265490451785526548323|Default:Ugc:0|4.9.90-5d85e7cd|ctrl_flac_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76",
+            "duration": 23,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492401785526548328|Default:Ugc:0|4.9.90-5d85e7cd|loudness_normalization_archive|{%22aid%22:949998141,%22cid%22:1022397665}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0",
+            "duration": 22.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265492441785526548363|Default:Ugc:0|4.9.90-5d85e7cd|thirtyseconds_show||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/6",
+            "duration": 23.900000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494411785526548371|Default:Ugc:0|4.9.90-5d85e7cd|dm_lol_mask_prepare|{%22bvid%22:%22BV1ps4y18729%22,%22mid%22:0,%22maskVersion%22:%221.0.7%22,%22enabled%22:true}|a54ea3ba7a31fa3b297c0fd3d86f98",
+            "duration": 19.299999997019768,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265494431785526548435|Default:Ugc:0|4.9.90-5d85e7cd|bp_nc_sdk|{%22type%22:1001,%22version%22:%222.14.0-cd05e51%22,%22isSupportP2P%22:true}|a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|",
+            "duration": 20.400000005960464,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111417855265494451785526548568|Default:Ugc:0|4.9.90-5d85e7cd|room_join||a54ea3ba7a31fa3b297c0fd3d86f9842|||949998141|1022397665|1|0|4|3|2|6|0|0|https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022",
+            "duration": 21.200000002980232,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 77.79999999701977,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-mirror08c.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100022.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrN",
+            "duration": 22.399999991059303,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 2.7999999970197678,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 78.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://data.bilibili.com/log/web?00111117855265536371785526553622|Default:Ugc:0|4.9.90-5d85e7cd|auto_switch_requested|{%22oldQ%22:16,%22newQ%22:32,%22bitrate%22:183,%22throughput%22:[28928,22340,30000,30000,6565],%22reason%22:{%22state%22:",
+            "duration": 18.5,
+            "transferSize": 0,
+            "responseStatus": 200
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 123.19999998807907,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 79.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 72.1000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 65.70000000298023,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-100023.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvN",
+            "duration": 73.5,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 76.59999999403954,
+            "transferSize": 0,
+            "responseStatus": 206
+          },
+          {
+            "name": "https://upos-sz-estgcos.bilivideo.com/upgcxcode/65/76/1022397665/1022397665-1-30216.m4s?e=ig8euxZM2rNcNbdlhoNvNC8BqJIzNbfqXBvEqxTEto8BTrNvN0GvT90W5JZMkX_YN0MvXg8gNEV4NC8xNEV4N03eN0B5tZlqNxTEto8BTrNvNeZVuJ10Kj_g2UB02J0mN0B5tZlqNCNEto8BTrNvNC",
+            "duration": 80.6000000089407,
+            "transferSize": 0,
+            "responseStatus": 206
+          }
+        ]
+      },
+      "canvases": [
+        {
+          "width": 135,
+          "height": 135,
+          "cssWidth": 0,
+          "cssHeight": 0
+        }
+      ],
+      "videos": [
+        {
+          "index": 0,
+          "currentTime": 4.676808,
+          "duration": 342,
+          "src": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "currentSrc": "blob:https://www.bilibili.com/cace92ca-ae12-4107-9190-8de04c15ba88",
+          "sources": [],
+          "paused": false,
+          "ended": false,
+          "readyState": 4,
+          "networkState": 2,
+          "width": 640,
+          "height": 360,
+          "playbackRate": 1,
+          "error": null,
+          "totalFrames": 339,
+          "droppedFrames": 0,
+          "corruptedFrames": 0
+        }
+      ]
+    }
+  ]
+}

@@ -98,6 +98,7 @@ iPadOS 16 的固定尺寸档位不是本方案必须接受的产品边界。开�
 ```text
 像素匹配密度 = macOS surface backingScale / (MTK drawable pixels / Scene points)
 像素匹配所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度
+放大 +10% 所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度 × 1.10
 更多空间所需 iPad 宽高 = macOS 最小 frame 宽高 × 像素匹配密度 × 0.85
 ```
 
@@ -140,11 +141,12 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 当前实现采用“逐窗口有效密度”：
 
 - **像素匹配 Retina（默认）**：动态使用 `macOS backingScale / UIKit effectiveDrawableScale`。最终安装二进制的 runtime witness 为 `frame=1728x1302 backing=2.000 drawable=1726x1302 content=(0.00,0.58 1004.00x755.84) density=1.16`：高度完全相等，宽度差异限制在两个物理取整像素内。同一几何版本还记录过 AppKit 收敛到 `1027x651 logical point`、surface `2054x1302`、drawable `2053x1302` 的一像素差证据。全屏或其他 Scene 合成比例变化后会重新计算，不能把 100% 或 135% 当成所有窗口状态下的固定答案。
+- **放大 +10%（可选）**：在动态像素匹配密度上乘 1.10，向 AppKit 请求更小的逻辑窗口，再由 Host 放大到 drawable。它可以让字体和控件变大，但当前仍是 Metal 线性重采样，不是逐像素 Retina；产品文案和默认迁移都不得把它描述成无损 HiDPI。
 - **更多空间 +18%**：在动态像素匹配密度上乘 0.85，使逻辑画布扩大约 `1 / 0.85 = 1.176`，再做一次受控等比缩小。它明确是可选缩放，不宣称是 1:1 原生 HiDPI。
 - DisplayStream 的真实 `backingScale` 仍用于 HiDPI 像素传输；密度模式不伪造 IOSurface 尺寸。原生 Retina 模式的验收必须记录 surface backing scale、drawable 像素尺寸和最终内容矩形三者，而不能只看控制面板的百分比文案。
 - 切换模式会恢复视口缩放、重新计算小窗口门槛，然后防抖请求 AppKit 重排。
 
-因此，这里实现的是“每个 Scene 的有效信息密度”，不是修改 macOS 全局 DPI。将来若验证出 macOS 13.4 可安全逐窗口设置 backing scale，必须先证明窗口纹理、命中测试、菜单和跨屏拖动四者一致，才能替换当前方案。
+因此，这里实现的是“每个 Scene 的有效信息密度”，不是修改 macOS 全局 DPI。真正“字体更大且仍逐像素锐利”需要在 AppKit/Core Animation 上游提高该窗口的 backing scale，并让扩大后的 backing surface 继续精确匹配 drawable；继续增大 Host 缩放系数做不到这一点。将来若验证出 macOS 13.4 可安全逐窗口设置 backing scale，必须先证明窗口纹理、命中测试、菜单和跨屏拖动四者一致，才能替换当前方案。
 
 ### 6. 触摸与妙控键盘
 

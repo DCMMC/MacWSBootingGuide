@@ -4,7 +4,7 @@
 // context and copies the command buffer's populated KCMD bytes through the
 // same getCurrentKernelCommandBufferStart:current:end: SPI already used by
 // iosclear_ref.m.  It never changes a driver object or command byte.  Select
-// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|render|draw|drawchain|aquariumchain
+// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|render|draw|drawblit|drawblitsignal|drawblitlegacy|drawchain|aquariumchain
 // (default: blit).
 
 @import Foundation;
@@ -625,6 +625,111 @@ static int macws_encode_draw(id<MTLDevice> device,
     return dump_status || command_buffer.error ? 41 : 0;
 }
 
+// Native-iOS structural control for the video-compositor submission captured
+// from VS Code on 2026-08-01.  That macOS producer emitted one subtype-1 draw,
+// a type-5 signal record, one subtype-3 mode-1 texture blit, then another
+// type-5 signal record.  Encode the same public draw -> texture-copy sequence
+// in one native command buffer.  The probe copies, but never edits, the KCMD;
+// the selector-0x1a segment list is captured independently with the project
+// LLDB just as for drawchain/aquariumchain.
+static int macws_encode_draw_blit(id<MTLDevice> device,
+                                  id<MTLCommandQueue> queue,
+                                  unsigned signal_kind) {
+    MTLTextureDescriptor *texture_descriptor =
+        [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:96 height:64 mipmapped:NO];
+    texture_descriptor.storageMode = MTLStorageModeShared;
+    texture_descriptor.usage = MTLTextureUsageRenderTarget |
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> source =
+        [device newTextureWithDescriptor:texture_descriptor];
+    id<MTLTexture> rendered =
+        [device newTextureWithDescriptor:texture_descriptor];
+    id<MTLTexture> destination =
+        [device newTextureWithDescriptor:texture_descriptor];
+
+    NSError *error = nil;
+    NSString *library_path = [NSString stringWithUTF8String:
+        "/System/Library/Frameworks/QuartzCore.framework/default.metallib"];
+    NSURL *library_url = [NSURL fileURLWithPath:library_path];
+    id<MTLLibrary> library =
+        [device newLibraryWithURL:library_url error:&error];
+    id<MTLFunction> vertex =
+        [library newFunctionWithName:
+            [NSString stringWithUTF8String:"read_surf_vert"]];
+    id<MTLFunction> fragment =
+        [library newFunctionWithName:
+            [NSString stringWithUTF8String:"read_surf_frag"]];
+    MTLRenderPipelineDescriptor *pipeline_descriptor =
+        [MTLRenderPipelineDescriptor new];
+    pipeline_descriptor.vertexFunction = vertex;
+    pipeline_descriptor.fragmentFunction = fragment;
+    pipeline_descriptor.colorAttachments[0].pixelFormat =
+        MTLPixelFormatBGRA8Unorm;
+    id<MTLRenderPipelineState> pipeline =
+        [device newRenderPipelineStateWithDescriptor:pipeline_descriptor
+                                                error:&error];
+    // Both event families are public Metal APIs but exercise distinct IOGPU
+    // producers on iOS 16.3: _MTLSharedEvent emits signal type 3, while the
+    // legacy IOGPUMTLEvent returned by -newEvent emits type 5.  Capturing both
+    // controls lets us compare the chroot's macOS type-5 stream with the exact
+    // native producer instead of inferring an ABI conversion from one family.
+    id<MTLEvent> signal_event = signal_kind == 1
+        ? (id<MTLEvent>)[device newSharedEvent]
+        : (signal_kind == 2 ? [device newEvent] : nil);
+    if (!source || !rendered || !destination || !pipeline ||
+        (signal_kind != 0 && !signal_event)) {
+        fprintf(stderr,
+            "IOS-AGX-KCMD drawblit setup source=%p rendered=%p "
+            "destination=%p pipeline=%p event=%p error=%s\n",
+            (__bridge void *)source, (__bridge void *)rendered,
+            (__bridge void *)destination, (__bridge void *)pipeline,
+            (__bridge void *)signal_event,
+            error.description.UTF8String ?: "nil");
+        return 49;
+    }
+
+    id<MTLCommandBuffer> command_buffer = macws_new_command_buffer(queue);
+    MTLRenderPassDescriptor *pass =
+        [MTLRenderPassDescriptor renderPassDescriptor];
+    pass.colorAttachments[0].texture = rendered;
+    pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> render =
+        [command_buffer renderCommandEncoderWithDescriptor:pass];
+    [render setRenderPipelineState:pipeline];
+    [render setFragmentTexture:source atIndex:0];
+    [render drawPrimitives:MTLPrimitiveTypeTriangleStrip
+               vertexStart:0 vertexCount:4];
+    [render endEncoding];
+    if (signal_kind != 0)
+        [command_buffer encodeSignalEvent:signal_event value:1];
+
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    [blit copyFromTexture:rendered sourceSlice:0 sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(96, 64, 1)
+                toTexture:destination destinationSlice:0
+         destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    if (signal_kind != 0)
+        [command_buffer encodeSignalEvent:signal_event value:2];
+    macws_commit_deferred_encoder(command_buffer);
+
+    const char *mode = signal_kind == 1 ? "drawblitsignal"
+        : (signal_kind == 2 ? "drawblitlegacy" : "drawblit");
+    int dump_status = macws_dump_kcmd(command_buffer, mode);
+    if (getenv("MACWS_IOS_KCMD_HOLD")) raise(SIGSTOP);
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    fprintf(stderr,
+        "IOS-AGX-KCMD mode=%s status=%ld error=%s dump=%d\n", mode,
+        (long)command_buffer.status,
+        command_buffer.error.description.UTF8String ?: "nil", dump_status);
+    return dump_status || command_buffer.error ? 50 : 0;
+}
+
 // Native control for Chromium's runtime-captured multi-segment submission.
 // Encode thirteen ordinary render passes into one command buffer so the iOS
 // AGX producer, rather than a guessed C layout, shows how repeated subtype-1
@@ -742,6 +847,12 @@ int main(void) {
             return macws_encode_parallel_render(device, queue);
         if (strcmp(mode, "draw") == 0)
             return macws_encode_draw(device, queue);
+        if (strcmp(mode, "drawblit") == 0)
+            return macws_encode_draw_blit(device, queue, 0);
+        if (strcmp(mode, "drawblitsignal") == 0)
+            return macws_encode_draw_blit(device, queue, 1);
+        if (strcmp(mode, "drawblitlegacy") == 0)
+            return macws_encode_draw_blit(device, queue, 2);
         if (strcmp(mode, "drawchain") == 0)
             return macws_encode_draw_chain(device, queue);
         if (strcmp(mode, "aquariumchain") == 0)
