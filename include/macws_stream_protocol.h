@@ -134,10 +134,11 @@ typedef struct __attribute__((packed)) {
     uint32_t contentY;
     uint32_t contentWidth;
     uint32_t contentHeight;
-    // Every window Scene has one base layer and zero or more AppKit-owned
-    // transient layers (menus, popovers, sheets). Each layer is transported
-    // as its own native SkyLight window IOSurface and composed by Host Metal.
-    // destination* is expressed in the base window's top-left backing pixels.
+    // Every Scene has one base layer and zero or more SkyLight window layers.
+    // A window Scene attaches its AppKit-owned transients; a fullscreen Scene
+    // attaches the visible desktop window catalog over a Retina IOSurface
+    // canvas. Each is transported as its own native window IOSurface and
+    // composed by Host Metal. destination* is expressed in base backing pixels.
     uint32_t layerWindowID;
     int32_t layerLevel;
     int32_t destinationX;

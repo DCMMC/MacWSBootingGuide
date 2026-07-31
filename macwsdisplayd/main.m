@@ -1,6 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
-#import <IOSurface/IOSurfaceRef.h>
+#import <IOSurface/IOSurface.h>
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -41,11 +41,13 @@ static uint64_t NextLeaseToken = 1;
 static int InvalidationSocket = -1;
 static dispatch_source_t InvalidationSource;
 static BOOL TransientReconcilePending;
+static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
 static CGFloat ObservedWindowBackingScale;
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
 static void ScheduleGeometryStreamRestart(void);
+static void ScheduleCatalogBroadcast(void);
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void DisplayLog(NSString *format, ...) {
@@ -103,6 +105,7 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t streamID;
 @property(nonatomic) uint64_t sequence;
 @property(nonatomic) CGDisplayStreamRef stream;
+@property(nonatomic) IOSurfaceRef workspaceCanvas;
 @property(nonatomic) uint64_t droppedFrames;
 @property(nonatomic) uint64_t firstDisplayTime;
 @property(nonatomic) CGFloat windowBackingScale;
@@ -129,6 +132,10 @@ static void DisplayLog(NSString *format, ...) {
         CGDisplayStreamStop(_stream);
         CFRelease(_stream);
         _stream = NULL;
+    }
+    if (_workspaceCanvas) {
+        CFRelease(_workspaceCanvas);
+        _workspaceCanvas = NULL;
     }
     _sequence = 0;
 }
@@ -266,6 +273,13 @@ static NSArray<NSDictionary *> *CopyOnScreenWindowInfo(void) {
     CFArrayRef raw = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID);
+    if (!raw) return @[];
+    return CFBridgingRelease(raw);
+}
+
+static NSArray<NSDictionary *> *CopyCompleteDesktopWindowInfo(void) {
+    CFArrayRef raw = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly, kCGNullWindowID);
     if (!raw) return @[];
     return CFBridgingRelease(raw);
 }
@@ -428,6 +442,23 @@ static void BroadcastWindowList(void) {
         SendWindowList(client);
 }
 
+// A single AppKit action can update focus, key state and window metrics in
+// separate callbacks. Runtime logs captured more than ten complete catalog
+// broadcasts in the burst following one UI action. Preserve the latest
+// authoritative CGWindow snapshot while collapsing each 16 ms burst into one
+// display-queue edge.
+// Explicit LIST_WINDOWS requests remain immediate in HandleRequest.
+static void ScheduleCatalogBroadcast(void) {
+    if (CatalogBroadcastPending) return;
+    CatalogBroadcastPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
+                   DisplayQueue, ^{
+        CatalogBroadcastPending = NO;
+        BroadcastWindowList();
+        ScheduleTransientReconcile(0);
+    });
+}
+
 // AppKit processes publish their window metrics in a shared sidecar. This
 // datagram is only an invalidation edge: displayd remains the single process
 // that reads the real CGWindow catalog and broadcasts a validated snapshot.
@@ -482,8 +513,7 @@ static void StartInvalidationListener(void) {
                 }
             }
         }
-        BroadcastWindowList();
-        ScheduleTransientReconcile(0);
+        ScheduleCatalogBroadcast();
         if (geometryChanged) ScheduleGeometryStreamRestart();
     });
     dispatch_source_set_cancel_handler(InvalidationSource, ^{
@@ -712,14 +742,7 @@ static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
                            @"DisplayStream stopped", YES);
             }
         };
-    if (client.mode == MacWSStreamModeFullscreen) {
-        CGDirectDisplayID display = CGMainDisplayID();
-        size_t width = CGDisplayPixelsWide(display);
-        size_t height = CGDisplayPixelsHigh(display);
-        return CGDisplayStreamCreateWithDispatchQueue(
-            display, width, height, 0x42475241u,
-            (__bridge CFDictionaryRef)properties, DisplayQueue, handler);
-    }
+    if (client.mode == MacWSStreamModeFullscreen) return NULL;
 
     MacWSSLSWindowStreamCreate createWindow = dlsym(
         RTLD_DEFAULT, "SLSHWCaptureStreamCreateWithWindow");
@@ -727,6 +750,51 @@ static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
     return createWindow(client.windowID, false,
                         (__bridge CFDictionaryRef)properties,
                         DisplayQueue, handler);
+}
+
+static IOSurfaceRef CreateWorkspaceCanvas(MacWSDisplayClient *client) {
+    CGDirectDisplayID display = CGMainDisplayID();
+    size_t width = CGDisplayPixelsWide(display);
+    size_t height = CGDisplayPixelsHigh(display);
+    if (width == 0 || height == 0 || width > MACWS_STREAM_MAX_DIMENSION ||
+        height > MACWS_STREAM_MAX_DIMENSION || width > SIZE_MAX / 4)
+        return NULL;
+    size_t bytesPerRow = width * 4;
+    if (height > SIZE_MAX / bytesPerRow) return NULL;
+    NSDictionary *properties = @{
+        (__bridge id)kIOSurfaceWidth: @(width),
+        (__bridge id)kIOSurfaceHeight: @(height),
+        (__bridge id)kIOSurfaceBytesPerElement: @4,
+        (__bridge id)kIOSurfaceBytesPerRow: @(bytesPerRow),
+        (__bridge id)kIOSurfaceAllocSize: @(bytesPerRow * height),
+        (__bridge id)kIOSurfacePixelFormat: @(0x42475241u),
+    };
+    IOSurfaceRef surface = IOSurfaceCreate(
+        (__bridge CFDictionaryRef)properties);
+    if (!surface) return NULL;
+    IOReturn lockResult = IOSurfaceLock(surface, 0, NULL);
+    if (lockResult != kIOReturnSuccess) {
+        CFRelease(surface);
+        return NULL;
+    }
+    uint32_t *pixels = IOSurfaceGetBaseAddress(surface);
+    size_t stride = IOSurfaceGetBytesPerRow(surface) / sizeof(uint32_t);
+    if (!pixels || stride < width) {
+        IOSurfaceUnlock(surface, 0, NULL);
+        CFRelease(surface);
+        return NULL;
+    }
+    // Opaque graphite is only the desktop backing. Real wallpaper, menu bar,
+    // Dock and application windows arrive as native SkyLight capture layers.
+    // It also provides deterministic pixels when a desktop element declines
+    // capture instead of exposing uninitialised IOSurface memory.
+    for (size_t y = 0; y < height; y++) {
+        uint32_t *row = pixels + y * stride;
+        for (size_t x = 0; x < width; x++) row[x] = 0xff25282du;
+    }
+    IOSurfaceUnlock(surface, 0, NULL);
+    client.windowBackingScale = MainDisplayBackingScale();
+    return surface;
 }
 
 static void SendLayerRemoved(MacWSDisplayClient *client,
@@ -792,6 +860,22 @@ static void StartClientStream(MacWSDisplayClient *client) {
     if (client.streamID == 0) client.streamID = NextStreamID++;
     client.droppedFrames = 0;
     client.firstDisplayTime = 0;
+    if (client.mode == MacWSStreamModeFullscreen) {
+        client.workspaceCanvas = CreateWorkspaceCanvas(client);
+        if (!client.workspaceCanvas) {
+            SendStatus(client, MACWS_STREAM_EVENT_ERROR,
+                       @"无法创建 Retina 桌面 IOSurface 画布", NO);
+            return;
+        }
+        PublishFrame(client, nil, mach_absolute_time(),
+                     client.workspaceCanvas);
+        DisplayLog(@"workspace-start id=%llu display=%zux%zu scale=%.3f transport=window-iosurface-composite",
+                   (unsigned long long)client.streamID,
+                   IOSurfaceGetWidth(client.workspaceCanvas),
+                   IOSurfaceGetHeight(client.workspaceCanvas),
+                   client.windowBackingScale);
+        return;
+    }
     client.stream = CreateStream(client);
     if (!client.stream) {
         SendStatus(client, MACWS_STREAM_EVENT_ERROR,
@@ -882,7 +966,7 @@ static void StartSubscription(MacWSDisplayClient *client,
     client.windowBackingScale = 0.0;
     [client stopTransientLayers];
     StartClientStream(client);
-    if (mode == MacWSStreamModeWindow) ScheduleTransientReconcile(0);
+    ScheduleTransientReconcile(0);
 }
 
 // Menus, popovers and sheets are real nonzero-layer SkyLight windows. Runtime
@@ -895,8 +979,72 @@ static void StartSubscription(MacWSDisplayClient *client,
 static void ReconcileTransientStreams(void) {
     TransientReconcilePending = NO;
     NSArray<NSDictionary *> *windowInfo = CopyOnScreenWindowInfo();
+    NSArray<NSDictionary *> *desktopInfo = nil;
     BOOL needsFollowup = NO;
+    BOOL workspaceNeedsFollowup = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
+        if (client.mode == MacWSStreamModeFullscreen) {
+            if (!desktopInfo) desktopInfo = CopyCompleteDesktopWindowInfo();
+            CGRect desktopBounds = CGDisplayBounds(CGMainDisplayID());
+            CGFloat scale = client.windowBackingScale > 0.0
+                ? client.windowBackingScale : MainDisplayBackingScale();
+            if (CGRectIsEmpty(desktopBounds) || !isfinite(scale) ||
+                scale < 0.5 || scale > 8.0) continue;
+            if (!client.transientLayers)
+                client.transientLayers = [NSMutableDictionary dictionary];
+            NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
+            NSUInteger attached = 0;
+            NSUInteger count = desktopInfo.count;
+            for (NSUInteger index = 0; index < count; index++) {
+                NSDictionary *info = desktopInfo[index];
+                uint32_t candidateWindowID =
+                    [info[(id)kCGWindowNumber] unsignedIntValue];
+                if (attached >= 48 || candidateWindowID == 0 ||
+                    [info[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
+                CGRect candidateBounds = CGRectZero;
+                if (!CGRectMakeWithDictionaryRepresentation(
+                        (__bridge CFDictionaryRef)info[(id)kCGWindowBounds],
+                        &candidateBounds) || CGRectIsEmpty(candidateBounds) ||
+                    !CGRectIntersectsRect(desktopBounds, candidateBounds))
+                    continue;
+                NSNumber *key = @(candidateWindowID);
+                [seen addObject:key];
+                attached++;
+                MacWSTransientLayer *layer = client.transientLayers[key];
+                BOOL isNew = layer == nil;
+                if (isNew) {
+                    layer = [MacWSTransientLayer new];
+                    layer.client = client;
+                    layer.windowID = candidateWindowID;
+                    client.transientLayers[key] = layer;
+                }
+                // CGWindowList is front-to-back. Host draws ascending levels,
+                // so reverse that rank and preserve the actual desktop z-order
+                // even when several ordinary windows all report layer zero.
+                layer.level = (int32_t)MIN((NSUInteger)INT32_MAX,
+                                           count - index);
+                layer.destinationBounds = CGRectMake(
+                    (candidateBounds.origin.x - desktopBounds.origin.x) * scale,
+                    (candidateBounds.origin.y - desktopBounds.origin.y) * scale,
+                    candidateBounds.size.width * scale,
+                    candidateBounds.size.height * scale);
+                layer.missCount = 0;
+                if (isNew || !layer.stream) StartTransientLayer(layer);
+            }
+            for (NSNumber *key in [client.transientLayers.allKeys copy]) {
+                MacWSTransientLayer *layer = client.transientLayers[key];
+                if ([seen containsObject:key]) continue;
+                layer.missCount++;
+                if (layer.missCount < 2) continue;
+                DisplayLog(@"workspace-layer-remove layer=%u",
+                           layer.windowID);
+                SendLayerRemoved(client, layer.windowID);
+                [layer stopStream];
+                [client.transientLayers removeObjectForKey:key];
+            }
+            workspaceNeedsFollowup |= client.transientLayers.count != 0;
+            continue;
+        }
         if (client.mode != MacWSStreamModeWindow || client.windowID == 0)
             continue;
         NSDictionary *baseInfo = nil;
@@ -973,8 +1121,9 @@ static void ReconcileTransientStreams(void) {
         }
         if (client.transientLayers.count) needsFollowup = YES;
     }
-    if (needsFollowup)
-        ScheduleTransientReconcile(100 * NSEC_PER_MSEC);
+    if (needsFollowup || workspaceNeedsFollowup)
+        ScheduleTransientReconcile((workspaceNeedsFollowup ? 250 : 100) *
+                                   NSEC_PER_MSEC);
 }
 
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds) {

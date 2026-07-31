@@ -3689,13 +3689,15 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         MacWSApplyTabletMetadata(upEvent, upRecord);
         id activeMenuPresentation = MacWSActiveMenuPresentationInstance();
         if (!secondary && !activeMenuPresentation &&
-            !routedToTransientWindow && requestedWindowNumber != 0) {
+            requestedWindowNumber != 0) {
             // A direct UIKit tap has no preceding pointer-motion packet, while
             // AppKit and Electron legitimately use mouseMoved/tracking-area
             // state to reveal and arm controls (Terminal's tab close button is
-            // one concrete example). Complete the ordinary mouse semantic at
-            // the same resolved point before down; do not inject it into an
-            // already-running native menu tracker.
+            // one concrete example). Apply the same complete semantic after
+            // routing to a real higher-level transient NSWindow instead of
+            // silently omitting hover only because the final window differs
+            // from the base. activeMenuPresentation remains the authoritative
+            // exclusion for an already-running native AppKit menu tracker.
             MacWSInputRecord hoverRecord = record;
             hoverRecord.kind = MacWSInputKindHover;
             hoverRecord.pressure = 0.0f;

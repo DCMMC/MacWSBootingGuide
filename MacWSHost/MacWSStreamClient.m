@@ -225,7 +225,8 @@
             event, MACWS_STREAM_KEY_WINDOW_ID);
         uint64_t layerWindowID = xpc_dictionary_get_uint64(
             event, MACWS_STREAM_KEY_LAYER_WINDOW_ID);
-        if (self.mode != MacWSStreamModeWindow ||
+        if ((self.mode != MacWSStreamModeWindow &&
+             self.mode != MacWSStreamModeFullscreen) ||
             baseWindowID != self.windowID || layerWindowID == 0 ||
             layerWindowID > UINT32_MAX || layerWindowID == baseWindowID)
             return;
@@ -269,9 +270,14 @@
         [self releaseToken:descriptor.leaseToken];
         return;
     }
+    if (self.mode == MacWSStreamModeFullscreen && descriptor.windowID != 0) {
+        [self releaseToken:descriptor.leaseToken];
+        return;
+    }
     BOOL overlay = (descriptor.flags & MacWSStreamFrameOverlay) != 0;
-    if ((overlay && (self.mode != MacWSStreamModeWindow ||
-                     descriptor.layerWindowID == descriptor.windowID)) ||
+    if ((overlay && (self.mode != MacWSStreamModeWindow &&
+                     self.mode != MacWSStreamModeFullscreen)) ||
+        (overlay && descriptor.layerWindowID == descriptor.windowID) ||
         (!overlay && self.mode == MacWSStreamModeWindow &&
          descriptor.layerWindowID != descriptor.windowID)) {
         [self releaseToken:descriptor.leaseToken];

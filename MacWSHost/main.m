@@ -31,6 +31,14 @@
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
 
+// iPadOS 16.3.1 UIKitCore owns this flag on the real scene activation
+// options object. Keep the declaration narrow and feature-detect it at
+// runtime so a missing private selector can never turn into an unrecognised
+// selector crash on another OS build.
+@interface UISceneActivationRequestOptions (MacWSFullscreenRequest)
+- (void)_setRequestFullscreen:(BOOL)requestFullscreen;
+@end
+
 static NSString *const MacWSFramePath =
     @"/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static NSString *const MacWSCaptureAckPath =
@@ -517,6 +525,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)startScrollMomentumWithVelocity:(CGPoint)velocity
                              framePoint:(CGPoint)framePoint;
 - (void)stopScrollMomentumWithTerminalPhase:(BOOL)terminalPhase;
+- (uint32_t)currentFrameWidth;
+- (uint32_t)currentFrameHeight;
 @end
 
 @implementation MacWSMetalView {
@@ -592,6 +602,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGPoint _scrollMomentumFramePoint;
     CFTimeInterval _scrollMomentumLastTimestamp;
     BOOL _scrollMomentumBegan;
+    CGPoint _scrollPendingTranslation;
     BOOL _windowConfigurationDispatchPending;
     CGSize _pendingRequestedWindowSize;
     CGFloat _pendingRequestedDensityScale;
@@ -953,6 +964,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (BOOL)streamServiceConnected { return _streamClient.isConnected; }
 
 - (void)setTargetPID:(int32_t)targetPID {
+    if (_targetPID == targetPID) return;
     _targetPID = targetPID;
     [self refreshPresentationPolicy];
 }
@@ -1833,9 +1845,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [commandBuffer commit];
     if (directSurface) {
         [self publishStatus:[NSString stringWithFormat:
-            @"%u×%u  ·  DisplayStream #%llu  ·  IOSurface 直传",
-            presentedWidth, presentedHeight,
-            (unsigned long long)submittedFrame.descriptor.sequence]];
+            @"%u×%u  ·  DisplayStream  ·  IOSurface 直传",
+            presentedWidth, presentedHeight]];
     } else {
         _presentedCaptureGeneration = _pendingCaptureGeneration;
         _pendingCaptureGeneration = 0;
@@ -2309,6 +2320,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 MAX([self currentFrameWidth] - 1, 1u);
             CGFloat sourceY = _trackpadCursor.y /
                 MAX([self currentFrameHeight] - 1, 1u);
+            CGPoint previousViewportCenter = _viewportCenter;
             if (sourceX < CGRectGetMinX(_visibleSourceRect))
                 _viewportCenter.x -= CGRectGetMinX(_visibleSourceRect) - sourceX;
             else if (sourceX > CGRectGetMaxX(_visibleSourceRect))
@@ -2320,7 +2332,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             simd_float4 unusedVertices[4];
             [self updateContentRectAndVertices:unusedVertices];
             [self updatePointerVisibility];
-            [self setNeedsDisplay];
+            // The pointer is a native UIKit subview. At 1x, moving it must not
+            // re-present an unchanged multi-megabyte macOS IOSurface; redraw
+            // Metal only if a zoomed viewport was actually panned.
+            if (fabs(previousViewportCenter.x - _viewportCenter.x) > 0.00001 ||
+                fabs(previousViewportCenter.y - _viewportCenter.y) > 0.00001)
+                [self setNeedsDisplay];
         }
     }
     [super touchesMoved:touches withEvent:event];
@@ -2619,6 +2636,31 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // natural scrolling, whose UIKit translation is inverted at this bridge.
     CGFloat direction = self.inputMode == MacWSHostInputModeDirect ? 1.0 : -1.0;
     float horizontal = (float)(direction * translation.x * scaleX);
+    float vertical = (float)(direction * translation.y * scaleY);
+    BOOL began = (flags & MacWSInputFlagScrollBegan) != 0;
+    BOOL changed = (flags & MacWSInputFlagScrollChanged) != 0;
+    BOOL terminal = (flags & (MacWSInputFlagScrollEnded |
+                              MacWSInputFlagScrollCancelled)) != 0;
+    if (began) _scrollPendingTranslation = CGPointZero;
+    if (changed) {
+        horizontal += (float)_scrollPendingTranslation.x;
+        vertical += (float)_scrollPendingTranslation.y;
+        // UIKit may deliver sub-pixel deltas at display cadence. AppKit keeps
+        // those events distinct even when they round to no visible Terminal
+        // cell movement, causing avoidable layout/capture churn. Accumulate
+        // them losslessly and emit once either axis reaches a logical pixel.
+        if (fabsf(horizontal) < 1.0f && fabsf(vertical) < 1.0f) {
+            _scrollPendingTranslation = CGPointMake(horizontal, vertical);
+            return;
+        }
+        _scrollPendingTranslation = CGPointZero;
+    } else if (terminal &&
+               (_scrollPendingTranslation.x != 0.0 ||
+                _scrollPendingTranslation.y != 0.0)) {
+        horizontal += (float)_scrollPendingTranslation.x;
+        vertical += (float)_scrollPendingTranslation.y;
+        _scrollPendingTranslation = CGPointZero;
+    }
     uint32_t horizontalBits = 0;
     memcpy(&horizontalBits, &horizontal, sizeof(horizontalBits));
     MacWSInputRecord record = {
@@ -2629,7 +2671,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .timestamp = timestamp,
         .x = (float)framePoint.x,
         .y = (float)framePoint.y,
-        .pressure = (float)(direction * translation.y * scaleY),
+        .pressure = vertical,
         .contactID = horizontalBits,
         .frameWidth = [self currentFrameWidth],
         .frameHeight = [self currentFrameHeight],
@@ -3039,6 +3081,36 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
         MacWSLog(@"scene-activation failed: %@", error);
         if (failureHandler) failureHandler(error);
     }];
+}
+
+static BOOL MacWSRequestCurrentSceneFullscreen(
+        UIWindowScene *scene,
+        NSUserActivity *activity,
+        void (^failureHandler)(NSError *error)) {
+    if (!scene || !scene.session) return NO;
+    UISceneActivationRequestOptions *options =
+        [UISceneActivationRequestOptions new];
+    SEL fullscreenSelector = @selector(_setRequestFullscreen:);
+    if (![options respondsToSelector:fullscreenSelector]) {
+        MacWSLog(@"scene-fullscreen unsupported session=%@ selector=%@",
+                 scene.session.persistentIdentifier,
+                 NSStringFromSelector(fullscreenSelector));
+        return NO;
+    }
+    [options _setRequestFullscreen:YES];
+    MacWSLog(@"scene-fullscreen requested session=%@ current-bounds=%@",
+             scene.session.persistentIdentifier,
+             NSStringFromCGRect(scene.coordinateSpace.bounds));
+    [UIApplication.sharedApplication
+        requestSceneSessionActivation:scene.session
+        userActivity:activity
+        options:options
+        errorHandler:^(NSError *error) {
+            MacWSLog(@"scene-fullscreen failed session=%@ error=%@",
+                     scene.session.persistentIdentifier, error);
+            if (failureHandler) failureHandler(error);
+        }];
+    return YES;
 }
 
 static BOOL MacWSSendCloseWindow(uint32_t windowID, int32_t ownerPID,
@@ -4851,11 +4923,65 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)openFullscreenWorkspace {
-    MacWSRequestNewScene(self.view.window.windowScene, 0, 0, 0,
-                         CGSizeZero, NO,
-                         @"MacWS Workspace", ^(NSError *error) {
-        [self setNotice:error.localizedDescription success:NO];
-    });
+    // Fullscreen is a presentation mode of the current Scene. The previous
+    // implementation requested a second Scene session, so the button could
+    // never make the window the user was operating become the workspace.
+    // First activate the exact native window while its ID/PID mapping is still
+    // authoritative, then detach this Scene from that identity and subscribe
+    // it to the complete desktop producer.
+    BOOL activatedExactWindow = _windowID != 0 && _windowOwnerPID > 1;
+    if (activatedExactWindow) {
+        MacWSInputRecord activation = {
+            .magic = MACWS_INPUT_MAGIC,
+            .version = MACWS_INPUT_VERSION,
+            .kind = MacWSInputKindActivateTarget,
+            .sceneID = MacWSInputSceneForWindow(_windowID, 0),
+            .timestamp = CACurrentMediaTime(),
+            .x = (float)([_metalView currentFrameWidth] * 0.5),
+            .y = (float)([_metalView currentFrameHeight] * 0.5),
+            .frameWidth = [_metalView currentFrameWidth],
+            .frameHeight = [_metalView currentFrameHeight],
+            .targetPID = _windowOwnerPID,
+            .source = MacWSInputSourceUnknown,
+        };
+        [self metalView:_metalView emittedInput:activation];
+    }
+    [_metalView suspendStream];
+    _streamMode = MacWSStreamModeFullscreen;
+    _windowID = 0;
+    _windowOwnerPID = 0;
+    _windowGroupID = 0;
+    _windowMinimumSize = CGSizeZero;
+    _windowResizable = NO;
+    _targetWindowObservedInCatalog = NO;
+    _targetWindowMissingCheckPending = NO;
+    _sceneDestructionRequested = NO;
+    _targetWindowMissingSerial++;
+    _bootstrapTerminalPending = NO;
+    _metalView.targetPID = 0;
+    _metalView.minimumLogicalSize = CGSizeZero;
+    _metalView.targetWindowResizable = NO;
+    self.view.window.windowScene.title = @"MacWS Workspace";
+    [_metalView configureStreamMode:_streamMode windowID:0];
+    [_metalView requestStreamWindowList];
+    MacWSRememberSceneBinding(self.view.window.windowScene.session,
+                              [self streamRestorationActivity]);
+    BOOL requestedSystemFullscreen = MacWSRequestCurrentSceneFullscreen(
+        self.view.window.windowScene, [self streamRestorationActivity],
+        ^(NSError *error) {
+            [self setNotice:[NSString stringWithFormat:
+                @"完整 macOS 桌面已经打开，但 iPadOS 无法最大化当前窗口：%@",
+                error.localizedDescription ?: @"未知错误"] success:NO];
+        });
+    [self hideControls];
+    [self refreshStatus];
+    [self setNotice:requestedSystemFullscreen
+        ? @"正在将当前 iPadOS 窗口最大化并显示完整 macOS 工作区"
+        : @"已显示完整 macOS 工作区；当前 iPadOS 版本没有可用的最大化请求"
+             success:requestedSystemFullscreen];
+    MacWSLog(@"scene-reused mode=fullscreen previous-window-activated=%@ system-fullscreen-requested=%@",
+             activatedExactWindow ? @"YES" : @"NO",
+             requestedSystemFullscreen ? @"YES" : @"NO");
 }
 
 - (void)refreshStatus {

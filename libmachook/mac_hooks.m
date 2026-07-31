@@ -2760,13 +2760,19 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // - HIServices.framework → com.apple.hiservices-xpcservice.xpc (NEW: AppKit's
         //   client-aux endpoint; previously: "Connection Invalid for
         //   com.apple.hiservices-xpcservice")
+        // - AppKit.framework → com.apple.appkit.xpc.openAndSavePanelService.xpc.
+        //   Runtime evidence from VSCode showed Electron leaving one file-open
+        //   dialog permanently in-flight while the service bundle exists under
+        //   AppKit/XPCServices. Register its owning framework through the same
+        //   real bootstrap path instead of replacing NSOpenPanel behavior.
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
         // Framework binary path uses TLD symlink form (matches Metal pattern)
         xpc_dictionary_set_uint64(dict, "/System/Library/PrivateFrameworks/ViewBridge.framework/ViewBridge", 2);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/HIServices", 2);
+        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/AppKit.framework/AppKit", 2);
         void(*_xpc_bootstrap_services_fn)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
-        fprintf(stderr, "#### XPC_BOOTSTRAP: fn=%p dict=%p (registering Metal/ViewBridge/HIServices)\n",
+        fprintf(stderr, "#### XPC_BOOTSTRAP: fn=%p dict=%p (registering Metal/ViewBridge/HIServices/AppKit)\n",
             _xpc_bootstrap_services_fn, dict);
         if (_xpc_bootstrap_services_fn) {
             _xpc_bootstrap_services_fn(dict);

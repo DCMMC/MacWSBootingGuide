@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-07-31；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入和 Carbon 右键菜单选择已在目标 iPad 运行确认，四窗、全屏直传与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-01；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入和 Carbon 右键菜单选择已在目标 iPad 运行确认。完整桌面已实现为 Retina 底层 IOSurface + 可见 SkyLight 窗口分层直传；当前 Scene 的 iPadOS 系统最大化已接入目标 UIKitCore 的真实 activation-options 请求。二者设备运行回归尚受 58% 内存安全护栏及随后网络不可达阻止；四窗与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -16,8 +16,8 @@
 
 | 核心工作 | 非常简要的工作原理 | 当前状态 |
 |---|---|---|
-| DisplayStream 直传 | SkyLight/CGDisplayStream 产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture | 精确基础窗和同 owner 瞬态层已在 iPad runtime-confirmed；全屏直传待修复 |
-| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放 | 单窗、四标签身份跟随、重复 Scene 去重和进程复用已实现；关闭 Scene 的真实窗口关闭待设备回归 |
+| DisplayStream 直传 | SkyLight 窗口流产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture；完整桌面按真实窗口目录分层合成 | 精确基础窗和同 owner 瞬态层已在 iPad runtime-confirmed；完整桌面 producer/consumer 已实现并通过编译，设备回归待完成 |
+| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放；进入工作区时复用当前 session 并请求系统 fullscreen activation | 单窗、四标签身份跟随、重复 Scene 去重和进程复用已实现；当前 Scene 内容切换与系统最大化请求已实现，最大化结果及关闭 Scene 的真实窗口关闭待设备回归 |
 | 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | RE-confirmed；设备已记录宽 109/高 36 个候选及多种 Scene geometry，物理拖动手感待复测 |
 | 比例稳定显示 | 1× 始终完整等比；重排交接期允许短暂边距，不拉伸、不裁边 | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
@@ -41,7 +41,7 @@ macOS 应用进程
              ▼
 macwsdisplayd（macOS 13.4 chroot）
   ├─ 窗口目录：CGWindowID + owner PID + logical group + AppKit 最小尺寸
-  ├─ 全屏：CGDisplayStream
+  ├─ 全屏：Retina IOSurface 底层 + 完整 on-screen SkyLight 窗口目录
   └─ 单窗：精确基础窗口 + 同 owner 菜单/弹窗/Sheet 各自的
            SLSHWCaptureStreamCreateWithWindow
              │ IOSurface Mach right + 帧描述符；无 RFB 编解码
@@ -504,6 +504,7 @@ NSMainMenu
 - RE-confirmed via `-[SBSwitcherChamoisSettings layoutAttributesForContainerBounds:…]` `0x1c7bd2448`：生成的宽高数组分别在 `0x1c7bd2cb8` / `0x1c7bd2cc4` 通过上述 setter 写入 layout attributes。
 - RE-confirmed via `-[SBSwitcherChamoisSettings _nearestGridSizeForSize:gridWidths:gridHeights:bounds:]` `0x1c7bd311c`：函数分别对两个数组执行 `count → objectAtIndex: → doubleValue`，用 `fabd` 计算候选值与请求宽/高的绝对差，并保留差值最小的候选。这证明数组内容参与真实 Stage Manager 尺寸量化，而不是只影响窗口装饰或截图比例。
 - RE-confirmed 的能力是“任意提供一组合法候选值并由系统吸附到最近值”。TrollPad 实际提供 20 point 密集离散网格；每 1 point 连续档位、低于系统/应用安全下限以及最终 Scene geometry 提交仍未 runtime-confirmed。
+- RE-confirmed via 目标 20D67 `UIKitCore:0x18a166598-0x18a1665a4`：`UISceneActivationRequestOptions` 的 `_requestFullscreen` / `_setRequestFullscreen:` 直接读取和写入 offset `0x9` 的 boolean；同一二进制的 `UIApplication requestSceneSessionActivation:...` 在 `0x189de13a8-0x189de13b0` 把 activation options 与 target session 交给 `initialClientSettings:activationOptions:targetSession:`。因此工作区按钮使用当前 session + 真实 fullscreen activation flag，而不是新建 Scene 或拉伸现有 layer；系统是否接受已 active session 的请求仍待 runtime-confirmed。
 
 因此当前把密集尺寸档位列为高可行性、RE-confirmed 工作项，同时保留设备运行门槛：记录原始数组、证明 hook 命中、证明 `UIWindowScene.bounds` 采用新增档位，并完成 safe area、输入坐标、键盘、拖放和四窗稳定性回归。TrollPad 的 150 point 下限不能提升为 MacWS 的已证实安全不变量。
 
@@ -530,7 +531,8 @@ NSMainMenu
 
 仍待确认或修复：
 
-- 全屏 `CGDisplayStream` 当前能成功 start，但本次订阅没有发布帧；生产 Host 不再用 mmap 静默掩盖这个缺口。
+- 全屏 `CGDisplayStream` 当前能成功 start 但没有发布帧；新实现改用 Retina canvas + 完整 on-screen SkyLight 窗口分层直传，设备首帧、z-order、菜单栏/Dock、动态窗口和内存上界仍待 runtime-confirmed。生产 Host 不再用 mmap 静默掩盖这个缺口。
+- 当前 session 的 `_requestFullscreen=YES` 是否被 iPadOS 16.3.1 接受并产生真实最大化 geometry；必须同时记录请求日志、Scene bounds 变化和系统拒绝错误，不能用内容铺满当前小 Scene 代替。
 - 四个前台 Scene 在台前调度下持续稳定。
 - 用手指连续拖过密集档位，逐档确认 `UIWindowScene.bounds`、drawable、AppKit frame 和输入坐标一致；已有运行 witness 只证明新增候选和多种 Scene geometry 已出现，不能替代该交互回归。
 - 验证密集档位的系统级影响和 Scene 隔离；当前 setter hook 仍改变全局候选数组，非 MacWS 应用不得因此出现布局、safe area、键盘、拖放或触摸命中回归。
