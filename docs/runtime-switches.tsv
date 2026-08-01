@@ -116,7 +116,7 @@ flag	/tmp/macws_kcmd_field_5e3_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_field_6bc_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_field_a4_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_fix	on	WindowServer	Required direct native-AGX command ABI adapter.
-flag	/tmp/macws_kcmd_wrapped_fix	on	WindowServer	Required validated wrapped command ABI adapter, including runtime-confirmed cold generation 0 and warm generations 2 through 4.
+flag	/tmp/macws_kcmd_wrapped_fix	on	WindowServer	Required validated wrapped command ABI adapter; generations 0 through 4 are runtime-confirmed, with generation 1 first captured by VSCode video on 2026-08-01.
 flag	/tmp/macws_observe_pf550	off	diagnostic	Compressed display submission observer.
 flag	/tmp/macws_owned_no_read	off	A/B control	Disables owned scanout read.
 flag	/tmp/macws_owned_scanout	on	WindowServer/VNC	Process-owned linear BGRA scanout transport.

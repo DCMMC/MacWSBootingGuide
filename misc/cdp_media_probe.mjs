@@ -128,7 +128,13 @@ const targets = await (await fetch(`${endpoint}/json/list`)).json();
 const page = targets.find((target) => target.type === "page" &&
   /^https?:/.test(target.url) && target.webSocketDebuggerUrl) ||
   targets.find((target) => target.type === "page" &&
-    !/^vscode-file:/.test(target.url) && target.webSocketDebuggerUrl);
+    !/^vscode-file:/.test(target.url) && target.webSocketDebuggerUrl) ||
+  // A fresh isolated benchmark profile initially exposes only the VS Code
+  // workbench renderer.  When the caller explicitly requested navigation it
+  // is safe to reuse that target; Page.navigate replaces only this disposable
+  // profile's renderer.  Never do this for an observe-only probe.
+  (args.url ? targets.find((target) => target.type === "page" &&
+    target.webSocketDebuggerUrl) : null);
 if (!page) throw new Error("no Simple Browser page CDP target");
 const socketURL = page.webSocketDebuggerUrl.replace(
   /ws:\/\/127\.0\.0\.1:\d+/, `ws://${args.host}:${args.port}`);

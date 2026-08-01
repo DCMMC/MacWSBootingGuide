@@ -455,9 +455,10 @@ def main() -> None:
         # on 2026-07-30: generation 4 retains the same trailing-wrapper list
         # framing and carries the range [0x210,0x228).  The first mapped submit
         # from an empty post-reboot profile uses the same framing with both
-        # generation fields zero and range [0x840,0x870).  Generation 1 has
-        # not been observed and remains rejected.
-        if list_generation not in (0, 2, 3, 4):
+        # generation fields zero and range [0x840,0x870).  VSCode video GPU
+        # serials 2 and 3 on 2026-08-01 supplied the missing generation-1
+        # witnesses with the same framing and exact outer/tail equality.
+        if list_generation not in (0, 1, 2, 3, 4):
             raise ValueError(
                 f"unobserved trailing-wrapper list generation {list_generation}"
             )

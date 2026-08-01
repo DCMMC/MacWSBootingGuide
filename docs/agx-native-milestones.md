@@ -2188,6 +2188,22 @@ The bounded CDP samples and the exact two-plane texture log excerpt are in
 post-fix correct-color screenshot is still required before declaring Bilibili
 or the first seconds of Apple's product animation fixed.
 
+A subsequent bounded production run captured the previously missing AGX
+trailing-wrapper generation 1. The command matched to GPU error `0x102` had a
+`0x870`-byte KCMD, `0x148`-byte list, subtype-1 range `0..0x840`, two type-3
+records over `0x840..0x870`, and opcode `0x9b03`; the next command carried the
+same generation/framing with one record over `0x840..0x858`. The translator
+had deliberately rejected unobserved generation 1, so both submissions
+reported `fixed=0`. Generations 0 through 4 now all have runtime witnesses and
+the exact adapter admits that bounded family while keeping every framing,
+range and opcode anchor. After installing it, Bilibili advanced from 4.005 to
+20.244 seconds and from 124 to 611 frames in a 15-second probe, with three
+dropped frames and no additional drops. This removes a real freeze path but
+does not fix the still-visible green/magenta output. The same run exposed a
+complex Chromium Skia library-target rejection; standalone Metal source
+compilation continued to succeed. Full hashes, decoded records and the
+acceptance boundary are recorded in the evidence README above.
+
 The on-device FAST installer had a separate cold-start invariant violation:
 it produced valid twice-signed thin libraries, then signed them again once
 while trustcaching the copy, recreating the known ldid/lipo invalid-page

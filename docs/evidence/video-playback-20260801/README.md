@@ -46,9 +46,71 @@ field offsets differ.
 
 ## Validation boundary
 
-The fix compiled, packaged and installed successfully. WindowServer remains
-stopped after the system memory reset, so no post-fix screenshot is claimed
-here. Bilibili correct-color playback and the first seconds of Apple's product
-animation remain runtime acceptance tests. The Apple symptom is a THEORY in
-the same IOSurface/NV12 metadata family until a post-fix frame capture proves
-or disproves it.
+The plane fix compiled, packaged and installed successfully. A later bounded
+production run did obtain post-fix screenshots, but they still show severe
+green/magenta colour mapping. Consequently the earlier plane-field mismatch
+was real, but it was not the only presentation fault. Bilibili correct-colour
+playback and the first seconds of Apple's product animation remain runtime
+acceptance tests. The Apple symptom is a THEORY in the same
+IOSurface/NV12/compiler-target family until a post-fix frame capture proves or
+disproves it.
+
+## Generation-1 command wrapper follow-up
+
+The first bounded run after Safari's compiler-service isolation produced an
+IOGPU error archive for Code Helper GPU PID 86614. Its manifest matched error
+`0x102` to serial 2 and recorded:
+
+```text
+serial=1 fixed=1 commands=2080 segments=304
+serial=2 fixed=0 commands=2160 segments=328 matched=YES
+serial=3 fixed=0 commands=2136 segments=328
+```
+
+The archived serials have the following SHA-256 witnesses:
+
+```text
+serial 2 KCMD     c34d36f1026f945224bd266ce67eff689878bdcdbcb4925afb2df710d99b1f43
+serial 2 segments 83b185979a96adebe2de007a53827c93962e7ce4f10aea6cf0a84280cb221d76
+serial 3 KCMD     ba26f85576b4b1220552a3e3dd1f676d57560740b1e1f57fc94ca35f4df9f3eb
+serial 3 segments 640ae8d1b1b0e0f1c0e7200a27300742c099bd835034d2c2f16fb98b54dc410f
+```
+
+`parse_agx_segment_list.py` runtime-decodes both records as trailing-wrapper
+generation 1, with equal outer/tail generation fields, exact subtype-1
+payload range `0x0..0x840`, and type-3 opcode `0x9b03`. Serial 2 carries two
+wrapper records over `0x840..0x870`; serial 3 carries one over
+`0x840..0x858`. Generations 0 and 2 through 4 already had independent runtime
+witnesses, so the translator now admits the bounded, fully observed family
+0 through 4 while retaining every structural/range/opcode validation. This is
+an upstream ABI adaptation, not a return-value or error-check bypass.
+
+The updated library was built on-device with the project's FAST_FORCE path,
+installed without reboot/respring, and passed the chroot smoke test. In the
+next 15-second Bilibili probe, decode/presentation counters advanced as
+follows:
+
+```text
+sample 0:  currentTime=4.005  totalVideoFrames=124 dropped=3
+sample 15: currentTime=12.088 totalVideoFrames=366 dropped=3
+sample 30: currentTime=20.244 totalVideoFrames=611 dropped=3
+```
+
+All samples had `readyState=4`, `paused=false`, `error=null`, and
+`corruptedVideoFrames=0`. This runtime-confirms that the generation-1 miss was
+a real freeze/completion blocker. It does not validate colour correctness.
+
+The same run also logged a separate Skia shader failure:
+
+```text
+Internal error while linking shader. MSL compilation error:
+This library format is not supported on this platform (or was built with an old version of the tools).
+```
+
+A standalone source-library probe still returned real `_MTLLibrary` and
+`_MTLFunctionInternal` objects, so the compiler bridge is not globally dead.
+The failure is currently isolated to the complex Chromium worker/library
+path. Reintroducing the former global target-OS or renamer NOPs is explicitly
+not an acceptable fix: they caused Safari's native compiler service to fail
+and violate the request-scope invariant. The next fix must establish the
+correct target/runtime module upstream and remain request-scoped.

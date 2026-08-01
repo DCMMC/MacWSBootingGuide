@@ -11935,11 +11935,14 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
         // reboot captured the identical structure with generation 0, opcode
         // 0x9903 and two type-3 records: fast-ring serial 2 had fixed=0 and
         // then returned 0x102.  The outer/tail generation equality, exact
-        // ranges and every other wrapper anchor still match.  Admit the two
-        // runtime-observed generation families only; generation 1 remains
-        // unobserved and rejected.
-        (list_generation == 0 ||
-         (list_generation >= 2 && list_generation <= 4)) &&
+        // ranges and every other wrapper anchor still match.  A bounded
+        // VSCode video reproduction on 2026-08-01 then captured generation 1
+        // in both the outer and trailing records with the same exact framing:
+        // serial 2 used KCMD 0x870/list 0x148/opcode 0x9b03 and serial 3 used
+        // KCMD 0x858/list 0x148/opcode 0x9b03.  The former was the command
+        // buffer matched to error 0x102.  All generations 0 through 4 are now
+        // runtime-observed; keep the upper bound and every structural anchor.
+        list_generation <= 4 &&
         *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
         *(uint32_t *)(wrapper_list + 0x08) == 1 &&
         *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
@@ -12335,9 +12338,11 @@ static unsigned macws_translate_agx_segment_list_records(
             // subtype-1 segments and one type-3 opcode 0x9b03 wrapper
             // (KCMD 0x1098, list 0x2a8, range 0x1080..0x1098, fixed=0,
             // completion 0x102).  Keep the outer/tail equality and exact
-            // ranges; admit only observed 0 and 2..4, not generation 1.
-            (list_generation == 0 ||
-             (list_generation >= 2 && list_generation <= 4)) &&
+            // ranges.  The 2026-08-01 VSCode video reproduction added the
+            // missing generation-1 witness (outer/tail equal, exact one- and
+            // two-wrapper ranges, opcode 0x9b03).  Admit the now-observed
+            // bounded generation family 0..4, not arbitrary values.
+            list_generation <= 4 &&
             *(uint32_t *)(wrapper_list + 0x04) == list_generation &&
             *(uint32_t *)(wrapper_list + 0x08) == 1 &&
             *(uint32_t *)(wrapper_list + 0x0c) == 0xc0000001 &&
