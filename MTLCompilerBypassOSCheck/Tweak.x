@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -128,6 +129,11 @@ static void MTLPatchLog(const char *fmt, ...) {
     syslog(LOG_NOTICE, "%s", buf + hdr);
     fprintf(stderr, "#### MTLBypass %s\n", buf + hdr);
     fflush(stderr);
+    // File witnesses are diagnostic-only.  Trying four sandbox-denied paths
+    // for every stock iOS compiler instance polluted the kernel log and added
+    // filesystem work to Safari's shader hot path.
+    if (access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics", F_OK) != 0)
+        return;
     // Try several paths until one is writable from the sandbox.
     static const char *paths[] = {
         "/var/mobile/Library/Logs/mtl_compiler_patch.log",
@@ -170,8 +176,20 @@ static const char *kMetalCacheRoot =
     "/var/jb/var/mobile/Library/Caches/macws-metalfe";
 static const char *kMetalCacheMarker = "/com.apple.metalfe/";
 
+// MTLCompilerService is shared by stock iOS clients as well as the chroot.
+// The exact source-build call sites below are therefore the isolation
+// boundary: only a request carrying both chroot-only compiler arguments may
+// activate MacWS filesystem translation.  A write lock makes that scope
+// exclusive, while ordinary native requests retain concurrent read access and
+// can never inherit the MacWS cache namespace.
+static pthread_rwlock_t gMetalBuildRequestLock = PTHREAD_RWLOCK_INITIALIZER;
+static _Atomic bool gMacWSMetalBuildRequestActive = false;
+static bool gMetalCacheAdapterInstalled = false;
+
 static bool TranslateMetalCachePath(const char *path,
                                     char translated[PATH_MAX]) {
+    if (!atomic_load_explicit(&gMacWSMetalBuildRequestActive,
+                              memory_order_acquire)) return false;
     if (!path || strncmp(path, "/var/folders/zz/", 16) != 0) return false;
     const char *marker = strstr(path, kMetalCacheMarker);
     if (!marker) return false;
@@ -443,19 +461,6 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     static const char targetArgument[] = "-active-platform=macos";
     static _Atomic uint32_t requestSequence = 0;
     uint32_t sequence = atomic_fetch_add(&requestSequence, 1) + 1;
-    if (sequence <= 256) {
-        uint8_t head[16] = {0};
-        size_t headLength = requestSize < sizeof(head)
-            ? requestSize : sizeof(head);
-        if (request && headLength) memcpy(head, request, headLength);
-        MTLPatchLog("target adapter entry #%u requestType=%#llx total=%zu request=%p head=%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x",
-                    sequence, (unsigned long long)a2, requestSize, request,
-                    head[0], head[1], head[2], head[3],
-                    head[4], head[5], head[6], head[7],
-                    head[8], head[9], head[10], head[11],
-                    head[12], head[13], head[14], head[15]);
-    }
-
     bool adapted = false;
     if (request && requestSize >= 16 && a2 == 0xd) {
         // Chromium's MSL requests use two closely related serializations.
@@ -517,22 +522,46 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
             long long layoutDelta = expectedSize <= LLONG_MAX
                 ? (long long)expectedSize - (long long)requestSize
                 : LLONG_MAX;
-            MTLPatchLog("target adapter request=%p total=%zu source=%llu sourceHash=%016llx args=%llu layoutDelta=%lld workingOffset=%lld cacheOffset=%lld adapted=%d",
-                        request, requestSize,
-                        (unsigned long long)sourceLength,
-                        (unsigned long long)sourceHash,
-                        (unsigned long long)argumentLength, layoutDelta,
-                        workingOffset == (size_t)-1 ? -1LL
-                            : (long long)workingOffset,
-                        cacheOffset == (size_t)-1 ? -1LL
-                            : (long long)cacheOffset,
-                        adapted);
+            if (adapted ||
+                access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics",
+                       F_OK) == 0) {
+                MTLPatchLog("target adapter #%u request=%p total=%zu source=%llu sourceHash=%016llx args=%llu layoutDelta=%lld workingOffset=%lld cacheOffset=%lld adapted=%d",
+                            sequence, request, requestSize,
+                            (unsigned long long)sourceLength,
+                            (unsigned long long)sourceHash,
+                            (unsigned long long)argumentLength, layoutDelta,
+                            workingOffset == (size_t)-1 ? -1LL
+                                : (long long)workingOffset,
+                            cacheOffset == (size_t)-1 ? -1LL
+                                : (long long)cacheOffset,
+                            adapted);
+            }
         }
     }
-    return OrigMTLCodeGenServiceBuildRequest
-        ? OrigMTLCodeGenServiceBuildRequest(a0, a1, a2, request,
-                                            requestSize, a5)
-        : (uintptr_t)-1;
+
+    if (!OrigMTLCodeGenServiceBuildRequest) return (uintptr_t)-1;
+
+    if (adapted)
+        pthread_rwlock_wrlock(&gMetalBuildRequestLock);
+    else
+        pthread_rwlock_rdlock(&gMetalBuildRequestLock);
+    // Do not interpose libc in a stock iOS compiler process at all.  The old
+    // ctor-time install made Safari's MTLCompilerService execute our
+    // MetalCacheUnlinkAt wrapper and runtime-confirmed stack-canary failures
+    // followed.  A MacWS source request is the first legitimate point at
+    // which this process needs the chroot cache namespace.
+    if (adapted && !gMetalCacheAdapterInstalled) {
+        InstallMetalCachePathAdapter();
+        gMetalCacheAdapterInstalled = true;
+    }
+    atomic_store_explicit(&gMacWSMetalBuildRequestActive, adapted,
+                          memory_order_release);
+    uintptr_t result = OrigMTLCodeGenServiceBuildRequest(
+        a0, a1, a2, request, requestSize, a5);
+    atomic_store_explicit(&gMacWSMetalBuildRequestActive, false,
+                          memory_order_release);
+    pthread_rwlock_unlock(&gMetalBuildRequestLock);
+    return result;
 }
 
 static void InstallMacOSMetalTargetAdapter(void) {
@@ -623,23 +652,27 @@ static void InstallMacOSMetalTargetAdapter(void) {
                     OrigMTLCodeGenServiceBuildRequest);
     }
 
-    uint32_t *replyDataSite = (uint32_t *)((uintptr_t)mh + 0x2770);
-    const uint32_t expectedReplyCall = 0x9400047c; // bl _xpc_data_create stub
-    uintptr_t replyTarget = StripPAC((const void *)MacWSCompilerReplyDataCreate);
-    intptr_t replyDelta = (intptr_t)replyTarget - (intptr_t)replyDataSite;
-    if (*replyDataSite != expectedReplyCall || (replyDelta & 3) != 0 ||
-        replyDelta < -(1LL << 27) || replyDelta >= (1LL << 27)) {
-        MTLPatchLog("compiler reply observer validation failed site=%p insn=%#x target=%#lx delta=%#lx",
-                    replyDataSite, *replyDataSite,
-                    (unsigned long)replyTarget, (unsigned long)replyDelta);
-        return;
+    // Reply dumping is a bounded diagnostic witness, not runtime machinery.
+    // Never patch the stock iOS reply path in production.
+    if (access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics", F_OK) == 0) {
+        uint32_t *replyDataSite = (uint32_t *)((uintptr_t)mh + 0x2770);
+        const uint32_t expectedReplyCall = 0x9400047c; // bl _xpc_data_create stub
+        uintptr_t replyTarget = StripPAC((const void *)MacWSCompilerReplyDataCreate);
+        intptr_t replyDelta = (intptr_t)replyTarget - (intptr_t)replyDataSite;
+        if (*replyDataSite != expectedReplyCall || (replyDelta & 3) != 0 ||
+            replyDelta < -(1LL << 27) || replyDelta >= (1LL << 27)) {
+            MTLPatchLog("compiler reply observer validation failed site=%p insn=%#x target=%#lx delta=%#lx",
+                        replyDataSite, *replyDataSite,
+                        (unsigned long)replyTarget, (unsigned long)replyDelta);
+            return;
+        }
+        uint32_t replyBranch = 0x94000000u |
+            ((uint32_t)((uint64_t)(replyDelta >> 2) & 0x03ffffffu));
+        PatchInstruction(replyDataSite, replyBranch);
+        MTLPatchLog("compiler reply observer installed site=%p old=%#x new=%#x wrapper=%#lx",
+                    replyDataSite, expectedReplyCall, *replyDataSite,
+                    (unsigned long)replyTarget);
     }
-    uint32_t replyBranch = 0x94000000u |
-        ((uint32_t)((uint64_t)(replyDelta >> 2) & 0x03ffffffu));
-    PatchInstruction(replyDataSite, replyBranch);
-    MTLPatchLog("compiler reply observer installed site=%p old=%#x new=%#x wrapper=%#lx",
-                replyDataSite, expectedReplyCall, *replyDataSite,
-                (unsigned long)replyTarget);
 }
 
 // Strip arm64e PAC bits from a pointer. dlsym/MSFindSymbol on arm64e
@@ -869,70 +902,11 @@ static void PatchAGXVerifyLoweredIR(void) {
 }
 
 %ctor {
-    InstallMetalCachePathAdapter();
-    // NSLog(@"#### debugbydcmmc MTLCompilerBypassOSCheck start");
+    // Load the exported build entry point used by the exact request adapter.
+    // Do not alter MTLCompiler or AGXCompilerCore globally: this executable is
+    // also the compiler service for Safari, WebKit, SpringBoard, and other
+    // native iOS clients.
     dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler", RTLD_GLOBAL);
-    MSImageRef image = MSGetImageByName("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler");
-    if (image) {
-    uint32_t *symbol = MSFindSymbol(image, "__ZN17MTLCompilerObject27readModuleFromBinaryRequestERK20ReadModuleParametersRN4llvm11LLVMContextEP15MTLFunctionTypePPvPmb");
-    if (symbol) {
-    MTLPatchLog("readModuleFromBinaryRequest symbol=%p stripped=%#lx",
-                symbol, (unsigned long)StripPAC(symbol));
-
-    // The OS check is the triplet:
-    //   0xb94087e8  ldr w8, [sp, #0x84]
-    //   0x71001d1f  cmp w8, #0x7              (iOS platform enum)
-    //   0x540003a1  b.ne <error path: "Target OS is incompatible.">
-    // The PREVIOUS implementation walked the function looking for the first
-    // ldr-w8 and asserted on the next cmp, which was brittle: if MSFindSymbol
-    // returned a slightly different address or the function's preamble was
-    // shifted on a newer iOS DSC, the walk could either go off the end of
-    // the dylib's __TEXT (SEGV) or land on a false match. Now we verify all
-    // three instructions and cap the scan window so a miss is silent rather
-    // than fatal.
-    const uint32_t SIG_LDR  = 0xb94087e8u;
-    const uint32_t SIG_CMP  = 0x71001d1fu;
-    const uint32_t SIG_BNE  = 0x540003a1u;
-    const int MAX_WALK_INSNS = 4096;  // bounds the scan to ~16KB of __text
-    int hit = 0;
-    for (int i = 0; i < MAX_WALK_INSNS; i++) {
-        if (symbol[i]   == SIG_LDR &&
-            symbol[i+1] == SIG_CMP &&
-            symbol[i+2] == SIG_BNE) {
-            PatchInstruction(&symbol[i + 2], 0xd503201f); // nop the b.ne
-            MTLPatchLog("readModule OS check exact hit index=%d branch=%p "
-                        "ldr=%#x cmp=%#x oldBranch=%#x newBranch=%#x",
-                        i, &symbol[i + 2], symbol[i], symbol[i + 1],
-                        SIG_BNE, symbol[i + 2]);
-            hit = 1;
-            break;
-        }
-    }
-    if (!hit) {
-        // Fallback: try the older partial-match where b.ne could be a
-        // different conditional but cmp w8 #0x7 is still the marker.
-        for (int i = 0; i < MAX_WALK_INSNS; i++) {
-            if (symbol[i]   == SIG_LDR &&
-                symbol[i+1] == SIG_CMP &&
-                ((symbol[i+2] & 0xff00001fu) == 0x54000001u)) {
-                PatchInstruction(&symbol[i + 2], 0xd503201f);
-                MTLPatchLog("readModule OS check fallback hit index=%d "
-                            "branch=%p ldr=%#x cmp=%#x newBranch=%#x",
-                            i, &symbol[i + 2], symbol[i], symbol[i + 1],
-                            symbol[i + 2]);
-                hit = 1;
-                break;
-            }
-        }
-    }
-
-    if (!hit) {
-        MTLPatchLog("readModule OS check signature NOT found in 16KB");
-    }
-
-    } // if (symbol)
-    } // if (image)
-
     InstallMacOSMetalTargetAdapter();
 
     // Originally tried: PatchAGXVerifyLoweredIR() — bypass the
@@ -941,60 +915,15 @@ static void PatchAGXVerifyLoweredIR(void) {
     // crash into libLLVM (NULL Function metadata at offset 0x30 in
     // codegen) — see commit message. Kept for reference only.
     (void)PatchAGXVerifyLoweredIR;
-    // Actual fix: disable the rename inside AGCLLVMUserObject::
-    // linkMetalRuntime that produces `agx.air.fract.v3f16.fast` from
-    // an existing `air.fract.v3f16`. The dispatcher
-    // AGCLLVMAirBuiltins::replaceBuiltins requires the function name
-    // to start with "air." (it calls findPrefix(name, "air.", 4) and
-    // bails if the prefix doesn't match), so the renamer's "agx."
-    // prepend hides the function from the dispatcher and leaves it
-    // unlowered. If we skip the prepend, the result is
-    // `air.fract.v3f16.fast` — still starts with "air.", findPrefix
-    // splits at the first '.' after the prefix so the dispatcher
-    // gets out1="fract" and looks up buildFract, which reads the
-    // actual operand type (half3) from the LLVM Value and emits the
-    // valid `x - floor(x)` lowering. No more unlowered call → no
-    // verifier complaint → no abort.
-    //
-    // Opt-in: set MTLCOMPILER_PATCH_RENAMER=1 in the LaunchAgent
-    // environment to enable. Disabled by default until we can
-    // confirm it doesn't regress WindowServer startup (current
-    // observation: when enabled, WindowServer dies before reaching
-    // pipeline build, suggesting the patched MTLCompilerService is
-    // returning compiled binaries that fail differently — possible
-    // ordering issue, possible findPrefix split mismatch we haven't
-    // RE'd yet).
-    // Opt-in via env (set MTLCOMPILER_PATCH_RENAMER=1 in MTLCompilerService's
-    // launchd environment to enable). Verified-correct patch site by static RE
-    // — anchor `_AIRNTGetVersion` minus delta `-0x1259a4` lands on `bl
-    // std::string::insert(0, "agx.")` in
-    // `AGCLLVMUserObject::linkMetalRuntime`. Empirically, however, enabling
-    // the patch on this iOS-16.3 build did NOT prevent the
-    // `agx.air.fract.v3f16.fast` abort — same payload still fires. Two
-    // most likely explanations to investigate next:
-    //   (a) Substrate's MTLCompilerService filter on this Dopamine install
-    //       is loading the tweak too late (after AGCLLVMUserObject has
-    //       already cached the renamed Function declarations from a prior
-    //       MetalRuntime warm-up). lldb verification was inconclusive
-    //       because the per-request MTLCompilerService spawn lifetime is
-    //       too short to attach without altering timing.
-    //   (b) the iOS-16.3 AGXCompilerCore has a SECOND `agx.` prepend
-    //       path I haven't located yet. Only one `"agx."` literal xref
-    //       exists in the iOS binary (chroot has 5, four of which are in
-    //       raytracing accessors), and we patched the matching one, so
-    //       this would have to be a Twine concatenation that doesn't
-    //       reuse the standalone literal — feasible if the renamer
-    //       constructs `Twine("agx.air.") + …` directly off the longer
-    //       agx.air.indirect literal at iOS 0x199a891 (sliding 8 chars
-    //       earlier into "agx.air." would give a usable prefix).
-    // Always run the renamer patch — no env gate. XPC services don't
-    // inherit env vars from the WS launchd plist and modifying the
-    // service's own Info.plist would require re-signing the bundle.
-    // The patch is signature-validated (only fires when both the ADD
-    // x2,x2,#0xdf4 AND BL opcode match within the search window), so
-    // an unknown DSC version safely no-ops instead of corrupting code.
-    MTLPatchLog("%%ctor: OS-check patched; running renamer patch now");
-    PatchAGXRenamerSkipAgxPrefix();
+    // Legacy diagnostics retained for explicit RE work only.  The former
+    // production path NOPed MTLCompiler's OS rejection branch and the
+    // AGXCompilerCore `agx.` renamer for every service instance.  Runtime
+    // evidence on 2026-08-01 showed stock com.apple.WebKit.GPU repeatedly
+    // aborting in QuartzCore pipeline compilation while those global patches
+    // were active, then remaining stable after the tweak was disabled.  A
+    // system compiler service must never be made permissive for unrelated iOS
+    // clients, so neither bypass is installed here.
+    (void)PatchAGXRenamerSkipAgxPrefix;
     if (access("/var/jb/var/mobile/macws_mtlcompiler_hold", F_OK) == 0) {
         MTLPatchLog("diagnostic hold: SIGSTOP before accepting compiler requests");
         raise(SIGSTOP);

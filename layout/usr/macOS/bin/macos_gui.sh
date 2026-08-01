@@ -87,6 +87,7 @@ EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
 EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
 EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
 EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
+MTLCOMPILER_DIAGNOSTICS="$LOGDIR/macws_mtlcompiler_diagnostics"
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
@@ -960,6 +961,7 @@ clear_diagnostic_state() {
     diagnostic_flag_paths | while IFS= read -r path; do
         rm -f "$ROOTFS$path"
     done
+    rm -f "$MTLCOMPILER_DIAGNOSTICS"
 
     # Bounded dump directories are historical evidence, not session state.
     # Match only exact MacWS prefixes one directory below the chroot tmp root.
@@ -1058,6 +1060,10 @@ production_preflight() {
         bad=1
     fi
     rm -f "$ROOTFS/private/tmp/macws_production_preflight.bad"
+    if [ -e "$MTLCOMPILER_DIAGNOSTICS" ]; then
+        log "ERROR: iOS MTLCompilerService diagnostic flag survived production cleanup: $MTLCOMPILER_DIAGNOSTICS"
+        bad=1
+    fi
     [ "$bad" = 0 ] || return 1
     log "PRODUCTION-PREFLIGHT: native AGX required; diagnostics/env traces/dump sentinels OFF."
     return 0
@@ -1471,12 +1477,14 @@ enable_experimental_if_requested() {
     # remains available only under the explicit diagnostic mode below.
     rm -f "$EXPERIMENTAL_SUBMIT_RING"
     rm -f "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
-        "$EXPERIMENTAL_OBSERVE_PF550" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS"
+        "$EXPERIMENTAL_OBSERVE_PF550" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \
+        "$MTLCOMPILER_DIAGNOSTICS"
     if [ "$WANT_DIAGNOSTICS" = 1 ]; then
         touch "$EXPERIMENTAL_COMMAND_ERROR" \
             "$EXPERIMENTAL_FAST_SUBMIT_RING" \
             "$EXPERIMENTAL_OBSERVE_PF550" \
-            "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS"
+            "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \
+            "$MTLCOMPILER_DIAGNOSTICS"
     fi
     rm -f "$EXPERIMENTAL_PACE"
     if [ -n "$COEXIST_PACE_US" ]; then

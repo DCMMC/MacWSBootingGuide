@@ -127,6 +127,7 @@ flag	/tmp/macws_queue_qos_diag	off	diagnostic	Command-queue QoS trace.
 flag	/tmp/macws_real_swapend	off	unsafe A/B	Lets macOS contend for the physical panel in coexistence.
 flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
 flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
+flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
 flag	/tmp/macws_submit_diag	off	diagnostic	Submit translation trace and raw dumps.
 flag	/tmp/macws_submit_fast_ring	off	diagnostic	Fixed-memory submit flight recorder.
