@@ -404,6 +404,67 @@ fi
 
 ROOTFS=/var/mnt/rootfs
 
+# Chromium 148 / Electron 42 ships ANGLE's default Metal library for macOS.
+# Its container loads in the chroot, but iOS MTLCompilerService rejects
+# function-constant specialization with "Target OS is incompatible". Install
+# the byte-validated replacement built from the exact ANGLE 1ba8ec3 generated
+# source through the project's real macabi compiler adapter. libmachook selects
+# it only when the original embedded library's length+FNV hash match.
+ANGLE_MACABI_SOURCE=/var/jb/usr/macOS/share/angle/angle-default-1ba8ec3-macabi.metallib
+ANGLE_MACABI_DIR="$ROOTFS/usr/local/share/macws/angle"
+ANGLE_MACABI_TARGET="$ANGLE_MACABI_DIR/angle-default-1ba8ec3-macabi.metallib"
+if [ ! -f "$ANGLE_MACABI_SOURCE" ] ||
+   [ "$(wc -c < "$ANGLE_MACABI_SOURCE" 2>/dev/null)" != 714152 ]; then
+	echo "[ERROR] Packaged ANGLE macabi default library is missing or invalid." >&2
+	exit 1
+fi
+mkdir -p "$ANGLE_MACABI_DIR" || exit 1
+ANGLE_MACABI_TMP="$ANGLE_MACABI_TARGET.new.$$"
+cp "$ANGLE_MACABI_SOURCE" "$ANGLE_MACABI_TMP" || exit 1
+chmod 0644 "$ANGLE_MACABI_TMP" || exit 1
+mv -f "$ANGLE_MACABI_TMP" "$ANGLE_MACABI_TARGET" || exit 1
+echo '[INFO] installed ANGLE 1ba8ec3 macabi default Metal library'
+
+# Metal's on-disk source-library cache key omits the effective target triple.
+# Caches created before the MacWS macabi source adapter therefore contain
+# valid MTLBs for iOS that the macOS AGX device rejects. Version this narrow,
+# regenerable cache independently from Chromium's profile/session caches.
+VSCODE_METAL_CACHE_ROOT="$ROOTFS/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C/com.microsoft.VSCode.helper/com.apple.metal"
+VSCODE_METAL_LIBRARY_CACHE="$VSCODE_METAL_CACHE_ROOT/31001"
+VSCODE_METAL_CACHE_SCHEMA=macws-macabi-source-v1
+VSCODE_METAL_CACHE_MARKER="$VSCODE_METAL_CACHE_ROOT/.macws-source-target-schema"
+
+invalidate_vscode_metal_source_cache() {
+	local installed_schema="" marker_tmp=""
+	[ -d "$ROOTFS/Applications/Visual Studio Code.app" ] || return 0
+	[ ! -f "$VSCODE_METAL_CACHE_MARKER" ] ||
+		installed_schema=$(sed -n '1p' "$VSCODE_METAL_CACHE_MARKER" 2>/dev/null)
+	[ "$installed_schema" != "$VSCODE_METAL_CACHE_SCHEMA" ] || return 0
+
+	# postinst can be invoked manually. Do not unlink an active helper's
+	# mmap-backed cache: leave the marker absent and macos_gui.sh will perform
+	# the same migration after its normal exact-process cleanup.
+	if ps ax -o command= 2>/dev/null |
+	   grep -E '[V]isual Studio Code\.app|[C]ode Helper' >/dev/null; then
+		rm -f "$VSCODE_METAL_CACHE_MARKER"
+		echo "[INFO] VS Code is running; deferred Metal source-cache migration to the next GUI start."
+		return 0
+	fi
+
+	mkdir -p "$VSCODE_METAL_CACHE_ROOT" || return 1
+	rm -f "$VSCODE_METAL_LIBRARY_CACHE/libraries.list" \
+	      "$VSCODE_METAL_LIBRARY_CACHE/libraries.data" || return 1
+	marker_tmp="$VSCODE_METAL_CACHE_MARKER.$$"
+	printf '%s\n' "$VSCODE_METAL_CACHE_SCHEMA" > "$marker_tmp" || return 1
+	mv -f "$marker_tmp" "$VSCODE_METAL_CACHE_MARKER" || return 1
+	echo "[INFO] VS Code Metal source cache migrated to $VSCODE_METAL_CACHE_SCHEMA."
+}
+
+invalidate_vscode_metal_source_cache || {
+	echo "[ERROR] Failed to migrate the VS Code Metal source cache." >&2
+	exit 1
+}
+
 # Runtime `ps eww` on a fresh Terminal session shows that Terminal launches
 # `/bin/bash` without `--login` and strips HOME/USER/SHELL from the child
 # environment. This bash build did not consume a user startup file even when

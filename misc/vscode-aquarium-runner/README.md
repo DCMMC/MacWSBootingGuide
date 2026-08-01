@@ -1,13 +1,17 @@
 # MacWS Aquarium Runner
 
 This disposable VS Code extension opens the WebGL Aquarium workload in the
-built-in Simple Browser after the workbench starts. It exists because Electron
-42 rejects browser-level `Target.createTarget`, while navigating the workbench
-target directly causes VS Code to replace that renderer.
+built-in Simple Browser when `MacWS: Open WebGL Aquarium` is selected from the
+command palette. It exists because Electron 42 rejects browser-level
+`Target.createTarget`, while navigating the workbench target directly causes
+VS Code to replace that renderer.
 
 Set `macwsAquarium.url` in the disposable benchmark profile to change the fish
-count or canvas dimensions. Set `macwsAquarium.openOnStartup` to `false` to
-keep the command installed without opening a page automatically.
+count or canvas dimensions. Automatic startup is deliberately disabled in the
+production profile: a 60,000-fish renderer otherwise competes with ordinary
+pages and video playback for the same Chromium GPU process and native-AGX
+resource budget. `macwsAquarium.openOnStartup` remains available for a
+dedicated benchmark profile.
 
 Startup is deliberately idempotent. VS Code restores Simple Browser webviews
 from the disposable profile, while `simpleBrowser.show` always creates another

@@ -18,6 +18,8 @@ env	MACWS_IOS_KCMD_HOLD	off	standalone probe	Stops the native iOS AGX command en
 env	MACWS_IOS_KCMD_MODE	off	standalone probe	Selects the native iOS AGX command-encoder workload.
 env	MACWS_IOS_MIP_TEXTURE_HOLD	off	standalone probe	Keeps the native iOS mipmapped-texture probe alive for LLDB inspection.
 env	MACWS_IOS_MIP_TEXTURE_PROBE	off	standalone probe	Selects the native iOS mipmapped-texture descriptor workload.
+env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 texture probe before creating plane textures for project-LLDB attachment.
+env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
 env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
@@ -43,6 +45,7 @@ env	MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT	on	VS Code,Chrome	Narrow Chromium task
 env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settlement; not enabled for benchmarks.
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
+env	MACWS_CHROMIUM_COMPOSITE_OVERLAYS	on	VS Code,Chrome	Mark Chromium's real AggregatedRenderPass video_capture_enabled field before native CALayer processing so its normal primary-plane fallback remains in the AGX scanout captured by MacWS/VNC.
 env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
 env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bind failure.
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
@@ -65,10 +68,15 @@ env	MACWS_MACH_MSG_TRACE	off	diagnostic	Mach-message trace.
 env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-policy compatibility.
 env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
 env	MACWS_METAL_PROBE_EVENT_ONLY	off	standalone probe	Restricts metal_source_probe to its event test.
+env	MACWS_METAL_PROBE_EXACT_SOURCE	off	standalone probe	Replays a captured MSL file byte-for-byte without adding the normal cache-busting comment.
 env	MACWS_METAL_PROBE_PAUSE_SECONDS	off	standalone probe	Pauses metal_source_probe for debugger attachment.
+env	MACWS_METAL_PROBE_SOURCE_ONLY	off	standalone probe	Skips event creation and GPU submission so a captured MSL library can be replayed in isolation.
+env	MACWS_METAL_PROBE_SOURCE_PATH	off	standalone probe	Compiles Metal source read from the exact requested path.
+env	MACWS_METAL_PROBE_FUNCTION	off	standalone probe	Loads the named function after a source-path probe compile.
 env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source target.
 env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
 env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
+env	MACWS_PING_HOLD_SECONDS	off	standalone probe	Keeps PingMTLCompilerService alive for bounded debugger attachment.
 env	MACWS_RESTORE_OUTBUMP	off	A/B control	Restores historical selector output-count mutation.
 env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight recorders.
 env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
@@ -95,10 +103,13 @@ setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid opt
 setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code benchmark profile	Avoid reviving stale benchmark-profile PTYs across isolated runs.
 artifact	/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist	on	VS Code production launcher	Packaged outside auto-scanned LaunchDaemons; loaded explicitly only after the GUI is ready.
 artifact	/var/jb/usr/macOS/share/vscode	on	VS Code production assets	Authoritative targetfix13 settings and Aquarium extension copied into the isolated benchmark profile.
+artifact	/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib	on	VS Code ANGLE Metal compatibility	Exact Chromium 148.0.7778.280 ANGLE 1ba8ec3 default shader source compiled by the real iOS MTLCompilerService through the macabi target adapter; selected only for the byte-exact embedded macOS library.
 state	/tmp/macws-vscode-profile-agx-native-targetfix13	on	dedicated VS Code benchmark profile	Project-owned profile; normal user profile is untouched and Chromium caches persist across warm starts.
+state	/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C/com.microsoft.VSCode.helper/com.apple.metal/.macws-source-target-schema	on	VS Code Metal library cache	Cold-start schema witness value macws-macabi-source-v1; a missing/mismatched value removes only compiler-31001 libraries.list/data so pure-iOS MTLBs cannot survive the macabi source-target migration.
 flag	/private/tmp/macws_agx_dump_methods	off	diagnostic	AGX Objective-C method dump.
 flag	/private/tmp/macws_agx_trace_reserve	off	diagnostic	AGX reserve trace.
-flag	/private/tmp/macws_mtl_library_diag	off	diagnostic	Metal library target/compile trace.
+flag	/private/tmp/macws_mtl_data_diag	off	diagnostic	Narrow read-only newLibraryWithData:error observer; dumps the first eight precompiled Metal library blobs with exact caller image+offset and never enables the private cache hooks.
+flag	/private/tmp/macws_mtl_library_diag	off	diagnostic	Metal source/options/result trace plus exact-UUID read-only cache-hit and pre-validation compiled-blob capture; dumps /private/tmp/macws_cached_library_*.bin and macws_compiled_library_*.bin and never changes compiler/loader results.
 flag	/private/tmp/macws_tile_descriptor_diag	off	diagnostic	Tile descriptor and completion observer.
 flag	/tmp/macws_allow_unsafe_pf550_capture	off	unsafe diagnostic	Cross-queue compressed-scanout capture.
 flag	/tmp/macws_cancel_completion	on	WindowServer	Required virtual-display cancelled-swap completion adapter.
@@ -122,18 +133,21 @@ flag	/tmp/macws_owned_no_read	off	A/B control	Disables owned scanout read.
 flag	/tmp/macws_owned_scanout	on	WindowServer/VNC	Process-owned linear BGRA scanout transport.
 flag	/tmp/macws_owned_unlocked_read	off	unsafe A/B	Reads IOSurface without ownership lock.
 flag	/tmp/macws_pf550_metadata_diag	off	diagnostic	PF550 metadata observer.
+flag	/tmp/macws_pipeline_diag	off	diagnostic	Read-only render-pipeline result and NSError witness.
 flag	/tmp/macws_probe_small_pf550	off	diagnostic	Small compressed-texture probe.
 flag	/tmp/macws_queue_qos_diag	off	diagnostic	Command-queue QoS trace.
 flag	/tmp/macws_real_swapend	off	unsafe A/B	Lets macOS contend for the physical panel in coexistence.
 flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
 flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
 flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
+flag	/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Native iOS-seatbelt spelling of the compiler diagnostics sentinel; equivalent to the rootless alias and removed by production preflight.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
 flag	/tmp/macws_submit_diag	off	diagnostic	Submit translation trace and raw dumps.
 flag	/tmp/macws_submit_fast_ring	off	diagnostic	Fixed-memory submit flight recorder.
 flag	/tmp/macws_submit_ring	off	diagnostic	Heap/mutex submit flight recorder.
 flag	/tmp/macws_trace_small_pf550_bind	off	diagnostic	Small compressed bind trace.
 flag	/tmp/macws_vnc_native_all	off	redundant override	Production owns this setting through OSXvnc environment.
+flag	/tmp/macws_video_diag	off	diagnostic	Read-only NV12 texture creation-to-fragment-binding witness.
 flag	/tmp/macws_vnc_share	on	WindowServer/VNC	Enable shared Retina framebuffer publication.
 flag	/tmp/macws_vnc_test	off	diagnostic	Synthetic VNC gradient.
 state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion interval, currently 100000 us.

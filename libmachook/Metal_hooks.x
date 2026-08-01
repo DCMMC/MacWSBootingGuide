@@ -10,11 +10,15 @@
 #import <stdatomic.h>
 #import <stdarg.h>
 #import <objc/runtime.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <ptrauth.h>
 #import "utils.h"
 
 #import <IOSurface/IOSurfaceRef.h>
 #import <sys/file.h>
 #import <sys/socket.h>
+#import <sys/stat.h>
 #import <sys/un.h>
 
 // Match mac_hooks.m's production/diagnostic boundary. This is intentionally
@@ -74,6 +78,10 @@ MACWS_DEFINE_STARTUP_FLAG(macws_res_diag_enabled,
                           "/tmp/macws_res_diag")
 MACWS_DEFINE_STARTUP_FLAG(macws_trace_small_pf550_bind_enabled,
                           "/tmp/macws_trace_small_pf550_bind")
+MACWS_DEFINE_STARTUP_FLAG(macws_video_diag_enabled,
+                          "/tmp/macws_video_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_pipeline_diag_enabled,
+                          "/tmp/macws_pipeline_diag")
 
 #undef MACWS_DEFINE_STARTUP_FLAG
 
@@ -107,8 +115,19 @@ static void macws_publish_graphics_ready_once(void) {
 
 extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef);
+// Present in the iOS 16 IOSurface binary but omitted from this Theos SDK's
+// public header. mac_hooks.m interposes it with the cross-image field adapter.
+extern size_t IOSurfaceGetOffsetOfPlane(IOSurfaceRef, size_t);
 extern int IOSurfaceLock(IOSurfaceRef, uint32_t options, uint32_t *seed);
 extern int IOSurfaceUnlock(IOSurfaceRef, uint32_t options, uint32_t *seed);
+// These property-backed adapters live in mac_hooks.m. Calls originating in
+// libmachook itself are not rewritten by DYLD_INTERPOSE, so focused evidence
+// must name the adapters directly instead of re-reading macOS field offsets.
+extern size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef, size_t);
+extern size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef, size_t);
+extern size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef, size_t);
+extern size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef, size_t);
+extern void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef, size_t);
 
 // MACWS_DISP_FILL_LOOP read-path probe (2026-06-20). Resolved once: enabled
 // by env MACWS_DISP_FILL_LOOP or sentinel file /tmp/macws_disp_fill (chroot
@@ -3721,8 +3740,18 @@ static void macws_log_failed_texture_descriptor(
 // stores the CPU/GPU mappings at +0x130/+0x40 before calling
 // texBaseAddressesUpdated().  This helper now only records the postcondition.
 static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
-                                                  IOSurfaceRef surf) {
-    if (!macws_runtime_diagnostics_enabled()) return;
+                                                  IOSurfaceRef surf,
+                                                  NSUInteger requested_plane,
+                                                  NSUInteger requested_width,
+                                                  NSUInteger requested_height,
+                                                  NSUInteger requested_format) {
+    // The focused video witness must also see the constructor-side descriptor
+    // for the exact VideoToolbox surface.  Keep every other texture behind the
+    // broader runtime recorder so this sentinel remains bounded to two 420v
+    // plane views per decoded-frame surface.
+    BOOL focused_video = macws_video_diag_enabled() && surf &&
+        IOSurfaceGetPixelFormat(surf) == (uint32_t)'420v';
+    if (!macws_runtime_diagnostics_enabled() && !focused_video) return;
     if (!tex || !surf) return;
     // This witness describes the private AGXG13GFamilyTexture layout below;
     // it is not a generic MTLTexture ABI.  The MTLSim path returns an
@@ -3749,14 +3778,14 @@ static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
             }
         }
         if (s_impl_off == 0) s_impl_off = 0x208;  // RE-fallback
-        fprintf(stderr,
+        dprintf(STDERR_FILENO,
             "#### AGX_MAP_AUDIT: _impl ivar offset = %#tx\n", s_impl_off);
     });
     void *impl = *(void **)((char *)(__bridge void *)tex + s_impl_off);
     if (!impl) {
         static int impllog = 0;
         if (impllog++ < 3) {
-            fprintf(stderr,
+            dprintf(STDERR_FILENO,
                 "#### AGX_MAP_AUDIT: _impl=NULL tex=%p surf=%p\n",
                 (void *)tex, (void *)surf);
         }
@@ -3769,32 +3798,520 @@ static void macws_audit_iosurface_texture_mapping(id<MTLTexture> tex,
     uint64_t gpu_mapping = *(volatile uint64_t *)((char *)impl + 0x40);
     macws_texture_descriptor_witness descriptor = {0};
     bool has_descriptor = macws_find_texture_descriptor(
-        impl, IOSurfaceGetWidth(surf), IOSurfaceGetHeight(surf), &descriptor);
+        impl, requested_width, requested_height, &descriptor);
     static _Atomic int audit_count = 0;
     int n = atomic_fetch_add(&audit_count, 1);
-    if (n < 32 || bound_surface != surf || cpu_mapping == NULL) {
-        fprintf(stderr,
+    BOOL video_plane = requested_plane != 0 || requested_format == 10 ||
+        requested_format == 30;
+    if (n < 32 || video_plane || bound_surface != surf ||
+        bound_plane != requested_plane || cpu_mapping == NULL) {
+        dprintf(STDERR_FILENO,
             "#### AGX_MAP_AUDIT #%d tex=%p impl=%p iosurface(arg=%p bound=%p) "
-            "plane=%u cpu130=%p gpu40=%#llx descriptorOff=%#tx "
+            "requested=%lux%lu pf=%lu plane(arg=%lu bound=%u) "
+            "cpu130=%p gpu40=%#llx descriptorOff=%#tx address=%#llx "
             "descriptorLayout=%u compressed=%u extended=%u match=%d\n",
             n, (void *)tex, impl, (void *)surf, (void *)bound_surface,
+            (unsigned long)requested_width, (unsigned long)requested_height,
+            (unsigned long)requested_format, (unsigned long)requested_plane,
             bound_plane, cpu_mapping, (unsigned long long)gpu_mapping,
             has_descriptor ? descriptor.offset : (ptrdiff_t)-1,
+            (unsigned long long)(has_descriptor ? descriptor.address : 0),
             has_descriptor ? descriptor.layout : 0,
             has_descriptor ? descriptor.compressed : 0,
             has_descriptor ? descriptor.extended : 0,
             bound_surface == surf);
         if (cpu_mapping == NULL) {
-            fprintf(stderr,
+            dprintf(STDERR_FILENO,
                 "#### AGX_MAP_AUDIT INVARIANT FAIL: real initializer left "
                 "Texture+0x130 NULL; no field synthesis performed\n");
         }
         if (bound_surface != surf) {
-            fprintf(stderr,
+            dprintf(STDERR_FILENO,
                 "#### AGX_MAP_AUDIT INVARIANT FAIL: Texture+0xa0 does not "
                 "match constructor IOSurfaceRef; no field synthesis performed\n");
         }
+        if (bound_plane != requested_plane) {
+            dprintf(STDERR_FILENO,
+                "#### AGX_MAP_AUDIT INVARIANT FAIL: Texture+0xa8 plane=%u "
+                "does not match constructor plane=%lu; no field synthesis "
+                "performed\n",
+                bound_plane, (unsigned long)requested_plane);
+        }
     }
+}
+
+// Diagnostic-only native-AGX sampler control.  It runs after both plane views
+// for one decoded surface have reached the render-encoder boundary, samples
+// them through a minimal independent Metal pipeline, and writes GPU-produced
+// RGBA8 bytes.  Correct output here isolates the remaining fault to ANGLE;
+// incorrect output isolates it to AGX texture sampling or command submission.
+static void macws_schedule_video_gpu_sample(id<MTLTexture> y_texture,
+                                            id<MTLTexture> uv_texture,
+                                            uint32_t surface_id) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("com.macwsguide.video-gpu-sample",
+                                      DISPATCH_QUEUE_SERIAL);
+    });
+    dispatch_async(queue, ^{
+        @autoreleasepool {
+            id<MTLDevice> device = y_texture.device;
+            NSUInteger width = y_texture.width;
+            NSUInteger height = y_texture.height;
+            NSError *error = nil;
+            NSString *source =
+                @"#include <metal_stdlib>\n"
+                 "using namespace metal;\n"
+                 "struct V { float4 position [[position]]; float2 uv; };\n"
+                 "vertex V macws_nv12_v(uint n [[vertex_id]]) {\n"
+                 "  const float2 p[3] = {float2(-1,-1), float2(3,-1), "
+                 "float2(-1,3)};\n"
+                 "  V o; o.position=float4(p[n],0,1); "
+                 "o.uv=float2((p[n].x+1)*0.5,1-(p[n].y+1)*0.5); return o;\n"
+                 "}\n"
+                 "fragment float4 macws_nv12_f(V i [[stage_in]], "
+                 "texture2d<float> yt [[texture(0)]], "
+                 "texture2d<float> uvt [[texture(1)]]) {\n"
+                 "  constexpr sampler s(coord::normalized, "
+                 "address::clamp_to_edge, filter::nearest);\n"
+                 "  float yc=yt.sample(s,i.uv).r; "
+                 "float2 uvc=uvt.sample(s,i.uv).rg;\n"
+                 "  float y=max(0.0,(yc-16.0/255.0)*(255.0/219.0)); "
+                 "float u=(uvc.x-128.0/255.0)*(255.0/224.0); "
+                 "float v=(uvc.y-128.0/255.0)*(255.0/224.0);\n"
+                 "  float3 rgb=float3(y+1.5748*v, "
+                 "y-0.1873*u-0.4681*v, y+1.8556*u);\n"
+                 "  return float4(clamp(rgb,0.0,1.0),1.0);\n"
+                 "}\n";
+            id<MTLLibrary> library =
+                [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) {
+                dprintf(STDERR_FILENO,
+                    "#### VIDEO-GPU-SAMPLE library failed surface=%u %s\n",
+                    surface_id, error.description.UTF8String ?: "(nil)");
+                goto done;
+            }
+            MTLRenderPipelineDescriptor *pipeline_descriptor =
+                [[MTLRenderPipelineDescriptor alloc] init];
+            pipeline_descriptor.vertexFunction =
+                [library newFunctionWithName:@"macws_nv12_v"];
+            pipeline_descriptor.fragmentFunction =
+                [library newFunctionWithName:@"macws_nv12_f"];
+            pipeline_descriptor.colorAttachments[0].pixelFormat =
+                MTLPixelFormatRGBA8Unorm;
+            id<MTLRenderPipelineState> pipeline =
+                [device newRenderPipelineStateWithDescriptor:
+                    pipeline_descriptor error:&error];
+            if (!pipeline) {
+                dprintf(STDERR_FILENO,
+                    "#### VIDEO-GPU-SAMPLE pipeline failed surface=%u %s\n",
+                    surface_id, error.description.UTF8String ?: "(nil)");
+                [pipeline_descriptor release];
+                goto done;
+            }
+            MTLTextureDescriptor *output_descriptor =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                    MTLPixelFormatRGBA8Unorm width:width height:height
+                    mipmapped:NO];
+            output_descriptor.storageMode = MTLStorageModeShared;
+            output_descriptor.usage = MTLTextureUsageRenderTarget |
+                MTLTextureUsageShaderRead;
+            id<MTLTexture> iosurface_output =
+                [device newTextureWithDescriptor:output_descriptor];
+            id<MTLTexture> cpuclone_output =
+                [device newTextureWithDescriptor:output_descriptor];
+
+            // A/B control for the external-texture boundary.  Public
+            // -getBytes: has already shown that the logical R8/RG8 texture
+            // views contain the same bytes as their decoded IOSurface planes.
+            // Re-upload those exact bytes into ordinary shared Metal textures,
+            // then sample both pairs through the same pipeline and command
+            // buffer.  This distinguishes an IOSurface GPU mapping/coherency
+            // defect from shader compilation, color conversion, or the rest
+            // of command submission without changing production rendering.
+            NSUInteger y_width = y_texture.width;
+            NSUInteger y_height = y_texture.height;
+            NSUInteger uv_width = uv_texture.width;
+            NSUInteger uv_height = uv_texture.height;
+            size_t y_bytes_per_row = y_width;
+            size_t uv_bytes_per_row = uv_width * 2;
+            size_t y_length = y_bytes_per_row * y_height;
+            size_t uv_length = uv_bytes_per_row * uv_height;
+            void *y_bytes = malloc(y_length);
+            void *uv_bytes = malloc(uv_length);
+            MTLTextureDescriptor *y_clone_descriptor =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                    y_texture.pixelFormat width:y_width height:y_height
+                    mipmapped:NO];
+            y_clone_descriptor.storageMode = MTLStorageModeShared;
+            y_clone_descriptor.usage = MTLTextureUsageShaderRead;
+            MTLTextureDescriptor *uv_clone_descriptor =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+                    uv_texture.pixelFormat width:uv_width height:uv_height
+                    mipmapped:NO];
+            uv_clone_descriptor.storageMode = MTLStorageModeShared;
+            uv_clone_descriptor.usage = MTLTextureUsageShaderRead;
+            id<MTLTexture> y_clone =
+                [device newTextureWithDescriptor:y_clone_descriptor];
+            id<MTLTexture> uv_clone =
+                [device newTextureWithDescriptor:uv_clone_descriptor];
+            BOOL clone_ready = y_bytes && uv_bytes && y_clone && uv_clone;
+            if (clone_ready) {
+                [y_texture getBytes:y_bytes bytesPerRow:y_bytes_per_row
+                      fromRegion:MTLRegionMake2D(0, 0, y_width, y_height)
+                     mipmapLevel:0];
+                [uv_texture getBytes:uv_bytes bytesPerRow:uv_bytes_per_row
+                       fromRegion:MTLRegionMake2D(0, 0, uv_width, uv_height)
+                      mipmapLevel:0];
+                [y_clone replaceRegion:MTLRegionMake2D(
+                            0, 0, y_width, y_height)
+                              mipmapLevel:0 withBytes:y_bytes
+                            bytesPerRow:y_bytes_per_row];
+                [uv_clone replaceRegion:MTLRegionMake2D(
+                             0, 0, uv_width, uv_height)
+                               mipmapLevel:0 withBytes:uv_bytes
+                             bytesPerRow:uv_bytes_per_row];
+            }
+            free(y_bytes);
+            free(uv_bytes);
+            id<MTLCommandQueue> command_queue = [device newCommandQueue];
+            id<MTLCommandBuffer> command_buffer =
+                [command_queue commandBuffer];
+            void (^encode_sample)(id<MTLTexture>, id<MTLTexture>,
+                                  id<MTLTexture>) =
+                ^(id<MTLTexture> sample_y, id<MTLTexture> sample_uv,
+                  id<MTLTexture> destination) {
+                    MTLRenderPassDescriptor *pass =
+                        [MTLRenderPassDescriptor renderPassDescriptor];
+                    pass.colorAttachments[0].texture = destination;
+                    pass.colorAttachments[0].loadAction =
+                        MTLLoadActionDontCare;
+                    pass.colorAttachments[0].storeAction =
+                        MTLStoreActionStore;
+                    id<MTLRenderCommandEncoder> encoder =
+                        [command_buffer
+                            renderCommandEncoderWithDescriptor:pass];
+                    [encoder setRenderPipelineState:pipeline];
+                    [encoder setFragmentTexture:sample_y atIndex:0];
+                    [encoder setFragmentTexture:sample_uv atIndex:1];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                                vertexStart:0 vertexCount:3];
+                    [encoder endEncoding];
+                };
+            encode_sample(y_texture, uv_texture, iosurface_output);
+            if (clone_ready)
+                encode_sample(y_clone, uv_clone, cpuclone_output);
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+                dprintf(STDERR_FILENO,
+                    "#### VIDEO-GPU-SAMPLE command failed surface=%u "
+                    "status=%lu error=%s\n",
+                    surface_id, (unsigned long)command_buffer.status,
+                    command_buffer.error.description.UTF8String ?: "(nil)");
+                [pipeline_descriptor release];
+                goto done;
+            }
+            void (^dump_output)(id<MTLTexture>, const char *) =
+                ^(id<MTLTexture> output, const char *variant) {
+                    size_t bytes_per_row = width * 4;
+                    size_t length = bytes_per_row * height;
+                    void *rgba = malloc(length);
+                    if (rgba) {
+                        [output getBytes:rgba bytesPerRow:bytes_per_row
+                              fromRegion:MTLRegionMake2D(
+                                  0, 0, width, height)
+                             mipmapLevel:0];
+                    }
+                    char output_path[PATH_MAX];
+                    snprintf(output_path, sizeof(output_path),
+                             "/tmp/macws_video_gpu_sample_%u_%s.rgba",
+                             surface_id, variant);
+                    int output_fd = rgba
+                        ? open(output_path, O_WRONLY | O_CREAT | O_TRUNC |
+                              O_CLOEXEC, 0600) : -1;
+                    size_t written_total = 0;
+                    while (output_fd >= 0 && written_total < length) {
+                        ssize_t written = write(
+                            output_fd,
+                            (const uint8_t *)rgba + written_total,
+                            length - written_total);
+                        if (written <= 0) break;
+                        written_total += (size_t)written;
+                    }
+                    if (output_fd >= 0) close(output_fd);
+                    free(rgba);
+                    dprintf(STDERR_FILENO,
+                        "#### VIDEO-GPU-SAMPLE completed surface=%u "
+                        "variant=%s shape=%lux%lu bytes=%zu written=%zu "
+                        "path=%s\n",
+                        surface_id, variant, (unsigned long)width,
+                        (unsigned long)height, length, written_total,
+                        output_path);
+                };
+            dump_output(iosurface_output, "iosurface");
+            if (clone_ready)
+                dump_output(cpuclone_output, "cpuclone");
+            [pipeline_descriptor release];
+        done:
+            CFRelease((CFTypeRef)y_texture);
+            CFRelease((CFTypeRef)uv_texture);
+        }
+    });
+}
+
+static void macws_collect_video_gpu_sample(id<MTLTexture> texture,
+                                           uint32_t surface_id,
+                                           uint32_t plane) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static uint32_t pending_surface_id = 0;
+    static id<MTLTexture> pending_y = nil;
+    static id<MTLTexture> pending_uv = nil;
+    static _Atomic uint32_t scheduled = 0;
+    if (atomic_load(&scheduled) || surface_id == 0 || plane > 1) return;
+    pthread_mutex_lock(&lock);
+    if (pending_surface_id != 0 && pending_surface_id != surface_id) {
+        if (pending_y) CFRelease((CFTypeRef)pending_y);
+        if (pending_uv) CFRelease((CFTypeRef)pending_uv);
+        pending_y = nil;
+        pending_uv = nil;
+    }
+    pending_surface_id = surface_id;
+    id<MTLTexture> *slot = plane == 0 ? &pending_y : &pending_uv;
+    if (!*slot) {
+        *slot = texture;
+        CFRetain((CFTypeRef)texture);
+    }
+    if (pending_y && pending_uv && !atomic_exchange(&scheduled, 1)) {
+        id<MTLTexture> y = pending_y;
+        id<MTLTexture> uv = pending_uv;
+        pending_y = nil;
+        pending_uv = nil;
+        pthread_mutex_unlock(&lock);
+        macws_schedule_video_gpu_sample(y, uv, surface_id);
+        return;
+    }
+    pthread_mutex_unlock(&lock);
+}
+
+// Diagnostic-only witness at the final render-encoder binding boundary.  The
+// IOSurface constructor trace proves what was requested; this records whether
+// ANGLE/Skia later binds that same NV12 plane and hardware descriptor to the
+// fragment slot.  It forwards the original setFragmentTexture arguments
+// unchanged and never retains or mutates the texture.
+static void macws_log_video_texture_binding(id encoder, id texture,
+                                            NSUInteger index) {
+    if (!macws_video_diag_enabled() || !texture) return;
+    Class agx_texture_class = objc_getClass("AGXG13GFamilyTexture");
+    if (!agx_texture_class || ![texture isKindOfClass:agx_texture_class]) return;
+
+    NSUInteger width = 0, height = 0, pixel_format = 0;
+    IOSurfaceRef surface = NULL;
+    id parent = nil;
+    @try {
+        width = [texture respondsToSelector:@selector(width)]
+            ? (NSUInteger)[texture width] : 0;
+        height = [texture respondsToSelector:@selector(height)]
+            ? (NSUInteger)[texture height] : 0;
+        pixel_format = [texture respondsToSelector:@selector(pixelFormat)]
+            ? (NSUInteger)[texture pixelFormat] : 0;
+        if ([texture respondsToSelector:@selector(iosurface)])
+            surface = (IOSurfaceRef)[texture iosurface];
+        SEL parent_selector = sel_registerName("parentTexture");
+        if ([texture respondsToSelector:parent_selector])
+            parent = ((id (*)(id, SEL))objc_msgSend)(texture, parent_selector);
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    uint32_t fourcc = surface ? IOSurfaceGetPixelFormat(surface) : 0;
+    // R8/RG8 are common for masks, glyph atlases and other unrelated Skia
+    // resources.  The backing IOSurface fourcc is the exact VideoToolbox NV12
+    // provenance witness; filtering on pixel format alone exhausted the bounded
+    // recorder before the first decoded frame reached ANGLE.
+    if (fourcc != (uint32_t)'420v') return;
+
+    // Focused one-surface capture used to locate the remaining video-colour
+    // fault.  Dumping the decoder's two NV12 planes before ANGLE samples them
+    // distinguishes damaged VideoToolbox/IOSurface contents from a later AGX
+    // sampler or YUV-conversion failure.  This is intentionally sentinel-only,
+    // bounded to one surface per process and read-only; production never locks
+    // or copies video frames here.
+    static _Atomic uint32_t dumped_surface_id = 0;
+    uint32_t surface_id = IOSurfaceGetID(surface);
+    uint32_t expected_surface_id = 0;
+    if (surface_id != 0 && atomic_compare_exchange_strong(
+            &dumped_surface_id, &expected_surface_id, surface_id)) {
+        uint32_t seed = 0;
+        int lock_result = IOSurfaceLock(surface, 1 /* read-only */, &seed);
+        size_t plane_count = IOSurfaceGetPlaneCount(surface);
+        dprintf(STDERR_FILENO,
+            "#### VIDEO-NV12-DUMP surface=%u lock=%#x seed=%u planes=%zu "
+            "alloc=%zu\n",
+            surface_id, lock_result, seed, plane_count,
+            IOSurfaceGetAllocSize(surface));
+        if (lock_result == 0 && plane_count >= 2) {
+            char metadata_path[PATH_MAX];
+            snprintf(metadata_path, sizeof(metadata_path),
+                     "/tmp/macws_video_nv12_%u.meta", surface_id);
+            int metadata_fd = open(metadata_path,
+                                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                                   0600);
+            if (metadata_fd >= 0) {
+                dprintf(metadata_fd,
+                    "surface=%u fourcc=%08x alloc=%zu seed=%u\n",
+                    surface_id, fourcc, IOSurfaceGetAllocSize(surface), seed);
+            }
+            for (size_t plane = 0; plane < 2; plane++) {
+                void *base = macws_IOSurfaceGetBaseAddressOfPlane(
+                    surface, plane);
+                size_t width = macws_IOSurfaceGetWidthOfPlane(surface, plane);
+                size_t height = macws_IOSurfaceGetHeightOfPlane(
+                    surface, plane);
+                size_t bytes_per_row =
+                    macws_IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+                size_t length = 0;
+                if (height != 0 && bytes_per_row <= SIZE_MAX / height)
+                    length = bytes_per_row * height;
+                if (metadata_fd >= 0) {
+                    dprintf(metadata_fd,
+                        "plane=%zu width=%zu height=%zu bytesPerRow=%zu "
+                        "offset=%zu size=%zu base=%p\n",
+                        plane, width, height, bytes_per_row,
+                        macws_IOSurfaceGetOffsetOfPlane(surface, plane), length,
+                        base);
+                }
+                char plane_path[PATH_MAX];
+                snprintf(plane_path, sizeof(plane_path),
+                         "/tmp/macws_video_nv12_%u_p%zu.raw",
+                         surface_id, plane);
+                int plane_fd = open(plane_path,
+                                    O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                                    0600);
+                size_t written_total = 0;
+                while (plane_fd >= 0 && base && written_total < length) {
+                    ssize_t written = write(
+                        plane_fd, (const uint8_t *)base + written_total,
+                        length - written_total);
+                    if (written <= 0) break;
+                    written_total += (size_t)written;
+                }
+                if (plane_fd >= 0) close(plane_fd);
+                dprintf(STDERR_FILENO,
+                    "#### VIDEO-NV12-DUMP plane=%zu shape=%zux%zu "
+                    "bytesPerRow=%zu requested=%zu written=%zu path=%s\n",
+                    plane, width, height, bytes_per_row, length,
+                    written_total, plane_path);
+            }
+            if (metadata_fd >= 0) close(metadata_fd);
+            IOSurfaceUnlock(surface, 1 /* read-only */, &seed);
+        } else {
+            if (lock_result == 0)
+                IOSurfaceUnlock(surface, 1 /* read-only */, &seed);
+            atomic_store(&dumped_surface_id, 0);
+        }
+    }
+
+    ptrdiff_t impl_offset = 0x208;
+    Ivar ivar = class_getInstanceVariable([texture class], "_impl");
+    if (ivar) impl_offset = ivar_getOffset(ivar);
+    void *impl = *(void **)((char *)(__bridge void *)texture + impl_offset);
+    uint32_t bound_plane = impl
+        ? *(volatile uint32_t *)((char *)impl + 0xa8) : UINT32_MAX;
+    void *cpu_mapping = impl
+        ? *(void * volatile *)((char *)impl + 0x130) : NULL;
+    uint64_t gpu_mapping = impl
+        ? *(volatile uint64_t *)((char *)impl + 0x40) : 0;
+    macws_texture_descriptor_witness descriptor = {0};
+    BOOL has_descriptor = impl && macws_find_texture_descriptor(
+        impl, width, height, &descriptor);
+
+    // Read the exact logical MTLTexture view once per plane as a second
+    // boundary witness.  IOSurface raw bytes were runtime-confirmed correct;
+    // if this public texture read differs, the defect is in resource import.
+    // If it matches, the remaining fault is strictly after texture creation
+    // (sampler/pipeline/command submission).  This call exists only under the
+    // focused video sentinel and never substitutes bytes or a return value.
+    if (surface_id == atomic_load(&dumped_surface_id) && bound_plane < 2) {
+        static _Atomic uint32_t texture_dump_mask = 0;
+        uint32_t bit = 1u << bound_plane;
+        uint32_t previous = atomic_fetch_or(&texture_dump_mask, bit);
+        if ((previous & bit) == 0) {
+            size_t bytes_per_pixel = pixel_format == MTLPixelFormatR8Unorm
+                ? 1 : (pixel_format == MTLPixelFormatRG8Unorm ? 2 : 0);
+            size_t bytes_per_row = 0, length = 0;
+            if (bytes_per_pixel != 0 && width <= SIZE_MAX / bytes_per_pixel) {
+                bytes_per_row = width * bytes_per_pixel;
+                if (height <= SIZE_MAX / bytes_per_row)
+                    length = bytes_per_row * height;
+            }
+            void *copy = length ? malloc(length) : NULL;
+            BOOL copied = NO;
+            if (copy) {
+                @try {
+                    [texture getBytes:copy bytesPerRow:bytes_per_row
+                        fromRegion:MTLRegionMake2D(0, 0, width, height)
+                        mipmapLevel:0];
+                    copied = YES;
+                } @catch (NSException *exception) {
+                    dprintf(STDERR_FILENO,
+                        "#### VIDEO-TEXTURE-DUMP exception plane=%u %s\n",
+                        bound_plane,
+                        exception.description.UTF8String ?: "(nil)");
+                }
+            }
+            char texture_path[PATH_MAX];
+            snprintf(texture_path, sizeof(texture_path),
+                     "/tmp/macws_video_texture_%u_p%u.raw",
+                     surface_id, bound_plane);
+            size_t written_total = 0;
+            int texture_fd = copied
+                ? open(texture_path,
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600) : -1;
+            while (texture_fd >= 0 && written_total < length) {
+                ssize_t written = write(
+                    texture_fd, (const uint8_t *)copy + written_total,
+                    length - written_total);
+                if (written <= 0) break;
+                written_total += (size_t)written;
+            }
+            if (texture_fd >= 0) close(texture_fd);
+            free(copy);
+            dprintf(STDERR_FILENO,
+                "#### VIDEO-TEXTURE-DUMP surface=%u plane=%u shape=%lux%lu "
+                "pixelFormat=%lu bytesPerRow=%zu requested=%zu written=%zu "
+                "path=%s\n",
+                surface_id, bound_plane, (unsigned long)width,
+                (unsigned long)height, (unsigned long)pixel_format,
+                bytes_per_row, length, written_total, texture_path);
+        }
+        macws_collect_video_gpu_sample(texture, surface_id, bound_plane);
+    }
+    char descriptor_hex[49] = {0};
+    if (has_descriptor) {
+        for (size_t i = 0; i < sizeof(descriptor.bytes); i++)
+            snprintf(descriptor_hex + i * 2, 3, "%02x", descriptor.bytes[i]);
+    }
+    static _Atomic uint32_t binding_count = 0;
+    uint32_t sequence = atomic_fetch_add(&binding_count, 1) + 1;
+    if (sequence > 256) return;
+    dprintf(STDERR_FILENO,
+        "#### VIDEO-TEX-BIND #%u encoder=%p index=%lu tex=%p class=%s "
+        "parent=%p surface=%u fourcc=%#x shape=%lux%lu pf=%lu "
+        "impl=%p plane=%u cpu130=%p gpu40=%#llx descriptorOff=%#tx "
+        "address=%#llx layout=%u compressed=%u extended=%u bytes=%s\n",
+        sequence, (void *)encoder, (unsigned long)index, (void *)texture,
+        class_getName([texture class]), (void *)parent,
+        surface ? IOSurfaceGetID(surface) : 0, fourcc,
+        (unsigned long)width, (unsigned long)height,
+        (unsigned long)pixel_format, impl, bound_plane, cpu_mapping,
+        (unsigned long long)gpu_mapping,
+        has_descriptor ? descriptor.offset : (ptrdiff_t)-1,
+        (unsigned long long)(has_descriptor ? descriptor.address : 0),
+        has_descriptor ? descriptor.layout : 0,
+        has_descriptor ? descriptor.compressed : 0,
+        has_descriptor ? descriptor.extended : 0,
+        has_descriptor ? descriptor_hex : "(not-found)");
 }
 
 // One-shot, read-only witness for the hardware Texture descriptor produced by
@@ -5299,7 +5816,10 @@ static void macws_sigabrt_trampoline(int sig) {
     // Verify the real initializer established its IOSurface and CPU/GPU
     // mappings.  This is read-only; field ownership stays inside AGX.
     if (result && iosurface) {
-        macws_audit_iosurface_texture_mapping(result, auditSurface);
+        NSUInteger audit_plane = auditSurface == iosurface ? plane : 0;
+        macws_audit_iosurface_texture_mapping(
+            result, auditSurface, audit_plane, desc.width, desc.height,
+            desc.pixelFormat);
         macws_diag_pf550_texture_descriptor(result, desc, iosurface, self);
     }
     // 2026-06-20 — VNC read-path test on the IOSURFACE VARIANT.  Filling
@@ -5985,7 +6505,8 @@ static void macws_sigabrt_trampoline(int sig) {
 
         // Read-only postcondition audit for the original Apple initializer.
         if (tex) {
-            macws_audit_iosurface_texture_mapping(tex, surf);
+            macws_audit_iosurface_texture_mapping(
+                tex, surf, 0, desc.width, desc.height, desc.pixelFormat);
             if (compressedPF550)
                 macws_schedule_small_pf550_probe(tex);
         }
@@ -7357,6 +7878,16 @@ typedef id (*macws_new_library_source_fn)(id, SEL, NSString *, id, NSError **);
 static macws_new_library_source_fn g_macws_new_library_source_orig = NULL;
 static _Atomic uint32_t g_macws_new_library_source_count = 0;
 
+// Narrow compatibility/observer boundary for precompiled libraries. ANGLE's
+// internal render utilities use -newLibraryWithData:error: instead of the
+// dynamic MSL source path above. The validated exact-library substitution is
+// production; its optional blob/caller logging has a separate sentinel so it
+// does not enable the much heavier private Metal cache instrumentation.
+typedef id (*macws_new_library_data_fn)(id, SEL, dispatch_data_t, NSError **)
+    __attribute__((ns_returns_retained));
+static macws_new_library_data_fn g_macws_new_library_data_orig = NULL;
+static _Atomic uint32_t g_macws_new_library_data_count = 0;
+
 static uint64_t macws_source_fnv1a64(const void *data, size_t length) {
     const uint8_t *bytes = (const uint8_t *)data;
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -7365,6 +7896,355 @@ static uint64_t macws_source_fnv1a64(const void *data, size_t length) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+// Chromium 148.0.7778.280 embeds ANGLE revision
+// 1ba8ec3afdee39c6b8d5c7268598b4beca530d07's default shader library as
+// air64-apple-macosx10.14.0. Runtime capture from the exact libGLESv2 image
+// showed that the container loads, but specialization of its function
+// constants through the iOS MTLCompilerService fails with "Target OS is
+// incompatible". The package carries the same generated ANGLE source compiled
+// by that real service through MacWS's macabi target adapter. Substitute only
+// the byte-exact upstream library; a different Electron build keeps its own
+// data and cannot accidentally receive a mismatched function set.
+static const size_t kMacWSANGLEDefaultMacOSBytes = 361943;
+static const uint64_t kMacWSANGLEDefaultMacOSHash =
+    UINT64_C(0x4a17e801057d2e72);
+static const size_t kMacWSANGLEDefaultMacABIBytes = 714152;
+static const uint64_t kMacWSANGLEDefaultMacABIHash =
+    UINT64_C(0x2b19e550c422772a);
+static const char *kMacWSANGLEDefaultMacABIPath =
+    "/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib";
+static dispatch_data_t g_macws_angle_default_macabi = NULL;
+
+static dispatch_data_t macws_angle_default_macabi_library(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        int fd = open(kMacWSANGLEDefaultMacABIPath, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return;
+        struct stat metadata = {0};
+        if (fstat(fd, &metadata) != 0 || metadata.st_size <= 0 ||
+            (size_t)metadata.st_size != kMacWSANGLEDefaultMacABIBytes) {
+            close(fd);
+            return;
+        }
+        size_t length = (size_t)metadata.st_size;
+        uint8_t *bytes = malloc(length);
+        if (!bytes) {
+            close(fd);
+            return;
+        }
+        size_t consumed = 0;
+        while (consumed < length) {
+            ssize_t count = read(fd, bytes + consumed, length - consumed);
+            if (count <= 0) break;
+            consumed += (size_t)count;
+        }
+        close(fd);
+        uint32_t magic = 0;
+        uint64_t container_length = 0;
+        if (consumed >= 24) {
+            memcpy(&magic, bytes, sizeof(magic));
+            memcpy(&container_length, bytes + 16, sizeof(container_length));
+        }
+        if (consumed == length && magic == UINT32_C(0x424c544d) &&
+            container_length == length &&
+            macws_source_fnv1a64(bytes, length) ==
+                kMacWSANGLEDefaultMacABIHash) {
+            // DEFAULT copies the package data into immutable dispatch-owned
+            // storage. Keep one process-lifetime object for all ANGLE displays.
+            g_macws_angle_default_macabi = dispatch_data_create(
+                bytes, length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        }
+        free(bytes);
+    });
+    return g_macws_angle_default_macabi;
+}
+
+// Read-only observers at the private Metal library-cache/compiler boundary.
+// RE-confirmed against macOS 13.4 Metal UUID
+// 2BAB169C-42DA-36E3-955A-F30B709EC2AD:
+//
+//   image+0x0ec430  MultiLevelPipelineCache::getElement
+//   image+0x023d6c  MTLLibraryCache::findLibraryData
+//   image+0x0ec530  processCompiledLibrary
+//
+// MTLLibraryBuilder::initLibraryContainerWithRequestData first asks the two
+// cache layers for a compiled dispatch-data blob.  Only a miss reaches the
+// real MTLCompilerRequest connection.  processCompiledLibrary is the common
+// validation boundary for a returned blob.  Capturing all three results is
+// therefore sufficient to distinguish a stale cache hit from a newly built
+// but incompatible container without changing either result.  These hooks are
+// installed only when /private/tmp/macws_mtl_library_diag exists before the
+// process starts; production never pays their cost.
+typedef dispatch_data_t (*macws_multilevel_get_element_fn)(
+    void *, const void *, bool);
+typedef dispatch_data_t (*macws_multilevel_get_archives_fn)(
+    void *, const void *, id);
+typedef id (*macws_binary_archive_cache_get_fn)(void *, const void *);
+typedef dispatch_data_t (*macws_multilevel_get_legacy_fn)(
+    void *, const void *);
+typedef int (*macws_fscache_open_with_key_fn)(
+    const char *, void *, void *, void *);
+typedef void *(*macws_library_cache_find_fn)(void *, const void *);
+typedef void (*macws_process_compiled_library_fn)(
+    dispatch_data_t, id, uint32_t, const void *, const void *, bool, uint64_t,
+    id, id, void **, NSError **, void *, uint64_t);
+
+static macws_multilevel_get_element_fn
+    g_macws_multilevel_get_element_orig = NULL;
+static macws_multilevel_get_archives_fn
+    g_macws_multilevel_get_archives_orig = NULL;
+static macws_binary_archive_cache_get_fn
+    g_macws_binary_archive_cache_get_orig = NULL;
+static macws_multilevel_get_legacy_fn
+    g_macws_multilevel_get_legacy_orig = NULL;
+static macws_fscache_open_with_key_fn
+    g_macws_fscache_open_with_key_orig = NULL;
+static macws_library_cache_find_fn g_macws_library_cache_find_orig = NULL;
+static macws_process_compiled_library_fn
+    g_macws_process_compiled_library_orig = NULL;
+static _Atomic uint32_t g_macws_metal_cache_sequence = 0;
+static _Atomic uint32_t g_macws_compiled_blob_sequence = 0;
+
+static dispatch_data_t macws_multilevel_get_archives_diag(
+    void *cache, const void *key, id archives) {
+    dispatch_data_t result = g_macws_multilevel_get_archives_orig
+        ? g_macws_multilevel_get_archives_orig(cache, key, archives) : NULL;
+    dprintf(STDERR_FILENO,
+        "#### MTL-CACHE tier=binary-archives cache=%p key=%p archives=%p "
+        "count=%lu result=%p bytes=%zu\n",
+        cache, key, (__bridge void *)archives,
+        archives && [archives respondsToSelector:@selector(count)]
+            ? (unsigned long)[archives count] : 0,
+        result, result ? dispatch_data_get_size(result) : 0);
+    return result;
+}
+
+static id macws_binary_archive_cache_get_diag(
+    void *cache, const void *key) {
+    id result = g_macws_binary_archive_cache_get_orig
+        ? g_macws_binary_archive_cache_get_orig(cache, key) : nil;
+    id path = cache ? *(id *)((uint8_t *)cache + 0xd0) : nil;
+    dprintf(STDERR_FILENO,
+        "#### MTL-CACHE tier=managed-binary-archive cache=%p key=%p "
+        "path=%s result=%p class=%s\n",
+        cache, key,
+        path && [path respondsToSelector:@selector(UTF8String)]
+            ? [path UTF8String] : "(nil)",
+        (__bridge void *)result,
+        result ? class_getName([result class]) : "(nil)");
+    return result;
+}
+
+static dispatch_data_t macws_multilevel_get_legacy_diag(
+    void *cache, const void *key) {
+    dispatch_data_t result = g_macws_multilevel_get_legacy_orig
+        ? g_macws_multilevel_get_legacy_orig(cache, key) : NULL;
+    dprintf(STDERR_FILENO,
+        "#### MTL-CACHE tier=legacy cache=%p key=%p result=%p bytes=%zu\n",
+        cache, key, result, result ? dispatch_data_get_size(result) : 0);
+    return result;
+}
+
+static int macws_fscache_open_with_key_diag(
+    const char *path, void *handle, void *config, void *key) {
+    int result = g_macws_fscache_open_with_key_orig
+        ? g_macws_fscache_open_with_key_orig(path, handle, config, key) : -1;
+    dprintf(STDERR_FILENO,
+        "#### MTL-CACHE fscache-open path=%s handle=%p config=%p key=%p "
+        "result=%d\n",
+        path ?: "(nil)", handle, config, key, result);
+    return result;
+}
+
+static dispatch_data_t macws_multilevel_get_element_diag(
+    void *cache, const void *key, bool flag) {
+    dispatch_data_t result = g_macws_multilevel_get_element_orig
+        ? g_macws_multilevel_get_element_orig(cache, key, flag) : NULL;
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_metal_cache_sequence, 1) + 1;
+    const void *bytes = NULL;
+    size_t length = 0;
+    dispatch_data_t mapped = result
+        ? dispatch_data_create_map(result, &bytes, &length) : NULL;
+    uint64_t blob_hash = bytes && length
+        ? macws_source_fnv1a64(bytes, length) : 0;
+    uint32_t magic = 0;
+    if (bytes && length >= sizeof(magic)) memcpy(&magic, bytes, sizeof(magic));
+    char path[PATH_MAX] = {0};
+    size_t written_total = 0;
+    // A Chromium GPU process asks this shared cache for hundreds of unrelated
+    // Mach-O/pipeline records before its first ANGLE source library.  Persist
+    // only actual MTLB containers, but allow enough requests to reach media
+    // shaders without turning the observer into a general cache dumper.
+    if (bytes && length && magic == UINT32_C(0x424c544d) &&
+        length <= 64 * 1024 * 1024 && sequence <= 4096) {
+        snprintf(path, sizeof(path),
+                 "/private/tmp/macws_cached_library_%04u_%016llx.bin",
+                 sequence, (unsigned long long)blob_hash);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            const uint8_t *cursor = (const uint8_t *)bytes;
+            size_t remaining = length;
+            while (remaining) {
+                ssize_t count = write(fd, cursor, remaining);
+                if (count <= 0) break;
+                cursor += count;
+                remaining -= (size_t)count;
+            }
+            written_total = length - remaining;
+            close(fd);
+        }
+    }
+    dprintf(STDERR_FILENO,
+        "#### MTL-CACHE multilevel #%u cache=%p key=%p flag=%d "
+        "result=%p bytes=%zu magic=%#x hash=%016llx path=%s written=%zu\n",
+        sequence, cache, key, flag, result,
+        length, magic, (unsigned long long)blob_hash,
+        path[0] ? path : "(none)", written_total);
+    if (mapped) dispatch_release(mapped);
+    return result;
+}
+
+static void *macws_library_cache_find_diag(void *cache, const void *key) {
+    void *result = g_macws_library_cache_find_orig
+        ? g_macws_library_cache_find_orig(cache, key) : NULL;
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_metal_cache_sequence, 1) + 1;
+    dprintf(STDERR_FILENO,
+        "#### MTL-CACHE library #%u cache=%p key=%p result=%p\n",
+        sequence, cache, key, result);
+    return result;
+}
+
+static void macws_process_compiled_library_diag(
+    dispatch_data_t data, id device, uint32_t request_type,
+    const void *pipeline_cache, const void *key, bool flag,
+    uint64_t library_type, id functions, id function_list,
+    void **library_data, NSError **error, void *outputs,
+    uint64_t compiler_option) {
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_compiled_blob_sequence, 1) + 1;
+    const void *bytes = NULL;
+    size_t length = 0;
+    dispatch_data_t mapped = data
+        ? dispatch_data_create_map(data, &bytes, &length) : NULL;
+    uint64_t blob_hash = bytes && length
+        ? macws_source_fnv1a64(bytes, length) : 0;
+    uint32_t magic = 0;
+    if (bytes && length >= sizeof(magic)) memcpy(&magic, bytes, sizeof(magic));
+
+    char path[PATH_MAX] = {0};
+    size_t written_total = 0;
+    if (bytes && length && length <= 64 * 1024 * 1024 && sequence <= 512) {
+        snprintf(path, sizeof(path),
+                 "/private/tmp/macws_compiled_library_%04u_%016llx.bin",
+                 sequence, (unsigned long long)blob_hash);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            const uint8_t *cursor = (const uint8_t *)bytes;
+            size_t remaining = length;
+            while (remaining) {
+                ssize_t count = write(fd, cursor, remaining);
+                if (count <= 0) break;
+                cursor += count;
+                remaining -= (size_t)count;
+            }
+            written_total = length - remaining;
+            close(fd);
+        }
+    }
+    dprintf(STDERR_FILENO,
+        "#### MTL-COMPILED-BLOB in #%u data=%p bytes=%zu magic=%#x "
+        "hash=%016llx requestType=%u device=%s libraryType=%llu flag=%d "
+        "compilerOption=%llu path=%s written=%zu\n",
+        sequence, data, length, magic, (unsigned long long)blob_hash,
+        request_type, device ? class_getName([device class]) : "(nil)",
+        (unsigned long long)library_type, flag,
+        (unsigned long long)compiler_option, path[0] ? path : "(none)",
+        written_total);
+
+    if (g_macws_process_compiled_library_orig) {
+        g_macws_process_compiled_library_orig(
+            data, device, request_type, pipeline_cache, key, flag,
+            library_type, functions, function_list, library_data, error,
+            outputs, compiler_option);
+    }
+    dprintf(STDERR_FILENO,
+        "#### MTL-COMPILED-BLOB out #%u libraryData=%p error=%s\n",
+        sequence, library_data ? *library_data : NULL,
+        error && *error ? (*error).localizedDescription.UTF8String : "(nil)");
+    if (mapped) dispatch_release(mapped);
+}
+
+static BOOL macws_macho_has_uuid(const struct mach_header *header,
+                                 const uint8_t expected[16]) {
+    if (!header || header->magic != MH_MAGIC_64) return NO;
+    const struct mach_header_64 *header64 =
+        (const struct mach_header_64 *)header;
+    const uint8_t *cursor = (const uint8_t *)(header64 + 1);
+    const uint8_t *limit = cursor + header64->sizeofcmds;
+    for (uint32_t index = 0; index < header64->ncmds; index++) {
+        if (cursor + sizeof(struct load_command) > limit) return NO;
+        const struct load_command *command =
+            (const struct load_command *)cursor;
+        if (command->cmdsize < sizeof(*command) ||
+            cursor + command->cmdsize > limit)
+            return NO;
+        if (command->cmd == LC_UUID &&
+            command->cmdsize >= sizeof(struct uuid_command)) {
+            const struct uuid_command *uuid =
+                (const struct uuid_command *)command;
+            return memcmp(uuid->uuid, expected, 16) == 0;
+        }
+        cursor += command->cmdsize;
+    }
+    return NO;
+}
+
+static void macws_install_metal_library_boundary_diagnostics(
+    const struct mach_header *header, intptr_t slide) {
+    (void)slide;
+    if (access("/private/tmp/macws_mtl_library_diag", F_OK) != 0) return;
+    static const uint8_t metal_13_4_uuid[16] = {
+        0x2b, 0xab, 0x16, 0x9c, 0x42, 0xda, 0x36, 0xe3,
+        0x95, 0x5a, 0xf3, 0x0b, 0x70, 0x9e, 0xc2, 0xad,
+    };
+    if (!macws_macho_has_uuid(header, metal_13_4_uuid)) return;
+    static _Atomic bool installed = false;
+    if (atomic_exchange(&installed, true)) return;
+
+    uint8_t *base = (uint8_t *)header;
+    MSHookFunction(base + 0x0ec430,
+                   (void *)macws_multilevel_get_element_diag,
+                   (void **)&g_macws_multilevel_get_element_orig);
+    MSHookFunction(base + 0x104e1c,
+                   (void *)macws_multilevel_get_archives_diag,
+                   (void **)&g_macws_multilevel_get_archives_orig);
+    MSHookFunction(base + 0x04a67c,
+                   (void *)macws_binary_archive_cache_get_diag,
+                   (void **)&g_macws_binary_archive_cache_get_orig);
+    MSHookFunction(base + 0x0f6ff8,
+                   (void *)macws_multilevel_get_legacy_diag,
+                   (void **)&g_macws_multilevel_get_legacy_orig);
+    void *fscache_open = dlsym(RTLD_DEFAULT, "fscache_open_with_key");
+    if (fscache_open) {
+        MSHookFunction(fscache_open,
+                       (void *)macws_fscache_open_with_key_diag,
+                       (void **)&g_macws_fscache_open_with_key_orig);
+    }
+    MSHookFunction(base + 0x023d6c,
+                   (void *)macws_library_cache_find_diag,
+                   (void **)&g_macws_library_cache_find_orig);
+    MSHookFunction(base + 0x0ec530,
+                   (void *)macws_process_compiled_library_diag,
+                   (void **)&g_macws_process_compiled_library_orig);
+    dprintf(STDERR_FILENO,
+        "#### MTL-LIB-BOUNDARY diagnostics installed Metal=%p "
+        "multi=%p library=%p process=%p fscacheOpen=%p\n",
+        base, base + 0x0ec430, base + 0x023d6c, base + 0x0ec530,
+        fscache_open);
 }
 
 static unsigned long long macws_objc_unsigned_property(id object,
@@ -7383,7 +8263,10 @@ static id macws_new_library_source_diag(id self, SEL selector,
                                         NSError **error) {
     uint32_t sequence =
         atomic_fetch_add(&g_macws_new_library_source_count, 1) + 1;
-    BOOL log_this = sequence <= 32;
+    // Chromium creates dozens of UI libraries before the first media shader.
+    // Keep this bounded, but large enough that a post-navigation ANGLE failure
+    // cannot fall past the recorder as it did with the former 32-call limit.
+    BOOL log_this = sequence <= 256;
     const char *source_utf8 = source.UTF8String ?: "";
     size_t source_utf8_length = strlen(source_utf8);
     uint64_t source_hash = macws_source_fnv1a64(source_utf8,
@@ -7405,7 +8288,7 @@ static id macws_new_library_source_diag(id self, SEL selector,
                                                    withString:@"\\n"]
                        stringByReplacingOccurrencesOfString:@"\r"
                                                    withString:@"\\r"];
-        fprintf(stderr,
+        dprintf(STDERR_FILENO,
             "#### MTL-LIB-SOURCE in #%u pid=%d device=%s sourceLength=%lu "
             "sourceUTF8Length=%zu sourceHash=%016llx "
             "optionsClass=%s languageVersion=%s%llu libraryType=%s%llu "
@@ -7421,16 +8304,13 @@ static id macws_new_library_source_diag(id self, SEL selector,
             prefix.UTF8String ?: "");
     }
 
-    NSError *local_error = nil;
-    NSError **error_pointer = error ? error : &local_error;
-    *error_pointer = nil;
     id result = g_macws_new_library_source_orig
         ? g_macws_new_library_source_orig(self, selector, source, options,
-                                          error_pointer)
+                                          error)
         : nil;
     if (log_this) {
-        NSError *returned_error = *error_pointer;
-        fprintf(stderr,
+        NSError *returned_error = error ? *error : nil;
+        dprintf(STDERR_FILENO,
             "#### MTL-LIB-SOURCE out #%u sourceHash=%016llx library=%p class=%s "
             "errorDomain=%s errorCode=%ld description=%s userInfo=%s\n",
             sequence, (unsigned long long)source_hash, (void *)result,
@@ -7442,7 +8322,360 @@ static id macws_new_library_source_diag(id self, SEL selector,
             returned_error ? returned_error.userInfo.description.UTF8String
                            : "(nil)");
     }
+    if (!result && source_utf8_length && sequence <= 256) {
+        char failure_path[PATH_MAX];
+        snprintf(failure_path, sizeof(failure_path),
+                 "/private/tmp/macws_mtl_source_failure_%016llx.metal",
+                 (unsigned long long)source_hash);
+        int fd = open(failure_path,
+                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            const uint8_t *cursor = (const uint8_t *)source_utf8;
+            size_t remaining = source_utf8_length;
+            while (remaining) {
+                ssize_t written = write(fd, cursor, remaining);
+                if (written <= 0) break;
+                cursor += written;
+                remaining -= (size_t)written;
+            }
+            close(fd);
+            dprintf(STDERR_FILENO,
+                "#### MTL-LIB-SOURCE failureDump #%u sourceHash=%016llx "
+                "path=%s written=%zu/%zu\n",
+                sequence, (unsigned long long)source_hash, failure_path,
+                source_utf8_length - remaining, source_utf8_length);
+        }
+    }
     return result;
+}
+
+static id macws_new_library_data_compat(id self, SEL selector,
+                                        dispatch_data_t data,
+                                        NSError **error)
+    __attribute__((ns_returns_retained));
+static id macws_new_library_data_compat(id self, SEL selector,
+                                        dispatch_data_t data,
+                                        NSError **error) {
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_new_library_data_count, 1) + 1;
+    BOOL diagnostic =
+        access("/private/tmp/macws_mtl_data_diag", F_OK) == 0;
+    const void *bytes = NULL;
+    size_t length = data ? dispatch_data_get_size(data) : 0;
+    dispatch_data_t mapped = NULL;
+    if (data && (diagnostic ||
+                 (getenv("MACWS_AGX_NATIVE") &&
+                  length == kMacWSANGLEDefaultMacOSBytes))) {
+        mapped = dispatch_data_create_map(data, &bytes, &length);
+    }
+    uint32_t magic = 0;
+    if (bytes && length >= sizeof(magic)) memcpy(&magic, bytes, sizeof(magic));
+    uint64_t hash = bytes && length
+        ? macws_source_fnv1a64(bytes, length) : 0;
+    dispatch_data_t selected_data = data;
+    BOOL substituted = NO;
+    if (getenv("MACWS_AGX_NATIVE") &&
+        length == kMacWSANGLEDefaultMacOSBytes &&
+        hash == kMacWSANGLEDefaultMacOSHash) {
+        dispatch_data_t replacement = macws_angle_default_macabi_library();
+        if (replacement) {
+            selected_data = replacement;
+            substituted = YES;
+        }
+    }
+
+    id result = g_macws_new_library_data_orig
+        ? g_macws_new_library_data_orig(self, selector, selected_data, error)
+        : nil;
+    NSError *returned_error = error ? *error : nil;
+
+    char path[PATH_MAX] = {0};
+    size_t written_total = 0;
+    if (diagnostic && bytes && length && length <= 64 * 1024 * 1024 &&
+        sequence <= 8) {
+        snprintf(path, sizeof(path),
+                 "/private/tmp/macws_mtl_data_%04u_%016llx.bin",
+                 sequence, (unsigned long long)hash);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            const uint8_t *cursor = (const uint8_t *)bytes;
+            size_t remaining = length;
+            while (remaining) {
+                ssize_t written = write(fd, cursor, remaining);
+                if (written <= 0) break;
+                cursor += written;
+                remaining -= (size_t)written;
+            }
+            written_total = length - remaining;
+            close(fd);
+        }
+    }
+    if (diagnostic) {
+        void *return_address = ptrauth_strip(__builtin_return_address(0),
+                                            ptrauth_key_return_address);
+        Dl_info caller = {0};
+        dladdr(return_address, &caller);
+        dprintf(STDERR_FILENO,
+            "#### MTL-LIB-DATA #%u pid=%d device=%s data=%p bytes=%zu "
+            "magic=%#x hash=%016llx substituted=%d selectedBytes=%zu "
+            "result=%p class=%s errorDomain=%s errorCode=%ld "
+            "description=%s caller=%s+%#llx path=%s written=%zu\n",
+            sequence, getpid(), class_getName([self class]), data, length,
+            magic, (unsigned long long)hash, substituted,
+            selected_data ? dispatch_data_get_size(selected_data) : 0,
+            (void *)result, result ? class_getName([result class]) : "(nil)",
+            returned_error ? returned_error.domain.UTF8String : "(nil)",
+            returned_error ? (long)returned_error.code : 0L,
+            returned_error ? returned_error.localizedDescription.UTF8String
+                           : "(nil)",
+            caller.dli_fname ?: "(unknown)",
+            caller.dli_fbase
+                ? (unsigned long long)((uintptr_t)return_address -
+                                       (uintptr_t)caller.dli_fbase) : 0,
+            path[0] ? path : "(none)", written_total);
+    }
+    if (mapped) dispatch_release(mapped);
+    return result;
+}
+
+typedef id (*macws_render_pipeline_error_fn)(
+    id, SEL, MTLRenderPipelineDescriptor *, NSError **)
+    __attribute__((ns_returns_retained));
+typedef id (*macws_render_pipeline_options_fn)(
+    id, SEL, MTLRenderPipelineDescriptor *, MTLPipelineOption,
+    MTLAutoreleasedRenderPipelineReflection **, NSError **)
+    __attribute__((ns_returns_retained));
+typedef void (^macws_render_pipeline_completion_block)(
+    id<MTLRenderPipelineState>, NSError *);
+typedef void (^macws_render_pipeline_reflection_completion_block)(
+    id<MTLRenderPipelineState>, MTLRenderPipelineReflection *, NSError *);
+typedef void (*macws_render_pipeline_async_fn)(
+    id, SEL, MTLRenderPipelineDescriptor *,
+    macws_render_pipeline_completion_block);
+typedef void (*macws_render_pipeline_async_options_fn)(
+    id, SEL, MTLRenderPipelineDescriptor *, MTLPipelineOption,
+    macws_render_pipeline_reflection_completion_block);
+static macws_render_pipeline_error_fn g_macws_pipeline_error_orig = NULL;
+static macws_render_pipeline_options_fn g_macws_pipeline_options_orig = NULL;
+static macws_render_pipeline_async_fn g_macws_pipeline_async_orig = NULL;
+static macws_render_pipeline_async_options_fn
+    g_macws_pipeline_async_options_orig = NULL;
+static _Atomic uint32_t g_macws_pipeline_diag_count = 0;
+
+typedef id (*macws_compute_pipeline_function_fn)(
+    id, SEL, id<MTLFunction>, NSError **)
+    __attribute__((ns_returns_retained));
+static macws_compute_pipeline_function_fn
+    g_macws_compute_pipeline_function_orig = NULL;
+static _Atomic uint32_t g_macws_compute_pipeline_diag_count = 0;
+
+static id macws_compute_pipeline_function_diag(
+        id self, SEL selector, id<MTLFunction> function, NSError **error)
+    __attribute__((ns_returns_retained));
+static id macws_compute_pipeline_function_diag(
+        id self, SEL selector, id<MTLFunction> function, NSError **error) {
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_compute_pipeline_diag_count, 1) + 1;
+    void *return_address = ptrauth_strip(__builtin_return_address(0),
+                                        ptrauth_key_return_address);
+    Dl_info caller = {0};
+    dladdr(return_address, &caller);
+    id result = g_macws_compute_pipeline_function_orig
+        ? g_macws_compute_pipeline_function_orig(self, selector, function,
+                                                  error) : nil;
+    NSError *returned_error = error ? *error : nil;
+    dprintf(STDERR_FILENO,
+        "#### COMPUTE-PIPELINE #%u device=%s function=%s result=%p "
+        "class=%s errorDomain=%s errorCode=%ld description=%s userInfo=%s "
+        "caller=%s+%#llx\n",
+        sequence, class_getName([self class]),
+        function.name.UTF8String ?: "(nil)", (void *)result,
+        result ? class_getName([result class]) : "(nil)",
+        returned_error ? returned_error.domain.UTF8String : "(nil)",
+        returned_error ? (long)returned_error.code : 0L,
+        returned_error ? returned_error.localizedDescription.UTF8String
+                       : "(nil)",
+        returned_error ? returned_error.userInfo.description.UTF8String
+                       : "(nil)",
+        caller.dli_fname ?: "(unknown)",
+        caller.dli_fbase
+            ? (unsigned long long)((uintptr_t)return_address -
+                                   (uintptr_t)caller.dli_fbase) : 0);
+    return result;
+}
+
+static void macws_log_pipeline_result(uint32_t sequence, id device,
+                                      MTLRenderPipelineDescriptor *descriptor,
+                                      id result, NSError *error,
+                                      const char *variant,
+                                      unsigned long long options) {
+    BOOL log_this = sequence <= 192 || (!result && sequence <= 512);
+    if (!log_this) return;
+    NSString *label = nil, *vertex_name = nil, *fragment_name = nil;
+    NSUInteger color_formats[4] = {0, 0, 0, 0};
+    NSUInteger depth_format = 0, stencil_format = 0, sample_count = 0;
+    @try {
+        label = descriptor.label;
+        vertex_name = descriptor.vertexFunction.name;
+        fragment_name = descriptor.fragmentFunction.name;
+        for (NSUInteger i = 0; i < 4; i++)
+            color_formats[i] = descriptor.colorAttachments[i].pixelFormat;
+        depth_format = descriptor.depthAttachmentPixelFormat;
+        stencil_format = descriptor.stencilAttachmentPixelFormat;
+        sample_count = descriptor.sampleCount;
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    dprintf(STDERR_FILENO,
+        "#### RENDER-PIPELINE #%u variant=%s device=%s options=%#llx "
+        "label=%s vertex=%s fragment=%s colors=%lu,%lu,%lu,%lu "
+        "depth=%lu stencil=%lu samples=%lu result=%p class=%s "
+        "errorDomain=%s errorCode=%ld description=%s userInfo=%s\n",
+        sequence, variant, class_getName([device class]), options,
+        label.UTF8String ?: "(nil)", vertex_name.UTF8String ?: "(nil)",
+        fragment_name.UTF8String ?: "(nil)",
+        (unsigned long)color_formats[0], (unsigned long)color_formats[1],
+        (unsigned long)color_formats[2], (unsigned long)color_formats[3],
+        (unsigned long)depth_format, (unsigned long)stencil_format,
+        (unsigned long)sample_count, (void *)result,
+        result ? class_getName([result class]) : "(nil)",
+        error ? error.domain.UTF8String : "(not-requested-or-nil)",
+        error ? (long)error.code : 0L,
+        error ? error.localizedDescription.UTF8String : "(nil)",
+        error ? error.userInfo.description.UTF8String : "(nil)");
+}
+
+static id macws_render_pipeline_error_diag(
+        id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
+        NSError **error) __attribute__((ns_returns_retained));
+static id macws_render_pipeline_error_diag(
+        id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
+        NSError **error) {
+    uint32_t sequence = atomic_fetch_add(&g_macws_pipeline_diag_count, 1) + 1;
+    id result = g_macws_pipeline_error_orig
+        ? g_macws_pipeline_error_orig(self, selector, descriptor, error) : nil;
+    NSError *returned_error = error ? *error : nil;
+    macws_log_pipeline_result(sequence, self, descriptor, result,
+                              returned_error, "error", 0);
+    return result;
+}
+
+static id macws_render_pipeline_options_diag(
+        id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
+        MTLPipelineOption options,
+        MTLAutoreleasedRenderPipelineReflection **reflection,
+        NSError **error) __attribute__((ns_returns_retained));
+static id macws_render_pipeline_options_diag(
+        id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
+        MTLPipelineOption options,
+        MTLAutoreleasedRenderPipelineReflection **reflection,
+        NSError **error) {
+    uint32_t sequence = atomic_fetch_add(&g_macws_pipeline_diag_count, 1) + 1;
+    id result = g_macws_pipeline_options_orig
+        ? g_macws_pipeline_options_orig(self, selector, descriptor, options,
+                                        reflection, error) : nil;
+    NSError *returned_error = error ? *error : nil;
+    macws_log_pipeline_result(sequence, self, descriptor, result,
+                              returned_error, "options", options);
+    return result;
+}
+
+static void macws_render_pipeline_async_diag(
+        id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
+        macws_render_pipeline_completion_block completion) {
+    uint32_t sequence = atomic_fetch_add(&g_macws_pipeline_diag_count, 1) + 1;
+    if (!g_macws_pipeline_async_orig) return;
+    if (!completion) {
+        // Preserve the caller's nil completion exactly.  The diagnostic must
+        // not turn an invalid call into a different API contract.
+        g_macws_pipeline_async_orig(self, selector, descriptor, completion);
+        return;
+    }
+    g_macws_pipeline_async_orig(
+        self, selector, descriptor,
+        ^(id<MTLRenderPipelineState> pipeline, NSError *error) {
+            macws_log_pipeline_result(sequence, self, descriptor, pipeline,
+                                      error, "async", 0);
+            completion(pipeline, error);
+        });
+}
+
+static void macws_render_pipeline_async_options_diag(
+        id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
+        MTLPipelineOption options,
+        macws_render_pipeline_reflection_completion_block completion) {
+    uint32_t sequence = atomic_fetch_add(&g_macws_pipeline_diag_count, 1) + 1;
+    if (!g_macws_pipeline_async_options_orig) return;
+    if (!completion) {
+        g_macws_pipeline_async_options_orig(self, selector, descriptor,
+                                            options, completion);
+        return;
+    }
+    g_macws_pipeline_async_options_orig(
+        self, selector, descriptor, options,
+        ^(id<MTLRenderPipelineState> pipeline,
+          MTLRenderPipelineReflection *reflection, NSError *error) {
+            macws_log_pipeline_result(sequence, self, descriptor, pipeline,
+                                      error, "async-options", options);
+            completion(pipeline, reflection, error);
+        });
+}
+
+// Install subclass-local read-only overrides. class_addMethod is deliberate:
+// if Metal inherits the implementation from IOGPUMetalDevice, changing that
+// Method would affect unrelated device classes in the process. The saved IMP
+// is the exact implementation that ordinary dispatch selected before the
+// override, and every caller argument is forwarded unchanged.
+static void macws_install_render_pipeline_diagnostic(Class agx) {
+    if (!macws_pipeline_diag_enabled()) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct {
+            const char *name;
+            IMP replacement;
+            IMP *original;
+        } entries[] = {
+            { "newRenderPipelineStateWithDescriptor:error:",
+              (IMP)macws_render_pipeline_error_diag,
+              (IMP *)&g_macws_pipeline_error_orig },
+            { "newRenderPipelineStateWithDescriptor:options:reflection:error:",
+              (IMP)macws_render_pipeline_options_diag,
+              (IMP *)&g_macws_pipeline_options_orig },
+            { "newRenderPipelineStateWithDescriptor:completionHandler:",
+              (IMP)macws_render_pipeline_async_diag,
+              (IMP *)&g_macws_pipeline_async_orig },
+            { "newRenderPipelineStateWithDescriptor:options:completionHandler:",
+              (IMP)macws_render_pipeline_async_options_diag,
+              (IMP *)&g_macws_pipeline_async_options_orig },
+            { "newComputePipelineStateWithFunction:error:",
+              (IMP)macws_compute_pipeline_function_diag,
+              (IMP *)&g_macws_compute_pipeline_function_orig },
+        };
+        for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+            SEL selector = sel_registerName(entries[i].name);
+            Method inherited = class_getInstanceMethod(agx, selector);
+            if (!inherited) {
+                dprintf(STDERR_FILENO,
+                    "#### RENDER-PIPELINE diagnostic missing %s on %s\n",
+                    entries[i].name, class_getName(agx));
+                continue;
+            }
+            IMP original = method_getImplementation(inherited);
+            *entries[i].original = original;
+            const char *types = method_getTypeEncoding(inherited);
+            BOOL added = class_addMethod(agx, selector,
+                                         entries[i].replacement, types);
+            if (!added) {
+                Method own = class_getInstanceMethod(agx, selector);
+                method_setImplementation(own, entries[i].replacement);
+            }
+            dprintf(STDERR_FILENO,
+                "#### RENDER-PIPELINE diagnostic installed selector=%s "
+                "class=%s original=%p subclassOverride=%s types=%s\n",
+                entries[i].name, class_getName(agx), (void *)original,
+                added ? "YES" : "NO", types ?: "(nil)");
+        }
+    });
 }
 
 static void macws_install_source_library_diagnostic(Class agx) {
@@ -7450,7 +8683,7 @@ static void macws_install_source_library_diagnostic(Class agx) {
     SEL selector = sel_registerName("newLibraryWithSource:options:error:");
     Method method = class_getInstanceMethod(agx, selector);
     if (!method) {
-        fprintf(stderr,
+        dprintf(STDERR_FILENO,
             "#### MTL-LIB-SOURCE diagnostic missing selector on %s\n",
             class_getName(agx));
         return;
@@ -7466,9 +8699,39 @@ static void macws_install_source_library_diagnostic(Class agx) {
         method_setImplementation(own_method,
                                  (IMP)macws_new_library_source_diag);
     }
-    fprintf(stderr,
+    dprintf(STDERR_FILENO,
         "#### MTL-LIB-SOURCE diagnostic installed on %s orig=%p\n",
         class_getName(agx), (void *)current);
+}
+
+static void macws_install_data_library_compatibility(Class agx) {
+    SEL selector = sel_registerName("newLibraryWithData:error:");
+    Method method = class_getInstanceMethod(agx, selector);
+    if (!method) {
+        if (access("/private/tmp/macws_mtl_data_diag", F_OK) == 0) {
+            dprintf(STDERR_FILENO,
+                "#### MTL-LIB-DATA compatibility missing selector on %s\n",
+                class_getName(agx));
+        }
+        return;
+    }
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)macws_new_library_data_compat) return;
+    g_macws_new_library_data_orig = (macws_new_library_data_fn)current;
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(agx, selector, (IMP)macws_new_library_data_compat,
+                         types)) {
+        Method own_method = class_getInstanceMethod(agx, selector);
+        method_setImplementation(own_method,
+                                 (IMP)macws_new_library_data_compat);
+    }
+    if (access("/private/tmp/macws_mtl_data_diag", F_OK) == 0) {
+        dprintf(STDERR_FILENO,
+            "#### MTL-LIB-DATA compatibility installed on %s orig=%p "
+            "types=%s replacement=%s\n",
+            class_getName(agx), (void *)current, types ?: "(nil)",
+            kMacWSANGLEDefaultMacABIPath);
+    }
 }
 
 // macOS Metal's private -[MTLDevice newEvent] contract is still used by
@@ -7558,6 +8821,8 @@ static void install_agx_init_redirect(Class agx) {
     install_cbri_probe();         // log commandBufferResourceInfo returns
     macws_install_tile_descriptor_diagnostic();
     macws_install_source_library_diagnostic(agx);
+    macws_install_data_library_compatibility(agx);
+    macws_install_render_pipeline_diagnostic(agx);
     macws_install_new_event_compat(agx);
     // (no pipeline fallback — see removed block above)
 
@@ -7817,6 +9082,9 @@ static void install_agx_init_redirect(Class agx) {
                                 hasTarget ? target.command_buffer : 0);
                         }
                     }
+                }
+                if (side == 0 && tex) {
+                    macws_log_video_texture_binding(self_, tex, idx);
                 }
                 if (!tex) {
                     static int nil_guard_log[2] = {0, 0};
@@ -8419,6 +9687,12 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 __attribute__((constructor)) static void InitMetalHooks() {
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
+
+    // The callback is inert unless the focused source-library diagnostic
+    // sentinel existed at process start. dyld also invokes it immediately for
+    // already-loaded images, so it is race-free for Metal-linked clients.
+    _dyld_register_func_for_add_image(
+        macws_install_metal_library_boundary_diagnostics);
 
     // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
     // at first invocation and decides whether to return AGXG13GFamilyDevice or Nil.

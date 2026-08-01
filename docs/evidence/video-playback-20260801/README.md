@@ -34,26 +34,138 @@ textures:
 #### MTL_TEX/iosurf.OUT -> 0x601ed4600 (label=(nolabel))
 ```
 
-RE-confirmed in this tree: the pre-fix type-`0x82` translator wrote constant
-zero to the iOS `args+0x38` plane field. The actual call above asks for RG8
-plane 1, so the translator discarded a real semantic input even though both
-texture constructors returned non-nil. `Metal_hooks.x` now carries
-IOSurfaceID, plane and compression span as one lock-protected scope, and
-`mac_hooks.m` writes the scoped plane at `args+0x38`. Adjacent per-plane
-IOSurface getters are recovered from explicit creation properties because
-disassembly of the macOS 13.4 and iOS 16.3 IOSurface binaries shows their
-field offsets differ.
+RE-confirmed in this tree: the pre-fix type-`0x82` translator discarded a real
+semantic plane input even though both texture constructors returned non-nil.
+`Metal_hooks.x` now carries IOSurfaceID, plane and compression span as one
+lock-protected scope. Adjacent per-plane IOSurface getters are recovered from
+explicit creation properties because disassembly of the macOS 13.4 and iOS
+16.3 IOSurface binaries shows their field offsets differ.
 
-## Validation boundary
+The initial translator follow-up placed the scoped plane at `args+0x38`. That
+was still the wrong ABI field. The project LLDB tool then traced a native iOS
+process creating R8 plane 0 and RG8 plane 1 views of the same two-plane `420v`
+surface. The complete trace is in `native-ios-type82-nv12.log`; its decisive
+returns are:
 
-The plane fix compiled, packaged and installed successfully. A later bounded
-production run did obtain post-fix screenshots, but they still show severe
-green/magenta colour mapping. Consequently the earlier plane-field mismatch
-was real, but it was not the only presentation fault. Bilibili correct-colour
-playback and the first seconds of Apple's product animation remain runtime
-acceptance tests. The Apple symptom is a THEORY in the same
-IOSurface/NV12/compiler-target family until a post-fix frame capture proves or
-disproves it.
+```text
+Y : type=0x82 in+30=0x00000000000000a7 in+38=0 in+50=0x180888c00
+UV: type=0x82 in+30=0x00000001000000a7 in+38=0 in+50=0x180888d00
+```
+
+Runtime-confirmed: the low 32 bits at `+0x30` are the IOSurface ID and the high
+32 bits at `+0x34` are the plane. `+0x38` is zero for both native calls. This
+also matches the iOS IOGPU call-site instruction
+`stp w0, w21, [x24, #0x30]`: `w0` is the surface ID and `w21` is the plane.
+The production translator now writes that exact packed pair and clears the
+incorrect shifted field instead of forcing a validation result.
+
+## Direct-GPU A/B isolation
+
+A sentinel-only in-process probe sampled a decoded NV12 frame twice through
+one independently compiled Metal pipeline and one command buffer:
+
+1. directly from the two external IOSurface-backed R8/RG8 textures;
+2. from ordinary Metal textures populated with the exact public `getBytes`
+   output of those same views.
+
+Before the `+0x34` fix, the direct sample was green/magenta while the CPU clone
+was correct. After the fix both 640×360 RGBA outputs were byte-identical:
+
+```text
+direct IOSurface SHA-256  8e62a43759486cbbe9350a548d36b35b287b061d46be2daab383df0ec74cca39
+CPU clone SHA-256         8e62a43759486cbbe9350a548d36b35b287b061d46be2daab383df0ec74cca39
+Y raw == Metal getBytes   96822f7b06bf6b1a90ca0e0cf4eca2bdaa3dd8518967bb09a20eb68d2a1bb2ab
+UV raw == Metal getBytes  06ab559e76dfa5a2290e9bf5fe828dc3d856f79114e65a63e3e5680ea217ec50
+```
+
+![Correct native-AGX IOSurface NV12 sample](nv12-gpu-plane34-iosurface.png)
+
+This runtime-confirms that decoder output, CPU plane addressing, Metal source
+compilation, the conversion shader, and generic command submission were
+already sound. The corruption boundary was specifically the external
+IOSurface plane resource imported with the wrong IOGPU type-`0x82` ABI.
+
+## Production validation
+
+The final plane fix compiled, packaged, installed, and ran with the production
+preflight reporting all dump/trace sentinels off. In a bounded VSCode run the
+Bilibili AV1 element reported `readyState=4`, `paused=false`, `error=null`, and
+advanced from media time `132.526404` / 309 total frames to `140.866912` / 562
+total frames. It recorded three dropped frames and zero corrupted frames. A
+compositor screenshot from the same run shows normal colours instead of the
+pre-fix green/magenta mapping:
+
+![VSCode Bilibili playback after native plane ABI fix](vscode-bilibili-plane34.png)
+
+The later interval in this particular source is a black title card, so media
+time advancement there is not promoted to a dynamic-frame stability claim.
+The validated interval above contains 253 newly presented frames and is the
+bounded production acceptance witness. Apple's product-page animation remains
+a separate integration test; this evidence does not claim that every codec,
+colour space, or website-specific animation is now covered.
+
+## Real VNC primary-plane capture
+
+The correct Chromium DevTools screenshot still did not prove that VNC could
+see the video. A simultaneous A/B showed correct, advancing video in
+`Page.captureScreenshot` while the true 2388×1668 RFB frame contained a black
+video rectangle. The boundary was therefore after Chromium composition and
+before the WindowServer primary scanout consumed by VNC.
+
+RE-confirmed in the exact installed Electron Framework
+`4C4C4442-5555-3144-A1A8-564169F3FF00`:
+
+```text
+OverlayProcessorMac::ProcessForOverlays       image + 0x0ca10b8
+CALayerOverlayProcessor::ProcessForCALayer... image + 0x0ca1254
+video_capture_enabled load                    image + 0x0ca12a8
+AggregatedRenderPass field                    render_pass + 0x0e2
+capture result                                w20 = 0x21 at +0x0ca17f0
+```
+
+Chromium 148.0.7778.280's actual source confirms the same invariant:
+`ProcessForCALayerOverlays` returns
+`kCALayerFailedVideoCaptureEnabled` when that field is set, after which
+`OverlayProcessorMac` preserves the root quads and appends its normal primary
+plane. Replacing the whole factory with `OverlayProcessorStub` was explicitly
+disproved: the real VNC client area became entirely black because the Stub did
+not perform that Mac primary-plane fallback.
+
+Production now keeps Chromium's `OverlayProcessorMac`. In the GPU helper only,
+after UUID/prologue/dataflow verification, two instructions are rearranged:
+
+```text
+before: mov x23,x1;             ldrb w8,[x1,#0xe2]
+after:  strb w8,[x1,#0xe2];     mov  x23,x1
+```
+
+The preceding unmodified `cmp w8,#1; b.ne` proves that `w8` is exactly one on
+this fallthrough. Thus the adapter writes Chromium's real capture field; its
+original `tbnz`, result selection, body, return and primary-plane fallback all
+remain intact. An earlier whole-function Substrate trampoline produced three
+GPU-helper exits during cold launch. The final two-instruction adapter produced
+zero `GPU process exited unexpectedly` lines in the bounded cold run.
+
+The true RFB frames below were captured three seconds apart. They are normal
+colour primary-scanout frames, not CDP screenshots, and have different hashes:
+
+```text
+vscode-bilibili-vnc-primary-03.png
+  5d0ad9ce784aefa6c638e14f09d51d0f3ef1aa91d02edac9a23d50f2c4819013
+vscode-bilibili-vnc-primary-06.png
+  8f604d822b46ac8dc5856b9a1523a1ca222fd3eb12602b53c621c065977d2146
+```
+
+![Bilibili video in the real VNC primary scanout](vscode-bilibili-vnc-primary-03.png)
+
+![Later real VNC frame](vscode-bilibili-vnc-primary-06.png)
+
+The matching observe-only CDP record is
+`vscode-bilibili-vnc-primary-cdp.json`. Across four seconds it reported
+`paused=false`, `readyState=4`, `error=null`, media time
+`72.2603 → 76.757731`, total frames `2173 → 2307`, dropped frames
+`33 → 35`, and corrupted frames fixed at zero. Together with the visible RFB
+frames, this runtime-confirms both playback progress and VNC presentation.
 
 ## Generation-1 command wrapper follow-up
 
@@ -108,9 +220,24 @@ This library format is not supported on this platform (or was built with an old 
 ```
 
 A standalone source-library probe still returned real `_MTLLibrary` and
-`_MTLFunctionInternal` objects, so the compiler bridge is not globally dead.
-The failure is currently isolated to the complex Chromium worker/library
-path. Reintroducing the former global target-OS or renamer NOPs is explicitly
-not an acceptable fix: they caused Safari's native compiler service to fail
-and violate the request-scope invariant. The next fix must establish the
-correct target/runtime module upstream and remain request-scoped.
+`_MTLFunctionInternal` objects, so the compiler bridge was not globally dead.
+Subsequent UUID-locked request/reply observation found two upstream target
+sources instead: an old cache populated with `air64-apple-ios16.3.0`, and the
+exact ANGLE 1ba8ec3 default library embedded as
+`air64-apple-macosx10.14.0`. Production now records a cache schema marker and
+invalidates only the two regenerable Metal cache index/data files when that
+schema changes.
+
+The package also carries ANGLE 1ba8ec3's same generated default-shader source
+compiled by the real service through the MacWS macabi request adapter. The
+runtime substitution is deliberately byte-exact:
+
+```text
+upstream ANGLE library  bytes=361943 FNV-1a-64=4a17e801057d2e72
+macabi replacement      bytes=714152 FNV-1a-64=2b19e550c422772a
+```
+
+Only the first exact length/hash pair is replaced; every different Electron
+or ANGLE library is forwarded unchanged. This keeps Safari's native compiler
+requests outside the MacWS request scope and avoids the global target-OS or
+renamer bypasses that previously broke Safari.

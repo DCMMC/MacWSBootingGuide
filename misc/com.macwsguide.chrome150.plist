@@ -48,6 +48,8 @@
         <string>1</string>
         <key>MACWS_MACOS_SYSTEM_POLICY_COMPAT</key>
         <string>1</string>
+        <key>MACWS_CHROMIUM_COMPOSITE_OVERLAYS</key>
+        <string>1</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

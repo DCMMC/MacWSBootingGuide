@@ -40,6 +40,15 @@ variables. `MallocScribble` is explicitly forbidden.
 - Direct/wrapped KCMD translation, cancelled-swap completion, owned BGRA
   scanout and the VNC mmap bridge are enabled for the current coexistence
   implementation.
+- VS Code and Chrome set `MACWS_CHROMIUM_COMPOSITE_OVERLAYS=1`. For the exact
+  UUID-checked Chromium 148 Electron Framework, this marks the root
+  `AggregatedRenderPass` with Chromium's real `video_capture_enabled` field
+  before its unmodified `CALayerOverlayProcessor` runs. Chromium then rejects
+  process-local CALayer promotion with its native
+  `kCALayerFailedVideoCaptureEnabled` result and appends the normal primary
+  plane, keeping video in the AGX-composited scanout captured by MacWS/VNC.
+  The exact adapter writes that real field using a verified two-instruction
+  dataflow rewrite; it does not install a per-frame function trampoline.
 - Submit rings, raw command dumps, lifecycle backtraces, method enumeration,
   PF550 experiments, XPC/RFB/JIT/IOSurface traces, unsafe readbacks and broad
   assert bypasses are off.
@@ -86,6 +95,27 @@ before starting WindowServer. It preserves Chromium caches/session state and
 never reads or writes the user's normal VS Code profile. VS Code itself is
 still loaded explicitly after the GUI is ready; package installation or
 re-jailbreak cannot launch Electron prematurely.
+
+The VS Code Helper Metal source-library cache has a separate persistent schema
+marker, `macws-macabi-source-v1`. Runtime capture on 2026-08-01 proved that an
+old `31001/libraries.data` returned `air64-apple-ios16.3.0` MTLBs to the macOS
+AGX device, while a clean cache produced only
+`air64-apple-ios19.0.0-macabi` and the same ANGLE sources compiled
+successfully. On a missing or mismatched marker, `postinst.sh` (or the next
+production start after all VS Code helpers are stopped) removes only
+`31001/libraries.list` and `31001/libraries.data`; Chromium profile, session,
+function, and media caches remain intact.
+
+Chromium 148.0.7778.280 embeds ANGLE revision `1ba8ec3`'s default Metal
+library as `air64-apple-macosx10.14.0`. The container itself loads on the
+chroot AGX device, but the iOS compiler service rejects function-constant
+specialization as a target-OS mismatch. The package therefore installs a
+second library generated from that exact ANGLE source by the real device
+compiler through the macabi adapter. `libmachook` substitutes it only when the
+embedded source library matches both the runtime-confirmed 361,943-byte length
+and FNV-1a hash `4a17e801057d2e72`; other Electron/ANGLE versions retain their
+own library. The installed replacement is independently checked as a
+714,152-byte MTLB with FNV-1a `2b19e550c422772a` before use.
 
 MacBook reference measurements use the matching guarded entry point:
 

@@ -16,6 +16,7 @@ const args = {
   play: 1,
   evaluate: 1,
   capture: 1,
+  single: 0,
   seek: -1,
   output: "/tmp/macws-media-probe.json",
   screenshots: "/tmp/macws-media-frame",
@@ -40,7 +41,7 @@ if (!Number.isFinite(args.seconds) || args.seconds < 1 || args.seconds > 60) {
 if (!Number.isFinite(args.loadwait) || args.loadwait < 0.25 || args.loadwait > 15) {
   throw new Error(`invalid --loadwait: ${args.loadwait}`);
 }
-for (const name of ["play", "evaluate", "capture"]) {
+for (const name of ["play", "evaluate", "capture", "single"]) {
   if (![0, 1].includes(args[name])) throw new Error(`invalid --${name}: ${args[name]}`);
 }
 if (!Number.isFinite(args.offset) || Math.abs(args.offset) > 20000) {
@@ -288,9 +289,10 @@ const sampleExpression = `(() => ({
 await mkdir(dirname(args.output), { recursive: true });
 await mkdir(dirname(args.screenshots), { recursive: true });
 const samples = [];
-const frameIndexes = new Set([0, Math.floor(args.seconds),
-                              Math.floor(args.seconds * 2)]);
-const iterations = Math.floor(args.seconds * 2) + 1;
+const frameIndexes = args.single
+  ? new Set([0])
+  : new Set([0, Math.floor(args.seconds), Math.floor(args.seconds * 2)]);
+const iterations = args.single ? 1 : Math.floor(args.seconds * 2) + 1;
 for (let index = 0; index < iterations; index++) {
   if (args.evaluate) {
     const evaluated = await cdp.send("Runtime.evaluate", {

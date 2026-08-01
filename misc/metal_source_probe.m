@@ -159,66 +159,70 @@ int main(void) {
         // a nil event must be diagnosed at creation time instead of being
         // handed to -encodeSignalEvent:value:, where AGX's superclass raises
         // an NSArray nil-insertion exception.
-        id<MTLSharedEvent> sharedEvent = nil;
-        if ([device respondsToSelector:@selector(newSharedEvent)])
-            sharedEvent = [device newSharedEvent];
-        fprintf(stderr,
-                "METAL_SOURCE_PROBE sharedEvent=%p class=%s signaledValue=%llu\n",
-                sharedEvent,
-                sharedEvent ? object_getClassName(sharedEvent) : "(nil)",
-                (unsigned long long)(sharedEvent
-                    ? sharedEvent.signaledValue : 0));
+        if (!getenv("MACWS_METAL_PROBE_SOURCE_ONLY")) {
+            id<MTLSharedEvent> sharedEvent = nil;
+            if ([device respondsToSelector:@selector(newSharedEvent)])
+                sharedEvent = [device newSharedEvent];
+            fprintf(stderr,
+                    "METAL_SOURCE_PROBE sharedEvent=%p class=%s signaledValue=%llu\n",
+                    sharedEvent,
+                    sharedEvent ? object_getClassName(sharedEvent) : "(nil)",
+                    (unsigned long long)(sharedEvent
+                        ? sharedEvent.signaledValue : 0));
 
         // Chromium 148's actual libGLESv2 binary calls the older private
         // -newEvent selector (RE-confirmed at arm64 file offset 0x2db888),
         // not public -newSharedEvent.  Compare the two on the same device.
-        SEL newEventSelector = sel_registerName("newEvent");
-        BOOL respondsToNewEvent = [device respondsToSelector:newEventSelector];
-        id legacyEvent = respondsToNewEvent
-            ? ((id (*)(id, SEL))objc_msgSend)(device, newEventSelector)
-            : nil;
-        fprintf(stderr,
-                "METAL_SOURCE_PROBE newEvent responds=%d event=%p class=%s\n",
-                respondsToNewEvent, legacyEvent,
-                legacyEvent ? object_getClassName(legacyEvent) : "(nil)");
+            SEL newEventSelector = sel_registerName("newEvent");
+            BOOL respondsToNewEvent =
+                [device respondsToSelector:newEventSelector];
+            id legacyEvent = respondsToNewEvent
+                ? ((id (*)(id, SEL))objc_msgSend)(device, newEventSelector)
+                : nil;
+            fprintf(stderr,
+                    "METAL_SOURCE_PROBE newEvent responds=%d event=%p class=%s\n",
+                    respondsToNewEvent, legacyEvent,
+                    legacyEvent ? object_getClassName(legacyEvent) : "(nil)");
 
-        BOOL sharedEventCommandsOK = NO;
-        if (sharedEvent) {
-            id<MTLCommandQueue> queue = [device newCommandQueue];
-            id<MTLCommandBuffer> signalBuffer = [queue commandBuffer];
-            id<MTLCommandBuffer> waitBuffer = [queue commandBuffer];
-            @try {
-                [signalBuffer encodeSignalEvent:sharedEvent value:1];
-                [waitBuffer encodeWaitForEvent:sharedEvent value:1];
-                [signalBuffer commit];
-                [waitBuffer commit];
-                [waitBuffer waitUntilCompleted];
-                fprintf(stderr,
-                        "METAL_SOURCE_PROBE sharedEventCommands "
-                        "signalStatus=%ld waitStatus=%ld eventValue=%llu "
-                        "signalError=%s waitError=%s\n",
-                        (long)signalBuffer.status,
-                        (long)waitBuffer.status,
-                        (unsigned long long)sharedEvent.signaledValue,
-                        signalBuffer.error
-                            ? signalBuffer.error.localizedDescription.UTF8String
-                            : "(nil)",
-                        waitBuffer.error
-                            ? waitBuffer.error.localizedDescription.UTF8String
-                            : "(nil)");
-                sharedEventCommandsOK =
-                    signalBuffer.status == MTLCommandBufferStatusCompleted &&
-                    waitBuffer.status == MTLCommandBufferStatusCompleted &&
-                    sharedEvent.signaledValue == 1 &&
-                    signalBuffer.error == nil && waitBuffer.error == nil;
-            } @catch (NSException *exception) {
-                fprintf(stderr,
-                        "METAL_SOURCE_PROBE sharedEventCommand exception=%s "
-                        "reason=%s\n",
-                        exception.name.UTF8String,
-                        exception.reason.UTF8String);
+            BOOL sharedEventCommandsOK = NO;
+            if (sharedEvent) {
+                id<MTLCommandQueue> queue = [device newCommandQueue];
+                id<MTLCommandBuffer> signalBuffer = [queue commandBuffer];
+                id<MTLCommandBuffer> waitBuffer = [queue commandBuffer];
+                @try {
+                    [signalBuffer encodeSignalEvent:sharedEvent value:1];
+                    [waitBuffer encodeWaitForEvent:sharedEvent value:1];
+                    [signalBuffer commit];
+                    [waitBuffer commit];
+                    [waitBuffer waitUntilCompleted];
+                    fprintf(stderr,
+                            "METAL_SOURCE_PROBE sharedEventCommands "
+                            "signalStatus=%ld waitStatus=%ld eventValue=%llu "
+                            "signalError=%s waitError=%s\n",
+                            (long)signalBuffer.status,
+                            (long)waitBuffer.status,
+                            (unsigned long long)sharedEvent.signaledValue,
+                            signalBuffer.error
+                                ? signalBuffer.error.localizedDescription.UTF8String
+                                : "(nil)",
+                            waitBuffer.error
+                                ? waitBuffer.error.localizedDescription.UTF8String
+                                : "(nil)");
+                    sharedEventCommandsOK =
+                        signalBuffer.status ==
+                            MTLCommandBufferStatusCompleted &&
+                        waitBuffer.status ==
+                            MTLCommandBufferStatusCompleted &&
+                        sharedEvent.signaledValue == 1 &&
+                        signalBuffer.error == nil && waitBuffer.error == nil;
+                } @catch (NSException *exception) {
+                    fprintf(stderr,
+                            "METAL_SOURCE_PROBE sharedEventCommand exception=%s "
+                            "reason=%s\n",
+                            exception.name.UTF8String,
+                            exception.reason.UTF8String);
+                }
             }
-        }
 
         // The iOS-native event ABI witness must not depend on the separate
         // chroot MTLCompilerService experiment below.  In particular, a
@@ -226,35 +230,72 @@ int main(void) {
         // target.  This opt-in endpoint gives the event probe a strict exit
         // status after both the public shared-event commands and the private
         // -newEvent constructor have been exercised.
-        if (getenv("MACWS_METAL_PROBE_EVENT_ONLY")) {
-            BOOL eventOnlyOK = legacyEvent != nil && sharedEventCommandsOK;
-            fprintf(stderr,
-                    "METAL_SOURCE_PROBE eventOnlyResult=%s\n",
-                    eventOnlyOK ? "PASS" : "FAIL");
+            if (getenv("MACWS_METAL_PROBE_EVENT_ONLY")) {
+                BOOL eventOnlyOK = legacyEvent != nil &&
+                    sharedEventCommandsOK;
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE eventOnlyResult=%s\n",
+                        eventOnlyOK ? "PASS" : "FAIL");
             // Force ARC to run both event destructors while libmachook's
             // IOKit interposer and stderr are still live.  Returning from
             // main can let process teardown reclaim VM mappings before the
             // external-method result is observable in the probe log.
 #if __has_feature(objc_arc)
-            legacyEvent = nil;
-            sharedEvent = nil;
+                legacyEvent = nil;
+                sharedEvent = nil;
 #else
-            [legacyEvent release];
-            [sharedEvent release];
+                [legacyEvent release];
+                [sharedEvent release];
 #endif
-            fprintf(stderr, "METAL_SOURCE_PROBE eventOnlyReleased=YES\n");
-            return eventOnlyOK ? 0 : 5;
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE eventOnlyReleased=YES\n");
+                return eventOnlyOK ? 0 : 5;
+            }
         }
 
         // Include a per-process comment so each invocation proves a fresh XPC
         // compilation instead of accepting a persistent source-cache hit.
-        NSString *source = [NSString stringWithFormat:
-            @"// macws source probe pid=%d\n"
-             "#include <metal_stdlib>\n"
-             "using namespace metal;\n"
-             "kernel void macws_probe(device uint *out [[buffer(0)]], "
-             "uint tid [[thread_position_in_grid]]) { out[tid] = tid + 1; }\n",
-             getpid()];
+        // An optional source file lets the same bounded probe replay an exact
+        // MSL program captured from a real client (for example ANGLE's YUV
+        // conversion shader) without starting Electron or WindowServer.  The
+        // compiler and Metal loader still consume the unmodified source after
+        // the harmless cache-busting comment; no result is synthesized.
+        const char *sourcePath = getenv("MACWS_METAL_PROBE_SOURCE_PATH");
+        const char *functionText = getenv("MACWS_METAL_PROBE_FUNCTION");
+        NSString *functionName = functionText && functionText[0]
+            ? [NSString stringWithUTF8String:functionText]
+            : (sourcePath ? @"main0" : @"macws_probe");
+        NSString *source = nil;
+        if (sourcePath && sourcePath[0]) {
+            NSError *readError = nil;
+            NSString *captured = [NSString
+                stringWithContentsOfFile:[NSString stringWithUTF8String:sourcePath]
+                                encoding:NSUTF8StringEncoding
+                                   error:&readError];
+            fprintf(stderr,
+                    "METAL_SOURCE_PROBE sourcePath=%s bytes=%lu readError=%s\n",
+                    sourcePath, (unsigned long)captured.length,
+                    readError
+                        ? readError.localizedDescription.UTF8String : "(nil)");
+            if (!captured) return 6;
+            if (getenv("MACWS_METAL_PROBE_EXACT_SOURCE")) {
+                // Deterministic replay for a source captured at the failing
+                // public Metal boundary.  Do not add the ordinary cache-bust
+                // comment: its hash and byte length are part of the witness.
+                source = captured;
+            } else {
+                source = [NSString stringWithFormat:
+                    @"// macws source probe pid=%d\n%@", getpid(), captured];
+            }
+        } else {
+            source = [NSString stringWithFormat:
+                @"// macws source probe pid=%d\n"
+                 "#include <metal_stdlib>\n"
+                 "using namespace metal;\n"
+                 "kernel void macws_probe(device uint *out [[buffer(0)]], "
+                 "uint tid [[thread_position_in_grid]]) { out[tid] = tid + 1; }\n",
+                 getpid()];
+        }
         MTLCompileOptions *options = [MTLCompileOptions new];
         options.languageVersion = MTLLanguageVersion3_0;
         NSError *error = nil;
@@ -271,8 +312,10 @@ int main(void) {
                 error ? error.localizedDescription.UTF8String : "(nil)");
         if (!library) return 3;
 
-        id<MTLFunction> function = [library newFunctionWithName:@"macws_probe"];
-        fprintf(stderr, "METAL_SOURCE_PROBE function=%p class=%s\n",
+        id<MTLFunction> function = [library newFunctionWithName:functionName];
+        fprintf(stderr,
+                "METAL_SOURCE_PROBE functionName=%s function=%p class=%s\n",
+                functionName.UTF8String,
                 function,
                 function ? object_getClassName(function) : "(nil)");
         return function ? 0 : 4;

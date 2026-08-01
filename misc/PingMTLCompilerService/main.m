@@ -5,8 +5,14 @@
 #include <stdio.h>
 #include <uuid/uuid.h>
 
-// The rootless iOS SDK bundled with Theos omits xpc/xpc.h.  Keep the probe on
-// the stable C ABI instead of depending on private SDK headers.
+// Older rootless Theos SDKs omit xpc/xpc.h, while the iOS 16.5 SDK used by
+// the production on-device build provides it indirectly through Metal.  Use
+// the SDK declarations when present and keep the stable C ABI fallback only
+// for the older SDK; redeclaring the types unconditionally conflicts with the
+// real header and breaks a clean production package build.
+#if __has_include(<xpc/xpc.h>)
+#include <xpc/xpc.h>
+#else
 typedef void *xpc_object_t;
 typedef xpc_object_t xpc_connection_t;
 typedef void (^xpc_handler_t)(xpc_object_t);
@@ -18,6 +24,7 @@ extern xpc_object_t xpc_dictionary_create(const char * const *,
 extern void xpc_dictionary_set_uint64(xpc_object_t, const char *, uint64_t);
 extern xpc_object_t xpc_connection_send_message_with_reply_sync(
     xpc_connection_t, xpc_object_t);
+#endif
 
 void xpc_add_bundle(char *, int);
 void xpc_connection_set_instance(xpc_connection_t, uuid_t);

@@ -33,8 +33,8 @@
         },
         "macwsAquarium.openOnStartup": {
           "type": "boolean",
-          "default": true,
-          "description": "Open the workload automatically after the VS Code workbench becomes ready."
+          "default": false,
+          "description": "Open the 60,000-fish workload automatically after the VS Code workbench becomes ready. Keep this disabled for ordinary browsing and video playback so the benchmark does not compete for GPU memory."
         }
       }
     }

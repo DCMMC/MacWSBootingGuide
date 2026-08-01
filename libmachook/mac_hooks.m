@@ -18,6 +18,7 @@
 #import <pthread.h>
 #import <limits.h>
 #import <math.h>
+#import <crt_externs.h>
 #import <ptrauth.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -1453,6 +1454,18 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                     force_override = 1;
                 } else if (strstr(image_name, "AGXMetal13_3") &&
                            !strcmp(lookup,
+                            "IOSurfaceGetWidthOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetWidthOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
+                            "IOSurfaceGetHeightOfPlane")) {
+                    resolved =
+                        (void *)macws_IOSurfaceGetHeightOfPlane;
+                    force_override = 1;
+                } else if (strstr(image_name, "AGXMetal13_3") &&
+                           !strcmp(lookup,
                             "IOSurfaceGetBytesPerRowOfPlane")) {
                     resolved =
                         (void *)macws_IOSurfaceGetBytesPerRowOfPlane;
@@ -2491,6 +2504,157 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
     });
 }
 
+static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
+                                     const uint8_t expected[16]);
+
+// Chromium's Apple display path normally promotes the complete root render
+// pass to process-local CALayers. MacWS/VNC captures the WindowServer primary
+// scanout, so a video promoted outside that scanout is visible in Chromium's
+// DevTools capture but is a black rectangle in the real VNC frame.
+//
+// Chromium already has the required invariant: when an AggregatedRenderPass
+// has `video_capture_enabled`, CALayerOverlayProcessor returns
+// kCALayerFailedVideoCaptureEnabled. OverlayProcessorMac then follows its
+// normal fallback, preserves the quads in the root render pass, and appends a
+// real primary-plane candidate. Tell that existing path that MacWS is a
+// continuous capture consumer. Do not replace OverlayProcessorMac with the
+// Stub: runtime VNC evidence showed that the Stub omits the Mac primary-plane
+// fallback and turns the whole Chromium client area black.
+//
+// RE-confirmed from the VS Code 1.130.0 Electron Framework actually installed
+// on the device, and source-confirmed against Chromium 148.0.7778.280
+// components/viz/service/display/{overlay_processor_mac,ca_layer_overlay}.cc:
+//   Chrome/Electron                         148.0.7778.280 / 42.6.0
+//   UUID                                    4C4C4442-5555-3144-A1A8-564169F3FF00
+//   OverlayProcessorMac::ProcessForOverlays image + 0x0ca10b8
+//   ProcessForCALayerOverlays               image + 0x0ca1254
+//   AggregatedRenderPass capture byte       render_pass + 0x0e2
+//   capture load/branch                     image + 0x0ca12a8 / +0x0ca12ac
+//   capture result                          w20 = 0x21 at image + 0x0ca17f0
+// The UUID, normal C++ function prologue, and complete field-read sequence are
+// checked before installing the adapter. A different Electron build is left
+// untouched instead of guessing at a private class layout.
+//
+// At +0xca1298 Chromium loads `enable_ca_renderer_`, compares it with 1, and
+// reaches +0xca12a4 only when w8 is therefore exactly 1. Reuse that proven
+// value to store the real capture bool, then move x1 into x23 in the following
+// slot. The original tbnz, error selection, function body, return value, and
+// OverlayProcessorMac fallback remain byte-for-byte intact. This avoids a
+// whole-function trampoline on Chromium's frame hot path.
+
+static void macws_install_chromium_composite_overlays(
+        const struct mach_header *untyped_header) {
+    if (!getenv("MACWS_CHROMIUM_COMPOSITE_OVERLAYS"))
+        return;
+
+    // Viz owns OverlayProcessorMac in Chromium's dedicated GPU helper. Do not
+    // modify the Electron main process: runtime LLDB caught its early
+    // fork/exec child faulting on instruction fetch at Electron Framework
+    // +0x3cd5fe0 after inheriting a parent COW text patch. Restricting the
+    // private-text hook to --type=gpu-process both matches the real owner and
+    // keeps the main process's pre-spawn text mapping pristine.
+    BOOL is_gpu_process = NO;
+    int *argc_pointer = _NSGetArgc();
+    char ***argv_pointer = _NSGetArgv();
+    if (argc_pointer && argv_pointer && *argv_pointer) {
+        for (int index = 1; index < *argc_pointer; index++) {
+            const char *argument = (*argv_pointer)[index];
+            if (argument && strcmp(argument, "--type=gpu-process") == 0) {
+                is_gpu_process = YES;
+                break;
+            }
+        }
+    }
+    if (!is_gpu_process)
+        return;
+
+    static _Atomic int installed = 0;
+    if (atomic_exchange_explicit(&installed, 1, memory_order_acq_rel))
+        return;
+
+    static const uint8_t expected_uuid[16] = {
+        0x4c, 0x4c, 0x44, 0x42, 0x55, 0x55, 0x31, 0x44,
+        0xa1, 0xa8, 0x56, 0x41, 0x69, 0xf3, 0xff, 0x00,
+    };
+    static const uint32_t expected_prologue[] = {
+        0x6db923e9, // stp d9, d8, [sp, #-0x70]!
+        0xa9016ffc, // stp x28, x27, [sp, #0x10]
+        0xa90267fa, // stp x26, x25, [sp, #0x20]
+        0xa9035ff8, // stp x24, x23, [sp, #0x30]
+        0xa90457f6, // stp x22, x21, [sp, #0x40]
+        0xa9054ff4, // stp x20, x19, [sp, #0x50]
+        0xa9067bfd, // stp x29, x30, [sp, #0x60]
+        0x910183fd, // add x29, sp, #0x60
+    };
+    static const uint32_t expected_capture_adapter[] = {
+        0x39402408, // ldrb w8, [x0, #0x9] (enable_ca_renderer_)
+        0x7100051f, // cmp w8, #1
+        0x54002b21, // b.ne disabled-CALayer result
+        0xaa0103f7, // mov x23, x1 (AggregatedRenderPass *)
+        0x39438828, // ldrb w8, [x1, #0xe2] (video_capture_enabled)
+        0x37002a08, // tbnz w8, #0, capture-disabled-CALayer result
+        0xa94b26e8, // ldp x8, x9, [x23, #0xb0] (copy_requests)
+        0xeb09011f, // cmp x8, x9
+    };
+    enum { kProcessForCALayerOverlaysOffset = 0x0ca1254 };
+    enum { kCaptureAdapterOffset = 0x44 };
+    enum { kCaptureStoreIndex = 3 };
+    enum { kRenderPassMoveIndex = 4 };
+
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!macws_macho_uuid_matches(header, expected_uuid)) {
+        fprintf(stderr,
+            "#### MACWS_CHROMIUM_COMPOSITE_OVERLAYS skipped: "
+            "Electron Framework UUID mismatch\n");
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+
+    void *process_for_ca_layers = (void *)((uintptr_t)header +
+        kProcessForCALayerOverlaysOffset);
+    uint32_t *capture_adapter = (uint32_t *)(
+        (uintptr_t)process_for_ca_layers + kCaptureAdapterOffset);
+    if (memcmp(process_for_ca_layers, expected_prologue,
+               sizeof(expected_prologue)) != 0) {
+        const uint32_t *actual = (const uint32_t *)process_for_ca_layers;
+        fprintf(stderr,
+            "#### MACWS_CHROMIUM_COMPOSITE_OVERLAYS skipped: "
+            "ProcessForCALayerOverlays prologue mismatch "
+            "%#x %#x %#x %#x %#x %#x %#x %#x\n",
+            actual[0], actual[1], actual[2], actual[3], actual[4],
+            actual[5], actual[6], actual[7]);
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+    if (memcmp(capture_adapter, expected_capture_adapter,
+               sizeof(expected_capture_adapter)) != 0) {
+        fprintf(stderr,
+            "#### MACWS_CHROMIUM_COMPOSITE_OVERLAYS skipped: capture "
+            "field sequence mismatch %#x %#x %#x %#x %#x %#x %#x %#x\n",
+            capture_adapter[0], capture_adapter[1], capture_adapter[2],
+            capture_adapter[3], capture_adapter[4], capture_adapter[5],
+            capture_adapter[6], capture_adapter[7]);
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+
+    ModifyExecutableRegion(capture_adapter + kCaptureStoreIndex,
+                           2 * sizeof(uint32_t), ^{
+        // Before: mov x23,x1; ldrb w8,[x1,#0xe2]
+        // After:  strb w8,[x1,#0xe2]; mov x23,x1
+        // w8 is exactly 1 on this fallthrough from the checked cmp above.
+        capture_adapter[kCaptureStoreIndex] = 0x39038828;
+        capture_adapter[kRenderPassMoveIndex] = 0xaa0103f7;
+    });
+    fprintf(stderr,
+        "#### MACWS_CHROMIUM_COMPOSITE_OVERLAYS installed "
+        "ProcessForCALayerOverlays=%p capture-adapter=%p "
+        "capture-field=render-pass+0xe2 "
+        "(Chromium keeps its native primary-plane fallback)\n",
+        process_for_ca_layers, capture_adapter + kCaptureStoreIndex);
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
     dladdr(header, &info);
@@ -2498,6 +2662,11 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         strstr(info.dli_fname,
                "/UniformTypeIdentifiers.framework/") != NULL) {
         macws_schedule_uttype_coretypes_compatibility();
+    }
+    if (info.dli_fname &&
+        strstr(info.dli_fname,
+               "/Electron Framework.framework/Versions/A/Electron Framework")) {
+        macws_install_chromium_composite_overlays(header);
     }
     if(!strncmp(info.dli_fname, SkyLightPath, strlen(SkyLightPath))) {
         // allow coexist with backboardd in WS::Displays::CAWSManager::CAWSManager() + 560
@@ -13829,13 +13998,22 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // synchronously from inside that swizzle's %orig), and inject it
         // into args[+0x30]. Keep +0x40 zero and move the macOS texture-layout
         // word from +0x58 to iOS +0x50.
-        // macOS chroot stores the IOSurfaceID at args+0x38 (where iOS puts
-        // the plane index); iOS userland stores IOSurfaceID at args+0x30
-        // (which macOS leaves zero). The swizzled Metal entry has both exact
-        // semantic values, so write its IOSurfaceID at +0x30 and its plane at
-        // +0x38. Chromium's VideoToolbox path uses plane 1 for the RG8 UV
-        // texture; the former hard-coded zero silently wrapped plane 0 twice,
-        // producing green/magenta video despite both texture creates succeeding.
+        // macOS chroot stores the IOSurfaceID at args+0x38. Native iOS packs
+        // IOSurfaceID and plane as two adjacent u32 values at +0x30/+0x34:
+        // the producer instruction above is `stp w0, w21, [x24, #0x30]`, not
+        // a write to +0x38. Project-LLDB captured the exact successful native
+        // 640x360 NV12 requests on 2026-08-01:
+        //
+        //   Y:  u64(+0x30)=0x00000000_000000a7, u64(+0x38)=0
+        //   UV: u64(+0x30)=0x00000001_000000a7, u64(+0x38)=0
+        //
+        // The former translator wrote plane at +0x38, so the kernel imported
+        // plane 0 for both logical textures even though the ObjC texture's
+        // private `boundPlane` field reported 1. Runtime A/B then showed:
+        // decoded IOSurface bytes == public texture getBytes, direct GPU
+        // sampling green/magenta, and an ordinary texture uploaded from those
+        // same bytes rendering correctly. Pack the two native fields exactly
+        // and clear macOS's shifted +0x38 slot.
         // Project-LLDB RE of the successful native pf550 path subsequently
         // located the exact iOS producer, `-[AGXG13GFamilyDevice
         // initNewTextureData:]` at runtime 0x2260cf0e0:
@@ -13853,7 +14031,9 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             uint64_t old_50 = *(const uint64_t *)(src + 0x50);
             uint64_t old_58 = *(const uint64_t *)(src + 0x58);
             uint32_t old_30 = *(const uint32_t *)(src + 0x30);
+            uint32_t old_34 = *(const uint32_t *)(src + 0x34);
             uint32_t old_38 = *(const uint32_t *)(src + 0x38);
+            uint32_t old_3c = *(const uint32_t *)(src + 0x3c);
             uint32_t current_surface_id = macws_get_current_iosurface_id();
             uint32_t current_plane = macws_get_current_iosurface_plane();
             uint64_t compression_header_span =
@@ -13870,13 +14050,15 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             *(uint64_t *)(shadowbuf + 0x58) = compression_header_span;
             if (current_surface_id != 0) {
                 *(uint32_t *)(shadowbuf + 0x30) = current_surface_id;
-                *(uint32_t *)(shadowbuf + 0x38) = current_plane;
+                *(uint32_t *)(shadowbuf + 0x34) = current_plane;
+                *(uint64_t *)(shadowbuf + 0x38) = 0;
             } else if (old_30 == 0 && old_38 != 0) {
                 // Legacy callers outside the Metal swizzle still carry the
                 // macOS surface ID at +0x38. Preserve their observed plane-0
                 // behavior when no semantic wrapper scope exists.
                 *(uint32_t *)(shadowbuf + 0x30) = old_38;
-                *(uint32_t *)(shadowbuf + 0x38) = 0;
+                *(uint32_t *)(shadowbuf + 0x34) = 0;
+                *(uint64_t *)(shadowbuf + 0x38) = 0;
             }
             patched = 1;
             static _Atomic unsigned int t82_patch_count = 0;
@@ -13889,11 +14071,15 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                           (plane_log != 0 && plane_log <= 8))) {
                 fprintf(stderr,
                     "#### AGXIOC type=0x82 patch #%u: scopeID=%#x scopePlane=%u "
-                    "f14=%#x +0x30 %#x→%#x +0x38 %#x→%#x "
+                    "f14=%#x +0x30 {%#x,%#x}→{%#x,%#x} "
+                    "+0x38 {%#x,%#x}→%#llx "
                     "+0x40 %#llx→0 +0x50 %#llx→%#llx +0x58 %#llx→%#llx\n",
                     t82_n, current_surface_id, current_plane, f14,
-                    old_30, *(const uint32_t *)(shadowbuf + 0x30),
-                    old_38, *(const uint32_t *)(shadowbuf + 0x38),
+                    old_30, old_34,
+                    *(const uint32_t *)(shadowbuf + 0x30),
+                    *(const uint32_t *)(shadowbuf + 0x34),
+                    old_38, old_3c,
+                    (unsigned long long)*(const uint64_t *)(shadowbuf + 0x38),
                     (unsigned long long)old_40,
                     (unsigned long long)old_50,
                     (unsigned long long)*(const uint64_t *)(shadowbuf + 0x50),

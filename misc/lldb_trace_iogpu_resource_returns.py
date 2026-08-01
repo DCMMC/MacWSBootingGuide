@@ -52,18 +52,20 @@ def callback(frame, bp_location, internal_dict):
         return False
     print(
         "IOGPU_RES_RETURN #%d status=%#x type=%#x f14=%#x f15=%#x "
-        "in+20=%#x in+28=%#x in+40=%#x in+48=%#x in+58=%#x "
+        "in+20=%#x in+28=%#x in+30=%#x in+38=%#x in+40=%#x "
+        "in+48=%#x in+50=%#x in+58=%#x "
         "out+00=%#x out+08=%#x out+10=%#x out+1c=%#x "
         "out+20=%#x out+48=%#x" %
         (_count, status, args[0], _u32(args, 0x14), args[0x15],
-         _u64(args, 0x20), _u64(args, 0x28), _u64(args, 0x40),
-         _u64(args, 0x48), _u64(args, 0x58),
+         _u64(args, 0x20), _u64(args, 0x28), _u64(args, 0x30),
+         _u64(args, 0x38), _u64(args, 0x40), _u64(args, 0x48),
+         _u64(args, 0x50), _u64(args, 0x58),
          _u64(output, 0x00), _u64(output, 0x08),
          _u64(output, 0x10), _u32(output, 0x1c),
          _u64(output, 0x20), _u64(output, 0x48)))
-    if args[0] == 0:
-        print("IOGPU_RES_RETURN #%d type0-args=%s" %
-              (_count, args.hex()))
+    if args[0] in (0, 0x82):
+        print("IOGPU_RES_RETURN #%d type%02x-args=%s" %
+              (_count, args[0], args.hex()))
     return False
 
 

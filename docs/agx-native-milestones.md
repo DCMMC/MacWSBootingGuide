@@ -2166,13 +2166,21 @@ measurements and thermal evidence are in
 Chromium's real VideoToolbox path requested an R8 texture for IOSurface plane
 0 and an RG8 texture for plane 1. Runtime `MACWS_TEX_TRACE` lines captured both
 calls and both successful texture objects. The type-0x82 macOS-to-iOS resource
-translation nevertheless wrote the iOS plane field at `args+0x38` as a
-constant zero, so both textures wrapped the Y plane. That runtime-confirmed
-protocol violation explains the otherwise successful green/magenta video.
-The translation now carries the actual IOSurface ID and plane from the Metal
-wrapper scope. Because AGX may issue the IOKit call on a worker thread, the ID,
-plane and compression-header tuple is protected by one recursive process-wide
-scope lock rather than an unsafe thread-local or racy global assumption.
+translation nevertheless discarded the requested plane, so both views sampled
+the same external-resource layout. The translation now carries the actual
+IOSurface ID and plane from the Metal wrapper scope. Because AGX may issue the
+IOKit call on a worker thread, the ID, plane and compression-header tuple is
+protected by one recursive process-wide scope lock rather than an unsafe
+thread-local or racy global assumption.
+
+The first follow-up assumed that iOS stored the plane at `args+0x38`. A native
+iOS R8/RG8 probe under the project LLDB tool disproved that assumption: its
+successful type-0x82 requests contained `+0x30=0xa7` for plane 0 and
+`+0x30=0x1000000a7` for plane 1, while `+0x38` remained zero in both calls.
+This matches the real iOS call site's `stp w0,w21,[x24,#0x30]`. The production
+translator now packs surface ID at `+0x30`, plane at `+0x34`, and clears the
+incorrect shifted field. This is an upstream ABI repair, not a validation or
+error-result bypass.
 
 LLDB disassembly of the exact macOS 13.4 and iOS 16.3 IOSurface binaries also
 confirmed the adjacent per-plane field drift for bytes-per-element, element
@@ -2183,10 +2191,41 @@ the Bilibili control already advanced from 0.49 to 4.68 seconds with 123 new
 frames, zero dropped/corrupted frames and no new AGX 0x102 errors, isolating
 the remaining fault to texture interpretation rather than network, codec or
 command completion.
-The bounded CDP samples and the exact two-plane texture log excerpt are in
-[`video-playback-20260801/`](evidence/video-playback-20260801/README.md). A
-post-fix correct-color screenshot is still required before declaring Bilibili
-or the first seconds of Apple's product animation fixed.
+
+A same-command-buffer diagnostic then sampled one decoded frame from the
+external IOSurface views and from ordinary Metal textures populated with the
+exact public `getBytes` output. Before the packed-field repair, only the direct
+IOSurface result was green/magenta; after it, the two 640×360 RGBA buffers were
+byte-identical with SHA-256
+`8e62a43759486cbbe9350a548d36b35b287b061d46be2daab383df0ec74cca39`.
+A production VSCode/Bilibili run subsequently advanced 253 frames during the
+validated interval with `error=null`, three dropped frames, zero corrupted
+frames, and a correct-colour compositor screenshot. The LLDB transcript,
+hashes and images are in
+[`video-playback-20260801/`](evidence/video-playback-20260801/README.md).
+
+The remaining black-video rectangle was not decode or colour conversion. A
+simultaneous witness showed correct video in Chromium's own CDP screenshot and
+black video in the real RFB frame. RE of the installed Electron Framework
+mapped `CALayerOverlayProcessor::ProcessForCALayerOverlays` to `+0xca1254`, its
+`AggregatedRenderPass::video_capture_enabled` load to `+0xca12a8`, and the
+field itself to `render_pass+0xe2`. Chromium 148 source independently confirms
+that this field selects `kCALayerFailedVideoCaptureEnabled`, after which the
+unmodified Mac processor appends the ordinary primary plane.
+
+A factory-wide `OverlayProcessorStub` experiment turned the entire VNC client
+area black and was removed. The production adapter instead reuses the value
+already proven equal to one by Chromium's preceding `cmp/b.ne` and changes
+only `mov x23,x1; ldrb w8,[x1,#0xe2]` into
+`strb w8,[x1,#0xe2]; mov x23,x1`. It writes the real capture field while
+retaining the original branch, result selection and fallback. The initial
+whole-function trampoline caused three cold-start GPU helper exits; the final
+instruction adapter had zero. In the acceptance run, two true 2388×1668 VNC
+frames three seconds apart showed normally coloured video, while the matching
+CDP record advanced media time `72.2603 → 76.757731` and total frames
+`2173 → 2307` with zero corrupted frames. This closes the VNC video-plane
+visibility boundary without disabling native AGX or fabricating a compositor
+success result.
 
 A subsequent bounded production run captured the previously missing AGX
 trailing-wrapper generation 1. The command matched to GPU error `0x102` had a
@@ -2199,10 +2238,15 @@ the exact adapter admits that bounded family while keeping every framing,
 range and opcode anchor. After installing it, Bilibili advanced from 4.005 to
 20.244 seconds and from 124 to 611 frames in a 15-second probe, with three
 dropped frames and no additional drops. This removes a real freeze path but
-does not fix the still-visible green/magenta output. The same run exposed a
-complex Chromium Skia library-target rejection; standalone Metal source
-compilation continued to succeed. Full hashes, decoded records and the
-acceptance boundary are recorded in the evidence README above.
+did not by itself fix the still-visible green/magenta output. The same run
+exposed a complex Chromium Skia library-target rejection. Request/reply
+captures then showed stale `air64-apple-ios16.3.0` cache entries and ANGLE's
+embedded `air64-apple-macosx10.14.0` default library reaching an iOS compiler
+service. Production now migrates that exact regenerable cache schema and
+substitutes only the byte-exact ANGLE 1ba8ec3 default library with the same
+generated source compiled as macabi. Different Electron library bytes are
+forwarded untouched. Full hashes, decoded records and the acceptance boundary
+are recorded in the evidence README above.
 
 The on-device FAST installer had a separate cold-start invariant violation:
 it produced valid twice-signed thin libraries, then signed them again once

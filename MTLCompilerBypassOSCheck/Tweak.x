@@ -17,6 +17,21 @@
 // is the exact public C ABI needed by the UUID-locked reply observer.
 extern void *xpc_data_create(const void *bytes, size_t length);
 
+// The compiler service's iOS seatbelt can hide the rootless /var/jb alias
+// even though the same file is visible from an SSH shell.  Keep the legacy
+// path for existing tooling and accept the native /var/mobile spelling used
+// by the service itself.  Both are diagnostic-only and removed by production
+// preflight.
+static bool MacWSCompilerDiagnosticsEnabled(void) {
+    return access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics", F_OK) == 0 ||
+        access("/var/mobile/macws_mtlcompiler_diagnostics", F_OK) == 0;
+}
+
+static bool MacWSCompilerHoldEnabled(void) {
+    return access("/var/jb/var/mobile/macws_mtlcompiler_hold", F_OK) == 0 ||
+        access("/var/mobile/macws_mtlcompiler_hold", F_OK) == 0;
+}
+
 // NOTE: do NOT take an ObjC block here. Under -fobjc-arc the on-device lld
 // arm64e build mis-signs the block's metadata pointer, so ARC's objc_storeStrong
 // on the block parameter PAC-faults in this dylib's %ctor (crashes MTLCompilerService
@@ -132,7 +147,7 @@ static void MTLPatchLog(const char *fmt, ...) {
     // File witnesses are diagnostic-only.  Trying four sandbox-denied paths
     // for every stock iOS compiler instance polluted the kernel log and added
     // filesystem work to Safari's shader hot path.
-    if (access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics", F_OK) != 0)
+    if (!MacWSCompilerDiagnosticsEnabled())
         return;
     // Try several paths until one is writable from the sandbox.
     static const char *paths[] = {
@@ -405,6 +420,47 @@ static uint64_t MacWSFNV1a64(const void *data, size_t length) {
     return hash;
 }
 
+// The compiler result is wrapped into XPC data immediately after the build
+// call returns on the same request-handler thread (RE-confirmed in the
+// UUID-locked executable at __TEXT+0x25f0/+0x2628 followed by +0x2770).
+// Preserve only diagnostic correlation metadata across that boundary.  The
+// request and result bytes themselves remain owned and consumed by Apple's
+// original implementation.
+static _Thread_local uint32_t gReplyRequestSequence = 0;
+static _Thread_local uintptr_t gReplyRequestDiscriminator = 0;
+static _Thread_local uint64_t gReplySourceHash = 0;
+
+static void DumpCompilerRequest(uint32_t sequence, uint64_t sourceHash,
+                                const void *request, size_t requestSize) {
+    if (!request || !requestSize || sequence > 64) return;
+    const char *directory =
+        "/var/jb/var/mobile/mtlcompiler_requests";
+    mkdir(directory, 0755);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path),
+             "%s/request-%d-%03u-%zu-%016llx.bin",
+             directory, getpid(), sequence, requestSize,
+             (unsigned long long)sourceHash);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        MTLPatchLog("compiler request #%u dump open failed path=%s errno=%d",
+                    sequence, path, errno);
+        return;
+    }
+    const uint8_t *cursor = (const uint8_t *)request;
+    size_t remaining = requestSize;
+    while (remaining) {
+        ssize_t written = write(fd, cursor, remaining);
+        if (written <= 0) break;
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    close(fd);
+    MTLPatchLog("compiler request #%u sourceHash=%016llx dump=%s written=%zu/%zu",
+                sequence, (unsigned long long)sourceHash, path,
+                requestSize - remaining, requestSize);
+}
+
 // Read-only compiler-result witness.  MTLCompilerService's exact executable
 // reply block calls xpc_data_create at UUID-locked __TEXT+0x2770 with the
 // compiler result bytes and length.  The adapter redirects only that BL here,
@@ -417,8 +473,11 @@ static void *MacWSCompilerReplyDataCreate(const void *bytes, size_t length) {
     uint8_t head[24] = {0};
     size_t headLength = length < sizeof(head) ? length : sizeof(head);
     if (bytes && headLength) memcpy(head, bytes, headLength);
-    MTLPatchLog("compiler reply #%u length=%zu hash=%016llx head=%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x",
-                sequence, length, (unsigned long long)hash,
+    MTLPatchLog("compiler reply #%u request=%u discriminator=%#lx sourceHash=%016llx length=%zu hash=%016llx head=%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x",
+                sequence, gReplyRequestSequence,
+                (unsigned long)gReplyRequestDiscriminator,
+                (unsigned long long)gReplySourceHash,
+                length, (unsigned long long)hash,
                 head[0], head[1], head[2], head[3],
                 head[4], head[5], head[6], head[7],
                 head[8], head[9], head[10], head[11],
@@ -427,7 +486,8 @@ static void *MacWSCompilerReplyDataCreate(const void *bytes, size_t length) {
                 head[20], head[21], head[22], head[23]);
 
     if (bytes && length && sequence <= 64) {
-        const char *directory = "/var/jb/var/mobile/mtlcompiler_replies";
+        const char *directory =
+            "/var/jb/var/mobile/mtlcompiler_replies";
         mkdir(directory, 0755);
         char path[PATH_MAX];
         snprintf(path, sizeof(path), "%s/reply-%d-%03u-%zu-%016llx.bin",
@@ -461,6 +521,29 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     static const char targetArgument[] = "-active-platform=macos";
     static _Atomic uint32_t requestSequence = 0;
     uint32_t sequence = atomic_fetch_add(&requestSequence, 1) + 1;
+    bool diagnostics = MacWSCompilerDiagnosticsEnabled();
+    gReplyRequestSequence = sequence;
+    gReplyRequestDiscriminator = a2;
+    gReplySourceHash = 0;
+    // The original observer logged only source-build discriminator 0xd.  That
+    // left a dangerous evidence gap: Chromium's complex worker path could
+    // enter the same real service vtable with another discriminator and look
+    // indistinguishable from "the compiler was never called".  Record the
+    // complete six-argument ABI at a bounded cadence in diagnostic sessions;
+    // production performs no logging and keeps the exact original call.
+    if (diagnostics && (sequence <= 256 || (sequence % 500) == 0)) {
+        uint8_t head[16] = {0};
+        size_t headLength = requestSize < sizeof(head)
+            ? requestSize : sizeof(head);
+        if (request && headLength) memcpy(head, request, headLength);
+        MTLPatchLog("target adapter entry #%u a0=%#lx a1=%#lx a2=%#lx request=%p total=%zu a5=%p head=%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x-%02x%02x%02x%02x",
+                    sequence, (unsigned long)a0, (unsigned long)a1,
+                    (unsigned long)a2, request, requestSize, a5,
+                    head[0], head[1], head[2], head[3],
+                    head[4], head[5], head[6], head[7],
+                    head[8], head[9], head[10], head[11],
+                    head[12], head[13], head[14], head[15]);
+    }
     bool adapted = false;
     if (request && requestSize >= 16 && a2 == 0xd) {
         // Chromium's MSL requests use two closely related serializations.
@@ -516,15 +599,14 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
             if (hashLength && bytes[16 + hashLength - 1] == 0)
                 hashLength--;
             uint64_t sourceHash = MacWSFNV1a64(bytes + 16, hashLength);
+            gReplySourceHash = sourceHash;
             uint64_t expectedSize =
                 ((UINT64_C(16) + sourceLength + 7) & ~UINT64_C(7)) +
                 argumentLength;
             long long layoutDelta = expectedSize <= LLONG_MAX
                 ? (long long)expectedSize - (long long)requestSize
                 : LLONG_MAX;
-            if (adapted ||
-                access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics",
-                       F_OK) == 0) {
+            if (adapted || diagnostics) {
                 MTLPatchLog("target adapter #%u request=%p total=%zu source=%llu sourceHash=%016llx args=%llu layoutDelta=%lld workingOffset=%lld cacheOffset=%lld adapted=%d",
                             sequence, request, requestSize,
                             (unsigned long long)sourceLength,
@@ -536,6 +618,9 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                                 : (long long)cacheOffset,
                             adapted);
             }
+            if (diagnostics)
+                DumpCompilerRequest(sequence, sourceHash,
+                                    request, requestSize);
         }
     }
 
@@ -654,16 +739,37 @@ static void InstallMacOSMetalTargetAdapter(void) {
 
     // Reply dumping is a bounded diagnostic witness, not runtime machinery.
     // Never patch the stock iOS reply path in production.
-    if (access("/var/jb/var/mobile/macws_mtlcompiler_diagnostics", F_OK) == 0) {
+    if (MacWSCompilerDiagnosticsEnabled()) {
         uint32_t *replyDataSite = (uint32_t *)((uintptr_t)mh + 0x2770);
         const uint32_t expectedReplyCall = 0x9400047c; // bl _xpc_data_create stub
         uintptr_t replyTarget = StripPAC((const void *)MacWSCompilerReplyDataCreate);
+        // The actual arm64e image produced by the on-device linker on
+        // 2026-08-01 encoded this one local function reference four bytes
+        // before its real entry: the pointer resolved to the preceding
+        // PatchInstruction tail branch while the next instruction was the
+        // reply wrapper's PACIBSP prologue.  Runtime crash report
+        // MTLCompilerService-2026-08-01-125558.ips then showed the patched
+        // call returning vm_protect's integer 0x10000003 as an XPC object and
+        // faulting in xpc_release.  Resolve only this diagnostic target by
+        // validating the exact function-entry instruction; never branch to a
+        // guessed address.
+        const uint32_t kPacibsp = 0xd503237fu;
+        if (*(const uint32_t *)replyTarget != kPacibsp &&
+            *(const uint32_t *)(replyTarget + 4) == kPacibsp) {
+            MTLPatchLog("compiler reply observer corrected arm64e local entry %#lx -> %#lx",
+                        (unsigned long)replyTarget,
+                        (unsigned long)(replyTarget + 4));
+            replyTarget += 4;
+        }
         intptr_t replyDelta = (intptr_t)replyTarget - (intptr_t)replyDataSite;
-        if (*replyDataSite != expectedReplyCall || (replyDelta & 3) != 0 ||
+        if (*(const uint32_t *)replyTarget != kPacibsp ||
+            *replyDataSite != expectedReplyCall || (replyDelta & 3) != 0 ||
             replyDelta < -(1LL << 27) || replyDelta >= (1LL << 27)) {
-            MTLPatchLog("compiler reply observer validation failed site=%p insn=%#x target=%#lx delta=%#lx",
+            MTLPatchLog("compiler reply observer validation failed site=%p insn=%#x target=%#lx targetInsn=%#x delta=%#lx",
                         replyDataSite, *replyDataSite,
-                        (unsigned long)replyTarget, (unsigned long)replyDelta);
+                        (unsigned long)replyTarget,
+                        *(const uint32_t *)replyTarget,
+                        (unsigned long)replyDelta);
             return;
         }
         uint32_t replyBranch = 0x94000000u |
@@ -924,7 +1030,7 @@ static void PatchAGXVerifyLoweredIR(void) {
     // system compiler service must never be made permissive for unrelated iOS
     // clients, so neither bypass is installed here.
     (void)PatchAGXRenamerSkipAgxPrefix;
-    if (access("/var/jb/var/mobile/macws_mtlcompiler_hold", F_OK) == 0) {
+    if (MacWSCompilerHoldEnabled()) {
         MTLPatchLog("diagnostic hold: SIGSTOP before accepting compiler requests");
         raise(SIGSTOP);
     }

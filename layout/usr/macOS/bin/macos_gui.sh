@@ -76,6 +76,18 @@ VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
 VSCODE_PROFILE_DIR="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-targetfix13"
 VSCODE_EXTENSIONS_DIR="$ROOTFS/private/tmp/macws-vscode-extensions"
+# Metal's source-library FS cache is keyed by compiler build, not by the
+# effective target triple. Before the macabi source adapter existed, VS Code
+# populated this exact cache with air64-apple-ios16.3.0 MTLBs. Metal later
+# returned those blobs to the macOS AGX device and rejected them as an
+# unsupported library format. Keep an explicit project schema beside the
+# regenerable library cache so a package/cold start cannot silently reuse
+# artifacts produced under the old target policy.
+VSCODE_METAL_CACHE_ROOT="$ROOTFS/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C/com.microsoft.VSCode.helper/com.apple.metal"
+VSCODE_METAL_LIBRARY_CACHE="$VSCODE_METAL_CACHE_ROOT/31001"
+VSCODE_METAL_CACHE_SCHEMA=macws-macabi-source-v1
+VSCODE_METAL_CACHE_MARKER="$VSCODE_METAL_CACHE_ROOT/.macws-source-target-schema"
+VSCODE_ANGLE_MACABI_LIBRARY="$ROOTFS/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib"
 CHROME150_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist
 CHROME150_LABEL=UIKitApplication:com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
@@ -88,6 +100,7 @@ EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
 EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
 EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
 MTLCOMPILER_DIAGNOSTICS="$LOGDIR/macws_mtlcompiler_diagnostics"
+MTLCOMPILER_DIAGNOSTICS_NATIVE=/var/mobile/macws_mtlcompiler_diagnostics
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
@@ -649,6 +662,7 @@ ensure_chroot_works() {
 prepare_vscode_production_assets() {
     local extension_source="$VSCODE_ASSET_DIR/macwsguide.macws-aquarium-runner-0.0.1"
     local extension_target="$VSCODE_EXTENSIONS_DIR/macwsguide.macws-aquarium-runner-0.0.1"
+    local installed_schema="" marker_tmp=""
 
     [ -d "$ROOTFS/Applications/Visual Studio Code.app" ] || return 0
     if [ ! -f "$VSCODE_PLIST" ] ||
@@ -667,6 +681,31 @@ prepare_vscode_production_assets() {
        ! cp "$extension_source/README.md" "$extension_target/README.md"; then
         log "ERROR: failed to materialize the VS Code production profile."
         return 1
+    fi
+
+    # Runtime-confirmed on 2026-08-01: the legacy libraries.data contained
+    # air64-apple-ios16.3.0 while a freshly generated cache contained only
+    # air64-apple-ios19.0.0-macabi and made every previously failing ANGLE
+    # source request return a real _MTLLibrary. cleanup_macos has already
+    # stopped every VS Code helper, so invalidating these two exact,
+    # regenerable files cannot race an active Metal cache writer.
+    [ ! -f "$VSCODE_METAL_CACHE_MARKER" ] ||
+        installed_schema=$(sed -n '1p' "$VSCODE_METAL_CACHE_MARKER" 2>/dev/null)
+    if [ "$installed_schema" != "$VSCODE_METAL_CACHE_SCHEMA" ]; then
+        if ! mkdir -p "$VSCODE_METAL_CACHE_ROOT" ||
+           ! rm -f "$VSCODE_METAL_LIBRARY_CACHE/libraries.list" \
+                   "$VSCODE_METAL_LIBRARY_CACHE/libraries.data"; then
+            log "ERROR: failed to invalidate the incompatible VS Code Metal library cache."
+            return 1
+        fi
+        marker_tmp="$VSCODE_METAL_CACHE_MARKER.$$"
+        if ! printf '%s\n' "$VSCODE_METAL_CACHE_SCHEMA" > "$marker_tmp" ||
+           ! mv -f "$marker_tmp" "$VSCODE_METAL_CACHE_MARKER"; then
+            rm -f "$marker_tmp"
+            log "ERROR: failed to commit the VS Code Metal cache schema marker."
+            return 1
+        fi
+        log "VS Code Metal source cache migrated to $VSCODE_METAL_CACHE_SCHEMA."
     fi
     log "VS Code production assets ready (isolated profile=targetfix13)."
 }
@@ -923,8 +962,10 @@ diagnostic_flag_paths() {
     printf '%s\n' \
         /private/tmp/macws_agx_dump_methods \
         /private/tmp/macws_agx_trace_reserve \
+        /private/tmp/macws_mtl_data_diag \
         /private/tmp/macws_mtl_library_diag \
         /private/tmp/macws_tile_descriptor_diag \
+        /tmp/macws_pipeline_diag \
         /tmp/macws_allow_unsafe_pf550_capture \
         /tmp/macws_command_error_diag \
         /tmp/macws_cvdl_trace \
@@ -953,6 +994,7 @@ diagnostic_flag_paths() {
         /tmp/macws_submit_ring \
         /tmp/macws_trace_small_pf550_bind \
         /tmp/macws_vnc_native_all \
+        /tmp/macws_video_diag \
         /tmp/macws_vnc_test
 }
 
@@ -961,7 +1003,12 @@ clear_diagnostic_state() {
     diagnostic_flag_paths | while IFS= read -r path; do
         rm -f "$ROOTFS$path"
     done
-    rm -f "$MTLCOMPILER_DIAGNOSTICS"
+    rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_DIAGNOSTICS_NATIVE"
+    # Request/reply captures are created only by the compiler diagnostic
+    # sentinel.  Remove these exact project-owned directories before an
+    # ordinary session so neither stale evidence nor bounded binary dumps add
+    # filesystem work to production shader compilation.
+    rm -rf "$LOGDIR/mtlcompiler_requests" "$LOGDIR/mtlcompiler_replies"
 
     # Bounded dump directories are historical evidence, not session state.
     # Match only exact MacWS prefixes one directory below the chroot tmp root.
@@ -979,6 +1026,14 @@ clear_diagnostic_state() {
         -o -name 'macws_back115.raw' \
         -o -name 'macws_backdense.raw' \
         -o -name 'macws_agx_runtime_methods.log' \
+        -o -name 'macws_mtl_source_failure_*.metal' \
+        -o -name 'macws_mtl_data_*.bin' \
+        -o -name 'macws_cached_library_*.bin' \
+        -o -name 'macws_compiled_library_*.bin' \
+        -o -name 'macws_video_nv12_*.meta' \
+        -o -name 'macws_video_nv12_*_p[01].raw' \
+        -o -name 'macws_video_texture_*_p[01].raw' \
+        -o -name 'macws_video_gpu_sample_*.rgba' \
         -o -name 'macws_disp.log' \) \
         -exec rm -f {} \; 2>/dev/null
 }
@@ -1007,11 +1062,17 @@ production_preflight() {
         fi
     done
     if [ -d "$ROOTFS/Applications/Visual Studio Code.app" ]; then
+        if [ ! -f "$VSCODE_ANGLE_MACABI_LIBRARY" ] ||
+           [ "$(wc -c < "$VSCODE_ANGLE_MACABI_LIBRARY" 2>/dev/null)" != 714152 ]; then
+            log "ERROR: exact ANGLE 1ba8ec3 macabi default library is missing or invalid: $VSCODE_ANGLE_MACABI_LIBRARY"
+            bad=1
+        fi
         for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
                    MACWS_PIN_FALLBACK MACWS_JIT_MPROTECT_COMPAT \
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
-                   MACWS_MACOS_SYSTEM_POLICY_COMPAT; do
+                   MACWS_MACOS_SYSTEM_POLICY_COMPAT \
+                   MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"
@@ -1060,10 +1121,13 @@ production_preflight() {
         bad=1
     fi
     rm -f "$ROOTFS/private/tmp/macws_production_preflight.bad"
-    if [ -e "$MTLCOMPILER_DIAGNOSTICS" ]; then
-        log "ERROR: iOS MTLCompilerService diagnostic flag survived production cleanup: $MTLCOMPILER_DIAGNOSTICS"
-        bad=1
-    fi
+    for path in "$MTLCOMPILER_DIAGNOSTICS" \
+                "$MTLCOMPILER_DIAGNOSTICS_NATIVE"; do
+        if [ -e "$path" ]; then
+            log "ERROR: iOS MTLCompilerService diagnostic flag survived production cleanup: $path"
+            bad=1
+        fi
+    done
     [ "$bad" = 0 ] || return 1
     log "PRODUCTION-PREFLIGHT: native AGX required; diagnostics/env traces/dump sentinels OFF."
     return 0
