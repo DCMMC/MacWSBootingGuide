@@ -172,3 +172,87 @@ SpringBoard/设备重启。无法从网络不可达本身判断是 Wi-Fi/睡眠�
 
 本轮没有新增 flag 文件或环境变量；AGX native、production、温控和内存 watchdog
 的默认开关状态均未改变。
+
+## 6. 设备恢复连接后的 Terminal “卡死”归因与修复
+
+设备在新地址 `192.168.1.5` 恢复连接后，安装状态 witness 证明第 5 节列出的最终
+本地包仍未部署：设备 Host 仍包含旧字符串
+`scene-reused mode=fullscreen previous-window-activated=%@`，不包含最终实现的
+`system-fullscreen-requested`。因此 current-session fullscreen、完整桌面和第一轮
+Terminal 去重修改不能被当作用户这次测试所运行的版本。
+
+不过，“只运行两个命令就卡死”不能只归因为旧包。设备现存 Terminal 日志给出了
+直接的根因栈：
+
+```text
+*** Assertion failure in -[NSWindowStackController _selectedWindow], NSWindowStackController.m:621
+*** Terminating app due to uncaught exception 'NSInternalInconsistencyException', reason: 'expected no items'
+3   AppKit             -[NSWindowStackController _selectedWindow] + 212
+4   AppKit             -[NSWindow(NSWindowTabbing) _doTabbedWindowOrderInWithWasVisible:mode:] + 424
+9   AppKit             -[NSWindow makeKeyAndOrderFront:] + 40
+10  libmachook.dylib   MacWSMenuSnapshotOnMainThread + 736
+11  libmachook.dylib   __MacWSHandleMenuRequest_block_invoke + 80
+```
+
+runtime-confirmed via `/var/jb/var/mobile/terminal.log:4582-4598`：用于刷新 iOS
+原生菜单栏的**只读快照**调用了 `makeKeyAndOrderFront:`，重入 Terminal 正在提交的
+AppKit tab/window-stack 事务并破坏了 `NSWindowStackController` 的不变量。这不是
+Terminal 执行命令慢，也不是需要跳过的 AppKit assert。
+
+修复在上游恢复查询/动作边界：
+
+- `MacWSMenuSnapshotOnMainThread` 成为纯查询，绝不激活、置前或重排窗口；
+- `MacWSMenuActionOnMainThread` 也不在 AppKit 菜单事务内重排窗口；
+- 只有用户真实点击 Host 菜单标题/菜单项时，Host 才发送现有
+  `MacWSInputKindActivateTarget` 控制记录；动作等待既有 20 ms + 80 ms 激活事务
+  落定后再通过 `sendAction:to:from:` 进入 AppKit；
+- 被动的 scene resume、窗口目录变化和菜单外观刷新不再具有窗口状态副作用。
+
+本次当前画面静止还有第二个独立证据链：
+
+```text
+1785552990.629 scene-close source=did-discard ... window=10 target=77272 sent=NO errno=2
+1785553015.858 scene-close source=did-discard ... window=10 target=77272 sent=YES errno=0
+1785553025.187 scene-reused mode=fullscreen previous-window-activated=NO
+1785553029.396 scene-reused mode=fullscreen previous-window-activated=NO
+```
+
+随后 Host 连续报告 `display-stream window-list count=0`，而 Terminal PID 77272 仍
+存活且 CPU 接近空闲。runtime-confirmed via
+`/var/mobile/Library/Logs/MacWSHost.log:14313-14372`：旧全屏流程 discard 了精确
+iOS Scene，生命周期桥正确关闭了对应 macOS window；Terminal 进程本身不随最后
+一个窗口退出，于是出现“进程还在、画面和输入都不动”的假卡死。最终 Host 已将
+全屏改为当前 Scene 原地切换，不再创建/丢弃第二个 Scene。
+
+截至以上取证时设备 thermal state 为 `nominal`、有效温度约 34 °C，系统可用内存
+为 58%。因此本次证据不支持把卡死归因于 Critical 温控；部署前先停止 GUI 栈释放
+内存，不绕过 58% 启动护栏，也不执行 reboot/respring。
+
+最终生产包随后完成构建和部署：
+
+```text
+package sha256 = 26fbf51bb9faad6e431199286121b47f641ca781f678c06571db363e67d7d24f
+installed Host sha256 = 11209fc530819c4105db7c48ac2e4e77d35fcbb6da2c4f6f5d1f607c98d165d6
+chroot smoke = chroot-smoke-menu-invariant
+```
+
+设备端 `dpkg -i`、fat dylib 的 macOS build-version 修改、arm64e/arm64 拆分、双重
+签名、rootfs 同步和上述 chroot smoke 均成功。Host binary 还包含最终
+`system-fullscreen-requested` witness。该包进一步让
+`MacWSInputKindActivateTarget` 只在显式用户意图下对 Scene 对应、已可见且
+`canBecomeKeyWindow` 的精确 NSWindow 调用普通 `makeKeyWindow`；它不调用
+`makeKeyAndOrderFront:`，也不改变窗口的 order。
+
+一次受控 `production coexist --no-vnc --runtime-cap=300` 回归从可用内存 62%
+启动，WindowServer、DisplayStream、input bridge 与新 Terminal PID 80991 均成功
+运行；温度保持 `nominal`。但 watchdog 的三个内存 witness 为 `62% -> 60% ->
+58%`，随后按既定策略记录：
+
+```text
+SAFETY TRIP: 系统可用内存降至 58%（安全下限 58%），已停止 macOS GUI以避免 SystemMemoryReset
+```
+
+因此本轮证明了最终包可以冷加载和启动完整生产链，但**没有足够安全窗口完成用户
+输入/滚动的可见闪烁验收**。这项仍是 runtime-pending，不能因编译、进程存活或
+短暂首帧而宣称已稳定。watchdog 停止后内存恢复到 62%，最终重新安装后的直接样本
+为 61%、thermal `nominal`；没有绕过阈值再次启动。

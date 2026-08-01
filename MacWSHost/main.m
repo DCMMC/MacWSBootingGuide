@@ -3011,6 +3011,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)resumeSceneStream;
 - (void)cancelBootstrapTerminal;
 - (void)sceneGeometryDidChange;
+- (BOOL)activateCurrentMacWindow;
 @end
 
 static void MacWSRequestNewScene(UIScene *requestingScene,
@@ -3751,6 +3752,27 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         }];
 }
 
+- (BOOL)activateCurrentMacWindow {
+    if (_windowID == 0 || _windowOwnerPID <= 1) return NO;
+    uint32_t frameWidth = [_metalView currentFrameWidth];
+    uint32_t frameHeight = [_metalView currentFrameHeight];
+    MacWSInputRecord activation = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindActivateTarget,
+        .sceneID = MacWSInputSceneForWindow(_windowID, 0),
+        .timestamp = CACurrentMediaTime(),
+        .x = (float)(frameWidth * 0.5),
+        .y = (float)(frameHeight * 0.5),
+        .frameWidth = MAX(frameWidth, 1u),
+        .frameHeight = MAX(frameHeight, 1u),
+        .targetPID = _windowOwnerPID,
+        .source = MacWSInputSourceFinger,
+    };
+    [self metalView:_metalView emittedInput:activation];
+    return YES;
+}
+
 - (void)dismissSemanticMenu {
     [_semanticMenuDismissLayer removeFromSuperview];
     _semanticMenuDismissLayer = nil;
@@ -3792,17 +3814,35 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                              title:item.title];
                 return;
             }
-            [self->_menuClient performItem:item inSnapshot:snapshot
-                completion:^(MacWSMenuStatus status, NSError *error) {
-                    if (status == MacWSMenuStatusOK) {
-                        [self setNotice:[NSString stringWithFormat:
-                            @"已发送“%@”", item.title] success:YES];
-                    } else {
-                        [self setNotice:error.localizedDescription ?: @"菜单项无法执行"
-                                 success:NO];
-                        [self refreshSemanticMenuWithCompletion:nil];
-                    }
-                }];
+            // The iOS menu is outside AppKit, so selecting it does not itself
+            // focus the represented NSWindow.  Send the same control-plane
+            // activation as a real click and let AppKit finish its documented
+            // activation transaction before routing a First Responder action.
+            // Unlike the old bridge-side makeKeyAndOrderFront:, this happens
+            // only for explicit user intent and never during passive refresh.
+            [self activateCurrentMacWindow];
+            uint32_t selectedWindowID = snapshot.windowID;
+            int32_t selectedOwnerPID = snapshot.ownerPID;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                          120 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (self->_windowID != selectedWindowID ||
+                    self->_windowOwnerPID != selectedOwnerPID) {
+                    [self setNotice:@"窗口已经切换，请重新选择菜单项" success:NO];
+                    return;
+                }
+                [self->_menuClient performItem:item inSnapshot:snapshot
+                    completion:^(MacWSMenuStatus status, NSError *error) {
+                        if (status == MacWSMenuStatusOK) {
+                            [self setNotice:[NSString stringWithFormat:
+                                @"已发送“%@”", item.title] success:YES];
+                        } else {
+                            [self setNotice:error.localizedDescription ?:
+                                @"菜单项无法执行" success:NO];
+                            [self refreshSemanticMenuWithCompletion:nil];
+                        }
+                    }];
+            });
         }];
     [self dismissSemanticMenu];
     [self.view layoutIfNeeded];
@@ -3858,6 +3898,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         siblingIndex = old.siblingIndex;
     }
     sender.enabled = NO;
+    [self activateCurrentMacWindow];
     [self refreshSemanticMenuWithCompletion:^(MacWSMenuSnapshot *snapshot,
                                                NSError *error) {
         sender.enabled = YES;
@@ -4929,23 +4970,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // First activate the exact native window while its ID/PID mapping is still
     // authoritative, then detach this Scene from that identity and subscribe
     // it to the complete desktop producer.
-    BOOL activatedExactWindow = _windowID != 0 && _windowOwnerPID > 1;
-    if (activatedExactWindow) {
-        MacWSInputRecord activation = {
-            .magic = MACWS_INPUT_MAGIC,
-            .version = MACWS_INPUT_VERSION,
-            .kind = MacWSInputKindActivateTarget,
-            .sceneID = MacWSInputSceneForWindow(_windowID, 0),
-            .timestamp = CACurrentMediaTime(),
-            .x = (float)([_metalView currentFrameWidth] * 0.5),
-            .y = (float)([_metalView currentFrameHeight] * 0.5),
-            .frameWidth = [_metalView currentFrameWidth],
-            .frameHeight = [_metalView currentFrameHeight],
-            .targetPID = _windowOwnerPID,
-            .source = MacWSInputSourceUnknown,
-        };
-        [self metalView:_metalView emittedInput:activation];
-    }
+    BOOL activatedExactWindow = [self activateCurrentMacWindow];
     [_metalView suspendStream];
     _streamMode = MacWSStreamModeFullscreen;
     _windowID = 0;

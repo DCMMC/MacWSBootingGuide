@@ -3057,6 +3057,35 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     if (record.kind == MacWSInputKindActivateTarget) {
         BOOL before = ((MacWSMsgBool)objc_msgSend)(
             application, sel_registerName("isActive"));
+        uint32_t requestedWindowNumber =
+            MacWSInputWindowIDForScene(record.sceneID);
+        id requestedWindow = requestedWindowNumber
+            ? MacWSWindowWithNumber(application, requestedWindowNumber) : nil;
+        BOOL keyedRequestedWindow = NO;
+        if (requestedWindow) {
+            BOOL visible = ((MacWSMsgBool)objc_msgSend)(
+                requestedWindow, sel_registerName("isVisible"));
+            BOOL canBecomeKey = ((MacWSMsgBool)objc_msgSend)(
+                requestedWindow, sel_registerName("canBecomeKeyWindow"));
+            id currentKeyWindow = ((MacWSMsgID)objc_msgSend)(
+                application, sel_registerName("keyWindow"));
+            if (visible && canBecomeKey && currentKeyWindow != requestedWindow &&
+                ((MacWSMsgBoolSEL)objc_msgSend)(requestedWindow,
+                    sel_registerName("respondsToSelector:"),
+                    sel_registerName("makeKeyWindow"))) {
+                // ActivateTarget is explicit user intent from one exact Host
+                // Scene.  Select that already-visible AppKit window through
+                // the normal key-window transaction, without ordering it or
+                // re-entering NSWindowStackController's tab-order path.
+                ((MacWSMsgVoid)objc_msgSend)(
+                    requestedWindow, sel_registerName("makeKeyWindow"));
+                keyedRequestedWindow = ((MacWSMsgID)objc_msgSend)(
+                    application, sel_registerName("keyWindow")) ==
+                    requestedWindow;
+            } else {
+                keyedRequestedWindow = currentKeyWindow == requestedWindow;
+            }
+        }
         BOOL systemMenuPreflight = record.frameHeight > 0 &&
             record.y >= 0.0f &&
             record.y <= (float)record.frameHeight * 0.04f;
@@ -3140,9 +3169,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
                 "#### APP-INPUT SYSTEM-ACTIVATE-CONTROL pid=%d active=%s "
-                "coordination=%s\n",
+                "coordination=%s requested-window=%u keyed=%s\n",
                 getpid(), before ? "YES" : "NO",
-                before ? "PRESERVE-NATIVE" : "DIRECT");
+                before ? "PRESERVE-NATIVE" : "DIRECT",
+                requestedWindowNumber,
+                keyedRequestedWindow ? "YES" : "NO");
             fflush(stderr);
         }
         return;
@@ -4514,15 +4545,15 @@ static NSData *MacWSMenuSnapshotOnMainThread(
             header.appearance = MacWSMenuAppearanceLight;
     }
 
-    SEL makeKey = sel_registerName("makeKeyAndOrderFront:");
-    if (((MacWSMsgBoolSEL)objc_msgSend)(
-            window, sel_registerName("respondsToSelector:"), makeKey))
-        ((void (*)(id, SEL, id))objc_msgSend)(window, makeKey, nil);
-    SEL activate = sel_registerName("activateIgnoringOtherApps:");
-    if (((MacWSMsgBoolSEL)objc_msgSend)(
-            application, sel_registerName("respondsToSelector:"), activate))
-        ((MacWSMsgVoidBool)objc_msgSend)(application, activate, YES);
-
+    // A snapshot is a read-only query.  In particular, never order or key the
+    // requested window here: NSWindowStackController can be in the middle of
+    // committing a Terminal tab-group transition while displayd asks for a
+    // menu refresh.  Runtime evidence from Terminal showed this former
+    // makeKeyAndOrderFront: call re-entering
+    // _doTabbedWindowOrderInWithWasVisible: and terminating on the AppKit
+    // "expected no items" invariant.  Explicit Host interaction activates
+    // the represented window before an action; passive refreshes must not
+    // mutate the application's window graph.
     NSMutableData *nodes = [NSMutableData data];
     NSMutableData *strings = [NSMutableData data];
     NSMutableArray *items = [NSMutableArray array];
@@ -4607,10 +4638,11 @@ static NSData *MacWSMenuActionOnMainThread(
                 // process without also destroying its only success reply.
                 status = MacWSMenuStatusOK;
             } else {
-                SEL makeKey = sel_registerName("makeKeyAndOrderFront:");
-                if (((MacWSMsgBoolSEL)objc_msgSend)(window,
-                        sel_registerName("respondsToSelector:"), makeKey))
-                    ((void (*)(id, SEL, id))objc_msgSend)(window, makeKey, nil);
+                // Action execution is also deliberately free of window-order
+                // mutations.  The Host emits ActivateTarget as the explicit
+                // user intent before arriving here.  Reordering from inside
+                // a menu transaction can re-enter AppKit's tab controller,
+                // which is the exact failure the snapshot path used to cause.
                 id target = ((MacWSMsgID)objc_msgSend)(
                     current, sel_registerName("target"));
                 status = ((MacWSMsgBoolSELIDID)objc_msgSend)(application,
