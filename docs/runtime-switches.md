@@ -61,14 +61,15 @@ session, then samples once every 300 seconds. Only an explicitly observed
 `macos_gui.sh status` reads the watchdog's timestamped cached snapshot and does
 not perform an extra sensor read.
 
-Memory pressure is an independent safety input. The launcher reads XNU's
-system-wide available-memory percentage through `memory_pressure -Q` at
-startup and every 30 seconds. It refuses or stops the disposable GUI stack at
-or below 58%, while unavailable telemetry remains log-only. This threshold is
-the project safety margin between the recovered 61–62% device witness and the
-56% `SystemMemoryReset` witness; it is not presented as an Apple-defined
-pressure class. Exact evidence and the largest resident processes are recorded
-in [`memory-reset-20260801/`](evidence/memory-reset-20260801/README.md).
+The former `memory_pressure -Q <= 58%` launcher guard is disabled. iOS uses
+otherwise-idle RAM for caches and reclaimable allocations, and the returned
+free percentage is not an Apple pressure-state boundary. Runtime on 2026-08-01
+showed the threshold stopping an otherwise-running production launch, so startup and the
+watchdog no longer sample, refuse, or stop on that value. XNU/iOS memorystatus
+retains authority over cache reclamation and process pressure handling. The
+historical reset evidence remains in
+[`memory-reset-20260801/`](evidence/memory-reset-20260801/README.md), but no
+project memory threshold is active.
 
 At startup, production mode validates two independent trustcache witnesses:
 the base chroot shell and VS Code's early-loaded Electron Framework. If either

@@ -51,7 +51,6 @@ CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
 THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
-MEMORY_PRESSURE_BIN=/var/jb/usr/bin/memory_pressure
 LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
 
@@ -189,15 +188,11 @@ esac
 # an iOS-native helper. Temperature values and non-critical states are evidence
 # only; per policy, thermal intervention occurs only at `critical`.
 WD_THERMAL_POLL=300  # temperature sensors are sampled every 5 minutes
-# `memory_pressure -Q` is a read-only wrapper around XNU's
-# memorystatus_get_level(): it reports the percentage of system-wide memory
-# XNU currently considers available.  The 2026-08-01 SystemMemoryReset report
-# was generated at 56%, while a recovered idle device measured 62%.  Stop the
-# disposable macOS GUI stack at or below 58% so iPadOS gets memory back before
-# it has to reset userspace services.  This is intentionally independent of
-# the critical-only thermal policy.
-WD_MEMORY_POLL=30
-WD_MEMORY_MIN_PERCENT=58
+# Do not gate or stop the GUI on `memory_pressure -Q`. iOS deliberately uses
+# otherwise-idle RAM for caches and reclaimable objects, so a free-percentage
+# threshold is not a reliable pressure-state boundary. The former 58% policy
+# produced a runtime-confirmed false stop during an otherwise healthy launch
+# and is retired. XNU/iOS memorystatus remains the authority for reclamation.
 WD_RESTART_LIMIT=12  # WindowServer restarts within WD_WINDOW that means "crash loop"
                      # (raised from 4: Firefox triggers some SkyLight CAWSBackend asserts
                      #  we haven't byte-patched yet (render_update composite_destination
@@ -216,7 +211,6 @@ WD_TRIP="$LOGDIR/macws_safety_trip"
 WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
 WD_READY="$LOGDIR/macos_gui_watchdog.ready"
 WD_THERMAL_SNAPSHOT="$LOGDIR/macos_gui_thermal_snapshot"
-WD_MEMORY_SNAPSHOT="$LOGDIR/macos_gui_memory_snapshot"
 RECOVERED_WS_PID=""
 RECOVERY_EXTRA_RESTARTS=0
 
@@ -353,37 +347,6 @@ record_thermal_snapshot() {
     mv "$snapshot_tmp" "$WD_THERMAL_SNAPSHOT"
 }
 
-# Populate MEMORY_* globals from `memory_pressure -Q`.  Do not estimate this
-# value from vm_stat: XNU's available-page accounting includes reclaimability
-# rules that a shell-side sum cannot reproduce.
-memory_snapshot() {
-    MEMORY_LINE=""
-    MEMORY_FREE_PERCENT=""
-    MEMORY_HELPER_RC=127
-
-    [ -x "$MEMORY_PRESSURE_BIN" ] || return 1
-    MEMORY_LINE=$("$MEMORY_PRESSURE_BIN" -Q 2>&1)
-    MEMORY_HELPER_RC=$?
-    MEMORY_FREE_PERCENT=$(printf '%s\n' "$MEMORY_LINE" | awk '
-        /System-wide memory free percentage:/ {
-            value=$NF
-            gsub(/%/, "", value)
-            print value
-            exit
-        }')
-    case "$MEMORY_FREE_PERCENT" in
-        ''|*[!0-9]*) return 1 ;;
-    esac
-    [ "$MEMORY_FREE_PERCENT" -le 100 ] || return 1
-    return 0
-}
-
-record_memory_snapshot() {
-    local payload="$1" snapshot_tmp="${WD_MEMORY_SNAPSHOT}.$$"
-    printf 'sampled-at=%s %s\n' "$(date +%s)" "$payload" > "$snapshot_tmp"
-    mv "$snapshot_tmp" "$WD_MEMORY_SNAPSHOT"
-}
-
 # A GUI client cannot reuse its WindowServer connection after that server dies.
 # Runtime evidence from OSXvnc is explicit:
 #   "received notification of WindowServer event port death"
@@ -514,7 +477,7 @@ watchdog_pidfile_cleanup() {
 # independent non-thermal trip paths.
 run_watchdog() {
     local last_pid="" restarts=0 t0 started now pid
-    local missing_samples=0 next_thermal=0 next_memory=0
+    local missing_samples=0 next_thermal=0
     local ws_seen=0 startup_wait_logged=0
     local startup_owner="${MACWS_WATCHDOG_STARTUP_OWNER:-}"
     local runtime_cap_label="disabled"
@@ -529,7 +492,6 @@ run_watchdog() {
     t0=$(date +%s)
     started=$t0
     next_thermal=$((started + WD_THERMAL_POLL))
-    next_memory=$((started + WD_MEMORY_POLL))
     [ "$WD_MAX_RUNTIME" -gt 0 ] &&
         runtime_cap_label="${WD_MAX_RUNTIME}s"
 
@@ -548,19 +510,8 @@ run_watchdog() {
         log "watchdog: WARNING: initial thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; continuing because only an observed critical state may intervene"
     fi
 
-    if memory_snapshot; then
-        record_memory_snapshot "free-percent=$MEMORY_FREE_PERCENT"
-        log "watchdog: initial memory sample: free=${MEMORY_FREE_PERCENT}%"
-        if [ "$MEMORY_FREE_PERCENT" -le "$WD_MEMORY_MIN_PERCENT" ]; then
-            trip_watchdog "启动时系统可用内存仅 ${MEMORY_FREE_PERCENT}%（安全下限 ${WD_MEMORY_MIN_PERCENT}%），已拒绝启动 macOS GUI"
-            return 0
-        fi
-    else
-        record_memory_snapshot "unavailable rc=$MEMORY_HELPER_RC"
-        log "watchdog: WARNING: memory-pressure telemetry unavailable rc=$MEMORY_HELPER_RC; continuing with thermal and crash-loop guards"
-    fi
     echo "$$" > "$WD_READY"
-    log "watchdog: armed (temperature every ${WD_THERMAL_POLL}s, critical-only; memory every ${WD_MEMORY_POLL}s, stop<=${WD_MEMORY_MIN_PERCENT}%; restarts>=$WD_RESTART_LIMIT/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
+    log "watchdog: armed (temperature every ${WD_THERMAL_POLL}s, critical-only; memory guard=disabled; restarts>=$WD_RESTART_LIMIT/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
     while :; do
         sleep "$WD_POLL"
         now=$(date +%s)
@@ -576,21 +527,6 @@ run_watchdog() {
             else
                 record_thermal_snapshot "unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'"
                 log "watchdog: WARNING: thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; no intervention without an observed critical state"
-            fi
-        fi
-
-        if [ "$now" -ge "$next_memory" ]; then
-            next_memory=$((now + WD_MEMORY_POLL))
-            if memory_snapshot; then
-                record_memory_snapshot "free-percent=$MEMORY_FREE_PERCENT"
-                log "watchdog: memory sample: free=${MEMORY_FREE_PERCENT}%"
-                if [ "$MEMORY_FREE_PERCENT" -le "$WD_MEMORY_MIN_PERCENT" ]; then
-                    trip_watchdog "系统可用内存降至 ${MEMORY_FREE_PERCENT}%（安全下限 ${WD_MEMORY_MIN_PERCENT}%），已停止 macOS GUI 以避免 SystemMemoryReset"
-                    return 0
-                fi
-            else
-                record_memory_snapshot "unavailable rc=$MEMORY_HELPER_RC"
-                log "watchdog: WARNING: memory-pressure telemetry unavailable rc=$MEMORY_HELPER_RC; no memory intervention without a valid percentage"
             fi
         fi
 
@@ -1339,11 +1275,7 @@ status() {
     else
         echo "thermal   : not sampled (watchdog is stopped or has not armed yet)"
     fi
-    if [ -f "$WD_MEMORY_SNAPSHOT" ]; then
-        echo "memory    : $(awk 'NR == 1 { print; exit }' "$WD_MEMORY_SNAPSHOT" 2>/dev/null)"
-    else
-        echo "memory    : not sampled (watchdog is stopped or has not armed yet)"
-    fi
+    echo "memory    : guard disabled (managed by iOS/XNU memorystatus)"
     if [ -e "$FLAG" ]; then
         echo "mode flag : present  -> COEXISTENCE (panel = iOS, macOS = VNC)"
     else
@@ -1415,12 +1347,12 @@ Modes:
 
 Safety: start launches a mandatory iOS-native health watchdog before the GUI.
 It records a startup snapshot, samples temperature every five minutes, and
-stops for thermal reasons only when iPadOS explicitly reports `critical`.
+stops for thermal reasons only when iPadOS explicitly reports critical.
 Nominal/fair/serious states, numeric temperatures, and unreadable samples are
-logged without intervention. It separately samples XNU's system-wide available
-memory every 30 seconds and stops the disposable GUI stack at or below 58%.
-Crash-loop and explicit runtime-cap guards remain separate. The watchdog cannot
-be disabled. Logs to
+logged without intervention. The former free-memory percentage guard is
+disabled; iOS/XNU memorystatus owns cache reclamation and memory pressure.
+Crash-loop and explicit runtime-cap guards remain separate. The watchdog
+cannot be disabled. Logs to
 $LOGDIR/macos_gui_watchdog.log.
 
 The production profile enables native AGX and its required command/completion
@@ -1615,14 +1547,14 @@ wait_for_initial_vnc_capture_if_requested() {
     return 0
 }
 
-# Launch the mandatory thermal/memory/crash-loop watchdog in the background (iOS-side,
+# Launch the mandatory thermal/crash-loop watchdog in the background (iOS-side,
 # survives SSH disconnect via nohup). Re-invokes this script in `watchdog` mode
 # and waits for its independent temperature-sensor handshake before returning.
 start_watchdog() {
     local child="" ready_owner="" waited=0
     stop_watchdogs
     rm -f "$WD_LOG" "$WD_TRIP" "$WD_READY" "$WD_THERMAL_SNAPSHOT" \
-        "$WD_MEMORY_SNAPSHOT"
+        "$LOGDIR/macos_gui_memory_snapshot"
     # Re-exec with the exact session intent.  The recovery path needs these
     # flags so a WS restart does not unexpectedly launch a VNC/Terminal job the
     # user disabled, and so it knows whether to request a fresh shared frame.
@@ -1641,7 +1573,7 @@ start_watchdog() {
     while [ "$waited" -lt 10 ]; do
         ready_owner=$(awk 'NR == 1 { print $1 }' "$WD_READY" 2>/dev/null)
         if [ "$ready_owner" = "$child" ]; then
-            log "watchdog: mandatory health guard ready (temperature=${WD_THERMAL_POLL}s critical-only; memory=${WD_MEMORY_POLL}s stop<=${WD_MEMORY_MIN_PERCENT}%; log=$WD_LOG)."
+            log "watchdog: mandatory health guard ready (temperature=${WD_THERMAL_POLL}s critical-only; memory guard=disabled; log=$WD_LOG)."
             return 0
         fi
         if [ -f "$WD_TRIP" ] || ! kill -0 "$child" 2>/dev/null; then

@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-01；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入和 Carbon 右键菜单选择已在目标 iPad 运行确认。完整桌面已实现为 Retina 底层 IOSurface + 可见 SkyLight 窗口分层直传；当前 Scene 的 iPadOS 系统最大化已接入目标 UIKitCore 的真实 activation-options 请求。二者设备运行回归尚受 58% 内存安全护栏及随后网络不可达阻止；四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-01；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入和 Carbon 右键菜单选择已在目标 iPad 运行确认。完整桌面已实现为 Retina 底层 IOSurface + 可见 SkyLight 窗口分层直传；当前 Scene 的 iPadOS 系统最大化已接入目标 UIKitCore 的真实 activation-options 请求。最终包已部署；产生误停止的 58% 空闲内存护栏已撤销，二者的设备运行回归继续进行。四窗与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 

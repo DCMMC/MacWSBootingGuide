@@ -256,3 +256,33 @@ SAFETY TRIP: 系统可用内存降至 58%（安全下限 58%），已停止 macO
 输入/滚动的可见闪烁验收**。这项仍是 runtime-pending，不能因编译、进程存活或
 短暂首帧而宣称已稳定。watchdog 停止后内存恢复到 62%，最终重新安装后的直接样本
 为 61%、thermal `nominal`；没有绕过阈值再次启动。
+
+## 7. 撤销空闲内存百分比护栏
+
+用户随后明确要求关闭该护栏。iOS 会把未使用 RAM 用于缓存和可回收对象，
+`memory_pressure -Q` 的 free percentage 不是 Apple 定义的 pressure-state 边界；
+用固定 58% 作为项目 kill switch 会把正常内存利用判为故障。第 6 节记录的
+`62% -> 60% -> 58%` 自动停止正是实际误触发 witness。
+
+生产启动脚本现已完全移除这条控制路径：不做 startup memory gate，不再每 30 秒
+采样，也不会因 free percentage 停止 GUI。`status` 明确显示
+`memory: guard disabled`，并在启动时删除旧 snapshot，避免旧的 58% 记录被误读为
+当前策略。温控仍为每 300 秒采样且仅 `critical` 干预；WindowServer crash-loop 与
+显式 `--runtime-cap` 继续独立工作。
+
+部署与运行 witness：最终包 SHA-256 为
+`535894fd6814db79f4ff7761670472aeb3da5151cf6d777d0e09ae60606cc37e`。
+设备脚本通过 `bash -n`，且不存在 `WD_MEMORY_*`、
+`MEMORY_PRESSURE_BIN` 或 `memory_snapshot()`。production/coexist/no-VNC
+启动后跨过旧 30 秒采样周期，watchdog 完整日志只有：
+
+```text
+watchdog: initial thermal sample: thermal-state=nominal ...
+watchdog: armed (temperature every 300s, critical-only; memory guard=disabled; restarts>=12/45s; runtime cap=disabled)
+```
+
+日志中没有 memory sample、free-percentage 或 memory safety trip；WindowServer
+PID 82786、Terminal PID 82893、DisplayStream 与 input bridge 继续运行。随后直接温度
+样本仍为 `thermal-state=nominal`、约 32.1 °C。runtime-confirmed via
+`/var/jb/var/mobile/macos_gui_watchdog.log` 与同一时刻的
+`macos_gui.sh status`。GUI 留在 production coexist 模式供后续交互回归使用。

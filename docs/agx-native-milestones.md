@@ -2212,8 +2212,10 @@ then passed `packaged-chroot-smoke-ok`. Evidence is in
 During the media run iPadOS emitted a real `SystemMemoryReset` report at 56%
 user-reclaimable memory. WindowServer and MacWSHost were substantial residents,
 but two Reynard Helper processes were larger, so this is recorded as a
-whole-system event rather than blamed on one process. Production now keeps the
-300-second, critical-only thermal rule and separately samples XNU's available
-memory every 30 seconds, stopping the GUI at or below the evidence-derived 58%
-safety margin. Full report and policy rationale are in
+whole-system event rather than blamed on one process. An initial 58% project
+threshold was later runtime-confirmed to stop an otherwise-running production launch and
+has been retired: iOS's available-memory percentage is not a pressure-state
+boundary. Production keeps the 300-second, critical-only thermal rule and
+crash-loop protection, but no longer samples or intervenes on free-memory
+percentage. Full report and policy history are in
 [`memory-reset-20260801/`](evidence/memory-reset-20260801/README.md).

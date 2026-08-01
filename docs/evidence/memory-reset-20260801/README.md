@@ -27,17 +27,21 @@ to one MacWS process. The later Electron abort in `_RegisterApplication`
 occurred after the WindowServer event port died and is downstream of this
 event.
 
-## Guard policy
+## Retired guard policy
 
 The recovered, GUI-stopped device reported 61–62% through
-`memory_pressure -Q`. Production now samples that XNU value every 30 seconds
-and stops the disposable macOS GUI stack at or below 58%. The threshold is a
-project safety margin selected between the recovered idle witness and the 56%
-reset witness; it is not claimed to be an Apple-defined critical threshold.
-Missing or malformed telemetry is logged but does not invent a pressure state.
+`memory_pressure -Q`. An initial policy sampled that value every 30 seconds and
+stopped the GUI at or below 58%. A later production start produced the sequence
+`62% -> 60% -> 58%` while the thermal state remained nominal; the project guard
+then stopped an otherwise-running WindowServer, DisplayStream and Terminal.
+
+That policy is retired. The percentage describes currently available memory,
+not an Apple pressure-state boundary, and normal iOS cache/reclaim behavior
+makes a fixed free-percentage threshold unsuitable as a project kill switch.
+Production no longer samples, refuses, or stops the GUI based on this value.
+XNU/iOS memorystatus remains responsible for reclamation and pressure policy.
 
 This does not alter the user-selected thermal policy: temperature is still
 sampled every 300 seconds and only an explicitly observed `critical` thermal
-state intervenes. A no-GUI watchdog run on the device observed
-`thermal-state=nominal`, `free=61%`, armed successfully, and exited when it
-confirmed that the WindowServer job was unloaded.
+state intervenes. Crash-loop detection and explicit automation runtime caps
+also remain independent safeguards.
