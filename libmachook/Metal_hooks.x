@@ -42,6 +42,41 @@ static BOOL macws_runtime_diagnostics_enabled(void) {
     return value != 0;
 }
 
+// Focused launch-context probe for ViewBridge/HIServices/OpenPanel.  These
+// services must retain libxpc's private per-instance dictionary across the
+// proxy chroot+exec boundary.  The probe records the real dictionary from the
+// target process; it never changes listener results or protocol behavior.
+static void macws_record_xpc_service_context_if_requested(void) {
+    if (access("/private/tmp/macws_xpc_proxy_trace", F_OK) != 0) return;
+    const char *program = getprogname();
+    if (!program || (!strstr(program, "ViewBridgeAuxiliary") &&
+                     !strstr(program, "hiservices-xpcservice") &&
+                     !strstr(program, "openAndSavePanelService"))) return;
+    typedef xpc_object_t (*copy_service_dictionary_fn)(void);
+    copy_service_dictionary_fn copyDictionary =
+        (copy_service_dictionary_fn)dlsym(
+            RTLD_DEFAULT, "_xpc_copy_xpcservice_dictionary");
+    xpc_object_t dictionary = copyDictionary ? copyDictionary() : NULL;
+    char *description = dictionary ? xpc_copy_description(dictionary) : NULL;
+    int fd = open("/private/tmp/macws_xpc_context.log",
+                  O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        dprintf(fd,
+                "stage=target-constructor program=%s pid=%d ppid=%d uid=%d "
+                "service=%s dictionary=%s\n",
+                program, getpid(), getppid(), getuid(),
+                getenv("XPC_SERVICE_NAME") ?: "<unset>",
+                description ?: "<unavailable>");
+        extern char **environ;
+        for (char **entry = environ; entry && *entry; entry++) {
+            if (strstr(*entry, "XPC") || strstr(*entry, "xpc"))
+                dprintf(fd, "stage=target-constructor env=%s\n", *entry);
+        }
+        close(fd);
+    }
+    free(description);
+}
+
 static int macws_filtered_fprintf(FILE *stream, const char *format, ...)
     __attribute__((format(printf, 2, 3)));
 static int macws_filtered_fprintf(FILE *stream, const char *format, ...) {
@@ -9468,6 +9503,14 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
     if(name && !strncmp(name, metalSimService, strlen(metalSimService))) {
         return xpc_connection_create(metalSimService, 0);
     }
+    // macOS Foundation's NSProgress registrar is provided by the native iOS
+    // filecoordinationd through a byte-for-byte relay XPC bundle.  The chroot
+    // process cannot resolve the user/501 endpoint directly from its root
+    // application domain; routing this one name through bundle activation
+    // keeps the real NSProgress protocol and replies intact.
+    if (name && !strcmp(name, "com.apple.ProgressReporting")) {
+        return xpc_connection_create("com.apple.ProgressReporting", targetq);
+    }
     return orig_xpc_connection_create_mach_service(name, targetq, flags);
 }
 
@@ -9477,103 +9520,13 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
     if (name && getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr, "#### XPC_TRACE service create: '%s'\n", name);
     }
+
     return orig_xpc_connection_create(name, queue);
 }
 
 extern int xpc_connection_enable_sim2host_4sim();
 %hookf(int, xpc_connection_enable_sim2host_4sim) {
     return 0;
-}
-
-// Deferred install of NSXPCSharedListener swizzle.
-// AppKit calls +[NSXPCSharedListener endpointForReply:withListenerName:replyErrorCode:]
-// to obtain endpoints to ViewBridgeAuxiliary / hiservices. In chroot these XPC services
-// can't be spawned (macOS-only frameworks; iOS launchd has no equivalent), so the call
-// returns nil and AppKit logs "Connection invalid", skipping window content creation.
-//
-// We return a process-local NSXPCListener's endpoint so AppKit thinks it got one. The
-// in-process listener doesn't actually serve the real protocol, but AppKit's "endpoint
-// non-nil" check passes and downstream window creation proceeds.
-//
-// MUST run AFTER libSystem_initializer (constructor-time NSClassFromString causes
-// libSystem PAC traps on arm64e). Install via dispatch_async-after-main-loop.
-static IMP gOrigEndpointForReply = NULL;
-
-static id hook_endpointForReply_replacement(Class self, SEL _cmd, id reply,
-                                             id listenerName, int *replyErrorCode) {
-    // listenerName is an OS_xpc_string (XPC string), not NSString. Extract cstring
-    // via the OS_xpc_string instance method instead of NSString's UTF8String.
-    const char *name_c = "(nil)";
-    if (listenerName) {
-        SEL utf8_sel = sel_registerName("UTF8String");
-        if ([listenerName respondsToSelector:utf8_sel]) {
-            // NSString-style — fine
-            name_c = ((const char *(*)(id, SEL))objc_msgSend)(listenerName, utf8_sel);
-        } else {
-            // Assume xpc_string_t — try xpc_string_get_string_ptr
-            extern const char *xpc_string_get_string_ptr(xpc_object_t xstring);
-            name_c = xpc_string_get_string_ptr((xpc_object_t)listenerName);
-            if (!name_c) name_c = "(xpc-string?)";
-        }
-    }
-    fprintf(stderr, "#### NSXPCSharedListener intercept: listener=%s\n", name_c);
-
-    static NSMutableDictionary *cache;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ cache = [NSMutableDictionary new]; });
-    if (!listenerName) {
-        if (replyErrorCode) *replyErrorCode = 0;
-        return nil;
-    }
-    NSString *key = [NSString stringWithUTF8String:name_c];
-    @synchronized(cache) {
-        NSXPCListenerEndpoint *ep = cache[key];
-        if (!ep) {
-            NSXPCListener *l = [NSXPCListener anonymousListener];
-            [l resume];
-            ep = l.endpoint;
-            cache[key] = ep;
-            fprintf(stderr, "#### NSXPCSharedListener: provided in-process endpoint %p for '%s'\n",
-                ep, name_c);
-        }
-        if (replyErrorCode) *replyErrorCode = 0;
-        return ep;
-    }
-}
-
-// Replacement for +[NSXPCSharedListener connectToService:instanceIdentifier:listener:error:].
-// Returning YES makes ViewBridge believe the connection is up; it then dereferences
-// an expected proxy and crashes in __auxiliaryProxyFor_block_invoke. Returning NO
-// makes ViewBridge bail with a graceful failure — auxiliaryProxyFor returns nil,
-// NSRemoteView initialize finishes without crashing, AppKit continues to window
-// creation (which doesn't strictly need NSRemoteView).
-static BOOL hook_connectToService_replacement(Class self, SEL _cmd, id service,
-                                                id instanceIdentifier, id listener,
-                                                NSError **errorPtr) {
-    fprintf(stderr, "#### NSXPCSharedListener connectToService intercepted (graceful fail)\n");
-    // Don't set errorPtr; NSError instantiation triggers PAC autda fault in chroot arm64e.
-    // Returning NO with *errorPtr untouched should be acceptable for ViewBridge's call site.
-    return NO;
-}
-
-static void install_nsxpcsharedlistener_swizzle(void) {
-    Class shl = objc_getClass("NSXPCSharedListener");
-    fprintf(stderr, "#### NSXPCSharedListener class=%p\n", shl);
-    if (!shl) return;
-    SEL sel = sel_registerName("endpointForReply:withListenerName:replyErrorCode:");
-    Method m = class_getClassMethod(shl, sel);
-    if (m) {
-        gOrigEndpointForReply = method_getImplementation(m);
-        method_setImplementation(m, (IMP)hook_endpointForReply_replacement);
-        fprintf(stderr, "#### NSXPCSharedListener endpointForReply swizzle installed\n");
-    }
-    // Also swizzle connectToService:instanceIdentifier:listener:error: to silently succeed.
-    SEL sel2 = sel_registerName("connectToService:instanceIdentifier:listener:error:");
-    Method m2 = class_getClassMethod(shl, sel2);
-    if (m2) {
-        method_setImplementation(m2, (IMP)hook_connectToService_replacement);
-        fprintf(stderr, "#### NSXPCSharedListener connectToService swizzle installed\n");
-    }
 }
 
 // Direct Terminal launches restore saved NSWindow state without the normal
@@ -9685,6 +9638,7 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
+    macws_record_xpc_service_context_if_requested();
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
 
@@ -9724,9 +9678,6 @@ __attribute__((constructor)) static void InitMetalHooks() {
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
     MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"), hooked_xpc_connection_create, (void *)&orig_xpc_connection_create);
 
-    // Defer NSXPCSharedListener swizzle install until after libSystem is fully up.
-    // Constructor-time class lookup PAC-traps on arm64e (autda fault in libobjc class
-    // realization). dispatch_async waits until the main runloop is active.
     dispatch_async(dispatch_get_main_queue(), ^{
         // (NOTE: tried calling MTLCreateSystemDefaultDevice here to force Metal load
         // for the black-tab fix — it DEADLOCKED chroot AppKit startup. Revisit via
@@ -9736,8 +9687,6 @@ __attribute__((constructor)) static void InitMetalHooks() {
             macws_iogpu_callback_diag_enabled()) {
             macws_install_iogpu_callback_diagnostics();
         }
-        install_nsxpcsharedlistener_swizzle();
-
         // A direct executable launch does not carry LaunchServices' normal
         // open-application AppleEvent.  This Terminal image also deliberately
         // returns NO from -applicationShouldOpenUntitledFile:.  Its real user
@@ -9821,10 +9770,25 @@ __attribute__((constructor)) static void InitMetalHooks() {
     snprintf(frameworkPath, sizeof(frameworkPath), "%s/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc", JBROOT_PATH("/usr/macOS/Frameworks"));
     xpc_add_bundle(frameworkPath, 2);
 
-    // ViewBridgeAuxiliary.xpc & hiservices-xpcservice.xpc are now registered via
-    // _xpc_bootstrap_services in mac_hooks.m's libxpc branch — pointing at the
-    // FRAMEWORK BINARY paths, which lets xpc auto-discover bundled XPCServices/
-    // children. xpc_add_bundle (the .xpc-path variant) didn't actually trigger
-    // spawn; _xpc_bootstrap_services does. (Credit: user-suggested fix based on
-    // their earlier MTLCompilerService shader recompile issue.)
+    // Register iOS-platform launch proxies only after libxpc and the ObjC/CF
+    // runtime have completed initialization.  Calling the private bootstrap
+    // routine from dyld's libxpc add-image callback is too early: it returned
+    // zero but later xpc_connection_create still received Connection Invalid
+    // and launchd never created an xpcproxy instance.  xpc_add_bundle is the
+    // public wrapper used by the already-working MTLSim service above; target
+    // disassembly confirms flag 2 maps to path value 0x1001 and calls the same
+    // routine after `_xpc_uncork_domain`.  The real macOS SETEXEC targets are
+    // signed/trusted by postinst before any client can request them.
+    static const char *const proxyRelativePaths[] = {
+        "/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc",
+        "/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc",
+        "/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc",
+        "/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc",
+        NULL,
+    };
+    for (const char *const *relative = proxyRelativePaths; *relative; relative++) {
+        snprintf(frameworkPath, sizeof(frameworkPath), "%s%s",
+                 JBROOT_PATH("/usr/macOS/Frameworks"), *relative);
+        xpc_add_bundle(frameworkPath, 2);
+    }
 }

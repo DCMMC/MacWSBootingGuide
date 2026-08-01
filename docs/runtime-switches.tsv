@@ -21,6 +21,7 @@ env	MACWS_IOS_MIP_TEXTURE_PROBE	off	standalone probe	Selects the native iOS mipm
 env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 texture probe before creating plane textures for project-LLDB attachment.
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
+env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
 env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
 env	MACWS_AGXIOC_FUZZ	off	diagnostic	Mutates AGX selector-9 arguments.
@@ -51,6 +52,7 @@ env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bin
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
 env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
 env	MACWS_DUMP_BACKING	off	diagnostic	Texture backing dump.
+env	MACWS_FILE_PANEL_DIAG	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls.
 env	MACWS_GLASS_BLUR_AB	off	diagnostic	GlassDemo blur A/B hook.
 env	MACWS_GOT_RAW_AUTH	off	diagnostic	Raw authenticated GOT inspection.
 env	MACWS_GOT_SKIP_AUTH	off	diagnostic	Skips authenticated GOT repair entries.
@@ -97,6 +99,7 @@ env	REDWIN_LOOP	off	standalone probe	Keeps the red-window rendering probe repain
 env	TOY_DELAY	off	standalone probe	Delays the ToyGUI rendering probe.
 env	VSCODE_RESOLVING_ENVIRONMENT	transient	VS Code shell environment resolver	Exact official marker selecting the token-plus-JSON exec adapter and minimal constructor mode.
 env	MallocScribble	off	allocator diagnostic	Forbidden in every production launch plist.
+env	XPC_SERVICE_NAME	auto	macOS XPC services	System-provided service identity observed by the read-only proxy diagnostic; MacWS does not set it.
 cli	--force-disable-user-env	on	VS Code main service	Supported VS Code switch avoids the redundant main-service login-shell environment probe.
 cli	--no-watchdog	off	safety invariant	Removed option; iPad thermal, memory-pressure and crash-loop protection cannot be disabled.
 setting	chat.agentHost.enabled	off	dedicated VS Code benchmark profile	Avoid optional Copilot/Claude AgentHost processes unrelated to native-AGX WebGL measurement.
@@ -139,6 +142,8 @@ flag	/tmp/macws_queue_qos_diag	off	diagnostic	Command-queue QoS trace.
 flag	/tmp/macws_real_swapend	off	unsafe A/B	Lets macOS contend for the physical panel in coexistence.
 flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
 flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
+flag	/tmp/macws_app_input_diagnostics	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
+flag	/tmp/macws_file_panel_diag	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls; production startup removes it.
 flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
 flag	/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Native iOS-seatbelt spelling of the compiler diagnostics sentinel; equivalent to the rootless alias and removed by production preflight.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
@@ -150,6 +155,7 @@ flag	/tmp/macws_vnc_native_all	off	redundant override	Production owns this setti
 flag	/tmp/macws_video_diag	off	diagnostic	Read-only NV12 texture creation-to-fragment-binding witness.
 flag	/tmp/macws_vnc_share	on	WindowServer/VNC	Enable shared Retina framebuffer publication.
 flag	/tmp/macws_vnc_test	off	diagnostic	Synthetic VNC gradient.
+flag	/private/tmp/macws_xpc_proxy_trace	off	XPC proxy diagnostic	Logs the real process/service environment for compatibility-service attribution; production startup removes it.
 state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion interval, currently 100000 us.
 state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
 state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.

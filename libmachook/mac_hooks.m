@@ -2916,36 +2916,28 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
-        // Register the bundled XPC services inside each framework. KEY here is
-        // the FRAMEWORK BINARY path (not the .xpc bundle path) — _xpc_bootstrap_services
-        // walks each framework, finds its XPCServices/ subdir, and registers every .xpc
-        // inside. xpc_add_bundle (the .xpc-path variant) silently fails in this context;
-        // _xpc_bootstrap_services is the working API.
+        // Register the services in this task's XPC domain. The Metal compiler
+        // intentionally resolves through the same /System path on iOS, where
+        // the iOS service exists and MTLCompilerBypassOSCheck adapts the target.
         //
-        // - Metal.framework → MTLCompilerService.xpc (existing, shader compile)
-        // - ViewBridge.framework → ViewBridgeAuxiliary.xpc (NEW: AppKit window content
-        //   render — without this, Terminal logs "Connection Invalid for
-        //   com.apple.ViewBridgeAuxiliary" and window content never renders)
-        // - HIServices.framework → com.apple.hiservices-xpcservice.xpc (NEW: AppKit's
-        //   client-aux endpoint; previously: "Connection Invalid for
-        //   com.apple.hiservices-xpcservice")
-        // - AppKit.framework → com.apple.appkit.xpc.openAndSavePanelService.xpc.
-        //   Runtime evidence from VSCode showed Electron leaving one file-open
-        //   dialog permanently in-flight while the service bundle exists under
-        //   AppKit/XPCServices. Register its owning framework through the same
-        //   real bootstrap path instead of replacing NSOpenPanel behavior.
+        // ViewBridge, HIServices and AppKit are owned by explicit MachServices
+        // jobs in the GUI stack. Runtime evidence on 2026-08-02 showed that
+        // `_xpc_bootstrap_services` accepted per-process proxy bundle paths
+        // (result=0), but NSXPCSharedListener still returned Connection Invalid
+        // and launchd never spawned a proxy. A system-bootstrap app cannot use
+        // the ordinary per-user bundle activation model. The launchd jobs keep
+        // the named receive rights in the same domain as these root GUI clients
+        // and execute the iOS-visible chroot proxies on demand.
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
-        // Framework binary path uses TLD symlink form (matches Metal pattern)
-        xpc_dictionary_set_uint64(dict, "/System/Library/PrivateFrameworks/ViewBridge.framework/ViewBridge", 2);
-        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/HIServices", 2);
-        xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/AppKit.framework/AppKit", 2);
-        void(*_xpc_bootstrap_services_fn)(xpc_object_t) = MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
-        fprintf(stderr, "#### XPC_BOOTSTRAP: fn=%p dict=%p (registering Metal/ViewBridge/HIServices/AppKit)\n",
+        int(*_xpc_bootstrap_services_fn)(xpc_object_t) =
+            MSFindSymbol((MSImageRef)header, "__xpc_bootstrap_services");
+        fprintf(stderr, "#### XPC_BOOTSTRAP: fn=%p dict=%p "
+            "(registering Metal compiler service)\n",
             _xpc_bootstrap_services_fn, dict);
         if (_xpc_bootstrap_services_fn) {
-            _xpc_bootstrap_services_fn(dict);
-            fprintf(stderr, "#### XPC_BOOTSTRAP: called OK\n");
+            int result = _xpc_bootstrap_services_fn(dict);
+            fprintf(stderr, "#### XPC_BOOTSTRAP: result=%d\n", result);
         } else {
             fprintf(stderr, "#### XPC_BOOTSTRAP: SYMBOL NOT FOUND\n");
         }
@@ -8612,10 +8604,15 @@ extern int16_t LMGetBootDrive(void);
 extern const CFStringRef _kCFURLVolumeRefNumKey;
 
 static int16_t macws_root_volume_refnum(void) {
-    CFURLRef rootURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
-                                                     CFSTR("/"),
-                                                     kCFURLPOSIXPathStyle,
-                                                     true);
+    // Finder's 2026-08-01 SIGTRAP is runtime-confirmed at
+    // CFStringGetLength -> _CFURLCreateWithFileSystemPath from this hook, with
+    // this hook's CFSTR argument as the only CFString input. Avoid that
+    // cross-image CFString construction boundary and create the same root URL
+    // from stable POSIX bytes; the volume refnum still comes from the native
+    // CFURL resource property.
+    static const UInt8 rootPath[] = {'/'};
+    CFURLRef rootURL = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, rootPath, sizeof(rootPath), true);
     if (!rootURL) return 0;
 
     CFTypeRef value = NULL;

@@ -247,6 +247,34 @@ add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framewor
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MTLSimDriver.framework/MTLSimDriver"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MTLSimImplementation.framework/MTLSimImplementation"
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MTLSimDriver.framework/XPCServices/MTLSimDriverHost.xpc/MTLSimDriverHost"
+# Theos rootless XPC bundles use a flat bundle layout.  Builds installed before
+# the proxy was converted from a copied macOS bundle can leave a second
+# `Contents/Info.plist` behind.  CoreFoundation then resolves that stale nested
+# metadata instead of the new flat Info.plist, so xpc_add_bundle never sees the
+# proxy's MachServices declaration.  Remove only that obsolete nested layout;
+# the authoritative executable and Info.plist are at the bundle root.
+VIEWBRIDGE_PROXY=/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc
+if [ -f "$VIEWBRIDGE_PROXY/Info.plist" ] &&
+   [ -d "$VIEWBRIDGE_PROXY/Contents" ]; then
+    rm -rf "$VIEWBRIDGE_PROXY/Contents"
+    echo "[INFO] removed stale nested ViewBridge proxy bundle layout"
+fi
+add_all_trustcache "/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary"
+add_all_trustcache "/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy"
+add_all_trustcache "/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy"
+add_all_trustcache "/var/jb/usr/macOS/Frameworks/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc/FileCoordinationProxy"
+# The flat iOS proxy bundles above are only the launch images visible to the
+# iOS XPC service manager.  Their SETEXEC targets live inside the macOS rootfs
+# and are admitted by iOS AMFI before libmachook/autosignd can run.  Runtime
+# evidence on 2026-08-02: each proxy reached its chroot boundary, then the real
+# target died before its first userspace log and the client received
+# `Connection invalid`; none of the three real target CDHashes was present in
+# the dynamic trustcache.  Persistently sign those upstream executables and
+# restore their CDHashes on every postinst/re-jailbreak, exactly like the other
+# initial process images below.
+sign_and_trustcache "/var/mnt/rootfs/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary"
+sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc/Contents/MacOS/com.apple.hiservices-xpcservice"
+sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService"
 # codesign -vvv -d dyld_shared_cache_arm64e 2>&1 | grep CDHash=
 jbctl trustcache add b5da39409492ac85e5a8e8ab618fe77e2d7a2980
 # codesign -vvv -d dyld_shared_cache_arm64e.01 2>&1 | grep CDHash=
@@ -327,6 +355,13 @@ ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
 # image was the next rejected arm64e dependency.
 ensure_project_signature_and_trustcache \
     '/var/mnt/rootfs/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI' || exit 1
+# The chroot has no loginwindow LaunchAgent domain, so macos_gui.sh publishes
+# the stock fontd's original com.apple.fonts services through an outer launchd
+# job. Like Finder, this top-level launch target must already pass AMFI before
+# libmachook can run. Preserve its project signature and restore its CDHash on
+# every post-reboot repair.
+ensure_project_signature_and_trustcache \
+    '/var/mnt/rootfs/System/Library/Frameworks/ApplicationServices.framework/Frameworks/ATS.framework/Support/fontd' || exit 1
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
 add_all_trustcache /var/mnt/rootfs/bin/ps

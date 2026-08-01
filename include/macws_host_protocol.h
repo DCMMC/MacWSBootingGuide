@@ -82,6 +82,11 @@ enum {
     // window. The target process performs the ordinary NSWindow close action;
     // backgrounding or stream disconnection never emits this control record.
     MacWSInputKindCloseWindow = 16,
+    // Bootstrap one ordinary document/browser window in an AppKit process
+    // that deliberately launches without a window (Finder is the concrete
+    // case). The target resolves the enabled Command-N item from its current
+    // NSMainMenu and sends that item's real target/action through NSApp.
+    MacWSInputKindCreateInitialWindow = 17,
 };
 
 typedef uint16_t MacWSHostInputMode;

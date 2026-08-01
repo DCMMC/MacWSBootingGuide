@@ -672,10 +672,11 @@ static void PublishFrame(MacWSDisplayClient *client,
         if (layer) layer.firstDisplayTime = displayTime;
         else client.firstDisplayTime = displayTime;
         DisplayLog(@"frame-first stream=%llu window=%u layer=%u overlay=%s "
-                   "surface=%ux%u destination=(%d,%d %ux%u)",
+                   "surface=%ux%u bpr=%u pf=%08x destination=(%d,%d %ux%u)",
             (unsigned long long)producerStreamID, client.windowID,
             layerWindowID, layer ? "YES" : "NO",
-            descriptor.width, descriptor.height, descriptor.destinationX,
+            descriptor.width, descriptor.height, descriptor.bytesPerRow,
+            descriptor.pixelFormat, descriptor.destinationX,
             descriptor.destinationY, descriptor.destinationWidth,
             descriptor.destinationHeight);
     }
@@ -759,7 +760,18 @@ static IOSurfaceRef CreateWorkspaceCanvas(MacWSDisplayClient *client) {
     if (width == 0 || height == 0 || width > MACWS_STREAM_MAX_DIMENSION ||
         height > MACWS_STREAM_MAX_DIMENSION || width > SIZE_MAX / 4)
         return NULL;
-    size_t bytesPerRow = width * 4;
+    // iOS 16.3 Metal's _mtlValidateStrideTextureParameters asks the native
+    // AGX device for iosurfaceReadOnlyTextureAlignmentBytes before importing
+    // a ShaderRead IOSurface. Runtime LLDB evidence on iPad13,6 shows that
+    // value is 16 bytes. The target's 1194-pixel workspace was previously
+    // allocated with a 4776-byte row, which violates that real invariant.
+    static const size_t kMacWSMetalIOSurfaceRowAlignment = 16;
+    size_t tightBytesPerRow = width * 4;
+    if (tightBytesPerRow > SIZE_MAX -
+            (kMacWSMetalIOSurfaceRowAlignment - 1)) return NULL;
+    size_t bytesPerRow = (tightBytesPerRow +
+        (kMacWSMetalIOSurfaceRowAlignment - 1)) &
+        ~(kMacWSMetalIOSurfaceRowAlignment - 1);
     if (height > SIZE_MAX / bytesPerRow) return NULL;
     NSDictionary *properties = @{
         (__bridge id)kIOSurfaceWidth: @(width),

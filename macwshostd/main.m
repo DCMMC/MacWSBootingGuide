@@ -217,7 +217,7 @@ static NSString *CaptureCommand(const char *const argv[], NSUInteger limit) {
     return text ?: @"";
 }
 
-static BOOL JobHasPID(const char *label, int *pidOut) {
+static BOOL InspectJob(const char *label, int *pidOut, BOOL *loadedOut) {
     const char *argv[] = {kLaunchctl, "list", label, NULL};
     NSString *output = CaptureCommand(argv, 32768);
     NSRegularExpression *regex = [NSRegularExpression
@@ -227,8 +227,32 @@ static BOOL JobHasPID(const char *label, int *pidOut) {
     int pid = 0;
     if (match.numberOfRanges > 1)
         pid = [[output substringWithRange:[match rangeAtIndex:1]] intValue];
+    if (loadedOut) {
+        NSString *marker = [NSString stringWithFormat:@"\"Label\" = \"%s\"",
+                            label];
+        *loadedOut = [output containsString:marker];
+    }
     if (pidOut) *pidOut = pid;
     return pid > 0;
+}
+
+static BOOL JobHasPID(const char *label, int *pidOut) {
+    return InspectJob(label, pidOut, NULL);
+}
+
+static BOOL WaitForJobPID(const char *label, NSTimeInterval timeout,
+                          int *pidOut) {
+    int pid = 0;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    do {
+        if (JobHasPID(label, &pid)) {
+            if (pidOut) *pidOut = pid;
+            return YES;
+        }
+        usleep(100000);
+    } while (deadline.timeIntervalSinceNow > 0);
+    if (pidOut) *pidOut = 0;
+    return NO;
 }
 
 static BOOL RootFSReady(void) {
@@ -605,6 +629,126 @@ static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
                                      exitStatusOut);
 }
 
+// launchd reaps macwshostd itself, but a successfully launched macOS app is
+// our direct child.  WaitForWindowMetrics owns waitpid only until the first
+// real window is published; after that there was previously no waiter at all.
+// Runtime witness on 2026-08-01: killed Terminal PID 6471 remained
+// `Z <defunct>` with macwshostd as PPID, so later launch/reuse transactions
+// accumulated stale process state.  Install one blocking waiter only after
+// the initial-window transaction has finished, avoiding a race with its
+// WNOHANG exit witness while guaranteeing every long-lived app is reaped.
+static void BeginApplicationChildReaper(pid_t pid, NSString *identifier) {
+    if (pid <= 1) return;
+    NSString *identifierCopy = [identifier copy] ?: @"app";
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int status = 0;
+        pid_t waited = 0;
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == pid) {
+            NSString *result = WIFEXITED(status)
+                ? [NSString stringWithFormat:@"exit-%d", WEXITSTATUS(status)]
+                : (WIFSIGNALED(status)
+                    ? [NSString stringWithFormat:@"signal-%d", WTERMSIG(status)]
+                    : [NSString stringWithFormat:@"status-%d", status]);
+            HostLog(@"launch-app reaped id=%@ pid=%d result=%@",
+                    identifierCopy, pid, result);
+            os_unfair_lock_lock(&gStateLock);
+            if (gActiveAppPID == pid) {
+                gActiveAppPID = 0;
+                gActiveAppID = @"";
+            }
+            os_unfair_lock_unlock(&gStateLock);
+        } else if (errno != ECHILD) {
+            HostLog(@"launch-app reap-failed id=%@ pid=%d errno=%d (%s)",
+                    identifierCopy, pid, errno, strerror(errno));
+        }
+    });
+}
+
+static BOOL WaitForAppInputEndpoint(pid_t pid, NSTimeInterval timeout) {
+    if (pid <= 1) return NO;
+    char path[PATH_MAX] = {0};
+    int length = snprintf(path, sizeof(path),
+        "/var/mnt/rootfs/private/tmp/macws_app_input.%d.sock", pid);
+    if (length <= 0 || (size_t)length >= sizeof(path)) return NO;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (deadline.timeIntervalSinceNow > 0) {
+        if (access(path, F_OK) == 0) return YES;
+        if (kill(pid, 0) != 0 && errno == ESRCH) return NO;
+        usleep(50000);
+    }
+    return NO;
+}
+
+static BOOL SendAppInputRecord(pid_t pid, MacWSInputRecord *record,
+                               int *errorOut) {
+    if (pid <= 1 || !record) {
+        if (errorOut) *errorOut = EINVAL;
+        return NO;
+    }
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0) {
+        if (errorOut) *errorOut = errno;
+        return NO;
+    }
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    int length = snprintf(address.sun_path, sizeof(address.sun_path),
+        "/var/mnt/rootfs/private/tmp/macws_app_input.%d.sock", pid);
+    if (length <= 0 || (size_t)length >= sizeof(address.sun_path)) {
+        close(socketFD);
+        if (errorOut) *errorOut = ENAMETOOLONG;
+        return NO;
+    }
+    record->targetPID = pid;
+    ssize_t sent = sendto(socketFD, record, sizeof(*record), 0,
+        (const struct sockaddr *)&address, sizeof(address));
+    int savedError = sent < 0 ? errno :
+        (sent == (ssize_t)sizeof(*record) ? 0 : EMSGSIZE);
+    close(socketFD);
+    if (errorOut) *errorOut = savedError;
+    return savedError == 0;
+}
+
+// Finder launched as a chroot executable reaches NSApplication's ordinary
+// event loop but does not create a browser window by itself. Runtime evidence
+// on 2026-08-01: PID 1400 kept a valid zero-entry metrics sidecar for 30 s,
+// while its AppInputBridge endpoint was live and the process stayed healthy.
+// Ask that exact AppKit process to resolve and perform its standard enabled
+// Command-N menu target/action, then require a visible-window metrics witness.
+// This is the missing launch action, not a synthetic window or uptime check.
+static BOOL RequestFinderBrowserWindow(pid_t pid, NSTimeInterval timeout) {
+    if (!WaitForAppInputEndpoint(pid, MIN(timeout, 5.0))) {
+        HostLog(@"finder-bootstrap pid=%d result=no-appinput-endpoint", pid);
+        return NO;
+    }
+    static _Atomic uint32_t sampleSequence = 0;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindCreateInitialWindow,
+        .x = 0.0f,
+        .y = 0.0f,
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = pid,
+        .source = MacWSInputSourceUnknown,
+        .sampleSequence = atomic_fetch_add(&sampleSequence, 1) + 1,
+    };
+    int sendError = 0;
+    BOOL sent = SendAppInputRecord(pid, &record, &sendError);
+    HostLog(@"finder-bootstrap pid=%d action=appkit-command-n sent=%@ "
+            "errno=%d", pid, sent ? @"YES" : @"NO", sendError);
+    if (!sent) return NO;
+    int exitStatus = -1;
+    BOOL ready = WaitForWindowMetrics(pid, timeout, &exitStatus);
+    HostLog(@"finder-bootstrap pid=%d result=%@ exit-status=%d", pid,
+            ready ? @"window-ready" : @"no-visible-window", exitStatus);
+    return ready;
+}
+
 static off_t FileSizeAtPath(const char *path) {
     struct stat st = {0};
     return stat(path, &st) == 0 && st.st_size > 0 ? st.st_size : 0;
@@ -797,22 +941,45 @@ static BOOL LaunchVSCode(NSString **message) {
     }
     int pid = 0;
     off_t launchLogOffset = FileSizeAtPath(kVSCodeLog);
-    BOOL reusedJob = JobHasPID(kVSCodeLabel, &pid);
+    BOOL jobLoaded = NO;
+    BOOL reusedJob = InspectJob(kVSCodeLabel, &pid, &jobLoaded);
     if (!reusedJob) {
+        // A one-shot launchd job can remain loaded with no PID after Electron
+        // exits. Treat that state separately from a genuinely absent job: the
+        // former needs `start`, while the latter needs `load` immediately.
+        const char *startArgv[] = {kLaunchctl, "start", kVSCodeLabel, NULL};
         const char *loadArgv[] = {kLaunchctl, "load", kVSCodePlist, NULL};
-        int rc = RunCommand(loadArgv, YES);
-        if (rc != 0) {
-            // A loaded but dormant one-shot job rejects a second load. Ask
-            // launchd to start that exact production job; never fall back to
-            // a bare Electron spawn that would lose the validated JIT/AGX
-            // environment and isolated profile.
-            const char *startArgv[] = {kLaunchctl, "start", kVSCodeLabel, NULL};
+        int loadResult = 0;
+        if (jobLoaded) {
             (void)RunCommand(startArgv, YES);
+            (void)WaitForJobPID(kVSCodeLabel, 2.0, &pid);
+        } else {
+            // Runtime-confirmed on 2026-08-02: after an ordinary unload the
+            // former start-first path waited its entire two-second dormant-job
+            // grace even though `launchctl list` had already established that
+            // the label did not exist. Load an absent job immediately; retain
+            // start-first only for the distinct loaded-without-PID state.
+            loadResult = RunCommand(loadArgv, YES);
+            (void)WaitForJobPID(kVSCodeLabel, 3.0, &pid);
         }
-        NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
-        while (deadline.timeIntervalSinceNow > 0 &&
-               !JobHasPID(kVSCodeLabel, &pid)) {
-            usleep(100000);
+        if (pid <= 1) {
+            if (jobLoaded)
+                loadResult = RunCommand(loadArgv, YES);
+            if (!WaitForJobPID(kVSCodeLabel, 3.0, &pid)) {
+                // A loaded-but-damaged definition did not respond to start and
+                // also rejected load. Refresh that exact production plist;
+                // never use a bare Electron spawn with a different environment.
+                HostLog(@"launch-app vscode-refresh-job start/load result=%d",
+                        loadResult);
+                const char *unloadArgv[] = {
+                    kLaunchctl, "unload", kVSCodePlist, NULL};
+                (void)RunCommand(unloadArgv, YES);
+                launchLogOffset = FileSizeAtPath(kVSCodeLog);
+                if (RunCommand(loadArgv, YES) != 0)
+                    pid = 0;
+                else
+                    (void)WaitForJobPID(kVSCodeLabel, 10.0, &pid);
+            }
         }
     }
     if (pid <= 1) {
@@ -854,11 +1021,7 @@ static BOOL LaunchVSCode(NSString **message) {
                 return NO;
             }
             pid = 0;
-            NSDate *restartDeadline = [NSDate dateWithTimeIntervalSinceNow:15.0];
-            while (restartDeadline.timeIntervalSinceNow > 0 &&
-                   !JobHasPID(kVSCodeLabel, &pid)) {
-                usleep(100000);
-            }
+            (void)WaitForJobPID(kVSCodeLabel, 15.0, &pid);
             if (pid <= 1) {
                 *message = @"VS Code 生产任务重启后未取得进程";
                 return NO;
@@ -902,7 +1065,12 @@ static BOOL LaunchRootExecutable(const char *identifier,
     pid_t existingPID = FindRunningRootExecutable(rootPath);
     if (existingPID > 1) {
         int exitStatus = -1;
-        if (!WaitForWindowMetrics(existingPID, 3.0, &exitStatus)) {
+        BOOL finder = strcmp(identifier, "finder") == 0;
+        BOOL existingWindow = WaitForWindowMetrics(existingPID, 3.0,
+                                                    &exitStatus);
+        if (!existingWindow && finder)
+            existingWindow = RequestFinderBrowserWindow(existingPID, 8.0);
+        if (!existingWindow) {
             // Runtime-confirmed on the default Terminal bootstrap: closing
             // its last represented iPad Scene leaves a healthy process with
             // a valid zero-entry metrics header. Reusing that process can
@@ -936,8 +1104,20 @@ static BOOL LaunchRootExecutable(const char *identifier,
         posix_spawn_file_actions_addclose(&actions, logFD);
     }
     const char *rootExecutable = rootPath.fileSystemRepresentation;
-    const char *argv[] = {kChrootExec, "0", "0", kRootFS,
-                          rootExecutable, NULL};
+    const char *ordinaryArgv[] = {kChrootExec, "0", "0", kRootFS,
+                                  rootExecutable, NULL};
+    const char *cleanStateArgv[] = {kChrootExec, "0", "0", kRootFS,
+        rootExecutable, "-ApplePersistenceIgnoreState", "YES", NULL};
+    BOOL cleanState = strcmp(identifier, "terminal") == 0 ||
+                      strcmp(identifier, "finder") == 0;
+    const char *const *argv = cleanState ? cleanStateArgv : ordinaryArgv;
+    // Runtime-confirmed on 2026-08-02: Terminal's ordinary launch restored
+    // two historical windows/tabs (including diagnostic text) and needed
+    // 3.30 s to publish a usable window. With AppKit's persistence override it
+    // published one clean window in 1.50 s. Finder likewise accumulated one
+    // restored browser per prior test launch. Start both user-facing shell
+    // apps cleanly; this changes their launch transaction upstream and does
+    // not hide extra catalog entries or relax the real-window witness below.
     pid_t pid = 0;
     int error = posix_spawn(&pid, kChrootExec, &actions, NULL,
                             (char *const *)argv, environ);
@@ -955,7 +1135,10 @@ static BOOL LaunchRootExecutable(const char *identifier,
     os_unfair_lock_unlock(&gStateLock);
     if (JobHasPID(kDisplayLabel, NULL)) {
         int exitStatus = -1;
-        if (!WaitForWindowMetrics(pid, timeout, &exitStatus)) {
+        BOOL windowReady = strcmp(identifier, "finder") == 0
+            ? RequestFinderBrowserWindow(pid, timeout)
+            : WaitForWindowMetrics(pid, timeout, &exitStatus);
+        if (!windowReady) {
             os_unfair_lock_lock(&gStateLock);
             if (gActiveAppPID == pid) {
                 gActiveAppPID = 0;
@@ -975,14 +1158,17 @@ static BOOL LaunchRootExecutable(const char *identifier,
                     @"%s 已启动，但 %.0f 秒内没有发布可捕获的 AppKit 窗口",
                     identifier, timeout];
             }
+            BeginApplicationChildReaper(pid, @(identifier));
             return NO;
         }
         HostLog(@"launch-app window-ready id=%s pid=%d path=DisplayStream",
                 identifier, pid);
     } else {
         *message = @"DisplayStream 服务未运行";
+        BeginApplicationChildReaper(pid, @(identifier));
         return NO;
     }
+    BeginApplicationChildReaper(pid, @(identifier));
     return YES;
 }
 

@@ -47,6 +47,7 @@ MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + required macOS s
 WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
 SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
+FONTD_PLIST="$MACOS_DAEMONS/com.macwsguide.xtyped.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
@@ -137,6 +138,7 @@ BACKBOARDD=/System/Library/LaunchDaemons/com.apple.backboardd.plist
 P_WINDOWSERVER='SkyLight.framework/Resources/WindowServer'
 P_LAUNCHSERVICESD='CoreServices/launchservicesd'
 P_SYSTEMSTATUSD='SystemStatusServer.framework/Support/systemstatusd'
+P_FONTD='ATS.framework/Support/fontd'
 P_OSXVNC='OSXvnc-server'
 P_TERMINAL='Utilities/Terminal.app/Contents/MacOS/Terminal'
 P_PBOARD='/usr/libexec/pboard'
@@ -241,11 +243,44 @@ require_root() {
 # Kill chroot macOS processes whose full command line contains a (fixed-string)
 # pattern. This device has no pkill/pgrep, so do it with ps + kill. Patterns are
 # full chroot paths, unique to the macOS processes, so iOS processes are never hit.
+CLEANUP_TERM_PIDS=""
 kill_by_pattern() {
-    local pat="$1" pids
+    local pat="$1" pids pid
     pids=$(ps aux 2>/dev/null | grep -v grep | grep -F "$pat" | awk '{print $2}')
-    [ -n "$pids" ] && kill $pids 2>/dev/null
+    for pid in $pids; do
+        [ "$pid" = "$$" ] && continue
+        kill "$pid" 2>/dev/null
+        case " $CLEANUP_TERM_PIDS " in
+            *" $pid "*) ;;
+            *) CLEANUP_TERM_PIDS="$CLEANUP_TERM_PIDS $pid" ;;
+        esac
+    done
     return 0
+}
+
+# AppKit clients can ignore or remain stuck while handling SIGTERM.  A plain
+# process uptime check used to make cleanup look successful even though an old
+# Finder survived for 81 minutes at 83% CPU and continuously logged an
+# incompatible LaunchServices schema.  Give the complete, exact PID set one
+# shared grace period, then KILL only surviving members of that set.  This is a
+# lifecycle invariant: no client connected to the previous WindowServer may
+# enter the next generation.
+finish_pattern_cleanup() {
+    local deadline alive="" pid
+    [ -z "$CLEANUP_TERM_PIDS" ] && return 0
+    deadline=$(( $(date +%s) + 2 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        alive=""
+        for pid in $CLEANUP_TERM_PIDS; do
+            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+        done
+        [ -z "$alive" ] && break
+        sleep 0.1
+    done
+    for pid in $alive; do
+        kill -KILL "$pid" 2>/dev/null
+    done
+    CLEANUP_TERM_PIDS=""
 }
 
 # True if any running process's command line contains the (fixed-string) pattern.
@@ -369,6 +404,7 @@ record_thermal_snapshot() {
 # a permanently dead CGS session.  Tear down only WS-dependent clients, wait for
 # launchd's replacement WS to stay alive for two samples, then reconnect them.
 stop_ws_dependents() {
+    CLEANUP_TERM_PIDS=""
     launchctl unload "$VNC_PLIST"  2>/dev/null
     launchctl unload "$TERM_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
@@ -404,6 +440,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_INTEROPD"
     kill_by_pattern "$P_VSCODE"
     kill_by_pattern "$P_CHROME150"
+    finish_pattern_cleanup
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_menu_client.*.sock
@@ -930,13 +967,16 @@ PLIST
 # Tear down every macOS GUI service we may have started.  Idempotent: unloading a
 # job that is not loaded / killing a process that is gone are harmless no-ops.
 stop_watchdogs() {
-    local watchdog_pid="" candidate=""
+    local watchdog_pid="" candidate="" stopped="" deadline="" alive=""
     if [ -f "$WD_PIDFILE" ]; then
         watchdog_pid=$(awk 'NR == 1 { print $1 }' "$WD_PIDFILE" 2>/dev/null)
         case "$watchdog_pid" in
             ''|*[!0-9]*) ;;
             *)
-                [ "$watchdog_pid" = "$$" ] || kill "$watchdog_pid" 2>/dev/null
+                if [ "$watchdog_pid" != "$$" ]; then
+                    kill "$watchdog_pid" 2>/dev/null
+                    stopped="$stopped $watchdog_pid"
+                fi
                 ;;
         esac
     fi
@@ -947,8 +987,44 @@ stop_watchdogs() {
     # rather than a broad process name.
     for candidate in $(ps -ax -o pid=,command= 2>/dev/null | awk \
         -v needle="bash $0 watchdog " 'index($0, needle) { print $1 }'); do
-        [ "$candidate" = "$$" ] || kill "$candidate" 2>/dev/null
+        if [ "$candidate" != "$$" ]; then
+            kill "$candidate" 2>/dev/null
+            case " $stopped " in
+                *" $candidate "*) ;;
+                *) stopped="$stopped $candidate" ;;
+            esac
+        fi
     done
+
+    # TERM is asynchronous. Runtime-confirmed on 2026-08-01: a previous
+    # watchdog could still be inside its recovery/cleanup transaction after a
+    # new `start` had created the production flags, then remove those new flags
+    # and make preflight fail. Wait for the exact PIDs selected above before
+    # starting another generation; use a bounded KILL only for those same
+    # stale watchdogs, never a broad process-name kill.
+    deadline=$(( $(date +%s) + 5 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        alive=""
+        for candidate in $stopped; do
+            kill -0 "$candidate" 2>/dev/null && alive="$alive $candidate"
+        done
+        [ -z "$alive" ] && break
+        sleep 0.1
+    done
+    for candidate in $alive; do
+        kill -KILL "$candidate" 2>/dev/null
+    done
+    if [ -n "$alive" ]; then
+        deadline=$(( $(date +%s) + 2 ))
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            stopped=""
+            for candidate in $alive; do
+                kill -0 "$candidate" 2>/dev/null && stopped="$stopped $candidate"
+            done
+            [ -z "$stopped" ] && break
+            sleep 0.1
+        done
+    fi
     rm -f "$WD_PIDFILE" "$WD_READY"
 }
 
@@ -962,6 +1038,8 @@ diagnostic_flag_paths() {
     printf '%s\n' \
         /private/tmp/macws_agx_dump_methods \
         /private/tmp/macws_agx_trace_reserve \
+        /tmp/macws_app_input_diagnostics \
+        /tmp/macws_file_panel_diag \
         /private/tmp/macws_mtl_data_diag \
         /private/tmp/macws_mtl_library_diag \
         /private/tmp/macws_tile_descriptor_diag \
@@ -995,7 +1073,8 @@ diagnostic_flag_paths() {
         /tmp/macws_trace_small_pf550_bind \
         /tmp/macws_vnc_native_all \
         /tmp/macws_video_diag \
-        /tmp/macws_vnc_test
+        /tmp/macws_vnc_test \
+        /private/tmp/macws_xpc_proxy_trace
 }
 
 clear_diagnostic_state() {
@@ -1049,7 +1128,7 @@ production_preflight() {
                  "$VSCODE_PLIST" "$CHROME150_PLIST"; do
         [ -f "$plist" ] || continue
         if plutil "$plist" 2>/dev/null | grep -Eq \
-            '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG)"?[[:space:]]*='; then
+            '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_APP_INPUT_DIAGNOSTICS|MACWS_FILE_PANEL_DIAG|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG)"?[[:space:]]*='; then
             log "ERROR: production debug environment found in $plist"
             bad=1
         fi
@@ -1136,6 +1215,7 @@ production_preflight() {
 cleanup_macos() {
     log "Cleaning up previous macOS GUI services..."
     stop_watchdogs
+    CLEANUP_TERM_PIDS=""
 
     # 1) our VNC / Terminal launchd jobs (by plist, then by label as a fallback)
     launchctl unload "$VNC_PLIST"  2>/dev/null
@@ -1189,6 +1269,8 @@ cleanup_macos() {
     kill_by_pattern "$P_WINDOWSERVER"
     kill_by_pattern "$P_LAUNCHSERVICESD"
     kill_by_pattern "$P_SYSTEMSTATUSD"
+    kill_by_pattern "$P_FONTD"
+    finish_pattern_cleanup
 
     clear_diagnostic_state
 
@@ -1250,6 +1332,26 @@ start_macos() {
     done
     proc_running "$P_SYSTEMSTATUSD" || {
         log "ERROR: macOS systemstatusd did not start. See $LOGDIR/systemstatusd.err"
+        return 1
+    }
+
+    # AppKit normally obtains its shared XType registry from the per-login
+    # com.apple.fonts service. The chroot has no loginwindow/LaunchAgent
+    # bootstrap, so every cold GUI application falls back to rebuilding a
+    # static registry in-process. Runtime timestamps on the target showed
+    # Terminal spending 2.685 seconds between that fallback message and its
+    # first NSWindow. Start the stock macOS fontd under the chroot launcher and
+    # publish its original Mach services before any GUI application starts.
+    log "Starting macOS shared font registry service..."
+    rm -f "$LOGDIR/fontd.log"
+    launchctl load "$FONTD_PLIST" || return 1
+    waited=0
+    while ! proc_running "$P_FONTD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_FONTD" || {
+        log "ERROR: macOS fontd did not start. See $LOGDIR/fontd.log"
         return 1
     }
 
@@ -1353,7 +1455,7 @@ status() {
     fi
     echo
     echo "-- processes --"
-    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SYSTEMSTATUSD|$P_PBOARD|$P_PBS" \
+    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SYSTEMSTATUSD|$P_FONTD|$P_PBOARD|$P_PBS" \
         | grep -v grep || echo "(none running)"
     echo
     echo "-- launchd jobs --"

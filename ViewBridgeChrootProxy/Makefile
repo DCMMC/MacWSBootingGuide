@@ -6,8 +6,9 @@ BUNDLE_NAME = ViewBridgeAuxiliary
 
 ViewBridgeAuxiliary_DYNAMIC_LIBRARY = 0
 ViewBridgeAuxiliary_BUNDLE_EXTENSION = xpc
-ViewBridgeAuxiliary_FILES = main.m
-ViewBridgeAuxiliary_CFLAGS = -fobjc-arc -I$(CURDIR)/../include
+ViewBridgeAuxiliary_FILES = main.c
+ViewBridgeAuxiliary_CFLAGS = -ffreestanding -fno-builtin -fno-stack-protector -fno-unwind-tables -fno-asynchronous-unwind-tables
+ViewBridgeAuxiliary_LDFLAGS = -nostdlib -lSystem -Wl,-e,_main
 ViewBridgeAuxiliary_CODESIGN_FLAGS = -S../entitlements.plist
 ViewBridgeAuxiliary_INSTALL_PATH = /usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices
 

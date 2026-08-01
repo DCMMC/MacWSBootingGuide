@@ -39,6 +39,10 @@
 - (void)_setRequestFullscreen:(BOOL)requestFullscreen;
 @end
 
+@interface NSObject (MacWSMetalIOSurfaceAlignment)
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes;
+@end
+
 static NSString *const MacWSFramePath =
     @"/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static NSString *const MacWSCaptureAckPath =
@@ -51,6 +55,8 @@ static NSMutableSet<NSString *> *MacWSObservedWindowIdentities;
 static NSMutableSet<NSString *> *MacWSPendingWindowSceneIdentities;
 static NSString *const MacWSSceneBindingsDefaultsKey =
     @"MacWSPersistedSceneWindowBindings";
+static NSString *const MacWSFullscreenDiscardDefaultsKey =
+    @"MacWSFullscreenDiscardPreserveDeadlines";
 static const char MacWSInputSocketPath[] =
     "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 
@@ -94,6 +100,20 @@ static double MacWSMachMilliseconds(uint64_t start, uint64_t end) {
     long double nanoseconds = (long double)(end - start) *
         timebase.numer / timebase.denom;
     return (double)(nanoseconds / 1000000.0L);
+}
+
+// Metal`_mtlValidateStrideTextureParameters in the target iOS 16.3.1 image
+// calls this native-device selector for ShaderRead IOSurfaces and aborts the
+// process through MTLReportFailure when bytesPerRow is not aligned. Query the
+// same device-owned requirement before import so a malformed producer frame
+// is rejected at the transport boundary instead of terminating every Scene.
+// The producer is still responsible for allocating a conforming IOSurface.
+static NSUInteger MacWSIOSurfaceReadOnlyTextureAlignment(
+        id<MTLDevice> device) {
+    SEL selector = NSSelectorFromString(
+        @"iosurfaceReadOnlyTextureAlignmentBytes");
+    if (!device || ![device respondsToSelector:selector]) return 0;
+    return [(NSObject *)device iosurfaceReadOnlyTextureAlignmentBytes];
 }
 
 static CGFloat MacWSDensityModeFactor(MacWSHostDisplayDensity density) {
@@ -2926,6 +2946,24 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         [client releaseFrame:frame];
         return;
     }
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(frame.surface);
+    NSUInteger requiredAlignment =
+        MacWSIOSurfaceReadOnlyTextureAlignment(self.device);
+    if (requiredAlignment != 0 &&
+        bytesPerRow % requiredAlignment != 0) {
+        MacWSLog(@"display-stream reject-metal-stride stream=%llu frame=%llu "
+                 "window=%u layer=%u surface=%ux%u bpr=%zu required=%lu",
+            (unsigned long long)frame.descriptor.streamID,
+            (unsigned long long)frame.descriptor.sequence,
+            frame.descriptor.windowID, frame.descriptor.layerWindowID,
+            frame.descriptor.width, frame.descriptor.height, bytesPerRow,
+            (unsigned long)requiredAlignment);
+        [client releaseFrame:frame];
+        [self publishStatus:[NSString stringWithFormat:
+            @"DisplayStream IOSurface 行跨度未按 Metal 要求对齐（%zu / %lu）",
+            bytesPerRow, (unsigned long)requiredAlignment]];
+        return;
+    }
     MTLTextureDescriptor *descriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                            width:frame.descriptor.width
@@ -3179,6 +3217,98 @@ static NSUserActivity *MacWSPersistedSceneActivity(NSString *identifier) {
     return activity;
 }
 
+// iPadOS 16.3's private current-session fullscreen request reconnects the
+// Host process and can discard the other Stage Manager Scene sessions. Those
+// discards are a presentation transition, not user requests to close their
+// represented macOS NSWindows. Persist a short, transaction-scoped allowlist
+// before asking FrontBoard to switch modes so the relaunched Host can
+// distinguish those callbacks from ordinary red-X / scene-close callbacks.
+static NSArray<NSString *> *MacWSMarkFullscreenDiscardPreservation(void) {
+    UIApplication *application = UIApplication.sharedApplication;
+    NSMutableDictionary *deadlines = [[NSUserDefaults.standardUserDefaults
+        dictionaryForKey:MacWSFullscreenDiscardDefaultsKey] mutableCopy] ?:
+        [NSMutableDictionary dictionary];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    NSTimeInterval deadline = now + 30.0;
+    NSMutableArray<NSString *> *marked = [NSMutableArray array];
+    for (UISceneSession *session in application.openSessions) {
+        NSString *identifier = session.persistentIdentifier;
+        if (!identifier.length) continue;
+        // The live controller is authoritative during the exact transaction
+        // that changes its mode. Runtime-confirmed failure on the target iPad:
+        // MacWSSceneBindings was empty (`preserve-mark count=0`) even though
+        // connected window Scenes still represented Terminal/VSCode. The
+        // ensuing FrontBoard fullscreen reconnect delivered didDiscard for
+        // those sessions and closed their real macOS windows, leaving only an
+        // empty desktop/menu layer. Read the current controller first, exactly
+        // as the existing Scene-reuse lookup does, then fall back to persisted
+        // state for disconnected-but-open sessions.
+        NSUserActivity *activity = nil;
+        for (UIScene *scene in application.connectedScenes) {
+            if (scene.session != session ||
+                ![scene isKindOfClass:UIWindowScene.class]) continue;
+            UIViewController *root = ((UIWindowScene *)scene).windows.firstObject
+                .rootViewController;
+            if ([root isKindOfClass:MacWSViewController.class])
+                activity = [(MacWSViewController *)root
+                    streamRestorationActivity];
+            break;
+        }
+        activity = activity ?: MacWSSceneBindings[identifier] ?:
+            MacWSPersistedSceneActivity(identifier) ?:
+            session.stateRestorationActivity;
+        NSDictionary *info = activity.userInfo;
+        if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow ||
+            [info[@"window_id"] unsignedIntValue] == 0 ||
+            [info[@"owner_pid"] intValue] <= 1) continue;
+        deadlines[identifier] = @(deadline);
+        [marked addObject:identifier];
+    }
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    [defaults setObject:deadlines forKey:MacWSFullscreenDiscardDefaultsKey];
+    [defaults synchronize];
+    MacWSLog(@"scene-fullscreen preserve-mark count=%lu deadline=%.3f",
+             (unsigned long)marked.count, deadline);
+    return marked;
+}
+
+static BOOL MacWSConsumeFullscreenDiscardPreservation(
+        NSString *identifier) {
+    if (!identifier.length) return NO;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSMutableDictionary *deadlines = [[defaults
+        dictionaryForKey:MacWSFullscreenDiscardDefaultsKey] mutableCopy] ?:
+        [NSMutableDictionary dictionary];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    BOOL preserved = [deadlines[identifier] doubleValue] >= now;
+    BOOL changed = NO;
+    for (NSString *candidate in [deadlines.allKeys copy]) {
+        if ([candidate isEqualToString:identifier] ||
+            [deadlines[candidate] doubleValue] < now) {
+            [deadlines removeObjectForKey:candidate];
+            changed = YES;
+        }
+    }
+    if (changed) {
+        [defaults setObject:deadlines forKey:MacWSFullscreenDiscardDefaultsKey];
+        [defaults synchronize];
+    }
+    return preserved;
+}
+
+static void MacWSClearFullscreenDiscardPreservation(
+        NSArray<NSString *> *identifiers) {
+    if (!identifiers.count) return;
+    NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
+    NSMutableDictionary *deadlines = [[defaults
+        dictionaryForKey:MacWSFullscreenDiscardDefaultsKey] mutableCopy] ?:
+        [NSMutableDictionary dictionary];
+    for (NSString *identifier in identifiers)
+        [deadlines removeObjectForKey:identifier];
+    [defaults setObject:deadlines forKey:MacWSFullscreenDiscardDefaultsKey];
+    [defaults synchronize];
+}
+
 // UISceneSession.stateRestorationActivity is not updated continuously while a
 // Scene changes from the bootstrap workspace to an exact macOS window. Keep
 // the live binding by persistent session identifier, and make closing a
@@ -3213,6 +3343,13 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
                                                 NSString *source) {
     NSString *identifier = session.persistentIdentifier;
     if (!identifier.length) return NO;
+    if (MacWSConsumeFullscreenDiscardPreservation(identifier)) {
+        [MacWSSceneBindings removeObjectForKey:identifier];
+        MacWSSetPersistedSceneBinding(identifier, nil);
+        MacWSLog(@"scene-close source=%@ id=%@ mac-window=preserved reason=fullscreen-transition",
+                 source ?: @"unknown", identifier);
+        return NO;
+    }
     if ([MacWSSceneSessionsPreservingMacWindow containsObject:identifier])
         return NO;
     if (!MacWSSceneBindings) MacWSSceneBindings = [NSMutableDictionary dictionary];
@@ -3771,6 +3908,54 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     };
     [self metalView:_metalView emittedInput:activation];
     return YES;
+}
+
+- (void)performSemanticShortcutForDiagnostics:(NSString *)shortcut {
+    if (_windowID == 0 || _windowOwnerPID <= 1 || !shortcut.length) {
+        MacWSLog(@"diagnostic-menu shortcut=%@ result=no-exact-window",
+                 shortcut ?: @"");
+        return;
+    }
+    [self refreshSemanticMenuWithCompletion:^(MacWSMenuSnapshot *snapshot,
+                                               NSError *error) {
+        if (!snapshot || error) {
+            MacWSLog(@"diagnostic-menu shortcut=%@ result=snapshot-failed "
+                     "error=%@", shortcut,
+                     error.localizedDescription ?: @"unknown");
+            return;
+        }
+        MacWSMenuItem *match = nil;
+        for (MacWSMenuItem *item in snapshot.items) {
+            if ([item.shortcut isEqualToString:shortcut] &&
+                (item.flags & MacWSMenuNodeEnabled) &&
+                !(item.flags & (MacWSMenuNodeHidden |
+                                MacWSMenuNodeHasSubmenu |
+                                MacWSMenuNodeRequiresWorkspace))) {
+                match = item;
+                break;
+            }
+        }
+        if (!match) {
+            MacWSLog(@"diagnostic-menu shortcut=%@ result=item-not-found",
+                     shortcut);
+            return;
+        }
+        MacWSLog(@"diagnostic-menu shortcut=%@ item=%@ owner=%d window=%u",
+                 shortcut, match.title, snapshot.ownerPID,
+                 snapshot.windowID);
+        [self activateCurrentMacWindow];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                      120 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            [self->_menuClient performItem:match inSnapshot:snapshot
+                completion:^(MacWSMenuStatus status, NSError *actionError) {
+                    MacWSLog(@"diagnostic-menu shortcut=%@ item=%@ "
+                             "status=%u error=%@", shortcut, match.title,
+                             (unsigned)status,
+                             actionError.localizedDescription ?: @"none");
+                }];
+        });
+    }];
 }
 
 - (void)dismissSemanticMenu {
@@ -4970,6 +5155,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // First activate the exact native window while its ID/PID mapping is still
     // authoritative, then detach this Scene from that identity and subscribe
     // it to the complete desktop producer.
+    NSArray<NSString *> *fullscreenPreservedSceneIDs =
+        MacWSMarkFullscreenDiscardPreservation();
     BOOL activatedExactWindow = [self activateCurrentMacWindow];
     [_metalView suspendStream];
     _streamMode = MacWSStreamModeFullscreen;
@@ -4994,10 +5181,26 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL requestedSystemFullscreen = MacWSRequestCurrentSceneFullscreen(
         self.view.window.windowScene, [self streamRestorationActivity],
         ^(NSError *error) {
+            MacWSClearFullscreenDiscardPreservation(
+                fullscreenPreservedSceneIDs);
             [self setNotice:[NSString stringWithFormat:
                 @"完整 macOS 桌面已经打开，但 iPadOS 无法最大化当前窗口：%@",
                 error.localizedDescription ?: @"未知错误"] success:NO];
         });
+    if (!requestedSystemFullscreen) {
+        MacWSClearFullscreenDiscardPreservation(
+            fullscreenPreservedSceneIDs);
+    } else {
+        // The persisted transaction survives the FrontBoard-triggered Host
+        // relaunch. If a marked Scene was not discarded, restore ordinary
+        // close semantics after the bounded transition window.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     31 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSClearFullscreenDiscardPreservation(
+                fullscreenPreservedSceneIDs);
+        });
+    }
     [self hideControls];
     [self refreshStatus];
     [self setNotice:requestedSystemFullscreen
@@ -5160,15 +5363,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 NSString *identifier = arguments[@MACWS_CONTROL_KEY_APP_ID];
                 int32_t launchedPID =
                     (int32_t)[reply[@"launched_app_pid"] intValue];
-                if ([identifier isEqualToString:@"finder"]) {
-                    self->_pendingFinderWindowPID =
-                        launchedPID;
-                    self->_pendingFinderMenuAttempts = 0;
-                    self->_finderMenuRequestInFlight = NO;
-                    MacWSLog(@"finder-browser launch-reply pid=%d active=%d",
-                             self->_pendingFinderWindowPID,
-                             (int32_t)[reply[@"active_app_pid"] intValue]);
-                } else if (launchedPID > 1) {
+                if (launchedPID > 1) {
+                    // hostd now completes Finder's native Command-N bootstrap
+                    // before replying, so Finder follows the same catalog ->
+                    // one Scene transaction as every other application. The
+                    // old post-reply menu walk created a second browser window
+                    // after the first had already become visible.
                     self->_pendingApplicationWindowPID = launchedPID;
                     self->_pendingApplicationIdentifier = identifier;
                     self->_pendingApplicationWindowAttempts = 0;
@@ -5314,6 +5514,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self repairAction];
     } else if ([action isEqualToString:@"capture"]) {
         [self captureAction];
+    } else if ([action isEqualToString:@"test-open-file"]) {
+        [self performSemanticShortcutForDiagnostics:@"⌘O"];
+    } else if ([action isEqualToString:@"fullscreen"]) {
+        [self openFullscreenWorkspace];
     } else if ([action isEqualToString:@"close-window"]) {
         [self closeCurrentWindow];
     } else if ([action isEqualToString:@"screenshot-ui"]) {
@@ -5835,6 +6039,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindKeyUp: phase = @"key-up"; break;
         case MacWSInputKindConfigureWindow: phase = @"configure-window"; break;
         case MacWSInputKindCloseWindow: phase = @"close-window"; break;
+        case MacWSInputKindCreateInitialWindow:
+            phase = @"create-initial-window"; break;
         default: break;
     }
     int sendError = 0;
@@ -6250,6 +6456,7 @@ static void MacWSDeduplicateWindowScenes(void) {
         if ([@[@"status", @"start", @"start-experimental", @"stop",
                @"glassdemo", @"terminal", @"vscode", @"activity-monitor", @"finder",
                @"recover", @"repair", @"capture",
+               @"test-open-file", @"fullscreen",
                @"close-window",
                @"screenshot-ui", @"hide-controls", @"show-controls"]
               containsObject:host]) {
@@ -6322,13 +6529,21 @@ extern void MacWSRunIOSClearReference(void);
     didDiscardSceneSessions:(NSSet<UISceneSession *> *)sceneSessions {
     (void)application;
     for (UISceneSession *session in sceneSessions) {
+        NSString *identifier = session.persistentIdentifier;
+        if (MacWSConsumeFullscreenDiscardPreservation(identifier)) {
+            [MacWSSceneBindings removeObjectForKey:identifier];
+            MacWSSetPersistedSceneBinding(identifier, nil);
+            MacWSLog(@"scene-discard id=%@ mac-window=preserved reason=fullscreen-transition",
+                     identifier);
+            continue;
+        }
         if ([MacWSSceneSessionsPreservingMacWindow
-                containsObject:session.persistentIdentifier]) {
+                containsObject:identifier]) {
             [MacWSSceneSessionsPreservingMacWindow
-                removeObject:session.persistentIdentifier];
-            MacWSSetPersistedSceneBinding(session.persistentIdentifier, nil);
+                removeObject:identifier];
+            MacWSSetPersistedSceneBinding(identifier, nil);
             MacWSLog(@"scene-discard duplicate-only id=%@ mac-window=preserved",
-                     session.persistentIdentifier);
+                     identifier);
             continue;
         }
         MacWSCloseMacWindowForSceneSession(session, @"did-discard");

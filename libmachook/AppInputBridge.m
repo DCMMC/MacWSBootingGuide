@@ -72,6 +72,8 @@ typedef void (*MacWSSetCGEventUnicode)(MacWSCGEventRef, size_t,
 typedef void (*MacWSSetCGEventIntegerField)(MacWSCGEventRef, uint32_t,
                                             int64_t);
 typedef void (*MacWSSetCGEventDoubleField)(MacWSCGEventRef, uint32_t, double);
+typedef void (*MacWSPostCGEvent)(uint32_t, MacWSCGEventRef);
+typedef int32_t (*MacWSPostLegacyMouseEvent)(CGPoint, bool, uint32_t, ...);
 typedef id (*MacWSEventFromCGEvent)(id, SEL, MacWSCGEventRef);
 typedef const void *(*MacWSEventRef)(id, SEL);
 typedef void (*MacWSPostEvent)(id, SEL, id, BOOL);
@@ -159,7 +161,14 @@ static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
-        value = getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
+        // AppInput needs a narrow recorder for hit-window/event routing. Do
+        // not require the global runtime switch here: that switch also turns
+        // on AGX submit/JIT recorders and changes the responsiveness being
+        // measured. The global switch retains its historical umbrella
+        // behavior, while this AppInput-only switch leaves rendering alone.
+        value = getenv("MACWS_APP_INPUT_DIAGNOSTICS") != NULL ||
+            access("/tmp/macws_app_input_diagnostics", F_OK) == 0 ||
+            getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
             access("/tmp/macws_runtime_diagnostics", F_OK) == 0;
         atomic_store_explicit(&cached, value, memory_order_release);
     }
@@ -763,6 +772,25 @@ static void MacWSScheduleApplicationDisplaySettle(void) {
 static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
     NSUInteger type = event ? ((MacWSMsgUInteger)objc_msgSend)(
         event, sel_registerName("type")) : 0;
+    // A process-local NSEvent does not update WindowServer's global button
+    // mask.  The synthetic-gesture bridge therefore owns that mask while the
+    // event is dispatched, but it must still make the same transition as a
+    // hardware stream.  Runtime-confirmed in VSCode's real
+    // NSMenuWindowManagerWindow: the routed mouseUp reached the correct menu
+    // container at local=(88,160), while +[NSEvent pressedMouseButtons]
+    // remained 0x1.  AppKit consequently kept the item in its pressed
+    // tracking state and neither selected nor dismissed it.  Reflect the
+    // individual event before AppKit observes it; restore the outer tracker
+    // state after sendEvent: returns so a mouseDown that entered a nested
+    // tracker still sees the button held for that tracker's lifetime.
+    NSUInteger savedSyntheticButtons = MacWSAppInputRFBTrackingButtons;
+    BOOL transitionedSyntheticButtons = MacWSAppInputRFBTrackingActive;
+    if (transitionedSyntheticButtons) {
+        if (type == 1) MacWSAppInputRFBTrackingButtons |= 1u;
+        else if (type == 2) MacWSAppInputRFBTrackingButtons &= ~1u;
+        else if (type == 3) MacWSAppInputRFBTrackingButtons |= 2u;
+        else if (type == 4) MacWSAppInputRFBTrackingButtons &= ~2u;
+    }
     uint64_t serial = 0;
     double started = 0.0;
     uint64_t mouseSerial = 0;
@@ -917,6 +945,8 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
         MacWSAppInputMouseLocation = previousMouseLocation;
         MacWSAppInputMouseLocationActive = previousMouseLocationActive;
     }
+    if (transitionedSyntheticButtons)
+        MacWSAppInputRFBTrackingButtons = savedSyntheticButtons;
     if (logMouseReturn) {
         double finished = MacWSAppInputMonotonicSeconds();
         Class eventClass = object_getClass(event);
@@ -1380,6 +1410,7 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindScroll:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
+        case MacWSInputKindCreateInitialWindow:
             return 0; // control-plane only; handled before event construction
     }
     return 0;
@@ -1831,6 +1862,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     if (record->kind == MacWSInputKindCloseWindow) {
         return MacWSInputWindowIDForScene(record->sceneID) != 0;
     }
+    if (record->kind == MacWSInputKindCreateInitialWindow) return YES;
     if (record->kind == MacWSInputKindScroll) {
         float horizontal = 0.0f;
         memcpy(&horizontal, &record->contactID, sizeof(horizontal));
@@ -2022,6 +2054,114 @@ static id MacWSCreateAppMouseEvent(Class eventClass,
         fflush(stderr);
     }
     return equivalent ? event : nil;
+}
+
+// System pointer owner for the native Host. A process-local NSEvent reaches
+// ordinary NSViews but never enters HIToolbox's Carbon menu chain. Runtime A/B
+// in VSCode proved the complete boundary:
+//   * CGEventPost and NSApplication.sendEvent: both left the real level-101
+//     NSMenuWindowManagerWindow open;
+//   * CGPostMouseEvent from that AppKit/CGS-connected process returned 0/0,
+//     selected the same menu point, and removed the transient window;
+//   * the exact installed OSXvnc implementation calls this same API at
+//     __TEXT+0x9f24.
+// Keep one owner for every Host pointer transition and let WindowServer/AppKit
+// perform ordinary hit testing, tracking, dragging, popup dismissal and Carbon
+// menu dispatch. AppInput remains the control plane for target selection and
+// the missing activation lifecycle; it no longer fabricates component-local
+// mouse events when this proven system route is available.
+static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
+    static MacWSPostLegacyMouseEvent postMouse;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        postMouse = (MacWSPostLegacyMouseEvent)dlsym(
+            RTLD_DEFAULT, "CGPostMouseEvent");
+        if (!postMouse) {
+            void *coreGraphics = dlopen(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+                RTLD_LAZY | RTLD_LOCAL);
+            if (coreGraphics) postMouse = (MacWSPostLegacyMouseEvent)dlsym(
+                coreGraphics, "CGPostMouseEvent");
+        }
+    });
+    return postMouse;
+}
+
+static BOOL MacWSPostLegacySystemPointerEvent(
+        MacWSInputRecord record, CGPoint screenPoint, CGRect screenFrame,
+        NSInteger windowNumber) {
+    // VNC already owns its complete native system stream in OSXvnc. Routing a
+    // second copy through the selected application would duplicate buttons.
+    if (record.source == MacWSInputSourceVNC) return NO;
+    MacWSPostLegacyMouseEvent postMouse = MacWSLegacySystemMousePoster();
+    if (!postMouse) {
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT SYSTEM-POINTER unavailable post=%p\n",
+                postMouse);
+            fflush(stderr);
+        }
+        return NO;
+    }
+
+    static BOOL leftDown;
+    static BOOL rightDown;
+    BOOL atomicTap = NO;
+    BOOL secondary = NO;
+    switch ((MacWSInputKind)record.kind) {
+        case MacWSInputKindTouchDown:
+            leftDown = YES;
+            break;
+        case MacWSInputKindTouchMove:
+        case MacWSInputKindHover:
+        case MacWSInputKindMenuHover:
+            break;
+        case MacWSInputKindTouchUp:
+        case MacWSInputKindTouchCancel:
+            leftDown = NO;
+            rightDown = NO;
+            break;
+        case MacWSInputKindTap:
+            atomicTap = YES;
+            break;
+        case MacWSInputKindSecondaryTap:
+            atomicTap = YES;
+            secondary = YES;
+            break;
+        default:
+            return NO;
+    }
+    CGPoint quartzPoint = {
+        screenPoint.x,
+        screenFrame.origin.y + screenFrame.size.height - screenPoint.y,
+    };
+    int32_t firstResult = 0;
+    int32_t secondResult = 0;
+    if (atomicTap) {
+        firstResult = postMouse(quartzPoint, true, 3,
+            secondary ? false : true, false, secondary ? true : false);
+        // Preserve a visibly distinct ordered transition without the former
+        // AppInput queue round trip. Eight milliseconds is one 120-Hz input
+        // interval and stays below a 60-Hz presentation frame.
+        usleep(8000);
+        secondResult = postMouse(quartzPoint, true, 3,
+            false, false, false);
+    } else {
+        firstResult = postMouse(quartzPoint, true, 3,
+            leftDown, false, rightDown);
+    }
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT SYSTEM-POINTER pid=%d window=%ld kind=%u "
+            "buttons=%u/%u appkit=(%.2f,%.2f) quartz=(%.2f,%.2f) "
+            "result=%d/%d\n",
+            getpid(), (long)windowNumber, record.kind,
+            leftDown ? 1u : 0u, rightDown ? 1u : 0u,
+            screenPoint.x, screenPoint.y, quartzPoint.x, quartzPoint.y,
+            firstResult, secondResult);
+        fflush(stderr);
+    }
+    return firstResult == 0 && secondResult == 0;
 }
 
 // Preserve Apple Pencil identity and geometry on the same mouse NSEvent that
@@ -2974,6 +3114,176 @@ static BOOL MacWSDeliverMissingActivateEvent(id application) {
         application, sel_registerName("isActive"));
 }
 
+// Resolve the application's current native menu instead of assuming a Finder
+// private selector. AppKit defines Command-N as the standard new-window/new-
+// document action, but the concrete target and action belong to the running
+// application and may change with localization or responder state.
+static id MacWSFindInitialWindowMenuItem(id menu, NSUInteger depth) {
+    if (!menu || depth >= MACWS_MENU_MAX_DEPTH) return nil;
+    SEL updateSelector = sel_registerName("update");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(
+            menu, sel_registerName("respondsToSelector:"), updateSelector))
+        ((MacWSMsgVoid)objc_msgSend)(menu, updateSelector);
+    id items = ((MacWSMsgID)objc_msgSend)(
+        menu, sel_registerName("itemArray"));
+    if (![items isKindOfClass:objc_getClass("NSArray")]) return nil;
+    for (id item in items) {
+        id submenu = ((MacWSMsgID)objc_msgSend)(
+            item, sel_registerName("submenu"));
+        id nested = MacWSFindInitialWindowMenuItem(submenu, depth + 1);
+        if (nested) return nested;
+        id key = ((MacWSMsgID)objc_msgSend)(
+            item, sel_registerName("keyEquivalent"));
+        if (![key isKindOfClass:objc_getClass("NSString")] ||
+            [key caseInsensitiveCompare:MacWSRuntimeString("n")] !=
+                NSOrderedSame)
+            continue;
+        NSUInteger modifiers = ((MacWSMsgUInteger)objc_msgSend)(
+            item, sel_registerName("keyEquivalentModifierMask"));
+        const NSUInteger relevant = (1u << 17) | (1u << 18) |
+                                    (1u << 19) | (1u << 20);
+        if ((modifiers & relevant) != (1u << 20) ||
+            ((MacWSMsgBool)objc_msgSend)(item,
+                sel_registerName("isHidden")) ||
+            !((MacWSMsgBool)objc_msgSend)(item,
+                sel_registerName("isEnabled")) ||
+            !((SEL (*)(id, SEL))objc_msgSend)(item,
+                sel_registerName("action")))
+            continue;
+        return item;
+    }
+    return nil;
+}
+
+static id MacWSFindEnabledMenuItemWithTitle(id menu, NSString *wantedTitle,
+                                            NSUInteger depth) {
+    if (!menu || !wantedTitle.length || depth >= MACWS_MENU_MAX_DEPTH)
+        return nil;
+    SEL updateSelector = sel_registerName("update");
+    if (((MacWSMsgBoolSEL)objc_msgSend)(
+            menu, sel_registerName("respondsToSelector:"), updateSelector))
+        ((MacWSMsgVoid)objc_msgSend)(menu, updateSelector);
+    id items = ((MacWSMsgID)objc_msgSend)(
+        menu, sel_registerName("itemArray"));
+    if (![items isKindOfClass:objc_getClass("NSArray")]) return nil;
+    for (id item in items) {
+        id title = ((MacWSMsgID)objc_msgSend)(
+            item, sel_registerName("title"));
+        if ([title isKindOfClass:objc_getClass("NSString")] &&
+            [title localizedCaseInsensitiveCompare:wantedTitle] ==
+                NSOrderedSame &&
+            !((MacWSMsgBool)objc_msgSend)(item,
+                sel_registerName("isHidden")) &&
+            ((MacWSMsgBool)objc_msgSend)(item,
+                sel_registerName("isEnabled")) &&
+            ((SEL (*)(id, SEL))objc_msgSend)(item,
+                sel_registerName("action")))
+            return item;
+        id nested = MacWSFindEnabledMenuItemWithTitle(
+            ((MacWSMsgID)objc_msgSend)(item, sel_registerName("submenu")),
+            wantedTitle, depth + 1);
+        if (nested) return nested;
+    }
+    return nil;
+}
+
+static BOOL MacWSMainBundleIsFinder(void) {
+    Class bundleClass = objc_getClass("NSBundle");
+    id bundle = bundleClass ? ((MacWSMsgID)objc_msgSend)(
+        (id)bundleClass, sel_registerName("mainBundle")) : nil;
+    id identifier = bundle ? ((MacWSMsgID)objc_msgSend)(
+        bundle, sel_registerName("bundleIdentifier")) : nil;
+    return [identifier isEqualToString:
+        MacWSRuntimeString("com.apple.finder")];
+}
+
+static NSSet *MacWSVisibleWindowNumberSnapshot(id application) {
+    NSMutableSet *numbers = [NSMutableSet set];
+    id windows = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("windows"));
+    if (![windows isKindOfClass:objc_getClass("NSArray")]) return numbers;
+    for (id window in windows) {
+        if (!((MacWSMsgBool)objc_msgSend)(
+                window, sel_registerName("isVisible"))) continue;
+        NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+            window, sel_registerName("windowNumber"));
+        if (number > 0) [numbers addObject:@(number)];
+    }
+    return numbers;
+}
+
+static id MacWSNewVisibleWindowSince(id application, NSSet *previousNumbers) {
+    id windows = ((MacWSMsgID)objc_msgSend)(
+        application, sel_registerName("windows"));
+    if (![windows isKindOfClass:objc_getClass("NSArray")]) return nil;
+    for (id window in windows) {
+        if (!((MacWSMsgBool)objc_msgSend)(
+                window, sel_registerName("isVisible"))) continue;
+        NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+            window, sel_registerName("windowNumber"));
+        if (number > 0 && ![previousNumbers containsObject:@(number)])
+            return window;
+    }
+    return nil;
+}
+
+static void MacWSCompleteFinderInitialWindow(id application,
+                                              NSSet *previousNumbers,
+                                              unsigned attempt) {
+    id newWindow = MacWSNewVisibleWindowSince(application, previousNumbers);
+    if (!newWindow && attempt < 80) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                      100 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSCompleteFinderInitialWindow(
+                application, previousNumbers, attempt + 1);
+        });
+        return;
+    }
+    if (newWindow) {
+        id keyWindow = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("keyWindow"));
+        if (keyWindow != newWindow &&
+            ((MacWSMsgBool)objc_msgSend)(
+                newWindow, sel_registerName("canBecomeKeyWindow")))
+            ((MacWSMsgVoid)objc_msgSend)(
+                newWindow, sel_registerName("makeKeyWindow"));
+        id currentMenu = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("mainMenu"));
+        id homeItem = MacWSFindEnabledMenuItemWithTitle(
+            currentMenu, MacWSRuntimeString("Home"), 0);
+        SEL homeAction = homeItem
+            ? ((SEL (*)(id, SEL))objc_msgSend)(
+                homeItem, sel_registerName("action")) : NULL;
+        id homeTarget = homeItem
+            ? ((MacWSMsgID)objc_msgSend)(
+                homeItem, sel_registerName("target")) : nil;
+        BOOL openedHome = homeAction &&
+            ((MacWSMsgBoolSELIDID)objc_msgSend)(
+                application, sel_registerName("sendAction:to:from:"),
+                homeAction, homeTarget, homeItem);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT FINDER-HOME pid=%d attempt=%u window=%ld "
+                "item=%s action=%s performed=%s\n",
+                getpid(), attempt,
+                (long)((MacWSMsgInteger)objc_msgSend)(
+                    newWindow, sel_registerName("windowNumber")),
+                homeItem ? "Home" : "nil",
+                homeAction ? sel_getName(homeAction) : "nil",
+                openedHome ? "YES" : "NO");
+            fflush(stderr);
+        }
+    } else if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT FINDER-HOME pid=%d result=no-new-window "
+            "attempts=%u\n", getpid(), attempt);
+        fflush(stderr);
+    }
+    MacWSPublishWindowMetrics();
+    MacWSNotifyDisplayCatalogChanged('n');
+}
+
 static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     BOOL logEvent = MacWSRuntimeDiagnosticsEnabled() &&
         record.kind != MacWSInputKindTouchMove &&
@@ -3175,6 +3485,54 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 requestedWindowNumber,
                 keyedRequestedWindow ? "YES" : "NO");
             fflush(stderr);
+        }
+        return;
+    }
+
+    if (record.kind == MacWSInputKindCreateInitialWindow) {
+        BOOL finder = MacWSMainBundleIsFinder();
+        NSSet *visibleWindowsBefore = finder
+            ? MacWSVisibleWindowNumberSnapshot(application) : nil;
+        id mainMenu = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("mainMenu"));
+        id item = MacWSFindInitialWindowMenuItem(mainMenu, 0);
+        SEL action = item ? ((SEL (*)(id, SEL))objc_msgSend)(
+            item, sel_registerName("action")) : NULL;
+        id target = item ? ((MacWSMsgID)objc_msgSend)(
+            item, sel_registerName("target")) : nil;
+        BOOL performed = action && ((MacWSMsgBoolSELIDID)objc_msgSend)(
+            application, sel_registerName("sendAction:to:from:"),
+            action, target, item);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            id title = item ? ((MacWSMsgID)objc_msgSend)(
+                item, sel_registerName("title")) : nil;
+            fprintf(stderr,
+                "#### APP-INPUT CREATE-INITIAL-WINDOW pid=%d item=%s "
+                "action=%s target=%s performed=%s\n",
+                getpid(), [title UTF8String] ?: "nil",
+                action ? sel_getName(action) : "nil",
+                target ? object_getClassName(target) : "nil",
+                performed ? "YES" : "NO");
+            fflush(stderr);
+        }
+        if (performed) {
+            if (finder) {
+                // Runtime-confirmed on the target rootfs: Finder's real
+                // Command-N window stayed in Recents/Loading indefinitely
+                // because that view depends on an unavailable metadata query
+                // service. Wait for that new browser window to become real,
+                // then perform its enabled native Go > Home target/action.
+                // This neither synthesizes files nor replaces the browser.
+                MacWSCompleteFinderInitialWindow(
+                    application, visibleWindowsBefore, 0);
+            } else {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                              100 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                MacWSPublishWindowMetrics();
+                MacWSNotifyDisplayCatalogChanged('n');
+                });
+            }
         }
         return;
     }
@@ -3429,7 +3787,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 getpid(), screenPoint.x, screenPoint.y);
         return;
     }
-    if (outsidePopupWindow && record.kind == MacWSInputKindTap) {
+    if (outsidePopupWindow && record.kind == MacWSInputKindTap &&
+        !MacWSLegacySystemMousePoster()) {
         NSInteger popupWindowNumber = ((MacWSMsgInteger)objc_msgSend)(
             outsidePopupWindow, sel_registerName("windowNumber"));
         Class menuWindowClass = objc_getClass("NSMenuWindowManagerWindow");
@@ -3511,13 +3870,54 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         }
         BOOL isActive = ((MacWSMsgBool)objc_msgSend)(application,
             sel_registerName("isActive"));
+        BOOL missingActivationDelivered = NO;
+        MacWSFrontUISnapshot frontSnapshot =
+            MacWSCaptureFrontUISnapshot();
+        BOOL ownsFrontUIProcess = frontSnapshot.ownsFrontUIProcess;
+        BOOL activationRepaired = NO;
+        if (record.source != MacWSInputSourceVNC &&
+            (!isActive || !ownsFrontUIProcess)) {
+            // A Host Scene names one exact existing AppKit window, so this is
+            // the same real user-activation boundary as OSXvnc's pre-down
+            // control transaction. Complete the upstream AppKit/SkyLight/LS
+            // lifecycle before posting the authoritative system down. Without
+            // this ordering a freshly launched VSCode consumed the first tap
+            // only as activation and opened its toolbar menu on the second.
+            // The helpers execute real framework handlers/transactions and
+            // verify their postconditions; no isActive/front predicate is
+            // overridden.
+            if (!isActive) {
+                missingActivationDelivered =
+                    MacWSDeliverMissingActivateEvent(application);
+                isActive = ((MacWSMsgBool)objc_msgSend)(
+                    application, sel_registerName("isActive"));
+            }
+            ownsFrontUIProcess = MacWSRepairFrontUIApplication(
+                application, "host-system-pointer");
+            activationRepaired = ownsFrontUIProcess;
+            if (!isActive && ((MacWSMsgBoolSEL)objc_msgSend)(
+                    application, sel_registerName("respondsToSelector:"),
+                    sel_registerName("activateIgnoringOtherApps:"))) {
+                ((MacWSMsgVoidBool)objc_msgSend)(application,
+                    sel_registerName("activateIgnoringOtherApps:"), YES);
+                if (!((MacWSMsgBool)objc_msgSend)(
+                        application, sel_registerName("isActive"))) {
+                    missingActivationDelivered =
+                        MacWSDeliverMissingActivateEvent(application) ||
+                        missingActivationDelivered;
+                }
+                isActive = ((MacWSMsgBool)objc_msgSend)(
+                    application, sel_registerName("isActive"));
+            }
+        }
         id keyWindow = ((MacWSMsgID)objc_msgSend)(application,
             sel_registerName("keyWindow"));
         static unsigned focusLogs;
         if (MacWSRuntimeDiagnosticsEnabled() && focusLogs++ < 12) {
             fprintf(stderr,
                 "#### APP-INPUT FOCUS pid=%d gesture=%u active=%s->%s "
-                "key=%ld->%ld selected=%ld\n",
+                "key=%ld->%ld selected=%ld front=%s repaired=%s "
+                "missing-event=%s\n",
                 getpid(), record.contactID,
                 wasActive ? "YES" : "NO", isActive ? "YES" : "NO",
                 oldKeyWindow ? (long)((MacWSMsgInteger)objc_msgSend)(
@@ -3525,7 +3925,10 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 keyWindow ? (long)((MacWSMsgInteger)objc_msgSend)(
                     keyWindow, sel_registerName("windowNumber")) : -1L,
                 (long)((MacWSMsgInteger)objc_msgSend)(window,
-                    sel_registerName("windowNumber")));
+                    sel_registerName("windowNumber")),
+                ownsFrontUIProcess ? "OWNED" : "OTHER",
+                activationRepaired ? "YES" : "NO",
+                missingActivationDelivered ? "YES" : "NO");
             fflush(stderr);
         }
     }
@@ -3538,6 +3941,17 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             sel_registerName("windowNumber")) : 0;
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,
         sel_registerName("convertPointFromScreen:"), screenPoint);
+    if (MacWSPostLegacySystemPointerEvent(
+            record, screenPoint, screenFrame, windowNumber)) {
+        MacWSNotifyDisplayCatalogChanged('t');
+        if (record.kind == MacWSInputKindTouchUp ||
+            record.kind == MacWSInputKindTouchCancel ||
+            record.kind == MacWSInputKindTap ||
+            record.kind == MacWSInputKindSecondaryTap)
+            MacWSSetAppInputGestureWindow(nil);
+        MacWSClearDeferredRFBMoveEvents();
+        return;
+    }
     if (record.kind == MacWSInputKindScroll) {
         id scrollEvent = MacWSCreateAppScrollEvent(
             eventClass, record, windowPoint, screenFrame, windowNumber);
@@ -4693,9 +5107,40 @@ static void MacWSHandleMenuRequest(const MacWSMenuRequest *request,
         replyHeader.stringBytes = 0;
         replyHeader.totalBytes = sizeof(replyHeader);
     }
-    (void)sendto(MacWSAppInputSocket, &replyHeader, sizeof(replyHeader), 0,
-                 (const struct sockaddr *)replyAddress,
-                 replyAddressLength);
+    // The Host and diagnostic clients run outside the chroot and bind their
+    // reply socket through /var/mnt/rootfs/private/tmp. recvfrom preserves
+    // that literal pathname, but the application resolves a sendto pathname
+    // inside the chroot where the same inode is /private/tmp/.... Runtime
+    // witness: Terminal produced APP-MENU status=1 and the complete sidecar,
+    // while the client timed out and the source socket remained untouched.
+    // Translate only this exact mount prefix before replying; do not weaken
+    // the request's PID/window validation or synthesize an acknowledgement.
+    struct sockaddr_un replyTarget = *replyAddress;
+    socklen_t replyTargetLength = replyAddressLength;
+    static const char rootMountPrefix[] = "/var/mnt/rootfs";
+    size_t rootMountLength = sizeof(rootMountPrefix) - 1;
+    size_t sourcePathLength = strnlen(replyTarget.sun_path,
+        sizeof(replyTarget.sun_path));
+    if (sourcePathLength > rootMountLength &&
+        memcmp(replyTarget.sun_path, rootMountPrefix,
+               rootMountLength) == 0 &&
+        replyTarget.sun_path[rootMountLength] == '/') {
+        size_t translatedLength = sourcePathLength - rootMountLength;
+        memmove(replyTarget.sun_path,
+                replyTarget.sun_path + rootMountLength,
+                translatedLength + 1);
+        replyTargetLength = (socklen_t)(
+            offsetof(struct sockaddr_un, sun_path) + translatedLength + 1);
+    }
+    ssize_t replyBytes = sendto(
+        MacWSAppInputSocket, &replyHeader, sizeof(replyHeader), 0,
+        (const struct sockaddr *)&replyTarget, replyTargetLength);
+    if (replyBytes != sizeof(replyHeader)) {
+        fprintf(stderr,
+            "#### APP-MENU REPLY-FAIL pid=%d op=%u path=%s errno=%d\n",
+            getpid(), request->operation, replyTarget.sun_path, errno);
+        fflush(stderr);
+    }
     if (request->operation == MacWSMenuOperationAction &&
         replyHeader.status == MacWSMenuStatusOK) {
         MacWSMenuRequest accepted = *request;

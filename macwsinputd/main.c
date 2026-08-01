@@ -134,6 +134,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindScroll: return "scroll";
         case MacWSInputKindConfigureWindow: return "configure-window";
         case MacWSInputKindCloseWindow: return "close-window";
+        case MacWSInputKindCreateInitialWindow: return "create-initial-window";
     }
     return "invalid";
 }
@@ -163,6 +164,8 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return record->targetPID > 1 &&
                MacWSInputWindowIDForScene(record->sceneID) != 0;
     }
+    if (record->kind == MacWSInputKindCreateInitialWindow)
+        return record->targetPID > 1;
     if (record->kind == MacWSInputKindScroll) {
         float horizontal = 0.0f;
         memcpy(&horizontal, &record->contactID, sizeof(horizontal));
