@@ -7,6 +7,7 @@
 #import <simd/simd.h>
 
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach/mach_time.h>
@@ -3202,20 +3203,25 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
     NSString *witness = [NSString stringWithContentsOfFile:
         MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    return [witness containsString:@"version=6"] &&
+    return [witness containsString:@"version=12"] &&
         [witness containsString:
-            @"fullscreen=exact-scene-keyboard-action-11"];
+            @"fullscreen=focused-scene-enter-action-17"];
 }
 
 static BOOL MacWSWindowingResizeBridgeIsLoaded(void) {
     NSString *witness = [NSString stringWithContentsOfFile:
         MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    return [witness containsString:@"version=6"] &&
-        [witness containsString:@"resize=app-layout-transaction"];
+    return [witness containsString:@"version=12"] &&
+        [witness containsString:@"resize=app-layout-transaction"] &&
+        [witness containsString:
+            @"exit=primary-to-page-center-environment-3"] &&
+        [witness containsString:
+            @"return-size=system-default-on-fullscreen-state"];
 }
 
-static BOOL MacWSRequestNativeSceneSize(UIWindowScene *scene,
-                                        CGSize preferredSize) {
+static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
+                                                CGSize preferredSize,
+                                                BOOL requestWindowedRole) {
     if (!scene || !scene.session || !isfinite(preferredSize.width) ||
         !isfinite(preferredSize.height) || preferredSize.width < 150.0 ||
         preferredSize.height < 150.0) {
@@ -3249,6 +3255,7 @@ static BOOL MacWSRequestNativeSceneSize(UIWindowScene *scene,
         @"session_identifier": scene.session.persistentIdentifier ?: @"",
         @"width": @(round(preferredSize.width)),
         @"height": @(round(preferredSize.height)),
+        @"windowed_role": @(requestWindowedRole),
         @"issued_at": @(NSDate.date.timeIntervalSince1970),
         @"nonce": nonce,
     };
@@ -3260,22 +3267,34 @@ static BOOL MacWSRequestNativeSceneSize(UIWindowScene *scene,
         return NO;
     }
 
-    MacWSLog(@"scene-native-size requested id=%@ fbs=%@ requested=%.1fx%.1f route=SBMainWorkspace",
+    MacWSLog(@"scene-native-size requested id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ route=SBMainWorkspace",
              scene.session.persistentIdentifier, sceneIdentifier,
-             preferredSize.width, preferredSize.height);
+             preferredSize.width, preferredSize.height,
+             requestWindowedRole ? @"YES" : @"NO");
     CFNotificationCenterPostNotification(
         CFNotificationCenterGetDarwinNotifyCenter(),
         MacWSRequestResizeNotification, NULL, NULL, true);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  1500 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
-        MacWSLog(@"scene-native-size result id=%@ fbs=%@ requested=%.1fx%.1f bounds=%.1fx%.1f",
+        CGRect sceneBounds = scene.coordinateSpace.bounds;
+        CGRect screenBounds = scene.screen.bounds;
+        BOOL fillsScreen = fabs(sceneBounds.size.width - screenBounds.size.width) <= 1.0 &&
+            fabs(sceneBounds.size.height - screenBounds.size.height) <= 1.0;
+        MacWSLog(@"scene-native-size result id=%@ fbs=%@ requested=%.1fx%.1f windowed-role=%@ fills-screen=%@ bounds=%.1fx%.1f",
                  scene.session.persistentIdentifier, sceneIdentifier,
                  preferredSize.width, preferredSize.height,
-                 scene.coordinateSpace.bounds.size.width,
-                 scene.coordinateSpace.bounds.size.height);
+                 requestWindowedRole ? @"YES" : @"NO",
+                 fillsScreen ? @"YES" : @"NO",
+                 sceneBounds.size.width, sceneBounds.size.height);
     });
     return YES;
+}
+
+static BOOL MacWSRequestNativeSceneSize(UIWindowScene *scene,
+                                        CGSize preferredSize) {
+    return MacWSRequestNativeSceneSizeWithRole(
+        scene, preferredSize, NO);
 }
 
 static BOOL MacWSRequestCurrentSceneFullscreen(
@@ -3287,6 +3306,7 @@ static BOOL MacWSRequestCurrentSceneFullscreen(
                  scene.session.persistentIdentifier ?: @"none");
         return NO;
     }
+
     if (!MacWSWindowingFullscreenBridgeIsLoaded()) {
         MacWSLog(@"scene-fullscreen unavailable reason=windowing-bridge-not-loaded session=%@",
                  scene.session.persistentIdentifier);
@@ -3320,7 +3340,7 @@ static BOOL MacWSRequestCurrentSceneFullscreen(
         return NO;
     }
 
-    MacWSLog(@"scene-fullscreen requested session=%@ fbs=%@ route=springboard-keyboard-action-11 current-bounds=%@",
+    MacWSLog(@"scene-fullscreen requested session=%@ fbs=%@ route=springboard-enter-fullscreen-action-17 current-bounds=%@",
              scene.session.persistentIdentifier, sceneIdentifier,
              NSStringFromCGRect(scene.coordinateSpace.bounds));
     CFNotificationCenterPostNotification(
@@ -3334,12 +3354,21 @@ static BOOL MacWSRequestCurrentSceneFullscreen(
                                  1500 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
         BOOL supportsState = [scene respondsToSelector:@selector(isFullScreen)];
-        BOOL fullScreen = supportsState && scene.isFullScreen;
-        MacWSLog(@"scene-fullscreen result session=%@ is-fullscreen=%@ bounds=%@ screen=%@",
+        BOOL systemState = supportsState && scene.isFullScreen;
+        CGRect sceneBounds = scene.coordinateSpace.bounds;
+        CGRect screenBounds = scene.screen.bounds;
+        BOOL fillsScreen = fabs(sceneBounds.origin.x - screenBounds.origin.x) <= 1.0 &&
+            fabs(sceneBounds.origin.y - screenBounds.origin.y) <= 1.0 &&
+            fabs(sceneBounds.size.width - screenBounds.size.width) <= 1.0 &&
+            fabs(sceneBounds.size.height - screenBounds.size.height) <= 1.0;
+        BOOL fullScreen = systemState || fillsScreen;
+        MacWSLog(@"scene-fullscreen result session=%@ is-fullscreen=%@ fills-screen=%@ effective=%@ bounds=%@ screen=%@",
                  scene.session.persistentIdentifier,
+                 systemState ? @"YES" : @"NO",
+                 fillsScreen ? @"YES" : @"NO",
                  fullScreen ? @"YES" : @"NO",
-                 NSStringFromCGRect(scene.coordinateSpace.bounds),
-                 NSStringFromCGRect(scene.screen.bounds));
+                 NSStringFromCGRect(sceneBounds),
+                 NSStringFromCGRect(screenBounds));
         if (!fullScreen && failureHandler) {
             NSError *error = [NSError errorWithDomain:@"MacWSWindowing"
                 code:2 userInfo:@{NSLocalizedDescriptionKey:
@@ -3786,6 +3815,24 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     [self setNeedsStatusBarAppearanceUpdate];
     [self setNeedsUpdateOfHomeIndicatorAutoHidden];
     [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+    BOOL expected = _streamMode == MacWSStreamModeFullscreen;
+    for (NSNumber *delay in @[@0, @250, @1250]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     delay.longLongValue * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            UIWindowScene *scene = self.view.window.windowScene;
+            BOOL actualStatusHidden = scene.statusBarManager.statusBarHidden;
+            MacWSLog(@"immersive-postcondition expected=%@ status-request=%@ status-hidden=%@ home-indicator-auto-hide=%@ deferred-edges=%lu bounds=%@ screen=%@ safe-insets=%@",
+                     expected ? @"YES" : @"NO",
+                     self.prefersStatusBarHidden ? @"YES" : @"NO",
+                     actualStatusHidden ? @"YES" : @"NO",
+                     self.prefersHomeIndicatorAutoHidden ? @"YES" : @"NO",
+                     (unsigned long)self.preferredScreenEdgesDeferringSystemGestures,
+                     NSStringFromCGRect(scene.coordinateSpace.bounds),
+                     NSStringFromCGRect(scene.screen.bounds),
+                     NSStringFromUIEdgeInsets(self.view.safeAreaInsets));
+        });
+    }
 }
 
 - (void)updateWorkspaceChrome {
@@ -5435,8 +5482,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                   [self streamRestorationActivity]);
         BOOL requestedOriginalSize =
             returnSceneSize.width >= 150.0 && returnSceneSize.height >= 150.0 &&
-            MacWSRequestNativeSceneSize(self.view.window.windowScene,
-                                        returnSceneSize);
+            MacWSRequestNativeSceneSizeWithRole(
+                self.view.window.windowScene, returnSceneSize, YES);
         [self hideControls];
         [self setNotice:requestedOriginalSize
             ? @"正在恢复进入全屏前的 iPadOS 窗口尺寸"
@@ -5528,12 +5575,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL legacyFramebuffer = MacWSLegacyFramebufferFallbackEnabled();
     BOOL renderableFrame = _metalView.hasDirectSurfaceFrame ||
         (legacyFramebuffer && frame);
-    BOOL activeAppInput = [status[@"app_input_ready"] boolValue];
-    int32_t activeAppPID = (int32_t)[status[@"active_app_pid"] intValue];
+    int32_t catalogPID = _metalView.targetPID;
     int32_t targetPID = _streamMode == MacWSStreamModeWindow
-        ? _windowOwnerPID : activeAppPID;
-    BOOL appInput = _streamMode == MacWSStreamModeWindow
-        ? MacWSAppInputEndpointReady(targetPID) : activeAppInput;
+        ? _windowOwnerPID
+        : (MacWSAppInputEndpointReady(catalogPID) ? catalogPID : 0);
+    // The full workspace must follow AppKit's actual focused window catalog,
+    // not macwshostd's process-local "last app launched" cache.  The daemon
+    // can restart while healthy chroot applications and their endpoints stay
+    // alive; treating its empty cache as authoritative disabled all touch on
+    // an otherwise visible desktop.  Endpoint existence is the invariant for
+    // both exact-window and full-workspace routing.
+    BOOL appInput = MacWSAppInputEndpointReady(targetPID);
+    BOOL fullscreenSystemRoute =
+        _streamMode == MacWSStreamModeFullscreen && targetPID <= 1;
     NSString *controlSummary = [NSString stringWithFormat:
         @"connected=%@ busy=%@ rootfs=%@ ws=%@ input=%@ frame=%@ phase=%@ error=%@",
         connected ? @"YES" : @"NO", busy ? @"YES" : @"NO",
@@ -5555,7 +5609,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _bridgeLabel.text = input
         ? (targetPID > 1 && appInput
             ? [NSString stringWithFormat:@"在线 · 目标 PID %d", targetPID]
-            : (targetPID > 1 ? @"在线 · 等待应用输入端点" : @"在线 · 等待应用"))
+            : (fullscreenSystemRoute
+                ? @"在线 · 全桌面逐点命中"
+                : (targetPID > 1 ? @"在线 · 等待应用输入端点" : @"在线 · 等待应用")))
         : @"离线";
     _bridgeLabel.textColor = input ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
     if (_metalView.hasDirectSurfaceFrame) {
@@ -5582,15 +5638,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     _metalView.targetPID = targetPID;
     BOOL inputReady = connected && !busy && ws && input && renderableFrame &&
-        targetPID > 1 && appInput;
+        ((targetPID > 1 && appInput) || fullscreenSystemRoute);
     NSString *inputReason = nil;
     if (!connected) inputReason = @"root 控制服务离线";
     else if (busy) inputReason = @"macOS 正在启动或切换";
     else if (!ws) inputReason = @"macOS 工作区已停止";
     else if (!input) inputReason = @"触控桥离线";
     else if (!renderableFrame) inputReason = @"等待 DisplayStream IOSurface 首帧";
-    else if (targetPID <= 1) inputReason = _streamMode == MacWSStreamModeWindow
-        ? @"等待该窗口的所属应用" : @"请先从控制中心启动一个 macOS 应用";
+    else if (targetPID <= 1 && !fullscreenSystemRoute)
+        inputReason = @"等待该窗口的所属应用";
     else if (!appInput) inputReason = @"目标应用输入端点尚未就绪";
     [_metalView setMacWSInputEnabled:inputReady reason:inputReason];
     _inputLabel.text = inputReady
@@ -5763,6 +5819,25 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     return written ? [NSURL fileURLWithPath:path] : nil;
 }
 
+- (NSURL *)writeHostScreenSnapshot {
+    // RE-confirmed in the target iOS 16.3.1 UIKitCore image: exported
+    // _UICreateScreenUIImage at 0x189df62ac returns the foreground screen
+    // composite. Keep this explicit diagnostic off every display/input hot
+    // path; unlike drawViewHierarchy it can witness system chrome.
+    UIImage *(*createScreenImage)(void) =
+        (UIImage *(*)(void))dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
+    UIImage *image = createScreenImage ? createScreenImage() : nil;
+    NSData *png = image ? UIImagePNGRepresentation(image) : nil;
+    NSString *path = @"/var/mobile/Library/Logs/MacWSHost-screen.png";
+    NSError *error = nil;
+    BOOL written = png.length &&
+        [png writeToFile:path options:NSDataWritingAtomic error:&error];
+    MacWSLog(@"screen-snapshot written=%@ bytes=%lu symbol=%@ path=%@ error=%@",
+             written ? @"YES" : @"NO", (unsigned long)png.length,
+             createScreenImage ? @"YES" : @"NO", path, error ?: @"");
+    return written ? [NSURL fileURLWithPath:path] : nil;
+}
+
 - (void)exportDiagnostics {
     NSURL *snapshot = [self writeHostUISnapshot];
     [_controlClient fetchLogs:^(NSDictionary<NSString *,id> *reply) {
@@ -5821,6 +5896,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self closeCurrentWindow];
     } else if ([action isEqualToString:@"screenshot-ui"]) {
         [self writeHostUISnapshot];
+    } else if ([action isEqualToString:@"screenshot-screen"]) {
+        [self writeHostScreenSnapshot];
     } else if ([action isEqualToString:@"hide-controls"]) {
         [self hideControls];
     } else if ([action isEqualToString:@"show-controls"]) {
@@ -6138,6 +6215,39 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
     (void)view;
     _streamWindows = [windows copy];
+    if (_streamMode == MacWSStreamModeFullscreen) {
+        MacWSStreamWindow *fallback = nil;
+        MacWSStreamWindow *focused = nil;
+        for (MacWSStreamWindow *window in windows) {
+            MacWSStreamWindowDescriptor descriptor = window.descriptor;
+            MacWSStreamWindowFlags flags = descriptor.flags;
+            if (descriptor.ownerPID <= 1 ||
+                !MacWSAppInputEndpointReady(descriptor.ownerPID) ||
+                (flags & MacWSStreamWindowVisible) == 0 ||
+                (flags & MacWSStreamWindowOnScreen) == 0) continue;
+            // CGWindowList preserves front-to-back order.  Keep its first
+            // eligible entry only as a cold-start fallback; AppInputBridge's
+            // real NSWindow isKeyWindow publication remains authoritative.
+            if (!fallback) fallback = window;
+            if (flags & MacWSStreamWindowFocused) {
+                focused = window;
+                break;
+            }
+        }
+        MacWSStreamWindow *target = focused ?: fallback;
+        int32_t previousPID = _metalView.targetPID;
+        int32_t targetPID = target ? target.descriptor.ownerPID : 0;
+        if (targetPID != previousPID) {
+            _metalView.targetPID = targetPID;
+            MacWSLog(@"fullscreen-input-target pid=%d window=%u source=%@ title=%@",
+                     targetPID, target ? target.descriptor.windowID : 0,
+                     target
+                        ? (focused ? @"appkit-focused" : @"frontmost-fallback")
+                        : @"system-point-hit-test",
+                     target.title ?: @"");
+            [self refreshStatus];
+        }
+    }
     // Establish the first complete catalog as a baseline before an explicit
     // launch transaction consumes it. This prevents restoring Host from
     // opening every pre-existing macOS window at once; subsequent identities
@@ -6356,6 +6466,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
     (void)view;
+    // A fullscreen workspace is a compositor surface, not one permanently
+    // owned AppKit window. Pointer and scroll records therefore enter
+    // macwsinputd with targetPID=0 so its front-to-back CGWindow hit test can
+    // select ordinary windows, menus, Dock, Launchpad, and status extras at
+    // the actual event point. Keyboard records retain the focused AppKit PID;
+    // without a focused AppKit window they stay zero and follow the broker's
+    // cached/probed system target. Runtime evidence on 2026-08-02: explicitly
+    // routing a Launchpad tap to Dock pid 99793 opened the native "Other"
+    // folder, while the old global fallback only moved the cursor.
+    if (_streamMode == MacWSStreamModeFullscreen &&
+        record.kind != MacWSInputKindKeyDown &&
+        record.kind != MacWSInputKindKeyUp) {
+        record.targetPID = 0;
+    }
     NSString *phase = @"?";
     switch ((MacWSInputKind)record.kind) {
         case MacWSInputKindTouchDown: phase = @"down"; break;
@@ -6394,6 +6518,22 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             @"触控桥离线 · %@ · errno=%d", phase, sendError];
         [_metalView setMacWSInputEnabled:NO reason:@"触控桥连接已中断"];
         [self refreshStatus];
+    } else if (_streamMode == MacWSStreamModeFullscreen &&
+               (record.kind == MacWSInputKindTap ||
+                record.kind == MacWSInputKindSecondaryTap ||
+                record.kind == MacWSInputKindTouchUp)) {
+        // A global click can make another real AppKit window key. Refresh the
+        // catalog at two bounded settlement points so subsequent keyboard and
+        // gesture records follow that owner. This is event-driven, not a
+        // frame-time poll.
+        for (NSNumber *delay in @[@80, @280]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         delay.longLongValue * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                if (self->_streamMode == MacWSStreamModeFullscreen)
+                    [self->_metalView requestStreamWindowList];
+            });
+        }
     }
 }
 @end
@@ -6612,6 +6752,12 @@ static void MacWSDeduplicateWindowScenes(void) {
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.rootViewController = controller;
     [self.window makeKeyAndVisible];
+    // Scene restoration can reconnect directly in fullscreen mode without
+    // passing through openFullscreenWorkspace. Re-assert and log UIKit's
+    // authoritative status-bar/Home-Indicator policy after the real window
+    // is visible so cold launch and interactive transition share the same
+    // immersive postconditions.
+    [controller updateImmersivePresentation];
     if (streamMode == MacWSStreamModeWindow && windowID != 0)
         MacWSRequestNativeSceneSize(windowScene, preferredSize);
     MacWSRememberSceneBinding(session, [controller streamRestorationActivity]);
@@ -6750,14 +6896,11 @@ static void MacWSDeduplicateWindowScenes(void) {
             };
             MacWSViewController *controller =
                 (MacWSViewController *)self.window.rootViewController;
-            NSDictionary *status = [controller valueForKey:@"latestStatus"];
             uint32_t targetWindowID = (uint32_t)[[controller
                 valueForKey:@"windowID"] unsignedIntValue];
             int32_t targetOwnerPID = (int32_t)[[controller
                 valueForKey:@"windowOwnerPID"] intValue];
-            record.targetPID = targetWindowID != 0
-                ? targetOwnerPID
-                : (int32_t)[status[@"active_app_pid"] intValue];
+            record.targetPID = targetWindowID != 0 ? targetOwnerPID : 0;
             if (targetWindowID != 0)
                 record.sceneID = MacWSInputSceneForWindow(targetWindowID, 0);
             if ([requestedKind isEqualToString:@"tap"])
@@ -6793,7 +6936,8 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"recover", @"repair", @"capture",
                @"test-open-file", @"fullscreen",
                @"close-window",
-               @"screenshot-ui", @"hide-controls", @"show-controls"]
+               @"screenshot-ui", @"screenshot-screen",
+               @"hide-controls", @"show-controls"]
               containsObject:host]) {
             MacWSViewController *controller = (MacWSViewController *)self.window.rootViewController;
             [controller performURLAction:host];

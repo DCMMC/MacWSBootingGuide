@@ -6,7 +6,7 @@
 	<string>com.apple.coreservices.launchservicesd</string>
 	<key>MachServices</key>
 	<dict>
-		<key>com.apple.coreservices.launchservicesd</key>
+		<key>com.apple.macosbooter.coreservices.launchservicesd</key>
 		<true/>
 	</dict>
 	<key>POSIXSpawnType</key>

@@ -325,7 +325,7 @@ if [ -f /var/jb/usr/macOS/bin/macwsinputd ]; then
 	chmod 755 /var/mnt/rootfs/usr/local/bin/macwsinputd
 	add_all_trustcache /var/mnt/rootfs/usr/local/bin/macwsinputd
 fi
-for bridge in macwsdisplayd macwsinteropd; do
+for bridge in macwsdisplayd macwsinteropd macwsworkspacectl; do
 	if [ -f "/var/jb/usr/macOS/bin/$bridge" ]; then
 		rm -f "/var/mnt/rootfs/usr/local/bin/$bridge"
 		cp -vf "/var/jb/usr/macOS/bin/$bridge" "/var/mnt/rootfs/usr/local/bin/$bridge"
@@ -333,6 +333,21 @@ for bridge in macwsdisplayd macwsinteropd; do
 		add_all_trustcache "/var/mnt/rootfs/usr/local/bin/$bridge"
 	fi
 done
+# LaunchServices' FSNode layer receives the kernel mount name for the macOS
+# filesystem even after launchdchrootexec has changed the process root.  On the
+# target device its real database therefore records bundle paths below
+# `/rootfs` (for example `/rootfs/System/Applications/Launchpad.app`).  The
+# matching runtime dump reports "Bundle node not found on disk" unless that
+# kernel-visible mount name also resolves inside the chroot.  Keep a single,
+# exact namespace alias to the logical process root; do not overwrite any real
+# path a user may already have created.
+if [ ! -e /var/mnt/rootfs/rootfs ] && [ ! -L /var/mnt/rootfs/rootfs ]; then
+	ln -s / /var/mnt/rootfs/rootfs
+elif [ -L /var/mnt/rootfs/rootfs ] &&
+     [ "$(readlink /var/mnt/rootfs/rootfs 2>/dev/null)" != / ]; then
+	echo '[ERROR] /var/mnt/rootfs/rootfs exists but does not target /' >&2
+	exit 1
+fi
 # MacWSHost runs as the iOS mobile user while the chroot apps currently run as
 # root.  A shared staging directory owned by mobile lets the Host copy
 # security-scoped imports into the mounted rootfs; root can then publish the
@@ -350,6 +365,19 @@ add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monit
 # changing the signed file and accumulating obsolete trustcache entries.
 FINDER_BIN='/var/mnt/rootfs/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder'
 ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
+# The chroot has no loginwindow trust/bootstrap handoff. These are direct
+# outer-launchd targets, so each top-level executable must already satisfy the
+# same project signing policy before libmachook/autosignd can run. Their stock
+# code and service contracts remain intact; this only makes the launch targets
+# admissible on the iOS kernel and restores dynamic trust after a reboot.
+for workspace_binary in \
+    '/var/mnt/rootfs/usr/libexec/lsd' \
+    '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock' \
+    '/var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer' \
+    '/var/mnt/rootfs/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter' \
+    '/var/mnt/rootfs/System/Applications/Launchpad.app/Contents/MacOS/Launchpad'; do
+    ensure_project_signature_and_trustcache "$workspace_binary" || exit 1
+done
 # Finder's TimelineUI dependency is not present in the iOS dyld shared cache.
 # Once Finder itself passed AMFI, dyld runtime-confirmed this exact on-disk
 # image was the next rejected arm64e dependency.
@@ -438,6 +466,124 @@ fi
 # on every reboot automatically.
 
 ROOTFS=/var/mnt/rootfs
+
+# Ventura QuartzCore's real desktop-window-effects shaders are compiled for a
+# macOS AIR target, while this project intentionally executes them on the iOS
+# native AGX driver. Preserve the original system library as the process-wide
+# default and build a secondary library in which only the three runtime-confirmed
+# failing functions carry a macabi AIR triple. libmachook forwards the original
+# function constants to this library; it does not bypass compilation or pipeline
+# validation.
+QC_DEFAULT="$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"
+QC_ORIGINAL="$QC_DEFAULT.macws-macos13.4-original"
+QC_EXPECTED_SHA256=ac8014164c7784395f86ac2926c62b67c96faa2a3c789f231b4b22b64024bfba
+QC_COMPAT_DIR="$ROOTFS/usr/local/share/macws/quartzcore"
+QC_COMPAT_TARGET="$QC_COMPAT_DIR/default-desktop-effects-macabi.metallib"
+QC_COMPAT_EXPECTED_SHA256=ae529c958e0c1a8caf4e9a0d40148e0c657f4e78ab74d0b0702c8631282acefd
+QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py
+QC_LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
+QC_LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
+
+qc_sha256() {
+	sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+if [ "$(qc_sha256 "$QC_ORIGINAL")" != "$QC_EXPECTED_SHA256" ]; then
+	if [ "$(qc_sha256 "$QC_DEFAULT")" != "$QC_EXPECTED_SHA256" ]; then
+		echo "[ERROR] QuartzCore default.metallib is not the supported macOS 13.4 library." >&2
+		exit 1
+	fi
+	cp "$QC_DEFAULT" "$QC_ORIGINAL.new.$$" || exit 1
+	chmod 0644 "$QC_ORIGINAL.new.$$" || exit 1
+	mv -f "$QC_ORIGINAL.new.$$" "$QC_ORIGINAL" || exit 1
+fi
+
+# Undo an interrupted diagnostic replacement before any GUI process can see it.
+if [ "$(qc_sha256 "$QC_DEFAULT")" != "$QC_EXPECTED_SHA256" ]; then
+	cp "$QC_ORIGINAL" "$QC_DEFAULT.new.$$" || exit 1
+	chmod 0644 "$QC_DEFAULT.new.$$" || exit 1
+	mv -f "$QC_DEFAULT.new.$$" "$QC_DEFAULT" || exit 1
+fi
+
+if [ ! -f "$QC_REPACKER" ] || [ ! -x "$QC_LLVM_DIS" ] ||
+   [ ! -x "$QC_LLVM_AS" ]; then
+	echo "[ERROR] QuartzCore macabi repacker or device LLVM 16 is unavailable." >&2
+	exit 1
+fi
+mkdir -p "$QC_COMPAT_DIR" || exit 1
+QC_COMPAT_TMP="$QC_COMPAT_TARGET.new.$$"
+python3 "$QC_REPACKER" "$QC_ORIGINAL" "$QC_COMPAT_TMP" \
+	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
+	--function fixed_vert_lph_spc \
+	--function fixed_vert_lph_gen \
+	--function fixed_frag_lph_cpf \
+	--rewrite-fract-v3f16-function fixed_frag_lph_cpf \
+	--preserve-container-target || exit 1
+if [ "$(qc_sha256 "$QC_COMPAT_TMP")" != "$QC_COMPAT_EXPECTED_SHA256" ]; then
+	echo "[ERROR] Generated QuartzCore desktop-effects library failed exact validation." >&2
+	exit 1
+fi
+chmod 0644 "$QC_COMPAT_TMP" || exit 1
+mv -f "$QC_COMPAT_TMP" "$QC_COMPAT_TARGET" || exit 1
+echo '[INFO] installed exact QuartzCore desktop-effects macabi shader library'
+
+# SkyLight's desktop backing-window path has a second, independently
+# runtime-confirmed target mismatch for SimpleVertex/SimpleTextureFragment.
+# Generate a separate two-function compatibility library from the exact
+# Ventura 13.4 source; never replace SkyLight's process-wide library.
+SKY_DEFAULT="$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/SkyLightShaders.air64.metallib"
+SKY_EXPECTED_SHA256=378174fcbf7fc639aa737cad7a765690b2d76fa3a66c7a8e71018441f3ac3184
+SKY_COMPAT_DIR="$ROOTFS/usr/local/share/macws/skylight"
+SKY_COMPAT_TARGET="$SKY_COMPAT_DIR/SkyLightShaders-desktop-effects-macabi.metallib"
+SKY_COMPAT_EXPECTED_SHA256=d592ac61f74cdeeb5c0ebc14bb86b5eae35cb847daf99f9da5faf5d2a990b923
+if [ "$(qc_sha256 "$SKY_DEFAULT")" != "$SKY_EXPECTED_SHA256" ]; then
+	echo "[ERROR] SkyLightShaders.air64.metallib is not the supported macOS 13.4 library." >&2
+	exit 1
+fi
+mkdir -p "$SKY_COMPAT_DIR" || exit 1
+SKY_COMPAT_TMP="$SKY_COMPAT_TARGET.new.$$"
+python3 "$QC_REPACKER" "$SKY_DEFAULT" "$SKY_COMPAT_TMP" \
+	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
+	--function SimpleVertex \
+	--function SimpleTextureFragment \
+	--preserve-container-target || exit 1
+if [ "$(qc_sha256 "$SKY_COMPAT_TMP")" != "$SKY_COMPAT_EXPECTED_SHA256" ]; then
+	echo "[ERROR] Generated SkyLight desktop-effects library failed exact validation." >&2
+	exit 1
+fi
+chmod 0644 "$SKY_COMPAT_TMP" || exit 1
+mv -f "$SKY_COMPAT_TMP" "$SKY_COMPAT_TARGET" || exit 1
+echo '[INFO] installed exact SkyLight desktop-effects macabi shader library'
+
+# MPSImage supplies the real desktop-effects reduction kernel reached after
+# SkyLight's desktop surface pipelines are available. The exact runtime
+# failures are sum_rgba_columns and sum_rgba_rows with a macOS AIR target;
+# both report no function constants against the exact Ventura library, so
+# libmachook redirects only base-function creation to this byte-validated
+# selective macabi library.
+MPSIMAGE_DEFAULT="$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib"
+MPSIMAGE_EXPECTED_SHA256=376ded7ee154429f6950656eb668b26af27fc6149b734b11dd48a33d68fe4285
+MPSIMAGE_COMPAT_DIR="$ROOTFS/usr/local/share/macws/mpsimage"
+MPSIMAGE_COMPAT_TARGET="$MPSIMAGE_COMPAT_DIR/default-desktop-effects-macabi.metallib"
+MPSIMAGE_COMPAT_EXPECTED_SHA256=0187b2e6f58659e9974680c1b82d15d393d99f5feb3be85451043c33861b1496
+if [ "$(qc_sha256 "$MPSIMAGE_DEFAULT")" != "$MPSIMAGE_EXPECTED_SHA256" ]; then
+	echo "[ERROR] MPSImage default.metallib is not the supported macOS 13.4 library." >&2
+	exit 1
+fi
+mkdir -p "$MPSIMAGE_COMPAT_DIR" || exit 1
+MPSIMAGE_COMPAT_TMP="$MPSIMAGE_COMPAT_TARGET.new.$$"
+python3 "$QC_REPACKER" "$MPSIMAGE_DEFAULT" "$MPSIMAGE_COMPAT_TMP" \
+	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
+	--function sum_rgba_columns \
+	--function sum_rgba_rows \
+	--preserve-container-target || exit 1
+if [ "$(qc_sha256 "$MPSIMAGE_COMPAT_TMP")" != "$MPSIMAGE_COMPAT_EXPECTED_SHA256" ]; then
+	echo "[ERROR] Generated MPSImage desktop-effects library failed exact validation." >&2
+	exit 1
+fi
+chmod 0644 "$MPSIMAGE_COMPAT_TMP" || exit 1
+mv -f "$MPSIMAGE_COMPAT_TMP" "$MPSIMAGE_COMPAT_TARGET" || exit 1
+echo '[INFO] installed exact MPSImage desktop-effects macabi shader library'
 
 # Chromium 148 / Electron 42 ships ANGLE's default Metal library for macOS.
 # Its container loads in the chroot, but iOS MTLCompilerService rejects

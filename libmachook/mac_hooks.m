@@ -28,6 +28,8 @@
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 
+static void macws_install_fsnode_root_volume_repair(void);
+
 // Expensive observation must never ride along with the normal interactive
 // path. The launcher creates this sentinel before process start only when the
 // operator explicitly passes --diagnostics, so cache the answer once and keep
@@ -2662,6 +2664,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         strstr(info.dli_fname,
                "/UniformTypeIdentifiers.framework/") != NULL) {
         macws_schedule_uttype_coretypes_compatibility();
+    }
+    if (info.dli_fname &&
+        strstr(info.dli_fname, "/LaunchServices.framework/") != NULL) {
+        macws_install_fsnode_root_volume_repair();
     }
     if (info.dli_fname &&
         strstr(info.dli_fname,
@@ -8683,18 +8689,37 @@ static bool macws_cfurl_is_process_root(CFURLRef url) {
     }
 
     static _Atomic uint64_t cachedRootInode = 0;
+    static _Atomic uint64_t cachedRootDevice = 0;
     uint64_t rootInode = atomic_load_explicit(&cachedRootInode,
+                                               memory_order_acquire);
+    uint64_t rootDevice = atomic_load_explicit(&cachedRootDevice,
                                                memory_order_acquire);
     if (rootInode == 0) {
         struct stat st = {0};
         if (stat("/", &st) != 0 || st.st_ino == 0) return false;
         rootInode = (uint64_t)st.st_ino;
+        rootDevice = (uint64_t)st.st_dev;
+        atomic_store_explicit(&cachedRootDevice, rootDevice,
+                              memory_order_release);
         atomic_store_explicit(&cachedRootInode, rootInode,
                               memory_order_release);
     }
 
     static const char prefix[] = "file:///.file/id=";
-    if (strncmp(text, prefix, sizeof(prefix) - 1) != 0) return false;
+    if (strncmp(text, prefix, sizeof(prefix) - 1) != 0) {
+        // LaunchServices persists the macOS volume under its kernel-visible
+        // mount name (`/rootfs` on this device). postinst provides only that
+        // exact symlink to `/`; following it and comparing vnode identity lets
+        // FSNode preserve the logical-volume invariant without blessing any
+        // unrelated path string.
+        UInt8 path[PATH_MAX];
+        struct stat st = {0};
+        return CFURLGetFileSystemRepresentation(url, true,
+                                                 path, sizeof(path)) &&
+            stat((const char *)path, &st) == 0 &&
+            (uint64_t)st.st_dev == rootDevice &&
+            (uint64_t)st.st_ino == rootInode;
+    }
     char *dot = strrchr(text, '.');
     if (!dot || dot[1] == '\0') return false;
     char *end = NULL;
@@ -8702,6 +8727,88 @@ static bool macws_cfurl_is_process_root(CFURLRef url) {
     unsigned long long inode = strtoull(dot + 1, &end, 10);
     return errno == 0 && inode == rootInode && end &&
         strcmp(end, "/") == 0;
+}
+
+// LaunchServices does not reach the exported
+// _CFURLCopyResourcePropertyValuesAndFlags interpose above when it classifies
+// an FSNode.  Runtime LLDB against macOS 13.4 LaunchServices on 2026-08-02
+// confirmed this exact private implementation:
+//
+//   -[FSNode isVolume] 0x19e38637c
+//     isDirectory
+//     _FSNodeCopyResourceProperty(NSURLIsVolumeKey, flag 1 << 3)
+//     isMountTrigger                         (fallback)
+//
+// For the chroot's logical root the actual object printed as
+// `<FSNode ...> { isDir = y, path = '/' }`, while NSURLIsVolumeKey was false
+// and isMountTrigger was false.  _LSIsNodeTranslocatedMountPoint therefore
+// created NSOSStatusErrorDomain/-50 at its source line 117, before lsd saw a
+// registration request.  The same runtime probe enumerated FSNode's exact
+// `URL` (`@16@0:8`) and `isVolume` (`B16@0:8`) methods.
+//
+// Preserve every native positive result.  Only restore the missing logical
+// chroot-root invariant, using the same exact URL/inode predicate as the
+// lower-level CFURL repair.  This is intentionally not a registration/check
+// bypass: non-root nodes and every native error remain untouched.
+static BOOL (*macws_FSNode_isVolume_original)(id, SEL) = NULL;
+
+static BOOL macws_FSNode_isVolume(id self, SEL selector) {
+    BOOL native = macws_FSNode_isVolume_original
+        ? macws_FSNode_isVolume_original(self, selector) : NO;
+    if (native || !self) return native;
+
+    SEL urlSelector = sel_registerName("URL");
+    Method urlMethod = class_getInstanceMethod(object_getClass(self),
+                                                urlSelector);
+    if (!urlMethod || strcmp(method_getTypeEncoding(urlMethod), "@16@0:8") != 0) {
+        return native;
+    }
+    CFURLRef url = ((CFURLRef (*)(id, SEL))objc_msgSend)(self, urlSelector);
+    if (!macws_cfurl_is_process_root(url)) return native;
+
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS_CHROOT_ROOT marked exact FSNode root as volume\n");
+    }
+    return YES;
+}
+
+static void macws_install_fsnode_root_volume_repair(void) {
+    static _Atomic int installed = 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &installed, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        return;
+    }
+
+    Class fsNode = objc_getClass("FSNode");
+    SEL selector = sel_registerName("isVolume");
+    Method method = fsNode ? class_getInstanceMethod(fsNode, selector) : NULL;
+    const char *types = method ? method_getTypeEncoding(method) : NULL;
+    if (!method || !types || strcmp(types, "B16@0:8") != 0) {
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### MACWS_CHROOT_ROOT FSNode hook skipped class=%p "
+                    "method=%p types=%s\n",
+                    fsNode, method, types ?: "(null)");
+        }
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+
+    IMP original = method_getImplementation(method);
+    if (!original || original == (IMP)macws_FSNode_isVolume) {
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+    macws_FSNode_isVolume_original = (BOOL (*)(id, SEL))original;
+    method_setImplementation(method, (IMP)macws_FSNode_isVolume);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS_CHROOT_ROOT installed FSNode isVolume repair "
+                "class=%p original=%p\n", fsNode, original);
+    }
 }
 
 static Boolean macws_CFURLCopyResourcePropertyValuesAndFlags(

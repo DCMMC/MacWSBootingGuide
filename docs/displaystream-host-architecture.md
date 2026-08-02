@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-02；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择以及 Ventura 原生 `NSOpenPanel` 已在目标 iPad 运行确认。完整桌面已实现为 Retina 底层 IOSurface + 可见 SkyLight 窗口分层直传。当前 Scene 的沉浸式全屏和新 Scene 初始尺寸已接入目标 SpringBoard 的真实工作区布局事务；v6 产物已部署，但为避免无人值守设备丢失越狱状态，本轮没有重启 SpringBoard，运行结果继续作为明确门槛。四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-02；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。四窗与完整性能门槛、IconServices 图标恢复仍单列为未完成。
 
 ## 一、方案总览
 
@@ -16,14 +16,14 @@
 
 | 核心工作 | 非常简要的工作原理 | 当前状态 |
 |---|---|---|
-| DisplayStream 直传 | SkyLight 窗口流产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture；完整桌面按真实窗口目录分层合成 | 精确基础窗和同 owner 瞬态层已在 iPad runtime-confirmed；完整桌面 producer/consumer 已实现并通过编译，设备回归待完成 |
-| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放；新 macOS 顶层窗口稳定后自动请求一个新 Scene；工作区复用当前 Scene 并调用 SpringBoard 自己的全屏 action 11 | 新窗口目录 1→2 后自动创建 Scene 已 runtime-confirmed；精确 FBS Scene 全屏请求已实现和部署，待 v6 自然装载后验证沉浸结果 |
+| DisplayStream 直传 | SkyLight 窗口流产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture；完整桌面按真实窗口目录分层合成 | 精确基础窗、同 owner 瞬态层和 2388×1668 完整 Aqua 桌面均已在 iPad runtime-confirmed |
+| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放；新 macOS 顶层窗口稳定后自动请求一个新 Scene；工作区复用当前 Scene 并调用 SpringBoard 自己的全屏 action 17 | 新窗口目录 1→2 后自动创建 Scene、精确 FBS Scene 系统全屏、iOS 状态栏隐藏与 Home Indicator 自动隐藏均已 runtime-confirmed |
 | 台前调度密集尺寸与初始大小 | SpringBoard `Chamois` 保存可选宽高数组；参考 TrollPad 增加候选档位。新 Scene 再以真实 macOS frame 为建议尺寸，走 `SBMutableSwitcherTransitionRequest → SBMainWorkspace` | 密集网格已 runtime-confirmed；精确 Scene 初始尺寸事务为 RE-confirmed、已实现和部署，待 v6 自然装载后验证小面板尺寸 |
 | 比例稳定显示 | 1× 始终完整等比；重排交接期允许短暂边距，不拉伸、不裁边 | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
 | 缩放与精确操控 | 双指双击在 1× 与用户配置的 1.5×/2× 间切换；放大后默认移动视口，输入坐标同步映射到裁剪后的源纹理 | 已实现并有数学单测；原生 magnify 待验证 |
-| 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标 | 原生协议语义矩阵、60 Hz 拖动、Carbon 右键菜单点击和滚动压力已在 iPad 通过；真实 UI 手感继续回归 |
+| 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标；全桌面按真实 CGWindow 前后顺序逐点选择 owner | 原生协议语义矩阵、60 Hz 拖动、Carbon 右键菜单、Dock/Launchpad 和 ControlCenter 点击、滚动压力已在 iPad 通过；真实手指主观手感继续回归 |
 | 全屏桌面手势 | 全屏工作区的屏幕虚拟触控板识别三指方向手势，发送一次性 macOS 桌面命令；外接妙控板保留 iPadOS 系统三指手势 | 规划；桌面命令路径与设备输入边界待验证 |
 | Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 精确 PID/window、generation 快照和动作桥已实现；macOS 外观、hover/键盘导航与复杂菜单仍待完善 |
 | 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
@@ -85,14 +85,16 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 
 1. Host 把**当前** Scene 从单窗流切换为完整桌面流并保留同一 session。
 2. Host 用 `-[UIScene _sceneIdentifier]` 取得精确 FBS ID，写入 15 秒内有效的一次性请求。
-3. SpringBoard 只在 `activeDisplayWindowScene.sceneIdentifier` 与请求完全相等时，调用系统 `canPerformKeyboardShortcutAction:0x0b` / `performKeyboardShortcutAction:0x0b`。焦点若已变化就拒绝，绝不放大别的应用。
+3. SpringBoard 从 switcher content controller 取得真实 keyboard-focused app layout，验证其中包含请求的 bundle 与精确 FBS Scene ID，然后调用系统 `performKeyboardShortcutAction:0x11`。焦点若已变化就有界重试后拒绝，绝不放大别的应用。
 4. SpringBoard 自己完成 Chamois/app-layout 转换与动画；Host 同时在桌面流模式返回 `prefersStatusBarHidden=YES`、`prefersHomeIndicatorAutoHidden=YES` 并延迟四边系统手势，形成视频/游戏式沉浸显示。
 5. 1.5 秒后以真实 `UIWindowScene.isFullScreen` 和 Scene/screen bounds 作为结果证据。通知送达或进程存活本身不算成功。
 6. 全屏是可逆的 Scene presentation state。进入前保存精确 window/PID/logical group、AppKit 尺寸约束、Scene 尺寸和标题；同一按钮第二次触发时恢复同一窗口流并通过真实 app-layout resize transaction 请求原 Scene 尺寸。返回点写入 `NSUserActivity`，进程被 UIKit 回收后也不能变成单向切换；全屏 Scene 被关闭时仍按返回身份关闭对应 AppKit 窗口。
 
 全屏只显示完整桌面流中的 macOS 原生菜单栏；Host 的单窗语义菜单栏高度收敛为 0。控制中心入口是独立的右上角半透明材质按钮，不依赖语义菜单栏；展开面板使用跟随 macOS 浅/深主题的实色 `systemBackgroundColor`，避免固定 dark blur 与动态标签/填充混色。
 
-RE-confirmed via 20D67 SpringBoard `-[SpringBoard _handleMakeFullscreenKeyShortcut:]` `0x1c7669964`：系统自己的“窗口全屏”快捷键就是上述 action 11 路径。本轮 v6 tweak 与 Host 已部署，但现存 SpringBoard 仍报告 v3 witness；遵守“不主动重启/respring”约束，必须等下次自然装载后才能标为 runtime-confirmed。
+RE-confirmed via 20D67 SpringBoard `-[SpringBoard _handleEnterFullScreenKeyShortcut:]` `0x1c7669808`：系统从 active display window scene 取得 switcher controller，并执行 action `0x11`（十进制 17）。runtime-confirmed via `MacWSWindowing.log`：目标 Scene 首次尝试即 `exact-focus=YES`、`action=YES`，随后记录 `fullscreen-performed ... action=17`。Host 冷恢复又在 0/250/1250 ms 三次记录 `status-hidden=YES`、`home-indicator-auto-hide=YES`、`deferred-edges=15` 以及 Scene/screen bounds 均为 1389×970；像素截图未出现 iOS 状态栏或 Home Indicator。
+
+全屏桌面输入不绑定一个永久 owner。指针、触摸与滚动以 `targetPID=0` 进入 `macwsinputd`，由 `CGWindowListCopyWindowInfo` 的真实前后顺序逐点选择第一个包含该点的非 WindowServer、非负层窗口。这样普通应用窗口、AppKit 弹出层、Dock/Launchpad 以及 SystemUIServer/ControlCenter 状态项走同一中央算法。runtime-confirmed：Launchpad 点击命中 `owner=Dock layer=27 window=25` 并改变文件夹展开状态；右上角点击打开了真实 macOS Control Center。完整证据见 [`fullscreen-aqua-workspace-20260802.md`](fullscreen-aqua-workspace-20260802.md)。
 
 #### 台前调度尺寸档位突破
 

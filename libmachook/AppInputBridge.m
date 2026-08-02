@@ -73,7 +73,14 @@ typedef void (*MacWSSetCGEventIntegerField)(MacWSCGEventRef, uint32_t,
                                             int64_t);
 typedef void (*MacWSSetCGEventDoubleField)(MacWSCGEventRef, uint32_t, double);
 typedef void (*MacWSPostCGEvent)(uint32_t, MacWSCGEventRef);
-typedef int32_t (*MacWSPostLegacyMouseEvent)(CGPoint, bool, uint32_t, ...);
+// CGRemoteOperation.h declares mouseButtonDown as a fixed boolean_t argument;
+// only buttons 2+ are variadic.  This distinction is load-bearing on arm64:
+// Darwin passes that fixed argument in w2 while the variadic button states
+// begin in the stack argument area.  Declaring every button as variadic left
+// w2 unrelated to the requested state and turned Host primary clicks into
+// secondary events while leaving the real primary state stuck down.
+typedef int32_t (*MacWSPostLegacyMouseEvent)(CGPoint, int32_t, uint32_t,
+                                             int32_t, ...);
 typedef id (*MacWSEventFromCGEvent)(id, SEL, MacWSCGEventRef);
 typedef const void *(*MacWSEventRef)(id, SEL);
 typedef void (*MacWSPostEvent)(id, SEL, id, BOOL);
@@ -2138,8 +2145,12 @@ static BOOL MacWSPostLegacySystemPointerEvent(
     int32_t firstResult = 0;
     int32_t secondResult = 0;
     if (atomicTap) {
+        // CoreGraphics button order is primary/left (the fixed argument),
+        // secondary/right (first variadic argument), then centre.  Keep the
+        // full three-button state explicit so the release is also a recovery
+        // boundary for a gesture interrupted by Scene suspension.
         firstResult = postMouse(quartzPoint, true, 3,
-            secondary ? false : true, false, secondary ? true : false);
+            secondary ? false : true, secondary ? true : false, false);
         // Preserve a visibly distinct ordered transition without the former
         // AppInput queue round trip. Eight milliseconds is one 120-Hz input
         // interval and stays below a 60-Hz presentation frame.
@@ -2148,7 +2159,7 @@ static BOOL MacWSPostLegacySystemPointerEvent(
             false, false, false);
     } else {
         firstResult = postMouse(quartzPoint, true, 3,
-            leftDown, false, rightDown);
+            leftDown, rightDown, false);
     }
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,

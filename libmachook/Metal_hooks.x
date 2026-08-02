@@ -8769,6 +8769,614 @@ static void macws_install_data_library_compatibility(Class agx) {
     }
 }
 
+// Ventura QuartzCore's desktop-window-effects pipeline specializes these two
+// exact fixed-function shaders successfully, then the iOS AGX driver rejects
+// the resulting macOS-target AIR at pipeline creation with
+// "Target OS is incompatible".  The package generates a byte-validated
+// secondary library from the device's own Ventura default.metallib: only these
+// two AIR modules receive a macabi target triple; all other module bytes and
+// every public function signature remain unchanged.
+//
+// Do not replace QuartzCore's default library.  A mixed-target MTLB used as the
+// process-wide default makes unrelated early CoreAnimation pipelines fail.
+// Instead, forward the original function name and the caller's real constant
+// values to the secondary library at the specialization boundary.  This keeps
+// the shader semantics and descriptor contract intact; no compiler or pipeline
+// validation result is bypassed.
+typedef id (*macws_library_specialize_fn)(
+    id, SEL, NSString *, MTLFunctionConstantValues *, NSError **)
+    __attribute__((ns_returns_retained));
+typedef id (*macws_library_function_fn)(id, SEL, NSString *)
+    __attribute__((ns_returns_retained));
+typedef id (*macws_library_specialize_cache_fn)(
+    id, SEL, NSString *, MTLFunctionConstantValues *, id, NSError **)
+    __attribute__((ns_returns_retained));
+typedef id (*macws_library_specialize_named_fn)(
+    id, SEL, NSString *, MTLFunctionConstantValues *, id, NSString *,
+    NSError **) __attribute__((ns_returns_retained));
+static macws_library_specialize_fn g_macws_qc_specialize_basic_orig = NULL;
+static macws_library_function_fn g_macws_skylight_function_orig = NULL;
+static macws_library_specialize_cache_fn
+    g_macws_qc_specialize_cache_orig = NULL;
+static macws_library_specialize_cache_fn
+    g_macws_qc_specialize_pipeline_orig = NULL;
+static macws_library_specialize_named_fn
+    g_macws_qc_specialize_named_orig = NULL;
+static id<MTLLibrary> g_macws_qc_desktop_library = nil;
+static id<MTLLibrary> g_macws_skylight_desktop_library = nil;
+static id<MTLLibrary> g_macws_mpsimage_desktop_library = nil;
+typedef id (*macws_function_specialize_fn)(
+    id, SEL, id, id, id, NSError **) __attribute__((ns_returns_retained));
+static macws_function_specialize_fn
+    g_macws_desktop_function_specialize_orig = NULL;
+typedef void (*macws_function_specialize_async_fn)(
+    id, SEL, id, id, id, BOOL, id);
+static macws_function_specialize_async_fn
+    g_macws_desktop_function_specialize_async_orig = NULL;
+static const char *kMacWSQCDesktopLibraryPath =
+    "/usr/local/share/macws/quartzcore/"
+    "default-desktop-effects-macabi.metallib";
+static const size_t kMacWSQCDesktopLibraryBytes = 1044688;
+static const uint64_t kMacWSQCDesktopLibraryHash =
+    UINT64_C(0xa1f2f4bab5c812cd);
+static const char *kMacWSSkyLightDesktopLibraryPath =
+    "/usr/local/share/macws/skylight/"
+    "SkyLightShaders-desktop-effects-macabi.metallib";
+static const size_t kMacWSSkyLightDesktopLibraryBytes = 706944;
+static const uint64_t kMacWSSkyLightDesktopLibraryHash =
+    UINT64_C(0x836ee78122915ae7);
+static const char *kMacWSMPSImageDesktopLibraryPath =
+    "/usr/local/share/macws/mpsimage/"
+    "default-desktop-effects-macabi.metallib";
+static const size_t kMacWSMPSImageDesktopLibraryBytes = 16449764;
+static const uint64_t kMacWSMPSImageDesktopLibraryHash =
+    UINT64_C(0x117d8d75f7cff1f4);
+
+static BOOL macws_qc_desktop_function_name(NSString *name) {
+    return [name isEqualToString:@"fixed_vert_lph_spc"] ||
+           [name isEqualToString:@"fixed_vert_lph_gen"] ||
+           [name isEqualToString:@"fixed_frag_lph_cpf"];
+}
+
+static BOOL macws_skylight_desktop_function_name(NSString *name) {
+    return [name isEqualToString:@"SimpleVertex"] ||
+           [name isEqualToString:@"SimpleTextureFragment"];
+}
+
+static BOOL macws_mpsimage_desktop_function_name(NSString *name) {
+    return [name isEqualToString:@"sum_rgba_columns"] ||
+           [name isEqualToString:@"sum_rgba_rows"];
+}
+
+static id<MTLLibrary> macws_qc_desktop_library(id<MTLDevice> device) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:kMacWSQCDesktopLibraryPath]
+                                               options:NSDataReadingMappedIfSafe
+                                                 error:nil];
+        if (data.length != kMacWSQCDesktopLibraryBytes ||
+            macws_source_fnv1a64(data.bytes, data.length) !=
+                kMacWSQCDesktopLibraryHash) {
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### QC-DESKTOP-TARGET invalid-library path=%s "
+                    "bytes=%lu\n",
+                    kMacWSQCDesktopLibraryPath,
+                    (unsigned long)data.length);
+            }
+            return;
+        }
+        NSError *error = nil;
+        NSURL *url = [NSURL fileURLWithPath:
+            [NSString stringWithUTF8String:kMacWSQCDesktopLibraryPath]];
+        g_macws_qc_desktop_library = [device newLibraryWithURL:url
+                                                         error:&error];
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### QC-DESKTOP-TARGET library=%p class=%s error=%s\n",
+                (void *)g_macws_qc_desktop_library,
+                g_macws_qc_desktop_library
+                    ? class_getName([g_macws_qc_desktop_library class])
+                    : "(nil)",
+                error ? error.localizedDescription.UTF8String : "(nil)");
+        }
+    });
+    return g_macws_qc_desktop_library;
+}
+
+static id<MTLLibrary> macws_skylight_desktop_library(
+        id<MTLDevice> device) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:kMacWSSkyLightDesktopLibraryPath]
+                                               options:NSDataReadingMappedIfSafe
+                                                 error:nil];
+        if (data.length != kMacWSSkyLightDesktopLibraryBytes ||
+            macws_source_fnv1a64(data.bytes, data.length) !=
+                kMacWSSkyLightDesktopLibraryHash) {
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET invalid-library path=%s "
+                    "bytes=%lu\n",
+                    kMacWSSkyLightDesktopLibraryPath,
+                    (unsigned long)data.length);
+            }
+            return;
+        }
+        NSError *error = nil;
+        NSURL *url = [NSURL fileURLWithPath:
+            [NSString stringWithUTF8String:kMacWSSkyLightDesktopLibraryPath]];
+        g_macws_skylight_desktop_library =
+            [device newLibraryWithURL:url error:&error];
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-METAL-TARGET library=%p path=%s error=%s\n",
+                (void *)g_macws_skylight_desktop_library,
+                kMacWSSkyLightDesktopLibraryPath,
+                error ? error.localizedDescription.UTF8String : "(nil)");
+        }
+    });
+    return g_macws_skylight_desktop_library;
+}
+
+static id<MTLLibrary> macws_mpsimage_desktop_library(
+        id<MTLDevice> device) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:kMacWSMPSImageDesktopLibraryPath]
+                                               options:NSDataReadingMappedIfSafe
+                                                 error:nil];
+        if (data.length != kMacWSMPSImageDesktopLibraryBytes ||
+            macws_source_fnv1a64(data.bytes, data.length) !=
+                kMacWSMPSImageDesktopLibraryHash) {
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET invalid-library path=%s "
+                    "bytes=%lu\n", kMacWSMPSImageDesktopLibraryPath,
+                    (unsigned long)data.length);
+            }
+            return;
+        }
+        NSError *error = nil;
+        NSURL *url = [NSURL fileURLWithPath:
+            [NSString stringWithUTF8String:kMacWSMPSImageDesktopLibraryPath]];
+        g_macws_mpsimage_desktop_library =
+            [device newLibraryWithURL:url error:&error];
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-METAL-TARGET library=%p path=%s error=%s\n",
+                (void *)g_macws_mpsimage_desktop_library,
+                kMacWSMPSImageDesktopLibraryPath,
+                error ? error.localizedDescription.UTF8String : "(nil)");
+        }
+    });
+    return g_macws_mpsimage_desktop_library;
+}
+
+static id<MTLLibrary> macws_qc_desktop_library_for_request(
+        id self, NSString *name) {
+    if (!getenv("MACWS_AGX_NATIVE")) return nil;
+    BOOL quartzcore_function = macws_qc_desktop_function_name(name);
+    BOOL skylight_function = macws_skylight_desktop_function_name(name);
+    BOOL mpsimage_function = macws_mpsimage_desktop_function_name(name);
+    if ((!quartzcore_function && !skylight_function && !mpsimage_function) ||
+        self == g_macws_qc_desktop_library ||
+        self == g_macws_skylight_desktop_library ||
+        self == g_macws_mpsimage_desktop_library) return nil;
+    id<MTLDevice> device = nil;
+    @try { device = [(id<MTLLibrary>)self device]; }
+    @catch (NSException *exception) { (void)exception; }
+    if (!device) return nil;
+    if (quartzcore_function) return macws_qc_desktop_library(device);
+    if (skylight_function) return macws_skylight_desktop_library(device);
+    return macws_mpsimage_desktop_library(device);
+}
+
+static id macws_skylight_function_compat(
+        id self, SEL selector, NSString *name)
+    __attribute__((ns_returns_retained));
+static id macws_skylight_function_compat(
+        id self, SEL selector, NSString *name) {
+    // Runtime-confirmed by metal_source_probe against the exact Ventura
+    // SkyLightShaders library: both Simple* functions report
+    // needsFunctionConstantValues=NO and an empty constants dictionary. They
+    // therefore never enter _MTLFunctionInternal's specialization methods;
+    // adapt only their base-function creation. MPSImage's runtime-confirmed
+    // sum_rgba_columns and sum_rgba_rows functions have the same
+    // zero-constant contract.
+    // QuartzCore's fixed_* functions are intentionally excluded because all
+    // three require specialization.
+    BOOL base_function_target =
+        macws_skylight_desktop_function_name(name) ||
+        macws_mpsimage_desktop_function_name(name);
+    id<MTLLibrary> library = base_function_target
+        ? macws_qc_desktop_library_for_request(self, name) : nil;
+    if (library && g_macws_skylight_function_orig) {
+        id function = g_macws_skylight_function_orig(
+            library, selector, name);
+        if (function) {
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET base-function selector=%s "
+                    "name=%s function=%p\n",
+                    sel_getName(selector), name.UTF8String,
+                    (void *)function);
+            }
+            return function;
+        }
+    }
+    return g_macws_skylight_function_orig
+        ? g_macws_skylight_function_orig(self, selector, name) : nil;
+}
+
+static id macws_qc_specialization_result(
+        id function, NSString *name, SEL selector,
+        MTLFunctionConstantValues *constant_values, NSError **error,
+        NSError *compatibility_error) {
+    if (function) {
+        if (error) *error = nil;
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### QC-DESKTOP-TARGET specialized selector=%s name=%s "
+                "function=%p constantValues=%p\n",
+                sel_getName(selector), name.UTF8String, (void *)function,
+                (void *)constant_values);
+        }
+        return function;
+    }
+    if (macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### QC-DESKTOP-TARGET specialization-failed selector=%s "
+            "name=%s error=%s; preserving original library path\n",
+            sel_getName(selector), name.UTF8String,
+            compatibility_error
+                ? compatibility_error.localizedDescription.UTF8String
+                : "(nil)");
+    }
+    return nil;
+}
+
+static id macws_desktop_specialized_function_compat(
+        id self, SEL selector, id descriptor, id destination_archive,
+        id function_cache, NSError **error)
+    __attribute__((ns_returns_retained));
+static id macws_desktop_specialized_function_compat(
+        id self, SEL selector, id descriptor, id destination_archive,
+        id function_cache, NSError **error) {
+    NSString *name = nil;
+    id<MTLDevice> device = nil;
+    @try {
+        name = [(id<MTLFunction>)self name];
+        device = [(id<MTLFunction>)self device];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+
+    BOOL quartzcore_function = macws_qc_desktop_function_name(name);
+    BOOL skylight_function = macws_skylight_desktop_function_name(name);
+    if (getenv("MACWS_AGX_NATIVE") && device &&
+        (quartzcore_function || skylight_function) &&
+        g_macws_desktop_function_specialize_orig) {
+        id<MTLLibrary> library = quartzcore_function
+            ? macws_qc_desktop_library(device)
+            : macws_skylight_desktop_library(device);
+        id base_function = library
+            ? [library newFunctionWithName:name] : nil;
+        if (base_function && base_function != self) {
+            NSError *compatibility_error = nil;
+            id specialized = g_macws_desktop_function_specialize_orig(
+                base_function, selector, descriptor, destination_archive,
+                function_cache, &compatibility_error);
+            if (specialized) {
+                if (error) *error = nil;
+                if (macws_runtime_diagnostics_enabled()) {
+                    dprintf(STDERR_FILENO,
+                        "#### MACWS-METAL-TARGET specialized-internal "
+                        "selector=%s name=%s descriptor=%p archive=%p "
+                        "cache=%p function=%p\n",
+                        sel_getName(selector), name.UTF8String,
+                        (void *)descriptor, (void *)destination_archive,
+                        (void *)function_cache, (void *)specialized);
+                }
+                return specialized;
+            }
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET specialization-internal-failed "
+                    "selector=%s name=%s descriptor=%p error=%s; "
+                    "preserving original function path\n",
+                    sel_getName(selector), name.UTF8String,
+                    (void *)descriptor,
+                    compatibility_error
+                        ? compatibility_error.localizedDescription.UTF8String
+                        : "(nil)");
+            }
+        }
+    }
+    return g_macws_desktop_function_specialize_orig
+        ? g_macws_desktop_function_specialize_orig(
+              self, selector, descriptor, destination_archive,
+              function_cache, error)
+        : nil;
+}
+
+static void macws_desktop_specialized_function_async_compat(
+        id self, SEL selector, id descriptor, id destination_archive,
+        id function_cache, BOOL synchronous, id completion_handler) {
+    NSString *name = nil;
+    id<MTLDevice> device = nil;
+    @try {
+        name = [(id<MTLFunction>)self name];
+        device = [(id<MTLFunction>)self device];
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+
+    BOOL quartzcore_function = macws_qc_desktop_function_name(name);
+    BOOL skylight_function = macws_skylight_desktop_function_name(name);
+    if (getenv("MACWS_AGX_NATIVE") && device &&
+        (quartzcore_function || skylight_function) &&
+        g_macws_desktop_function_specialize_async_orig) {
+        id<MTLLibrary> library = quartzcore_function
+            ? macws_qc_desktop_library(device)
+            : macws_skylight_desktop_library(device);
+        id base_function = library
+            ? [library newFunctionWithName:name] : nil;
+        if (base_function && base_function != self) {
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET specialize-internal-async "
+                    "selector=%s name=%s descriptor=%p archive=%p "
+                    "cache=%p sync=%d completion=%p\n",
+                    sel_getName(selector), name.UTF8String,
+                    (void *)descriptor, (void *)destination_archive,
+                    (void *)function_cache, synchronous,
+                    (void *)completion_handler);
+            }
+            g_macws_desktop_function_specialize_async_orig(
+                base_function, selector, descriptor, destination_archive,
+                function_cache, synchronous, completion_handler);
+            return;
+        }
+    }
+    if (g_macws_desktop_function_specialize_async_orig) {
+        g_macws_desktop_function_specialize_async_orig(
+            self, selector, descriptor, destination_archive,
+            function_cache, synchronous, completion_handler);
+    }
+}
+
+static id macws_qc_specialize_basic_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, NSError **error)
+    __attribute__((ns_returns_retained));
+static id macws_qc_specialize_basic_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, NSError **error) {
+    id<MTLLibrary> library =
+        macws_qc_desktop_library_for_request(self, name);
+    if (library && g_macws_qc_specialize_basic_orig) {
+        NSError *compatibility_error = nil;
+        id function = g_macws_qc_specialize_basic_orig(
+            library, selector, name, constant_values, &compatibility_error);
+        function = macws_qc_specialization_result(
+            function, name, selector, constant_values, error,
+            compatibility_error);
+        if (function) return function;
+    }
+    return g_macws_qc_specialize_basic_orig
+        ? g_macws_qc_specialize_basic_orig(
+              self, selector, name, constant_values, error) : nil;
+}
+
+static id macws_qc_specialize_cache_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, id function_cache,
+        NSError **error) __attribute__((ns_returns_retained));
+static id macws_qc_specialize_cache_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, id function_cache,
+        NSError **error) {
+    id<MTLLibrary> library =
+        macws_qc_desktop_library_for_request(self, name);
+    if (library && g_macws_qc_specialize_cache_orig) {
+        NSError *compatibility_error = nil;
+        id function = g_macws_qc_specialize_cache_orig(
+            library, selector, name, constant_values, function_cache,
+            &compatibility_error);
+        function = macws_qc_specialization_result(
+            function, name, selector, constant_values, error,
+            compatibility_error);
+        if (function) return function;
+    }
+    return g_macws_qc_specialize_cache_orig
+        ? g_macws_qc_specialize_cache_orig(
+              self, selector, name, constant_values, function_cache, error)
+        : nil;
+}
+
+static id macws_qc_specialize_pipeline_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, id pipeline_library,
+        NSError **error) __attribute__((ns_returns_retained));
+static id macws_qc_specialize_pipeline_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, id pipeline_library,
+        NSError **error) {
+    id<MTLLibrary> library =
+        macws_qc_desktop_library_for_request(self, name);
+    if (library && g_macws_qc_specialize_pipeline_orig) {
+        NSError *compatibility_error = nil;
+        id function = g_macws_qc_specialize_pipeline_orig(
+            library, selector, name, constant_values, pipeline_library,
+            &compatibility_error);
+        function = macws_qc_specialization_result(
+            function, name, selector, constant_values, error,
+            compatibility_error);
+        if (function) return function;
+    }
+    return g_macws_qc_specialize_pipeline_orig
+        ? g_macws_qc_specialize_pipeline_orig(
+              self, selector, name, constant_values, pipeline_library, error)
+        : nil;
+}
+
+static id macws_qc_specialize_named_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, id function_cache,
+        NSString *specialized_name, NSError **error)
+    __attribute__((ns_returns_retained));
+static id macws_qc_specialize_named_compat(
+        id self, SEL selector, NSString *name,
+        MTLFunctionConstantValues *constant_values, id function_cache,
+        NSString *specialized_name, NSError **error) {
+    id<MTLLibrary> library =
+        macws_qc_desktop_library_for_request(self, name);
+    if (library && g_macws_qc_specialize_named_orig) {
+        NSError *compatibility_error = nil;
+        id function = g_macws_qc_specialize_named_orig(
+            library, selector, name, constant_values, function_cache,
+            specialized_name, &compatibility_error);
+        function = macws_qc_specialization_result(
+            function, name, selector, constant_values, error,
+            compatibility_error);
+        if (function) return function;
+    }
+    return g_macws_qc_specialize_named_orig
+        ? g_macws_qc_specialize_named_orig(
+              self, selector, name, constant_values, function_cache,
+              specialized_name, error)
+        : nil;
+}
+
+static void macws_install_qc_desktop_function_compatibility(void) {
+    if (!getenv("MACWS_AGX_NATIVE")) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "WindowServer") != 0) return;
+    Class library_class = objc_getClass("_MTLLibrary");
+    if (!library_class) return;
+    struct {
+        const char *selector_name;
+        IMP replacement;
+        IMP *original;
+    } entries[] = {
+        { "newFunctionWithName:",
+          (IMP)macws_skylight_function_compat,
+          (IMP *)&g_macws_skylight_function_orig },
+        { "newFunctionWithName:constantValues:error:",
+          (IMP)macws_qc_specialize_basic_compat,
+          (IMP *)&g_macws_qc_specialize_basic_orig },
+        { "newFunctionWithName:constantValues:functionCache:error:",
+          (IMP)macws_qc_specialize_cache_compat,
+          (IMP *)&g_macws_qc_specialize_cache_orig },
+        { "newFunctionWithName:constantValues:pipelineLibrary:error:",
+          (IMP)macws_qc_specialize_pipeline_compat,
+          (IMP *)&g_macws_qc_specialize_pipeline_orig },
+        { "newFunctionWithName:constantValues:functionCache:"
+          "specializedName:error:",
+          (IMP)macws_qc_specialize_named_compat,
+          (IMP *)&g_macws_qc_specialize_named_orig },
+    };
+    for (size_t index = 0;
+         index < sizeof(entries) / sizeof(entries[0]); index++) {
+        SEL selector = sel_registerName(entries[index].selector_name);
+        Method method = class_getInstanceMethod(library_class, selector);
+        if (!method) {
+            if (macws_runtime_diagnostics_enabled())
+                dprintf(STDERR_FILENO,
+                    "#### QC-DESKTOP-TARGET missing selector=%s\n",
+                    entries[index].selector_name);
+            continue;
+        }
+        IMP current = method_getImplementation(method);
+        if (current == entries[index].replacement) continue;
+        *entries[index].original = current;
+        const char *types = method_getTypeEncoding(method);
+        if (!class_addMethod(library_class, selector,
+                             entries[index].replacement, types)) {
+            Method own_method =
+                class_getInstanceMethod(library_class, selector);
+            method_setImplementation(own_method,
+                                     entries[index].replacement);
+        }
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### QC-DESKTOP-TARGET installed class=%s selector=%s "
+                "original=%p\n",
+                class_getName(library_class), entries[index].selector_name,
+                (void *)current);
+        }
+    }
+
+    Class function_class = objc_getClass("_MTLFunctionInternal");
+    SEL function_selector = sel_registerName(
+        "newSpecializedFunctionWithDescriptor:destinationArchive:"
+        "functionCache:error:");
+    Method function_method = function_class
+        ? class_getInstanceMethod(function_class, function_selector) : NULL;
+    if (function_method) {
+        IMP replacement =
+            (IMP)macws_desktop_specialized_function_compat;
+        IMP current = method_getImplementation(function_method);
+        if (current != replacement) {
+            g_macws_desktop_function_specialize_orig =
+                (macws_function_specialize_fn)current;
+            const char *types = method_getTypeEncoding(function_method);
+            if (!class_addMethod(function_class, function_selector,
+                                 replacement, types)) {
+                method_setImplementation(function_method, replacement);
+            }
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET installed class=%s "
+                    "selector=%s original=%p types=%s\n",
+                    class_getName(function_class),
+                    sel_getName(function_selector), (void *)current, types);
+            }
+        }
+    } else if (macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### MACWS-METAL-TARGET missing class/selector class=%p "
+            "selector=%s\n", (void *)function_class,
+            sel_getName(function_selector));
+    }
+
+    SEL async_selector = sel_registerName(
+        "newSpecializedFunctionWithDescriptor:destinationArchive:"
+        "functionCache:sync:completionHandler:");
+    Method async_method = function_class
+        ? class_getInstanceMethod(function_class, async_selector) : NULL;
+    if (async_method) {
+        IMP replacement =
+            (IMP)macws_desktop_specialized_function_async_compat;
+        IMP current = method_getImplementation(async_method);
+        if (current != replacement) {
+            g_macws_desktop_function_specialize_async_orig =
+                (macws_function_specialize_async_fn)current;
+            const char *types = method_getTypeEncoding(async_method);
+            if (!class_addMethod(function_class, async_selector,
+                                 replacement, types)) {
+                method_setImplementation(async_method, replacement);
+            }
+            if (macws_runtime_diagnostics_enabled()) {
+                dprintf(STDERR_FILENO,
+                    "#### MACWS-METAL-TARGET installed class=%s "
+                    "selector=%s original=%p types=%s\n",
+                    class_getName(function_class),
+                    sel_getName(async_selector), (void *)current, types);
+            }
+        }
+    } else if (macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### MACWS-METAL-TARGET missing class/selector class=%p "
+            "selector=%s\n", (void *)function_class,
+            sel_getName(async_selector));
+    }
+}
+
 // macOS Metal's private -[MTLDevice newEvent] contract is still used by
 // Chromium 148's ANGLE Metal backend.  The exact VS Code 1.130 libGLESv2
 // binary calls -newEvent at arm64 __TEXT+0x2db888, retains the result, then
@@ -8857,6 +9465,7 @@ static void install_agx_init_redirect(Class agx) {
     macws_install_tile_descriptor_diagnostic();
     macws_install_source_library_diagnostic(agx);
     macws_install_data_library_compatibility(agx);
+    macws_install_qc_desktop_function_compatibility();
     macws_install_render_pipeline_diagnostic(agx);
     macws_install_new_event_compat(agx);
     // (no pipeline fallback — see removed block above)
@@ -9463,15 +10072,14 @@ static void install_agx_init_redirect(Class agx) {
 
 const char *metalSimService = "com.apple.metal.simulator";
 
-// macOS SystemStatus and iOS SystemStatus publish the same three bootstrap
-// names.  Runtime-confirmed on iPadOS 16.3 (2026-07-30): after unloading our
-// chroot com.apple.systemstatusd job, launchctl print user/501 still reported
-// all three original names active.  A direct launch with MACWS_XPC_DEBUG=1
-// also proved that both macOS server listeners (flags=0x1) and clients enter
-// this exact xpc_connection_create_mach_service hook.  Give the chroot graph a
-// private namespace on both sides rather than connecting macOS protocol
-// objects to iOS's endpoints.
-static const char *macws_systemstatus_service_name(const char *name) {
+// macOS and iOS publish several identically named bootstrap services with
+// different protocol/data contracts. Runtime-confirmed on iPadOS 16.3:
+// SystemStatus's three original names remain active in user/501, and
+// LaunchServices has the same collision: lsregister runtime-confirmed that a
+// chroot client opened iOS's container csstore, whose Bundle table was empty,
+// instead of a macOS database. Both chroot server listeners (flags=0x1) and
+// clients enter this hook, so isolate their names symmetrically.
+static const char *macws_private_chroot_service_name(const char *name) {
     if (!name) return name;
     if (!strcmp(name, "com.apple.systemstatus"))
         return "com.apple.macosbooter.systemstatus";
@@ -9479,6 +10087,34 @@ static const char *macws_systemstatus_service_name(const char *name) {
         return "com.apple.macosbooter.systemstatus.publisher";
     if (!strcmp(name, "com.apple.systemstatus.activityattribution"))
         return "com.apple.macosbooter.systemstatus.activityattribution";
+    if (!strcmp(name, "com.apple.coreservices.launchservicesd"))
+        return "com.apple.macosbooter.coreservices.launchservicesd";
+    if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
+        return "com.apple.macosbooter.lsd.advertisingidentifiers";
+    if (!strcmp(name, "com.apple.lsd.diagnostics"))
+        return "com.apple.macosbooter.lsd.diagnostics";
+    if (!strcmp(name, "com.apple.lsd.dissemination"))
+        return "com.apple.macosbooter.lsd.dissemination";
+    if (!strcmp(name, "com.apple.lsd.encryption"))
+        return "com.apple.macosbooter.lsd.encryption";
+    if (!strcmp(name, "com.apple.lsd.extensions"))
+        return "com.apple.macosbooter.lsd.extensions";
+    if (!strcmp(name, "com.apple.lsd.mapdb"))
+        return "com.apple.macosbooter.lsd.mapdb";
+    if (!strcmp(name, "com.apple.lsd.modifydb"))
+        return "com.apple.macosbooter.lsd.modifydb";
+    if (!strcmp(name, "com.apple.lsd.open"))
+        return "com.apple.macosbooter.lsd.open";
+    if (!strcmp(name, "com.apple.lsd.openurl"))
+        return "com.apple.macosbooter.lsd.openurl";
+    if (!strcmp(name, "com.apple.lsd.personaobserver"))
+        return "com.apple.macosbooter.lsd.personaobserver";
+    if (!strcmp(name, "com.apple.lsd.plugin"))
+        return "com.apple.macosbooter.lsd.plugin";
+    if (!strcmp(name, "com.apple.lsd.trustedsignatures"))
+        return "com.apple.macosbooter.lsd.trustedsignatures";
+    if (!strcmp(name, "com.apple.security.translocation"))
+        return "com.apple.macosbooter.security.translocation";
     return name;
 }
 
@@ -9486,7 +10122,7 @@ xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, d
 xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, dispatch_queue_t targetq, uint64_t flags) {
     flags &= ~XPC_CONNECTION_MACH_SERVICE_PRIVILEGED;
     const char *originalName = name;
-    name = macws_systemstatus_service_name(name);
+    name = macws_private_chroot_service_name(name);
     // Connection tracing is a diagnostic flight recorder.  Terminal used to
     // enable it implicitly, making an ordinary production shell write every
     // XPC lookup to stderr.  Keep the functional privileged-flag translation
@@ -9647,6 +10283,15 @@ __attribute__((constructor)) static void InitMetalHooks() {
     // already-loaded images, so it is race-free for Metal-linked clients.
     _dyld_register_func_for_add_image(
         macws_install_metal_library_boundary_diagnostics);
+
+    // QuartzCore and SkyLight specialize their base MTLFunction objects as
+    // soon as the first AGX device becomes available. Installing this adapter
+    // from install_agx_init_redirect() was therefore too late on a clean
+    // launch. Metal.framework is a load dependency of this image, so its
+    // concrete library/function classes are registered by the time this
+    // constructor runs. Keep the AGX-init call as an idempotent fallback for
+    // unusual dyld ordering, but wrap the specialization boundary first.
+    macws_install_qc_desktop_function_compatibility();
 
     // Install plugin-class hook unconditionally — it inspects MACWS_AGX_NATIVE
     // at first invocation and decides whether to return AGXG13GFamilyDevice or Nil.

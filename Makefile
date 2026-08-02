@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 # iOS subprojects
 SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwsthermal mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy FileCoordinationChrootProxy mtl_keepalive MacWSHost misc/PingMTLCompilerService
 # macOS subprojects
-SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd
+SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl
 
 include $(THEOS_MAKE_PATH)/aggregate.mk
 
@@ -27,3 +27,5 @@ after-stage::
 		misc/vscode-aquarium-runner/extension.js \
 		misc/vscode-aquarium-runner/README.md \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1/
+	@install -m 0644 misc/repack_metallib_macabi.py \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/repack_metallib_macabi.py

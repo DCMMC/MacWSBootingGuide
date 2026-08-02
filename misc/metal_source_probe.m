@@ -6,6 +6,7 @@
 #include <ptrauth.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 static void DumpNewEventImplementation(id device) {
@@ -124,6 +125,48 @@ static void DumpNewEventImplementation(id device) {
     }
 }
 
+static void DumpFunctionMethods(id function) {
+    if (!function || !getenv("MACWS_METAL_PROBE_DUMP_FUNCTION_METHODS"))
+        return;
+    for (Class cls = object_getClass(function); cls;
+         cls = class_getSuperclass(cls)) {
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(cls, &methodCount);
+        for (unsigned int methodIndex = 0;
+             methods && methodIndex < methodCount; methodIndex++) {
+            SEL selector = method_getName(methods[methodIndex]);
+            const char *selectorName = sel_getName(selector);
+            if (selectorName &&
+                (strstr(selectorName, "pecial") ||
+                 strstr(selectorName, "onstant") ||
+                 strstr(selectorName, "unction") ||
+                 strstr(selectorName, "ibrary"))) {
+                fprintf(stderr,
+                    "METAL_SOURCE_PROBE functionMethod class=%s "
+                    "selector=%s types=%s imp=%p\n",
+                    class_getName(cls), selectorName,
+                    method_getTypeEncoding(methods[methodIndex]),
+                    method_getImplementation(methods[methodIndex]));
+            }
+        }
+        free(methods);
+    }
+}
+
+static void DumpFunctionSpecializationRequirement(id function) {
+    SEL selector = sel_registerName("needsFunctionConstantValues");
+    BOOL needsValues = function &&
+        [function respondsToSelector:selector]
+        ? ((BOOL (*)(id, SEL))objc_msgSend)(function, selector) : NO;
+    fprintf(stderr,
+        "METAL_SOURCE_PROBE functionRequirement name=%s function=%p "
+        "needsFunctionConstantValues=%d constants=%lu\n",
+        function ? [[function name] UTF8String] : "(nil)", function,
+        needsValues,
+        (unsigned long)(function
+            ? [[function functionConstantsDictionary] count] : 0));
+}
+
 // Minimal chroot-side witness for the MTLCompilerService bridge.  It avoids
 // WindowServer, Electron and Aquarium so one source compile can be tested
 // without a GPU-process restart loop or sustained compositor load.
@@ -137,6 +180,166 @@ int main(void) {
         if (!device) return 2;
 
         DumpNewEventImplementation(device);
+
+        // Load a precompiled library through the same macOS Metal client and
+        // native iOS AGX device used by WindowServer.  This is a bounded
+        // compatibility witness for cross-OS system metallibs: it never
+        // substitutes a function or retries a failed pipeline.  The two
+        // descriptors differ only in color attachment 0, matching the
+        // runtime-confirmed CoreAnimation success (private format 550) and
+        // Dock desktop-effect failure (RGBA8Unorm / value 70).
+        const char *libraryPath = getenv("MACWS_METAL_PROBE_LIBRARY_PATH");
+        if (libraryPath && libraryPath[0]) {
+            NSError *libraryError = nil;
+            NSURL *libraryURL = [NSURL fileURLWithPath:
+                [NSString stringWithUTF8String:libraryPath]];
+            id<MTLLibrary> library = [device newLibraryWithURL:libraryURL
+                                                        error:&libraryError];
+            NSArray<NSString *> *functionNames = library.functionNames;
+            if (getenv("MACWS_METAL_PROBE_DUMP_LIBRARY_METHODS")) {
+                for (Class cls = object_getClass(library); cls;
+                     cls = class_getSuperclass(cls)) {
+                    unsigned int methodCount = 0;
+                    Method *methods = class_copyMethodList(cls, &methodCount);
+                    for (unsigned int methodIndex = 0;
+                         methodIndex < methodCount; methodIndex++) {
+                        SEL selector = method_getName(methods[methodIndex]);
+                        const char *selectorName = sel_getName(selector);
+                        if (selectorName && strstr(selectorName, "Function")) {
+                            fprintf(stderr,
+                                "METAL_SOURCE_PROBE libraryMethod class=%s "
+                                "selector=%s types=%s imp=%p\n",
+                                class_getName(cls), selectorName,
+                                method_getTypeEncoding(methods[methodIndex]),
+                                method_getImplementation(methods[methodIndex]));
+                        }
+                    }
+                    free(methods);
+                }
+            }
+            fprintf(stderr,
+                    "METAL_SOURCE_PROBE precompiledPath=%s library=%p "
+                    "class=%s functions=%lu errorDomain=%s errorCode=%ld "
+                    "description=%s\n",
+                    libraryPath, library,
+                    library ? object_getClassName(library) : "(nil)",
+                    (unsigned long)functionNames.count,
+                    libraryError ? libraryError.domain.UTF8String : "(nil)",
+                    (long)(libraryError ? libraryError.code : 0),
+                    libraryError
+                        ? libraryError.localizedDescription.UTF8String : "(nil)");
+            if (!library) return 7;
+
+            id<MTLFunction> vertex =
+                [library newFunctionWithName:@"fixed_vert_lph_spc"];
+            id<MTLFunction> fragment =
+                [library newFunctionWithName:@"fixed_frag_lph_cpf"];
+            id<MTLFunction> genericVertex =
+                [library newFunctionWithName:@"fixed_vert_lph_gen"];
+            DumpFunctionMethods(vertex);
+            DumpFunctionSpecializationRequirement(vertex);
+            DumpFunctionSpecializationRequirement(genericVertex);
+            DumpFunctionSpecializationRequirement(fragment);
+            for (NSString *extraName in
+                 @[ @"SimpleVertex", @"SimpleTextureFragment",
+                    @"sum_rgba_columns", @"sum_rgba_rows" ]) {
+                if ([functionNames containsObject:extraName]) {
+                    DumpFunctionSpecializationRequirement(
+                        [library newFunctionWithName:extraName]);
+                }
+            }
+            fprintf(stderr,
+                    "METAL_SOURCE_PROBE precompiledFunctions vertex=%p "
+                    "fragment=%p hasVertexName=%d hasFragmentName=%d\n",
+                    vertex, fragment,
+                    [functionNames containsObject:@"fixed_vert_lph_spc"],
+                    [functionNames containsObject:@"fixed_frag_lph_cpf"]);
+            if (!vertex || !fragment) return 8;
+
+            if (!getenv("MACWS_METAL_PROBE_PIPELINE")) return 0;
+
+            id<MTLFunction> genericFunctions[] = { vertex, fragment };
+            NSString *genericNames[] = {
+                @"fixed_vert_lph_spc", @"fixed_frag_lph_cpf"
+            };
+            id<MTLFunction> specializedFunctions[] = { nil, nil };
+            for (NSUInteger functionIndex = 0; functionIndex < 2;
+                 functionIndex++) {
+                NSDictionary<NSString *, MTLFunctionConstant *> *constants =
+                    genericFunctions[functionIndex].functionConstantsDictionary;
+                MTLFunctionConstantValues *values =
+                    [MTLFunctionConstantValues new];
+                uint8_t zeroValue[256] = {0};
+                for (NSString *constantName in constants) {
+                    MTLFunctionConstant *constant = constants[constantName];
+                    [values setConstantValue:zeroValue type:constant.type
+                                    withName:constantName];
+                }
+                NSError *specializationError = nil;
+                specializedFunctions[functionIndex] =
+                    [library newFunctionWithName:genericNames[functionIndex]
+                                   constantValues:values
+                                            error:&specializationError];
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE specializedFunction name=%s "
+                        "constants=%lu function=%p class=%s errorDomain=%s "
+                        "errorCode=%ld description=%s\n",
+                        genericNames[functionIndex].UTF8String,
+                        (unsigned long)constants.count,
+                        specializedFunctions[functionIndex],
+                        specializedFunctions[functionIndex]
+                            ? object_getClassName(
+                                specializedFunctions[functionIndex])
+                            : "(nil)",
+                        specializationError
+                            ? specializationError.domain.UTF8String : "(nil)",
+                        (long)(specializationError
+                            ? specializationError.code : 0),
+                        specializationError
+                            ? specializationError.localizedDescription.UTF8String
+                            : "(nil)");
+            }
+            vertex = specializedFunctions[0];
+            fragment = specializedFunctions[1];
+            if (!vertex || !fragment) return 9;
+
+            const NSUInteger color0Formats[] = { 550, 70 };
+            BOOL allPipelinesBuilt = YES;
+            for (NSUInteger index = 0;
+                 index < sizeof(color0Formats) / sizeof(color0Formats[0]);
+                 index++) {
+                MTLRenderPipelineDescriptor *descriptor =
+                    [MTLRenderPipelineDescriptor new];
+                descriptor.label = [NSString stringWithFormat:
+                    @"MacWS precompiled probe color0=%lu",
+                    (unsigned long)color0Formats[index]];
+                descriptor.vertexFunction = vertex;
+                descriptor.fragmentFunction = fragment;
+                descriptor.colorAttachments[0].pixelFormat =
+                    color0Formats[index];
+                descriptor.colorAttachments[1].pixelFormat =
+                    MTLPixelFormatRGBA16Float;
+                NSError *pipelineError = nil;
+                id<MTLRenderPipelineState> pipeline =
+                    [device newRenderPipelineStateWithDescriptor:descriptor
+                                                           error:&pipelineError];
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE precompiledPipeline color0=%lu "
+                        "color1=%lu pipeline=%p class=%s errorDomain=%s "
+                        "errorCode=%ld description=%s\n",
+                        (unsigned long)color0Formats[index],
+                        (unsigned long)MTLPixelFormatRGBA16Float,
+                        pipeline,
+                        pipeline ? object_getClassName(pipeline) : "(nil)",
+                        pipelineError ? pipelineError.domain.UTF8String : "(nil)",
+                        (long)(pipelineError ? pipelineError.code : 0),
+                        pipelineError
+                            ? pipelineError.localizedDescription.UTF8String
+                            : "(nil)");
+                if (!pipeline) allPipelinesBuilt = NO;
+            }
+            return allPipelinesBuilt ? 0 : 10;
+        }
 
         // Optional bounded LLDB attach window.  Pause only after Metal and the
         // concrete AGX/IOGPU classes are loaded, but before either event

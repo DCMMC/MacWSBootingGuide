@@ -53,6 +53,7 @@ extern const CFStringRef kCGWindowNumber;
 extern const CFStringRef kCGWindowLayer;
 extern const CFStringRef kCGWindowBounds;
 extern const CFStringRef kCGWindowOwnerPID;
+extern const CFStringRef kCGWindowOwnerName;
 extern bool CGRectMakeWithDictionaryRepresentation(CFDictionaryRef dictionary,
                                                     CGRect *rect);
 
@@ -253,8 +254,17 @@ static bool PointInRect(CGPoint point, CGRect rect) {
 
 // CGEventPost(kCGHIDEventTap) updates the posting process's cursor state in
 // this chroot, but runtime capture proved that it does not route mouse events
-// into the frontmost AppKit process. Resolve the front-to-back, layer-zero
-// window containing the point and use CoreGraphics' public per-process route.
+// into the frontmost macOS process. Resolve the first front-to-back,
+// non-WindowServer window containing the point and use CoreGraphics' public
+// per-process route. Restricting this to layer zero made fullscreen system UI
+// structurally unreachable: runtime diagnostics on 2026-08-02 showed the real
+// Launchpad surfaces owned by Dock at layers 29 and 27; a targetPID=0 tap fell
+// through to the ineffective global route, while the same tap explicitly
+// routed to Dock pid 99793 opened the native "Other" folder. AppKit menus,
+// Dock, Launchpad, and SystemUIServer extras are intentionally nonzero-layer
+// windows, so preserve CGWindowList's authoritative front-to-back ordering
+// instead of assuming a content-window layer. WindowServer's cursor/menu
+// infrastructure is excluded by owner PID.
 // Window bounds and input points are both in Quartz logical coordinates.
 static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
     MacWSWindowTarget target = {0};
@@ -288,20 +298,29 @@ static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
             info, kCGWindowLayer);
         CFNumberRef windowValue = (CFNumberRef)CFDictionaryGetValue(
             info, kCGWindowNumber);
+        CFStringRef ownerValue = (CFStringRef)CFDictionaryGetValue(
+            info, kCGWindowOwnerName);
         CFDictionaryRef boundsValue = (CFDictionaryRef)CFDictionaryGetValue(
             info, kCGWindowBounds);
         int32_t pid = 0, layer = -1, windowID = 0;
+        char ownerName[96] = {0};
         CGRect bounds = {{0, 0}, {0, 0}};
         bool decoded = pidValue && layerValue && windowValue && boundsValue &&
             CFNumberGetValue(pidValue, kCFNumberSInt32Type, &pid) &&
             CFNumberGetValue(layerValue, kCFNumberSInt32Type, &layer) &&
             CFNumberGetValue(windowValue, kCFNumberSInt32Type, &windowID) &&
             CGRectMakeWithDictionaryRepresentation(boundsValue, &bounds);
+        if (ownerValue && CFGetTypeID(ownerValue) == CFStringGetTypeID()) {
+            (void)CFStringGetCString(ownerValue, ownerName,
+                                     sizeof(ownerName), kCFStringEncodingUTF8);
+        }
         if (logProbe && i < 16) {
             fprintf(stderr,
                     "MACWS-INPUT TARGET-CANDIDATE index=%ld decoded=%s "
-                    "pid=%d layer=%d window=%d bounds=(%.1f,%.1f %.1fx%.1f) contains=%s\n",
-                    (long)i, decoded ? "YES" : "NO", pid, layer, windowID,
+                    "pid=%d owner=%s layer=%d window=%d "
+                    "bounds=(%.1f,%.1f %.1fx%.1f) contains=%s\n",
+                    (long)i, decoded ? "YES" : "NO", pid,
+                    ownerName[0] ? ownerName : "?", layer, windowID,
                     bounds.origin.x, bounds.origin.y,
                     bounds.size.width, bounds.size.height,
                     decoded && PointInRect(point, bounds) ? "YES" : "NO");
@@ -309,7 +328,11 @@ static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
         if (!decoded) {
             continue;
         }
-        if (pid <= 1 || pid == getpid() || layer != 0 ||
+        bool windowServerOwner = ownerValue &&
+            CFGetTypeID(ownerValue) == CFStringGetTypeID() &&
+            (CFEqual(ownerValue, CFSTR("WindowServer")) ||
+             CFEqual(ownerValue, CFSTR("Window Server")));
+        if (pid <= 1 || pid == getpid() || windowServerOwner || layer < 0 ||
             !PointInRect(point, bounds)) {
             continue;
         }

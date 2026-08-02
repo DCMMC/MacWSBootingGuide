@@ -61,6 +61,11 @@ VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
+LSD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd.plist"
+FINDER_DESKTOP_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.finder-desktop.plist"
+DOCK_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.dock.plist"
+SYSTEMUI_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.systemuiserver.plist"
+CONTROL_CENTER_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.controlcenter.plist"
 INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 DISPLAY_PLIST="$MACOS_DAEMONS/com.macwsguide.display.plist"
 INTEROP_PLIST="$MACOS_DAEMONS/com.macwsguide.interop.plist"
@@ -69,6 +74,11 @@ VNC_LABEL=UIKitApplication:com.macwsguide.osxvnc
 TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
 PBS_LABEL=com.macwsguide.pbs
+LSD_LABEL=com.macwsguide.lsd
+FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
+DOCK_LABEL=com.macwsguide.dock
+SYSTEMUI_LABEL=com.macwsguide.systemuiserver
+CONTROL_CENTER_LABEL=com.macwsguide.controlcenter
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
 DISPLAY_LABEL=UIKitApplication:com.macwsguide.display
 INTEROP_LABEL=UIKitApplication:com.macwsguide.interop
@@ -128,6 +138,13 @@ VNC_BIN=/usr/local/bin/OSXvnc-server                                            
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
 PBOARD_BIN=/usr/libexec/pboard
 PBS_BIN=/System/Library/CoreServices/pbs
+FINDER_BIN=/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
+DOCK_BIN=/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
+SYSTEMUI_BIN=/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
+CONTROL_CENTER_BIN=/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
+WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png'
 VNC_DESKTOP=macOS-iPad
 
 SPRINGBOARD=/System/Library/LaunchDaemons/com.apple.SpringBoard.plist
@@ -146,6 +163,9 @@ P_PBS='/System/Library/CoreServices/pbs'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
+P_DOCK='CoreServices/Dock.app/Contents/MacOS/Dock'
+P_SYSTEMUI='CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer'
+P_CONTROL_CENTER='CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter'
 P_INPUTD='/usr/local/bin/macwsinputd'
 P_DISPLAYD='/usr/local/bin/macwsdisplayd'
 P_INTEROPD='/usr/local/bin/macwsinteropd'
@@ -419,6 +439,16 @@ stop_ws_dependents() {
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
     launchctl unload "$CHROME150_PLIST" 2>/dev/null
     launchctl remove "$CHROME150_LABEL" 2>/dev/null
+    launchctl unload "$LSD_PLIST" 2>/dev/null
+    launchctl remove "$LSD_LABEL" 2>/dev/null
+    for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
+                           "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
+        launchctl unload "$workspace_plist" 2>/dev/null
+    done
+    for workspace_label in "$FINDER_DESKTOP_LABEL" "$DOCK_LABEL" \
+                           "$SYSTEMUI_LABEL" "$CONTROL_CENTER_LABEL"; do
+        launchctl remove "$workspace_label" 2>/dev/null
+    done
     # A root SSH shell on this jailbreak can still submit `launchctl load`
     # into mobile's user/501 domain.  A system-domain unload then reports
     # success/no-op while the browser job survives and contaminates the next
@@ -435,6 +465,9 @@ stop_ws_dependents() {
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
+    kill_by_pattern "$P_DOCK"
+    kill_by_pattern "$P_SYSTEMUI"
+    kill_by_pattern "$P_CONTROL_CENTER"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
@@ -492,6 +525,11 @@ recover_ws_dependents() {
     fi
     [ ! -f "$DISPLAY_PLIST" ] || launchctl load "$DISPLAY_PLIST" 2>/dev/null
     [ ! -f "$INTEROP_PLIST" ] || launchctl load "$INTEROP_PLIST" 2>/dev/null
+    [ ! -f "$LSD_PLIST" ] || launchctl load "$LSD_PLIST" 2>/dev/null
+    for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
+                           "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
+        [ ! -f "$workspace_plist" ] || launchctl load "$workspace_plist" 2>/dev/null
+    done
     if [ "$WANT_VNC" = 1 ]; then
         launchctl load "$VNC_PLIST" 2>/dev/null
     fi
@@ -907,6 +945,179 @@ PLIST
 </plist>
 PLIST
 
+    # Ventura applications use /usr/libexec/lsd, not the legacy
+    # launchservicesd endpoint alone.  iPadOS publishes the same com.apple.lsd
+    # names in user/501; without isolation the chroot's lsregister runtime-
+    # confirmed that it opened iOS's container database (Bundle table = 0).
+    # Publish the stock macOS LaunchAgent contract under names that
+    # libmachook maps on both the listener and client sides.
+    cat > "$LSD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${LSD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>/usr/libexec/lsd</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.lsd.advertisingidentifiers</key><true/>
+        <key>com.apple.macosbooter.lsd.diagnostics</key><true/>
+        <key>com.apple.macosbooter.lsd.dissemination</key><true/>
+        <key>com.apple.macosbooter.lsd.encryption</key><true/>
+        <key>com.apple.macosbooter.lsd.extensions</key><true/>
+        <key>com.apple.macosbooter.lsd.mapdb</key><true/>
+        <key>com.apple.macosbooter.lsd.modifydb</key><true/>
+        <key>com.apple.macosbooter.lsd.open</key><true/>
+        <key>com.apple.macosbooter.lsd.openurl</key><true/>
+        <key>com.apple.macosbooter.lsd.personaobserver</key><true/>
+        <key>com.apple.macosbooter.lsd.plugin</key><true/>
+        <key>com.apple.macosbooter.lsd.trustedsignatures</key><true/>
+        <key>com.apple.macosbooter.security.translocation</key><true/>
+    </dict>
+    <key>EnableTransactions</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>${LOGDIR}/lsd.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/lsd.log</string>
+</dict>
+</plist>
+PLIST
+
+    # A macOS Aqua login session normally launches Finder, Dock,
+    # SystemUIServer and ControlCenter as per-user LaunchAgents.  The chroot
+    # deliberately has no loginwindow domain, so map the stock Ventura agents'
+    # executable and Mach-service contracts into the outer launchd domain.
+    # These are the real desktop owners: Finder publishes desktop items, Dock
+    # owns desktop pictures/Spaces/Launchpad, and the latter two publish the
+    # right side of the global menu bar.  Host captures their SkyLight windows;
+    # it does not draw substitutes.
+    cat > "$FINDER_DESKTOP_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${FINDER_DESKTOP_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${FINDER_BIN}</string>
+        <string>-ApplePersistenceIgnoreState</string><string>YES</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>EnvironmentVariables</key>
+    <dict><key>CA_VSYNC_OFF</key><string>1</string></dict>
+    <key>StandardOutPath</key><string>${LOGDIR}/finder-desktop.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/finder-desktop.log</string>
+</dict>
+</plist>
+PLIST
+
+    cat > "$DOCK_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${DOCK_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${DOCK_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.desktoppicture.cache-delete</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.appstore</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.controlcenter</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.downloads</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.fullscreen</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.launchpad</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.notificationcenter</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.ppt</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.remotedesktoppicture</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.server</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.sidecar</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dock.spaces</key><dict><key>HideUntilCheckIn</key><true/></dict>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict><key>CA_VSYNC_OFF</key><string>1</string></dict>
+    <key>StandardOutPath</key><string>${LOGDIR}/dock.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/dock.log</string>
+</dict>
+</plist>
+PLIST
+
+    cat > "$SYSTEMUI_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${SYSTEMUI_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${SYSTEMUI_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.SUISMessaging</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dockextra.server</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.dockling.server</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.ipodserver</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.systemuiserver.ServiceProvider</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.systemuiserver.screencapture</key><dict><key>HideUntilCheckIn</key><true/></dict>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict><key>CA_VSYNC_OFF</key><string>1</string></dict>
+    <key>StandardOutPath</key><string>${LOGDIR}/systemuiserver.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/systemuiserver.log</string>
+</dict>
+</plist>
+PLIST
+
+    cat > "$CONTROL_CENTER_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${CONTROL_CENTER_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${CONTROL_CENTER_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.controlcenter</key><true/>
+        <key>com.apple.controlcenter.show.toggles</key><dict><key>HideUntilCheckIn</key><true/></dict>
+        <key>com.apple.usernotifications.delegate.com.apple.controlcenter.notifications.airplay</key><true/>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict><key>CA_VSYNC_OFF</key><string>1</string></dict>
+    <key>StandardOutPath</key><string>${LOGDIR}/controlcenter.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/controlcenter.log</string>
+</dict>
+</plist>
+PLIST
+
     # Terminal is a GUI app: start it once (RunAtLoad) but do NOT relaunch when
     # the user closes it (KeepAlive false) so launchd does not thrash.
     cat > "$TERM_PLIST" <<PLIST
@@ -1226,6 +1437,16 @@ cleanup_macos() {
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl remove "$PBOARD_LABEL" 2>/dev/null
     launchctl remove "$PBS_LABEL" 2>/dev/null
+    launchctl unload "$LSD_PLIST" 2>/dev/null
+    launchctl remove "$LSD_LABEL" 2>/dev/null
+    for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
+                           "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
+        launchctl unload "$workspace_plist" 2>/dev/null
+    done
+    for workspace_label in "$FINDER_DESKTOP_LABEL" "$DOCK_LABEL" \
+                           "$SYSTEMUI_LABEL" "$CONTROL_CENTER_LABEL"; do
+        launchctl remove "$workspace_label" 2>/dev/null
+    done
 
     # inputd blocks in recv(2), so tear its job down explicitly before the
     # broader directory unload and verify no pre-fix binary remains alive.
@@ -1252,6 +1473,9 @@ cleanup_macos() {
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
+    kill_by_pattern "$P_DOCK"
+    kill_by_pattern "$P_SYSTEMUI"
+    kill_by_pattern "$P_CONTROL_CENTER"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
@@ -1311,6 +1535,50 @@ mode_exclusive() {
     launchctl unload "$BACKBOARDD"  2>/dev/null
 }
 
+seed_launchservices_database() {
+    if [ ! -x "$ROOTFS$LSREGISTER_BIN" ]; then
+        log "ERROR: stock macOS lsregister is missing at $LSREGISTER_BIN"
+        return 1
+    fi
+    rm -f "$LOGDIR/lsregister.log"
+    log "Registering the real macOS system/local/user application catalog..."
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" \
+            -f -apps system,local,user > "$LOGDIR/lsregister.log" 2>&1; then
+        log "ERROR: LaunchServices application scan failed."
+        tail -n 20 "$LOGDIR/lsregister.log" 2>/dev/null || true
+        return 1
+    fi
+    log "LaunchServices application catalog ready."
+}
+
+apply_workspace_wallpaper() {
+    if [ ! -x "$ROOTFS$WORKSPACECTL_BIN" ]; then
+        log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
+        return 1
+    fi
+    rm -f "$LOGDIR/workspace-controller.log"
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+            set-wallpaper "$WORKSPACE_WALLPAPER" \
+            > "$LOGDIR/workspace-controller.log" 2>&1; then
+        log "ERROR: the real macOS desktop wallpaper could not be applied."
+        tail -n 20 "$LOGDIR/workspace-controller.log" 2>/dev/null || true
+        return 1
+    fi
+    log "Native macOS desktop wallpaper ready."
+}
+
+toggle_native_launchpad() {
+    [ -x "$ROOTFS$WORKSPACECTL_BIN" ] || {
+        log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
+        return 1
+    }
+    proc_running "$P_WINDOWSERVER" && proc_running "$P_DOCK" || {
+        log "ERROR: Launchpad requires a running WindowServer and Dock."
+        return 1
+    }
+    "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" show-launchpad
+}
+
 start_macos() {
     local ws_log_start_line=1 waited=0
     if [ -f "$LOGDIR/WindowServer.err" ]; then
@@ -1355,7 +1623,17 @@ start_macos() {
         return 1
     }
 
-    log "Loading macOS launchservicesd, input bridge, and WindowServer..."
+    log "Publishing the private macOS LaunchServices database services..."
+    rm -f "$LOGDIR/lsd.log"
+    launchctl load "$LSD_PLIST" || return 1
+    launchctl list "$LSD_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private macOS lsd MachService contract was not registered."
+        return 1
+    }
+
+    seed_launchservices_database || return 1
+
+    log "Loading legacy macOS launchservicesd, input bridge, and WindowServer..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1
     launchctl load "$INPUT_PLIST" || return 1
     launchctl load "$WINDOWSERVER_PLIST" || return 1
@@ -1393,6 +1671,43 @@ start_macos() {
         log "ERROR: macOS pbs process did not start."
         return 1
     }
+
+    log "Starting the real macOS Aqua workspace agents (Finder, Dock, SystemUIServer, ControlCenter)..."
+    for workspace_log in finder-desktop dock systemuiserver controlcenter; do
+        rm -f "$LOGDIR/$workspace_log.log"
+    done
+    if ! proc_running "$P_FINDER"; then
+        launchctl load "$FINDER_DESKTOP_PLIST" || return 1
+    else
+        log "Finder desktop owner is already running; preserving the single instance."
+    fi
+    launchctl load "$DOCK_PLIST" || return 1
+    launchctl load "$SYSTEMUI_PLIST" || return 1
+    launchctl load "$CONTROL_CENTER_PLIST" || return 1
+    waited=0
+    while [ "$waited" -lt 15 ]; do
+        proc_running "$P_FINDER" && proc_running "$P_DOCK" &&
+            proc_running "$P_SYSTEMUI" && proc_running "$P_CONTROL_CENTER" && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    for workspace_spec in \
+        "Finder:$P_FINDER:finder-desktop.log" \
+        "Dock:$P_DOCK:dock.log" \
+        "SystemUIServer:$P_SYSTEMUI:systemuiserver.log" \
+        "ControlCenter:$P_CONTROL_CENTER:controlcenter.log"; do
+        workspace_name=${workspace_spec%%:*}
+        workspace_rest=${workspace_spec#*:}
+        workspace_pattern=${workspace_rest%%:*}
+        workspace_log=${workspace_rest#*:}
+        if proc_running "$workspace_pattern"; then
+            log "$workspace_name workspace agent ready."
+        else
+            log "ERROR: $workspace_name did not reach a live process. See $LOGDIR/$workspace_log"
+            return 1
+        fi
+    done
+    apply_workspace_wallpaper || return 1
 
     if [ "$WANT_VNC" = 1 ]; then
         log "Starting VNC server (launchd job '$VNC_LABEL', persistent)..."
@@ -1455,7 +1770,7 @@ status() {
     fi
     echo
     echo "-- processes --"
-    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SYSTEMSTATUSD|$P_FONTD|$P_PBOARD|$P_PBS" \
+    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SYSTEMSTATUSD|$P_FONTD|$P_PBOARD|$P_PBS|$P_FINDER|$P_DOCK|$P_SYSTEMUI|$P_CONTROL_CENTER" \
         | grep -v grep || echo "(none running)"
     echo
     echo "-- launchd jobs --"
@@ -1468,7 +1783,7 @@ status() {
         echo "VNC: not running"
     fi
     echo
-    echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/pboard.log  $LOGDIR/pbs.log  $LOGDIR/WindowServer.err"
+    echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/lsd.log  $LOGDIR/dock.log  $LOGDIR/systemuiserver.log  $LOGDIR/controlcenter.log  $LOGDIR/WindowServer.err"
 }
 
 switch_status() {
@@ -1509,6 +1824,7 @@ Usage (run as root):
   sudo bash $0 production
   sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc]
   sudo bash $0 switches
+  sudo bash $0 launchpad
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
@@ -1810,6 +2126,10 @@ case "$CMD" in
         ;;
     switches)
         switch_status
+        ;;
+    launchpad)
+        require_root "$@"
+        toggle_native_launchpad
         ;;
     watchdog)
         require_root "$@"
