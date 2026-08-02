@@ -75,7 +75,9 @@ static void DisplayLog(NSString *format, ...) {
 
 @class MacWSDisplayClient;
 
-@interface MacWSTransientLayer : NSObject
+@interface MacWSTransientLayer : NSObject {
+    IOSurfaceRef _latestSurface;
+}
 @property(nonatomic, weak) MacWSDisplayClient *client;
 @property(nonatomic) uint32_t windowID;
 @property(nonatomic) int32_t level;
@@ -86,11 +88,23 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t droppedFrames;
 @property(nonatomic) NSUInteger missCount;
 @property(nonatomic) CGDisplayStreamRef stream;
+@property(nonatomic) IOSurfaceRef latestSurface;
+@property(nonatomic) uint64_t latestDisplayTime;
 - (void)stopStream;
 @end
 
 @implementation MacWSTransientLayer
-- (void)dealloc { [self stopStream]; }
+- (void)dealloc {
+    [self stopStream];
+    self.latestSurface = NULL;
+}
+- (IOSurfaceRef)latestSurface { return _latestSurface; }
+- (void)setLatestSurface:(IOSurfaceRef)surface {
+    if (_latestSurface == surface) return;
+    if (surface) CFRetain(surface);
+    if (_latestSurface) CFRelease(_latestSurface);
+    _latestSurface = surface;
+}
 - (void)stopStream {
     if (_stream) {
         CGDisplayStreamStop(_stream);
@@ -98,11 +112,18 @@ static void DisplayLog(NSString *format, ...) {
         _stream = NULL;
     }
     _sequence = 0;
+    self.latestSurface = NULL;
+    _latestDisplayTime = 0;
 }
 @end
 
 @interface MacWSDisplayClient : NSObject
 @property(nonatomic) xpc_connection_t connection;
+// A full-desktop subscription owns a complete SkyLight capture graph (menu
+// bar, Dock, wallpaper and every visible window).  It is deliberately
+// exclusive: duplicating that graph for two Host Scenes creates two sets of
+// full-Retina capture streams inside the same WindowServer.
+@property(nonatomic) BOOL subscriptionActive;
 @property(nonatomic) MacWSStreamMode mode;
 @property(nonatomic) uint32_t windowID;
 @property(nonatomic) uint64_t streamID;
@@ -570,6 +591,13 @@ static void PublishFrame(MacWSDisplayClient *client,
                          MacWSTransientLayer *layer,
                          uint64_t displayTime, IOSurfaceRef surface) {
     if (!surface || ![Clients containsObject:client]) return;
+    // Keep one immutable IOSurface reference per workspace layer.  A
+    // fullscreen Scene ownership transfer can then republish the complete
+    // current desktop without stopping/recreating any SkyLight stream.
+    if (layer) {
+        layer.latestSurface = surface;
+        layer.latestDisplayTime = displayTime;
+    }
     uint32_t layerWindowID = layer ? layer.windowID
         : (client.windowID ? client.windowID : UINT32_MAX);
     uint64_t producerStreamID = layer ? layer.streamID : client.streamID;
@@ -992,6 +1020,98 @@ static void ScheduleGeometryStreamRestart(void) {
 
 static void StartSubscription(MacWSDisplayClient *client,
                               MacWSStreamMode mode, uint32_t windowID) {
+    if (mode == MacWSStreamModeFullscreen) {
+        // Runtime-confirmed on 2026-08-03: a stale fullscreen client kept
+        // stream 10 and its desktop layers alive while the foreground Scene
+        // created workspace stream 55.  The duplicated Retina capture graphs
+        // were immediately followed by WindowServer AGX command-buffer error
+        // 00000103 and a producer restart.  Fullscreen is one shared physical
+        // macOS desktop, so transfer its producer ownership atomically to the
+        // newest foreground subscriber instead of cloning the graph.
+        MacWSDisplayClient *owner = nil;
+        for (MacWSDisplayClient *candidate in [Clients copy]) {
+            if (candidate != client && candidate.subscriptionActive &&
+                candidate.mode == MacWSStreamModeFullscreen) {
+                owner = candidate;
+                break;
+            }
+        }
+        if (owner) {
+            // Stop only this client's former exact-window graph.  The desktop
+            // graph remains running and its layer callbacks dynamically read
+            // layer.client, so moving the layer objects changes the XPC sink
+            // without overlapping CGDisplayStreamStop/Create operations.
+            [client stopTransientLayers];
+            [client stopStream];
+            client.outstandingByLayer = [NSMutableDictionary dictionary];
+            client.subscriptionActive = YES;
+            client.mode = MacWSStreamModeFullscreen;
+            client.windowID = 0;
+            client.streamID = owner.streamID;
+            client.sequence = owner.sequence;
+            client.droppedFrames = owner.droppedFrames;
+            client.firstDisplayTime = owner.firstDisplayTime;
+            client.windowBackingScale = owner.windowBackingScale;
+            client.lastSurfaceWidth = owner.lastSurfaceWidth;
+            client.lastSurfaceHeight = owner.lastSurfaceHeight;
+            client.workspaceCanvas = owner.workspaceCanvas;
+            owner.workspaceCanvas = NULL;
+            client.transientLayers = owner.transientLayers ?:
+                [NSMutableDictionary dictionary];
+            owner.transientLayers = [NSMutableDictionary dictionary];
+            for (MacWSTransientLayer *layer in
+                    client.transientLayers.allValues) {
+                layer.client = client;
+            }
+
+            owner.subscriptionActive = NO;
+            owner.mode = 0;
+            owner.windowID = 0;
+            owner.streamID = 0;
+            owner.sequence = 0;
+            owner.firstDisplayTime = 0;
+            owner.droppedFrames = 0;
+            owner.windowBackingScale = 0;
+            owner.lastSurfaceWidth = 0;
+            owner.lastSurfaceHeight = 0;
+
+            DisplayLog(@"workspace-handoff stream=%llu layers=%lu new-client=%p transport=live-graph-transfer",
+                       (unsigned long long)client.streamID,
+                       (unsigned long)client.transientLayers.count, client);
+            // Republish the retained current generation before waiting for a
+            // future damage callback; static wallpaper/menu layers may not
+            // otherwise emit another frame for the new Scene.
+            if (client.workspaceCanvas) {
+                PublishFrame(client, nil, mach_absolute_time(),
+                             client.workspaceCanvas);
+            }
+            NSArray<MacWSTransientLayer *> *layers =
+                [client.transientLayers.allValues
+                    sortedArrayUsingComparator:^NSComparisonResult(
+                        MacWSTransientLayer *left,
+                        MacWSTransientLayer *right) {
+                    if (left.level < right.level) return NSOrderedAscending;
+                    if (left.level > right.level) return NSOrderedDescending;
+                    if (left.windowID < right.windowID)
+                        return NSOrderedAscending;
+                    if (left.windowID > right.windowID)
+                        return NSOrderedDescending;
+                    return NSOrderedSame;
+                }];
+            for (MacWSTransientLayer *layer in layers) {
+                if (layer.latestSurface) {
+                    PublishFrame(client, layer,
+                        layer.latestDisplayTime ?: mach_absolute_time(),
+                        layer.latestSurface);
+                }
+            }
+            SendStatus(owner, MACWS_STREAM_EVENT_STOPPED,
+                       @"全屏工作区已转移到当前前台窗口", YES);
+            ScheduleTransientReconcile(0);
+            return;
+        }
+    }
+    client.subscriptionActive = YES;
     client.mode = mode;
     client.windowID = mode == MacWSStreamModeWindow ? windowID : 0;
     client.windowBackingScale = 0.0;
@@ -1014,6 +1134,7 @@ static void ReconcileTransientStreams(void) {
     BOOL needsFollowup = NO;
     BOOL workspaceNeedsFollowup = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive) continue;
         if (client.mode == MacWSStreamModeFullscreen) {
             if (!desktopInfo) desktopInfo = CopyCompleteDesktopWindowInfo();
             CGRect desktopBounds = CGDisplayBounds(CGMainDisplayID());
@@ -1222,6 +1343,9 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
         }
         StartSubscription(client, mode, (uint32_t)windowID);
     } else if (strcmp(operation, MACWS_STREAM_OP_UNSUBSCRIBE) == 0) {
+        client.subscriptionActive = NO;
+        client.mode = 0;
+        client.windowID = 0;
         [client stopTransientLayers];
         [client stopStream];
     } else if (strcmp(operation, MACWS_STREAM_OP_RELEASE_FRAME) == 0) {

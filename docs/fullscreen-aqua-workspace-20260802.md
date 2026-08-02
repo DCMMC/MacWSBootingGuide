@@ -85,11 +85,16 @@ sudo bash /var/jb/usr/macOS/bin/macos_gui.sh launchpad
 ```
 
 [`cold-production-launchpad.png`](evidence/fullscreen-workspace-20260802/cold-production-launchpad.png)
-shows the real Launchpad search field, folder and Dock. LaunchServices now
-registers the real applications, but several Dock/Launchpad icons remain gray
-or `?`: the native IconServices agent currently fails its quarantine startup
-with `qtn_proc_init_with_self result=-2 errno=103 (ENOPOLICY)`. This milestone
-does not hide that remaining native-service defect with generated UIKit icons.
+shows the real Launchpad search field, folder and Dock. The later production
+IconServices repair now keeps both `iconservicesd` and `iconservicesagent`
+alive: runtime tracing proved `qtn_proc_init_with_self` returned
+`-2/ENOPOLICY`, while a diagnostic-state probe inside the wrapper clobbered
+the deliberately translated `ENOATTR` back to `ENOENT`. The wrapper now
+evaluates diagnostics before restoring errno, so the stock agent reaches its
+listener in production. Dock icons are mostly restored. Four `?` placeholders
+and an empty Launchpad “Other” folder remain because Launchpad's application
+import stage has not populated its persistent database (`apps=0`); this is no
+longer attributed to IconServices process startup.
 
 [`fullscreen-status-menu-touch.png`](evidence/fullscreen-workspace-20260802/fullscreen-status-menu-touch.png)
 shows a fullscreen Host click opening the real macOS Control Center. The menu
@@ -189,8 +194,65 @@ Runtime-confirmed in this milestone:
 
 Still open:
 
-- repair native IconServices/quarantine startup so all Dock/Launchpad icons
-  populate normally;
+- repair Launchpad's native application-source import stage so its persistent
+  database populates application rows and the remaining Dock placeholders;
 - physical-finger subjective latency and all gesture combinations still need
   a user-on-device regression even though the exact controller → broker →
   native system-UI event path has visible runtime witnesses here.
+
+## 7. Atomic window → fullscreen stream handoff (2026-08-03)
+
+The enlarged partial desktop and disabled touch seen during an interactive
+window → fullscreen transition had one shared producer failure, not two
+unrelated view/input bugs.
+
+Runtime-confirmed via `MacWSHost.log`: the exact-window generation ended at
+`2162×1414`; after the fullscreen request there was no replacement base frame
+for about 40 seconds. During that interval Host retained the last Metal
+drawable while iPadOS maximized the Scene, so the old window-sized image was
+scaled up. Input correctly remained gated because the replacement frame
+generation did not exist. The first healthy replacement was:
+
+```text
+display-stream first-frame revalidate-input mode=1 target=0 status=DisplayStream IOSurface 首帧已就绪
+display-stream first-frame revalidate-input mode=1 target=0 status=2388×1668  ·  DisplayStream  ·  IOSurface 直传
+```
+
+Runtime-confirmed via `macwsdisplayd.err`: a stale fullscreen Scene still owned
+`stream 10` and its full desktop layer set while the current window owned an
+exact stream. Entering fullscreen created workspace `55` plus a second set of
+Retina layer streams. WindowServer then emitted AGX command-buffer
+`Internal Error (00000103)` and restarted. The first attempted ownership fix
+still stopped the old graph and immediately created another; the integration
+probe changed WindowServer PID `75537 → 78356` and recorded
+`layer-start failed ... error=-308`, so that implementation was rejected.
+
+Production now treats the complete macOS desktop capture graph as a unique
+physical resource. A newer foreground fullscreen subscriber receives the
+already-running graph: layer callbacks are rebound to the new XPC client and
+each layer's retained latest IOSurface is republished. No SkyLight capture
+stream is stopped or recreated during the transfer. The packaged build passed
+the two-client probe with stable PIDs:
+
+```text
+78356 WindowServer  (before and after)
+79399 macwsdisplayd (before and after)
+MACWS-DISPLAY workspace-handoff stream=1 layers=11 new-client=... transport=live-graph-transfer
+```
+
+Host also submits an explicit black Metal clear for the short interval between
+stream generations. `MTKView` therefore cannot retain and magnify an exact
+window drawable while the fullscreen base IOSurface is pending. Viewport zoom
+is reset to `1.0`, center `(0.5,0.5)` before both transition directions, and
+the first direct IOSurface causes the controller to re-evaluate the complete
+input-ready invariant.
+
+The reproducible integration source is
+[`macws_display_handoff_probe.m`](../misc/macws_display_handoff_probe.m); the
+verbatim accepted/rejected evidence is
+[`display-handoff-production.txt`](evidence/fullscreen-workspace-20260802/display-handoff-production.txt).
+
+The device was locked after package installation, so the final physical UIKit
+button/finger pass for this exact build remains an explicit evidence boundary.
+The display-service ownership race itself is exercised without UIKit and has
+passed twice, including once against the installed production `.deb`.

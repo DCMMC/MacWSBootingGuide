@@ -106,7 +106,7 @@ static BOOL MacWSMessageBool(id receiver, SEL selector) {
     return ((BOOL (*)(id, SEL))objc_msgSend)(receiver, selector);
 }
 
-static void MacWSMessagePerformFullscreen(id receiver) {
+static void MacWSMessageToggleMaximization(id receiver) {
     SEL selector = NSSelectorFromString(
         @"performKeyboardShortcutAction:forBundleIdentifier:");
     ((void (*)(id, SEL, NSInteger, NSString *))objc_msgSend)(
@@ -120,32 +120,82 @@ static void MacWSFinishFullscreenRequest(NSString *path, NSString *message) {
     [MacWSFullscreenRequestsInFlight removeObject:path];
 }
 
-static BOOL MacWSAppLayoutContainsExactScene(
-        id layout, NSString *bundleIdentifier, NSString *sceneIdentifier) {
+static id MacWSAppLayoutExactSceneItem(id layout,
+                                       NSString *bundleIdentifier,
+                                       NSString *sceneIdentifier) {
     if (!layout || bundleIdentifier.length == 0 || sceneIdentifier.length == 0)
-        return NO;
+        return nil;
     NSArray *items = MacWSMessageObject(
         layout, NSSelectorFromString(@"allItems"));
-    if (![items isKindOfClass:NSArray.class]) return NO;
+    if (![items isKindOfClass:NSArray.class]) return nil;
     for (id item in items) {
         NSString *candidateBundle = MacWSMessageObject(
             item, NSSelectorFromString(@"bundleIdentifier"));
         NSString *candidateIdentifier = MacWSMessageObject(
             item, NSSelectorFromString(@"uniqueIdentifier"));
         if ([candidateBundle isEqualToString:bundleIdentifier] &&
-            [candidateIdentifier isEqualToString:sceneIdentifier]) return YES;
+            [candidateIdentifier isEqualToString:sceneIdentifier]) return item;
     }
-    return NO;
+    return nil;
 }
 
-// RE-confirmed on iPadOS 16.3.1 SpringBoard at 0x1c7669808:
-// -[SpringBoard _handleEnterFullScreenKeyShortcut:] asks the active display
-// window scene for its switcherController and directly performs action 0x11.
-// This is distinct from _handleMakeFullscreenKeyShortcut: at 0x1c7669964,
-// whose action 0x0b is unavailable in the active Chamois modifier state.
-// Reuse the correct system transaction so SpringBoard owns the layout
-// mutation, animation, status bar and Home Indicator. This does not mutate
-// private ivars, force a condition, or skip a check present in Apple's path.
+static void MacWSVerifyMaximizationPostcondition(
+        id coordinator, NSString *bundleIdentifier, NSString *sceneIdentifier,
+        BOOL expectedFullscreen) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1200 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        NSArray *appLayouts = MacWSMessageObject(
+            coordinator, NSSelectorFromString(@"recentAppLayouts"));
+        id actualLayout = nil;
+        id actualItem = nil;
+        for (id layout in appLayouts) {
+            id item = MacWSAppLayoutExactSceneItem(
+                layout, bundleIdentifier, sceneIdentifier);
+            if (item) {
+                actualLayout = layout;
+                actualItem = item;
+                break;
+            }
+        }
+        NSInteger actualRole = MacWSMessageIntegerWithObject(
+            actualLayout, NSSelectorFromString(@"layoutRoleForItem:"),
+            actualItem);
+        NSInteger actualCenter = MacWSMessageInteger(
+            actualLayout, NSSelectorFromString(@"centerConfiguration"));
+        NSInteger actualEnvironment = MacWSMessageInteger(
+            actualLayout, NSSelectorFromString(@"environment"));
+        NSInteger *primaryRoleAddress = (NSInteger *)dlsym(
+            RTLD_DEFAULT, "SBLayoutRolePrimary");
+        NSInteger *centerRoleAddress = (NSInteger *)dlsym(
+            RTLD_DEFAULT, "SBLayoutRoleCenter");
+        BOOL landed = actualLayout && actualItem && primaryRoleAddress &&
+            centerRoleAddress;
+        if (landed) {
+            landed = expectedFullscreen
+                ? actualRole == *primaryRoleAddress && actualCenter == 0
+                : actualRole == *centerRoleAddress && actualCenter == 1;
+        }
+        MacWSWindowingLogLine([NSString stringWithFormat:
+            @"maximization-postcondition scene=%@ landed=%@ expected-fullscreen=%@ role=%ld center=%ld environment=%ld primary=%ld windowed=%ld",
+            sceneIdentifier, landed ? @"YES" : @"NO",
+            expectedFullscreen ? @"YES" : @"NO", (long)actualRole,
+            (long)actualCenter, (long)actualEnvironment,
+            (long)(primaryRoleAddress ? *primaryRoleAddress : -1),
+            (long)(centerRoleAddress ? *centerRoleAddress : -1)]);
+    });
+}
+
+// RE-confirmed on iPadOS 16.3.1 SpringBoard:
+// - performSwitcherKeyboardShortcutAction: at 0x1c7add0c0 maps action 0x11
+//   to top-affordance action type 9.
+// - SBTopAffordanceViewController's _maximizationAction handler at
+//   0x1c7c1f078 sends that same action type 9, while
+//   updateContextMenuWithLayoutRole:... selects the localized
+//   MAXIMIZATION_ZOOM / MAXIMIZATION_UNZOOM title from the current state.
+// Therefore action 0x11 is the system's maximization toggle, not an enter-only
+// operation. Use it in both directions so SpringBoard owns the Primary <- ->
+// Center role transaction, animation, status bar and Home Indicator. This
+// does not mutate private ivars, force a condition, or skip a system check.
 //
 // Runtime-confirmed on the same device: activeDisplayWindowScene is the
 // enclosing SBWindowScene whose identifier is com.apple.springboard.  The
@@ -160,10 +210,13 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
                                         NSUInteger attempt) {
     NSString *bundleIdentifier = request[@"bundle_identifier"];
     NSString *requestedIdentifier = request[@"scene_identifier"];
+    NSNumber *expectedFullscreenValue = request[@"expected_fullscreen"];
+    BOOL expectedFullscreen = expectedFullscreenValue.boolValue;
     NSTimeInterval issuedAt = [request[@"issued_at"] doubleValue];
     NSTimeInterval age = NSDate.date.timeIntervalSince1970 - issuedAt;
     if (![bundleIdentifier isEqualToString:@"com.macwsguide.host"] ||
         ![requestedIdentifier isKindOfClass:NSString.class] ||
+        ![expectedFullscreenValue isKindOfClass:NSNumber.class] ||
         requestedIdentifier.length == 0 || !isfinite(age) || age < -2.0 ||
         age > 15.0) {
         MacWSFinishFullscreenRequest(path, [NSString stringWithFormat:
@@ -210,21 +263,52 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
             coordinator, NSSelectorFromString(@"_currentAppLayout"));
         if (focusedLayout) focusSource = @"_currentAppLayout";
     }
-    BOOL exactScene = MacWSAppLayoutContainsExactScene(
+    id focusedItem = MacWSAppLayoutExactSceneItem(
         focusedLayout, bundleIdentifier, requestedIdentifier);
+    BOOL exactScene = focusedItem != nil;
+    NSInteger sourceRole = MacWSMessageIntegerWithObject(
+        focusedLayout, NSSelectorFromString(@"layoutRoleForItem:"),
+        focusedItem);
+    NSInteger sourceCenter = MacWSMessageInteger(
+        focusedLayout, NSSelectorFromString(@"centerConfiguration"));
+    NSInteger *primaryRoleAddress = (NSInteger *)dlsym(
+        RTLD_DEFAULT, "SBLayoutRolePrimary");
+    NSInteger *centerRoleAddress = (NSInteger *)dlsym(
+        RTLD_DEFAULT, "SBLayoutRoleCenter");
+    BOOL sourceFullscreen = exactScene && primaryRoleAddress &&
+        sourceRole == *primaryRoleAddress && sourceCenter == 0;
+    BOOL sourceWindowed = exactScene && centerRoleAddress &&
+        sourceRole == *centerRoleAddress && sourceCenter == 1;
+    BOOL alreadyExpected = expectedFullscreen
+        ? sourceFullscreen : sourceWindowed;
     SEL performSelector = NSSelectorFromString(
         @"performKeyboardShortcutAction:forBundleIdentifier:");
     BOOL actionAvailable = switcherController &&
         [switcherController respondsToSelector:performSelector];
     BOOL allowed = exactScene && actionAvailable;
     MacWSWindowingLogLine([NSString stringWithFormat:
-        @"fullscreen-request requested=%@ exact-focus=%@ focus-source=%@ manager=%@ switcher=%@ content=%@ action=%@ attempt=%lu",
-        requestedIdentifier, exactScene ? @"YES" : @"NO",
-        focusSource ?: @"none", windowSceneManager ? @"YES" : @"NO",
+        @"maximization-request requested=%@ expected-fullscreen=%@ exact-focus=%@ focus-source=%@ role=%ld center=%ld source-fullscreen=%@ source-windowed=%@ manager=%@ switcher=%@ content=%@ action=%@ attempt=%lu",
+        requestedIdentifier, expectedFullscreen ? @"YES" : @"NO",
+        exactScene ? @"YES" : @"NO", focusSource ?: @"none",
+        (long)sourceRole, (long)sourceCenter,
+        sourceFullscreen ? @"YES" : @"NO",
+        sourceWindowed ? @"YES" : @"NO",
+        windowSceneManager ? @"YES" : @"NO",
         switcherController ? @"YES" : @"NO",
         contentController ? @"YES" : @"NO",
         actionAvailable ? @"YES" : @"NO",
         (unsigned long)(attempt + 1)]);
+    if (alreadyExpected) {
+        MacWSVerifyMaximizationPostcondition(
+            MacWSMessageObject(switcherController,
+                               NSSelectorFromString(@"switcherCoordinator")),
+            bundleIdentifier, requestedIdentifier, expectedFullscreen);
+        MacWSFinishFullscreenRequest(path, [NSString stringWithFormat:
+            @"maximization-not-performed scene=%@ reason=already-in-requested-state expected-fullscreen=%@ role=%ld center=%ld",
+            requestedIdentifier, expectedFullscreen ? @"YES" : @"NO",
+            (long)sourceRole, (long)sourceCenter]);
+        return;
+    }
     if (!allowed) {
         if (!exactScene && attempt < 10) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -235,16 +319,22 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
             return;
         }
         MacWSFinishFullscreenRequest(path, [NSString stringWithFormat:
-            @"fullscreen-not-performed requested=%@ reason=%@ attempts=%lu",
+            @"maximization-not-performed requested=%@ expected-fullscreen=%@ reason=%@ attempts=%lu",
             requestedIdentifier,
+            expectedFullscreen ? @"YES" : @"NO",
             exactScene ? @"system-action-unavailable" : @"focused-scene-mismatch",
             (unsigned long)(attempt + 1)]);
         return;
     }
-    MacWSMessagePerformFullscreen(switcherController);
+    MacWSMessageToggleMaximization(switcherController);
+    MacWSVerifyMaximizationPostcondition(
+        MacWSMessageObject(switcherController,
+                           NSSelectorFromString(@"switcherCoordinator")),
+        bundleIdentifier, requestedIdentifier, expectedFullscreen);
     MacWSFinishFullscreenRequest(path, [NSString stringWithFormat:
-        @"fullscreen-performed scene=%@ action=17 focus-source=%@",
-        requestedIdentifier, focusSource]);
+        @"maximization-performed scene=%@ expected-fullscreen=%@ action=17 top-action=9 focus-source=%@",
+        requestedIdentifier, expectedFullscreen ? @"YES" : @"NO",
+        focusSource]);
 }
 
 static void MacWSHandleFullscreenRequest(
@@ -797,11 +887,11 @@ __attribute__((constructor)) static void MacWSDenseGridLoadedWitness(void) {
     int fd = open(MacWSDenseGridLoaded,
                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd >= 0) {
-        dprintf(fd, "version=12 pid=%d step=10 minimum=150 "
-                    "fullscreen=focused-scene-enter-action-17 "
+        dprintf(fd, "version=13 pid=%d step=10 minimum=150 "
+                    "fullscreen=focused-scene-maximization-toggle-action-17 "
                     "resize=app-layout-transaction "
-                    "exit=primary-to-page-center-environment-3 "
-                    "return-size=system-default-on-fullscreen-state\n",
+                    "exit=system-maximization-unzoom "
+                    "postcondition=layout-role-and-center-configuration\n",
                     getpid());
         close(fd);
     }

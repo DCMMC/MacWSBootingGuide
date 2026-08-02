@@ -1,6 +1,7 @@
 cd $(realpath $HOME/../..)/usr/macOS
 
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
+CFPREFSD_ENT="/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist"
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
 LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
@@ -156,6 +157,69 @@ ensure_project_signature_and_trustcache() {
         ldid -S"$ENT" -M "$path" || return 1
     fi
     add_all_trustcache "$path"
+}
+
+# Keep cfprefsd out of the generic project entitlement profile.  Runtime
+# evidence on iPadOS 16.3 established both failure boundaries: the stock Apple
+# image is rejected by AMFI CT policy 0x8, and adding the generic profile's
+# com.apple.security.system-container makes sandbox_init kill the process.
+# A private fresh-inode copy signed with this dedicated profile runs normally
+# and can map the injected libmachook image.  Re-sign only if the persistent
+# copy is absent or has the wrong identity/profile, avoiding obsolete CDHashes.
+ensure_private_cfprefsd_and_trustcache() {
+    local source_path='/var/mnt/rootfs/usr/sbin/cfprefsd'
+    local target_path='/var/mnt/rootfs/usr/local/libexec/macws-cfprefsd'
+    local temporary_root='/var/mnt/rootfs/private/var/.TemporaryItems'
+    local temporary_user="$temporary_root/folders.0"
+    local temporary_leaf="$temporary_user/TemporaryItems"
+    local target_dir temporary needs_refresh=0 entitlements=''
+
+    [ -f "$source_path" ] || return 1
+    [ -f "$CFPREFSD_ENT" ] || return 1
+    target_dir=${target_path%/*}
+    mkdir -p "$target_dir" || return 1
+
+    # RE-confirmed against Ventura CoreFoundation and the iPadOS 16.3
+    # libsystem_coreservices implementation.  CFPDSource's atomic plist writer
+    # calls _dirhelper_relative for the Preferences mount.  On this chroot's
+    # mount topology it resolves to this exact three-level hierarchy and
+    # rejects/misses it unless the modes are 01311, 0700, 0700 respectively.
+    # Without it _CFPrefsTemporaryFDToWriteTo returns -1/ENOENT after the
+    # target plist itself has already opened successfully.
+    mkdir -p "$temporary_leaf" || return 1
+    chown root:wheel "$temporary_root" "$temporary_user" "$temporary_leaf" \
+        2>/dev/null || true
+    chmod 1311 "$temporary_root" || return 1
+    chmod 0700 "$temporary_user" "$temporary_leaf" || return 1
+
+    if [ ! -f "$target_path" ]; then
+        needs_refresh=1
+    else
+        entitlements=$(ldid -e "$target_path" 2>/dev/null || true)
+        ldid -h "$target_path" 2>/dev/null |
+            grep -q 'Identifier=com.macwsguide.cfprefsd' || needs_refresh=1
+        printf '%s\n' "$entitlements" |
+            grep -q '<key>com.apple.private.graphics-restart-no-kill</key>' || needs_refresh=1
+        if printf '%s\n' "$entitlements" |
+             grep -q '<key>com.apple.security.system-container</key>'; then
+            needs_refresh=1
+        fi
+    fi
+
+    if [ "$needs_refresh" -eq 1 ]; then
+        temporary="${target_path}.new-$$"
+        rm -f "$temporary"
+        cp "$source_path" "$temporary" || return 1
+        chmod 755 "$temporary" || return 1
+        chown root:wheel "$temporary" 2>/dev/null || true
+        ldid -Icom.macwsguide.cfprefsd -S"$CFPREFSD_ENT" "$temporary" || {
+            rm -f "$temporary"
+            return 1
+        }
+        mv -f "$temporary" "$target_path" || return 1
+        echo "[INFO] installed dedicated private macOS cfprefsd"
+    fi
+    add_all_trustcache "$target_path"
 }
 
 # Re-register every already-signed executable Mach-O in an application bundle.
@@ -372,12 +436,15 @@ ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
 # admissible on the iOS kernel and restores dynamic trust after a reboot.
 for workspace_binary in \
     '/var/mnt/rootfs/usr/libexec/lsd' \
+    '/var/mnt/rootfs/System/Library/CoreServices/iconservicesd' \
+    '/var/mnt/rootfs/System/Library/CoreServices/iconservicesagent' \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock' \
     '/var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer' \
     '/var/mnt/rootfs/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter' \
     '/var/mnt/rootfs/System/Applications/Launchpad.app/Contents/MacOS/Launchpad'; do
     ensure_project_signature_and_trustcache "$workspace_binary" || exit 1
 done
+ensure_private_cfprefsd_and_trustcache || exit 1
 # Finder's TimelineUI dependency is not present in the iOS dyld shared cache.
 # Once Finder itself passed AMFI, dyld runtime-confirmed this exact on-disk
 # image was the next rejected arm64e dependency.

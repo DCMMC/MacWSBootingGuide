@@ -10089,6 +10089,14 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.systemstatus.activityattribution";
     if (!strcmp(name, "com.apple.coreservices.launchservicesd"))
         return "com.apple.macosbooter.coreservices.launchservicesd";
+    if (!strcmp(name, "com.apple.cfprefsd.daemon"))
+        return "com.apple.macosbooter.cfprefsd.daemon";
+    if (!strcmp(name, "com.apple.cfprefsd.agent"))
+        return "com.apple.macosbooter.cfprefsd.agent";
+    if (!strcmp(name, "com.apple.iconservices"))
+        return "com.apple.macosbooter.iconservices";
+    if (!strcmp(name, "com.apple.iconservices.store"))
+        return "com.apple.macosbooter.iconservices.store";
     if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
         return "com.apple.macosbooter.lsd.advertisingidentifiers";
     if (!strcmp(name, "com.apple.lsd.diagnostics"))
@@ -10116,6 +10124,112 @@ static const char *macws_private_chroot_service_name(const char *name) {
     if (!strcmp(name, "com.apple.security.translocation"))
         return "com.apple.macosbooter.security.translocation";
     return name;
+}
+
+typedef int (*macws_qtn_proc_init_with_self_fn)(void *process);
+typedef int (*macws_qtn_proc_init_fn)(void *process);
+typedef int (*macws_qtn_proc_set_flags_fn)(void *process, uint32_t flags);
+typedef int (*macws_qtn_proc_apply_to_self_fn)(void *process);
+typedef uint32_t (*macws_qtn_proc_get_flags_fn)(void *process);
+static macws_qtn_proc_init_with_self_fn
+    g_macws_orig_qtn_proc_init_with_self = NULL;
+static macws_qtn_proc_init_fn g_macws_orig_qtn_proc_init = NULL;
+static macws_qtn_proc_set_flags_fn g_macws_orig_qtn_proc_set_flags = NULL;
+static macws_qtn_proc_apply_to_self_fn
+    g_macws_orig_qtn_proc_apply_to_self = NULL;
+static macws_qtn_proc_get_flags_fn g_macws_qtn_proc_get_flags = NULL;
+static uint32_t g_macws_iconservices_emulated_qtn_flags = 0;
+
+static int macws_qtn_proc_init_with_self(void *process) {
+    int result = g_macws_orig_qtn_proc_init_with_self
+        ? g_macws_orig_qtn_proc_init_with_self(process) : -1;
+    int originalError = errno;
+    if (result != 0 && originalError == 103 /* ENOPOLICY */ &&
+        g_macws_iconservices_emulated_qtn_flags != 0 &&
+        g_macws_orig_qtn_proc_init && g_macws_orig_qtn_proc_set_flags &&
+        g_macws_orig_qtn_proc_init(process) == 0 &&
+        g_macws_orig_qtn_proc_set_flags(
+            process, g_macws_iconservices_emulated_qtn_flags) == 0) {
+        // macOS's Quarantine sandbox extension does not exist in the iOS
+        // kernel.  Once the exact startup state below has been accepted,
+        // preserve the observable qtn_proc_init_with_self contract for later
+        // in-process readers instead of merely hiding the kernel error.
+        errno = 0;
+        return 0;
+    }
+    // RE-confirmed via iconservicesagent arm64e +0x3494..+0x34b0: the stock
+    // process first calls _qtn_proc_init_with_self and, on failure, performs
+    // its supported _qtn_proc_init fallback only for ENOATTR (93).  The same
+    // call in this cross-OS chroot returns ENOPOLICY (103): iOS has no macOS
+    // quarantine policy for the chroot executable.  Translate only that
+    // foreign-policy errno so the original binary takes its own fallback;
+    // retain every other result/error and never manufacture qtn success.
+    if (result != 0 && originalError == 103 /* ENOPOLICY */) {
+        // macws_runtime_diagnostics_enabled() probes diagnostic sentinels
+        // with access(2) in a quiet production process.  That probe sets
+        // errno=ENOENT, so it must run before the caller-visible translation.
+        // Restore ENOATTR last, after optional logging, because the target's
+        // arm64e main explicitly compares errno with 93 at +0x34a4.
+        BOOL diagnostics = macws_runtime_diagnostics_enabled();
+        if (diagnostics) {
+            fprintf(stderr,
+                "#### ICONSERVICES qtn self errno ENOPOLICY -> ENOATTR; "
+                "stock _qtn_proc_init fallback remains authoritative\n");
+        }
+        errno = 93; /* ENOATTR */
+    } else {
+        errno = originalError;
+    }
+    return result;
+}
+
+static int macws_qtn_proc_apply_to_self(void *process) {
+    int result = g_macws_orig_qtn_proc_apply_to_self
+        ? g_macws_orig_qtn_proc_apply_to_self(process) : -1;
+    int savedError = errno;
+    uint32_t flags = g_macws_qtn_proc_get_flags
+        ? g_macws_qtn_proc_get_flags(process) : 0;
+    // RE-confirmed via live LLDB against iOS 16.3 libquarantine:
+    //   _qtn_proc_apply_to_self -> _qtn_proc_apply_to_pid(process, 0)
+    //   -> __sandbox_ms("Quarantine", 0x57, ...)
+    // and the kernel returns ENOPOLICY because iOS has no macOS Quarantine
+    // named policy.  The stock iconservicesagent initializes a fresh process
+    // object, sets exactly flags 0x6, and treats this unavailable security
+    // hardening as fatal before publishing its XPC service.  Accept only that
+    // exact cross-OS state and retain it for init_with_self readers above;
+    // all other qtn errors and flag sets remain authoritative.
+    if (result == -2 && savedError == 103 /* ENOPOLICY */ && flags == 0x6) {
+        g_macws_iconservices_emulated_qtn_flags = flags;
+        fprintf(stderr,
+                "[macws] iconservicesagent: emulating qtn self-state flags=%#x; "
+                "iOS kernel has no macOS Quarantine policy\n", flags);
+        errno = 0;
+        return 0;
+    }
+    errno = savedError;
+    return result;
+}
+
+static void macws_install_iconservices_quarantine_fallback(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "iconservicesagent") != 0) return;
+    void *symbol = dlsym(RTLD_DEFAULT, "_qtn_proc_init_with_self");
+    if (!symbol) return;
+    MSHookFunction(symbol, (void *)macws_qtn_proc_init_with_self,
+                   (void **)&g_macws_orig_qtn_proc_init_with_self);
+    symbol = dlsym(RTLD_DEFAULT, "_qtn_proc_init");
+    if (symbol) g_macws_orig_qtn_proc_init = (macws_qtn_proc_init_fn)symbol;
+    symbol = dlsym(RTLD_DEFAULT, "_qtn_proc_set_flags");
+    if (symbol)
+        g_macws_orig_qtn_proc_set_flags = (macws_qtn_proc_set_flags_fn)symbol;
+    symbol = dlsym(RTLD_DEFAULT, "_qtn_proc_get_flags");
+    if (symbol)
+        g_macws_qtn_proc_get_flags = (macws_qtn_proc_get_flags_fn)symbol;
+    symbol = dlsym(RTLD_DEFAULT, "_qtn_proc_apply_to_self");
+    if (symbol) {
+        MSHookFunction(symbol, (void *)macws_qtn_proc_apply_to_self,
+                       (void **)&g_macws_orig_qtn_proc_apply_to_self);
+    }
 }
 
 xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, dispatch_queue_t targetq, uint64_t flags);
@@ -10275,6 +10389,7 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 
 __attribute__((constructor)) static void InitMetalHooks() {
     macws_record_xpc_service_context_if_requested();
+    macws_install_iconservices_quarantine_fallback();
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
 

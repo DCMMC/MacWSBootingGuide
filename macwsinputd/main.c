@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <dirent.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
@@ -33,6 +34,7 @@ typedef uint32_t CGEventField;
 typedef uint32_t CGWindowID;
 typedef uint32_t CGWindowListOption;
 typedef const void *CGEventRef;
+typedef uint32_t SLSConnectionID;
 
 extern CGDirectDisplayID CGMainDisplayID(void);
 extern CGRect CGDisplayBounds(CGDirectDisplayID display);
@@ -252,21 +254,121 @@ static bool PointInRect(CGPoint point, CGRect rect) {
            point.y < rect.origin.y + rect.size.height;
 }
 
-// CGEventPost(kCGHIDEventTap) updates the posting process's cursor state in
-// this chroot, but runtime capture proved that it does not route mouse events
-// into the frontmost macOS process. Resolve the first front-to-back,
-// non-WindowServer window containing the point and use CoreGraphics' public
-// per-process route. Restricting this to layer zero made fullscreen system UI
-// structurally unreachable: runtime diagnostics on 2026-08-02 showed the real
-// Launchpad surfaces owned by Dock at layers 29 and 27; a targetPID=0 tap fell
-// through to the ineffective global route, while the same tap explicitly
-// routed to Dock pid 99793 opened the native "Other" folder. AppKit menus,
-// Dock, Launchpad, and SystemUIServer extras are intentionally nonzero-layer
-// windows, so preserve CGWindowList's authoritative front-to-back ordering
-// instead of assuming a content-window layer. WindowServer's cursor/menu
-// infrastructure is excluded by owner PID.
+typedef SLSConnectionID (*MacWSSLSMainConnectionIDFn)(void);
+typedef CFDictionaryRef
+    (*MacWSSLSCopyWindowRoutingRecordsForScreenLocationFn)(
+        SLSConnectionID connection, CGPoint location);
+typedef int32_t (*MacWSSLSConnectionGetPIDFn)(SLSConnectionID connection,
+                                              pid_t *pid);
+
+typedef struct {
+    bool attempted;
+    void *image;
+    MacWSSLSMainConnectionIDFn mainConnectionID;
+    MacWSSLSCopyWindowRoutingRecordsForScreenLocationFn
+        copyRoutingRecords;
+    MacWSSLSConnectionGetPIDFn connectionGetPID;
+} MacWSSkyLightRoutingAPI;
+
+static MacWSSkyLightRoutingAPI SkyLightRoutingAPI(void) {
+    static MacWSSkyLightRoutingAPI api;
+    if (api.attempted) return api;
+    api.attempted = true;
+    api.image = dlopen(
+        "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight",
+        RTLD_LAZY | RTLD_LOCAL);
+    if (!api.image) return api;
+    api.mainConnectionID = (MacWSSLSMainConnectionIDFn)dlsym(
+        api.image, "SLSMainConnectionID");
+    api.copyRoutingRecords =
+        (MacWSSLSCopyWindowRoutingRecordsForScreenLocationFn)dlsym(
+            api.image, "SLSCopyWindowRoutingRecordsForScreenLocation");
+    api.connectionGetPID = (MacWSSLSConnectionGetPIDFn)dlsym(
+        api.image, "SLSConnectionGetPID");
+    return api;
+}
+
+// RE-confirmed against macOS 13.4 SkyLight:
+// _SLSCopyWindowRoutingRecordsForScreenLocation at 0x18519cf58 sends the
+// queried Quartz point to WindowServer and returns the server's routing
+// property list; _SLSConnectionGetPID at 0x18536a2bc resolves each returned
+// connection ID to its owning process. Runtime captures on 2026-08-02 proved
+// that this distinguishes Finder's desktop, the active application's menu
+// bar, ControlCenter status items, Dock, and ordinary AppKit windows even when
+// Dock also owns a transparent full-display layer. Use the last valid routing
+// record because it is the deepest destination in a nested routing chain.
+static MacWSWindowTarget WindowServerRoutingTargetAtPoint(CGPoint point) {
+    MacWSWindowTarget target = {0};
+    MacWSSkyLightRoutingAPI api = SkyLightRoutingAPI();
+    if (!api.mainConnectionID || !api.copyRoutingRecords ||
+        !api.connectionGetPID) return target;
+
+    SLSConnectionID queryingConnection = api.mainConnectionID();
+    if (!queryingConnection) return target;
+    CFDictionaryRef response = api.copyRoutingRecords(queryingConnection,
+                                                       point);
+    if (!response || CFGetTypeID(response) != CFDictionaryGetTypeID()) {
+        if (response) CFRelease(response);
+        return target;
+    }
+
+    int32_t windowID = 0;
+    CFNumberRef windowValue = (CFNumberRef)CFDictionaryGetValue(
+        response, CFSTR("WindowID"));
+    if (windowValue &&
+        CFGetTypeID(windowValue) == CFNumberGetTypeID()) {
+        (void)CFNumberGetValue(windowValue, kCFNumberSInt32Type, &windowID);
+    }
+
+    CFArrayRef records = (CFArrayRef)CFDictionaryGetValue(
+        response, CFSTR("Routing Records"));
+    if (records && CFGetTypeID(records) == CFArrayGetTypeID()) {
+        for (CFIndex index = CFArrayGetCount(records); index > 0; index--) {
+            CFTypeRef value = CFArrayGetValueAtIndex(records, index - 1);
+            if (!value || CFGetTypeID(value) != CFDictionaryGetTypeID())
+                continue;
+            CFDictionaryRef record = (CFDictionaryRef)value;
+            CFNumberRef connectionValue =
+                (CFNumberRef)CFDictionaryGetValue(
+                    record, CFSTR("Connection ID"));
+            int32_t rawConnection = 0;
+            if (!connectionValue ||
+                CFGetTypeID(connectionValue) != CFNumberGetTypeID() ||
+                !CFNumberGetValue(connectionValue, kCFNumberSInt32Type,
+                                  &rawConnection) ||
+                rawConnection <= 0) {
+                continue;
+            }
+            pid_t pid = 0;
+            if (api.connectionGetPID((SLSConnectionID)rawConnection, &pid) !=
+                    0 ||
+                pid <= 1 || pid == getpid()) {
+                continue;
+            }
+            target.pid = pid;
+            target.windowID = windowID;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                        "MACWS-INPUT SLS-ROUTE point=(%.2f,%.2f) "
+                        "connection=%u pid=%d window=%d depth=%ld/%ld\n",
+                        point.x, point.y, (unsigned)rawConnection, pid,
+                        windowID, (long)index,
+                        (long)CFArrayGetCount(records));
+                fflush(stderr);
+            }
+            break;
+        }
+    }
+    CFRelease(response);
+    return target;
+}
+
+// CGEventPost(kCGHIDEventTap) updates only the posting process's cursor state
+// in this chroot. The WindowServer routing query above is the authoritative
+// path. Retain the public window-list scan solely as a compatibility fallback
+// if the private symbols or routing response are unavailable on another OS.
 // Window bounds and input points are both in Quartz logical coordinates.
-static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
+static MacWSWindowTarget WindowListFallbackTargetAtPoint(CGPoint point) {
     MacWSWindowTarget target = {0};
     static unsigned probeCount;
     bool logProbe = RuntimeDiagnosticsEnabled() && probeCount++ < 2;
@@ -343,6 +445,12 @@ static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
     if (logProbe) fflush(stderr);
     CFRelease(windows);
     return target;
+}
+
+static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
+    MacWSWindowTarget target = WindowServerRoutingTargetAtPoint(point);
+    if (target.pid > 1) return target;
+    return WindowListFallbackTargetAtPoint(point);
 }
 
 static uint64_t RealtimeNanoseconds(void) {

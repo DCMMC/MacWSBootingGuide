@@ -949,6 +949,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _textureWidth = 0;
     _textureHeight = 0;
     _contentRect = CGRectZero;
+    // A UIWindow/Stage Manager maximization animation can rescale the last
+    // CAMetalDrawable before the replacement DisplayStream generation lands.
+    // Rendering a deterministic clear frame prevents that stale exact-window
+    // image from appearing as a cropped/magnified full desktop.
+    _submittedPresentWitness = NO;
     _directTouchIndicator.hidden = YES;
     _trackpadCursorView.hidden = YES;
     if (leases.count && _commandQueue) {
@@ -963,6 +968,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         for (MacWSSurfaceFrame *frame in leases)
             [_streamClient releaseFrame:frame];
     }
+    [self setNeedsDisplay];
 }
 
 - (uint32_t)currentFrameWidth {
@@ -1672,6 +1678,32 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             [self publishStatus:self.targetWindowID != 0
                 ? @"等待该窗口的 DisplayStream IOSurface 直传帧"
                 : @"等待全屏 DisplayStream IOSurface 直传帧"];
+            // MTKView retains its previous drawable if no command buffer is
+            // submitted.  During a window -> fullscreen Scene transaction
+            // iPadOS then scales that old window-sized drawable to the panel,
+            // which looks like a cropped desktop and cannot share the new
+            // input coordinate generation.  Clear through the real Metal
+            // render pass while waiting; the first new IOSurface replaces it
+            // through the normal draw path below.
+            MTLRenderPassDescriptor *waitingPass =
+                view.currentRenderPassDescriptor;
+            id<CAMetalDrawable> waitingDrawable = view.currentDrawable;
+            if (waitingPass && waitingDrawable) {
+                waitingPass.colorAttachments[0].loadAction =
+                    MTLLoadActionClear;
+                waitingPass.colorAttachments[0].storeAction =
+                    MTLStoreActionStore;
+                waitingPass.colorAttachments[0].clearColor =
+                    MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+                id<MTLCommandBuffer> waitingBuffer =
+                    [_commandQueue commandBuffer];
+                id<MTLRenderCommandEncoder> waitingEncoder =
+                    [waitingBuffer renderCommandEncoderWithDescriptor:
+                        waitingPass];
+                [waitingEncoder endEncoding];
+                [waitingBuffer presentDrawable:waitingDrawable];
+                [waitingBuffer commit];
+            }
             return;
         }
         if (![_frame refresh]) {
@@ -2604,11 +2636,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)resetViewportZoom {
+    CGFloat previousZoom = _viewportZoom;
+    CGPoint previousCenter = _viewportCenter;
     _viewportZoom = 1.0;
     _viewportCenter = CGPointMake(0.5, 0.5);
     _contentGesturesPassthrough = NO;
     [self updateZoomHUD];
     [self setNeedsDisplay];
+    MacWSLog(@"viewport-reset previous-zoom=%.3f previous-center=(%.3f,%.3f) zoom=%.3f center=(%.3f,%.3f)",
+             previousZoom, previousCenter.x, previousCenter.y,
+             _viewportZoom, _viewportCenter.x, _viewportCenter.y);
 }
 
 - (void)viewportZoomToggled:(UITapGestureRecognizer *)recognizer {
@@ -3047,6 +3084,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _surfaceFrame = frame;
     _surfaceTexture = texture;
     _streamConnected = YES;
+    if (!previous) {
+        // suspendStream deliberately releases the old stream's base frame.
+        // applyStatus consequently disables input until the replacement has
+        // an IOSurface.  A DisplayStream connection notification can precede
+        // this frame, so publish a distinct first-frame state transition and
+        // let the controller re-evaluate the complete input invariant.
+        [self publishStatus:@"DisplayStream IOSurface 首帧已就绪"];
+    }
     // DisplayStream is now authoritative. Stop polling the legacy mmap
     // acknowledgement files until this Scene changes streams or disconnects.
     _framePollDisplayLink.paused = YES;
@@ -3081,6 +3126,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                            preferredSize:(CGSize)preferredSize
                                resizable:(BOOL)resizable;
 - (void)performURLAction:(NSString *)action;
+- (void)setFullscreenWorkspaceEnabled:(BOOL)enabled;
 - (void)openWindowInCurrentScene:(MacWSStreamWindow *)window
                           reason:(NSString *)reason;
 - (void)openWindowIDInCurrentScene:(uint32_t)windowID
@@ -3203,20 +3249,16 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
 static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
     NSString *witness = [NSString stringWithContentsOfFile:
         MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    return [witness containsString:@"version=12"] &&
+    return [witness containsString:@"version=13"] &&
         [witness containsString:
-            @"fullscreen=focused-scene-enter-action-17"];
+            @"fullscreen=focused-scene-maximization-toggle-action-17"];
 }
 
 static BOOL MacWSWindowingResizeBridgeIsLoaded(void) {
     NSString *witness = [NSString stringWithContentsOfFile:
         MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    return [witness containsString:@"version=12"] &&
-        [witness containsString:@"resize=app-layout-transaction"] &&
-        [witness containsString:
-            @"exit=primary-to-page-center-environment-3"] &&
-        [witness containsString:
-            @"return-size=system-default-on-fullscreen-state"];
+    return [witness containsString:@"version=13"] &&
+        [witness containsString:@"resize=app-layout-transaction"];
 }
 
 static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
@@ -3297,8 +3339,8 @@ static BOOL MacWSRequestNativeSceneSize(UIWindowScene *scene,
         scene, preferredSize, NO);
 }
 
-static BOOL MacWSRequestCurrentSceneFullscreen(
-        UIWindowScene *scene,
+static BOOL MacWSRequestCurrentSceneMaximization(
+        UIWindowScene *scene, BOOL expectedFullscreen,
         void (^failureHandler)(NSError *error)) {
     if (!scene || !scene.session ||
         scene.activationState != UISceneActivationStateForegroundActive) {
@@ -3331,6 +3373,7 @@ static BOOL MacWSRequestCurrentSceneFullscreen(
             @"com.macwsguide.host",
         @"scene_identifier": sceneIdentifier,
         @"session_identifier": scene.session.persistentIdentifier ?: @"",
+        @"expected_fullscreen": @(expectedFullscreen),
         @"issued_at": @(NSDate.date.timeIntervalSince1970),
         @"nonce": nonce,
     };
@@ -3340,16 +3383,18 @@ static BOOL MacWSRequestCurrentSceneFullscreen(
         return NO;
     }
 
-    MacWSLog(@"scene-fullscreen requested session=%@ fbs=%@ route=springboard-enter-fullscreen-action-17 current-bounds=%@",
+    MacWSLog(@"scene-maximization requested session=%@ fbs=%@ expected-fullscreen=%@ route=springboard-maximization-toggle-action-17 current-bounds=%@",
              scene.session.persistentIdentifier, sceneIdentifier,
+             expectedFullscreen ? @"YES" : @"NO",
              NSStringFromCGRect(scene.coordinateSpace.bounds));
     CFNotificationCenterPostNotification(
         CFNotificationCenterGetDarwinNotifyCenter(),
         MacWSRequestFullscreenNotification, NULL, NULL, true);
 
-    // The SpringBoard transaction is asynchronous. Record the authoritative
-    // UIWindowScene state after its animation window; process uptime or a
-    // successful Darwin notification is not evidence of fullscreen.
+    // The SpringBoard transaction is asynchronous. UIKit's coordinateSpace
+    // remains panel-sized for both Center and Primary layouts on iPadOS 16,
+    // so it is only an observational witness here. MacWSWindowing records the
+    // authoritative SBAppLayout role/centerConfiguration postcondition.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  1500 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
@@ -3361,20 +3406,14 @@ static BOOL MacWSRequestCurrentSceneFullscreen(
             fabs(sceneBounds.origin.y - screenBounds.origin.y) <= 1.0 &&
             fabs(sceneBounds.size.width - screenBounds.size.width) <= 1.0 &&
             fabs(sceneBounds.size.height - screenBounds.size.height) <= 1.0;
-        BOOL fullScreen = systemState || fillsScreen;
-        MacWSLog(@"scene-fullscreen result session=%@ is-fullscreen=%@ fills-screen=%@ effective=%@ bounds=%@ screen=%@",
+        MacWSLog(@"scene-maximization UIKit-observation session=%@ expected-fullscreen=%@ is-fullscreen=%@ fills-screen=%@ bounds=%@ screen=%@ authoritative-postcondition=MacWSWindowing-layout-role",
                  scene.session.persistentIdentifier,
+                 expectedFullscreen ? @"YES" : @"NO",
                  systemState ? @"YES" : @"NO",
                  fillsScreen ? @"YES" : @"NO",
-                 fullScreen ? @"YES" : @"NO",
                  NSStringFromCGRect(sceneBounds),
                  NSStringFromCGRect(screenBounds));
-        if (!fullScreen && failureHandler) {
-            NSError *error = [NSError errorWithDomain:@"MacWSWindowing"
-                code:2 userInfo:@{NSLocalizedDescriptionKey:
-                    @"SpringBoard 没有把当前窗口提升为全屏"}];
-            failureHandler(error);
-        }
+        (void)failureHandler;
     });
     return YES;
 }
@@ -3841,9 +3880,9 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     _semanticMenuHeightConstraint.constant = fullscreen ? 0.0 : 26.0;
     if (_menuBarButton) {
         [self setButton:_menuBarButton
-                  title:fullscreen && _workspaceReturnValid
-                      ? @"恢复窗口模式" : @"打开全屏 macOS 工作区"
-                  image:fullscreen && _workspaceReturnValid
+                  title:fullscreen
+                      ? @"进入窗口模式" : @"打开全屏 macOS 工作区"
+                  image:fullscreen
                       ? @"arrow.down.right.and.arrow.up.left"
                       : @"arrow.up.left.and.arrow.down.right"];
     }
@@ -5411,6 +5450,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                             reason:(NSString *)reason {
     if (windowID == 0 || ownerPID <= 1) return;
     [_metalView suspendStream];
+    // A Scene is reused across per-window and desktop presentation. A
+    // double-tap zoom belongs to the old stream's coordinate space; carrying
+    // it into the new stream crops the desktop and maps input into that stale
+    // crop. Reset before installing the new stream identity.
+    [_metalView resetViewportZoom];
     _streamMode = MacWSStreamModeWindow;
     _windowID = windowID;
     _windowOwnerPID = ownerPID;
@@ -5458,6 +5502,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         CGSize returnSceneSize = _workspaceReturnSceneSize;
         BOOL returnResizable = _workspaceReturnResizable;
         NSString *returnTitle = [_workspaceReturnTitle copy];
+        BOOL requestedSystemWindowed =
+            MacWSRequestCurrentSceneMaximization(
+                self.view.window.windowScene, NO,
+                ^(NSError *error) {
+                    [self setNotice:[NSString stringWithFormat:
+                        @"macOS 窗口已经恢复，但 iPadOS 无法退出最大化：%@",
+                        error.localizedDescription ?: @"未知错误"]
+                             success:NO];
+                });
         _workspaceReturnValid = NO;
         _workspaceReturnWindowID = 0;
         _workspaceReturnOwnerPID = 0;
@@ -5480,19 +5533,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _metalView.targetWindowResizable = returnResizable;
         MacWSRememberSceneBinding(self.view.window.windowScene.session,
                                   [self streamRestorationActivity]);
-        BOOL requestedOriginalSize =
-            returnSceneSize.width >= 150.0 && returnSceneSize.height >= 150.0 &&
-            MacWSRequestNativeSceneSizeWithRole(
-                self.view.window.windowScene, returnSceneSize, YES);
         [self hideControls];
-        [self setNotice:requestedOriginalSize
-            ? @"正在恢复进入全屏前的 iPadOS 窗口尺寸"
-            : @"已恢复进入全屏前的 macOS 窗口"
-                 success:YES];
-        MacWSLog(@"scene-reused mode=window restored-from-workspace window=%u owner=%d group=%u scene-size=%.1fx%.1f native-size-requested=%@",
+        [self setNotice:requestedSystemWindowed
+            ? @"正在通过 iPadOS 系统动画恢复窗口模式"
+            : @"已切回 macOS 窗口内容；iPadOS 窗口模式请求不可用"
+                 success:requestedSystemWindowed];
+        MacWSLog(@"scene-reused mode=window restored-from-workspace window=%u owner=%d group=%u remembered-scene-size=%.1fx%.1f system-unzoom-requested=%@",
                  returnWindowID, returnOwnerPID, returnGroupID,
                  returnSceneSize.width, returnSceneSize.height,
-                 requestedOriginalSize ? @"YES" : @"NO");
+                 requestedSystemWindowed ? @"YES" : @"NO");
         return;
     }
 
@@ -5508,12 +5557,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _workspaceReturnGroupID = _windowGroupID;
     _workspaceReturnMinimumSize = _windowMinimumSize;
     _workspaceReturnPreferredSize = _windowPreferredSize;
+    // UIWindowScene.coordinateSpace is panel-sized even for a Stage Manager
+    // Center window on iPadOS 16 (runtime: 1389x970 in both roles). The root
+    // view is the actual Scene content extent. Preserve it only as a witness;
+    // SpringBoard's maximization toggle owns restoration of the native size.
+    CGSize currentViewSize = self.view.bounds.size;
     _workspaceReturnSceneSize =
-        self.view.window.windowScene.coordinateSpace.bounds.size;
+        currentViewSize.width >= 150.0 && currentViewSize.height >= 150.0
+            ? currentViewSize : _windowPreferredSize;
     _workspaceReturnResizable = _windowResizable;
     _workspaceReturnTitle = [self.view.window.windowScene.title copy];
     BOOL activatedExactWindow = [self activateCurrentMacWindow];
     [_metalView suspendStream];
+    [_metalView resetViewportZoom];
     _streamMode = MacWSStreamModeFullscreen;
     _windowID = 0;
     _windowOwnerPID = 0;
@@ -5540,8 +5596,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // not strand the AppKit window or turn the toggle into a one-way action.
     MacWSRememberSceneBinding(self.view.window.windowScene.session,
                               [self streamRestorationActivity]);
-    BOOL requestedSystemFullscreen = MacWSRequestCurrentSceneFullscreen(
-        self.view.window.windowScene,
+    BOOL requestedSystemFullscreen = MacWSRequestCurrentSceneMaximization(
+        self.view.window.windowScene, YES,
         ^(NSError *error) {
             [self setNotice:[NSString stringWithFormat:
                 @"完整 macOS 桌面已经打开，但 iPadOS 无法最大化当前窗口：%@",
@@ -5556,6 +5612,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     MacWSLog(@"scene-reused mode=fullscreen previous-window-activated=%@ system-fullscreen-requested=%@",
              activatedExactWindow ? @"YES" : @"NO",
              requestedSystemFullscreen ? @"YES" : @"NO");
+}
+
+- (void)setFullscreenWorkspaceEnabled:(BOOL)enabled {
+    BOOL active = _streamMode == MacWSStreamModeFullscreen;
+    if (active == enabled) {
+        MacWSLog(@"workspace-mode request idempotent requested=%@ active=%@",
+                 enabled ? @"fullscreen" : @"window",
+                 active ? @"fullscreen" : @"window");
+        return;
+    }
+    [self openFullscreenWorkspace];
 }
 
 - (void)refreshStatus {
@@ -5892,6 +5959,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self performSemanticShortcutForDiagnostics:@"⌘O"];
     } else if ([action isEqualToString:@"fullscreen"]) {
         [self openFullscreenWorkspace];
+    } else if ([action isEqualToString:@"enter-workspace"]) {
+        [self setFullscreenWorkspaceEnabled:YES];
+    } else if ([action isEqualToString:@"exit-workspace"]) {
+        [self setFullscreenWorkspaceEnabled:NO];
     } else if ([action isEqualToString:@"close-window"]) {
         [self closeCurrentWindow];
     } else if ([action isEqualToString:@"screenshot-ui"]) {
@@ -5906,8 +5977,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)metalView:(MacWSMetalView *)view statusChanged:(NSString *)status {
-    (void)view;
     _statusLabel.text = [@"画面：" stringByAppendingString:status];
+    if (view.hasDirectSurfaceFrame && !view.isMacWSInputEnabled) {
+        MacWSLog(@"display-stream first-frame revalidate-input mode=%lu target=%d status=%@",
+                 (unsigned long)_streamMode, view.targetPID, status);
+        [self refreshStatus];
+    }
 }
 
 - (void)openInitialFinderBrowserWindowIfNeeded:
@@ -6820,6 +6895,15 @@ static void MacWSDeduplicateWindowScenes(void) {
 
 - (void)scene:(UIScene *)scene openURLContexts:(NSSet<UIOpenURLContext *> *)URLContexts {
     for (UIOpenURLContext *context in URLContexts) {
+        if ([context.URL.host isEqualToString:@"toggle-workspace"]) {
+            MacWSViewController *controller =
+                [self.window.rootViewController
+                    isKindOfClass:MacWSViewController.class]
+                    ? (MacWSViewController *)self.window.rootViewController
+                    : nil;
+            if (controller) [controller openFullscreenWorkspace];
+            break;
+        }
         if ([context.URL.host isEqualToString:@"new"]) {
             uint32_t windowID = 0;
             int32_t ownerPID = 0;
@@ -6935,6 +7019,7 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"glassdemo", @"terminal", @"vscode", @"activity-monitor", @"finder",
                @"recover", @"repair", @"capture",
                @"test-open-file", @"fullscreen",
+               @"enter-workspace", @"exit-workspace",
                @"close-window",
                @"screenshot-ui", @"screenshot-screen",
                @"hide-controls", @"show-controls"]

@@ -8904,15 +8904,79 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 // WS and clients, so both rewrites are consistent.
 #define CARENDER_ORIG "com.apple.CARenderServer"
 #define CARENDER_NEW  "com.apple.macosbooter.CARenderServer"
+static const char *macws_private_bootstrap_service_name(const char *name) {
+    if (!name) return name;
+    if (!strcmp(name, CARENDER_ORIG))
+        return CARENDER_NEW;
+    return name;
+}
+
+// Ventura cfprefsd selects its daemon/agent role from the launchd session when
+// initWithRole: receives the automatic role (0).  RE-confirmed in the target
+// CoreFoundation:
+//   initWithRole:testMode: +0x080..+0x0f4 calls vproc_swap_string key 6,
+//   compares the result with "System", then stores role 2 for System or role 1
+//   for a login/background session.  iOS has no per-user launchd domains at
+//   all (`launchctl help` states this explicitly), so the private agent job is
+//   unavoidably classified as a second daemon and never executes checkIn.
+//
+// Preserve the stock role-selection code and translate only the missing
+// launchd-session value for our dedicated private cfprefsd `agent` invocation.
+// The original vproc call, errors, all other keys/processes, and daemon launch
+// remain authoritative.  strdup keeps the documented caller-owned result
+// contract after releasing the original vproc string.
+extern void *vproc_swap_string(void *vproc, int key,
+                               const char *input, char **output);
+static bool macws_is_private_cfprefsd_agent(void) {
+    const char *program = getprogname();
+    int *argc_pointer = _NSGetArgc();
+    char ***argv_pointer = _NSGetArgv();
+    return program && strcmp(program, "macws-cfprefsd") == 0 &&
+        argc_pointer && *argc_pointer >= 2 && argv_pointer && *argv_pointer &&
+        (*argv_pointer)[1] && strcmp((*argv_pointer)[1], "agent") == 0;
+}
+
+static void *vproc_swap_string_new(void *vproc, int key,
+                                   const char *input, char **output) {
+    void *error = vproc_swap_string(vproc, key, input, output);
+    if (!error && key == 6 && input == NULL && output && *output &&
+        strcmp(*output, "System") == 0 &&
+        macws_is_private_cfprefsd_agent()) {
+        char *background = strdup("Background");
+        if (background) {
+            free(*output);
+            *output = background;
+        }
+    }
+    return error;
+}
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
 extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
 kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_t *sp) {
-    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
-    return bootstrap_look_up(bp, name, sp);
+    const char *originalName = name;
+    name = macws_private_bootstrap_service_name(name);
+    kern_return_t result = bootstrap_look_up(bp, name, sp);
+    if (getenv("MACWS_XPC_DEBUG")) {
+        fprintf(stderr,
+                "#### BOOTSTRAP look_up '%s'%s%s%s -> %#x port=%#x\n",
+                originalName ?: "(null)", name != originalName ? " -> '" : "",
+                name != originalName ? name : "", name != originalName ? "'" : "",
+                result, sp ? *sp : MACH_PORT_NULL);
+    }
+    return result;
 }
 kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port_t *sp) {
-    if(name && !strcmp(name, CARENDER_ORIG)) name = CARENDER_NEW;
-    return bootstrap_check_in(bp, name, sp);
+    const char *originalName = name;
+    name = macws_private_bootstrap_service_name(name);
+    kern_return_t result = bootstrap_check_in(bp, name, sp);
+    if (getenv("MACWS_XPC_DEBUG")) {
+        fprintf(stderr,
+                "#### BOOTSTRAP check_in '%s'%s%s%s -> %#x port=%#x\n",
+                originalName ?: "(null)", name != originalName ? " -> '" : "",
+                name != originalName ? name : "", name != originalName ? "'" : "",
+                result, sp ? *sp : MACH_PORT_NULL);
+    }
+    return result;
 }
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
@@ -15320,6 +15384,7 @@ DYLD_INTERPOSE(CVDisplayLinkCreateWithCGDisplay_new,
                CVDisplayLinkCreateWithCGDisplay);
 DYLD_INTERPOSE(CVDisplayLinkSetOutputCallback_new,
                CVDisplayLinkSetOutputCallback);
+DYLD_INTERPOSE(vproc_swap_string_new, vproc_swap_string);
 
 // XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
 // signed-equivalent so the kernel runs the full privileged UC-init (sets

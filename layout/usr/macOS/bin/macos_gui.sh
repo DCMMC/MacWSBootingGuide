@@ -62,6 +62,10 @@ TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
 LSD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd.plist"
+CFPREFSD_DAEMON_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-daemon.plist"
+CFPREFSD_AGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-agent.plist"
+ICONSERVICESD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesd.plist"
+ICONSERVICESAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesagent.plist"
 FINDER_DESKTOP_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.finder-desktop.plist"
 DOCK_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.dock.plist"
 SYSTEMUI_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.systemuiserver.plist"
@@ -75,6 +79,10 @@ TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
 PBS_LABEL=com.macwsguide.pbs
 LSD_LABEL=com.macwsguide.lsd
+CFPREFSD_DAEMON_LABEL=com.macwsguide.cfprefsd-daemon
+CFPREFSD_AGENT_LABEL=com.macwsguide.cfprefsd-agent
+ICONSERVICESD_LABEL=com.macwsguide.iconservicesd
+ICONSERVICESAGENT_LABEL=com.macwsguide.iconservicesagent
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
 DOCK_LABEL=com.macwsguide.dock
 SYSTEMUI_LABEL=com.macwsguide.systemuiserver
@@ -142,6 +150,15 @@ FINDER_BIN=/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
 DOCK_BIN=/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
 SYSTEMUI_BIN=/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
 CONTROL_CENTER_BIN=/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+ICONSERVICESD_BIN=/System/Library/CoreServices/iconservicesd
+ICONSERVICESAGENT_BIN=/System/Library/CoreServices/iconservicesagent
+# Never launch Ventura's stock cfprefsd image directly.  iPadOS AMFI rejects
+# its Apple CT policy, while the project's broad chroot entitlement profile
+# gives it com.apple.security.system-container and makes sandbox_init kill it.
+# postinst creates this byte-identical private copy with the dedicated minimal
+# cfprefsd entitlement profile that was runtime-validated on iPadOS 16.3.
+CFPREFSD_BIN=/usr/local/libexec/macws-cfprefsd
+DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
 WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png'
@@ -166,6 +183,8 @@ P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_DOCK='CoreServices/Dock.app/Contents/MacOS/Dock'
 P_SYSTEMUI='CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer'
 P_CONTROL_CENTER='CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter'
+P_ICONSERVICESD='CoreServices/iconservicesd'
+P_ICONSERVICESAGENT='CoreServices/iconservicesagent'
 P_INPUTD='/usr/local/bin/macwsinputd'
 P_DISPLAYD='/usr/local/bin/macwsdisplayd'
 P_INTEROPD='/usr/local/bin/macwsinteropd'
@@ -441,6 +460,10 @@ stop_ws_dependents() {
     launchctl remove "$CHROME150_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
+    launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
+    launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
+    launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
+    launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         launchctl unload "$workspace_plist" 2>/dev/null
@@ -468,6 +491,8 @@ stop_ws_dependents() {
     kill_by_pattern "$P_DOCK"
     kill_by_pattern "$P_SYSTEMUI"
     kill_by_pattern "$P_CONTROL_CENTER"
+    kill_by_pattern "$P_ICONSERVICESAGENT"
+    kill_by_pattern "$P_ICONSERVICESD"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
@@ -526,6 +551,10 @@ recover_ws_dependents() {
     [ ! -f "$DISPLAY_PLIST" ] || launchctl load "$DISPLAY_PLIST" 2>/dev/null
     [ ! -f "$INTEROP_PLIST" ] || launchctl load "$INTEROP_PLIST" 2>/dev/null
     [ ! -f "$LSD_PLIST" ] || launchctl load "$LSD_PLIST" 2>/dev/null
+    [ ! -f "$ICONSERVICESD_PLIST" ] || \
+        launchctl load "$ICONSERVICESD_PLIST" 2>/dev/null
+    [ ! -f "$ICONSERVICESAGENT_PLIST" ] || \
+        launchctl load "$ICONSERVICESAGENT_PLIST" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         [ ! -f "$workspace_plist" ] || launchctl load "$workspace_plist" 2>/dev/null
@@ -699,28 +728,70 @@ vscode_bundle_trusted() {
         /var/jb/usr/bin/grep -Fqi "$hash"
 }
 
+# cfprefsd is now a direct outer-launchd target, so autosignd cannot repair it:
+# AMFI evaluates the executable before libmachook can connect to autosignd.
+# Runtime-confirmed on iPadOS 16.3: the stock Ventura signature is killed with
+# "unsuitable CT policy 0x8 for this platform/device" and launchd records exit
+# status 9.  Require both the persistent project entitlement marker and the
+# current-boot arm64e trustcache entry before any CFPreferences client starts.
+macos_cfprefsd_trusted() {
+    local binary="$ROOTFS$CFPREFSD_BIN" hash=""
+    [ -f "$binary" ] || return 1
+    /var/jb/usr/bin/ldid -e "$binary" 2>/dev/null |
+        /var/jb/usr/bin/grep -q \
+            '<key>com.apple.private.graphics-restart-no-kill</key>' || return 1
+    hash=$(/var/jb/usr/bin/ldid -arch arm64e -h "$binary" 2>/dev/null |
+        /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
+    [ -n "$hash" ] || return 1
+    /var/jb/usr/bin/jbctl trustcache info 2>/dev/null |
+        /var/jb/usr/bin/grep -Fqi "$hash"
+}
+
+# Repair the same-volume temporary directory contract that Ventura
+# CoreFoundation's cfprefsd requires for atomic plist replacement.  The
+# mounted macOS /private/var is a distinct filesystem root in this chroot, so
+# iPadOS _dirhelper_relative resolves it beneath /private/var/.TemporaryItems.
+# LLDB runtime-confirmed all three components and their required modes.  Keep
+# this in the production start path as well as postinst so cold starts repair
+# an incomplete/restored rootfs before the first preferences client connects.
+ensure_cfprefsd_dirhelper_tree() {
+    local temporary_root="$ROOTFS/private/var/.TemporaryItems"
+    local temporary_user="$temporary_root/folders.0"
+    local temporary_leaf="$temporary_user/TemporaryItems"
+
+    mkdir -p "$temporary_leaf" || return 1
+    chown root:wheel "$temporary_root" "$temporary_user" "$temporary_leaf" \
+        2>/dev/null || true
+    chmod 1311 "$temporary_root" || return 1
+    chmod 0700 "$temporary_user" "$temporary_leaf" || return 1
+}
+
 # Self-heal both post-reboot failure classes before starting WindowServer.
 # One postinst pass restores the base chroot plus every persistent executable
 # signature in VS Code's nested frameworks; both witnesses must pass afterward.
 ensure_chroot_works() {
-    local chroot_ok=0 vscode_ok=0
+    local chroot_ok=0 vscode_ok=0 cfprefs_ok=0
 
     log "Checking the macOS chroot is runnable..."
     chroot_works && chroot_ok=1
     vscode_bundle_trusted && vscode_ok=1
-    if [ "$chroot_ok" -eq 1 ] && [ "$vscode_ok" -eq 1 ]; then
-        log "chroot and VS Code trust sentinels OK."
+    macos_cfprefsd_trusted && cfprefs_ok=1
+    if [ "$chroot_ok" -eq 1 ] && [ "$vscode_ok" -eq 1 ] &&
+       [ "$cfprefs_ok" -eq 1 ]; then
+        log "chroot, VS Code, and macOS cfprefsd trust sentinels OK."
         return 0
     fi
     [ "$chroot_ok" -eq 1 ] ||
         log "chroot not runnable (base trustcache is incomplete)."
     [ "$vscode_ok" -eq 1 ] ||
         log "VS Code Electron Framework is not trusted (application trustcache is incomplete)."
+    [ "$cfprefs_ok" -eq 1 ] ||
+        log "macOS cfprefsd lacks the project signature or current-boot trustcache entry."
     if [ -f "$POSTINST" ]; then
         log "Re-registering trustcaches via postinst.sh (~1 min)..."
         bash "$POSTINST" > "$LOGDIR/postinst.log" 2>&1
-        if chroot_works && vscode_bundle_trusted; then
-            log "chroot and VS Code trust sentinels OK after postinst."
+        if chroot_works && vscode_bundle_trusted && macos_cfprefsd_trusted; then
+            log "chroot, VS Code, and macOS cfprefsd trust sentinels OK after postinst."
             return 0
         fi
     fi
@@ -945,6 +1016,60 @@ PLIST
 </plist>
 PLIST
 
+    # A normal macOS login bootstrap publishes both CFPreferences services
+    # before Dock/Finder start.  Runtime-confirmed on the target: without the
+    # macOS agent, Dock creates a LaunchPadDBName and immediately reports that
+    # its ByHost domain is non-persistent, so no Launchpad database is created.
+    # iPadOS publishes identically named but platform-incompatible endpoints;
+    # libmachook maps these private listeners and every chroot client together.
+    cat > "$CFPREFSD_DAEMON_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${CFPREFSD_DAEMON_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${CFPREFSD_BIN}</string>
+        <string>daemon</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.cfprefsd.daemon</key><true/></dict>
+    <key>EnableTransactions</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>${LOGDIR}/cfprefsd-daemon.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/cfprefsd-daemon.log</string>
+</dict>
+</plist>
+PLIST
+
+    cat > "$CFPREFSD_AGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${CFPREFSD_AGENT_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${CFPREFSD_BIN}</string>
+        <string>agent</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.cfprefsd.agent</key><true/></dict>
+    <key>EnableTransactions</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>${LOGDIR}/cfprefsd-agent.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/cfprefsd-agent.log</string>
+</dict>
+</plist>
+PLIST
+
     # Ventura applications use /usr/libexec/lsd, not the legacy
     # launchservicesd endpoint alone.  iPadOS publishes the same com.apple.lsd
     # names in user/501; without isolation the chroot's lsregister runtime-
@@ -984,6 +1109,58 @@ PLIST
     <key>KeepAlive</key><false/>
     <key>StandardOutPath</key><string>${LOGDIR}/lsd.log</string>
     <key>StandardErrorPath</key><string>${LOGDIR}/lsd.log</string>
+</dict>
+</plist>
+PLIST
+
+    # IconServices is normally split between a system store daemon and a
+    # per-login agent.  The chroot has neither launchd domain, while iPadOS
+    # publishes incompatible services under the same bootstrap names.  Run
+    # the two stock Ventura executables with their stock UID split and publish
+    # collision-free names; libmachook maps both listeners and clients.
+    cat > "$ICONSERVICESD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${ICONSERVICESD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>240</string><string>240</string>
+        <string>${ROOTFS}</string><string>${ICONSERVICESD_BIN}</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.iconservices.store</key><true/></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/iconservicesd.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/iconservicesd.log</string>
+</dict>
+</plist>
+PLIST
+
+    cat > "$ICONSERVICESAGENT_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${ICONSERVICESAGENT_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${ICONSERVICESAGENT_BIN}</string>
+        <string>runAsRoot</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.iconservices</key><true/></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/iconservicesagent.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/iconservicesagent.log</string>
 </dict>
 </plist>
 PLIST
@@ -1439,6 +1616,14 @@ cleanup_macos() {
     launchctl remove "$PBS_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
+    launchctl unload "$CFPREFSD_AGENT_PLIST" 2>/dev/null
+    launchctl unload "$CFPREFSD_DAEMON_PLIST" 2>/dev/null
+    launchctl remove "$CFPREFSD_AGENT_LABEL" 2>/dev/null
+    launchctl remove "$CFPREFSD_DAEMON_LABEL" 2>/dev/null
+    launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
+    launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
+    launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
+    launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         launchctl unload "$workspace_plist" 2>/dev/null
@@ -1476,6 +1661,8 @@ cleanup_macos() {
     kill_by_pattern "$P_DOCK"
     kill_by_pattern "$P_SYSTEMUI"
     kill_by_pattern "$P_CONTROL_CENTER"
+    kill_by_pattern "$P_ICONSERVICESAGENT"
+    kill_by_pattern "$P_ICONSERVICESD"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
@@ -1551,6 +1738,27 @@ seed_launchservices_database() {
     log "LaunchServices application catalog ready."
 }
 
+verify_preferences_persistence() {
+    local value=""
+    rm -f "$LOGDIR/cfprefsd-probe.log"
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+            com.macwsguide.bootstrap PersistentPreferencesReady -bool true \
+            > "$LOGDIR/cfprefsd-probe.log" 2>&1; then
+        log "ERROR: private macOS CFPreferences write failed."
+        tail -n 20 "$LOGDIR/cfprefsd-probe.log" 2>/dev/null || true
+        return 1
+    fi
+    value=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+        com.macwsguide.bootstrap PersistentPreferencesReady 2>> \
+        "$LOGDIR/cfprefsd-probe.log") || value=""
+    if [ "$value" != 1 ]; then
+        log "ERROR: private macOS CFPreferences domain is not persistent (read='$value')."
+        tail -n 20 "$LOGDIR/cfprefsd-probe.log" 2>/dev/null || true
+        return 1
+    fi
+    log "Private macOS CFPreferences database ready."
+}
+
 apply_workspace_wallpaper() {
     if [ ! -x "$ROOTFS$WORKSPACECTL_BIN" ]; then
         log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
@@ -1623,6 +1831,24 @@ start_macos() {
         return 1
     }
 
+    log "Publishing private macOS CFPreferences daemon and login agent..."
+    ensure_cfprefsd_dirhelper_tree || {
+        log "ERROR: could not prepare the CFPreferences atomic-write hierarchy."
+        return 1
+    }
+    rm -f "$LOGDIR/cfprefsd-daemon.log" "$LOGDIR/cfprefsd-agent.log"
+    launchctl load "$CFPREFSD_DAEMON_PLIST" || return 1
+    launchctl load "$CFPREFSD_AGENT_PLIST" || return 1
+    launchctl list "$CFPREFSD_DAEMON_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private macOS cfprefsd daemon contract was not registered."
+        return 1
+    }
+    launchctl list "$CFPREFSD_AGENT_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private macOS cfprefsd agent contract was not registered."
+        return 1
+    }
+    verify_preferences_persistence || return 1
+
     log "Publishing the private macOS LaunchServices database services..."
     rm -f "$LOGDIR/lsd.log"
     launchctl load "$LSD_PLIST" || return 1
@@ -1630,6 +1856,42 @@ start_macos() {
         log "ERROR: private macOS lsd MachService contract was not registered."
         return 1
     }
+
+    # Register the stock IconServices store and root-session agent before
+    # lsregister asks LaunchServices to resolve application resources.  Merely
+    # leaving these services to the iOS bootstrap namespace produced an empty
+    # Launchpad and transparent Dock tiles; clients were speaking to the wrong
+    # platform contract.  Both processes must remain alive, not merely have a
+    # launchd label, before the application catalog scan begins.
+    log "Starting private macOS IconServices store and session agent..."
+    rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
+    launchctl load "$ICONSERVICESD_PLIST" || return 1
+    launchctl load "$ICONSERVICESAGENT_PLIST" || return 1
+    waited=0
+    while [ "$waited" -lt 10 ]; do
+        proc_running "$P_ICONSERVICESD" &&
+            proc_running "$P_ICONSERVICESAGENT" && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_ICONSERVICESD" || {
+        log "ERROR: macOS iconservicesd did not stay alive. See $LOGDIR/iconservicesd.log"
+        return 1
+    }
+    proc_running "$P_ICONSERVICESAGENT" || {
+        log "ERROR: macOS iconservicesagent did not stay alive. See $LOGDIR/iconservicesagent.log"
+        return 1
+    }
+    # The former quarantine failure happened after the process was briefly
+    # visible, so a single ps sample falsely declared readiness.  Require the
+    # same two endpoints to survive beyond that startup window.
+    sleep 2
+    proc_running "$P_ICONSERVICESD" && proc_running "$P_ICONSERVICESAGENT" || {
+        log "ERROR: a macOS IconServices endpoint exited during startup."
+        tail -n 20 "$LOGDIR/iconservicesagent.log" 2>/dev/null || true
+        return 1
+    }
+    log "Private macOS IconServices endpoints ready."
 
     seed_launchservices_database || return 1
 

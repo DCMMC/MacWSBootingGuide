@@ -74,9 +74,13 @@ env	MACWS_KEEP_VALIDATE_ALWAYS	off	diagnostic scaffold	Forces historical validat
 env	MACWS_MACH_MSG_TRACE	off	diagnostic	Mach-message trace.
 env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-policy compatibility.
 env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
+env	MACWS_METAL_PROBE_DUMP_FUNCTION_METHODS	off	standalone probe	Prints specialization/library-related Objective-C methods on probe MTLFunction objects.
+env	MACWS_METAL_PROBE_DUMP_LIBRARY_METHODS	off	standalone probe	Prints function-related Objective-C methods on a loaded probe MTLLibrary object.
 env	MACWS_METAL_PROBE_EVENT_ONLY	off	standalone probe	Restricts metal_source_probe to its event test.
 env	MACWS_METAL_PROBE_EXACT_SOURCE	off	standalone probe	Replays a captured MSL file byte-for-byte without adding the normal cache-busting comment.
+env	MACWS_METAL_PROBE_LIBRARY_PATH	off	standalone probe	Loads the exact precompiled metallib path requested by the bounded Metal source probe.
 env	MACWS_METAL_PROBE_PAUSE_SECONDS	off	standalone probe	Pauses metal_source_probe for debugger attachment.
+env	MACWS_METAL_PROBE_PIPELINE	off	standalone probe	Continues a precompiled-library probe through function specialization and render-pipeline creation.
 env	MACWS_METAL_PROBE_SOURCE_ONLY	off	standalone probe	Skips event creation and GPU submission so a captured MSL library can be replayed in isolation.
 env	MACWS_METAL_PROBE_SOURCE_PATH	off	standalone probe	Compiles Metal source read from the exact requested path.
 env	MACWS_METAL_PROBE_FUNCTION	off	standalone probe	Loads the named function after a source-path probe compile.
@@ -89,6 +93,7 @@ env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight
 env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
 env	MACWS_SURF_FILL_IOS	off	diagnostic	IOSurface fill probe.
 env	MACWS_SUSPEND_AT_EXEC	off	diagnostic	SIGSTOP immediately after injection for LLDB attach.
+env	MACWS_SUSPEND_TARGET	off	diagnostic	Narrows MACWS_SUSPEND_AT_EXEC to one exact executable path or basename; absent means every launcher target.
 env	MACWS_TEX_TRACE	off	diagnostic	Texture call trace.
 env	MACWS_VNC_LOW_LATENCY_COMPRESSION	on	OSXvnc	Clamp negotiated compression work factor to measured level 1.
 env	MACWS_VNC_INPUT_MODE	off	OSXvnc A/B control	Explicitly selects stock, scale-only, or hybrid input ownership; production leaves it unset and obtains hybrid behavior from MACWS_VNC_NATIVE_ALL=1.

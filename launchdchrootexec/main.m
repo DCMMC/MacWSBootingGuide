@@ -88,10 +88,18 @@ int main(int argc, char *argv[], char *envp[]) {
     // state. Lets us race-attach lldb before a single instruction runs.
     // Resume with `process continue` in lldb or `kill -CONT <pid>`.
     short spawn_flags = POSIX_SPAWN_SETEXEC;
-    if (getenv("MACWS_SUSPEND_AT_EXEC")) {
+    const char *suspendTarget = getenv("MACWS_SUSPEND_TARGET");
+    const char *targetBasename = strrchr(execPath, '/');
+    targetBasename = targetBasename ? targetBasename + 1 : execPath;
+    int suspendRequested = getenv("MACWS_SUSPEND_AT_EXEC") != NULL;
+    int suspendTargetMatches = !suspendTarget || !*suspendTarget ||
+        !strcmp(suspendTarget, targetBasename) ||
+        !strcmp(suspendTarget, execPath);
+    if (suspendRequested && suspendTargetMatches) {
         spawn_flags |= POSIX_SPAWN_START_SUSPENDED;
-        fprintf(stderr, "[launchdchrootexec] MACWS_SUSPEND_AT_EXEC set — %s will start STOPPED\n",
-                execPath);
+        fprintf(stderr,
+                "[launchdchrootexec] MACWS_SUSPEND_AT_EXEC target=%s — %s will start STOPPED\n",
+                suspendTarget ?: "*", execPath);
     }
     if(posix_spawnattr_setflags(&attr, spawn_flags) != 0) {
         perror("posix_spawnattr_set_flags");

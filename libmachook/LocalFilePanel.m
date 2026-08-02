@@ -31,20 +31,38 @@ static id MacWSRuntimeString(const char *UTF8) {
 
 __attribute__((constructor))
 static void MacWSUseNativeInProcessFilePanels(void) {
-    Class defaultsClass = objc_getClass("NSUserDefaults");
-    id defaults = defaultsClass
-        ? ((id (*)(id, SEL))objc_msgSend)(
-              (id)defaultsClass, sel_registerName("standardUserDefaults"))
-        : nil;
-    id key = MacWSRuntimeString("NSUseRemoteSavePanel");
-    if (!defaults || !key) return;
-    ((void (*)(id, SEL, BOOL, id))objc_msgSend)(
-        defaults, sel_registerName("setBool:forKey:"), NO, key);
+    // This preference is meaningful only to AppKit clients.  The old global
+    // constructor called +[NSUserDefaults standardUserDefaults] in every
+    // injected process, including defaults(1), cfprefsd, and launchservicesd.
+    // Runtime-confirmed with LLDB on the target: that constructor reached
+    // _CFXPreferences::_copyDaemonConnection... and cached the iPadOS
+    // com.apple.cfprefsd.daemon endpoint before libmachook's private-service
+    // routing hook was installed.  The later production persistence probe
+    // therefore talked to the incompatible iOS daemon and failed.
+    //
+    // AppKit is already mapped before an AppKit executable's constructors run.
+    // Limit the preference to those clients and enqueue it after all dylib
+    // constructors have installed their service routing.  This preserves the
+    // stock NSLocalOpenPanel selection without initializing CFPreferences in
+    // unrelated daemons.
+    if (!objc_getClass("NSApplication")) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class defaultsClass = objc_getClass("NSUserDefaults");
+        id defaults = defaultsClass
+            ? ((id (*)(id, SEL))objc_msgSend)(
+                  (id)defaultsClass,
+                  sel_registerName("standardUserDefaults"))
+            : nil;
+        id key = MacWSRuntimeString("NSUseRemoteSavePanel");
+        if (!defaults || !key) return;
+        ((void (*)(id, SEL, BOOL, id))objc_msgSend)(
+            defaults, sel_registerName("setBool:forKey:"), NO, key);
 
-    if (getenv("MACWS_FILE_PANEL_DIAG")) {
-        fprintf(stderr,
-                "MACWS_FILE_PANEL native=AppKit-in-process "
-                "NSUseRemoteSavePanel=0\n");
-        fflush(stderr);
-    }
+        if (getenv("MACWS_FILE_PANEL_DIAG")) {
+            fprintf(stderr,
+                    "MACWS_FILE_PANEL native=AppKit-in-process "
+                    "NSUseRemoteSavePanel=0\n");
+            fflush(stderr);
+        }
+    });
 }
