@@ -7,5 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = MacWSWindowing
 MacWSWindowing_FILES = Tweak.x
 MacWSWindowing_CFLAGS = -fobjc-arc -Wall -Wextra
+MacWSWindowing_FRAMEWORKS = Foundation UIKit
 
 include $(THEOS_MAKE_PATH)/tweak.mk

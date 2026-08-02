@@ -9,6 +9,15 @@
 #define MACWS_DIRECT_GESTURE_THRESHOLD_POINTS 6.0
 #define MACWS_DIRECT_LONG_PRESS_SECONDS 0.45
 
+// A dispatch_after callback is only a visual/feedback hint.  The Host main
+// queue can be busy presenting a large IOSurface when that callback becomes
+// runnable, while UIKit's already-recorded touch-up is still waiting behind
+// it.  Always use the UITouch hardware timestamps at the next real event to
+// decide whether the hold duration was actually reached.
+static inline bool MacWSTouchReachedLongPress(double elapsedSeconds) {
+    return elapsedSeconds >= MACWS_DIRECT_LONG_PRESS_SECONDS;
+}
+
 typedef enum {
     MacWSTouchCandidateDecisionWait = 0,
     MacWSTouchCandidateDecisionTap,
@@ -53,7 +62,7 @@ static inline MacWSTouchCandidateDecision MacWSDecideTouchCandidate(
     // main-queue timer cannot reinterpret an already-moving finger as a hold.
     if (travelPoints >= MACWS_DIRECT_GESTURE_THRESHOLD_POINTS)
         return MacWSTouchCandidateDecisionScroll;
-    if (elapsedSeconds >= MACWS_DIRECT_LONG_PRESS_SECONDS)
+    if (MacWSTouchReachedLongPress(elapsedSeconds))
         return MacWSTouchCandidateDecisionLongPress;
     return didEnd ? MacWSTouchCandidateDecisionTap
                   : MacWSTouchCandidateDecisionWait;

@@ -4,6 +4,15 @@
 `192.168.1.6`。本轮没有重启 iPad，也没有降低或绕过任何温控、内存
 安全阈值。
 
+> 2026-08-02 更正：本文第 1、2 节保存的是当时的诊断阶段，不是当前产品
+> 架构。后续目标 AppKit 反编译和运行截图证明，可以通过
+> `NSUseRemoteSavePanel=NO` 使用 Ventura 自带的
+> `NSLocalOpenPanel → NSLocalSavePanel → NSPanel`；MacWS 自制文件浏览器已全部
+> 删除。当前 Scene 全屏也已改为精确 FBS Scene ID + SpringBoard 系统 action
+> 11，不再使用 `_requestFullscreen` Scene activation。当前实现与证据边界见
+> `docs/ipados-host-panels-finder-fullscreen-20260802.md` 和
+> `docs/displaystream-host-architecture.md`。
+
 ## 1. VSCode Open File
 
 VSCode 的实际日志连续记录：

@@ -52,7 +52,12 @@ env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bin
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
 env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
 env	MACWS_DUMP_BACKING	off	diagnostic	Texture backing dump.
-env	MACWS_FILE_PANEL_DIAG	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls.
+env	MACWS_FILE_PANEL_DIAG	off	file-panel diagnostic	Logs selection of Ventura AppKit's native in-process NSOpenPanel/NSSavePanel implementation.
+env	MACWS_NATIVE_PANEL_DIRECTORY	off	standalone native-panel probe	Optional initial directory for misc/native_open_panel_probe.c.
+env	MACWS_NATIVE_PANEL_HOLD	off	standalone native-panel probe	Stops the diagnostic process before panel construction for an explicit debugger attach.
+env	MACWS_NATIVE_PANEL_INPROCESS	off	standalone native-panel probe	Sets NSUseRemoteSavePanel=NO and exercises the public NSOpenPanel factory.
+env	MACWS_NATIVE_PANEL_INVENTORY	off	standalone native-panel probe	Prints the realized AppKit OpenPanel/SavePanel runtime classes and methods.
+env	MACWS_NATIVE_PANEL_LOCAL	off	standalone native-panel probe	Diagnostic-only direct NSLocalOpenPanel construction for comparing the public factory path.
 env	MACWS_GLASS_BLUR_AB	off	diagnostic	GlassDemo blur A/B hook.
 env	MACWS_GOT_RAW_AUTH	off	diagnostic	Raw authenticated GOT inspection.
 env	MACWS_GOT_SKIP_AUTH	off	diagnostic	Skips authenticated GOT repair entries.
@@ -144,6 +149,7 @@ flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
 flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
 flag	/tmp/macws_app_input_diagnostics	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 flag	/tmp/macws_file_panel_diag	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls; production startup removes it.
+flag	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled	off	SpringBoard windowing	Emergency opt-out for MacWS dense Stage Manager size candidates; absence means the production grid expansion remains enabled.
 flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
 flag	/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Native iOS-seatbelt spelling of the compiler diagnostics sentinel; equivalent to the rootless alias and removed by production preflight.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
@@ -159,6 +165,12 @@ flag	/private/tmp/macws_xpc_proxy_trace	off	XPC proxy diagnostic	Logs the real p
 state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion interval, currently 100000 us.
 state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
 state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.
+state	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded	transient	SpringBoard windowing	Loaded-code witness. Production Host requires v6 with fullscreen=exact-scene-keyboard-action-11 and resize=app-layout-transaction before sending private layout requests.
+request	/var/mobile/Library/Preferences/com.macwsguide.windowing.fullscreen-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene fullscreen request; SpringBoard deletes it after performing or rejecting system keyboard action 11.
+request	/var/mobile/Library/Preferences/com.macwsguide.windowing.resize-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene preferred-size request; SpringBoard deletes it after the immutable app-layout transaction succeeds or fails.
+notification	com.macwsguide.windowing.request-fullscreen	transient	MacWSHost to SpringBoard	Wakeup only; authority and exact target are read from the bounded fullscreen request plist.
+notification	com.macwsguide.windowing.request-resize	transient	MacWSHost to SpringBoard	Wakeup only; authority, dimensions and exact target are read from the bounded resize request plist.
+default	NSUseRemoteSavePanel	off	macOS GUI clients	Set in-process so Ventura AppKit uses its native NSLocalOpenPanel/NSLocalSavePanel instead of the unavailable remote ViewBridge service; this does not substitute an iOS picker.
 state	/tmp/macws_vnc_activity	transient	VNC input	Monotonic input timestamp selecting the 16.667 ms interactive interval.
 state	/tmp/macws_interaction_wake.sock	transient	VNC/Host input	WindowServer-owned datagram wakeup for interrupting the current 100 ms idle completion wait; event producers only signal it after publishing macws_vnc_activity.
 state	/tmp/macws_vnc_activation_reply.sock	transient	VNC input	Bound OSXvnc acknowledgement endpoint; skips the historical fixed 20 ms wait only when macwsinputd proves the hit target is already active/frontmost.

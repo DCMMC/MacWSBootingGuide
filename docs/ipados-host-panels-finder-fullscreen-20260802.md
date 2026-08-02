@@ -33,31 +33,32 @@ The first tap after another app owned the front process can still be an
 activation transaction; the next tap opens the native menu. This is a real
 macOS lifecycle constraint rather than a duplicated local click.
 
-## 2. Functional local Open panel
+## 2. Ventura's native in-process Open panel
 
-Ventura's stock `NSOpenPanel` construction enters the ViewBridge open/save
-service. That service is not loadable in this chroot and the caller aborted
-before a panel could be returned. The replacement lives at the construction
-boundary (`+[NSOpenPanel openPanel]` and
-`+[NSSavePanel _crunchyRawUnbonedPanel]`) and returns a real AppKit window with
-real filesystem `NSURL` results.
+The earlier Host build contained an AppKit-looking filesystem browser written
+by MacWS. That was useful as a diagnostic scaffold, but it was not a macOS
+native Open panel and therefore was not a valid product fix. It has been
+removed in full.
 
-Two arm64e invariants were found rather than bypassed:
+RE-confirmed via the target macOS 13.4 AppKit
+`-[NSLocalSavePanel _useRemotePanel]`: the `NSUseRemoteSavePanel` default
+selects whether the public `NSOpenPanel` factory uses the remote
+OpenAndSavePanel/ViewBridge service. That auxiliary service graph is not
+available in the chroot. AppKit itself also ships the complete in-process
+implementation with the runtime inheritance chain
+`NSLocalOpenPanel → NSLocalSavePanel → NSPanel`.
 
-1. `bash-2026-08-02-042833.ips` trapped in libobjc `readClass` while
-   authenticating static `OBJC_CLASS_$_MacWSLocalFilePanelController` metadata.
-   Both helper classes are now created by `objc_allocateClassPair`, so macOS
-   libobjc owns/signs the class metadata.
-2. `bash-2026-08-02-043543.ips` then trapped while `NSLog` consumed an
-   authenticated `__CFConstantStringClassReference`. The panel implementation
-   now creates its strings through the realized `NSString` runtime class.
-
-The production arm64e smoke test now reaches the target command:
+The production constructor now performs one upstream selection only:
 
 ```text
-[launchdchrootexec] target=/bin/bash arch=arm64e insert=/usr/local/lib/libmachook.dylib
-MACWS_ARM64E_FINDER_WAIT_OK
+[[NSUserDefaults standardUserDefaults]
+    setBool:NO forKey:@"NSUseRemoteSavePanel"]
 ```
+
+The target application still calls its ordinary `+[NSOpenPanel openPanel]`,
+`runModal`/sheet APIs, delegates and URL accessors. MacWS does not replace the
+class or factory, manufacture a modal result, duplicate Finder UI in UIKit, or
+force a validation function to succeed.
 
 The Host semantic-menu response path also normalizes an iOS-side reply address
 from `/var/mnt/rootfs/private/tmp/...` to its chroot spelling
@@ -71,9 +72,13 @@ VS Code:  item=30 title='Open…' shortcut='⌘O'
 action status=1
 ```
 
-Exact screen captures showed the browser at `/Users/root` in both apps. Escape
-closed each panel and both processes remained alive. Production logs contained
-none of `####`, `MACWS_FILE_PANEL`, or per-input tracing.
+Runtime-confirmed via the target iPad screenshot
+`/tmp/macws-native-open-panel.png` (2388×1668, SHA-256
+`ff224dbb4558a9090dcf835237ba141172132ec16b50d63eb970c2a2a458fcfc`):
+the real Ventura Finder-style native `NSOpenPanel` appeared in the chroot
+desktop. Escape closed the panel and the client process remained alive.
+Production logs contained none of `####`, `MACWS_FILE_PANEL`, or per-input
+tracing.
 
 ## 3. Finder bootstrap
 
@@ -134,40 +139,60 @@ path changed from approximately 4.9 s to 2.2 s:
 1785618599.107 launch-app window-ready id=vscode pid=29717 path=DisplayStream
 ```
 
-## 5. Fullscreen Scene lifecycle
+## 5. Native Scene creation, initial size, and immersive fullscreen
 
-The prior failure is runtime-confirmed by the Host log:
+The old fullscreen implementation asked UIKit to activate a Scene again. That
+could create or reconnect the wrong lifecycle object and was the source of the
+black secondary window. It has been removed. Fullscreen is now a presentation
+transition of the Scene the user is already operating:
 
-```text
-scene-fullscreen preserve-mark count=0
-scene-fullscreen requested
-scene-reused mode=fullscreen
-scene-close source=did-discard ...
-```
+1. Host changes that Scene from the exact-window stream to the complete desktop
+   stream without creating a second `UISceneSession`.
+2. Host writes a short-lived request containing the exact private FBS Scene ID.
+3. A SpringBoard tweak verifies that ID still equals
+   `activeDisplayWindowScene.sceneIdentifier`.
+4. It follows the exact call sequence RE-confirmed in 20D67 SpringBoard
+   `-[SpringBoard _handleMakeFullscreenKeyShortcut:]` at `0x1c7669964`:
+   `switcherController` checks and performs keyboard shortcut action `0x0b`.
+5. Host hides the status bar and Home Indicator in desktop-stream mode and
+   verifies `UIWindowScene.isFullScreen` after the system animation.
 
-The fullscreen request reconnects the current iPadOS Scene and can discard
-other Stage Manager sessions. Those callbacks were incorrectly interpreted as
-user window closes, so the transition closed the real Terminal/VS Code/Finder
-windows and left a black workspace with only an empty menu layer.
+This leaves Chamois, workspace validation, safe areas and animation under
+SpringBoard ownership. There is no direct `UIWindow.frame` write, CALayer
+stretch, forced condition or black placeholder Scene. An exact-ID mismatch is
+rejected rather than accidentally maximizing another app.
 
-Before requesting system fullscreen, the Host now enumerates every live
-connected Scene and obtains its authoritative `streamRestorationActivity`
-directly from the live `MacWSViewController`; persisted/session activities are
-fallbacks only. A bounded persisted allowlist makes transition-driven
-`didDiscardSceneSessions:` preserve the represented AppKit windows. Ordinary
-red-X/discard behavior is unchanged outside that transaction.
+New macOS top-level windows are also automatic. Runtime-confirmed via
+`MacWSHost.log`: a Terminal catalog transition from one to two windows emitted
+`window-auto-scene identity=25808:g:21`, followed by
+`scene-activation requested` and `scene-connected ... window=21`. The identity
+uses owner PID plus AppKit logical tab/window group, so one macOS window cannot
+silently occupy two Host Scenes.
 
-The updated Host binary is installed on the target. Final on-device UI
-validation is pending only because the lock-state probe currently reports:
+UIKit Scene activation exposes only discrete preferred size categories. To
+preserve a small macOS utility window's real initial size, v6 sends its exact
+FBS Scene ID and AppKit preferred frame to SpringBoard after connection.
+RE-confirmed via
+`-[SBItemResizeGestureSwitcherModifier
+_responseForSceneSizeUpdateToSize:center:sceneUpdatesOnly:]` at `0x1c79cfaf4`
+and the coordinator submit path at `0x1c79e67b8`: the tweak uses the same
+`SBDisplayItemAttributedSizeInfer`, immutable layout-attribute mutation,
+`SBMutableSwitcherTransitionRequest`, and `SBMainWorkspace` transaction as a
+real Stage Manager resize.
 
-```text
-springboard port=3335 locked=1 passcode_enabled=1
-notify name=com.apple.springboard.lockstate register=0 get=0 state=1
-```
-
-No lock-state bypass is attempted. After unlock, the acceptance witness is
-`scene-fullscreen preserve-mark count>=1`, a fullscreen reconnect, advancing
-fullscreen DisplayStream frames, and no close record for a marked Scene.
+The v6 binaries are installed on the target. The currently running SpringBoard
+still reports the v3 loaded witness. Per the no-reboot/no-respring safety
+constraint, this session did not force-load v6. Acceptance after the next
+natural SpringBoard load requires both `isFullScreen=YES` with hidden system
+bars and a small-window `resize-performed ... route=SBMainWorkspace` log whose
+final Scene bounds match the system-clamped requested size. The final local
+rootless package SHA-256 is
+`2281aa4194b7b08b5e0458cfbb8d0922a53d56d688358e042fa1c06c2e1e8036`;
+the target disk hashes are
+`dc2c3ac3ae0f693b2425b617bcc8864724c34d9aaa24588633cb554a66d15ccb`
+for Host and
+`8d3f3d4f9a3140b6d287a68d768405f0c3bc745b25429f84525539f7b9b97ab6`
+for the v6 tweak.
 
 ## Production switch state
 

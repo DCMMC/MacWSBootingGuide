@@ -29,6 +29,9 @@ int main(void) {
     // an already-moving finger must not become a delayed long press.
     assert(MacWSDecideTouchCandidate(0.45, 6.0, false) ==
            MacWSTouchCandidateDecisionScroll);
+    assert(!MacWSTouchReachedLongPress(0.10));
+    assert(!MacWSTouchReachedLongPress(0.449));
+    assert(MacWSTouchReachedLongPress(0.45));
     assert(MacWSChooseDirectScrollAxis(2.0, 6.0) ==
            MacWSDirectScrollAxisVertical);
     assert(MacWSChooseDirectScrollAxis(6.0, 4.6) ==

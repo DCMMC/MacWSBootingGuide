@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-01；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入和 Carbon 右键菜单选择已在目标 iPad 运行确认。完整桌面已实现为 Retina 底层 IOSurface + 可见 SkyLight 窗口分层直传；当前 Scene 的 iPadOS 系统最大化已接入目标 UIKitCore 的真实 activation-options 请求。最终包已部署；产生误停止的 58% 空闲内存护栏已撤销，二者的设备运行回归继续进行。四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-02；单窗 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择以及 Ventura 原生 `NSOpenPanel` 已在目标 iPad 运行确认。完整桌面已实现为 Retina 底层 IOSurface + 可见 SkyLight 窗口分层直传。当前 Scene 的沉浸式全屏和新 Scene 初始尺寸已接入目标 SpringBoard 的真实工作区布局事务；v6 产物已部署，但为避免无人值守设备丢失越狱状态，本轮没有重启 SpringBoard，运行结果继续作为明确门槛。四窗与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -17,8 +17,8 @@
 | 核心工作 | 非常简要的工作原理 | 当前状态 |
 |---|---|---|
 | DisplayStream 直传 | SkyLight 窗口流产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture；完整桌面按真实窗口目录分层合成 | 精确基础窗和同 owner 瞬态层已在 iPad runtime-confirmed；完整桌面 producer/consumer 已实现并通过编译，设备回归待完成 |
-| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放；进入工作区时复用当前 session 并请求系统 fullscreen activation | 单窗、四标签身份跟随、重复 Scene 去重和进程复用已实现；当前 Scene 内容切换与系统最大化请求已实现，最大化结果及关闭 Scene 的真实窗口关闭待设备回归 |
-| 台前调度密集尺寸档位 | iPadOS 16 的 SpringBoard `Chamois` 布局对象保存可选宽高数组；参考 TrollPad 增加候选档位，最终仍走系统 Scene geometry 事务 | RE-confirmed；设备已记录宽 109/高 36 个候选及多种 Scene geometry，物理拖动手感待复测 |
+| macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放；新 macOS 顶层窗口稳定后自动请求一个新 Scene；工作区复用当前 Scene 并调用 SpringBoard 自己的全屏 action 11 | 新窗口目录 1→2 后自动创建 Scene 已 runtime-confirmed；精确 FBS Scene 全屏请求已实现和部署，待 v6 自然装载后验证沉浸结果 |
+| 台前调度密集尺寸与初始大小 | SpringBoard `Chamois` 保存可选宽高数组；参考 TrollPad 增加候选档位。新 Scene 再以真实 macOS frame 为建议尺寸，走 `SBMutableSwitcherTransitionRequest → SBMainWorkspace` | 密集网格已 runtime-confirmed；精确 Scene 初始尺寸事务为 RE-confirmed、已实现和部署，待 v6 自然装载后验证小面板尺寸 |
 | 比例稳定显示 | 1× 始终完整等比；重排交接期允许短暂边距，不拉伸、不裁边 | 已实现并有纯 C 单测 |
 | 小窗口保护 | AppKit 发布窗口真实最小尺寸；Scene 小于要求时整窗遮罩并停止向该窗口注入输入 | 已实现；iPad 待验证 |
 | 触屏/键鼠双密度 | 改变 Scene 对应的 macOS 逻辑窗口尺寸，让触屏模式控件更大、键鼠模式信息更多 | 已实现；iPad 待验证 |
@@ -76,6 +76,20 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 - Scene 进入后台时取消订阅；Metal fence 完成后释放所有 IOSurface lease。恢复前不把旧截图当成可交互画面。
 - Host 以 `owner PID + logical group`（无 group 时为精确 `CGWindowID`）作为 Scene 身份。重复打开优先激活既有 Scene；连接后若仍发现重复，保留前台优先级最高的一份并销毁其余 Scene，且销毁去重副本时明确保留 macOS 原窗口。
 - 启动 allowlist 应用前，hostd 用 `proc_pidpath` 与解析后的 chroot 可执行文件绝对路径做精确身份匹配。已有进程若已发布窗口 metrics 就直接复用；若尚无可捕获窗口则拒绝生成第二个实例并返回明确状态。
+- 窗口目录出现新的稳定逻辑窗口组后，Host 自动请求一个新 Scene。runtime-confirmed via `MacWSHost.log`：Terminal 窗口目录从 1 增加到 2 后出现 `window-auto-scene identity=25808:g:21`、`scene-activation requested` 和 `scene-connected ... window=21`。这条路径按 owner/group 工作，不按应用名 hardcode。
+- Scene activation 只能携带系统的离散 preferred size category，不能表达任意 `CGSize`。Host 因此把新 macOS 窗口的真实 frame size 与精确 FBS Scene ID 写入短期请求；SpringBoard tweak 找到该 Scene 对应的 `SBDisplayItem`，沿系统 immutable app-layout transaction 提交建议尺寸。小工具面板可以请求接近真实小尺寸，最终仍由系统边界、网格和应用最小尺寸钳制。
+
+#### 当前 Scene 的沉浸式全屏
+
+“打开全屏工作区”不是创建第二个 Scene，也不是把当前 Metal layer 缩放到窗口边缘：
+
+1. Host 把**当前** Scene 从单窗流切换为完整桌面流并保留同一 session。
+2. Host 用 `-[UIScene _sceneIdentifier]` 取得精确 FBS ID，写入 15 秒内有效的一次性请求。
+3. SpringBoard 只在 `activeDisplayWindowScene.sceneIdentifier` 与请求完全相等时，调用系统 `canPerformKeyboardShortcutAction:0x0b` / `performKeyboardShortcutAction:0x0b`。焦点若已变化就拒绝，绝不放大别的应用。
+4. SpringBoard 自己完成 Chamois/app-layout 转换与动画；Host 同时在桌面流模式返回 `prefersStatusBarHidden=YES`、`prefersHomeIndicatorAutoHidden=YES` 并延迟四边系统手势，形成视频/游戏式沉浸显示。
+5. 1.5 秒后以真实 `UIWindowScene.isFullScreen` 和 Scene/screen bounds 作为结果证据。通知送达或进程存活本身不算成功。
+
+RE-confirmed via 20D67 SpringBoard `-[SpringBoard _handleMakeFullscreenKeyShortcut:]` `0x1c7669964`：系统自己的“窗口全屏”快捷键就是上述 action 11 路径。本轮 v6 tweak 与 Host 已部署，但现存 SpringBoard 仍报告 v3 witness；遵守“不主动重启/respring”约束，必须等下次自然装载后才能标为 runtime-confirmed。
 
 #### 台前调度尺寸档位突破
 
@@ -259,6 +273,12 @@ iPadOS 的三指左/右滑撤销/重做属于 UIKit 标准编辑交互，应用�
 - 每次读取 iPadOS general pasteboard 必须由用户动作触发，避免无意触发系统粘贴隐私提示。
 - 同一内容由 origin/generation 去重，服务重启后也不得在两端无限回弹。
 - 安全作用域 URL 必须在复制完成后成对结束访问；路径需 canonicalize 并限制在允许的 rootfs/暂存目录内。
+
+**macOS 原生打开/保存面板**
+
+- “打开文件”仍由目标 macOS 应用执行自己的 `⌘O` / `NSDocumentController` 动作；Host 不弹 iOS `UIDocumentPickerViewController`，也不复制一个外观相似的 UIKit 文件浏览器。
+- RE-confirmed via macOS 13.4 AppKit `-[NSLocalSavePanel _useRemotePanel]`：`NSUseRemoteSavePanel` 默认值决定是否走远程 ViewBridge。chroot 中缺少该远程面板服务，所以生产构造器把 `NSUseRemoteSavePanel` 设置为 `NO`，让 AppKit 自己选择同进程的 `NSLocalOpenPanel → NSLocalSavePanel → NSPanel`。
+- runtime-confirmed via 2026-08-02 目标 iPad 可见截图 `/tmp/macws-native-open-panel.png`：Ventura Finder 风格的原生 `NSOpenPanel` 完整出现。实现没有替换 `NSOpenPanel` 类、没有伪造 modal result，也没有 always-YES 校验 hook。
 
 ## 三、开发技术细节
 
@@ -488,7 +508,7 @@ NSMainMenu
 
 以上是二进制逆向事实。content shape 是否精确包含标题栏、阴影以及与 `NSWindow.frame` 的像素偏移，仍然是设备运行门槛，不由这段 RE 自动证明。
 
-### 3. iPadOS 16.3.1 台前调度档位的 Source 与 RE 证据
+### 3. iPadOS 16.3.1 Scene 布局的 Source 与 RE 证据
 
 **开源实现证据**
 
@@ -504,7 +524,11 @@ NSMainMenu
 - RE-confirmed via `-[SBSwitcherChamoisSettings layoutAttributesForContainerBounds:…]` `0x1c7bd2448`：生成的宽高数组分别在 `0x1c7bd2cb8` / `0x1c7bd2cc4` 通过上述 setter 写入 layout attributes。
 - RE-confirmed via `-[SBSwitcherChamoisSettings _nearestGridSizeForSize:gridWidths:gridHeights:bounds:]` `0x1c7bd311c`：函数分别对两个数组执行 `count → objectAtIndex: → doubleValue`，用 `fabd` 计算候选值与请求宽/高的绝对差，并保留差值最小的候选。这证明数组内容参与真实 Stage Manager 尺寸量化，而不是只影响窗口装饰或截图比例。
 - RE-confirmed 的能力是“任意提供一组合法候选值并由系统吸附到最近值”。TrollPad 实际提供 20 point 密集离散网格；每 1 point 连续档位、低于系统/应用安全下限以及最终 Scene geometry 提交仍未 runtime-confirmed。
-- RE-confirmed via 目标 20D67 `UIKitCore:0x18a166598-0x18a1665a4`：`UISceneActivationRequestOptions` 的 `_requestFullscreen` / `_setRequestFullscreen:` 直接读取和写入 offset `0x9` 的 boolean；同一二进制的 `UIApplication requestSceneSessionActivation:...` 在 `0x189de13a8-0x189de13b0` 把 activation options 与 target session 交给 `initialClientSettings:activationOptions:targetSession:`。因此工作区按钮使用当前 session + 真实 fullscreen activation flag，而不是新建 Scene 或拉伸现有 layer；系统是否接受已 active session 的请求仍待 runtime-confirmed。
+- RE-confirmed via 目标 20D67 SpringBoard `-[SpringBoard _handleMakeFullscreenKeyShortcut:]` `0x1c7669964`：`windowSceneManager → activeDisplayWindowScene → switcherController` 后检查并执行 keyboard shortcut action `0x0b`。生产全屏桥复用这条完整系统路径，不再依赖只面向 Scene activation 的 `_requestFullscreen` flag。
+- RE-confirmed via 目标 20D67 UIKitCore `-[UIScene _sceneIdentifier]` `0x189322ff0` 与 SpringBoard `+[SBDisplayItem applicationDisplayItemWithBundleIdentifier:sceneIdentifier:]` `0x1c773f33c`：前者返回的 FBS Scene ID 被后者用作 display item `uniqueIdentifier`，可以精确区分同一 Host bundle 的多个窗口。
+- RE-confirmed via 目标 20D67 UIKitCore symbol/disassembly inventory：`-[UIWindowScene isFullScreen]` 位于 `0x189f44284`，`-[UISceneActivationRequestOptions requestingScene]` / `setRequestingScene:` 位于 `0x18a166564` / `0x18a16656c`。Host 用前者作为异步结果 witness，并仅用后者归属新 Scene activation；不再设置未证明有用的 layout 私有 flag。
+- RE-confirmed via `-[SBItemResizeGestureSwitcherModifier _responseForSceneSizeUpdateToSize:center:sceneUpdatesOnly:]` `0x1c79cfaf4`：系统尺寸路径调用 `_SBDisplayItemAttributedSizeInfer`，通过 `attributesByModifyingAttributedSize:` / `attributesByModifyingSizingPolicy:` 构造不可变 layout attributes，再用 `appLayoutByModifyingLayoutAttributes:forItem:` 和 `appLayoutByBringingItemToFront:inAppLayout:` 得到新 app layout，最后创建 `SBMutableSwitcherTransitionRequest`。
+- RE-confirmed via `-[SBMainSwitcherControllerCoordinator switcherContentController:performTransitionWithRequest:gestureInitiated:]` `0x1c79e67b8`：非手势请求被提交给 `SBMainWorkspace`。MacWS 初始尺寸桥按同一 ABI 和对象事务执行；不直接写 SpringBoard ivar、`UIWindow.frame` 或 CALayer transform。
 
 因此当前把密集尺寸档位列为高可行性、RE-confirmed 工作项，同时保留设备运行门槛：记录原始数组、证明 hook 命中、证明 `UIWindowScene.bounds` 采用新增档位，并完成 safe area、输入坐标、键盘、拖放和四窗稳定性回归。TrollPad 的 150 point 下限不能提升为 MacWS 的已证实安全不变量。
 
@@ -532,7 +556,8 @@ NSMainMenu
 仍待确认或修复：
 
 - 全屏 `CGDisplayStream` 当前能成功 start 但没有发布帧；新实现改用 Retina canvas + 完整 on-screen SkyLight 窗口分层直传，设备首帧、z-order、菜单栏/Dock、动态窗口和内存上界仍待 runtime-confirmed。生产 Host 不再用 mmap 静默掩盖这个缺口。
-- 当前 session 的 `_requestFullscreen=YES` 是否被 iPadOS 16.3.1 接受并产生真实最大化 geometry；必须同时记录请求日志、Scene bounds 变化和系统拒绝错误，不能用内容铺满当前小 Scene 代替。
+- v6 自然装载后验证精确 FBS Scene 的 action 11 是否产生真实 `isFullScreen=YES`、Scene bounds 变化、状态栏/Home Indicator 隐藏以及原 Scene session 不变；不能用内容铺满当前小 Scene 代替。
+- v6 自然装载后从真实小型 macOS utility panel 创建新 Scene，记录请求尺寸、`resize-performed ... route=SBMainWorkspace`、最终 Scene bounds 和 AppKit frame；静态 RE 与构建成功不能替代这条运行证据。
 - 四个前台 Scene 在台前调度下持续稳定。
 - 用手指连续拖过密集档位，逐档确认 `UIWindowScene.bounds`、drawable、AppKit frame 和输入坐标一致；已有运行 witness 只证明新增候选和多种 Scene geometry 已出现，不能替代该交互回归。
 - 验证密集档位的系统级影响和 Scene 隔离；当前 setter hook 仍改变全局候选数组，非 MacWS 应用不得因此出现布局、safe area、键盘、拖放或触摸命中回归。
