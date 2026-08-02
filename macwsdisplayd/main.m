@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOSurface/IOSurface.h>
 
@@ -13,6 +14,7 @@
 #include <xpc/xpc.h>
 
 #include "macws_menu_protocol.h"
+#include "macws_display_geometry.h"
 #include "macws_stream_protocol.h"
 
 // macOS 13.4 SkyLight RE witness (binary UUID
@@ -45,6 +47,7 @@ static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
 static CGFloat ObservedWindowBackingScale;
+static CGFloat AppKitMainDisplayBackingScale;
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
 static void ScheduleGeometryStreamRestart(void);
 static void ScheduleCatalogBroadcast(void);
@@ -296,6 +299,13 @@ static CGFloat MainDisplayBackingScale(void) {
     if (ObservedWindowBackingScale >= 0.5 &&
         ObservedWindowBackingScale <= 8.0)
         return ObservedWindowBackingScale;
+    // NSScreen is the authoritative AppKit point-to-backing-pixel mapping.
+    // The chroot virtual display's CGDisplayPixelsWide/High runtime-report its
+    // logical extent, so that API pair alone collapses Retina to 1x during a
+    // cold fullscreen subscription before any exact-window frame is observed.
+    if (AppKitMainDisplayBackingScale >= 0.5 &&
+        AppKitMainDisplayBackingScale <= 8.0)
+        return AppKitMainDisplayBackingScale;
     CGDirectDisplayID display = CGMainDisplayID();
     CGRect bounds = CGDisplayBounds(display);
     size_t pixelWidth = CGDisplayPixelsWide(display);
@@ -755,10 +765,19 @@ static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
 
 static IOSurfaceRef CreateWorkspaceCanvas(MacWSDisplayClient *client) {
     CGDirectDisplayID display = CGMainDisplayID();
-    size_t width = CGDisplayPixelsWide(display);
-    size_t height = CGDisplayPixelsHigh(display);
-    if (width == 0 || height == 0 || width > MACWS_STREAM_MAX_DIMENSION ||
-        height > MACWS_STREAM_MAX_DIMENSION || width > SIZE_MAX / 4)
+    CGRect logicalBounds = CGDisplayBounds(display);
+    CGFloat backingScale = MainDisplayBackingScale();
+    size_t width = 0, height = 0;
+    // runtime-confirmed via macwsdisplayd.log on iPad13,6: the old canvas was
+    // 1194x834 at scale 2 while the compositor published a 2388x1668 desktop
+    // and layer destinations. That mixed coordinate spaces, cropping the
+    // desktop and shifting every fullscreen input point by 2x.
+    if (!MacWSPhysicalDisplayExtent(logicalBounds.size.width,
+                                    logicalBounds.size.height,
+                                    backingScale,
+                                    MACWS_STREAM_MAX_DIMENSION,
+                                    &width, &height) ||
+        width > SIZE_MAX / 4)
         return NULL;
     // iOS 16.3 Metal's _mtlValidateStrideTextureParameters asks the native
     // AGX device for iosurfaceReadOnlyTextureAlignmentBytes before importing
@@ -805,7 +824,7 @@ static IOSurfaceRef CreateWorkspaceCanvas(MacWSDisplayClient *client) {
         for (size_t x = 0; x < width; x++) row[x] = 0xff25282du;
     }
     IOSurfaceUnlock(surface, 0, NULL);
-    client.windowBackingScale = MainDisplayBackingScale();
+    client.windowBackingScale = backingScale;
     return surface;
 }
 
@@ -1238,6 +1257,17 @@ static void AcceptConnection(xpc_connection_t connection) {
 
 int main(void) {
     @autoreleasepool {
+        // Establish the AppKit display mapping once on the main thread. The
+        // serial display queue then consumes only this immutable scalar on
+        // catalog/frame hot paths.
+        NSScreen *screen = NSScreen.mainScreen ?: NSScreen.screens.firstObject;
+        CGFloat appKitScale = screen.backingScaleFactor;
+        if (isfinite(appKitScale) && appKitScale >= 0.5 &&
+            appKitScale <= 8.0) {
+            AppKitMainDisplayBackingScale = appKitScale;
+            DisplayLog(@"runtime-confirmed AppKit display backing-scale=%.3f frame=%@",
+                       appKitScale, NSStringFromRect(screen.frame));
+        }
         DisplayQueue = dispatch_queue_create("com.macwsguide.display.queue",
                                              DISPATCH_QUEUE_SERIAL);
         MenuQueue = dispatch_queue_create("com.macwsguide.display.menu",

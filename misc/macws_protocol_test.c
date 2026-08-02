@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "macws_interop_protocol.h"
+#include "macws_display_geometry.h"
 #include "macws_host_protocol.h"
 #include "macws_menu_protocol.h"
 #include "macws_stream_protocol.h"
@@ -14,6 +15,14 @@ static int Near(float lhs, float rhs) {
 }
 
 int main(void) {
+    size_t physicalWidth = 0, physicalHeight = 0;
+    assert(MacWSPhysicalDisplayExtent(1194.0, 834.0, 2.0, 8192,
+                                      &physicalWidth, &physicalHeight));
+    assert(physicalWidth == 2388 && physicalHeight == 1668);
+    assert(!MacWSPhysicalDisplayExtent(1194.0, 834.0, 0.0, 8192,
+                                       &physicalWidth, &physicalHeight));
+    assert(!MacWSPhysicalDisplayExtent(5000.0, 5000.0, 2.0, 8192,
+                                       &physicalWidth, &physicalHeight));
     assert(MACWS_INPUT_VERSION == 4u);
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);

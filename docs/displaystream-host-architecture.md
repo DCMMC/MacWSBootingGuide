@@ -88,6 +88,9 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 3. SpringBoard 只在 `activeDisplayWindowScene.sceneIdentifier` 与请求完全相等时，调用系统 `canPerformKeyboardShortcutAction:0x0b` / `performKeyboardShortcutAction:0x0b`。焦点若已变化就拒绝，绝不放大别的应用。
 4. SpringBoard 自己完成 Chamois/app-layout 转换与动画；Host 同时在桌面流模式返回 `prefersStatusBarHidden=YES`、`prefersHomeIndicatorAutoHidden=YES` 并延迟四边系统手势，形成视频/游戏式沉浸显示。
 5. 1.5 秒后以真实 `UIWindowScene.isFullScreen` 和 Scene/screen bounds 作为结果证据。通知送达或进程存活本身不算成功。
+6. 全屏是可逆的 Scene presentation state。进入前保存精确 window/PID/logical group、AppKit 尺寸约束、Scene 尺寸和标题；同一按钮第二次触发时恢复同一窗口流并通过真实 app-layout resize transaction 请求原 Scene 尺寸。返回点写入 `NSUserActivity`，进程被 UIKit 回收后也不能变成单向切换；全屏 Scene 被关闭时仍按返回身份关闭对应 AppKit 窗口。
+
+全屏只显示完整桌面流中的 macOS 原生菜单栏；Host 的单窗语义菜单栏高度收敛为 0。控制中心入口是独立的右上角半透明材质按钮，不依赖语义菜单栏；展开面板使用跟随 macOS 浅/深主题的实色 `systemBackgroundColor`，避免固定 dark blur 与动态标签/填充混色。
 
 RE-confirmed via 20D67 SpringBoard `-[SpringBoard _handleMakeFullscreenKeyShortcut:]` `0x1c7669964`：系统自己的“窗口全屏”快捷键就是上述 action 11 路径。本轮 v6 tweak 与 Host 已部署，但现存 SpringBoard 仍报告 v3 witness；遵守“不主动重启/respring”约束，必须等下次自然装载后才能标为 runtime-confirmed。
 
@@ -551,11 +554,14 @@ NSMainMenu
 - runtime-confirmed via `MacWSHostd.log` / `MacWSHost.log`：再次打开 Terminal 命中 `launch-app reuse id=terminal pid=99577 ... identity=proc_pidpath`，随后 Host 记录 `launch-auto-window app=terminal pid=99577 window=15 group=15`；测试前后只有一个该可执行文件进程。
 - runtime-confirmed via SpringBoard witness：dense-grid height 为 `original=4 expanded=36 minimum=603 maximum=922`，width 为 `original=8 expanded=109 minimum=327 maximum=1341`；Host 同期收到 `710x810`、`1004x670`、`1004x807`、`1052x671` 等 Scene geometry。该证据确认新增候选和多种真实 Scene bounds 已到运行系统，但用户手指拖过全部档位的最终手感仍待复测。
 - runtime-confirmed via Terminal diagnostics：一条 420-point scroll change 命中精确窗口 54 并记录 `route=NSWindow.sendEvent`，截图显示内容实际滚动。120 个约 60 Hz scroll change 在 2.003 秒内发送；第 120 帧记录 capture→receipt 1.615 ms、receipt→submit 5.755 ms、submit→complete 2.633 ms，producer `outstanding=1 dropped=0`。这不是整段交互的 input-to-visible p95，不能据此宣称完整 60 fps 验收已通过。
+- runtime-confirmed via `macwsdisplayd.err`（2026-08-02）：冷启动时 AppKit 给出 `runtime-confirmed AppKit display backing-scale=2.000 frame={{0, 0}, {1194, 834}}`。全屏 canvas 随后记录 `workspace-start id=3 display=2388x1668 scale=2.000`，基础帧与桌面层目的坐标均为 2388×1668，修复了旧 1194×834 canvas 与 2× layer/input 坐标混用造成的放大裁剪和点击偏移。
+- runtime-confirmed via `MacWSHost.log`（2026-08-02）：从 Terminal window 21/group 16 进入桌面后，第二次同一 action 记录 `scene-reused mode=window restored-from-workspace window=21 owner=35681 group=16 scene-size=1194.0x807.0`；持久化字典从 `mode=1, return_window_id=21` 回到 `mode=2, window_id=21`。Host 进程重建与 DisplayStream 服务重连后仍能恢复该精确窗口身份。
+- runtime-confirmed via设备端 Host UI 截图（`/var/mobile/Library/Logs/MacWSHost-ui.png`）：全屏画面没有 Host 语义菜单栏，保留完整 macOS 原生菜单栏和右上角独立材质按钮；展开控制中心为不透出桌面颜色的浅色实底，标签、分段控件与按钮对比度一致。
 - 当前画面性能尚未达标：关闭 `OSXvnc-server` 和全屏 mmap producer 后，同一动态窗口的接受序号 120→240 用时 3.210 秒（37.4 fps），240→360 用时 3.106 秒（38.6 fps）；producer 同期记录 `outstanding=2/3` 和持续 drop。带 VNC 会话的同负载为约 38–40 fps，因此 RFB/mmap 已被 A/B 排除为主因。这里只把剩余瓶颈归到 DisplayStream/lease/presentation 边界，具体根因仍需新的运行或 RE 证据。
 
 仍待确认或修复：
 
-- 全屏 `CGDisplayStream` 当前能成功 start 但没有发布帧；新实现改用 Retina canvas + 完整 on-screen SkyLight 窗口分层直传，设备首帧、z-order、菜单栏/Dock、动态窗口和内存上界仍待 runtime-confirmed。生产 Host 不再用 mmap 静默掩盖这个缺口。
+- 全屏 Retina canvas、完整 on-screen SkyLight z-order、原生菜单栏和动态 Terminal 首帧已经 runtime-confirmed；Dock、多个 Space、持续动态负载和 IOSurface 内存上界仍待独立压力验证。生产 Host 不再用 mmap 静默掩盖该路径。
 - v6 自然装载后验证精确 FBS Scene 的 action 11 是否产生真实 `isFullScreen=YES`、Scene bounds 变化、状态栏/Home Indicator 隐藏以及原 Scene session 不变；不能用内容铺满当前小 Scene 代替。
 - v6 自然装载后从真实小型 macOS utility panel 创建新 Scene，记录请求尺寸、`resize-performed ... route=SBMainWorkspace`、最终 Scene bounds 和 AppKit frame；静态 RE 与构建成功不能替代这条运行证据。
 - 四个前台 Scene 在台前调度下持续稳定。

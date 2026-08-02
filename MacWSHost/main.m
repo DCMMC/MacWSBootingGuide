@@ -3093,7 +3093,35 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)cancelBootstrapTerminal;
 - (void)sceneGeometryDidChange;
 - (BOOL)activateCurrentMacWindow;
+- (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 @end
+
+// A fullscreen workspace remains the presentation of the exact AppKit window
+// from which it was entered. Resolve that owned identity uniformly anywhere
+// Scene lifecycle code needs to deduplicate, prune, close or restore it.
+static BOOL MacWSSceneOwnedWindowFields(NSDictionary *info,
+                                        int32_t *ownerPIDOut,
+                                        uint32_t *windowIDOut,
+                                        uint32_t *logicalGroupIDOut) {
+    MacWSStreamMode mode = (MacWSStreamMode)[info[@"mode"] unsignedIntValue];
+    int32_t ownerPID = 0;
+    uint32_t windowID = 0, logicalGroupID = 0;
+    if (mode == MacWSStreamModeWindow) {
+        ownerPID = [info[@"owner_pid"] intValue];
+        windowID = [info[@"window_id"] unsignedIntValue];
+        logicalGroupID = [info[@"logical_group_id"] unsignedIntValue];
+    } else if (mode == MacWSStreamModeFullscreen) {
+        ownerPID = [info[@"return_owner_pid"] intValue];
+        windowID = [info[@"return_window_id"] unsignedIntValue];
+        logicalGroupID =
+            [info[@"return_logical_group_id"] unsignedIntValue];
+    }
+    if (ownerPID <= 1 || windowID == 0) return NO;
+    if (ownerPIDOut) *ownerPIDOut = ownerPID;
+    if (windowIDOut) *windowIDOut = windowID;
+    if (logicalGroupIDOut) *logicalGroupIDOut = logicalGroupID;
+    return YES;
+}
 
 static void MacWSRequestNewScene(UIScene *requestingScene,
                                  uint32_t windowID,
@@ -3135,11 +3163,11 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
                 break;
             }
             NSDictionary *info = candidate.userInfo;
-            if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow ||
-                [info[@"owner_pid"] intValue] != ownerPID) continue;
-            uint32_t candidateGroup =
-                [info[@"logical_group_id"] unsignedIntValue];
-            uint32_t candidateWindow = [info[@"window_id"] unsignedIntValue];
+            int32_t candidateOwner = 0;
+            uint32_t candidateWindow = 0, candidateGroup = 0;
+            if (!MacWSSceneOwnedWindowFields(info, &candidateOwner,
+                    &candidateWindow, &candidateGroup) ||
+                candidateOwner != ownerPID) continue;
             BOOL sameIdentity = logicalGroupID != 0 && candidateGroup != 0
                 ? logicalGroupID == candidateGroup
                 : windowID == candidateWindow;
@@ -3376,14 +3404,58 @@ static void MacWSSetPersistedSceneBinding(NSString *identifier,
 
 static NSUserActivity *MacWSPersistedSceneActivity(NSString *identifier) {
     NSDictionary *info = MacWSPersistedSceneBinding(identifier);
-    if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow ||
-        [info[@"window_id"] unsignedIntValue] == 0 ||
-        [info[@"owner_pid"] intValue] <= 1) return nil;
+    if (!MacWSSceneOwnedWindowFields(info, NULL, NULL, NULL)) return nil;
     NSUserActivity *activity = [[NSUserActivity alloc]
         initWithActivityType:@"com.macwsguide.host.window"];
     activity.title = [info[@"title"] isKindOfClass:NSString.class]
         ? info[@"title"] : @"MacWS Window";
     activity.userInfo = info;
+    return activity;
+}
+
+static NSUserActivity *MacWSRecoverOrphanedWorkspaceActivity(
+        UISceneSession *newSession) {
+    NSString *newIdentifier = newSession.persistentIdentifier;
+    if (!newIdentifier.length) return nil;
+    NSDictionary *bindings = [NSUserDefaults.standardUserDefaults
+        dictionaryForKey:MacWSSceneBindingsDefaultsKey];
+    if (bindings.count == 0) return nil;
+    NSString *candidateIdentifier = nil;
+    NSDictionary *candidateInfo = nil;
+    for (NSString *identifier in bindings) {
+        if ([identifier isEqualToString:newIdentifier]) continue;
+        NSDictionary *info = [bindings[identifier]
+            isKindOfClass:NSDictionary.class] ? bindings[identifier] : nil;
+        if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeFullscreen)
+            continue;
+        int32_t ownerPID = 0;
+        if (!MacWSSceneOwnedWindowFields(info, &ownerPID, NULL, NULL))
+            continue;
+        errno = 0;
+        if (kill(ownerPID, 0) != 0 && errno == ESRCH) continue;
+        // More than one orphaned workspace cannot be assigned safely without
+        // a stable token from UIKit. Refuse ambiguity instead of restoring an
+        // unrelated AppKit window into the new Scene.
+        if (candidateInfo) return nil;
+        candidateIdentifier = identifier;
+        candidateInfo = info;
+    }
+    if (!candidateInfo) return nil;
+    if (!MacWSSceneSessionsPreservingMacWindow)
+        MacWSSceneSessionsPreservingMacWindow = [NSMutableSet set];
+    [MacWSSceneSessionsPreservingMacWindow addObject:candidateIdentifier];
+    [MacWSSceneBindings removeObjectForKey:candidateIdentifier];
+    MacWSSetPersistedSceneBinding(newIdentifier, candidateInfo);
+    MacWSSetPersistedSceneBinding(candidateIdentifier, nil);
+    MacWSLog(@"scene-workspace-binding-migrated old=%@ new=%@ return-window=%u owner=%d",
+             candidateIdentifier, newIdentifier,
+             [candidateInfo[@"return_window_id"] unsignedIntValue],
+             [candidateInfo[@"return_owner_pid"] intValue]);
+    NSUserActivity *activity = [[NSUserActivity alloc]
+        initWithActivityType:@"com.macwsguide.host.window"];
+    activity.title = [candidateInfo[@"title"] isKindOfClass:NSString.class]
+        ? candidateInfo[@"title"] : @"MacWS Workspace";
+    activity.userInfo = candidateInfo;
     return activity;
 }
 
@@ -3404,10 +3476,9 @@ static void MacWSRememberSceneBinding(UISceneSession *session,
     // performClose: while UIKit is tearing the Scene down.
     if ([MacWSSceneCloseRequestsSent containsObject:identifier]) return;
     NSDictionary *info = activity.userInfo;
-    uint32_t windowID = [info[@"window_id"] unsignedIntValue];
-    int32_t ownerPID = [info[@"owner_pid"] intValue];
-    if ([info[@"mode"] unsignedIntValue] == MacWSStreamModeWindow &&
-        windowID != 0 && ownerPID > 1) {
+    int32_t ownerPID = 0;
+    uint32_t windowID = 0;
+    if (MacWSSceneOwnedWindowFields(info, &ownerPID, &windowID, NULL)) {
         MacWSSceneBindings[identifier] = activity;
         [MacWSSceneCloseRequestsSent removeObject:identifier];
         MacWSSetPersistedSceneBinding(identifier, info);
@@ -3431,10 +3502,10 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
         MacWSPersistedSceneActivity(identifier) ?:
         session.stateRestorationActivity;
     NSDictionary *info = activity.userInfo;
-    uint32_t windowID = [info[@"window_id"] unsignedIntValue];
-    int32_t ownerPID = [info[@"owner_pid"] intValue];
-    if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow ||
-        windowID == 0 || ownerPID <= 1) return NO;
+    int32_t ownerPID = 0;
+    uint32_t windowID = 0;
+    if (!MacWSSceneOwnedWindowFields(info, &ownerPID, &windowID, NULL))
+        return NO;
     int sendError = 0;
     BOOL sent = MacWSSendCloseWindow(windowID, ownerPID, &sendError);
     if (sent) {
@@ -3621,12 +3692,14 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     MacWSMenuClient *_menuClient;
     MacWSMenuSnapshot *_menuSnapshot;
     UIVisualEffectView *_semanticMenuBar;
+    NSLayoutConstraint *_semanticMenuHeightConstraint;
     UIScrollView *_semanticMenuScroll;
     UIStackView *_semanticMenuTitles;
     UIViewController *_semanticMenuPanel;
     UIControl *_semanticMenuDismissLayer;
     UIVisualEffectView *_controlPanel;
     UIControl *_controlDismissLayer;
+    UIVisualEffectView *_showControlsMaterial;
     UIButton *_showControlsButton;
     UILabel *_serviceLabel;
     UILabel *_phaseLabel;
@@ -3685,6 +3758,15 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     BOOL _targetWindowMissingCheckPending;
     BOOL _sceneDestructionRequested;
     uint64_t _targetWindowMissingSerial;
+    BOOL _workspaceReturnValid;
+    uint32_t _workspaceReturnWindowID;
+    int32_t _workspaceReturnOwnerPID;
+    uint32_t _workspaceReturnGroupID;
+    CGSize _workspaceReturnMinimumSize;
+    CGSize _workspaceReturnPreferredSize;
+    CGSize _workspaceReturnSceneSize;
+    BOOL _workspaceReturnResizable;
+    NSString *_workspaceReturnTitle;
 }
 
 - (BOOL)prefersStatusBarHidden {
@@ -3704,6 +3786,45 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     [self setNeedsStatusBarAppearanceUpdate];
     [self setNeedsUpdateOfHomeIndicatorAutoHidden];
     [self setNeedsUpdateOfScreenEdgesDeferringSystemGestures];
+}
+
+- (void)updateWorkspaceChrome {
+    BOOL fullscreen = _streamMode == MacWSStreamModeFullscreen;
+    _semanticMenuBar.hidden = fullscreen;
+    _semanticMenuHeightConstraint.constant = fullscreen ? 0.0 : 26.0;
+    if (_menuBarButton) {
+        [self setButton:_menuBarButton
+                  title:fullscreen && _workspaceReturnValid
+                      ? @"恢复窗口模式" : @"打开全屏 macOS 工作区"
+                  image:fullscreen && _workspaceReturnValid
+                      ? @"arrow.down.right.and.arrow.up.left"
+                      : @"arrow.up.left.and.arrow.down.right"];
+    }
+    _closeWindowButton.hidden = fullscreen || _windowID == 0;
+    [self.view setNeedsLayout];
+}
+
+- (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity {
+    NSDictionary *info = activity.userInfo;
+    if (_streamMode != MacWSStreamModeFullscreen ||
+        [info[@"return_window_id"] unsignedIntValue] == 0 ||
+        [info[@"return_owner_pid"] intValue] <= 1) return;
+    _workspaceReturnValid = YES;
+    _workspaceReturnWindowID = [info[@"return_window_id"] unsignedIntValue];
+    _workspaceReturnOwnerPID = [info[@"return_owner_pid"] intValue];
+    _workspaceReturnGroupID = [info[@"return_logical_group_id"] unsignedIntValue];
+    _workspaceReturnMinimumSize = CGSizeMake(
+        [info[@"return_minimum_width"] doubleValue],
+        [info[@"return_minimum_height"] doubleValue]);
+    _workspaceReturnPreferredSize = CGSizeMake(
+        [info[@"return_preferred_width"] doubleValue],
+        [info[@"return_preferred_height"] doubleValue]);
+    _workspaceReturnSceneSize = CGSizeMake(
+        [info[@"return_scene_width"] doubleValue],
+        [info[@"return_scene_height"] doubleValue]);
+    _workspaceReturnResizable = [info[@"return_resizable"] boolValue];
+    _workspaceReturnTitle = [info[@"return_title"] isKindOfClass:NSString.class]
+        ? [info[@"return_title"] copy] : @"MacWS Window";
 }
 
 - (instancetype)initWithSceneIdentifier:(NSString *)identifier
@@ -3959,7 +4080,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     else if (appearance == MacWSMenuAppearanceLight)
         style = UIUserInterfaceStyleLight;
     _semanticMenuBar.overrideUserInterfaceStyle = style;
+    _showControlsMaterial.overrideUserInterfaceStyle = style;
+    _controlPanel.overrideUserInterfaceStyle = style;
     [_semanticMenuBar setNeedsLayout];
+    [_showControlsMaterial setNeedsLayout];
+    [_controlPanel setNeedsLayout];
 }
 
 - (void)refreshSemanticMenuWithCompletion:(void (^ _Nullable)(
@@ -4327,12 +4452,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                    forControlEvents:UIControlEventTouchUpInside];
     [root addSubview:_controlDismissLayer];
 
-    _controlPanel = [[UIVisualEffectView alloc]
-        initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
+    // The expanded card must be a stable reading surface. The former fixed
+    // dark blur was composited with adaptive light/dark labels and fills,
+    // which produced incorrect translucency and contrast. Keep blur only for
+    // the small floating affordance; the card itself follows one opaque
+    // semantic color system.
+    _controlPanel = [[UIVisualEffectView alloc] initWithEffect:nil];
     _controlPanel.translatesAutoresizingMaskIntoConstraints = NO;
     _controlPanel.layer.cornerRadius = 22;
     _controlPanel.layer.cornerCurve = kCACornerCurveContinuous;
     _controlPanel.clipsToBounds = YES;
+    _controlPanel.contentView.backgroundColor = UIColor.systemBackgroundColor;
     [root addSubview:_controlPanel];
 
     UIScrollView *scroll = [UIScrollView new];
@@ -4624,22 +4754,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     content.layoutMarginsRelativeArrangement = YES;
     [scroll addSubview:content];
 
+    _showControlsMaterial = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
+    _showControlsMaterial.translatesAutoresizingMaskIntoConstraints = NO;
+    _showControlsMaterial.layer.cornerRadius = 15;
+    _showControlsMaterial.layer.cornerCurve = kCACornerCurveContinuous;
+    _showControlsMaterial.layer.borderWidth = 0.5;
+    _showControlsMaterial.layer.borderColor =
+        [UIColor.separatorColor colorWithAlphaComponent:0.55].CGColor;
+    _showControlsMaterial.clipsToBounds = YES;
+    [root addSubview:_showControlsMaterial];
+
     _showControlsButton = [self buttonWithTitle:@"控制中心" image:@"sidebar.left"
-                                         action:@selector(showControls) prominent:YES];
+                                         action:@selector(showControls) prominent:NO];
     _showControlsButton.translatesAutoresizingMaskIntoConstraints = NO;
-    _showControlsButton.hidden = YES;
-    if (_semanticMenuBar) {
-        UIButtonConfiguration *configuration =
-            [UIButtonConfiguration plainButtonConfiguration];
-        configuration.image = [UIImage systemImageNamed:@"switch.2"];
-        configuration.baseForegroundColor = UIColor.labelColor;
-        configuration.contentInsets = NSDirectionalEdgeInsetsMake(3, 5, 3, 5);
-        _showControlsButton.configuration = configuration;
-        _showControlsButton.accessibilityLabel = @"MacWS 控制中心";
-        [_semanticMenuBar.contentView addSubview:_showControlsButton];
-    } else {
-        [root addSubview:_showControlsButton];
-    }
+    UIButtonConfiguration *configuration =
+        [UIButtonConfiguration plainButtonConfiguration];
+    configuration.image = [UIImage systemImageNamed:@"switch.2"];
+    configuration.baseForegroundColor = UIColor.labelColor;
+    configuration.contentInsets = NSDirectionalEdgeInsetsMake(3, 5, 3, 5);
+    _showControlsButton.configuration = configuration;
+    _showControlsButton.accessibilityLabel = @"MacWS 控制中心";
+    [_showControlsMaterial.contentView addSubview:_showControlsButton];
 
     UILayoutGuide *safe = root.safeAreaLayoutGuide;
     NSLayoutConstraint *responsiveWidth = [_controlPanel.widthAnchor
@@ -4680,34 +4816,38 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [content.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
         [content.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
         [content.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor],
+        [_showControlsMaterial.trailingAnchor constraintEqualToAnchor:
+            safe.trailingAnchor constant:-6],
+        [_showControlsMaterial.topAnchor constraintEqualToAnchor:
+            safe.topAnchor constant:2],
+        [_showControlsMaterial.widthAnchor constraintEqualToConstant:38],
+        [_showControlsMaterial.heightAnchor constraintEqualToConstant:30],
+        [_showControlsButton.leadingAnchor constraintEqualToAnchor:
+            _showControlsMaterial.contentView.leadingAnchor],
+        [_showControlsButton.trailingAnchor constraintEqualToAnchor:
+            _showControlsMaterial.contentView.trailingAnchor],
+        [_showControlsButton.topAnchor constraintEqualToAnchor:
+            _showControlsMaterial.contentView.topAnchor],
+        [_showControlsButton.bottomAnchor constraintEqualToAnchor:
+            _showControlsMaterial.contentView.bottomAnchor],
     ]];
     if (_semanticMenuBar) {
+        _semanticMenuHeightConstraint = [_semanticMenuBar.heightAnchor
+            constraintEqualToConstant:26];
         [NSLayoutConstraint activateConstraints:@[
             [_semanticMenuBar.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
             [_semanticMenuBar.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
             [_semanticMenuBar.topAnchor constraintEqualToAnchor:safe.topAnchor],
-            [_semanticMenuBar.heightAnchor constraintEqualToConstant:26],
-            [_showControlsButton.trailingAnchor constraintEqualToAnchor:
-                _semanticMenuBar.contentView.trailingAnchor constant:-4],
-            [_showControlsButton.centerYAnchor constraintEqualToAnchor:
-                _semanticMenuBar.contentView.centerYAnchor],
-            [_showControlsButton.widthAnchor constraintEqualToConstant:32],
-            [_showControlsButton.heightAnchor constraintEqualToConstant:24],
+            _semanticMenuHeightConstraint,
         ]];
         // A native macOS window should open as content, not as a settings
         // sheet. Keep the compact menu visible and expose Control Center as a
         // small explicit affordance; fullscreen/bootstrap scenes still open
         // with controls shown.
         _controlPanel.hidden = YES;
-        _showControlsButton.hidden = NO;
-    } else {
-        [NSLayoutConstraint activateConstraints:@[
-            [_showControlsButton.leadingAnchor constraintEqualToAnchor:
-                safe.leadingAnchor constant:12],
-            [_showControlsButton.topAnchor constraintEqualToAnchor:
-                controlTop constant:12],
-        ]];
+        _showControlsMaterial.hidden = NO;
     }
+    [self updateWorkspaceChrome];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -4759,13 +4899,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (void)hideControls {
     _controlPanel.hidden = YES;
     _controlDismissLayer.hidden = YES;
-    _showControlsButton.hidden = NO;
+    _showControlsMaterial.hidden = NO;
 }
 
 - (void)showControls {
     _controlDismissLayer.hidden = NO;
     _controlPanel.hidden = NO;
-    _showControlsButton.hidden = YES;
+    _showControlsMaterial.hidden = YES;
 }
 
 - (void)setNotice:(NSString *)notice success:(BOOL)success {
@@ -5239,6 +5379,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetWindowResizable = NO;
     _metalView.targetPID = ownerPID;
     [self updateImmersivePresentation];
+    [self updateWorkspaceChrome];
     self.view.window.windowScene.title = title.length ? title :
         [NSString stringWithFormat:@"MacWS Window %u", windowID];
     [_metalView configureStreamMode:_streamMode windowID:_windowID];
@@ -5254,12 +5395,76 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)openFullscreenWorkspace {
+    if (_streamMode == MacWSStreamModeFullscreen) {
+        if (!_workspaceReturnValid || _workspaceReturnWindowID == 0 ||
+            _workspaceReturnOwnerPID <= 1) {
+            [self setNotice:@"当前工作区没有可恢复的来源窗口。请从“打开 macOS 窗口”选择一个窗口。"
+                     success:NO];
+            return;
+        }
+
+        uint32_t returnWindowID = _workspaceReturnWindowID;
+        int32_t returnOwnerPID = _workspaceReturnOwnerPID;
+        uint32_t returnGroupID = _workspaceReturnGroupID;
+        CGSize returnMinimumSize = _workspaceReturnMinimumSize;
+        CGSize returnPreferredSize = _workspaceReturnPreferredSize;
+        CGSize returnSceneSize = _workspaceReturnSceneSize;
+        BOOL returnResizable = _workspaceReturnResizable;
+        NSString *returnTitle = [_workspaceReturnTitle copy];
+        _workspaceReturnValid = NO;
+        _workspaceReturnWindowID = 0;
+        _workspaceReturnOwnerPID = 0;
+        _workspaceReturnGroupID = 0;
+        _workspaceReturnMinimumSize = CGSizeZero;
+        _workspaceReturnPreferredSize = CGSizeZero;
+        _workspaceReturnSceneSize = CGSizeZero;
+        _workspaceReturnResizable = NO;
+        _workspaceReturnTitle = nil;
+
+        [self openWindowIDInCurrentScene:returnWindowID
+                                ownerPID:returnOwnerPID
+                          logicalGroupID:returnGroupID
+                                   title:returnTitle
+                                  reason:nil];
+        _windowMinimumSize = returnMinimumSize;
+        _windowPreferredSize = returnPreferredSize;
+        _windowResizable = returnResizable;
+        _metalView.minimumLogicalSize = returnMinimumSize;
+        _metalView.targetWindowResizable = returnResizable;
+        MacWSRememberSceneBinding(self.view.window.windowScene.session,
+                                  [self streamRestorationActivity]);
+        BOOL requestedOriginalSize =
+            returnSceneSize.width >= 150.0 && returnSceneSize.height >= 150.0 &&
+            MacWSRequestNativeSceneSize(self.view.window.windowScene,
+                                        returnSceneSize);
+        [self hideControls];
+        [self setNotice:requestedOriginalSize
+            ? @"正在恢复进入全屏前的 iPadOS 窗口尺寸"
+            : @"已恢复进入全屏前的 macOS 窗口"
+                 success:YES];
+        MacWSLog(@"scene-reused mode=window restored-from-workspace window=%u owner=%d group=%u scene-size=%.1fx%.1f native-size-requested=%@",
+                 returnWindowID, returnOwnerPID, returnGroupID,
+                 returnSceneSize.width, returnSceneSize.height,
+                 requestedOriginalSize ? @"YES" : @"NO");
+        return;
+    }
+
     // Fullscreen is a presentation mode of the current Scene. The previous
     // implementation requested a second Scene session, so the button could
     // never make the window the user was operating become the workspace.
     // First activate the exact native window while its ID/PID mapping is still
     // authoritative, then detach this Scene from that identity and subscribe
     // it to the complete desktop producer.
+    _workspaceReturnValid = _windowID != 0 && _windowOwnerPID > 1;
+    _workspaceReturnWindowID = _windowID;
+    _workspaceReturnOwnerPID = _windowOwnerPID;
+    _workspaceReturnGroupID = _windowGroupID;
+    _workspaceReturnMinimumSize = _windowMinimumSize;
+    _workspaceReturnPreferredSize = _windowPreferredSize;
+    _workspaceReturnSceneSize =
+        self.view.window.windowScene.coordinateSpace.bounds.size;
+    _workspaceReturnResizable = _windowResizable;
+    _workspaceReturnTitle = [self.view.window.windowScene.title copy];
     BOOL activatedExactWindow = [self activateCurrentMacWindow];
     [_metalView suspendStream];
     _streamMode = MacWSStreamModeFullscreen;
@@ -5277,10 +5482,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetPID = 0;
     _metalView.minimumLogicalSize = CGSizeZero;
     _metalView.targetWindowResizable = NO;
+    [self dismissSemanticMenu];
     [self updateImmersivePresentation];
+    [self updateWorkspaceChrome];
     self.view.window.windowScene.title = @"MacWS Workspace";
     [_metalView configureStreamMode:_streamMode windowID:0];
     [_metalView requestStreamWindowList];
+    // Fullscreen is presentation state, not a new owner identity. Persist the
+    // return identity in the Scene activity so a UIKit process eviction does
+    // not strand the AppKit window or turn the toggle into a one-way action.
     MacWSRememberSceneBinding(self.view.window.windowScene.session,
                               [self streamRestorationActivity]);
     BOOL requestedSystemFullscreen = MacWSRequestCurrentSceneFullscreen(
@@ -5840,10 +6050,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             MacWSPersistedSceneActivity(session.persistentIdentifier) ?:
             session.stateRestorationActivity;
         NSDictionary *info = activity.userInfo;
-        NSString *identity = MacWSWindowIdentity(
-            [info[@"owner_pid"] intValue],
-            [info[@"window_id"] unsignedIntValue],
-            [info[@"logical_group_id"] unsignedIntValue]);
+        int32_t ownerPID = 0;
+        uint32_t windowID = 0, groupID = 0;
+        NSString *identity = MacWSSceneOwnedWindowFields(
+            info, &ownerPID, &windowID, &groupID)
+            ? MacWSWindowIdentity(ownerPID, windowID, groupID) : nil;
         if (identity) [occupied addObject:identity];
     }
 
@@ -6100,6 +6311,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         @"minimum_height": @(_windowMinimumSize.height),
         @"resizable": @(_windowResizable),
         @"title": activity.title,
+        @"return_window_id": @(_workspaceReturnValid
+            ? _workspaceReturnWindowID : 0),
+        @"return_owner_pid": @(_workspaceReturnValid
+            ? _workspaceReturnOwnerPID : 0),
+        @"return_logical_group_id": @(_workspaceReturnValid
+            ? _workspaceReturnGroupID : 0),
+        @"return_preferred_width": @(_workspaceReturnValid
+            ? _workspaceReturnPreferredSize.width : 0),
+        @"return_preferred_height": @(_workspaceReturnValid
+            ? _workspaceReturnPreferredSize.height : 0),
+        @"return_minimum_width": @(_workspaceReturnValid
+            ? _workspaceReturnMinimumSize.width : 0),
+        @"return_minimum_height": @(_workspaceReturnValid
+            ? _workspaceReturnMinimumSize.height : 0),
+        @"return_scene_width": @(_workspaceReturnValid
+            ? _workspaceReturnSceneSize.width : 0),
+        @"return_scene_height": @(_workspaceReturnValid
+            ? _workspaceReturnSceneSize.height : 0),
+        @"return_resizable": @(_workspaceReturnValid
+            ? _workspaceReturnResizable : NO),
+        @"return_title": _workspaceReturnValid
+            ? (_workspaceReturnTitle ?: @"MacWS Window") : @"",
     };
     return activity;
 }
@@ -6188,11 +6421,10 @@ static void MacWSPruneDeadWindowSceneSessions(void) {
             }
         }
         NSDictionary *info = activity.userInfo;
-        if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow)
+        uint32_t windowID = 0;
+        int32_t ownerPID = 0;
+        if (!MacWSSceneOwnedWindowFields(info, &ownerPID, &windowID, NULL))
             continue;
-        uint32_t windowID = [info[@"window_id"] unsignedIntValue];
-        int32_t ownerPID = [info[@"owner_pid"] intValue];
-        if (windowID == 0 || ownerPID <= 1) continue;
         errno = 0;
         if (kill(ownerPID, 0) == 0 || errno != ESRCH) continue;
         NSString *identifier = session.persistentIdentifier;
@@ -6230,10 +6462,9 @@ static void MacWSPruneDormantWorkspaceSessions(void) {
         // dormant workspace Scenes.
         if (!connectedScene) continue;
         NSDictionary *info = activity.userInfo;
-        BOOL exactWindow = [info[@"mode"] unsignedIntValue] ==
-            MacWSStreamModeWindow &&
-            [info[@"window_id"] unsignedIntValue] != 0;
-        if (exactWindow || (connectedScene && connectedScene.activationState ==
+        BOOL ownsWindow = MacWSSceneOwnedWindowFields(
+            info, NULL, NULL, NULL);
+        if (ownsWindow || (connectedScene && connectedScene.activationState ==
                 UISceneActivationStateForegroundActive)) continue;
         NSString *identifier = session.persistentIdentifier;
         if ([MacWSSceneSessionsPreservingMacWindow containsObject:identifier])
@@ -6252,10 +6483,10 @@ static void MacWSPruneDormantWorkspaceSessions(void) {
 
 static NSString *MacWSSceneWindowIdentity(NSUserActivity *activity) {
     NSDictionary *info = activity.userInfo;
-    if ([info[@"mode"] unsignedIntValue] != MacWSStreamModeWindow) return nil;
-    int32_t ownerPID = [info[@"owner_pid"] intValue];
-    uint32_t windowID = [info[@"window_id"] unsignedIntValue];
-    uint32_t groupID = [info[@"logical_group_id"] unsignedIntValue];
+    int32_t ownerPID = 0;
+    uint32_t windowID = 0, groupID = 0;
+    if (!MacWSSceneOwnedWindowFields(info, &ownerPID, &windowID, &groupID))
+        return nil;
     return MacWSWindowIdentity(ownerPID, windowID, groupID);
 }
 
@@ -6334,6 +6565,14 @@ static void MacWSDeduplicateWindowScenes(void) {
         NSUserActivity *persisted = MacWSPersistedSceneActivity(
             session.persistentIdentifier);
         activity = persisted ?: activity ?: session.stateRestorationActivity;
+        NSDictionary *info = activity.userInfo;
+        BOOL emptyWorkspace =
+            [info[@"mode"] unsignedIntValue] == MacWSStreamModeFullscreen &&
+            [info[@"return_window_id"] unsignedIntValue] == 0;
+        if (emptyWorkspace) {
+            activity = MacWSRecoverOrphanedWorkspaceActivity(session) ?:
+                activity;
+        }
     }
     MacWSStreamMode streamMode = (MacWSStreamMode)
         [activity.userInfo[@"mode"] unsignedIntValue];
@@ -6369,6 +6608,7 @@ static void MacWSDeduplicateWindowScenes(void) {
                     minimumSize:minimumSize
                   preferredSize:preferredSize
                       resizable:resizable];
+    [controller restoreWorkspaceReturnFromActivity:activity];
     self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
     self.window.rootViewController = controller;
     [self.window makeKeyAndVisible];
@@ -6629,6 +6869,7 @@ extern void MacWSRunIOSClearReference(void);
                 containsObject:identifier]) {
             [MacWSSceneSessionsPreservingMacWindow
                 removeObject:identifier];
+            [MacWSSceneBindings removeObjectForKey:identifier];
             MacWSSetPersistedSceneBinding(identifier, nil);
             MacWSLog(@"scene-discard duplicate-only id=%@ mac-window=preserved",
                      identifier);
