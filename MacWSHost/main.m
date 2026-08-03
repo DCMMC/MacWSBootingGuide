@@ -4653,11 +4653,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIButton *vscode = [self buttonWithTitle:@"VS Code" image:@"chevron.left.forwardslash.chevron.right"
                                       action:@selector(launchApplication:) prominent:NO];
     vscode.accessibilityIdentifier = @"vscode";
-    _applicationButtons = @[glassDemo, terminal, activity, finder, vscode];
+    UIButton *settings = [self buttonWithTitle:@"系统设置" image:@"gearshape"
+                                        action:@selector(launchApplication:) prominent:NO];
+    settings.accessibilityIdentifier = @"system-settings";
+    UIButton *maps = [self buttonWithTitle:@"地图" image:@"map"
+                                    action:@selector(launchApplication:) prominent:NO];
+    maps.accessibilityIdentifier = @"maps";
+    _applicationButtons = @[
+        glassDemo, terminal, activity, finder, vscode, settings, maps,
+    ];
     UIStackView *appRow1 = [[UIStackView alloc] initWithArrangedSubviews:@[glassDemo, terminal]];
     UIStackView *appRow2 = [[UIStackView alloc] initWithArrangedSubviews:@[activity, finder]];
-    UIStackView *appRow3 = [[UIStackView alloc] initWithArrangedSubviews:@[vscode]];
-    for (UIStackView *row in @[appRow1, appRow2, appRow3]) {
+    UIStackView *appRow3 = [[UIStackView alloc] initWithArrangedSubviews:@[vscode, settings]];
+    UIStackView *appRow4 = [[UIStackView alloc] initWithArrangedSubviews:@[maps]];
+    for (UIStackView *row in @[appRow1, appRow2, appRow3, appRow4]) {
         row.axis = UILayoutConstraintAxisHorizontal;
         row.distribution = UIStackViewDistributionFillEqually;
         row.spacing = 8;
@@ -4817,6 +4826,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         appRow1,
         appRow2,
         appRow3,
+        appRow4,
         _windowPickerButton,
         _menuBarButton,
         _closeWindowButton,
@@ -5741,6 +5751,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         @"activity-monitor": @"activity_monitor_available",
         @"finder": @"finder_available",
         @"vscode": @"vscode_available",
+        @"system-settings": @"system_settings_available",
+        @"maps": @"maps_available",
     };
     for (UIButton *button in _applicationButtons) {
         BOOL available = [status[availability[button.accessibilityIdentifier]] boolValue];

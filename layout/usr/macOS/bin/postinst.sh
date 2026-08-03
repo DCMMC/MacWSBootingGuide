@@ -2,6 +2,8 @@ cd $(realpath $HOME/../..)/usr/macOS
 
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 CFPREFSD_ENT="/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist"
+EXTENSIONKIT_ENT="/var/jb/usr/macOS/bin/extensionkitservice-entitlements.plist"
+APPEARANCE_ENT="/var/jb/usr/macOS/bin/appearance-extension-entitlements.plist"
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
 LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
@@ -115,6 +117,54 @@ sign_and_trustcache() {
     # Add all hashes
     for h in $hashes; do
         trust_cdhash "$h" "$path" "all"
+    done
+}
+
+# ExtensionKit's service is admitted before autosignd can participate and its
+# native private entitlements are part of the service contract.  The generic
+# MacWS profile drops those rights, while the stock macOS signature is rejected
+# by the iPadOS launch-constraint policy.  Preserve the service-specific
+# profile and use two ldid passes so the final CodeDirectory describes the
+# settled __LINKEDIT layout.
+sign_and_trustcache_with_entitlements() {
+    local path="$1"
+    local entitlements="$2"
+    local required_marker="${3:-<key>com.apple.private.extensionkit.host.any-extension</key>}"
+    local identifier="${4:-}"
+    [ -f "$path" ] || return 0
+    [ -f "$entitlements" ] || return 1
+
+    local hashes="" h dominated=1
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && hashes="$hashes $h"
+    done
+    for h in $hashes; do
+        if ! is_trusted "$h"; then
+            dominated=0
+            break
+        fi
+    done
+    if [ -n "$hashes" ] && [ "$dominated" -eq 1 ] &&
+       ldid -e "$path" 2>/dev/null |
+           grep -Fq "$required_marker"; then
+        if [ -z "$identifier" ] ||
+           ldid -h "$path" 2>/dev/null |
+               grep -Fqx "Identifier=$identifier"; then
+            return 0
+        fi
+    fi
+
+    if [ -n "$identifier" ]; then
+        ldid -I"$identifier" -S"$entitlements" -M "$path" || return 1
+        ldid -I"$identifier" -S"$entitlements" -M "$path" || return 1
+    else
+        ldid -S"$entitlements" -M "$path" || return 1
+        ldid -S"$entitlements" -M "$path" || return 1
+    fi
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && trust_cdhash "$h" "$path" "$arch"
     done
 }
 
@@ -323,9 +373,37 @@ if [ -f "$VIEWBRIDGE_PROXY/Info.plist" ] &&
     rm -rf "$VIEWBRIDGE_PROXY/Contents"
     echo "[INFO] removed stale nested ViewBridge proxy bundle layout"
 fi
-add_all_trustcache "/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary"
-add_all_trustcache "/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy"
-add_all_trustcache "/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy"
+VIEWBRIDGE_PROXY_EXEC="$VIEWBRIDGE_PROXY/ViewBridgeAuxiliary"
+HISERVICES_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy"
+OPEN_SAVE_PANEL_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy"
+add_all_trustcache "$VIEWBRIDGE_PROXY_EXEC"
+add_all_trustcache "$HISERVICES_PROXY_EXEC"
+add_all_trustcache "$OPEN_SAVE_PANEL_PROXY_EXEC"
+EXTENSIONKIT_PROXY="/var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy"
+add_all_trustcache "$EXTENSIONKIT_PROXY"
+# These four services are launched as mobile-owned per-process XPC jobs, but
+# share a freestanding first image that must chroot before libSystem/libxpc
+# consumes launchd's one-shot context.  Runtime witness (2026-08-04): both
+# ViewBridgeAuxiliary and ExtensionKitProxy in mode 0755 exited with the
+# source-defined chroot-failure status 111; mode 4755 let the same images
+# reach their real macOS targets.  Keep the privilege on these minimal launch
+# stubs only and enforce the invariant for every consumer of main.c.
+for proxy in \
+    "$VIEWBRIDGE_PROXY_EXEC" \
+    "$HISERVICES_PROXY_EXEC" \
+    "$OPEN_SAVE_PANEL_PROXY_EXEC" \
+    "$EXTENSIONKIT_PROXY"; do
+    if [ -x "$proxy" ]; then
+        chown root:wheel "$proxy"
+        chmod 4755 "$proxy"
+    fi
+done
+add_all_trustcache "/var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy"
+if [ -x /var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy ]; then
+    chown root:wheel /var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy
+    chmod 4755 /var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy
+    uicache -p /var/jb/Applications/SettingsExtensionProxy.app >/dev/null 2>&1 || true
+fi
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc/FileCoordinationProxy"
 # The flat iOS proxy bundles above are only the launch images visible to the
 # iOS XPC service manager.  Their SETEXEC targets live inside the macOS rootfs
@@ -337,8 +415,17 @@ add_all_trustcache "/var/jb/usr/macOS/Frameworks/FileCoordination.framework/Vers
 # restore their CDHashes on every postinst/re-jailbreak, exactly like the other
 # initial process images below.
 sign_and_trustcache "/var/mnt/rootfs/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary"
+sign_and_trustcache "/var/mnt/rootfs/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem"
 sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc/Contents/MacOS/com.apple.hiservices-xpcservice"
 sign_and_trustcache "/var/mnt/rootfs/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService"
+sign_and_trustcache_with_entitlements \
+    "/var/mnt/rootfs/System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/extensionkitservice.xpc/Contents/MacOS/extensionkitservice" \
+    "$EXTENSIONKIT_ENT"
+sign_and_trustcache_with_entitlements \
+    "/var/mnt/rootfs/System/Library/ExtensionKit/Extensions/Appearance.appex/Contents/MacOS/Appearance" \
+    "$APPEARANCE_ENT" \
+    '<key>com.apple.security.exception.files.absolute-path.read-write</key>' \
+    'com.apple.Appearance-Settings.extension'
 # codesign -vvv -d dyld_shared_cache_arm64e 2>&1 | grep CDHash=
 jbctl trustcache add b5da39409492ac85e5a8e8ab618fe77e2d7a2980
 # codesign -vvv -d dyld_shared_cache_arm64e.01 2>&1 | grep CDHash=
@@ -380,6 +467,12 @@ if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
 	cp -vf /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 fi
+
+# System Settings panes are real Ventura ExtensionKit executables launched
+# through an iOS first-image proxy. Keep their bundle-local dependency closure,
+# load commands, dedicated sandbox exceptions and reboot-volatile trustcache in
+# one idempotent helper shared with the package postinst.
+bash /var/jb/usr/macOS/bin/ensure_appearance_runtime.sh || exit 1
 
 # Native-host input bridge.  Keep the installed source and the chroot-visible
 # executable on fresh inodes so AMFI does not reuse a stale vnode signature.
@@ -477,6 +570,8 @@ add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fra
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/CursorAsset_base
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+sign_and_trustcache '/var/mnt/rootfs/System/Applications/System Settings.app/Contents/MacOS/System Settings'
+sign_and_trustcache '/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps'
 # GlassDemo is launched directly by macwshostd before libmachook can ask
 # autosignd for help. Its persistent signature survives reboot, while
 # Dopamine's dynamic trustcache does not.

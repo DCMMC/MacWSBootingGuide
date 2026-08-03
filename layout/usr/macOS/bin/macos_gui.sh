@@ -120,6 +120,7 @@ EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
 EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
 MTLCOMPILER_DIAGNOSTICS="$LOGDIR/macws_mtlcompiler_diagnostics"
 MTLCOMPILER_DIAGNOSTICS_NATIVE=/var/mobile/macws_mtlcompiler_diagnostics
+CATALYST_LAUNCH_TRACE="$LOGDIR/macws_catalyst_launch.trace"
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
@@ -1470,7 +1471,8 @@ clear_diagnostic_state() {
     diagnostic_flag_paths | while IFS= read -r path; do
         rm -f "$ROOTFS$path"
     done
-    rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_DIAGNOSTICS_NATIVE"
+    rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_DIAGNOSTICS_NATIVE" \
+        "$CATALYST_LAUNCH_TRACE"
     # Request/reply captures are created only by the compiler diagnostic
     # sentinel.  Remove these exact project-owned directories before an
     # ordinary session so neither stale evidence nor bounded binary dumps add

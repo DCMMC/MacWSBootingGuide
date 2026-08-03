@@ -35,6 +35,8 @@ static const char *const kGUI = "/var/jb/usr/macOS/bin/macos_gui.sh";
 static const char *const kBash = "/var/jb/usr/bin/bash";
 static const char *const kLaunchctl = "/var/jb/usr/bin/launchctl";
 static const char *const kKillall = "/var/jb/usr/bin/killall";
+static const char *const kSudo = "/var/jb/usr/bin/sudo";
+static const char *const kUIOpen = "/var/jb/usr/bin/uiopen";
 static const char *const kChrootExec = "/var/jb/usr/macOS/bin/launchdchrootexec";
 static const char *const kPostinst = "/var/jb/usr/macOS/bin/postinst.sh";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
@@ -59,6 +61,12 @@ static const char *const kVSCodePlist =
 static const char *const kVSCodeLog = "/var/jb/var/mobile/vscode.log";
 static const char *const kVSCodeHealthMarker =
     "/var/jb/var/mobile/vscode-health-marker";
+static const char *const kUIKitSystemPlist =
+    "/var/jb/usr/macOS/LaunchDaemons/com.apple.uikitsystemapp.plist";
+static const char *const kUIKitSystemExecutable =
+    "/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem";
+static const char *const kMapsExecutable =
+    "/System/Applications/Maps.app/Contents/MacOS/Maps";
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
@@ -392,6 +400,10 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_bool(reply, "terminal_available", access("/var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "activity_monitor_available", access("/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "finder_available", access("/var/mnt/rootfs/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", X_OK) == 0);
+    xpc_dictionary_set_bool(reply, "system_settings_available",
+        access("/var/mnt/rootfs/System/Applications/System Settings.app/Contents/MacOS/System Settings", X_OK) == 0);
+    xpc_dictionary_set_bool(reply, "maps_available",
+        access("/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "vscode_available",
         access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron", X_OK) == 0 &&
         access(kVSCodePlist, R_OK) == 0);
@@ -525,7 +537,13 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
 static BOOL StopGUI(NSString **message) {
     const char *argv[] = {kBash, kGUI, "stop", NULL};
     int rc = RunCommand(argv, YES);
-    const char *appNames[] = {"GlassDemo", "Terminal", "Activity Monitor", "Finder"};
+    const char *unloadUIKitSystem[] = {
+        kLaunchctl, "unload", kUIKitSystemPlist, NULL,
+    };
+    (void)RunCommand(unloadUIKitSystem, YES);
+    const char *appNames[] = {"GlassDemo", "Terminal", "Activity Monitor",
+                              "Finder", "System Settings", "Maps",
+                              "MacWSCatalystLauncher", "UIKitSystem"};
     for (NSUInteger i = 0; i < sizeof(appNames) / sizeof(appNames[0]); i++) {
         const char *killArgv[] = {kKillall, "-9", appNames[i], NULL};
         (void)RunCommand(killArgv, YES);
@@ -559,6 +577,8 @@ static const AllowedApp kAllowedApps[] = {
     {"terminal", "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", "/var/mobile/Library/Logs/Terminal.host.log"},
     {"activity-monitor", "/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor", "/var/mobile/Library/Logs/ActivityMonitor.host.log"},
     {"finder", "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", "/var/mobile/Library/Logs/Finder.host.log"},
+    {"system-settings", "/System/Applications/System Settings.app/Contents/MacOS/System Settings", "/var/mobile/Library/Logs/SystemSettings.host.log"},
+    {"maps", "/System/Applications/Maps.app/Contents/MacOS/Maps", "/var/mobile/Library/Logs/Maps.host.log"},
 };
 
 // A native Host launch is complete when AppInputBridge has published at least
@@ -749,6 +769,42 @@ static BOOL RequestFinderBrowserWindow(pid_t pid, NSTimeInterval timeout) {
     return ready;
 }
 
+// Apps launched by launchdchrootexec have a valid AppKit event loop,
+// HIServices process record and real NSWindows, but launchservicesd cannot
+// create their AppleEvent endpoint (runtime: both PID and ProcessSerialNumber
+// kAEReopenApplication sends return procNotFound/-600).  System Settings is a
+// concrete witness: its SwiftUI delegate creates an ordered-out settings scene
+// at (239,87,715x625), then waits for the ordinary reopen lifecycle before
+// ordering it on screen. Deliver that exact public NSApplicationDelegate
+// lifecycle inside the owning process and require a visible metrics entry.
+static BOOL RequestApplicationReopen(pid_t pid, NSTimeInterval timeout) {
+    if (!WaitForAppInputEndpoint(pid, MIN(timeout, 5.0))) {
+        HostLog(@"application-reopen pid=%d result=no-appinput-endpoint", pid);
+        return NO;
+    }
+    static _Atomic uint32_t sampleSequence = 0;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindReopenApplication,
+        .frameWidth = 1,
+        .frameHeight = 1,
+        .targetPID = pid,
+        .source = MacWSInputSourceUnknown,
+        .sampleSequence = atomic_fetch_add(&sampleSequence, 1) + 1,
+    };
+    int sendError = 0;
+    BOOL sent = SendAppInputRecord(pid, &record, &sendError);
+    HostLog(@"application-reopen pid=%d sent=%@ errno=%d",
+            pid, sent ? @"YES" : @"NO", sendError);
+    if (!sent) return NO;
+    int exitStatus = -1;
+    BOOL ready = WaitForWindowMetrics(pid, timeout, &exitStatus);
+    HostLog(@"application-reopen pid=%d result=%@ exit-status=%d", pid,
+            ready ? @"window-ready" : @"no-visible-window", exitStatus);
+    return ready;
+}
+
 static off_t FileSizeAtPath(const char *path) {
     struct stat st = {0};
     return stat(path, &st) == 0 && st.st_size > 0 ? st.st_size : 0;
@@ -932,6 +988,122 @@ static BOOL TerminateWindowlessRootExecutable(pid_t pid, NSString *rootPath,
     return NO;
 }
 
+static pid_t WaitForRunningRootExecutable(NSString *rootPath,
+                                          NSTimeInterval timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    do {
+        pid_t pid = FindRunningRootExecutable(rootPath);
+        if (pid > 1) return pid;
+        usleep(100000);
+    } while (deadline.timeIntervalSinceNow > 0);
+    return 0;
+}
+
+// Maps is a Mac Catalyst application.  Directly exec'ing its Mach-O produces
+// an anonymous RunningBoard process, so FuseBoard correctly denies every
+// scene.  Replacing a foreground UIKit carrier with POSIX_SPAWN_SETEXEC is
+// also invalid: SpringBoard runtime-confirmed that the carrier workspace XPC
+// is invalidated immediately and marks the process pending exit.  Keep the
+// ordinary iOS UIApplication alive and let it spawn Maps as a separate chroot
+// child.  UIKitSystem then registers that child's exact audit-token generation
+// through the native FrontBoard bootstrap before accepting its scenes.
+static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
+    NSString *mapsRootPath = @(kMapsExecutable);
+    NSString *mapsHostPath = [@("/var/mnt/rootfs")
+        stringByAppendingString:mapsRootPath];
+    if (access(mapsHostPath.fileSystemRepresentation, X_OK) != 0 ||
+        access(kUIKitSystemPlist, R_OK) != 0 ||
+        access(kUIOpen, X_OK) != 0) {
+        *message = @"Maps 的 Catalyst 启动组件不完整，请先修复环境";
+        return NO;
+    }
+    if (!JobHasPID(kWindowServerLabel, NULL) ||
+        !JobHasPID(kDisplayLabel, NULL)) {
+        *message = @"请先启动 macOS GUI 与 DisplayStream";
+        return NO;
+    }
+
+    pid_t mapsPID = FindRunningRootExecutable(mapsRootPath);
+    if (mapsPID > 1) {
+        int exitStatus = -1;
+        if (WaitForWindowMetrics(mapsPID, 3.0, &exitStatus) ||
+            RequestApplicationReopen(mapsPID, 5.0)) {
+            os_unfair_lock_lock(&gStateLock);
+            gActiveAppPID = mapsPID;
+            gActiveAppID = @"maps";
+            os_unfair_lock_unlock(&gStateLock);
+            HostLog(@"launch-app reuse id=maps pid=%d route=UIKit-carrier",
+                    mapsPID);
+            *message = @"地图已在运行，现有原生窗口已进入窗口列表";
+            return YES;
+        }
+        if (!TerminateWindowlessRootExecutable(
+                mapsPID, mapsRootPath, message)) return NO;
+    }
+
+    pid_t uikitSystemPID = FindRunningRootExecutable(
+        @(kUIKitSystemExecutable));
+    if (uikitSystemPID <= 1) {
+        const char *loadUIKitSystem[] = {
+            kLaunchctl, "load", kUIKitSystemPlist, NULL,
+        };
+        const char *kickstartUIKitSystem[] = {
+            kLaunchctl, "kickstart", "-k",
+            "user/501/com.apple.uikitsystemapp", NULL,
+        };
+        (void)RunCommand(loadUIKitSystem, YES);
+        (void)RunCommand(kickstartUIKitSystem, YES);
+        uikitSystemPID = WaitForRunningRootExecutable(
+            @(kUIKitSystemExecutable), 8.0);
+        if (uikitSystemPID <= 1) {
+            *message = @"UIKitSystem 未能完成 Catalyst 场景服务启动";
+            return NO;
+        }
+    }
+
+    // A carrier whose previous child exited retains its in-memory child PID
+    // until its main-queue reaper runs.  A fresh carrier is cheap and makes a
+    // user-initiated Maps launch deterministic without creating duplicates.
+    const char *retireCarrier[] = {
+        kKillall, "-TERM", "MacWSCatalystLauncher", NULL,
+    };
+    (void)RunCommand(retireCarrier, YES);
+    usleep(150000);
+    const char *openCarrier[] = {
+        kSudo, "-u", "mobile", kUIOpen, "--bundleid",
+        "com.macwsguide.catalystlauncher", NULL,
+    };
+    int openResult = RunCommand(openCarrier, YES);
+    if (openResult != 0) {
+        *message = [NSString stringWithFormat:
+            @"无法打开 Maps UIKit 载体（退出码 %d）", openResult];
+        return NO;
+    }
+
+    mapsPID = WaitForRunningRootExecutable(mapsRootPath, 12.0);
+    if (mapsPID <= 1) {
+        *message = @"Maps 载体已启动，但 chroot 应用子进程未出现";
+        return NO;
+    }
+    int exitStatus = -1;
+    BOOL windowReady = WaitForWindowMetrics(mapsPID, 30.0, &exitStatus);
+    if (!windowReady)
+        windowReady = RequestApplicationReopen(mapsPID, 8.0);
+    if (!windowReady) {
+        *message = @"Maps 正在运行，但没有发布可见的原生窗口";
+        return NO;
+    }
+
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = mapsPID;
+    gActiveAppID = @"maps";
+    os_unfair_lock_unlock(&gStateLock);
+    HostLog(@"launch-app window-ready id=maps pid=%d uikitsystem=%d "
+            "route=UIKit-carrier", mapsPID, uikitSystemPID);
+    *message = @"地图已通过 UIKitSystem 启动，原生窗口已进入窗口列表";
+    return YES;
+}
+
 static BOOL LaunchVSCode(NSString **message) {
     if (access(kVSCodePlist, R_OK) != 0 ||
         access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
@@ -1066,10 +1238,14 @@ static BOOL LaunchRootExecutable(const char *identifier,
     if (existingPID > 1) {
         int exitStatus = -1;
         BOOL finder = strcmp(identifier, "finder") == 0;
+        BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
+                               strcmp(identifier, "maps") == 0;
         BOOL existingWindow = WaitForWindowMetrics(existingPID, 3.0,
                                                     &exitStatus);
         if (!existingWindow && finder)
             existingWindow = RequestFinderBrowserWindow(existingPID, 8.0);
+        if (!existingWindow && reopenLifecycle)
+            existingWindow = RequestApplicationReopen(existingPID, 8.0);
         if (!existingWindow) {
             // Runtime-confirmed on the default Terminal bootstrap: closing
             // its last represented iPad Scene leaves a healthy process with
@@ -1135,9 +1311,14 @@ static BOOL LaunchRootExecutable(const char *identifier,
     os_unfair_lock_unlock(&gStateLock);
     if (JobHasPID(kDisplayLabel, NULL)) {
         int exitStatus = -1;
-        BOOL windowReady = strcmp(identifier, "finder") == 0
+        BOOL finder = strcmp(identifier, "finder") == 0;
+        BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
+                               strcmp(identifier, "maps") == 0;
+        BOOL windowReady = finder
             ? RequestFinderBrowserWindow(pid, timeout)
-            : WaitForWindowMetrics(pid, timeout, &exitStatus);
+            : (reopenLifecycle
+                ? RequestApplicationReopen(pid, timeout)
+                : WaitForWindowMetrics(pid, timeout, &exitStatus));
         if (!windowReady) {
             os_unfair_lock_lock(&gStateLock);
             if (gActiveAppPID == pid) {
@@ -1225,6 +1406,8 @@ static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
 static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
     if (identifier && strcmp(identifier, "vscode") == 0)
         return LaunchVSCode(message);
+    if (identifier && strcmp(identifier, "maps") == 0)
+        return LaunchMapsViaUIKitCarrier(message);
     const AllowedApp *app = NULL;
     for (NSUInteger i = 0; i < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); i++) {
         if (identifier && strcmp(identifier, kAllowedApps[i].identifier) == 0) {

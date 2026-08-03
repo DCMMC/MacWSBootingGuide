@@ -17,6 +17,8 @@
 
 #import <IOSurface/IOSurfaceRef.h>
 #import <sys/file.h>
+#import <sys/fsgetpath.h>
+#import <sys/mount.h>
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
@@ -40,6 +42,150 @@ static BOOL macws_runtime_diagnostics_enabled(void) {
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
+}
+
+// ExtensionFoundation obtains the identity for the executable it is hosting
+// from +[LSBundleRecord bundleRecordForCurrentProcess].  On stock macOS the
+// process audit token leads back to the LaunchServices entry created for that
+// app extension.  Here RunningBoard launches the iOS proxy first and then the
+// proxy execs the macOS image inside the chroot, so the preserved audit-token
+// identity describes the proxy while NSBundle describes Appearance.appex.
+// Runtime evidence in appearance-inline-ls-oslog.txt is exact:
+// _LSPluginFindWithPlatformInfo:699 returns -10814 and the provider returns
+// nil.  ExtensionFoundation then exits at EXRunningExtension.m:149.
+//
+// Repair that missing audit-token -> bundle-URL association at the provider
+// boundary.  This is deliberately not a success/check bypass: the stock
+// result wins, the fallback is restricted to the exact hosted appex identity,
+// and LSApplicationExtensionRecord must independently accept the real bundle
+// URL and return a record with the same identifier.
+static id (*macws_bundle_record_for_current_process_orig)(id, SEL) = NULL;
+
+static id macws_bundle_record_for_current_process_compat(id receiver,
+                                                          SEL selector) {
+    id record = macws_bundle_record_for_current_process_orig
+        ? macws_bundle_record_for_current_process_orig(receiver, selector)
+        : nil;
+    if (record) return record;
+
+    NSBundle *bundle = [NSBundle mainBundle];
+    NSString *identifier = [bundle bundleIdentifier];
+    const char *identifierBytes = [identifier UTF8String];
+    if (!identifierBytes || strcmp(
+            identifierBytes, "com.apple.Appearance-Settings.extension") != 0)
+        return nil;
+
+    NSURL *bundleURL = [bundle bundleURL];
+    Class extensionRecordClass = objc_getClass("LSApplicationExtensionRecord");
+    if (!bundleURL || !extensionRecordClass) return nil;
+
+    NSError *error = nil;
+    id candidate = ((id (*)(id, SEL))objc_msgSend)(
+        (id)extensionRecordClass, sel_registerName("alloc"));
+    candidate = ((id (*)(id, SEL, id, id *))objc_msgSend)(
+        candidate, sel_registerName("initWithURL:error:"), bundleURL, &error);
+    id candidateIdentifier = candidate
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              candidate, sel_registerName("bundleIdentifier"))
+        : nil;
+    BOOL validClass = candidate && ((BOOL (*)(id, SEL, id))objc_msgSend)(
+        candidate, sel_registerName("isKindOfClass:"), extensionRecordClass);
+    BOOL validIdentifier = validClass && candidateIdentifier &&
+        ((BOOL (*)(id, SEL, id))objc_msgSend)(
+            candidateIdentifier, sel_registerName("isEqualToString:"),
+            identifier);
+    fprintf(stderr,
+            "#### EXTENSION-LS-IDENTITY original=nil bundle=%s url=%s "
+            "candidate=%s candidate-id=%s error=%s accepted=%s\n",
+            identifierBytes,
+            [[[bundleURL absoluteURL] path] UTF8String] ?: "<nil>",
+            candidate ? object_getClassName(candidate) : "nil",
+            candidateIdentifier
+                ? [[candidateIdentifier description] UTF8String] : "nil",
+            error ? [[error description] UTF8String] : "nil",
+            validIdentifier ? "YES" : "NO");
+    fflush(stderr);
+    return validIdentifier ? candidate : nil;
+}
+
+static void macws_install_extension_bundle_identity_compatibility(void) {
+    const char *appExtension = getenv("MACWS_APP_EXTENSION");
+    if (!appExtension || strcmp(appExtension, "1") != 0) return;
+    Class recordClass = objc_getClass("LSBundleRecord");
+    if (!recordClass) {
+        fprintf(stderr,
+                "#### EXTENSION-LS-IDENTITY LSBundleRecord unavailable\n");
+        return;
+    }
+    Method method = class_getClassMethod(
+        recordClass, sel_registerName("bundleRecordForCurrentProcess"));
+    if (!method) {
+        fprintf(stderr,
+                "#### EXTENSION-LS-IDENTITY provider method unavailable\n");
+        return;
+    }
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)macws_bundle_record_for_current_process_compat) return;
+    macws_bundle_record_for_current_process_orig =
+        (id (*)(id, SEL))current;
+    method_setImplementation(
+        method, (IMP)macws_bundle_record_for_current_process_compat);
+    fprintf(stderr,
+            "#### EXTENSION-LS-IDENTITY provider compatibility installed\n");
+}
+
+// Runtime-confirmed by misc/ExtensionRecordProbe against the loaded Ventura
+// 13.4 ExtensionFoundation image:
+//
+//   -[_EXRunningExtension _startWithArguments:count:]
+//       types=i28@0:8r^*16i24
+//
+// The corresponding disassembly at +160 sends
+// +[LSBundleRecord bundleRecordForCurrentProcess].  Installing the provider
+// replacement from libmachook's constructor was too early on this launch
+// path: LaunchServices can finish registering its Objective-C classes only
+// when ExtensionFoundation enters this method.  Wrap the actual lifecycle
+// boundary and install the narrow provider compatibility immediately before
+// the original lookup.  The original implementation, arguments, and return
+// value remain intact.
+static int (*macws_running_extension_start_orig)(
+    id, SEL, const char *const *, int) = NULL;
+
+static int macws_running_extension_start_compat(
+    id receiver, SEL selector, const char *const *arguments, int count) {
+    macws_install_extension_bundle_identity_compatibility();
+    return macws_running_extension_start_orig
+        ? macws_running_extension_start_orig(
+              receiver, selector, arguments, count)
+        : -1;
+}
+
+static void macws_install_running_extension_identity_boundary(void) {
+    const char *appExtension = getenv("MACWS_APP_EXTENSION");
+    if (!appExtension || strcmp(appExtension, "1") != 0) return;
+    Class runningExtensionClass = objc_getClass("_EXRunningExtension");
+    if (!runningExtensionClass) return;
+    Method startMethod = class_getInstanceMethod(
+        runningExtensionClass,
+        sel_registerName("_startWithArguments:count:"));
+    if (!startMethod) return;
+    IMP current = method_getImplementation(startMethod);
+    if (current == (IMP)macws_running_extension_start_compat) return;
+    macws_running_extension_start_orig =
+        (int (*)(id, SEL, const char *const *, int))current;
+    method_setImplementation(
+        startMethod, (IMP)macws_running_extension_start_compat);
+    fprintf(stderr,
+            "#### EXTENSION-LS-IDENTITY lifecycle boundary installed\n");
+}
+
+// InitStuff in mac_hooks.m calls this again after EnableJIT.  That second
+// installation point is intentional: the bundle-local dylib can be initialized
+// before the extension proxy's post-exec debug marker lands, while the method
+// implementations execute only after ExtensionFoundation starts its listener.
+void MacWSInstallExtensionRuntimeCompatibility(void) {
+    macws_install_extension_bundle_identity_compatibility();
+    macws_install_running_extension_identity_boundary();
 }
 
 // Focused launch-context probe for ViewBridge/HIServices/OpenPanel.  These
@@ -75,6 +221,1817 @@ static void macws_record_xpc_service_context_if_requested(void) {
         close(fd);
     }
     free(description);
+}
+
+// macOS normally completes this state transition in loginwindow.  MacWS has
+// a real WindowServer session but intentionally no loginwindow process, so
+// Ventura reports the pre-login placeholder (uid 88, user "unknown",
+// on-console=true, login-done=false) forever.  This is not merely cosmetic:
+// RE-confirmed in Ventura System Settings at 0x1000afba0..0x1000afcdc, the
+// application skips SwiftUI.App.main entirely unless this provider returns a
+// true kCGSessionLoginDoneKey.  loginwindow itself updates the provider with
+// CGSSessionSetCurrentSessionProperties, but that path requires macOS audit
+// SessionCreate; runtime on iOS returns 100078 and CGS then rejects the
+// loginwindow connection with error 1000.
+//
+// Complete the absent provider handoff at the provider boundary, not in each
+// consumer. Preserve every WindowServer-owned value and only change the one
+// login-completion bit for MacWS's exact shared synthetic audit session and
+// exact pre-login placeholder identity. A future real loginwindow session, a
+// different audit session, or an already-complete login remains untouched.
+typedef CFDictionaryRef (*macws_copy_cgsession_fn)(void);
+static macws_copy_cgsession_fn macws_cgsession_private_orig = NULL;
+static macws_copy_cgsession_fn macws_cgsession_public_orig = NULL;
+
+static BOOL macws_cgsession_is_prelogin_placeholder(CFDictionaryRef session) {
+    if (!session || CFGetTypeID(session) != CFDictionaryGetTypeID()) return NO;
+    // Do not use CFSTR constants emitted into the injected dylib as keys in a
+    // macOS arm64e CoreFoundation collection.  Maps-2026-08-03-163221.ips
+    // runtime-confirmed a PAC fault in -[__NSFrozenDictionaryM objectForKey:]
+    // while hashing such a cross-image constant.  Strings created by the live
+    // process's CoreFoundation runtime carry the correct authentication state.
+    const char *keyNames[] = {
+        "kCGSSessionAuditIDKey",
+        "kCGSSessionUserIDKey",
+        "kCGSSessionUserNameKey",
+        "kCGSSessionOnConsoleKey",
+        "kCGSessionLoginDoneKey",
+        "unknown",
+    };
+    CFStringRef strings[sizeof(keyNames) / sizeof(keyNames[0])] = {};
+    BOOL allStringsCreated = YES;
+    for (size_t index = 0;
+         index < sizeof(strings) / sizeof(strings[0]); index++) {
+        strings[index] = CFStringCreateWithCString(
+            kCFAllocatorDefault, keyNames[index], kCFStringEncodingUTF8);
+        if (!strings[index]) allStringsCreated = NO;
+    }
+    if (!allStringsCreated) {
+        for (size_t index = 0;
+             index < sizeof(strings) / sizeof(strings[0]); index++) {
+            if (strings[index]) CFRelease(strings[index]);
+        }
+        return NO;
+    }
+
+    CFTypeRef audit = CFDictionaryGetValue(session, strings[0]);
+    CFTypeRef userID = CFDictionaryGetValue(session, strings[1]);
+    CFTypeRef userName = CFDictionaryGetValue(session, strings[2]);
+    CFTypeRef onConsole = CFDictionaryGetValue(session, strings[3]);
+    CFTypeRef loginDone = CFDictionaryGetValue(session, strings[4]);
+    BOOL matchesTypes = audit && CFGetTypeID(audit) == CFNumberGetTypeID() &&
+        userID && CFGetTypeID(userID) == CFNumberGetTypeID() &&
+        userName && CFGetTypeID(userName) == CFStringGetTypeID() &&
+        onConsole == kCFBooleanTrue && loginDone == kCFBooleanFalse;
+    if (!matchesTypes) {
+        for (size_t index = 0;
+             index < sizeof(strings) / sizeof(strings[0]); index++)
+            CFRelease(strings[index]);
+        return NO;
+    }
+
+    int64_t auditValue = 0;
+    int64_t userIDValue = 0;
+    BOOL readNumbers =
+        CFNumberGetValue((CFNumberRef)audit, kCFNumberSInt64Type,
+                         &auditValue) &&
+        CFNumberGetValue((CFNumberRef)userID, kCFNumberSInt64Type,
+                         &userIDValue);
+    BOOL result = readNumbers && auditValue == 0x004d5753 &&
+        userIDValue == 88 &&
+        CFStringCompare((CFStringRef)userName, strings[5], 0) ==
+            kCFCompareEqualTo;
+    for (size_t index = 0;
+         index < sizeof(strings) / sizeof(strings[0]); index++)
+        CFRelease(strings[index]);
+    return result;
+}
+
+static CFDictionaryRef macws_cgsession_complete_login_handoff(
+    CFDictionaryRef session) {
+    if (!macws_cgsession_is_prelogin_placeholder(session)) return session;
+    CFMutableDictionaryRef completed = CFDictionaryCreateMutableCopy(
+        kCFAllocatorDefault, 0, session);
+    if (!completed) return session;
+    CFStringRef loginDoneKey = CFStringCreateWithCString(
+        kCFAllocatorDefault, "kCGSessionLoginDoneKey",
+        kCFStringEncodingUTF8);
+    if (!loginDoneKey) {
+        CFRelease(completed);
+        return session;
+    }
+    CFDictionarySetValue(completed, loginDoneKey, kCFBooleanTrue);
+    CFRelease(loginDoneKey);
+    CFRelease(session);
+    return completed;
+}
+
+static CFDictionaryRef macws_cgsession_private_compat(void) {
+    return macws_cgsession_complete_login_handoff(
+        macws_cgsession_private_orig
+            ? macws_cgsession_private_orig() : NULL);
+}
+
+static CFDictionaryRef macws_cgsession_public_compat(void) {
+    return macws_cgsession_complete_login_handoff(
+        macws_cgsession_public_orig
+            ? macws_cgsession_public_orig() : NULL);
+}
+
+static void macws_install_cgsession_login_handoff_compatibility(void) {
+    void *privateProvider = dlsym(
+        RTLD_DEFAULT, "CGSSessionCopyCurrentSessionProperties");
+    void *publicProvider = dlsym(
+        RTLD_DEFAULT, "CGSessionCopyCurrentDictionary");
+    if (privateProvider) {
+        MSHookFunction(privateProvider,
+                       (void *)macws_cgsession_private_compat,
+                       (void **)&macws_cgsession_private_orig);
+    }
+    if (publicProvider && publicProvider != privateProvider) {
+        MSHookFunction(publicProvider,
+                       (void *)macws_cgsession_public_compat,
+                       (void **)&macws_cgsession_public_orig);
+    }
+}
+
+// Focused Launchpad source-import diagnostic.  Ventura's Dock owns the
+// LPAppManager/LPAppSource implementation, so observing these real method
+// boundaries tells us whether an empty Launchpad database comes from source
+// validation, source bring-up, or directory scanning.  This is deliberately
+// opt-in: production Dock processes pay no swizzle or logging cost unless the
+// launchd job starts with MACWS_LAUNCHPAD_TRACE=1.
+static BOOL (*macws_lp_path_valid_orig)(id, SEL, id) = NULL;
+static void (*macws_lp_source_common_init_orig)(id, SEL) = NULL;
+static void (*macws_lp_source_bring_online_orig)(id, SEL) = NULL;
+static void (*macws_lp_source_rescan_orig)(id, SEL) = NULL;
+static BOOL (*macws_lp_source_start_watching_orig)(id, SEL, BOOL *) = NULL;
+static void (*macws_lp_scan_path_orig)(id, SEL, id, id, NSUInteger, id) = NULL;
+static int (*macws_lp_fstatfs_orig)(int, struct statfs *) = NULL;
+static int (*macws_lp_statfs_orig)(const char *, struct statfs *) = NULL;
+static ssize_t (*macws_fsgetpath_orig)(char *, size_t, fsid_t *, uint64_t) = NULL;
+static BOOL macws_chroot_root_mount_needs_rebase = NO;
+static fsid_t macws_chroot_root_fsid = {};
+static char macws_chroot_root_host_mount[MAXPATHLEN] = {};
+static char macws_chroot_host_root[MAXPATHLEN] = {};
+typedef Boolean (*macws_cfurl_copy_resource_property_fn)(
+    CFURLRef, CFStringRef, void *, CFErrorRef *);
+static macws_cfurl_copy_resource_property_fn
+    macws_cfurl_copy_resource_property_orig = NULL;
+
+static BOOL macws_needs_application_mount_namespace_compatibility(void) {
+    const char *program = getprogname();
+    return program &&
+        (strcmp(program, "Dock") == 0 ||
+         strcmp(program, "launchservicesd") == 0 ||
+         strcmp(program, "lsd") == 0);
+}
+
+// Darwin's statfs/fstatfs expose the host mount namespace even after chroot(2).
+// On this iPad, every path backed by the chroot root filesystem reports that it
+// is mounted at `/private/var`, although the process-visible mount point is `/`.
+// This is a filesystem invariant rather than an application-directory special
+// case:
+//
+//   * Dock's stock LPAppSource rejects /System/Applications when the returned
+//     mount point is not a prefix of the process-visible path.
+//   * Runtime LLDB on the stock Ventura lsd showed
+//     -[NSFileManager getRelationship:ofDirectoryAtURL:toItemAtURL:error:]
+//     walking `/private -> / -> /private/var/mnt -> /private/var -> /private`
+//     forever while _LSDatabaseClean registers a required bundle. The parent
+//     of the chroot root escaped into the host namespace because `/` was not
+//     recognized as the volume root.
+//
+// Capture the real root filesystem ID before interposing, then report `/` as
+// the mount point for every statfs result on exactly that filesystem. Separate
+// bind mounts (devfs, dyld cache, etc.) retain their own filesystem identity and
+// mount point. This models a real chroot mount namespace; it neither fabricates
+// LaunchServices records nor bypasses its validation.
+static void macws_rebase_application_mount_namespace(
+    const char *path, struct statfs *buffer) {
+    if (!buffer || !macws_needs_application_mount_namespace_compatibility() ||
+        !macws_chroot_root_mount_needs_rebase ||
+        buffer->f_fsid.val[0] != macws_chroot_root_fsid.val[0] ||
+        buffer->f_fsid.val[1] != macws_chroot_root_fsid.val[1]) return;
+
+    if (strcmp(buffer->f_mntonname, "/") == 0) return;
+
+    char hostMount[MAXPATHLEN] = {};
+    strlcpy(hostMount, buffer->f_mntonname, sizeof(hostMount));
+    strlcpy(buffer->f_mntonname, "/", sizeof(buffer->f_mntonname));
+    if (getenv("MACWS_LAUNCHPAD_TRACE") ||
+        getenv("MACWS_APP_MOUNT_TRACE")) {
+        fprintf(stderr,
+                "#### APP-MOUNT namespace rebase process=%s path=%s "
+                "hostMnton=%s visibleMnton=/ fsid=(%d,%d)\n",
+                getprogname() ?: "unknown", path, hostMount,
+                buffer->f_fsid.val[0], buffer->f_fsid.val[1]);
+    }
+}
+
+static int macws_lp_fstatfs_namespace_compat(int descriptor,
+                                            struct statfs *buffer) {
+    int result = macws_lp_fstatfs_orig(descriptor, buffer);
+    if (result != 0 || !buffer) return result;
+
+    char path[MAXPATHLEN] = {};
+    if (fcntl(descriptor, F_GETPATH, path) == 0)
+        macws_rebase_application_mount_namespace(path, buffer);
+    return result;
+}
+
+static int macws_lp_statfs_namespace_compat(const char *path,
+                                           struct statfs *buffer) {
+    int result = macws_lp_statfs_orig(path, buffer);
+    if (result == 0 && buffer)
+        macws_rebase_application_mount_namespace(path, buffer);
+    return result;
+}
+
+// CFURL's resource-property provider is where NSURLParentDirectoryURLKey and
+// NSURLVolumeURLKey cross from a process-visible URL into the kernel's host
+// mount namespace.
+// Runtime LLDB on Ventura 13.4 captured createURLParentageArray repeatedly
+// asking this API for exactly NSURLParentDirectoryURLKey while its URL chain
+// cycled `/private/ -> / -> /private/var/mnt/ -> /private/var -> /private`.
+// The same trace showed that the local createVolumeParentURL provider is not
+// used by this query, so hooking that provider would only hide a nearby
+// symptom and is intentionally avoided.
+//
+// Runtime-confirmed on lsd PID 83632: asking NSURLVolumeURLKey for
+// /System/Library/CoreServices/CoreTypes.bundle returned `/private/var`, the
+// host mount point. FSNode then constructed that host URL in the chroot, where
+// it names an ordinary directory; -isVolume returned false and
+// _LSIsNodeTranslocatedMountPoint rejected every plugin with OSStatus -50.
+//
+// Restore the standard filesystem invariants at the public provider boundary:
+// the process-visible root URL has no parent, and the volume URL for any node
+// on the chroot root filesystem is `/`. This is deliberately limited to
+// lsd/Dock/launchservicesd instances whose real root statfs reports the exact
+// chroot filesystem mounted elsewhere in the host namespace. Every separate
+// filesystem, unrelated resource key, and normal process uses CoreFoundation
+// unchanged.
+static Boolean macws_cfurl_copy_resource_property_compat(
+    CFURLRef url, CFStringRef key, void *value, CFErrorRef *error) {
+    char keyName[64] = {};
+    char visiblePath[MAXPATHLEN] = {};
+    BOOL hasKeyName = key && CFGetTypeID(key) == CFStringGetTypeID() &&
+        CFStringGetCString(key, keyName, sizeof(keyName),
+                           kCFStringEncodingUTF8);
+    BOOL hasVisiblePath = url && CFURLGetFileSystemRepresentation(
+        url, true, (UInt8 *)visiblePath, sizeof(visiblePath));
+    if (url && key && macws_chroot_root_mount_needs_rebase &&
+        hasKeyName && hasVisiblePath) {
+        if (
+            strcmp(keyName, "NSURLParentDirectoryURLKey") == 0 &&
+            strcmp(visiblePath, "/") == 0) {
+            if (value) *(CFTypeRef *)value = NULL;
+            if (error) *error = NULL;
+            if (getenv("MACWS_APP_MOUNT_TRACE")) {
+                fprintf(stderr,
+                        "#### APP-MOUNT process root has no parent "
+                        "process=%s fsid=(%d,%d)\n",
+                        getprogname() ?: "unknown",
+                        macws_chroot_root_fsid.val[0],
+                        macws_chroot_root_fsid.val[1]);
+            }
+            return true;
+        }
+    }
+    Boolean result = macws_cfurl_copy_resource_property_orig
+        ? macws_cfurl_copy_resource_property_orig(url, key, value, error)
+        : false;
+    BOOL isVolumeQuery = hasKeyName && hasVisiblePath &&
+        strcmp(keyName, "NSURLVolumeURLKey") == 0;
+    if (result && isVolumeQuery && value &&
+        macws_chroot_root_mount_needs_rebase) {
+        CFTypeRef property = *(CFTypeRef *)value;
+        char volumePath[MAXPATHLEN] = {};
+        struct statfs inputFileSystem = {};
+        BOOL isRootFileSystem = macws_lp_statfs_orig &&
+            macws_lp_statfs_orig(visiblePath, &inputFileSystem) == 0 &&
+            inputFileSystem.f_fsid.val[0] == macws_chroot_root_fsid.val[0] &&
+            inputFileSystem.f_fsid.val[1] == macws_chroot_root_fsid.val[1];
+        BOOL isLeakedHostMount = property &&
+            CFGetTypeID(property) == CFURLGetTypeID() &&
+            CFURLGetFileSystemRepresentation(
+                (CFURLRef)property, true, (UInt8 *)volumePath,
+                sizeof(volumePath)) &&
+            strcmp(volumePath, macws_chroot_root_host_mount) == 0;
+        if (isRootFileSystem && isLeakedHostMount) {
+            static const UInt8 rootPath[] = "/";
+            CFURLRef visibleRoot = CFURLCreateFromFileSystemRepresentation(
+                kCFAllocatorDefault, rootPath, 1, true);
+            if (visibleRoot) {
+                CFRelease(property);
+                *(CFTypeRef *)value = visibleRoot;
+                if (getenv("MACWS_APP_MOUNT_TRACE")) {
+                    fprintf(stderr,
+                            "#### APP-MOUNT volume namespace rebase "
+                            "process=%s input=%s hostVolume=%s "
+                            "visibleVolume=/ fsid=(%d,%d)\n",
+                            getprogname() ?: "unknown", visiblePath,
+                            volumePath, inputFileSystem.f_fsid.val[0],
+                            inputFileSystem.f_fsid.val[1]);
+                }
+            }
+        }
+    }
+    if (getenv("MACWS_APP_MOUNT_TRACE") && isVolumeQuery) {
+        char volumePath[MAXPATHLEN] = "<none>";
+        CFTypeRef property = value ? *(CFTypeRef *)value : NULL;
+        if (result && property && CFGetTypeID(property) == CFURLGetTypeID()) {
+            if (!CFURLGetFileSystemRepresentation(
+                    (CFURLRef)property, true, (UInt8 *)volumePath,
+                    sizeof(volumePath))) {
+                strlcpy(volumePath, "<unrepresentable>", sizeof(volumePath));
+            }
+        }
+        fprintf(stderr,
+                "#### APP-MOUNT volume provider process=%s input=%s "
+                "result=%d volume=%s\n",
+                getprogname() ?: "unknown", visiblePath, result, volumePath);
+    }
+    return result;
+}
+
+static void macws_install_root_parent_namespace_compatibility(void) {
+    void *target = dlsym(RTLD_DEFAULT,
+                         "CFURLCopyResourcePropertyForKey");
+    if (!target) return;
+    MSHookFunction(target,
+                   (void *)macws_cfurl_copy_resource_property_compat,
+                   (void **)&macws_cfurl_copy_resource_property_orig);
+    if (getenv("MACWS_APP_MOUNT_TRACE")) {
+        fprintf(stderr,
+                "#### APP-MOUNT root parent provider installed "
+                "target=%p original=%p\n",
+                target, macws_cfurl_copy_resource_property_orig);
+    }
+}
+
+// statfs fixes volume identity, while fsgetpath fixes the other half of the
+// same namespace contract. CoreServices asks the kernel to turn a file ID back
+// into a path when producing NSURLParentDirectoryURLKey. The iOS kernel returns
+// `/private/var/mnt/rootfs/...`; exposing that string to a chrooted process lets
+// the parent of `/` escape the chroot. Rebase only the canonical host root
+// supplied by launchdchrootexec, preserving every path from other filesystems.
+static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
+                                                fsid_t *fsid,
+                                                uint64_t objectID) {
+    ssize_t result = macws_fsgetpath_orig(buffer, capacity, fsid, objectID);
+    if (result < 0 || !buffer || !macws_chroot_host_root[0]) return result;
+
+    size_t hostRootLength = strlen(macws_chroot_host_root);
+    if (strncmp(buffer, macws_chroot_host_root, hostRootLength) != 0 ||
+        (buffer[hostRootLength] != '\0' &&
+         buffer[hostRootLength] != '/')) return result;
+
+    char hostPath[MAXPATHLEN] = {};
+    if (getenv("MACWS_APP_MOUNT_TRACE"))
+        strlcpy(hostPath, buffer, sizeof(hostPath));
+
+    const char *visibleSuffix = buffer + hostRootLength;
+    if (*visibleSuffix == '\0') {
+        if (capacity < 2) {
+            errno = ERANGE;
+            return -1;
+        }
+        buffer[0] = '/';
+        buffer[1] = '\0';
+    } else {
+        size_t visibleLength = strlen(visibleSuffix) + 1;
+        memmove(buffer, visibleSuffix, visibleLength);
+    }
+    result = (ssize_t)strlen(buffer) + 1;
+
+    if (getenv("MACWS_APP_MOUNT_TRACE")) {
+        fprintf(stderr,
+                "#### APP-MOUNT fsgetpath process=%s host=%s visible=%s "
+                "fsid=(%d,%d) object=%llu\n",
+                getprogname() ?: "unknown", hostPath, buffer,
+                fsid ? fsid->val[0] : 0, fsid ? fsid->val[1] : 0,
+                (unsigned long long)objectID);
+    }
+    return result;
+}
+
+static void macws_install_launchpad_mount_namespace_compatibility(void) {
+    const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
+    if (hostRoot && hostRoot[0] == '/' && strcmp(hostRoot, "/") != 0) {
+        strlcpy(macws_chroot_host_root, hostRoot,
+                sizeof(macws_chroot_host_root));
+        void *fsgetpathSymbol = dlsym(RTLD_DEFAULT, "fsgetpath");
+        if (fsgetpathSymbol) {
+            MSHookFunction(fsgetpathSymbol,
+                           (void *)macws_fsgetpath_namespace_compat,
+                           (void **)&macws_fsgetpath_orig);
+        }
+    }
+
+    if (!macws_needs_application_mount_namespace_compatibility()) return;
+    void *statSymbol = dlsym(RTLD_DEFAULT, "statfs");
+    if (!statSymbol) return;
+
+    macws_lp_statfs_orig = (int (*)(const char *, struct statfs *))statSymbol;
+    struct statfs rootFileSystem = {};
+    if (macws_lp_statfs_orig("/", &rootFileSystem) != 0 ||
+        strcmp(rootFileSystem.f_mntonname, "/") == 0) return;
+
+    macws_chroot_root_mount_needs_rebase = YES;
+    macws_chroot_root_fsid = rootFileSystem.f_fsid;
+    strlcpy(macws_chroot_root_host_mount, rootFileSystem.f_mntonname,
+            sizeof(macws_chroot_root_host_mount));
+
+    void *fstatSymbol = dlsym(RTLD_DEFAULT, "fstatfs");
+    if (fstatSymbol) {
+        MSHookFunction(fstatSymbol, (void *)macws_lp_fstatfs_namespace_compat,
+                       (void **)&macws_lp_fstatfs_orig);
+    }
+    MSHookFunction(statSymbol, (void *)macws_lp_statfs_namespace_compat,
+                       (void **)&macws_lp_statfs_orig);
+
+    macws_install_root_parent_namespace_compatibility();
+
+    if (getenv("MACWS_LAUNCHPAD_TRACE") ||
+        getenv("MACWS_APP_MOUNT_TRACE")) {
+        fprintf(stderr,
+                "#### APP-MOUNT chroot root process=%s hostMnton=%s "
+                "visibleMnton=/ fsid=(%d,%d)\n",
+                getprogname() ?: "unknown",
+                macws_chroot_root_host_mount,
+                macws_chroot_root_fsid.val[0],
+                macws_chroot_root_fsid.val[1]);
+    }
+}
+
+static const char *macws_lp_utf8(id value) {
+    if (!value) return "<nil>";
+    id description = ((id (*)(id, SEL))objc_msgSend)(
+        value, sel_registerName("description"));
+    if (!description) return "<no-description>";
+    const char *text = ((const char *(*)(id, SEL))objc_msgSend)(
+        description, sel_registerName("UTF8String"));
+    return text ?: "<invalid-utf8>";
+}
+
+static NSInteger macws_lp_source_location(id source) {
+    return ((NSInteger (*)(id, SEL))objc_msgSend)(
+        source, sel_registerName("location"));
+}
+
+static id macws_lp_source_path(id source) {
+    return ((id (*)(id, SEL))objc_msgSend)(
+        source, sel_registerName("path"));
+}
+
+static BOOL macws_lp_source_online(id source) {
+    return ((BOOL (*)(id, SEL))objc_msgSend)(
+        source, sel_registerName("online"));
+}
+
+static BOOL macws_lp_path_valid_trace(id self, SEL selector, id path) {
+    BOOL valid = macws_lp_path_valid_orig(self, selector, path);
+    fprintf(stderr, "#### LAUNCHPAD pathValid path=%s result=%s\n",
+            macws_lp_utf8(path), valid ? "YES" : "NO");
+    return valid;
+}
+
+static void macws_lp_source_common_init_trace(id self, SEL selector) {
+    macws_lp_source_common_init_orig(self, selector);
+    fprintf(stderr,
+            "#### LAUNCHPAD source commonInit location=%ld path=%s online=%s\n",
+            (long)macws_lp_source_location(self),
+            macws_lp_utf8(macws_lp_source_path(self)),
+            macws_lp_source_online(self) ? "YES" : "NO");
+}
+
+static void macws_lp_source_bring_online_trace(id self, SEL selector) {
+    fprintf(stderr,
+            "#### LAUNCHPAD source bringOnline enter location=%ld path=%s online=%s\n",
+            (long)macws_lp_source_location(self),
+            macws_lp_utf8(macws_lp_source_path(self)),
+            macws_lp_source_online(self) ? "YES" : "NO");
+    macws_lp_source_bring_online_orig(self, selector);
+    fprintf(stderr,
+            "#### LAUNCHPAD source bringOnline return location=%ld path=%s online=%s\n",
+            (long)macws_lp_source_location(self),
+            macws_lp_utf8(macws_lp_source_path(self)),
+            macws_lp_source_online(self) ? "YES" : "NO");
+}
+
+static void macws_lp_source_rescan_trace(id self, SEL selector) {
+    fprintf(stderr,
+            "#### LAUNCHPAD source rescan location=%ld path=%s online=%s\n",
+            (long)macws_lp_source_location(self),
+            macws_lp_utf8(macws_lp_source_path(self)),
+            macws_lp_source_online(self) ? "YES" : "NO");
+    macws_lp_source_rescan_orig(self, selector);
+}
+
+static BOOL macws_lp_source_start_watching_trace(id self, SEL selector,
+                                                 BOOL *newVolume) {
+    id path = macws_lp_source_path(self);
+    const char *fileSystemPath = path
+        ? ((const char *(*)(id, SEL))objc_msgSend)(
+              path, sel_registerName("fileSystemRepresentation"))
+        : NULL;
+    int descriptor = -1;
+    int openError = 0;
+    int statResult = -1;
+    int statError = 0;
+    struct statfs fs = {};
+    char descriptorPath[MAXPATHLEN] = {};
+    if (fileSystemPath) {
+        descriptor = open(fileSystemPath, O_EVTONLY | O_CLOEXEC);
+        openError = descriptor < 0 ? errno : 0;
+        if (descriptor >= 0) {
+            statResult = fstatfs(descriptor, &fs);
+            statError = statResult < 0 ? errno : 0;
+            (void)fcntl(descriptor, F_GETPATH, descriptorPath);
+            close(descriptor);
+        }
+    }
+    fprintf(stderr,
+            "#### LAUNCHPAD watch preflight path=%s fdPath=%s open=%d "
+            "openErr=%d stat=%d statErr=%d fsid=(%d,%d) mnton=%s "
+            "mntfrom=%s fstype=%s\n",
+            macws_lp_utf8(path), descriptorPath[0] ? descriptorPath : "<none>",
+            descriptor, openError, statResult, statError,
+            fs.f_fsid.val[0], fs.f_fsid.val[1],
+            statResult == 0 ? fs.f_mntonname : "<none>",
+            statResult == 0 ? fs.f_mntfromname : "<none>",
+            statResult == 0 ? fs.f_fstypename : "<none>");
+
+    BOOL result = macws_lp_source_start_watching_orig(
+        self, selector, newVolume);
+    fprintf(stderr,
+            "#### LAUNCHPAD watch result path=%s result=%s newVolume=%s "
+            "online=%s\n",
+            macws_lp_utf8(path), result ? "YES" : "NO",
+            newVolume ? (*newVolume ? "YES" : "NO") : "<null>",
+            macws_lp_source_online(self) ? "YES" : "NO");
+    return result;
+}
+
+static void macws_lp_scan_path_trace(id self, SEL selector, id path,
+                                     id source, NSUInteger options,
+                                     id completion) {
+    fprintf(stderr,
+            "#### LAUNCHPAD scan enter path=%s sourceLocation=%ld "
+            "sourcePath=%s options=0x%lx completion=%p\n",
+            macws_lp_utf8(path), (long)macws_lp_source_location(source),
+            macws_lp_utf8(macws_lp_source_path(source)),
+            (unsigned long)options, completion);
+    macws_lp_scan_path_orig(self, selector, path, source, options, completion);
+}
+
+static BOOL macws_lp_replace_instance_method(Class cls, const char *name,
+                                             IMP replacement, IMP *original) {
+    BOOL traceInstall = getenv("MACWS_LAUNCHPAD_TRACE") != NULL ||
+        getenv("MACWS_APP_LIFECYCLE_TRACE") != NULL ||
+        getenv("MACWS_CATALYST_TRACE") != NULL;
+    Method method = class_getInstanceMethod(cls, sel_registerName(name));
+    if (!method) {
+        if (traceInstall) {
+            fprintf(stderr, "#### MACWS-DIAG hook missing %s[%s %s]\n",
+                    class_isMetaClass(cls) ? "+" : "-",
+                    class_getName(cls), name);
+        }
+        return NO;
+    }
+    *original = method_setImplementation(method, replacement);
+    if (traceInstall) {
+        fprintf(stderr, "#### MACWS-DIAG hook installed %s[%s %s] original=%p\n",
+                class_isMetaClass(cls) ? "+" : "-", class_getName(cls),
+                name, *original);
+    }
+    return YES;
+}
+
+static void macws_install_launchpad_source_diagnostics(void) {
+    const char *program = getprogname();
+    if (!getenv("MACWS_LAUNCHPAD_TRACE") ||
+        !program || strcmp(program, "Dock") != 0) return;
+
+    Class manager = objc_getClass("LPAppManager");
+    Class source = objc_getClass("LPAppSource");
+    if (!manager || !source) {
+        fprintf(stderr,
+                "#### LAUNCHPAD trace classes unavailable manager=%p source=%p\n",
+                manager, source);
+        return;
+    }
+
+    macws_lp_replace_instance_method(
+        manager, "pathValidForApplications:",
+        (IMP)macws_lp_path_valid_trace, (IMP *)&macws_lp_path_valid_orig);
+    macws_lp_replace_instance_method(
+        source, "commonInit", (IMP)macws_lp_source_common_init_trace,
+        (IMP *)&macws_lp_source_common_init_orig);
+    macws_lp_replace_instance_method(
+        source, "_bringOnlineIfPossible",
+        (IMP)macws_lp_source_bring_online_trace,
+        (IMP *)&macws_lp_source_bring_online_orig);
+    macws_lp_replace_instance_method(
+        source, "rescan", (IMP)macws_lp_source_rescan_trace,
+        (IMP *)&macws_lp_source_rescan_orig);
+    macws_lp_replace_instance_method(
+        source, "_startWatchingForChanges:",
+        (IMP)macws_lp_source_start_watching_trace,
+        (IMP *)&macws_lp_source_start_watching_orig);
+    macws_lp_replace_instance_method(
+        manager, "scanForApplicationsAtPath:fromSource:options:completion:",
+        (IMP)macws_lp_scan_path_trace, (IMP *)&macws_lp_scan_path_orig);
+}
+
+// Short-lived AppKit/SwiftUI lifecycle probe for applications that return
+// cleanly before publishing a window.  It records real framework boundaries;
+// it does not keep the process alive or alter delegate answers.
+static void (*macws_app_run_orig)(id, SEL) = NULL;
+static void (*macws_app_finish_launching_orig)(id, SEL) = NULL;
+static void (*macws_app_terminate_orig)(id, SEL, id) = NULL;
+static void (*macws_app_stop_orig)(id, SEL, id) = NULL;
+static void (*macws_app_delegate_did_finish_orig)(id, SEL, id) = NULL;
+
+static NSUInteger macws_app_window_count(id application) {
+    id windows = ((id (*)(id, SEL))objc_msgSend)(
+        application, sel_registerName("windows"));
+    return windows ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+        windows, sel_registerName("count")) : 0;
+}
+
+static void macws_app_run_trace(id self, SEL selector) {
+    fprintf(stderr, "#### APP-LIFECYCLE NSApplication.run enter windows=%lu\n",
+            (unsigned long)macws_app_window_count(self));
+    macws_app_run_orig(self, selector);
+    fprintf(stderr, "#### APP-LIFECYCLE NSApplication.run return windows=%lu\n",
+            (unsigned long)macws_app_window_count(self));
+}
+
+static void macws_app_finish_launching_trace(id self, SEL selector) {
+    fprintf(stderr,
+            "#### APP-LIFECYCLE NSApplication.finishLaunching enter windows=%lu\n",
+            (unsigned long)macws_app_window_count(self));
+    macws_app_finish_launching_orig(self, selector);
+    fprintf(stderr,
+            "#### APP-LIFECYCLE NSApplication.finishLaunching return windows=%lu "
+            "delegate=%s\n",
+            (unsigned long)macws_app_window_count(self),
+            macws_lp_utf8(((id (*)(id, SEL))objc_msgSend)(
+                self, sel_registerName("delegate"))));
+}
+
+static void macws_app_log_termination(const char *method, id self) {
+    fprintf(stderr, "#### APP-LIFECYCLE NSApplication.%s windows=%lu\n",
+            method, (unsigned long)macws_app_window_count(self));
+    void *frames[48] = {};
+    int count = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+}
+
+static void macws_app_terminate_trace(id self, SEL selector, id sender) {
+    macws_app_log_termination("terminate:", self);
+    macws_app_terminate_orig(self, selector, sender);
+}
+
+static void macws_app_stop_trace(id self, SEL selector, id sender) {
+    macws_app_log_termination("stop:", self);
+    macws_app_stop_orig(self, selector, sender);
+}
+
+static void macws_app_delegate_did_finish_trace(id self, SEL selector,
+                                                id notification) {
+    fprintf(stderr,
+            "#### APP-LIFECYCLE delegate didFinish enter class=%s\n",
+            object_getClassName(self));
+    macws_app_delegate_did_finish_orig(self, selector, notification);
+    id applicationClass = objc_getClass("NSApplication");
+    id application = applicationClass
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              applicationClass, sel_registerName("sharedApplication"))
+        : nil;
+    fprintf(stderr,
+            "#### APP-LIFECYCLE delegate didFinish return class=%s windows=%lu\n",
+            object_getClassName(self),
+            (unsigned long)macws_app_window_count(application));
+}
+
+static void macws_install_app_lifecycle_diagnostics(void) {
+    if (!getenv("MACWS_APP_LIFECYCLE_TRACE")) return;
+    const char *program = getprogname();
+    if (!program || (strcmp(program, "System Settings") != 0 &&
+                     strcmp(program, "Maps") != 0)) return;
+
+    Class application = objc_getClass("NSApplication");
+    if (application) {
+        macws_lp_replace_instance_method(
+            application, "run", (IMP)macws_app_run_trace,
+            (IMP *)&macws_app_run_orig);
+        macws_lp_replace_instance_method(
+            application, "finishLaunching",
+            (IMP)macws_app_finish_launching_trace,
+            (IMP *)&macws_app_finish_launching_orig);
+        macws_lp_replace_instance_method(
+            application, "terminate:", (IMP)macws_app_terminate_trace,
+            (IMP *)&macws_app_terminate_orig);
+        macws_lp_replace_instance_method(
+            application, "stop:", (IMP)macws_app_stop_trace,
+            (IMP *)&macws_app_stop_orig);
+    }
+
+    const char *delegateName = strcmp(program, "System Settings") == 0
+        ? "_TtC15System_Settings11AppDelegate" : "AppDelegate";
+    Class delegate = objc_getClass(delegateName);
+    if (delegate) {
+        macws_lp_replace_instance_method(
+            delegate, "applicationDidFinishLaunching:",
+            (IMP)macws_app_delegate_did_finish_trace,
+            (IMP *)&macws_app_delegate_did_finish_orig);
+    } else {
+        fprintf(stderr,
+                "#### APP-LIFECYCLE delegate class unavailable program=%s "
+                "class=%s\n", program, delegateName);
+    }
+}
+
+// Focused Catalyst launch probe.  A direct Ventura Maps exec currently enters
+// UIApplicationMain and then aborts in +[UIScreen mainScreen] while
+// -_compellApplicationLaunchToCompleteUnconditionally is completing a nil
+// FBSScene.  Observe the real UIKitMacHelper lifecycle immediately upstream;
+// no return value, scene, screen, or delegate state is changed by this probe.
+// It is opt-in because these framework-private boundaries are not on the
+// production path once LaunchServices supplies a complete scene transaction.
+static void (*macws_catalyst_compell_orig)(id, SEL) = NULL;
+static id (*macws_catalyst_main_screen_orig)(id, SEL) = NULL;
+static void (*macws_catalyst_uins_finish_orig)(id, SEL) = NULL;
+static void (*macws_catalyst_uins_did_finish_orig)(id, SEL, id) = NULL;
+static void (*macws_catalyst_request_scene_orig)(id, SEL, id, id) = NULL;
+static _Atomic int macws_catalyst_initial_scene_request_state = 0;
+static id (*macws_catalyst_endpoint_for_system_orig)(
+    id, SEL, id, id, id) = NULL;
+static id (*macws_catalyst_endpoint_for_mach_orig)(
+    id, SEL, id, id, id) = NULL;
+
+static id macws_catalyst_private_frontboard_name(id machName) {
+    if (!machName || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            machName, sel_registerName("respondsToSelector:"),
+            sel_registerName("UTF8String"))) return machName;
+    const char *value = ((const char *(*)(id, SEL))objc_msgSend)(
+        machName, sel_registerName("UTF8String"));
+    if (!value || strcmp(value,
+                         "com.apple.frontboard.systemappservices") != 0)
+        return machName;
+    Class stringClass = objc_getClass("NSString");
+    return stringClass
+        ? ((id (*)(id, SEL, const char *))objc_msgSend)(
+              (id)stringClass, sel_registerName("stringWithUTF8String:"),
+              "com.apple.macosbooter.frontboard.systemappservices")
+        : machName;
+}
+
+static id macws_catalyst_endpoint_for_system_route(
+    id self, SEL selector, id machName, id service, id instance) {
+    id routedName = macws_catalyst_private_frontboard_name(machName);
+    if (routedName != machName && getenv("MACWS_CATALYST_TRACE")) {
+        fprintf(stderr,
+                "#### CATALYST-FRONTBOARD endpoint system route=%s "
+                "service=%s\n",
+                ((const char *(*)(id, SEL))objc_msgSend)(
+                    routedName, sel_registerName("UTF8String")),
+                service ? ((const char *(*)(id, SEL))objc_msgSend)(
+                    service, sel_registerName("UTF8String")) : "<nil>");
+    }
+    return macws_catalyst_endpoint_for_system_orig(
+        self, selector, routedName, service, instance);
+}
+
+static id macws_catalyst_endpoint_for_mach_route(
+    id self, SEL selector, id machName, id service, id instance) {
+    id routedName = macws_catalyst_private_frontboard_name(machName);
+    if (routedName != machName && getenv("MACWS_CATALYST_TRACE")) {
+        fprintf(stderr,
+                "#### CATALYST-FRONTBOARD endpoint route=%s service=%s\n",
+                ((const char *(*)(id, SEL))objc_msgSend)(
+                    routedName, sel_registerName("UTF8String")),
+                service ? ((const char *(*)(id, SEL))objc_msgSend)(
+                    service, sel_registerName("UTF8String")) : "<nil>");
+    }
+    return macws_catalyst_endpoint_for_mach_orig(
+        self, selector, routedName, service, instance);
+}
+
+static void macws_install_catalyst_frontboard_route(void) {
+    // UINSWorkspace is the macOS Catalyst workspace.  Install for every
+    // Catalyst process, not just Maps, at the endpoint-construction boundary
+    // identified by the actual BoardServices runtime method list.  Ordinary
+    // AppKit and iOS processes do not realize UINSWorkspace and are untouched.
+    if (!objc_getClass("UINSWorkspace") ||
+        !objc_getClass("UIApplication")) return;
+    Class endpointClass = objc_getClass("BSServiceConnectionEndpoint");
+    if (!endpointClass) return;
+    Class metaClass = object_getClass(endpointClass);
+    macws_lp_replace_instance_method(
+        metaClass, "endpointForSystemMachName:service:instance:",
+        (IMP)macws_catalyst_endpoint_for_system_route,
+        (IMP *)&macws_catalyst_endpoint_for_system_orig);
+    macws_lp_replace_instance_method(
+        metaClass, "endpointForMachName:service:instance:",
+        (IMP)macws_catalyst_endpoint_for_mach_route,
+        (IMP *)&macws_catalyst_endpoint_for_mach_orig);
+}
+
+// A UIKit application carrier enters UIApplicationMain before SETEXEC replaces
+// its image with a Mac Catalyst executable.  The numeric PID and launchd job
+// survive, but the kernel's versioned PID (pid + exec generation) changes.
+//
+// RE-confirmed in Ventura 13.4 FrontBoard on the target iPad:
+//   -[FBProcessManager processForVersionedPID:] first looks in the exact-vpid
+//   map at self+0x58, then falls back to the bare-pid map at self+0x50 and
+//   returns that stale process while logging
+//   "Returning ..., even though it does not match provided vpid ...".
+//   -[FBProcessManager registerProcessForAuditToken:] treats any non-nil result
+//   as registered and returns early.  Even after an exact miss is forced,
+//   +[RBSProcessHandle handleForIdentifier:error:] reuses UIKitSystem's cached
+//   pre-SETEXEC handle and _bootstrapProcessWithHandle: recreates the old vpid.
+//
+// RBS itself deliberately keeps the launcher's application identity across
+// SETEXEC, so asking runningboardd for the bare PID again cannot manufacture a
+// new exec generation.  Deleting that FBProcess is also wrong: _removeProcess:
+// broadcasts an exit and RunningBoard terminates the still-live carrier.
+//
+// Runtime-confirmed on the target iPad: the post-SETEXEC handle returned for
+// Maps contains the base RBSProcessIdentity class, whose -isApplication method
+// is literally `mov w0, #0; ret`.  RunningBoard's own
+// +identityForEmbeddedApplicationIdentifier: factory instead returns an
+// RBSEmbeddedAppProcessIdentity for com.apple.Maps with isApplication=YES,
+// isEmbeddedApplication=YES and platform=0.  Build the new process instance
+// from that framework-created identity and replace only the stale audit-token
+// snapshot.  Ventura's real RBSProcessHandle initializer accepts an
+// RBSProcessInstance plus an RBSAuditToken and derives its PID/euid from the
+// latter.  We make a non-cached handle for the exact audit token, then pass it
+// through FrontBoard's own _reallyRegisterProcessForHandle: bootstrap path.
+// The refresh hook itself checks the exact generation before returning early;
+// processForVersionedPID: otherwise retains FrontBoard's stock bare-PID
+// fallback.  That fallback is required after SETEXEC because the already-open
+// UIKit workspace transports still identify the carrier's preceding exec
+// generation while the refreshed FBProcess owns the current generation.  No
+// process is deleted and no UIKit/RBS predicate is forced true.
+typedef uint64_t (*macws_bs_versioned_pid_for_audit_token_fn)(
+    const audit_token_t *token);
+typedef id (*macws_fb_register_process_for_audit_token_fn)(
+    id self, SEL selector, const audit_token_t *token);
+typedef id (*macws_fb_process_for_versioned_pid_fn)(
+    id self, SEL selector, uint64_t versionedPID);
+typedef id (*macws_rbs_handle_for_identifier_fn)(
+    id self, SEL selector, id identifier, NSError **error);
+typedef id (*macws_rbs_fu_handle_for_identifier_fn)(
+    id self, SEL selector, id identifier);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+
+static macws_bs_versioned_pid_for_audit_token_fn
+    macws_bs_versioned_pid_for_audit_token = NULL;
+static macws_fb_register_process_for_audit_token_fn
+    macws_fb_register_process_for_audit_token_orig = NULL;
+static macws_fb_process_for_versioned_pid_fn
+    macws_fb_process_for_versioned_pid_orig = NULL;
+static macws_rbs_handle_for_identifier_fn
+    macws_rbs_handle_for_identifier_orig = NULL;
+static macws_rbs_fu_handle_for_identifier_fn
+    macws_rbs_fu_handle_for_identifier_orig = NULL;
+static _Atomic BOOL macws_uikitsystem_exec_identity_hook_installed = NO;
+static _Atomic BOOL macws_uikitsystem_fu_handle_hook_installed = NO;
+static pthread_mutex_t macws_maps_rbs_handle_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static id macws_maps_current_rbs_handle = nil;
+static pid_t macws_maps_current_rbs_pid = -1;
+static uint64_t macws_maps_current_rbs_versioned_pid = UINT64_MAX;
+
+static BOOL macws_pid_is_live_chroot_maps(pid_t pid, char *path,
+                                          size_t pathCapacity) {
+    if (pid <= 0 || !path || pathCapacity == 0) return NO;
+    path[0] = '\0';
+    int length = proc_pidpath(pid, path, (uint32_t)pathCapacity);
+    if (length <= 0 || (size_t)length >= pathCapacity) return NO;
+    path[pathCapacity - 1] = '\0';
+    return strcmp(path,
+                  "/System/Applications/Maps.app/Contents/MacOS/Maps") == 0;
+}
+
+static uint64_t macws_fb_process_versioned_pid(id process) {
+    if (!process) return UINT64_MAX;
+    return ((uint64_t (*)(id, SEL))objc_msgSend)(
+        process, sel_registerName("versionedPID"));
+}
+
+static uint64_t macws_rbs_handle_versioned_pid(id handle) {
+    if (!handle) return UINT64_MAX;
+    SEL selector = sel_registerName("fu_versionedPID");
+    if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            handle, sel_registerName("respondsToSelector:"), selector))
+        selector = sel_registerName("versionedPID");
+    if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            handle, sel_registerName("respondsToSelector:"), selector))
+        return UINT64_MAX;
+    return ((uint64_t (*)(id, SEL))objc_msgSend)(handle, selector);
+}
+
+static void macws_publish_maps_rbs_handle(id handle, pid_t pid) {
+    if (!handle || pid <= 0) return;
+    id retainedHandle = ((id (*)(id, SEL))objc_msgSend)(
+        handle, sel_registerName("retain"));
+    uint64_t versionedPID = macws_rbs_handle_versioned_pid(handle);
+    pthread_mutex_lock(&macws_maps_rbs_handle_lock);
+    id previousHandle = macws_maps_current_rbs_handle;
+    macws_maps_current_rbs_handle = retainedHandle;
+    macws_maps_current_rbs_pid = pid;
+    macws_maps_current_rbs_versioned_pid = versionedPID;
+    pthread_mutex_unlock(&macws_maps_rbs_handle_lock);
+    if (previousHandle) {
+        ((void (*)(id, SEL))objc_msgSend)(
+            previousHandle, sel_registerName("release"));
+    }
+}
+
+// Returns an autoreleased strong snapshot so replacement of the process-wide
+// cache on a later Maps launch cannot race a current FuseBoard lookup.
+static id macws_copy_exact_maps_rbs_handle(
+    pid_t pid, uint64_t requestedVersionedPID) {
+    pthread_mutex_lock(&macws_maps_rbs_handle_lock);
+    id handle = nil;
+    if (macws_maps_current_rbs_handle &&
+        macws_maps_current_rbs_pid == pid &&
+        macws_maps_current_rbs_versioned_pid == requestedVersionedPID) {
+        handle = ((id (*)(id, SEL))objc_msgSend)(
+            macws_maps_current_rbs_handle, sel_registerName("retain"));
+    }
+    pthread_mutex_unlock(&macws_maps_rbs_handle_lock);
+    return handle
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              handle, sel_registerName("autorelease"))
+        : nil;
+}
+
+// RE-confirmed in Ventura 13.4 FuseBoard:
+// +[RBSProcessHandle(FuseBoard) fu_handleForIdentifier:] converts the incoming
+// scene's fu_versionedPID to NSNumber, calls this RunningBoard factory, then
+// rejects the result unless both versioned PIDs are byte-for-byte equal.
+// Runtime-confirmed after the identity refresh: the scene requested the
+// current generation while RunningBoard's global factory still returned the
+// carrier's preceding cached generation.  Resolve only to the fresh handle
+// that this process constructed from the real current audit token, and only
+// when its complete versioned PID exactly equals the request after validating
+// the kernel's exact Maps path.  FuseBoard still performs its native strict
+// generation comparison, application predicate and FUApplication lookup.
+static id macws_maps_rbs_handle_for_identifier(
+    id self, SEL selector, id identifier, NSError **error) {
+    id handle = macws_rbs_handle_for_identifier_orig(
+        self, selector, identifier, error);
+    Class numberClass = objc_getClass("NSNumber");
+    if (!identifier || !numberClass ||
+        !((BOOL (*)(id, SEL, Class))objc_msgSend)(
+            identifier, sel_registerName("isKindOfClass:"), numberClass))
+        return handle;
+
+    uint64_t requestedVersionedPID =
+        ((uint64_t (*)(id, SEL))objc_msgSend)(
+            identifier, sel_registerName("unsignedLongLongValue"));
+    uint64_t returnedVersionedPID = macws_rbs_handle_versioned_pid(handle);
+    if (returnedVersionedPID == requestedVersionedPID) return handle;
+
+    pid_t pid = (pid_t)(uint32_t)requestedVersionedPID;
+    char executablePath[4096];
+    if (!macws_pid_is_live_chroot_maps(
+            pid, executablePath, sizeof(executablePath))) return handle;
+
+    id exactHandle = macws_copy_exact_maps_rbs_handle(
+        pid, requestedVersionedPID);
+    if (!exactHandle) return handle;
+    uint64_t exactVersionedPID =
+        macws_rbs_handle_versioned_pid(exactHandle);
+
+    if (getenv("MACWS_CATALYST_TRACE")) {
+        fprintf(stderr,
+                "#### CATALYST-IDENTITY resolved Maps scene pid=%d "
+                "requested=%#llx stale=%#llx exact=%#llx\n",
+                pid, (unsigned long long)requestedVersionedPID,
+                (unsigned long long)returnedVersionedPID,
+                (unsigned long long)exactVersionedPID);
+        fflush(stderr);
+    }
+    return exactHandle;
+}
+
+// RE-confirmed in Ventura 13.4 FuseBoard at
+// +[RBSProcessHandle(FuseBoard) fu_handleForIdentifier:]+52..184: the method
+// reads the caller's fu_versionedPID, resolves a global RBS handle, and returns
+// it only when the complete versioned PID matches.  A separately spawned
+// chroot Maps process is intentionally anonymous to the iOS runningboardd, so
+// that globally resolved handle remains [anon<Maps>] even after UIKitSystem's
+// FBProcessManager has natively bootstrapped the exact audit-token generation.
+// Resolve at this category boundary to that already-registered, exact handle;
+// retain all native PID/generation/application checks and preserve the stock
+// result for every other process.
+static id macws_maps_fu_handle_for_identifier(
+    id self, SEL selector, id identifier) {
+    id handle = macws_rbs_fu_handle_for_identifier_orig(
+        self, selector, identifier);
+    uint64_t requestedVersionedPID =
+        macws_rbs_handle_versioned_pid(identifier);
+    if (requestedVersionedPID == UINT64_MAX) return handle;
+
+    SEL applicationSelector = sel_registerName("fu_isApplication");
+    BOOL returnedIsApplication =
+        handle &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            handle, sel_registerName("respondsToSelector:"),
+            applicationSelector) &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(handle, applicationSelector);
+    if (returnedIsApplication &&
+        macws_rbs_handle_versioned_pid(handle) == requestedVersionedPID)
+        return handle;
+
+    pid_t pid = (pid_t)(uint32_t)requestedVersionedPID;
+    char executablePath[4096];
+    if (!macws_pid_is_live_chroot_maps(
+            pid, executablePath, sizeof(executablePath))) return handle;
+
+    id exactHandle = macws_copy_exact_maps_rbs_handle(
+        pid, requestedVersionedPID);
+    if (!exactHandle) return handle;
+    BOOL exactIsApplication =
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            exactHandle, sel_registerName("respondsToSelector:"),
+            applicationSelector) &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(
+            exactHandle, applicationSelector);
+    if (!exactIsApplication) return handle;
+
+    if (getenv("MACWS_CATALYST_TRACE")) {
+        fprintf(stderr,
+                "#### CATALYST-IDENTITY FuseBoard resolved Maps pid=%d "
+                "requested=%#llx global=%p exact=%p\n",
+                pid, (unsigned long long)requestedVersionedPID,
+                handle, exactHandle);
+        fflush(stderr);
+    }
+    return exactHandle;
+}
+
+static id macws_maps_rbs_handle_for_audit_token(
+    const audit_token_t *token, pid_t pid, const char *executablePath) {
+    Class identifierClass = objc_getClass("RBSProcessIdentifier");
+    Class handleClass = objc_getClass("RBSProcessHandle");
+    Class instanceClass = objc_getClass("RBSProcessInstance");
+    Class auditTokenClass = objc_getClass("RBSAuditToken");
+    Class identityClass = objc_getClass("RBSProcessIdentity");
+    if (!identifierClass || !handleClass || !instanceClass ||
+        !auditTokenClass || !identityClass || !token || !executablePath)
+        return nil;
+
+    id identifier = ((id (*)(id, SEL, pid_t))objc_msgSend)(
+        (id)identifierClass, sel_registerName("identifierWithPid:"), pid);
+    NSError *error = nil;
+    id staleHandle = ((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+        (id)handleClass, sel_registerName("handleForIdentifier:error:"),
+        identifier, &error);
+    // Do not pass an Objective-C constant string emitted into libmachook here.
+    // UIKitSystem-2026-08-03-160935.ips runtime-confirmed that the macOS
+    // arm64e RunningBoard factory faults while retaining that cross-image
+    // constant (invalid PAC on __CFConstantStringClassReference).  A string
+    // instantiated by the process's live Foundation/CoreFoundation runtime
+    // carries the correct image/runtime authentication state.
+    Class stringClass = objc_getClass("NSString");
+    id mapsBundleIdentifier = stringClass
+        ? ((id (*)(id, SEL, const char *))objc_msgSend)(
+              (id)stringClass, sel_registerName("stringWithUTF8String:"),
+              "com.apple.Maps")
+        : nil;
+    id launcherJobLabel = stringClass
+        ? ((id (*)(id, SEL, const char *))objc_msgSend)(
+              (id)stringClass, sel_registerName("stringWithUTF8String:"),
+              "UIKitApplication:com.macwsguide.catalystlauncher")
+        : nil;
+    const char *identityFactory = "embedded-identifier";
+    id identity = mapsBundleIdentifier
+        ? ((id (*)(id, SEL, id))objc_msgSend)(
+        (id)identityClass,
+        sel_registerName("identityForEmbeddedApplicationIdentifier:"),
+        mapsBundleIdentifier)
+        : nil;
+    // The short factory consults the host application's registration state
+    // and runtime-confirmed returns nil inside the chroot UIKitSystem.  The
+    // complete factory is the RunningBoard API for constructing that same
+    // application identity from its launchd job and bundle identity; the
+    // iOS-native runtime probe confirms it returns
+    // RBSEmbeddedAppProcessIdentity with both application predicates true.
+    if (!identity && launcherJobLabel && mapsBundleIdentifier) {
+        identityFactory = "job-label";
+        identity = ((id (*)(id, SEL, id, id, int))objc_msgSend)(
+            (id)identityClass,
+            sel_registerName(
+                "identityForApplicationJobLabel:bundleID:platform:"),
+            launcherJobLabel, mapsBundleIdentifier, 0);
+    }
+    if (getenv("MACWS_CATALYST_TRACE")) {
+        BOOL isApplication = identity
+            ? ((BOOL (*)(id, SEL))objc_msgSend)(
+                  identity, sel_registerName("isApplication"))
+            : NO;
+        BOOL isEmbeddedApplication = identity
+            ? ((BOOL (*)(id, SEL))objc_msgSend)(
+                  identity, sel_registerName("isEmbeddedApplication"))
+            : NO;
+        int platform = identity
+            ? ((int (*)(id, SEL))objc_msgSend)(
+                  identity, sel_registerName("platform"))
+            : -1;
+        fprintf(stderr,
+                "#### CATALYST-IDENTITY construct pid=%d identifier=%p "
+                "staleHandle=%p factory=%s identity=%p class=%s app=%s "
+                "embedded=%s platform=%d\n",
+                pid, identifier, staleHandle, identityFactory, identity,
+                identity ? object_getClassName(identity) : "<nil>",
+                isApplication ? "YES" : "NO",
+                isEmbeddedApplication ? "YES" : "NO", platform);
+        fflush(stderr);
+    }
+    if (!identifier || !identity) return nil;
+
+    id freshInstance = ((id (*)(id, SEL, id, id))objc_msgSend)(
+        (id)instanceClass,
+        sel_registerName("instanceWithIdentifier:identity:"),
+        identifier, identity);
+    id freshAuditToken = ((id (*)(id, SEL, const audit_token_t *))objc_msgSend)(
+        (id)auditTokenClass, sel_registerName("tokenFromAuditTokenRef:"),
+        token);
+    if (!freshInstance || !freshAuditToken) {
+        if (getenv("MACWS_CATALYST_TRACE")) {
+            fprintf(stderr,
+                    "#### CATALYST-IDENTITY instance/token failed pid=%d "
+                    "instance=%p auditToken=%p\n",
+                    pid, freshInstance, freshAuditToken);
+            fflush(stderr);
+        }
+        return nil;
+    }
+
+    // Use the concrete identity's native policy (255 for the Maps embedded-app
+    // identity on this OS) instead of carrying the generic process handle's
+    // two lifecycle bits across the exec-generation boundary.
+    unsigned char manageFlags =
+        ((unsigned char (*)(id, SEL))objc_msgSend)(
+            identity, sel_registerName("defaultManageFlags"));
+    id beforeTranslocationPath = staleHandle
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              staleHandle,
+              sel_registerName("beforeTranslocationBundlePath"))
+        : nil;
+    id bundleData = nil;
+    id staleBundle = staleHandle
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              staleHandle, sel_registerName("bundle"))
+        : nil;
+    if (staleBundle) {
+        Ivar dataSourceIvar = class_getInstanceVariable(
+            object_getClass(staleBundle), "_dataSource");
+        if (dataSourceIvar) bundleData = object_getIvar(
+            staleBundle, dataSourceIvar);
+    }
+    id path = [NSString stringWithUTF8String:executablePath];
+
+    id allocated = ((id (*)(id, SEL))objc_msgSend)(
+        (id)handleClass, sel_registerName("alloc"));
+    // RE-confirmed at
+    // -[RBSProcessHandle initWithInstance:...]+432: it is passed to
+    // +[RBSProcessBundle bundleWithDataSource:] and the result is stored
+    // independently of identity/audit token. Preserve the stale handle's real
+    // bundle data source when that private ivar exists; nil remains a supported
+    // optional value on builds without it.
+    id freshHandle =
+        ((id (*)(id, SEL, id, id, id, unsigned char, id, id, BOOL))
+             objc_msgSend)(
+        allocated,
+        sel_registerName(
+            "initWithInstance:auditToken:bundleData:manageFlags:"
+            "beforeTranslocationBundlePath:executablePath:cache:"),
+        freshInstance, freshAuditToken, bundleData, manageFlags,
+        beforeTranslocationPath, path, NO);
+    if (getenv("MACWS_CATALYST_TRACE")) {
+        fprintf(stderr,
+                "#### CATALYST-IDENTITY handle pid=%d instance=%p "
+                "auditToken=%p flags=%u bundleData=%p handle=%p class=%s\n",
+                pid, freshInstance, freshAuditToken, manageFlags, bundleData,
+                freshHandle,
+                freshHandle ? object_getClassName(freshHandle) : "<nil>");
+        fflush(stderr);
+    }
+    macws_publish_maps_rbs_handle(freshHandle, pid);
+    return ((id (*)(id, SEL))objc_msgSend)(
+        freshHandle, sel_registerName("autorelease"));
+}
+
+static id macws_fb_register_process_for_audit_token(
+    id self, SEL selector, const audit_token_t *token) {
+    if (!token || !macws_bs_versioned_pid_for_audit_token)
+        return macws_fb_register_process_for_audit_token_orig(
+            self, selector, token);
+
+    uint64_t requestedVersionedPID =
+        macws_bs_versioned_pid_for_audit_token(token);
+    pid_t pid = (pid_t)(uint32_t)requestedVersionedPID;
+    char executablePath[4096];
+    if (!macws_pid_is_live_chroot_maps(
+            pid, executablePath, sizeof(executablePath)))
+        return macws_fb_register_process_for_audit_token_orig(
+            self, selector, token);
+
+    id exactProcess = macws_fb_process_for_versioned_pid_orig(
+        self, sel_registerName("processForVersionedPID:"),
+        requestedVersionedPID);
+    if (exactProcess &&
+        macws_fb_process_versioned_pid(exactProcess) == requestedVersionedPID)
+        return exactProcess;
+
+    id freshHandle = macws_maps_rbs_handle_for_audit_token(
+        token, pid, executablePath);
+    SEL registerSelector = sel_registerName("_reallyRegisterProcessForHandle:");
+    BOOL canReallyRegister = ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+        self, sel_registerName("respondsToSelector:"), registerSelector);
+    if (!freshHandle || !canReallyRegister) {
+        if (getenv("MACWS_CATALYST_TRACE")) {
+            fprintf(stderr,
+                    "#### CATALYST-IDENTITY bootstrap unavailable pid=%d "
+                    "handle=%p selector=%s\n",
+                    pid, freshHandle, canReallyRegister ? "YES" : "NO");
+            fflush(stderr);
+        }
+        return macws_fb_register_process_for_audit_token_orig(
+            self, selector, token);
+    }
+
+    id process = ((id (*)(id, SEL, id))objc_msgSend)(
+        self, registerSelector, freshHandle);
+    if (process &&
+        macws_fb_process_versioned_pid(process) == requestedVersionedPID) {
+        if (getenv("MACWS_CATALYST_TRACE")) {
+            fprintf(stderr,
+                    "#### CATALYST-IDENTITY registered Maps pid=%d "
+                    "vpid=%#llx through native FrontBoard bootstrap\n",
+                    pid, (unsigned long long)requestedVersionedPID);
+            fflush(stderr);
+        }
+        return process;
+    }
+
+    if (getenv("MACWS_CATALYST_TRACE")) {
+        fprintf(stderr,
+                "#### CATALYST-IDENTITY bootstrap mismatch pid=%d "
+                "requested=%#llx process=%p actual=%#llx\n",
+                pid, (unsigned long long)requestedVersionedPID, process,
+                (unsigned long long)macws_fb_process_versioned_pid(process));
+        fflush(stderr);
+    }
+
+    // Preserve stock failure behavior if the private constructor/bootstrap
+    // contract changes on another OS build.
+    return macws_fb_register_process_for_audit_token_orig(
+        self, selector, token);
+}
+
+static void macws_install_uikitsystem_exec_identity_refresh(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "UIKitSystem") != 0) return;
+
+    Class handleClass = objc_getClass("RBSProcessHandle");
+    if (!handleClass) return;
+    if (!atomic_load_explicit(
+            &macws_uikitsystem_exec_identity_hook_installed,
+            memory_order_acquire)) {
+        Class managerClass = objc_getClass("FBProcessManager");
+        if (!managerClass) return;
+        SEL processSelector = sel_registerName("processForVersionedPID:");
+        SEL registerSelector = sel_registerName("registerProcessForAuditToken:");
+        Method processMethod = class_getInstanceMethod(
+            managerClass, processSelector);
+        Method registerMethod = class_getInstanceMethod(
+            managerClass, registerSelector);
+        SEL handleSelector = sel_registerName("handleForIdentifier:error:");
+        Method handleMethod = class_getClassMethod(
+            handleClass, handleSelector);
+        if (!processMethod || !registerMethod || !handleMethod) return;
+
+        macws_bs_versioned_pid_for_audit_token =
+            (macws_bs_versioned_pid_for_audit_token_fn)dlsym(
+                RTLD_DEFAULT, "BSVersionedPIDForAuditToken");
+        if (!macws_bs_versioned_pid_for_audit_token) return;
+
+        macws_fb_process_for_versioned_pid_orig =
+            (macws_fb_process_for_versioned_pid_fn)
+                method_getImplementation(processMethod);
+        if (!macws_fb_process_for_versioned_pid_orig) return;
+
+        macws_rbs_handle_for_identifier_orig =
+            (macws_rbs_handle_for_identifier_fn)method_setImplementation(
+                handleMethod, (IMP)macws_maps_rbs_handle_for_identifier);
+        if (!macws_rbs_handle_for_identifier_orig) return;
+
+        macws_fb_register_process_for_audit_token_orig =
+            (macws_fb_register_process_for_audit_token_fn)
+                method_setImplementation(
+                    registerMethod,
+                    (IMP)macws_fb_register_process_for_audit_token);
+        if (!macws_fb_register_process_for_audit_token_orig) return;
+        atomic_store_explicit(
+            &macws_uikitsystem_exec_identity_hook_installed, YES,
+            memory_order_release);
+    }
+
+    // FuseBoard is loaded after RunningBoardServices on this build.  Install
+    // this independently from the base identity refresh so the dyld image
+    // callback can pick it up when the category method becomes available.
+    if (atomic_load_explicit(
+            &macws_uikitsystem_fu_handle_hook_installed,
+            memory_order_acquire)) return;
+    SEL fuseHandleSelector = sel_registerName("fu_handleForIdentifier:");
+    Method fuseHandleMethod = class_getClassMethod(
+        handleClass, fuseHandleSelector);
+    if (!fuseHandleMethod) return;
+    macws_rbs_fu_handle_for_identifier_orig =
+        (macws_rbs_fu_handle_for_identifier_fn)method_setImplementation(
+            fuseHandleMethod, (IMP)macws_maps_fu_handle_for_identifier);
+    if (!macws_rbs_fu_handle_for_identifier_orig) return;
+    atomic_store_explicit(
+        &macws_uikitsystem_fu_handle_hook_installed, YES,
+        memory_order_release);
+}
+
+static void macws_uikitsystem_exec_identity_image_added(
+    const struct mach_header *header, intptr_t slide) {
+    (void)header;
+    (void)slide;
+    macws_install_uikitsystem_exec_identity_refresh();
+}
+
+static id macws_catalyst_application_support_client;
+static id macws_catalyst_application_initialization_context;
+static _Atomic int macws_catalyst_application_registration_attempts;
+
+static void macws_register_catalyst_application_with_fuseboard(void) {
+    if (!getenv("MACWS_CATALYST_REGISTER_APPLICATION")) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Maps") != 0) return;
+    BOOL trace = getenv("MACWS_CATALYST_TRACE") != NULL;
+    int attempt = atomic_fetch_add_explicit(
+        &macws_catalyst_application_registration_attempts, 1,
+        memory_order_acq_rel) + 1;
+    // Attempt 1 runs in the injected-library constructor.  SETEXEC has already
+    // changed pid-version there, but the app has not necessarily completed its
+    // RBS/workspace bootstrap.  Attempt 2 runs at UIApplication's launch
+    // completion boundary, after that bootstrap and immediately before the
+    // first scene request.  More calls would only duplicate a live service
+    // connection.
+    if (attempt > 2) return;
+
+    // RE-confirmed via UIKitServices on Ventura 13.4:
+    // -[UISApplicationSupportClient
+    // applicationInitializationContextWithParameters:] obtains the official
+    // UISApplicationSupportService endpoint and synchronously calls
+    // initializeClientWithParameters:completion:.  FuseBoard's
+    // -[FUApplicationManager service:initializeClient:withParameters:] then
+    // resolves the real audit-token-backed RBSProcessHandle and registers the
+    // live versioned PID before returning its initialization context.  Direct
+    // chroot launch skipped this normal client handshake, leaving the scene
+    // request with no FUApplication entry.
+    Class clientClass = objc_getClass("UISApplicationSupportClient");
+    Class parametersClass =
+        objc_getClass("UISApplicationInitializationContextParameters");
+    if (!clientClass || !parametersClass) {
+        if (trace) {
+            fprintf(stderr,
+                    "#### CATALYST-SUPPORT classes client=%s parameters=%s\n",
+                    clientClass ? "YES" : "NO",
+                    parametersClass ? "YES" : "NO");
+            fflush(stderr);
+        }
+        return;
+    }
+
+    id parameters = ((id (*)(id, SEL))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)(
+            (id)parametersClass, sel_registerName("alloc")),
+        sel_registerName("init"));
+    id client = ((id (*)(id, SEL))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)(
+            (id)clientClass, sel_registerName("alloc")),
+        sel_registerName("init"));
+    id context = nil;
+    SEL initializeSelector = sel_registerName(
+        "applicationInitializationContextWithParameters:");
+    if (client && parameters &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            client, sel_registerName("respondsToSelector:"),
+            initializeSelector)) {
+        @try {
+            context = ((id (*)(id, SEL, id))objc_msgSend)(
+                client, initializeSelector, parameters);
+        } @catch (NSException *exception) {
+            if (trace) {
+                fprintf(stderr,
+                        "#### CATALYST-SUPPORT initialization throw=%s "
+                        "reason=%s\n",
+                        exception.name.UTF8String ?: "<nil>",
+                        exception.reason.UTF8String ?: "<nil>");
+                fflush(stderr);
+            }
+        }
+    }
+
+    if (client) {
+        macws_catalyst_application_support_client = client;
+    }
+    if (context) {
+        macws_catalyst_application_initialization_context =
+            ((id (*)(id, SEL))objc_msgSend)(
+                context, sel_registerName("retain"));
+    }
+    if (parameters) {
+        ((void (*)(id, SEL))objc_msgSend)(
+            parameters, sel_registerName("release"));
+    }
+    if (trace) {
+        fprintf(stderr,
+                "#### CATALYST-SUPPORT registration attempt=%d client=%s "
+                "context=%s\n",
+                attempt,
+                client ? object_getClassName(client) : "nil",
+                context ? object_getClassName(context) : "nil");
+        fflush(stderr);
+    }
+}
+
+static NSUInteger macws_catalyst_collection_count(id value) {
+    if (!value || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            value, sel_registerName("respondsToSelector:"),
+            sel_registerName("count"))) return 0;
+    return ((NSUInteger (*)(id, SEL))objc_msgSend)(
+        value, sel_registerName("count"));
+}
+
+static id macws_catalyst_send_id(id receiver, const char *selector) {
+    if (!receiver) return nil;
+    SEL sel = sel_registerName(selector);
+    if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            receiver, sel_registerName("respondsToSelector:"), sel))
+        return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(receiver, sel);
+}
+
+static BOOL macws_catalyst_send_bool(id receiver, const char *selector,
+                                     BOOL *supported) {
+    if (supported) *supported = NO;
+    if (!receiver) return NO;
+    SEL sel = sel_registerName(selector);
+    if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            receiver, sel_registerName("respondsToSelector:"), sel))
+        return NO;
+    if (supported) *supported = YES;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(receiver, sel);
+}
+
+static void macws_catalyst_log_state(const char *stage, id application) {
+    Class delegateClass = objc_getClass("UINSApplicationDelegate");
+    id delegate = delegateClass
+        ? macws_catalyst_send_id((id)delegateClass, "sharedDelegate") : nil;
+    Class workspaceClass = objc_getClass("UINSWorkspace");
+    id workspace = workspaceClass
+        ? macws_catalyst_send_id((id)workspaceClass, "sharedInstance") : nil;
+    id initialScreen = macws_catalyst_send_id(workspace, "initialScreen");
+    id scenes = macws_catalyst_send_id(application, "connectedScenes");
+    id windows = macws_catalyst_send_id(
+        objc_getClass("NSApplication")
+            ? macws_catalyst_send_id(
+                  (id)objc_getClass("NSApplication"), "sharedApplication")
+            : nil,
+        "windows");
+    BOOL wantsSupported = NO;
+    BOOL wantsInitialScene = macws_catalyst_send_bool(
+        delegate, "_wantsInitialScene", &wantsSupported);
+    BOOL configuredSupported = NO;
+    BOOL didConfigureWindow = macws_catalyst_send_bool(
+        delegate, "didConfigureWindow", &configuredSupported);
+    id requestCallback = macws_catalyst_send_id(
+        delegate,
+        "requestHostingSceneCreationWithPersistentIdentifierCallback");
+    fprintf(stderr,
+        "#### CATALYST-LAUNCH stage=%s app=%s delegate=%s workspace=%s "
+        "initialScreen=%s connectedScenes=%lu nsWindows=%lu "
+        "wantsInitial=%s/%s configured=%s/%s requestCallback=%s\n",
+        stage ?: "<unknown>",
+        application ? object_getClassName(application) : "nil",
+        delegate ? object_getClassName(delegate) : "nil",
+        workspace ? object_getClassName(workspace) : "nil",
+        initialScreen ? object_getClassName(initialScreen) : "nil",
+        (unsigned long)macws_catalyst_collection_count(scenes),
+        (unsigned long)macws_catalyst_collection_count(windows),
+        wantsSupported ? "supported" : "missing",
+        wantsInitialScene ? "YES" : "NO",
+        configuredSupported ? "supported" : "missing",
+        didConfigureWindow ? "YES" : "NO",
+        requestCallback ? object_getClassName(requestCallback) : "nil");
+    fflush(stderr);
+}
+
+static id macws_catalyst_pending_application;
+static SEL macws_catalyst_pending_compell_selector;
+static _Atomic unsigned macws_catalyst_scene_poll_attempts;
+
+// RE-confirmed in Ventura 13.4 UIKitMacHelper:
+// -[UINSApplicationDelegate willRequestSceneWithOptions:] is exactly an ADRP
+// + ADD that loads __block_literal_global.123, followed by a tail call to
+// _willRequestSceneWithOptions:withCompletion:. Its block invoke is a single
+// RET. Reuse that Apple-framework-owned, correctly arm64e-signed no-op block
+// instead of creating a block in the on-device-built injected dylib. The
+// latter's _NSConcreteStackBlock isa trapped PAC in
+// Maps-2026-08-03-152724.ips.
+static id macws_uins_framework_noop_scene_completion(Class delegateClass) {
+    if (!delegateClass) return nil;
+    Method method = class_getInstanceMethod(
+        delegateClass, sel_registerName("willRequestSceneWithOptions:"));
+    if (!method) return nil;
+    uintptr_t pc = (uintptr_t)ptrauth_strip(
+        method_getImplementation(method), ptrauth_key_function_pointer);
+    uint32_t adrp = 0;
+    uint32_t add = 0;
+    memcpy(&adrp, (const void *)pc, sizeof(adrp));
+    memcpy(&add, (const void *)(pc + sizeof(adrp)), sizeof(add));
+    if ((adrp & 0x9f000000u) != 0x90000000u ||
+        (add & 0xffc00000u) != 0x91000000u) return nil;
+    unsigned destination = adrp & 0x1fu;
+    if ((add & 0x1fu) != destination ||
+        ((add >> 5) & 0x1fu) != destination) return nil;
+
+    int64_t pages = (int64_t)((((adrp >> 5) & 0x7ffffu) << 2) |
+                              ((adrp >> 29) & 0x3u));
+    if (pages & (1ll << 20)) pages -= 1ll << 21;
+    uintptr_t blockAddress = (pc & ~(uintptr_t)0xfff) +
+        (uintptr_t)(pages << 12);
+    uintptr_t addImmediate = (uintptr_t)((add >> 10) & 0xfffu);
+    if ((add >> 22) & 1u) addImmediate <<= 12;
+    blockAddress += addImmediate;
+
+    id block = (__bridge id)(void *)blockAddress;
+    const char *className = block ? object_getClassName(block) : NULL;
+    return className && strstr(className, "Block") ? block : nil;
+}
+
+static void macws_catalyst_finish_after_scene(void *context) {
+    (void)context;
+    @autoreleasepool {
+        id application = macws_catalyst_pending_application;
+        if (!application || !macws_catalyst_compell_orig) return;
+        NSUInteger sceneCount = macws_catalyst_collection_count(
+            macws_catalyst_send_id(application, "connectedScenes"));
+        if (sceneCount > 0) {
+            atomic_store_explicit(
+                &macws_catalyst_initial_scene_request_state, 2,
+                memory_order_release);
+            SEL selector = macws_catalyst_pending_compell_selector;
+            macws_catalyst_pending_application = nil;
+            macws_catalyst_pending_compell_selector = NULL;
+            macws_catalyst_compell_orig(application, selector);
+            if (macws_runtime_diagnostics_enabled())
+                macws_catalyst_log_state(
+                    "UIApplication.compell-scene-ready", application);
+            return;
+        }
+
+        unsigned attempt = atomic_fetch_add_explicit(
+            &macws_catalyst_scene_poll_attempts, 1,
+            memory_order_acq_rel) + 1;
+        if (attempt < 100) {
+            dispatch_after_f(
+                dispatch_time(DISPATCH_TIME_NOW,
+                              50 * NSEC_PER_MSEC),
+                dispatch_get_main_queue(), NULL,
+                macws_catalyst_finish_after_scene);
+            return;
+        }
+        atomic_store_explicit(
+            &macws_catalyst_initial_scene_request_state, 3,
+            memory_order_release);
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### CATALYST-LAUNCH initial scene timed out after "
+                    "%u polls\n", attempt);
+            fflush(stderr);
+        }
+    }
+}
+
+static void macws_catalyst_compell_compat(id self, SEL selector) {
+    macws_register_catalyst_application_with_fuseboard();
+    if (macws_runtime_diagnostics_enabled())
+        macws_catalyst_log_state("UIApplication.compell-enter", self);
+    if (getenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE") &&
+        macws_catalyst_collection_count(
+            macws_catalyst_send_id(self, "connectedScenes")) == 0) {
+        int expected = 0;
+        if (atomic_compare_exchange_strong_explicit(
+                &macws_catalyst_initial_scene_request_state, &expected, 1,
+                memory_order_acq_rel, memory_order_acquire)) {
+            Class delegateClass = objc_getClass("UINSApplicationDelegate");
+            id delegate = delegateClass
+                ? macws_catalyst_send_id(
+                      (id)delegateClass, "sharedDelegate") : nil;
+            SEL createSelector = sel_registerName(
+                "_createNewSceneInForegroundWithCompletionHandler:");
+            BOOL supported = delegate &&
+                ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+                    delegate, sel_registerName("respondsToSelector:"),
+                    createSelector);
+            id completion = supported
+                ? macws_uins_framework_noop_scene_completion(delegateClass)
+                : nil;
+            if (supported && completion) {
+                macws_catalyst_pending_application = self;
+                macws_catalyst_pending_compell_selector = selector;
+                atomic_store_explicit(
+                    &macws_catalyst_scene_poll_attempts, 0,
+                    memory_order_release);
+                @try {
+                    ((void (*)(id, SEL, id))objc_msgSend)(
+                        delegate, createSelector, completion);
+                } @catch (NSException *exception) {
+                    atomic_store_explicit(
+                        &macws_catalyst_initial_scene_request_state, 3,
+                        memory_order_release);
+                    fprintf(stderr,
+                        "#### CATALYST-LAUNCH stage=initial-scene-request "
+                        "throw=%s reason=%s\n",
+                        exception.name.UTF8String ?: "<nil>",
+                        exception.reason.UTF8String ?: "<nil>");
+                    fflush(stderr);
+                }
+                if (atomic_load_explicit(
+                        &macws_catalyst_initial_scene_request_state,
+                        memory_order_acquire) == 1) {
+                    dispatch_after_f(
+                        dispatch_time(DISPATCH_TIME_NOW,
+                                      50 * NSEC_PER_MSEC),
+                        dispatch_get_main_queue(), NULL,
+                        macws_catalyst_finish_after_scene);
+                }
+                return;
+            }
+            atomic_store_explicit(
+                &macws_catalyst_initial_scene_request_state, 3,
+                memory_order_release);
+        } else if (expected == 1) {
+            return;
+        }
+    }
+    macws_catalyst_compell_orig(self, selector);
+    if (macws_runtime_diagnostics_enabled())
+        macws_catalyst_log_state("UIApplication.compell-return", self);
+}
+
+static void macws_install_catalyst_launch_compatibility(void) {
+    if (!getenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE")) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Maps") != 0) return;
+    Class application = objc_getClass("UIApplication");
+    if (!application) return;
+    macws_lp_replace_instance_method(
+        application, "_compellApplicationLaunchToCompleteUnconditionally",
+        (IMP)macws_catalyst_compell_compat,
+        (IMP *)&macws_catalyst_compell_orig);
+}
+
+static id macws_catalyst_main_screen_trace(id self, SEL selector) {
+    fprintf(stderr, "#### CATALYST-LAUNCH stage=UIScreen.mainScreen-enter\n");
+    fflush(stderr);
+    @try {
+        id screen = macws_catalyst_main_screen_orig(self, selector);
+        fprintf(stderr,
+                "#### CATALYST-LAUNCH stage=UIScreen.mainScreen-return "
+                "screen=%s\n",
+                screen ? object_getClassName(screen) : "nil");
+        fflush(stderr);
+        return screen;
+    } @catch (NSException *exception) {
+        fprintf(stderr,
+                "#### CATALYST-LAUNCH stage=UIScreen.mainScreen-throw "
+                "name=%s reason=%s\n",
+                exception.name.UTF8String ?: "<nil>",
+                exception.reason.UTF8String ?: "<nil>");
+        fflush(stderr);
+        @throw exception;
+    }
+}
+
+static void macws_catalyst_uins_finish_trace(id self, SEL selector) {
+    macws_catalyst_log_state("UINS.finish-enter", nil);
+    macws_catalyst_uins_finish_orig(self, selector);
+    macws_catalyst_log_state("UINS.finish-return", nil);
+}
+
+static void macws_catalyst_uins_did_finish_trace(id self, SEL selector,
+                                                 id notification) {
+    macws_catalyst_log_state("UINS.didFinish-enter", nil);
+    macws_catalyst_uins_did_finish_orig(self, selector, notification);
+    macws_catalyst_log_state("UINS.didFinish-return", nil);
+}
+
+static void macws_catalyst_request_scene_trace(id self, SEL selector,
+                                               id options, id completion) {
+    fprintf(stderr,
+            "#### CATALYST-LAUNCH stage=UINSWorkspace.requestScene "
+            "options=%s completion=%s\n",
+            options ? object_getClassName(options) : "nil",
+            completion ? object_getClassName(completion) : "nil");
+    fflush(stderr);
+    macws_catalyst_request_scene_orig(self, selector, options, completion);
+}
+
+static void macws_catalyst_dump_service_class(const char *className) {
+    Class cls = objc_getClass(className);
+    fprintf(stderr, "#### CATALYST-SERVICE class=%s available=%s\n",
+            className, cls ? "YES" : "NO");
+    if (!cls) return;
+    unsigned int ivarCount = 0;
+    Ivar *ivars = class_copyIvarList(cls, &ivarCount);
+    for (unsigned int index = 0; index < ivarCount; index++) {
+        fprintf(stderr,
+                "#### CATALYST-SERVICE ivar class=%s name=%s type=%s "
+                "offset=%td\n",
+                className, ivar_getName(ivars[index]) ?: "<nil>",
+                ivar_getTypeEncoding(ivars[index]) ?: "<nil>",
+                ivar_getOffset(ivars[index]));
+    }
+    free(ivars);
+    for (int meta = 0; meta <= 1; meta++) {
+        Class owner = meta ? object_getClass(cls) : cls;
+        unsigned int methodCount = 0;
+        Method *methods = class_copyMethodList(owner, &methodCount);
+        for (unsigned int index = 0; index < methodCount; index++) {
+            fprintf(stderr,
+                    "#### CATALYST-SERVICE method class=%s scope=%c "
+                    "selector=%s types=%s\n",
+                    className, meta ? '+' : '-',
+                    sel_getName(method_getName(methods[index])) ?: "<nil>",
+                    method_getTypeEncoding(methods[index]) ?: "<nil>");
+        }
+        free(methods);
+    }
+}
+
+static void macws_install_catalyst_launch_diagnostics(void) {
+    // MACWS_CATALYST_TRACE may be inherited from an older launcher build.
+    // Installing these invasive lifecycle swizzles in production caused an
+    // arm64e PAC fault while UIKitMacHelper retained the diagnostic stack
+    // block (Maps-2026-08-03-152724.ips, main thread, this file:1112).
+    // Require the repository-wide diagnostics master gate as well.
+    if (!getenv("MACWS_CATALYST_TRACE") ||
+        !macws_runtime_diagnostics_enabled()) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Maps") != 0) return;
+
+    Class application = objc_getClass("UIApplication");
+    Class screen = objc_getClass("UIScreen");
+    Class delegate = objc_getClass("UINSApplicationDelegate");
+    Class workspace = objc_getClass("UINSWorkspace");
+    macws_catalyst_dump_service_class("BSServiceDomain");
+    macws_catalyst_dump_service_class("BSServiceConnectionEndpoint");
+    macws_catalyst_dump_service_class("BSServiceConnection");
+    if (screen) {
+        macws_lp_replace_instance_method(
+            object_getClass(screen), "mainScreen",
+            (IMP)macws_catalyst_main_screen_trace,
+            (IMP *)&macws_catalyst_main_screen_orig);
+    }
+    if (delegate) {
+        macws_lp_replace_instance_method(
+            delegate, "_finishLaunching",
+            (IMP)macws_catalyst_uins_finish_trace,
+            (IMP *)&macws_catalyst_uins_finish_orig);
+        macws_lp_replace_instance_method(
+            delegate, "applicationDidFinishLaunching:",
+            (IMP)macws_catalyst_uins_did_finish_trace,
+            (IMP *)&macws_catalyst_uins_did_finish_orig);
+    }
+    if (workspace) {
+        macws_lp_replace_instance_method(
+            workspace, "requestSceneWithOptions:completion:",
+            (IMP)macws_catalyst_request_scene_trace,
+            (IMP *)&macws_catalyst_request_scene_orig);
+    }
+    fprintf(stderr,
+            "#### CATALYST-LAUNCH diagnostics installed app=%s screen=%s "
+            "delegate=%s workspace=%s\n",
+            application ? "YES" : "NO", screen ? "YES" : "NO",
+            delegate ? "YES" : "NO", workspace ? "YES" : "NO");
+    fflush(stderr);
 }
 
 static int macws_filtered_fprintf(FILE *stream, const char *format, ...)
@@ -10081,6 +12038,17 @@ const char *metalSimService = "com.apple.metal.simulator";
 // clients enter this hook, so isolate their names symmetrically.
 static const char *macws_private_chroot_service_name(const char *name) {
     if (!name) return name;
+    // RunningBoard names the launchd endpoints from the registered iOS first
+    // image, while Ventura's ExtensionFoundation names them from the real
+    // application-extension record.  `launchctl procinfo` runtime-confirmed
+    // these carrier endpoints in the System Settings host's per-process
+    // bootstrap domain. Translate both peers at the service boundary; the
+    // launchd-managed ports and stock ExtensionKit protocols stay untouched.
+    if (!strcmp(name,
+                "com.apple.Appearance-Settings.extension.extensionkit.internal"))
+        return "com.macwsguide.settings-extension-carrier.extensionkit.internal";
+    if (!strcmp(name, "com.apple.Appearance-Settings.extension.viewbridge"))
+        return "com.macwsguide.settings-extension-carrier.viewbridge";
     if (!strcmp(name, "com.apple.systemstatus"))
         return "com.apple.macosbooter.systemstatus";
     if (!strcmp(name, "com.apple.systemstatus.publisher"))
@@ -10123,6 +12091,28 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.lsd.trustedsignatures";
     if (!strcmp(name, "com.apple.security.translocation"))
         return "com.apple.macosbooter.security.translocation";
+    // Mac Catalyst clients and Ventura's UIKitSystem publish the same
+    // FrontBoard workspace Mach service name that iPadOS SpringBoard owns.
+    // Runtime-confirmed on 2026-08-03: an unisolated chroot Maps request went
+    // to SpringBoard, which rejected it with "requested scene creation but is
+    // not a daemon or lacks the entitlement".  Ventura's stock
+    // com.apple.uikitsystemapp.plist identifies UIKitSystem as the owner of
+    // this exact service.  Rewrite both the UIKitSystem listener and chroot
+    // clients symmetrically to the private launchd endpoint; the real
+    // FrontBoard workspace protocol remains unchanged.  RunningBoard is
+    // deliberately *not* isolated: a runtime sample of Maps on 2026-08-03
+    // showed UIApplication waiting in RBSConnection's synchronous handshake,
+    // while Ventura runningboardd repeatedly asserted in
+    // -[RBSEmbeddedAppProcessIdentity _initEmbeddedAppWithBundleID:] when it
+    // inspected the surrounding iOS launchd namespace.  iOS runningboardd
+    // already owns the real process identity; only the scene workspace needs
+    // to cross into Ventura UIKitSystem.
+    if (!strcmp(name, "com.apple.frontboard.systemappservices"))
+        return "com.apple.macosbooter.frontboard.systemappservices";
+    if (!strcmp(name, "com.apple.ViewBridgeAuxiliary"))
+        return "com.apple.macosbooter.ViewBridgeAuxiliary";
+    if (!strcmp(name, "com.apple.extensionkitservice"))
+        return "com.apple.macosbooter.extensionkitservice";
     return name;
 }
 
@@ -10267,8 +12257,14 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
 // Also trace xpc_connection_create (the XPC service / bundle-name style)
 xpc_connection_t (*orig_xpc_connection_create)(const char *name, dispatch_queue_t queue);
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
-    if (name && getenv("MACWS_XPC_DEBUG")) {
-        fprintf(stderr, "#### XPC_TRACE service create: '%s'\n", name);
+    const char *originalName = name;
+    name = macws_private_chroot_service_name(name);
+    if (originalName && getenv("MACWS_XPC_DEBUG")) {
+        fprintf(stderr, "#### XPC_TRACE service create: '%s'%s%s%s\n",
+                originalName,
+                name != originalName ? " -> '" : "",
+                name != originalName ? name : "",
+                name != originalName ? "'" : "");
     }
 
     return orig_xpc_connection_create(name, queue);
@@ -10390,8 +12386,32 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 __attribute__((constructor)) static void InitMetalHooks() {
     macws_record_xpc_service_context_if_requested();
     macws_install_iconservices_quarantine_fallback();
+    macws_install_cgsession_login_handoff_compatibility();
+    macws_install_launchpad_mount_namespace_compatibility();
+    macws_install_launchpad_source_diagnostics();
+    macws_install_app_lifecycle_diagnostics();
+    macws_install_catalyst_frontboard_route();
+    macws_install_uikitsystem_exec_identity_refresh();
+    _dyld_register_func_for_add_image(
+        macws_uikitsystem_exec_identity_image_added);
+    macws_register_catalyst_application_with_fuseboard();
+    macws_install_catalyst_launch_compatibility();
+    macws_install_catalyst_launch_diagnostics();
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
+    const char *appExtension = getenv("MACWS_APP_EXTENSION");
+    const BOOL isHostedAppExtension =
+        appExtension && strcmp(appExtension, "1") == 0;
+    MacWSInstallExtensionRuntimeCompatibility();
+    if (isHostedAppExtension) {
+        // LaunchServices is not a direct dependency of libmachook.  In the
+        // ExtensionKit executable it can be mapped after this constructor,
+        // so retry on the listener's main queue before the first inbound host
+        // request is handled.  The installer is idempotent.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MacWSInstallExtensionRuntimeCompatibility();
+        });
+    }
 
     // The callback is inert unless the focused source-library diagnostic
     // sentinel existed at process start. dyld also invokes it immediately for
@@ -10434,9 +12454,27 @@ __attribute__((constructor)) static void InitMetalHooks() {
         CFRelease(app);
     });
 
-    MSImageRef xpc = MSGetImageByName("/usr/lib/system/libxpc.dylib");
-    MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create_mach_service"), hooked_xpc_connection_create_mach_service, (void *)&orig_xpc_connection_create_mach_service);
-    MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"), hooked_xpc_connection_create, (void *)&orig_xpc_connection_create);
+    // libxpc calls these entry points from within the dyld shared cache, so a
+    // client dylib's static interpose cannot see every lookup.  This matters
+    // for ExtensionKit: appearance-static-route-oslog.txt runtime-confirmed
+    // that Appearance's com.apple.lsd.modifydb requests still reached the
+    // original iPadOS name and were rejected by its settings-extension
+    // sandbox, ending in _LSPluginFindWithPlatformInfo:699 / -10814.
+    //
+    // MSHookFunction dirties the containing executable page.  The launch
+    // proxy now marks the final post-exec extension process CS_DEBUGGED before
+    // InitStuff returns (and EnableJIT asserts that state), so the same two
+    // narrow hooks used by ordinary MacWS clients are valid here too.  Do not
+    // broaden this to any of libxpc's protocol or object functions.
+    MSImageRef xpc =
+        MSGetImageByName("/usr/lib/system/libxpc.dylib");
+    MSHookFunction(
+        MSFindSymbol(xpc, "_xpc_connection_create_mach_service"),
+        hooked_xpc_connection_create_mach_service,
+        (void *)&orig_xpc_connection_create_mach_service);
+    MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"),
+                   hooked_xpc_connection_create,
+                   (void *)&orig_xpc_connection_create);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         // (NOTE: tried calling MTLCreateSystemDefaultDevice here to force Metal load
@@ -10524,6 +12562,20 @@ __attribute__((constructor)) static void InitMetalHooks() {
             });
         }
     });
+    // xpc_add_bundle mutates the current process's pid-domain registration.
+    // A RunningBoard-hosted ExtensionKit process already receives every
+    // endpoint in its launch overlay and must not uncork/rebuild that domain.
+    // Runtime evidence: Appearance's first call below reached
+    // _xpc_init_pid_domain and instruction-faulted in _xpc_uint64_create_tagged
+    // (Appearance-2026-08-04-030014.ips).  Preserve Metal and connection hooks
+    // above, but leave service registration to the host/private launchd jobs.
+    if (isHostedAppExtension) {
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                "#### XPC bundle registration skipped: hosted app extension\n");
+        }
+        return;
+    }
     // register MTLSimDriverHost.xpc
     char frameworkPath[PATH_MAX];
     // NSLog(@"#### debugbydcmmc register MTLSimDriverHost.xpc");
@@ -10543,6 +12595,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         "/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc",
         "/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc",
         "/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc",
+        "/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc",
         "/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc",
         NULL,
     };
@@ -10551,4 +12604,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
                  JBROOT_PATH("/usr/macOS/Frameworks"), *relative);
         xpc_add_bundle(frameworkPath, 2);
     }
+    snprintf(frameworkPath, sizeof(frameworkPath), "%s",
+             JBROOT_PATH("/Applications/MacWSCatalystLauncher.app/PlugIns/SettingsExtensionProxy.appex"));
+    xpc_add_bundle(frameworkPath, 2);
 }

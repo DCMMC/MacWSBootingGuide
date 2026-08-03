@@ -46,6 +46,7 @@ typedef BOOL (*MacWSMsgBoolID)(id, SEL, id);
 typedef BOOL (*MacWSMsgBoolSELIDID)(id, SEL, SEL, id, id);
 typedef void (*MacWSMsgVoid)(id, SEL);
 typedef void (*MacWSMsgVoidBool)(id, SEL, BOOL);
+typedef void (*MacWSMsgVoidID)(id, SEL, id);
 typedef void (*MacWSMsgVoidRectBoolBool)(id, SEL, CGRect, BOOL, BOOL);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
@@ -1870,6 +1871,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
         return MacWSInputWindowIDForScene(record->sceneID) != 0;
     }
     if (record->kind == MacWSInputKindCreateInitialWindow) return YES;
+    if (record->kind == MacWSInputKindReopenApplication) return YES;
     if (record->kind == MacWSInputKindScroll) {
         float horizontal = 0.0f;
         memcpy(&horizontal, &record->contactID, sizeof(horizontal));
@@ -3544,6 +3546,163 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                 MacWSNotifyDisplayCatalogChanged('n');
                 });
             }
+        }
+        return;
+    }
+
+    if (record.kind == MacWSInputKindReopenApplication) {
+        NSArray *windows = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("windows"));
+        BOOL hasVisibleWindows = NO;
+        for (id window in windows) {
+            if (((MacWSMsgBool)objc_msgSend)(
+                    window, sel_registerName("isVisible"))) {
+                hasVisibleWindows = YES;
+                break;
+            }
+        }
+        // RE-confirmed against the running macOS 13.4 AppKit image:
+        // -[NSApplication _handleAEReopen:] is at image offset 0x197064.
+        // Its implementation retains the AppleEvent argument, executes the
+        // complete reopen decision/window-restoration chain, and then runs
+        // the ordinary activation tail. Calling only the public delegate
+        // question is not equivalent: runtime System Settings returned NO
+        // and its real 715x625 scene stayed ordered out. Recreate the standard
+        // kCoreEventClass/kAEReopenApplication descriptor inside the target
+        // and enter AppKit at the point where the missing cross-process
+        // AppleEvent endpoint would have delivered it.
+        Class descriptorClass = objc_getClass("NSAppleEventDescriptor");
+        SEL eventFactory = sel_registerName(
+            "appleEventWithEventClass:eventID:targetDescriptor:returnID:"
+            "transactionID:");
+        id event = descriptorClass && ((MacWSMsgBoolSEL)objc_msgSend)(
+            (id)descriptorClass, sel_registerName("respondsToSelector:"),
+            eventFactory)
+            ? ((id (*)(id, SEL, uint32_t, uint32_t, id, int16_t, int32_t))
+                objc_msgSend)((id)descriptorClass, eventFactory,
+                    0x61657674u, // 'aevt' / kCoreEventClass
+                    0x72617070u, // 'rapp' / kAEReopenApplication
+                    nil, -1, 0)
+            : nil;
+        SEL handleReopen = sel_registerName("_handleAEReopen:");
+        BOOL supported = event && ((MacWSMsgBoolSEL)objc_msgSend)(
+            application, sel_registerName("respondsToSelector:"),
+            handleReopen);
+        if (supported)
+            ((MacWSMsgVoidID)objc_msgSend)(application, handleReopen, event);
+        if (MacWSRuntimeDiagnosticsEnabled() || !supported) {
+            fprintf(stderr,
+                "#### APP-INPUT REOPEN pid=%d route=AppKit-AE supported=%s "
+                "visible-before=%s event=%s\n",
+                getpid(),
+                supported ? "YES" : "NO",
+                hasVisibleWindows ? "YES" : "NO",
+                event ? "YES" : "NO");
+            fflush(stderr);
+        }
+        if (supported) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                          150 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                BOOL visibleAfterReopen = NO;
+                id currentWindows = ((MacWSMsgID)objc_msgSend)(
+                    application, sel_registerName("windows"));
+                for (id window in currentWindows) {
+                    if (((MacWSMsgBool)objc_msgSend)(
+                            window, sel_registerName("isVisible"))) {
+                        visibleAfterReopen = YES;
+                        break;
+                    }
+                }
+                BOOL openedUntitled = NO;
+                SEL openUntitled = sel_registerName("_doOpenUntitled");
+                if (!visibleAfterReopen && ((MacWSMsgBoolSEL)objc_msgSend)(
+                        application, sel_registerName("respondsToSelector:"),
+                        openUntitled)) {
+                    // RE-confirmed in the same AppKit image at offset
+                    // 0x1b3b98: this is NSApplication's own standard
+                    // untitled/open-primary-window transaction. It preserves
+                    // app delegate/document/SwiftUI routing; it does not
+                    // allocate or force-order an NSWindow in the bridge.
+                    openedUntitled = ((MacWSMsgBool)objc_msgSend)(
+                        application, openUntitled);
+                }
+                if (MacWSRuntimeDiagnosticsEnabled() ||
+                    (!visibleAfterReopen && !openedUntitled)) {
+                    fprintf(stderr,
+                        "#### APP-INPUT REOPEN-COMPLETE pid=%d "
+                        "visible-after-ae=%s do-open-untitled=%s\n",
+                        getpid(), visibleAfterReopen ? "YES" : "NO",
+                        openedUntitled ? "YES" : "NO");
+                    fflush(stderr);
+                }
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                              250 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    BOOL visibleAfterLifecycle = NO;
+                    id orderCandidate = nil;
+                    id reopenedWindows = ((MacWSMsgID)objc_msgSend)(
+                        application, sel_registerName("windows"));
+                    for (id window in reopenedWindows) {
+                        BOOL visible = ((MacWSMsgBool)objc_msgSend)(
+                            window, sel_registerName("isVisible"));
+                        if (visible) {
+                            visibleAfterLifecycle = YES;
+                            break;
+                        }
+                        BOOL canBecomeKey = ((MacWSMsgBool)objc_msgSend)(
+                            window, sel_registerName("canBecomeKeyWindow"));
+                        NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+                            window, sel_registerName("windowNumber"));
+                        if (!orderCandidate && canBecomeKey && number > 0)
+                            orderCandidate = window;
+                    }
+                    BOOL orderedExisting = NO;
+                    if (!visibleAfterLifecycle && orderCandidate) {
+                        SEL orderFront = sel_registerName(
+                            "makeKeyAndOrderFront:");
+                        if (((MacWSMsgBoolSEL)objc_msgSend)(
+                                orderCandidate,
+                                sel_registerName("respondsToSelector:"),
+                                orderFront)) {
+                            // Runtime-confirmed System Settings invariant:
+                            // finishLaunching created one real, key-capable
+                            // NSWindow at (239,87,715x625), but the missing LS
+                            // event left only its ordering transaction undone.
+                            // Use that existing app-owned window's ordinary
+                            // AppKit order method; never synthesize a window or
+                            // bypass validation inside WindowServer/SkyLight.
+                            ((MacWSMsgVoidID)objc_msgSend)(
+                                orderCandidate, orderFront, nil);
+                            SEL activate = sel_registerName(
+                                "activateIgnoringOtherApps:");
+                            if (((MacWSMsgBoolSEL)objc_msgSend)(
+                                    application,
+                                    sel_registerName("respondsToSelector:"),
+                                    activate))
+                                ((MacWSMsgVoidBool)objc_msgSend)(
+                                    application, activate, YES);
+                            orderedExisting = ((MacWSMsgBool)objc_msgSend)(
+                                orderCandidate, sel_registerName("isVisible"));
+                        }
+                    }
+                    if (MacWSRuntimeDiagnosticsEnabled() ||
+                        (!visibleAfterLifecycle && !orderedExisting)) {
+                        fprintf(stderr,
+                            "#### APP-INPUT REOPEN-WINDOW pid=%d "
+                            "visible-after-lifecycle=%s candidate=%s "
+                            "ordered-existing=%s\n",
+                            getpid(),
+                            visibleAfterLifecycle ? "YES" : "NO",
+                            orderCandidate
+                                ? object_getClassName(orderCandidate) : "nil",
+                            orderedExisting ? "YES" : "NO");
+                        fflush(stderr);
+                    }
+                    MacWSPublishWindowMetrics();
+                    MacWSNotifyDisplayCatalogChanged('r');
+                });
+            });
         }
         return;
     }

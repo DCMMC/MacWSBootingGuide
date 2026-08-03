@@ -4,7 +4,7 @@ ARCHS = arm64
 include $(THEOS)/makefiles/common.mk
 
 # iOS subprojects
-SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwsthermal mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy FileCoordinationChrootProxy mtl_keepalive MacWSHost misc/PingMTLCompilerService
+SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwsthermal mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
 # macOS subprojects
 SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl
 
@@ -29,3 +29,5 @@ after-stage::
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1/
 	@install -m 0644 misc/repack_metallib_macabi.py \
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/repack_metallib_macabi.py
+	@install -m 0644 misc/add_macho_load_dylib.py \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/add_macho_load_dylib.py

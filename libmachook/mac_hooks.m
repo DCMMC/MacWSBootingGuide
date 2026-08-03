@@ -29,6 +29,8 @@
 #import "macws_host_protocol.h"
 
 static void macws_install_fsnode_root_volume_repair(void);
+static void macws_install_launchservices_bookmark_volume_repair(void);
+static const char *macws_private_bootstrap_service_name(const char *name);
 
 // Expensive observation must never ride along with the normal interactive
 // path. The launcher creates this sentinel before process start only when the
@@ -1170,6 +1172,7 @@ extern uid_t audit_token_to_auid(audit_token_t atoken);
 // #define FORCE_SW_RENDER 1
 BOOL hooked_return_1(void) { return YES; }
 void EnableJIT(void);
+int isJITEnabled(void);
 
 // FORCE_M1_DRIVER: route Metal through the REAL macOS AGX (M1/G13G) GPU driver
 // instead of the MTLSimDriver simulator bridge. Auto-enabled for both arm64e
@@ -2667,6 +2670,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
     }
     if (info.dli_fname &&
         strstr(info.dli_fname, "/LaunchServices.framework/") != NULL) {
+        macws_install_launchservices_bookmark_volume_repair();
         macws_install_fsnode_root_volume_repair();
     }
     if (info.dli_fname &&
@@ -2922,18 +2926,9 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
     } else if(!strncmp(info.dli_fname, libxpcPath, strlen(libxpcPath))) {
-        // Register the services in this task's XPC domain. The Metal compiler
-        // intentionally resolves through the same /System path on iOS, where
-        // the iOS service exists and MTLCompilerBypassOSCheck adapts the target.
-        //
-        // ViewBridge, HIServices and AppKit are owned by explicit MachServices
-        // jobs in the GUI stack. Runtime evidence on 2026-08-02 showed that
-        // `_xpc_bootstrap_services` accepted per-process proxy bundle paths
-        // (result=0), but NSXPCSharedListener still returned Connection Invalid
-        // and launchd never spawned a proxy. A system-bootstrap app cannot use
-        // the ordinary per-user bundle activation model. The launchd jobs keep
-        // the named receive rights in the same domain as these root GUI clients
-        // and execute the iOS-visible chroot proxies on demand.
+        // Register the Metal framework before libxpc uncorks this task's PID
+        // domain.  Concrete XPC bundles are added later through xpc_add_bundle
+        // after CoreFoundation can parse their metadata.
         xpc_object_t dict = (xpc_object_t)xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_uint64(dict, "/System/Library/Frameworks/Metal.framework/Metal", 2);
         int(*_xpc_bootstrap_services_fn)(xpc_object_t) =
@@ -7884,6 +7879,8 @@ static void macws_install_osxvnc_hooks(void) {
             (void *)mh, (void *)macws_rfbScreen);
 }
 
+extern void MacWSInstallExtensionRuntimeCompatibility(void);
+
 __attribute__((constructor)) void InitStuff() {
     // VS Code 1.130 marks both its login shell and the Electron-as-Node
     // environment printer with this exact value.  Runtime-confirmed: running
@@ -7901,7 +7898,23 @@ __attribute__((constructor)) void InitStuff() {
         return;
     }
     macws_install_glass_blur_ab_if_requested();
+    // A tiny root child retained by the settings-extension launch proxy marks
+    // the final post-exec process through `jbctl proc_set_debugged`.  Wait only
+    // for that explicitly identified process class; ordinary applications
+    // continue through EnableJIT with no launch delay.
+    const char *appExtension = getenv("MACWS_APP_EXTENSION");
+    if (appExtension && strcmp(appExtension, "1") == 0) {
+        for (unsigned int attempt = 0;
+             attempt < 2000 && !isJITEnabled(); attempt++) {
+            usleep(1000);
+        }
+    }
     EnableJIT();
+    // Settings extensions carry libmachook through a bundle-local load command.
+    // Retry their ExtensionFoundation/LaunchServices boundary only after the
+    // post-exec process has CS_DEBUGGED, so both Objective-C class availability
+    // and executable replacement-code admission are established.
+    MacWSInstallExtensionRuntimeCompatibility();
     macws_install_crash_diag();
     macws_install_osxvnc_hooks();
     // HID bypass is OPT-IN. Whole-IOKit-symbol hooking creates a tower of
@@ -8673,6 +8686,121 @@ extern Boolean _CFURLCopyResourcePropertyValuesAndFlags(
     uint64_t *returnedFlags,
     CFErrorRef *error);
 
+static bool macws_cfurl_is_application_tree(CFURLRef url) {
+    UInt8 path[PATH_MAX] = {};
+    if (!url || !CFURLGetFileSystemRepresentation(
+                    url, true, path, sizeof(path))) return false;
+
+    static const char *const roots[] = {
+        "/System/Applications",
+        "/Applications",
+        "/var/root/Applications",
+        "/Users/Shared",
+        "/AppleInternal/Applications",
+        "/System/Volumes/Preboot/Cryptexes/App/System/Applications",
+    };
+    const char *candidate = (const char *)path;
+    for (size_t index = 0; index < sizeof(roots) / sizeof(roots[0]); index++) {
+        size_t length = strlen(roots[index]);
+        if (strncmp(candidate, roots[index], length) == 0 &&
+            (candidate[length] == '\0' || candidate[length] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool macws_launchservices_owns_application_bookmarks(void) {
+    const char *program = getprogname();
+    return program &&
+        (strcmp(program, "lsd") == 0 ||
+         strcmp(program, "launchservicesd") == 0);
+}
+
+// RE-confirmed in CoreServicesInternal 13.4 on 2026-08-03:
+// addVolumeInfoForURLToBookmark +120 asks NSURLVolumeURLKey while encoding
+// each plugin alias (_LSRegisterPlugin -> _LSAliasAddURL).  The chroot's host
+// vnode reports file:///private/var/ as its volume, so the stored bookmark is
+// later resolved against that host volume and PluginKit assigns container
+// state -1.  Present the process-visible root only for the exact synchronous
+// FSNode bookmark operation, then restore the URL resource cache.
+typedef id (*MacWSFSNodeBookmarkDataMethod)(
+    id, SEL, NSUInteger, id, id *);
+static MacWSFSNodeBookmarkDataMethod
+    macws_FSNode_bookmarkData_original = NULL;
+
+static id macws_FSNode_bookmarkData(
+    id self, SEL selector, NSUInteger options, id relativeNode, id *error) {
+    if (!macws_FSNode_bookmarkData_original) return nil;
+    SEL urlSelector = sel_registerName("URL");
+    CFURLRef url = self && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+        self, sel_registerName("respondsToSelector:"), urlSelector)
+        ? ((CFURLRef (*)(id, SEL))objc_msgSend)(self, urlSelector)
+        : NULL;
+    if (!macws_cfurl_is_application_tree(url)) {
+        return macws_FSNode_bookmarkData_original(
+            self, selector, options, relativeNode, error);
+    }
+
+    static const UInt8 rootPath[] = {'/'};
+    static const UInt8 volumeURLKeyBytes[] = {
+        'N', 'S', 'U', 'R', 'L', 'V', 'o', 'l', 'u', 'm', 'e',
+        'U', 'R', 'L', 'K', 'e', 'y'
+    };
+    CFURLRef rootURL = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, rootPath, sizeof(rootPath), true);
+    CFStringRef volumeURLKey = CFStringCreateWithBytes(
+        kCFAllocatorDefault, volumeURLKeyBytes,
+        sizeof(volumeURLKeyBytes), kCFStringEncodingUTF8, false);
+    if (!rootURL || !volumeURLKey) {
+        if (rootURL) CFRelease(rootURL);
+        if (volumeURLKey) CFRelease(volumeURLKey);
+        return macws_FSNode_bookmarkData_original(
+            self, selector, options, relativeNode, error);
+    }
+
+    CFTypeRef previousValue = NULL;
+    Boolean hadPreviousValue = CFURLCopyResourcePropertyForKey(
+        url, volumeURLKey, &previousValue, NULL);
+    CFURLSetTemporaryResourcePropertyForKey(
+        url, volumeURLKey, rootURL);
+    id bookmark = macws_FSNode_bookmarkData_original(
+        self, selector, options, relativeNode, error);
+    if (hadPreviousValue && previousValue) {
+        CFURLSetTemporaryResourcePropertyForKey(
+            url, volumeURLKey, previousValue);
+    } else {
+        CFURLClearResourcePropertyCacheForKey(url, volumeURLKey);
+    }
+    if (previousValue) CFRelease(previousValue);
+    CFRelease(volumeURLKey);
+    CFRelease(rootURL);
+    return bookmark;
+}
+
+static void macws_install_launchservices_bookmark_volume_repair(void) {
+    static _Atomic int installed = 0;
+    if (!macws_launchservices_owns_application_bookmarks()) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &installed, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) return;
+
+    Class fsNode = objc_getClass("FSNode");
+    SEL selector = sel_registerName(
+        "bookmarkDataWithOptions:relativeToNode:error:");
+    Method method = fsNode
+        ? class_getInstanceMethod(fsNode, selector) : NULL;
+    IMP original = method ? method_getImplementation(method) : NULL;
+    if (!original || original == (IMP)macws_FSNode_bookmarkData) {
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+    macws_FSNode_bookmarkData_original =
+        (MacWSFSNodeBookmarkDataMethod)original;
+    method_setImplementation(method, (IMP)macws_FSNode_bookmarkData);
+}
+
 static bool macws_cfurl_is_process_root(CFURLRef url) {
     if (!url) return false;
     CFStringRef string = CFURLGetString(url);
@@ -8904,10 +9032,90 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 // WS and clients, so both rewrites are consistent.
 #define CARENDER_ORIG "com.apple.CARenderServer"
 #define CARENDER_NEW  "com.apple.macosbooter.CARenderServer"
+#define FRONTBOARD_SYSTEM_ORIG "com.apple.frontboard.systemappservices"
+#define FRONTBOARD_SYSTEM_NEW  "com.apple.macosbooter.frontboard.systemappservices"
+#define VIEWBRIDGE_AUXILIARY_ORIG "com.apple.ViewBridgeAuxiliary"
+#define VIEWBRIDGE_AUXILIARY_NEW  "com.apple.macosbooter.ViewBridgeAuxiliary"
+#define EXTENSIONKIT_SERVICE_ORIG "com.apple.extensionkitservice"
+#define EXTENSIONKIT_SERVICE_NEW  "com.apple.macosbooter.extensionkitservice"
 static const char *macws_private_bootstrap_service_name(const char *name) {
     if (!name) return name;
+    // The settings-extension launch proxy is the first iOS image submitted to
+    // RunningBoard, so launchd allocates its managed endpoints under the proxy
+    // bundle identifier.  Ventura derives the peer names from Appearance's
+    // real LSApplicationExtensionRecord.  Runtime `launchctl procinfo` showed
+    // the exact carrier endpoint pair below; map names only, preserving the
+    // original managed ports and ExtensionKit/ViewBridge wire protocols.
+    if (!strcmp(name,
+                "com.apple.Appearance-Settings.extension.extensionkit.internal"))
+        return "com.macwsguide.settings-extension-carrier.extensionkit.internal";
+    if (!strcmp(name, "com.apple.Appearance-Settings.extension.viewbridge"))
+        return "com.macwsguide.settings-extension-carrier.viewbridge";
     if (!strcmp(name, CARENDER_ORIG))
         return CARENDER_NEW;
+    // Keep the static-interpose route complete.  Most clients also pass
+    // through Metal_hooks.x's libxpc hooks, but hosted ExtensionKit processes
+    // deliberately cannot dirty libxpc text after their sandbox is installed.
+    // Runtime-confirmed by appearance-debug-marker-oslog.txt (2026-08-04):
+    // Appearance issued 243 lookups for com.apple.lsd.modifydb which the
+    // extension sandbox rejected with error 159, followed by
+    // +[LSBundleRecord bundleRecordForCurrentProcess] returning nil.  These
+    // names are the exact MachServices published by MacWS's Ventura daemons;
+    // rewriting at dyld's bootstrap/xpc interpose boundary keeps the stock LS,
+    // preferences, IconServices and SystemStatus protocols intact.
+    if (!strcmp(name, "com.apple.systemstatus"))
+        return "com.apple.macosbooter.systemstatus";
+    if (!strcmp(name, "com.apple.systemstatus.publisher"))
+        return "com.apple.macosbooter.systemstatus.publisher";
+    if (!strcmp(name, "com.apple.systemstatus.activityattribution"))
+        return "com.apple.macosbooter.systemstatus.activityattribution";
+    if (!strcmp(name, "com.apple.coreservices.launchservicesd"))
+        return "com.apple.macosbooter.coreservices.launchservicesd";
+    if (!strcmp(name, "com.apple.cfprefsd.daemon"))
+        return "com.apple.macosbooter.cfprefsd.daemon";
+    if (!strcmp(name, "com.apple.cfprefsd.agent"))
+        return "com.apple.macosbooter.cfprefsd.agent";
+    if (!strcmp(name, "com.apple.iconservices"))
+        return "com.apple.macosbooter.iconservices";
+    if (!strcmp(name, "com.apple.iconservices.store"))
+        return "com.apple.macosbooter.iconservices.store";
+    if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
+        return "com.apple.macosbooter.lsd.advertisingidentifiers";
+    if (!strcmp(name, "com.apple.lsd.diagnostics"))
+        return "com.apple.macosbooter.lsd.diagnostics";
+    if (!strcmp(name, "com.apple.lsd.dissemination"))
+        return "com.apple.macosbooter.lsd.dissemination";
+    if (!strcmp(name, "com.apple.lsd.encryption"))
+        return "com.apple.macosbooter.lsd.encryption";
+    if (!strcmp(name, "com.apple.lsd.extensions"))
+        return "com.apple.macosbooter.lsd.extensions";
+    if (!strcmp(name, "com.apple.lsd.mapdb"))
+        return "com.apple.macosbooter.lsd.mapdb";
+    if (!strcmp(name, "com.apple.lsd.modifydb"))
+        return "com.apple.macosbooter.lsd.modifydb";
+    if (!strcmp(name, "com.apple.lsd.open"))
+        return "com.apple.macosbooter.lsd.open";
+    if (!strcmp(name, "com.apple.lsd.openurl"))
+        return "com.apple.macosbooter.lsd.openurl";
+    if (!strcmp(name, "com.apple.lsd.personaobserver"))
+        return "com.apple.macosbooter.lsd.personaobserver";
+    if (!strcmp(name, "com.apple.lsd.plugin"))
+        return "com.apple.macosbooter.lsd.plugin";
+    if (!strcmp(name, "com.apple.lsd.trustedsignatures"))
+        return "com.apple.macosbooter.lsd.trustedsignatures";
+    if (!strcmp(name, "com.apple.security.translocation"))
+        return "com.apple.macosbooter.security.translocation";
+    // FrontBoard's BSServiceConnection resolves its domain endpoint with raw
+    // bootstrap_look_up rather than xpc_connection_create_mach_service.
+    // Keep this mapping identical to macws_private_chroot_service_name() so
+    // Maps reaches Ventura UIKitSystem instead of iPadOS SpringBoard regardless
+    // of which public transport wrapper the framework selects.
+    if (!strcmp(name, FRONTBOARD_SYSTEM_ORIG))
+        return FRONTBOARD_SYSTEM_NEW;
+    if (!strcmp(name, VIEWBRIDGE_AUXILIARY_ORIG))
+        return VIEWBRIDGE_AUXILIARY_NEW;
+    if (!strcmp(name, EXTENSIONKIT_SERVICE_ORIG))
+        return EXTENSIONKIT_SERVICE_NEW;
     return name;
 }
 
@@ -8952,6 +9160,19 @@ static void *vproc_swap_string_new(void *vproc, int key,
 }
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
 extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
+extern kern_return_t bootstrap_look_up2(mach_port_t bp, const char *name,
+                                        mach_port_t *sp, pid_t target_pid,
+                                        uint64_t flags);
+extern kern_return_t bootstrap_look_up3(mach_port_t bp, const char *name,
+                                        mach_port_t *sp, pid_t target_pid,
+                                        const unsigned char instance[16],
+                                        uint64_t flags);
+extern kern_return_t bootstrap_check_in2(mach_port_t bp, const char *name,
+                                         mach_port_t *sp, uint64_t flags);
+extern kern_return_t bootstrap_check_in3(mach_port_t bp, const char *name,
+                                         mach_port_t *sp,
+                                         unsigned char instance[16],
+                                         uint64_t flags);
 kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_t *sp) {
     const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
@@ -8959,6 +9180,39 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
                 "#### BOOTSTRAP look_up '%s'%s%s%s -> %#x port=%#x\n",
+                originalName ?: "(null)", name != originalName ? " -> '" : "",
+                name != originalName ? name : "", name != originalName ? "'" : "",
+                result, sp ? *sp : MACH_PORT_NULL);
+    }
+    return result;
+}
+kern_return_t bootstrap_look_up2_new(mach_port_t bp, const char *name,
+                                      mach_port_t *sp, pid_t target_pid,
+                                      uint64_t flags) {
+    const char *originalName = name;
+    name = macws_private_bootstrap_service_name(name);
+    kern_return_t result = bootstrap_look_up2(
+        bp, name, sp, target_pid, flags);
+    if (getenv("MACWS_XPC_DEBUG")) {
+        fprintf(stderr,
+                "#### BOOTSTRAP look_up2 '%s'%s%s%s -> %#x port=%#x\n",
+                originalName ?: "(null)", name != originalName ? " -> '" : "",
+                name != originalName ? name : "", name != originalName ? "'" : "",
+                result, sp ? *sp : MACH_PORT_NULL);
+    }
+    return result;
+}
+kern_return_t bootstrap_look_up3_new(mach_port_t bp, const char *name,
+                                      mach_port_t *sp, pid_t target_pid,
+                                      const unsigned char instance[16],
+                                      uint64_t flags) {
+    const char *originalName = name;
+    name = macws_private_bootstrap_service_name(name);
+    kern_return_t result = bootstrap_look_up3(
+        bp, name, sp, target_pid, instance, flags);
+    if (getenv("MACWS_XPC_DEBUG")) {
+        fprintf(stderr,
+                "#### BOOTSTRAP look_up3 '%s'%s%s%s -> %#x port=%#x\n",
                 originalName ?: "(null)", name != originalName ? " -> '" : "",
                 name != originalName ? name : "", name != originalName ? "'" : "",
                 result, sp ? *sp : MACH_PORT_NULL);
@@ -8978,8 +9232,114 @@ kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port
     }
     return result;
 }
+kern_return_t bootstrap_check_in2_new(mach_port_t bp, const char *name,
+                                       mach_port_t *sp, uint64_t flags) {
+    name = macws_private_bootstrap_service_name(name);
+    return bootstrap_check_in2(bp, name, sp, flags);
+}
+kern_return_t bootstrap_check_in3_new(mach_port_t bp, const char *name,
+                                       mach_port_t *sp,
+                                       unsigned char instance[16],
+                                       uint64_t flags) {
+    name = macws_private_bootstrap_service_name(name);
+    return bootstrap_check_in3(bp, name, sp, instance, flags);
+}
+
+// UIKit/FrontBoard initializes its BSService endpoint from framework
+// initializers that may run before libmachook's constructors.  Static dyld
+// interposition is active while dependency initializers run, so route this one
+// colliding service at the earliest transport boundary.  All other XPC names,
+// connection flags, queues, handlers, and messages are passed through.
+extern xpc_connection_t macws_xpc_connection_create_mach_service_raw(
+    const char *, dispatch_queue_t, uint64_t)
+    __asm("_xpc_connection_create_mach_service");
+xpc_connection_t macws_xpc_connection_create_mach_service_early(
+    const char *name, dispatch_queue_t targetq, uint64_t flags) {
+    name = macws_private_bootstrap_service_name(name);
+    return macws_xpc_connection_create_mach_service_raw(
+        name, targetq, flags);
+}
+
+xpc_connection_t macws_xpc_connection_create_early(
+    const char *name, dispatch_queue_t targetq) {
+    if (name && !strcmp(name, FRONTBOARD_SYSTEM_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            FRONTBOARD_SYSTEM_NEW, targetq, 0);
+    }
+    // Ventura normally runs ViewBridgeAuxiliary as a per-user XPC service.
+    // MacWS cannot launch that service through a setuid chroot proxy:
+    // runtime oslog on 2026-08-04 recorded libxpc terminating it with
+    // "running setugid(), which is not allowed".  A root launchd job starts
+    // the identical proxy without any credential transition and publishes
+    // this private Mach endpoint.  Preserve the ViewBridge wire protocol and
+    // change only how the endpoint is resolved.
+    if (name && !strcmp(name, VIEWBRIDGE_AUXILIARY_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            VIEWBRIDGE_AUXILIARY_NEW, targetq, 0);
+    }
+    // ExtensionFoundation normally activates extensionkitservice by its XPC
+    // bundle identifier.  Runtime routing evidence on 2026-08-04 showed that
+    // this unqualified request reached the already-running iPadOS service and
+    // returned zero identities even though Ventura LaunchServices could
+    // resolve Appearance's platform-1 record by identifier.  Route only this
+    // colliding service to the root Ventura listener; query objects and reply
+    // payloads remain the stock ExtensionFoundation protocol.
+    if (name && !strcmp(name, EXTENSIONKIT_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            EXTENSIONKIT_SERVICE_NEW, targetq, 0);
+    }
+    return xpc_connection_create(name, targetq);
+}
+
+extern void macws_xpc_main_raw(xpc_connection_handler_t handler)
+    __asm("_xpc_main") __attribute__((noreturn));
+
+// xpc_main only accepts a process born as an XPCService.  The root ViewBridge
+// and ExtensionKit jobs are deliberately launchd Mach services so their
+// freestanding proxies can chroot without a setuid transition; runtime oslog
+// showed stock xpc_main otherwise exits with XPC_EXIT_REASON_UNMANAGED.  Adapt
+// only those two launch contexts to libxpc's supported Mach-listener API and
+// pass each connection to the original service handler.  Listener-name
+// requests, anonymous sublisteners, replies and protocol delegates remain the
+// unmodified Ventura implementations.
+void macws_xpc_main(xpc_connection_handler_t handler) {
+    const char *program = getprogname();
+    const char *service = getenv("XPC_SERVICE_NAME");
+    const char *privateMachService = NULL;
+    if (program && strcmp(program, "ViewBridgeAuxiliary") == 0 &&
+        service && strcmp(service, "com.macwsguide.viewbridge") == 0) {
+        privateMachService = VIEWBRIDGE_AUXILIARY_NEW;
+    } else if (program && strcmp(program, "extensionkitservice") == 0 &&
+               service &&
+               strcmp(service, "com.macwsguide.extensionkit") == 0) {
+        privateMachService = EXTENSIONKIT_SERVICE_NEW;
+    }
+    if (privateMachService && getuid() == 0 && geteuid() == 0) {
+        xpc_connection_t listener =
+            macws_xpc_connection_create_mach_service_raw(
+                privateMachService, dispatch_get_main_queue(),
+                XPC_CONNECTION_MACH_SERVICE_LISTENER);
+        if (listener) {
+            xpc_connection_set_event_handler(listener, ^(xpc_object_t event) {
+                if (xpc_get_type(event) == XPC_TYPE_CONNECTION)
+                    handler((xpc_connection_t)event);
+            });
+            xpc_connection_resume(listener);
+            dispatch_main();
+        }
+    }
+    macws_xpc_main_raw(handler);
+}
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
+DYLD_INTERPOSE(bootstrap_look_up2_new, bootstrap_look_up2);
+DYLD_INTERPOSE(bootstrap_look_up3_new, bootstrap_look_up3);
+DYLD_INTERPOSE(bootstrap_check_in2_new, bootstrap_check_in2);
+DYLD_INTERPOSE(bootstrap_check_in3_new, bootstrap_check_in3);
+DYLD_INTERPOSE(macws_xpc_connection_create_mach_service_early,
+               macws_xpc_connection_create_mach_service_raw);
+DYLD_INTERPOSE(macws_xpc_connection_create_early, xpc_connection_create);
+DYLD_INTERPOSE(macws_xpc_main, macws_xpc_main_raw);
 
 // 2026-06-19 RE: chroot's texture super-init failure traces to
 // `-[IOGPUMetalResource initWithDevice:remoteStorageResource:options:args:

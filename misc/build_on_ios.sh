@@ -37,6 +37,8 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      macwsthermal \
                      mountdevfs ViewBridgeChrootProxy \
                      HIServicesChrootProxy OpenAndSavePanelChrootProxy \
+                     ExtensionKitChrootProxy \
+                     SettingsExtensionChrootProxy \
                      FileCoordinationChrootProxy \
                      mtl_keepalive \
                      MacWSHost macwsinputd launchservicesd \

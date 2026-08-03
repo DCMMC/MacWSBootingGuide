@@ -4,6 +4,7 @@ env	AGXPROBE_HOLD	off	standalone probe	Keeps the AGX API probe alive for debugge
 env	AGXPROBE_TEXTURE_INIT	off	standalone probe	Selects the texture-initializer probe variant.
 env	CA_DISABLE_SWAP_ICC	on	WindowServer,GUI clients	Required CoreAnimation compatibility; not a diagnostic.
 env	CA_VSYNC_OFF	on	WindowServer,GUI clients	No working chroot vblank handoff; commits use the virtual completion path.
+env	COMMAND_MODE	on	GUI clients	Selects the unix2003 command environment expected by Ventura GUI applications.
 env	DYLD_INSERT_LIBRARIES	auto	launchdchrootexec	Launcher selects the matching thin libmachook slice.
 env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
 env	ELECTRON_RUN_AS_NODE	transient	VS Code shell environment resolver	Official VS Code marker paired with VSCODE_RESOLVING_ENVIRONMENT; never set by a production plist.
@@ -21,6 +22,7 @@ env	MACWS_IOS_MIP_TEXTURE_PROBE	off	standalone probe	Selects the native iOS mipm
 env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 texture probe before creating plane textures for project-LLDB attachment.
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
+env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
 env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
 env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
@@ -67,6 +69,11 @@ env	MACWS_IOSURF_TRACE	off	diagnostic	Per-IOSurface creation trace.
 env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome	Chromium MAP_JIT/W^X compatibility without verbose trace.
 env	MACWS_JIT_FAULT_WRITE_COMPAT	on	VS Code	Page-granular V8 W^X adapter; only faulted 16-KiB writer pages become RW before RX restore.
 env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace.
+env	MACWS_LAUNCHPAD_TRACE	off	diagnostic	Dock-only Launchpad source validation/bring-up/rescan trace; never enable in production.
+env	MACWS_CATALYST_REGISTER_APPLICATION	on	Maps UIKit carrier child	Completes Maps' stock UIKitServices application-support handshake; UIKitSystem validates the real child audit token and complete exec generation before FrontBoard registration.
+env	MACWS_CATALYST_REQUEST_INITIAL_SCENE	on	Maps UIKit carrier child	Requests Maps' initial UIKitMac scene after the validated UIKitServices registration; set only by MacWSCatalystLauncher, not globally.
+env	MACWS_CATALYST_TRACE	off	Catalyst diagnostic	Emits verbose UIKitMac/FuseBoard lifecycle inventories; never enable in production.
+env	APPLICATION_SUPPORT_SERVICE_MACH_NAME	auto	Maps UIKit carrier child	Routes Maps' UIKitServices client to the private macOS-booter FrontBoard endpoint published by UIKitSystem; set only by MacWSCatalystLauncher.
 env	MACWS_KEEP_ASSERT_BYPASS	off	safety invariant	Real assertions remain enabled.
 env	MACWS_KEEP_FORCE_ACCEL	off	legacy simulator control	Simulator force-accelerator shim remains disabled.
 env	MACWS_KEEP_RENDER_UPDATE_CBZ	off	A/B control	Restores historical SkyLight render-update branch.
@@ -76,6 +83,7 @@ env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-po
 env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
 env	MACWS_METAL_PROBE_DUMP_FUNCTION_METHODS	off	standalone probe	Prints specialization/library-related Objective-C methods on probe MTLFunction objects.
 env	MACWS_METAL_PROBE_DUMP_LIBRARY_METHODS	off	standalone probe	Prints function-related Objective-C methods on a loaded probe MTLLibrary object.
+env	__CFBundleIdentifier	auto	Catalyst direct launcher	Sets the actual macOS application bundle identity after RunningBoard selects the hidden iOS carrier identity.
 env	MACWS_METAL_PROBE_EVENT_ONLY	off	standalone probe	Restricts metal_source_probe to its event test.
 env	MACWS_METAL_PROBE_EXACT_SOURCE	off	standalone probe	Replays a captured MSL file byte-for-byte without adding the normal cache-busting comment.
 env	MACWS_METAL_PROBE_LIBRARY_PATH	off	standalone probe	Loads the exact precompiled metallib path requested by the bounded Metal source probe.
@@ -155,6 +163,7 @@ flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead 
 flag	/tmp/macws_app_input_diagnostics	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 flag	/tmp/macws_file_panel_diag	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls; production startup removes it.
 flag	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled	off	SpringBoard windowing	Emergency opt-out for MacWS dense Stage Manager size candidates; absence means the production grid expansion remains enabled.
+flag	/var/jb/var/mobile/macws_catalyst_launch.trace	off	runningboardd diagnostic	Logs only the exact hidden Catalyst launcher job rewrite; production keeps this absent.
 flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
 flag	/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Native iOS-seatbelt spelling of the compiler diagnostics sentinel; equivalent to the rootless alias and removed by production preflight.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.

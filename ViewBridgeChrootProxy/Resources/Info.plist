@@ -35,7 +35,16 @@
         <key>RunLoopType</key>
         <string>NSRunLoop</string>
         <key>ServiceType</key>
-        <string>User</string>
+        <!-- iPadOS does not register the copied macOS User service in the
+             host's bootstrap domain.  Runtime A/B on 2026-08-04 produced no
+             launchd job and an immediate Connection invalid.  Application
+             service metadata creates the required per-host endpoint; the
+             freestanding proxy still preserves its one-shot XPC context. -->
+        <string>Application</string>
+        <key>_MultipleInstances</key>
+        <true/>
+        <key>_ProcessType</key>
+        <string>App</string>
     </dict>
 </dict>
 </plist>

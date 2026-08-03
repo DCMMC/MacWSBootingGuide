@@ -87,6 +87,14 @@ enum {
     // case). The target resolves the enabled Command-N item from its current
     // NSMainMenu and sends that item's real target/action through NSApp.
     MacWSInputKindCreateInitialWindow = 17,
+    // Deliver the standard NSApplication reopen lifecycle inside a directly
+    // exec'd chroot application. Such processes have real HIServices and
+    // WindowServer records but no LaunchServices AppleEvent endpoint, so a
+    // Dock/open-style kAEReopenApplication addressed from another process
+    // returns procNotFound. The target asks its real NSApplicationDelegate to
+    // handle applicationShouldHandleReopen:hasVisibleWindows: on the main
+    // thread; no application-specific window is synthesized.
+    MacWSInputKindReopenApplication = 18,
 };
 
 typedef uint16_t MacWSHostInputMode;

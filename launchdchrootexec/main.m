@@ -14,6 +14,17 @@ int main(int argc, char *argv[], char *envp[]) {
     const char *rootPath = argv[3];
     const char *execPath = argv[4];
     char **execArgs = &argv[4];
+
+    // The kernel's file-ID-to-path APIs are not chroot-aware. Preserve the
+    // canonical host path before entering the chroot so libmachook can map
+    // fsgetpath(2) results back into the process-visible namespace. This is
+    // data, not a feature flag: descendants inherit the same root invariant.
+    char canonicalRootPath[PATH_MAX];
+    if (realpath(rootPath, canonicalRootPath)) {
+        setenv("MACWS_CHROOT_HOST_ROOT", canonicalRootPath, 1);
+    } else {
+        setenv("MACWS_CHROOT_HOST_ROOT", rootPath, 1);
+    }
      
     char currentPath[PATH_MAX];
     if(getcwd(currentPath, sizeof(currentPath)) == NULL) {

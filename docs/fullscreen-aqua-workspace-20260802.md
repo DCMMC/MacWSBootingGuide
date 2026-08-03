@@ -91,10 +91,18 @@ alive: runtime tracing proved `qtn_proc_init_with_self` returned
 `-2/ENOPOLICY`, while a diagnostic-state probe inside the wrapper clobbered
 the deliberately translated `ENOATTR` back to `ENOENT`. The wrapper now
 evaluates diagnostics before restoring errno, so the stock agent reaches its
-listener in production. Dock icons are mostly restored. Four `?` placeholders
-and an empty Launchpad “Other” folder remain because Launchpad's application
-import stage has not populated its persistent database (`apps=0`); this is no
-longer attributed to IconServices process startup.
+listener in production.
+
+The remaining empty Launchpad database was a second namespace invariant.
+Runtime tracing of Dock's real import worker showed that its source-volume
+validation compared the macOS application root against `fstatfs(2)`'s iOS
+host mount name (`/var/mnt/rootfs`).  Only in Dock, and only for this exact
+source mount, libmachook now reports the chroot-visible `/` name.  It does not
+change file identity, database results, or any non-Dock caller.  The unchanged
+stock importer then populated `apps=63`, `items=76`; a 2388×1668 VNC witness
+shows Launchpad pages containing System Settings, Maps and the rest of the
+Ventura application set with their real icons.  This replaces the former
+`apps=0` failure without forcing an import success return.
 
 [`fullscreen-status-menu-touch.png`](evidence/fullscreen-workspace-20260802/fullscreen-status-menu-touch.png)
 shows a fullscreen Host click opening the real macOS Control Center. The menu
@@ -194,8 +202,6 @@ Runtime-confirmed in this milestone:
 
 Still open:
 
-- repair Launchpad's native application-source import stage so its persistent
-  database populates application rows and the remaining Dock placeholders;
 - physical-finger subjective latency and all gesture combinations still need
   a user-on-device regression even though the exact controller → broker →
   native system-UI event path has visible runtime witnesses here.
