@@ -55,5 +55,12 @@ int main(int argc, const char *argv[]) {
         reply, "launched_app_pid");
     printf("ok=%s launched-pid=%lld message=%s\n",
            ok ? "yes" : "no", launchedPID, message ?: "");
+    if (strcmp(operation, MACWS_CONTROL_OP_STATUS) == 0) {
+        printf("system-settings-available=%s maps-available=%s\n",
+               xpc_dictionary_get_bool(
+                   reply, "system_settings_available") ? "yes" : "no",
+               xpc_dictionary_get_bool(
+                   reply, "maps_available") ? "yes" : "no");
+    }
     return ok ? 0 : 1;
 }
