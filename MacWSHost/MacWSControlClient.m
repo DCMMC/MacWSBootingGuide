@@ -62,7 +62,8 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
         "app_input_ready",
         "glassdemo_available", "terminal_available",
         "activity_monitor_available", "finder_available",
-        "vscode_available",
+        "vscode_available", "system_settings_available",
+        "maps_available",
     };
     for (NSUInteger i = 0; i < sizeof(boolKeys) / sizeof(boolKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, boolKeys[i]);

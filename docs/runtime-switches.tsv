@@ -8,6 +8,7 @@ env	COMMAND_MODE	on	GUI clients	Selects the unix2003 command environment expecte
 env	DYLD_INSERT_LIBRARIES	auto	launchdchrootexec	Launcher selects the matching thin libmachook slice.
 env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
 env	ELECTRON_RUN_AS_NODE	transient	VS Code shell environment resolver	Official VS Code marker paired with VSCODE_RESOLVING_ENVIRONMENT; never set by a production plist.
+env	HOME	auto	chroot/iOS launchers	Launcher-owned home directory appropriate to the target execution namespace.
 env	IOSCLEAR_DRAW_MODE	off	standalone probe	Selects an iosclear reference draw experiment.
 env	IOSCLEAR_DUMP_AGX_METHODS	off	standalone probe	Dumps AGX methods from iosclear_ref.
 env	IOSCLEAR_EARLY_DELAY	off	standalone probe	Delays the early iosclear reference path.
@@ -22,7 +23,10 @@ env	MACWS_IOS_MIP_TEXTURE_PROBE	off	standalone probe	Selects the native iOS mipm
 env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 texture probe before creating plane textures for project-LLDB attachment.
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
+env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
+env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
+env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
 env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
 env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
@@ -49,12 +53,15 @@ env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settleme
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
 env	MACWS_CHROMIUM_COMPOSITE_OVERLAYS	on	VS Code,Chrome	Mark Chromium's real AggregatedRenderPass video_capture_enabled field before native CALayer processing so its normal primary-plane fallback remains in the AGX scanout captured by MacWS/VNC.
+env	MACWS_CHROOT_HOST_ROOT	auto	launchdchrootexec descendants	Canonical host path captured before chroot and used to translate kernel file-ID paths into the process-visible root namespace.
 env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
+env	MACWS_DESKTOPSERVICES_DIAG	off	diagnostic	Exact-UUID Finder volume-map lookup and SamePhysicalDevice boundary recorder; observation only.
 env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bind failure.
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
 env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
 env	MACWS_DUMP_BACKING	off	diagnostic	Texture backing dump.
 env	MACWS_FILE_PANEL_DIAG	off	file-panel diagnostic	Logs selection of Ventura AppKit's native in-process NSOpenPanel/NSSavePanel implementation.
+env	MACWS_FILECACHE_DIAG	off	diagnostic	Exact-UUID CoreServicesInternal FileCache finalizer depth/object recorder; observation only.
 env	MACWS_NATIVE_PANEL_DIRECTORY	off	standalone native-panel probe	Optional initial directory for misc/native_open_panel_probe.c.
 env	MACWS_NATIVE_PANEL_HOLD	off	standalone native-panel probe	Stops the diagnostic process before panel construction for an explicit debugger attach.
 env	MACWS_NATIVE_PANEL_INPROCESS	off	standalone native-panel probe	Sets NSUseRemoteSavePanel=NO and exercises the public NSOpenPanel factory.
@@ -96,6 +103,20 @@ env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source targ
 env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
 env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
 env	MACWS_PING_HOLD_SECONDS	off	standalone probe	Keeps PingMTLCompilerService alive for bounded debugger attachment.
+env	MACWS_PROBE_DETACHED_ENUMERATOR	off	standalone ExtensionRecord probe	Exercises the detached application-extension record enumerator path.
+env	MACWS_PROBE_DETACHED_IDENTITY	off	standalone ExtensionRecord probe	Exercises detached extension-identity construction.
+env	MACWS_PROBE_DISASM_QUERY	off	standalone ExtensionPointCatalog probe	Dumps exact query-method bytes and branch targets.
+env	MACWS_PROBE_EXTENSIONKIT_CONSTANTS	off	standalone ExtensionRecord probe	Reads the runtime-confirmed ExtensionFoundation query constants.
+env	MACWS_PROBE_HOLD	off	standalone OSLaunchdJob probe	Stops the probe for debugger attachment.
+env	MACWS_PROBE_HOLD_SECONDS	off	standalone ExtensionKit XPC probe	Bounds the post-message diagnostic hold to at most 60 seconds.
+env	MACWS_PROBE_INTERFACE	off	standalone OSLaunchdJob probe	Constructs the private RunningBoard launchd interface for observation.
+env	MACWS_PROBE_QUERY_OWNERS	off	standalone ExtensionPointCatalog probe	Enumerates runtime classes that own ExtensionFoundation query selectors.
+env	MACWS_PROBE_QUERY_POINT_ENUMERATOR	off	standalone ExtensionRecord probe	Exercises the extension-point record enumerator route.
+env	MACWS_PROBE_QUERY_ROUTES	off	standalone ExtensionRecord probe	Inventories the available ExtensionFoundation query routes.
+env	MACWS_PROBE_REGISTER_DETAIL	off	standalone ExtensionRecord probe	Records the private LaunchServices plugin-registration builder/context boundary.
+env	MACWS_PROBE_REGISTER_ORIGINAL	off	standalone ExtensionRecord probe	Calls the stock private plugin registration entry point for an explicit A/B.
+env	MACWS_PROBE_STOP_BEFORE_REGISTER	off	standalone ExtensionRecord probe	Stops immediately before the explicit private registration call for LLDB.
+env	MACWS_PROBE_SUBMIT	off	standalone OSLaunchdJob probe	Submits the bounded private RunningBoard launchd-job diagnostic workload.
 env	MACWS_RESTORE_OUTBUMP	off	A/B control	Restores historical selector output-count mutation.
 env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight recorders.
 env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
@@ -114,7 +135,10 @@ env	PATH	auto	chroot launcher	Explicit standard chroot executable search path.
 env	PINPROBE_HOLD_BEFORE_PIN	off	standalone probe	Holds PinnedVAProbe before pinning for debugger attachment.
 env	REDWIN_DELAY	off	standalone probe	Delays the red-window rendering probe.
 env	REDWIN_LOOP	off	standalone probe	Keeps the red-window rendering probe repainting.
+env	RBS_DISASM_ONLY	off	standalone RunningBoard probe	Stops after locating the exact encodeForJob implementation for disassembly.
 env	TOY_DELAY	off	standalone probe	Delays the ToyGUI rendering probe.
+env	TMPDIR	auto	chroot/iOS launchers	Launcher-owned temporary directory appropriate to the target execution namespace.
+env	USER	auto	Catalyst/chroot launcher	Sets the logical root user identity for the launched macOS process.
 env	VSCODE_RESOLVING_ENVIRONMENT	transient	VS Code shell environment resolver	Exact official marker selecting the token-plus-JSON exec adapter and minimal constructor mode.
 env	MallocScribble	off	allocator diagnostic	Forbidden in every production launch plist.
 env	XPC_SERVICE_NAME	auto	macOS XPC services	System-provided service identity observed by the read-only proxy diagnostic; MacWS does not set it.

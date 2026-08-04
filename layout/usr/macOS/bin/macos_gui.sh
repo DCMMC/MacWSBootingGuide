@@ -56,6 +56,7 @@ LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
 
 GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned at boot
+WATCHDOG_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.watchdog.plist"
 VSCODE_ASSET_DIR=/var/jb/usr/macOS/share/vscode
 VNC_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.osxvnc.plist"
 TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
@@ -90,6 +91,7 @@ CONTROL_CENTER_LABEL=com.macwsguide.controlcenter
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
 DISPLAY_LABEL=UIKitApplication:com.macwsguide.display
 INTEROP_LABEL=UIKitApplication:com.macwsguide.interop
+WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
@@ -267,6 +269,7 @@ WD_TRIP="$LOGDIR/macws_safety_trip"
 WD_PIDFILE="$LOGDIR/macos_gui_watchdog.pid"
 WD_READY="$LOGDIR/macos_gui_watchdog.ready"
 WD_THERMAL_SNAPSHOT="$LOGDIR/macos_gui_thermal_snapshot"
+WD_WS_PIDFILE="$LOGDIR/macos_gui_watchdog.ws-pid"
 RECOVERED_WS_PID=""
 RECOVERY_EXTRA_RESTARTS=0
 
@@ -328,10 +331,20 @@ proc_running() {
     ps aux 2>/dev/null | grep -v grep | grep -qF "$1"
 }
 
-# launchd's current PID for WindowServer (empty / "-" when not running).
-ws_pid() {
-    launchctl list "$WINDOWSERVER_LABEL" 2>/dev/null \
+# launchd's current PID for one exact job (empty / "-" when not running).
+launchd_job_pid() {
+    launchctl list "$1" 2>/dev/null \
         | awk -F'= ' '/"PID"/{gsub(/[ ";]/,"",$2); print $2}'
+}
+
+ws_pid() { launchd_job_pid "$WINDOWSERVER_LABEL"; }
+
+record_ws_pid() {
+    local pid="$1" tmp="${WD_WS_PIDFILE}.$$"
+    case "$pid" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s\n' "$pid" > "$tmp" && mv "$tmp" "$WD_WS_PIDFILE"
 }
 
 # Do not connect multiple CGS clients while WindowServer is still realizing
@@ -603,11 +616,21 @@ run_watchdog() {
     case "$startup_owner" in
         ''|*[!0-9]*) startup_owner="" ;;
     esac
-    # The parent records $! as soon as it forks us, and the child records $$
-    # again here after exec.  The ownership-aware EXIT trap cannot erase a
-    # replacement watchdog's pidfile if launch timing overlaps.
+    # Every launchd generation records its own PID. The ownership-aware EXIT
+    # trap cannot erase a replacement watchdog's pidfile if relaunch timing
+    # overlaps with the previous process exiting.
     echo "$$" > "$WD_PIDFILE"
     trap watchdog_pidfile_cleanup EXIT
+    # launchd restarts this process after an abnormal death. Preserve the last
+    # observed WindowServer PID outside the shell process so the replacement
+    # can detect a server-generation change that happened while no loop was
+    # running. Runtime-confirmed 2026-08-04: the old nohup watchdog vanished
+    # with a stale pidfile while macwsdisplayd outlived WindowServer; restarting
+    # only macwsdisplayd immediately restored every workspace capture layer.
+    last_pid=$(awk 'NR == 1 { print $1 }' "$WD_WS_PIDFILE" 2>/dev/null)
+    case "$last_pid" in
+        ''|*[!0-9]*) last_pid="" ;;
+    esac
     t0=$(date +%s)
     started=$t0
     next_thermal=$((started + WD_THERMAL_POLL))
@@ -689,7 +712,11 @@ run_watchdog() {
             restarts=$((restarts + RECOVERY_EXTRA_RESTARTS))
             pid="$RECOVERED_WS_PID"
         fi
-        [ -n "$pid" ] && [ "$pid" != "-" ] && last_pid="$pid"
+        if [ -n "$pid" ] && [ "$pid" != "-" ]; then
+            last_pid="$pid"
+            record_ws_pid "$pid" || \
+                log "watchdog: WARNING: could not persist WindowServer pid=$pid"
+        fi
         now=$(date +%s)
         if [ $((now - t0)) -ge "$WD_WINDOW" ]; then restarts=0; t0=$now; fi
         if [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
@@ -1357,6 +1384,15 @@ PLIST
 # job that is not loaded / killing a process that is gone are harmless no-ops.
 stop_watchdogs() {
     local watchdog_pid="" candidate="" stopped="" deadline="" alive=""
+    # A watchdog that trips must finish stop_all() before it exits. Unloading
+    # its own launchd job here would terminate it halfway through restoration;
+    # SuccessfulExit=false leaves the loaded job dormant after the clean exit.
+    # Ordinary start/stop callers unload the job first so no replacement can
+    # race their cleanup transaction.
+    if [ "$CMD" != watchdog ]; then
+        launchctl unload "$WATCHDOG_PLIST" 2>/dev/null
+        launchctl remove "$WATCHDOG_LABEL" 2>/dev/null
+    fi
     if [ -f "$WD_PIDFILE" ]; then
         watchdog_pid=$(awk 'NR == 1 { print $1 }' "$WD_PIDFILE" 2>/dev/null)
         case "$watchdog_pid" in
@@ -1415,6 +1451,7 @@ stop_watchdogs() {
         done
     fi
     rm -f "$WD_PIDFILE" "$WD_READY"
+    [ "$CMD" = watchdog ] || rm -f "$WD_WS_PIDFILE"
 }
 
 # Every sentinel below changes code paths, installs tracing, records submit
@@ -2088,6 +2125,7 @@ Usage (run as root):
   sudo bash $0 production
   sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc]
   sudo bash $0 switches
+  sudo bash $0 guard [coexist|exclusive] [...]  # re-arm only; no GUI restart
   sudo bash $0 launchpad
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
@@ -2097,7 +2135,9 @@ Modes:
   coexist     (default) iPad panel keeps showing iOS; macOS renders to VNC only.
   exclusive   macOS takes over the physical panel as well as VNC.
 
-Safety: start launches a mandatory iOS-native health watchdog before the GUI.
+Safety: start launches a mandatory launchd-backed iOS-native health watchdog
+before the GUI. If the guard is killed abnormally, launchd restarts it and its
+persisted WindowServer generation reconnects stale GUI bridges.
 It records a startup snapshot, samples temperature every five minutes, and
 stops for thermal reasons only when iPadOS explicitly reports critical.
 Nominal/fair/serious states, numeric temperatures, and unreadable samples are
@@ -2301,14 +2341,60 @@ wait_for_initial_vnc_capture_if_requested() {
     return 0
 }
 
-# Launch the mandatory thermal/crash-loop watchdog in the background (iOS-side,
-# survives SSH disconnect via nohup). Re-invokes this script in `watchdog` mode
-# and waits for its independent temperature-sensor handshake before returning.
+# Write the exact launch intent into a script-owned launchd job. The job is not
+# installed in an auto-scanned daemon directory, so it exists only for an
+# explicitly started MacWS session. `SuccessfulExit=false` restarts it after a
+# signal/jetsam death, while a deliberate clean exit remains stopped.
+write_watchdog_plist() {
+    local startup_owner="$1"
+    shift
+    {
+        cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${WATCHDOG_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/bin/bash</string>
+        <string>$0</string>
+PLIST
+        for watchdog_arg in "$@"; do
+            # All values reaching this helper are constrained enum/numeric
+            # command-line options, so none can contain XML metacharacters.
+            printf '        <string>%s</string>\n' "$watchdog_arg"
+        done
+        cat <<PLIST
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MACWS_WATCHDOG_STARTUP_OWNER</key>
+        <string>${startup_owner}</string>
+        <!-- launchd does not supply the interactive rootless Procursus PATH. -->
+        <key>PATH</key>
+        <string>/var/jb/usr/bin:/var/jb/usr/sbin:/var/jb/bin:/var/jb/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key>
+    <dict><key>SuccessfulExit</key><false/></dict>
+    <key>ProcessType</key><string>Background</string>
+    <key>ThrottleInterval</key><integer>2</integer>
+    <key>StandardOutPath</key><string>${WD_LOG}</string>
+    <key>StandardErrorPath</key><string>${WD_LOG}</string>
+</dict>
+</plist>
+PLIST
+    } > "$WATCHDOG_PLIST"
+}
+
+# Launch the mandatory thermal/crash-loop watchdog as an iOS-side launchd job
+# and wait for its independent temperature-sensor handshake before returning.
 start_watchdog() {
     local child="" ready_owner="" waited=0
     stop_watchdogs
     rm -f "$WD_LOG" "$WD_TRIP" "$WD_READY" "$WD_THERMAL_SNAPSHOT" \
-        "$LOGDIR/macos_gui_memory_snapshot"
+        "$WD_WS_PIDFILE" "$LOGDIR/macos_gui_memory_snapshot"
     # Re-exec with the exact session intent.  The recovery path needs these
     # flags so a WS restart does not unexpectedly launch a VNC/Terminal job the
     # user disabled, and so it knows whether to request a fresh shared frame.
@@ -2320,17 +2406,20 @@ start_watchdog() {
     [ -n "$COEXIST_PACE_US" ] && set -- "$@" "--pace-us=$COEXIST_PACE_US"
     [ "$WD_MAX_RUNTIME" -gt 0 ] &&
         set -- "$@" "--runtime-cap=$WD_MAX_RUNTIME"
-    MACWS_WATCHDOG_STARTUP_OWNER="$$" \
-        nohup bash "$0" "$@" > "$WD_LOG" 2>&1 < /dev/null &
-    child=$!
-    echo "$child" > "$WD_PIDFILE"
+    write_watchdog_plist "$$" "$@" || return 1
+    if ! launchctl load "$WATCHDOG_PLIST"; then
+        log "ERROR: mandatory health watchdog launchd job failed to load."
+        return 1
+    fi
     while [ "$waited" -lt 10 ]; do
+        child=$(launchd_job_pid "$WATCHDOG_LABEL")
         ready_owner=$(awk 'NR == 1 { print $1 }' "$WD_READY" 2>/dev/null)
-        if [ "$ready_owner" = "$child" ]; then
-            log "watchdog: mandatory health guard ready (temperature=${WD_THERMAL_POLL}s critical-only; memory guard=disabled; log=$WD_LOG)."
+        if [ -n "$child" ] && [ "$child" != "-" ] &&
+           [ "$ready_owner" = "$child" ]; then
+            log "watchdog: launchd-backed health guard ready (pid=$child; temperature=${WD_THERMAL_POLL}s critical-only; memory guard=disabled; log=$WD_LOG)."
             return 0
         fi
-        if [ -f "$WD_TRIP" ] || ! kill -0 "$child" 2>/dev/null; then
+        if [ -f "$WD_TRIP" ]; then
             log "ERROR: mandatory health watchdog failed to arm."
             [ -f "$WD_TRIP" ] && sed 's/^/[macos_gui]        /' "$WD_TRIP"
             return 1
@@ -2390,6 +2479,14 @@ case "$CMD" in
         ;;
     switches)
         switch_status
+        ;;
+    guard)
+        # Low-impact recovery/testing entry point: arm the mandatory guard for
+        # an already-running GUI session without restarting WindowServer or
+        # any client. Ordinary users get the same path automatically via start.
+        require_root "$@"
+        mkdir -p "$GUI_LAUNCHD_DIR"
+        start_watchdog
         ;;
     launchpad)
         require_root "$@"

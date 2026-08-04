@@ -3140,6 +3140,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)cancelBootstrapTerminal;
 - (void)sceneGeometryDidChange;
 - (BOOL)activateCurrentMacWindow;
+- (void)reassertFullscreenScenePresentation;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 @end
 
@@ -3246,19 +3247,24 @@ static void MacWSRequestNewScene(UIScene *requestingScene,
     }];
 }
 
-static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
+static BOOL MacWSWindowingBridgeIsLoadedWithCapability(
+        NSString *capability) {
     NSString *witness = [NSString stringWithContentsOfFile:
         MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    return [witness containsString:@"version=13"] &&
-        [witness containsString:
-            @"fullscreen=focused-scene-maximization-toggle-action-17"];
+    NSRange versionMarker = [witness rangeOfString:@"version="];
+    NSInteger version = versionMarker.location == NSNotFound ? 0 :
+        [[witness substringFromIndex:NSMaxRange(versionMarker)] integerValue];
+    return version >= 13 && [witness containsString:capability];
+}
+
+static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
+    return MacWSWindowingBridgeIsLoadedWithCapability(
+        @"fullscreen=focused-scene-maximization-toggle-action-17");
 }
 
 static BOOL MacWSWindowingResizeBridgeIsLoaded(void) {
-    NSString *witness = [NSString stringWithContentsOfFile:
-        MacWSWindowingLoadedPath encoding:NSUTF8StringEncoding error:nil];
-    return [witness containsString:@"version=13"] &&
-        [witness containsString:@"resize=app-layout-transaction"];
+    return MacWSWindowingBridgeIsLoadedWithCapability(
+        @"resize=app-layout-transaction");
 }
 
 static BOOL MacWSRequestNativeSceneSizeWithRole(UIWindowScene *scene,
@@ -5635,6 +5641,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self openFullscreenWorkspace];
 }
 
+- (void)reassertFullscreenScenePresentation {
+    if (_streamMode != MacWSStreamModeFullscreen) return;
+    [self updateImmersivePresentation];
+    BOOL requested = MacWSRequestCurrentSceneMaximization(
+        self.view.window.windowScene, YES, ^(NSError *error) {
+            [self setNotice:[NSString stringWithFormat:
+                @"完整 macOS 桌面已恢复，但 iPadOS 无法重新最大化窗口：%@",
+                error.localizedDescription ?: @"未知错误"] success:NO];
+        });
+    MacWSLog(@"scene-fullscreen foreground-reassert requested=%@",
+             requested ? @"YES" : @"NO");
+}
+
 - (void)refreshStatus {
     [_controlClient fetchStatus:^(NSDictionary<NSString *,id> *reply) {
         [self applyStatus:reply];
@@ -6147,6 +6166,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (!MacWSObservedWindowIdentities)
         MacWSObservedWindowIdentities = [NSMutableSet set];
     if (targetIdentity) [MacWSObservedWindowIdentities addObject:targetIdentity];
+    if (_streamMode == MacWSStreamModeFullscreen) {
+        // The fullscreen Scene already presents WindowServer's complete
+        // desktop. Turning it into a per-window stream here both crops that
+        // desktop and asks UIKit to create/restore a windowed Scene. Keep the
+        // workspace identity intact; the catalog's focused-window update
+        // above supplies the keyboard target and the new AppKit window appears
+        // naturally inside the existing desktop stream.
+        [self setNotice:[NSString stringWithFormat:
+            @"%@ 已在当前全屏工作区中打开。", identifier] success:YES];
+        MacWSLog(@"launch-auto-window retained-fullscreen app=%@ pid=%d window=%u group=%u",
+                 identifier, ownerPID, target.descriptor.windowID,
+                 target.descriptor.logicalGroupID);
+        return;
+    }
     if (_windowID == 0) {
         NSString *reason = [identifier isEqualToString:@"terminal"]
             ? @"默认终端已经就绪。"
@@ -6200,6 +6233,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         NSString *identity = MacWSWindowIdentity(descriptor.ownerPID,
             descriptor.windowID, descriptor.logicalGroupID);
         if (identity) current[identity] = window;
+    }
+    if (_streamMode == MacWSStreamModeFullscreen) {
+        // New AppKit windows are already visible in the desktop stream. They
+        // must not become additional iPadOS Scenes until the user returns to
+        // per-window mode; doing so was the second path that made fullscreen
+        // launches unexpectedly pop out into Stage Manager windows.
+        if (!MacWSObservedWindowIdentities)
+            MacWSObservedWindowIdentities = [NSMutableSet set];
+        [MacWSObservedWindowIdentities setSet:
+            [NSSet setWithArray:current.allKeys]];
+        [MacWSPendingWindowSceneIdentities removeAllObjects];
+        return;
     }
     if (!MacWSObservedWindowIdentities) {
         MacWSObservedWindowIdentities = [NSMutableSet setWithArray:current.allKeys];
@@ -6874,6 +6919,12 @@ static void MacWSDeduplicateWindowScenes(void) {
 - (void)sceneWillEnterForeground:(UIScene *)scene {
     (void)scene;
     [(MacWSViewController *)self.window.rootViewController resumeSceneStream];
+}
+
+- (void)sceneDidBecomeActive:(UIScene *)scene {
+    (void)scene;
+    [(MacWSViewController *)self.window.rootViewController
+        reassertFullscreenScenePresentation];
 }
 
 - (void)sceneDidEnterBackground:(UIScene *)scene {

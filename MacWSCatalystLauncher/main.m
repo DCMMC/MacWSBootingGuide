@@ -64,7 +64,11 @@ static void macws_spawn_maps(void) {
     setenv("USER", "root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
+    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
     setenv("CA_VSYNC_OFF", "1", 1);
+    setenv("MACWS_AGX_NATIVE", "1", 1);
+    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
+    setenv("MACWS_PIN_FALLBACK", "1", 1);
     setenv("COMMAND_MODE", "unix2003", 1);
     setenv("__CFBundleIdentifier", "com.apple.Maps", 1);
     // Complete UIKitMacHelper's native process-support handshake and initial

@@ -96,10 +96,14 @@ listener in production.
 The remaining empty Launchpad database was a second namespace invariant.
 Runtime tracing of Dock's real import worker showed that its source-volume
 validation compared the macOS application root against `fstatfs(2)`'s iOS
-host mount name (`/var/mnt/rootfs`).  Only in Dock, and only for this exact
-source mount, libmachook now reports the chroot-visible `/` name.  It does not
-change file identity, database results, or any non-Dock caller.  The unchanged
-stock importer then populated `apps=63`, `items=76`; a 2388×1668 VNC witness
+host mount name (`/var/mnt/rootfs`).  The original repair was Dock-only. The
+2026-08-04 Finder/IconServices regression proved that the same statfs,
+fsgetpath, CFURL-volume and boot-vRefNum contract is also consumed by the exact
+desktop/catalog process set; the finalized scope and actual DesktopServices
+RE are documented in
+[`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md).
+It still does not change file identity, database results, or ordinary AppKit
+callers. The unchanged stock importer then populated `apps=63`, `items=76`; a 2388×1668 VNC witness
 shows Launchpad pages containing System Settings, Maps and the rest of the
 Ventura application set with their real icons.  This replaces the former
 `apps=0` failure without forcing an import success return.

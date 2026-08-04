@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-04；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口；证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-04；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口；证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。四窗与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 

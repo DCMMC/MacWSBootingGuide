@@ -29,7 +29,6 @@
 #import "macws_host_protocol.h"
 
 static void macws_install_fsnode_root_volume_repair(void);
-static void macws_install_launchservices_bookmark_volume_repair(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
 
 // Expensive observation must never ride along with the normal interactive
@@ -41,6 +40,7 @@ static bool macws_runtime_diagnostics_enabled(void) {
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         value = getenv("MACWS_RUNTIME_DIAGNOSTICS") != NULL ||
+            getenv("MACWS_FILECACHE_DIAG") != NULL ||
             access("/tmp/macws_runtime_diagnostics", F_OK) == 0 ||
             access("/tmp/macws_submit_diag", F_OK) == 0 ||
             access("/tmp/macws_submit_ring", F_OK) == 0 ||
@@ -2512,6 +2512,191 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]);
 
+// Diagnostic only. Finder and iconservicesagent currently terminate after a
+// real CoreServicesInternal FileCache/CFURL ownership cycle recursively enters
+// _FileCacheFinalize until the stack guard. The crash report loses the object
+// identity that created the cycle, and LLDB cannot install the shared-cache
+// breakpoint before the first finalize call on this dyld build. Hook the exact
+// Ventura 13.4 function only under an explicit per-process environment flag,
+// preserving its behavior while recording the cache identities and contents.
+// This is evidence collection, not a release/abort bypass or a production fix.
+typedef void (*MacWSFileCacheFinalizeFn)(const void *cache);
+static MacWSFileCacheFinalizeFn macws_filecache_finalize_original = NULL;
+static _Thread_local unsigned macws_filecache_finalize_depth = 0;
+
+static void macws_filecache_finalize_diagnostic(const void *cache) {
+    unsigned depth = ++macws_filecache_finalize_depth;
+    if (depth <= 64) {
+        uintptr_t words[12] = {};
+        size_t allocation = cache ? malloc_size(cache) : 0;
+        size_t readable = allocation < sizeof(words) ? allocation
+                                                      : sizeof(words);
+        if (cache && readable) memcpy(words, cache, readable);
+        dprintf(STDERR_FILENO,
+            "MACWS-FILECACHE depth=%u cache=%p malloc=%zu caller=%p "
+            "q0=%#lx q1=%#lx q2=%#lx q3=%#lx q4=%#lx q5=%#lx "
+            "q6=%#lx q7=%#lx q8=%#lx q9=%#lx q10=%#lx q11=%#lx\n",
+            depth, cache, allocation, __builtin_return_address(0),
+            (unsigned long)words[0], (unsigned long)words[1],
+            (unsigned long)words[2], (unsigned long)words[3],
+            (unsigned long)words[4], (unsigned long)words[5],
+            (unsigned long)words[6], (unsigned long)words[7],
+            (unsigned long)words[8], (unsigned long)words[9],
+            (unsigned long)words[10], (unsigned long)words[11]);
+    }
+    if (macws_filecache_finalize_original)
+        macws_filecache_finalize_original(cache);
+    --macws_filecache_finalize_depth;
+}
+
+static void macws_install_filecache_diagnostic(
+    const struct mach_header *untyped_header) {
+    if (!getenv("MACWS_FILECACHE_DIAG")) return;
+    static _Atomic int installed = 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &installed, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) return;
+
+    // CrashReporter UUID and offsets from the actual iPad macOS 13.4 shared
+    // cache: CoreServicesInternal dc429505-f838-3d6d-9b03-5a826efe86a4;
+    // _FileCacheFinalize crash frame image+0x8d00 at symbol+0x4c, therefore
+    // the function entry is image+0x8cb4.
+    static const uint8_t expectedUUID[16] = {
+        0xdc, 0x42, 0x95, 0x05, 0xf8, 0x38, 0x3d, 0x6d,
+        0x9b, 0x03, 0x5a, 0x82, 0x6e, 0xfe, 0x86, 0xa4,
+    };
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!macws_macho_uuid_matches(header, expectedUUID)) {
+        dprintf(STDERR_FILENO,
+                "MACWS-FILECACHE install skipped: UUID mismatch\n");
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+    void *target = (void *)((uintptr_t)header + 0x8cb4);
+    MSHookFunction(target, (void *)macws_filecache_finalize_diagnostic,
+                   (void **)&macws_filecache_finalize_original);
+    dprintf(STDERR_FILENO,
+            "MACWS-FILECACHE installed target=%p original=%p\n",
+            target, macws_filecache_finalize_original);
+}
+
+// Diagnostic-only probe for Finder's DesktopServices volume registry.  The
+// actual Ventura 13.4 crash at DesktopServicesPriv+0xe8f50 dereferences
+// `this+0x200` with x0 == NULL.  RE of the caller at +0xe8374 shows that x0 is
+// the object returned through a shared_ptr by +0xe9648; +0xe9648 in turn calls
+// the map lookup at +0xef968 and emits an empty shared_ptr when it returns nil.
+// Observe that real boundary without fabricating a map node or changing the
+// native failure path.
+typedef void *(*MacWSDesktopVolumeMapFindFn)(void *map, const void *key);
+typedef bool (*MacWSSamePhysicalDeviceFn)(const void *lhs, const void *rhs);
+static MacWSDesktopVolumeMapFindFn
+    macws_desktop_volume_map_find_original = NULL;
+static MacWSSamePhysicalDeviceFn
+    macws_same_physical_device_original = NULL;
+
+static void *macws_desktop_volume_map_find_diagnostic(void *map,
+                                                       const void *key) {
+    void *result = macws_desktop_volume_map_find_original
+        ? macws_desktop_volume_map_find_original(map, key) : NULL;
+    uintptr_t mapWords[6] = {};
+    uintptr_t keyWords[8] = {};
+    uintptr_t resultWords[12] = {};
+    if (map) memcpy(mapWords, map, sizeof(mapWords));
+    if (key) memcpy(keyWords, key, sizeof(keyWords));
+    if (result) memcpy(resultWords, result, sizeof(resultWords));
+    dprintf(STDERR_FILENO,
+        "MACWS-DESKTOP-VOLUME find map=%p result=%p "
+        "map=[%#lx,%#lx,%#lx,%#lx,%#lx,%#lx] "
+        "key=[%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx] "
+        "node=[%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx]\n",
+        map, result,
+        (unsigned long)mapWords[0], (unsigned long)mapWords[1],
+        (unsigned long)mapWords[2], (unsigned long)mapWords[3],
+        (unsigned long)mapWords[4], (unsigned long)mapWords[5],
+        (unsigned long)keyWords[0], (unsigned long)keyWords[1],
+        (unsigned long)keyWords[2], (unsigned long)keyWords[3],
+        (unsigned long)keyWords[4], (unsigned long)keyWords[5],
+        (unsigned long)keyWords[6], (unsigned long)keyWords[7],
+        (unsigned long)resultWords[0], (unsigned long)resultWords[1],
+        (unsigned long)resultWords[2], (unsigned long)resultWords[3],
+        (unsigned long)resultWords[4], (unsigned long)resultWords[5],
+        (unsigned long)resultWords[6], (unsigned long)resultWords[7],
+        (unsigned long)resultWords[8], (unsigned long)resultWords[9],
+        (unsigned long)resultWords[10], (unsigned long)resultWords[11]);
+    // libc++ __hash_table layout, RE-confirmed at the actual +0xef968 lookup:
+    // map q2 is the sentinel's next pointer and q3 is element count. Follow
+    // only the recorded number of nodes (capped at four) so the stored key can
+    // be compared with the failed query without an unbounded traversal.
+    uintptr_t node = map ? mapWords[2] : 0;
+    uintptr_t count = map ? mapWords[3] : 0;
+    if (count > 4) count = 4;
+    for (uintptr_t index = 0; node && index < count; index++) {
+        uintptr_t nodeWords[16] = {};
+        memcpy(nodeWords, (const void *)node, sizeof(nodeWords));
+        dprintf(STDERR_FILENO,
+            "MACWS-DESKTOP-VOLUME node index=%lu address=%p "
+            "words=[%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,"
+            "%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx,%#lx]\n",
+            (unsigned long)index, (void *)node,
+            (unsigned long)nodeWords[0], (unsigned long)nodeWords[1],
+            (unsigned long)nodeWords[2], (unsigned long)nodeWords[3],
+            (unsigned long)nodeWords[4], (unsigned long)nodeWords[5],
+            (unsigned long)nodeWords[6], (unsigned long)nodeWords[7],
+            (unsigned long)nodeWords[8], (unsigned long)nodeWords[9],
+            (unsigned long)nodeWords[10], (unsigned long)nodeWords[11],
+            (unsigned long)nodeWords[12], (unsigned long)nodeWords[13],
+            (unsigned long)nodeWords[14], (unsigned long)nodeWords[15]);
+        node = nodeWords[0];
+    }
+    return result;
+}
+
+static bool macws_same_physical_device_diagnostic(const void *lhs,
+                                                   const void *rhs) {
+    dprintf(STDERR_FILENO,
+            "MACWS-DESKTOP-VOLUME SamePhysicalDevice lhs=%p rhs=%p\n",
+            lhs, rhs);
+    return macws_same_physical_device_original
+        ? macws_same_physical_device_original(lhs, rhs) : false;
+}
+
+static void macws_install_desktop_volume_diagnostic(
+    const struct mach_header *untyped_header) {
+    if (!getenv("MACWS_DESKTOPSERVICES_DIAG")) return;
+    static _Atomic int installed = 0;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &installed, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) return;
+
+    static const uint8_t expectedUUID[16] = {
+        0xc7, 0x6a, 0xb2, 0x8e, 0x02, 0xa7, 0x3d, 0x20,
+        0xa2, 0x94, 0x9d, 0xab, 0xb9, 0x4c, 0x43, 0x13,
+    };
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!macws_macho_uuid_matches(header, expectedUUID)) {
+        dprintf(STDERR_FILENO,
+                "MACWS-DESKTOP-VOLUME install skipped: UUID mismatch\n");
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+
+    void *mapFind = (void *)((uintptr_t)header + 0xef968);
+    void *samePhysical = (void *)((uintptr_t)header + 0xe8f3c);
+    MSHookFunction(mapFind,
+                   (void *)macws_desktop_volume_map_find_diagnostic,
+                   (void **)&macws_desktop_volume_map_find_original);
+    MSHookFunction(samePhysical,
+                   (void *)macws_same_physical_device_diagnostic,
+                   (void **)&macws_same_physical_device_original);
+    dprintf(STDERR_FILENO,
+            "MACWS-DESKTOP-VOLUME installed mapFind=%p samePhysical=%p\n",
+            mapFind, samePhysical);
+}
+
 // Chromium's Apple display path normally promotes the complete root render
 // pass to process-local CALayers. MacWS/VNC captures the WindowServer primary
 // scanout, so a video promoted outside that scanout is visible in Chromium's
@@ -2669,8 +2854,17 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         macws_schedule_uttype_coretypes_compatibility();
     }
     if (info.dli_fname &&
+        strstr(info.dli_fname,
+               "/CoreServicesInternal.framework/") != NULL) {
+        macws_install_filecache_diagnostic(header);
+    }
+    if (info.dli_fname &&
+        strstr(info.dli_fname,
+               "/DesktopServicesPriv.framework/") != NULL) {
+        macws_install_desktop_volume_diagnostic(header);
+    }
+    if (info.dli_fname &&
         strstr(info.dli_fname, "/LaunchServices.framework/") != NULL) {
-        macws_install_launchservices_bookmark_volume_repair();
         macws_install_fsnode_root_volume_repair();
     }
     if (info.dli_fname &&
@@ -8609,20 +8803,34 @@ IOSurfaceRef IOSurfaceCreate_new(NSMutableDictionary *properties) {
 }
 
 // CarbonCore's LMGetBootDrive still backs DesktopServices' boot-volume
-// identity on macOS 13.  In the iOS-hosted chroot its compatibility shim
-// returns zero, while CFURL's volume resource property correctly reports the
-// mounted root's signed 16-bit vRefNum.  Finder consequently fails to mark the
-// root TFSVolumeInfo as the boot volume and asks the not-yet-populated global
-// volume map for it during that same object's initialization.
+// identity on macOS 13. In the iOS-hosted chroot it reports the host boot
+// volume, while CFURL's volume resource property correctly reports the mounted
+// root's signed 16-bit vRefNum. Finder consequently fails to mark the root
+// TFSVolumeInfo as the boot volume and asks the not-yet-populated global volume
+// map for it during that same object's initialization.
 //
-// Keep the native answer whenever CarbonCore has one.  Only repair the
-// unsupported zero result, deriving the value through the exact
-// _kCFURLVolumeRefNumKey mechanism used by
-// DesktopServicesPriv::TCFURLInfo::GetVRefNum(CFURLRef).
+// CarbonCore is not chroot-aware: runtime-confirmed in Finder on this iPad,
+// LMGetBootDrive returned the host boot volume -100 while `/` reported -101.
+// RE-confirmed at DesktopServicesPriv+0xe8280..+0xe829c: the result is compared
+// directly with the volume being initialized; the mismatch leaves isBootVolume
+// false and later makes +0xe8374 look up a nonexistent physical-volume peer.
+// Derive the logical boot volume through the exact _kCFURLVolumeRefNumKey
+// mechanism used by DesktopServicesPriv::TCFURLInfo::GetVRefNum(CFURLRef).
+// Preserve CarbonCore only when the process-visible root cannot provide one.
 extern int16_t LMGetBootDrive(void);
 extern const CFStringRef _kCFURLVolumeRefNumKey;
 
 static int16_t macws_root_volume_refnum(void) {
+    static _Atomic int32_t cached = 0;
+    static _Thread_local bool resolving = false;
+    int32_t previous = atomic_load_explicit(&cached, memory_order_acquire);
+    if (previous != 0) return (int16_t)previous;
+    // CFURL is the authoritative provider, but preserve CarbonCore's native
+    // value if a future OS revision asks LMGetBootDrive while constructing the
+    // root resource cache itself.
+    if (resolving) return 0;
+    resolving = true;
+
     // Finder's 2026-08-01 SIGTRAP is runtime-confirmed at
     // CFStringGetLength -> _CFURLCreateWithFileSystemPath from this hook, with
     // this hook's CFSTR argument as the only CFString input. Avoid that
@@ -8632,7 +8840,10 @@ static int16_t macws_root_volume_refnum(void) {
     static const UInt8 rootPath[] = {'/'};
     CFURLRef rootURL = CFURLCreateFromFileSystemRepresentation(
         kCFAllocatorDefault, rootPath, sizeof(rootPath), true);
-    if (!rootURL) return 0;
+    if (!rootURL) {
+        resolving = false;
+        return 0;
+    }
 
     CFTypeRef value = NULL;
     CFErrorRef error = NULL;
@@ -8649,20 +8860,26 @@ static int16_t macws_root_volume_refnum(void) {
     if (value) CFRelease(value);
     if (error) CFRelease(error);
     CFRelease(rootURL);
+    if (result != 0) {
+        atomic_store_explicit(&cached, (int32_t)result,
+                              memory_order_release);
+    }
+    resolving = false;
     return result;
 }
 
 static int16_t LMGetBootDrive_new(void) {
     int16_t native = LMGetBootDrive();
-    if (native != 0) return native;
-
     int16_t repaired = macws_root_volume_refnum();
-    if (macws_runtime_diagnostics_enabled()) {
-        fprintf(stderr,
-                "#### MACWS_BOOT_VREF CarbonCore=%d root-CFURL=%d\n",
-                (int)native, (int)repaired);
+    int16_t effective = repaired != 0 ? repaired : native;
+    if (macws_runtime_diagnostics_enabled() ||
+        getenv("MACWS_DESKTOPSERVICES_DIAG")) {
+        dprintf(STDERR_FILENO,
+                "MACWS-DESKTOP-VOLUME LMGetBootDrive native=%d "
+                "root-CFURL=%d effective=%d\n",
+                (int)native, (int)repaired, (int)effective);
     }
-    return repaired;
+    return effective;
 }
 
 // A chroot changes pathname lookup's process root but does not turn that vnode
@@ -8685,121 +8902,6 @@ extern Boolean _CFURLCopyResourcePropertyValuesAndFlags(
     uint64_t requestedFlags,
     uint64_t *returnedFlags,
     CFErrorRef *error);
-
-static bool macws_cfurl_is_application_tree(CFURLRef url) {
-    UInt8 path[PATH_MAX] = {};
-    if (!url || !CFURLGetFileSystemRepresentation(
-                    url, true, path, sizeof(path))) return false;
-
-    static const char *const roots[] = {
-        "/System/Applications",
-        "/Applications",
-        "/var/root/Applications",
-        "/Users/Shared",
-        "/AppleInternal/Applications",
-        "/System/Volumes/Preboot/Cryptexes/App/System/Applications",
-    };
-    const char *candidate = (const char *)path;
-    for (size_t index = 0; index < sizeof(roots) / sizeof(roots[0]); index++) {
-        size_t length = strlen(roots[index]);
-        if (strncmp(candidate, roots[index], length) == 0 &&
-            (candidate[length] == '\0' || candidate[length] == '/')) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool macws_launchservices_owns_application_bookmarks(void) {
-    const char *program = getprogname();
-    return program &&
-        (strcmp(program, "lsd") == 0 ||
-         strcmp(program, "launchservicesd") == 0);
-}
-
-// RE-confirmed in CoreServicesInternal 13.4 on 2026-08-03:
-// addVolumeInfoForURLToBookmark +120 asks NSURLVolumeURLKey while encoding
-// each plugin alias (_LSRegisterPlugin -> _LSAliasAddURL).  The chroot's host
-// vnode reports file:///private/var/ as its volume, so the stored bookmark is
-// later resolved against that host volume and PluginKit assigns container
-// state -1.  Present the process-visible root only for the exact synchronous
-// FSNode bookmark operation, then restore the URL resource cache.
-typedef id (*MacWSFSNodeBookmarkDataMethod)(
-    id, SEL, NSUInteger, id, id *);
-static MacWSFSNodeBookmarkDataMethod
-    macws_FSNode_bookmarkData_original = NULL;
-
-static id macws_FSNode_bookmarkData(
-    id self, SEL selector, NSUInteger options, id relativeNode, id *error) {
-    if (!macws_FSNode_bookmarkData_original) return nil;
-    SEL urlSelector = sel_registerName("URL");
-    CFURLRef url = self && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
-        self, sel_registerName("respondsToSelector:"), urlSelector)
-        ? ((CFURLRef (*)(id, SEL))objc_msgSend)(self, urlSelector)
-        : NULL;
-    if (!macws_cfurl_is_application_tree(url)) {
-        return macws_FSNode_bookmarkData_original(
-            self, selector, options, relativeNode, error);
-    }
-
-    static const UInt8 rootPath[] = {'/'};
-    static const UInt8 volumeURLKeyBytes[] = {
-        'N', 'S', 'U', 'R', 'L', 'V', 'o', 'l', 'u', 'm', 'e',
-        'U', 'R', 'L', 'K', 'e', 'y'
-    };
-    CFURLRef rootURL = CFURLCreateFromFileSystemRepresentation(
-        kCFAllocatorDefault, rootPath, sizeof(rootPath), true);
-    CFStringRef volumeURLKey = CFStringCreateWithBytes(
-        kCFAllocatorDefault, volumeURLKeyBytes,
-        sizeof(volumeURLKeyBytes), kCFStringEncodingUTF8, false);
-    if (!rootURL || !volumeURLKey) {
-        if (rootURL) CFRelease(rootURL);
-        if (volumeURLKey) CFRelease(volumeURLKey);
-        return macws_FSNode_bookmarkData_original(
-            self, selector, options, relativeNode, error);
-    }
-
-    CFTypeRef previousValue = NULL;
-    Boolean hadPreviousValue = CFURLCopyResourcePropertyForKey(
-        url, volumeURLKey, &previousValue, NULL);
-    CFURLSetTemporaryResourcePropertyForKey(
-        url, volumeURLKey, rootURL);
-    id bookmark = macws_FSNode_bookmarkData_original(
-        self, selector, options, relativeNode, error);
-    if (hadPreviousValue && previousValue) {
-        CFURLSetTemporaryResourcePropertyForKey(
-            url, volumeURLKey, previousValue);
-    } else {
-        CFURLClearResourcePropertyCacheForKey(url, volumeURLKey);
-    }
-    if (previousValue) CFRelease(previousValue);
-    CFRelease(volumeURLKey);
-    CFRelease(rootURL);
-    return bookmark;
-}
-
-static void macws_install_launchservices_bookmark_volume_repair(void) {
-    static _Atomic int installed = 0;
-    if (!macws_launchservices_owns_application_bookmarks()) return;
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(
-            &installed, &expected, 1,
-            memory_order_acq_rel, memory_order_acquire)) return;
-
-    Class fsNode = objc_getClass("FSNode");
-    SEL selector = sel_registerName(
-        "bookmarkDataWithOptions:relativeToNode:error:");
-    Method method = fsNode
-        ? class_getInstanceMethod(fsNode, selector) : NULL;
-    IMP original = method ? method_getImplementation(method) : NULL;
-    if (!original || original == (IMP)macws_FSNode_bookmarkData) {
-        atomic_store_explicit(&installed, 0, memory_order_release);
-        return;
-    }
-    macws_FSNode_bookmarkData_original =
-        (MacWSFSNodeBookmarkDataMethod)original;
-    method_setImplementation(method, (IMP)macws_FSNode_bookmarkData);
-}
 
 static bool macws_cfurl_is_process_root(CFURLRef url) {
     if (!url) return false;
@@ -9394,41 +9496,129 @@ DYLD_INTERPOSE(macws_xpc_main, macws_xpc_main_raw);
 // PlaneSize. In every case the replacement must come from the IOSurface's own
 // explicit creation properties; no format or compressibility answer is
 // synthesized here.
-static bool macws_iosurface_plane_property_value(IOSurfaceRef surface,
-                                                  size_t plane,
-                                                  NSString *shortKey,
-                                                  NSString *fullKey,
-                                                  uint64_t *valueOut) {
+typedef enum {
+    MacWSIOSurfacePlaneWidth,
+    MacWSIOSurfacePlaneHeight,
+    MacWSIOSurfacePlaneCompressionType,
+    MacWSIOSurfacePlaneHeightInCompressedTiles,
+    MacWSIOSurfacePlaneWidthInCompressedTiles,
+    MacWSIOSurfacePlaneBytesPerRow,
+    MacWSIOSurfacePlaneBytesPerElement,
+    MacWSIOSurfacePlaneElementWidth,
+    MacWSIOSurfacePlaneElementHeight,
+    MacWSIOSurfacePlaneSize,
+    MacWSIOSurfacePlaneNumberOfComponents,
+    MacWSIOSurfacePlaneBytesPerTileData,
+    MacWSIOSurfacePlaneOffset,
+    MacWSIOSurfacePlaneAddressFormat,
+    MacWSIOSurfacePlanePropertyCount,
+} MacWSIOSurfacePlaneProperty;
+
+typedef struct {
+    CFStringRef creationProperties;
+    CFStringRef planeInfo;
+    CFStringRef componentInfo;
+    CFStringRef fullComponentInfo;
+    CFStringRef shortKeys[MacWSIOSurfacePlanePropertyCount];
+    CFStringRef fullKeys[MacWSIOSurfacePlanePropertyCount];
+} MacWSIOSurfacePropertyKeys;
+
+static const MacWSIOSurfacePropertyKeys *macws_iosurface_property_keys(void) {
+    static MacWSIOSurfacePropertyKeys keys = {0};
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        static const char *const shortNames[] = {
+            "Width", "Height", "CompressionType",
+            "HeightInCompressedTiles", "WidthInCompressedTiles",
+            "BytesPerRow", "BytesPerElement", "ElementWidth",
+            "ElementHeight", "Size", "NumberOfComponents",
+            "BytesPerTileData", "Offset", "AddressFormat",
+        };
+        static const char *const fullNames[] = {
+            "IOSurfacePlaneWidth", "IOSurfacePlaneHeight",
+            "IOSurfacePlaneCompressionType",
+            "IOSurfacePlaneHeightInCompressedTiles",
+            "IOSurfacePlaneWidthInCompressedTiles",
+            "IOSurfacePlaneBytesPerRow", "IOSurfacePlaneBytesPerElement",
+            "IOSurfacePlaneElementWidth", "IOSurfacePlaneElementHeight",
+            "IOSurfacePlaneSize", "IOSurfacePlaneNumberOfComponents",
+            "IOSurfacePlaneBytesPerTileData", "IOSurfacePlaneOffset",
+            "IOSurfaceAddressFormat",
+        };
+        keys.creationProperties = CFStringCreateWithCString(
+            kCFAllocatorDefault, "CreationProperties", kCFStringEncodingUTF8);
+        keys.planeInfo = CFStringCreateWithCString(
+            kCFAllocatorDefault, "IOSurfacePlaneInfo", kCFStringEncodingUTF8);
+        keys.componentInfo = CFStringCreateWithCString(
+            kCFAllocatorDefault, "ComponentInfo", kCFStringEncodingUTF8);
+        keys.fullComponentInfo = CFStringCreateWithCString(
+            kCFAllocatorDefault, "IOSurfacePlaneComponentInfo",
+            kCFStringEncodingUTF8);
+        for (size_t index = 0;
+             index < MacWSIOSurfacePlanePropertyCount; index++) {
+            keys.shortKeys[index] = CFStringCreateWithCString(
+                kCFAllocatorDefault, shortNames[index],
+                kCFStringEncodingUTF8);
+            keys.fullKeys[index] = CFStringCreateWithCString(
+                kCFAllocatorDefault, fullNames[index],
+                kCFStringEncodingUTF8);
+        }
+    });
+    return &keys;
+}
+
+// arm64e runtime-confirmed on 2026-08-04: using an on-device-linked
+// Objective-C constant string here put the unauthenticated
+// __CFConstantStringClassReference (0x00200001eed885d8) into
+// -[__NSFrozenDictionaryM objectForKey:] and crashed in objc_msgSend while
+// CoreUI rendered Terminal's toolbar.  Read the CF property-list graph with
+// runtime-created CFStrings and CF collection APIs.  This preserves the exact
+// IOSurface values and removes the broken constant-string ABI boundary rather
+// than suppressing the CoreImage render.
+static bool macws_iosurface_plane_property_value(
+        IOSurfaceRef surface, size_t plane,
+        MacWSIOSurfacePlaneProperty property, uint64_t *valueOut) {
     if (!surface || !valueOut) return false;
+    if (property < 0 || property >= MacWSIOSurfacePlanePropertyCount)
+        return false;
+    const MacWSIOSurfacePropertyKeys *keys = macws_iosurface_property_keys();
+    if (!keys->creationProperties || !keys->planeInfo ||
+        !keys->shortKeys[property] || !keys->fullKeys[property]) return false;
     CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
     if (!copied) return false;
     uint64_t value = 0;
     bool found = false;
-    @try {
-        NSDictionary *root = (__bridge NSDictionary *)copied;
-        id creationValue = [root objectForKey:@"CreationProperties"];
-        NSDictionary *creation =
-            [creationValue isKindOfClass:[NSDictionary class]]
-                ? (NSDictionary *)creationValue : root;
-        id planeInfoValue = [creation objectForKey:@"IOSurfacePlaneInfo"];
-        if ([planeInfoValue isKindOfClass:[NSArray class]] &&
-            plane < [(NSArray *)planeInfoValue count]) {
-            id planeValue = [(NSArray *)planeInfoValue objectAtIndex:plane];
-            if ([planeValue isKindOfClass:[NSDictionary class]]) {
-                id number = [(NSDictionary *)planeValue objectForKey:shortKey]
-                    ?: [(NSDictionary *)planeValue objectForKey:fullKey];
-                if ([number respondsToSelector:@selector(unsignedLongLongValue)]) {
-                    value = [number unsignedLongLongValue];
+    if (CFGetTypeID(copied) == CFDictionaryGetTypeID()) {
+        CFTypeRef creationValue = CFDictionaryGetValue(
+            copied, keys->creationProperties);
+        CFDictionaryRef creation = creationValue &&
+            CFGetTypeID(creationValue) == CFDictionaryGetTypeID()
+                ? (CFDictionaryRef)creationValue : copied;
+        CFTypeRef planeInfoValue = CFDictionaryGetValue(
+            creation, keys->planeInfo);
+        if (planeInfoValue &&
+            CFGetTypeID(planeInfoValue) == CFArrayGetTypeID() &&
+            plane < (size_t)CFArrayGetCount((CFArrayRef)planeInfoValue)) {
+            CFTypeRef planeValue = CFArrayGetValueAtIndex(
+                (CFArrayRef)planeInfoValue, (CFIndex)plane);
+            if (planeValue &&
+                CFGetTypeID(planeValue) == CFDictionaryGetTypeID()) {
+                CFTypeRef number = CFDictionaryGetValue(
+                    (CFDictionaryRef)planeValue, keys->shortKeys[property]);
+                if (!number) {
+                    number = CFDictionaryGetValue(
+                        (CFDictionaryRef)planeValue,
+                        keys->fullKeys[property]);
+                }
+                int64_t signedValue = 0;
+                if (number && CFGetTypeID(number) == CFNumberGetTypeID() &&
+                    CFNumberGetValue((CFNumberRef)number,
+                                     kCFNumberSInt64Type, &signedValue) &&
+                    signedValue >= 0) {
+                    value = (uint64_t)signedValue;
                     found = true;
                 }
             }
-        }
-    } @catch (NSException *exception) {
-        static int exceptionLogs = 0;
-        if (exceptionLogs++ < 4) {
-            fprintf(stderr,
-                "#### IOSURFACE-COMPAT property parse exception: %s\n",
-                [[exception description] UTF8String] ?: "?");
         }
     }
     CFRelease(copied);
@@ -9439,61 +9629,58 @@ static bool macws_iosurface_plane_property_value(IOSurfaceRef surface,
 static bool macws_iosurface_plane_component_count(IOSurfaceRef surface,
                                                    size_t plane,
                                                    uint64_t *valueOut) {
-    if (!surface || !valueOut) return false;
+    if (macws_iosurface_plane_property_value(
+            surface, plane, MacWSIOSurfacePlaneNumberOfComponents,
+            valueOut)) return true;
+
+    const MacWSIOSurfacePropertyKeys *keys = macws_iosurface_property_keys();
+    if (!surface || !valueOut || !keys->creationProperties ||
+        !keys->planeInfo || !keys->componentInfo ||
+        !keys->fullComponentInfo) return false;
     CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
     if (!copied) return false;
-    uint64_t value = 0;
     bool found = false;
-    @try {
-        NSDictionary *root = (__bridge NSDictionary *)copied;
-        id creationValue = [root objectForKey:@"CreationProperties"];
-        NSDictionary *creation =
-            [creationValue isKindOfClass:[NSDictionary class]]
-                ? (NSDictionary *)creationValue : root;
-        id planeInfoValue = [creation objectForKey:@"IOSurfacePlaneInfo"];
-        if ([planeInfoValue isKindOfClass:[NSArray class]] &&
-            plane < [(NSArray *)planeInfoValue count]) {
-            id planeValue = [(NSArray *)planeInfoValue objectAtIndex:plane];
-            if ([planeValue isKindOfClass:[NSDictionary class]]) {
-                id number = [(NSDictionary *)planeValue
-                    objectForKey:@"NumberOfComponents"] ?:
-                    [(NSDictionary *)planeValue
-                    objectForKey:@"IOSurfacePlaneNumberOfComponents"];
-                if ([number respondsToSelector:@selector(unsignedLongLongValue)]) {
-                    value = [number unsignedLongLongValue];
-                    found = true;
-                } else {
-                    id components = [(NSDictionary *)planeValue
-                        objectForKey:@"ComponentInfo"] ?:
-                        [(NSDictionary *)planeValue
-                        objectForKey:@"IOSurfacePlaneComponentInfo"];
-                    if ([components isKindOfClass:[NSArray class]] &&
-                        [(NSArray *)components count] != 0) {
-                        value = [(NSArray *)components count];
+    if (CFGetTypeID(copied) == CFDictionaryGetTypeID()) {
+        CFTypeRef creationValue = CFDictionaryGetValue(
+            copied, keys->creationProperties);
+        CFDictionaryRef creation = creationValue &&
+            CFGetTypeID(creationValue) == CFDictionaryGetTypeID()
+                ? (CFDictionaryRef)creationValue : copied;
+        CFTypeRef planes = CFDictionaryGetValue(creation, keys->planeInfo);
+        if (planes && CFGetTypeID(planes) == CFArrayGetTypeID() &&
+            plane < (size_t)CFArrayGetCount((CFArrayRef)planes)) {
+            CFTypeRef planeValue = CFArrayGetValueAtIndex(
+                (CFArrayRef)planes, (CFIndex)plane);
+            if (planeValue &&
+                CFGetTypeID(planeValue) == CFDictionaryGetTypeID()) {
+                CFTypeRef components = CFDictionaryGetValue(
+                    (CFDictionaryRef)planeValue, keys->componentInfo);
+                if (!components) {
+                    components = CFDictionaryGetValue(
+                        (CFDictionaryRef)planeValue,
+                        keys->fullComponentInfo);
+                }
+                if (components &&
+                    CFGetTypeID(components) == CFArrayGetTypeID()) {
+                    CFIndex count = CFArrayGetCount((CFArrayRef)components);
+                    if (count > 0) {
+                        *valueOut = (uint64_t)count;
                         found = true;
                     }
                 }
             }
         }
-    } @catch (NSException *exception) {
-        if (macws_runtime_diagnostics_enabled()) {
-            fprintf(stderr,
-                "#### IOSURFACE-COMPAT component parse exception: %s\n",
-                [[exception description] UTF8String] ?: "?");
-        }
     }
     CFRelease(copied);
-    if (found) *valueOut = value;
     return found;
 }
 
 static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
                                                 size_t plane,
-                                                NSString *shortKey,
-                                                NSString *fullKey) {
+                                                MacWSIOSurfacePlaneProperty property) {
     uint64_t value = 0;
     (void)macws_iosurface_plane_property_value(
-        surface, plane, shortKey, fullKey, &value);
+        surface, plane, property, &value);
     return value;
 }
 
@@ -9509,8 +9696,8 @@ static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
 size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetWidthOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"Width", @"IOSurfacePlaneWidth");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneWidth);
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9529,8 +9716,8 @@ size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
 size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetHeightOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"Height", @"IOSurfacePlaneHeight");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneHeight);
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9550,8 +9737,8 @@ uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                    size_t plane) {
     uint32_t original = IOSurfaceGetCompressionTypeOfPlane(surface, plane);
     if (original != 0 || !getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"CompressionType", @"IOSurfacePlaneCompressionType");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneCompressionType);
     if (property == 0 || property > UINT32_MAX) return original;
     static _Atomic unsigned int recoveryCount = 0;
     unsigned int count = macws_runtime_diagnostics_enabled()
@@ -9570,9 +9757,8 @@ size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
     size_t original = IOSurfaceGetHeightInCompressedTilesOfPlane(
         surface, plane);
     if (original != 0 || !getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"HeightInCompressedTiles",
-        @"IOSurfacePlaneHeightInCompressedTiles");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneHeightInCompressedTiles);
     if (property == 0 || property > SIZE_MAX) return original;
     static _Atomic unsigned int recoveryCount = 0;
     unsigned int count = macws_runtime_diagnostics_enabled()
@@ -9591,9 +9777,8 @@ size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
     size_t original = IOSurfaceGetWidthInCompressedTilesOfPlane(
         surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"WidthInCompressedTiles",
-        @"IOSurfacePlaneWidthInCompressedTiles");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneWidthInCompressedTiles);
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9612,8 +9797,8 @@ size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
                                             size_t plane) {
     size_t original = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"BytesPerRow", @"IOSurfacePlaneBytesPerRow");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneBytesPerRow);
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9644,10 +9829,10 @@ size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
 // IOSurface's own CreationProperties.
 static size_t macws_iosurface_explicit_plane_size(
         IOSurfaceRef surface, size_t plane, size_t original,
-        NSString *shortKey, NSString *fullKey, const char *field) {
+        MacWSIOSurfacePlaneProperty propertyKey, const char *field) {
     if (!getenv("MACWS_AGX_NATIVE")) return original;
     uint64_t property = macws_iosurface_plane_property(
-        surface, plane, shortKey, fullKey);
+        surface, plane, propertyKey);
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9667,7 +9852,7 @@ size_t macws_IOSurfaceGetBytesPerElementOfPlane(IOSurfaceRef surface,
                                                 size_t plane) {
     size_t original = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
-        @"BytesPerElement", @"IOSurfacePlaneBytesPerElement",
+        MacWSIOSurfacePlaneBytesPerElement,
         "bytesPerElement");
 }
 
@@ -9675,20 +9860,20 @@ size_t macws_IOSurfaceGetElementWidthOfPlane(IOSurfaceRef surface,
                                              size_t plane) {
     size_t original = IOSurfaceGetElementWidthOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
-        @"ElementWidth", @"IOSurfacePlaneElementWidth", "elementWidth");
+        MacWSIOSurfacePlaneElementWidth, "elementWidth");
 }
 
 size_t macws_IOSurfaceGetElementHeightOfPlane(IOSurfaceRef surface,
                                               size_t plane) {
     size_t original = IOSurfaceGetElementHeightOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
-        @"ElementHeight", @"IOSurfacePlaneElementHeight", "elementHeight");
+        MacWSIOSurfacePlaneElementHeight, "elementHeight");
 }
 
 size_t macws_IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetSizeOfPlane(surface, plane);
     return macws_iosurface_explicit_plane_size(surface, plane, original,
-        @"Size", @"IOSurfacePlaneSize", "size");
+        MacWSIOSurfacePlaneSize, "size");
 }
 
 size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
@@ -9713,8 +9898,8 @@ size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
                                                  size_t plane) {
     size_t original = IOSurfaceGetBytesPerTileDataOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"BytesPerTileData", @"IOSurfacePlaneBytesPerTileData");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneBytesPerTileData);
     if (property == 0 || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9733,8 +9918,8 @@ size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetOffsetOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
     uint64_t property = 0;
-    bool found = macws_iosurface_plane_property_value(surface, plane,
-        @"Offset", @"IOSurfacePlaneOffset", &property);
+    bool found = macws_iosurface_plane_property_value(
+        surface, plane, MacWSIOSurfacePlaneOffset, &property);
     if (!found || property > SIZE_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;
@@ -9754,8 +9939,8 @@ void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
     void *original = IOSurfaceGetBaseAddressOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
     uint64_t propertyOffset = 0;
-    bool found = macws_iosurface_plane_property_value(surface, plane,
-        @"Offset", @"IOSurfacePlaneOffset", &propertyOffset);
+    bool found = macws_iosurface_plane_property_value(
+        surface, plane, MacWSIOSurfacePlaneOffset, &propertyOffset);
     void *base = IOSurfaceGetBaseAddress(surface);
     if (!found || !base || propertyOffset > UINTPTR_MAX - (uintptr_t)base)
         return original;
@@ -9778,8 +9963,8 @@ uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
                                                 size_t plane) {
     uint32_t original = IOSurfaceGetAddressFormatOfPlane(surface, plane);
     if (!getenv("MACWS_AGX_NATIVE")) return original;
-    uint64_t property = macws_iosurface_plane_property(surface, plane,
-        @"AddressFormat", @"IOSurfaceAddressFormat");
+    uint64_t property = macws_iosurface_plane_property(
+        surface, plane, MacWSIOSurfacePlaneAddressFormat);
     if (property == 0 || property > UINT32_MAX || property == original)
         return original;
     static _Atomic unsigned int recoveryCount = 0;

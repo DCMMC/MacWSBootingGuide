@@ -52,6 +52,11 @@ variables. `MallocScribble` is explicitly forbidden.
 - Submit rings, raw command dumps, lifecycle backtraces, method enumeration,
   PF550 experiments, XPC/RFB/JIT/IOSurface traces, unsafe readbacks and broad
   assert bypasses are off.
+- Finder, Dock, IconServices and LaunchServices use the exact scoped chroot
+  mount namespace. CarbonCore's host boot-volume refnum is translated to the
+  process-visible root refnum; the RE and runtime witnesses are in
+  [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md).
+  FileCache/DesktopServices volume-map probes remain off in production.
 - The 100,000-us idle virtual-display interval temporarily changes to
   16,667 us for one second after real VNC input. This is compatibility pacing,
   not a hardware-vblank claim.

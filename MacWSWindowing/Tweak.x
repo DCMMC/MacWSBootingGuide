@@ -883,25 +883,47 @@ static NSArray<NSNumber *> *MacWSDenseCandidates(NSArray<NSNumber *> *source,
 }
 %end
 
-__attribute__((constructor)) static void MacWSDenseGridLoadedWitness(void) {
-    int fd = open(MacWSDenseGridLoaded,
-                  O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd >= 0) {
-        dprintf(fd, "version=13 pid=%d step=10 minimum=150 "
-                    "fullscreen=focused-scene-maximization-toggle-action-17 "
-                    "resize=app-layout-transaction "
-                    "exit=system-maximization-unzoom "
-                    "postcondition=layout-role-and-center-configuration\n",
-                    getpid());
-        close(fd);
-    }
+static void MacWSInstallRequestObservers(void *context) {
+    (void)context;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        CFNotificationCenterRef center =
+            CFNotificationCenterGetDarwinNotifyCenter();
+        CFNotificationCenterAddObserver(
+            center, NULL, MacWSHandleFullscreenRequest,
+            MacWSRequestFullscreenNotification, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
+        CFNotificationCenterAddObserver(
+            center, NULL, MacWSHandleResizeRequest,
+            MacWSRequestResizeNotification, NULL,
+            CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        MacWSHandleFullscreenRequest, MacWSRequestFullscreenNotification,
-        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(
-        CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        MacWSHandleResizeRequest, MacWSRequestResizeNotification,
-        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        // This file is a readiness witness, not merely an image-load witness:
+        // publish it only after both Darwin observers are installed.
+        int fd = open(MacWSDenseGridLoaded,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            dprintf(fd, "version=14 pid=%d step=10 minimum=150 "
+                        "observers=main-queue-after-dyld "
+                        "fullscreen=focused-scene-maximization-toggle-action-17 "
+                        "resize=app-layout-transaction "
+                        "exit=system-maximization-unzoom "
+                        "postcondition=layout-role-and-center-configuration\n",
+                        getpid());
+            close(fd);
+        }
+    });
+}
+
+__attribute__((constructor)) static void MacWSDenseGridLoadedWitness(void) {
+    // Keep the constructor side-effect minimal and publish readiness only
+    // after the observers actually exist.  The original Safe Mode root cause
+    // was NOT constructor timing: SpringBoard-2026-08-04-124439.ips reproduced
+    // the same CFHash trap from the main queue and its register dump proved the
+    // on-device arm64e linker emitted a malformed constant-object class
+    // pointer.  MacWSWindowing/Makefile now prevents that unsafe slice from
+    // being produced on-device.
+    unlink(MacWSDenseGridLoaded);
+    dispatch_async_f(dispatch_get_main_queue(), NULL,
+                     MacWSInstallRequestObservers);
 }

@@ -380,9 +380,16 @@ static macws_cfurl_copy_resource_property_fn
     macws_cfurl_copy_resource_property_orig = NULL;
 
 static BOOL macws_needs_application_mount_namespace_compatibility(void) {
+    // Diagnostic escape hatch for another isolated CoreServices consumer. It
+    // is never set by a shipped launch plist; production scope is the exact
+    // catalog/desktop process list below.
+    if (getenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC")) return YES;
     const char *program = getprogname();
     return program &&
         (strcmp(program, "Dock") == 0 ||
+         strcmp(program, "Finder") == 0 ||
+         strcmp(program, "iconservicesagent") == 0 ||
+         strcmp(program, "iconservicesd") == 0 ||
          strcmp(program, "launchservicesd") == 0 ||
          strcmp(program, "lsd") == 0);
 }
@@ -617,6 +624,17 @@ static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
 }
 
 static void macws_install_launchpad_mount_namespace_compatibility(void) {
+    // This compatibility belongs to the application-catalog owners only.
+    // Installing the fsgetpath trampoline in every AppKit process dirties the
+    // libsystem_kernel __TEXT page that also contains mach_port_construct.
+    // Runtime-confirmed on iPadOS 16.3: Terminal's fork child inherited that
+    // COW page as r--/rw- and faulted at mach_port_construct+0 during
+    // _pthread_main_thread_postfork_init.  Keep both halves of the namespace
+    // model in the same narrowly-scoped catalog/desktop processes (Dock,
+    // Finder, IconServices, lsd and launchservicesd); ordinary applications
+    // retain the stock kernel entry.
+    if (!macws_needs_application_mount_namespace_compatibility()) return;
+
     const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
     if (hostRoot && hostRoot[0] == '/' && strcmp(hostRoot, "/") != 0) {
         strlcpy(macws_chroot_host_root, hostRoot,
@@ -629,7 +647,6 @@ static void macws_install_launchpad_mount_namespace_compatibility(void) {
         }
     }
 
-    if (!macws_needs_application_mount_namespace_compatibility()) return;
     void *statSymbol = dlsym(RTLD_DEFAULT, "statfs");
     if (!statSymbol) return;
 

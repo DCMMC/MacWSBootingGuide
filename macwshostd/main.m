@@ -114,6 +114,69 @@ static BOOL TouchPath(const char *path) {
     return YES;
 }
 
+// Build a private, deterministic envp for one child. posix_spawn consumes the
+// strings synchronously, so the caller frees it immediately after the call.
+// Existing entries with the same key are replaced instead of relying on the
+// undefined first/last behavior of duplicate environment variables.
+static char **CopyEnvironmentAdding(const char *const *additions,
+                                    size_t additionCount) {
+    size_t inheritedCount = 0;
+    for (char **cursor = environ; cursor && *cursor; cursor++) {
+        BOOL replaced = NO;
+        for (size_t index = 0; index < additionCount; index++) {
+            const char *equals = additions[index]
+                ? strchr(additions[index], '=') : NULL;
+            size_t keyLength = equals
+                ? (size_t)(equals - additions[index]) : 0;
+            if (keyLength != 0 &&
+                strncmp(*cursor, additions[index], keyLength) == 0 &&
+                (*cursor)[keyLength] == '=') {
+                replaced = YES;
+                break;
+            }
+        }
+        if (!replaced) inheritedCount++;
+    }
+
+    char **result = calloc(inheritedCount + additionCount + 1,
+                           sizeof(*result));
+    if (!result) return NULL;
+    size_t output = 0;
+    for (char **cursor = environ; cursor && *cursor; cursor++) {
+        BOOL replaced = NO;
+        for (size_t index = 0; index < additionCount; index++) {
+            const char *equals = additions[index]
+                ? strchr(additions[index], '=') : NULL;
+            size_t keyLength = equals
+                ? (size_t)(equals - additions[index]) : 0;
+            if (keyLength != 0 &&
+                strncmp(*cursor, additions[index], keyLength) == 0 &&
+                (*cursor)[keyLength] == '=') {
+                replaced = YES;
+                break;
+            }
+        }
+        if (!replaced) result[output++] = strdup(*cursor);
+    }
+    for (size_t index = 0; index < additionCount; index++)
+        result[output++] = strdup(additions[index]);
+    for (size_t index = 0; index < output; index++) {
+        if (!result[index]) {
+            for (size_t cleanup = 0; cleanup < output; cleanup++)
+                free(result[cleanup]);
+            free(result);
+            return NULL;
+        }
+    }
+    return result;
+}
+
+static void FreeCopiedEnvironment(char **environment) {
+    if (!environment) return;
+    for (char **cursor = environment; *cursor; cursor++) free(*cursor);
+    free(environment);
+}
+
 static uint64_t ArmCapture(void) {
     struct timespec now = {0};
     if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
@@ -1295,8 +1358,29 @@ static BOOL LaunchRootExecutable(const char *identifier,
     // apps cleanly; this changes their launch transaction upstream and does
     // not hide extra catalog entries or relax the real-window witness below.
     pid_t pid = 0;
+    char **childEnvironment = environ;
+    char **ownedEnvironment = NULL;
+    if (strcmp(identifier, "glassdemo") == 0) {
+        static const char *const nativeAGXEnvironment[] = {
+            "MACWS_AGX_NATIVE=1",
+            "MACWS_AGX_REGISTER_CLASSES=1",
+            "MACWS_PIN_FALLBACK=1",
+        };
+        ownedEnvironment = CopyEnvironmentAdding(
+            nativeAGXEnvironment,
+            sizeof(nativeAGXEnvironment) /
+                sizeof(nativeAGXEnvironment[0]));
+        if (!ownedEnvironment) {
+            posix_spawn_file_actions_destroy(&actions);
+            if (logFD >= 0) close(logFD);
+            *message = @"无法为 GlassDemo 构造 native AGX 启动环境";
+            return NO;
+        }
+        childEnvironment = ownedEnvironment;
+    }
     int error = posix_spawn(&pid, kChrootExec, &actions, NULL,
-                            (char *const *)argv, environ);
+                            (char *const *)argv, childEnvironment);
+    FreeCopiedEnvironment(ownedEnvironment);
     posix_spawn_file_actions_destroy(&actions);
     if (logFD >= 0) close(logFD);
     if (error != 0) {
