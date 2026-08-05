@@ -13,7 +13,7 @@
 #define MACWS_STREAM_INVALIDATE_SOCKET_PATH \
     "/private/tmp/macws_display_invalidate.sock"
 #define MACWS_STREAM_MAGIC 0x4d575354u /* "MWST" */
-#define MACWS_STREAM_VERSION 3u
+#define MACWS_STREAM_VERSION 4u
 
 #define MACWS_STREAM_MAX_DIMENSION 16384u
 #define MACWS_STREAM_MAX_BYTES_PER_ROW (MACWS_STREAM_MAX_DIMENSION * 16u)
@@ -140,12 +140,43 @@ typedef struct __attribute__((packed)) {
     // canvas. Each is transported as its own native window IOSurface and
     // composed by Host Metal. destination* is expressed in base backing pixels.
     uint32_t layerWindowID;
+    // Fullscreen input must follow the same graph that Host composites.
+    // SkyLight's independent global routing order can disagree after captured
+    // windows have been repositioned, so carry the actual layer owner too.
+    int32_t layerOwnerPID;
     int32_t layerLevel;
     int32_t destinationX;
     int32_t destinationY;
     uint32_t destinationWidth;
     uint32_t destinationHeight;
 } MacWSStreamFrameDescriptor;
+
+// Map a point in the fullscreen desktop canvas into one captured layer.  A
+// continuous gesture must use the descriptor captured at its Begin boundary:
+// the window's live destination changes while WindowServer drags it, and
+// feeding that new destination into the next sample subtracts the displacement
+// that the preceding sample just applied.
+static inline bool MacWSStreamMapDesktopPointToLayer(
+    const MacWSStreamFrameDescriptor *descriptor, float desktopX,
+    float desktopY, float *layerX, float *layerY) {
+    if (!descriptor || !layerX || !layerY ||
+        descriptor->destinationWidth == 0 ||
+        descriptor->destinationHeight == 0 ||
+        descriptor->contentWidth == 0 || descriptor->contentHeight == 0) {
+        return false;
+    }
+    double u = (desktopX - descriptor->destinationX) /
+        (double)descriptor->destinationWidth;
+    double v = (desktopY - descriptor->destinationY) /
+        (double)descriptor->destinationHeight;
+    if (u < 0.0) u = 0.0;
+    if (u > 0.999999) u = 0.999999;
+    if (v < 0.0) v = 0.0;
+    if (v > 0.999999) v = 0.999999;
+    *layerX = descriptor->contentX + (float)(u * descriptor->contentWidth);
+    *layerY = descriptor->contentY + (float)(v * descriptor->contentHeight);
+    return true;
+}
 
 typedef struct __attribute__((packed)) {
     int32_t x;
@@ -273,7 +304,7 @@ static inline bool MacWSStreamFrameDescriptorIsValid(
 #if defined(__cplusplus)
 static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
               "MacWS window descriptor ABI");
-static_assert(sizeof(MacWSStreamFrameDescriptor) == 112,
+static_assert(sizeof(MacWSStreamFrameDescriptor) == 116,
               "MacWS frame descriptor ABI");
 static_assert(sizeof(MacWSStreamDamageRect) == 16,
               "MacWS damage rect ABI");
@@ -286,7 +317,7 @@ static_assert(sizeof(MacWSWindowMetricsEntry) == 20,
 #else
 _Static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
                "MacWS window descriptor ABI");
-_Static_assert(sizeof(MacWSStreamFrameDescriptor) == 112,
+_Static_assert(sizeof(MacWSStreamFrameDescriptor) == 116,
                "MacWS frame descriptor ABI");
 _Static_assert(sizeof(MacWSStreamDamageRect) == 16,
                "MacWS damage rect ABI");

@@ -1,5 +1,6 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 
 static NSString *const MacWSEventLogPath = @"/tmp/macws_inputlab_events.jsonl";
 static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
@@ -88,6 +89,70 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 @property(nonatomic, strong) MacWSInputRecorder *recorder;
 @end
 
+@interface NSWindow (MacWSInputLabPrivateScrollWitness)
+- (void)_latchViewForScrollEvent:(NSEvent *)event;
+- (BOOL)_isViewScrolling;
+- (void)_willBeginViewScrolling;
+- (void)_didEndViewScrolling;
+@end
+
+// Boundary witness for synthetic scroll reconstruction. AppInputBridge enters
+// NSWindow's ordinary dispatcher after resolving the exact captured window;
+// recording here distinguishes a malformed NSEvent from a responder-routing
+// failure without changing the event or invoking a view action directly.
+@interface MacWSInputWindow : NSWindow
+@property(nonatomic, weak) MacWSInputRecorder *inputRecorder;
+@end
+
+@implementation MacWSInputWindow
+- (void)_latchViewForScrollEvent:(NSEvent *)event {
+    fprintf(stderr,
+            "INPUTLAB NSWINDOW-LATCH phase=%lu momentum=%lu window=%ld "
+            "scrolling-before=%s\n",
+            (unsigned long)event.phase, (unsigned long)event.momentumPhase,
+            (long)event.windowNumber, self._isViewScrolling ? "YES" : "NO");
+    [super _latchViewForScrollEvent:event];
+    fprintf(stderr, "INPUTLAB NSWINDOW-LATCH-RETURN scrolling-after=%s\n",
+            self._isViewScrolling ? "YES" : "NO");
+    unsigned int ivarCount = 0;
+    Ivar *ivars = class_copyIvarList(NSWindow.class, &ivarCount);
+    for (unsigned int index = 0; index < ivarCount; index++) {
+        const char *name = ivar_getName(ivars[index]);
+        const char *type = ivar_getTypeEncoding(ivars[index]);
+        if (name && strcasestr(name, "scroll")) {
+            id value = type && type[0] == '@'
+                ? object_getIvar(self, ivars[index]) : nil;
+            fprintf(stderr,
+                    "INPUTLAB NSWINDOW-SCROLL-IVAR %s type=%s offset=%td "
+                    "object=%s\n", name, type ?: "", ivar_getOffset(ivars[index]),
+                    value ? object_getClassName(value) : "nil/nonobject");
+        }
+    }
+    free(ivars);
+}
+- (void)_willBeginViewScrolling {
+    fprintf(stderr, "INPUTLAB NSWINDOW-WILL-BEGIN-SCROLL\n");
+    [super _willBeginViewScrolling];
+}
+- (void)_didEndViewScrolling {
+    fprintf(stderr, "INPUTLAB NSWINDOW-DID-END-SCROLL\n");
+    [super _didEndViewScrolling];
+}
+- (void)sendEvent:(NSEvent *)event {
+    if (event.type == NSEventTypeScrollWheel && self.inputRecorder) {
+        [self.inputRecorder record:@"scroll_window_boundary" event:event
+                           details:@{
+            @"delta_x": @(event.scrollingDeltaX),
+            @"delta_y": @(event.scrollingDeltaY),
+            @"precise": @(event.hasPreciseScrollingDeltas),
+            @"phase": @(event.phase),
+            @"momentum_phase": @(event.momentumPhase),
+        }];
+    }
+    [super sendEvent:event];
+}
+@end
+
 @implementation MacWSInputCanvas
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
@@ -154,7 +219,18 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     }];
 }
 - (void)magnifyWithEvent:(NSEvent *)event {
-    [self.recorder record:@"magnify" event:event details:@{@"magnification": @(event.magnification)}];
+    [self.recorder record:@"magnify" event:event details:@{
+        @"magnification": @(event.magnification),
+        @"phase": @(event.phase),
+    }];
+}
+- (void)beginGestureWithEvent:(NSEvent *)event {
+    [self.recorder record:@"gesture_begin" event:event details:@{
+        @"phase": @(event.phase)}];
+}
+- (void)endGestureWithEvent:(NSEvent *)event {
+    [self.recorder record:@"gesture_end" event:event details:@{
+        @"phase": @(event.phase)}];
 }
 - (void)rotateWithEvent:(NSEvent *)event {
     [self.recorder record:@"rotate" event:event details:@{@"rotation": @(event.rotation)}];
@@ -197,13 +273,38 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 @implementation MacWSInputLabDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
+    unsigned int factoryCount = 0;
+    Method *factories = class_copyMethodList(object_getClass(NSEvent.class),
+                                              &factoryCount);
+    for (unsigned int index = 0; index < factoryCount; index++) {
+        const char *name = sel_getName(method_getName(factories[index]));
+        if (name && (strcasestr(name, "scroll") ||
+                     strcasestr(name, "momentum"))) {
+            fprintf(stderr, "INPUTLAB NSEVENT-FACTORY %s types=%s\n", name,
+                    method_getTypeEncoding(factories[index]));
+        }
+    }
+    free(factories);
+    unsigned int windowMethodCount = 0;
+    Method *windowMethods = class_copyMethodList(NSWindow.class,
+                                                  &windowMethodCount);
+    for (unsigned int index = 0; index < windowMethodCount; index++) {
+        const char *name = sel_getName(method_getName(windowMethods[index]));
+        if (name && (strcasestr(name, "scroll") ||
+                     strcasestr(name, "momentum"))) {
+            fprintf(stderr, "INPUTLAB NSWINDOW-METHOD %s types=%s\n", name,
+                    method_getTypeEncoding(windowMethods[index]));
+        }
+    }
+    free(windowMethods);
     self.recorder = [MacWSInputRecorder new];
     NSRect frame = NSMakeRect(160, 120, 860, 620);
-    self.window = [[NSWindow alloc] initWithContentRect:frame
+    self.window = [[MacWSInputWindow alloc] initWithContentRect:frame
         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                   NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
         backing:NSBackingStoreBuffered defer:NO];
     self.window.title = @"MacWS Input Lab";
+    ((MacWSInputWindow *)self.window).inputRecorder = self.recorder;
     self.window.minSize = NSMakeSize(640, 460);
 
     NSView *root = self.window.contentView;

@@ -135,6 +135,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindKeyUp: return "key-up";
         case MacWSInputKindSecondaryTap: return "secondary-tap";
         case MacWSInputKindScroll: return "scroll";
+        case MacWSInputKindMagnify: return "magnify";
         case MacWSInputKindConfigureWindow: return "configure-window";
         case MacWSInputKindCloseWindow: return "close-window";
         case MacWSInputKindCreateInitialWindow: return "create-initial-window";
@@ -179,11 +180,21 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
             fabsf(record->pressure) > 16384.0f ||
             fabsf(horizontal) > 16384.0f) return false;
     }
+    if (record->kind == MacWSInputKindMagnify) {
+        uint16_t phase = record->flags &
+            (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+             MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+        if (!isfinite(record->pressure) || fabsf(record->pressure) > 4.0f ||
+            (phase != MacWSInputFlagGestureBegan &&
+             phase != MacWSInputFlagGestureChanged &&
+             phase != MacWSInputFlagGestureEnded &&
+             phase != MacWSInputFlagGestureCancelled)) return false;
+    }
     if (
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindScroll) {
+        record->kind > MacWSInputKindMagnify) {
         return false;
     }
     return true;
@@ -227,8 +238,11 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindKeyDown:
         case MacWSInputKindKeyUp:
         case MacWSInputKindScroll:
+        case MacWSInputKindMagnify:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
+        case MacWSInputKindCreateInitialWindow:
+        case MacWSInputKindReopenApplication:
             // Consumed before event construction in main().
             return 0;
     }
@@ -563,7 +577,9 @@ static bool SendToAppInputBridge(int socketFD,
                       record->kind == MacWSInputKindHover ||
                       record->kind == MacWSInputKindMenuHover ||
                       (record->kind == MacWSInputKindScroll &&
-                       (record->flags & MacWSInputFlagScrollChanged));
+                       (record->flags & MacWSInputFlagScrollChanged)) ||
+                      (record->kind == MacWSInputKindMagnify &&
+                       (record->flags & MacWSInputFlagGestureChanged));
     unsigned attempts = continuous ? 1 : 2;
     ssize_t sent = -1;
     int savedError = 0;
@@ -812,6 +828,7 @@ static MacWSWindowTarget ProbeAppInputTarget(
         record->kind == MacWSInputKindKeyDown ||
         record->kind == MacWSInputKindKeyUp ||
         record->kind == MacWSInputKindScroll ||
+        record->kind == MacWSInputKindMagnify ||
         systemMenuActivation;
     if (target.pid <= 1 && allowActiveFallback) {
         if (!frontAmbiguous && frontTarget.pid > 1) {
@@ -1126,13 +1143,15 @@ int main(void) {
         bool keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
         bool scrollRecord = record.kind == MacWSInputKindScroll;
+        bool magnifyRecord = record.kind == MacWSInputKindMagnify;
+        bool gestureRecord = scrollRecord || magnifyRecord;
         if (exactWindowRecord) {
             // A native iPadOS Scene is permanently bound to one AppKit owner
             // and window. Do not let a stale fullscreen hover/menu cache route
             // its pointer or keyboard record into another application.
             eventTarget.pid = record.targetPID;
             eventTarget.windowID = (int32_t)exactWindowID;
-        } else if ((keyRecord || scrollRecord) && menuTarget.pid > 1) {
+        } else if ((keyRecord || gestureRecord) && menuTarget.pid > 1) {
             // ActivateTarget is resolved before the authoritative native
             // mouse-down and remains the front application target after the
             // menu candidate ends.  Keyboard focus follows that application,
@@ -1146,7 +1165,7 @@ int main(void) {
             // owner instead of starting a second main-thread probe just as
             // the application is about to enter its contextual-menu loop.
             eventTarget = menuTarget;
-        } else if ((keyRecord || scrollRecord) && hoverTarget.pid > 1) {
+        } else if ((keyRecord || gestureRecord) && hoverTarget.pid > 1) {
             eventTarget = hoverTarget;
         } else if (record.kind == MacWSInputKindMenuHover &&
             menuTarget.pid > 1) {
@@ -1174,7 +1193,7 @@ int main(void) {
                 if (record.kind == MacWSInputKindTouchDown ||
                     record.kind == MacWSInputKindTap ||
                     record.kind == MacWSInputKindSecondaryTap || keyRecord ||
-                    scrollRecord) {
+                    gestureRecord) {
                     eventTarget = ProbeAppInputTarget(targetSocketFD, &record);
                 } else if ((record.kind == MacWSInputKindHover ||
                             record.kind == MacWSInputKindMenuHover) &&
@@ -1192,6 +1211,20 @@ int main(void) {
             if (record.kind == MacWSInputKindTouchDown)
                 gestureTarget = eventTarget;
         }
+        // A native scroll/magnify gesture has one hit-tested owner from begin
+        // through its terminal phase.  Fullscreen Host records deliberately
+        // carry targetPID=0 so the first sample can hit Dock, Finder, a menu,
+        // or the actual AppKit window at that point.  Re-running SkyLight's
+        // routing query for every Changed sample both adds a synchronous IPC
+        // edge at touch cadence and can switch owners as content moves under
+        // a stationary finger.  Latch the first authoritative target exactly
+        // as mouse dragging already does, then clear it only at End/Cancel.
+        if (scrollRecord &&
+            (record.flags & MacWSInputFlagScrollBegan))
+            gestureTarget = eventTarget;
+        if (magnifyRecord &&
+            (record.flags & MacWSInputFlagGestureBegan))
+            gestureTarget = eventTarget;
         if (record.kind == MacWSInputKindActivateTarget)
             menuTarget = eventTarget;
         uint64_t captureGeneration = ArmCaptureForInput(&record);
@@ -1314,6 +1347,25 @@ int main(void) {
                     appBridgeSent ? "YES" : "NO", appBridgeError);
                 fflush(stderr);
             }
+            if (record.flags & (MacWSInputFlagScrollEnded |
+                                MacWSInputFlagScrollCancelled))
+                gestureTarget = (MacWSWindowTarget){0};
+            continue;
+        }
+        if (magnifyRecord) {
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT MAGNIFY seq=%llu target=%d phase=%#x "
+                    "amount=%.6f app-bridge=%s errno=%d\n",
+                    (unsigned long long)sequence, eventTarget.pid,
+                    record.flags, record.pressure,
+                    appBridgeSent ? "YES" : "NO", appBridgeError);
+                fflush(stderr);
+            }
+            if (record.flags & (MacWSInputFlagGestureEnded |
+                                MacWSInputFlagGestureCancelled))
+                gestureTarget = (MacWSWindowTarget){0};
             continue;
         }
         CGMouseButton mouseButton =

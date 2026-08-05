@@ -50,6 +50,16 @@
 @property(nonatomic) uint32_t subscribedWindowID;
 @property(nonatomic) BOOL subscriptionActive;
 @property(nonatomic) NSData *lastWindowCatalog;
+// DisplayStream is a realtime transport.  If UIKit's main thread is still
+// presenting frame N when N+1/N+2 arrive, replaying every stale frame adds
+// latency without adding visible information.  Keep only the newest base and
+// newest frame for each overlay until the next main-queue delivery.
+@property(nonatomic) MacWSSurfaceFrame *pendingBaseFrame;
+@property(nonatomic) NSMutableDictionary<NSNumber *, MacWSSurfaceFrame *> *pendingOverlayFrames;
+@property(nonatomic) BOOL frameDeliveryScheduled;
+@property(nonatomic) BOOL reconnectEnabled;
+@property(nonatomic) NSUInteger reconnectAttempt;
+@property(nonatomic) uint64_t reconnectGeneration;
 @end
 
 @implementation MacWSStreamClient
@@ -59,6 +69,8 @@
     if (self) {
         _queue = dispatch_queue_create("com.macwsguide.host.display-client",
                                        DISPATCH_QUEUE_SERIAL);
+        _pendingOverlayFrames = [NSMutableDictionary dictionary];
+        _reconnectEnabled = YES;
     }
     return self;
 }
@@ -128,8 +140,13 @@
         return;
     if (mode == MacWSStreamModeWindow && windowID == 0) return;
     dispatch_async(self.queue, ^{
+        self.reconnectEnabled = YES;
+        uint32_t normalizedWindowID = mode == MacWSStreamModeWindow
+            ? windowID : 0;
+        if (self.mode != mode || self.windowID != normalizedWindowID)
+            [self clearPendingFramesOnClientQueueReleasing:YES];
         self.mode = mode;
-        self.windowID = mode == MacWSStreamModeWindow ? windowID : 0;
+        self.windowID = normalizedWindowID;
         if (![self ensureConnection]) return;
         if (self.isConnected) [self sendSubscription];
     });
@@ -137,6 +154,7 @@
 
 - (void)requestWindowList {
     dispatch_async(self.queue, ^{
+        self.reconnectEnabled = YES;
         if (![self ensureConnection]) return;
         // Callers use an explicit list request as a synchronization barrier
         // after launch/reopen. The bytes may equal the last unsolicited
@@ -155,7 +173,10 @@
 
 - (void)unsubscribe {
     dispatch_async(self.queue, ^{
+        self.reconnectEnabled = NO;
+        self.reconnectGeneration++;
         self.subscriptionActive = NO;
+        [self clearPendingFramesOnClientQueueReleasing:YES];
         if (!self.connection) return;
         xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
         xpc_dictionary_set_string(request, MACWS_STREAM_KEY_OP,
@@ -181,13 +202,128 @@
     });
 }
 
+- (void)releaseTokenImmediatelyOnClientQueue:(uint64_t)leaseToken {
+    if (!leaseToken || !self.connection) return;
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(request, MACWS_STREAM_KEY_OP,
+                              MACWS_STREAM_OP_RELEASE_FRAME);
+    xpc_dictionary_set_uint64(request, MACWS_STREAM_KEY_LEASE_TOKEN,
+                              leaseToken);
+    xpc_connection_send_message(self.connection, request);
+}
+
+- (void)clearPendingFramesOnClientQueueReleasing:(BOOL)releaseFrames {
+    NSArray<MacWSSurfaceFrame *> *pending = nil;
+    @synchronized (self) {
+        NSMutableArray<MacWSSurfaceFrame *> *frames =
+            [NSMutableArray arrayWithCapacity:
+                self.pendingOverlayFrames.count + 1];
+        if (self.pendingBaseFrame) [frames addObject:self.pendingBaseFrame];
+        [frames addObjectsFromArray:self.pendingOverlayFrames.allValues];
+        pending = [frames copy];
+        self.pendingBaseFrame = nil;
+        [self.pendingOverlayFrames removeAllObjects];
+    }
+    if (releaseFrames) {
+        for (MacWSSurfaceFrame *frame in pending) {
+            [self releaseTokenImmediatelyOnClientQueue:
+                frame.descriptor.leaseToken];
+        }
+    }
+}
+
+- (void)enqueueFrameForMainDelivery:(MacWSSurfaceFrame *)frame {
+    BOOL overlay = (frame.descriptor.flags & MacWSStreamFrameOverlay) != 0;
+    MacWSSurfaceFrame *replaced = nil;
+    BOOL scheduleDelivery = NO;
+    @synchronized (self) {
+        if (overlay) {
+            NSNumber *key = @(frame.descriptor.layerWindowID);
+            replaced = self.pendingOverlayFrames[key];
+            self.pendingOverlayFrames[key] = frame;
+        } else {
+            replaced = self.pendingBaseFrame;
+            self.pendingBaseFrame = frame;
+        }
+        if (!self.frameDeliveryScheduled) {
+            self.frameDeliveryScheduled = YES;
+            scheduleDelivery = YES;
+        }
+    }
+    if (replaced) {
+        [self releaseTokenImmediatelyOnClientQueue:
+            replaced.descriptor.leaseToken];
+    }
+    if (!scheduleDelivery) return;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSArray<MacWSSurfaceFrame *> *frames = nil;
+        // Never synchronously enter the XPC receive queue from UIKit's main
+        // thread. Under an interactive 60-Hz stream that queue can be inside
+        // IOSurface import or lease bookkeeping, turning one busy producer
+        // callback into avoidable touch-to-present latency. A tiny object
+        // monitor protects only the pointer swap; frame parsing and Metal
+        // presentation remain outside the critical section.
+        @synchronized (strongSelf) {
+            NSMutableArray<MacWSSurfaceFrame *> *latest =
+                [NSMutableArray arrayWithCapacity:
+                    strongSelf.pendingOverlayFrames.count + 1];
+            if (strongSelf.pendingBaseFrame)
+                [latest addObject:strongSelf.pendingBaseFrame];
+            NSArray<MacWSSurfaceFrame *> *overlays =
+                [strongSelf.pendingOverlayFrames.allValues
+                    sortedArrayUsingComparator:^NSComparisonResult(
+                        MacWSSurfaceFrame *left,
+                        MacWSSurfaceFrame *right) {
+                    if (left.descriptor.layerLevel <
+                        right.descriptor.layerLevel) return NSOrderedAscending;
+                    if (left.descriptor.layerLevel >
+                        right.descriptor.layerLevel) return NSOrderedDescending;
+                    if (left.descriptor.layerWindowID <
+                        right.descriptor.layerWindowID) return NSOrderedAscending;
+                    if (left.descriptor.layerWindowID >
+                        right.descriptor.layerWindowID) return NSOrderedDescending;
+                    return NSOrderedSame;
+                }];
+            [latest addObjectsFromArray:overlays];
+            frames = [latest copy];
+            strongSelf.pendingBaseFrame = nil;
+            [strongSelf.pendingOverlayFrames removeAllObjects];
+            strongSelf.frameDeliveryScheduled = NO;
+        }
+        for (MacWSSurfaceFrame *latest in frames)
+            [strongSelf.delegate streamClient:strongSelf receivedFrame:latest];
+    });
+}
+
 - (void)invalidate {
     xpc_connection_t connection = self.connection;
     self.connection = nil;
     self.connected = NO;
     self.subscriptionActive = NO;
     self.lastWindowCatalog = nil;
+    self.reconnectEnabled = NO;
+    self.reconnectGeneration++;
+    dispatch_sync(self.queue, ^{
+        [self clearPendingFramesOnClientQueueReleasing:YES];
+    });
     if (connection) xpc_connection_cancel(connection);
+}
+
+- (void)scheduleReconnectOnClientQueue {
+    if (!self.reconnectEnabled || !self.mode || self.connection) return;
+    uint64_t generation = ++self.reconnectGeneration;
+    NSUInteger attempt = MIN(self.reconnectAttempt++, (NSUInteger)4);
+    uint64_t delayMilliseconds = 100ull << attempt; // 100ms ... 1.6s
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 delayMilliseconds * NSEC_PER_MSEC),
+                   self.queue, ^{
+        if (generation != self.reconnectGeneration ||
+            !self.reconnectEnabled || !self.mode || self.connection) return;
+        [self ensureConnection];
+    });
 }
 
 - (void)handleEvent:(xpc_object_t)event {
@@ -197,11 +333,13 @@
         self.connection = nil;
         self.subscriptionActive = NO;
         self.lastWindowCatalog = nil;
+        [self clearPendingFramesOnClientQueueReleasing:NO];
         if (connection) xpc_connection_cancel(connection);
         [self publishStatus:event == XPC_ERROR_CONNECTION_INTERRUPTED
             ? @"DisplayStream 连接中断，等待重新连接"
             : @"DisplayStream 服务离线"
                   connected:NO];
+        [self scheduleReconnectOnClientQueue];
         return;
     }
     if (!event || xpc_get_type(event) != XPC_TYPE_DICTIONARY) return;
@@ -215,6 +353,8 @@
             [self publishStatus:@"DisplayStream 协议版本不匹配" connected:NO];
             return;
         }
+        self.reconnectAttempt = 0;
+        self.reconnectGeneration++;
         [self publishStatus:@"DisplayStream IOSurface 直传已连接" connected:YES];
         if (self.mode) [self sendSubscription];
         [self requestWindowList];
@@ -322,9 +462,7 @@
     MacWSSurfaceFrame *frame = [[MacWSSurfaceFrame alloc]
         initWithDescriptor:descriptor surface:surface receiptTime:receiptTime];
     CFRelease(surface);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.delegate streamClient:self receivedFrame:frame];
-    });
+    [self enqueueFrameForMainDelivery:frame];
 }
 
 - (void)handleWindowsEvent:(xpc_object_t)event {

@@ -6,8 +6,12 @@
 
 // Product-level direct-touch thresholds. Keep these in a pure header so the
 // UIKit state machine and local boundary tests cannot silently diverge.
-#define MACWS_DIRECT_GESTURE_THRESHOLD_POINTS 6.0
+// Four UIKit points is enough to reject normal tap jitter on an 11-inch
+// iPad, while avoiding the extra display-frame of perceived latency that the
+// previous six-point gate added to slow, deliberate map/document pans.
+#define MACWS_DIRECT_GESTURE_THRESHOLD_POINTS 4.0
 #define MACWS_DIRECT_LONG_PRESS_SECONDS 0.45
+#define MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND 80.0
 
 // A dispatch_after callback is only a visual/feedback hint.  The Host main
 // queue can be busy presenting a large IOSurface when that callback becomes
@@ -18,6 +22,12 @@ static inline bool MacWSTouchReachedLongPress(double elapsedSeconds) {
     return elapsedSeconds >= MACWS_DIRECT_LONG_PRESS_SECONDS;
 }
 
+static inline bool MacWSShouldStartScrollMomentum(double velocityX,
+                                                  double velocityY) {
+    return hypot(velocityX, velocityY) >=
+        MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND;
+}
+
 typedef enum {
     MacWSTouchCandidateDecisionWait = 0,
     MacWSTouchCandidateDecisionTap,
@@ -25,14 +35,16 @@ typedef enum {
     MacWSTouchCandidateDecisionLongPress,
 } MacWSTouchCandidateDecision;
 
-// Once a direct-touch scroll has crossed the gesture threshold, keep it on
-// one axis for the lifetime of that gesture.  A slight vertical bias matches
-// the common iPad reading gesture and prevents hand jitter from producing a
-// horizontal wheel stream in editors and web pages.
+// Once a direct-touch scroll has crossed the gesture threshold, lock clearly
+// horizontal/vertical gestures for stable document scrolling, but preserve
+// both axes for genuinely diagonal direct manipulation.  Always forcing one
+// axis made Maps and 2-D canvases lag behind the finger because half of the
+// physical trajectory was discarded before AppKit ever saw it.
 typedef enum {
     MacWSDirectScrollAxisNone = 0,
     MacWSDirectScrollAxisHorizontal,
     MacWSDirectScrollAxisVertical,
+    MacWSDirectScrollAxisFree,
 } MacWSDirectScrollAxis;
 
 static inline MacWSDirectScrollAxis MacWSChooseDirectScrollAxis(
@@ -40,8 +52,9 @@ static inline MacWSDirectScrollAxis MacWSChooseDirectScrollAxis(
     double x = fabs(displacementX);
     double y = fabs(displacementY);
     if (x == 0.0 && y == 0.0) return MacWSDirectScrollAxisNone;
-    return y >= x * 0.75 ? MacWSDirectScrollAxisVertical
-                         : MacWSDirectScrollAxisHorizontal;
+    if (y >= x * 1.5) return MacWSDirectScrollAxisVertical;
+    if (x >= y * 1.5) return MacWSDirectScrollAxisHorizontal;
+    return MacWSDirectScrollAxisFree;
 }
 
 static inline void MacWSConstrainDirectScrollDelta(
@@ -55,15 +68,18 @@ static inline void MacWSConstrainDirectScrollDelta(
 
 static inline MacWSTouchCandidateDecision MacWSDecideTouchCandidate(
         double elapsedSeconds, double travelPoints, bool didEnd) {
-    // Direct touch is scroll-first: crossing the movement threshold before a
-    // hold becomes a native scroll gesture.  A stationary hold arms mouse
-    // dragging; the UIKit state machine decides on release whether an armed
-    // hold was a drag or a secondary click.  Check travel first so a delayed
-    // main-queue timer cannot reinterpret an already-moving finger as a hold.
-    if (travelPoints >= MACWS_DIRECT_GESTURE_THRESHOLD_POINTS)
-        return MacWSTouchCandidateDecisionScroll;
+    // UITouch.timestamp is the hardware event time, independent of when the
+    // main queue gets to process it.  A movement sample recorded after the
+    // hold threshold therefore means "hold, then move" and must arm a mouse
+    // drag even if dispatch_after's visual feedback callback was delayed.
+    // Movement whose hardware timestamp is still before the threshold remains
+    // scroll-first. Once scrolling starts the UIKit state machine no longer
+    // asks this candidate policy, so a long continuous scroll cannot turn
+    // into a drag when its total duration later crosses the hold threshold.
     if (MacWSTouchReachedLongPress(elapsedSeconds))
         return MacWSTouchCandidateDecisionLongPress;
+    if (travelPoints >= MACWS_DIRECT_GESTURE_THRESHOLD_POINTS)
+        return MacWSTouchCandidateDecisionScroll;
     return didEnd ? MacWSTouchCandidateDecisionTap
                   : MacWSTouchCandidateDecisionWait;
 }

@@ -26,6 +26,14 @@ KEY_DOWN = 11
 KEY_UP = 12
 SECONDARY_TAP = 13
 SCROLL = 14
+MAGNIFY = 19
+
+GESTURE_BEGAN = 1 << 8
+GESTURE_CHANGED = 1 << 9
+GESTURE_ENDED = 1 << 10
+LATENCY_DIAGNOSTIC = 1 << 15
+SCROLL_MOMENTUM = 1 << 12
+SCROLL_WILL_MOMENTUM = 1 << 7
 
 SOURCE_FINGER = 1
 SOURCE_HARDWARE_KEYBOARD = 4
@@ -51,12 +59,13 @@ def scene_for_window(window_id, modifiers=0):
 
 
 def record(kind, sequence, pid, window_id, width, height, x, y,
-           pressure=0.0, contact=0, source=SOURCE_FINGER, modifiers=0):
+           pressure=0.0, contact=0, source=SOURCE_FINGER, modifiers=0,
+           flags=0):
     return RECORD.pack(
         INPUT_MAGIC, INPUT_VERSION, kind,
         scene_for_window(window_id, modifiers), uptime(),
         float(x), float(y), float(pressure), contact & 0xFFFFFFFF,
-        width, height, pid, source, 0, 0,
+        width, height, pid, source, flags, 0,
         0.0, 0.0, 0.0, 0.0, sequence, 0)
 
 
@@ -93,8 +102,10 @@ def resolve_window(pid, requested, timeout=5.0):
         raise RuntimeError(f"no window metrics entry for pid {pid}")
     magic, version, header_size, entry_size, entry_count, generation = \
         struct.unpack_from("<IHHIIQ", payload)
-    if (magic != 0x4D57474D or version != 1 or header_size != 24 or
-            entry_size != 16 or entry_count < 1 or generation == 0):
+    expected_size = header_size + entry_count * entry_size
+    if (magic != 0x4D57474D or version != 2 or header_size != 24 or
+            entry_size != 20 or entry_count < 1 or generation == 0 or
+            len(payload) != expected_size):
         raise RuntimeError(f"invalid window metrics for pid {pid}")
     return struct.unpack_from("<I", payload, header_size)[0]
 
@@ -122,6 +133,10 @@ def main():
                         help="AppKit window number; 0 discovers it from metrics")
     parser.add_argument("--width", type=int, default=1728)
     parser.add_argument("--height", type=int, default=1312)
+    parser.add_argument(
+        "--global-route", action="store_true",
+        help=("send fullscreen targetPID=0/window=0 records so macwsinputd "
+              "must hit-test and latch the native gesture owner"))
     parser.add_argument("--socket",
                         default="/var/mnt/rootfs/private/tmp/macws_host_input.sock")
     parser.add_argument("--log",
@@ -131,6 +146,15 @@ def main():
     if args.pid <= 1 or args.window < 0 or args.width <= 0 or args.height <= 0:
         parser.error("pid/geometry must be positive and window nonnegative")
     args.window = resolve_window(args.pid, args.window)
+    route_pid = 0 if args.global_route else args.pid
+    route_window = 0 if args.global_route else args.window
+
+    # Every assertion below describes this invocation only.  Keeping stale
+    # InputLab events makes an ordered-name check pass before a new record has
+    # traversed the bridge and also corrupts the exact keyboard/magnify value
+    # comparisons.
+    with open(args.log, "w", encoding="utf-8"):
+        pass
 
     try:
         os.unlink("/tmp/macws_host_input_matrix.sock")
@@ -143,7 +167,7 @@ def main():
     def send(kind, x, y, **kwargs):
         nonlocal sequence
         sequence += 1
-        sock.sendto(record(kind, sequence, args.pid, args.window,
+        sock.sendto(record(kind, sequence, route_pid, route_window,
                            args.width, args.height, x, y, **kwargs),
                     args.socket)
 
@@ -167,9 +191,58 @@ def main():
     wait_for(sock, ["right_down", "right_up"], args.log,
              time.time() + args.timeout)
 
-    horizontal_bits = struct.unpack("<I", struct.pack("<f", 13.0))[0]
-    send(SCROLL, 900, 500, pressure=-31.0, contact=horizontal_bits)
-    wait_for(sock, ["scroll"], args.log, time.time() + args.timeout)
+    # Exercise a real phased gesture.  In fullscreen mode the begin must
+    # resolve the window under the finger once; every changed/end record must
+    # stay latched to that same AppKit owner without another SkyLight query.
+    send(SCROLL, 900, 500, flags=GESTURE_BEGAN)
+    horizontal_bits = struct.unpack("<I", struct.pack("<f", 1.5))[0]
+    for _ in range(8):
+        send(SCROLL, 900, 500, pressure=-4.0,
+             contact=horizontal_bits, flags=GESTURE_CHANGED)
+        time.sleep(1.0 / 120.0)
+    send(SCROLL, 900, 500, flags=GESTURE_ENDED)
+    deadline = time.time() + args.timeout
+    scroll_events = []
+    while time.time() < deadline:
+        scroll_events = load_events(args.log)
+        if any(event.get("event") == "scroll" and
+               event.get("phase") == 8 for event in scroll_events):
+            break
+        time.sleep(0.02)
+    scroll_phases = [event.get("phase") for event in scroll_events
+                     if event.get("event") == "scroll"]
+    if not scroll_phases or scroll_phases[0] != 1 or \
+            scroll_phases[-1] != 8 or 4 not in scroll_phases:
+        raise RuntimeError(f"scroll phase mismatch values={scroll_phases}")
+
+    gesture_contact = 0x50494E43  # "PINC"
+    send(MAGNIFY, 900, 500, contact=gesture_contact,
+         flags=GESTURE_BEGAN)
+    send(MAGNIFY, 900, 500, pressure=0.125, contact=gesture_contact,
+         flags=GESTURE_CHANGED)
+    wait_for(sock, ["magnify", "magnify"], args.log,
+             time.time() + args.timeout)
+    send(MAGNIFY, 900, 500, pressure=-0.0625, contact=gesture_contact,
+         flags=GESTURE_CHANGED)
+    send(MAGNIFY, 900, 500, contact=gesture_contact,
+         flags=GESTURE_ENDED)
+    magnify_events = wait_for(
+        sock, ["magnify", "magnify", "magnify", "magnify"],
+        args.log, time.time() + args.timeout)
+    magnifications = [event.get("magnification") for event in magnify_events
+                      if event.get("event") == "magnify"]
+    expected_magnifications = [0.0, 0.125, -0.0625, 0.0]
+    if (len(magnifications) != len(expected_magnifications) or
+            any(abs(actual - expected) > 1e-6
+                for actual, expected in zip(
+                    magnifications, expected_magnifications))):
+        raise RuntimeError(
+            f"magnify semantic mismatch values={magnifications}")
+    magnify_phases = [event.get("phase") for event in magnify_events
+                      if event.get("event") == "magnify"]
+    if magnify_phases != [1, 4, 4, 8]:
+        raise RuntimeError(
+            f"magnify phase mismatch values={magnify_phases}")
 
     keys = [
         (0, ord("a"), 0),
@@ -219,12 +292,17 @@ def main():
         "transport": "MacWSInputRecord-v4 (no RFB)",
         "pid": args.pid,
         "window": args.window,
+        "route": "fullscreen-global-hit-test" if args.global_route
+                 else "exact-window",
         "frame": [args.width, args.height],
         "records_sent": sequence,
         "events_received": len(relevant),
         "events": [event.get("event") for event in relevant],
         "keyboard_characters": actual_characters,
         "keyboard_modifiers": actual_modifiers,
+        "magnifications": magnifications,
+        "magnify_phases": magnify_phases,
+        "scroll_phases": scroll_phases,
         "command_key_up": "delivered to NSApplication; consumed before responder",
         "latency_ms": {
             "minimum": min(latencies) if latencies else None,

@@ -95,6 +95,11 @@ enum {
     // handle applicationShouldHandleReopen:hasVisibleWindows: on the main
     // thread; no application-specific window is synthesized.
     MacWSInputKindReopenApplication = 18,
+    // Native AppKit magnification gesture. pressure carries the incremental
+    // magnification delta (for example +0.05 means 5% larger), contactID is a
+    // stable identity for the gesture, and the phase reuses the scroll-phase
+    // flag bits below. The wire record stays ABI-compatible at 84 bytes.
+    MacWSInputKindMagnify = 19,
 };
 
 typedef uint16_t MacWSHostInputMode;
@@ -145,11 +150,22 @@ enum {
     MacWSInputFlagEstimatedPressure = 1u << 2,
     MacWSInputFlagExpectingLocationUpdate = 1u << 3,
     MacWSInputFlagExpectingPressureUpdate = 1u << 4,
+    // The producer has already accepted the release velocity and will follow
+    // this finger ScrollEnded record with a momentum Began sequence. The AppKit
+    // endpoint keeps its native per-window scroll target latched across that
+    // boundary; without this explicit contract it must end the session now.
+    MacWSInputFlagScrollWillMomentum = 1u << 7,
     MacWSInputFlagScrollBegan = 1u << 8,
     MacWSInputFlagScrollChanged = 1u << 9,
     MacWSInputFlagScrollEnded = 1u << 10,
     MacWSInputFlagScrollCancelled = 1u << 11,
     MacWSInputFlagScrollMomentum = 1u << 12,
+    // These aliases describe the same NSEventPhase state machine for native
+    // magnification without allocating another set of wire bits.
+    MacWSInputFlagGestureBegan = MacWSInputFlagScrollBegan,
+    MacWSInputFlagGestureChanged = MacWSInputFlagScrollChanged,
+    MacWSInputFlagGestureEnded = MacWSInputFlagScrollEnded,
+    MacWSInputFlagGestureCancelled = MacWSInputFlagScrollCancelled,
     // ConfigureWindow requests from an exact native Host Scene anchor the
     // represented AppKit window at the upper-left of its real NSScreen. This
     // makes AppKit constrain popovers against the same screen edge that bounds
@@ -160,6 +176,9 @@ enum {
     // frame; right anchoring therefore keeps a right-edge popup inside the
     // exact-window DisplayStream instead of clipping it past the Scene edge.
     MacWSInputFlagConfigureAnchorTopRight = 1u << 14,
+    // Bounded lab probes may request latency aggregation at the receiving
+    // AppInput endpoint. Production UIKit/VNC producers leave this clear.
+    MacWSInputFlagLatencyDiagnostic = 1u << 15,
 };
 
 // Versioned wire record for the iOS-host -> macOS event bridge.

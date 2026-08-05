@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-04；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口；证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-06；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口；证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。2026-08-06 的真实手指验收确认弹出菜单和单指滚动惯性均达到预期；长按拖动的全屏坐标负反馈根因已用运行轨迹确认并修复部署，等待修复后的真实手指最终复验。四窗与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -178,6 +178,14 @@ macOS 的显示缩放主要是显示级配置，并不适合在四个独立 Scen
 - 武装后不移动直接抬起：发送一个原子右键单击。这样长按右键与长按后拖动共享前半段，但不会互相抢占。
 - 第二根手指加入会取消候选；若左键拖动已经开始，Host 发送 cancel。这样双指滚动/放大不会留下卡住的按钮状态。
 - 适合经过触屏密度放大的按钮、列表、标签页、拖动目标和右键菜单。450 ms 与 6 pt 是产品阈值，设备测试后可以统一调整，不能在各手势回调里复制不同常量。
+
+**2026-08-06 手势事务证据与长按拖动修复**
+
+- 用户在目标 iPad 的真实手指验收中确认：弹出菜单点击和单指滚动惯性均“工作得非常完美”。这两项可以视为产品交互验收，不再只依赖自动事件探针。
+- runtime-confirmed via `/var/mobile/Library/Logs/MacWSHost.log`：修复前同一次全屏标题栏拖动中，layer destination 从 `x=310 → 334 → 384` 变化，而 Host 把手指桌面坐标 `800 → 850 → 900 → 950 → 1000` 映射成局部 `490 → 540 → 566 → 616 → 616`。后两次手指仍向右，局部坐标却停止推进，直接解释了窗口左右往返。
+- 根因不是手势阈值，也不是丢帧：全屏 Host 已在 Begin 保存 `_fullscreenGestureRouteDescriptor`，但 continuation 错误地优先读取移动后的 live descriptor；接收端同时正确冻结 down-time NSWindow 映射，于是上一事件产生的窗口位移在下一事件中被反向减掉。
+- 修复后每个连续手势以 Begin 的 descriptor 和 contact 为唯一坐标所有者。runtime-confirmed：同一测试序列的四个 move 始终保持 frozen destination `(0,50 2484×1502)`，局部 x 严格为 `800 → 850 → 900 → 950 → 1000`，直到相同 contact 的 up 才释放；纯 C 回归另覆盖“live destination 已移动 50 px，但 frozen mapping 仍重建正确桌面点”的不变量。
+- 单窗 Scene 的几何事务也不再盲目重放：ConfigureWindow 发出后，以新 DisplayStream IOSurface 的逻辑尺寸作为可见 ACK，尺寸匹配即取消 350 ms/1.2 s/3 s 重试；手指接触开始也会取消遗留 settlement，防止标题栏拖动期间被右上角 anchor 拉回。这里验证的是下游可见帧，不以进程存活冒充成功。
 
 **精确触控板**
 

@@ -1143,7 +1143,7 @@ static BOOL TerminateWindowlessRootExecutable(pid_t pid, NSString *rootPath,
             @"无窗口实例无法正常退出（PID %d，errno=%d）", pid, errno];
         return NO;
     }
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:3.0];
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.4];
     while (deadline.timeIntervalSinceNow > 0) {
         errno = 0;
         if (kill(pid, 0) != 0 && errno == ESRCH) {
@@ -1153,12 +1153,13 @@ static BOOL TerminateWindowlessRootExecutable(pid_t pid, NSString *rootPath,
         }
         usleep(50000);
     }
-    // Runtime-confirmed with Terminal on 2026-07-31: after its last NSWindow
-    // performed the ordinary close action, SIGTERM left the zero-window
-    // process alive indefinitely. At this point the exact executable has had
-    // both a three-second zero-window witness and a three-second graceful
-    // termination grace period. Force-retiring that UI-less instance is the
-    // bounded final step of this launch transaction, not a process-uptime
+    // Runtime-confirmed with Terminal on 2026-07-31 and again on 2026-08-06:
+    // after its last NSWindow performed the ordinary close action, SIGTERM
+    // leaves the zero-window process alive; waiting three seconds changed no
+    // state and directly inflated the next launch. The app has already failed
+    // its real metrics + AppKit reopen transaction before this helper runs, so
+    // retain a bounded 400-ms cooperative grace and then retire that exact
+    // executable. This remains a final lifecycle step, not a process-uptime
     // substitute for window health.
     HostLog(@"launch-app windowless-retire pid=%d executable=%@ signal=KILL "
             "reason=term-timeout", pid, rootPath);
@@ -1167,7 +1168,7 @@ static BOOL TerminateWindowlessRootExecutable(pid_t pid, NSString *rootPath,
             @"无窗口实例无法清理（PID %d，errno=%d）", pid, errno];
         return NO;
     }
-    deadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
+    deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
     while (deadline.timeIntervalSinceNow > 0) {
         errno = 0;
         if (kill(pid, 0) != 0 && errno == ESRCH) {
@@ -1455,13 +1456,30 @@ static BOOL LaunchRootExecutable(const char *identifier,
         // application main queue stopped publishing.  Require a fresh
         // generation produced after the exact reopen request; PID uptime or a
         // stale Visible bit is not a launch-success witness.
+        // A current visible metrics entry is an immediate reuse witness; a
+        // generic AppKit process with zero windows must receive the same real
+        // reopen lifecycle as a Dock/open request before it is discarded.
+        // Runtime-confirmed with Terminal pid 99506 on 2026-08-06: the app was
+        // healthy and idle in NSApplication.run with a live AppInput endpoint,
+        // and one ReopenApplication record published its normal Terminal
+        // window. The old three-second metrics-only wait could never change a
+        // windowless process and was followed by another three-second TERM
+        // timeout. Use that upstream lifecycle for every ordinary AppKit app;
+        // Finder retains its native Command-N browser transaction below.
         BOOL existingWindow = reopenLifecycle
             ? RequestApplicationReopen(existingPID, 8.0)
-            : WaitForWindowMetrics(existingPID, 3.0, &exitStatus);
+            : WaitForWindowMetrics(existingPID, 0.15, &exitStatus);
         if (existingWindow && strcmp(identifier, "system-settings") == 0)
             existingWindow = WaitForSystemSettingsContent(12.0);
         if (!existingWindow && finder)
             existingWindow = RequestFinderBrowserWindow(existingPID, 8.0);
+        if (!existingWindow && !finder && !reopenLifecycle)
+            // Runtime-confirmed on Terminal pid 14367 (2026-08-06): a
+            // successful AppKit reopen publishes its window metrics within
+            // 400 ms.  A zero-window instance that has not answered after one
+            // second never answered during the old 2.5-second grace either;
+            // the additional wait only delayed the replacement launch.
+            existingWindow = RequestApplicationReopen(existingPID, 1.0);
         if (!existingWindow) {
             // Runtime-confirmed on the default Terminal bootstrap: closing
             // its last represented iPad Scene leaves a healthy process with

@@ -47,6 +47,7 @@ typedef BOOL (*MacWSMsgBoolSELIDID)(id, SEL, SEL, id, id);
 typedef void (*MacWSMsgVoid)(id, SEL);
 typedef void (*MacWSMsgVoidBool)(id, SEL, BOOL);
 typedef void (*MacWSMsgVoidID)(id, SEL, id);
+typedef void (*MacWSMsgVoidIDBool)(id, SEL, id, BOOL);
 typedef void (*MacWSMsgVoidRectBoolBool)(id, SEL, CGRect, BOOL, BOOL);
 typedef double (*MacWSMsgDouble)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
@@ -57,6 +58,7 @@ typedef id (*MacWSKeyEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
                                    NSTimeInterval, NSInteger, id, id, id,
                                    BOOL, unsigned short);
 typedef const void *MacWSCGEventRef;
+typedef MacWSCGEventRef (*MacWSCreateCGEvent)(const void *);
 typedef MacWSCGEventRef (*MacWSCreateKeyboardCGEvent)(
     const void *, unsigned short, bool);
 typedef MacWSCGEventRef (*MacWSCreateMouseCGEvent)(
@@ -68,11 +70,13 @@ typedef MacWSCGEventRef (*MacWSCreateScrollWheelCGEvent2)(
 typedef void (*MacWSSetCGEventFlags)(MacWSCGEventRef, uint64_t);
 typedef void (*MacWSSetCGEventLocation)(MacWSCGEventRef, CGPoint);
 typedef void (*MacWSSetCGEventTimestamp)(MacWSCGEventRef, uint64_t);
+typedef void (*MacWSSetCGEventType)(MacWSCGEventRef, uint32_t);
 typedef void (*MacWSSetCGEventUnicode)(MacWSCGEventRef, size_t,
                                       const unichar *);
 typedef void (*MacWSSetCGEventIntegerField)(MacWSCGEventRef, uint32_t,
                                             int64_t);
 typedef void (*MacWSSetCGEventDoubleField)(MacWSCGEventRef, uint32_t, double);
+typedef void *(*MacWSSLEventRecordPointer)(MacWSCGEventRef);
 typedef void (*MacWSPostCGEvent)(uint32_t, MacWSCGEventRef);
 // CGRemoteOperation.h declares mouseButtonDown as a fixed boolean_t argument;
 // only buttons 2+ are variadic.  This distinction is load-bearing on arm64:
@@ -101,10 +105,12 @@ static char MacWSAppInputPath[sizeof(((struct sockaddr_un *)0)->sun_path)];
 static char MacWSWindowMetricsPath[PATH_MAX];
 static NSData *MacWSLastWindowMetricsEntries;
 static uint64_t MacWSWindowMetricsGeneration;
+static NSMutableArray *MacWSWindowGeometryObserverTokens;
 static void MacWSPublishWindowMetrics(void);
 static void MacWSNotifyDisplayCatalogChanged(uint8_t reason);
 static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
                                               CGRect appliedFrame);
+static void MacWSInstallWindowGeometryObservers(void);
 // Main-thread-only semantic menu snapshot cache. ObjC objects never cross the
 // process boundary: Host receives generation-scoped integer IDs, while the
 // target process retains the corresponding item and index path solely long
@@ -164,6 +170,14 @@ typedef struct {
     CFTypeRef application;
 } MacWSDirectTrackingContext;
 static MacWSDirectTrackingContext MacWSAppInputDirectContext;
+// Native non-client tracking (title bar, traffic-light controls and resize
+// chrome) belongs to WindowServer, not an NSView responder.  Once a verified
+// exact-window down enters CGPostMouseEvent, keep its move/up records on that
+// same system route so the button cannot be stranded halfway through a drag.
+static BOOL MacWSExactSystemPointerActive;
+static uint32_t MacWSExactSystemPointerContact;
+static uint32_t MacWSExactSystemPointerWindow;
+static CGRect MacWSExactSystemPointerMappingFrame;
 
 static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
     static _Atomic int cached = -1;
@@ -181,6 +195,81 @@ static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
+}
+
+static double MacWSInputUptimeSeconds(void) {
+#ifdef CLOCK_UPTIME_RAW
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_UPTIME_RAW, &now) == 0)
+        return (double)now.tv_sec + (double)now.tv_nsec / 1.0e9;
+#endif
+    return [[NSProcessInfo processInfo] systemUptime];
+}
+
+typedef struct {
+    MacWSInputKind kind;
+    uint32_t count;
+    uint32_t firstSequence;
+    uint32_t lastSequence;
+    double transportTotalUS;
+    double transportMaximumUS;
+    double queueTotalUS;
+    double queueMaximumUS;
+    double dispatchTotalUS;
+    double dispatchMaximumUS;
+} MacWSInputLatencyAggregate;
+
+// Main-thread-only, opt-in latency witness. It records the producer
+// timestamp, AppInput socket receipt, main-runloop dispatch and generic
+// NSWindow event-dispatch duration without enabling the high-volume runtime
+// diagnostics that would perturb the measurement itself.
+static MacWSInputLatencyAggregate MacWSInputLatency;
+
+static void MacWSRecordInputLatency(MacWSInputRecord record,
+                                    double mainStart,
+                                    double dispatchEnd) {
+    if (!(record.flags & MacWSInputFlagLatencyDiagnostic)) return;
+    BOOL began = (record.flags & MacWSInputFlagGestureBegan) != 0;
+    BOOL terminal = (record.flags & (MacWSInputFlagGestureEnded |
+                                     MacWSInputFlagGestureCancelled)) != 0;
+    if (began || MacWSInputLatency.kind != record.kind) {
+        MacWSInputLatency = (MacWSInputLatencyAggregate){
+            .kind = (MacWSInputKind)record.kind,
+            .firstSequence = record.sampleSequence,
+        };
+    }
+    double totalUS = fmax(0.0, (mainStart - record.timestamp) * 1.0e6);
+    double transportUS = record.reserved;
+    double queueUS = fmax(0.0, totalUS - transportUS);
+    double dispatchUS = fmax(0.0, (dispatchEnd - mainStart) * 1.0e6);
+    MacWSInputLatency.count++;
+    MacWSInputLatency.lastSequence = record.sampleSequence;
+    MacWSInputLatency.transportTotalUS += transportUS;
+    MacWSInputLatency.transportMaximumUS = fmax(
+        MacWSInputLatency.transportMaximumUS, transportUS);
+    MacWSInputLatency.queueTotalUS += queueUS;
+    MacWSInputLatency.queueMaximumUS = fmax(
+        MacWSInputLatency.queueMaximumUS, queueUS);
+    MacWSInputLatency.dispatchTotalUS += dispatchUS;
+    MacWSInputLatency.dispatchMaximumUS = fmax(
+        MacWSInputLatency.dispatchMaximumUS, dispatchUS);
+    if (terminal && MacWSInputLatency.count != 0) {
+        double count = MacWSInputLatency.count;
+        fprintf(stderr,
+            "#### APP-INPUT LATENCY pid=%d kind=%u samples=%u seq=%u..%u "
+            "transport-us(avg/max)=%.1f/%.1f queue-us(avg/max)=%.1f/%.1f "
+            "dispatch-us(avg/max)=%.1f/%.1f\n",
+            getpid(), MacWSInputLatency.kind, MacWSInputLatency.count,
+            MacWSInputLatency.firstSequence,
+            MacWSInputLatency.lastSequence,
+            MacWSInputLatency.transportTotalUS / count,
+            MacWSInputLatency.transportMaximumUS,
+            MacWSInputLatency.queueTotalUS / count,
+            MacWSInputLatency.queueMaximumUS,
+            MacWSInputLatency.dispatchTotalUS / count,
+            MacWSInputLatency.dispatchMaximumUS);
+        fflush(stderr);
+    }
 }
 
 static void MacWSTrackOrderedWindow(id window) {
@@ -290,6 +379,21 @@ static BOOL MacWSAppInputMenuContextValid;
 // front Terminal window synchronously; re-hit-testing the up then targeted the
 // newly exposed window (23 -> 6), splitting one gesture across two windows.
 static CFTypeRef MacWSAppInputGestureWindow;
+// Exact Host gestures are already routed against the DisplayStream layer
+// graph before they enter this process.  Retain both the requested base
+// window (the coordinate-space anchor) and the one real transient/base window
+// selected at gesture begin.  Changed samples can then preserve AppKit's
+// normal gesture ownership without repeating +[NSWindow
+// windowNumberAtPoint:belowWindowWithWindowNumber:], a synchronous SkyLight
+// round trip, at touch-display cadence.
+static CFTypeRef MacWSAppInputGestureBaseWindow;
+static uint32_t MacWSAppInputGestureBaseWindowNumber;
+// Process-local CG scroll events never pass through WindowServer's hardware
+// event queue, which normally owns NSWindow's latched scroll target. Keep the
+// corresponding AppKit session balanced across the finger -> momentum split.
+// Main-thread only.
+static CFTypeRef MacWSAppInputScrollSessionWindow;
+static uint64_t MacWSAppInputScrollSessionGeneration;
 // Main-thread-only diagnostic witness for whether the real hit NSControl
 // changed state after AppKit dispatch. It is observational: no setter/action
 // is called by the bridge.
@@ -1079,6 +1183,65 @@ static void MacWSSetAppInputGestureWindow(id window) {
     CFTypeRef previous = MacWSAppInputGestureWindow;
     MacWSAppInputGestureWindow = replacement;
     if (previous) CFRelease(previous);
+    if (!window) {
+        CFTypeRef previousBase = MacWSAppInputGestureBaseWindow;
+        MacWSAppInputGestureBaseWindow = NULL;
+        MacWSAppInputGestureBaseWindowNumber = 0;
+        if (previousBase) CFRelease(previousBase);
+    }
+}
+
+static void MacWSSetAppInputGestureRoute(id baseWindow, id targetWindow,
+                                         uint32_t baseWindowNumber) {
+    CFTypeRef replacementBase = baseWindow
+        ? CFRetain((__bridge CFTypeRef)baseWindow) : NULL;
+    CFTypeRef previousBase = MacWSAppInputGestureBaseWindow;
+    MacWSAppInputGestureBaseWindow = replacementBase;
+    MacWSAppInputGestureBaseWindowNumber = replacementBase
+        ? baseWindowNumber : 0;
+    if (previousBase) CFRelease(previousBase);
+    MacWSSetAppInputGestureWindow(targetWindow);
+}
+
+static void MacWSEndAppInputScrollSession(void) {
+    id window = (__bridge id)MacWSAppInputScrollSessionWindow;
+    MacWSAppInputScrollSessionGeneration++;
+    if (window) {
+        SEL didEnd = sel_registerName("_didEndViewScrolling");
+        if (((MacWSMsgBoolSEL)objc_msgSend)(
+                window, sel_registerName("respondsToSelector:"), didEnd)) {
+            ((MacWSMsgVoid)objc_msgSend)(window, didEnd);
+        }
+    }
+    CFTypeRef previous = MacWSAppInputScrollSessionWindow;
+    MacWSAppInputScrollSessionWindow = NULL;
+    if (previous) CFRelease(previous);
+}
+
+static void MacWSBeginAppInputScrollSession(id window) {
+    if ((__bridge id)MacWSAppInputScrollSessionWindow != window)
+        MacWSEndAppInputScrollSession();
+    if (!MacWSAppInputScrollSessionWindow) {
+        MacWSAppInputScrollSessionWindow = window
+            ? CFRetain((__bridge CFTypeRef)window) : NULL;
+        SEL willBegin = sel_registerName("_willBeginViewScrolling");
+        if (window && ((MacWSMsgBoolSEL)objc_msgSend)(
+                window, sel_registerName("respondsToSelector:"), willBegin)) {
+            ((MacWSMsgVoid)objc_msgSend)(window, willBegin);
+        }
+    }
+    MacWSAppInputScrollSessionGeneration++;
+}
+
+static void MacWSScheduleAppInputScrollSessionTimeout(id window) {
+    uint64_t generation = MacWSAppInputScrollSessionGeneration;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (MacWSAppInputScrollSessionGeneration == generation &&
+            (__bridge id)MacWSAppInputScrollSessionWindow == window) {
+            MacWSEndAppInputScrollSession();
+        }
+    });
 }
 
 static void MacWSSetAppInputGestureHitView(id view) {
@@ -1096,7 +1259,8 @@ static void MacWSSetAppInputGestureHitView(id view) {
 
 static void MacWSLogAppInputGestureHitResult(const char *phase,
                                              uint32_t gesture) {
-    if (!MacWSRuntimeDiagnosticsEnabled()) return;
+    if (!MacWSRuntimeDiagnosticsEnabled() &&
+        gesture != MACWS_INPUT_CONTACT_DIAGNOSTIC) return;
     id view = (__bridge id)MacWSAppInputGestureHitView;
     if (!view) return;
     BOOL enabled = ![view respondsToSelector:sel_registerName("isEnabled")] ||
@@ -1416,9 +1580,11 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindKeyDown:
         case MacWSInputKindKeyUp:
         case MacWSInputKindScroll:
+        case MacWSInputKindMagnify:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
+        case MacWSInputKindReopenApplication:
             return 0; // control-plane only; handled before event construction
     }
     return 0;
@@ -1879,10 +2045,20 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
             fabsf(record->pressure) > 16384.0f ||
             fabsf(horizontal) > 16384.0f) return NO;
     }
+    if (record->kind == MacWSInputKindMagnify) {
+        uint16_t phase = record->flags &
+            (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+             MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+        if (!isfinite(record->pressure) || fabsf(record->pressure) > 4.0f ||
+            (phase != MacWSInputFlagGestureBegan &&
+             phase != MacWSInputFlagGestureChanged &&
+             phase != MacWSInputFlagGestureEnded &&
+             phase != MacWSInputFlagGestureCancelled)) return NO;
+    }
     return
         record->version == MACWS_INPUT_VERSION &&
         record->kind >= MacWSInputKindTouchDown &&
-        record->kind <= MacWSInputKindScroll &&
+        record->kind <= MacWSInputKindMagnify &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -1898,6 +2074,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
 // action or changing the target window's state directly.
 static id MacWSCreateAppScrollEvent(Class eventClass,
                                     MacWSInputRecord record,
+                                    id window,
                                     CGPoint windowPoint,
                                     CGRect screenFrame,
                                     NSInteger windowNumber) {
@@ -1956,17 +2133,35 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
     if (setFlags) setFlags(cgEvent,
         MacWSInputModifiersForScene(record.sceneID));
     if (setInteger) {
-        uint64_t phase = 0;
-        if (record.flags & MacWSInputFlagScrollBegan) phase = 1;
-        else if (record.flags & MacWSInputFlagScrollChanged) phase = 4;
-        else if (record.flags & MacWSInputFlagScrollEnded) phase = 8;
-        else if (record.flags & MacWSInputFlagScrollCancelled) phase = 16;
+        // CGEvent's private scroll fields consume CGScrollPhase, not
+        // NSEventPhase.  The encodings diverge after Began:
+        //   CGScrollPhase    Began/Changed/Ended/Cancelled = 1/2/4/8
+        //   NSEventPhase     Began/Changed/Ended/Cancelled = 1/4/8/16
+        // Runtime InputLab evidence on Ventura 13.4 was exact: writing the
+        // old 1/4/8/16 sequence produced NSEvent phases 1/8/16, so every
+        // Changed sample terminated the gesture and the final End became a
+        // cancellation.  Encode the producer's semantic phase in the field's
+        // actual ABI and let AppKit perform its normal CG -> NSEvent mapping.
+        uint64_t scrollPhase = 0;
+        uint64_t momentumPhase = 0;
+        if (record.flags & MacWSInputFlagScrollBegan) {
+            scrollPhase = 1;
+            momentumPhase = 1; // kCGMomentumScrollPhaseBegin
+        } else if (record.flags & MacWSInputFlagScrollChanged) {
+            scrollPhase = 2;
+            momentumPhase = 2; // kCGMomentumScrollPhaseContinue
+        } else if (record.flags & (MacWSInputFlagScrollEnded |
+                                   MacWSInputFlagScrollCancelled)) {
+            scrollPhase = (record.flags & MacWSInputFlagScrollEnded) ? 4 : 8;
+            momentumPhase = 3; // kCGMomentumScrollPhaseEnd
+        }
         setInteger(cgEvent, 88 /* kCGScrollWheelEventIsContinuous */, 1);
         if (record.flags & MacWSInputFlagScrollMomentum) {
             setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */, 0);
-            setInteger(cgEvent, 123 /* ...MomentumPhase */, phase);
+            setInteger(cgEvent, 123 /* ...MomentumPhase */, momentumPhase);
         } else {
-            setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */, phase);
+            setInteger(cgEvent, 99 /* kCGScrollWheelEventScrollPhase */,
+                       scrollPhase);
             setInteger(cgEvent, 123 /* ...MomentumPhase */, 0);
         }
         if (windowNumber > 0) {
@@ -1980,6 +2175,191 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
     id event = ((MacWSEventFromCGEvent)objc_msgSend)(
         (id)eventClass, eventWithCGEvent, cgEvent);
     CFRelease(cgEvent);
+    if (!event) return nil;
+    // Like the gesture family below, eventWithCGEvent: does not import fields
+    // 91/92 into NSEvent's target-window state in this launchd/chroot session.
+    // The public NSWindow dispatcher can geometrically recover an ordinary
+    // finger scroll, but its inner momentum path requires the queue-associated
+    // window that a hardware event normally carries. Resolve the named Ventura
+    // ivars, fill that missing queue state, and reject the event unless both
+    // public getters round-trip exactly; no responder or action is selected
+    // here.
+    Ivar windowIvar = class_getInstanceVariable(eventClass, "_window");
+    Ivar windowNumberIvar = class_getInstanceVariable(
+        eventClass, "_windowNumber");
+    ptrdiff_t windowNumberOffset = windowNumberIvar
+        ? ivar_getOffset(windowNumberIvar) : -1;
+    size_t instanceSize = class_getInstanceSize(eventClass);
+    const char *windowType = windowIvar
+        ? ivar_getTypeEncoding(windowIvar) : NULL;
+    const char *windowNumberType = windowNumberIvar
+        ? ivar_getTypeEncoding(windowNumberIvar) : NULL;
+    if (!window || windowNumber <= 0 || !windowIvar || !windowNumberIvar ||
+        !windowType || windowType[0] != '@' || !windowNumberType ||
+        windowNumberType[0] != 'q' || instanceSize < sizeof(NSInteger) ||
+        windowNumberOffset < 0 ||
+        (size_t)windowNumberOffset > instanceSize - sizeof(NSInteger))
+        return nil;
+    object_setIvar(event, windowIvar, window);
+    memcpy((uint8_t *)(void *)event + windowNumberOffset,
+           &windowNumber, sizeof(windowNumber));
+    if (((MacWSMsgID)objc_msgSend)(event, sel_registerName("window")) !=
+            window ||
+        ((MacWSMsgInteger)objc_msgSend)(
+            event, sel_registerName("windowNumber")) != windowNumber)
+        return nil;
+    return event;
+}
+
+// Construct the exact Ventura gesture event consumed by AppKit. Runtime and
+// RE evidence for macOS 13.4:
+//   * -[NSEvent _initWithCGEvent:eventRef:] maps CG type 29 field 110 values
+//     61/8/62 to BeginGesture/Magnify/EndGesture and reads magnification from
+//     field 113.
+//   * SLEventRecordSetDoubleValue +104 accepts type 29; its field-113 jump
+//     table stores float(amount) at SLSEventRecord+0xa4.
+//   * The public CGEventSetDoubleValueField exported into this mixed runtime
+//     silently leaves field 113 unchanged, while SLEventRecordPointer is
+//     exported and returns the real 0xf8-byte record.
+// This is target-private ABI encoding, not a check bypass: the resulting
+// NSEvent is validated for both type and magnification before NSWindow sees it.
+static id MacWSCreateAppMagnifyEvent(Class eventClass,
+                                     MacWSInputRecord record,
+                                     id window,
+                                     CGPoint windowPoint,
+                                     CGRect screenFrame,
+                                     NSInteger windowNumber) {
+    static MacWSCreateCGEvent createEvent;
+    static MacWSSetCGEventType setType;
+    static MacWSSetCGEventLocation setLocation;
+    static MacWSSetCGEventFlags setFlags;
+    static MacWSSetCGEventTimestamp setTimestamp;
+    static MacWSSetCGEventIntegerField setInteger;
+    static MacWSSLEventRecordPointer recordPointer;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        createEvent = (MacWSCreateCGEvent)dlsym(RTLD_DEFAULT,
+                                                "CGEventCreate");
+        setType = (MacWSSetCGEventType)dlsym(RTLD_DEFAULT,
+                                             "CGEventSetType");
+        setLocation = (MacWSSetCGEventLocation)dlsym(
+            RTLD_DEFAULT, "CGEventSetLocation");
+        setFlags = (MacWSSetCGEventFlags)dlsym(
+            RTLD_DEFAULT, "CGEventSetFlags");
+        setTimestamp = (MacWSSetCGEventTimestamp)dlsym(
+            RTLD_DEFAULT, "CGEventSetTimestamp");
+        setInteger = (MacWSSetCGEventIntegerField)dlsym(
+            RTLD_DEFAULT, "CGEventSetIntegerValueField");
+        recordPointer = (MacWSSLEventRecordPointer)dlsym(
+            RTLD_DEFAULT, "SLEventRecordPointer");
+    });
+    SEL eventWithCGEvent = sel_registerName("eventWithCGEvent:");
+    if (!eventClass || !createEvent || !setType || !setInteger ||
+        !recordPointer ||
+        !class_respondsToSelector(object_getClass(eventClass),
+                                  eventWithCGEvent)) return nil;
+
+    const uint32_t cgGestureType = 29;
+    const uint32_t gestureKindField = 110;
+    const uint32_t gestureIdentityField = 117;
+    const uint32_t gesturePhaseField = 132;
+    uint16_t phaseFlags = record.flags &
+        (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+         MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+    // SLSEventRecord field 132 stores CGGesturePhase (1/2/4/8), not the
+    // numerically different NSEventPhase (1/4/8/16). NSEvent's initializer
+    // performs that conversion when it wraps the record.
+    uint64_t phase = phaseFlags == MacWSInputFlagGestureBegan ? 1 :
+        phaseFlags == MacWSInputFlagGestureChanged ? 2 :
+        phaseFlags == MacWSInputFlagGestureEnded ? 4 : 8;
+    // AppKit's default `NSEventSuppressBeginEndGesture` is true. RE of
+    // -[NSWindow _reallySendEvent:isDelayedEvent:] therefore shows type 19/20
+    // returning before responder selection, while the type-30 magnify handler
+    // uses phase==Began to establish its latched responder and consumes later
+    // Changed/Ended samples from that same event family. Keep type 30 for the
+    // complete lifecycle; phase, not a separate event type, is the state
+    // machine used by native magnification.
+    int64_t gestureKind = 8;
+
+    MacWSCGEventRef cgEvent = createEvent(NULL);
+    if (!cgEvent) return nil;
+    setType(cgEvent, cgGestureType);
+    setInteger(cgEvent, gestureKindField, gestureKind);
+    setInteger(cgEvent, gestureIdentityField,
+               record.contactID ? record.contactID : 0x50494e43u);
+    setInteger(cgEvent, gesturePhaseField, (int64_t)phase);
+    if (windowNumber > 0) {
+        setInteger(cgEvent, 91, windowNumber);
+        setInteger(cgEvent, 92, windowNumber);
+    }
+    if (setTimestamp && record.timestamp > 0.0)
+        setTimestamp(cgEvent, (uint64_t)llround(record.timestamp * 1.0e9));
+    CGPoint cgWindowPoint = {
+        windowPoint.x,
+        screenFrame.origin.y + screenFrame.size.height - windowPoint.y,
+    };
+    if (setLocation) setLocation(cgEvent, cgWindowPoint);
+    if (setFlags) setFlags(cgEvent,
+        MacWSInputModifiersForScene(record.sceneID));
+
+    void *eventRecord = recordPointer(cgEvent);
+    uint32_t encodedType = 0;
+    if (eventRecord) memcpy(&encodedType, (uint8_t *)eventRecord + 0x8,
+                            sizeof(encodedType));
+    if (!eventRecord || encodedType != cgGestureType) {
+        CFRelease(cgEvent);
+        return nil;
+    }
+    float encodedAmount = phaseFlags == MacWSInputFlagGestureChanged
+        ? record.pressure : 0.0f;
+    memcpy((uint8_t *)eventRecord + 0xa4, &encodedAmount,
+           sizeof(encodedAmount));
+
+    id event = ((MacWSEventFromCGEvent)objc_msgSend)(
+        (id)eventClass, eventWithCGEvent, cgEvent);
+    CFRelease(cgEvent);
+    if (!event) return nil;
+    NSUInteger eventType = ((MacWSMsgUInteger)objc_msgSend)(
+        event, sel_registerName("type"));
+    NSUInteger expectedType = 30;
+    if (eventType != expectedType) return nil;
+    double observed = ((MacWSMsgDouble)objc_msgSend)(
+        event, sel_registerName("magnification"));
+    if (!isfinite(observed) || fabs(observed - encodedAmount) > 0.0005)
+        return nil;
+    // `eventWithCGEvent:` in this macOS-on-iOS runtime does not import CG
+    // fields 91/92 into NSEvent's window association. Runtime InputLab
+    // evidence was exact: every otherwise-valid gesture had windowNumber=0,
+    // so NSApplication.sendEvent: could not select a responder. Objective-C
+    // runtime inspection of the actual Ventura 13.4 NSEvent found `_window`
+    // at +0x20 and `_windowNumber` at +0x28. Resolve the named ivars instead
+    // of baking those offsets, fill the same state AppKit's event queue would,
+    // and validate through public getters before allowing dispatch.
+    Ivar windowIvar = class_getInstanceVariable(eventClass, "_window");
+    Ivar windowNumberIvar = class_getInstanceVariable(
+        eventClass, "_windowNumber");
+    ptrdiff_t windowNumberOffset = windowNumberIvar
+        ? ivar_getOffset(windowNumberIvar) : -1;
+    size_t instanceSize = class_getInstanceSize(eventClass);
+    const char *windowType = windowIvar
+        ? ivar_getTypeEncoding(windowIvar) : NULL;
+    const char *windowNumberType = windowNumberIvar
+        ? ivar_getTypeEncoding(windowNumberIvar) : NULL;
+    if (!window || windowNumber <= 0 || !windowIvar ||
+        !windowNumberIvar || !windowType || windowType[0] != '@' ||
+        !windowNumberType || windowNumberType[0] != 'q' ||
+        instanceSize < sizeof(NSInteger) || windowNumberOffset < 0 ||
+        (size_t)windowNumberOffset > instanceSize - sizeof(NSInteger))
+        return nil;
+    object_setIvar(event, windowIvar, window);
+    memcpy((uint8_t *)(void *)event + windowNumberOffset,
+           &windowNumber, sizeof(windowNumber));
+    id observedWindow = ((MacWSMsgID)objc_msgSend)(
+        event, sel_registerName("window"));
+    NSInteger observedWindowNumber = ((MacWSMsgInteger)objc_msgSend)(
+        event, sel_registerName("windowNumber"));
+    if (observedWindow != window || observedWindowNumber != windowNumber)
+        return nil;
     return event;
 }
 
@@ -2098,10 +2478,27 @@ static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
 
 static BOOL MacWSPostLegacySystemPointerEvent(
         MacWSInputRecord record, CGPoint screenPoint, CGRect screenFrame,
-        NSInteger windowNumber) {
+        CGRect inputMappingFrame, NSInteger windowNumber,
+        BOOL allowExactSystemStart) {
     // VNC already owns its complete native system stream in OSXvnc. Routing a
     // second copy through the selected application would duplicate buttons.
     if (record.source == MacWSInputSourceVNC) return NO;
+    // A v4 Host record with an encoded window came from the exact
+    // DisplayStream layer that Host visibly composited. CGPostMouseEvent has
+    // no PID/window parameter: it throws that identity away and asks
+    // WindowServer to hit-test its independent global scene graph again.
+    // Runtime-confirmed on 2026-08-05: Host selected Maps PID 47265/window 44
+    // at the visible Continue button, then this global repost opened
+    // Terminal's Inspector instead. Preserve exact records for the ordinary
+    // per-window AppKit dispatcher below; retain this system route only for
+    // zero-window fallback pixels such as uncatalogued system surfaces.
+    uint32_t exactWindow = MacWSInputWindowIDForScene(record.sceneID);
+    BOOL exactContinuation = exactWindow != 0 &&
+        MacWSExactSystemPointerActive &&
+        MacWSExactSystemPointerContact == record.contactID &&
+        MacWSExactSystemPointerWindow == exactWindow;
+    if (exactWindow != 0 && !allowExactSystemStart && !exactContinuation)
+        return NO;
     MacWSPostLegacyMouseEvent postMouse = MacWSLegacySystemMousePoster();
     if (!postMouse) {
         if (MacWSRuntimeDiagnosticsEnabled()) {
@@ -2163,18 +2560,36 @@ static BOOL MacWSPostLegacySystemPointerEvent(
         firstResult = postMouse(quartzPoint, true, 3,
             leftDown, rightDown, false);
     }
+    BOOL posted = firstResult == 0 && secondResult == 0;
+    if (posted && exactWindow != 0 && allowExactSystemStart &&
+        record.kind == MacWSInputKindTouchDown) {
+        MacWSExactSystemPointerActive = YES;
+        MacWSExactSystemPointerContact = record.contactID;
+        MacWSExactSystemPointerWindow = exactWindow;
+        MacWSExactSystemPointerMappingFrame = inputMappingFrame;
+    }
+    if (exactContinuation &&
+        (record.kind == MacWSInputKindTouchUp ||
+         record.kind == MacWSInputKindTouchCancel)) {
+        MacWSExactSystemPointerActive = NO;
+        MacWSExactSystemPointerContact = 0;
+        MacWSExactSystemPointerWindow = 0;
+        MacWSExactSystemPointerMappingFrame = (CGRect){0};
+    }
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,
             "#### APP-INPUT SYSTEM-POINTER pid=%d window=%ld kind=%u "
             "buttons=%u/%u appkit=(%.2f,%.2f) quartz=(%.2f,%.2f) "
-            "result=%d/%d\n",
+            "exact-start=%s exact-continuation=%s result=%d/%d\n",
             getpid(), (long)windowNumber, record.kind,
             leftDown ? 1u : 0u, rightDown ? 1u : 0u,
             screenPoint.x, screenPoint.y, quartzPoint.x, quartzPoint.y,
+            allowExactSystemStart ? "YES" : "NO",
+            exactContinuation ? "YES" : "NO",
             firstResult, secondResult);
         fflush(stderr);
     }
-    return firstResult == 0 && secondResult == 0;
+    return posted;
 }
 
 // Preserve Apple Pencil identity and geometry on the same mouse NSEvent that
@@ -3298,7 +3713,11 @@ static void MacWSCompleteFinderInitialWindow(id application,
 }
 
 static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
-    BOOL logEvent = MacWSRuntimeDiagnosticsEnabled() &&
+    double latencyMainStart =
+        (record.flags & MacWSInputFlagLatencyDiagnostic)
+            ? MacWSInputUptimeSeconds() : 0.0;
+    BOOL logEvent = (MacWSRuntimeDiagnosticsEnabled() ||
+                     record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) &&
         record.kind != MacWSInputKindTouchMove &&
         record.kind != MacWSInputKindHover &&
         record.kind != MacWSInputKindMenuHover;
@@ -3321,6 +3740,12 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     MacWSInstallPressedMouseButtonsBridge(eventClass);
     id application = ((MacWSMsgID)objc_msgSend)((id)applicationClass,
         sel_registerName("sharedApplication"));
+    // Geometry observation is input-facing state. Install it lazily on the
+    // already-running AppKit main thread instead of during application launch;
+    // Catalyst Maps has not completed its native scene/window transaction at
+    // constructor time, and eagerly touching NSWindow notification machinery
+    // can perturb that upstream lifecycle before any window exists.
+    MacWSInstallWindowGeometryObservers();
     id screen = ((MacWSMsgID)objc_msgSend)((id)screenClass,
         sel_registerName("mainScreen"));
     if (!application || !screen || record.frameWidth == 0 ||
@@ -3852,16 +4277,39 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     CGFloat normalizedY = record.y / (CGFloat)record.frameHeight;
     CGRect screenFrame = ((MacWSMsgRect)objc_msgSend)(screen,
         sel_registerName("frame"));
+    // The socket-side live tracker receives the producer's original x/y and
+    // frameWidth/frameHeight.  Preserve the exact affine region that maps
+    // those top-left pixels into AppKit screen points.  For a zero-window
+    // desktop record this is NSScreen.frame; exact DisplayStream records
+    // replace it below with their base window's Retina mapping.
+    CGRect inputMappingFrame = screenFrame;
     uint32_t requestedWindowNumber =
         MacWSInputWindowIDForScene(record.sceneID);
     id window = nil;
     id requestedBaseWindow = nil;
     id outsidePopupWindow = nil;
     BOOL routedToTransientWindow = NO;
+    BOOL exactGestureContinuation =
+        (record.kind == MacWSInputKindTouchMove ||
+         record.kind == MacWSInputKindTouchUp ||
+         record.kind == MacWSInputKindTouchCancel ||
+         (record.kind == MacWSInputKindScroll &&
+          !(record.flags & MacWSInputFlagScrollBegan)) ||
+         (record.kind == MacWSInputKindMagnify &&
+          !(record.flags & MacWSInputFlagGestureBegan)));
+    BOOL reusedGestureRoute = requestedWindowNumber != 0 &&
+        exactGestureContinuation && MacWSAppInputGestureBaseWindow &&
+        MacWSAppInputGestureWindow &&
+        MacWSAppInputGestureBaseWindowNumber == requestedWindowNumber;
     CGPoint screenPoint = {0};
     if (requestedWindowNumber != 0) {
-        window = MacWSWindowWithNumber(application, requestedWindowNumber);
-        if (!window) {
+        requestedBaseWindow = reusedGestureRoute
+            ? (__bridge id)MacWSAppInputGestureBaseWindow
+            : MacWSWindowWithNumber(application, requestedWindowNumber);
+        window = reusedGestureRoute
+            ? (__bridge id)MacWSAppInputGestureWindow
+            : requestedBaseWindow;
+        if (!requestedBaseWindow || !window) {
             fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=target-window-closed "
                 "window=%u kind=%u\n",
@@ -3869,7 +4317,6 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             fflush(stderr);
             return;
         }
-        requestedBaseWindow = window;
         // Window DisplayStream coordinates are top-left backing pixels. Map
         // them through the producer's real backing scale, not by normalizing
         // them into NSWindow.frame. Runtime-confirmed in VSCode PID 53270:
@@ -3880,19 +4327,19 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         // The base window stays top-left anchored, so its current maxY and
         // origin remain the stable screen-space origin during live resizing.
         CGRect windowFrame = ((MacWSMsgRect)objc_msgSend)(
-            window, sel_registerName("frame"));
+            requestedBaseWindow, sel_registerName("frame"));
         CGFloat backingScale = 0.0;
         SEL backingScaleSelector = sel_registerName("backingScaleFactor");
         if (((MacWSMsgBoolSEL)objc_msgSend)(
-                window, sel_registerName("respondsToSelector:"),
+                requestedBaseWindow, sel_registerName("respondsToSelector:"),
                 backingScaleSelector)) {
             backingScale = ((MacWSMsgDouble)objc_msgSend)(
-                window, backingScaleSelector);
+                requestedBaseWindow, backingScaleSelector);
         }
         if (!isfinite(backingScale) || backingScale < 0.5 ||
             backingScale > 8.0) {
             id windowScreen = ((MacWSMsgID)objc_msgSend)(
-                window, sel_registerName("screen"));
+                requestedBaseWindow, sel_registerName("screen"));
             if (windowScreen && ((MacWSMsgBoolSEL)objc_msgSend)(
                     windowScreen, sel_registerName("respondsToSelector:"),
                     backingScaleSelector)) {
@@ -3908,11 +4355,41 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             backingScale = record.frameWidth > 0
                 ? record.frameWidth / fmax(windowFrame.size.width, 1.0) : 1.0;
         }
-        screenPoint = (CGPoint){
-            windowFrame.origin.x + record.x / backingScale,
-            windowFrame.origin.y + windowFrame.size.height -
-                record.y / backingScale,
-        };
+        BOOL exactSystemContinuation =
+            MacWSExactSystemPointerActive &&
+            MacWSExactSystemPointerContact == record.contactID &&
+            MacWSExactSystemPointerWindow == requestedWindowNumber;
+        if (exactSystemContinuation &&
+            MacWSExactSystemPointerMappingFrame.size.width > 0.0 &&
+            MacWSExactSystemPointerMappingFrame.size.height > 0.0) {
+            // WindowServer updates NSWindow.frame during a native drag. Using
+            // that moving origin to map the next producer-local sample feeds
+            // the already-applied displacement back into the pointer and
+            // amplifies motion on every event. Keep the down-time affine map
+            // immutable through up, exactly as the AppKit tracker snapshot.
+            inputMappingFrame = MacWSExactSystemPointerMappingFrame;
+            screenPoint = (CGPoint){
+                inputMappingFrame.origin.x +
+                    normalizedX * inputMappingFrame.size.width,
+                inputMappingFrame.origin.y +
+                    (1.0 - normalizedY) * inputMappingFrame.size.height,
+            };
+        } else {
+            CGFloat mappedWidth = record.frameWidth / backingScale;
+            CGFloat mappedHeight = record.frameHeight / backingScale;
+            inputMappingFrame = (CGRect){
+                .origin = {
+                    windowFrame.origin.x,
+                    windowFrame.origin.y + windowFrame.size.height - mappedHeight,
+                },
+                .size = {mappedWidth, mappedHeight},
+            };
+            screenPoint = (CGPoint){
+                windowFrame.origin.x + record.x / backingScale,
+                windowFrame.origin.y + windowFrame.size.height -
+                    record.y / backingScale,
+            };
+        }
 
         // A menu, sheet, tooltip, or popover is a real higher-level NSWindow
         // owned by the same application. Exact-window streaming still uses
@@ -3921,18 +4398,22 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         // mapped screen point. Restrict this to a visible window above the
         // requested base level so another ordinary same-process document
         // window cannot steal input from its Scene.
-        id hitWindow = MacWSWindowForScreenPoint(application, screenPoint);
-        if (hitWindow && hitWindow != requestedBaseWindow) {
-            NSInteger baseLevel = ((MacWSMsgInteger)objc_msgSend)(
-                requestedBaseWindow, sel_registerName("level"));
-            NSInteger hitLevel = ((MacWSMsgInteger)objc_msgSend)(
-                hitWindow, sel_registerName("level"));
-            BOOL hitVisible = ((MacWSMsgBool)objc_msgSend)(
-                hitWindow, sel_registerName("isVisible"));
-            if (hitVisible && hitLevel > baseLevel) {
-                window = hitWindow;
-                routedToTransientWindow = YES;
+        if (!reusedGestureRoute) {
+            id hitWindow = MacWSWindowForScreenPoint(application, screenPoint);
+            if (hitWindow && hitWindow != requestedBaseWindow) {
+                NSInteger baseLevel = ((MacWSMsgInteger)objc_msgSend)(
+                    requestedBaseWindow, sel_registerName("level"));
+                NSInteger hitLevel = ((MacWSMsgInteger)objc_msgSend)(
+                    hitWindow, sel_registerName("level"));
+                BOOL hitVisible = ((MacWSMsgBool)objc_msgSend)(
+                    hitWindow, sel_registerName("isVisible"));
+                if (hitVisible && hitLevel > baseLevel) {
+                    window = hitWindow;
+                    routedToTransientWindow = YES;
+                }
             }
+        } else {
+            routedToTransientWindow = window != requestedBaseWindow;
         }
         if (!routedToTransientWindow &&
             (record.kind == MacWSInputKindTap ||
@@ -4020,10 +4501,20 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             return;
         }
     }
-    if (record.kind == MacWSInputKindTouchDown ||
-        record.kind == MacWSInputKindTap ||
-        record.kind == MacWSInputKindSecondaryTap)
+    BOOL beginsContinuousGesture =
+        record.kind == MacWSInputKindTouchDown ||
+        (record.kind == MacWSInputKindScroll &&
+         (record.flags & MacWSInputFlagScrollBegan)) ||
+        (record.kind == MacWSInputKindMagnify &&
+         (record.flags & MacWSInputFlagGestureBegan));
+    if (requestedBaseWindow && beginsContinuousGesture) {
+        MacWSSetAppInputGestureRoute(requestedBaseWindow, window,
+                                     requestedWindowNumber);
+    } else if (record.kind == MacWSInputKindTouchDown ||
+               record.kind == MacWSInputKindTap ||
+               record.kind == MacWSInputKindSecondaryTap) {
         MacWSSetAppInputGestureWindow(window);
+    }
     if (!routedToTransientWindow &&
         (record.kind == MacWSInputKindTouchDown ||
         record.kind == MacWSInputKindTap ||
@@ -4117,20 +4608,74 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             sel_registerName("windowNumber")) : 0;
     CGPoint windowPoint = ((MacWSMsgPointPoint)objc_msgSend)(window,
         sel_registerName("convertPointFromScreen:"), screenPoint);
+    // RE/runtime-confirmed on this Ventura AppKit build: a process-local
+    // down/up pair reaches NSMenuWindowManagerMenuItemsContainerView but does
+    // not enter the menu presentation dispatch, while CGPostMouseEvent from
+    // the same AppKit/CGS-connected process selects the item and removes the
+    // level-101 menu.  Preserve exact per-window routing everywhere else;
+    // allow the system route only after the resolved real target itself is an
+    // on-screen NSMenuWindowManagerWindow, which is globally frontmost by its
+    // popup-menu level and therefore cannot reproduce the Maps/base-window
+    // z-order misroute that disabled the blanket exact route.
+    Class systemMenuWindowClass = objc_getClass("NSMenuWindowManagerWindow");
+    BOOL exactSystemMenu = requestedWindowNumber != 0 &&
+        systemMenuWindowClass && ((MacWSMsgBoolID)objc_msgSend)(
+            window, sel_registerName("isKindOfClass:"),
+            (id)systemMenuWindowClass);
+    // A title bar or other native frame region is intentionally outside the
+    // content view. Process-local NSApplication.sendEvent: reaches neither
+    // WindowServer's move/resize tracker nor its traffic-light tracking path;
+    // runtime diagnostics in VSCode showed an immediate sendEvent return and
+    // no geometry change even though all move/up records arrived. Only enter
+    // the proven CGPostMouseEvent route when WindowServer independently says
+    // this exact requested window is globally under the same point. That
+    // postcondition prevents the earlier Maps-behind-Terminal misroute.
+    id exactContentView = requestedBaseWindow
+        ? ((MacWSMsgID)objc_msgSend)(requestedBaseWindow,
+            sel_registerName("contentView")) : nil;
+    CGPoint exactContentPoint = exactContentView
+        ? ((MacWSMsgPointPointID)objc_msgSend)(exactContentView,
+            sel_registerName("convertPoint:fromView:"), windowPoint, nil)
+        : (CGPoint){0.0, 0.0};
+    id exactContentHit = exactContentView
+        ? ((MacWSMsgIDPoint)objc_msgSend)(exactContentView,
+            sel_registerName("hitTest:"), exactContentPoint) : nil;
+    NSInteger globalWindowNumber = 0;
+    Class nativeWindowClass = objc_getClass("NSWindow");
+    SEL globalHitSelector = sel_registerName(
+        "windowNumberAtPoint:belowWindowWithWindowNumber:");
+    if (nativeWindowClass && class_respondsToSelector(
+            object_getClass(nativeWindowClass), globalHitSelector)) {
+        globalWindowNumber = ((MacWSMsgIntegerPointInteger)objc_msgSend)(
+            (id)nativeWindowClass, globalHitSelector, screenPoint, 0);
+    }
+    BOOL exactNativeFrameStart = requestedWindowNumber != 0 &&
+        record.kind == MacWSInputKindTouchDown &&
+        window == requestedBaseWindow && exactContentView &&
+        !exactContentHit &&
+        globalWindowNumber == (NSInteger)requestedWindowNumber;
     if (MacWSPostLegacySystemPointerEvent(
-            record, screenPoint, screenFrame, windowNumber)) {
+            record, screenPoint, screenFrame, inputMappingFrame, windowNumber,
+            exactSystemMenu || exactNativeFrameStart)) {
         MacWSNotifyDisplayCatalogChanged('t');
         if (record.kind == MacWSInputKindTouchUp ||
             record.kind == MacWSInputKindTouchCancel ||
             record.kind == MacWSInputKindTap ||
-            record.kind == MacWSInputKindSecondaryTap)
+            record.kind == MacWSInputKindSecondaryTap ||
+            (record.kind == MacWSInputKindScroll &&
+             (record.flags & (MacWSInputFlagScrollEnded |
+                              MacWSInputFlagScrollCancelled))) ||
+            (record.kind == MacWSInputKindMagnify &&
+             (record.flags & (MacWSInputFlagGestureEnded |
+                              MacWSInputFlagGestureCancelled))))
             MacWSSetAppInputGestureWindow(nil);
         MacWSClearDeferredRFBMoveEvents();
         return;
     }
     if (record.kind == MacWSInputKindScroll) {
         id scrollEvent = MacWSCreateAppScrollEvent(
-            eventClass, record, windowPoint, screenFrame, windowNumber);
+            eventClass, record, window, windowPoint, screenFrame,
+            windowNumber);
         if (!scrollEvent) {
             fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=scroll-event-create "
@@ -4147,8 +4692,63 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         // thread, so use NSWindow's standard event dispatcher. This preserves
         // responder-chain hit testing and scrollWheel: semantics; it does not
         // invoke a control action directly.
-        ((MacWSSendEvent)objc_msgSend)(window,
-            sel_registerName("sendEvent:"), scrollEvent);
+        if (record.flags & (MacWSInputFlagScrollBegan |
+                            MacWSInputFlagScrollChanged)) {
+            // Runtime enumeration of the actual Ventura NSWindow exposes the
+            // window-level scroll-session primitive with ABI v24@0:8@16.
+            // InputLab proved process-local -sendEvent: never invokes it: all
+            // finger phases reached scrollWheel:, but the following native
+            // momentum sequence stopped at the window boundary. Establish the
+            // same generic view latch that AppKit's hardware-event queue owns;
+            // later phases remain ordinary event dispatch and no application
+            // view/action is named here.
+            SEL latchScrollTarget = sel_registerName(
+                "_latchViewForScrollEvent:");
+            if (record.flags & MacWSInputFlagScrollBegan)
+                MacWSBeginAppInputScrollSession(window);
+            if (((MacWSMsgBoolSEL)objc_msgSend)(
+                    window, sel_registerName("respondsToSelector:"),
+                    latchScrollTarget)) {
+                ((MacWSMsgVoidID)objc_msgSend)(
+                    window, latchScrollTarget, scrollEvent);
+            }
+        }
+        if (record.flags & MacWSInputFlagScrollMomentum) {
+            // Runtime-confirmed with the on-device InputLab boundary witness:
+            // the reconstructed event reaches NSWindow with the exact native
+            // sequence phase=0, momentumPhase=1/4/.../8, but public
+            // -sendEvent: consumes every momentum sample before scrollWheel:.
+            // A process-local event did not enter WindowServer's physical
+            // scroll-session tracker. The Began phase above has now installed
+            // AppKit's native per-window view latch; re-enter the ordinary
+            // window dispatcher so it can consume that state just as it does
+            // for the finger phases.
+            ((MacWSSendEvent)objc_msgSend)(window,
+                sel_registerName("sendEvent:"), scrollEvent);
+        } else {
+            ((MacWSSendEvent)objc_msgSend)(window,
+                sel_registerName("sendEvent:"), scrollEvent);
+        }
+        MacWSRecordInputLatency(record, latencyMainStart,
+                                MacWSInputUptimeSeconds());
+        BOOL scrollTerminal = (record.flags &
+            (MacWSInputFlagScrollEnded |
+             MacWSInputFlagScrollCancelled)) != 0;
+        if (scrollTerminal) {
+            if (record.flags & MacWSInputFlagScrollMomentum) {
+                MacWSEndAppInputScrollSession();
+            } else if (record.flags & MacWSInputFlagScrollWillMomentum) {
+                // A producer failure must not leak AppKit's view-scrolling
+                // state forever. A real momentum Began advances the generation
+                // within one display interval and cancels this bounded guard.
+                MacWSScheduleAppInputScrollSessionTimeout(window);
+            } else {
+                MacWSEndAppInputScrollSession();
+            }
+        }
+        if (record.flags & (MacWSInputFlagScrollEnded |
+                            MacWSInputFlagScrollCancelled))
+            MacWSSetAppInputGestureWindow(nil);
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
                 "#### APP-INPUT SCROLL-DISPATCH pid=%d target-window=%ld "
@@ -4164,7 +4764,60 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         }
         return;
     }
-    if (MacWSRuntimeDiagnosticsEnabled() &&
+    if (record.kind == MacWSInputKindMagnify) {
+        id gestureEvent = MacWSCreateAppMagnifyEvent(
+            eventClass, record, window, windowPoint, screenFrame,
+            windowNumber);
+        if (!gestureEvent) {
+            fprintf(stderr,
+                "#### APP-INPUT DROP pid=%d reason=magnify-event-create "
+                "window=%ld phase=%#x amount=%.6f\n",
+                getpid(), (long)windowNumber, record.flags,
+                record.pressure);
+            return;
+        }
+        // Ventura's public NSWindow.sendEvent: and NSApplication.sendEvent:
+        // both accepted the reconstructed event but stopped before the
+        // responder chain in runtime InputLab A/B tests. Runtime enumeration
+        // of the actual NSWindow exposed `_reallySendEvent:isDelayedEvent:`
+        // (v28@0:8@16B24), the ordinary inner dispatcher used after AppKit's
+        // queue has already associated a concrete window. Our broker has done
+        // that association above, so enter this generic window dispatcher;
+        // no view action or application-specific selector is invoked.
+        SEL reallySendEvent = sel_registerName(
+            "_reallySendEvent:isDelayedEvent:");
+        if (!((MacWSMsgBoolSEL)objc_msgSend)(
+                window, sel_registerName("respondsToSelector:"),
+                reallySendEvent)) {
+            fprintf(stderr,
+                "#### APP-INPUT DROP pid=%d reason=gesture-dispatcher "
+                "window=%ld\n", getpid(), (long)windowNumber);
+            return;
+        }
+        ((MacWSMsgVoidIDBool)objc_msgSend)(
+            window, reallySendEvent, gestureEvent, NO);
+        MacWSRecordInputLatency(record, latencyMainStart,
+                                MacWSInputUptimeSeconds());
+        if (record.flags & (MacWSInputFlagGestureEnded |
+                            MacWSInputFlagGestureCancelled))
+            MacWSSetAppInputGestureWindow(nil);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT MAGNIFY-DISPATCH pid=%d target-window=%ld "
+                "event-window=%ld type=%lu phase=%#x amount=%.6f "
+                "route=NSWindow._reallySendEvent\n",
+                getpid(), (long)windowNumber,
+                (long)((MacWSMsgInteger)objc_msgSend)(
+                    gestureEvent, sel_registerName("windowNumber")),
+                (unsigned long)((MacWSMsgUInteger)objc_msgSend)(
+                    gestureEvent, sel_registerName("type")),
+                record.flags, record.pressure);
+            fflush(stderr);
+        }
+        return;
+    }
+    if ((MacWSRuntimeDiagnosticsEnabled() ||
+         record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) &&
         (record.kind == MacWSInputKindTouchDown ||
          record.kind == MacWSInputKindTap)) {
         id contentView = ((MacWSMsgID)objc_msgSend)(window,
@@ -4360,11 +5013,6 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         // the socket thread. If sendEvent: returns normally this interval is
         // only a few microseconds; if it enters TrackMenuCommon, later taps go
         // straight into the event queue that the nested tracker consumes.
-        CGRect inputMappingFrame = screenFrame;
-        if (requestedBaseWindow) {
-            inputMappingFrame = ((MacWSMsgRect)objc_msgSend)(
-                requestedBaseWindow, sel_registerName("frame"));
-        }
         pthread_mutex_lock(&MacWSAppInputRouteLock);
         MacWSCacheMenuContextLocked(
             application, eventClass, windowNumber, inputMappingFrame,
@@ -4383,7 +5031,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                               memory_order_release);
         MacWSAppInputRFBTrackingActive = NO;
         MacWSAppInputRFBTrackingButtons = 0;
-        if (MacWSRuntimeDiagnosticsEnabled()) {
+        if (MacWSRuntimeDiagnosticsEnabled() ||
+            record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
             fprintf(stderr,
                 "#### APP-INPUT TAP-COMPLETE pid=%d button=%s gesture=%u window=%ld "
                 "screen=(%.2f,%.2f) local=(%.2f,%.2f)\n",
@@ -4449,7 +5098,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         id downEvent = nil;
         pthread_mutex_lock(&MacWSAppInputRouteLock);
         MacWSArmDirectTrackingContextLocked(application, eventClass,
-            record.contactID, windowNumber, screenFrame,
+            record.contactID, windowNumber, inputMappingFrame,
             screenPoint, windowPoint);
         useBufferedFallback =
             MacWSHasPendingRFBTrackingRecordLocked(record.contactID);
@@ -4694,6 +5343,8 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                           record.kind == MacWSInputKindHover ||
                           record.kind == MacWSInputKindMenuHover ||
                           record.kind == MacWSInputKindScroll ||
+                          (record.kind == MacWSInputKindMagnify &&
+                           (record.flags & MacWSInputFlagGestureChanged)) ||
                           record.kind == MacWSInputKindConfigureWindow;
         BOOL replaced = NO;
         NSUInteger pendingCount = [MacWSAppInputPending count];
@@ -4705,8 +5356,10 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                 if (last.kind == record.kind &&
                     last.sceneID == record.sceneID &&
                     (record.kind == MacWSInputKindScroll ||
+                     record.kind == MacWSInputKindMagnify ||
                      last.contactID == record.contactID) &&
-                    (record.kind != MacWSInputKindScroll ||
+                    ((record.kind != MacWSInputKindScroll &&
+                      record.kind != MacWSInputKindMagnify) ||
                      last.flags == record.flags) &&
                     last.targetPID == record.targetPID) {
                     if (record.kind == MacWSInputKindScroll) {
@@ -4724,6 +5377,12 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                                 previousHorizontal + incomingHorizontal));
                         memcpy(&record.contactID, &incomingHorizontal,
                                sizeof(record.contactID));
+                        [data release];
+                        data = [[NSData alloc] initWithBytes:&record
+                                                     length:sizeof(record)];
+                    } else if (record.kind == MacWSInputKindMagnify) {
+                        record.pressure = fmaxf(-4.0f, fminf(4.0f,
+                            last.pressure + record.pressure));
                         [data release];
                         data = [[NSData alloc] initWithBytes:&record
                                                      length:sizeof(record)];
@@ -4751,6 +5410,7 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                         candidate.kind == MacWSInputKindHover ||
                         candidate.kind == MacWSInputKindMenuHover ||
                         candidate.kind == MacWSInputKindScroll ||
+                        candidate.kind == MacWSInputKindMagnify ||
                         candidate.kind == MacWSInputKindConfigureWindow) {
                         removable = index;
                         break;
@@ -5406,6 +6066,11 @@ static void *MacWSAppInputThread(void *unused) {
             fflush(stderr);
             continue;
         }
+        if (record.flags & MacWSInputFlagLatencyDiagnostic) {
+            double transportUS = fmax(
+                0.0, (MacWSInputUptimeSeconds() - record.timestamp) * 1.0e6);
+            record.reserved = (uint32_t)fmin(transportUS, UINT32_MAX);
+        }
         // During a real NSControl tracking loop the main thread is synchronous
         // inside sendEvent(mouseDown), and that private tracker does not run
         // our CFRunLoop common-mode drain. NSApplication documents subthread
@@ -5717,6 +6382,42 @@ static void MacWSScheduleWindowMetricsPublish(void) {
         @autoreleasepool { MacWSPublishWindowMetrics(); }
         MacWSScheduleWindowMetricsPublish();
     });
+}
+
+static void MacWSInstallWindowGeometryObservers(void) {
+    if (MacWSWindowGeometryObserverTokens) return;
+    MacWSWindowGeometryObserverTokens = [NSMutableArray new];
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+    NSOperationQueue *mainQueue = [NSOperationQueue mainQueue];
+    // The target's on-device arm64e lld can leave newly-added ObjC constant
+    // container/string pointers with an incompatible PAC discriminator. The
+    // Maps crash report at AppInputBridge.m:5977 showed objc_msgSend(retain)
+    // faulting inside __NSArrayI_new on exactly this observer-name array.
+    // Construct ordinary runtime NSString objects from immutable C bytes;
+    // the notification API and resulting semantics are unchanged.
+    static const char *const names[] = {
+        "NSWindowDidMoveNotification",
+        "NSWindowDidResizeNotification",
+        "NSWindowDidEndLiveResizeNotification",
+    };
+    for (NSUInteger index = 0;
+         index < sizeof(names) / sizeof(names[0]); index++) {
+        NSString *name = [NSString stringWithUTF8String:names[index]];
+        if (!name) continue;
+        id token = [center addObserverForName:name object:nil queue:mainQueue
+            usingBlock:^(NSNotification *notification) {
+                id window = notification.object;
+                if (!window) return;
+                NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+                    window, sel_registerName("windowNumber"));
+                if (number <= 0 || (uint64_t)number > UINT32_MAX) return;
+                CGRect frame = ((MacWSMsgRect)objc_msgSend)(
+                    window, sel_registerName("frame"));
+                MacWSNotifyDisplayGeometryChanged(
+                    (uint32_t)number, window, frame);
+            }];
+        if (token) [MacWSWindowGeometryObserverTokens addObject:token];
+    }
 }
 
 static void MacWSInstallAppInputBridgeNow(void) {

@@ -28,29 +28,39 @@ int main(void) {
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSDecideTouchCandidate(0.10, 0.0, false) ==
            MacWSTouchCandidateDecisionWait);
-    assert(MacWSDecideTouchCandidate(0.44, 5.99, true) ==
+    assert(MacWSDecideTouchCandidate(0.44, 3.99, true) ==
            MacWSTouchCandidateDecisionTap);
-    assert(MacWSDecideTouchCandidate(0.10, 6.0, false) ==
+    assert(MacWSDecideTouchCandidate(0.10, 4.0, false) ==
            MacWSTouchCandidateDecisionScroll);
-    assert(MacWSDecideTouchCandidate(0.45, 5.99, false) ==
+    assert(MacWSDecideTouchCandidate(0.45, 3.99, false) ==
            MacWSTouchCandidateDecisionLongPress);
     // Movement wins when timer delivery and the touch sample arrive together;
     // an already-moving finger must not become a delayed long press.
-    assert(MacWSDecideTouchCandidate(0.45, 6.0, false) ==
-           MacWSTouchCandidateDecisionScroll);
+    // The movement sample itself occurred after the hardware hold threshold:
+    // this is hold-then-drag even if the main-queue feedback timer was late.
+    assert(MacWSDecideTouchCandidate(0.45, 4.0, false) ==
+           MacWSTouchCandidateDecisionLongPress);
     assert(!MacWSTouchReachedLongPress(0.10));
     assert(!MacWSTouchReachedLongPress(0.449));
     assert(MacWSTouchReachedLongPress(0.45));
+    assert(!MacWSShouldStartScrollMomentum(79.99, 0.0));
+    assert(MacWSShouldStartScrollMomentum(80.0, 0.0));
+    assert(MacWSShouldStartScrollMomentum(60.0, 60.0));
     assert(MacWSChooseDirectScrollAxis(2.0, 6.0) ==
            MacWSDirectScrollAxisVertical);
     assert(MacWSChooseDirectScrollAxis(6.0, 4.6) ==
-           MacWSDirectScrollAxisVertical);
-    assert(MacWSChooseDirectScrollAxis(6.0, 4.4) ==
+           MacWSDirectScrollAxisFree);
+    assert(MacWSChooseDirectScrollAxis(6.0, 4.0) ==
            MacWSDirectScrollAxisHorizontal);
     double constrainedX = 2.0, constrainedY = -9.0;
     MacWSConstrainDirectScrollDelta(MacWSDirectScrollAxisVertical,
                                     &constrainedX, &constrainedY);
     assert(constrainedX == 0.0 && constrainedY == -9.0);
+    constrainedX = 4.0;
+    constrainedY = -7.0;
+    MacWSConstrainDirectScrollDelta(MacWSDirectScrollAxisFree,
+                                    &constrainedX, &constrainedY);
+    assert(constrainedX == 4.0 && constrainedY == -7.0);
 
     MacWSViewport viewport = {0};
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 1, 0.5, 0.5,
@@ -129,6 +139,30 @@ int main(void) {
         .destinationHeight = 2048,
     };
     assert(MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
+    frame.destinationX = 200;
+    frame.destinationY = 100;
+    frame.destinationWidth = 1000;
+    frame.destinationHeight = 800;
+    frame.contentWidth = 1000;
+    frame.contentHeight = 800;
+    float layerX = 0.0f, layerY = 0.0f;
+    assert(MacWSStreamMapDesktopPointToLayer(
+        &frame, 400.0f, 300.0f, &layerX, &layerY));
+    assert(Near(layerX, 200.0f));
+    assert(Near(layerY, 200.0f));
+    // WindowServer moved the live window 50 px after the first drag sample.
+    // The gesture snapshot must still map the next desktop sample through the
+    // original destination: local x=300 reconstructs desktop x=500. Mapping
+    // through a live destination x=250 would incorrectly yield x=250 and feed
+    // the 50-px window displacement back against the user's finger.
+    assert(MacWSStreamMapDesktopPointToLayer(
+        &frame, 500.0f, 300.0f, &layerX, &layerY));
+    assert(Near(layerX, 300.0f));
+    MacWSStreamFrameDescriptor movedFrame = frame;
+    movedFrame.destinationX = 250;
+    assert(MacWSStreamMapDesktopPointToLayer(
+        &movedFrame, 500.0f, 300.0f, &layerX, &layerY));
+    assert(Near(layerX, 250.0f));
     frame.bytesPerRow = 1;
     assert(!MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
     frame.bytesPerRow = 2732 * 4;

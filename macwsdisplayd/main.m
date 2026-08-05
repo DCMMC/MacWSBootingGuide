@@ -38,11 +38,19 @@ static dispatch_queue_t DisplayQueue;
 static dispatch_queue_t MenuQueue;
 static NSMutableSet *Clients;
 static NSMutableDictionary<NSNumber *, id> *Leases;
+// A SkyLight popup can disappear while its final AGX command buffer is still
+// retiring.  Keep the capture object alive for a bounded grace period instead
+// of synchronously stopping it from the catalog-removal stack.
+static NSMutableArray *RetiredTransientLayers;
 static uint64_t NextStreamID = 1;
 static uint64_t NextLeaseToken = 1;
 static int InvalidationSocket = -1;
 static dispatch_source_t InvalidationSource;
 static BOOL TransientReconcilePending;
+// Every request receives a generation. An urgent event-driven reconcile can
+// therefore supersede the slow correctness poll already queued for 100/250ms
+// instead of being rejected by its pending bit.
+static uint64_t TransientReconcileGeneration;
 static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
@@ -80,6 +88,10 @@ static void DisplayLog(NSString *format, ...) {
 }
 @property(nonatomic, weak) MacWSDisplayClient *client;
 @property(nonatomic) uint32_t windowID;
+@property(nonatomic) int32_t ownerPID;
+@property(nonatomic, copy) NSString *ownerName;
+@property(nonatomic, copy) NSString *windowName;
+@property(nonatomic) NSInteger skyLightLayer;
 @property(nonatomic) int32_t level;
 @property(nonatomic) CGRect destinationBounds;
 @property(nonatomic) uint64_t streamID;
@@ -90,6 +102,11 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) CGDisplayStreamRef stream;
 @property(nonatomic) IOSurfaceRef latestSurface;
 @property(nonatomic) uint64_t latestDisplayTime;
+@property(nonatomic) BOOL oneShotCapture;
+@property(nonatomic) BOOL snapshotComplete;
+@property(nonatomic) BOOL retiring;
+@property(nonatomic) uint64_t retirementGeneration;
+- (void)stopCapturePreservingSurface;
 - (void)stopStream;
 @end
 
@@ -105,15 +122,19 @@ static void DisplayLog(NSString *format, ...) {
     if (_latestSurface) CFRelease(_latestSurface);
     _latestSurface = surface;
 }
-- (void)stopStream {
+- (void)stopCapturePreservingSurface {
     if (_stream) {
         CGDisplayStreamStop(_stream);
         CFRelease(_stream);
         _stream = NULL;
     }
     _sequence = 0;
+}
+- (void)stopStream {
+    [self stopCapturePreservingSurface];
     self.latestSurface = NULL;
     _latestDisplayTime = 0;
+    _snapshotComplete = NO;
 }
 @end
 
@@ -140,6 +161,12 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t geometryRestartGeneration;
 @property(nonatomic) NSMutableDictionary<NSNumber *, MacWSTransientLayer *> *transientLayers;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *outstandingByLayer;
+// A fullscreen Host can be relaunched or have its UIWindowScene recreated
+// while WindowServer keeps producing the same desktop. Keep a generation for
+// the bounded disconnect handoff instead of tearing down the whole capture
+// graph synchronously from the XPC error callback.
+@property(nonatomic) uint64_t disconnectGeneration;
+@property(nonatomic) BOOL deliveryPaused;
 - (void)stopStream;
 - (void)stopTransientLayers;
 @end
@@ -170,6 +197,7 @@ static void DisplayLog(NSString *format, ...) {
 
 static void SendStatus(MacWSDisplayClient *client, const char *eventName,
                        NSString *message, BOOL ok) {
+    if (!client.connection || client.deliveryPaused) return;
     xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT, eventName);
     xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_PROTOCOL_VERSION,
@@ -421,6 +449,7 @@ static MacWSStreamWindowDescriptor WindowDescriptor(
 }
 
 static void SendWindowList(MacWSDisplayClient *client) {
+    if (!client.connection) return;
     xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT,
                               MACWS_STREAM_EVENT_WINDOWS);
@@ -602,6 +631,11 @@ static void PublishFrame(MacWSDisplayClient *client,
         layer.latestSurface = surface;
         layer.latestDisplayTime = displayTime;
     }
+    // During the bounded fullscreen handoff grace period, keep the existing
+    // SkyLight streams and their newest immutable surfaces alive but do not
+    // manufacture leases for a dead XPC connection. The replacement Host
+    // republishes these surfaces when it atomically takes ownership.
+    if (!client.connection || client.deliveryPaused) return;
     uint32_t layerWindowID = layer ? layer.windowID
         : (client.windowID ? client.windowID : UINT32_MAX);
     uint64_t producerStreamID = layer ? layer.streamID : client.streamID;
@@ -704,6 +738,7 @@ static void PublishFrame(MacWSDisplayClient *client,
         .contentWidth = contentWidth,
         .contentHeight = contentHeight,
         .layerWindowID = layerWindowID,
+        .layerOwnerPID = layer ? layer.ownerPID : 0,
         .layerLevel = layer ? layer.level : 0,
         .destinationX = destinationX,
         .destinationY = destinationY,
@@ -862,6 +897,7 @@ static IOSurfaceRef CreateWorkspaceCanvas(MacWSDisplayClient *client) {
 
 static void SendLayerRemoved(MacWSDisplayClient *client,
                              uint32_t layerWindowID) {
+    if (!client.connection || client.deliveryPaused) return;
     xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT,
                               MACWS_STREAM_EVENT_LAYER_REMOVED);
@@ -874,14 +910,47 @@ static void SendLayerRemoved(MacWSDisplayClient *client,
     xpc_connection_send_message(client.connection, event);
 }
 
+static void RetireTransientLayer(MacWSDisplayClient *client,
+                                 NSNumber *key,
+                                 MacWSTransientLayer *layer,
+                                 NSString *reason) {
+    if (!client || !key || !layer || layer.retiring) return;
+    layer.retiring = YES;
+    uint64_t generation = ++layer.retirementGeneration;
+    // Detach delivery immediately: Host has already removed this layer and a
+    // final frame racing from the old stream must not resurrect stale pixels.
+    layer.client = nil;
+    if (![RetiredTransientLayers containsObject:layer])
+        [RetiredTransientLayers addObject:layer];
+    DisplayLog(@"layer-retire-begin layer=%u reason=%@ grace-ms=5000",
+               layer.windowID, reason ?: @"catalog-removed");
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   DisplayQueue, ^{
+        if (!layer.retiring ||
+            layer.retirementGeneration != generation) return;
+        // If the same SkyLight window ID returned during the grace period,
+        // reconciliation cancels this retirement and reuses the live stream.
+        if (client.transientLayers[key] != layer) return;
+        [layer stopStream];
+        [client.transientLayers removeObjectForKey:key];
+        [RetiredTransientLayers removeObject:layer];
+        DisplayLog(@"layer-retire-complete layer=%u reason=%@",
+                   layer.windowID, reason ?: @"catalog-removed");
+    });
+}
+
 static void StartTransientLayer(MacWSTransientLayer *layer) {
     MacWSDisplayClient *client = layer.client;
     if (!client || layer.windowID == 0) return;
-    [layer stopStream];
+    // Preserve the last complete IOSurface while SkyLight retires/recreates
+    // the exact-window stream. Host can keep compositing it at the newly
+    // committed destination instead of flashing a black hole during resize.
+    [layer stopCapturePreservingSurface];
     layer.streamID = NextStreamID++;
     if (layer.streamID == 0) layer.streamID = NextStreamID++;
     layer.droppedFrames = 0;
     layer.firstDisplayTime = 0;
+    layer.snapshotComplete = NO;
     uint64_t generation = layer.streamID;
     __weak MacWSTransientLayer *weakLayer = layer;
     CGDisplayStreamFrameAvailableHandler handler =
@@ -892,9 +961,31 @@ static void StartTransientLayer(MacWSTransientLayer *layer) {
             MacWSDisplayClient *strongClient = strongLayer.client;
             if (!strongLayer || !strongClient ||
                 strongLayer.streamID != generation) return;
-            if (status == kCGDisplayStreamFrameStatusFrameComplete)
+            if (status == kCGDisplayStreamFrameStatusFrameComplete) {
                 PublishFrame(strongClient, strongLayer, displayTime,
                              frameSurface);
+                if (strongLayer.oneShotCapture &&
+                    !strongLayer.snapshotComplete) {
+                    strongLayer.snapshotComplete = YES;
+                    // Wallpaper/backing streams have fulfilled their only
+                    // job after one complete native IOSurface. Stop capture
+                    // on the next display-queue turn while retaining that
+                    // immutable surface for Host composition.
+                    dispatch_async(DisplayQueue, ^{
+                        MacWSTransientLayer *snapshotLayer = weakLayer;
+                        if (!snapshotLayer ||
+                            snapshotLayer.streamID != generation ||
+                            !snapshotLayer.oneShotCapture ||
+                            !snapshotLayer.snapshotComplete) return;
+                        [snapshotLayer stopCapturePreservingSurface];
+                        DisplayLog(@"workspace-layer-snapshot stream=%llu layer=%u owner=%@ name=%@",
+                            (unsigned long long)generation,
+                            snapshotLayer.windowID,
+                            snapshotLayer.ownerName ?: @"",
+                            snapshotLayer.windowName ?: @"");
+                    });
+                }
+            }
         };
     MacWSSLSWindowStreamCreate createWindow = dlsym(
         RTLD_DEFAULT, "SLSHWCaptureStreamCreateWithWindow");
@@ -904,15 +995,18 @@ static void StartTransientLayer(MacWSTransientLayer *layer) {
     if (!layer.stream) return;
     CGError error = CGDisplayStreamStart(layer.stream);
     if (error != kCGErrorSuccess) {
-        [layer stopStream];
+        [layer stopCapturePreservingSurface];
         DisplayLog(@"layer-start failed base=%u layer=%u error=%d",
                    client.windowID, layer.windowID, error);
         return;
     }
     DisplayLog(@"layer-start stream=%llu base=%u layer=%u level=%d "
+               "owner-pid=%d owner=%@ name=%@ skylight-layer=%ld "
                "destination=(%.0f,%.0f %.0fx%.0f)",
         (unsigned long long)layer.streamID, client.windowID, layer.windowID,
-        layer.level, layer.destinationBounds.origin.x,
+        layer.level, layer.ownerPID, layer.ownerName ?: @"",
+        layer.windowName ?: @"", (long)layer.skyLightLayer,
+        layer.destinationBounds.origin.x,
         layer.destinationBounds.origin.y, layer.destinationBounds.size.width,
         layer.destinationBounds.size.height);
 }
@@ -1048,6 +1142,31 @@ static void StartSubscription(MacWSDisplayClient *client,
                               MacWSStreamMode mode, uint32_t windowID) {
     client.geometryRestartGeneration++;
     if (mode == MacWSStreamModeFullscreen) {
+        if (client.subscriptionActive &&
+            client.mode == MacWSStreamModeFullscreen &&
+            (client.workspaceCanvas || client.transientLayers.count != 0)) {
+            // UIKit can briefly resign/reactivate the same fullscreen Scene
+            // during app launch and system fullscreen transactions. Resume
+            // this client's retained graph instead of treating the identical
+            // subscription as a request to allocate a second desktop graph.
+            client.deliveryPaused = NO;
+            client.disconnectGeneration++;
+            DisplayLog(@"workspace-resume stream=%llu layers=%lu transport=retained-graph",
+                       (unsigned long long)client.streamID,
+                       (unsigned long)client.transientLayers.count);
+            if (client.workspaceCanvas)
+                PublishFrame(client, nil, mach_absolute_time(),
+                             client.workspaceCanvas);
+            for (MacWSTransientLayer *layer in
+                    client.transientLayers.allValues) {
+                if (layer.latestSurface)
+                    PublishFrame(client, layer,
+                        layer.latestDisplayTime ?: mach_absolute_time(),
+                        layer.latestSurface);
+            }
+            ScheduleTransientReconcile(0);
+            return;
+        }
         // Runtime-confirmed on 2026-08-03: a stale fullscreen client kept
         // stream 10 and its desktop layers alive while the foreground Scene
         // created workspace stream 55.  The duplicated Retina capture graphs
@@ -1064,6 +1183,8 @@ static void StartSubscription(MacWSDisplayClient *client,
             }
         }
         if (owner) {
+            BOOL ownerDisconnected = owner.connection == nil;
+            owner.disconnectGeneration++;
             // Stop only this client's former exact-window graph.  The desktop
             // graph remains running and its layer callbacks dynamically read
             // layer.client, so moving the layer objects changes the XPC sink
@@ -1072,6 +1193,7 @@ static void StartSubscription(MacWSDisplayClient *client,
             [client stopStream];
             client.outstandingByLayer = [NSMutableDictionary dictionary];
             client.subscriptionActive = YES;
+            client.deliveryPaused = NO;
             client.mode = MacWSStreamModeFullscreen;
             client.windowID = 0;
             client.streamID = owner.streamID;
@@ -1092,6 +1214,7 @@ static void StartSubscription(MacWSDisplayClient *client,
             }
 
             owner.subscriptionActive = NO;
+            owner.deliveryPaused = NO;
             owner.mode = 0;
             owner.windowID = 0;
             owner.streamID = 0;
@@ -1134,11 +1257,17 @@ static void StartSubscription(MacWSDisplayClient *client,
             }
             SendStatus(owner, MACWS_STREAM_EVENT_STOPPED,
                        @"全屏工作区已转移到当前前台窗口", YES);
+            // A disconnected owner was retained solely as a short handoff
+            // carrier. Its graph and retained surfaces now belong to the new
+            // client, and its outstanding leases were cleared at disconnect,
+            // so removing the empty shell performs no CGDisplayStream stop.
+            if (ownerDisconnected) [Clients removeObject:owner];
             ScheduleTransientReconcile(0);
             return;
         }
     }
     client.subscriptionActive = YES;
+    client.deliveryPaused = NO;
     client.mode = mode;
     client.windowID = mode == MacWSStreamModeWindow ? windowID : 0;
     client.windowBackingScale = 0.0;
@@ -1161,7 +1290,7 @@ static void ReconcileTransientStreams(void) {
     BOOL needsFollowup = NO;
     BOOL workspaceNeedsFollowup = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
-        if (!client.subscriptionActive) continue;
+        if (!client.subscriptionActive || client.deliveryPaused) continue;
         if (client.mode == MacWSStreamModeFullscreen) {
             if (!desktopInfo) desktopInfo = CopyCompleteDesktopWindowInfo();
             CGRect desktopBounds = CGDisplayBounds(CGMainDisplayID());
@@ -1174,6 +1303,27 @@ static void ReconcileTransientStreams(void) {
             NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
             NSUInteger attached = 0;
             NSUInteger count = desktopInfo.count;
+            // The frontmost full-display negative-level window is Finder's
+            // interactive desktop on the target runtime and must remain live
+            // for icon selection. Lower negative layers are compositor
+            // backing/wallpaper: capture one authoritative frame, then retain
+            // it without keeping several redundant Retina streams active.
+            uint32_t frontmostInteractiveDesktopWindowID = 0;
+            for (NSDictionary *candidate in desktopInfo) {
+                NSInteger candidateLevel =
+                    [candidate[(id)kCGWindowLayer] integerValue];
+                CGRect candidateBounds = CGRectZero;
+                if (candidateLevel >= 0 ||
+                    !CGRectMakeWithDictionaryRepresentation(
+                        (__bridge CFDictionaryRef)
+                            candidate[(id)kCGWindowBounds],
+                        &candidateBounds) ||
+                    !CGRectContainsRect(candidateBounds, desktopBounds))
+                    continue;
+                frontmostInteractiveDesktopWindowID =
+                    [candidate[(id)kCGWindowNumber] unsignedIntValue];
+                if (frontmostInteractiveDesktopWindowID != 0) break;
+            }
             for (NSUInteger index = 0; index < count; index++) {
                 NSDictionary *info = desktopInfo[index];
                 uint32_t candidateWindowID =
@@ -1197,29 +1347,75 @@ static void ReconcileTransientStreams(void) {
                     layer.windowID = candidateWindowID;
                     client.transientLayers[key] = layer;
                 }
+                if (layer.retiring) {
+                    layer.retiring = NO;
+                    layer.retirementGeneration++;
+                    [RetiredTransientLayers removeObject:layer];
+                    DisplayLog(@"layer-retire-cancel layer=%u reason=window-returned",
+                               layer.windowID);
+                }
+                layer.client = client;
+                layer.ownerPID = [info[(id)kCGWindowOwnerPID] intValue];
+                id ownerName = info[(id)kCGWindowOwnerName];
+                layer.ownerName = [ownerName isKindOfClass:NSString.class]
+                    ? ownerName : @"";
+                id windowName = info[(id)kCGWindowName];
+                layer.windowName = [windowName isKindOfClass:NSString.class]
+                    ? windowName : @"";
+                layer.skyLightLayer = [info[(id)kCGWindowLayer] integerValue];
+                BOOL desiredOneShot = layer.skyLightLayer < 0 &&
+                    CGRectContainsRect(candidateBounds, desktopBounds) &&
+                    candidateWindowID != frontmostInteractiveDesktopWindowID;
+                BOOL capturePolicyChanged = !isNew &&
+                    layer.oneShotCapture != desiredOneShot;
+                layer.oneShotCapture = desiredOneShot;
                 // CGWindowList is front-to-back. Host draws ascending levels,
                 // so reverse that rank and preserve the actual desktop z-order
                 // even when several ordinary windows all report layer zero.
-                layer.level = (int32_t)MIN((NSUInteger)INT32_MAX,
-                                           count - index);
-                layer.destinationBounds = CGRectMake(
+                int32_t newLevel = (int32_t)MIN((NSUInteger)INT32_MAX,
+                                                count - index);
+                CGRect newDestination = CGRectMake(
                     (candidateBounds.origin.x - desktopBounds.origin.x) * scale,
                     (candidateBounds.origin.y - desktopBounds.origin.y) * scale,
                     candidateBounds.size.width * scale,
                     candidateBounds.size.height * scale);
+                BOOL presentationChanged = !isNew &&
+                    (layer.level != newLevel ||
+                     !CGRectEqualToRect(layer.destinationBounds,
+                                        newDestination));
+                layer.level = newLevel;
+                layer.destinationBounds = newDestination;
                 layer.missCount = 0;
-                if (isNew || !layer.stream) StartTransientLayer(layer);
+                if (capturePolicyChanged) {
+                    layer.snapshotComplete = NO;
+                    StartTransientLayer(layer);
+                } else if (isNew ||
+                           (!layer.stream &&
+                            !(layer.oneShotCapture &&
+                              layer.snapshotComplete))) {
+                    StartTransientLayer(layer);
+                }
+                // Window movement does not necessarily damage its backing
+                // store. Re-emit the retained surface immediately with the
+                // authoritative new compositor destination; waiting for a
+                // future capture callback made title-bar dragging update at
+                // the 250ms catalog-poll cadence.
+                if (presentationChanged && layer.latestSurface) {
+                    PublishFrame(client, layer, mach_absolute_time(),
+                                 layer.latestSurface);
+                }
             }
             for (NSNumber *key in [client.transientLayers.allKeys copy]) {
                 MacWSTransientLayer *layer = client.transientLayers[key];
                 if ([seen containsObject:key]) continue;
+                if (layer.retiring) continue;
                 layer.missCount++;
                 if (layer.missCount < 2) continue;
                 DisplayLog(@"workspace-layer-remove layer=%u",
                            layer.windowID);
                 SendLayerRemoved(client, layer.windowID);
-                [layer stopStream];
-                [client.transientLayers removeObjectForKey:key];
+                RetireTransientLayer(client, key, layer,
+                                     @"workspace-catalog-removed");
             }
             workspaceNeedsFollowup |= client.transientLayers.count != 0;
             continue;
@@ -1292,6 +1488,22 @@ static void ReconcileTransientStreams(void) {
                 layer.windowID = candidateWindowID;
                 client.transientLayers[key] = layer;
             }
+            if (layer.retiring) {
+                layer.retiring = NO;
+                layer.retirementGeneration++;
+                [RetiredTransientLayers removeObject:layer];
+                DisplayLog(@"layer-retire-cancel layer=%u reason=window-returned",
+                           layer.windowID);
+            }
+            layer.client = client;
+            layer.ownerPID = [info[(id)kCGWindowOwnerPID] intValue];
+            id ownerName = info[(id)kCGWindowOwnerName];
+            layer.ownerName = [ownerName isKindOfClass:NSString.class]
+                ? ownerName : @"";
+            id windowName = info[(id)kCGWindowName];
+            layer.windowName = [windowName isKindOfClass:NSString.class]
+                ? windowName : @"";
+            layer.skyLightLayer = level;
             // An AppKit sheet can be a level-0 SkyLight window even though it
             // belongs above its presenting document. The metrics sidecar is
             // the owning process's authoritative relationship; assign only
@@ -1307,6 +1519,7 @@ static void ReconcileTransientStreams(void) {
         for (NSNumber *key in [client.transientLayers.allKeys copy]) {
             MacWSTransientLayer *layer = client.transientLayers[key];
             if ([seen containsObject:key]) continue;
+            if (layer.retiring) continue;
             // A transient can briefly disappear from the on-screen catalog
             // while AppKit swaps its selection/shadow surface. Three misses
             // bound detach latency to 300 ms without a one-sample flicker.
@@ -1315,21 +1528,33 @@ static void ReconcileTransientStreams(void) {
             DisplayLog(@"layer-remove base=%u layer=%u",
                        client.windowID, layer.windowID);
             SendLayerRemoved(client, layer.windowID);
-            [layer stopStream];
-            [client.transientLayers removeObjectForKey:key];
+            RetireTransientLayer(client, key, layer,
+                                 @"window-catalog-removed");
         }
         if (client.transientLayers.count) needsFollowup = YES;
     }
     if (needsFollowup || workspaceNeedsFollowup)
-        ScheduleTransientReconcile((workspaceNeedsFollowup ? 250 : 100) *
+        // Native AppKit geometry/catalog datagrams now preempt this timer at
+        // 16ms. The periodic pass is only a recovery net for non-AppKit system
+        // producers, so an idle fullscreen desktop no longer scans four times
+        // per second.
+        ScheduleTransientReconcile((workspaceNeedsFollowup ? 1000 : 250) *
                                    NSEC_PER_MSEC);
 }
 
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds) {
-    if (TransientReconcilePending) return;
+    // A delayed follow-up is only a recovery poll. A geometry/catalog edge is
+    // authoritative and must be able to preempt it. Generation cancellation
+    // keeps at most one effective reconcile without relying on an
+    // uncancellable dispatch_after block.
+    if (TransientReconcilePending && delayNanoseconds != 0) return;
     TransientReconcilePending = YES;
+    uint64_t generation = ++TransientReconcileGeneration;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanoseconds),
-                   DisplayQueue, ^{ ReconcileTransientStreams(); });
+                   DisplayQueue, ^{
+        if (generation != TransientReconcileGeneration) return;
+        ReconcileTransientStreams();
+    });
 }
 
 static void ReleaseLease(uint64_t token, MacWSDisplayClient *client) {
@@ -1343,21 +1568,94 @@ static void ReleaseLease(uint64_t token, MacWSDisplayClient *client) {
     [Leases removeObjectForKey:@(token)];
 }
 
-static void RemoveClient(MacWSDisplayClient *client) {
-    [client stopTransientLayers];
-    [client stopStream];
+static void RemoveClientLeases(MacWSDisplayClient *client) {
     NSArray<NSNumber *> *tokens = [Leases.allKeys copy];
     for (NSNumber *token in tokens) {
         MacWSDisplayLease *lease = Leases[token];
         if (lease.owner == client) [Leases removeObjectForKey:token];
     }
+    [client.outstandingByLayer removeAllObjects];
+}
+
+static void RemoveClient(MacWSDisplayClient *client) {
+    client.disconnectGeneration++;
+    [client stopTransientLayers];
+    [client stopStream];
+    RemoveClientLeases(client);
     [Clients removeObject:client];
+}
+
+static void RetireFullscreenClientStaggered(MacWSDisplayClient *client) {
+    if (![Clients containsObject:client]) return;
+    client.disconnectGeneration++;
+    NSArray<MacWSTransientLayer *> *layers =
+        [client.transientLayers.allValues copy];
+    // Detach first so removing/deallocating the client cannot synchronously
+    // stop every Retina stream in one stack frame. Runtime evidence from
+    // WindowServer.err showed that the old disconnect/reconnect burst was
+    // followed by AGX command-buffer Internal Error 00000103 and a fresh
+    // WindowServer PID.
+    client.transientLayers = [NSMutableDictionary dictionary];
+    [client stopStream];
+    RemoveClientLeases(client);
+    client.subscriptionActive = NO;
+    client.deliveryPaused = NO;
+    client.mode = 0;
+    client.windowID = 0;
+    client.streamID = 0;
+    if (!client.connection) [Clients removeObject:client];
+    DisplayLog(@"workspace-retire-staggered layers=%lu interval-ms=16",
+               (unsigned long)layers.count);
+    [layers enumerateObjectsUsingBlock:^(MacWSTransientLayer *layer,
+                                         NSUInteger index, BOOL *stop) {
+        (void)stop;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(index + 1) * 16 *
+                                         NSEC_PER_MSEC),
+                       DisplayQueue, ^{
+            [layer stopStream];
+            if (index + 1 == layers.count)
+                DisplayLog(@"workspace-retire-complete layers=%lu",
+                           (unsigned long)layers.count);
+        });
+    }];
+}
+
+static void PreserveFullscreenClientForHandoff(
+        MacWSDisplayClient *client, BOOL disconnected) {
+    if (disconnected) client.connection = nil;
+    client.deliveryPaused = YES;
+    RemoveClientLeases(client);
+    uint64_t generation = ++client.disconnectGeneration;
+    DisplayLog(@"workspace-%@-grace stream=%llu layers=%lu grace-ms=5000",
+               disconnected ? @"disconnect" : @"pause",
+               (unsigned long long)client.streamID,
+               (unsigned long)client.transientLayers.count);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   DisplayQueue, ^{
+        if (![Clients containsObject:client] ||
+            client.disconnectGeneration != generation ||
+            !client.subscriptionActive ||
+            !client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen ||
+            (disconnected && client.connection)) return;
+        DisplayLog(@"workspace-%@-grace-expired stream=%llu",
+                   disconnected ? @"disconnect" : @"pause",
+                   (unsigned long long)client.streamID);
+        RetireFullscreenClientStaggered(client);
+    });
 }
 
 static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
     if (request == XPC_ERROR_CONNECTION_INVALID ||
         request == XPC_ERROR_CONNECTION_INTERRUPTED) {
-        RemoveClient(client);
+        if (client.subscriptionActive &&
+            client.mode == MacWSStreamModeFullscreen &&
+            (client.workspaceCanvas || client.transientLayers.count != 0)) {
+            PreserveFullscreenClientForHandoff(client, YES);
+        } else {
+            RemoveClient(client);
+        }
         return;
     }
     if (!request || xpc_get_type(request) != XPC_TYPE_DICTIONARY) return;
@@ -1388,14 +1686,30 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
                        @"invalid subscription", NO);
             return;
         }
+        DisplayLog(@"request-subscribe client=%p requested-mode=%u window=%llu current-mode=%u active=%@ paused=%@ stream=%llu",
+                   client, mode, (unsigned long long)windowID, client.mode,
+                   client.subscriptionActive ? @"YES" : @"NO",
+                   client.deliveryPaused ? @"YES" : @"NO",
+                   (unsigned long long)client.streamID);
         StartSubscription(client, mode, (uint32_t)windowID);
     } else if (strcmp(operation, MACWS_STREAM_OP_UNSUBSCRIBE) == 0) {
         client.geometryRestartGeneration++;
-        client.subscriptionActive = NO;
-        client.mode = 0;
-        client.windowID = 0;
-        [client stopTransientLayers];
-        [client stopStream];
+        DisplayLog(@"request-unsubscribe client=%p current-mode=%u active=%@ stream=%llu",
+                   client, client.mode,
+                   client.subscriptionActive ? @"YES" : @"NO",
+                   (unsigned long long)client.streamID);
+        if (client.subscriptionActive &&
+            client.mode == MacWSStreamModeFullscreen &&
+            (client.workspaceCanvas || client.transientLayers.count != 0)) {
+            PreserveFullscreenClientForHandoff(client, NO);
+        } else {
+            client.subscriptionActive = NO;
+            client.deliveryPaused = NO;
+            client.mode = 0;
+            client.windowID = 0;
+            [client stopTransientLayers];
+            [client stopStream];
+        }
     } else if (strcmp(operation, MACWS_STREAM_OP_RELEASE_FRAME) == 0) {
         ReleaseLease(xpc_dictionary_get_uint64(
             request, MACWS_STREAM_KEY_LEASE_TOKEN), client);
@@ -1446,6 +1760,7 @@ int main(void) {
                                           DISPATCH_QUEUE_CONCURRENT);
         Clients = [NSMutableSet set];
         Leases = [NSMutableDictionary dictionary];
+        RetiredTransientLayers = [NSMutableArray array];
         GeometryTargets = [NSMutableDictionary dictionary];
         StartInvalidationListener();
         xpc_connection_t listener = xpc_connection_create_mach_service(
