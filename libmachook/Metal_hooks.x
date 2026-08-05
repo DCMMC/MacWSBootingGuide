@@ -49,16 +49,17 @@ static BOOL macws_runtime_diagnostics_enabled(void) {
 // process audit token leads back to the LaunchServices entry created for that
 // app extension.  Here RunningBoard launches the iOS proxy first and then the
 // proxy execs the macOS image inside the chroot, so the preserved audit-token
-// identity describes the proxy while NSBundle describes Appearance.appex.
+// identity describes the proxy while NSBundle describes the real Settings
+// extension bundle.
 // Runtime evidence in appearance-inline-ls-oslog.txt is exact:
 // _LSPluginFindWithPlatformInfo:699 returns -10814 and the provider returns
 // nil.  ExtensionFoundation then exits at EXRunningExtension.m:149.
 //
 // Repair that missing audit-token -> bundle-URL association at the provider
 // boundary.  This is deliberately not a success/check bypass: the stock
-// result wins, the fallback is restricted to the exact hosted appex identity,
-// and LSApplicationExtensionRecord must independently accept the real bundle
-// URL and return a record with the same identifier.
+// result wins, the fallback is restricted to a real system Settings appex,
+// and LSApplicationExtensionRecord must independently accept the exact bundle
+// URL and return a platform-1 record with the same identifier.
 static id (*macws_bundle_record_for_current_process_orig)(id, SEL) = NULL;
 
 static id macws_bundle_record_for_current_process_compat(id receiver,
@@ -71,11 +72,21 @@ static id macws_bundle_record_for_current_process_compat(id receiver,
     NSBundle *bundle = [NSBundle mainBundle];
     NSString *identifier = [bundle bundleIdentifier];
     const char *identifierBytes = [identifier UTF8String];
-    if (!identifierBytes || strcmp(
-            identifierBytes, "com.apple.Appearance-Settings.extension") != 0)
-        return nil;
-
     NSURL *bundleURL = [bundle bundleURL];
+    NSString *bundlePath = [[bundleURL path] stringByStandardizingPath];
+    NSDictionary *extensionAttributes =
+        [[bundle infoDictionary] objectForKey:@"EXAppExtensionAttributes"];
+    NSString *extensionPoint =
+        [extensionAttributes isKindOfClass:[NSDictionary class]]
+            ? [extensionAttributes objectForKey:@"EXExtensionPointIdentifier"]
+            : nil;
+    if (!identifierBytes ||
+        ![bundlePath hasPrefix:
+            @"/System/Library/ExtensionKit/Extensions/"] ||
+        [bundlePath rangeOfString:@".appex"].location == NSNotFound ||
+        ![extensionPoint isEqualToString:
+            @"com.apple.Settings.extension.ui"]) return nil;
+
     Class extensionRecordClass = objc_getClass("LSApplicationExtensionRecord");
     if (!bundleURL || !extensionRecordClass) return nil;
 
@@ -88,20 +99,33 @@ static id macws_bundle_record_for_current_process_compat(id receiver,
         ? ((id (*)(id, SEL))objc_msgSend)(
               candidate, sel_registerName("bundleIdentifier"))
         : nil;
+    unsigned candidatePlatform = candidate
+        ? ((unsigned (*)(id, SEL))objc_msgSend)(
+              candidate, sel_registerName("platform"))
+        : 0;
+    NSURL *candidateURL = candidate
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              candidate, sel_registerName("URL"))
+        : nil;
     BOOL validClass = candidate && ((BOOL (*)(id, SEL, id))objc_msgSend)(
         candidate, sel_registerName("isKindOfClass:"), extensionRecordClass);
     BOOL validIdentifier = validClass && candidateIdentifier &&
         ((BOOL (*)(id, SEL, id))objc_msgSend)(
             candidateIdentifier, sel_registerName("isEqualToString:"),
-            identifier);
+            identifier) && candidatePlatform == 1 &&
+        [[[candidateURL path] stringByStandardizingPath]
+            isEqualToString:bundlePath];
     fprintf(stderr,
             "#### EXTENSION-LS-IDENTITY original=nil bundle=%s url=%s "
-            "candidate=%s candidate-id=%s error=%s accepted=%s\n",
+            "candidate=%s candidate-id=%s platform=%u candidate-url=%s "
+            "error=%s accepted=%s\n",
             identifierBytes,
-            [[[bundleURL absoluteURL] path] UTF8String] ?: "<nil>",
+            [bundlePath UTF8String] ?: "<nil>",
             candidate ? object_getClassName(candidate) : "nil",
             candidateIdentifier
                 ? [[candidateIdentifier description] UTF8String] : "nil",
+            candidatePlatform,
+            [[[candidateURL absoluteURL] path] UTF8String] ?: "<nil>",
             error ? [[error description] UTF8String] : "nil",
             validIdentifier ? "YES" : "NO");
     fflush(stderr);
@@ -12075,6 +12099,51 @@ static void install_agx_init_redirect(Class agx) {
 
 const char *metalSimService = "com.apple.metal.simulator";
 
+static const char *macws_settings_extension_endpoint_name(
+    const char *name) {
+    if (!name) return name;
+    const char *program = getprogname();
+    const char *appExtension = getenv("MACWS_APP_EXTENSION");
+    BOOL isSettingsHost = program && !strcmp(program, "System Settings");
+    BOOL isSettingsExtension = appExtension && !strcmp(appExtension, "1");
+    if (!isSettingsHost && !isSettingsExtension) return name;
+
+    static const char extensionKitSuffix[] = ".extensionkit.internal";
+    static const char viewBridgeSuffix[] = ".viewbridge";
+    const char *suffix = NULL;
+    size_t nameLength = strlen(name);
+    size_t suffixLength = sizeof(extensionKitSuffix) - 1;
+    if (nameLength > suffixLength &&
+        !strcmp(name + nameLength - suffixLength, extensionKitSuffix)) {
+        suffix = extensionKitSuffix;
+    } else {
+        suffixLength = sizeof(viewBridgeSuffix) - 1;
+        if (nameLength > suffixLength &&
+            !strcmp(name + nameLength - suffixLength, viewBridgeSuffix))
+            suffix = viewBridgeSuffix;
+    }
+    if (!suffix) return name;
+
+    size_t identifierLength = nameLength - suffixLength;
+    if (identifierLength <= strlen("com.apple.") ||
+        strncmp(name, "com.apple.", strlen("com.apple.")) != 0)
+        return name;
+    for (size_t index = 0; index < identifierLength; index++) {
+        char character = name[index];
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '.' || character == '-')) return name;
+    }
+    static __thread char rewritten[512];
+    int length = snprintf(
+        rewritten, sizeof(rewritten),
+        "com.macwsguide.settings-extension-carrier.%.*s%s",
+        (int)identifierLength, name, suffix);
+    return length > 0 && (size_t)length < sizeof(rewritten)
+        ? rewritten : name;
+}
+
 // macOS and iOS publish several identically named bootstrap services with
 // different protocol/data contracts. Runtime-confirmed on iPadOS 16.3:
 // SystemStatus's three original names remain active in user/501, and
@@ -12090,11 +12159,9 @@ static const char *macws_private_chroot_service_name(const char *name) {
     // these carrier endpoints in the System Settings host's per-process
     // bootstrap domain. Translate both peers at the service boundary; the
     // launchd-managed ports and stock ExtensionKit protocols stay untouched.
-    if (!strcmp(name,
-                "com.apple.Appearance-Settings.extension.extensionkit.internal"))
-        return "com.macwsguide.settings-extension-carrier.extensionkit.internal";
-    if (!strcmp(name, "com.apple.Appearance-Settings.extension.viewbridge"))
-        return "com.macwsguide.settings-extension-carrier.viewbridge";
+    const char *settingsEndpoint =
+        macws_settings_extension_endpoint_name(name);
+    if (settingsEndpoint != name) return settingsEndpoint;
     if (!strcmp(name, "com.apple.systemstatus"))
         return "com.apple.macosbooter.systemstatus";
     if (!strcmp(name, "com.apple.systemstatus.publisher"))

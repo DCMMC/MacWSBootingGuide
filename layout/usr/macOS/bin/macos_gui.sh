@@ -179,9 +179,8 @@ DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
 SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
-UICACHE=/var/jb/usr/bin/uicache
-SETTINGS_EXTENSION_CARRIER_ID=com.macwsguide.settings-extension-carrier
-SETTINGS_EXTENSION_CARRIER_APP=/var/jb/Applications/SettingsExtensionProxy.app
+SETTINGS_EXTENSIONS_RUNTIME=/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
+SETTINGS_EXTENSIONS_RUNTIME_LOG="$LOGDIR/settings-extensions-runtime.log"
 WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png'
 VNC_DESKTOP=macOS-iPad
 
@@ -1853,15 +1852,16 @@ seed_launchservices_database() {
         tail -n 20 "$LOGDIR/lsregister.log" 2>/dev/null || true
         return 1
     fi
-    # Appearance.appex is system-level ExtensionKit content, not embedded in
-    # System Settings.app.  The normal application scan can therefore leave
-    # its old PlugInKit record at Container state -1 after a cold database
-    # rebuild.  Use Ventura LaunchServices' own plug-in registrar and require
-    # an exact platform-1 record before publishing the settings services.
+    # Ventura's Settings panes are system-level ExtensionKit content, not
+    # embedded in System Settings.app.  A normal application-only scan leaves
+    # these plug-ins absent (or with stale Container state -1 records) after a
+    # cold database rebuild.  Register every pane through LaunchServices' own
+    # plug-in registrar and require exact platform-1 records before publishing
+    # the settings services.
     rm -f "$SETTINGS_EXTENSION_REGISTER_LOG"
     if ! MACWS_CATALOG_REGISTRATION=1 \
             "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-            register-settings-extension \
+            register-settings-extensions \
             > "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
         log "ERROR: System Settings extension registration failed."
         tail -n 20 "$SETTINGS_EXTENSION_REGISTER_LOG" 2>/dev/null || true
@@ -1891,29 +1891,39 @@ prepare_settings_service_proxies() {
         chown root:wheel "$proxy" || return 1
         chmod 4755 "$proxy" || return 1
     done
+    for proxy in \
+        /var/jb/Applications/MacWSSettingsExtension-com.apple.*.app/SettingsExtensionProxy; do
+        [ -x "$proxy" ] || continue
+        chown root:wheel "$proxy" || return 1
+        chmod 4755 "$proxy" || return 1
+    done
 
-    # ExtensionKit resolves the Ventura Appearance.appex through the iOS
-    # RunningBoard carrier.  A valid macOS PlugInKit record alone is not
-    # sufficient: runtime on 2026-08-04 reproduced an ordered-in but empty
-    # System Settings shell while this carrier was absent from iOS
-    # LaunchServices.  Make the carrier registration a startup invariant, not
-    # a best-effort postinst side effect.
-    if [ ! -x "$UICACHE" ]; then
-        log "ERROR: uicache is missing; cannot verify the Settings extension carrier."
+    # Every Ventura Settings pane is a distinct ExtensionKit executable and
+    # therefore needs a distinct registered iOS first-image carrier.  Runtime
+    # on 2026-08-05 proved that sharing one path makes RunningBoard reject the
+    # second pane with unequal identities, while preparing only Appearance
+    # leaves Wi-Fi/Bluetooth/etc. at OSLaunchdErrorDomain/2.  Reconcile the
+    # complete metadata-selected set at production start so restored
+    # trustcaches and iOS LaunchServices state cannot silently regress after a
+    # cold jailbreak bootstrap.
+    if [ ! -f "$SETTINGS_EXTENSIONS_RUNTIME" ]; then
+        log "ERROR: Settings ExtensionKit runtime helper is missing."
         return 1
     fi
-    if ! "$UICACHE" -l 2>/dev/null | grep -Fq \
-            "$SETTINGS_EXTENSION_CARRIER_ID : "; then
-        log "Registering the iOS System Settings extension carrier..."
-        "$UICACHE" -p "$SETTINGS_EXTENSION_CARRIER_APP" \
-            >/dev/null 2>&1 || return 1
+    rm -f "$SETTINGS_EXTENSIONS_RUNTIME_LOG"
+    if ! bash "$SETTINGS_EXTENSIONS_RUNTIME" --verify \
+            > "$SETTINGS_EXTENSIONS_RUNTIME_LOG" 2>&1; then
+        log "Repairing System Settings extension runtimes after verification failure..."
+        if ! bash "$SETTINGS_EXTENSIONS_RUNTIME" \
+                >> "$SETTINGS_EXTENSIONS_RUNTIME_LOG" 2>&1 ||
+           ! bash "$SETTINGS_EXTENSIONS_RUNTIME" --verify \
+                >> "$SETTINGS_EXTENSIONS_RUNTIME_LOG" 2>&1; then
+            log "ERROR: System Settings extension runtimes could not be prepared."
+            tail -n 20 "$SETTINGS_EXTENSIONS_RUNTIME_LOG" 2>/dev/null || true
+            return 1
+        fi
     fi
-    if ! "$UICACHE" -l 2>/dev/null | grep -Fq \
-            "$SETTINGS_EXTENSION_CARRIER_ID : "; then
-        log "ERROR: System Settings extension carrier is not registered in iOS LaunchServices."
-        return 1
-    fi
-    log "System Settings extension carrier registration ready."
+    log "All System Settings extension runtimes and carriers are ready."
 }
 
 publish_settings_service_contracts() {

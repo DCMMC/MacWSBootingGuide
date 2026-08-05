@@ -664,10 +664,11 @@ add_all_trustcache \
 	/var/mnt/rootfs/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
 
 # System Settings panes are real Ventura ExtensionKit executables launched
-# through an iOS first-image proxy. Keep their bundle-local dependency closure,
-# load commands, dedicated sandbox exceptions and reboot-volatile trustcache in
-# one idempotent helper shared with the package postinst.
-bash /var/jb/usr/macOS/bin/ensure_appearance_runtime.sh || exit 1
+# through unique iOS first-image carriers. Keep every pane's native
+# entitlements, bundle-local dependency closure, load commands, common service
+# exceptions, runtime fingerprint and reboot-volatile trustcache in one
+# idempotent helper shared with the package postinst.
+bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh || exit 1
 
 # Native-host input bridge.  Keep the installed source and the chroot-visible
 # executable on fresh inodes so AMFI does not reuse a stale vnode signature.

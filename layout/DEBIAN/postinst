@@ -406,12 +406,14 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" || exit 1
     ensure_chroot_extensionkit_signature \
         "$ROOTFS/System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/extensionkitservice.xpc/Contents/MacOS/extensionkitservice" || exit 1
-    # Installs the bundle-local libmachook/Substrate/trampoline closure, adds
-    # the two idempotent LC_LOAD_DYLIB commands, applies Appearance's narrow
-    # ExtensionKit Mach-service profile, and restores every resulting CDHash.
-    bash /var/jb/usr/macOS/bin/ensure_appearance_runtime.sh || exit 1
     ensure_chroot_appearance_signature \
         "$ROOTFS/System/Library/ExtensionKit/Extensions/Appearance.appex/Contents/MacOS/Appearance" || exit 1
+    # Preserve Appearance's stock private capabilities first, then reconcile
+    # every Settings pane's bundle-local libmachook/Substrate/trampoline
+    # closure, common MacWS service contract, unique iOS carrier, runtime
+    # fingerprint and resulting CDHashes.  The generic helper merges rather
+    # than replaces each pane's native entitlements.
+    bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh || exit 1
     ensure_chroot_native_service_signature \
         "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
         "$CORELOCATIONAGENT_NATIVE_ENTITLEMENTS" \

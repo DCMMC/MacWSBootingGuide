@@ -67,9 +67,6 @@ static const char *const kUIKitSystemExecutable =
     "/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem";
 static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
-static const char *const kAppearanceExecutable =
-    "/System/Library/ExtensionKit/Extensions/Appearance.appex/Contents/MacOS/Appearance";
-
 static pid_t WaitForRunningRootExecutable(NSString *rootPath,
                                           NSTimeInterval timeout);
 
@@ -905,24 +902,101 @@ static BOOL RequestApplicationReopen(pid_t pid, NSTimeInterval timeout) {
     return ready;
 }
 
-// System Settings' SwiftUI shell can publish a real visible NSWindow before
-// ExtensionKit has supplied the remote preference pane.  That exact state was
-// runtime-confirmed as a blank right-hand pane together with
-// `PPCenter.swift:267 Falling back to Appearance` and LaunchServices -10814.
-// Require both halves of the stock transaction: a fresh shell-window
-// generation (RequestApplicationReopen above) and the real Ventura Appearance
-// extension executable launched by ExtensionKit.  This does not synthesize a
-// view or turn an extension error into success.
-static BOOL WaitForSystemSettingsContent(NSTimeInterval timeout) {
-    pid_t appearancePID = WaitForRunningRootExecutable(
-        @(kAppearanceExecutable), timeout);
-    if (appearancePID <= 1) {
-        HostLog(@"system-settings content result=missing-appearance-extension");
-        return NO;
+// Return a live, real Ventura Settings UI extension. System Settings persists
+// the selected pane, so Appearance is not a valid universal readiness proxy:
+// after reopening on Displays, Bluetooth, etc. the shell is healthy while the
+// Appearance executable is correctly absent. Match the exact stock extension
+// point in the appex's Info.plist as well as its strict on-disk executable
+// path; an unrelated ExtensionKit child cannot satisfy this witness.
+static pid_t FindRunningSettingsExtension(NSString **executableOut) {
+    typedef int (*MacWSProcListPIDs)(uint32_t, uint32_t, void *, int);
+    typedef int (*MacWSProcPIDPath)(int, void *, uint32_t);
+    static MacWSProcListPIDs procListPIDs;
+    static MacWSProcPIDPath procPIDPath;
+    static dispatch_once_t procOnce;
+    dispatch_once(&procOnce, ^{
+        procListPIDs = (MacWSProcListPIDs)dlsym(
+            RTLD_DEFAULT, "proc_listpids");
+        procPIDPath = (MacWSProcPIDPath)dlsym(
+            RTLD_DEFAULT, "proc_pidpath");
+    });
+    if (!procListPIDs || !procPIDPath) return 0;
+
+    int capacity = procListPIDs(1 /* PROC_ALL_PIDS */, 0, NULL, 0);
+    if (capacity <= 0) return 0;
+    pid_t *pids = calloc(1, (size_t)capacity);
+    if (!pids) return 0;
+    int bytes = procListPIDs(1, 0, pids, capacity);
+    int count = bytes > 0 ? bytes / (int)sizeof(pid_t) : 0;
+    NSString *const rootPrefix = @"/System/Library/ExtensionKit/Extensions/";
+    NSString *const hostPrefix =
+        @"/var/mnt/rootfs/System/Library/ExtensionKit/Extensions/";
+    NSString *const executableMarker = @".appex/Contents/MacOS/";
+    pid_t found = 0;
+    for (int index = 0; index < count; index++) {
+        pid_t pid = pids[index];
+        if (pid <= 1 || pid == getpid()) continue;
+        char processPath[4096] = {0};
+        if (procPIDPath(pid, processPath, sizeof(processPath)) <= 0)
+            continue;
+        NSString *candidate = [NSString stringWithUTF8String:processPath];
+        NSString *rootPath = nil;
+        if ([candidate hasPrefix:rootPrefix]) {
+            rootPath = candidate;
+        } else if ([candidate hasPrefix:hostPrefix]) {
+            rootPath = [candidate substringFromIndex:
+                @"/var/mnt/rootfs".length];
+        } else {
+            continue;
+        }
+        if ([rootPath containsString:@".."] ||
+            ![rootPath containsString:executableMarker] ||
+            [rootPath hasSuffix:executableMarker]) continue;
+        NSRange marker = [rootPath rangeOfString:executableMarker];
+        if (marker.location == NSNotFound) continue;
+        NSUInteger appexEnd = marker.location + @".appex".length;
+        NSString *bundleRoot = [rootPath substringToIndex:appexEnd];
+        NSString *infoPath = [@"/var/mnt/rootfs"
+            stringByAppendingFormat:@"%@/Contents/Info.plist", bundleRoot];
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:
+            infoPath];
+        NSDictionary *attributes = [info[@"EXAppExtensionAttributes"]
+            isKindOfClass:NSDictionary.class]
+                ? info[@"EXAppExtensionAttributes"] : nil;
+        NSString *extensionPoint = [attributes[@"EXExtensionPointIdentifier"]
+            isKindOfClass:NSString.class]
+                ? attributes[@"EXExtensionPointIdentifier"] : nil;
+        if (![extensionPoint isEqualToString:
+                @"com.apple.Settings.extension.ui"]) continue;
+        if (kill(pid, 0) != 0 && errno != EPERM) continue;
+        found = pid;
+        if (executableOut) *executableOut = rootPath;
+        break;
     }
-    HostLog(@"system-settings content result=appearance-extension-ready pid=%d",
-            appearancePID);
-    return YES;
+    free(pids);
+    return found;
+}
+
+// System Settings' SwiftUI shell can publish a real visible NSWindow before
+// ExtensionKit has supplied the selected remote preference pane. Require both
+// halves of the stock transaction: a fresh shell-window generation
+// (RequestApplicationReopen above) and one real, metadata-validated Ventura
+// Settings extension executable launched by ExtensionKit. This does not
+// synthesize content or convert an extension error into success.
+static BOOL WaitForSystemSettingsContent(NSTimeInterval timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    do {
+        NSString *executable = nil;
+        pid_t extensionPID = FindRunningSettingsExtension(&executable);
+        if (extensionPID > 1) {
+            HostLog(@"system-settings content result=settings-extension-ready "
+                    "pid=%d executable=%@", extensionPID, executable);
+            return YES;
+        }
+        usleep(100000);
+    } while (deadline.timeIntervalSinceNow > 0);
+    HostLog(@"system-settings content result=missing-settings-extension");
+    return NO;
 }
 
 static off_t FileSizeAtPath(const char *path) {

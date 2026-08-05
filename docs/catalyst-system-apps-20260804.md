@@ -52,7 +52,67 @@ iOS first image enters the chroot before libSystem consumes the one-shot XPC
 launch context, then execs the real macOS extension. Dedicated ExtensionKit
 and Appearance entitlement profiles, bundle-local `libmachook` dependencies,
 and reboot-volatile trustcache restoration are installed idempotently by
-`ensure_appearance_runtime.sh` and both package postinstall paths.
+`ensure_settings_extensions_runtime.sh` (with the legacy
+`ensure_appearance_runtime.sh` wrapper) and both package postinstall paths.
+
+### 2026-08-05: all Ventura Settings panes are registered and launchable
+
+The earlier milestone only prepared `Appearance.appex`. That made the shell
+look partially correct while every other sidebar item lacked either a macOS
+LaunchServices plug-in record or an executable iOS launch carrier. The repair
+is now metadata-driven rather than pane-name-driven:
+
+- `macwsworkspacectl register-settings-extensions` enumerates the stock
+  `/System/Library/ExtensionKit/Extensions` directory, selects only the exact
+  `com.apple.Settings.extension.ui` extension point, registers each URL with
+  LaunchServices' own plug-in registrar, and validates the resulting platform-1
+  record.
+- `ensure_settings_extensions_runtime.sh` preserves each pane's native
+  entitlements, adds only the common MacWS service contract, prepares its
+  bundle-local dependency closure, and creates one uniquely identified iOS
+  first-image carrier per real bundle identifier. Sharing one carrier was
+  runtime-disproved: launchd reported `Two equal instances have unequal
+  identities` when the second pane reused Appearance's executable path.
+- the RunningBoard launch interposer reads the original strict
+  `RunningBoardLaunchedIdentity` from the stock overlay and substitutes only
+  that pane's unique carrier executable. The System Settings host and child
+  map the corresponding `.extensionkit.internal` and `.viewbridge` names to
+  the same unique identity; no extension-success result is forced.
+- production startup first performs a fingerprint, setuid, iOS
+  LaunchServices and trustcache verification. The expensive repair path runs
+  only after that verification fails; package postinstall remains the normal
+  cold-bootstrap repair owner.
+
+Runtime evidence from the iPadOS 16.3.1 target:
+
+```text
+[INFO] Settings ExtensionKit runtimes ready: 48
+[INFO] Settings ExtensionKit runtime verification passed: 48
+carrier_count=48
+LAUNCH_COUNT=30
+FAILURES=(none: no Launch failed, OSLaunchdErrorDomain, incompatible platform,
+          unequal identity, or missing unique settings service)
+```
+
+The clean production package containing this implementation is
+`com.kdt.macosbooter_0.3.4_iphoneos-arm64.deb` (1,520,164 bytes), SHA-256
+`7fc54aa6e43a276c0b611da7fb29c8f4baf06ac9e5d6d66ab2e080f3540e9c4a`.
+
+The cold process list contained the real System Settings host plus stock
+Appearance, Apple ID, Family, Touch ID, Headphones, Follow Up, Battery, Wallet,
+Game Controller, ClassKit, Classroom, Mouse, CD/DVD, VPN and Trackpad appex
+executables. VNC interaction then opened real Wi-Fi state, Bluetooth devices
+and the Display scaling/color-profile pane. The complete sidebar and two
+independent content panes are visible here:
+
+![All Ventura Settings sidebar entries and Appearance content](evidence/catalyst-system-apps-20260804/system-settings-all-panels-20260805.png)
+
+![Real Ventura Displays extension](evidence/catalyst-system-apps-20260804/system-settings-displays-20260805.png)
+
+`macwshostd` readiness now accepts any live executable whose strict appex path
+and `Info.plist` both identify the real Settings UI extension point. This fixes
+reopening on a persisted non-Appearance pane without weakening the visible
+window or extension-content postcondition.
 
 ## Maps uses a persistent UIKit carrier and a real FrontBoard identity
 

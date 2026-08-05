@@ -24,7 +24,7 @@ env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 t
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
-env	MACWS_CATALOG_REGISTRATION	off; one-shot=1	macwsworkspacectl register-settings-extension	Enables the chroot mount-namespace model only for the short-lived stock LaunchServices registration of standalone System Settings extensions; never persisted in a launchd plist.
+env	MACWS_CATALOG_REGISTRATION	off; one-shot=1	macwsworkspacectl register-settings-extensions	Enables the chroot mount-namespace model only for the short-lived stock LaunchServices registration of all standalone System Settings extensions; never persisted in a launchd plist.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.

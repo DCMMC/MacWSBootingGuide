@@ -9649,19 +9649,62 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define LOCATIOND_SIMULATION_ORIG "com.apple.locationd.simulation"
 #define LOCATIOND_SIMULATION_NEW \
     "com.apple.macosbooter.locationd.simulation"
+static const char *macws_settings_extension_bootstrap_name(
+    const char *name) {
+    if (!name) return name;
+    const char *program = getprogname();
+    const char *appExtension = getenv("MACWS_APP_EXTENSION");
+    BOOL isSettingsHost = program && !strcmp(program, "System Settings");
+    BOOL isSettingsExtension = appExtension && !strcmp(appExtension, "1");
+    if (!isSettingsHost && !isSettingsExtension) return name;
+
+    static const char extensionKitSuffix[] = ".extensionkit.internal";
+    static const char viewBridgeSuffix[] = ".viewbridge";
+    const char *suffix = NULL;
+    size_t nameLength = strlen(name);
+    size_t suffixLength = sizeof(extensionKitSuffix) - 1;
+    if (nameLength > suffixLength &&
+        !strcmp(name + nameLength - suffixLength, extensionKitSuffix)) {
+        suffix = extensionKitSuffix;
+    } else {
+        suffixLength = sizeof(viewBridgeSuffix) - 1;
+        if (nameLength > suffixLength &&
+            !strcmp(name + nameLength - suffixLength, viewBridgeSuffix))
+            suffix = viewBridgeSuffix;
+    }
+    if (!suffix) return name;
+
+    size_t identifierLength = nameLength - suffixLength;
+    if (identifierLength <= strlen("com.apple.") ||
+        strncmp(name, "com.apple.", strlen("com.apple.")) != 0)
+        return name;
+    for (size_t index = 0; index < identifierLength; index++) {
+        char character = name[index];
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '.' || character == '-')) return name;
+    }
+    static __thread char rewritten[512];
+    int length = snprintf(
+        rewritten, sizeof(rewritten),
+        "com.macwsguide.settings-extension-carrier.%.*s%s",
+        (int)identifierLength, name, suffix);
+    return length > 0 && (size_t)length < sizeof(rewritten)
+        ? rewritten : name;
+}
+
 static const char *macws_private_bootstrap_service_name(const char *name) {
     if (!name) return name;
     // The settings-extension launch proxy is the first iOS image submitted to
     // RunningBoard, so launchd allocates its managed endpoints under the proxy
-    // bundle identifier.  Ventura derives the peer names from Appearance's
-    // real LSApplicationExtensionRecord.  Runtime `launchctl procinfo` showed
-    // the exact carrier endpoint pair below; map names only, preserving the
+    // unique bundle identifier. Ventura derives each peer name from the real
+    // pane's LSApplicationExtensionRecord. Runtime `launchctl procinfo` showed
+    // the corresponding carrier endpoint pair; map names only, preserving the
     // original managed ports and ExtensionKit/ViewBridge wire protocols.
-    if (!strcmp(name,
-                "com.apple.Appearance-Settings.extension.extensionkit.internal"))
-        return "com.macwsguide.settings-extension-carrier.extensionkit.internal";
-    if (!strcmp(name, "com.apple.Appearance-Settings.extension.viewbridge"))
-        return "com.macwsguide.settings-extension-carrier.viewbridge";
+    const char *settingsEndpoint =
+        macws_settings_extension_bootstrap_name(name);
+    if (settingsEndpoint != name) return settingsEndpoint;
     if (!strcmp(name, CARENDER_ORIG))
         return CARENDER_NEW;
     // Keep the static-interpose route complete.  Most clients also pass
