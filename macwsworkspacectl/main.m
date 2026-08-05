@@ -70,6 +70,97 @@ static int ShowLaunchpad(void) {
     return WEXITSTATUS(status);
 }
 
+static int RegisterSettingsExtension(void) {
+    static NSString *const path =
+        @"/System/Library/ExtensionKit/Extensions/Appearance.appex";
+    static NSString *const expectedIdentifier =
+        @"com.apple.Appearance-Settings.extension";
+    BOOL directory = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path
+                                               isDirectory:&directory] ||
+        !directory) {
+        fprintf(stderr,
+                "macwsworkspacectl: settings extension is missing: %s\n",
+                path.fileSystemRepresentation);
+        return 66;
+    }
+
+    void *launchServices = dlopen(
+        "/System/Library/Frameworks/CoreServices.framework/Versions/A/"
+        "Frameworks/LaunchServices.framework/Versions/A/LaunchServices",
+        RTLD_NOW | RTLD_LOCAL);
+    typedef int32_t (*LSRegisterPluginURL)(CFURLRef);
+    LSRegisterPluginURL registerPluginURL = launchServices
+        ? (LSRegisterPluginURL)dlsym(launchServices,
+                                     "_LSRegisterPluginURL")
+        : NULL;
+    if (!registerPluginURL) {
+        fprintf(stderr,
+                "macwsworkspacectl: LaunchServices plug-in registrar is "
+                "unavailable: %s\n", dlerror() ?: "unknown error");
+        if (launchServices) dlclose(launchServices);
+        return 69;
+    }
+
+    NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
+    int32_t status = registerPluginURL((__bridge CFURLRef)url);
+    if (status != 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: stock LaunchServices registration "
+                "failed status=%d path=%s\n", status,
+                path.fileSystemRepresentation);
+        dlclose(launchServices);
+        return 1;
+    }
+
+    // Validate the record produced by LaunchServices rather than treating a
+    // zero status as sufficient.  Before this registration the real target
+    // database reported `invalid plugin / Container state is -1`; after the
+    // stock registrar it must resolve to the exact platform-1 Appearance
+    // record at the real bundle URL.
+    Class recordClass = NSClassFromString(@"LSApplicationExtensionRecord");
+    NSError *recordError = nil;
+    id record = recordClass
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              (id)recordClass, sel_registerName("alloc"))
+        : nil;
+    record = record
+        ? ((id (*)(id, SEL, id, id *))objc_msgSend)(
+              record, sel_registerName("initWithURL:error:"),
+              url, &recordError)
+        : nil;
+    NSString *identifier = record
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              record, sel_registerName("bundleIdentifier"))
+        : nil;
+    unsigned platform = record
+        ? ((unsigned (*)(id, SEL))objc_msgSend)(
+              record, sel_registerName("platform"))
+        : 0;
+    NSURL *recordURL = record
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              record, sel_registerName("URL"))
+        : nil;
+    BOOL valid = [identifier isEqualToString:expectedIdentifier] &&
+        platform == 1 && [recordURL.path isEqualToString:path];
+    if (!valid) {
+        fprintf(stderr,
+                "macwsworkspacectl: registered settings record failed "
+                "validation identifier=%s platform=%u url=%s error=%s\n",
+                identifier.UTF8String ?: "<nil>", platform,
+                recordURL.path.UTF8String ?: "<nil>",
+                recordError.description.UTF8String ?: "none");
+        dlclose(launchServices);
+        return 1;
+    }
+    fprintf(stdout,
+            "settings-extension-ready identifier=%s platform=%u path=%s\n",
+            identifier.UTF8String, platform,
+            recordURL.path.fileSystemRepresentation);
+    dlclose(launchServices);
+    return 0;
+}
+
 static int OpenApplication(const char *pathBytes) {
     NSString *path = [NSString stringWithUTF8String:pathBytes ?: ""];
     BOOL directory = NO;
@@ -445,6 +536,10 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 && strcmp(argv[1], "show-launchpad") == 0) {
             return ShowLaunchpad();
         }
+        if (argc == 2 &&
+            strcmp(argv[1], "register-settings-extension") == 0) {
+            return RegisterSettingsExtension();
+        }
         if (argc == 3 && strcmp(argv[1], "open-application") == 0) {
             return OpenApplication(argv[2]);
         }
@@ -468,7 +563,8 @@ int main(int argc, const char *argv[]) {
         }
         fprintf(stderr,
                 "usage: macwsworkspacectl set-wallpaper [path] | "
-                "show-launchpad | open-application /absolute/App.app | "
+                "show-launchpad | register-settings-extension | "
+                "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "
                 "reopen-process PID | inspect-appkit-reopen | "
                 "inspect-uikitmac\n");

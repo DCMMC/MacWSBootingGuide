@@ -48,6 +48,10 @@ WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
 SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
 FONTD_PLIST="$MACOS_DAEMONS/com.macwsguide.xtyped.plist"
+VIEWBRIDGE_PLIST="$MACOS_DAEMONS/com.macwsguide.viewbridge.plist"
+EXTENSIONKIT_PLIST="$MACOS_DAEMONS/com.macwsguide.extensionkit.plist"
+HISERVICES_PLIST="$MACOS_DAEMONS/com.macwsguide.hiservices.plist"
+GEOD_PLIST="$MACOS_DAEMONS/com.macwsguide.geod.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
@@ -65,6 +69,9 @@ PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
 LSD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd.plist"
 CFPREFSD_DAEMON_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-daemon.plist"
 CFPREFSD_AGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-agent.plist"
+MACOS_LOCATIOND_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.macos-locationd.plist"
+CORELOCATIONAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.corelocationagent.plist"
+LOCATIONBRIDGE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.locationbridge.plist"
 ICONSERVICESD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesd.plist"
 ICONSERVICESAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesagent.plist"
 FINDER_DESKTOP_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.finder-desktop.plist"
@@ -82,6 +89,9 @@ PBS_LABEL=com.macwsguide.pbs
 LSD_LABEL=com.macwsguide.lsd
 CFPREFSD_DAEMON_LABEL=com.macwsguide.cfprefsd-daemon
 CFPREFSD_AGENT_LABEL=com.macwsguide.cfprefsd-agent
+MACOS_LOCATIOND_LABEL=com.macwsguide.macos-locationd
+CORELOCATIONAGENT_LABEL=com.macwsguide.corelocationagent
+LOCATIONBRIDGE_LABEL=com.macwsguide.locationbridge
 ICONSERVICESD_LABEL=com.macwsguide.iconservicesd
 ICONSERVICESAGENT_LABEL=com.macwsguide.iconservicesagent
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
@@ -91,6 +101,10 @@ CONTROL_CENTER_LABEL=com.macwsguide.controlcenter
 INPUT_LABEL=UIKitApplication:com.macwsguide.input
 DISPLAY_LABEL=UIKitApplication:com.macwsguide.display
 INTEROP_LABEL=UIKitApplication:com.macwsguide.interop
+VIEWBRIDGE_LABEL=com.macwsguide.viewbridge
+EXTENSIONKIT_LABEL=com.macwsguide.extensionkit
+HISERVICES_LABEL=com.macwsguide.hiservices
+GEOD_LABEL=com.macwsguide.geod
 WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
@@ -164,6 +178,10 @@ CFPREFSD_BIN=/usr/local/libexec/macws-cfprefsd
 DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
+SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
+UICACHE=/var/jb/usr/bin/uicache
+SETTINGS_EXTENSION_CARRIER_ID=com.macwsguide.settings-extension-carrier
+SETTINGS_EXTENSION_CARRIER_APP=/var/jb/Applications/SettingsExtensionProxy.app
 WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png'
 VNC_DESKTOP=macOS-iPad
 
@@ -190,7 +208,7 @@ P_ICONSERVICESD='CoreServices/iconservicesd'
 P_ICONSERVICESAGENT='CoreServices/iconservicesagent'
 P_INPUTD='/usr/local/bin/macwsinputd'
 P_DISPLAYD='/usr/local/bin/macwsdisplayd'
-P_INTEROPD='/usr/local/bin/macwsinteropd'
+P_INTEROPD='/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd'
 P_VSCODE='Visual Studio Code.app/Contents/'
 P_CHROME150='Google Chrome.app/Contents/'
 
@@ -468,8 +486,28 @@ stop_ws_dependents() {
     launchctl remove "$DISPLAY_LABEL" 2>/dev/null
     launchctl unload "$INTEROP_PLIST" 2>/dev/null
     launchctl remove "$INTEROP_LABEL" 2>/dev/null
+    launchctl unload "$HISERVICES_PLIST" 2>/dev/null
+    launchctl unload "$GEOD_PLIST" 2>/dev/null
+    launchctl unload "$EXTENSIONKIT_PLIST" 2>/dev/null
+    launchctl unload "$VIEWBRIDGE_PLIST" 2>/dev/null
+    launchctl remove "$HISERVICES_LABEL" 2>/dev/null
+    launchctl remove "$GEOD_LABEL" 2>/dev/null
+    launchctl remove "$EXTENSIONKIT_LABEL" 2>/dev/null
+    launchctl remove "$VIEWBRIDGE_LABEL" 2>/dev/null
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
+
+    # These are on-demand Ventura location services, kept outside the
+    # auto-scanned LaunchDaemons directory so they can never race a missing
+    # chroot/WindowServer at jailbreak startup.  Unload their exact jobs;
+    # never use killall locationd because that would also terminate iPadOS's
+    # native system location daemon.
+    launchctl unload "$CORELOCATIONAGENT_PLIST" 2>/dev/null
+    launchctl remove "$CORELOCATIONAGENT_LABEL" 2>/dev/null
+    launchctl unload "$LOCATIONBRIDGE_PLIST" 2>/dev/null
+    launchctl remove "$LOCATIONBRIDGE_LABEL" 2>/dev/null
+    launchctl unload "$MACOS_LOCATIOND_PLIST" 2>/dev/null
+    launchctl remove "$MACOS_LOCATIOND_LABEL" 2>/dev/null
     launchctl unload "$CHROME150_PLIST" 2>/dev/null
     launchctl remove "$CHROME150_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
@@ -559,11 +597,28 @@ recover_ws_dependents() {
         return 1
     fi
 
+    publish_settings_service_contracts || {
+        log "watchdog: private macOS settings service contracts did not recover"
+        return 1
+    }
+    ensure_locationd_dirhelper_tree || {
+        log "watchdog: Ventura locationd cache tree did not recover"
+        return 1
+    }
+    [ ! -f "$MACOS_LOCATIOND_PLIST" ] ||
+        launchctl load "$MACOS_LOCATIOND_PLIST" 2>/dev/null
+    [ ! -f "$CORELOCATIONAGENT_PLIST" ] ||
+        launchctl load "$CORELOCATIONAGENT_PLIST" 2>/dev/null
     if [ -f "$INPUT_PLIST" ]; then
         launchctl load "$INPUT_PLIST" 2>/dev/null
     fi
     [ ! -f "$DISPLAY_PLIST" ] || launchctl load "$DISPLAY_PLIST" 2>/dev/null
     [ ! -f "$INTEROP_PLIST" ] || launchctl load "$INTEROP_PLIST" 2>/dev/null
+    # The native location producer publishes scalar fixes through interopd.
+    # Start it only after that Mach listener exists; an XPC client created
+    # before the listener on cold boot can lose its cached first fix.
+    [ ! -f "$LOCATIONBRIDGE_PLIST" ] ||
+        launchctl load "$LOCATIONBRIDGE_PLIST" 2>/dev/null
     [ ! -f "$LSD_PLIST" ] || launchctl load "$LSD_PLIST" 2>/dev/null
     [ ! -f "$ICONSERVICESD_PLIST" ] || \
         launchctl load "$ICONSERVICESD_PLIST" 2>/dev/null
@@ -792,6 +847,20 @@ ensure_cfprefsd_dirhelper_tree() {
         2>/dev/null || true
     chmod 1311 "$temporary_root" || return 1
     chmod 0700 "$temporary_user" "$temporary_leaf" || return 1
+}
+
+# Ventura's _locationd account is uid/gid 205 and Darwin dirhelper resolves
+# its per-user cache root to this deterministic hash.  Runtime on the target
+# reached `CLLocationController` only after the complete 0/C/T hierarchy
+# existed; without it locationd exits with "could not create persistent store
+# directory" and errno EIO.  Repair only this exact service-owned tree.
+ensure_locationd_dirhelper_tree() {
+    local location_root="$ROOTFS/var/folders/zz/zyxvpxvq6csfxvn_n00000sm00006d"
+    mkdir -p "$location_root/0" "$location_root/C" "$location_root/T" ||
+        return 1
+    chown -R 205:205 "$location_root" 2>/dev/null || true
+    chmod 0700 "$location_root" "$location_root/0" \
+        "$location_root/C" "$location_root/T" || return 1
 }
 
 # Self-heal both post-reboot failure classes before starting WindowServer.
@@ -1689,6 +1758,16 @@ cleanup_macos() {
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
 
+    # These are on-demand Ventura services outside the auto-scanned daemon
+    # directory. Unload exact jobs; killing `locationd` by process name would
+    # also terminate iPadOS's native location daemon.
+    launchctl unload "$CORELOCATIONAGENT_PLIST" 2>/dev/null
+    launchctl remove "$CORELOCATIONAGENT_LABEL" 2>/dev/null
+    launchctl unload "$LOCATIONBRIDGE_PLIST" 2>/dev/null
+    launchctl remove "$LOCATIONBRIDGE_LABEL" 2>/dev/null
+    launchctl unload "$MACOS_LOCATIOND_PLIST" 2>/dev/null
+    launchctl remove "$MACOS_LOCATIOND_LABEL" 2>/dev/null
+
     # 2) stray GUI clients (Terminal, VNC, Activity Monitor, ...)
     kill_by_pattern "$P_OSXVNC"
     kill_by_pattern "$P_TERMINAL"
@@ -1774,7 +1853,88 @@ seed_launchservices_database() {
         tail -n 20 "$LOGDIR/lsregister.log" 2>/dev/null || true
         return 1
     fi
+    # Appearance.appex is system-level ExtensionKit content, not embedded in
+    # System Settings.app.  The normal application scan can therefore leave
+    # its old PlugInKit record at Container state -1 after a cold database
+    # rebuild.  Use Ventura LaunchServices' own plug-in registrar and require
+    # an exact platform-1 record before publishing the settings services.
+    rm -f "$SETTINGS_EXTENSION_REGISTER_LOG"
+    if ! MACWS_CATALOG_REGISTRATION=1 \
+            "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+            register-settings-extension \
+            > "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
+        log "ERROR: System Settings extension registration failed."
+        tail -n 20 "$SETTINGS_EXTENSION_REGISTER_LOG" 2>/dev/null || true
+        return 1
+    fi
     log "LaunchServices application catalog ready."
+}
+
+prepare_settings_service_proxies() {
+    local proxy=""
+    # These freestanding iOS first images chroot before libSystem consumes
+    # launchd's one-shot context.  Package postinst establishes this invariant,
+    # but an incremental developer copy can replace a file and silently clear
+    # its setuid bit.  Reassert the exact owner/mode before publishing any
+    # service so cold production starts cannot regress to Connection Invalid.
+    for proxy in \
+        /var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary \
+        /var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy \
+        /var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy \
+        /var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy \
+        /var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy \
+        /var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy; do
+        if [ ! -x "$proxy" ]; then
+            log "ERROR: required macOS service proxy is missing: $proxy"
+            return 1
+        fi
+        chown root:wheel "$proxy" || return 1
+        chmod 4755 "$proxy" || return 1
+    done
+
+    # ExtensionKit resolves the Ventura Appearance.appex through the iOS
+    # RunningBoard carrier.  A valid macOS PlugInKit record alone is not
+    # sufficient: runtime on 2026-08-04 reproduced an ordered-in but empty
+    # System Settings shell while this carrier was absent from iOS
+    # LaunchServices.  Make the carrier registration a startup invariant, not
+    # a best-effort postinst side effect.
+    if [ ! -x "$UICACHE" ]; then
+        log "ERROR: uicache is missing; cannot verify the Settings extension carrier."
+        return 1
+    fi
+    if ! "$UICACHE" -l 2>/dev/null | grep -Fq \
+            "$SETTINGS_EXTENSION_CARRIER_ID : "; then
+        log "Registering the iOS System Settings extension carrier..."
+        "$UICACHE" -p "$SETTINGS_EXTENSION_CARRIER_APP" \
+            >/dev/null 2>&1 || return 1
+    fi
+    if ! "$UICACHE" -l 2>/dev/null | grep -Fq \
+            "$SETTINGS_EXTENSION_CARRIER_ID : "; then
+        log "ERROR: System Settings extension carrier is not registered in iOS LaunchServices."
+        return 1
+    fi
+    log "System Settings extension carrier registration ready."
+}
+
+publish_settings_service_contracts() {
+    local plist="" label=""
+    prepare_settings_service_proxies || return 1
+    for plist in "$VIEWBRIDGE_PLIST" "$EXTENSIONKIT_PLIST" \
+                 "$HISERVICES_PLIST" "$GEOD_PLIST"; do
+        if [ ! -f "$plist" ]; then
+            log "ERROR: required macOS service job is missing: $plist"
+            return 1
+        fi
+        launchctl load "$plist" || return 1
+    done
+    for label in "$VIEWBRIDGE_LABEL" "$EXTENSIONKIT_LABEL" \
+                 "$HISERVICES_LABEL" "$GEOD_LABEL"; do
+        launchctl list "$label" >/dev/null 2>&1 || {
+            log "ERROR: private macOS service contract was not registered: $label"
+            return 1
+        }
+    done
+    log "Private macOS ViewBridge, ExtensionKit, HIServices and GeoServices contracts ready."
 }
 
 verify_preferences_persistence() {
@@ -1934,12 +2094,49 @@ start_macos() {
 
     seed_launchservices_database || return 1
 
+    # System Settings' first visible pane is a stock ExtensionKit scene.  Its
+    # host synchronously resolves ViewBridgeAuxiliary and HIServices before
+    # Appearance is launched, so all three collision-free service contracts
+    # must exist before any GUI application can enter that dependency chain.
+    log "Publishing macOS ViewBridge, ExtensionKit and HIServices services..."
+    publish_settings_service_contracts || return 1
+
     log "Loading legacy macOS launchservicesd, input bridge, and WindowServer..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1
     launchctl load "$INPUT_PLIST" || return 1
     launchctl load "$WINDOWSERVER_PLIST" || return 1
     log "Waiting for WindowServer graphics initialization before GUI clients..."
     wait_for_initial_ws_ready "$ws_log_start_line" || return 1
+
+    # Maps uses Ventura CoreLocationAgent and the four Ventura desktop
+    # locationd protocols.  iPadOS publishes colliding but wire-incompatible
+    # services; libmachook maps the stock macOS peers together under private
+    # names.  Publish the on-demand jobs only after both LaunchServices and
+    # WindowServer are ready because CoreLocationAgent is an AppKit process.
+    log "Publishing private Ventura CoreLocation services..."
+    ensure_locationd_dirhelper_tree || {
+        log "ERROR: could not prepare Ventura locationd's uid-205 cache tree."
+        return 1
+    }
+    [ -f "$MACOS_LOCATIOND_PLIST" ] &&
+        [ -f "$CORELOCATIONAGENT_PLIST" ] &&
+        [ -f "$LOCATIONBRIDGE_PLIST" ] || {
+        log "ERROR: packaged Ventura CoreLocation launch contracts are missing."
+        return 1
+    }
+    rm -f "$LOGDIR/macos-locationd.log" "$LOGDIR/corelocationagent.log" \
+          "$LOGDIR/macwslocationd.log"
+    launchctl load "$MACOS_LOCATIOND_PLIST" || return 1
+    launchctl load "$CORELOCATIONAGENT_PLIST" || return 1
+    launchctl list "$MACOS_LOCATIOND_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: Ventura locationd contract was not registered."
+        return 1
+    }
+    launchctl list "$CORELOCATIONAGENT_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: CoreLocationAgent contract was not registered."
+        return 1
+    }
+    log "Private Ventura CoreLocation contracts ready."
 
     log "Starting DisplayStream IOSurface bridge..."
     launchctl load "$DISPLAY_PLIST" || return 1
@@ -1959,6 +2156,18 @@ start_macos() {
 
     log "Starting iOS/macOS clipboard and file bridge..."
     launchctl load "$INTEROP_PLIST" || return 1
+
+    # CLLocation's private keyed archive differs between iPadOS 16 and
+    # Ventura 13.  The native producer therefore sends validated scalar fields
+    # to macwsinteropd, which reconstructs the object with Ventura CoreLocation.
+    # Publish the native producer only after interopd owns its Mach service.
+    log "Starting native-to-Ventura location provider bridge..."
+    launchctl load "$LOCATIONBRIDGE_PLIST" || return 1
+    launchctl list "$LOCATIONBRIDGE_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: native-to-Ventura location bridge did not start."
+        return 1
+    }
+    log "Native-to-Ventura location provider bridge ready."
 
     log "Starting macOS Services database service (launchd job '$PBS_LABEL')..."
     rm -f "$LOGDIR/pbs.log"

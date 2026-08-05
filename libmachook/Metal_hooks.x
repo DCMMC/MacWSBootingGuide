@@ -385,11 +385,28 @@ static BOOL macws_needs_application_mount_namespace_compatibility(void) {
     // catalog/desktop process list below.
     if (getenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC")) return YES;
     const char *program = getprogname();
+    // The stock application scan is executed by lsregister itself, while the
+    // standalone System Settings extensions are registered by the narrowly
+    // scoped macwsworkspacectl transaction below.  Both are catalog owners,
+    // but macwsworkspacectl's other commands (notably show-launchpad) can
+    // spawn children and must not inherit the fsgetpath trampoline.  Admit
+    // only the explicit one-shot registration environment.
+    if (program && strcmp(program, "macwsworkspacectl") == 0 &&
+        getenv("MACWS_CATALOG_REGISTRATION") &&
+        strcmp(getenv("MACWS_CATALOG_REGISTRATION"), "1") == 0)
+        return YES;
     return program &&
         (strcmp(program, "Dock") == 0 ||
          strcmp(program, "Finder") == 0 ||
          strcmp(program, "iconservicesagent") == 0 ||
          strcmp(program, "iconservicesd") == 0 ||
+         // Runtime-confirmed in locationd-2026-08-05-115330.ips: the
+         // Ventura daemon's CLInternalServiceSilo recursively finalized 511
+         // CoreServicesInternal FileCache/CFURL frames after the host mount
+         // escaped its chroot. It consumes the same logical-root filesystem
+         // contract as Finder, while iPadOS locationd never loads libmachook.
+         strcmp(program, "locationd") == 0 ||
+         strcmp(program, "lsregister") == 0 ||
          strcmp(program, "launchservicesd") == 0 ||
          strcmp(program, "lsd") == 0);
 }
@@ -630,9 +647,9 @@ static void macws_install_launchpad_mount_namespace_compatibility(void) {
     // Runtime-confirmed on iPadOS 16.3: Terminal's fork child inherited that
     // COW page as r--/rw- and faulted at mach_port_construct+0 during
     // _pthread_main_thread_postfork_init.  Keep both halves of the namespace
-    // model in the same narrowly-scoped catalog/desktop processes (Dock,
-    // Finder, IconServices, lsd and launchservicesd); ordinary applications
-    // retain the stock kernel entry.
+    // model in the same narrowly-scoped filesystem-metadata consumers (Dock,
+    // Finder, IconServices, lsd, launchservicesd, and Ventura locationd);
+    // ordinary applications retain the stock kernel entry.
     if (!macws_needs_application_mount_namespace_compatibility()) return;
 
     const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
@@ -8808,8 +8825,17 @@ static void install_agx_init_redirect(Class agx);
             // (FATAL: driver shader binary file not found), leaving
             // Device->0x318 (the Compiler wrapper) uninitialised → every
             // shader-variant lookup later crashes on null deref.
-            NSBundle *agxBundle = [NSBundle bundleWithPath:
-                @"/System/Library/Extensions/AGXMetal13_3.bundle"];
+            // Do not pass an on-device-linked Objective-C constant string
+            // across this arm64e Foundation boundary.  Maps runtime-confirmed
+            // that __CFConstantStringClassReference was not authenticated for
+            // the macOS cache context and PAC-faulted inside
+            // -[NSBundle initWithPath:].  Construct the same immutable values
+            // through Foundation at runtime, so their isa comes from the live
+            // process rather than this injected image's broken constant-
+            // string relocation.
+            NSString *agxBundlePath = [NSString stringWithUTF8String:
+                "/System/Library/Extensions/AGXMetal13_3.bundle"];
+            NSBundle *agxBundle = [NSBundle bundleWithPath:agxBundlePath];
             fprintf(stderr, "#### MACWS_AGX_NATIVE +[NSBundle bundleWithPath:AGXMetal13_3.bundle] = %p id=%s\n",
                 agxBundle, agxBundle ? [agxBundle.bundleIdentifier UTF8String] : "(nil)");
             if (agxBundle) {
@@ -8821,7 +8847,10 @@ static void install_agx_init_redirect(Class agx);
                 fprintf(stderr, "#### MACWS_AGX_NATIVE bundle loadAndReturnError: %d (err=%s) loaded=%d\n",
                     loaded, err ? [[err description] UTF8String] : "nil",
                     [agxBundle isLoaded]);
-                NSString *dsPath = [agxBundle pathForResource:@"ds" ofType:@"g13g"];
+                NSString *dsName = [NSString stringWithUTF8String:"ds"];
+                NSString *dsType = [NSString stringWithUTF8String:"g13g"];
+                NSString *dsPath = [agxBundle pathForResource:dsName
+                                                       ofType:dsType];
                 fprintf(stderr, "#### MACWS_AGX_NATIVE bundle pathForResource:ds.g13g = %s\n",
                     dsPath ? [dsPath UTF8String] : "(nil)");
             }
@@ -12108,6 +12137,18 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.lsd.trustedsignatures";
     if (!strcmp(name, "com.apple.security.translocation"))
         return "com.apple.macosbooter.security.translocation";
+    if (!strcmp(name, "com.apple.locationd.desktop.agent"))
+        return "com.apple.macosbooter.locationd.desktop.agent";
+    if (!strcmp(name, "com.apple.locationd.desktop.registration"))
+        return "com.apple.macosbooter.locationd.desktop.registration";
+    if (!strcmp(name, "com.apple.locationd.desktop.spi"))
+        return "com.apple.macosbooter.locationd.desktop.spi";
+    if (!strcmp(name, "com.apple.locationd.desktop.synchronous"))
+        return "com.apple.macosbooter.locationd.desktop.synchronous";
+    if (!strcmp(name, "com.apple.locationd.simulation"))
+        return "com.apple.macosbooter.locationd.simulation";
+    if (!strcmp(name, "com.apple.geod"))
+        return "com.apple.macosbooter.geod";
     // Mac Catalyst clients and Ventura's UIKitSystem publish the same
     // FrontBoard workspace Mach service name that iPadOS SpringBoard owns.
     // Runtime-confirmed on 2026-08-03: an unisolated chroot Maps request went
@@ -12130,6 +12171,8 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.ViewBridgeAuxiliary";
     if (!strcmp(name, "com.apple.extensionkitservice"))
         return "com.apple.macosbooter.extensionkitservice";
+    if (!strcmp(name, "com.apple.hiservices-xpcservice"))
+        return "com.apple.macosbooter.hiservices-xpcservice";
     return name;
 }
 

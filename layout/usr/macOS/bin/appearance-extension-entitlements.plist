@@ -62,6 +62,7 @@
         <string>com.apple.macosbooter.security.translocation</string>
         <string>com.apple.macosbooter.ViewBridgeAuxiliary</string>
         <string>com.apple.macosbooter.extensionkitservice</string>
+        <string>com.apple.macosbooter.hiservices-xpcservice</string>
         <string>com.apple.macosbooter.CARenderServer</string>
         <string>com.apple.windowserver</string>
         <string>com.apple.windowserver.active</string>

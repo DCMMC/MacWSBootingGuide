@@ -152,6 +152,19 @@ static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
                "Versions/A/XPCServices/extensionkitservice.xpc/Contents/"
                "MacOS/extensionkitservice";
     }
+    if (MacWSStringContains(program, "GeodProxy")) {
+        return "/System/Library/PrivateFrameworks/GeoServices.framework/"
+               "Versions/A/XPCServices/com.apple.geod.xpc/Contents/MacOS/"
+               "com.apple.geod";
+    }
+    if (MacWSStringContains(program, "WriteConfigProxy")) {
+        return "/System/Library/PrivateFrameworks/"
+               "SystemAdministration.framework/XPCServices/"
+               "writeconfig.xpc/Contents/MacOS/writeconfig";
+    }
+    if (MacWSStringContains(program, "LocationdProxy")) {
+        return "/usr/libexec/locationd";
+    }
     return "/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/"
            "XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/"
            "ViewBridgeAuxiliary";

@@ -7,6 +7,19 @@
 
 #include "macws_control_protocol.h"
 
+// Procursus/Theos' public iOS 16 XPC shim intentionally declares only a
+// small subset of libxpc.  Keep this witness buildable on-device without
+// weakening its reply validation; the symbols below are exported by the
+// platform libxpc and are present in Apple's complete SDK headers.
+#ifndef XPC_TYPE_DICTIONARY
+extern const struct _xpc_type_s _xpc_type_dictionary;
+#define XPC_TYPE_DICTIONARY (&_xpc_type_dictionary)
+xpc_type_t xpc_get_type(xpc_object_t object);
+char *xpc_copy_description(xpc_object_t object);
+bool xpc_dictionary_get_bool(xpc_object_t dictionary, const char *key);
+int64_t xpc_dictionary_get_int64(xpc_object_t dictionary, const char *key);
+#endif
+
 // Minimal on-device witness for the typed MacWS Host control service.  This
 // deliberately exposes only the same fixed operations as the public protocol;
 // it is not a shell bridge and cannot launch arbitrary commands.

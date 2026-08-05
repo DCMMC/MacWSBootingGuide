@@ -135,6 +135,9 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) CGFloat windowBackingScale;
 @property(nonatomic) size_t lastSurfaceWidth;
 @property(nonatomic) size_t lastSurfaceHeight;
+// CGDisplayStreamStop is asynchronous.  A generation token keeps a delayed
+// exact-window recreation from resurrecting an obsolete Scene subscription.
+@property(nonatomic) uint64_t geometryRestartGeneration;
 @property(nonatomic) NSMutableDictionary<NSNumber *, MacWSTransientLayer *> *transientLayers;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *outstandingByLayer;
 - (void)stopStream;
@@ -446,7 +449,8 @@ static void SendWindowList(MacWSDisplayClient *client) {
         NSInteger layer = [info[(id)kCGWindowLayer] integerValue];
         if (!metricsValue || layer != 0) continue;
         [metricsValue getValue:&metrics];
-        if ((metrics.flags & MacWSStreamWindowVisible) == 0) continue;
+        if ((metrics.flags & MacWSStreamWindowVisible) == 0 ||
+            (metrics.flags & MacWSStreamWindowTransient) != 0) continue;
         MacWSStreamWindowDescriptor descriptor = WindowDescriptor(
             info, &metrics);
         if (descriptor.windowID == 0 || descriptor.ownerPID <= 1 ||
@@ -1005,14 +1009,36 @@ static void ScheduleGeometryStreamRestart(void) {
                 client.lastSurfaceHeight == expectedHeight) {
                 continue;
             }
-            DisplayLog(@"geometry-stream-restart window=%u old-stream=%llu current=%zux%zu expected=%ux%u",
+            DisplayLog(@"geometry-stream-restart window=%u old-stream=%llu current=%zux%zu expected=%ux%u phase=stop",
                        client.windowID,
                        (unsigned long long)client.streamID,
                        client.lastSurfaceWidth, client.lastSurfaceHeight,
                        expectedWidth, expectedHeight);
+            uint64_t restartGeneration = ++client.geometryRestartGeneration;
+            uint32_t restartWindowID = client.windowID;
             client.windowBackingScale = 0.0;
             [client stopTransientLayers];
-            StartClientStream(client);
+            [client stopStream];
+            // Runtime-confirmed on Maps/System Settings: recreating in the
+            // same display-queue turn eventually made
+            // SLSHWCaptureStreamCreateWithWindow return NULL for every Scene;
+            // reloading displayd immediately restored creation.  Leave one
+            // bounded release interval for SkyLight to retire the old graph.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         250 * NSEC_PER_MSEC),
+                           DisplayQueue, ^{
+                if (![Clients containsObject:client] ||
+                    !client.subscriptionActive ||
+                    client.mode != MacWSStreamModeWindow ||
+                    client.windowID != restartWindowID ||
+                    client.geometryRestartGeneration != restartGeneration)
+                    return;
+                DisplayLog(@"geometry-stream-restart window=%u generation=%llu phase=create",
+                           client.windowID,
+                           (unsigned long long)restartGeneration);
+                StartClientStream(client);
+                ScheduleTransientReconcile(0);
+            });
         }
         ScheduleTransientReconcile(0);
     });
@@ -1020,6 +1046,7 @@ static void ScheduleGeometryStreamRestart(void) {
 
 static void StartSubscription(MacWSDisplayClient *client,
                               MacWSStreamMode mode, uint32_t windowID) {
+    client.geometryRestartGeneration++;
     if (mode == MacWSStreamModeFullscreen) {
         // Runtime-confirmed on 2026-08-03: a stale fullscreen client kept
         // stream 10 and its desktop layers alive while the foreground Scene
@@ -1212,6 +1239,11 @@ static void ReconcileTransientStreams(void) {
                 (__bridge CFDictionaryRef)baseInfo[(id)kCGWindowBounds],
                 &baseBounds) || CGRectIsEmpty(baseBounds)) continue;
         int32_t ownerPID = [baseInfo[(id)kCGWindowOwnerPID] intValue];
+        NSDictionary<NSNumber *, NSValue *> *processMetrics =
+            CopyWindowMetrics(ownerPID);
+        MacWSWindowMetricsEntry baseMetrics = {0};
+        NSValue *baseMetricsValue = processMetrics[@(client.windowID)];
+        if (baseMetricsValue) [baseMetricsValue getValue:&baseMetrics];
         CGFloat scale = client.windowBackingScale > 0.0
             ? client.windowBackingScale : MainDisplayBackingScale();
         if (!isfinite(scale) || scale < 0.5 || scale > 8.0) continue;
@@ -1224,8 +1256,18 @@ static void ReconcileTransientStreams(void) {
             uint32_t candidateWindowID =
                 [info[(id)kCGWindowNumber] unsignedIntValue];
             NSInteger level = [info[(id)kCGWindowLayer] integerValue];
+            MacWSWindowMetricsEntry candidateMetrics = {0};
+            NSValue *candidateMetricsValue =
+                processMetrics[@(candidateWindowID)];
+            if (candidateMetricsValue)
+                [candidateMetricsValue getValue:&candidateMetrics];
+            BOOL logicalTransient = level == 0 &&
+                (candidateMetrics.flags & MacWSStreamWindowTransient) != 0 &&
+                baseMetrics.logicalGroupID != 0 &&
+                candidateMetrics.logicalGroupID == baseMetrics.logicalGroupID;
             if (attached >= 8 || candidateWindowID == 0 ||
-                candidateWindowID == client.windowID || level == 0 ||
+                candidateWindowID == client.windowID ||
+                (level == 0 && !logicalTransient) ||
                 [info[(id)kCGWindowOwnerPID] intValue] != ownerPID ||
                 [info[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
             CGRect candidateBounds = CGRectZero;
@@ -1250,8 +1292,13 @@ static void ReconcileTransientStreams(void) {
                 layer.windowID = candidateWindowID;
                 client.transientLayers[key] = layer;
             }
+            // An AppKit sheet can be a level-0 SkyLight window even though it
+            // belongs above its presenting document. The metrics sidecar is
+            // the owning process's authoritative relationship; assign only
+            // those children a synthetic positive compositor level.
+            NSInteger compositorLevel = logicalTransient ? 1 : level;
             layer.level = (int32_t)MAX(INT32_MIN,
-                MIN((NSInteger)INT32_MAX, level));
+                MIN((NSInteger)INT32_MAX, compositorLevel));
             layer.destinationBounds = destination;
             layer.missCount = 0;
             if (isNew || !layer.stream) StartTransientLayer(layer);
@@ -1343,6 +1390,7 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
         }
         StartSubscription(client, mode, (uint32_t)windowID);
     } else if (strcmp(operation, MACWS_STREAM_OP_UNSUBSCRIBE) == 0) {
+        client.geometryRestartGeneration++;
         client.subscriptionActive = NO;
         client.mode = 0;
         client.windowID = 0;

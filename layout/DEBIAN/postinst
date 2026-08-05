@@ -7,7 +7,11 @@ VIEWBRIDGE_PROXY=/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XP
 HISERVICES_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
 OPEN_SAVE_PANEL_PROXY=/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy
 EXTENSIONKIT_PROXY=/var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy
+GEOD_PROXY=/var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy
+WRITE_CONFIG_PROXY=/var/jb/usr/macOS/PrivateFrameworks/SystemAdministration.framework/XPCServices/WriteConfigProxy.xpc/WriteConfigProxy
+LOCATIOND_PROXY=/var/jb/usr/macOS/PrivateFrameworks/CoreLocation.framework/XPCServices/LocationdProxy.xpc/LocationdProxy
 SETTINGS_EXTENSION_PROXY=/var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy
+LOCATION_BRIDGE=/var/jb/usr/macOS/bin/macwslocationd
 LEGACY_GLASS_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.glassdemo.plist
 DISABLED_DAEMONS=/var/jb/usr/macOS/disabled-launchdaemons
 MACHO_PATCHER=/var/jb/usr/macOS/bin/set_macos_version.py
@@ -17,6 +21,11 @@ ENTITLEMENTS=/var/jb/usr/macOS/bin/entitlements.plist
 CFPREFSD_ENTITLEMENTS=/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist
 EXTENSIONKIT_ENTITLEMENTS=/var/jb/usr/macOS/bin/extensionkitservice-entitlements.plist
 APPEARANCE_ENTITLEMENTS=/var/jb/usr/macOS/bin/appearance-extension-entitlements.plist
+CORELOCATIONAGENT_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/corelocationagent-native-entitlements.plist
+LOCATIOND_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/locationd-native-entitlements.plist
+GEOD_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/geod-native-entitlements.plist
+INTEROP_LOCATION_ENTITLEMENTS=/var/jb/usr/macOS/bin/interop-location-entitlements.plist
+CODE_REQUIREMENT_WRITER=/var/jb/usr/macOS/bin/write_code_requirement.py
 LIPO=/var/jb/usr/bin/lipo
 ROOTFS=/var/mnt/rootfs
 
@@ -94,9 +103,67 @@ trust_installed_macho() {
     done
 }
 
+ensure_interop_signature() {
+    path="$1"
+    [ -f "$path" ] || return 0
+    [ -f "$INTEROP_LOCATION_ENTITLEMENTS" ] || return 1
+    [ -f "$CODE_REQUIREMENT_WRITER" ] || return 1
+    entitlements=$(/var/jb/usr/bin/ldid -e "$path" 2>/dev/null || true)
+    needs_signature=0
+    printf '%s\n' "$entitlements" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+        needs_signature=1
+    printf '%s\n' "$entitlements" |
+        grep -Fq '<key>com.apple.locationd.simulation</key>' ||
+        needs_signature=1
+    /var/jb/usr/bin/ldid -q "$path" 2>/dev/null | strings |
+        grep -Fqx 'com.macwsguide.interopd' || needs_signature=1
+    if /var/jb/usr/bin/ldid -q "$path" 2>/dev/null | strings |
+        grep -Fq 'subject.CN'; then
+        needs_signature=1
+    fi
+    if [ "$needs_signature" -eq 1 ]; then
+        requirement_file="/tmp/macws-code-requirement.$$.bin"
+        /var/jb/usr/bin/python3 "$CODE_REQUIREMENT_WRITER" \
+            com.macwsguide.interopd "$requirement_file" || return 1
+        /var/jb/usr/bin/ldid -Icom.macwsguide.interopd \
+            -Q"$requirement_file" -S"$ENTITLEMENTS" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        /var/jb/usr/bin/ldid -Icom.macwsguide.interopd \
+            -Q"$requirement_file" -S"$INTEROP_LOCATION_ENTITLEMENTS" \
+            -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        # This ldid build can grow __LINKEDIT on the first merge; settle the
+        # final page hashes before registering the persistent CDHash.
+        /var/jb/usr/bin/ldid -Icom.macwsguide.interopd \
+            -Q"$requirement_file" -S"$INTEROP_LOCATION_ENTITLEMENTS" \
+            -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        rm -f "$requirement_file"
+    fi
+    ! /var/jb/usr/bin/ldid -q "$path" 2>/dev/null | strings |
+        grep -Fq 'subject.CN' || return 1
+    trust_installed_macho "$path"
+}
+
 trust_installed_macho "$VIEWBRIDGE_PROXY"
+trust_installed_macho "$HISERVICES_PROXY"
+trust_installed_macho "$OPEN_SAVE_PANEL_PROXY"
 trust_installed_macho "$EXTENSIONKIT_PROXY"
+trust_installed_macho "$GEOD_PROXY"
+trust_installed_macho "$WRITE_CONFIG_PROXY"
+trust_installed_macho "$LOCATIOND_PROXY"
 trust_installed_macho "$SETTINGS_EXTENSION_PROXY"
+trust_installed_macho "$LOCATION_BRIDGE"
+trust_installed_macho /var/jb/usr/macOS/bin/launchdchrootexec
+ensure_interop_signature \
+    /var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd || exit 1
 
 ensure_chroot_application_signature() {
     path="$1"
@@ -106,6 +173,44 @@ ensure_chroot_application_signature() {
             grep -q '<key>com.apple.private.graphics-restart-no-kill</key>'; then
         /var/jb/usr/bin/ldid -S"$ENTITLEMENTS" -M "$path" || return 1
     fi
+    trust_installed_macho "$path"
+}
+
+ensure_chroot_identifier_requirement_signature() {
+    path="$1"
+    identifier="$2"
+    [ -f "$path" ] || return 0
+    [ -f "$CODE_REQUIREMENT_WRITER" ] || return 1
+
+    entitlements=$(/var/jb/usr/bin/ldid -e "$path" 2>/dev/null || true)
+    needs_signature=0
+    printf '%s\n' "$entitlements" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+        needs_signature=1
+    /var/jb/usr/bin/ldid -h "$path" 2>/dev/null |
+        grep -Fqx "Identifier=$identifier" || needs_signature=1
+    /var/jb/usr/bin/ldid -q "$path" 2>/dev/null | strings |
+        grep -Fqx "$identifier" || needs_signature=1
+
+    if [ "$needs_signature" -eq 1 ]; then
+        requirement_file="/tmp/macws-code-requirement.$$.bin"
+        /var/jb/usr/bin/python3 "$CODE_REQUIREMENT_WRITER" \
+            "$identifier" "$requirement_file" || return 1
+        /var/jb/usr/bin/ldid -I"$identifier" -Q"$requirement_file" \
+            -S"$ENTITLEMENTS" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        /var/jb/usr/bin/ldid -I"$identifier" -Q"$requirement_file" \
+            -S"$ENTITLEMENTS" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        rm -f "$requirement_file"
+    fi
+
+    /var/jb/usr/bin/ldid -q "$path" 2>/dev/null | strings |
+        grep -Fqx "$identifier" || return 1
     trust_installed_macho "$path"
 }
 
@@ -142,6 +247,33 @@ ensure_chroot_appearance_signature() {
             -S"$APPEARANCE_ENTITLEMENTS" -M "$path" || return 1
         /var/jb/usr/bin/ldid -Icom.apple.Appearance-Settings.extension \
             -S"$APPEARANCE_ENTITLEMENTS" -M "$path" || return 1
+    fi
+    trust_installed_macho "$path"
+}
+
+ensure_chroot_native_service_signature() {
+    path="$1"
+    native_entitlements="$2"
+    native_marker="$3"
+    identifier="$4"
+    [ -f "$path" ] || return 0
+    [ -f "$native_entitlements" ] || return 1
+    entitlements=$(/var/jb/usr/bin/ldid -e "$path" 2>/dev/null || true)
+    needs_signature=0
+    printf '%s\n' "$entitlements" |
+        grep -q '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+        needs_signature=1
+    printf '%s\n' "$entitlements" | grep -Fq "$native_marker" ||
+        needs_signature=1
+    /var/jb/usr/bin/ldid -h "$path" 2>/dev/null |
+        grep -q "^Identifier=$identifier$" || needs_signature=1
+    if [ "$needs_signature" -eq 1 ]; then
+        /var/jb/usr/bin/ldid -I"$identifier" -S"$ENTITLEMENTS" -M "$path" ||
+            return 1
+        /var/jb/usr/bin/ldid -I"$identifier" -S"$native_entitlements" -M "$path" ||
+            return 1
+        /var/jb/usr/bin/ldid -I"$identifier" -S"$native_entitlements" -M "$path" ||
+            return 1
     fi
     trust_installed_macho "$path"
 }
@@ -231,10 +363,43 @@ if [ -d "$ROOTFS/System/Library" ]; then
         install_chroot_runtime "/var/jb/usr/macOS/bin/$bridge" \
             "$ROOTFS/usr/local/bin/$bridge" || exit 1
     done
+    interop_bundle_source=/var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents
+    interop_bundle_target="$ROOTFS/usr/local/libexec/MacWSInteropService.app/Contents"
+    if [ -f "$interop_bundle_source/MacOS/macwsinteropd" ]; then
+        mkdir -p "$interop_bundle_target/MacOS"
+        cp -f "$interop_bundle_source/Info.plist" \
+            "$interop_bundle_target/Info.plist" || exit 1
+        rm -f "$interop_bundle_target/MacOS/macwsinteropd"
+        cp -f "$interop_bundle_source/MacOS/macwsinteropd" \
+            "$interop_bundle_target/MacOS/macwsinteropd" || exit 1
+        chmod 644 "$interop_bundle_target/Info.plist"
+        chmod 755 "$interop_bundle_target/MacOS/macwsinteropd"
+		# CoreLocationAgent uses macOS Security's live-code validation, which
+		# rejects the ldid-only bundle even though AMFI accepts its CDHash.
+		# Re-seal the complete app with Ventura's native ad-hoc signer.  The
+		# operation is deterministic on the target and preserves the merged
+		# native/project entitlements plus identifier-only requirement.
+		/var/jb/usr/macOS/bin/launchdchrootexec 0 0 "$ROOTFS" \
+			/usr/bin/codesign --force --sign - --timestamp=none \
+			--preserve-metadata=identifier,entitlements,requirements \
+			/usr/local/libexec/MacWSInteropService.app || exit 1
+		/var/jb/usr/macOS/bin/launchdchrootexec 0 0 "$ROOTFS" \
+			/usr/bin/codesign --verify --strict --verbose=2 \
+			/usr/local/libexec/MacWSInteropService.app || exit 1
+		/var/jb/usr/bin/ldid -e \
+			"$interop_bundle_target/MacOS/macwsinteropd" 2>/dev/null |
+			grep -Fq '<key>com.apple.locationd.simulation</key>' || exit 1
+		/var/jb/usr/bin/ldid -h \
+			"$interop_bundle_target/MacOS/macwsinteropd" 2>/dev/null |
+			grep -Fqx 'Identifier=com.macwsguide.interopd' || exit 1
+        trust_installed_macho \
+            "$interop_bundle_target/MacOS/macwsinteropd"
+    fi
     ensure_chroot_application_signature \
         "$ROOTFS/System/Applications/System Settings.app/Contents/MacOS/System Settings" || exit 1
-    ensure_chroot_application_signature \
-        "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" || exit 1
+    ensure_chroot_identifier_requirement_signature \
+        "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" \
+        'com.apple.Maps' || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem" || exit 1
     ensure_chroot_application_signature \
@@ -247,6 +412,21 @@ if [ -d "$ROOTFS/System/Library" ]; then
     bash /var/jb/usr/macOS/bin/ensure_appearance_runtime.sh || exit 1
     ensure_chroot_appearance_signature \
         "$ROOTFS/System/Library/ExtensionKit/Extensions/Appearance.appex/Contents/MacOS/Appearance" || exit 1
+    ensure_chroot_native_service_signature \
+        "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
+        "$CORELOCATIONAGENT_NATIVE_ENTITLEMENTS" \
+        '<key>com.apple.locationd.authorizeapplications</key>' \
+        'com.apple.CoreLocationAgent' || exit 1
+    ensure_chroot_native_service_signature \
+        "$ROOTFS/usr/libexec/locationd" \
+        "$LOCATIOND_NATIVE_ENTITLEMENTS" \
+        '<key>com.apple.private.security.storage.locationd</key>' \
+        'com.apple.locationd' || exit 1
+    ensure_chroot_native_service_signature \
+        "$ROOTFS/System/Library/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/com.apple.geod.xpc/Contents/MacOS/com.apple.geod" \
+        "$GEOD_NATIVE_ENTITLEMENTS" \
+        '<key>com.apple.private.network.socket-delegate</key>' \
+        'com.apple.geod' || exit 1
     # cfprefsd is launched before autosignd can help.  Keep the stock image
     # untouched and install a private copy with its proven minimal profile;
     # the generic project profile's system-container entitlement is invalid in
@@ -300,7 +480,10 @@ for proxy in \
     "$VIEWBRIDGE_PROXY" \
     "$HISERVICES_PROXY" \
     "$OPEN_SAVE_PANEL_PROXY" \
-    "$EXTENSIONKIT_PROXY"; do
+    "$EXTENSIONKIT_PROXY" \
+    "$GEOD_PROXY" \
+    "$WRITE_CONFIG_PROXY" \
+    "$LOCATIOND_PROXY"; do
     if [ -x "$proxy" ]; then
         chown root:wheel "$proxy"
         chmod 4755 "$proxy"

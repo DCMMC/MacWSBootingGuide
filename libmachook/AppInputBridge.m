@@ -3699,6 +3699,12 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                             orderedExisting ? "YES" : "NO");
                         fflush(stderr);
                     }
+                    // This reopen request is also the launcher's liveness
+                    // handshake.  Force one new metrics generation even when
+                    // the window set is byte-for-byte unchanged; otherwise a
+                    // stale Visible record can make a windowless/hung process
+                    // look successfully reopened forever.
+                    unlink(MacWSWindowMetricsPath);
                     MacWSPublishWindowMetrics();
                     MacWSNotifyDisplayCatalogChanged('r');
                 });
@@ -5446,7 +5452,56 @@ static void *MacWSAppInputThread(void *unused) {
 // constraints; macwsdisplayd must not invent a product-wide minimum width.
 static char MacWSLogicalWindowGroupAssociationKey;
 
-static uint32_t MacWSLogicalWindowGroupID(id window) {
+// AppKit sheets and application-modal panels are separate level-0 CGWindows
+// on Ventura.  Treating every level-0 window as a user document made Maps'
+// 482x600 What's New panel win over its 1024x768 map window and gave that
+// panel its own iPadOS Scene.  Resolve the real presenting window first so
+// the catalog can expose one logical window and displayd can composite the
+// child as an IOSurface overlay.
+static id MacWSPresentingWindow(id window, id application) {
+    if (!window) return nil;
+    const SEL parentSelectors[] = {
+        sel_registerName("sheetParent"),
+        sel_registerName("parentWindow"),
+    };
+    for (NSUInteger index = 0;
+         index < sizeof(parentSelectors) / sizeof(parentSelectors[0]);
+         index++) {
+        SEL selector = parentSelectors[index];
+        if (!((MacWSMsgBoolSEL)objc_msgSend)(
+                window, sel_registerName("respondsToSelector:"), selector))
+            continue;
+        id parent = ((MacWSMsgID)objc_msgSend)(window, selector);
+        if (parent && parent != window) return parent;
+    }
+    SEL modalSelector = sel_registerName("modalWindow");
+    SEL mainSelector = sel_registerName("mainWindow");
+    if (application &&
+        ((MacWSMsgBoolSEL)objc_msgSend)(
+            application, sel_registerName("respondsToSelector:"),
+            modalSelector) &&
+        ((MacWSMsgID)objc_msgSend)(application, modalSelector) == window &&
+        ((MacWSMsgBoolSEL)objc_msgSend)(
+            application, sel_registerName("respondsToSelector:"),
+            mainSelector)) {
+        id mainWindow = ((MacWSMsgID)objc_msgSend)(application, mainSelector);
+        if (mainWindow && mainWindow != window) return mainWindow;
+    }
+    return nil;
+}
+
+static id MacWSRootPresentingWindow(id window, id application) {
+    id current = window;
+    for (NSUInteger depth = 0; depth < 16; depth++) {
+        id parent = MacWSPresentingWindow(current, application);
+        if (!parent || parent == current) break;
+        current = parent;
+    }
+    return current;
+}
+
+static uint32_t MacWSLogicalWindowGroupID(id window, id application) {
+    window = MacWSRootPresentingWindow(window, application);
     NSInteger ownNumber = ((MacWSMsgInteger)objc_msgSend)(
         window, sel_registerName("windowNumber"));
     if (ownNumber <= 0 || (uint64_t)ownNumber > UINT32_MAX) return 0;
@@ -5606,12 +5661,15 @@ static void MacWSPublishWindowMetrics(void) {
         // through displayd's transient stream and cannot satisfy launcher
         // readiness or create their own Scene.
         BOOL visible = orderedVisible && windowLevel == 0;
+        id presentingWindow = MacWSPresentingWindow(window, application);
+        BOOL transient = presentingWindow != nil;
         MacWSWindowMetricsEntry entry = {
             .windowID = (uint32_t)number,
             .flags = (resizable ? MacWSStreamWindowResizable : 0) |
                 (visible ? MacWSStreamWindowVisible : 0) |
+                (transient ? MacWSStreamWindowTransient : 0) |
                 (window == keyWindow ? MacWSStreamWindowFocused : 0),
-            .logicalGroupID = MacWSLogicalWindowGroupID(window),
+            .logicalGroupID = MacWSLogicalWindowGroupID(window, application),
             .minimumLogicalWidth = (float)minimum.width,
             .minimumLogicalHeight = (float)minimum.height,
         };

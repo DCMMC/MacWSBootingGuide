@@ -168,16 +168,11 @@ static void MacWSVerifyMaximizationPostcondition(
             RTLD_DEFAULT, "SBLayoutRolePrimary");
         NSInteger *centerRoleAddress = (NSInteger *)dlsym(
             RTLD_DEFAULT, "SBLayoutRoleCenter");
-        BOOL landed = actualLayout && actualItem && primaryRoleAddress &&
+        BOOL modelFound = actualLayout && actualItem && primaryRoleAddress &&
             centerRoleAddress;
-        if (landed) {
-            landed = expectedFullscreen
-                ? actualRole == *primaryRoleAddress && actualCenter == 0
-                : actualRole == *centerRoleAddress && actualCenter == 1;
-        }
         MacWSWindowingLogLine([NSString stringWithFormat:
-            @"maximization-postcondition scene=%@ landed=%@ expected-fullscreen=%@ role=%ld center=%ld environment=%ld primary=%ld windowed=%ld",
-            sceneIdentifier, landed ? @"YES" : @"NO",
+            @"maximization-layout-observation scene=%@ model-found=%@ expected-fullscreen=%@ role=%ld center=%ld environment=%ld primary=%ld windowed=%ld final-geometry=MacWSHost-UIKit-observation",
+            sceneIdentifier, modelFound ? @"YES" : @"NO",
             expectedFullscreen ? @"YES" : @"NO", (long)actualRole,
             (long)actualCenter, (long)actualEnvironment,
             (long)(primaryRoleAddress ? *primaryRoleAddress : -1),
@@ -211,12 +206,17 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
     NSString *bundleIdentifier = request[@"bundle_identifier"];
     NSString *requestedIdentifier = request[@"scene_identifier"];
     NSNumber *expectedFullscreenValue = request[@"expected_fullscreen"];
+    NSNumber *sourceGeometryFullscreenValue =
+        request[@"source_geometry_fullscreen"];
     BOOL expectedFullscreen = expectedFullscreenValue.boolValue;
+    BOOL sourceGeometryFullscreen =
+        sourceGeometryFullscreenValue.boolValue;
     NSTimeInterval issuedAt = [request[@"issued_at"] doubleValue];
     NSTimeInterval age = NSDate.date.timeIntervalSince1970 - issuedAt;
     if (![bundleIdentifier isEqualToString:@"com.macwsguide.host"] ||
         ![requestedIdentifier isKindOfClass:NSString.class] ||
         ![expectedFullscreenValue isKindOfClass:NSNumber.class] ||
+        ![sourceGeometryFullscreenValue isKindOfClass:NSNumber.class] ||
         requestedIdentifier.length == 0 || !isfinite(age) || age < -2.0 ||
         age > 15.0) {
         MacWSFinishFullscreenRequest(path, [NSString stringWithFormat:
@@ -279,16 +279,24 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
         sourceRole == *primaryRoleAddress && sourceCenter == 0;
     BOOL sourceWindowed = exactScene && centerRoleAddress &&
         sourceRole == *centerRoleAddress && sourceCenter == 1;
-    BOOL alreadyExpected = expectedFullscreen
-        ? sourceFullscreen : sourceWindowed;
+    // Runtime-confirmed on this iPadOS 16.3.1 target: a Stage Manager Scene
+    // can remain 1194x807 while SBAppLayout reports Primary/center=0.  The old
+    // role-only test therefore suppressed action 17 even though UIKit's Scene
+    // was smaller than the 1389x970 screen.  The requester supplies the live
+    // Scene-vs-screen geometry it just measured; use that as the idempotence
+    // condition while retaining the exact focused-scene identity and Apple's
+    // own maximization transaction below.
+    BOOL alreadyExpected =
+        sourceGeometryFullscreen == expectedFullscreen;
     SEL performSelector = NSSelectorFromString(
         @"performKeyboardShortcutAction:forBundleIdentifier:");
     BOOL actionAvailable = switcherController &&
         [switcherController respondsToSelector:performSelector];
     BOOL allowed = exactScene && actionAvailable;
     MacWSWindowingLogLine([NSString stringWithFormat:
-        @"maximization-request requested=%@ expected-fullscreen=%@ exact-focus=%@ focus-source=%@ role=%ld center=%ld source-fullscreen=%@ source-windowed=%@ manager=%@ switcher=%@ content=%@ action=%@ attempt=%lu",
+        @"maximization-request requested=%@ expected-fullscreen=%@ source-geometry-fullscreen=%@ exact-focus=%@ focus-source=%@ role=%ld center=%ld source-fullscreen=%@ source-windowed=%@ manager=%@ switcher=%@ content=%@ action=%@ attempt=%lu",
         requestedIdentifier, expectedFullscreen ? @"YES" : @"NO",
+        sourceGeometryFullscreen ? @"YES" : @"NO",
         exactScene ? @"YES" : @"NO", focusSource ?: @"none",
         (long)sourceRole, (long)sourceCenter,
         sourceFullscreen ? @"YES" : @"NO",
@@ -304,8 +312,9 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
                                NSSelectorFromString(@"switcherCoordinator")),
             bundleIdentifier, requestedIdentifier, expectedFullscreen);
         MacWSFinishFullscreenRequest(path, [NSString stringWithFormat:
-            @"maximization-not-performed scene=%@ reason=already-in-requested-state expected-fullscreen=%@ role=%ld center=%ld",
+            @"maximization-not-performed scene=%@ reason=geometry-already-in-requested-state expected-fullscreen=%@ source-geometry-fullscreen=%@ role=%ld center=%ld",
             requestedIdentifier, expectedFullscreen ? @"YES" : @"NO",
+            sourceGeometryFullscreen ? @"YES" : @"NO",
             (long)sourceRole, (long)sourceCenter]);
         return;
     }
@@ -903,12 +912,12 @@ static void MacWSInstallRequestObservers(void *context) {
         int fd = open(MacWSDenseGridLoaded,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd >= 0) {
-            dprintf(fd, "version=14 pid=%d step=10 minimum=150 "
+            dprintf(fd, "version=15 pid=%d step=10 minimum=150 "
                         "observers=main-queue-after-dyld "
                         "fullscreen=focused-scene-maximization-toggle-action-17 "
                         "resize=app-layout-transaction "
                         "exit=system-maximization-unzoom "
-                        "postcondition=layout-role-and-center-configuration\n",
+                        "postcondition=host-scene-screen-geometry\n",
                         getpid());
             close(fd);
         }

@@ -28,8 +28,22 @@
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 
+// These macOS code-signing entry points are present in the iPadOS shared
+// cache and used by Ventura's CoreLocationAgent, but the iPhoneOS SDK omits
+// their declarations. Keep the declarations local instead of building this
+// iOS-targeted interposer against macOS Security headers.
+typedef struct __SecRequirement *SecRequirementRef;
+typedef uint32_t SecCSFlags;
+extern OSStatus SecRequirementCreateWithString(
+    CFStringRef text, SecCSFlags flags, SecRequirementRef *requirement);
+extern OSStatus SecRequirementCreateWithData(
+    CFDataRef data, SecCSFlags flags, SecRequirementRef *requirement);
+
 static void macws_install_fsnode_root_volume_repair(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
+static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
+                                     const uint8_t expected[16]);
+static void macws_schedule_maps_location_capability_adapter(void);
 
 // Expensive observation must never ride along with the normal interactive
 // path. The launcher creates this sentinel before process start only when the
@@ -2315,8 +2329,83 @@ static void install_skylight_prepare_for_use_tolerate_nil_hook(const void *heade
 // remain nil; this is not a blanket non-nil stub.
 typedef id (*MacWSUTTypeWithIdentifierFn)(id, SEL, NSString *);
 static MacWSUTTypeWithIdentifierFn g_macws_orig_uttype_with_identifier;
-static CFSetRef g_macws_coretypes_identifiers;
+typedef struct {
+    char **values;
+    size_t count;
+    size_t capacity;
+} MacWSCoreTypesIdentifierTable;
+static MacWSCoreTypesIdentifierTable *g_macws_coretypes_identifiers;
 static _Thread_local bool g_macws_uttype_fallback_active;
+
+static void macws_destroy_coretypes_identifiers(
+        MacWSCoreTypesIdentifierTable *table) {
+    if (!table) return;
+    for (size_t index = 0; index < table->count; index++)
+        free(table->values[index]);
+    free(table->values);
+    free(table);
+}
+
+static bool macws_append_coretypes_identifier(
+        MacWSCoreTypesIdentifierTable *table, CFStringRef identifier) {
+    if (!table || !identifier) return false;
+    CFIndex length = CFStringGetLength(identifier);
+    CFIndex maximum = CFStringGetMaximumSizeForEncoding(
+        length, kCFStringEncodingUTF8);
+    if (maximum < 0 || maximum > 4095) return false;
+    char *bytes = calloc((size_t)maximum + 1, 1);
+    if (!bytes || !CFStringGetCString(identifier, bytes,
+                                       maximum + 1,
+                                       kCFStringEncodingUTF8)) {
+        free(bytes);
+        return false;
+    }
+    for (size_t index = 0; index < table->count; index++) {
+        if (strcmp(table->values[index], bytes) == 0) {
+            free(bytes);
+            return true;
+        }
+    }
+    if (table->count == table->capacity) {
+        size_t capacity = table->capacity ? table->capacity * 2 : 64;
+        char **values = realloc(table->values,
+                                capacity * sizeof(*values));
+        if (!values) {
+            free(bytes);
+            return false;
+        }
+        table->values = values;
+        table->capacity = capacity;
+    }
+    table->values[table->count++] = bytes;
+    return true;
+}
+
+static bool macws_coretypes_contains_identifier(NSString *identifier) {
+    MacWSCoreTypesIdentifierTable *table = g_macws_coretypes_identifiers;
+    if (!table || !identifier) return false;
+    CFStringRef value = (__bridge CFStringRef)identifier;
+    CFIndex maximum = CFStringGetMaximumSizeForEncoding(
+        CFStringGetLength(value), kCFStringEncodingUTF8);
+    if (maximum < 0 || maximum > 4095) return false;
+    char stackBytes[256] = {0};
+    char *bytes = maximum < (CFIndex)sizeof(stackBytes)
+        ? stackBytes : calloc((size_t)maximum + 1, 1);
+    if (!bytes) return false;
+    bool converted = CFStringGetCString(value, bytes, maximum + 1,
+                                         kCFStringEncodingUTF8);
+    bool found = false;
+    if (converted) {
+        for (size_t index = 0; index < table->count; index++) {
+            if (strcmp(table->values[index], bytes) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (bytes != stackBytes) free(bytes);
+    return found;
+}
 
 static id macws_uttype_with_identifier(id cls, SEL cmd,
                                         NSString *identifier) {
@@ -2324,8 +2413,7 @@ static id macws_uttype_with_identifier(id cls, SEL cmd,
         ? g_macws_orig_uttype_with_identifier(cls, cmd, identifier) : nil;
     if (result || !identifier || g_macws_uttype_fallback_active ||
         !g_macws_coretypes_identifiers ||
-        !CFSetContainsValue(g_macws_coretypes_identifiers,
-                            (__bridge CFStringRef)identifier)) {
+        !macws_coretypes_contains_identifier(identifier)) {
         return result;
     }
 
@@ -2363,7 +2451,8 @@ static id macws_uttype_with_identifier(id cls, SEL cmd,
     return result;
 }
 
-static CFSetRef macws_copy_coretypes_identifiers(void) {
+static MacWSCoreTypesIdentifierTable *
+macws_copy_coretypes_identifiers(void) {
     static const char path[] =
         "/System/Library/CoreServices/CoreTypes.bundle/Contents/Info.plist";
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -2410,15 +2499,21 @@ static CFSetRef macws_copy_coretypes_identifiers(void) {
         return NULL;
     }
 
-    CFMutableSetRef identifiers = CFSetCreateMutable(
-        kCFAllocatorDefault, 0, &kCFTypeSetCallBacks);
+    // Do not retain the parsed CFString objects in a CFSet. Runtime-confirmed
+    // in Ventura locationd PID 23350 (locationd-2026-08-05-115107.ips):
+    // CFSetAddValue reached CFHash and faulted with SIGBUS while hashing one of
+    // these cross-image property-list strings. Convert declarations to owned
+    // UTF-8 bytes while the plist is alive; exact strcmp lookup preserves the
+    // allow-list invariant without crossing CoreFoundation hash callbacks.
+    MacWSCoreTypesIdentifierTable *identifiers =
+        calloc(1, sizeof(*identifiers));
     CFStringRef identifierKey = CFStringCreateWithCString(
         kCFAllocatorDefault, "UTTypeIdentifier", kCFStringEncodingUTF8);
     static const char *declarationNames[] = {
         "UTExportedTypeDeclarations", "UTImportedTypeDeclarations",
     };
     if (!identifiers || !identifierKey) {
-        if (identifiers) CFRelease(identifiers);
+        macws_destroy_coretypes_identifiers(identifiers);
         if (identifierKey) CFRelease(identifierKey);
         CFRelease(root);
         return NULL;
@@ -2445,7 +2540,14 @@ static CFSetRef macws_copy_coretypes_identifiers(void) {
                     (CFDictionaryRef)declaration, identifierKey);
                 if (identifier &&
                     CFGetTypeID(identifier) == CFStringGetTypeID()) {
-                    CFSetAddValue(identifiers, identifier);
+                    if (!macws_append_coretypes_identifier(
+                            identifiers, (CFStringRef)identifier)) {
+                        CFRelease(declarationKey);
+                        CFRelease(identifierKey);
+                        CFRelease(root);
+                        macws_destroy_coretypes_identifiers(identifiers);
+                        return NULL;
+                    }
                 }
             }
         }
@@ -2453,8 +2555,8 @@ static CFSetRef macws_copy_coretypes_identifiers(void) {
     }
     CFRelease(identifierKey);
     CFRelease(root);
-    if (CFSetGetCount(identifiers) == 0) {
-        CFRelease(identifiers);
+    if (identifiers->count == 0) {
+        macws_destroy_coretypes_identifiers(identifiers);
         return NULL;
     }
     return identifiers;
@@ -2465,14 +2567,15 @@ static void macws_install_uttype_coretypes_compatibility(void) {
     bool expected = false;
     if (!atomic_compare_exchange_strong(&installed, &expected, true)) return;
 
-    CFSetRef identifiers = macws_copy_coretypes_identifiers();
+    MacWSCoreTypesIdentifierTable *identifiers =
+        macws_copy_coretypes_identifiers();
 
     Class typeClass = objc_getClass("UTType");
     Method method = typeClass
         ? class_getClassMethod(typeClass, sel_registerName("typeWithIdentifier:"))
         : NULL;
     if (!method || !identifiers) {
-        if (identifiers) CFRelease(identifiers);
+        macws_destroy_coretypes_identifiers(identifiers);
         atomic_store(&installed, false);
         return;
     }
@@ -2484,7 +2587,7 @@ static void macws_install_uttype_coretypes_compatibility(void) {
     if (macws_runtime_diagnostics_enabled()) {
         fprintf(stderr,
                 "#### MACWS_UTTYPE installed CoreTypes compatibility (%lu IDs)\n",
-                (unsigned long)CFSetGetCount(g_macws_coretypes_identifiers));
+                (unsigned long)g_macws_coretypes_identifiers->count);
     }
 }
 
@@ -2505,6 +2608,83 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
             macws_install_uttype_coretypes_compatibility();
+        });
+    });
+}
+
+// Ventura Maps opts the shared MKLocationManager into Mac CoreWLAN monitoring
+// immediately before creating the singleton:
+//
+//   RE-confirmed in Maps arm64e at +0x378d94..+0x378da8:
+//     ldr class_MKLocationManager
+//     mov w2, #1
+//     objc_msgSend("setCanMonitorWiFiStatus:")
+//     objc_msgSend("sharedLocationManager")
+//
+// That platform declaration is invalid inside the iPad chroot: there is no
+// macOS CWFInterface even though macwslocationd supplies real iPad CoreLocation
+// fixes to Ventura locationd. Runtime-confirmed in Maps PID 7109: the
+// MKLocationManager at the availability check had _wifiObserver (ivar +0x148)
+// == nil. MapKit then treated the absent observer as Wi-Fi disabled and emitted
+// MKLocationErrorDomain code 4 before Maps registered as a location client.
+//
+// Use MapKit's own platform-capability setter to declare that this process
+// cannot monitor *Mac CoreWLAN*. This is deliberately upstream of the
+// availability check: authorization, restricted/denied status, provider
+// readiness, and location delivery all continue through unmodified MapKit and
+// CoreLocation paths. It does not fabricate Wi-Fi state or force an availability
+// result.
+typedef void (*MacWSMKSetCanMonitorWiFiFn)(id, SEL, BOOL);
+static MacWSMKSetCanMonitorWiFiFn g_macws_mk_set_can_monitor_wifi = NULL;
+
+static void macws_mk_set_can_monitor_wifi(id self, SEL command,
+                                          BOOL requested) {
+    (void)requested;
+    MacWSMKSetCanMonitorWiFiFn original = g_macws_mk_set_can_monitor_wifi;
+    if (original) original(self, command, NO);
+}
+
+static bool macws_install_maps_location_capability_adapter(void) {
+    static _Atomic bool installed = false;
+    if (atomic_load_explicit(&installed, memory_order_acquire)) return true;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Maps") != 0) return true;
+
+    Class managerClass = objc_getClass("MKLocationManager");
+    SEL selector = sel_registerName("setCanMonitorWiFiStatus:");
+    Method method = managerClass
+        ? class_getClassMethod(managerClass, selector) : NULL;
+    if (!method) return false;
+
+    IMP current = method_getImplementation(method);
+    if (current != (IMP)macws_mk_set_can_monitor_wifi) {
+        g_macws_mk_set_can_monitor_wifi =
+            (MacWSMKSetCanMonitorWiFiFn)current;
+        method_setImplementation(method,
+                                 (IMP)macws_mk_set_can_monitor_wifi);
+    }
+    atomic_store_explicit(&installed, true, memory_order_release);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS MAPS location capability: CoreWLAN monitoring "
+                "disabled; Ventura CoreLocation provider remains authoritative\n");
+    }
+    return true;
+}
+
+static void macws_schedule_maps_location_capability_adapter(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (macws_install_maps_location_capability_adapter()) return;
+            // The add-image callback precedes Objective-C realization on some
+            // Ventura images. One bounded retry runs after that notification
+            // has unwound, still before normal application interaction.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         50 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                (void)macws_install_maps_location_capability_adapter();
+            });
         });
     });
 }
@@ -2845,13 +3025,143 @@ static void macws_install_chromium_composite_overlays(
         process_for_ca_layers, capture_adapter + kCaptureStoreIndex);
 }
 
+// AGXMetal13_3 was extracted from the macOS dyld shared cache. Its external
+// authenticated stub at static 0x1e5a5dfc0 reaches a cache-global GOT page
+// which is not part of the standalone image. Every AGX super-init routes
+// through this stub. Maps runtime-confirmed that its Metal DeviceDispatch
+// thread can enter -[AGXG13GFamilyDevice initWithAcceleratorPort:...] before
+// the old, late repair point ran: objc_msgSendSuper2's branch target was PAC-
+// poisoned at the call's return address. Repair this exact stub immediately
+// after deriving the image slide, before invoking any ObjC/Metal operation.
+static bool macws_repair_agx_objc_msgsend_super2_stub(intptr_t slide) {
+    static const uintptr_t kStubStatic = 0x1e5a5dfc0;
+    static const uint32_t kOriginal[4] = {
+        0xd01cf7f1, 0x9132a231, 0xf9400230, 0xd71f0a11,
+    };
+
+    void *resolved = dlsym(RTLD_DEFAULT, "objc_msgSendSuper2");
+    if (!resolved) {
+        fprintf(stderr,
+                "#### MACWS_AGX_STUB_FIX dlsym(objc_msgSendSuper2)=NULL\n");
+        return false;
+    }
+    uintptr_t target = (uintptr_t)ptrauth_strip(
+        resolved, ptrauth_key_function_pointer);
+    const uint32_t Rd = 16;
+    uint32_t replacement[4] = {
+        0xD2800000u | ((uint32_t)(target & 0xffffu) << 5) | Rd,
+        0xF2A00000u | ((uint32_t)((target >> 16) & 0xffffu) << 5) | Rd,
+        0xF2C00000u | ((uint32_t)((target >> 32) & 0xffffu) << 5) | Rd,
+        0xD61F0200u,
+    };
+    uint32_t *stub = (uint32_t *)(kStubStatic + slide);
+    if (memcmp(stub, replacement, sizeof(replacement)) == 0) return true;
+    if (memcmp(stub, kOriginal, sizeof(kOriginal)) != 0) {
+        fprintf(stderr,
+                "#### MACWS_AGX_STUB_FIX exact-precondition-failed stub=%p "
+                "actual=[%08x %08x %08x %08x]\n",
+                stub, stub[0], stub[1], stub[2], stub[3]);
+        return false;
+    }
+
+    uint32_t insn0 = replacement[0];
+    uint32_t insn1 = replacement[1];
+    uint32_t insn2 = replacement[2];
+    uint32_t insn3 = replacement[3];
+    ModifyExecutableRegion(stub, sizeof(replacement), ^{
+        stub[0] = insn0;
+        stub[1] = insn1;
+        stub[2] = insn2;
+        stub[3] = insn3;
+    });
+    bool repaired = memcmp(stub, replacement, sizeof(replacement)) == 0;
+    fprintf(stderr,
+            "#### MACWS_AGX_STUB_FIX objc_msgSendSuper2 %s stub=%p "
+            "target=%p new=[%08x %08x %08x %08x]\n",
+            repaired ? "repaired-early" : "write-verification-failed",
+            stub, (void *)target, stub[0], stub[1], stub[2], stub[3]);
+    return repaired;
+}
+
+// Ventura locationd gives an otherwise idle daemon only three seconds after
+// startRun before scheduling shutdown, even though its AutoShutdownDelay
+// preference has already been read as 15 seconds.  That is normally enough
+// on macOS, but the first MacWS launch must finish the chroot service graph
+// (including GeoServices) before CoreLocationAgent's synchronous requirement
+// request can be answered.  Runtime LLDB captured the client-side MIG result
+// as MIG_SERVER_DIED (-308): locationd completed startRun, logged "no more
+// clients, 3 second(s) to auto-shutdown", and exited while the real request
+// was still pending.
+//
+// Preserve the stock lifecycle and client accounting.  Only extend the first
+// idle window to the configured default of 15 seconds; a registered client
+// still cancels the timer through Apple's original code, while a genuinely
+// idle daemon still exits.  The exact Ventura 13.4 UUID and the surrounding
+// five instructions are mandatory preconditions so this cannot drift onto a
+// different locationd build.
+static void macws_extend_locationd_initial_idle_window(
+    const struct mach_header *untyped_header) {
+    static const uint8_t expected_uuid[16] = {
+        0xda, 0x33, 0x4e, 0x85, 0x02, 0xce, 0x30, 0x6b,
+        0xa7, 0xb3, 0x7a, 0x9d, 0xb0, 0x96, 0x6e, 0xa1,
+    };
+    static const uint32_t expected[5] = {
+        0x97ef019e, // bl  internal activity predicate
+        0x35002420, // cbnz w0, diagnostic path
+        0xaa1303e0, // mov x0, x19 (CLDaemonCore *)
+        0x52800061, // mov w1, #3
+        0x94000176, // bl  CLDaemonCore::scheduleShutdown(int)
+    };
+    static const uint32_t repaired_delay = 0x528001e1; // mov w1, #15
+    enum { kInitialDelayCallsiteOffset = 0x46579c };
+
+    const char *program = getprogname();
+    if (!program || strcmp(program, "locationd") != 0) return;
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!macws_macho_uuid_matches(header, expected_uuid)) return;
+
+    uint32_t *callsite = (uint32_t *)((uintptr_t)header +
+                                      kInitialDelayCallsiteOffset);
+    if (callsite[3] == repaired_delay) return;
+    if (memcmp(callsite, expected, sizeof(expected)) != 0) {
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### MACWS LOCATIOND idle-window precondition mismatch "
+                    "at %p: %08x %08x %08x %08x %08x\n",
+                    callsite, callsite[0], callsite[1], callsite[2],
+                    callsite[3], callsite[4]);
+        }
+        return;
+    }
+
+    ModifyExecutableRegion(&callsite[3], sizeof(callsite[3]), ^{
+        callsite[3] = repaired_delay;
+    });
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS LOCATIOND initial idle window %s at %p "
+                "(3s -> 15s)\n",
+                callsite[3] == repaired_delay ? "extended" : "write-failed",
+                &callsite[3]);
+    }
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
     dladdr(header, &info);
     if (info.dli_fname &&
+        strcmp(info.dli_fname, "/usr/libexec/locationd") == 0) {
+        macws_extend_locationd_initial_idle_window(header);
+    }
+    if (info.dli_fname &&
         strstr(info.dli_fname,
                "/UniformTypeIdentifiers.framework/") != NULL) {
         macws_schedule_uttype_coretypes_compatibility();
+    }
+    if (info.dli_fname &&
+        strstr(info.dli_fname, "/MapKit.framework/") != NULL) {
+        macws_schedule_maps_location_capability_adapter();
     }
     if (info.dli_fname &&
         strstr(info.dli_fname,
@@ -3401,6 +3711,13 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                                        "__TEXT", "__text", &text_sz);
         intptr_t slide = (intptr_t)text - (intptr_t)text_static_base;
 
+        // Fail closed: continuing into AGX class realization with this known-
+        // invalid external stub recreates the Maps PAC crash and can leave a
+        // partially initialized MTLDevice behind for later callers.
+        if (!macws_repair_agx_objc_msgsend_super2_stub(slide)) {
+            return;
+        }
+
         // ──────────────────────────────────────────────────────────────────
         // AGX texture wrap gate bypass (env-gated).
         // -[AGXTexture initWithDevice:desc:iosurface:plane:] @ 0x1e5a5ae18 calls
@@ -3936,138 +4253,6 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
             }
         }
 #endif
-
-        // ──────────────────────────────────────────────────────────────────
-        // External __auth_stub patcher (MACWS_AGX_NATIVE-gated).
-        //
-        // The chained-fixups walker above repairs slots INSIDE this image's
-        // own __got / __auth_got sections. But AGXMetal13_3 was extracted
-        // from the dyld_shared_cache, and the cache builder consolidated
-        // cross-image function-pointer slots (objc_msgSend, objc_msgSend\
-        // Super2, libc, libobjc helpers, …) into shared __got pages OUTSIDE
-        // individual images. For this binary they live at:
-        //     0x21f927000..0x21f95b000     (15 pages, ~228 slots total)
-        // none of which are in any segment of the extracted file.
-        //
-        // 228 of AGXMetal13_3's __auth_stubs reference one of these external
-        // pages — the only 4 that stay in-image use 0x21e807000 (the local
-        // __auth_got). Walking chained-fixups can't reach the external slots:
-        // they have no fixup record because they were inlined into the cache
-        // at cache-build time.
-        //
-        // In chroot the pages are not mapped at the runtime VA the stubs
-        // compute (or they land in whatever happens to be at that VA from a
-        // neighboring mapping — e.g. MediaToolbox). `ldr x16, [x17] ; braa
-        // x16, x17` then reads garbage and either auth-traps or tail-calls
-        // the wrong function.
-        //
-        // Worked example confirmed via BN macOS DSC analysis this session:
-        //   stub @ 0x1e5a5dfc0 = adrp 0x21f95b000 + #0xca8 = slot 0x21f95bca8
-        //   slot in cache holds &_objc_msgSendSuper2
-        //   xrefs to sub_1e5a5dfc0 confirm 100+ -[…super dealloc] /
-        //     [super initWith…] call sites pass through this stub
-        //   in chroot the slot is wrong → super-init returns 0 →
-        //     -[AGXTexture initWithDevice:desc:iosurface:plane:] nil-exits →
-        //     newTextureWithDescriptor:iosurface:plane: = nil →
-        //     SkyLight's framebuffer wrap fails.
-        //
-        // Fix: rewrite the 4-instruction stub with a direct absolute jump:
-        //     movz x16, #lo16
-        //     movk x16, #mid16, lsl #16
-        //     movk x16, #hi16, lsl #32          ; user-space VA is 48-bit
-        //     br   x16                          ; unauthenticated br
-        // Same byte count (16). No PAC modulus issues; br is not authed and
-        // the stub itself lives in __TEXT which we already write through
-        // ModifyExecutableRegion elsewhere.
-        //
-        // Bootstrap the slot-offset→symbol map with the highest-value entry
-        // (msgSendSuper2). Extend as more broken paths are identified by
-        // crash-log triage.
-        if (getenv("MACWS_AGX_NATIVE")) {
-            struct stub_repair {
-                uint64_t    stub_static;
-                uint64_t    slot_static;   // expected adrp(page)+add(off) for logging
-                const char *symbol;
-            };
-            static const struct stub_repair repairs[] = {
-                // sub_1e5a5dfc0 — adrp 0x21f95b000 + #0xca8 = slot 0x21f95bca8.
-                // Slot holds _objc_msgSendSuper2 in the macOS DSC; the stub
-                // is the super-init / super-dealloc dispatcher for every
-                // class in this image.
-                { 0x1e5a5dfc0, 0x21f95bca8, "objc_msgSendSuper2" },
-            };
-            for (size_t i = 0; i < sizeof(repairs)/sizeof(repairs[0]); i++) {
-                const struct stub_repair *r = &repairs[i];
-                void *fn = dlsym(RTLD_DEFAULT, r->symbol);
-                if (!fn) {
-                    fprintf(stderr, "#### MACWS_AGX_STUB_FIX dlsym(%s)=NULL skip\n",
-                        r->symbol);
-                    continue;
-                }
-                uint32_t *stub_at      = (uint32_t *)(r->stub_static + slide);
-                void    **slot_runtime = (void **)   (r->slot_static + slide);
-
-                uint32_t cur0 = stub_at[0], cur1 = stub_at[1];
-                uint32_t cur2 = stub_at[2], cur3 = stub_at[3];
-
-                // Read slot value defensively — VA may not be mapped.
-                void *cur_slot = NULL;
-                Dl_info di = {0};
-                int dlinfo_ok = 0;
-                @try {
-                    cur_slot = *slot_runtime;
-                    dlinfo_ok = dladdr(cur_slot, &di);
-                } @catch (id e) {
-                    cur_slot = (void *)-1;
-                    dlinfo_ok = 0;
-                }
-                fprintf(stderr,
-                    "#### MACWS_AGX_STUB_FIX %s\n"
-                    "####   stub@%p insns=[%08x %08x %08x %08x]\n"
-                    "####   slot@%p value=%p sym=%s base=%p path=%s\n",
-                    r->symbol, stub_at, cur0, cur1, cur2, cur3,
-                    slot_runtime, cur_slot,
-                    dlinfo_ok ? (di.dli_sname ?: "(none)") : "(no-mapping)",
-                    dlinfo_ok ? di.dli_fbase : NULL,
-                    dlinfo_ok ? (di.dli_fname ?: "(none)") : "(none)");
-
-                // Build movz/movk/movk/br x16 → fn. (4 named vars, not an
-                // array — blocks can't capture C arrays directly.)
-                uint64_t t  = (uint64_t)fn;
-                uint16_t i0 = (uint16_t)( t        & 0xFFFF);
-                uint16_t i1 = (uint16_t)((t >> 16) & 0xFFFF);
-                uint16_t i2 = (uint16_t)((t >> 32) & 0xFFFF);
-                const uint32_t Rd = 16;   // x16
-                uint32_t insn0 = 0xD2800000u | ((uint32_t)i0 << 5) | Rd; // movz x16,#i0
-                uint32_t insn1 = 0xF2A00000u | ((uint32_t)i1 << 5) | Rd; // movk x16,#i1,#16
-                uint32_t insn2 = 0xF2C00000u | ((uint32_t)i2 << 5) | Rd; // movk x16,#i2,#32
-                uint32_t insn3 = 0xD61F0200u;                            // br   x16
-
-                BOOL already_patched = (cur0 == insn0 && cur1 == insn1 &&
-                                        cur2 == insn2 && cur3 == insn3);
-                if (already_patched) {
-                    fprintf(stderr, "####   already patched, skipping\n");
-                    continue;
-                }
-                // Sanity: top of original insn must look like ADRP.
-                //   ADRP encoding: bit31=1, bits28:24=10000 → mask 0x9F000000 == 0x90000000
-                BOOL is_adrp = ((cur0 & 0x9F000000) == 0x90000000);
-                if (!is_adrp) {
-                    fprintf(stderr, "####   first insn %#x not ADRP — skip\n", cur0);
-                    continue;
-                }
-                ModifyExecutableRegion(stub_at, 16, ^{
-                    stub_at[0] = insn0;
-                    stub_at[1] = insn1;
-                    stub_at[2] = insn2;
-                    stub_at[3] = insn3;
-                });
-                fprintf(stderr,
-                    "####   PATCHED → br %p (movz/movk/movk/br)\n"
-                    "####   new=[%08x %08x %08x %08x]\n",
-                    fn, insn0, insn1, insn2, insn3);
-            }
-        }
 
         // ──────────────────────────────────────────────────────────────────
         // EVERYTHING BELOW (class registration via objc_readClassPair, AGX
@@ -8203,6 +8388,34 @@ __attribute__((constructor)) void InitStuff() {
     }
 
     _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))loadImageCallback);
+
+    // Existing-image callbacks may have queued the Maps adapter while ObjC
+    // registration was still unwinding. At constructor time the dependency
+    // images are normally realized already, so make one synchronous,
+    // idempotent attempt before UIApplicationMain can create the shared
+    // MKLocationManager. The queued worker remains only as a fallback.
+    (void)macws_install_maps_location_capability_adapter();
+
+    // POSIX_SPAWN_START_SUSPENDED stops before dyld has initialized the
+    // macOS image.  Maps exits during that debugger path before its normal
+    // framework bootstrap completes, so service tracing needs a later,
+    // explicit attach point.  This diagnostic gate stops only after
+    // libmachook has installed its compatibility interposes and image
+    // callback; no protocol result or application state is fabricated.
+    const char *lateLLDBHold = getenv("MACWS_LLDB_HOLD_AFTER_INIT");
+    if (lateLLDBHold && strcmp(lateLLDBHold, "1") == 0) {
+        const char *holdTarget = getenv("MACWS_SUSPEND_TARGET");
+        const char *program = getprogname();
+        if (!holdTarget || !*holdTarget ||
+            (program && strcmp(holdTarget, program) == 0)) {
+            fprintf(stderr,
+                    "#### MACWS_LLDB_HOLD_AFTER_INIT target=%s pid=%d "
+                    "stopping after compatibility init\n",
+                    program ?: "(unknown)", getpid());
+            fflush(stderr);
+            raise(SIGSTOP);
+        }
+    }
 }
 
 extern int gpu_bundle_find_trusted(const char *name, char *trusted_path, size_t trusted_path_len);
@@ -8410,6 +8623,67 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
             write(STDERR_FILENO, line, write_length);
         }
     }
+    return result;
+}
+
+// Diagnostic-only observer for Ventura locationd's MIG receive boundary.
+// Apple's open-source libdispatch declares this callback ABI as
+// boolean_t (*)(mach_msg_header_t *, mach_msg_header_t *) and invokes the
+// callback synchronously inside dispatch_mig_server().  Keep the active
+// callback thread-local so concurrent dispatch sources retain their exact
+// original demux routine.  The wrapper records only headers; it neither
+// changes a request/reply byte nor fabricates a successful result.
+typedef boolean_t (*macws_dispatch_mig_callback_t)(
+    mach_msg_header_t *request, mach_msg_header_t *reply);
+extern mach_msg_return_t dispatch_mig_server(
+    dispatch_source_t source, size_t max_message_size,
+    macws_dispatch_mig_callback_t callback);
+
+static _Thread_local macws_dispatch_mig_callback_t
+    g_macws_locationd_mig_callback;
+static _Atomic unsigned g_macws_locationd_mig_record_count;
+
+static boolean_t macws_locationd_mig_callback(
+    mach_msg_header_t *request, mach_msg_header_t *reply) {
+    macws_dispatch_mig_callback_t callback =
+        g_macws_locationd_mig_callback;
+    if (!callback) return FALSE;
+
+    unsigned record = atomic_fetch_add_explicit(
+        &g_macws_locationd_mig_record_count, 1, memory_order_relaxed);
+    if (record < 256 && request) {
+        dprintf(STDERR_FILENO,
+                "#### MACWS LOCATIOND-MIG receive #%u id=%#x size=%u "
+                "bits=%#x remote=%u local=%u\n",
+                record + 1, request->msgh_id, request->msgh_size,
+                request->msgh_bits, request->msgh_remote_port,
+                request->msgh_local_port);
+    }
+    boolean_t handled = callback(request, reply);
+    if (record < 256) {
+        dprintf(STDERR_FILENO,
+                "#### MACWS LOCATIOND-MIG demux #%u handled=%d "
+                "reply_id=%#x reply_size=%u\n",
+                record + 1, handled, reply ? reply->msgh_id : 0,
+                reply ? reply->msgh_size : 0);
+    }
+    return handled;
+}
+
+static mach_msg_return_t macws_dispatch_mig_server(
+    dispatch_source_t source, size_t max_message_size,
+    macws_dispatch_mig_callback_t callback) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "locationd") != 0 ||
+        !getenv("MACWS_LOCATIOND_MIG_TRACE") || !callback) {
+        return dispatch_mig_server(source, max_message_size, callback);
+    }
+    macws_dispatch_mig_callback_t previous =
+        g_macws_locationd_mig_callback;
+    g_macws_locationd_mig_callback = callback;
+    mach_msg_return_t result = dispatch_mig_server(
+        source, max_message_size, macws_locationd_mig_callback);
+    g_macws_locationd_mig_callback = previous;
     return result;
 }
 
@@ -9066,16 +9340,228 @@ static Boolean macws_CFURLCopyResourcePropertyValuesAndFlags(
     return result;
 }
 
+// Ventura CoreLocationAgent receives a textual designated requirement from a
+// registering desktop client and compiles it before calling
+// SecCodeCheckValidity.  In the actual Ventura binary, the decision is at
+// CoreLocationAgent+0x7234..0x727c: verified is written only when both the
+// requirement compilation and the subsequent live-code validation succeed.
+//
+// The iPadOS 16 Security implementation behind the shared-cache symbol does
+// not implement macOS's text compiler. Runtime LLDB evidence for Maps:
+//
+//   SecRequirementCreateWithString("identifier \"com.apple.Maps\"") = -50
+//   SecRequirementCreateWithData(the equivalent requirement blob)     = 0
+//   SecCodeCheckValidity(live Maps, that requirement)                  = 0
+//
+// Restore that missing compiler operation for the single requirement form
+// emitted by MacWS's ldid signing contract. This creates a real
+// SecRequirement; CoreLocationAgent still performs the original
+// SecCodeCheckValidity and remains solely responsible for setting verified.
+static void macws_requirement_put_be32(uint8_t *where, uint32_t value) {
+    value = CFSwapInt32HostToBig(value);
+    memcpy(where, &value, sizeof(value));
+}
+
+static OSStatus macws_SecRequirementCreateWithString(
+    CFStringRef text,
+    SecCSFlags flags,
+    SecRequirementRef *requirement) {
+    OSStatus status = SecRequirementCreateWithString(text, flags, requirement);
+    const char *program = getprogname();
+    if (macws_runtime_diagnostics_enabled()) {
+        char diagnosticExpression[1024] = {0};
+        if (text) {
+            (void)CFStringGetCString(text, diagnosticExpression,
+                                     sizeof(diagnosticExpression),
+                                     kCFStringEncodingUTF8);
+        }
+        fprintf(stderr,
+                "#### MACWS SECURITY requirement text entry program=%s "
+                "status=%d output=%p expression=%s\n",
+                program ?: "(null)", (int)status,
+                requirement ? (void *)*requirement : NULL,
+                diagnosticExpression[0] ? diagnosticExpression : "(unavailable)");
+    }
+    if (status != -50 || !text || !requirement || *requirement != NULL ||
+        !program || strcmp(program, "CoreLocationAgent") != 0) {
+        return status;
+    }
+
+    char expression[1024];
+    if (!CFStringGetCString(text, expression, sizeof(expression),
+                            kCFStringEncodingUTF8)) {
+        return status;
+    }
+
+    static const char prefix[] = "identifier \"";
+    size_t expressionLength = strlen(expression);
+    size_t prefixLength = sizeof(prefix) - 1;
+    if (expressionLength <= prefixLength + 1 ||
+        memcmp(expression, prefix, prefixLength) != 0 ||
+        expression[expressionLength - 1] != '"') {
+        return status;
+    }
+
+    size_t identifierLength = expressionLength - prefixLength - 1;
+    const char *identifier = expression + prefixLength;
+    for (size_t i = 0; i < identifierLength; i++) {
+        unsigned char c = (unsigned char)identifier[i];
+        bool allowed = (c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '.' || c == '-' || c == '_';
+        if (!allowed) return status;
+    }
+
+    size_t paddedIdentifierLength = (identifierLength + 3u) & ~3u;
+    size_t blobLength = 20u + paddedIdentifierLength;
+    if (identifierLength > UINT32_MAX || blobLength > UINT32_MAX) {
+        return status;
+    }
+
+    uint8_t *blob = calloc(1, blobLength);
+    if (!blob) return status;
+    // CSMAGIC_REQUIREMENT, length, kSecRequirementKindExplicit,
+    // requirement-language opIdent, then the length-prefixed identifier.
+    macws_requirement_put_be32(blob + 0, 0xfade0c00u);
+    macws_requirement_put_be32(blob + 4, (uint32_t)blobLength);
+    macws_requirement_put_be32(blob + 8, 1u);
+    macws_requirement_put_be32(blob + 12, 2u);
+    macws_requirement_put_be32(blob + 16, (uint32_t)identifierLength);
+    memcpy(blob + 20, identifier, identifierLength);
+
+    CFDataRef data = CFDataCreate(kCFAllocatorDefault, blob,
+                                  (CFIndex)blobLength);
+    free(blob);
+    if (!data) return status;
+    OSStatus compiledStatus = SecRequirementCreateWithData(
+        data, flags, requirement);
+    CFRelease(data);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS SECURITY requirement text fallback id=%.*s "
+                "status=%d\n",
+                (int)identifierLength, identifier, (int)compiledStatus);
+    }
+    return compiledStatus;
+}
+
+// CoreLocationAgent's Ventura arm64e executable uses an authenticated chained
+// bind in __DATA_CONST,__auth_got for SecRequirementCreateWithString. Runtime
+// diagnostics show that dyld applies libmachook's static interpose to an
+// ordinary arm64e probe with the same bind shape, but not to this prebuilt
+// Apple executable: the call at CoreLocationAgent+0x7234 reaches Security
+// directly and the interposer's entry witness never fires.
+//
+// iPadOS 16 dyld also does not export _dyld_dynamic_interpose. Rebind only the
+// Agent slot whose PAC-stripped runtime target is symbolicated as Security's
+// SecRequirementCreateWithString. dyld_info confirms these chained entries use
+// key=IA, addrDiv=1, diversity=0, so sign the replacement with that exact
+// contract. The Agent's subsequent SecStaticCodeCheckValidity call remains
+// untouched and solely determines whether verified becomes true.
+__attribute__((constructor))
+static void macws_install_corelocation_requirement_interpose(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "CoreLocationAgent") != 0) return;
+
+    const struct mach_header *agentHeader = NULL;
+    for (uint32_t index = 0; index < _dyld_image_count(); index++) {
+        const char *imageName = _dyld_get_image_name(index);
+        if (!imageName ||
+            !strstr(imageName,
+                    "/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent")) {
+            continue;
+        }
+        agentHeader = _dyld_get_image_header(index);
+        break;
+    }
+    if (!agentHeader) return;
+
+    unsigned long authGotSize = 0;
+    uint64_t *authGot = (uint64_t *)getsectiondata(
+        (const struct mach_header_64 *)agentHeader,
+        "__DATA_CONST", "__auth_got", &authGotSize);
+    uint64_t *candidate = NULL;
+    size_t candidateCount = 0;
+    for (size_t index = 0;
+         authGot && index < authGotSize / sizeof(*authGot); index++) {
+        uintptr_t currentTarget = (uintptr_t)ptrauth_strip(
+            (void *)authGot[index], ptrauth_key_function_pointer);
+        Dl_info targetInfo = {0};
+        bool hasTargetInfo = currentTarget &&
+            dladdr((void *)currentTarget, &targetInfo);
+        // RE-confirmed via `dyld_info -arch arm64e -fixups`: in Ventura
+        // 13.4's CoreLocationAgent the section is 0x410 bytes and the
+        // SecRequirementCreateWithString bind is __auth_got+0xe0. Keep this
+        // exact offset only as a symbolication fallback for the stripped
+        // shared-cache Security image, and still require dladdr to identify
+        // Security.framework before touching the slot.
+        bool exactVenturaSlot = authGotSize == 0x410 &&
+            index == 0xe0 / sizeof(*authGot);
+        if (macws_runtime_diagnostics_enabled() && exactVenturaSlot) {
+            fprintf(stderr,
+                    "#### MACWS SECURITY expected auth GOT slot=%p "
+                    "target=%p image=%s symbol=%s\n",
+                    &authGot[index], (void *)currentTarget,
+                    hasTargetInfo && targetInfo.dli_fname
+                        ? targetInfo.dli_fname : "(unknown)",
+                    hasTargetInfo && targetInfo.dli_sname
+                        ? targetInfo.dli_sname : "(unknown)");
+        }
+        if (!currentTarget ||
+            !hasTargetInfo || !targetInfo.dli_fname ||
+            !strstr(targetInfo.dli_fname, "/Security.framework/") ||
+            (!exactVenturaSlot &&
+             (!targetInfo.dli_sname ||
+              (strcmp(targetInfo.dli_sname,
+                      "SecRequirementCreateWithString") != 0 &&
+               strcmp(targetInfo.dli_sname,
+                      "_SecRequirementCreateWithString") != 0)))) {
+            continue;
+        }
+        candidate = &authGot[index];
+        candidateCount++;
+    }
+
+    size_t patched = 0;
+    uintptr_t replacementTarget = (uintptr_t)ptrauth_strip(
+        (void *)macws_SecRequirementCreateWithString,
+        ptrauth_key_function_pointer);
+    if (candidateCount == 1 && candidate) {
+        uint64_t modifier = (uint64_t)candidate & 0x0000FFFFFFFFFFFFull;
+        uint64_t signedReplacement = macws_pac_sign(
+            replacementTarget, modifier, 0);
+        ModifyExecutableRegion(candidate, sizeof(*candidate), ^{
+            *candidate = signedReplacement;
+        });
+        if ((uintptr_t)ptrauth_strip(
+                (void *)*candidate, ptrauth_key_function_pointer) ==
+            replacementTarget) {
+            patched = 1;
+        }
+    }
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS SECURITY authenticated GOT interpose "
+                "agent=%p slots=%lu candidates=%zu replacement=%p "
+                "patched=%zu\n",
+                agentHeader, authGotSize / sizeof(*authGot), candidateCount,
+                (void *)replacementTarget, patched);
+    }
+}
+
 DYLD_INTERPOSE(sysctlbyname_new, sysctlbyname);
 DYLD_INTERPOSE(LMGetBootDrive_new, LMGetBootDrive);
 DYLD_INTERPOSE(macws_CFURLCopyResourcePropertyValuesAndFlags,
                _CFURLCopyResourcePropertyValuesAndFlags);
+DYLD_INTERPOSE(macws_SecRequirementCreateWithString,
+               SecRequirementCreateWithString);
 DYLD_INTERPOSE(__mac_syscall_new, __mac_syscall);
 DYLD_INTERPOSE(csr_get_active_config_new, csr_get_active_config);
 DYLD_INTERPOSE(sandbox_init_with_parameters_new, sandbox_init_with_parameters);
 DYLD_INTERPOSE(sandbox_init_new, sandbox_init);
 DYLD_INTERPOSE(mach_port_construct_new, mach_port_construct);
 DYLD_INTERPOSE(mach_msg_new, mach_msg);
+DYLD_INTERPOSE(macws_dispatch_mig_server, dispatch_mig_server);
 DYLD_INTERPOSE(audit_token_to_asid_new, audit_token_to_asid);
 DYLD_INTERPOSE(audit_token_to_auid_new, audit_token_to_auid);
 DYLD_INTERPOSE(auditon_new, auditon);
@@ -9140,6 +9626,29 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define VIEWBRIDGE_AUXILIARY_NEW  "com.apple.macosbooter.ViewBridgeAuxiliary"
 #define EXTENSIONKIT_SERVICE_ORIG "com.apple.extensionkitservice"
 #define EXTENSIONKIT_SERVICE_NEW  "com.apple.macosbooter.extensionkitservice"
+#define HISERVICES_SERVICE_ORIG "com.apple.hiservices-xpcservice"
+#define HISERVICES_SERVICE_NEW  "com.apple.macosbooter.hiservices-xpcservice"
+#define GEOD_XPC_SERVICE "com.apple.geod"
+#define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
+#define LOCATIOND_DESKTOP_AGENT_ORIG \
+    "com.apple.locationd.desktop.agent"
+#define LOCATIOND_DESKTOP_AGENT_NEW \
+    "com.apple.macosbooter.locationd.desktop.agent"
+#define LOCATIOND_DESKTOP_REGISTRATION_ORIG \
+    "com.apple.locationd.desktop.registration"
+#define LOCATIOND_DESKTOP_REGISTRATION_NEW \
+    "com.apple.macosbooter.locationd.desktop.registration"
+#define LOCATIOND_DESKTOP_SPI_ORIG \
+    "com.apple.locationd.desktop.spi"
+#define LOCATIOND_DESKTOP_SPI_NEW \
+    "com.apple.macosbooter.locationd.desktop.spi"
+#define LOCATIOND_DESKTOP_SYNCHRONOUS_ORIG \
+    "com.apple.locationd.desktop.synchronous"
+#define LOCATIOND_DESKTOP_SYNCHRONOUS_NEW \
+    "com.apple.macosbooter.locationd.desktop.synchronous"
+#define LOCATIOND_SIMULATION_ORIG "com.apple.locationd.simulation"
+#define LOCATIOND_SIMULATION_NEW \
+    "com.apple.macosbooter.locationd.simulation"
 static const char *macws_private_bootstrap_service_name(const char *name) {
     if (!name) return name;
     // The settings-extension launch proxy is the first iOS image submitted to
@@ -9195,6 +9704,37 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return "com.apple.macosbooter.lsd.mapdb";
     if (!strcmp(name, "com.apple.lsd.modifydb"))
         return "com.apple.macosbooter.lsd.modifydb";
+    // Ventura's four desktop CoreLocation endpoints are a different protocol
+    // surface from iPadOS 16's similarly named services.  Runtime logs on the
+    // target first showed `getLocationServicesCapableWithReplyBlock:` rejected
+    // by the iOS synchronous NSXPC interface.  A subsequent run of Ventura's
+    // real locationd reached CLLocationController only after its uid-205
+    // cache tree existed, but then exited cleanly because this interposer also
+    // rewrote the daemon's own desktop check-ins to the already-owned iOS
+    // names.  Give all four desktop endpoints collision-free names and apply
+    // the mapping symmetrically to the stock daemon and its stock clients.
+    if (!strcmp(name, LOCATIOND_DESKTOP_AGENT_ORIG))
+        return LOCATIOND_DESKTOP_AGENT_NEW;
+    if (!strcmp(name, LOCATIOND_DESKTOP_REGISTRATION_ORIG))
+        return LOCATIOND_DESKTOP_REGISTRATION_NEW;
+    if (!strcmp(name, LOCATIOND_DESKTOP_SPI_ORIG))
+        return LOCATIOND_DESKTOP_SPI_NEW;
+    if (!strcmp(name, LOCATIOND_DESKTOP_SYNCHRONOUS_ORIG))
+        return LOCATIOND_DESKTOP_SYNCHRONOUS_NEW;
+    // Ventura's simulation controller is the stock, typed ingestion point for
+    // CLLocation objects.  Keep it separate from iPadOS locationd's endpoint
+    // so the native MacWS provider can feed the real iPad location into the
+    // Ventura provider graph without replacing CLLocationManager results.
+    if (!strcmp(name, LOCATIOND_SIMULATION_ORIG))
+        return LOCATIOND_SIMULATION_NEW;
+    // GeoServices wire formats are release-specific.  Runtime-confirmed on
+    // iPadOS 16.3: Ventura Maps reached iOS geod but received GEOErrorDomain
+    // Code=-10 ("No resources in request") and rendered only the empty tile
+    // grid.  Route both the stock Ventura listener and its clients to a
+    // collision-free endpoint; payloads still terminate in Ventura's real
+    // com.apple.geod executable.
+    if (!strcmp(name, GEOD_XPC_SERVICE))
+        return GEOD_XPC_SERVICE_NEW;
     if (!strcmp(name, "com.apple.lsd.open"))
         return "com.apple.macosbooter.lsd.open";
     if (!strcmp(name, "com.apple.lsd.openurl"))
@@ -9218,6 +9758,8 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return VIEWBRIDGE_AUXILIARY_NEW;
     if (!strcmp(name, EXTENSIONKIT_SERVICE_ORIG))
         return EXTENSIONKIT_SERVICE_NEW;
+    if (!strcmp(name, HISERVICES_SERVICE_ORIG))
+        return HISERVICES_SERVICE_NEW;
     return name;
 }
 
@@ -9275,9 +9817,48 @@ extern kern_return_t bootstrap_check_in3(mach_port_t bp, const char *name,
                                          mach_port_t *sp,
                                          unsigned char instance[16],
                                          uint64_t flags);
+
+// Bounded, allocation-free cold-start service recorder.  Using fprintf from
+// the static XPC interpose is not safe this early: the stdio path can re-enter
+// framework initialization before Maps reaches NSApplicationMain.  This
+// diagnostic writes at most 512 short records directly to the inherited log
+// descriptor and never changes the requested service or its result.
+static void macws_trace_xpc_name(const char *transport, const char *name) {
+    if (!name || !getenv("MACWS_XPC_NAME_TRACE")) return;
+    static _Thread_local bool tracing = false;
+    static _Atomic unsigned int recordCount = 0;
+    if (tracing) return;
+    unsigned int record = atomic_fetch_add_explicit(
+        &recordCount, 1, memory_order_relaxed);
+    if (record >= 512) return;
+
+    tracing = true;
+    char line[768];
+    size_t used = 0;
+    static const char prefix[] = "#### XPC-NAME ";
+    size_t prefixLength = sizeof(prefix) - 1;
+    memcpy(line + used, prefix, prefixLength);
+    used += prefixLength;
+    size_t transportLength = strnlen(transport ?: "unknown", 64);
+    memcpy(line + used, transport ?: "unknown", transportLength);
+    used += transportLength;
+    line[used++] = ' ';
+    line[used++] = '\'';
+    size_t nameLength = strnlen(name, sizeof(line) - used - 3);
+    memcpy(line + used, name, nameLength);
+    used += nameLength;
+    line[used++] = '\'';
+    line[used++] = '\n';
+    (void)write(STDERR_FILENO, line, used);
+    tracing = false;
+}
+
 kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_t *sp) {
     const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
+    macws_trace_xpc_name("bootstrap_look_up", originalName);
+    if (name != originalName)
+        macws_trace_xpc_name("bootstrap_look_up.mapped", name);
     kern_return_t result = bootstrap_look_up(bp, name, sp);
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
@@ -9293,6 +9874,9 @@ kern_return_t bootstrap_look_up2_new(mach_port_t bp, const char *name,
                                       uint64_t flags) {
     const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
+    macws_trace_xpc_name("bootstrap_look_up2", originalName);
+    if (name != originalName)
+        macws_trace_xpc_name("bootstrap_look_up2.mapped", name);
     kern_return_t result = bootstrap_look_up2(
         bp, name, sp, target_pid, flags);
     if (getenv("MACWS_XPC_DEBUG")) {
@@ -9310,6 +9894,9 @@ kern_return_t bootstrap_look_up3_new(mach_port_t bp, const char *name,
                                       uint64_t flags) {
     const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
+    macws_trace_xpc_name("bootstrap_look_up3", originalName);
+    if (name != originalName)
+        macws_trace_xpc_name("bootstrap_look_up3.mapped", name);
     kern_return_t result = bootstrap_look_up3(
         bp, name, sp, target_pid, instance, flags);
     if (getenv("MACWS_XPC_DEBUG")) {
@@ -9324,6 +9911,9 @@ kern_return_t bootstrap_look_up3_new(mach_port_t bp, const char *name,
 kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port_t *sp) {
     const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
+    macws_trace_xpc_name("bootstrap_check_in", originalName);
+    if (name != originalName)
+        macws_trace_xpc_name("bootstrap_check_in.mapped", name);
     kern_return_t result = bootstrap_check_in(bp, name, sp);
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
@@ -9357,13 +9947,44 @@ extern xpc_connection_t macws_xpc_connection_create_mach_service_raw(
     __asm("_xpc_connection_create_mach_service");
 xpc_connection_t macws_xpc_connection_create_mach_service_early(
     const char *name, dispatch_queue_t targetq, uint64_t flags) {
+    const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
+    macws_trace_xpc_name("xpc_mach_service", originalName);
+    if (name != originalName)
+        macws_trace_xpc_name("xpc_mach_service.mapped", name);
     return macws_xpc_connection_create_mach_service_raw(
         name, targetq, flags);
 }
 
+// GeoServices does not create its daemon listener through xpc_main or
+// xpc_connection_create_mach_service.  RE-confirmed against Ventura 13.4's
+// GeoServices (UUID represented by the installed shared cache):
+//
+//   -[GEODaemon initPrimaryDaemon] +0x34
+//       -> -[GEODaemon initWithPort:createXPCListenerBlock:]
+//   __30-[GEODaemon initPrimaryDaemon]_block_invoke +0x10
+//       -> xpc_connection_create_listener("com.apple.geod")
+//
+// The public name is already owned by iPadOS geod, while MacWS publishes the
+// unmodified Ventura protocol on GEOD_XPC_SERVICE_NEW.  Apply the same
+// collision-free name translation used by every other bootstrap/XPC entry
+// point; listener queue, handler, activation and all request/reply objects stay
+// under stock GEODaemon control.
+extern xpc_connection_t macws_xpc_connection_create_listener_raw(
+    const char *) __asm("_xpc_connection_create_listener");
+xpc_connection_t macws_xpc_connection_create_listener_early(
+    const char *name) {
+    const char *originalName = name;
+    name = macws_private_bootstrap_service_name(name);
+    macws_trace_xpc_name("xpc_listener", originalName);
+    if (name != originalName)
+        macws_trace_xpc_name("xpc_listener.mapped", name);
+    return macws_xpc_connection_create_listener_raw(name);
+}
+
 xpc_connection_t macws_xpc_connection_create_early(
     const char *name, dispatch_queue_t targetq) {
+    macws_trace_xpc_name("xpc_service", name);
     if (name && !strcmp(name, FRONTBOARD_SYSTEM_ORIG)) {
         return macws_xpc_connection_create_mach_service_raw(
             FRONTBOARD_SYSTEM_NEW, targetq, 0);
@@ -9390,6 +10011,23 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             EXTENSIONKIT_SERVICE_NEW, targetq, 0);
     }
+    // HIServices is shipped as an XPCService, but a freestanding chroot
+    // proxy cannot preserve its per-process XPC domain across exec.  Starting
+    // that proxy as an ordinary launchd job without adapting xpc_main is also
+    // rejected verbatim by libxpc: "An XPC Service cannot be run directly."
+    // Route the unchanged HIServices wire protocol to the same root-owned
+    // private Mach-listener shape already used for ViewBridge/ExtensionKit.
+    if (name && !strcmp(name, HISERVICES_SERVICE_ORIG)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            HISERVICES_SERVICE_NEW, targetq, 0);
+    }
+    // Ventura's GeoServices client resolves geod as a per-user XPC service.
+    // MacWS publishes the matching Ventura executable as a private launchd
+    // Mach service because the public name is already owned by iPadOS geod.
+    if (name && !strcmp(name, GEOD_XPC_SERVICE)) {
+        return macws_xpc_connection_create_mach_service_raw(
+            GEOD_XPC_SERVICE_NEW, targetq, 0);
+    }
     return xpc_connection_create(name, targetq);
 }
 
@@ -9415,6 +10053,10 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                service &&
                strcmp(service, "com.macwsguide.extensionkit") == 0) {
         privateMachService = EXTENSIONKIT_SERVICE_NEW;
+    } else if (program &&
+               strcmp(program, "com.apple.hiservices-xpcservice") == 0 &&
+               service && strcmp(service, "com.macwsguide.hiservices") == 0) {
+        privateMachService = HISERVICES_SERVICE_NEW;
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =
@@ -9440,6 +10082,8 @@ DYLD_INTERPOSE(bootstrap_check_in2_new, bootstrap_check_in2);
 DYLD_INTERPOSE(bootstrap_check_in3_new, bootstrap_check_in3);
 DYLD_INTERPOSE(macws_xpc_connection_create_mach_service_early,
                macws_xpc_connection_create_mach_service_raw);
+DYLD_INTERPOSE(macws_xpc_connection_create_listener_early,
+               macws_xpc_connection_create_listener_raw);
 DYLD_INTERPOSE(macws_xpc_connection_create_early, xpc_connection_create);
 DYLD_INTERPOSE(macws_xpc_main, macws_xpc_main_raw);
 
@@ -10462,6 +11106,22 @@ static uint32_t IOConnectTranslateSelector(io_connect_t client, uint32_t selecto
                 return 0xf;
             case 0x12: // ioGPUNotificationQueueFinalize
                 return 0x10;
+            case 0x16: // IOGPUMTLFence initWithDevice:
+                       // RE-confirmed 2026-08-04 against the exact macOS
+                       // 13.4 and iPad13,6 iOS 16.3.1 IOGPU images. Both
+                       // implementations pass zero scalar/struct input and
+                       // request one 32-bit fence index; only the external
+                       // method ordinal differs (macOS 0x16, iOS 0x12).
+                       // Without this translation newFence returns nil and
+                       // VectorKit later faults in updateFence:afterStages:
+                       // while reading that fence's _fenceIndex ivar.
+                return 0x12;
+            case 0x17: // IOGPUMTLFence dealloc
+                       // Paired lifecycle call for the mapping above. The
+                       // actual implementations both pass the stored fence
+                       // index as one scalar; macOS uses 0x17 and this iOS
+                       // driver uses 0x13.
+                return 0x13;
             case 0x18: // IOGPUMTLEvent initWithDevice:
                        // RE-confirmed 2026-07-29 from the actual framework
                        // binaries and an iOS-native runtime byte dump. macOS

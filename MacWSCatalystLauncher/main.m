@@ -80,7 +80,6 @@ static void macws_spawn_maps(void) {
     setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
     setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
            "com.apple.macosbooter.frontboard.systemappservices", 1);
-
     char *const childArgv[] = {
         (char *)kChrootExec, "0", "0", (char *)kMacWSRoot,
         (char *)kMapsExecutable, NULL,

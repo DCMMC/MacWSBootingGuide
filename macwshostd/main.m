@@ -67,6 +67,11 @@ static const char *const kUIKitSystemExecutable =
     "/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem";
 static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
+static const char *const kAppearanceExecutable =
+    "/System/Library/ExtensionKit/Extensions/Appearance.appex/Contents/MacOS/Appearance";
+
+static pid_t WaitForRunningRootExecutable(NSString *rootPath,
+                                          NSTimeInterval timeout);
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
@@ -647,9 +652,26 @@ static const AllowedApp kAllowedApps[] = {
 // A native Host launch is complete when AppInputBridge has published at least
 // one real NSWindow descriptor. This replaces the VNC framebuffer
 // acknowledgement, which is intentionally absent under `start --no-vnc`.
-static BOOL WaitForWindowMetricsFlags(pid_t pid, NSTimeInterval timeout,
-                                      uint32_t requiredFlags,
-                                      int *exitStatusOut) {
+static uint64_t ReadWindowMetricsGeneration(pid_t pid) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path),
+             "/var/mnt/rootfs/private/tmp/macws_window_metrics.%d.bin", pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    MacWSWindowMetricsHeader header = {0};
+    struct stat st = {0};
+    ssize_t count = read(fd, &header, sizeof(header));
+    BOOL valid = fstat(fd, &st) == 0 &&
+        count == (ssize_t)sizeof(header) &&
+        st.st_size >= (off_t)sizeof(header) &&
+        MacWSWindowMetricsAreValid(&header, (size_t)st.st_size);
+    close(fd);
+    return valid ? header.generation : 0;
+}
+
+static BOOL WaitForWindowMetricsFlagsAfterGeneration(
+        pid_t pid, NSTimeInterval timeout, uint32_t requiredFlags,
+        uint64_t minimumGenerationExclusive, int *exitStatusOut) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path),
              "/var/mnt/rootfs/private/tmp/macws_window_metrics.%d.bin", pid);
@@ -677,7 +699,9 @@ static BOOL WaitForWindowMetricsFlags(pid_t pid, NSTimeInterval timeout,
                 st.st_size >= (off_t)sizeof(header) &&
                 MacWSWindowMetricsAreValid(&header, (size_t)st.st_size);
             BOOL ready = NO;
-            if (valid) {
+            if (valid &&
+                (minimumGenerationExclusive == 0 ||
+                 header.generation > minimumGenerationExclusive)) {
                 // NSApplication.windows retains ordered-out panels and other
                 // invisible objects after the last user window closes.
                 // Runtime-confirmed with Terminal after Scene discard: the
@@ -703,6 +727,13 @@ static BOOL WaitForWindowMetricsFlags(pid_t pid, NSTimeInterval timeout,
         usleep(100000);
     }
     return NO;
+}
+
+static BOOL WaitForWindowMetricsFlags(pid_t pid, NSTimeInterval timeout,
+                                      uint32_t requiredFlags,
+                                      int *exitStatusOut) {
+    return WaitForWindowMetricsFlagsAfterGeneration(
+        pid, timeout, requiredFlags, 0, exitStatusOut);
 }
 
 static BOOL WaitForWindowMetrics(pid_t pid, NSTimeInterval timeout,
@@ -845,6 +876,7 @@ static BOOL RequestApplicationReopen(pid_t pid, NSTimeInterval timeout) {
         HostLog(@"application-reopen pid=%d result=no-appinput-endpoint", pid);
         return NO;
     }
+    uint64_t previousGeneration = ReadWindowMetricsGeneration(pid);
     static _Atomic uint32_t sampleSequence = 0;
     MacWSInputRecord record = {
         .magic = MACWS_INPUT_MAGIC,
@@ -862,10 +894,35 @@ static BOOL RequestApplicationReopen(pid_t pid, NSTimeInterval timeout) {
             pid, sent ? @"YES" : @"NO", sendError);
     if (!sent) return NO;
     int exitStatus = -1;
-    BOOL ready = WaitForWindowMetrics(pid, timeout, &exitStatus);
-    HostLog(@"application-reopen pid=%d result=%@ exit-status=%d", pid,
-            ready ? @"window-ready" : @"no-visible-window", exitStatus);
+    BOOL ready = WaitForWindowMetricsFlagsAfterGeneration(
+        pid, timeout, MacWSStreamWindowVisible, previousGeneration,
+        &exitStatus);
+    HostLog(@"application-reopen pid=%d result=%@ previous-generation=%llu "
+            "current-generation=%llu exit-status=%d", pid,
+            ready ? @"window-ready" : @"no-visible-window",
+            (unsigned long long)previousGeneration,
+            (unsigned long long)ReadWindowMetricsGeneration(pid), exitStatus);
     return ready;
+}
+
+// System Settings' SwiftUI shell can publish a real visible NSWindow before
+// ExtensionKit has supplied the remote preference pane.  That exact state was
+// runtime-confirmed as a blank right-hand pane together with
+// `PPCenter.swift:267 Falling back to Appearance` and LaunchServices -10814.
+// Require both halves of the stock transaction: a fresh shell-window
+// generation (RequestApplicationReopen above) and the real Ventura Appearance
+// extension executable launched by ExtensionKit.  This does not synthesize a
+// view or turn an extension error into success.
+static BOOL WaitForSystemSettingsContent(NSTimeInterval timeout) {
+    pid_t appearancePID = WaitForRunningRootExecutable(
+        @(kAppearanceExecutable), timeout);
+    if (appearancePID <= 1) {
+        HostLog(@"system-settings content result=missing-appearance-extension");
+        return NO;
+    }
+    HostLog(@"system-settings content result=appearance-extension-ready pid=%d",
+            appearancePID);
+    return YES;
 }
 
 static off_t FileSizeAtPath(const char *path) {
@@ -1088,9 +1145,12 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
 
     pid_t mapsPID = FindRunningRootExecutable(mapsRootPath);
     if (mapsPID > 1) {
-        int exitStatus = -1;
-        if (WaitForWindowMetrics(mapsPID, 3.0, &exitStatus) ||
-            RequestApplicationReopen(mapsPID, 5.0)) {
+        // Maps can retain a stale Visible metrics sidecar after its last
+        // Catalyst scene or renderer has gone away.  Reuse is successful
+        // only when the live process handles the native reopen request and
+        // publishes a strictly newer generation, exactly like the generic
+        // System Settings/Maps lifecycle path below.
+        if (RequestApplicationReopen(mapsPID, 8.0)) {
             os_unfair_lock_lock(&gStateLock);
             gActiveAppPID = mapsPID;
             gActiveAppID = @"maps";
@@ -1156,6 +1216,19 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
         *message = @"Maps 正在运行，但没有发布可见的原生窗口";
         return NO;
     }
+
+    // uiopen'ing the Catalyst carrier necessarily foregrounds that otherwise
+    // invisible helper and suspends MacWSHost before its XPC reply can be
+    // consumed.  Runtime-confirmed on PID 55688: returning the existing Host
+    // application after window readiness immediately completed the pending
+    // window transaction and selected the native Maps window.
+    const char *returnHost[] = {
+        kSudo, "-u", "mobile", kUIOpen, "--bundleid",
+        "com.macwsguide.host", NULL,
+    };
+    int returnHostResult = RunCommand(returnHost, YES);
+    HostLog(@"launch-app foreground-return id=maps result=%d route=uiopen-host",
+            returnHostResult);
 
     os_unfair_lock_lock(&gStateLock);
     gActiveAppPID = mapsPID;
@@ -1303,12 +1376,18 @@ static BOOL LaunchRootExecutable(const char *identifier,
         BOOL finder = strcmp(identifier, "finder") == 0;
         BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
                                strcmp(identifier, "maps") == 0;
-        BOOL existingWindow = WaitForWindowMetrics(existingPID, 3.0,
-                                                    &exitStatus);
+        // System Settings and Maps own native reopen lifecycles.  Their
+        // metrics sidecar may describe a window that has since closed if the
+        // application main queue stopped publishing.  Require a fresh
+        // generation produced after the exact reopen request; PID uptime or a
+        // stale Visible bit is not a launch-success witness.
+        BOOL existingWindow = reopenLifecycle
+            ? RequestApplicationReopen(existingPID, 8.0)
+            : WaitForWindowMetrics(existingPID, 3.0, &exitStatus);
+        if (existingWindow && strcmp(identifier, "system-settings") == 0)
+            existingWindow = WaitForSystemSettingsContent(12.0);
         if (!existingWindow && finder)
             existingWindow = RequestFinderBrowserWindow(existingPID, 8.0);
-        if (!existingWindow && reopenLifecycle)
-            existingWindow = RequestApplicationReopen(existingPID, 8.0);
         if (!existingWindow) {
             // Runtime-confirmed on the default Terminal bootstrap: closing
             // its last represented iPad Scene leaves a healthy process with
@@ -1403,6 +1482,8 @@ static BOOL LaunchRootExecutable(const char *identifier,
             : (reopenLifecycle
                 ? RequestApplicationReopen(pid, timeout)
                 : WaitForWindowMetrics(pid, timeout, &exitStatus));
+        if (windowReady && strcmp(identifier, "system-settings") == 0)
+            windowReady = WaitForSystemSettingsContent(12.0);
         if (!windowReady) {
             os_unfair_lock_lock(&gStateLock);
             if (gActiveAppPID == pid) {

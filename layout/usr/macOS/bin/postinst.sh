@@ -4,6 +4,11 @@ ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 CFPREFSD_ENT="/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist"
 EXTENSIONKIT_ENT="/var/jb/usr/macOS/bin/extensionkitservice-entitlements.plist"
 APPEARANCE_ENT="/var/jb/usr/macOS/bin/appearance-extension-entitlements.plist"
+CORELOCATIONAGENT_NATIVE_ENT="/var/jb/usr/macOS/bin/corelocationagent-native-entitlements.plist"
+LOCATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/locationd-native-entitlements.plist"
+GEOD_NATIVE_ENT="/var/jb/usr/macOS/bin/geod-native-entitlements.plist"
+INTEROP_LOCATION_ENT="/var/jb/usr/macOS/bin/interop-location-entitlements.plist"
+CODE_REQUIREMENT_WRITER="/var/jb/usr/macOS/bin/write_code_requirement.py"
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
 LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
@@ -120,6 +125,55 @@ sign_and_trustcache() {
     done
 }
 
+# CoreLocationAgent refuses UUID registration unless the client has a real
+# designated requirement and that requirement validates against the live
+# process. ldid's default ad-hoc requirement contains certificate predicates
+# that cannot hold without a signing certificate; generic -S signing can also
+# leave no extractable requirement at all. Embed the explicit identifier
+# requirement through ldid's raw -Q contract, then trust the resulting hashes.
+# Do not re-sign a correct persistent image merely because Dopamine's dynamic
+# trustcache was cleared by reboot.
+sign_and_trustcache_with_identifier_requirement() {
+    local path="$1"
+    local identifier="$2"
+    [ -f "$path" ] || return 0
+    [ -f "$CODE_REQUIREMENT_WRITER" ] || return 1
+
+    local needs_signature=0 current_entitlements="" requirement_file=""
+    current_entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    printf '%s\n' "$current_entitlements" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+        needs_signature=1
+    ldid -h "$path" 2>/dev/null |
+        grep -Fqx "Identifier=$identifier" || needs_signature=1
+    ldid -q "$path" 2>/dev/null | strings |
+        grep -Fqx "$identifier" || needs_signature=1
+
+    if [ "$needs_signature" -eq 1 ]; then
+        requirement_file="/tmp/macws-code-requirement.$$.bin"
+        /var/jb/usr/bin/python3 "$CODE_REQUIREMENT_WRITER" \
+            "$identifier" "$requirement_file" || return 1
+        ldid -I"$identifier" -Q"$requirement_file" -S"$ENT" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        ldid -I"$identifier" -Q"$requirement_file" -S"$ENT" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        rm -f "$requirement_file"
+    fi
+
+    ldid -q "$path" 2>/dev/null | strings |
+        grep -Fqx "$identifier" || return 1
+    local arch h
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null |
+            grep CDHash= | cut -c8-)
+        [ -n "$h" ] && trust_cdhash "$h" "$path" "$arch"
+    done
+}
+
 # ExtensionKit's service is admitted before autosignd can participate and its
 # native private entitlements are part of the service contract.  The generic
 # MacWS profile drops those rights, while the stock macOS signature is rejected
@@ -166,6 +220,101 @@ sign_and_trustcache_with_entitlements() {
         h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
         [ -n "$h" ] && trust_cdhash "$h" "$path" "$arch"
     done
+    # A thin binary legitimately has no hash for the final probed
+    # architectures.  Do not let the last false `[ -n "$h" ]` turn an
+    # otherwise successful signing/trust operation into a function failure.
+    return 0
+}
+
+# A stock service can need both its native private protocol rights and the
+# MacWS admission/injection profile.  `ldid -M` merges the second profile into
+# the current signature; signing with either profile alone drops the other
+# half and reproduces an early sandbox or launch-constraint kill.  Validate
+# both markers and the identifier before treating a persistent signature as a
+# cold-start witness.  Callers that are themselves verified by a stock macOS
+# agent can request an explicit identifier-only designated requirement; ldid's
+# synthesized ad-hoc default contains certificate predicates that can never
+# validate for our unsigned image.
+sign_and_trustcache_merging_native_entitlements() {
+    local path="$1"
+    local native_entitlements="$2"
+    local native_marker="$3"
+    local identifier="$4"
+    local explicit_requirement="${5:-0}"
+    [ -f "$path" ] || return 0
+    [ -f "$native_entitlements" ] || return 1
+
+    local hashes="" h dominated=1 current_entitlements="" requirement_valid=1
+    current_entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    if [ "$explicit_requirement" -eq 1 ]; then
+        ldid -q "$path" 2>/dev/null | strings |
+            grep -Fqx "$identifier" || requirement_valid=0
+        if ldid -q "$path" 2>/dev/null | strings |
+            grep -Fq 'subject.CN'; then
+            requirement_valid=0
+        fi
+    fi
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && hashes="$hashes $h"
+    done
+    for h in $hashes; do
+        if ! is_trusted "$h"; then
+            dominated=0
+            break
+        fi
+    done
+    if [ -n "$hashes" ] && [ "$dominated" -eq 1 ] &&
+       [ "$requirement_valid" -eq 1 ] &&
+       printf '%s\n' "$current_entitlements" |
+           grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' &&
+       printf '%s\n' "$current_entitlements" | grep -Fq "$native_marker" &&
+       ldid -h "$path" 2>/dev/null |
+           grep -Fqx "Identifier=$identifier"; then
+        return 0
+    fi
+
+    if [ "$explicit_requirement" -eq 1 ]; then
+        local requirement_file="/tmp/macws-code-requirement.$$.bin"
+        /var/jb/usr/bin/python3 "$CODE_REQUIREMENT_WRITER" \
+            "$identifier" "$requirement_file" || return 1
+        ldid -I"$identifier" -Q"$requirement_file" -S"$ENT" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        ldid -I"$identifier" -Q"$requirement_file" \
+            -S"$native_entitlements" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        ldid -I"$identifier" -Q"$requirement_file" \
+            -S"$native_entitlements" -M "$path" || {
+            rm -f "$requirement_file"
+            return 1
+        }
+        rm -f "$requirement_file"
+    else
+        ldid -I"$identifier" -S"$ENT" -M "$path" || return 1
+        ldid -I"$identifier" -S"$native_entitlements" -M "$path" || return 1
+        ldid -I"$identifier" -S"$native_entitlements" -M "$path" || return 1
+    fi
+    current_entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    printf '%s\n' "$current_entitlements" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' || return 1
+    printf '%s\n' "$current_entitlements" | grep -Fq "$native_marker" || return 1
+    ldid -h "$path" 2>/dev/null |
+        grep -Fqx "Identifier=$identifier" || return 1
+    if [ "$explicit_requirement" -eq 1 ]; then
+        ldid -q "$path" 2>/dev/null | strings |
+            grep -Fqx "$identifier" || return 1
+        ! ldid -q "$path" 2>/dev/null | strings |
+            grep -Fq 'subject.CN' || return 1
+    fi
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$h" ] && trust_cdhash "$h" "$path" "$arch"
+    done
+    return 0
 }
 
 add_trustcache() {
@@ -354,7 +503,12 @@ add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec"
 add_all_trustcache "/var/jb/usr/macOS/bin/launchdchrootexec_debug"
 add_all_trustcache "/var/jb/usr/macOS/bin/macwsinputd"
 add_all_trustcache "/var/jb/usr/macOS/bin/macwsdisplayd"
-add_all_trustcache "/var/jb/usr/macOS/bin/macwsinteropd"
+sign_and_trustcache_merging_native_entitlements \
+    "/var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd" \
+    "$INTEROP_LOCATION_ENT" \
+    '<key>com.apple.locationd.simulation</key>' \
+    'com.macwsguide.interopd' \
+    1 || exit 1
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer"
 cp -vf /var/jb/usr/macOS/Frameworks/MetalSerializer.framework/MetalSerializer_macos /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
 add_all_trustcache /var/mnt/rootfs/usr/local/Frameworks/MetalSerializer.framework/MetalSerializer
@@ -376,9 +530,16 @@ fi
 VIEWBRIDGE_PROXY_EXEC="$VIEWBRIDGE_PROXY/ViewBridgeAuxiliary"
 HISERVICES_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy"
 OPEN_SAVE_PANEL_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy"
+GEOD_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy"
+WRITE_CONFIG_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/SystemAdministration.framework/XPCServices/WriteConfigProxy.xpc/WriteConfigProxy"
+LOCATIOND_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/CoreLocation.framework/XPCServices/LocationdProxy.xpc/LocationdProxy"
 add_all_trustcache "$VIEWBRIDGE_PROXY_EXEC"
 add_all_trustcache "$HISERVICES_PROXY_EXEC"
 add_all_trustcache "$OPEN_SAVE_PANEL_PROXY_EXEC"
+add_all_trustcache "$GEOD_PROXY_EXEC"
+add_all_trustcache "$WRITE_CONFIG_PROXY_EXEC"
+add_all_trustcache "$LOCATIOND_PROXY_EXEC"
+add_all_trustcache "/var/jb/usr/macOS/bin/macwslocationd"
 EXTENSIONKIT_PROXY="/var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy"
 add_all_trustcache "$EXTENSIONKIT_PROXY"
 # These four services are launched as mobile-owned per-process XPC jobs, but
@@ -392,7 +553,10 @@ for proxy in \
     "$VIEWBRIDGE_PROXY_EXEC" \
     "$HISERVICES_PROXY_EXEC" \
     "$OPEN_SAVE_PANEL_PROXY_EXEC" \
-    "$EXTENSIONKIT_PROXY"; do
+    "$EXTENSIONKIT_PROXY" \
+    "$GEOD_PROXY_EXEC" \
+    "$WRITE_CONFIG_PROXY_EXEC" \
+    "$LOCATIOND_PROXY_EXEC"; do
     if [ -x "$proxy" ]; then
         chown root:wheel "$proxy"
         chmod 4755 "$proxy"
@@ -426,6 +590,21 @@ sign_and_trustcache_with_entitlements \
     "$APPEARANCE_ENT" \
     '<key>com.apple.security.exception.files.absolute-path.read-write</key>' \
     'com.apple.Appearance-Settings.extension'
+sign_and_trustcache_merging_native_entitlements \
+    "/var/mnt/rootfs/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
+    "$CORELOCATIONAGENT_NATIVE_ENT" \
+    '<key>com.apple.locationd.authorizeapplications</key>' \
+    'com.apple.CoreLocationAgent' || exit 1
+sign_and_trustcache_merging_native_entitlements \
+    "/var/mnt/rootfs/usr/libexec/locationd" \
+    "$LOCATIOND_NATIVE_ENT" \
+    '<key>com.apple.private.security.storage.locationd</key>' \
+    'com.apple.locationd' || exit 1
+sign_and_trustcache_merging_native_entitlements \
+    "/var/mnt/rootfs/System/Library/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/com.apple.geod.xpc/Contents/MacOS/com.apple.geod" \
+    "$GEOD_NATIVE_ENT" \
+    '<key>com.apple.private.network.socket-delegate</key>' \
+    'com.apple.geod' || exit 1
 # codesign -vvv -d dyld_shared_cache_arm64e 2>&1 | grep CDHash=
 jbctl trustcache add b5da39409492ac85e5a8e8ab618fe77e2d7a2980
 # codesign -vvv -d dyld_shared_cache_arm64e.01 2>&1 | grep CDHash=
@@ -468,6 +647,22 @@ if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
 	add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 fi
 
+# Establish the complete arm64e loader closure before the first chroot exec
+# below.  The signatures persist across a reboot, but Dopamine's dynamic
+# trustcache does not.  Runtime-confirmed on 2026-08-05: invoking /bin/bash
+# before these two hashes were restored produced, in order,
+#
+#   AMFI: '/usr/lib/dyld' has no CMS blob
+#   Library not loaded: @rpath/CydiaSubstrate.framework/CydiaSubstrate
+#
+# and SIGKILL/abort before the later legacy registration block could run.
+# Registering the existing dyld and chroot CydiaSubstrate CodeDirectories made
+# the unchanged bash process complete normally.  Keep this upstream of the
+# Ventura codesign calls rather than weakening their result checks.
+add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
+add_all_trustcache \
+	/var/mnt/rootfs/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate
+
 # System Settings panes are real Ventura ExtensionKit executables launched
 # through an iOS first-image proxy. Keep their bundle-local dependency closure,
 # load commands, dedicated sandbox exceptions and reboot-volatile trustcache in
@@ -490,6 +685,42 @@ for bridge in macwsdisplayd macwsinteropd macwsworkspacectl; do
 		add_all_trustcache "/var/mnt/rootfs/usr/local/bin/$bridge"
 	fi
 done
+# Keep the CoreLocation client at a real bundle path.  CoreLocationAgent's
+# copy_client_info routine skips designated-requirement extraction when both
+# bundle identifier and bundle path are absent; the old /usr/local/bin daemon
+# therefore remained permanently unverified even with a valid CodeDirectory.
+INTEROP_BUNDLE_SOURCE=/var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents
+INTEROP_BUNDLE_TARGET=/var/mnt/rootfs/usr/local/libexec/MacWSInteropService.app/Contents
+if [ -f "$INTEROP_BUNDLE_SOURCE/MacOS/macwsinteropd" ]; then
+	mkdir -p "$INTEROP_BUNDLE_TARGET/MacOS"
+	cp -f "$INTEROP_BUNDLE_SOURCE/Info.plist" \
+		"$INTEROP_BUNDLE_TARGET/Info.plist"
+	rm -f "$INTEROP_BUNDLE_TARGET/MacOS/macwsinteropd"
+	cp -f "$INTEROP_BUNDLE_SOURCE/MacOS/macwsinteropd" \
+		"$INTEROP_BUNDLE_TARGET/MacOS/macwsinteropd"
+	chmod 644 "$INTEROP_BUNDLE_TARGET/Info.plist"
+	chmod 755 "$INTEROP_BUNDLE_TARGET/MacOS/macwsinteropd"
+	# CoreLocationAgent validates the live client through macOS Security.
+	# ldid's embedded signature is sufficient for AMFI but Ventura Security
+	# reports it as an unsupported live Code object.  Re-seal the complete
+	# chroot bundle with Ventura's own ad-hoc signer so Info.plist, resources,
+	# entitlements, identifier and the explicit identifier-only requirement are
+	# represented in the native macOS CodeDirectory.  Runtime-confirmed on the
+	# target: strict verification passes, flags=0x2(adhoc), and repeated signing
+	# produces the same CDHash.
+	/var/jb/usr/macOS/bin/launchdchrootexec 0 0 /var/mnt/rootfs \
+		/usr/bin/codesign --force --sign - --timestamp=none \
+		--preserve-metadata=identifier,entitlements,requirements \
+		/usr/local/libexec/MacWSInteropService.app || exit 1
+	/var/jb/usr/macOS/bin/launchdchrootexec 0 0 /var/mnt/rootfs \
+		/usr/bin/codesign --verify --strict --verbose=2 \
+		/usr/local/libexec/MacWSInteropService.app || exit 1
+	ldid -e "$INTEROP_BUNDLE_TARGET/MacOS/macwsinteropd" 2>/dev/null |
+		grep -Fq '<key>com.apple.locationd.simulation</key>' || exit 1
+	ldid -h "$INTEROP_BUNDLE_TARGET/MacOS/macwsinteropd" 2>/dev/null |
+		grep -Fqx 'Identifier=com.macwsguide.interopd' || exit 1
+	add_all_trustcache "$INTEROP_BUNDLE_TARGET/MacOS/macwsinteropd"
+fi
 # LaunchServices' FSNode layer receives the kernel mount name for the macOS
 # filesystem even after launchdchrootexec has changed the process root.  On the
 # target device its real database therefore records bundle paths below
@@ -571,7 +802,9 @@ add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.fra
 add_all_trustcache /var/mnt/rootfs/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/31001/Libraries/libGPUCompiler.dylib
 add_all_trustcache /var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
 sign_and_trustcache '/var/mnt/rootfs/System/Applications/System Settings.app/Contents/MacOS/System Settings'
-sign_and_trustcache '/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps'
+sign_and_trustcache_with_identifier_requirement \
+    '/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps' \
+    'com.apple.Maps' || exit 1
 # GlassDemo is launched directly by macwshostd before libmachook can ask
 # autosignd for help. Its persistent signature survives reboot, while
 # Dopamine's dynamic trustcache does not.

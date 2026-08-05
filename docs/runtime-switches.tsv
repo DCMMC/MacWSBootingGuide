@@ -24,6 +24,7 @@ env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 t
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
+env	MACWS_CATALOG_REGISTRATION	off; one-shot=1	macwsworkspacectl register-settings-extension	Enables the chroot mount-namespace model only for the short-lived stock LaunchServices registration of standalone System Settings extensions; never persisted in a launchd plist.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
@@ -123,6 +124,7 @@ env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
 env	MACWS_SURF_FILL_IOS	off	diagnostic	IOSurface fill probe.
 env	MACWS_SUSPEND_AT_EXEC	off	diagnostic	SIGSTOP immediately after injection for LLDB attach.
 env	MACWS_SUSPEND_TARGET	off	diagnostic	Narrows MACWS_SUSPEND_AT_EXEC to one exact executable path or basename; absent means every launcher target.
+env	MACWS_LLDB_HOLD_AFTER_INIT	off	diagnostic	Stops after libmachook installs compatibility interposes and its dyld image callback; use MACWS_SUSPEND_TARGET to narrow the process name. Intended for cold-start service tracing when POSIX_SPAWN_START_SUSPENDED is too early.
 env	MACWS_TEX_TRACE	off	diagnostic	Texture call trace.
 env	MACWS_VNC_LOW_LATENCY_COMPRESSION	on	OSXvnc	Clamp negotiated compression work factor to measured level 1.
 env	MACWS_VNC_INPUT_MODE	off	OSXvnc A/B control	Explicitly selects stock, scale-only, or hybrid input ownership; production leaves it unset and obtains hybrid behavior from MACWS_VNC_NATIVE_ALL=1.
@@ -130,6 +132,7 @@ env	MACWS_VNC_NATIVE_ALL	on	OSXvnc	Single system-wide CoreGraphics input owner.
 env	MACWS_VNC_SHARE	off	environment override	Production enables the equivalent /tmp/macws_vnc_share session flag.
 env	MACWS_VNC_TRACE_CLIENT_MESSAGES	off	diagnostic	RFB client-message trace.
 env	MACWS_XPC_DEBUG	off	diagnostic	XPC connection trace; no process enables it implicitly.
+env	MACWS_XPC_NAME_TRACE	off	diagnostic	Bounded allocation-free cold-start recorder for XPC/bootstrap service names; writes at most 512 records to stderr and never changes requests or results.
 env	NSRunningFromLaunchd	on	pbs	Matches the real macOS Services daemon launch contract.
 env	PATH	auto	chroot launcher	Explicit standard chroot executable search path.
 env	PINPROBE_HOLD_BEFORE_PIN	off	standalone probe	Holds PinnedVAProbe before pinning for debugger attachment.

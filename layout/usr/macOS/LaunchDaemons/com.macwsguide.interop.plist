@@ -17,7 +17,7 @@
 		<string>0</string>
 		<string>0</string>
 		<string>/var/mnt/rootfs</string>
-		<string>/usr/local/bin/macwsinteropd</string>
+		<string>/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

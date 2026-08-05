@@ -2279,3 +2279,68 @@ boundary. Production keeps the 300-second, critical-only thermal rule and
 crash-loop protection, but no longer samples or intervenes on free-memory
 percentage. Full report and policy history are in
 [`memory-reset-20260801/`](evidence/memory-reset-20260801/README.md).
+
+## 2026-08-04: Maps reaches stable native-AGX AppKit windows
+
+Maps exposed two independent native-AGX compatibility boundaries after its
+UIKitSystem/FuseBoard identity was repaired. First, runtime LLDB showed that
+the AGX external `objc_msgSendSuper2` stub could be called before the previous
+late repair point. The production loader now validates and rewrites that exact
+four-instruction stub immediately after deriving the AGX image slide, before
+any AGX Objective-C initialization.
+
+A later clean-deployment check also caught a build-boundary regression rather
+than accepting a black/short-lived window as success. The exact crash report
+`Maps-2026-08-04-172524.ips` records a PAC-invalid
+`__CFConstantStringClassReference` at `0x00200001eed885e8` in
+`-[NSBundle initWithPath:]`, reached from
+`getMetalPluginClassForService`. The AGX bundle path and `ds.g13g` resource
+names now enter Foundation as runtime-created NSString instances, eliminating
+that invalid arm64e constant-object relocation without bypassing
+authentication. A clean Mac-ld64 package then cold-launched Maps PID 47337,
+published visible 1024x724 and 482x600 windows, survived the observation
+interval, and completed a second native reopen handshake with metrics
+generation `4 -> 5`. The accepted package SHA-256 is
+`ebc05b6fb58463118ab0d6b413d0d05901b2211dcabf3629d82b0fd85b00fa67`.
+
+Second, the post-race-fix crash report and runtime disassembly placed a nil
+fence in `-[AGXG13GFamilyRenderContext updateFence:afterStages:] +124` at the
+exact `ldrh w1, [x19, x8]` instruction. Disassembly of the installed Ventura
+IOGPU and the iPad13,6 iOS 16.3.1 IOGPU image confirmed the same zero-input,
+one-32-bit-output fence ABI under different selectors: macOS create/destroy
+`0x16/0x17`, iOS create/destroy `0x12/0x13`. The IOConnect translator now maps
+only those exact pairs. No fence object, success result, or protocol predicate
+is synthesized.
+
+The installed production result was Maps PID 37607 with an onscreen 1024x724
+main window and 482x600 first-run window, no new Maps crash during the bounded
+acceptance observation, and nominal iPad thermal state. Visual and launch
+evidence is recorded in
+[`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md).
+
+## 2026-08-05: Maps tiles and current location complete the stock provider path
+
+Ventura Maps initially reached its native-AGX window but still failed at two
+independent service boundaries. GeoServices requests were reaching iPadOS 16's
+wire-incompatible `com.apple.geod` and returned `GEOErrorDomain -10`; the final
+architecture gives the stock Ventura listener and its clients one symmetric,
+collision-free bootstrap name. Populated map tiles then rendered without a
+request/response translator.
+
+For location, the iPadOS helper sends validated native scalars while Ventura's
+own CoreLocation reconstructs the object and retains authorization, filtering
+and client delivery. RE of both exact CoreLocation images found a shared
+176-byte `CLClientLocation` ABI: provider type at `0x60`, reference frame at
+`0x84`, and raw reference frame at `0x88`. The public scalar initializer had
+reset those fields, which runtime logs exposed as
+`location dropped due to referenceFrame=Unknown`. The final bridge preserves
+the real native metadata through Apple's `initWithClientLocation:` and reads it
+back before submission; it fails closed on any ABI mismatch.
+
+In the final bounded production session, Ventura locationd accepted ten
+consecutive fixes and sent all ten to `com.apple.Maps`, with zero unknown-frame
+drops. A 2388x1668 VNC witness showed populated tiles and the blue current-
+location marker. The iPadOS location daemon was never restarted, no related
+crash report was created, and the 5-minute Critical-only thermal watchdog
+reported nominal state. Full RE and runtime evidence is in
+[`maps-location-geoservices-20260804.md`](maps-location-geoservices-20260804.md).
