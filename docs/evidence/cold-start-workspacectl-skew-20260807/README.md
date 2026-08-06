@@ -73,3 +73,28 @@ The Host then launched Terminal and obtained its real DisplayStream window:
 No reboot or respring was used during repair.  The thermal watchdog remained
 armed at its production 300-second interval and reported `thermal-state=nominal`
 with an effective battery temperature of 32.19 °C.
+
+## Full-package alignment
+
+A follow-up timestamp audit found that the installed `macwshostd`,
+`macwsinputd`, `macwsdisplayd`, and arm64 `libmachook` images also predated the
+current `e457662` production source commit.  A clean detached worktree at
+`18b9f6c` was therefore rebuilt as a complete package instead of copying more
+individual artifacts.  The package witness was:
+
+```text
+525c3f50c654530391df15436d0a8fad1a09147a546e9aedd77959ecfb4fc577  com.kdt.macosbooter_0.3.4_iphoneos-arm64.deb
+Status: install ok installed
+Version: 0.3.4
+```
+
+The post-package equivalent cold start again passed the trust sentinels,
+registered the application catalog and all Settings extensions, and returned
+success.  No reboot or respring was used.
+
+This repair does **not** claim to solve the separate native-AGX WindowServer
+stability issue.  After launcher success, runtime logs still showed periodic
+WindowServer exit status 6 following Metal command-buffer `Internal Error
+00000103`; the watchdog rebuilt input/display services for each replacement
+generation.  That failure is downstream of the repaired package-version
+contract and needs its own AGX evidence/root-cause cycle.
