@@ -34,11 +34,13 @@ for arg in "$@"; do [ "$arg" = "--resume" ] && SKIP_CLEAN=1; done
 if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
     MARKER=/var/jb/usr/lib/TweakInject/MTLCompilerBypassOSCheck.dylib
     if [ -f "$MARKER" ]; then
-        STALE=$(find MTLCompilerBypassOSCheck MTLSimDriverHost \
+        STALE=$(find MTLCompilerBypassOSCheck MacWSWindowing \
+                     MacWSCatalystLaunch MTLSimDriverHost \
                      launchdchrootexec autosignd macwsallocd macwshostd \
                      macwsthermal macwslocationd \
                      mountdevfs ViewBridgeChrootProxy \
                      HIServicesChrootProxy OpenAndSavePanelChrootProxy \
+                     DockHelperChrootProxy \
                      ExtensionKitChrootProxy \
                      SettingsExtensionChrootProxy \
                      FileCoordinationChrootProxy \
@@ -46,7 +48,10 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      WriteConfigChrootProxy \
                      LocationdChrootProxy \
                      mtl_keepalive \
-                     MacWSHost macwsinputd launchservicesd \
+                     MacWSHost MacWSCatalystLauncher \
+                     SettingsExtensionMetadata misc/PingMTLCompilerService \
+                     macwsinputd macwsdisplayd macwsinteropd \
+                     macwsworkspacectl launchservicesd \
                      Makefile control layout \
                      -type f -newer "$MARKER" 2>/dev/null \
                 | grep -v '/\._' | head -3)

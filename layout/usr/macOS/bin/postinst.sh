@@ -685,6 +685,15 @@ if [ -f /var/jb/usr/macOS/bin/macwsinputd ]; then
 	chmod 755 /var/mnt/rootfs/usr/local/bin/macwsinputd
 	add_all_trustcache /var/mnt/rootfs/usr/local/bin/macwsinputd
 fi
+# Keep the repair path subject to the same package/runtime compatibility
+# invariant as DEBIAN/postinst.  Copying a stale single-pane controller over a
+# newer chroot binary would make a reboot self-heal deterministically regress
+# into the long `register-settings-extensions` failure loop.
+if ! /var/jb/usr/bin/grep -aFq 'register-settings-extensions' \
+		/var/jb/usr/macOS/bin/macwsworkspacectl 2>/dev/null; then
+	echo 'ERROR: installed macwsworkspacectl lacks the all-settings startup contract.' >&2
+	exit 1
+fi
 for bridge in macwsdisplayd macwsinteropd macwsworkspacectl; do
 	if [ -f "/var/jb/usr/macOS/bin/$bridge" ]; then
 		rm -f "/var/mnt/rootfs/usr/local/bin/$bridge"

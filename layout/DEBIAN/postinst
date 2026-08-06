@@ -361,6 +361,17 @@ install_chroot_runtime() {
 # A missing System/Library sentinel means the rootfs is not mounted; never
 # create a shadow tree under the mount point in that state.
 if [ -d "$ROOTFS/System/Library" ]; then
+    # macos_gui.sh and macwsworkspacectl form a versioned startup contract.
+    # A 2026-08-07 cold start had the new all-pane launcher script beside the
+    # old single-pane binary; the latter printed its usage for
+    # `register-settings-extensions`, then every automatic retry repeated the
+    # complete LaunchServices scan.  Refuse that split package at install time
+    # instead of publishing a runtime which can only fail after boot.
+    if ! /var/jb/usr/bin/grep -aFq 'register-settings-extensions' \
+            /var/jb/usr/macOS/bin/macwsworkspacectl 2>/dev/null; then
+        echo 'ERROR: packaged macwsworkspacectl lacks the all-settings startup contract.' >&2
+        exit 1
+    fi
     install_chroot_runtime "$LIBMACHOOK" \
         "$ROOTFS/usr/local/lib/libmachook.dylib" || exit 1
     install_chroot_runtime "$LIBMACHOOK_ARM64" \
