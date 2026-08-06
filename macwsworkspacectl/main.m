@@ -131,8 +131,8 @@ static int RegisterSettingsExtensions(BOOL registerRecords) {
         return 69;
     }
 
-    NSUInteger candidateCount = 0;
-    NSUInteger registeredCount = 0;
+    NSMutableArray<NSDictionary<NSString *, id> *> *candidates =
+        [NSMutableArray array];
     for (NSURL *url in contents) {
         @autoreleasepool {
             NSNumber *isDirectory = nil;
@@ -151,7 +151,6 @@ static int RegisterSettingsExtensions(BOOL registerRecords) {
             if (![extensionPoint isEqualToString:settingsExtensionPoint])
                 continue;
 
-            candidateCount++;
             NSString *expectedIdentifier = bundle.bundleIdentifier;
             if (expectedIdentifier.length == 0) {
                 fprintf(stderr,
@@ -176,11 +175,30 @@ static int RegisterSettingsExtensions(BOOL registerRecords) {
                 }
             }
 
-            // A zero registrar status is not sufficient.  Require the exact
-            // platform-1 record at the real bundle URL before publishing the
-            // Settings ExtensionKit services.  This catches the historical
-            // `Container state is -1` failure at startup instead of leaving a
-            // sidebar with silently missing panes.
+            [candidates addObject:@{
+                @"url": url,
+                @"identifier": expectedIdentifier,
+            }];
+        }
+    }
+
+    // LaunchServices commits plug-in registrations as one database
+    // transaction.  Runtime evidence on the iPad was explicit: registering
+    // AppleIDSettings returned status 0, but an initWithURL:error: performed
+    // before later plug-ins were submitted still returned -10814.  Aborting
+    // there left the catalog with only the first five records and made System
+    // Settings show only Appearance.  Once the remaining URLs were submitted,
+    // the stock enumerator returned all 48 matching records.
+    //
+    // Keep status checking on every stock registration, then validate only
+    // after the complete candidate set has been submitted.  No failure is
+    // accepted as success: every record must still resolve to the exact
+    // platform-1 identifier and URL before services are published.
+    NSUInteger registeredCount = 0;
+    for (NSDictionary<NSString *, id> *candidate in candidates) {
+        @autoreleasepool {
+            NSURL *url = candidate[@"url"];
+            NSString *expectedIdentifier = candidate[@"identifier"];
             NSError *recordError = nil;
             id record = ((id (*)(id, SEL))objc_msgSend)(
                 (id)recordClass, sel_registerName("alloc"));
@@ -226,6 +244,7 @@ static int RegisterSettingsExtensions(BOOL registerRecords) {
         }
     }
 
+    NSUInteger candidateCount = candidates.count;
     if (candidateCount == 0 || registeredCount != candidateCount) {
         fprintf(stderr,
                 "macwsworkspacectl: settings extension registration is "

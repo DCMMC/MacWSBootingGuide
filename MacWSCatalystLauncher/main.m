@@ -3,6 +3,9 @@
 
 #include "macws_macho_arch.h"
 
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+#define MACWS_PROC_PIDPATH_MAX 4096
+
 static const char *const kMacWSRoot = "/var/mnt/rootfs";
 static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
@@ -10,7 +13,72 @@ static const char *const kMapsHostExecutable =
     "/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps";
 static const char *const kChrootExec =
     "/var/jb/usr/macOS/bin/launchdchrootexec";
+static const char *const kHostCarrierMarker =
+    "/var/jb/var/mobile/macws-maps-host-carrier.pid";
 static pid_t gMapsPID = -1;
+
+static pid_t macws_live_host_carried_maps_pid(void) {
+    int marker = open(kHostCarrierMarker, O_RDONLY | O_CLOEXEC);
+    if (marker < 0) return 0;
+    char value[32] = {0};
+    ssize_t count = read(marker, value, sizeof(value) - 1);
+    close(marker);
+    int candidate = 0;
+    if (count <= 0 || sscanf(value, "%d", &candidate) != 1 || candidate <= 1)
+        return 0;
+    char path[MACWS_PROC_PIDPATH_MAX] = {0};
+    if (proc_pidpath(candidate, path, sizeof(path)) <= 0 ||
+        strcmp(path, kMapsExecutable) != 0) return 0;
+    return (pid_t)candidate;
+}
+
+static bool macws_configure_maps_environment(void) {
+    macws_macho_arch_t arch = macws_macho_arch_for_path(kMapsHostExecutable);
+    const char *insert = macws_insert_dylib_for_arch(arch);
+    if (!insert) return false;
+    setenv("DYLD_INSERT_LIBRARIES", insert, 1);
+    setenv("HOME", "/Users/root", 1);
+    setenv("USER", "root", 1);
+    setenv("TMPDIR", "/tmp", 1);
+    setenv("MallocNanoZone", "0", 1);
+    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
+    setenv("CA_VSYNC_OFF", "1", 1);
+    setenv("MACWS_AGX_NATIVE", "1", 1);
+    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
+    setenv("MACWS_PIN_FALLBACK", "1", 1);
+    setenv("COMMAND_MODE", "unix2003", 1);
+    setenv("__CFBundleIdentifier", "com.apple.Maps", 1);
+    setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
+    setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
+    setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
+           "com.apple.macosbooter.frontboard.systemappservices", 1);
+    return true;
+}
+
+// MacWSHost is already a foreground UIApplication with a valid live
+// FrontBoard scene.  In this mode the setuid helper does not create a second
+// UIKit scene: it immediately replaces only itself with the chroot exec
+// carrier.  The resulting Maps process remains a direct child of MacWSHost,
+// while the Host keeps its fullscreen workspace and input connection alive.
+static int macws_exec_maps_from_existing_host(void) {
+    if (geteuid() != 0) return 77;
+    if (macws_live_host_carried_maps_pid() > 1) return 0;
+    if (!macws_configure_maps_environment()) return 78;
+    int marker = open(kHostCarrierMarker,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (marker >= 0) {
+        char value[32];
+        int length = snprintf(value, sizeof(value), "%d\n", getpid());
+        if (length > 0) (void)write(marker, value, (size_t)length);
+        close(marker);
+    }
+    char *const childArgv[] = {
+        (char *)kChrootExec, "0", "0", (char *)kMacWSRoot,
+        (char *)kMapsExecutable, NULL,
+    };
+    execv(kChrootExec, childArgv);
+    return errno ? errno : 78;
+}
 
 static void macws_open_launcher_log(void) {
     int fd = open("/var/jb/var/mobile/catalyst-launcher.log",
@@ -50,36 +118,17 @@ static void macws_spawn_maps(void) {
         return;
     }
 
-    macws_macho_arch_t arch = macws_macho_arch_for_path(kMapsHostExecutable);
-    const char *insert = macws_insert_dylib_for_arch(arch);
-    if (!insert) {
+    if (!macws_configure_maps_environment()) {
         fprintf(stderr,
-                "[MacWSCatalystLauncher] unsupported target architecture %s\n",
-                macws_arch_name(arch));
+                "[MacWSCatalystLauncher] unsupported Maps architecture\n");
         (void)seteuid(getuid());
         return;
     }
-    setenv("DYLD_INSERT_LIBRARIES", insert, 1);
-    setenv("HOME", "/Users/root", 1);
-    setenv("USER", "root", 1);
-    setenv("TMPDIR", "/tmp", 1);
-    setenv("MallocNanoZone", "0", 1);
-    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
-    setenv("CA_VSYNC_OFF", "1", 1);
-    setenv("MACWS_AGX_NATIVE", "1", 1);
-    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
-    setenv("MACWS_PIN_FALLBACK", "1", 1);
-    setenv("COMMAND_MODE", "unix2003", 1);
-    setenv("__CFBundleIdentifier", "com.apple.Maps", 1);
     // Complete UIKitMacHelper's native process-support handshake and initial
     // scene request through the live carrier.  UIKitSystem validates the Maps
     // child's real audit token and exact exec generation; no UIScreen or
     // application predicate is fabricated.  Verbose CATALYST_TRACE is
     // intentionally absent from the production environment.
-    setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
-    setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
-    setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
-           "com.apple.macosbooter.frontboard.systemappservices", 1);
     char *const childArgv[] = {
         (char *)kChrootExec, "0", "0", (char *)kMacWSRoot,
         (char *)kMapsExecutable, NULL,
@@ -202,6 +251,8 @@ int main(int argc, char *argv[]) {
                     "required before UIApplicationMain\n");
             return 77;
         }
+        if (argc == 2 && strcmp(argv[1], "--exec-maps-from-host") == 0)
+            return macws_exec_maps_from_existing_host();
         uid_t launchUser = getuid();
         if (seteuid(launchUser) < 0) {
             perror("[MacWSCatalystLauncher] enter mobile UIKit identity");

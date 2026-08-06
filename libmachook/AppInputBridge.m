@@ -1576,6 +1576,14 @@ static BOOL MacWSAppInputSupportedProcess(void) {
     // non-replying helper would unnecessarily consume the target-probe
     // deadline.  Processes that do not load NSApplication are not endpoints.
     if (!program || !objc_getClass("NSApplication")) return NO;
+    // UIKitSystem is infrastructure, not a user-facing AppKit application.
+    // Runtime-confirmed by UIKitSystem-2026-08-07-040707.ips: our periodic
+    // MacWSPublishWindowMetrics entered +[NSApplication sharedApplication]
+    // inside UIKitSystem, initialized Dock registration there, and the same
+    // process then crashed while its FrontBoard repository was being built.
+    // It must provide Catalyst/FrontBoard services without an AppInput socket,
+    // an NSApplication instance, or a synthetic window-catalog publisher.
+    if (strcmp(program, "UIKitSystem") == 0) return NO;
     if (strstr(program, "Helper") || strstr(program, "Renderer") ||
         strstr(program, "GPU") || strcmp(program, "WindowServer") == 0 ||
         strstr(program, "OSXvnc") || strcmp(program, "launchservicesd") == 0 ||

@@ -14,6 +14,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #import "MacWSControlClient.h"
@@ -69,6 +71,8 @@ static CFStringRef const MacWSRequestFullscreenNotification =
     CFSTR("com.macwsguide.windowing.request-fullscreen");
 static CFStringRef const MacWSRequestResizeNotification =
     CFSTR("com.macwsguide.windowing.request-resize");
+static CFStringRef const MacWSLaunchMapsFromHostNotification =
+    CFSTR("com.macwsguide.host.launch-maps");
 static NSString *const MacWSResizeRequestDirectory =
     @"/var/mobile/Library/Preferences";
 static NSString *const MacWSFullscreenRequestPrefix =
@@ -77,6 +81,9 @@ static NSString *const MacWSResizeRequestPrefix =
     @"com.macwsguide.windowing.resize-request.";
 static const char MacWSInputSocketPath[] =
     "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
+static const char MacWSCatalystLauncherPath[] =
+    "/var/jb/Applications/MacWSCatalystLauncher.app/"
+    "MacWSCatalystLauncher";
 
 static BOOL MacWSHostDiagnosticsEnabled(void) {
     static dispatch_once_t onceToken;
@@ -174,6 +181,53 @@ static void MacWSLog(NSString *format, ...) {
         fclose(file);
     }
     pthread_mutex_unlock(&logLock);
+}
+
+static BOOL MacWSSpawnMapsFromForegroundHost(int *errorOut) {
+    char *const arguments[] = {
+        (char *)MacWSCatalystLauncherPath,
+        "--exec-maps-from-host",
+        NULL,
+    };
+    extern char **environ;
+    pid_t child = 0;
+    int error = posix_spawn(&child, MacWSCatalystLauncherPath,
+                            NULL, NULL, arguments, environ);
+    if (errorOut) *errorOut = error;
+    MacWSLog(@"maps-host-carrier spawn result=%d child=%d parent=%d",
+             error, child, getpid());
+    if (error == 0 && child > 1) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int status = 0;
+            pid_t waited = 0;
+            do {
+                waited = waitpid(child, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+            if (waited == child) {
+                MacWSLog(@"maps-host-carrier child-exit pid=%d exited=%@ code=%d signaled=%@ signal=%d",
+                         child, WIFEXITED(status) ? @"YES" : @"NO",
+                         WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                         WIFSIGNALED(status) ? @"YES" : @"NO",
+                         WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+            } else {
+                MacWSLog(@"maps-host-carrier wait-failed pid=%d errno=%d",
+                         child, errno);
+            }
+        });
+    }
+    return error == 0;
+}
+
+static void MacWSLaunchMapsNotificationCallback(
+    __unused CFNotificationCenterRef center,
+    __unused void *observer,
+    __unused CFStringRef name,
+    __unused const void *object,
+    __unused CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        int error = 0;
+        (void)MacWSSpawnMapsFromForegroundHost(&error);
+    });
 }
 
 static BOOL MacWSSendInputRecord(const MacWSInputRecord *record,
@@ -3760,6 +3814,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                            preferredSize:(CGSize)preferredSize
                                resizable:(BOOL)resizable;
 - (void)performURLAction:(NSString *)action;
+- (void)launchApplicationIdentifier:(NSString *)identifier;
 - (void)setFullscreenWorkspaceEnabled:(BOOL)enabled;
 - (void)openWindowInCurrentScene:(MacWSStreamWindow *)window
                           reason:(NSString *)reason;
@@ -3775,6 +3830,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)sceneGeometryDidChange;
 - (BOOL)activateCurrentMacWindow;
 - (BOOL)activateMacWindow:(MacWSStreamWindow *)window;
+- (BOOL)isFullscreenWorkspace;
+- (BOOL)activateMacWindowIDInFullscreenWorkspace:(uint32_t)windowID
+                                        ownerPID:(int32_t)ownerPID
+                                           title:(NSString *)title;
 - (void)presentWindowOverviewCurrentApplication:(BOOL)currentApplicationOnly;
 - (void)reassertFullscreenScenePresentation;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
@@ -5072,6 +5131,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     return YES;
 }
 
+- (BOOL)isFullscreenWorkspace {
+    return _streamMode == MacWSStreamModeFullscreen;
+}
+
+- (BOOL)activateMacWindowIDInFullscreenWorkspace:(uint32_t)windowID
+                                        ownerPID:(int32_t)ownerPID
+                                           title:(NSString *)title {
+    if (_streamMode != MacWSStreamModeFullscreen ||
+        windowID == 0 || ownerPID <= 1) return NO;
+    for (MacWSStreamWindow *window in _streamWindows) {
+        if (window.descriptor.windowID == windowID &&
+            window.descriptor.ownerPID == ownerPID)
+            return [self activateMacWindow:window];
+    }
+    [_metalView requestStreamWindowList];
+    [self setNotice:[NSString stringWithFormat:@"%@ 已在当前全屏工作区中打开，正在等待窗口目录更新。",
+        title.length ? title : @"macOS 应用"] success:YES];
+    MacWSLog(@"fullscreen-window-route pending pid=%d window=%u title=%@",
+             ownerPID, windowID, title ?: @"");
+    return YES;
+}
+
 - (void)presentWindowOverviewCurrentApplication:(BOOL)currentApplicationOnly {
     if (_streamMode != MacWSStreamModeFullscreen) return;
     [_metalView requestStreamWindowList];
@@ -6311,9 +6392,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                  success:YES];
         return;
     }
+    BOOL fullscreenWorkspace = [self isFullscreenWorkspace];
     UIAlertController *picker = [UIAlertController
-        alertControllerWithTitle:@"在新 iPadOS 窗口中打开"
-                         message:@"每个 Scene 只订阅一个 macOS 窗口的 IOSurface 流。"
+        alertControllerWithTitle:fullscreenWorkspace
+            ? @"切换 macOS 窗口" : @"在新 iPadOS 窗口中打开"
+                         message:fullscreenWorkspace
+            ? @"所选窗口会留在当前全屏桌面中，不会创建新的 iPadOS 窗口。"
+            : @"每个 Scene 只订阅一个 macOS 窗口的 IOSurface 流。"
                   preferredStyle:UIAlertControllerStyleActionSheet];
     NSUInteger limit = MIN(logicalWindows.count, 24);
     for (NSUInteger index = 0; index < limit; index++) {
@@ -6322,6 +6407,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             [NSString stringWithFormat:@"Window %u", window.descriptor.windowID];
         [picker addAction:[UIAlertAction actionWithTitle:title
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+                if ([self isFullscreenWorkspace]) {
+                    [self activateMacWindow:window];
+                    return;
+                }
                 MacWSRequestNewScene(self.view.window.windowScene,
                     window.descriptor.windowID, window.descriptor.ownerPID,
                     window.descriptor.logicalGroupID,
@@ -6758,11 +6847,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (ws && !_interopClient.isConnected) [_interopClient connect];
 
     _metalView.targetPID = targetPID;
-    BOOL inputReady = connected && !busy && ws && input && renderableFrame &&
+    // A root control transaction (for example a 30-second application launch
+    // witness) does not stop WindowServer, DisplayStream, or the per-process
+    // input sockets.  Coupling desktop input to hostd's unrelated `busy` bit
+    // made the whole fullscreen workspace intentionally unresponsive while an
+    // app was starting.  Keep controls serialized, but derive input readiness
+    // solely from the live display/input transport invariants.
+    BOOL inputReady = connected && ws && input && renderableFrame &&
         ((targetPID > 1 && appInput) || fullscreenSystemRoute);
     NSString *inputReason = nil;
     if (!connected) inputReason = @"root 控制服务离线";
-    else if (busy) inputReason = @"macOS 正在启动或切换";
     else if (!ws) inputReason = @"macOS 工作区已停止";
     else if (!input) inputReason = @"触控桥离线";
     else if (!renderableFrame) inputReason = @"等待 DisplayStream IOSurface 首帧";
@@ -6889,8 +6983,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)launchApplication:(UIButton *)sender {
+    [self launchApplicationIdentifier:sender.accessibilityIdentifier ?: @""];
+}
+
+- (void)launchApplicationIdentifier:(NSString *)identifier {
+    // hostd owns application-launch serialization.  For Maps it sends one
+    // Darwin request back to this already-foreground Host, whose observer
+    // performs the responsible-process spawn.  Spawning here as well created
+    // two Maps generations during the 200 ms hostd round trip and left both
+    // competing for one UIKitSystem scene.  Keep one transaction and one
+    // process generation for Control Center, Dock and URL launches alike.
     [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
-             arguments:@{@MACWS_CONTROL_KEY_APP_ID: sender.accessibilityIdentifier ?: @""}];
+             arguments:@{@MACWS_CONTROL_KEY_APP_ID: identifier ?: @""}];
 }
 
 - (void)captureAction {
@@ -7007,8 +7111,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                [action isEqualToString:@"finder"] ||
                [action isEqualToString:@"system-settings"] ||
                [action isEqualToString:@"maps"]) {
-        [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
-                 arguments:@{@MACWS_CONTROL_KEY_APP_ID: action}];
+        [self launchApplicationIdentifier:action];
     } else if ([action isEqualToString:@"recover"]) {
         [self recoverAction];
     } else if ([action isEqualToString:@"repair"]) {
@@ -7254,12 +7357,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         // The fullscreen Scene already presents WindowServer's complete
         // desktop. Turning it into a per-window stream here both crops that
         // desktop and asks UIKit to create/restore a windowed Scene. Keep the
-        // workspace identity intact; the catalog's focused-window update
-        // above supplies the keyboard target and the new AppKit window appears
-        // naturally inside the existing desktop stream.
+        // workspace identity intact and activate the exact catalog window in
+        // place.  Merely waiting for the focused flag left newly launched
+        // Catalyst/AppKit applications behind the previous frontmost app, so
+        // both pixels and AppInput continued to target the old process.
+        // ActivateTarget uses the window ID + owner PID already published by
+        // DisplayStream; it neither creates a UIKit Scene nor starts another
+        // application generation.
+        [self activateMacWindow:target];
         [self setNotice:[NSString stringWithFormat:
             @"%@ 已在当前全屏工作区中打开。", identifier] success:YES];
-        MacWSLog(@"launch-auto-window retained-fullscreen app=%@ pid=%d window=%u group=%u",
+        MacWSLog(@"launch-auto-window activated-fullscreen app=%@ pid=%d window=%u group=%u",
                  identifier, ownerPID, target.descriptor.windowID,
                  target.descriptor.logicalGroupID);
         return;
@@ -7341,9 +7449,41 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         // Manager window even though the initiating controller was fullscreen.
         if (!MacWSObservedWindowIdentities)
             MacWSObservedWindowIdentities = [NSMutableSet set];
+        // Dock and other macOS-native launch owners call hostd directly, so
+        // they do not receive the Control Center's pending-PID callback. The
+        // DisplayStream catalog is the common authoritative boundary for
+        // every launch source. Activate the best newly published, ordinary
+        // window in the existing desktop while retaining the one fullscreen
+        // iPadOS Scene. Pending Control Center launches add their identity
+        // before reaching this branch and therefore remain exactly-once.
+        MacWSStreamWindow *newTarget = nil;
+        NSUInteger newTargetScore = 0;
+        for (NSString *identity in current) {
+            if ([MacWSObservedWindowIdentities containsObject:identity])
+                continue;
+            MacWSStreamWindow *window = current[identity];
+            MacWSStreamWindowFlags flags = window.descriptor.flags;
+            if (window.descriptor.ownerPID <= 1 ||
+                (flags & MacWSStreamWindowTransient) != 0) continue;
+            NSUInteger score =
+                ((flags & MacWSStreamWindowFocused) ? 4 : 0) |
+                ((flags & MacWSStreamWindowVisible) ? 2 : 0) | 1;
+            if (!newTarget || score > newTargetScore) {
+                newTarget = window;
+                newTargetScore = score;
+            }
+        }
         [MacWSObservedWindowIdentities setSet:
             [NSSet setWithArray:current.allKeys]];
         [MacWSPendingWindowSceneIdentities removeAllObjects];
+        if (newTarget) {
+            [self activateMacWindow:newTarget];
+            MacWSLog(@"window-auto-scene activated-fullscreen-catalog pid=%d window=%u group=%u score=%lu",
+                     newTarget.descriptor.ownerPID,
+                     newTarget.descriptor.windowID,
+                     newTarget.descriptor.logicalGroupID,
+                     (unsigned long)newTargetScore);
+        }
         return;
     }
     if (![self isWindowDiscoveryCoordinator]) return;
@@ -7418,6 +7558,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                          identity);
                 return;
             }
+            if ([self hasForegroundFullscreenWorkspace]) {
+                [MacWSPendingWindowSceneIdentities removeObject:identity];
+                if (!MacWSObservedWindowIdentities)
+                    MacWSObservedWindowIdentities = [NSMutableSet set];
+                [MacWSObservedWindowIdentities addObject:identity];
+                [self activateMacWindow:stableWindow];
+                MacWSLog(@"window-auto-scene retained-fullscreen identity=%@ pid=%d window=%u",
+                         identity, stableWindow.descriptor.ownerPID,
+                         stableWindow.descriptor.windowID);
+                return;
+            }
             NSString *title = stableWindow.title.length
                 ? stableWindow.title : @"macOS Window";
             MacWSLog(@"window-auto-scene identity=%@ title=%@ stable-ms=250",
@@ -7478,6 +7629,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                         ? (focused ? @"appkit-focused" : @"frontmost-fallback")
                         : @"system-point-hit-test",
                      target.title ?: @"");
+            // Runtime-confirmed with Dock switching System Settings -> Maps:
+            // Dock published Maps as the AppKit-focused catalog owner, but
+            // the previous application's window remained above it and its
+            // menu bar stayed active. Reconcile a real cross-process focus
+            // edge by activating the exact focused catalog window. The PID is
+            // stored before this request, so the resulting catalog refresh is
+            // idempotent rather than an activation loop.
+            if (previousPID > 1 && targetPID > 1 && focused) {
+                [self activateMacWindow:target];
+                MacWSLog(@"fullscreen-focus-reconciled previous-pid=%d pid=%d window=%u route=exact-catalog-window",
+                         previousPID, targetPID,
+                         target.descriptor.windowID);
+            }
             [self refreshStatus];
         }
     }
@@ -8158,6 +8322,17 @@ static void MacWSDeduplicateWindowScenes(void) {
                 else if ([item.name isEqualToString:@"title"])
                     title = item.value;
             }
+            MacWSViewController *controller =
+                [self.window.rootViewController
+                    isKindOfClass:MacWSViewController.class]
+                    ? (MacWSViewController *)self.window.rootViewController
+                    : nil;
+            if ([controller isFullscreenWorkspace] && windowID != 0 &&
+                ownerPID > 1) {
+                [controller activateMacWindowIDInFullscreenWorkspace:windowID
+                    ownerPID:ownerPID title:title];
+                break;
+            }
             MacWSRequestNewScene(scene, windowID, ownerPID, 0,
                                  CGSizeZero, CGSizeZero, NO, title,
                                  ^(NSError *error) {
@@ -8328,6 +8503,13 @@ extern void MacWSRunIOSClearReference(void);
              MacWSLegacyFramebufferFallbackEnabled() ? @"enabled" : @"disabled",
              MacWSFramePath);
     MacWSLogMetalRegistryState();
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge const void *)self,
+        MacWSLaunchMapsNotificationCallback,
+        MacWSLaunchMapsFromHostNotification,
+        NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         MacWSPruneDeadWindowSceneSessions();

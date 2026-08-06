@@ -8300,6 +8300,50 @@ static void macws_install_osxvnc_hooks(void) {
 
 extern void MacWSInstallExtensionRuntimeCompatibility(void);
 
+// Ventura 13.4 has no ExtensionKit feature-flag domain.  The chrooted image
+// nevertheless resolves libsystem_featureflags against iPadOS's already-live
+// feature state, whose /System/Library/FeatureFlags/Domain/ExtensionKit.plist
+// enables `automatically_sandbox_extensions` and
+// `prefer_inprocess_discovery`.  Runtime evidence from the real Ventura
+// ExtensionFoundation boundary is exact:
+//
+//   _EXDefaults.forceSandbox = 1
+//   _EXDiscoveryController canRunQuery:error: = 0
+//   _LSApplicationExtensionRecordEnumerator recordCount=1 matchCount=1
+//
+// The corresponding macOS rootfs originally has no ExtensionKit.plist at all,
+// while the outer iPadOS file explicitly sets these flags true.  Restore the
+// target OS's absent-domain/default-false semantics at the feature provider,
+// before ExtensionFoundation decides whether its legitimate LS records are
+// admissible.  This is not a query/check bypass: every stock query, extension
+// entitlement, LS match, and ExtensionKit launch remains responsible for its
+// own normal validation.
+typedef bool (*macws_os_feature_enabled_impl_fn)(const char *, const char *);
+static macws_os_feature_enabled_impl_fn
+    macws_os_feature_enabled_impl_orig = NULL;
+static bool macws_os_feature_enabled_impl_compat(const char *domain,
+                                                  const char *feature) {
+    if (domain && strcmp(domain, "ExtensionKit") == 0) {
+        if (getenv("MACWS_RUNTIME_DIAGNOSTICS")) {
+            fprintf(stderr,
+                    "#### FEATUREFLAGS target-macos domain=%s feature=%s "
+                    "enabled=0\n", domain, feature ?: "<nil>");
+        }
+        return false;
+    }
+    return macws_os_feature_enabled_impl_orig
+        ? macws_os_feature_enabled_impl_orig(domain, feature) : false;
+}
+
+static void macws_install_target_feature_flag_compatibility(void) {
+    if (macws_os_feature_enabled_impl_orig) return;
+    void *provider = dlsym(RTLD_DEFAULT, "_os_feature_enabled_impl");
+    if (!provider) return;
+    MSHookFunction(provider,
+                   (void *)macws_os_feature_enabled_impl_compat,
+                   (void **)&macws_os_feature_enabled_impl_orig);
+}
+
 __attribute__((constructor)) void InitStuff() {
     // VS Code 1.130 marks both its login shell and the Electron-as-Node
     // environment printer with this exact value.  Runtime-confirmed: running
@@ -8329,6 +8373,7 @@ __attribute__((constructor)) void InitStuff() {
         }
     }
     EnableJIT();
+    macws_install_target_feature_flag_compatibility();
     // Settings extensions carry libmachook through a bundle-local load command.
     // Retry their ExtensionFoundation/LaunchServices boundary only after the
     // post-exec process has CS_DEBUGGED, so both Objective-C class availability
@@ -10252,23 +10297,29 @@ xpc_connection_t macws_xpc_connection_create_mach_service_early(
 //   -[GEODaemon initPrimaryDaemon] +0x34
 //       -> -[GEODaemon initWithPort:createXPCListenerBlock:]
 //   __30-[GEODaemon initPrimaryDaemon]_block_invoke +0x10
-//       -> xpc_connection_create_listener("com.apple.geod")
+//       -> xpc_connection_create_listener("com.apple.geod", targetq)
 //
 // The public name is already owned by iPadOS geod, while MacWS publishes the
 // unmodified Ventura protocol on GEOD_XPC_SERVICE_NEW.  Apply the same
 // collision-free name translation used by every other bootstrap/XPC entry
 // point; listener queue, handler, activation and all request/reply objects stay
 // under stock GEODaemon control.
+// RE-confirmed on the actual iPadOS 16.3.1 libxpc image at
+// xpc_connection_create_listener+0x10: `mov x2, x1; mov x1, x0; mov w0, #0`
+// before entering the common constructor. The private ABI has two arguments.
+// The former one-argument declaration let tracing calls clobber x1 and crashed
+// in _dispatch_mach_create at address 0x15a on every geod activation.
 extern xpc_connection_t macws_xpc_connection_create_listener_raw(
-    const char *) __asm("_xpc_connection_create_listener");
+    const char *, dispatch_queue_t)
+    __asm("_xpc_connection_create_listener");
 xpc_connection_t macws_xpc_connection_create_listener_early(
-    const char *name) {
+    const char *name, dispatch_queue_t targetq) {
     const char *originalName = name;
     name = macws_private_bootstrap_service_name(name);
     macws_trace_xpc_name("xpc_listener", originalName);
     if (name != originalName)
         macws_trace_xpc_name("xpc_listener.mapped", name);
-    return macws_xpc_connection_create_listener_raw(name);
+    return macws_xpc_connection_create_listener_raw(name, targetq);
 }
 
 xpc_connection_t macws_xpc_connection_create_early(

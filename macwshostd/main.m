@@ -35,8 +35,6 @@ static const char *const kGUI = "/var/jb/usr/macOS/bin/macos_gui.sh";
 static const char *const kBash = "/var/jb/usr/bin/bash";
 static const char *const kLaunchctl = "/var/jb/usr/bin/launchctl";
 static const char *const kKillall = "/var/jb/usr/bin/killall";
-static const char *const kSudo = "/var/jb/usr/bin/sudo";
-static const char *const kUIOpen = "/var/jb/usr/bin/uiopen";
 static const char *const kChrootExec = "/var/jb/usr/macOS/bin/launchdchrootexec";
 static const char *const kPostinst = "/var/jb/usr/macOS/bin/postinst.sh";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
@@ -75,6 +73,10 @@ static const char *const kUIKitSystemExecutable =
     "/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem";
 static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
+static const char *const kMapsHostCarrierMarker =
+    "/var/jb/var/mobile/macws-maps-host-carrier.pid";
+static CFStringRef const kMapsHostLaunchNotification =
+    CFSTR("com.macwsguide.host.launch-maps");
 static pid_t WaitForRunningRootExecutable(NSString *rootPath,
                                           NSTimeInterval timeout);
 
@@ -945,6 +947,8 @@ static pid_t FindRunningSettingsExtension(NSString **executableOut) {
     NSString *const rootPrefix = @"/System/Library/ExtensionKit/Extensions/";
     NSString *const hostPrefix =
         @"/var/mnt/rootfs/System/Library/ExtensionKit/Extensions/";
+    NSString *const privateHostPrefix =
+        @"/private/var/mnt/rootfs/System/Library/ExtensionKit/Extensions/";
     NSString *const executableMarker = @".appex/Contents/MacOS/";
     pid_t found = 0;
     for (int index = 0; index < count; index++) {
@@ -957,9 +961,12 @@ static pid_t FindRunningSettingsExtension(NSString **executableOut) {
         NSString *rootPath = nil;
         if ([candidate hasPrefix:rootPrefix]) {
             rootPath = candidate;
-        } else if ([candidate hasPrefix:hostPrefix]) {
+        } else if ([candidate hasPrefix:hostPrefix] ||
+                   [candidate hasPrefix:privateHostPrefix]) {
             rootPath = [candidate substringFromIndex:
-                @"/var/mnt/rootfs".length];
+                [candidate hasPrefix:privateHostPrefix]
+                    ? @"/private/var/mnt/rootfs".length
+                    : @"/var/mnt/rootfs".length];
         } else {
             continue;
         }
@@ -1208,21 +1215,42 @@ static pid_t WaitForRunningRootExecutable(NSString *rootPath,
     return 0;
 }
 
-// Maps is a Mac Catalyst application.  Directly exec'ing its Mach-O produces
-// an anonymous RunningBoard process, so FuseBoard correctly denies every
-// scene.  Replacing a foreground UIKit carrier with POSIX_SPAWN_SETEXEC is
-// also invalid: SpringBoard runtime-confirmed that the carrier workspace XPC
-// is invalidated immediately and marks the process pending exit.  Keep the
-// ordinary iOS UIApplication alive and let it spawn Maps as a separate chroot
-// child.  UIKitSystem then registers that child's exact audit-token generation
-// through the native FrontBoard bootstrap before accepting its scenes.
+static BOOL MapsHostCarrierMarkerMatches(pid_t pid) {
+    char value[32] = {0};
+    int fd = open(kMapsHostCarrierMarker, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    ssize_t count = read(fd, value, sizeof(value) - 1);
+    close(fd);
+    int markerPID = 0;
+    return count > 0 && sscanf(value, "%d", &markerPID) == 1 &&
+        markerPID == pid && pid > 1;
+}
+
+static void RetireLegacyMapsUIKitCarrier(void) {
+    // The pre-fullscreen architecture foregrounded this UIApplication and
+    // kept its empty UIWindowScene alive after Maps exited.  A process whose
+    // executable is still MacWSCatalystLauncher is necessarily that legacy
+    // UI carrier: the new helper replaces itself with launchdchrootexec before
+    // Maps starts.  Retire it before notifying the foreground Host so the
+    // user cannot inherit the old black iPadOS window after an upgrade.
+    const char *retire[] = {
+        kKillall, "-TERM", "MacWSCatalystLauncher", NULL,
+    };
+    int result = RunCommand(retire, YES);
+    HostLog(@"maps legacy-ui-carrier retire result=%d", result);
+}
+
+// Maps is a Mac Catalyst application. MacWSHost is already the foreground
+// UIApplication and owns the user's fullscreen scene. Ask that existing Host
+// to spawn a setuid helper which immediately execs Maps as its direct child.
+// This preserves the valid UIKit/FrontBoard responsible-process ancestry
+// without ever foregrounding the old empty MacWSCatalystLauncher UIWindowScene.
 static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
     NSString *mapsRootPath = @(kMapsExecutable);
     NSString *mapsHostPath = [@("/var/mnt/rootfs")
         stringByAppendingString:mapsRootPath];
     if (access(mapsHostPath.fileSystemRepresentation, X_OK) != 0 ||
-        access(kUIKitSystemPlist, R_OK) != 0 ||
-        access(kUIOpen, X_OK) != 0) {
+        access(kUIKitSystemPlist, R_OK) != 0) {
         *message = @"Maps 的 Catalyst 启动组件不完整，请先修复环境";
         return NO;
     }
@@ -1232,26 +1260,7 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
         return NO;
     }
 
-    pid_t mapsPID = FindRunningRootExecutable(mapsRootPath);
-    if (mapsPID > 1) {
-        // Maps can retain a stale Visible metrics sidecar after its last
-        // Catalyst scene or renderer has gone away.  Reuse is successful
-        // only when the live process handles the native reopen request and
-        // publishes a strictly newer generation, exactly like the generic
-        // System Settings/Maps lifecycle path below.
-        if (RequestApplicationReopen(mapsPID, 8.0)) {
-            os_unfair_lock_lock(&gStateLock);
-            gActiveAppPID = mapsPID;
-            gActiveAppID = @"maps";
-            os_unfair_lock_unlock(&gStateLock);
-            HostLog(@"launch-app reuse id=maps pid=%d route=UIKit-carrier",
-                    mapsPID);
-            *message = @"地图已在运行，现有原生窗口已进入窗口列表";
-            return YES;
-        }
-        if (!TerminateWindowlessRootExecutable(
-                mapsPID, mapsRootPath, message)) return NO;
-    }
+    RetireLegacyMapsUIKitCarrier();
 
     pid_t uikitSystemPID = FindRunningRootExecutable(
         @(kUIKitSystemExecutable));
@@ -1273,59 +1282,56 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
         }
     }
 
-    // A carrier whose previous child exited retains its in-memory child PID
-    // until its main-queue reaper runs.  A fresh carrier is cheap and makes a
-    // user-initiated Maps launch deterministic without creating duplicates.
-    const char *retireCarrier[] = {
-        kKillall, "-TERM", "MacWSCatalystLauncher", NULL,
-    };
-    (void)RunCommand(retireCarrier, YES);
-    usleep(150000);
-    const char *openCarrier[] = {
-        kSudo, "-u", "mobile", kUIOpen, "--bundleid",
-        "com.macwsguide.catalystlauncher", NULL,
-    };
-    int openResult = RunCommand(openCarrier, YES);
-    if (openResult != 0) {
-        *message = [NSString stringWithFormat:
-            @"无法打开 Maps UIKit 载体（退出码 %d）", openResult];
-        return NO;
+    pid_t mapsPID = FindRunningRootExecutable(mapsRootPath);
+    BOOL freshHostChild = MapsHostCarrierMarkerMatches(mapsPID);
+    if (mapsPID > 1 && !freshHostChild) {
+        // A previously published Catalyst scene may be reopened in place.
+        // If it is a stale windowless generation, retire it before asking the
+        // live Host for one new exact process generation.
+        if (RequestApplicationReopen(mapsPID, 8.0)) {
+            os_unfair_lock_lock(&gStateLock);
+            gActiveAppPID = mapsPID;
+            gActiveAppID = @"maps";
+            os_unfair_lock_unlock(&gStateLock);
+            HostLog(@"launch-app reuse id=maps pid=%d route=existing-window",
+                    mapsPID);
+            *message = @"地图已在运行，现有原生窗口已进入窗口列表";
+            return YES;
+        }
+        if (!TerminateWindowlessRootExecutable(
+                mapsPID, mapsRootPath, message)) return NO;
+        mapsPID = 0;
     }
-
-    mapsPID = WaitForRunningRootExecutable(mapsRootPath, 12.0);
     if (mapsPID <= 1) {
-        *message = @"Maps 载体已启动，但 chroot 应用子进程未出现";
+        unlink(kMapsHostCarrierMarker);
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            kMapsHostLaunchNotification, NULL, NULL, true);
+        mapsPID = WaitForRunningRootExecutable(mapsRootPath, 3.0);
+        freshHostChild = MapsHostCarrierMarkerMatches(mapsPID);
+    }
+    if (mapsPID <= 1) {
+        *message = @"MacWSHost 未能从当前工作区启动地图；没有创建黑色 UIKit 载体窗口";
         return NO;
     }
-    int exitStatus = -1;
-    BOOL windowReady = WaitForWindowMetrics(mapsPID, 30.0, &exitStatus);
-    if (!windowReady)
-        windowReady = RequestApplicationReopen(mapsPID, 8.0);
-    if (!windowReady) {
-        *message = @"Maps 正在运行，但没有发布可见的原生窗口";
+    if (!freshHostChild) {
+        *message = @"地图进程没有匹配当前 MacWSHost 的启动代次，已拒绝创建额外 iOS 场景";
         return NO;
     }
-
-    // uiopen'ing the Catalyst carrier necessarily foregrounds that otherwise
-    // invisible helper and suspends MacWSHost before its XPC reply can be
-    // consumed.  Runtime-confirmed on PID 55688: returning the existing Host
-    // application after window readiness immediately completed the pending
-    // window transaction and selected the native Maps window.
-    const char *returnHost[] = {
-        kSudo, "-u", "mobile", kUIOpen, "--bundleid",
-        "com.macwsguide.host", NULL,
-    };
-    int returnHostResult = RunCommand(returnHost, YES);
-    HostLog(@"launch-app foreground-return id=maps result=%d route=uiopen-host",
-            returnHostResult);
-
+    // Do not synchronously wait up to 30 seconds for a Catalyst window here.
+    // The foreground Host already owns the DisplayStream catalog and can
+    // observe the exact (PID, window ID) publication without polling.  Return
+    // the responsible process immediately so its generic pending-window
+    // transaction can stabilize and activate that native window while input
+    // and the control center remain responsive.
     os_unfair_lock_lock(&gStateLock);
     gActiveAppPID = mapsPID;
     gActiveAppID = @"maps";
     os_unfair_lock_unlock(&gStateLock);
-    HostLog(@"launch-app window-ready id=maps pid=%d uikitsystem=%d "
-            "route=UIKit-carrier", mapsPID, uikitSystemPID);
-    *message = @"地图已通过 UIKitSystem 启动，原生窗口已进入窗口列表";
+    HostLog(@"launch-app process-ready id=maps pid=%d uikitsystem=%d "
+            "route=existing-MacWSHost catalog=asynchronous", mapsPID,
+            uikitSystemPID);
+    *message = @"地图正在当前工作区打开，未创建新的 iPadOS 窗口";
     return YES;
 }
 
