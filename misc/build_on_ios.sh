@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build and install MacWSBootingGuide on-device (iOS shell with Theos)
-# Usage: bash misc/build_on_ios.sh
+# Usage: bash misc/build_on_ios.sh [--fast|--fast-force|--resume]
 #
 # This is the on-device equivalent of misc/build.sh (which builds from macOS).
 # All files (scripts, libmachook.dylib) are installed via the .deb package.
@@ -18,8 +18,10 @@ cd "$PROJECT_DIR"
 # the fast path to cut build time from ~20s to a few seconds.
 FAST=${FAST:-0}
 FAST_FORCE=${FAST_FORCE:-0}
+SKIP_CLEAN=${SKIP_CLEAN:-0}
 for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
 for arg in "$@"; do [ "$arg" = "--fast-force" ] && FAST=1 && FAST_FORCE=1; done
+for arg in "$@"; do [ "$arg" = "--resume" ] && SKIP_CLEAN=1; done
 
 # Guardrail: FAST only copies libmachook.{arm64,arm64e}.dylib to the rootfs.
 # Any other build artefact (CydiaSubstrate tweak under TweakInject, iOS-side
@@ -67,9 +69,11 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" = "1" ]; then
     echo "==> FAST_FORCE: explicitly shipping libmachook only; non-libmachook changes are not packaged"
 fi
 
-if [ "$FAST" != "1" ]; then
+if [ "$FAST" != "1" ] && [ "$SKIP_CLEAN" != "1" ]; then
     echo "==> Cleaning previous build..."
     make clean 2>/dev/null || true
+elif [ "$FAST" != "1" ]; then
+    echo "==> RESUME mode: preserving successful objects from the interrupted full build"
 else
     echo "==> FAST mode: skipping make clean (incremental build)"
 fi

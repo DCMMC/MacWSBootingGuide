@@ -74,6 +74,7 @@ CORELOCATIONAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.corelocationagent.plist
 LOCATIONBRIDGE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.locationbridge.plist"
 ICONSERVICESD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesd.plist"
 ICONSERVICESAGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.iconservicesagent.plist"
+CSNAMEDDATAD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.csnameddatad.plist"
 FINDER_DESKTOP_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.finder-desktop.plist"
 DOCK_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.dock.plist"
 SYSTEMUI_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.systemuiserver.plist"
@@ -94,6 +95,7 @@ CORELOCATIONAGENT_LABEL=com.macwsguide.corelocationagent
 LOCATIONBRIDGE_LABEL=com.macwsguide.locationbridge
 ICONSERVICESD_LABEL=com.macwsguide.iconservicesd
 ICONSERVICESAGENT_LABEL=com.macwsguide.iconservicesagent
+CSNAMEDDATAD_LABEL=com.macwsguide.csnameddatad
 FINDER_DESKTOP_LABEL=com.macwsguide.finder-desktop
 DOCK_LABEL=com.macwsguide.dock
 SYSTEMUI_LABEL=com.macwsguide.systemuiserver
@@ -169,6 +171,9 @@ SYSTEMUI_BIN=/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/Syst
 CONTROL_CENTER_BIN=/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
 ICONSERVICESD_BIN=/System/Library/CoreServices/iconservicesd
 ICONSERVICESAGENT_BIN=/System/Library/CoreServices/iconservicesagent
+CSNAMEDDATAD_BIN=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad
+CSNAMEDDATA_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
+DOCK_HELPER_PROXY=/var/jb/usr/macOS/Frameworks/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc/DockHelperProxy
 # Never launch Ventura's stock cfprefsd image directly.  iPadOS AMFI rejects
 # its Apple CT policy, while the project's broad chroot entitlement profile
 # gives it com.apple.security.system-container and makes sandbox_init kill it.
@@ -205,6 +210,8 @@ P_SYSTEMUI='CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer'
 P_CONTROL_CENTER='CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter'
 P_ICONSERVICESD='CoreServices/iconservicesd'
 P_ICONSERVICESAGENT='CoreServices/iconservicesagent'
+P_CSNAMEDDATAD='XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad'
+P_DOCK_HELPER='XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper'
 P_INPUTD='/usr/local/bin/macwsinputd'
 P_DISPLAYD='/usr/local/bin/macwsdisplayd'
 P_INTEROPD='/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd'
@@ -515,6 +522,8 @@ stop_ws_dependents() {
     launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
     launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
     launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
+    launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
+    launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         launchctl unload "$workspace_plist" 2>/dev/null
@@ -540,10 +549,12 @@ stop_ws_dependents() {
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
+    kill_by_pattern "$P_DOCK_HELPER"
     kill_by_pattern "$P_SYSTEMUI"
     kill_by_pattern "$P_CONTROL_CENTER"
     kill_by_pattern "$P_ICONSERVICESAGENT"
     kill_by_pattern "$P_ICONSERVICESD"
+    kill_by_pattern "$P_CSNAMEDDATAD"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
@@ -623,6 +634,8 @@ recover_ws_dependents() {
         launchctl load "$ICONSERVICESD_PLIST" 2>/dev/null
     [ ! -f "$ICONSERVICESAGENT_PLIST" ] || \
         launchctl load "$ICONSERVICESAGENT_PLIST" 2>/dev/null
+    [ ! -f "$CSNAMEDDATAD_PLIST" ] || \
+        launchctl load "$CSNAMEDDATAD_PLIST" 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         [ ! -f "$workspace_plist" ] || launchctl load "$workspace_plist" 2>/dev/null
@@ -955,6 +968,14 @@ prepare_vscode_production_assets() {
 write_plists() {
     mkdir -p "$GUI_LAUNCHD_DIR"
 
+    # Remove the pre-xpcproxy scaffold on upgrade.  A normal launchd Mach job
+    # cannot provide an Application-type XPC service's AppKit main-thread
+    # lifecycle; keeping it registered races the real bundle activation and
+    # leaves Dock's MenuGroup waiting forever for a reply.
+    launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist" 2>/dev/null
+    launchctl remove com.macwsguide.dockhelper 2>/dev/null
+    rm -f "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist"
+
     cat > "$VNC_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -972,6 +993,16 @@ write_plists() {
         <string>${ROOTFS}</string>
         <string>${VNC_BIN}</string>
         <string>-rfbnoauth</string>
+        <!--
+          OSXvnc maps RFB button 4 to the third CGPostMouseEvent slot unless
+          this option is enabled. Runtime tracing in Dock then receives
+          CGEvent type 0x19 (OtherMouseDown), while the swapped mapping
+          delivers the correct type 3 (RightMouseDown). Keep RFB's
+          conventional bit-4 right button and translate it with the server's
+          documented compatibility switch. Dock still applies its own later
+          tracking-state gate; correct event type alone does not bypass it.
+        -->
+        <string>-swapButtons</string>
         <!--
           The installed OSXvnc-server defaults rfbDeferUpdateTime to 40 ms.
           RE-confirmed at arm64 clientOutput+0xec: it unlocks the client mutex,
@@ -1257,6 +1288,42 @@ PLIST
     <key>ThrottleInterval</key><integer>10</integer>
     <key>StandardOutPath</key><string>${LOGDIR}/iconservicesagent.log</string>
     <key>StandardErrorPath</key><string>${LOGDIR}/iconservicesagent.log</string>
+</dict>
+</plist>
+PLIST
+
+    # CarbonCore normally asks launchd's XPC bundle resolver to instantiate
+    # csnameddatad for a login session. The chroot has no XPC bundle domain.
+    # Runtime-confirmed on 2026-08-06: a Dock secondary click reached the real
+    # DOCKFileTile showMenu:options: path, then logged lookup error 3 for this
+    # exact endpoint and produced no menu window. Publish the stock Ventura
+    # XPC executable under a collision-free service name; libmachook maps both
+    # the listener and every chroot client without replacing its protocol.
+    cat > "$CSNAMEDDATAD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${CSNAMEDDATAD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array><string>${CSNAMEDDATA_PROXY}</string></array>
+    <key>MachServices</key>
+    <dict><key>com.apple.macosbooter.carboncore.csnameddata</key><true/></dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>XPC_SERVICE_NAME</key><string>${CSNAMEDDATAD_LABEL}</string>
+        <key>MACWS_XPC_TARGET</key><string>${CSNAMEDDATAD_BIN}</string>
+        <key>CA_VSYNC_OFF</key><string>1</string>
+        <key>MACWS_AGX_NATIVE</key><string>1</string>
+        <key>MACWS_AGX_REGISTER_CLASSES</key><string>1</string>
+        <key>MACWS_PIN_FALLBACK</key><string>1</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/csnameddatad.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/csnameddatad.log</string>
 </dict>
 </plist>
 PLIST
@@ -1731,6 +1798,11 @@ cleanup_macos() {
     launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
     launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
     launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
+    launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
+    launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
+    # Upgrade cleanup for the obsolete direct-DockHelper launchd scaffold.
+    launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist" 2>/dev/null
+    launchctl remove com.macwsguide.dockhelper 2>/dev/null
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         launchctl unload "$workspace_plist" 2>/dev/null
@@ -1776,6 +1848,7 @@ cleanup_macos() {
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
+    kill_by_pattern "$P_DOCK_HELPER"
     kill_by_pattern "$P_SYSTEMUI"
     kill_by_pattern "$P_CONTROL_CENTER"
     kill_by_pattern "$P_ICONSERVICESAGENT"
@@ -2020,25 +2093,17 @@ start_macos() {
         return 1
     }
 
-    # AppKit normally obtains its shared XType registry from the per-login
-    # com.apple.fonts service. The chroot has no loginwindow/LaunchAgent
-    # bootstrap, so every cold GUI application falls back to rebuilding a
-    # static registry in-process. Runtime timestamps on the target showed
-    # Terminal spending 2.685 seconds between that fallback message and its
-    # first NSWindow. Start the stock macOS fontd under the chroot launcher and
-    # publish its original Mach services before any GUI application starts.
-    log "Starting macOS shared font registry service..."
-    rm -f "$LOGDIR/fontd.log"
-    launchctl load "$FONTD_PLIST" || return 1
-    waited=0
-    while ! proc_running "$P_FONTD" && [ "$waited" -lt 10 ]; do
-        sleep 1
-        waited=$((waited + 1))
-    done
-    proc_running "$P_FONTD" || {
-        log "ERROR: macOS fontd did not start. See $LOGDIR/fontd.log"
-        return 1
-    }
+    # The stock fontd is not healthy in this chroot merely because its PID is
+    # present: a runtime sample on 2026-08-06 found no original service main
+    # thread, only CydiaSubstrate exception/signal workers, while clients
+    # repeatedly logged "failed to get common fonts".  A controlled cold
+    # Terminal A/B measured first-window latency at 8.463 s with that endpoint
+    # present versus 3.361 s after unloading it.  Leave the stale job unloaded
+    # so AppKit immediately selects its working per-process static registry.
+    # This is dependency selection backed by a visible-window witness, not a
+    # check bypass; the plist remains packaged for future root-cause work.
+    launchctl unload "$FONTD_PLIST" >/dev/null 2>&1 || true
+    log "Using AppKit's per-process static font registry (shared fontd disabled)."
 
     log "Publishing private macOS CFPreferences daemon and login agent..."
     ensure_cfprefsd_dirhelper_tree || {
@@ -2101,6 +2166,14 @@ start_macos() {
         return 1
     }
     log "Private macOS IconServices endpoints ready."
+
+    log "Publishing CarbonCore named-data service for Dock menus..."
+    rm -f "$LOGDIR/csnameddatad.log"
+    launchctl load "$CSNAMEDDATAD_PLIST" || return 1
+    launchctl list "$CSNAMEDDATAD_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: CarbonCore named-data MachService contract was not registered."
+        return 1
+    }
 
     seed_launchservices_database || return 1
 
@@ -2191,6 +2264,16 @@ start_macos() {
         log "ERROR: macOS pbs process did not start."
         return 1
     }
+
+    # DockHelper is an Application-type XPC service and must remain on-demand.
+    # libmachook registers this proxy bundle in Dock; xpcproxy gives the stock
+    # helper the NSApplication main-thread lifecycle required by TrackMenuCommon.
+    # A permanently running launchd job is not an equivalent readiness witness.
+    [ -x "$DOCK_HELPER_PROXY" ] || {
+        log "ERROR: DockHelper XPC activation proxy is missing: $DOCK_HELPER_PROXY"
+        return 1
+    }
+    log "Dock menu presentation helper registered for on-demand XPC activation."
 
     log "Starting the real macOS Aqua workspace agents (Finder, Dock, SystemUIServer, ControlCenter)..."
     for workspace_log in finder-desktop dock systemuiserver controlcenter; do

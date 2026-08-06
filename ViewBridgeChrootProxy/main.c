@@ -132,6 +132,19 @@ static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
     if (MacWSIsSettingsExtensionTarget(extensionTarget)) {
         return extensionTarget;
     }
+    // A normal login launchd discovers CarbonCore's csnameddatad through its
+    // XPC bundle. MacWS has no chroot XPC bundle domain, so the root launchd
+    // job reuses this freestanding chroot transition and selects exactly that
+    // stock executable. Do not accept an arbitrary path from the environment.
+    const char *xpcTarget = MacWSEnvironmentValue(envp, "MACWS_XPC_TARGET");
+    static const char csNamedDataTarget[] =
+        "/System/Library/Frameworks/CoreServices.framework/Versions/A/"
+        "Frameworks/CarbonCore.framework/Versions/A/XPCServices/"
+        "csnameddatad.xpc/Contents/MacOS/csnameddatad";
+    if (xpcTarget && MacWSStringContains(xpcTarget, csNamedDataTarget) &&
+        MacWSStringContains(csNamedDataTarget, xpcTarget)) {
+        return csNamedDataTarget;
+    }
     if (MacWSStringContains(program, "SettingsExtensionProxy")) {
         return "/System/Library/ExtensionKit/Extensions/Appearance.appex/"
                "Contents/MacOS/Appearance";
@@ -146,6 +159,10 @@ static const char *MacWSTargetForProxy(const char *program, char *envp[]) {
         return "/System/Library/Frameworks/AppKit.framework/Versions/C/"
                "XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/"
                "Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService";
+    }
+    if (MacWSStringContains(program, "DockHelperProxy")) {
+        return "/System/Library/CoreServices/Dock.app/Contents/XPCServices/"
+               "DockHelper.xpc/Contents/MacOS/DockHelper";
     }
     if (MacWSStringContains(program, "ExtensionKitProxy")) {
         return "/System/Library/Frameworks/ExtensionFoundation.framework/"

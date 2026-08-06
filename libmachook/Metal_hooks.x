@@ -12178,6 +12178,10 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.iconservices";
     if (!strcmp(name, "com.apple.iconservices.store"))
         return "com.apple.macosbooter.iconservices.store";
+    if (!strcmp(name, "com.apple.carboncore.csnameddata"))
+        return "com.apple.macosbooter.carboncore.csnameddata";
+    if (!strcmp(name, "com.apple.dock.helper"))
+        return "com.apple.macosbooter.dock.helper";
     if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
         return "com.apple.macosbooter.lsd.advertisingidentifiers";
     if (!strcmp(name, "com.apple.lsd.diagnostics"))
@@ -12512,6 +12516,29 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 
 __attribute__((constructor)) static void InitMetalHooks() {
     macws_record_xpc_service_context_if_requested();
+    const char *initialProgram = getprogname();
+    if (initialProgram &&
+        (strcmp(initialProgram, "com.apple.hiservices-xpcservice") == 0 ||
+         strcmp(initialProgram, "fontd") == 0 ||
+         strcmp(initialProgram, "fontworker") == 0)) {
+        // These are headless request brokers. Their bootstrap/XPC adaptation
+        // is implemented by static interposes in mac_hooks.m; none creates a
+        // Metal device or presents UI.
+        //
+        // Runtime-confirmed on 2026-08-06: Terminal pid 95025 was permanently
+        // blocked in HIS_XPC_GetCapsLockLanguageSwitch while the corresponding
+        // HIServices pid 86010 had never reached xpc_main. A two-second sample
+        // placed every main-thread sample in InitMetalHooks -> MSHookFunction
+        // -> CydiaSubstrate stopAllThreads, specifically at the return from
+        // the unnecessary CGSSessionCopyCurrentSessionProperties hook. Keep
+        // Keep each service on its real protocol and skip only hook families
+        // it cannot consume, so its listener becomes available before clients
+        // issue synchronous requests. Runtime fontd sampling on 2026-08-06
+        // likewise showed no UI work: after its missing FontWorker dependency
+        // made main return, only an injected exception thread kept the
+        // otherwise-dead PID visible.
+        return;
+    }
     macws_install_iconservices_quarantine_fallback();
     macws_install_cgsession_login_handoff_compatibility();
     macws_install_launchpad_mount_namespace_compatibility();
@@ -12722,6 +12749,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         "/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc",
         "/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc",
         "/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc",
+        "/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc",
         "/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc",
         "/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc",
         NULL,

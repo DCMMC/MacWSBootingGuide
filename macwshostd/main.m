@@ -61,6 +61,14 @@ static const char *const kVSCodePlist =
 static const char *const kVSCodeLog = "/var/jb/var/mobile/vscode.log";
 static const char *const kVSCodeHealthMarker =
     "/var/jb/var/mobile/vscode-health-marker";
+static const char *const kVSCodeExecutable =
+    "/Applications/Visual Studio Code.app/Contents/MacOS/Electron";
+// Current VS Code's bundle metadata names the thin launcher `Code`, while the
+// production launchd job intentionally runs the equivalent `Electron` entry
+// with MacWS's JIT/environment contract. Dock resolves CFBundleExecutable and
+// therefore presents this path to the generic launch boundary.
+static const char *const kVSCodeBundleExecutable =
+    "/Applications/Visual Studio Code.app/Contents/MacOS/Code";
 static const char *const kUIKitSystemPlist =
     "/var/jb/usr/macOS/LaunchDaemons/com.apple.uikitsystemapp.plist";
 static const char *const kUIKitSystemExecutable =
@@ -114,6 +122,12 @@ static BOOL TouchPath(const char *path) {
     if (fd < 0) return NO;
     close(fd);
     return YES;
+}
+
+static BOOL HasExecutableFileMode(const char *path) {
+    struct stat status = {0};
+    return path && stat(path, &status) == 0 && S_ISREG(status.st_mode) &&
+        (status.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
 }
 
 // Build a private, deterministic envp for one child. posix_spawn consumes the
@@ -1434,7 +1448,12 @@ static BOOL LaunchRootExecutable(const char *identifier,
                                  NSTimeInterval timeout,
                                  NSString **message) {
     NSString *hostPath = [@("/var/mnt/rootfs") stringByAppendingString:rootPath];
-    if (access(hostPath.fileSystemRepresentation, X_OK) != 0) {
+    // access(X_OK) asks iPadOS whether this foreign-platform Mach-O may be
+    // executed directly in the caller's native context.  AMFI correctly
+    // answers EPERM for Finder even though launchdchrootexec can admit the
+    // trusted image after entering the macOS root.  Validate the filesystem
+    // invariant here; the real chroot launch remains the admission witness.
+    if (!HasExecutableFileMode(hostPath.fileSystemRepresentation)) {
         *message = [NSString stringWithFormat:@"应用不存在或不可执行: %@",
                     rootPath];
         return NO;
@@ -1638,16 +1657,44 @@ static NSString *ResolveExecutableRootPath(const char *requestedPath,
             stringByAppendingPathComponent:executable];
         hostPath = [@("/var/mnt/rootfs") stringByAppendingString:rootPath];
     }
+    char resolvedRoot[PATH_MAX] = {0};
     char resolved[PATH_MAX] = {0};
-    static const char hostRootPrefix[] = "/var/mnt/rootfs/";
-    if (!realpath(hostPath.fileSystemRepresentation, resolved) ||
-        strncmp(resolved, hostRootPrefix, sizeof(hostRootPrefix) - 1) != 0 ||
-        access(resolved, X_OK) != 0) {
+    if (!realpath("/var/mnt/rootfs", resolvedRoot)) {
+        HostLog(@"launch-path reject stage=root-realpath errno=%d (%s)",
+                errno, strerror(errno));
         if (errorOut) *errorOut = @"解析后的文件不可执行";
         return nil;
     }
-    return [NSString stringWithUTF8String:resolved + strlen("/var/mnt/rootfs")];
+    if (!realpath(hostPath.fileSystemRepresentation, resolved)) {
+        HostLog(@"launch-path reject stage=target-realpath path=%@ errno=%d (%s)",
+                hostPath, errno, strerror(errno));
+        if (errorOut) *errorOut = @"解析后的文件不可执行";
+        return nil;
+    }
+    size_t rootLength = strlen(resolvedRoot);
+    // iPadOS canonicalizes /var to /private/var.  Compare two canonical paths
+    // and require a component boundary: the old literal-prefix check rejected
+    // every valid app, while a boundary-less prefix would admit sibling paths
+    // such as /private/var/mnt/rootfs-escape.
+    struct stat executableStatus = {0};
+    BOOL executableFile = stat(resolved, &executableStatus) == 0 &&
+        S_ISREG(executableStatus.st_mode) &&
+        (executableStatus.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+    if (strncmp(resolved, resolvedRoot, rootLength) != 0 ||
+        resolved[rootLength] != '/' || !executableFile) {
+        HostLog(@"launch-path reject stage=boundary-or-mode root=%s "
+                "target=%s boundary=%d mode=%#o errno=%d (%s)",
+                resolvedRoot, resolved, (int)(unsigned char)resolved[rootLength],
+                executableStatus.st_mode, errno, strerror(errno));
+        if (errorOut) *errorOut = @"解析后的文件不可执行";
+        return nil;
+    }
+    HostLog(@"launch-path accepted requested=%s executable=%s",
+            requestedPath, resolved + rootLength);
+    return [NSString stringWithUTF8String:resolved + rootLength];
 }
+
+static BOOL LaunchAllowedApp(const char *identifier, NSString **message);
 
 static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
     NSString *error = nil;
@@ -1655,6 +1702,18 @@ static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
     if (!rootPath) {
         *message = error ?: @"无法解析路径";
         return NO;
+    }
+    // A Dock tile and Control Center must enter the same application launch
+    // transaction.  Preserve the special lifecycle already proven for Maps,
+    // VS Code, System Settings, Finder and the other packaged apps instead of
+    // reducing a resolved bundle URL to a bare generic exec.
+    if ([rootPath isEqualToString:@(kVSCodeExecutable)] ||
+        [rootPath isEqualToString:@(kVSCodeBundleExecutable)])
+        return LaunchAllowedApp("vscode", message);
+    for (NSUInteger index = 0;
+         index < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); index++) {
+        if ([rootPath isEqualToString:@(kAllowedApps[index].rootPath)])
+            return LaunchAllowedApp(kAllowedApps[index].identifier, message);
     }
     return LaunchRootExecutable("custom-path", rootPath,
         "/var/mobile/Library/Logs/CustomApp.host.log", 30.0, message);

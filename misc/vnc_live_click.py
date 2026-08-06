@@ -216,9 +216,21 @@ def main():
                              "changed update (default: 1.5)")
     parser.add_argument("--click", nargs=2, required=True, type=int,
                         metavar=("X", "Y"))
+    parser.add_argument("--button", choices=("left", "right"),
+                        default="left")
+    parser.add_argument("--control", action="store_true",
+                        help="hold Control across the pointer transition")
+    parser.add_argument("--hold-seconds", type=float, default=0.05)
+    parser.add_argument("--click-count", type=int, choices=(1, 2), default=1,
+                        help="send one click or a native two-click sequence "
+                             "on the same RFB connection")
+    parser.add_argument("--inter-click-seconds", type=float, default=0.10,
+                        help="delay between clicks when --click-count=2")
     parser.add_argument("--max-updates", type=int, default=12)
     args = parser.parse_args()
-    if args.timeout <= 0 or args.settle_seconds < 0 or args.max_updates < 1:
+    if (args.timeout <= 0 or args.settle_seconds < 0 or
+            args.hold_seconds < 0 or args.inter_click_seconds < 0 or
+            args.max_updates < 1):
         parser.error("timeout/max-updates must be positive and settle nonnegative")
 
     sock, width, height, name = vnc_capture.connect_rfb(
@@ -243,9 +255,19 @@ def main():
         # update after each response.
         request_update(sock, width, height, True)
         time.sleep(0.1)
-        sock.sendall(struct.pack(">BBHH", 5, 1, x, y))
-        time.sleep(0.05)
-        sock.sendall(struct.pack(">BBHH", 5, 0, x, y))
+        if args.control:
+            sock.sendall(struct.pack(">BBxxI", 4, 1, 0xFFE3))
+            time.sleep(0.02)
+        button_mask = 1 if args.button == "left" else 4
+        for click_index in range(args.click_count):
+            sock.sendall(struct.pack(">BBHH", 5, button_mask, x, y))
+            time.sleep(args.hold_seconds)
+            sock.sendall(struct.pack(">BBHH", 5, 0, x, y))
+            if click_index + 1 < args.click_count:
+                time.sleep(args.inter_click_seconds)
+        if args.control:
+            time.sleep(0.02)
+            sock.sendall(struct.pack(">BBxxI", 4, 0, 0xFFE3))
 
         deadline = time.monotonic() + args.timeout
         changed_update = False

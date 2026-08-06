@@ -79,6 +79,14 @@ enum {
     MacWSStreamFrameSizeChanged = 1u << 2,
     MacWSStreamFrameOccluded = 1u << 3,
     MacWSStreamFrameOverlay = 1u << 4,
+    // The captured layer belongs to a non-AppKit global input owner such as
+    // Dock. Host must preserve desktop coordinates and route through that
+    // process's CGS endpoint even when its AppInput socket is present.
+    MacWSStreamFrameGlobalSystemSurface = 1u << 5,
+    // Visual-only system layers (currently the real WindowServer cursor)
+    // participate in Metal composition but must never become the hit-test
+    // owner for a touch at the cursor's own position.
+    MacWSStreamFrameInputPassthrough = 1u << 6,
 };
 
 // Title bytes immediately follow this descriptor in a window-list item.  The

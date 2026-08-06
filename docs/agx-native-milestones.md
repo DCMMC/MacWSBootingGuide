@@ -2344,3 +2344,34 @@ location marker. The iPadOS location daemon was never restarted, no related
 crash report was created, and the 5-minute Critical-only thermal watchdog
 reported nominal state. Full RE and runtime evidence is in
 [`maps-location-geoservices-20260804.md`](maps-location-geoservices-20260804.md).
+
+## 2026-08-06: fullscreen input becomes graph-derived and multi-touch aware
+
+Several apparently application-specific failures shared one upstream cause:
+Host treated every composited DisplayStream layer as an input target. Runtime
+proved that WindowServer's 34x46 cursor layer could therefore intercept a tap
+intended for a menubar or application control beneath it. displayd now marks
+cursor-level layers as input-pass-through; Host continues rendering them but
+skips them during exact-graph hit testing. Shared menubar capture and AppKit
+event routing are joined by the stable CGWindowID, so WindowServer-to-active-
+application ownership handoff no longer invalidates the route.
+
+Native popup menus now retain the next outside click only while a real popup-
+level window exists, including Dock's transfer to DockHelper. Completed AppKit
+clicks invalidate displayd's catalog; bounded urgent snapshots retire a closed
+layer after two independently absent catalogs, and Host tombstones it against
+late stream frames. This closes both the non-dismissable-menu and translucent-
+ghost failures without synthesizing window state.
+
+Direct hold-drag freezes its initial layer geometry for the whole transaction,
+and titlebar double tap calls the real `-[NSWindow zoom:]`. A live Terminal
+window maximized, restored and moved to the desktop centre while the recovered
+WindowServer PID stayed unchanged. Fullscreen also has exact-three-finger
+Space switching plus all-window/current-app overviews; the gesture classifier
+is pure and covered by the protocol test. Dock's native context menu is
+captured from DockHelper, and both modern VSCode `Code` and legacy `Electron`
+executables map to the production AGX/JIT launcher.
+
+Screenshots, exact routing/layer logs, validation commands, the package hash
+and the separately recorded unresolved compositor abort are in
+[`displaystream-input-multitouch-20260806/`](evidence/displaystream-input-multitouch-20260806/README.md).

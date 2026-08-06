@@ -583,6 +583,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record;
 - (void)metalView:(MacWSMetalView *)view
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows;
+- (void)metalView:(MacWSMetalView *)view
+ requestedWindowOverviewForCurrentApplication:(BOOL)currentApplicationOnly;
 @end
 
 @interface MacWSMetalView : MTKView
@@ -688,6 +690,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSDirectScrollAxis _directScrollAxis;
     NSTimeInterval _directTouchStartTimestamp;
     NSTimeInterval _directTouchPreviousTimestamp;
+    NSTimeInterval _lastDirectTapTimestamp;
+    CGPoint _lastDirectTapPoint;
     uint64_t _directTouchSerial;
     UIImpactFeedbackGenerator *_directTouchFeedback;
     CGFloat _viewportZoom;
@@ -696,6 +700,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     BOOL _contentGesturesPassthrough;
     UIPanGestureRecognizer *_twoFingerPanRecognizer;
     UIPinchGestureRecognizer *_pinchRecognizer;
+    UIPanGestureRecognizer *_threeFingerPanRecognizer;
+    BOOL _threeFingerCommandDispatched;
     CADisplayLink *_scrollMomentumDisplayLink;
     CGPoint _scrollMomentumVelocity;
     CGPoint _scrollMomentumFramePoint;
@@ -715,6 +721,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     int32_t _fullscreenGestureRoutePID;
     uint32_t _fullscreenGestureRouteWindowID;
     MacWSStreamFrameDescriptor _fullscreenGestureRouteDescriptor;
+    CFTimeInterval _fullscreenLastTapRouteTimestamp;
+    int32_t _fullscreenLastTapRoutePID;
+    uint32_t _fullscreenLastTapRouteWindowID;
+    MacWSStreamFrameDescriptor _fullscreenLastTapRouteDescriptor;
 }
 
 - (instancetype)initWithFrame:(CGRect)frameRect {
@@ -960,6 +970,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _pinchRecognizer.cancelsTouchesInView = YES;
     _pinchRecognizer.delegate = self;
     [self addGestureRecognizer:_pinchRecognizer];
+    _threeFingerPanRecognizer = [[UIPanGestureRecognizer alloc]
+        initWithTarget:self action:@selector(threeFingerPanned:)];
+    _threeFingerPanRecognizer.minimumNumberOfTouches = 3;
+    _threeFingerPanRecognizer.maximumNumberOfTouches = 3;
+    _threeFingerPanRecognizer.allowedTouchTypes = @[@(UITouchTypeDirect)];
+    _threeFingerPanRecognizer.cancelsTouchesInView = YES;
+    _threeFingerPanRecognizer.delegate = self;
+    [self addGestureRecognizer:_threeFingerPanRecognizer];
     UITapGestureRecognizer *resetZoom = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(viewportZoomToggled:)];
     resetZoom.numberOfTouchesRequired = 2;
@@ -995,6 +1013,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _fullscreenGestureRoutePID = 0;
     _fullscreenGestureRouteWindowID = 0;
     _fullscreenGestureRouteDescriptor = (MacWSStreamFrameDescriptor){0};
+    _fullscreenLastTapRouteTimestamp = 0.0;
+    _fullscreenLastTapRoutePID = 0;
+    _fullscreenLastTapRouteWindowID = 0;
+    _fullscreenLastTapRouteDescriptor = (MacWSStreamFrameDescriptor){0};
     self.targetWindowID = mode == MacWSStreamModeWindow ? windowID : 0;
     // A window Scene must only display the IOSurface exported for that window.
     // The mmap framebuffer is a full-desktop compatibility path and would show
@@ -2113,9 +2135,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         MacWSStreamFrameDescriptor descriptor = frame.descriptor;
         if (descriptor.layerOwnerPID <= 1 ||
             descriptor.layerWindowID == 0 ||
+            (descriptor.flags & MacWSStreamFrameInputPassthrough) != 0 ||
             descriptor.destinationWidth == 0 ||
-            descriptor.destinationHeight == 0 ||
-            !MacWSAppInputEndpointReady(descriptor.layerOwnerPID)) continue;
+            descriptor.destinationHeight == 0) continue;
         CGRect destination = CGRectMake(
             descriptor.destinationX, descriptor.destinationY,
             descriptor.destinationWidth, descriptor.destinationHeight);
@@ -2190,7 +2212,22 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     uint32_t windowID = 0;
     MacWSStreamFrameDescriptor descriptor = {0};
     BOOL resolved = NO;
-    if (continuation && _fullscreenGestureRouteActive) {
+    BOOL atomicPrimaryTap = record->kind == MacWSInputKindTap;
+    BOOL reuseDoubleTapRoute = atomicPrimaryTap &&
+        (record->flags & MacWSInputFlagDoubleClick) != 0 &&
+        _fullscreenLastTapRouteTimestamp > 0.0 &&
+        record->timestamp >= _fullscreenLastTapRouteTimestamp &&
+        record->timestamp - _fullscreenLastTapRouteTimestamp <=
+            MACWS_DIRECT_DOUBLE_TAP_SECONDS + 0.05 &&
+        _fullscreenLastTapRoutePID > 1 &&
+        _fullscreenLastTapRouteWindowID != 0 &&
+        _overlayFrames[@(_fullscreenLastTapRouteWindowID)] != nil;
+    if (reuseDoubleTapRoute) {
+        ownerPID = _fullscreenLastTapRoutePID;
+        windowID = _fullscreenLastTapRouteWindowID;
+        descriptor = _fullscreenLastTapRouteDescriptor;
+        resolved = YES;
+    } else if (continuation && _fullscreenGestureRouteActive) {
         ownerPID = _fullscreenGestureRoutePID;
         windowID = _fullscreenGestureRouteWindowID;
         resolved = ownerPID > 1 && windowID != 0;
@@ -2209,24 +2246,60 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (resolved) {
         float desktopX = record->x;
         float desktopY = record->y;
-        float layerX = 0.0f, layerY = 0.0f;
-        resolved = MacWSStreamMapDesktopPointToLayer(
-            &descriptor, desktopX, desktopY, &layerX, &layerY);
-        if (!resolved) return NO;
-        record->x = layerX;
-        record->y = layerY;
-        record->frameWidth = descriptor.width;
-        record->frameHeight = descriptor.height;
         uint32_t modifiers = MacWSInputModifiersForScene(record->sceneID);
-        record->targetPID = ownerPID;
+        BOOL globalSystemSurface =
+            (descriptor.flags & MacWSStreamFrameGlobalSystemSurface) != 0;
+        BOOL ownerHasEndpoint = MacWSAppInputEndpointReady(ownerPID);
+        if (!globalSystemSurface && ownerHasEndpoint) {
+            float layerX = 0.0f, layerY = 0.0f;
+            resolved = MacWSStreamMapDesktopPointToLayer(
+                &descriptor, desktopX, desktopY, &layerX, &layerY);
+            if (!resolved) return NO;
+            record->x = layerX;
+            record->y = layerY;
+            record->frameWidth = descriptor.width;
+            record->frameHeight = descriptor.height;
+            record->targetPID = ownerPID;
+        } else {
+            // Dock and similar global owners use a real process-local CGS
+            // endpoint, but they are not AppKit windows and their capture is
+            // the complete desktop coordinate space. Preserve those desktop
+            // coordinates and identify the route explicitly from displayd's
+            // catalog metadata; endpoint existence alone cannot distinguish
+            // Dock from an ordinary exact-window application.
+            record->targetPID = ownerPID;
+            record->flags |= MacWSInputFlagGlobalSystemSurface;
+        }
         record->sceneID = MacWSInputSceneForWindow(windowID, modifiers);
         if (record->contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
-            MacWSLog(@"fullscreen-layer-input runtime-confirmed pid=%d window=%u desktop=(%.1f,%.1f) local=(%.1f,%.1f)/%ux%u destination=(%d,%d %ux%u)",
-                     ownerPID, windowID, desktopX, desktopY,
+            MacWSLog(@"fullscreen-layer-input runtime-confirmed pid=%d target=%d route=%@ window=%u flags=%#x desktop=(%.1f,%.1f) local=(%.1f,%.1f)/%ux%u destination=(%d,%d %ux%u)",
+                     ownerPID, record->targetPID,
+                     globalSystemSurface ? @"global-system" : @"app",
+                     windowID, descriptor.flags, desktopX, desktopY,
                      record->x, record->y, record->frameWidth,
                      record->frameHeight, descriptor.destinationX,
                      descriptor.destinationY, descriptor.destinationWidth,
                      descriptor.destinationHeight);
+        }
+    }
+    // The first click can activate/reorder a native window and the event-
+    // driven catalog refresh may land before the second physical click. Keep
+    // a short-lived identity snapshot so a UIKit-authoritative double tap is
+    // one AppKit transaction, matching VNC's proven same-connection pair.
+    // Do not retain vanished popup/menu layers: a dismissal must expose the
+    // newly hit-tested surface beneath it for the next independent tap.
+    if (atomicPrimaryTap) {
+        if (resolved) {
+            _fullscreenLastTapRouteTimestamp = record->timestamp;
+            _fullscreenLastTapRoutePID = ownerPID;
+            _fullscreenLastTapRouteWindowID = windowID;
+            _fullscreenLastTapRouteDescriptor = descriptor;
+        } else if ((record->flags & MacWSInputFlagDoubleClick) == 0) {
+            _fullscreenLastTapRouteTimestamp = 0.0;
+            _fullscreenLastTapRoutePID = 0;
+            _fullscreenLastTapRouteWindowID = 0;
+            _fullscreenLastTapRouteDescriptor =
+                (MacWSStreamFrameDescriptor){0};
         }
     }
     if (begins) {
@@ -2340,7 +2413,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [self.statusDelegate metalView:self emittedInput:record];
 }
 
-- (void)emitKind:(MacWSInputKind)kind touch:(UITouch *)touch point:(CGPoint)viewPoint {
+- (void)emitKind:(MacWSInputKind)kind
+           touch:(UITouch *)touch
+           point:(CGPoint)viewPoint
+      extraFlags:(uint16_t)extraFlags {
     if (touch.type == UITouchTypePencil)
         viewPoint = [touch preciseLocationInView:self];
     CGPoint framePoint;
@@ -2379,7 +2455,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .frameHeight = [self currentFrameHeight],
         .targetPID = self.targetPID,
         .source = source,
-        .flags = inputFlags,
+        .flags = inputFlags | extraFlags,
         .altitude = altitude,
         .azimuth = azimuth,
         .tiltX = tiltX,
@@ -2395,6 +2471,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         if (!_directTouchIndicator.hidden)
             [self bringSubviewToFront:_directTouchIndicator];
     }
+}
+
+- (void)emitKind:(MacWSInputKind)kind touch:(UITouch *)touch point:(CGPoint)viewPoint {
+    [self emitKind:kind touch:touch point:viewPoint extraFlags:0];
 }
 
 - (void)emitTouches:(NSSet<UITouch *> *)touches kind:(MacWSInputKind)kind {
@@ -2772,9 +2852,23 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                              touch:_directTouch point:point];
                     [_directTouchFeedback impactOccurred];
                 } else if (decision == MacWSTouchCandidateDecisionTap) {
+                    BOOL doubleTap = _directTouch.tapCount >= 2 ||
+                        MacWSIsDirectDoubleTap(
+                            _lastDirectTapTimestamp, _directTouch.timestamp,
+                            point.x - _lastDirectTapPoint.x,
+                            point.y - _lastDirectTapPoint.y);
+                    if (doubleTap) {
+                        _lastDirectTapTimestamp = 0.0;
+                    } else {
+                        _lastDirectTapTimestamp = _directTouch.timestamp;
+                        _lastDirectTapPoint = point;
+                    }
                     [self emitKind:MacWSInputKindTap
-                             touch:_directTouch point:point];
+                             touch:_directTouch point:point
+                        extraFlags:doubleTap
+                            ? MacWSInputFlagDoubleClick : 0];
                 } else if (decision == MacWSTouchCandidateDecisionScroll) {
+                    _lastDirectTapTimestamp = 0.0;
                     // Preserve a quick flick even when UIKit coalesces it to a
                     // final sample; movement in direct mode is scrolling, not
                     // an implicit primary-button drag.
@@ -2814,6 +2908,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 }
             } else if (_directTouchState ==
                        MacWSDirectTouchStateLongPressArmed) {
+                _lastDirectTapTimestamp = 0.0;
                 CGFloat armedTravel = hypot(
                     point.x - _directTouchStartPoint.x,
                     point.y - _directTouchStartPoint.y);
@@ -2838,10 +2933,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 }
             } else if (_directTouchState ==
                        MacWSDirectTouchStateDragging) {
+                _lastDirectTapTimestamp = 0.0;
                 [self emitKind:MacWSInputKindTouchUp touch:_directTouch
                          point:point];
             } else if (_directTouchState ==
                        MacWSDirectTouchStateScrolling) {
+                _lastDirectTapTimestamp = 0.0;
                 CGPoint framePoint = _directScrollFramePoint;
                 if ([self framePointForViewPoint:point output:&framePoint]) {
                     CGPoint delta = CGPointMake(
@@ -3290,6 +3387,107 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
 }
 
+- (void)emitDesktopCommand:(MacWSDesktopCommand)command {
+    if (!self.isMacWSInputEnabled ||
+        _streamClient.mode != MacWSStreamModeFullscreen ||
+        command < MacWSDesktopCommandSpaceLeft ||
+        command > MacWSDesktopCommandSpaceRight) return;
+    uint32_t width = [self currentFrameWidth];
+    uint32_t height = [self currentFrameHeight];
+    int32_t commandTargetPID = 0;
+    // A fullscreen workspace may have been opened from the desktop bootstrap
+    // scene, whose configured targetPID is zero. Select the frontmost real
+    // application layer with a live AppInput endpoint; the endpoint merely
+    // supplies the CGS-connected process from which the standard
+    // Control+Arrow shortcut is posted.
+    for (NSNumber *key in [[self overlayKeysBackToFront]
+            reverseObjectEnumerator]) {
+        MacWSStreamFrameDescriptor descriptor =
+            _overlayFrames[key].descriptor;
+        if (descriptor.layerOwnerPID > 1 &&
+            descriptor.layerWindowID != 0 &&
+            (descriptor.flags & MacWSStreamFrameGlobalSystemSurface) == 0 &&
+            MacWSAppInputEndpointReady(descriptor.layerOwnerPID)) {
+            commandTargetPID = descriptor.layerOwnerPID;
+            break;
+        }
+    }
+    if (commandTargetPID <= 1 && self.targetPID > 1 &&
+        MacWSAppInputEndpointReady(self.targetPID))
+        commandTargetPID = self.targetPID;
+    if (width == 0 || height == 0 || commandTargetPID <= 1) return;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindDesktopCommand,
+        .sceneID = [self inputSceneIDWithModifiers:0],
+        .timestamp = CACurrentMediaTime(),
+        .x = width * 0.5f,
+        .y = height * 0.5f,
+        .contactID = command,
+        .frameWidth = width,
+        .frameHeight = height,
+        .targetPID = commandTargetPID,
+        .source = MacWSInputSourceFinger,
+        .sampleSequence = ++_inputSampleSequence,
+    };
+    [self.statusDelegate metalView:self emittedInput:record];
+}
+
+- (void)threeFingerPanned:(UIPanGestureRecognizer *)recognizer {
+    if (_streamClient.mode != MacWSStreamModeFullscreen) return;
+    if (recognizer.state == UIGestureRecognizerStateBegan) {
+        _threeFingerCommandDispatched = NO;
+        [self stopScrollMomentumWithTerminalPhase:YES];
+        return;
+    }
+    if (_threeFingerCommandDispatched ||
+        (recognizer.state != UIGestureRecognizerStateChanged &&
+         recognizer.state != UIGestureRecognizerStateEnded)) return;
+    CGPoint translation = [recognizer translationInView:self];
+    CGPoint velocity = [recognizer velocityInView:self];
+    MacWSThreeFingerGesture gesture = MacWSClassifyThreeFingerPan(
+        translation.x, translation.y, velocity.x, velocity.y,
+        MIN(self.bounds.size.width, self.bounds.size.height));
+    if (gesture == MacWSThreeFingerGestureNone) return;
+    MacWSDesktopCommand command = 0;
+    NSString *status = nil;
+    if (gesture == MacWSThreeFingerGestureLeft ||
+        gesture == MacWSThreeFingerGestureRight) {
+        command = gesture == MacWSThreeFingerGestureLeft
+            ? MacWSDesktopCommandSpaceRight
+            : MacWSDesktopCommandSpaceLeft;
+        status = gesture == MacWSThreeFingerGestureLeft
+            ? @"切换到右侧桌面" : @"切换到左侧桌面";
+    } else {
+        // A native Control+Up Mission Control transaction reaches MPS from
+        // this headless WindowServer and runtime-crashed it with
+        // OS_REASON_COREANIMATION / MPS Internal Error 00000103. Preserve the
+        // MacBook gesture vocabulary with Host's real window catalog instead
+        // of risking the whole desktop.
+        _threeFingerCommandDispatched = YES;
+        [self.statusDelegate metalView:self
+            requestedWindowOverviewForCurrentApplication:
+                gesture == MacWSThreeFingerGestureDown];
+        [_directTouchFeedback impactOccurred];
+        [self publishStatus:gesture == MacWSThreeFingerGestureUp
+            ? @"macOS 窗口总览" : @"当前应用窗口"];
+        return;
+    }
+    if (!command) return;
+    _threeFingerCommandDispatched = YES;
+    [self emitDesktopCommand:command];
+    [_directTouchFeedback impactOccurred];
+    [self publishStatus:status];
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer == _threeFingerPanRecognizer)
+        return self.isMacWSInputEnabled &&
+            _streamClient.mode == MacWSStreamModeFullscreen;
+    return YES;
+}
+
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
         shouldRecognizeSimultaneouslyWithGestureRecognizer:
             (UIGestureRecognizer *)otherGestureRecognizer {
@@ -3543,6 +3741,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [_overlayFrames removeObjectForKey:key];
     [_overlayTextures removeObjectForKey:key];
     _sortedOverlayKeys = nil;
+    MacWSLog(@"display-stream overlay-retire-ui layer=%u immediate=YES",
+             layerWindowID);
     [self setNeedsDisplay];
 }
 @end
@@ -3574,6 +3774,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)cancelBootstrapTerminal;
 - (void)sceneGeometryDidChange;
 - (BOOL)activateCurrentMacWindow;
+- (BOOL)activateMacWindow:(MacWSStreamWindow *)window;
+- (void)presentWindowOverviewCurrentApplication:(BOOL)currentApplicationOnly;
 - (void)reassertFullscreenScenePresentation;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 - (BOOL)detachMissingWorkspaceReturnOwnerPID:(int32_t)ownerPID
@@ -4835,6 +5037,100 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     };
     [self metalView:_metalView emittedInput:activation];
     return YES;
+}
+
+- (BOOL)activateMacWindow:(MacWSStreamWindow *)window {
+    if (!window || window.descriptor.windowID == 0 ||
+        window.descriptor.ownerPID <= 1) return NO;
+    uint32_t frameWidth = [_metalView currentFrameWidth];
+    uint32_t frameHeight = [_metalView currentFrameHeight];
+    MacWSInputRecord activation = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindActivateTarget,
+        .sceneID = MacWSInputSceneForWindow(
+            window.descriptor.windowID, 0),
+        .timestamp = CACurrentMediaTime(),
+        .x = (float)(frameWidth * 0.5),
+        .y = (float)(frameHeight * 0.5),
+        .frameWidth = MAX(frameWidth, 1u),
+        .frameHeight = MAX(frameHeight, 1u),
+        .targetPID = window.descriptor.ownerPID,
+        .source = MacWSInputSourceFinger,
+    };
+    [self metalView:_metalView emittedInput:activation];
+    NSString *title = window.title.length ? window.title :
+        [NSString stringWithFormat:@"Window %u",
+            window.descriptor.windowID];
+    [self setNotice:[NSString stringWithFormat:@"已切换到 %@", title]
+             success:YES];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        if (self->_streamMode == MacWSStreamModeFullscreen)
+            [self->_metalView requestStreamWindowList];
+    });
+    return YES;
+}
+
+- (void)presentWindowOverviewCurrentApplication:(BOOL)currentApplicationOnly {
+    if (_streamMode != MacWSStreamModeFullscreen) return;
+    [_metalView requestStreamWindowList];
+    NSArray<MacWSStreamWindow *> *logicalWindows =
+        [self logicalWindowRepresentatives];
+    int32_t currentPID = _metalView.targetPID;
+    if (currentPID <= 1) {
+        for (MacWSStreamWindow *window in logicalWindows) {
+            if ((window.descriptor.flags & MacWSStreamWindowFocused) != 0) {
+                currentPID = window.descriptor.ownerPID;
+                break;
+            }
+        }
+    }
+    NSMutableArray<MacWSStreamWindow *> *visible = [NSMutableArray array];
+    for (MacWSStreamWindow *window in logicalWindows) {
+        MacWSStreamWindowFlags flags = window.descriptor.flags;
+        if (window.descriptor.ownerPID <= 1 ||
+            (flags & MacWSStreamWindowVisible) == 0 ||
+            (flags & MacWSStreamWindowOnScreen) == 0 ||
+            (currentApplicationOnly &&
+             window.descriptor.ownerPID != currentPID)) continue;
+        [visible addObject:window];
+    }
+    if (visible.count == 0) {
+        [self setNotice:currentApplicationOnly
+            ? @"当前应用没有可切换的 macOS 窗口"
+            : @"当前桌面没有可切换的 macOS 窗口" success:NO];
+        return;
+    }
+    UIAlertController *overview = [UIAlertController
+        alertControllerWithTitle:currentApplicationOnly
+            ? @"当前应用窗口" : @"macOS 窗口总览"
+                         message:@"三指左右切换 Space；点选窗口立即置前。"
+                  preferredStyle:UIAlertControllerStyleActionSheet];
+    NSUInteger limit = MIN(visible.count, 24);
+    for (NSUInteger index = 0; index < limit; index++) {
+        MacWSStreamWindow *window = visible[index];
+        BOOL focused =
+            (window.descriptor.flags & MacWSStreamWindowFocused) != 0;
+        NSString *baseTitle = window.title.length ? window.title :
+            [NSString stringWithFormat:@"Window %u",
+                window.descriptor.windowID];
+        NSString *title = focused
+            ? [NSString stringWithFormat:@"✓ %@", baseTitle] : baseTitle;
+        [overview addAction:[UIAlertAction actionWithTitle:title
+            style:UIAlertActionStyleDefault
+            handler:^(__unused UIAlertAction *action) {
+                [self activateMacWindow:window];
+            }]];
+    }
+    [overview addAction:[UIAlertAction actionWithTitle:@"取消"
+        style:UIAlertActionStyleCancel handler:nil]];
+    overview.popoverPresentationController.sourceView = _metalView;
+    overview.popoverPresentationController.sourceRect = CGRectMake(
+        CGRectGetMidX(_metalView.bounds), CGRectGetMidY(_metalView.bounds),
+        1.0, 1.0);
+    overview.popoverPresentationController.permittedArrowDirections = 0;
+    [self presentViewController:overview animated:YES completion:nil];
 }
 
 - (void)performSemanticShortcutForDiagnostics:(NSString *)shortcut {
@@ -7341,6 +7637,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
               image:@"macwindow.on.rectangle"];
 }
 
+- (void)metalView:(MacWSMetalView *)view
+ requestedWindowOverviewForCurrentApplication:(BOOL)currentApplicationOnly {
+    (void)view;
+    [self presentWindowOverviewCurrentApplication:currentApplicationOnly];
+}
+
 - (NSUserActivity *)streamRestorationActivity {
     NSUserActivity *activity = [[NSUserActivity alloc]
         initWithActivityType:@"com.macwsguide.host.window"];
@@ -7411,7 +7713,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // remains only for pixels without a rendered owner layer.
     if (_streamMode == MacWSStreamModeFullscreen &&
         record.kind != MacWSInputKindKeyDown &&
-        record.kind != MacWSInputKindKeyUp) {
+        record.kind != MacWSInputKindKeyUp &&
+        record.kind != MacWSInputKindActivateTarget &&
+        record.kind != MacWSInputKindDesktopCommand) {
         if (![_metalView routeFullscreenInputRecord:&record]) {
             record.targetPID = 0;
             record.sceneID &= UINT64_C(0x7fffffff);
@@ -7428,6 +7732,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindSecondaryTap: phase = @"secondary"; break;
         case MacWSInputKindScroll: phase = @"scroll"; break;
         case MacWSInputKindMagnify: phase = @"magnify"; break;
+        case MacWSInputKindDesktopCommand: phase = @"desktop-command"; break;
         case MacWSInputKindKeyDown: phase = @"key-down"; break;
         case MacWSInputKindKeyUp: phase = @"key-up"; break;
         case MacWSInputKindConfigureWindow: phase = @"configure-window"; break;
@@ -7880,6 +8185,7 @@ static void MacWSDeduplicateWindowScenes(void) {
             float scrollY = 0.0f;
             NSString *scrollPhase = @"changed";
             NSString *requestedKind = @"hover";
+            BOOL diagnosticDoubleTap = NO;
             NSURLComponents *components = [NSURLComponents
                 componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
             for (NSURLQueryItem *item in components.queryItems) {
@@ -7924,6 +8230,16 @@ static void MacWSDeduplicateWindowScenes(void) {
                 record.sceneID = MacWSInputSceneForWindow(targetWindowID, 0);
             if ([requestedKind isEqualToString:@"tap"])
                 record.kind = MacWSInputKindTap;
+            else if ([requestedKind isEqualToString:@"double"]) {
+                // Transport-only end-to-end witness for the same two physical
+                // tap records emitted by direct touch. The title bar uses the
+                // native CGPostMouseEvent route, whose double-click state is
+                // derived from the ordered button transitions rather than the
+                // NSEvent clickCount field, so diagnostics must preserve both
+                // taps instead of fabricating one clickCount=2 event.
+                record.kind = MacWSInputKindTap;
+                diagnosticDoubleTap = YES;
+            }
             else if ([requestedKind isEqualToString:@"secondary"])
                 record.kind = MacWSInputKindSecondaryTap;
             else if ([requestedKind isEqualToString:@"down"])
@@ -7951,6 +8267,16 @@ static void MacWSDeduplicateWindowScenes(void) {
             // Besides transport this schedules the post-AppKit window catalog
             // refresh required when a native tab selection swaps CGWindowID.
             [controller metalView:nil emittedInput:record];
+            if (diagnosticDoubleTap) {
+                MacWSInputRecord secondTap = record;
+                secondTap.flags |= MacWSInputFlagDoubleClick;
+                secondTap.timestamp += 0.10;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                              100 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), ^{
+                    [controller metalView:nil emittedInput:secondTap];
+                });
+            }
             MacWSLog(@"input-v4 synthetic kind=%@ routed-through-controller scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
                      requestedKind, record.sceneID, record.targetPID,
                      record.x, record.y, record.frameWidth,

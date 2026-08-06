@@ -33,6 +33,8 @@ typedef uint32_t CGEventTapLocation;
 typedef uint32_t CGEventField;
 typedef uint32_t CGWindowID;
 typedef uint32_t CGWindowListOption;
+typedef int32_t CGWindowLevel;
+typedef int32_t CGWindowLevelKey;
 typedef const void *CGEventRef;
 typedef uint32_t SLSConnectionID;
 
@@ -51,6 +53,7 @@ extern void CGEventPostToPid(pid_t pid, CGEventRef event);
 extern bool CGPreflightPostEventAccess(void);
 extern CFArrayRef CGWindowListCopyWindowInfo(CGWindowListOption option,
                                              CGWindowID relativeToWindow);
+extern CGWindowLevel CGWindowLevelForKey(CGWindowLevelKey key);
 extern const CFStringRef kCGWindowNumber;
 extern const CFStringRef kCGWindowLayer;
 extern const CFStringRef kCGWindowBounds;
@@ -75,6 +78,7 @@ enum {
     MacWSCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent = 92,
     MacWSCGWindowListOptionOnScreenOnly = 1 << 0,
     MacWSCGWindowListExcludeDesktopElements = 1 << 4,
+    MacWSCGPopUpMenuWindowLevelKey = 11,
 };
 
 static const char InputSocketPath[] = "/private/tmp/macws_host_input.sock";
@@ -140,6 +144,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindCloseWindow: return "close-window";
         case MacWSInputKindCreateInitialWindow: return "create-initial-window";
         case MacWSInputKindReopenApplication: return "reopen-application";
+        case MacWSInputKindDesktopCommand: return "desktop-command";
     }
     return "invalid";
 }
@@ -173,6 +178,10 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return record->targetPID > 1;
     if (record->kind == MacWSInputKindReopenApplication)
         return record->targetPID > 1;
+    if (record->kind == MacWSInputKindDesktopCommand)
+        return record->targetPID > 1 &&
+            record->contactID >= MacWSDesktopCommandSpaceLeft &&
+            record->contactID <= MacWSDesktopCommandSpaceRight;
     if (record->kind == MacWSInputKindScroll) {
         float horizontal = 0.0f;
         memcpy(&horizontal, &record->contactID, sizeof(horizontal));
@@ -194,7 +203,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindMagnify) {
+        record->kind > MacWSInputKindDesktopCommand) {
         return false;
     }
     return true;
@@ -243,6 +252,7 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
         case MacWSInputKindReopenApplication:
+        case MacWSInputKindDesktopCommand:
             // Consumed before event construction in main().
             return 0;
     }
@@ -470,9 +480,61 @@ static MacWSWindowTarget WindowTargetAtPoint(CGPoint point) {
     return WindowListFallbackTargetAtPoint(point);
 }
 
+static MacWSWindowTarget VisiblePopupMenuTarget(pid_t preferredPID) {
+    MacWSWindowTarget target = {0};
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        MacWSCGWindowListOptionOnScreenOnly |
+            MacWSCGWindowListExcludeDesktopElements,
+        0);
+    if (!windows) return target;
+    const int32_t popupLevel =
+        CGWindowLevelForKey(MacWSCGPopUpMenuWindowLevelKey);
+    MacWSWindowTarget firstPopup = {0};
+    for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+        CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(
+            windows, index);
+        CFNumberRef pidValue = (CFNumberRef)CFDictionaryGetValue(
+            info, kCGWindowOwnerPID);
+        CFNumberRef layerValue = (CFNumberRef)CFDictionaryGetValue(
+            info, kCGWindowLayer);
+        CFNumberRef windowValue = (CFNumberRef)CFDictionaryGetValue(
+            info, kCGWindowNumber);
+        CFDictionaryRef boundsValue = (CFDictionaryRef)CFDictionaryGetValue(
+            info, kCGWindowBounds);
+        int32_t ownerPID = 0, layer = 0, windowID = 0;
+        CGRect bounds = {{0, 0}, {0, 0}};
+        if (pidValue && layerValue && windowValue && boundsValue &&
+            CFNumberGetValue(pidValue, kCFNumberSInt32Type, &ownerPID) &&
+            CFNumberGetValue(layerValue, kCFNumberSInt32Type, &layer) &&
+            CFNumberGetValue(windowValue, kCFNumberSInt32Type, &windowID) &&
+            CGRectMakeWithDictionaryRepresentation(boundsValue, &bounds) &&
+            ownerPID > 1 && windowID > 0 && layer >= popupLevel &&
+            bounds.size.width > 0.0 && bounds.size.height > 0.0) {
+            MacWSWindowTarget candidate = {
+                .pid = (pid_t)ownerPID,
+                .windowID = windowID,
+            };
+            if (firstPopup.pid <= 1) firstPopup = candidate;
+            if (ownerPID == preferredPID) {
+                target = candidate;
+                break;
+            }
+        }
+    }
+    if (target.pid <= 1) target = firstPopup;
+    CFRelease(windows);
+    return target;
+}
+
 static uint64_t RealtimeNanoseconds(void) {
     struct timespec now = {0};
     if (clock_gettime(CLOCK_REALTIME, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+}
+
+static uint64_t MonotonicNanoseconds(void) {
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
 }
 
@@ -674,6 +736,20 @@ static bool PIDInList(pid_t pid, const pid_t *pids, size_t count) {
     return false;
 }
 
+// A DisplayStream system-surface descriptor is useful even when this
+// launchd session cannot ask WindowServer for a routing record.  Validate the
+// process-local receiver itself before using that descriptor as the bounded
+// fallback: this rejects exited/reused owners without turning an unavailable
+// SkyLight query into a false routing mismatch.
+static bool AppInputBridgeEndpointExists(pid_t pid) {
+    if (pid <= 1 || kill(pid, 0) != 0) return false;
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
+    int length = snprintf(path, sizeof(path),
+                          "/private/tmp/macws_app_input.%d.sock", pid);
+    return length > 0 && (size_t)length < sizeof(path) &&
+           access(path, F_OK) == 0;
+}
+
 // Ask every live AppKit process to hit-test on its own main thread, then send
 // the real event only to the unique best reply. This is a query broadcast,
 // not an event broadcast: probes cannot create NSEvents. Active/key state
@@ -829,6 +905,7 @@ static MacWSWindowTarget ProbeAppInputTarget(
         record->kind == MacWSInputKindKeyUp ||
         record->kind == MacWSInputKindScroll ||
         record->kind == MacWSInputKindMagnify ||
+        record->kind == MacWSInputKindDesktopCommand ||
         systemMenuActivation;
     if (target.pid <= 1 && allowActiveFallback) {
         if (!frontAmbiguous && frontTarget.pid > 1) {
@@ -1040,6 +1117,14 @@ int main(void) {
     // the authoritative target resolved for the real button-down; OSXvnc only
     // emits MenuHover during its bounded native-menu candidate lifetime.
     MacWSWindowTarget menuTarget = {0};
+    // A contextual menu owns the next primary tap even when that tap lies
+    // outside its visible bounds. WindowServer correctly reports the window
+    // underneath that point, but treating that expected mismatch as a stale
+    // layer drops the cancellation before the native menu tracker sees it.
+    // Arm one bounded capture only after a secondary tap was successfully
+    // delivered to a verified global-system endpoint.
+    MacWSWindowTarget globalSystemMenuCaptureTarget = {0};
+    uint64_t globalSystemMenuCaptureDeadline = 0;
     while (!StopRequested) {
         MacWSInputRecord record = {0};
         struct sockaddr_un sender = {0};
@@ -1138,14 +1223,126 @@ int main(void) {
         }
         CGEventType eventType = EventTypeForRecord(&record, &buttonDown);
         MacWSWindowTarget eventTarget = {0};
+        bool armSystemMenuCapture = false;
+        uint64_t monotonicNow = MonotonicNanoseconds();
         uint32_t exactWindowID = MacWSInputWindowIDForScene(record.sceneID);
+        bool pendingGlobalMenuTap = record.kind == MacWSInputKindTap &&
+            globalSystemMenuCaptureTarget.pid > 1 &&
+            globalSystemMenuCaptureTarget.windowID > 0 &&
+            monotonicNow != 0 &&
+            monotonicNow <= globalSystemMenuCaptureDeadline;
+        // A native popup menu's synchronous tracker owns the next primary
+        // tap even when the tap is outside the popup and Host therefore hit-
+        // tests a different underlying layer.  Confirm a real on-screen
+        // kCGPopUpMenuWindowLevel window and use its current owner (Dock can
+        // hand the menu to DockHelper) before transferring the tap.  This is
+        // state-derived, not a timed blind capture, and prevents a dismissed
+        // menu from stealing the user's next independent click.
+        MacWSWindowTarget visiblePopupTarget = pendingGlobalMenuTap
+            ? VisiblePopupMenuTarget(globalSystemMenuCaptureTarget.pid)
+            : (MacWSWindowTarget){0};
+        bool capturedGlobalMenuTap = visiblePopupTarget.pid > 1 &&
+            visiblePopupTarget.windowID > 0;
+        if (capturedGlobalMenuTap) {
+            // Dock delegates its context menu to DockHelper, so the visible
+            // popup's real connection can legitimately differ from the
+            // process that received the initiating secondary click.  Route
+            // to the live popup window itself; the CGWindow catalog is the
+            // authoritative ownership handoff.
+            globalSystemMenuCaptureTarget = visiblePopupTarget;
+            exactWindowID = (uint32_t)globalSystemMenuCaptureTarget.windowID;
+            record.targetPID = globalSystemMenuCaptureTarget.pid;
+            record.flags |= MacWSInputFlagGlobalSystemSurface;
+            record.sceneID = MacWSInputSceneForWindow(
+                exactWindowID, MacWSInputModifiersForScene(record.sceneID));
+        } else if (pendingGlobalMenuTap) {
+            globalSystemMenuCaptureTarget = (MacWSWindowTarget){0};
+            globalSystemMenuCaptureDeadline = 0;
+        }
         bool exactWindowRecord = record.targetPID > 1 && exactWindowID != 0;
+        bool globalSystemSurfaceRecord = exactWindowRecord &&
+            (record.flags & MacWSInputFlagGlobalSystemSurface) != 0;
         bool keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
         bool scrollRecord = record.kind == MacWSInputKindScroll;
         bool magnifyRecord = record.kind == MacWSInputKindMagnify;
+        bool desktopCommandRecord =
+            record.kind == MacWSInputKindDesktopCommand;
         bool gestureRecord = scrollRecord || magnifyRecord;
-        if (exactWindowRecord) {
+        if (globalSystemSurfaceRecord) {
+            // Dock and other non-NSApplication surfaces need CoreGraphics'
+            // per-process route, not a borrowed application's global poster.
+            // Re-read WindowServer immediately before the transition so a
+            // retired/covered DisplayStream layer can never steal the click.
+            MacWSWindowTarget verifiedTarget = WindowTargetAtPoint(point);
+            bool routingAvailable = verifiedTarget.pid > 1;
+            // Capture ownership and event-route ownership are deliberately
+            // different for the shared macOS menu bar.  Runtime evidence on
+            // 2026-08-06: displayd described window 15 as WindowServer
+            // (91623/15), while
+            // SLSCopyWindowRoutingRecordsForScreenLocation returned the
+            // active Terminal connection (2251/15).  The CGWindowID is the
+            // stable identity; requiring the capture owner's PID discarded
+            // an otherwise exact WindowServer route and made the menu bar
+            // untouchable.  Accept only that same-window ownership transfer;
+            // a different nonzero window is still treated as a stale/covered
+            // DisplayStream layer and dropped below.
+            bool routingMatches = routingAvailable &&
+                verifiedTarget.windowID == (int32_t)exactWindowID;
+            armSystemMenuCapture = !capturedGlobalMenuTap &&
+                record.kind == MacWSInputKindTap && routingMatches &&
+                verifiedTarget.pid != record.targetPID;
+            bool capturedRouting = capturedGlobalMenuTap &&
+                globalSystemMenuCaptureTarget.pid == record.targetPID &&
+                globalSystemMenuCaptureTarget.windowID ==
+                    (int32_t)exactWindowID;
+            bool exactEndpointAvailable =
+                AppInputBridgeEndpointExists(record.targetPID);
+            if ((routingAvailable && !routingMatches && !capturedRouting) ||
+                (!routingAvailable && !exactEndpointAvailable)) {
+                sequence++;
+                if (RuntimeDiagnosticsEnabled()) {
+                    fprintf(stderr,
+                        "MACWS-INPUT SYSTEM-SURFACE-DROP seq=%llu "
+                        "requested=%d/%u verified=%d/%d point=(%.2f,%.2f)\n",
+                        (unsigned long long)sequence, record.targetPID,
+                        exactWindowID, verifiedTarget.pid,
+                        verifiedTarget.windowID, point.x, point.y);
+                    fflush(stderr);
+                }
+                continue;
+            }
+            if (capturedRouting) {
+                eventTarget = globalSystemMenuCaptureTarget;
+                if (RuntimeDiagnosticsEnabled()) {
+                    fprintf(stderr,
+                        "MACWS-INPUT SYSTEM-MENU-CAPTURE requested=%d/%u "
+                        "verified=%d/%d point=(%.2f,%.2f)\n",
+                        record.targetPID, exactWindowID, verifiedTarget.pid,
+                        verifiedTarget.windowID, point.x, point.y);
+                    fflush(stderr);
+                }
+            } else if (routingMatches) {
+                eventTarget = verifiedTarget;
+            } else {
+                // Runtime-confirmed on 2026-08-06: Dock's real VNC click
+                // opens Launchpad while this broker's SLS routing response
+                // and public CGWindow catalog both contain no Dock window.
+                // The Host descriptor still names Dock's current PID/window
+                // and its process-local AppInput socket is live.  Treat this
+                // as routing API unavailability, never as permission to
+                // override a nonzero mismatching WindowServer result.
+                eventTarget.pid = record.targetPID;
+                eventTarget.windowID = (int32_t)exactWindowID;
+                if (RuntimeDiagnosticsEnabled()) {
+                    fprintf(stderr,
+                        "MACWS-INPUT SYSTEM-SURFACE-ENDPOINT-FALLBACK "
+                        "requested=%d/%u point=(%.2f,%.2f)\n",
+                        record.targetPID, exactWindowID, point.x, point.y);
+                    fflush(stderr);
+                }
+            }
+        } else if (exactWindowRecord) {
             // A native iPadOS Scene is permanently bound to one AppKit owner
             // and window. Do not let a stale fullscreen hover/menu cache route
             // its pointer or keyboard record into another application.
@@ -1260,11 +1457,33 @@ int main(void) {
                 socketFD, eventTarget.pid, &record);
         }
         int appBridgeError = 0;
-        bool appBridgeAttempted =
-            record.kind != MacWSInputKindActivateTarget ||
-            activationRepairNeeded || systemMenuPreflightNeeded;
+        // System surfaces such as Dock now expose a process-local endpoint.
+        // Prefer it because this broker's CoreGraphics post access is denied;
+        // retain the old per-PID CGEvent path only as an explicit fallback
+        // when the endpoint is absent (sendto returns ENOENT/ECONNREFUSED).
+        bool appBridgeAttempted = globalSystemSurfaceRecord ||
+            (record.kind != MacWSInputKindActivateTarget ||
+             activationRepairNeeded || systemMenuPreflightNeeded);
         bool appBridgeSent = appBridgeAttempted &&
             SendToAppInputBridge(socketFD, &routedRecord, &appBridgeError);
+        if (globalSystemSurfaceRecord &&
+            (record.kind == MacWSInputKindSecondaryTap ||
+             armSystemMenuCapture) && appBridgeSent &&
+            eventTarget.pid > 1 && eventTarget.windowID > 0 &&
+            monotonicNow != 0) {
+            globalSystemMenuCaptureTarget = eventTarget;
+            globalSystemMenuCaptureDeadline = monotonicNow +
+                30ull * 1000000000ull;
+        } else if (capturedGlobalMenuTap) {
+            // One primary tap either selects an item or dismisses the menu.
+            // Never let a stale capture steal a later independent action.
+            globalSystemMenuCaptureTarget = (MacWSWindowTarget){0};
+            globalSystemMenuCaptureDeadline = 0;
+        } else if (globalSystemMenuCaptureDeadline != 0 &&
+                   monotonicNow > globalSystemMenuCaptureDeadline) {
+            globalSystemMenuCaptureTarget = (MacWSWindowTarget){0};
+            globalSystemMenuCaptureDeadline = 0;
+        }
         if ((record.kind == MacWSInputKindHover ||
              record.kind == MacWSInputKindMenuHover) &&
             !appBridgeSent &&
@@ -1328,6 +1547,19 @@ int main(void) {
                     (unsigned long long)(record.sceneID & 0xffffffffull),
                     appBridgeSent ? "YES" : "NO", appBridgeError);
             if (RuntimeDiagnosticsEnabled()) fflush(stderr);
+            continue;
+        }
+        if (desktopCommandRecord) {
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT DESKTOP-COMMAND seq=%llu target=%d "
+                    "command=%u sent=%s errno=%d\n",
+                    (unsigned long long)sequence, eventTarget.pid,
+                    record.contactID, appBridgeSent ? "YES" : "NO",
+                    appBridgeError);
+                fflush(stderr);
+            }
             continue;
         }
         if (scrollRecord) {

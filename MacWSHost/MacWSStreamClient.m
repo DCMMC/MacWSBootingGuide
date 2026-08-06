@@ -56,6 +56,13 @@
 // newest frame for each overlay until the next main-queue delivery.
 @property(nonatomic) MacWSSurfaceFrame *pendingBaseFrame;
 @property(nonatomic) NSMutableDictionary<NSNumber *, MacWSSurfaceFrame *> *pendingOverlayFrames;
+// A layer removal and its final capture callback can cross UIKit's main-queue
+// delivery boundary. Remember the retired producer stream so a late frame from
+// that generation cannot resurrect visible pixels during displayd's five-second
+// crash-safe stream-stop grace period. A genuinely recreated SkyLight window
+// has a new streamID and clears its own tombstone on first frame.
+@property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *latestOverlayStreamIDs;
+@property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *retiredOverlayStreamIDs;
 @property(nonatomic) BOOL frameDeliveryScheduled;
 @property(nonatomic) BOOL reconnectEnabled;
 @property(nonatomic) NSUInteger reconnectAttempt;
@@ -70,6 +77,8 @@
         _queue = dispatch_queue_create("com.macwsguide.host.display-client",
                                        DISPATCH_QUEUE_SERIAL);
         _pendingOverlayFrames = [NSMutableDictionary dictionary];
+        _latestOverlayStreamIDs = [NSMutableDictionary dictionary];
+        _retiredOverlayStreamIDs = [NSMutableDictionary dictionary];
         _reconnectEnabled = YES;
     }
     return self;
@@ -223,6 +232,8 @@
         pending = [frames copy];
         self.pendingBaseFrame = nil;
         [self.pendingOverlayFrames removeAllObjects];
+        [self.latestOverlayStreamIDs removeAllObjects];
+        [self.retiredOverlayStreamIDs removeAllObjects];
     }
     if (releaseFrames) {
         for (MacWSSurfaceFrame *frame in pending) {
@@ -370,6 +381,16 @@
             baseWindowID != self.windowID || layerWindowID == 0 ||
             layerWindowID > UINT32_MAX || layerWindowID == baseWindowID)
             return;
+        NSNumber *layerKey = @((uint32_t)layerWindowID);
+        MacWSSurfaceFrame *pending = nil;
+        @synchronized (self) {
+            NSNumber *streamID = self.latestOverlayStreamIDs[layerKey];
+            if (streamID) self.retiredOverlayStreamIDs[layerKey] = streamID;
+            pending = self.pendingOverlayFrames[layerKey];
+            [self.pendingOverlayFrames removeObjectForKey:layerKey];
+        }
+        if (pending) [self releaseTokenImmediatelyOnClientQueue:
+            pending.descriptor.leaseToken];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.delegate streamClient:self
                    removedLayerWindowID:(uint32_t)layerWindowID];
@@ -422,6 +443,26 @@
          descriptor.layerWindowID != descriptor.windowID)) {
         [self releaseToken:descriptor.leaseToken];
         return;
+    }
+    if (overlay) {
+        NSNumber *layerKey = @(descriptor.layerWindowID);
+        NSNumber *streamID = @(descriptor.streamID);
+        BOOL retiredGeneration = NO;
+        @synchronized (self) {
+            NSNumber *retired = self.retiredOverlayStreamIDs[layerKey];
+            retiredGeneration = retired &&
+                retired.unsignedLongLongValue == descriptor.streamID;
+            if (!retiredGeneration) {
+                // A new producer generation is the authoritative proof that a
+                // removed SkyLight window ID has returned.
+                [self.retiredOverlayStreamIDs removeObjectForKey:layerKey];
+                self.latestOverlayStreamIDs[layerKey] = streamID;
+            }
+        }
+        if (retiredGeneration) {
+            [self releaseToken:descriptor.leaseToken];
+            return;
+        }
     }
 
     IOSurfaceRef surface = NULL;

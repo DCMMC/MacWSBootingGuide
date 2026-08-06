@@ -26,6 +26,15 @@ int main(void) {
     assert(MACWS_INPUT_VERSION == 4u);
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
+    assert(MacWSInputKindDesktopCommand == 20);
+    assert(MacWSDesktopCommandMissionControl !=
+           MacWSDesktopCommandApplicationWindows);
+    assert(MacWSDesktopCommandSpaceLeft == 3);
+    assert(MacWSDesktopCommandSpaceRight == 4);
+    assert((MacWSInputFlagDoubleClick & MacWSInputFlagScrollBegan) == 0);
+    assert((MacWSInputFlagGlobalSystemSurface &
+            (MacWSInputFlagDoubleClick | MacWSInputFlagScrollBegan |
+             MacWSInputFlagGestureChanged)) == 0);
     assert(MacWSDecideTouchCandidate(0.10, 0.0, false) ==
            MacWSTouchCandidateDecisionWait);
     assert(MacWSDecideTouchCandidate(0.44, 3.99, true) ==
@@ -43,6 +52,9 @@ int main(void) {
     assert(!MacWSTouchReachedLongPress(0.10));
     assert(!MacWSTouchReachedLongPress(0.449));
     assert(MacWSTouchReachedLongPress(0.45));
+    assert(MacWSIsDirectDoubleTap(10.0, 10.40, 20.0, 20.0));
+    assert(!MacWSIsDirectDoubleTap(10.0, 10.43, 0.0, 0.0));
+    assert(!MacWSIsDirectDoubleTap(10.0, 10.20, 44.1, 0.0));
     assert(!MacWSShouldStartScrollMomentum(79.99, 0.0));
     assert(MacWSShouldStartScrollMomentum(80.0, 0.0));
     assert(MacWSShouldStartScrollMomentum(60.0, 60.0));
@@ -52,6 +64,20 @@ int main(void) {
            MacWSDirectScrollAxisFree);
     assert(MacWSChooseDirectScrollAxis(6.0, 4.0) ==
            MacWSDirectScrollAxisHorizontal);
+    assert(MacWSClassifyThreeFingerPan(-100.0, 10.0, 0.0, 0.0, 800.0) ==
+           MacWSThreeFingerGestureLeft);
+    assert(MacWSClassifyThreeFingerPan(100.0, 10.0, 0.0, 0.0, 800.0) ==
+           MacWSThreeFingerGestureRight);
+    assert(MacWSClassifyThreeFingerPan(10.0, -100.0, 0.0, 0.0, 800.0) ==
+           MacWSThreeFingerGestureUp);
+    assert(MacWSClassifyThreeFingerPan(10.0, 100.0, 0.0, 0.0, 800.0) ==
+           MacWSThreeFingerGestureDown);
+    assert(MacWSClassifyThreeFingerPan(30.0, 30.0, 1500.0, 1500.0, 800.0) ==
+           MacWSThreeFingerGestureNone);
+    assert(MacWSClassifyThreeFingerPan(-30.0, 2.0, -1000.0, 0.0, 800.0) ==
+           MacWSThreeFingerGestureLeft);
+    assert(MacWSClassifyThreeFingerPan(-27.0, 1.0, -1000.0, 0.0, 800.0) ==
+           MacWSThreeFingerGestureNone);
     double constrainedX = 2.0, constrainedY = -9.0;
     MacWSConstrainDirectScrollDelta(MacWSDirectScrollAxisVertical,
                                     &constrainedX, &constrainedY);
@@ -139,6 +165,8 @@ int main(void) {
         .destinationHeight = 2048,
     };
     assert(MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
+    assert((MacWSStreamFrameInputPassthrough &
+            MacWSStreamFrameGlobalSystemSurface) == 0);
     frame.destinationX = 200;
     frame.destinationY = 100;
     frame.destinationWidth = 1000;

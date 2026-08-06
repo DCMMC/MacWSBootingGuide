@@ -19,10 +19,13 @@ UICACHE=/var/jb/usr/bin/uicache
 BASE_CARRIER_APP=/var/jb/Applications/SettingsExtensionProxy.app
 BASE_CARRIER_EXECUTABLE="$BASE_CARRIER_APP/SettingsExtensionProxy"
 CARRIER_ENTITLEMENTS="/tmp/macws-settings-carrier-entitlements.$$"
+BOOT_READY_MARKER=/var/jb/var/mobile/macws-settings-runtime.boot-ready
+SYSCTL=/var/jb/usr/sbin/sysctl
 UICACHE_LIST=""
 TRUSTCACHE_INFO=""
 RUNTIME_SCHEMA="macws-settings-extension-runtime-v2"
 RUNTIME_BASE_FINGERPRINT=""
+CURRENT_BOOT_ID=""
 
 if [ ! -d "$EXTENSIONS_ROOT" ]; then
     echo '[INFO] Settings extension runtime deferred: macOS rootfs is not mounted'
@@ -40,10 +43,6 @@ if [ ! -f "$BASE_CARRIER_APP/Info.plist" ] ||
     echo "[ERROR] Settings extension carrier is missing: $BASE_CARRIER_APP" >&2
     exit 1
 fi
-$LDID -e "$BASE_CARRIER_EXECUTABLE" > "$CARRIER_ENTITLEMENTS" 2>/dev/null
-[ ! -x "$UICACHE" ] || UICACHE_LIST=$($UICACHE -l 2>/dev/null || true)
-TRUSTCACHE_INFO=$($JBCTL trustcache info 2>/dev/null || true)
-trap 'rm -f "$CARRIER_ENTITLEMENTS"' EXIT
 
 selected_cdhash() {
     local path="$1" hash
@@ -57,6 +56,35 @@ selected_cdhash() {
 }
 
 RUNTIME_BASE_FINGERPRINT="$RUNTIME_SCHEMA|$(selected_cdhash "$LIBMACHOOK")|$(selected_cdhash "$SUBSTRATE")|$(selected_cdhash "$TRAMPOLINES")"
+if [ -x "$SYSCTL" ]; then
+    CURRENT_BOOT_ID=$($SYSCTL -n kern.bootsessionuuid 2>/dev/null || true)
+fi
+
+# A full 48-pane verification reads every bundle, LaunchServices registration
+# and trustcache entry.  That is essential after a reboot or binary update,
+# but it used to run synchronously before every WindowServer launch.  The
+# bootsession UUID plus the three load-bearing dependency CDHashes make a
+# same-boot success reusable without hiding a cold-boot or package-update
+# failure.  The success marker is written only after the deep verifier passes.
+if [ "$#" -eq 1 ] && [ "$1" = "--verify" ] &&
+   [ -n "$CURRENT_BOOT_ID" ] && [ -f "$BOOT_READY_MARKER" ] &&
+   [ "$(sed -n '1p' "$BOOT_READY_MARKER" 2>/dev/null)" = \
+     "$CURRENT_BOOT_ID|$RUNTIME_BASE_FINGERPRINT" ] &&
+   [ -z "$(sed -n '2p' "$BOOT_READY_MARKER" 2>/dev/null)" ]; then
+    echo "[INFO] Settings ExtensionKit runtime verification reused for bootsession: $CURRENT_BOOT_ID"
+    exit 0
+fi
+
+# Any preparation invalidates the aggregate marker before touching a pane.
+# The following --verify must prove that the complete set is coherent again.
+if ! { [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; }; then
+    rm -f "$BOOT_READY_MARKER"
+fi
+
+$LDID -e "$BASE_CARRIER_EXECUTABLE" > "$CARRIER_ENTITLEMENTS" 2>/dev/null
+[ ! -x "$UICACHE" ] || UICACHE_LIST=$($UICACHE -l 2>/dev/null || true)
+TRUSTCACHE_INFO=$($JBCTL trustcache info 2>/dev/null || true)
+trap 'rm -f "$CARRIER_ENTITLEMENTS"' EXIT
 
 ensure_trust_hash() {
     local hash="$1"
@@ -356,6 +384,13 @@ if [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; then
         echo '[ERROR] Settings ExtensionKit runtime verification failed' >&2
         exit 1
     }
+    if [ -n "$CURRENT_BOOT_ID" ]; then
+        boot_marker_temporary="${BOOT_READY_MARKER}.new-$$"
+        printf '%s\n' "$CURRENT_BOOT_ID|$RUNTIME_BASE_FINGERPRINT" > \
+            "$boot_marker_temporary"
+        chmod 644 "$boot_marker_temporary"
+        mv -f "$boot_marker_temporary" "$BOOT_READY_MARKER"
+    fi
     exit 0
 elif [ "$#" -gt 0 ]; then
     for bundle in "$@"; do

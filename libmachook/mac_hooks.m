@@ -27,6 +27,7 @@
 #import <poll.h>
 #include <execinfo.h>
 #import "macws_host_protocol.h"
+#import "macws_control_protocol.h"
 
 // These macOS code-signing entry points are present in the iPadOS shared
 // cache and used by Ventura's CoreLocationAgent, but the iPhoneOS SDK omits
@@ -1025,6 +1026,11 @@ static _Thread_local uint64_t g_macws_agx_initfull_len = 0;
 static _Atomic int g_macws_iomfb_coexist_swap_cancel = 0;
 static void macws_install_quartzcore_frame_info_hook(
     const struct mach_header *header);
+static void macws_install_quartzcore_coexist_pacing_hooks(
+    const struct mach_header *header);
+static uint32_t macws_coexist_completion_pace_us(void);
+static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us);
+static uint32_t macws_coexist_wait_for_completion_slot(uint32_t interval_us);
 static IOReturn (*g_macws_orig_iomfb_swap_end)(void *framebuffer) = NULL;
 static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer);
 
@@ -1327,6 +1333,13 @@ static inline uint64_t macws_pac_sign(uint64_t ptr, uint64_t mod, uint8_t key) {
 #include <mach-o/nlist.h>
 #include <mach-o/reloc.h>
 
+// Forward declaration for the targeted HIServices main-image import repair
+// below. The ordinary DYLD_INTERPOSE tuple remains the preferred path; the
+// authenticated GOT repair is needed only for Ventura's prebuilt arm64e XPC
+// service executable, whose _xpc_main chained bind is not rewritten by the
+// iPadOS 16 dyld.
+void macws_xpc_main(xpc_connection_handler_t handler);
+
 // Repair __got / __auth_got slots via indirect symbol table + LC_SYMTAB. Used
 // for dlopen'd DSC-bound images that have no LC_DYLD_CHAINED_FIXUPS (because
 // the cache builder removed it; cache pre-filled __got at cache-prep time).
@@ -1363,6 +1376,10 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
         return;
     }
     BOOL diagnostics = macws_runtime_diagnostics_enabled();
+    const char *program = getprogname();
+    BOOL hiservicesMain = program &&
+        strcmp(program, "com.apple.hiservices-xpcservice") == 0 &&
+        header == (const struct mach_header_64 *)_dyld_get_image_header(0);
     int64_t linkedit_runtime_base = (int64_t)linkedit_vmaddr + slide - (int64_t)linkedit_fileoff;
     const struct nlist_64 *symtab    = (const struct nlist_64 *)(linkedit_runtime_base + st->symoff);
     const char            *strtab    = (const char           *)(linkedit_runtime_base + st->stroff);
@@ -1406,8 +1423,11 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
             uint32_t indirect_start = sn->reserved1;
             BOOL is_auth = (strstr(sn->sectname, "auth") != NULL);
             uint64_t *slots = (uint64_t *)(sn->addr + slide);
-            fprintf(stderr, "####   sect[%u] %s,%s type=%u entries=%u indirect_start=%u auth=%d\n",
-                k, sc->segname, sn->sectname, type, entries, indirect_start, is_auth);
+            if (diagnostics) {
+                fprintf(stderr, "####   sect[%u] %s,%s type=%u entries=%u indirect_start=%u auth=%d\n",
+                    k, sc->segname, sn->sectname, type, entries,
+                    indirect_start, is_auth);
+            }
             for (uint32_t e = 0; e < entries; e++) {
                 if (indirect_start + e >= dt->nindirectsyms) break;
                 total_indirect_slots++;
@@ -1442,8 +1462,25 @@ static void macws_repair_got_via_symtab(const struct mach_header_64 *header,
                 // under-realized AGX class.
                 int force_override = 0;
                 extern id objc_alloc_trace(Class);
-                if (!strcmp(lookup, "objc_alloc")) {
+                if (strstr(image_name, "AGXMetal13_3") &&
+                    !strcmp(lookup, "objc_alloc")) {
                     resolved = (void *)objc_alloc_trace;
+                    force_override = 1;
+                }
+                // RE-confirmed in Ventura 13.4's actual arm64e
+                // com.apple.hiservices-xpcservice: main+0x4c14 calls the
+                // _xpc_main auth stub, whose __DATA_CONST,__auth_got slot is
+                // +0x3f8 (key=IA, addrDiv=1, diversity=0). iPadOS 16 dyld
+                // leaves that slot bound to stock libxpc despite the static
+                // interpose tuple. Stock xpc_main rejects this deliberately
+                // freestanding root launchd job with "An XPC Service cannot
+                // be run directly", so the service main thread exits and
+                // AppKit clients receive Connection invalid. Rebind the
+                // symbolically identified main-image slot to the same real
+                // listener adapter; the generic auth-GOT signer below uses
+                // the exact slot-address discriminator expected by braa.
+                if (hiservicesMain && !strcmp(lookup, "xpc_main")) {
+                    resolved = (void *)macws_xpc_main;
                     force_override = 1;
                 }
                 // macOS 13.4 IOSurfaceClient's per-plane fields are four bytes
@@ -3640,6 +3677,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         if (atomic_load(&g_macws_iomfb_coexist_swap_cancel) &&
             macws_cancel_completion_enabled()) {
             macws_install_quartzcore_frame_info_hook(header);
+            macws_install_quartzcore_coexist_pacing_hooks(header);
         }
 #endif
         // Force CABackingStorePrepareUpdates_ onto the accelerated/IOSurface path so window
@@ -9549,12 +9587,135 @@ static void macws_install_corelocation_requirement_interpose(void) {
     }
 }
 
+// Ventura Dock opens an application tile with LSOpenFromURLSpec on a worker
+// queue.  In this chroot, LaunchServices can resolve the real bundle URL but
+// its final RunningBoard request belongs to iPadOS and cannot describe a
+// macOS executable.  Runtime evidence from the installed Dock 2207.3 is
+// exact: Dock+0x8aadc calls LSOpenFromURLSpec with appURL=NULL, one .app item
+// URL and flags 0x45; the function returns -10810.  The independent `/usr/bin
+// /open -a Finder` witness reaches the same boundary and reports
+// RBSAssertionErrorDomain Code=2 (missing domain-plist attribute).
+//
+// Preserve LaunchServices as the first owner.  Only its exact failed
+// application-bundle transaction is handed to macwshostd, which already owns
+// the validated chroot spawn/reopen/readiness lifecycle used by Control
+// Center.  Documents, folders, successful LS requests and multi-item opens
+// never enter this adapter.
+typedef struct {
+    CFURLRef appURL;
+    CFArrayRef itemURLs;
+    const void *passThruParams;
+    uint32_t launchFlags;
+    void *asyncRefCon;
+} MacWSLSLaunchURLSpec;
+
+extern OSStatus LSOpenFromURLSpec(const MacWSLSLaunchURLSpec *launchSpec,
+                                  CFURLRef *outLaunchedURL);
+extern xpc_connection_t macws_xpc_connection_create_mach_service_raw(
+    const char *, dispatch_queue_t, uint64_t)
+    __asm("_xpc_connection_create_mach_service");
+
+static CFURLRef macws_failed_application_url(
+        const MacWSLSLaunchURLSpec *launchSpec) {
+    if (!launchSpec) return NULL;
+    CFURLRef candidate = NULL;
+    if (launchSpec->appURL &&
+        (!launchSpec->itemURLs ||
+         CFArrayGetCount(launchSpec->itemURLs) == 0)) {
+        candidate = launchSpec->appURL;
+    } else if (!launchSpec->appURL && launchSpec->itemURLs &&
+               CFGetTypeID(launchSpec->itemURLs) == CFArrayGetTypeID() &&
+               CFArrayGetCount(launchSpec->itemURLs) == 1) {
+        CFTypeRef item = CFArrayGetValueAtIndex(launchSpec->itemURLs, 0);
+        if (item && CFGetTypeID(item) == CFURLGetTypeID())
+            candidate = (CFURLRef)item;
+    }
+    if (!candidate || CFGetTypeID(candidate) != CFURLGetTypeID()) return NULL;
+
+    // Runtime-confirmed in Ventura Dock 2207.3 on 2026-08-06: evaluating
+    // `-[NSString caseInsensitiveCompare:]` against an Objective-C constant
+    // from this arm64e interposer faults in CFStringGetLength with a pointer-
+    // authentication failure immediately after the real LSOpenFromURLSpec
+    // returns -10810.  This boundary only needs a POSIX bundle suffix, so keep
+    // it in CoreFoundation/C storage and do an exact ASCII comparison.  It
+    // also avoids turning URL parsing into another cross-image ObjC dispatch.
+    UInt8 pathBytes[PATH_MAX] = {0};
+    if (!CFURLGetFileSystemRepresentation(candidate, true, pathBytes,
+                                           sizeof(pathBytes))) return NULL;
+    size_t pathLength = strlen((const char *)pathBytes);
+    if (pathLength < 4) return NULL;
+    const char *suffix = (const char *)pathBytes + pathLength - 4;
+    BOOL application = suffix[0] == '.' &&
+        (suffix[1] == 'a' || suffix[1] == 'A') &&
+        (suffix[2] == 'p' || suffix[2] == 'P') &&
+        (suffix[3] == 'p' || suffix[3] == 'P');
+    return application ? candidate : NULL;
+}
+
+static BOOL macws_launch_application_path_via_host(CFURLRef applicationURL) {
+    if (!applicationURL) return NO;
+    UInt8 pathStorage[PATH_MAX] = {0};
+    if (!CFURLGetFileSystemRepresentation(applicationURL, true, pathStorage,
+                                           sizeof(pathStorage))) return NO;
+    const char *pathBytes = (const char *)pathStorage;
+    BOOL launched = NO;
+    xpc_connection_t connection =
+        macws_xpc_connection_create_mach_service_raw(
+        MACWS_CONTROL_SERVICE,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (connection && pathBytes && pathBytes[0] == '/') {
+        xpc_connection_set_event_handler(connection,
+            ^(xpc_object_t event) { (void)event; });
+        xpc_connection_resume(connection);
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_OP,
+                                  MACWS_CONTROL_OP_LAUNCH_PATH);
+        xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_APP_PATH,
+                                  pathBytes);
+        xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+            connection, request);
+        launched = reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY &&
+            xpc_dictionary_get_bool(reply, "ok");
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                    "#### MACWS LS-APP-FALLBACK path=%s launched=%s "
+                    "reply=%s\n",
+                    pathBytes, launched ? "YES" : "NO",
+                    reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY
+                        ? (xpc_dictionary_get_string(reply, "message") ?: "")
+                        : "invalid");
+        }
+        if (reply) xpc_release(reply);
+        xpc_release(request);
+        xpc_connection_cancel(connection);
+    }
+    if (connection) xpc_release(connection);
+    return launched;
+}
+
+static OSStatus macws_LSOpenFromURLSpec(
+        const MacWSLSLaunchURLSpec *launchSpec,
+        CFURLRef *outLaunchedURL) {
+    OSStatus status = LSOpenFromURLSpec(launchSpec, outLaunchedURL);
+    // -10810 is the exact kLSUnknownErr returned after LaunchServices has
+    // resolved the application but its foreign-platform RBS launch failed.
+    // Do not turn unrelated LS failures into success.
+    if (status != -10810) return status;
+    CFURLRef applicationURL = macws_failed_application_url(launchSpec);
+    if (!applicationURL ||
+        !macws_launch_application_path_via_host(applicationURL)) return status;
+    if (outLaunchedURL && !*outLaunchedURL)
+        *outLaunchedURL = (CFURLRef)CFRetain(applicationURL);
+    return noErr;
+}
+
 DYLD_INTERPOSE(sysctlbyname_new, sysctlbyname);
 DYLD_INTERPOSE(LMGetBootDrive_new, LMGetBootDrive);
 DYLD_INTERPOSE(macws_CFURLCopyResourcePropertyValuesAndFlags,
                _CFURLCopyResourcePropertyValuesAndFlags);
 DYLD_INTERPOSE(macws_SecRequirementCreateWithString,
                SecRequirementCreateWithString);
+DYLD_INTERPOSE(macws_LSOpenFromURLSpec, LSOpenFromURLSpec);
 DYLD_INTERPOSE(__mac_syscall_new, __mac_syscall);
 DYLD_INTERPOSE(csr_get_active_config_new, csr_get_active_config);
 DYLD_INTERPOSE(sandbox_init_with_parameters_new, sandbox_init_with_parameters);
@@ -9628,6 +9789,8 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define EXTENSIONKIT_SERVICE_NEW  "com.apple.macosbooter.extensionkitservice"
 #define HISERVICES_SERVICE_ORIG "com.apple.hiservices-xpcservice"
 #define HISERVICES_SERVICE_NEW  "com.apple.macosbooter.hiservices-xpcservice"
+#define DOCK_HELPER_SERVICE_ORIG "com.apple.dock.helper"
+#define DOCK_HELPER_SERVICE_NEW  "com.apple.macosbooter.dock.helper"
 #define GEOD_XPC_SERVICE "com.apple.geod"
 #define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
 #define LOCATIOND_DESKTOP_AGENT_ORIG \
@@ -9733,6 +9896,10 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return "com.apple.macosbooter.iconservices";
     if (!strcmp(name, "com.apple.iconservices.store"))
         return "com.apple.macosbooter.iconservices.store";
+    if (!strcmp(name, "com.apple.carboncore.csnameddata"))
+        return "com.apple.macosbooter.carboncore.csnameddata";
+    if (!strcmp(name, DOCK_HELPER_SERVICE_ORIG))
+        return DOCK_HELPER_SERVICE_NEW;
     if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
         return "com.apple.macosbooter.lsd.advertisingidentifiers";
     if (!strcmp(name, "com.apple.lsd.diagnostics"))
@@ -10064,6 +10231,33 @@ xpc_connection_t macws_xpc_connection_create_early(
         return macws_xpc_connection_create_mach_service_raw(
             HISERVICES_SERVICE_NEW, targetq, 0);
     }
+    // CarbonCore resolves its named-data helper with xpc_connection_create,
+    // not the Mach-service constructor used by lsd/IconServices. Route this
+    // early static-interpose entry point explicitly so Dock cannot cache a
+    // failed public XPC-bundle lookup before Metal_hooks installs its broader
+    // runtime name mapper.
+    if (name && !strcmp(name, "com.apple.carboncore.csnameddata")) {
+        return macws_xpc_connection_create_mach_service_raw(
+            "com.apple.macosbooter.carboncore.csnameddata", targetq, 0);
+    }
+    // Dock's DockHelperConnection uses -[NSXPCConnection initWithServiceName:]
+    // for the embedded Application-type XPC bundle.  The custom root launchd
+    // domain cannot perform bundle activation, so route that one service-name
+    // constructor to the stock DockHelper listener published by
+    // macos_gui.sh.  RE-confirmed against Ventura Dock 2207.3: the real
+    // popupWithMenu:...withReply: call goes through this connection, and the
+    // missing reply leaves Dock's MenuGroup non-null so all later mouse events
+    // intentionally take the early-exit path.
+    if (name && !strcmp(name, DOCK_HELPER_SERVICE_ORIG)) {
+        // Preserve XPC bundle activation here. DockHelper is an Application
+        // service whose NSXPCListener main-queue contract is established by
+        // xpcproxy; treating it as a freestanding Mach service delivers the
+        // request but runs menu tracking on a worker after the true main
+        // thread has exited. The registered DockHelperProxy performs only the
+        // raw chroot+exec transition, so the stock service consumes the
+        // launchd-provided XPC context in the original task.
+        return xpc_connection_create(DOCK_HELPER_SERVICE_NEW, targetq);
+    }
     // Ventura's GeoServices client resolves geod as a per-user XPC service.
     // MacWS publishes the matching Ventura executable as a private launchd
     // Mach service because the public name is already owned by iPadOS geod.
@@ -10100,6 +10294,11 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
                strcmp(program, "com.apple.hiservices-xpcservice") == 0 &&
                service && strcmp(service, "com.macwsguide.hiservices") == 0) {
         privateMachService = HISERVICES_SERVICE_NEW;
+    } else if (program && strcmp(program, "csnameddatad") == 0 &&
+               service &&
+               strcmp(service, "com.macwsguide.csnameddatad") == 0) {
+        privateMachService =
+            "com.apple.macosbooter.carboncore.csnameddata";
     }
     if (privateMachService && getuid() == 0 && geteuid() == 0) {
         xpc_connection_t listener =
@@ -10116,6 +10315,25 @@ void macws_xpc_main(xpc_connection_handler_t handler) {
         }
     }
     macws_xpc_main_raw(handler);
+}
+
+__attribute__((constructor))
+static void macws_install_hiservices_xpc_main_import(void) {
+    const char *program = getprogname();
+    if (!program ||
+        strcmp(program, "com.apple.hiservices-xpcservice") != 0) return;
+
+    const struct mach_header *mainHeader = _dyld_get_image_header(0);
+    if (!mainHeader || mainHeader->magic != MH_MAGIC_64) return;
+    // Do not hook libxpc or suspend any threads here. Repair only the target
+    // executable's symbol-table-identified authenticated import before main
+    // reaches its single xpc_main call. This preserves the stock HIServices
+    // request handler and wire protocol while changing only the launch-context
+    // adapter required by the chroot proxy.
+    macws_repair_got_via_symtab(
+        (const struct mach_header_64 *)mainHeader,
+        _dyld_get_image_vmaddr_slide(0),
+        "com.apple.hiservices-xpcservice(main)");
 }
 DYLD_INTERPOSE(bootstrap_look_up_new, bootstrap_look_up);
 DYLD_INTERPOSE(bootstrap_check_in_new, bootstrap_check_in);
@@ -12106,6 +12324,142 @@ static void macws_install_quartzcore_frame_info_hook(
         "enable-tag-list=%p trampoline=%p callback=%p\n",
         target, g_macws_orig_enable_frame_info_tag_list,
         (void *)(g_macws_quartzcore_header + 0x29209c));
+}
+
+// Keep virtual-display pacing outside QuartzCore's display-server locks.
+//
+// RE-confirmed with project LLDB against the loaded macOS 13.4 QuartzCore
+// CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC on 2026-08-05:
+//
+//   IOMFBServer::begin_skylight_update  image+0x291288
+//     +28  pthread_mutex_lock(server+0x18)
+//     +36  pthread_mutex_lock(server+0x158)
+//
+//   IOMFBServer::finish_skylight_update image+0x291220
+//     +64  calls IOMFBDisplay::finish_skylight_update
+//           (its SwapEnd call is at image+0x2fdcc8)
+//     +76  pthread_mutex_unlock(server+0x158)
+//     +84  pthread_mutex_unlock(server+0x18)
+//
+//   IOMFBServer::vsync_callback          image+0x28f0fc
+//     +72  pthread_mutex_lock(server+0x158)
+//
+// Runtime sample `/tmp/ws-magnify.sample` placed 232/266 display-timer
+// samples in vsync_callback+76 waiting for that mutex while the updater was
+// in MacwsIOMobileFramebufferSwapEnd_new's poll.  The old synchronous wait
+// preserved bounded one-submit/one-completion ownership, but did so inside
+// both server locks.  Pace once immediately BEFORE begin acquires them.  The
+// finish wrapper only marks the exact dynamic scope in which SwapEnd must not
+// repeat that wait; cancellation and its one matching completion remain in
+// the original SwapEnd hook below.
+typedef uintptr_t (*MacwsIOMFBServerBeginSkylightUpdateFunction)(
+    void *server, void *update);
+typedef uintptr_t (*MacwsIOMFBServerFinishSkylightUpdateFunction)(
+    void *server, void *update, uint32_t flags, uint64_t seed);
+static MacwsIOMFBServerBeginSkylightUpdateFunction
+    g_macws_orig_iomfbserver_begin_skylight_update;
+static MacwsIOMFBServerFinishSkylightUpdateFunction
+    g_macws_orig_iomfbserver_finish_skylight_update;
+static _Thread_local unsigned g_macws_iomfbserver_finish_depth;
+
+static uintptr_t macws_iomfbserver_begin_skylight_update(
+    void *server, void *update) {
+    if (atomic_load_explicit(&g_macws_iomfb_coexist_swap_cancel,
+                             memory_order_acquire) &&
+        macws_cancel_completion_enabled()) {
+        uint32_t pace_us = macws_coexist_activity_pace_us(
+            macws_coexist_completion_pace_us());
+        uint32_t slept_us =
+            macws_coexist_wait_for_completion_slot(pace_us);
+        if (macws_runtime_diagnostics_enabled()) {
+            static _Atomic unsigned long paced_updates;
+            unsigned long sequence = atomic_fetch_add_explicit(
+                &paced_updates, 1, memory_order_relaxed) + 1;
+            if (sequence <= 4 || (sequence % 600) == 0) {
+                fprintf(stderr,
+                    "#### COEXIST pre-lock completion pace #%lu: "
+                    "interval=%u us slept=%u us server=%p\n",
+                    sequence, pace_us, slept_us, server);
+            }
+        }
+    }
+    return g_macws_orig_iomfbserver_begin_skylight_update(server, update);
+}
+
+static uintptr_t macws_iomfbserver_finish_skylight_update(
+    void *server, void *update, uint32_t flags, uint64_t seed) {
+    g_macws_iomfbserver_finish_depth++;
+    uintptr_t result = g_macws_orig_iomfbserver_finish_skylight_update(
+        server, update, flags, seed);
+    g_macws_iomfbserver_finish_depth--;
+    return result;
+}
+
+static void macws_install_quartzcore_coexist_pacing_hooks(
+    const struct mach_header *untyped_header) {
+    static const uint8_t expected_uuid[16] = {
+        0xcf, 0x85, 0x3b, 0xbd, 0x01, 0xb6, 0x3f, 0x46,
+        0xad, 0xa1, 0xec, 0x70, 0xfd, 0x2d, 0xc9, 0xdc,
+    };
+    static const uint32_t expected_finish_prologue[4] = {
+        0xd503237f, // pacibsp
+        0xa9be4ff4, // stp x20, x19, [sp, #-0x20]!
+        0xa9017bfd, // stp x29, x30, [sp, #0x10]
+        0x910043fd, // add x29, sp, #0x10
+    };
+    static const uint32_t expected_begin_prologue[4] = {
+        0xd503237f, // pacibsp
+        0xa9be4ff4, // stp x20, x19, [sp, #-0x20]!
+        0xa9017bfd, // stp x29, x30, [sp, #0x10]
+        0x910043fd, // add x29, sp, #0x10
+    };
+    enum {
+        kQuartzCoreIOMFBServerFinishSkylightUpdateOffset = 0x291220,
+        kQuartzCoreIOMFBServerBeginSkylightUpdateOffset = 0x291288,
+    };
+
+    static _Atomic int installed;
+    if (atomic_exchange_explicit(&installed, 1, memory_order_acq_rel)) return;
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!header || header->magic != MH_MAGIC_64 ||
+        !macws_macho_uuid_matches(header, expected_uuid)) {
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+
+    void *finish_target = (void *)((uintptr_t)header +
+        kQuartzCoreIOMFBServerFinishSkylightUpdateOffset);
+    void *begin_target = (void *)((uintptr_t)header +
+        kQuartzCoreIOMFBServerBeginSkylightUpdateOffset);
+    // Validate both endpoints before modifying either one. A partial install
+    // would pace before begin and then pace again inside SwapEnd.
+    if (memcmp(finish_target, expected_finish_prologue,
+               sizeof(expected_finish_prologue)) != 0 ||
+        memcmp(begin_target, expected_begin_prologue,
+               sizeof(expected_begin_prologue)) != 0) {
+        if (macws_runtime_diagnostics_enabled()) {
+            fprintf(stderr,
+                "#### COEXIST pre-lock pacing skipped: QuartzCore "
+                "begin/finish prologue mismatch\n");
+        }
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+
+    MSHookFunction(begin_target,
+        (void *)macws_iomfbserver_begin_skylight_update,
+        (void **)&g_macws_orig_iomfbserver_begin_skylight_update);
+    MSHookFunction(finish_target,
+        (void *)macws_iomfbserver_finish_skylight_update,
+        (void **)&g_macws_orig_iomfbserver_finish_skylight_update);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### COEXIST pre-lock pacing installed begin=%p/%p "
+            "finish=%p/%p\n",
+            begin_target, g_macws_orig_iomfbserver_begin_skylight_update,
+            finish_target, g_macws_orig_iomfbserver_finish_skylight_update);
+    }
 }
 
 static void macws_iomfb_complete_cancelled_swap(
@@ -16215,10 +16569,15 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
         // its one matching completion.  Pace against the preceding completion
         // timestamp so render work counts toward (rather than being added to)
         // the requested interval.
-        uint32_t pace_us = macws_coexist_activity_pace_us(
-            macws_coexist_completion_pace_us());
-        uint32_t slept_us =
-            macws_coexist_wait_for_completion_slot(pace_us);
+        BOOL paced_before_server_locks =
+            g_macws_iomfbserver_finish_depth != 0;
+        uint32_t pace_us = 0;
+        uint32_t slept_us = 0;
+        if (!paced_before_server_locks) {
+            pace_us = macws_coexist_activity_pace_us(
+                macws_coexist_completion_pace_us());
+            slept_us = macws_coexist_wait_for_completion_slot(pace_us);
+        }
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);
         macws_iomfb_complete_cancelled_swap(
@@ -16226,8 +16585,9 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
         if (sequence && sequence <= 4) {
             fprintf(stderr,
                 "#### COEXIST completion pace #%lu: interval=%u us "
-                "slept=%u us before swapID=%u\n",
-                sequence, pace_us, slept_us, swap_id);
+                "slept=%u us pre-lock=%s before swapID=%u\n",
+                sequence, pace_us, slept_us,
+                paced_before_server_locks ? "YES" : "NO", swap_id);
         }
     }
     return result;
@@ -16277,17 +16637,23 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
             // public hook out, this unpaced path delivered 4,200 completions
             // in a bounded run and kept WindowServer hot even at an intended
             // 100-ms idle pace.
-            uint32_t pace_us = macws_coexist_activity_pace_us(
-                macws_coexist_completion_pace_us());
-            uint32_t slept_us =
-                macws_coexist_wait_for_completion_slot(pace_us);
+            BOOL paced_before_server_locks =
+                g_macws_iomfbserver_finish_depth != 0;
+            uint32_t pace_us = 0;
+            uint32_t slept_us = 0;
+            if (!paced_before_server_locks) {
+                pace_us = macws_coexist_activity_pace_us(
+                    macws_coexist_completion_pace_us());
+                slept_us = macws_coexist_wait_for_completion_slot(pace_us);
+            }
             macws_iomfb_complete_cancelled_swap(
                 client, swap_id, requested_presentation_time);
             if (cancel_n && cancel_n <= 4) {
                 fprintf(stderr,
                     "#### COEXIST fallback completion pace #%lu: "
-                    "interval=%u us slept=%u us before swapID=%u\n",
-                    cancel_n, pace_us, slept_us, swap_id);
+                    "interval=%u us slept=%u us pre-lock=%s before swapID=%u\n",
+                    cancel_n, pace_us, slept_us,
+                    paced_before_server_locks ? "YES" : "NO", swap_id);
             }
         }
 

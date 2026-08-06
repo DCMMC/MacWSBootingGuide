@@ -100,6 +100,22 @@ enum {
     // stable identity for the gesture, and the phase reuses the scroll-phase
     // flag bits below. The wire record stays ABI-compatible at 84 bytes.
     MacWSInputKindMagnify = 19,
+    // One semantic macOS Space gesture produced only by the fullscreen
+    // workspace. contactID carries MacWSDesktopCommand. Vertical three-finger
+    // overview stays in Host because native Mission Control is unsafe in this
+    // headless WindowServer; only left/right reach an AppKit endpoint as the
+    // ordinary Control+Arrow shortcut.
+    MacWSInputKindDesktopCommand = 20,
+};
+
+typedef uint32_t MacWSDesktopCommand;
+enum {
+    // Reserved wire values from the diagnostic implementation. Validators
+    // reject them: Control+Up runtime-crashed WindowServer in MPS.
+    MacWSDesktopCommandMissionControl = 1,
+    MacWSDesktopCommandApplicationWindows = 2,
+    MacWSDesktopCommandSpaceLeft = 3,
+    MacWSDesktopCommandSpaceRight = 4,
 };
 
 typedef uint16_t MacWSHostInputMode;
@@ -150,6 +166,16 @@ enum {
     MacWSInputFlagEstimatedPressure = 1u << 2,
     MacWSInputFlagExpectingLocationUpdate = 1u << 3,
     MacWSInputFlagExpectingPressureUpdate = 1u << 4,
+    // UIKit's authoritative UITouch.tapCount says this atomic primary tap is
+    // the second member of a double click. The first tap is still delivered
+    // immediately, so ordinary single-click latency is unchanged.
+    MacWSInputFlagDoubleClick = 1u << 5,
+    // The fullscreen compositor resolved a real SkyLight layer that has no
+    // process-local AppInput endpoint (Dock/system surfaces are the common
+    // cases). Coordinates remain in the complete desktop framebuffer.
+    // targetPID + encoded window name the real owner; the broker must
+    // independently confirm that exact frontmost hit before posting to it.
+    MacWSInputFlagGlobalSystemSurface = 1u << 6,
     // The producer has already accepted the release velocity and will follow
     // this finger ScrollEnded record with a momentum Began sequence. The AppKit
     // endpoint keeps its native per-window scroll target latched across that

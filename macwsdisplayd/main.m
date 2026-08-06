@@ -51,6 +51,13 @@ static BOOL TransientReconcilePending;
 // therefore supersede the slow correctness poll already queued for 100/250ms
 // instead of being rejected by its pending bit.
 static uint64_t TransientReconcileGeneration;
+// A completed semantic pointer click is an authoritative catalog edge: the
+// target process emits it only after AppKit's synchronous control/menu tracker
+// has returned.  Keep two independent post-click CGWindow snapshots (one
+// display interval apart) so a genuinely dismissed popup disappears promptly,
+// while the ordinary recovery poll retains its more conservative three-miss
+// policy for uncorrelated catalog churn.
+static unsigned UrgentTransientRetirePasses;
 static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
@@ -556,6 +563,7 @@ static void StartInvalidationListener(void) {
     dispatch_source_set_event_handler(InvalidationSource, ^{
         uint8_t bytes[128];
         BOOL geometryChanged = NO;
+        BOOL semanticPointerClickCompleted = NO;
         ssize_t count = 0;
         while ((count = recv(InvalidationSocket, bytes,
                              sizeof(bytes), 0)) > 0) {
@@ -574,9 +582,13 @@ static void StartInvalidationListener(void) {
             } else {
                 for (ssize_t index = 0; index < count; index++) {
                     if (bytes[index] == 'g') geometryChanged = YES;
+                    if (bytes[index] == 't')
+                        semanticPointerClickCompleted = YES;
                 }
             }
         }
+        if (semanticPointerClickCompleted)
+            UrgentTransientRetirePasses = 10;
         ScheduleCatalogBroadcast();
         if (geometryChanged) ScheduleGeometryStreamRestart();
     });
@@ -724,7 +736,12 @@ static void PublishFrame(MacWSDisplayClient *client,
         .streamID = producerStreamID,
         .windowID = client.windowID,
         .flags = MacWSStreamFrameComplete |
-                 (layer ? MacWSStreamFrameOverlay : 0),
+                 (layer ? MacWSStreamFrameOverlay : 0) |
+                 (layer && [layer.ownerName isEqualToString:@"Dock"]
+                     ? MacWSStreamFrameGlobalSystemSurface : 0) |
+                 (layer && layer.skyLightLayer >=
+                      CGWindowLevelForKey(kCGCursorWindowLevelKey)
+                     ? MacWSStreamFrameInputPassthrough : 0),
         .leaseToken = lease.token,
         .sequence = layer ? ++layer.sequence : ++client.sequence,
         .displayTime = displayTime,
@@ -749,9 +766,12 @@ static void PublishFrame(MacWSDisplayClient *client,
         if (layer) layer.firstDisplayTime = displayTime;
         else client.firstDisplayTime = displayTime;
         DisplayLog(@"frame-first stream=%llu window=%u layer=%u overlay=%s "
-                   "surface=%ux%u bpr=%u pf=%08x destination=(%d,%d %ux%u)",
+                   "owner=%@ owner-pid=%d flags=%#x surface=%ux%u bpr=%u "
+                   "pf=%08x destination=(%d,%d %ux%u)",
             (unsigned long long)producerStreamID, client.windowID,
             layerWindowID, layer ? "YES" : "NO",
+            layer.ownerName ?: @"", descriptor.layerOwnerPID,
+            descriptor.flags,
             descriptor.width, descriptor.height, descriptor.bytesPerRow,
             descriptor.pixelFormat, descriptor.destinationX,
             descriptor.destinationY, descriptor.destinationWidth,
@@ -1285,10 +1305,15 @@ static void StartSubscription(MacWSDisplayClient *client,
 // restart is involved.
 static void ReconcileTransientStreams(void) {
     TransientReconcilePending = NO;
+    BOOL urgentRetireConfirmation = UrgentTransientRetirePasses > 0;
+    if (UrgentTransientRetirePasses > 0) UrgentTransientRetirePasses--;
     NSArray<NSDictionary *> *windowInfo = CopyOnScreenWindowInfo();
     NSArray<NSDictionary *> *desktopInfo = nil;
     BOOL needsFollowup = NO;
+    BOOL windowMissingLayerNeedsConfirmation = NO;
     BOOL workspaceNeedsFollowup = NO;
+    BOOL workspaceMissingLayerNeedsConfirmation = NO;
+    BOOL urgentPopupPresent = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
         if (!client.subscriptionActive || client.deliveryPaused) continue;
         if (client.mode == MacWSStreamModeFullscreen) {
@@ -1337,6 +1362,11 @@ static void ReconcileTransientStreams(void) {
                     !CGRectIntersectsRect(desktopBounds, candidateBounds))
                     continue;
                 NSNumber *key = @(candidateWindowID);
+                // A compositor layer is identified by its CGWindow ID.  Even
+                // if SkyLight momentarily exposes the same ID more than once
+                // while rebuilding the desktop list, it must still own only
+                // one capture stream in this reconciliation transaction.
+                if ([seen containsObject:key]) continue;
                 [seen addObject:key];
                 attached++;
                 MacWSTransientLayer *layer = client.transientLayers[key];
@@ -1363,12 +1393,32 @@ static void ReconcileTransientStreams(void) {
                 layer.windowName = [windowName isKindOfClass:NSString.class]
                     ? windowName : @"";
                 layer.skyLightLayer = [info[(id)kCGWindowLayer] integerValue];
+                if (urgentRetireConfirmation &&
+                    layer.skyLightLayer >=
+                        CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) &&
+                    layer.skyLightLayer <
+                        CGWindowLevelForKey(kCGCursorWindowLevelKey))
+                    urgentPopupPresent = YES;
                 BOOL desiredOneShot = layer.skyLightLayer < 0 &&
                     CGRectContainsRect(candidateBounds, desktopBounds) &&
                     candidateWindowID != frontmostInteractiveDesktopWindowID;
-                BOOL capturePolicyChanged = !isNew &&
-                    layer.oneShotCapture != desiredOneShot;
-                layer.oneShotCapture = desiredOneShot;
+                // Bind capture lifetime to the window identity that created
+                // it, not to a later catalog rank.  During cold desktop
+                // bootstrap the WindowServer backing, Dock wallpaper and
+                // Finder desktop appear in separate snapshots; the previous
+                // code reclassified the old full-screen layer each time a
+                // more-front negative layer arrived, synchronously stopping
+                // and recreating the same CGWindow stream.  Runtime logs on
+                // 2026-08-06 prove window 2 was restarted as streams 3 -> 5
+                // and window 4 as streams 4 -> 13 during one cold recovery.
+                // Separately, launchd records the preceding WindowServer's
+                // last exit as OS_REASON_COREANIMATION; the duplicate starts
+                // are not claimed as that abort's cause, but they directly
+                // violate the one-window/one-stream invariant. A window's
+                // immutable first-seen policy restores that invariant.
+                // Retirement and a genuinely new ID still create a fresh
+                // policy.
+                if (isNew) layer.oneShotCapture = desiredOneShot;
                 // CGWindowList is front-to-back. Host draws ascending levels,
                 // so reverse that rank and preserve the actual desktop z-order
                 // even when several ordinary windows all report layer zero.
@@ -1386,10 +1436,7 @@ static void ReconcileTransientStreams(void) {
                 layer.level = newLevel;
                 layer.destinationBounds = newDestination;
                 layer.missCount = 0;
-                if (capturePolicyChanged) {
-                    layer.snapshotComplete = NO;
-                    StartTransientLayer(layer);
-                } else if (isNew ||
+                if (isNew ||
                            (!layer.stream &&
                             !(layer.oneShotCapture &&
                               layer.snapshotComplete))) {
@@ -1410,7 +1457,18 @@ static void ReconcileTransientStreams(void) {
                 if ([seen containsObject:key]) continue;
                 if (layer.retiring) continue;
                 layer.missCount++;
-                if (layer.missCount < 2) continue;
+                if (layer.missCount < 2) {
+                    // A native popup can disappear between two AppKit
+                    // catalog notifications. Confirm the first miss on the
+                    // next display interval instead of waiting for the 1 s
+                    // idle recovery poll; otherwise the already-closed menu
+                    // remains visibly composited as a translucent ghost.
+                    // Two independent CGWindow snapshots remain required, so
+                    // a one-sample catalog transition cannot detach a live
+                    // window.
+                    workspaceMissingLayerNeedsConfirmation = YES;
+                    continue;
+                }
                 DisplayLog(@"workspace-layer-remove layer=%u",
                            layer.windowID);
                 SendLayerRemoved(client, layer.windowID);
@@ -1504,6 +1562,12 @@ static void ReconcileTransientStreams(void) {
             layer.windowName = [windowName isKindOfClass:NSString.class]
                 ? windowName : @"";
             layer.skyLightLayer = level;
+            if (urgentRetireConfirmation &&
+                layer.skyLightLayer >=
+                    CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) &&
+                layer.skyLightLayer <
+                    CGWindowLevelForKey(kCGCursorWindowLevelKey))
+                urgentPopupPresent = YES;
             // An AppKit sheet can be a level-0 SkyLight window even though it
             // belongs above its presenting document. The metrics sidecar is
             // the owning process's authoritative relationship; assign only
@@ -1521,10 +1585,19 @@ static void ReconcileTransientStreams(void) {
             if ([seen containsObject:key]) continue;
             if (layer.retiring) continue;
             // A transient can briefly disappear from the on-screen catalog
-            // while AppKit swaps its selection/shadow surface. Three misses
-            // bound detach latency to 300 ms without a one-sample flicker.
+            // while AppKit swaps its selection/shadow surface. Ordinary
+            // recovery polling still requires three misses. A completed
+            // semantic click is stronger evidence, but still requires two
+            // independent snapshots; confirm its first miss on the next
+            // display interval instead of leaving a closed translucent menu
+            // visible until the 250 ms recovery poll runs twice.
             layer.missCount++;
-            if (layer.missCount < 3) continue;
+            unsigned requiredMisses = urgentRetireConfirmation ? 2 : 3;
+            if (layer.missCount < requiredMisses) {
+                if (urgentRetireConfirmation)
+                    windowMissingLayerNeedsConfirmation = YES;
+                continue;
+            }
             DisplayLog(@"layer-remove base=%u layer=%u",
                        client.windowID, layer.windowID);
             SendLayerRemoved(client, layer.windowID);
@@ -1538,7 +1611,13 @@ static void ReconcileTransientStreams(void) {
         // 16ms. The periodic pass is only a recovery net for non-AppKit system
         // producers, so an idle fullscreen desktop no longer scans four times
         // per second.
-        ScheduleTransientReconcile((workspaceNeedsFollowup ? 1000 : 250) *
+        ScheduleTransientReconcile(((workspaceMissingLayerNeedsConfirmation ||
+                                      windowMissingLayerNeedsConfirmation)
+                                        ? 16
+                                        : (urgentPopupPresent &&
+                                           UrgentTransientRetirePasses > 0)
+                                            ? 50
+                                            : (workspaceNeedsFollowup ? 1000 : 250)) *
                                    NSEC_PER_MSEC);
 }
 

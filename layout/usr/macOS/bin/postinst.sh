@@ -1,5 +1,9 @@
 cd $(realpath $HOME/../..)/usr/macOS
 
+# Invalidate the same-bootsession Settings ExtensionKit verification cache
+# before an installation can replace any of its signed runtime dependencies.
+rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
+
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 CFPREFSD_ENT="/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist"
 EXTENSIONKIT_ENT="/var/jb/usr/macOS/bin/extensionkitservice-entitlements.plist"
@@ -530,12 +534,14 @@ fi
 VIEWBRIDGE_PROXY_EXEC="$VIEWBRIDGE_PROXY/ViewBridgeAuxiliary"
 HISERVICES_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy"
 OPEN_SAVE_PANEL_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy"
+DOCK_HELPER_PROXY_EXEC="/var/jb/usr/macOS/Frameworks/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc/DockHelperProxy"
 GEOD_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy"
 WRITE_CONFIG_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/SystemAdministration.framework/XPCServices/WriteConfigProxy.xpc/WriteConfigProxy"
 LOCATIOND_PROXY_EXEC="/var/jb/usr/macOS/PrivateFrameworks/CoreLocation.framework/XPCServices/LocationdProxy.xpc/LocationdProxy"
 add_all_trustcache "$VIEWBRIDGE_PROXY_EXEC"
 add_all_trustcache "$HISERVICES_PROXY_EXEC"
 add_all_trustcache "$OPEN_SAVE_PANEL_PROXY_EXEC"
+add_all_trustcache "$DOCK_HELPER_PROXY_EXEC"
 add_all_trustcache "$GEOD_PROXY_EXEC"
 add_all_trustcache "$WRITE_CONFIG_PROXY_EXEC"
 add_all_trustcache "$LOCATIOND_PROXY_EXEC"
@@ -553,6 +559,7 @@ for proxy in \
     "$VIEWBRIDGE_PROXY_EXEC" \
     "$HISERVICES_PROXY_EXEC" \
     "$OPEN_SAVE_PANEL_PROXY_EXEC" \
+    "$DOCK_HELPER_PROXY_EXEC" \
     "$EXTENSIONKIT_PROXY" \
     "$GEOD_PROXY_EXEC" \
     "$WRITE_CONFIG_PROXY_EXEC" \
@@ -764,6 +771,8 @@ for workspace_binary in \
     '/var/mnt/rootfs/System/Library/CoreServices/iconservicesd' \
     '/var/mnt/rootfs/System/Library/CoreServices/iconservicesagent' \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock' \
+    '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper' \
+    '/var/mnt/rootfs/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad' \
     '/var/mnt/rootfs/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer' \
     '/var/mnt/rootfs/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter' \
     '/var/mnt/rootfs/System/Applications/Launchpad.app/Contents/MacOS/Launchpad'; do

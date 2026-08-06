@@ -6,6 +6,7 @@ HOSTD_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.hostd.plist
 VIEWBRIDGE_PROXY=/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary
 HISERVICES_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
 OPEN_SAVE_PANEL_PROXY=/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy
+DOCK_HELPER_PROXY=/var/jb/usr/macOS/Frameworks/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc/DockHelperProxy
 EXTENSIONKIT_PROXY=/var/jb/usr/macOS/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc/ExtensionKitProxy
 GEOD_PROXY=/var/jb/usr/macOS/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/GeodProxy.xpc/GeodProxy
 WRITE_CONFIG_PROXY=/var/jb/usr/macOS/PrivateFrameworks/SystemAdministration.framework/XPCServices/WriteConfigProxy.xpc/WriteConfigProxy
@@ -28,6 +29,10 @@ INTEROP_LOCATION_ENTITLEMENTS=/var/jb/usr/macOS/bin/interop-location-entitlement
 CODE_REQUIREMENT_WRITER=/var/jb/usr/macOS/bin/write_code_requirement.py
 LIPO=/var/jb/usr/bin/lipo
 ROOTFS=/var/mnt/rootfs
+
+# A package install may replace libmachook or an ExtensionKit carrier.  Force
+# the next launch through the deep verifier before allowing the boot cache.
+rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
 
 # Theos builds libmachook for iOS and the chroot's macOS dyld rejects that
 # LC_BUILD_VERSION. This used to be a mandatory SSH-only step after every
@@ -155,6 +160,7 @@ ensure_interop_signature() {
 trust_installed_macho "$VIEWBRIDGE_PROXY"
 trust_installed_macho "$HISERVICES_PROXY"
 trust_installed_macho "$OPEN_SAVE_PANEL_PROXY"
+trust_installed_macho "$DOCK_HELPER_PROXY"
 trust_installed_macho "$EXTENSIONKIT_PROXY"
 trust_installed_macho "$GEOD_PROXY"
 trust_installed_macho "$WRITE_CONFIG_PROXY"
@@ -404,6 +410,10 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem" || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" || exit 1
+    ensure_chroot_application_signature \
+        "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" || exit 1
+    ensure_chroot_application_signature \
+        "$ROOTFS/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad" || exit 1
     ensure_chroot_extensionkit_signature \
         "$ROOTFS/System/Library/Frameworks/ExtensionFoundation.framework/Versions/A/XPCServices/extensionkitservice.xpc/Contents/MacOS/extensionkitservice" || exit 1
     ensure_chroot_appearance_signature \
@@ -482,6 +492,7 @@ for proxy in \
     "$VIEWBRIDGE_PROXY" \
     "$HISERVICES_PROXY" \
     "$OPEN_SAVE_PANEL_PROXY" \
+    "$DOCK_HELPER_PROXY" \
     "$EXTENSIONKIT_PROXY" \
     "$GEOD_PROXY" \
     "$WRITE_CONFIG_PROXY" \

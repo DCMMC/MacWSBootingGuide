@@ -11,14 +11,14 @@
 // small subset of libxpc.  Keep this witness buildable on-device without
 // weakening its reply validation; the symbols below are exported by the
 // platform libxpc and are present in Apple's complete SDK headers.
-#ifndef XPC_TYPE_DICTIONARY
 extern const struct _xpc_type_s _xpc_type_dictionary;
+#ifndef XPC_TYPE_DICTIONARY
 #define XPC_TYPE_DICTIONARY (&_xpc_type_dictionary)
+#endif
 xpc_type_t xpc_get_type(xpc_object_t object);
 char *xpc_copy_description(xpc_object_t object);
 bool xpc_dictionary_get_bool(xpc_object_t dictionary, const char *key);
 int64_t xpc_dictionary_get_int64(xpc_object_t dictionary, const char *key);
-#endif
 
 // Minimal on-device witness for the typed MacWS Host control service.  This
 // deliberately exposes only the same fixed operations as the public protocol;
@@ -51,6 +51,14 @@ int main(int argc, const char *argv[]) {
             return 64;
         }
         xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_APP_ID, argv[2]);
+    } else if (strcmp(operation, MACWS_CONTROL_OP_LAUNCH_PATH) == 0) {
+        if (argc != 3) {
+            fprintf(stderr,
+                    "usage: macws_control_probe launch-path /absolute/App.app\n");
+            return 64;
+        }
+        xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_APP_PATH,
+                                  argv[2]);
     }
 
     xpc_object_t reply = xpc_connection_send_message_with_reply_sync(

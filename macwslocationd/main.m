@@ -20,6 +20,14 @@
 
 #include "macws_interop_protocol.h"
 
+// Procursus' reduced iPhoneOS16.5 xpc.h omits this public libxpc entry point
+// even though the runtime exports it.  Keep the signed scalar wire type used
+// by the Ventura receiver; substituting set_uint64 would change the XPC type
+// and make xpc_dictionary_get_int64 return its missing/wrong-type value.
+extern void xpc_dictionary_set_int64(xpc_object_t dictionary,
+                                     const char *key,
+                                     int64_t value);
+
 static NSString *const MacWSEffectiveLocationClient =
     @"com.macwsguide.host";
 
