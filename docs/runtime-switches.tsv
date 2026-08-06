@@ -24,7 +24,7 @@ env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 t
 env	MACWS_IOS_NV12_TEXTURE_PROBE	off	standalone probe	Creates native iOS R8/RG8 views of a 420v surface and dumps their AGX descriptors without GPU submission.
 env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
-env	MACWS_CATALOG_REGISTRATION	off; one-shot=1	macwsworkspacectl register-settings-extensions	Enables the chroot mount-namespace model only for the short-lived stock LaunchServices registration of all standalone System Settings extensions; never persisted in a launchd plist.
+env	MACWS_CATALOG_REGISTRATION	off	macwsworkspacectl register-settings-extensions	Production launch plists keep this unset; the catalog transaction sets it to 1 only for the short-lived stock registration of all standalone System Settings extensions.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
@@ -78,6 +78,9 @@ env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome	Chromium MAP_JIT/W^X compatibili
 env	MACWS_JIT_FAULT_WRITE_COMPAT	on	VS Code	Page-granular V8 W^X adapter; only faulted 16-KiB writer pages become RW before RX restore.
 env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace.
 env	MACWS_LAUNCHPAD_TRACE	off	diagnostic	Dock-only Launchpad source validation/bring-up/rescan trace; never enable in production.
+env	MACWS_LOCATIOND_MIG_TRACE	off	diagnostic	Bounded 256-record locationd dispatch-MIG receive/demux trace; production leaves the native callback unchanged.
+env	MACWS_LSD_ROLE	auto	private LaunchServices daemons	Explicitly selects the system-store or session-catalog endpoint family; ordinary GUI clients leave it unset and use the session family.
+env	MACWS_LSD_SESSION_USER_DIR	auto	private LaunchServices session daemon	Absolute isolated Darwin user directory used only by the MACWS_LSD_ROLE=session daemon so it cannot clean the system daemon's csstore.
 env	MACWS_CATALYST_REGISTER_APPLICATION	on	Maps UIKit carrier child	Completes Maps' stock UIKitServices application-support handshake; UIKitSystem validates the real child audit token and complete exec generation before FrontBoard registration.
 env	MACWS_CATALYST_REQUEST_INITIAL_SCENE	on	Maps UIKit carrier child	Requests Maps' initial UIKitMac scene after the validated UIKitServices registration; set only by MacWSCatalystLauncher, not globally.
 env	MACWS_CATALYST_TRACE	off	Catalyst diagnostic	Emits verbose UIKitMac/FuseBoard lifecycle inventories; never enable in production.
@@ -136,6 +139,7 @@ env	MACWS_XPC_NAME_TRACE	off	diagnostic	Bounded allocation-free cold-start recor
 env	NSRunningFromLaunchd	on	pbs	Matches the real macOS Services daemon launch contract.
 env	PATH	auto	chroot launcher	Explicit standard chroot executable search path.
 env	PINPROBE_HOLD_BEFORE_PIN	off	standalone probe	Holds PinnedVAProbe before pinning for debugger attachment.
+env	MACWS_PROBE_CAN_MONITOR_WIFI	off	standalone MapKit probe	Requests MKLocationManager setCanMonitorWiFiStatus:YES before singleton creation only for an explicit probe A/B; never set by production.
 env	REDWIN_DELAY	off	standalone probe	Delays the red-window rendering probe.
 env	REDWIN_LOOP	off	standalone probe	Keeps the red-window rendering probe repainting.
 env	RBS_DISASM_ONLY	off	standalone RunningBoard probe	Stops after locating the exact encodeForJob implementation for disassembly.
@@ -206,6 +210,11 @@ flag	/private/tmp/macws_xpc_proxy_trace	off	XPC proxy diagnostic	Logs the real p
 state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion interval, currently 100000 us.
 state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
 state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.
+state	/var/jb/var/mobile/.macos_gui.transaction	transient	GUI lifecycle transaction	Atomic mkdir lock with exact owner PID; overlapping start, restart, and stop operations return 75, while an ownerless stale lock is recoverable.
+state	/var/jb/var/mobile/macos_gui_start.state	transient	GUI lifecycle transaction	Atomically replaced schema, PID, operation, mode, phase, timestamps, and detail consumed by the Host UI without parsing logs.
+state	/var/jb/var/mobile/macws-settings-runtime.boot-ready	auto	System Settings cold start	Current-bootsession and dependency-hash witness; never sufficient without the unchanged deep verifier.
+state	/var/jb/var/mobile/macws-settings-runtime.trust-hashes	auto	System Settings cold start	Persistent verified CDHash manifest used to restore only the reboot-volatile dynamic trustcache entries before 48-pane verification.
+state	/var/db/macws/launchservices-catalog.ready	auto	LaunchServices cold start	Schema and rootfs source fingerprint marker accepted only after live application and 48-pane record verification; inactive records are reactivated through stock registrars.
 state	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded	transient	SpringBoard windowing	Loaded-code witness. Production Host requires v6 with fullscreen=exact-scene-keyboard-action-11 and resize=app-layout-transaction before sending private layout requests.
 request	/var/mobile/Library/Preferences/com.macwsguide.windowing.fullscreen-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene fullscreen request; SpringBoard deletes it after performing or rejecting system keyboard action 11.
 request	/var/mobile/Library/Preferences/com.macwsguide.windowing.resize-request.<UUID>.plist	transient	MacWSHost to SpringBoard	15-second exact-FBS-scene preferred-size request; SpringBoard deletes it after the immutable app-layout transaction succeeds or fails.

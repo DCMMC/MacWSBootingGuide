@@ -10796,13 +10796,15 @@ static void macws_install_data_library_compatibility(Class agx) {
     }
 }
 
-// Ventura QuartzCore's desktop-window-effects pipeline specializes these two
-// exact fixed-function shaders successfully, then the iOS AGX driver rejects
-// the resulting macOS-target AIR at pipeline creation with
-// "Target OS is incompatible".  The package generates a byte-validated
-// secondary library from the device's own Ventura default.metallib: only these
-// two AIR modules receive a macabi target triple; all other module bytes and
-// every public function signature remain unchanged.
+// Ventura QuartzCore's desktop-window-effects pipeline specializes its fixed
+// shaders successfully, then the iOS AGX driver rejects the resulting
+// macOS-target AIR at pipeline creation with "Target OS is incompatible".
+// The same rejection occurs on the first Terminal generation for the
+// unspecialized path_blit_vert_lph + attachment_clear_frag_lph pair.  The
+// package generates a byte-validated secondary library from the device's own
+// Ventura default.metallib: only these five runtime-confirmed AIR modules
+// receive a macabi target triple; all other module bytes and every public
+// function signature remain unchanged.
 //
 // Do not replace QuartzCore's default library.  A mixed-target MTLB used as the
 // process-wide default makes unrelated early CoreAnimation pipelines fail.
@@ -10843,9 +10845,9 @@ static macws_function_specialize_async_fn
 static const char *kMacWSQCDesktopLibraryPath =
     "/usr/local/share/macws/quartzcore/"
     "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1044688;
+static const size_t kMacWSQCDesktopLibraryBytes = 1045424;
 static const uint64_t kMacWSQCDesktopLibraryHash =
-    UINT64_C(0xa1f2f4bab5c812cd);
+    UINT64_C(0x7c844f46e7610242);
 static const char *kMacWSSkyLightDesktopLibraryPath =
     "/usr/local/share/macws/skylight/"
     "SkyLightShaders-desktop-effects-macabi.metallib";
@@ -10862,7 +10864,17 @@ static const uint64_t kMacWSMPSImageDesktopLibraryHash =
 static BOOL macws_qc_desktop_function_name(NSString *name) {
     return [name isEqualToString:@"fixed_vert_lph_spc"] ||
            [name isEqualToString:@"fixed_vert_lph_gen"] ||
-           [name isEqualToString:@"fixed_frag_lph_cpf"];
+           [name isEqualToString:@"fixed_frag_lph_cpf"] ||
+           [name isEqualToString:@"path_blit_vert_lph"] ||
+           [name isEqualToString:@"attachment_clear_frag_lph"];
+}
+
+static BOOL macws_qc_desktop_base_function_name(NSString *name) {
+    // RE-confirmed from the exact Ventura 13.4 AIR modules: neither function
+    // contains function-constant metadata.  CoreAnimation requests both as
+    // ordinary base functions before building spec Pw40aXm_TatcA2S1Xhf.
+    return [name isEqualToString:@"path_blit_vert_lph"] ||
+           [name isEqualToString:@"attachment_clear_frag_lph"];
 }
 
 static BOOL macws_skylight_desktop_function_name(NSString *name) {
@@ -11017,6 +11029,7 @@ static id macws_skylight_function_compat(
     // QuartzCore's fixed_* functions are intentionally excluded because all
     // three require specialization.
     BOOL base_function_target =
+        macws_qc_desktop_base_function_name(name) ||
         macws_skylight_desktop_function_name(name) ||
         macws_mpsimage_desktop_function_name(name);
     id<MTLLibrary> library = base_function_target
@@ -12151,6 +12164,39 @@ static const char *macws_settings_extension_endpoint_name(
 // chroot client opened iOS's container csstore, whose Bundle table was empty,
 // instead of a macOS database. Both chroot server listeners (flags=0x1) and
 // clients enter this hook, so isolate their names symmetrically.
+static const char *macws_private_lsd_service_name(const char *name) {
+    if (!name) return name;
+    static const char lsdPrefix[] = "com.apple.lsd.";
+    BOOL isLsdService = !strncmp(name, lsdPrefix, sizeof(lsdPrefix) - 1);
+    BOOL isTranslocation = !strcmp(name, "com.apple.security.translocation");
+    if (!isLsdService && !isTranslocation) return name;
+
+    // Ventura publishes two lsd jobs in different bootstrap domains.  The
+    // system daemon owns the durable store and the session agent owns the
+    // application-facing catalog.  iPadOS gives MacWS only one usable launchd
+    // domain, so preserve that split with two private name families.  The
+    // session agent is the sole client of the system dissemination/encryption
+    // endpoints; ordinary GUI clients always stay on the session family.
+    const char *role = getenv("MACWS_LSD_ROLE");
+    BOOL systemFamily = role && !strcmp(role, "system");
+    const char *suffix = isLsdService
+        ? name + sizeof(lsdPrefix) - 1 : "security.translocation";
+    if (role && !strcmp(role, "session") &&
+        (!strcmp(suffix, "dissemination") || !strcmp(suffix, "encryption")))
+        systemFamily = YES;
+    if (isTranslocation && !systemFamily)
+        return "com.apple.macosbooter.security.translocation";
+
+    static __thread char rewritten[192];
+    int length = snprintf(rewritten, sizeof(rewritten),
+                          systemFamily
+                              ? "com.apple.macosbooter.lsd.system.%s"
+                              : "com.apple.macosbooter.lsd.%s",
+                          suffix);
+    return length > 0 && (size_t)length < sizeof(rewritten)
+        ? rewritten : name;
+}
+
 static const char *macws_private_chroot_service_name(const char *name) {
     if (!name) return name;
     // RunningBoard names the launchd endpoints from the registered iOS first
@@ -12182,32 +12228,8 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.carboncore.csnameddata";
     if (!strcmp(name, "com.apple.dock.helper"))
         return "com.apple.macosbooter.dock.helper";
-    if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
-        return "com.apple.macosbooter.lsd.advertisingidentifiers";
-    if (!strcmp(name, "com.apple.lsd.diagnostics"))
-        return "com.apple.macosbooter.lsd.diagnostics";
-    if (!strcmp(name, "com.apple.lsd.dissemination"))
-        return "com.apple.macosbooter.lsd.dissemination";
-    if (!strcmp(name, "com.apple.lsd.encryption"))
-        return "com.apple.macosbooter.lsd.encryption";
-    if (!strcmp(name, "com.apple.lsd.extensions"))
-        return "com.apple.macosbooter.lsd.extensions";
-    if (!strcmp(name, "com.apple.lsd.mapdb"))
-        return "com.apple.macosbooter.lsd.mapdb";
-    if (!strcmp(name, "com.apple.lsd.modifydb"))
-        return "com.apple.macosbooter.lsd.modifydb";
-    if (!strcmp(name, "com.apple.lsd.open"))
-        return "com.apple.macosbooter.lsd.open";
-    if (!strcmp(name, "com.apple.lsd.openurl"))
-        return "com.apple.macosbooter.lsd.openurl";
-    if (!strcmp(name, "com.apple.lsd.personaobserver"))
-        return "com.apple.macosbooter.lsd.personaobserver";
-    if (!strcmp(name, "com.apple.lsd.plugin"))
-        return "com.apple.macosbooter.lsd.plugin";
-    if (!strcmp(name, "com.apple.lsd.trustedsignatures"))
-        return "com.apple.macosbooter.lsd.trustedsignatures";
-    if (!strcmp(name, "com.apple.security.translocation"))
-        return "com.apple.macosbooter.security.translocation";
+    const char *lsdEndpoint = macws_private_lsd_service_name(name);
+    if (lsdEndpoint != name) return lsdEndpoint;
     if (!strcmp(name, "com.apple.locationd.desktop.agent"))
         return "com.apple.macosbooter.locationd.desktop.agent";
     if (!strcmp(name, "com.apple.locationd.desktop.registration"))

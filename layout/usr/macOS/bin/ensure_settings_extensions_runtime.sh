@@ -20,6 +20,7 @@ BASE_CARRIER_APP=/var/jb/Applications/SettingsExtensionProxy.app
 BASE_CARRIER_EXECUTABLE="$BASE_CARRIER_APP/SettingsExtensionProxy"
 CARRIER_ENTITLEMENTS="/tmp/macws-settings-carrier-entitlements.$$"
 BOOT_READY_MARKER=/var/jb/var/mobile/macws-settings-runtime.boot-ready
+TRUST_MANIFEST=/var/jb/var/mobile/macws-settings-runtime.trust-hashes
 SYSCTL=/var/jb/usr/sbin/sysctl
 UICACHE_LIST=""
 TRUSTCACHE_INFO=""
@@ -96,6 +97,51 @@ ensure_trust_hash() {
     TRUSTCACHE_INFO="${TRUSTCACHE_INFO}
 $hash"
 }
+
+restore_runtime_trust_manifest() {
+    local manifest_fingerprint hash restored=0
+    [ -f "$TRUST_MANIFEST" ] || return 0
+    manifest_fingerprint=$(sed -n '1p' "$TRUST_MANIFEST" 2>/dev/null)
+    [ "$manifest_fingerprint" = "$RUNTIME_BASE_FINGERPRINT" ] || return 0
+    while IFS= read -r hash; do
+        [ -n "$hash" ] || continue
+        if ! printf '%s\n' "$TRUSTCACHE_INFO" | grep -Fiq "$hash"; then
+            $JBCTL trustcache add "$hash" >/dev/null 2>&1 || return 1
+            TRUSTCACHE_INFO="${TRUSTCACHE_INFO}
+$hash"
+            restored=$((restored + 1))
+        fi
+    done < <(sed -n '2,$p' "$TRUST_MANIFEST" 2>/dev/null)
+    echo "[INFO] Settings runtime trust manifest restored: $restored"
+}
+
+write_runtime_trust_manifest() {
+    local temporary="${TRUST_MANIFEST}.new-$$" marker=""
+    {
+        printf '%s\n' "$RUNTIME_BASE_FINGERPRINT"
+        for marker in "$EXTENSIONS_ROOT"/*.appex/Contents/Frameworks/.macws-settings-runtime; do
+            [ -f "$marker" ] || continue
+            awk -F'|' '{ for (field = 5; field <= 9; field++) if ($field != "") print $field }' \
+                "$marker"
+        done | sort -u
+    } > "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    chmod 0644 "$temporary" || return 1
+    mv -f "$temporary" "$TRUST_MANIFEST"
+}
+
+# The dynamic trustcache is recreated after a device boot.  Re-add only the
+# exact CDHashes recorded by the previous full 48-pane verification, then run
+# the unchanged deep verifier below.  This turns cold-boot recovery into a
+# bounded trust restore instead of re-signing/copying every pane and carrier.
+if [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; then
+    restore_runtime_trust_manifest || {
+        echo '[ERROR] Settings runtime trust manifest restore failed' >&2
+        exit 1
+    }
+fi
 
 trust_macho() {
     local path="$1" arch hash
@@ -382,6 +428,10 @@ prepared_count=0
 if [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; then
     verify_current_runtime || {
         echo '[ERROR] Settings ExtensionKit runtime verification failed' >&2
+        exit 1
+    }
+    write_runtime_trust_manifest || {
+        echo '[ERROR] Settings runtime trust manifest update failed' >&2
         exit 1
     }
     if [ -n "$CURRENT_BOOT_ID" ]; then

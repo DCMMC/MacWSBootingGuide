@@ -70,7 +70,7 @@ static int ShowLaunchpad(void) {
     return WEXITSTATUS(status);
 }
 
-static int RegisterSettingsExtensions(void) {
+static int RegisterSettingsExtensions(BOOL registerRecords) {
     static NSString *const directoryPath =
         @"/System/Library/ExtensionKit/Extensions";
     static NSString *const settingsExtensionPoint =
@@ -162,15 +162,18 @@ static int RegisterSettingsExtensions(void) {
                 return 1;
             }
 
-            int32_t status = registerPluginURL((__bridge CFURLRef)url);
-            if (status != 0) {
-                fprintf(stderr,
-                        "macwsworkspacectl: stock LaunchServices "
-                        "registration failed status=%d identifier=%s "
-                        "path=%s\n", status, expectedIdentifier.UTF8String,
-                        url.path.fileSystemRepresentation);
-                dlclose(launchServices);
-                return 1;
+            if (registerRecords) {
+                int32_t status = registerPluginURL((__bridge CFURLRef)url);
+                if (status != 0) {
+                    fprintf(stderr,
+                            "macwsworkspacectl: stock LaunchServices "
+                            "registration failed status=%d identifier=%s "
+                            "path=%s\n", status,
+                            expectedIdentifier.UTF8String,
+                            url.path.fileSystemRepresentation);
+                    dlclose(launchServices);
+                    return 1;
+                }
             }
 
             // A zero registrar status is not sufficient.  Require the exact
@@ -215,8 +218,10 @@ static int RegisterSettingsExtensions(void) {
             }
             registeredCount++;
             fprintf(stdout,
-                    "settings-extension-ready identifier=%s platform=%u "
-                    "path=%s\n", identifier.UTF8String, platform,
+                    "settings-extension-%s identifier=%s platform=%u "
+                    "path=%s\n",
+                    registerRecords ? "ready" : "verified",
+                    identifier.UTF8String, platform,
                     recordURL.path.fileSystemRepresentation);
         }
     }
@@ -231,11 +236,56 @@ static int RegisterSettingsExtensions(void) {
         return 1;
     }
     fprintf(stdout,
-            "settings-extensions-ready candidates=%lu registered=%lu\n",
+            "settings-extensions-%s candidates=%lu records=%lu\n",
+            registerRecords ? "ready" : "verified",
             (unsigned long)candidateCount,
             (unsigned long)registeredCount);
     dlclose(launchServices);
     return 0;
+}
+
+static int VerifyLaunchServicesCatalog(void) {
+    // A full `lsregister -f -apps system,local,user` walk takes roughly a
+    // minute on the iPad rootfs.  Verify persistent LaunchServices state
+    // through NSWorkspace's real bundle-ID lookup, so a matching source
+    // fingerprint can reuse it after a cold bootstrap.
+    // This is deliberately not a marker-only shortcut: every essential app
+    // and all Settings panes must still resolve to their exact platform-1 URL.
+    NSArray<NSString *> *requiredPaths = @[
+        @"/System/Applications/Utilities/Terminal.app",
+        @"/System/Applications/System Settings.app",
+        @"/System/Library/CoreServices/Finder.app",
+        @"/System/Library/CoreServices/Dock.app",
+    ];
+    NSMutableArray<NSString *> *paths = [requiredPaths mutableCopy];
+    NSString *vscodePath = @"/Applications/Visual Studio Code.app";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:vscodePath])
+        [paths addObject:vscodePath];
+
+    for (NSString *path in paths) {
+        NSURL *url = [NSURL fileURLWithPath:path isDirectory:YES];
+        NSBundle *bundle = [NSBundle bundleWithURL:url];
+        NSString *expectedIdentifier = bundle.bundleIdentifier;
+        NSURL *recordURL = expectedIdentifier.length
+            ? [NSWorkspace.sharedWorkspace
+                  URLForApplicationWithBundleIdentifier:expectedIdentifier]
+            : nil;
+        BOOL valid = expectedIdentifier.length != 0 &&
+            [recordURL.path isEqualToString:path];
+        if (!valid) {
+            fprintf(stderr,
+                    "macwsworkspacectl: application catalog validation "
+                    "failed identifier=%s expectedURL=%s resolvedURL=%s\n",
+                    expectedIdentifier.UTF8String ?: "<nil>",
+                    path.UTF8String, recordURL.path.UTF8String ?: "<nil>");
+            return 1;
+        }
+        fprintf(stdout,
+                "application-record-verified identifier=%s path=%s\n",
+                expectedIdentifier.UTF8String,
+                recordURL.path.fileSystemRepresentation);
+    }
+    return RegisterSettingsExtensions(NO);
 }
 
 static int OpenApplication(const char *pathBytes) {
@@ -616,7 +666,11 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 &&
             (strcmp(argv[1], "register-settings-extensions") == 0 ||
              strcmp(argv[1], "register-settings-extension") == 0)) {
-            return RegisterSettingsExtensions();
+            return RegisterSettingsExtensions(YES);
+        }
+        if (argc == 2 &&
+            strcmp(argv[1], "verify-launchservices-catalog") == 0) {
+            return VerifyLaunchServicesCatalog();
         }
         if (argc == 3 && strcmp(argv[1], "open-application") == 0) {
             return OpenApplication(argv[2]);
@@ -642,6 +696,7 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr,
                 "usage: macwsworkspacectl set-wallpaper [path] | "
                 "show-launchpad | register-settings-extensions | "
+                "verify-launchservices-catalog | "
                 "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "
                 "reopen-process PID | inspect-appkit-reopen | "

@@ -34,6 +34,25 @@ ROOTFS=/var/mnt/rootfs
 # the next launch through the deep verifier before allowing the boot cache.
 rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
 
+# Files copied directly from layout/ retain the build account's uid/gid in a
+# rootless .deb.  iPadOS launchctl rejects system-domain jobs unless their
+# plist is root-owned and not group/world writable.  Normalize the complete
+# packaged job set before either the Host app or a cold-start transaction can
+# load it; relying on the separate rootfs repair script leaves a fresh package
+# installation unable to start its very first service.
+for launch_directory in \
+    /var/jb/usr/macOS/LaunchDaemons \
+    /var/jb/usr/macOS/gui-launchd; do
+    [ -d "$launch_directory" ] || continue
+    chown root:wheel "$launch_directory"/*.plist 2>/dev/null || true
+    chmod 0644 "$launch_directory"/*.plist 2>/dev/null || true
+done
+for launch_plist in /var/jb/Library/LaunchDaemons/com.macwsguide*.plist; do
+    [ -f "$launch_plist" ] || continue
+    chown root:wheel "$launch_plist" || exit 1
+    chmod 0644 "$launch_plist" || exit 1
+done
+
 # Theos builds libmachook for iOS and the chroot's macOS dyld rejects that
 # LC_BUILD_VERSION. This used to be a mandatory SSH-only step after every
 # package install. Do it before publishing the App's root control service so a
@@ -435,6 +454,10 @@ if [ -d "$ROOTFS/System/Library" ]; then
     # fingerprint and resulting CDHashes.  The generic helper merges rather
     # than replaces each pane's native entitlements.
     bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh || exit 1
+    # Publish the bootsession/dependency witness and persistent trust-hash
+    # manifest during installation; do not defer a 48-pane deep verification
+    # to the first interactive MacWS launch.
+    bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh --verify || exit 1
     ensure_chroot_native_service_signature \
         "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
         "$CORELOCATIONAGENT_NATIVE_ENTITLEMENTS" \

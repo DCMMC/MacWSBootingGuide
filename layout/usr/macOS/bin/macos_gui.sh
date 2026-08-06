@@ -58,6 +58,11 @@ POSTINST=/var/jb/usr/macOS/bin/postinst.sh
 THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
 LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
+GUI_TRANSACTION_LOCK="$LOGDIR/.macos_gui.transaction"
+GUI_TRANSACTION_PID="$GUI_TRANSACTION_LOCK/pid"
+GUI_START_STATE="$LOGDIR/macos_gui_start.state"
+GUI_TRANSACTION_HELD=0
+GUI_TRANSACTION_STARTED=0
 
 GUI_LAUNCHD_DIR=/var/jb/usr/macOS/gui-launchd   # script-owned; NOT auto-scanned at boot
 WATCHDOG_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.watchdog.plist"
@@ -67,6 +72,7 @@ TERM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.terminal.plist"
 PBOARD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pboard.plist"
 PBS_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.pbs.plist"
 LSD_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd.plist"
+LSD_SYSTEM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.lsd-system.plist"
 CFPREFSD_DAEMON_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-daemon.plist"
 CFPREFSD_AGENT_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.cfprefsd-agent.plist"
 MACOS_LOCATIOND_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.macos-locationd.plist"
@@ -88,6 +94,7 @@ TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
 PBS_LABEL=com.macwsguide.pbs
 LSD_LABEL=com.macwsguide.lsd
+LSD_SYSTEM_LABEL=com.macwsguide.lsd-system
 CFPREFSD_DAEMON_LABEL=com.macwsguide.cfprefsd-daemon
 CFPREFSD_AGENT_LABEL=com.macwsguide.cfprefsd-agent
 MACOS_LOCATIOND_LABEL=com.macwsguide.macos-locationd
@@ -183,6 +190,10 @@ CFPREFSD_BIN=/usr/local/libexec/macws-cfprefsd
 DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
+LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v2
+LAUNCHSERVICES_CATALOG_MARKER="$ROOTFS/var/db/macws/launchservices-catalog.ready"
+LSD_SESSION_USER_DIR=/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/macws-lsd-session/
+LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
 SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
 SETTINGS_EXTENSIONS_RUNTIME=/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
 SETTINGS_EXTENSIONS_RUNTIME_LOG="$LOGDIR/settings-extensions-runtime.log"
@@ -247,7 +258,7 @@ fi
 #
 # `status` remains read-only and is always allowed.
 case "${1:-}" in
-    start|restart|stop)
+    start|restart|stop|production)
         if [ -f "$TEST_LEASE" ]; then
             expected_lease=$(awk 'NR == 1 { print; exit }' "$TEST_LEASE" 2>/dev/null)
             provided_lease="${MACWS_TEST_LEASE_TOKEN:-}"
@@ -299,6 +310,71 @@ RECOVERY_EXTRA_RESTARTS=0
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 log() { echo "[macos_gui] $*"; }
+
+# `start`, `restart`, and `stop` mutate the same outer-launchd contracts. A
+# second control-centre tap used to enter cleanup while the first invocation
+# was still publishing services, leaving a plausible-looking half stack whose
+# WindowServer or lsd belonged to the wrong generation. `mkdir` is the one
+# atomic primitive available in the device shell. Keep the lock recoverable by
+# recording the exact owner PID and reclaiming it only after that PID is gone.
+release_gui_transaction() {
+    local owner=""
+    [ "$GUI_TRANSACTION_HELD" -eq 1 ] || return 0
+    owner=$(sed -n '1p' "$GUI_TRANSACTION_PID" 2>/dev/null)
+    if [ "$owner" = "$$" ]; then
+        rm -f "$GUI_TRANSACTION_PID"
+        rmdir "$GUI_TRANSACTION_LOCK" 2>/dev/null || true
+    fi
+    GUI_TRANSACTION_HELD=0
+}
+
+acquire_gui_transaction() {
+    local operation="$1" owner="" owner_command="" attempt=0
+    while [ "$attempt" -lt 2 ]; do
+        if mkdir "$GUI_TRANSACTION_LOCK" 2>/dev/null; then
+            printf '%s\n' "$$" > "$GUI_TRANSACTION_PID" || {
+                rmdir "$GUI_TRANSACTION_LOCK" 2>/dev/null || true
+                return 1
+            }
+            GUI_TRANSACTION_HELD=1
+            GUI_TRANSACTION_STARTED=$(date +%s)
+            trap release_gui_transaction EXIT
+            return 0
+        fi
+        owner=$(sed -n '1p' "$GUI_TRANSACTION_PID" 2>/dev/null)
+        case "$owner" in
+            ''|*[!0-9]*) owner="" ;;
+        esac
+        if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+            owner_command=$(ps -p "$owner" -o command= 2>/dev/null)
+            log "ERROR: GUI transition '$operation' refused; pid=$owner is already changing the MacWS stack (${owner_command:-unknown command})."
+            return 75
+        fi
+        # A killed shell cannot run its EXIT trap. Remove only the two exact
+        # script-owned lock objects, then retry the atomic mkdir once.
+        rm -f "$GUI_TRANSACTION_PID"
+        rmdir "$GUI_TRANSACTION_LOCK" 2>/dev/null || return 75
+        log "Recovered stale GUI transition lock (previous owner=${owner:-unknown})."
+        attempt=$((attempt + 1))
+    done
+    return 75
+}
+
+write_gui_start_state() {
+    local phase="$1" detail="${2:-}" temporary="${GUI_START_STATE}.new.$$"
+    {
+        printf 'schema=macws-gui-start-v1\n'
+        printf 'pid=%s\n' "$$"
+        printf 'operation=%s\n' "$CMD"
+        printf 'mode=%s\n' "$MODE"
+        printf 'phase=%s\n' "$phase"
+        printf 'started_at=%s\n' "$GUI_TRANSACTION_STARTED"
+        printf 'updated_at=%s\n' "$(date +%s)"
+        printf 'detail=%s\n' "$detail"
+    } > "$temporary" || return 1
+    chmod 0644 "$temporary" || return 1
+    mv -f "$temporary" "$GUI_START_STATE"
+}
 
 require_root() {
     if [ "$(id -u)" != "0" ]; then
@@ -518,6 +594,8 @@ stop_ws_dependents() {
     launchctl remove "$CHROME150_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
+    launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
+    launchctl remove "$LSD_SYSTEM_LABEL" 2>/dev/null
     launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
     launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
     launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
@@ -629,6 +707,8 @@ recover_ws_dependents() {
     # before the listener on cold boot can lose its cached first fix.
     [ ! -f "$LOCATIONBRIDGE_PLIST" ] ||
         launchctl load "$LOCATIONBRIDGE_PLIST" 2>/dev/null
+    [ ! -f "$LSD_SYSTEM_PLIST" ] || \
+        launchctl load "$LSD_SYSTEM_PLIST" 2>/dev/null
     [ ! -f "$LSD_PLIST" ] || launchctl load "$LSD_PLIST" 2>/dev/null
     [ ! -f "$ICONSERVICESD_PLIST" ] || \
         launchctl load "$ICONSERVICESD_PLIST" 2>/dev/null
@@ -859,6 +939,13 @@ ensure_cfprefsd_dirhelper_tree() {
         2>/dev/null || true
     chmod 1311 "$temporary_root" || return 1
     chmod 0700 "$temporary_user" "$temporary_leaf" || return 1
+}
+
+ensure_launchservices_session_user_dir() {
+    local directory="$ROOTFS$LSD_SESSION_USER_DIR"
+    mkdir -p "$directory" || return 1
+    chown root:wheel "$directory" 2>/dev/null || true
+    chmod 0700 "$directory" || return 1
 }
 
 # Ventura's _locationd account is uid/gid 205 and Darwin dirhelper resolves
@@ -1201,8 +1288,53 @@ PLIST
     # launchservicesd endpoint alone.  iPadOS publishes the same com.apple.lsd
     # names in user/501; without isolation the chroot's lsregister runtime-
     # confirmed that it opened iOS's container database (Bundle table = 0).
-    # Publish the stock macOS LaunchAgent contract under names that
-    # libmachook maps on both the listener and client sides.
+    # macOS runs two copies of lsd in different launchd domains.  The system
+    # daemon opens the durable csstore (`runAsRoot` is its stock role switch),
+    # while the Background-session agent exposes the application catalog to
+    # AppKit clients and obtains generations from the daemon's dissemination
+    # endpoint.  A single iPadOS bootstrap domain cannot publish the same
+    # service names twice, so libmachook maps the unmodified protocols onto a
+    # private system family and private session family.
+    cat > "$LSD_SYSTEM_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${LSD_SYSTEM_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>/usr/libexec/lsd</string>
+        <string>runAsRoot</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict><key>MACWS_LSD_ROLE</key><string>system</string></dict>
+    <key>MachServices</key>
+    <dict>
+        <key>com.apple.macosbooter.lsd.system.advertisingidentifiers</key><true/>
+        <key>com.apple.macosbooter.lsd.system.diagnostics</key><true/>
+        <key>com.apple.macosbooter.lsd.system.dissemination</key><true/>
+        <key>com.apple.macosbooter.lsd.system.encryption</key><true/>
+        <key>com.apple.macosbooter.lsd.system.extensions</key><true/>
+        <key>com.apple.macosbooter.lsd.system.mapdb</key><true/>
+        <key>com.apple.macosbooter.lsd.system.modifydb</key><true/>
+        <key>com.apple.macosbooter.lsd.system.open</key><true/>
+        <key>com.apple.macosbooter.lsd.system.openurl</key><true/>
+        <key>com.apple.macosbooter.lsd.system.personaobserver</key><true/>
+        <key>com.apple.macosbooter.lsd.system.plugin</key><true/>
+        <key>com.apple.macosbooter.lsd.system.trustedsignatures</key><true/>
+        <key>com.apple.macosbooter.lsd.system.security.translocation</key><true/>
+    </dict>
+    <key>EnableTransactions</key><true/>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>${LOGDIR}/lsd-system.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/lsd-system.log</string>
+</dict>
+</plist>
+PLIST
+
     cat > "$LSD_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1215,12 +1347,15 @@ PLIST
         <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
         <string>${ROOTFS}</string><string>/usr/libexec/lsd</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MACWS_LSD_ROLE</key><string>session</string>
+        <key>MACWS_LSD_SESSION_USER_DIR</key><string>${LSD_SESSION_USER_DIR}</string>
+    </dict>
     <key>MachServices</key>
     <dict>
         <key>com.apple.macosbooter.lsd.advertisingidentifiers</key><true/>
         <key>com.apple.macosbooter.lsd.diagnostics</key><true/>
-        <key>com.apple.macosbooter.lsd.dissemination</key><true/>
-        <key>com.apple.macosbooter.lsd.encryption</key><true/>
         <key>com.apple.macosbooter.lsd.extensions</key><true/>
         <key>com.apple.macosbooter.lsd.mapdb</key><true/>
         <key>com.apple.macosbooter.lsd.modifydb</key><true/>
@@ -1234,8 +1369,8 @@ PLIST
     <key>EnableTransactions</key><true/>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><false/>
-    <key>StandardOutPath</key><string>${LOGDIR}/lsd.log</string>
-    <key>StandardErrorPath</key><string>${LOGDIR}/lsd.log</string>
+    <key>StandardOutPath</key><string>${LOGDIR}/lsd-session.log</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/lsd-session.log</string>
 </dict>
 </plist>
 PLIST
@@ -1476,6 +1611,17 @@ PLIST
         <string>0</string>
         <string>${ROOTFS}</string>
         <string>${TERM_BIN}</string>
+        <!--
+          A cold start must create a usable shell window, not restore whichever
+          auxiliary panel happened to survive the previous GUI generation.
+          Runtime evidence on 2026-08-07 captured a Terminal process whose
+          only on-screen layer-3 window was "Inspector"; the corresponding
+          /var/root Saved Application State windows.plist contained that same
+          sole persistent window.  Use AppKit's native persistence opt-out for
+          this launch, while leaving Terminal preferences and profiles intact.
+        -->
+        <string>-ApplePersistenceIgnoreState</string>
+        <string>YES</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -1790,6 +1936,8 @@ cleanup_macos() {
     launchctl remove "$PBS_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
+    launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
+    launchctl remove "$LSD_SYSTEM_LABEL" 2>/dev/null
     launchctl unload "$CFPREFSD_AGENT_PLIST" 2>/dev/null
     launchctl unload "$CFPREFSD_DAEMON_PLIST" 2>/dev/null
     launchctl remove "$CFPREFSD_AGENT_LABEL" 2>/dev/null
@@ -1912,16 +2060,141 @@ mode_exclusive() {
     launchctl unload "$BACKBOARDD"  2>/dev/null
 }
 
+launchservices_source_fingerprint() {
+    local manifest="$ROOTFS/private/tmp/macws-launchservices-source.$$"
+    local root="" bundle="" info="" checksum=""
+    {
+        printf '%s\n' "$LAUNCHSERVICES_CATALOG_SCHEMA"
+        for root in \
+            "$ROOTFS/System/Applications" \
+            "$ROOTFS/Applications" \
+            "$ROOTFS/Users/root/Applications" \
+            "$ROOTFS/System/Library/CoreServices"; do
+            [ -d "$root" ] || continue
+            find "$root" -type d -name '*.app' -prune -print 2>/dev/null
+        done | sort | while IFS= read -r bundle; do
+            info="$bundle/Contents/Info.plist"
+            printf '%s|' "${bundle#$ROOTFS}"
+            if [ -f "$info" ]; then
+                checksum=$(cksum "$info" 2>/dev/null) || checksum=unreadable
+                printf '%s\n' "$checksum"
+            else
+                printf '%s\n' missing-info
+            fi
+        done
+        root="$ROOTFS/System/Library/ExtensionKit/Extensions"
+        if [ -d "$root" ]; then
+            find "$root" -type d -name '*.appex' -prune -print 2>/dev/null |
+                sort | while IFS= read -r bundle; do
+                    info="$bundle/Contents/Info.plist"
+                    printf '%s|' "${bundle#$ROOTFS}"
+                    if [ -f "$info" ]; then
+                        checksum=$(cksum "$info" 2>/dev/null) ||
+                            checksum=unreadable
+                        printf '%s\n' "$checksum"
+                    else
+                        printf '%s\n' missing-info
+                    fi
+                done
+        fi
+        info="$ROOTFS/System/Library/CoreServices/SystemVersion.plist"
+        [ ! -f "$info" ] || cksum "$info" 2>/dev/null
+    } > "$manifest" || {
+        rm -f "$manifest"
+        return 1
+    }
+    checksum=$(cksum "$manifest" 2>/dev/null | awk '{print $1 ":" $2}')
+    rm -f "$manifest"
+    [ -n "$checksum" ] || return 1
+    printf '%s' "$checksum"
+}
+
 seed_launchservices_database() {
+    local fingerprint="" marker_value="" marker_tmp="" catalog_current=0
+    local root="" bundle=""
+    local -a application_paths=()
     if [ ! -x "$ROOTFS$LSREGISTER_BIN" ]; then
         log "ERROR: stock macOS lsregister is missing at $LSREGISTER_BIN"
         return 1
     fi
+    if [ ! -x "$ROOTFS$WORKSPACECTL_BIN" ]; then
+        log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
+        return 1
+    fi
+    fingerprint=$(launchservices_source_fingerprint) || {
+        log "ERROR: LaunchServices source fingerprint could not be computed."
+        return 1
+    }
+    marker_value="$LAUNCHSERVICES_CATALOG_SCHEMA|$fingerprint"
     rm -f "$LOGDIR/lsregister.log"
-    log "Registering the real macOS system/local/user application catalog..."
+    if [ -f "$LAUNCHSERVICES_CATALOG_MARKER" ] &&
+       [ "$(sed -n '1p' "$LAUNCHSERVICES_CATALOG_MARKER" 2>/dev/null)" = \
+         "$marker_value" ]; then
+        catalog_current=1
+        rm -f "$LAUNCHSERVICES_VERIFY_LOG"
+        if "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                verify-launchservices-catalog \
+                > "$LAUNCHSERVICES_VERIFY_LOG" 2>&1; then
+            log "LaunchServices catalog reused after platform-1 record verification."
+            return 0
+        fi
+
+        # Runtime A/B on 2026-08-07 established the actual reboot invariant:
+        # the same healthy, seeded csstore reports Terminal as `mounted`
+        # immediately after registration and `not mounted` after only the
+        # session lsd is reloaded.  _LSCopyLocalDatabase still returns the
+        # non-null database with no error; NSWorkspace filters those inactive
+        # records and returns nil.  A normal macOS login receives a root-volume
+        # mount notification that reactivates them, while the bind-mounted
+        # chroot does not.  Re-register each already-known application path and
+        # the Settings extensions through stock LaunchServices.  An on-device
+        # A/B over all 184 application bundles took 3 seconds and left the
+        # csstore byte size unchanged, while restoring arbitrary Spotlight-
+        # style launches instead of only the five startup witnesses.
+        log "Reactivating persisted LaunchServices records for the mounted chroot..."
+        for root in \
+            "$ROOTFS/System/Applications" \
+            "$ROOTFS/Applications" \
+            "$ROOTFS/Users/root/Applications" \
+            "$ROOTFS/System/Library/CoreServices"; do
+            [ -d "$root" ] || continue
+            while IFS= read -r bundle; do
+                application_paths+=("${bundle#$ROOTFS}")
+            done < <(find "$root" -type d -name '*.app' -prune -print \
+                2>/dev/null | sort)
+        done
+        if [ "${#application_paths[@]}" -gt 0 ] &&
+           "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" -f \
+                "${application_paths[@]}" \
+                > "$LOGDIR/lsregister-reactivate.log" 2>&1 &&
+           MACWS_CATALOG_REGISTRATION=1 \
+                "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                register-settings-extensions \
+                > "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1 &&
+           "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                verify-launchservices-catalog \
+                >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
+            log "LaunchServices catalog reactivated and verified."
+            return 0
+        fi
+        log "Targeted LaunchServices reactivation failed; rebuilding the clean catalog."
+        tail -n 8 "$LAUNCHSERVICES_VERIFY_LOG" 2>/dev/null || true
+    fi
+
+    # A changed rootfs/catalog schema needs one authoritative rebuild.  The
+    # previous `-f -apps system,local,user` path repeatedly appended records:
+    # runtime evidence found a 148,717,568-byte store and a 50-60 second
+    # `_LSDatabaseClean` on every lsd launch.  Ventura's stock `-kill -seed`
+    # transaction produced a clean 6-10 MB store in 6 seconds on this device
+    # and immediately passed every application/ExtensionKit witness.
+    if [ "$catalog_current" -eq 1 ]; then
+        log "Rebuilding the real macOS application catalog after failed reactivation..."
+    else
+        log "Building the real macOS application catalog for this rootfs generation..."
+    fi
     if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" \
-            -f -apps system,local,user > "$LOGDIR/lsregister.log" 2>&1; then
-        log "ERROR: LaunchServices application scan failed."
+            -kill -seed > "$LOGDIR/lsregister.log" 2>&1; then
+        log "ERROR: LaunchServices clean seed failed."
         tail -n 20 "$LOGDIR/lsregister.log" 2>/dev/null || true
         return 1
     fi
@@ -1932,14 +2205,27 @@ seed_launchservices_database() {
     # plug-in registrar and require exact platform-1 records before publishing
     # the settings services.
     rm -f "$SETTINGS_EXTENSION_REGISTER_LOG"
-    if ! MACWS_CATALOG_REGISTRATION=1 \
-            "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-            register-settings-extensions \
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+            verify-launchservices-catalog \
             > "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
-        log "ERROR: System Settings extension registration failed."
-        tail -n 20 "$SETTINGS_EXTENSION_REGISTER_LOG" 2>/dev/null || true
-        return 1
+        log "Clean seed needs explicit System Settings extension activation..."
+        if ! MACWS_CATALOG_REGISTRATION=1 \
+                "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                register-settings-extensions \
+                >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1 ||
+           ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                verify-launchservices-catalog \
+                >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
+            log "ERROR: rebuilt LaunchServices catalog failed record verification."
+            tail -n 20 "$SETTINGS_EXTENSION_REGISTER_LOG" 2>/dev/null || true
+            return 1
+        fi
     fi
+    mkdir -p "$(dirname "$LAUNCHSERVICES_CATALOG_MARKER")" || return 1
+    marker_tmp="$LAUNCHSERVICES_CATALOG_MARKER.new.$$"
+    printf '%s\n' "$marker_value" > "$marker_tmp" || return 1
+    chmod 0644 "$marker_tmp" || return 1
+    mv -f "$marker_tmp" "$LAUNCHSERVICES_CATALOG_MARKER" || return 1
     log "LaunchServices application catalog ready."
 }
 
@@ -2123,11 +2409,20 @@ start_macos() {
     }
     verify_preferences_persistence || return 1
 
-    log "Publishing the private macOS LaunchServices database services..."
-    rm -f "$LOGDIR/lsd.log"
+    log "Publishing the private macOS LaunchServices system store and session catalog..."
+    ensure_launchservices_session_user_dir || {
+        log "ERROR: could not prepare the isolated LaunchServices session store."
+        return 1
+    }
+    rm -f "$LOGDIR/lsd-system.log" "$LOGDIR/lsd-session.log"
+    launchctl load "$LSD_SYSTEM_PLIST" || return 1
+    launchctl list "$LSD_SYSTEM_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: private macOS system lsd contract was not registered."
+        return 1
+    }
     launchctl load "$LSD_PLIST" || return 1
     launchctl list "$LSD_LABEL" >/dev/null 2>&1 || {
-        log "ERROR: private macOS lsd MachService contract was not registered."
+        log "ERROR: private macOS session lsd contract was not registered."
         return 1
     }
 
@@ -2386,7 +2681,7 @@ status() {
         echo "VNC: not running"
     fi
     echo
-    echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/lsd.log  $LOGDIR/dock.log  $LOGDIR/systemuiserver.log  $LOGDIR/controlcenter.log  $LOGDIR/WindowServer.err"
+    echo "logs: $LOGDIR/osxvnc.log  $LOGDIR/terminal.log  $LOGDIR/lsd-system.log  $LOGDIR/lsd-session.log  $LOGDIR/dock.log  $LOGDIR/systemuiserver.log  $LOGDIR/controlcenter.log  $LOGDIR/WindowServer.err"
 }
 
 switch_status() {
@@ -2736,42 +3031,65 @@ start_watchdog() {
 case "$CMD" in
     start)
         require_root "$@"
+        acquire_gui_transaction start || exit $?
+        write_gui_start_state preparing "generating launchd contracts"
         write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
+        write_gui_start_state cleaning "retiring the previous service generation"
         cleanup_macos
+        write_gui_start_state assets "preparing the production application profile"
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
+            write_gui_start_state preflight "validating native AGX production switches"
             production_preflight || { stop_all; exit 1; }
         fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
+        write_gui_start_state safety "arming the critical-only thermal watchdog"
         start_watchdog || { stop_all; exit 1; }
+        write_gui_start_state trust "restoring executable trust for this boot"
         ensure_chroot_works || { stop_all; exit 1; }
+        write_gui_start_state services "starting catalogs, WindowServer, bridges, and applications"
         start_macos || { stop_all; exit 1; }
+        write_gui_start_state first-frame "waiting for the optional initial VNC capture"
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
+        write_gui_start_state ready "WindowServer and requested clients are ready"
         echo
         log "Started in $MODE mode."
         status
         ;;
     stop)
         require_root "$@"
+        acquire_gui_transaction stop || exit $?
+        write_gui_start_state stopping "retiring the active GUI service generation"
         stop_all
+        write_gui_start_state stopped "iOS display services restored"
         ;;
     restart)
         require_root "$@"
+        acquire_gui_transaction restart || exit $?
+        write_gui_start_state preparing "generating launchd contracts"
         write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
+        write_gui_start_state cleaning "retiring the active GUI service generation"
         stop_all
+        write_gui_start_state assets "preparing the production application profile"
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
+            write_gui_start_state preflight "validating native AGX production switches"
             production_preflight || { stop_all; exit 1; }
         fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
+        write_gui_start_state safety "arming the critical-only thermal watchdog"
         start_watchdog || { stop_all; exit 1; }
+        write_gui_start_state trust "restoring executable trust for this boot"
         ensure_chroot_works || { stop_all; exit 1; }
+        write_gui_start_state services "starting catalogs, WindowServer, bridges, and applications"
         start_macos || { stop_all; exit 1; }
+        write_gui_start_state first-frame "waiting for the optional initial VNC capture"
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
+        write_gui_start_state ready "WindowServer and requested clients are ready"
         echo
         log "Restarted in $MODE mode."
         status

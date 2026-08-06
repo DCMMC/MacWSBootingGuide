@@ -492,9 +492,16 @@ ALLOCD_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.alloc.plist
 if [ -x "$ALLOCD" ]; then
     add_all_trustcache "$ALLOCD"
     if [ -f "$ALLOCD_PLIST" ]; then
-        # Unload + load to pick up plist changes.
+        # Rootless package extraction can preserve the build account's uid.
+        # launchd rejects a system-domain plist before the allocator ever gets
+        # a chance to check in, so normalize and verify the real load result.
+        chown root:wheel "$ALLOCD_PLIST" || exit 1
+        chmod 0644 "$ALLOCD_PLIST" || exit 1
         launchctl unload "$ALLOCD_PLIST" 2>/dev/null || true
-        launchctl load "$ALLOCD_PLIST" 2>&1 | head -3
+        if ! launchctl load "$ALLOCD_PLIST"; then
+            echo "[ERROR] failed to load com.macwsguide.alloc launchd job" >&2
+            exit 1
+        fi
         echo "[INFO] loaded com.macwsguide.alloc launchd job"
     fi
 fi
@@ -676,6 +683,12 @@ add_all_trustcache \
 # exceptions, runtime fingerprint and reboot-volatile trustcache in one
 # idempotent helper shared with the package postinst.
 bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh || exit 1
+# Package installation already paid the one-time signing/copying cost.  Deeply
+# verify the completed closure now so the first GUI launch can reuse the exact
+# bootsession/dependency witness instead of re-reading all 48 panes on its
+# latency-sensitive path.  The verifier also writes the persistent trust-hash
+# manifest used to restore the reboot-volatile dynamic trustcache.
+bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh --verify || exit 1
 
 # Native-host input bridge.  Keep the installed source and the chroot-visible
 # executable on fresh inodes so AMFI does not reuse a stale vnode signature.
@@ -829,13 +842,18 @@ sign_and_trustcache_with_identifier_requirement \
 # Dopamine's dynamic trustcache does not.
 add_all_trustcache /var/mnt/rootfs/tmp/GlassDemo
 add_all_trustcache /var/mnt/rootfs/usr/local/lib/.jbroot/usr/lib/libroot.dylib
-# VS Code's main executable is not enough after a reboot: dyld must admit its
-# Electron/Squirrel/Mantle/ReactiveObjC frameworks before any injected repair
-# code can execute.  Keep this in postinst so macos_gui.sh's existing
-# post-reboot self-heal restores the complete benchmark application too.
-trust_existing_app_bundle \
-    "/var/mnt/rootfs/Applications/Visual Studio Code.app" \
-    "Visual Studio Code"
+# A user application's main executable is not enough after a reboot: dyld must
+# admit its nested frameworks before libmachook/autosignd has a chance to run.
+# VS Code first exposed this with Electron/Squirrel/Mantle/ReactiveObjC, but the
+# invariant applies equally to newly installed AppKit and Electron bundles.
+# Restore every *already-signed* executable in /Applications so launch-by-path
+# remains cold-boot safe without growing a hard-coded application list.
+for application_bundle in /var/mnt/rootfs/Applications/*.app; do
+    [ -d "$application_bundle" ] || continue
+    trust_existing_app_bundle \
+        "$application_bundle" \
+        "$(basename "$application_bundle" .app)"
+done
 # vnc server
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent
@@ -884,16 +902,17 @@ ROOTFS=/var/mnt/rootfs
 # Ventura QuartzCore's real desktop-window-effects shaders are compiled for a
 # macOS AIR target, while this project intentionally executes them on the iOS
 # native AGX driver. Preserve the original system library as the process-wide
-# default and build a secondary library in which only the three runtime-confirmed
-# failing functions carry a macabi AIR triple. libmachook forwards the original
-# function constants to this library; it does not bypass compilation or pipeline
-# validation.
+# default and build a secondary library in which only the five
+# runtime-confirmed failing functions carry a macabi AIR triple. libmachook
+# forwards the original function constants when present and redirects the two
+# zero-constant base functions unchanged; it does not bypass compilation or
+# pipeline validation.
 QC_DEFAULT="$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"
 QC_ORIGINAL="$QC_DEFAULT.macws-macos13.4-original"
 QC_EXPECTED_SHA256=ac8014164c7784395f86ac2926c62b67c96faa2a3c789f231b4b22b64024bfba
 QC_COMPAT_DIR="$ROOTFS/usr/local/share/macws/quartzcore"
 QC_COMPAT_TARGET="$QC_COMPAT_DIR/default-desktop-effects-macabi.metallib"
-QC_COMPAT_EXPECTED_SHA256=ae529c958e0c1a8caf4e9a0d40148e0c657f4e78ab74d0b0702c8631282acefd
+QC_COMPAT_EXPECTED_SHA256=8ea3ef15574a2b1de460aaec17a0c1d9cd432a2109feb006f45323355c1804a3
 QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py
 QC_LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 QC_LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
@@ -931,6 +950,8 @@ python3 "$QC_REPACKER" "$QC_ORIGINAL" "$QC_COMPAT_TMP" \
 	--function fixed_vert_lph_spc \
 	--function fixed_vert_lph_gen \
 	--function fixed_frag_lph_cpf \
+	--function path_blit_vert_lph \
+	--function attachment_clear_frag_lph \
 	--rewrite-fract-v3f16-function fixed_frag_lph_cpf \
 	--preserve-container-target || exit 1
 if [ "$(qc_sha256 "$QC_COMPAT_TMP")" != "$QC_COMPAT_EXPECTED_SHA256" ]; then

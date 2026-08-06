@@ -41,6 +41,7 @@ extern OSStatus SecRequirementCreateWithData(
     CFDataRef data, SecCSFlags flags, SecRequirementRef *requirement);
 
 static void macws_install_fsnode_root_volume_repair(void);
+static void macws_install_lsd_session_store_isolation(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]);
@@ -3213,6 +3214,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
     if (info.dli_fname &&
         strstr(info.dli_fname, "/LaunchServices.framework/") != NULL) {
         macws_install_fsnode_root_volume_repair();
+        macws_install_lsd_session_store_isolation();
     }
     if (info.dli_fname &&
         strstr(info.dli_fname,
@@ -9857,6 +9859,33 @@ static const char *macws_settings_extension_bootstrap_name(
         ? rewritten : name;
 }
 
+static const char *macws_private_bootstrap_lsd_service_name(const char *name) {
+    if (!name) return name;
+    static const char lsdPrefix[] = "com.apple.lsd.";
+    bool isLsdService = !strncmp(name, lsdPrefix, sizeof(lsdPrefix) - 1);
+    bool isTranslocation = !strcmp(name, "com.apple.security.translocation");
+    if (!isLsdService && !isTranslocation) return name;
+
+    const char *role = getenv("MACWS_LSD_ROLE");
+    bool systemFamily = role && !strcmp(role, "system");
+    const char *suffix = isLsdService
+        ? name + sizeof(lsdPrefix) - 1 : "security.translocation";
+    if (role && !strcmp(role, "session") &&
+        (!strcmp(suffix, "dissemination") || !strcmp(suffix, "encryption")))
+        systemFamily = true;
+    if (isTranslocation && !systemFamily)
+        return "com.apple.macosbooter.security.translocation";
+
+    static _Thread_local char rewritten[192];
+    int length = snprintf(rewritten, sizeof(rewritten),
+                          systemFamily
+                              ? "com.apple.macosbooter.lsd.system.%s"
+                              : "com.apple.macosbooter.lsd.%s",
+                          suffix);
+    return length > 0 && (size_t)length < sizeof(rewritten)
+        ? rewritten : name;
+}
+
 static const char *macws_private_bootstrap_service_name(const char *name) {
     if (!name) return name;
     // The settings-extension launch proxy is the first iOS image submitted to
@@ -9900,20 +9929,8 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
         return "com.apple.macosbooter.carboncore.csnameddata";
     if (!strcmp(name, DOCK_HELPER_SERVICE_ORIG))
         return DOCK_HELPER_SERVICE_NEW;
-    if (!strcmp(name, "com.apple.lsd.advertisingidentifiers"))
-        return "com.apple.macosbooter.lsd.advertisingidentifiers";
-    if (!strcmp(name, "com.apple.lsd.diagnostics"))
-        return "com.apple.macosbooter.lsd.diagnostics";
-    if (!strcmp(name, "com.apple.lsd.dissemination"))
-        return "com.apple.macosbooter.lsd.dissemination";
-    if (!strcmp(name, "com.apple.lsd.encryption"))
-        return "com.apple.macosbooter.lsd.encryption";
-    if (!strcmp(name, "com.apple.lsd.extensions"))
-        return "com.apple.macosbooter.lsd.extensions";
-    if (!strcmp(name, "com.apple.lsd.mapdb"))
-        return "com.apple.macosbooter.lsd.mapdb";
-    if (!strcmp(name, "com.apple.lsd.modifydb"))
-        return "com.apple.macosbooter.lsd.modifydb";
+    const char *lsdEndpoint = macws_private_bootstrap_lsd_service_name(name);
+    if (lsdEndpoint != name) return lsdEndpoint;
     // Ventura's four desktop CoreLocation endpoints are a different protocol
     // surface from iPadOS 16's similarly named services.  Runtime logs on the
     // target first showed `getLocationServicesCapableWithReplyBlock:` rejected
@@ -9945,18 +9962,6 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
     // com.apple.geod executable.
     if (!strcmp(name, GEOD_XPC_SERVICE))
         return GEOD_XPC_SERVICE_NEW;
-    if (!strcmp(name, "com.apple.lsd.open"))
-        return "com.apple.macosbooter.lsd.open";
-    if (!strcmp(name, "com.apple.lsd.openurl"))
-        return "com.apple.macosbooter.lsd.openurl";
-    if (!strcmp(name, "com.apple.lsd.personaobserver"))
-        return "com.apple.macosbooter.lsd.personaobserver";
-    if (!strcmp(name, "com.apple.lsd.plugin"))
-        return "com.apple.macosbooter.lsd.plugin";
-    if (!strcmp(name, "com.apple.lsd.trustedsignatures"))
-        return "com.apple.macosbooter.lsd.trustedsignatures";
-    if (!strcmp(name, "com.apple.security.translocation"))
-        return "com.apple.macosbooter.security.translocation";
     // FrontBoard's BSServiceConnection resolves its domain endpoint with raw
     // bootstrap_look_up rather than xpc_connection_create_mach_service.
     // Keep this mapping identical to macws_private_chroot_service_name() so
@@ -9984,9 +9989,9 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
 //
 // Preserve the stock role-selection code and translate only the missing
 // launchd-session value for our dedicated private cfprefsd `agent` invocation.
-// The original vproc call, errors, all other keys/processes, and daemon launch
-// remain authoritative.  strdup keeps the documented caller-owned result
-// contract after releasing the original vproc string.
+// The original vproc call, errors, all other keys/processes, and daemon
+// launches remain authoritative. strdup keeps the documented caller-owned
+// result contract after releasing the original vproc string.
 extern void *vproc_swap_string(void *vproc, int key,
                                const char *input, char **output);
 static bool macws_is_private_cfprefsd_agent(void) {
@@ -10011,6 +10016,80 @@ static void *vproc_swap_string_new(void *vproc, int key,
         }
     }
     return error;
+}
+
+// A normal macOS system bootstrap and login bootstrap never share
+// _CS_DARWIN_USER_DIR: root lsd owns the system store while the login lsd owns
+// a per-user store. MacWS has to submit both jobs to one outer launchd domain
+// and currently runs GUI clients as uid 0, so uid alone would make both lsd
+// roles clean/recover the same csstore concurrently. Preserve the stock
+// confstr contract, but give only the explicitly tagged session lsd the
+// dedicated user directory prepared by macos_gui.sh. All other confstr keys,
+// processes, errors and buffer-size semantics remain native.
+static size_t macws_confstr_new(int name, char *buffer, size_t length) {
+    const char *role = getenv("MACWS_LSD_ROLE");
+    const char *sessionDirectory = getenv("MACWS_LSD_SESSION_USER_DIR");
+    if (name == _CS_DARWIN_USER_DIR && role && sessionDirectory &&
+        !strcmp(role, "session") && sessionDirectory[0] == '/') {
+        size_t required = strlen(sessionDirectory) + 1;
+        if (buffer && length > 0) strlcpy(buffer, sessionDirectory, length);
+        return required;
+    }
+    return confstr(name, buffer, length);
+}
+
+static id (*macws_lsd_database_store_url_orig)(id, SEL) = NULL;
+static id (*macws_lsd_database_store_url_uid_orig)(id, SEL, uid_t) = NULL;
+
+static id macws_lsd_relocated_store_url(id originalURL) {
+    const char *directory = getenv("MACWS_LSD_SESSION_USER_DIR");
+    if (!originalURL || !directory || directory[0] != '/') return originalURL;
+    NSString *directoryPath = [NSString stringWithUTF8String:directory];
+    NSString *filename = [originalURL lastPathComponent];
+    if (!directoryPath || !filename) return originalURL;
+    NSURL *directoryURL = [NSURL fileURLWithPath:directoryPath
+                                     isDirectory:YES];
+    return [directoryURL URLByAppendingPathComponent:filename
+                                         isDirectory:NO];
+}
+
+static id macws_lsd_database_store_url(id self, SEL command) {
+    id originalURL = macws_lsd_database_store_url_orig
+        ? macws_lsd_database_store_url_orig(self, command) : nil;
+    return macws_lsd_relocated_store_url(originalURL);
+}
+
+static id macws_lsd_database_store_url_uid(id self, SEL command, uid_t uid) {
+    id originalURL = macws_lsd_database_store_url_uid_orig
+        ? macws_lsd_database_store_url_uid_orig(self, command, uid) : nil;
+    return macws_lsd_relocated_store_url(originalURL);
+}
+
+static void macws_install_lsd_session_store_isolation(void) {
+    const char *role = getenv("MACWS_LSD_ROLE");
+    const char *directory = getenv("MACWS_LSD_SESSION_USER_DIR");
+    if (!role || strcmp(role, "session") != 0 || !directory ||
+        directory[0] != '/') return;
+
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class defaultsClass = objc_getClass("_LSDefaults");
+        if (!defaultsClass) return;
+        SEL selector = sel_registerName("databaseStoreFileURL");
+        Method method = class_getInstanceMethod(defaultsClass, selector);
+        if (method) {
+            MSHookMessageEx(defaultsClass, selector,
+                            (IMP)macws_lsd_database_store_url,
+                            (IMP *)&macws_lsd_database_store_url_orig);
+        }
+        selector = sel_registerName("databaseStoreFileURLWithUID:");
+        method = class_getInstanceMethod(defaultsClass, selector);
+        if (method) {
+            MSHookMessageEx(defaultsClass, selector,
+                            (IMP)macws_lsd_database_store_url_uid,
+                            (IMP *)&macws_lsd_database_store_url_uid_orig);
+        }
+    });
 }
 extern kern_return_t bootstrap_look_up(mach_port_t bp, const char *name, mach_port_t *sp);
 extern kern_return_t bootstrap_check_in(mach_port_t bp, const char *name, mach_port_t *sp);
@@ -16999,6 +17078,7 @@ DYLD_INTERPOSE(CVDisplayLinkCreateWithCGDisplay_new,
 DYLD_INTERPOSE(CVDisplayLinkSetOutputCallback_new,
                CVDisplayLinkSetOutputCallback);
 DYLD_INTERPOSE(vproc_swap_string_new, vproc_swap_string);
+DYLD_INTERPOSE(macws_confstr_new, confstr);
 
 // XPC-borrow the AGX io_connect_t from macwsallocd. The helper is iOS-Apple-
 // signed-equivalent so the kernel runs the full privileged UC-init (sets

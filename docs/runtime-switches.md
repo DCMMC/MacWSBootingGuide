@@ -92,6 +92,17 @@ to pass before WindowServer starts. `postinst.sh` re-registers the persistent
 per-architecture signatures of executable files inside the existing VS Code
 bundle; it deliberately does not re-sign nested frameworks.
 
+Cold-start control state is intentionally small and explicit.  The atomic
+`/var/jb/var/mobile/.macos_gui.transaction` directory prevents overlapping
+start/stop/restart mutations, while `macos_gui_start.state` is an atomically
+replaced phase journal for the Host UI.  The rootfs catalog marker records the
+LaunchServices schema plus an application/extension source fingerprint; it is
+accepted only after a live read-only record verification.  A matching but
+inactive catalog is reactivated through stock `lsregister` calls, not trusted
+from the marker alone.  The Settings boot-ready witness is tied to the current
+bootsession and dependency hashes; its persistent hash manifest contains only
+verified executable CDHashes used to restore the reboot-volatile trustcache.
+
 The deb installs the optional VS Code launch job under
 `/var/jb/usr/macOS/gui-launchd`, which is intentionally not auto-scanned by
 launchd. `macos_gui.sh production` synchronizes the packaged 60,000-fish
