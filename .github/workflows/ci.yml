@@ -1,0 +1,36 @@
+name: ci
+
+# Fast validation gate for every push / pull request to a development branch.
+# Builds nothing; it only enforces the production invariants that must hold
+# before a release tag is cut (runtime-switch inventory, shell syntax, and
+# packaged plist validity).
+
+on:
+  push:
+    branches:
+      - main
+      - release/production
+  pull_request:
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runtime-switch audit
+        run: python3 misc/audit_runtime_switches.py
+      - name: Shell syntax
+        run: |
+          set -e
+          for f in layout/usr/macOS/bin/*.sh misc/*.sh; do
+            [ -f "$f" ] || continue
+            bash -n "$f"
+          done
+      - name: Plist lint
+        run: |
+          set -e
+          for p in layout/Library/LaunchDaemons/*.plist \
+                   layout/usr/macOS/LaunchDaemons/*.plist; do
+            plutil -lint "$p"
+          done

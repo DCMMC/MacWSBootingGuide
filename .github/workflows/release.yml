@@ -1,0 +1,134 @@
+name: release
+
+# Build the production .deb package and attach it to a GitHub Release.
+#
+# Triggers:
+#   - a tag push named v<version> (e.g. v0.4.0)
+#   - manual dispatch (workflow_dispatch) with a version string
+#
+# Runner: macos-latest — Xcode provides the macOS SDK for the macOS-side
+# subprojects (launchservicesd, libmachook, macwsinputd, macwsdisplayd,
+# macwsinteropd, macwsworkspacectl); the iOS-side subprojects are compiled
+# against the vendored iPhoneOS 16.5 SDK from theos/sdks, matching the
+# on-device build (iPadOS 16.3) rather than the Xcode 26 iOS SDK (which marks
+# APIs used by the project as unavailable).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (without leading v), e.g. 0.4.0"
+        required: true
+        default: "0.4.0"
+
+env:
+  THEOS: "$HOME/theos"
+
+jobs:
+  validate:
+    name: Validate (audit + shell + plists)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runtime-switch audit
+        run: python3 misc/audit_runtime_switches.py
+      - name: Shell syntax (macos_gui.sh, cleanup_all.sh, build_on_ios.sh)
+        run: |
+          bash -n layout/usr/macOS/bin/macos_gui.sh
+          bash -n misc/cleanup_all.sh
+          bash -n misc/build_on_ios.sh
+      - name: Plist lint (all packaged launchd jobs)
+        run: |
+          set -e
+          for p in layout/Library/LaunchDaemons/*.plist \
+                   layout/usr/macOS/LaunchDaemons/*.plist; do
+            plutil -lint "$p"
+          done
+
+  build:
+    name: Build .deb (arm64)
+    needs: validate
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host tooling (dpkg-deb, ldid)
+        run: |
+          brew install dpkg ldid
+
+      - name: Set up Theos
+        run: |
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+
+      - name: Install iPhoneOS 16.5 SDK (matches the on-device iOS 16.3 build)
+        run: |
+          curl -fL -o /tmp/iPhoneOS16.5.sdk.tar.xz \
+            "https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+          tar -xJf /tmp/iPhoneOS16.5.sdk.tar.xz -C "$THEOS/sdks"
+          ls "$THEOS/sdks"
+
+      - name: Link macOS SDK from Xcode for macOS-side subprojects
+        run: |
+          MACOS_SDK_PATH=$(xcrun --sdk macosx --show-sdk-path)
+          MACOS_SDK_VER=$(xcrun --sdk macosx --show-sdk-version)
+          ln -sfn "$MACOS_SDK_PATH" "$THEOS/sdks/MacOSX${MACOS_SDK_VER}.sdk"
+          ls "$THEOS/sdks"
+
+      - name: Stamp package version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VER="${{ github.event.inputs.version }}"
+          else
+            VER="${GITHUB_REF_NAME#v}"
+          fi
+          VER="${VER%%[[:space:]]*}"
+          sed -i '' "s/^Version:.*/Version: ${VER}/" control
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          grep '^Version:' control
+
+      - name: Build package
+        run: |
+          gmake FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+            THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 package
+
+      - name: List artifacts
+        run: |
+          ls -la packages/
+          sha256sum packages/*.deb
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macwsbootingguide-deb
+          path: packages/*.deb
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macwsbootingguide-deb
+          path: dist/
+      - name: Create / update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist/
+          VERSION="${GITHUB_REF_NAME#v}"
+          DEB=$(ls dist/*.deb | head -1)
+          echo "releasing $DEB as v${VERSION}"
+          gh release create "${GITHUB_REF_NAME}" "$DEB" \
+            --title "MacWS Booting Guide v${VERSION}" \
+            --notes "Production release built from theos iPhoneOS 16.5 SDK." \
+            --generate-notes 2>/dev/null || \
+          gh release upload "${GITHUB_REF_NAME}" "$DEB" --clobber

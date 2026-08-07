@@ -2482,7 +2482,7 @@ toggle_native_launchpad() {
 }
 
 start_macos() {
-    local ws_log_start_line=1 waited=0
+    local ws_log_start_line=1 waited=0 pboard_up=0 pbs_up=0
     if [ -f "$LOGDIR/WindowServer.err" ]; then
         ws_log_start_line=$(( $(wc -l < "$LOGDIR/WindowServer.err") + 1 ))
     fi
@@ -2648,18 +2648,30 @@ start_macos() {
     log "Starting macOS pasteboard service (launchd job '$PBOARD_LABEL')..."
     rm -f "$LOGDIR/pboard.log"
     launchctl load "$PBOARD_PLIST" || return 1
+    log "Starting macOS Services database service (launchd job '$PBS_LABEL')..."
+    rm -f "$LOGDIR/pbs.log"
+    launchctl load "$PBS_PLIST" || return 1
+    log "Starting iOS/macOS clipboard and file bridge..."
+    launchctl load "$INTEROP_PLIST" || return 1
+    # pboard, pbs and interopd are independent once WindowServer is up; poll
+    # them together so two serial 10-second waits collapse into one.
     waited=0
-    while ! proc_running "$P_PBOARD" && [ "$waited" -lt 10 ]; do
+    while [ "$waited" -lt 10 ]; do
+        pboard_up=0; pbs_up=0
+        proc_running "$P_PBOARD" && pboard_up=1
+        proc_running "$P_PBS" && pbs_up=1
+        [ "$pboard_up" = 1 ] && [ "$pbs_up" = 1 ] && break
         sleep 1
         waited=$((waited + 1))
     done
     proc_running "$P_PBOARD" || {
-        log "ERROR: macOS pboard process did not start."
+        log "ERROR: macOS pboard process did not start. See $LOGDIR/pboard.log"
         return 1
     }
-
-    log "Starting iOS/macOS clipboard and file bridge..."
-    launchctl load "$INTEROP_PLIST" || return 1
+    proc_running "$P_PBS" || {
+        log "ERROR: macOS pbs process did not start. See $LOGDIR/pbs.log"
+        return 1
+    }
 
     # CLLocation's private keyed archive differs between iPadOS 16 and
     # Ventura 13.  The native producer therefore sends validated scalar fields
@@ -2672,19 +2684,6 @@ start_macos() {
         return 1
     }
     log "Native-to-Ventura location provider bridge ready."
-
-    log "Starting macOS Services database service (launchd job '$PBS_LABEL')..."
-    rm -f "$LOGDIR/pbs.log"
-    launchctl load "$PBS_PLIST" || return 1
-    waited=0
-    while ! proc_running "$P_PBS" && [ "$waited" -lt 10 ]; do
-        sleep 1
-        waited=$((waited + 1))
-    done
-    proc_running "$P_PBS" || {
-        log "ERROR: macOS pbs process did not start."
-        return 1
-    }
 
     # DockHelper is an Application-type XPC service and must remain on-demand.
     # libmachook registers this proxy bundle in Dock; xpcproxy gives the stock
@@ -2746,7 +2745,7 @@ start_macos() {
             log "ERROR: VNC process did not start."
             return 1
         }
-        sleep 2
+        sleep 1
         started_ws_unchanged "VNC startup" || return 1
     fi
 
@@ -2754,7 +2753,13 @@ start_macos() {
         log "Starting Terminal (launchd job '$TERM_LABEL')..."
         rm -f "$LOGDIR/terminal.log"
         launchctl load "$TERM_PLIST"
-        sleep 5
+        # Terminal can appear within ~1-3s of launch; poll instead of a blind
+        # 5-second settle so the fast path returns immediately.
+        waited=0
+        while ! proc_running "$P_TERMINAL" && [ "$waited" -lt 5 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
         started_ws_unchanged "Terminal startup" || return 1
     fi
 }

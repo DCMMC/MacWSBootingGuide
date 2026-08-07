@@ -47,7 +47,16 @@ for plist in /var/jb/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist \
   [ -f "$plist" ] || continue
   launchctl unload "$plist" 2>/dev/null &
 done
-sleep 3
+# Wait for the WindowServer/launchservicesd processes to actually exit, bounded
+# by the previous fixed 3s but finishing immediately when they are already gone.
+ws_unload_waited=0
+while [ "$ws_unload_waited" -lt 3 ]; do
+  if ! ps aux 2>/dev/null | grep -v grep | grep -qE 'WindowServer|launchservicesd'; then
+    break
+  fi
+  sleep 1
+  ws_unload_waited=$((ws_unload_waited + 1))
+done
 for p in $(jobs -p); do kill -9 $p 2>/dev/null; done
 
 echo === killing chroot processes ===
@@ -98,7 +107,17 @@ for pid in $(ps aux 2>/dev/null \
   kill -9 "$pid" 2>/dev/null
 done
 
-sleep 2
+# Let the KILL signals land before printing the final state; finish early when
+# everything is already dead instead of paying a fixed 2s.
+final_waited=0
+while [ "$final_waited" -lt 2 ]; do
+  if ! ps aux 2>/dev/null | grep -v grep | grep -qE \
+      "WindowServer|macwsallocd|macwsinputd|macwsdisplayd|macwsinteropd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper"; then
+    break
+  fi
+  sleep 1
+  final_waited=$((final_waited + 1))
+done
 echo
 echo === final state ===
 ps aux | grep -iE \
