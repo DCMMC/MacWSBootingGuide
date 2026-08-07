@@ -31,10 +31,10 @@ extern OSStatus SecRequirementCreateWithString(
 extern OSStatus SecRequirementCreateWithData(
     CFDataRef data, SecCSFlags flags, SecRequirementRef *requirement);
 
-static void macws_install_fsnode_root_volume_repair(void);
-static void macws_install_lsd_session_store_isolation(void);
+extern void macws_install_fsnode_root_volume_repair(void);
+extern void macws_install_lsd_session_store_isolation(void);
 static const char *macws_private_bootstrap_service_name(const char *name);
-static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
+extern BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]);
 static void macws_schedule_maps_location_capability_adapter(void);
 
