@@ -676,7 +676,7 @@ int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc >= 2 && strcmp(argv[1], "set-wallpaper") == 0) {
             const char *path = argc >= 3 ? argv[2] :
-                "/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png";
+                "/System/Library/Desktop Pictures/Motion Green.heic";
             return SetWallpaper(path);
         }
         if (argc == 2 && strcmp(argv[1], "show-launchpad") == 0) {

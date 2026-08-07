@@ -223,7 +223,7 @@ LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
 SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
 SETTINGS_EXTENSIONS_RUNTIME=/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
 SETTINGS_EXTENSIONS_RUNTIME_LOG="$LOGDIR/settings-extensions-runtime.log"
-WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png'
+WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Motion Green.heic'
 VNC_DESKTOP=macOS-iPad
 
 SPRINGBOARD=/System/Library/LaunchDaemons/com.apple.SpringBoard.plist
