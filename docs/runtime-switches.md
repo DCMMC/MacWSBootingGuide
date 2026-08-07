@@ -54,8 +54,8 @@ variables. `MallocScribble` is explicitly forbidden.
   assert bypasses are off.
 - Finder, Dock, IconServices and LaunchServices use the exact scoped chroot
   mount namespace. CarbonCore's host boot-volume refnum is translated to the
-  process-visible root refnum; the RE and runtime witnesses are in
-  [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md).
+  process-visible root refnum (runtime witness; the historical debug record was
+  removed from the release branch).
   FileCache/DesktopServices volume-map probes remain off in production.
 - The 100,000-us idle virtual-display interval temporarily changes to
   16,667 us for one second after real VNC input. This is compatibility pacing,
@@ -136,17 +136,13 @@ own library. The installed replacement is independently checked as a
 MacBook reference measurements use the matching guarded entry point:
 
 ```bash
-bash misc/run_aquarium_benchmark_safe.sh \
-  --host 127.0.0.1 --port 9222 --fish 60000 --seconds 15
+# 原 misc/run_aquarium_benchmark_safe.sh 已随历史 debug 工具移除；
+# 基准入口统一走 macos_gui.sh（--runtime-cap / --no-vnc / --pace-us）。
 ```
 
-`misc/macbook_thermal_watchdog.sh` performs the same immediate snapshot and
-300-second sampling around any supplied command, with intervention restricted
-to `critical`. On macOS it uses
-`AppleSmartBattery.Temperature` as the physical battery-temperature field and
-records `VirtualTemperature` separately; the two are not interchangeable on
-the M1 reference machine. The watchdog log defaults to
-`${TMPDIR}/macws_macbook_thermal_watchdog.log`.
+`macos_gui.sh` 自带的 `macwsthermal` 执行相同的即时快照，并把干预严格限制在
+`critical` 状态（参考实现曾由 `misc/macbook_thermal_watchdog.sh` 承担，已随历史
+debug 工具移除）。
 
 ## Inventory format
 

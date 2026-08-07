@@ -1,2 +1,0 @@
-INPUT start name='macOS-iPad' size=2388x1668 initial_rectangles=129 initial_pixels=3983184 digest=2e8106cd0ef37da3667fec84038411e329aa859116e4f52501ca75e6ebd1f70c
-INPUT FAIL operations=0 error=no changed incremental frame for left-click; nonempty_updates=0 empty_updates=121 rectangles=[]

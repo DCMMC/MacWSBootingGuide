@@ -1,2 +1,0 @@
-settings set target.process.stop-on-sharedlibrary-events false
-disassemble --start-address 0x208086b40 --end-address 0x208087080

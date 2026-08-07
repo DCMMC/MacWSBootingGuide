@@ -1,5 +1,0 @@
-settings set target.process.stop-on-sharedlibrary-events false
-image lookup -n IOSurfaceGetCompressionTypeOfPlane
-image lookup -n _IOSurfaceGetCompressionTypeOfPlane
-image lookup -r -n 'IOSurface.*Compression'
-image lookup -r -n 'IOSurfaceGet.*Plane'

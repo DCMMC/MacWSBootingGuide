@@ -1,5 +1,0 @@
-INPUT start name='macOS-iPad' size=2388x1668 initial_rectangles=129 initial_pixels=3983184 digest=94cc7293de8882c398eaee631ad8d068db7c15f762160862f1fe6d7808b99f58
-INPUT PASS operation=left-click latency=0.140s updates=1 empty_updates=1 raw_rectangles=0 raw_pixels=0 digest=3ac2a6c925583f4e56edda204188a71f9c70fcd33d4a59826d79411a8d80c9cc
-SETTLE retained=0.500s updates=18 changed_updates=0 final_digest=3ac2a6c925583f4e56edda204188a71f9c70fcd33d4a59826d79411a8d80c9cc
-final bgrx_sha256=3ac2a6c925583f4e56edda204188a71f9c70fcd33d4a59826d79411a8d80c9cc nonblack=2776547/3983184 wrote=docs/evidence/input-unification-20260731/inputlab-retina-visible-16ms/round-3.png
-INPUT PASS operations=1 final_digest=3ac2a6c925583f4e56edda204188a71f9c70fcd33d4a59826d79411a8d80c9cc

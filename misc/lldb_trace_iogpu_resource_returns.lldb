@@ -1,3 +1,0 @@
-command script import misc/lldb_trace_iogpu_resource_returns.py
-script lldb_trace_iogpu_resource_returns.install(lldb.debugger)
-continue

@@ -1,3 +1,0 @@
-[79656:0728/070553.111206:ERROR:ui/gl/angle_platform_impl.cc:47] mtl_command_buffer.mm:693 (onCommandBufferCompleted): Completed MTLCommandBuffer failed, and error is Internal Error (00000102:Internal Error)
-[79656:0728/070553.124226:ERROR:ui/gl/angle_platform_impl.cc:47] mtl_command_buffer.mm:693 (onCommandBufferCompleted): Completed MTLCommandBuffer failed, and error is Internal Error (00000102:Internal Error)
-[79656:0728/070553.152172:ERROR:ui/gl/angle_platform_impl.cc:47] mtl_command_buffer.mm:693 (onCommandBufferCompleted): Completed MTLCommandBuffer failed, and error is Internal Error (00000102:Internal Error)

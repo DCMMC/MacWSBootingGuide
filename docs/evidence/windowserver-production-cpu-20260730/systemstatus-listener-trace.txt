@@ -1,8 +1,0 @@
-Runtime capture from a direct macOS 13 systemstatusd launch with
-MACWS_XPC_DEBUG=1.  This proves the server listeners enter the same
-xpc_connection_create_mach_service hook as clients; flags=0x1 is the listener
-flag.  It is why one exact-name mapping in libmachook can rewrite both ends.
-
-#### XPC_TRACE mach_service create: 'com.apple.systemstatus' flags=0x1
-#### XPC_TRACE mach_service create: 'com.apple.systemstatus.publisher' flags=0x1
-#### XPC_TRACE mach_service create: 'com.apple.systemstatus.activityattribution' flags=0x1

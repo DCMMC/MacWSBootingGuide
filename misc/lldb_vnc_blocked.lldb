@@ -1,3 +1,0 @@
-settings set target.process.stop-on-sharedlibrary-events false
-thread list
-thread backtrace all

@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-06；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口；证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。2026-08-06 的真实手指验收确认弹出菜单和单指滚动惯性均达到预期；长按拖动的全屏坐标负反馈根因已用运行轨迹确认并修复部署，等待修复后的真实手指最终复验。四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-06；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行。System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。2026-08-06 的真实手指验收确认弹出菜单和单指滚动惯性均达到预期；长按拖动的全屏坐标负反馈根因已用运行轨迹确认并修复部署，等待修复后的真实手指最终复验。四窗与完整性能门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -94,7 +94,7 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 
 RE-confirmed via 20D67 SpringBoard `-[SpringBoard _handleEnterFullScreenKeyShortcut:]` `0x1c7669808`：系统从 active display window scene 取得 switcher controller，并执行 action `0x11`（十进制 17）。runtime-confirmed via `MacWSWindowing.log`：目标 Scene 首次尝试即 `exact-focus=YES`、`action=YES`，随后记录 `fullscreen-performed ... action=17`。Host 冷恢复又在 0/250/1250 ms 三次记录 `status-hidden=YES`、`home-indicator-auto-hide=YES`、`deferred-edges=15` 以及 Scene/screen bounds 均为 1389×970；像素截图未出现 iOS 状态栏或 Home Indicator。
 
-全屏桌面输入不绑定一个永久 owner。指针、触摸与滚动以 `targetPID=0` 进入 `macwsinputd`，由 `CGWindowListCopyWindowInfo` 的真实前后顺序逐点选择第一个包含该点的非 WindowServer、非负层窗口。这样普通应用窗口、AppKit 弹出层、Dock/Launchpad 以及 SystemUIServer/ControlCenter 状态项走同一中央算法。runtime-confirmed：Launchpad 点击命中 `owner=Dock layer=27 window=25` 并改变文件夹展开状态；右上角点击打开了真实 macOS Control Center。完整证据见 [`fullscreen-aqua-workspace-20260802.md`](fullscreen-aqua-workspace-20260802.md)。
+全屏桌面输入不绑定一个永久 owner。指针、触摸与滚动以 `targetPID=0` 进入 `macwsinputd`，由 `CGWindowListCopyWindowInfo` 的真实前后顺序逐点选择第一个包含该点的非 WindowServer、非负层窗口。这样普通应用窗口、AppKit 弹出层、Dock/Launchpad 以及 SystemUIServer/ControlCenter 状态项走同一中央算法。runtime-confirmed：Launchpad 点击命中 `owner=Dock layer=27 window=25` 并改变文件夹展开状态；右上角点击打开了真实 macOS Control Center（实时证据，历史 debug 记录已从 release 分支移除）。
 
 #### 台前调度尺寸档位突破
 
@@ -485,7 +485,7 @@ NSMainMenu
 | Desktop owner（规划） | 新 `macws_desktop_protocol.h`、系统控制服务、Host 三指识别器 | capability、一次执行、全屏门控、系统后端证据和结果回执 |
 | Windowing owner（规划） | 新 SpringBoard tweak（路径待定）、对应 iPadOS 16 私有头与 probe | Chamois 候选数组、Scene 隔离、geometry 提交、恢复开关与版本门控 |
 | Bootstrap owner | `layout/usr/macOS/`、根 Makefile | launchd 顺序、清理、签名、打包 |
-| Evidence owner | `misc/`、`docs/evidence/` | probe、基准、日志索引、结果判定 |
+| Evidence owner | `misc/` 保留的 load-bearing RE 工具 | 反汇编/寄存器证据、结果判定（历史 debug 记录已从 release 分支移除） |
 
 建议集成顺序：协议与纯函数 → producer/AppKit → input/interop → Host → bootstrap → 设备证据。上游协议未合并前，下游 agent 不复制临时结构体到自己的模块。
 
@@ -565,7 +565,7 @@ NSMainMenu
 - runtime-confirmed via SpringBoard witness：dense-grid height 为 `original=4 expanded=36 minimum=603 maximum=922`，width 为 `original=8 expanded=109 minimum=327 maximum=1341`；Host 同期收到 `710x810`、`1004x670`、`1004x807`、`1052x671` 等 Scene geometry。该证据确认新增候选和多种真实 Scene bounds 已到运行系统，但用户手指拖过全部档位的最终手感仍待复测。
 - runtime-confirmed via Terminal diagnostics：一条 420-point scroll change 命中精确窗口 54 并记录 `route=NSWindow.sendEvent`，截图显示内容实际滚动。120 个约 60 Hz scroll change 在 2.003 秒内发送；第 120 帧记录 capture→receipt 1.615 ms、receipt→submit 5.755 ms、submit→complete 2.633 ms，producer `outstanding=1 dropped=0`。这不是整段交互的 input-to-visible p95，不能据此宣称完整 60 fps 验收已通过。
 - runtime-confirmed via `macwsdisplayd.err`（2026-08-02）：冷启动时 AppKit 给出 `runtime-confirmed AppKit display backing-scale=2.000 frame={{0, 0}, {1194, 834}}`。全屏 canvas 随后记录 `workspace-start id=3 display=2388x1668 scale=2.000`，基础帧与桌面层目的坐标均为 2388×1668，修复了旧 1194×834 canvas 与 2× layer/input 坐标混用造成的放大裁剪和点击偏移。
-- runtime-confirmed via `macwsdisplayd.err` + 双客户端集成探针（2026-08-03）：完整桌面捕获图是唯一物理资源。新的前台全屏 Scene 直接接管仍在运行的 stream/layer 对象和各层最后一张 IOSurface，不 stop/recreate SkyLight 捕获流。正式包的 witness 为 `workspace-handoff stream=1 layers=11 ... transport=live-graph-transfer`，WindowServer PID `78356` 和 displayd PID `79399` 交接前后不变；对照失败实现曾得到 PID `75537 → 78356` 和 `layer-start failed ... error=-308`。Host 在新代际首帧前提交黑色 Metal clear，旧单窗 drawable 不会被系统全屏动画放大成伪桌面。完整证据见 [`fullscreen-aqua-workspace-20260802.md`](fullscreen-aqua-workspace-20260802.md)。
+- runtime-confirmed via `macwsdisplayd.err` + 双客户端集成探针（2026-08-03）：完整桌面捕获图是唯一物理资源。新的前台全屏 Scene 直接接管仍在运行的 stream/layer 对象和各层最后一张 IOSurface，不 stop/recreate SkyLight 捕获流。正式包的 witness 为 `workspace-handoff stream=1 layers=11 ... transport=live-graph-transfer`，WindowServer PID `78356` 和 displayd PID `79399` 交接前后不变；对照失败实现曾得到 PID `75537 → 78356` 和 `layer-start failed ... error=-308`。Host 在新代际首帧前提交黑色 Metal clear，旧单窗 drawable 不会被系统全屏动画放大成伪桌面（实时 witness，历史 debug 记录已从 release 分支移除）。
 - runtime-confirmed via `MacWSHost.log`（2026-08-02）：从 Terminal window 21/group 16 进入桌面后，第二次同一 action 记录 `scene-reused mode=window restored-from-workspace window=21 owner=35681 group=16 scene-size=1194.0x807.0`；持久化字典从 `mode=1, return_window_id=21` 回到 `mode=2, window_id=21`。Host 进程重建与 DisplayStream 服务重连后仍能恢复该精确窗口身份。
 - runtime-confirmed via设备端 Host UI 截图（`/var/mobile/Library/Logs/MacWSHost-ui.png`）：全屏画面没有 Host 语义菜单栏，保留完整 macOS 原生菜单栏和右上角独立材质按钮；展开控制中心为不透出桌面颜色的浅色实底，标签、分段控件与按钮对比度一致。
 - 当前画面性能尚未达标：关闭 `OSXvnc-server` 和全屏 mmap producer 后，同一动态窗口的接受序号 120→240 用时 3.210 秒（37.4 fps），240→360 用时 3.106 秒（38.6 fps）；producer 同期记录 `outstanding=2/3` 和持续 drop。带 VNC 会话的同负载为约 38–40 fps，因此 RFB/mmap 已被 A/B 排除为主因。这里只把剩余瓶颈归到 DisplayStream/lease/presentation 边界，具体根因仍需新的运行或 RE 证据。
@@ -590,10 +590,8 @@ NSMainMenu
 ### 1. 本地静态与构建测试
 
 ```bash
-cc -std=c11 -Wall -Wextra -Werror -Iinclude \
-  misc/macws_protocol_test.c -lm -o /tmp/macws_protocol_test
-/tmp/macws_protocol_test
-
+# 协议静态断言：原 misc/macws_protocol_test.c 已随历史 debug 工具移除；
+# 使用 include/macws_host_protocol.h 内嵌的 _Static_assert 即可。
 gmake -C MacWSHost all GO_EASY_ON_ME=1
 gmake -C macwsdisplayd all GO_EASY_ON_ME=1
 gmake -C macwsinputd all GO_EASY_ON_ME=1

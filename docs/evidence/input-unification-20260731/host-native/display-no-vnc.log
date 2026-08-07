@@ -1,8 +1,0 @@
-MACWS-DISPLAY backpressure stream=8 window=4 outstanding=3 dropped=1
-MACWS-DISPLAY throughput stream=8 window=4 frames=120 elapsed=18.783 fps=6.34 outstanding=2 dropped=40
-MACWS-DISPLAY throughput stream=8 window=4 frames=240 elapsed=21.993 fps=10.87 outstanding=2 dropped=75
-MACWS-DISPLAY throughput stream=8 window=4 frames=360 elapsed=25.099 fps=14.30 outstanding=3 dropped=103
-1785484726.231 display-perf stream=8 sequence=120 capture-to-receipt-ms=1.675 receipt-to-submit-ms=1.157 submit-to-complete-ms=2.540 status=4 error=nil
-1785484729.457 display-perf stream=8 sequence=240 capture-to-receipt-ms=17.841 receipt-to-submit-ms=1.209 submit-to-complete-ms=2.010 status=4 error=nil
-1785484732.581 display-perf stream=8 sequence=360 capture-to-receipt-ms=36.936 receipt-to-submit-ms=1.289 submit-to-complete-ms=1.638 status=4 error=nil
-process witness: macwsdisplayd and MacWSHost running; OSXvnc-server absent

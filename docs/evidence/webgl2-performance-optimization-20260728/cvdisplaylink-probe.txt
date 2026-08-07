@@ -1,9 +1,0 @@
-CVDL nominal value=200080 scale=24000000 flags=0 hz=119.952019 latency_s=0.000000000 running=0
-CVDL callback=2 host=6288638799760 delta_ms=8.337 videoTime=6288638849760 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL callback=3 host=6288638999840 delta_ms=8.337 videoTime=6288639049840 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL callback=4 host=6288639244920 delta_ms=10.212 videoTime=6288639249920 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL callback=5 host=6288639449000 delta_ms=8.503 videoTime=6288639450000 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL callback=6 host=6288639653080 delta_ms=8.503 videoTime=6288639650080 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL callback=7 host=6288639858497 delta_ms=8.559 videoTime=6288639850160 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL callback=8 host=6288640061381 delta_ms=8.454 videoTime=6288640050240 scale=24000000 refreshPeriod=200080 flags=0x1b
-CVDL summary callbacks=574 elapsed_s=4.993916 measured_hz=114.739612 min_ms=4.525 max_ms=104.539

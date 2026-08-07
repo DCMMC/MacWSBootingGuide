@@ -1,5 +1,0 @@
-image list -o -f
-image lookup -n IOGPUDeviceCreateWithAPIProperty
-image lookup -n IOGPUCommandQueueCreateWithQoS
-image lookup -n IOServiceOpen
-image lookup -n IOConnectCallMethod
