@@ -6,16 +6,29 @@
 #
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh production        # one-click production profile
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist     # same production defaults, explicit command
+#   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start coexist --debug  # debug-mode session (rich diagnostics)
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start exclusive   # macOS takes the physical panel + VNC
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop              # tear everything down, return to iOS
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh restart coexist   # stop, then start in the given mode
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh status            # show what is running
+#
+# Runtime modes:
+#   production (default) — no diagnostic env/sentinels; production_preflight
+#       asserts a clean environment before WindowServer starts, and strips any
+#       leftover debug environment so a crashed debug session self-heals.
+#   --debug — one-click debug session: enables the full diagnostic sentinel set
+#       (as --diagnostics) AND injects getenv-driven libmachook traces
+#       (CRASH_DIAG/ABORT_TRACE/IOSURF_TRACE/XPC_DEBUG/...) into the
+#       WindowServer, VNC and Terminal launchd contracts before load.  A debug
+#       session is intentionally heavier and slower; `stop` restores the
+#       production plists.
 #
 # Options for start/restart:
 #   coexist | exclusive   display mode (default: coexist)
 #   --experimental        compatibility alias; native-AGX path is now the default
 #   --no-experimental     explicit control run without the native-AGX VNC adapters
 #   --diagnostics         also enable high-overhead AGX flight recorders/traces
+#   --debug               full debug session (diagnostics + trace env; see above)
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
 #   --pace-us=N           diagnostic synthetic-completion pace (8333..100000)
@@ -167,6 +180,19 @@ CAPTURE_READY_WAIT=60
 # clean-producer witness shortly after the launcher had returned failure.
 WINDOWSERVER_READY_WAIT=90
 STARTED_WS_PID=""
+
+# ─── Runtime mode: production (default) vs debug ─────────────────────────────
+# `start --debug` turns a session into a diagnostic session.  Every key below is
+# a getenv-driven libmachook trace that is off in production; the canonical
+# WindowServer plist is edited in place before load and stripped again on stop.
+# Deliberately EXCLUDES the behavior-changing LAZY/scaffold toggles
+# (MACWS_KEEP_ASSERT_BYPASS, MACWS_KEEP_RENDER_UPDATE_CBZ, MACWS_AGXIOC_FUZZ,
+# MACWS_AGX_ZERO_QUEUE_ARGS, MACWS_RESTORE_OUTBUMP) — those are not safe even
+# in a debug session.  Keep this list in sync with docs/runtime-switches.tsv.
+MACWS_DEBUG_ENV_KEYS="MACWS_MODE MACWS_RUNTIME_DIAGNOSTICS MACWS_AGX_CRASH_DIAG MACWS_ABORT_TRACE MACWS_IOSURF_TRACE MACWS_XPC_DEBUG MACWS_MACH_MSG_TRACE MACWS_VNC_TRACE_CLIENT_MESSAGES MACWS_AGX_LIFE_VERBOSE"
+# Debug plists are edited in place (WS canonical + script-owned VNC/Terminal).
+# The canonical WS plist is the only one that must be stripped again on stop.
+MACWS_DEBUG_PLISTS="$WINDOWSERVER_PLIST"
 
 VNC_BIN=/usr/local/bin/OSXvnc-server                                              # chroot path
 TERM_BIN="/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"   # chroot path
@@ -1825,9 +1851,109 @@ clear_diagnostic_state() {
         -exec rm -f {} \; 2>/dev/null
 }
 
+# ─── Runtime-mode plist helpers (production/debug) ──────────────────────────
+# Debug mode injects the MACWS_DEBUG_ENV_KEYS into a launchd plist's
+# EnvironmentVariables.  Uses procursus python3 (plistlib) because the device
+# plutil only reads.  Editing is idempotent; stripping preserves every other
+# key, so a legitimately-updated production plist is never reverted.
+
+plist_has_debug_env() {
+    # Detection is plistlib-based (not plutil text parsing) because plutil's
+    # output format differs between the device and macOS hosts.
+    local plist="$1"
+    [ -f "$plist" ] || return 1
+    MACWS_PLIST_TARGET="$plist" MACWS_DEBUG_ENV_KEYS="$MACWS_DEBUG_ENV_KEYS" \
+        /var/jb/usr/bin/python3 - >/dev/null 2>&1 <<'PYEOF'
+import os, plistlib, sys
+path = os.environ["MACWS_PLIST_TARGET"]
+keys = os.environ["MACWS_DEBUG_ENV_KEYS"].split()
+with open(path, "rb") as f:
+    data = plistlib.load(f)
+env = data.get("EnvironmentVariables") or {}
+sys.exit(0 if any(k in env for k in keys) else 1)
+PYEOF
+}
+
+plist_env_apply() {
+    # plist_env_apply <plist> KEY=VALUE [...]
+    local plist="$1"; shift
+    [ -f "$plist" ] || return 0
+    MACWS_PLIST_TARGET="$plist" /var/jb/usr/bin/python3 - "$@" <<'PYEOF'
+import os, plistlib, sys
+path = os.environ["MACWS_PLIST_TARGET"]
+pairs = [a.split("=", 1) for a in sys.argv[1:]]
+with open(path, "rb") as f:
+    data = plistlib.load(f)
+env = data.setdefault("EnvironmentVariables", {})
+for k, v in pairs:
+    env[k] = v
+with open(path, "wb") as f:
+    plistlib.dump(data, f)
+PYEOF
+}
+
+plist_env_strip() {
+    local plist="$1"
+    [ -f "$plist" ] || return 0
+    MACWS_PLIST_TARGET="$plist" MACWS_DEBUG_ENV_KEYS="$MACWS_DEBUG_ENV_KEYS" \
+        /var/jb/usr/bin/python3 - >/dev/null 2>&1 <<'PYEOF'
+import os, plistlib
+path = os.environ["MACWS_PLIST_TARGET"]
+keys = os.environ["MACWS_DEBUG_ENV_KEYS"].split()
+with open(path, "rb") as f:
+    data = plistlib.load(f)
+env = data.get("EnvironmentVariables")
+if env:
+    for k in keys:
+        env.pop(k, None)
+    with open(path, "wb") as f:
+        plistlib.dump(data, f)
+PYEOF
+}
+
+# Strip any leftover debug environment from the canonical plists.  Runs on every
+# production start (self-heal after a crashed debug session) and on stop.
+restore_production_plists() {
+    local plist
+    for plist in $MACWS_DEBUG_PLISTS; do
+        if plist_has_debug_env "$plist"; then
+            plist_env_strip "$plist"
+            log "WARNING: stripped leftover debug environment from $plist (previous session did not stop cleanly)."
+        fi
+    done
+}
+
+# Apply the requested runtime mode to the launchd contracts.  Must run AFTER
+# write_plists() (script-owned VNC/Terminal plists are regenerated there) and
+# BEFORE any launchctl load.  Production mode heals and returns.
+apply_runtime_mode() {
+    if [ "$WANT_DEBUG" != 1 ]; then
+        restore_production_plists
+        return 0
+    fi
+    local key value plist
+    for key in $MACWS_DEBUG_ENV_KEYS; do
+        value=1
+        [ "$key" = MACWS_MODE ] && value=debug
+        for plist in $WINDOWSERVER_PLIST "$VNC_PLIST" "$TERM_PLIST"; do
+            plist_env_apply "$plist" "$key=$value"
+        done
+    done
+    log "RUNTIME-MODE: DEBUG session — diagnostic sentinels + WindowServer/VNC/Terminal trace env enabled."
+}
+
+# Full teardown of a debug session: strip injected env (idempotent).
+runtime_mode_clear() {
+    restore_production_plists
+}
+
 production_preflight() {
     local path plist key bad=0
     clear_diagnostic_state
+    # Self-heal: a crashed debug session may have left MACWS_DEBUG_ENV_KEYS in
+    # the canonical plists.  Strip them so a cold production start never inherits
+    # diagnostic behavior; the checks below then verify the clean state.
+    restore_production_plists
 
     # No production launch job may enable allocator/debug flight recorders via
     # environment.  Functional compatibility variables are documented and
@@ -2635,6 +2761,7 @@ start_macos() {
 
 stop_all() {
     cleanup_macos
+    runtime_mode_clear
     rm -f "$FLAG"
     # A watchdog stop does not pass back through macwshostd, so it must clear
     # the diagnostic sentinels itself.  Otherwise the next ordinary CLI start
@@ -2720,7 +2847,7 @@ macos_gui.sh — start/stop the chroot macOS GUI (WindowServer + VNC + Terminal)
 
 Usage (run as root):
   sudo bash $0 production
-  sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc]
+  sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics|--debug] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc]
   sudo bash $0 switches
   sudo bash $0 guard [coexist|exclusive] [...]  # re-arm only; no GUI restart
   sudo bash $0 launchpad
@@ -2731,6 +2858,17 @@ Usage (run as root):
 Modes:
   coexist     (default) iPad panel keeps showing iOS; macOS renders to VNC only.
   exclusive   macOS takes over the physical panel as well as VNC.
+
+Runtime modes:
+  production (default) — native AGX + its required command/completion adapters,
+      no diagnostic env/sentinels. production_preflight asserts a clean
+      environment and strips any leftover debug state before starting, so a
+      crashed debug session self-heals on the next production start.
+  --debug — full diagnostic session: --diagnostics PLUS getenv-driven
+      libmachook traces (AGX_CRASH_DIAG, ABORT_TRACE, IOSURF_TRACE, XPC_DEBUG,
+      MACH_MSG_TRACE, AGX_LIFE_VERBOSE) injected into the WindowServer/VNC/
+      Terminal contracts. Slower and heavier by design; `stop` restores the
+      production contracts.
 
 Safety: start launches a mandatory launchd-backed iOS-native health watchdog
 before the GUI. If the guard is killed abnormally, launchd restarts it and its
@@ -2771,6 +2909,7 @@ WANT_VNC=1
 WANT_TERMINAL=1
 WANT_EXPERIMENTAL=1
 WANT_DIAGNOSTICS=0
+WANT_DEBUG=0
 COEXIST_PACE_US=""
 for a in "$@"; do
     case "$a" in
@@ -2779,6 +2918,7 @@ for a in "$@"; do
         --experimental)          WANT_EXPERIMENTAL=1 ;;
         --no-experimental)       WANT_EXPERIMENTAL=0 ;;
         --diagnostics)           WANT_DIAGNOSTICS=1 ;;
+        --debug)                 WANT_DEBUG=1; WANT_DIAGNOSTICS=1 ;;
         --pace-us=*)             COEXIST_PACE_US="${a#--pace-us=}" ;;
         --runtime-cap=*)         WD_MAX_RUNTIME="${a#--runtime-cap=}" ;;
         --no-terminal)           WANT_TERMINAL=0 ;;
@@ -3039,6 +3179,7 @@ case "$CMD" in
         write_gui_start_state assets "preparing the production application profile"
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
+        apply_runtime_mode
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
             write_gui_start_state preflight "validating native AGX production switches"
             production_preflight || { stop_all; exit 1; }
@@ -3075,6 +3216,7 @@ case "$CMD" in
         write_gui_start_state assets "preparing the production application profile"
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
+        apply_runtime_mode
         if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_DIAGNOSTICS" != 1 ]; then
             write_gui_start_state preflight "validating native AGX production switches"
             production_preflight || { stop_all; exit 1; }

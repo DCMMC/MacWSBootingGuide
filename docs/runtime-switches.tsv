@@ -122,6 +122,7 @@ env	MACWS_PROBE_REGISTER_ORIGINAL	off	standalone ExtensionRecord probe	Calls the
 env	MACWS_PROBE_STOP_BEFORE_REGISTER	off	standalone ExtensionRecord probe	Stops immediately before the explicit private registration call for LLDB.
 env	MACWS_PROBE_SUBMIT	off	standalone OSLaunchdJob probe	Submits the bounded private RunningBoard launchd-job diagnostic workload.
 env	MACWS_RESTORE_OUTBUMP	off	A/B control	Restores historical selector output-count mutation.
+env	MACWS_MODE	off	launcher marker	Runtime-mode marker injected by macos_gui.sh --debug (production|debug); consumed by launcher/control-center status, not by libmachook.
 env	MACWS_RUNTIME_DIAGNOSTICS	off	diagnostic master	Enables high-overhead flight recorders.
 env	MACWS_SUBMIT_FAST_RING	off	diagnostic	Fixed-memory AGX submit recorder.
 env	MACWS_SURF_FILL_IOS	off	diagnostic	IOSurface fill probe.
