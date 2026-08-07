@@ -12,16 +12,25 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
-# Incremental mode: skip `make clean` and only rebuild changed files.
-# Triggered by env FAST=1 or argument --fast. The first build of the day
-# should still be a full one; subsequent edits to libmachook/*.m can use
-# the fast path to cut build time from ~20s to a few seconds.
+# Incremental by default: reuse the .theos object cache and only recompile
+# what changed (Theos tracks header deps via .Td files). Pass --clean / CLEAN=1
+# to force a from-scratch rebuild; --fast ships only libmachook; --resume
+# preserves objects of an interrupted full build.
+#
+# Parallelism: the aggregate Makefile walks subprojects serially (staging dir
+# races otherwise), but GNU make -j propagates via MAKEFLAGS to each
+# subproject's instance make, which runs with _THEOS_MAKE_PARALLEL=yes and
+# compiles its object files in parallel. libmachook alone has ~32 .o jobs
+# (16 sources x arm64/arm64e), so -j$JOBS is the big win.
 FAST=${FAST:-0}
 FAST_FORCE=${FAST_FORCE:-0}
 SKIP_CLEAN=${SKIP_CLEAN:-0}
+CLEAN=${CLEAN:-0}
+JOBS=${JOBS:-$(nproc 2>/dev/null || echo 4)}
 for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
 for arg in "$@"; do [ "$arg" = "--fast-force" ] && FAST=1 && FAST_FORCE=1; done
 for arg in "$@"; do [ "$arg" = "--resume" ] && SKIP_CLEAN=1; done
+for arg in "$@"; do [ "$arg" = "--clean" ] && CLEAN=1; done
 
 # Guardrail: FAST only copies libmachook.{arm64,arm64e}.dylib to the rootfs.
 # Any other build artefact (CydiaSubstrate tweak under TweakInject, iOS-side
@@ -74,13 +83,15 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" = "1" ]; then
     echo "==> FAST_FORCE: explicitly shipping libmachook only; non-libmachook changes are not packaged"
 fi
 
-if [ "$FAST" != "1" ] && [ "$SKIP_CLEAN" != "1" ]; then
+if [ "$FAST" = "1" ]; then
+    echo "==> FAST mode: skipping make clean (incremental build)"
+elif [ "$CLEAN" = "1" ]; then
     echo "==> Cleaning previous build..."
     make clean 2>/dev/null || true
-elif [ "$FAST" != "1" ]; then
+elif [ "$SKIP_CLEAN" = "1" ]; then
     echo "==> RESUME mode: preserving successful objects from the interrupted full build"
 else
-    echo "==> FAST mode: skipping make clean (incremental build)"
+    echo "==> Incremental build: reusing .theos cache (--clean forces a full rebuild)"
 fi
 
 echo "==> Building..."
@@ -111,11 +122,11 @@ if [ "$FAST" = "1" ]; then
     # this both keeps `interpose.h` on the project include path and reuses the
     # existing root .theos object cache.
     THEOS_PROJECT_DIR="$PROJECT_DIR" THEOS_BUILD_DIR="$PROJECT_DIR" \
-        make -C libmachook \
+        make -j"$JOBS" -C libmachook \
         FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
         GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
 else
-    make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
+    make -j"$JOBS" FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
         GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
 fi
 
@@ -135,7 +146,7 @@ fi
 
 if [ "$FAST" != "1" ]; then
 echo "==> Packaging..."
-make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+make -j"$JOBS" FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
 	LIBMACHOOK_ON_DEVICE_BUILD=1 package
 
 # Find the built .deb
