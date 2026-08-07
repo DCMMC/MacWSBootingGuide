@@ -238,6 +238,48 @@ ssh -p 2222 root@192.168.5.8 'sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c "ec
 Git operations over SSH fail due to host-key policy; use `git reset --hard
 origin/main` to sync (fetch works with HTTPS, push does not from device).
 
+#### Git workflow (commit on iOS, push from macOS)
+
+**The canonical git repo is the one on the device**
+(`/var/jb/var/mobile/MacWSBootingGuide`). Make edits and `git commit` there;
+never create commits from the macOS checkout.
+
+- Device `git push` fails (host-key policy). `git fetch` works over HTTPS.
+- `git am` on macOS re-creates commits with a different hash than the device's
+  `git commit`, so macOS and device commit hashes diverge even when content is
+  identical — that is expected; always reconcile by resetting BOTH repos to
+  `origin/<branch>`.
+
+Standard flow (edit → build → ship):
+
+```bash
+# 1. On the device: edit files, commit, then push it out as a patch
+cd /var/jb/var/mobile/MacWSBootingGuide
+git add -A && git commit -m "subject"
+git format-patch -1 --stdout > /tmp/macws.patch
+# (scp the patch to macOS; then on macOS:)
+
+# 2. On macOS: apply, push, reconcile local checkout
+cd ~/Downloads/Projects/MacWSBootingGuide
+git fetch origin && git am /tmp/macws.patch
+git push origin release/production
+git fetch origin && git reset --hard origin/release/production   # keep macOS checkout in sync
+
+# 3. Back on the device: reconcile device repo to the pushed commit
+cd /var/jb/var/mobile/MacWSBootingGuide
+git fetch origin && git reset --hard origin/release/production
+```
+
+Steps 2+3 can be collapsed when both sides can reach origin: after step 1's
+commit, just `git fetch && git reset --hard origin/<branch>` on the device (if
+already pushed) and `git fetch && git reset --hard` + `git push` on macOS (if
+not). The rule that matters: **device commits, macOS pushes, both resets to
+origin.**
+
+After a device-side commit that has NOT been pushed yet, `git reset --hard
+origin/<branch>` on macOS will discard any uncommitted local edits there — copy
+them into a device-side commit first.
+
 ### Build on iOS (on-device) manually
 
 ```bash
