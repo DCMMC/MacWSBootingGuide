@@ -11,9 +11,10 @@ include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = libmachook
 
-libmachook_FILES = jit.m objc_hooks.c mac_hooks.m AppInputBridge.m LocalFilePanel.m os_variant_hooks.x \
-  ControlCenter_hooks.x Metal_hooks.x QuartzCore_hooks.x os_log_hooks.m \
-  exec_hooks.c
+libmachook_FILES = jit.m objc_hooks.c mac_hooks.m mac_hooks_vnc.m \
+  mac_hooks_iosurface.m mac_hooks_iogpu.m AppInputBridge.m LocalFilePanel.m \
+  os_variant_hooks.x ControlCenter_hooks.x Metal_hooks.x QuartzCore_hooks.x \
+  os_log_hooks.m exec_hooks.c
 libmachook_FRAMEWORKS = IOKit IOSurface Metal
 # -isystem: use the vendored iOS xpc headers (the theos iPhoneOS SDK ships
 # without xpc/). See ../vendor/ios-xpc/README.md.
