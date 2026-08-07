@@ -606,6 +606,72 @@ unload + load` was skipped, or the file inside the deb is being shadowed).
 
 ---
 
+## Runtime Modes: production (default) vs debug
+
+A session runs in exactly one runtime mode. Production is the default and is
+what ships in release packages; debug is an explicit, heavier diagnostic mode.
+
+### How the mode is selected
+
+- **CLI**: `bash macos_gui.sh start --debug` (or `--diagnostics` for the legacy
+  sentinel-only subset). `production` / plain `start` = production.
+- **Control Center** (MacWSHost): the "调试模式" switch under "启动模式"
+  persists `MacWSDebugMode` in NSUserDefaults and sends the `debug` key on the
+  start op (`MACWS_CONTROL_KEY_DEBUG`). macwshostd passes `--debug` to
+  `macos_gui.sh`.
+
+### What production mode guarantees
+
+- `production_preflight` asserts a clean environment before WindowServer loads:
+  no diagnostic env/sentinels, required native-AGX vars present.
+- **Self-healing**: if a debug session crashed without stopping cleanly, the
+  leftover `MACWS_DEBUG_ENV_KEYS` are stripped from the WindowServer plist on
+  the next production start (warned, not fatal), so a cold production start
+  always recovers to full functionality.
+
+### What debug mode does
+
+1. Touches the full `--diagnostics` sentinel set (command-error recorder, fast
+   submit ring, PF550 observer, `macws_runtime_diagnostics`, MTLCompilerService
+   diagnostics).
+2. Injects `MACWS_DEBUG_ENV_KEYS` into the WindowServer (canonical plist, edited
+   in place before load) plus the script-owned VNC/Terminal plists:
+   `MACWS_MODE=debug`, `MACWS_RUNTIME_DIAGNOSTICS=1`, `MACWS_AGX_CRASH_DIAG=1`,
+   `MACWS_ABORT_TRACE=1`, `MACWS_IOSURF_TRACE=1`, `MACWS_XPC_DEBUG=1`,
+   `MACWS_MACH_MSG_TRACE=1`, `MACWS_VNC_TRACE_CLIENT_MESSAGES=1`,
+   `MACWS_AGX_LIFE_VERBOSE=1`.
+3. `stop` / `stop_all` strip the injected env again (idempotent, preserves all
+   other plist keys) and clear the diagnostic sentinels.
+
+Deliberately excluded even from debug mode: the behavior-changing LAZY/scaffold
+toggles (`MACWS_KEEP_ASSERT_BYPASS`, `MACWS_KEEP_RENDER_UPDATE_CBZ`,
+`MACWS_AGXIOC_FUZZ`, `MACWS_AGX_ZERO_QUEUE_ARGS`, `MACWS_RESTORE_OUTBUMP`).
+They are not safe to enable.
+
+### Error reporting
+
+`macwshostd` runs the lifecycle script through `RunCommandCapture`, so a failed
+`start`/`stop` relays a bounded tail of `macos_gui.sh` output in the
+`last_error_detail` status key (protocol v5). The Control Center auto-opens the
+log pane with that detail whenever an operation fails.
+
+### Control Center module layout
+
+`MacWSHost/` is no longer a single 8600-line file:
+- `MacWSHostSupport.{h,m}` — shared statics (MacWSLog, diagnostics gates,
+  frame/ack helpers, HID keymap, path constants).
+- `MacWSMetalView.{h,m}` — the MTKView display/input pipeline,
+  `MacWSDirectTouchState`, status delegate protocol, `MacWSMappedFrame`.
+- `main.m` — scene/controller/app lifecycle.
+
+### CI / releases
+
+- `.github/workflows/ci.yml` — runtime-switch audit + shell syntax + plist lint
+  on every push/PR.
+- `.github/workflows/release.yml` — builds the `.deb` on `macos-latest` (Theos +
+  theos/sdks `iPhoneOS16.5.sdk` + Xcode macOS SDK + `brew install dpkg ldid`),
+  attaches it to a GitHub Release on `v*` tags.
+
 ## Skills: Common Operations
 
 ### Skill: Sign and Trustcache a Single Binary
