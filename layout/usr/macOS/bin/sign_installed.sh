@@ -19,7 +19,12 @@ ROOTFS=/var/mnt/rootfs
 # ── snapshot current trustcache so we can skip already-trusted entries ────────
 
 TC_CACHE=$(mktemp /tmp/tc_cache.XXXXXX)
-"$JBCTL" trustcache list 2>/dev/null | tr '[:upper:]' '[:lower:]' > "$TC_CACHE"
+# Dopamine's `trustcache list` currently returns an empty result even when the
+# dynamic trustcache is populated.  `trustcache info` is the read-only command
+# that exposes the live hashes, and is also what postinst.sh uses.  Using the
+# empty `list` output made every invocation re-add all hashes and steadily
+# accumulated obsolete entries while testing large application bundles.
+"$JBCTL" trustcache info 2>/dev/null | tr '[:upper:]' '[:lower:]' > "$TC_CACHE"
 trap 'rm -f "$TC_CACHE"' EXIT
 printf 'Loaded %d existing trustcache entries.\n' "$(wc -l < "$TC_CACHE")"
 
