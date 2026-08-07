@@ -1072,7 +1072,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     NSArray<UIButton *> *_softModifierButtons;
     uint32_t _softModifiers;
     UITextView *_logsView;
-    UISwitch *_experimentalSwitch;
     UISwitch *_debugSwitch;
     UISegmentedControl *_inputModeControl;
     UISegmentedControl *_densityControl;
@@ -1082,7 +1081,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     MacWSMetalView *_metalView;
     NSTimer *_statusTimer;
     NSDictionary<NSString *, id> *_latestStatus;
-    BOOL _experimentalTouched;
     BOOL _debugTouched;
     uint64_t _inputLogSequence;
     NSString *_lastLoggedControlSummary;
@@ -1257,10 +1255,6 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
         _interopClient = [MacWSInteropClient new];
         _interopClient.delegate = self;
         _menuClient = [MacWSMenuClient new];
-        NSUserDefaults *defaults = NSUserDefaults.standardUserDefaults;
-        if ([defaults objectForKey:@"MacWSExperimentalMode"] == nil)
-            [defaults setBool:YES forKey:@"MacWSExperimentalMode"];
-        _experimentalTouched = YES;
     }
     return self;
 }
@@ -2053,27 +2047,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                     action:@selector(primaryAction) prominent:YES];
     [_primaryButton.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
 
-    UILabel *experimentalText = MacWSMakeLabel(@"实验兼容模式",
-        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
-    UILabel *experimentalDetail = MacWSMakeLabel(
-        @"启用命令 ABI / completion 诊断脚手架；受 5 分钟与高 CPU 热保护，不是根因修复。",
-        [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
-        UIColor.systemOrangeColor);
-    UIStackView *experimentalLabels = [[UIStackView alloc]
-        initWithArrangedSubviews:@[experimentalText, experimentalDetail]];
-    experimentalLabels.axis = UILayoutConstraintAxisVertical;
-    experimentalLabels.spacing = 2;
-    _experimentalSwitch = [UISwitch new];
-    _experimentalSwitch.on = [NSUserDefaults.standardUserDefaults
-        boolForKey:@"MacWSExperimentalMode"];
-    [_experimentalSwitch addTarget:self action:@selector(experimentalChanged:)
-                  forControlEvents:UIControlEventValueChanged];
-    UIStackView *experimentalRow = [[UIStackView alloc]
-        initWithArrangedSubviews:@[experimentalLabels, _experimentalSwitch]];
-    experimentalRow.axis = UILayoutConstraintAxisHorizontal;
-    experimentalRow.alignment = UIStackViewAlignmentCenter;
-    experimentalRow.spacing = 10;
-
     UILabel *debugText = MacWSMakeLabel(@"调试模式",
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
     UILabel *debugDetail = MacWSMakeLabel(
@@ -2294,7 +2267,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _zoomScaleControl,
         _resetZoomButton,
         [self sectionTitle:@"启动模式"],
-        experimentalRow,
         debugRow,
         _noticeLabel,
         [self divider],
@@ -2482,7 +2454,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _clipboardButton.enabled = enabled;
     _importButton.enabled = enabled;
     _macFilesButton.enabled = _receivedMacOSFiles.count > 0;
-    _experimentalSwitch.enabled = enabled;
     _debugSwitch.enabled = enabled;
     _inputModeControl.enabled = enabled;
     _densityControl.enabled = enabled;
@@ -3296,9 +3267,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _frameLabel.text = @"等待 DisplayStream IOSurface 首帧";
         _frameLabel.textColor = UIColor.systemOrangeColor;
     }
-    if (!_experimentalTouched || ws) {
-        _experimentalSwitch.on = [status[@"experimental_mode"] boolValue];
-    }
     if (!_debugTouched || ws) {
         _debugSwitch.on = [status[@"debug_mode"] boolValue];
     }
@@ -3432,10 +3400,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self setControlsEnabled:NO];
         [self setNotice:_debugSwitch.isOn
             ? @"正在以调试模式启动 macOS：崩溃转储与详细日志已开启。"
-            : (_experimentalSwitch.isOn
-                ? @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。"
-                : @"正在检查环境；重启后丢失的信任缓存会自动恢复。") success:YES];
-        [_controlClient startWithExperimentalMode:_experimentalSwitch.isOn
+            : @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。" success:YES];
+        [_controlClient startWithExperimentalMode:YES
                                         debugMode:_debugSwitch.isOn
             completion:^(NSDictionary<NSString *,id> *reply) {
                 BOOL ok = [reply[@"ok"] boolValue];
@@ -3446,15 +3412,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 [self refreshStatus];
             }];
     }
-}
-
-- (void)experimentalChanged:(UISwitch *)sender {
-    _experimentalTouched = YES;
-    [NSUserDefaults.standardUserDefaults setBool:sender.isOn
-                                          forKey:@"MacWSExperimentalMode"];
-    NSString *state = sender.isOn ? @"已选择实验兼容模式，将在下次启动时生效。" :
-        @"已选择标准模式，将在下次启动时移除诊断脚手架。";
-    [self setNotice:state success:!sender.isOn];
 }
 
 - (void)debugChanged:(UISwitch *)sender {
@@ -3586,8 +3543,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if ([action isEqualToString:@"start"] ||
                [action isEqualToString:@"start-experimental"]) {
         if (![_latestStatus[@"windowserver_running"] boolValue]) {
-            _experimentalSwitch.on = [action isEqualToString:@"start-experimental"];
-            [self experimentalChanged:_experimentalSwitch];
             [self primaryAction];
         } else {
             [self setNotice:@"macOS 工作区已经在运行" success:YES];
