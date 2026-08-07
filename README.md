@@ -1,239 +1,263 @@
-# MacWSBootingGuide
-Booting macOS's WindowServer on your jailbroken iDevice for real (WIP)
+# MacWS Booting Guide
 
-The current iPadOS multi-window, DisplayStream/IOSurface, touch, density, and
-interop design is documented in
-[`docs/displaystream-host-architecture.md`](docs/displaystream-host-architecture.md).
-The older [`docs/ipados-native-host.md`](docs/ipados-native-host.md) is retained
-as the historical M0-M4 framebuffer milestone record. The direct presentation
-path does not require RFB/VNC; VNC remains a diagnostic fallback.
+Run the real **macOS WindowServer and GUI applications on a jailbroken iPad or
+iPhone** — a full macOS desktop rendered live on the iOS display, driven by the
+device's own AGX GPU. This is the production release branch.
 
-Some paths are currently hardcoded for rootless jailbreak, but you can change them to work with rootful jailbreak. Some tools are hardcoded for Dopamine jailbreak.
+The project chroots a full macOS 13.4 (Ventura) root filesystem on the iOS
+device, `exec`s macOS binaries inside that chroot, and bridges the two worlds:
+WindowServer renders through the real iOS AGX kernel driver, the Host app on
+the iPad streams the desktop via `IOSurface` (no VNC needed for the primary
+path), and a root control daemon orchestrates the whole lifecycle.
 
-You need these from simulator runtime: MTLSimDriver.framework, MTLSimImplementation.framework, MetalSerializer.framework
+> **State of this branch:** production-oriented. Defaults to production mode
+> (no diagnostic instrumentation), ships a one-tap debug mode from the Control
+> Center, self-heals a crashed debug session on the next production start, and
+> is built/verified by GitHub Actions.
 
-## Setting up (macOS full installation)
-TODO: make a script
-- Extract full filesystem dmg to a directory, e.g. `/var/mnt/rootfs`
-- ~~Extract App cryptex dmg to `rootfs/System/Volumes/Preboot/Cryptexes/App`~~ (for Safari only, which is not needed)
-- Extract OS cryptex dmg to `rootfs/System/Volumes/Preboot/Cryptexes/OS`
-- Copy-merge folders from `rootfs/System/Library/Templates/Data` to your `rootfs`
-- Symlink `rootfs/System/Volumes/Data` -> `../..`
-- Symlink `/home` -> `rootfs/System/Volumes/Data/home` (optional?)
-- Symlink `rootfs/var/folders/zz` -> `/var/folders/zz`
-- mkdir `rootfs/Users/root`
-- Copy `/etc` from macOS installation to `rootfs/etc` (optional?)
-- [Bind mount](https://github.com/khanhduytran0/mount-bindfs-dopamine) `rootfs/var/jb` -> `/var/jb`
-- Patch `dyld`, `launchservicesd` and `WindowServer` as described below.
-- Modify `cpusubtype` in `Installer Progress` and `WindowServer` using `set_to_arm64`
-- For every executable you wanna run, sign and merge with `entitlements.plist` in this repo: `ldid -S./entitlements.plist -M binary_name`.
-- Load macOS trustcaches using `loadtc /path/to/trustcache`
+---
 
-## Starting up
-build in macOS:
+## What it looks like
+
+- The **MacWSHost** app (iOS UIKit) shows the macOS desktop on the iPad panel
+  and acts as the Control Center: start/stop the workspace, launch apps, choose
+  touch vs. trackpad, change display density, import/export files, sync the
+  clipboard, and view logs.
+- Native **Finder, Dock, SystemUIServer, ControlCenter, System Settings, Maps,
+  Terminal, GlassDemo, Activity Monitor, VS Code** run inside the chroot as
+  real Ventura processes.
+- Input is delivered as native AppKit events (touch → clicks, trackpad mode,
+  two-finger scroll, pinch-to-zoom, hover, pencil).
+
+---
+
+## Requirements
+
+| Requirement | Value |
+|---|---|
+| Device | iPad13,6 (and similar arm64e iPads) |
+| iPadOS | 16.3 / 16.3.1 |
+| Jailbreak | **Dopamine** (rootless, Procursus) |
+| macOS rootfs | Full **macOS 13.4** (Ventura) filesystem, extracted to `/var/mnt/rootfs` |
+| GPU path | Real iOS **AGX** kernel driver (`MACWS_AGX_NATIVE=1`) |
+
+> Some paths are hardcoded for a rootless jailbreak. With rootful
+> jailbreaks you will need to adjust the `/var/jb` prefix and trustcache flow.
+
+---
+
+## Quick start (installed package)
+
+Once the `.deb` is installed on the device (see [Installation](#installation)):
+
 ```bash
-# edit DEVICE_IP/DEVICE_PORT at the top of misc/build.sh to match your iPad/iPhone
-bash misc/build.sh
-```
-
-run in your iPad/iPhone device:
-
-```bash
+# 1. (one time) mount the macOS rootfs and prepare the chroot — done by the
+#    package postinst, or re-run it after reinstalling:
 sudo bash /var/jb/usr/macOS/bin/postinst.sh
-# enter macOS bash environment
-sudo bash /var/jb/usr/macOS/bin/run_bash.sh
 ```
 
-To run any exectuable in (chroot) macOS, run this in iOS shell:
+Then open the **MacWSHost** app on the iPad. It auto-starts the macOS
+workspace, or tap **启动 macOS 工作区**. The desktop streams to the panel;
+touch works immediately.
+
+### Command-line control
 
 ```bash
-cd $(realpath $HOME/../..)/usr/macOS
+# Enter the chroot shell
+sudo bash /var/jb/usr/macOS/bin/run_bash.sh -c "echo hi"
 
-add_trustcache() {
-    local path=$1
-    local cdhash
-    cdhash=$(ldid -arch arm64 -h $path 2>/dev/null | grep CDHash= | cut -c8-)
-    if [ -n "$cdhash" ]; then
-        echo "Adding $path cdhash: $cdhash"
-        jbctl trustcache add "$cdhash"
-    fi
-}
+# Start / stop the full GUI stack (root, from the iOS shell)
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh production    # production start
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop          # tear down, return to iOS
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh status        # what is running
 
-add_arm64e_trustcache() {
-    local path=$1
-    local cdhash
-    cdhash=$(ldid -arch arm64e -h $path 2>/dev/null | grep CDHash= | cut -c8-)
-    if [ -n "$cdhash" ]; then
-        echo "Adding $path cdhash: $cdhash"
-        jbctl trustcache add "$cdhash"
-    fi
-}
-
-add_x86_64_trustcache() {
-    local path=$1
-    local cdhash
-    cdhash=$(ldid -arch x86_64 -h $path 2>/dev/null | grep CDHash= | cut -c8-)
-    if [ -n "$cdhash" ]; then
-        echo "Adding $path cdhash: $cdhash"
-        jbctl trustcache add "$cdhash"
-    fi
-}
-
-add_all_trustcache() {
-    add_trustcache $1
-    add_arm64e_trustcache $1
-    add_x86_64_trustcache $1
-}
-
-cp /var/mnt/rootfs/usr/bin/whoami{,.bak}
-ldid -S./bin/entitlements.plist -M /var/mnt/rootfs/usr/bin/whoami
-add_all_trustcache /var/mnt/rootfs/usr/bin/whoami
+# Debug-mode session (rich diagnostics, slower by design)
+sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start --debug
 ```
 
-Debug `kill: 9` when running macOS binary in iOS:
-```bash
-sudo oslog | grep "AMFI\|debugbydcmmc\|launchd\|launchser\|WindowSer\|MTL\|Metal\|Terminal\|iolation"
-```
+---
 
-Open GUI in (chroot) macOS:
+## Runtime modes
+
+A session runs in exactly one runtime mode.
+
+### Production (default)
+
+- No diagnostic environment variables or sentinels; `production_preflight`
+  asserts a clean environment before WindowServer loads.
+- **Self-healing:** if a debug session crashed without stopping cleanly, the
+  leftover debug environment is stripped on the next production start, so a cold
+  production start always recovers to full functionality.
+
+### Debug mode
+
+- Enabled from the **Control Center** (调试模式 switch, persisted) or the CLI
+  (`macos_gui.sh start --debug`).
+- Injects getenv-driven libmachook traces (`AGX_CRASH_DIAG`, `ABORT_TRACE`,
+  `IOSURF_TRACE`, `XPC_DEBUG`, `MACH_MSG_TRACE`, …) into the WindowServer/VNC/
+  Terminal launchd contracts plus the full diagnostic sentinel set.
+- Slower and heavier; `stop` restores the production contracts.
+- Behavior-changing LAZY/scaffold toggles (`MACWS_KEEP_ASSERT_BYPASS`,
+  `MACWS_AGXIOC_FUZZ`, …) are deliberately excluded even from debug mode.
+
+---
+
+## Installation
+
+### Build the `.deb`
+
+**On the device (recommended):**
 
 ```bash
-sudo launchctl unload /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
-sudo launchctl load /var/jb/usr/macOS/LaunchDaemons
+ssh -p 2222 root@<device-ip> \
+  'THEOS=/var/jb/var/mobile/theos bash /var/jb/var/mobile/MacWSBootingGuide/misc/build_on_ios.sh'
 ```
 
-In (chroot) macOS bash environment, you can run CLI or GUI applications:
+**From macOS (cross-compile):** set `DEVICE_IP`/`DEVICE_PORT` at the top of
+`misc/build.sh`, then `bash misc/build.sh`.
 
-- `/usr/local/bin/OSXvnc-server -rfbnoauth` first to open a VNC server
-- `/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal`
-- `/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor`
+**From CI:** push a `v*` tag; `.github/workflows/release.yml` builds the `.deb`
+on a macOS runner (Theos + `iPhoneOS16.5.sdk` + Xcode macOS SDK + `brew install
+dpkg ldid`) and attaches it to a GitHub Release.
 
-Respring to iOS:
+### Install on the device
 
 ```bash
-sudo launchctl unload /var/jb/usr/macOS/LaunchDaemons
-sudo launchctl load /System/Library/LaunchDaemons/com.apple.{SpringBoard,backboardd}.plist
+# Copy the .deb to the device, then:
+sudo dpkg -i com.kdt.macosbooter_<version>_iphoneos-arm.deb
+sudo bash /var/jb/usr/macOS/bin/postinst.sh     # sign + trustcache everything
 ```
 
-## Running Claude Code in the chroot
+---
 
-The Claude Code native CLI (a bun/JSC binary) runs inside the macOS chroot.
-Several chroot-specific quirks are involved:
+## Device setup (one time, before first package install)
 
-- **AMFI / signing** — every Mach-O must be ad-hoc re-signed + trustcached or AMFI
-  `SIGKILL`s it (an Apple signature alone is not enough — its platform-binary /
-  library-validation flags get the process killed even when the CDHash is
-  trustcached). This is now automatic: the `autosignd` daemon + `libmachook`'s
-  exec hooks sign+trustcache each binary on first `exec` (see "On-demand signing"
-  below), so `claude` and everything it spawns (`security`, `ps`, `ioreg`, `git`,
-  …) just work. `postinst.sh` also signs `claude` and `/usr/bin/security` up front.
-- **JSC gigacage** — JavaScriptCore tries to reserve a 64 GiB virtual-address
-  "gigacage" at startup, which fails on iOS (`FATAL: Could not allocate gigacage
-  memory`). Set `GIGACAGE_ENABLED=0` to disable it.
-- **No DNS** — the chroot has network but no working resolver. Route through a
-  proxy (the chroot can't resolve hostnames itself). **Important:** Claude Code's
-  API client (undici) only honors **`http(s)://` proxies, not `socks5h://`**
-  (it does run its own SOCKS server for sandboxed children, but won't use a SOCKS
-  proxy for its own API calls). So set `HTTPS_PROXY=http://HOST:PORT` — e.g. point
-  it at a mixed http+socks proxy like `pproxy`. `curl`/`git`/`pip` accept the same
-  `http://` proxy and resolve DNS through it too.
+1. Extract a full **macOS 13.4** DMG to `/var/mnt/rootfs` (and the OS cryptex
+   to `rootfs/System/Volumes/Preboot/Cryptexes/OS`).
+2. Copy-merge `rootfs/System/Library/Templates/Data` into your `rootfs` and
+   create the documented symlinks (`System/Volumes/Data → ../..`, `/home`,
+   `var/folders/zz`, …).
+3. Bind-mount `rootfs/var/jb → /var/jb`
+   ([mount-bindfs-dopamine](https://github.com/khanhduytran0/mount-bindfs-dopamine)).
+4. Patch `dyld`, `launchservicesd` and `WindowServer` as documented in
+   `README`'s "Additional patches" history and in `docs/`; the package's
+   `postinst.sh` re-signs every Mach-O with `entitlements.plist` and registers
+   CDHashes in the trustcache.
+5. Install the `.deb` (above).
 
-**1. Install the binary.** The official `install.sh` aborts because the chroot's
-`uname -m` reports `iPadN,N` ("Unsupported architecture"), so download the
-macOS-arm64 build directly into the chroot at `/usr/local/bin/claude`:
+---
 
-```bash
-# inside the chroot (network via your http proxy):
-ver=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)
-curl -fsSL -o /usr/local/bin/claude \
-  "https://downloads.claude.ai/claude-code-releases/$ver/darwin-arm64/claude"
-chmod +x /usr/local/bin/claude
-sudo bash /var/jb/usr/macOS/bin/postinst.sh   # sign + trustcache it (from iOS shell)
-```
+## Architecture
 
-**2. Configure the environment.** The `Claude Code TUI environment` block in
-`/var/mnt/rootfs/Users/root/.bashrc` sets `PATH`, `GIGACAGE_ENABLED=0`,
-`SSL_CERT_FILE`, and the `http://` proxy vars. Add your auth (env vars work — no
-`settings.json` required):
+### Subprojects (root `Makefile`)
 
-```bash
-# Official API key (sent as x-api-key):
-export ANTHROPIC_API_KEY=sk-ant-...
-# OR a Bearer token for a relay/gateway (sent as Authorization: Bearer) — then
-# also set the relay endpoint:
-export ANTHROPIC_AUTH_TOKEN=...
-export ANTHROPIC_BASE_URL=https://your-relay.example.com/
-```
+**iOS-side (run in the iOS context):**
+- `MacWSHost` — the Control Center / display-stream client app.
+- `macwshostd` — root control daemon (`com.macwsguide.host.control` XPC); runs
+  the GUI lifecycle script, launches apps, reports typed status.
+- `macwsallocd` — IOSurface allocator (`com.macwsguide.alloc`).
+- `macwsthermal` — iOS-native temperature watchdog helper.
+- `autosignd` — on-demand Mach-O re-sign + trustcache for arbitrary chroot
+  binaries.
+- `launchdchrootexec` — posix_spawns a macOS binary inside the chroot with
+  `DYLD_INSERT_LIBRARIES=libmachook.dylib`.
+- `MTLCompilerBypassOSCheck`, `MTLSimDriverHost`, `MacWSWindowing`,
+  `MacWSCatalystLaunch`, `SettingsExtension*`, `ViewBridge*`, `HIServices*`,
+  `Geod*`, `Locationd*`, `FileCoordination*`, `OpenAndSavePanel*`,
+  `DockHelper*`, `ExtensionKit*`, `WriteConfig*` proxies.
+- `mountdevfs`, `mtl_keepalive`, `misc/PingMTLCompilerService`.
 
-If `ANTHROPIC_BASE_URL` is an **internal** host (e.g. a corp gateway on a `10.x`
-IP) it must be reached directly, not via an overseas circumvention proxy — add the
-host to the chroot's `/etc/hosts` (chroot has no DNS) and `NO_PROXY` it, or use a
-proxy whose egress is on that internal network.
+**macOS-side (built for macOS, run inside the chroot):**
+- `libmachook` — the injected hook dylib (`DYLD_INSERT_LIBRARIES`), the heart
+  of the project: dyld image-load callbacks that patch incompatible system
+  calls, AGX/IOGPU/Metal interposers, IOSurface transport, VNC bridge.
+- `launchservicesd`, `macwsinputd` (AppKit input), `macwsdisplayd`
+  (DisplayStream/IOSurface bridge), `macwsinteropd` (clipboard/files),
+  `macwsworkspacectl` (desktop control).
 
-**3. Run it:**
+### libmachook module layout
 
-```bash
-sudo bash /var/jb/usr/macOS/bin/run_bash.sh   # interactive; sources ~/.bashrc
-claude          # TUI; or:  claude -p "hi"
-```
+`libmachook/` was split from a single 17,000-line file into focused units:
 
-### On-demand signing (`autosignd` + `libmachook` exec hooks)
+| File | Responsibility |
+|---|---|
+| `mac_hooks.m` | infrastructure, JIT, `loadImageCallback` dispatcher |
+| `mac_hooks_vnc.m` | diagnostics, VNC/OSXvnc, fsnode/CoreLocation |
+| `mac_hooks_iosurface.m` | IOSurface adapters, `IOServiceOpen`, LSD/HIServices |
+| `mac_hooks_iogpu.m` | the `#ifdef FORCE_M1_DRIVER` IOGPU/AGX submit subsystem |
+| `mac_hooks_internal.h` | shared preamble, types, and cross-part externs |
+| `Metal_hooks.x` | Metal/AGX texture + device hooks |
+| `AppInputBridge.m` | VNC/AppKit input bridge |
+| `exec_hooks.c` | exec-time signing daemon client |
 
-AMFI evaluates every `exec` in the kernel, so a binary can only be signed from an
-**iOS-platform** process (the chroot's macOS dyld refuses to load
-`libjailbreak.dylib`, so chroot code cannot call `jbclient_*` directly). The flow:
+### The startup cascade
 
-- `libmachook` interposes `posix_spawn[p]` / `execve` / `execv` / `execvp`. Before
-  each `exec` it sends the target's chroot path to `autosignd` over the unix socket
-  `/tmp/autosignd.sock` and waits for an ack (fail-open; per-process path cache).
-- `autosignd` (started by `postinst.sh`, runs in the iOS context) translates the
-  path into the rootfs, ad-hoc re-signs it with `ldid -S<entitlements> -M`, and
-  registers every slice's CDHash via `jbctl trustcache add`.
+`macos_gui.sh start` (orchestrated by `macwshostd` on a Control-Center start):
 
-Net effect: arbitrary macOS programs run in the chroot without pre-listing every
-binary in `postinst.sh`. (`execl*` varargs forms are not interposed — rare, and
-they call the array forms internally inside libsystem.)
+1. Generates launchd contracts (`gui-launchd/`), retires any previous
+   generation.
+2. Applies the runtime mode (production = assert clean; debug = inject
+   diagnostic env).
+3. Arms the mandatory thermal/crash-loop watchdog.
+4. Publishes system services (systemstatusd, cfprefsd, lsd, iconservices,
+   LaunchServices catalog, Settings proxies), then `launchservicesd` +
+   `macwsinputd` + **WindowServer**.
+5. Waits for WindowServer graphics readiness, then launches the workspace
+   agents (Finder, Dock, SystemUIServer, ControlCenter) and optional VNC/
+   Terminal.
 
-## Additional patches
-> [!NOTE]
-> - Some offsets are hardcoded for iOS 16.5/macOS 13.4
-> - [x] means it is automated or handled by hooks
-> - [ ] means you need to patch it by hand
+`macos_gui.sh stop` (or `misc/cleanup_all.sh` for emergencies) tears everything
+down and restores SpringBoard/backboardd.
 
-### macOS side
-#### dyld
-- [ ] `mach-o file, but is an incompatible architecture (have 'arm64e', need 'arm64')` because `GradedArchs::grade` [disallows](https://github.com/apple-oss-distributions/dyld/blob/dyld-1285.19/common/MachOFile.cpp#L1985-L1989) loading non-system arm64e libraries to arm64 processes. (not really this function but the caller of it I forgot).
+---
 
-#### launchservicesd
-- [x] Missing syscalls: `audit_token_to_asid`, `audit_token_to_auid`, `auditon`, `getaudit_addr`
-- [ ] This daemon needs to be converted to a dylib using [LiveContainer's method](https://github.com/LiveContainer/LiveContainer/blob/341cc87d40d8eec690d21dc71bd69d74667588da/LiveContainer/LCMachOUtils.m#L71-L88). Please make sure to resign dylib without entitlements to avoid codesign panic ([#2](https://github.com/khanhduytran0/MacWSBootingGuide/issues/2)).
+## Troubleshooting
 
-#### loginwindowLite
-- [ ] `Error (non-fatal) enumerating <private>: Error Domain=NSCocoaErrorDomain Code=256 "The file “Library” couldn’t be opened." UserInfo={NSURL=Library/ -- file:///System/Library/CoreServices/CoreTypes.bundle/Contents/, NSFilePath=/System/Library/CoreServices/CoreTypes.bundle/Contents/Library, NSUnderlyingError=0x13d5a73b0 {Error Domain=NSPOSIXErrorDomain Code=20 "Not a directory"}}`: because `/System/Volumes/Data/System/Library/CoreServices/CoreTypes.bundle/Contents/Library` might be missing.
+| Symptom | What to check |
+|---|---|
+| Start fails | The Control Center shows the `macos_gui.sh` output tail (`last_error_detail`). Or: `sudo bash /var/jb/usr/macOS/bin/macos_gui.sh start --debug` |
+| App killed by AMFI (`SIGKILL`) | Binary not signed/trustcached. Run `sudo bash /var/jb/usr/macOS/bin/postinst.sh` or use `misc/sign_installed.sh` |
+| `chdir: No such file or directory` | Harmless — `run_bash.sh` falls back to `/` |
+| No desktop / black frame | Check WindowServer logs via the Control Center log viewer |
+| CPU stuck / crash loop | `sudo bash /var/jb/var/mobile/MacWSBootingGuide/misc/cleanup_all.sh` (bounds the loop, restores iOS) |
+| Debug session crashed | Next `production` start strips leftover debug env automatically |
 
-#### MTLSimDriver
-- [x] `failed assertion _limits.maxColorAttachments > 0 at line 3791 in -[_MTLDevice initLimits]`, can be bypassed using `CFPreferencesSetAppValue(@"EnableSimApple5", @1, @"com.apple.Metal")`
-- [x] `-[MTLTextureDescriptorInternal validateWithDevice:], line 1344: error 'Texture Descriptor Validation invalid storageMode (1). Must be one of MTLStorageModeShared(0) MTLStorageModeMemoryless(3) MTLStorageModePrivate(2)`: because macOS defaults to `MTLStorageModeManaged`, while iOS always has unified memory so it doesn't allow that.
-- [x] `Attempt to pass a malloc(3)ed region to xpc_shmem_create().`: while regular drivers accept passing `malloc`ed region to `newBufferWithBytesNoCopy:length:options:deallocator:`, doing so to simulator is not allowed since XPC has to share the memory with `MTLSimDriverHost.xpc` process. Workaround is to create a mirrored region using `vm_remap` that can be shared across processes.
-- [x] `Unimplemented pixel format of 645346401 used in WSCompositeDestinationCreateWithIOSurface.` due to missing implementation of `-[MTLSimDevice acceleratorPort]`, which mysteriously caused WindowServer to fallback to software rendering in some places, causing said fatal error.
-- [x] `-[MTLSimDevice newRenderPipelineStateWithTileDescriptor:options:reflection:error:], line 2124: error 'not supported in the simulator'`. FIXME: this is not implemented at all. However, it is only used by `QuartzCore'CA::OGL::BlurState::tile_downsample(int)` which is skipped by the hook.
-- [x] `-[MTLSimTexture initWithDescriptor:decompressedPixelFormat:iosurface:plane:textureRef:heap:device:]:813: failed assertion 'IOSurface backed XR10 textures are not supported in the simulator'`: patch out the check, since it actually works fine.
-- [x] `-[MTLSimBuffer newTextureWithDescriptor:offset:bytesPerRow:]`: patch `storageMode == private` check.
+### Logs
 
-#### WindowServer
-- [x] It hangs twice when calling `NXClickTime` and `NXGetClickSpace`. Hooked to do nothing instead since both were deprecated.
-- [ ] Missing light theme when using macOS recovery. Can be fixed by copying `/System/Library/CoreServices/SystemAppearance.bundle/Contents/Resources` from full macOS installation.
+- `MacWSHostd.log` — root control daemon (`/var/mobile/Library/Logs/`)
+- `WindowServer.err` / `WindowServer.out` — WindowServer
+- `macos_gui_watchdog.log` — thermal/crash-loop guard
+- `macos_gui_start.state` — start phase state machine
 
-### iOS side
-#### MTLCompilerService
-- [x] `MTLCompilerObject::readModuleFromBinaryRequest`: patch platform check to allow cross-platform compilation. MTLCompilerBypassOSCheck compares against hardcoded instruction so it might not be reliable across iOS versions.
+### On-demand signing
 
-#### launchd
-- [x] `Path not allowed in target domain` is raised when attempting to load XPC bundles not declared in `launchd.plist` (`MTLSimDriverHost.xpc` in this case). This can be bypassed by adding `com.apple.private.domain-extension` entitlement.
+AMFI evaluates every `exec` in the kernel, so binaries are signed from an
+iOS-platform process. `libmachook` interposes `posix_spawn`/`execve` and asks
+`autosignd` (via `/tmp/autosignd.sock`) to re-sign + trustcache each binary
+before it runs — arbitrary macOS programs work in the chroot without pre-listing
+every binary.
 
-#### watchdogd
-- [x] Install `WatchDisable` tweak from [this repo](https://nathan4s.lol/repo) which automatically runs @zhuowei's `who_let_the_dogs_out.c` at boot.
+---
+
+## Development
+
+- **Docs:** `docs/` — `displaystream-host-architecture.md` (architecture),
+  `runtime-switches.tsv` + `.md` (authoritative env/sentinel inventory).
+- **CI checks:** `.github/workflows/ci.yml` runs the runtime-switch audit,
+  shell syntax, and plist lint on every push/PR; `release.yml` builds the `.deb`.
+- **Local syntax check:** `bash misc/compile_check.sh <file.m> …` compiles an
+  iOS-side ObjC file against the Xcode SDK to catch typos before shipping.
+- **Runtime-switch audit:** `python3 misc/audit_runtime_switches.py` verifies
+  every `getenv`/sentinel has a manifest entry.
+- **Patch discipline:** see `AGENTS.md`. A symptom-suppressing patch is not a
+  fix; every claim about a broken path needs decompiled-code or runtime-log
+  evidence.
+
+---
 
 ## Credits
+
 - [zhuowei/iOS-run-macOS-executables-tools](https://github.com/zhuowei/iOS-run-macOS-executables-tools)
 - [SongXiaoXi/Reductant](https://github.com/SongXiaoXi/Reductant)
+- [LiveContainer](https://github.com/LiveContainer/LiveContainer) (launchservicesd → dylib conversion method)
+- Theos, Dopamine, Procursus communities
