@@ -4639,6 +4639,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     uint32_t _softModifiers;
     UITextView *_logsView;
     UISwitch *_experimentalSwitch;
+    UISwitch *_debugSwitch;
     UISegmentedControl *_inputModeControl;
     UISegmentedControl *_densityControl;
     UISegmentedControl *_zoomScaleControl;
@@ -4648,6 +4649,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     NSTimer *_statusTimer;
     NSDictionary<NSString *, id> *_latestStatus;
     BOOL _experimentalTouched;
+    BOOL _debugTouched;
     uint64_t _inputLogSequence;
     NSString *_lastLoggedControlSummary;
     NSArray<MacWSStreamWindow *> *_streamWindows;
@@ -5638,6 +5640,27 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     experimentalRow.alignment = UIStackViewAlignmentCenter;
     experimentalRow.spacing = 10;
 
+    UILabel *debugText = MacWSMakeLabel(@"调试模式",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
+    UILabel *debugDetail = MacWSMakeLabel(
+        @"以 debug 模式启动 macOS：开启崩溃转储与详细追踪日志（更慢，用于故障排查）。",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
+        UIColor.systemOrangeColor);
+    UIStackView *debugLabels = [[UIStackView alloc]
+        initWithArrangedSubviews:@[debugText, debugDetail]];
+    debugLabels.axis = UILayoutConstraintAxisVertical;
+    debugLabels.spacing = 2;
+    _debugSwitch = [UISwitch new];
+    _debugSwitch.on = [NSUserDefaults.standardUserDefaults
+        boolForKey:@"MacWSDebugMode"];
+    [_debugSwitch addTarget:self action:@selector(debugChanged:)
+           forControlEvents:UIControlEventValueChanged];
+    UIStackView *debugRow = [[UIStackView alloc]
+        initWithArrangedSubviews:@[debugLabels, _debugSwitch]];
+    debugRow.axis = UILayoutConstraintAxisHorizontal;
+    debugRow.alignment = UIStackViewAlignmentCenter;
+    debugRow.spacing = 10;
+
     UIButton *glassDemo = [self buttonWithTitle:@"GlassDemo" image:@"sparkles.rectangle.stack"
                                          action:@selector(launchApplication:) prominent:NO];
     glassDemo.accessibilityIdentifier = @"glassdemo";
@@ -5836,6 +5859,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self sectionTitle:@"放大视角"],
         _zoomScaleControl,
         _resetZoomButton,
+        [self sectionTitle:@"启动模式"],
+        experimentalRow,
+        debugRow,
         _noticeLabel,
         [self divider],
         serviceCard,
@@ -6023,6 +6049,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _importButton.enabled = enabled;
     _macFilesButton.enabled = _receivedMacOSFiles.count > 0;
     _experimentalSwitch.enabled = enabled;
+    _debugSwitch.enabled = enabled;
     _inputModeControl.enabled = enabled;
     _densityControl.enabled = enabled;
     _zoomScaleControl.enabled = enabled;
@@ -6838,6 +6865,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (!_experimentalTouched || ws) {
         _experimentalSwitch.on = [status[@"experimental_mode"] boolValue];
     }
+    if (!_debugTouched || ws) {
+        _debugSwitch.on = [status[@"debug_mode"] boolValue];
+    }
+    if ([status[@"debug_mode"] boolValue] && ws) {
+        _serviceLabel.text = @"● root 控制服务已连接 · 调试模式";
+        _serviceLabel.textColor = UIColor.systemOrangeColor;
+    }
     NSString *lastError = status[@"last_error"];
     if (lastError.length) [self setNotice:lastError success:NO];
 
@@ -6910,6 +6944,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             _bootstrapWorkspaceStartInFlight = YES;
             [self setNotice:@"正在启动 macOS，并准备默认终端窗口…" success:YES];
             [_controlClient startWithExperimentalMode:YES
+                                            debugMode:_debugSwitch.isOn
                 completion:^(NSDictionary<NSString *,id> *reply) {
                     self->_bootstrapWorkspaceStartInFlight = NO;
                     BOOL ok = [reply[@"ok"] boolValue];
@@ -6929,6 +6964,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_controlClient performOperation:operation arguments:arguments
         completion:^(NSDictionary<NSString *,id> *reply) {
             BOOL ok = [reply[@"ok"] boolValue];
+            if (!ok) [self showErrorDetail:reply[@(MACWS_CONTROL_KEY_LAST_ERROR_DETAIL)]];
             [self setNotice:reply[@"message"] ?: @"操作完成" success:ok];
             [self applyStatus:reply];
             if (ok && [operation isEqualToString:@MACWS_CONTROL_OP_LAUNCH_APP]) {
@@ -6960,12 +6996,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self runOperation:@MACWS_CONTROL_OP_STOP arguments:nil];
     } else {
         [self setControlsEnabled:NO];
-        [self setNotice:_experimentalSwitch.isOn
-            ? @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。"
-            : @"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
+        [self setNotice:_debugSwitch.isOn
+            ? @"正在以调试模式启动 macOS：崩溃转储与详细日志已开启。"
+            : (_experimentalSwitch.isOn
+                ? @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。"
+                : @"正在检查环境；重启后丢失的信任缓存会自动恢复。") success:YES];
         [_controlClient startWithExperimentalMode:_experimentalSwitch.isOn
+                                        debugMode:_debugSwitch.isOn
             completion:^(NSDictionary<NSString *,id> *reply) {
                 BOOL ok = [reply[@"ok"] boolValue];
+                NSString *detail = reply[@(MACWS_CONTROL_KEY_LAST_ERROR_DETAIL)];
+                if (!ok) [self showErrorDetail:detail];
                 [self setNotice:reply[@"message"] ?: @"启动完成" success:ok];
                 [self applyStatus:reply];
                 [self refreshStatus];
@@ -6980,6 +7021,23 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSString *state = sender.isOn ? @"已选择实验兼容模式，将在下次启动时生效。" :
         @"已选择标准模式，将在下次启动时移除诊断脚手架。";
     [self setNotice:state success:!sender.isOn];
+}
+
+- (void)debugChanged:(UISwitch *)sender {
+    _debugTouched = YES;
+    [NSUserDefaults.standardUserDefaults setBool:sender.isOn
+                                          forKey:@"MacWSDebugMode"];
+    [self setNotice:sender.isOn
+        ? @"已选择调试模式：下次启动将启用崩溃转储与详细追踪日志，并会自动显示失败详情。"
+        : @"已关闭调试模式，下次启动将恢复生产模式。" success:!sender.isOn];
+}
+
+- (void)showErrorDetail:(NSString *)detail {
+    if (detail.length == 0) return;
+    _logsView.text = detail;
+    _logsView.hidden = NO;
+    [self setButton:_logsButton title:@"收起日志" image:@"doc.text.magnifyingglass"];
+    [_logsView scrollRangeToVisible:NSMakeRange(detail.length - 1, 1)];
 }
 
 - (void)launchApplication:(UIButton *)sender {

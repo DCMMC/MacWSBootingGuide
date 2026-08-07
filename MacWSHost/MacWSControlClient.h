@@ -9,6 +9,9 @@ typedef void (^MacWSControlCompletion)(NSDictionary<NSString *, id> *reply);
 - (void)fetchLogs:(MacWSControlCompletion)completion;
 - (void)startWithExperimentalMode:(BOOL)experimental
                        completion:(MacWSControlCompletion)completion;
+- (void)startWithExperimentalMode:(BOOL)experimental
+                        debugMode:(BOOL)debug
+                       completion:(MacWSControlCompletion)completion;
 - (void)performOperation:(NSString *)operation
                arguments:(nullable NSDictionary<NSString *, id> *)arguments
               completion:(MacWSControlCompletion)completion;

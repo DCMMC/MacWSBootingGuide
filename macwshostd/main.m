@@ -44,6 +44,8 @@ static const char *const kCaptureFlag = "/var/mnt/rootfs/tmp/macws_capture_final
 static const char *const kCaptureAck = "/var/mnt/rootfs/tmp/macws_capture_done";
 static const char *const kExperimentalKCmd = "/var/mnt/rootfs/private/tmp/macws_kcmd_fix";
 static const char *const kExperimentalCompletion = "/var/mnt/rootfs/private/tmp/macws_cancel_completion";
+static const char *const kWindowServerPlist =
+    "/var/jb/usr/macOS/LaunchDaemons/com.apple.WindowServer.plist";
 static const char *const kWindowServerLog = "/var/jb/var/mobile/WindowServer.err";
 static const char *const kSafetyTrip = "/var/jb/var/mobile/macws_safety_trip";
 static const char *const kWindowServerLabel =
@@ -86,6 +88,7 @@ static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gBusy;
 static NSString *gPhase = @"就绪";
 static NSString *gLastError = @"";
+static NSString *gLastErrorDetail = @"";
 static pid_t gActiveAppPID;
 static NSString *gActiveAppID = @"";
 
@@ -117,6 +120,12 @@ static void SetState(BOOL busy, NSString *phase, NSString *error) {
     os_unfair_lock_unlock(&gStateLock);
     HostLog(@"state busy=%@ phase=%@ error=%@", busy ? @"YES" : @"NO",
             phase ?: gPhase, error ?: gLastError);
+}
+
+static void SetStateDetail(NSString *detail) {
+    os_unfair_lock_lock(&gStateLock);
+    gLastErrorDetail = detail ? [detail copy] : @"";
+    os_unfair_lock_unlock(&gStateLock);
 }
 
 static BOOL TouchPath(const char *path) {
@@ -306,6 +315,64 @@ static NSString *CaptureCommand(const char *const argv[], NSUInteger limit) {
     return text ?: @"";
 }
 
+// Run a child and return its exit status plus a bounded tail of stdout+stderr.
+// This is what error reporting uses for lifecycle operations: the concise
+// message goes in last_error and the actionable log tail in last_error_detail.
+static NSString *RunCommandCapture(const char *const argv[], NSUInteger limit,
+                                   int *exitStatusOut) {
+    int pipes[2];
+    if (pipe(pipes) != 0) return @"";
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, pipes[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, pipes[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, pipes[0]);
+    posix_spawn_file_actions_addclose(&actions, pipes[1]);
+    pid_t pid = 0;
+    int error = posix_spawn(&pid, argv[0], &actions, NULL,
+                            (char *const *)argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipes[1]);
+    if (error != 0) {
+        close(pipes[0]);
+        if (exitStatusOut) *exitStatusOut = 128 + error;
+        return [NSString stringWithFormat:@"spawn %s: %s", argv[0],
+                strerror(error)];
+    }
+    NSMutableData *data = [NSMutableData data];
+    uint8_t buffer[4096];
+    for (;;) {
+        ssize_t count = read(pipes[0], buffer, sizeof(buffer));
+        if (count > 0) {
+            if (data.length + (NSUInteger)count > limit) {
+                NSUInteger skip = data.length + (NSUInteger)count - limit;
+                if (skip < data.length)
+                    [data replaceBytesInRange:NSMakeRange(0, skip)
+                                    withBytes:NULL length:0];
+                else
+                    [data setLength:0];
+            }
+            NSUInteger room = limit - data.length;
+            [data appendBytes:buffer length:MIN((NSUInteger)count, room)];
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    close(pipes[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    if (exitStatusOut) {
+        if (WIFEXITED(status)) *exitStatusOut = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) *exitStatusOut = 128 + WTERMSIG(status);
+        else *exitStatusOut = 126;
+    }
+    NSString *text = [[NSString alloc] initWithData:data
+                                           encoding:NSUTF8StringEncoding];
+    return text ?: @"";
+}
+
 static BOOL InspectJob(const char *label, int *pidOut, BOOL *loadedOut) {
     const char *argv[] = {kLaunchctl, "list", label, NULL};
     NSString *output = CaptureCommand(argv, 32768);
@@ -348,6 +415,17 @@ static BOOL RootFSReady(void) {
     return access("/var/mnt/rootfs/bin/bash", X_OK) == 0 &&
            access("/var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer", X_OK) == 0 &&
            access(kGUI, R_OK) == 0 && access(kChrootExec, X_OK) == 0;
+}
+
+// True while the WindowServer launchd contract carries MACWS_MODE=debug (set by
+// `macos_gui.sh start --debug`).  Production starts strip the key, so this is a
+// durable, self-healing way to reflect the current runtime mode in status.
+static BOOL WindowServerDebugMode(void) {
+    NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:
+                           @(kWindowServerPlist)];
+    NSDictionary *environment = plist[@"EnvironmentVariables"];
+    return [environment isKindOfClass:NSDictionary.class] &&
+        [environment[@"MACWS_MODE"] isEqual:@"debug"];
 }
 
 static BOOL ReadFrame(uint32_t *width, uint32_t *height) {
@@ -433,10 +511,12 @@ static void AddStatus(xpc_object_t reply) {
     BOOL busy;
     NSString *phase;
     NSString *lastError;
+    NSString *lastErrorDetail;
     os_unfair_lock_lock(&gStateLock);
     busy = gBusy;
     phase = gPhase;
     lastError = gLastError;
+    lastErrorDetail = gLastErrorDetail;
     pid_t activeAppPID = gActiveAppPID;
     NSString *activeAppID = gActiveAppID;
     if (activeAppPID > 1 && kill(activeAppPID, 0) != 0 && errno == ESRCH) {
@@ -461,6 +541,7 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_bool(reply, "busy", busy);
     SetString(reply, "phase", phase);
     SetString(reply, "last_error", lastError);
+    SetString(reply, MACWS_CONTROL_KEY_LAST_ERROR_DETAIL, lastErrorDetail);
     SetString(reply, "safety_trip", safetyTrip);
     xpc_dictionary_set_bool(reply, "rootfs_ready", RootFSReady());
     xpc_dictionary_set_bool(reply, "windowserver_running", ws);
@@ -477,6 +558,8 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_uint64(reply, "frame_generation", frameGeneration);
     xpc_dictionary_set_bool(reply, "experimental_mode",
         access(kExperimentalKCmd, F_OK) == 0 || access(kExperimentalCompletion, F_OK) == 0);
+    xpc_dictionary_set_bool(reply, MACWS_CONTROL_KEY_DEBUG_MODE,
+                            WindowServerDebugMode());
     xpc_dictionary_set_bool(reply, "glassdemo_available", access("/var/mnt/rootfs/tmp/GlassDemo", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "terminal_available", access("/var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "activity_monitor_available", access("/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor", X_OK) == 0);
@@ -557,7 +640,7 @@ static void RotateWindowServerLog(void) {
 
 static BOOL StopGUI(NSString **message);
 
-static BOOL StartGUI(BOOL experimental, NSString **message) {
+static BOOL StartGUI(BOOL experimental, BOOL debug, NSString **message) {
     if (!RootFSReady()) {
         *message = @"macOS rootfs 或启动组件不完整";
         return NO;
@@ -585,12 +668,21 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
     RotateWindowServerLog();
     SetState(YES, @"检查并修复启动环境…", @"");
     const char *startArgv[] = {kBash, kGUI, "start", "coexist",
-                               "--no-terminal", "--no-vnc", NULL};
-    int rc = RunCommand(startArgv, YES);
+                               "--no-terminal", "--no-vnc",
+                               debug ? "--debug" : NULL, NULL};
+    int rc = 0;
+    NSString *tail = RunCommandCapture(startArgv, 2048, &rc);
     if (rc != 0) {
-        *message = [NSString stringWithFormat:@"GUI 启动脚本失败（退出码 %d）", rc];
+        *message = debug
+            ? [NSString stringWithFormat:@"调试模式启动失败（退出码 %d）", rc]
+            : [NSString stringWithFormat:@"GUI 启动脚本失败（退出码 %d）", rc];
+        if (tail.length)
+            SetStateDetail([@"macos_gui.sh 输出:\n" stringByAppendingString:tail]);
+        HostLog(@"start script failed rc=%d tail=%@", rc, tail);
         return NO;
     }
+    if (debug)
+        HostLog(@"debug-mode GUI start script completed");
     // The script has already loaded and validated WindowServer, inputd and
     // displayd.  In the native window architecture there is intentionally no
     // AppKit window yet (`--no-terminal --no-vnc`), so requiring a framebuffer
@@ -617,7 +709,8 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
 
 static BOOL StopGUI(NSString **message) {
     const char *argv[] = {kBash, kGUI, "stop", NULL};
-    int rc = RunCommand(argv, YES);
+    int rc = 0;
+    NSString *tail = RunCommandCapture(argv, 2048, &rc);
     const char *unloadUIKitSystem[] = {
         kLaunchctl, "unload", kUIKitSystemPlist, NULL,
     };
@@ -641,8 +734,12 @@ static BOOL StopGUI(NSString **message) {
     RemovePath(kExperimentalCompletion);
     if (rc != 0) {
         *message = [NSString stringWithFormat:@"停止脚本失败（退出码 %d）", rc];
+        if (tail.length)
+            SetStateDetail([@"macos_gui.sh 输出:\n" stringByAppendingString:tail]);
+        HostLog(@"stop script failed rc=%d tail=%@", rc, tail);
         return NO;
     }
+    SetStateDetail(@"");
     *message = @"macOS GUI 已停止，iPadOS 保持运行";
     return YES;
 }
@@ -1788,7 +1885,9 @@ static void ServeRequest(xpc_object_t request) {
         pid_t launchedAppPID = 0;
         if (strcmp(op, MACWS_CONTROL_OP_START) == 0) {
             BOOL experimental = xpc_dictionary_get_bool(request, MACWS_CONTROL_KEY_EXPERIMENTAL);
-            ok = StartGUI(experimental, &message);
+            BOOL debug = xpc_dictionary_get_bool(request, MACWS_CONTROL_KEY_DEBUG);
+            SetStateDetail(@"");
+            ok = StartGUI(experimental, debug, &message);
         } else if (strcmp(op, MACWS_CONTROL_OP_STOP) == 0) {
             SetState(YES, @"停止 macOS GUI…", @"");
             ok = StopGUI(&message);

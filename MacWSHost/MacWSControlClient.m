@@ -59,6 +59,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
     const char *boolKeys[] = {
         "ok", "busy", "rootfs_ready", "windowserver_running",
         "input_running", "frame_ready", "experimental_mode",
+        MACWS_CONTROL_KEY_DEBUG_MODE,
         "app_input_ready",
         "glassdemo_available", "terminal_available",
         "activity_monitor_available", "finder_available",
@@ -89,6 +90,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
     }
     const char *stringKeys[] = {
         "message", "phase", "last_error", "hostd_log",
+        MACWS_CONTROL_KEY_LAST_ERROR_DETAIL,
         "safety_trip", "active_app_id", "windowserver_log", "input_log", "postinst_log",
     };
     for (NSUInteger i = 0; i < sizeof(stringKeys) / sizeof(stringKeys[0]); i++) {
@@ -143,8 +145,16 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
 
 - (void)startWithExperimentalMode:(BOOL)experimental
                        completion:(MacWSControlCompletion)completion {
+    [self startWithExperimentalMode:experimental debugMode:NO
+                         completion:completion];
+}
+
+- (void)startWithExperimentalMode:(BOOL)experimental
+                        debugMode:(BOOL)debug
+                       completion:(MacWSControlCompletion)completion {
     [self performOperation:@MACWS_CONTROL_OP_START
-                 arguments:@{@MACWS_CONTROL_KEY_EXPERIMENTAL: @(experimental)}
+                 arguments:@{@MACWS_CONTROL_KEY_EXPERIMENTAL: @(experimental),
+                             @MACWS_CONTROL_KEY_DEBUG: @(debug)}
                 completion:completion];
 }
 
