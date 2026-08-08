@@ -1,0 +1,29 @@
+[launchdchrootexec] target=/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock arch=arm64e insert=/usr/local/lib/libmachook.dylib
+getppid = 1
+#### MACWS_HID_BYPASS installed SetMatchingMultiple → no-op (1) at 0xa6018001aa7e5e8c — skips iOS-format CFBinaryPlist parse inside
+####   IOHIDEventSystemClientCacheMatchingServices → IOHIDUnserializeAndVMDealloc → CFPropertyListCreateFromStream
+####   that BUS_ADRALNs in the IOMFBServer thread.
+#### MACWS_AGX_RENAMER_PATCH: off (set MACWS_AGX_RENAMER_PATCH=1 to enable)
+#### MACWS_ASSERT_BYPASS DISABLED (set MACWS_KEEP_ASSERT_BYPASS=1 to restore lazy bypass) — real __assert_rtn now reaches abort
+#### XPC_BOOTSTRAP: fn=0xfc1e8001a739d140 dict=0x151807660 (registering Metal compiler service)
+#### XPC_BOOTSTRAP: result=0
+#### MACWS_CHROOT_ROOT installed FSNode isVolume repair class=0x202673398 original=0xbf1c0001a7ba237c
+#### COEXIST API SwapEnd hook installed target=0x1b227b1cc trampoline=0xf626000103138000
+#### SkyLight PrepareForUse tolerate-nil hook installed at 0xa8300001ac65cfc4
+#### SkyLight StartCompositeForDisplayStream nil-skip hook installed at 0x7f668001ac485d74
+#### SkyLight StartComposite(WSCD) tolerate-nil + pop-on-bail hook installed at 0x56550001ac485358
+#### SkyLight StartComposite(MTLTex) pop-on-bail hook installed at 0x917d0001ac485fb8
+#### SkyLight EndCurrentComposite(bool) completion hook installed at 0xb9300001ac48453c
+#### SkyLight EndUpdate(bool) submission hook installed at 0x13500001ac4840b0
+#### SkyLight _state_stack pop_back resolved at 0x1c350001ac482fa0
+#### SkyLight WSCompositeDestinationCreateWithMetalTexture nil-tolerate hook installed at 0x78380001ac48853c
+#### SkyLight MetalContext::StopCapture invalid-this guard installed at 0x17238001ac4841bc
+#### APP-INPUT READY pid=27004 socket=/private/tmp/macws_app_input.27004.sock abi=4 record=84
+#### APP-INPUT THREAD pid=27004 socket=3
+#### MACWS_UTTYPE installed CoreTypes compatibility (966 IDs)
+#### tile-encoder forwards: class MTLSimRenderCommandEncoder NOT found
+#### IOGPU-CALLBACK-DIAG installed queueClass=0x0 method=0x0 orig=0x0 bufferClass=0x0 method=0x0 orig=0x0 errorMethod=0x0 errorOrig=0x0 (file-gated)
+2026-08-07 23:24:49.044 Dock[27004:4637121] XType: Using static font registry.
+2026-08-07 23:24:50.458 Dock[27004:4637121] Couldn't connect to the usernoted
+#### APP-INPUT DOCK-GESTURE pid=27004 axis=2 phase=0x140 progress=-0.014583 velocity=-0.875000 route=DOCKGestures.handleEvent
+#### APP-INPUT DOCK-GESTURE pid=27004 axis=2 phase=0x840 progress=-0.350000 velocity=-0.875000 route=DOCKGestures.handleEvent

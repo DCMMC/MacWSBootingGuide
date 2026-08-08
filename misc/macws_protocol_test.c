@@ -27,6 +27,9 @@ int main(void) {
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSInputKindDesktopCommand == 20);
+    assert(MacWSInputKindSystemGesture == 21);
+    assert(MacWSSystemGestureAxisHorizontal == 1);
+    assert(MacWSSystemGestureAxisVertical == 2);
     assert(MacWSDesktopCommandMissionControl !=
            MacWSDesktopCommandApplicationWindows);
     assert(MacWSDesktopCommandSpaceLeft == 3);
@@ -78,6 +81,26 @@ int main(void) {
            MacWSThreeFingerGestureLeft);
     assert(MacWSClassifyThreeFingerPan(-27.0, 1.0, -1000.0, 0.0, 800.0) ==
            MacWSThreeFingerGestureNone);
+    assert(MacWSSystemGestureAxisForTranslation(-12.0, 1.0, 800.0) ==
+           MacWSSystemGestureAxisHorizontal);
+    assert(MacWSSystemGestureAxisForTranslation(1.0, -12.0, 800.0) ==
+           MacWSSystemGestureAxisVertical);
+    assert(MacWSSystemGestureAxisForTranslation(5.0, 0.0, 800.0) == 0);
+    assert(MacWSSystemGestureAxisForTranslation(12.0, 12.0, 800.0) == 0);
+    assert(Near((float)MacWSSystemGestureReferenceDistance(834.0),
+                233.52f));
+    // UIKit finger-left/finger-up are both negative, but Dock's verified
+    // private gesture progress uses different signs for the two axes.
+    assert(Near((float)MacWSSystemGestureProgressForDisplacement(
+                    MacWSSystemGestureAxisHorizontal, -120.0, 240.0),
+                0.5f));
+    assert(Near((float)MacWSSystemGestureProgressForDisplacement(
+                    MacWSSystemGestureAxisVertical, -120.0, 240.0),
+                -0.5f));
+    assert(MacWSSystemGestureProgressForDisplacement(0, -120.0, 240.0) ==
+           0.0);
+    assert(MacWSSystemGestureProgressForDisplacement(
+               MacWSSystemGestureAxisVertical, -120.0, 0.0) == 0.0);
     double constrainedX = 2.0, constrainedY = -9.0;
     MacWSConstrainDirectScrollDelta(MacWSDirectScrollAxisVertical,
                                     &constrainedX, &constrainedY);

@@ -637,8 +637,6 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record;
 - (void)metalView:(MacWSMetalView *)view
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows;
-- (void)metalView:(MacWSMetalView *)view
- requestedWindowOverviewForCurrentApplication:(BOOL)currentApplicationOnly;
 @end
 
 @interface MacWSMetalView : MTKView
@@ -755,7 +753,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     UIPanGestureRecognizer *_twoFingerPanRecognizer;
     UIPinchGestureRecognizer *_pinchRecognizer;
     UIPanGestureRecognizer *_threeFingerPanRecognizer;
-    BOOL _threeFingerCommandDispatched;
+    BOOL _threeFingerSystemGestureActive;
+    MacWSSystemGestureAxis _threeFingerSystemGestureAxis;
+    CGFloat _threeFingerSystemGestureReferenceDistance;
+    uint32_t _threeFingerSystemGestureContactID;
     CADisplayLink *_scrollMomentumDisplayLink;
     CGPoint _scrollMomentumVelocity;
     CGPoint _scrollMomentumFramePoint;
@@ -1067,6 +1068,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _fullscreenGestureRoutePID = 0;
     _fullscreenGestureRouteWindowID = 0;
     _fullscreenGestureRouteDescriptor = (MacWSStreamFrameDescriptor){0};
+    _threeFingerSystemGestureActive = NO;
+    _threeFingerSystemGestureAxis = 0;
+    _threeFingerSystemGestureReferenceDistance = 0.0;
+    _threeFingerSystemGestureContactID = 0;
     _fullscreenLastTapRouteTimestamp = 0.0;
     _fullscreenLastTapRoutePID = 0;
     _fullscreenLastTapRouteWindowID = 0;
@@ -3441,48 +3446,54 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
 }
 
-- (void)emitDesktopCommand:(MacWSDesktopCommand)command {
-    if (!self.isMacWSInputEnabled ||
-        _streamClient.mode != MacWSStreamModeFullscreen ||
-        command < MacWSDesktopCommandSpaceLeft ||
-        command > MacWSDesktopCommandSpaceRight) return;
-    uint32_t width = [self currentFrameWidth];
-    uint32_t height = [self currentFrameHeight];
-    int32_t commandTargetPID = 0;
-    // A fullscreen workspace may have been opened from the desktop bootstrap
-    // scene, whose configured targetPID is zero. Select the frontmost real
-    // application layer with a live AppInput endpoint; the endpoint merely
-    // supplies the CGS-connected process from which the standard
-    // Control+Arrow shortcut is posted.
+- (int32_t)dockSystemGestureTargetPID {
+    // displayd marks only real Dock-owned capture layers with
+    // GlobalSystemSurface.  Use that catalog identity instead of guessing a
+    // PID from process names on the iOS side or borrowing the front app's CGS
+    // connection as the old keyboard-shortcut path did.
     for (NSNumber *key in [[self overlayKeysBackToFront]
             reverseObjectEnumerator]) {
         MacWSStreamFrameDescriptor descriptor =
             _overlayFrames[key].descriptor;
-        if (descriptor.layerOwnerPID > 1 &&
-            descriptor.layerWindowID != 0 &&
-            (descriptor.flags & MacWSStreamFrameGlobalSystemSurface) == 0 &&
-            MacWSAppInputEndpointReady(descriptor.layerOwnerPID)) {
-            commandTargetPID = descriptor.layerOwnerPID;
-            break;
-        }
+        if ((descriptor.flags & MacWSStreamFrameGlobalSystemSurface) != 0 &&
+            descriptor.layerOwnerPID > 1 &&
+            MacWSAppInputEndpointReady(descriptor.layerOwnerPID))
+            return descriptor.layerOwnerPID;
     }
-    if (commandTargetPID <= 1 && self.targetPID > 1 &&
-        MacWSAppInputEndpointReady(self.targetPID))
-        commandTargetPID = self.targetPID;
-    if (width == 0 || height == 0 || commandTargetPID <= 1) return;
+    return 0;
+}
+
+- (void)emitSystemGestureAxis:(MacWSSystemGestureAxis)axis
+                      progress:(CGFloat)progress
+                      velocity:(CGFloat)velocity
+                         flags:(uint16_t)flags
+                     timestamp:(NSTimeInterval)timestamp {
+    if (!self.isMacWSInputEnabled ||
+        _streamClient.mode != MacWSStreamModeFullscreen ||
+        (axis != MacWSSystemGestureAxisHorizontal &&
+         axis != MacWSSystemGestureAxisVertical) ||
+        !isfinite(progress) || !isfinite(velocity)) return;
+    int32_t dockPID = [self dockSystemGestureTargetPID];
+    uint32_t width = [self currentFrameWidth];
+    uint32_t height = [self currentFrameHeight];
+    if (width == 0 || height == 0 || dockPID <= 1) return;
     MacWSInputRecord record = {
         .magic = MACWS_INPUT_MAGIC,
         .version = MACWS_INPUT_VERSION,
-        .kind = MacWSInputKindDesktopCommand,
+        .kind = MacWSInputKindSystemGesture,
         .sceneID = [self inputSceneIDWithModifiers:0],
-        .timestamp = CACurrentMediaTime(),
+        .timestamp = timestamp,
         .x = width * 0.5f,
         .y = height * 0.5f,
-        .contactID = command,
+        .pressure = (float)fmax(-2.0, fmin(progress, 2.0)),
+        .contactID = _threeFingerSystemGestureContactID,
         .frameWidth = width,
         .frameHeight = height,
-        .targetPID = commandTargetPID,
+        .targetPID = dockPID,
         .source = MacWSInputSourceFinger,
+        .flags = flags | MacWSInputFlagGlobalSystemSurface,
+        .buttons = axis,
+        .altitude = (float)fmax(-12.0, fmin(velocity, 12.0)),
         .sampleSequence = ++_inputSampleSequence,
     };
     [self.statusDelegate metalView:self emittedInput:record];
@@ -3491,48 +3502,85 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)threeFingerPanned:(UIPanGestureRecognizer *)recognizer {
     if (_streamClient.mode != MacWSStreamModeFullscreen) return;
     if (recognizer.state == UIGestureRecognizerStateBegan) {
-        _threeFingerCommandDispatched = NO;
+        _threeFingerSystemGestureActive = NO;
+        _threeFingerSystemGestureAxis = 0;
+        _threeFingerSystemGestureReferenceDistance = 0.0;
+        _threeFingerSystemGestureContactID = 0;
         [self stopScrollMomentumWithTerminalPhase:YES];
         return;
     }
-    if (_threeFingerCommandDispatched ||
-        (recognizer.state != UIGestureRecognizerStateChanged &&
-         recognizer.state != UIGestureRecognizerStateEnded)) return;
     CGPoint translation = [recognizer translationInView:self];
     CGPoint velocity = [recognizer velocityInView:self];
-    MacWSThreeFingerGesture gesture = MacWSClassifyThreeFingerPan(
-        translation.x, translation.y, velocity.x, velocity.y,
-        MIN(self.bounds.size.width, self.bounds.size.height));
-    if (gesture == MacWSThreeFingerGestureNone) return;
-    MacWSDesktopCommand command = 0;
-    NSString *status = nil;
-    if (gesture == MacWSThreeFingerGestureLeft ||
-        gesture == MacWSThreeFingerGestureRight) {
-        command = gesture == MacWSThreeFingerGestureLeft
-            ? MacWSDesktopCommandSpaceRight
-            : MacWSDesktopCommandSpaceLeft;
-        status = gesture == MacWSThreeFingerGestureLeft
-            ? @"切换到右侧桌面" : @"切换到左侧桌面";
-    } else {
-        // A native Control+Up Mission Control transaction reaches MPS from
-        // this headless WindowServer and runtime-crashed it with
-        // OS_REASON_COREANIMATION / MPS Internal Error 00000103. Preserve the
-        // MacBook gesture vocabulary with Host's real window catalog instead
-        // of risking the whole desktop.
-        _threeFingerCommandDispatched = YES;
-        [self.statusDelegate metalView:self
-            requestedWindowOverviewForCurrentApplication:
-                gesture == MacWSThreeFingerGestureDown];
-        [_directTouchFeedback impactOccurred];
-        [self publishStatus:gesture == MacWSThreeFingerGestureUp
-            ? @"macOS 窗口总览" : @"当前应用窗口"];
-        return;
+    NSTimeInterval timestamp = CACurrentMediaTime();
+    if (!_threeFingerSystemGestureActive &&
+        recognizer.state == UIGestureRecognizerStateChanged) {
+        CGFloat minimumDimension = MIN(self.bounds.size.width,
+                                       self.bounds.size.height);
+        _threeFingerSystemGestureAxis =
+            MacWSSystemGestureAxisForTranslation(
+                translation.x, translation.y, minimumDimension);
+        if (_threeFingerSystemGestureAxis == 0) return;
+        _threeFingerSystemGestureReferenceDistance =
+            MacWSSystemGestureReferenceDistance(minimumDimension);
+        _threeFingerSystemGestureContactID =
+            0x33464700u | ((++_directTouchSerial) & 0xffu); // "3FG"
+        _threeFingerSystemGestureActive = YES;
+        CGFloat initialDisplacement = _threeFingerSystemGestureAxis ==
+            MacWSSystemGestureAxisHorizontal ? translation.x : translation.y;
+        CGFloat initialVelocity = _threeFingerSystemGestureAxis ==
+            MacWSSystemGestureAxisHorizontal ? velocity.x : velocity.y;
+        [self emitSystemGestureAxis:_threeFingerSystemGestureAxis
+                           progress:MacWSSystemGestureProgressForDisplacement(
+                                _threeFingerSystemGestureAxis,
+                                initialDisplacement,
+                                _threeFingerSystemGestureReferenceDistance)
+                           velocity:MacWSSystemGestureProgressForDisplacement(
+                                _threeFingerSystemGestureAxis,
+                                initialVelocity,
+                                _threeFingerSystemGestureReferenceDistance)
+                              flags:MacWSInputFlagGestureBegan
+                          timestamp:timestamp];
     }
-    if (!command) return;
-    _threeFingerCommandDispatched = YES;
-    [self emitDesktopCommand:command];
-    [_directTouchFeedback impactOccurred];
-    [self publishStatus:status];
+    if (!_threeFingerSystemGestureActive) return;
+
+    CGFloat displacement = _threeFingerSystemGestureAxis ==
+        MacWSSystemGestureAxisHorizontal ? translation.x : translation.y;
+    CGFloat pointVelocity = _threeFingerSystemGestureAxis ==
+        MacWSSystemGestureAxisHorizontal ? velocity.x : velocity.y;
+    // Use Dock's RE- and runtime-confirmed per-axis sign convention. A single
+    // Cartesian sign flip misroutes finger-up to the disabled App Expose slot
+    // instead of the live native Mission Control fluid controller.
+    CGFloat progress = MacWSSystemGestureProgressForDisplacement(
+        _threeFingerSystemGestureAxis, displacement,
+        _threeFingerSystemGestureReferenceDistance);
+    CGFloat progressVelocity = MacWSSystemGestureProgressForDisplacement(
+        _threeFingerSystemGestureAxis, pointVelocity,
+        _threeFingerSystemGestureReferenceDistance);
+    uint16_t phase = 0;
+    switch (recognizer.state) {
+        case UIGestureRecognizerStateChanged:
+            phase = MacWSInputFlagGestureChanged;
+            break;
+        case UIGestureRecognizerStateEnded:
+            phase = MacWSInputFlagGestureEnded;
+            break;
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed:
+            phase = MacWSInputFlagGestureCancelled;
+            break;
+        default:
+            return;
+    }
+    [self emitSystemGestureAxis:_threeFingerSystemGestureAxis
+                       progress:progress velocity:progressVelocity
+                          flags:phase timestamp:timestamp];
+    if (phase & (MacWSInputFlagGestureEnded |
+                 MacWSInputFlagGestureCancelled)) {
+        _threeFingerSystemGestureActive = NO;
+        _threeFingerSystemGestureAxis = 0;
+        _threeFingerSystemGestureReferenceDistance = 0.0;
+        _threeFingerSystemGestureContactID = 0;
+    }
 }
 
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
@@ -3834,7 +3882,6 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (BOOL)activateMacWindowIDInFullscreenWorkspace:(uint32_t)windowID
                                         ownerPID:(int32_t)ownerPID
                                            title:(NSString *)title;
-- (void)presentWindowOverviewCurrentApplication:(BOOL)currentApplicationOnly;
 - (void)reassertFullscreenScenePresentation;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 - (BOOL)detachMissingWorkspaceReturnOwnerPID:(int32_t)ownerPID
@@ -5151,67 +5198,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     MacWSLog(@"fullscreen-window-route pending pid=%d window=%u title=%@",
              ownerPID, windowID, title ?: @"");
     return YES;
-}
-
-- (void)presentWindowOverviewCurrentApplication:(BOOL)currentApplicationOnly {
-    if (_streamMode != MacWSStreamModeFullscreen) return;
-    [_metalView requestStreamWindowList];
-    NSArray<MacWSStreamWindow *> *logicalWindows =
-        [self logicalWindowRepresentatives];
-    int32_t currentPID = _metalView.targetPID;
-    if (currentPID <= 1) {
-        for (MacWSStreamWindow *window in logicalWindows) {
-            if ((window.descriptor.flags & MacWSStreamWindowFocused) != 0) {
-                currentPID = window.descriptor.ownerPID;
-                break;
-            }
-        }
-    }
-    NSMutableArray<MacWSStreamWindow *> *visible = [NSMutableArray array];
-    for (MacWSStreamWindow *window in logicalWindows) {
-        MacWSStreamWindowFlags flags = window.descriptor.flags;
-        if (window.descriptor.ownerPID <= 1 ||
-            (flags & MacWSStreamWindowVisible) == 0 ||
-            (flags & MacWSStreamWindowOnScreen) == 0 ||
-            (currentApplicationOnly &&
-             window.descriptor.ownerPID != currentPID)) continue;
-        [visible addObject:window];
-    }
-    if (visible.count == 0) {
-        [self setNotice:currentApplicationOnly
-            ? @"当前应用没有可切换的 macOS 窗口"
-            : @"当前桌面没有可切换的 macOS 窗口" success:NO];
-        return;
-    }
-    UIAlertController *overview = [UIAlertController
-        alertControllerWithTitle:currentApplicationOnly
-            ? @"当前应用窗口" : @"macOS 窗口总览"
-                         message:@"三指左右切换 Space；点选窗口立即置前。"
-                  preferredStyle:UIAlertControllerStyleActionSheet];
-    NSUInteger limit = MIN(visible.count, 24);
-    for (NSUInteger index = 0; index < limit; index++) {
-        MacWSStreamWindow *window = visible[index];
-        BOOL focused =
-            (window.descriptor.flags & MacWSStreamWindowFocused) != 0;
-        NSString *baseTitle = window.title.length ? window.title :
-            [NSString stringWithFormat:@"Window %u",
-                window.descriptor.windowID];
-        NSString *title = focused
-            ? [NSString stringWithFormat:@"✓ %@", baseTitle] : baseTitle;
-        [overview addAction:[UIAlertAction actionWithTitle:title
-            style:UIAlertActionStyleDefault
-            handler:^(__unused UIAlertAction *action) {
-                [self activateMacWindow:window];
-            }]];
-    }
-    [overview addAction:[UIAlertAction actionWithTitle:@"取消"
-        style:UIAlertActionStyleCancel handler:nil]];
-    overview.popoverPresentationController.sourceView = _metalView;
-    overview.popoverPresentationController.sourceRect = CGRectMake(
-        CGRectGetMidX(_metalView.bounds), CGRectGetMidY(_metalView.bounds),
-        1.0, 1.0);
-    overview.popoverPresentationController.permittedArrowDirections = 0;
-    [self presentViewController:overview animated:YES completion:nil];
 }
 
 - (void)performSemanticShortcutForDiagnostics:(NSString *)shortcut {
@@ -7801,12 +7787,6 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
               image:@"macwindow.on.rectangle"];
 }
 
-- (void)metalView:(MacWSMetalView *)view
- requestedWindowOverviewForCurrentApplication:(BOOL)currentApplicationOnly {
-    (void)view;
-    [self presentWindowOverviewCurrentApplication:currentApplicationOnly];
-}
-
 - (NSUserActivity *)streamRestorationActivity {
     NSUserActivity *activity = [[NSUserActivity alloc]
         initWithActivityType:@"com.macwsguide.host.window"];
@@ -7879,7 +7859,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         record.kind != MacWSInputKindKeyDown &&
         record.kind != MacWSInputKindKeyUp &&
         record.kind != MacWSInputKindActivateTarget &&
-        record.kind != MacWSInputKindDesktopCommand) {
+        record.kind != MacWSInputKindDesktopCommand &&
+        record.kind != MacWSInputKindSystemGesture) {
         if (![_metalView routeFullscreenInputRecord:&record]) {
             record.targetPID = 0;
             record.sceneID &= UINT64_C(0x7fffffff);
@@ -7897,6 +7878,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindScroll: phase = @"scroll"; break;
         case MacWSInputKindMagnify: phase = @"magnify"; break;
         case MacWSInputKindDesktopCommand: phase = @"desktop-command"; break;
+        case MacWSInputKindSystemGesture: phase = @"system-gesture"; break;
         case MacWSInputKindKeyDown: phase = @"key-down"; break;
         case MacWSInputKindKeyUp: phase = @"key-up"; break;
         case MacWSInputKindConfigureWindow: phase = @"configure-window"; break;
@@ -7911,7 +7893,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL continuous = record.kind == MacWSInputKindTouchMove ||
                       record.kind == MacWSInputKindHover ||
                       record.kind == MacWSInputKindScroll ||
-                      record.kind == MacWSInputKindMagnify;
+                      record.kind == MacWSInputKindMagnify ||
+                      record.kind == MacWSInputKindSystemGesture;
     if (MacWSHostDiagnosticsEnabled() &&
         (!continuous || (_inputLogSequence % 60) == 0)) {
         MacWSLog(@"input-v4 transport=%@ errno=%d scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",

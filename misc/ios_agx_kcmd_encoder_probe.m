@@ -4,7 +4,7 @@
 // context and copies the command buffer's populated KCMD bytes through the
 // same getCurrentKernelCommandBufferStart:current:end: SPI already used by
 // iosclear_ref.m.  It never changes a driver object or command byte.  Select
-// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|render|draw|drawblit|drawblitsignal|drawblitlegacy|drawchain|aquariumchain
+// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|statistics|render|draw|drawblit|drawblitsignal|drawblitlegacy|drawchain|aquariumchain
 // (default: blit).
 
 @import Foundation;
@@ -34,6 +34,54 @@ static int macws_save_file(const char *path, const void *bytes,
     size_t written = fwrite(bytes, 1, length, output);
     int close_status = fclose(output);
     return written == length && close_status == 0 ? 0 : -1;
+}
+
+static uintptr_t macws_strip_pointer(uintptr_t pointer) {
+    return pointer & UINT64_C(0x0000ffffffffffff);
+}
+
+static void macws_dump_segment_list(id<MTLCommandBuffer> command_buffer,
+                                    const char *mode) {
+    // RE-confirmed via iOS 16.3
+    // -[IOGPUMetalCommandBuffer fillCommandBufferArgs:commandQueue:]:
+    // command-buffer +0x1f0 is IOGPUMetalCommandBufferStorage*.  The storage
+    // fields below are the same read-only fields used by
+    // lldb_dump_iosclear.py.  Copying them here avoids a remote-debugger hold
+    // while preserving the exact bytes submitted by the native producer.
+    uintptr_t object = (uintptr_t)(__bridge void *)command_buffer;
+    uintptr_t storage_raw = 0;
+    memcpy(&storage_raw, (const void *)(object + 0x1f0), sizeof(storage_raw));
+    uintptr_t storage = macws_strip_pointer(storage_raw);
+    if (!storage) {
+        fprintf(stderr, "IOS-AGX-SEGMENT mode=%s missing-storage\n", mode);
+        return;
+    }
+
+    uintptr_t start_raw = 0, limit_raw = 0, current_raw = 0;
+    int32_t segment_mode = 0;
+    memcpy(&start_raw, (const void *)(storage + 0x68), sizeof(start_raw));
+    memcpy(&limit_raw, (const void *)(storage + 0x70), sizeof(limit_raw));
+    memcpy(&current_raw, (const void *)(storage + 0x328),
+           sizeof(current_raw));
+    memcpy(&segment_mode, (const void *)(storage + 0x340),
+           sizeof(segment_mode));
+    uintptr_t start = macws_strip_pointer(start_raw);
+    uintptr_t limit = macws_strip_pointer(limit_raw);
+    uintptr_t current = macws_strip_pointer(current_raw);
+    size_t length = start && start <= current && current <= limit
+        ? (size_t)(current - start) : 0;
+    fprintf(stderr,
+        "IOS-AGX-SEGMENT mode=%s storage=%p start=%p current=%p "
+        "limit=%p length=%#zx segment-mode=%d\n",
+        mode, (void *)storage, (void *)start, (void *)current,
+        (void *)limit, length, segment_mode);
+    if (!length || length > 0x10000) return;
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "/tmp/ios-agx-segment-%s.bin", mode);
+    int save_status = macws_save_file(path, (const void *)start, length);
+    fprintf(stderr, "IOS-AGX-SEGMENT saved=%s status=%d\n",
+            path, save_status);
 }
 
 static int macws_dump_kcmd(id<MTLCommandBuffer> command_buffer,
@@ -89,6 +137,7 @@ static int macws_dump_kcmd(id<MTLCommandBuffer> command_buffer,
     }
     fprintf(stderr, "IOS-AGX-KCMD saved=%s records=%u chain-end=%#zx\n",
             path, record, offset);
+    macws_dump_segment_list(command_buffer, mode);
     return 0;
 }
 
@@ -252,6 +301,56 @@ static int macws_encode_compute(id<MTLDevice> device,
         (long)command_buffer.status,
         command_buffer.error.description.UTF8String ?: "nil", dump_status);
     return dump_status || command_buffer.error ? 21 : 0;
+}
+
+// Native-iOS control for the exact two-pass MPS reduction selected by the
+// macOS transition compositor.  Runtime pipeline traces from WindowServer
+// name the two functions sum_rgba_columns and sum_rgba_rows.  The public
+// MPSImageStatisticsMean API performs that RGBA reduction without mutating
+// any private driver state, so its successful iOS command stream is the
+// authoritative ABI reference for the failing macOS-produced submission.
+static int macws_encode_statistics(id<MTLDevice> device,
+                                   id<MTLCommandQueue> queue) {
+    MTLTextureDescriptor *source_descriptor =
+        [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            width:1366 height:1024 mipmapped:NO];
+    source_descriptor.storageMode = MTLStorageModeShared;
+    source_descriptor.usage = MTLTextureUsageShaderRead |
+        MTLTextureUsageShaderWrite;
+    MTLTextureDescriptor *destination_descriptor =
+        [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+            width:1 height:1 mipmapped:NO];
+    destination_descriptor.storageMode = MTLStorageModeShared;
+    destination_descriptor.usage = MTLTextureUsageShaderRead |
+        MTLTextureUsageShaderWrite;
+    id<MTLTexture> source =
+        [device newTextureWithDescriptor:source_descriptor];
+    id<MTLTexture> destination =
+        [device newTextureWithDescriptor:destination_descriptor];
+    MPSImageStatisticsMean *statistics =
+        [[MPSImageStatisticsMean alloc] initWithDevice:device];
+    if (!source || !destination || !statistics) return 28;
+
+    id<MTLCommandBuffer> command_buffer = macws_new_command_buffer(queue);
+    [statistics encodeToCommandBuffer:command_buffer
+                         sourceTexture:source
+                    destinationTexture:destination];
+    macws_commit_deferred_encoder(command_buffer);
+    // -commit finalizes state+0x328 (the segment-list logical end).  The
+    // command-buffer object and its storage remain valid until completion,
+    // so dump immediately after the successful native submission instead of
+    // observing the intentionally empty pre-finalization list.
+    [command_buffer commit];
+    int dump_status = macws_dump_kcmd(command_buffer, "statistics");
+    if (getenv("MACWS_IOS_KCMD_HOLD")) raise(SIGSTOP);
+    [command_buffer waitUntilCompleted];
+    fprintf(stderr,
+        "IOS-AGX-KCMD mode=statistics status=%ld error=%s dump=%d\n",
+        (long)command_buffer.status,
+        command_buffer.error.description.UTF8String ?: "nil", dump_status);
+    return dump_status || command_buffer.error ? 29 : 0;
 }
 
 static int macws_encode_scale(id<MTLDevice> device,
@@ -833,6 +932,8 @@ int main(void) {
             return macws_encode_mipmap(device, queue);
         if (strcmp(mode, "compute") == 0)
             return macws_encode_compute(device, queue);
+        if (strcmp(mode, "statistics") == 0)
+            return macws_encode_statistics(device, queue);
         if (strcmp(mode, "scale") == 0)
             return macws_encode_scale(device, queue);
         if (strcmp(mode, "chain") == 0)

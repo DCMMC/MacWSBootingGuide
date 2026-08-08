@@ -1,0 +1,7 @@
+IOS-AGX-KCMD pid=68045 mode=statistics device=0x10380ca00 class=AGXG13GDevice queue=0x102438760
+IOS-AGX-KCMD mode=statistics start=0x1022fc000 current=0x1022fc218 end=0x102300000 length=0x218
+IOS-AGX-KCMD record=0 offset=0 type=0x10000 span=0x218 end=0x1d8 size=0x1a8 inner=0x30 subtype=3
+IOS-AGX-KCMD saved=/tmp/ios-agx-kcmd-statistics.bin records=1 chain-end=0x218
+IOS-AGX-SEGMENT mode=statistics storage=0x102478630 start=0x1022f4000 current=0x1022f40f0 limit=0x1022f8000 length=0xf0 segment-mode=-1
+IOS-AGX-SEGMENT saved=/tmp/ios-agx-segment-statistics.bin status=0
+IOS-AGX-KCMD mode=statistics status=4 error=nil dump=0

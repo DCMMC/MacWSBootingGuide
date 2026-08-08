@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <math.h>
 
+#include "macws_host_protocol.h"
+
 // Product-level direct-touch thresholds. Keep these in a pure header so the
 // UIKit state machine and local boundary tests cannot silently diverge.
 // Four UIKit points is enough to reject normal tap jitter on an 11-inch
@@ -14,6 +16,8 @@
 #define MACWS_DIRECT_DOUBLE_TAP_SECONDS 0.42
 #define MACWS_DIRECT_DOUBLE_TAP_DISTANCE_POINTS 44.0
 #define MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND 80.0
+#define MACWS_SYSTEM_GESTURE_RECOGNITION_FRACTION 0.012
+#define MACWS_SYSTEM_GESTURE_REFERENCE_FRACTION 0.28
 
 // A dispatch_after callback is only a visual/feedback hint.  The Host main
 // queue can be busy presenting a large IOSurface when that callback becomes
@@ -93,6 +97,46 @@ static inline MacWSThreeFingerGesture MacWSClassifyThreeFingerPan(
         return translationY < 0.0 ? MacWSThreeFingerGestureUp
                                   : MacWSThreeFingerGestureDown;
     return MacWSThreeFingerGestureNone;
+}
+
+// A physical Mac trackpad locks the navigation axis after a small slop region,
+// then reports a continuous signed progress. Keep that recognition boundary
+// independent of UIKit so the Host cannot regress to a one-shot thresholded
+// shortcut without the protocol test noticing.
+static inline MacWSSystemGestureAxis MacWSSystemGestureAxisForTranslation(
+        double translationX, double translationY,
+        double minimumViewDimension) {
+    double x = fabs(translationX), y = fabs(translationY);
+    double recognitionDistance = fmax(
+        8.0, minimumViewDimension *
+            MACWS_SYSTEM_GESTURE_RECOGNITION_FRACTION);
+    if (hypot(x, y) < recognitionDistance) return 0;
+    if (x > y * 1.12) return MacWSSystemGestureAxisHorizontal;
+    if (y > x * 1.12) return MacWSSystemGestureAxisVertical;
+    return 0;
+}
+
+static inline double MacWSSystemGestureReferenceDistance(
+        double minimumViewDimension) {
+    return fmax(120.0, minimumViewDimension *
+        MACWS_SYSTEM_GESTURE_REFERENCE_FRACTION);
+}
+
+// Ventura Dock does not use one Cartesian sign convention for both navigation
+// axes. RE at Dock __TEXT+0x8d508 plus the live handler table shows:
+//   * horizontal finger-left -> positive progress -> swipe-left handler
+//   * vertical finger-up     -> negative progress -> swipe-up handler
+// UIKit reports both of those finger translations as negative. Preserve the
+// verified per-axis convention here for displacement and velocity alike.
+static inline double MacWSSystemGestureProgressForDisplacement(
+        MacWSSystemGestureAxis axis, double displacement,
+        double referenceDistance) {
+    if (referenceDistance <= 0.0) return 0.0;
+    if (axis == MacWSSystemGestureAxisHorizontal)
+        return -displacement / referenceDistance;
+    if (axis == MacWSSystemGestureAxisVertical)
+        return displacement / referenceDistance;
+    return 0.0;
 }
 
 static inline MacWSDirectScrollAxis MacWSChooseDirectScrollAxis(

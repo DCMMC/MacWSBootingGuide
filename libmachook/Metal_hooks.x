@@ -10800,11 +10800,15 @@ static void macws_install_data_library_compatibility(Class agx) {
 // shaders successfully, then the iOS AGX driver rejects the resulting
 // macOS-target AIR at pipeline creation with "Target OS is incompatible".
 // The same rejection occurs on the first Terminal generation for the
-// unspecialized path_blit_vert_lph + attachment_clear_frag_lph pair.  The
-// package generates a byte-validated secondary library from the device's own
-// Ventura default.metallib: only these five runtime-confirmed AIR modules
-// receive a macabi target triple; all other module bytes and every public
-// function signature remain unchanged.
+// unspecialized path_blit_vert_lph + attachment_clear_frag_lph pair, and in
+// Dock's fluid Mission Control transition for std_vert1_lph +
+// inplace_copy_lph. The fluid transition's blurred-overview variant also
+// specializes downsample_blur_vert_lph + downsample_8_frag_lph; the original
+// functions reached AGXMetal13_3 code=3 even after the copy pass succeeded.
+// The package generates a byte-validated secondary library from the device's
+// own Ventura default.metallib: only these nine
+// runtime-confirmed AIR modules receive a macabi target triple; all other
+// module bytes and every public function signature remain unchanged.
 //
 // Do not replace QuartzCore's default library.  A mixed-target MTLB used as the
 // process-wide default makes unrelated early CoreAnimation pipelines fail.
@@ -10845,15 +10849,15 @@ static macws_function_specialize_async_fn
 static const char *kMacWSQCDesktopLibraryPath =
     "/usr/local/share/macws/quartzcore/"
     "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1045424;
+static const size_t kMacWSQCDesktopLibraryBytes = 1047040;
 static const uint64_t kMacWSQCDesktopLibraryHash =
-    UINT64_C(0x7c844f46e7610242);
+    UINT64_C(0xa767741e41e0beb5);
 static const char *kMacWSSkyLightDesktopLibraryPath =
     "/usr/local/share/macws/skylight/"
     "SkyLightShaders-desktop-effects-macabi.metallib";
-static const size_t kMacWSSkyLightDesktopLibraryBytes = 706944;
+static const size_t kMacWSSkyLightDesktopLibraryBytes = 707456;
 static const uint64_t kMacWSSkyLightDesktopLibraryHash =
-    UINT64_C(0x836ee78122915ae7);
+    UINT64_C(0xa6690304dfdf552c);
 static const char *kMacWSMPSImageDesktopLibraryPath =
     "/usr/local/share/macws/mpsimage/"
     "default-desktop-effects-macabi.metallib";
@@ -10866,18 +10870,35 @@ static BOOL macws_qc_desktop_function_name(NSString *name) {
            [name isEqualToString:@"fixed_vert_lph_gen"] ||
            [name isEqualToString:@"fixed_frag_lph_cpf"] ||
            [name isEqualToString:@"path_blit_vert_lph"] ||
-           [name isEqualToString:@"attachment_clear_frag_lph"];
+           [name isEqualToString:@"attachment_clear_frag_lph"] ||
+           [name isEqualToString:@"std_vert1_lph"] ||
+           [name isEqualToString:@"inplace_copy_lph"] ||
+           [name isEqualToString:@"downsample_blur_vert_lph"] ||
+           [name isEqualToString:@"downsample_8_frag_lph"];
 }
 
 static BOOL macws_qc_desktop_base_function_name(NSString *name) {
-    // RE-confirmed from the exact Ventura 13.4 AIR modules: neither function
-    // contains function-constant metadata.  CoreAnimation requests both as
-    // ordinary base functions before building spec Pw40aXm_TatcA2S1Xhf.
+    // Runtime-confirmed against the exact Ventura 13.4 library: these are
+    // requested as ordinary base functions. CoreAnimation pairs the first two
+    // for Pw40aXm_TatcA2S1Xhf and the latter two for the Mission Control
+    // transition's Pw40aXm_TipcA2Xhf_Isrc copy pass.
     return [name isEqualToString:@"path_blit_vert_lph"] ||
-           [name isEqualToString:@"attachment_clear_frag_lph"];
+           [name isEqualToString:@"attachment_clear_frag_lph"] ||
+           [name isEqualToString:@"std_vert1_lph"] ||
+           [name isEqualToString:@"inplace_copy_lph"];
 }
 
 static BOOL macws_skylight_desktop_function_name(NSString *name) {
+    return [name isEqualToString:@"SimpleVertex"] ||
+           [name isEqualToString:@"SimpleTextureFragment"] ||
+           [name isEqualToString:@"UberCompositeFragment"];
+}
+
+static BOOL macws_skylight_desktop_base_function_name(NSString *name) {
+    // The Simple* pair has no function constants and is requested directly.
+    // UberCompositeFragment is different: ShaderComposer passes the real
+    // per-composite MTLFunctionConstantValues through the library
+    // specialization API, so it must not be flattened into a base request.
     return [name isEqualToString:@"SimpleVertex"] ||
            [name isEqualToString:@"SimpleTextureFragment"];
 }
@@ -11030,7 +11051,7 @@ static id macws_skylight_function_compat(
     // three require specialization.
     BOOL base_function_target =
         macws_qc_desktop_base_function_name(name) ||
-        macws_skylight_desktop_function_name(name) ||
+        macws_skylight_desktop_base_function_name(name) ||
         macws_mpsimage_desktop_function_name(name);
     id<MTLLibrary> library = base_function_target
         ? macws_qc_desktop_library_for_request(self, name) : nil;
@@ -11207,9 +11228,34 @@ static id macws_qc_specialize_basic_compat(
             compatibility_error);
         if (function) return function;
     }
-    return g_macws_qc_specialize_basic_orig
+    id original_function = g_macws_qc_specialize_basic_orig
         ? g_macws_qc_specialize_basic_orig(
               self, selector, name, constant_values, error) : nil;
+    // ShaderComposer::UberComposite stores the result of this call directly
+    // in its unordered-map cache.  Runtime crash evidence from the native
+    // three-finger Mission Control transition showed that one previously
+    // unseen key stored nil, after which MetalBacking passed that nil
+    // MetalShader to CopyPipelineState and faulted at this+0x28.  Record the
+    // actual Metal specialization result/error here, at the upstream failure
+    // boundary.  Do not replace the nil result or alter the cache contract.
+    if (macws_runtime_diagnostics_enabled() &&
+        ([name isEqualToString:@"UberCompositeVertex"] ||
+         [name isEqualToString:@"UberCompositeFragment"])) {
+        NSError *specialization_error = error ? *error : nil;
+        dprintf(STDERR_FILENO,
+            "#### SKYLIGHT-UBER-SPECIALIZE selector=%s name=%s "
+            "constants=%p function=%p errorDomain=%s errorCode=%ld "
+            "description=%s\n",
+            sel_getName(selector), name.UTF8String,
+            (void *)constant_values, (void *)original_function,
+            specialization_error
+                ? specialization_error.domain.UTF8String : "(nil)",
+            specialization_error ? (long)specialization_error.code : 0L,
+            specialization_error
+                ? specialization_error.localizedDescription.UTF8String
+                : "(nil)");
+    }
+    return original_function;
 }
 
 static id macws_qc_specialize_cache_compat(

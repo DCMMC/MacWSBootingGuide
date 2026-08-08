@@ -902,9 +902,9 @@ ROOTFS=/var/mnt/rootfs
 # Ventura QuartzCore's real desktop-window-effects shaders are compiled for a
 # macOS AIR target, while this project intentionally executes them on the iOS
 # native AGX driver. Preserve the original system library as the process-wide
-# default and build a secondary library in which only the five
+# default and build a secondary library in which only the nine
 # runtime-confirmed failing functions carry a macabi AIR triple. libmachook
-# forwards the original function constants when present and redirects the two
+# forwards the original function constants when present and redirects the four
 # zero-constant base functions unchanged; it does not bypass compilation or
 # pipeline validation.
 QC_DEFAULT="$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib"
@@ -912,7 +912,7 @@ QC_ORIGINAL="$QC_DEFAULT.macws-macos13.4-original"
 QC_EXPECTED_SHA256=ac8014164c7784395f86ac2926c62b67c96faa2a3c789f231b4b22b64024bfba
 QC_COMPAT_DIR="$ROOTFS/usr/local/share/macws/quartzcore"
 QC_COMPAT_TARGET="$QC_COMPAT_DIR/default-desktop-effects-macabi.metallib"
-QC_COMPAT_EXPECTED_SHA256=8ea3ef15574a2b1de460aaec17a0c1d9cd432a2109feb006f45323355c1804a3
+QC_COMPAT_EXPECTED_SHA256=0cc979fb9a44ca2b7675bb73fcae02bbfa472f7498aa51bd543229927392f8e2
 QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py
 QC_LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 QC_LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
@@ -952,6 +952,10 @@ python3 "$QC_REPACKER" "$QC_ORIGINAL" "$QC_COMPAT_TMP" \
 	--function fixed_frag_lph_cpf \
 	--function path_blit_vert_lph \
 	--function attachment_clear_frag_lph \
+	--function std_vert1_lph \
+	--function inplace_copy_lph \
+	--function downsample_blur_vert_lph \
+	--function downsample_8_frag_lph \
 	--rewrite-fract-v3f16-function fixed_frag_lph_cpf \
 	--preserve-container-target || exit 1
 if [ "$(qc_sha256 "$QC_COMPAT_TMP")" != "$QC_COMPAT_EXPECTED_SHA256" ]; then
@@ -963,14 +967,16 @@ mv -f "$QC_COMPAT_TMP" "$QC_COMPAT_TARGET" || exit 1
 echo '[INFO] installed exact QuartzCore desktop-effects macabi shader library'
 
 # SkyLight's desktop backing-window path has a second, independently
-# runtime-confirmed target mismatch for SimpleVertex/SimpleTextureFragment.
-# Generate a separate two-function compatibility library from the exact
-# Ventura 13.4 source; never replace SkyLight's process-wide library.
+# Runtime-confirmed target mismatches exist for the ordinary
+# SimpleVertex/SimpleTextureFragment pair and for the UberCompositeFragment
+# specialization reached when Mission Control snapshots a real application
+# window. Generate a separate three-function compatibility library from the
+# exact Ventura 13.4 source; never replace SkyLight's process-wide library.
 SKY_DEFAULT="$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/SkyLightShaders.air64.metallib"
 SKY_EXPECTED_SHA256=378174fcbf7fc639aa737cad7a765690b2d76fa3a66c7a8e71018441f3ac3184
 SKY_COMPAT_DIR="$ROOTFS/usr/local/share/macws/skylight"
 SKY_COMPAT_TARGET="$SKY_COMPAT_DIR/SkyLightShaders-desktop-effects-macabi.metallib"
-SKY_COMPAT_EXPECTED_SHA256=d592ac61f74cdeeb5c0ebc14bb86b5eae35cb847daf99f9da5faf5d2a990b923
+SKY_COMPAT_EXPECTED_SHA256=990803db710c494ff98155983cc9d3134c131e1ddbf3ce9e4468a3013134ffd6
 if [ "$(qc_sha256 "$SKY_DEFAULT")" != "$SKY_EXPECTED_SHA256" ]; then
 	echo "[ERROR] SkyLightShaders.air64.metallib is not the supported macOS 13.4 library." >&2
 	exit 1
@@ -981,6 +987,7 @@ python3 "$QC_REPACKER" "$SKY_DEFAULT" "$SKY_COMPAT_TMP" \
 	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
 	--function SimpleVertex \
 	--function SimpleTextureFragment \
+	--function UberCompositeFragment \
 	--preserve-container-target || exit 1
 if [ "$(qc_sha256 "$SKY_COMPAT_TMP")" != "$SKY_COMPAT_EXPECTED_SHA256" ]; then
 	echo "[ERROR] Generated SkyLight desktop-effects library failed exact validation." >&2

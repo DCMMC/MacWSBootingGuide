@@ -14501,6 +14501,11 @@ static unsigned macws_translate_agx_segment_list_records(
             0xff, 0xff, 0xff, 0xff,
             0xff, 0xff, 0xff, 0xff
         };
+        static const unsigned char subtype3_reduction_sentinel[12] = {
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff
+        };
         // This mode dword is after the macOS-only window, so its original
         // location is 0x10 later than the normalized iOS record.
         uint32_t subtype3_mode = span >= 0x1f8
@@ -14515,7 +14520,33 @@ static unsigned macws_translate_agx_segment_list_records(
             macws_submit_bytes_are_zero(record + 0x1cc, 0x10) &&
             memcmp(record + 0x1dc, subtype3_sentinel,
                    sizeof(subtype3_sentinel)) == 0;
-        if (!subtype1_anchors && !subtype2_anchors && !subtype3_anchors)
+        // Paired native control for the first stage of
+        // MPSImageStatisticsMean (the sum_rgba_columns/rows transition
+        // reduction).  WindowServer emitted a two-segment macOS command whose
+        // first subtype-3 record is 0x228 bytes and has a mode-2 dword at
+        // +0x1f4.  Unlike the previously captured compute/scale variant, this
+        // producer has no leading 1 before its twelve-byte all-ones sentinel:
+        // the macOS bytes are zero through +0x1df and the sentinel starts at
+        // +0x1e0.  The public iOS-native MPSImageStatisticsMean control
+        // completed status=4/error=nil with a 0x218-byte record.  Deleting the
+        // macOS-only zero window at +0x1d0 and normalizing the three size
+        // fields makes 502/536 bytes identical; every residual difference is
+        // outside the removed window and remains untouched.  Admit only that
+        // exact independently observed framing rather than weakening the
+        // existing generic sentinel contract.
+        int subtype3_reduction_anchors = span == 0x228 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x228 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            subtype3_mode == 2 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0;
+        if (!subtype1_anchors && !subtype2_anchors && !subtype3_anchors &&
+            !subtype3_reduction_anchors)
             continue;
 
         uint32_t shrink = subtype1_anchors ? 0x20 : 0x10;

@@ -100,22 +100,37 @@ enum {
     // stable identity for the gesture, and the phase reuses the scroll-phase
     // flag bits below. The wire record stays ABI-compatible at 84 bytes.
     MacWSInputKindMagnify = 19,
-    // One semantic macOS Space gesture produced only by the fullscreen
-    // workspace. contactID carries MacWSDesktopCommand. Vertical three-finger
-    // overview stays in Host because native Mission Control is unsafe in this
-    // headless WindowServer; only left/right reach an AppKit endpoint as the
-    // ordinary Control+Arrow shortcut.
+    // Legacy one-shot desktop command retained only for wire compatibility
+    // with older diagnostic clients. Fullscreen Host no longer emits it:
+    // semantic commands cannot carry native fluid gesture progress.
     MacWSInputKindDesktopCommand = 20,
+    // Continuous macOS system-trackpad gesture, delivered only to Dock's
+    // process-local input endpoint. pressure is the signed, cumulative
+    // progress; altitude is progress/second; buttons carries
+    // MacWSSystemGestureAxis; contactID remains stable from Begin through the
+    // terminal phase. Dock's Ventura gesture controller, rather than Host,
+    // owns the native Mission Control/Spaces animation and completion policy.
+    MacWSInputKindSystemGesture = 21,
 };
 
 typedef uint32_t MacWSDesktopCommand;
 enum {
-    // Reserved wire values from the diagnostic implementation. Validators
-    // reject them: Control+Up runtime-crashed WindowServer in MPS.
+    // Reserved wire values from the retired diagnostic implementation.
+    // Production fullscreen gestures use MacWSInputKindSystemGesture.
     MacWSDesktopCommandMissionControl = 1,
     MacWSDesktopCommandApplicationWindows = 2,
     MacWSDesktopCommandSpaceLeft = 3,
     MacWSDesktopCommandSpaceRight = 4,
+};
+
+typedef uint32_t MacWSSystemGestureAxis;
+enum {
+    // These values intentionally match Ventura 13.4's navigation-gesture
+    // field (CGEvent field 123) consumed by -[DOCKGestures handleEvent:].
+    // Dock derives the actual left/right/up/down gesture from the signed
+    // progress, exactly as it does for a physical MacBook trackpad.
+    MacWSSystemGestureAxisHorizontal = 1,
+    MacWSSystemGestureAxisVertical = 2,
 };
 
 typedef uint16_t MacWSHostInputMode;

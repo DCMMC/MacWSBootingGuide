@@ -145,6 +145,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindCreateInitialWindow: return "create-initial-window";
         case MacWSInputKindReopenApplication: return "reopen-application";
         case MacWSInputKindDesktopCommand: return "desktop-command";
+        case MacWSInputKindSystemGesture: return "system-gesture";
     }
     return "invalid";
 }
@@ -199,11 +200,27 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
              phase != MacWSInputFlagGestureEnded &&
              phase != MacWSInputFlagGestureCancelled)) return false;
     }
+    if (record->kind == MacWSInputKindSystemGesture) {
+        uint16_t phase = record->flags &
+            (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+             MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+        if (record->targetPID <= 1 ||
+            (record->flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
+            (record->buttons != MacWSSystemGestureAxisHorizontal &&
+             record->buttons != MacWSSystemGestureAxisVertical) ||
+            record->contactID == 0 || !isfinite(record->pressure) ||
+            fabsf(record->pressure) > 2.0f ||
+            fabsf(record->altitude) > 12.0f ||
+            (phase != MacWSInputFlagGestureBegan &&
+             phase != MacWSInputFlagGestureChanged &&
+             phase != MacWSInputFlagGestureEnded &&
+             phase != MacWSInputFlagGestureCancelled)) return false;
+    }
     if (
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindDesktopCommand) {
+        record->kind > MacWSInputKindSystemGesture) {
         return false;
     }
     return true;
@@ -253,6 +270,7 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindCreateInitialWindow:
         case MacWSInputKindReopenApplication:
         case MacWSInputKindDesktopCommand:
+        case MacWSInputKindSystemGesture:
             // Consumed before event construction in main().
             return 0;
     }
@@ -641,6 +659,8 @@ static bool SendToAppInputBridge(int socketFD,
                       (record->kind == MacWSInputKindScroll &&
                        (record->flags & MacWSInputFlagScrollChanged)) ||
                       (record->kind == MacWSInputKindMagnify &&
+                       (record->flags & MacWSInputFlagGestureChanged)) ||
+                      (record->kind == MacWSInputKindSystemGesture &&
                        (record->flags & MacWSInputFlagGestureChanged));
     unsigned attempts = continuous ? 1 : 2;
     ssize_t sent = -1;
@@ -1145,10 +1165,15 @@ int main(void) {
             fprintf(stderr,
                     "MACWS-INPUT REJECT bytes=%zd magic=%#x version=%u "
                     "kind=%u point=(%.3f,%.3f) frame=%ux%u target=%d "
-                    "finite=%s\n",
+                    "source=%u flags=%#x buttons=%u contact=%u "
+                    "pressure=%.6f altitude=%.6f azimuth=%.6f "
+                    "tilt=(%.6f,%.6f) finite=%s\n",
                     received, record.magic, record.version, record.kind,
                     record.x, record.y, record.frameWidth,
-                    record.frameHeight, record.targetPID,
+                    record.frameHeight, record.targetPID, record.source,
+                    record.flags, record.buttons, record.contactID,
+                    record.pressure, record.altitude, record.azimuth,
+                    record.tiltX, record.tiltY,
                     (isfinite(record.x) && isfinite(record.y))
                         ? "YES" : "NO");
             fflush(stderr);
@@ -1268,6 +1293,8 @@ int main(void) {
         bool magnifyRecord = record.kind == MacWSInputKindMagnify;
         bool desktopCommandRecord =
             record.kind == MacWSInputKindDesktopCommand;
+        bool systemGestureRecord =
+            record.kind == MacWSInputKindSystemGesture;
         bool gestureRecord = scrollRecord || magnifyRecord;
         if (globalSystemSurfaceRecord) {
             // Dock and other non-NSApplication surfaces need CoreGraphics'
@@ -1342,6 +1369,12 @@ int main(void) {
                     fflush(stderr);
                 }
             }
+        } else if (systemGestureRecord && record.targetPID > 1) {
+            // Host resolves the real Dock owner from displayd's
+            // GlobalSystemSurface catalog. A system gesture must never follow
+            // the front application's menu/hover cache: Dock itself owns the
+            // native fluid gesture controller and animation lifecycle.
+            eventTarget.pid = record.targetPID;
         } else if (exactWindowRecord) {
             // A native iPadOS Scene is permanently bound to one AppKit owner
             // and window. Do not let a stale fullscreen hover/menu cache route
@@ -1598,6 +1631,21 @@ int main(void) {
             if (record.flags & (MacWSInputFlagGestureEnded |
                                 MacWSInputFlagGestureCancelled))
                 gestureTarget = (MacWSWindowTarget){0};
+            continue;
+        }
+        if (systemGestureRecord) {
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT SYSTEM-GESTURE seq=%llu target=%d "
+                    "axis=%u phase=%#x progress=%.6f velocity=%.6f "
+                    "app-bridge=%s errno=%d\n",
+                    (unsigned long long)sequence, eventTarget.pid,
+                    record.buttons, record.flags, record.pressure,
+                    record.altitude, appBridgeSent ? "YES" : "NO",
+                    appBridgeError);
+                fflush(stderr);
+            }
             continue;
         }
         CGMouseButton mouseButton =

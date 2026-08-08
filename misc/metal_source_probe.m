@@ -242,7 +242,11 @@ int main(void) {
             DumpFunctionSpecializationRequirement(fragment);
             for (NSString *extraName in
                  @[ @"SimpleVertex", @"SimpleTextureFragment",
-                    @"sum_rgba_columns", @"sum_rgba_rows" ]) {
+                    @"UberCompositeFragment",
+                    @"sum_rgba_columns", @"sum_rgba_rows",
+                    @"std_vert1_lph", @"inplace_copy_lph",
+                    @"downsample_blur_vert_lph",
+                    @"downsample_8_frag_lph" ]) {
                 if ([functionNames containsObject:extraName]) {
                     DumpFunctionSpecializationRequirement(
                         [library newFunctionWithName:extraName]);

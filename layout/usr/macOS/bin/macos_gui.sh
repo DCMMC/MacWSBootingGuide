@@ -137,6 +137,8 @@ CHROME150_LABEL=UIKitApplication:com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
 EXPERIMENTAL_WRAPPED_KCMD="$ROOTFS/private/tmp/macws_kcmd_wrapped_fix"
 EXPERIMENTAL_COMMAND_ERROR="$ROOTFS/private/tmp/macws_command_error_diag"
+EXPERIMENTAL_IOGPU_ERROR="$ROOTFS/private/tmp/macws_iogpu_error_diag"
+EXPERIMENTAL_PIPELINE_DIAG="$ROOTFS/private/tmp/macws_pipeline_diag"
 EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
 EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
@@ -2859,11 +2861,13 @@ enable_experimental_if_requested() {
     # perturb the timing-sensitive 0x102 failure.  The fixed-memory recorder
     # remains available only under the explicit diagnostic mode below.
     rm -f "$EXPERIMENTAL_SUBMIT_RING"
-    rm -f "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
+    rm -f "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_IOGPU_ERROR" \
+        "$EXPERIMENTAL_PIPELINE_DIAG" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
         "$EXPERIMENTAL_OBSERVE_PF550" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \
         "$MTLCOMPILER_DIAGNOSTICS"
     if [ "$WANT_DIAGNOSTICS" = 1 ]; then
-        touch "$EXPERIMENTAL_COMMAND_ERROR" \
+        touch "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_IOGPU_ERROR" \
+            "$EXPERIMENTAL_PIPELINE_DIAG" \
             "$EXPERIMENTAL_FAST_SUBMIT_RING" \
             "$EXPERIMENTAL_OBSERVE_PF550" \
             "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \

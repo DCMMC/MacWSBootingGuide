@@ -76,6 +76,8 @@ typedef void (*MacWSSetCGEventUnicode)(MacWSCGEventRef, size_t,
 typedef void (*MacWSSetCGEventIntegerField)(MacWSCGEventRef, uint32_t,
                                             int64_t);
 typedef void (*MacWSSetCGEventDoubleField)(MacWSCGEventRef, uint32_t, double);
+typedef int64_t (*MacWSGetCGEventIntegerField)(MacWSCGEventRef, uint32_t);
+typedef double (*MacWSGetCGEventDoubleField)(MacWSCGEventRef, uint32_t);
 typedef void *(*MacWSSLEventRecordPointer)(MacWSCGEventRef);
 typedef void (*MacWSPostCGEvent)(uint32_t, MacWSCGEventRef);
 // CGRemoteOperation.h declares mouseButtonDown as a fixed boolean_t argument;
@@ -171,6 +173,12 @@ typedef struct {
     CFTypeRef application;
 } MacWSDirectTrackingContext;
 static MacWSDirectTrackingContext MacWSAppInputDirectContext;
+// Dock is not an NSApplication. Capture its real DOCKGestures singleton at
+// ordinary -init time so the process-local endpoint can pass reconstructed
+// trackpad CGEvents into the same handleEvent: pipeline used by hardware.
+// The witness does not replace or suppress any Dock behavior.
+static _Atomic(uintptr_t) MacWSDockGesturesInstance;
+static IMP MacWSOriginalDockGesturesInit;
 // Native non-client tracking (title bar, traffic-light controls and resize
 // chrome) belongs to WindowServer, not an NSView responder.  Once a verified
 // exact-window down enters CGPostMouseEvent, keep its move/up records on that
@@ -1598,6 +1606,29 @@ static BOOL MacWSAppInputIsDockEndpoint(void) {
     return program && strcmp(program, "Dock") == 0;
 }
 
+static id MacWSDockGesturesInitWitness(id self, SEL selector) {
+    id result = MacWSOriginalDockGesturesInit
+        ? ((id (*)(id, SEL))MacWSOriginalDockGesturesInit)(self, selector)
+        : nil;
+    if (result) atomic_store_explicit(
+        &MacWSDockGesturesInstance, (uintptr_t)result,
+        memory_order_release);
+    return result;
+}
+
+static BOOL MacWSInstallDockGesturesWitness(void) {
+    Class gesturesClass = objc_getClass("DOCKGestures");
+    if (!gesturesClass) return NO;
+    Method method = class_getInstanceMethod(gesturesClass,
+                                             sel_registerName("init"));
+    if (!method) return NO;
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)MacWSDockGesturesInitWitness) return YES;
+    MacWSOriginalDockGesturesInit = current;
+    method_setImplementation(method, (IMP)MacWSDockGesturesInitWitness);
+    return YES;
+}
+
 static BOOL MacWSPointInRect(CGPoint point, CGRect rect) {
     return point.x >= rect.origin.x && point.y >= rect.origin.y &&
            point.x < rect.origin.x + rect.size.width &&
@@ -1626,6 +1657,7 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindCreateInitialWindow:
         case MacWSInputKindReopenApplication:
         case MacWSInputKindDesktopCommand:
+        case MacWSInputKindSystemGesture:
             return 0; // control-plane only; handled before event construction
     }
     return 0;
@@ -2100,10 +2132,26 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
              phase != MacWSInputFlagGestureEnded &&
              phase != MacWSInputFlagGestureCancelled)) return NO;
     }
+    if (record->kind == MacWSInputKindSystemGesture) {
+        uint16_t phase = record->flags &
+            (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+             MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+        if (!MacWSAppInputIsDockEndpoint() ||
+            (record->flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
+            (record->buttons != MacWSSystemGestureAxisHorizontal &&
+             record->buttons != MacWSSystemGestureAxisVertical) ||
+            record->contactID == 0 || !isfinite(record->pressure) ||
+            fabsf(record->pressure) > 2.0f ||
+            fabsf(record->altitude) > 12.0f ||
+            (phase != MacWSInputFlagGestureBegan &&
+             phase != MacWSInputFlagGestureChanged &&
+             phase != MacWSInputFlagGestureEnded &&
+             phase != MacWSInputFlagGestureCancelled)) return NO;
+    }
     return
         record->version == MACWS_INPUT_VERSION &&
         record->kind >= MacWSInputKindTouchDown &&
-        record->kind <= MacWSInputKindDesktopCommand &&
+        record->kind <= MacWSInputKindSystemGesture &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -2684,6 +2732,143 @@ static BOOL MacWSPostLegacySystemPointerEvent(
     return posted;
 }
 
+// Reconstruct the exact Ventura 13.4 event consumed by Dock's native fluid
+// gesture controller. RE-confirmed in the actual Dock arm64e image:
+//   -[DOCKGestures handleEvent:] at __TEXT+0x8d1b0 accepts CGEvent field 110
+//   == 23, uses field 132 bits 1/2/4/8 as Begin/Change/End/Cancel, and creates
+//   DOCKGestureEvent for fluidGestureStart/Progress/End.
+//   -[DOCKGestureEvent initWithEvent:display:gesture:] at __TEXT+0x47798
+//   reads signed progress from field 124, velocity from field 129, direction
+//   from field 115, and reversal from field 136.
+//   Dock's helper at __TEXT+0x8d508 reads navigation axis from field 123 and
+//   derives left/right/up/down from signed progress. Host therefore transports
+//   one continuous axis/progress stream instead of deciding a semantic action.
+static MacWSCGEventRef MacWSCreateDockSystemGestureEvent(
+        MacWSInputRecord record) {
+    static MacWSCreateCGEvent createEvent;
+    static MacWSSetCGEventType setType;
+    static MacWSSetCGEventTimestamp setTimestamp;
+    static MacWSSetCGEventIntegerField setInteger;
+    static MacWSSetCGEventDoubleField setDouble;
+    static MacWSGetCGEventIntegerField getInteger;
+    static MacWSGetCGEventDoubleField getDouble;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        createEvent = (MacWSCreateCGEvent)dlsym(RTLD_DEFAULT,
+                                                "CGEventCreate");
+        setType = (MacWSSetCGEventType)dlsym(RTLD_DEFAULT,
+                                             "CGEventSetType");
+        setTimestamp = (MacWSSetCGEventTimestamp)dlsym(
+            RTLD_DEFAULT, "CGEventSetTimestamp");
+        setInteger = (MacWSSetCGEventIntegerField)dlsym(
+            RTLD_DEFAULT, "CGEventSetIntegerValueField");
+        setDouble = (MacWSSetCGEventDoubleField)dlsym(
+            RTLD_DEFAULT, "CGEventSetDoubleValueField");
+        getInteger = (MacWSGetCGEventIntegerField)dlsym(
+            RTLD_DEFAULT, "CGEventGetIntegerValueField");
+        getDouble = (MacWSGetCGEventDoubleField)dlsym(
+            RTLD_DEFAULT, "CGEventGetDoubleValueField");
+    });
+    if (!createEvent || !setType || !setInteger || !setDouble ||
+        !getInteger || !getDouble) return NULL;
+
+    uint16_t phaseFlags = record.flags &
+        (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+         MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+    int64_t phase = phaseFlags == MacWSInputFlagGestureBegan ? 1 :
+        phaseFlags == MacWSInputFlagGestureChanged ? 2 :
+        phaseFlags == MacWSInputFlagGestureEnded ? 4 : 8;
+    int64_t direction = 0;
+    if (record.buttons == MacWSSystemGestureAxisHorizontal)
+        direction = record.pressure >= 0.0f ? 4 : 8;
+    else if (record.buttons == MacWSSystemGestureAxisVertical)
+        direction = record.pressure >= 0.0f ? 1 : 2;
+
+    MacWSCGEventRef event = createEvent(NULL);
+    if (!event) return NULL;
+    setType(event, 29);       // private CG gesture event family
+    setInteger(event, 110, 23); // Dock navigation gesture
+    setInteger(event, 115, direction);
+    // Do not write field 117. Runtime readback on Ventura 13.4 proves that
+    // CGEventSetIntegerValueField maps 117 onto the same backing slot as 115:
+    // writing a contact ID there overwrites Dock's direction.  Dock's target
+    // handleEvent:/DOCKGestureEvent path does not read 117; contact identity
+    // remains a transport invariant used by Host and the broker only.
+    setInteger(event, 123, record.buttons);
+    setDouble(event, 124, record.pressure);
+    setDouble(event, 129, record.altitude);
+    setInteger(event, 132, phase);
+    setInteger(event, 136, 1); // physical direction is not reversed
+    if (setTimestamp && record.timestamp > 0.0)
+        setTimestamp(event, (uint64_t)llround(record.timestamp * 1.0e9));
+
+    BOOL equivalent = getInteger(event, 110) == 23 &&
+        getInteger(event, 115) == direction &&
+        getInteger(event, 123) == record.buttons &&
+        getInteger(event, 132) == phase && getInteger(event, 136) == 1 &&
+        fabs(getDouble(event, 124) - record.pressure) <= 0.0005 &&
+        fabs(getDouble(event, 129) - record.altitude) <= 0.0005;
+    if (!equivalent) {
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT DOCK-GESTURE-CREATE-FAIL pid=%d "
+                "axis=%u phase=%lld progress=%.6f->%.6f "
+                "velocity=%.6f->%.6f fields="
+                "110:%lld 115:%lld 123:%lld 132:%lld 136:%lld\n",
+                getpid(), record.buttons, (long long)phase,
+                record.pressure, getDouble(event, 124), record.altitude,
+                getDouble(event, 129),
+                (long long)getInteger(event, 110),
+                (long long)getInteger(event, 115),
+                (long long)getInteger(event, 123),
+                (long long)getInteger(event, 132),
+                (long long)getInteger(event, 136));
+            fflush(stderr);
+        }
+        CFRelease(event);
+        return NULL;
+    }
+    return event;
+}
+
+static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
+    MacWSCGEventRef event = MacWSCreateDockSystemGestureEvent(record);
+    if (!event) return NO;
+    id gestures = (id)atomic_load_explicit(
+        &MacWSDockGesturesInstance, memory_order_acquire);
+    SEL handleEvent = sel_registerName("handleEvent:");
+    if (!gestures || !((MacWSMsgBoolSEL)objc_msgSend)(
+            gestures, sel_registerName("respondsToSelector:"), handleEvent)) {
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT DOCK-GESTURE-DROP pid=%d "
+                "reason=native-controller-unavailable\n", getpid());
+            fflush(stderr);
+        }
+        CFRelease(event);
+        return NO;
+    }
+    // Dock's hardware event source hands its CGEvent to DOCKGestures on the
+    // main queue. Preserve that same serialization: the socket thread only
+    // reconstructs the event and never runs Mission Control state itself.
+    CFRetain(event);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        ((MacWSMsgVoidID)objc_msgSend)(gestures, handleEvent, (id)event);
+        CFRelease(event);
+    });
+    CFRelease(event);
+    if (MacWSRuntimeDiagnosticsEnabled() &&
+        (record.flags & MacWSInputFlagGestureChanged) == 0) {
+        fprintf(stderr,
+            "#### APP-INPUT DOCK-GESTURE pid=%d axis=%u phase=%#x "
+            "progress=%.6f velocity=%.6f route=DOCKGestures.handleEvent\n",
+            getpid(), record.buttons, record.flags, record.pressure,
+            record.altitude);
+        fflush(stderr);
+    }
+    return YES;
+}
+
 // The central broker runs outside a normal WindowServer application session:
 // runtime CGPreflightPostEventAccess is NO.  OSXvnc's working mouse path calls
 // CGPostMouseEvent at __TEXT+0x9f24 from a CGS-connected process; the
@@ -2696,6 +2881,8 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
     if ((record.flags & MacWSInputFlagGlobalSystemSurface) == 0 ||
         record.frameWidth == 0 || record.frameHeight == 0)
         return NO;
+    if (record.kind == MacWSInputKindSystemGesture)
+        return MacWSPostDockSystemGesture(record);
     switch ((MacWSInputKind)record.kind) {
         case MacWSInputKindTouchDown:
         case MacWSInputKindTouchMove:
@@ -6810,6 +6997,14 @@ static void MacWSInstallAppInputBridgeNow(void) {
             &MacWSAppInputInstallState, &expected, 1,
             memory_order_acq_rel, memory_order_acquire)) return;
     BOOL dockEndpoint = MacWSAppInputIsDockEndpoint();
+    if (dockEndpoint && !MacWSInstallDockGesturesWitness()) {
+        // Dock's main executable can finish Objective-C registration after an
+        // inserted dylib constructor. Keep the endpoint alive; the finite
+        // install retry below will call this again before user interaction.
+        atomic_store_explicit(&MacWSAppInputInstallState, 0,
+                              memory_order_release);
+        return;
+    }
     if (!dockEndpoint) {
         MacWSInstallApplicationKeyWitness();
         MacWSInstallMenuEventLoopWitness();
