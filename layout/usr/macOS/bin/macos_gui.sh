@@ -2309,7 +2309,7 @@ publish_settings_service_contracts() {
 }
 
 verify_preferences_persistence() {
-    local value=""
+    local value="" mission_control="" app_expose=""
     rm -f "$LOGDIR/cfprefsd-probe.log"
     if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
             com.macwsguide.bootstrap PersistentPreferencesReady -bool true \
@@ -2326,7 +2326,35 @@ verify_preferences_persistence() {
         tail -n 20 "$LOGDIR/cfprefsd-probe.log" 2>/dev/null || true
         return 1
     fi
-    log "Private macOS CFPreferences database ready."
+    # Dock registers its native fluid-gesture controllers while starting.  A
+    # cold rootfs may not have created either preference yet; in that state
+    # Ventura's real DOCKGestures object has no App Expose handler in slot 1,
+    # so a correctly delivered three-finger-down stream is intentionally
+    # ignored.  Persist the stock Dock preferences before Dock is launched and
+    # verify the values through cfprefsd instead of installing another handler.
+    rm -f "$LOGDIR/dock-gesture-preferences.log"
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+            com.apple.dock showMissionControlGestureEnabled -bool true \
+            > "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
+       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+            com.apple.dock showAppExposeGestureEnabled -bool true \
+            >> "$LOGDIR/dock-gesture-preferences.log" 2>&1; then
+        log "ERROR: native Dock gesture preferences could not be persisted."
+        tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
+        return 1
+    fi
+    mission_control=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+        com.apple.dock showMissionControlGestureEnabled 2>> \
+        "$LOGDIR/dock-gesture-preferences.log") || mission_control=""
+    app_expose=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+        com.apple.dock showAppExposeGestureEnabled 2>> \
+        "$LOGDIR/dock-gesture-preferences.log") || app_expose=""
+    if [ "$mission_control" != 1 ] || [ "$app_expose" != 1 ]; then
+        log "ERROR: native Dock gesture preferences failed verification (Mission Control='$mission_control', App Expose='$app_expose')."
+        tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
+        return 1
+    fi
+    log "Private macOS CFPreferences database ready; native Mission Control and App Expose gestures enabled."
 }
 
 apply_workspace_wallpaper() {
@@ -2571,6 +2599,20 @@ start_macos() {
         return 1
     }
     log "Dock menu presentation helper registered for on-demand XPC activation."
+
+    # A stock one-Desktop session has no adjacent Space, so Dock correctly
+    # treats both horizontal fluid gestures as no-ops.  Establish the minimum
+    # real SkyLight topology before Dock registers its native gesture
+    # controllers.  The controller verifies the managed-space catalog and is
+    # idempotent: persisted/user-created desktops are never duplicated.
+    rm -f "$LOGDIR/navigation-spaces.log"
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+            ensure-navigation-spaces > "$LOGDIR/navigation-spaces.log" 2>&1; then
+        log "ERROR: could not establish adjacent native macOS desktops."
+        tail -n 20 "$LOGDIR/navigation-spaces.log" 2>/dev/null || true
+        return 1
+    fi
+    log "Native macOS desktop navigation topology ready: $(tail -n 1 "$LOGDIR/navigation-spaces.log")"
 
     log "Starting the real macOS Aqua workspace agents (Finder, Dock, SystemUIServer, ControlCenter)..."
     for workspace_log in finder-desktop dock systemuiserver controlcenter; do

@@ -99,8 +99,14 @@ int main(void) {
                     MacWSSystemGestureAxisHorizontal, -120.0, 240.0),
                 0.5f));
     assert(Near((float)MacWSSystemGestureProgressForDisplacement(
+                    MacWSSystemGestureAxisHorizontal, 120.0, 240.0),
+                -0.5f));
+    assert(Near((float)MacWSSystemGestureProgressForDisplacement(
                     MacWSSystemGestureAxisVertical, -120.0, 240.0),
                 -0.5f));
+    assert(Near((float)MacWSSystemGestureProgressForDisplacement(
+                    MacWSSystemGestureAxisVertical, 120.0, 240.0),
+                0.5f));
     assert(MacWSSystemGestureProgressForDisplacement(0, -120.0, 240.0) ==
            0.0);
     assert(MacWSSystemGestureProgressForDisplacement(

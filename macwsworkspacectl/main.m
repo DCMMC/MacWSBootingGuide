@@ -70,6 +70,123 @@ static int ShowLaunchpad(void) {
     return WEXITSTATUS(status);
 }
 
+typedef int32_t (*MainConnectionIDFn)(void);
+typedef CFArrayRef (*CopyManagedDisplaySpacesFn)(int32_t);
+typedef uint64_t (*SpaceCreateFn)(int32_t, int32_t, CFDictionaryRef);
+
+static NSArray *CopyManagedSpaces(int32_t *connectionOut,
+                                  NSUInteger *totalSpacesOut) {
+    MainConnectionIDFn mainConnectionID =
+        (MainConnectionIDFn)dlsym(RTLD_DEFAULT, "SLSMainConnectionID");
+    if (!mainConnectionID) {
+        mainConnectionID =
+            (MainConnectionIDFn)dlsym(RTLD_DEFAULT, "CGSMainConnectionID");
+    }
+    CopyManagedDisplaySpacesFn copySpaces =
+        (CopyManagedDisplaySpacesFn)dlsym(
+            RTLD_DEFAULT, "SLSCopyManagedDisplaySpaces");
+    if (!copySpaces) {
+        copySpaces = (CopyManagedDisplaySpacesFn)dlsym(
+            RTLD_DEFAULT, "CGSCopyManagedDisplaySpaces");
+    }
+    if (!mainConnectionID || !copySpaces) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight managed-space API is "
+                "unavailable (connection=%s spaces=%s)\n",
+                mainConnectionID ? "yes" : "no",
+                copySpaces ? "yes" : "no");
+        return nil;
+    }
+
+    int32_t connection = mainConnectionID();
+    CFArrayRef copied = copySpaces(connection);
+    if (!copied) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight returned no managed spaces\n");
+        return nil;
+    }
+    NSArray *displays = CFBridgingRelease(copied);
+    NSUInteger totalSpaces = 0;
+    for (id displayValue in displays) {
+        if (![displayValue isKindOfClass:NSDictionary.class]) continue;
+        NSDictionary *display = displayValue;
+        id spacesValue = display[@"Spaces"] ?: display[@"spaces"];
+        if ([spacesValue isKindOfClass:NSArray.class])
+            totalSpaces += [spacesValue count];
+    }
+    if (connectionOut) *connectionOut = connection;
+    if (totalSpacesOut) *totalSpacesOut = totalSpaces;
+    return displays;
+}
+
+static int ListSpaces(void) {
+    NSUInteger totalSpaces = 0;
+    NSArray *displays = CopyManagedSpaces(NULL, &totalSpaces);
+    if (!displays) return 69;
+    NSError *error = nil;
+    NSData *propertyList = [NSPropertyListSerialization
+        dataWithPropertyList:displays
+                      format:NSPropertyListXMLFormat_v1_0
+                     options:0
+                       error:&error];
+    fprintf(stdout, "managed-spaces displays=%lu spaces=%lu\n",
+            (unsigned long)displays.count, (unsigned long)totalSpaces);
+    if (propertyList) {
+        fwrite(propertyList.bytes, 1, propertyList.length, stdout);
+        fputc('\n', stdout);
+    } else {
+        fprintf(stdout, "%s\n",
+                displays.description.UTF8String ?: "<unprintable>");
+        fprintf(stderr,
+                "macwsworkspacectl: managed-space property-list encoding "
+                "failed: %s\n",
+                error.description.UTF8String ?: "unknown error");
+    }
+    return totalSpaces > 0 ? 0 : 1;
+}
+
+static int EnsureNavigationSpaces(void) {
+    int32_t connection = 0;
+    NSUInteger before = 0;
+    NSArray *displays = CopyManagedSpaces(&connection, &before);
+    if (!displays || before == 0) return 69;
+    if (before >= 2) {
+        fprintf(stdout,
+                "navigation-spaces ready before=%lu after=%lu created=0\n",
+                (unsigned long)before, (unsigned long)before);
+        return 0;
+    }
+
+    SpaceCreateFn createSpace = (SpaceCreateFn)dlsym(
+        RTLD_DEFAULT, "CGSSpaceCreate");
+    if (!createSpace) createSpace = (SpaceCreateFn)dlsym(
+        RTLD_DEFAULT, "SLSSpaceCreate");
+    if (!createSpace) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight space-create API is unavailable\n");
+        return 69;
+    }
+    uint64_t createdSpace = createSpace(connection, 0, NULL);
+    if (createdSpace == 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight failed to create the second "
+                "navigation space\n");
+        return 1;
+    }
+
+    NSUInteger after = 0;
+    for (unsigned attempt = 0; attempt < 20; attempt++) {
+        NSArray *updated = CopyManagedSpaces(NULL, &after);
+        if (updated && after >= 2) break;
+        usleep(50 * 1000);
+    }
+    fprintf(stdout,
+            "navigation-spaces ready before=%lu after=%lu created=%llu\n",
+            (unsigned long)before, (unsigned long)after,
+            (unsigned long long)createdSpace);
+    return after >= 2 ? 0 : 1;
+}
+
 static int RegisterSettingsExtensions(BOOL registerRecords) {
     static NSString *const directoryPath =
         @"/System/Library/ExtensionKit/Extensions";
@@ -682,6 +799,13 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 && strcmp(argv[1], "show-launchpad") == 0) {
             return ShowLaunchpad();
         }
+        if (argc == 2 && strcmp(argv[1], "list-spaces") == 0) {
+            return ListSpaces();
+        }
+        if (argc == 2 &&
+            strcmp(argv[1], "ensure-navigation-spaces") == 0) {
+            return EnsureNavigationSpaces();
+        }
         if (argc == 2 &&
             (strcmp(argv[1], "register-settings-extensions") == 0 ||
              strcmp(argv[1], "register-settings-extension") == 0)) {
@@ -714,7 +838,8 @@ int main(int argc, const char *argv[]) {
         }
         fprintf(stderr,
                 "usage: macwsworkspacectl set-wallpaper [path] | "
-                "show-launchpad | register-settings-extensions | "
+                "show-launchpad | list-spaces | ensure-navigation-spaces | "
+                "register-settings-extensions | "
                 "verify-launchservices-catalog | "
                 "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "

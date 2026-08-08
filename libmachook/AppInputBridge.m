@@ -2867,6 +2867,14 @@ static BOOL MacWSDeliverDockSystemGesture(MacWSInputRecord record) {
     // source.  The socket thread never runs Mission Control state itself.
     ((MacWSMsgVoidID)objc_msgSend)(gestures, handleEvent, (id)event);
     CFRelease(event);
+    // Dock's fluid controllers move compositor windows directly, so their
+    // progress does not pass through the NSWindow geometry hooks that usually
+    // wake displayd.  Notify displayd only after the native handler consumed
+    // the sample; it temporarily samples the authoritative CGWindow geometry
+    // at display cadence and keeps Host's independent IOSurface layers in the
+    // same continuous animation.  This is an invalidation edge, not a second
+    // gesture implementation.
+    MacWSNotifyDisplayCatalogChanged('a');
     if (MacWSRuntimeDiagnosticsEnabled() &&
         (record.flags & MacWSInputFlagGestureChanged) == 0) {
         fprintf(stderr,
@@ -6921,16 +6929,32 @@ static uint32_t MacWSLogicalWindowGroupID(id window, id application) {
     return groupID;
 }
 
-static void MacWSNotifyDisplayCatalogChanged(uint8_t reason) {
-    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (socketFD < 0) return;
-    struct sockaddr_un target = {0};
-    target.sun_family = AF_UNIX;
-    strlcpy(target.sun_path, MACWS_STREAM_INVALIDATE_SOCKET_PATH,
-            sizeof(target.sun_path));
-    (void)sendto(socketFD, &reason, sizeof(reason), MSG_DONTWAIT,
+static void MacWSSendDisplayInvalidation(const void *bytes, size_t size) {
+    static int socketFD = -1;
+    static struct sockaddr_un target;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (socketFD >= 0) {
+            int flags = fcntl(socketFD, F_GETFL, 0);
+            if (flags >= 0) (void)fcntl(socketFD, F_SETFL,
+                                        flags | O_NONBLOCK);
+        }
+        target.sun_family = AF_UNIX;
+        strlcpy(target.sun_path, MACWS_STREAM_INVALIDATE_SOCKET_PATH,
+                sizeof(target.sun_path));
+    });
+    if (socketFD < 0 || !bytes || size == 0) return;
+    // A datagram is one atomic invalidation edge. The descriptor remains
+    // valid across displayd restarts because sendto resolves the pathname for
+    // every message; sharing it also removes socket/open/close work from
+    // Dock's 60/120-Hz native gesture handler on its main thread.
+    (void)sendto(socketFD, bytes, size, MSG_DONTWAIT,
                  (const struct sockaddr *)&target, sizeof(target));
-    close(socketFD);
+}
+
+static void MacWSNotifyDisplayCatalogChanged(uint8_t reason) {
+    MacWSSendDisplayInvalidation(&reason, sizeof(reason));
 }
 
 static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
@@ -6953,15 +6977,7 @@ static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
         .pixelWidth = (uint32_t)pixelWidth,
         .pixelHeight = (uint32_t)pixelHeight,
     };
-    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (socketFD < 0) return;
-    struct sockaddr_un target = {0};
-    target.sun_family = AF_UNIX;
-    strlcpy(target.sun_path, MACWS_STREAM_INVALIDATE_SOCKET_PATH,
-            sizeof(target.sun_path));
-    (void)sendto(socketFD, &record, sizeof(record), MSG_DONTWAIT,
-                 (const struct sockaddr *)&target, sizeof(target));
-    close(socketFD);
+    MacWSSendDisplayInvalidation(&record, sizeof(record));
 }
 
 // Do not use NSNotificationCenter's block observer API from this injected

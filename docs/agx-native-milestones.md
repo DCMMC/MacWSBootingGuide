@@ -2375,3 +2375,26 @@ executables map to the production AGX/JIT launcher.
 Screenshots, exact routing/layer logs, validation commands, the package hash
 and the separately recorded unresolved compositor abort are in
 [`displaystream-input-multitouch-20260806/`](evidence/displaystream-input-multitouch-20260806/README.md).
+
+## 2026-08-08: native four-direction fluid gestures become cold-start complete
+
+Target Ventura Dock disassembly and live LLDB established the complete signed
+mapping: horizontal positive/negative selects Dock handler slots 3/4 and
+vertical positive/negative selects slots 1/2. The missing down direction was a
+nil stock App Exposé handler caused by an absent Dock preference; production
+now persists and verifies both real gesture preferences before Dock starts.
+The missing horizontal transitions were independently traced to a one-Space
+SkyLight catalog. Cold startup now creates exactly one adjacent real Desktop
+when required, before Dock registers its controllers, and preserves every
+existing multi-Space topology.
+
+Input was not the residual smoothness bottleneck: Dock received 119 Changed
+records at 120 Hz and delivered 115 to its native handler. displayd now uses a
+bounded native-gesture invalidation edge to resample authoritative SkyLight
+geometry, compensates catalog work against a 60-Hz period, and Host presents
+one batched Metal update per producer interval. A production App Exposé A/B
+increased Host texture imports `2864 -> 3261` over 3.051 seconds; the accepted
+cold run moved Current Space `1 -> 2 -> 1` with both horizontal signs and no
+new crash report. Full RE attribution, rejected-run accounting, pacing
+measurements, thermal evidence and remaining limits are recorded in
+[`fullscreen-native-three-finger-gesture-20260808.md`](fullscreen-native-three-finger-gesture-20260808.md).

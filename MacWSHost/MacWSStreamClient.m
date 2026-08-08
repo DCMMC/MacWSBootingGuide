@@ -236,12 +236,14 @@
             displayLinkWithTarget:self
                          selector:@selector(deliverPendingFramesForDisplayLink:)];
         if (@available(iOS 15.0, *)) {
-            // The producer is capped at 60 fps, but a 120-Hz panel boundary
-            // keeps the batching delay below one producer interval and still
-            // coalesces the same-composite layer callbacks that arrive in one
-            // XPC burst.  A 60-Hz iPad naturally clamps this range.
-            link.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 120.0,
-                                                                 120.0);
+            // Every SkyLight producer is explicitly capped at 60 Hz.  Drain
+            // once per producer interval so the independent window/menu/Dock
+            // callbacks belonging to one workspace composite land in the
+            // same Metal presentation.  A 120-Hz drain can split that set at
+            // an arbitrary 8.3-ms boundary and doubles main-thread imports
+            // without creating an additional macOS frame.
+            link.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 60.0,
+                                                                 60.0);
         } else {
             link.preferredFramesPerSecond = 60;
         }

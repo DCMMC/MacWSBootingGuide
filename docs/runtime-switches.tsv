@@ -227,6 +227,9 @@ state	/tmp/macws_vnc_activation_reply.sock	transient	VNC input	Bound OSXvnc ackn
 state	/tmp/macws_vnc_damage.sock	transient	VNC transport	Damage notification datagram socket.
 state	/tmp/macws_vnc_fb	transient	VNC transport	Retina mmap pixel transport and publication sequence.
 preference	MacWSLegacyFramebufferFallback	off	MacWSHost compatibility	Explicitly permits the historical full-display mmap upload when DisplayStream is unavailable; production Host defaults to IOSurface-only. Enable only for an A/B with `defaults write com.macwsguide.host MacWSLegacyFramebufferFallback -bool YES` and relaunch Host.
+preference	com.apple.dock:showMissionControlGestureEnabled	on	Dock native gestures	Persisted and read back before Dock starts; owns the real vertical-negative Mission Control fluid controller.
+preference	com.apple.dock:showAppExposeGestureEnabled	on	Dock native gestures	Persisted and read back before Dock starts; owns the real vertical-positive App Expose fluid controller.
+state	SkyLight managed desktop count	auto	Dock native gestures	Cold one-Space sessions receive exactly one real adjacent Desktop before Dock starts; existing two-or-more-Space topology is preserved, enabling native horizontal fluid gestures without a Dock reload.
 state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
 state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.
 socket	/private/tmp/macws_app_input.%d.sock	transient	GUI client	Per-process AppInputBridge endpoint.

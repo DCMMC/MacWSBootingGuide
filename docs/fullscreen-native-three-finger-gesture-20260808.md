@@ -225,3 +225,93 @@ cancel restoration through the production AGX/VNC path. A physical-touch
 witness still requires closing and reopening the already-running Host app so
 its UIKit process loads the newly installed executable; a pre-install process
 cannot acquire new code in place.
+
+## 2026-08-08 four-direction completion and presentation pacing
+
+The remaining direction failures were two independent stock-macOS
+preconditions, not missing Host gesture recognizers.
+
+Target Dock `-[DOCKGestures _handlerForEvent:]` was disassembled through both
+branches. Horizontal positive/negative progress selects handler slots 3/4;
+vertical positive/negative selects slots 1/2. Runtime LLDB and event readback
+confirmed that the bridge delivered those exact signs. A cold preferences
+database, however, did not contain Dock's real
+`showAppExposeGestureEnabled` preference, so the slot-1 handler was nil.
+Production startup now writes and reads back both
+`showMissionControlGestureEnabled` and `showAppExposeGestureEnabled` before
+Dock launches. Startup fails instead of silently exposing a half-configured
+gesture controller if either value cannot be persisted.
+
+The initial managed-space catalog contained exactly one real Space. That makes
+both horizontal edge gestures stock Dock no-ops. The new read-only
+`macwsworkspacectl list-spaces` command uses the target-exported
+`SLS/CGSMainConnectionID` and `SLS/CGSCopyManagedDisplaySpaces` APIs to make
+this topology visible. `CGSSpaceCreate` was RE-confirmed from Ventura call
+sites as `(connection, type, options) -> uint64_t`, then runtime-confirmed on
+the device: a created Space appeared in the same authoritative catalog and a
+positive two-second gesture changed Current Space `1 -> 2`; the negative
+gesture changed it back `2 -> 1`, with the same WindowServer and Dock PIDs.
+
+Production now invokes the idempotent
+`ensure-navigation-spaces` command after WindowServer is ready but before
+Dock starts. A one-Space cold session gets exactly one adjacent native Desktop;
+an existing two-or-more-Space user topology is preserved. The validated cold
+start printed:
+
+```text
+Native macOS desktop navigation topology ready: navigation-spaces ready before=1 after=2 created=2
+```
+
+This ordering matters. A diagnostic that created a Space and then unloaded a
+live Dock caused WindowServer to restart while displayd was retiring Dock's
+full-Retina streams. That run was rejected as evidence and the full GUI stack
+was stopped. Production never reloads Dock for this feature.
+
+### Why the animation had looked much slower than the input
+
+AppInput diagnostics on Dock PID 99804 received 119 Changed records at 120 Hz,
+delivered 115 to the real `DOCKGestures.handleEvent:`, and coalesced only 4.
+This runtime result rules out the HID broker and Dock main-queue coalescer as
+the remaining frame-rate bottleneck.
+
+Dock's fluid controllers update SkyLight compositor geometry without passing
+through the AppKit NSWindow sidecar. displayd previously discovered those
+positions only through its one-second recovery catalog scan. The native
+handler now sends one lightweight `a` invalidation after it consumes a sample;
+displayd temporarily samples authoritative CGWindow geometry at display
+cadence and republishes each retained IOSurface at its new destination. It
+does not create an animation or choose a transition.
+
+The first implementation still waited a full 16 ms *after* each Retina
+catalog scan. Its period was therefore `scan time + 16 ms`, and a moving Dock
+desktop layer retired at only 19.85 fps. The production loop now subtracts
+the completed scan time from the 60-Hz period and runs the next pass
+immediately when a scan has already consumed the budget. This high-rate mode
+is bounded to 250 ms after the last native gesture sample. The Dock notifier
+also reuses one nonblocking Unix datagram socket instead of creating and
+closing a socket on every main-thread sample.
+
+The installed production A/B showed:
+
+- before animation sampling, a two-second Space transition caused only 46
+  Host texture imports over 5.066 seconds;
+- the first event-driven version caused 476 imports over 5.123 seconds
+  (10.3 times the aggregate presentation work);
+- after period compensation, a 1.5-second App Exposé gesture increased Host
+  imports `2864 -> 3261` over 3.051 seconds and its primary Dock layer reached
+  sequence 98 while still updating;
+- the cold-start two-Space build completed horizontal Current Space `1 -> 2`
+  and `2 -> 1`, and vertical positive/negative gestures entered and left the
+  native Dock views;
+- no new crash report appeared during the accepted four-direction run. The
+  final device sample was thermal `nominal`, 34.09 °C. The mandatory watchdog
+  remains 300-second, Critical-only, with its memory guard disabled.
+
+The final rootless production package is
+`com.kdt.macosbooter_0.3.4_iphoneos-arm64.deb`, SHA-256
+`c2f09a57e4b1d7c9db14413de1aa20cf9b31baa65d981c58eb817e764a4f60d5`.
+
+This closes the four-direction functional gap and removes the artificial
+post-scan delay. It is not a claim that every complex Mission Control scene is
+now identical to a MacBook at 60 fps: CGWindow catalog work and the number of
+simultaneous Retina layers remain measurable costs.

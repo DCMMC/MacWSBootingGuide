@@ -66,6 +66,15 @@ static uint64_t TransientReconcileGeneration;
 // while the ordinary recovery poll retains its more conservative three-miss
 // policy for uncorrelated catalog churn.
 static unsigned UrgentTransientRetirePasses;
+// Dock's native Mission Control/App Expose/Spaces animations move existing
+// SkyLight windows without sending the AppKit geometry sidecar datagrams used
+// by ordinary window moves.  A one-second idle recovery scan therefore turns
+// a continuous native gesture into a handful of Host compositor positions.
+// Dock emits the lightweight 'a' invalidation only after its real
+// DOCKGestures handler consumes a progress sample.  Keep the expensive desktop
+// catalog scan at display cadence only while those samples are arriving, then
+// retain a short tail so Dock's spring/settlement animation is captured too.
+static CFTimeInterval WorkspaceAnimationSamplingDeadline;
 static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
@@ -573,6 +582,8 @@ static void StartInvalidationListener(void) {
         uint8_t bytes[128];
         BOOL geometryChanged = NO;
         BOOL semanticPointerClickCompleted = NO;
+        BOOL workspaceAnimationAdvanced = NO;
+        BOOL catalogChanged = NO;
         ssize_t count = 0;
         while ((count = recv(InvalidationSocket, bytes,
                              sizeof(bytes), 0)) > 0) {
@@ -588,8 +599,14 @@ static void StartInvalidationListener(void) {
                             objCType:@encode(MacWSGeometryInvalidation)];
                 }
                 geometryChanged = YES;
+                catalogChanged = YES;
             } else {
                 for (ssize_t index = 0; index < count; index++) {
+                    if (bytes[index] == 'a') {
+                        workspaceAnimationAdvanced = YES;
+                        continue;
+                    }
+                    catalogChanged = YES;
                     if (bytes[index] == 'g') geometryChanged = YES;
                     if (bytes[index] == 't')
                         semanticPointerClickCompleted = YES;
@@ -598,7 +615,18 @@ static void StartInvalidationListener(void) {
         }
         if (semanticPointerClickCompleted)
             UrgentTransientRetirePasses = 10;
-        ScheduleCatalogBroadcast();
+        if (workspaceAnimationAdvanced) {
+            CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+            BOOL wasSampling = now < WorkspaceAnimationSamplingDeadline;
+            WorkspaceAnimationSamplingDeadline =
+                now + 0.25;
+            // This path only needs compositor geometry. Avoid broadcasting a
+            // complete application-window list for every gesture sample. The
+            // active 16-ms loop is also authoritative: do not let 120-Hz
+            // input repeatedly preempt it with twice as many immediate scans.
+            if (!wasSampling) ScheduleTransientReconcile(0);
+        }
+        if (catalogChanged) ScheduleCatalogBroadcast();
         if (geometryChanged) ScheduleGeometryStreamRestart();
     });
     dispatch_source_set_cancel_handler(InvalidationSource, ^{
@@ -982,8 +1010,26 @@ static void RetireTransientLayer(MacWSDisplayClient *client,
     layer.client = nil;
     if (![RetiredTransientLayers containsObject:layer])
         [RetiredTransientLayers addObject:layer];
-    DisplayLog(@"layer-retire-begin layer=%u reason=%@ grace-ms=5000",
-               layer.windowID, reason ?: @"catalog-removed");
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t timebaseOnce;
+    dispatch_once(&timebaseOnce, ^{ (void)mach_timebase_info(&timebase); });
+    double elapsed = 0.0;
+    if (timebase.denom && layer.firstDisplayTime &&
+        layer.latestDisplayTime >= layer.firstDisplayTime) {
+        elapsed = (double)(layer.latestDisplayTime - layer.firstDisplayTime) *
+            timebase.numer / timebase.denom / 1.0e9;
+    }
+    NSUInteger outstanding = OutstandingFramesForLayer(client,
+                                                         layer.windowID);
+    DisplayLog(@"layer-retire-begin layer=%u reason=%@ grace-ms=5000 "
+               "frames=%llu elapsed=%.3f fps=%.2f outstanding=%lu "
+               "dropped=%llu",
+               layer.windowID, reason ?: @"catalog-removed",
+               (unsigned long long)layer.sequence, elapsed,
+               elapsed > 0.0 && layer.sequence > 1
+                   ? (layer.sequence - 1) / elapsed : 0.0,
+               (unsigned long)outstanding,
+               (unsigned long long)layer.droppedFrames);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    DisplayQueue, ^{
         if (!layer.retiring ||
@@ -1357,6 +1403,7 @@ static void StartSubscription(MacWSDisplayClient *client,
 // Host composites the layers with Metal; no RFB, CPU copy, or stream-mode
 // restart is involved.
 static void ReconcileTransientStreams(void) {
+    CFTimeInterval reconcileStarted = CFAbsoluteTimeGetCurrent();
     TransientReconcilePending = NO;
     BOOL urgentRetireConfirmation = UrgentTransientRetirePasses > 0;
     if (UrgentTransientRetirePasses > 0) UrgentTransientRetirePasses--;
@@ -1659,19 +1706,43 @@ static void ReconcileTransientStreams(void) {
         }
         if (client.transientLayers.count) needsFollowup = YES;
     }
-    if (needsFollowup || workspaceNeedsFollowup)
+    CFTimeInterval reconcileFinished = CFAbsoluteTimeGetCurrent();
+    BOOL workspaceAnimationSampling =
+        reconcileFinished < WorkspaceAnimationSamplingDeadline;
+    if (needsFollowup || workspaceNeedsFollowup ||
+        workspaceAnimationSampling) {
         // Native AppKit geometry/catalog datagrams now preempt this timer at
         // 16ms. The periodic pass is only a recovery net for non-AppKit system
         // producers, so an idle fullscreen desktop no longer scans four times
         // per second.
-        ScheduleTransientReconcile(((workspaceMissingLayerNeedsConfirmation ||
-                                      windowMissingLayerNeedsConfirmation)
-                                        ? 16
-                                        : (urgentPopupPresent &&
-                                           UrgentTransientRetirePasses > 0)
-                                            ? 50
-                                            : (workspaceNeedsFollowup ? 1000 : 250)) *
-                                   NSEC_PER_MSEC);
+        uint64_t delayNanoseconds = 0;
+        if (workspaceAnimationSampling) {
+            // This one-shot timer is armed after the catalog work above has
+            // completed. Waiting another full 16 ms here makes the real
+            // period scan-cost + 16 ms (about 45-50 ms on the target's
+            // full-Retina desktop). Compensate for work already spent so the
+            // authoritative geometry samples begin on a 60-Hz cadence. If a
+            // pass itself exceeds the budget, run the next pass immediately;
+            // the gesture deadline still bounds this high-rate mode.
+            const CFTimeInterval framePeriod = 1.0 / 60.0;
+            CFTimeInterval remaining = framePeriod -
+                (reconcileFinished - reconcileStarted);
+            if (remaining > 0.0)
+                delayNanoseconds = (uint64_t)llround(
+                    remaining * (double)NSEC_PER_SEC);
+        } else {
+            delayNanoseconds =
+                ((workspaceMissingLayerNeedsConfirmation ||
+                  windowMissingLayerNeedsConfirmation)
+                    ? 16
+                    : (urgentPopupPresent &&
+                       UrgentTransientRetirePasses > 0)
+                        ? 50
+                        : (workspaceNeedsFollowup ? 1000 : 250)) *
+                NSEC_PER_MSEC;
+        }
+        ScheduleTransientReconcile(delayNanoseconds);
+    }
 }
 
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds) {
