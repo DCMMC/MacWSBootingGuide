@@ -670,6 +670,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)startScrollMomentumWithVelocity:(CGPoint)velocity
                              framePoint:(CGPoint)framePoint;
 - (void)stopScrollMomentumWithTerminalPhase:(BOOL)terminalPhase;
+- (void)cancelActiveThreeFingerSystemGestureAtTimestamp:
+    (NSTimeInterval)timestamp;
 - (uint32_t)currentFrameWidth;
 - (uint32_t)currentFrameHeight;
 - (NSArray<NSNumber *> *)overlayKeysBackToFront;
@@ -758,6 +760,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSSystemGestureAxis _threeFingerSystemGestureAxis;
     CGFloat _threeFingerSystemGestureReferenceDistance;
     uint32_t _threeFingerSystemGestureContactID;
+    int32_t _threeFingerSystemGestureTargetPID;
+    uint32_t _threeFingerSystemGestureFrameWidth;
+    uint32_t _threeFingerSystemGestureFrameHeight;
+    CGFloat _threeFingerSystemGestureLastProgress;
+    CGFloat _threeFingerSystemGestureLastVelocity;
     CADisplayLink *_scrollMomentumDisplayLink;
     CGPoint _scrollMomentumVelocity;
     CGPoint _scrollMomentumFramePoint;
@@ -1062,6 +1069,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
+    // A UIKit scene/mode transition can cancel its recognizers after the
+    // DisplayStream subscription has already changed.  Close the native Dock
+    // phase stream while its latched endpoint is still valid; clearing these
+    // fields without a Cancel strands Dock's fluid controller in a gesture
+    // that no later touch owns.
+    [self cancelActiveThreeFingerSystemGestureAtTimestamp:
+        CACurrentMediaTime()];
     _windowConfigurationSettlementSerial++;
     _windowConfigurationAwaitingAcknowledgement = NO;
     _lastRequestedWindowSize = CGSizeZero;
@@ -1074,6 +1088,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _threeFingerSystemGestureAxis = 0;
     _threeFingerSystemGestureReferenceDistance = 0.0;
     _threeFingerSystemGestureContactID = 0;
+    _threeFingerSystemGestureTargetPID = 0;
+    _threeFingerSystemGestureFrameWidth = 0;
+    _threeFingerSystemGestureFrameHeight = 0;
+    _threeFingerSystemGestureLastProgress = 0.0;
+    _threeFingerSystemGestureLastVelocity = 0.0;
     _fullscreenLastTapRouteTimestamp = 0.0;
     _fullscreenLastTapRoutePID = 0;
     _fullscreenLastTapRouteWindowID = 0;
@@ -1099,6 +1118,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)suspendStream {
+    [self cancelActiveThreeFingerSystemGestureAtTimestamp:
+        CACurrentMediaTime()];
     _framePollDisplayLink.paused = YES;
     [_streamClient unsubscribe];
     NSMutableArray<MacWSSurfaceFrame *> *leases =
@@ -3513,14 +3534,26 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                       velocity:(CGFloat)velocity
                          flags:(uint16_t)flags
                      timestamp:(NSTimeInterval)timestamp {
-    if (!self.isMacWSInputEnabled ||
-        _streamClient.mode != MacWSStreamModeFullscreen ||
+    BOOL terminalPhase = (flags & (MacWSInputFlagGestureEnded |
+        MacWSInputFlagGestureCancelled)) != 0;
+    // Once Begin reached Dock, its terminal record is mandatory even if a
+    // Scene transition has already disabled new pointer input. The endpoint
+    // and geometry below are latched precisely so this close can outlive the
+    // current DisplayStream/UI input-ready state.
+    if ((!self.isMacWSInputEnabled && !terminalPhase) ||
+        !_threeFingerSystemGestureActive ||
         (axis != MacWSSystemGestureAxisHorizontal &&
          axis != MacWSSystemGestureAxisVertical) ||
         !isfinite(progress) || !isfinite(velocity)) return;
-    int32_t dockPID = [self dockSystemGestureTargetPID];
-    uint32_t width = [self currentFrameWidth];
-    uint32_t height = [self currentFrameHeight];
+    // A hardware gesture has one device/endpoint for its complete phase
+    // lifetime.  Mission Control can temporarily remove or reorder Dock's
+    // captured layers, and a UIKit scene transition can unsubscribe the
+    // fullscreen stream before delivering its recognizer cancellation.  Use
+    // the Begin-time identity rather than re-resolving a moving capture graph
+    // for every Changed/End record.
+    int32_t dockPID = _threeFingerSystemGestureTargetPID;
+    uint32_t width = _threeFingerSystemGestureFrameWidth;
+    uint32_t height = _threeFingerSystemGestureFrameHeight;
     if (width == 0 || height == 0 || dockPID <= 1) return;
     MacWSInputRecord record = {
         .magic = MACWS_INPUT_MAGIC,
@@ -3544,16 +3577,47 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [self.statusDelegate metalView:self emittedInput:record];
 }
 
+- (void)resetActiveThreeFingerSystemGesture {
+    _threeFingerSystemGestureActive = NO;
+    _threeFingerSystemGestureAxis = 0;
+    _threeFingerSystemGestureReferenceDistance = 0.0;
+    _threeFingerSystemGestureContactID = 0;
+    _threeFingerSystemGestureTargetPID = 0;
+    _threeFingerSystemGestureFrameWidth = 0;
+    _threeFingerSystemGestureFrameHeight = 0;
+    _threeFingerSystemGestureLastProgress = 0.0;
+    _threeFingerSystemGestureLastVelocity = 0.0;
+}
+
+- (void)cancelActiveThreeFingerSystemGestureAtTimestamp:
+        (NSTimeInterval)timestamp {
+    if (!_threeFingerSystemGestureActive) return;
+    [self emitSystemGestureAxis:_threeFingerSystemGestureAxis
+                       progress:_threeFingerSystemGestureLastProgress
+                       velocity:_threeFingerSystemGestureLastVelocity
+                          flags:MacWSInputFlagGestureCancelled
+                      timestamp:timestamp > 0.0 ? timestamp :
+                          CACurrentMediaTime()];
+    [self resetActiveThreeFingerSystemGesture];
+}
+
 - (void)threeFingerPanned:(UIPanGestureRecognizer *)recognizer {
-    if (_streamClient.mode != MacWSStreamModeFullscreen) return;
     if (recognizer.state == UIGestureRecognizerStateBegan) {
-        _threeFingerSystemGestureActive = NO;
-        _threeFingerSystemGestureAxis = 0;
-        _threeFingerSystemGestureReferenceDistance = 0.0;
-        _threeFingerSystemGestureContactID = 0;
+        [self cancelActiveThreeFingerSystemGestureAtTimestamp:
+            CACurrentMediaTime()];
         [self stopScrollMomentumWithTerminalPhase:YES];
         return;
     }
+    BOOL terminalState =
+        recognizer.state == UIGestureRecognizerStateEnded ||
+        recognizer.state == UIGestureRecognizerStateCancelled ||
+        recognizer.state == UIGestureRecognizerStateFailed;
+    // UIKit is allowed to report cancellation after the Scene has suspended
+    // or changed stream mode.  A live latched gesture must still close; only
+    // an attempt to begin a new gesture requires a current fullscreen stream.
+    if (_streamClient.mode != MacWSStreamModeFullscreen &&
+        !_threeFingerSystemGestureActive) return;
+    if (terminalState && !_threeFingerSystemGestureActive) return;
     CGPoint translation = [recognizer translationInView:self];
     CGPoint velocity = [recognizer velocityInView:self];
     NSTimeInterval timestamp = CACurrentMediaTime();
@@ -3569,6 +3633,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             MacWSSystemGestureReferenceDistance(minimumDimension);
         _threeFingerSystemGestureContactID =
             0x33464700u | ((++_directTouchSerial) & 0xffu); // "3FG"
+        _threeFingerSystemGestureTargetPID =
+            [self dockSystemGestureTargetPID];
+        _threeFingerSystemGestureFrameWidth = [self currentFrameWidth];
+        _threeFingerSystemGestureFrameHeight = [self currentFrameHeight];
+        if (_threeFingerSystemGestureTargetPID <= 1 ||
+            _threeFingerSystemGestureFrameWidth == 0 ||
+            _threeFingerSystemGestureFrameHeight == 0) {
+            [self resetActiveThreeFingerSystemGesture];
+            return;
+        }
         _threeFingerSystemGestureActive = YES;
         CGFloat initialDisplacement = _threeFingerSystemGestureAxis ==
             MacWSSystemGestureAxisHorizontal ? translation.x : translation.y;
@@ -3601,6 +3675,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGFloat progressVelocity = MacWSSystemGestureProgressForDisplacement(
         _threeFingerSystemGestureAxis, pointVelocity,
         _threeFingerSystemGestureReferenceDistance);
+    _threeFingerSystemGestureLastProgress = progress;
+    _threeFingerSystemGestureLastVelocity = progressVelocity;
     uint16_t phase = 0;
     switch (recognizer.state) {
         case UIGestureRecognizerStateChanged:
@@ -3621,10 +3697,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                           flags:phase timestamp:timestamp];
     if (phase & (MacWSInputFlagGestureEnded |
                  MacWSInputFlagGestureCancelled)) {
-        _threeFingerSystemGestureActive = NO;
-        _threeFingerSystemGestureAxis = 0;
-        _threeFingerSystemGestureReferenceDistance = 0.0;
-        _threeFingerSystemGestureContactID = 0;
+        [self resetActiveThreeFingerSystemGesture];
     }
 }
 

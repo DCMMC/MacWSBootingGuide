@@ -30,6 +30,8 @@
 #define MACWS_STREAM_KEY_MODE "mode"
 #define MACWS_STREAM_KEY_WINDOW_ID "window_id"
 #define MACWS_STREAM_KEY_LAYER_WINDOW_ID "layer_window_id"
+#define MACWS_STREAM_KEY_STREAM_ID "stream_id"
+#define MACWS_STREAM_KEY_SEQUENCE "sequence"
 #define MACWS_STREAM_KEY_DESCRIPTOR "descriptor"
 #define MACWS_STREAM_KEY_WINDOWS "windows"
 #define MACWS_STREAM_KEY_SURFACE_PORT "surface_port"
@@ -158,6 +160,22 @@ typedef struct __attribute__((packed)) {
     uint32_t destinationWidth;
     uint32_t destinationHeight;
 } MacWSStreamFrameDescriptor;
+
+// A layer-removed event carries the exact producer stream and the last frame
+// sequence detached from Host. displayd may keep that CGDisplayStream alive
+// during its five-second reuse grace and explicitly republish the retained
+// IOSurface if the same SkyLight window returns. In that case a higher
+// sequence from the same stream is authoritative; an older/equal sequence is
+// a delayed pre-removal frame and must remain rejected. A zero cutoff is the
+// compatibility form from an older producer and cannot prove same-stream
+// return, so only a different stream generation may clear it.
+static inline bool MacWSStreamFrameSupersedesLayerRemoval(
+        uint64_t frameStreamID, uint64_t frameSequence,
+        uint64_t removedStreamID, uint64_t removedThroughSequence) {
+    if (removedStreamID == 0 || frameStreamID != removedStreamID) return true;
+    return removedThroughSequence != 0 &&
+           frameSequence > removedThroughSequence;
+}
 
 // Map a point in the fullscreen desktop canvas into one captured layer.  A
 // continuous gesture must use the descriptor captured at its Begin boundary:

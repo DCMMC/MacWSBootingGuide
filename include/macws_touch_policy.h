@@ -111,9 +111,15 @@ static inline MacWSSystemGestureAxis MacWSSystemGestureAxisForTranslation(
         8.0, minimumViewDimension *
             MACWS_SYSTEM_GESTURE_RECOGNITION_FRACTION);
     if (hypot(x, y) < recognitionDistance) return 0;
-    if (x > y * 1.12) return MacWSSystemGestureAxisHorizontal;
-    if (y > x * 1.12) return MacWSSystemGestureAxisVertical;
-    return 0;
+    // Once the hardware-sized slop has been crossed, a Mac trackpad commits
+    // to one navigation axis even when the fingers travelled diagonally.  A
+    // second 12% dominance gate made ordinary slightly-diagonal downward
+    // swipes remain forever unrecognised despite ample travel.  Resolve the
+    // dominant displacement deterministically; exact ties choose vertical,
+    // which is the less destructive overview operation.
+    if (x > y) return MacWSSystemGestureAxisHorizontal;
+    if (y > x) return MacWSSystemGestureAxisVertical;
+    return MacWSSystemGestureAxisVertical;
 }
 
 static inline double MacWSSystemGestureReferenceDistance(

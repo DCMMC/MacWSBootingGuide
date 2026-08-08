@@ -187,6 +187,7 @@ static IMP MacWSOriginalDockGesturesInit;
 // behind at most one scheduled main-queue drain.
 static pthread_mutex_t MacWSDockGestureLock = PTHREAD_MUTEX_INITIALIZER;
 static MacWSInputRecord MacWSDockGestureLatestChanged;
+static MacWSInputRecord MacWSDockGestureLastRecord;
 static uint64_t MacWSDockGestureSession;
 static uint64_t MacWSDockGestureLatestRevision;
 static uint64_t MacWSDockGestureDeliveredRevision;
@@ -2942,10 +2943,31 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
         (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
          MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
     if (phase == MacWSInputFlagGestureBegan) {
+        MacWSInputRecord orphanCancellation = {0};
+        BOOL haveOrphanCancellation = NO;
         pthread_mutex_lock(&MacWSDockGestureLock);
+        if (MacWSDockGestureActiveContact != 0 &&
+            MacWSDockGestureLastRecord.contactID ==
+                MacWSDockGestureActiveContact) {
+            // A new hardware Begin is an authoritative ownership boundary.
+            // If a Scene suspension or transport loss prevented the previous
+            // recognizer's terminal record from arriving, close that exact
+            // native Dock phase before starting another one.  Silently
+            // replacing ActiveContact leaves DOCKGestures._currentHandler
+            // owned by the abandoned session and makes later directions
+            // intermittently unresponsive.
+            orphanCancellation = MacWSDockGestureLastRecord;
+            orphanCancellation.flags &= ~(MacWSInputFlagGestureBegan |
+                MacWSInputFlagGestureChanged |
+                MacWSInputFlagGestureEnded |
+                MacWSInputFlagGestureCancelled);
+            orphanCancellation.flags |= MacWSInputFlagGestureCancelled;
+            haveOrphanCancellation = YES;
+        }
         uint64_t session = ++MacWSDockGestureSession;
         if (session == 0) session = ++MacWSDockGestureSession;
         MacWSDockGestureActiveContact = record.contactID;
+        MacWSDockGestureLastRecord = record;
         MacWSDockGestureLatestRevision = 0;
         MacWSDockGestureDeliveredRevision = 0;
         MacWSDockGestureReceivedChanges = 0;
@@ -2954,6 +2976,8 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
         pthread_mutex_unlock(&MacWSDockGestureLock);
         dispatch_async(dispatch_get_main_queue(), ^{
             (void)session;
+            if (haveOrphanCancellation)
+                (void)MacWSDeliverDockSystemGesture(orphanCancellation);
             (void)MacWSDeliverDockSystemGesture(record);
         });
         return YES;
@@ -2968,6 +2992,7 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
             return NO;
         }
         MacWSDockGestureLatestChanged = record;
+        MacWSDockGestureLastRecord = record;
         MacWSDockGestureLatestRevision++;
         MacWSDockGestureReceivedChanges++;
         session = MacWSDockGestureSession;
@@ -3001,6 +3026,7 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
     }
     receivedChanges = MacWSDockGestureReceivedChanges;
     deliveredChanges = MacWSDockGestureDeliveredChanges;
+    MacWSDockGestureLastRecord = record;
     MacWSDockGestureActiveContact = 0;
     MacWSDockGestureDrainScheduled = NO;
     pthread_mutex_unlock(&MacWSDockGestureLock);

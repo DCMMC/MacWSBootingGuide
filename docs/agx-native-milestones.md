@@ -2398,3 +2398,24 @@ cold run moved Current Space `1 -> 2 -> 1` with both horizontal signs and no
 new crash report. Full RE attribution, rejected-run accounting, pacing
 measurements, thermal evidence and remaining limits are recorded in
 [`fullscreen-native-three-finger-gesture-20260808.md`](fullscreen-native-three-finger-gesture-20260808.md).
+
+## 2026-08-09: native gesture lifecycle and retained display state converge
+
+The residual horizontal freeze and vertical-return window loss were separated
+into two state machines. Host now latches one Dock endpoint for the complete
+UIKit gesture, always sends its terminal phase across scene/input-state
+changes, and the input bridge cancels an orphaned contact before accepting a
+new Begin. Dominant-axis selection no longer leaves a slightly diagonal
+down-swipe unclassified. Fullscreen display reconciliation also removes an
+unused full CGWindow scan from every gesture sample and follows Dock's real
+settlement animation within a bounded 800 ms tail.
+
+Runtime evidence then exposed an independent display protocol failure: Dock and
+SkyLight had correctly restored Terminal and VSCode, while Host showed only
+Dock. `layer_removed` now carries an exact stream/sequence cutoff. A retained
+CGDisplayStream can republish its latest real IOSurface above that cutoff while
+late pre-removal frames remain rejected. Native App Expose restored both apps,
+and three consecutive horizontal `Space 1 -> 2 -> 1` cycles preserved the same
+processes and all application layers without a crash. Evidence, protocol
+invariants and the installed package hash are recorded in
+[`fullscreen-three-finger-state-recovery-20260809.md`](fullscreen-three-finger-state-recovery-20260809.md).

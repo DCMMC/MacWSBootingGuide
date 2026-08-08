@@ -30,6 +30,11 @@ int main(void) {
     assert(MacWSInputKindSystemGesture == 21);
     assert(MacWSSystemGestureAxisHorizontal == 1);
     assert(MacWSSystemGestureAxisVertical == 2);
+    assert(!MacWSStreamFrameSupersedesLayerRemoval(7, 41, 7, 41));
+    assert(!MacWSStreamFrameSupersedesLayerRemoval(7, 40, 7, 41));
+    assert(MacWSStreamFrameSupersedesLayerRemoval(7, 42, 7, 41));
+    assert(MacWSStreamFrameSupersedesLayerRemoval(8, 1, 7, 41));
+    assert(!MacWSStreamFrameSupersedesLayerRemoval(7, 42, 7, 0));
     assert(MacWSDesktopCommandMissionControl !=
            MacWSDesktopCommandApplicationWindows);
     assert(MacWSDesktopCommandSpaceLeft == 3);
@@ -90,7 +95,12 @@ int main(void) {
     assert(MacWSSystemGestureAxisForTranslation(1.0, -12.0, 800.0) ==
            MacWSSystemGestureAxisVertical);
     assert(MacWSSystemGestureAxisForTranslation(5.0, 0.0, 800.0) == 0);
-    assert(MacWSSystemGestureAxisForTranslation(12.0, 12.0, 800.0) == 0);
+    assert(MacWSSystemGestureAxisForTranslation(12.0, 12.0, 800.0) ==
+           MacWSSystemGestureAxisVertical);
+    assert(MacWSSystemGestureAxisForTranslation(11.0, 12.0, 800.0) ==
+           MacWSSystemGestureAxisVertical);
+    assert(MacWSSystemGestureAxisForTranslation(12.0, 11.0, 800.0) ==
+           MacWSSystemGestureAxisHorizontal);
     assert(Near((float)MacWSSystemGestureReferenceDistance(834.0),
                 233.52f));
     // UIKit finger-left/finger-up are both negative, but Dock's verified

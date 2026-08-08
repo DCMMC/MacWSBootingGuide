@@ -6,6 +6,7 @@
 #import <objc/message.h>
 #import <ptrauth.h>
 #import <spawn.h>
+#import <stdlib.h>
 #import <string.h>
 #import <sys/wait.h>
 #import <sys/socket.h>
@@ -73,6 +74,8 @@ static int ShowLaunchpad(void) {
 typedef int32_t (*MainConnectionIDFn)(void);
 typedef CFArrayRef (*CopyManagedDisplaySpacesFn)(int32_t);
 typedef uint64_t (*SpaceCreateFn)(int32_t, int32_t, CFDictionaryRef);
+typedef int32_t (*ManagedDisplaySetCurrentSpaceFn)(
+    int32_t, CFStringRef, uint64_t);
 
 static NSArray *CopyManagedSpaces(int32_t *connectionOut,
                                   NSUInteger *totalSpacesOut) {
@@ -143,6 +146,87 @@ static int ListSpaces(void) {
                 error.description.UTF8String ?: "unknown error");
     }
     return totalSpaces > 0 ? 0 : 1;
+}
+
+static uint64_t ManagedSpaceID(NSDictionary *space) {
+    id value = space[@"ManagedSpaceID"] ?: space[@"id64"] ?: space[@"wsid"];
+    return [value respondsToSelector:@selector(unsignedLongLongValue)]
+        ? [value unsignedLongLongValue] : 0;
+}
+
+static int SetCurrentSpace(const char *spaceBytes) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long parsed = strtoull(spaceBytes ?: "", &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed == 0) return 64;
+
+    int32_t connection = 0;
+    NSArray *displays = CopyManagedSpaces(&connection, NULL);
+    if (!displays) return 69;
+    NSString *targetDisplay = nil;
+    for (NSDictionary *display in displays) {
+        NSArray *spaces = display[@"Spaces"] ?: display[@"spaces"];
+        if (![spaces isKindOfClass:NSArray.class]) continue;
+        for (NSDictionary *space in spaces) {
+            if (ManagedSpaceID(space) != (uint64_t)parsed) continue;
+            id identifier = display[@"Display Identifier"] ?:
+                display[@"displayIdentifier"];
+            if ([identifier isKindOfClass:NSString.class])
+                targetDisplay = identifier;
+            break;
+        }
+        if (targetDisplay) break;
+    }
+    if (!targetDisplay) {
+        fprintf(stderr,
+                "macwsworkspacectl: managed space %llu does not exist\n",
+                parsed);
+        return 66;
+    }
+
+    ManagedDisplaySetCurrentSpaceFn setCurrent =
+        (ManagedDisplaySetCurrentSpaceFn)dlsym(
+            RTLD_DEFAULT, "CGSManagedDisplaySetCurrentSpace");
+    if (!setCurrent) setCurrent = (ManagedDisplaySetCurrentSpaceFn)dlsym(
+        RTLD_DEFAULT, "SLSManagedDisplaySetCurrentSpace");
+    if (!setCurrent) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight current-space API is unavailable\n");
+        return 69;
+    }
+    // RE-confirmed in the target Ventura Dock arm64e image: call sites at
+    // __TEXT+0x1ed9ac and +0x1f090c load (main connection, bridged display
+    // identifier, uint64 space ID) into x0/x1/x2 immediately before calling
+    // CGSManagedDisplaySetCurrentSpace. This command is a bounded recovery and
+    // test primitive; production gestures still belong entirely to Dock.
+    int32_t result = setCurrent(connection,
+                                (__bridge CFStringRef)targetDisplay,
+                                (uint64_t)parsed);
+    if (result != 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: set current space %llu failed: %d\n",
+                parsed, result);
+        return 1;
+    }
+
+    BOOL observed = NO;
+    for (unsigned attempt = 0; attempt < 20 && !observed; attempt++) {
+        NSArray *updated = CopyManagedSpaces(NULL, NULL);
+        for (NSDictionary *display in updated) {
+            NSDictionary *current = display[@"Current Space"] ?:
+                display[@"currentSpace"];
+            if (ManagedSpaceID(current) == (uint64_t)parsed) {
+                observed = YES;
+                break;
+            }
+        }
+        if (!observed) usleep(50 * 1000);
+    }
+    fprintf(stdout,
+            "current-space requested=%llu display=%s observed=%s\n",
+            parsed, targetDisplay.UTF8String ?: "<unknown>",
+            observed ? "yes" : "no");
+    return observed ? 0 : 1;
 }
 
 static int EnsureNavigationSpaces(void) {
@@ -802,6 +886,9 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 && strcmp(argv[1], "list-spaces") == 0) {
             return ListSpaces();
         }
+        if (argc == 3 && strcmp(argv[1], "set-current-space") == 0) {
+            return SetCurrentSpace(argv[2]);
+        }
         if (argc == 2 &&
             strcmp(argv[1], "ensure-navigation-spaces") == 0) {
             return EnsureNavigationSpaces();
@@ -838,7 +925,8 @@ int main(int argc, const char *argv[]) {
         }
         fprintf(stderr,
                 "usage: macwsworkspacectl set-wallpaper [path] | "
-                "show-launchpad | list-spaces | ensure-navigation-spaces | "
+                "show-launchpad | list-spaces | set-current-space ID | "
+                "ensure-navigation-spaces | "
                 "register-settings-extensions | "
                 "verify-launchservices-catalog | "
                 "open-application /absolute/App.app | "

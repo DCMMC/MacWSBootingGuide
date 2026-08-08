@@ -75,6 +75,10 @@ static unsigned UrgentTransientRetirePasses;
 // catalog scan at display cadence only while those samples are arriving, then
 // retain a short tail so Dock's spring/settlement animation is captured too.
 static CFTimeInterval WorkspaceAnimationSamplingDeadline;
+// Dock owns a spring after the last input sample. Continue only while real
+// SkyLight presentation geometry is still changing, with this hard bound so a
+// noisy catalog can never turn one gesture into permanent high-rate polling.
+static CFTimeInterval WorkspaceAnimationSettlementHardDeadline;
 static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
@@ -620,6 +624,7 @@ static void StartInvalidationListener(void) {
             BOOL wasSampling = now < WorkspaceAnimationSamplingDeadline;
             WorkspaceAnimationSamplingDeadline =
                 now + 0.25;
+            WorkspaceAnimationSettlementHardDeadline = now + 0.80;
             // This path only needs compositor geometry. Avoid broadcasting a
             // complete application-window list for every gesture sample. The
             // active 16-ms loop is also authoritative: do not let 120-Hz
@@ -953,8 +958,9 @@ static IOSurfaceRef CreateWorkspaceCanvas(MacWSDisplayClient *client) {
 }
 
 static void SendLayerRemoved(MacWSDisplayClient *client,
-                             uint32_t layerWindowID) {
+                             MacWSTransientLayer *layer) {
     if (!client.connection || client.deliveryPaused) return;
+    if (!layer || layer.windowID == 0) return;
     xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT,
                               MACWS_STREAM_EVENT_LAYER_REMOVED);
@@ -963,7 +969,15 @@ static void SendLayerRemoved(MacWSDisplayClient *client,
     xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_WINDOW_ID,
                               client.windowID);
     xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_LAYER_WINDOW_ID,
-                              layerWindowID);
+                              layer.windowID);
+    // This is the exact ordered cutoff for the producer generation. A return
+    // republish increments layer.sequence in PublishFrame, allowing Host to
+    // distinguish it from an already-queued pre-removal frame without
+    // restarting the real CGDisplayStream.
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_STREAM_ID,
+                              layer.streamID);
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_SEQUENCE,
+                              layer.sequence);
     xpc_connection_send_message(client.connection, event);
 }
 
@@ -1407,13 +1421,18 @@ static void ReconcileTransientStreams(void) {
     TransientReconcilePending = NO;
     BOOL urgentRetireConfirmation = UrgentTransientRetirePasses > 0;
     if (UrgentTransientRetirePasses > 0) UrgentTransientRetirePasses--;
-    NSArray<NSDictionary *> *windowInfo = CopyOnScreenWindowInfo();
+    // Fullscreen owns an exclusive desktop capture graph and does not need
+    // the application-only catalog.  Keeping this eager performed two full
+    // CGWindow snapshots on every 60-Hz native gesture sample; load the second
+    // list only if a window-mode client actually exists.
+    NSArray<NSDictionary *> *windowInfo = nil;
     NSArray<NSDictionary *> *desktopInfo = nil;
     BOOL needsFollowup = NO;
     BOOL windowMissingLayerNeedsConfirmation = NO;
     BOOL workspaceNeedsFollowup = NO;
     BOOL workspaceMissingLayerNeedsConfirmation = NO;
     BOOL urgentPopupPresent = NO;
+    BOOL workspacePresentationChanged = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
         if (!client.subscriptionActive || client.deliveryPaused) continue;
         if (client.mode == MacWSStreamModeFullscreen) {
@@ -1477,7 +1496,8 @@ static void ReconcileTransientStreams(void) {
                     layer.windowID = candidateWindowID;
                     client.transientLayers[key] = layer;
                 }
-                if (layer.retiring) {
+                BOOL returnedFromCatalog = layer.retiring;
+                if (returnedFromCatalog) {
                     layer.retiring = NO;
                     layer.retirementGeneration++;
                     [RetiredTransientLayers removeObject:layer];
@@ -1536,6 +1556,8 @@ static void ReconcileTransientStreams(void) {
                 layer.level = newLevel;
                 layer.destinationBounds = newDestination;
                 layer.missCount = 0;
+                workspacePresentationChanged |=
+                    isNew || presentationChanged || returnedFromCatalog;
                 if (isNew ||
                            (!layer.stream &&
                             !(layer.oneShotCapture &&
@@ -1547,7 +1569,15 @@ static void ReconcileTransientStreams(void) {
                 // authoritative new compositor destination; waiting for a
                 // future capture callback made title-bar dragging update at
                 // the 250ms catalog-poll cadence.
-                if (presentationChanged && layer.latestSurface) {
+                // SendLayerRemoved detached this layer from Host as soon as
+                // the native overview/Space catalog hid it. If Dock restores
+                // the window to exactly its old z-order and bounds, an exact
+                // CGDisplayStream has no content damage to report and
+                // presentationChanged is false. Re-publish the retained real
+                // IOSurface on catalog return or the window remains invisible
+                // even though it never closed.
+                if ((presentationChanged || returnedFromCatalog) &&
+                    layer.latestSurface) {
                     PublishFrame(client, layer, mach_absolute_time(),
                                  layer.latestSurface);
                 }
@@ -1569,9 +1599,11 @@ static void ReconcileTransientStreams(void) {
                     workspaceMissingLayerNeedsConfirmation = YES;
                     continue;
                 }
-                DisplayLog(@"workspace-layer-remove layer=%u",
-                           layer.windowID);
-                SendLayerRemoved(client, layer.windowID);
+                DisplayLog(@"workspace-layer-remove layer=%u stream=%llu through=%llu",
+                           layer.windowID,
+                           (unsigned long long)layer.streamID,
+                           (unsigned long long)layer.sequence);
+                SendLayerRemoved(client, layer);
                 RetireTransientLayer(client, key, layer,
                                      @"workspace-catalog-removed");
             }
@@ -1580,6 +1612,7 @@ static void ReconcileTransientStreams(void) {
         }
         if (client.mode != MacWSStreamModeWindow || client.windowID == 0)
             continue;
+        if (!windowInfo) windowInfo = CopyOnScreenWindowInfo();
         NSDictionary *baseInfo = nil;
         for (NSDictionary *info in windowInfo) {
             if ([info[(id)kCGWindowNumber] unsignedIntValue] ==
@@ -1698,15 +1731,25 @@ static void ReconcileTransientStreams(void) {
                     windowMissingLayerNeedsConfirmation = YES;
                 continue;
             }
-            DisplayLog(@"layer-remove base=%u layer=%u",
-                       client.windowID, layer.windowID);
-            SendLayerRemoved(client, layer.windowID);
+            DisplayLog(@"layer-remove base=%u layer=%u stream=%llu through=%llu",
+                       client.windowID, layer.windowID,
+                       (unsigned long long)layer.streamID,
+                       (unsigned long long)layer.sequence);
+            SendLayerRemoved(client, layer);
             RetireTransientLayer(client, key, layer,
                                  @"window-catalog-removed");
         }
         if (client.transientLayers.count) needsFollowup = YES;
     }
     CFTimeInterval reconcileFinished = CFAbsoluteTimeGetCurrent();
+    if (workspacePresentationChanged &&
+        reconcileFinished < WorkspaceAnimationSettlementHardDeadline) {
+        CFTimeInterval settlementDeadline = fmin(
+            WorkspaceAnimationSettlementHardDeadline,
+            reconcileFinished + 0.10);
+        WorkspaceAnimationSamplingDeadline = fmax(
+            WorkspaceAnimationSamplingDeadline, settlementDeadline);
+    }
     BOOL workspaceAnimationSampling =
         reconcileFinished < WorkspaceAnimationSamplingDeadline;
     if (needsFollowup || workspaceNeedsFollowup ||

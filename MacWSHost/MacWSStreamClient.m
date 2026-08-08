@@ -65,6 +65,7 @@
 // has a new streamID and clears its own tombstone on first frame.
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *latestOverlayStreamIDs;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *retiredOverlayStreamIDs;
+@property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *retiredOverlaySequences;
 // Frame events for one WindowServer composite arrive as a short burst from
 // several independent window streams.  Delivering each burst immediately on
 // UIKit's main queue made Mission Control import textures and schedule Metal
@@ -87,6 +88,7 @@
         _pendingOverlayFrames = [NSMutableDictionary dictionary];
         _latestOverlayStreamIDs = [NSMutableDictionary dictionary];
         _retiredOverlayStreamIDs = [NSMutableDictionary dictionary];
+        _retiredOverlaySequences = [NSMutableDictionary dictionary];
         _reconnectEnabled = YES;
     }
     return self;
@@ -304,6 +306,7 @@
         [self.pendingOverlayFrames removeAllObjects];
         [self.latestOverlayStreamIDs removeAllObjects];
         [self.retiredOverlayStreamIDs removeAllObjects];
+        [self.retiredOverlaySequences removeAllObjects];
         self.frameDeliveryScheduled = NO;
     }
     if (releaseFrames) {
@@ -423,6 +426,10 @@
             event, MACWS_STREAM_KEY_WINDOW_ID);
         uint64_t layerWindowID = xpc_dictionary_get_uint64(
             event, MACWS_STREAM_KEY_LAYER_WINDOW_ID);
+        uint64_t removedStreamID = xpc_dictionary_get_uint64(
+            event, MACWS_STREAM_KEY_STREAM_ID);
+        uint64_t removedThroughSequence = xpc_dictionary_get_uint64(
+            event, MACWS_STREAM_KEY_SEQUENCE);
         if ((self.mode != MacWSStreamModeWindow &&
              self.mode != MacWSStreamModeFullscreen) ||
             baseWindowID != self.windowID || layerWindowID == 0 ||
@@ -431,8 +438,14 @@
         NSNumber *layerKey = @((uint32_t)layerWindowID);
         MacWSSurfaceFrame *pending = nil;
         @synchronized (self) {
-            NSNumber *streamID = self.latestOverlayStreamIDs[layerKey];
-            if (streamID) self.retiredOverlayStreamIDs[layerKey] = streamID;
+            NSNumber *streamID = removedStreamID != 0
+                ? @(removedStreamID)
+                : self.latestOverlayStreamIDs[layerKey];
+            if (streamID) {
+                self.retiredOverlayStreamIDs[layerKey] = streamID;
+                self.retiredOverlaySequences[layerKey] =
+                    @(removedThroughSequence);
+            }
             pending = self.pendingOverlayFrames[layerKey];
             [self.pendingOverlayFrames removeObjectForKey:layerKey];
         }
@@ -497,12 +510,21 @@
         BOOL retiredGeneration = NO;
         @synchronized (self) {
             NSNumber *retired = self.retiredOverlayStreamIDs[layerKey];
+            NSNumber *retiredThrough =
+                self.retiredOverlaySequences[layerKey];
             retiredGeneration = retired &&
-                retired.unsignedLongLongValue == descriptor.streamID;
+                !MacWSStreamFrameSupersedesLayerRemoval(
+                    descriptor.streamID, descriptor.sequence,
+                    retired.unsignedLongLongValue,
+                    retiredThrough.unsignedLongLongValue);
             if (!retiredGeneration) {
-                // A new producer generation is the authoritative proof that a
-                // removed SkyLight window ID has returned.
+                // Either a new producer generation or a sequence above
+                // displayd's explicit removal cutoff is authoritative proof
+                // that the SkyLight window has returned. The latter preserves
+                // the live stream and its retained IOSurface during Space and
+                // App Expose transitions.
                 [self.retiredOverlayStreamIDs removeObjectForKey:layerKey];
+                [self.retiredOverlaySequences removeObjectForKey:layerKey];
                 self.latestOverlayStreamIDs[layerKey] = streamID;
             }
         }
