@@ -2419,3 +2419,23 @@ and three consecutive horizontal `Space 1 -> 2 -> 1` cycles preserved the same
 processes and all application layers without a crash. Evidence, protocol
 invariants and the installed package hash are recorded in
 [`fullscreen-three-finger-state-recovery-20260809.md`](fullscreen-three-finger-state-recovery-20260809.md).
+
+## 2026-08-09: Maps sessions recover and the native desktop reaches the edges
+
+Maps' apparent long-running crash was separated from the unproven cause of any
+WindowServer replacement. Runtime logs recorded the old Maps generation's
+WindowServer event-port death; it then remained alive with zero windows and a
+large retained footprint. Maps is now an exact WindowServer-dependent client:
+the watchdog remembers whether it was open, retires only the stale generation,
+and relaunches it through the foreground Host's existing Catalyst route. A
+bounded replacement test produced a fresh Maps PID and onscreen 1024x724 window,
+which survived the follow-up gesture stress run.
+
+Production startup now installs and applies a project-owned green forest/lake
+wallpaper, and persists plus verifies the native Dock's `magnification=1` and
+maximum `largesize=128`. The Host also preserves Move/Up/Cancel at fitted-content
+and system-gesture edges by clamping only an already-started pointer transaction;
+unrelated taps outside the desktop remain rejected. Live window geometry reached
+the bottom boundary and returned to the native 24-point menubar constraint.
+Screenshots, exact logs, package hash, thermal result and validation are in
+[`maps-wallpaper-dock-edge-20260809/`](evidence/maps-wallpaper-dock-edge-20260809/README.md).

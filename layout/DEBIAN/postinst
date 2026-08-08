@@ -29,6 +29,8 @@ INTEROP_LOCATION_ENTITLEMENTS=/var/jb/usr/macOS/bin/interop-location-entitlement
 CODE_REQUIREMENT_WRITER=/var/jb/usr/macOS/bin/write_code_requirement.py
 LIPO=/var/jb/usr/bin/lipo
 ROOTFS=/var/mnt/rootfs
+WORKSPACE_WALLPAPER_SOURCE=/var/jb/usr/macOS/share/wallpapers/macws-forest-lake.png
+WORKSPACE_WALLPAPER_TARGET="$ROOTFS/usr/local/share/macws/wallpapers/macws-forest-lake.png"
 
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
@@ -399,6 +401,20 @@ if [ -d "$ROOTFS/System/Library" ]; then
         install_chroot_runtime "/var/jb/usr/macOS/bin/$bridge" \
             "$ROOTFS/usr/local/bin/$bridge" || exit 1
     done
+    # Wallpaper is package data, not executable runtime. Publish it with an
+    # atomic inode replacement so a cold rootfs never observes a partial PNG.
+    # Unlike install_chroot_runtime it deliberately needs neither signing nor
+    # trustcache registration.
+    if [ -f "$WORKSPACE_WALLPAPER_SOURCE" ]; then
+        wallpaper_directory=${WORKSPACE_WALLPAPER_TARGET%/*}
+        wallpaper_temporary="${WORKSPACE_WALLPAPER_TARGET}.package-new-$$"
+        mkdir -p "$wallpaper_directory" || exit 1
+        rm -f "$wallpaper_temporary"
+        cp -f "$WORKSPACE_WALLPAPER_SOURCE" "$wallpaper_temporary" || exit 1
+        chmod 644 "$wallpaper_temporary" || exit 1
+        chown root:wheel "$wallpaper_temporary" 2>/dev/null || true
+        mv -f "$wallpaper_temporary" "$WORKSPACE_WALLPAPER_TARGET" || exit 1
+    fi
     interop_bundle_source=/var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents
     interop_bundle_target="$ROOTFS/usr/local/libexec/MacWSInteropService.app/Contents"
     if [ -f "$interop_bundle_source/MacOS/macwsinteropd" ]; then

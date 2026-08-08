@@ -2128,12 +2128,28 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [self setNeedsDisplay];
 }
 
-- (BOOL)framePointForViewPoint:(CGPoint)viewPoint output:(CGPoint *)framePoint {
+- (BOOL)framePointForViewPoint:(CGPoint)viewPoint
+                       output:(CGPoint *)framePoint
+           clampContinuationToContent:(BOOL)clampContinuation {
     uint32_t frameWidth = [self currentFrameWidth];
     uint32_t frameHeight = [self currentFrameHeight];
-    if (frameWidth == 0 || frameHeight == 0 ||
-        CGRectIsEmpty(_contentRect) || !CGRectContainsPoint(_contentRect, viewPoint)) {
+    if (frameWidth == 0 || frameHeight == 0 || CGRectIsEmpty(_contentRect)) {
         return NO;
+    }
+    if (!CGRectContainsPoint(_contentRect, viewPoint) && !clampContinuation)
+        return NO;
+    // A pointer transaction which began on the macOS surface must always
+    // receive its Move/Up/Cancel boundary.  In a fitted Scene, UIKit can keep
+    // delivering the finger in the one-pixel letterbox or deferred top/bottom
+    // system-gesture inset.  Dropping those samples froze a title-bar drag
+    // before it reached the native macOS screen edge and could also strand the
+    // primary button down.  Clamp only continuations; an independent tap or
+    // hover outside the rendered desktop remains rejected.
+    if (clampContinuation) {
+        viewPoint.x = fmin(fmax(viewPoint.x, CGRectGetMinX(_contentRect)),
+                           CGRectGetMaxX(_contentRect));
+        viewPoint.y = fmin(fmax(viewPoint.y, CGRectGetMinY(_contentRect)),
+                           CGRectGetMaxY(_contentRect));
     }
     CGFloat nx = (viewPoint.x - CGRectGetMinX(_contentRect)) /
         _contentRect.size.width;
@@ -2146,6 +2162,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     framePoint->x = sourceX * (frameWidth - 1);
     framePoint->y = sourceY * (frameHeight - 1);
     return YES;
+}
+
+- (BOOL)framePointForViewPoint:(CGPoint)viewPoint output:(CGPoint *)framePoint {
+    return [self framePointForViewPoint:viewPoint output:framePoint
+                    clampContinuationToContent:NO];
 }
 
 - (BOOL)viewPointForFramePoint:(CGPoint)framePoint output:(CGPoint *)viewPoint {
@@ -2545,7 +2566,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (touch.type == UITouchTypePencil)
         viewPoint = [touch preciseLocationInView:self];
     CGPoint framePoint;
-    if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
+    BOOL pointerContinuation = kind == MacWSInputKindTouchMove ||
+        kind == MacWSInputKindTouchUp ||
+        kind == MacWSInputKindTouchCancel;
+    if (![self framePointForViewPoint:viewPoint output:&framePoint
+                   clampContinuationToContent:pointerContinuation]) return;
     float pressure = touch.maximumPossibleForce > 0
         ? touch.force / touch.maximumPossibleForce : 0.0f;
     MacWSInputSource source = MacWSInputSourceFinger;

@@ -199,7 +199,7 @@ LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
 SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
 SETTINGS_EXTENSIONS_RUNTIME=/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
 SETTINGS_EXTENSIONS_RUNTIME_LOG="$LOGDIR/settings-extensions-runtime.log"
-WORKSPACE_WALLPAPER='/System/Library/Desktop Pictures/Solid Colors/Blue Violet.png'
+WORKSPACE_WALLPAPER='/usr/local/share/macws/wallpapers/macws-forest-lake.png'
 VNC_DESKTOP=macOS-iPad
 
 SPRINGBOARD=/System/Library/LaunchDaemons/com.apple.SpringBoard.plist
@@ -217,6 +217,7 @@ P_PBOARD='/usr/libexec/pboard'
 P_PBS='/System/Library/CoreServices/pbs'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
+P_MAPS='/System/Applications/Maps.app/Contents/MacOS/Maps'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_DOCK='CoreServices/Dock.app/Contents/MacOS/Dock'
 P_SYSTEMUI='CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer'
@@ -389,6 +390,11 @@ require_root() {
 # pattern. This device has no pkill/pgrep, so do it with ps + kill. Patterns are
 # full chroot paths, unique to the macOS processes, so iOS processes are never hit.
 CLEANUP_TERM_PIDS=""
+RESTORE_MAPS_AFTER_WS=0
+pattern_is_running() {
+    ps aux 2>/dev/null | grep -v grep | grep -Fq "$1"
+}
+
 kill_by_pattern() {
     local pat="$1" pids pid
     pids=$(ps aux 2>/dev/null | grep -v grep | grep -F "$pat" | awk '{print $2}')
@@ -560,6 +566,14 @@ record_thermal_snapshot() {
 # launchd's replacement WS to stay alive for two samples, then reconnect them.
 stop_ws_dependents() {
     CLEANUP_TERM_PIDS=""
+    RESTORE_MAPS_AFTER_WS=0
+    # Maps was previously omitted from the dependent set. Runtime evidence
+    # showed its old process still alive with 0 windows and ~956 MiB footprint
+    # after "WindowServer event port death"; it did not publish another window
+    # in that generation. Remember that it was open, retire the stale generation
+    # below, and let the foreground Host's existing Catalyst carrier recreate
+    # exactly one fresh generation.
+    pattern_is_running "$P_MAPS" && RESTORE_MAPS_AFTER_WS=1
     launchctl unload "$VNC_PLIST"  2>/dev/null
     launchctl unload "$TERM_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
@@ -627,6 +641,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_TERMINAL"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
+    kill_by_pattern "$P_MAPS"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
     kill_by_pattern "$P_DOCK_HELPER"
@@ -728,6 +743,14 @@ recover_ws_dependents() {
     if [ "$WANT_TERMINAL" = 1 ]; then
         sleep 2
         launchctl load "$TERM_PLIST" 2>/dev/null
+    fi
+    if [ "$RESTORE_MAPS_AFTER_WS" = 1 ] &&
+       [ -x /var/jb/usr/bin/uiopen ]; then
+        # macwshost://maps is the sole production Catalyst launch route. It
+        # brings the existing Host Scene forward, then the foreground Host
+        # performs the responsible-process spawn required by UIKitSystem.
+        /var/jb/usr/bin/uiopen 'macwshost://maps' >/dev/null 2>&1 ||
+            log "watchdog: WARNING: Maps restoration request was rejected"
     fi
     if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_VNC" = 1 ] &&
        [ "$WANT_TERMINAL" = 1 ]; then
@@ -2310,6 +2333,7 @@ publish_settings_service_contracts() {
 
 verify_preferences_persistence() {
     local value="" mission_control="" app_expose=""
+    local dock_magnification="" dock_large_size=""
     rm -f "$LOGDIR/cfprefsd-probe.log"
     if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
             com.macwsguide.bootstrap PersistentPreferencesReady -bool true \
@@ -2338,8 +2362,14 @@ verify_preferences_persistence() {
             > "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
        ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
             com.apple.dock showAppExposeGestureEnabled -bool true \
+            >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
+       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+            com.apple.dock magnification -bool true \
+            >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
+       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+            com.apple.dock largesize -int 128 \
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1; then
-        log "ERROR: native Dock gesture preferences could not be persisted."
+        log "ERROR: native Dock gesture/magnification preferences could not be persisted."
         tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
         return 1
     fi
@@ -2349,12 +2379,19 @@ verify_preferences_persistence() {
     app_expose=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
         com.apple.dock showAppExposeGestureEnabled 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || app_expose=""
-    if [ "$mission_control" != 1 ] || [ "$app_expose" != 1 ]; then
-        log "ERROR: native Dock gesture preferences failed verification (Mission Control='$mission_control', App Expose='$app_expose')."
+    dock_magnification=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+        com.apple.dock magnification 2>> \
+        "$LOGDIR/dock-gesture-preferences.log") || dock_magnification=""
+    dock_large_size=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+        com.apple.dock largesize 2>> \
+        "$LOGDIR/dock-gesture-preferences.log") || dock_large_size=""
+    if [ "$mission_control" != 1 ] || [ "$app_expose" != 1 ] ||
+       [ "$dock_magnification" != 1 ] || [ "$dock_large_size" != 128 ]; then
+        log "ERROR: native Dock preferences failed verification (Mission Control='$mission_control', App Expose='$app_expose', magnification='$dock_magnification', largesize='$dock_large_size')."
         tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
         return 1
     fi
-    log "Private macOS CFPreferences database ready; native Mission Control and App Expose gestures enabled."
+    log "Private macOS CFPreferences database ready; native gestures and maximum Dock hover magnification enabled."
 }
 
 apply_workspace_wallpaper() {
