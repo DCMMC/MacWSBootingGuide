@@ -185,11 +185,15 @@ enum {
     // the second member of a double click. The first tap is still delivered
     // immediately, so ordinary single-click latency is unchanged.
     MacWSInputFlagDoubleClick = 1u << 5,
-    // The fullscreen compositor resolved a real SkyLight layer that has no
-    // process-local AppInput endpoint (Dock/system surfaces are the common
-    // cases). Coordinates remain in the complete desktop framebuffer.
-    // targetPID + encoded window name the real owner; the broker must
-    // independently confirm that exact frontmost hit before posting to it.
+    // Coordinates remain in the complete desktop framebuffer and the target
+    // is a CGS-connected system-pointer owner.  There are two forms:
+    //   * an encoded nonzero window names an exact captured Dock/system layer,
+    //     which the broker independently confirms before posting;
+    //   * encoded window zero is the fullscreen workspace's hardware-style
+    //     global pointer stream.  targetPID is Dock's live endpoint and
+    //     WindowServer performs the authoritative hit test, including native
+    //     Mission Control transforms that do not belong to any captured
+    //     application's local AppKit coordinate space.
     MacWSInputFlagGlobalSystemSurface = 1u << 6,
     // The producer has already accepted the release velocity and will follow
     // this finger ScrollEnded record with a momentum Began sequence. The AppKit
@@ -256,7 +260,9 @@ typedef struct __attribute__((packed)) {
 // exact CGWindowID and those modifiers. UIKit's modifier flags occupy bits
 // 16..21, so unused bit 31 marks this encoding, bits 32..63 retain the full
 // 32-bit macOS window number, and bits 0..30 retain modifier flags.
-// Fullscreen/RFB records keep the marker bit clear.
+// Untargeted RFB records keep the marker bit clear. A fullscreen global
+// pointer can set the marker with a zero window ID so modifiers survive while
+// WindowServer, rather than a captured NSWindow, remains the hit-test owner.
 static inline uint64_t MacWSInputSceneForWindow(uint32_t windowID,
                                                 uint32_t modifiers) {
     return MACWS_INPUT_WINDOW_SCENE_FLAG |

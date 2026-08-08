@@ -38,6 +38,10 @@ int main(void) {
     assert((MacWSInputFlagGlobalSystemSurface &
             (MacWSInputFlagDoubleClick | MacWSInputFlagScrollBegan |
              MacWSInputFlagGestureChanged)) == 0);
+    uint64_t fullscreenPointerScene =
+        MacWSInputSceneForWindow(0, 0x1234u);
+    assert(MacWSInputWindowIDForScene(fullscreenPointerScene) == 0);
+    assert(MacWSInputModifiersForScene(fullscreenPointerScene) == 0x1234u);
     assert(MacWSDecideTouchCandidate(0.10, 0.0, false) ==
            MacWSTouchCandidateDecisionWait);
     assert(MacWSDecideTouchCandidate(0.44, 3.99, true) ==

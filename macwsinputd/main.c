@@ -150,6 +150,22 @@ static const char *KindName(MacWSInputKind kind) {
     return "invalid";
 }
 
+static bool IsSystemPointerKind(MacWSInputKind kind) {
+    switch (kind) {
+        case MacWSInputKindTouchDown:
+        case MacWSInputKindTouchMove:
+        case MacWSInputKindTouchUp:
+        case MacWSInputKindTouchCancel:
+        case MacWSInputKindHover:
+        case MacWSInputKindMenuHover:
+        case MacWSInputKindTap:
+        case MacWSInputKindSecondaryTap:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool RecordIsValid(const MacWSInputRecord *record) {
     if (record->magic != MACWS_INPUT_MAGIC ||
         record->version != MACWS_INPUT_VERSION ||
@@ -1287,6 +1303,10 @@ int main(void) {
         bool exactWindowRecord = record.targetPID > 1 && exactWindowID != 0;
         bool globalSystemSurfaceRecord = exactWindowRecord &&
             (record.flags & MacWSInputFlagGlobalSystemSurface) != 0;
+        bool fullscreenGlobalPointerRecord = record.targetPID > 1 &&
+            exactWindowID == 0 &&
+            (record.flags & MacWSInputFlagGlobalSystemSurface) != 0 &&
+            IsSystemPointerKind((MacWSInputKind)record.kind);
         bool keyRecord = record.kind == MacWSInputKindKeyDown ||
                          record.kind == MacWSInputKindKeyUp;
         bool scrollRecord = record.kind == MacWSInputKindScroll;
@@ -1296,7 +1316,16 @@ int main(void) {
         bool systemGestureRecord =
             record.kind == MacWSInputKindSystemGesture;
         bool gestureRecord = scrollRecord || magnifyRecord;
-        if (globalSystemSurfaceRecord) {
+        if (fullscreenGlobalPointerRecord) {
+            // A fullscreen workspace is a hardware-style global input
+            // surface.  Its composited Mission Control/Dock transforms are
+            // authoritative only inside WindowServer and cannot be validated
+            // against one stale captured CGWindow ID. Host has already
+            // resolved Dock's live process-local endpoint; keep the complete
+            // desktop coordinates and let Dock's CGPostMouseEvent enter
+            // WindowServer's current global hit test, matching OSXvnc.
+            eventTarget.pid = record.targetPID;
+        } else if (globalSystemSurfaceRecord) {
             // Dock and other non-NSApplication surfaces need CoreGraphics'
             // per-process route, not a borrowed application's global poster.
             // Re-read WindowServer immediately before the transition so a
@@ -1495,6 +1524,7 @@ int main(void) {
         // retain the old per-PID CGEvent path only as an explicit fallback
         // when the endpoint is absent (sendto returns ENOENT/ECONNREFUSED).
         bool appBridgeAttempted = globalSystemSurfaceRecord ||
+            fullscreenGlobalPointerRecord ||
             (record.kind != MacWSInputKindActivateTarget ||
              activationRepairNeeded || systemMenuPreflightNeeded);
         bool appBridgeSent = appBridgeAttempted &&

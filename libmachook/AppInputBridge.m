@@ -179,6 +179,21 @@ static MacWSDirectTrackingContext MacWSAppInputDirectContext;
 // The witness does not replace or suppress any Dock behavior.
 static _Atomic(uintptr_t) MacWSDockGesturesInstance;
 static IMP MacWSOriginalDockGesturesInit;
+// The physical trackpad path never leaves an unbounded list of stale Changed
+// samples on Dock's main queue.  UIKit can produce at 120 Hz while a native
+// Mission Control frame is temporarily more expensive; enqueueing one block
+// per sample made Dock animate old progress long after the finger moved.
+// Preserve every semantic boundary, but keep only the newest Changed record
+// behind at most one scheduled main-queue drain.
+static pthread_mutex_t MacWSDockGestureLock = PTHREAD_MUTEX_INITIALIZER;
+static MacWSInputRecord MacWSDockGestureLatestChanged;
+static uint64_t MacWSDockGestureSession;
+static uint64_t MacWSDockGestureLatestRevision;
+static uint64_t MacWSDockGestureDeliveredRevision;
+static uint32_t MacWSDockGestureActiveContact;
+static uint32_t MacWSDockGestureReceivedChanges;
+static uint32_t MacWSDockGestureDeliveredChanges;
+static BOOL MacWSDockGestureDrainScheduled;
 // Native non-client tracking (title bar, traffic-light controls and resize
 // chrome) belongs to WindowServer, not an NSView responder.  Once a verified
 // exact-window down enters CGPostMouseEvent, keep its move/up records on that
@@ -2831,7 +2846,7 @@ static MacWSCGEventRef MacWSCreateDockSystemGestureEvent(
     return event;
 }
 
-static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
+static BOOL MacWSDeliverDockSystemGesture(MacWSInputRecord record) {
     MacWSCGEventRef event = MacWSCreateDockSystemGestureEvent(record);
     if (!event) return NO;
     id gestures = (id)atomic_load_explicit(
@@ -2848,14 +2863,9 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
         CFRelease(event);
         return NO;
     }
-    // Dock's hardware event source hands its CGEvent to DOCKGestures on the
-    // main queue. Preserve that same serialization: the socket thread only
-    // reconstructs the event and never runs Mission Control state itself.
-    CFRetain(event);
-    dispatch_async(dispatch_get_main_queue(), ^{
-        ((MacWSMsgVoidID)objc_msgSend)(gestures, handleEvent, (id)event);
-        CFRelease(event);
-    });
+    // This helper runs on Dock's main queue, matching the hardware event
+    // source.  The socket thread never runs Mission Control state itself.
+    ((MacWSMsgVoidID)objc_msgSend)(gestures, handleEvent, (id)event);
     CFRelease(event);
     if (MacWSRuntimeDiagnosticsEnabled() &&
         (record.flags & MacWSInputFlagGestureChanged) == 0) {
@@ -2866,6 +2876,141 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
             record.altitude);
         fflush(stderr);
     }
+    return YES;
+}
+
+static void MacWSDrainDockGestureChanges(uint64_t session) {
+    MacWSInputRecord record = {0};
+    BOOL haveRecord = NO;
+    pthread_mutex_lock(&MacWSDockGestureLock);
+    if (session != MacWSDockGestureSession) {
+        pthread_mutex_unlock(&MacWSDockGestureLock);
+        return;
+    }
+    if (session == MacWSDockGestureSession &&
+        MacWSDockGestureActiveContact != 0 &&
+        MacWSDockGestureLatestRevision >
+            MacWSDockGestureDeliveredRevision) {
+        record = MacWSDockGestureLatestChanged;
+        MacWSDockGestureDeliveredRevision =
+            MacWSDockGestureLatestRevision;
+        MacWSDockGestureDeliveredChanges++;
+        haveRecord = YES;
+    } else {
+        MacWSDockGestureDrainScheduled = NO;
+    }
+    pthread_mutex_unlock(&MacWSDockGestureLock);
+
+    if (haveRecord) (void)MacWSDeliverDockSystemGesture(record);
+
+    BOOL scheduleNext = NO;
+    pthread_mutex_lock(&MacWSDockGestureLock);
+    if (session == MacWSDockGestureSession &&
+        MacWSDockGestureActiveContact != 0 &&
+        MacWSDockGestureLatestRevision >
+            MacWSDockGestureDeliveredRevision) {
+        // Yield to the rest of Dock's main queue between native progress
+        // updates. The next block observes the newest producer record, not a
+        // historical sample from an ever-growing queue.
+        scheduleNext = YES;
+    } else if (session == MacWSDockGestureSession) {
+        MacWSDockGestureDrainScheduled = NO;
+    }
+    pthread_mutex_unlock(&MacWSDockGestureLock);
+    if (scheduleNext) dispatch_async(dispatch_get_main_queue(), ^{
+        MacWSDrainDockGestureChanges(session);
+    });
+}
+
+static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
+    id gestures = (id)atomic_load_explicit(
+        &MacWSDockGesturesInstance, memory_order_acquire);
+    SEL handleEvent = sel_registerName("handleEvent:");
+    if (!gestures || !((MacWSMsgBoolSEL)objc_msgSend)(
+            gestures, sel_registerName("respondsToSelector:"),
+            handleEvent)) return NO;
+
+    uint16_t phase = record.flags &
+        (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
+         MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
+    if (phase == MacWSInputFlagGestureBegan) {
+        pthread_mutex_lock(&MacWSDockGestureLock);
+        uint64_t session = ++MacWSDockGestureSession;
+        if (session == 0) session = ++MacWSDockGestureSession;
+        MacWSDockGestureActiveContact = record.contactID;
+        MacWSDockGestureLatestRevision = 0;
+        MacWSDockGestureDeliveredRevision = 0;
+        MacWSDockGestureReceivedChanges = 0;
+        MacWSDockGestureDeliveredChanges = 0;
+        MacWSDockGestureDrainScheduled = NO;
+        pthread_mutex_unlock(&MacWSDockGestureLock);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            (void)session;
+            (void)MacWSDeliverDockSystemGesture(record);
+        });
+        return YES;
+    }
+
+    if (phase == MacWSInputFlagGestureChanged) {
+        BOOL scheduleDrain = NO;
+        uint64_t session = 0;
+        pthread_mutex_lock(&MacWSDockGestureLock);
+        if (MacWSDockGestureActiveContact != record.contactID) {
+            pthread_mutex_unlock(&MacWSDockGestureLock);
+            return NO;
+        }
+        MacWSDockGestureLatestChanged = record;
+        MacWSDockGestureLatestRevision++;
+        MacWSDockGestureReceivedChanges++;
+        session = MacWSDockGestureSession;
+        if (!MacWSDockGestureDrainScheduled) {
+            MacWSDockGestureDrainScheduled = YES;
+            scheduleDrain = YES;
+        }
+        pthread_mutex_unlock(&MacWSDockGestureLock);
+        if (scheduleDrain) dispatch_async(dispatch_get_main_queue(), ^{
+            MacWSDrainDockGestureChanges(session);
+        });
+        return YES;
+    }
+
+    MacWSInputRecord finalChanged = {0};
+    BOOL haveFinalChanged = NO;
+    uint32_t receivedChanges = 0;
+    uint32_t deliveredChanges = 0;
+    pthread_mutex_lock(&MacWSDockGestureLock);
+    if (MacWSDockGestureActiveContact != record.contactID) {
+        pthread_mutex_unlock(&MacWSDockGestureLock);
+        return NO;
+    }
+    if (MacWSDockGestureLatestRevision >
+        MacWSDockGestureDeliveredRevision) {
+        finalChanged = MacWSDockGestureLatestChanged;
+        MacWSDockGestureDeliveredRevision =
+            MacWSDockGestureLatestRevision;
+        MacWSDockGestureDeliveredChanges++;
+        haveFinalChanged = YES;
+    }
+    receivedChanges = MacWSDockGestureReceivedChanges;
+    deliveredChanges = MacWSDockGestureDeliveredChanges;
+    MacWSDockGestureActiveContact = 0;
+    MacWSDockGestureDrainScheduled = NO;
+    pthread_mutex_unlock(&MacWSDockGestureLock);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (haveFinalChanged)
+            (void)MacWSDeliverDockSystemGesture(finalChanged);
+        (void)MacWSDeliverDockSystemGesture(record);
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT DOCK-GESTURE-COALESCE pid=%d "
+                "received=%u delivered=%u coalesced=%u\n",
+                getpid(), receivedChanges, deliveredChanges,
+                receivedChanges >= deliveredChanges
+                    ? receivedChanges - deliveredChanges : 0);
+            fflush(stderr);
+        }
+    });
     return YES;
 }
 

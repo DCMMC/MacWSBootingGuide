@@ -2238,6 +2238,40 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (BOOL)routeFullscreenInputRecord:(MacWSInputRecord *)record {
     if (!record || _streamClient.mode != MacWSStreamModeFullscreen)
         return NO;
+    BOOL globalPointer =
+        record->kind == MacWSInputKindTouchDown ||
+        record->kind == MacWSInputKindTouchMove ||
+        record->kind == MacWSInputKindTouchUp ||
+        record->kind == MacWSInputKindTouchCancel ||
+        record->kind == MacWSInputKindHover ||
+        record->kind == MacWSInputKindMenuHover ||
+        record->kind == MacWSInputKindTap ||
+        record->kind == MacWSInputKindSecondaryTap;
+    if (globalPointer) {
+        // A fullscreen desktop is one WindowServer input surface, just like a
+        // physical Mac display or OSXvnc.  Do not route pointer input into the
+        // AppKit process whose *captured* pixels happen to be under the
+        // finger: Mission Control applies compositor-only transforms to those
+        // windows, so their local NSWindow coordinates are no longer the
+        // visible card coordinates.  Runtime A/B on 2026-08-08 proved that
+        // the old route ignored or crashed on a Mission Control card, while
+        // the same point through OSXvnc's global CGPostMouseEvent selected the
+        // card and completed with stable WindowServer/Dock/Terminal PIDs.
+        //
+        // Dock is already the verified CGS-connected owner used for native
+        // three-finger gestures.  A zero encoded window deliberately tells
+        // its endpoint to preserve full-desktop coordinates and let
+        // WindowServer perform the authoritative, current global hit test.
+        int32_t dockPID = [self dockSystemGestureTargetPID];
+        if (dockPID > 1) {
+            uint32_t modifiers =
+                MacWSInputModifiersForScene(record->sceneID);
+            record->targetPID = dockPID;
+            record->sceneID = MacWSInputSceneForWindow(0, modifiers);
+            record->flags |= MacWSInputFlagGlobalSystemSurface;
+            return YES;
+        }
+    }
     BOOL terminal = record->kind == MacWSInputKindTouchUp ||
         record->kind == MacWSInputKindTouchCancel ||
         (record->kind == MacWSInputKindScroll &&
@@ -7850,11 +7884,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
     (void)view;
-    // A fullscreen workspace is the DisplayStream layer graph currently
-    // painted by MacWSMetalView. Route pointer/gesture records against that
-    // same graph; SkyLight's independent global routing order can disagree
-    // after captured windows are repositioned. The zero-target broker route
-    // remains only for pixels without a rendered owner layer.
+    // Fullscreen pointer records become one hardware-style global stream in
+    // routeFullscreenInputRecord:, leaving WindowServer authoritative for
+    // Dock/Mission Control transforms. Scroll and magnify still freeze the
+    // captured layer selected at Begin because those gestures belong to one
+    // application-local responder for their complete lifetime.
     if (_streamMode == MacWSStreamModeFullscreen &&
         record.kind != MacWSInputKindKeyDown &&
         record.kind != MacWSInputKindKeyUp &&

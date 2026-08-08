@@ -28,6 +28,8 @@ from host_input_matrix import (
     record,
 )
 
+GLOBAL_SYSTEM_SURFACE = 1 << 6
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -48,6 +50,10 @@ def main():
                         help="mark a scroll sequence as native momentum")
     parser.add_argument("--will-momentum", action="store_true",
                         help="mark the terminal finger phase as followed by momentum")
+    parser.add_argument(
+        "--global-system-surface", action="store_true",
+        help=("send a fullscreen hardware-style record to a CGS-connected "
+              "system endpoint; --pid must name that live endpoint"))
     parser.add_argument("--diagnostic", action="store_true",
                         help="use the bounded DIAG contact marker")
     parser.add_argument(
@@ -60,6 +66,8 @@ def main():
         parser.error("--momentum is valid only for scroll")
     if args.will_momentum and (args.gesture != "scroll" or args.momentum):
         parser.error("--will-momentum requires a non-momentum scroll")
+    if args.global_system_surface and args.pid <= 1:
+        parser.error("--global-system-surface requires a live target --pid")
 
     local = f"/tmp/macws_host_gesture.{os.getpid()}.sock"
     try:
@@ -82,6 +90,8 @@ def main():
     def send(phase, amount=0.0):
         nonlocal sequence
         sequence += 1
+        if args.global_system_surface:
+            phase |= GLOBAL_SYSTEM_SURFACE
         if args.diagnostic:
             phase |= LATENCY_DIAGNOSTIC
         if args.momentum:
