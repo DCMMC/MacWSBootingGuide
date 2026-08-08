@@ -42,6 +42,14 @@ static NSMutableDictionary<NSNumber *, id> *Leases;
 // retiring.  Keep the capture object alive for a bounded grace period instead
 // of synchronously stopping it from the catalog-removal stack.
 static NSMutableArray *RetiredTransientLayers;
+// A Mission Control transition removes several full-Retina Dock capture
+// windows in the same catalog transaction.  Their five-second reuse grace
+// therefore expires on the same DisplayQueue turn.  Stopping all of those
+// streams in one call stack recreates the AGX/WindowServer teardown burst that
+// RetireFullscreenClientStaggered already avoids.  Drain validated retirements
+// one display interval apart while preserving the existing reuse grace.
+static NSMutableArray *RetiredTransientStopBlocks;
+static BOOL RetiredTransientStopDrainPending;
 static uint64_t NextStreamID = 1;
 static uint64_t NextLeaseToken = 1;
 static int InvalidationSocket = -1;
@@ -66,6 +74,7 @@ static CGFloat AppKitMainDisplayBackingScale;
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
 static void ScheduleGeometryStreamRestart(void);
 static void ScheduleCatalogBroadcast(void);
+static void EnqueueRetiredTransientStop(dispatch_block_t stopBlock);
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void DisplayLog(NSString *format, ...) {
@@ -930,6 +939,37 @@ static void SendLayerRemoved(MacWSDisplayClient *client,
     xpc_connection_send_message(client.connection, event);
 }
 
+static void DrainOneRetiredTransientStop(void) {
+    if (RetiredTransientStopBlocks.count == 0) {
+        RetiredTransientStopDrainPending = NO;
+        return;
+    }
+    dispatch_block_t stopBlock = RetiredTransientStopBlocks.firstObject;
+    [RetiredTransientStopBlocks removeObjectAtIndex:0];
+    stopBlock();
+    if (RetiredTransientStopBlocks.count == 0) {
+        RetiredTransientStopDrainPending = NO;
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
+                   DisplayQueue, ^{
+        DrainOneRetiredTransientStop();
+    });
+}
+
+static void EnqueueRetiredTransientStop(dispatch_block_t stopBlock) {
+    if (!stopBlock) return;
+    [RetiredTransientStopBlocks addObject:[stopBlock copy]];
+    DisplayLog(@"layer-retire-stop-queued depth=%lu interval-ms=16",
+               (unsigned long)RetiredTransientStopBlocks.count);
+    if (RetiredTransientStopDrainPending) return;
+    RetiredTransientStopDrainPending = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC),
+                   DisplayQueue, ^{
+        DrainOneRetiredTransientStop();
+    });
+}
+
 static void RetireTransientLayer(MacWSDisplayClient *client,
                                  NSNumber *key,
                                  MacWSTransientLayer *layer,
@@ -950,12 +990,25 @@ static void RetireTransientLayer(MacWSDisplayClient *client,
             layer.retirementGeneration != generation) return;
         // If the same SkyLight window ID returned during the grace period,
         // reconciliation cancels this retirement and reuses the live stream.
-        if (client.transientLayers[key] != layer) return;
-        [layer stopStream];
-        [client.transientLayers removeObjectForKey:key];
-        [RetiredTransientLayers removeObject:layer];
-        DisplayLog(@"layer-retire-complete layer=%u reason=%@",
-                   layer.windowID, reason ?: @"catalog-removed");
+        if (client.transientLayers[key] != layer) {
+            [RetiredTransientLayers removeObject:layer];
+            return;
+        }
+        EnqueueRetiredTransientStop(^{
+            // The catalog may have restored this exact window in the short
+            // interval between the grace expiry and its staggered drain slot.
+            if (!layer.retiring ||
+                layer.retirementGeneration != generation ||
+                client.transientLayers[key] != layer) {
+                [RetiredTransientLayers removeObject:layer];
+                return;
+            }
+            [layer stopStream];
+            [client.transientLayers removeObjectForKey:key];
+            [RetiredTransientLayers removeObject:layer];
+            DisplayLog(@"layer-retire-complete layer=%u reason=%@",
+                       layer.windowID, reason ?: @"catalog-removed");
+        });
     });
 }
 
@@ -1840,6 +1893,7 @@ int main(void) {
         Clients = [NSMutableSet set];
         Leases = [NSMutableDictionary dictionary];
         RetiredTransientLayers = [NSMutableArray array];
+        RetiredTransientStopBlocks = [NSMutableArray array];
         GeometryTargets = [NSMutableDictionary dictionary];
         StartInvalidationListener();
         xpc_connection_t listener = xpc_connection_create_mach_service(

@@ -715,7 +715,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     uint64_t _lastPerformanceLogSequence;
     NSArray<NSNumber *> *_sortedOverlayKeys;
     NSMutableArray<MacWSSurfaceFrame *> *_retiredSurfaceFrames;
-    uint64_t _submittedSurfaceSequence;
+    uint64_t _submittedSurfaceLeaseToken;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_submittedOverlayLeaseTokens;
     BOOL _streamConnected;
     UITouch *_trackpadTouch;
     CGPoint _trackpadCursor;
@@ -813,6 +814,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _overlayFrames = [NSMutableDictionary dictionary];
     _overlayTextures = [NSMutableDictionary dictionary];
     _retiredSurfaceFrames = [NSMutableArray array];
+    _submittedOverlayLeaseTokens = [NSMutableDictionary dictionary];
     _commandQueue = [device newCommandQueue];
     _commandQueue.label = @"MacWSHost display queue";
     _contentRect = CGRectZero;
@@ -1108,6 +1110,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _surfaceTexture = nil;
     [_overlayFrames removeAllObjects];
     [_overlayTextures removeAllObjects];
+    [_submittedOverlayLeaseTokens removeAllObjects];
+    _submittedSurfaceLeaseToken = 0;
     _sortedOverlayKeys = nil;
     _sourceTexture = nil;
     _textureWidth = 0;
@@ -2004,6 +2008,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             [encoder setFragmentTexture:overlayTexture atIndex:0];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                         vertexStart:0 vertexCount:4];
+            // The lease token is the unique ownership identity across stream
+            // recreation.  A later frame can now distinguish an IOSurface
+            // actually referenced by an in-flight command buffer from one
+            // merely imported and superseded before this draw.
+            _submittedOverlayLeaseTokens[key] =
+                @(overlayFrame.descriptor.leaseToken);
         }
     }
     [encoder endEncoding];
@@ -2015,7 +2025,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSArray<MacWSSurfaceFrame *> *framesToRelease =
         _retiredSurfaceFrames.count ? [_retiredSurfaceFrames copy] : @[];
     [_retiredSurfaceFrames removeAllObjects];
-    if (submittedFrame) _submittedSurfaceSequence = submittedFrame.descriptor.sequence;
+    if (submittedFrame)
+        _submittedSurfaceLeaseToken = submittedFrame.descriptor.leaseToken;
     if (performanceFrame &&
         (performanceFrame.descriptor.sequence % 120) == 0 &&
         (_lastPerformanceLogStreamID != performanceFrame.descriptor.streamID ||
@@ -3724,16 +3735,27 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!connected && (_surfaceFrame || _overlayFrames.count)) {
         _framePollDisplayLink.paused = self.targetWindowID != 0 ||
             !MacWSLegacyFramebufferFallbackEnabled();
-        if (_surfaceFrame &&
-            _surfaceFrame.descriptor.sequence == _submittedSurfaceSequence)
-            [_retiredSurfaceFrames addObject:_surfaceFrame];
-        else if (_surfaceFrame)
-            [_streamClient releaseFrame:_surfaceFrame];
-        [_retiredSurfaceFrames addObjectsFromArray:_overlayFrames.allValues];
+        if (_surfaceFrame) {
+            if (_surfaceFrame.descriptor.leaseToken ==
+                _submittedSurfaceLeaseToken)
+                [_retiredSurfaceFrames addObject:_surfaceFrame];
+            else
+                [_streamClient releaseFrame:_surfaceFrame];
+        }
+        for (NSNumber *key in _overlayFrames) {
+            MacWSSurfaceFrame *frame = _overlayFrames[key];
+            if (frame.descriptor.leaseToken ==
+                [_submittedOverlayLeaseTokens[key] unsignedLongLongValue])
+                [_retiredSurfaceFrames addObject:frame];
+            else
+                [_streamClient releaseFrame:frame];
+        }
         _surfaceFrame = nil;
         _surfaceTexture = nil;
         [_overlayFrames removeAllObjects];
         [_overlayTextures removeAllObjects];
+        [_submittedOverlayLeaseTokens removeAllObjects];
+        _submittedSurfaceLeaseToken = 0;
         _sortedOverlayKeys = nil;
         _sourceTexture = nil;
         _textureWidth = 0;
@@ -3811,7 +3833,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         if (!previous ||
             previous.descriptor.layerLevel != frame.descriptor.layerLevel)
             _sortedOverlayKeys = nil;
-        if (previous) [_retiredSurfaceFrames addObject:previous];
+        if (previous) {
+            if (previous.descriptor.leaseToken ==
+                [_submittedOverlayLeaseTokens[key] unsignedLongLongValue])
+                [_retiredSurfaceFrames addObject:previous];
+            else
+                [client releaseFrame:previous];
+        }
         _overlayFrames[key] = frame;
         _overlayTextures[key] = texture;
         _streamConnected = YES;
@@ -3824,7 +3852,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         !MacWSStreamFrameGeometryEqual(previous.descriptor,
                                        frame.descriptor);
     if (previous) {
-        if (previous.descriptor.sequence == _submittedSurfaceSequence)
+        if (previous.descriptor.leaseToken == _submittedSurfaceLeaseToken)
             [_retiredSurfaceFrames addObject:previous];
         else
             [client releaseFrame:previous];
@@ -3873,9 +3901,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSNumber *key = @(layerWindowID);
     MacWSSurfaceFrame *frame = _overlayFrames[key];
     if (!frame) return;
-    [_retiredSurfaceFrames addObject:frame];
+    if (frame.descriptor.leaseToken ==
+        [_submittedOverlayLeaseTokens[key] unsignedLongLongValue])
+        [_retiredSurfaceFrames addObject:frame];
+    else
+        [_streamClient releaseFrame:frame];
     [_overlayFrames removeObjectForKey:key];
     [_overlayTextures removeObjectForKey:key];
+    [_submittedOverlayLeaseTokens removeObjectForKey:key];
     _sortedOverlayKeys = nil;
     MacWSLog(@"display-stream overlay-retire-ui layer=%u immediate=YES",
              layerWindowID);

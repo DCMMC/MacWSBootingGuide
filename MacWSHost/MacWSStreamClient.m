@@ -1,5 +1,7 @@
 #import "MacWSStreamClient.h"
 
+#import <QuartzCore/QuartzCore.h>
+
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -63,6 +65,12 @@
 // has a new streamID and clears its own tombstone on first frame.
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *latestOverlayStreamIDs;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *retiredOverlayStreamIDs;
+// Frame events for one WindowServer composite arrive as a short burst from
+// several independent window streams.  Delivering each burst immediately on
+// UIKit's main queue made Mission Control import textures and schedule Metal
+// presents several times inside one panel refresh.  Arm a paused display link
+// and drain only the newest frame for each layer at the next native refresh.
+@property(nonatomic) CADisplayLink *frameDeliveryDisplayLink;
 @property(nonatomic) BOOL frameDeliveryScheduled;
 @property(nonatomic) BOOL reconnectEnabled;
 @property(nonatomic) NSUInteger reconnectAttempt;
@@ -221,6 +229,66 @@
     xpc_connection_send_message(self.connection, request);
 }
 
+- (void)setFrameDeliveryDisplayLinkPausedOnMainQueue:(BOOL)paused {
+    NSAssert(NSThread.isMainThread, @"frame delivery display link is main-thread owned");
+    if (!self.frameDeliveryDisplayLink && !paused) {
+        CADisplayLink *link = [CADisplayLink
+            displayLinkWithTarget:self
+                         selector:@selector(deliverPendingFramesForDisplayLink:)];
+        if (@available(iOS 15.0, *)) {
+            // The producer is capped at 60 fps, but a 120-Hz panel boundary
+            // keeps the batching delay below one producer interval and still
+            // coalesces the same-composite layer callbacks that arrive in one
+            // XPC burst.  A 60-Hz iPad naturally clamps this range.
+            link.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 120.0,
+                                                                 120.0);
+        } else {
+            link.preferredFramesPerSecond = 60;
+        }
+        link.paused = YES;
+        [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+        self.frameDeliveryDisplayLink = link;
+    }
+    self.frameDeliveryDisplayLink.paused = paused;
+}
+
+- (void)deliverPendingFramesForDisplayLink:(CADisplayLink *)displayLink {
+    NSAssert(NSThread.isMainThread, @"frame delivery must run on UIKit main");
+    NSArray<MacWSSurfaceFrame *> *frames = nil;
+    @synchronized (self) {
+        NSMutableArray<MacWSSurfaceFrame *> *latest =
+            [NSMutableArray arrayWithCapacity:
+                self.pendingOverlayFrames.count + 1];
+        if (self.pendingBaseFrame) [latest addObject:self.pendingBaseFrame];
+        NSArray<MacWSSurfaceFrame *> *overlays =
+            [self.pendingOverlayFrames.allValues
+                sortedArrayUsingComparator:^NSComparisonResult(
+                    MacWSSurfaceFrame *left,
+                    MacWSSurfaceFrame *right) {
+                if (left.descriptor.layerLevel <
+                    right.descriptor.layerLevel) return NSOrderedAscending;
+                if (left.descriptor.layerLevel >
+                    right.descriptor.layerLevel) return NSOrderedDescending;
+                if (left.descriptor.layerWindowID <
+                    right.descriptor.layerWindowID) return NSOrderedAscending;
+                if (left.descriptor.layerWindowID >
+                    right.descriptor.layerWindowID) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+        [latest addObjectsFromArray:overlays];
+        frames = [latest copy];
+        self.pendingBaseFrame = nil;
+        [self.pendingOverlayFrames removeAllObjects];
+        self.frameDeliveryScheduled = NO;
+    }
+    // Pause before invoking the delegate.  A frame arriving during texture
+    // import observes frameDeliveryScheduled=NO and queues a later unpause;
+    // it cannot be accidentally cancelled by the end of this callback.
+    displayLink.paused = YES;
+    for (MacWSSurfaceFrame *latest in frames)
+        [self.delegate streamClient:self receivedFrame:latest];
+}
+
 - (void)clearPendingFramesOnClientQueueReleasing:(BOOL)releaseFrames {
     NSArray<MacWSSurfaceFrame *> *pending = nil;
     @synchronized (self) {
@@ -234,6 +302,7 @@
         [self.pendingOverlayFrames removeAllObjects];
         [self.latestOverlayStreamIDs removeAllObjects];
         [self.retiredOverlayStreamIDs removeAllObjects];
+        self.frameDeliveryScheduled = NO;
     }
     if (releaseFrames) {
         for (MacWSSurfaceFrame *frame in pending) {
@@ -241,6 +310,9 @@
                 frame.descriptor.leaseToken];
         }
     }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self setFrameDeliveryDisplayLinkPausedOnMainQueue:YES];
+    });
 }
 
 - (void)enqueueFrameForMainDelivery:(MacWSSurfaceFrame *)frame {
@@ -270,46 +342,19 @@
     dispatch_async(dispatch_get_main_queue(), ^{
         typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
-        NSArray<MacWSSurfaceFrame *> *frames = nil;
-        // Never synchronously enter the XPC receive queue from UIKit's main
-        // thread. Under an interactive 60-Hz stream that queue can be inside
-        // IOSurface import or lease bookkeeping, turning one busy producer
-        // callback into avoidable touch-to-present latency. A tiny object
-        // monitor protects only the pointer swap; frame parsing and Metal
-        // presentation remain outside the critical section.
-        @synchronized (strongSelf) {
-            NSMutableArray<MacWSSurfaceFrame *> *latest =
-                [NSMutableArray arrayWithCapacity:
-                    strongSelf.pendingOverlayFrames.count + 1];
-            if (strongSelf.pendingBaseFrame)
-                [latest addObject:strongSelf.pendingBaseFrame];
-            NSArray<MacWSSurfaceFrame *> *overlays =
-                [strongSelf.pendingOverlayFrames.allValues
-                    sortedArrayUsingComparator:^NSComparisonResult(
-                        MacWSSurfaceFrame *left,
-                        MacWSSurfaceFrame *right) {
-                    if (left.descriptor.layerLevel <
-                        right.descriptor.layerLevel) return NSOrderedAscending;
-                    if (left.descriptor.layerLevel >
-                        right.descriptor.layerLevel) return NSOrderedDescending;
-                    if (left.descriptor.layerWindowID <
-                        right.descriptor.layerWindowID) return NSOrderedAscending;
-                    if (left.descriptor.layerWindowID >
-                        right.descriptor.layerWindowID) return NSOrderedDescending;
-                    return NSOrderedSame;
-                }];
-            [latest addObjectsFromArray:overlays];
-            frames = [latest copy];
-            strongSelf.pendingBaseFrame = nil;
-            [strongSelf.pendingOverlayFrames removeAllObjects];
-            strongSelf.frameDeliveryScheduled = NO;
-        }
-        for (MacWSSurfaceFrame *latest in frames)
-            [strongSelf.delegate streamClient:strongSelf receivedFrame:latest];
+        [strongSelf setFrameDeliveryDisplayLinkPausedOnMainQueue:NO];
     });
 }
 
 - (void)invalidate {
+    CADisplayLink *deliveryLink = self.frameDeliveryDisplayLink;
+    self.frameDeliveryDisplayLink = nil;
+    if (deliveryLink) {
+        if (NSThread.isMainThread) [deliveryLink invalidate];
+        else dispatch_async(dispatch_get_main_queue(), ^{
+            [deliveryLink invalidate];
+        });
+    }
     xpc_connection_t connection = self.connection;
     self.connection = nil;
     self.connected = NO;
