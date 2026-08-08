@@ -3,9 +3,12 @@
 #import <Foundation/Foundation.h>
 
 #include <CommonCrypto/CommonDigest.h>
+#include <fcntl.h>
 #include <math.h>
 #include <objc/message.h>
+#include <stdatomic.h>
 #include <string.h>
+#include <unistd.h>
 #include <xpc/xpc.h>
 
 #include "macws_interop_protocol.h"
@@ -33,6 +36,37 @@ static id LocationKeepaliveDelegate;
 
 static void InteropLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
+static void PublishLocationProviderReadiness(void) {
+    static _Atomic bool published = false;
+    if (atomic_load_explicit(&published, memory_order_acquire)) return;
+    // This is an end-to-end readiness witness, not a requested-state flag. It
+    // is published only after the unmodified Ventura CLLocationManager
+    // receives a location from Ventura locationd.
+    const char *path = "/private/tmp/macws_location_provider_ready";
+    int descriptor = open(path,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                          0644);
+    if (descriptor < 0) {
+        InteropLog(@"could not publish location provider readiness: %s",
+                   strerror(errno));
+        return;
+    }
+    char payload[32];
+    int length = snprintf(payload, sizeof(payload), "%d\n", getpid());
+    ssize_t written = length > 0
+        ? write(descriptor, payload, (size_t)length) : -1;
+    int savedError = written < 0 ? errno : EIO;
+    close(descriptor);
+    if (length <= 0 || written != length) {
+        unlink(path);
+        InteropLog(@"could not complete location provider readiness: %s",
+                   strerror(savedError));
+        return;
+    }
+    atomic_store_explicit(&published, true, memory_order_release);
+    InteropLog(@"Ventura location provider readiness published");
+}
+
 @interface MacWSLocationKeepaliveDelegate : NSObject <CLLocationManagerDelegate>
 @end
 
@@ -43,6 +77,7 @@ static void InteropLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
     static dispatch_once_t once;
     CLLocation *location = locations.lastObject;
     if (!location) return;
+    PublishLocationProviderReadiness();
     dispatch_once(&once, ^{
         InteropLog(@"Ventura CLLocationManager output ready");
     });

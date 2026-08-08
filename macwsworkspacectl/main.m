@@ -271,6 +271,46 @@ static int EnsureNavigationSpaces(void) {
     return after >= 2 ? 0 : 1;
 }
 
+static int CreateNavigationSpace(void) {
+    int32_t connection = 0;
+    NSUInteger before = 0;
+    NSArray *displays = CopyManagedSpaces(&connection, &before);
+    if (!displays || before == 0) return 69;
+
+    SpaceCreateFn createSpace = (SpaceCreateFn)dlsym(
+        RTLD_DEFAULT, "CGSSpaceCreate");
+    if (!createSpace) createSpace = (SpaceCreateFn)dlsym(
+        RTLD_DEFAULT, "SLSSpaceCreate");
+    if (!createSpace) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight space-create API is unavailable\n");
+        return 69;
+    }
+
+    // This is an explicit diagnostic/repair primitive for exercising the same
+    // SkyLight mutation that Dock's Mission Control add button ultimately
+    // requests.  It never substitutes for normal gesture or pointer input.
+    uint64_t createdSpace = createSpace(connection, 0, NULL);
+    if (createdSpace == 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: SkyLight failed to create a navigation "
+                "space\n");
+        return 1;
+    }
+
+    NSUInteger after = 0;
+    for (unsigned attempt = 0; attempt < 20; attempt++) {
+        NSArray *updated = CopyManagedSpaces(NULL, &after);
+        if (updated && after >= before + 1) break;
+        usleep(50 * 1000);
+    }
+    fprintf(stdout,
+            "navigation-space created before=%lu after=%lu id=%llu\n",
+            (unsigned long)before, (unsigned long)after,
+            (unsigned long long)createdSpace);
+    return after >= before + 1 ? 0 : 1;
+}
+
 static int RegisterSettingsExtensions(BOOL registerRecords) {
     static NSString *const directoryPath =
         @"/System/Library/ExtensionKit/Extensions";
@@ -893,6 +933,9 @@ int main(int argc, const char *argv[]) {
             strcmp(argv[1], "ensure-navigation-spaces") == 0) {
             return EnsureNavigationSpaces();
         }
+        if (argc == 2 && strcmp(argv[1], "create-space") == 0) {
+            return CreateNavigationSpace();
+        }
         if (argc == 2 &&
             (strcmp(argv[1], "register-settings-extensions") == 0 ||
              strcmp(argv[1], "register-settings-extension") == 0)) {
@@ -926,7 +969,7 @@ int main(int argc, const char *argv[]) {
         fprintf(stderr,
                 "usage: macwsworkspacectl set-wallpaper [path] | "
                 "show-launchpad | list-spaces | set-current-space ID | "
-                "ensure-navigation-spaces | "
+                "ensure-navigation-spaces | create-space | "
                 "register-settings-extensions | "
                 "verify-launchservices-catalog | "
                 "open-application /absolute/App.app | "

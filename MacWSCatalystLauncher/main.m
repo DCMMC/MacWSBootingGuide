@@ -15,7 +15,13 @@ static const char *const kChrootExec =
     "/var/jb/usr/macOS/bin/launchdchrootexec";
 static const char *const kHostCarrierMarker =
     "/var/jb/var/mobile/macws-maps-host-carrier.pid";
+static const char *const kLocationProviderMarker =
+    "/var/mnt/rootfs/private/tmp/macws_location_provider_ready";
+static const char *const kLocationProviderExecutable =
+    "/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/"
+    "macwsinteropd";
 static pid_t gMapsPID = -1;
+static bool gMapsLaunchPending = false;
 
 static pid_t macws_live_host_carried_maps_pid(void) {
     int marker = open(kHostCarrierMarker, O_RDONLY | O_CLOEXEC);
@@ -32,12 +38,52 @@ static pid_t macws_live_host_carried_maps_pid(void) {
     return (pid_t)candidate;
 }
 
+static bool macws_live_location_provider_ready(void) {
+    int marker = open(kLocationProviderMarker, O_RDONLY | O_CLOEXEC);
+    if (marker < 0) return false;
+    char value[32] = {0};
+    ssize_t count = read(marker, value, sizeof(value) - 1);
+    close(marker);
+    int candidate = 0;
+    char trailing = '\0';
+    if (count <= 0 || sscanf(value, "%d%c", &candidate, &trailing) < 1 ||
+        candidate <= 1 ||
+        (trailing != '\0' && trailing != '\n')) return false;
+    if (kill((pid_t)candidate, 0) != 0 && errno != EPERM) return false;
+    char path[MACWS_PROC_PIDPATH_MAX] = {0};
+    if (proc_pidpath(candidate, path, sizeof(path)) <= 0) return false;
+    return strcmp(path, kLocationProviderExecutable) == 0;
+}
+
+static bool macws_wait_for_location_provider(void) {
+    // The normal warm path returns immediately.  On a cold GUI generation the
+    // Host remains responsive while this short-lived helper waits for the
+    // first real Ventura CLLocationManager callback.  Maps must not cache a
+    // hardware-capability result before that end-to-end witness exists.
+    for (unsigned attempt = 0; attempt < 300; attempt++) {
+        if (macws_live_location_provider_ready()) return true;
+        usleep(100 * 1000);
+    }
+    fprintf(stderr,
+            "[MacWSCatalystLauncher] location provider was not ready after "
+            "30 seconds; Maps launch deferred\n");
+    fflush(stderr);
+    return false;
+}
+
 static bool macws_configure_maps_environment(void) {
     macws_macho_arch_t arch = macws_macho_arch_for_path(kMapsHostExecutable);
     const char *insert = macws_insert_dylib_for_arch(arch);
     if (!insert) return false;
     setenv("DYLD_INSERT_LIBRARIES", insert, 1);
     setenv("HOME", "/Users/root", 1);
+    // The UIKit carrier inherits iPadOS's fixed preferences home
+    // (/var/mobile).  Leaving that value intact makes Ventura CFPreferences
+    // open a non-persistent domain even though HOME already points into the
+    // chroot.  Use Maps' real Ventura container Data directory so first-run
+    // state and location-related defaults survive every carrier generation.
+    setenv("CFFIXED_USER_HOME",
+           "/var/root/Library/Containers/com.apple.Maps/Data", 1);
     setenv("USER", "root", 1);
     setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
@@ -63,6 +109,7 @@ static bool macws_configure_maps_environment(void) {
 static int macws_exec_maps_from_existing_host(void) {
     if (geteuid() != 0) return 77;
     if (macws_live_host_carried_maps_pid() > 1) return 0;
+    if (!macws_wait_for_location_provider()) return 69;
     if (!macws_configure_maps_environment()) return 78;
     int marker = open(kHostCarrierMarker,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -190,9 +237,32 @@ static void macws_spawn_maps(void) {
 @property(nonatomic, strong) UIWindow *window;
 @end
 
+static void macws_schedule_exec_maps_attempt(unsigned attempt) {
+    if (macws_live_location_provider_ready()) {
+        gMapsLaunchPending = false;
+        macws_spawn_maps();
+        return;
+    }
+    if (attempt == 0) {
+        fprintf(stderr,
+                "[MacWSCatalystLauncher] waiting for first Ventura location "
+                "provider update before spawning Maps\n");
+        fflush(stderr);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(250 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        macws_schedule_exec_maps_attempt(attempt + 1);
+    });
+}
+
 static void macws_schedule_exec_maps(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        macws_spawn_maps();
+        if (gMapsLaunchPending ||
+            (gMapsPID > 1 && (kill(gMapsPID, 0) == 0 || errno == EPERM)))
+            return;
+        gMapsLaunchPending = true;
+        macws_schedule_exec_maps_attempt(0);
     });
 }
 

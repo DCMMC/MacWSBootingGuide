@@ -230,6 +230,8 @@ preference	MacWSLegacyFramebufferFallback	off	MacWSHost compatibility	Explicitly
 preference	com.apple.dock:showMissionControlGestureEnabled	on	Dock native gestures	Persisted and read back before Dock starts; owns the real vertical-negative Mission Control fluid controller.
 preference	com.apple.dock:showAppExposeGestureEnabled	on	Dock native gestures	Persisted and read back before Dock starts; owns the real vertical-positive App Expose fluid controller.
 state	SkyLight managed desktop count	auto	Dock native gestures	Cold one-Space sessions receive exactly one real adjacent Desktop before Dock starts; existing two-or-more-Space topology is preserved, enabling native horizontal fluid gestures without a Dock reload.
+state	/private/tmp/macws_location_provider_ready	transient	Maps location capability	Current macwsinteropd PID, published only after its unmodified Ventura CLLocationManager receives a real provider update; Maps accepts it only while that exact executable remains live, and GUI teardown removes it.
+state	/var/jb/var/mobile/macws-maps-host-carrier.pid	transient	Maps Catalyst lifecycle	Current Maps carrier PID; every WindowServer teardown removes it after terminating Maps so a new GUI generation cannot reuse a live process with a dead CGS connection.
 state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
 state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.
 socket	/private/tmp/macws_app_input.%d.sock	transient	GUI client	Per-process AppInputBridge endpoint.

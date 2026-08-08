@@ -55,6 +55,7 @@ GEOD_PLIST="$MACOS_DAEMONS/com.macwsguide.geod.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
+QUARTZCORE_COMPAT_PROVISIONER=/var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh
 THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
 LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
@@ -148,6 +149,7 @@ EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
 MTLCOMPILER_DIAGNOSTICS="$LOGDIR/macws_mtlcompiler_diagnostics"
 MTLCOMPILER_DIAGNOSTICS_NATIVE=/var/mobile/macws_mtlcompiler_diagnostics
 CATALYST_LAUNCH_TRACE="$LOGDIR/macws_catalyst_launch.trace"
+MAPS_HOST_CARRIER_MARKER="$LOGDIR/macws-maps-host-carrier.pid"
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
 EXPERIMENTAL_OWNED_SCANOUT="$ROOTFS/private/tmp/macws_owned_scanout"
 EXPERIMENTAL_PACE="$ROOTFS/private/tmp/macws_coexist_pace_us"
@@ -159,6 +161,7 @@ VNC_ACTIVITY="$ROOTFS/private/tmp/macws_vnc_activity"
 INTERACTION_WAKE="$ROOTFS/private/tmp/macws_interaction_wake.sock"
 VNC_ACTIVATION_REPLY="$ROOTFS/private/tmp/macws_vnc_activation_reply.sock"
 GRAPHICS_READY="$ROOTFS/private/tmp/macws_graphics_ready"
+LOCATION_PROVIDER_READY="$ROOTFS/private/tmp/macws_location_provider_ready"
 ARMED_CAPTURE_GENERATION=""
 CAPTURE_READY_WAIT=60
 # A cold native-AGX start may spend more than 45 seconds realizing classes and
@@ -584,6 +587,10 @@ stop_ws_dependents() {
     launchctl remove "$DISPLAY_LABEL" 2>/dev/null
     launchctl unload "$INTEROP_PLIST" 2>/dev/null
     launchctl remove "$INTEROP_LABEL" 2>/dev/null
+    # This file is an output witness from the current interopd generation, not
+    # persistent configuration. Never let a replacement process inherit an
+    # apparently-ready provider from a dead generation.
+    rm -f "$LOCATION_PROVIDER_READY"
     launchctl unload "$HISERVICES_PLIST" 2>/dev/null
     launchctl unload "$GEOD_PLIST" 2>/dev/null
     launchctl unload "$EXTENSIONKIT_PLIST" 2>/dev/null
@@ -642,6 +649,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_MAPS"
+    rm -f "$MAPS_HOST_CARRIER_MARKER"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
     kill_by_pattern "$P_DOCK_HELPER"
@@ -691,6 +699,17 @@ wait_for_replacement_ws() {
     return 1
 }
 
+ensure_navigation_spaces() {
+    rm -f "$LOGDIR/navigation-spaces.log"
+    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+            ensure-navigation-spaces > "$LOGDIR/navigation-spaces.log" 2>&1; then
+        log "ERROR: could not establish adjacent native macOS desktops."
+        tail -n 20 "$LOGDIR/navigation-spaces.log" 2>/dev/null || true
+        return 1
+    fi
+    log "Native macOS desktop navigation topology ready: $(tail -n 1 "$LOGDIR/navigation-spaces.log")"
+}
+
 recover_ws_dependents() {
     local old_pid="$1" observed_pid="$2"
     log "watchdog: reconnecting GUI clients to replacement WindowServer $observed_pid"
@@ -733,6 +752,10 @@ recover_ws_dependents() {
         launchctl load "$ICONSERVICESAGENT_PLIST" 2>/dev/null
     [ ! -f "$CSNAMEDDATAD_PLIST" ] || \
         launchctl load "$CSNAMEDDATAD_PLIST" 2>/dev/null
+    # A replacement WindowServer starts with one managed Space. Restore the
+    # same minimum native topology as a cold start before Dock registers its
+    # Mission Control and horizontal fluid-gesture controllers.
+    ensure_navigation_spaces || return 1
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         [ ! -f "$workspace_plist" ] || launchctl load "$workspace_plist" 2>/dev/null
@@ -994,6 +1017,17 @@ ensure_chroot_works() {
     local chroot_ok=0 vscode_ok=0 cfprefs_ok=0
 
     log "Checking the macOS chroot is runnable..."
+    # A restored/rootfs snapshot can regress only the data-only shader artifact
+    # while every executable trust sentinel remains valid. Hash-check the
+    # focused provisioner on every cold start; its matching path is one 1-MiB
+    # read and performs no compiler or signing work.
+    if [ ! -f "$QUARTZCORE_COMPAT_PROVISIONER" ] ||
+       ! bash "$QUARTZCORE_COMPAT_PROVISIONER" \
+            > "$LOGDIR/quartzcore-compat.log" 2>&1; then
+        log "ERROR: exact QuartzCore native-AGX compatibility library is unavailable."
+        tail -n 20 "$LOGDIR/quartzcore-compat.log" 2>/dev/null || true
+        return 1
+    fi
     chroot_works && chroot_ok=1
     vscode_bundle_trusted && vscode_ok=1
     macos_cfprefsd_trusted && cfprefs_ok=1
@@ -1993,6 +2027,7 @@ cleanup_macos() {
     launchctl remove "$DISPLAY_LABEL" 2>/dev/null
     launchctl unload "$INTEROP_PLIST" 2>/dev/null
     launchctl remove "$INTEROP_LABEL" 2>/dev/null
+    rm -f "$LOCATION_PROVIDER_READY"
 
     # VS Code is launched separately from this script, but it is still a CGS
     # client of this WindowServer.  Runtime-confirmed after the 300-second
@@ -2019,6 +2054,12 @@ cleanup_macos() {
     kill_by_pattern "$P_PBS"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
+    # Maps cannot survive a WindowServer generation change: its CGS port is
+    # permanently bound to the retired server even if the Catalyst carrier
+    # process remains live.  The old omission made the next launch falsely
+    # reuse that live PID and publish no AppKit window.
+    kill_by_pattern "$P_MAPS"
+    rm -f "$MAPS_HOST_CARRIER_MARKER"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
     kill_by_pattern "$P_DOCK_HELPER"
@@ -2642,14 +2683,7 @@ start_macos() {
     # real SkyLight topology before Dock registers its native gesture
     # controllers.  The controller verifies the managed-space catalog and is
     # idempotent: persisted/user-created desktops are never duplicated.
-    rm -f "$LOGDIR/navigation-spaces.log"
-    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-            ensure-navigation-spaces > "$LOGDIR/navigation-spaces.log" 2>&1; then
-        log "ERROR: could not establish adjacent native macOS desktops."
-        tail -n 20 "$LOGDIR/navigation-spaces.log" 2>/dev/null || true
-        return 1
-    fi
-    log "Native macOS desktop navigation topology ready: $(tail -n 1 "$LOGDIR/navigation-spaces.log")"
+    ensure_navigation_spaces || return 1
 
     log "Starting the real macOS Aqua workspace agents (Finder, Dock, SystemUIServer, ControlCenter)..."
     for workspace_log in finder-desktop dock systemuiserver controlcenter; do

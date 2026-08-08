@@ -39,6 +39,7 @@ extern OSStatus SecRequirementCreateWithString(
     CFStringRef text, SecCSFlags flags, SecRequirementRef *requirement);
 extern OSStatus SecRequirementCreateWithData(
     CFDataRef data, SecCSFlags flags, SecRequirementRef *requirement);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
 static void macws_install_fsnode_root_volume_repair(void);
 static void macws_install_lsd_session_store_isolation(void);
@@ -2674,12 +2675,52 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
 // result.
 typedef void (*MacWSMKSetCanMonitorWiFiFn)(id, SEL, BOOL);
 static MacWSMKSetCanMonitorWiFiFn g_macws_mk_set_can_monitor_wifi = NULL;
+typedef BOOL (*MacWSCLLocationServicesCapableFn)(id, SEL);
+static MacWSCLLocationServicesCapableFn
+    g_macws_cl_location_services_capable = NULL;
 
 static void macws_mk_set_can_monitor_wifi(id self, SEL command,
                                           BOOL requested) {
     (void)requested;
     MacWSMKSetCanMonitorWiFiFn original = g_macws_mk_set_can_monitor_wifi;
     if (original) original(self, command, NO);
+}
+
+static bool macws_maps_has_live_location_provider(void) {
+    const char *marker = "/private/tmp/macws_location_provider_ready";
+    int descriptor = open(marker, O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return false;
+    char payload[32] = {0};
+    ssize_t count = read(descriptor, payload, sizeof(payload) - 1);
+    close(descriptor);
+    if (count <= 0) return false;
+
+    errno = 0;
+    char *end = NULL;
+    long value = strtol(payload, &end, 10);
+    if (errno != 0 || value <= 1 || value > INT_MAX || end == payload ||
+        (*end != '\0' && *end != '\n')) return false;
+    pid_t providerPID = (pid_t)value;
+    if (kill(providerPID, 0) != 0 && errno != EPERM) return false;
+
+    char executable[PATH_MAX] = {0};
+    if (proc_pidpath(providerPID, executable, sizeof(executable)) <= 0)
+        return false;
+    return strcmp(executable,
+                  "/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/"
+                  "macwsinteropd") == 0;
+}
+
+static BOOL macws_cl_location_services_capable(id self, SEL command) {
+    MacWSCLLocationServicesCapableFn original =
+        g_macws_cl_location_services_capable;
+    BOOL nativeCapable = original ? original(self, command) : NO;
+    if (nativeCapable) return YES;
+    // Ventura locationd reports no built-in Mac location hardware on the iPad
+    // even while its ordinary CLLocationManager is receiving fixes through
+    // MacWSInteropService. Accept only that live, end-to-end provider witness;
+    // a stale file or dead/wrong executable cannot change the capability.
+    return macws_maps_has_live_location_provider() ? YES : NO;
 }
 
 static bool macws_install_maps_location_capability_adapter(void) {
@@ -2689,23 +2730,34 @@ static bool macws_install_maps_location_capability_adapter(void) {
     if (!program || strcmp(program, "Maps") != 0) return true;
 
     Class managerClass = objc_getClass("MKLocationManager");
-    SEL selector = sel_registerName("setCanMonitorWiFiStatus:");
-    Method method = managerClass
-        ? class_getClassMethod(managerClass, selector) : NULL;
-    if (!method) return false;
+    SEL wifiSelector = sel_registerName("setCanMonitorWiFiStatus:");
+    Method wifiMethod = managerClass
+        ? class_getClassMethod(managerClass, wifiSelector) : NULL;
+    Class locationClass = objc_getClass("CLLocationManager");
+    SEL capableSelector = sel_registerName("locationServicesCapable");
+    Method capableMethod = locationClass
+        ? class_getClassMethod(locationClass, capableSelector) : NULL;
+    if (!wifiMethod || !capableMethod) return false;
 
-    IMP current = method_getImplementation(method);
+    IMP current = method_getImplementation(wifiMethod);
     if (current != (IMP)macws_mk_set_can_monitor_wifi) {
         g_macws_mk_set_can_monitor_wifi =
             (MacWSMKSetCanMonitorWiFiFn)current;
-        method_setImplementation(method,
+        method_setImplementation(wifiMethod,
                                  (IMP)macws_mk_set_can_monitor_wifi);
+    }
+    current = method_getImplementation(capableMethod);
+    if (current != (IMP)macws_cl_location_services_capable) {
+        g_macws_cl_location_services_capable =
+            (MacWSCLLocationServicesCapableFn)current;
+        method_setImplementation(capableMethod,
+                                 (IMP)macws_cl_location_services_capable);
     }
     atomic_store_explicit(&installed, true, memory_order_release);
     if (macws_runtime_diagnostics_enabled()) {
         fprintf(stderr,
                 "#### MACWS MAPS location capability: CoreWLAN monitoring "
-                "disabled; Ventura CoreLocation provider remains authoritative\n");
+                "disabled; live Ventura CoreLocation provider is authoritative\n");
     }
     return true;
 }

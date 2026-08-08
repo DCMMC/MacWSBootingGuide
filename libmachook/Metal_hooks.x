@@ -10805,8 +10805,12 @@ static void macws_install_data_library_compatibility(Class agx) {
 // inplace_copy_lph. The fluid transition's blurred-overview variant also
 // specializes downsample_blur_vert_lph + downsample_8_frag_lph; the original
 // functions reached AGXMetal13_3 code=3 even after the copy pass succeeded.
+// Creating a Desktop from the expanded Spaces strip reaches one additional
+// real CoreAnimation pair: downsample_blur_vert_lph +
+// single_pass_blur_3_lph. The unadapted fragment produced the same exact
+// code=3 before WindowServer exited with OS_REASON_COREANIMATION.
 // The package generates a byte-validated secondary library from the device's
-// own Ventura default.metallib: only these nine
+// own Ventura default.metallib: only these ten
 // runtime-confirmed AIR modules receive a macabi target triple; all other
 // module bytes and every public function signature remain unchanged.
 //
@@ -10849,9 +10853,9 @@ static macws_function_specialize_async_fn
 static const char *kMacWSQCDesktopLibraryPath =
     "/usr/local/share/macws/quartzcore/"
     "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1047040;
+static const size_t kMacWSQCDesktopLibraryBytes = 1047456;
 static const uint64_t kMacWSQCDesktopLibraryHash =
-    UINT64_C(0xa767741e41e0beb5);
+    UINT64_C(0xcd2dd4b299540c07);
 static const char *kMacWSSkyLightDesktopLibraryPath =
     "/usr/local/share/macws/skylight/"
     "SkyLightShaders-desktop-effects-macabi.metallib";
@@ -10874,7 +10878,8 @@ static BOOL macws_qc_desktop_function_name(NSString *name) {
            [name isEqualToString:@"std_vert1_lph"] ||
            [name isEqualToString:@"inplace_copy_lph"] ||
            [name isEqualToString:@"downsample_blur_vert_lph"] ||
-           [name isEqualToString:@"downsample_8_frag_lph"];
+           [name isEqualToString:@"downsample_8_frag_lph"] ||
+           [name isEqualToString:@"single_pass_blur_3_lph"];
 }
 
 static BOOL macws_qc_desktop_base_function_name(NSString *name) {

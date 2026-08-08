@@ -2439,3 +2439,24 @@ unrelated taps outside the desktop remain rejected. Live window geometry reached
 the bottom boundary and returned to the native 24-point menubar constraint.
 Screenshots, exact logs, package hash, thermal result and validation are in
 [`maps-wallpaper-dock-edge-20260809/`](evidence/maps-wallpaper-dock-edge-20260809/README.md).
+
+## 2026-08-09: cold Maps capability and native Desktop creation reach their real boundaries
+
+Maps' cold-only location loss was traced to launch ordering, not to the
+already-working scalar bridge: Maps queried and cached
+`+[CLLocationManager locationServicesCapable]` before the first real Ventura
+provider callback. `macwsinteropd` now publishes a process-bound readiness
+witness only from `didUpdateLocations:`; the Maps-only adapter and Catalyst
+launcher both validate its live PID and exact executable. Teardown removes the
+witness and the old Maps carrier, while `CFFIXED_USER_HOME` points Maps at its
+real persistent Ventura container.
+
+The native Mission Control `+` crash was independently reproduced through
+Dock's real continuous gesture and global pointer route. The last pipeline was
+`Pw40aXm_Tsb3A2Xhf_Isrc`, pairing `downsample_blur_vert_lph` with
+`single_pass_blur_3_lph`; AGX returned code 3, `Target OS is incompatible`, and
+WindowServer exited with `OS_REASON_COREANIMATION`. The tenth exact QuartzCore
+module now joins the secondary macabi library. No gesture, CGS Space, compiler
+result, or pipeline validator is bypassed. The root-cause evidence and artifact
+fingerprints are recorded in
+[`maps-cold-location-and-space-create-20260809.md`](maps-cold-location-and-space-create-20260809.md).
