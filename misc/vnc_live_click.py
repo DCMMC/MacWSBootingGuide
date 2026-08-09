@@ -221,6 +221,10 @@ def main():
     parser.add_argument("--control", action="store_true",
                         help="hold Control across the pointer transition")
     parser.add_argument("--hold-seconds", type=float, default=0.05)
+    parser.add_argument(
+        "--pre-hover-seconds", type=float, default=0.0,
+        help=("move the server cursor to the click point and wait before "
+              "pressing; useful for native hover-expanded controls"))
     parser.add_argument("--click-count", type=int, choices=(1, 2), default=1,
                         help="send one click or a native two-click sequence "
                              "on the same RFB connection")
@@ -229,7 +233,8 @@ def main():
     parser.add_argument("--max-updates", type=int, default=12)
     args = parser.parse_args()
     if (args.timeout <= 0 or args.settle_seconds < 0 or
-            args.hold_seconds < 0 or args.inter_click_seconds < 0 or
+            args.hold_seconds < 0 or args.pre_hover_seconds < 0 or
+            args.inter_click_seconds < 0 or
             args.max_updates < 1):
         parser.error("timeout/max-updates must be positive and settle nonnegative")
 
@@ -255,6 +260,9 @@ def main():
         # update after each response.
         request_update(sock, width, height, True)
         time.sleep(0.1)
+        if args.pre_hover_seconds > 0:
+            sock.sendall(struct.pack(">BBHH", 5, 0, x, y))
+            time.sleep(args.pre_hover_seconds)
         if args.control:
             sock.sendall(struct.pack(">BBxxI", 4, 1, 0xFFE3))
             time.sleep(0.02)

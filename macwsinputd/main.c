@@ -1318,13 +1318,20 @@ int main(void) {
         bool gestureRecord = scrollRecord || magnifyRecord;
         if (fullscreenGlobalPointerRecord) {
             // A fullscreen workspace is a hardware-style global input
-            // surface.  Its composited Mission Control/Dock transforms are
-            // authoritative only inside WindowServer and cannot be validated
-            // against one stale captured CGWindow ID. Host has already
-            // resolved Dock's live process-local endpoint; keep the complete
-            // desktop coordinates and let Dock's CGPostMouseEvent enter
-            // WindowServer's current global hit test, matching OSXvnc.
+            // surface. Its composited Mission Control/Dock transforms are
+            // authoritative only inside WindowServer, so never trust a stale
+            // Host-captured CGWindow ID. Re-query WindowServer at the event
+            // point instead. When that live route names the same system
+            // endpoint, preserve its current window as well as its PID; Dock's
+            // Mission Control modal router needs that exact Spaces Bar window
+            // identity. If the routing API has no result, retain the existing
+            // process-level fallback used by ordinary Dock/global clicks.
             eventTarget.pid = record.targetPID;
+            MacWSWindowTarget liveTarget = WindowTargetAtPoint(point);
+            if (liveTarget.pid == record.targetPID &&
+                liveTarget.windowID > 0) {
+                eventTarget = liveTarget;
+            }
         } else if (globalSystemSurfaceRecord) {
             // Dock and other non-NSApplication surfaces need CoreGraphics'
             // per-process route, not a borrowed application's global poster.
@@ -1493,6 +1500,18 @@ int main(void) {
         // SendToAppInputBridge reject it before sendto(2).
         MacWSInputRecord routedRecord = record;
         routedRecord.targetPID = eventTarget.pid;
+        // WindowTargetAtPoint resolved both halves of the destination.  The
+        // per-process bridge reads its window identity from sceneID, so
+        // forwarding only the resolved PID silently turns a precise
+        // system-surface hit into window 0.  Runtime evidence on 2026-08-09:
+        // the broker resolved Mission Control's add-Space point as Dock
+        // 30658/window 71, while Dock received the same record as window 0.
+        // Preserve modifier bits while carrying the authoritative window.
+        if (eventTarget.windowID > 0 && exactWindowID == 0) {
+            routedRecord.sceneID = MacWSInputSceneForWindow(
+                (uint32_t)eventTarget.windowID,
+                MacWSInputModifiersForScene(record.sceneID));
+        }
         size_t deactivated = 0;
         bool activationRepairNeeded =
             record.kind == MacWSInputKindActivateTarget &&

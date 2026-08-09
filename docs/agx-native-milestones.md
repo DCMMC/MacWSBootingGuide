@@ -2471,3 +2471,24 @@ Dock and gained hard startup bounds, eliminating an indefinite cold repair
 wait. Root-cause artifacts, accepted screenshots, and the exact library hash
 are recorded in
 [`maps-cold-location-and-space-create-20260809.md`](maps-cold-location-and-space-create-20260809.md).
+
+## 2026-08-10: native Mission Control input and presentation pacing converge
+
+The three-finger input transaction was already reaching Dock at 120 Hz, but
+Host presented it through two serial 60-Hz scheduling stages. A controlled
+181-record/1.5-second Mission Control replay measured only 30.82 fps with 30
+dropped frames. The Host frame-delivery link now follows the 120-Hz panel
+cadence, remains demand-driven, and still coalesces pending producer frames.
+The identical replay reached 48.96 fps with four dropped frames; repeated runs
+held 49-50 fps. A direct predecessor IOSurface texture reuse removes redundant
+Metal texture imports without retaining an unbounded surface cache.
+
+The native Dock modal path is also complete enough for a Host-format global
+tap to select and dismiss Mission Control. The input bridge retains Dock's
+authoritative `ECModalEventController` state, excludes private gesture events
+from its mouse-event witness, and performs witness installation once per
+gesture rather than once per Changed sample. Native maximum Dock magnification,
+two real Spaces, stable service PIDs, no new WindowServer crash, and nominal
+thermal state were verified after installing the full production package.
+Exact logs, screenshots, artifact hashes, and rejected cache experiment are in
+[`mission-control-dock-production-20260809/`](evidence/mission-control-dock-production-20260809/README.md).

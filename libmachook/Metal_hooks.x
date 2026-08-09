@@ -8198,90 +8198,22 @@ static void macws_sigabrt_trampoline(int sig) {
             return tex;
         }
         if (texType != 2 /* 2D */ && texType != 3 /* 2DArray */) {
-            // 2026-06-20 evening — Native path attempt for non-2D textures.
-            //
-            // RE of -[AGXTexture initWithDevice:desc:isSuballocDisabled:]
-            // (static 0x1e5a5b7a0) shows the cascade SHOULD work with our
-            // existing stubs because:
-            //   - validateWithDevice: → stubbed YES ✓
-            //   - initImpl (10-arg) → AGXG13GFamilyTexture native ✓
-            //   - initNewTextureData:, isMemoryless, getCPUSizeBytes,
-            //     getAlignment, getBytesPerRow, finalizeTextureCreation,
-            //     updateBindDataWithAddresses:... → AGXTexture has NATIVE
-            //     impls (our stubs are added to IOGPUMetalTexture and are
-            //     shadowed by AGXTexture's parent-class natives).
-            //   - allocBufferSubDataWithLength:... → IOGPUMetalDevice native
-            //     (iOS IOGPU framework, present in chroot).
-            //
-            // Try the native path FIRST.  If it returns a usable texture,
-            // great.  If it returns nil or a corrupt object that crashes
-            // in setFragmentTexture, fall back to the 2D-downgrade safe
-            // path so WS stays up.
-            //
-            // We can't safely detect "corrupt object" at return time, so
-            // env-gate this experiment behind MACWS_AGX_NATIVE_NON2D=1.
-            // Default OFF until proven safe.
-            if (getenv("MACWS_AGX_NATIVE_NON2D")) {
-                static int native_log = 0;
-                BOOL diagnostics = macws_runtime_diagnostics_enabled();
-                if (diagnostics && native_log++ < 6) {
-                    fprintf(stderr,
-                        "#### MTL_TEX plain NON-2D native attempt: texType=%lu\n",
-                        (unsigned long)texType);
-                }
-                id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
-                if (diagnostics && native_log < 8) {
-                    fprintf(stderr,
-                        "#### MTL_TEX plain NON-2D native result: %p class=%s\n",
-                        (void *)tex, tex ? class_getName([tex class]) : "(nil)");
-                }
-                if (tex) return tex;
+            // Runtime-confirmed by WindowServer-2026-08-09-225014.ips plus
+            // WindowServer.err: the historical fallback changed a legitimate
+            // six-face descriptor to MTLTextureType2D while retaining
+            // arrayLength=6. Metal rejected that internally inconsistent
+            // descriptor in validateWithDevice: from
+            // MetalContext::GetColorConverter. IOSurface compatibility is
+            // structurally 2D-only, so Cube/3D/MSAA semantics cannot be
+            // represented by changing one enum. Preserve the caller's exact
+            // descriptor and use the real AGX plain allocator; a nil result is
+            // propagated rather than returning a texture with false shape and
+            // sampling semantics.
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            if (!tex)
                 macws_log_mtldesc(desc, NULL, 0,
                     "plain.NON-2D-NATIVE.NIL");
-                // fall through to 2D downgrade if nil
-            }
-            // 2026-06-20 — Real implementation for non-2D textures (Cube, 3D, etc.).
-            //
-            // The chroot AGX framework's path for non-2D texture creation goes
-            // through AGXTexture init with selectors that aren't all resolvable
-            // in our stub cascade (returns a corrupt-but-non-nil texture that
-            // SIGSEGVs in AGX::ResourceGroupUsage::setTexture).  IOSurface
-            // backing is 2D-only per Metal validation, so we can't route the
-            // original descriptor through ROUTE-IOSURF either.
-            //
-            // Solution: downgrade the descriptor to textureType=2 (2D) so the
-            // existing ROUTE-IOSURF path (which IS proven to work end-to-end)
-            // can build a real AGXG13GFamilyTexture instance.  The returned
-            // texture is functionally 2D, but for CA's primary non-2D use case
-            // — encode_placeholder_cube binding a 1×1×1 cube as a placeholder —
-            // the texture is only BOUND (slot occupied), never SAMPLED with
-            // 3D coordinates from a real shader path.  AGX::setTexture only
-            // reads the texture's ivar layout (which is correct for a 2D
-            // texture) and writes the binding slot.
-            //
-            // For sampled-from-shader non-2D textures (e.g. CA's actual cube
-            // map for backdrop reflections, or genuine 3D LUTs), this still
-            // hands back a valid object that responds to all MTLTexture
-            // protocol queries — width / height / pixelFormat report what
-            // the caller asked for; only depth/textureType are 2D-ish.
-            // Sampling will read wrong data but won't crash.  That's the
-            // right trade-off for chroot — visual correctness for non-2D
-            // effects is a separate fix beyond plain texture creation.
-            static int nontex2d_log = 0;
-            if (macws_runtime_diagnostics_enabled() && nontex2d_log++ < 6) {
-                fprintf(stderr,
-                    "#### MTL_TEX plain NON-2D: texType=%lu → downgrading to 2D "
-                    "(IOSurface backing is 2D-only; native AGXTexture init's "
-                    "cascade returns a corrupt non-2D texture that SIGSEGVs in "
-                    "setFragmentTexture). The result is a real bindable 2D "
-                    "AGXG13GFamilyTexture; CA's placeholder bind needs a "
-                    "non-nil tex but doesn't actually sample it.\n",
-                    (unsigned long)texType);
-            }
-            if ([desc respondsToSelector:@selector(setTextureType:)]) {
-                [desc setTextureType:2 /* MTLTextureType2D */];
-            }
-            // Continue down to the ROUTE-IOSURF path below.
+            return tex;
         }
         NSUInteger width  = [desc respondsToSelector:@selector(width)]
                             ? [desc width] : 0;
@@ -10807,14 +10739,19 @@ static void macws_install_data_library_compatibility(Class agx) {
 // functions reached AGXMetal13_3 code=3 even after the copy pass succeeded.
 // Mission Control's initial overview shadow reaches downsample_blur_vert_lph
 // + downsample_4_frag_lph, while creating a Desktop from the expanded Spaces
-// strip reaches downsample_blur_vert_lph + single_pass_blur_3_lph. Opening
+// strip first reaches downsample_blur_vert_lph + single_pass_blur_3_lph and
+// its native insertion transition later reaches
+// downsample_blur_vert_lph + narrow_blur_27_frag_lph. Opening
 // Maps' route chrome then reached the separate tile_downsample_4 AIR module;
 // crash report 944AFB88-2054-46E9-8506-8F102F2388AD records the exact
 // COREANIMATION payload `tile_pipeline=...tile_downsample_4` and AGX's
-// `Target OS is incompatible` result. Each unadapted function therefore
+// `Target OS is incompatible` result. Creating a new Mission Control Space
+// then reached `tile_pipeline=MTLPixelFormatBGRA8Unorm_tile_downsample_8`;
+// WindowServer-2026-08-09-220237.ips records the same compiler-target failure
+// from MetalContext::get_tile_pipeline. Each unadapted function therefore
 // failed at the real compiler target boundary before WindowServer exited.
 // The package generates a byte-validated secondary library from the device's
-// own Ventura default.metallib: only these twelve
+// own Ventura default.metallib: only these fourteen
 // runtime-confirmed AIR modules receive a macabi target triple; all other
 // module bytes and every public function signature remain unchanged.
 //
@@ -10857,12 +10794,12 @@ static macws_function_specialize_async_fn
 static const char *kMacWSQCDesktopLibraryPath =
     "/usr/local/share/macws/quartzcore/"
     "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1048304;
+static const size_t kMacWSQCDesktopLibraryBytes = 1049184;
 static const uint64_t kMacWSQCDesktopLibraryHash =
     // macws_source_fnv1a64 intentionally retains this project's historical
     // non-standard offset basis. Runtime validation of the exact SHA-256
-    // 909a864e...f4a9 artifact produces this value.
-    UINT64_C(0x2939b64a5ca3cd91);
+    // 1f8c17bf...5aca8 artifact produces this value.
+    UINT64_C(0x9b69d1eac04650b3);
 static const char *kMacWSSkyLightDesktopLibraryPath =
     "/usr/local/share/macws/skylight/"
     "SkyLightShaders-desktop-effects-macabi.metallib";
@@ -10888,7 +10825,9 @@ static BOOL macws_qc_desktop_function_name(NSString *name) {
            [name isEqualToString:@"downsample_8_frag_lph"] ||
            [name isEqualToString:@"downsample_4_frag_lph"] ||
            [name isEqualToString:@"single_pass_blur_3_lph"] ||
-           [name isEqualToString:@"tile_downsample_4"];
+           [name isEqualToString:@"tile_downsample_4"] ||
+           [name isEqualToString:@"tile_downsample_8"] ||
+           [name isEqualToString:@"narrow_blur_27_frag_lph"];
 }
 
 static BOOL macws_qc_desktop_base_function_name(NSString *name) {
@@ -10900,7 +10839,8 @@ static BOOL macws_qc_desktop_base_function_name(NSString *name) {
            [name isEqualToString:@"attachment_clear_frag_lph"] ||
            [name isEqualToString:@"std_vert1_lph"] ||
            [name isEqualToString:@"inplace_copy_lph"] ||
-           [name isEqualToString:@"tile_downsample_4"];
+           [name isEqualToString:@"tile_downsample_4"] ||
+           [name isEqualToString:@"tile_downsample_8"];
 }
 
 static BOOL macws_skylight_desktop_function_name(NSString *name) {
@@ -10930,15 +10870,18 @@ static id<MTLLibrary> macws_qc_desktop_library(id<MTLDevice> device) {
             [NSString stringWithUTF8String:kMacWSQCDesktopLibraryPath]
                                                options:NSDataReadingMappedIfSafe
                                                  error:nil];
+        uint64_t observed_hash = data.length
+            ? macws_source_fnv1a64(data.bytes, data.length) : 0;
         if (data.length != kMacWSQCDesktopLibraryBytes ||
-            macws_source_fnv1a64(data.bytes, data.length) !=
-                kMacWSQCDesktopLibraryHash) {
+            observed_hash != kMacWSQCDesktopLibraryHash) {
             if (macws_runtime_diagnostics_enabled()) {
                 dprintf(STDERR_FILENO,
                     "#### QC-DESKTOP-TARGET invalid-library path=%s "
-                    "bytes=%lu\n",
+                    "bytes=%lu hash=%016llx expected=%016llx\n",
                     kMacWSQCDesktopLibraryPath,
-                    (unsigned long)data.length);
+                    (unsigned long)data.length,
+                    (unsigned long long)observed_hash,
+                    (unsigned long long)kMacWSQCDesktopLibraryHash);
             }
             return;
         }

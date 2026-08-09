@@ -713,6 +713,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSMutableDictionary<NSNumber *, MacWSSurfaceFrame *> *_overlayFrames;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *_overlayTextures;
     uint64_t _surfaceTextureImports;
+    uint64_t _surfaceTextureReuses;
     uint64_t _lastPerformanceLogStreamID;
     uint64_t _lastPerformanceLogSequence;
     NSArray<NSNumber *> *_sortedOverlayKeys;
@@ -2225,12 +2226,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSStreamFrameDescriptor base = _surfaceFrame.descriptor;
     MacWSLog(@"display-performance-snapshot reason=%@ "
              "base-stream=%llu base-sequence=%llu base-surface=%u "
-             "texture-imports=%llu layers=[%@]",
+             "texture-imports=%llu texture-reuses=%llu layers=[%@]",
              reason.length ? reason : @"manual",
              (unsigned long long)base.streamID,
              (unsigned long long)base.sequence,
              _surfaceFrame ? IOSurfaceGetID(_surfaceFrame.surface) : 0,
              (unsigned long long)_surfaceTextureImports,
+             (unsigned long long)_surfaceTextureReuses,
              [layers componentsJoinedByString:@", "]);
 }
 
@@ -3905,29 +3907,52 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             bytesPerRow, (unsigned long)requiredAlignment]];
         return;
     }
-    MTLTextureDescriptor *descriptor =
-        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                           width:frame.descriptor.width
-                                                          height:frame.descriptor.height
-                                                       mipmapped:NO];
-    descriptor.storageMode = MTLStorageModeShared;
-    descriptor.usage = MTLTextureUsageShaderRead;
-    id<MTLTexture> texture = [self.device newTextureWithDescriptor:descriptor
-                                                         iosurface:frame.surface
-                                                             plane:0];
+    BOOL overlayFrame =
+        (frame.descriptor.flags & MacWSStreamFrameOverlay) != 0;
+    NSNumber *overlayKey = overlayFrame
+        ? @(frame.descriptor.layerWindowID) : nil;
+    MacWSSurfaceFrame *texturePredecessor = overlayFrame
+        ? _overlayFrames[overlayKey] : _surfaceFrame;
+    id<MTLTexture> texture = overlayFrame
+        ? _overlayTextures[overlayKey] : _surfaceTexture;
+    uint32_t incomingSurfaceID = IOSurfaceGetID(frame.surface);
+    uint32_t predecessorSurfaceID = texturePredecessor
+        ? IOSurfaceGetID(texturePredecessor.surface) : 0;
+    BOOL reusedTexture = texture && incomingSurfaceID != 0 &&
+        incomingSurfaceID == predecessorSurfaceID &&
+        texture.width == frame.descriptor.width &&
+        texture.height == frame.descriptor.height &&
+        texture.pixelFormat == MTLPixelFormatBGRA8Unorm;
+    if (!reusedTexture) {
+        MTLTextureDescriptor *descriptor =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                               width:frame.descriptor.width
+                                                              height:frame.descriptor.height
+                                                           mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead;
+        texture = [self.device newTextureWithDescriptor:descriptor
+                                              iosurface:frame.surface
+                                                  plane:0];
+    }
     if (!texture) {
         [client releaseFrame:frame];
         [self publishStatus:@"无法从 DisplayStream IOSurface 创建 Metal 纹理"];
         return;
     }
-    _surfaceTextureImports++;
-    texture.label = [NSString stringWithFormat:@"MacWS stream %llu frame %llu",
-        (unsigned long long)frame.descriptor.streamID,
-        (unsigned long long)frame.descriptor.sequence];
+    if (reusedTexture) {
+        _surfaceTextureReuses++;
+    } else {
+        _surfaceTextureImports++;
+        texture.label = [NSString stringWithFormat:
+            @"MacWS stream %llu frame %llu",
+            (unsigned long long)frame.descriptor.streamID,
+            (unsigned long long)frame.descriptor.sequence];
+    }
 
-    if ((frame.descriptor.flags & MacWSStreamFrameOverlay) != 0) {
-        NSNumber *key = @(frame.descriptor.layerWindowID);
-        MacWSSurfaceFrame *previous = _overlayFrames[key];
+    if (overlayFrame) {
+        NSNumber *key = overlayKey;
+        MacWSSurfaceFrame *previous = texturePredecessor;
         if (!previous ||
             previous.descriptor.layerLevel != frame.descriptor.layerLevel)
             _sortedOverlayKeys = nil;
@@ -3945,7 +3970,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     }
 
-    MacWSSurfaceFrame *previous = _surfaceFrame;
+    MacWSSurfaceFrame *previous = texturePredecessor;
     BOOL geometryChanged = !previous ||
         !MacWSStreamFrameGeometryEqual(previous.descriptor,
                                        frame.descriptor);

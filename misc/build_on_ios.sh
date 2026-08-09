@@ -81,6 +81,17 @@ elif [ "$FAST" != "1" ]; then
     echo "==> RESUME mode: preserving successful objects from the interrupted full build"
 else
     echo "==> FAST mode: skipping make clean (incremental build)"
+    # Source synchronization (scp, git reset, restored worktrees) can install
+    # correct content with a timestamp older than a cached Theos object. GNU
+    # make then silently relinks that stale object. This previously shipped a
+    # pre-12-function QuartzCore compatibility hash and made a cold
+    # WindowServer reject the exact current metallib. FAST is already scoped
+    # to libmachook, so make every translation unit newer than its object and
+    # rebuild this one library deterministically; packaging remains skipped.
+    find libmachook -maxdepth 1 -type f \
+        \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.x' \) \
+        -exec touch {} +
+    echo "==> FAST invariant: refreshed all libmachook source mtimes"
 fi
 
 echo "==> Building..."

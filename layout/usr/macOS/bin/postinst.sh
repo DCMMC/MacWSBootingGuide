@@ -902,7 +902,7 @@ ROOTFS=/var/mnt/rootfs
 # Ventura QuartzCore's real desktop-window-effects shaders are compiled for a
 # macOS AIR target, while this project intentionally executes them on the iOS
 # native AGX driver. The focused provisioner preserves the original library,
-# regenerates the twelve-function secondary macabi artifact when required, and
+# regenerates the fourteen-function secondary macabi artifact when required, and
 # performs exact byte validation. It is also called by dpkg's postinst so an
 # upgrade cannot leave a stale shader artifact behind valid trust sentinels.
 QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py

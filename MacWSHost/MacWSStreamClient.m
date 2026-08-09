@@ -238,14 +238,18 @@
             displayLinkWithTarget:self
                          selector:@selector(deliverPendingFramesForDisplayLink:)];
         if (@available(iOS 15.0, *)) {
-            // Every SkyLight producer is explicitly capped at 60 Hz.  Drain
-            // once per producer interval so the independent window/menu/Dock
-            // callbacks belonging to one workspace composite land in the
-            // same Metal presentation.  A 120-Hz drain can split that set at
-            // an arbitrary 8.3-ms boundary and doubles main-thread imports
-            // without creating an additional macOS frame.
-            link.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 60.0,
-                                                                 60.0);
+            // Frame delivery and MTKView presentation are two consecutive
+            // main-runloop stages. Runtime evidence on 2026-08-10 showed that
+            // pacing both at 60 Hz reduced an interactive full-Retina Dock
+            // layer to 30.82 fps (68 frames / 2.174 s, with 30 producer frames
+            // dropped to the three-lease backpressure limit). Use the iPad
+            // panel's 120-Hz boundary for this lightweight newest-frame drain.
+            // The producer remains capped at 60 Hz, the pending dictionary
+            // still coalesces by layer, and the display link pauses after one
+            // drain, so this reduces the two-stage latency without inventing
+            // frames or running continuously while the desktop is static.
+            link.preferredFrameRateRange = CAFrameRateRangeMake(60.0, 120.0,
+                                                                 120.0);
         } else {
             link.preferredFramesPerSecond = 60;
         }

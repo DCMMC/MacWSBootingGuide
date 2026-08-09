@@ -1,0 +1,48 @@
+{
+  "name": "macOS-iPad",
+  "width": 2388,
+  "height": 1668,
+  "encoding": "hextile",
+  "trajectory": [
+    1194,
+    1200,
+    1780,
+    1588
+  ],
+  "roi": [
+    0,
+    1400,
+    2388,
+    268
+  ],
+  "duration_seconds": 1.0,
+  "settle_seconds": 3.0,
+  "requested_hz": 60.0,
+  "pipelined_requests": false,
+  "classification": "transmitted_roi_area",
+  "sent_events": 61,
+  "framebuffer_updates": 227,
+  "update_fps": 56.75,
+  "meaningful_updates": 3,
+  "meaningful_fps": 0.75,
+  "unique_masked_roi_frames": null,
+  "rectangles_seen": 147,
+  "receive_seconds": 0.9604629228706472,
+  "first_update_seconds": 0.008562750008422881,
+  "first_meaningful_seconds": 0.9700949999969453,
+  "meaningful_interval_p50_seconds": 0.23916195801575668,
+  "meaningful_interval_p95_seconds": 0.5809834999963641,
+  "meaningful_interval_max_seconds": 0.5809834999963641,
+  "changed_pixels_mean": 2578.9603524229074,
+  "changed_pixels_max": 344656,
+  "changed_pixels_from_baseline": null,
+  "initial_rectangles": [
+    [
+      0,
+      0,
+      2388,
+      1668,
+      5
+    ]
+  ]
+}

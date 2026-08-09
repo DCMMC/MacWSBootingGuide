@@ -59,6 +59,8 @@ typedef id (*MacWSKeyEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
                                    BOOL, unsigned short);
 typedef const void *MacWSCGEventRef;
 typedef MacWSCGEventRef (*MacWSCreateCGEvent)(const void *);
+typedef MacWSCGEventRef (*MacWSCopyCGEvent)(MacWSCGEventRef);
+typedef uint32_t (*MacWSGetCGEventType)(MacWSCGEventRef);
 typedef MacWSCGEventRef (*MacWSCreateKeyboardCGEvent)(
     const void *, unsigned short, bool);
 typedef MacWSCGEventRef (*MacWSCreateMouseCGEvent)(
@@ -179,6 +181,18 @@ static MacWSDirectTrackingContext MacWSAppInputDirectContext;
 // The witness does not replace or suppress any Dock behavior.
 static _Atomic(uintptr_t) MacWSDockGesturesInstance;
 static IMP MacWSOriginalDockGesturesInit;
+// Mission Control pointer input is owned by EyeCandy's process-local modal
+// router, not Dock's ordinary global CGS event path. Dock __TEXT+0x41980
+// confirmed that
+// -[ECModalEventController handleEvent:windows:topLayers:windowCount:] takes a
+// CF-backed raw CGEventRef and constructs its ECEvent wrapper internally. Its
+// real CGS event entry also supplies the exact Spaces Bar WALayerKitWindow and
+// top layer. Retain that tuple at the native routing boundary instead of
+// searching the heap or reconstructing Dock's private object graph.
+static IMP MacWSOriginalDockModalEventRouter;
+static id MacWSDockModalWindow;
+static id MacWSDockModalTopLayer;
+static MacWSCGEventRef MacWSDockModalTemplateEvent;
 // The physical trackpad path never leaves an unbounded list of stale Changed
 // samples on Dock's main queue.  UIKit can produce at 120 Hz while a native
 // Mission Control frame is temporarily more expensive; enqueueing one block
@@ -1632,6 +1646,89 @@ static id MacWSDockGesturesInitWitness(id self, SEL selector) {
     return result;
 }
 
+static void MacWSClearDockModalContext(void) {
+    [MacWSDockModalWindow release];
+    [MacWSDockModalTopLayer release];
+    MacWSDockModalWindow = nil;
+    MacWSDockModalTopLayer = nil;
+    if (MacWSDockModalTemplateEvent)
+        CFRelease(MacWSDockModalTemplateEvent);
+    MacWSDockModalTemplateEvent = NULL;
+}
+
+static void MacWSDockModalEventRouterWitness(
+        id self, SEL selector, id event, const id *windows,
+        const id *topLayers, NSUInteger windowCount) {
+    id currentHandler = [self respondsToSelector:
+        sel_registerName("currentHandler")]
+        ? ((id (*)(id, SEL))objc_msgSend)(
+            self, sel_registerName("currentHandler")) : nil;
+    Class exposeClass = objc_getClass("_TtC4Dock21ExposeEventController");
+    if (windowCount > 0 && windows && topLayers && windows[0] &&
+        topLayers[0] && currentHandler && exposeClass &&
+        [currentHandler isKindOfClass:exposeClass]) {
+        static MacWSCopyCGEvent copyEvent;
+        static MacWSGetCGEventType getEventType;
+        static dispatch_once_t copyOnce;
+        dispatch_once(&copyOnce, ^{
+            copyEvent = (MacWSCopyCGEvent)dlsym(
+                RTLD_DEFAULT, "CGEventCreateCopy");
+            getEventType = (MacWSGetCGEventType)dlsym(
+                RTLD_DEFAULT, "CGEventGetType");
+        });
+        if (MacWSDockModalWindow != windows[0]) {
+            [windows[0] retain];
+            [MacWSDockModalWindow release];
+            MacWSDockModalWindow = windows[0];
+        }
+        if (MacWSDockModalTopLayer != topLayers[0]) {
+            [topLayers[0] retain];
+            [MacWSDockModalTopLayer release];
+            MacWSDockModalTopLayer = topLayers[0];
+        }
+        MacWSCGEventRef sourceEvent =
+            (MacWSCGEventRef)(uintptr_t)event;
+        uint32_t eventType = getEventType && sourceEvent
+            ? getEventType(sourceEvent) : UINT32_MAX;
+        // The template is used only to reconstruct a mouse event at the same
+        // native modal hit. DOCKGestures also drives private type-29 gesture
+        // events through adjacent EyeCandy state while Mission Control is
+        // animating. Copying and retaining each 120-Hz gesture event adds work
+        // to Dock's main thread and cannot improve pointer routing. Preserve
+        // only the real mouse family (down/up/move/drag = 1...6).
+        MacWSCGEventRef copied = copyEvent && eventType >= 1 && eventType <= 6
+            ? copyEvent(sourceEvent) : NULL;
+        if (copied) {
+            if (MacWSDockModalTemplateEvent)
+                CFRelease(MacWSDockModalTemplateEvent);
+            MacWSDockModalTemplateEvent = copied;
+        }
+    } else if (!currentHandler || !exposeClass ||
+               ![currentHandler isKindOfClass:exposeClass]) {
+        MacWSClearDockModalContext();
+    }
+    if (MacWSOriginalDockModalEventRouter)
+        ((void (*)(id, SEL, id, const id *, const id *, NSUInteger))
+            MacWSOriginalDockModalEventRouter)(
+                self, selector, event, windows, topLayers, windowCount);
+}
+
+static BOOL MacWSInstallDockModalEventWitness(void) {
+    Class modalClass = objc_getClass("ECModalEventController");
+    if (!modalClass) return NO;
+    SEL routeSelector = sel_registerName(
+        "handleEvent:windows:topLayers:windowCount:");
+    Method routeMethod = class_getInstanceMethod(modalClass, routeSelector);
+    if (!routeMethod) return NO;
+    IMP current = method_getImplementation(routeMethod);
+    if (current != (IMP)MacWSDockModalEventRouterWitness) {
+        MacWSOriginalDockModalEventRouter = current;
+        method_setImplementation(
+            routeMethod, (IMP)MacWSDockModalEventRouterWitness);
+    }
+    return YES;
+}
+
 static BOOL MacWSInstallDockGesturesWitness(void) {
     Class gesturesClass = objc_getClass("DOCKGestures");
     if (!gesturesClass) return NO;
@@ -1639,9 +1736,13 @@ static BOOL MacWSInstallDockGesturesWitness(void) {
                                              sel_registerName("init"));
     if (!method) return NO;
     IMP current = method_getImplementation(method);
-    if (current == (IMP)MacWSDockGesturesInitWitness) return YES;
-    MacWSOriginalDockGesturesInit = current;
-    method_setImplementation(method, (IMP)MacWSDockGesturesInitWitness);
+    if (current != (IMP)MacWSDockGesturesInitWitness) {
+        MacWSOriginalDockGesturesInit = current;
+        method_setImplementation(method, (IMP)MacWSDockGesturesInitWitness);
+    }
+    // EyeCandy classes can be realized after the inserted-dylib constructor.
+    // The system-gesture Begin path retries before Dock opens Mission Control.
+    (void)MacWSInstallDockModalEventWitness();
     return YES;
 }
 
@@ -2943,6 +3044,11 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
         (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
          MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
     if (phase == MacWSInputFlagGestureBegan) {
+        // Install exactly once at the ownership boundary, before Begin asks
+        // Dock to construct the Spaces Bar. Calling ObjC method discovery for
+        // every 120-Hz Changed sample is unnecessary; a Swift class that was
+        // unrealized at dylib startup is guaranteed to be present by Begin.
+        (void)MacWSInstallDockModalEventWitness();
         MacWSInputRecord orphanCancellation = {0};
         BOOL haveOrphanCancellation = NO;
         pthread_mutex_lock(&MacWSDockGestureLock);
@@ -3048,6 +3154,131 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
     return YES;
 }
 
+// Route a real pointer event through the active Mission Control modal owner.
+// Global CGEventPost/CGPostMouseEvent reaches Dock's normal CGS connection but
+// cannot supply the Spaces Bar's WALayerKitWindow/top-layer pair. The native
+// ECModalEventController route takes those exact live objects and therefore
+// preserves Dock's own hit testing, actions and animation state.
+static BOOL MacWSPostDockModalPointerEvent(MacWSInputRecord record,
+                                           uint32_t windowNumber,
+                                           BOOL *activeOut) {
+    if (activeOut) *activeOut = NO;
+    if (windowNumber == 0) return NO;
+    switch ((MacWSInputKind)record.kind) {
+        case MacWSInputKindTouchDown:
+        case MacWSInputKindTouchMove:
+        case MacWSInputKindTouchUp:
+        case MacWSInputKindTouchCancel:
+        case MacWSInputKindHover:
+        case MacWSInputKindMenuHover:
+        case MacWSInputKindTap:
+        case MacWSInputKindSecondaryTap:
+            break;
+        default:
+            return NO;
+    }
+
+    static MacWSCopyCGEvent copyEvent;
+    static MacWSSetCGEventType setType;
+    static MacWSSetCGEventIntegerField setInteger;
+    static MacWSSetCGEventTimestamp setTimestamp;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        copyEvent = (MacWSCopyCGEvent)dlsym(
+            RTLD_DEFAULT, "CGEventCreateCopy");
+        setType = (MacWSSetCGEventType)dlsym(
+            RTLD_DEFAULT, "CGEventSetType");
+        setInteger = (MacWSSetCGEventIntegerField)dlsym(
+            RTLD_DEFAULT, "CGEventSetIntegerValueField");
+        setTimestamp = (MacWSSetCGEventTimestamp)dlsym(
+            RTLD_DEFAULT, "CGEventSetTimestamp");
+    });
+    if (!copyEvent || !setType || !setInteger) return NO;
+
+    __block BOOL routed = NO;
+    dispatch_block_t routeBlock = ^{
+        Class modalClass = objc_getClass("ECModalEventController");
+        SEL sharedSelector = sel_registerName("sharedController");
+        SEL currentHandlerSelector = sel_registerName("currentHandler");
+        SEL routeSelector = sel_registerName(
+            "handleEvent:windows:topLayers:windowCount:");
+        if (!modalClass ||
+            ![modalClass respondsToSelector:sharedSelector]) return;
+        id modalController = ((id (*)(id, SEL))objc_msgSend)(
+            modalClass, sharedSelector);
+        if (!modalController ||
+            ![modalController respondsToSelector:currentHandlerSelector] ||
+            ![modalController respondsToSelector:routeSelector]) return;
+        id currentHandler = ((id (*)(id, SEL))objc_msgSend)(
+            modalController, currentHandlerSelector);
+        Class exposeClass = objc_getClass(
+            "_TtC4Dock21ExposeEventController");
+        if (!currentHandler || !exposeClass ||
+            ![currentHandler isKindOfClass:exposeClass]) return;
+        if (activeOut) *activeOut = YES;
+        id hitWindow = MacWSDockModalWindow;
+        id topLayer = MacWSDockModalTopLayer;
+        MacWSCGEventRef templateEvent = MacWSDockModalTemplateEvent;
+        if (!hitWindow || !topLayer || !templateEvent) return;
+
+        uint32_t firstType = 0;
+        uint32_t secondType = 0;
+        uint32_t button = 0;
+        switch ((MacWSInputKind)record.kind) {
+            case MacWSInputKindTouchDown: firstType = 1; break;
+            case MacWSInputKindTouchMove: firstType = 6; break;
+            case MacWSInputKindTouchUp:
+            case MacWSInputKindTouchCancel: firstType = 2; break;
+            case MacWSInputKindHover:
+            case MacWSInputKindMenuHover: firstType = 5; break;
+            case MacWSInputKindTap:
+                firstType = 1; secondType = 2; break;
+            case MacWSInputKindSecondaryTap:
+                firstType = 3; secondType = 4; button = 1; break;
+            default: break;
+        }
+        if (firstType == 0) return;
+
+        MacWSCGEventRef events[2] = {
+            copyEvent(templateEvent),
+            secondType ? copyEvent(templateEvent) : NULL,
+        };
+        if (!events[0] || (secondType && !events[1])) {
+            if (events[0]) CFRelease(events[0]);
+            if (events[1]) CFRelease(events[1]);
+            return;
+        }
+        NSUInteger eventCount = secondType ? 2 : 1;
+        for (NSUInteger index = 0; index < eventCount; index++) {
+            MacWSCGEventRef event = events[index];
+            setType(event, index == 0 ? firstType : secondType);
+            setInteger(event, 1 /* click state */,
+                (record.flags & MacWSInputFlagDoubleClick) ? 2 : 1);
+            setInteger(event, 3 /* button number */, button);
+            // All window, connection and local-location fields remain the
+            // byte-for-byte values WindowServer supplied on the pre-hover at
+            // this same quartz point. Only event phase/button/timestamp change.
+            if (setTimestamp && record.timestamp > 0.0)
+                setTimestamp(event,
+                    (uint64_t)llround(record.timestamp * 1.0e9));
+        }
+
+        id windows[1] = {hitWindow};
+        id topLayers[1] = {topLayer};
+        for (NSUInteger index = 0; index < eventCount; index++)
+            ((void (*)(id, SEL, id, const id *, const id *, NSUInteger))
+                objc_msgSend)(modalController, routeSelector,
+                    (id)(uintptr_t)events[index], windows, topLayers, 1);
+        for (NSUInteger index = 0; index < eventCount; index++)
+            CFRelease(events[index]);
+        routed = YES;
+    };
+    if ([NSThread isMainThread]) routeBlock();
+    else dispatch_sync(dispatch_get_main_queue(), routeBlock);
+    if (routed) MacWSNotifyDisplayCatalogChanged('m');
+    return routed;
+}
+
 // The central broker runs outside a normal WindowServer application session:
 // runtime CGPreflightPostEventAccess is NO.  OSXvnc's working mouse path calls
 // CGPostMouseEvent at __TEXT+0x9f24 from a CGS-connected process; the
@@ -3104,16 +3335,39 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
         frame.origin.y + frame.size.height - appKitPoint.y,
     };
     uint32_t windowNumber = MacWSInputWindowIDForScene(record.sceneID);
-    BOOL posted = MacWSPostLegacySystemPointerEvent(
+    BOOL modalActive = NO;
+    BOOL modalPosted = MacWSPostDockModalPointerEvent(
+        record, windowNumber, &modalActive);
+    if (!modalPosted && modalActive && ![NSThread isMainThread] &&
+        record.kind != MacWSInputKindHover &&
+        record.kind != MacWSInputKindMenuHover) {
+        // The first finger tap after opening Mission Control may precede any
+        // pointer motion, so the native router has not yet published its
+        // window/layer tuple. Send one button-free event through the existing
+        // CGS owner, wait less than one 60-Hz frame on the socket thread (Dock's
+        // main queue remains free), then retry the original record. The router
+        // witness captures WindowServer's authoritative hit context; no
+        // coordinate-specific object lookup or private-state fabrication is
+        // involved.
+        MacWSInputRecord hover = record;
+        hover.kind = MacWSInputKindHover;
+        (void)MacWSPostLegacySystemPointerEvent(
+            hover, appKitPoint, frame, frame, windowNumber, YES);
+        usleep(12000);
+        modalPosted = MacWSPostDockModalPointerEvent(
+            record, windowNumber, &modalActive);
+    }
+    BOOL posted = modalPosted || MacWSPostLegacySystemPointerEvent(
         record, appKitPoint, frame, frame, windowNumber, YES);
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,
             "#### APP-INPUT DOCK-SYSTEM pid=%d window=%u kind=%u "
             "pixel=(%.2f,%.2f)/%ux%u logical=(%.2f,%.2f) "
-            "quartz=(%.2f,%.2f) route=system-mouse posted=%s\n",
+            "quartz=(%.2f,%.2f) route=%s posted=%s\n",
             getpid(), windowNumber, record.kind, record.x, record.y,
             record.frameWidth, record.frameHeight,
             appKitPoint.x, appKitPoint.y, quartzPoint.x, quartzPoint.y,
+            modalPosted ? "mission-control-modal" : "system-mouse",
             posted ? "YES" : "NO");
         fflush(stderr);
     }
@@ -7295,6 +7549,7 @@ __attribute__((destructor)) static void MacWSRemoveAppInputBridge(void) {
     MacWSSetAppInputGestureWindow(nil);
     MacWSSetAppInputGestureHitView(nil);
     MacWSSetLastSystemActivationEvent(nil);
+    if (MacWSAppInputIsDockEndpoint()) MacWSClearDockModalContext();
     if (MacWSAppInputSocket >= 0) close(MacWSAppInputSocket);
     if (MacWSAppInputPath[0]) unlink(MacWSAppInputPath);
     if (MacWSWindowMetricsPath[0]) unlink(MacWSWindowMetricsPath);
