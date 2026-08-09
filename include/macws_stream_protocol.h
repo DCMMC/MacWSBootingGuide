@@ -13,7 +13,13 @@
 #define MACWS_STREAM_INVALIDATE_SOCKET_PATH \
     "/private/tmp/macws_display_invalidate.sock"
 #define MACWS_STREAM_MAGIC 0x4d575354u /* "MWST" */
-#define MACWS_STREAM_VERSION 4u
+// Version 5 makes the layer_removed stream/sequence cutoff mandatory.  A v4
+// displayd only sent the CGWindow ID, so a newer Host could permanently
+// tombstone a still-live capture stream when Mission Control temporarily
+// removed and then restored an application window.  Keep this as a hard wire
+// compatibility boundary: silently pairing a v5 Host with a stale v4 daemon
+// recreates the "only the focused app remains" failure.
+#define MACWS_STREAM_VERSION 5u
 
 #define MACWS_STREAM_MAX_DIMENSION 16384u
 #define MACWS_STREAM_MAX_BYTES_PER_ROW (MACWS_STREAM_MAX_DIMENSION * 16u)

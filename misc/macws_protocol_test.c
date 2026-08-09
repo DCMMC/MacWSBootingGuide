@@ -24,6 +24,7 @@ int main(void) {
     assert(!MacWSPhysicalDisplayExtent(5000.0, 5000.0, 2.0, 8192,
                                        &physicalWidth, &physicalHeight));
     assert(MACWS_INPUT_VERSION == 4u);
+    assert(MACWS_STREAM_VERSION == 5u);
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSInputKindDesktopCommand == 20);
