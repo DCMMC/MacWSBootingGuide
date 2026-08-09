@@ -8557,6 +8557,27 @@ __attribute__((constructor)) void InitStuff() {
 
 extern int gpu_bundle_find_trusted(const char *name, char *trusted_path, size_t trusted_path_len);
 
+// Calling sysctlbyname() from its own DYLD_INTERPOSE replacement is not a
+// reliable route to the original symbol.  A client image can bind that call
+// back to this replacement, recursing until the main-thread stack guard is
+// reached (runtime-confirmed with CleanMyMac X 4.15.8 on 2026-08-10).  Resolve
+// the name to a MIB and use the lower-level sysctl syscall wrapper instead;
+// this preserves the kernel's real errno/size semantics without relying on
+// dyld's lookup scope.
+static int macws_real_sysctlbyname(const char *name, void *oldp,
+                                   size_t *oldlenp, void *newp,
+                                   size_t newlen) {
+    int mib[CTL_MAXNAME];
+    size_t miblen = CTL_MAXNAME;
+    if (!name) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (sysctlnametomib(name, mib, &miblen) != 0)
+        return -1;
+    return sysctl(mib, (u_int)miblen, oldp, oldlenp, newp, newlen);
+}
+
 int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     // printf("debugbydcmmc Calling interposed sysctlbyname\n");
     if (name && oldp) {
@@ -8564,18 +8585,21 @@ int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, 
             *(unsigned long long *)oldp = 0x70010000f388828b; // bit 0 = diagnostics enabled
             return 0;
         } else if(!strcmp(name, "kern.osproductversion")) {
-            sysctlbyname(name, oldp, oldlenp, newp, newlen);
+            int result = macws_real_sysctlbyname(name, oldp, oldlenp,
+                                                 newp, newlen);
+            if (result != 0)
+                return result;
             char *version = (char *)oldp;
-            assert(version[0] == '1');
-            if(version[1] >= '4') {
+            if (oldlenp && *oldlenp >= 2 && version[0] == '1' &&
+                version[1] >= '4') {
                 version[1] -= 3; // 16 -> 13
-            } else {
+            } else if (oldlenp && *oldlenp >= 2 && version[0] == '1') {
                 version[1] = '1'; // always macOS 11
             }
             return 0;
         }
     }
-    return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+    return macws_real_sysctlbyname(name, oldp, oldlenp, newp, newlen);
 }
 
 extern int __mac_syscall(const char *policy, int operation, void *argument);

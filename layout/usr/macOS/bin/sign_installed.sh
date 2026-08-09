@@ -14,12 +14,15 @@
 ENT=/var/jb/usr/macOS/bin/entitlements.plist
 LDID=/var/jb/usr/bin/ldid
 JBCTL=/var/jb/usr/bin/jbctl
+PYTHON=/var/jb/usr/bin/python3
 ROOTFS=/var/mnt/rootfs
 
 # ── snapshot current trustcache so we can skip already-trusted entries ────────
 
 TC_CACHE=$(mktemp /tmp/tc_cache.XXXXXX)
-"$JBCTL" trustcache list 2>/dev/null | tr '[:upper:]' '[:lower:]' > "$TC_CACHE"
+# Dopamine's jbctl `list` subcommand silently returns an empty result on the
+# target.  `info` is its authoritative read-only inventory.
+"$JBCTL" trustcache info 2>/dev/null | tr '[:upper:]' '[:lower:]' > "$TC_CACHE"
 trap 'rm -f "$TC_CACHE"' EXIT
 printf 'Loaded %d existing trustcache entries.\n' "$(wc -l < "$TC_CACHE")"
 
@@ -85,7 +88,35 @@ sign_tree() {
     local dir="$1"
     [ -d "$dir" ] || { printf 'skip (not found): %s\n' "$dir"; return 0; }
     printf '\n==> %s\n' "$dir"
-    find "$dir" -type f | while read -r f; do
+    # File mode is not a reliable code predicate in third-party bundles:
+    # Office marks thousands of inert resources executable, while Valheim ships
+    # its 57 MB PlayFab Mach-O bundle as mode 0644. Probe every regular file's
+    # four-byte Mach-O/fat magic in one Python process so ldid only sees code.
+    # Office 16.91 Word is the large-tree witness: executable-bit filtering sent
+    # 3,640 resources through ldid and still would not catch Valheim's plugin.
+    "$PYTHON" -c '
+import os, stat, sys
+
+magics = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+for base, _, names in os.walk(sys.argv[1]):
+    for name in names:
+        path = os.path.join(base, name)
+        try:
+            mode = os.stat(path, follow_symlinks=False).st_mode
+            if not stat.S_ISREG(mode):
+                continue
+            with open(path, "rb") as stream:
+                if stream.read(4) not in magics:
+                    continue
+            os.write(1, os.fsencode(path) + b"\0")
+        except OSError:
+            pass
+' "$dir" | while IFS= read -r -d '' f; do
         sign_one "$f"
     done
 }

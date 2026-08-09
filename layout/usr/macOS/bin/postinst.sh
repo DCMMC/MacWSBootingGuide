@@ -425,7 +425,37 @@ ensure_private_cfprefsd_and_trustcache() {
     add_all_trustcache "$target_path"
 }
 
-# Re-register every already-signed executable Mach-O in an application bundle.
+# Emit every regular Mach-O/fat file in a tree as a NUL-delimited path list.
+# Do not trust mode bits here: Valheim 0.220.5 runtime-confirmed that its
+# PlayFabPartyMacOS bundle is real arm64 code shipped as mode 0644, while Office
+# marks thousands of fonts and proofing resources executable.
+list_macho_files() {
+    /var/jb/usr/bin/python3 -c '
+import os, stat, sys
+
+magics = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+for base, _, names in os.walk(sys.argv[1]):
+    for name in names:
+        path = os.path.join(base, name)
+        try:
+            mode = os.stat(path, follow_symlinks=False).st_mode
+            if not stat.S_ISREG(mode):
+                continue
+            with open(path, "rb") as stream:
+                if stream.read(4) not in magics:
+                    continue
+            os.write(1, os.fsencode(path) + b"\0")
+        except OSError:
+            pass
+' "$1"
+}
+
+# Re-register every already-signed Mach-O in an application bundle.
 #
 # Dynamic jailbreak trustcaches are lost across a device reboot, while the
 # ad-hoc signatures stored in the macOS rootfs persist.  launchdchrootexec can
@@ -447,7 +477,7 @@ trust_existing_app_bundle() {
     [ -d "$bundle" ] || return 0
 
     echo "[INFO] Restoring signed Mach-O trustcache entries for $name..."
-    find "$bundle/Contents" -type f -perm -111 -print0 2>/dev/null |
+    list_macho_files "$bundle/Contents" |
         while IFS= read -r -d '' path; do
             add_all_trustcache "$path"
         done
@@ -854,6 +884,12 @@ for application_bundle in /var/mnt/rootfs/Applications/*.app; do
         "$application_bundle" \
         "$(basename "$application_bundle" .app)"
 done
+# Microsoft Office's applications talk to this helper before an injected app
+# can ask autosignd to repair it.  Its project+native merged signature persists
+# in the rootfs, while Dopamine's dynamic trustcache does not survive a reboot.
+# Re-register the installed image without changing its identifier/entitlements.
+add_all_trustcache \
+    /var/mnt/rootfs/Library/PrivilegedHelperTools/com.microsoft.office.licensingV2.helper
 # vnc server
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
 add_all_trustcache /var/mnt/rootfs/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent
