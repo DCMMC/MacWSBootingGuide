@@ -700,10 +700,26 @@ wait_for_replacement_ws() {
 }
 
 ensure_navigation_spaces() {
+    local rc=0
+
+    # CGSSpaceCreate needs Dock's per-session Space controller to be live.
+    # Runtime-confirmed on the 2026-08-09 cold boot: invoking the controller
+    # after WindowServer but before Dock blocked indefinitely inside
+    # `ensure-navigation-spaces`.  Require the upstream owner and bound the
+    # IPC transaction so a broken Space service can never wedge GUI startup.
+    proc_running "$P_DOCK" || {
+        log "ERROR: Dock must be ready before establishing native macOS desktops."
+        return 1
+    }
     rm -f "$LOGDIR/navigation-spaces.log"
-    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-            ensure-navigation-spaces > "$LOGDIR/navigation-spaces.log" 2>&1; then
+    /var/jb/usr/bin/timeout -k 2 20 \
+        "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+        ensure-navigation-spaces > "$LOGDIR/navigation-spaces.log" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
         log "ERROR: could not establish adjacent native macOS desktops."
+        [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] ||
+            log "ERROR: native desktop IPC exceeded the 20-second startup bound."
         tail -n 20 "$LOGDIR/navigation-spaces.log" 2>/dev/null || true
         return 1
     fi
@@ -752,14 +768,20 @@ recover_ws_dependents() {
         launchctl load "$ICONSERVICESAGENT_PLIST" 2>/dev/null
     [ ! -f "$CSNAMEDDATAD_PLIST" ] || \
         launchctl load "$CSNAMEDDATAD_PLIST" 2>/dev/null
-    # A replacement WindowServer starts with one managed Space. Restore the
-    # same minimum native topology as a cold start before Dock registers its
-    # Mission Control and horizontal fluid-gesture controllers.
-    ensure_navigation_spaces || return 1
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         [ ! -f "$workspace_plist" ] || launchctl load "$workspace_plist" 2>/dev/null
     done
+    # A replacement WindowServer owns a new session/Space catalog. Wait for
+    # Dock's replacement controller before rebuilding the adjacent native
+    # desktop topology; the bounded helper prevents recovery itself wedging.
+    local workspace_waited=0
+    while ! proc_running "$P_DOCK" && [ "$workspace_waited" -lt 15 ]; do
+        sleep 1
+        workspace_waited=$((workspace_waited + 1))
+    done
+    ensure_navigation_spaces || return 1
+    apply_workspace_wallpaper || return 1
     if [ "$WANT_VNC" = 1 ]; then
         launchctl load "$VNC_PLIST" 2>/dev/null
     fi
@@ -926,6 +948,100 @@ run_watchdog() {
     done
 }
 
+# Restore only existing signatures required before autosignd and the macOS
+# session can start. Dopamine's dynamic trustcache is reboot-volatile, while
+# all CodeDirectories below persist on disk. Runtime LLDB on the 2026-08-09
+# cold boot proved that omitting launchservicesd.dylib makes its loader call a
+# NULL dlopen result; WindowServer then blocks in LS setup before publishing
+# the SkyLight session port, leaving Dock and every AppKit client hung in
+# get_session_port. This bounded restore changes no binary or signature.
+BOOT_TRUSTCACHE_INFO=""
+BOOT_TRUSTCACHE_ADDED=0
+
+boot_trust_hash() {
+    local hash="$1"
+    [ -n "$hash" ] || return 0
+    if printf '%s\n' "$BOOT_TRUSTCACHE_INFO" |
+            /var/jb/usr/bin/grep -Fqi "$hash"; then
+        return 0
+    fi
+    /var/jb/usr/bin/jbctl trustcache add "$hash" >/dev/null 2>&1 || return 1
+    BOOT_TRUSTCACHE_INFO="${BOOT_TRUSTCACHE_INFO}
+$hash"
+    BOOT_TRUSTCACHE_ADDED=$((BOOT_TRUSTCACHE_ADDED + 1))
+}
+
+boot_trust_macho() {
+    local path="$1" arch="" hash=""
+    [ -f "$path" ] || return 0
+    for arch in arm64 arm64e; do
+        hash=$(/var/jb/usr/bin/ldid -arch "$arch" -h "$path" 2>/dev/null |
+            /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
+        [ -z "$hash" ] || boot_trust_hash "$hash" || return 1
+    done
+}
+
+restore_cold_boot_trust() {
+    local path="" vscode_bundle="$ROOTFS/Applications/Visual Studio Code.app"
+    BOOT_TRUSTCACHE_INFO=$(/var/jb/usr/bin/jbctl trustcache info 2>/dev/null || true)
+    BOOT_TRUSTCACHE_ADDED=0
+
+    # Exact Ventura 13.4 arm64e shared-cache CodeDirectories. dyld reports
+    # "code signature registration for shared cache failed" without them.
+    boot_trust_hash b5da39409492ac85e5a8e8ab618fe77e2d7a2980 || return 1
+    boot_trust_hash bbb765988e2677b98d47a549d612fa0d4af25f69 || return 1
+
+    for path in \
+        /var/jb/usr/macOS/bin/launchdchrootexec \
+        /var/jb/usr/macOS/lib/libmachook.dylib \
+        /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
+        /var/jb/Applications/MacWSCatalystLauncher.app/MacWSCatalystLauncher \
+        "$ROOTFS/usr/local/lib/libmachook.dylib" \
+        "$ROOTFS/usr/local/lib/libmachook_arm64.dylib" \
+        "$ROOTFS/usr/lib/dyld" \
+        "$ROOTFS/System/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate" \
+        /var/jb/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate \
+        "$ROOTFS/bin/bash" \
+        "$ROOTFS/System/Library/CoreServices/launchservicesd" \
+        "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib" \
+        "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer" \
+        "$ROOTFS/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" \
+        "$ROOTFS/usr/local/libexec/macws-cfprefsd" \
+        "$ROOTFS/usr/libexec/lsd" \
+        "$ROOTFS/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder" \
+        "$ROOTFS/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI" \
+        "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" \
+        "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" \
+        "$ROOTFS/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc/Contents/MacOS/com.apple.hiservices-xpcservice" \
+        "$ROOTFS/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer" \
+        "$ROOTFS/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter" \
+        "$ROOTFS/System/Library/CoreServices/iconservicesd" \
+        "$ROOTFS/System/Library/CoreServices/iconservicesagent" \
+        "$ROOTFS/usr/libexec/pboard" \
+        "$ROOTFS/System/Library/CoreServices/pbs" \
+        "$ROOTFS/System/Applications/System Settings.app/Contents/MacOS/System Settings" \
+        "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" \
+        "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
+        "$ROOTFS/usr/libexec/locationd" \
+        "$ROOTFS/System/Library/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/com.apple.geod.xpc/Contents/MacOS/com.apple.geod" \
+        "$ROOTFS/usr/local/bin/macwsinputd" \
+        "$ROOTFS/usr/local/bin/macwsdisplayd" \
+        "$ROOTFS/usr/local/bin/macwsinteropd" \
+        "$ROOTFS/usr/local/bin/macwsworkspacectl"; do
+        boot_trust_macho "$path" || return 1
+    done
+
+    # Electron's nested executable signatures persist, but dyld validates them
+    # before libmachook/autosignd can service the process. Restore the unchanged
+    # bundle exactly as the former full postinst path did.
+    if [ -d "$vscode_bundle/Contents" ]; then
+        while IFS= read -r -d '' path; do
+            boot_trust_macho "$path" || return 1
+        done < <(find "$vscode_bundle/Contents" -type f -perm -111 -print0 2>/dev/null)
+    fi
+    log "Cold-boot trust closure ready (registered=$BOOT_TRUSTCACHE_ADDED existing CodeDirectories)."
+}
+
 # True if a macOS binary can actually run in the chroot right now.
 chroot_works() {
     case "$(bash "$RUN_BASH" -c 'echo __CHROOT_OK__' 2>/dev/null)" in
@@ -1017,6 +1133,10 @@ ensure_chroot_works() {
     local chroot_ok=0 vscode_ok=0 cfprefs_ok=0
 
     log "Checking the macOS chroot is runnable..."
+    restore_cold_boot_trust || {
+        log "ERROR: reboot-volatile macOS trust closure could not be restored."
+        return 1
+    }
     # A restored/rootfs snapshot can regress only the data-only shader artifact
     # while every executable trust sentinel remains valid. Hash-check the
     # focused provisioner on every cold start; its matching path is one 1-MiB
@@ -2436,15 +2556,22 @@ verify_preferences_persistence() {
 }
 
 apply_workspace_wallpaper() {
+    local rc=0
+
     if [ ! -x "$ROOTFS$WORKSPACECTL_BIN" ]; then
         log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
         return 1
     fi
     rm -f "$LOGDIR/workspace-controller.log"
-    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-            set-wallpaper "$WORKSPACE_WALLPAPER" \
-            > "$LOGDIR/workspace-controller.log" 2>&1; then
+    /var/jb/usr/bin/timeout -k 2 20 \
+        "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+        set-wallpaper "$WORKSPACE_WALLPAPER" \
+        > "$LOGDIR/workspace-controller.log" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
         log "ERROR: the real macOS desktop wallpaper could not be applied."
+        [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] ||
+            log "ERROR: native wallpaper IPC exceeded the 20-second startup bound."
         tail -n 20 "$LOGDIR/workspace-controller.log" 2>/dev/null || true
         return 1
     fi
@@ -2587,8 +2714,34 @@ start_macos() {
     log "Publishing macOS ViewBridge, ExtensionKit and HIServices services..."
     publish_settings_service_contracts || return 1
 
-    log "Loading legacy macOS launchservicesd, input bridge, and WindowServer..."
+    log "Loading legacy macOS launchservicesd..."
     launchctl load "$LAUNCHSERVICESD_PLIST" || return 1
+    # The launchd contract can be registered even when the loader's dylib is
+    # absent from Dopamine's reboot-volatile trustcache. Runtime LLDB on the
+    # 2026-08-09 cold boot showed WindowServer then blocking synchronously in
+    # LSClientToServerConnection before it published the SkyLight session
+    # port. Require the real payload process to survive first; a merely loaded
+    # launchd label is not a readiness witness.
+    waited=0
+    while ! proc_running "$P_LAUNCHSERVICESD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_LAUNCHSERVICESD" || {
+        log "ERROR: legacy macOS launchservicesd did not reach a live process."
+        tail -n 30 "$LOGDIR/launchservicesd.err" 2>/dev/null ||
+            tail -n 30 /var/jb/var/mobile/launchservicesd.err 2>/dev/null || true
+        return 1
+    }
+    sleep 2
+    proc_running "$P_LAUNCHSERVICESD" || {
+        log "ERROR: legacy macOS launchservicesd exited during its readiness window."
+        tail -n 30 /var/jb/var/mobile/launchservicesd.err 2>/dev/null || true
+        return 1
+    }
+    log "Legacy macOS LaunchServices endpoint ready."
+
+    log "Loading input bridge and WindowServer..."
     launchctl load "$INPUT_PLIST" || return 1
     launchctl load "$WINDOWSERVER_PLIST" || return 1
     log "Waiting for WindowServer graphics initialization before GUI clients..."
@@ -2678,13 +2831,6 @@ start_macos() {
     }
     log "Dock menu presentation helper registered for on-demand XPC activation."
 
-    # A stock one-Desktop session has no adjacent Space, so Dock correctly
-    # treats both horizontal fluid gestures as no-ops.  Establish the minimum
-    # real SkyLight topology before Dock registers its native gesture
-    # controllers.  The controller verifies the managed-space catalog and is
-    # idempotent: persisted/user-created desktops are never duplicated.
-    ensure_navigation_spaces || return 1
-
     log "Starting the real macOS Aqua workspace agents (Finder, Dock, SystemUIServer, ControlCenter)..."
     for workspace_log in finder-desktop dock systemuiserver controlcenter; do
         rm -f "$LOGDIR/$workspace_log.log"
@@ -2720,6 +2866,12 @@ start_macos() {
             return 1
         fi
     done
+    # These IPCs used to run before Dock and could wedge indefinitely in
+    # get_session_port. They are now bounded and run only after LaunchServices,
+    # WindowServer, and all real Aqua session owners have explicit readiness
+    # witnesses. Establish two adjacent native Spaces for continuous three-
+    # finger navigation, then apply the persisted high-resolution wallpaper.
+    ensure_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
 
     if [ "$WANT_VNC" = 1 ]; then

@@ -33,6 +33,13 @@ static BOOL LocationControlInFlight;
 static BOOL LocationRetryScheduled;
 static CLLocationManager *LocationKeepaliveManager;
 static id LocationKeepaliveDelegate;
+static id WorkspaceLaunchObserver;
+
+// Ventura's private locationd protocol can return the iOS-compatible
+// authorized-when-in-use value even though the public macOS SDK marks that
+// enum member unavailable.  Keep the wire value explicit instead of asking
+// the compiler to reference an unavailable public symbol.
+static const int kMacWSAuthorizationStatusAuthorizedWhenInUse = 4;
 
 static void InteropLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
@@ -113,11 +120,16 @@ static void PublishLocationProviderReadiness(void) {
                     forBundleID:(NSString *)bundleID
                    orBundlePath:(NSString *)bundlePath
                      replyBlock:(void (^)(NSError *error))reply;
+- (void)getAuthorizationStatusForBundleID:(NSString *)bundleID
+                             orBundlePath:(NSString *)bundlePath
+                               replyBlock:(void (^)(NSError *error,
+                                                     int status))reply;
 @end
 
 static void SubmitVenturaLocation(CLLocation *location);
 static void ScheduleLocationRetry(void);
 static void EnsureVenturaLocationClient(void);
+static void ScheduleMapsLaunchAuthorizationRefresh(pid_t pid);
 
 static void InteropLog(NSString *format, ...) {
     va_list args;
@@ -220,6 +232,10 @@ static void ResetLocationControl(void) {
     LocationControlInFlight = NO;
 }
 
+static BOOL LocationControlConnectionIsCurrent(NSXPCConnection *connection) {
+    return connection && LocationControlConnection == connection;
+}
+
 static void PrepareVenturaLocationControl(void) {
     if (LocationControlReady || LocationControlInFlight) return;
     LocationControlInFlight = YES;
@@ -229,8 +245,12 @@ static void PrepareVenturaLocationControl(void) {
                         options:0];
     connection.remoteObjectInterface = [NSXPCInterface
         interfaceWithProtocol:@protocol(MacWSLocationInternalServiceProtocol)];
+    __weak NSXPCConnection *weakConnection = connection;
     connection.interruptionHandler = ^{
         dispatch_async(InteropQueue, ^{
+            NSXPCConnection *interruptedConnection = weakConnection;
+            if (!LocationControlConnectionIsCurrent(interruptedConnection))
+                return;
             InteropLog(@"Ventura location control service interrupted");
             ResetLocationControl();
             ScheduleLocationRetry();
@@ -238,6 +258,9 @@ static void PrepareVenturaLocationControl(void) {
     };
     connection.invalidationHandler = ^{
         dispatch_async(InteropQueue, ^{
+            NSXPCConnection *invalidatedConnection = weakConnection;
+            if (!LocationControlConnectionIsCurrent(invalidatedConnection))
+                return;
             InteropLog(@"Ventura location control service invalidated");
             ResetLocationControl();
             ScheduleLocationRetry();
@@ -248,6 +271,9 @@ static void PrepareVenturaLocationControl(void) {
     LocationControlProxy = [connection remoteObjectProxyWithErrorHandler:
         ^(NSError *error) {
             dispatch_async(InteropQueue, ^{
+                NSXPCConnection *failedConnection = weakConnection;
+                if (!LocationControlConnectionIsCurrent(failedConnection))
+                    return;
                 InteropLog(@"Ventura location control request failed: %@",
                            error);
                 ResetLocationControl();
@@ -258,37 +284,137 @@ static void PrepareVenturaLocationControl(void) {
     [control setLocationServicesEnabled:YES replyBlock:^(NSError *error) {
         if (error) {
             dispatch_async(InteropQueue, ^{
+                NSXPCConnection *failedConnection = weakConnection;
+                if (!LocationControlConnectionIsCurrent(failedConnection))
+                    return;
                 InteropLog(@"Ventura location enable failed: %@", error);
                 ResetLocationControl();
                 ScheduleLocationRetry();
             });
             return;
         }
-        id<MacWSLocationInternalServiceProtocol> authorizationControl =
-            LocationControlProxy;
-        [authorizationControl setAuthorizationStatus:YES
-            withCorrectiveCompensation:0
-                            forBundleID:@"com.apple.Maps"
-                           orBundlePath:nil
-                             replyBlock:^(NSError *authorizationError) {
-            if (authorizationError) {
-                dispatch_async(InteropQueue, ^{
-                    InteropLog(@"Ventura Maps authorization failed: %@",
-                               authorizationError);
-                    ResetLocationControl();
-                    ScheduleLocationRetry();
-                });
+        dispatch_async(InteropQueue, ^{
+            NSXPCConnection *enabledConnection = weakConnection;
+            if (!LocationControlConnectionIsCurrent(enabledConnection))
                 return;
-            }
-            dispatch_async(InteropQueue, ^{
-                LocationControlReady = YES;
-                LocationControlInFlight = NO;
-                InteropLog(@"Ventura location services and Maps authorization ready");
-                if (LastNativeLocation)
-                    SubmitVenturaLocation(LastNativeLocation);
-            });
-        }];
+            id<MacWSLocationInternalServiceProtocol> authorizationControl =
+                LocationControlProxy;
+            [authorizationControl setAuthorizationStatus:YES
+                withCorrectiveCompensation:0
+                                forBundleID:@"com.apple.Maps"
+                               orBundlePath:nil
+                                 replyBlock:^(NSError *authorizationError) {
+                if (authorizationError) {
+                    dispatch_async(InteropQueue, ^{
+                        NSXPCConnection *failedConnection = weakConnection;
+                        if (!LocationControlConnectionIsCurrent(
+                                failedConnection))
+                            return;
+                        InteropLog(@"Ventura Maps authorization failed: %@",
+                                   authorizationError);
+                        ResetLocationControl();
+                        ScheduleLocationRetry();
+                    });
+                    return;
+                }
+                dispatch_async(InteropQueue, ^{
+                    NSXPCConnection *authorizedConnection = weakConnection;
+                    if (!LocationControlConnectionIsCurrent(
+                            authorizedConnection))
+                        return;
+                    id<MacWSLocationInternalServiceProtocol> readbackControl =
+                        LocationControlProxy;
+                    [readbackControl
+                        getAuthorizationStatusForBundleID:@"com.apple.Maps"
+                        orBundlePath:nil
+                        replyBlock:^(NSError *readbackError, int status) {
+                        dispatch_async(InteropQueue, ^{
+                            NSXPCConnection *readbackConnection =
+                                weakConnection;
+                            if (!LocationControlConnectionIsCurrent(
+                                    readbackConnection))
+                                return;
+                            BOOL authorized = status ==
+                                    kCLAuthorizationStatusAuthorizedAlways ||
+                                status ==
+                                    kMacWSAuthorizationStatusAuthorizedWhenInUse;
+                            if (readbackError || !authorized) {
+                                InteropLog(@"Ventura Maps authorization "
+                                           "readback failed status=%d "
+                                           "error=%@",
+                                           status,
+                                           readbackError ?: @"(nil)");
+                                ResetLocationControl();
+                                ScheduleLocationRetry();
+                                return;
+                            }
+                            LocationControlReady = YES;
+                            LocationControlInFlight = NO;
+                            InteropLog(@"Ventura location services and Maps "
+                                       "authorization verified status=%d",
+                                       status);
+                            if (LastNativeLocation)
+                                SubmitVenturaLocation(LastNativeLocation);
+                        });
+                    }];
+                });
+            }];
+        });
     }];
+}
+
+static void RefreshVenturaMapsAuthorizationForLaunch(pid_t pid) {
+    NSRunningApplication *application =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+    if (![application.bundleIdentifier isEqualToString:@"com.apple.Maps"])
+        return;
+
+    // Runtime-confirmed on 2026-08-09: locationd's private authorization
+    // getter persisted status 3 across a Maps relaunch, but the new Maps PID
+    // still logged "Showing Location Services Authorization Prompt with no
+    // handler" and locationd did not send fixes to that client. Replaying the
+    // stock setter while that exact Maps process existed immediately caused
+    // stock locationd to send repeated WGS84 fixes to com.apple.Maps. Bind the
+    // control transaction to the application generation instead of treating
+    // a pre-launch persisted value as client readiness.
+    InteropLog(@"refreshing Maps authorization for application pid=%d", pid);
+    NSXPCConnection *oldConnection = LocationControlConnection;
+    ResetLocationControl();
+    [oldConnection invalidate];
+    PrepareVenturaLocationControl();
+}
+
+static void ScheduleMapsLaunchAuthorizationRefresh(pid_t pid) {
+    if (pid <= 0) return;
+    // NSWorkspace publishes after exec, but Maps still has to initialize its
+    // AppKit/CoreLocation identity. This one bounded delay avoids racing that
+    // setup without polling a process or authorization value indefinitely.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                   InteropQueue, ^{
+        RefreshVenturaMapsAuthorizationForLaunch(pid);
+    });
+}
+
+static void ObserveMapsApplicationGenerations(void) {
+    NSNotificationCenter *center = NSWorkspace.sharedWorkspace.notificationCenter;
+    WorkspaceLaunchObserver = [center
+        addObserverForName:NSWorkspaceDidLaunchApplicationNotification
+                    object:nil
+                     queue:NSOperationQueue.mainQueue
+                usingBlock:^(NSNotification *notification) {
+        NSRunningApplication *application =
+            notification.userInfo[NSWorkspaceApplicationKey];
+        if ([application.bundleIdentifier isEqualToString:@"com.apple.Maps"])
+            ScheduleMapsLaunchAuthorizationRefresh(application.processIdentifier);
+    }];
+
+    // Also close the daemon-replacement case: package upgrades may restart
+    // interop while an existing Maps generation remains alive.
+    for (NSRunningApplication *application in
+            [NSRunningApplication
+                runningApplicationsWithBundleIdentifier:@"com.apple.Maps"]) {
+        ScheduleMapsLaunchAuthorizationRefresh(application.processIdentifier);
+    }
 }
 
 static double MacWSGetXPCDouble(xpc_object_t dictionary, const char *key) {
@@ -744,6 +870,7 @@ int main(void) {
         // main thread has exited", followed by the client aborting. Keep the
         // real main thread and its CFRunLoop alive instead.
         EnsureVenturaLocationClient();
+        ObserveMapsApplicationGenerations();
         InteropLog(@"READY service=%s protocol=%u origin=%llu",
             MACWS_INTEROP_SERVICE, MACWS_INTEROP_VERSION,
             (unsigned long long)DaemonOriginID);

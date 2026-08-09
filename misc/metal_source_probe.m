@@ -247,7 +247,9 @@ int main(void) {
                     @"std_vert1_lph", @"inplace_copy_lph",
                     @"downsample_blur_vert_lph",
                     @"downsample_8_frag_lph",
-                    @"single_pass_blur_3_lph" ]) {
+                    @"downsample_4_frag_lph",
+                    @"single_pass_blur_3_lph",
+                    @"tile_downsample_4" ]) {
                 if ([functionNames containsObject:extraName]) {
                     DumpFunctionSpecializationRequirement(
                         [library newFunctionWithName:extraName]);

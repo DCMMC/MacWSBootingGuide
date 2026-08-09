@@ -10805,12 +10805,16 @@ static void macws_install_data_library_compatibility(Class agx) {
 // inplace_copy_lph. The fluid transition's blurred-overview variant also
 // specializes downsample_blur_vert_lph + downsample_8_frag_lph; the original
 // functions reached AGXMetal13_3 code=3 even after the copy pass succeeded.
-// Creating a Desktop from the expanded Spaces strip reaches one additional
-// real CoreAnimation pair: downsample_blur_vert_lph +
-// single_pass_blur_3_lph. The unadapted fragment produced the same exact
-// code=3 before WindowServer exited with OS_REASON_COREANIMATION.
+// Mission Control's initial overview shadow reaches downsample_blur_vert_lph
+// + downsample_4_frag_lph, while creating a Desktop from the expanded Spaces
+// strip reaches downsample_blur_vert_lph + single_pass_blur_3_lph. Opening
+// Maps' route chrome then reached the separate tile_downsample_4 AIR module;
+// crash report 944AFB88-2054-46E9-8506-8F102F2388AD records the exact
+// COREANIMATION payload `tile_pipeline=...tile_downsample_4` and AGX's
+// `Target OS is incompatible` result. Each unadapted function therefore
+// failed at the real compiler target boundary before WindowServer exited.
 // The package generates a byte-validated secondary library from the device's
-// own Ventura default.metallib: only these ten
+// own Ventura default.metallib: only these twelve
 // runtime-confirmed AIR modules receive a macabi target triple; all other
 // module bytes and every public function signature remain unchanged.
 //
@@ -10853,9 +10857,12 @@ static macws_function_specialize_async_fn
 static const char *kMacWSQCDesktopLibraryPath =
     "/usr/local/share/macws/quartzcore/"
     "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1047456;
+static const size_t kMacWSQCDesktopLibraryBytes = 1048304;
 static const uint64_t kMacWSQCDesktopLibraryHash =
-    UINT64_C(0xcd2dd4b299540c07);
+    // macws_source_fnv1a64 intentionally retains this project's historical
+    // non-standard offset basis. Runtime validation of the exact SHA-256
+    // 909a864e...f4a9 artifact produces this value.
+    UINT64_C(0x2939b64a5ca3cd91);
 static const char *kMacWSSkyLightDesktopLibraryPath =
     "/usr/local/share/macws/skylight/"
     "SkyLightShaders-desktop-effects-macabi.metallib";
@@ -10879,7 +10886,9 @@ static BOOL macws_qc_desktop_function_name(NSString *name) {
            [name isEqualToString:@"inplace_copy_lph"] ||
            [name isEqualToString:@"downsample_blur_vert_lph"] ||
            [name isEqualToString:@"downsample_8_frag_lph"] ||
-           [name isEqualToString:@"single_pass_blur_3_lph"];
+           [name isEqualToString:@"downsample_4_frag_lph"] ||
+           [name isEqualToString:@"single_pass_blur_3_lph"] ||
+           [name isEqualToString:@"tile_downsample_4"];
 }
 
 static BOOL macws_qc_desktop_base_function_name(NSString *name) {
@@ -10890,7 +10899,8 @@ static BOOL macws_qc_desktop_base_function_name(NSString *name) {
     return [name isEqualToString:@"path_blit_vert_lph"] ||
            [name isEqualToString:@"attachment_clear_frag_lph"] ||
            [name isEqualToString:@"std_vert1_lph"] ||
-           [name isEqualToString:@"inplace_copy_lph"];
+           [name isEqualToString:@"inplace_copy_lph"] ||
+           [name isEqualToString:@"tile_downsample_4"];
 }
 
 static BOOL macws_skylight_desktop_function_name(NSString *name) {

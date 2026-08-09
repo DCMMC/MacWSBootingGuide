@@ -15,14 +15,10 @@
     </dict>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>CA_VSYNC_OFF</key>
-        <string>1</string>
-        <key>MACWS_AGX_NATIVE</key>
-        <string>1</string>
-        <key>MACWS_AGX_REGISTER_CLASSES</key>
-        <string>1</string>
-        <key>MACWS_PIN_FALLBACK</key>
-        <string>1</string>
+        <!-- HIServices owns application/input metadata only.  Giving this
+             6-MB iOS launchd daemon the renderer's AGX environment makes
+             libmachook eagerly load IOGPU/AGXMetal, so launchd kills it
+             before it can reply to synchronous HIToolbox requests. -->
         <key>XPC_SERVICE_NAME</key>
         <string>com.macwsguide.hiservices</string>
     </dict>

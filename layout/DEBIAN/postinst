@@ -458,6 +458,11 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" || exit 1
+    # The project launchservicesd executable is a thin loader. Its already-
+    # signed Ventura payload is dlopen'd before autosignd can run, so restore
+    # that dylib's reboot-volatile CDHash as part of the same package closure.
+    trust_installed_macho \
+        "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib"
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad" || exit 1
     ensure_chroot_extensionkit_signature \

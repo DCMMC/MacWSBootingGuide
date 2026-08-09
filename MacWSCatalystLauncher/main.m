@@ -20,6 +20,9 @@ static const char *const kLocationProviderMarker =
 static const char *const kLocationProviderExecutable =
     "/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/"
     "macwsinteropd";
+static const char *const kLocationProviderHostExecutable =
+    "/private/var/mnt/rootfs/usr/local/libexec/"
+    "MacWSInteropService.app/Contents/MacOS/macwsinteropd";
 static pid_t gMapsPID = -1;
 static bool gMapsLaunchPending = false;
 
@@ -52,7 +55,14 @@ static bool macws_live_location_provider_ready(void) {
     if (kill((pid_t)candidate, 0) != 0 && errno != EPERM) return false;
     char path[MACWS_PROC_PIDPATH_MAX] = {0};
     if (proc_pidpath(candidate, path, sizeof(path)) <= 0) return false;
-    return strcmp(path, kLocationProviderExecutable) == 0;
+    // Runtime-confirmed after the 2026-08-09 device cold boot: proc_pidpath
+    // runs in the launcher's iOS mount namespace and returns the canonical
+    // host path `/private/var/mnt/rootfs/...`, while the same executable sees
+    // `/usr/local/...` inside its chroot. Accept only those two exact aliases
+    // of the packaged interop image; a suffix or PID-only match would let an
+    // unrelated process satisfy Maps' real-provider readiness invariant.
+    return strcmp(path, kLocationProviderExecutable) == 0 ||
+        strcmp(path, kLocationProviderHostExecutable) == 0;
 }
 
 static bool macws_wait_for_location_provider(void) {

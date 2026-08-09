@@ -2440,23 +2440,34 @@ the bottom boundary and returned to the native 24-point menubar constraint.
 Screenshots, exact logs, package hash, thermal result and validation are in
 [`maps-wallpaper-dock-edge-20260809/`](evidence/maps-wallpaper-dock-edge-20260809/README.md).
 
-## 2026-08-09: cold Maps capability and native Desktop creation reach their real boundaries
+## 2026-08-09: cold trust, Maps authorization, and native blur converge
 
-Maps' cold-only location loss was traced to launch ordering, not to the
-already-working scalar bridge: Maps queried and cached
-`+[CLLocationManager locationServicesCapable]` before the first real Ventura
-provider callback. `macwsinteropd` now publishes a process-bound readiness
-witness only from `didUpdateLocations:`; the Maps-only adapter and Catalyst
-launcher both validate its live PID and exact executable. Teardown removes the
-witness and the old Maps carrier, while `CFFIXED_USER_HOME` points Maps at its
-real persistent Ventura container.
+The remaining cold Maps failures were three independent service invariants.
+The Catalyst launcher now recognizes only the two exact mount-namespace paths
+of the live interop readiness PID. A 783-sample Maps main-thread trace then
+placed the apparent input freeze in a synchronous HIToolbox request to the
+missing stock HIServices XPC target; its exact existing CodeDirectory is now
+part of the reboot-volatile trust closure. Finally, a successful private
+authorization setter reply was disproven as readiness by an immediate stock
+query returning status `0`. Production now reads the authorization back and
+accepts only status `3/4`, with XPC-generation-safe retries. Ventura locationd
+delivered repeated WGS84 fixes to `com.apple.Maps`, and the stock blue marker
+was visible over populated map tiles. A subsequent relaunch also disproved a
+persisted status `3` as sufficient for a new Maps client generation. The
+bridge now observes the real NSWorkspace application launch, waits a bounded
+two seconds, and repeats the stock set/readback transaction for the live Maps
+PID. The accepted package launched PID 20475, logged the generation refresh
+and verified status `3`, then displayed the blue marker without any manual
+diagnostic helper call.
 
-The native Mission Control `+` crash was independently reproduced through
-Dock's real continuous gesture and global pointer route. The last pipeline was
-`Pw40aXm_Tsb3A2Xhf_Isrc`, pairing `downsample_blur_vert_lph` with
-`single_pass_blur_3_lph`; AGX returned code 3, `Target OS is incompatible`, and
-WindowServer exited with `OS_REASON_COREANIMATION`. The tenth exact QuartzCore
-module now joins the secondary macabi library. No gesture, CGS Space, compiler
-result, or pipeline validator is bypassed. The root-cause evidence and artifact
-fingerprints are recorded in
+Two separate native blur paths completed the QuartzCore boundary. Mission
+Control required `single_pass_blur_3_lph`; Maps route chrome then produced an
+exact `OS_REASON_COREANIMATION` report naming the distinct tile AIR module
+`tile_downsample_4`. The deterministic secondary macabi library now holds
+twelve narrowly selected functions. The system library remains the default,
+and no AGX compiler result, pipeline validator, CGS Space mutation, or
+CoreAnimation abort is bypassed. Space/wallpaper IPC also moved behind a live
+Dock and gained hard startup bounds, eliminating an indefinite cold repair
+wait. Root-cause artifacts, accepted screenshots, and the exact library hash
+are recorded in
 [`maps-cold-location-and-space-create-20260809.md`](maps-cold-location-and-space-create-20260809.md).
