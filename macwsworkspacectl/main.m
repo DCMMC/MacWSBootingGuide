@@ -639,21 +639,27 @@ static int ActivateProcess(const char *pidBytes) {
     pid_t pid = (pid_t)parsed;
     NSRunningApplication *application =
         [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
-    if (application && [application activateWithOptions:
-            (NSApplicationActivateAllWindows |
-             NSApplicationActivateIgnoringOtherApps)]) {
-        fprintf(stdout, "application-active pid=%d route=NSRunningApplication\n",
-                pid);
-        return 0;
-    }
+    BOOL workspaceActivated = application && [application activateWithOptions:
+        (NSApplicationActivateAllWindows |
+         NSApplicationActivateIgnoringOtherApps)];
 
     // Direct chroot launch targets can own valid SkyLight windows without an
-    // LS process record. HIServices resolves that existing process by PID and
-    // performs the normal front-window transaction; it does not synthesize a
-    // window or create a second application instance.
+    // LS process record.  Even when NSRunningApplication reports success, the
+    // chroot can miss the Workspace callback that performs SkyLight's actual
+    // front/key-window transaction.  Runtime evidence on 2026-08-11 showed
+    // activateWithOptions: returning YES for Word while Finder remained the
+    // visible menu owner and every traffic light stayed inactive.  Therefore
+    // always complete the public HIServices transaction as well; neither call
+    // synthesizes a window or mutates AppKit state directly.
     ProcessSerialNumber process = {0, 0};
     OSStatus lookup = GetProcessForPID(pid, &process);
     if (lookup != noErr) {
+        if (workspaceActivated) {
+            fprintf(stdout,
+                    "application-active pid=%d route=NSRunningApplication "
+                    "hiservices-lookup=%d\n", pid, (int)lookup);
+            return 0;
+        }
         fprintf(stderr,
                 "macwsworkspacectl: GetProcessForPID(%d) failed: %d\n",
                 pid, (int)lookup);
@@ -663,12 +669,20 @@ static int ActivateProcess(const char *pidBytes) {
         &process, kSetFrontProcessFrontWindowOnly |
                   kSetFrontProcessCausedByUser);
     if (activated != noErr) {
+        if (workspaceActivated) {
+            fprintf(stdout,
+                    "application-active pid=%d route=NSRunningApplication "
+                    "hiservices-set-front=%d\n", pid, (int)activated);
+            return 0;
+        }
         fprintf(stderr,
                 "macwsworkspacectl: SetFrontProcessWithOptions(%d) "
                 "failed: %d\n", pid, (int)activated);
         return 1;
     }
-    fprintf(stdout, "application-active pid=%d route=HIServices\n", pid);
+    fprintf(stdout,
+            "application-active pid=%d route=%s+HIServices\n", pid,
+            workspaceActivated ? "NSRunningApplication" : "direct");
     return 0;
 }
 

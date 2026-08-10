@@ -38,6 +38,14 @@ typedef int32_t CGWindowLevelKey;
 typedef const void *CGEventRef;
 typedef uint32_t SLSConnectionID;
 
+// Carbon Process Manager's public ABI.  Keep the declarations local so this
+// small broker does not have to import the legacy ApplicationServices headers
+// alongside CoreGraphics' modern definitions.
+typedef struct {
+    uint32_t highLongOfPSN;
+    uint32_t lowLongOfPSN;
+} MacWSProcessSerialNumber;
+
 extern CGDirectDisplayID CGMainDisplayID(void);
 extern CGRect CGDisplayBounds(CGDirectDisplayID display);
 extern size_t CGDisplayPixelsWide(CGDirectDisplayID display);
@@ -321,6 +329,9 @@ typedef CFDictionaryRef
         SLSConnectionID connection, CGPoint location);
 typedef int32_t (*MacWSSLSConnectionGetPIDFn)(SLSConnectionID connection,
                                               pid_t *pid);
+typedef int32_t (*MacWSGetFrontProcessFn)(MacWSProcessSerialNumber *process);
+typedef int32_t (*MacWSGetProcessPIDFn)(const MacWSProcessSerialNumber *process,
+                                       pid_t *pid);
 
 typedef struct {
     bool attempted;
@@ -347,6 +358,48 @@ static MacWSSkyLightRoutingAPI SkyLightRoutingAPI(void) {
     api.connectionGetPID = (MacWSSLSConnectionGetPIDFn)dlsym(
         api.image, "SLSConnectionGetPID");
     return api;
+}
+
+// Read the session's real front-process owner without asking every AppKit
+// application's main thread.  GetFrontProcess/GetProcessPID are the same
+// public HIServices transaction used by macwsworkspacectl's activation path.
+// They remain responsive while an application is inside a synchronous menu
+// or control tracker, which is precisely when a per-application target probe
+// cannot drain.  Resolve dynamically so another macOS image can retain the
+// existing AppInput fallback if the compatibility framework is unavailable.
+static pid_t FrontUIProcessPID(void) {
+    static bool attempted;
+    static void *applicationServices;
+    static MacWSGetFrontProcessFn getFrontProcess;
+    static MacWSGetProcessPIDFn getProcessPID;
+    if (!attempted) {
+        attempted = true;
+        getFrontProcess = (MacWSGetFrontProcessFn)dlsym(
+            RTLD_DEFAULT, "GetFrontProcess");
+        getProcessPID = (MacWSGetProcessPIDFn)dlsym(
+            RTLD_DEFAULT, "GetProcessPID");
+        if (!getFrontProcess || !getProcessPID) {
+            applicationServices = dlopen(
+                "/System/Library/Frameworks/ApplicationServices.framework/"
+                "ApplicationServices",
+                RTLD_LAZY | RTLD_LOCAL);
+            if (applicationServices) {
+                getFrontProcess = (MacWSGetFrontProcessFn)dlsym(
+                    applicationServices, "GetFrontProcess");
+                getProcessPID = (MacWSGetProcessPIDFn)dlsym(
+                    applicationServices, "GetProcessPID");
+            }
+        }
+    }
+    if (!getFrontProcess || !getProcessPID) return 0;
+
+    MacWSProcessSerialNumber process = {0};
+    pid_t pid = 0;
+    if (getFrontProcess(&process) != 0 ||
+        getProcessPID(&process, &pid) != 0 || pid <= 1) {
+        return 0;
+    }
+    return pid;
 }
 
 // RE-confirmed against macOS 13.4 SkyLight:
@@ -984,13 +1037,11 @@ static MacWSWindowTarget ProbeAppInputTarget(
     return target;
 }
 
-// A native OSXvnc button-down is delivered before this control record.  The
-// target AppKit main thread can therefore be inside its synchronous mouseDown
-// dispatch while the first target probe is drained.  Runtime evidence from a
-// Terminal-over-GlassDemo switch showed nonce 7 receiving only Terminal with
-// no authoritative hit, followed immediately by nonce 8 receiving both live
-// endpoints and the correct Terminal hit.  Retry only the button-triggered
-// activation query; periodic hover probes must never activate an application.
+// Compatibility fallback for systems where SkyLight's routing-record API is
+// unavailable.  A target probe runs on every application's main thread, so it
+// must not be the primary click path: an application doing synchronous layout,
+// menu tracking, or first-run work cannot reply inside the bounded deadline.
+// Retry only this fallback; periodic hover probes must never activate an app.
 static MacWSWindowTarget ProbeActivationTarget(
         int targetSocketFD, const MacWSInputRecord *record) {
     MacWSWindowTarget first = ProbeAppInputTarget(targetSocketFD, record);
@@ -1248,7 +1299,16 @@ int main(void) {
 
         CGPoint point = QuartzPointForRecord(&record, bounds);
         if (record.kind == MacWSInputKindTargetProbe) {
-            hoverTarget = ProbeAppInputTarget(targetSocketFD, &record);
+            // WindowServer already owns the authoritative routing chain.  A
+            // broadcast probe made every ordinary RFB click wait as long as
+            // 150 ms for unrelated applications whose main thread was busy,
+            // and an unanswered covered application could erase an otherwise
+            // exact visible hit.  Use the same SLS route as ActivateTarget;
+            // retain the old main-thread query only for an unavailable API.
+            hoverTarget = WindowTargetAtPoint(point);
+            if (hoverTarget.pid <= 1) {
+                hoverTarget = ProbeAppInputTarget(targetSocketFD, &record);
+            }
             sequence++;
             if (RuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
@@ -1441,10 +1501,48 @@ int main(void) {
             hoverTarget.pid > 1) {
             eventTarget = hoverTarget;
         } else if (record.kind == MacWSInputKindActivateTarget) {
-            // Window content requires an authoritative hit.  The target probe
-            // itself recognizes the system menu-bar surface, which has no
-            // ordinary NSWindow, and may select its unique active owner.
-            eventTarget = ProbeActivationTarget(targetSocketFD, &record);
+            // Resolve real pointer ownership in WindowServer before asking
+            // application main threads.  RE-confirmed against Ventura 13.4:
+            // SLSCopyWindowRoutingRecordsForScreenLocation returns the
+            // server's routing chain and SLSConnectionGetPID resolves its
+            // deepest destination.  Runtime evidence on 2026-08-11 showed a
+            // Terminal title-bar click returning only 3/9 AppInput probe
+            // replies (none from Terminal, Finder, or Word), which produced
+            // target=0 and made native-all discard activation even though the
+            // same SkyLight API continued resolving the visible windows.
+            // Main-thread probing is therefore only a compatibility fallback
+            // when WindowServer has no route (for example an OS-version API
+            // mismatch), never the ordinary activation dependency.
+            eventTarget = WindowTargetAtPoint(point);
+            if (eventTarget.pid > 1) {
+                // WindowTargetAtPoint intentionally returns only routing
+                // identity.  Leaving the four activation-state fields zero
+                // made every click look like an inactive target: inputd then
+                // deactivated every other endpoint and queued another AppKit
+                // activation before OSXvnc's real native down.  Read the
+                // session's upstream front owner instead.  A matching owner
+                // is already ready; a different owner needs exactly one real
+                // activation transaction.  No application main thread is on
+                // this ordinary path.
+                pid_t frontPID = FrontUIProcessPID();
+                eventTarget.selectedWasActive =
+                    frontPID == eventTarget.pid;
+                eventTarget.selectedWasFrontUIProcess =
+                    frontPID == eventTarget.pid;
+                eventTarget.competingActiveOwner = false;
+                eventTarget.responseIncomplete = frontPID <= 1;
+                if (RuntimeDiagnosticsEnabled()) {
+                    fprintf(stderr,
+                            "MACWS-INPUT FRONT-OWNER routed=%d front=%d "
+                            "ready=%s\n",
+                            eventTarget.pid, frontPID,
+                            frontPID == eventTarget.pid ? "YES" : "NO");
+                    fflush(stderr);
+                }
+            } else {
+                eventTarget = ProbeActivationTarget(
+                    targetSocketFD, &record);
+            }
         } else if (record.kind != MacWSInputKindHover &&
             record.kind != MacWSInputKindMenuHover &&
             record.kind != MacWSInputKindTap && gestureTarget.pid > 1) {

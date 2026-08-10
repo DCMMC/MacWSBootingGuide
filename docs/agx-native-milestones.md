@@ -2492,3 +2492,24 @@ two real Spaces, stable service PIDs, no new WindowServer crash, and nominal
 thermal state were verified after installing the full production package.
 Exact logs, screenshots, artifact hashes, and rejected cache experiment are in
 [`mission-control-dock-production-20260809/`](evidence/mission-control-dock-production-20260809/README.md).
+
+## 2026-08-11: WindowServer becomes the authoritative click router
+
+Gray traffic lights and selectively dead controls were traced to two upstream
+invariants rather than Dock/Finder overlays. The real Ventura ViewBridge target
+was absent from the reboot-volatile trust closure, leaving launchd in an
+`OS_REASON_EXEC` spawn loop while application main threads waited on ViewBridge.
+Trusting its existing CodeDirectory made the stock service run; the cold closure
+now also includes the real UIKitSystem, OpenAndSavePanel and ExtensionKit
+targets.
+
+Separately, SkyLight routing returned the correct PID/window but inputd left its
+activation-state fields false. Every click therefore deactivated all other
+applications, then waited on a broadcast to unrelated AppKit main threads.
+Inputd now joins the authoritative SkyLight hit with the public HIServices front
+process owner. Repeated front-app clicks log `repair=NO`, `deactivated=0`, and
+skip redundant activation. The full left/right/drag/scroll/keyboard InputLab
+matrix passed with 4.668 ms median AppKit delivery latency, and real System
+Settings, Dock and Terminal menubar clicks were verified before returning to
+production mode. Evidence and rejected attribution are recorded in
+[`input-front-owner-viewbridge-20260811.md`](input-front-owner-viewbridge-20260811.md).
