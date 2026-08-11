@@ -2558,7 +2558,7 @@ QuartzCore RenderServer HUD plus a per-Scene fixed-ring profiler spanning
 DisplayStream capture, IOSurface receipt, Host Metal submission/GPU completion,
 actual `CAMetalDrawable` presentation, and Host-input-to-visible latency. The
 Control Center exposes compact/full HUD, reset, JSON export and a bounded
-ten-scenario gesture suite; `misc/macws_ui_profile.py` runs the granular fixed-
+thirteen-scenario gesture suite; `misc/macws_ui_profile.py` runs the granular fixed-
 floor release gate without requiring a MacBook calibration run.
 
 The first nominal-thermal run honestly failed visible fluidity while passing
@@ -2568,3 +2568,34 @@ p95 was 37.52–41.68 ms and 1% low was 23.99 FPS. Vertical Dock gestures reache
 69.57–71.49 average FPS but retained 75–104 ms p99 outliers; horizontal Dock
 gestures were only 32.71–33.75 average FPS with 74–83 ms input-to-visible p95.
 See [the complete profiler architecture and evidence](ui-performance-profiler-20260811.md).
+
+## 2026-08-12: thirteen-gesture gate separates input from presentation
+
+The regression suite now covers hover, long-press drag and momentum scrolling
+in addition to the previous ten scenarios. A complete nominal-thermal run kept
+every service PID stable and delivered 59.78 of 60 requested moves/s at
+3.165 ms p95 plus 113.56 of 120 requested moves/s at 2.770 ms p95. Ordinary
+AppKit content nevertheless remained at 49.72–52.34 FPS, while vertical Dock
+composition reached 86.58–88.96 final-presented FPS. This independently rules
+the AF_UNIX input bridge out as the principal current cadence bottleneck.
+
+The same run exposed a cold dependency: Dock launched before the final
+two-Space topology accepted vertical gestures but produced zero horizontal
+animation frames. Reloading only Dock restored 48 live geometry updates and
+38.96 final-presented FPS. Startup and WindowServer recovery now rebind Dock
+after `ensure-navigation-spaces`. The exact target SkyLight transaction-setter
+ABI was also captured and disassembled, but no speculative private-ABI hook is
+shipped. Full runtime and RE evidence is in
+[the 2026-08-12 regression record](ui-performance-regression-20260812.md).
+
+A controlled A/B then reduced the active completion interval from 13,000 us
+to 8,333 us while preserving the 100,000 us idle path and 60 Hz exact-window
+capture bound. Two focused repeats and one complete thirteen-gesture run at
+29.19–29.59 °C reproduced the gain. Ordinary presentation reached
+54.14–55.55 FPS, vertical Dock presentation reached 96.52–99.09 FPS, and
+horizontal Space presentation reached 56.85–63.98 FPS. The complete run kept
+all six service PIDs stable, passed semantic and 60/120 Hz input delivery,
+reported zero Metal command errors, and left the fixed release gate unchanged.
+Residual failures are now isolated to visible tails: sub-45-FPS ordinary 1%
+lows, 108–125 ms horizontal p99 gaps, and 65.94 ms right-Space
+input-to-visible p95.

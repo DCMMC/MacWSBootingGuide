@@ -19,14 +19,9 @@
     <true/>
     <key>KeepAlive</key>
     <false/>
-    <!-- InputLab is an opt-in test process, not part of the production GUI
-         stack.  Keep bridge diagnostics scoped here so production
-         WindowServer/VNC/app processes retain their zero-debug defaults. -->
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>MACWS_RUNTIME_DIAGNOSTICS</key>
-        <string>1</string>
-    </dict>
+    <!-- Performance regression is zero-debug by default. Set the narrow
+         MACWS_INPUTLAB_DIAGNOSTICS variable in a temporary test job only when
+         collecting private AppKit boundary evidence. -->
     <key>StandardOutPath</key>
     <string>/var/jb/var/mobile/macws_inputlab.log</string>
     <key>StandardErrorPath</key>

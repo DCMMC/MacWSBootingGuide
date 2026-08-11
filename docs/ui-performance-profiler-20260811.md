@@ -136,8 +136,11 @@ The suite covers:
 - primary tap;
 - double tap;
 - secondary tap;
+- pointer hover without a click;
 - 120 Hz primary-button drag;
+- long-press followed by a primary-button drag;
 - 120 Hz phased scroll;
+- phased scroll with a native momentum tail;
 - 120 Hz phased magnify;
 - 120 Hz native Dock vertical up/down gestures;
 - 120 Hz native Dock horizontal left/right gestures.
@@ -173,33 +176,62 @@ input-to-visible p95 ≤ 50 ms, input bridge p95 ≤ 8 ms, zero Metal command
 errors, ≥45 delivered moves/s for a 60 Hz stream, and ≥60 delivered moves/s
 for a 120 Hz stress stream.
 
-## First runtime result
+## 2026-08-12 13 ms production baseline
 
-Runtime-confirmed on iPad13,6 at nominal 36.5 °C. All ten gesture scenarios
-completed, and WindowServer `19905`, Dock `20197`, InputLab `39480`,
-UIKitSystem `67107`, displayd `72050`, and the tested Host generation stayed
-alive. All Host-side Metal command error counters were zero.
+Runtime-confirmed on iPad13,6 at nominal 29.5 °C. All thirteen scenarios
+completed; WindowServer `16770`, Dock `27704`, InputLab `26651`, displayd
+`25930`, inputd `25928`, and Host `16845` retained the same PID before and
+after the run. The semantic matrix passed and all Host-side Metal command
+error counters were zero. The table uses the exact application source for
+ordinary interactions and final drawable presentation for the native
+multi-layer Dock animations.
 
 | Scenario | Active avg FPS | 1% low | frame p50 / p95 / p99 ms | input→visible p95 ms | GPU p95 ms |
 |---|---:|---:|---:|---:|---:|
-| Drag | 52.03 | 23.99 | 16.67 / 41.68 / 41.68 | 49.11 | 2.25 |
-| Scroll | 47.98 | 23.99 | 16.67 / 37.52 / 41.68 | 48.89 | 2.41 |
-| Magnify | 49.18 | 23.99 | 16.67 / 37.52 / 41.68 | 44.86 | 2.27 |
-| Three-finger up | 71.49 | 9.60 | 8.34 / 25.01 / 104.21 | 45.67 | 3.76 |
-| Three-finger down | 69.57 | 13.33 | 12.50 / 29.18 / 75.03 | 41.63 | 3.51 |
-| Three-finger left | 32.71 | 17.14 | 25.01 / 58.36 / 58.36 | 74.41 | 2.08 |
-| Three-finger right | 33.75 | 15.99 | 20.84 / 58.36 / 62.53 | 83.11 | 2.81 |
+| Hover | 52.34 | 36.18 | 17.63 / 24.66 / 27.64 | 41.10 | 2.64 |
+| Drag | 50.41 | 36.07 | 17.59 / 26.71 / 27.72 | 45.22 | 2.51 |
+| Long-press drag | 51.68 | 36.10 | 17.87 / 25.26 / 27.70 | 44.13 | 2.80 |
+| Scroll | 49.72 | 34.64 | 17.89 / 28.45 / 28.87 | 44.92 | 2.53 |
+| Momentum scroll | 51.66 | 35.96 | 17.77 / 26.80 / 27.81 | 41.01 | 2.67 |
+| Magnify | 52.06 | 38.88 | 17.70 / 25.35 / 25.72 | 41.20 | 2.48 |
+| Three-finger up | 88.96 | 8.89 | 8.34 / 20.84 / 112.55 | 47.19 | 3.25 |
+| Three-finger down | 86.58 | 10.00 | 8.34 / 20.84 / 100.04 | 50.80 | 2.85 |
+| Three-finger left | 32.59 | 12.63 | 33.35 / 58.36 / 79.20 | 66.33 | 2.44 |
+| Three-finger right | 33.27 | 9.23 | 25.01 / 54.19 / 108.38 | 58.15 | 2.31 |
 
 InputLab remained much faster than the visible boundary:
 
 | Input stream | delivered rate | bridge p95 |
 |---|---:|---:|
-| requested 60 Hz | 55.00 events/s | 0.765 ms |
-| requested 120 Hz | 79.37 events/s | 3.777 ms |
+| requested 60 Hz | 59.78 events/s | 3.165 ms |
+| requested 120 Hz | 113.56 events/s | 2.770 ms |
 
 This is runtime evidence that the principal remaining UI problem is not the
-AF_UNIX input broker or Host GPU execution. The current tail is dominated by
-frame production/presentation cadence, especially horizontal Dock navigation,
-with roughly 2–4 ms GPU time but 38–83 ms visible/input tail latency. The next
-optimization milestone must improve that boundary rather than add another
-event-specific input patch.
+AF_UNIX input broker or Host GPU execution. The broker preserves 94.7% of a
+120 Hz stress stream below 3 ms p95, while ordinary content remains around
+50–52 FPS and horizontal Space presentation around 33 FPS with only 2–3 ms
+GPU p95. The next optimization boundary is therefore producer/presentation
+cadence and exact SkyLight Space geometry, not another event-specific input
+patch.
+
+The runner also uses the inode of atomically replaced `latest.json` as its
+generation witness. Seconds-resolution mtime plus byte size was runtime-
+disproved: adjacent exports can share both values and previously caused a
+false “no fresh performance JSON” failure after all thirteen gestures had
+actually completed.
+
+## 2026-08-12 active-cadence A/B
+
+Reducing the production active completion interval from 13,000 us to 8,333 us
+while retaining the 100,000 us idle interval improved the same full regression
+at nominal 29.59 °C. Ordinary active averages moved from 49.72–52.34 FPS to
+54.14–55.55 FPS; vertical native Dock animations moved from 86.58–88.96 FPS
+to 96.52–99.09 FPS; horizontal Space animations moved from 32.59–33.27 FPS to
+56.85–63.98 FPS. Drag passed the fixed release floor at 55.55 FPS average and
+46.96 FPS 1% low.
+
+This is not a blanket PASS. Horizontal presentation still has 108–125 ms p99
+gaps, the right-Space gesture has 65.94 ms input-to-visible p95, and several
+ordinary gestures remain below the 45 FPS 1%-low floor. The exact A/B records,
+stable PIDs, thermal sample, and SkyLight transaction ABI evidence are in
+[`ui-performance-regression-20260812.md`](ui-performance-regression-20260812.md).

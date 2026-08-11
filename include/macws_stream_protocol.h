@@ -13,18 +13,19 @@
 #define MACWS_STREAM_INVALIDATE_SOCKET_PATH \
     "/private/tmp/macws_display_invalidate.sock"
 #define MACWS_STREAM_MAGIC 0x4d575354u /* "MWST" */
-// Version 5 makes the layer_removed stream/sequence cutoff mandatory.  A v4
-// displayd only sent the CGWindow ID, so a newer Host could permanently
-// tombstone a still-live capture stream when Mission Control temporarily
-// removed and then restored an application window.  Keep this as a hard wire
-// compatibility boundary: silently pairing a v5 Host with a stale v4 daemon
-// recreates the "only the focused app remains" failure.
-#define MACWS_STREAM_VERSION 5u
+// Version 6 separates ordered layer geometry transactions from IOSurface
+// content frames. Version 5 republished the same IOSurface Mach right and
+// acquired another lease for every native Spaces/Mission Control position;
+// that multiplied one 60-Hz catalog sample by every moving desktop layer.
+// Keep this as a hard wire boundary so an old daemon cannot silently send a
+// message shape that a new Host interprets without the sequence invariant.
+#define MACWS_STREAM_VERSION 6u
 
 #define MACWS_STREAM_MAX_DIMENSION 16384u
 #define MACWS_STREAM_MAX_BYTES_PER_ROW (MACWS_STREAM_MAX_DIMENSION * 16u)
 #define MACWS_STREAM_MAX_WINDOWS 256u
 #define MACWS_STREAM_MAX_DAMAGE_RECTS 64u
+#define MACWS_STREAM_MAX_LAYER_GEOMETRY 64u
 #define MACWS_WINDOW_METRICS_MAGIC 0x4d57474du /* "MWGM" */
 #define MACWS_WINDOW_METRICS_VERSION 2u
 #define MACWS_GEOMETRY_INVALIDATION_MAGIC 0x4d574749u /* "MWGI" */
@@ -43,6 +44,7 @@
 #define MACWS_STREAM_KEY_SURFACE_PORT "surface_port"
 #define MACWS_STREAM_KEY_SURFACE_ID "surface_id"
 #define MACWS_STREAM_KEY_DAMAGE_RECTS "damage_rects"
+#define MACWS_STREAM_KEY_LAYER_GEOMETRY "layer_geometry"
 #define MACWS_STREAM_KEY_LEASE_TOKEN "lease_token"
 #define MACWS_STREAM_KEY_MESSAGE "message"
 #define MACWS_STREAM_KEY_OK "ok"
@@ -57,6 +59,7 @@
 #define MACWS_STREAM_EVENT_WINDOWS "windows"
 #define MACWS_STREAM_EVENT_FRAME "frame"
 #define MACWS_STREAM_EVENT_LAYER_REMOVED "layer_removed"
+#define MACWS_STREAM_EVENT_LAYER_GEOMETRY "layer_geometry"
 #define MACWS_STREAM_EVENT_STOPPED "stopped"
 #define MACWS_STREAM_EVENT_ERROR "error"
 
@@ -166,6 +169,61 @@ typedef struct __attribute__((packed)) {
     uint32_t destinationWidth;
     uint32_t destinationHeight;
 } MacWSStreamFrameDescriptor;
+
+// A native workspace animation usually changes only composition geometry;
+// the application's IOSurface pixels remain immutable. displayd batches these
+// records in one ordered XPC event. streamID + sequence share the corresponding
+// content producer's monotonic order, so Host can reject a delayed frame or
+// geometry record instead of visually jumping back to an older position.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint64_t streamID;
+    uint64_t sequence;
+    uint64_t displayTime;
+    uint32_t windowID;
+    uint32_t layerWindowID;
+    int32_t layerOwnerPID;
+    int32_t layerLevel;
+    int32_t destinationX;
+    int32_t destinationY;
+    uint32_t destinationWidth;
+    uint32_t destinationHeight;
+    uint32_t flags;
+} MacWSStreamLayerGeometry;
+
+static inline bool MacWSStreamLayerGeometryIsValid(
+        const MacWSStreamLayerGeometry *geometry, size_t byteCount) {
+    if (!geometry || byteCount != sizeof(*geometry) ||
+        geometry->magic != MACWS_STREAM_MAGIC ||
+        geometry->version != MACWS_STREAM_VERSION ||
+        geometry->size != sizeof(*geometry) || geometry->streamID == 0 ||
+        geometry->sequence == 0 || geometry->displayTime == 0 ||
+        geometry->layerWindowID == 0 ||
+        geometry->layerWindowID == geometry->windowID ||
+        geometry->destinationWidth == 0 ||
+        geometry->destinationHeight == 0 ||
+        geometry->destinationWidth > MACWS_STREAM_MAX_DIMENSION ||
+        geometry->destinationHeight > MACWS_STREAM_MAX_DIMENSION ||
+        geometry->destinationX < -(int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        geometry->destinationY < -(int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        geometry->destinationX > (int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        geometry->destinationY > (int32_t)MACWS_STREAM_MAX_DIMENSION ||
+        (geometry->flags & MacWSStreamFrameOverlay) == 0) return false;
+    uint32_t allowedFlags = MacWSStreamFrameOverlay |
+        MacWSStreamFrameGlobalSystemSurface |
+        MacWSStreamFrameInputPassthrough;
+    return (geometry->flags & ~allowedFlags) == 0;
+}
+
+static inline bool MacWSStreamLayerGeometrySupersedesFrame(
+        const MacWSStreamLayerGeometry *geometry,
+        const MacWSStreamFrameDescriptor *frame) {
+    return geometry && frame && geometry->streamID == frame->streamID &&
+        geometry->layerWindowID == frame->layerWindowID &&
+        geometry->sequence > frame->sequence;
+}
 
 // A layer-removed event carries the exact producer stream and the last frame
 // sequence detached from Host. displayd may keep that CGDisplayStream alive
@@ -338,6 +396,8 @@ static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
               "MacWS window descriptor ABI");
 static_assert(sizeof(MacWSStreamFrameDescriptor) == 116,
               "MacWS frame descriptor ABI");
+static_assert(sizeof(MacWSStreamLayerGeometry) == 68,
+              "MacWS layer geometry ABI");
 static_assert(sizeof(MacWSStreamDamageRect) == 16,
               "MacWS damage rect ABI");
 static_assert(sizeof(MacWSGeometryInvalidation) == 20,
@@ -351,6 +411,8 @@ _Static_assert(sizeof(MacWSStreamWindowDescriptor) == 64,
                "MacWS window descriptor ABI");
 _Static_assert(sizeof(MacWSStreamFrameDescriptor) == 116,
                "MacWS frame descriptor ABI");
+_Static_assert(sizeof(MacWSStreamLayerGeometry) == 68,
+               "MacWS layer geometry ABI");
 _Static_assert(sizeof(MacWSStreamDamageRect) == 16,
                "MacWS damage rect ABI");
 _Static_assert(sizeof(MacWSGeometryInvalidation) == 20,

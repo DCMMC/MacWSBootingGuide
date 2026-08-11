@@ -730,6 +730,37 @@ ensure_navigation_spaces() {
     log "Native macOS desktop navigation topology ready: $(tail -n 1 "$LOGDIR/navigation-spaces.log")"
 }
 
+refresh_dock_after_navigation_spaces() {
+    local old_pid="" new_pid="" waited=0
+
+    # Runtime-confirmed on 2026-08-11: a Dock process started before
+    # `ensure-navigation-spaces` continued to accept vertical Mission Control
+    # gestures but ignored both horizontal Space gestures (zero presentation
+    # frames).  Reloading that same production job after the final two-Space
+    # catalog existed immediately restored 48 live geometry updates and a
+    # 38.96 FPS final drawable.  Bind Dock to the completed catalog as part of
+    # the startup transaction instead of leaving a manual-restart dependency.
+    old_pid=$(launchd_job_pid "$DOCK_LABEL")
+    launchctl unload "$DOCK_PLIST" 2>/dev/null || return 1
+    launchctl load "$DOCK_PLIST" || return 1
+    while [ "$waited" -lt 15 ]; do
+        new_pid=$(launchd_job_pid "$DOCK_LABEL")
+        case "$new_pid" in
+            ''|'-'|*[!0-9]*) ;;
+            *)
+                if [ "$new_pid" != "$old_pid" ] && proc_running "$P_DOCK"; then
+                    log "Dock rebound to completed native desktop catalog (pid $old_pid -> $new_pid)."
+                    return 0
+                fi
+                ;;
+        esac
+        sleep 1
+        waited=$((waited + 1))
+    done
+    log "ERROR: Dock did not rebind to the completed native desktop catalog."
+    return 1
+}
+
 recover_ws_dependents() {
     local old_pid="$1" observed_pid="$2"
     log "watchdog: reconnecting GUI clients to replacement WindowServer $observed_pid"
@@ -785,6 +816,7 @@ recover_ws_dependents() {
         workspace_waited=$((workspace_waited + 1))
     done
     ensure_navigation_spaces || return 1
+    refresh_dock_after_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
     if [ "$WANT_VNC" = 1 ]; then
         launchctl load "$VNC_PLIST" 2>/dev/null
@@ -2911,6 +2943,7 @@ start_macos() {
     # witnesses. Establish two adjacent native Spaces for continuous three-
     # finger navigation, then apply the persisted high-resolution wallpaper.
     ensure_navigation_spaces || return 1
+    refresh_dock_after_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
 
     if [ "$WANT_VNC" = 1 ]; then

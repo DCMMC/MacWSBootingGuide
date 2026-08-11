@@ -16615,7 +16615,13 @@ static uint32_t macws_coexist_completion_pace_us(void) {
 
 static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
     enum {
-        kInteractivePaceUS = 16667,
+        // Drive the virtual compositor at the iPad's native 120-Hz interaction
+        // cadence while a real Host/VNC input stream is active. Exact-window
+        // capture remains independently bounded to 60 Hz, so this reduces
+        // producer/input phase misses without doubling IOSurface delivery.
+        // Idle still uses idle_pace_us (100 ms in production), limiting this
+        // work to the bounded one-second window after real input.
+        kInteractivePaceUS = 8333,
         kInteractionWindowNS = 1000 * NSEC_PER_MSEC,
     };
     if (idle_pace_us <= kInteractivePaceUS) return idle_pace_us;

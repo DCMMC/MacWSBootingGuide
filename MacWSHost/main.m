@@ -872,7 +872,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (uint32_t)currentFrameWidth;
 - (uint32_t)currentFrameHeight;
 - (NSArray<NSNumber *> *)overlayKeysBackToFront;
-- (BOOL)routeFullscreenInputRecord:(MacWSInputRecord *)record;
+- (BOOL)routeFullscreenInputRecord:(MacWSInputRecord *)record
+             presentationTargetPID:(int32_t *)presentationTargetPID;
+- (BOOL)performanceVisiblePointForTargetPID:(int32_t)targetPID
+                                      point:(CGPoint *)point;
 - (void)logPerformanceSnapshotWithReason:(NSString *)reason;
 - (void)runPerformanceGestureScenario:(NSString *)scenario
     completion:(void (^)(BOOL success, NSString *message))completion;
@@ -992,6 +995,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     int32_t _fullscreenLastTapRoutePID;
     uint32_t _fullscreenLastTapRouteWindowID;
     MacWSStreamFrameDescriptor _fullscreenLastTapRouteDescriptor;
+    int32_t _fullscreenGlobalPointerPresentationPID;
+    uint32_t _fullscreenGlobalPointerPresentationContactID;
 }
 
 - (instancetype)initWithFrame:(CGRect)frameRect {
@@ -2703,9 +2708,53 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     return NO;
 }
 
-- (BOOL)routeFullscreenInputRecord:(MacWSInputRecord *)record {
+- (BOOL)performanceVisiblePointForTargetPID:(int32_t)targetPID
+                                      point:(CGPoint *)point {
+    if (targetPID <= 1) return NO;
+    static const CGFloat fractions[][2] = {
+        {0.50, 0.50}, {0.35, 0.35}, {0.65, 0.35}, {0.35, 0.65},
+        {0.65, 0.65}, {0.50, 0.30}, {0.50, 0.70}, {0.30, 0.50},
+        {0.70, 0.50}, {0.20, 0.20}, {0.80, 0.20}, {0.20, 0.80},
+        {0.80, 0.80},
+    };
+    for (NSNumber *key in [[self overlayKeysBackToFront]
+            reverseObjectEnumerator]) {
+        MacWSSurfaceFrame *frame = _overlayFrames[key];
+        MacWSStreamFrameDescriptor descriptor = frame.descriptor;
+        if (descriptor.layerOwnerPID != targetPID ||
+            descriptor.destinationWidth == 0 ||
+            descriptor.destinationHeight == 0) continue;
+        CGRect destination = CGRectMake(
+            descriptor.destinationX, descriptor.destinationY,
+            descriptor.destinationWidth, descriptor.destinationHeight);
+        for (NSUInteger index = 0;
+             index < sizeof(fractions) / sizeof(fractions[0]); index++) {
+            CGPoint candidate = CGPointMake(
+                CGRectGetMinX(destination) +
+                    CGRectGetWidth(destination) * fractions[index][0],
+                CGRectGetMinY(destination) +
+                    CGRectGetHeight(destination) * fractions[index][1]);
+            int32_t resolvedPID = 0;
+            uint32_t resolvedWindowID = 0;
+            if ([self resolveFullscreenLayerAtPoint:candidate
+                                                pid:&resolvedPID
+                                           windowID:&resolvedWindowID
+                                         descriptor:NULL] &&
+                resolvedPID == targetPID &&
+                resolvedWindowID == descriptor.layerWindowID) {
+                if (point) *point = candidate;
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+- (BOOL)routeFullscreenInputRecord:(MacWSInputRecord *)record
+             presentationTargetPID:(int32_t *)presentationTargetPID {
     if (!record || _streamClient.mode != MacWSStreamModeFullscreen)
         return NO;
+    if (presentationTargetPID) *presentationTargetPID = record->targetPID;
     BOOL globalPointer =
         record->kind == MacWSInputKindTouchDown ||
         record->kind == MacWSInputKindTouchMove ||
@@ -2732,11 +2781,40 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         // WindowServer perform the authoritative, current global hit test.
         int32_t dockPID = [self dockSystemGestureTargetPID];
         if (dockPID > 1) {
+            int32_t visualPID = 0;
+            BOOL beginsGlobalDrag = record->kind == MacWSInputKindTouchDown;
+            BOOL continuesGlobalDrag = record->kind == MacWSInputKindTouchMove ||
+                record->kind == MacWSInputKindTouchUp ||
+                record->kind == MacWSInputKindTouchCancel;
+            if (continuesGlobalDrag &&
+                _fullscreenGlobalPointerPresentationPID > 1 &&
+                record->contactID ==
+                    _fullscreenGlobalPointerPresentationContactID) {
+                visualPID = _fullscreenGlobalPointerPresentationPID;
+            } else {
+                (void)[self resolveFullscreenLayerAtPoint:
+                    CGPointMake(record->x, record->y) pid:&visualPID
+                    windowID:NULL descriptor:NULL];
+            }
+            if (beginsGlobalDrag) {
+                _fullscreenGlobalPointerPresentationPID = visualPID;
+                _fullscreenGlobalPointerPresentationContactID =
+                    record->contactID;
+            }
+            if (presentationTargetPID)
+                *presentationTargetPID = visualPID;
             uint32_t modifiers =
                 MacWSInputModifiersForScene(record->sceneID);
             record->targetPID = dockPID;
             record->sceneID = MacWSInputSceneForWindow(0, modifiers);
             record->flags |= MacWSInputFlagGlobalSystemSurface;
+            if ((record->kind == MacWSInputKindTouchUp ||
+                 record->kind == MacWSInputKindTouchCancel) &&
+                record->contactID ==
+                    _fullscreenGlobalPointerPresentationContactID) {
+                _fullscreenGlobalPointerPresentationPID = 0;
+                _fullscreenGlobalPointerPresentationContactID = 0;
+            }
             return YES;
         }
     }
@@ -2805,6 +2883,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                      windowID:&windowID descriptor:&descriptor];
     }
     if (resolved) {
+        if (presentationTargetPID) *presentationTargetPID = ownerPID;
         float desktopX = record->x;
         float desktopY = record->y;
         uint32_t modifiers = MacWSInputModifiersForScene(record->sceneID);
@@ -4160,6 +4239,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     }
     CGPoint center = CGPointMake(width * 0.5, height * 0.5);
+    BOOL systemScenario = [scenario hasPrefix:@"three-"];
+    if (!systemScenario && _streamClient.mode == MacWSStreamModeFullscreen &&
+        ![self performanceVisiblePointForTargetPID:self.targetPID
+                                             point:&center]) {
+        finish(NO, @"目标应用当前没有可见、可命中的性能测试区域");
+        return;
+    }
     uint32_t contact = 0x50524600u |
         ((++_directTouchSerial) & 0xffu); // "PRF"
     void (^emitPointer)(MacWSInputKind, CGPoint, float, uint16_t) =
@@ -4184,8 +4270,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         };
         [self.statusDelegate metalView:self emittedInput:record];
     };
-    MacWSLog(@"performance-gesture-start scenario=%@ target=%d frame=%ux%u",
-             scenario, self.targetPID, width, height);
+    MacWSLog(@"performance-gesture-start scenario=%@ target=%d "
+             "frame=%ux%u point=(%.1f,%.1f)", scenario, self.targetPID,
+             width, height, center.x, center.y);
 
     if ([scenario isEqualToString:@"tap"] ||
         [scenario isEqualToString:@"right-tap"] ||
@@ -4211,14 +4298,21 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     }
 
-    if ([scenario isEqualToString:@"drag"]) {
-        const NSInteger steps = 60;
+    if ([scenario isEqualToString:@"drag"] ||
+        [scenario isEqualToString:@"long-drag"]) {
+        BOOL longPress = [scenario isEqualToString:@"long-drag"];
+        const NSInteger steps = 120;
         const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
-        CGPoint start = CGPointMake(width * 0.35, height * 0.35);
-        CGPoint end = CGPointMake(width * 0.65, height * 0.55);
+        const uint64_t holdNanoseconds = longPress
+            ? 420 * NSEC_PER_MSEC : 0;
+        CGPoint start = center;
+        CGPoint end = CGPointMake(
+            fmin(width - 1.0, center.x + width * 0.12),
+            fmin(height - 1.0, center.y + height * 0.08));
         emitPointer(MacWSInputKindTouchDown, start, 1.0f, 0);
         for (NSInteger index = 1; index <= steps; index++) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         holdNanoseconds +
                                          index * stepNanoseconds),
                            dispatch_get_main_queue(), ^{
                 CGFloat progress = index / (CGFloat)steps;
@@ -4229,25 +4323,31 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             });
         }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     holdNanoseconds +
                                      (steps + 1) * stepNanoseconds),
                        dispatch_get_main_queue(), ^{
             emitPointer(MacWSInputKindTouchUp, end, 0.0f, 0);
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     holdNanoseconds +
                                      (steps + 1) * stepNanoseconds +
                                      400 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MacWSLog(@"performance-gesture-end scenario=drag success=YES");
-            finish(YES, @"120 Hz 拖动场景已完成");
+            MacWSLog(@"performance-gesture-end scenario=%@ success=YES",
+                     scenario);
+            finish(YES, longPress ? @"长按后 120 Hz 拖动场景已完成"
+                                  : @"120 Hz 拖动场景已完成");
         });
         return;
     }
 
     if ([scenario isEqualToString:@"scroll"] ||
+        [scenario isEqualToString:@"scroll-momentum"] ||
         [scenario isEqualToString:@"magnify"]) {
-        const NSInteger steps = 72;
+        const NSInteger steps = 120;
         const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
         BOOL magnify = [scenario isEqualToString:@"magnify"];
+        BOOL momentum = [scenario isEqualToString:@"scroll-momentum"];
         if (magnify) {
             [self emitMagnifyAtFramePoint:center amount:0.0
                 flags:MacWSInputFlagGestureBegan
@@ -4282,18 +4382,55 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                     timestamp:CACurrentMediaTime()];
             } else {
                 [self emitScrollAtFramePoint:center translation:CGPointZero
-                    flags:MacWSInputFlagScrollEnded
+                    flags:MacWSInputFlagScrollEnded |
+                          (momentum ? MacWSInputFlagScrollWillMomentum : 0)
                     timestamp:CACurrentMediaTime()];
+                if (momentum) {
+                    [self startScrollMomentumWithVelocity:
+                        CGPointMake(0.0, -900.0) framePoint:center];
+                }
             }
         });
+        uint64_t settleNanoseconds = momentum
+            ? 2800 * NSEC_PER_MSEC : 500 * NSEC_PER_MSEC;
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (steps + 1) * stepNanoseconds +
-                                     500 * NSEC_PER_MSEC),
+                                     settleNanoseconds),
                        dispatch_get_main_queue(), ^{
+            if (momentum)
+                [self stopScrollMomentumWithTerminalPhase:YES];
             MacWSLog(@"performance-gesture-end scenario=%@ success=YES",
                      scenario);
-            finish(YES, magnify ? @"120 Hz 缩放场景已完成"
-                                : @"120 Hz 滚动场景已完成");
+            finish(YES, magnify ? @"120 Hz 缩放场景已完成" :
+                momentum ? @"滚动与原生惯性衰减场景已完成" :
+                           @"120 Hz 滚动场景已完成");
+        });
+        return;
+    }
+
+    if ([scenario isEqualToString:@"hover"]) {
+        const NSInteger steps = 120;
+        const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
+        CGPoint start = CGPointMake(
+            fmax(0.0, center.x - width * 0.06), center.y);
+        CGPoint end = CGPointMake(
+            fmin(width - 1.0, center.x + width * 0.06), center.y);
+        for (NSInteger index = 0; index <= steps; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         index * stepNanoseconds),
+                           dispatch_get_main_queue(), ^{
+                CGFloat progress = index / (CGFloat)steps;
+                emitPointer(MacWSInputKindHover, CGPointMake(
+                    start.x + (end.x - start.x) * progress, start.y),
+                    0.0f, 0);
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     400 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end scenario=hover success=YES");
+            finish(YES, @"120 Hz 悬停场景已完成");
         });
         return;
     }
@@ -4314,7 +4451,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         MacWSSystemGestureAxis axis =
             (MacWSSystemGestureAxis)system[0].unsignedIntValue;
         CGFloat finalProgress = system[1].doubleValue;
-        const NSInteger steps = 60;
+        const NSInteger steps = 90;
         const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
         _threeFingerSystemGestureActive = YES;
         _threeFingerSystemGestureAxis = axis;
@@ -4323,7 +4460,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _threeFingerSystemGestureFrameWidth = width;
         _threeFingerSystemGestureFrameHeight = height;
         _threeFingerSystemGestureLastProgress = 0.0;
-        _threeFingerSystemGestureLastVelocity = finalProgress / 0.5;
+        _threeFingerSystemGestureLastVelocity = finalProgress /
+            (steps / 120.0);
         [self emitSystemGestureAxis:axis progress:finalProgress / steps
             velocity:_threeFingerSystemGestureLastVelocity
             flags:MacWSInputFlagGestureBegan timestamp:CACurrentMediaTime()];
@@ -4547,6 +4685,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         ? @(frame.descriptor.layerWindowID) : nil;
     MacWSSurfaceFrame *texturePredecessor = overlayFrame
         ? _overlayFrames[overlayKey] : _surfaceFrame;
+    if (texturePredecessor &&
+        ((frame.descriptor.streamID ==
+              texturePredecessor.descriptor.streamID &&
+          frame.descriptor.sequence <=
+              texturePredecessor.descriptor.sequence) ||
+         frame.descriptor.streamID <
+              texturePredecessor.descriptor.streamID)) {
+        // XPC is ordered, but frame delivery is paced to the next display
+        // link while geometry batches are applied immediately on main. A
+        // delayed content frame must not roll the compositor back behind an
+        // already-visible geometry transaction or a newer producer stream.
+        [client releaseFrame:frame];
+        return;
+    }
     id<MTLTexture> texture = overlayFrame
         ? _overlayTextures[overlayKey] : _surfaceTexture;
     uint32_t incomingSurfaceID = IOSurfaceGetID(frame.surface);
@@ -4576,6 +4728,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
     [_performanceMonitor recordFrameReceivedForStream:
         frame.descriptor.streamID sequence:frame.descriptor.sequence
+        layerWindowID:frame.descriptor.layerWindowID
+        ownerPID:frame.descriptor.layerOwnerPID
         captureTime:frame.descriptor.displayTime receiptTime:frame.receiptTime];
     if (reusedTexture) {
         _surfaceTextureReuses++;
@@ -4653,6 +4807,58 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         [self scheduleWindowConfiguration];
     }
     [self setNeedsDisplay];
+}
+
+- (void)streamClient:(MacWSStreamClient *)client
+ receivedLayerGeometryUpdates:(NSData *)updates
+                   receiptTime:(uint64_t)receiptTime {
+    (void)client;
+    if (!updates.length ||
+        updates.length % sizeof(MacWSStreamLayerGeometry) != 0 ||
+        updates.length / sizeof(MacWSStreamLayerGeometry) >
+            MACWS_STREAM_MAX_LAYER_GEOMETRY) return;
+    const MacWSStreamLayerGeometry *records = updates.bytes;
+    NSUInteger count = updates.length / sizeof(*records);
+    [_performanceMonitor recordGeometryBatchReceived];
+    BOOL changed = NO;
+    for (NSUInteger index = 0; index < count; index++) {
+        const MacWSStreamLayerGeometry *geometry = &records[index];
+        if (!MacWSStreamLayerGeometryIsValid(geometry,
+                                              sizeof(*geometry))) continue;
+        NSNumber *key = @(geometry->layerWindowID);
+        MacWSSurfaceFrame *frame = _overlayFrames[key];
+        if (!frame) continue;
+        MacWSStreamFrameDescriptor current = frame.descriptor;
+        if (!MacWSStreamLayerGeometrySupersedesFrame(
+                geometry, &current)) continue;
+        MacWSStreamFrameDescriptor descriptor = current;
+        BOOL levelChanged = descriptor.layerLevel != geometry->layerLevel;
+        descriptor.sequence = geometry->sequence;
+        descriptor.displayTime = geometry->displayTime;
+        descriptor.layerOwnerPID = geometry->layerOwnerPID;
+        descriptor.layerLevel = geometry->layerLevel;
+        descriptor.destinationX = geometry->destinationX;
+        descriptor.destinationY = geometry->destinationY;
+        descriptor.destinationWidth = geometry->destinationWidth;
+        descriptor.destinationHeight = geometry->destinationHeight;
+        descriptor.flags = (descriptor.flags &
+            ~(MacWSStreamFrameGlobalSystemSurface |
+              MacWSStreamFrameInputPassthrough)) |
+            (geometry->flags &
+                (MacWSStreamFrameGlobalSystemSurface |
+                 MacWSStreamFrameInputPassthrough));
+        _overlayFrames[key] = [[MacWSSurfaceFrame alloc]
+            initWithDescriptor:descriptor surface:frame.surface
+            receiptTime:receiptTime];
+        if (levelChanged) _sortedOverlayKeys = nil;
+        [_performanceMonitor recordGeometryReceivedForStream:
+            descriptor.streamID sequence:descriptor.sequence
+            layerWindowID:descriptor.layerWindowID
+            ownerPID:descriptor.layerOwnerPID
+            captureTime:descriptor.displayTime receiptTime:receiptTime];
+        changed = YES;
+    }
+    if (changed) [self setNeedsDisplay];
 }
 
 - (void)streamClient:(MacWSStreamClient *)client
@@ -7195,8 +7401,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _systemPerformanceHUDSwitch.on = NO;
     [_metalView.performanceMonitor resetWithReason:@"gesture-suite"];
     NSMutableArray<NSString *> *scenarios = [@[
-        @"tap", @"double-tap", @"right-tap", @"drag", @"scroll",
-        @"magnify",
+        @"tap", @"double-tap", @"right-tap", @"hover", @"drag",
+        @"long-drag", @"scroll", @"scroll-momentum", @"magnify",
     ] mutableCopy];
     if (_streamMode == MacWSStreamModeFullscreen) {
         [scenarios addObjectsFromArray:@[
@@ -8201,6 +8407,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self exportPerformanceMeasurement];
     } else if ([action isEqualToString:@"performance-reset"]) {
         [_metalView.performanceMonitor resetWithReason:@"url-control"];
+        // Give the external regression runner a fresh focus witness for this
+        // exact reset.  Reading the last historical catalog message can bind
+        // a new run to an application that was frontmost minutes earlier.
+        MacWSLog(@"performance-profile-target pid=%d window=%u mode=%lu",
+                 _metalView.targetPID, _metalView.targetWindowID,
+                 (unsigned long)_streamMode);
     } else if ([action isEqualToString:@"performance-gesture-suite"]) {
         [self runPerformanceGestureSuite];
     } else if ([action hasPrefix:@"performance-gesture-"]) {
@@ -8952,7 +9164,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)metalView:(MacWSMetalView *)view emittedInput:(MacWSInputRecord)record {
-    (void)view;
+    int32_t presentationTargetPID = record.targetPID;
     // Fullscreen pointer records become one hardware-style global stream in
     // routeFullscreenInputRecord:, leaving WindowServer authoritative for
     // Dock/Mission Control transforms. Scroll and magnify still freeze the
@@ -8964,9 +9176,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         record.kind != MacWSInputKindActivateTarget &&
         record.kind != MacWSInputKindDesktopCommand &&
         record.kind != MacWSInputKindSystemGesture) {
-        if (![_metalView routeFullscreenInputRecord:&record]) {
+        if (![_metalView routeFullscreenInputRecord:&record
+                              presentationTargetPID:
+                                  &presentationTargetPID]) {
             record.targetPID = 0;
             record.sceneID &= UINT64_C(0x7fffffff);
+            presentationTargetPID = 0;
         }
     }
     NSString *phase = @"?";
@@ -8993,7 +9208,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     int sendError = 0;
     BOOL sent = MacWSSendInputRecord(&record, &sendError);
     [_metalView.performanceMonitor recordInputKind:record.kind
-        sampleTime:record.timestamp transportSuccess:sent];
+        sampleTime:record.timestamp targetPID:presentationTargetPID
+        transportSuccess:sent];
     _inputLogSequence++;
     BOOL continuous = record.kind == MacWSInputKindTouchMove ||
                       record.kind == MacWSInputKindHover ||
@@ -9560,8 +9776,11 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"performance-gesture-suite", @"performance-gesture-tap",
                @"performance-gesture-double-tap",
                @"performance-gesture-right-tap",
+               @"performance-gesture-hover",
                @"performance-gesture-drag",
+               @"performance-gesture-long-drag",
                @"performance-gesture-scroll",
+               @"performance-gesture-scroll-momentum",
                @"performance-gesture-magnify",
                @"performance-gesture-three-up",
                @"performance-gesture-three-down",

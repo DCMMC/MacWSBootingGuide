@@ -21,6 +21,7 @@ WINDOW_SCENE_FLAG = 0x80000000
 TOUCH_DOWN = 1
 TOUCH_MOVE = 2
 TOUCH_UP = 3
+HOVER = 5
 TAP = 6
 KEY_DOWN = 11
 KEY_UP = 12
@@ -182,6 +183,9 @@ def main():
     wait_for(sock, ["left_down", "left_up"], args.log,
              time.time() + args.timeout)
 
+    send(HOVER, 940, 520, contact=0x1005)
+    wait_for(sock, ["move"], args.log, time.time() + args.timeout)
+
     send(TOUCH_DOWN, 700, 500, pressure=1.0, contact=0x1002)
     for step in range(1, 9):
         send(TOUCH_MOVE, 700 + step * 35, 500 + step * 8,
@@ -218,6 +222,40 @@ def main():
     if not scroll_phases or scroll_phases[0] != 1 or \
             scroll_phases[-1] != 8 or 4 not in scroll_phases:
         raise RuntimeError(f"scroll phase mismatch values={scroll_phases}")
+
+    # Preserve AppKit's two linked phase machines across finger release and
+    # inertial continuation. The finger stream advertises WillMomentum before
+    # ending; the following records must arrive with phase=0 and native
+    # momentum Begin/Continue/End rather than starting a new scroll target.
+    event_offset = len(load_events(args.log))
+    send(SCROLL, 900, 500, flags=GESTURE_BEGAN)
+    send(SCROLL, 900, 500, pressure=-6.0,
+         flags=GESTURE_CHANGED)
+    send(SCROLL, 900, 500,
+         flags=GESTURE_ENDED | SCROLL_WILL_MOMENTUM)
+    send(SCROLL, 900, 500, pressure=-5.0,
+         flags=GESTURE_BEGAN | SCROLL_MOMENTUM)
+    send(SCROLL, 900, 500, pressure=-3.0,
+         flags=GESTURE_CHANGED | SCROLL_MOMENTUM)
+    send(SCROLL, 900, 500,
+         flags=GESTURE_ENDED | SCROLL_MOMENTUM)
+    deadline = time.time() + args.timeout
+    momentum_events = []
+    while time.time() < deadline:
+        momentum_events = [
+            event for event in load_events(args.log)[event_offset:]
+            if event.get("event") == "scroll"
+        ]
+        momentum_phases = [event.get("momentum_phase")
+                           for event in momentum_events]
+        if momentum_phases and momentum_phases[-1] == 8:
+            break
+        time.sleep(0.02)
+    momentum_phases = [event.get("momentum_phase")
+                       for event in momentum_events]
+    if momentum_phases[-3:] != [1, 4, 8]:
+        raise RuntimeError(
+            f"momentum phase mismatch values={momentum_phases}")
 
     gesture_contact = 0x50494E43  # "PINC"
     send(MAGNIFY, 900, 500, contact=gesture_contact,
@@ -307,6 +345,7 @@ def main():
         "magnifications": magnifications,
         "magnify_phases": magnify_phases,
         "scroll_phases": scroll_phases,
+        "momentum_phases": momentum_phases,
         "command_key_up": "delivered to NSApplication; consumed before responder",
         "latency_ms": {
             "minimum": min(latencies) if latencies else None,

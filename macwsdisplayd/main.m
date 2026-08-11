@@ -36,6 +36,12 @@ typedef CGDisplayStreamRef (*MacWSSLSWindowStreamCreate)(
 
 static dispatch_queue_t DisplayQueue;
 static dispatch_queue_t MenuQueue;
+// Presentation-only SkyLight description calls can synchronously stall for
+// 90+ ms at their tail even though their median cost is below 1 ms. Keep those
+// calls off DisplayQueue: exact-window capture callbacks, leases and input-
+// correlated content frames must remain drainable while WindowServer answers
+// a Mission Control geometry query.
+static dispatch_queue_t WorkspaceGeometryQueue;
 static NSMutableSet *Clients;
 static NSMutableDictionary<NSNumber *, id> *Leases;
 // A SkyLight popup can disappear while its final AGX command buffer is still
@@ -79,12 +85,22 @@ static CFTimeInterval WorkspaceAnimationSamplingDeadline;
 // SkyLight presentation geometry is still changing, with this hard bound so a
 // noisy catalog can never turn one gesture into permanent high-rate polling.
 static CFTimeInterval WorkspaceAnimationSettlementHardDeadline;
+static BOOL WorkspaceGeometryQueryInFlight;
+static BOOL WorkspaceGeometryQueryPending;
+static BOOL WorkspaceGeometryBurstActive;
+static uint64_t WorkspaceGeometryQueryGeneration;
+static uint64_t WorkspaceGeometryQuerySamples;
+static uint64_t WorkspaceGeometryRecordsSent;
+static double WorkspaceGeometryQueryDurationsMS[256];
+static NSUInteger WorkspaceGeometryQueryDurationCount;
+static NSUInteger WorkspaceGeometryQueryDurationCursor;
 static BOOL CatalogBroadcastPending;
 static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
 static CGFloat ObservedWindowBackingScale;
 static CGFloat AppKitMainDisplayBackingScale;
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
+static void RequestWorkspaceGeometrySample(void);
 static void ScheduleGeometryStreamRestart(void);
 static void ScheduleCatalogBroadcast(void);
 static void EnqueueRetiredTransientStop(dispatch_block_t stopBlock);
@@ -440,6 +456,30 @@ static NSArray<NSDictionary *> *CopyCompleteDesktopWindowInfo(void) {
     return CFBridgingRelease(raw);
 }
 
+static NSArray<NSDictionary *> *CopyWindowDescriptions(
+        NSArray<NSNumber *> *windowIDs) {
+    if (!windowIDs.count) return @[];
+    // CGWindowListCreateDescriptionFromArray's historical ABI consumes each
+    // element as an integer-sized CGWindowID, not as a retained CFNumber.
+    // The target geometry probe runtime-confirmed that a callback-free array
+    // of pointer-sized IDs exposes live presentation bounds; passing an
+    // NSArray<NSNumber *> instead returns unrelated/model-only entries.
+    const void *values[MACWS_STREAM_MAX_LAYER_GEOMETRY] = {0};
+    CFIndex count = (CFIndex)MIN(windowIDs.count,
+        (NSUInteger)MACWS_STREAM_MAX_LAYER_GEOMETRY);
+    for (CFIndex index = 0; index < count; index++) {
+        values[index] = (const void *)(uintptr_t)
+            [windowIDs[(NSUInteger)index] unsignedIntValue];
+    }
+    CFArrayRef identifiers = CFArrayCreate(kCFAllocatorDefault, values,
+                                            count, NULL);
+    CFArrayRef raw = identifiers
+        ? CGWindowListCreateDescriptionFromArray(identifiers) : NULL;
+    if (identifiers) CFRelease(identifiers);
+    if (!raw) return @[];
+    return CFBridgingRelease(raw);
+}
+
 static NSArray<NSDictionary *> *CopyCatalogWindowInfo(void) {
     CFArrayRef raw = CGWindowListCopyWindowInfo(
         kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
@@ -698,10 +738,11 @@ static void StartInvalidationListener(void) {
                 now + 0.25;
             WorkspaceAnimationSettlementHardDeadline = now + 0.80;
             // This path only needs compositor geometry. Avoid broadcasting a
-            // complete application-window list for every gesture sample. The
-            // active 16-ms loop is also authoritative: do not let 120-Hz
-            // input repeatedly preempt it with twice as many immediate scans.
+            // complete application-window list for every gesture sample. A
+            // targeted asynchronous query is single-flight: 120-Hz input can
+            // request the next sample without queuing redundant SkyLight RPCs.
             if (!wasSampling) ScheduleTransientReconcile(0);
+            RequestWorkspaceGeometrySample();
         }
         if (catalogChanged) ScheduleCatalogBroadcast();
         if (geometryChanged) ScheduleGeometryStreamRestart();
@@ -1052,6 +1093,241 @@ static void SendLayerRemoved(MacWSDisplayClient *client,
     xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_SEQUENCE,
                               layer.sequence);
     xpc_connection_send_message(client.connection, event);
+}
+
+static void AppendLayerGeometry(NSMutableData *batch,
+                                MacWSDisplayClient *client,
+                                MacWSTransientLayer *layer,
+                                uint64_t displayTime) {
+    if (!batch || !client || !layer || !layer.latestSurface ||
+        layer.retiring || batch.length / sizeof(MacWSStreamLayerGeometry) >=
+            MACWS_STREAM_MAX_LAYER_GEOMETRY) return;
+    uint32_t flags = MacWSStreamFrameOverlay |
+        ([layer.ownerName isEqualToString:@"Dock"]
+            ? MacWSStreamFrameGlobalSystemSurface : 0) |
+        (layer.skyLightLayer >= CGWindowLevelForKey(kCGCursorWindowLevelKey)
+            ? MacWSStreamFrameInputPassthrough : 0);
+    MacWSStreamLayerGeometry geometry = {
+        .magic = MACWS_STREAM_MAGIC,
+        .version = MACWS_STREAM_VERSION,
+        .size = sizeof(MacWSStreamLayerGeometry),
+        .streamID = layer.streamID,
+        .sequence = ++layer.sequence,
+        .displayTime = displayTime,
+        .windowID = client.windowID,
+        .layerWindowID = layer.windowID,
+        .layerOwnerPID = layer.ownerPID,
+        .layerLevel = layer.level,
+        .destinationX = (int32_t)llround(layer.destinationBounds.origin.x),
+        .destinationY = (int32_t)llround(layer.destinationBounds.origin.y),
+        .destinationWidth = (uint32_t)llround(
+            layer.destinationBounds.size.width),
+        .destinationHeight = (uint32_t)llround(
+            layer.destinationBounds.size.height),
+        .flags = flags,
+    };
+    if (!MacWSStreamLayerGeometryIsValid(&geometry, sizeof(geometry))) {
+        // Do not consume an invalid sequence. The next real content frame or
+        // valid geometry transaction remains contiguous and authoritative.
+        layer.sequence--;
+        return;
+    }
+    [layer recordActiveFrameAtDisplayTime:displayTime];
+    layer.latestDisplayTime = displayTime;
+    [batch appendBytes:&geometry length:sizeof(geometry)];
+}
+
+static void SendLayerGeometryBatch(MacWSDisplayClient *client,
+                                   NSData *batch) {
+    if (!client.connection || client.deliveryPaused || !batch.length ||
+        batch.length % sizeof(MacWSStreamLayerGeometry) != 0 ||
+        batch.length / sizeof(MacWSStreamLayerGeometry) >
+            MACWS_STREAM_MAX_LAYER_GEOMETRY) return;
+    xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
+    xpc_dictionary_set_string(event, MACWS_STREAM_KEY_EVENT,
+                              MACWS_STREAM_EVENT_LAYER_GEOMETRY);
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_PROTOCOL_VERSION,
+                              MACWS_STREAM_VERSION);
+    xpc_dictionary_set_uint64(event, MACWS_STREAM_KEY_WINDOW_ID,
+                              client.windowID);
+    xpc_dictionary_set_data(event, MACWS_STREAM_KEY_LAYER_GEOMETRY,
+                            batch.bytes, batch.length);
+    xpc_connection_send_message(client.connection, event);
+}
+
+static double WorkspaceMachMilliseconds(uint64_t start, uint64_t end) {
+    if (!start || end < start) return 0.0;
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ (void)mach_timebase_info(&timebase); });
+    if (!timebase.denom) return 0.0;
+    return (double)(end - start) * timebase.numer / timebase.denom / 1.0e6;
+}
+
+static void FinishWorkspaceGeometryBurst(void) {
+    if (!WorkspaceGeometryBurstActive) return;
+    WorkspaceGeometryBurstActive = NO;
+    NSUInteger count = MIN(WorkspaceGeometryQueryDurationCount,
+        sizeof(WorkspaceGeometryQueryDurationsMS) /
+            sizeof(WorkspaceGeometryQueryDurationsMS[0]));
+    if (count) {
+        double durations[256];
+        double total = 0.0;
+        for (NSUInteger index = 0; index < count; index++) {
+            durations[index] = WorkspaceGeometryQueryDurationsMS[index];
+            total += durations[index];
+        }
+        qsort(durations, count, sizeof(durations[0]),
+              MacWSCompareFrameInterval);
+        NSUInteger p50Index = MIN(count - 1,
+            (NSUInteger)ceil((double)count * 0.50) - 1);
+        NSUInteger p95Index = MIN(count - 1,
+            (NSUInteger)ceil((double)count * 0.95) - 1);
+        NSUInteger p99Index = MIN(count - 1,
+            (NSUInteger)ceil((double)count * 0.99) - 1);
+        DisplayLog(@"workspace-geometry-burst queries=%llu records=%llu "
+                   "query-mean-ms=%.3f p50-ms=%.3f p95-ms=%.3f "
+                   "p99-ms=%.3f route=targeted-description-async",
+                   (unsigned long long)WorkspaceGeometryQuerySamples,
+                   (unsigned long long)WorkspaceGeometryRecordsSent,
+                   total / count, durations[p50Index], durations[p95Index],
+                   durations[p99Index]);
+    }
+}
+
+static void ApplyWorkspaceGeometryDescriptions(
+        NSArray<NSDictionary *> *descriptions, uint64_t displayTime) {
+    NSMutableDictionary<NSNumber *, NSDictionary *> *byWindow =
+        [NSMutableDictionary dictionaryWithCapacity:descriptions.count];
+    for (NSDictionary *info in descriptions) {
+        NSNumber *windowID = info[(id)kCGWindowNumber];
+        if (windowID.unsignedIntValue) byWindow[windowID] = info;
+    }
+    CGRect desktopBounds = CGDisplayBounds(CGMainDisplayID());
+    if (CGRectIsEmpty(desktopBounds)) return;
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive || client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen) continue;
+        CGFloat scale = client.windowBackingScale > 0.0
+            ? client.windowBackingScale : MainDisplayBackingScale();
+        if (!isfinite(scale) || scale < 0.5 || scale > 8.0) continue;
+        NSMutableData *geometryBatch = [NSMutableData dataWithCapacity:
+            MIN(client.transientLayers.count, (NSUInteger)
+                MACWS_STREAM_MAX_LAYER_GEOMETRY) *
+                sizeof(MacWSStreamLayerGeometry)];
+        for (NSNumber *key in [client.transientLayers.allKeys copy]) {
+            MacWSTransientLayer *layer = client.transientLayers[key];
+            NSDictionary *info = byWindow[key];
+            if (!layer || layer.retiring || !layer.latestSurface || !info)
+                continue;
+            CGRect bounds = CGRectZero;
+            if (!CGRectMakeWithDictionaryRepresentation(
+                    (__bridge CFDictionaryRef)info[(id)kCGWindowBounds],
+                    &bounds) || CGRectIsEmpty(bounds)) continue;
+            CGRect destination = CGRectMake(
+                (bounds.origin.x - desktopBounds.origin.x) * scale,
+                (bounds.origin.y - desktopBounds.origin.y) * scale,
+                bounds.size.width * scale, bounds.size.height * scale);
+            if (CGRectEqualToRect(layer.destinationBounds, destination))
+                continue;
+            layer.destinationBounds = destination;
+            AppendLayerGeometry(geometryBatch, client, layer, displayTime);
+        }
+        WorkspaceGeometryRecordsSent += geometryBatch.length /
+            sizeof(MacWSStreamLayerGeometry);
+        SendLayerGeometryBatch(client, geometryBatch);
+    }
+}
+
+static void RequestWorkspaceGeometrySample(void) {
+    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (now >= WorkspaceAnimationSamplingDeadline) {
+        if (WorkspaceGeometryBurstActive &&
+            !WorkspaceGeometryQueryInFlight) {
+            WorkspaceGeometryQueryPending = NO;
+            FinishWorkspaceGeometryBurst();
+            ScheduleTransientReconcile(0);
+        }
+        return;
+    }
+    if (WorkspaceGeometryQueryInFlight) {
+        WorkspaceGeometryQueryPending = YES;
+        return;
+    }
+    NSMutableOrderedSet<NSNumber *> *identifiers = [NSMutableOrderedSet
+        orderedSet];
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive || client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen) continue;
+        for (NSNumber *key in client.transientLayers) {
+            MacWSTransientLayer *layer = client.transientLayers[key];
+            if (layer.latestSurface && !layer.retiring)
+                [identifiers addObject:key];
+        }
+    }
+    if (!identifiers.count) return;
+    if (!WorkspaceGeometryBurstActive) {
+        WorkspaceGeometryBurstActive = YES;
+        WorkspaceGeometryQuerySamples = 0;
+        WorkspaceGeometryRecordsSent = 0;
+        WorkspaceGeometryQueryDurationCount = 0;
+        WorkspaceGeometryQueryDurationCursor = 0;
+        memset(WorkspaceGeometryQueryDurationsMS, 0,
+               sizeof(WorkspaceGeometryQueryDurationsMS));
+    }
+    WorkspaceGeometryQueryInFlight = YES;
+    WorkspaceGeometryQueryPending = NO;
+    uint64_t generation = ++WorkspaceGeometryQueryGeneration;
+    NSArray<NSNumber *> *windowIDs = identifiers.array;
+    uint64_t queryStarted = mach_absolute_time();
+    dispatch_async(WorkspaceGeometryQueue, ^{
+        @autoreleasepool {
+            NSArray<NSDictionary *> *descriptions =
+                CopyWindowDescriptions(windowIDs);
+            uint64_t queryFinished = mach_absolute_time();
+            dispatch_async(DisplayQueue, ^{
+                WorkspaceGeometryQueryInFlight = NO;
+                if (generation != WorkspaceGeometryQueryGeneration) return;
+                double duration = WorkspaceMachMilliseconds(queryStarted,
+                                                             queryFinished);
+                NSUInteger capacity =
+                    sizeof(WorkspaceGeometryQueryDurationsMS) /
+                    sizeof(WorkspaceGeometryQueryDurationsMS[0]);
+                WorkspaceGeometryQueryDurationsMS[
+                    WorkspaceGeometryQueryDurationCursor] = duration;
+                WorkspaceGeometryQueryDurationCursor =
+                    (WorkspaceGeometryQueryDurationCursor + 1) % capacity;
+                if (WorkspaceGeometryQueryDurationCount < capacity)
+                    WorkspaceGeometryQueryDurationCount++;
+                WorkspaceGeometryQuerySamples++;
+                ApplyWorkspaceGeometryDescriptions(descriptions,
+                                                    queryFinished);
+
+                CFTimeInterval completedAt = CFAbsoluteTimeGetCurrent();
+                if (completedAt < WorkspaceAnimationSamplingDeadline) {
+                    const double frameBudgetMS = 1000.0 / 60.0;
+                    uint64_t delay = duration < frameBudgetMS
+                        ? (uint64_t)llround((frameBudgetMS - duration) *
+                                           NSEC_PER_MSEC)
+                        : 0;
+                    // A queued real Dock progress edge wins over the cadence
+                    // timer, but both collapse through the in-flight gate.
+                    if (WorkspaceGeometryQueryPending) delay = 0;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay),
+                                   DisplayQueue, ^{
+                        RequestWorkspaceGeometrySample();
+                    });
+                } else {
+                    WorkspaceGeometryQueryPending = NO;
+                    FinishWorkspaceGeometryBurst();
+                    // Presentation sampling deliberately ignores topology.
+                    // One authoritative full snapshot now discovers/removes
+                    // transition windows after Dock's native animation ends.
+                    ScheduleTransientReconcile(0);
+                }
+            });
+        }
+    });
 }
 
 static void DrainOneRetiredTransientStop(void) {
@@ -1491,7 +1767,6 @@ static void StartSubscription(MacWSDisplayClient *client,
 // Host composites the layers with Metal; no RFB, CPU copy, or stream-mode
 // restart is involved.
 static void ReconcileTransientStreams(void) {
-    CFTimeInterval reconcileStarted = CFAbsoluteTimeGetCurrent();
     TransientReconcilePending = NO;
     BOOL urgentRetireConfirmation = UrgentTransientRetirePasses > 0;
     if (UrgentTransientRetirePasses > 0) UrgentTransientRetirePasses--;
@@ -1518,6 +1793,11 @@ static void ReconcileTransientStreams(void) {
                 scale < 0.5 || scale > 8.0) continue;
             if (!client.transientLayers)
                 client.transientLayers = [NSMutableDictionary dictionary];
+            NSMutableData *geometryBatch = [NSMutableData dataWithCapacity:
+                MIN(client.transientLayers.count, (NSUInteger)
+                    MACWS_STREAM_MAX_LAYER_GEOMETRY) *
+                    sizeof(MacWSStreamLayerGeometry)];
+            uint64_t geometryDisplayTime = mach_absolute_time();
             NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
             NSUInteger attached = 0;
             NSUInteger count = desktopInfo.count;
@@ -1639,10 +1919,11 @@ static void ReconcileTransientStreams(void) {
                     StartTransientLayer(layer);
                 }
                 // Window movement does not necessarily damage its backing
-                // store. Re-emit the retained surface immediately with the
-                // authoritative new compositor destination; waiting for a
-                // future capture callback made title-bar dragging update at
-                // the 250ms catalog-poll cadence.
+                // store. Send an ordered geometry record while retaining the
+                // already-imported IOSurface; waiting for a future capture
+                // callback made title-bar dragging update at the 250ms
+                // catalog-poll cadence, while republishing the surface made
+                // every moving layer acquire another Mach port and lease.
                 // SendLayerRemoved detached this layer from Host as soon as
                 // the native overview/Space catalog hid it. If Dock restores
                 // the window to exactly its old z-order and bounds, an exact
@@ -1650,12 +1931,15 @@ static void ReconcileTransientStreams(void) {
                 // presentationChanged is false. Re-publish the retained real
                 // IOSurface on catalog return or the window remains invisible
                 // even though it never closed.
-                if ((presentationChanged || returnedFromCatalog) &&
-                    layer.latestSurface) {
+                if (returnedFromCatalog && layer.latestSurface) {
                     PublishFrame(client, layer, mach_absolute_time(),
                                  layer.latestSurface);
+                } else if (presentationChanged && layer.latestSurface) {
+                    AppendLayerGeometry(geometryBatch, client, layer,
+                                        geometryDisplayTime);
                 }
             }
+            SendLayerGeometryBatch(client, geometryBatch);
             for (NSNumber *key in [client.transientLayers.allKeys copy]) {
                 MacWSTransientLayer *layer = client.transientLayers[key];
                 if ([seen containsObject:key]) continue;
@@ -1826,38 +2110,23 @@ static void ReconcileTransientStreams(void) {
     }
     BOOL workspaceAnimationSampling =
         reconcileFinished < WorkspaceAnimationSamplingDeadline;
-    if (needsFollowup || workspaceNeedsFollowup ||
-        workspaceAnimationSampling) {
+    if (workspaceAnimationSampling) RequestWorkspaceGeometrySample();
+    if ((needsFollowup || workspaceNeedsFollowup) &&
+        !workspaceAnimationSampling) {
         // Native AppKit geometry/catalog datagrams now preempt this timer at
         // 16ms. The periodic pass is only a recovery net for non-AppKit system
         // producers, so an idle fullscreen desktop no longer scans four times
         // per second.
         uint64_t delayNanoseconds = 0;
-        if (workspaceAnimationSampling) {
-            // This one-shot timer is armed after the catalog work above has
-            // completed. Waiting another full 16 ms here makes the real
-            // period scan-cost + 16 ms (about 45-50 ms on the target's
-            // full-Retina desktop). Compensate for work already spent so the
-            // authoritative geometry samples begin on a 60-Hz cadence. If a
-            // pass itself exceeds the budget, run the next pass immediately;
-            // the gesture deadline still bounds this high-rate mode.
-            const CFTimeInterval framePeriod = 1.0 / 60.0;
-            CFTimeInterval remaining = framePeriod -
-                (reconcileFinished - reconcileStarted);
-            if (remaining > 0.0)
-                delayNanoseconds = (uint64_t)llround(
-                    remaining * (double)NSEC_PER_SEC);
-        } else {
-            delayNanoseconds =
-                ((workspaceMissingLayerNeedsConfirmation ||
-                  windowMissingLayerNeedsConfirmation)
-                    ? 16
-                    : (urgentPopupPresent &&
-                       UrgentTransientRetirePasses > 0)
-                        ? 50
-                        : (workspaceNeedsFollowup ? 1000 : 250)) *
-                NSEC_PER_MSEC;
-        }
+        delayNanoseconds =
+            ((workspaceMissingLayerNeedsConfirmation ||
+              windowMissingLayerNeedsConfirmation)
+                ? 16
+                : (urgentPopupPresent &&
+                   UrgentTransientRetirePasses > 0)
+                    ? 50
+                    : (workspaceNeedsFollowup ? 1000 : 250)) *
+            NSEC_PER_MSEC;
         ScheduleTransientReconcile(delayNanoseconds);
     }
 }
@@ -2078,6 +2347,9 @@ int main(void) {
                                              DISPATCH_QUEUE_SERIAL);
         MenuQueue = dispatch_queue_create("com.macwsguide.display.menu",
                                           DISPATCH_QUEUE_CONCURRENT);
+        WorkspaceGeometryQueue = dispatch_queue_create(
+            "com.macwsguide.display.workspace-geometry",
+            DISPATCH_QUEUE_SERIAL);
         Clients = [NSMutableSet set];
         Leases = [NSMutableDictionary dictionary];
         RetiredTransientLayers = [NSMutableArray array];

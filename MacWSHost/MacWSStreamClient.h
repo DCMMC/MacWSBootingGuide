@@ -34,6 +34,9 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)streamClient:(MacWSStreamClient *)client
         receivedFrame:(MacWSSurfaceFrame *)frame;
 - (void)streamClient:(MacWSStreamClient *)client
+ receivedLayerGeometryUpdates:(NSData *)updates
+                   receiptTime:(uint64_t)receiptTime;
+- (void)streamClient:(MacWSStreamClient *)client
  removedLayerWindowID:(uint32_t)layerWindowID;
 @end
 

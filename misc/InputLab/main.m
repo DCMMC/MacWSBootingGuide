@@ -6,11 +6,24 @@
 static NSString *const MacWSEventLogPath = @"/tmp/macws_inputlab_events.jsonl";
 static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 
+static BOOL MacWSInputLabDiagnosticsEnabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled;
+    dispatch_once(&onceToken, ^{
+        enabled = getenv("MACWS_INPUTLAB_DIAGNOSTICS") != NULL;
+    });
+    return enabled;
+}
+
 @interface MacWSInputRecorder : NSObject
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *counts;
 @property(nonatomic, copy) NSString *lastEvent;
 @property(nonatomic) uint64_t sequence;
 @property(nonatomic, copy) void (^stateChanged)(NSDictionary *state);
+@property(nonatomic) dispatch_queue_t ioQueue;
+@property(nonatomic, strong) NSFileHandle *eventHandle;
+@property(nonatomic, strong) NSDictionary *latestStateForIO;
+@property(nonatomic) BOOL stateFlushScheduled;
 - (void)record:(NSString *)name event:(NSEvent *)event details:(NSDictionary *)details;
 @end
 
@@ -21,6 +34,11 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     _counts = [NSMutableDictionary dictionary];
     _lastEvent = @"ready";
     [[NSFileManager defaultManager] removeItemAtPath:MacWSEventLogPath error:nil];
+    [[NSData data] writeToFile:MacWSEventLogPath atomically:YES];
+    chmod(MacWSEventLogPath.fileSystemRepresentation, 0666);
+    _eventHandle = [NSFileHandle fileHandleForWritingAtPath:MacWSEventLogPath];
+    _ioQueue = dispatch_queue_create("com.macwsguide.inputlab.io",
+                                     DISPATCH_QUEUE_SERIAL);
     return self;
 }
 
@@ -60,40 +78,51 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     } mutableCopy];
     if (details) [entry addEntriesFromDictionary:details];
 
-    NSData *json = [NSJSONSerialization dataWithJSONObject:entry options:0 error:nil];
-    if (json) {
-        NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:MacWSEventLogPath];
-        if (!handle) {
-            [[NSData data] writeToFile:MacWSEventLogPath atomically:YES];
-            // InputLab is launched by root in the chroot while the release
-            // runner connects as the ordinary mobile user.  This is an
-            // intentionally public test endpoint under /tmp, not app data;
-            // make the recorder resettable without embedding a sudo password
-            // in the repeatable host-side workflow.
-            chmod(MacWSEventLogPath.fileSystemRepresentation, 0666);
-            handle = [NSFileHandle fileHandleForWritingAtPath:MacWSEventLogPath];
-        }
-        [handle seekToEndOfFile];
-        [handle writeData:json];
-        [handle writeData:[@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
-        [handle closeFile];
-    }
-
     NSDictionary *state = @{
         @"sequence": @(self.sequence),
         @"last_event": self.lastEvent,
-        @"counts": self.counts,
+        @"counts": [self.counts copy],
         @"last": entry,
     };
-    NSData *stateJSON = [NSJSONSerialization dataWithJSONObject:state
-        options:NSJSONWritingPrettyPrinted error:nil];
-    [stateJSON writeToFile:MacWSStatePath atomically:YES];
+    NSDictionary *entrySnapshot = [entry copy];
+    NSDictionary *stateSnapshot = [state copy];
+    dispatch_async(self.ioQueue, ^{
+        NSData *json = [NSJSONSerialization dataWithJSONObject:entrySnapshot
+                                                       options:0 error:nil];
+        if (json && self.eventHandle) {
+            // The regression runner intentionally truncates this public file
+            // between scenarios. Seek on every background append so an open
+            // descriptor follows that boundary without creating a sparse file.
+            [self.eventHandle seekToEndOfFile];
+            [self.eventHandle writeData:json];
+            [self.eventHandle writeData:
+                [@"\n" dataUsingEncoding:NSUTF8StringEncoding]];
+        }
+        self.latestStateForIO = stateSnapshot;
+        if (!self.stateFlushScheduled) {
+            self.stateFlushScheduled = YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         16 * NSEC_PER_MSEC),
+                           self.ioQueue, ^{
+                NSDictionary *latest = self.latestStateForIO;
+                self.latestStateForIO = nil;
+                self.stateFlushScheduled = NO;
+                NSData *stateJSON = [NSJSONSerialization
+                    dataWithJSONObject:latest
+                               options:NSJSONWritingPrettyPrinted error:nil];
+                [stateJSON writeToFile:MacWSStatePath atomically:YES];
+            });
+        }
+    });
     if (self.stateChanged) self.stateChanged(state);
 }
 @end
 
 @interface MacWSInputCanvas : NSView
 @property(nonatomic, strong) MacWSInputRecorder *recorder;
+@property(nonatomic) NSPoint markerPoint;
+@property(nonatomic) CGFloat scrollOffset;
+@property(nonatomic) CGFloat magnification;
 @end
 
 @interface NSWindow (MacWSInputLabPrivateScrollWitness)
@@ -113,12 +142,18 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 
 @implementation MacWSInputWindow
 - (void)_latchViewForScrollEvent:(NSEvent *)event {
-    fprintf(stderr,
-            "INPUTLAB NSWINDOW-LATCH phase=%lu momentum=%lu window=%ld "
-            "scrolling-before=%s\n",
-            (unsigned long)event.phase, (unsigned long)event.momentumPhase,
-            (long)event.windowNumber, self._isViewScrolling ? "YES" : "NO");
+    BOOL diagnostics = MacWSInputLabDiagnosticsEnabled();
+    if (diagnostics) {
+        fprintf(stderr,
+                "INPUTLAB NSWINDOW-LATCH phase=%lu momentum=%lu window=%ld "
+                "scrolling-before=%s\n",
+                (unsigned long)event.phase,
+                (unsigned long)event.momentumPhase,
+                (long)event.windowNumber,
+                self._isViewScrolling ? "YES" : "NO");
+    }
     [super _latchViewForScrollEvent:event];
+    if (!diagnostics) return;
     fprintf(stderr, "INPUTLAB NSWINDOW-LATCH-RETURN scrolling-after=%s\n",
             self._isViewScrolling ? "YES" : "NO");
     unsigned int ivarCount = 0;
@@ -138,11 +173,13 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     free(ivars);
 }
 - (void)_willBeginViewScrolling {
-    fprintf(stderr, "INPUTLAB NSWINDOW-WILL-BEGIN-SCROLL\n");
+    if (MacWSInputLabDiagnosticsEnabled())
+        fprintf(stderr, "INPUTLAB NSWINDOW-WILL-BEGIN-SCROLL\n");
     [super _willBeginViewScrolling];
 }
 - (void)_didEndViewScrolling {
-    fprintf(stderr, "INPUTLAB NSWINDOW-DID-END-SCROLL\n");
+    if (MacWSInputLabDiagnosticsEnabled())
+        fprintf(stderr, "INPUTLAB NSWINDOW-DID-END-SCROLL\n");
     [super _didEndViewScrolling];
 }
 - (void)sendEvent:(NSEvent *)event {
@@ -161,6 +198,14 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 @end
 
 @implementation MacWSInputCanvas
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        _markerPoint = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+        _magnification = 1.0;
+    }
+    return self;
+}
 - (BOOL)acceptsFirstResponder { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
 - (BOOL)isFlipped { return YES; }
@@ -183,15 +228,32 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     };
     [@"Input canvas — click, drag, scroll, right-click and type here"
         drawAtPoint:NSMakePoint(24, 22) withAttributes:attributes];
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.10] setStroke];
+    NSBezierPath *grid = [NSBezierPath bezierPath];
+    CGFloat spacing = 48.0 * fmax(0.5, fmin(self.magnification, 2.0));
+    CGFloat offset = fmod(self.scrollOffset, spacing);
+    for (CGFloat y = 64.0 + offset; y < NSHeight(self.bounds); y += spacing) {
+        [grid moveToPoint:NSMakePoint(0, y)];
+        [grid lineToPoint:NSMakePoint(NSWidth(self.bounds), y)];
+    }
+    [grid stroke];
+    [[NSColor systemCyanColor] setFill];
+    NSRect marker = NSMakeRect(self.markerPoint.x - 11.0,
+                               self.markerPoint.y - 11.0, 22.0, 22.0);
+    [[NSBezierPath bezierPathWithOvalInRect:marker] fill];
 }
 - (void)mouseDown:(NSEvent *)event {
     [self.window makeFirstResponder:self];
+    self.markerPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    [self setNeedsDisplay:YES];
     [self.recorder record:@"left_down" event:event details:nil];
 }
 - (void)mouseUp:(NSEvent *)event {
     [self.recorder record:@"left_up" event:event details:nil];
 }
 - (void)mouseDragged:(NSEvent *)event {
+    self.markerPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    [self setNeedsDisplay:YES];
     [self.recorder record:@"left_drag" event:event details:@{
         @"delta_x": @(event.deltaX), @"delta_y": @(event.deltaY)}];
 }
@@ -208,6 +270,8 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     [self.recorder record:@"other_up" event:event details:nil];
 }
 - (void)mouseMoved:(NSEvent *)event {
+    self.markerPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    [self setNeedsDisplay:YES];
     [self.recorder record:@"move" event:event details:nil];
 }
 - (void)mouseEntered:(NSEvent *)event {
@@ -217,6 +281,8 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     [self.recorder record:@"exited" event:event details:nil];
 }
 - (void)scrollWheel:(NSEvent *)event {
+    self.scrollOffset += event.scrollingDeltaY;
+    [self setNeedsDisplay:YES];
     [self.recorder record:@"scroll" event:event details:@{
         @"delta_x": @(event.scrollingDeltaX),
         @"delta_y": @(event.scrollingDeltaY),
@@ -226,6 +292,9 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
     }];
 }
 - (void)magnifyWithEvent:(NSEvent *)event {
+    self.magnification = fmax(0.5, fmin(2.0,
+        self.magnification + event.magnification));
+    [self setNeedsDisplay:YES];
     [self.recorder record:@"magnify" event:event details:@{
         @"magnification": @(event.magnification),
         @"phase": @(event.phase),
@@ -275,35 +344,39 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) NSTextField *status;
 @property(nonatomic, strong) MacWSInputRecorder *recorder;
+@property(nonatomic, strong) NSDictionary *pendingStatusState;
+@property(nonatomic) BOOL statusUpdateScheduled;
 @end
 
 @implementation MacWSInputLabDelegate
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
-    unsigned int factoryCount = 0;
-    Method *factories = class_copyMethodList(object_getClass(NSEvent.class),
-                                              &factoryCount);
-    for (unsigned int index = 0; index < factoryCount; index++) {
-        const char *name = sel_getName(method_getName(factories[index]));
-        if (name && (strcasestr(name, "scroll") ||
-                     strcasestr(name, "momentum"))) {
-            fprintf(stderr, "INPUTLAB NSEVENT-FACTORY %s types=%s\n", name,
-                    method_getTypeEncoding(factories[index]));
+    if (MacWSInputLabDiagnosticsEnabled()) {
+        unsigned int factoryCount = 0;
+        Method *factories = class_copyMethodList(object_getClass(NSEvent.class),
+                                                  &factoryCount);
+        for (unsigned int index = 0; index < factoryCount; index++) {
+            const char *name = sel_getName(method_getName(factories[index]));
+            if (name && (strcasestr(name, "scroll") ||
+                         strcasestr(name, "momentum"))) {
+                fprintf(stderr, "INPUTLAB NSEVENT-FACTORY %s types=%s\n", name,
+                        method_getTypeEncoding(factories[index]));
+            }
         }
-    }
-    free(factories);
-    unsigned int windowMethodCount = 0;
-    Method *windowMethods = class_copyMethodList(NSWindow.class,
-                                                  &windowMethodCount);
-    for (unsigned int index = 0; index < windowMethodCount; index++) {
-        const char *name = sel_getName(method_getName(windowMethods[index]));
-        if (name && (strcasestr(name, "scroll") ||
-                     strcasestr(name, "momentum"))) {
-            fprintf(stderr, "INPUTLAB NSWINDOW-METHOD %s types=%s\n", name,
-                    method_getTypeEncoding(windowMethods[index]));
+        free(factories);
+        unsigned int windowMethodCount = 0;
+        Method *windowMethods = class_copyMethodList(NSWindow.class,
+                                                      &windowMethodCount);
+        for (unsigned int index = 0; index < windowMethodCount; index++) {
+            const char *name = sel_getName(method_getName(windowMethods[index]));
+            if (name && (strcasestr(name, "scroll") ||
+                         strcasestr(name, "momentum"))) {
+                fprintf(stderr, "INPUTLAB NSWINDOW-METHOD %s types=%s\n", name,
+                        method_getTypeEncoding(windowMethods[index]));
+            }
         }
+        free(windowMethods);
     }
-    free(windowMethods);
     self.recorder = [MacWSInputRecorder new];
     NSRect frame = NSMakeRect(160, 120, 860, 620);
     self.window = [[MacWSInputWindow alloc] initWithContentRect:frame
@@ -358,10 +431,24 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
 
     __weak typeof(self) weakSelf = self;
     self.recorder.stateChanged = ^(NSDictionary *state) {
-        weakSelf.status.stringValue = [NSString stringWithFormat:
-            @"sequence=%@  last=%@\n%@\nlog=%@",
-            state[@"sequence"], state[@"last_event"], state[@"counts"],
-            MacWSEventLogPath];
+        MacWSInputLabDelegate *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.pendingStatusState = state;
+        if (strongSelf.statusUpdateScheduled) return;
+        strongSelf.statusUpdateScheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     16 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSInputLabDelegate *innerSelf = weakSelf;
+            if (!innerSelf) return;
+            NSDictionary *latest = innerSelf.pendingStatusState;
+            innerSelf.pendingStatusState = nil;
+            innerSelf.statusUpdateScheduled = NO;
+            innerSelf.status.stringValue = [NSString stringWithFormat:
+                @"sequence=%@  last=%@\n%@\nlog=%@",
+                latest[@"sequence"], latest[@"last_event"],
+                latest[@"counts"], MacWSEventLogPath];
+        });
     };
 
     NSMenu *mainMenu = [NSMenu new];

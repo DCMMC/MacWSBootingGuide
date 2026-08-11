@@ -425,6 +425,33 @@
         [self requestWindowList];
     } else if (strcmp(eventName, MACWS_STREAM_EVENT_FRAME) == 0) {
         [self handleFrameEvent:event];
+    } else if (strcmp(eventName,
+                      MACWS_STREAM_EVENT_LAYER_GEOMETRY) == 0) {
+        uint64_t receiptTime = mach_absolute_time();
+        size_t byteCount = 0;
+        const MacWSStreamLayerGeometry *updates =
+            xpc_dictionary_get_data(event,
+                MACWS_STREAM_KEY_LAYER_GEOMETRY, &byteCount);
+        NSUInteger count = byteCount / sizeof(MacWSStreamLayerGeometry);
+        BOOL valid = updates && byteCount != 0 &&
+            byteCount % sizeof(MacWSStreamLayerGeometry) == 0 &&
+            count <= MACWS_STREAM_MAX_LAYER_GEOMETRY;
+        for (NSUInteger index = 0; valid && index < count; index++) {
+            const MacWSStreamLayerGeometry *geometry = &updates[index];
+            valid = MacWSStreamLayerGeometryIsValid(
+                geometry, sizeof(*geometry)) &&
+                ((self.mode == MacWSStreamModeFullscreen &&
+                  geometry->windowID == 0) ||
+                 (self.mode == MacWSStreamModeWindow &&
+                  geometry->windowID == self.windowID));
+        }
+        if (!valid) return;
+        NSData *payload = [NSData dataWithBytes:updates length:byteCount];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.delegate streamClient:self
+                receivedLayerGeometryUpdates:payload
+                               receiptTime:receiptTime];
+        });
     } else if (strcmp(eventName, MACWS_STREAM_EVENT_LAYER_REMOVED) == 0) {
         uint64_t baseWindowID = xpc_dictionary_get_uint64(
             event, MACWS_STREAM_KEY_WINDOW_ID);

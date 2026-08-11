@@ -28,12 +28,23 @@ typedef NS_ENUM(NSInteger, MacWSPerformanceHUDMode) {
 
 - (void)recordInputKind:(uint16_t)kind
              sampleTime:(CFTimeInterval)sampleTime
+              targetPID:(int32_t)targetPID
        transportSuccess:(BOOL)success;
 
 - (void)recordFrameReceivedForStream:(uint64_t)streamID
                             sequence:(uint64_t)sequence
+                       layerWindowID:(uint32_t)layerWindowID
+                            ownerPID:(int32_t)ownerPID
                          captureTime:(uint64_t)captureTime
                          receiptTime:(uint64_t)receiptTime;
+
+- (void)recordGeometryReceivedForStream:(uint64_t)streamID
+                                sequence:(uint64_t)sequence
+                           layerWindowID:(uint32_t)layerWindowID
+                                ownerPID:(int32_t)ownerPID
+                             captureTime:(uint64_t)captureTime
+                             receiptTime:(uint64_t)receiptTime;
+- (void)recordGeometryBatchReceived;
 
 // Call before -presentDrawable:. This registers Metal completion and actual
 // drawable-presentation handlers, so the result is visible-frame timing and

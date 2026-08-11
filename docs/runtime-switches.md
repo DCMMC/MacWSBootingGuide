@@ -176,6 +176,10 @@ but that run must not be reported as a production performance result.
 
 These production controls are independent of `MACWS_RUNTIME_DIAGNOSTICS`:
 
+`MACWS_INPUTLAB_DIAGNOSTICS` is intentionally absent from the shipped InputLab
+job. It enables private AppKit boundary traces only in a temporary diagnostic
+job; scored runs keep those synchronous logs off.
+
 | Control | Default | Scope | Meaning |
 |---|---|---|---|
 | `MacWSPerformanceHUDMode` (`NSUserDefaults`) | `0` | each Host Scene | `0` off, `1` compact, `2` full; off has one atomic fast-path check unless an explicit Reset-to-Export recording is active |
@@ -184,7 +188,7 @@ These production controls are independent of `MACWS_RUNTIME_DIAGNOSTICS`:
 | `macwshost://performance-snapshot` | explicit | active Host Scene | writes `latest.json` and a timestamped bounded archive |
 | `macwshost://performance-hud-{off,compact,full}` | off | active Host Scene | changes only the MacWS overlay |
 | `macwshost://system-performance-hud-{on,off}` | off | system-wide | selects Apple Full level 5 or clears flag `0x10000000` |
-| `macwshost://performance-gesture-{tap,double-tap,right-tap,drag,scroll,magnify,three-up,three-down,three-left,three-right}` | explicit | active Host Scene | one bounded replay through the production Host controller input boundary |
+| `macwshost://performance-gesture-{tap,double-tap,right-tap,hover,drag,long-drag,scroll,scroll-momentum,magnify,three-up,three-down,three-left,three-right}` | explicit | active Host Scene | one bounded replay through the production Host controller input boundary |
 | `macwshost://performance-gesture-suite` | explicit | active Host Scene | resets, runs every applicable scenario, and exports JSON |
 
 `misc/macws_ui_profile.py` always switches both visual HUDs off before a scored

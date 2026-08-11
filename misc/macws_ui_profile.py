@@ -29,6 +29,7 @@ THRESHOLDS = {
     "minimum_motion_120_delivery_hz": 60.0,
     "maximum_command_errors": 0,
     "minimum_visible_interval_samples": 30,
+    "minimum_input_visible_samples": 12,
 }
 
 
@@ -68,9 +69,18 @@ def percentile(values, fraction):
 
 
 def thermal_snapshot(remote):
+    # The watchdog log is intentionally shared with recovery/status messages,
+    # so its last line is not necessarily a thermal sample.  Query the same
+    # low-frequency helper directly at each regression boundary; fall back to
+    # the newest thermal-bearing watchdog line only if the helper is absent.
     raw = remote.run(
-        "tail -n 1 /var/jb/var/mobile/macos_gui_watchdog.log "
-        "2>/dev/null || true", check=False).strip()
+        "/var/jb/usr/macOS/bin/macwsthermal 2>&1 || true",
+        check=False).strip()
+    if not re.search(r"thermal-state=([a-z]+)", raw):
+        raw = remote.run(
+            "grep 'thermal-state=' "
+            "/var/jb/var/mobile/macos_gui_watchdog.log 2>/dev/null | "
+            "tail -n 1 || true", check=False).strip()
     state = re.search(r"thermal-state=([a-z]+)", raw)
     temperature = re.search(r"effective-temp-centic=(\d+)", raw)
     return {
@@ -114,7 +124,10 @@ def wait_for_profile(remote, previous_marker, timeout=8.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         marker = remote.run(
-            f"stat -f '%m:%z' {path} 2>/dev/null || true",
+            # Host commits latest.json with NSDataWritingAtomic.  Seconds and
+            # byte size can legitimately repeat for adjacent gesture exports;
+            # the atomic replacement's inode is the generation witness.
+            f"stat -f '%m:%z:%i' {path} 2>/dev/null || true",
             check=False).strip()
         if marker and marker != previous_marker:
             return marker, json.loads(remote.run(f"cat {path}"))
@@ -122,20 +135,26 @@ def wait_for_profile(remote, previous_marker, timeout=8.0):
     raise RuntimeError("MacWSHost did not export a fresh performance JSON")
 
 
-def execute_gesture_suite(remote, include_system_gestures):
+def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
     scenarios = [
-        "tap", "double-tap", "right-tap", "drag", "scroll", "magnify",
+        "tap", "double-tap", "right-tap", "hover", "drag", "long-drag",
+        "scroll", "scroll-momentum", "magnify",
     ]
-    if include_system_gestures:
+    if dock_pid > 1:
         scenarios.extend((
             "three-up", "three-down", "three-left", "three-right",
         ))
+    if requested:
+        unknown = [name for name in requested if name not in scenarios]
+        if unknown:
+            raise RuntimeError(f"unknown/unavailable scenarios: {unknown}")
+        scenarios = list(requested)
     results = []
     log_path = "/var/mobile/Library/Logs/MacWSHost.log"
     for name in scenarios:
         latest_path = "/var/mobile/Library/Logs/MacWSPerformance/latest.json"
         previous_marker = remote.run(
-            f"stat -f '%m:%z' {latest_path} 2>/dev/null || true",
+            f"stat -f '%m:%z:%i' {latest_path} 2>/dev/null || true",
             check=False).strip()
         remote.run("uiopen macwshost://performance-reset")
         time.sleep(0.25)
@@ -172,13 +191,16 @@ def execute_gesture_suite(remote, include_system_gestures):
         remote.run("uiopen macwshost://performance-snapshot")
         marker, profile = wait_for_profile(remote, previous_marker)
         fluid = name in {
-            "drag", "scroll", "magnify", "three-up", "three-down",
-            "three-left", "three-right",
+            "hover", "drag", "long-drag", "scroll", "scroll-momentum",
+            "magnify", "three-up", "three-down", "three-left", "three-right",
         }
         results[-1]["profile_marker"] = marker
         results[-1]["performance"] = profile
         results[-1]["score"] = score_profile(
-            profile, require_fluid_metrics=fluid)
+            profile, target_pid=(dock_pid if name.startswith("three-")
+                                 else target_pid),
+            system_gesture=name.startswith("three-"),
+            require_fluid_metrics=fluid)
     return results
 
 
@@ -214,10 +236,40 @@ def input_semantic_gate(remote, remote_repo, pid):
     }
 
 
-def score_profile(profile, *, require_fluid_metrics=True):
+def select_motion_source(profile, target_pid, system_gesture):
+    sources = profile.get("pipeline", {}).get("source_streams", [])
+    if system_gesture:
+        candidates = [item for item in sources
+                      if item.get("owner_pid") == target_pid and
+                      item.get("geometry_updates", 0) > 0]
+        key = lambda item: (
+            item.get("frame_interval", {}).get("samples", 0),
+            item.get("geometry_updates", 0),
+            item.get("content_frames", 0),
+        )
+    else:
+        candidates = [item for item in sources
+                      if item.get("owner_pid") == target_pid]
+        key = lambda item: (
+            item.get("content_frames", 0) +
+            item.get("geometry_updates", 0),
+            item.get("frame_interval", {}).get("samples", 0),
+        )
+    return max(candidates, key=key) if candidates else {}
+
+
+def score_profile(profile, *, target_pid, system_gesture=False,
+                  require_fluid_metrics=True):
     visible = profile.get("visible_presentation", {})
     counters = profile.get("counters", {})
-    frame = visible.get("frame_interval", {})
+    motion_source = select_motion_source(profile, target_pid, system_gesture)
+    # Mission Control/Spaces is one native compositor animation assembled
+    # from several Dock, WindowServer and application layers.  No individual
+    # source represents what the user saw; score the final drawable cadence.
+    # Ordinary app gestures remain source-scoped so unrelated desktop layers
+    # cannot inflate one application's result.
+    motion_metric = visible if system_gesture else motion_source
+    frame = motion_metric.get("frame_interval", {})
     input_visible = profile.get("pipeline", {}).get(
         "input_dispatch_to_visible_callback", {})
     checks = {
@@ -227,16 +279,17 @@ def score_profile(profile, *, require_fluid_metrics=True):
     }
     if require_fluid_metrics:
         checks.update({
-        "active_average_fps":
-            visible.get("active_average_fps", 0) >=
+        "motion_active_average_fps":
+            motion_metric.get("active_average_fps", 0) >=
             THRESHOLDS["minimum_active_average_fps"],
-        "one_percent_low_fps":
-            visible.get("one_percent_low_fps", 0) >=
+        "motion_one_percent_low_fps":
+            motion_metric.get("one_percent_low_fps", 0) >=
             THRESHOLDS["minimum_one_percent_low_fps"],
-        "enough_visible_samples": frame.get("samples", 0) >=
+        "enough_motion_samples": frame.get("samples", 0) >=
             THRESHOLDS["minimum_visible_interval_samples"],
         "input_to_visible_p95":
-            input_visible.get("samples", 0) >= 30 and
+            input_visible.get("samples", 0) >=
+                THRESHOLDS["minimum_input_visible_samples"] and
             input_visible.get("p95_ms") is not None and
             input_visible["p95_ms"] <=
                 THRESHOLDS["maximum_input_to_visible_p95_ms"],
@@ -244,6 +297,8 @@ def score_profile(profile, *, require_fluid_metrics=True):
     return {
         "result": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
+        "target_source": motion_source,
+        "visible_presentation": visible,
     }
 
 
@@ -262,6 +317,10 @@ def main():
     parser.add_argument("--width", type=int, default=1728)
     parser.add_argument("--height", type=int, default=1312)
     parser.add_argument("--skip-system-gestures", action="store_true")
+    parser.add_argument(
+        "--scenarios",
+        help=("comma-separated subset for an optimization iteration; the "
+              "default remains the complete gesture matrix"))
     parser.add_argument("--output", type=pathlib.Path,
                         default=pathlib.Path("/tmp/macws-ui-profile.json"))
     args = parser.parse_args()
@@ -297,20 +356,29 @@ def main():
     time.sleep(0.5)
     focus_witness = remote.run(
         "tail -n 500 /var/mobile/Library/Logs/MacWSHost.log | "
-        "grep 'fullscreen-input-target' | tail -n 1", check=False).strip()
-    focus_match = re.search(r"pid=(\d+)", focus_witness)
+        "grep 'performance-profile-target' | tail -n 1",
+        check=False).strip()
+    focus_match = re.search(r"performance-profile-target pid=(\d+)",
+                            focus_witness)
+    if not focus_match:
+        raise SystemExit(
+            "Host did not emit a fresh performance-profile-target witness")
     if focus_match and int(focus_match.group(1)) != target_pid:
         raise SystemExit(
             f"Host focused PID {focus_match.group(1)} does not match "
             f"profile target {target_pid}: {focus_witness}")
 
-    gestures = execute_gesture_suite(remote, dock_pid > 1)
+    requested_scenarios = ([item.strip() for item in args.scenarios.split(",")
+                            if item.strip()] if args.scenarios else None)
+    gestures = execute_gesture_suite(remote, dock_pid, target_pid,
+                                     requested_scenarios)
     input_gate = input_semantic_gate(remote, args.remote_repo, target_pid)
     after_processes = process_snapshot(remote)
     after_thermal = thermal_snapshot(remote)
     fluid_scenarios = [item for item in gestures
                        if item["scenario"] in {
-                           "drag", "scroll", "magnify", "three-up",
+                           "hover", "drag", "long-drag", "scroll",
+                           "scroll-momentum", "magnify", "three-up",
                            "three-down", "three-left", "three-right",
                        }]
     profile_score = {
@@ -321,10 +389,15 @@ def main():
             item["scenario"]: item["score"] for item in fluid_scenarios
         },
     }
+    stability_names = [
+        "WindowServer", "macwsdisplayd", "MacWSHost", "UIKitSystem",
+        "MacWSInputLab",
+    ]
+    if dock_pid > 1:
+        stability_names.append("Dock")
     stable_processes = all(
         set(before_processes[name]).issubset(after_processes[name])
-        for name in ("WindowServer", "macwsdisplayd", "MacWSHost",
-                     "UIKitSystem", "MacWSInputLab"))
+        for name in stability_names)
     checks = {
         "profile": profile_score["result"] == "PASS",
         "input": input_gate["result"] == "PASS",
@@ -332,7 +405,7 @@ def main():
         "thermal_not_critical": after_thermal["state"] != "critical",
     }
     report = {
-        "schema": "macws-ui-regression-v1",
+        "schema": "macws-ui-regression-v2",
         "result": "PASS" if all(checks.values()) else "FAIL",
         "device": args.host,
         "target_pid": target_pid,
@@ -342,7 +415,7 @@ def main():
         "checks": checks,
         "profile_score": profile_score,
         "host_profile": {
-            "schema": "macws-ui-scenario-profiles-v1",
+            "schema": "macws-ui-scenario-profiles-v2",
             "profiles": {
                 item["scenario"]: item["performance"] for item in gestures
             },

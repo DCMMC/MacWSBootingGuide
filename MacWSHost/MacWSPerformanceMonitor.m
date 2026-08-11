@@ -19,6 +19,19 @@ typedef struct {
     NSUInteger cursor;
 } MacWSPerfRing;
 
+static const NSUInteger MacWSPerfSourceCapacity = 64;
+typedef struct {
+    uint64_t streamID;
+    uint64_t lastCaptureTime;
+    uint64_t lastReceiptTime;
+    uint64_t contentFrames;
+    uint64_t geometryUpdates;
+    uint32_t layerWindowID;
+    int32_t ownerPID;
+    bool dirtySinceSubmission;
+    MacWSPerfRing intervals;
+} MacWSPerfSource;
+
 static void MacWSPerfRingReset(MacWSPerfRing *ring) {
     memset(ring, 0, sizeof(*ring));
 }
@@ -115,6 +128,9 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     BOOL _explicitRecording;
 
     uint64_t _framesReceived;
+    uint64_t _contentFramesReceived;
+    uint64_t _geometryUpdatesReceived;
+    uint64_t _geometryBatchesReceived;
     uint64_t _framesSubmitted;
     uint64_t _framesPresented;
     uint64_t _commandErrors;
@@ -127,8 +143,6 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     uint64_t _inactiveGapCount;
     uint64_t _staleCaptureSamples;
 
-    uint64_t _lastReceivedStream;
-    uint64_t _lastReceivedCaptureTime;
     uint64_t _lastSubmittedStream;
     uint64_t _lastSubmittedSequence;
     double _lastPresentedSeconds;
@@ -136,6 +150,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     uint64_t _lastInputMachTime;
     uint64_t _pendingInputMachTime;
     uint16_t _pendingInputKind;
+    int32_t _pendingInputTargetPID;
 
     MacWSPerfRing _sourceIntervals;
     MacWSPerfRing _presentIntervals;
@@ -146,6 +161,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     MacWSPerfRing _gpuExecution;
     MacWSPerfRing _captureToPresent;
     MacWSPerfRing _inputToPresent;
+    MacWSPerfSource _sources[64];
 
     UIVisualEffectView *_HUDMaterial;
     UILabel *_HUDLabel;
@@ -270,6 +286,9 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     _resetDate = NSDate.date;
     _resetReason = [reason copy] ?: @"manual";
     _framesReceived = 0;
+    _contentFramesReceived = 0;
+    _geometryUpdatesReceived = 0;
+    _geometryBatchesReceived = 0;
     _framesSubmitted = 0;
     _framesPresented = 0;
     _commandErrors = 0;
@@ -281,8 +300,6 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     _stallCount = 0;
     _inactiveGapCount = 0;
     _staleCaptureSamples = 0;
-    _lastReceivedStream = 0;
-    _lastReceivedCaptureTime = 0;
     _lastSubmittedStream = 0;
     _lastSubmittedSequence = 0;
     _lastPresentedSeconds = 0.0;
@@ -290,6 +307,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     _lastInputMachTime = 0;
     _pendingInputMachTime = 0;
     _pendingInputKind = 0;
+    _pendingInputTargetPID = 0;
     MacWSPerfRingReset(&_sourceIntervals);
     MacWSPerfRingReset(&_presentIntervals);
     MacWSPerfRingReset(&_observedPresentIntervals);
@@ -299,6 +317,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     MacWSPerfRingReset(&_gpuExecution);
     MacWSPerfRingReset(&_captureToPresent);
     MacWSPerfRingReset(&_inputToPresent);
+    memset(_sources, 0, sizeof(_sources));
     os_unfair_lock_unlock(&_lock);
     if (self.HUDMode != MacWSPerformanceHUDModeOff)
         dispatch_async(dispatch_get_main_queue(), ^{ [self updateHUD]; });
@@ -306,6 +325,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
 
 - (void)recordInputKind:(uint16_t)kind
              sampleTime:(CFTimeInterval)sampleTime
+              targetPID:(int32_t)targetPID
        transportSuccess:(BOOL)success {
     (void)sampleTime;
     if (!atomic_load(&_instrumentationActive)) return;
@@ -321,6 +341,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         if (!_pendingInputMachTime) {
             _pendingInputMachTime = now;
             _pendingInputKind = kind;
+            _pendingInputTargetPID = targetPID;
         }
     } else {
         _inputTransportErrors++;
@@ -328,23 +349,54 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     os_unfair_lock_unlock(&_lock);
 }
 
-- (void)recordFrameReceivedForStream:(uint64_t)streamID
-                            sequence:(uint64_t)sequence
-                         captureTime:(uint64_t)captureTime
-                         receiptTime:(uint64_t)receiptTime {
+- (void)recordSourceForStream:(uint64_t)streamID
+                     sequence:(uint64_t)sequence
+                layerWindowID:(uint32_t)layerWindowID
+                     ownerPID:(int32_t)ownerPID
+                  captureTime:(uint64_t)captureTime
+                  receiptTime:(uint64_t)receiptTime
+                     geometry:(BOOL)geometry {
     (void)sequence;
     if (!atomic_load(&_instrumentationActive)) return;
     os_unfair_lock_lock(&_lock);
     _framesReceived++;
-    if (_lastReceivedStream == streamID && _lastReceivedCaptureTime &&
-        captureTime > _lastReceivedCaptureTime) {
-        double interval = MacWSPerfMachMilliseconds(_lastReceivedCaptureTime,
-                                                    captureTime);
-        if (interval <= MacWSPerfActiveGapMilliseconds)
-            MacWSPerfRingAppend(&_sourceIntervals, interval);
+    if (geometry) _geometryUpdatesReceived++;
+    else _contentFramesReceived++;
+    MacWSPerfSource *source = NULL;
+    MacWSPerfSource *empty = NULL;
+    for (NSUInteger index = 0; index < MacWSPerfSourceCapacity; index++) {
+        MacWSPerfSource *candidate = &_sources[index];
+        if (candidate->streamID == streamID) {
+            source = candidate;
+            break;
+        }
+        if (!candidate->streamID && !empty) empty = candidate;
     }
-    _lastReceivedStream = streamID;
-    _lastReceivedCaptureTime = captureTime;
+    if (!source && streamID) {
+        source = empty ?: &_sources[streamID % MacWSPerfSourceCapacity];
+        memset(source, 0, sizeof(*source));
+        source->streamID = streamID;
+    }
+    if (source) {
+        if (layerWindowID) source->layerWindowID = layerWindowID;
+        if (ownerPID > 0) source->ownerPID = ownerPID;
+        if (geometry) source->geometryUpdates++;
+        else source->contentFrames++;
+        if (source->lastCaptureTime &&
+            captureTime > source->lastCaptureTime) {
+            double interval = MacWSPerfMachMilliseconds(
+                source->lastCaptureTime, captureTime);
+            if (interval <= MacWSPerfActiveGapMilliseconds) {
+                MacWSPerfRingAppend(&_sourceIntervals, interval);
+                MacWSPerfRingAppend(&source->intervals, interval);
+            }
+        }
+        if (captureTime > source->lastCaptureTime)
+            source->lastCaptureTime = captureTime;
+        if (receiptTime > source->lastReceiptTime)
+            source->lastReceiptTime = receiptTime;
+        source->dirtySinceSubmission = true;
+    }
     double captureReceipt = MacWSPerfMachMilliseconds(captureTime,
                                                       receiptTime);
     // displayd may explicitly republish a retained static IOSurface after a
@@ -354,6 +406,35 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         MacWSPerfRingAppend(&_captureToReceipt, captureReceipt);
     else
         _staleCaptureSamples++;
+    os_unfair_lock_unlock(&_lock);
+}
+
+- (void)recordFrameReceivedForStream:(uint64_t)streamID
+                            sequence:(uint64_t)sequence
+                       layerWindowID:(uint32_t)layerWindowID
+                            ownerPID:(int32_t)ownerPID
+                         captureTime:(uint64_t)captureTime
+                         receiptTime:(uint64_t)receiptTime {
+    [self recordSourceForStream:streamID sequence:sequence
+        layerWindowID:layerWindowID ownerPID:ownerPID
+        captureTime:captureTime receiptTime:receiptTime geometry:NO];
+}
+
+- (void)recordGeometryReceivedForStream:(uint64_t)streamID
+                                sequence:(uint64_t)sequence
+                           layerWindowID:(uint32_t)layerWindowID
+                                ownerPID:(int32_t)ownerPID
+                             captureTime:(uint64_t)captureTime
+                             receiptTime:(uint64_t)receiptTime {
+    [self recordSourceForStream:streamID sequence:sequence
+        layerWindowID:layerWindowID ownerPID:ownerPID
+        captureTime:captureTime receiptTime:receiptTime geometry:YES];
+}
+
+- (void)recordGeometryBatchReceived {
+    if (!atomic_load(&_instrumentationActive)) return;
+    os_unfair_lock_lock(&_lock);
+    _geometryBatchesReceived++;
     os_unfair_lock_unlock(&_lock);
 }
 
@@ -380,10 +461,31 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
             MacWSPerfMachMilliseconds(receiptTime, submitTime));
     }
     // Never pair input with a redraw of a frame captured before that input.
-    if (_pendingInputMachTime && receiptTime >= _pendingInputMachTime) {
+    BOOL inputTargetUpdated = NO;
+    BOOL dirtyFrameAfterReset = NO;
+    for (NSUInteger index = 0; index < MacWSPerfSourceCapacity; index++) {
+        MacWSPerfSource *source = &_sources[index];
+        if (source->dirtySinceSubmission &&
+            source->lastReceiptTime >= _resetMachTime)
+            dirtyFrameAfterReset = YES;
+        if (source->dirtySinceSubmission && _pendingInputMachTime &&
+            source->lastReceiptTime >= _pendingInputMachTime &&
+            (_pendingInputTargetPID <= 1 ||
+             source->ownerPID == _pendingInputTargetPID))
+            inputTargetUpdated = YES;
+        source->dirtySinceSubmission = false;
+    }
+    // A drawable may composite several streams. The caller passes the newest
+    // representative stream for capture/receipt timing, but that stream can
+    // be a retained static overlay while another source supplied the fresh
+    // pixels. Count the presentation whenever any included source was dirty;
+    // otherwise valid target-correlated input samples disappear.
+    newlyReceivedFrame = newlyReceivedFrame || dirtyFrameAfterReset;
+    if (_pendingInputMachTime && inputTargetUpdated) {
         inputMachTime = _pendingInputMachTime;
         _pendingInputMachTime = 0;
         _pendingInputKind = 0;
+        _pendingInputTargetPID = 0;
     }
     os_unfair_lock_unlock(&_lock);
 
@@ -473,6 +575,8 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
 }
 
 - (NSDictionary<NSString *, id> *)snapshotWithReason:(NSString *)reason {
+    MacWSPerfSource *sourcesCopy = calloc(MacWSPerfSourceCapacity,
+                                          sizeof(MacWSPerfSource));
     os_unfair_lock_lock(&_lock);
     NSDictionary *present = MacWSPerfRingSummary(&_presentIntervals);
     NSDictionary *observedPresent =
@@ -485,6 +589,9 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     NSDictionary *capturePresent = MacWSPerfRingSummary(&_captureToPresent);
     NSDictionary *inputPresent = MacWSPerfRingSummary(&_inputToPresent);
     uint64_t framesReceived = _framesReceived;
+    uint64_t contentFramesReceived = _contentFramesReceived;
+    uint64_t geometryUpdatesReceived = _geometryUpdatesReceived;
+    uint64_t geometryBatchesReceived = _geometryBatchesReceived;
     uint64_t framesSubmitted = _framesSubmitted;
     uint64_t framesPresented = _framesPresented;
     uint64_t commandErrors = _commandErrors;
@@ -502,7 +609,44 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     NSDate *resetDate = _resetDate;
     NSString *resetReason = _resetReason;
     BOOL instrumentationActive = atomic_load(&_instrumentationActive);
+    if (sourcesCopy)
+        memcpy(sourcesCopy, _sources, sizeof(_sources));
     os_unfair_lock_unlock(&_lock);
+
+    NSMutableArray<NSDictionary *> *sourceStreams = [NSMutableArray array];
+    if (sourcesCopy) {
+        for (NSUInteger index = 0; index < MacWSPerfSourceCapacity; index++) {
+            MacWSPerfSource *item = &sourcesCopy[index];
+            if (!item->streamID) continue;
+            NSDictionary *interval = MacWSPerfRingSummary(&item->intervals);
+            NSNumber *mean = interval[@"mean_ms"];
+            NSNumber *p99 = interval[@"p99_ms"];
+            double fps = [mean isKindOfClass:NSNumber.class] &&
+                         mean.doubleValue > 0.0
+                ? 1000.0 / mean.doubleValue : 0.0;
+            double low = [p99 isKindOfClass:NSNumber.class] &&
+                         p99.doubleValue > 0.0
+                ? 1000.0 / p99.doubleValue : 0.0;
+            [sourceStreams addObject:@{
+                @"stream_id": @(item->streamID),
+                @"layer_window_id": @(item->layerWindowID),
+                @"owner_pid": @(item->ownerPID),
+                @"content_frames": @(item->contentFrames),
+                @"geometry_updates": @(item->geometryUpdates),
+                @"active_average_fps": @(fps),
+                @"one_percent_low_fps": @(low),
+                @"frame_interval": interval,
+            }];
+        }
+        free(sourcesCopy);
+    }
+    [sourceStreams sortUsingComparator:^NSComparisonResult(
+            NSDictionary *left, NSDictionary *right) {
+        NSComparisonResult owner = [left[@"owner_pid"]
+            compare:right[@"owner_pid"]];
+        if (owner != NSOrderedSame) return owner;
+        return [left[@"layer_window_id"] compare:right[@"layer_window_id"]];
+    }];
 
     NSNumber *meanFrame = present[@"mean_ms"];
     NSNumber *p99Frame = present[@"p99_ms"];
@@ -557,6 +701,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         },
         @"pipeline": @{
             @"source_frame_interval": source,
+            @"source_streams": sourceStreams,
             @"capture_to_host_receipt": captureReceipt,
             @"host_receipt_to_submit": receiptSubmit,
             @"submit_to_command_complete": submitComplete,
@@ -566,6 +711,9 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         },
         @"counters": @{
             @"frames_received": @(framesReceived),
+            @"content_frames_received": @(contentFramesReceived),
+            @"geometry_updates_received": @(geometryUpdatesReceived),
+            @"geometry_batches_received": @(geometryBatchesReceived),
             @"frames_submitted": @(framesSubmitted),
             @"frames_presented": @(framesPresented),
             @"command_errors": @(commandErrors),
@@ -585,7 +733,9 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         @"measurement_notes": @[
             @"Interactive FPS uses CAMetalDrawable presentation callbacks within 250 ms of Host input; gaps over 150 ms are excluded.",
             @"Observed frame interval remains available for autonomous animation/WebGL workloads that do not emit input.",
-            @"Input latency pairs the oldest unrepresented Host input with the first subsequently captured DisplayStream frame.",
+            @"Source cadence is tracked independently by producer stream/owner; the aggregate includes every active desktop layer and must not be used to score one target app.",
+            @"Content IOSurface frames and lease-free layer geometry transactions have separate counters.",
+            @"Input latency pairs the oldest unrepresented Host input only with a subsequently captured DisplayStream frame owned by that input target PID.",
             @"Synthetic transport probes do not measure physical finger-to-UIKit recognizer latency.",
         ],
     };

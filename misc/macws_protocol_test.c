@@ -24,7 +24,7 @@ int main(void) {
     assert(!MacWSPhysicalDisplayExtent(5000.0, 5000.0, 2.0, 8192,
                                        &physicalWidth, &physicalHeight));
     assert(MACWS_INPUT_VERSION == 4u);
-    assert(MACWS_STREAM_VERSION == 5u);
+    assert(MACWS_STREAM_VERSION == 6u);
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSInputKindDesktopCommand == 20);
@@ -235,6 +235,39 @@ int main(void) {
     assert(MacWSStreamMapDesktopPointToLayer(
         &movedFrame, 500.0f, 300.0f, &layerX, &layerY));
     assert(Near(layerX, 250.0f));
+    MacWSStreamLayerGeometry layerGeometry = {
+        .magic = MACWS_STREAM_MAGIC,
+        .version = MACWS_STREAM_VERSION,
+        .size = sizeof(layerGeometry),
+        .streamID = frame.streamID,
+        .sequence = frame.sequence + 1,
+        .displayTime = 1,
+        .windowID = 0,
+        .layerWindowID = frame.layerWindowID,
+        .layerOwnerPID = 99,
+        .layerLevel = 12,
+        .destinationX = -100,
+        .destinationY = 20,
+        .destinationWidth = 1000,
+        .destinationHeight = 800,
+        .flags = MacWSStreamFrameOverlay,
+    };
+    assert(MacWSStreamLayerGeometryIsValid(&layerGeometry,
+                                            sizeof(layerGeometry)));
+    assert(MacWSStreamLayerGeometrySupersedesFrame(&layerGeometry, &frame));
+    layerGeometry.sequence = frame.sequence;
+    assert(!MacWSStreamLayerGeometrySupersedesFrame(&layerGeometry, &frame));
+    layerGeometry.sequence++;
+    layerGeometry.streamID++;
+    assert(!MacWSStreamLayerGeometrySupersedesFrame(&layerGeometry, &frame));
+    layerGeometry.streamID = frame.streamID;
+    layerGeometry.flags = 0;
+    assert(!MacWSStreamLayerGeometryIsValid(&layerGeometry,
+                                             sizeof(layerGeometry)));
+    layerGeometry.flags = MacWSStreamFrameOverlay;
+    layerGeometry.destinationWidth = MACWS_STREAM_MAX_DIMENSION + 1;
+    assert(!MacWSStreamLayerGeometryIsValid(&layerGeometry,
+                                             sizeof(layerGeometry)));
     frame.bytesPerRow = 1;
     assert(!MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
     frame.bytesPerRow = 2732 * 4;

@@ -30,6 +30,7 @@ env	MACWS_APP_MOUNT_COMPAT	auto	custom-path apps, generic Catalyst children and 
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
 env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
+env	MACWS_INPUTLAB_DIAGNOSTICS	off	InputLab diagnostic	Enables private AppKit scroll/factory tracing only in a temporary regression job; the production test harness performs no synchronous diagnostic logging.
 env	MACWS_AGC_FASTMATH_HOOK	off	legacy diagnostic	Superseded compiler renamer experiment.
 env	MACWS_AGC_VERIFY_BYPASS	off	legacy diagnostic	Compiler verification bypass experiment.
 env	MACWS_AGXIOC_FUZZ	off	diagnostic	Mutates AGX selector-9 arguments.
