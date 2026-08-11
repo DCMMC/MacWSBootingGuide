@@ -16,6 +16,9 @@ LDID=/var/jb/usr/bin/ldid
 JBCTL=/var/jb/usr/bin/jbctl
 PYTHON=/var/jb/usr/bin/python3
 ROOTFS=/var/mnt/rootfs
+SIGN_ENT=$ENT
+SIGN_PROFILE=system
+APP_ENT=""
 
 # ── snapshot current trustcache so we can skip already-trusted entries ────────
 
@@ -23,13 +26,18 @@ TC_CACHE=$(mktemp /tmp/tc_cache.XXXXXX)
 # Dopamine's jbctl `list` subcommand silently returns an empty result on the
 # target.  `info` is its authoritative read-only inventory.
 "$JBCTL" trustcache info 2>/dev/null | tr '[:upper:]' '[:lower:]' > "$TC_CACHE"
-trap 'rm -f "$TC_CACHE"' EXIT
 printf 'Loaded %d existing trustcache entries.\n' "$(wc -l < "$TC_CACHE")"
 
 # ── counters (written to a tmp file because subshells can't update parent vars) ──
 
 COUNTS=$(mktemp /tmp/tc_counts.XXXXXX)
 printf '0 0 0 0\n' > "$COUNTS"   # signed  already_trusted  skipped  no_cdhash
+
+cleanup() {
+    rm -f "$TC_CACHE" "$COUNTS"
+    [ -n "$APP_ENT" ] && rm -f "$APP_ENT"
+}
+trap cleanup EXIT
 
 inc_counter() {
     # inc_counter <field 1-4>
@@ -42,16 +50,65 @@ inc_counter() {
     esac
     printf '%d %d %d %d\n' "$s" "$a" "$k" "$n" > "$COUNTS"
 }
-trap 'rm -f "$TC_CACHE" "$COUNTS"' EXIT
-
 # ── core sign + trustcache function ──────────────────────────────────────────
 
 sign_one() {
     local f="$1"
+    local effective_ent="$SIGN_ENT"
+    local current_ent="" merged_ent=""
+    local sign_result=0
     [ -f "$f" ] || return 0
 
-    # Sign with entitlements; ldid exits non-zero for non-Mach-O — skip silently.
-    if ! "$LDID" -S"$ENT" -M "$f" 2>/dev/null; then
+    if [ "$SIGN_PROFILE" = third-party-nonplatform ]; then
+        current_ent=$(mktemp /tmp/macws_current_entitlements.XXXXXX) || return 1
+        merged_ent=$(mktemp /tmp/macws_merged_entitlements.XXXXXX) || {
+            rm -f "$current_ent"
+            return 1
+        }
+        : > "$current_ent"
+        for entitlement_arch in arm64 arm64e x86_64; do
+            if "$LDID" -arch "$entitlement_arch" -e "$f" \
+                    > "$current_ent" 2>/dev/null &&
+               [ -s "$current_ent" ]; then
+                break
+            fi
+            : > "$current_ent"
+        done
+        if ! "$PYTHON" - "$SIGN_ENT" "$current_ent" "$merged_ent" <<'PY'
+import plistlib, sys
+
+with open(sys.argv[1], "rb") as stream:
+    project = plistlib.load(stream)
+vendor = {}
+try:
+    with open(sys.argv[2], "rb") as stream:
+        vendor = plistlib.load(stream)
+except (EOFError, OSError, plistlib.InvalidFileException):
+    pass
+vendor.update(project)
+vendor.pop("platform-application", None)
+with open(sys.argv[3], "wb") as stream:
+    plistlib.dump(vendor, stream, fmt=plistlib.FMT_XML, sort_keys=True)
+PY
+        then
+            rm -f "$current_ent" "$merged_ent"
+            return 1
+        fi
+        effective_ent=$merged_ent
+    fi
+
+    # `-M` cannot remove an entitlement which polluted an earlier signature.
+    # The non-platform profile above is already a complete vendor+project merge,
+    # so sign it directly. Other targets retain the historical merge behavior.
+    if [ "$SIGN_PROFILE" = third-party-nonplatform ]; then
+        "$LDID" -S"$effective_ent" "$f" 2>/dev/null
+        sign_result=$?
+    else
+        "$LDID" -S"$effective_ent" -M "$f" 2>/dev/null
+        sign_result=$?
+    fi
+    rm -f "$current_ent" "$merged_ent"
+    if [ "$sign_result" -ne 0 ]; then
         inc_counter 3   # skipped (non-Mach-O)
         return 0
     fi
@@ -121,6 +178,29 @@ for base, _, names in os.walk(sys.argv[1]):
     done
 }
 
+# A third-party application is not an iOS platform process.  Giving its main
+# executable `platform-application` makes PMAP_CS treat it as a platform main
+# binary. Runtime-confirmed with CleanMyMac X 4.15.8: the iPadOS 16.3.1 panic
+# named CleanMyMac as the panicked task and reported "attempted associating
+# duplicate platform main binary without matching address space layout".
+#
+# Retain the project's other compatibility permissions and `-M` vendor merge,
+# but remove only this incorrect identity bit for /Applications/*.app trees.
+prepare_third_party_app_profile() {
+    APP_ENT=$(mktemp /tmp/macws_app_entitlements.XXXXXX) || return 1
+    "$PYTHON" - "$ENT" "$APP_ENT" <<'PY'
+import plistlib, sys
+
+with open(sys.argv[1], "rb") as stream:
+    entitlements = plistlib.load(stream)
+entitlements.pop("platform-application", None)
+with open(sys.argv[2], "wb") as stream:
+    plistlib.dump(entitlements, stream, fmt=plistlib.FMT_XML, sort_keys=True)
+PY
+    SIGN_ENT=$APP_ENT
+    SIGN_PROFILE=third-party-nonplatform
+}
+
 # ── target selection ──────────────────────────────────────────────────────────
 
 TARGET="${1:-both}"
@@ -130,7 +210,13 @@ case "$TARGET" in
     homebrew|brew) DO_MACPORTS=0; DO_HOMEBREW=1 ;;
     both|"")       DO_MACPORTS=1; DO_HOMEBREW=1 ;;
     /*)
-        printf '=== Signing custom path: %s ===\n' "$TARGET"
+        case "$TARGET" in
+            "$ROOTFS"/Applications/*.app|"$ROOTFS"/Applications/*.app/*)
+                prepare_third_party_app_profile || exit 1
+                ;;
+        esac
+        printf '=== Signing custom path: %s (profile=%s) ===\n' \
+               "$TARGET" "$SIGN_PROFILE"
         sign_tree "$TARGET"
         read -r s a k n < "$COUNTS"
         printf '\nDone. newly-trusted=%d  already-trusted=%d  skipped(non-Mach-O)=%d  no-cdhash=%d\n' \

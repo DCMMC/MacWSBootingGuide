@@ -25,11 +25,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern pid_t audit_token_to_pid(audit_token_t token);
+
 #import "MacWSControlClient.h"
 #import "MacWSInteropClient.h"
 #import "MacWSMenuClient.h"
 #import "MacWSStreamClient.h"
 #include "macws_control_protocol.h"
+#include "macws_catalyst_drawable_protocol.h"
 #include "macws_host_protocol.h"
 #include "macws_touch_policy.h"
 #include "macws_viewport_math.h"
@@ -73,6 +76,8 @@ static CFStringRef const MacWSRequestResizeNotification =
     CFSTR("com.macwsguide.windowing.request-resize");
 static CFStringRef const MacWSLaunchMapsFromHostNotification =
     CFSTR("com.macwsguide.host.launch-maps");
+static CFStringRef const MacWSLaunchCatalystFromHostNotification =
+    CFSTR("com.macwsguide.host.launch-catalyst");
 static NSString *const MacWSResizeRequestDirectory =
     @"/var/mobile/Library/Preferences";
 static NSString *const MacWSFullscreenRequestPrefix =
@@ -84,6 +89,10 @@ static const char MacWSInputSocketPath[] =
 static const char MacWSCatalystLauncherPath[] =
     "/var/jb/Applications/MacWSCatalystLauncher.app/"
     "MacWSCatalystLauncher";
+static NSString *const MacWSCatalystDrawableDidPresentNotification =
+    @"MacWSCatalystDrawableDidPresentNotification";
+static dispatch_source_t MacWSCatalystDrawableSource;
+static mach_port_t MacWSCatalystDrawableReceivePort = MACH_PORT_NULL;
 
 static BOOL MacWSHostDiagnosticsEnabled(void) {
     static dispatch_once_t onceToken;
@@ -183,6 +192,118 @@ static void MacWSLog(NSString *format, ...) {
     pthread_mutex_unlock(&logLock);
 }
 
+static void MacWSStartCatalystDrawableReceiver(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        mach_port_t receivePort = MACH_PORT_NULL;
+        kern_return_t result = mach_port_allocate(
+            mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receivePort);
+        if (result != KERN_SUCCESS) {
+            MacWSLog(@"catalyst-drawable port-allocate failed kr=%d", result);
+            return;
+        }
+        result = mach_port_insert_right(
+            mach_task_self(), receivePort, receivePort,
+            MACH_MSG_TYPE_MAKE_SEND);
+        if (result != KERN_SUCCESS) {
+            (void)mach_port_mod_refs(mach_task_self(), receivePort,
+                                    MACH_PORT_RIGHT_RECEIVE, -1);
+            MacWSLog(@"catalyst-drawable port-insert failed kr=%d", result);
+            return;
+        }
+        result = bootstrap_register(
+            bootstrap_port, MACWS_CATALYST_DRAWABLE_MACH_SERVICE,
+            receivePort);
+        // bootstrap_register copies the send right. Keep only the receive
+        // right locally so an accidental sender leak cannot pin this service
+        // after the Host exits.
+        (void)mach_port_mod_refs(mach_task_self(), receivePort,
+                                MACH_PORT_RIGHT_SEND, -1);
+        if (result != BOOTSTRAP_SUCCESS) {
+            (void)mach_port_mod_refs(mach_task_self(), receivePort,
+                                    MACH_PORT_RIGHT_RECEIVE, -1);
+            MacWSLog(@"catalyst-drawable bootstrap-register failed kr=%d",
+                     result);
+            return;
+        }
+        MacWSCatalystDrawableReceivePort = receivePort;
+        MacWSCatalystDrawableSource = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_MACH_RECV, (uintptr_t)receivePort, 0,
+            dispatch_get_main_queue());
+        dispatch_source_set_event_handler(MacWSCatalystDrawableSource, ^{
+            for (;;) {
+                _Alignas(8) uint8_t bytes[
+                    sizeof(MacWSCatalystDrawableMachMessage) +
+                    MAX_TRAILER_SIZE] = {0};
+                MacWSCatalystDrawableMachMessage *message =
+                    (MacWSCatalystDrawableMachMessage *)bytes;
+                mach_msg_return_t received = mach_msg(
+                    &message->header,
+                    MACH_RCV_MSG | MACH_RCV_TIMEOUT |
+                        MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+                        MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
+                    0, sizeof(bytes),
+                    receivePort, 0, MACH_PORT_NULL);
+                if (received == MACH_RCV_TIMED_OUT) break;
+                if (received != MACH_MSG_SUCCESS) {
+                    MacWSLog(@"catalyst-drawable receive failed kr=%d",
+                             received);
+                    break;
+                }
+                mach_port_t surfacePort = message->surfacePort.name;
+                mach_msg_audit_trailer_t *trailer =
+                    (mach_msg_audit_trailer_t *)(bytes +
+                        round_msg(message->header.msgh_size));
+                BOOL trailerValid =
+                    (uint8_t *)(trailer + 1) <= bytes + sizeof(bytes) &&
+                    trailer->msgh_trailer_type ==
+                        MACH_MSG_TRAILER_FORMAT_0 &&
+                    trailer->msgh_trailer_size >= sizeof(*trailer);
+                pid_t senderPID = trailerValid
+                    ? audit_token_to_pid(trailer->msgh_audit) : -1;
+                BOOL envelopeValid =
+                    message->header.msgh_id ==
+                        MACWS_CATALYST_DRAWABLE_MACH_MESSAGE_ID &&
+                    message->header.msgh_size == sizeof(*message) &&
+                    (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+                    message->body.msgh_descriptor_count == 1 &&
+                    message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
+                    MACH_PORT_VALID(surfacePort) && trailerValid;
+                if (!envelopeValid) {
+                    if (MACH_PORT_VALID(surfacePort))
+                        (void)mach_port_deallocate(
+                            mach_task_self(), surfacePort);
+                    continue;
+                }
+                MacWSCatalystDrawableRecord record = message->record;
+                if (!MacWSCatalystDrawableRecordIsValid(
+                        &record, sizeof(record)) ||
+                    record.ownerPID != senderPID) {
+                    (void)mach_port_deallocate(mach_task_self(), surfacePort);
+                    continue;
+                }
+                IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surfacePort);
+                (void)mach_port_deallocate(mach_task_self(), surfacePort);
+                if (!surface) continue;
+                NSData *payload = [NSData dataWithBytes:&record
+                                                  length:sizeof(record)];
+                NSDictionary *delivery = @{
+                    @"record": payload,
+                    @"surface": (__bridge id)surface,
+                };
+                [NSNotificationCenter.defaultCenter
+                    postNotificationName:
+                        MacWSCatalystDrawableDidPresentNotification
+                    object:delivery];
+                CFRelease(surface);
+            }
+        });
+        dispatch_resume(MacWSCatalystDrawableSource);
+        MacWSLog(@"catalyst-drawable receiver-ready service=%s port=%u",
+                 MACWS_CATALYST_DRAWABLE_MACH_SERVICE, receivePort);
+    });
+}
+
 static BOOL MacWSSpawnMapsFromForegroundHost(int *errorOut) {
     char *const arguments[] = {
         (char *)MacWSCatalystLauncherPath,
@@ -218,6 +339,42 @@ static BOOL MacWSSpawnMapsFromForegroundHost(int *errorOut) {
     return error == 0;
 }
 
+static BOOL MacWSSpawnRequestedCatalystFromForegroundHost(int *errorOut) {
+    char *const arguments[] = {
+        (char *)MacWSCatalystLauncherPath,
+        "--exec-request-from-host",
+        NULL,
+    };
+    extern char **environ;
+    pid_t child = 0;
+    int error = posix_spawn(&child, MacWSCatalystLauncherPath,
+                            NULL, NULL, arguments, environ);
+    if (errorOut) *errorOut = error;
+    MacWSLog(@"catalyst-host-carrier spawn result=%d child=%d parent=%d",
+             error, child, getpid());
+    if (error == 0 && child > 1) {
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int status = 0;
+            pid_t waited = 0;
+            do {
+                waited = waitpid(child, &status, 0);
+            } while (waited < 0 && errno == EINTR);
+            if (waited == child) {
+                MacWSLog(@"catalyst-host-carrier child-exit pid=%d exited=%@ "
+                         "code=%d signaled=%@ signal=%d",
+                         child, WIFEXITED(status) ? @"YES" : @"NO",
+                         WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+                         WIFSIGNALED(status) ? @"YES" : @"NO",
+                         WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+            } else {
+                MacWSLog(@"catalyst-host-carrier wait-failed pid=%d errno=%d",
+                         child, errno);
+            }
+        });
+    }
+    return error == 0;
+}
+
 static void MacWSLaunchMapsNotificationCallback(
     __unused CFNotificationCenterRef center,
     __unused void *observer,
@@ -227,6 +384,18 @@ static void MacWSLaunchMapsNotificationCallback(
     dispatch_async(dispatch_get_main_queue(), ^{
         int error = 0;
         (void)MacWSSpawnMapsFromForegroundHost(&error);
+    });
+}
+
+static void MacWSLaunchCatalystNotificationCallback(
+    __unused CFNotificationCenterRef center,
+    __unused void *observer,
+    __unused CFStringRef name,
+    __unused const void *object,
+    __unused CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        int error = 0;
+        (void)MacWSSpawnRequestedCatalystFromForegroundHost(&error);
     });
 }
 
@@ -624,6 +793,32 @@ static NSInteger MacWSHIDUsageForASCII(uint32_t scalar) {
 
 @class MacWSMetalView;
 
+@interface MacWSCatalystDrawableFrame : NSObject
+@property(nonatomic, readonly) MacWSCatalystDrawableRecord record;
+@property(nonatomic, readonly) IOSurfaceRef surface;
+@property(nonatomic, readonly) id<MTLTexture> texture;
+- (instancetype)initWithRecord:(MacWSCatalystDrawableRecord)record
+                        surface:(IOSurfaceRef)surface
+                        texture:(id<MTLTexture>)texture;
+@end
+
+@implementation MacWSCatalystDrawableFrame {
+    IOSurfaceRef _surface;
+}
+- (instancetype)initWithRecord:(MacWSCatalystDrawableRecord)record
+                        surface:(IOSurfaceRef)surface
+                        texture:(id<MTLTexture>)texture {
+    self = [super init];
+    if (!self) return nil;
+    _record = record;
+    _surface = surface ? (IOSurfaceRef)CFRetain(surface) : NULL;
+    _texture = texture;
+    return self;
+}
+- (IOSurfaceRef)surface { return _surface; }
+- (void)dealloc { if (_surface) CFRelease(_surface); }
+@end
+
 typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSDirectTouchStateIdle = 0,
     MacWSDirectTouchStateCandidate,
@@ -690,6 +885,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGRect _visibleSourceRect;
     BOOL _reportedNonzeroFrame;
     BOOL _submittedPresentWitness;
+    BOOL _submittedCatalystDrawableWitness;
     NSString *_lastStatus;
     UIView *_directTouchIndicator;
     UIView *_trackpadCursorView;
@@ -712,6 +908,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     id<MTLTexture> _surfaceTexture;
     NSMutableDictionary<NSNumber *, MacWSSurfaceFrame *> *_overlayFrames;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *_overlayTextures;
+    NSMutableDictionary<NSNumber *, MacWSCatalystDrawableFrame *> *
+        _catalystDrawableFrames;
     uint64_t _surfaceTextureImports;
     uint64_t _surfaceTextureReuses;
     uint64_t _lastPerformanceLogStreamID;
@@ -821,6 +1019,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _streamClient.delegate = self;
     _overlayFrames = [NSMutableDictionary dictionary];
     _overlayTextures = [NSMutableDictionary dictionary];
+    _catalystDrawableFrames = [NSMutableDictionary dictionary];
     _retiredSurfaceFrames = [NSMutableArray array];
     _submittedOverlayLeaseTokens = [NSMutableDictionary dictionary];
     _commandQueue = [device newCommandQueue];
@@ -833,6 +1032,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _directTouchState = MacWSDirectTouchStateIdle;
     _directTouchFeedback = [[UIImpactFeedbackGenerator alloc]
         initWithStyle:UIImpactFeedbackStyleMedium];
+    MacWSStartCatalystDrawableReceiver();
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(catalystDrawableDidPresent:)
+        name:MacWSCatalystDrawableDidPresentNotification object:nil];
 
     // Direct touch uses a soft contact halo.  It is deliberately different
     // from the trackpad cursor: one represents the finger's absolute contact,
@@ -1059,6 +1262,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self
+        name:MacWSCatalystDrawableDidPresentNotification object:nil];
     [_framePollDisplayLink invalidate];
     [_scrollMomentumDisplayLink invalidate];
     if (_surfaceFrame) [_streamClient releaseFrame:_surfaceFrame];
@@ -1067,6 +1272,72 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     for (MacWSSurfaceFrame *frame in _retiredSurfaceFrames)
         [_streamClient releaseFrame:frame];
     [_streamClient invalidate];
+}
+
+- (void)catalystDrawableDidPresent:(NSNotification *)notification {
+    NSDictionary *delivery =
+        [notification.object isKindOfClass:[NSDictionary class]]
+            ? (NSDictionary *)notification.object : nil;
+    NSData *payload = [delivery[@"record"] isKindOfClass:[NSData class]]
+        ? delivery[@"record"] : nil;
+    IOSurfaceRef deliveredSurface = delivery[@"surface"]
+        ? (__bridge IOSurfaceRef)delivery[@"surface"] : NULL;
+    if (payload.length != sizeof(MacWSCatalystDrawableRecord) || !self.device)
+        return;
+    MacWSCatalystDrawableRecord record = {0};
+    memcpy(&record, payload.bytes, sizeof(record));
+    if (!MacWSCatalystDrawableRecordIsValid(&record, sizeof(record))) return;
+
+    BOOL relevant = self.targetPID == record.ownerPID;
+    if (!relevant && self.targetWindowID == 0) {
+        for (MacWSSurfaceFrame *frame in _overlayFrames.allValues) {
+            if (frame.descriptor.layerOwnerPID == record.ownerPID) {
+                relevant = YES;
+                break;
+            }
+        }
+    }
+    if (!relevant) return;
+
+    NSNumber *ownerKey = @(record.ownerPID);
+    MacWSCatalystDrawableFrame *previous =
+        _catalystDrawableFrames[ownerKey];
+    if (previous && previous.record.sequence >= record.sequence) return;
+    IOSurfaceRef surface = deliveredSurface;
+    if (!surface) return;
+    BOOL geometryMatches = IOSurfaceGetWidth(surface) == record.width &&
+        IOSurfaceGetHeight(surface) == record.height &&
+        IOSurfaceGetBytesPerRow(surface) == record.bytesPerRow &&
+        IOSurfaceGetPixelFormat(surface) == record.ioSurfacePixelFormat;
+    NSUInteger requiredAlignment =
+        MacWSIOSurfaceReadOnlyTextureAlignment(self.device);
+    if (!geometryMatches || (requiredAlignment &&
+        record.bytesPerRow % requiredAlignment != 0)) {
+        return;
+    }
+    MTLTextureDescriptor *descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            MTLPixelFormatBGRA8Unorm width:record.width height:record.height
+            mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [self.device newTextureWithDescriptor:descriptor
+                                                        iosurface:surface
+                                                            plane:0];
+    if (!texture) {
+        return;
+    }
+    _catalystDrawableFrames[ownerKey] =
+        [[MacWSCatalystDrawableFrame alloc] initWithRecord:record
+                                                   surface:surface
+                                                   texture:texture];
+    if (!previous) {
+        MacWSLog(@"runtime-confirmed catalyst-drawable imported pid=%d "
+                 "surface=%u size=%ux%u bpr=%u metal-pf=%u",
+                 record.ownerPID, record.surfaceID, record.width,
+                 record.height, record.bytesPerRow, record.metalPixelFormat);
+    }
+    [self setNeedsDisplay];
 }
 
 - (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID {
@@ -1098,6 +1369,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _fullscreenLastTapRoutePID = 0;
     _fullscreenLastTapRouteWindowID = 0;
     _fullscreenLastTapRouteDescriptor = (MacWSStreamFrameDescriptor){0};
+    [_catalystDrawableFrames removeAllObjects];
     self.targetWindowID = mode == MacWSStreamModeWindow ? windowID : 0;
     // A window Scene must only display the IOSurface exported for that window.
     // The mmap framebuffer is a full-desktop compatibility path and would show
@@ -1862,6 +2134,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)drawInMTKView:(MTKView *)view {
     if (!_pipeline || !_commandQueue) return;
+    BOOL drewCatalystDrawable = NO;
+    MacWSCatalystDrawableFrame *catalystWitnessFrame = nil;
     BOOL directSurface = _surfaceFrame != nil && _surfaceTexture != nil;
     if (directSurface) {
         _sourceTexture = _surfaceTexture;
@@ -1943,6 +2217,42 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [encoder setFragmentTexture:_sourceTexture atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                 vertexStart:0 vertexCount:4];
+
+    // A Host-carried Catalyst CAMetalLayer can bypass SkyLight's client-area
+    // capture while its native AppKit title bar remains present. Draw the
+    // completed producer IOSurface over only the content portion, preserving
+    // the captured traffic lights/title bar and the exact existing viewport.
+    MacWSCatalystDrawableFrame *baseCatalystFrame = self.targetPID > 1
+        ? _catalystDrawableFrames[@(self.targetPID)] : nil;
+    if (directSurface && baseCatalystFrame.texture) {
+        float visibleTop = vertices[2].w;
+        float visibleBottom = vertices[0].w;
+        float titlebarFraction = _surfaceFrame.descriptor.contentHeight
+            ? fminf(48.0f / _surfaceFrame.descriptor.contentHeight, 0.12f)
+            : 0.0f;
+        float directTop = fmaxf(visibleTop, titlebarFraction);
+        if (directTop < visibleBottom) {
+            float span = visibleBottom - visibleTop;
+            float topProgress = span > 0.0f
+                ? (directTop - visibleTop) / span : 0.0f;
+            simd_float4 directVertices[4] = {
+                vertices[0], vertices[1], vertices[2], vertices[3],
+            };
+            float directTopY = vertices[2].y +
+                (vertices[0].y - vertices[2].y) * topProgress;
+            directVertices[2].y = directTopY;
+            directVertices[3].y = directTopY;
+            directVertices[2].w = directTop;
+            directVertices[3].w = directTop;
+            [encoder setVertexBytes:directVertices
+                              length:sizeof(directVertices) atIndex:0];
+            [encoder setFragmentTexture:baseCatalystFrame.texture atIndex:0];
+            [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                        vertexStart:0 vertexCount:4];
+            drewCatalystDrawable = YES;
+            catalystWitnessFrame = baseCatalystFrame;
+        }
+    }
 
     MacWSSurfaceFrame *performanceFrame = directSurface ? _surfaceFrame : nil;
     if (directSurface && _overlayFrames.count) {
@@ -2030,6 +2340,77 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             [encoder setFragmentTexture:overlayTexture atIndex:0];
             [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
                         vertexStart:0 vertexCount:4];
+            MacWSCatalystDrawableFrame *catalystFrame =
+                _catalystDrawableFrames[@(overlay.layerOwnerPID)];
+            if (catalystFrame.texture && destination.size.height > 48.0) {
+                CGRect catalystDestination = CGRectMake(
+                    destination.origin.x, destination.origin.y + 48.0,
+                    destination.size.width, destination.size.height - 48.0);
+                CGRect catalystClipped = CGRectIntersection(
+                    catalystDestination, visiblePixels);
+                if (!CGRectIsNull(catalystClipped) &&
+                    !CGRectIsEmpty(catalystClipped)) {
+                    CGFloat catalystLeft = CGRectGetMinX(_contentRect) +
+                        (CGRectGetMinX(catalystClipped) -
+                         CGRectGetMinX(visiblePixels)) /
+                            CGRectGetWidth(visiblePixels) *
+                            CGRectGetWidth(_contentRect);
+                    CGFloat catalystRight = CGRectGetMinX(_contentRect) +
+                        (CGRectGetMaxX(catalystClipped) -
+                         CGRectGetMinX(visiblePixels)) /
+                            CGRectGetWidth(visiblePixels) *
+                            CGRectGetWidth(_contentRect);
+                    CGFloat catalystTop = CGRectGetMinY(_contentRect) +
+                        (CGRectGetMinY(catalystClipped) -
+                         CGRectGetMinY(visiblePixels)) /
+                            CGRectGetHeight(visiblePixels) *
+                            CGRectGetHeight(_contentRect);
+                    CGFloat catalystBottom = CGRectGetMinY(_contentRect) +
+                        (CGRectGetMaxY(catalystClipped) -
+                         CGRectGetMinY(visiblePixels)) /
+                            CGRectGetHeight(visiblePixels) *
+                            CGRectGetHeight(_contentRect);
+                    float directLeft =
+                        (CGRectGetMinX(catalystClipped) -
+                         CGRectGetMinX(destination)) /
+                        CGRectGetWidth(destination);
+                    float directRight =
+                        (CGRectGetMaxX(catalystClipped) -
+                         CGRectGetMinX(destination)) /
+                        CGRectGetWidth(destination);
+                    float directTop =
+                        (CGRectGetMinY(catalystClipped) -
+                         CGRectGetMinY(destination)) /
+                        CGRectGetHeight(destination);
+                    float directBottom =
+                        (CGRectGetMaxY(catalystClipped) -
+                         CGRectGetMinY(destination)) /
+                        CGRectGetHeight(destination);
+                    simd_float4 catalystVertices[4] = {
+                        {(float)(catalystLeft / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - catalystBottom / viewHeight * 2.0),
+                         directLeft, directBottom},
+                        {(float)(catalystRight / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - catalystBottom / viewHeight * 2.0),
+                         directRight, directBottom},
+                        {(float)(catalystLeft / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - catalystTop / viewHeight * 2.0),
+                         directLeft, directTop},
+                        {(float)(catalystRight / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - catalystTop / viewHeight * 2.0),
+                         directRight, directTop},
+                    };
+                    [encoder setVertexBytes:catalystVertices
+                                      length:sizeof(catalystVertices)
+                                     atIndex:0];
+                    [encoder setFragmentTexture:catalystFrame.texture
+                                         atIndex:0];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                                vertexStart:0 vertexCount:4];
+                    drewCatalystDrawable = YES;
+                    catalystWitnessFrame = catalystFrame;
+                }
+            }
             // The lease token is the unique ownership identity across stream
             // recreation.  A later frame can now distinguish an IOSurface
             // actually referenced by an in-flight command buffer from one
@@ -2040,6 +2421,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
     [encoder endEncoding];
     [commandBuffer presentDrawable:drawable];
+    if (drewCatalystDrawable && !_submittedCatalystDrawableWitness) {
+        _submittedCatalystDrawableWitness = YES;
+        MacWSCatalystDrawableRecord witness = catalystWitnessFrame.record;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            MacWSLog(@"runtime-confirmed catalyst-drawable presented pid=%d "
+                     "surface=%u sequence=%llu size=%ux%u status=%ld "
+                     "error=%@",
+                     witness.ownerPID, witness.surfaceID,
+                     (unsigned long long)witness.sequence, witness.width,
+                     witness.height, (long)completed.status,
+                     completed.error ?: @"nil");
+        }];
+    }
     uint64_t submitTime = mach_absolute_time();
     uint32_t presentedWidth = [self currentFrameWidth];
     uint32_t presentedHeight = [self currentFrameHeight];
@@ -8681,6 +9075,13 @@ extern void MacWSRunIOSClearReference(void);
         (__bridge const void *)self,
         MacWSLaunchMapsNotificationCallback,
         MacWSLaunchMapsFromHostNotification,
+        NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        (__bridge const void *)self,
+        MacWSLaunchCatalystNotificationCallback,
+        MacWSLaunchCatalystFromHostNotification,
         NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),

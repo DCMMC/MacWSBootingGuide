@@ -11,6 +11,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -513,6 +514,73 @@ static void ReplyResult(xpc_object_t request, BOOL ok, NSString *message,
     xpc_dictionary_set_bool(reply, "ok", ok);
     SetString(reply, "message", message ?: @"");
     if (extra) extra(reply);
+    xpc_connection_send_message(peer, reply);
+}
+
+// macOS Libinfo normally sends getaddrinfo requests to mDNSResponder.  The
+// chroot has the Ventura client frameworks but not a viable resolver daemon in
+// its bootstrap namespace, while this iOS-native daemon has the real network
+// configuration and resolver service.  Preserve the standard getaddrinfo ABI
+// across a small typed XPC request; callers reconstruct ordinary addrinfo
+// nodes and keep the successful local macOS path untouched.
+static void ReplyHostResolution(xpc_object_t request) {
+    xpc_connection_t peer = xpc_dictionary_get_remote_connection(request);
+    xpc_object_t reply = xpc_dictionary_create_reply(request);
+    if (!peer || !reply) return;
+
+    const char *node = xpc_dictionary_get_string(
+        request, MACWS_CONTROL_KEY_DNS_NODE);
+    const char *service = xpc_dictionary_get_string(
+        request, MACWS_CONTROL_KEY_DNS_SERVICE);
+    if (!node || node[0] == '\0' || strnlen(node, 254) > 253 ||
+        (service && strnlen(service, 65) > 64)) {
+        xpc_dictionary_set_int64(reply, "gai_error", EAI_NONAME);
+        xpc_connection_send_message(peer, reply);
+        return;
+    }
+
+    struct addrinfo hints = {0};
+    hints.ai_flags = (int)xpc_dictionary_get_int64(
+        request, MACWS_CONTROL_KEY_DNS_FLAGS);
+    hints.ai_family = (int)xpc_dictionary_get_int64(
+        request, MACWS_CONTROL_KEY_DNS_FAMILY);
+    hints.ai_socktype = (int)xpc_dictionary_get_int64(
+        request, MACWS_CONTROL_KEY_DNS_SOCKTYPE);
+    hints.ai_protocol = (int)xpc_dictionary_get_int64(
+        request, MACWS_CONTROL_KEY_DNS_PROTOCOL);
+    if (hints.ai_family != AF_UNSPEC && hints.ai_family != AF_INET &&
+        hints.ai_family != AF_INET6) {
+        xpc_dictionary_set_int64(reply, "gai_error", EAI_FAMILY);
+        xpc_connection_send_message(peer, reply);
+        return;
+    }
+
+    struct addrinfo *resolved = NULL;
+    int error = getaddrinfo(node, service && service[0] ? service : NULL,
+                            &hints, &resolved);
+    xpc_dictionary_set_int64(reply, "gai_error", error);
+    if (error == 0) {
+        xpc_object_t entries = xpc_array_create(NULL, 0);
+        size_t count = 0;
+        for (const struct addrinfo *item = resolved;
+             item && count < 64; item = item->ai_next, count++) {
+            if (!item->ai_addr || item->ai_addrlen == 0 ||
+                item->ai_addrlen > sizeof(struct sockaddr_storage)) continue;
+            xpc_object_t entry = xpc_dictionary_create(NULL, NULL, 0);
+            xpc_dictionary_set_int64(entry, "flags", item->ai_flags);
+            xpc_dictionary_set_int64(entry, "family", item->ai_family);
+            xpc_dictionary_set_int64(entry, "socktype", item->ai_socktype);
+            xpc_dictionary_set_int64(entry, "protocol", item->ai_protocol);
+            xpc_dictionary_set_data(entry, "address", item->ai_addr,
+                                    item->ai_addrlen);
+            if (item->ai_canonname)
+                xpc_dictionary_set_string(entry, "canonname",
+                                          item->ai_canonname);
+            xpc_array_append_value(entries, entry);
+        }
+        xpc_dictionary_set_value(reply, "results", entries);
+        freeaddrinfo(resolved);
+    }
     xpc_connection_send_message(peer, reply);
 }
 
@@ -1573,6 +1641,30 @@ static BOOL LaunchRootExecutable(const char *identifier,
             return NO;
         }
         childEnvironment = ownedEnvironment;
+    } else if (strcmp(identifier, "custom-path") == 0) {
+        // Runtime-confirmed by Amadine-2026-08-11-141854.ips: creating a
+        // document made AppKit resolve a NIB image through NSWorkspace, which
+        // dispatched LaunchServices bundle registration and recursively
+        // finalized 511 CoreServicesInternal FileCache/CFURL frames when the
+        // host mount escaped the chroot.  A controlled A/B with the complete
+        // logical-root namespace produced the real canvas and no new crash.
+        // Scope that filesystem contract to macwshostd's already validated
+        // third-party executable transaction; ordinary Terminal/Finder paths
+        // keep their separately proven fork/catalog policies.
+        static const char *const thirdPartyEnvironment[] = {
+            "MACWS_APP_MOUNT_COMPAT=1",
+        };
+        ownedEnvironment = CopyEnvironmentAdding(
+            thirdPartyEnvironment,
+            sizeof(thirdPartyEnvironment) /
+                sizeof(thirdPartyEnvironment[0]));
+        if (!ownedEnvironment) {
+            posix_spawn_file_actions_destroy(&actions);
+            if (logFD >= 0) close(logFD);
+            *message = @"无法为第三方 App 构造 chroot 根卷环境";
+            return NO;
+        }
+        childEnvironment = ownedEnvironment;
     }
     int error = posix_spawn(&pid, kChrootExec, &actions, NULL,
                             (char *const *)argv, childEnvironment);
@@ -1594,11 +1686,33 @@ static BOOL LaunchRootExecutable(const char *identifier,
         BOOL finder = strcmp(identifier, "finder") == 0;
         BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
                                strcmp(identifier, "maps") == 0;
-        BOOL windowReady = finder
-            ? RequestFinderBrowserWindow(pid, timeout)
-            : (reopenLifecycle
-                ? RequestApplicationReopen(pid, timeout)
-                : WaitForWindowMetrics(pid, timeout, &exitStatus));
+        BOOL customPath = strcmp(identifier, "custom-path") == 0;
+        BOOL windowReady = NO;
+        if (finder) {
+            windowReady = RequestFinderBrowserWindow(pid, timeout);
+        } else if (reopenLifecycle) {
+            windowReady = RequestApplicationReopen(pid, timeout);
+        } else if (customPath) {
+            // Runtime-confirmed with Amadine pid 60156/60398 on 2026-08-11:
+            // the application remained healthy with a live AppInput endpoint,
+            // while its valid metrics catalog stayed at entryCount=0 for more
+            // than one minute.  A bare executable launch has no LaunchServices
+            // AppleEvent to perform the ordinary Dock/open lifecycle.  Give a
+            // third-party app a short chance to publish its initial NSWindow,
+            // then deliver the real NSApplication reopen inside that owning
+            // process.  This is the same generic lifecycle used when reusing a
+            // windowless process above, not an app-name exception or a
+            // synthetic window-success witness.
+            NSTimeInterval initialWindowTimeout = MIN(timeout, 3.0);
+            windowReady = WaitForWindowMetrics(
+                pid, initialWindowTimeout, &exitStatus);
+            if (!windowReady && exitStatus < 0) {
+                windowReady = RequestApplicationReopen(
+                    pid, MAX(1.0, timeout - initialWindowTimeout));
+            }
+        } else {
+            windowReady = WaitForWindowMetrics(pid, timeout, &exitStatus);
+        }
         if (windowReady && strcmp(identifier, "system-settings") == 0)
             windowReady = WaitForSystemSettingsContent(12.0);
         if (!windowReady) {
@@ -1770,6 +1884,10 @@ static void ServeRequest(xpc_object_t request) {
             SetString(reply, "input_log", TailFile("/var/jb/var/mobile/macwsinputd.err", 16384));
             SetString(reply, "postinst_log", TailFile("/var/jb/var/mobile/postinst.log", 16384));
         });
+        return;
+    }
+    if (strcmp(op, MACWS_CONTROL_OP_RESOLVE_HOST) == 0) {
+        ReplyHostResolution(request);
         return;
     }
 

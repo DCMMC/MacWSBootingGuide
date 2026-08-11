@@ -23,6 +23,10 @@ static const char *const kLocationProviderExecutable =
 static const char *const kLocationProviderHostExecutable =
     "/private/var/mnt/rootfs/usr/local/libexec/"
     "MacWSInteropService.app/Contents/MacOS/macwsinteropd";
+static const char *const kCatalystRequestPath =
+    "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
+static const char *const kCatalystMarkerDirectory =
+    "/var/mnt/rootfs/private/tmp";
 static pid_t gMapsPID = -1;
 static bool gMapsLaunchPending = false;
 
@@ -109,6 +113,177 @@ static bool macws_configure_maps_environment(void) {
     setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
            "com.apple.macosbooter.frontboard.systemappservices", 1);
     return true;
+}
+
+static bool macws_valid_catalyst_root_executable(NSString *rootExecutable) {
+    if (![rootExecutable hasPrefix:@"/Applications/"] &&
+        ![rootExecutable hasPrefix:@"/System/Applications/"])
+        return false;
+    if ([rootExecutable rangeOfString:@"/../"].location != NSNotFound ||
+        [rootExecutable hasSuffix:@"/.."] ||
+        [rootExecutable rangeOfString:@"\n"].location != NSNotFound)
+        return false;
+    return [rootExecutable rangeOfString:@".app/Contents/MacOS/"].location !=
+        NSNotFound;
+}
+
+static bool macws_valid_bundle_identifier(NSString *bundleIdentifier) {
+    if (bundleIdentifier.length == 0 || bundleIdentifier.length > 255)
+        return false;
+    NSCharacterSet *allowed = [NSCharacterSet
+        characterSetWithCharactersInString:
+            @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-"];
+    return [bundleIdentifier rangeOfCharacterFromSet:allowed.invertedSet]
+        .location == NSNotFound;
+}
+
+static bool macws_load_catalyst_request(NSString **rootExecutableOut,
+                                        NSString **bundleIdentifierOut,
+                                        NSString **containerHomeOut) {
+    NSDictionary *request = [NSDictionary
+        dictionaryWithContentsOfFile:@(kCatalystRequestPath)];
+    NSString *rootExecutable = request[@"root_executable"];
+    NSString *bundleIdentifier = request[@"bundle_identifier"];
+    NSString *containerHome = request[@"container_home"];
+    if (![rootExecutable isKindOfClass:NSString.class] ||
+        ![bundleIdentifier isKindOfClass:NSString.class] ||
+        !macws_valid_catalyst_root_executable(rootExecutable) ||
+        !macws_valid_bundle_identifier(bundleIdentifier))
+        return false;
+    if (![containerHome isKindOfClass:NSString.class] ||
+        ![containerHome hasPrefix:@"/var/root/Library/Containers/"] ||
+        [containerHome rangeOfString:@"/../"].location != NSNotFound ||
+        [containerHome rangeOfString:@"\n"].location != NSNotFound)
+        return false;
+
+    NSString *hostExecutable = [@(kMacWSRoot)
+        stringByAppendingString:rootExecutable];
+    char resolvedRoot[PATH_MAX] = {0};
+    char resolvedExecutable[PATH_MAX] = {0};
+    if (!realpath(kMacWSRoot, resolvedRoot) ||
+        !realpath(hostExecutable.fileSystemRepresentation,
+                  resolvedExecutable))
+        return false;
+    size_t rootLength = strlen(resolvedRoot);
+    if (strncmp(resolvedExecutable, resolvedRoot, rootLength) != 0 ||
+        resolvedExecutable[rootLength] != '/')
+        return false;
+    struct stat executableStatus = {0};
+    if (stat(resolvedExecutable, &executableStatus) != 0 ||
+        !S_ISREG(executableStatus.st_mode) ||
+        !(executableStatus.st_mode & 0111))
+        return false;
+
+    if (rootExecutableOut) *rootExecutableOut = rootExecutable;
+    if (bundleIdentifierOut) *bundleIdentifierOut = bundleIdentifier;
+    if (containerHomeOut) *containerHomeOut = containerHome;
+    return true;
+}
+
+static bool macws_configure_catalyst_environment(
+        NSString *rootExecutable, NSString *bundleIdentifier,
+        NSString *containerHome) {
+    NSString *hostExecutable = [@(kMacWSRoot)
+        stringByAppendingString:rootExecutable];
+    macws_macho_arch_t arch = macws_macho_arch_for_path(
+        hostExecutable.fileSystemRepresentation);
+    const char *insert = macws_insert_dylib_for_arch(arch);
+    if (!insert) return false;
+    setenv("DYLD_INSERT_LIBRARIES", insert, 1);
+    setenv("HOME", "/Users/root", 1);
+    setenv("CFFIXED_USER_HOME", containerHome.fileSystemRepresentation, 1);
+    setenv("USER", "root", 1);
+    setenv("TMPDIR", "/tmp", 1);
+    setenv("MallocNanoZone", "0", 1);
+    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
+    setenv("CA_VSYNC_OFF", "1", 1);
+    setenv("MACWS_AGX_NATIVE", "1", 1);
+    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
+    setenv("MACWS_PIN_FALLBACK", "1", 1);
+    // Generic Catalyst applications resolve resources and container URLs
+    // through the same scoped mount-namespace compatibility contract used by
+    // macwshostd's production custom-path launcher.
+    setenv("MACWS_APP_MOUNT_COMPAT", "1", 1);
+    // The foreground Host can itself have been started from a diagnostic
+    // shell. Never inherit its broad mount tracer into a production child.
+    unsetenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC");
+    // Some Catalyst Metal layers are presented by the UIKit carrier and are
+    // not included in SkyLight's exact-window capture. Transfer only the
+    // completed drawable's IOSurface Mach right; Host imports it on the
+    // native-GPU path without a CPU readback or compression step.
+    setenv("MACWS_CATALYST_DIRECT_DRAWABLE", "1", 1);
+    setenv("COMMAND_MODE", "unix2003", 1);
+    setenv("__CFBundleIdentifier", bundleIdentifier.UTF8String, 1);
+    setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
+    setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
+    setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
+           "com.apple.macosbooter.frontboard.systemappservices", 1);
+    return true;
+}
+
+static bool macws_publish_catalyst_child_marker(
+        NSString *rootExecutable, NSString *bundleIdentifier) {
+    char markerPath[PATH_MAX] = {0};
+    char temporaryPath[PATH_MAX] = {0};
+    int markerLength = snprintf(
+        markerPath, sizeof(markerPath), "%s/macws_catalyst_child.%d.info",
+        kCatalystMarkerDirectory, getpid());
+    int temporaryLength = snprintf(
+        temporaryPath, sizeof(temporaryPath), "%s.tmp.%d",
+        markerPath, getpid());
+    if (markerLength <= 0 || (size_t)markerLength >= sizeof(markerPath) ||
+        temporaryLength <= 0 ||
+        (size_t)temporaryLength >= sizeof(temporaryPath))
+        return false;
+    int marker = open(temporaryPath,
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (marker < 0) return false;
+    NSString *payload = [NSString stringWithFormat:@"v1\n%@\n%@\n",
+                         rootExecutable, bundleIdentifier];
+    NSData *data = [payload dataUsingEncoding:NSUTF8StringEncoding];
+    ssize_t written = write(marker, data.bytes, data.length);
+    int closeResult = close(marker);
+    if (written != (ssize_t)data.length || closeResult != 0 ||
+        rename(temporaryPath, markerPath) != 0) {
+        unlink(temporaryPath);
+        return false;
+    }
+    return true;
+}
+
+static int macws_exec_requested_catalyst_from_existing_host(void) {
+    if (geteuid() != 0) return 77;
+    NSString *rootExecutable = nil;
+    NSString *bundleIdentifier = nil;
+    NSString *containerHome = nil;
+    if (!macws_load_catalyst_request(&rootExecutable, &bundleIdentifier,
+                                     &containerHome)) {
+        fprintf(stderr,
+                "[MacWSCatalystLauncher] invalid generic Catalyst request\n");
+        return 64;
+    }
+    // Consume exactly one request before exec. The PID-scoped marker below is
+    // the durable identity witness used by UIKitSystem; leaving this mutable
+    // control file behind could redirect a later ordinary Maps notification.
+    if (unlink(kCatalystRequestPath) != 0) return 73;
+    if (!macws_configure_catalyst_environment(
+            rootExecutable, bundleIdentifier, containerHome))
+        return 78;
+    if (!macws_publish_catalyst_child_marker(
+            rootExecutable, bundleIdentifier))
+        return 73;
+    fprintf(stderr,
+            "[MacWSCatalystLauncher] foreground Host launching Catalyst "
+            "bundle=%s executable=%s pid=%d\n",
+            bundleIdentifier.UTF8String, rootExecutable.UTF8String,
+            getpid());
+    fflush(stderr);
+    char *const childArgv[] = {
+        (char *)kChrootExec, "0", "0", (char *)kMacWSRoot,
+        (char *)rootExecutable.fileSystemRepresentation, NULL,
+    };
+    execv(kChrootExec, childArgv);
+    return errno ? errno : 78;
 }
 
 // MacWSHost is already a foreground UIApplication with a valid live
@@ -331,8 +506,24 @@ int main(int argc, char *argv[]) {
                     "required before UIApplicationMain\n");
             return 77;
         }
-        if (argc == 2 && strcmp(argv[1], "--exec-maps-from-host") == 0)
+        if (argc == 2 && strcmp(argv[1], "--exec-maps-from-host") == 0) {
+            // Keep the deployed Host's proven foreground-parent transaction
+            // backward compatible: a pending generic request consumes this
+            // one notification; with no request the exact Maps route is
+            // unchanged.
+            // access(2) checks the real uid for a setuid process.  The
+            // request is deliberately root-owned 0600, so a launcher whose
+            // real uid is mobile would incorrectly fall through to Maps even
+            // though its effective uid is root.  Presence is enough here;
+            // macws_load_catalyst_request performs the strict validation.
+            struct stat requestStatus = {0};
+            if (lstat(kCatalystRequestPath, &requestStatus) == 0)
+                return macws_exec_requested_catalyst_from_existing_host();
             return macws_exec_maps_from_existing_host();
+        }
+        if (argc == 2 &&
+            strcmp(argv[1], "--exec-request-from-host") == 0)
+            return macws_exec_requested_catalyst_from_existing_host();
         uid_t launchUser = getuid();
         if (seteuid(launchUser) < 0) {
             perror("[MacWSCatalystLauncher] enter mobile UIKit identity");

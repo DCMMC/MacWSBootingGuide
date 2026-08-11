@@ -12,7 +12,7 @@ QC_ORIGINAL="$QC_DEFAULT.macws-macos13.4-original"
 QC_EXPECTED_SHA256=ac8014164c7784395f86ac2926c62b67c96faa2a3c789f231b4b22b64024bfba
 QC_COMPAT_DIR="$ROOTFS/usr/local/share/macws/quartzcore"
 QC_COMPAT_TARGET="$QC_COMPAT_DIR/default-desktop-effects-macabi.metallib"
-QC_COMPAT_EXPECTED_SHA256=1f8c17bf0e887bc877769423e4908e14dd564d20b20259556fb861918885aca8
+QC_COMPAT_EXPECTED_SHA256=104c91d38b13fa0068db9b5b98ff90b40ab8e3755e901dbb56e26534f9d0cbb9
 QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py
 QC_LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 QC_LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
@@ -67,8 +67,15 @@ python3 "$QC_REPACKER" "$QC_ORIGINAL" "$QC_COMPAT_TMP" \
 	--function downsample_8_frag_lph \
 	--function downsample_4_frag_lph \
 	--function single_pass_blur_3_lph \
+	--function tile_downsample_1 \
+	--function tile_downsample_2 \
 	--function tile_downsample_4 \
 	--function tile_downsample_8 \
+	--function narrow_blur_7_frag_lph \
+	--function narrow_blur_11_frag_lph \
+	--function narrow_blur_15_frag_lph \
+	--function narrow_blur_19_frag_lph \
+	--function narrow_blur_23_frag_lph \
 	--function narrow_blur_27_frag_lph \
 	--rewrite-fract-v3f16-function fixed_frag_lph_cpf \
 	--preserve-container-target || {

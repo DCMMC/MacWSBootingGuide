@@ -23,6 +23,143 @@
 #import <sys/stat.h>
 #import <sys/un.h>
 
+#include "macws_catalyst_drawable_protocol.h"
+
+typedef void (*macws_present_drawable_fn)(id, SEL, id);
+static macws_present_drawable_fn macws_present_drawable_orig = NULL;
+static _Atomic uint64_t macws_catalyst_drawable_sequence = 0;
+static pthread_mutex_t macws_catalyst_drawable_service_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static mach_port_t macws_catalyst_drawable_service = MACH_PORT_NULL;
+
+static mach_port_t macws_catalyst_drawable_service_port(void) {
+    pthread_mutex_lock(&macws_catalyst_drawable_service_lock);
+    if (!MACH_PORT_VALID(macws_catalyst_drawable_service)) {
+        mach_port_t service = MACH_PORT_NULL;
+        if (bootstrap_look_up(bootstrap_port,
+                MACWS_CATALYST_DRAWABLE_MACH_SERVICE, &service) ==
+            BOOTSTRAP_SUCCESS)
+            macws_catalyst_drawable_service = service;
+    }
+    mach_port_t result = macws_catalyst_drawable_service;
+    pthread_mutex_unlock(&macws_catalyst_drawable_service_lock);
+    return result;
+}
+
+static void macws_invalidate_catalyst_drawable_service(
+        mach_port_t failedService) {
+    pthread_mutex_lock(&macws_catalyst_drawable_service_lock);
+    if (macws_catalyst_drawable_service == failedService) {
+        (void)mach_port_deallocate(mach_task_self(), failedService);
+        macws_catalyst_drawable_service = MACH_PORT_NULL;
+    }
+    pthread_mutex_unlock(&macws_catalyst_drawable_service_lock);
+}
+
+static void macws_publish_completed_catalyst_drawable(
+        MacWSCatalystDrawableRecord record, IOSurfaceRef retainedSurface) {
+    if (!retainedSurface) return;
+    record.completionTime = mach_absolute_time();
+    mach_port_t surfacePort = IOSurfaceCreateMachPort(retainedSurface);
+    CFRelease(retainedSurface);
+    mach_port_t service = macws_catalyst_drawable_service_port();
+    if (!MACH_PORT_VALID(surfacePort) || !MACH_PORT_VALID(service)) {
+        if (MACH_PORT_VALID(surfacePort))
+            (void)mach_port_deallocate(mach_task_self(), surfacePort);
+        return;
+    }
+    MacWSCatalystDrawableMachMessage message = {0};
+    message.header.msgh_bits = MACH_MSGH_BITS(
+        MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+    message.header.msgh_size = sizeof(message);
+    message.header.msgh_remote_port = service;
+    message.header.msgh_local_port = MACH_PORT_NULL;
+    message.header.msgh_id = MACWS_CATALYST_DRAWABLE_MACH_MESSAGE_ID;
+    message.body.msgh_descriptor_count = 1;
+    message.surfacePort.name = surfacePort;
+    message.surfacePort.disposition = MACH_MSG_TYPE_MOVE_SEND;
+    message.surfacePort.type = MACH_MSG_PORT_DESCRIPTOR;
+    message.record = record;
+    mach_msg_return_t result = mach_msg(
+        &message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+        sizeof(message), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    if (result != MACH_MSG_SUCCESS) {
+        (void)mach_port_deallocate(mach_task_self(), surfacePort);
+        if (result == MACH_SEND_INVALID_DEST)
+            macws_invalidate_catalyst_drawable_service(service);
+    }
+}
+
+static void macws_present_drawable_with_host_publish(
+        id commandBuffer, SEL selector, id drawable) {
+    IOSurfaceRef retainedSurface = NULL;
+    MacWSCatalystDrawableRecord record = {0};
+    @try {
+        id texture = drawable &&
+                [drawable respondsToSelector:@selector(texture)]
+            ? [drawable texture] : nil;
+        IOSurfaceRef surface = texture &&
+                [texture respondsToSelector:@selector(iosurface)]
+            ? (IOSurfaceRef)[texture iosurface] : NULL;
+        uint32_t surfaceID = surface ? IOSurfaceGetID(surface) : 0;
+        if (surface && surfaceID != 0) {
+            retainedSurface = (IOSurfaceRef)CFRetain(surface);
+            record = (MacWSCatalystDrawableRecord){
+                .magic = MACWS_CATALYST_DRAWABLE_MAGIC,
+                .version = MACWS_CATALYST_DRAWABLE_VERSION,
+                .size = sizeof(record),
+                .ownerPID = getpid(),
+                .surfaceID = surfaceID,
+                .sequence = atomic_fetch_add_explicit(
+                    &macws_catalyst_drawable_sequence, 1,
+                    memory_order_relaxed) + 1,
+                .width = (uint32_t)[texture width],
+                .height = (uint32_t)[texture height],
+                .bytesPerRow = (uint32_t)IOSurfaceGetBytesPerRow(surface),
+                .ioSurfacePixelFormat = IOSurfaceGetPixelFormat(surface),
+                .metalPixelFormat = (uint32_t)[texture pixelFormat],
+            };
+            if (!MacWSCatalystDrawableRecordIsValid(&record, sizeof(record))) {
+                CFRelease(retainedSurface);
+                retainedSurface = NULL;
+            }
+        }
+    } @catch (NSException *exception) {
+        (void)exception;
+        if (retainedSurface) CFRelease(retainedSurface);
+        retainedSurface = NULL;
+    }
+
+    if (retainedSurface &&
+        [commandBuffer respondsToSelector:@selector(addCompletedHandler:)]) {
+        IOSurfaceRef surfaceForCompletion = retainedSurface;
+        MacWSCatalystDrawableRecord recordForCompletion = record;
+        [commandBuffer addCompletedHandler:^(__unused id completed) {
+            macws_publish_completed_catalyst_drawable(
+                recordForCompletion, surfaceForCompletion);
+        }];
+    } else if (retainedSurface) {
+        CFRelease(retainedSurface);
+    }
+    if (macws_present_drawable_orig)
+        macws_present_drawable_orig(commandBuffer, selector, drawable);
+}
+
+static void macws_install_catalyst_drawable_publisher(void) {
+    const char *enabled = getenv("MACWS_CATALYST_DIRECT_DRAWABLE");
+    if (!enabled || strcmp(enabled, "1") != 0) return;
+    Class commandBufferClass = objc_getClass("_MTLCommandBuffer");
+    SEL selector = sel_registerName("presentDrawable:");
+    Method method = commandBufferClass
+        ? class_getInstanceMethod(commandBufferClass, selector) : NULL;
+    if (!method) return;
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)macws_present_drawable_with_host_publish) return;
+    macws_present_drawable_orig = (macws_present_drawable_fn)current;
+    method_setImplementation(
+        method, (IMP)macws_present_drawable_with_host_publish);
+}
+
 // Match mac_hooks.m's production/diagnostic boundary. This is intentionally
 // process-start state: enabling method swizzles or flight recorders halfway
 // through a frame would itself make a performance trace incoherent.
@@ -404,9 +541,16 @@ static macws_cfurl_copy_resource_property_fn
     macws_cfurl_copy_resource_property_orig = NULL;
 
 static BOOL macws_needs_application_mount_namespace_compatibility(void) {
-    // Diagnostic escape hatch for another isolated CoreServices consumer. It
-    // is never set by a shipped launch plist; production scope is the exact
-    // catalog/desktop process list below.
+    // Third-party AppKit executables launched through macwshostd's validated
+    // custom-path transaction may become LaunchServices/CoreServices catalog
+    // consumers while decoding a document NIB or resolving an icon.  The
+    // launcher opts those processes into the same complete logical-root mount
+    // contract as the catalog owners below.  Do not infer this from "GUI":
+    // Terminal's fork path must continue to avoid the fsgetpath trampoline.
+    const char *production = getenv("MACWS_APP_MOUNT_COMPAT");
+    if (production && strcmp(production, "1") == 0) return YES;
+    // Diagnostic escape hatch for one isolated consumer. It is never set by a
+    // shipped launch plist or the production launcher.
     if (getenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC")) return YES;
     const char *program = getprogname();
     // The stock application scan is executed by lsregister itself, while the
@@ -665,7 +809,8 @@ static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
 }
 
 static void macws_install_launchpad_mount_namespace_compatibility(void) {
-    // This compatibility belongs to the application-catalog owners only.
+    // This compatibility belongs to application-catalog owners and to the
+    // validated third-party AppKit launch transaction only.
     // Installing the fsgetpath trampoline in every AppKit process dirties the
     // libsystem_kernel __TEXT page that also contains mach_port_construct.
     // Runtime-confirmed on iPadOS 16.3: Terminal's fork child inherited that
@@ -1159,21 +1304,96 @@ static macws_rbs_fu_handle_for_identifier_fn
     macws_rbs_fu_handle_for_identifier_orig = NULL;
 static _Atomic BOOL macws_uikitsystem_exec_identity_hook_installed = NO;
 static _Atomic BOOL macws_uikitsystem_fu_handle_hook_installed = NO;
-static pthread_mutex_t macws_maps_rbs_handle_lock =
+static pthread_mutex_t macws_catalyst_rbs_handle_lock =
     PTHREAD_MUTEX_INITIALIZER;
-static id macws_maps_current_rbs_handle = nil;
-static pid_t macws_maps_current_rbs_pid = -1;
-static uint64_t macws_maps_current_rbs_versioned_pid = UINT64_MAX;
+// UIKitSystem processes one foreground Catalyst bootstrap at a time.  Keep
+// the original, proven single-handle lifetime contract.  THEORY under A/B:
+// retaining several private RBS handles may extend stale CoreServices bundle
+// graphs; the generalized-table build repeatedly crashed in
+// _FileCacheFinalize, while the pre-table build stayed alive.  Preserve the
+// old ownership shape while separately testing the marker/identity changes.
+// A new exact audit-token generation atomically replaces the prior snapshot.
+static id macws_catalyst_current_rbs_handle = nil;
+static pid_t macws_catalyst_current_rbs_pid = -1;
+static uint64_t macws_catalyst_current_rbs_versioned_pid = UINT64_MAX;
 
-static BOOL macws_pid_is_live_chroot_maps(pid_t pid, char *path,
-                                          size_t pathCapacity) {
+static BOOL macws_valid_catalyst_bundle_identifier(const char *identifier) {
+    if (!identifier || !*identifier || strlen(identifier) > 255) return NO;
+    for (const unsigned char *cursor =
+             (const unsigned char *)identifier; *cursor; cursor++) {
+        if ((*cursor >= 'a' && *cursor <= 'z') ||
+            (*cursor >= 'A' && *cursor <= 'Z') ||
+            (*cursor >= '0' && *cursor <= '9') ||
+            *cursor == '.' || *cursor == '-') continue;
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL macws_valid_catalyst_executable_path(const char *path) {
+    if (!path ||
+        (strncmp(path, "/Applications/", 14) != 0 &&
+         strncmp(path, "/System/Applications/", 21) != 0) ||
+        !strstr(path, ".app/Contents/MacOS/") ||
+        strstr(path, "/../") || strchr(path, '\n')) return NO;
+    return YES;
+}
+
+// A generic Catalyst child is admitted only when the setuid launcher wrote a
+// root-owned, PID-scoped marker before replacing itself with launchdchrootexec.
+// The marker's path must exactly equal proc_pidpath for the live audit-token
+// PID. Maps keeps its historical exact-path admission so upgrades do not make
+// the already-proven production route depend on a new marker format.
+static BOOL macws_live_chroot_catalyst_identity(
+        pid_t pid, char *path, size_t pathCapacity,
+        char *bundleIdentifier, size_t bundleCapacity) {
     if (pid <= 0 || !path || pathCapacity == 0) return NO;
     path[0] = '\0';
     int length = proc_pidpath(pid, path, (uint32_t)pathCapacity);
     if (length <= 0 || (size_t)length >= pathCapacity) return NO;
     path[pathCapacity - 1] = '\0';
-    return strcmp(path,
-                  "/System/Applications/Maps.app/Contents/MacOS/Maps") == 0;
+    if (strcmp(path,
+               "/System/Applications/Maps.app/Contents/MacOS/Maps") == 0) {
+        if (!bundleIdentifier || bundleCapacity <= strlen("com.apple.Maps"))
+            return NO;
+        strlcpy(bundleIdentifier, "com.apple.Maps", bundleCapacity);
+        return YES;
+    }
+    if (!macws_valid_catalyst_executable_path(path) ||
+        !bundleIdentifier || bundleCapacity == 0) return NO;
+
+    char markerPath[PATH_MAX] = {0};
+    int markerLength = snprintf(
+        markerPath, sizeof(markerPath),
+        "/private/tmp/macws_catalyst_child.%d.info", pid);
+    if (markerLength <= 0 || (size_t)markerLength >= sizeof(markerPath))
+        return NO;
+    int marker = open(markerPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (marker < 0) return NO;
+    struct stat markerStatus = {0};
+    char payload[PATH_MAX + 512] = {0};
+    ssize_t count = read(marker, payload, sizeof(payload) - 1);
+    int statusResult = fstat(marker, &markerStatus);
+    close(marker);
+    if (count <= 0 || (size_t)count >= sizeof(payload) ||
+        statusResult != 0 || !S_ISREG(markerStatus.st_mode) ||
+        markerStatus.st_uid != 0 || (markerStatus.st_mode & 022) != 0 ||
+        markerStatus.st_nlink != 1) return NO;
+    payload[count] = '\0';
+    if (strncmp(payload, "v1\n", 3) != 0) return NO;
+    char *recordedPath = payload + 3;
+    char *pathEnd = strchr(recordedPath, '\n');
+    if (!pathEnd) return NO;
+    *pathEnd = '\0';
+    char *recordedBundle = pathEnd + 1;
+    char *bundleEnd = strchr(recordedBundle, '\n');
+    if (!bundleEnd || bundleEnd[1] != '\0') return NO;
+    *bundleEnd = '\0';
+    if (strcmp(recordedPath, path) != 0 ||
+        !macws_valid_catalyst_bundle_identifier(recordedBundle) ||
+        strlen(recordedBundle) >= bundleCapacity) return NO;
+    strlcpy(bundleIdentifier, recordedBundle, bundleCapacity);
+    return YES;
 }
 
 static uint64_t macws_fb_process_versioned_pid(id process) {
@@ -1194,17 +1414,17 @@ static uint64_t macws_rbs_handle_versioned_pid(id handle) {
     return ((uint64_t (*)(id, SEL))objc_msgSend)(handle, selector);
 }
 
-static void macws_publish_maps_rbs_handle(id handle, pid_t pid) {
+static void macws_publish_catalyst_rbs_handle(id handle, pid_t pid) {
     if (!handle || pid <= 0) return;
     id retainedHandle = ((id (*)(id, SEL))objc_msgSend)(
         handle, sel_registerName("retain"));
     uint64_t versionedPID = macws_rbs_handle_versioned_pid(handle);
-    pthread_mutex_lock(&macws_maps_rbs_handle_lock);
-    id previousHandle = macws_maps_current_rbs_handle;
-    macws_maps_current_rbs_handle = retainedHandle;
-    macws_maps_current_rbs_pid = pid;
-    macws_maps_current_rbs_versioned_pid = versionedPID;
-    pthread_mutex_unlock(&macws_maps_rbs_handle_lock);
+    pthread_mutex_lock(&macws_catalyst_rbs_handle_lock);
+    id previousHandle = macws_catalyst_current_rbs_handle;
+    macws_catalyst_current_rbs_handle = retainedHandle;
+    macws_catalyst_current_rbs_pid = pid;
+    macws_catalyst_current_rbs_versioned_pid = versionedPID;
+    pthread_mutex_unlock(&macws_catalyst_rbs_handle_lock);
     if (previousHandle) {
         ((void (*)(id, SEL))objc_msgSend)(
             previousHandle, sel_registerName("release"));
@@ -1213,21 +1433,148 @@ static void macws_publish_maps_rbs_handle(id handle, pid_t pid) {
 
 // Returns an autoreleased strong snapshot so replacement of the process-wide
 // cache on a later Maps launch cannot race a current FuseBoard lookup.
-static id macws_copy_exact_maps_rbs_handle(
+static id macws_copy_exact_catalyst_rbs_handle(
     pid_t pid, uint64_t requestedVersionedPID) {
-    pthread_mutex_lock(&macws_maps_rbs_handle_lock);
+    pthread_mutex_lock(&macws_catalyst_rbs_handle_lock);
     id handle = nil;
-    if (macws_maps_current_rbs_handle &&
-        macws_maps_current_rbs_pid == pid &&
-        macws_maps_current_rbs_versioned_pid == requestedVersionedPID) {
+    if (macws_catalyst_current_rbs_handle &&
+        macws_catalyst_current_rbs_pid == pid &&
+        macws_catalyst_current_rbs_versioned_pid == requestedVersionedPID) {
         handle = ((id (*)(id, SEL))objc_msgSend)(
-            macws_maps_current_rbs_handle, sel_registerName("retain"));
+            macws_catalyst_current_rbs_handle, sel_registerName("retain"));
     }
-    pthread_mutex_unlock(&macws_maps_rbs_handle_lock);
+    pthread_mutex_unlock(&macws_catalyst_rbs_handle_lock);
     return handle
         ? ((id (*)(id, SEL))objc_msgSend)(
               handle, sel_registerName("autorelease"))
         : nil;
+}
+
+// RE-confirmed in Ventura 13.4 RunningBoardServices:
+// -[RBSProcessHandle initWithInstance:auditToken:bundleData:...]+432 passes
+// bundleData to +[RBSProcessBundle bundleWithDataSource:].  That factory then
+// immediately sends bundleIdentifier, bundlePath, executablePath and
+// extensionPointIdentifier to the data source and stores strong snapshots of
+// the returned strings.  Runtime tracing of the first generic Asphalt launch
+// showed bundleData=0x0 immediately before FrontBoard's repository manager
+// repeatedly died in _FileCacheFinalize.  Supply the real bundle metadata at
+// the constructor boundary instead of asking the repository to infer a chroot
+// bundle from an empty RBSProcessBundle.
+static char macws_catalyst_bundle_identifier_key;
+static char macws_catalyst_bundle_path_key;
+static char macws_catalyst_executable_path_key;
+static char macws_catalyst_bundle_data_source_owner_key;
+
+static id macws_catalyst_bundle_identifier_value(id self, SEL selector) {
+    (void)selector;
+    return objc_getAssociatedObject(
+        self, &macws_catalyst_bundle_identifier_key);
+}
+
+static id macws_catalyst_bundle_path_value(id self, SEL selector) {
+    (void)selector;
+    return objc_getAssociatedObject(self, &macws_catalyst_bundle_path_key);
+}
+
+static id macws_catalyst_executable_path_value(id self, SEL selector) {
+    (void)selector;
+    return objc_getAssociatedObject(
+        self, &macws_catalyst_executable_path_key);
+}
+
+static id macws_catalyst_no_extension_point(id self, SEL selector) {
+    (void)self;
+    (void)selector;
+    return nil;
+}
+
+static id macws_catalyst_no_bundle_info_value(
+        id self, SEL selector, id key) {
+    (void)self;
+    (void)selector;
+    (void)key;
+    return nil;
+}
+
+// Returns a retained object. RBSProcessBundle keeps only a weak reference to
+// its source, so the resulting RBSProcessHandle owns it through an associated
+// object for exactly the handle's lifetime.
+static id macws_create_catalyst_bundle_data_source(
+        const char *executablePath, const char *bundleIdentifier) {
+    if (!executablePath || !bundleIdentifier) return nil;
+    const char *contents = strstr(
+        executablePath, ".app/Contents/MacOS/");
+    if (!contents) return nil;
+    size_t bundlePathLength = (size_t)(contents - executablePath) + 4;
+    if (bundlePathLength == 0 || bundlePathLength >= PATH_MAX) return nil;
+    char bundlePath[PATH_MAX] = {0};
+    memcpy(bundlePath, executablePath, bundlePathLength);
+    bundlePath[bundlePathLength] = '\0';
+
+    static Class dataSourceClass;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class superclass = objc_getClass("NSObject");
+        Class created = superclass
+            ? objc_allocateClassPair(
+                  superclass, "MacWSCatalystBundleDataSource", 0)
+            : Nil;
+        if (!created) {
+            dataSourceClass = objc_getClass(
+                "MacWSCatalystBundleDataSource");
+            return;
+        }
+        class_addMethod(created, sel_registerName("bundleIdentifier"),
+                        (IMP)macws_catalyst_bundle_identifier_value, "@@:");
+        class_addMethod(created, sel_registerName("bundlePath"),
+                        (IMP)macws_catalyst_bundle_path_value, "@@:");
+        class_addMethod(created, sel_registerName("executablePath"),
+                        (IMP)macws_catalyst_executable_path_value, "@@:");
+        class_addMethod(created,
+                        sel_registerName("extensionPointIdentifier"),
+                        (IMP)macws_catalyst_no_extension_point, "@@:");
+        class_addMethod(created, sel_registerName("bundleInfoValueForKey:"),
+                        (IMP)macws_catalyst_no_bundle_info_value, "@@:@");
+        objc_registerClassPair(created);
+        dataSourceClass = created;
+    });
+    if (!dataSourceClass) return nil;
+
+    id source = ((id (*)(id, SEL))objc_msgSend)(
+        (id)dataSourceClass, sel_registerName("alloc"));
+    source = ((id (*)(id, SEL))objc_msgSend)(
+        source, sel_registerName("init"));
+    Class stringClass = objc_getClass("NSString");
+    id identifier = stringClass
+        ? ((id (*)(id, SEL, const char *))objc_msgSend)(
+              (id)stringClass, sel_registerName("stringWithUTF8String:"),
+              bundleIdentifier)
+        : nil;
+    id path = stringClass
+        ? ((id (*)(id, SEL, const char *))objc_msgSend)(
+              (id)stringClass, sel_registerName("stringWithUTF8String:"),
+              bundlePath)
+        : nil;
+    id executable = stringClass
+        ? ((id (*)(id, SEL, const char *))objc_msgSend)(
+              (id)stringClass, sel_registerName("stringWithUTF8String:"),
+              executablePath)
+        : nil;
+    if (!source || !identifier || !path || !executable) {
+        if (source) ((void (*)(id, SEL))objc_msgSend)(
+            source, sel_registerName("release"));
+        return nil;
+    }
+    objc_setAssociatedObject(
+        source, &macws_catalyst_bundle_identifier_key, identifier,
+        OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(
+        source, &macws_catalyst_bundle_path_key, path,
+        OBJC_ASSOCIATION_COPY_NONATOMIC);
+    objc_setAssociatedObject(
+        source, &macws_catalyst_executable_path_key, executable,
+        OBJC_ASSOCIATION_COPY_NONATOMIC);
+    return source;
 }
 
 // RE-confirmed in Ventura 13.4 FuseBoard:
@@ -1241,7 +1588,7 @@ static id macws_copy_exact_maps_rbs_handle(
 // when its complete versioned PID exactly equals the request after validating
 // the kernel's exact Maps path.  FuseBoard still performs its native strict
 // generation comparison, application predicate and FUApplication lookup.
-static id macws_maps_rbs_handle_for_identifier(
+static id macws_catalyst_rbs_handle_for_identifier(
     id self, SEL selector, id identifier, NSError **error) {
     id handle = macws_rbs_handle_for_identifier_orig(
         self, selector, identifier, error);
@@ -1259,10 +1606,12 @@ static id macws_maps_rbs_handle_for_identifier(
 
     pid_t pid = (pid_t)(uint32_t)requestedVersionedPID;
     char executablePath[4096];
-    if (!macws_pid_is_live_chroot_maps(
-            pid, executablePath, sizeof(executablePath))) return handle;
+    char bundleIdentifier[256];
+    if (!macws_live_chroot_catalyst_identity(
+            pid, executablePath, sizeof(executablePath),
+            bundleIdentifier, sizeof(bundleIdentifier))) return handle;
 
-    id exactHandle = macws_copy_exact_maps_rbs_handle(
+    id exactHandle = macws_copy_exact_catalyst_rbs_handle(
         pid, requestedVersionedPID);
     if (!exactHandle) return handle;
     uint64_t exactVersionedPID =
@@ -1270,9 +1619,10 @@ static id macws_maps_rbs_handle_for_identifier(
 
     if (getenv("MACWS_CATALYST_TRACE")) {
         fprintf(stderr,
-                "#### CATALYST-IDENTITY resolved Maps scene pid=%d "
+                "#### CATALYST-IDENTITY resolved scene pid=%d bundle=%s "
                 "requested=%#llx stale=%#llx exact=%#llx\n",
-                pid, (unsigned long long)requestedVersionedPID,
+                pid, bundleIdentifier,
+                (unsigned long long)requestedVersionedPID,
                 (unsigned long long)returnedVersionedPID,
                 (unsigned long long)exactVersionedPID);
         fflush(stderr);
@@ -1290,7 +1640,7 @@ static id macws_maps_rbs_handle_for_identifier(
 // Resolve at this category boundary to that already-registered, exact handle;
 // retain all native PID/generation/application checks and preserve the stock
 // result for every other process.
-static id macws_maps_fu_handle_for_identifier(
+static id macws_catalyst_fu_handle_for_identifier(
     id self, SEL selector, id identifier) {
     id handle = macws_rbs_fu_handle_for_identifier_orig(
         self, selector, identifier);
@@ -1311,10 +1661,12 @@ static id macws_maps_fu_handle_for_identifier(
 
     pid_t pid = (pid_t)(uint32_t)requestedVersionedPID;
     char executablePath[4096];
-    if (!macws_pid_is_live_chroot_maps(
-            pid, executablePath, sizeof(executablePath))) return handle;
+    char bundleIdentifier[256];
+    if (!macws_live_chroot_catalyst_identity(
+            pid, executablePath, sizeof(executablePath),
+            bundleIdentifier, sizeof(bundleIdentifier))) return handle;
 
-    id exactHandle = macws_copy_exact_maps_rbs_handle(
+    id exactHandle = macws_copy_exact_catalyst_rbs_handle(
         pid, requestedVersionedPID);
     if (!exactHandle) return handle;
     BOOL exactIsApplication =
@@ -1327,17 +1679,19 @@ static id macws_maps_fu_handle_for_identifier(
 
     if (getenv("MACWS_CATALYST_TRACE")) {
         fprintf(stderr,
-                "#### CATALYST-IDENTITY FuseBoard resolved Maps pid=%d "
+                "#### CATALYST-IDENTITY FuseBoard resolved pid=%d bundle=%s "
                 "requested=%#llx global=%p exact=%p\n",
-                pid, (unsigned long long)requestedVersionedPID,
+                pid, bundleIdentifier,
+                (unsigned long long)requestedVersionedPID,
                 handle, exactHandle);
         fflush(stderr);
     }
     return exactHandle;
 }
 
-static id macws_maps_rbs_handle_for_audit_token(
-    const audit_token_t *token, pid_t pid, const char *executablePath) {
+static id macws_catalyst_rbs_handle_for_audit_token(
+    const audit_token_t *token, pid_t pid, const char *executablePath,
+    const char *bundleIdentifier) {
     Class identifierClass = objc_getClass("RBSProcessIdentifier");
     Class handleClass = objc_getClass("RBSProcessHandle");
     Class instanceClass = objc_getClass("RBSProcessInstance");
@@ -1360,10 +1714,10 @@ static id macws_maps_rbs_handle_for_audit_token(
     // instantiated by the process's live Foundation/CoreFoundation runtime
     // carries the correct image/runtime authentication state.
     Class stringClass = objc_getClass("NSString");
-    id mapsBundleIdentifier = stringClass
+    id catalystBundleIdentifier = stringClass && bundleIdentifier
         ? ((id (*)(id, SEL, const char *))objc_msgSend)(
               (id)stringClass, sel_registerName("stringWithUTF8String:"),
-              "com.apple.Maps")
+              bundleIdentifier)
         : nil;
     id launcherJobLabel = stringClass
         ? ((id (*)(id, SEL, const char *))objc_msgSend)(
@@ -1371,11 +1725,11 @@ static id macws_maps_rbs_handle_for_audit_token(
               "UIKitApplication:com.macwsguide.catalystlauncher")
         : nil;
     const char *identityFactory = "embedded-identifier";
-    id identity = mapsBundleIdentifier
+    id identity = catalystBundleIdentifier
         ? ((id (*)(id, SEL, id))objc_msgSend)(
         (id)identityClass,
         sel_registerName("identityForEmbeddedApplicationIdentifier:"),
-        mapsBundleIdentifier)
+        catalystBundleIdentifier)
         : nil;
     // The short factory consults the host application's registration state
     // and runtime-confirmed returns nil inside the chroot UIKitSystem.  The
@@ -1383,13 +1737,13 @@ static id macws_maps_rbs_handle_for_audit_token(
     // application identity from its launchd job and bundle identity; the
     // iOS-native runtime probe confirms it returns
     // RBSEmbeddedAppProcessIdentity with both application predicates true.
-    if (!identity && launcherJobLabel && mapsBundleIdentifier) {
+    if (!identity && launcherJobLabel && catalystBundleIdentifier) {
         identityFactory = "job-label";
         identity = ((id (*)(id, SEL, id, id, int))objc_msgSend)(
             (id)identityClass,
             sel_registerName(
                 "identityForApplicationJobLabel:bundleID:platform:"),
-            launcherJobLabel, mapsBundleIdentifier, 0);
+            launcherJobLabel, catalystBundleIdentifier, 0);
     }
     if (getenv("MACWS_CATALYST_TRACE")) {
         BOOL isApplication = identity
@@ -1405,10 +1759,11 @@ static id macws_maps_rbs_handle_for_audit_token(
                   identity, sel_registerName("platform"))
             : -1;
         fprintf(stderr,
-                "#### CATALYST-IDENTITY construct pid=%d identifier=%p "
+                "#### CATALYST-IDENTITY construct pid=%d bundle=%s identifier=%p "
                 "staleHandle=%p factory=%s identity=%p class=%s app=%s "
                 "embedded=%s platform=%d\n",
-                pid, identifier, staleHandle, identityFactory, identity,
+                pid, bundleIdentifier ?: "<nil>", identifier, staleHandle,
+                identityFactory, identity,
                 identity ? object_getClassName(identity) : "<nil>",
                 isApplication ? "YES" : "NO",
                 isEmbeddedApplication ? "YES" : "NO", platform);
@@ -1456,6 +1811,12 @@ static id macws_maps_rbs_handle_for_audit_token(
         if (dataSourceIvar) bundleData = object_getIvar(
             staleBundle, dataSourceIvar);
     }
+    id ownedBundleData = nil;
+    if (!bundleData) {
+        ownedBundleData = macws_create_catalyst_bundle_data_source(
+            executablePath, bundleIdentifier);
+        bundleData = ownedBundleData;
+    }
     id path = [NSString stringWithUTF8String:executablePath];
 
     id allocated = ((id (*)(id, SEL))objc_msgSend)(
@@ -1475,6 +1836,15 @@ static id macws_maps_rbs_handle_for_audit_token(
             "beforeTranslocationBundlePath:executablePath:cache:"),
         freshInstance, freshAuditToken, bundleData, manageFlags,
         beforeTranslocationPath, path, NO);
+    if (freshHandle && ownedBundleData) {
+        objc_setAssociatedObject(
+            freshHandle, &macws_catalyst_bundle_data_source_owner_key,
+            ownedBundleData, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (ownedBundleData) {
+        ((void (*)(id, SEL))objc_msgSend)(
+            ownedBundleData, sel_registerName("release"));
+    }
     if (getenv("MACWS_CATALYST_TRACE")) {
         fprintf(stderr,
                 "#### CATALYST-IDENTITY handle pid=%d instance=%p "
@@ -1484,7 +1854,7 @@ static id macws_maps_rbs_handle_for_audit_token(
                 freshHandle ? object_getClassName(freshHandle) : "<nil>");
         fflush(stderr);
     }
-    macws_publish_maps_rbs_handle(freshHandle, pid);
+    macws_publish_catalyst_rbs_handle(freshHandle, pid);
     return ((id (*)(id, SEL))objc_msgSend)(
         freshHandle, sel_registerName("autorelease"));
 }
@@ -1499,8 +1869,10 @@ static id macws_fb_register_process_for_audit_token(
         macws_bs_versioned_pid_for_audit_token(token);
     pid_t pid = (pid_t)(uint32_t)requestedVersionedPID;
     char executablePath[4096];
-    if (!macws_pid_is_live_chroot_maps(
-            pid, executablePath, sizeof(executablePath)))
+    char bundleIdentifier[256];
+    if (!macws_live_chroot_catalyst_identity(
+            pid, executablePath, sizeof(executablePath),
+            bundleIdentifier, sizeof(bundleIdentifier)))
         return macws_fb_register_process_for_audit_token_orig(
             self, selector, token);
 
@@ -1511,8 +1883,8 @@ static id macws_fb_register_process_for_audit_token(
         macws_fb_process_versioned_pid(exactProcess) == requestedVersionedPID)
         return exactProcess;
 
-    id freshHandle = macws_maps_rbs_handle_for_audit_token(
-        token, pid, executablePath);
+    id freshHandle = macws_catalyst_rbs_handle_for_audit_token(
+        token, pid, executablePath, bundleIdentifier);
     SEL registerSelector = sel_registerName("_reallyRegisterProcessForHandle:");
     BOOL canReallyRegister = ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
         self, sel_registerName("respondsToSelector:"), registerSelector);
@@ -1534,9 +1906,10 @@ static id macws_fb_register_process_for_audit_token(
         macws_fb_process_versioned_pid(process) == requestedVersionedPID) {
         if (getenv("MACWS_CATALYST_TRACE")) {
             fprintf(stderr,
-                    "#### CATALYST-IDENTITY registered Maps pid=%d "
+                    "#### CATALYST-IDENTITY registered pid=%d bundle=%s "
                     "vpid=%#llx through native FrontBoard bootstrap\n",
-                    pid, (unsigned long long)requestedVersionedPID);
+                    pid, bundleIdentifier,
+                    (unsigned long long)requestedVersionedPID);
             fflush(stderr);
         }
         return process;
@@ -1591,7 +1964,7 @@ static void macws_install_uikitsystem_exec_identity_refresh(void) {
 
         macws_rbs_handle_for_identifier_orig =
             (macws_rbs_handle_for_identifier_fn)method_setImplementation(
-                handleMethod, (IMP)macws_maps_rbs_handle_for_identifier);
+                handleMethod, (IMP)macws_catalyst_rbs_handle_for_identifier);
         if (!macws_rbs_handle_for_identifier_orig) return;
 
         macws_fb_register_process_for_audit_token_orig =
@@ -1617,7 +1990,7 @@ static void macws_install_uikitsystem_exec_identity_refresh(void) {
     if (!fuseHandleMethod) return;
     macws_rbs_fu_handle_for_identifier_orig =
         (macws_rbs_fu_handle_for_identifier_fn)method_setImplementation(
-            fuseHandleMethod, (IMP)macws_maps_fu_handle_for_identifier);
+            fuseHandleMethod, (IMP)macws_catalyst_fu_handle_for_identifier);
     if (!macws_rbs_fu_handle_for_identifier_orig) return;
     atomic_store_explicit(
         &macws_uikitsystem_fu_handle_hook_installed, YES,
@@ -1637,8 +2010,6 @@ static _Atomic int macws_catalyst_application_registration_attempts;
 
 static void macws_register_catalyst_application_with_fuseboard(void) {
     if (!getenv("MACWS_CATALYST_REGISTER_APPLICATION")) return;
-    const char *program = getprogname();
-    if (!program || strcmp(program, "Maps") != 0) return;
     BOOL trace = getenv("MACWS_CATALYST_TRACE") != NULL;
     int attempt = atomic_fetch_add_explicit(
         &macws_catalyst_application_registration_attempts, 1,
@@ -1956,8 +2327,6 @@ static void macws_catalyst_compell_compat(id self, SEL selector) {
 
 static void macws_install_catalyst_launch_compatibility(void) {
     if (!getenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE")) return;
-    const char *program = getprogname();
-    if (!program || strcmp(program, "Maps") != 0) return;
     Class application = objc_getClass("UIApplication");
     if (!application) return;
     macws_lp_replace_instance_method(
@@ -7979,6 +8348,40 @@ static void macws_sigabrt_trampoline(int sig) {
     return result;
 }
 
+// Block-compressed Metal textures are not byte-addressable linear images and
+// therefore cannot be represented by the generic IOSurface compatibility
+// allocator below.  Keep this as an exact enum set instead of a broad numeric
+// range: the gaps in Metal's compressed-format ranges are real, and treating a
+// future uncompressed enum as compressed would silently change its allocator.
+static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
+    switch (pf) {
+        // BC1-BC7 (S3TC/RGTC/BPTC).
+        case 130: case 131: case 132: case 133: case 134: case 135:
+        case 140: case 141: case 142: case 143:
+        case 150: case 151: case 152: case 153:
+        // PVRTC.
+        case 160: case 161: case 162: case 163:
+        case 164: case 165: case 166: case 167:
+        // EAC / ETC2.
+        case 170: case 172: case 174: case 176: case 178: case 179:
+        case 180: case 181: case 182: case 183:
+        // ASTC sRGB, LDR and HDR.  Metal intentionally leaves holes between
+        // some block-size encodings (191, 201-203, 209, 219-221, 227).
+        case 186: case 187: case 188: case 189: case 190:
+        case 192: case 193: case 194: case 195: case 196:
+        case 197: case 198: case 199: case 200:
+        case 204: case 205: case 206: case 207: case 208:
+        case 210: case 211: case 212: case 213: case 214:
+        case 215: case 216: case 217: case 218:
+        case 222: case 223: case 224: case 225: case 226:
+        case 228: case 229: case 230: case 231: case 232:
+        case 233: case 234: case 235: case 236:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
@@ -8040,6 +8443,36 @@ static void macws_sigabrt_trampoline(int sig) {
                                  ? [desc storageMode] : 0;
         NSUInteger pf = [desc respondsToSelector:@selector(pixelFormat)]
                         ? [desc pixelFormat] : 80; // MTLPixelFormatBGRA8Unorm default
+
+        // A compressed texture cannot use the byte-per-pixel IOSurface path.
+        // Try the driver's real block layout before the mipmap gate below.
+        // The ordering matters: a mipmapped BC texture is still compressed,
+        // so classifying it merely as "mipmapped" loses the evidence needed
+        // to distinguish an unsupported block format from a generic mip
+        // allocation failure.
+        if (macws_pixel_format_is_block_compressed(pf)) {
+            id<MTLTexture> tex =
+                [self hooked_newTextureWithDescriptor:desc];
+            if (!tex && storageMode == MTLStorageModeShared) {
+                // macOS permits CPU-visible block-compressed resources on
+                // unified memory, while this iOS 16.3 AGX image rejects that
+                // storage combination. Runtime A/B with Asphalt preserved the
+                // exact BC format, dimensions, mip topology and usage: Shared
+                // returned nil repeatedly, Private succeeded for BC1/3/5, and
+                // the game completed texture prewarming plus its network/UI
+                // initialization without an upload validation failure. Keep
+                // all content semantics and translate only the unsupported
+                // storage contract at the device boundary.
+                MTLTextureDescriptor *native = [desc copy];
+                native.storageMode = MTLStorageModePrivate;
+                tex = [self hooked_newTextureWithDescriptor:native];
+            }
+            if (!tex) {
+                macws_log_mtldesc(desc, NULL, 0,
+                                  "plain.COMPRESSED-NATIVE.NIL");
+            }
+            return tex;
+        }
 
         // Metal's IOSurface initializer structurally forbids mipmapped
         // textures.  Chromium/Skia requests a 2048x2048 R8 texture with 12
@@ -10748,11 +11181,20 @@ static void macws_install_data_library_compatibility(Class agx) {
 // `Target OS is incompatible` result. Creating a new Mission Control Space
 // then reached `tile_pipeline=MTLPixelFormatBGRA8Unorm_tile_downsample_8`;
 // WindowServer-2026-08-09-220237.ips records the same compiler-target failure
-// from MetalContext::get_tile_pipeline. Each unadapted function therefore
-// failed at the real compiler target boundary before WindowServer exited.
+// from MetalContext::get_tile_pipeline. WindowServer-2026-08-11-001717.ips
+// later recorded `spec=Pw40aXm_Tn11A2Xhf_Isrc` from BlurState::narrow_blur;
+// the exact Ventura metallib maps that `Tn11` variant to
+// narrow_blur_11_frag_lph. Binary inspection shows the complete narrow-blur
+// family consists only of the 7/11/15/19/23/27 variants and that every member
+// carries the same macOS 13.4 AIR target. Adapt the family as one compiler-
+// target invariant rather than waiting for every blur radius to crash.
+// WindowServer-2026-08-11-003026.ips independently records
+// MTLPixelFormatBGRA10_XR_tile_downsample_2 failing from get_tile_pipeline.
+// The exact library contains only tile_downsample_1/2/4/8 and all four carry
+// that same desktop target, so the tile family follows the same invariant.
 // The package generates a byte-validated secondary library from the device's
-// own Ventura default.metallib: only these fourteen
-// runtime-confirmed AIR modules receive a macabi target triple; all other
+// own Ventura default.metallib: only these twenty-one RE- or runtime-confirmed
+// AIR modules receive a macabi target triple; all other
 // module bytes and every public function signature remain unchanged.
 //
 // Do not replace QuartzCore's default library.  A mixed-target MTLB used as the
@@ -10794,18 +11236,18 @@ static macws_function_specialize_async_fn
 static const char *kMacWSQCDesktopLibraryPath =
     "/usr/local/share/macws/quartzcore/"
     "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1049184;
+static const size_t kMacWSQCDesktopLibraryBytes = 1052160;
 static const uint64_t kMacWSQCDesktopLibraryHash =
     // macws_source_fnv1a64 intentionally retains this project's historical
-    // non-standard offset basis. Runtime validation of the exact SHA-256
-    // 1f8c17bf...5aca8 artifact produces this value.
-    UINT64_C(0x9b69d1eac04650b3);
+    // non-standard offset basis. Runtime validation of the exact artifact
+    // produces this value.
+    UINT64_C(0x022d2a0179b8c898);
 static const char *kMacWSSkyLightDesktopLibraryPath =
     "/usr/local/share/macws/skylight/"
     "SkyLightShaders-desktop-effects-macabi.metallib";
-static const size_t kMacWSSkyLightDesktopLibraryBytes = 707456;
+static const size_t kMacWSSkyLightDesktopLibraryBytes = 736944;
 static const uint64_t kMacWSSkyLightDesktopLibraryHash =
-    UINT64_C(0xa6690304dfdf552c);
+    UINT64_C(0xed46648d355bb00e);
 static const char *kMacWSMPSImageDesktopLibraryPath =
     "/usr/local/share/macws/mpsimage/"
     "default-desktop-effects-macabi.metallib";
@@ -10825,8 +11267,15 @@ static BOOL macws_qc_desktop_function_name(NSString *name) {
            [name isEqualToString:@"downsample_8_frag_lph"] ||
            [name isEqualToString:@"downsample_4_frag_lph"] ||
            [name isEqualToString:@"single_pass_blur_3_lph"] ||
+           [name isEqualToString:@"tile_downsample_1"] ||
+           [name isEqualToString:@"tile_downsample_2"] ||
            [name isEqualToString:@"tile_downsample_4"] ||
            [name isEqualToString:@"tile_downsample_8"] ||
+           [name isEqualToString:@"narrow_blur_7_frag_lph"] ||
+           [name isEqualToString:@"narrow_blur_11_frag_lph"] ||
+           [name isEqualToString:@"narrow_blur_15_frag_lph"] ||
+           [name isEqualToString:@"narrow_blur_19_frag_lph"] ||
+           [name isEqualToString:@"narrow_blur_23_frag_lph"] ||
            [name isEqualToString:@"narrow_blur_27_frag_lph"];
 }
 
@@ -10839,23 +11288,72 @@ static BOOL macws_qc_desktop_base_function_name(NSString *name) {
            [name isEqualToString:@"attachment_clear_frag_lph"] ||
            [name isEqualToString:@"std_vert1_lph"] ||
            [name isEqualToString:@"inplace_copy_lph"] ||
+           [name isEqualToString:@"tile_downsample_1"] ||
+           [name isEqualToString:@"tile_downsample_2"] ||
            [name isEqualToString:@"tile_downsample_4"] ||
            [name isEqualToString:@"tile_downsample_8"];
 }
 
 static BOOL macws_skylight_desktop_function_name(NSString *name) {
-    return [name isEqualToString:@"SimpleVertex"] ||
-           [name isEqualToString:@"SimpleTextureFragment"] ||
-           [name isEqualToString:@"UberCompositeFragment"];
+    // Runtime metal_source_probe enumerated the exact Ventura 13.4 library:
+    // all 54 functions carry the desktop AIR target, so every function must
+    // come from the coherently retargeted companion library.
+    static NSSet<NSString *> *names;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Metal_hooks.x is compiled without ARC; the process-lifetime set
+        // must own its storage instead of retaining an autoreleased object in
+        // a static pointer.
+        names = [[NSSet alloc] initWithArray:@[
+            @"RippleFragment", @"GroupFadeTextureFragment",
+            @"SimpleVertex", @"Backdrop_Clear_PlusL",
+            @"DownsampleBloody4x", @"UberCompositeVertex",
+            @"Backdrop_Clear_PlusD", @"Backdrop_Inactive_Sover",
+            @"Backdrop_Clear_Sover", @"BackdropVBlur1x",
+            @"SimpleTextureLightingVertex", @"BackdropVBlur2x",
+            @"Downsample2x", @"Downsample4x",
+            @"SimpleTextureScaleToSDRFragment", @"SimpleColorFragment",
+            @"SimpleTextureLightingFragment", @"SimpleColorVertex",
+            @"ColorFillYCbCr_ChromaOnly", @"UberCompositeFragment",
+            @"BackdropFreezeFragment", @"SimpleTextureFragmentUV",
+            @"BackdropFreezeVertex", @"ShadowCompositeFragment",
+            @"InPlaceAlphaUnpremultiply", @"SimpleTextureFragment",
+            @"SimpleGrayscale", @"Backdrop_Inactive_PlusL",
+            @"UberResampleLanczosFragmentBGRA", @"BackdropHBlur1x",
+            @"ColorFillYCbCr", @"DownsampleClampedBloody4x",
+            @"DownsampleClamped4x", @"UberBackdropFragment",
+            @"Backdrop_Inactive_Masked_PlusL", @"BlurCompositeVertex",
+            @"Backdrop_Inactive_PlusD",
+            @"Backdrop_Inactive_Masked_PlusD", @"UberBackdropVertex",
+            @"BackdropHBlur2x", @"BlurUpsampleVertex",
+            @"BackdropInactiveVertex", @"InPlaceSover",
+            @"SimpleTextureTintFragment", @"ShadowVerticalBlurFragment",
+            @"AlphaTextureFragment", @"BlurComposite",
+            @"SimpleMeshVertex", @"ShadowHorizontalBlurFragment",
+            @"UberResampleLanczosFragmentYCbCr", @"BlurUpsample",
+            @"ShadowVerticalBlurRGBAFragment",
+            @"Backdrop_Inactive_Masked_Sover", @"SimpleVertexShadow"
+        ]];
+    });
+    return [names containsObject:name];
 }
 
 static BOOL macws_skylight_desktop_base_function_name(NSString *name) {
-    // The Simple* pair has no function constants and is requested directly.
-    // UberCompositeFragment is different: ShaderComposer passes the real
-    // per-composite MTLFunctionConstantValues through the library
-    // specialization API, so it must not be flattened into a base request.
-    return [name isEqualToString:@"SimpleVertex"] ||
-           [name isEqualToString:@"SimpleTextureFragment"];
+    // Runtime-confirmed requirements for all 54 functions: these eleven use
+    // function constants and must preserve the caller's specialization path;
+    // every other SkyLight function is an ordinary base request.
+    if (!macws_skylight_desktop_function_name(name)) return NO;
+    return !([name isEqualToString:@"UberCompositeVertex"] ||
+             [name isEqualToString:@"UberCompositeFragment"] ||
+             [name isEqualToString:@"BackdropFreezeFragment"] ||
+             [name isEqualToString:@"ShadowCompositeFragment"] ||
+             [name isEqualToString:@"UberResampleLanczosFragmentBGRA"] ||
+             [name isEqualToString:@"UberBackdropFragment"] ||
+             [name isEqualToString:@"ShadowVerticalBlurFragment"] ||
+             [name isEqualToString:@"BlurComposite"] ||
+             [name isEqualToString:@"ShadowHorizontalBlurFragment"] ||
+             [name isEqualToString:@"UberResampleLanczosFragmentYCbCr"] ||
+             [name isEqualToString:@"ShadowVerticalBlurRGBAFragment"]);
 }
 
 static BOOL macws_mpsimage_desktop_function_name(NSString *name) {
@@ -10998,13 +11496,11 @@ static id macws_skylight_function_compat(
     __attribute__((ns_returns_retained));
 static id macws_skylight_function_compat(
         id self, SEL selector, NSString *name) {
-    // Runtime-confirmed by metal_source_probe against the exact Ventura
-    // SkyLightShaders library: both Simple* functions report
-    // needsFunctionConstantValues=NO and an empty constants dictionary. They
-    // therefore never enter _MTLFunctionInternal's specialization methods;
-    // adapt only their base-function creation. MPSImage's runtime-confirmed
-    // sum_rgba_columns and sum_rgba_rows functions have the same
-    // zero-constant contract.
+    // Runtime-confirmed by metal_source_probe against every function in the
+    // exact Ventura SkyLightShaders library: redirect the 43 functions with
+    // needsFunctionConstantValues=NO here, and leave the other eleven to the
+    // specialization hooks below. MPSImage's runtime-confirmed reduction
+    // functions have the same zero-constant contract.
     // QuartzCore's fixed_* functions are intentionally excluded because all
     // three require specialization.
     BOOL base_function_target =
@@ -11198,7 +11694,8 @@ static id macws_qc_specialize_basic_compat(
     // boundary.  Do not replace the nil result or alter the cache contract.
     if (macws_runtime_diagnostics_enabled() &&
         ([name isEqualToString:@"UberCompositeVertex"] ||
-         [name isEqualToString:@"UberCompositeFragment"])) {
+         [name isEqualToString:@"UberCompositeFragment"] ||
+         [name isEqualToString:@"UberResampleLanczosFragmentBGRA"])) {
         NSError *specialization_error = error ? *error : nil;
         dprintf(STDERR_FILENO,
             "#### SKYLIGHT-UBER-SPECIALIZE selector=%s name=%s "
@@ -12577,6 +13074,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
     macws_register_catalyst_application_with_fuseboard();
     macws_install_catalyst_launch_compatibility();
     macws_install_catalyst_launch_diagnostics();
+    macws_install_catalyst_drawable_publisher();
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
     const char *appExtension = getenv("MACWS_APP_EXTENSION");

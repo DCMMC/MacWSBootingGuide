@@ -52,6 +52,7 @@ VIEWBRIDGE_PLIST="$MACOS_DAEMONS/com.macwsguide.viewbridge.plist"
 EXTENSIONKIT_PLIST="$MACOS_DAEMONS/com.macwsguide.extensionkit.plist"
 HISERVICES_PLIST="$MACOS_DAEMONS/com.macwsguide.hiservices.plist"
 GEOD_PLIST="$MACOS_DAEMONS/com.macwsguide.geod.plist"
+OFFICE_LICENSING_PLIST="$MACOS_DAEMONS/com.macwsguide.office-licensing.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
@@ -115,6 +116,7 @@ VIEWBRIDGE_LABEL=com.macwsguide.viewbridge
 EXTENSIONKIT_LABEL=com.macwsguide.extensionkit
 HISERVICES_LABEL=com.macwsguide.hiservices
 GEOD_LABEL=com.macwsguide.geod
+OFFICE_LICENSING_LABEL=com.macwsguide.office-licensing
 WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
@@ -181,6 +183,7 @@ FINDER_BIN=/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder
 DOCK_BIN=/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock
 SYSTEMUI_BIN=/System/Library/CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer
 CONTROL_CENTER_BIN=/System/Library/CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter
+OFFICE_LICENSING_BIN=/Library/PrivilegedHelperTools/com.microsoft.office.licensingV2.helper
 ICONSERVICESD_BIN=/System/Library/CoreServices/iconservicesd
 ICONSERVICESAGENT_BIN=/System/Library/CoreServices/iconservicesagent
 CSNAMEDDATAD_BIN=/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/CarbonCore.framework/Versions/A/XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad
@@ -225,6 +228,7 @@ P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_DOCK='CoreServices/Dock.app/Contents/MacOS/Dock'
 P_SYSTEMUI='CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer'
 P_CONTROL_CENTER='CoreServices/ControlCenter.app/Contents/MacOS/ControlCenter'
+P_OFFICE_LICENSING='PrivilegedHelperTools/com.microsoft.office.licensingV2.helper'
 P_ICONSERVICESD='CoreServices/iconservicesd'
 P_ICONSERVICESAGENT='CoreServices/iconservicesagent'
 P_CSNAMEDDATAD='XPCServices/csnameddatad.xpc/Contents/MacOS/csnameddatad'
@@ -1023,6 +1027,7 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/CoreServices/iconservicesagent" \
         "$ROOTFS/usr/libexec/pboard" \
         "$ROOTFS/System/Library/CoreServices/pbs" \
+        "$ROOTFS$OFFICE_LICENSING_BIN" \
         "$ROOTFS/System/Applications/System Settings.app/Contents/MacOS/System Settings" \
         "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" \
         "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
@@ -2113,10 +2118,12 @@ cleanup_macos() {
     launchctl unload "$TERM_PLIST" 2>/dev/null
     launchctl unload "$PBOARD_PLIST" 2>/dev/null
     launchctl unload "$PBS_PLIST" 2>/dev/null
+    launchctl unload "$OFFICE_LICENSING_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl remove "$PBOARD_LABEL" 2>/dev/null
     launchctl remove "$PBS_LABEL" 2>/dev/null
+    launchctl remove "$OFFICE_LICENSING_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
     launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
@@ -2176,6 +2183,7 @@ cleanup_macos() {
     kill_by_pattern "$P_TERMINAL"
     kill_by_pattern "$P_PBOARD"
     kill_by_pattern "$P_PBS"
+    kill_by_pattern "$P_OFFICE_LICENSING"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     # Maps cannot survive a WindowServer generation change: its CGS port is
@@ -2647,6 +2655,33 @@ start_macos() {
         return 1
     }
     verify_preferences_persistence || return 1
+
+    # Office's serializer and applications do not write the volume-license
+    # plist in-process. They synchronously call the stock privileged helper's
+    # Mach service. A normal macOS boot publishes that service from the
+    # helper's LaunchDaemon, but the chroot has no independent launchd domain.
+    # Publish the unmodified protocol in the outer bootstrap and execute the
+    # real helper through launchdchrootexec. This is optional when Office is
+    # not installed and must never make the base desktop unavailable.
+    if [ -x "$ROOTFS$OFFICE_LICENSING_BIN" ]; then
+        if [ ! -f "$OFFICE_LICENSING_PLIST" ]; then
+            log "WARNING: Office licensing helper is installed but its launch contract is missing."
+        else
+            log "Publishing Microsoft Office volume-licensing service..."
+            rm -f "$LOGDIR/office-licensing.log"
+            if launchctl load "$OFFICE_LICENSING_PLIST"; then
+                # MachServices registration is the readiness contract.  The
+                # stock helper is allowed to exit after an idle request and
+                # launchd will reactivate it for the next Office client, so
+                # waiting for a persistent PID would add ten seconds to every
+                # desktop start and misreport a healthy on-demand service.
+                log "Microsoft Office volume-licensing service registered (on demand)."
+            else
+                log "WARNING: Office licensing service could not be registered."
+                tail -n 20 "$LOGDIR/office-licensing.log" 2>/dev/null || true
+            fi
+        fi
+    fi
 
     log "Publishing the private macOS LaunchServices system store and session catalog..."
     ensure_launchservices_session_user_dir || {

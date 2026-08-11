@@ -26,6 +26,7 @@ env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
 env	MACWS_CATALOG_REGISTRATION	off	macwsworkspacectl register-settings-extensions	Production launch plists keep this unset; the catalog transaction sets it to 1 only for the short-lived stock registration of all standalone System Settings extensions.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
+env	MACWS_APP_MOUNT_COMPAT	auto	custom-path and generic Catalyst children	Launcher-owned scoped root-volume/statfs/fsgetpath compatibility; enabled only for an exact validated executable rather than globally.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
 env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
@@ -83,7 +84,9 @@ env	MACWS_LSD_ROLE	auto	private LaunchServices daemons	Explicitly selects the sy
 env	MACWS_LSD_SESSION_USER_DIR	auto	private LaunchServices session daemon	Absolute isolated Darwin user directory used only by the MACWS_LSD_ROLE=session daemon so it cannot clean the system daemon's csstore.
 env	MACWS_CATALYST_REGISTER_APPLICATION	on	Maps UIKit carrier child	Completes Maps' stock UIKitServices application-support handshake; UIKitSystem validates the real child audit token and complete exec generation before FrontBoard registration.
 env	MACWS_CATALYST_REQUEST_INITIAL_SCENE	on	Maps UIKit carrier child	Requests Maps' initial UIKitMac scene after the validated UIKitServices registration; set only by MacWSCatalystLauncher, not globally.
+env	MACWS_CATALYST_DIRECT_DRAWABLE	on	generic Catalyst carrier child	Publishes completed CAMetalLayer IOSurfaces through a typed Mach message when SkyLight exact-window capture omits the client area; Host imports and composites the same native AGX surface without RFB or CPU readback.
 env	MACWS_CATALYST_TRACE	off	Catalyst diagnostic	Emits verbose UIKitMac/FuseBoard lifecycle inventories; never enable in production.
+env	MACWS_DNS_DEBUG	off	DNS compatibility diagnostic	Logs local getaddrinfo failure and bounded hostd fallback results; production fallback remains active but quiet.
 env	APPLICATION_SUPPORT_SERVICE_MACH_NAME	auto	Maps UIKit carrier child	Routes Maps' UIKitServices client to the private macOS-booter FrontBoard endpoint published by UIKitSystem; set only by MacWSCatalystLauncher.
 env	MACWS_KEEP_ASSERT_BYPASS	off	safety invariant	Real assertions remain enabled.
 env	MACWS_KEEP_FORCE_ACCEL	off	legacy simulator control	Simulator force-accelerator shim remains disabled.
@@ -92,6 +95,7 @@ env	MACWS_KEEP_VALIDATE_ALWAYS	off	diagnostic scaffold	Forces historical validat
 env	MACWS_MACH_MSG_TRACE	off	diagnostic	Mach-message trace.
 env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-policy compatibility.
 env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
+env	MACWS_METAL_PROBE_DUMP_FUNCTIONS	off	standalone probe	Prints the exact function inventory exposed by a probe Metal library; never enabled in production.
 env	MACWS_METAL_PROBE_DUMP_FUNCTION_METHODS	off	standalone probe	Prints specialization/library-related Objective-C methods on probe MTLFunction objects.
 env	MACWS_METAL_PROBE_DUMP_LIBRARY_METHODS	off	standalone probe	Prints function-related Objective-C methods on a loaded probe MTLLibrary object.
 env	__CFBundleIdentifier	auto	Catalyst direct launcher	Sets the actual macOS application bundle identity after RunningBoard selects the hidden iOS carrier identity.
@@ -231,6 +235,7 @@ preference	com.apple.dock:showMissionControlGestureEnabled	on	Dock native gestur
 preference	com.apple.dock:showAppExposeGestureEnabled	on	Dock native gestures	Persisted and read back before Dock starts; owns the real vertical-positive App Expose fluid controller.
 state	SkyLight managed desktop count	auto	Dock native gestures	Cold one-Space sessions receive exactly one real adjacent Desktop before Dock starts; existing two-or-more-Space topology is preserved, enabling native horizontal fluid gestures without a Dock reload.
 state	/private/tmp/macws_location_provider_ready	transient	Maps location capability	Current macwsinteropd PID, published only after its unmodified Ventura CLLocationManager receives a real provider update; Maps accepts it only while that exact executable remains live, and GUI teardown removes it.
+state	com.macwsguide.catalyst-drawable	transient	MacWSHost/Catalyst display transport	Foreground Host-owned bootstrap Mach receive service; each typed complex message transfers one completed IOSurface send right and is rejected on envelope, geometry, stride, pixel-format, or owner mismatch.
 state	/var/jb/var/mobile/macws-maps-host-carrier.pid	transient	Maps Catalyst lifecycle	Current Maps carrier PID; every WindowServer teardown removes it after terminating Maps so a new GUI generation cannot reuse a live process with a dead CGS connection.
 state	/tmp/macws_vnc_surfid	transient	legacy transport	IOSurface ID compatibility state.
 state	/tmp/ws_headless	on	coexistence	Keeps the iPad panel owned by iOS.

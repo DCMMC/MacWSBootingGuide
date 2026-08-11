@@ -938,8 +938,8 @@ ROOTFS=/var/mnt/rootfs
 # Ventura QuartzCore's real desktop-window-effects shaders are compiled for a
 # macOS AIR target, while this project intentionally executes them on the iOS
 # native AGX driver. The focused provisioner preserves the original library,
-# regenerates the fourteen-function secondary macabi artifact when required, and
-# performs exact byte validation. It is also called by dpkg's postinst so an
+# regenerates the twenty-one-function secondary macabi artifact when required,
+# and performs exact byte validation. It is also called by dpkg's postinst so an
 # upgrade cannot leave a stale shader artifact behind valid trust sentinels.
 QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py
 QC_LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
@@ -951,17 +951,18 @@ qc_sha256() {
 
 bash /var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh || exit 1
 
-# SkyLight's desktop backing-window path has a second, independently
-# Runtime-confirmed target mismatches exist for the ordinary
-# SimpleVertex/SimpleTextureFragment pair and for the UberCompositeFragment
-# specialization reached when Mission Control snapshots a real application
-# window. Generate a separate three-function compatibility library from the
-# exact Ventura 13.4 source; never replace SkyLight's process-wide library.
+# SkyLight has an independent desktop AIR target mismatch. Runtime failures
+# reached backing-window, menu-bar, Mission Control, simple-color,
+# alpha-texture, tile, and window-shadow paths. metal_source_probe enumerated
+# all 54 functions in the exact Ventura 13.4 source and confirmed that every
+# function carries the same desktop target (43 base functions and 11 requiring
+# function constants). Retarget the complete library as one coherent closure;
+# never replace the process-wide source library.
 SKY_DEFAULT="$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/SkyLightShaders.air64.metallib"
 SKY_EXPECTED_SHA256=378174fcbf7fc639aa737cad7a765690b2d76fa3a66c7a8e71018441f3ac3184
 SKY_COMPAT_DIR="$ROOTFS/usr/local/share/macws/skylight"
 SKY_COMPAT_TARGET="$SKY_COMPAT_DIR/SkyLightShaders-desktop-effects-macabi.metallib"
-SKY_COMPAT_EXPECTED_SHA256=990803db710c494ff98155983cc9d3134c131e1ddbf3ce9e4468a3013134ffd6
+SKY_COMPAT_EXPECTED_SHA256=bfe93e8146325a912a0db9fc1ed28a2de32aa9ccb4065148398be12ac0644df1
 if [ "$(qc_sha256 "$SKY_DEFAULT")" != "$SKY_EXPECTED_SHA256" ]; then
 	echo "[ERROR] SkyLightShaders.air64.metallib is not the supported macOS 13.4 library." >&2
 	exit 1
@@ -969,11 +970,7 @@ fi
 mkdir -p "$SKY_COMPAT_DIR" || exit 1
 SKY_COMPAT_TMP="$SKY_COMPAT_TARGET.new.$$"
 python3 "$QC_REPACKER" "$SKY_DEFAULT" "$SKY_COMPAT_TMP" \
-	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
-	--function SimpleVertex \
-	--function SimpleTextureFragment \
-	--function UberCompositeFragment \
-	--preserve-container-target || exit 1
+	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" || exit 1
 if [ "$(qc_sha256 "$SKY_COMPAT_TMP")" != "$SKY_COMPAT_EXPECTED_SHA256" ]; then
 	echo "[ERROR] Generated SkyLight desktop-effects library failed exact validation." >&2
 	exit 1

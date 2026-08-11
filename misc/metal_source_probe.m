@@ -229,6 +229,18 @@ int main(void) {
                     libraryError
                         ? libraryError.localizedDescription.UTF8String : "(nil)");
             if (!library) return 7;
+            if (getenv("MACWS_METAL_PROBE_DUMP_FUNCTIONS")) {
+                for (NSString *functionName in functionNames) {
+                    fprintf(stderr,
+                            "METAL_SOURCE_PROBE libraryFunction name=%s\n",
+                            functionName.UTF8String);
+                    if (getenv(
+                            "MACWS_METAL_PROBE_DUMP_FUNCTION_REQUIREMENTS")) {
+                        DumpFunctionSpecializationRequirement(
+                            [library newFunctionWithName:functionName]);
+                    }
+                }
+            }
 
             id<MTLFunction> vertex =
                 [library newFunctionWithName:@"fixed_vert_lph_spc"];
@@ -242,15 +254,28 @@ int main(void) {
             DumpFunctionSpecializationRequirement(fragment);
             for (NSString *extraName in
                  @[ @"SimpleVertex", @"SimpleTextureFragment",
+                    @"SimpleColorVertex", @"SimpleColorFragment",
+                    @"SimpleVertexShadow", @"ShadowCompositeFragment",
+                    @"ShadowHorizontalBlurFragment",
+                    @"ShadowVerticalBlurFragment",
+                    @"ShadowVerticalBlurRGBAFragment",
                     @"UberCompositeFragment",
+                    @"UberResampleLanczosFragmentBGRA",
                     @"sum_rgba_columns", @"sum_rgba_rows",
                     @"std_vert1_lph", @"inplace_copy_lph",
                     @"downsample_blur_vert_lph",
                     @"downsample_8_frag_lph",
                     @"downsample_4_frag_lph",
                     @"single_pass_blur_3_lph",
+                    @"tile_downsample_1",
+                    @"tile_downsample_2",
                     @"tile_downsample_4",
                     @"tile_downsample_8",
+                    @"narrow_blur_7_frag_lph",
+                    @"narrow_blur_11_frag_lph",
+                    @"narrow_blur_15_frag_lph",
+                    @"narrow_blur_19_frag_lph",
+                    @"narrow_blur_23_frag_lph",
                     @"narrow_blur_27_frag_lph" ]) {
                 if ([functionNames containsObject:extraName]) {
                     DumpFunctionSpecializationRequirement(

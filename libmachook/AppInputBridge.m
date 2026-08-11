@@ -1923,63 +1923,42 @@ static void MacWSMenuEventLoopWitness(id self, SEL command, BOOL track,
 static void MacWSInstallMenuEventLoopWitness(void) {
     SEL selector = sel_registerName("_doMenuEventLoop:inMode:");
     Class baseClass = objc_getClass("NSMenuPresentationInstance");
-    int classCount = objc_getClassList(NULL, 0);
-    Class *classes = classCount > 0
-        ? calloc((size_t)classCount, sizeof(Class)) : NULL;
-    if (!baseClass || !classes ||
-        objc_getClassList(classes, classCount) <= 0) {
+    if (!baseClass) {
         fprintf(stderr,
                 "#### APP-INPUT MENU-TRACK-WITNESS unavailable "
-                "base=%s classes=%d\n",
-                baseClass ? "YES" : "NO", classCount);
+                "base=NO\n");
         fflush(stderr);
-        free(classes);
         return;
     }
 
-    for (int classIndex = 0; classIndex < classCount &&
-         MacWSMenuEventLoopHookCount < 32; classIndex++) {
-        Class candidate = classes[classIndex];
-        BOOL isPresentationClass = NO;
-        for (Class superclass = candidate; superclass;
-             superclass = class_getSuperclass(superclass)) {
-            if (superclass == baseClass) {
-                isPresentationClass = YES;
-                break;
-            }
-        }
-        if (!isPresentationClass) continue;
-
-        unsigned methodCount = 0;
-        Method *methods = class_copyMethodList(candidate, &methodCount);
-        Method directMethod = NULL;
-        for (unsigned methodIndex = 0; methodIndex < methodCount;
-             methodIndex++) {
-            if (method_getName(methods[methodIndex]) == selector) {
-                directMethod = methods[methodIndex];
-                break;
-            }
-        }
-        free(methods);
-        if (!directMethod) continue;
-
-        const char *types = method_getTypeEncoding(directMethod);
-        // Runtime-confirmed on macOS 13.4 as v28@0:8B16@20: void return,
-        // BOOL, object. Keep this a load-bearing witness rather than
-        // installing a guessed calling convention on another AppKit build.
-        if (!types || strcmp(types, "v28@0:8B16@20") != 0) {
-            fprintf(stderr,
-                    "#### APP-INPUT MENU-TRACK-WITNESS skip class=%s "
-                    "types=%s\n",
-                    class_getName(candidate), types ?: "nil");
-            fflush(stderr);
-            continue;
-        }
-        IMP implementation = method_getImplementation(directMethod);
-        if (implementation == (IMP)MacWSMenuEventLoopWitness) continue;
+    // Hook the implementation on AppKit's presentation base class. Subclasses
+    // inherit this method, so walking every registered Objective-C class is
+    // unnecessary. More importantly, objc_getClassList() realizes Swift-backed
+    // classes while an inserted dylib constructor is still running. Runtime-
+    // confirmed with Office 16.91 Word on 2026-08-10: that global realization
+    // entered OfficeArt's singleton metadata accessor before its image was
+    // initialized and crashed at address 0. Targeting the RE-confirmed AppKit
+    // owner keeps the menu event-loop invariant without touching unrelated app
+    // classes.
+    Method directMethod = class_getInstanceMethod(baseClass, selector);
+    const char *types = directMethod
+        ? method_getTypeEncoding(directMethod) : NULL;
+    // Runtime-confirmed on macOS 13.4 as v28@0:8B16@20: void return,
+    // BOOL, object. Keep this a load-bearing witness rather than installing a
+    // guessed calling convention on another AppKit build.
+    if (!directMethod || !types || strcmp(types, "v28@0:8B16@20") != 0) {
+        fprintf(stderr,
+                "#### APP-INPUT MENU-TRACK-WITNESS skip class=%s types=%s\n",
+                class_getName(baseClass), types ?: "nil");
+        fflush(stderr);
+        return;
+    }
+    IMP implementation = method_getImplementation(directMethod);
+    if (implementation != (IMP)MacWSMenuEventLoopWitness &&
+        MacWSMenuEventLoopHookCount < 32) {
         MacWSMenuEventLoopHooks[MacWSMenuEventLoopHookCount++] =
             (MacWSMenuEventLoopHook){
-                .ownerClass = candidate,
+                .ownerClass = baseClass,
                 .original = (MacWSMenuEventLoop)implementation,
             };
         method_setImplementation(directMethod,
@@ -1987,11 +1966,10 @@ static void MacWSInstallMenuEventLoopWitness(void) {
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
                     "#### APP-INPUT MENU-TRACK-WITNESS hook class=%s types=%s\n",
-                    class_getName(candidate), types);
+                    class_getName(baseClass), types);
             fflush(stderr);
         }
     }
-    free(classes);
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,
                 "#### APP-INPUT MENU-TRACK-WITNESS installed hooks=%zu\n",

@@ -124,11 +124,28 @@ def send_key(sock, keysym):
     sock.sendall(struct.pack(">BBxxI", 4, 0, keysym))
 
 
+def send_key_chord(sock, modifier_keysyms, keysym):
+    for modifier in modifier_keysyms:
+        sock.sendall(struct.pack(">BBxxI", 4, 1, modifier))
+    sock.sendall(struct.pack(">BBxxI", 4, 1, keysym))
+    sock.sendall(struct.pack(">BBxxI", 4, 0, keysym))
+    for modifier in reversed(modifier_keysyms):
+        sock.sendall(struct.pack(">BBxxI", 4, 0, modifier))
+
+
 def send_pointer_click(sock, point, button_mask, hold_seconds=0.04):
     sock.sendall(struct.pack(">BBHH", 5, button_mask, point[0], point[1]))
     if hold_seconds:
         time.sleep(hold_seconds)
     sock.sendall(struct.pack(">BBHH", 5, 0, point[0], point[1]))
+
+
+def send_pointer_double_click(sock, point, button_mask, hold_seconds=0.04,
+                              interval_seconds=0.08):
+    send_pointer_click(sock, point, button_mask, hold_seconds)
+    if interval_seconds:
+        time.sleep(interval_seconds)
+    send_pointer_click(sock, point, button_mask, hold_seconds)
 
 
 def send_text(sock, text, key_delay):
@@ -213,10 +230,17 @@ def main():
     parser.add_argument("--left-click", nargs=2, type=int,
                         metavar=("X", "Y"),
                         help="send one RFB primary-button down/up pair")
+    parser.add_argument("--double-click", nargs=2, type=int,
+                        metavar=("X", "Y"),
+                        help="send two primary-button pairs on one RFB "
+                             "connection")
     parser.add_argument("--move", nargs=2, type=int,
                         metavar=("X", "Y"),
                         help="send one button-free RFB pointer move")
     parser.add_argument("--text")
+    parser.add_argument("--command-key", metavar="KEY",
+                        help="send Command+KEY using X11 Meta_L (0xffe7); "
+                             "KEY may also be Tab")
     parser.add_argument("--capture-only", action="store_true",
                         help="save/describe one fresh non-incremental frame "
                              "without sending input")
@@ -227,7 +251,9 @@ def main():
     content_drag = parse_drag(parser, args.content_drag, "--content-drag")
     if (title_drag is None and content_drag is None and
             args.right_click is None and args.left_click is None and
+            args.double_click is None and
             args.move is None and args.text is None and
+            args.command_key is None and
             not args.capture_only):
         parser.error("select at least one input operation")
     if (args.timeout <= 0 or args.max_updates < 1 or args.drag_steps < 1 or
@@ -300,6 +326,18 @@ def main():
                 started, args.timeout, args.max_updates)
             completed += 1
 
+        if args.double_click is not None:
+            double_click = tuple(args.double_click)
+            check_point(width, height, *double_click)
+            vnc_live_click.request_update(sock, width, height, True)
+            started = time.monotonic()
+            send_pointer_double_click(
+                sock, double_click, 1, args.click_hold)
+            digest, _ = request_and_wait(
+                sock, width, height, framebuffer, digest, "double-click",
+                started, args.timeout, args.max_updates)
+            completed += 1
+
         if args.move is not None:
             move = tuple(args.move)
             check_point(width, height, *move)
@@ -342,6 +380,22 @@ def main():
                     f"latency_max={max(key_latencies):.3f}s "
                     f"latency_avg={sum(key_latencies) / len(key_latencies):.3f}s",
                     flush=True)
+            completed += 1
+
+        if args.command_key is not None:
+            if args.command_key.lower() == "tab":
+                command_keysym = 0xff09
+            elif len(args.command_key) == 1:
+                command_keysym = ord(args.command_key.lower())
+            else:
+                parser.error(
+                    "--command-key needs one character or the name Tab")
+            vnc_live_click.request_update(sock, width, height, True)
+            started = time.monotonic()
+            send_key_chord(sock, (0xffe7,), command_keysym)
+            digest, _ = request_and_wait(
+                sock, width, height, framebuffer, digest, "command-key",
+                started, args.timeout, args.max_updates)
             completed += 1
 
         digest = settle_and_drain(

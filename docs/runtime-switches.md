@@ -40,6 +40,15 @@ variables. `MallocScribble` is explicitly forbidden.
 - Direct/wrapped KCMD translation, cancelled-swap completion, owned BGRA
   scanout and the VNC mmap bridge are enabled for the current coexistence
   implementation.
+- Validated custom-path and generic Catalyst children receive the scoped
+  `MACWS_APP_MOUNT_COMPAT=1` namespace contract. Generic Catalyst children also
+  receive `MACWS_CATALYST_DIRECT_DRAWABLE=1`: if SkyLight captures their title
+  bar but omits a CAMetalLayer client area, libmachook transfers the completed
+  drawable's real IOSurface Mach right to the foreground Host. Host validates
+  its typed envelope and geometry, imports it as a native Metal texture, and
+  composites it over the black client area without RFB, compression, or CPU
+  pixel copies. The broad mount diagnostic is explicitly removed from the
+  child environment even if the existing Host was started by a debug shell.
 - VS Code and Chrome set `MACWS_CHROMIUM_COMPOSITE_OVERLAYS=1`. For the exact
   UUID-checked Chromium 148 Electron Framework, this marks the root
   `AggregatedRenderPass` with Chromium's real `video_capture_enabled` field

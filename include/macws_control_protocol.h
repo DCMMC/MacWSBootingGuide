@@ -8,6 +8,12 @@
 #define MACWS_CONTROL_KEY_APP_ID "app_id"
 #define MACWS_CONTROL_KEY_APP_PATH "app_path"
 #define MACWS_CONTROL_KEY_EXPERIMENTAL "experimental"
+#define MACWS_CONTROL_KEY_DNS_NODE "dns_node"
+#define MACWS_CONTROL_KEY_DNS_SERVICE "dns_service"
+#define MACWS_CONTROL_KEY_DNS_FLAGS "dns_flags"
+#define MACWS_CONTROL_KEY_DNS_FAMILY "dns_family"
+#define MACWS_CONTROL_KEY_DNS_SOCKTYPE "dns_socktype"
+#define MACWS_CONTROL_KEY_DNS_PROTOCOL "dns_protocol"
 
 #define MACWS_CONTROL_OP_STATUS "status"
 #define MACWS_CONTROL_OP_START "start"
@@ -18,5 +24,6 @@
 #define MACWS_CONTROL_OP_LAUNCH_PATH "launch-path"
 #define MACWS_CONTROL_OP_CAPTURE "capture"
 #define MACWS_CONTROL_OP_LOGS "logs"
+#define MACWS_CONTROL_OP_RESOLVE_HOST "resolve-host"
 
 #endif
