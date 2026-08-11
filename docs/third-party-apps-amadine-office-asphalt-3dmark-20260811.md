@@ -103,3 +103,20 @@ variant for that device and preserves its receipt. The product page has been
 opened on the iPad; installation still requires the normal user App Store
 authorization/tap. After that install lands, MacWS can test the device variant
 without modifying FairPlay material.
+
+## Control Center integration
+
+Per the user's 2026-08-11 decision, 3DMark is no longer an active test target
+and has no Control Center entry. The production Control Center now exposes
+Amadine, Word, Excel, PowerPoint and Asphalt. Availability comes from each
+exact executable's file-mode witness, so an uninstalled app remains disabled.
+
+Amadine and the three Office applications enter the same typed allowlist and
+scoped `MACWS_APP_MOUNT_COMPAT=1` launch transaction used for their successful
+production tests. Asphalt is deliberately different: its button writes one
+root-owned `0600` property-list request containing only the fixed executable,
+bundle identifier and container home, then asks the already-foreground
+MacWSHost to create the Catalyst child. The returned PID must have the exact
+root-owned per-PID carrier marker before hostd accepts it. This preserves the
+validated UIKit/FrontBoard ancestry and does not fall back to a bare chroot
+spawn or create a second black iPadOS scene.

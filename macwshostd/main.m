@@ -76,8 +76,18 @@ static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
 static const char *const kMapsHostCarrierMarker =
     "/var/jb/var/mobile/macws-maps-host-carrier.pid";
+static const char *const kAsphaltExecutable =
+    "/Applications/Asphalt.app/Contents/MacOS/Asphalt";
+static const char *const kAsphaltBundleIdentifier =
+    "com.gameloft.asphalt9mac";
+static const char *const kAsphaltContainerHome =
+    "/var/root/Library/Containers/com.gameloft.asphalt9mac/Data";
+static const char *const kCatalystRequestPath =
+    "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
 static CFStringRef const kMapsHostLaunchNotification =
     CFSTR("com.macwsguide.host.launch-maps");
+static CFStringRef const kCatalystHostLaunchNotification =
+    CFSTR("com.macwsguide.host.launch-catalyst");
 static pid_t WaitForRunningRootExecutable(NSString *rootPath,
                                           NSTimeInterval timeout);
 
@@ -489,6 +499,16 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_bool(reply, "vscode_available",
         access("/var/mnt/rootfs/Applications/Visual Studio Code.app/Contents/MacOS/Electron", X_OK) == 0 &&
         access(kVSCodePlist, R_OK) == 0);
+    xpc_dictionary_set_bool(reply, "amadine_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/Applications/Amadine.app/Contents/MacOS/Amadine"));
+    xpc_dictionary_set_bool(reply, "word_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/Applications/Microsoft Word.app/Contents/MacOS/Microsoft Word"));
+    xpc_dictionary_set_bool(reply, "excel_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/Applications/Microsoft Excel.app/Contents/MacOS/Microsoft Excel"));
+    xpc_dictionary_set_bool(reply, "powerpoint_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint"));
+    xpc_dictionary_set_bool(reply, "asphalt_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/Applications/Asphalt.app/Contents/MacOS/Asphalt"));
 }
 
 static NSString *TailFile(const char *path, NSUInteger limit) {
@@ -728,7 +748,19 @@ static const AllowedApp kAllowedApps[] = {
     {"finder", "/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder", "/var/mobile/Library/Logs/Finder.host.log"},
     {"system-settings", "/System/Applications/System Settings.app/Contents/MacOS/System Settings", "/var/mobile/Library/Logs/SystemSettings.host.log"},
     {"maps", "/System/Applications/Maps.app/Contents/MacOS/Maps", "/var/mobile/Library/Logs/Maps.host.log"},
+    {"amadine", "/Applications/Amadine.app/Contents/MacOS/Amadine", "/var/mobile/Library/Logs/Amadine.host.log"},
+    {"word", "/Applications/Microsoft Word.app/Contents/MacOS/Microsoft Word", "/var/mobile/Library/Logs/MicrosoftWord.host.log"},
+    {"excel", "/Applications/Microsoft Excel.app/Contents/MacOS/Microsoft Excel", "/var/mobile/Library/Logs/MicrosoftExcel.host.log"},
+    {"powerpoint", "/Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint", "/var/mobile/Library/Logs/MicrosoftPowerPoint.host.log"},
 };
+
+static BOOL IsThirdPartyAppIdentifier(const char *identifier) {
+    return identifier &&
+        (strcmp(identifier, "amadine") == 0 ||
+         strcmp(identifier, "word") == 0 ||
+         strcmp(identifier, "excel") == 0 ||
+         strcmp(identifier, "powerpoint") == 0);
+}
 
 // A native Host launch is complete when AppInputBridge has published at least
 // one real NSWindow descriptor. This replaces the VNC framebuffer
@@ -1294,6 +1326,93 @@ static BOOL MapsHostCarrierMarkerMatches(pid_t pid) {
         markerPID == pid && pid > 1;
 }
 
+static BOOL CatalystChildMarkerMatches(pid_t pid, const char *rootExecutable,
+                                       const char *bundleIdentifier) {
+    if (pid <= 1 || !rootExecutable || !bundleIdentifier) return NO;
+    char markerPath[PATH_MAX] = {0};
+    int length = snprintf(
+        markerPath, sizeof(markerPath),
+        "/var/mnt/rootfs/private/tmp/macws_catalyst_child.%d.info", pid);
+    if (length <= 0 || (size_t)length >= sizeof(markerPath)) return NO;
+    int fd = open(markerPath, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return NO;
+    struct stat status = {0};
+    char payload[PATH_MAX + 512] = {0};
+    ssize_t count = read(fd, payload, sizeof(payload) - 1);
+    int statusResult = fstat(fd, &status);
+    close(fd);
+    if (count <= 0 || (size_t)count >= sizeof(payload) ||
+        statusResult != 0 || !S_ISREG(status.st_mode) ||
+        status.st_uid != 0 || (status.st_mode & 022) != 0 ||
+        status.st_nlink != 1) return NO;
+    payload[count] = '\0';
+    NSString *expected = [NSString stringWithFormat:@"v1\n%s\n%s\n",
+                          rootExecutable, bundleIdentifier];
+    return strcmp(payload, expected.UTF8String) == 0;
+}
+
+static BOOL WriteCatalystLaunchRequest(const char *rootExecutable,
+                                       const char *bundleIdentifier,
+                                       const char *containerHome,
+                                       NSString **message) {
+    NSDictionary *request = @{
+        @"root_executable": @(rootExecutable),
+        @"bundle_identifier": @(bundleIdentifier),
+        @"container_home": @(containerHome),
+    };
+    NSError *serializationError = nil;
+    NSData *data = [NSPropertyListSerialization
+        dataWithPropertyList:request
+                      format:NSPropertyListBinaryFormat_v1_0
+                     options:0
+                       error:&serializationError];
+    if (!data) {
+        *message = [NSString stringWithFormat:
+            @"无法构造 Catalyst 启动请求：%@",
+            serializationError.localizedDescription ?: @"未知错误"];
+        return NO;
+    }
+    char temporaryPath[PATH_MAX] = {0};
+    int length = snprintf(temporaryPath, sizeof(temporaryPath),
+                          "%s.new.%d", kCatalystRequestPath, getpid());
+    if (length <= 0 || (size_t)length >= sizeof(temporaryPath)) {
+        *message = @"Catalyst 启动请求路径过长";
+        return NO;
+    }
+    unlink(temporaryPath);
+    int fd = open(temporaryPath,
+                  O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0) {
+        *message = [NSString stringWithFormat:
+            @"无法创建 Catalyst 启动请求（errno=%d）", errno];
+        return NO;
+    }
+    const uint8_t *cursor = data.bytes;
+    size_t remaining = data.length;
+    BOOL written = YES;
+    while (remaining > 0) {
+        ssize_t count = write(fd, cursor, remaining);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            written = NO;
+            break;
+        }
+        cursor += count;
+        remaining -= (size_t)count;
+    }
+    if (written && fsync(fd) != 0) written = NO;
+    if (close(fd) != 0) written = NO;
+    if (!written || rename(temporaryPath, kCatalystRequestPath) != 0) {
+        int savedError = errno;
+        unlink(temporaryPath);
+        *message = [NSString stringWithFormat:
+            @"无法发布 Catalyst 启动请求（errno=%d）", savedError];
+        return NO;
+    }
+    return YES;
+}
+
 static void RetireLegacyMapsUIKitCarrier(void) {
     // The pre-fullscreen architecture foregrounded this UIApplication and
     // kept its empty UIWindowScene alive after Maps exited.  A process whose
@@ -1400,6 +1519,99 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
             "route=existing-MacWSHost catalog=asynchronous", mapsPID,
             uikitSystemPID);
     *message = @"地图正在当前工作区打开，未创建新的 iPadOS 窗口";
+    return YES;
+}
+
+// Asphalt is the first third-party Catalyst control-center target. Its
+// executable, bundle identity and container are an exact allowlist entry;
+// macwshostd publishes one root-owned request and the already-foreground
+// MacWSHost creates the responsible-process child. This is the same upstream
+// UIKit/FrontBoard ancestry that runtime-confirmed the native AGX drawable,
+// not a bare chroot spawn or a second black UIKit scene.
+static BOOL LaunchAsphaltViaUIKitCarrier(NSString **message) {
+    NSString *rootPath = @(kAsphaltExecutable);
+    NSString *hostPath = [@(kRootFS) stringByAppendingString:rootPath];
+    NSString *hostContainer = [@(kRootFS)
+        stringByAppendingString:@"/private/var/root/Library/Containers/com.gameloft.asphalt9mac/Data"];
+    struct stat containerStatus = {0};
+    if (!HasExecutableFileMode(hostPath.fileSystemRepresentation) ||
+        stat(hostContainer.fileSystemRepresentation, &containerStatus) != 0 ||
+        !S_ISDIR(containerStatus.st_mode) ||
+        access(kUIKitSystemPlist, R_OK) != 0) {
+        *message = @"Asphalt 的可执行文件、容器或 Catalyst 服务不完整";
+        return NO;
+    }
+    if (!JobHasPID(kWindowServerLabel, NULL) ||
+        !JobHasPID(kDisplayLabel, NULL)) {
+        *message = @"请先启动 macOS GUI 与 DisplayStream";
+        return NO;
+    }
+
+    pid_t uikitSystemPID = FindRunningRootExecutable(
+        @(kUIKitSystemExecutable));
+    if (uikitSystemPID <= 1) {
+        const char *loadUIKitSystem[] = {
+            kLaunchctl, "load", kUIKitSystemPlist, NULL,
+        };
+        const char *kickstartUIKitSystem[] = {
+            kLaunchctl, "kickstart", "-k",
+            "user/501/com.apple.uikitsystemapp", NULL,
+        };
+        (void)RunCommand(loadUIKitSystem, YES);
+        (void)RunCommand(kickstartUIKitSystem, YES);
+        uikitSystemPID = WaitForRunningRootExecutable(
+            @(kUIKitSystemExecutable), 8.0);
+        if (uikitSystemPID <= 1) {
+            *message = @"UIKitSystem 未能完成 Asphalt 场景服务启动";
+            return NO;
+        }
+    }
+
+    pid_t asphaltPID = FindRunningRootExecutable(rootPath);
+    if (asphaltPID > 1) {
+        BOOL exactCarrier = CatalystChildMarkerMatches(
+            asphaltPID, kAsphaltExecutable, kAsphaltBundleIdentifier);
+        if (exactCarrier && RequestApplicationReopen(asphaltPID, 8.0)) {
+            os_unfair_lock_lock(&gStateLock);
+            gActiveAppPID = asphaltPID;
+            gActiveAppID = @"asphalt";
+            os_unfair_lock_unlock(&gStateLock);
+            *message = @"Asphalt 已在当前 MacWSHost 工作区运行";
+            return YES;
+        }
+        if (!TerminateWindowlessRootExecutable(asphaltPID, rootPath, message))
+            return NO;
+    }
+
+    RetireLegacyMapsUIKitCarrier();
+    if (!WriteCatalystLaunchRequest(
+            kAsphaltExecutable, kAsphaltBundleIdentifier,
+            kAsphaltContainerHome, message)) return NO;
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        kCatalystHostLaunchNotification, NULL, NULL, true);
+    asphaltPID = WaitForRunningRootExecutable(rootPath, 5.0);
+    unlink(kCatalystRequestPath);
+    if (asphaltPID <= 1) {
+        *message = @"MacWSHost 未能在当前工作区启动 Asphalt";
+        return NO;
+    }
+    if (!CatalystChildMarkerMatches(
+            asphaltPID, kAsphaltExecutable, kAsphaltBundleIdentifier)) {
+        NSString *retireMessage = nil;
+        (void)TerminateWindowlessRootExecutable(
+            asphaltPID, rootPath, &retireMessage);
+        *message = @"Asphalt 进程缺少匹配的 Host Catalyst 身份，已拒绝";
+        return NO;
+    }
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = asphaltPID;
+    gActiveAppID = @"asphalt";
+    os_unfair_lock_unlock(&gStateLock);
+    HostLog(@"launch-app process-ready id=asphalt pid=%d uikitsystem=%d "
+            "route=existing-MacWSHost catalog=asynchronous",
+            asphaltPID, uikitSystemPID);
+    *message = @"Asphalt 正在当前工作区打开，未创建新的 iPadOS 窗口";
     return YES;
 }
 
@@ -1641,7 +1853,8 @@ static BOOL LaunchRootExecutable(const char *identifier,
             return NO;
         }
         childEnvironment = ownedEnvironment;
-    } else if (strcmp(identifier, "custom-path") == 0) {
+    } else if (strcmp(identifier, "custom-path") == 0 ||
+               IsThirdPartyAppIdentifier(identifier)) {
         // Runtime-confirmed by Amadine-2026-08-11-141854.ips: creating a
         // document made AppKit resolve a NIB image through NSWorkspace, which
         // dispatched LaunchServices bundle registration and recursively
@@ -1686,7 +1899,8 @@ static BOOL LaunchRootExecutable(const char *identifier,
         BOOL finder = strcmp(identifier, "finder") == 0;
         BOOL reopenLifecycle = strcmp(identifier, "system-settings") == 0 ||
                                strcmp(identifier, "maps") == 0;
-        BOOL customPath = strcmp(identifier, "custom-path") == 0;
+        BOOL customPath = strcmp(identifier, "custom-path") == 0 ||
+                          IsThirdPartyAppIdentifier(identifier);
         BOOL windowReady = NO;
         if (finder) {
             windowReady = RequestFinderBrowserWindow(pid, timeout);
@@ -1830,6 +2044,8 @@ static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
     if ([rootPath isEqualToString:@(kVSCodeExecutable)] ||
         [rootPath isEqualToString:@(kVSCodeBundleExecutable)])
         return LaunchAllowedApp("vscode", message);
+    if ([rootPath isEqualToString:@(kAsphaltExecutable)])
+        return LaunchAllowedApp("asphalt", message);
     for (NSUInteger index = 0;
          index < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); index++) {
         if ([rootPath isEqualToString:@(kAllowedApps[index].rootPath)])
@@ -1844,6 +2060,8 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         return LaunchVSCode(message);
     if (identifier && strcmp(identifier, "maps") == 0)
         return LaunchMapsViaUIKitCarrier(message);
+    if (identifier && strcmp(identifier, "asphalt") == 0)
+        return LaunchAsphaltViaUIKitCarrier(message);
     const AllowedApp *app = NULL;
     for (NSUInteger i = 0; i < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); i++) {
         if (identifier && strcmp(identifier, kAllowedApps[i].identifier) == 0) {

@@ -6229,14 +6229,45 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     UIButton *maps = [self buttonWithTitle:@"地图" image:@"map"
                                     action:@selector(launchApplication:) prominent:NO];
     maps.accessibilityIdentifier = @"maps";
+    UIButton *amadine = [self buttonWithTitle:@"Amadine"
+                                        image:@"paintbrush.pointed"
+                                       action:@selector(launchApplication:)
+                                    prominent:NO];
+    amadine.accessibilityIdentifier = @"amadine";
+    UIButton *word = [self buttonWithTitle:@"Word" image:@"doc.richtext"
+                                     action:@selector(launchApplication:)
+                                  prominent:NO];
+    word.accessibilityIdentifier = @"word";
+    UIButton *excel = [self buttonWithTitle:@"Excel" image:@"tablecells"
+                                      action:@selector(launchApplication:)
+                                   prominent:NO];
+    excel.accessibilityIdentifier = @"excel";
+    UIButton *powerpoint = [self buttonWithTitle:@"PowerPoint"
+                                           image:@"play.rectangle"
+                                          action:@selector(launchApplication:)
+                                       prominent:NO];
+    powerpoint.accessibilityIdentifier = @"powerpoint";
+    UIButton *asphalt = [self buttonWithTitle:@"Asphalt"
+                                        image:@"flag.checkered"
+                                       action:@selector(launchApplication:)
+                                    prominent:NO];
+    asphalt.accessibilityIdentifier = @"asphalt";
     _applicationButtons = @[
         glassDemo, terminal, activity, finder, vscode, settings, maps,
+        amadine, word, excel, powerpoint, asphalt,
     ];
     UIStackView *appRow1 = [[UIStackView alloc] initWithArrangedSubviews:@[glassDemo, terminal]];
     UIStackView *appRow2 = [[UIStackView alloc] initWithArrangedSubviews:@[activity, finder]];
     UIStackView *appRow3 = [[UIStackView alloc] initWithArrangedSubviews:@[vscode, settings]];
     UIStackView *appRow4 = [[UIStackView alloc] initWithArrangedSubviews:@[maps]];
-    for (UIStackView *row in @[appRow1, appRow2, appRow3, appRow4]) {
+    UIStackView *appRow5 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[amadine, word]];
+    UIStackView *appRow6 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[excel, powerpoint]];
+    UIStackView *appRow7 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[asphalt]];
+    for (UIStackView *row in @[
+             appRow1, appRow2, appRow3, appRow4, appRow5, appRow6, appRow7]) {
         row.axis = UILayoutConstraintAxisHorizontal;
         row.distribution = UIStackViewDistributionFillEqually;
         row.spacing = 8;
@@ -6397,6 +6428,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         appRow2,
         appRow3,
         appRow4,
+        appRow5,
+        appRow6,
+        appRow7,
         _windowPickerButton,
         _menuBarButton,
         _closeWindowButton,
@@ -6721,6 +6755,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         identifier = @"activity-monitor";
     else if ([lower containsString:@"finder"])
         identifier = @"finder";
+    else if ([lower containsString:@"amadine"])
+        identifier = @"amadine";
+    else if ([lower isEqualToString:@"word"] ||
+             [lower containsString:@"microsoft word"])
+        identifier = @"word";
+    else if ([lower isEqualToString:@"excel"] ||
+             [lower containsString:@"microsoft excel"])
+        identifier = @"excel";
+    else if ([lower containsString:@"powerpoint"] ||
+             [lower isEqualToString:@"ppt"])
+        identifier = @"powerpoint";
+    else if ([lower containsString:@"asphalt"])
+        identifier = @"asphalt";
     [textField resignFirstResponder];
     if (identifier) {
         [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
@@ -6729,7 +6776,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self runOperation:@MACWS_CONTROL_OP_LAUNCH_PATH
                  arguments:@{@MACWS_CONTROL_KEY_APP_PATH: query}];
     } else {
-        [self setNotice:@"未找到应用；可输入 VS Code、Terminal、Finder，或 / 开头的 macOS 绝对路径。"
+        [self setNotice:@"未找到应用；可搜索 Amadine、Office、Asphalt，或输入 / 开头的 macOS 绝对路径。"
                  success:NO];
     }
     return NO;
@@ -7461,6 +7508,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         @"vscode": @"vscode_available",
         @"system-settings": @"system_settings_available",
         @"maps": @"maps_available",
+        @"amadine": @"amadine_available",
+        @"word": @"word_available",
+        @"excel": @"excel_available",
+        @"powerpoint": @"powerpoint_available",
+        @"asphalt": @"asphalt_available",
     };
     for (UIButton *button in _applicationButtons) {
         BOOL available = [status[availability[button.accessibilityIdentifier]] boolValue];
@@ -7680,7 +7732,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                [action isEqualToString:@"activity-monitor"] ||
                [action isEqualToString:@"finder"] ||
                [action isEqualToString:@"system-settings"] ||
-               [action isEqualToString:@"maps"]) {
+               [action isEqualToString:@"maps"] ||
+               [action isEqualToString:@"amadine"] ||
+               [action isEqualToString:@"word"] ||
+               [action isEqualToString:@"excel"] ||
+               [action isEqualToString:@"powerpoint"] ||
+               [action isEqualToString:@"asphalt"]) {
         [self launchApplicationIdentifier:action];
     } else if ([action isEqualToString:@"recover"]) {
         [self recoverAction];
@@ -9028,7 +9085,8 @@ static void MacWSDeduplicateWindowScenes(void) {
         NSString *host = context.URL.host ?: @"status";
         if ([@[@"status", @"start", @"start-experimental", @"stop",
                @"glassdemo", @"terminal", @"vscode", @"activity-monitor", @"finder",
-               @"system-settings", @"maps",
+               @"system-settings", @"maps", @"amadine", @"word", @"excel",
+               @"powerpoint", @"asphalt",
                @"recover", @"repair", @"capture",
                @"test-open-file", @"fullscreen",
                @"enter-workspace", @"exit-workspace",
