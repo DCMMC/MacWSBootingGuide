@@ -30,6 +30,7 @@ extern pid_t audit_token_to_pid(audit_token_t token);
 #import "MacWSControlClient.h"
 #import "MacWSInteropClient.h"
 #import "MacWSMenuClient.h"
+#import "MacWSPerformanceMonitor.h"
 #import "MacWSStreamClient.h"
 #include "macws_control_protocol.h"
 #include "macws_catalyst_drawable_protocol.h"
@@ -850,6 +851,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 @property(nonatomic, readonly) BOOL hasDirectSurfaceFrame;
 @property(nonatomic, readonly) BOOL streamServiceConnected;
 @property(nonatomic, readonly) CGFloat effectiveDensityScale;
+@property(nonatomic, readonly) MacWSPerformanceMonitor *performanceMonitor;
 - (void)setMacWSInputEnabled:(BOOL)enabled reason:(NSString *)reason;
 - (void)configureStreamMode:(MacWSStreamMode)mode windowID:(uint32_t)windowID;
 - (void)requestStreamWindowList;
@@ -872,6 +874,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (NSArray<NSNumber *> *)overlayKeysBackToFront;
 - (BOOL)routeFullscreenInputRecord:(MacWSInputRecord *)record;
 - (void)logPerformanceSnapshotWithReason:(NSString *)reason;
+- (void)runPerformanceGestureScenario:(NSString *)scenario
+    completion:(void (^)(BOOL success, NSString *message))completion;
 @end
 
 @implementation MacWSMetalView {
@@ -879,6 +883,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     id<MTLCommandQueue> _commandQueue;
     id<MTLRenderPipelineState> _pipeline;
     id<MTLTexture> _sourceTexture;
+    MacWSPerformanceMonitor *_performanceMonitor;
     uint32_t _textureWidth;
     uint32_t _textureHeight;
     CGRect _contentRect;
@@ -1024,6 +1029,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _submittedOverlayLeaseTokens = [NSMutableDictionary dictionary];
     _commandQueue = [device newCommandQueue];
     _commandQueue.label = @"MacWSHost display queue";
+    _performanceMonitor = [[MacWSPerformanceMonitor alloc]
+        initWithSceneLabel:[NSString stringWithFormat:@"scene-%p", self]];
     _contentRect = CGRectZero;
     _visibleSourceRect = CGRectMake(0, 0, 1, 1);
     _trackpadCursor = CGPointMake(-1, -1);
@@ -2420,6 +2427,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         }
     }
     [encoder endEncoding];
+    uint64_t submitTime = mach_absolute_time();
+    uint64_t performanceStreamID = performanceFrame
+        ? performanceFrame.descriptor.streamID : 0;
+    uint64_t performanceSequence = performanceFrame
+        ? performanceFrame.descriptor.sequence : 0;
+    uint64_t performanceCaptureTime = performanceFrame
+        ? performanceFrame.descriptor.displayTime : 0;
+    uint64_t performanceReceiptTime = performanceFrame
+        ? performanceFrame.receiptTime : submitTime;
+    [_performanceMonitor recordSubmissionForStream:performanceStreamID
+        sequence:performanceSequence captureTime:performanceCaptureTime
+        receiptTime:performanceReceiptTime submitTime:submitTime
+        commandBuffer:commandBuffer drawable:drawable];
     [commandBuffer presentDrawable:drawable];
     if (drewCatalystDrawable && !_submittedCatalystDrawableWitness) {
         _submittedCatalystDrawableWitness = YES;
@@ -2434,7 +2454,6 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                      completed.error ?: @"nil");
         }];
     }
-    uint64_t submitTime = mach_absolute_time();
     uint32_t presentedWidth = [self currentFrameWidth];
     uint32_t presentedHeight = [self currentFrameHeight];
     MacWSSurfaceFrame *submittedFrame = directSurface ? _surfaceFrame : nil;
@@ -4122,6 +4141,227 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
 }
 
+- (void)runPerformanceGestureScenario:(NSString *)scenario
+    completion:(void (^)(BOOL success, NSString *message))completion {
+    void (^finish)(BOOL, NSString *) = completion
+        ? [completion copy]
+        : [^(BOOL success, NSString *message) {
+            (void)success;
+            (void)message;
+        } copy];
+    if (!self.isMacWSInputEnabled) {
+        finish(NO, @"触控桥尚未就绪");
+        return;
+    }
+    uint32_t width = [self currentFrameWidth];
+    uint32_t height = [self currentFrameHeight];
+    if (!width || !height) {
+        finish(NO, @"DisplayStream 尚无有效画面尺寸");
+        return;
+    }
+    CGPoint center = CGPointMake(width * 0.5, height * 0.5);
+    uint32_t contact = 0x50524600u |
+        ((++_directTouchSerial) & 0xffu); // "PRF"
+    void (^emitPointer)(MacWSInputKind, CGPoint, float, uint16_t) =
+        ^(MacWSInputKind kind, CGPoint point, float pressure,
+          uint16_t flags) {
+        MacWSInputRecord record = {
+            .magic = MACWS_INPUT_MAGIC,
+            .version = MACWS_INPUT_VERSION,
+            .kind = kind,
+            .sceneID = [self inputSceneIDWithModifiers:0],
+            .timestamp = CACurrentMediaTime(),
+            .x = (float)point.x,
+            .y = (float)point.y,
+            .pressure = pressure,
+            .contactID = contact,
+            .frameWidth = width,
+            .frameHeight = height,
+            .targetPID = self.targetPID,
+            .source = MacWSInputSourceFinger,
+            .flags = flags,
+            .sampleSequence = ++self->_inputSampleSequence,
+        };
+        [self.statusDelegate metalView:self emittedInput:record];
+    };
+    MacWSLog(@"performance-gesture-start scenario=%@ target=%d frame=%ux%u",
+             scenario, self.targetPID, width, height);
+
+    if ([scenario isEqualToString:@"tap"] ||
+        [scenario isEqualToString:@"right-tap"] ||
+        [scenario isEqualToString:@"double-tap"]) {
+        MacWSInputKind kind = [scenario isEqualToString:@"right-tap"]
+            ? MacWSInputKindSecondaryTap : MacWSInputKindTap;
+        emitPointer(kind, center, 1.0f, 0);
+        if ([scenario isEqualToString:@"double-tap"]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         100 * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{
+                emitPointer(MacWSInputKindTap, center, 1.0f,
+                            MacWSInputFlagDoubleClick);
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     450 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end scenario=%@ success=YES",
+                     scenario);
+            finish(YES, @"场景已完成");
+        });
+        return;
+    }
+
+    if ([scenario isEqualToString:@"drag"]) {
+        const NSInteger steps = 60;
+        const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
+        CGPoint start = CGPointMake(width * 0.35, height * 0.35);
+        CGPoint end = CGPointMake(width * 0.65, height * 0.55);
+        emitPointer(MacWSInputKindTouchDown, start, 1.0f, 0);
+        for (NSInteger index = 1; index <= steps; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         index * stepNanoseconds),
+                           dispatch_get_main_queue(), ^{
+                CGFloat progress = index / (CGFloat)steps;
+                CGPoint point = CGPointMake(
+                    start.x + (end.x - start.x) * progress,
+                    start.y + (end.y - start.y) * progress);
+                emitPointer(MacWSInputKindTouchMove, point, 1.0f, 0);
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds),
+                       dispatch_get_main_queue(), ^{
+            emitPointer(MacWSInputKindTouchUp, end, 0.0f, 0);
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     400 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end scenario=drag success=YES");
+            finish(YES, @"120 Hz 拖动场景已完成");
+        });
+        return;
+    }
+
+    if ([scenario isEqualToString:@"scroll"] ||
+        [scenario isEqualToString:@"magnify"]) {
+        const NSInteger steps = 72;
+        const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
+        BOOL magnify = [scenario isEqualToString:@"magnify"];
+        if (magnify) {
+            [self emitMagnifyAtFramePoint:center amount:0.0
+                flags:MacWSInputFlagGestureBegan
+                timestamp:CACurrentMediaTime()];
+        } else {
+            [self emitScrollAtFramePoint:center translation:CGPointZero
+                flags:MacWSInputFlagScrollBegan
+                timestamp:CACurrentMediaTime()];
+        }
+        for (NSInteger index = 1; index <= steps; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         index * stepNanoseconds),
+                           dispatch_get_main_queue(), ^{
+                if (magnify) {
+                    [self emitMagnifyAtFramePoint:center amount:0.004
+                        flags:MacWSInputFlagGestureChanged
+                        timestamp:CACurrentMediaTime()];
+                } else {
+                    [self emitScrollAtFramePoint:center
+                        translation:CGPointMake(0.0, -3.0)
+                        flags:MacWSInputFlagScrollChanged
+                        timestamp:CACurrentMediaTime()];
+                }
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds),
+                       dispatch_get_main_queue(), ^{
+            if (magnify) {
+                [self emitMagnifyAtFramePoint:center amount:0.0
+                    flags:MacWSInputFlagGestureEnded
+                    timestamp:CACurrentMediaTime()];
+            } else {
+                [self emitScrollAtFramePoint:center translation:CGPointZero
+                    flags:MacWSInputFlagScrollEnded
+                    timestamp:CACurrentMediaTime()];
+            }
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     500 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end scenario=%@ success=YES",
+                     scenario);
+            finish(YES, magnify ? @"120 Hz 缩放场景已完成"
+                                : @"120 Hz 滚动场景已完成");
+        });
+        return;
+    }
+
+    NSDictionary<NSString *, NSArray<NSNumber *> *> *systemScenarios = @{
+        @"three-up": @[@(MacWSSystemGestureAxisVertical), @(-0.35)],
+        @"three-down": @[@(MacWSSystemGestureAxisVertical), @(0.35)],
+        @"three-left": @[@(MacWSSystemGestureAxisHorizontal), @(0.35)],
+        @"three-right": @[@(MacWSSystemGestureAxisHorizontal), @(-0.35)],
+    };
+    NSArray<NSNumber *> *system = systemScenarios[scenario];
+    if (system) {
+        int32_t dockPID = [self dockSystemGestureTargetPID];
+        if (_streamClient.mode != MacWSStreamModeFullscreen || dockPID <= 1) {
+            finish(NO, @"三指性能场景需要全屏工作区和可用 Dock 图层");
+            return;
+        }
+        MacWSSystemGestureAxis axis =
+            (MacWSSystemGestureAxis)system[0].unsignedIntValue;
+        CGFloat finalProgress = system[1].doubleValue;
+        const NSInteger steps = 60;
+        const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
+        _threeFingerSystemGestureActive = YES;
+        _threeFingerSystemGestureAxis = axis;
+        _threeFingerSystemGestureContactID = contact;
+        _threeFingerSystemGestureTargetPID = dockPID;
+        _threeFingerSystemGestureFrameWidth = width;
+        _threeFingerSystemGestureFrameHeight = height;
+        _threeFingerSystemGestureLastProgress = 0.0;
+        _threeFingerSystemGestureLastVelocity = finalProgress / 0.5;
+        [self emitSystemGestureAxis:axis progress:finalProgress / steps
+            velocity:_threeFingerSystemGestureLastVelocity
+            flags:MacWSInputFlagGestureBegan timestamp:CACurrentMediaTime()];
+        for (NSInteger index = 2; index <= steps; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         index * stepNanoseconds),
+                           dispatch_get_main_queue(), ^{
+                CGFloat progress = finalProgress * index / steps;
+                self->_threeFingerSystemGestureLastProgress = progress;
+                [self emitSystemGestureAxis:axis progress:progress
+                    velocity:self->_threeFingerSystemGestureLastVelocity
+                    flags:MacWSInputFlagGestureChanged
+                    timestamp:CACurrentMediaTime()];
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     80 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            [self emitSystemGestureAxis:axis progress:finalProgress
+                velocity:0.0 flags:MacWSInputFlagGestureCancelled
+                timestamp:CACurrentMediaTime()];
+            [self resetActiveThreeFingerSystemGesture];
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     650 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end scenario=%@ success=YES",
+                     scenario);
+            finish(YES, @"120 Hz 原生 Dock 三指场景已完成并取消恢复");
+        });
+        return;
+    }
+
+    finish(NO, @"未知性能手势场景");
+}
+
 - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
     if (gestureRecognizer == _threeFingerPanRecognizer)
         return self.isMacWSInputEnabled &&
@@ -4334,6 +4574,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         [self publishStatus:@"无法从 DisplayStream IOSurface 创建 Metal 纹理"];
         return;
     }
+    [_performanceMonitor recordFrameReceivedForStream:
+        frame.descriptor.streamID sequence:frame.descriptor.sequence
+        captureTime:frame.descriptor.displayTime receiptTime:frame.receiptTime];
     if (reusedTexture) {
         _surfaceTextureReuses++;
     } else {
@@ -5273,6 +5516,11 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UISegmentedControl *_inputModeControl;
     UISegmentedControl *_densityControl;
     UISegmentedControl *_zoomScaleControl;
+    UISegmentedControl *_performanceHUDControl;
+    UISwitch *_systemPerformanceHUDSwitch;
+    UIButton *_performanceResetButton;
+    UIButton *_performanceExportButton;
+    UIButton *_performanceRunButton;
     UIButton *_resetZoomButton;
     NSArray<UIButton *> *_applicationButtons;
     MacWSMetalView *_metalView;
@@ -6023,6 +6271,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.targetWindowID = _streamMode == MacWSStreamModeWindow ? _windowID : 0;
     _metalView.targetPID = _windowOwnerPID;
     [root addSubview:_metalView];
+    MacWSPerformanceHUDMode savedHUDMode = (MacWSPerformanceHUDMode)
+        [NSUserDefaults.standardUserDefaults integerForKey:
+            @"MacWSPerformanceHUDMode"];
+    if (savedHUDMode < MacWSPerformanceHUDModeOff ||
+        savedHUDMode > MacWSPerformanceHUDModeFull)
+        savedHUDMode = MacWSPerformanceHUDModeOff;
+    _metalView.performanceMonitor.HUDMode = savedHUDMode;
+    [_metalView.performanceMonitor attachHUDToView:root];
 
     // The iPadOS Scene exists before its default Terminal window is launched.
     // Keep a native menu bar during that short bootstrap interval too, so an
@@ -6385,6 +6641,54 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         (_metalView.displayDensity == MacWSHostDisplayDensityComfort ? 1 : 0);
     [_densityControl addTarget:self action:@selector(densityChanged:)
                forControlEvents:UIControlEventValueChanged];
+
+    _performanceHUDControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"关闭", @"简洁", @"完整"]];
+    _performanceHUDControl.selectedSegmentIndex = savedHUDMode;
+    [_performanceHUDControl addTarget:self
+        action:@selector(performanceHUDChanged:)
+        forControlEvents:UIControlEventValueChanged];
+
+    UILabel *systemHUDTitle = MacWSMakeLabel(@"Apple 系统渲染 HUD",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline],
+        UIColor.labelColor);
+    UILabel *systemHUDDetail = MacWSMakeLabel(
+        @"QuartzCore RenderServer 全系统 FPS / GPU / 卡顿视图",
+        [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
+        UIColor.secondaryLabelColor);
+    UIStackView *systemHUDLabels = [[UIStackView alloc]
+        initWithArrangedSubviews:@[systemHUDTitle, systemHUDDetail]];
+    systemHUDLabels.axis = UILayoutConstraintAxisVertical;
+    systemHUDLabels.spacing = 2;
+    _systemPerformanceHUDSwitch = [UISwitch new];
+    NSInteger systemHUDLevel =
+        [MacWSPerformanceMonitor systemPerformanceHUDLevel];
+    _systemPerformanceHUDSwitch.on = systemHUDLevel > 0;
+    _systemPerformanceHUDSwitch.enabled = systemHUDLevel >= 0;
+    [_systemPerformanceHUDSwitch addTarget:self
+        action:@selector(systemPerformanceHUDChanged:)
+        forControlEvents:UIControlEventValueChanged];
+    UIStackView *systemHUDRow = [[UIStackView alloc]
+        initWithArrangedSubviews:@[systemHUDLabels,
+                                   _systemPerformanceHUDSwitch]];
+    systemHUDRow.axis = UILayoutConstraintAxisHorizontal;
+    systemHUDRow.alignment = UIStackViewAlignmentCenter;
+    systemHUDRow.spacing = 10;
+    _performanceResetButton = [self buttonWithTitle:@"重新计时"
+        image:@"stopwatch" action:@selector(resetPerformanceMeasurement)
+        prominent:NO];
+    _performanceExportButton = [self buttonWithTitle:@"导出 JSON"
+        image:@"square.and.arrow.up"
+        action:@selector(exportPerformanceMeasurement) prominent:NO];
+    UIStackView *performanceActions = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_performanceResetButton,
+                                   _performanceExportButton]];
+    performanceActions.axis = UILayoutConstraintAxisHorizontal;
+    performanceActions.distribution = UIStackViewDistributionFillEqually;
+    performanceActions.spacing = 8;
+    _performanceRunButton = [self buttonWithTitle:@"运行标准触摸 / 手势回归"
+        image:@"hand.draw" action:@selector(runPerformanceGestureSuite)
+        prominent:NO];
     _zoomScaleControl = [[UISegmentedControl alloc]
         initWithItems:@[@"双指双击 1.5×", @"双指双击 2.0×"]];
     _zoomScaleControl.selectedSegmentIndex =
@@ -6422,6 +6726,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _densityControl,
         _keyboardButton,
         _primaryButton,
+        [self sectionTitle:@"性能测量"],
+        _performanceHUDControl,
+        systemHUDRow,
+        performanceActions,
+        _performanceRunButton,
         [self sectionTitle:@"macOS 应用"],
         _appSearchField,
         appRow1,
@@ -6628,6 +6937,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _macFilesButton.enabled = _receivedMacOSFiles.count > 0;
     _experimentalSwitch.enabled = enabled;
     _inputModeControl.enabled = enabled;
+    _performanceHUDControl.enabled = YES;
+    _performanceResetButton.enabled = YES;
+    _performanceExportButton.enabled = YES;
+    _performanceRunButton.enabled = enabled;
     _densityControl.enabled = enabled;
     _zoomScaleControl.enabled = enabled;
     _resetZoomButton.enabled = enabled;
@@ -6814,6 +7127,130 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             @"显示：像素匹配 Retina；当前有效密度 %.0f%%（随 iPadOS 合成比例自动调整）",
             _metalView.effectiveDensityScale * 100.0];
     }
+}
+
+- (void)performanceHUDChanged:(UISegmentedControl *)sender {
+    MacWSPerformanceHUDMode mode = (MacWSPerformanceHUDMode)
+        sender.selectedSegmentIndex;
+    _metalView.performanceMonitor.HUDMode = mode;
+    [NSUserDefaults.standardUserDefaults setInteger:mode
+        forKey:@"MacWSPerformanceHUDMode"];
+    if (mode == MacWSPerformanceHUDModeOff) {
+        [self setNotice:@"MacWS 性能 HUD 已隐藏；手动计时会持续到导出，普通生产热路径停止采样"
+                 success:YES];
+    } else {
+        [self setNotice:mode == MacWSPerformanceHUDModeFull
+            ? @"完整性能 HUD 已开启（2 Hz 刷新，不改变 DisplayStream 帧率）"
+            : @"简洁性能 HUD 已开启（实际 drawable 呈现 FPS / 1% low）"
+                 success:YES];
+    }
+}
+
+- (void)systemPerformanceHUDChanged:(UISwitch *)sender {
+    NSError *error = nil;
+    // CAPerfHUD level 5 is Apple's Full render-server view. Keep this
+    // explicit and independently switchable because it is system-wide and
+    // persists until disabled or backboardd restarts.
+    NSInteger requestedLevel = sender.isOn ? 5 : 0;
+    BOOL applied = [MacWSPerformanceMonitor
+        setSystemPerformanceHUDLevel:requestedLevel error:&error];
+    if (!applied) sender.on = !sender.isOn;
+    [self setNotice:applied
+        ? (sender.isOn ? @"Apple 全系统渲染 HUD 已开启"
+                       : @"Apple 全系统渲染 HUD 已关闭")
+        : (error.localizedDescription ?: @"无法切换 Apple 系统渲染 HUD")
+        success:applied];
+}
+
+- (void)resetPerformanceMeasurement {
+    [_metalView.performanceMonitor resetWithReason:@"control-center"];
+    [self setNotice:@"性能计时已清零；请立即执行要测量的触摸手势"
+             success:YES];
+}
+
+- (void)exportPerformanceMeasurement {
+    NSError *error = nil;
+    NSString *path = [_metalView.performanceMonitor
+        exportSnapshotWithReason:@"control-center" error:&error];
+    if (!path) {
+        [self setNotice:error.localizedDescription ?: @"性能 JSON 导出失败"
+                 success:NO];
+        return;
+    }
+    MacWSLog(@"performance-profile-export path=%@", path);
+    [self setNotice:[NSString stringWithFormat:@"性能报告已保存：%@", path]
+             success:YES];
+}
+
+- (void)runPerformanceGestureSuite {
+    if (!_metalView.isMacWSInputEnabled) {
+        [self setNotice:@"触控桥或 DisplayStream 尚未就绪，不能开始回归"
+                 success:NO];
+        return;
+    }
+    _performanceRunButton.enabled = NO;
+    NSError *systemHUDError = nil;
+    (void)[MacWSPerformanceMonitor setSystemPerformanceHUDLevel:0
+        error:&systemHUDError];
+    _systemPerformanceHUDSwitch.on = NO;
+    [_metalView.performanceMonitor resetWithReason:@"gesture-suite"];
+    NSMutableArray<NSString *> *scenarios = [@[
+        @"tap", @"double-tap", @"right-tap", @"drag", @"scroll",
+        @"magnify",
+    ] mutableCopy];
+    if (_streamMode == MacWSStreamModeFullscreen) {
+        [scenarios addObjectsFromArray:@[
+            @"three-up", @"three-down", @"three-left", @"three-right",
+        ]];
+    }
+    [self setNotice:[NSString stringWithFormat:
+        @"正在运行 %lu 个标准手势；请暂时不要触摸屏幕",
+        (unsigned long)scenarios.count] success:YES];
+
+    __block NSUInteger index = 0;
+    __weak typeof(self) weakSelf = self;
+    __block void (^runNext)(void) = nil;
+    runNext = ^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (index >= scenarios.count) {
+            NSError *error = nil;
+            NSString *path = [strongSelf->_metalView.performanceMonitor
+                exportSnapshotWithReason:@"gesture-suite" error:&error];
+            strongSelf->_performanceRunButton.enabled = YES;
+            [strongSelf setNotice:path
+                ? [NSString stringWithFormat:
+                    @"标准手势回归完成，性能报告：%@", path]
+                : (error.localizedDescription ?: @"手势完成，但报告导出失败")
+                success:path != nil];
+            MacWSLog(@"performance-gesture-suite-end count=%lu path=%@ error=%@",
+                     (unsigned long)scenarios.count, path ?: @"",
+                     error ?: @"");
+            runNext = nil;
+            return;
+        }
+        NSString *scenario = scenarios[index++];
+        [strongSelf->_metalView runPerformanceGestureScenario:scenario
+            completion:^(BOOL success, NSString *message) {
+                typeof(self) innerSelf = weakSelf;
+                if (!innerSelf) return;
+                if (!success) {
+                    innerSelf->_performanceRunButton.enabled = YES;
+                    [innerSelf setNotice:[NSString stringWithFormat:
+                        @"手势 %@ 失败：%@", scenario, message] success:NO];
+                    MacWSLog(@"performance-gesture-suite-abort scenario=%@ reason=%@",
+                             scenario, message);
+                    runNext = nil;
+                    return;
+                }
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                              250 * NSEC_PER_MSEC),
+                               dispatch_get_main_queue(), runNext);
+            }];
+    };
+    MacWSLog(@"performance-gesture-suite-start count=%lu",
+             (unsigned long)scenarios.count);
+    runNext();
 }
 
 - (void)zoomScaleChanged:(UISegmentedControl *)sender {
@@ -7761,6 +8198,31 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self writeHostScreenSnapshot];
     } else if ([action isEqualToString:@"performance-snapshot"]) {
         [_metalView logPerformanceSnapshotWithReason:@"url-control"];
+        [self exportPerformanceMeasurement];
+    } else if ([action isEqualToString:@"performance-reset"]) {
+        [_metalView.performanceMonitor resetWithReason:@"url-control"];
+    } else if ([action isEqualToString:@"performance-gesture-suite"]) {
+        [self runPerformanceGestureSuite];
+    } else if ([action hasPrefix:@"performance-gesture-"]) {
+        NSString *scenario = [action substringFromIndex:
+            @"performance-gesture-".length];
+        [_metalView runPerformanceGestureScenario:scenario
+            completion:^(BOOL success, NSString *message) {
+                MacWSLog(@"performance-url-gesture scenario=%@ success=%@ message=%@",
+                         scenario, success ? @"YES" : @"NO", message);
+            }];
+    } else if ([action isEqualToString:@"performance-hud-off"] ||
+               [action isEqualToString:@"performance-hud-compact"] ||
+               [action isEqualToString:@"performance-hud-full"]) {
+        _performanceHUDControl.selectedSegmentIndex =
+            [action isEqualToString:@"performance-hud-full"] ? 2 :
+            ([action isEqualToString:@"performance-hud-compact"] ? 1 : 0);
+        [self performanceHUDChanged:_performanceHUDControl];
+    } else if ([action isEqualToString:@"system-performance-hud-on"] ||
+               [action isEqualToString:@"system-performance-hud-off"]) {
+        _systemPerformanceHUDSwitch.on =
+            [action isEqualToString:@"system-performance-hud-on"];
+        [self systemPerformanceHUDChanged:_systemPerformanceHUDSwitch];
     } else if ([action isEqualToString:@"hide-controls"]) {
         [self hideControls];
     } else if ([action isEqualToString:@"show-controls"]) {
@@ -8530,6 +8992,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     }
     int sendError = 0;
     BOOL sent = MacWSSendInputRecord(&record, &sendError);
+    [_metalView.performanceMonitor recordInputKind:record.kind
+        sampleTime:record.timestamp transportSuccess:sent];
     _inputLogSequence++;
     BOOL continuous = record.kind == MacWSInputKindTouchMove ||
                       record.kind == MacWSInputKindHover ||
@@ -9092,7 +9556,20 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"enter-workspace", @"exit-workspace",
                @"close-window",
                @"screenshot-ui", @"screenshot-screen",
-               @"performance-snapshot",
+               @"performance-snapshot", @"performance-reset",
+               @"performance-gesture-suite", @"performance-gesture-tap",
+               @"performance-gesture-double-tap",
+               @"performance-gesture-right-tap",
+               @"performance-gesture-drag",
+               @"performance-gesture-scroll",
+               @"performance-gesture-magnify",
+               @"performance-gesture-three-up",
+               @"performance-gesture-three-down",
+               @"performance-gesture-three-left",
+               @"performance-gesture-three-right",
+               @"performance-hud-off", @"performance-hud-compact",
+               @"performance-hud-full", @"system-performance-hud-on",
+               @"system-performance-hud-off",
                @"hide-controls", @"show-controls"]
               containsObject:host]) {
             MacWSViewController *controller = (MacWSViewController *)self.window.rootViewController;

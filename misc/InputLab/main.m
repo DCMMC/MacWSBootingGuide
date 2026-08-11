@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#include <sys/stat.h>
 
 static NSString *const MacWSEventLogPath = @"/tmp/macws_inputlab_events.jsonl";
 static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
@@ -64,6 +65,12 @@ static NSString *const MacWSStatePath = @"/tmp/macws_inputlab_state.json";
         NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:MacWSEventLogPath];
         if (!handle) {
             [[NSData data] writeToFile:MacWSEventLogPath atomically:YES];
+            // InputLab is launched by root in the chroot while the release
+            // runner connects as the ordinary mobile user.  This is an
+            // intentionally public test endpoint under /tmp, not app data;
+            // make the recorder resettable without embedding a sudo password
+            // in the repeatable host-side workflow.
+            chmod(MacWSEventLogPath.fileSystemRepresentation, 0666);
             handle = [NSFileHandle fileHandleForWritingAtPath:MacWSEventLogPath];
         }
         [handle seekToEndOfFile];

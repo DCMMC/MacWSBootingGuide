@@ -26,6 +26,11 @@
         <string>com.apple.UIKitSystemApp</string>
         <key>COMMAND_MODE</key>
         <string>unix2003</string>
+        <!-- UIKitSystem owns the CoreServices repository used to bootstrap
+             Mac Catalyst children.  Keep its CFURL/statfs/fsgetpath view in
+             the same logical chroot namespace as lsd and Finder. -->
+        <key>MACWS_APP_MOUNT_COMPAT</key>
+        <string>1</string>
     </dict>
     <key>ProcessType</key>
     <string>Interactive</string>

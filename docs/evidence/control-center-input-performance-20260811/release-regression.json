@@ -1,0 +1,567 @@
+{
+  "result": "PASS",
+  "device": "192.168.1.6",
+  "elapsed_s": 13.765349864959717,
+  "thresholds": {
+    "active_interaction_target_fps": 60.0,
+    "active_interaction_1pct_low_fps": 45.0,
+    "input_bridge_p95_ms": 8.0,
+    "input_to_visible_p95_ms": 50.0,
+    "motion_60_min_delivery_hz": 45.0,
+    "motion_120_min_delivery_hz": 60.0
+  },
+  "preflight": {
+    "result": "PASS",
+    "required_processes": {
+      "WindowServer": [
+        19905
+      ],
+      "macwsdisplayd": [
+        72050
+      ],
+      "MacWSHost": [
+        38539
+      ],
+      "UIKitSystem": [
+        67107
+      ],
+      "MacWSInputLab": [
+        39480
+      ]
+    },
+    "missing_processes": [],
+    "native_agx_switches": {
+      "MACWS_AGX_NATIVE": true,
+      "MACWS_AGX_REGISTER_CLASSES": true,
+      "MACWS_PIN_FALLBACK": true
+    },
+    "runtime_diagnostics_sentinel_off": true,
+    "thermal": {
+      "state": "nominal",
+      "temperature_c": 36.89,
+      "raw_witness": "[macos_gui] watchdog: thermal sample: thermal-state=nominal raw=0 low-power=no battery-temp-centic=3689 virtual-temp-centic=3689 effective-temp-centic=3689 uptime=110729.318"
+    },
+    "thermal_policy": "intervene only at Critical; sample every 300 s"
+  },
+  "applications": {
+    "result": "PASS",
+    "source": "/tmp/macws-control-center-regression/summary.json",
+    "summary": {
+      "result": "PASS",
+      "device": "192.168.1.6",
+      "apps": [
+        {
+          "app": "glassdemo",
+          "result": "PASS",
+          "elapsed_s": 5.379543916962575,
+          "pid": 40234,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 3,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 341,
+                "x": 1.0229478789571165e-43,
+                "y": 4.778427763347626e-43,
+                "width": 0.0,
+                "height": 28.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/glassdemo.png",
+          "screenshot_bytes": 2289667,
+          "screenshot_sha256": "1a983fb5fb04364fd60cb5b6abfd71d8474932d2d0cd72612ee209423c4da334",
+          "host_log": "1786439394.780 url-control action=glassdemo\n1786439394.975 display-stream window-list count=6\n1786439394.975 launch-auto-window candidate app=glassdemo pid=40234 window=341 score=7 state=new\n1786439395.484 display-stream window-list count=6\n1786439395.484 launch-auto-window app=glassdemo pid=40234 window=341 group=341\n1786439395.486 launch-auto-window activated-fullscreen app=glassdemo pid=40234 window=341 group=341\n1786439395.561 display-stream window-list count=6\n1786439395.562 fullscreen-input-target pid=40234 window=341 source=appkit-focused title=Glass Demo — vibrancy + segmented + popup + ctx menu\n1786439395.563 fullscreen-focus-reconciled previous-pid=40786 pid=40234 window=341 route=exact-catalog-window\n1786439395.587 display-perf stream=155 sequence=1680 capture-to-receipt-ms=1.267 receipt-to-submit-ms=5.960 submit-to-complete-ms=6.321 status=4 error=nil\n1786439395.592 display-stream window-list count=6\n1786439395.678 display-stream window-list count=6\n",
+          "hostd_log": "1786439394.781 state busy=YES phase=启动 macOS 应用… error=\n1786439394.822 launch-app reuse id=glassdemo pid=40234 executable=/tmp/GlassDemo identity=proc_pidpath\n1786439394.822 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "terminal",
+          "result": "PASS",
+          "elapsed_s": 5.0814827919821255,
+          "pid": 20270,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 8,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 347,
+                "x": 1.0229478789571165e-43,
+                "y": 4.862505671207115e-43,
+                "width": 150.0,
+                "height": 133.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/terminal.png",
+          "screenshot_bytes": 2329355,
+          "screenshot_sha256": "9acc645547e4fd756e092d43cb809c31b8561e16f3b4ef50fa2d4f703d14158d",
+          "host_log": "1786439401.486 url-control action=terminal\n1786439401.639 display-stream window-list count=6\n1786439401.639 launch-auto-window candidate app=terminal pid=20270 window=347 score=7 state=new\n1786439402.149 display-stream window-list count=6\n1786439402.150 launch-auto-window app=terminal pid=20270 window=347 group=347\n1786439402.151 launch-auto-window activated-fullscreen app=terminal pid=20270 window=347 group=347\n1786439402.256 display-stream window-list count=6\n1786439402.464 display-stream window-list count=6\n1786439402.464 fullscreen-input-target pid=20270 window=347 source=appkit-focused title=Terminal — bash -i — 80×24\n1786439402.465 fullscreen-focus-reconciled previous-pid=40234 pid=20270 window=347 route=exact-catalog-window\n",
+          "hostd_log": "1786439401.487 state busy=YES phase=启动 macOS 应用… error=\n1786439401.528 launch-app reuse id=terminal pid=20270 executable=/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal identity=proc_pidpath\n1786439401.528 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "activity-monitor",
+          "result": "PASS",
+          "elapsed_s": 8.57548537501134,
+          "pid": 40786,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 4,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 348,
+                "x": 1.0229478789571165e-43,
+                "y": 4.8765186558503634e-43,
+                "width": 576.0,
+                "height": 384.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/activity-monitor.png",
+          "screenshot_bytes": 2580268,
+          "screenshot_sha256": "b8ccf89b6f30cff2df4d295a7229e46a7ce05862f5119bd72a9d3083842773d6",
+          "host_log": "1786439407.858 url-control action=activity-monitor\n1786439408.031 display-stream window-list count=6\n1786439408.031 launch-auto-window candidate app=activity-monitor pid=40786 window=348 score=7 state=new\n1786439408.538 display-stream window-list count=6\n1786439408.538 launch-auto-window app=activity-monitor pid=40786 window=348 group=348\n1786439408.540 launch-auto-window activated-fullscreen app=activity-monitor pid=40786 window=348 group=348\n1786439408.646 display-stream window-list count=6\n1786439408.858 display-stream window-list count=6\n1786439408.858 fullscreen-input-target pid=40786 window=348 source=appkit-focused title=Activity Monitor\n1786439408.859 fullscreen-focus-reconciled previous-pid=20270 pid=40786 window=348 route=exact-catalog-window\n1786439408.967 display-stream window-list count=6\n",
+          "hostd_log": "1786439407.859 state busy=YES phase=启动 macOS 应用… error=\n1786439407.897 launch-app reuse id=activity-monitor pid=40786 executable=/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor identity=proc_pidpath\n1786439407.897 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "finder",
+          "result": "PASS",
+          "elapsed_s": 9.193977500020992,
+          "pid": 46536,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 3,
+            "entry_count": 2,
+            "windows": [
+              {
+                "window": 405,
+                "flags": 73,
+                "logical_group": 405,
+                "minimum_width": 0.0,
+                "minimum_height": 24.0
+              },
+              {
+                "window": 406,
+                "flags": 0,
+                "logical_group": 406,
+                "minimum_width": 1194.0,
+                "minimum_height": 834.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/finder.png",
+          "screenshot_bytes": 2674415,
+          "screenshot_sha256": "bdece24d44c619d735419e8fd256195d89723a186eb657906c72d0935358f87a",
+          "host_log": "1786442317.607 display-perf stream=155 sequence=31320 capture-to-receipt-ms=2.424 receipt-to-submit-ms=4.042 submit-to-complete-ms=5.846 status=4 error=nil\n1786442317.833 url-control action=finder\n1786442319.225 control-status connected=YES busy=YES rootfs=YES ws=YES input=YES frame=YES phase=启动 macOS 应用… error=\n1786442321.764 display-stream window-list count=12\n1786442321.764 fullscreen-input-target pid=41679 window=376 source=frontmost-fallback title=Book1\n1786442321.850 control-status connected=YES busy=NO rootfs=YES ws=YES input=YES frame=YES phase=就绪 error=\n1786442321.966 display-stream window-list count=12\n1786442322.467 display-stream window-list count=13\n1786442322.467 launch-auto-window candidate app=finder pid=46536 window=405 score=7 state=new\n1786442322.467 window-auto-scene activated-fullscreen-catalog pid=46536 window=405 group=405 score=3\n1786442322.588 display-stream window-list count=13\n1786442322.947 display-stream window-list count=13\n1786442323.472 display-stream window-list count=13\n1786442323.472 launch-auto-window app=finder pid=46536 window=405 group=405\n1786442323.473 launch-auto-window activated-fullscreen app=finder pid=46536 window=405 group=405\n",
+          "hostd_log": "1786442317.834 state busy=YES phase=启动 macOS 应用… error=\n1786442317.889 launch-app id=finder pid=46536 executable=/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder\n1786442318.412 finder-bootstrap pid=46536 action=appkit-command-n sent=YES errno=0\n1786442321.822 finder-bootstrap pid=46536 result=window-ready exit-status=-1\n1786442321.822 launch-app window-ready id=finder pid=46536 path=DisplayStream\n1786442321.822 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "vscode",
+          "result": "PASS",
+          "elapsed_s": 5.589034999953583,
+          "pid": 24386,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 81,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 69,
+                "x": 1.0229478789571165e-43,
+                "y": 9.668959403841238e-44,
+                "width": 400.0,
+                "height": 270.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/vscode.png",
+          "screenshot_bytes": 2846772,
+          "screenshot_sha256": "0304d6a4750608f7c0656e9f4a443be6b981dbe165088db627fc44dd92b4b3da",
+          "host_log": "1786439538.349 url-control action=vscode\n1786439538.589 display-stream window-list count=7\n1786439538.589 launch-auto-window candidate app=vscode pid=24386 window=69 score=7 state=new\n1786439539.098 display-stream window-list count=7\n1786439539.098 launch-auto-window app=vscode pid=24386 window=69 group=69\n1786439539.099 launch-auto-window activated-fullscreen app=vscode pid=24386 window=69 group=69\n1786439539.206 display-stream window-list count=7\n1786439539.329 display-stream window-list count=7\n1786439539.329 fullscreen-input-target pid=24386 window=69 source=appkit-focused title=Extension: GitLens — Git supercharged [Superuser]\n1786439539.329 fullscreen-focus-reconciled previous-pid=41125 pid=24386 window=69 route=exact-catalog-window\n",
+          "hostd_log": "1786439538.350 state busy=YES phase=启动 macOS 应用… error=\n1786439538.421 launch-app window-ready id=vscode pid=24386 path=DisplayStream\n1786439538.421 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "system-settings",
+          "result": "PASS",
+          "elapsed_s": 7.416039666975848,
+          "pid": 25351,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 14,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 61,
+                "x": 1.0229478789571165e-43,
+                "y": 8.547920632381384e-44,
+                "width": 715.0,
+                "height": 470.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/system-settings.png",
+          "screenshot_bytes": 2455522,
+          "screenshot_sha256": "0e09c3d644beee509bb86431e9492af00f00efee8d026c73c65ca6240b314ee3",
+          "host_log": "1786439545.253 url-control action=system-settings\n1786439545.928 display-stream window-list count=7\n1786439545.928 launch-auto-window candidate app=system-settings pid=25351 window=61 score=7 state=new\n1786439546.433 display-stream window-list count=7\n1786439546.433 launch-auto-window app=system-settings pid=25351 window=61 group=61\n1786439546.434 launch-auto-window activated-fullscreen app=system-settings pid=25351 window=61 group=61\n1786439546.538 display-stream window-list count=7\n1786439546.701 display-stream window-list count=7\n1786439546.702 fullscreen-input-target pid=41125 window=354 source=frontmost-fallback title=root\n1786439546.841 display-stream window-list count=7\n1786439546.841 fullscreen-input-target pid=25351 window=61 source=appkit-focused title=Appearance\n1786439546.842 fullscreen-focus-reconciled previous-pid=41125 pid=25351 window=61 route=exact-catalog-window\n1786439546.950 display-stream window-list count=7\n",
+          "hostd_log": "1786439545.254 state busy=YES phase=启动 macOS 应用… error=\n1786439545.304 application-reopen pid=25351 sent=YES errno=0\n1786439545.816 application-reopen pid=25351 result=window-ready previous-generation=12 current-generation=13 exit-status=-1\n1786439545.819 system-settings content result=settings-extension-ready pid=28660 executable=/System/Library/ExtensionKit/Extensions/GameControllerMacSettings.appex/Contents/MacOS/GameControllerMacSettings\n1786439545.819 launch-app reuse id=system-settings pid=25351 executable=/System/Applications/System Settings.app/Contents/MacOS/System Settings identity=proc_pidpath\n1786439545.819 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "maps",
+          "result": "PASS",
+          "elapsed_s": 11.50225620798301,
+          "pid": 41419,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 3,
+            "entry_count": 2,
+            "windows": [
+              {
+                "window": 360,
+                "x": 1.2611686178923354e-44,
+                "y": 5.0446744715693415e-43,
+                "width": 660.0,
+                "height": 360.0
+              },
+              {
+                "window": 361,
+                "x": 1.471363387541058e-43,
+                "y": 5.0446744715693415e-43,
+                "width": 0.0,
+                "height": 0.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/maps.png",
+          "screenshot_bytes": 4350219,
+          "screenshot_sha256": "4dde5cbf730edcb70116cdd55f3c4b6a2894ebdc0145cd9738382dba00c6c053",
+          "host_log": "1786439554.567 url-control action=maps\n1786439554.780 maps-host-carrier spawn result=0 child=41419 parent=38539\n1786439555.143 display-stream window-list count=7\n1786439555.653 display-stream window-list count=7\n1786439556.158 display-stream window-list count=7\n1786439556.475 display-perf stream=158 sequence=360 capture-to-receipt-ms=0.611 receipt-to-submit-ms=3.550 submit-to-complete-ms=3.884 status=4 error=nil\n1786439556.664 display-stream window-list count=7\n1786439557.272 display-stream window-list count=7\n1786439557.779 display-stream window-list count=7\n1786439558.286 display-stream window-list count=7\n1786439558.794 display-stream window-list count=7\n1786439559.407 display-stream window-list count=7\n1786439559.607 display-stream window-list count=8\n1786439559.607 launch-auto-window candidate app=maps pid=41419 window=360 score=3 state=new\n1786439559.608 window-auto-scene activated-fullscreen-catalog pid=41419 window=360 group=360 score=3\n1786439559.714 display-stream window-list count=8\n1786439559.809 display-stream window-list count=8\n1786439560.109 display-perf stream=155 sequence=3480 capture-to-receipt-ms=2.236 receipt-to-submit-ms=2.414 submit-to-complete-ms=4.462 status=4 error=nil\n1786439560.174 display-stream window-list count=8\n1786439560.174 fullscreen-input-target pid=41125 window=354 source=frontmost-fallback title=root\n1786439560.174 launch-auto-window app=maps pid=41419 window=360 group=360\n1786439560.175 launch-auto-window activated-fullscreen app=maps pid=41419 window=360 group=360\n1786439560.301 display-stream window-list count=8\n",
+          "hostd_log": "1786439554.568 state busy=YES phase=启动 macOS 应用… error=\n1786439554.687 spawned pid=41418 executable=/var/jb/usr/bin/killall wait=YES\n1786439554.775 maps legacy-ui-carrier retire result=0\n1786439554.988 launch-app process-ready id=maps pid=41419 uikitsystem=31341 route=existing-MacWSHost catalog=asynchronous\n1786439554.988 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "amadine",
+          "result": "PASS",
+          "elapsed_s": 8.468230333004612,
+          "pid": 41513,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 3,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 366,
+                "x": 1.0229478789571165e-43,
+                "y": 5.1287523794288305e-43,
+                "width": 650.0,
+                "height": 532.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/amadine.png",
+          "screenshot_bytes": 1829259,
+          "screenshot_sha256": "6c30f523cbf31be6248aa961959955f9c21a8ae4861c6bc9985820e4d4dff105",
+          "host_log": "1786439567.542 url-control action=amadine\n1786439568.264 control-status connected=YES busy=YES rootfs=YES ws=YES input=YES frame=YES phase=启动 macOS 应用… error=\n1786439570.122 display-perf stream=155 sequence=3600 capture-to-receipt-ms=4.443 receipt-to-submit-ms=4.457 submit-to-complete-ms=4.941 status=4 error=nil\n1786439571.536 display-stream window-list count=9\n1786439571.537 window-auto-scene activated-fullscreen-catalog pid=41513 window=366 group=366 score=3\n1786439571.595 control-status connected=YES busy=NO rootfs=YES ws=YES input=YES frame=YES phase=就绪 error=\n1786439571.611 display-stream window-list count=9\n1786439571.611 launch-auto-window candidate app=amadine pid=41513 window=366 score=7 state=new\n1786439571.646 display-stream window-list count=9\n1786439571.825 display-stream window-list count=9\n1786439571.825 fullscreen-input-target pid=41513 window=366 source=appkit-focused title=\n1786439571.825 fullscreen-focus-reconciled previous-pid=41125 pid=41513 window=366 route=exact-catalog-window\n1786439571.932 display-stream window-list count=9\n",
+          "hostd_log": "1786439567.543 state busy=YES phase=启动 macOS 应用… error=\n1786439567.597 launch-app id=amadine pid=41513 executable=/Applications/Amadine.app/Contents/MacOS/Amadine\n1786439570.731 application-reopen pid=41513 sent=YES errno=0\n1786439571.451 application-reopen pid=41513 result=window-ready previous-generation=1 current-generation=2 exit-status=-1\n1786439571.451 launch-app window-ready id=amadine pid=41513 path=DisplayStream\n1786439571.451 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "word",
+          "result": "PASS",
+          "elapsed_s": 14.656824042031076,
+          "pid": 41571,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 2,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 371,
+                "x": 1.0229478789571165e-43,
+                "y": 5.198817302645071e-43,
+                "width": 692.0,
+                "height": 546.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/word.png",
+          "screenshot_bytes": 2508316,
+          "screenshot_sha256": "f1bdba268a8b9022e80c5bea292eebb40517dba0974afc1a5e07e7b43fca951b",
+          "host_log": "1786439578.119 url-control action=word\n1786439580.279 control-status connected=YES busy=YES rootfs=YES ws=YES input=YES frame=YES phase=启动 macOS 应用… error=\n1786439585.636 display-perf stream=163 sequence=240 capture-to-receipt-ms=5.861 receipt-to-submit-ms=3.358 submit-to-complete-ms=4.384 status=4 error=nil\n1786439586.846 display-stream window-list count=10\n1786439586.846 window-auto-scene activated-fullscreen-catalog pid=41571 window=371 group=371 score=3\n1786439586.876 control-status connected=YES busy=NO rootfs=YES ws=YES input=YES frame=YES phase=就绪 error=\n1786439586.880 display-stream window-list count=10\n1786439586.880 launch-auto-window candidate app=word pid=41571 window=371 score=7 state=new\n1786439586.966 display-stream window-list count=10\n1786439587.185 display-stream window-list count=10\n1786439587.185 fullscreen-input-target pid=41125 window=354 source=frontmost-fallback title=root\n1786439587.408 display-stream window-list count=10\n1786439587.408 launch-auto-window app=word pid=41571 window=371 group=371\n1786439587.409 launch-auto-window activated-fullscreen app=word pid=41571 window=371 group=371\n1786439587.519 display-stream window-list count=10\n",
+          "hostd_log": "1786439578.120 state busy=YES phase=启动 macOS 应用… error=\n1786439578.168 launch-app id=word pid=41571 executable=/Applications/Microsoft Word.app/Contents/MacOS/Microsoft Word\n1786439581.296 application-reopen pid=41571 sent=YES errno=0\n1786439586.766 application-reopen pid=41571 result=window-ready previous-generation=0 current-generation=1 exit-status=-1\n1786439586.766 launch-app window-ready id=word pid=41571 path=DisplayStream\n1786439586.766 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "excel",
+          "result": "PASS",
+          "elapsed_s": 23.51964916603174,
+          "pid": 41679,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 3,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 376,
+                "x": 1.0229478789571165e-43,
+                "y": 5.268882225861312e-43,
+                "width": 0.0,
+                "height": 10.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/excel.png",
+          "screenshot_bytes": 2426209,
+          "screenshot_sha256": "1f9fa92088536681047fbc9c43e5a9204e0562e86c341e3376e3414abaf29d67",
+          "host_log": "1786439594.938 url-control action=excel\n1786439595.272 control-status connected=YES busy=YES rootfs=YES ws=YES input=YES frame=YES phase=启动 macOS 应用… error=\n1786439600.460 display-perf stream=163 sequence=480 capture-to-receipt-ms=2.147 receipt-to-submit-ms=3.735 submit-to-complete-ms=5.113 status=4 error=nil\n1786439610.906 display-stream window-list count=11\n1786439610.907 window-auto-scene activated-fullscreen-catalog pid=41679 window=376 group=376 score=3\n1786439611.034 display-stream window-list count=11\n1786439611.075 control-status connected=YES busy=NO rootfs=YES ws=YES input=YES frame=YES phase=就绪 error=\n1786439611.085 display-stream window-list count=11\n1786439611.085 launch-auto-window candidate app=excel pid=41679 window=376 score=7 state=new\n1786439611.304 display-perf stream=166 sequence=120 capture-to-receipt-ms=0.938 receipt-to-submit-ms=9.536 submit-to-complete-ms=8.360 status=4 error=nil\n1786439611.399 display-stream window-list count=11\n1786439611.399 fullscreen-input-target pid=41679 window=376 source=frontmost-fallback title=Book1\n1786439611.607 display-stream window-list count=11\n1786439611.607 launch-auto-window app=excel pid=41679 window=376 group=376\n1786439611.608 launch-auto-window activated-fullscreen app=excel pid=41679 window=376 group=376\n1786439611.718 display-stream window-list count=11\n",
+          "hostd_log": "1786439594.938 state busy=YES phase=启动 macOS 应用… error=\n1786439595.008 launch-app id=excel pid=41679 executable=/Applications/Microsoft Excel.app/Contents/MacOS/Microsoft Excel\n1786439598.144 application-reopen pid=41679 sent=YES errno=0\n1786439610.941 application-reopen pid=41679 result=window-ready previous-generation=0 current-generation=1 exit-status=-1\n1786439610.941 launch-app window-ready id=excel pid=41679 path=DisplayStream\n1786439610.941 state busy=NO phase=就绪 error=\n"
+        },
+        {
+          "app": "powerpoint",
+          "result": "PASS",
+          "elapsed_s": 14.224928290990647,
+          "pid": 41828,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 2,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 381,
+                "x": 1.0229478789571165e-43,
+                "y": 5.338947149077553e-43,
+                "width": 692.0,
+                "height": 546.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/powerpoint.png",
+          "screenshot_bytes": 2376340,
+          "screenshot_sha256": "f9b1f48db8b9a1789c33cecee847e667cec6cf91cdb4dabd312717599d487276",
+          "host_log": "1786439620.796 url-control action=powerpoint\n1786439622.271 control-status connected=YES busy=YES rootfs=YES ws=YES input=YES frame=YES phase=启动 macOS 应用… error=\n1786439629.555 display-perf stream=163 sequence=840 capture-to-receipt-ms=0.724 receipt-to-submit-ms=4.026 submit-to-complete-ms=5.665 status=4 error=nil\n1786439630.662 display-stream window-list count=12\n1786439630.662 window-auto-scene activated-fullscreen-catalog pid=41828 window=381 group=381 score=3\n1786439630.767 control-status connected=YES busy=NO rootfs=YES ws=YES input=YES frame=YES phase=就绪 error=\n1786439630.773 display-stream window-list count=12\n1786439630.773 launch-auto-window candidate app=powerpoint pid=41828 window=381 score=7 state=new\n",
+          "hostd_log": "1786439620.797 state busy=YES phase=启动 macOS 应用… error=\n1786439620.866 launch-app id=powerpoint pid=41828 executable=/Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint\n1786439624.034 application-reopen pid=41828 sent=YES errno=0\n"
+        },
+        {
+          "app": "asphalt",
+          "result": "PASS",
+          "elapsed_s": 10.281970000010915,
+          "pid": 68446,
+          "process_live": true,
+          "window_metrics": {
+            "generation": 3,
+            "entry_count": 1,
+            "windows": [
+              {
+                "window": 459,
+                "flags": 73,
+                "logical_group": 459,
+                "minimum_width": 0.0,
+                "minimum_height": 0.0
+              }
+            ]
+          },
+          "input_socket": true,
+          "host_scene_transition": true,
+          "screenshot": "/tmp/macws-control-center-regression/asphalt.png",
+          "screenshot_bytes": 1751361,
+          "screenshot_sha256": "860ee3d68ba35d5b97e2a8eca4ae756d409a2be41bd3eaacde8ec19fedda23a8",
+          "host_log": "1786448547.447 url-control action=asphalt\n1786448547.603 catalyst-host-carrier spawn result=0 child=68446 parent=38539\n1786448547.977 display-stream window-list count=12\n1786448548.484 display-stream window-list count=12\n1786448548.992 display-stream window-list count=12\n1786448549.500 display-stream window-list count=12\n1786448550.008 display-stream window-list count=12\n1786448550.514 display-stream window-list count=12\n1786448551.123 display-stream window-list count=12\n1786448551.636 display-stream window-list count=12\n1786448552.140 display-stream window-list count=12\n1786448552.348 display-stream window-list count=13\n1786448552.348 launch-auto-window candidate app=asphalt pid=68446 window=459 score=7 state=new\n1786448552.348 window-auto-scene activated-fullscreen-catalog pid=68446 window=459 group=459 score=3\n1786448552.440 runtime-confirmed catalyst-drawable imported pid=68446 surface=455 size=1330x941 bpr=5376 metal-pf=80\n1786448552.455 display-stream window-list count=13\n1786448552.630 display-stream window-list count=13\n1786448552.630 fullscreen-input-target pid=68446 window=459 source=frontmost-fallback title=Asphalt\n1786448552.901 display-stream window-list count=13\n1786448552.901 launch-auto-window app=asphalt pid=68446 window=459 group=459\n1786448552.902 launch-auto-window activated-fullscreen app=asphalt pid=68446 window=459 group=459\n1786448553.009 display-stream window-list count=13\n1786448553.764 display-perf stream=158 sequence=14640 capture-to-receipt-ms=1.383 receipt-to-submit-ms=0.884 submit-to-complete-ms=5.787 status=4 error=nil\n",
+          "hostd_log": "1786448547.448 state busy=YES phase=启动 macOS 应用… error=\n1786448547.546 spawned pid=68445 executable=/var/jb/usr/bin/killall wait=YES\n1786448547.599 maps legacy-ui-carrier retire result=0\n1786448547.811 launch-app process-ready id=asphalt pid=68446 uikitsystem=67107 route=existing-MacWSHost catalog=asynchronous\n1786448547.811 state busy=NO phase=就绪 error=\n"
+        }
+      ]
+    }
+  },
+  "input": {
+    "result": "PASS",
+    "semantic_matrix": {
+      "result": "PASS",
+      "transport": "MacWSInputRecord-v4 (no RFB)",
+      "pid": 39480,
+      "window": 336,
+      "route": "exact-window",
+      "frame": [
+        1728,
+        1312
+      ],
+      "records_sent": 44,
+      "events_received": 50,
+      "events": [
+        "left_down",
+        "left_up",
+        "left_down",
+        "left_drag",
+        "left_drag",
+        "left_drag",
+        "left_drag",
+        "left_drag",
+        "left_drag",
+        "left_drag",
+        "left_up",
+        "right_down",
+        "right_up",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "scroll_window_boundary",
+        "scroll",
+        "magnify",
+        "magnify",
+        "magnify",
+        "magnify",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_up",
+        "key_down",
+        "key_up"
+      ],
+      "keyboard_characters": [
+        "a",
+        "A",
+        "B",
+        "c",
+        "m",
+        "\t",
+        "",
+        "\r",
+        "\u001b"
+      ],
+      "keyboard_modifiers": [
+        0,
+        131072,
+        65536,
+        262144,
+        1048576,
+        0,
+        0,
+        0,
+        0
+      ],
+      "magnifications": [
+        0,
+        0.125,
+        -0.0625,
+        0
+      ],
+      "magnify_phases": [
+        1,
+        4,
+        4,
+        8
+      ],
+      "scroll_phases": [
+        1,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        8
+      ],
+      "command_key_up": "delivered to NSApplication; consumed before responder",
+      "latency_ms": {
+        "minimum": 0.24866667808964849,
+        "maximum": 68.66641667147633,
+        "average": 19.148256891639903
+      }
+    },
+    "motion": {
+      "60": {
+        "result": "PASS",
+        "transport": "MacWSInputRecord-v4 (no RFB)",
+        "pid": 39480,
+        "window": 336,
+        "requested_hz": 60.0,
+        "duration_s": 5.001641035079956,
+        "move_records_sent": 300,
+        "drag_events_received": 285,
+        "drag_delivery_hz": 56.98129833810515,
+        "coalesced_or_missing_moves": 15,
+        "latency_ms": {
+          "p50": 0.5079999973531812,
+          "p95": 0.7609583408338949,
+          "maximum": 11.958167000557296
+        },
+        "ordered_boundaries": [
+          "left_down",
+          "left_up"
+        ]
+      },
+      "120": {
+        "result": "PASS",
+        "transport": "MacWSInputRecord-v4 (no RFB)",
+        "pid": 39480,
+        "window": 336,
+        "requested_hz": 120.0,
+        "duration_s": 5.000697135925293,
+        "move_records_sent": 600,
+        "drag_events_received": 413,
+        "drag_delivery_hz": 82.58848492002934,
+        "coalesced_or_missing_moves": 187,
+        "latency_ms": {
+          "p50": 0.4008336691185832,
+          "p95": 3.16700033727102,
+          "maximum": 20.28883334423881
+        },
+        "ordered_boundaries": [
+          "left_down",
+          "left_up"
+        ]
+      }
+    },
+    "gates": {
+      "semantic_events": true,
+      "delivery_rate": true,
+      "p95_latency": true
+    }
+  },
+  "visible_output_gate": {
+    "result": "MANUAL_REQUIRED",
+    "reason": "synthetic transport events cannot measure physical touch-to-photon latency or 1% low frame rate",
+    "procedure": "docs/control-center-input-performance-regression-20260811.md"
+  },
+  "macbook_calibration": "not required for daily regression"
+}

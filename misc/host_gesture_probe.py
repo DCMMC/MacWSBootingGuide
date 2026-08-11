@@ -12,6 +12,7 @@ import struct
 import time
 
 from host_input_matrix import (
+    DOUBLE_CLICK,
     GESTURE_BEGAN,
     GESTURE_CHANGED,
     GESTURE_ENDED,
@@ -20,6 +21,7 @@ from host_input_matrix import (
     SCROLL,
     SCROLL_MOMENTUM,
     SCROLL_WILL_MOMENTUM,
+    SECONDARY_TAP,
     SOURCE_FINGER,
     TAP,
     TOUCH_DOWN,
@@ -33,7 +35,8 @@ GLOBAL_SYSTEM_SURFACE = 1 << 6
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("gesture", choices=("tap", "drag", "scroll", "magnify"))
+    parser.add_argument("gesture", choices=(
+        "tap", "double-tap", "right-tap", "drag", "scroll", "magnify"))
     parser.add_argument("--pid", type=int, default=0)
     parser.add_argument("--window", type=int, default=0)
     parser.add_argument("--width", type=int, default=2388)
@@ -105,14 +108,25 @@ def main():
 
     started = time.perf_counter()
     deadline = time.perf_counter()
-    if args.gesture == "tap":
+    if args.gesture in ("tap", "double-tap", "right-tap"):
         # UIKit classifies a stationary touch as one atomic tap record.  The
         # target bridge constructs and queues its matching down/up pair before
         # entering AppKit's synchronous control tracker; two datagrams can
         # strand the up event inside that nested loop.
-        kind = TAP
-        send(0, 1.0)
-        record_count = 1
+        kind = SECONDARY_TAP if args.gesture == "right-tap" else TAP
+        if args.gesture == "double-tap":
+            # Preserve the two physical taps produced by UIKit: AppKit uses
+            # the first clickCount=1 transition to arm controls and the second
+            # clickCount=2 transition to perform their double-click action.
+            # Sending only clickCount=2 selects Finder items but does not open
+            # them, and is not equivalent to the Host's production route.
+            send(0, 1.0)
+            time.sleep(0.10)
+            send(DOUBLE_CLICK, 1.0)
+            record_count = 2
+        else:
+            send(0, 1.0)
+            record_count = 1
     elif args.gesture == "drag":
         end_x = args.end_x if args.end_x is not None else args.x + 300.0
         end_y = args.end_y if args.end_y is not None else args.y + 180.0
@@ -141,7 +155,8 @@ def main():
         send(GESTURE_ENDED)
         record_count = args.changes + 2
     elapsed = time.perf_counter() - started
-    changed_samples = args.changes if args.gesture != "tap" else 0
+    changed_samples = (args.changes if args.gesture in
+                       ("drag", "scroll", "magnify") else 0)
     print(
         f"gesture={args.gesture} records={record_count} "
         f"elapsed-ms={elapsed * 1000.0:.3f} "

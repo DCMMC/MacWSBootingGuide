@@ -114,6 +114,14 @@ static void DisplayLog(NSString *format, ...) {
 
 @interface MacWSTransientLayer : NSObject {
     IOSurfaceRef _latestSurface;
+    // One fixed, allocation-free ring is enough to score an active native
+    // animation burst.  A gap is deliberately excluded: Mission Control can
+    // remain open and static between its enter and exit animations, and the
+    // old first-to-last calculation therefore reported 28 fps for a healthy
+    // producer simply because the tester inspected the screen for a second.
+    double _activeFrameIntervalsMS[512];
+    NSUInteger _activeFrameIntervalCount;
+    NSUInteger _activeFrameIntervalCursor;
 }
 @property(nonatomic, weak) MacWSDisplayClient *client;
 @property(nonatomic) uint32_t windowID;
@@ -135,6 +143,8 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) BOOL snapshotComplete;
 @property(nonatomic) BOOL retiring;
 @property(nonatomic) uint64_t retirementGeneration;
+- (void)recordActiveFrameAtDisplayTime:(uint64_t)displayTime;
+- (void)finishActiveFrameBurstWithReason:(NSString *)reason;
 - (void)stopCapturePreservingSurface;
 - (void)stopStream;
 @end
@@ -150,6 +160,68 @@ static void DisplayLog(NSString *format, ...) {
     if (surface) CFRetain(surface);
     if (_latestSurface) CFRelease(_latestSurface);
     _latestSurface = surface;
+}
+
+static int MacWSCompareFrameInterval(const void *left, const void *right) {
+    double a = *(const double *)left;
+    double b = *(const double *)right;
+    return (a > b) - (a < b);
+}
+
+- (void)finishActiveFrameBurstWithReason:(NSString *)reason {
+    NSUInteger count = MIN(_activeFrameIntervalCount,
+                           sizeof(_activeFrameIntervalsMS) /
+                               sizeof(_activeFrameIntervalsMS[0]));
+    if (count >= 8) {
+        double intervals[512];
+        double total = 0.0;
+        for (NSUInteger index = 0; index < count; index++) {
+            intervals[index] = _activeFrameIntervalsMS[index];
+            total += intervals[index];
+        }
+        qsort(intervals, count, sizeof(intervals[0]),
+              MacWSCompareFrameInterval);
+        NSUInteger p50Index = MIN(count - 1,
+            (NSUInteger)ceil((double)count * 0.50) - 1);
+        NSUInteger p99Index = MIN(count - 1,
+            (NSUInteger)ceil((double)count * 0.99) - 1);
+        double meanInterval = total / count;
+        double p50 = intervals[p50Index];
+        double p99 = intervals[p99Index];
+        DisplayLog(@"active-frame-burst layer=%u owner=%@ reason=%@ "
+                   "intervals=%lu average-fps=%.2f p50-ms=%.3f "
+                   "p99-ms=%.3f one-percent-low-fps=%.2f",
+                   self.windowID, self.ownerName ?: @"", reason ?: @"end",
+                   (unsigned long)count,
+                   meanInterval > 0.0 ? 1000.0 / meanInterval : 0.0,
+                   p50, p99, p99 > 0.0 ? 1000.0 / p99 : 0.0);
+    }
+    _activeFrameIntervalCount = 0;
+    _activeFrameIntervalCursor = 0;
+}
+
+- (void)recordActiveFrameAtDisplayTime:(uint64_t)displayTime {
+    if (!_latestDisplayTime || displayTime <= _latestDisplayTime) return;
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ (void)mach_timebase_info(&timebase); });
+    if (!timebase.denom) return;
+    double intervalMS = (double)(displayTime - _latestDisplayTime) *
+        timebase.numer / timebase.denom / 1.0e6;
+    // A native animation produces no CGDisplayStream callback while its layer
+    // is static.  Split at that real producer gap instead of counting idle
+    // inspection time as dropped frames.  Very small/non-finite timestamps
+    // are invalid timing samples, not zero-latency frames.
+    if (!isfinite(intervalMS) || intervalMS < 0.05) return;
+    if (intervalMS > 150.0) {
+        [self finishActiveFrameBurstWithReason:@"producer-gap"];
+        return;
+    }
+    NSUInteger capacity = sizeof(_activeFrameIntervalsMS) /
+        sizeof(_activeFrameIntervalsMS[0]);
+    _activeFrameIntervalsMS[_activeFrameIntervalCursor] = intervalMS;
+    _activeFrameIntervalCursor = (_activeFrameIntervalCursor + 1) % capacity;
+    if (_activeFrameIntervalCount < capacity) _activeFrameIntervalCount++;
 }
 - (void)stopCapturePreservingSurface {
     if (_stream) {
@@ -682,6 +754,7 @@ static void PublishFrame(MacWSDisplayClient *client,
     // fullscreen Scene ownership transfer can then republish the complete
     // current desktop without stopping/recreating any SkyLight stream.
     if (layer) {
+        [layer recordActiveFrameAtDisplayTime:displayTime];
         layer.latestSurface = surface;
         layer.latestDisplayTime = displayTime;
     }
@@ -1018,6 +1091,7 @@ static void RetireTransientLayer(MacWSDisplayClient *client,
                                  NSString *reason) {
     if (!client || !key || !layer || layer.retiring) return;
     layer.retiring = YES;
+    [layer finishActiveFrameBurstWithReason:@"catalog-retire"];
     uint64_t generation = ++layer.retirementGeneration;
     // Detach delivery immediately: Host has already removed this layer and a
     // final frame racing from the old stream must not resurrect stale pixels.

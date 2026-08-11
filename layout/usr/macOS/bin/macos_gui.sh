@@ -3283,6 +3283,12 @@ PLIST
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key>
     <dict><key>SuccessfulExit</key><false/></dict>
+    <!-- The old job was runtime-confirmed to exit with
+         JETSAM_REASON_MEMORY_IDLE_EXIT after arming.  This launchd lifecycle
+         flag keeps the mandatory five-minute thermal sampler resident; it
+         neither restores the retired free-memory guard nor overrides an iOS
+         memorystatus limit. -->
+    <key>EnablePressuredExit</key><false/>
     <key>ProcessType</key><string>Background</string>
     <key>ThrottleInterval</key><integer>2</integer>
     <key>StandardOutPath</key><string>${WD_LOG}</string>

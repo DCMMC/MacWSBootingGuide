@@ -1,0 +1,21 @@
+{
+  "result": "PASS",
+  "transport": "MacWSInputRecord-v4 (no RFB)",
+  "pid": 39480,
+  "window": 336,
+  "requested_hz": 120.0,
+  "duration_s": 5.001888036727905,
+  "move_records_sent": 600,
+  "drag_events_received": 429,
+  "drag_delivery_hz": 85.76761351912222,
+  "coalesced_or_missing_moves": 171,
+  "latency_ms": {
+    "p50": 0.4029173433082178,
+    "p95": 2.658333338331431,
+    "maximum": 17.73758401395753
+  },
+  "ordered_boundaries": [
+    "left_down",
+    "left_up"
+  ]
+}

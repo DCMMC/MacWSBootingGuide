@@ -11,6 +11,7 @@ include $(THEOS)/makefiles/common.mk
 APPLICATION_NAME = MacWSHost
 
 MacWSHost_FILES = main.m MacWSControlClient.m MacWSStreamClient.m \
+	MacWSPerformanceMonitor.m \
 	MacWSMenuClient.m \
 	MacWSInteropClient.m ../misc/iosclear_ref.m
 MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation \

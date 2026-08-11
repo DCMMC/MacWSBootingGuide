@@ -40,8 +40,11 @@ variables. `MallocScribble` is explicitly forbidden.
 - Direct/wrapped KCMD translation, cancelled-swap completion, owned BGRA
   scanout and the VNC mmap bridge are enabled for the current coexistence
   implementation.
-- Validated custom-path and generic Catalyst children receive the scoped
-  `MACWS_APP_MOUNT_COMPAT=1` namespace contract. Generic Catalyst children also
+- Validated custom-path apps, generic Catalyst children, and the stock
+  UIKitSystem service receive the scoped `MACWS_APP_MOUNT_COMPAT=1` namespace
+  contract. UIKitSystem owns the CoreServices repository used while Catalyst
+  bundles initialize; without the same logical chroot root its CFURL cache can
+  recurse during finalization. Generic Catalyst children also
   receive `MACWS_CATALYST_DIRECT_DRAWABLE=1`: if SkyLight captures their title
   bar but omits a CAMetalLayer client area, libmachook transfers the completed
   drawable's real IOSurface Mach right to the foreground Host. Host validates
@@ -169,3 +172,21 @@ and purpose. States mean:
 
 Diagnostic files and environment variables can still be enabled deliberately,
 but that run must not be reported as a production performance result.
+## MacWS UI performance controls (2026-08-11)
+
+These production controls are independent of `MACWS_RUNTIME_DIAGNOSTICS`:
+
+| Control | Default | Scope | Meaning |
+|---|---|---|---|
+| `MacWSPerformanceHUDMode` (`NSUserDefaults`) | `0` | each Host Scene | `0` off, `1` compact, `2` full; off has one atomic fast-path check unless an explicit Reset-to-Export recording is active |
+| Apple system performance HUD | off | system-wide QuartzCore RenderServer | Control Center toggle uses CAPerfHUD-compatible Full level 5; `com.apple.QuartzCore.debug` is required |
+| `macwshost://performance-reset` | explicit | active Host Scene | clears all fixed rings and starts a new measurement generation |
+| `macwshost://performance-snapshot` | explicit | active Host Scene | writes `latest.json` and a timestamped bounded archive |
+| `macwshost://performance-hud-{off,compact,full}` | off | active Host Scene | changes only the MacWS overlay |
+| `macwshost://system-performance-hud-{on,off}` | off | system-wide | selects Apple Full level 5 or clears flag `0x10000000` |
+| `macwshost://performance-gesture-{tap,double-tap,right-tap,drag,scroll,magnify,three-up,three-down,three-left,three-right}` | explicit | active Host Scene | one bounded replay through the production Host controller input boundary |
+| `macwshost://performance-gesture-suite` | explicit | active Host Scene | resets, runs every applicable scenario, and exports JSON |
+
+`misc/macws_ui_profile.py` always switches both visual HUDs off before a scored
+run, aborts only at Critical thermal state, and uses the fixed thresholds
+documented in `docs/ui-performance-profiler-20260811.md`.

@@ -26,7 +26,7 @@ env	MACWS_ABORT_TRACE	off	diagnostic	Abort/backtrace flight recorder.
 env	MACWS_APP_EXTENSION	auto	Settings ExtensionKit child	Marks the exact ViewBridgeChrootProxy app-extension target for its identity and bounded JIT/ExtensionKit startup compatibility.
 env	MACWS_CATALOG_REGISTRATION	off	macwsworkspacectl register-settings-extensions	Production launch plists keep this unset; the catalog transaction sets it to 1 only for the short-lived stock registration of all standalone System Settings extensions.
 env	MACWS_APP_LIFECYCLE_TRACE	off	diagnostic	System Settings/Maps AppKit lifecycle boundary trace; never enable in production.
-env	MACWS_APP_MOUNT_COMPAT	auto	custom-path and generic Catalyst children	Launcher-owned scoped root-volume/statfs/fsgetpath compatibility; enabled only for an exact validated executable rather than globally.
+env	MACWS_APP_MOUNT_COMPAT	auto	custom-path apps, generic Catalyst children and UIKitSystem	Launcher/job-owned scoped root-volume/statfs/fsgetpath compatibility; UIKitSystem needs the same logical-root contract while its CoreServices repository resolves Catalyst bundles.
 env	MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC	off	diagnostic	Temporarily applies the chroot mount-namespace model to one otherwise-unlisted process; never set by a production plist.
 env	MACWS_APP_MOUNT_TRACE	off	diagnostic	Logs scoped statfs, fsgetpath and CFURL volume-namespace translations.
 env	MACWS_APP_INPUT_DIAGNOSTICS	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.

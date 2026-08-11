@@ -1,0 +1,377 @@
+"""Repeatable MacWS UI performance, input and stability profile.
+
+Run this from the controlling Mac. The workload executes on the iPad against
+one real AppKit InputLab window, while MacWSHost records actual drawable
+presentation callbacks and the complete DisplayStream/Metal stage timings.
+No MacBook baseline run is required; fixed release floors are embedded here.
+
+The wire-level replayer deliberately complements rather than replaces a real
+finger run: it validates every native event family and rendering response, but
+cannot include UIKit recognizer latency before MacWSInputRecord is produced.
+"""
+
+import argparse
+import json
+import pathlib
+import re
+import shlex
+import subprocess
+import time
+
+
+THRESHOLDS = {
+    "target_fps": 60.0,
+    "minimum_active_average_fps": 55.0,
+    "minimum_one_percent_low_fps": 45.0,
+    "maximum_input_bridge_p95_ms": 8.0,
+    "maximum_input_to_visible_p95_ms": 50.0,
+    "minimum_motion_60_delivery_hz": 45.0,
+    "minimum_motion_120_delivery_hz": 60.0,
+    "maximum_command_errors": 0,
+    "minimum_visible_interval_samples": 30,
+}
+
+
+class Remote:
+    def __init__(self, host, user, port):
+        self.base = [
+            "ssh", "-p", str(port), "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8", f"{user}@{host}",
+        ]
+
+    def run(self, command, *, timeout=45, check=True):
+        result = subprocess.run(
+            self.base + [command], capture_output=True, text=True,
+            timeout=timeout,
+        )
+        if check and result.returncode:
+            raise RuntimeError(
+                f"remote command failed rc={result.returncode}: "
+                f"{result.stderr.strip()}\ncommand={command}")
+        return result.stdout
+
+
+def parse_json(text, label):
+    start = text.find("{")
+    if start < 0:
+        raise RuntimeError(f"{label} emitted no JSON: {text[-500:]}")
+    return json.loads(text[start:])
+
+
+def percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1,
+                       int(len(ordered) * fraction + 0.999999) - 1))
+    return ordered[index]
+
+
+def thermal_snapshot(remote):
+    raw = remote.run(
+        "tail -n 1 /var/jb/var/mobile/macos_gui_watchdog.log "
+        "2>/dev/null || true", check=False).strip()
+    state = re.search(r"thermal-state=([a-z]+)", raw)
+    temperature = re.search(r"effective-temp-centic=(\d+)", raw)
+    return {
+        "state": state.group(1) if state else "unknown",
+        "temperature_c": (int(temperature.group(1)) / 100.0
+                          if temperature else None),
+        "witness": raw,
+    }
+
+
+def process_snapshot(remote):
+    names = [
+        "WindowServer", "macwsdisplayd", "MacWSHost", "UIKitSystem",
+        "MacWSInputLab", "Dock",
+    ]
+    output = remote.run("ps -axo pid=,comm=", timeout=15)
+    result = {name: [] for name in names}
+    for line in output.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) != 2 or not fields[0].isdigit():
+            continue
+        basename = pathlib.PurePosixPath(fields[1]).name
+        if basename in result:
+            result[basename].append(int(fields[0]))
+    return result
+
+
+def run_remote_python(remote, remote_repo, script, arguments,
+                      *, timeout=45, expect_json=False):
+    command = "cd {} && python3 {} {}".format(
+        shlex.quote(str(pathlib.PurePosixPath(remote_repo) / "misc")),
+        shlex.quote(script),
+        " ".join(shlex.quote(str(value)) for value in arguments),
+    )
+    output = remote.run(command, timeout=timeout)
+    return parse_json(output, script) if expect_json else output.strip()
+
+
+def wait_for_profile(remote, previous_marker, timeout=8.0):
+    path = "/var/mobile/Library/Logs/MacWSPerformance/latest.json"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        marker = remote.run(
+            f"stat -f '%m:%z' {path} 2>/dev/null || true",
+            check=False).strip()
+        if marker and marker != previous_marker:
+            return marker, json.loads(remote.run(f"cat {path}"))
+        time.sleep(0.15)
+    raise RuntimeError("MacWSHost did not export a fresh performance JSON")
+
+
+def execute_gesture_suite(remote, include_system_gestures):
+    scenarios = [
+        "tap", "double-tap", "right-tap", "drag", "scroll", "magnify",
+    ]
+    if include_system_gestures:
+        scenarios.extend((
+            "three-up", "three-down", "three-left", "three-right",
+        ))
+    results = []
+    log_path = "/var/mobile/Library/Logs/MacWSHost.log"
+    for name in scenarios:
+        latest_path = "/var/mobile/Library/Logs/MacWSPerformance/latest.json"
+        previous_marker = remote.run(
+            f"stat -f '%m:%z' {latest_path} 2>/dev/null || true",
+            check=False).strip()
+        remote.run("uiopen macwshost://performance-reset")
+        time.sleep(0.25)
+        offset = int(remote.run(
+            f"wc -c < {log_path} 2>/dev/null || printf 0").strip() or 0)
+        started = time.monotonic()
+        remote.run(f"uiopen macwshost://performance-gesture-{name}")
+        deadline = time.monotonic() + 6.0
+        log_delta = ""
+        success = False
+        while time.monotonic() < deadline:
+            log_delta = remote.run(
+                f"tail -c +{offset + 1} {log_path} 2>/dev/null || true",
+                check=False)
+            if re.search(
+                    rf"performance-gesture-end scenario={re.escape(name)} "
+                    r"success=YES", log_delta):
+                success = True
+                break
+            if re.search(
+                    rf"performance-url-gesture scenario={re.escape(name)} "
+                    r"success=NO", log_delta):
+                break
+            time.sleep(0.1)
+        results.append({
+            "scenario": name,
+            "result": "PASS" if success else "FAIL",
+            "elapsed_s": time.monotonic() - started,
+            "host_log": log_delta,
+        })
+        if not success:
+            raise RuntimeError(f"Host gesture scenario failed: {name}")
+        time.sleep(0.45)
+        remote.run("uiopen macwshost://performance-snapshot")
+        marker, profile = wait_for_profile(remote, previous_marker)
+        fluid = name in {
+            "drag", "scroll", "magnify", "three-up", "three-down",
+            "three-left", "three-right",
+        }
+        results[-1]["profile_marker"] = marker
+        results[-1]["performance"] = profile
+        results[-1]["score"] = score_profile(
+            profile, require_fluid_metrics=fluid)
+    return results
+
+
+def input_semantic_gate(remote, remote_repo, pid):
+    matrix = run_remote_python(remote, remote_repo, "host_input_matrix.py",
+                               ["--pid", pid], expect_json=True)
+    motion = {}
+    for rate in (60, 120):
+        motion[str(rate)] = run_remote_python(
+            remote, remote_repo, "host_input_motion.py",
+            ["--pid", pid, "--duration", 5, "--hz", rate],
+            timeout=20, expect_json=True)
+    p95_values = [
+        item.get("latency_ms", {}).get("p95")
+        for item in motion.values()
+    ]
+    checks = {
+        "semantic_matrix": matrix.get("result") == "PASS",
+        "motion_60_delivery": motion["60"].get("drag_delivery_hz", 0) >=
+            THRESHOLDS["minimum_motion_60_delivery_hz"],
+        "motion_120_delivery": motion["120"].get("drag_delivery_hz", 0) >=
+            THRESHOLDS["minimum_motion_120_delivery_hz"],
+        "bridge_p95_latency": all(
+            value is not None and
+            value <= THRESHOLDS["maximum_input_bridge_p95_ms"]
+            for value in p95_values),
+    }
+    return {
+        "result": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+        "matrix": matrix,
+        "motion": motion,
+    }
+
+
+def score_profile(profile, *, require_fluid_metrics=True):
+    visible = profile.get("visible_presentation", {})
+    counters = profile.get("counters", {})
+    frame = visible.get("frame_interval", {})
+    input_visible = profile.get("pipeline", {}).get(
+        "input_dispatch_to_visible_callback", {})
+    checks = {
+        "metal_command_errors": counters.get("command_errors", 0) <=
+            THRESHOLDS["maximum_command_errors"],
+        "input_was_dispatched": counters.get("inputs_sent", 0) > 0,
+    }
+    if require_fluid_metrics:
+        checks.update({
+        "active_average_fps":
+            visible.get("active_average_fps", 0) >=
+            THRESHOLDS["minimum_active_average_fps"],
+        "one_percent_low_fps":
+            visible.get("one_percent_low_fps", 0) >=
+            THRESHOLDS["minimum_one_percent_low_fps"],
+        "enough_visible_samples": frame.get("samples", 0) >=
+            THRESHOLDS["minimum_visible_interval_samples"],
+        "input_to_visible_p95":
+            input_visible.get("samples", 0) >= 30 and
+            input_visible.get("p95_ms") is not None and
+            input_visible["p95_ms"] <=
+                THRESHOLDS["maximum_input_to_visible_p95_ms"],
+        })
+    return {
+        "result": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--user", default="mobile")
+    parser.add_argument("--port", type=int, default=22)
+    parser.add_argument("--remote-repo",
+                        default="/var/jb/var/mobile/MacWSBootingGuide")
+    parser.add_argument(
+        "--pid", type=int,
+        help=("expected focused AppKit PID and semantic-gate target; "
+              "defaults to MacWSInputLab"))
+    parser.add_argument("--window", type=int, default=0)
+    parser.add_argument("--width", type=int, default=1728)
+    parser.add_argument("--height", type=int, default=1312)
+    parser.add_argument("--skip-system-gestures", action="store_true")
+    parser.add_argument("--output", type=pathlib.Path,
+                        default=pathlib.Path("/tmp/macws-ui-profile.json"))
+    args = parser.parse_args()
+
+    remote = Remote(args.host, args.user, args.port)
+    before_thermal = thermal_snapshot(remote)
+    if before_thermal["state"] == "critical":
+        report = {
+            "result": "ABORTED_CRITICAL_THERMAL",
+            "device": args.host,
+            "thermal_before": before_thermal,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, ensure_ascii=False,
+                                          indent=2) + "\n")
+        raise SystemExit(2)
+
+    before_processes = process_snapshot(remote)
+    target_pid = args.pid or (
+        before_processes["MacWSInputLab"][-1]
+        if before_processes["MacWSInputLab"] else 0)
+    if target_pid <= 1:
+        raise SystemExit("MacWSInputLab is not running and --pid was omitted")
+    dock_pid = (0 if args.skip_system_gestures else
+                (before_processes["Dock"][-1]
+                 if before_processes["Dock"] else 0))
+
+    # Hide both HUDs during the measured workload. The fixed rings remain
+    # active, and the explicit snapshot below exports them after the run.
+    remote.run("uiopen macwshost://performance-hud-off")
+    remote.run("uiopen macwshost://system-performance-hud-off")
+    remote.run("uiopen macwshost://performance-reset")
+    time.sleep(0.5)
+    focus_witness = remote.run(
+        "tail -n 500 /var/mobile/Library/Logs/MacWSHost.log | "
+        "grep 'fullscreen-input-target' | tail -n 1", check=False).strip()
+    focus_match = re.search(r"pid=(\d+)", focus_witness)
+    if focus_match and int(focus_match.group(1)) != target_pid:
+        raise SystemExit(
+            f"Host focused PID {focus_match.group(1)} does not match "
+            f"profile target {target_pid}: {focus_witness}")
+
+    gestures = execute_gesture_suite(remote, dock_pid > 1)
+    input_gate = input_semantic_gate(remote, args.remote_repo, target_pid)
+    after_processes = process_snapshot(remote)
+    after_thermal = thermal_snapshot(remote)
+    fluid_scenarios = [item for item in gestures
+                       if item["scenario"] in {
+                           "drag", "scroll", "magnify", "three-up",
+                           "three-down", "three-left", "three-right",
+                       }]
+    profile_score = {
+        "result": "PASS" if fluid_scenarios and all(
+            item["score"]["result"] == "PASS"
+            for item in fluid_scenarios) else "FAIL",
+        "fluid_scenarios": {
+            item["scenario"]: item["score"] for item in fluid_scenarios
+        },
+    }
+    stable_processes = all(
+        set(before_processes[name]).issubset(after_processes[name])
+        for name in ("WindowServer", "macwsdisplayd", "MacWSHost",
+                     "UIKitSystem", "MacWSInputLab"))
+    checks = {
+        "profile": profile_score["result"] == "PASS",
+        "input": input_gate["result"] == "PASS",
+        "process_stability": stable_processes,
+        "thermal_not_critical": after_thermal["state"] != "critical",
+    }
+    report = {
+        "schema": "macws-ui-regression-v1",
+        "result": "PASS" if all(checks.values()) else "FAIL",
+        "device": args.host,
+        "target_pid": target_pid,
+        "target_window": args.window,
+        "host_focus_witness": focus_witness,
+        "thresholds": THRESHOLDS,
+        "checks": checks,
+        "profile_score": profile_score,
+        "host_profile": {
+            "schema": "macws-ui-scenario-profiles-v1",
+            "profiles": {
+                item["scenario"]: item["performance"] for item in gestures
+            },
+        },
+        "input_gate": input_gate,
+        "gesture_scenarios": gestures,
+        "processes_before": before_processes,
+        "processes_after": after_processes,
+        "thermal_before": before_thermal,
+        "thermal_after": after_thermal,
+        "measurement_limitations": [
+            "Wire replay excludes physical finger-to-UIKit recognizer latency.",
+            "A real-finger run can use the same reset/export controls to add that boundary.",
+            "A MacBook run is calibration-only and is not required for this fixed-floor gate.",
+        ],
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n")
+    print(json.dumps({
+        "result": report["result"],
+        "output": str(args.output),
+        "profile": profile_score,
+        "input": input_gate["result"],
+        "thermal": after_thermal,
+    }, ensure_ascii=False, indent=2))
+    if report["result"] != "PASS":
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

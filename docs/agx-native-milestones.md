@@ -2513,3 +2513,58 @@ matrix passed with 4.668 ms median AppKit delivery latency, and real System
 Settings, Dock and Terminal menubar clicks were verified before returning to
 production mode. Evidence and rejected attribution are recorded in
 [`input-front-owner-viewbridge-20260811.md`](input-front-owner-viewbridge-20260811.md).
+
+## 2026-08-11: the Control Center becomes a measured release surface
+
+Every Control Center application now has one repeatable launch contract rather
+than a process-uptime check. The runner requires a live process, valid AppKit
+window metrics, its real input socket, and a Host DisplayStream Scene/focus
+transition, then retains JSON plus a screenshot. GlassDemo, Terminal, Activity
+Monitor, Finder, VS Code, System Settings, Maps, Amadine, Word, Excel,
+PowerPoint, and Asphalt passed 12/12. Separate visible actions exercised native
+menus, tabs, document/cell/slide typing, Maps drag/magnify, and application
+controls.
+
+The Asphalt run exposed two independent upstream ownership failures. Runtime
+sample `/var/mnt/rootfs/tmp/asphalt.sample` placed startup synchronously inside
+UIKitSystem's Catalyst initialization XPC, while crash
+`UIKitSystem-193110.ips` showed recursive
+`_FileCacheFinalize → _CFRelease → CFURL dealloc → CFBasicHashDrain`. Giving
+the stock UIKitSystem job the same scoped logical-root mount contract already
+required by its CoreServices repository stopped the repeated crash and left a
+stable service generation. Asphalt later produced `EXC_GUARD INVALID_NAME` at
+`mach_port_deallocate → macws_publish_completed_catalyst_drawable`
+(`Asphalt-193829.ips`). Its message used `MOVE_SEND`, so an error could consume
+the surface right before the failure branch released the same name. The
+producer now uses `COPY_SEND` and releases its owned right exactly once after
+`mach_msg`; a fresh Catalyst PID rendered its real age screen and remained
+alive for the bounded three-minute test.
+
+InputLab also became the fixed daily performance gate. At nominal 37.69 °C,
+60-Hz motion delivered 56.58 AppKit drags/s at 1.002 ms p95; 120-Hz motion
+delivered 79.97/s at 2.597 ms p95. A new allocation-free active-frame interval
+ring corrected the old Mission Control score that included static inspection
+time. It measured the primary Dock layer at 55.08 fps average, 17.644 ms p50,
+34.290 ms p99 and 29.16 fps 1% low. Thus application and input gates pass, but
+the fixed 60 fps / 45 fps 1%-low visible gate remains honestly open. Runtime
+backpressure and four dropped Dock frames place the next investigation at the
+multi-layer fullscreen capture/presentation boundary, not in the sub-3-ms
+input bridge. Full records and the one-command workflow are in
+[`control-center-input-performance-regression-20260811.md`](control-center-input-performance-regression-20260811.md).
+[2026-08-11 UI performance profiler and gesture replay]
+
+MacWS now has a two-layer production profiler: optional CAPerfHUD-compatible
+QuartzCore RenderServer HUD plus a per-Scene fixed-ring profiler spanning
+DisplayStream capture, IOSurface receipt, Host Metal submission/GPU completion,
+actual `CAMetalDrawable` presentation, and Host-input-to-visible latency. The
+Control Center exposes compact/full HUD, reset, JSON export and a bounded
+ten-scenario gesture suite; `misc/macws_ui_profile.py` runs the granular fixed-
+floor release gate without requiring a MacBook calibration run.
+
+The first nominal-thermal run honestly failed visible fluidity while passing
+the semantic input matrix, 60/120 Hz input-delivery gates, zero Metal command
+errors and process stability. Drag/scroll/magnify p50 was already 16.67 ms, but
+p95 was 37.52–41.68 ms and 1% low was 23.99 FPS. Vertical Dock gestures reached
+69.57–71.49 average FPS but retained 75–104 ms p99 outliers; horizontal Dock
+gestures were only 32.71–33.75 average FPS with 74–83 ms input-to-visible p95.
+See [the complete profiler architecture and evidence](ui-performance-profiler-20260811.md).

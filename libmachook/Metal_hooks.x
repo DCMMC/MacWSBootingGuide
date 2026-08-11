@@ -77,14 +77,20 @@ static void macws_publish_completed_catalyst_drawable(
     message.header.msgh_id = MACWS_CATALYST_DRAWABLE_MACH_MESSAGE_ID;
     message.body.msgh_descriptor_count = 1;
     message.surfacePort.name = surfacePort;
-    message.surfacePort.disposition = MACH_MSG_TYPE_MOVE_SEND;
+    // Keep the producer's ownership deterministic across every mach_msg
+    // result.  A MOVE_SEND descriptor can consume the right even when the
+    // send reports an error; the old failure path then deallocated that
+    // already-consumed name and the kernel terminated Asphalt with
+    // EXC_GUARD INVALID_NAME.  COPY_SEND gives the receiver its own right and
+    // leaves this one owned by the producer until the single release below.
+    message.surfacePort.disposition = MACH_MSG_TYPE_COPY_SEND;
     message.surfacePort.type = MACH_MSG_PORT_DESCRIPTOR;
     message.record = record;
     mach_msg_return_t result = mach_msg(
         &message.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
         sizeof(message), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    (void)mach_port_deallocate(mach_task_self(), surfacePort);
     if (result != MACH_MSG_SUCCESS) {
-        (void)mach_port_deallocate(mach_task_self(), surfacePort);
         if (result == MACH_SEND_INVALID_DEST)
             macws_invalidate_catalyst_drawable_service(service);
     }
