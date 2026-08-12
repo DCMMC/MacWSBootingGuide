@@ -220,6 +220,9 @@ def main():
                         default="left")
     parser.add_argument("--control", action="store_true",
                         help="hold Control across the pointer transition")
+    parser.add_argument("--shift", action="store_true",
+                        help="hold Shift across the pointer transition; "
+                             "macOS uses this for slow window animations")
     parser.add_argument("--hold-seconds", type=float, default=0.05)
     parser.add_argument(
         "--pre-hover-seconds", type=float, default=0.0,
@@ -266,6 +269,9 @@ def main():
         if args.control:
             sock.sendall(struct.pack(">BBxxI", 4, 1, 0xFFE3))
             time.sleep(0.02)
+        if args.shift:
+            sock.sendall(struct.pack(">BBxxI", 4, 1, 0xFFE1))
+            time.sleep(0.02)
         button_mask = 1 if args.button == "left" else 4
         for click_index in range(args.click_count):
             sock.sendall(struct.pack(">BBHH", 5, button_mask, x, y))
@@ -276,6 +282,9 @@ def main():
         if args.control:
             time.sleep(0.02)
             sock.sendall(struct.pack(">BBxxI", 4, 0, 0xFFE3))
+        if args.shift:
+            time.sleep(0.02)
+            sock.sendall(struct.pack(">BBxxI", 4, 0, 0xFFE1))
 
         deadline = time.monotonic() + args.timeout
         changed_update = False

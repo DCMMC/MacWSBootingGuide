@@ -4,6 +4,7 @@
 
 #include "macws_interop_protocol.h"
 #include "macws_display_geometry.h"
+#include "macws_final_composite_protocol.h"
 #include "macws_host_protocol.h"
 #include "macws_menu_protocol.h"
 #include "macws_stream_protocol.h"
@@ -24,7 +25,9 @@ int main(void) {
     assert(!MacWSPhysicalDisplayExtent(5000.0, 5000.0, 2.0, 8192,
                                        &physicalWidth, &physicalHeight));
     assert(MACWS_INPUT_VERSION == 4u);
-    assert(MACWS_STREAM_VERSION == 6u);
+    assert(MACWS_STREAM_VERSION == 7u);
+    assert(MACWS_FINAL_COMPOSITE_VERSION == 1u);
+    assert(sizeof(MacWSFinalCompositeRecord) == 56);
     assert(sizeof(MacWSInputRecord) == 84);
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSInputKindDesktopCommand == 20);
@@ -211,6 +214,35 @@ int main(void) {
     assert(MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
     assert((MacWSStreamFrameInputPassthrough &
             MacWSStreamFrameGlobalSystemSurface) == 0);
+    frame.flags = MacWSStreamFrameComplete |
+        MacWSStreamFrameFinalComposite;
+    frame.windowID = 0;
+    frame.layerWindowID = UINT32_MAX;
+    assert(MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
+    frame.flags |= MacWSStreamFrameOverlay;
+    assert(!MacWSStreamFrameDescriptorIsValid(&frame, sizeof(frame)));
+    MacWSFinalCompositeRecord finalRecord = {
+        .magic = MACWS_FINAL_COMPOSITE_MAGIC,
+        .version = MACWS_FINAL_COMPOSITE_VERSION,
+        .size = sizeof(finalRecord),
+        .producerPID = 42,
+        .surfaceID = 7,
+        .sequence = 1,
+        .completionTime = 2,
+        .width = 2388,
+        .height = 1668,
+        .bytesPerRow = 9600,
+        .ioSurfacePixelFormat = MACWS_FINAL_COMPOSITE_BGRA,
+        .metalPixelFormat = MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM,
+    };
+    assert(MacWSFinalCompositeRecordIsValid(
+        &finalRecord, sizeof(finalRecord)));
+    finalRecord.bytesPerRow = finalRecord.width * 4u - 1u;
+    assert(!MacWSFinalCompositeRecordIsValid(
+        &finalRecord, sizeof(finalRecord)));
+    frame.flags = MacWSStreamFrameComplete;
+    frame.windowID = 42;
+    frame.layerWindowID = 42;
     frame.destinationX = 200;
     frame.destinationY = 100;
     frame.destinationWidth = 1000;

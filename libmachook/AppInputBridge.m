@@ -264,13 +264,120 @@ typedef struct {
 // diagnostics that would perturb the measurement itself.
 static MacWSInputLatencyAggregate MacWSInputLatency;
 
+#define MACWS_SYSTEM_INPUT_LATENCY_MAGIC UINT32_C(0x4d574c54)
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t kind;
+    uint32_t windowNumber;
+    uint32_t sampleSequence;
+    double producerTimestamp;
+    double posterReceiptTimestamp;
+} MacWSSystemInputLatencyMarker;
+
+static void MacWSSystemInputLatencyPath(uint32_t windowNumber,
+                                        char path[PATH_MAX]) {
+    snprintf(path, PATH_MAX,
+             "/private/tmp/macws_input_latency_pending.%u.bin",
+             windowNumber);
+}
+
+// A fullscreen pointer follows the same native system route as OSXvnc:
+// Host -> Dock's CGS connection -> WindowServer -> target NSApplication.
+// The target application therefore cannot see the original socket record.
+// For an explicitly requested latency sample only, publish one fixed-size
+// marker keyed by the authoritative CGWindowID before CGPostMouseEvent.  The
+// receiving application's observational sendEvent: hook consumes it on the
+// matching mouseDown.  No marker is created during ordinary interaction.
+static BOOL MacWSWriteSystemInputLatencyMarker(MacWSInputRecord record,
+                                                uint32_t windowNumber) {
+    if (!(record.flags & MacWSInputFlagLatencyDiagnostic) ||
+        windowNumber == 0 ||
+        (record.kind != MacWSInputKindTap &&
+         record.kind != MacWSInputKindSecondaryTap)) return NO;
+    MacWSSystemInputLatencyMarker marker = {
+        .magic = MACWS_SYSTEM_INPUT_LATENCY_MAGIC,
+        .version = 1,
+        .kind = record.kind,
+        .windowNumber = windowNumber,
+        .sampleSequence = record.sampleSequence,
+        .producerTimestamp = record.timestamp,
+        .posterReceiptTimestamp = MacWSInputUptimeSeconds(),
+    };
+    char path[PATH_MAX] = {0};
+    MacWSSystemInputLatencyPath(windowNumber, path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return NO;
+    ssize_t count = write(fd, &marker, sizeof(marker));
+    close(fd);
+    if (count != (ssize_t)sizeof(marker)) {
+        unlink(path);
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL MacWSConsumeSystemInputLatencyMarker(
+        uint32_t windowNumber, MacWSSystemInputLatencyMarker *marker) {
+    if (!marker || windowNumber == 0) return NO;
+    char path[PATH_MAX] = {0};
+    MacWSSystemInputLatencyPath(windowNumber, path);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NO;
+    MacWSSystemInputLatencyMarker candidate = {0};
+    ssize_t count = read(fd, &candidate, sizeof(candidate));
+    close(fd);
+    // Exactly one mouseDown owns the marker. Remove malformed and stale
+    // samples as well so a failed diagnostic cannot contaminate a later run.
+    unlink(path);
+    double now = MacWSInputUptimeSeconds();
+    BOOL valid = count == (ssize_t)sizeof(candidate) &&
+        candidate.magic == MACWS_SYSTEM_INPUT_LATENCY_MAGIC &&
+        candidate.version == 1 &&
+        candidate.windowNumber == windowNumber &&
+        candidate.producerTimestamp > 0.0 &&
+        candidate.posterReceiptTimestamp >= candidate.producerTimestamp &&
+        now >= candidate.posterReceiptTimestamp &&
+        now - candidate.posterReceiptTimestamp <= 2.0;
+    if (!valid) return NO;
+    *marker = candidate;
+    return YES;
+}
+
+static void MacWSAppendOneShotInputLatency(MacWSInputRecord record,
+                                           double totalUS,
+                                           double transportUS,
+                                           double queueUS,
+                                           double dispatchUS) {
+    char path[PATH_MAX] = {0};
+    snprintf(path, sizeof(path),
+             "/private/tmp/macws_input_latency.%d.jsonl", getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    char line[320] = {0};
+    int length = snprintf(line, sizeof(line),
+        "{\"sample\":%u,\"kind\":%u,\"total_us\":%.1f,"
+        "\"transport_us\":%.1f,\"queue_us\":%.1f,"
+        "\"dispatch_us\":%.1f}\n",
+        record.sampleSequence, record.kind, totalUS, transportUS,
+        queueUS, dispatchUS);
+    if (length > 0 && (size_t)length < sizeof(line))
+        (void)write(fd, line, (size_t)length);
+    close(fd);
+}
+
 static void MacWSRecordInputLatency(MacWSInputRecord record,
                                     double mainStart,
                                     double dispatchEnd) {
     if (!(record.flags & MacWSInputFlagLatencyDiagnostic)) return;
-    BOOL began = (record.flags & MacWSInputFlagGestureBegan) != 0;
+    BOOL oneShot = record.kind == MacWSInputKindTap ||
+                   record.kind == MacWSInputKindSecondaryTap;
+    BOOL began = oneShot ||
+        (record.flags & MacWSInputFlagGestureBegan) != 0;
     BOOL terminal = (record.flags & (MacWSInputFlagGestureEnded |
-                                     MacWSInputFlagGestureCancelled)) != 0;
+                                     MacWSInputFlagGestureCancelled)) != 0 ||
+                    oneShot;
     if (began || MacWSInputLatency.kind != record.kind) {
         MacWSInputLatency = (MacWSInputLatencyAggregate){
             .kind = (MacWSInputKind)record.kind,
@@ -281,6 +388,14 @@ static void MacWSRecordInputLatency(MacWSInputRecord record,
     double transportUS = record.reserved;
     double queueUS = fmax(0.0, totalUS - transportUS);
     double dispatchUS = fmax(0.0, (dispatchEnd - mainStart) * 1.0e6);
+    if (oneShot) {
+        // A small JSONL sidecar is opt-in through LatencyDiagnostic and lets
+        // the release profiler measure unmodified Terminal/Finder/VS Code
+        // clicks. One file append happens after AppKit has completed the
+        // click, so the measured sample itself cannot include the write.
+        MacWSAppendOneShotInputLatency(
+            record, totalUS, transportUS, queueUS, dispatchUS);
+    }
     MacWSInputLatency.count++;
     MacWSInputLatency.lastSequence = record.sampleSequence;
     MacWSInputLatency.transportTotalUS += transportUS;
@@ -292,7 +407,7 @@ static void MacWSRecordInputLatency(MacWSInputRecord record,
     MacWSInputLatency.dispatchTotalUS += dispatchUS;
     MacWSInputLatency.dispatchMaximumUS = fmax(
         MacWSInputLatency.dispatchMaximumUS, dispatchUS);
-    if (terminal && MacWSInputLatency.count != 0) {
+    if (terminal && MacWSInputLatency.count != 0 && !oneShot) {
         double count = MacWSInputLatency.count;
         fprintf(stderr,
             "#### APP-INPUT LATENCY pid=%d kind=%u samples=%u seq=%u..%u "
@@ -923,6 +1038,17 @@ static void MacWSScheduleApplicationDisplaySettle(void) {
 static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
     NSUInteger type = event ? ((MacWSMsgUInteger)objc_msgSend)(
         event, sel_registerName("type")) : 0;
+    MacWSSystemInputLatencyMarker systemLatencyMarker = {0};
+    double systemLatencyMainStart = 0.0;
+    if (type == 1 || type == 3) {
+        NSInteger eventWindow = ((MacWSMsgInteger)objc_msgSend)(
+            event, sel_registerName("windowNumber"));
+        if (eventWindow > 0 && eventWindow <= UINT32_MAX &&
+            MacWSConsumeSystemInputLatencyMarker(
+                (uint32_t)eventWindow, &systemLatencyMarker)) {
+            systemLatencyMainStart = MacWSInputUptimeSeconds();
+        }
+    }
     // A process-local NSEvent does not update WindowServer's global button
     // mask.  The synthetic-gesture bridge therefore owns that mask while the
     // event is dispatched, but it must still make the same transition as a
@@ -1092,6 +1218,22 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
     }
     if (MacWSOriginalApplicationSendEvent)
         MacWSOriginalApplicationSendEvent(self, command, event);
+    if (systemLatencyMainStart > 0.0) {
+        double dispatchEnd = MacWSInputUptimeSeconds();
+        MacWSInputRecord latencyRecord = {
+            .kind = systemLatencyMarker.kind,
+            .sampleSequence = systemLatencyMarker.sampleSequence,
+        };
+        MacWSAppendOneShotInputLatency(
+            latencyRecord,
+            fmax(0.0, (systemLatencyMainStart -
+                       systemLatencyMarker.producerTimestamp) * 1.0e6),
+            fmax(0.0, (systemLatencyMarker.posterReceiptTimestamp -
+                       systemLatencyMarker.producerTimestamp) * 1.0e6),
+            fmax(0.0, (systemLatencyMainStart -
+                       systemLatencyMarker.posterReceiptTimestamp) * 1.0e6),
+            fmax(0.0, (dispatchEnd - systemLatencyMainStart) * 1.0e6));
+    }
     if (hasBridgedMouseLocation) {
         MacWSAppInputMouseLocation = previousMouseLocation;
         MacWSAppInputMouseLocationActive = previousMouseLocationActive;
@@ -2777,6 +2919,9 @@ static BOOL MacWSPostLegacySystemPointerEvent(
     };
     int32_t firstResult = 0;
     int32_t secondResult = 0;
+    BOOL latencyMarker = atomicTap &&
+        MacWSWriteSystemInputLatencyMarker(record,
+            exactWindow != 0 ? exactWindow : (uint32_t)windowNumber);
     if (atomicTap) {
         // Runtime-confirmed in Dock on 2026-08-06: setting only the third
         // slot produces event type 0x19 (OtherMouseDown), while the second
@@ -2785,10 +2930,13 @@ static BOOL MacWSPostLegacySystemPointerEvent(
         // boundary for a gesture interrupted by Scene suspension.
         firstResult = postMouse(quartzPoint, true, 3,
             secondary ? false : true, secondary ? true : false, false);
-        // Preserve a visibly distinct ordered transition without the former
-        // AppInput queue round trip. Eight milliseconds is one 120-Hz input
-        // interval and stays below a 60-Hz presentation frame.
-        usleep(8000);
+        // CGPostMouseEvent preserves call order and button transitions are
+        // not coalesced. The former 8-ms hold added almost one complete iPad
+        // Pro display interval before the receiving NSApplication observed
+        // the click (runtime A/B: Terminal system-queue p95 14.43 ms). Keep a
+        // small 2-ms separation for trackers that sample pressedMouseButtons,
+        // while avoiding an artificial frame of input latency.
+        usleep(2000);
         secondResult = postMouse(quartzPoint, true, 3,
             false, false, false);
     } else {
@@ -2796,6 +2944,13 @@ static BOOL MacWSPostLegacySystemPointerEvent(
             leftDown, rightDown, false);
     }
     BOOL posted = firstResult == 0 && secondResult == 0;
+    if (!posted && latencyMarker) {
+        char latencyPath[PATH_MAX] = {0};
+        MacWSSystemInputLatencyPath(
+            exactWindow != 0 ? exactWindow : (uint32_t)windowNumber,
+            latencyPath);
+        unlink(latencyPath);
+    }
     if (posted && exactWindow != 0 && allowExactSystemStart &&
         record.kind == MacWSInputKindTouchDown) {
         MacWSExactSystemPointerActive = YES;
@@ -3313,6 +3468,30 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
         frame.origin.y + frame.size.height - appKitPoint.y,
     };
     uint32_t windowNumber = MacWSInputWindowIDForScene(record.sceneID);
+    // Fullscreen Host records intentionally encode window zero so Dock remains
+    // a neutral CGS event poster and WindowServer performs the final hit test.
+    // For a diagnostic atomic click only, ask the same WindowServer scene for
+    // the window currently under the post point and use that identity solely
+    // to correlate the receiving NSApplication.sendEvent: boundary. The
+    // actual pointer record stays window-zero and its routing is unchanged.
+    uint32_t latencyWindowNumber = windowNumber;
+    if (latencyWindowNumber == 0 &&
+        (record.flags & MacWSInputFlagLatencyDiagnostic) &&
+        (record.kind == MacWSInputKindTap ||
+         record.kind == MacWSInputKindSecondaryTap)) {
+        Class nativeWindowClass = objc_getClass("NSWindow");
+        SEL globalHitSelector = sel_registerName(
+            "windowNumberAtPoint:belowWindowWithWindowNumber:");
+        if (nativeWindowClass && class_respondsToSelector(
+                object_getClass(nativeWindowClass), globalHitSelector)) {
+            NSInteger hit = ((MacWSMsgIntegerPointInteger)objc_msgSend)(
+                (id)nativeWindowClass, globalHitSelector, appKitPoint, 0);
+            if (hit > 0 && hit <= UINT32_MAX)
+                latencyWindowNumber = (uint32_t)hit;
+        }
+    }
+    BOOL latencyMarker = MacWSWriteSystemInputLatencyMarker(
+        record, latencyWindowNumber);
     BOOL modalActive = NO;
     BOOL modalPosted = MacWSPostDockModalPointerEvent(
         record, windowNumber, &modalActive);
@@ -3337,6 +3516,11 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
     }
     BOOL posted = modalPosted || MacWSPostLegacySystemPointerEvent(
         record, appKitPoint, frame, frame, windowNumber, YES);
+    if (!posted && latencyMarker) {
+        char latencyPath[PATH_MAX] = {0};
+        MacWSSystemInputLatencyPath(latencyWindowNumber, latencyPath);
+        unlink(latencyPath);
+    }
     if (MacWSRuntimeDiagnosticsEnabled()) {
         fprintf(stderr,
             "#### APP-INPUT DOCK-SYSTEM pid=%d window=%u kind=%u "
@@ -3449,8 +3633,9 @@ static BOOL MacWSPerformNativeTitlebarDoubleClick(
 // documents mouse subtype 1 as tablet-point and fields 15..24 as tablet
 // position/buttons/pressure/tilt/rotation/device ID. This avoids fabricating a
 // second event that could reorder against the click while giving drawing apps
-// real NSEvent tablet metadata. Runtime validation still needs to confirm which
-// target applications consume the subtype under macOS 13.4 in this chroot.
+// real NSEvent tablet metadata. Runtime-confirmed with Amadine on 2026-08-12:
+// a pressure/tilt Pencil down-move-up sequence created a visible Rectangle and
+// a second Path layer, whereas the former hover-only sequence did not drag.
 static void MacWSApplyTabletMetadata(id event, MacWSInputRecord record) {
     if (!event || record.source != MacWSInputSourcePencil) return;
     SEL cgEventSelector = sel_registerName("CGEvent");
@@ -3797,7 +3982,10 @@ static void MacWSPostDirectTrackingRecord(
             screenPoint.x + snapshot.windowMinusScreen.x,
             screenPoint.y + snapshot.windowMinusScreen.y,
         };
-        float pressure = record.kind == MacWSInputKindTouchMove ? 1.0f : 0.0f;
+        float pressure = record.kind == MacWSInputKindTouchMove
+            ? (record.source == MacWSInputSourcePencil
+                ? fmaxf(0.0f, fminf(1.0f, record.pressure)) : 1.0f)
+            : 0.0f;
         id event = ((MacWSMouseEventFactory)objc_msgSend)(
             (id)snapshot.eventClass,
             sel_registerName("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
@@ -4467,14 +4655,31 @@ static id MacWSFindEnabledMenuItemWithTitle(id menu, NSString *wantedTitle,
     return nil;
 }
 
-static BOOL MacWSMainBundleIsFinder(void) {
+static id MacWSMainBundleIdentifier(void) {
     Class bundleClass = objc_getClass("NSBundle");
     id bundle = bundleClass ? ((MacWSMsgID)objc_msgSend)(
         (id)bundleClass, sel_registerName("mainBundle")) : nil;
-    id identifier = bundle ? ((MacWSMsgID)objc_msgSend)(
+    return bundle ? ((MacWSMsgID)objc_msgSend)(
         bundle, sel_registerName("bundleIdentifier")) : nil;
+}
+
+static BOOL MacWSMainBundleIsFinder(void) {
+    id identifier = MacWSMainBundleIdentifier();
     return [identifier isEqualToString:
         MacWSRuntimeString("com.apple.finder")];
+}
+
+static BOOL MacWSMainBundleUsesSpatialCanvasTouch(void) {
+    id identifier = MacWSMainBundleIdentifier();
+    // macOS Maps implements pan as a primary-button tracking sequence and
+    // zoom as scroll/magnify. Runtime-confirmed symptom on the target iPad:
+    // MacWS's document-wide one-finger Scroll route zoomed the map instead of
+    // moving it. Publish an application-content capability at the owning
+    // AppKit process rather than guessing from a title, window position or
+    // map control hit point. Future spatial canvases can join this identity
+    // table without changing the transport or gesture state machine.
+    return [identifier isEqualToString:
+        MacWSRuntimeString("com.apple.Maps")];
 }
 
 static NSSet *MacWSVisibleWindowNumberSnapshot(id application) {
@@ -5003,10 +5208,65 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             // loop turn. Publish the committed catalog after that turn so
             // every Host Scene observes the close without a polling delay.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                          100 * NSEC_PER_MSEC),
+                                          150 * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
                 MacWSPublishWindowMetrics();
                 MacWSNotifyDisplayCatalogChanged('c');
+
+                // Closing an iPad Scene is an explicit application-window
+                // lifecycle transaction, not merely a request to hide pixels.
+                // Runtime-confirmed before this fix with Terminal: the final
+                // NSWindow disappeared, but its process and Dock running dot
+                // remained indefinitely; a Dock activation then produced only
+                // the menu bar because there was no window to order forward.
+                // Terminate cooperatively only after AppKit proves the exact
+                // requested window accepted performClose: and no other visible
+                // level-zero application window remains.  A delegate-vetoed
+                // close or another document window therefore cannot lose data
+                // or terminate the application behind another iPad Scene.
+                id closedWindow = MacWSWindowWithNumber(
+                    application, windowNumber);
+                BOOL closeCommitted = !closedWindow ||
+                    !((MacWSMsgBool)objc_msgSend)(
+                        closedWindow, sel_registerName("isVisible"));
+                NSUInteger visiblePrimaryWindows = 0;
+                NSArray *applicationWindows = ((MacWSMsgID)objc_msgSend)(
+                    application, sel_registerName("windows"));
+                for (id candidate in applicationWindows) {
+                    BOOL visible = ((MacWSMsgBool)objc_msgSend)(
+                        candidate, sel_registerName("isVisible"));
+                    NSInteger level = ((MacWSMsgInteger)objc_msgSend)(
+                        candidate, sel_registerName("level"));
+                    NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+                        candidate, sel_registerName("windowNumber"));
+                    if (visible && level == 0 && number > 0)
+                        visiblePrimaryWindows++;
+                }
+                if (closeCommitted && visiblePrimaryWindows == 0) {
+                    SEL terminate = sel_registerName("terminate:");
+                    if (((MacWSMsgBoolSEL)objc_msgSend)(
+                            application,
+                            sel_registerName("respondsToSelector:"),
+                            terminate)) {
+                        if (MacWSRuntimeDiagnosticsEnabled()) {
+                            fprintf(stderr,
+                                "#### APP-INPUT CLOSE-WINDOW-LAST pid=%d "
+                                "window=%u route=NSApplication.terminate\n",
+                                getpid(), windowNumber);
+                            fflush(stderr);
+                        }
+                        ((MacWSMsgVoidID)objc_msgSend)(
+                            application, terminate, nil);
+                    }
+                } else if (MacWSRuntimeDiagnosticsEnabled()) {
+                    fprintf(stderr,
+                        "#### APP-INPUT CLOSE-WINDOW-KEEP pid=%d window=%u "
+                        "committed=%s visible-primary=%lu\n",
+                        getpid(), windowNumber,
+                        closeCommitted ? "YES" : "NO",
+                        (unsigned long)visiblePrimaryWindows);
+                    fflush(stderr);
+                }
             });
             if (MacWSRuntimeDiagnosticsEnabled()) {
                 fprintf(stderr,
@@ -5835,10 +6095,14 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     }
     NSUInteger eventType = MacWSNSEventType((MacWSInputKind)record.kind);
     NSInteger clickCount = (record.flags & MacWSInputFlagDoubleClick) ? 2 : 1;
-    float pressure = record.kind == MacWSInputKindTouchDown ||
-                     record.kind == MacWSInputKindTap ||
-                     record.kind == MacWSInputKindTouchMove
-        ? (record.pressure > 0.0f ? record.pressure : 1.0f) : 0.0f;
+    BOOL pressed = record.kind == MacWSInputKindTouchDown ||
+                   record.kind == MacWSInputKindTap ||
+                   record.kind == MacWSInputKindTouchMove;
+    float pressure = pressed
+        ? (record.source == MacWSInputSourcePencil
+            ? fmaxf(0.0f, fminf(1.0f, record.pressure))
+            : (record.pressure > 0.0f ? record.pressure : 1.0f))
+        : 0.0f;
     id event = MacWSRuntimeDiagnosticsEnabled()
         ? MacWSCreateAppMouseEvent(eventClass, record, eventType,
             screenPoint, windowPoint, screenFrame, windowNumber)
@@ -5965,6 +6229,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                               memory_order_release);
         MacWSAppInputRFBTrackingActive = NO;
         MacWSAppInputRFBTrackingButtons = 0;
+        MacWSRecordInputLatency(record, latencyMainStart,
+                                MacWSInputUptimeSeconds());
         if (MacWSRuntimeDiagnosticsEnabled() ||
             record.contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
             fprintf(stderr,
@@ -7274,6 +7540,7 @@ static void MacWSPublishWindowMetrics(void) {
         application, sel_registerName("windows"));
     id keyWindow = ((MacWSMsgID)objc_msgSend)(
         application, sel_registerName("keyWindow"));
+    BOOL spatialCanvas = MacWSMainBundleUsesSpatialCanvasTouch();
     NSMutableData *entries = [NSMutableData data];
     NSUInteger count = [windows count];
     for (NSUInteger index = 0;
@@ -7307,12 +7574,20 @@ static void MacWSPublishWindowMetrics(void) {
         BOOL visible = orderedVisible && windowLevel == 0;
         id presentingWindow = MacWSPresentingWindow(window, application);
         BOOL transient = presentingWindow != nil;
+        SEL hasShadowSelector = sel_registerName("hasShadow");
+        BOOL hasShadow = visible &&
+            ((MacWSMsgBoolSEL)objc_msgSend)(
+                window, sel_registerName("respondsToSelector:"),
+                hasShadowSelector) &&
+            ((MacWSMsgBool)objc_msgSend)(window, hasShadowSelector);
         MacWSWindowMetricsEntry entry = {
             .windowID = (uint32_t)number,
             .flags = (resizable ? MacWSStreamWindowResizable : 0) |
                 (visible ? MacWSStreamWindowVisible : 0) |
                 (transient ? MacWSStreamWindowTransient : 0) |
-                (window == keyWindow ? MacWSStreamWindowFocused : 0),
+                (window == keyWindow ? MacWSStreamWindowFocused : 0) |
+                (hasShadow ? MacWSStreamWindowHasShadow : 0) |
+                (spatialCanvas ? MacWSStreamWindowSpatialCanvas : 0),
             .logicalGroupID = MacWSLogicalWindowGroupID(window, application),
             .minimumLogicalWidth = (float)minimum.width,
             .minimumLogicalHeight = (float)minimum.height,

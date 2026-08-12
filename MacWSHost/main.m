@@ -151,6 +151,7 @@ static BOOL MacWSStreamFrameGeometryEqual(
         left.destinationY == right.destinationY &&
         left.destinationWidth == right.destinationWidth &&
         left.destinationHeight == right.destinationHeight &&
+        left.flags == right.flags &&
         fabsf(left.backingScale - right.backingScale) < 0.001f;
 }
 
@@ -885,6 +886,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     MacWSMappedFrame *_frame;
     id<MTLCommandQueue> _commandQueue;
     id<MTLRenderPipelineState> _pipeline;
+    id<MTLRenderPipelineState> _shadowPipeline;
     id<MTLTexture> _sourceTexture;
     MacWSPerformanceMonitor *_performanceMonitor;
     uint32_t _textureWidth;
@@ -918,6 +920,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *_overlayTextures;
     NSMutableDictionary<NSNumber *, MacWSCatalystDrawableFrame *> *
         _catalystDrawableFrames;
+    NSSet<NSNumber *> *_spatialCanvasPIDs;
+    NSSet<NSNumber *> *_shadowWindowIDs;
+    BOOL _directTouchUsesPrimaryDrag;
     uint64_t _surfaceTextureImports;
     uint64_t _surfaceTextureReuses;
     uint64_t _lastPerformanceLogStreamID;
@@ -1480,6 +1485,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)setTargetPID:(int32_t)targetPID {
     if (_targetPID == targetPID) return;
     _targetPID = targetPID;
+    _directTouchUsesPrimaryDrag = targetPID > 1 &&
+        [_spatialCanvasPIDs containsObject:@(targetPID)];
     [self refreshPresentationPolicy];
 }
 
@@ -1908,6 +1915,22 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
          "  constexpr sampler s(coord::normalized, address::clamp_to_edge,\n"
          "                      filter::linear);\n"
          "  return image.sample(s, in.uv);\n"
+         "}\n"
+         "fragment half4 macws_shadow(VOut in [[stage_in]],\n"
+         "    constant float4 *geometry [[buffer(0)]]) {\n"
+         "  float2 quad = geometry[0].xy;\n"
+         "  float2 innerOrigin = geometry[0].zw;\n"
+         "  float2 innerSize = geometry[1].xy;\n"
+         "  float radius = geometry[1].z;\n"
+         "  float sigma = geometry[1].w;\n"
+         "  float2 p = in.uv * quad - (innerOrigin + innerSize * 0.5);\n"
+         "  float2 q = abs(p) - (innerSize * 0.5 - radius);\n"
+         "  float distance = length(max(q, 0.0))\n"
+         "      + min(max(q.x, q.y), 0.0) - radius;\n"
+         "  float outside = max(distance, 0.0);\n"
+         "  half alpha = half(0.30 * exp(-(outside * outside)\n"
+         "      / (2.0 * sigma * sigma)));\n"
+         "  return half4(0.0h, 0.0h, 0.0h, alpha);\n"
          "}\n";
     NSError *error = nil;
     id<MTLLibrary> library = [self.device newLibraryWithSource:shaderSource
@@ -1934,6 +1957,15 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!_pipeline) {
         [self publishStatus:[NSString stringWithFormat:@"Metal pipeline 创建失败: %@",
                              error.localizedDescription ?: @"未知错误"]];
+    }
+    descriptor.label = @"MacWSHost native-window shadow pipeline";
+    descriptor.fragmentFunction = [library newFunctionWithName:@"macws_shadow"];
+    _shadowPipeline = [self.device
+        newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (!_shadowPipeline) {
+        [self publishStatus:[NSString stringWithFormat:
+            @"窗口阴影 pipeline 创建失败: %@",
+            error.localizedDescription ?: @"未知错误"]];
     }
 }
 
@@ -2149,6 +2181,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     BOOL drewCatalystDrawable = NO;
     MacWSCatalystDrawableFrame *catalystWitnessFrame = nil;
     BOOL directSurface = _surfaceFrame != nil && _surfaceTexture != nil;
+    BOOL finalComposite = directSurface &&
+        (_surfaceFrame.descriptor.flags &
+            MacWSStreamFrameFinalComposite) != 0;
     if (directSurface) {
         _sourceTexture = _surfaceTexture;
     } else {
@@ -2236,7 +2271,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // the captured traffic lights/title bar and the exact existing viewport.
     MacWSCatalystDrawableFrame *baseCatalystFrame = self.targetPID > 1
         ? _catalystDrawableFrames[@(self.targetPID)] : nil;
-    if (directSurface && baseCatalystFrame.texture) {
+    if (directSurface && !finalComposite && baseCatalystFrame.texture) {
         float visibleTop = vertices[2].w;
         float visibleBottom = vertices[0].w;
         float titlebarFraction = _surfaceFrame.descriptor.contentHeight
@@ -2267,7 +2302,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
 
     MacWSSurfaceFrame *performanceFrame = directSurface ? _surfaceFrame : nil;
-    if (directSurface && _overlayFrames.count) {
+    if (directSurface && !finalComposite && _overlayFrames.count) {
         [self overlayKeysBackToFront];
         CGFloat baseWidth = _surfaceFrame.descriptor.contentWidth;
         CGFloat baseHeight = _surfaceFrame.descriptor.contentHeight;
@@ -2295,6 +2330,93 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             if (!performanceFrame ||
                 overlayFrame.receiptTime > performanceFrame.receiptTime)
                 performanceFrame = overlayFrame;
+
+            // SkyLight's exact-window stream contains the window backing but
+            // not the compositor's external drop shadow.  The private stream
+            // boolean was runtime-probed both ways on window 88 and returned
+            // the same 960x656 surface, so no native shadow pixels exist to
+            // copy.  AppInputBridge now publishes NSWindow.hasShadow from the
+            // real window; render one inexpensive rounded Gaussian SDF behind
+            // that layer on the GPU before painting its authoritative pixels.
+            if (_shadowPipeline &&
+                [_shadowWindowIDs containsObject:
+                    @(overlay.layerWindowID)]) {
+                const CGFloat marginLeft = 32.0;
+                const CGFloat marginTop = 24.0;
+                const CGFloat marginRight = 32.0;
+                const CGFloat marginBottom = 40.0;
+                CGRect shadowDestination = CGRectMake(
+                    destination.origin.x - marginLeft,
+                    destination.origin.y - marginTop,
+                    destination.size.width + marginLeft + marginRight,
+                    destination.size.height + marginTop + marginBottom);
+                CGRect shadowClipped = CGRectIntersection(
+                    shadowDestination, visiblePixels);
+                if (!CGRectIsNull(shadowClipped) &&
+                    !CGRectIsEmpty(shadowClipped)) {
+                    CGFloat shadowLeft = CGRectGetMinX(_contentRect) +
+                        (CGRectGetMinX(shadowClipped) -
+                         CGRectGetMinX(visiblePixels)) /
+                            CGRectGetWidth(visiblePixels) *
+                            CGRectGetWidth(_contentRect);
+                    CGFloat shadowRight = CGRectGetMinX(_contentRect) +
+                        (CGRectGetMaxX(shadowClipped) -
+                         CGRectGetMinX(visiblePixels)) /
+                            CGRectGetWidth(visiblePixels) *
+                            CGRectGetWidth(_contentRect);
+                    CGFloat shadowTop = CGRectGetMinY(_contentRect) +
+                        (CGRectGetMinY(shadowClipped) -
+                         CGRectGetMinY(visiblePixels)) /
+                            CGRectGetHeight(visiblePixels) *
+                            CGRectGetHeight(_contentRect);
+                    CGFloat shadowBottom = CGRectGetMinY(_contentRect) +
+                        (CGRectGetMaxY(shadowClipped) -
+                         CGRectGetMinY(visiblePixels)) /
+                            CGRectGetHeight(visiblePixels) *
+                            CGRectGetHeight(_contentRect);
+                    float u0 = (CGRectGetMinX(shadowClipped) -
+                                CGRectGetMinX(shadowDestination)) /
+                               CGRectGetWidth(shadowDestination);
+                    float u1 = (CGRectGetMaxX(shadowClipped) -
+                                CGRectGetMinX(shadowDestination)) /
+                               CGRectGetWidth(shadowDestination);
+                    float v0 = (CGRectGetMinY(shadowClipped) -
+                                CGRectGetMinY(shadowDestination)) /
+                               CGRectGetHeight(shadowDestination);
+                    float v1 = (CGRectGetMaxY(shadowClipped) -
+                                CGRectGetMinY(shadowDestination)) /
+                               CGRectGetHeight(shadowDestination);
+                    simd_float4 shadowVertices[4] = {
+                        {(float)(shadowLeft / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - shadowBottom / viewHeight * 2.0),
+                         u0, v1},
+                        {(float)(shadowRight / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - shadowBottom / viewHeight * 2.0),
+                         u1, v1},
+                        {(float)(shadowLeft / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - shadowTop / viewHeight * 2.0),
+                         u0, v0},
+                        {(float)(shadowRight / viewWidth * 2.0 - 1.0),
+                         (float)(1.0 - shadowTop / viewHeight * 2.0),
+                         u1, v0},
+                    };
+                    simd_float4 shadowGeometry[2] = {
+                        {(float)shadowDestination.size.width,
+                         (float)shadowDestination.size.height,
+                         (float)marginLeft, (float)marginTop},
+                        {(float)destination.size.width,
+                         (float)destination.size.height, 12.0f, 13.0f},
+                    };
+                    [encoder setRenderPipelineState:_shadowPipeline];
+                    [encoder setVertexBytes:shadowVertices
+                                      length:sizeof(shadowVertices) atIndex:0];
+                    [encoder setFragmentBytes:shadowGeometry
+                                        length:sizeof(shadowGeometry) atIndex:0];
+                    [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
+                                vertexStart:0 vertexCount:4];
+                    [encoder setRenderPipelineState:_pipeline];
+                }
+            }
 
             CGFloat relativeLeft =
                 (CGRectGetMinX(clipped) - CGRectGetMinX(visiblePixels)) /
@@ -2467,7 +2589,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     [_retiredSurfaceFrames removeAllObjects];
     if (submittedFrame)
         _submittedSurfaceLeaseToken = submittedFrame.descriptor.leaseToken;
-    if (performanceFrame &&
+    if (MacWSHostDiagnosticsEnabled() && performanceFrame &&
         (performanceFrame.descriptor.sequence % 120) == 0 &&
         (_lastPerformanceLogStreamID != performanceFrame.descriptor.streamID ||
          _lastPerformanceLogSequence != performanceFrame.descriptor.sequence)) {
@@ -2782,6 +2904,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         int32_t dockPID = [self dockSystemGestureTargetPID];
         if (dockPID > 1) {
             int32_t visualPID = 0;
+            uint32_t visualWindowID = 0;
             BOOL beginsGlobalDrag = record->kind == MacWSInputKindTouchDown;
             BOOL continuesGlobalDrag = record->kind == MacWSInputKindTouchMove ||
                 record->kind == MacWSInputKindTouchUp ||
@@ -2794,7 +2917,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             } else {
                 (void)[self resolveFullscreenLayerAtPoint:
                     CGPointMake(record->x, record->y) pid:&visualPID
-                    windowID:NULL descriptor:NULL];
+                    windowID:&visualWindowID descriptor:NULL];
             }
             if (beginsGlobalDrag) {
                 _fullscreenGlobalPointerPresentationPID = visualPID;
@@ -2806,7 +2929,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             uint32_t modifiers =
                 MacWSInputModifiersForScene(record->sceneID);
             record->targetPID = dockPID;
-            record->sceneID = MacWSInputSceneForWindow(0, modifiers);
+            // Ordinary fullscreen input stays a zero-window system stream so
+            // WindowServer remains the final hit-test authority. An explicit
+            // regression sample additionally carries Host's already-resolved
+            // CGWindowID as a correlation key; Dock still posts the same
+            // global CGPostMouseEvent and does not route by this identity.
+            uint32_t diagnosticWindowID =
+                (record->flags & MacWSInputFlagLatencyDiagnostic)
+                    ? visualWindowID : 0;
+            record->sceneID = MacWSInputSceneForWindow(
+                diagnosticWindowID, modifiers);
             record->flags |= MacWSInputFlagGlobalSystemSurface;
             if ((record->kind == MacWSInputKindTouchUp ||
                  record->kind == MacWSInputKindTouchCancel) &&
@@ -3218,7 +3350,18 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _pencilTouchStartPoint = [touch preciseLocationInView:self];
         _pencilTouchTravel = 0;
         _pencilTouchBeganAt = touch.timestamp;
-        [self emitPencilHoverForTouch:touch point:_pencilTouchStartPoint];
+        // Pencil contact is a real tablet-button lifecycle, not a hovering
+        // preview. Runtime A/B with Amadine's Rectangle tool confirmed that
+        // the old Hover-only route could select the tool but could not create
+        // a Path layer, while this down/move/up route with tablet metadata
+        // created a visible rectangle and Path layer. Preserve UIKit's
+        // precise point, pressure, altitude and azimuth; the separate
+        // UIHoverGestureRecognizer remains the non-contact route.
+        [self emitKind:MacWSInputKindTouchDown touch:touch
+                 point:_pencilTouchStartPoint];
+        _pencilCursorView.center = _pencilTouchStartPoint;
+        _pencilCursorView.hidden = NO;
+        [self bringSubviewToFront:_pencilCursorView];
     } else if (pointerTouch) {
         if (@available(iOS 13.4, *)) {
             // buttonMask is the complete current button state.  A primary
@@ -3246,6 +3389,18 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             _directGestureBlocked = YES;
         } else if (!_directGestureBlocked && !_directTouch && touch) {
             [self beginDirectTouchCandidate:touch];
+            if (_directTouchUsesPrimaryDrag) {
+                // Spatial canvases map one finger to the native primary-drag
+                // lifecycle immediately. Waiting for MacWS's document-scroll
+                // threshold would first emit a scroll wheel, which Maps
+                // correctly interprets as zoom and cannot later reinterpret
+                // as a pan. The existing Dragging move/up/cancel path retains
+                // AppKit's synchronous control tracking and two-finger input
+                // still cancels this contact before magnification begins.
+                _directTouchState = MacWSDirectTouchStateDragging;
+                [self emitKind:MacWSInputKindTouchDown touch:touch
+                         point:_directTouchStartPoint];
+            }
         }
     } else if (!_trackpadTouch && touch) {
         _trackpadTouch = touch;
@@ -3290,7 +3445,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _pencilTouchTravel = MAX(_pencilTouchTravel,
             hypot(point.x - _pencilTouchStartPoint.x,
                   point.y - _pencilTouchStartPoint.y));
-        [self emitPencilHoverForTouch:_pencilTouch point:point];
+        [self emitKind:MacWSInputKindTouchMove touch:_pencilTouch point:point];
+        _pencilCursorView.center = point;
+        _pencilCursorView.hidden = NO;
+        [self bringSubviewToFront:_pencilCursorView];
     } else if (pointerTouch) {
         if (touch != _secondaryPointerTouch)
             [self emitTouches:touches kind:MacWSInputKindTouchMove];
@@ -3459,12 +3617,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _pencilTouchTravel = MAX(_pencilTouchTravel,
             hypot(point.x - _pencilTouchStartPoint.x,
                   point.y - _pencilTouchStartPoint.y));
-        // On pre-hover iPads contact movement is a precise, non-clicking
-        // preview. A short stationary contact retains normal Pencil tap.
-        if (_pencilTouchTravel < MACWS_DIRECT_GESTURE_THRESHOLD_POINTS &&
-            touch.timestamp - _pencilTouchBeganAt < 0.45) {
-            [self emitKind:MacWSInputKindTap touch:_pencilTouch point:point];
-        }
+        [self emitKind:MacWSInputKindTouchUp touch:_pencilTouch point:point];
         _pencilTouch = nil;
         _pencilCursorView.hidden = !_pencilHoverActive;
     } else if (pointerTouch) {
@@ -3654,6 +3807,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     UITouch *touch = touches.anyObject;
     BOOL pointerTouch = touch.type == UITouchTypeIndirectPointer;
     if (_pencilTouch && [touches containsObject:_pencilTouch]) {
+        [self emitKind:MacWSInputKindTouchCancel touch:_pencilTouch
+                 point:[_pencilTouch preciseLocationInView:self]];
         _pencilTouch = nil;
         _pencilCursorView.hidden = !_pencilHoverActive;
     } else if (pointerTouch) {
@@ -4298,6 +4453,67 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     }
 
+    if ([scenario isEqualToString:@"tap-burst"]) {
+        // A single click often produces no content frame (for example when
+        // it lands on an already-focused editor), so collect 24 ordinary
+        // clicks at 10 Hz and score their target NSApplication boundary
+        // directly. Keep the exact visible point selected above: offsetting
+        // it can cross an overlapping fullscreen layer and would measure a
+        // different real application on every other sample.
+        const NSInteger count = 24;
+        const uint64_t interval = 100 * NSEC_PER_MSEC;
+        CGPoint alternate = center;
+        if (_streamClient.mode == MacWSStreamModeFullscreen) {
+            int32_t centerPID = 0;
+            uint32_t centerWindowID = 0;
+            if ([self resolveFullscreenLayerAtPoint:center pid:&centerPID
+                                           windowID:&centerWindowID
+                                         descriptor:NULL]) {
+                static const CGFloat offsets[][2] = {
+                    {16.0, 0.0}, {-16.0, 0.0}, {0.0, 16.0},
+                    {0.0, -16.0}, {24.0, 0.0}, {-24.0, 0.0},
+                };
+                for (NSUInteger index = 0;
+                     index < sizeof(offsets) / sizeof(offsets[0]); index++) {
+                    CGPoint candidate = CGPointMake(
+                        center.x + offsets[index][0],
+                        center.y + offsets[index][1]);
+                    int32_t candidatePID = 0;
+                    uint32_t candidateWindowID = 0;
+                    if ([self resolveFullscreenLayerAtPoint:candidate
+                                                        pid:&candidatePID
+                                                   windowID:&candidateWindowID
+                                                 descriptor:NULL] &&
+                        candidatePID == centerPID &&
+                        candidateWindowID == centerWindowID) {
+                        alternate = candidate;
+                        break;
+                    }
+                }
+            }
+        } else {
+            alternate.x = fmin(width - 1.0, center.x + 16.0);
+        }
+        for (NSInteger index = 0; index < count; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         index * interval),
+                           dispatch_get_main_queue(), ^{
+                emitPointer(MacWSInputKindTap,
+                            (index & 1) ? alternate : center, 1.0f,
+                            MacWSInputFlagLatencyDiagnostic);
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     count * interval +
+                                     450 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end scenario=tap-burst "
+                     "success=YES");
+            finish(YES, @"真实应用 24 次点击响应场景已完成");
+        });
+        return;
+    }
+
     if ([scenario isEqualToString:@"drag"] ||
         [scenario isEqualToString:@"long-drag"]) {
         BOOL longPress = [scenario isEqualToString:@"long-drag"];
@@ -4350,11 +4566,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         BOOL momentum = [scenario isEqualToString:@"scroll-momentum"];
         if (magnify) {
             [self emitMagnifyAtFramePoint:center amount:0.0
-                flags:MacWSInputFlagGestureBegan
+                flags:MacWSInputFlagGestureBegan |
+                      MacWSInputFlagLatencyDiagnostic
                 timestamp:CACurrentMediaTime()];
         } else {
-            [self emitScrollAtFramePoint:center translation:CGPointZero
-                flags:MacWSInputFlagScrollBegan
+                [self emitScrollAtFramePoint:center translation:CGPointZero
+                flags:MacWSInputFlagScrollBegan |
+                      MacWSInputFlagLatencyDiagnostic
                 timestamp:CACurrentMediaTime()];
         }
         for (NSInteger index = 1; index <= steps; index++) {
@@ -4363,12 +4581,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                            dispatch_get_main_queue(), ^{
                 if (magnify) {
                     [self emitMagnifyAtFramePoint:center amount:0.004
-                        flags:MacWSInputFlagGestureChanged
+                        flags:MacWSInputFlagGestureChanged |
+                              MacWSInputFlagLatencyDiagnostic
                         timestamp:CACurrentMediaTime()];
                 } else {
                     [self emitScrollAtFramePoint:center
-                        translation:CGPointMake(0.0, -3.0)
-                        flags:MacWSInputFlagScrollChanged
+                        translation:CGPointMake(0.0, 3.0)
+                        flags:MacWSInputFlagScrollChanged |
+                              MacWSInputFlagLatencyDiagnostic
                         timestamp:CACurrentMediaTime()];
                 }
             });
@@ -4378,16 +4598,18 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                        dispatch_get_main_queue(), ^{
             if (magnify) {
                 [self emitMagnifyAtFramePoint:center amount:0.0
-                    flags:MacWSInputFlagGestureEnded
+                    flags:MacWSInputFlagGestureEnded |
+                          MacWSInputFlagLatencyDiagnostic
                     timestamp:CACurrentMediaTime()];
             } else {
                 [self emitScrollAtFramePoint:center translation:CGPointZero
                     flags:MacWSInputFlagScrollEnded |
+                          MacWSInputFlagLatencyDiagnostic |
                           (momentum ? MacWSInputFlagScrollWillMomentum : 0)
                     timestamp:CACurrentMediaTime()];
                 if (momentum) {
                     [self startScrollMomentumWithVelocity:
-                        CGPointMake(0.0, -900.0) framePoint:center];
+                        CGPointMake(0.0, 900.0) framePoint:center];
                 }
             }
         });
@@ -4640,8 +4862,23 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)streamClient:(MacWSStreamClient *)client
       receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
     (void)client;
-    MacWSLog(@"display-stream window-list count=%lu",
-             (unsigned long)windows.count);
+    NSMutableSet<NSNumber *> *spatialCanvasPIDs = [NSMutableSet set];
+    NSMutableSet<NSNumber *> *shadowWindowIDs = [NSMutableSet set];
+    for (MacWSStreamWindow *window in windows) {
+        if (window.descriptor.ownerPID > 1 &&
+            (window.descriptor.flags & MacWSStreamWindowSpatialCanvas) != 0)
+            [spatialCanvasPIDs addObject:@(window.descriptor.ownerPID)];
+        if (window.descriptor.windowID != 0 &&
+            (window.descriptor.flags & MacWSStreamWindowHasShadow) != 0)
+            [shadowWindowIDs addObject:@(window.descriptor.windowID)];
+    }
+    _spatialCanvasPIDs = [spatialCanvasPIDs copy];
+    _shadowWindowIDs = [shadowWindowIDs copy];
+    _directTouchUsesPrimaryDrag = self.targetPID > 1 &&
+        [_spatialCanvasPIDs containsObject:@(self.targetPID)];
+    if (MacWSHostDiagnosticsEnabled())
+        MacWSLog(@"display-stream window-list count=%lu",
+                 (unsigned long)windows.count);
     [self.statusDelegate metalView:self receivedWindows:windows];
 }
 
@@ -4725,6 +4962,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         [client releaseFrame:frame];
         [self publishStatus:@"无法从 DisplayStream IOSurface 创建 Metal 纹理"];
         return;
+    }
+    if (!overlayFrame) {
+        [_performanceMonitor recordBaseTransportFinalComposite:
+            ((frame.descriptor.flags &
+              MacWSStreamFrameFinalComposite) != 0)
+            streamID:frame.descriptor.streamID
+            sequence:frame.descriptor.sequence
+            surfaceID:incomingSurfaceID];
     }
     [_performanceMonitor recordFrameReceivedForStream:
         frame.descriptor.streamID sequence:frame.descriptor.sequence
@@ -5499,6 +5744,30 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
         [MacWSSceneCloseRequestsSent addObject:identifier];
         [MacWSSceneBindings removeObjectForKey:identifier];
         MacWSSetPersistedSceneBinding(identifier, nil);
+
+        // Runtime-confirmed on macOS 13.4 in this chroot: after Terminal's
+        // final window accepted performClose: and NSApplication terminated,
+        // lsappinfo immediately stopped listing the process but Dock retained
+        // its running dot. Restarting only Dock rebuilt the correct state via
+        // its imported _LSCopyRunningApplicationArray. Ask root hostd to do
+        // that bounded repair only after it proves this exact owner PID has
+        // exited. A vetoed close or a process with another window stays alive
+        // and therefore cannot trigger the repair.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     450 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSControlClient *client = [MacWSControlClient new];
+            [client performOperation:@MACWS_CONTROL_OP_REFRESH_DOCK
+                           arguments:@{
+                               @MACWS_CONTROL_KEY_TARGET_PID: @(ownerPID)
+                           }
+                          completion:^(NSDictionary<NSString *,id> *reply) {
+                MacWSLog(@"scene-close dock-refresh target=%d ok=%@ message=%@",
+                         ownerPID,
+                         [reply[@"ok"] boolValue] ? @"YES" : @"NO",
+                         reply[@"message"] ?: @"");
+            }];
+        });
     }
     MacWSLog(@"scene-close source=%@ id=%@ window=%u target=%d sent=%@ errno=%d",
              source ?: @"unknown", identifier, windowID, ownerPID,
@@ -9774,6 +10043,7 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"screenshot-ui", @"screenshot-screen",
                @"performance-snapshot", @"performance-reset",
                @"performance-gesture-suite", @"performance-gesture-tap",
+               @"performance-gesture-tap-burst",
                @"performance-gesture-double-tap",
                @"performance-gesture-right-tap",
                @"performance-gesture-hover",

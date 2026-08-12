@@ -24,6 +24,7 @@
 #import <sys/un.h>
 
 #include "macws_catalyst_drawable_protocol.h"
+#include "macws_final_composite_protocol.h"
 
 typedef void (*macws_present_drawable_fn)(id, SEL, id);
 static macws_present_drawable_fn macws_present_drawable_orig = NULL;
@@ -31,6 +32,224 @@ static _Atomic uint64_t macws_catalyst_drawable_sequence = 0;
 static pthread_mutex_t macws_catalyst_drawable_service_lock =
     PTHREAD_MUTEX_INITIALIZER;
 static mach_port_t macws_catalyst_drawable_service = MACH_PORT_NULL;
+
+static _Atomic uint64_t macws_final_composite_sequence = 0;
+// The first owned BGRA scanout is sampled once before it is exposed outside
+// WindowServer.  This retains the existing content-ready invariant that
+// rejects the early title-only/constant recovery surfaces.  After that
+// witness, every producer completion can publish the same coherent IOSurface
+// immediately; VNC's much more expensive CPU damage scan is independent.
+static _Atomic BOOL macws_final_composite_content_validated = NO;
+static pthread_mutex_t macws_final_composite_service_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static mach_port_t macws_final_composite_service = MACH_PORT_NULL;
+static uint64_t macws_final_composite_service_refresh_deadline_ns = 0;
+static _Atomic uint32_t macws_final_composite_failure_witnesses = 0;
+static _Atomic uint32_t macws_final_composite_lookup_witnesses = 0;
+static BOOL macws_is_owned_scanout_texture(id<MTLTexture> texture);
+static IOSurfaceRef macws_vnc_bound_surface(id<MTLTexture> texture);
+
+// Return a caller-owned send-right reference.  The cached reference is only
+// the lookup anchor: final-frame and VNC observers can publish concurrently,
+// so handing its bare name outside the lock lets one observer invalidate and
+// deallocate the right while the other is entering mach_msg.
+static mach_port_t macws_acquire_final_composite_service_port(void) {
+    struct timespec now = {0};
+    uint64_t nowNS = clock_gettime(CLOCK_MONOTONIC, &now) == 0
+        ? (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec : 0;
+    pthread_mutex_lock(&macws_final_composite_service_lock);
+    BOOL refreshDue = !MACH_PORT_VALID(macws_final_composite_service) ||
+        nowNS == 0 ||
+        nowNS >= macws_final_composite_service_refresh_deadline_ns;
+    if (refreshDue) {
+        mach_port_t service = MACH_PORT_NULL;
+        kern_return_t lookupResult = bootstrap_look_up(
+            bootstrap_port, MACWS_FINAL_COMPOSITE_MACH_SERVICE, &service);
+        if (lookupResult == BOOTSTRAP_SUCCESS && MACH_PORT_VALID(service)) {
+            if (service == macws_final_composite_service) {
+                // bootstrap_look_up added another user reference to the same
+                // send right. Keep one cached reference, not one per second.
+                (void)mach_port_deallocate(mach_task_self(), service);
+            } else {
+                mach_port_t previous = macws_final_composite_service;
+                macws_final_composite_service = service;
+                if (MACH_PORT_VALID(previous))
+                    (void)mach_port_deallocate(mach_task_self(), previous);
+            }
+        } else {
+            // Bounded production witness: this is the only evidence that can
+            // distinguish a dead cached right from launchd no longer exposing
+            // the replacement service in WindowServer's bootstrap namespace.
+            // It does not enable any of libmachook's frame-path diagnostics.
+            uint32_t witness = atomic_fetch_add_explicit(
+                &macws_final_composite_lookup_witnesses, 1,
+                memory_order_relaxed) + 1;
+            if (witness <= 8) {
+                dprintf(STDERR_FILENO,
+                    "#### FINAL-COMPOSITE bootstrap-lookup-failed "
+                    "witness=%u bootstrap=%u cached=%u returned=%u kr=%#x\n",
+                    witness, bootstrap_port,
+                    macws_final_composite_service, service, lookupResult);
+            }
+        }
+        // A bootstrap receive right can be replaced while the old send right
+        // remains valid enough for mach_msg to accept queued messages. A
+        // one-second lookup is the authoritative recovery witness; relying
+        // only on MACH_SEND_INVALID_DEST leaves Host on its startup canvas
+        // after a displayd relaunch.
+        macws_final_composite_service_refresh_deadline_ns = nowNS
+            ? nowNS + NSEC_PER_SEC : 0;
+    }
+    mach_port_t result = macws_final_composite_service;
+    if (MACH_PORT_VALID(result) && mach_port_mod_refs(
+            mach_task_self(), result, MACH_PORT_RIGHT_SEND, 1) !=
+            KERN_SUCCESS) {
+        // A dead cached endpoint cannot be leased to a sender.  Drop the
+        // cache entry now so the next acquisition performs a fresh launchd
+        // lookup rather than repeatedly returning an unusable name.
+        (void)mach_port_deallocate(mach_task_self(), result);
+        macws_final_composite_service = MACH_PORT_NULL;
+        macws_final_composite_service_refresh_deadline_ns = 0;
+        result = MACH_PORT_NULL;
+    }
+    pthread_mutex_unlock(&macws_final_composite_service_lock);
+    return result;
+}
+
+static void macws_invalidate_final_composite_service(
+        mach_port_t failedService) {
+    pthread_mutex_lock(&macws_final_composite_service_lock);
+    if (macws_final_composite_service == failedService) {
+        (void)mach_port_deallocate(mach_task_self(), failedService);
+        macws_final_composite_service = MACH_PORT_NULL;
+        macws_final_composite_service_refresh_deadline_ns = 0;
+    }
+    pthread_mutex_unlock(&macws_final_composite_service_lock);
+}
+
+static mach_msg_return_t macws_send_final_composite_message(
+        MacWSFinalCompositeMachMessage *message, mach_port_t service) {
+    if (!message || !MACH_PORT_VALID(service)) return MACH_SEND_INVALID_DEST;
+    message->header.msgh_remote_port = service;
+    return mach_msg(
+        &message->header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+        sizeof(*message), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+}
+
+static BOOL macws_publish_final_composite_surface(
+        IOSurfaceRef surface, uint32_t metalPixelFormat) {
+    if (!surface || metalPixelFormat !=
+            MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM) return NO;
+    size_t width = IOSurfaceGetWidth(surface);
+    size_t height = IOSurfaceGetHeight(surface);
+    size_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
+    uint32_t ioSurfacePixelFormat = IOSurfaceGetPixelFormat(surface);
+    if (ioSurfacePixelFormat == 0)
+        ioSurfacePixelFormat = MACWS_FINAL_COMPOSITE_BGRA;
+    MacWSFinalCompositeRecord record = {
+        .magic = MACWS_FINAL_COMPOSITE_MAGIC,
+        .version = MACWS_FINAL_COMPOSITE_VERSION,
+        .size = sizeof(MacWSFinalCompositeRecord),
+        .producerPID = getpid(),
+        .surfaceID = IOSurfaceGetID(surface),
+        .sequence = atomic_fetch_add_explicit(
+            &macws_final_composite_sequence, 1, memory_order_relaxed) + 1,
+        .completionTime = mach_absolute_time(),
+        .width = width <= UINT32_MAX ? (uint32_t)width : 0,
+        .height = height <= UINT32_MAX ? (uint32_t)height : 0,
+        .bytesPerRow = bytesPerRow <= UINT32_MAX
+            ? (uint32_t)bytesPerRow : 0,
+        .ioSurfacePixelFormat = ioSurfacePixelFormat,
+        .metalPixelFormat = metalPixelFormat,
+    };
+    if (!MacWSFinalCompositeRecordIsValid(&record, sizeof(record))) return NO;
+    mach_port_t service = macws_acquire_final_composite_service_port();
+    if (!MACH_PORT_VALID(service)) {
+        uint32_t witness = atomic_fetch_add_explicit(
+            &macws_final_composite_failure_witnesses, 1,
+            memory_order_relaxed) + 1;
+        if (witness <= 8) {
+            dprintf(STDERR_FILENO,
+                "#### FINAL-COMPOSITE publish-failed stage=bootstrap-lookup "
+                "witness=%u sequence=%llu surface=%u\n",
+                witness, (unsigned long long)record.sequence,
+                record.surfaceID);
+        }
+        return NO;
+    }
+    mach_port_t surfacePort = IOSurfaceCreateMachPort(surface);
+    if (!MACH_PORT_VALID(surfacePort)) {
+        uint32_t witness = atomic_fetch_add_explicit(
+            &macws_final_composite_failure_witnesses, 1,
+            memory_order_relaxed) + 1;
+        if (witness <= 8) {
+            dprintf(STDERR_FILENO,
+                "#### FINAL-COMPOSITE publish-failed stage=surface-port "
+                "witness=%u sequence=%llu surface=%u service=%u\n",
+                witness, (unsigned long long)record.sequence,
+                record.surfaceID, service);
+        }
+        (void)mach_port_deallocate(mach_task_self(), service);
+        return NO;
+    }
+    MacWSFinalCompositeMachMessage message = {0};
+    message.header.msgh_bits = MACH_MSGH_BITS(
+        MACH_MSG_TYPE_COPY_SEND, 0) | MACH_MSGH_BITS_COMPLEX;
+    message.header.msgh_size = sizeof(message);
+    message.header.msgh_remote_port = service;
+    message.header.msgh_local_port = MACH_PORT_NULL;
+    message.header.msgh_id = MACWS_FINAL_COMPOSITE_MACH_MESSAGE_ID;
+    message.body.msgh_descriptor_count = 1;
+    message.surfacePort.name = surfacePort;
+    message.surfacePort.disposition = MACH_MSG_TYPE_COPY_SEND;
+    message.surfacePort.type = MACH_MSG_PORT_DESCRIPTOR;
+    message.record = record;
+    mach_msg_return_t result =
+        macws_send_final_composite_message(&message, service);
+    if (result == MACH_SEND_INVALID_DEST) {
+        // The display daemon can replace its bootstrap receive right while
+        // this process still owns a stale send right. The first mach_msg then
+        // consumes no COPY_SEND surface right, so refresh once and replay the
+        // exact already-completed surface message. This makes a static desktop
+        // recover without requiring another WindowServer frame.
+        macws_invalidate_final_composite_service(service);
+        // Release this publisher's reference separately from the cache
+        // reference invalidated above, then acquire the replacement endpoint.
+        (void)mach_port_deallocate(mach_task_self(), service);
+        service = macws_acquire_final_composite_service_port();
+        if (MACH_PORT_VALID(service))
+            result = macws_send_final_composite_message(&message, service);
+    }
+    (void)mach_port_deallocate(mach_task_self(), surfacePort);
+    if (result == MACH_SEND_INVALID_DEST)
+        macws_invalidate_final_composite_service(service);
+    if (MACH_PORT_VALID(service))
+        (void)mach_port_deallocate(mach_task_self(), service);
+    if (result != MACH_MSG_SUCCESS) {
+        uint32_t witness = atomic_fetch_add_explicit(
+            &macws_final_composite_failure_witnesses, 1,
+            memory_order_relaxed) + 1;
+        if (witness <= 8) {
+            dprintf(STDERR_FILENO,
+                "#### FINAL-COMPOSITE publish-failed stage=mach-msg "
+                "witness=%u sequence=%llu surface=%u service=%u kr=%d\n",
+                witness, (unsigned long long)record.sequence,
+                record.surfaceID, service, result);
+        }
+    }
+    return result == MACH_MSG_SUCCESS;
+}
+
+static BOOL macws_publish_validated_final_composite_texture(
+        id<MTLTexture> texture) {
+    if (!atomic_load_explicit(&macws_final_composite_content_validated,
+                              memory_order_acquire) ||
+        !texture || [texture pixelFormat] != MTLPixelFormatBGRA8Unorm ||
+        !macws_is_owned_scanout_texture(texture)) return NO;
+    IOSurfaceRef surface = macws_vnc_bound_surface(texture);
+    return surface && macws_publish_final_composite_surface(
+        surface, (uint32_t)[texture pixelFormat]);
+}
 
 static mach_port_t macws_catalyst_drawable_service_port(void) {
     pthread_mutex_lock(&macws_catalyst_drawable_service_lock);
@@ -3670,6 +3889,10 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     }
     BOOL valid = readable && macws_vnc_content_ready(
         sampled, different, denseContentRows);
+    if (valid) {
+        atomic_store_explicit(&macws_final_composite_content_validated, YES,
+                              memory_order_release);
+    }
     BOOL committed = NO;
     if (valid) {
         if (!macws_vnc_mmap_publish_bgra_if_changed(
@@ -3679,6 +3902,42 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
     }
     if (!unlockedRead)
         IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
+    // Runtime-confirmed source boundary: this is the completed, process-owned
+    // BGRA target whose mmap copy drives OSXvnc. The initial validated frame
+    // is also the admission witness for the direct final-composite publisher.
+    // Later producer completions publish before this CPU damage scan, so this
+    // block only supplies the first frame and a five-second service-recovery
+    // replay. The receiver owns backpressure; no RFB encoding is introduced.
+    if (valid) {
+        // Damage-driven publication preserves the mmap path's proven idle
+        // suppression.  A five-second replay opportunity makes displayd
+        // recovery deterministic if it was relaunched while the desktop was
+        // static; failed sends do not advance this timestamp.
+        static _Atomic uint64_t lastFinalCompositePublication = 0;
+        uint64_t now = mach_absolute_time();
+        uint64_t last = atomic_load_explicit(
+            &lastFinalCompositePublication, memory_order_relaxed);
+        static mach_timebase_info_data_t timebase;
+        static dispatch_once_t timebaseOnce;
+        dispatch_once(&timebaseOnce, ^{
+            (void)mach_timebase_info(&timebase);
+        });
+        BOOL replayDue = last == 0;
+        if (!replayDue && timebase.denom && now >= last) {
+            long double elapsedNS = (long double)(now - last) *
+                timebase.numer / timebase.denom;
+            replayDue = elapsedNS >= 5.0e9L;
+        }
+        if ((atomic_load_explicit(
+                 &macws_final_composite_sequence, memory_order_relaxed) == 0 ||
+             replayDue) &&
+            macws_publish_final_composite_surface(
+                surface, (uint32_t)[texture pixelFormat])) {
+            atomic_store_explicit(&lastFinalCompositePublication, now,
+                                  memory_order_relaxed);
+        }
+    }
 
     static _Atomic uint64_t publishCount = 0;
     static _Atomic uint64_t rejectCount = 0;
@@ -5146,8 +5405,8 @@ void macws_vnc_complete_composite(void *context) {
 // completion.  A 10-second production sample accumulated 69 short-lived
 // __macws_vnc_finish_update_block_invoke threads, most sleeping/pixel-scanning
 // for only one or two samples before exit. A serial libdispatch queue preserves
-// the single-observer invariant and
-// invariant while reusing the process worker pool instead of creating ~10
+// the single-observer invariant while reusing the process worker pool instead
+// of creating ~10
 // NSThreads per second. The one-deep latest-state queue below now provides the
 // ownership/in-flight invariant.
 static dispatch_queue_t macws_vnc_completion_observer_queue(void) {
@@ -5159,6 +5418,84 @@ static dispatch_queue_t macws_vnc_completion_observer_queue(void) {
             DISPATCH_QUEUE_SERIAL);
     });
     return queue;
+}
+
+// Host's final-composite transport must not queue behind the 15.2-MiB CPU
+// compare/copy required by OSXvnc. Both consumers observe the same already-
+// committed producer command buffer, but this queue performs only a bounded
+// read-only status poll followed by an IOSurface Mach-right send. A one-deep
+// latest-state slot naturally coalesces frames if Host/displayd cannot keep
+// up, without retaining a chain of WindowServer scanouts.
+static dispatch_queue_t macws_final_completion_observer_queue(void) {
+    static dispatch_once_t once;
+    static dispatch_queue_t queue;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create(
+            "com.macwsguide.final-composite-observer",
+            DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static NSObject *g_final_completion_pending_lock = nil;
+static id<MTLCommandBuffer> g_final_completion_pending_command = nil;
+static id<MTLTexture> g_final_completion_pending_texture = nil;
+static _Atomic int g_final_completion_worker_running = 0;
+
+static void macws_enqueue_final_completion_observation(
+        id<MTLCommandBuffer> commandBuffer, id<MTLTexture> texture) {
+    if (!commandBuffer || !texture) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_final_completion_pending_lock = [NSObject new];
+    });
+
+    id<MTLCommandBuffer> retainedCommand = macws_vnc_retain(commandBuffer);
+    id<MTLTexture> retainedTexture = macws_vnc_retain(texture);
+    @synchronized(g_final_completion_pending_lock) {
+        id oldCommand = g_final_completion_pending_command;
+        id oldTexture = g_final_completion_pending_texture;
+        g_final_completion_pending_command = retainedCommand;
+        g_final_completion_pending_texture = retainedTexture;
+        macws_vnc_release(oldCommand);
+        macws_vnc_release(oldTexture);
+    }
+    if (atomic_exchange(&g_final_completion_worker_running, 1)) return;
+
+    dispatch_async(macws_final_completion_observer_queue(), ^{
+        for (;;) {
+            @autoreleasepool {
+                id<MTLCommandBuffer> pendingCommand = nil;
+                id<MTLTexture> pendingTexture = nil;
+                @synchronized(g_final_completion_pending_lock) {
+                    if (!g_final_completion_pending_command ||
+                        !g_final_completion_pending_texture) {
+                        atomic_store(&g_final_completion_worker_running, 0);
+                        return;
+                    }
+                    pendingCommand = g_final_completion_pending_command;
+                    pendingTexture = g_final_completion_pending_texture;
+                    g_final_completion_pending_command = nil;
+                    g_final_completion_pending_texture = nil;
+                }
+                MTLCommandBufferStatus status = [pendingCommand status];
+                unsigned polls = 0;
+                while (status != MTLCommandBufferStatusCompleted &&
+                       status != MTLCommandBufferStatusError && polls < 2000) {
+                    usleep(1000);
+                    status = [pendingCommand status];
+                    polls++;
+                }
+                if (status == MTLCommandBufferStatusCompleted &&
+                    ![pendingCommand error]) {
+                    (void)macws_publish_validated_final_composite_texture(
+                        pendingTexture);
+                }
+                macws_vnc_release(pendingCommand);
+                macws_vnc_release(pendingTexture);
+            }
+        }
+    });
 }
 
 // Completion observation is a latest-state stream, not a FIFO.  A static UI
@@ -5590,6 +5927,16 @@ void macws_vnc_finish_update(void *context) {
     // Ownership of both retained objects transfers to the one-deep latest
     // queue.  Replacing a pending source releases it immediately; the worker
     // releases the selected pair after observing producer completion.
+    // The Host branch takes its own bounded retains and runs independently of
+    // the CPU damage scanner below.
+    // Only the process-owned display target can contain the coherent final
+    // SkyLight frame.  Enqueuing every unrelated PF80 render target allowed a
+    // later small/intermediate texture to replace that final target in the
+    // one-deep slot before the observer ran, even though the slower VNC worker
+    // eventually sampled the owned target.  Filter at the ownership boundary
+    // instead of teaching the consumer to guess which PF80 was intended.
+    if (pixelFormat == 80 && macws_is_owned_scanout_texture(texture))
+        macws_enqueue_final_completion_observation(commandBuffer, texture);
     macws_vnc_enqueue_completion_observation(
         commandBuffer, texture, context, deepCapture, diagnostics,
         submitSerial);

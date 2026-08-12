@@ -13,13 +13,14 @@
 #define MACWS_STREAM_INVALIDATE_SOCKET_PATH \
     "/private/tmp/macws_display_invalidate.sock"
 #define MACWS_STREAM_MAGIC 0x4d575354u /* "MWST" */
-// Version 6 separates ordered layer geometry transactions from IOSurface
-// content frames. Version 5 republished the same IOSurface Mach right and
-// acquired another lease for every native Spaces/Mission Control position;
-// that multiplied one 60-Hz catalog sample by every moving desktop layer.
+// Version 7 adds an explicit final-composite base-frame flag. Version 6
+// separated ordered layer geometry transactions from IOSurface content
+// frames. Version 5 republished the same IOSurface Mach right and acquired
+// another lease for every native Spaces/Mission Control position; that
+// multiplied one 60-Hz catalog sample by every moving desktop layer.
 // Keep this as a hard wire boundary so an old daemon cannot silently send a
 // message shape that a new Host interprets without the sequence invariant.
-#define MACWS_STREAM_VERSION 6u
+#define MACWS_STREAM_VERSION 7u
 
 #define MACWS_STREAM_MAX_DIMENSION 16384u
 #define MACWS_STREAM_MAX_BYTES_PER_ROW (MACWS_STREAM_MAX_DIMENSION * 16u)
@@ -81,6 +82,12 @@ enum {
     MacWSStreamWindowMenuBar = 1u << 4,
     MacWSStreamWindowTransient = 1u << 5,
     MacWSStreamWindowFocused = 1u << 6,
+    // The owning application presents a spatial canvas whose primary direct-
+    // touch manipulation is button-down dragging, not document scrolling.
+    // AppInputBridge derives this from the real bundle identity and publishes
+    // it with each native window; Host never guesses from localized titles or
+    // control coordinates. Two-finger magnification remains independent.
+    MacWSStreamWindowSpatialCanvas = 1u << 7,
 };
 
 typedef uint32_t MacWSStreamFrameFlags;
@@ -98,6 +105,11 @@ enum {
     // participate in Metal composition but must never become the hit-test
     // owner for a touch at the cursor's own position.
     MacWSStreamFrameInputPassthrough = 1u << 6,
+    // This fullscreen base is WindowServer's completed native AGX composite,
+    // not the graphite workspace canvas. It already contains every SkyLight
+    // layer and compositor-only effect. Host keeps overlay descriptors and
+    // surfaces for hit testing, but must not paint them over these pixels.
+    MacWSStreamFrameFinalComposite = 1u << 7,
 };
 
 // Title bytes immediately follow this descriptor in a window-list item.  The
@@ -388,6 +400,16 @@ static inline bool MacWSStreamFrameDescriptorIsValid(
         descriptor->destinationY > (int32_t)MACWS_STREAM_MAX_DIMENSION) {
         return false;
     }
+    uint32_t allowedFlags = MacWSStreamFrameComplete |
+        MacWSStreamFrameHasDamage | MacWSStreamFrameSizeChanged |
+        MacWSStreamFrameOccluded | MacWSStreamFrameOverlay |
+        MacWSStreamFrameGlobalSystemSurface |
+        MacWSStreamFrameInputPassthrough |
+        MacWSStreamFrameFinalComposite;
+    if ((descriptor->flags & ~allowedFlags) != 0) return false;
+    if ((descriptor->flags & MacWSStreamFrameFinalComposite) != 0 &&
+        ((descriptor->flags & MacWSStreamFrameOverlay) != 0 ||
+         descriptor->windowID != 0)) return false;
     return (uint64_t)descriptor->bytesPerRow * descriptor->height <= SIZE_MAX;
 }
 

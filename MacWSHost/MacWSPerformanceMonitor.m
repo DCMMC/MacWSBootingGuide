@@ -151,6 +151,10 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     uint64_t _pendingInputMachTime;
     uint16_t _pendingInputKind;
     int32_t _pendingInputTargetPID;
+    BOOL _finalCompositeActive;
+    uint64_t _baseTransportStreamID;
+    uint64_t _baseTransportSequence;
+    uint32_t _baseTransportSurfaceID;
 
     MacWSPerfRing _sourceIntervals;
     MacWSPerfRing _presentIntervals;
@@ -349,6 +353,18 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     os_unfair_lock_unlock(&_lock);
 }
 
+- (void)recordBaseTransportFinalComposite:(BOOL)finalComposite
+                                  streamID:(uint64_t)streamID
+                                  sequence:(uint64_t)sequence
+                                 surfaceID:(uint32_t)surfaceID {
+    os_unfair_lock_lock(&_lock);
+    _finalCompositeActive = finalComposite;
+    _baseTransportStreamID = streamID;
+    _baseTransportSequence = sequence;
+    _baseTransportSurfaceID = surfaceID;
+    os_unfair_lock_unlock(&_lock);
+}
+
 - (void)recordSourceForStream:(uint64_t)streamID
                      sequence:(uint64_t)sequence
                 layerWindowID:(uint32_t)layerWindowID
@@ -471,7 +487,9 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         if (source->dirtySinceSubmission && _pendingInputMachTime &&
             source->lastReceiptTime >= _pendingInputMachTime &&
             (_pendingInputTargetPID <= 1 ||
-             source->ownerPID == _pendingInputTargetPID))
+             source->ownerPID == _pendingInputTargetPID ||
+             (_finalCompositeActive &&
+              source->streamID == _baseTransportStreamID)))
             inputTargetUpdated = YES;
         source->dirtySinceSubmission = false;
     }
@@ -605,6 +623,10 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     uint64_t staleCaptureSamples = _staleCaptureSamples;
     uint64_t lastStream = _lastSubmittedStream;
     uint64_t lastSequence = _lastSubmittedSequence;
+    BOOL finalCompositeActive = _finalCompositeActive;
+    uint64_t baseTransportStreamID = _baseTransportStreamID;
+    uint64_t baseTransportSequence = _baseTransportSequence;
+    uint32_t baseTransportSurfaceID = _baseTransportSurfaceID;
     uint64_t resetTime = _resetMachTime;
     NSDate *resetDate = _resetDate;
     NSString *resetReason = _resetReason;
@@ -687,6 +709,12 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
             @"input_active_window_ms":
                 @(MacWSPerfInputActiveWindowMilliseconds),
         },
+        @"presentation_transport": @{
+            @"final_composite_active": @(finalCompositeActive),
+            @"base_stream": @(baseTransportStreamID),
+            @"base_sequence": @(baseTransportSequence),
+            @"base_surface": @(baseTransportSurfaceID),
+        },
         @"visible_presentation": @{
             @"active_average_fps": @(averageFPS),
             @"one_percent_low_fps": @(onePercentLowFPS),
@@ -735,7 +763,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
             @"Observed frame interval remains available for autonomous animation/WebGL workloads that do not emit input.",
             @"Source cadence is tracked independently by producer stream/owner; the aggregate includes every active desktop layer and must not be used to score one target app.",
             @"Content IOSurface frames and lease-free layer geometry transactions have separate counters.",
-            @"Input latency pairs the oldest unrepresented Host input only with a subsequently captured DisplayStream frame owned by that input target PID.",
+            @"Input latency pairs the oldest unrepresented Host input with a subsequently captured target-owned frame, or with the authoritative WindowServer final-composite base when that transport is active.",
             @"Synthetic transport probes do not measure physical finger-to-UIKit recognizer latency.",
         ],
     };

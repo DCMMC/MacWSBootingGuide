@@ -25,6 +25,8 @@ THRESHOLDS = {
     "minimum_one_percent_low_fps": 45.0,
     "maximum_input_bridge_p95_ms": 8.0,
     "maximum_input_to_visible_p95_ms": 50.0,
+    "maximum_real_app_main_dispatch_p95_ms": 16.7,
+    "maximum_real_app_click_complete_p95_ms": 50.0,
     "minimum_motion_60_delivery_hz": 45.0,
     "minimum_motion_120_delivery_hz": 60.0,
     "maximum_command_errors": 0,
@@ -66,6 +68,36 @@ def percentile(values, fraction):
     index = max(0, min(len(ordered) - 1,
                        int(len(ordered) * fraction + 0.999999) - 1))
     return ordered[index]
+
+
+def summarize_real_app_input_latency(records):
+    def summary(key):
+        values = [float(item[key]) / 1000.0 for item in records
+                  if key in item]
+        return {
+            "samples": len(values),
+            "p50_ms": percentile(values, 0.50),
+            "p95_ms": percentile(values, 0.95),
+            "maximum_ms": max(values) if values else None,
+        }
+    completed = [
+        (float(item["total_us"]) + float(item["dispatch_us"])) / 1000.0
+        for item in records
+        if "total_us" in item and "dispatch_us" in item
+    ]
+    return {
+        "samples": len(records),
+        "producer_to_main": summary("total_us"),
+        "transport": summary("transport_us"),
+        "main_queue": summary("queue_us"),
+        "appkit_dispatch": summary("dispatch_us"),
+        "producer_to_appkit_complete": {
+            "samples": len(completed),
+            "p50_ms": percentile(completed, 0.50),
+            "p95_ms": percentile(completed, 0.95),
+            "maximum_ms": max(completed) if completed else None,
+        },
+    }
 
 
 def thermal_snapshot(remote):
@@ -127,7 +159,7 @@ def wait_for_profile(remote, previous_marker, timeout=8.0):
             # Host commits latest.json with NSDataWritingAtomic.  Seconds and
             # byte size can legitimately repeat for adjacent gesture exports;
             # the atomic replacement's inode is the generation witness.
-            f"stat -f '%m:%z:%i' {path} 2>/dev/null || true",
+            f"stat -c '%Y:%s:%i' {path} 2>/dev/null || true",
             check=False).strip()
         if marker and marker != previous_marker:
             return marker, json.loads(remote.run(f"cat {path}"))
@@ -137,7 +169,7 @@ def wait_for_profile(remote, previous_marker, timeout=8.0):
 
 def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
     scenarios = [
-        "tap", "double-tap", "right-tap", "hover", "drag", "long-drag",
+        "tap", "tap-burst", "double-tap", "right-tap", "hover", "drag", "long-drag",
         "scroll", "scroll-momentum", "magnify",
     ]
     if dock_pid > 1:
@@ -154,8 +186,13 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
     for name in scenarios:
         latest_path = "/var/mobile/Library/Logs/MacWSPerformance/latest.json"
         previous_marker = remote.run(
-            f"stat -f '%m:%z:%i' {latest_path} 2>/dev/null || true",
+            f"stat -c '%Y:%s:%i' {latest_path} 2>/dev/null || true",
             check=False).strip()
+        latency_path = ("/var/mnt/rootfs/private/tmp/"
+                        f"macws_input_latency.{target_pid}.jsonl")
+        latency_offset = int(remote.run(
+            f"wc -c < {latency_path} 2>/dev/null || printf 0",
+            check=False).strip() or 0)
         remote.run("uiopen macwshost://performance-reset")
         time.sleep(0.25)
         offset = int(remote.run(
@@ -187,20 +224,47 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
         })
         if not success:
             raise RuntimeError(f"Host gesture scenario failed: {name}")
-        time.sleep(0.45)
+        latency_records = []
+        if name == "tap-burst":
+            # CGPostMouseEvent enters the target application's real main-loop
+            # tracker asynchronously. On Terminal a 24-click burst can finish
+            # at the Host while the final AppKit completions are still
+            # draining. Wait for the declared scenario sample count instead
+            # of scoring a timing-dependent prefix.
+            latency_deadline = time.monotonic() + 3.0
+            while time.monotonic() < latency_deadline:
+                delta = remote.run(
+                    f"tail -c +{latency_offset + 1} {latency_path} "
+                    "2>/dev/null || true", check=False)
+                latency_records = []
+                for line in delta.splitlines():
+                    try:
+                        latency_records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+                if len(latency_records) >= 24:
+                    break
+                time.sleep(0.1)
+        else:
+            time.sleep(0.45)
         remote.run("uiopen macwshost://performance-snapshot")
         marker, profile = wait_for_profile(remote, previous_marker)
+        app_input_latency = summarize_real_app_input_latency(
+            latency_records)
         fluid = name in {
             "hover", "drag", "long-drag", "scroll", "scroll-momentum",
             "magnify", "three-up", "three-down", "three-left", "three-right",
         }
         results[-1]["profile_marker"] = marker
         results[-1]["performance"] = profile
+        results[-1]["app_input_latency"] = app_input_latency
         results[-1]["score"] = score_profile(
             profile, target_pid=(dock_pid if name.startswith("three-")
                                  else target_pid),
             system_gesture=name.startswith("three-"),
-            require_fluid_metrics=fluid)
+            require_fluid_metrics=fluid,
+            require_click_latency=name == "tap-burst",
+            app_input_latency=app_input_latency)
     return results
 
 
@@ -259,16 +323,23 @@ def select_motion_source(profile, target_pid, system_gesture):
 
 
 def score_profile(profile, *, target_pid, system_gesture=False,
-                  require_fluid_metrics=True):
+                  require_fluid_metrics=True, require_click_latency=False,
+                  app_input_latency=None):
     visible = profile.get("visible_presentation", {})
     counters = profile.get("counters", {})
     motion_source = select_motion_source(profile, target_pid, system_gesture)
+    transport = profile.get("presentation_transport", {})
+    final_composite_active = bool(
+        transport.get("final_composite_active", False))
     # Mission Control/Spaces is one native compositor animation assembled
     # from several Dock, WindowServer and application layers.  No individual
     # source represents what the user saw; score the final drawable cadence.
-    # Ordinary app gestures remain source-scoped so unrelated desktop layers
-    # cannot inflate one application's result.
-    motion_metric = visible if system_gesture else motion_source
+    # In final-composite mode the WindowServer-owned base is the presentation
+    # authority. Per-window streams remain diagnostic metadata but are no
+    # longer pixels painted by the Host, so scoring them would measure the
+    # retired reconstruction path rather than what the user saw.
+    motion_metric = (visible if system_gesture or final_composite_active
+                     else motion_source)
     frame = motion_metric.get("frame_interval", {})
     input_visible = profile.get("pipeline", {}).get(
         "input_dispatch_to_visible_callback", {})
@@ -294,10 +365,33 @@ def score_profile(profile, *, target_pid, system_gesture=False,
             input_visible["p95_ms"] <=
                 THRESHOLDS["maximum_input_to_visible_p95_ms"],
         })
+    if require_click_latency:
+        app_input_latency = app_input_latency or {}
+        main = app_input_latency.get("producer_to_main", {})
+        complete = app_input_latency.get(
+            "producer_to_appkit_complete", {})
+        checks.update({
+            "enough_click_response_samples":
+                app_input_latency.get("samples", 0) >=
+                    THRESHOLDS["minimum_input_visible_samples"],
+            "real_app_main_dispatch_p95":
+                main.get("p95_ms") is not None and
+                main["p95_ms"] <= THRESHOLDS[
+                    "maximum_real_app_main_dispatch_p95_ms"],
+            "real_app_click_complete_p95":
+                complete.get("p95_ms") is not None and
+                complete["p95_ms"] <= THRESHOLDS[
+                    "maximum_real_app_click_complete_p95_ms"],
+        })
     return {
         "result": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
         "target_source": motion_source,
+        "presentation_transport": transport,
+        "scored_cadence": ("visible_final_composite"
+                            if final_composite_active
+                            else ("visible_system_gesture"
+                                  if system_gesture else "target_source")),
         "visible_presentation": visible,
     }
 
@@ -317,6 +411,11 @@ def main():
     parser.add_argument("--width", type=int, default=1728)
     parser.add_argument("--height", type=int, default=1312)
     parser.add_argument("--skip-system-gestures", action="store_true")
+    parser.add_argument(
+        "--skip-semantic-gate", action="store_true",
+        help=("profile a real application instead of InputLab; keep the "
+              "end-to-end Host/DisplayStream measurements but skip the "
+              "InputLab-only event log and motion-delivery assertions"))
     parser.add_argument(
         "--scenarios",
         help=("comma-separated subset for an optimization iteration; the "
@@ -372,11 +471,24 @@ def main():
                             if item.strip()] if args.scenarios else None)
     gestures = execute_gesture_suite(remote, dock_pid, target_pid,
                                      requested_scenarios)
-    input_gate = input_semantic_gate(remote, args.remote_repo, target_pid)
+    input_gate = (input_semantic_gate(remote, args.remote_repo, target_pid)
+                  if not args.skip_semantic_gate else {
+                      "result": "SKIPPED_REAL_APP",
+                      "reason": ("InputLab event-log semantics are not "
+                                 "available inside an unmodified real app"),
+                  })
     after_processes = process_snapshot(remote)
+    # GUI applications normally run as root in the chroot while this harness
+    # connects as mobile. `kill -0` therefore returns EPERM for a healthy
+    # target and falsely reports a crash. Read the process table instead; this
+    # is the same non-mutating identity witness used by process_snapshot().
+    target_alive_after = remote.run(
+        f"ps -p {target_pid} -o pid= 2>/dev/null | tr -d ' '",
+        check=False).strip() == str(target_pid)
     after_thermal = thermal_snapshot(remote)
     fluid_scenarios = [item for item in gestures
                        if item["scenario"] in {
+                           "tap-burst",
                            "hover", "drag", "long-drag", "scroll",
                            "scroll-momentum", "magnify", "three-up",
                            "three-down", "three-left", "three-right",
@@ -400,7 +512,10 @@ def main():
         for name in stability_names)
     checks = {
         "profile": profile_score["result"] == "PASS",
-        "input": input_gate["result"] == "PASS",
+        "input": (input_gate["result"] == "PASS" or
+                  (args.skip_semantic_gate and
+                   input_gate["result"] == "SKIPPED_REAL_APP")),
+        "target_process_stability": target_alive_after,
         "process_stability": stable_processes,
         "thermal_not_critical": after_thermal["state"] != "critical",
     }
@@ -410,6 +525,7 @@ def main():
         "device": args.host,
         "target_pid": target_pid,
         "target_window": args.window,
+        "target_alive_after": target_alive_after,
         "host_focus_witness": focus_witness,
         "thresholds": THRESHOLDS,
         "checks": checks,
@@ -430,6 +546,10 @@ def main():
             "Wire replay excludes physical finger-to-UIKit recognizer latency.",
             "A real-finger run can use the same reset/export controls to add that boundary.",
             "A MacBook run is calibration-only and is not required for this fixed-floor gate.",
+            ("InputLab-only event-name and synthetic delivery-rate checks "
+             "were skipped for this real application."
+             if args.skip_semantic_gate else
+             "InputLab semantic and delivery-rate gates were included."),
         ],
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

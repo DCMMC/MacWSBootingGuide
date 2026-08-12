@@ -40,6 +40,12 @@ variables. `MallocScribble` is explicitly forbidden.
 - Direct/wrapped KCMD translation, cancelled-swap completion, owned BGRA
   scanout and the VNC mmap bridge are enabled for the current coexistence
   implementation.
+- The same completed owned BGRA scanout is published to macwsdisplayd through
+  the authenticated `com.macwsguide.display.final-composite` Mach service.
+  Fullscreen Host imports that IOSurface directly and therefore preserves
+  WindowServer-only shadows, backdrop materials and warped animations without
+  RFB or the VNC CPU damage scan. This is a production invariant, not a new
+  environment/file switch; exact layers remain subscribed for hit testing.
 - Validated custom-path apps, generic Catalyst children, and the stock
   UIKitSystem service receive the scoped `MACWS_APP_MOUNT_COMPAT=1` namespace
   contract. UIKitSystem owns the CoreServices repository used while Catalyst

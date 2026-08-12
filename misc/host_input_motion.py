@@ -9,7 +9,8 @@ import struct
 import time
 
 from host_input_matrix import (
-    SOURCE_FINGER, TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP, record, resolve_window,
+    SOURCE_FINGER, SOURCE_PENCIL, TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP, record,
+    resolve_window,
 )
 
 
@@ -43,12 +44,21 @@ def main():
     parser.add_argument("--height", type=int, default=1312)
     parser.add_argument("--duration", type=float, default=3.0)
     parser.add_argument("--hz", type=float, default=60.0)
+    parser.add_argument("--source", choices=("finger", "pencil"),
+                        default="finger")
+    parser.add_argument("--pressure", type=float, default=0.72,
+                        help="Pencil pressure for move records (0...1)")
+    parser.add_argument("--tilt-x", type=float, default=0.18)
+    parser.add_argument("--tilt-y", type=float, default=-0.12)
     parser.add_argument("--socket",
                         default="/var/mnt/rootfs/private/tmp/macws_host_input.sock")
     parser.add_argument("--log",
                         default="/var/mnt/rootfs/private/tmp/macws_inputlab_events.jsonl")
     args = parser.parse_args()
-    if args.pid <= 1 or args.duration <= 0 or args.hz <= 0:
+    if (args.pid <= 1 or args.duration <= 0 or args.hz <= 0 or
+            not 0.0 <= args.pressure <= 1.0 or
+            not -1.0 <= args.tilt_x <= 1.0 or
+            not -1.0 <= args.tilt_y <= 1.0):
         parser.error("pid/duration/hz must be positive")
     window = resolve_window(args.pid, args.window)
     baseline = len(read_events(args.log))
@@ -59,17 +69,21 @@ def main():
     contact = 0x4D4F544E  # "MOTN"
     sequence = 1
 
+    input_source = SOURCE_PENCIL if args.source == "pencil" else SOURCE_FINGER
+
     def send(kind, x, y, pressure):
         nonlocal sequence
         sock.sendto(record(kind, sequence, args.pid, window,
                            args.width, args.height, x, y,
                            pressure=pressure, contact=contact,
-                           source=SOURCE_FINGER), args.socket)
+                           source=input_source, altitude=0.9, azimuth=0.35,
+                           tilt_x=args.tilt_x, tilt_y=args.tilt_y), args.socket)
         sequence += 1
 
     sample_count = max(2, round(args.duration * args.hz))
     started = time.time()
-    send(TOUCH_DOWN, 520, 520, 1.0)
+    active_pressure = args.pressure if input_source == SOURCE_PENCIL else 1.0
+    send(TOUCH_DOWN, 520, 520, active_pressure)
     deadline = time.perf_counter()
     for index in range(sample_count):
         # Three smooth traversals within InputLab's canvas.  The endpoint
@@ -81,7 +95,7 @@ def main():
             fraction = 1.0 - fraction
         x = 520.0 + fraction * 660.0
         y = 520.0 + 70.0 * math.sin(index * 2.0 * math.pi / 60.0)
-        send(TOUCH_MOVE, x, y, 1.0)
+        send(TOUCH_MOVE, x, y, active_pressure)
         deadline += 1.0 / args.hz
         delay = deadline - time.perf_counter()
         if delay > 0:
@@ -108,6 +122,7 @@ def main():
         "result": "PASS" if ("left_down" in names and
                                "left_up" in names and drags) else "FAIL",
         "transport": "MacWSInputRecord-v4 (no RFB)",
+        "source": args.source,
         "pid": args.pid,
         "window": window,
         "requested_hz": args.hz,

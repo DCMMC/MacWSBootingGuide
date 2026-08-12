@@ -31,6 +31,14 @@ typedef NS_ENUM(NSInteger, MacWSPerformanceHUDMode) {
               targetPID:(int32_t)targetPID
        transportSuccess:(BOOL)success;
 
+// Records the presentation authority independently of measurement state.
+// A final-composite base is WindowServer-owned by construction, so input
+// latency must correlate against this base rather than a target-PID layer.
+- (void)recordBaseTransportFinalComposite:(BOOL)finalComposite
+                                  streamID:(uint64_t)streamID
+                                   sequence:(uint64_t)sequence
+                                  surfaceID:(uint32_t)surfaceID;
+
 - (void)recordFrameReceivedForStream:(uint64_t)streamID
                             sequence:(uint64_t)sequence
                        layerWindowID:(uint32_t)layerWindowID

@@ -2599,3 +2599,31 @@ reported zero Metal command errors, and left the fixed release gate unchanged.
 Residual failures are now isolated to visible tails: sub-45-FPS ordinary 1%
 lows, 108–125 ms horizontal p99 gaps, and 65.94 ms right-Space
 input-to-visible p95.
+
+## 2026-08-12: authoritative final composite restores native effects
+
+Fullscreen Host no longer tries to reconstruct compositor-only pixels from
+rectangular per-window streams. WindowServer publishes its real completed
+native-AGX BGRA scanout through an authenticated Mach message; displayd
+validates the audit PID, executable path, ABI, sequence and IOSurface geometry,
+then sends it through the existing bounded Host lease as protocol v7's
+`MacWSStreamFrameFinalComposite`. Exact layer surfaces stay alive for input
+hit testing but are not painted twice.
+
+This single upstream change made the Host show the same external Terminal
+shadow, Dock backdrop blur and native Genie minimize warp already visible to
+VNC. A real Terminal/desktop gesture soak reached final base sequence 6504,
+82.94 visible FPS, 47.98 FPS 1% low, 0.863 ms GPU p95 and 2.565 ms
+capture-to-Host p95 with 661/661 input records, zero Metal command errors,
+stable service PIDs and nominal temperature. Full protocol, evidence and
+remaining lifecycle boundary are recorded in
+[`final-composite-effects-20260812.md`](final-composite-effects-20260812.md).
+
+The performance exporter was then taught the transport invariant explicitly.
+When `presentation_transport.final_composite_active` is true, the final
+WindowServer base—not a now-diagnostic target window stream—is the authority
+for visible cadence and input response. A real Terminal rerun passed drag,
+scroll, momentum and magnify at 72.03–79.97 FPS, 47.98 FPS 1% low, zero
+hitches/stalls and zero Metal errors at 35.79 °C. Thresholds were unchanged;
+the independent AppKit burst-click latency gate remains visible as unfinished
+work.

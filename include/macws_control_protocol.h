@@ -2,7 +2,7 @@
 #define MACWS_CONTROL_PROTOCOL_H
 
 #define MACWS_CONTROL_SERVICE "com.macwsguide.host.control"
-#define MACWS_CONTROL_VERSION 4u
+#define MACWS_CONTROL_VERSION 5u
 
 #define MACWS_CONTROL_KEY_OP "op"
 #define MACWS_CONTROL_KEY_APP_ID "app_id"
@@ -14,6 +14,7 @@
 #define MACWS_CONTROL_KEY_DNS_FAMILY "dns_family"
 #define MACWS_CONTROL_KEY_DNS_SOCKTYPE "dns_socktype"
 #define MACWS_CONTROL_KEY_DNS_PROTOCOL "dns_protocol"
+#define MACWS_CONTROL_KEY_TARGET_PID "target_pid"
 
 #define MACWS_CONTROL_OP_STATUS "status"
 #define MACWS_CONTROL_OP_START "start"
@@ -25,5 +26,6 @@
 #define MACWS_CONTROL_OP_CAPTURE "capture"
 #define MACWS_CONTROL_OP_LOGS "logs"
 #define MACWS_CONTROL_OP_RESOLVE_HOST "resolve-host"
+#define MACWS_CONTROL_OP_REFRESH_DOCK "refresh-dock"
 
 #endif

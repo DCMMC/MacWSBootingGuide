@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-06；单窗/完整桌面 IOSurface 直传、瞬态窗口分层合成、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 已运行真实 Appearance ExtensionKit 页面，Maps 已通过持续存活的 UIKit carrier 与 UIKitSystem/FrontBoard 身份链冷启动并显示原生窗口；证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。全屏冷恢复的实时证据为 `status-hidden=YES`、`home-indicator-auto-hide=YES`、Scene bounds 等于 screen bounds；Dock/Launchpad 与右上角 Control Center 点击也有可见状态变化证据。2026-08-06 的真实手指验收确认弹出菜单和单指滚动惯性均达到预期；长按拖动的全屏坐标负反馈根因已用运行轨迹确认并修复部署，等待修复后的真实手指最终复验。四窗与完整性能门槛仍单列为未完成。
+> 文档状态：2026-08-12；单窗 DisplayStream、全屏 WindowServer 最终 AGX 合成 IOSurface、瞬态窗口输入图、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。全屏 Host 已直接显示与 VNC 同源的最终合成像素，窗口外部阴影、Dock 毛玻璃和 Genie 最小化变形不再由分层窗口近似重建。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 与 Maps 证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。完整最终合成协议、视觉和性能证据见 [`final-composite-effects-20260812.md`](final-composite-effects-20260812.md)。四窗与完整长期压力门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -16,7 +16,7 @@
 
 | 核心工作 | 非常简要的工作原理 | 当前状态 |
 |---|---|---|
-| DisplayStream 直传 | SkyLight 窗口流产生 IOSurface，XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture；完整桌面按真实窗口目录分层合成 | 精确基础窗、同 owner 瞬态层和 2388×1668 完整 Aqua 桌面均已在 iPad runtime-confirmed |
+| 原生 IOSurface 直传 | 单窗由 SkyLight 精确窗口流产生 IOSurface；全屏由 WindowServer 发布已完成的最终 AGX BGRA scanout。XPC 只传 Mach right 和描述符，Host 直接创建 Metal texture；全屏窗口目录/精确层继续保留但只负责命中测试 | 精确基础窗、2388×1668 最终 Aqua 桌面、窗口阴影、Dock blur 和 Genie 动画均已在 iPad runtime-confirmed |
 | macOS 窗口 → iPadOS Scene | 每个 Scene 保存当前真实 `CGWindowID`、owner PID 和稳定逻辑窗口组，独立订阅、恢复和释放；新 macOS 顶层窗口稳定后自动请求一个新 Scene；工作区复用当前 Scene 并调用 SpringBoard 自己的全屏 action 17 | 新窗口目录 1→2 后自动创建 Scene、精确 FBS Scene 系统全屏、iOS 状态栏隐藏与 Home Indicator 自动隐藏均已 runtime-confirmed |
 | 台前调度密集尺寸与初始大小 | SpringBoard `Chamois` 保存可选宽高数组；参考 TrollPad 增加候选档位。新 Scene 再以真实 macOS frame 为建议尺寸，走 `SBMutableSwitcherTransitionRequest → SBMainWorkspace` | 密集网格已 runtime-confirmed；精确 Scene 初始尺寸事务为 RE-confirmed、已实现和部署，待 v6 自然装载后验证小面板尺寸 |
 | 比例稳定显示 | 1× 始终完整等比；重排交接期允许短暂边距，不拉伸、不裁边 | 已实现并有纯 C 单测 |
@@ -27,7 +27,7 @@
 | 全屏桌面手势 | 全屏工作区的屏幕虚拟触控板识别三指方向手势，发送一次性 macOS 桌面命令；外接妙控板保留 iPadOS 系统三指手势 | 规划；桌面命令路径与设备输入边界待验证 |
 | Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 精确 PID/window、generation 快照和动作桥已实现；macOS 外观、hover/键盘导航与复杂菜单仍待完善 |
 | 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
-| 性能与稳定性 | 每个基础/瞬态 producer 独立最多三帧在途，Metal 完成后才释放 surface；慢消费者丢新帧而不阻塞 WindowServer | 输入约 60 Hz/亚毫秒；120 次滚动压力中最后一帧 capture→Metal complete 约 10.0 ms、drop=0，完整可见响应和四窗仍待验收 |
+| 性能与稳定性 | 每个基础/瞬态 producer 独立最多三帧在途；最终合成以一深度 latest-state observer 合并积压，Producer 完成后才发布，Host Metal 完成后释放消费 lease | 最终合成真实手势 soak 为 82.94 可见 FPS、47.98 FPS 1% low、GPU p95 0.863 ms、0 次 Metal error；四窗和长期压力仍待验收 |
 
 ### 3. 端到端结构
 
@@ -41,14 +41,16 @@ macOS 应用进程
              ▼
 macwsdisplayd（macOS 13.4 chroot）
   ├─ 窗口目录：CGWindowID + owner PID + logical group + AppKit 最小尺寸
-  ├─ 全屏：Retina IOSurface 底层 + 完整 on-screen SkyLight 窗口目录
+  ├─ 全屏画面：接收 WindowServer 已完成的最终 AGX BGRA IOSurface
+  ├─ 全屏输入：完整 on-screen SkyLight 窗口目录 + 精确层命中图
   └─ 单窗：精确基础窗口 + 同 owner 菜单/弹窗/Sheet 各自的
            SLSHWCaptureStreamCreateWithWindow
              │ IOSurface Mach right + 帧描述符；无 RFB 编解码
              ▼
 MacWSHost（iPadOS）
   ├─ 一个 macOS 窗口对应一个 UIWindowScene
-  ├─ 多个 IOSurface → 多个 MTLTexture → 按 SkyLight level 合成到 MTKView
+  ├─ 单窗按 SkyLight level 合成；全屏只绘最终合成 MTLTexture
+  ├─ 全屏精确层不重复绘制，仅用于指针/触摸 owner 命中
   ├─ 等比视口、缩放、遮罩、密度选择
   └─ Scene 顶部语义菜单 / 触摸 / 全屏桌面手势 / 妙控键盘 / 拖放 / 剪贴板
              │ 84-byte v4 有版本输入记录
@@ -62,7 +64,7 @@ macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 2. 不绕过 AppKit 约束。最终窗口尺寸必须由应用自己的 `minSize`、`contentMinSize` 和 style mask 决定；Host 只能提出请求。
 3. 缩放只改变视口，不改变应用状态。恢复缩放是可预测、无损的本地操作。
 4. 密度切换要求 macOS 应用真正重排。不能只把同一张图缩放，否则文字会糊、命中区域也不会改善。
-5. 直传失败必须可观察。mmap/VNC 只是诊断和兼容路径，不能静默伪装成 IOSurface 直传。
+5. 直传失败必须可观察。全屏最终合成和 VNC 读取同一 WindowServer owned scanout，但 Host 不经过 VNC/RFB，也不等待其 CPU damage scan；mmap/VNC 只是诊断和兼容路径，不能静默伪装成 IOSurface 直传。
 6. 进程存活不是稳定性证据。帧序号、完成回调、输入结果、内存上界和可见画面才是证据。
 
 ## 二、产品交互设计
@@ -297,15 +299,21 @@ iPadOS 的三指左/右滑撤销/重做属于 UIKit 标准编辑交互，应用�
 
 ### 1. DisplayStream 与 IOSurface 生命周期
 
-全屏路径：
+全屏画面路径：
 
 ```text
-CGDisplayStreamCreateWithDispatchQueue(main display)
-  → IOSurfaceRef callback
-  → retain + lease token
-  → IOSurfaceCreateMachPort
-  → XPC
+WindowServer owned BGRA scanout producer command buffer
+  → completed 且 error == nil
+  → 一深度 latest-state observer
+  → IOSurface Mach right + MWFC v1 record
+  → macwsdisplayd audit/PID/geometry/sequence 校验
+  → 既有 bounded lease/XPC
+  → Host final-composite Metal texture
 ```
+
+全屏输入目录仍以 SkyLight on-screen window graph 和精确层 stream 为准；
+这些 surface 不再覆盖绘制到 final-composite base。最终合成服务尚未收到首帧时，
+displayd 才保留旧 workspace canvas 作为显式启动回退。
 
 单窗路径：
 
@@ -331,7 +339,7 @@ IOSurfaceLookupFromMachPort
 - 消费者落后时 producer 丢弃新帧并累计 `droppedFrames`，不能阻塞 SkyLight 回调或无限增长内存。
 - 畸形描述符、错误窗口 ID、几何不匹配、非 BGRA surface 都必须立即释放对应 lease。
 - Scene 后台化或取消订阅时先提交空 command buffer 作为 fence，再释放仍可能被 GPU 采样的 surface。
-- 直传路径没有 framebuffer memcpy、`replaceRegion`、RFB 压缩或 RFB 解压。mmap upload 只在 display service 不可用或尚未收到第一帧时作为显式回退。
+- Host 直传路径没有 framebuffer memcpy、`replaceRegion`、RFB 压缩或 RFB 解压。VNC 独立保留自己的 CPU damage scan；最终合成发布在 producer completion 后的独立队列完成，不等待这次扫描。mmap upload 只在 display service 不可用或尚未收到第一帧时作为显式回退。
 
 ### 2. 窗口目录与 AppKit 最小尺寸
 
@@ -568,11 +576,11 @@ NSMainMenu
 - runtime-confirmed via `macwsdisplayd.err` + 双客户端集成探针（2026-08-03）：完整桌面捕获图是唯一物理资源。新的前台全屏 Scene 直接接管仍在运行的 stream/layer 对象和各层最后一张 IOSurface，不 stop/recreate SkyLight 捕获流。正式包的 witness 为 `workspace-handoff stream=1 layers=11 ... transport=live-graph-transfer`，WindowServer PID `78356` 和 displayd PID `79399` 交接前后不变；对照失败实现曾得到 PID `75537 → 78356` 和 `layer-start failed ... error=-308`。Host 在新代际首帧前提交黑色 Metal clear，旧单窗 drawable 不会被系统全屏动画放大成伪桌面。完整证据见 [`fullscreen-aqua-workspace-20260802.md`](fullscreen-aqua-workspace-20260802.md)。
 - runtime-confirmed via `MacWSHost.log`（2026-08-02）：从 Terminal window 21/group 16 进入桌面后，第二次同一 action 记录 `scene-reused mode=window restored-from-workspace window=21 owner=35681 group=16 scene-size=1194.0x807.0`；持久化字典从 `mode=1, return_window_id=21` 回到 `mode=2, window_id=21`。Host 进程重建与 DisplayStream 服务重连后仍能恢复该精确窗口身份。
 - runtime-confirmed via设备端 Host UI 截图（`/var/mobile/Library/Logs/MacWSHost-ui.png`）：全屏画面没有 Host 语义菜单栏，保留完整 macOS 原生菜单栏和右上角独立材质按钮；展开控制中心为不透出桌面颜色的浅色实底，标签、分段控件与按钮对比度一致。
-- 当前画面性能尚未达标：关闭 `OSXvnc-server` 和全屏 mmap producer 后，同一动态窗口的接受序号 120→240 用时 3.210 秒（37.4 fps），240→360 用时 3.106 秒（38.6 fps）；producer 同期记录 `outstanding=2/3` 和持续 drop。带 VNC 会话的同负载为约 38–40 fps，因此 RFB/mmap 已被 A/B 排除为主因。这里只把剩余瓶颈归到 DisplayStream/lease/presentation 边界，具体根因仍需新的运行或 RE 证据。
+- 历史分层全屏路径的同一动态窗口只有约 37–40 fps，并出现 `outstanding=2/3` 与 drop；该数据仍描述精确 layer source，不再代表 2026-08-12 的全屏像素路径。最终合成实测为 82.94 可见 FPS、47.98 FPS 1% low、20.842 ms p95、0.863 ms GPU p95、2.565 ms capture→Host p95，661/661 输入、0 Metal error。完整边界见 [`final-composite-effects-20260812.md`](final-composite-effects-20260812.md)。
 
 仍待确认或修复：
 
-- 全屏 Retina canvas、完整 on-screen SkyLight z-order、原生菜单栏和动态 Terminal 首帧已经 runtime-confirmed；Dock、多个 Space、持续动态负载和 IOSurface 内存上界仍待独立压力验证。生产 Host 不再用 mmap 静默掩盖该路径。
+- 全屏 Retina final composite、完整 on-screen SkyLight 命中图、原生菜单栏、Dock blur、窗口外阴影、Genie 变形和动态 Terminal 首帧已经 runtime-confirmed；多个 Space、持续视频负载、四 Scene 与长期 IOSurface 内存上界仍待独立压力验证。生产 Host 不再用 mmap 静默掩盖该路径。
 - v6 自然装载后验证精确 FBS Scene 的 action 11 是否产生真实 `isFullScreen=YES`、Scene bounds 变化、状态栏/Home Indicator 隐藏以及原 Scene session 不变；不能用内容铺满当前小 Scene 代替。
 - v6 自然装载后从真实小型 macOS utility panel 创建新 Scene，记录请求尺寸、`resize-performed ... route=SBMainWorkspace`、最终 Scene bounds 和 AppKit frame；静态 RE 与构建成功不能替代这条运行证据。
 - 四个前台 Scene 在台前调度下持续稳定。

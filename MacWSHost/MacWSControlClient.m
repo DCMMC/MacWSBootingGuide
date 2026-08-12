@@ -121,9 +121,18 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
             if ([value isKindOfClass:NSString.class])
                 xpc_dictionary_set_string(request, key.UTF8String,
                                           [value UTF8String]);
-            else if ([value isKindOfClass:NSNumber.class])
-                xpc_dictionary_set_bool(request, key.UTF8String,
-                                        [value boolValue]);
+            else if ([value isKindOfClass:NSNumber.class]) {
+                // Most historical numeric arguments are protocol booleans.
+                // A process identity must retain its complete value so hostd
+                // can prove that the exact closing application exited before
+                // it repairs Dock's stale running-application cache.
+                if ([key isEqualToString:@MACWS_CONTROL_KEY_TARGET_PID])
+                    xpc_dictionary_set_int64(request, key.UTF8String,
+                                             [value longLongValue]);
+                else
+                    xpc_dictionary_set_bool(request, key.UTF8String,
+                                            [value boolValue]);
+            }
         }];
         xpc_connection_send_message_with_reply(self.connection, request,
             self.connectionQueue, ^(xpc_object_t reply) {

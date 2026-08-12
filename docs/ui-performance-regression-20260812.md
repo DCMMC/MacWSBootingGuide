@@ -127,3 +127,39 @@ thirteen-gesture run completed every Host replay but failed afterward because
 the final atomic replacement shared those two values with its predecessor.
 The runner now includes the replacement inode in the marker. This is a test
 framework correction; it does not relax any performance threshold.
+
+## Final-composite presentation removes the reconstruction bottleneck
+
+Later on 2026-08-12, fullscreen presentation moved from repainting every exact
+SkyLight layer to importing WindowServer's already completed native-AGX BGRA
+scanout. The exact graph remains active for input hit testing, but Host does not
+draw it over a `MacWSStreamFrameFinalComposite` base. This also fixes shadows,
+backdrop materials and Genie frames; see
+[`final-composite-effects-20260812.md`](final-composite-effects-20260812.md).
+
+The final-composite publisher initially waited behind VNC's full CPU damage
+scan and delivered only about 20.6 base frames/s. Moving only the completed
+surface publication to a one-deep serial observer removed that dependency. A
+real Terminal scroll/long-drag/three-finger soak then recorded 82.94 visible
+FPS, 47.98 FPS 1% low, 20.842 ms p95, 0.863 ms GPU p95, 2.565 ms
+capture-to-Host p95, 661/661 input records and zero command errors at nominal
+thermal state. The earlier 49–55 FPS exact-layer measurements remain valid for
+those source streams; they are no longer the fullscreen pixel presentation
+path.
+
+Profiler schema v1 now makes that authority explicit through
+`presentation_transport.final_composite_active` and the current base
+stream/sequence/surface. Only when this runtime field is true does the fixed
+gate score ordinary gestures using final drawable cadence; legacy
+reconstruction mode remains target-source scoped. The same flag also lets the
+Host pair pending target input with the subsequent WindowServer final base,
+whose owner PID is intentionally not the application PID. No threshold was
+changed. A real Terminal verification then passed drag, scroll, momentum and
+magnify: 72.03–79.97 visible FPS, 47.98 FPS 1% low, zero hitches, zero >50-ms
+stalls, zero Metal errors and a passing input-to-visible p95 gate at nominal
+35.79 °C. The separate 24-click AppKit main-dispatch p95 remained 19.98 ms
+against its 15-ms gate and is preserved as a distinct responsiveness target.
+The clean production package was then installed without restarting
+WindowServer. Its exact installed Host binary passed a focused rerun at
+83.23 FPS for drag and 72.21 FPS for scroll, both at 47.98 FPS 1% low with
+zero hitches, stalls, or Metal errors and nominal 36.50 °C.

@@ -5,6 +5,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdatomic.h>
@@ -15,7 +16,11 @@
 
 #include "macws_menu_protocol.h"
 #include "macws_display_geometry.h"
+#include "macws_final_composite_protocol.h"
 #include "macws_stream_protocol.h"
+
+extern pid_t audit_token_to_pid(audit_token_t token);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
 // macOS 13.4 SkyLight RE witness (binary UUID
 // 96676A53-B1E0-3D7E-B98B-B73873CD1880):
@@ -44,6 +49,14 @@ static dispatch_queue_t MenuQueue;
 static dispatch_queue_t WorkspaceGeometryQueue;
 static NSMutableSet *Clients;
 static NSMutableDictionary<NSNumber *, id> *Leases;
+// The latest WindowServer-owned final AGX composite is retained independently
+// of any Host Scene. A foreground fullscreen subscriber can therefore acquire
+// the current native desktop immediately without waiting for unrelated damage.
+static IOSurfaceRef FinalCompositeSurface;
+static MacWSFinalCompositeRecord FinalCompositeRecord;
+static dispatch_source_t FinalCompositeSource;
+static mach_port_t FinalCompositeReceivePort = MACH_PORT_NULL;
+static _Atomic uint32_t FinalCompositeRejectWitnesses;
 // A SkyLight popup can disappear while its final AGX command buffer is still
 // retiring.  Keep the capture object alive for a bounded grace period instead
 // of synchronously stopping it from the catalog-removal stack.
@@ -104,8 +117,19 @@ static void RequestWorkspaceGeometrySample(void);
 static void ScheduleGeometryStreamRestart(void);
 static void ScheduleCatalogBroadcast(void);
 static void EnqueueRetiredTransientStop(dispatch_block_t stopBlock);
+static void StartFinalCompositeReceiver(void);
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static BOOL MacWSDisplayDiagnosticsEnabled(void) {
+    static BOOL enabled;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MACWS_DISPLAY_DIAGNOSTICS");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    });
+    return enabled;
+}
+
 static void DisplayLog(NSString *format, ...) {
     va_list args;
     va_start(args, format);
@@ -185,6 +209,11 @@ static int MacWSCompareFrameInterval(const void *left, const void *right) {
 }
 
 - (void)finishActiveFrameBurstWithReason:(NSString *)reason {
+    if (!MacWSDisplayDiagnosticsEnabled()) {
+        _activeFrameIntervalCount = 0;
+        _activeFrameIntervalCursor = 0;
+        return;
+    }
     NSUInteger count = MIN(_activeFrameIntervalCount,
                            sizeof(_activeFrameIntervalsMS) /
                                sizeof(_activeFrameIntervalsMS[0]));
@@ -217,6 +246,7 @@ static int MacWSCompareFrameInterval(const void *left, const void *right) {
 }
 
 - (void)recordActiveFrameAtDisplayTime:(uint64_t)displayTime {
+    if (!MacWSDisplayDiagnosticsEnabled()) return;
     if (!_latestDisplayTime || displayTime <= _latestDisplayTime) return;
     static mach_timebase_info_data_t timebase;
     static dispatch_once_t onceToken;
@@ -581,8 +611,9 @@ static MacWSStreamWindowDescriptor WindowDescriptor(
     };
     if (metrics) {
         descriptor.flags |= metrics->flags &
-            (MacWSStreamWindowVisible | MacWSStreamWindowResizable |
-             MacWSStreamWindowFocused);
+            (MacWSStreamWindowVisible | MacWSStreamWindowHasShadow |
+             MacWSStreamWindowResizable |
+             MacWSStreamWindowFocused | MacWSStreamWindowSpatialCanvas);
     }
     if ([info[(id)kCGWindowIsOnscreen] boolValue])
         descriptor.flags |= MacWSStreamWindowOnScreen;
@@ -760,7 +791,18 @@ static NSDictionary *StreamProperties(void) {
         (__bridge id)kCGDisplayStreamQueueDepth: @3,
         (__bridge id)kCGDisplayStreamShowCursor: @NO,
         (__bridge id)kCGDisplayStreamPreserveAspectRatio: @YES,
-        (__bridge id)kCGDisplayStreamMinimumFrameTime: @(1.0 / 60.0),
+        // The coexist compositor is paced at 120 Hz only during the bounded
+        // one-second interaction window. Capping exact-window capture at 60
+        // Hz forced a fresh VS Code frame to miss every other compositor
+        // completion and runtime-measured 18.2 ms mean source intervals plus
+        // 20.9 ms during momentum. A 120-Hz A/B restored 59 FPS average but
+        // delivered bursts into an application/final-present path that is
+        // currently near 60 Hz, increasing 33-66 ms tail gaps. A 90-Hz A/B
+        // reduced the tails but momentum fell to 55.9 source FPS. Test the
+        // midpoint at 100 Hz to retain the phase tolerance without needlessly
+        // filling the three-surface lease queue. A static window still
+        // produces no CGDisplayStream callback.
+        (__bridge id)kCGDisplayStreamMinimumFrameTime: @(1.0 / 100.0),
     } mutableCopy];
     CFStringRef *surfacePropertiesKey = dlsym(
         RTLD_DEFAULT, "kSLDisplayStreamIOSurfaceProperties");
@@ -885,6 +927,10 @@ static void PublishFrame(MacWSDisplayClient *client,
 
     CGFloat scale = client.windowBackingScale > 0.0
         ? client.windowBackingScale : MainDisplayBackingScale();
+    BOOL finalComposite = !layer &&
+        client.mode == MacWSStreamModeFullscreen &&
+        surface == FinalCompositeSurface &&
+        FinalCompositeRecord.producerPID > 1;
     MacWSStreamFrameDescriptor descriptor = {
         .magic = MACWS_STREAM_MAGIC,
         .version = MACWS_STREAM_VERSION,
@@ -892,6 +938,8 @@ static void PublishFrame(MacWSDisplayClient *client,
         .streamID = producerStreamID,
         .windowID = client.windowID,
         .flags = MacWSStreamFrameComplete |
+                 (finalComposite
+                     ? MacWSStreamFrameFinalComposite : 0) |
                  (layer ? MacWSStreamFrameOverlay : 0) |
                  (layer && [layer.ownerName isEqualToString:@"Dock"]
                      ? MacWSStreamFrameGlobalSystemSurface : 0) |
@@ -935,7 +983,8 @@ static void PublishFrame(MacWSDisplayClient *client,
     }
     uint64_t firstDisplayTime = layer ? layer.firstDisplayTime
                                       : client.firstDisplayTime;
-    if ((descriptor.sequence % 120) == 0 &&
+    if (MacWSDisplayDiagnosticsEnabled() &&
+        (descriptor.sequence % 120) == 0 &&
         displayTime >= firstDisplayTime) {
         static mach_timebase_info_data_t timebase;
         static dispatch_once_t onceToken;
@@ -974,6 +1023,214 @@ static void PublishFrame(MacWSDisplayClient *client,
                               lease.token);
     xpc_connection_send_message(client.connection, event);
     mach_port_deallocate(mach_task_self(), port);
+}
+
+static BOOL FinalCompositeProducerIsWindowServer(pid_t pid) {
+    if (pid <= 1) return NO;
+    char path[PATH_MAX] = {0};
+    int length = proc_pidpath(pid, path, sizeof(path));
+    if (length <= 0 || length >= (int)sizeof(path)) return NO;
+    path[sizeof(path) - 1] = '\0';
+    // Runtime-confirmed on the Ventura 13.4 rootfs: proc_pidpath resolves the
+    // framework's public Resources symlink through Versions/A, while earlier
+    // launch records preserved the public path.  Accept only these two exact
+    // WindowServer executable suffixes; the audit-token PID must still match
+    // the record PID before this path check is reached.
+    static const char versionedPath[] =
+        "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/"
+        "Resources/WindowServer";
+    static const char publicPath[] =
+        "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/"
+        "WindowServer";
+    return strcmp(path, versionedPath) == 0 || strcmp(path, publicPath) == 0;
+}
+
+static void DeliverFinalComposite(
+        IOSurfaceRef surface, MacWSFinalCompositeRecord record) {
+    if (!surface) return;
+    if (FinalCompositeRecord.producerPID == record.producerPID &&
+        FinalCompositeRecord.sequence >= record.sequence) return;
+    IOSurfaceRef oldSurface = FinalCompositeSurface;
+    FinalCompositeSurface = (IOSurfaceRef)CFRetain(surface);
+    FinalCompositeRecord = record;
+    if (oldSurface) CFRelease(oldSurface);
+
+    NSUInteger subscribers = 0;
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive || client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen) continue;
+        subscribers++;
+        PublishFrame(client, nil, record.completionTime,
+                     FinalCompositeSurface);
+    }
+    static BOOL loggedFirstAcceptedFrame = NO;
+    if (!loggedFirstAcceptedFrame || MacWSDisplayDiagnosticsEnabled()) {
+        loggedFirstAcceptedFrame = YES;
+        DisplayLog(@"final-composite-received producer=%d sequence=%llu "
+                   "surface=%u size=%ux%u bpr=%u subscribers=%lu",
+                   record.producerPID,
+                   (unsigned long long)record.sequence, record.surfaceID,
+                   record.width, record.height, record.bytesPerRow,
+                   (unsigned long)subscribers);
+    }
+}
+
+static void StartFinalCompositeReceiver(void) {
+    mach_port_t receivePort = MACH_PORT_NULL;
+    kern_return_t result = bootstrap_check_in(
+        bootstrap_port, MACWS_FINAL_COMPOSITE_MACH_SERVICE, &receivePort);
+    if (result != BOOTSTRAP_SUCCESS || !MACH_PORT_VALID(receivePort)) {
+        DisplayLog(@"final-composite check-in failed service=%s kr=%d port=%u",
+                   MACWS_FINAL_COMPOSITE_MACH_SERVICE, result, receivePort);
+        return;
+    }
+    FinalCompositeReceivePort = receivePort;
+    FinalCompositeSource = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_MACH_RECV, (uintptr_t)receivePort, 0,
+        DisplayQueue);
+    dispatch_source_set_event_handler(FinalCompositeSource, ^{
+        for (;;) {
+            _Alignas(8) uint8_t bytes[
+                sizeof(MacWSFinalCompositeMachMessage) +
+                MAX_TRAILER_SIZE] = {0};
+            MacWSFinalCompositeMachMessage *message =
+                (MacWSFinalCompositeMachMessage *)bytes;
+            mach_msg_return_t received = mach_msg(
+                &message->header,
+                MACH_RCV_MSG | MACH_RCV_TIMEOUT |
+                    MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+                    MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
+                0, sizeof(bytes), receivePort, 0, MACH_PORT_NULL);
+            if (received == MACH_RCV_TIMED_OUT) break;
+            if (received != MACH_MSG_SUCCESS) {
+                DisplayLog(@"final-composite receive failed kr=%d",
+                           received);
+                break;
+            }
+            mach_port_t surfacePort = message->surfacePort.name;
+            mach_msg_audit_trailer_t *trailer =
+                (mach_msg_audit_trailer_t *)(bytes +
+                    round_msg(message->header.msgh_size));
+            BOOL trailerValid =
+                (uint8_t *)(trailer + 1) <= bytes + sizeof(bytes) &&
+                trailer->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0 &&
+                trailer->msgh_trailer_size >= sizeof(*trailer);
+            pid_t senderPID = trailerValid
+                ? audit_token_to_pid(trailer->msgh_audit) : -1;
+            BOOL envelopeValid =
+                message->header.msgh_id ==
+                    MACWS_FINAL_COMPOSITE_MACH_MESSAGE_ID &&
+                message->header.msgh_size == sizeof(*message) &&
+                (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+                message->body.msgh_descriptor_count == 1 &&
+                message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
+                MACH_PORT_VALID(surfacePort) && trailerValid;
+            if (!envelopeValid) {
+                // Destroy only a descriptor the kernel actually delivered as
+                // part of a complex message. Treating arbitrary bytes from an
+                // invalid envelope as a received right could deallocate an
+                // unrelated name in this task.
+                BOOL receivedPortDescriptor =
+                    (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+                    message->body.msgh_descriptor_count == 1 &&
+                    message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
+                    MACH_PORT_VALID(surfacePort);
+                if (receivedPortDescriptor)
+                    (void)mach_port_deallocate(
+                        mach_task_self(), surfacePort);
+                uint32_t witness = atomic_fetch_add(
+                    &FinalCompositeRejectWitnesses, 1) + 1;
+                if (witness <= 8) {
+                    DisplayLog(@"final-composite-rejected stage=envelope "
+                               "witness=%u id=%d size=%u bits=%#x "
+                               "descriptors=%u type=%u port=%u trailer=%@",
+                               witness, message->header.msgh_id,
+                               message->header.msgh_size,
+                               message->header.msgh_bits,
+                               message->body.msgh_descriptor_count,
+                               message->surfacePort.type, surfacePort,
+                               trailerValid ? @"valid" : @"invalid");
+                }
+                continue;
+            }
+            MacWSFinalCompositeRecord record = message->record;
+            BOOL recordValid = MacWSFinalCompositeRecordIsValid(
+                &record, sizeof(record));
+            BOOL pidValid = record.producerPID == senderPID;
+            BOOL producerValid =
+                FinalCompositeProducerIsWindowServer(senderPID);
+            if (!recordValid || !pidValid || !producerValid) {
+                (void)mach_port_deallocate(mach_task_self(), surfacePort);
+                uint32_t witness = atomic_fetch_add(
+                    &FinalCompositeRejectWitnesses, 1) + 1;
+                if (witness <= 8) {
+                    char producerPath[PATH_MAX] = {0};
+                    (void)proc_pidpath(senderPID, producerPath,
+                                      sizeof(producerPath));
+                    DisplayLog(@"final-composite-rejected stage=identity "
+                               "witness=%u record=%@ record-pid=%d "
+                               "sender-pid=%d pid-match=%@ producer=%@ "
+                               "path=%s sequence=%llu surface=%u",
+                               witness, recordValid ? @"valid" : @"invalid",
+                               record.producerPID, senderPID,
+                               pidValid ? @"YES" : @"NO",
+                               producerValid ? @"YES" : @"NO",
+                               producerPath,
+                               (unsigned long long)record.sequence,
+                               record.surfaceID);
+                }
+                continue;
+            }
+            IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surfacePort);
+            (void)mach_port_deallocate(mach_task_self(), surfacePort);
+            if (!surface) {
+                uint32_t witness = atomic_fetch_add(
+                    &FinalCompositeRejectWitnesses, 1) + 1;
+                if (witness <= 8) {
+                    DisplayLog(@"final-composite-rejected stage=surface-lookup "
+                               "witness=%u producer=%d sequence=%llu "
+                               "surface=%u",
+                               witness, senderPID,
+                               (unsigned long long)record.sequence,
+                               record.surfaceID);
+                }
+                continue;
+            }
+            BOOL surfaceValid = IOSurfaceGetID(surface) == record.surfaceID &&
+                IOSurfaceGetWidth(surface) == record.width &&
+                IOSurfaceGetHeight(surface) == record.height &&
+                IOSurfaceGetBytesPerRow(surface) == record.bytesPerRow &&
+                (IOSurfaceGetPixelFormat(surface) == 0 ||
+                 IOSurfaceGetPixelFormat(surface) ==
+                    record.ioSurfacePixelFormat);
+            if (surfaceValid) {
+                DeliverFinalComposite(surface, record);
+            } else {
+                uint32_t witness = atomic_fetch_add(
+                    &FinalCompositeRejectWitnesses, 1) + 1;
+                if (witness <= 8) {
+                    DisplayLog(@"final-composite-rejected stage=surface "
+                               "witness=%u producer=%d sequence=%llu "
+                               "expected=(%u %ux%u bpr=%u pf=%08x) "
+                               "actual=(%u %zux%zu bpr=%zu pf=%08x)",
+                               witness, senderPID,
+                               (unsigned long long)record.sequence,
+                               record.surfaceID, record.width, record.height,
+                               record.bytesPerRow,
+                               record.ioSurfacePixelFormat,
+                               IOSurfaceGetID(surface),
+                               IOSurfaceGetWidth(surface),
+                               IOSurfaceGetHeight(surface),
+                               IOSurfaceGetBytesPerRow(surface),
+                               IOSurfaceGetPixelFormat(surface));
+                }
+            }
+            CFRelease(surface);
+        }
+    });
+    dispatch_resume(FinalCompositeSource);
+    DisplayLog(@"final-composite receiver-ready service=%s port=%u",
+               MACWS_FINAL_COMPOSITE_MACH_SERVICE, receivePort);
 }
 
 static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
@@ -1167,6 +1424,11 @@ static double WorkspaceMachMilliseconds(uint64_t start, uint64_t end) {
 static void FinishWorkspaceGeometryBurst(void) {
     if (!WorkspaceGeometryBurstActive) return;
     WorkspaceGeometryBurstActive = NO;
+    if (!MacWSDisplayDiagnosticsEnabled()) {
+        WorkspaceGeometryQueryDurationCount = 0;
+        WorkspaceGeometryQueryDurationCursor = 0;
+        return;
+    }
     NSUInteger count = MIN(WorkspaceGeometryQueryDurationCount,
         sizeof(WorkspaceGeometryQueryDurationsMS) /
             sizeof(WorkspaceGeometryQueryDurationsMS[0]));
@@ -1507,13 +1769,18 @@ static void StartClientStream(MacWSDisplayClient *client) {
                        @"无法创建 Retina 桌面 IOSurface 画布", NO);
             return;
         }
-        PublishFrame(client, nil, mach_absolute_time(),
-                     client.workspaceCanvas);
-        DisplayLog(@"workspace-start id=%llu display=%zux%zu scale=%.3f transport=window-iosurface-composite",
+        IOSurfaceRef base = FinalCompositeSurface
+            ? FinalCompositeSurface : client.workspaceCanvas;
+        uint64_t baseTime = FinalCompositeSurface
+            ? FinalCompositeRecord.completionTime : mach_absolute_time();
+        PublishFrame(client, nil, baseTime, base);
+        DisplayLog(@"workspace-start id=%llu display=%zux%zu scale=%.3f transport=%@",
                    (unsigned long long)client.streamID,
-                   IOSurfaceGetWidth(client.workspaceCanvas),
-                   IOSurfaceGetHeight(client.workspaceCanvas),
-                   client.windowBackingScale);
+                   IOSurfaceGetWidth(base), IOSurfaceGetHeight(base),
+                   client.windowBackingScale,
+                   FinalCompositeSurface
+                       ? @"final-composite-iosurface"
+                       : @"window-iosurface-composite");
         return;
     }
     client.stream = CreateStream(client);
@@ -1637,9 +1904,13 @@ static void StartSubscription(MacWSDisplayClient *client,
             DisplayLog(@"workspace-resume stream=%llu layers=%lu transport=retained-graph",
                        (unsigned long long)client.streamID,
                        (unsigned long)client.transientLayers.count);
-            if (client.workspaceCanvas)
-                PublishFrame(client, nil, mach_absolute_time(),
-                             client.workspaceCanvas);
+            IOSurfaceRef retainedBase = FinalCompositeSurface
+                ? FinalCompositeSurface : client.workspaceCanvas;
+            if (retainedBase)
+                PublishFrame(client, nil,
+                    FinalCompositeSurface
+                        ? FinalCompositeRecord.completionTime
+                        : mach_absolute_time(), retainedBase);
             for (MacWSTransientLayer *layer in
                     client.transientLayers.allValues) {
                 if (layer.latestSurface)
@@ -1714,9 +1985,13 @@ static void StartSubscription(MacWSDisplayClient *client,
             // Republish the retained current generation before waiting for a
             // future damage callback; static wallpaper/menu layers may not
             // otherwise emit another frame for the new Scene.
-            if (client.workspaceCanvas) {
-                PublishFrame(client, nil, mach_absolute_time(),
-                             client.workspaceCanvas);
+            IOSurfaceRef retainedBase = FinalCompositeSurface
+                ? FinalCompositeSurface : client.workspaceCanvas;
+            if (retainedBase) {
+                PublishFrame(client, nil,
+                    FinalCompositeSurface
+                        ? FinalCompositeRecord.completionTime
+                        : mach_absolute_time(), retainedBase);
             }
             NSArray<MacWSTransientLayer *> *layers =
                 [client.transientLayers.allValues
@@ -1826,6 +2101,17 @@ static void ReconcileTransientStreams(void) {
                 NSDictionary *info = desktopInfo[index];
                 uint32_t candidateWindowID =
                     [info[(id)kCGWindowNumber] unsignedIntValue];
+                NSInteger candidateSkyLightLayer =
+                    [info[(id)kCGWindowLayer] integerValue];
+                // runtime-confirmed on iPad13,6 on 2026-08-12: WindowServer
+                // publishes its black 34x46 `Cursor` as window 3 at
+                // SkyLight layer 2147483630. Host already renders its own
+                // direct-touch/trackpad/Pencil affordance, so composing that
+                // hardware cursor creates a duplicate visual pointer. Cursor-
+                // level surfaces are presentation-only and never belong in
+                // the macOS desktop layer graph consumed by Host.
+                if (candidateSkyLightLayer >=
+                    CGWindowLevelForKey(kCGCursorWindowLevelKey)) continue;
                 if (attached >= 48 || candidateWindowID == 0 ||
                     [info[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
                 CGRect candidateBounds = CGRectZero;
@@ -1866,7 +2152,7 @@ static void ReconcileTransientStreams(void) {
                 id windowName = info[(id)kCGWindowName];
                 layer.windowName = [windowName isKindOfClass:NSString.class]
                     ? windowName : @"";
-                layer.skyLightLayer = [info[(id)kCGWindowLayer] integerValue];
+                layer.skyLightLayer = candidateSkyLightLayer;
                 if (urgentRetireConfirmation &&
                     layer.skyLightLayer >=
                         CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) &&
@@ -2369,6 +2655,7 @@ int main(void) {
                 AcceptConnection((xpc_connection_t)event);
         });
         xpc_connection_resume(listener);
+        StartFinalCompositeReceiver();
         DisplayLog(@"READY service=%s protocol=%u", MACWS_STREAM_SERVICE,
                    MACWS_STREAM_VERSION);
         dispatch_main();

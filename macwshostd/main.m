@@ -30,6 +30,17 @@
 
 extern char **environ;
 
+// Darwin's public spawn.h does not expose this Apple-private declaration,
+// although libsystem has shipped it since iOS 6.  XNU 8792 maps process type
+// 0x100 to TASK_APPTYPE_APP_DEFAULT.  macOS AppKit's concurrent scrolling
+// creates a CA_CLIENT work interval; the iOS kernel deliberately rejects that
+// work-interval type with KERN_NOT_SUPPORTED when task_is_app() is false.
+// Mark the child at its real spawn boundary instead of translating the work
+// interval or suppressing AppKit's invariant.
+extern int posix_spawnattr_setprocesstype_np(posix_spawnattr_t *attr,
+                                              int processType);
+#define MACWS_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT 0x00000100
+
 static const char *const kLogPath = "/var/mobile/Library/Logs/MacWSHostd.log";
 static const char *const kRootFS = "/var/mnt/rootfs";
 static const char *const kGUI = "/var/jb/usr/macOS/bin/macos_gui.sh";
@@ -37,6 +48,7 @@ static const char *const kBash = "/var/jb/usr/bin/bash";
 static const char *const kLaunchctl = "/var/jb/usr/bin/launchctl";
 static const char *const kKillall = "/var/jb/usr/bin/killall";
 static const char *const kChrootExec = "/var/jb/usr/macOS/bin/launchdchrootexec";
+static const char *const kWorkspaceCtl = "/usr/local/bin/macwsworkspacectl";
 static const char *const kPostinst = "/var/jb/usr/macOS/bin/postinst.sh";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
@@ -240,7 +252,9 @@ static void RemovePath(const char *path) {
         HostLog(@"unlink failed path=%s errno=%d (%s)", path, errno, strerror(errno));
 }
 
-static int RunCommand(const char *const argv[], BOOL waitForExit) {
+static int RunCommandWithEnvironment(const char *const argv[],
+                                     char *const environment[],
+                                     BOOL waitForExit) {
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
     int logFD = open(kLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
@@ -251,7 +265,8 @@ static int RunCommand(const char *const argv[], BOOL waitForExit) {
     }
     pid_t pid = 0;
     int spawnError = posix_spawn(&pid, argv[0], &actions, NULL,
-                                 (char *const *)argv, environ);
+                                 (char *const *)argv,
+                                 environment ? environment : environ);
     posix_spawn_file_actions_destroy(&actions);
     if (logFD >= 0) close(logFD);
     if (spawnError != 0) {
@@ -271,6 +286,28 @@ static int RunCommand(const char *const argv[], BOOL waitForExit) {
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return 126;
+}
+
+static int RunCommand(const char *const argv[], BOOL waitForExit) {
+    return RunCommandWithEnvironment(argv, environ, waitForExit);
+}
+
+static int SpawnMacOSApplication(pid_t *pid,
+                                 const char *path,
+                                 const posix_spawn_file_actions_t *actions,
+                                 char *const argv[],
+                                 char *const environment[]) {
+    posix_spawnattr_t attributes;
+    int error = posix_spawnattr_init(&attributes);
+    if (error != 0) return error;
+    error = posix_spawnattr_setprocesstype_np(
+        &attributes, MACWS_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT);
+    if (error == 0) {
+        error = posix_spawn(pid, path, actions, &attributes, argv,
+                            environment ? environment : environ);
+    }
+    posix_spawnattr_destroy(&attributes);
+    return error;
 }
 
 static NSString *CaptureCommand(const char *const argv[], NSUInteger limit) {
@@ -1248,6 +1285,72 @@ static pid_t FindRunningRootExecutable(NSString *rootPath) {
     return found;
 }
 
+// LaunchServices' authoritative running-application record does retire when a
+// bridged AppKit process exits, but the macOS 13.4 Dock in this chroot does not
+// receive the corresponding termination notification. Runtime evidence: after
+// a clean final-window close, lsappinfo no longer listed Terminal while Dock
+// kept its running dot; restarting only Dock removed it. RE evidence from the
+// exact Dock binary: its state rebuild calls _LSCopyRunningApplicationArray at
+// Dock+0x2a8cd4. Rebuild only after the exact target process is gone, and only
+// terminate the exact Dock executable. This is deliberately a bounded
+// compatibility repair for the missing notification, not an assertion that
+// the native notification path is fixed.
+static BOOL RefreshDockAfterProcessExit(pid_t targetPID, NSString **message) {
+    if (targetPID <= 1) {
+        *message = @"缺少有效的应用进程标识，Dock 未改动";
+        return NO;
+    }
+    NSDate *exitDeadline = [NSDate dateWithTimeIntervalSinceNow:0.65];
+    while (exitDeadline.timeIntervalSinceNow > 0) {
+        errno = 0;
+        if (kill(targetPID, 0) != 0 && errno == ESRCH) break;
+        usleep(50000);
+    }
+    errno = 0;
+    if (kill(targetPID, 0) == 0 || errno != ESRCH) {
+        HostLog(@"dock-refresh skipped target=%d reason=still-running",
+                targetPID);
+        *message = [NSString stringWithFormat:
+            @"应用 PID %d 仍在运行，未重建 Dock 状态", targetPID];
+        return YES;
+    }
+
+    NSString *dockPath =
+        @"/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock";
+    pid_t oldDockPID = FindRunningRootExecutable(dockPath);
+    if (oldDockPID <= 1) {
+        HostLog(@"dock-refresh target=%d state=already-absent", targetPID);
+        *message = @"应用已退出；Dock 当前未运行，无陈旧状态可清理";
+        return YES;
+    }
+    HostLog(@"dock-refresh target=%d dock=%d signal=TERM", targetPID,
+            oldDockPID);
+    if (kill(oldDockPID, SIGTERM) != 0 && errno != ESRCH) {
+        *message = [NSString stringWithFormat:
+            @"应用已退出，但 Dock 状态重建失败（PID %d，errno=%d）",
+            oldDockPID, errno];
+        return NO;
+    }
+
+    NSDate *restartDeadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
+    pid_t newDockPID = 0;
+    while (restartDeadline.timeIntervalSinceNow > 0) {
+        newDockPID = FindRunningRootExecutable(dockPath);
+        if (newDockPID > 1 && newDockPID != oldDockPID) break;
+        usleep(50000);
+    }
+    if (newDockPID <= 1 || newDockPID == oldDockPID) {
+        *message = [NSString stringWithFormat:
+            @"应用已退出，但 Dock 未在时限内完成状态重建（旧 PID %d）",
+            oldDockPID];
+        return NO;
+    }
+    HostLog(@"dock-refresh complete target=%d old-dock=%d new-dock=%d",
+            targetPID, oldDockPID, newDockPID);
+    *message = @"应用已退出，Dock 运行状态已重建";
+    return YES;
+}
+
 // An AppKit application can outlive its last NSWindow.  That is the normal
 // result after an iPad Scene asks AppInputBridge to performClose:, but such a
 // process cannot satisfy a later launch request by merely being "reused".
@@ -1302,6 +1405,105 @@ static BOOL TerminateWindowlessRootExecutable(pid_t pid, NSString *rootPath,
     *message = [NSString stringWithFormat:
         @"无窗口实例清理超时（PID %d），未创建重复进程", pid];
     return NO;
+}
+
+// A LaunchServices session can discard its mounted Settings extension records
+// while leaving the already-running SwiftUI shell alive.  Once that shell has
+// cached an empty PPCenter catalog, reopening its NSWindow cannot populate the
+// panes: runtime A/B on 2026-08-12 kept the old shell blank after all 48
+// records verified, while retiring that exact executable and launching it
+// again immediately created real Appearance/Trackpad/Mouse extension
+// processes.  Retire only that identified process, with the same bounded
+// cooperative grace used for a windowless application.
+static BOOL RetireRootExecutableForCatalogRefresh(pid_t pid,
+                                                  NSString *rootPath,
+                                                  NSString **message) {
+    if (pid <= 1 || !rootPath.length) return YES;
+    HostLog(@"launch-app catalog-refresh-retire pid=%d executable=%@ "
+            "signal=TERM", pid, rootPath);
+    if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+        *message = [NSString stringWithFormat:
+            @"设置目录已修复，但旧进程无法退出（PID %d，errno=%d）",
+            pid, errno];
+        return NO;
+    }
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.4];
+    while (deadline.timeIntervalSinceNow > 0) {
+        errno = 0;
+        if (kill(pid, 0) != 0 && errno == ESRCH) return YES;
+        usleep(50000);
+    }
+    HostLog(@"launch-app catalog-refresh-retire pid=%d executable=%@ "
+            "signal=KILL reason=term-timeout", pid, rootPath);
+    if (kill(pid, SIGKILL) != 0 && errno != ESRCH) {
+        *message = [NSString stringWithFormat:
+            @"设置目录已修复，但旧进程无法清理（PID %d，errno=%d）",
+            pid, errno];
+        return NO;
+    }
+    deadline = [NSDate dateWithTimeIntervalSinceNow:1.0];
+    while (deadline.timeIntervalSinceNow > 0) {
+        errno = 0;
+        if (kill(pid, 0) != 0 && errno == ESRCH) return YES;
+        usleep(50000);
+    }
+    *message = [NSString stringWithFormat:
+        @"设置目录已修复，但旧进程清理超时（PID %d）", pid];
+    return NO;
+}
+
+// Validate the records actually visible to the current LaunchServices
+// generation immediately before launching System Settings.  The startup
+// marker alone is insufficient: runtime-confirmed on 2026-08-12, the same
+// session that had prepared 48/48 panes later returned an
+// LSApplicationExtensionRecord with identifier=<nil>, platform=0 and url=nil.
+// Re-register through stock LaunchServices only when the exact verifier fails;
+// do not manufacture a pane or treat process uptime as content readiness.
+static BOOL EnsureSystemSettingsCatalog(BOOL *repairedOut,
+                                        NSString **message) {
+    if (repairedOut) *repairedOut = NO;
+    const char *verify[] = {
+        kChrootExec, "0", "0", kRootFS, kWorkspaceCtl,
+        "verify-launchservices-catalog", NULL,
+    };
+    int verifyResult = RunCommand(verify, YES);
+    if (verifyResult == 0) {
+        HostLog(@"system-settings catalog result=verified action=reuse");
+        return YES;
+    }
+
+    static const char *const registrationEnvironment[] = {
+        "MACWS_CATALOG_REGISTRATION=1",
+    };
+    char **environment = CopyEnvironmentAdding(
+        registrationEnvironment,
+        sizeof(registrationEnvironment) /
+            sizeof(registrationEnvironment[0]));
+    if (!environment) {
+        *message = @"无法构造系统设置目录修复环境";
+        return NO;
+    }
+    const char *repairCatalog[] = {
+        kChrootExec, "0", "0", kRootFS, kWorkspaceCtl,
+        "repair-launchservices-catalog", NULL,
+    };
+    int repairResult = RunCommandWithEnvironment(
+        repairCatalog, environment, YES);
+    FreeCopiedEnvironment(environment);
+    int repairedVerifyResult = repairResult == 0
+        ? RunCommand(verify, YES) : 126;
+    HostLog(@"system-settings catalog result=%s initial_verify=%d "
+            "repair=%d final_verify=%d",
+            repairedVerifyResult == 0 ? "repaired" : "failed",
+            verifyResult, repairResult, repairedVerifyResult);
+    if (repairedVerifyResult != 0) {
+        *message = [NSString stringWithFormat:
+            @"系统设置目录修复失败（验证 %d，修复 %d，复验 %d）",
+            verifyResult, repairResult, repairedVerifyResult];
+        return NO;
+    }
+    if (repairedOut) *repairedOut = YES;
+    return YES;
 }
 
 static pid_t WaitForRunningRootExecutable(NSString *rootPath,
@@ -1853,7 +2055,8 @@ static BOOL LaunchRootExecutable(const char *identifier,
             return NO;
         }
         childEnvironment = ownedEnvironment;
-    } else if (strcmp(identifier, "custom-path") == 0 ||
+    } else if (strcmp(identifier, "activity-monitor") == 0 ||
+               strcmp(identifier, "custom-path") == 0 ||
                IsThirdPartyAppIdentifier(identifier)) {
         // Runtime-confirmed by Amadine-2026-08-11-141854.ips: creating a
         // document made AppKit resolve a NIB image through NSWorkspace, which
@@ -1861,9 +2064,14 @@ static BOOL LaunchRootExecutable(const char *identifier,
         // finalized 511 CoreServicesInternal FileCache/CFURL frames when the
         // host mount escaped the chroot.  A controlled A/B with the complete
         // logical-root namespace produced the real canvas and no new crash.
-        // Scope that filesystem contract to macwshostd's already validated
-        // third-party executable transaction; ordinary Terminal/Finder paths
-        // keep their separately proven fork/catalog policies.
+        // Activity Monitor reaches the same root invariant while resolving a
+        // sampled process icon: runtime-confirmed by
+        // Activity Monitor-2026-08-12-010001.ips, whose crashing thread enters
+        // NSWorkspace iconForFile: -> _LSFindOrRegisterBundleNode -> NSURL
+        // bookmarkData -> CoreServicesInternal FileCache recursion until the
+        // stack guard fires. Scope the filesystem contract to these proven
+        // consumers; ordinary Terminal/Finder keep their separately proven
+        // fork/catalog policies.
         static const char *const thirdPartyEnvironment[] = {
             "MACWS_APP_MOUNT_COMPAT=1",
         };
@@ -1874,13 +2082,13 @@ static BOOL LaunchRootExecutable(const char *identifier,
         if (!ownedEnvironment) {
             posix_spawn_file_actions_destroy(&actions);
             if (logFD >= 0) close(logFD);
-            *message = @"无法为第三方 App 构造 chroot 根卷环境";
+            *message = @"无法为应用构造 chroot 根卷环境";
             return NO;
         }
         childEnvironment = ownedEnvironment;
     }
-    int error = posix_spawn(&pid, kChrootExec, &actions, NULL,
-                            (char *const *)argv, childEnvironment);
+    int error = SpawnMacOSApplication(
+        &pid, kChrootExec, &actions, (char *const *)argv, childEnvironment);
     FreeCopiedEnvironment(ownedEnvironment);
     posix_spawn_file_actions_destroy(&actions);
     if (logFD >= 0) close(logFD);
@@ -2073,6 +2281,16 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         *message = @"应用标识不在白名单中";
         return NO;
     }
+    if (strcmp(identifier, "system-settings") == 0) {
+        BOOL repaired = NO;
+        if (!EnsureSystemSettingsCatalog(&repaired, message)) return NO;
+        if (repaired) {
+            NSString *rootPath = @(app->rootPath);
+            pid_t cachedPID = FindRunningRootExecutable(rootPath);
+            if (!RetireRootExecutableForCatalogRefresh(
+                    cachedPID, rootPath, message)) return NO;
+        }
+    }
     if (!LaunchRootExecutable(identifier, @(app->rootPath), app->logPath,
                               30.0, message)) return NO;
     if (strcmp(identifier, "glassdemo") == 0) {
@@ -2172,6 +2390,13 @@ static void ServeRequest(xpc_object_t request) {
                  WaitForCapture(wsPID, generation, 60.0, NULL);
             message = ok ? @"共享帧已刷新并由 WindowServer 确认" :
                 @"WindowServer 未在 60 秒内确认刷新帧";
+        } else if (strcmp(op, MACWS_CONTROL_OP_REFRESH_DOCK) == 0) {
+            // This operation is internal to the Scene close transaction. It
+            // never terminates the target application; it only observes that
+            // the application has already exited before rebuilding Dock.
+            pid_t targetPID = (pid_t)xpc_dictionary_get_int64(
+                request, MACWS_CONTROL_KEY_TARGET_PID);
+            ok = RefreshDockAfterProcessExit(targetPID, &message);
         }
 
         SetState(NO, ok ? @"就绪" : @"操作失败", ok ? @"" : message);

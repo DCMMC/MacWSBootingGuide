@@ -41,6 +41,7 @@ SCROLL_MOMENTUM = 1 << 12
 SCROLL_WILL_MOMENTUM = 1 << 7
 
 SOURCE_FINGER = 1
+SOURCE_PENCIL = 2
 SOURCE_HARDWARE_KEYBOARD = 4
 
 MOD_CAPS_LOCK = 1 << 16
@@ -65,13 +66,14 @@ def scene_for_window(window_id, modifiers=0):
 
 def record(kind, sequence, pid, window_id, width, height, x, y,
            pressure=0.0, contact=0, source=SOURCE_FINGER, modifiers=0,
-           flags=0):
+           flags=0, altitude=0.0, azimuth=0.0, tilt_x=0.0, tilt_y=0.0):
     return RECORD.pack(
         INPUT_MAGIC, INPUT_VERSION, kind,
         scene_for_window(window_id, modifiers), uptime(),
         float(x), float(y), float(pressure), contact & 0xFFFFFFFF,
         width, height, pid, source, flags, 0,
-        0.0, 0.0, 0.0, 0.0, sequence, 0)
+        float(altitude), float(azimuth), float(tilt_x), float(tilt_y),
+        sequence, 0)
 
 
 def load_events(path):

@@ -1,6 +1,7 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <xpc/xpc.h>
@@ -19,6 +20,8 @@ xpc_type_t xpc_get_type(xpc_object_t object);
 char *xpc_copy_description(xpc_object_t object);
 bool xpc_dictionary_get_bool(xpc_object_t dictionary, const char *key);
 int64_t xpc_dictionary_get_int64(xpc_object_t dictionary, const char *key);
+void xpc_dictionary_set_int64(xpc_object_t dictionary, const char *key,
+                              int64_t value);
 
 // Minimal on-device witness for the typed MacWS Host control service.  This
 // deliberately exposes only the same fixed operations as the public protocol;
@@ -59,6 +62,20 @@ int main(int argc, const char *argv[]) {
         }
         xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_APP_PATH,
                                   argv[2]);
+    } else if (strcmp(operation, MACWS_CONTROL_OP_REFRESH_DOCK) == 0) {
+        if (argc != 3) {
+            fprintf(stderr,
+                    "usage: macws_control_probe refresh-dock TARGET_PID\n");
+            return 64;
+        }
+        char *end = NULL;
+        long value = strtol(argv[2], &end, 10);
+        if (!end || *end != '\0' || value <= 1 || value > INT32_MAX) {
+            fprintf(stderr, "invalid target pid: %s\n", argv[2]);
+            return 64;
+        }
+        xpc_dictionary_set_int64(request, MACWS_CONTROL_KEY_TARGET_PID,
+                                 (int64_t)value);
     }
 
     xpc_object_t reply = xpc_connection_send_message_with_reply_sync(

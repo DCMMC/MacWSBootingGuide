@@ -16,6 +16,7 @@ macwsdisplayd_FILES = main.m
 macwsdisplayd_CFLAGS = -fobjc-arc -fblocks -Wall -Wextra \
 	-I$(CURDIR)/../include -isystem $(CURDIR)/../vendor/ios-xpc
 macwsdisplayd_FRAMEWORKS = Foundation AppKit CoreFoundation CoreGraphics IOSurface
+macwsdisplayd_LIBRARIES = bsm
 macwsdisplayd_CODESIGN_FLAGS = -S../layout/usr/macOS/bin/entitlements.plist
 macwsdisplayd_INSTALL_PATH = /usr/macOS/bin
 

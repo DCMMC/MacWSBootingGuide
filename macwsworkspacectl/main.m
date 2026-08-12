@@ -504,6 +504,69 @@ static int RegisterSettingsExtensions(BOOL registerRecords) {
     return 0;
 }
 
+static int CleanSeedLaunchServicesCatalog(void) {
+    // Runtime-confirmed on the iPad on 2026-08-12: after the session lsd was
+    // reloaded, trying to reactivate all 193 mounted application records with
+    // one `lsregister -f` transaction left lsd at 86.8% CPU and Finder at
+    // 34.5% CPU for more than nine minutes (one-minute load reached 105).
+    // The existing cold-start fallback is the correct upstream recovery:
+    // Ventura's stock `-kill -seed` rebuilt a coherent catalog in 8 seconds,
+    // immediately verified all essential applications and all 48 Settings
+    // extensions, and lsd settled to 5.5% CPU. Reuse that bounded transaction
+    // instead of enumerating application bundles in this latency-sensitive
+    // launch path.
+    static NSString *const lsregisterPath =
+        @"/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+         "LaunchServices.framework/Support/lsregister";
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    if (![fileManager isExecutableFileAtPath:lsregisterPath]) {
+        fprintf(stderr,
+                "macwsworkspacectl: stock lsregister is missing: %s\n",
+                lsregisterPath.fileSystemRepresentation);
+        return 66;
+    }
+
+    pid_t child = 0;
+    const char *arguments[] = {
+        lsregisterPath.fileSystemRepresentation, "-kill", "-seed", NULL,
+    };
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    int spawnError = posix_spawn(&child, arguments[0], NULL, NULL,
+                                 (char *const *)arguments, environ);
+    if (spawnError != 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: lsregister spawn failed error=%d (%s)\n",
+                spawnError, strerror(spawnError));
+        return 128 + spawnError;
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        fprintf(stderr,
+                "macwsworkspacectl: lsregister wait failed errno=%d (%s)\n",
+                errno, strerror(errno));
+        return 127;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr,
+                "macwsworkspacectl: clean lsregister seed failed status=%d\n",
+                status);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 126;
+    }
+    fprintf(stdout,
+            "launchservices-catalog-clean-seeded elapsed_ms=%.0f "
+            "route=stock-lsregister\n",
+            (CFAbsoluteTimeGetCurrent() - start) * 1000.0);
+    return 0;
+}
+
+static int RepairLaunchServicesCatalog(void) {
+    int seedResult = CleanSeedLaunchServicesCatalog();
+    if (seedResult != 0) return seedResult;
+    int settingsResult = RegisterSettingsExtensions(NO);
+    return settingsResult == 0 ? 0 : RegisterSettingsExtensions(YES);
+}
+
 static int VerifyLaunchServicesCatalog(void) {
     // A full `lsregister -f -apps system,local,user` walk takes roughly a
     // minute on the iPad rootfs.  Verify persistent LaunchServices state
@@ -956,6 +1019,11 @@ int main(int argc, const char *argv[]) {
             return RegisterSettingsExtensions(YES);
         }
         if (argc == 2 &&
+            (strcmp(argv[1], "repair-launchservices-catalog") == 0 ||
+             strcmp(argv[1], "reactivate-launchservices-catalog") == 0)) {
+            return RepairLaunchServicesCatalog();
+        }
+        if (argc == 2 &&
             strcmp(argv[1], "verify-launchservices-catalog") == 0) {
             return VerifyLaunchServicesCatalog();
         }
@@ -984,6 +1052,7 @@ int main(int argc, const char *argv[]) {
                 "usage: macwsworkspacectl set-wallpaper [path] | "
                 "show-launchpad | list-spaces | set-current-space ID | "
                 "ensure-navigation-spaces | create-space | "
+                "repair-launchservices-catalog | "
                 "register-settings-extensions | "
                 "verify-launchservices-catalog | "
                 "open-application /absolute/App.app | "

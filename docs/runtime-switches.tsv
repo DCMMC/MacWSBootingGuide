@@ -59,6 +59,7 @@ env	MACWS_CHROMIUM_COMPOSITE_OVERLAYS	on	VS Code,Chrome	Mark Chromium's real Agg
 env	MACWS_CHROOT_HOST_ROOT	auto	launchdchrootexec descendants	Canonical host path captured before chroot and used to translate kernel file-ID paths into the process-visible root namespace.
 env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
 env	MACWS_DESKTOPSERVICES_DIAG	off	diagnostic	Exact-UUID Finder volume-map lookup and SamePhysicalDevice boundary recorder; observation only.
+env	MACWS_DISPLAY_DIAGNOSTICS	off	macwsdisplayd diagnostic	Enables per-frame throughput and final-composite receive logging; production keeps it unset to avoid synchronous stderr overhead.
 env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bind failure.
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
 env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
