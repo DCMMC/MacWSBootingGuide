@@ -12,6 +12,7 @@ APPLICATION_NAME = MacWSHost
 
 MacWSHost_FILES = main.m MacWSControlClient.m MacWSStreamClient.m \
 	MacWSPerformanceMonitor.m \
+	Testing/MacWSPerformanceGestureScenario.m \
 	Support/MacWSHostDiagnostics.m \
 	Transport/MacWSCatalystDrawableReceiver.m \
 	Compatibility/MacWSMappedFrame.m \

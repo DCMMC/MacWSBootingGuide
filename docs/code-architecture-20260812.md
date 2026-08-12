@@ -32,8 +32,10 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
   `MacWSLegacyFramebufferFallback` preference; production uses DisplayStream
   IOSurfaces.
 - `Testing/` is reserved for explicitly invoked profile/regression adapters.
-  Test scenarios must not become a prerequisite of streaming, input routing,
-  application launch or presentation.
+  `MacWSPerformanceGestureScenario` owns synthetic scenario timing while the
+  view supplies narrow callbacks into the real input boundary. Test scenarios
+  must not become a prerequisite of streaming, input routing, application
+  launch or presentation.
 
 ## Invariants
 
