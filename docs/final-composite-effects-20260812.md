@@ -132,6 +132,14 @@ input-to-visible latency, zero hitches/stalls/Metal errors, and nominal
 36.50 °C. WindowServer and the chroot desktop were not restarted for package
 installation.
 
+A controlled reload of only the installed display daemon then changed its PID
+from `68105` to `91033` while WindowServer remained `67259`. The replacement
+receiver immediately accepted surface 34 at producer sequence 25185 and
+started the workspace with `transport=final-composite-iosurface`; Host advanced
+the replacement base stream to sequence 874 on the same surface. This is the
+runtime witness that the one-second bootstrap refresh recovers across a
+receive-right replacement without a WindowServer or iOS restart.
+
 ## Remaining limits
 
 - Fullscreen now uses the authoritative compositor pixels. Individual
