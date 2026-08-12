@@ -239,7 +239,7 @@ def main():
                         help="send one button-free RFB pointer move")
     parser.add_argument("--text")
     parser.add_argument("--command-key", metavar="KEY",
-                        help="send Command+KEY using X11 Meta_L (0xffe7); "
+                        help="send Command+KEY using X11 Alt_L (0xffe9); "
                              "KEY may also be Tab")
     parser.add_argument("--capture-only", action="store_true",
                         help="save/describe one fresh non-incremental frame "
@@ -392,7 +392,11 @@ def main():
                     "--command-key needs one character or the name Tab")
             vnc_live_click.request_update(sock, width, height, True)
             started = time.monotonic()
-            send_key_chord(sock, (0xffe7,), command_keysym)
+            # Runtime-confirmed against the installed OSXvnc key table:
+            # XK_Alt_L maps to macOS Command (keyCode 55); Meta/Super maps to
+            # Option. Using Meta here made this supposedly semantic helper
+            # test Option+KEY instead of Command+KEY.
+            send_key_chord(sock, (0xffe9,), command_keysym)
             digest, _ = request_and_wait(
                 sock, width, height, framebuffer, digest, "command-key",
                 started, args.timeout, args.max_updates)

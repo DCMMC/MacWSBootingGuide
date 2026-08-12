@@ -13,6 +13,9 @@ LOCATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/locationd-native-entitlements.plist"
 GEOD_NATIVE_ENT="/var/jb/usr/macOS/bin/geod-native-entitlements.plist"
 INTEROP_LOCATION_ENT="/var/jb/usr/macOS/bin/interop-location-entitlements.plist"
 CODE_REQUIREMENT_WRITER="/var/jb/usr/macOS/bin/write_code_requirement.py"
+ASPHALT_CA_INTERMEDIATE="/var/jb/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem"
+MACOS_CA_BUNDLE="/var/mnt/rootfs/etc/ssl/cert.pem"
+ASPHALT_CA_BUNDLE="/var/mnt/rootfs/usr/local/ssl/cert.pem"
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
 LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
@@ -689,6 +692,24 @@ if [ -f /var/jb/usr/macOS/lib/libmachook_arm64.dylib ]; then
 	rm -f /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	cp -vf /var/jb/usr/macOS/lib/libmachook_arm64.dylib /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
 	add_all_trustcache /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib
+fi
+
+# Asphalt embeds a peer-verifying OpenSSL client whose compiled default is
+# /usr/local/ssl/cert.pem. gameoptions.gameloft.com currently sends a Sectigo
+# leaf followed by an unrelated Entrust intermediate; the authentic missing
+# Sectigo OV R36 intermediate is packaged above. Build an app-scoped CA file
+# from Ventura's existing roots and that intermediate. This repairs chain
+# construction without disabling hostname, signature, expiry, or peer checks.
+if [ -f "$ASPHALT_CA_INTERMEDIATE" ] && [ -f "$MACOS_CA_BUNDLE" ]; then
+	mkdir -p "$(dirname "$ASPHALT_CA_BUNDLE")" || exit 1
+	ASPHALT_CA_TEMP="${ASPHALT_CA_BUNDLE}.new.$$"
+	cat "$MACOS_CA_BUNDLE" "$ASPHALT_CA_INTERMEDIATE" > \
+		"$ASPHALT_CA_TEMP" || exit 1
+	chmod 0644 "$ASPHALT_CA_TEMP" || exit 1
+	mv "$ASPHALT_CA_TEMP" "$ASPHALT_CA_BUNDLE" || exit 1
+else
+	echo '[ERROR] Asphalt peer-verification CA inputs are missing' >&2
+	exit 1
 fi
 
 # Establish the complete arm64e loader closure before the first chroot exec

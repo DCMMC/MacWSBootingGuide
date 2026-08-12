@@ -218,6 +218,17 @@ static bool macws_configure_catalyst_environment(
     setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
     setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
            "com.apple.macosbooter.frontboard.systemappservices", 1);
+    if ([bundleIdentifier isEqualToString:@"com.gameloft.asphalt9mac"]) {
+        // Asphalt's embedded OpenSSL defaults to /usr/local/ssl/cert.pem.
+        // gameoptions.gameloft.com currently serves the Sectigo leaf with an
+        // unrelated Entrust intermediate, so a normal peer-verifying client
+        // cannot construct the chain. postinst builds this scoped bundle from
+        // Ventura's trust roots plus Sectigo's authentic OV R36 intermediate.
+        // Keep verification enabled; never replace this with a permissive
+        // verify callback or SSL_VERIFYPEER=0 diagnostic.
+        setenv("SSL_CERT_FILE", "/usr/local/ssl/cert.pem", 1);
+        unsetenv("SSL_CERT_DIR");
+    }
     return true;
 }
 

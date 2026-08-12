@@ -25,8 +25,20 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
 
 - `Support/MacWSHostDiagnostics.*` owns runtime diagnostic selection, timestamp
   conversion and file logging.
+- `Input/MacWSKeyMapping.*` owns the pure macOS virtual-key, X11 keysym and
+  ASCII translation tables. UIKit event lifecycle and transport remain in the
+  view/controller; adding a keyboard layout no longer grows that controller.
 - `Transport/MacWSCatalystDrawableReceiver.*` owns the authenticated Catalyst
   drawable Mach service and emits validated notifications to the renderer.
+- `Rendering/MacWSCatalystDrawableCompositor.*` owns Catalyst IOSurface/Metal
+  texture lifetime, newest-sequence admission and the geometry-only draw
+  primitive. The view chooses whether a producer is relevant; it no longer
+  implements Mach delivery, texture ownership and vertex construction in one
+  method.
+- `Launch/MacWSCatalystLaunchCoordinator.*` owns the two foreground-carrier
+  Darwin notifications, fixed launcher argv and child reaping. The UI app
+  delegate only installs this boundary; hostd and the launcher still validate
+  the exact application request and identity.
 - `Compatibility/MacWSMappedFrame.*` contains the legacy mmap framebuffer
   adapter. It is reachable only through the explicit
   `MacWSLegacyFramebufferFallback` preference; production uses DisplayStream
@@ -36,6 +48,22 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
   view supplies narrow callbacks into the real input boundary. Test scenarios
   must not become a prerequisite of streaming, input routing, application
   launch or presentation.
+
+### AppInputBridge
+
+- `libmachook/Diagnostics/MacWSInputLatency.*` is the opt-in latency recorder.
+  Its marker files and JSONL output are absent from the production input path
+  unless a regression explicitly sets `MacWSInputFlagLatencyDiagnostic`.
+- `AppInputBridge.m` retains event construction, native Dock modal routing and
+  the bounded main-thread queue. Continuous pointer/scroll/configure samples
+  may coalesce, but magnification deltas remain discrete because AppKit
+  consumes them as incremental ratios.
+
+This organization makes the top-level files coordinators rather than owners
+of unrelated policy. The remaining large view and bridge implementations are
+still migration targets; future splits should follow an already-proven
+boundary (gesture state machine, scene lifecycle, menu model) rather than move
+arbitrary line ranges into generic utility files.
 
 ## Invariants
 
@@ -49,6 +77,10 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
 5. Production diagnostics stay disabled unless an explicit environment value
    or sentinel enables them.
 6. Legacy mmap transport never silently replaces DisplayStream.
+7. Final-composite mode remains authoritative for native SkyLight effects,
+   except a focused Host-carried Catalyst client whose real completed drawable
+   is absent from SkyLight capture; only that exact window rectangle is
+   replaced.
 
 ## Verification before device deployment
 
@@ -67,3 +99,62 @@ The next milestone must run the installed-package release gate before changing
 Mission Control pointer latency, magnification coalescing or third-party game
 launch behavior. That keeps structural changes and behavioral optimization
 separately attributable.
+
+## Post-split runtime regression
+
+The structural refactor was deployed without restarting WindowServer or iOS.
+The native `mission-select` scenario passed against the final composite:
+
+```text
+visible active average      109.824 FPS
+visible p50 / p95 / p99     8.337 / 16.674 / 16.674 ms
+visible 1% low              59.975 FPS
+thumbnail Tap -> visible    37.161 ms
+hitches / >50 ms stalls     0 / 0
+Metal command errors        0
+thermal                     nominal, 35.50 C
+```
+
+This is runtime-confirmed via
+`/tmp/macws-mission-after-refactor.json`. Mission selection is consumed by
+Dock's native modal controller, so Tap-to-first-visible-final-composite is the
+correct endpoint; waiting for an AppKit `mouseDown` in the selected process
+would measure an event that macOS does not deliver.
+
+Maps magnification had one source-confirmed discontinuity: the bridge added
+multiple incremental ratio deltas into one queued record. Magnify was removed
+from continuous coalescing while ordinary motion remains bounded. The real
+Maps follow-up passed at 90.77 visible FPS, 47.98 FPS 1% low, no hitch/stall,
+and no Metal error under nominal temperature.
+
+Asphalt exposed a separate presentation regression after final-composite was
+enabled. Runtime logs proved that its completed 1330x910 IOSurface was imported,
+while source inspection showed the final-composite branch skipped every
+Catalyst drawable. The new compositor preserves final SkyLight pixels and
+replaces only the focused Catalyst window client rectangle. A fresh process
+then logged:
+
+```text
+runtime-confirmed catalyst-drawable imported pid=9000 surface=686 size=1330x910 bpr=5376 metal-pf=80
+runtime-confirmed catalyst-drawable presented pid=9000 surface=686 sequence=4 size=1330x910 status=4 error=nil
+```
+
+VNC remains intentionally unable to see that Host-only overlay, so a VNC black
+client area is no longer a valid witness for the iPad Host presentation of a
+Catalyst game. Registration/gameplay and a sustained in-race FPS record remain
+open until the visible Host UI can be driven through onboarding.
+
+The explicitly invoked test probe subsequently sampled the current process
+PID 11918 at sequence 7960: 51,274 of 65,536 stratified bytes were nonzero and
+the digest remained `b74f9a321e64e472`. Its exported frame showed Asphalt's
+own `CONNECTION ERROR` page rather than a transport-black frame. A bounded
+synthetic Retry tap was runtime-confirmed by unified logging to enter the real
+Catalyst `UIWindow`; it did not change the frame digest. Network A/B then found
+that four Gameloft endpoints completed DNS/TLS/HTTP on iOS, while
+`gameoptions.gameloft.com` alone failed certificate verification. The server
+presented a Sectigo leaf plus an unrelated Entrust intermediate; OpenSSL
+reported `unable to verify the first certificate`. Adding the actual
+`Sectigo Public Server Authentication CA OV R36` intermediate to a scoped
+test bundle changed the same chroot request from curl error 60 to HTTP 302.
+This is the current upstream boundary for Asphalt launch; production must fix
+the missing CA material for this validated child, not disable peer validation.

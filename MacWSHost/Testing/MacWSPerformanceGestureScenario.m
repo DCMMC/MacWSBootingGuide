@@ -27,12 +27,13 @@
         }
         MacWSInputKind kind = [scenario isEqualToString:@"right-tap"]
             ? MacWSInputKindSecondaryTap : MacWSInputKindTap;
-        self.emitPointer(kind, center, 1.0f, 0);
+        self.emitPointer(kind, center, 1.0f, self.pointerFlags);
         if ([scenario isEqualToString:@"double-tap"]) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          100 * NSEC_PER_MSEC),
                            dispatch_get_main_queue(), ^{
                 self.emitPointer(MacWSInputKindTap, center, 1.0f,
+                                 self.pointerFlags |
                                  MacWSInputFlagDoubleClick);
             });
         }
@@ -66,6 +67,7 @@
                            dispatch_get_main_queue(), ^{
                 self.emitPointer(MacWSInputKindTap,
                                  (index & 1) ? alternate : center, 1.0f,
+                                 self.pointerFlags |
                                  MacWSInputFlagLatencyDiagnostic);
             });
         }
@@ -288,6 +290,77 @@
             MacWSLog(@"performance-gesture-end scenario=%@ success=YES",
                      scenario);
             finish(YES, @"120 Hz 原生 Dock 三指场景已完成并取消恢复");
+        });
+        return;
+    }
+
+    if ([scenario isEqualToString:@"mission-select"]) {
+        if (!self.fullscreen || self.dockPID <= 1) {
+            finish(NO, @"Mission Control 选择测试需要全屏工作区和可用 Dock 图层");
+            return;
+        }
+        if (!self.prepareSystemGesture || !self.emitSystemGesture ||
+            !self.resetSystemGesture || !self.emitPointer) {
+            finish(NO, @"Mission Control 选择测试适配器不可用");
+            return;
+        }
+        const NSInteger steps = 90;
+        const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
+        const CGFloat finalProgress = -0.85;
+        const CGFloat progressVelocity = finalProgress / (steps / 120.0);
+        self.prepareSystemGesture(
+            MacWSSystemGestureAxisVertical, self.contactID, self.dockPID,
+            width, height, progressVelocity);
+        self.emitSystemGesture(
+            MacWSSystemGestureAxisVertical, finalProgress / steps,
+            progressVelocity, MacWSInputFlagGestureBegan,
+            CACurrentMediaTime());
+        for (NSInteger index = 2; index <= steps; index++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         index * stepNanoseconds),
+                           dispatch_get_main_queue(), ^{
+                CGFloat progress = finalProgress * index / steps;
+                self.emitSystemGesture(
+                    MacWSSystemGestureAxisVertical, progress,
+                    progressVelocity, MacWSInputFlagGestureChanged,
+                    CACurrentMediaTime());
+            });
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds),
+                       dispatch_get_main_queue(), ^{
+            self.emitSystemGesture(
+                MacWSSystemGestureAxisVertical, finalProgress,
+                progressVelocity, MacWSInputFlagGestureEnded,
+                CACurrentMediaTime());
+            self.resetSystemGesture();
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     250 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            if (self.missionControlDidCommit)
+                self.missionControlDidCommit();
+        });
+        // Keep the native hover primer and the measured click as two distinct
+        // presentation transactions. Otherwise the monitor correctly binds
+        // the first resulting frame to Hover and the Tap selection has no
+        // independent input-to-visible sample.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     300 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            self.emitPointer(
+                MacWSInputKindTap, center, 1.0f,
+                self.pointerFlags | MacWSInputFlagLatencyDiagnostic);
+        });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (steps + 1) * stepNanoseconds +
+                                     1250 * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{
+            MacWSLog(@"performance-gesture-end "
+                     "scenario=mission-select success=YES");
+            finish(YES, @"Mission Control 缩略图选择场景已完成");
         });
         return;
     }

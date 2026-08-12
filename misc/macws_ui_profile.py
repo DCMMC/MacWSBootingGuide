@@ -175,6 +175,7 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
     if dock_pid > 1:
         scenarios.extend((
             "three-up", "three-down", "three-left", "three-right",
+            "mission-select",
         ))
     if requested:
         unknown = [name for name in requested if name not in scenarios]
@@ -242,7 +243,9 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
                         latency_records.append(json.loads(line))
                     except json.JSONDecodeError:
                         pass
-                if len(latency_records) >= 24:
+                required_latency_samples = (
+                    24 if name == "tap-burst" else 1)
+                if len(latency_records) >= required_latency_samples:
                     break
                 time.sleep(0.1)
         else:
@@ -254,16 +257,20 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
         fluid = name in {
             "hover", "drag", "long-drag", "scroll", "scroll-momentum",
             "magnify", "three-up", "three-down", "three-left", "three-right",
+            "mission-select",
         }
         results[-1]["profile_marker"] = marker
         results[-1]["performance"] = profile
         results[-1]["app_input_latency"] = app_input_latency
         results[-1]["score"] = score_profile(
             profile, target_pid=(dock_pid if name.startswith("three-")
+                                 or name == "mission-select"
                                  else target_pid),
-            system_gesture=name.startswith("three-"),
+            system_gesture=name.startswith("three-") or
+                name == "mission-select",
             require_fluid_metrics=fluid,
             require_click_latency=name == "tap-burst",
+            require_system_selection=name == "mission-select",
             app_input_latency=app_input_latency)
     return results
 
@@ -324,6 +331,8 @@ def select_motion_source(profile, target_pid, system_gesture):
 
 def score_profile(profile, *, target_pid, system_gesture=False,
                   require_fluid_metrics=True, require_click_latency=False,
+                  minimum_click_samples=None,
+                  require_system_selection=False,
                   app_input_latency=None):
     visible = profile.get("visible_presentation", {})
     counters = profile.get("counters", {})
@@ -343,6 +352,8 @@ def score_profile(profile, *, target_pid, system_gesture=False,
     frame = motion_metric.get("frame_interval", {})
     input_visible = profile.get("pipeline", {}).get(
         "input_dispatch_to_visible_callback", {})
+    input_visible_by_kind = profile.get("pipeline", {}).get(
+        "input_dispatch_to_visible_by_kind", {})
     checks = {
         "metal_command_errors": counters.get("command_errors", 0) <=
             THRESHOLDS["maximum_command_errors"],
@@ -367,13 +378,16 @@ def score_profile(profile, *, target_pid, system_gesture=False,
         })
     if require_click_latency:
         app_input_latency = app_input_latency or {}
+        if minimum_click_samples is None:
+            minimum_click_samples = THRESHOLDS[
+                "minimum_input_visible_samples"]
         main = app_input_latency.get("producer_to_main", {})
         complete = app_input_latency.get(
             "producer_to_appkit_complete", {})
         checks.update({
             "enough_click_response_samples":
                 app_input_latency.get("samples", 0) >=
-                    THRESHOLDS["minimum_input_visible_samples"],
+                    minimum_click_samples,
             "real_app_main_dispatch_p95":
                 main.get("p95_ms") is not None and
                 main["p95_ms"] <= THRESHOLDS[
@@ -382,6 +396,20 @@ def score_profile(profile, *, target_pid, system_gesture=False,
                 complete.get("p95_ms") is not None and
                 complete["p95_ms"] <= THRESHOLDS[
                     "maximum_real_app_click_complete_p95_ms"],
+        })
+    if require_system_selection:
+        # Mission Control owns thumbnail clicks inside Dock's native modal
+        # controller. No mouseDown is sent to the selected application's
+        # NSApplication; the correct end-to-end witness is Tap(kind=6) at the
+        # Host boundary to the first newly visible final-composite frame.
+        selection = input_visible_by_kind.get("6", {})
+        checks.update({
+            "system_selection_visible_sample":
+                selection.get("samples", 0) >= 1,
+            "system_selection_to_visible_p95":
+                selection.get("p95_ms") is not None and
+                selection["p95_ms"] <=
+                    THRESHOLDS["maximum_input_to_visible_p95_ms"],
         })
     return {
         "result": "PASS" if all(checks.values()) else "FAIL",
@@ -491,6 +519,7 @@ def main():
                            "tap-burst",
                            "hover", "drag", "long-drag", "scroll",
                            "scroll-momentum", "magnify", "three-up",
+                           "mission-select",
                            "three-down", "three-left", "three-right",
                        }]
     profile_score = {

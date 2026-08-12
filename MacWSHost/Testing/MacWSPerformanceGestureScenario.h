@@ -36,6 +36,7 @@ typedef void (^MacWSPerformanceGestureCompletion)(
 @property(nonatomic) int32_t dockPID;
 @property(nonatomic) BOOL fullscreen;
 @property(nonatomic) uint32_t contactID;
+@property(nonatomic) uint16_t pointerFlags;
 
 @property(nonatomic, copy) MacWSPerformancePointerEmitter emitPointer;
 @property(nonatomic, copy) MacWSPerformanceScrollEmitter emitScroll;
@@ -48,6 +49,7 @@ typedef void (^MacWSPerformanceGestureCompletion)(
     emitSystemGesture;
 @property(nonatomic, copy) MacWSPerformanceSystemGestureResetter
     resetSystemGesture;
+@property(nonatomic, copy) dispatch_block_t missionControlDidCommit;
 
 - (void)runWithCompletion:(MacWSPerformanceGestureCompletion)completion;
 

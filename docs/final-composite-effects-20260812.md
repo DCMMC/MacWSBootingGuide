@@ -152,3 +152,9 @@ receive-right replacement without a WindowServer or iOS restart.
 - Long-duration multi-Space, video and four-Scene pressure remain release
   gates even though this bounded gesture soak had stable PIDs and no command
   errors.
+- A Catalyst child carried by MacWSHost is not part of SkyLight's client-area
+  capture. Final-composite therefore preserves the native desktop and replaces
+  only the focused Catalyst window rectangle with that child's authenticated,
+  GPU-completed drawable. This exception is implemented by
+  `Rendering/MacWSCatalystDrawableCompositor.*`; VNC still shows SkyLight's
+  black client area and cannot validate this Host-only layer.

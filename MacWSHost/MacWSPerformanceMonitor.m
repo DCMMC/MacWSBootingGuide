@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 
 static const NSUInteger MacWSPerfRingCapacity = 512;
+static const NSUInteger MacWSPerfInputKindCapacity = 32;
 static const double MacWSPerfActiveGapMilliseconds = 150.0;
 static const double MacWSPerfInputActiveWindowMilliseconds = 250.0;
 static const double MacWSPerfTargetFrameMilliseconds = 1000.0 / 60.0;
@@ -165,6 +166,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     MacWSPerfRing _gpuExecution;
     MacWSPerfRing _captureToPresent;
     MacWSPerfRing _inputToPresent;
+    MacWSPerfRing _inputToPresentByKind[32];
     MacWSPerfSource _sources[64];
 
     UIVisualEffectView *_HUDMaterial;
@@ -321,6 +323,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     MacWSPerfRingReset(&_gpuExecution);
     MacWSPerfRingReset(&_captureToPresent);
     MacWSPerfRingReset(&_inputToPresent);
+    memset(_inputToPresentByKind, 0, sizeof(_inputToPresentByKind));
     memset(_sources, 0, sizeof(_sources));
     os_unfair_lock_unlock(&_lock);
     if (self.HUDMode != MacWSPerformanceHUDModeOff)
@@ -464,6 +467,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     if (!commandBuffer || !drawable ||
         !atomic_load(&_instrumentationActive)) return;
     __block uint64_t inputMachTime = 0;
+    __block uint16_t inputKind = 0;
     __block uint64_t measurementGeneration = 0;
     __block BOOL newlyReceivedFrame = NO;
     os_unfair_lock_lock(&_lock);
@@ -501,6 +505,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     newlyReceivedFrame = newlyReceivedFrame || dirtyFrameAfterReset;
     if (_pendingInputMachTime && inputTargetUpdated) {
         inputMachTime = _pendingInputMachTime;
+        inputKind = _pendingInputKind;
         _pendingInputMachTime = 0;
         _pendingInputKind = 0;
         _pendingInputTargetPID = 0;
@@ -585,8 +590,12 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
         else
             strongSelf->_staleCaptureSamples++;
         if (inputMachTime) {
-            MacWSPerfRingAppend(&strongSelf->_inputToPresent,
-                MacWSPerfMachMilliseconds(inputMachTime, callbackTime));
+            double latency = MacWSPerfMachMilliseconds(
+                inputMachTime, callbackTime);
+            MacWSPerfRingAppend(&strongSelf->_inputToPresent, latency);
+            if (inputKind < MacWSPerfInputKindCapacity)
+                MacWSPerfRingAppend(
+                    &strongSelf->_inputToPresentByKind[inputKind], latency);
         }
         os_unfair_lock_unlock(&strongSelf->_lock);
     }];
@@ -606,6 +615,14 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
     NSDictionary *gpu = MacWSPerfRingSummary(&_gpuExecution);
     NSDictionary *capturePresent = MacWSPerfRingSummary(&_captureToPresent);
     NSDictionary *inputPresent = MacWSPerfRingSummary(&_inputToPresent);
+    NSMutableDictionary<NSString *, NSDictionary *> *inputPresentByKind =
+        [NSMutableDictionary dictionary];
+    for (NSUInteger kind = 0; kind < MacWSPerfInputKindCapacity; kind++) {
+        if (_inputToPresentByKind[kind].count == 0) continue;
+        inputPresentByKind[[NSString stringWithFormat:@"%lu",
+            (unsigned long)kind]] = MacWSPerfRingSummary(
+                &_inputToPresentByKind[kind]);
+    }
     uint64_t framesReceived = _framesReceived;
     uint64_t contentFramesReceived = _contentFramesReceived;
     uint64_t geometryUpdatesReceived = _geometryUpdatesReceived;
@@ -736,6 +753,7 @@ static NSString *MacWSPerfThermalStateName(NSProcessInfoThermalState state) {
             @"gpu_execution": gpu,
             @"capture_to_visible_callback": capturePresent,
             @"input_dispatch_to_visible_callback": inputPresent,
+            @"input_dispatch_to_visible_by_kind": inputPresentByKind,
         },
         @"counters": @{
             @"frames_received": @(framesReceived),

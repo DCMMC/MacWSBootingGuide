@@ -10,3 +10,9 @@ gesture scheduling is implemented by `MacWSPerformanceGestureScenario`; the
 view supplies small emit callbacks so every scenario still crosses the exact
 production input boundary. New synthetic scenarios belong here rather than in
 transport, renderer or application-launch modules.
+
+`MacWSCatalystDrawableProbe` is likewise reachable only through the explicit
+`macwshost://test-catalyst-drawable?pid=...` URL. It is the sole owner of the
+read-only IOSurface scan and optional CPU copy used to prove third-party frame
+contents. The normal Catalyst receiver/compositor never calls it, never scans
+pixels, and never performs a readback.

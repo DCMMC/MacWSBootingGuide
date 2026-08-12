@@ -16,6 +16,7 @@ include $(THEOS_MAKE_PATH)/aggregate.mk
 # start Electron against a missing CGS session.
 after-stage::
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/gui-launchd
+	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/certificates
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS
 	@rm -rf $(THEOS_STAGING_DIR)/usr/macOS/bin/__pycache__
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1
@@ -35,6 +36,8 @@ after-stage::
 		$(THEOS_STAGING_DIR)/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd
 	@install -m 0644 misc/vscode-production-settings.json \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/settings.json
+	@install -m 0644 layout/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem \
+		$(THEOS_STAGING_DIR)/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem
 	@install -m 0644 misc/vscode-aquarium-runner/extensions.json \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/extensions.json
 	@install -m 0644 misc/vscode-aquarium-runner/package.json \

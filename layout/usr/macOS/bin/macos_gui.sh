@@ -2538,7 +2538,7 @@ publish_settings_service_contracts() {
 
 verify_preferences_persistence() {
     local value="" mission_control="" app_expose=""
-    local dock_magnification="" dock_large_size=""
+    local dock_magnification="" dock_large_size="" dock_minimize_effect=""
     rm -f "$LOGDIR/cfprefsd-probe.log"
     if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
             com.macwsguide.bootstrap PersistentPreferencesReady -bool true \
@@ -2573,6 +2573,9 @@ verify_preferences_persistence() {
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
        ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
             com.apple.dock largesize -int 128 \
+            >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
+       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+            com.apple.dock mineffect -string genie \
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1; then
         log "ERROR: native Dock gesture/magnification preferences could not be persisted."
         tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
@@ -2590,13 +2593,17 @@ verify_preferences_persistence() {
     dock_large_size=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
         com.apple.dock largesize 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || dock_large_size=""
+    dock_minimize_effect=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+        com.apple.dock mineffect 2>> \
+        "$LOGDIR/dock-gesture-preferences.log") || dock_minimize_effect=""
     if [ "$mission_control" != 1 ] || [ "$app_expose" != 1 ] ||
-       [ "$dock_magnification" != 1 ] || [ "$dock_large_size" != 128 ]; then
-        log "ERROR: native Dock preferences failed verification (Mission Control='$mission_control', App Expose='$app_expose', magnification='$dock_magnification', largesize='$dock_large_size')."
+       [ "$dock_magnification" != 1 ] || [ "$dock_large_size" != 128 ] ||
+       [ "$dock_minimize_effect" != genie ]; then
+        log "ERROR: native Dock preferences failed verification (Mission Control='$mission_control', App Expose='$app_expose', magnification='$dock_magnification', largesize='$dock_large_size', mineffect='$dock_minimize_effect')."
         tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
         return 1
     fi
-    log "Private macOS CFPreferences database ready; native gestures and maximum Dock hover magnification enabled."
+    log "Private macOS CFPreferences database ready; native gestures, Genie minimize and maximum Dock hover magnification enabled."
 }
 
 apply_workspace_wallpaper() {
