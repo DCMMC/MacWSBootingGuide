@@ -12,7 +12,7 @@ _THEOS_INTERNAL_IFLAGS_BASE = -I$(THEOS_TARGET_INCLUDE_PATH) \
 
 TOOL_NAME = macwsdisplayd
 
-macwsdisplayd_FILES = main.m
+macwsdisplayd_FILES = main.m MacWSFinalCompositeReceiver.m
 macwsdisplayd_CFLAGS = -fobjc-arc -fblocks -Wall -Wextra \
 	-I$(CURDIR)/../include -isystem $(CURDIR)/../vendor/ios-xpc
 macwsdisplayd_FRAMEWORKS = Foundation AppKit CoreFoundation CoreGraphics IOSurface

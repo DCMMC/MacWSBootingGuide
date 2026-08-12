@@ -16,11 +16,8 @@
 
 #include "macws_menu_protocol.h"
 #include "macws_display_geometry.h"
-#include "macws_final_composite_protocol.h"
 #include "macws_stream_protocol.h"
-
-extern pid_t audit_token_to_pid(audit_token_t token);
-extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+#import "MacWSFinalCompositeReceiver.h"
 
 // macOS 13.4 SkyLight RE witness (binary UUID
 // 96676A53-B1E0-3D7E-B98B-B73873CD1880):
@@ -54,9 +51,6 @@ static NSMutableDictionary<NSNumber *, id> *Leases;
 // the current native desktop immediately without waiting for unrelated damage.
 static IOSurfaceRef FinalCompositeSurface;
 static MacWSFinalCompositeRecord FinalCompositeRecord;
-static dispatch_source_t FinalCompositeSource;
-static mach_port_t FinalCompositeReceivePort = MACH_PORT_NULL;
-static _Atomic uint32_t FinalCompositeRejectWitnesses;
 // A SkyLight popup can disappear while its final AGX command buffer is still
 // retiring.  Keep the capture object alive for a bounded grace period instead
 // of synchronously stopping it from the catalog-removal stack.
@@ -117,7 +111,6 @@ static void RequestWorkspaceGeometrySample(void);
 static void ScheduleGeometryStreamRestart(void);
 static void ScheduleCatalogBroadcast(void);
 static void EnqueueRetiredTransientStop(dispatch_block_t stopBlock);
-static void StartFinalCompositeReceiver(void);
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static BOOL MacWSDisplayDiagnosticsEnabled(void) {
@@ -1025,26 +1018,6 @@ static void PublishFrame(MacWSDisplayClient *client,
     mach_port_deallocate(mach_task_self(), port);
 }
 
-static BOOL FinalCompositeProducerIsWindowServer(pid_t pid) {
-    if (pid <= 1) return NO;
-    char path[PATH_MAX] = {0};
-    int length = proc_pidpath(pid, path, sizeof(path));
-    if (length <= 0 || length >= (int)sizeof(path)) return NO;
-    path[sizeof(path) - 1] = '\0';
-    // Runtime-confirmed on the Ventura 13.4 rootfs: proc_pidpath resolves the
-    // framework's public Resources symlink through Versions/A, while earlier
-    // launch records preserved the public path.  Accept only these two exact
-    // WindowServer executable suffixes; the audit-token PID must still match
-    // the record PID before this path check is reached.
-    static const char versionedPath[] =
-        "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/"
-        "Resources/WindowServer";
-    static const char publicPath[] =
-        "/System/Library/PrivateFrameworks/SkyLight.framework/Resources/"
-        "WindowServer";
-    return strcmp(path, versionedPath) == 0 || strcmp(path, publicPath) == 0;
-}
-
 static void DeliverFinalComposite(
         IOSurfaceRef surface, MacWSFinalCompositeRecord record) {
     if (!surface) return;
@@ -1073,164 +1046,6 @@ static void DeliverFinalComposite(
                    record.width, record.height, record.bytesPerRow,
                    (unsigned long)subscribers);
     }
-}
-
-static void StartFinalCompositeReceiver(void) {
-    mach_port_t receivePort = MACH_PORT_NULL;
-    kern_return_t result = bootstrap_check_in(
-        bootstrap_port, MACWS_FINAL_COMPOSITE_MACH_SERVICE, &receivePort);
-    if (result != BOOTSTRAP_SUCCESS || !MACH_PORT_VALID(receivePort)) {
-        DisplayLog(@"final-composite check-in failed service=%s kr=%d port=%u",
-                   MACWS_FINAL_COMPOSITE_MACH_SERVICE, result, receivePort);
-        return;
-    }
-    FinalCompositeReceivePort = receivePort;
-    FinalCompositeSource = dispatch_source_create(
-        DISPATCH_SOURCE_TYPE_MACH_RECV, (uintptr_t)receivePort, 0,
-        DisplayQueue);
-    dispatch_source_set_event_handler(FinalCompositeSource, ^{
-        for (;;) {
-            _Alignas(8) uint8_t bytes[
-                sizeof(MacWSFinalCompositeMachMessage) +
-                MAX_TRAILER_SIZE] = {0};
-            MacWSFinalCompositeMachMessage *message =
-                (MacWSFinalCompositeMachMessage *)bytes;
-            mach_msg_return_t received = mach_msg(
-                &message->header,
-                MACH_RCV_MSG | MACH_RCV_TIMEOUT |
-                    MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
-                    MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
-                0, sizeof(bytes), receivePort, 0, MACH_PORT_NULL);
-            if (received == MACH_RCV_TIMED_OUT) break;
-            if (received != MACH_MSG_SUCCESS) {
-                DisplayLog(@"final-composite receive failed kr=%d",
-                           received);
-                break;
-            }
-            mach_port_t surfacePort = message->surfacePort.name;
-            mach_msg_audit_trailer_t *trailer =
-                (mach_msg_audit_trailer_t *)(bytes +
-                    round_msg(message->header.msgh_size));
-            BOOL trailerValid =
-                (uint8_t *)(trailer + 1) <= bytes + sizeof(bytes) &&
-                trailer->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0 &&
-                trailer->msgh_trailer_size >= sizeof(*trailer);
-            pid_t senderPID = trailerValid
-                ? audit_token_to_pid(trailer->msgh_audit) : -1;
-            BOOL envelopeValid =
-                message->header.msgh_id ==
-                    MACWS_FINAL_COMPOSITE_MACH_MESSAGE_ID &&
-                message->header.msgh_size == sizeof(*message) &&
-                (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
-                message->body.msgh_descriptor_count == 1 &&
-                message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
-                MACH_PORT_VALID(surfacePort) && trailerValid;
-            if (!envelopeValid) {
-                // Destroy only a descriptor the kernel actually delivered as
-                // part of a complex message. Treating arbitrary bytes from an
-                // invalid envelope as a received right could deallocate an
-                // unrelated name in this task.
-                BOOL receivedPortDescriptor =
-                    (message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
-                    message->body.msgh_descriptor_count == 1 &&
-                    message->surfacePort.type == MACH_MSG_PORT_DESCRIPTOR &&
-                    MACH_PORT_VALID(surfacePort);
-                if (receivedPortDescriptor)
-                    (void)mach_port_deallocate(
-                        mach_task_self(), surfacePort);
-                uint32_t witness = atomic_fetch_add(
-                    &FinalCompositeRejectWitnesses, 1) + 1;
-                if (witness <= 8) {
-                    DisplayLog(@"final-composite-rejected stage=envelope "
-                               "witness=%u id=%d size=%u bits=%#x "
-                               "descriptors=%u type=%u port=%u trailer=%@",
-                               witness, message->header.msgh_id,
-                               message->header.msgh_size,
-                               message->header.msgh_bits,
-                               message->body.msgh_descriptor_count,
-                               message->surfacePort.type, surfacePort,
-                               trailerValid ? @"valid" : @"invalid");
-                }
-                continue;
-            }
-            MacWSFinalCompositeRecord record = message->record;
-            BOOL recordValid = MacWSFinalCompositeRecordIsValid(
-                &record, sizeof(record));
-            BOOL pidValid = record.producerPID == senderPID;
-            BOOL producerValid =
-                FinalCompositeProducerIsWindowServer(senderPID);
-            if (!recordValid || !pidValid || !producerValid) {
-                (void)mach_port_deallocate(mach_task_self(), surfacePort);
-                uint32_t witness = atomic_fetch_add(
-                    &FinalCompositeRejectWitnesses, 1) + 1;
-                if (witness <= 8) {
-                    char producerPath[PATH_MAX] = {0};
-                    (void)proc_pidpath(senderPID, producerPath,
-                                      sizeof(producerPath));
-                    DisplayLog(@"final-composite-rejected stage=identity "
-                               "witness=%u record=%@ record-pid=%d "
-                               "sender-pid=%d pid-match=%@ producer=%@ "
-                               "path=%s sequence=%llu surface=%u",
-                               witness, recordValid ? @"valid" : @"invalid",
-                               record.producerPID, senderPID,
-                               pidValid ? @"YES" : @"NO",
-                               producerValid ? @"YES" : @"NO",
-                               producerPath,
-                               (unsigned long long)record.sequence,
-                               record.surfaceID);
-                }
-                continue;
-            }
-            IOSurfaceRef surface = IOSurfaceLookupFromMachPort(surfacePort);
-            (void)mach_port_deallocate(mach_task_self(), surfacePort);
-            if (!surface) {
-                uint32_t witness = atomic_fetch_add(
-                    &FinalCompositeRejectWitnesses, 1) + 1;
-                if (witness <= 8) {
-                    DisplayLog(@"final-composite-rejected stage=surface-lookup "
-                               "witness=%u producer=%d sequence=%llu "
-                               "surface=%u",
-                               witness, senderPID,
-                               (unsigned long long)record.sequence,
-                               record.surfaceID);
-                }
-                continue;
-            }
-            BOOL surfaceValid = IOSurfaceGetID(surface) == record.surfaceID &&
-                IOSurfaceGetWidth(surface) == record.width &&
-                IOSurfaceGetHeight(surface) == record.height &&
-                IOSurfaceGetBytesPerRow(surface) == record.bytesPerRow &&
-                (IOSurfaceGetPixelFormat(surface) == 0 ||
-                 IOSurfaceGetPixelFormat(surface) ==
-                    record.ioSurfacePixelFormat);
-            if (surfaceValid) {
-                DeliverFinalComposite(surface, record);
-            } else {
-                uint32_t witness = atomic_fetch_add(
-                    &FinalCompositeRejectWitnesses, 1) + 1;
-                if (witness <= 8) {
-                    DisplayLog(@"final-composite-rejected stage=surface "
-                               "witness=%u producer=%d sequence=%llu "
-                               "expected=(%u %ux%u bpr=%u pf=%08x) "
-                               "actual=(%u %zux%zu bpr=%zu pf=%08x)",
-                               witness, senderPID,
-                               (unsigned long long)record.sequence,
-                               record.surfaceID, record.width, record.height,
-                               record.bytesPerRow,
-                               record.ioSurfacePixelFormat,
-                               IOSurfaceGetID(surface),
-                               IOSurfaceGetWidth(surface),
-                               IOSurfaceGetHeight(surface),
-                               IOSurfaceGetBytesPerRow(surface),
-                               IOSurfaceGetPixelFormat(surface));
-                }
-            }
-            CFRelease(surface);
-        }
-    });
-    dispatch_resume(FinalCompositeSource);
-    DisplayLog(@"final-composite receiver-ready service=%s port=%u",
-               MACWS_FINAL_COMPOSITE_MACH_SERVICE, receivePort);
 }
 
 static CGDisplayStreamRef CreateStream(MacWSDisplayClient *client) {
@@ -2655,7 +2470,14 @@ int main(void) {
                 AcceptConnection((xpc_connection_t)event);
         });
         xpc_connection_resume(listener);
-        StartFinalCompositeReceiver();
+        MacWSStartFinalCompositeReceiver(
+            DisplayQueue,
+            ^(IOSurfaceRef surface, MacWSFinalCompositeRecord record) {
+                DeliverFinalComposite(surface, record);
+            },
+            ^(NSString *message) {
+                DisplayLog(@"%@", message);
+            });
         DisplayLog(@"READY service=%s protocol=%u", MACWS_STREAM_SERVICE,
                    MACWS_STREAM_VERSION);
         dispatch_main();
