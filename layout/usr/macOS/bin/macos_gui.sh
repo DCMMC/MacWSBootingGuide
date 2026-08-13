@@ -226,6 +226,10 @@ P_PBOARD='/usr/libexec/pboard'
 P_PBS='/System/Library/CoreServices/pbs'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
+P_AMADINE='/Applications/Amadine.app/Contents/MacOS/Amadine'
+P_WORD='/Applications/Microsoft Word.app/Contents/MacOS/Microsoft Word'
+P_EXCEL='/Applications/Microsoft Excel.app/Contents/MacOS/Microsoft Excel'
+P_POWERPOINT='/Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint'
 P_MAPS='/System/Applications/Maps.app/Contents/MacOS/Maps'
 P_SYSTEM_SETTINGS='/System/Applications/System Settings.app/Contents/MacOS/System Settings'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
@@ -418,6 +422,21 @@ kill_by_pattern() {
         esac
     done
     return 0
+}
+
+# Third-party AppKit applications are just as tightly bound to their creating
+# WindowServer generation as the system applications above.  Runtime-confirmed
+# 2026-08-13 in Amadine.host.log and all three Office host logs: after a WS
+# replacement each process received "WindowServer event port death" and
+# "port matched the WindowServer port created in BindCGSToRunLoop", then
+# remained alive with no reusable window.  Retire those exact executables at
+# the same lifecycle boundary so Host never mistakes a dead CGS client for an
+# application it can reopen.
+kill_third_party_ws_clients() {
+    kill_by_pattern "$P_AMADINE"
+    kill_by_pattern "$P_WORD"
+    kill_by_pattern "$P_EXCEL"
+    kill_by_pattern "$P_POWERPOINT"
 }
 
 # AppKit clients can ignore or remain stuck while handling SIGTERM.  A plain
@@ -656,6 +675,7 @@ stop_ws_dependents() {
     kill_by_pattern "$P_TERMINAL"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
+    kill_third_party_ws_clients
     kill_by_pattern "$P_MAPS"
     # Like Maps, System Settings owns a WindowServer-bound AppKit shell plus
     # ExtensionKit child scenes.  Keeping that shell across a WindowServer
@@ -2312,6 +2332,7 @@ cleanup_macos() {
     kill_by_pattern "$P_OFFICE_LICENSING"
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
+    kill_third_party_ws_clients
     # Maps cannot survive a WindowServer generation change: its CGS port is
     # permanently bound to the retired server even if the Catalyst carrier
     # process remains live.  The old omission made the next launch falsely

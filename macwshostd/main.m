@@ -749,6 +749,8 @@ static BOOL StopGUI(NSString **message) {
     (void)RunCommand(unloadUIKitSystem, YES);
     const char *appNames[] = {"GlassDemo", "Terminal", "Activity Monitor",
                               "Finder", "System Settings", "Maps",
+                              "Amadine", "Microsoft Word", "Microsoft Excel",
+                              "Microsoft PowerPoint",
                               "MacWSCatalystLauncher", "UIKitSystem"};
     for (NSUInteger i = 0; i < sizeof(appNames) / sizeof(appNames[0]); i++) {
         const char *killArgv[] = {kKillall, "-9", appNames[i], NULL};
