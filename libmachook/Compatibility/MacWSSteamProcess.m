@@ -13,7 +13,9 @@
 // 1785799196 (arm64). RE-confirmed in libtier0_s.dylib at +0xd91c:
 //
 //   x0 command/argv, x1 flags, x2 cwd
-//   bit 1: setpgrp + setsid
+//   bit 1: setpgrp, then setsid (the latter necessarily fails after the child
+//          became a process-group leader, so the effective contract is a new
+//          process group in the parent's existing session)
 //   bit 2: shell command, bit 3: execv argv, bit 4: execvp argv
 //
 // Steam's webhelper call site in chromehtml.dylib at +0x71da0 passes 0x0a,
@@ -32,6 +34,7 @@ static MacWSCreateSimpleProcessFunction gMacWSOriginalCreateSimpleProcess;
 static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
                                          const char *workingDirectory);
 static bool MacWSPathEndsWith(const char *path, const char *suffix);
+static bool MacWSIsTopLevelSteamBrowser(void);
 
 static void MacWSRebindSteamProcessImport(const struct mach_header *header,
                                            intptr_t slide) {
@@ -456,15 +459,32 @@ static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
         result = addChdir ? addChdir(&actions, workingDirectory) : ENOSYS;
     }
 
-    // Preserve Valve's signal-mask contract. RE-confirmed
-    // libtier0_s.dylib _CreateSimpleProcess+0x34..+0x14c calls fork,
-    // setpgrp/setsid, chdir and execv/execvp, but does not change SIGCHLD.
-    // Blocking SIGCHLD here changes Chromium's child lifecycle and made the
-    // browser repeatedly lose its renderer. posix_spawn already inherits the
-    // caller's mask when POSIX_SPAWN_SETSIGMASK is absent.
+    // Preserve Valve's actual process-group and signal-mask contract.
+    // RE-confirmed in client 1785799196's arm64 libtier0_s.dylib:
+    //   +0x40 fork
+    //   +0x44 setpgrp; +0x48 setsid
+    //   +0x60 sigprocmask(SIG_UNBLOCK, { SIGCHLD }, NULL)
+    // Calling setpgrp first makes the child a process-group leader, so the
+    // following setsid necessarily fails with EPERM; POSIX_SPAWN_SETSID was
+    // therefore observably different (new session) from Valve's effective
+    // contract. Build a new process group in the existing session and apply
+    // the parent's mask with SIGCHLD removed atomically at spawn.
     short attributeFlags = 0;
-    if (flags & 0x02) attributeFlags |= POSIX_SPAWN_SETSID;
-    if (result == 0 && attributeFlags != 0)
+    if (result == 0 && (flags & 0x02)) {
+        result = posix_spawnattr_setpgroup(&attributes, 0);
+        if (result == 0) attributeFlags |= POSIX_SPAWN_SETPGROUP;
+    }
+    sigset_t childSignalMask;
+    if (result == 0 &&
+        sigprocmask(SIG_SETMASK, NULL, &childSignalMask) != 0)
+        result = errno;
+    if (result == 0 && sigdelset(&childSignalMask, SIGCHLD) != 0)
+        result = errno;
+    if (result == 0) {
+        result = posix_spawnattr_setsigmask(&attributes, &childSignalMask);
+        if (result == 0) attributeFlags |= POSIX_SPAWN_SETSIGMASK;
+    }
+    if (result == 0)
         result = posix_spawnattr_setflags(&attributes, attributeFlags);
 
     pid_t child = 0;

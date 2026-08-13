@@ -19,9 +19,12 @@ after-stage::
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/certificates
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS
 	@rm -rf $(THEOS_STAGING_DIR)/usr/macOS/bin/__pycache__
+	@rm -f $(THEOS_STAGING_DIR)/usr/macOS/bin/.ldid.entitlements.plist
 	@mkdir -p $(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1
 	@install -m 0644 misc/com.macwsguide.vscode.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
+	@install -m 0644 misc/com.macwsguide.steam.runtime.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist
 	@install -m 0644 misc/com.macwsguide.macos-locationd.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.macos-locationd.plist
 	@install -m 0644 misc/com.macwsguide.corelocationagent.plist \
@@ -48,3 +51,9 @@ after-stage::
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/repack_metallib_macabi.py
 	@install -m 0644 misc/add_macho_load_dylib.py \
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/add_macho_load_dylib.py
+	@install -m 0644 misc/patch_electron_pa_ios_va.py \
+		misc/patch_steam_cef126_pa_ios_va.py \
+		misc/refresh_steam_inventory.py \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/
+	@install -m 0755 misc/run_steam_live.sh \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/run_steam_live.sh

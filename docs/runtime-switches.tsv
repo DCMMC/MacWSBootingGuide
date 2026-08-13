@@ -9,6 +9,7 @@ env	DYLD_INSERT_LIBRARIES	auto	launchdchrootexec	Launcher selects the matching t
 env	DRAW_DELAY	off	standalone probe	Delays the drawtest test window.
 env	ELECTRON_RUN_AS_NODE	transient	VS Code shell environment resolver	Official VS Code marker paired with VSCODE_RESOLVING_ENVIRONMENT; never set by a production plist.
 env	HOME	auto	chroot/iOS launchers	Launcher-owned home directory appropriate to the target execution namespace.
+env	LOGNAME	auto	Steam launchd job	Matches the uid-501 chroot user identity expected by Valve's bootstrap.
 env	IOSCLEAR_DRAW_MODE	off	standalone probe	Selects an iosclear reference draw experiment.
 env	IOSCLEAR_DUMP_AGX_METHODS	off	standalone probe	Dumps AGX methods from iosclear_ref.
 env	IOSCLEAR_EARLY_DELAY	off	standalone probe	Delays the early iosclear reference path.
@@ -78,8 +79,8 @@ env	MACWS_GOT_SKIP_AUTH	off	diagnostic	Skips authenticated GOT repair entries.
 env	MACWS_HID_BYPASS	off	diagnostic/A-B	Broad HID compatibility hooks are not production-safe.
 env	MACWS_IOMFB_SWAP_TRACE	off	diagnostic	Swap ABI trace.
 env	MACWS_IOSURF_TRACE	off	diagnostic	Per-IOSurface creation trace.
-env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome	Chromium MAP_JIT/W^X compatibility without verbose trace.
-env	MACWS_JIT_FAULT_WRITE_COMPAT	on	VS Code	Page-granular V8 W^X adapter; only faulted 16-KiB writer pages become RW before RX restore.
+env	MACWS_JIT_MPROTECT_COMPAT	on	VS Code,Chrome,Steam	Chromium MAP_JIT/W^X compatibility without verbose trace.
+env	MACWS_JIT_FAULT_WRITE_COMPAT	on	VS Code,Steam	Page-granular V8/CEF W^X adapter; only faulted 16-KiB writer pages become RW before RX restore.
 env	MACWS_JIT_MPROTECT_TRACE	off	diagnostic	Per-mprotect JIT trace.
 env	MACWS_LAUNCHPAD_TRACE	off	diagnostic	Dock-only Launchpad source validation/bring-up/rescan trace; never enable in production.
 env	MACWS_LOCATIOND_MIG_TRACE	off	diagnostic	Bounded 256-record locationd dispatch-MIG receive/demux trace; production leaves the native callback unchanged.
@@ -95,6 +96,28 @@ env	MACWS_KEEP_ASSERT_BYPASS	off	safety invariant	Real assertions remain enabled
 env	MACWS_KEEP_FORCE_ACCEL	off	legacy simulator control	Simulator force-accelerator shim remains disabled.
 env	MACWS_KEEP_RENDER_UPDATE_CBZ	off	A/B control	Restores historical SkyLight render-update branch.
 env	MACWS_KEEP_VALIDATE_ALWAYS	off	diagnostic scaffold	Forces historical validate bypass behavior.
+env	MACWS_FINAL_COMPOSITE	on	WindowServer	Publishes the authenticated completed final composite consumed by displayd/Host.
+env	MACWS_PROBE_ICON_RECORD	off	standalone ExtensionRecord probe	Exercises the icon-record query after the ordinary extension graph setup.
+env	MACWS_PROBE_ICON_RECORD_EARLY	off	standalone ExtensionRecord probe	Exercises the icon-record query before the ordinary extension graph setup.
+env	MACWS_PROBE_NO_APPKIT_APP	off	standalone ExtensionRecord probe	Skips NSApplication construction for a bounded AppKit dependency A/B.
+env	MACWS_PROBE_NO_VARIANT_MATRIX	off	standalone ExtensionRecord probe	Skips the bounded symbol variant matrix used by the graphics probe.
+env	MACWS_PROBE_STOP_BEFORE_GRAPHIC_RENDER	off	standalone ExtensionRecord probe	Stops before the diagnostic graphic-render operation for LLDB attachment.
+env	MACWS_UTILITY_PROCESS	transient	postinst macOS utilities	Keeps signing/verification utilities outside GUI, input and Metal application hooks.
+env	MACWS_DISABLE_STEAM_PROCESS_COMPAT	off	Steam A/B diagnostic	Disables the exact Valve child-process adapter for a bounded comparison only.
+env	MACWS_STEAM_EXIT_DIAGNOSTICS	off	Steam diagnostic	Installs bounded top-level Helper exit backtraces; never enabled in production.
+env	MACWS_STEAM_EXIT_STOP	off	Steam diagnostic	Stops the top-level Helper at an observed exit for LLDB attachment.
+env	MACWS_STEAM_LAUNCH_EPOCH	transient	Steam launch transaction	Identifies one outer bootstrap/live-client family so hostd resets its semaphore namespace exactly once.
+env	MACWS_STEAM_NATIVE_BROWSER_LAUNCH	on	Steam	Preserves Valve's top-level WebUI transport fork while atomically spawning Chromium descendants.
+env	MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS	off	Steam diagnostic	Leaves the top-level Helper's native fault visible to CrashReporter/LLDB during an explicit diagnostic.
+env	MACWS_STEAM_PIPE_DIAGNOSTICS	off	Steam diagnostic	Records bounded steam.pipe syscalls without changing results.
+env	MACWS_STEAM_PROCESS_DIAGNOSTICS	off	Steam diagnostic	Records exact Valve process-adapter decisions and child argv.
+env	MACWS_STEAM_PROCESS_TRACE_ONLY	off	Steam A/B diagnostic	Observes process launch calls while retaining Valve's implementation.
+env	MACWS_STEAM_SEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded named-semaphore lifecycle and value transitions.
+env	MACWS_STEAM_VA_DIAGNOSTICS	off	Steam diagnostic	Records only Steam's GiB-scale virtual-memory reservations.
+env	MACWS_STEAM_VOLUME_DIAGNOSTICS	off	Steam diagnostic	Records exact storage-volume property queries used by the Steam bootstrap.
+env	SDL_JOYSTICK_HIDAPI	off	Steam client UI	Disables SDL HIDAPI joystick discovery in the chroot; does not affect macOS input bridging.
+env	SDL_JOYSTICK_IOKIT	off	Steam client UI	Disables SDL's incompatible direct IOKit joystick discovery in the chroot.
+env	SDL_JOYSTICK_MFI	off	Steam client UI	Disables SDL MFi joystick discovery in the chroot.
 env	MACWS_MACH_MSG_TRACE	off	diagnostic	Mach-message trace.
 env	MACWS_MACOS_SYSTEM_POLICY_COMPAT	on	VS Code,Chrome	Narrow Chromium system-policy compatibility.
 env	MACWS_METAL_PROBE_DUMP_EVENT_IMP	off	standalone probe	Dumps the Metal event implementation pointer.
@@ -206,6 +229,8 @@ flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
 flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
 flag	/tmp/macws_app_input_diagnostics	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 flag	/tmp/macws_file_panel_diag	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls; production startup removes it.
+flag	/tmp/macws_final_composite	on	WindowServer	Authoritative sentinel enabling authenticated final-composite publication to displayd/Host.
+flag	/tmp/macws_probe_stop_before_graphic	off	standalone ExtensionRecord probe	File-form LLDB stop before the bounded graphic-render diagnostic.
 flag	/tmp/macws_asphalt_random_diag	off	Asphalt diagnostic	Enables one-launch read-only entropy/TLS source tracing; production startup removes it.
 flag	/tmp/macws_asphalt_identity_diag	off	Asphalt diagnostic	Enables one-launch Security/identifier status tracing; production startup removes it.
 flag	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled	off	SpringBoard windowing	Emergency opt-out for MacWS dense Stage Manager size candidates; absence means the production grid expansion remains enabled.

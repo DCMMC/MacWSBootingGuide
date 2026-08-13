@@ -4,6 +4,7 @@
 #import "interpose.h"
 
 #include <fcntl.h>
+#include <crt_externs.h>
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <stdarg.h>
@@ -78,10 +79,22 @@ DYLD_INTERPOSE(MacWSSteamPipeUnlink, unlink)
 // the faulting state. Refuse only CydiaSubstrate's exact installation call
 // under an explicit one-shot flag; every other task_set_exception_ports call
 // and all production runs preserve the native kernel result.
+static bool MacWSIsTopLevelSteamHelperForNativeException(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Steam Helper")) return false;
+    char ***argumentsPointer = _NSGetArgv();
+    char **arguments = argumentsPointer ? *argumentsPointer : NULL;
+    for (size_t index = 1; arguments && arguments[index]; index++) {
+        if (!strncmp(arguments[index], "--type=", 7)) return false;
+    }
+    return true;
+}
+
 static kern_return_t MacWSSteamDiagnosticTaskSetExceptionPorts(
     task_t task, exception_mask_t mask, mach_port_t newPort,
     exception_behavior_t behavior, thread_state_flavor_t flavor) {
-    if (getenv("MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS")) {
+    if (getenv("MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS") &&
+        MacWSIsTopLevelSteamHelperForNativeException()) {
         Dl_info caller = {0};
         void *returnAddress = __builtin_return_address(0);
         if (dladdr(returnAddress, &caller) && caller.dli_fname &&
@@ -177,7 +190,8 @@ static void MacWSSteamCapitalExit(int status) {
 
 __attribute__((constructor))
 static void MacWSInstallSteamExitDiagnostics(void) {
-    if (!getenv("MACWS_STEAM_EXIT_DIAGNOSTICS")) return;
+    if (!getenv("MACWS_STEAM_EXIT_DIAGNOSTICS") ||
+        !MacWSIsTopLevelSteamHelperForNativeException()) return;
     atexit(MacWSSteamExitDiagnostics);
     void *exitTarget = dlsym(RTLD_DEFAULT, "exit");
     void *underscoreExitTarget = dlsym(RTLD_DEFAULT, "_exit");

@@ -47,6 +47,7 @@ FLAG="$ROOTFS/tmp/ws_headless"                 # coexistence flag (chroot /tmp/w
 MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + required macOS services
 WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
+SHAREDFILELISTD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.sharedfilelistd.plist"
 SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
 FONTD_PLIST="$MACOS_DAEMONS/com.macwsguide.xtyped.plist"
 VIEWBRIDGE_PLIST="$MACOS_DAEMONS/com.macwsguide.viewbridge.plist"
@@ -119,9 +120,12 @@ EXTENSIONKIT_LABEL=com.macwsguide.extensionkit
 HISERVICES_LABEL=com.macwsguide.hiservices
 GEOD_LABEL=com.macwsguide.geod
 OFFICE_LICENSING_LABEL=com.macwsguide.office-licensing
+SHAREDFILELISTD_LABEL=com.apple.coreservices.sharedfilelistd
 WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
+STEAM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.steam.runtime.plist"
+STEAM_LABEL=com.macwsguide.steam
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
 VSCODE_PROFILE_DIR="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-targetfix13"
 VSCODE_EXTENSIONS_DIR="$ROOTFS/private/tmp/macws-vscode-extensions"
@@ -218,6 +222,7 @@ BACKBOARDD=/System/Library/LaunchDaemons/com.apple.backboardd.plist
 # never hit an iOS process by accident — iOS has no WindowServer/launchservicesd).
 P_WINDOWSERVER='SkyLight.framework/Resources/WindowServer'
 P_LAUNCHSERVICESD='CoreServices/launchservicesd'
+P_SHAREDFILELISTD='/System/Library/CoreServices/sharedfilelistd'
 P_SYSTEMSTATUSD='SystemStatusServer.framework/Support/systemstatusd'
 P_FONTD='ATS.framework/Support/fontd'
 P_OSXVNC='OSXvnc-server'
@@ -246,6 +251,9 @@ P_DISPLAYD='/usr/local/bin/macwsdisplayd'
 P_INTEROPD='/usr/local/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd'
 P_VSCODE='Visual Studio Code.app/Contents/'
 P_CHROME150='Google Chrome.app/Contents/'
+P_STEAM_OUTER='/Applications/Steam.app/Contents/MacOS/steam_osx'
+P_STEAM_LIVE='/Steam.AppBundle/Steam/Contents/MacOS/steam_osx'
+P_STEAM_HELPER='Steam Helper.app/Contents/MacOS/Steam Helper'
 
 # Opt-in invocation audit for tracking an unexpected second start/stop without
 # leaving permanent command logging in normal use.  The 2026-07-29 controlled
@@ -628,6 +636,10 @@ stop_ws_dependents() {
     launchctl remove "$VIEWBRIDGE_LABEL" 2>/dev/null
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl unload "$STEAM_PLIST" 2>/dev/null
+    launchctl remove "$STEAM_LABEL" 2>/dev/null
+    launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null
+    launchctl remove "$SHAREDFILELISTD_LABEL" 2>/dev/null
 
     # These are on-demand Ventura location services, kept outside the
     # auto-scanned LaunchDaemons directory so they can never race a missing
@@ -668,6 +680,8 @@ stop_ws_dependents() {
     # disposable browser jobs in that actual domain as well.
     launchctl asuser 501 launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl asuser 501 launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl asuser 501 launchctl unload "$STEAM_PLIST" 2>/dev/null
+    launchctl asuser 501 launchctl remove "$STEAM_LABEL" 2>/dev/null
     launchctl asuser 501 launchctl unload "$CHROME150_PLIST" 2>/dev/null
     launchctl asuser 501 launchctl remove "$CHROME150_LABEL" 2>/dev/null
 
@@ -692,10 +706,14 @@ stop_ws_dependents() {
     kill_by_pattern "$P_ICONSERVICESAGENT"
     kill_by_pattern "$P_ICONSERVICESD"
     kill_by_pattern "$P_CSNAMEDDATAD"
+    kill_by_pattern "$P_SHAREDFILELISTD"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
     kill_by_pattern "$P_VSCODE"
+    kill_by_pattern "$P_STEAM_OUTER"
+    kill_by_pattern "$P_STEAM_LIVE"
+    kill_by_pattern "$P_STEAM_HELPER"
     kill_by_pattern "$P_CHROME150"
     finish_pattern_cleanup
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
@@ -703,6 +721,46 @@ stop_ws_dependents() {
     rm -f "$ROOTFS"/private/tmp/macws_menu_client.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_menu_snapshot.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
+}
+
+start_sharedfilelistd() {
+    local waited=0
+
+    # AppKit populates the Apple menu and Steam initializes its login UI via
+    # LSSharedFileListCopySnapshot. On the 2026-08-14 production run the real
+    # Steam main thread blocked synchronously in SFLLoginItemList because the
+    # corresponding Ventura Mach service had never been loaded. Loading this
+    # stock daemon live released that exact call and Steam immediately reached
+    # its Web Helper launch. Treat the process surviving its startup window as
+    # the readiness witness; a registered MachService alone is insufficient.
+    if proc_running "$P_SHAREDFILELISTD"; then
+        launchctl list "$SHAREDFILELISTD_LABEL" >/dev/null 2>&1 && {
+            log "macOS SharedFileList endpoint already ready."
+            return 0
+        }
+        kill_by_pattern "$P_SHAREDFILELISTD"
+        finish_pattern_cleanup
+    fi
+
+    log "Starting macOS SharedFileList service before GUI applications..."
+    rm -f "$LOGDIR/sharedfilelistd.out" "$LOGDIR/sharedfilelistd.err"
+    launchctl load "$SHAREDFILELISTD_PLIST" || return 1
+    while ! proc_running "$P_SHAREDFILELISTD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_SHAREDFILELISTD" || {
+        log "ERROR: macOS sharedfilelistd did not reach a live process."
+        tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
+        return 1
+    }
+    sleep 2
+    proc_running "$P_SHAREDFILELISTD" || {
+        log "ERROR: macOS sharedfilelistd exited during its readiness window."
+        tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
+        return 1
+    }
+    log "macOS SharedFileList endpoint ready."
 }
 
 wait_for_replacement_ws() {
@@ -827,6 +885,10 @@ recover_ws_dependents() {
     [ ! -f "$LSD_SYSTEM_PLIST" ] || \
         launchctl load "$LSD_SYSTEM_PLIST" 2>/dev/null
     [ ! -f "$LSD_PLIST" ] || launchctl load "$LSD_PLIST" 2>/dev/null
+    start_sharedfilelistd || {
+        log "watchdog: macOS SharedFileList endpoint did not recover"
+        return 1
+    }
     [ ! -f "$ICONSERVICESD_PLIST" ] || \
         launchctl load "$ICONSERVICESD_PLIST" 2>/dev/null
     [ ! -f "$ICONSERVICESAGENT_PLIST" ] || \
@@ -2166,7 +2228,7 @@ production_preflight() {
     # environment.  Functional compatibility variables are documented and
     # intentionally excluded from this deny-list.
     for plist in "$WINDOWSERVER_PLIST" "$VNC_PLIST" "$TERM_PLIST" \
-                 "$VSCODE_PLIST" "$CHROME150_PLIST"; do
+                 "$VSCODE_PLIST" "$CHROME150_PLIST" "$STEAM_PLIST"; do
         [ -f "$plist" ] || continue
         if plutil "$plist" 2>/dev/null | grep -Eq \
             '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_APP_INPUT_DIAGNOSTICS|MACWS_FILE_PANEL_DIAG|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG|MACWS_RANDOM_DIAGNOSTICS|MACWS_IDENTITY_DIAGNOSTICS|MACWS_XPC_NAME_TRACE)"?[[:space:]]*='; then
@@ -2265,11 +2327,13 @@ cleanup_macos() {
     launchctl unload "$PBOARD_PLIST" 2>/dev/null
     launchctl unload "$PBS_PLIST" 2>/dev/null
     launchctl unload "$OFFICE_LICENSING_PLIST" 2>/dev/null
+    launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl remove "$PBOARD_LABEL" 2>/dev/null
     launchctl remove "$PBS_LABEL" 2>/dev/null
     launchctl remove "$OFFICE_LICENSING_LABEL" 2>/dev/null
+    launchctl remove "$SHAREDFILELISTD_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
     launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
@@ -2313,6 +2377,8 @@ cleanup_macos() {
     # Unload the exact optional job whenever its owning GUI stack is torn down.
     launchctl unload "$VSCODE_PLIST" 2>/dev/null
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
+    launchctl unload "$STEAM_PLIST" 2>/dev/null
+    launchctl remove "$STEAM_LABEL" 2>/dev/null
 
     # These are on-demand Ventura services outside the auto-scanned daemon
     # directory. Unload exact jobs; killing `locationd` by process name would
@@ -2347,10 +2413,14 @@ cleanup_macos() {
     kill_by_pattern "$P_CONTROL_CENTER"
     kill_by_pattern "$P_ICONSERVICESAGENT"
     kill_by_pattern "$P_ICONSERVICESD"
+    kill_by_pattern "$P_SHAREDFILELISTD"
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
     kill_by_pattern "$P_VSCODE"
+    kill_by_pattern "$P_STEAM_OUTER"
+    kill_by_pattern "$P_STEAM_LIVE"
+    kill_by_pattern "$P_STEAM_HELPER"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_menu_client.*.sock
@@ -2363,6 +2433,7 @@ cleanup_macos() {
     # 4) anything still lingering
     kill_by_pattern "$P_WINDOWSERVER"
     kill_by_pattern "$P_LAUNCHSERVICESD"
+    kill_by_pattern "$P_SHAREDFILELISTD"
     kill_by_pattern "$P_SYSTEMSTATUSD"
     kill_by_pattern "$P_FONTD"
     finish_pattern_cleanup
@@ -2960,6 +3031,8 @@ start_macos() {
     }
     log "Legacy macOS LaunchServices endpoint ready."
 
+    start_sharedfilelistd || return 1
+
     log "Loading input bridge and WindowServer..."
     launchctl load "$INPUT_PLIST" || return 1
     launchctl load "$WINDOWSERVER_PLIST" || return 1
@@ -3156,7 +3229,7 @@ status() {
     fi
     echo
     echo "-- processes --"
-    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SYSTEMSTATUSD|$P_FONTD|$P_PBOARD|$P_PBS|$P_FINDER|$P_DOCK|$P_SYSTEMUI|$P_CONTROL_CENTER" \
+    ps aux | grep -iE "$P_WINDOWSERVER|$P_OSXVNC|$P_TERMINAL|$P_LAUNCHSERVICESD|$P_SHAREDFILELISTD|$P_SYSTEMSTATUSD|$P_FONTD|$P_PBOARD|$P_PBS|$P_FINDER|$P_DOCK|$P_SYSTEMUI|$P_CONTROL_CENTER" \
         | grep -v grep || echo "(none running)"
     echo
     echo "-- launchd jobs --"
@@ -3194,7 +3267,7 @@ switch_status() {
     echo
     echo "-- configured launch environments --"
     for path in "$WINDOWSERVER_PLIST" "$VNC_PLIST" "$TERM_PLIST" \
-                "$VSCODE_PLIST" "$CHROME150_PLIST"; do
+                "$VSCODE_PLIST" "$CHROME150_PLIST" "$STEAM_PLIST"; do
         [ -f "$path" ] || continue
         echo "[$path]"
         plutil "$path" 2>/dev/null | sed -n '/EnvironmentVariables =/,/^    };/p'

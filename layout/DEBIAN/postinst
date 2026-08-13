@@ -423,6 +423,11 @@ if [ -d "$ROOTFS/System/Library" ]; then
         install_chroot_runtime "/var/jb/usr/macOS/bin/$bridge" \
             "$ROOTFS/usr/local/bin/$bridge" || exit 1
     done
+    # Steam's launchd job enters the chroot before invoking this script. Keep
+    # its source in package storage and publish one atomic rootfs copy so a
+    # reboot or package reinstall cannot depend on a historical /tmp file.
+    install_chroot_runtime "/var/jb/usr/macOS/bin/run_steam_live.sh" \
+        "$ROOTFS/usr/local/bin/macws-run-steam.sh" || exit 1
     # Wallpaper is package data, not executable runtime. Publish it with an
     # atomic inode replacement so a cold rootfs never observes a partial PNG.
     # Unlike install_chroot_runtime it deliberately needs neither signing nor

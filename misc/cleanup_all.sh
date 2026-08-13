@@ -55,7 +55,9 @@ for pat in WindowServer launchservicesd OSXvnc-server Terminal GlassDemo \
            "Activity Monitor" launchdchrootexec MTLSimDriverHost macwsinputd \
            macwsdisplayd macwsinteropd \
            "Visual Studio Code.app" "Code Helper" \
-           "Google Chrome.app" "Chrome Helper" MacWSHost; do
+           "Google Chrome.app" "Chrome Helper" \
+           "/Applications/Steam.app/Contents/MacOS/steam_osx" \
+           "/Library/Application Support/Steam/.*Steam Helper" MacWSHost; do
   pkill -9 -f "$pat" 2>/dev/null
 done
 
@@ -102,7 +104,7 @@ sleep 2
 echo
 echo === final state ===
 ps aux | grep -iE \
-  "WindowServer|macwsallocd|macwsinputd|macwsdisplayd|macwsinteropd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|MacWSHost" \
+  "WindowServer|macwsallocd|macwsinputd|macwsdisplayd|macwsinteropd|OSXvnc|autosignd|launchdchroot|GlassDemo|Terminal|launchservicesd|Visual Studio Code|Code Helper|Google Chrome|Chrome Helper|Steam Helper|Steam.app/Contents/MacOS/steam_osx|MacWSHost" \
   | grep -v grep | head -10 || echo "(none)"
 echo
 uptime

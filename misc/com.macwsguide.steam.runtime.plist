@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Optional runtime job for an installed Steam client.  It intentionally
+      lives under misc rather than the package LaunchDaemons directory: Steam
+      should start when the user requests it, not on every MacWS cold start.
+    -->
+    <key>Label</key>
+    <string>com.macwsguide.steam</string>
+    <key>POSIXSpawnType</key>
+    <string>Interactive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- This short iOS-side preflight runs as the launchd job owner before
+             launchdchrootexec drops to uid/gid 501. A root-owned stale FIFO
+             from an interrupted older run made Steam's real NamedPipe open
+             fail with EACCES, leaving the updater onscreen after verification.
+             Only Steam's exact private endpoints are retired, and only while
+             this single-instance job is starting. -->
+        <string>/var/jb/usr/bin/sh</string>
+        <string>-c</string>
+		<string>/var/jb/usr/bin/rm -f /var/mnt/rootfs/private/tmp/steam.pipe; /var/jb/usr/bin/find /var/mnt/rootfs/private/tmp -maxdepth 1 \( -type f -o -type p -o -type s \) \( -name '.macws-steam-sem-*' -o -name '.macws-sysvsem-*' -o -name 'steam_chrome_shmem_uid501_spid*' -o -name 'steam??????' \) -delete; exec /var/jb/usr/macOS/bin/launchdchrootexec 501 501 /var/mnt/rootfs /bin/bash /usr/local/bin/macws-run-steam.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>/Users/root</string>
+        <key>USER</key><string>mobile</string>
+        <key>LOGNAME</key><string>mobile</string>
+        <key>TMPDIR</key><string>/tmp</string>
+        <key>CA_VSYNC_OFF</key><string>1</string>
+        <!--
+          Steam's bundled SDL 3 controller backend blocks the AppKit main
+          thread on iPadOS while CHIDIO owns SDL's device mutex. Mouse,
+          keyboard and MacWS touch input use AppKit/CGEvent, not SDL joystick
+          enumeration, so disable only the unsupported controller backends.
+        -->
+        <key>SDL_JOYSTICK_HIDAPI</key><string>0</string>
+        <key>SDL_JOYSTICK_IOKIT</key><string>0</string>
+        <key>SDL_JOYSTICK_MFI</key><string>0</string>
+        <!-- Steam's CEF renderers use the same V8 MAP_JIT contract as the
+             production VS Code build. Keep W^X through libmachook's
+             page-granular RW/RX compatibility path. -->
+        <key>MACWS_JIT_MPROTECT_COMPAT</key><string>1</string>
+        <key>MACWS_JIT_FAULT_WRITE_COMPAT</key><string>1</string>
+        <!-- The top-level WebUI helper needs Valve's inherited transport FDs;
+             its Chromium descendants still use the atomic spawn adapter. -->
+        <key>MACWS_STEAM_NATIVE_BROWSER_LAUNCH</key><string>1</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/var/jb/var/mobile/steam-runtime.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/jb/var/mobile/steam-runtime.log</string>
+</dict>
+</plist>
