@@ -71,8 +71,13 @@ int main(int argc, char *argv[], char *envp[]) {
     setenv("DYLD_INSERT_LIBRARIES", insert, 1);
     fprintf(stderr, "[launchdchrootexec] target=%s arch=%s insert=%s\n",
             execPath, macws_arch_name(target_arch), insert);
-    setenv("HOME", "/Users/root", 1);
-    setenv("TMPDIR", "/tmp", 1);
+    // Callers that deliberately drop to a login uid can provide that user's
+    // macOS home/container before entering the chroot. Do not replace it with
+    // root after setuid: doing so split Catalyst CoreData/Keychain state across
+    // two identities. Ordinary daemon callers omit these variables and retain
+    // the historical defaults.
+    if (!getenv("HOME")) setenv("HOME", "/Users/root", 1);
+    if (!getenv("TMPDIR")) setenv("TMPDIR", "/tmp", 1);
     setenv("MallocNanoZone", "0", 1);
     // setenv("DYLD_PRINT_SEARCHING", "1", 1);
     // setenv("DYLD_PRINT_LIBRARIES", "1", 1);

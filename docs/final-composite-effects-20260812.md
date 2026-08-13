@@ -158,3 +158,105 @@ receive-right replacement without a WindowServer or iOS restart.
   GPU-completed drawable. This exception is implemented by
   `Rendering/MacWSCatalystDrawableCompositor.*`; VNC still shows SkyLight's
   black client area and cannot validate this Host-only layer.
+
+## 2026-08-13 coherence, cursor and menu follow-up
+
+The producer reuse warning above became a real interactive defect: pointer,
+blur and Dock activity let WindowServer begin a later write to the same final
+IOSurface while Host still sampled it. Runtime diagnostics showed a fixed
+surface before the repair and the sequence `160 -> 34 -> 20 -> 84` after it.
+The final publisher now performs an ordered same-command-queue AGX blit into a
+four-slot independent IOSurface snapshot ring. `macwsdisplayd` holds a
+cross-process IOSurface use count for its current frame and each Host lease, so
+the producer never reuses a consumer-owned slot. The explicit diagnostic
+rollback is `MACWS_FINAL_COMPOSITE_DIRECT=1`; production leaves it absent and
+uses the ring. The user then confirmed that the display flicker was gone.
+
+A post-fix Excel hover profile recorded 70.45 active FPS, 16.67/20.84 ms
+p50/p95 frame time, 39.98 FPS 1% low, 2.05% hitches, 41.05 ms
+input-to-visible p95, 0.626 ms mean GPU execution and zero Metal command
+errors. The evidence file is
+`/var/mobile/Library/Logs/MacWSPerformance/profile-20260812-165153.json`.
+
+The black pointer was present in `macwshost://screenshot-base`, proving that it
+was already inside WindowServer's authoritative final composite rather than a
+Host overlay. RE-confirmed via Ventura 13.4 SkyLight:
+
+- `CGXHideCursor` is at image offset `0x1322b0` and updates the session hide
+  count at `cursorState+0x78` before calling the native display cursor-hidden
+  transaction;
+- its global chain is SkyLight image `+0x53ae8460 -> +0x20 -> +0x108`;
+- `CGXShowCursor` decrements the same count and shows the sprite only at the
+  transition back to zero.
+
+The first implementation called the correct function from the final-composite
+worker and exposed a real thread invariant. Runtime-confirmed by
+`WindowServer-2026-08-13-011147.ips` and `...-011209.ips`: both abort on
+`com.macwsguide.vnc-completion-observer` at
+`CGXHideCursor -> post_notification -> write_datagram`, whose exact assertion
+was `pthread_main_np()`. The production implementation performs the complete
+SkyLight mutation on WindowServer's main queue, reads the RE-confirmed native
+hide count before scheduling and again before calling, and re-arms the check
+afterward. It therefore repairs a later application `ShowCursor` transition
+without inflating the balanced count every frame. A base screenshot after
+Terminal launch, a context-menu hover and menu dismissal contained no native
+arrow.
+
+Menu hover keeps the global pointer position even though the sprite is hidden.
+Runtime-confirmed on Terminal's native context menu: a Host hover queued to the
+application main thread did not highlight Copy because Carbon
+`TrackMenuCommon` already owned that thread. AppInputBridge now posts a real
+button-free `CGPostMouseEvent` from the process socket thread; WindowServer
+performs the native menu-window hit test and AppKit coordinates the selected
+background and text appearance. The final base frame showed a blue `Mark`
+selection with white text, followed by clean outside-click dismissal, while
+WindowServer remained stable and the thermal state stayed nominal at 30.69 C.
+
+## 2026-08-14 no-VNC production and scroll-unit regression
+
+The final-composite producer used to share `/tmp/macws_vnc_share` as its
+master enable predicate. `macos_gui.sh --no-vnc` correctly removed that RFB
+sentinel, but accidentally disabled the native Host base at the same time and
+fell back to per-window composition, losing SkyLight-only material/shadow
+pixels. Production now owns two independent contracts:
+
+- `/tmp/macws_final_composite` enables the authenticated WindowServer ->
+  displayd -> Host IOSurface transport;
+- `/tmp/macws_vnc_share` enables only the legacy RFB mmap/damage consumer.
+
+Owned BGRA scanout and final snapshots remain enabled with or without a VNC
+listener. In final-only mode the one-time scanout classifier remains, but the
+per-frame CPU RFB comparison/mmap publication is skipped. Runtime after the
+repair reported:
+
+```text
+MACWS-DISPLAY final-composite-received producer=61324 sequence=1 surface=25 size=2388x1668 bpr=9600 subscribers=1
+presentation_transport: base_sequence=321 base_stream=1 base_surface=163 final_composite_active=true
+```
+
+A later production snapshot advanced that same authenticated base to sequence
+19136 while `/tmp/macws_vnc_share` remained absent. The captured native Dock
+context menu contained its translucent material and the desktop/Dock remained
+visible through the final composite. No macOS arrow was present: each
+successful final publication revalidates the balanced main-thread SkyLight
+cursor-hide invariant, so a later application `ShowCursor` cannot leak a
+duplicate sprite into Host.
+
+The same regression pass found that one-finger VSCode scrolling had become
+four times too fast. Source and runtime evidence identified two distinct APIs:
+
+- the installed OSXvnc disassembly uses a pixel-unit
+  `CGEventCreateScrollWheelEvent` followed by `CGEventPost`;
+- `CGPostScrollWheelEvent` accepts small integral wheel movements, not pixel
+  deltas (also stated by Apple's `CGRemoteOperation.h`).
+
+Electron's process could call pixel `CGEventPost`, but its denied event-post
+session silently delivered no Chromium wheel event. Passing every 10-point
+UIKit sample to the legacy API did deliver, but a CDP observer measured six
+samples as `scrollY 4000 -> 4240`: one remote unit expanded to 40 CSS pixels.
+AppInputBridge now chooses by framework capability rather than application ID.
+`ElectronNSWindow` uses the process-local precise NSEvent path; windows that
+require the WindowServer remote route use a 40-pixel calibrated accumulator
+with sub-unit residual. The exact repeat produced six `deltaMode=0,
+deltaY=10` Chromium events and `scrollY 4000 -> 4060`, preserving 1:1 finger
+travel and the existing native scroll/momentum phases.

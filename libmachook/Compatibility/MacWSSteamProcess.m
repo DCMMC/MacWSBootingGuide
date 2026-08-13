@@ -1,0 +1,552 @@
+@import Darwin;
+@import CydiaSubstrate;
+@import MachO;
+
+#include <dlfcn.h>
+#include <crt_externs.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach/mach.h>
+#include <spawn.h>
+
+// Valve's tier0 helper launcher has this exported ABI on Steam client build
+// 1785799196 (arm64). RE-confirmed in libtier0_s.dylib at +0xd91c:
+//
+//   x0 command/argv, x1 flags, x2 cwd
+//   bit 1: setpgrp + setsid
+//   bit 2: shell command, bit 3: execv argv, bit 4: execvp argv
+//
+// Steam's webhelper call site in chromehtml.dylib at +0x71da0 passes 0x0a,
+// so the child contract is argv + new session. The original implementation
+// uses fork() first. On iPadOS 16.3 the child then crashes before exec inside
+// Network.framework's nw_settings_child_has_forked atfork handler, jumping to
+// the read-only xpc_dictionary_apply data page (runtime crash witness:
+// steam_osx-2026-08-13-064756.ips).
+//
+// Reproduce the process contract atomically with posix_spawn. This avoids
+// inheriting initialized Network/XPC state; it does not skip an atfork handler
+// or claim that a failed child launch succeeded.
+typedef int (*MacWSCreateSimpleProcessFunction)(
+    void *, int, const char *);
+static MacWSCreateSimpleProcessFunction gMacWSOriginalCreateSimpleProcess;
+static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
+                                         const char *workingDirectory);
+static bool MacWSPathEndsWith(const char *path, const char *suffix);
+
+static void MacWSRebindSteamProcessImport(const struct mach_header *header,
+                                           intptr_t slide) {
+    // Never publish the replacement until the Valve fallback target is known.
+    // dyld can notify us about steamui before libtier0; rebinding in that
+    // interval would make an early unsupported call return a synthetic zero
+    // instead of preserving Valve's implementation.
+    if (!gMacWSOriginalCreateSimpleProcess ||
+        !header || header->magic != MH_MAGIC_64) return;
+    Dl_info imageInfo = {0};
+    if (!dladdr(header, &imageInfo) || !imageInfo.dli_fname) return;
+    if (strstr(imageInfo.dli_fname, "/libmachook") ||
+        strstr(imageInfo.dli_fname, "/libtier0_s.dylib")) return;
+
+    const struct mach_header_64 *header64 =
+        (const struct mach_header_64 *)header;
+    const struct load_command *command =
+        (const struct load_command *)(header64 + 1);
+    const struct segment_command_64 *linkedit = NULL;
+    const struct symtab_command *symbols = NULL;
+    const struct dysymtab_command *dynamicSymbols = NULL;
+    for (uint32_t index = 0; index < header64->ncmds; index++) {
+        if (command->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *segment =
+                (const struct segment_command_64 *)command;
+            if (!strcmp(segment->segname, SEG_LINKEDIT)) linkedit = segment;
+        } else if (command->cmd == LC_SYMTAB) {
+            symbols = (const struct symtab_command *)command;
+        } else if (command->cmd == LC_DYSYMTAB) {
+            dynamicSymbols = (const struct dysymtab_command *)command;
+        }
+        command = (const struct load_command *)
+            ((const uint8_t *)command + command->cmdsize);
+    }
+    if (!linkedit || !symbols || !dynamicSymbols) return;
+
+    uintptr_t linkeditBase = (uintptr_t)slide + linkedit->vmaddr -
+        linkedit->fileoff;
+    const struct nlist_64 *symbolTable =
+        (const struct nlist_64 *)(linkeditBase + symbols->symoff);
+    const char *stringTable =
+        (const char *)(linkeditBase + symbols->stroff);
+    const uint32_t *indirectTable =
+        (const uint32_t *)(linkeditBase + dynamicSymbols->indirectsymoff);
+
+    command = (const struct load_command *)(header64 + 1);
+    for (uint32_t commandIndex = 0;
+         commandIndex < header64->ncmds; commandIndex++) {
+        if (command->cmd != LC_SEGMENT_64) {
+            command = (const struct load_command *)
+                ((const uint8_t *)command + command->cmdsize);
+            continue;
+        }
+        const struct segment_command_64 *segment =
+            (const struct segment_command_64 *)command;
+        const struct section_64 *section =
+            (const struct section_64 *)(segment + 1);
+        for (uint32_t sectionIndex = 0;
+             sectionIndex < segment->nsects; sectionIndex++, section++) {
+            uint32_t type = section->flags & SECTION_TYPE;
+            if (type != S_LAZY_SYMBOL_POINTERS &&
+                type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+            uintptr_t *pointers = (uintptr_t *)
+                ((uintptr_t)slide + section->addr);
+            size_t count = (size_t)(section->size / sizeof(uintptr_t));
+            for (size_t pointerIndex = 0;
+                 pointerIndex < count; pointerIndex++) {
+                uint32_t symbolIndex =
+                    indirectTable[section->reserved1 + pointerIndex];
+                if (symbolIndex == INDIRECT_SYMBOL_ABS ||
+                    symbolIndex == INDIRECT_SYMBOL_LOCAL ||
+                    symbolIndex == (INDIRECT_SYMBOL_LOCAL |
+                                    INDIRECT_SYMBOL_ABS)) continue;
+                const char *name = stringTable +
+                    symbolTable[symbolIndex].n_un.n_strx;
+                if (!name || strcmp(name, "_CreateSimpleProcess")) continue;
+                uintptr_t replacement =
+                    (uintptr_t)MacWSSteamCreateSimpleProcess;
+                MSHookMemory(&pointers[pointerIndex], &replacement,
+                             sizeof(replacement));
+                if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+                    fprintf(stderr,
+                            "[MacWSSteamProcess] rebound import image=%s "
+                            "slot=%p replacement=%p\n",
+                            imageInfo.dli_fname, &pointers[pointerIndex],
+                            MacWSSteamCreateSimpleProcess);
+                    fflush(stderr);
+                }
+            }
+        }
+        command = (const struct load_command *)
+            ((const uint8_t *)command + command->cmdsize);
+    }
+}
+
+static bool MacWSIsSteamProcess(void) {
+    const char *program = getprogname();
+    if (program && (!strcmp(program, "steam_osx") ||
+                    !strcmp(program, "Steam Helper"))) return true;
+    char executable[PATH_MAX] = {0};
+    extern int proc_pidpath(int, void *, uint32_t);
+    return proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
+        strstr(executable, "/Library/Application Support/Steam/") != NULL;
+}
+
+static bool MacWSIsSteamMainProcess(void) {
+    const char *program = getprogname();
+    if (program && !strcmp(program, "steam_osx")) return true;
+    char executable[PATH_MAX] = {0};
+    extern int proc_pidpath(int, void *, uint32_t);
+    return proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
+        MacWSPathEndsWith(executable, "/Steam.app/Contents/MacOS/steam_osx");
+}
+
+static bool MacWSIsTopLevelSteamBrowser(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Steam Helper") != 0) return false;
+    char ***argumentsPointer = _NSGetArgv();
+    char **arguments = argumentsPointer ? *argumentsPointer : NULL;
+    for (size_t index = 1; arguments && arguments[index]; index++) {
+        if (!strncmp(arguments[index], "--type=", 7)) return false;
+    }
+    return true;
+}
+
+// AppKit's first finishLaunching pass asks HIServices for the lazily linked
+// AccessibilityBaseImplementations image.  Steam CEF has already created and
+// retired startup workers by that point.  On the iPadOS 16 kernel the macOS
+// dyld recursive API lock can retain a Mach-thread owner name that is no
+// longer valid: runtime-confirmed in Steam Helper 1785799196 with dlopen_from
+// waiting on owner 0x10c02 while mach_port_type(task, 0x10c02) returned
+// KERN_INVALID_NAME (0xf).
+//
+// Resolve the same HIServices soft-link accessor while the top-level browser
+// is still in its single-threaded image-initializer phase.  The accessor does
+// the stock dlopen and returns the stock implementation library; no
+// Accessibility result or lock operation is bypassed.  Later AppKit
+// registration consumes HIServices' initialized once-state and therefore
+// does not begin its first lazy load after worker retirement.
+static void MacWSPrepareSteamAccessibilityRuntime(void) {
+    if (!MacWSIsTopLevelSteamBrowser()) return;
+    typedef void *(*MacWSAccessibilityLibraryFunction)(void *);
+    static const char *const paths[] = {
+        "/System/Library/Frameworks/ApplicationServices.framework/"
+        "Versions/A/Frameworks/HIServices.framework/Versions/A/HIServices",
+        "/System/Library/Frameworks/ApplicationServices.framework/"
+        "Frameworks/HIServices.framework/HIServices",
+        NULL,
+    };
+    MSImageRef image = NULL;
+    for (size_t index = 0; paths[index] && !image; index++) {
+        image = MSGetImageByName(paths[index]);
+        if (!image && dlopen(paths[index], RTLD_LAZY | RTLD_LOCAL))
+            image = MSGetImageByName(paths[index]);
+    }
+
+    // This generated HIServices soft-link accessor is deliberately private,
+    // so dlsym cannot resolve it even after dlopen. RE-confirmed in the exact
+    // macOS 13.4 DSC (UUID 7D9FAA84-5C6B-3EF4-9379-FABA64346673):
+    // _libAccessibilityBaseImplementationsLibraryCore is at unslid
+    // 0x185c79564 and performs the stock _sl_dlopen sequence. Resolve the
+    // private symbol through Substrate's Mach-O image lookup instead.
+    MacWSAccessibilityLibraryFunction library = image ?
+        (MacWSAccessibilityLibraryFunction)MSFindSymbol(
+            image, "_libAccessibilityBaseImplementationsLibraryCore") : NULL;
+    if (!library) return;
+    // RE-confirmed call sites in _AXUIElementRegisterServerWithRunLoop at
+    // 0x185c535a8 and +0xf4 explicitly pass x0 = NULL to this accessor.
+    void *handle = library(NULL);
+    if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+        fprintf(stderr,
+                "[MacWSSteamProcess] Accessibility implementation "
+                "preloaded=%p\n", handle);
+        fflush(stderr);
+    }
+}
+
+// The top-level browser is a special case. Runtime evidence from Steam build
+// 1785799196 shows that replacing this one launch with posix_spawn leaves
+// transport_steamui.txt uninitialized, while Valve's implementation reaches
+// both WebUITransportController::Initialized and BrowserReady. RE of
+// libtier0_s.dylib _CreateSimpleProcess+0x34..+0x14c confirms the original
+// implementation is fork + chdir + execv/execvp rather than a separate XPC
+// broker. The remaining transport difference (likely process/session or FD
+// inheritance) is still under investigation; do not promote that detail to a
+// fact without a runtime FD comparison.
+//
+// Chromium's renderer/network/GPU descendants do not carry that private
+// parent contract. They are launched from "Steam Helper" with --type=... and
+// must continue through the atomic posix_spawn adapter: the inherited-fork
+// path crashes those descendants with EXC_GUARD on iPadOS. Keep this decision
+// structural (caller + exact executable + absence of --type), not PID- or
+// timing-based.
+static bool MacWSShouldPreserveValveBrowserLaunch(
+    void *commandOrArguments, int flags) {
+    if (!getenv("MACWS_STEAM_NATIVE_BROWSER_LAUNCH") ||
+        !MacWSIsSteamMainProcess() || !(flags & 0x08)) return false;
+    char *const *arguments = (char *const *)commandOrArguments;
+    if (!arguments || !MacWSPathEndsWith(
+            arguments[0],
+            "/Steam Helper.app/Contents/MacOS/Steam Helper")) return false;
+    for (size_t index = 1; arguments[index]; index++) {
+        if (!strncmp(arguments[index], "--type=", 7)) return false;
+    }
+    return true;
+}
+
+// Valve's bit-2 call sites build a sequence of individually single-quoted
+// arguments (runtime example: '.../steamsysinfo' '-steamid' '0' ...). Parse
+// only that unambiguous form so it can be spawned atomically without a second
+// shell exec. Any metacharacter, unquoted token or embedded quote rejects the
+// parse and retains the native /bin/sh contract below.
+static char **MacWSParseValveQuotedArguments(const char *command) {
+    if (!command) return NULL;
+    size_t count = 0;
+    size_t capacity = 8;
+    char **arguments = calloc(capacity, sizeof(*arguments));
+    if (!arguments) return NULL;
+    const char *cursor = command;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        if (!*cursor) break;
+        if (*cursor++ != '\'') goto invalid;
+        const char *start = cursor;
+        while (*cursor && *cursor != '\'') cursor++;
+        if (*cursor != '\'') goto invalid;
+        size_t length = (size_t)(cursor - start);
+        char *argument = strndup(start, length);
+        if (!argument) goto invalid;
+        cursor++;
+        if (*cursor && *cursor != ' ' && *cursor != '\t') {
+            free(argument);
+            goto invalid;
+        }
+        if (count + 2 > capacity) {
+            capacity *= 2;
+            char **grown = realloc(arguments,
+                                   capacity * sizeof(*arguments));
+            if (!grown) {
+                free(argument);
+                goto invalid;
+            }
+            arguments = grown;
+        }
+        arguments[count++] = argument;
+        arguments[count] = NULL;
+    }
+    if (count > 0 && arguments[0][0] == '/') return arguments;
+invalid:
+    for (size_t index = 0; index < count; index++) free(arguments[index]);
+    free(arguments);
+    return NULL;
+}
+
+static void MacWSFreeParsedArguments(char **arguments) {
+    if (!arguments) return;
+    for (size_t index = 0; arguments[index]; index++) free(arguments[index]);
+    free(arguments);
+}
+
+static bool MacWSPathEndsWith(const char *path, const char *suffix) {
+    if (!path || !suffix) return false;
+    size_t pathLength = strlen(path);
+    size_t suffixLength = strlen(suffix);
+    return pathLength >= suffixLength &&
+        !strcmp(path + pathLength - suffixLength, suffix);
+}
+
+// Steam's browser process runs under the same explicitly unsandboxed MacWS
+// compatibility profile as its parent.  Chromium 126 nevertheless attempts
+// to construct the macOS Seatbelt parameter table and terminates at
+// sandbox_parameters_mac.mm:69 when iPadOS cannot provide that macOS process
+// metadata (runtime log: errno=EIO).  Select Chromium's supported no-sandbox
+// launch mode at the parent call site, before initialization; this keeps its
+// internal invariants intact and matches the kernel policy already attached to
+// the process.  Restrict the switch to Valve's exact browser helper.
+static char **MacWSArgumentsByAddingSteamBrowserPolicy(
+    const char *executable, char *const *arguments) {
+    static const char helperSuffix[] =
+        "/Steam Helper.app/Contents/MacOS/Steam Helper";
+    if (!MacWSPathEndsWith(executable, helperSuffix) || !arguments) return NULL;
+    size_t count = 0;
+    while (arguments[count]) {
+        if (!strcmp(arguments[count], "--no-sandbox")) return NULL;
+        count++;
+    }
+    char **result = calloc(count + 2, sizeof(*result));
+    if (!result) return NULL;
+    for (size_t index = 0; index < count; index++)
+        result[index] = arguments[index];
+    result[count] = (char *)"--no-sandbox";
+    return result;
+}
+
+static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
+                                         const char *workingDirectory) {
+    bool diagnostics = getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS") != NULL;
+    if (diagnostics) {
+        fprintf(stderr,
+                "[MacWSSteamProcess] entry command=%p flags=%#x cwd=%p "
+                "steam=%s\n",
+                commandOrArguments, flags,
+                workingDirectory,
+                MacWSIsSteamProcess() ? "yes" : "no");
+        fflush(stderr);
+    }
+    if (getenv("MACWS_STEAM_PROCESS_TRACE_ONLY")) {
+        return gMacWSOriginalCreateSimpleProcess ?
+            gMacWSOriginalCreateSimpleProcess(
+                commandOrArguments, flags, workingDirectory) : 0;
+    }
+    if (MacWSShouldPreserveValveBrowserLaunch(commandOrArguments, flags)) {
+        if (diagnostics) {
+            fprintf(stderr,
+                    "[MacWSSteamProcess] preserving Valve top-level browser "
+                    "launch for WebUI transport flags=%#x\n", flags);
+            fflush(stderr);
+        }
+        return gMacWSOriginalCreateSimpleProcess ?
+            gMacWSOriginalCreateSimpleProcess(
+                commandOrArguments, flags, workingDirectory) : 0;
+    }
+    if (!MacWSIsSteamProcess() || (flags & 0x20) ||
+        !(flags & (0x04 | 0x08 | 0x10))) {
+        if (diagnostics) {
+            fprintf(stderr,
+                    "[MacWSSteamProcess] fallback to Valve implementation "
+                    "flags=%#x\n", flags);
+            fflush(stderr);
+        }
+        return gMacWSOriginalCreateSimpleProcess ?
+            gMacWSOriginalCreateSimpleProcess(
+                commandOrArguments, flags, workingDirectory) : 0;
+    }
+
+    char *shellArguments[4] = {0};
+    char *shellCommand = NULL;
+    char **parsedArguments = NULL;
+    char *const *arguments = NULL;
+    const char *executable = NULL;
+    bool searchPath = false;
+
+    if (flags & 0x08) {
+        arguments = (char *const *)commandOrArguments;
+        executable = arguments ? arguments[0] : NULL;
+    } else if (flags & 0x10) {
+        arguments = (char *const *)commandOrArguments;
+        executable = arguments ? arguments[0] : NULL;
+        searchPath = true;
+    } else {
+        // RE-confirmed in Valve's implementation: the bit-2 path prefixes
+        // "exec " before /bin/sh -c. Preserve that exact contract. Omitting
+        // the prefix left the shell itself alive after its chrooted fork path
+        // failed, consuming one core until ChildProcessQuery timed out.
+        parsedArguments = MacWSParseValveQuotedArguments(
+            (const char *)commandOrArguments);
+        if (parsedArguments) {
+            arguments = parsedArguments;
+            executable = parsedArguments[0];
+        } else {
+            if (asprintf(&shellCommand, "exec %s",
+                         (const char *)commandOrArguments) < 0) {
+                errno = ENOMEM;
+                return 0;
+            }
+            shellArguments[0] = (char *)"sh";
+            shellArguments[1] = (char *)"-c";
+            shellArguments[2] = shellCommand;
+            arguments = shellArguments;
+            executable = "/bin/sh";
+        }
+    }
+    if (!executable || !arguments) {
+        errno = EINVAL;
+        return 0;
+    }
+
+    char **policyArguments = MacWSArgumentsByAddingSteamBrowserPolicy(
+        executable, arguments);
+    if (policyArguments) arguments = policyArguments;
+    if (diagnostics) {
+        fprintf(stderr,
+                "[MacWSSteamProcess] spawn request executable=%s flags=%#x "
+                "cwd=%s argv0=%s argv1=%s\n",
+                executable, flags, workingDirectory ?: "(null)",
+                arguments[0] ?: "(null)", arguments[1] ?: "(null)");
+        for (size_t index = 0; index < 96 && arguments[index]; index++) {
+            fprintf(stderr, "[MacWSSteamProcess] argv[%zu]=%s\n",
+                    index, arguments[index]);
+        }
+        fflush(stderr);
+    }
+
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attributes;
+    int result = posix_spawn_file_actions_init(&actions);
+    if (result != 0) {
+        free(shellCommand);
+        free(policyArguments);
+        MacWSFreeParsedArguments(parsedArguments);
+        errno = result;
+        return 0;
+    }
+    result = posix_spawnattr_init(&attributes);
+    if (result != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        free(shellCommand);
+        free(policyArguments);
+        MacWSFreeParsedArguments(parsedArguments);
+        errno = result;
+        return 0;
+    }
+
+    if (workingDirectory && workingDirectory[0]) {
+        // The iOS SDK marks this macOS ABI unavailable even though the
+        // chroot's macOS libSystem exports it. Resolve the running image's
+        // implementation without mutating the multithreaded parent's cwd.
+        typedef int (*MacWSAddChdirFunction)(
+            posix_spawn_file_actions_t *, const char *);
+        MacWSAddChdirFunction addChdir = (MacWSAddChdirFunction)dlsym(
+            RTLD_DEFAULT, "posix_spawn_file_actions_addchdir_np");
+        result = addChdir ? addChdir(&actions, workingDirectory) : ENOSYS;
+    }
+
+    // Preserve Valve's signal-mask contract. RE-confirmed
+    // libtier0_s.dylib _CreateSimpleProcess+0x34..+0x14c calls fork,
+    // setpgrp/setsid, chdir and execv/execvp, but does not change SIGCHLD.
+    // Blocking SIGCHLD here changes Chromium's child lifecycle and made the
+    // browser repeatedly lose its renderer. posix_spawn already inherits the
+    // caller's mask when POSIX_SPAWN_SETSIGMASK is absent.
+    short attributeFlags = 0;
+    if (flags & 0x02) attributeFlags |= POSIX_SPAWN_SETSID;
+    if (result == 0 && attributeFlags != 0)
+        result = posix_spawnattr_setflags(&attributes, attributeFlags);
+
+    pid_t child = 0;
+    extern char **environ;
+    if (result == 0) {
+        result = searchPath ?
+            posix_spawnp(&child, executable, &actions, &attributes,
+                         (char *const *)arguments, environ) :
+            posix_spawn(&child, executable, &actions, &attributes,
+                        (char *const *)arguments, environ);
+    }
+
+    posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    free(shellCommand);
+    if (result != 0) {
+        errno = result;
+        if (diagnostics) {
+            fprintf(stderr,
+                    "[MacWSSteamProcess] spawn failed executable=%s "
+                    "flags=%#x cwd=%s error=%d\n",
+                    executable, flags,
+                    workingDirectory ?: "(null)", result);
+            fflush(stderr);
+        }
+        MacWSFreeParsedArguments(parsedArguments);
+        free(policyArguments);
+        return 0;
+    }
+    if (diagnostics) {
+        fprintf(stderr,
+                "[MacWSSteamProcess] spawn success executable=%s "
+                "flags=%#x cwd=%s pid=%d\n",
+                executable, flags, workingDirectory ?: "(null)", child);
+        fflush(stderr);
+    }
+    MacWSFreeParsedArguments(parsedArguments);
+    free(policyArguments);
+    return child;
+}
+
+static void MacWSSteamProcessImageLoaded(const struct mach_header *header,
+                                         intptr_t slide) {
+    if (!MacWSIsSteamProcess()) return;
+    Dl_info image = {0};
+    if (dladdr(header, &image) && image.dli_fname &&
+        strstr(image.dli_fname, "/libtier0_s.dylib")) {
+        gMacWSOriginalCreateSimpleProcess =
+            (MacWSCreateSimpleProcessFunction)MSFindSymbol(
+                (MSImageRef)header, "_CreateSimpleProcess");
+        if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+            fprintf(stderr,
+                    "[MacWSSteamProcess] resolved Valve implementation=%p "
+                    "image=%s\n",
+                    gMacWSOriginalCreateSimpleProcess, image.dli_fname);
+            fflush(stderr);
+        }
+        // libtier0 may load after steamui. Revisit every already-mapped image
+        // now that both sides of the adapter are valid; future images continue
+        // through the normal add-image callback below.
+        if (gMacWSOriginalCreateSimpleProcess) {
+            for (uint32_t index = 0; index < _dyld_image_count(); index++) {
+                MacWSRebindSteamProcessImport(
+                    _dyld_get_image_header(index),
+                    _dyld_get_image_vmaddr_slide(index));
+            }
+        }
+    }
+    MacWSRebindSteamProcessImport(header, slide);
+}
+
+__attribute__((constructor))
+static void MacWSInstallSteamProcessCompatibility(void) {
+    // Diagnostic isolation switch only. Production keeps the adapter enabled;
+    // this lets a bounded run compare Valve's original fork path without
+    // changing the shipped default.
+    if (getenv("MACWS_DISABLE_STEAM_PROCESS_COMPAT")) return;
+    if (MacWSIsSteamProcess()) {
+        MacWSPrepareSteamAccessibilityRuntime();
+        _dyld_register_func_for_add_image(MacWSSteamProcessImageLoaded);
+        for (uint32_t index = 0; index < _dyld_image_count(); index++)
+            MacWSSteamProcessImageLoaded(_dyld_get_image_header(index),
+                                         _dyld_get_image_vmaddr_slide(index));
+    }
+}

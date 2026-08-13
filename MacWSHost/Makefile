@@ -16,6 +16,8 @@ MacWSHost_FILES = main.m MacWSControlClient.m MacWSStreamClient.m \
 	Testing/MacWSCatalystDrawableProbe.m \
 	Input/MacWSKeyMapping.m \
 	Support/MacWSHostDiagnostics.m \
+	Support/MacWSHostRuntime.m \
+	Rendering/MacWSMetalView.m \
 	Transport/MacWSCatalystDrawableReceiver.m \
 	Rendering/MacWSCatalystDrawableCompositor.m \
 	Launch/MacWSCatalystLaunchCoordinator.m \
@@ -26,7 +28,7 @@ MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation \
 	IOKit IOSurface UniformTypeIdentifiers
 MacWSHost_LIBRARIES = bsm
 MacWSHost_CFLAGS = -fobjc-arc -Wall -Wextra -I$(CURDIR)/../include \
-	-I$(CURDIR)/Support -I$(CURDIR)/Testing -I$(CURDIR)/Transport \
+	-I$(CURDIR) -I$(CURDIR)/Support -I$(CURDIR)/Testing -I$(CURDIR)/Transport \
 	-I$(CURDIR)/Input -I$(CURDIR)/Rendering -I$(CURDIR)/Launch \
 	-I$(CURDIR)/Compatibility \
 	-isystem $(CURDIR)/../vendor/ios-xpc -DIOSCLEAR_LIBRARY_MODE=1

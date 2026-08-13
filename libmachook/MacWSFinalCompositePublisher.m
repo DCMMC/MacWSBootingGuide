@@ -9,10 +9,13 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "macws_final_composite_protocol.h"
+
+extern void MacWSHideNativeCursorAfterFirstComposite(void);
 
 static _Atomic uint64_t PublishedSequence;
 static _Atomic bool ContentValidated;
@@ -23,9 +26,52 @@ static _Atomic uint32_t FailureWitnesses;
 static _Atomic uint32_t LookupWitnesses;
 static NSObject *CompletionLock;
 static id<MTLCommandBuffer> PendingCommand;
+static id<MTLTexture> PendingSourceTexture;
 static IOSurfaceRef PendingSurface;
 static uint32_t PendingPixelFormat;
 static _Atomic bool CompletionWorkerRunning;
+
+// The SkyLight display target is intentionally reused by WindowServer. A
+// completion callback proves that one render finished, but it does not stop a
+// later command buffer from modifying that same IOSurface while Host samples
+// it. Preserve presentation effects (blur, shadows, Dock magnification) by
+// copying the completed native composite on its own AGX command queue into a
+// small pool of independent IOSurfaces. displayd marks a surface in-use while
+// it or Host holds a lease, so a pool slot is never overwritten under a
+// consumer.
+enum { MacWSFinalCompositeSnapshotSlotCount = 4 };
+typedef struct {
+    IOSurfaceRef surface;
+    id<MTLTexture> texture;
+    id<MTLDevice> device;
+    size_t width;
+    size_t height;
+    uint64_t lastPublishedNS;
+} MacWSFinalCompositeSnapshotSlot;
+static MacWSFinalCompositeSnapshotSlot SnapshotSlots[
+    MacWSFinalCompositeSnapshotSlotCount];
+static NSUInteger NextSnapshotSlot;
+static _Atomic uint32_t SnapshotFailureWitnesses;
+
+static bool DirectCompositeTransportRequested(void) {
+    static bool direct;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MACWS_FINAL_COMPOSITE_DIRECT");
+        direct = value && value[0] && strcmp(value, "0") != 0;
+    });
+    return direct;
+}
+
+static void SnapshotLogFailure(const char *stage, id object) {
+    uint32_t witness = atomic_fetch_add_explicit(
+        &SnapshotFailureWitnesses, 1, memory_order_relaxed) + 1;
+    if (witness <= 12) {
+        dprintf(STDERR_FILENO,
+            "#### FINAL-COMPOSITE snapshot-failed stage=%s witness=%u "
+            "object=%p\n", stage, witness, (__bridge void *)object);
+    }
+}
 
 static uint64_t MonotonicNanoseconds(void) {
     struct timespec now = {0};
@@ -101,6 +147,7 @@ static mach_msg_return_t SendMessage(
 
 void MacWSFinalCompositePublisherMarkContentValidated(void) {
     atomic_store_explicit(&ContentValidated, true, memory_order_release);
+    MacWSHideNativeCursorAfterFirstComposite();
 }
 
 bool MacWSFinalCompositePublisherCanPublish(void) {
@@ -203,6 +250,8 @@ bool MacWSFinalCompositePublisherPublishSurface(
                 record.surfaceID, service, result);
         }
     }
+    if (result == MACH_MSG_SUCCESS)
+        MacWSHideNativeCursorAfterFirstComposite();
     return result == MACH_MSG_SUCCESS;
 }
 
@@ -233,23 +282,165 @@ static void ReleaseObject(id object) {
 #endif
 }
 
+static void ResetSnapshotSlot(MacWSFinalCompositeSnapshotSlot *slot) {
+    if (!slot) return;
+    ReleaseObject(slot->texture);
+    ReleaseObject(slot->device);
+    if (slot->surface) CFRelease(slot->surface);
+    memset(slot, 0, sizeof(*slot));
+}
+
+static MacWSFinalCompositeSnapshotSlot *AcquireSnapshotSlot(
+        id<MTLDevice> device, size_t width, size_t height) {
+    if (!device || width == 0 || height == 0 || width > UINT32_MAX ||
+        height > UINT32_MAX || width > SIZE_MAX / 4) return NULL;
+    size_t tightBytesPerRow = width * 4;
+    size_t bytesPerRow = (tightBytesPerRow + 63) & ~(size_t)63;
+    if (bytesPerRow < tightBytesPerRow || height > SIZE_MAX / bytesPerRow)
+        return NULL;
+
+    uint64_t nowNS = MonotonicNanoseconds();
+    for (NSUInteger attempt = 0;
+         attempt < MacWSFinalCompositeSnapshotSlotCount; attempt++) {
+        NSUInteger index = (NextSnapshotSlot + attempt) %
+            MacWSFinalCompositeSnapshotSlotCount;
+        MacWSFinalCompositeSnapshotSlot *slot = &SnapshotSlots[index];
+        BOOL compatible = slot->surface && slot->texture &&
+            slot->device == device && slot->width == width &&
+            slot->height == height;
+        if (slot->surface && !compatible) {
+            if (IOSurfaceIsInUse(slot->surface)) continue;
+            ResetSnapshotSlot(slot);
+        }
+        if (slot->surface) {
+            // Four 120-Hz frames already provide ~33 ms for displayd to take
+            // its cross-process use-count. Keep the explicit minimum as a
+            // handoff guard if frames were coalesced unusually quickly.
+            if (IOSurfaceIsInUse(slot->surface) ||
+                (nowNS && slot->lastPublishedNS &&
+                 nowNS - slot->lastPublishedNS < 30 * NSEC_PER_MSEC)) {
+                continue;
+            }
+            NextSnapshotSlot = (index + 1) %
+                MacWSFinalCompositeSnapshotSlotCount;
+            return slot;
+        }
+
+        NSDictionary *properties = @{
+            (__bridge id)kIOSurfaceWidth: @(width),
+            (__bridge id)kIOSurfaceHeight: @(height),
+            (__bridge id)kIOSurfaceBytesPerElement: @4,
+            (__bridge id)kIOSurfaceBytesPerRow: @(bytesPerRow),
+            (__bridge id)kIOSurfaceAllocSize: @(bytesPerRow * height),
+            (__bridge id)kIOSurfacePixelFormat:
+                @(MACWS_FINAL_COMPOSITE_BGRA),
+        };
+        IOSurfaceRef surface = IOSurfaceCreate(
+            (__bridge CFDictionaryRef)properties);
+        if (!surface) {
+            SnapshotLogFailure("iosurface-create", device);
+            return NULL;
+        }
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+            texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+            width:width height:height mipmapped:NO];
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.usage = MTLTextureUsageShaderRead |
+            MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
+        id<MTLTexture> texture = [device
+            newTextureWithDescriptor:descriptor iosurface:surface plane:0];
+        if (!texture) {
+            CFRelease(surface);
+            SnapshotLogFailure("texture-create", device);
+            return NULL;
+        }
+        slot->surface = surface;
+        slot->texture = RetainObject(texture);
+        slot->device = RetainObject(device);
+        slot->width = width;
+        slot->height = height;
+        ReleaseObject(texture);
+        NextSnapshotSlot = (index + 1) %
+            MacWSFinalCompositeSnapshotSlotCount;
+        return slot;
+    }
+    return NULL;
+}
+
+static bool SnapshotAndPublish(id<MTLCommandBuffer> completedCommand,
+                               id<MTLTexture> sourceTexture,
+                               uint32_t pixelFormat) {
+    if (!completedCommand || !sourceTexture ||
+        pixelFormat != MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM)
+        return false;
+    id<MTLCommandQueue> queue = completedCommand.commandQueue;
+    id<MTLDevice> device = sourceTexture.device;
+    size_t width = sourceTexture.width;
+    size_t height = sourceTexture.height;
+    if (!queue || !device || width == 0 || height == 0) {
+        SnapshotLogFailure("source", sourceTexture);
+        return false;
+    }
+    MacWSFinalCompositeSnapshotSlot *slot = AcquireSnapshotSlot(
+        device, width, height);
+    if (!slot) return false;
+
+    id<MTLCommandBuffer> copyCommand = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [copyCommand blitCommandEncoder];
+    if (!copyCommand || !blit) {
+        SnapshotLogFailure("command", queue);
+        return false;
+    }
+    [blit copyFromTexture:sourceTexture
+              sourceSlice:0 sourceLevel:0
+             sourceOrigin:MTLOriginMake(0, 0, 0)
+               sourceSize:MTLSizeMake(width, height, 1)
+                toTexture:slot->texture
+         destinationSlice:0 destinationLevel:0
+        destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blit endEncoding];
+    [copyCommand commit];
+
+    MTLCommandBufferStatus status = copyCommand.status;
+    unsigned polls = 0;
+    while (status != MTLCommandBufferStatusCompleted &&
+           status != MTLCommandBufferStatusError && polls < 2000) {
+        usleep(500);
+        status = copyCommand.status;
+        polls++;
+    }
+    if (status != MTLCommandBufferStatusCompleted || copyCommand.error) {
+        SnapshotLogFailure("copy-completion", copyCommand);
+        return false;
+    }
+    bool published = MacWSFinalCompositePublisherPublishSurface(
+        slot->surface, pixelFormat);
+    if (published) slot->lastPublishedNS = MonotonicNanoseconds();
+    return published;
+}
+
 void MacWSFinalCompositePublisherEnqueueCompletion(
-        id<MTLCommandBuffer> commandBuffer, IOSurfaceRef surface,
+        id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sourceTexture,
+        IOSurfaceRef surface,
         uint32_t metalPixelFormat) {
-    if (!commandBuffer || !surface || metalPixelFormat !=
+    if (!commandBuffer || !sourceTexture || !surface || metalPixelFormat !=
             MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM) return;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ CompletionLock = [NSObject new]; });
 
     id<MTLCommandBuffer> retainedCommand = RetainObject(commandBuffer);
+    id<MTLTexture> retainedSource = RetainObject(sourceTexture);
     IOSurfaceRef retainedSurface = (IOSurfaceRef)CFRetain(surface);
     @synchronized (CompletionLock) {
         id<MTLCommandBuffer> oldCommand = PendingCommand;
+        id<MTLTexture> oldSource = PendingSourceTexture;
         IOSurfaceRef oldSurface = PendingSurface;
         PendingCommand = retainedCommand;
+        PendingSourceTexture = retainedSource;
         PendingSurface = retainedSurface;
         PendingPixelFormat = metalPixelFormat;
         ReleaseObject(oldCommand);
+        ReleaseObject(oldSource);
         if (oldSurface) CFRelease(oldSurface);
     }
     if (atomic_exchange_explicit(&CompletionWorkerRunning, true,
@@ -259,18 +450,22 @@ void MacWSFinalCompositePublisherEnqueueCompletion(
         for (;;) {
             @autoreleasepool {
                 id<MTLCommandBuffer> command = nil;
+                id<MTLTexture> sourceTexture = nil;
                 IOSurfaceRef completedSurface = NULL;
                 uint32_t pixelFormat = 0;
                 @synchronized (CompletionLock) {
-                    if (!PendingCommand || !PendingSurface) {
+                    if (!PendingCommand || !PendingSourceTexture ||
+                        !PendingSurface) {
                         atomic_store_explicit(&CompletionWorkerRunning, false,
                                               memory_order_release);
                         return;
                     }
                     command = PendingCommand;
+                    sourceTexture = PendingSourceTexture;
                     completedSurface = PendingSurface;
                     pixelFormat = PendingPixelFormat;
                     PendingCommand = nil;
+                    PendingSourceTexture = nil;
                     PendingSurface = NULL;
                     PendingPixelFormat = 0;
                 }
@@ -285,10 +480,16 @@ void MacWSFinalCompositePublisherEnqueueCompletion(
                 if (status == MTLCommandBufferStatusCompleted &&
                     command.error == nil &&
                     MacWSFinalCompositePublisherCanPublish()) {
-                    (void)MacWSFinalCompositePublisherPublishSurface(
-                        completedSurface, pixelFormat);
+                    if (DirectCompositeTransportRequested()) {
+                        (void)MacWSFinalCompositePublisherPublishSurface(
+                            completedSurface, pixelFormat);
+                    } else {
+                        (void)SnapshotAndPublish(command, sourceTexture,
+                                                 pixelFormat);
+                    }
                 }
                 ReleaseObject(command);
+                ReleaseObject(sourceTexture);
                 CFRelease(completedSurface);
             }
         }

@@ -9,7 +9,16 @@
 // in an iOS-platform process (the chroot's macOS dyld refuses to load
 // libjailbreak.dylib, so the chroot cannot call jbclient_* directly).
 //
-// Protocol: client connects, sends "<chroot-path>\n", daemon replies "OK\n".
+// Protocol:
+//   "<chroot-path>\n"  sign/trustcache that chroot-absolute path
+//   "DEBUG\n"         mark the connecting process CS_DEBUGGED
+//
+// The second operation replaces libmachook's historical constructor-time
+// fork()+ptrace JIT bootstrap.  Forking while dyld is still running image
+// initializers leaves dyld's atfork lock lifecycle exposed to the macOS/iOS
+// libSystem boundary; Steam CEF runtime-confirmed the resulting permanent
+// wait in dlopen_from().  The daemon obtains the peer PID from the Unix socket,
+// so a client cannot nominate an unrelated process.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,6 +140,57 @@ static void adhoc_sign(const char *path) {
     capture(argv, NULL, 0);
 }
 
+// A current CDHash in Dopamine's dynamic trustcache is a byte-level witness
+// that this exact Mach-O has already completed the project's signing policy.
+// Preserve it verbatim. Re-running ldid is not semantically idempotent for all
+// vendor signatures: Steam 1785799196 runtime-confirmed that a second pass
+// grew three child executables by 64 bytes after sign_installed.sh had already
+// synchronized package/*.installed, causing the updater to restore them and
+// enter a verify/update loop.
+static int current_hashes_are_trusted(const char *path) {
+    char hashes[3][128] = {{0}};
+    size_t hash_count = 0;
+    for (const char **arch = kArches; *arch; arch++) {
+        if (cdhash_for_arch(path, *arch, hashes[hash_count],
+                            sizeof(hashes[hash_count]))) {
+            hash_count++;
+        }
+    }
+    if (hash_count == 0) return 0;
+
+    // 3,500 entries occupy well below this bound on the target. If the
+    // inventory ever grows past it, capture() drains the command and the
+    // conservative result is a re-sign, never a false trusted decision.
+    size_t inventory_size = 1024 * 1024;
+    char *inventory = calloc(1, inventory_size);
+    if (!inventory) return 0;
+    char *const argv[] = {
+        (char *)JBCTL, "trustcache", "info", NULL
+    };
+    int status = capture(argv, inventory, inventory_size);
+    if (status != 0) {
+        free(inventory);
+        return 0;
+    }
+    for (char *cursor = inventory; *cursor; cursor++) {
+        if (*cursor >= 'A' && *cursor <= 'Z')
+            *cursor = (char)(*cursor - 'A' + 'a');
+    }
+    int trusted = 1;
+    for (size_t index = 0; index < hash_count; index++) {
+        for (char *cursor = hashes[index]; *cursor; cursor++) {
+            if (*cursor >= 'A' && *cursor <= 'Z')
+                *cursor = (char)(*cursor - 'A' + 'a');
+        }
+        if (!strstr(inventory, hashes[index])) {
+            trusted = 0;
+            break;
+        }
+    }
+    free(inventory);
+    return trusted;
+}
+
 // Ad-hoc re-sign + trustcache every Mach-O slice of one rootfs path.
 static void process_path(const char *realpath) {
     if (seen(realpath)) return;
@@ -138,12 +198,17 @@ static void process_path(const char *realpath) {
     struct stat st;
     if (stat(realpath, &st) != 0 || !S_ISREG(st.st_mode)) { mark_seen(realpath); return; }
 
-    // ALWAYS ad-hoc re-sign first: AMFI SIGKILLs Apple-signed binaries even when
-    // their CDHash is trustcached (platform-binary / library-validation flags in
-    // the original signature). Re-signing ad-hoc with our entitlements strips
-    // those flags; the resulting CDHash + trustcache is accepted and runnable.
-    // (This mirrors postinst.sh's sign_and_trustcache.) ldid is a no-op on
-    // non-Mach-O files, so the cdhash loop below simply finds nothing for those.
+    if (current_hashes_are_trusted(realpath)) {
+        logmsg("preserved already-trusted signature: %s", realpath);
+        mark_seen(realpath);
+        return;
+    }
+
+    // An untrusted Apple/vendor signature still needs conversion: iOS AMFI can
+    // reject it despite a newly added stock CDHash because its platform and
+    // library-validation policy is not the MacWS chroot policy. Re-sign once,
+    // then register the resulting hashes. Subsequent requests take the exact
+    // trusted-byte fast path above.
     adhoc_sign(realpath);
 
     char hash[128];
@@ -165,6 +230,24 @@ static void handle_request(const char *chroot_path) {
     int n = snprintf(real, sizeof(real), "%s%s", ROOTFS, chroot_path);
     if (n <= 0 || (size_t)n >= sizeof(real)) return;
     process_path(real);
+}
+
+static int mark_peer_debugged(pid_t peer_pid) {
+    if (peer_pid <= 1) return 0;
+    char pid_string[32];
+    int length = snprintf(pid_string, sizeof(pid_string), "%d", peer_pid);
+    if (length <= 0 || (size_t)length >= sizeof(pid_string)) return 0;
+    char output[512] = {0};
+    char *const argv[] = {
+        (char *)JBCTL, "proc_set_debugged", pid_string, NULL
+    };
+    int status = capture(argv, output, sizeof(output));
+    if (status != 0) {
+        logmsg("proc_set_debugged pid=%d failed status=%d output=%s",
+               peer_pid, status, output[0] ? output : "(empty)");
+        return 0;
+    }
+    return 1;
 }
 
 int main(void) {
@@ -201,9 +284,23 @@ int main(void) {
         char *nl = strchr(buf, '\n');
         if (nl) *nl = '\0';
 
-        if (buf[0]) handle_request(buf);
+        int ok = 1;
+        if (strcmp(buf, "DEBUG") == 0) {
+            pid_t peer_pid = -1;
+            socklen_t peer_length = sizeof(peer_pid);
+            if (getsockopt(c, SOL_LOCAL, LOCAL_PEERPID,
+                           &peer_pid, &peer_length) != 0 ||
+                peer_length != sizeof(peer_pid)) {
+                logmsg("LOCAL_PEERPID failed: %s", strerror(errno));
+                ok = 0;
+            } else {
+                ok = mark_peer_debugged(peer_pid);
+            }
+        } else if (buf[0]) {
+            handle_request(buf);
+        }
 
-        write(c, "OK\n", 3);
+        write(c, ok ? "OK\n" : "ERR\n", ok ? 3 : 4);
         close(c);
     }
     close(s);

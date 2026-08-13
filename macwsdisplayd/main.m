@@ -137,10 +137,15 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) IOSurfaceRef surface;
 @property(nonatomic, weak) id owner;
 @property(nonatomic) uint32_t layerWindowID;
+@property(nonatomic) BOOL holdsSurfaceUseCount;
 @end
 
 @implementation MacWSDisplayLease
-- (void)dealloc { if (_surface) CFRelease(_surface); }
+- (void)dealloc {
+    if (_surface && _holdsSurfaceUseCount)
+        IOSurfaceDecrementUseCount(_surface);
+    if (_surface) CFRelease(_surface);
+}
 @end
 
 @class MacWSDisplayClient;
@@ -909,10 +914,19 @@ static void PublishFrame(MacWSDisplayClient *client,
         : contentHeight;
     if (destinationWidth == 0 || destinationHeight == 0) return;
 
+    BOOL finalComposite = !layer &&
+        client.mode == MacWSStreamModeFullscreen &&
+        surface == FinalCompositeSurface &&
+        FinalCompositeRecord.producerPID > 1;
+
     MacWSDisplayLease *lease = [MacWSDisplayLease new];
     lease.token = NextLeaseToken++;
     if (lease.token == 0) lease.token = NextLeaseToken++;
     lease.surface = (IOSurfaceRef)CFRetain(surface);
+    if (finalComposite) {
+        IOSurfaceIncrementUseCount(surface);
+        lease.holdsSurfaceUseCount = YES;
+    }
     lease.owner = client;
     lease.layerWindowID = layerWindowID;
     Leases[@(lease.token)] = lease;
@@ -920,10 +934,6 @@ static void PublishFrame(MacWSDisplayClient *client,
 
     CGFloat scale = client.windowBackingScale > 0.0
         ? client.windowBackingScale : MainDisplayBackingScale();
-    BOOL finalComposite = !layer &&
-        client.mode == MacWSStreamModeFullscreen &&
-        surface == FinalCompositeSurface &&
-        FinalCompositeRecord.producerPID > 1;
     MacWSStreamFrameDescriptor descriptor = {
         .magic = MACWS_STREAM_MAGIC,
         .version = MACWS_STREAM_VERSION,
@@ -1024,9 +1034,17 @@ static void DeliverFinalComposite(
     if (FinalCompositeRecord.producerPID == record.producerPID &&
         FinalCompositeRecord.sequence >= record.sequence) return;
     IOSurfaceRef oldSurface = FinalCompositeSurface;
+    // Own one cross-process use count for the current presentation surface.
+    // Every Host lease owns an additional local count. The producer's pool
+    // therefore sees IOSurfaceIsInUse until both the current-frame reference
+    // and every outstanding GPU lease have retired.
+    IOSurfaceIncrementUseCount(surface);
     FinalCompositeSurface = (IOSurfaceRef)CFRetain(surface);
     FinalCompositeRecord = record;
-    if (oldSurface) CFRelease(oldSurface);
+    if (oldSurface) {
+        IOSurfaceDecrementUseCount(oldSurface);
+        CFRelease(oldSurface);
+    }
 
     NSUInteger subscribers = 0;
     for (MacWSDisplayClient *client in [Clients copy]) {

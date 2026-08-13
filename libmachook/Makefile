@@ -11,7 +11,7 @@ include $(THEOS)/makefiles/common.mk
 
 LIBRARY_NAME = libmachook
 
-libmachook_FILES = jit.m objc_hooks.c mac_hooks.m AppInputBridge.m LocalFilePanel.m DNSBridge.c MacWSFinalCompositePublisher.m Diagnostics/MacWSInputLatency.m os_variant_hooks.x \
+libmachook_FILES = jit.m objc_hooks.c mac_hooks.m AppInputBridge.m LocalFilePanel.m DNSBridge.c MacWSFinalCompositePublisher.m Compatibility/MacWSCatalystInputPolicy.m Compatibility/MacWSCatalystKeychain.m Compatibility/MacWSSysVSemaphore.c Compatibility/MacWSSteamNamedSemaphore.c Compatibility/MacWSSteamProcess.m Diagnostics/MacWSInputLatency.m Diagnostics/MacWSRandomDiagnostics.m Diagnostics/MacWSIdentityDiagnostics.m Diagnostics/MacWSSteamPipeDiagnostics.m os_variant_hooks.x \
   ControlCenter_hooks.x Metal_hooks.x QuartzCore_hooks.x os_log_hooks.m \
   exec_hooks.c
 libmachook_FRAMEWORKS = IOKit IOSurface Metal
@@ -25,7 +25,7 @@ libmachook_FRAMEWORKS = IOKit IOSurface Metal
 # relying on an interactive shell's CFLAGS.
 libmachook_CFLAGS = -DFORCE_M1_DRIVER=1 \
   -isystem $(CURDIR)/../vendor/ios-xpc -I$(CURDIR)/../include \
-  -I$(CURDIR)/.. -I$(CURDIR)/Diagnostics
+  -I$(CURDIR)/.. -I$(CURDIR)/Compatibility -I$(CURDIR)/Diagnostics
 libmachook_LDFLAGS = -undefined dynamic_lookup
 
 # A direct `make package` on the iPad must be just as safe as the documented

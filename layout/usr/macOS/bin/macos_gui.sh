@@ -10,6 +10,7 @@
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh stop              # tear everything down, return to iOS
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh restart coexist   # stop, then start in the given mode
 #   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh status            # show what is running
+#   sudo bash /var/jb/usr/macOS/bin/macos_gui.sh trust             # restore this boot's persistent code trust only
 #
 # Options for start/restart:
 #   coexist | exclusive   display mode (default: coexist)
@@ -58,6 +59,7 @@ RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
 QUARTZCORE_COMPAT_PROVISIONER=/var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh
 THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
+MOUNTDEVFS=/var/jb/usr/macOS/bin/mountdevfs
 LOGDIR=/var/jb/var/mobile
 TEST_LEASE="$LOGDIR/macws_test_lease"
 GUI_TRANSACTION_LOCK="$LOGDIR/.macos_gui.transaction"
@@ -144,6 +146,7 @@ EXPERIMENTAL_IOGPU_ERROR="$ROOTFS/private/tmp/macws_iogpu_error_diag"
 EXPERIMENTAL_PIPELINE_DIAG="$ROOTFS/private/tmp/macws_pipeline_diag"
 EXPERIMENTAL_COMPLETION="$ROOTFS/private/tmp/macws_cancel_completion"
 EXPERIMENTAL_VNC_SHARE="$ROOTFS/private/tmp/macws_vnc_share"
+EXPERIMENTAL_FINAL_COMPOSITE="$ROOTFS/private/tmp/macws_final_composite"
 EXPERIMENTAL_OBSERVE_PF550="$ROOTFS/private/tmp/macws_observe_pf550"
 EXPERIMENTAL_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_ring"
 EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
@@ -224,6 +227,7 @@ P_PBS='/System/Library/CoreServices/pbs'
 P_ACTIVITYMON='Activity Monitor.app/Contents/MacOS/Activity Monitor'
 P_GLASSDEMO='/tmp/GlassDemo'
 P_MAPS='/System/Applications/Maps.app/Contents/MacOS/Maps'
+P_SYSTEM_SETTINGS='/System/Applications/System Settings.app/Contents/MacOS/System Settings'
 P_FINDER='CoreServices/Finder.app/Contents/MacOS/Finder'
 P_DOCK='CoreServices/Dock.app/Contents/MacOS/Dock'
 P_SYSTEMUI='CoreServices/SystemUIServer.app/Contents/MacOS/SystemUIServer'
@@ -653,6 +657,12 @@ stop_ws_dependents() {
     kill_by_pattern "$P_ACTIVITYMON"
     kill_by_pattern "$P_GLASSDEMO"
     kill_by_pattern "$P_MAPS"
+    # Like Maps, System Settings owns a WindowServer-bound AppKit shell plus
+    # ExtensionKit child scenes.  Keeping that shell across a WindowServer
+    # generation leaves a live PID with a dead CGS port; its stale metrics can
+    # then be mistaken for a reusable window while the sidebar/content is
+    # blank. Retire only the exact macOS executable during stack cleanup.
+    kill_by_pattern "$P_SYSTEM_SETTINGS"
     rm -f "$MAPS_HOST_CARRIER_MARKER"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
@@ -993,6 +1003,7 @@ run_watchdog() {
 # get_session_port. This bounded restore changes no binary or signature.
 BOOT_TRUSTCACHE_INFO=""
 BOOT_TRUSTCACHE_ADDED=0
+APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
 
 boot_trust_hash() {
     local hash="$1"
@@ -1017,8 +1028,78 @@ boot_trust_macho() {
     done
 }
 
+# Emit every regular Mach-O/fat image in a tree as a NUL-delimited list.  Mode
+# bits are not a code witness: Valheim ships a real arm64 framework as 0644,
+# while Office marks many data resources executable.  Reading the four-byte
+# magic first keeps the later ldid work bounded to actual code.
+list_boot_macho_files() {
+    /var/jb/usr/bin/python3 -c '
+import os, stat, sys
+
+magics = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+for base, _, names in os.walk(sys.argv[1]):
+    for name in names:
+        path = os.path.join(base, name)
+        try:
+            mode = os.stat(path, follow_symlinks=False).st_mode
+            if not stat.S_ISREG(mode):
+                continue
+            with open(path, "rb") as stream:
+                if stream.read(4) not in magics:
+                    continue
+            os.write(1, os.fsencode(path) + b"\0")
+        except OSError:
+            pass
+' "$1"
+}
+
+boot_session_identifier() {
+    /var/jb/usr/sbin/sysctl -n kern.boottime 2>/dev/null |
+        /var/jb/usr/bin/tr -cd '0-9,='
+}
+
+# Restore the dependency closure of every already-signed third-party app once
+# per iPad boot.  launchdchrootexec/autosignd can admit a main executable, but
+# dyld validates nested frameworks before either injected code path can run.
+# Runtime-confirmed after the 2026-08-13 reboot: Amadine stopped at Sparkle,
+# Word at Forms, and Excel/PowerPoint at ADAL4 with `code signature invalid`.
+# Their on-disk CodeDirectories were intact; only Dopamine's dynamic trustcache
+# entries had disappeared.  Never re-sign here, because that would mutate the
+# nested-code relationship.  A successful marker makes warm GUI restarts fast,
+# while kern.boottime invalidates it naturally after the next cold boot.
+restore_installed_application_trust() {
+    local boot_id="" marker_id="" bundle="" path="" bundle_count=0 image_count=0
+    boot_id=$(boot_session_identifier)
+    marker_id=$(sed -n '1p' "$APPLICATION_TRUST_BOOT_MARKER" 2>/dev/null || true)
+    if [ -n "$boot_id" ] && [ "$marker_id" = "$boot_id" ]; then
+        log "Application trust closure already verified for this iPad boot."
+        return 0
+    fi
+
+    for bundle in "$ROOTFS"/Applications/*.app; do
+        [ -d "$bundle/Contents" ] || continue
+        bundle_count=$((bundle_count + 1))
+        while IFS= read -r -d '' path; do
+            boot_trust_macho "$path" || return 1
+            image_count=$((image_count + 1))
+        done < <(list_boot_macho_files "$bundle/Contents")
+    done
+
+    if [ -n "$boot_id" ]; then
+        marker_tmp="${APPLICATION_TRUST_BOOT_MARKER}.new.$$"
+        printf '%s\n' "$boot_id" > "$marker_tmp" || return 1
+        mv -f "$marker_tmp" "$APPLICATION_TRUST_BOOT_MARKER" || return 1
+    fi
+    log "Application trust closure ready (bundles=$bundle_count Mach-O images=$image_count)."
+}
+
 restore_cold_boot_trust() {
-    local path="" vscode_bundle="$ROOTFS/Applications/Visual Studio Code.app"
+    local path=""
     BOOT_TRUSTCACHE_INFO=$(/var/jb/usr/bin/jbctl trustcache info 2>/dev/null || true)
     BOOT_TRUSTCACHE_ADDED=0
 
@@ -1048,6 +1129,7 @@ restore_cold_boot_trust() {
         "$ROOTFS/System/Library/PrivateFrameworks/TimelineUI.framework/Versions/A/TimelineUI" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock" \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" \
+        "$ROOTFS$CSNAMEDDATAD_BIN" \
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" \
         "$ROOTFS/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/HIServices.framework/Versions/A/XPCServices/com.apple.hiservices-xpcservice.xpc/Contents/MacOS/com.apple.hiservices-xpcservice" \
         "$ROOTFS/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService" \
@@ -1062,6 +1144,7 @@ restore_cold_boot_trust() {
         "$ROOTFS$OFFICE_LICENSING_BIN" \
         "$ROOTFS/System/Applications/System Settings.app/Contents/MacOS/System Settings" \
         "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" \
+        "$ROOTFS/tmp/GlassDemo" \
         "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
         "$ROOTFS/usr/libexec/locationd" \
         "$ROOTFS/System/Library/PrivateFrameworks/GeoServices.framework/Versions/A/XPCServices/com.apple.geod.xpc/Contents/MacOS/com.apple.geod" \
@@ -1072,14 +1155,7 @@ restore_cold_boot_trust() {
         boot_trust_macho "$path" || return 1
     done
 
-    # Electron's nested executable signatures persist, but dyld validates them
-    # before libmachook/autosignd can service the process. Restore the unchanged
-    # bundle exactly as the former full postinst path did.
-    if [ -d "$vscode_bundle/Contents" ]; then
-        while IFS= read -r -d '' path; do
-            boot_trust_macho "$path" || return 1
-        done < <(find "$vscode_bundle/Contents" -type f -perm -111 -print0 2>/dev/null)
-    fi
+    restore_installed_application_trust || return 1
     log "Cold-boot trust closure ready (registered=$BOOT_TRUSTCACHE_ADDED existing CodeDirectories)."
 }
 
@@ -1178,6 +1254,21 @@ ensure_chroot_works() {
         log "ERROR: reboot-volatile macOS trust closure could not be restored."
         return 1
     }
+    # devfs mounts are reboot-volatile, unlike the rootfs contents and package
+    # signatures.  A successful trust probe alone therefore cannot establish
+    # that GUI clients can create pseudo-terminals. Runtime evidence from the
+    # current cold start was exact: /var/mnt/rootfs/dev/ptmx was absent and
+    # Terminal reported `[forkpty: No such file or directory]`; invoking the
+    # iOS-native helper created the real devfs node immediately. Make that
+    # mount and its concrete ptmx witness part of every production preflight.
+    if [ ! -x "$MOUNTDEVFS" ] ||
+       ! "$MOUNTDEVFS" "$ROOTFS/dev" \
+            > "$LOGDIR/mountdevfs.log" 2>&1 ||
+       [ ! -c "$ROOTFS/dev/ptmx" ]; then
+        log "ERROR: chroot devfs is unavailable; Terminal cannot create a pty."
+        tail -n 10 "$LOGDIR/mountdevfs.log" 2>/dev/null || true
+        return 1
+    fi
     # A restored/rootfs snapshot can regress only the data-only shader artifact
     # while every executable trust sentinel remains valid. Hash-check the
     # focused provisioner on every cold start; its matching path is one 1-MiB
@@ -1966,6 +2057,8 @@ diagnostic_flag_paths() {
         /private/tmp/macws_agx_dump_methods \
         /private/tmp/macws_agx_trace_reserve \
         /tmp/macws_app_input_diagnostics \
+        /tmp/macws_asphalt_identity_diag \
+        /tmp/macws_asphalt_random_diag \
         /tmp/macws_file_panel_diag \
         /private/tmp/macws_mtl_data_diag \
         /private/tmp/macws_mtl_library_diag \
@@ -2056,7 +2149,7 @@ production_preflight() {
                  "$VSCODE_PLIST" "$CHROME150_PLIST"; do
         [ -f "$plist" ] || continue
         if plutil "$plist" 2>/dev/null | grep -Eq \
-            '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_APP_INPUT_DIAGNOSTICS|MACWS_FILE_PANEL_DIAG|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG)"?[[:space:]]*='; then
+            '"?(MallocScribble|MallocStackLogging|MACWS_RUNTIME_DIAGNOSTICS|MACWS_APP_INPUT_DIAGNOSTICS|MACWS_FILE_PANEL_DIAG|MACWS_SUBMIT_FAST_RING|MACWS_ABORT_TRACE|MACWS_AGX_CRASH_DIAG|MACWS_IOSURF_TRACE|MACWS_JIT_MPROTECT_TRACE|MACWS_MACH_MSG_TRACE|MACWS_VNC_TRACE_CLIENT_MESSAGES|MACWS_XPC_DEBUG|MACWS_RANDOM_DIAGNOSTICS|MACWS_IDENTITY_DIAGNOSTICS|MACWS_XPC_NAME_TRACE)"?[[:space:]]*='; then
             log "ERROR: production debug environment found in $plist"
             bad=1
         fi
@@ -2098,7 +2191,8 @@ production_preflight() {
         done
     fi
     for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
-                /tmp/macws_cancel_completion; do
+                /tmp/macws_cancel_completion /tmp/macws_final_composite \
+                /tmp/macws_owned_scanout; do
         if [ ! -e "$ROOTFS$path" ]; then
             log "ERROR: required native-AGX production flag missing: $path"
             bad=1
@@ -2223,6 +2317,7 @@ cleanup_macos() {
     # process remains live.  The old omission made the next launch falsely
     # reuse that live PID and publish no AppKit window.
     kill_by_pattern "$P_MAPS"
+    kill_by_pattern "$P_SYSTEM_SETTINGS"
     rm -f "$MAPS_HOST_CARRIER_MARKER"
     kill_by_pattern "$P_FINDER"
     kill_by_pattern "$P_DOCK"
@@ -2264,7 +2359,8 @@ cleanup_macos() {
         "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE" \
         "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
         "$EXPERIMENTAL_COMMAND_ERROR" "$EXPERIMENTAL_COMPLETION" \
-        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_FINAL_COMPOSITE" \
+        "$EXPERIMENTAL_OBSERVE_PF550" \
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
         "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_QUEUE_QOS" \
         "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" "$EXPERIMENTAL_PACE"
@@ -2782,6 +2878,30 @@ start_macos() {
         log "ERROR: CarbonCore named-data MachService contract was not registered."
         return 1
     }
+    # A registered launchd label is not a readiness witness: on the 2026-08-13
+    # cold start, csnameddatad's persistent signature survived while its
+    # reboot-volatile arm64e CDHash did not. launchd published the MachService
+    # and repeatedly recorded exit status 9, while Dock's main thread blocked
+    # in CarbonCore `_CSGetNamedData` and could not drain native gesture work.
+    # `restore_cold_boot_trust` now restores the exact executable hash above;
+    # require the real process to survive its former AMFI failure window too.
+    waited=0
+    while ! proc_running "$P_CSNAMEDDATAD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_CSNAMEDDATAD" || {
+        log "ERROR: CarbonCore named-data service did not reach a live process."
+        tail -n 30 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
+        return 1
+    }
+    sleep 2
+    proc_running "$P_CSNAMEDDATAD" || {
+        log "ERROR: CarbonCore named-data service exited during its readiness window."
+        tail -n 30 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
+        return 1
+    }
+    log "CarbonCore named-data endpoint ready."
 
     seed_launchservices_database || return 1
 
@@ -2987,7 +3107,8 @@ stop_all() {
     # silently inherits experimental protocol behavior.
     rm -f "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_COMPLETION" \
         "$EXPERIMENTAL_WRAPPED_KCMD" "$EXPERIMENTAL_COMMAND_ERROR" \
-        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
+        "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_FINAL_COMPOSITE" \
+        "$EXPERIMENTAL_OBSERVE_PF550" \
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_OWNED_SCANOUT" \
         "$EXPERIMENTAL_FAST_SUBMIT_RING" \
         "$EXPERIMENTAL_QUEUE_QOS" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \
@@ -3037,7 +3158,8 @@ switch_status() {
     echo
     echo "-- required functional flags --"
     for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
-                /tmp/macws_cancel_completion /tmp/macws_vnc_share \
+                /tmp/macws_cancel_completion /tmp/macws_final_composite \
+                /tmp/macws_vnc_share \
                 /tmp/macws_owned_scanout /tmp/macws_coexist_pace_us; do
         if [ -e "$ROOTFS$path" ]; then actual=ON; else actual=OFF; fi
         printf '%-48s actual=%s\n' "$path" "$actual"
@@ -3073,6 +3195,7 @@ Usage (run as root):
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
   sudo bash $0 status
+  sudo bash $0 trust  # restore/audit this boot's code trust; no GUI restart
 
 Modes:
   coexist     (default) iPad panel keeps showing iOS; macOS renders to VNC only.
@@ -3188,17 +3311,20 @@ fi
 
 enable_experimental_if_requested() {
     [ "$WANT_EXPERIMENTAL" = 1 ] || return 0
+    # MacWSHost consumes WindowServer's already-composited native-AGX surface
+    # directly. This transport is independent of RFB and remains enabled when
+    # --no-vnc is selected; the owned BGRA target is its render destination.
     touch "$EXPERIMENTAL_KCMD" "$EXPERIMENTAL_WRAPPED_KCMD" \
-        "$EXPERIMENTAL_COMPLETION"
+        "$EXPERIMENTAL_COMPLETION" "$EXPERIMENTAL_FINAL_COMPOSITE" \
+        "$EXPERIMENTAL_OWNED_SCANOUT"
     if [ "$WANT_VNC" = 1 ]; then
         touch "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OWNED_SCANOUT"
     else
-        # A headless/CDP performance run must not allocate and publish a
-        # 15.2-MiB VNC scanout every WindowServer frame.  Keeping these
-        # producer hooks enabled without an RFB consumer perturbs the very
-        # presentation cadence the run is intended to measure.
+        # RFB is optional. Keep the native final-composite transport active
+        # for MacWSHost, but do not allocate the separate mmap framebuffer or
+        # run its CPU damage copier when there is no VNC consumer.
         rm -f "$EXPERIMENTAL_VNC_SHARE" "$EXPERIMENTAL_OBSERVE_PF550" \
-            "$EXPERIMENTAL_OWNED_SCANOUT"
+            "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
     fi
     # Keep the old heap-allocating, mutex-protected deep recorder off the hot
     # path.  A VS Code GPU-process sample caught it in submission, and it can
@@ -3224,7 +3350,7 @@ enable_experimental_if_requested() {
     if [ "$WANT_VNC" = 1 ]; then
         log "NATIVE-AGX-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion + owned BGRA scanout + stable VNC mmap enabled."
     else
-        log "NATIVE-AGX-SCAFFOLD: command ABI (direct + validated wrapper forms) + cancelled-swap completion enabled; VNC scanout bridge disabled for headless measurement."
+        log "NATIVE-AGX-SCAFFOLD: command ABI + cancelled-swap completion + native final-composite IOSurface enabled; RFB mmap/CPU damage bridge disabled."
     fi
     if [ "$WANT_DIAGNOSTICS" = 1 ]; then
         log "DIAGNOSTICS: AGX fast submit recorder, lifecycle witnesses, PF550 observer, and command-error hooks enabled."
@@ -3450,6 +3576,13 @@ case "$CMD" in
         ;;
     status)
         status
+        ;;
+    trust)
+        # Non-disruptive cold-boot repair/audit entry point.  It changes no
+        # signature and does not stop or launch any GUI process; production
+        # start runs the identical closure automatically before WindowServer.
+        require_root "$@"
+        restore_cold_boot_trust
         ;;
     switches)
         switch_status

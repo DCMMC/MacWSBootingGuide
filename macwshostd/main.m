@@ -93,7 +93,7 @@ static const char *const kAsphaltExecutable =
 static const char *const kAsphaltBundleIdentifier =
     "com.gameloft.asphalt9mac";
 static const char *const kAsphaltContainerHome =
-    "/var/root/Library/Containers/com.gameloft.asphalt9mac/Data";
+    "/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data";
 static const char *const kCatalystRequestPath =
     "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
 static CFStringRef const kMapsHostLaunchNotification =
@@ -1727,14 +1727,16 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
 // Asphalt is the first third-party Catalyst control-center target. Its
 // executable, bundle identity and container are an exact allowlist entry;
 // macwshostd publishes one root-owned request and the already-foreground
-// MacWSHost creates the responsible-process child. This is the same upstream
+// MacWSHost creates the responsible-process child. The container is owned by
+// the iPadOS login uid (501), matching a normal Catalyst application and its
+// Data Protection Keychain session. This is the same upstream
 // UIKit/FrontBoard ancestry that runtime-confirmed the native AGX drawable,
 // not a bare chroot spawn or a second black UIKit scene.
 static BOOL LaunchAsphaltViaUIKitCarrier(NSString **message) {
     NSString *rootPath = @(kAsphaltExecutable);
     NSString *hostPath = [@(kRootFS) stringByAppendingString:rootPath];
     NSString *hostContainer = [@(kRootFS)
-        stringByAppendingString:@"/private/var/root/Library/Containers/com.gameloft.asphalt9mac/Data"];
+        stringByAppendingString:@"/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data"];
     struct stat containerStatus = {0};
     if (!HasExecutableFileMode(hostPath.fileSystemRepresentation) ||
         stat(hostContainer.fileSystemRepresentation, &containerStatus) != 0 ||

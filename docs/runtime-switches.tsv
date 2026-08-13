@@ -60,6 +60,7 @@ env	MACWS_CHROOT_HOST_ROOT	auto	launchdchrootexec descendants	Canonical host pat
 env	MACWS_COEXIST_PACE_US	off	environment override	Production uses the documented /tmp/macws_coexist_pace_us file instead.
 env	MACWS_DESKTOPSERVICES_DIAG	off	diagnostic	Exact-UUID Finder volume-map lookup and SamePhysicalDevice boundary recorder; observation only.
 env	MACWS_DISPLAY_DIAGNOSTICS	off	macwsdisplayd diagnostic	Enables per-frame throughput and final-composite receive logging; production keeps it unset to avoid synchronous stderr overhead.
+env	MACWS_FINAL_COMPOSITE_DIRECT	off	final-composite A/B rollback	Bypasses the production four-slot same-queue snapshot ring and republishes WindowServer's mutable display target directly; diagnostic only because producer and Host can race on the same IOSurface.
 env	MACWS_DIAG_SKIP_BIND_UPDATE	off	diagnostic	Reproduces historical texture bind failure.
 env	MACWS_DISP_COPY	off	diagnostic experiment	Legacy display CPU-copy bridge.
 env	MACWS_DISP_FILL_LOOP	off	diagnostic experiment	Legacy continuous gray-fill probe.
@@ -142,6 +143,12 @@ env	MACWS_VNC_SHARE	off	environment override	Production enables the equivalent /
 env	MACWS_VNC_TRACE_CLIENT_MESSAGES	off	diagnostic	RFB client-message trace.
 env	MACWS_XPC_DEBUG	off	diagnostic	XPC connection trace; no process enables it implicitly.
 env	MACWS_XPC_NAME_TRACE	off	diagnostic	Bounded allocation-free cold-start recorder for XPC/bootstrap service names; writes at most 512 records to stderr and never changes requests or results.
+env	MACWS_XPC_NAME_TRACE_FILTER	off	diagnostic	Optional substring filter for MACWS_XPC_NAME_TRACE; absent in production and launcher-cleared before every Catalyst child.
+env	MACWS_RANDOM_DIAGNOSTICS	off	Asphalt diagnostic	Read-only entropy/file-access witnesses enabled only by the matching rootfs sentinel; production preflight removes the sentinel.
+env	MACWS_IDENTITY_DIAGNOSTICS	off	Asphalt diagnostic	Read-only identifierForVendor and SecItem status witnesses; never records UUID or Keychain value, and production preflight removes its sentinel.
+env	MACWS_CATALYST_LOCAL_KEYCHAIN	on	Asphalt compatibility	After the stock Ventura SecItem client returns errSecNotAvailable/errSecMDSError, routes only Asphalt generic-password requests through the authenticated mobile-session iOS Security helper with the original Gameloft access groups.
+env	ALL_PROXY/HTTPS_PROXY/HTTP_PROXY	auto	Asphalt network compatibility	Set to socks5h://127.0.0.1:1082 only when that user-owned loopback endpoint accepts a bounded launch-time connection; otherwise cleared for direct networking. TLS verification remains enabled.
+env	MACWS_KEYCHAIN_PROBE_PRESERVE	off	standalone Keychain probe	Keeps the probe's synthetic generic-password record for a second-process persistence check; never set by an application or production launch job.
 env	NSRunningFromLaunchd	on	pbs	Matches the real macOS Services daemon launch contract.
 env	PATH	auto	chroot launcher	Explicit standard chroot executable search path.
 env	PINPROBE_HOLD_BEFORE_PIN	off	standalone probe	Holds PinnedVAProbe before pinning for debugger attachment.
@@ -199,6 +206,8 @@ flag	/tmp/macws_res_diag	off	diagnostic	AGX resource argument trace.
 flag	/tmp/macws_runtime_diagnostics	off	diagnostic master	Enables high-overhead recorders and per-frame/event logs.
 flag	/tmp/macws_app_input_diagnostics	off	AppInput diagnostic	Logs AppKit hit-window and event routing without enabling AGX/JIT recorders.
 flag	/tmp/macws_file_panel_diag	off	file-panel diagnostic	Logs local NSOpenPanel runtime-class installation and factory calls; production startup removes it.
+flag	/tmp/macws_asphalt_random_diag	off	Asphalt diagnostic	Enables one-launch read-only entropy/TLS source tracing; production startup removes it.
+flag	/tmp/macws_asphalt_identity_diag	off	Asphalt diagnostic	Enables one-launch Security/identifier status tracing; production startup removes it.
 flag	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled	off	SpringBoard windowing	Emergency opt-out for MacWS dense Stage Manager size candidates; absence means the production grid expansion remains enabled.
 flag	/var/jb/var/mobile/macws_catalyst_launch.trace	off	runningboardd diagnostic	Logs only the exact hidden Catalyst launcher job rewrite; production keeps this absent.
 flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.

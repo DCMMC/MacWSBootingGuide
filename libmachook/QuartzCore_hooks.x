@@ -23,6 +23,8 @@ DYLD_INTERPOSE(NXGetClickSpace_new, NXGetClickSpace)
 // "Patch Discipline".)
 
 __attribute__((constructor)) static void InitQuartzCoreHooks() {
+    const char *utility_process = getenv("MACWS_UTILITY_PROCESS");
+    if (utility_process && strcmp(utility_process, "1") == 0) return;
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
 

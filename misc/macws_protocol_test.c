@@ -53,17 +53,17 @@ int main(void) {
     assert(MacWSInputModifiersForScene(fullscreenPointerScene) == 0x1234u);
     assert(MacWSDecideTouchCandidate(0.10, 0.0, false) ==
            MacWSTouchCandidateDecisionWait);
-    assert(MacWSDecideTouchCandidate(0.44, 3.99, true) ==
+    assert(MacWSDecideTouchCandidate(0.44, 7.99, true) ==
            MacWSTouchCandidateDecisionTap);
-    assert(MacWSDecideTouchCandidate(0.10, 4.0, false) ==
+    assert(MacWSDecideTouchCandidate(0.10, 8.0, false) ==
            MacWSTouchCandidateDecisionScroll);
-    assert(MacWSDecideTouchCandidate(0.45, 3.99, false) ==
+    assert(MacWSDecideTouchCandidate(0.45, 7.99, false) ==
            MacWSTouchCandidateDecisionLongPress);
     // Movement wins when timer delivery and the touch sample arrive together;
     // an already-moving finger must not become a delayed long press.
     // The movement sample itself occurred after the hardware hold threshold:
     // this is hold-then-drag even if the main-queue feedback timer was late.
-    assert(MacWSDecideTouchCandidate(0.45, 4.0, false) ==
+    assert(MacWSDecideTouchCandidate(0.45, 8.0, false) ==
            MacWSTouchCandidateDecisionLongPress);
     assert(!MacWSTouchReachedLongPress(0.10));
     assert(!MacWSTouchReachedLongPress(0.449));

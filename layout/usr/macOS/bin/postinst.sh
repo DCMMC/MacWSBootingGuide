@@ -1,8 +1,17 @@
 cd $(realpath $HOME/../..)/usr/macOS
 
+# Several provisioning steps below create paths in the mounted macOS volume
+# before the historical late assignment near the toolchain section.  Keep the
+# mount root authoritative from the first statement: after a reboot the
+# Asphalt mobile-container step otherwise expands an unset ROOTFS to
+# /Users/mobile on iOS, where the sealed root is read-only, and aborts before
+# the generic /Applications trustcache restoration runs.
+ROOTFS=/var/mnt/rootfs
+
 # Invalidate the same-bootsession Settings ExtensionKit verification cache
 # before an installation can replace any of its signed runtime dependencies.
 rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
+rm -f /var/jb/var/mobile/macws-application-trust.boot-ready
 
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 CFPREFSD_ENT="/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist"
@@ -14,8 +23,10 @@ GEOD_NATIVE_ENT="/var/jb/usr/macOS/bin/geod-native-entitlements.plist"
 INTEROP_LOCATION_ENT="/var/jb/usr/macOS/bin/interop-location-entitlements.plist"
 CODE_REQUIREMENT_WRITER="/var/jb/usr/macOS/bin/write_code_requirement.py"
 ASPHALT_CA_INTERMEDIATE="/var/jb/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem"
+ASPHALT_OPENSSL_CONFIG="/var/jb/usr/macOS/share/openssl/openssl.cnf"
 MACOS_CA_BUNDLE="/var/mnt/rootfs/etc/ssl/cert.pem"
 ASPHALT_CA_BUNDLE="/var/mnt/rootfs/usr/local/ssl/cert.pem"
+ASPHALT_OPENSSL_CONFIG_DEST="/var/mnt/rootfs/usr/local/ssl/openssl.cnf"
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
 LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
@@ -490,6 +501,7 @@ trust_existing_app_bundle() {
 # MacWSHost app.  Trust it here, but never unload it from this script: postinst
 # may itself be running as a request served by macwshostd.
 add_all_trustcache "/var/jb/usr/macOS/bin/macwshostd"
+add_all_trustcache "/var/jb/usr/macOS/bin/macwskeychaind"
 
 # ─── LaunchDaemons plist ownership/permissions ─────────────────────────────
 # launchctl refuses to load any plist under a system LaunchDaemons dir unless
@@ -712,6 +724,42 @@ else
 	exit 1
 fi
 
+# Some self-contained Mac Catalyst applications retain OpenSSL's compiled
+# `/usr/local/ssl` prefix even though their code and trust roots are bundled.
+# Install a real, non-permissive config at that canonical location. Runtime
+# diagnostics in Asphalt confirmed the missing file returned ENOENT before its
+# otherwise-valid TLS handshake; this file neither disables verification nor
+# changes the cipher/security level.
+if [ -f "$ASPHALT_OPENSSL_CONFIG" ]; then
+	mkdir -p "$(dirname "$ASPHALT_OPENSSL_CONFIG_DEST")" || exit 1
+	cp "$ASPHALT_OPENSSL_CONFIG" "$ASPHALT_OPENSSL_CONFIG_DEST" || exit 1
+	chmod 0644 "$ASPHALT_OPENSSL_CONFIG_DEST" || exit 1
+else
+	echo '[ERROR] OpenSSL compatibility config is missing' >&2
+	exit 1
+fi
+
+# Catalyst children execute as the foreground iPadOS login user (uid/gid 501)
+# so UIKit and the Data Protection Keychain share the same user session. Older
+# packages stored Asphalt below /var/root; a uid-501 process cannot traverse
+# that directory even if the leaf itself is chowned. Copy the existing Data
+# tree once into the normal mobile macOS home, keep the source as a rollback
+# backup, and never weaken /var/root permissions.
+ASPHALT_OLD_CONTAINER="$ROOTFS/var/root/Library/Containers/com.gameloft.asphalt9mac/Data"
+ASPHALT_MOBILE_CONTAINER="$ROOTFS/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data"
+if [ ! -d "$ASPHALT_MOBILE_CONTAINER" ]; then
+	mkdir -p "${ASPHALT_MOBILE_CONTAINER%/Data}" || exit 1
+	if [ -d "$ASPHALT_OLD_CONTAINER" ]; then
+		cp -Rp "$ASPHALT_OLD_CONTAINER" "$ASPHALT_MOBILE_CONTAINER" || exit 1
+	else
+		mkdir -p "$ASPHALT_MOBILE_CONTAINER/Documents" \
+			"$ASPHALT_MOBILE_CONTAINER/Library" || exit 1
+	fi
+fi
+chown -R 501:501 "$ROOTFS/Users/mobile/Library/Containers/com.gameloft.asphalt9mac" || exit 1
+chmod 0700 "$ROOTFS/Users/mobile/Library/Containers/com.gameloft.asphalt9mac" \
+	"$ASPHALT_MOBILE_CONTAINER" || exit 1
+
 # Establish the complete arm64e loader closure before the first chroot exec
 # below.  The signatures persist across a reboot, but Dopamine's dynamic
 # trustcache does not.  Runtime-confirmed on 2026-08-05: invoking /bin/bash
@@ -789,10 +837,12 @@ if [ -f "$INTEROP_BUNDLE_SOURCE/MacOS/macwsinteropd" ]; then
 	# represented in the native macOS CodeDirectory.  Runtime-confirmed on the
 	# target: strict verification passes, flags=0x2(adhoc), and repeated signing
 	# produces the same CDHash.
+	MACWS_UTILITY_PROCESS=1 \
 	/var/jb/usr/macOS/bin/launchdchrootexec 0 0 /var/mnt/rootfs \
 		/usr/bin/codesign --force --sign - --timestamp=none \
 		--preserve-metadata=identifier,entitlements,requirements \
 		/usr/local/libexec/MacWSInteropService.app || exit 1
+	MACWS_UTILITY_PROCESS=1 \
 	/var/jb/usr/macOS/bin/launchdchrootexec 0 0 /var/mnt/rootfs \
 		/usr/bin/codesign --verify --strict --verbose=2 \
 		/usr/local/libexec/MacWSInteropService.app || exit 1
@@ -841,6 +891,7 @@ ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
 # admissible on the iOS kernel and restores dynamic trust after a reboot.
 for workspace_binary in \
     '/var/mnt/rootfs/usr/libexec/lsd' \
+    '/var/mnt/rootfs/System/Library/CoreServices/sharedfilelistd' \
     '/var/mnt/rootfs/System/Library/CoreServices/iconservicesd' \
     '/var/mnt/rootfs/System/Library/CoreServices/iconservicesagent' \
     '/var/mnt/rootfs/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock' \

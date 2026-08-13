@@ -69,9 +69,14 @@ ssh_privileged() {
         "sudo -S bash -c $quoted"
 }
 
-# Resolve target PID on device.
-PID=$(ssh -n -p "$PORT" "$SSH_USER@$HOST" \
-    "ps aux | grep -E '$PROC_NAME' | grep -v grep | head -1 | awk '{print \$2}'")
+# Resolve target PID on device. Accepting an exact numeric PID avoids matching
+# wrapper/tmux command lines which contain the child executable's name.
+if [[ "$PROC_NAME" =~ ^[0-9]+$ ]]; then
+    PID=$PROC_NAME
+else
+    PID=$(ssh -n -p "$PORT" "$SSH_USER@$HOST" \
+        "ps aux | grep -E '$PROC_NAME' | grep -v grep | head -1 | awk '{print \$2}'")
+fi
 if [ -z "$PID" ]; then
     echo "error: no process matching '$PROC_NAME' on $HOST" >&2
     exit 1

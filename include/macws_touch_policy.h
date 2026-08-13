@@ -8,10 +8,12 @@
 
 // Product-level direct-touch thresholds. Keep these in a pure header so the
 // UIKit state machine and local boundary tests cannot silently diverge.
-// Four UIKit points is enough to reject normal tap jitter on an 11-inch
-// iPad, while avoiding the extra display-frame of perceived latency that the
-// previous six-point gate added to slow, deliberate map/document pans.
-#define MACWS_DIRECT_GESTURE_THRESHOLD_POINTS 4.0
+// UIKit's ordinary tap slop on a Retina iPad is materially wider than four
+// points.  Four points classified normal fingertip centroid jitter as a
+// document scroll before touch-up, so the first half of a Finder double tap
+// was frequently lost.  Eight points still begins direct manipulation within
+// one short physical movement while preserving a stationary tap transaction.
+#define MACWS_DIRECT_GESTURE_THRESHOLD_POINTS 8.0
 #define MACWS_DIRECT_LONG_PRESS_SECONDS 0.45
 #define MACWS_DIRECT_DOUBLE_TAP_SECONDS 0.42
 #define MACWS_DIRECT_DOUBLE_TAP_DISTANCE_POINTS 44.0

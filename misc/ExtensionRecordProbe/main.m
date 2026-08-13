@@ -2,6 +2,7 @@
 // ExtensionFoundation's Settings extension discovery path.
 
 @import Foundation;
+@import AppKit;
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
@@ -19,6 +20,658 @@
 static id SendObject(id object, const char *selectorName) {
     return object ? ((id (*)(id, SEL))objc_msgSend)(
         object, sel_registerName(selectorName)) : nil;
+}
+
+static id SendClassObject(const char *className, const char *selectorName) {
+    Class cls = objc_getClass(className);
+    return cls ? ((id (*)(id, SEL))objc_msgSend)(
+        cls, sel_registerName(selectorName)) : nil;
+}
+
+static NSInteger SendInteger(id object, const char *selectorName) {
+    return object ? ((NSInteger (*)(id, SEL))objc_msgSend)(
+        object, sel_registerName(selectorName)) : 0;
+}
+
+static double SendDouble(id object, const char *selectorName) {
+    return object ? ((double (*)(id, SEL))objc_msgSend)(
+        object, sel_registerName(selectorName)) : 0.0;
+}
+
+static void DumpObjectIvars(id object, const char *label) {
+    if (!object) {
+        printf("OBJECT_IVARS label=%s object=nil\n", label);
+        return;
+    }
+    printf("OBJECT_IVARS label=%s class=%s value=%s\n", label,
+           object_getClassName(object), [[object description] UTF8String]);
+    for (Class owner = object_getClass(object); owner;
+         owner = class_getSuperclass(owner)) {
+        unsigned count = 0;
+        Ivar *ivars = class_copyIvarList(owner, &count);
+        for (unsigned index = 0; index < count; index++) {
+            const char *name = ivar_getName(ivars[index]);
+            const char *type = ivar_getTypeEncoding(ivars[index]);
+            ptrdiff_t offset = ivar_getOffset(ivars[index]);
+            if (type && type[0] == '@') {
+                id value = object_getIvar(object, ivars[index]);
+                printf("OBJECT_IVAR label=%s owner=%s name=%s offset=%td "
+                       "type=%s class=%s value=%s\n", label,
+                       class_getName(owner), name ?: "?", offset, type,
+                       value ? object_getClassName(value) : "nil",
+                       value ? [[value description] UTF8String] : "nil");
+            } else {
+                printf("OBJECT_IVAR label=%s owner=%s name=%s offset=%td "
+                       "type=%s\n", label, class_getName(owner), name ?: "?",
+                       offset, type ?: "?");
+            }
+        }
+        free(ivars);
+    }
+}
+
+static id ObjectIvarNamed(id object, const char *name) {
+    if (!object || !name) return nil;
+    for (Class owner = object_getClass(object); owner;
+         owner = class_getSuperclass(owner)) {
+        Ivar ivar = class_getInstanceVariable(owner, name);
+        if (ivar) return object_getIvar(object, ivar);
+    }
+    return nil;
+}
+
+static IMP gOriginalGraphicVariantWithOptions;
+
+static id ProbeGraphicVariantWithOptions(id self, SEL selector, id options) {
+    DumpObjectIvars(options, "graphic-variant-options");
+    printf("GRAPHIC_VARIANT_OPTION_VALUES shape=%ld fill=%ld content=%ld "
+           "shapeEffect=%ld centering=%ld scaling=%ld alignment=%ld "
+           "corner=%.3f preferred=%ld\n",
+           (long)SendInteger(options, "shape"),
+           (long)SendInteger(options, "fill"),
+           (long)SendInteger(options, "contentEffect"),
+           (long)SendInteger(options, "shapeEffect"),
+           (long)SendInteger(options, "imageCentering"),
+           (long)SendInteger(options, "imageScaling"),
+           (long)SendInteger(options, "imageAlignment"),
+           SendDouble(options, "roundedRectCornerRadius"),
+           (long)SendInteger(self, "preferredRenderingMode"));
+    id result = ((id (*)(id, SEL, id))gOriginalGraphicVariantWithOptions)(
+        self, selector, options);
+    printf("GRAPHIC_VARIANT glyph-class=%s options-class=%s result-class=%s "
+           "result=%s\n",
+           self ? object_getClassName(self) : "nil",
+           options ? object_getClassName(options) : "nil",
+           result ? object_getClassName(result) : "nil",
+           result ? [[result description] UTF8String] : "nil");
+    DumpObjectIvars(result, "graphic-variant-result");
+    if (result && [result respondsToSelector:
+            sel_registerName("rasterizeImageUsingScaleFactor:forTargetSize:")]) {
+        id raster = ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
+            result,
+            sel_registerName("rasterizeImageUsingScaleFactor:forTargetSize:"),
+            2.0, CGSizeMake(32.0, 32.0));
+        printf("GRAPHIC_VARIANT_RASTER class=%s value=%s cgimage=%p\n",
+               raster ? object_getClassName(raster) : "nil",
+               raster ? [[raster description] UTF8String] : "nil",
+               raster && [raster respondsToSelector:sel_registerName("CGImage")]
+                   ? ((void *(*)(id, SEL))objc_msgSend)(
+                         raster, sel_registerName("CGImage")) : NULL);
+        NSArray *palette = SendObject(options, "fillColors");
+        SEL paletteSelector = sel_registerName(
+            "rasterizeImageUsingScaleFactor:forTargetSize:withPaletteColors:");
+        id paletteRaster = [result respondsToSelector:paletteSelector]
+            ? ((id (*)(id, SEL, double, CGSize, id))objc_msgSend)(
+                  result, paletteSelector, 2.0, CGSizeMake(32.0, 32.0),
+                  palette) : nil;
+        CGColorRef firstColor = palette.count
+            ? (__bridge CGColorRef)palette.firstObject
+            : CGColorGetConstantColor(kCGColorWhite);
+        CGColorRef (^resolver)(NSUInteger, NSUInteger) =
+            ^CGColorRef(NSUInteger layer, NSUInteger style) {
+                (void)layer;
+                (void)style;
+                return firstColor;
+            };
+        SEL colorSelector = sel_registerName(
+            "rasterizeImageUsingScaleFactor:forTargetSize:withColorResolver:");
+        id colorRaster = [result respondsToSelector:colorSelector]
+            ? ((id (*)(id, SEL, double, CGSize, id))objc_msgSend)(
+                  result, colorSelector, 2.0, CGSizeMake(32.0, 32.0),
+                  resolver) : nil;
+        printf("GRAPHIC_VARIANT_ALT_RASTER palette=%s color=%s\n",
+               paletteRaster ? object_getClassName(paletteRaster) : "nil",
+               colorRaster ? object_getClassName(colorRaster) : "nil");
+    }
+    Class optionsClass = objc_getClass("CUIVectorGlyphGraphicVariantOptions");
+    if (optionsClass && !getenv("MACWS_PROBE_NO_VARIANT_MATRIX")) {
+        const char *const getters[] = {
+            "shape", "fill", "contentEffect", "shapeEffect",
+            "imageCentering", "imageScaling", "imageAlignment", NULL,
+        };
+        const char *const setters[] = {
+            "setShape:", "setFill:", "setContentEffect:", "setShapeEffect:",
+            "setImageCentering:", "setImageScaling:", "setImageAlignment:",
+            NULL,
+        };
+        for (NSUInteger stage = 0; stage < 8; stage++) {
+            id matrixOptions = ((id (*)(id, SEL))objc_msgSend)(
+                optionsClass, sel_registerName("new"));
+            for (NSUInteger optionIndex = 0; optionIndex < stage;
+                 optionIndex++) {
+                NSInteger value = SendInteger(options, getters[optionIndex]);
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+                    matrixOptions, sel_registerName(setters[optionIndex]),
+                    value);
+            }
+            id matrixVariant = ((id (*)(id, SEL, id))
+                gOriginalGraphicVariantWithOptions)(self, selector,
+                                                     matrixOptions);
+            id matrixRaster = matrixVariant
+                ? ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
+                      matrixVariant,
+                      sel_registerName(
+                          "rasterizeImageUsingScaleFactor:forTargetSize:"),
+                      2.0, CGSizeMake(32.0, 32.0)) : nil;
+            printf("GRAPHIC_VARIANT_MATRIX stage=%lu last=%s "
+                   "variant=%s raster=%s\n",
+                   (unsigned long)stage,
+                   stage ? getters[stage - 1] : "defaults",
+                   matrixVariant ? object_getClassName(matrixVariant) : "nil",
+                   matrixRaster ? object_getClassName(matrixRaster) : "nil");
+        }
+    }
+    return result;
+}
+
+static void InstallGraphicVariantProbe(void) {
+    Class glyphClass = objc_getClass("CUINamedVectorGlyph");
+    SEL selector = sel_registerName("graphicVariantWithOptions:");
+    Method method = glyphClass ? class_getInstanceMethod(glyphClass, selector)
+                               : NULL;
+    if (!method) {
+        printf("GRAPHIC_VARIANT_PROBE installed=0\n");
+        return;
+    }
+    gOriginalGraphicVariantWithOptions = method_getImplementation(method);
+    method_setImplementation(method, (IMP)ProbeGraphicVariantWithOptions);
+    Class variantClass = objc_getClass("_CUIGraphicVariantVectorGlyph");
+    SEL rasterSelector = sel_registerName(
+        "rasterizeImageUsingScaleFactor:forTargetSize:");
+    Method rasterMethod = variantClass
+        ? class_getInstanceMethod(variantClass, rasterSelector) : NULL;
+    printf("GRAPHIC_VARIANT_PROBE installed=1 class=%s original=%p\n",
+           class_getName(glyphClass), gOriginalGraphicVariantWithOptions);
+    printf("GRAPHIC_VARIANT_RASTER_IMP class=%s imp=%p\n",
+           variantClass ? class_getName(variantClass) : "nil",
+           rasterMethod ? method_getImplementation(rasterMethod) : NULL);
+}
+
+static void DumpLoadedImageBuild(const char *needle) {
+    uint32_t imageCount = _dyld_image_count();
+    for (uint32_t imageIndex = 0; imageIndex < imageCount; imageIndex++) {
+        const char *name = _dyld_get_image_name(imageIndex);
+        if (!name || !strstr(name, needle)) continue;
+        const struct mach_header_64 *header =
+            (const struct mach_header_64 *)_dyld_get_image_header(imageIndex);
+        uint32_t platform = 0;
+        uint32_t minOS = 0;
+        uint32_t sdk = 0;
+        if (header && header->magic == MH_MAGIC_64) {
+            const struct load_command *command =
+                (const struct load_command *)((const uint8_t *)header +
+                                               sizeof(*header));
+            for (uint32_t index = 0; index < header->ncmds; index++) {
+                if (command->cmd == LC_BUILD_VERSION &&
+                    command->cmdsize >= sizeof(struct build_version_command)) {
+                    const struct build_version_command *build =
+                        (const struct build_version_command *)command;
+                    platform = build->platform;
+                    minOS = build->minos;
+                    sdk = build->sdk;
+                    break;
+                }
+                command = (const struct load_command *)
+                    ((const uint8_t *)command + command->cmdsize);
+            }
+        }
+        printf("LOADED_IMAGE needle=%s path=%s header=%p platform=%u "
+               "minos=%u.%u.%u sdk=%u.%u.%u\n",
+               needle, name, header, platform,
+               (minOS >> 16) & 0xffff, (minOS >> 8) & 0xff, minOS & 0xff,
+               (sdk >> 16) & 0xffff, (sdk >> 8) & 0xff, sdk & 0xff);
+    }
+}
+
+static int DumpIconRecord(void) {
+    if (!getenv("MACWS_PROBE_NO_APPKIT_APP")) [NSApplication sharedApplication];
+    void *iconServices = dlopen(
+        "/System/Library/PrivateFrameworks/IconServices.framework/"
+        "IconServices", RTLD_NOW | RTLD_LOCAL);
+    printf("ICON_FRAMEWORK handle=%p error=%s\n", iconServices,
+           iconServices ? "none" : (dlerror() ?: "unknown"));
+    void *settingsFramework = dlopen(
+        "/System/Library/PrivateFrameworks/Settings.framework/Settings",
+        RTLD_NOW | RTLD_LOCAL);
+    printf("SETTINGS_FRAMEWORK handle=%p error=%s\n", settingsFramework,
+           settingsFramework ? "none" : (dlerror() ?: "unknown"));
+    void *sfSymbolsFramework = dlopen(
+        "/System/Library/PrivateFrameworks/SFSymbols.framework/SFSymbols",
+        RTLD_NOW | RTLD_LOCAL);
+    printf("SFSYMBOLS_FRAMEWORK handle=%p error=%s\n", sfSymbolsFramework,
+           sfSymbolsFramework ? "none" : (dlerror() ?: "unknown"));
+    NSBundle *privateGlyphsBundle = [NSBundle bundleWithPath:
+        @"/System/Library/PrivateFrameworks/SFSymbols.framework/Versions/A/"
+         "Resources/CoreGlyphsPrivate.bundle"];
+    NSError *privateGlyphsError = nil;
+    BOOL privateGlyphsLoaded = [privateGlyphsBundle
+        loadAndReturnError:&privateGlyphsError];
+    NSBundle *bundleByIdentifier =
+        [NSBundle bundleWithIdentifier:@"com.apple.CoreGlyphsPrivate"];
+    printf("PRIVATE_GLYPHS_BUNDLE loaded=%u executable=%s error=%s\n",
+           privateGlyphsLoaded ? 1u : 0u,
+           privateGlyphsBundle.executablePath
+               ? [privateGlyphsBundle.executablePath UTF8String] : "nil",
+           privateGlyphsError
+               ? [[privateGlyphsError description] UTF8String] : "nil");
+    printf("PRIVATE_GLYPHS_IDENTIFIER bundle=%s same=%u loaded=%u\n",
+           bundleByIdentifier
+               ? [[bundleByIdentifier description] UTF8String] : "nil",
+           bundleByIdentifier == privateGlyphsBundle ? 1u : 0u,
+           bundleByIdentifier.loaded ? 1u : 0u);
+    NSImage *publicSymbol = [NSImage imageWithSystemSymbolName:@"gearshape"
+                                     accessibilityDescription:nil];
+    NSImage *privateSymbol = [NSImage imageWithSystemSymbolName:@"appearance"
+                                      accessibilityDescription:nil];
+    printf("NSIMAGE_SYMBOL public=%s private=%s\n",
+           publicSymbol ? [[publicSymbol description] UTF8String] : "nil",
+           privateSymbol ? [[privateSymbol description] UTF8String] : "nil");
+    id corePrivateBundle = SendClassObject("IFBundle",
+                                            "coreGlyphsPrivateBundle");
+    id corePublicBundle = SendClassObject("IFBundle",
+                                           "coreGlyphsBundle");
+    id corePublicCatalog = SendClassObject("IFSymbol",
+                                            "coreGlyphsCatalog");
+    id corePrivateCatalog = SendClassObject("IFSymbol",
+                                             "coreGlyphsPrivateCatalog");
+    printf("CORE_PUBLIC bundle-class=%s bundle=%s catalog-class=%s "
+           "catalog=%s asset-url=%s\n",
+           corePublicBundle ? object_getClassName(corePublicBundle) : "nil",
+           corePublicBundle
+               ? [[corePublicBundle description] UTF8String] : "nil",
+           corePublicCatalog ? object_getClassName(corePublicCatalog) : "nil",
+           corePublicCatalog
+               ? [[corePublicCatalog description] UTF8String] : "nil",
+           SendObject(corePublicBundle, "assetCatalogURL")
+               ? [[SendObject(corePublicBundle, "assetCatalogURL") description]
+                     UTF8String] : "nil");
+    printf("CORE_PRIVATE bundle-class=%s bundle=%s catalog-class=%s "
+           "catalog=%s asset-url=%s\n",
+           corePrivateBundle ? object_getClassName(corePrivateBundle) : "nil",
+           corePrivateBundle
+               ? [[corePrivateBundle description] UTF8String] : "nil",
+           corePrivateCatalog ? object_getClassName(corePrivateCatalog) : "nil",
+           corePrivateCatalog
+               ? [[corePrivateCatalog description] UTF8String] : "nil",
+           SendObject(corePrivateBundle, "assetCatalogURL")
+               ? [[SendObject(corePrivateBundle, "assetCatalogURL") description]
+                     UTF8String] : "nil");
+    DumpObjectIvars(corePrivateBundle, "core-private-bundle");
+    DumpObjectIvars(corePrivateCatalog, "core-private-catalog");
+    SEL namedGlyphSelector = sel_registerName(
+        "namedVectorGlyphWithName:scaleFactor:deviceIdiom:layoutDirection:"
+        "glyphSize:glyphWeight:glyphPointSize:appearanceName:");
+    Method namedGlyphMethod = corePrivateCatalog
+        ? class_getInstanceMethod(object_getClass(corePrivateCatalog),
+                                  namedGlyphSelector)
+        : NULL;
+    printf("CORE_PRIVATE_GLYPH_API responds=%u types=%s\n",
+           corePrivateCatalog &&
+               [corePrivateCatalog respondsToSelector:namedGlyphSelector]
+                   ? 1u : 0u,
+           namedGlyphMethod ? method_getTypeEncoding(namedGlyphMethod) : "nil");
+    if (corePublicCatalog &&
+        [corePublicCatalog respondsToSelector:namedGlyphSelector]) {
+        typedef id (*NamedGlyphMessage)(id, SEL, id, double, NSUInteger,
+                                        NSUInteger, NSUInteger, NSInteger,
+                                        double, id);
+        const NSString *const names[] = {@"wifi", @"speaker.wave.3.fill",
+                                         @"gearshape", @"network"};
+        for (NSUInteger index = 0; index < 4; index++) {
+            id glyph = ((NamedGlyphMessage)objc_msgSend)(
+                corePublicCatalog, namedGlyphSelector, names[index], 2.0,
+                0, 0, 0, 0, 16.0, nil);
+            printf("CORE_PUBLIC_GLYPH name=%s class=%s value=%s\n",
+                   [names[index] UTF8String],
+                   glyph ? object_getClassName(glyph) : "nil",
+                   glyph ? [[glyph description] UTF8String] : "nil");
+        }
+    }
+    if (corePrivateCatalog && namedGlyphMethod) {
+        typedef id (*NamedGlyphMessage)(id, SEL, id, double, NSUInteger,
+                                        NSUInteger, NSUInteger, NSInteger,
+                                        double, id);
+        const double scales[] = {1.0, 2.0};
+        const NSUInteger sizes[] = {0, 1, 2, 3};
+        const NSInteger weights[] = {-1, 0, 3, 6};
+        for (NSUInteger scaleIndex = 0; scaleIndex < 2; scaleIndex++) {
+            for (NSUInteger sizeIndex = 0; sizeIndex < 4; sizeIndex++) {
+                for (NSUInteger weightIndex = 0; weightIndex < 4;
+                     weightIndex++) {
+                    id glyph = ((NamedGlyphMessage)objc_msgSend)(
+                        corePrivateCatalog, namedGlyphSelector, @"appearance",
+                        scales[scaleIndex], 0, 0, sizes[sizeIndex],
+                        weights[weightIndex], 16.0, nil);
+                    if (glyph) {
+                        printf("CORE_PRIVATE_GLYPH_HIT scale=%.0f size=%lu "
+                               "weight=%ld class=%s value=%s\n",
+                               scales[scaleIndex],
+                               (unsigned long)sizes[sizeIndex],
+                               (long)weights[weightIndex],
+                               object_getClassName(glyph),
+                               [[glyph description] UTF8String]);
+                    }
+                }
+            }
+        }
+    }
+    DumpLoadedImageBuild("/Settings.framework/");
+    DumpLoadedImageBuild("/IconServices.framework/");
+    DumpLoadedImageBuild("/SFSymbols.framework/");
+    Class recordClass = objc_getClass("LSApplicationExtensionRecord");
+    NSURL *url = [NSURL fileURLWithPath:
+        @"/System/Library/ExtensionKit/Extensions/Appearance.appex"];
+    NSError *error = nil;
+    id record = ((id (*)(id, SEL))objc_msgSend)(
+        recordClass, sel_registerName("alloc"));
+    record = record ? ((id (*)(id, SEL, id, id *))objc_msgSend)(
+        record, sel_registerName("initWithURL:error:"), url, &error) : nil;
+    printf("ICON_RECORD class=%s value=%s error=%s\n",
+           record ? object_getClassName(record) : "nil",
+           record ? [[record description] UTF8String] : "nil",
+           error ? [[error description] UTF8String] : "nil");
+    if (!record) return 2;
+    for (Class owner = object_getClass(record); owner;
+         owner = class_getSuperclass(owner)) {
+        unsigned methodCount = 0;
+        Method *methods = class_copyMethodList(owner, &methodCount);
+        for (unsigned methodIndex = 0; methodIndex < methodCount;
+             methodIndex++) {
+            const char *selector = sel_getName(
+                method_getName(methods[methodIndex]));
+            if (!strcasestr(selector, "icon")) continue;
+            printf("ICON_METHOD class=%s selector=%s types=%s\n",
+                   class_getName(owner), selector,
+                   method_getTypeEncoding(methods[methodIndex]));
+        }
+        free(methods);
+    }
+    const char *const iconSelectors[] = {
+        "iconsDictionary", "iconDictionary", "iconResourceBundleURL",
+        "iconData", "iconUTTypeIdentifier", "iconFileNames", NULL,
+    };
+    for (const char *const *selector = iconSelectors; *selector; selector++) {
+        SEL sel = sel_registerName(*selector);
+        BOOL responds = [record respondsToSelector:sel];
+        id value = responds ? ((id (*)(id, SEL))objc_msgSend)(record, sel)
+                            : nil;
+        printf("ICON_VALUE selector=%s responds=%u class=%s value=%s\n",
+               *selector, responds ? 1u : 0u,
+               value ? object_getClassName(value) : "nil",
+               value ? [[value description] UTF8String] : "nil");
+    }
+    NSBundle *bundle = [NSBundle bundleWithURL:url];
+    printf("ICON_BUNDLE icons=%s file=%s name=%s\n",
+           [[bundle.infoDictionary[@"CFBundleIcons"] description]
+               UTF8String] ?: "nil",
+           [[bundle.infoDictionary[@"CFBundleIconFile"] description]
+               UTF8String] ?: "nil",
+           [[bundle.infoDictionary[@"CFBundleIconName"] description]
+               UTF8String] ?: "nil");
+    Class providerClass = objc_getClass("ISBundleResourceProvider");
+    id provider = providerClass
+        ? ((id (*)(id, SEL))objc_msgSend)(providerClass,
+                                           sel_registerName("alloc"))
+        : nil;
+    SEL providerInit =
+        sel_registerName("initWithBundleURL:iconDictionary:options:");
+    if (provider && [provider respondsToSelector:providerInit]) {
+        provider = ((id (*)(id, SEL, id, id, NSUInteger))objc_msgSend)(
+            provider, providerInit, url,
+            bundle.infoDictionary[@"CFBundleIcons"], 0);
+    }
+    id iconResourceBeforeResolve = SendObject(provider, "iconResource");
+    DumpObjectIvars(provider, "provider-before-resolve");
+    DumpObjectIvars(iconResourceBeforeResolve, "resource-before-resolve");
+    if (provider && [provider respondsToSelector:
+            sel_registerName("resolveResources")]) {
+        ((void (*)(id, SEL))objc_msgSend)(provider,
+                                          sel_registerName("resolveResources"));
+    }
+    id iconResource = SendObject(provider, "iconResource");
+    id templateResource = SendObject(provider, "templateIconResource");
+    DumpObjectIvars(provider, "provider-after-resolve");
+    DumpObjectIvars(iconResource, "resource-after-resolve");
+    id resourceDescriptor = ObjectIvarNamed(iconResource, "_descriptor");
+    DumpObjectIvars(resourceDescriptor, "resource-descriptor-after-resolve");
+    DumpObjectIvars(SendObject(resourceDescriptor, "_resourceProvider"),
+                    "resource-descriptor-provider-after-resolve");
+    Class ifSymbolClass = objc_getClass("IFSymbol");
+    SEL symbolInit = sel_registerName("initWithSymbolName:bundleURL:");
+    id appSymbol = ifSymbolClass
+        ? ((id (*)(id, SEL))objc_msgSend)(ifSymbolClass,
+                                          sel_registerName("alloc")) : nil;
+    appSymbol = appSymbol
+        ? ((id (*)(id, SEL, id, id))objc_msgSend)(
+              appSymbol, symbolInit, @"appearance", url) : nil;
+    id privateBundleURL = [NSURL fileURLWithPath:
+        @"/System/Library/CoreServices/CoreGlyphsPrivate.bundle"];
+    id privateSymbolObject = ifSymbolClass
+        ? ((id (*)(id, SEL))objc_msgSend)(ifSymbolClass,
+                                          sel_registerName("alloc")) : nil;
+    privateSymbolObject = privateSymbolObject
+        ? ((id (*)(id, SEL, id, id))objc_msgSend)(
+              privateSymbolObject, symbolInit, @"appearance",
+              privateBundleURL) : nil;
+    InstallGraphicVariantProbe();
+    if (getenv("MACWS_PROBE_STOP_BEFORE_GRAPHIC_RENDER") ||
+        access("/tmp/macws_probe_stop_before_graphic", F_OK) == 0) {
+        printf("GRAPHIC_VARIANT_PROBE stopping pid=%d\n", getpid());
+        fflush(stdout);
+        raise(SIGSTOP);
+    }
+    const char *const renderSelectors[] = {
+        "imageForDescriptor:", "imageForGraphicSymbolDescriptor:", NULL,
+    };
+    for (const char *const *renderSelector = renderSelectors;
+         *renderSelector; renderSelector++) {
+        SEL selector = sel_registerName(*renderSelector);
+        id appImage = appSymbol && [appSymbol respondsToSelector:selector]
+            ? ((id (*)(id, SEL, id))objc_msgSend)(appSymbol, selector,
+                                                  resourceDescriptor) : nil;
+        id privateImage = privateSymbolObject &&
+                [privateSymbolObject respondsToSelector:selector]
+            ? ((id (*)(id, SEL, id))objc_msgSend)(privateSymbolObject,
+                                                  selector,
+                                                  resourceDescriptor) : nil;
+        printf("IFSYMBOL_RENDER selector=%s app-class=%s app=%s "
+               "private-class=%s private=%s private-url=%s\n",
+               *renderSelector,
+               appImage ? object_getClassName(appImage) : "nil",
+               appImage ? [[appImage description] UTF8String] : "nil",
+               privateImage ? object_getClassName(privateImage) : "nil",
+               privateImage ? [[privateImage description] UTF8String] : "nil",
+               privateBundleURL
+                   ? [[privateBundleURL description] UTF8String] : "nil");
+    }
+    SEL imageForDescriptorSelector = sel_registerName("imageForDescriptor:");
+    id symbolImage = appSymbol &&
+            [appSymbol respondsToSelector:imageForDescriptorSelector]
+        ? ((id (*)(id, SEL, id))objc_msgSend)(appSymbol,
+                                              imageForDescriptorSelector,
+                                              resourceDescriptor) : nil;
+    id vectorGlyph = SendObject(symbolImage, "vectorGlyph");
+    DumpObjectIvars(symbolImage, "if-symbol-image");
+    DumpObjectIvars(vectorGlyph, "if-vector-glyph");
+    if (vectorGlyph && [vectorGlyph respondsToSelector:
+            sel_registerName("rasterizeImageUsingScaleFactor:forTargetSize:")]) {
+        id raster = ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
+            vectorGlyph,
+            sel_registerName("rasterizeImageUsingScaleFactor:forTargetSize:"),
+            2.0, CGSizeMake(32.0, 32.0));
+        printf("VECTOR_GLYPH_RASTER class=%s value=%s cgimage=%p\n",
+               raster ? object_getClassName(raster) : "nil",
+               raster ? [[raster description] UTF8String] : "nil",
+               raster && [raster respondsToSelector:sel_registerName("CGImage")]
+                   ? ((void *(*)(id, SEL))objc_msgSend)(
+                         raster, sel_registerName("CGImage")) : NULL);
+    }
+    printf("ICON_PROVIDER class=%s value=%s supports=%u only=%u "
+           "resource-class=%s resource=%s template-class=%s template=%s\n",
+           provider ? object_getClassName(provider) : "nil",
+           provider ? [[provider description] UTF8String] : "nil",
+           provider && [provider respondsToSelector:
+               sel_registerName("supportsGraphicIcons")]
+               ? ((BOOL (*)(id, SEL))objc_msgSend)(
+                     provider, sel_registerName("supportsGraphicIcons")) : 0,
+           provider && [provider respondsToSelector:
+               sel_registerName("onlySupportsGraphicIcons")]
+               ? ((BOOL (*)(id, SEL))objc_msgSend)(
+                     provider, sel_registerName("onlySupportsGraphicIcons")) : 0,
+           iconResource ? object_getClassName(iconResource) : "nil",
+           iconResource ? [[iconResource description] UTF8String] : "nil",
+           templateResource ? object_getClassName(templateResource) : "nil",
+           templateResource ? [[templateResource description] UTF8String]
+                            : "nil");
+    if (iconResource && [iconResource respondsToSelector:
+            sel_registerName("imageForSize:scale:")]) {
+        id image = ((id (*)(id, SEL, CGSize, double))objc_msgSend)(
+            iconResource, sel_registerName("imageForSize:scale:"),
+            CGSizeMake(32.0, 32.0), 2.0);
+        printf("ICON_PROVIDER_IMAGE class=%s value=%s\n",
+               image ? object_getClassName(image) : "nil",
+               image ? [[image description] UTF8String] : "nil");
+        if (image && [image respondsToSelector:sel_registerName("TIFFRepresentation")]) {
+            NSData *tiff = SendObject(image, "TIFFRepresentation");
+            NSString *outputPath = @"/tmp/macws-settings-appearance-icon.tiff";
+            BOOL wrote = [tiff writeToFile:outputPath atomically:YES];
+            printf("ICON_PROVIDER_IMAGE_WRITE path=%s bytes=%lu result=%u\n",
+                   [outputPath UTF8String], (unsigned long)tiff.length,
+                   wrote ? 1u : 0u);
+        }
+    }
+    NSDictionary *iconsDictionary = bundle.infoDictionary[@"CFBundleIcons"];
+    id graphicConfiguration = iconsDictionary[@"ISGraphicIconConfiguration"];
+    printf("GRAPHIC_CONFIGURATION class=%s value=%s\n",
+           graphicConfiguration ? object_getClassName(graphicConfiguration)
+                                : "nil",
+           graphicConfiguration
+               ? [[graphicConfiguration description] UTF8String] : "nil");
+    id namedResource = provider && [provider respondsToSelector:
+            sel_registerName("resourceNamed:")]
+        ? ((id (*)(id, SEL, id))objc_msgSend)(
+              provider, sel_registerName("resourceNamed:"), @"appearance")
+        : nil;
+    DumpObjectIvars(namedResource, "provider-resource-named-appearance");
+    Class settingsExtensionClass =
+        objc_getClass("_TtC8Settings17SettingsExtension");
+    printf("SETTINGS_EXTENSION_CLASS value=%p\n", settingsExtensionClass);
+    if (settingsExtensionClass) {
+        id settingsExtension = ((id (*)(id, SEL))objc_msgSend)(
+            settingsExtensionClass, sel_registerName("alloc"));
+        SEL initSelector =
+            sel_registerName("initWithApplicationExtensionRecord:");
+        printf("SETTINGS_EXTENSION_INIT responds=%u\n",
+               [settingsExtension respondsToSelector:initSelector] ? 1u : 0u);
+        if ([settingsExtension respondsToSelector:initSelector]) {
+            settingsExtension = ((id (*)(id, SEL, id))objc_msgSend)(
+                settingsExtension, initSelector, record);
+            id icon = SendObject(settingsExtension, "icon");
+            printf("SETTINGS_EXTENSION value=%s icon-class=%s icon=%s\n",
+                   settingsExtension
+                       ? [[settingsExtension description] UTF8String] : "nil",
+                   icon ? object_getClassName(icon) : "nil",
+                   icon ? [[icon description] UTF8String] : "nil");
+            if (icon && [icon respondsToSelector:
+                    sel_registerName("imageForSize:scale:")]) {
+                CGSize size = CGSizeMake(32.0, 32.0);
+                id image = ((id (*)(id, SEL, CGSize, double))objc_msgSend)(
+                    icon, sel_registerName("imageForSize:scale:"), size, 2.0);
+                printf("SETTINGS_EXTENSION_IMAGE class=%s value=%s\n",
+                       image ? object_getClassName(image) : "nil",
+                       image ? [[image description] UTF8String] : "nil");
+            }
+        }
+    }
+    const char *const classNames[] = {
+        "ISIcon", "ISGraphicIcon", "ISImage", "ISImageDescriptor",
+        "IFImage", "IFSymbolImage",
+        "ISBundleResourceProvider", "ISGraphicSymbolResource",
+        "ISGraphicSymbolDescriptor", "ISIconFactory", "ISConcreteIcon",
+        "ISSymbolIcon", NULL,
+    };
+    for (const char *const *name = classNames; *name; name++) {
+        Class iconClass = objc_getClass(*name);
+        printf("ICON_CLASS name=%s value=%p\n", *name, iconClass);
+        if (!iconClass) continue;
+        Class owners[2] = {iconClass, object_getClass(iconClass)};
+        const char kinds[2] = {'-', '+'};
+        for (unsigned ownerIndex = 0; ownerIndex < 2; ownerIndex++) {
+            unsigned methodCount = 0;
+            Method *methods = class_copyMethodList(owners[ownerIndex],
+                                                   &methodCount);
+            for (unsigned methodIndex = 0; methodIndex < methodCount;
+                 methodIndex++) {
+                const char *selector = sel_getName(
+                    method_getName(methods[methodIndex]));
+                if (!strcasestr(selector, "init") &&
+                    !strcasestr(selector, "image") &&
+                    !strcasestr(selector, "graphic") &&
+                    !strcasestr(selector, "dictionary") &&
+                    !strcasestr(selector, "resource") &&
+                    !strcasestr(selector, "configuration") &&
+                    !strcasestr(selector, "icon")) continue;
+                printf("ICON_API class=%s kind=%c selector=%s types=%s\n",
+                       *name, kinds[ownerIndex], selector,
+                       method_getTypeEncoding(methods[methodIndex]));
+            }
+            free(methods);
+        }
+    }
+    unsigned runtimeClassCount = 0;
+    Class *runtimeClasses = objc_copyClassList(&runtimeClassCount);
+    for (unsigned index = 0; index < runtimeClassCount; index++) {
+        Class candidate = runtimeClasses[index];
+        const char *image = class_getImageName(candidate);
+        if (!image || (!strstr(image, "/Settings.framework/") &&
+                       !strstr(image, "/IconServices.framework/") &&
+                       !strstr(image, "/IconFoundation.framework/"))) continue;
+        Class owners[2] = {candidate, object_getClass(candidate)};
+        const char kinds[2] = {'-', '+'};
+        for (unsigned ownerIndex = 0; ownerIndex < 2; ownerIndex++) {
+            unsigned methodCount = 0;
+            Method *methods = class_copyMethodList(owners[ownerIndex],
+                                                   &methodCount);
+            for (unsigned methodIndex = 0; methodIndex < methodCount;
+                 methodIndex++) {
+                const char *selector = sel_getName(
+                    method_getName(methods[methodIndex]));
+                if (!strcasestr(selector, "icon") &&
+                    !strcasestr(selector, "graphic") &&
+                    !strcasestr(selector, "dictionary") &&
+                    !strcasestr(selector, "configuration") &&
+                    !strcasestr(selector, "applicationExtensionRecord"))
+                    continue;
+                printf("FRAMEWORK_ICON_API image=%s class=%s kind=%c "
+                       "selector=%s types=%s\n", image,
+                       class_getName(candidate), kinds[ownerIndex], selector,
+                       method_getTypeEncoding(methods[methodIndex]));
+            }
+            free(methods);
+        }
+    }
+    free(runtimeClasses);
+    return 0;
 }
 
 static int RegisterPendingObjectiveCClasses(void) {
@@ -81,6 +734,9 @@ int main(void) {
         printf("FRAMEWORK handle=%p error=%s\n", extensionFoundation,
                extensionFoundation ? "none" : (dlerror() ?: "unknown"));
         if (!extensionFoundation) return 1;
+        if (getenv("MACWS_PROBE_ICON_RECORD_EARLY")) {
+            return DumpIconRecord();
+        }
         if (getenv("MACWS_PROBE_EXTENSIONKIT_CONSTANTS")) {
             // Runtime addresses come directly from the current-boot
             // ExtensionFoundation 13.4 disassembly of
@@ -206,6 +862,10 @@ int main(void) {
         int realizedClasses = RegisterPendingObjectiveCClasses();
         printf("OBJC_PREREGISTER realized=%d LSPlugInKitProxy=%p\n",
                realizedClasses, objc_getClass("LSPlugInKitProxy"));
+        if (getenv("MACWS_PROBE_ICON_RECORD") ||
+            access("/tmp/macws_probe_stop_before_graphic", F_OK) == 0) {
+            return DumpIconRecord();
+        }
 
         // Capture the exact Objective-C ABI of the late ExtensionFoundation
         // entry point before installing a boundary hook in libmachook.  This
@@ -479,6 +1139,50 @@ int main(void) {
                object_getClassName(record), platform,
                [[recordIdentifier description] UTF8String],
                [[recordURL description] UTF8String]);
+        if (getenv("MACWS_PROBE_ICON_RECORD")) {
+            Class owners[2] = {object_getClass(record),
+                               object_getClass(object_getClass(record))};
+            const char kinds[2] = {'-', '+'};
+            for (unsigned ownerIndex = 0; ownerIndex < 2; ownerIndex++) {
+                unsigned methodCount = 0;
+                Method *methods = class_copyMethodList(owners[ownerIndex],
+                                                       &methodCount);
+                for (unsigned methodIndex = 0; methodIndex < methodCount;
+                     methodIndex++) {
+                    const char *selector = sel_getName(
+                        method_getName(methods[methodIndex]));
+                    if (!strcasestr(selector, "icon")) continue;
+                    printf("ICON_METHOD class=%s kind=%c selector=%s types=%s\n",
+                           class_getName(object_getClass(record)),
+                           kinds[ownerIndex], selector,
+                           method_getTypeEncoding(methods[methodIndex]));
+                }
+                free(methods);
+            }
+            const char *const iconSelectors[] = {
+                "iconsDictionary", "iconDictionary", "iconResourceBundleURL",
+                "iconData", "iconUTTypeIdentifier", "iconFileNames", NULL,
+            };
+            for (const char *const *selector = iconSelectors; *selector;
+                 selector++) {
+                SEL sel = sel_registerName(*selector);
+                BOOL responds = [record respondsToSelector:sel];
+                id value = responds ? ((id (*)(id, SEL))objc_msgSend)(record, sel)
+                                    : nil;
+                printf("ICON_VALUE selector=%s responds=%u class=%s value=%s\n",
+                       *selector, responds ? 1u : 0u,
+                       value ? object_getClassName(value) : "nil",
+                       value ? [[value description] UTF8String] : "nil");
+            }
+            NSBundle *recordBundle = [NSBundle bundleWithURL:recordURL];
+            printf("ICON_BUNDLE icons=%s file=%s name=%s\n",
+                   [[recordBundle.infoDictionary[@"CFBundleIcons"] description]
+                       UTF8String] ?: "nil",
+                   [[recordBundle.infoDictionary[@"CFBundleIconFile"] description]
+                       UTF8String] ?: "nil",
+                   [[recordBundle.infoDictionary[@"CFBundleIconName"] description]
+                       UTF8String] ?: "nil");
+        }
         printf("POINT_RECORD class=%s value=%s\n",
                pointRecord ? object_getClassName(pointRecord) : "nil",
                pointRecord ? [[pointRecord description] UTF8String] : "nil");

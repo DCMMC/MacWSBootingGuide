@@ -46,6 +46,15 @@ variables. `MallocScribble` is explicitly forbidden.
   WindowServer-only shadows, backdrop materials and warped animations without
   RFB or the VNC CPU damage scan. This is a production invariant, not a new
   environment/file switch; exact layers remain subscribed for hit testing.
+- Production snapshots that final composite through a four-slot same-AGX-queue
+  IOSurface ring, with displayd/Host lease use counts preventing producer reuse
+  while a consumer owns a frame. `MACWS_FINAL_COMPOSITE_DIRECT=1` is an
+  off-by-default diagnostic rollback to the unsafe direct SkyLight surface;
+  it must not be used for performance or stability claims.
+- WindowServer's native cursor sprite is kept hidden through its verified
+  session hide-count contract while its global pointer position continues to
+  move. Native menus and Chromium popups therefore retain WindowServer/AppKit
+  hover semantics without duplicating Host's circular pointer affordance.
 - Validated custom-path apps, generic Catalyst children, and the stock
   UIKitSystem service receive the scoped `MACWS_APP_MOUNT_COMPAT=1` namespace
   contract. UIKitSystem owns the CoreServices repository used while Catalyst
@@ -58,6 +67,17 @@ variables. `MallocScribble` is explicitly forbidden.
   composites it over the black client area without RFB, compression, or CPU
   pixel copies. The broad mount diagnostic is explicitly removed from the
   child environment even if the existing Host was started by a debug shell.
+- Asphalt additionally enables `MACWS_CATALYST_LOCAL_KEYCHAIN=1`. The stock
+  Ventura Security API remains first; only unavailable/MDS results are sent to
+  the uid-501 iOS-native `macwskeychaind`, which authenticates Asphalt's exact
+  executable and preserves its two original Gameloft Keychain groups. MacWS
+  owns no plaintext credential store. At child launch the carrier also probes
+  the loopback SOCKS endpoint `127.0.0.1:1082` once: if it is already live,
+  Asphalt receives upper/lower-case `ALL_PROXY`, `HTTPS_PROXY` and
+  `HTTP_PROXY` values using `socks5h`; otherwise it stays on direct networking.
+  This selection does not start a proxy, weaken TLS, or affect another app.
+  See
+  [`catalyst-keychain-bridge-20260812.md`](catalyst-keychain-bridge-20260812.md).
 - VS Code and Chrome set `MACWS_CHROMIUM_COMPOSITE_OVERLAYS=1`. For the exact
   UUID-checked Chromium 148 Electron Framework, this marks the root
   `AggregatedRenderPass` with Chromium's real `video_capture_enabled` field
@@ -120,6 +140,32 @@ inactive catalog is reactivated through stock `lsregister` calls, not trusted
 from the marker alone.  The Settings boot-ready witness is tied to the current
 bootsession and dependency hashes; its persistent hash manifest contains only
 verified executable CDHashes used to restore the reboot-volatile trustcache.
+
+The trust closure is not limited to the main executable or executable mode
+bits. Once per iPad boot, production scans the existing `/Applications/*.app`
+nested-code trees by Mach-O magic and restores every already-signed
+CodeDirectory to Dopamine's reboot-volatile trustcache. It never re-signs that
+nested code. Package installation invalidates the boot marker, so a replaced
+framework cannot inherit a stale ready witness. This is the cold-start
+invariant that restored Amadine Sparkle, Office Forms/ADAL4 and VSCode helper
+frameworks after reboot.
+
+The rootfs devfs mount is independently reboot-volatile. Before reporting the
+chroot ready, production invokes the iOS-native `mountdevfs` helper and requires
+`/var/mnt/rootfs/dev/ptmx` to be a character device. Runtime before this check
+showed Terminal's exact `[forkpty: No such file or directory]`; after the
+preflight and a process-only relaunch, Terminal owned a live `/bin/bash -i`
+child. A valid shell trustcache witness alone is therefore never treated as a
+PTY/readiness witness.
+
+Package configuration has a separate non-GUI utility contract. Ventura's
+native `codesign` still runs through `launchdchrootexec` so the normal chroot
+and dyld interposes apply, but the caller sets `MACWS_UTILITY_PROCESS=1`.
+Only GUI, input, Metal and JIT constructors honor that marker; `codesign`'s
+real signature validation and exit status are unchanged. Runtime before this
+contract aborted in `EnableJIT` while dpkg was half-configured. The repaired
+run completed native ad-hoc signing, strict designated-requirement validation,
+all 48 Settings extension checks, and left the package `install ok installed`.
 
 The deb installs the optional VS Code launch job under
 `/var/jb/usr/macOS/gui-launchd`, which is intentionally not auto-scanned by

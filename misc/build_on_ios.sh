@@ -37,6 +37,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
         STALE=$(find MTLCompilerBypassOSCheck MacWSWindowing \
                      MacWSCatalystLaunch MTLSimDriverHost \
                      launchdchrootexec autosignd macwsallocd macwshostd \
+                     macwskeychaind \
                      macwsthermal macwslocationd \
                      mountdevfs ViewBridgeChrootProxy \
                      HIServicesChrootProxy OpenAndSavePanelChrootProxy \

@@ -20,5 +20,6 @@ bool MacWSFinalCompositePublisherPublishSurface(
 // thread. Ownership selection and texture-to-IOSurface binding stay in the
 // Metal adapter; the publisher owns completion coalescing and object lifetime.
 void MacWSFinalCompositePublisherEnqueueCompletion(
-    id<MTLCommandBuffer> commandBuffer, IOSurfaceRef surface,
+    id<MTLCommandBuffer> commandBuffer, id<MTLTexture> sourceTexture,
+    IOSurfaceRef surface,
     uint32_t metalPixelFormat);

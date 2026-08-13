@@ -26,6 +26,7 @@
 #import "macws_host_protocol.h"
 #import "macws_menu_protocol.h"
 #import "macws_stream_protocol.h"
+#import "MacWSCatalystInputPolicy.h"
 #import "MacWSInputLatency.h"
 
 typedef id (*MacWSMsgID)(id, SEL);
@@ -62,6 +63,7 @@ typedef const void *MacWSCGEventRef;
 typedef MacWSCGEventRef (*MacWSCreateCGEvent)(const void *);
 typedef MacWSCGEventRef (*MacWSCopyCGEvent)(MacWSCGEventRef);
 typedef uint32_t (*MacWSGetCGEventType)(MacWSCGEventRef);
+typedef CGPoint (*MacWSGetCGEventLocation)(MacWSCGEventRef);
 typedef MacWSCGEventRef (*MacWSCreateKeyboardCGEvent)(
     const void *, unsigned short, bool);
 typedef MacWSCGEventRef (*MacWSCreateMouseCGEvent)(
@@ -91,6 +93,7 @@ typedef void (*MacWSPostCGEvent)(uint32_t, MacWSCGEventRef);
 // secondary events while leaving the real primary state stuck down.
 typedef int32_t (*MacWSPostLegacyMouseEvent)(CGPoint, int32_t, uint32_t,
                                              int32_t, ...);
+typedef int32_t (*MacWSPostLegacyScrollEvent)(uint32_t, int32_t, ...);
 typedef int32_t (*MacWSPostLegacyKeyboardEvent)(uint16_t, uint16_t, int32_t);
 typedef id (*MacWSEventFromCGEvent)(id, SEL, MacWSCGEventRef);
 typedef const void *(*MacWSEventRef)(id, SEL);
@@ -194,6 +197,13 @@ static IMP MacWSOriginalDockModalEventRouter;
 static id MacWSDockModalWindow;
 static id MacWSDockModalTopLayer;
 static MacWSCGEventRef MacWSDockModalTemplateEvent;
+static CGPoint MacWSDockModalTemplatePoint;
+static BOOL MacWSDockModalTemplatePointValid;
+// Published only after the template and its native WALayerKit tuple have been
+// replaced together on Dock's main thread. The socket thread uses the revision
+// as a completion fence after posting a real global hover at a new point; it
+// never reuses a template captured at an older Mission Control card.
+static _Atomic uint64_t MacWSDockModalContextRevision;
 // The physical trackpad path never leaves an unbounded list of stale Changed
 // samples on Dock's main queue.  UIKit can produce at 120 Hz while a native
 // Mission Control frame is temporarily more expensive; enqueueing one block
@@ -1367,13 +1377,18 @@ static BOOL MacWSPrepareDirectMenuPostLocked(
         MacWSInputRecord record, MacWSDirectTrackingSnapshot *snapshot) {
     BOOL isMenuMotion = record.kind == MacWSInputKindMenuHover ||
                         record.kind == MacWSInputKindHover;
-    BOOL carbonTrackerActive = atomic_load_explicit(
-        &MacWSAppInputSynchronousTrackingActive, memory_order_acquire);
-    BOOL legacyVNCMenuMotion =
-        record.sceneID == 0x564e430000000001ull &&
-        record.kind == MacWSInputKindMenuHover;
+    // The right-button system route enters Carbon's menu loop from the real
+    // WindowServer event after MacWSPostLegacySystemPointerEvent has already
+    // returned, so MacWSAppInputSynchronousTrackingActive is intentionally
+    // false even though the application main thread is now blocked inside
+    // TrackMenuCommon. Runtime-confirmed on iPad13,6 on 2026-08-13: Terminal's
+    // native context menu remained visible but a Host hover over Copy produced
+    // no highlight because the record was queued to that blocked main thread.
+    // A target probe made before the right click already cached the exact
+    // application screen transform. Allow every button-free hover to use that
+    // snapshot on the socket thread; the post below is a native global motion
+    // event, so WindowServer remains the final hit-test authority.
     if (!isMenuMotion ||
-        (!carbonTrackerActive && !legacyVNCMenuMotion) ||
         !MacWSAppInputMenuContextValid ||
         !MacWSAppInputMenuContext.application ||
         !MacWSAppInputMenuContext.eventClass) return NO;
@@ -1607,6 +1622,10 @@ static void MacWSClearDockModalContext(void) {
     if (MacWSDockModalTemplateEvent)
         CFRelease(MacWSDockModalTemplateEvent);
     MacWSDockModalTemplateEvent = NULL;
+    MacWSDockModalTemplatePoint = CGPointZero;
+    MacWSDockModalTemplatePointValid = NO;
+    atomic_fetch_add_explicit(&MacWSDockModalContextRevision, 1,
+                              memory_order_release);
 }
 
 static void MacWSDockModalEventRouterWitness(
@@ -1622,12 +1641,15 @@ static void MacWSDockModalEventRouterWitness(
         [currentHandler isKindOfClass:exposeClass]) {
         static MacWSCopyCGEvent copyEvent;
         static MacWSGetCGEventType getEventType;
+        static MacWSGetCGEventLocation getEventLocation;
         static dispatch_once_t copyOnce;
         dispatch_once(&copyOnce, ^{
             copyEvent = (MacWSCopyCGEvent)dlsym(
                 RTLD_DEFAULT, "CGEventCreateCopy");
             getEventType = (MacWSGetCGEventType)dlsym(
                 RTLD_DEFAULT, "CGEventGetType");
+            getEventLocation = (MacWSGetCGEventLocation)dlsym(
+                RTLD_DEFAULT, "CGEventGetLocation");
         });
         if (MacWSDockModalWindow != windows[0]) {
             [windows[0] retain];
@@ -1655,6 +1677,11 @@ static void MacWSDockModalEventRouterWitness(
             if (MacWSDockModalTemplateEvent)
                 CFRelease(MacWSDockModalTemplateEvent);
             MacWSDockModalTemplateEvent = copied;
+            MacWSDockModalTemplatePoint = getEventLocation
+                ? getEventLocation(copied) : CGPointZero;
+            MacWSDockModalTemplatePointValid = getEventLocation != NULL;
+            atomic_fetch_add_explicit(&MacWSDockModalContextRevision, 1,
+                                      memory_order_release);
         }
     } else if (!currentHandler || !exposeClass ||
                ![currentHandler isKindOfClass:exposeClass]) {
@@ -1682,6 +1709,88 @@ static BOOL MacWSInstallDockModalEventWitness(void) {
     return YES;
 }
 
+// Dock constructs its process-wide DOCKGestures object during application
+// startup.  An inserted-dylib constructor normally installs the -init witness
+// first, but that order is not an invariant: relaunching only Dock inside an
+// already-running Aqua session can initialize the singleton before AppKit has
+// returned to our finite install retry.  Do not allocate a second gesture
+// controller.  Recover the exact strong object that Dock's own -init stores.
+//
+// RE-confirmed in the target Ventura 13.4 arm64e Dock binary: the epilogue of
+// -[DOCKGestures init] at __TEXT+0x9314 materializes its strong global with
+//     adrp x0, <slot>; add x0, x0, <offset>; mov x1, x19;
+//     bl _objc_storeStrong
+// Runtime LLDB on Dock pid 16180 (2026-08-13) read that derived slot at
+// 0x100507ac8 as 0x14cf27970 after a late hook install.  Decode the guarded
+// instruction relationship instead of baking either address or the ASLR
+// slide into production.
+static id MacWSExistingDockGesturesInstanceFromInitIMP(
+        IMP implementation, Class gesturesClass) {
+#if defined(__arm64__) || defined(__aarch64__)
+    if (!implementation || !gesturesClass) return nil;
+    const uint32_t *instructions = (const uint32_t *)ptrauth_strip(
+        (void *)implementation, ptrauth_key_function_pointer);
+    if (!instructions) return nil;
+    // The real target method is 0x184 bytes.  Keep the scan finite and require
+    // the complete compiler-emitted objc_storeStrong argument sequence so an
+    // unrelated ADRP/ADD pair can never become an object slot.
+    for (NSUInteger index = 0; index + 3 < 0x200 / sizeof(uint32_t);
+         index++) {
+        uint32_t adrp = instructions[index];
+        uint32_t add = instructions[index + 1];
+        uint32_t moveObject = instructions[index + 2];
+        uint32_t call = instructions[index + 3];
+        BOOL adrpX0 = (adrp & UINT32_C(0x9f00001f)) ==
+            UINT32_C(0x90000000);
+        BOOL addX0X0 = (add & UINT32_C(0xff8003ff)) ==
+            UINT32_C(0x91000000);
+        if (!adrpX0 || !addX0X0 ||
+            moveObject != UINT32_C(0xaa1303e1) ||
+            (call & UINT32_C(0xfc000000)) != UINT32_C(0x94000000))
+            continue;
+
+        int64_t pageDelta = (int64_t)(((adrp >> 5) & 0x7ffffu) << 2 |
+                                      ((adrp >> 29) & 0x3u));
+        // Sign-extend the 21-bit ADRP immediate before its page shift.
+        if (pageDelta & (INT64_C(1) << 20))
+            pageDelta -= INT64_C(1) << 21;
+        uintptr_t instructionPC = (uintptr_t)&instructions[index];
+        uintptr_t page = instructionPC & ~(uintptr_t)0xfff;
+        uintptr_t slot = (uintptr_t)((intptr_t)page + pageDelta * 4096);
+        uintptr_t immediate = (add >> 10) & 0xfffu;
+        if (add & (UINT32_C(1) << 22)) immediate <<= 12;
+        slot += immediate;
+        if ((slot & (sizeof(uintptr_t) - 1)) != 0) continue;
+
+        uintptr_t rawObject = __atomic_load_n(
+            (const uintptr_t *)slot, __ATOMIC_ACQUIRE);
+        id candidate = (id)rawObject;
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT DOCK-GESTURES scan pid=%d init=%p "
+                "slot=%p candidate=%p class=%p expected=%p\n",
+                getpid(), implementation, (void *)slot, candidate,
+                candidate ? object_getClass(candidate) : Nil, gesturesClass);
+            fflush(stderr);
+        }
+        if (candidate && object_getClass(candidate) == gesturesClass) {
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "#### APP-INPUT DOCK-GESTURES recovered pid=%d "
+                    "instance=%p slot=%p source=init-strong-global\n",
+                    getpid(), candidate, (void *)slot);
+                fflush(stderr);
+            }
+            return candidate;
+        }
+    }
+#else
+    (void)implementation;
+    (void)gesturesClass;
+#endif
+    return nil;
+}
+
 static BOOL MacWSInstallDockGesturesWitness(void) {
     Class gesturesClass = objc_getClass("DOCKGestures");
     if (!gesturesClass) return NO;
@@ -1693,10 +1802,40 @@ static BOOL MacWSInstallDockGesturesWitness(void) {
         MacWSOriginalDockGesturesInit = current;
         method_setImplementation(method, (IMP)MacWSDockGesturesInitWitness);
     }
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT DOCK-GESTURES install pid=%d current=%p "
+            "original=%p captured=%p\n",
+            getpid(), current, MacWSOriginalDockGesturesInit,
+            (void *)atomic_load_explicit(&MacWSDockGesturesInstance,
+                                         memory_order_acquire));
+        fflush(stderr);
+    }
+    if (atomic_load_explicit(&MacWSDockGesturesInstance,
+                             memory_order_acquire) == 0) {
+        id existing = MacWSExistingDockGesturesInstanceFromInitIMP(
+            MacWSOriginalDockGesturesInit, gesturesClass);
+        if (existing) atomic_store_explicit(
+            &MacWSDockGesturesInstance, (uintptr_t)existing,
+            memory_order_release);
+    }
     // EyeCandy classes can be realized after the inserted-dylib constructor.
     // The system-gesture Begin path retries before Dock opens Mission Control.
     (void)MacWSInstallDockModalEventWitness();
     return YES;
+}
+
+static id MacWSCurrentDockGesturesInstance(void) {
+    id gestures = (id)atomic_load_explicit(
+        &MacWSDockGesturesInstance, memory_order_acquire);
+    if (gestures || !MacWSAppInputIsDockEndpoint()) return gestures;
+    Class gesturesClass = objc_getClass("DOCKGestures");
+    gestures = MacWSExistingDockGesturesInstanceFromInitIMP(
+        MacWSOriginalDockGesturesInit, gesturesClass);
+    if (gestures) atomic_store_explicit(
+        &MacWSDockGesturesInstance, (uintptr_t)gestures,
+        memory_order_release);
+    return gestures;
 }
 
 static BOOL MacWSPointInRect(CGPoint point, CGRect rect) {
@@ -2618,6 +2757,119 @@ static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
     return postMouse;
 }
 
+// CGEventPost of a pixel-unit event is the ideal route and is exactly what the
+// installed OSXvnc binary uses. Runtime on VSCode PID 64433 nevertheless
+// proved that Electron's target process can construct/post that event while
+// Chromium receives zero wheel events (its event-post preflight is denied).
+// The older CGPostScrollWheelEvent still reaches WindowServer from this same
+// CGS-connected process, but Apple's CGRemoteOperation.h defines its arguments
+// as small integral *wheel movement* rather than pixels. Convert the Host's
+// 120-Hz logical-point stream into those units with a per-gesture residual.
+//
+// The distinction is also RE-confirmed in OSXvnc's handleMouseButtons: at
+// docs/evidence/vnc-usability-stability-20260729/
+// osxvnc-handle-mouse-arm64-disasm.txt: its default wheel step is w22=10 and
+// its generated CGEvent is explicitly kCGScrollEventUnitPixel. That value
+// cannot be copied into CGPostScrollWheelEvent, whose unit is instead measured
+// at the application boundary below.
+static BOOL MacWSPostSystemScrollEvent(
+        MacWSInputRecord record, CGPoint screenPoint, CGRect screenFrame,
+        id window, NSInteger windowNumber, NSInteger globalWindowNumber) {
+    // Electron's renderer consumes the ordinary process-local precise NSEvent
+    // path below. Runtime CDP on VSCode PID 65571 measured the remote wheel
+    // fallback at 240 CSS px for six 10-point samples (4x the finger travel),
+    // while the window-local event preserves unit=pixel and native phases.
+    // Select by framework capability/class, not bundle ID, so every Electron
+    // application receives the same coherent input contract.
+    Class electronWindowClass = objc_getClass("ElectronNSWindow");
+    if (window && electronWindowClass &&
+        ((MacWSMsgBoolID)objc_msgSend)(
+            window, sel_registerName("isKindOfClass:"),
+            (id)electronWindowClass)) return NO;
+    static MacWSPostLegacyScrollEvent postScroll;
+    static dispatch_once_t onceToken;
+    static NSInteger activeWindowNumber;
+    static double horizontalPixelResidual;
+    static double verticalPixelResidual;
+    dispatch_once(&onceToken, ^{
+        postScroll = (MacWSPostLegacyScrollEvent)dlsym(
+            RTLD_DEFAULT, "CGPostScrollWheelEvent");
+        if (!postScroll) {
+            void *coreGraphics = dlopen(
+                "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+                RTLD_LAZY | RTLD_LOCAL);
+            if (coreGraphics) postScroll =
+                (MacWSPostLegacyScrollEvent)dlsym(
+                    coreGraphics, "CGPostScrollWheelEvent");
+        }
+    });
+    if (!postScroll || record.source == MacWSInputSourceVNC ||
+        windowNumber <= 0) return NO;
+    BOOL began = (record.flags & MacWSInputFlagScrollBegan) != 0;
+    BOOL terminal = (record.flags & (MacWSInputFlagScrollEnded |
+                                      MacWSInputFlagScrollCancelled)) != 0;
+    if (began) {
+        activeWindowNumber = 0;
+        horizontalPixelResidual = 0.0;
+        verticalPixelResidual = 0.0;
+        if (globalWindowNumber != windowNumber) return NO;
+        activeWindowNumber = windowNumber;
+        MacWSPostLegacyMouseEvent postMouse = MacWSLegacySystemMousePoster();
+        if (postMouse) {
+            CGPoint quartzPoint = {
+                screenPoint.x,
+                screenFrame.origin.y + screenFrame.size.height - screenPoint.y,
+            };
+            // Button-free pointer motion synchronizes WindowServer's wheel
+            // hit point without exposing its independently hidden cursor.
+            (void)postMouse(quartzPoint, true, 3, false, false, false);
+        }
+    }
+    if (activeWindowNumber != windowNumber) return NO;
+
+    float horizontalFloat = 0.0f;
+    memcpy(&horizontalFloat, &record.contactID, sizeof(horizontalFloat));
+    // Runtime Chromium calibration on this Ventura/iPadOS pair: one legacy
+    // wheel unit becomes 40 CSS/logical pixels. Divide by that observed unit,
+    // not OSXvnc's 10-pixel *CGEvent* step (a different API contract).
+    const double pixelsPerWheelUnit = 40.0;
+    horizontalPixelResidual += horizontalFloat;
+    verticalPixelResidual += record.pressure;
+    int32_t horizontal = (int32_t)trunc(
+        horizontalPixelResidual / pixelsPerWheelUnit);
+    int32_t vertical = (int32_t)trunc(
+        verticalPixelResidual / pixelsPerWheelUnit);
+    // The API contract warns that large values have application-dependent
+    // results. Bound one 120-Hz delivery to its documented normal range and
+    // retain the unconsumed distance for the next sample.
+    horizontal = MAX(-10, MIN(10, horizontal));
+    vertical = MAX(-10, MIN(10, vertical));
+    horizontalPixelResidual -= horizontal * pixelsPerWheelUnit;
+    verticalPixelResidual -= vertical * pixelsPerWheelUnit;
+    int32_t result = 0;
+    if (vertical != 0 || horizontal != 0) {
+        result = horizontal != 0
+            ? postScroll(2, vertical, horizontal)
+            : postScroll(1, vertical);
+    }
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT SYSTEM-SCROLL pid=%d window=%ld "
+            "pixel=(%.3f,%.3f) wheel=(%d,%d) residual=(%.3f,%.3f) "
+            "phase=%#x result=%d route=CGPostScrollWheelEvent\n",
+            getpid(), (long)windowNumber, horizontalFloat, record.pressure,
+            horizontal, vertical, horizontalPixelResidual,
+            verticalPixelResidual, record.flags, result);
+        fflush(stderr);
+    }
+    if (terminal) {
+        activeWindowNumber = 0;
+        horizontalPixelResidual = 0.0;
+        verticalPixelResidual = 0.0;
+    }
+    return result == 0;
+}
+
 static BOOL MacWSPostDesktopCommand(MacWSDesktopCommand command) {
     static MacWSPostLegacyKeyboardEvent postKeyboard;
     static dispatch_once_t onceToken;
@@ -2739,6 +2991,13 @@ static BOOL MacWSPostLegacySystemPointerEvent(
         // slot is the secondary/right button.  Keep the
         // full three-button state explicit so the release is also a recovery
         // boundary for a gesture interrupted by Scene suspension.
+        // Native menu trackers consult WindowServer's global mouse location
+        // when choosing both the highlighted row background and its text
+        // appearance. The event coordinate alone is not sufficient: setting
+        // updateMouseCursorPosition=false produced mismatched hover colours
+        // in NSMenu/Chromium popup windows. Keep the real global pointer state
+        // coherent here; WindowServer's cursor sprite is hidden independently
+        // at the completed-composite boundary.
         firstResult = postMouse(quartzPoint, true, 3,
             secondary ? false : true, secondary ? true : false, false);
         // CGPostMouseEvent preserves call order and button transitions are
@@ -2891,8 +3150,7 @@ static MacWSCGEventRef MacWSCreateDockSystemGestureEvent(
 static BOOL MacWSDeliverDockSystemGesture(MacWSInputRecord record) {
     MacWSCGEventRef event = MacWSCreateDockSystemGestureEvent(record);
     if (!event) return NO;
-    id gestures = (id)atomic_load_explicit(
-        &MacWSDockGesturesInstance, memory_order_acquire);
+    id gestures = MacWSCurrentDockGesturesInstance();
     SEL handleEvent = sel_registerName("handleEvent:");
     if (!gestures || !((MacWSMsgBoolSEL)objc_msgSend)(
             gestures, sel_registerName("respondsToSelector:"), handleEvent)) {
@@ -2973,12 +3231,20 @@ static void MacWSDrainDockGestureChanges(uint64_t session) {
 }
 
 static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
-    id gestures = (id)atomic_load_explicit(
-        &MacWSDockGesturesInstance, memory_order_acquire);
+    id gestures = MacWSCurrentDockGesturesInstance();
     SEL handleEvent = sel_registerName("handleEvent:");
     if (!gestures || !((MacWSMsgBoolSEL)objc_msgSend)(
             gestures, sel_registerName("respondsToSelector:"),
-            handleEvent)) return NO;
+            handleEvent)) {
+        if (MacWSRuntimeDiagnosticsEnabled()) {
+            fprintf(stderr,
+                "#### APP-INPUT DOCK-GESTURE-DROP pid=%d "
+                "reason=instance-unavailable instance=%p\n",
+                getpid(), gestures);
+            fflush(stderr);
+        }
+        return NO;
+    }
 
     uint16_t phase = record.flags &
         (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
@@ -3100,6 +3366,7 @@ static BOOL MacWSPostDockSystemGesture(MacWSInputRecord record) {
 // ECModalEventController route takes those exact live objects and therefore
 // preserves Dock's own hit testing, actions and animation state.
 static BOOL MacWSPostDockModalPointerEvent(MacWSInputRecord record,
+                                           CGPoint expectedQuartzPoint,
                                            BOOL *activeOut) {
     if (activeOut) *activeOut = NO;
     switch ((MacWSInputKind)record.kind) {
@@ -3157,7 +3424,20 @@ static BOOL MacWSPostDockModalPointerEvent(MacWSInputRecord record,
         id hitWindow = MacWSDockModalWindow;
         id topLayer = MacWSDockModalTopLayer;
         MacWSCGEventRef templateEvent = MacWSDockModalTemplateEvent;
-        if (!hitWindow || !topLayer || !templateEvent) return;
+        // Mission Control's window cards are presentation-layer transforms,
+        // so the captured WALayerKit tuple is valid only at the native event
+        // point which produced it. Code-path-confirmed in this adapter: the old
+        // modal replay returned success without moving WindowServer first, so
+        // the witness could never replace a template captured at another card.
+        // Require the live tuple and its CGEvent point to describe the current
+        // Host point. If not, the caller posts one real button-free WindowServer
+        // event and retries after the witness publishes a newer revision. The
+        // reported click/hover regression remains the runtime validation target.
+        if (!hitWindow || !topLayer || !templateEvent ||
+            !MacWSDockModalTemplatePointValid ||
+            hypot(MacWSDockModalTemplatePoint.x - expectedQuartzPoint.x,
+                  MacWSDockModalTemplatePoint.y - expectedQuartzPoint.y) >
+                1.5) return;
 
         uint32_t firstType = 0;
         uint32_t secondType = 0;
@@ -3297,8 +3577,26 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
     }
     BOOL latencyMarker = MacWSWriteSystemInputLatencyMarker(
         record, latencyWindowNumber);
+
+    BOOL hoverRecord = record.kind == MacWSInputKindHover ||
+        record.kind == MacWSInputKindMenuHover;
+    if (hoverRecord) {
+        // Do not replay Dock's last modal event for pointer motion. A physical
+        // Magic Keyboard mouse first moves WindowServer's global cursor; Dock's
+        // normal ECModalEventController entry then resolves the current card
+        // and records its exact WALayerKit tuple in the witness above. Replaying
+        // the prior tuple here was self-sealing: it returned success, suppressed
+        // this native move, and left hover permanently on the old card.
+        BOOL posted = MacWSPostLegacySystemPointerEvent(
+            record, appKitPoint, frame, frame, windowNumber, YES);
+        if (!posted && latencyMarker)
+            MacWSRemoveSystemInputLatencyMarker(latencyWindowNumber);
+        return posted;
+    }
+
     BOOL modalActive = NO;
-    BOOL modalPosted = MacWSPostDockModalPointerEvent(record, &modalActive);
+    BOOL modalPosted = MacWSPostDockModalPointerEvent(
+        record, quartzPoint, &modalActive);
     if (!modalPosted && modalActive && ![NSThread isMainThread] &&
         record.kind != MacWSInputKindHover &&
         record.kind != MacWSInputKindMenuHover) {
@@ -3310,12 +3608,24 @@ static BOOL MacWSPostDockSystemInput(MacWSInputRecord record) {
         // witness captures WindowServer's authoritative hit context; no
         // coordinate-specific object lookup or private-state fabrication is
         // involved.
+        uint64_t contextRevision = atomic_load_explicit(
+            &MacWSDockModalContextRevision, memory_order_acquire);
         MacWSInputRecord hover = record;
         hover.kind = MacWSInputKindHover;
         (void)MacWSPostLegacySystemPointerEvent(
             hover, appKitPoint, frame, frame, windowNumber, YES);
-        usleep(12000);
-        modalPosted = MacWSPostDockModalPointerEvent(record, &modalActive);
+        // Wait only until Dock's native router publishes the event context
+        // produced by that move, with the former sub-frame 12 ms sleep as a
+        // hard ceiling. This removes fixed click latency on fast frames and
+        // never blocks Dock's main queue (this path is socket-thread-only).
+        for (unsigned attempt = 0; attempt < 24; attempt++) {
+            if (atomic_load_explicit(&MacWSDockModalContextRevision,
+                                     memory_order_acquire) !=
+                contextRevision) break;
+            usleep(500);
+        }
+        modalPosted = MacWSPostDockModalPointerEvent(
+            record, quartzPoint, &modalActive);
     }
     BOOL posted = modalPosted || MacWSPostLegacySystemPointerEvent(
         record, appKitPoint, frame, frame, windowNumber, YES);
@@ -3787,6 +4097,43 @@ static void MacWSPostDirectTrackingRecord(
             screenPoint.x + snapshot.windowMinusScreen.x,
             screenPoint.y + snapshot.windowMinusScreen.y,
         };
+        if (record.kind == MacWSInputKindHover ||
+            record.kind == MacWSInputKindMenuHover) {
+            // A process-local mouseMoved carries a location but does not move
+            // WindowServer's authoritative global pointer. NSMenu and Chromium
+            // popup trackers use that global state to coordinate both their
+            // selection background and selected-text appearance. Post one
+            // genuine, button-free system motion from this already-CGS-bound
+            // application process. This socket thread remains runnable while
+            // the app main thread is synchronously inside TrackMenuCommon.
+            MacWSPostLegacyMouseEvent postMouse =
+                MacWSLegacySystemMousePoster();
+            CGPoint quartzPoint = {
+                screenPoint.x,
+                snapshot.screenFrame.origin.y +
+                    snapshot.screenFrame.size.height - screenPoint.y,
+            };
+            int32_t result = postMouse
+                ? postMouse(quartzPoint, true, 3, false, false, false)
+                : -1;
+            if (result == 0) {
+                if (MacWSRuntimeDiagnosticsEnabled()) {
+                    static _Atomic uint64_t nativeHoverPosts;
+                    uint64_t post = atomic_fetch_add_explicit(
+                        &nativeHoverPosts, 1, memory_order_relaxed) + 1;
+                    if (post <= 24 || (post % 600) == 0) {
+                        fprintf(stderr,
+                            "#### APP-INPUT NATIVE-HOVER pid=%d event=%llu "
+                            "kind=%u quartz=(%.2f,%.2f)\n",
+                            getpid(), (unsigned long long)post, record.kind,
+                            quartzPoint.x, quartzPoint.y);
+                        fflush(stderr);
+                    }
+                }
+                if (snapshot.application) CFRelease(snapshot.application);
+                return;
+            }
+        }
         float pressure = record.kind == MacWSInputKindTouchMove
             ? (record.source == MacWSInputSourcePencil
                 ? fmaxf(0.0f, fminf(1.0f, record.pressure)) : 1.0f)
@@ -4671,6 +5018,45 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             MacWSInputWindowIDForScene(record.sceneID);
         id requestedWindow = requestedWindowNumber
             ? MacWSWindowWithNumber(application, requestedWindowNumber) : nil;
+        MacWSFrontUISnapshot frontBefore = MacWSCaptureFrontUISnapshot();
+        BOOL frontOwnershipKnown = frontBefore.getStatus == 0 &&
+            frontBefore.sameStatus == 0;
+        BOOL rebuiltStaleActiveLifecycle = NO;
+        if (before && requestedWindow && frontOwnershipKnown &&
+            !frontBefore.ownsFrontUIProcess) {
+            // Runtime-confirmed on iPad13,6 on 2026-08-13: reusing Terminal
+            // PID 737 produced a score-7 (visible/on-screen but not focused)
+            // catalog entry, Host emitted ActivateTarget, and the retained UI
+            // screenshot still showed VS Code. AppKit's process-local
+            // isActive bit was stale while _GetFrontUIProcess named another
+            // owner, so activateIgnoringOtherApps: took its already-active
+            // fast path and never performed a new front-process transaction.
+            //
+            // Complete the missing normal AppKit lifecycle before the user-
+            // requested activation. This is conditional on the authoritative
+            // cross-process owner mismatch; an application that really owns
+            // the front remains untouched, preserving live menu/tracker state.
+            SEL deactivateSelector = sel_registerName("deactivate");
+            if (((MacWSMsgBoolSEL)objc_msgSend)(
+                    application, sel_registerName("respondsToSelector:"),
+                    deactivateSelector)) {
+                ((MacWSMsgVoid)objc_msgSend)(application,
+                                             deactivateSelector);
+            }
+            if (((MacWSMsgBool)objc_msgSend)(
+                    application, sel_registerName("isActive"))) {
+                rebuiltStaleActiveLifecycle =
+                    MacWSDeliverMissingDeactivateEvent(application);
+            }
+            if (!((MacWSMsgBool)objc_msgSend)(
+                    application, sel_registerName("isActive"))) {
+                (void)MacWSCompleteFrontUILostLifecycle();
+                (void)MacWSClearMainMenuBar(application);
+                rebuiltStaleActiveLifecycle = YES;
+            }
+            before = ((MacWSMsgBool)objc_msgSend)(
+                application, sel_registerName("isActive"));
+        }
         BOOL keyedRequestedWindow = NO;
         if (requestedWindow) {
             BOOL visible = ((MacWSMsgBool)objc_msgSend)(
@@ -4779,11 +5165,15 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
                 "#### APP-INPUT SYSTEM-ACTIVATE-CONTROL pid=%d active=%s "
-                "coordination=%s requested-window=%u keyed=%s\n",
+                "coordination=%s requested-window=%u keyed=%s "
+                "front-known=%s front-owned=%s stale-lifecycle=%s\n",
                 getpid(), before ? "YES" : "NO",
                 before ? "PRESERVE-NATIVE" : "DIRECT",
                 requestedWindowNumber,
-                keyedRequestedWindow ? "YES" : "NO");
+                keyedRequestedWindow ? "YES" : "NO",
+                frontOwnershipKnown ? "YES" : "NO",
+                frontBefore.ownsFrontUIProcess ? "YES" : "NO",
+                rebuiltStaleActiveLifecycle ? "REBUILT" : "NO");
             fflush(stderr);
         }
         return;
@@ -5262,7 +5652,19 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         if (MacWSPostLegacySystemPointerEvent(
                 record, globalPoint, screenFrame, screenFrame,
                 requestedWindowNumber, exactGlobalHit)) {
-            MacWSNotifyDisplayCatalogChanged('t');
+            // Existing streams publish pointer/Dock visual damage directly;
+            // a move or hover does not change the native window catalog. The
+            // old unconditional notification forced a full transient-layer
+            // reconciliation for every Dock hover sample and visibly
+            // flickered that surface. Reconcile only at boundaries that can
+            // open, close, order, or dismiss a native window/menu.
+            BOOL mayChangeCatalog =
+                record.kind == MacWSInputKindTouchDown ||
+                record.kind == MacWSInputKindTouchUp ||
+                record.kind == MacWSInputKindTouchCancel ||
+                record.kind == MacWSInputKindTap ||
+                record.kind == MacWSInputKindSecondaryTap;
+            if (mayChangeCatalog) MacWSNotifyDisplayCatalogChanged('t');
             if (record.kind == MacWSInputKindTouchUp ||
                 record.kind == MacWSInputKindTouchCancel ||
                 record.kind == MacWSInputKindTap ||
@@ -5644,6 +6046,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     BOOL exactPointerStart = record.kind == MacWSInputKindTouchDown ||
         record.kind == MacWSInputKindTap ||
         record.kind == MacWSInputKindSecondaryTap;
+    BOOL catalystContentInput =
+        MacWSCatalystWindowUsesProcessLocalInputAtPoint(window, windowPoint);
     // CGPostMouseEvent has no window parameter, so the visible Host layer and
     // WindowServer's independent global hit must agree before the system route
     // is allowed. This equality is the missing invariant: it keeps Maps-behind-
@@ -5651,7 +6055,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     // dismissal, Dock tracking, content controls, traffic lights and title-bar
     // move/zoom whenever the requested surface truly is frontmost.
     BOOL exactGlobalSystemStart = requestedWindowNumber != 0 &&
-        exactPointerStart && globalWindowNumber == windowNumber;
+        exactPointerStart && globalWindowNumber == windowNumber &&
+        !catalystContentInput;
     if (MacWSPostLegacySystemPointerEvent(
             record, screenPoint, screenFrame, inputMappingFrame, windowNumber,
             exactSystemMenu || exactGlobalSystemStart)) {
@@ -5668,6 +6073,15 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                               MacWSInputFlagGestureCancelled))))
             MacWSSetAppInputGestureWindow(nil);
         MacWSClearDeferredRFBMoveEvents();
+        return;
+    }
+    if (record.kind == MacWSInputKindScroll &&
+        MacWSPostSystemScrollEvent(
+            record, screenPoint, screenFrame, window, windowNumber,
+            globalWindowNumber)) {
+        if (record.flags & (MacWSInputFlagScrollEnded |
+                            MacWSInputFlagScrollCancelled))
+            MacWSSetAppInputGestureWindow(nil);
         return;
     }
     if (record.kind == MacWSInputKindScroll) {
@@ -5687,9 +6101,14 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         // AppKit's application queue discards the wrapped scroll event because
         // eventWithCGEvent: leaves windowNumber=0 on this launchd session.
         // The broker already selected the exact native NSWindow on its main
-        // thread, so use NSWindow's standard event dispatcher. This preserves
-        // responder-chain hit testing and scrollWheel: semantics; it does not
-        // invoke a control action directly.
+        // thread and MacWSCreateAppScrollEvent round-tripped that identity
+        // through NSEvent. Recover the ordinary content responder chosen
+        // after AppKit's queue has associated a window. Runtime-confirmed with
+        // System Settings window 538: public -sendEvent: accepted every phase
+        // and logged the correct local point/delta but never moved its SwiftUI
+        // sidebar. The generic hit/responder path retains AppKit hit testing
+        // and invokes
+        // no application-specific view or action.
         if (record.flags & (MacWSInputFlagScrollBegan |
                             MacWSInputFlagScrollChanged)) {
             // Runtime enumeration of the actual Ventura NSWindow exposes the
@@ -5711,22 +6130,13 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                     window, latchScrollTarget, scrollEvent);
             }
         }
-        if (record.flags & MacWSInputFlagScrollMomentum) {
-            // Runtime-confirmed with the on-device InputLab boundary witness:
-            // the reconstructed event reaches NSWindow with the exact native
-            // sequence phase=0, momentumPhase=1/4/.../8, but public
-            // -sendEvent: consumes every momentum sample before scrollWheel:.
-            // A process-local event did not enter WindowServer's physical
-            // scroll-session tracker. The Began phase above has now installed
-            // AppKit's native per-window view latch; re-enter the ordinary
-            // window dispatcher so it can consume that state just as it does
-            // for the finger phases.
-            ((MacWSSendEvent)objc_msgSend)(window,
-                sel_registerName("sendEvent:"), scrollEvent);
-        } else {
-            ((MacWSSendEvent)objc_msgSend)(window,
-                sel_registerName("sendEvent:"), scrollEvent);
-        }
+        // Covered/per-window scenes cannot safely use the global
+        // WindowServer scroll route above. Keep their conservative AppKit
+        // fallback at the window boundary. Do not call a hit-tested private
+        // NSView directly: SwiftUI and Catalyst own responder state that is
+        // established by NSWindow before scrollWheel: is delivered.
+        ((MacWSSendEvent)objc_msgSend)(
+            window, sel_registerName("sendEvent:"), scrollEvent);
         MacWSRecordInputLatency(record, latencyMainStart,
                                 MacWSInputUptimeSeconds());
         BOOL scrollTerminal = (record.flags &
@@ -7035,9 +7445,22 @@ static void *MacWSAppInputThread(void *unused) {
         // requests remain owned by the ordinary AppKit endpoints.
         if (MacWSAppInputIsDockEndpoint()) {
             MacWSInputRecord record = message.record;
-            if (count == sizeof(record) &&
-                MacWSInputRecordIsValid(&record)) {
-                (void)MacWSPostDockSystemInput(record);
+            BOOL valid = count == sizeof(record) &&
+                MacWSInputRecordIsValid(&record);
+            BOOL posted = valid && MacWSPostDockSystemInput(record);
+            if (MacWSRuntimeDiagnosticsEnabled() &&
+                record.kind != MacWSInputKindTouchMove &&
+                record.kind != MacWSInputKindHover &&
+                record.kind != MacWSInputKindMenuHover &&
+                (record.kind != MacWSInputKindSystemGesture ||
+                 (record.flags & MacWSInputFlagGestureChanged) == 0)) {
+                fprintf(stderr,
+                    "#### APP-INPUT DOCK-RX pid=%d bytes=%zd kind=%u "
+                    "target=%d flags=%#x valid=%s posted=%s\n",
+                    getpid(), count, record.kind, record.targetPID,
+                    record.flags, valid ? "YES" : "NO",
+                    posted ? "YES" : "NO");
+                fflush(stderr);
             }
             continue;
         }
@@ -7578,6 +8001,8 @@ static void MacWSScheduleAppInputBridgeInstall(unsigned attempt) {
 }
 
 __attribute__((constructor)) static void MacWSInstallAppInputBridge(void) {
+    const char *utility_process = getenv("MACWS_UTILITY_PROCESS");
+    if (utility_process && strcmp(utility_process, "1") == 0) return;
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
     MacWSInstallAppInputBridgeNow();

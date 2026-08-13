@@ -577,6 +577,13 @@ static BOOL macws_needs_application_mount_namespace_compatibility(void) {
          strcmp(program, "Finder") == 0 ||
          strcmp(program, "iconservicesagent") == 0 ||
          strcmp(program, "iconservicesd") == 0 ||
+         // Runtime-confirmed in sharedfilelistd-2026-08-13-073755.ips:
+         // Ventura's SharedFileList worker hit the same four-node
+         // CoreServicesInternal FileCache/CFURL finalization recursion as
+         // Finder when the host mount namespace escaped the chroot.  Steam's
+         // startup synchronously queries this service, so it is a filesystem
+         // catalog consumer and needs the identical root-volume contract.
+         strcmp(program, "sharedfilelistd") == 0 ||
          // Runtime-confirmed in locationd-2026-08-05-115330.ips: the
          // Ventura daemon's CLInternalServiceSilo recursively finalized 511
          // CoreServicesInternal FileCache/CFURL frames after the host mount
@@ -3128,6 +3135,15 @@ static int macws_vnc_share_enabled(void) {
     if (c < 0) c = (getenv("MACWS_VNC_SHARE") || access("/tmp/macws_vnc_share", F_OK) == 0) ? 1 : 0;
     return c;
 }
+static int macws_final_composite_enabled(void) {
+    static int c = -1;
+    if (c < 0) c = (getenv("MACWS_FINAL_COMPOSITE") ||
+                    access("/tmp/macws_final_composite", F_OK) == 0) ? 1 : 0;
+    return c;
+}
+static int macws_composite_capture_enabled(void) {
+    return macws_vnc_share_enabled() || macws_final_composite_enabled();
+}
 static void macws_vnc_share_ensure(size_t w, size_t h) {
     if (g_vncSurf || w < 1000 || h < 600) return;
     NSDictionary *p = @{ @"IOSurfaceWidth": @(w), @"IOSurfaceHeight": @(h),
@@ -3677,7 +3693,7 @@ static BOOL macws_vnc_publish_owned_texture(id<MTLTexture> texture) {
         MacWSFinalCompositePublisherMarkContentValidated();
     }
     BOOL committed = NO;
-    if (valid) {
+    if (valid && macws_vnc_share_enabled()) {
         if (!macws_vnc_mmap_publish_bgra_if_changed(
                 base, bytesPerRow, width, height, &committed)) {
             valid = NO;
@@ -5080,7 +5096,7 @@ static _Atomic uint64_t g_vnc_poll_drop_count = 0;
 static _Atomic uint64_t g_vnc_poll_clean_count = 0;
 static _Atomic uint64_t g_vnc_poll_error_count = 0;
 void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
-    if (!macws_vnc_share_enabled() || !context || !texture) return;
+    if (!macws_composite_capture_enabled() || !context || !texture) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         g_vnc_composite_stages = [NSMutableDictionary new];
@@ -5098,7 +5114,8 @@ void macws_vnc_stage_composite(void *context, id<MTLTexture> texture) {
 }
 
 void macws_vnc_complete_composite(void *context) {
-    if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_stages)
+    if (!macws_composite_capture_enabled() || !context ||
+        !g_vnc_composite_stages)
         return;
     id<MTLTexture> texture = nil;
     NSValue *key = [NSValue valueWithPointer:context];
@@ -5417,7 +5434,8 @@ static void macws_vnc_enqueue_completion_observation(
 }
 
 void macws_vnc_finish_update(void *context) {
-    if (!macws_vnc_share_enabled() || !context || !g_vnc_composite_pending)
+    if (!macws_composite_capture_enabled() || !context ||
+        !g_vnc_composite_pending)
         return;
     BOOL diagnostics = macws_runtime_diagnostics_enabled();
     uint64_t finish = diagnostics
@@ -5639,16 +5657,29 @@ void macws_vnc_finish_update(void *context) {
     // one-deep slot before the observer ran, even though the slower VNC worker
     // eventually sampled the owned target.  Filter at the ownership boundary
     // instead of teaching the consumer to guess which PF80 was intended.
-    if (pixelFormat == 80 && macws_is_owned_scanout_texture(texture)) {
+    if (macws_final_composite_enabled() && pixelFormat == 80 &&
+        macws_is_owned_scanout_texture(texture)) {
         IOSurfaceRef finalSurface = macws_vnc_bound_surface(texture);
         if (finalSurface) {
             MacWSFinalCompositePublisherEnqueueCompletion(
-                commandBuffer, finalSurface, (uint32_t)pixelFormat);
+                commandBuffer, texture, finalSurface,
+                (uint32_t)pixelFormat);
         }
     }
-    macws_vnc_enqueue_completion_observation(
-        commandBuffer, texture, context, deepCapture, diagnostics,
-        submitSerial);
+    // Final-composite-only sessions need the CPU classifier once to establish
+    // that the owned display target contains real desktop pixels. After that
+    // the completed AGX snapshot path is authoritative and performs no RFB
+    // mmap copy or per-frame CPU scan. VNC keeps the existing observer for
+    // damage publication and screenshot requests.
+    if (macws_vnc_share_enabled() || deepCapture ||
+        !MacWSFinalCompositePublisherCanPublish()) {
+        macws_vnc_enqueue_completion_observation(
+            commandBuffer, texture, context, deepCapture, diagnostics,
+            submitSerial);
+    } else {
+        macws_vnc_release(commandBuffer);
+        macws_vnc_release(texture);
+    }
 }
 
 // Track a display-sized (tex, IOSurface) pair and spawn the single bg bridge
@@ -8649,17 +8680,34 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
             }
             return tex;
         }
-        // 2026-06-20 — Texture-type gate: ROUTE-IOSURF can ONLY back
-        // MTLTextureType2D or MTLTextureType2DArray (Metal's IOSurface
-        // texture validation enforces this with assertion
-        // _mtlValidateStrideTextureParameters:1843 'IOSurface texture:
-        // must be of type MTLTextureType2D or linear MTLTextureType2DArray').
+        // Texture-type gate: this compatibility allocator creates one
+        // ordinary 2D IOSurface plane.  It therefore represents only a 2D
+        // texture, not an array of independently addressable slices.  Metal's
+        // real IOSurface validator permits only a specially constructed
+        // *linear* 2DArray; routing an ordinary Chromium 2DArray through our
+        // one-plane allocation aborts the GPU process at
+        // _mtlValidateStrideTextureParameters:1843 with
+        // "textureType (MTLTextureType2DArray) disallowed".  Preserve every
+        // array descriptor field and let the native AGX plain allocator own
+        // the array storage instead.
         // CA can request 3D / Cube / Multisample textures for compositor
         // intermediates — wrapping those in an IOSurface SIGABRTs WS.
         // For any non-2D/non-2DArray request, fall through to the native
         // AGXG13GFamilyDevice path (which handles the type correctly).
         NSUInteger texType = [desc respondsToSelector:@selector(textureType)]
                              ? [desc textureType] : 2 /* default 2D */;
+        if (texType == 3 /* MTLTextureType2DArray */) {
+            id<MTLTexture> tex = [self hooked_newTextureWithDescriptor:desc];
+            if (!tex) {
+                // Failure-only production evidence.  Returning nil preserves
+                // the Metal contract and lets Chromium choose its fallback;
+                // fabricating a one-slice IOSurface texture would corrupt the
+                // descriptor's array semantics.
+                macws_log_mtldesc(desc, NULL, 0,
+                    "plain.2D-ARRAY-NATIVE.NIL");
+            }
+            return tex;
+        }
         // MTLTextureType2DMultisample (4) and
         // MTLTextureType2DMultisampleArray (8) have a hard semantic link to
         // sampleCount > 1.  Downgrading either descriptor to plain 2D while
@@ -8692,7 +8740,7 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
             }
             return tex;
         }
-        if (texType != 2 /* 2D */ && texType != 3 /* 2DArray */) {
+        if (texType != 2 /* 2D */) {
             // Runtime-confirmed by WindowServer-2026-08-09-225014.ips plus
             // WindowServer.err: the historical fallback changed a legitimate
             // six-face descriptor to MTLTextureType2D while retaining
@@ -13137,6 +13185,8 @@ __attribute__((constructor)) static void InitMetalHooks() {
     macws_install_catalyst_launch_compatibility();
     macws_install_catalyst_launch_diagnostics();
     macws_install_catalyst_drawable_publisher();
+    const char *utility_process = getenv("MACWS_UTILITY_PROCESS");
+    if (utility_process && strcmp(utility_process, "1") == 0) return;
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
     const char *appExtension = getenv("MACWS_APP_EXTENSION");

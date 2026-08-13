@@ -27,8 +27,102 @@ static const char *const kCatalystRequestPath =
     "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
 static const char *const kCatalystMarkerDirectory =
     "/var/mnt/rootfs/private/tmp";
+static const char *const kCatalystLoopbackProxyURL =
+    "socks5h://127.0.0.1:1082";
 static pid_t gMapsPID = -1;
 static bool gMapsLaunchPending = false;
+
+static void macws_clear_catalyst_debug_environment(void) {
+    // MacWSHost is long-lived and can have inherited these from an earlier
+    // diagnostic shell. Every child starts from the same production-clean
+    // baseline; individual allowlisted applications may then opt into a
+    // read-only diagnostic through a rootfs sentinel below.
+    static const char *const variables[] = {
+        "MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC",
+        "MACWS_LLDB_HOLD_AFTER_INIT",
+        "MACWS_SUSPEND_AT_EXEC",
+        "MACWS_SUSPEND_TARGET",
+        "MACWS_RANDOM_DIAGNOSTICS",
+        "MACWS_IDENTITY_DIAGNOSTICS",
+        "MACWS_XPC_NAME_TRACE",
+        "MACWS_XPC_NAME_TRACE_FILTER",
+    };
+    for (size_t index = 0;
+         index < sizeof(variables) / sizeof(variables[0]); index++) {
+        unsetenv(variables[index]);
+    }
+}
+
+static bool macws_loopback_proxy_is_reachable(void) {
+    int descriptor = socket(AF_INET, SOCK_STREAM, 0);
+    if (descriptor < 0) return false;
+    int flags = fcntl(descriptor, F_GETFL, 0);
+    if (flags >= 0) (void)fcntl(descriptor, F_SETFL, flags | O_NONBLOCK);
+    struct sockaddr_in address = {
+        .sin_len = sizeof(address),
+        .sin_family = AF_INET,
+        .sin_port = htons(1082),
+        .sin_addr = {.s_addr = htonl(INADDR_LOOPBACK)},
+    };
+    int result = connect(descriptor, (const struct sockaddr *)&address,
+                         sizeof(address));
+    bool reachable = result == 0;
+    if (!reachable && errno == EINPROGRESS) {
+        struct pollfd pollDescriptor = {
+            .fd = descriptor,
+            .events = POLLOUT,
+        };
+        if (poll(&pollDescriptor, 1, 150) > 0) {
+            int socketError = 0;
+            socklen_t errorLength = sizeof(socketError);
+            reachable = getsockopt(descriptor, SOL_SOCKET, SO_ERROR,
+                                   &socketError, &errorLength) == 0 &&
+                socketError == 0;
+        }
+    }
+    close(descriptor);
+    return reachable;
+}
+
+static void macws_configure_asphalt_network_environment(void) {
+    // Direct networking remains the default.  Some access networks block the
+    // Google/Firebase endpoints required during Asphalt registration while a
+    // user-owned SOCKS forward is available on the iPad loopback interface.
+    // Select that already-running endpoint once at child launch.  The game
+    // retains normal DNS-through-proxy and TLS peer verification; MacWS does
+    // not intercept traffic, install a permissive verifier, or fabricate
+    // registration state.
+    static const char *const proxyVariables[] = {
+        "ALL_PROXY", "all_proxy", "HTTPS_PROXY", "https_proxy",
+        "HTTP_PROXY", "http_proxy",
+    };
+    bool reachable = macws_loopback_proxy_is_reachable();
+    for (size_t index = 0;
+         index < sizeof(proxyVariables) / sizeof(proxyVariables[0]); index++) {
+        if (reachable)
+            setenv(proxyVariables[index], kCatalystLoopbackProxyURL, 1);
+        else
+            unsetenv(proxyVariables[index]);
+    }
+    fprintf(stderr,
+            "[MacWSCatalystLauncher] Asphalt network route=%s\n",
+            reachable ? kCatalystLoopbackProxyURL : "direct");
+    fflush(stderr);
+}
+
+static void macws_configure_native_agx_environment(void) {
+    setenv("MallocNanoZone", "0", 1);
+    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
+    setenv("CA_VSYNC_OFF", "1", 1);
+    setenv("MACWS_AGX_NATIVE", "1", 1);
+    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
+    setenv("MACWS_PIN_FALLBACK", "1", 1);
+    setenv("COMMAND_MODE", "unix2003", 1);
+    setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
+    setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
+    setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
+           "com.apple.macosbooter.frontboard.systemappservices", 1);
+}
 
 static pid_t macws_live_host_carried_maps_pid(void) {
     int marker = open(kHostCarrierMarker, O_RDONLY | O_CLOEXEC);
@@ -100,18 +194,9 @@ static bool macws_configure_maps_environment(void) {
            "/var/root/Library/Containers/com.apple.Maps/Data", 1);
     setenv("USER", "root", 1);
     setenv("TMPDIR", "/tmp", 1);
-    setenv("MallocNanoZone", "0", 1);
-    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
-    setenv("CA_VSYNC_OFF", "1", 1);
-    setenv("MACWS_AGX_NATIVE", "1", 1);
-    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
-    setenv("MACWS_PIN_FALLBACK", "1", 1);
-    setenv("COMMAND_MODE", "unix2003", 1);
+    macws_clear_catalyst_debug_environment();
+    macws_configure_native_agx_environment();
     setenv("__CFBundleIdentifier", "com.apple.Maps", 1);
-    setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
-    setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
-    setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
-           "com.apple.macosbooter.frontboard.systemappservices", 1);
     return true;
 }
 
@@ -151,7 +236,7 @@ static bool macws_load_catalyst_request(NSString **rootExecutableOut,
         !macws_valid_bundle_identifier(bundleIdentifier))
         return false;
     if (![containerHome isKindOfClass:NSString.class] ||
-        ![containerHome hasPrefix:@"/var/root/Library/Containers/"] ||
+        ![containerHome hasPrefix:@"/Users/mobile/Library/Containers/"] ||
         [containerHome rangeOfString:@"/../"].location != NSNotFound ||
         [containerHome rangeOfString:@"\n"].location != NSNotFound)
         return false;
@@ -190,35 +275,35 @@ static bool macws_configure_catalyst_environment(
     const char *insert = macws_insert_dylib_for_arch(arch);
     if (!insert) return false;
     setenv("DYLD_INSERT_LIBRARIES", insert, 1);
-    setenv("HOME", "/Users/root", 1);
+    setenv("HOME", "/Users/mobile", 1);
     setenv("CFFIXED_USER_HOME", containerHome.fileSystemRepresentation, 1);
-    setenv("USER", "root", 1);
+    setenv("USER", "mobile", 1);
     setenv("TMPDIR", "/tmp", 1);
-    setenv("MallocNanoZone", "0", 1);
-    setenv("CA_DISABLE_SWAP_ICC", "1", 1);
-    setenv("CA_VSYNC_OFF", "1", 1);
-    setenv("MACWS_AGX_NATIVE", "1", 1);
-    setenv("MACWS_AGX_REGISTER_CLASSES", "1", 1);
-    setenv("MACWS_PIN_FALLBACK", "1", 1);
+    macws_clear_catalyst_debug_environment();
+    macws_configure_native_agx_environment();
     // Generic Catalyst applications resolve resources and container URLs
     // through the same scoped mount-namespace compatibility contract used by
     // macwshostd's production custom-path launcher.
     setenv("MACWS_APP_MOUNT_COMPAT", "1", 1);
-    // The foreground Host can itself have been started from a diagnostic
-    // shell. Never inherit its broad mount tracer into a production child.
-    unsetenv("MACWS_APP_MOUNT_COMPAT_DIAGNOSTIC");
+    // The foreground Host is long-lived and can itself have been started from
+    // a diagnostic shell.  A production application child must start from a
+    // closed set of compatibility variables rather than inherit one-shot
+    // tracing/suspend controls from that carrier.  In particular an inherited
+    // LLDB hold leaves the child SIGSTOP'd before its first scene and looks to
+    // the user like a slow or permanently black launch.
     // Some Catalyst Metal layers are presented by the UIKit carrier and are
     // not included in SkyLight's exact-window capture. Transfer only the
     // completed drawable's IOSurface Mach right; Host imports it on the
     // native-GPU path without a CPU readback or compression step.
     setenv("MACWS_CATALYST_DIRECT_DRAWABLE", "1", 1);
-    setenv("COMMAND_MODE", "unix2003", 1);
     setenv("__CFBundleIdentifier", bundleIdentifier.UTF8String, 1);
-    setenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE", "1", 1);
-    setenv("MACWS_CATALYST_REGISTER_APPLICATION", "1", 1);
-    setenv("APPLICATION_SUPPORT_SERVICE_MACH_NAME",
-           "com.apple.macosbooter.frontboard.systemappservices", 1);
     if ([bundleIdentifier isEqualToString:@"com.gameloft.asphalt9mac"]) {
+        macws_configure_asphalt_network_environment();
+        // Ventura's Security client cannot speak iPadOS 16's per-user secd
+        // storage protocol. Use the authenticated iOS-native Security helper;
+        // it is reached only after stock SecItem reports an unavailable/MDS
+        // backend and it preserves the vendor's real Keychain access groups.
+        setenv("MACWS_CATALYST_LOCAL_KEYCHAIN", "1", 1);
         // Asphalt's embedded OpenSSL defaults to /usr/local/ssl/cert.pem.
         // gameoptions.gameloft.com currently serves the Sectigo leaf with an
         // unrelated Entrust intermediate, so a normal peer-verifying client
@@ -228,6 +313,27 @@ static bool macws_configure_catalyst_environment(
         // verify callback or SSL_VERIFYPEER=0 diagnostic.
         setenv("SSL_CERT_FILE", "/usr/local/ssl/cert.pem", 1);
         unsetenv("SSL_CERT_DIR");
+        // Explicit, launch-time-only random-source diagnostic. The marker
+        // lives in the macOS rootfs so libmachook sees the matching /tmp path
+        // after chroot. The diagnostic records the real API result and never
+        // changes it; ordinary production launches do not create the marker.
+        struct stat randomDiagnosticStatus = {0};
+        if (lstat("/var/mnt/rootfs/private/tmp/"
+                  "macws_asphalt_random_diag",
+                  &randomDiagnosticStatus) == 0) {
+            setenv("MACWS_RANDOM_DIAGNOSTICS", "1", 1);
+        }
+        // Identity diagnostics are deliberately independent of entropy/TLS
+        // tracing. They record only Security API status and whether UIKit's
+        // vendor identifier exists; no Keychain value or UUID is emitted.
+        struct stat identityDiagnosticStatus = {0};
+        if (lstat("/var/mnt/rootfs/private/tmp/"
+                  "macws_asphalt_identity_diag",
+                  &identityDiagnosticStatus) == 0) {
+            setenv("MACWS_IDENTITY_DIAGNOSTICS", "1", 1);
+            setenv("MACWS_XPC_NAME_TRACE", "1", 1);
+            setenv("MACWS_XPC_NAME_TRACE_FILTER", "secur", 1);
+        }
     }
     return true;
 }
@@ -290,7 +396,12 @@ static int macws_exec_requested_catalyst_from_existing_host(void) {
             getpid());
     fflush(stderr);
     char *const childArgv[] = {
-        (char *)kChrootExec, "0", "0", (char *)kMacWSRoot,
+        // Catalyst applications belong to the foreground iPadOS login user.
+        // Runtime-confirmed root launches receive errSecNotAvailable (-25291)
+        // from every modern SecItem operation. This matching-uid launch is an
+        // explicit A/B against that witness; the setuid launcher retains root
+        // only long enough to chroot, then drops to MacWSHost's uid/gid.
+        (char *)kChrootExec, "501", "501", (char *)kMacWSRoot,
         (char *)rootExecutable.fileSystemRepresentation, NULL,
     };
     execv(kChrootExec, childArgv);

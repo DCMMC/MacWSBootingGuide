@@ -25,6 +25,10 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
 
 - `Support/MacWSHostDiagnostics.*` owns runtime diagnostic selection, timestamp
   conversion and file logging.
+- `Support/MacWSHostRuntime.*` owns the Unix input transport, shared-frame ACK
+  compatibility reader, endpoint readiness checks and one-shot Metal registry
+  witness. None of those process/transport details remain in the Scene
+  controller.
 - `Input/MacWSKeyMapping.*` owns the pure macOS virtual-key, X11 keysym and
   ASCII translation tables. UIKit event lifecycle and transport remain in the
   view/controller; adding a keyboard layout no longer grows that controller.
@@ -35,6 +39,10 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
   primitive. The view chooses whether a producer is relevant; it no longer
   implements Mach delivery, texture ownership and vertex construction in one
   method.
+- `Rendering/MacWSMetalView.*` owns the DisplayStream/Metal presentation view
+  and its touch, pointer, keyboard and gesture state machines. `main.m` now
+  coordinates UIKit Scenes, window lifecycle and control-center presentation;
+  it no longer also contains the 4,000-line renderer/input implementation.
 - `Launch/MacWSCatalystLaunchCoordinator.*` owns the two foreground-carrier
   Darwin notifications, fixed launcher argv and child reaping. The UI app
   delegate only installs this boundary; hostd and the launcher still validate
@@ -58,12 +66,41 @@ No RFB encoding or CPU framebuffer copy is introduced by this split.
   the bounded main-thread queue. Continuous pointer/scroll/configure samples
   may coalesce, but magnification deltas remain discrete because AppKit
   consumes them as incremental ratios.
+- Scroll delivery has two framework-capability routes. Electron windows use
+  process-local pixel NSEvents with native phase/momentum fields; windows that
+  do not consume that path use WindowServer's integral remote-wheel API with a
+  runtime-calibrated 40-logical-pixel accumulator and preserved residual. The
+  decision is based on the real `ElectronNSWindow` class contract, never a
+  VSCode bundle identifier or fixed screen coordinate. The bounded CDP probe
+  `misc/cdp_scroll_transport_probe.mjs` observes Chromium state without
+  synthesizing input, while `misc/host_scroll_delivery.py` emits the same v4
+  records as the UIKit boundary.
+- `libmachook/Compatibility/MacWSCatalystKeychain.*` owns the narrowly scoped
+  Catalyst Security compatibility adapter. It first calls the stock Ventura
+  Security API and falls back only for unavailable/MDS statuses. The fallback
+  sends property-list requests to `macwskeychaind`; it contains no local or
+  plaintext credential database.
+- `libmachook/Compatibility/MacWSCatalystInputPolicy.*` owns the generic
+  Catalyst client-area classification. A real `_UINSWindow` client point uses
+  the process-local responder chain; its title bar and traffic lights retain
+  the verified WindowServer pointer route. This policy is class/geometry based
+  and contains no application or coordinate allowlist.
+- `libmachook/Diagnostics/MacWSRandomDiagnostics.*` and
+  `MacWSIdentityDiagnostics.*` contain observation-only Asphalt bring-up
+  witnesses. The launcher clears their environment for every production child
+  and enables them only when an explicit rootfs sentinel exists.
+- `macwskeychaind/` is a mobile-session iOS-native Security adapter. It accepts
+  only uid 501 requests from Asphalt's exact executable path, only generic
+  passwords, and only the two original Gameloft access groups. Unsupported
+  reference result types fail closed.
 
 This organization makes the top-level files coordinators rather than owners
-of unrelated policy. The remaining large view and bridge implementations are
-still migration targets; future splits should follow an already-proven
-boundary (gesture state machine, scene lifecycle, menu model) rather than move
-arbitrary line ranges into generic utility files.
+of unrelated policy. `MacWSMetalView.m` is intentionally still one cohesive
+state machine: its gesture recognizers, coordinate mapping and rendering
+admission share ordering-sensitive state. The next split should extract one
+state machine behind an explicit protocol, not scatter coupled ivars across
+categories. Scene lifecycle and control-center UI remain the corresponding
+targets in `main.m`.
 
 ## Invariants
 

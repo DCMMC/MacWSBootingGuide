@@ -15,6 +15,7 @@ ENT=/var/jb/usr/macOS/bin/entitlements.plist
 LDID=/var/jb/usr/bin/ldid
 JBCTL=/var/jb/usr/bin/jbctl
 PYTHON=/var/jb/usr/bin/python3
+ENTITLEMENT_MERGER=/var/jb/usr/macOS/bin/merge_third_party_entitlements.py
 ROOTFS=/var/mnt/rootfs
 SIGN_ENT=$ENT
 SIGN_PROFILE=system
@@ -50,6 +51,101 @@ inc_counter() {
     esac
     printf '%d %d %d %d\n' "$s" "$a" "$k" "$n" > "$COUNTS"
 }
+
+# Return success only when every signed architecture currently present in the
+# file is already in Dopamine's live trustcache.  This is a byte-level witness
+# that the exact file has completed signing.  Preserve it verbatim: a second
+# ldid pass is not reliably idempotent for very large universal frameworks
+# (Steam CEF is the runtime witness), and can also invalidate Valve's package
+# inventory after that inventory was synchronized.
+current_file_is_trusted() {
+    local f="$1" found=0 h
+    for arch in arm64 arm64e x86_64; do
+        h=$("$LDID" -arch "$arch" -h "$f" 2>/dev/null | \
+            grep 'CDHash=' | cut -c8- | tr '[:upper:]' '[:lower:]')
+        [ -n "$h" ] || continue
+        found=1
+        grep -qF "$h" "$TC_CACHE" 2>/dev/null || return 1
+    done
+    [ "$found" -eq 1 ]
+}
+
+executable_has_compat_profile() {
+    local f="$1" ent
+    ent=$(mktemp /tmp/macws_exec_entitlements.XXXXXX) || return 1
+    : > "$ent"
+    for arch in arm64 arm64e x86_64; do
+        if "$LDID" -arch "$arch" -e "$f" > "$ent" 2>/dev/null &&
+           [ -s "$ent" ]; then
+            break
+        fi
+        : > "$ent"
+    done
+    # These are the exec-policy essentials demonstrated by Steam.  Also reject
+    # platform-application, which previously caused duplicate-platform-main
+    # panics in third-party processes.
+    if grep -q '<key>com.apple.private.security.no-container</key>' "$ent" &&
+       grep -q '<key>com.apple.private.security.no-sandbox</key>' "$ent" &&
+       ! grep -q '<key>platform-application</key>' "$ent"; then
+        rm -f "$ent"
+        return 0
+    fi
+    rm -f "$ent"
+    return 1
+}
+
+# Main executables need the MacWS compatibility profile; libraries must not
+# carry executable entitlements.  Runtime evidence from Steam showed iPadOS
+# rejecting Breakpad/CoreImage dylibs with "has entitlements but is not a main
+# binary".  Read the Mach-O header (including fat containers) using the iOS
+# Python already required by this installer.  MH_EXECUTE is filetype 2.
+macho_contains_executable_slice() {
+    "$PYTHON" - "$1" <<'PY'
+import struct, sys
+
+data = open(sys.argv[1], "rb").read(4096)
+if len(data) < 16:
+    raise SystemExit(1)
+magic = data[:4]
+if magic in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"):
+    endian = "<"
+    offset = 0
+elif magic in (b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce"):
+    endian = ">"
+    offset = 0
+elif magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+    endian = ">"
+    count = struct.unpack_from(">I", data, 4)[0]
+    width = 32 if magic == b"\xca\xfe\xba\xbf" else 20
+    offsets = [struct.unpack_from(">Q" if width == 32 else ">I",
+                                  data, 8 + i * width + 8)[0]
+               for i in range(count)]
+    with open(sys.argv[1], "rb") as stream:
+        for candidate in offsets:
+            stream.seek(candidate)
+            header = stream.read(16)
+            if len(header) >= 16 and struct.unpack_from("<I", header, 12)[0] == 2:
+                raise SystemExit(0)
+    raise SystemExit(1)
+elif magic in (b"\xbe\xba\xfe\xca", b"\xbf\xba\xfe\xca"):
+    endian = "<"
+    count = struct.unpack_from("<I", data, 4)[0]
+    width = 32 if magic == b"\xbf\xba\xfe\xca" else 20
+    offsets = [struct.unpack_from("<Q" if width == 32 else "<I",
+                                  data, 8 + i * width + 8)[0]
+               for i in range(count)]
+    with open(sys.argv[1], "rb") as stream:
+        for candidate in offsets:
+            stream.seek(candidate)
+            header = stream.read(16)
+            if len(header) >= 16 and struct.unpack_from(">I", header, 12)[0] == 2:
+                raise SystemExit(0)
+    raise SystemExit(1)
+else:
+    raise SystemExit(1)
+raise SystemExit(0 if struct.unpack_from(endian + "I", data, offset + 12)[0] == 2 else 1)
+PY
+}
 # ── core sign + trustcache function ──────────────────────────────────────────
 
 sign_one() {
@@ -59,7 +155,26 @@ sign_one() {
     local sign_result=0
     [ -f "$f" ] || return 0
 
+    local is_executable=1
     if [ "$SIGN_PROFILE" = third-party-nonplatform ]; then
+        if macho_contains_executable_slice "$f"; then
+            is_executable=1
+        else
+            is_executable=0
+        fi
+    fi
+
+    if current_file_is_trusted "$f" &&
+       { [ "$SIGN_PROFILE" != third-party-nonplatform ] ||
+         [ "$is_executable" -eq 0 ] ||
+         executable_has_compat_profile "$f"; }; then
+        inc_counter 2
+        printf '  keep    %s\n' "$(basename "$f")"
+        return 0
+    fi
+
+    if [ "$SIGN_PROFILE" = third-party-nonplatform ] &&
+       [ "$is_executable" -eq 1 ]; then
         current_ent=$(mktemp /tmp/macws_current_entitlements.XXXXXX) || return 1
         merged_ent=$(mktemp /tmp/macws_merged_entitlements.XXXXXX) || {
             rm -f "$current_ent"
@@ -74,22 +189,9 @@ sign_one() {
             fi
             : > "$current_ent"
         done
-        if ! "$PYTHON" - "$SIGN_ENT" "$current_ent" "$merged_ent" <<'PY'
-import plistlib, sys
-
-with open(sys.argv[1], "rb") as stream:
-    project = plistlib.load(stream)
-vendor = {}
-try:
-    with open(sys.argv[2], "rb") as stream:
-        vendor = plistlib.load(stream)
-except (EOFError, OSError, plistlib.InvalidFileException):
-    pass
-vendor.update(project)
-vendor.pop("platform-application", None)
-with open(sys.argv[3], "wb") as stream:
-    plistlib.dump(vendor, stream, fmt=plistlib.FMT_XML, sort_keys=True)
-PY
+        if [ ! -f "$ENTITLEMENT_MERGER" ] ||
+           ! "$PYTHON" "$ENTITLEMENT_MERGER" \
+                "$SIGN_ENT" "$current_ent" "$merged_ent"
         then
             rm -f "$current_ent" "$merged_ent"
             return 1
@@ -100,8 +202,14 @@ PY
     # `-M` cannot remove an entitlement which polluted an earlier signature.
     # The non-platform profile above is already a complete vendor+project merge,
     # so sign it directly. Other targets retain the historical merge behavior.
-    if [ "$SIGN_PROFILE" = third-party-nonplatform ]; then
+    if [ "$SIGN_PROFILE" = third-party-nonplatform ] &&
+       [ "$is_executable" -eq 1 ]; then
         "$LDID" -S"$effective_ent" "$f" 2>/dev/null
+        sign_result=$?
+    elif [ "$SIGN_PROFILE" = third-party-nonplatform ]; then
+        # Framework/dylib/bundle slices receive an empty ad-hoc signature.
+        # Entitlements on non-main images violate iPadOS exec policy.
+        "$LDID" -S "$f" 2>/dev/null
         sign_result=$?
     else
         "$LDID" -S"$effective_ent" -M "$f" 2>/dev/null
@@ -178,6 +286,115 @@ for base, _, names in os.walk(sys.argv[1]):
     done
 }
 
+# Steam's bootstrapper owns a second integrity database in addition to the
+# Mach-O code signature. Each line in package/*.installed stores
+# relative-path,size,mtime,CRC32. Re-signing a binary is required before the
+# iOS kernel will admit it into the macOS chroot, but that legitimate signature
+# change also changes all four recorded values. On the next launch Steam then
+# restores Valve's original binary, whose macOS signature the iOS kernel kills,
+# creating an updater -> AMFI -> updater loop.
+#
+# Update only records that already exist and whose current target is a Mach-O.
+# Non-code resources, package manifests, versions, and download hashes remain
+# untouched, so a real upstream Steam update is still discovered normally.
+refresh_steam_installed_records() {
+    local app_root="$1"
+    local package_dir="$app_root/Contents/MacOS/package"
+    [ -d "$package_dir" ] || return 0
+    set -- "$package_dir"/*.installed
+    [ -f "$1" ] || return 0
+    printf '\n==> refreshing Steam signed-code inventory\n'
+    "$PYTHON" - "$app_root/Contents/MacOS" "$@" <<'PY'
+import os
+import re
+import stat
+import sys
+import zlib
+import hashlib
+
+root = os.path.realpath(sys.argv[1])
+magics = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+record = re.compile(r"^(.*),(-?\d+);(-?\d+);(\d+)(\r?\n)?$")
+
+for inventory in sys.argv[2:]:
+    with open(inventory, "r", encoding="utf-8") as stream:
+        lines = stream.readlines()
+    output = []
+    changed = 0
+    for line in lines:
+        match = record.match(line)
+        if not match or int(match.group(2)) < 0:
+            output.append(line)
+            continue
+        relative = match.group(1)
+        path = os.path.realpath(os.path.join(root, relative))
+        # A malicious/corrupt inventory must not make the privileged installer
+        # inspect or rewrite metadata for a path outside Steam's MacOS root.
+        if path != root and not path.startswith(root + os.sep):
+            output.append(line)
+            continue
+        try:
+            status = os.stat(path)
+            if not stat.S_ISREG(status.st_mode):
+                output.append(line)
+                continue
+            with open(path, "rb") as stream:
+                if stream.read(4) not in magics:
+                    output.append(line)
+                    continue
+            checksum = 0
+            with open(path, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    checksum = zlib.crc32(chunk, checksum)
+        except OSError:
+            output.append(line)
+            continue
+        newline = (
+            f"{relative},{status.st_size};{int(status.st_mtime)};"
+            f"{checksum & 0xffffffff}{match.group(5) or ''}"
+        )
+        changed += newline != line
+        output.append(newline)
+
+    # The footer authenticates every byte before its own SHA1 line. This is
+    # format evidence from Valve's untouched inventory: hashing that prefix
+    # exactly reproduces the shipped footer. Keep the inventory self-consistent
+    # after replacing only its signed-code records.
+    for index, line in enumerate(output):
+        if not line.startswith("SHA1="):
+            continue
+        line_ending = "\r\n" if line.endswith("\r\n") else (
+            "\n" if line.endswith("\n") else ""
+        )
+        digest = hashlib.sha1(
+            "".join(output[:index]).encode("utf-8")
+        ).hexdigest().upper()
+        replacement = f"SHA1={digest}{line_ending}"
+        changed += replacement != line
+        output[index] = replacement
+        break
+
+    old_status = os.stat(inventory)
+    temporary = inventory + ".macws-new"
+    with open(temporary, "w", encoding="utf-8", newline="") as stream:
+        stream.writelines(output)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary, stat.S_IMODE(old_status.st_mode))
+    try:
+        os.chown(temporary, old_status.st_uid, old_status.st_gid)
+    except PermissionError:
+        pass
+    os.replace(temporary, inventory)
+    print(f"  inventory {os.path.basename(inventory)} code-records={changed}")
+PY
+}
+
 # A third-party application is not an iOS platform process.  Giving its main
 # executable `platform-application` makes PMAP_CS treat it as a platform main
 # binary. Runtime-confirmed with CleanMyMac X 4.15.8: the iPadOS 16.3.1 panic
@@ -210,14 +427,30 @@ case "$TARGET" in
     homebrew|brew) DO_MACPORTS=0; DO_HOMEBREW=1 ;;
     both|"")       DO_MACPORTS=1; DO_HOMEBREW=1 ;;
     /*)
+        # Steam's native updater deliberately keeps its live application at
+        # ~/Library/Application Support/Steam/Steam.AppBundle/Steam rather
+        # than below /Applications. Detect application bundles by structure,
+        # not by one installation prefix, so every third-party GUI app keeps
+        # the non-platform signing profile. System applications remain on the
+        # historical system profile when explicitly targeted.
         case "$TARGET" in
-            "$ROOTFS"/Applications/*.app|"$ROOTFS"/Applications/*.app/*)
-                prepare_third_party_app_profile || exit 1
+            "$ROOTFS"/System/*) ;;
+            *)
+                if [ -f "$TARGET/Contents/Info.plist" ]; then
+                    prepare_third_party_app_profile || exit 1
+                fi
                 ;;
         esac
         printf '=== Signing custom path: %s (profile=%s) ===\n' \
                "$TARGET" "$SIGN_PROFILE"
         sign_tree "$TARGET"
+        # Structural detection keeps this valid for Steam's live bundle below
+        # Application Support and for a conventional /Applications symlink.
+        if [ -f "$TARGET/Contents/MacOS/package/steam_client_osx.installed" ] ||
+           [ -f "$TARGET/Contents/MacOS/package/steam_client_signed_osx.installed" ] ||
+           [ -f "$TARGET/Contents/MacOS/package/steam_client_signed-2_osx.installed" ]; then
+            refresh_steam_installed_records "$TARGET" || exit 1
+        fi
         read -r s a k n < "$COUNTS"
         printf '\nDone. newly-trusted=%d  already-trusted=%d  skipped(non-Mach-O)=%d  no-cdhash=%d\n' \
                "$s" "$a" "$k" "$n"

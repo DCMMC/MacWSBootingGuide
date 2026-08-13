@@ -3,6 +3,8 @@
 
 HOSTD=/var/jb/usr/macOS/bin/macwshostd
 HOSTD_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.hostd.plist
+KEYCHAIND=/var/jb/usr/macOS/bin/macwskeychaind
+KEYCHAIND_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.keychain.plist
 VIEWBRIDGE_PROXY=/var/jb/usr/macOS/Frameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/ViewBridgeAuxiliary
 HISERVICES_PROXY=/var/jb/usr/macOS/Frameworks/HIServices.framework/Versions/A/XPCServices/HIServicesProxy.xpc/HIServicesProxy
 OPEN_SAVE_PANEL_PROXY=/var/jb/usr/macOS/Frameworks/AppKit.framework/Versions/C/XPCServices/OpenAndSavePanelProxy.xpc/OpenAndSavePanelProxy
@@ -35,6 +37,7 @@ WORKSPACE_WALLPAPER_TARGET="$ROOTFS/usr/local/share/macws/wallpapers/macws-fores
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
 rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
+rm -f /var/jb/var/mobile/macws-application-trust.boot-ready
 
 # Files copied directly from layout/ retain the build account's uid/gid in a
 # rootless .deb.  iPadOS launchctl rejects system-domain jobs unless their
@@ -107,6 +110,25 @@ if [ -x "$HOSTD" ]; then
             | grep CDHash= | cut -c8-)
         [ -n "$hash" ] && /var/jb/usr/bin/jbctl trustcache add "$hash" 2>/dev/null || true
     done
+fi
+
+# Asphalt's Catalyst process uses Ventura Security.framework, whose modern
+# SecItem client cannot negotiate with iPadOS 16 secd directly.  Keep the
+# narrow iOS-native adapter in launchd's mobile session so its real Keychain
+# access-group and Data Protection identity match the foreground application.
+if [ -x "$KEYCHAIND" ]; then
+    for arch in arm64 arm64e; do
+        hash=$(/var/jb/usr/bin/ldid -arch "$arch" -h "$KEYCHAIND" 2>/dev/null \
+            | grep CDHash= | cut -c8-)
+        [ -n "$hash" ] && \
+            /var/jb/usr/bin/jbctl trustcache add "$hash" 2>/dev/null || true
+    done
+    if [ -f "$KEYCHAIND_PLIST" ]; then
+        chown root:wheel "$KEYCHAIND_PLIST" || exit 1
+        chmod 0644 "$KEYCHAIND_PLIST" || exit 1
+        /var/jb/usr/bin/launchctl unload "$KEYCHAIND_PLIST" 2>/dev/null || true
+        /var/jb/usr/bin/launchctl load "$KEYCHAIND_PLIST" || exit 1
+    fi
 fi
 
 for lib in "$LIBMACHOOK" "$LIBMACHOOK_ARM64"; do
@@ -431,10 +453,12 @@ if [ -d "$ROOTFS/System/Library" ]; then
 		# Re-seal the complete app with Ventura's native ad-hoc signer.  The
 		# operation is deterministic on the target and preserves the merged
 		# native/project entitlements plus identifier-only requirement.
+		MACWS_UTILITY_PROCESS=1 \
 		/var/jb/usr/macOS/bin/launchdchrootexec 0 0 "$ROOTFS" \
 			/usr/bin/codesign --force --sign - --timestamp=none \
 			--preserve-metadata=identifier,entitlements,requirements \
 			/usr/local/libexec/MacWSInteropService.app || exit 1
+		MACWS_UTILITY_PROCESS=1 \
 		/var/jb/usr/macOS/bin/launchdchrootexec 0 0 "$ROOTFS" \
 			/usr/bin/codesign --verify --strict --verbose=2 \
 			/usr/local/libexec/MacWSInteropService.app || exit 1
@@ -458,6 +482,8 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/System/Library/PrivateFrameworks/ViewBridge.framework/Versions/A/XPCServices/ViewBridgeAuxiliary.xpc/Contents/MacOS/ViewBridgeAuxiliary" || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/CoreServices/Dock.app/Contents/XPCServices/DockHelper.xpc/Contents/MacOS/DockHelper" || exit 1
+    ensure_chroot_application_signature \
+        "$ROOTFS/System/Library/CoreServices/sharedfilelistd" || exit 1
     # The project launchservicesd executable is a thin loader. Its already-
     # signed Ventura payload is dlopen'd before autosignd can run, so restore
     # that dylib's reboot-volatile CDHash as part of the same package closure.

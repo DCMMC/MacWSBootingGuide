@@ -40,6 +40,7 @@ extern OSStatus SecRequirementCreateWithString(
 extern OSStatus SecRequirementCreateWithData(
     CFDataRef data, SecCSFlags flags, SecRequirementRef *requirement);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+extern CFTypeID CGImageGetTypeID(void);
 
 static void macws_install_fsnode_root_volume_repair(void);
 static void macws_install_lsd_session_store_isolation(void);
@@ -47,6 +48,160 @@ static const char *macws_private_bootstrap_service_name(const char *name);
 static BOOL macws_macho_uuid_matches(const struct mach_header_64 *header,
                                      const uint8_t expected[16]);
 static void macws_schedule_maps_location_capability_adapter(void);
+static void macws_schedule_settings_symbol_raster_compatibility(void);
+
+// Steam's arm64 updater asks NSURL for
+// NSURLVolumeSupportsCaseSensitiveNamesKey and deliberately refuses to start
+// when the answer is true (RE-confirmed at steam_osx+0x2aaf0..+0x2ab18).
+// The macOS rootfs is case-sensitive, but Steam's own tree has no case-fold
+// collisions and the updater/game layout is designed for case-insensitive
+// macOS volumes. Scope the compatibility result to the two official Steam
+// trees: the outer /Applications bootstrap bundle and its updater-managed live
+// bundle below Application Support.  NSURL can expose the latter either as
+// the chroot-visible /Users/root path or as its bind-mounted iOS backing path
+// (/var/jb/var/root); Steam's startup alert runtime-confirmed that it uses the
+// latter spelling for this volume query.  All other resource values and every
+// other process retain CoreFoundation's real answer.
+static BOOL macws_process_is_steam(void) {
+    const char *program = getprogname();
+    if (program && (strcmp(program, "steam_osx") == 0 ||
+                    strcmp(program, "Steam Helper") == 0)) return YES;
+    char executable[PATH_MAX] = {0};
+    if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0) return NO;
+    return strstr(executable,
+                  "/Library/Application Support/Steam/") != NULL;
+}
+
+static BOOL macws_url_is_steam_storage(CFURLRef url) {
+    UInt8 path[PATH_MAX] = {0};
+    if (!url || !CFURLGetFileSystemRepresentation(
+            url, true, path, sizeof(path))) return NO;
+    static const char *const steamPrefixes[] = {
+        "/Applications/Steam.app",
+        "/Users/root/Library/Application Support/Steam",
+        "/var/jb/var/root/Library/Application Support/Steam",
+        "/private/var/jb/var/root/Library/Application Support/Steam",
+    };
+    for (size_t index = 0;
+         index < sizeof(steamPrefixes) / sizeof(steamPrefixes[0]); index++) {
+        size_t prefixLength = strlen(steamPrefixes[index]);
+        if (strncmp((const char *)path, steamPrefixes[index], prefixLength) ==
+                0 &&
+            (path[prefixLength] == '\0' || path[prefixLength] == '/'))
+            return YES;
+    }
+    // Runtime-confirmed: after checking the live bundle itself, Valve asks
+    // the same volume property on the nearest stable ancestor returned by
+    // its path canonicalizer.  These exact three spellings are that one
+    // Library directory inside/outside the chroot; do not generalize this to
+    // /, /var, or arbitrary Steam-process URLs.
+    static const char *const steamVolumeAncestors[] = {
+        "/Users/root/Library",
+        "/var/jb/var/root/Library",
+        "/private/var/jb/var/root/Library",
+    };
+    for (size_t index = 0;
+         index < sizeof(steamVolumeAncestors) /
+                     sizeof(steamVolumeAncestors[0]); index++) {
+        if (strcmp((const char *)path, steamVolumeAncestors[index]) == 0)
+            return YES;
+    }
+    return NO;
+}
+
+static BOOL (*macws_NSURL_getResourceValue_original)(
+    id, SEL, id *, id, id *) = NULL;
+static Boolean (*macws_CFURLCopyResourcePropertyForKey_original)(
+    CFURLRef, CFStringRef, CFTypeRef *, CFErrorRef *) = NULL;
+
+static BOOL macws_NSURL_getResourceValue(id self, SEL selector,
+                                         id *value, id key, id *error) {
+    BOOL result = macws_NSURL_getResourceValue_original
+        ? macws_NSURL_getResourceValue_original(
+              self, selector, value, key, error) : NO;
+    if (getenv("MACWS_STEAM_VOLUME_DIAGNOSTICS")) {
+        fprintf(stderr,
+                "[MacWSSteamVolume] NSURL query url=%s key=%s result=%d "
+                "steamProcess=%d steamStorage=%d\n",
+                [[self path] UTF8String] ?: "(nil)",
+                [key UTF8String] ?: "(nil)", result,
+                macws_process_is_steam(),
+                macws_url_is_steam_storage((__bridge CFURLRef)self));
+        fflush(stderr);
+    }
+    if (!result || !value || !key || !macws_process_is_steam() ||
+        ![key isEqualToString:NSURLVolumeSupportsCaseSensitiveNamesKey] ||
+        !macws_url_is_steam_storage((__bridge CFURLRef)self)) return result;
+    *value = @NO;
+    return YES;
+}
+
+static Boolean macws_CFURLCopyResourcePropertyForKey_steam(
+    CFURLRef url, CFStringRef key, CFTypeRef *value, CFErrorRef *error) {
+    Boolean result = macws_CFURLCopyResourcePropertyForKey_original
+        ? macws_CFURLCopyResourcePropertyForKey_original(
+              url, key, value, error) : false;
+    if (!result || !value || !key || !macws_process_is_steam() ||
+        !CFEqual(key, (__bridge CFStringRef)
+                       NSURLVolumeSupportsCaseSensitiveNamesKey) ||
+        !macws_url_is_steam_storage(url)) return result;
+    if (*value) CFRelease(*value);
+    *value = CFRetain(kCFBooleanFalse);
+    return true;
+}
+
+static void macws_install_steam_volume_compatibility(void) {
+    if (!macws_process_is_steam()) return;
+    // steam_osx build 1785799196 reaches the volume property through both the
+    // NSURL method and CoreFoundation's public C entry point during its two
+    // bootstrap phases. Hook the common provider while retaining its native
+    // result/error and replacing only this one value for Steam-owned storage.
+    void *resourceProvider = dlsym(
+        RTLD_DEFAULT, "CFURLCopyResourcePropertyForKey");
+    if (resourceProvider &&
+        resourceProvider != (void *)macws_CFURLCopyResourcePropertyForKey_steam)
+        MSHookFunction(
+            resourceProvider,
+            (void *)macws_CFURLCopyResourcePropertyForKey_steam,
+            (void **)&macws_CFURLCopyResourcePropertyForKey_original);
+    Class urlClass = objc_getClass("NSURL");
+    SEL selector = sel_registerName("getResourceValue:forKey:error:");
+    Method method = urlClass
+        ? class_getInstanceMethod(urlClass, selector) : NULL;
+    // Ventura annotates both out parameters in the runtime encoding
+    // (`B40@0:8o^@16@24o^@32`).  Qualifiers do not change the ABI; require
+    // the exact selector size instead of rejecting the annotated form.
+    const char *types = method ? method_getTypeEncoding(method) : NULL;
+    if (getenv("MACWS_STEAM_VOLUME_DIAGNOSTICS")) {
+        fprintf(stderr,
+                "[MacWSSteamVolume] install class=%p method=%p types=%s "
+                "cfProvider=%p\n",
+                urlClass, method, types ?: "(nil)", resourceProvider);
+        fflush(stderr);
+    }
+    if (!method || !types ||
+        (strcmp(types, "B40@0:8^@16@24^@32") != 0 &&
+         strcmp(types, "B40@0:8o^@16@24o^@32") != 0)) return;
+    IMP original = method_getImplementation(method);
+    if (!original || original == (IMP)macws_NSURL_getResourceValue) return;
+    macws_NSURL_getResourceValue_original =
+        (BOOL (*)(id, SEL, id *, id, id *))original;
+    method_setImplementation(method,
+                             (IMP)macws_NSURL_getResourceValue);
+}
+
+static BOOL macws_process_needs_settings_symbol_raster(void) {
+    const char *program = getprogname();
+    if (program && strcmp(program, "System Settings") == 0) return YES;
+    if (program && strcmp(program, "iconservicesagent") == 0) return YES;
+    char executable[PATH_MAX] = {0};
+    if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0) return NO;
+    return strcmp(executable,
+                  "/System/Applications/System Settings.app/Contents/MacOS/"
+                  "System Settings") == 0 ||
+           strcmp(executable,
+                  "/System/Library/CoreServices/iconservicesagent") == 0;
+}
 
 // Expensive observation must never ride along with the normal interactive
 // path. The launcher creates this sentinel before process start only when the
@@ -1248,6 +1403,133 @@ const char *SkyLightPath = "/System/Library/PrivateFrameworks/SkyLight.framework
 const char *QuartzCorePath = "/System/Library/Frameworks/QuartzCore.framework/Versions/A/QuartzCore";
 const char *libxpcPath = "/usr/lib/system/libxpc.dylib";
 const char *AGXMetalPath = "/System/Library/Extensions/AGXMetal13_3.bundle/Contents/MacOS/AGXMetal13_3";
+
+// Hide only the native WindowServer cursor sprite after the first validated
+// final composite. Host owns the visible touch/trackpad/Pencil affordance, but
+// macOS menu tracking still needs a real, moving global cursor position.
+//
+// RE-confirmed against the Ventura 13.4 SkyLight image at static
+// 0x1852172b0 (image offset 0x1322b0): CGXHideCursor(void) increments the
+// session hide count at session+0x78; on its 0->1 transition it calls
+// WS::Displays::CAManager()->set_cursor_hidden(true), rebuilds the session
+// cursor window and posts the standard cursor-hidden notification. Calling
+// the public CGDisplayHideCursor from macwsdisplayd returned success but did
+// not affect the chroot WindowServer's own session. Invoke the same verified
+// server-side operation only after the compositor has produced a real frame,
+// when CAWSManager/session state is initialized.
+static const struct mach_header *MacWSSkyLightHeader(void) {
+    static const struct mach_header *header;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        uint32_t imageCount = _dyld_image_count();
+        for (uint32_t index = 0; index < imageCount; index++) {
+            const char *name = _dyld_get_image_name(index);
+            if (name && strcmp(name, SkyLightPath) == 0) {
+                header = _dyld_get_image_header(index);
+                break;
+            }
+        }
+    });
+    return header;
+}
+
+static bool MacWSSkyLightCursorABIValid(
+        const struct mach_header *skyLightHeader) {
+    if (!skyLightHeader) return false;
+    enum { kCGXHideCursorOffset = 0x1322b0 };
+    const uint32_t expectedPrologue[] = {
+        0xd503237f, // pacibsp
+        0xd10103ff, // sub sp, sp, #0x40
+        0xa9024ff4, // stp x20, x19, [sp, #0x20]
+        0xa9037bfd, // stp x29, x30, [sp, #0x30]
+        0x9100c3fd, // add x29, sp, #0x30
+    };
+    const uint32_t *candidate = (const uint32_t *)(
+        (uintptr_t)skyLightHeader + kCGXHideCursorOffset);
+    return memcmp(candidate, expectedPrologue,
+                  sizeof(expectedPrologue)) == 0;
+}
+
+static uint64_t MacWSSkyLightCursorHideCount(
+        const struct mach_header *skyLightHeader) {
+    if (!MacWSSkyLightCursorABIValid(skyLightHeader)) return 0;
+    // RE-confirmed in CGXHideCursor+0x14..+0x40 and
+    // CGXShowCursor+0x24..+0x50 in Ventura 13.4 SkyLight: the image global at
+    // static 0x1d8bcd460 is WS::Globals*, +0x20 is CGXSession*, +0x108 is the
+    // cursor session state, and +0x78 is the balanced hide count. This lets the
+    // Host policy remain idempotent: repeated frame checks never inflate the
+    // native count, while a later application ShowCursor transition back to
+    // zero is repaired on the next completed composite.
+    enum { kWSGlobalsPointerOffset = 0x53ae8460 };
+    uintptr_t globalsPointerAddress = (uintptr_t)skyLightHeader +
+        kWSGlobalsPointerOffset;
+    uintptr_t globals = *(const uintptr_t *)globalsPointerAddress;
+    if (!globals) return 0;
+    uintptr_t session = *(const uintptr_t *)(globals + 0x20);
+    if (!session) return 0;
+    uintptr_t cursorState = *(const uintptr_t *)(session + 0x108);
+    if (!cursorState) return 0;
+    return *(const uint64_t *)(cursorState + 0x78);
+}
+
+static void MacWSHideNativeCursorOnMainThread(void) {
+    // Runtime-confirmed by WindowServer-2026-08-13-011147.ips and
+    // WindowServer-2026-08-13-011209.ips: CGXHideCursor reached
+    // post_notification -> write_datagram from
+    // com.macwsguide.vnc-completion-observer and asserted
+    // pthread_main_np().  This is a SkyLight session mutation, so its whole
+    // transaction must run on WindowServer's main queue.
+    if (!pthread_main_np()) return;
+
+    const struct mach_header *skyLightHeader = MacWSSkyLightHeader();
+    if (!skyLightHeader) {
+        fprintf(stderr,
+                "#### MACWS CURSOR-HIDE rejected: SkyLight image missing\n");
+        return;
+    }
+    if (MacWSSkyLightCursorHideCount(skyLightHeader) != 0) return;
+    enum { kCGXHideCursorOffset = 0x1322b0 };
+    const uint32_t *candidate = (const uint32_t *)(
+        (uintptr_t)skyLightHeader + kCGXHideCursorOffset);
+    if (!MacWSSkyLightCursorABIValid(skyLightHeader)) {
+        fprintf(stderr,
+                "#### MACWS CURSOR-HIDE rejected: SkyLight signature "
+                "mismatch at %p\n", candidate);
+        return;
+    }
+    typedef void (*MacWSCGXHideCursor)(void);
+    MacWSCGXHideCursor hideCursor = (MacWSCGXHideCursor)candidate;
+    hideCursor();
+    fprintf(stderr,
+            "#### MACWS CURSOR-HIDE applied via RE-verified CGXHideCursor "
+            "at %p\n", candidate);
+}
+
+void MacWSHideNativeCursorAfterFirstComposite(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "WindowServer") != 0) return;
+    const struct mach_header *skyLightHeader = MacWSSkyLightHeader();
+    if (!MacWSSkyLightCursorABIValid(skyLightHeader)) return;
+    if (skyLightHeader &&
+        MacWSSkyLightCursorHideCount(skyLightHeader) != 0) return;
+    // This is called after every validated final-composite observation. At
+    // most one main-queue repair may be pending, but the gate re-arms after
+    // each check so an application's later ShowCursor can be corrected.
+    static _Atomic bool scheduled = false;
+    bool expectedScheduled = false;
+    if (!atomic_compare_exchange_strong_explicit(
+            &scheduled, &expectedScheduled, true,
+            memory_order_acq_rel, memory_order_acquire)) return;
+    if (pthread_main_np()) {
+        MacWSHideNativeCursorOnMainThread();
+        atomic_store_explicit(&scheduled, false, memory_order_release);
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            MacWSHideNativeCursorOnMainThread();
+            atomic_store_explicit(&scheduled, false, memory_order_release);
+        });
+    }
+}
 
 // Private malloc zone for synth-buffer scratch (ivar+0x30) — Mempool freelist
 // target. AGX driver writes its own sentinels (e.g. 0x1) into this buffer for
@@ -2651,6 +2933,168 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
     });
 }
 
+// Ventura's IconFoundation first resolves a private Settings symbol to a real
+// CUINamedVectorGlyph, then asks CoreUI for a graphic variant.  On this iPad
+// runtime the latter's rasterizer returns nil even though the source glyph's
+// rasterizer returns a valid CGImage.  This is runtime-confirmed with the stock
+// `appearance` recipe; catalog lookup and graphicVariantWithOptions: both
+// succeed, and failure begins at
+// -[_CUIGraphicVariantVectorGlyph rasterizeImageUsingScaleFactor:forTargetSize:].
+//
+// Preserve IconFoundation's full path first.  Only when it returns nil for an
+// ISGraphicSymbolResource do we rasterize the already-resolved source glyph
+// and wrap that CGImage in IconFoundation's IFImage container.
+// This keeps real Settings artwork and dimensions; it is a narrow CPU-backed
+// compatibility fallback for an unsupported CoreUI graphic-variant renderer,
+// not a success-forcing or placeholder-image patch.
+static id (*g_macws_orig_settings_symbol_image)(id, SEL, CGSize, double);
+static __thread BOOL g_macws_rendering_settings_symbol;
+static id g_macws_settings_private_symbol_catalog;
+static id g_macws_settings_public_symbol_catalog;
+
+static id macws_settings_symbol_image(id self, SEL selector,
+                                      CGSize size, double scale) {
+    id image = g_macws_orig_settings_symbol_image
+        ? g_macws_orig_settings_symbol_image(self, selector, size, scale)
+        : nil;
+    // IFSymbol's source-glyph lookup may consult another
+    // ISGraphicSymbolResource.  Let that nested lookup use Apple's original
+    // result; only the outer request owns the compatibility rasterization.
+    if (g_macws_rendering_settings_symbol) return image;
+    SEL cgImageSelector = sel_registerName("CGImage");
+    void *originalCGImage = image &&
+            [image respondsToSelector:cgImageSelector]
+        ? ((void *(*)(id, SEL))objc_msgSend)(image, cgImageSelector)
+        : NULL;
+    // Runtime-confirmed on iOS 16.3/macOS 13.4: the stock method can return
+    // a non-nil ISImage whose CGImage is nil after CoreUI's private graphic-
+    // variant rasterizer fails.  Treat that object as a failed render, while
+    // preserving every original image that actually owns displayable pixels.
+    if (image && originalCGImage) {
+        return image;
+    }
+    if (!self) {
+        return image;
+    }
+
+    id descriptor = nil;
+    id symbolName = nil;
+    Ivar descriptorIvar = class_getInstanceVariable(
+        object_getClass(self), "_descriptor");
+    Ivar symbolNameIvar = class_getInstanceVariable(
+        object_getClass(self), "_symbolName");
+    descriptor = descriptorIvar ? object_getIvar(self, descriptorIvar) : nil;
+    symbolName = symbolNameIvar ? object_getIvar(self, symbolNameIvar) : nil;
+    Class symbolClass = objc_getClass("IFSymbol");
+    if (!descriptor || !symbolName || !symbolClass) {
+        return nil;
+    }
+
+    g_macws_rendering_settings_symbol = YES;
+
+    SEL namedGlyphSelector = sel_registerName(
+        "namedVectorGlyphWithName:scaleFactor:deviceIdiom:layoutDirection:"
+        "glyphSize:glyphWeight:glyphPointSize:appearanceName:");
+    NSUInteger layoutDirection = [descriptor respondsToSelector:
+            sel_registerName("layoutDirection")]
+        ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+              descriptor, sel_registerName("layoutDirection")) : 0;
+    NSUInteger glyphSize = [descriptor respondsToSelector:
+            sel_registerName("symbolSize")]
+        ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+              descriptor, sel_registerName("symbolSize")) : 0;
+    NSInteger glyphWeight = [descriptor respondsToSelector:
+            sel_registerName("symbolWeight")]
+        ? ((NSInteger (*)(id, SEL))objc_msgSend)(
+              descriptor, sel_registerName("symbolWeight")) : 0;
+    double pointSize = [descriptor respondsToSelector:
+            sel_registerName("pointSize")]
+        ? ((double (*)(id, SEL))objc_msgSend)(
+              descriptor, sel_registerName("pointSize"))
+        : fmax(size.width, size.height);
+    id vectorGlyph = nil;
+    const id catalogs[] = {g_macws_settings_private_symbol_catalog,
+                           g_macws_settings_public_symbol_catalog};
+    for (NSUInteger index = 0; index < 2 && !vectorGlyph; index++) {
+        id catalog = catalogs[index];
+        if (!catalog || ![catalog respondsToSelector:namedGlyphSelector])
+            continue;
+        vectorGlyph = ((id (*)(id, SEL, id, double, NSUInteger, NSUInteger,
+                                NSUInteger, NSInteger, double, id))
+                           objc_msgSend)(
+            catalog, namedGlyphSelector, symbolName, scale, 0,
+            layoutDirection, glyphSize, glyphWeight, pointSize, nil);
+    }
+    SEL rasterSelector = sel_registerName(
+        "rasterizeImageUsingScaleFactor:forTargetSize:");
+    if (!vectorGlyph || ![vectorGlyph respondsToSelector:rasterSelector]) {
+        g_macws_rendering_settings_symbol = NO;
+        return nil;
+    }
+    id raster = ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
+        vectorGlyph, rasterSelector, scale, size);
+    // CUINamedVectorGlyph's rasterizer returns a CGImageRef directly on the
+    // Ventura 13.4 runtime (runtime probe class=__NSCFType and
+    // CFGetTypeID==CGImageGetTypeID), not an Objective-C wrapper exposing a
+    // -CGImage selector. Accept both runtime shapes.
+    void *cgImage = raster &&
+            CFGetTypeID((__bridge CFTypeRef)raster) == CGImageGetTypeID()
+        ? (__bridge void *)raster
+        : raster && [raster respondsToSelector:cgImageSelector]
+            ? ((void *(*)(id, SEL))objc_msgSend)(raster, cgImageSelector)
+            : NULL;
+    Class imageClass = objc_getClass("IFImage");
+    SEL imageInitializer = sel_registerName("initWithCGImage:scale:");
+    id fallback = imageClass && cgImage
+        ? ((id (*)(id, SEL, void *, double))objc_msgSend)(
+              ((id (*)(id, SEL))objc_msgSend)(imageClass, @selector(alloc)),
+              imageInitializer, cgImage, scale)
+        : nil;
+    g_macws_rendering_settings_symbol = NO;
+    if (fallback && macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS SETTINGS symbol raster fallback name=%s "
+                "size=%.1fx%.1f scale=%.1f\n",
+                [symbolName UTF8String], size.width, size.height, scale);
+    }
+    return fallback;
+}
+
+static void macws_install_settings_symbol_raster_compatibility(void) {
+    if (!macws_process_needs_settings_symbol_raster()) return;
+    Class resourceClass = objc_getClass("ISGraphicSymbolResource");
+    SEL selector = sel_registerName("imageForSize:scale:");
+    Method method = resourceClass
+        ? class_getInstanceMethod(resourceClass, selector) : NULL;
+    if (!method || g_macws_orig_settings_symbol_image) return;
+    Class symbolClass = objc_getClass("IFSymbol");
+    const SEL privateCatalogSelector =
+        sel_registerName("coreGlyphsPrivateCatalog");
+    const SEL publicCatalogSelector = sel_registerName("coreGlyphsCatalog");
+    if (!g_macws_settings_private_symbol_catalog && symbolClass &&
+        [symbolClass respondsToSelector:privateCatalogSelector]) {
+        g_macws_settings_private_symbol_catalog =
+            ((id (*)(id, SEL))objc_msgSend)(symbolClass,
+                                            privateCatalogSelector);
+    }
+    if (!g_macws_settings_public_symbol_catalog && symbolClass &&
+        [symbolClass respondsToSelector:publicCatalogSelector]) {
+        g_macws_settings_public_symbol_catalog =
+            ((id (*)(id, SEL))objc_msgSend)(symbolClass,
+                                            publicCatalogSelector);
+    }
+    g_macws_orig_settings_symbol_image =
+        (id (*)(id, SEL, CGSize, double))method_setImplementation(
+            method, (IMP)macws_settings_symbol_image);
+}
+
+static void macws_schedule_settings_symbol_raster_compatibility(void) {
+    if (!macws_process_needs_settings_symbol_raster()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        macws_install_settings_symbol_raster_compatibility();
+    });
+}
+
 // Ventura Maps opts the shared MKLocationManager into Mac CoreWLAN monitoring
 // immediately before creating the singleton:
 //
@@ -3248,6 +3692,10 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         strstr(info.dli_fname,
                "/UniformTypeIdentifiers.framework/") != NULL) {
         macws_schedule_uttype_coretypes_compatibility();
+    }
+    if (info.dli_fname &&
+        strstr(info.dli_fname, "/IconServices.framework/") != NULL) {
+        macws_schedule_settings_symbol_raster_compatibility();
     }
     if (info.dli_fname &&
         strstr(info.dli_fname, "/MapKit.framework/") != NULL) {
@@ -8397,6 +8845,16 @@ static void macws_install_target_feature_flag_compatibility(void) {
 }
 
 __attribute__((constructor)) void InitStuff() {
+    // Package provisioning occasionally needs a macOS command-line utility
+    // (currently Ventura's native codesign) inside the chroot.  It consumes
+    // the syscall/dyld interposes exported by this library, but has no GUI,
+    // Metal, input, or JIT work.  Requiring autosignd to grant CS_DEBUGGED to
+    // that short-lived process made a cold dpkg configure fail before the
+    // trust closure could be restored.  The caller marks only that utility
+    // process; its normal validation and exit status remain authoritative.
+    const char *utility_process = getenv("MACWS_UTILITY_PROCESS");
+    if (utility_process && strcmp(utility_process, "1") == 0) return;
+
     // VS Code 1.130 marks both its login shell and the Electron-as-Node
     // environment printer with this exact value.  Runtime-confirmed: running
     // the normal GUI/JIT initialization in the printer aborts while reserving
@@ -8426,6 +8884,7 @@ __attribute__((constructor)) void InitStuff() {
     }
     EnableJIT();
     macws_install_target_feature_flag_compatibility();
+    macws_install_steam_volume_compatibility();
     // Settings extensions carry libmachook through a bundle-local load command.
     // Retry their ExtensionFoundation/LaunchServices boundary only after the
     // post-exec process has CS_DEBUGGED, so both Objective-C class availability
@@ -8525,6 +8984,12 @@ __attribute__((constructor)) void InitStuff() {
     }
 
     _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))loadImageCallback);
+
+    // IconServices is part of System Settings' initial dyld closure.  Install
+    // synchronously here: its SwiftUI sidebar requests every image before the
+    // first main-queue turn, so an async-only install observes no calls.
+    macws_install_settings_symbol_raster_compatibility();
+    macws_schedule_settings_symbol_raster_compatibility();
 
     // Existing-image callbacks may have queued the Maps adapter while ObjC
     // registration was still unwinding. At constructor time the dependency
@@ -8944,6 +9409,23 @@ int getaudit_addr_new(auditinfo_addr_t *auditinfo_addr, u_int length) {
 void *mmap_new(void *address, size_t size, int protection, int flags, int fd,
                off_t offset) {
     void *result = mmap(address, size, protection, flags, fd, offset);
+    if (getenv("MACWS_STEAM_VA_DIAGNOSTICS") &&
+        size >= (1ULL << 30)) {
+        int saved_error = errno;
+        void *caller = __builtin_return_address(0);
+        Dl_info image = {0};
+        dladdr(caller, &image);
+        fprintf(stderr,
+                "[MacWSSteamVA] mmap hint=%p size=%#zx prot=%#x flags=%#x "
+                "fd=%#x result=%p errno=%d caller=%p image=%s offset=%#llx\n",
+                address, size, protection, flags, fd, result,
+                result == MAP_FAILED ? saved_error : 0, caller,
+                image.dli_fname ?: "(unknown)",
+                (unsigned long long)(image.dli_fbase
+                    ? (uintptr_t)caller - (uintptr_t)image.dli_fbase : 0));
+        fflush(stderr);
+        errno = saved_error;
+    }
     if (!macws_jit_mprotect_compat_enabled() ||
         (flags & MAP_JIT) == 0 || result != MAP_FAILED || errno != EINVAL) {
         return result;
@@ -10235,6 +10717,8 @@ extern kern_return_t bootstrap_check_in3(mach_port_t bp, const char *name,
 // descriptor and never changes the requested service or its result.
 static void macws_trace_xpc_name(const char *transport, const char *name) {
     if (!name || !getenv("MACWS_XPC_NAME_TRACE")) return;
+    const char *filter = getenv("MACWS_XPC_NAME_TRACE_FILTER");
+    if (filter && filter[0] && !strcasestr(name, filter)) return;
     static _Thread_local bool tracing = false;
     static _Atomic unsigned int recordCount = 0;
     if (tracing) return;
