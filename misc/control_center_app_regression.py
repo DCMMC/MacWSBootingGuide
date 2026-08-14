@@ -137,7 +137,8 @@ def test_app(remote, app, output, timeout):
             ).strip() == "0"
             live = process_is_live(remote, pid)
             scene = bool(re.search(
-                rf"(?:fullscreen-focus-reconciled|window-auto-scene|pending-window).*"
+                rf"(?:fullscreen-focus-reconciled|window-auto-scene|"
+                rf"launch-auto-window|pending-window).*"
                 rf"pid={pid}\b", host_delta))
             if metrics and input_socket and live and scene:
                 break
@@ -150,7 +151,8 @@ def test_app(remote, app, output, timeout):
     screenshot_file.write_bytes(screenshot)
     elapsed = time.monotonic() - began
     scene = bool(pid > 1 and re.search(
-        rf"(?:fullscreen-focus-reconciled|window-auto-scene|pending-window).*"
+        rf"(?:fullscreen-focus-reconciled|window-auto-scene|"
+        rf"launch-auto-window|pending-window).*"
         rf"pid={pid}\b", host_delta))
     process_live = process_is_live(remote, pid)
     result = {

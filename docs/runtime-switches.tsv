@@ -52,7 +52,7 @@ env	MACWS_AGX_RENAMER_PATCH	off	legacy diagnostic	Superseded AIR renamer patch.
 env	MACWS_AGX_STRIP_OPEN_OPTIONS	off	A/B control	IOServiceOpen option mutation.
 env	MACWS_AGX_TEX_BYPASS_GATE	off	diagnostic scaffold	Texture gate bypass.
 env	MACWS_AGX_ZERO_QUEUE_ARGS	off	disproved experiment	Zeroes command-queue arguments.
-env	MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT	on	VS Code,Chrome	Narrow Chromium task-policy compatibility.
+env	MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT	on	VS Code,Chrome,Steam	Narrow Chromium task-policy compatibility; covers newer __mac_syscall and CEF 126 __sandbox_ms entry points.
 env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settlement; not enabled for benchmarks.
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
@@ -107,7 +107,7 @@ env	MACWS_DISABLE_STEAM_PROCESS_COMPAT	off	Steam A/B diagnostic	Disables the exa
 env	MACWS_STEAM_EXIT_DIAGNOSTICS	off	Steam diagnostic	Installs bounded top-level Helper exit backtraces; never enabled in production.
 env	MACWS_STEAM_EXIT_STOP	off	Steam diagnostic	Stops the top-level Helper at an observed exit for LLDB attachment.
 env	MACWS_STEAM_LAUNCH_EPOCH	transient	Steam launch transaction	Identifies one outer bootstrap/live-client family so hostd resets its semaphore namespace exactly once.
-env	MACWS_STEAM_NATIVE_BROWSER_LAUNCH	on	Steam	Preserves Valve's top-level WebUI transport fork while atomically spawning Chromium descendants.
+env	MACWS_STEAM_NATIVE_BROWSER_LAUNCH	off	removed Steam diagnostic	Native top-level WebUI fork crashes in the Network/XPC atfork child; production uses the atomic spawn adapter.
 env	MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS	off	Steam diagnostic	Leaves the top-level Helper's native fault visible to CrashReporter/LLDB during an explicit diagnostic.
 env	MACWS_STEAM_PIPE_DIAGNOSTICS	off	Steam diagnostic	Records bounded steam.pipe syscalls without changing results.
 env	MACWS_STEAM_PROCESS_DIAGNOSTICS	off	Steam diagnostic	Records exact Valve process-adapter decisions and child argv.

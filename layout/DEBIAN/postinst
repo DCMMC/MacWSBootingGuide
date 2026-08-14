@@ -27,6 +27,7 @@ APPEARANCE_ENTITLEMENTS=/var/jb/usr/macOS/bin/appearance-extension-entitlements.
 CORELOCATIONAGENT_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/corelocationagent-native-entitlements.plist
 LOCATIOND_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/locationd-native-entitlements.plist
 GEOD_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/geod-native-entitlements.plist
+DISKARBITRATIOND_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/diskarbitrationd-native-entitlements.plist
 INTEROP_LOCATION_ENTITLEMENTS=/var/jb/usr/macOS/bin/interop-location-entitlements.plist
 CODE_REQUIREMENT_WRITER=/var/jb/usr/macOS/bin/write_code_requirement.py
 LIPO=/var/jb/usr/bin/lipo
@@ -525,6 +526,11 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$GEOD_NATIVE_ENTITLEMENTS" \
         '<key>com.apple.private.network.socket-delegate</key>' \
         'com.apple.geod' || exit 1
+    ensure_chroot_native_service_signature \
+        "$ROOTFS/usr/libexec/diskarbitrationd" \
+        "$DISKARBITRATIOND_NATIVE_ENTITLEMENTS" \
+        '<key>com.apple.private.security.disk-device-access</key>' \
+        'com.apple.diskarbitrationd' || exit 1
     # cfprefsd is launched before autosignd can help.  Keep the stock image
     # untouched and install a private copy with its proven minimal profile;
     # the generic project profile's system-container entitlement is invalid in

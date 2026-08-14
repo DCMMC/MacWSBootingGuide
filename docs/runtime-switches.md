@@ -87,10 +87,14 @@ variables. `MallocScribble` is explicitly forbidden.
   plane, keeping video in the AGX-composited scanout captured by MacWS/VNC.
   The exact adapter writes that real field using a verified two-instruction
   dataflow rewrite; it does not install a per-frame function trampoline.
-- Steam's on-demand job enables `MACWS_STEAM_NATIVE_BROWSER_LAUNCH=1` plus the
-  same production W^X adapters used by Chromium. Valve's top-level browser
-  keeps its WebUI transport contract; renderer/network/GPU descendants use the
-  atomic process adapter. Steam's `/BSem`, `/Evt` and `/MTX` POSIX names are
+- Steam's on-demand job enables `MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT=1`
+  plus the same production W^X adapters used by Chromium. The iOS kernel
+  returns `ENOSYS` for CEF 126's `__sandbox_ms("AMFI", 0x60, ...)` query even
+  though task ports are hard-immovable; the exact compatibility result makes
+  Chromium use its native no-task-port path. Valve's top-level browser and its
+  renderer/network/GPU descendants use atomic `posix_spawn` launch paths, so
+  neither the fatal Network/XPC `fork` child nor guarded task-port transfer is
+  reached. Steam's `/BSem`, `/Evt` and `/MTX` POSIX names are
   backed by hostd-issued generations and flock/vnode notification state, so
   `sem_unlink` plus same-name recreation cannot alias an old Helper handle.
   `MACWS_STEAM_LAUNCH_EPOCH` is generated once by the packaged launch script

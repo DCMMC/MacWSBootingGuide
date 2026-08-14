@@ -45,9 +45,12 @@
              page-granular RW/RX compatibility path. -->
         <key>MACWS_JIT_MPROTECT_COMPAT</key><string>1</string>
         <key>MACWS_JIT_FAULT_WRITE_COMPAT</key><string>1</string>
-        <!-- The top-level WebUI helper needs Valve's inherited transport FDs;
-             its Chromium descendants still use the atomic spawn adapter. -->
-        <key>MACWS_STEAM_NATIVE_BROWSER_LAUNCH</key><string>1</string>
+        <!-- Chromium 126 imports __sandbox_ms("AMFI", 0x60, ...), which the
+             iOS kernel reports as ENOSYS even though its task ports are
+             hard-immovable. Expose that exact policy so Chromium takes its
+             built-in no-task-port path instead of sending mach_task_self()
+             and receiving EXC_GUARD/ILLEGAL_MOVE. -->
+        <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key><string>1</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

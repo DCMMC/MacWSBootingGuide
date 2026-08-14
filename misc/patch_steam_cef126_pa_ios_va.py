@@ -34,6 +34,10 @@ EXPECTED_INPUT_SHA256S = {
     # instruction manifests below still verify every transformed site, so this
     # admits only the known signature-container variant, not arbitrary CEF 126.
     "2072fe50e4d6e0fcf7b928fc1e50783e21ea1299de441a5810bfe5c451dc5b3f",
+    # Arm64 slice extracted from Valve's macos-signed-2 universal package for
+    # the same build.  The UUID and the complete 54,310-instruction manifest
+    # below were independently revalidated before admitting this container.
+    "343e02d60ca848927c031eea73f8a938e8e376d6a12fb08cdb0b9fc7b7bc9d5f",
 }
 
 OLD_POOL_BASE_MASK = 0xFFFFFFFC00000000  # ~(16 GiB - 1)

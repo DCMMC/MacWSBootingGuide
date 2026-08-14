@@ -89,7 +89,9 @@ else
     # WindowServer reject the exact current metallib. FAST is already scoped
     # to libmachook, so make every translation unit newer than its object and
     # rebuild this one library deterministically; packaging remains skipped.
-    find libmachook -maxdepth 1 -type f \
+    find libmachook \
+        \( -path 'libmachook/.theos' -o -path 'libmachook/.theos/*' \) \
+            -prune -o -type f \
         \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.x' \) \
         -exec touch {} +
     echo "==> FAST invariant: refreshed all libmachook source mtimes"

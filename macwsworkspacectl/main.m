@@ -16,6 +16,52 @@
 
 extern char **environ;
 
+typedef CFTypeRef (*MacWSLSSharedFileListCreateFn)(
+    CFAllocatorRef, CFStringRef, CFTypeRef);
+typedef CFArrayRef (*MacWSLSSharedFileListCopySnapshotFn)(CFTypeRef, UInt32 *);
+
+static int SharedFileListReady(void) {
+    MacWSLSSharedFileListCreateFn createList =
+        (MacWSLSSharedFileListCreateFn)dlsym(
+            RTLD_DEFAULT, "LSSharedFileListCreate");
+    MacWSLSSharedFileListCopySnapshotFn copySnapshot =
+        (MacWSLSSharedFileListCopySnapshotFn)dlsym(
+            RTLD_DEFAULT, "LSSharedFileListCopySnapshot");
+    CFStringRef *recentDocuments = (CFStringRef *)dlsym(
+        RTLD_DEFAULT, "kLSSharedFileListRecentDocumentItems");
+    if (!createList || !copySnapshot || !recentDocuments ||
+        !*recentDocuments) {
+        fprintf(stderr,
+                "macwsworkspacectl: SharedFileList SPI unavailable "
+                "(create=%s snapshot=%s list=%s)\n",
+                createList ? "yes" : "no",
+                copySnapshot ? "yes" : "no",
+                recentDocuments && *recentDocuments ? "yes" : "no");
+        return 69;
+    }
+
+    CFTypeRef list = createList(kCFAllocatorDefault, *recentDocuments, NULL);
+    if (!list) {
+        fprintf(stderr,
+                "macwsworkspacectl: recent-document list creation failed\n");
+        return 1;
+    }
+    UInt32 seed = 0;
+    CFArrayRef snapshot = copySnapshot(list, &seed);
+    if (!snapshot) {
+        CFRelease(list);
+        fprintf(stderr,
+                "macwsworkspacectl: recent-document snapshot failed\n");
+        return 1;
+    }
+    CFIndex count = CFArrayGetCount(snapshot);
+    fprintf(stdout, "shared-file-list-ready items=%ld seed=%u\n",
+            (long)count, seed);
+    CFRelease(snapshot);
+    CFRelease(list);
+    return 0;
+}
+
 static int SetWallpaper(const char *pathBytes) {
     NSString *path = [NSString stringWithUTF8String:pathBytes ?: ""];
     if (path.length == 0 || ![[NSFileManager defaultManager]
@@ -1033,6 +1079,9 @@ int main(int argc, const char *argv[]) {
         if (argc == 2 && strcmp(argv[1], "session-status") == 0) {
             return SessionStatus();
         }
+        if (argc == 2 && strcmp(argv[1], "shared-file-list-ready") == 0) {
+            return SharedFileListReady();
+        }
         if (argc == 3 && strcmp(argv[1], "activate-process") == 0) {
             return ActivateProcess(argv[2]);
         }
@@ -1055,6 +1104,7 @@ int main(int argc, const char *argv[]) {
                 "repair-launchservices-catalog | "
                 "register-settings-extensions | "
                 "verify-launchservices-catalog | "
+                "shared-file-list-ready | "
                 "open-application /absolute/App.app | "
                 "session-status | activate-process PID | list-windows PID | "
                 "reopen-process PID | inspect-appkit-reopen | "

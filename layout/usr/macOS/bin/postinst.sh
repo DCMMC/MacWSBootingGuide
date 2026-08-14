@@ -20,6 +20,7 @@ APPEARANCE_ENT="/var/jb/usr/macOS/bin/appearance-extension-entitlements.plist"
 CORELOCATIONAGENT_NATIVE_ENT="/var/jb/usr/macOS/bin/corelocationagent-native-entitlements.plist"
 LOCATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/locationd-native-entitlements.plist"
 GEOD_NATIVE_ENT="/var/jb/usr/macOS/bin/geod-native-entitlements.plist"
+DISKARBITRATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/diskarbitrationd-native-entitlements.plist"
 INTEROP_LOCATION_ENT="/var/jb/usr/macOS/bin/interop-location-entitlements.plist"
 CODE_REQUIREMENT_WRITER="/var/jb/usr/macOS/bin/write_code_requirement.py"
 ASPHALT_CA_INTERMEDIATE="/var/jb/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem"
@@ -884,6 +885,11 @@ add_all_trustcache '/var/mnt/rootfs/System/Applications/Utilities/Activity Monit
 # changing the signed file and accumulating obsolete trustcache entries.
 FINDER_BIN='/var/mnt/rootfs/System/Library/CoreServices/Finder.app/Contents/MacOS/Finder'
 ensure_project_signature_and_trustcache "$FINDER_BIN" || exit 1
+sign_and_trustcache_merging_native_entitlements \
+    '/var/mnt/rootfs/usr/libexec/diskarbitrationd' \
+    "$DISKARBITRATIOND_NATIVE_ENT" \
+    '<key>com.apple.private.security.disk-device-access</key>' \
+    'com.apple.diskarbitrationd' || exit 1
 # The chroot has no loginwindow trust/bootstrap handoff. These are direct
 # outer-launchd targets, so each top-level executable must already satisfy the
 # same project signing policy before libmachook/autosignd can run. Their stock

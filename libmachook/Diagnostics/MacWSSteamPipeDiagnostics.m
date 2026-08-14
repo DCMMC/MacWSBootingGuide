@@ -90,6 +90,11 @@ static bool MacWSIsTopLevelSteamHelperForNativeException(void) {
     return true;
 }
 
+static bool MacWSIsAnySteamHelper(void) {
+    const char *program = getprogname();
+    return program && strcmp(program, "Steam Helper") == 0;
+}
+
 static kern_return_t MacWSSteamDiagnosticTaskSetExceptionPorts(
     task_t task, exception_mask_t mask, mach_port_t newPort,
     exception_behavior_t behavior, thread_state_flavor_t flavor) {
@@ -191,7 +196,7 @@ static void MacWSSteamCapitalExit(int status) {
 __attribute__((constructor))
 static void MacWSInstallSteamExitDiagnostics(void) {
     if (!getenv("MACWS_STEAM_EXIT_DIAGNOSTICS") ||
-        !MacWSIsTopLevelSteamHelperForNativeException()) return;
+        !MacWSIsAnySteamHelper()) return;
     atexit(MacWSSteamExitDiagnostics);
     void *exitTarget = dlsym(RTLD_DEFAULT, "exit");
     void *underscoreExitTarget = dlsym(RTLD_DEFAULT, "_exit");

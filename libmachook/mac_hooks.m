@@ -28,6 +28,7 @@
 #include <execinfo.h>
 #import "macws_host_protocol.h"
 #import "macws_control_protocol.h"
+#import "macws_steam_mach_rendezvous_protocol.h"
 
 // These macOS code-signing entry points are present in the iPadOS shared
 // cache and used by Ventura's CoreLocationAgent, but the iPhoneOS SDK omits
@@ -286,6 +287,12 @@ static bool macws_jit_trace_enabled(void) {
     return macws_runtime_diagnostics_enabled() ||
         getenv("MACWS_JIT_MPROTECT_TRACE") != NULL;
 }
+
+// mach_vm_map participates in libSystem's own allocation bootstrap, before
+// getenv's internal environment lock exists.  Interposed VM entry points must
+// remain allocation- and environment-independent until our constructor has
+// started running.
+static _Atomic bool g_macws_libsystem_runtime_ready = false;
 
 static bool macws_kcmd_fix_enabled(void) {
     static _Atomic int cached = -1;
@@ -8845,6 +8852,8 @@ static void macws_install_target_feature_flag_compatibility(void) {
 }
 
 __attribute__((constructor)) void InitStuff() {
+    atomic_store_explicit(&g_macws_libsystem_runtime_ready, true,
+                          memory_order_release);
     // Package provisioning occasionally needs a macOS command-line utility
     // (currently Ventura's native codesign) inside the chroot.  It consumes
     // the syscall/dyld interposes exported by this library, but has no GUI,
@@ -9069,30 +9078,50 @@ int sysctlbyname_new(const char *name, void *oldp, size_t *oldlenp, void *newp, 
 
 extern int __mac_syscall(const char *policy, int operation, void *argument);
 extern int csr_get_active_config(uint32_t *configuration);
-int __mac_syscall_new(const char *policy, int operation, void *argument) {
-    // Chromium 148 queries this macOS AMFI policy specifically to decide
+static bool macws_amfi_immovable_task_port_compat(
+        const char *entryPoint, const char *policy, int operation,
+        void *argument) {
+    // Chromium queries this macOS AMFI policy specifically to decide
     // whether child task-control ports are movable.  The iOS 16.3 kernel
-    // returns ENOSYS for the macOS policy operation, while its task control
-    // ports are in fact hard-immovable.  Chromium treats query failure as
-    // "movable" and asks every helper to MOVE_SEND mach_task_self(), which the
-    // kernel terminates with EXC_GUARD/ILLEGAL_MOVE.
+    // returns ENOSYS through both exported entry points without writing the
+    // status word, while its task control ports are in fact hard-immovable.
+    // Chromium 126 imports __sandbox_ms; newer Chromium imports
+    // __mac_syscall.  A failed query makes both versions request every
+    // helper's mach_task_self(), which the kernel terminates with
+    // EXC_GUARD/ILLEGAL_MOVE.
     //
     // Report the equivalent `amfi_get_out_of_my_way` bit so Chromium uses its
     // own documented no-task-port fallback (crbug.com/1291789).  This is a
     // narrow system-policy compatibility result, not a mach_msg rewrite or a
     // guard bypass.  Keep it opt-in for macOS applications that need it.
-    if (getenv("MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT") && policy && argument &&
-        strcmp(policy, "AMFI") == 0 && operation == 0x60) {
-        *(uint64_t *)argument = 1ULL << 2;
-        static _Atomic bool logged = false;
-        if (!atomic_exchange_explicit(&logged, true, memory_order_relaxed)) {
-            fprintf(stderr,
-                "#### AMFI-POLICY-COMPAT policy=AMFI op=0x60 status=0x4 "
-                "(iOS task ports are hard-immovable)\n");
-        }
-        return 0;
+    if (!getenv("MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT") || !policy ||
+        !argument || strcmp(policy, "AMFI") != 0 || operation != 0x60)
+        return false;
+
+    *(uint64_t *)argument = 1ULL << 2;
+    static _Atomic bool logged = false;
+    if (!atomic_exchange_explicit(&logged, true, memory_order_relaxed)) {
+        fprintf(stderr,
+            "#### AMFI-POLICY-COMPAT entry=%s policy=AMFI op=0x60 "
+            "status=0x4 (iOS task ports are hard-immovable)\n",
+            entryPoint);
     }
+    return true;
+}
+
+int __mac_syscall_new(const char *policy, int operation, void *argument) {
+    if (macws_amfi_immovable_task_port_compat(
+            "__mac_syscall", policy, operation, argument))
+        return 0;
     return __mac_syscall(policy, operation, argument);
+}
+
+extern int __sandbox_ms(const char *policy, int operation, void *argument);
+int macws_sandbox_ms(const char *policy, int operation, void *argument) {
+    if (macws_amfi_immovable_task_port_compat(
+            "__sandbox_ms", policy, operation, argument))
+        return 0;
+    return __sandbox_ms(policy, operation, argument);
 }
 
 int csr_get_active_config_new(uint32_t *configuration) {
@@ -9142,6 +9171,50 @@ int sandbox_init_new(const char *profile, uint64_t flags, char **errorbuf) {
     return 0;
 }
 
+extern int fileport_makefd(mach_port_t port);
+extern int fileport_makeport(int descriptor, mach_port_t *port);
+static bool macws_mach_msg_trace_enabled(void);
+
+int macws_fileport_makefd(mach_port_t port) {
+    int result = fileport_makefd(port);
+    int savedErrno = errno;
+    if (macws_mach_msg_trace_enabled()) {
+        char line[192];
+        int length = snprintf(
+            line, sizeof(line),
+            "#### FILEPORT-MAKEFD pid=%d port=%u result=%d errno=%d\n",
+            getpid(), port, result, savedErrno);
+        if (length > 0) {
+            size_t writeLength = (size_t)length < sizeof(line)
+                ? (size_t)length : sizeof(line) - 1;
+            (void)write(STDERR_FILENO, line, writeLength);
+        }
+    }
+    errno = savedErrno;
+    return result;
+}
+
+int macws_fileport_makeport(int descriptor, mach_port_t *port) {
+    int result = fileport_makeport(descriptor, port);
+    int savedErrno = errno;
+    if (macws_mach_msg_trace_enabled()) {
+        char line[224];
+        int length = snprintf(
+            line, sizeof(line),
+            "#### FILEPORT-MAKEPORT pid=%d fd=%d result=%d errno=%d "
+            "port=%u\n",
+            getpid(), descriptor, result, savedErrno,
+            port ? *port : MACH_PORT_NULL);
+        if (length > 0) {
+            size_t writeLength = (size_t)length < sizeof(line)
+                ? (size_t)length : sizeof(line) - 1;
+            (void)write(STDERR_FILENO, line, writeLength);
+        }
+    }
+    errno = savedErrno;
+    return result;
+}
+
 kern_return_t mach_port_construct_new(ipc_space_t task, mach_port_options_ptr_t options, uint64_t context, mach_port_name_t *name) {
     options->flags &= ~MPO_TG_BLOCK_TRACKING;
     return mach_port_construct(task, options, context, name);
@@ -9154,6 +9227,10 @@ kern_return_t mach_port_construct_new(ipc_space_t task, mach_port_options_ptr_t 
 // entering the kernel.  This deliberately does not rewrite the message or
 // suppress the guard exception; enable it only with MACWS_MACH_MSG_TRACE=1.
 static bool macws_mach_msg_trace_enabled(void) {
+    if (!atomic_load_explicit(&g_macws_libsystem_runtime_ready,
+                              memory_order_acquire)) {
+        return false;
+    }
     static _Atomic int cached = -1;
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
@@ -9163,6 +9240,9 @@ static bool macws_mach_msg_trace_enabled(void) {
     return value != 0;
 }
 
+static _Atomic bool g_macws_steam_mojo_rendezvous_received = false;
+static _Atomic unsigned g_macws_steam_post_rendezvous_records = 0;
+
 mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
                                mach_msg_option_t option,
                                mach_msg_size_t send_size,
@@ -9170,11 +9250,31 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
                                mach_port_name_t receive_name,
                                mach_msg_timeout_t timeout,
                                mach_port_name_t notify) {
-    if (macws_mach_msg_trace_enabled() && message &&
+    bool machTraceEnabled = macws_mach_msg_trace_enabled();
+    bool tracePostRendezvous = machTraceEnabled && message &&
+        atomic_load_explicit(&g_macws_steam_mojo_rendezvous_received,
+                             memory_order_acquire);
+    unsigned postRendezvousRecord = tracePostRendezvous
+        ? atomic_fetch_add_explicit(&g_macws_steam_post_rendezvous_records, 1,
+                                    memory_order_relaxed)
+        : UINT_MAX;
+    mach_msg_id_t preMessageID = tracePostRendezvous &&
+        (option & MACH_SEND_MSG) ? message->msgh_id : 0;
+    mach_msg_bits_t preMessageBits = tracePostRendezvous &&
+        (option & MACH_SEND_MSG) ? message->msgh_bits : 0;
+    mach_port_name_t preRemotePort = tracePostRendezvous &&
+        (option & MACH_SEND_MSG) ? message->msgh_remote_port : MACH_PORT_NULL;
+    mach_port_name_t preLocalPort = tracePostRendezvous &&
+        (option & MACH_SEND_MSG) ? message->msgh_local_port : MACH_PORT_NULL;
+    bool traceMojoSend = machTraceEnabled && message &&
         (option & MACH_SEND_MSG) &&
         (message->msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
         message->msgh_id == (mach_msg_id_t)'MOJO' &&
-        send_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t)) {
+        send_size >= sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+    mach_msg_id_t tracedMessageID = traceMojoSend ? message->msgh_id : 0;
+    mach_port_name_t tracedRemotePort = traceMojoSend
+        ? message->msgh_remote_port : MACH_PORT_NULL;
+    if (traceMojoSend) {
         const mach_msg_body_t *body =
             (const mach_msg_body_t *)(message + 1);
         uint32_t count = body->msgh_descriptor_count;
@@ -9232,6 +9332,93 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
     mach_msg_return_t result = mach_msg(
         message, option, send_size, receive_limit, receive_name,
         timeout, notify);
+    if (tracePostRendezvous && postRendezvousRecord < 256) {
+        char line[384];
+        bool received = result == MACH_MSG_SUCCESS &&
+            (option & MACH_RCV_MSG) && message;
+        int length = snprintf(
+            line, sizeof(line),
+            "#### MACH-POST-RZV pid=%d seq=%u option=0x%x send=%u "
+            "rcv_limit=%u rcv_name=%u timeout=%u result=0x%x "
+            "pre={id=0x%x,bits=0x%x,remote=%u,local=%u} "
+            "post={id=0x%x,bits=0x%x,remote=%u,local=%u,size=%u}\n",
+            getpid(), postRendezvousRecord, option, send_size,
+            receive_limit, receive_name, timeout, result,
+            preMessageID, preMessageBits, preRemotePort, preLocalPort,
+            received ? message->msgh_id : 0,
+            received ? message->msgh_bits : 0,
+            received ? message->msgh_remote_port : MACH_PORT_NULL,
+            received ? message->msgh_local_port : MACH_PORT_NULL,
+            received ? message->msgh_size : 0);
+        if (length > 0) {
+            size_t writeLength = (size_t)length < sizeof(line)
+                ? (size_t)length : sizeof(line) - 1;
+            (void)write(STDERR_FILENO, line, writeLength);
+        }
+    }
+    if (traceMojoSend) {
+        char line[192];
+        int length = snprintf(
+            line, sizeof(line),
+            "#### MACH-MSG-SEND-RESULT pid=%d id=0x%x remote=%u "
+            "result=0x%x\n",
+            getpid(), tracedMessageID, tracedRemotePort, result);
+        if (length > 0) {
+            size_t writeLength = (size_t)length < sizeof(line)
+                ? (size_t)length : sizeof(line) - 1;
+            (void)write(STDERR_FILENO, line, writeLength);
+        }
+    }
+    bool traceMojoReceive = macws_mach_msg_trace_enabled() && message &&
+        (option & MACH_RCV_MSG) && result == MACH_MSG_SUCCESS &&
+        message->msgh_id == (mach_msg_id_t)'MOJO' &&
+        (message->msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+        message->msgh_size >=
+            sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t);
+    if (traceMojoReceive) {
+        const mach_msg_body_t *body =
+            (const mach_msg_body_t *)(message + 1);
+        uint32_t count = body->msgh_descriptor_count;
+        const mach_msg_port_descriptor_t *descriptors =
+            (const mach_msg_port_descriptor_t *)(body + 1);
+        size_t descriptorBytes =
+            (size_t)count * sizeof(mach_msg_port_descriptor_t);
+        size_t required = sizeof(mach_msg_header_t) +
+                          sizeof(mach_msg_body_t) + descriptorBytes;
+        if (count <= 64 && required <= message->msgh_size) {
+            char line[768];
+            int used = snprintf(
+                line, sizeof(line),
+                "#### MACH-MSG-RECEIVE pid=%d id=0x%x bits=0x%x "
+                "remote=%u local=%u size=%u descriptors=%u",
+                getpid(), message->msgh_id, message->msgh_bits,
+                message->msgh_remote_port, message->msgh_local_port,
+                message->msgh_size, count);
+            for (uint32_t index = 0; index < count && used > 0 &&
+                 (size_t)used < sizeof(line); index++) {
+                const mach_msg_port_descriptor_t *descriptor =
+                    &descriptors[index];
+                mach_port_type_t rightTypes = 0;
+                kern_return_t typeResult = mach_port_type(
+                    mach_task_self(), descriptor->name, &rightTypes);
+                int appended = snprintf(
+                    line + used, sizeof(line) - used,
+                    " d%u={name=%u,disp=%u,type=%u,rights=0x%x,type_kr=0x%x}",
+                    index, descriptor->name, descriptor->disposition,
+                    descriptor->type, rightTypes, typeResult);
+                if (appended < 0) break;
+                used += appended;
+            }
+            if (used > 0) {
+                size_t length = (size_t)used < sizeof(line)
+                    ? (size_t)used : sizeof(line) - 1;
+                if (length + 1 < sizeof(line)) line[length++] = '\n';
+                (void)write(STDERR_FILENO, line, length);
+            }
+        }
+        atomic_store_explicit(&g_macws_steam_mojo_rendezvous_received, true,
+                              memory_order_release);
+    }
     if (trace_sls_window_group && result == MACH_SEND_INVALID_DEST) {
         char line[320];
         int length = snprintf(
@@ -9498,6 +9685,68 @@ extern kern_return_t mach_vm_remap(
     vm_map_t source_task, mach_vm_address_t source_address, boolean_t copy,
     vm_prot_t *current_protection, vm_prot_t *maximum_protection,
     vm_inherit_t inheritance);
+
+kern_return_t mach_vm_map_new(
+    vm_map_t target_task, mach_vm_address_t *address, mach_vm_size_t size,
+    mach_vm_offset_t mask, int flags, mach_port_t object,
+    memory_object_offset_t offset, boolean_t copy,
+    vm_prot_t current_protection, vm_prot_t maximum_protection,
+    vm_inherit_t inheritance) {
+    kern_return_t result = mach_vm_map(
+        target_task, address, size, mask, flags, object, offset, copy,
+        current_protection, maximum_protection, inheritance);
+    if (macws_mach_msg_trace_enabled() && MACH_PORT_VALID(object)) {
+        static _Atomic unsigned recordCount = 0;
+        unsigned record = atomic_fetch_add_explicit(
+            &recordCount, 1, memory_order_relaxed);
+        if (record < 128) {
+            char line[320];
+            int length = snprintf(
+                line, sizeof(line),
+                "#### MACH-VM-MAP pid=%d object=%u size=0x%llx "
+                "offset=0x%llx cur=0x%x max=0x%x result=0x%x addr=0x%llx\n",
+                getpid(), object, (unsigned long long)size,
+                (unsigned long long)offset, current_protection,
+                maximum_protection, result,
+                (unsigned long long)(address ? *address : 0));
+            if (length > 0) {
+                size_t writeLength = (size_t)length < sizeof(line)
+                    ? (size_t)length : sizeof(line) - 1;
+                (void)write(STDERR_FILENO, line, writeLength);
+            }
+        }
+    }
+    return result;
+}
+
+kern_return_t mach_make_memory_entry_64_new(
+    vm_map_t target_task, memory_object_size_t *size,
+    memory_object_offset_t offset, vm_prot_t permission,
+    mach_port_t *object_handle, mem_entry_name_port_t parent_handle) {
+    kern_return_t result = mach_make_memory_entry_64(
+        target_task, size, offset, permission, object_handle, parent_handle);
+    if (macws_mach_msg_trace_enabled()) {
+        static _Atomic unsigned recordCount = 0;
+        unsigned record = atomic_fetch_add_explicit(
+            &recordCount, 1, memory_order_relaxed);
+        if (record < 128) {
+            char line[320];
+            int length = snprintf(
+                line, sizeof(line),
+                "#### MACH-MEMORY-ENTRY pid=%d size=0x%llx offset=0x%llx "
+                "permission=0x%x parent=%u result=0x%x object=%u\n",
+                getpid(), (unsigned long long)(size ? *size : 0),
+                (unsigned long long)offset, permission, parent_handle,
+                result, object_handle ? *object_handle : MACH_PORT_NULL);
+            if (length > 0) {
+                size_t writeLength = (size_t)length < sizeof(line)
+                    ? (size_t)length : sizeof(line) - 1;
+                (void)write(STDERR_FILENO, line, writeLength);
+            }
+        }
+    }
+    return result;
+}
 
 kern_return_t mach_vm_remap_new(
     vm_map_t target_task, mach_vm_address_t *target_address,
@@ -10322,9 +10571,12 @@ DYLD_INTERPOSE(macws_SecRequirementCreateWithString,
                SecRequirementCreateWithString);
 DYLD_INTERPOSE(macws_LSOpenFromURLSpec, LSOpenFromURLSpec);
 DYLD_INTERPOSE(__mac_syscall_new, __mac_syscall);
+DYLD_INTERPOSE(macws_sandbox_ms, __sandbox_ms);
 DYLD_INTERPOSE(csr_get_active_config_new, csr_get_active_config);
 DYLD_INTERPOSE(sandbox_init_with_parameters_new, sandbox_init_with_parameters);
 DYLD_INTERPOSE(sandbox_init_new, sandbox_init);
+DYLD_INTERPOSE(macws_fileport_makefd, fileport_makefd);
+DYLD_INTERPOSE(macws_fileport_makeport, fileport_makeport);
 DYLD_INTERPOSE(mach_port_construct_new, mach_port_construct);
 DYLD_INTERPOSE(mach_msg_new, mach_msg);
 DYLD_INTERPOSE(macws_dispatch_mig_server, dispatch_mig_server);
@@ -10335,6 +10587,8 @@ DYLD_INTERPOSE(getaudit_addr_new, getaudit_addr);
 DYLD_INTERPOSE(mmap_new, mmap);
 DYLD_INTERPOSE(mprotect_new, mprotect);
 DYLD_INTERPOSE(munmap_new, munmap);
+DYLD_INTERPOSE(mach_vm_map_new, mach_vm_map);
+DYLD_INTERPOSE(mach_make_memory_entry_64_new, mach_make_memory_entry_64);
 DYLD_INTERPOSE(mach_vm_remap_new, mach_vm_remap);
 DYLD_INTERPOSE(pthread_jit_write_protect_np_new,
                macws_pthread_jit_write_protect_original);
@@ -10398,6 +10652,10 @@ DYLD_INTERPOSE(objc_alloc_trace, objc_alloc);
 #define DOCK_HELPER_SERVICE_NEW  "com.apple.macosbooter.dock.helper"
 #define GEOD_XPC_SERVICE "com.apple.geod"
 #define GEOD_XPC_SERVICE_NEW "com.apple.macosbooter.geod"
+#define DISKARBITRATIOND_SERVICE_ORIG \
+    "com.apple.DiskArbitration.diskarbitrationd"
+#define DISKARBITRATIOND_SERVICE_NEW \
+    "com.apple.macosbooter.DiskArbitration.diskarbitrationd"
 #define LOCATIOND_DESKTOP_AGENT_ORIG \
     "com.apple.locationd.desktop.agent"
 #define LOCATIOND_DESKTOP_AGENT_NEW \
@@ -10565,6 +10823,17 @@ static const char *macws_private_bootstrap_service_name(const char *name) {
     // com.apple.geod executable.
     if (!strcmp(name, GEOD_XPC_SERVICE))
         return GEOD_XPC_SERVICE_NEW;
+    // CoreFoundation's Ventura _CFVolumeObserver asks DiskArbitration for the
+    // initial mounted-volume set and a terminal "existing events received"
+    // event.  Runtime sampling of the stock Ventura sharedfilelistd on
+    // iPadOS 16.3 showed VolumeManager::volumes blocked forever in
+    // dispatch_group_wait: the similarly named iPadOS endpoint accepted the
+    // connection but never completed Ventura's observer protocol.  Keep the
+    // stock Ventura daemon and all injected Ventura clients on a private,
+    // collision-free bootstrap name; this preserves the original protocol
+    // and leaves iPadOS diskarbitrationd and its storage clients untouched.
+    if (!strcmp(name, DISKARBITRATIOND_SERVICE_ORIG))
+        return DISKARBITRATIOND_SERVICE_NEW;
     // FrontBoard's BSServiceConnection resolves its domain endpoint with raw
     // bootstrap_look_up rather than xpc_connection_create_mach_service.
     // Keep this mapping identical to macws_private_chroot_service_name() so
@@ -10710,6 +10979,142 @@ extern kern_return_t bootstrap_check_in3(mach_port_t bp, const char *name,
                                          unsigned char instance[16],
                                          uint64_t flags);
 
+// Chromium 126's macOS MachPortRendezvousServer publishes one dynamic
+// bootstrap name per browser PID. The browser calls bootstrap_check_in() to
+// obtain the receive right; renderer/network/GPU children call
+// bootstrap_look_up() and then use Chromium's unchanged Mach-message protocol
+// to receive their shared-memory ports. iPadOS launchd does not provision
+// these macOS application-scoped dynamic names. Runtime traces on iPadOS 16.3
+// show the call entering the native bootstrap path without producing a usable
+// completion while every child reaches ChildThreadImpl::EnsureConnected()
+// about 15 seconds later.
+//
+// Preserve the protocol rather than bypassing the invariant. On that exact
+// native failure, allocate a real receive right in the browser and let the
+// iOS-native host keep only a send right under the exact name. Child lookup
+// copies that send right back. The host never handles Chromium messages or
+// shared-memory descriptors; it only supplies the missing bootstrap name
+// lifetime. All other names and every successful native bootstrap operation
+// remain untouched.
+static bool macws_is_steam_mach_rendezvous_name(const char *name) {
+    static const char prefix[] = MACWS_STEAM_MACH_RENDEZVOUS_PREFIX;
+    if (!name || strncmp(name, prefix, sizeof(prefix) - 1) != 0) return false;
+    const char *suffix = name + sizeof(prefix) - 1;
+    if (!*suffix) return false;
+    for (const char *cursor = suffix; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') return false;
+    }
+    return strnlen(name, 128) < 128;
+}
+
+// These wrappers run while CEF is still bringing up its process-global
+// locks. stdio is not re-entrancy-safe there (the XPC name tracer below has
+// the same constraint), so diagnostics must remain allocation-free and use
+// the inherited descriptor directly.
+static void macws_steam_mach_trace(const char *message) {
+    if (!message || !getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) return;
+    (void)write(STDERR_FILENO, message, strlen(message));
+}
+
+static int macws_steam_mach_rendezvous_broker(
+        const char *operation, const char *name, mach_port_t sendPort,
+        mach_port_t *copiedPort) {
+    if (copiedPort) *copiedPort = MACH_PORT_NULL;
+    xpc_connection_t connection =
+        macws_xpc_connection_create_mach_service_raw(
+            MACWS_CONTROL_SERVICE,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (!connection) return EIO;
+    xpc_connection_set_event_handler(connection,
+        ^(xpc_object_t event) { (void)event; });
+    xpc_connection_resume(connection);
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    if (!request) {
+        xpc_connection_cancel(connection);
+        xpc_release(connection);
+        return ENOMEM;
+    }
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_OP, operation);
+    xpc_dictionary_set_string(request, MACWS_STEAM_MACH_KEY_NAME, name);
+    macws_steam_mach_trace("#### STEAM-MACH broker-send\n");
+    if (MACH_PORT_VALID(sendPort))
+        xpc_dictionary_set_mach_send(
+            request, MACWS_STEAM_MACH_KEY_PORT, sendPort);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+        connection, request);
+    int error = EIO;
+    if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+        error = (int)xpc_dictionary_get_int64(
+            reply, MACWS_STEAM_MACH_KEY_ERROR);
+        if (error == 0 && copiedPort) {
+            *copiedPort = xpc_dictionary_copy_mach_send(
+                reply, MACWS_STEAM_MACH_KEY_PORT);
+            if (!MACH_PORT_VALID(*copiedPort)) error = EIO;
+        }
+    }
+    if (reply) xpc_release(reply);
+    xpc_release(request);
+    xpc_connection_cancel(connection);
+    xpc_release(connection);
+    return error;
+}
+
+static kern_return_t macws_steam_mach_rendezvous_check_in(
+        const char *name, mach_port_t *servicePort,
+        kern_return_t nativeResult) {
+    bool matchingName = macws_is_steam_mach_rendezvous_name(name);
+    macws_steam_mach_trace("#### STEAM-MACH check-in entry\n");
+    if (!servicePort || !matchingName) return nativeResult;
+
+    mach_port_t receivePort = MACH_PORT_NULL;
+    kern_return_t result = mach_port_allocate(
+        mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &receivePort);
+    if (result == KERN_SUCCESS) {
+        result = mach_port_insert_right(
+            mach_task_self(), receivePort, receivePort,
+            MACH_MSG_TYPE_MAKE_SEND);
+    }
+    int brokerError = result == KERN_SUCCESS
+        ? macws_steam_mach_rendezvous_broker(
+            MACWS_STEAM_MACH_OP_REGISTER, name, receivePort, NULL)
+        : EIO;
+    if (result == KERN_SUCCESS && brokerError == 0) {
+        // xpc_dictionary_set_mach_send copied the send right into hostd. The
+        // browser owns only the receive right, matching bootstrap_check_in.
+        (void)mach_port_mod_refs(
+            mach_task_self(), receivePort, MACH_PORT_RIGHT_SEND, -1);
+        *servicePort = receivePort;
+        macws_steam_mach_trace("#### STEAM-MACH check-in broker-ok\n");
+        return KERN_SUCCESS;
+    }
+    if (MACH_PORT_VALID(receivePort)) {
+        (void)mach_port_mod_refs(
+            mach_task_self(), receivePort, MACH_PORT_RIGHT_SEND, -1);
+        (void)mach_port_mod_refs(
+            mach_task_self(), receivePort, MACH_PORT_RIGHT_RECEIVE, -1);
+    }
+    macws_steam_mach_trace("#### STEAM-MACH check-in broker-failed\n");
+    return nativeResult;
+}
+
+static kern_return_t macws_steam_mach_rendezvous_look_up(
+        const char *name, mach_port_t *servicePort,
+        kern_return_t nativeResult) {
+    bool matchingName = macws_is_steam_mach_rendezvous_name(name);
+    macws_steam_mach_trace("#### STEAM-MACH lookup entry\n");
+    if (!servicePort || !matchingName) return nativeResult;
+    mach_port_t copiedPort = MACH_PORT_NULL;
+    int brokerError = macws_steam_mach_rendezvous_broker(
+        MACWS_STEAM_MACH_OP_LOOKUP, name, MACH_PORT_NULL, &copiedPort);
+    if (brokerError == 0 && MACH_PORT_VALID(copiedPort)) {
+        *servicePort = copiedPort;
+        macws_steam_mach_trace("#### STEAM-MACH lookup broker-ok\n");
+        return KERN_SUCCESS;
+    }
+    macws_steam_mach_trace("#### STEAM-MACH lookup broker-failed\n");
+    return nativeResult;
+}
+
 // Bounded, allocation-free cold-start service recorder.  Using fprintf from
 // the static XPC interpose is not safe this early: the stdio path can re-enter
 // framework initialization before Maps reaches NSApplicationMain.  This
@@ -10753,7 +11158,21 @@ kern_return_t bootstrap_look_up_new(mach_port_t bp, const char *name, mach_port_
     macws_trace_xpc_name("bootstrap_look_up", originalName);
     if (name != originalName)
         macws_trace_xpc_name("bootstrap_look_up.mapped", name);
-    kern_return_t result = bootstrap_look_up(bp, name, sp);
+    bool steamRendezvous =
+        macws_is_steam_mach_rendezvous_name(originalName);
+    // The iPadOS bootstrap namespace cannot provide Chromium's per-browser
+    // rendezvous endpoint. Route this exact, validated dynamic name through
+    // hostd before entering the native routine; all unrelated names retain
+    // the original bootstrap lookup path.
+    kern_return_t result = steamRendezvous
+        ? macws_steam_mach_rendezvous_look_up(
+            originalName, sp, KERN_FAILURE)
+        : bootstrap_look_up(bp, name, sp);
+    if (steamRendezvous)
+        macws_steam_mach_trace("#### STEAM-MACH lookup routed-result\n");
+    if (!steamRendezvous && result != KERN_SUCCESS)
+        result = macws_steam_mach_rendezvous_look_up(
+            originalName, sp, result);
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
                 "#### BOOTSTRAP look_up '%s'%s%s%s -> %#x port=%#x\n",
@@ -10808,7 +11227,19 @@ kern_return_t bootstrap_check_in_new(mach_port_t bp, const char *name, mach_port
     macws_trace_xpc_name("bootstrap_check_in", originalName);
     if (name != originalName)
         macws_trace_xpc_name("bootstrap_check_in.mapped", name);
-    kern_return_t result = bootstrap_check_in(bp, name, sp);
+    bool steamRendezvous =
+        macws_is_steam_mach_rendezvous_name(originalName);
+    // See bootstrap_look_up_new above. The browser receives a real receive
+    // right and hostd retains only a send right for child lookup.
+    kern_return_t result = steamRendezvous
+        ? macws_steam_mach_rendezvous_check_in(
+            originalName, sp, KERN_FAILURE)
+        : bootstrap_check_in(bp, name, sp);
+    if (steamRendezvous)
+        macws_steam_mach_trace("#### STEAM-MACH check-in routed-result\n");
+    if (!steamRendezvous && result != KERN_SUCCESS)
+        result = macws_steam_mach_rendezvous_check_in(
+            originalName, sp, result);
     if (getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr,
                 "#### BOOTSTRAP check_in '%s'%s%s%s -> %#x port=%#x\n",
@@ -11915,6 +12346,7 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
 
     thread_act_array_t threads = NULL;
     mach_msg_type_number_t thread_count = 0;
+    mach_msg_type_number_t current_index = 0;
     kern_return_t threads_kr = task_threads(mach_task_self(), &threads,
                                              &thread_count);
     uint8_t *suspended = threads_kr == KERN_SUCCESS && thread_count
@@ -11925,10 +12357,8 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
     thread_t current = mach_thread_self();
     kern_return_t current_kr = thread_info(current, THREAD_IDENTIFIER_INFO,
         (thread_info_t)&current_info, &current_info_count);
-    mach_port_deallocate(mach_task_self(), current);
 
-    if (threads_kr != KERN_SUCCESS || !suspended ||
-        current_kr != KERN_SUCCESS) {
+    if (threads_kr != KERN_SUCCESS || !suspended) {
         fprintf(stderr,
             "#### ModifyExecutableRegion refused unsafe patch addr=%p "
             "size=%zu task_threads=%#x current_info=%#x\n",
@@ -11936,20 +12366,35 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
         goto cleanup;
     }
 
-    bool found_current = false;
+    // Resolve the caller before suspending anything. The old single-pass loop
+    // suspended each non-matching candidate as it searched; if this runtime
+    // failed THREAD_IDENTIFIER_INFO matching for the caller, it eventually
+    // suspended itself and could never reach the recovery loop. Runtime proof:
+    // Steam Helper PID 84825 retained suspend_count=1 on the exact 31 threads
+    // present at patch time while two subsequently-created threads remained 0.
+    current_index = thread_count;
     for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
-        if (macws_same_thread_id(threads[i], &current_info)) {
-            found_current = true;
-            continue;
+        // Send rights for the same thread object normally coalesce to the same
+        // task-local name. Keep identifier comparison as a verified fallback.
+        if (threads[i] == current ||
+            (current_kr == KERN_SUCCESS &&
+             macws_same_thread_id(threads[i], &current_info))) {
+            current_index = i;
+            break;
         }
-        if (thread_suspend(threads[i]) == KERN_SUCCESS)
-            suspended[i] = 1;
     }
-    if (!found_current) {
+    if (current_index == thread_count) {
         fprintf(stderr,
             "#### ModifyExecutableRegion refused patch: current thread "
-            "missing from task_threads (addr=%p size=%zu)\n", addr, size);
-        goto resume;
+            "missing from task_threads (addr=%p size=%zu current=%u "
+            "current_info=%#x)\n", addr, size, current, current_kr);
+        goto cleanup;
+    }
+    for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
+        if (i == current_index) continue;
+        if (thread_suspend(threads[i]) == KERN_SUCCESS) {
+            suspended[i] = 1;
+        }
     }
 
     kern_return_t writable_kr = vm_protect(mach_task_self(),
@@ -11979,10 +12424,13 @@ void ModifyExecutableRegion(void *addr, size_t size, void(^callback)(void)) {
 
 resume:
     for (mach_msg_type_number_t i = 0; i < thread_count; i++) {
-        if (suspended[i]) thread_resume(threads[i]);
+        if (!suspended[i]) continue;
+        thread_resume(threads[i]);
     }
 
 cleanup:
+    if (MACH_PORT_VALID(current))
+        mach_port_deallocate(mach_task_self(), current);
     free(suspended);
     if (threads_kr == KERN_SUCCESS && threads) {
         for (mach_msg_type_number_t i = 0; i < thread_count; i++)

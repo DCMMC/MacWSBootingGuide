@@ -35,19 +35,25 @@ static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
                                          const char *workingDirectory);
 static bool MacWSPathEndsWith(const char *path, const char *suffix);
 static bool MacWSIsTopLevelSteamBrowser(void);
+extern kern_return_t bootstrap_check_in_new(
+    mach_port_t bootstrapPort, const char *serviceName,
+    mach_port_t *servicePort);
+extern kern_return_t bootstrap_look_up_new(
+    mach_port_t bootstrapPort, const char *serviceName,
+    mach_port_t *servicePort);
+extern void ModifyExecutableRegion(void *address, size_t size,
+                                   void (^callback)(void));
 
 static void MacWSRebindSteamProcessImport(const struct mach_header *header,
                                            intptr_t slide) {
-    // Never publish the replacement until the Valve fallback target is known.
-    // dyld can notify us about steamui before libtier0; rebinding in that
-    // interval would make an early unsupported call return a synthetic zero
-    // instead of preserving Valve's implementation.
-    if (!gMacWSOriginalCreateSimpleProcess ||
-        !header || header->magic != MH_MAGIC_64) return;
+    if (!header || header->magic != MH_MAGIC_64) return;
     Dl_info imageInfo = {0};
     if (!dladdr(header, &imageInfo) || !imageInfo.dli_fname) return;
     if (strstr(imageInfo.dli_fname, "/libmachook") ||
         strstr(imageInfo.dli_fname, "/libtier0_s.dylib")) return;
+    bool chromiumFramework = strstr(
+        imageInfo.dli_fname,
+        "/Chromium Embedded Framework.framework/") != NULL;
 
     const struct mach_header_64 *header64 =
         (const struct mach_header_64 *)header;
@@ -102,25 +108,76 @@ static void MacWSRebindSteamProcessImport(const struct mach_header *header,
             size_t count = (size_t)(section->size / sizeof(uintptr_t));
             for (size_t pointerIndex = 0;
                  pointerIndex < count; pointerIndex++) {
+                uint32_t indirectIndex = section->reserved1 + pointerIndex;
+                if (indirectIndex >= dynamicSymbols->nindirectsyms) break;
                 uint32_t symbolIndex =
-                    indirectTable[section->reserved1 + pointerIndex];
+                    indirectTable[indirectIndex];
                 if (symbolIndex == INDIRECT_SYMBOL_ABS ||
                     symbolIndex == INDIRECT_SYMBOL_LOCAL ||
                     symbolIndex == (INDIRECT_SYMBOL_LOCAL |
-                                    INDIRECT_SYMBOL_ABS)) continue;
+                                    INDIRECT_SYMBOL_ABS) ||
+                    symbolIndex >= symbols->nsyms) continue;
                 const char *name = stringTable +
                     symbolTable[symbolIndex].n_un.n_strx;
-                if (!name || strcmp(name, "_CreateSimpleProcess")) continue;
-                uintptr_t replacement =
-                    (uintptr_t)MacWSSteamCreateSimpleProcess;
-                MSHookMemory(&pointers[pointerIndex], &replacement,
-                             sizeof(replacement));
+                if (!name) continue;
+                uintptr_t replacement = 0;
+                bool directLazyWrite = false;
+                if (!strcmp(name, "_CreateSimpleProcess")) {
+                    // Never publish the Valve adapter until its fallback
+                    // target is known. dyld can notify us about steamui before
+                    // libtier0; any unsupported call in that interval must
+                    // retain Valve's implementation.
+                    if (!gMacWSOriginalCreateSimpleProcess) continue;
+                    replacement = (uintptr_t)MacWSSteamCreateSimpleProcess;
+                } else if (chromiumFramework &&
+                           type == S_LAZY_SYMBOL_POINTERS &&
+                           !strcmp(name, "_bootstrap_check_in")) {
+                    replacement = (uintptr_t)bootstrap_check_in_new;
+                    directLazyWrite = true;
+                } else if (chromiumFramework &&
+                           type == S_LAZY_SYMBOL_POINTERS &&
+                           !strcmp(name, "_bootstrap_look_up")) {
+                    replacement = (uintptr_t)bootstrap_look_up_new;
+                    directLazyWrite = true;
+                } else {
+                    continue;
+                }
+                uintptr_t previous = __atomic_load_n(
+                    &pointers[pointerIndex], __ATOMIC_ACQUIRE);
+                if (directLazyWrite) {
+                    // __DATA,__la_symbol_ptr is writable in this exact CEF
+                    // image. A direct atomic store is the fishhook contract:
+                    // the existing stub now branches to our wrapper and never
+                    // enters dyld_stub_binder, so no later lazy bind can
+                    // replace it. MSHookMemory is for executable/const pages
+                    // and did not provide a verifiable data-slot write here.
+                    __atomic_store_n(&pointers[pointerIndex], replacement,
+                                     __ATOMIC_RELEASE);
+                } else {
+                    // This slot may live in __DATA_CONST. Do not use
+                    // MSHookMemory here: runtime-confirmed in Steam Helper
+                    // PID 90074 that ElleKit's stopAllThreads suspended all
+                    // 32 peer threads while rebinding steamclient.dylib and
+                    // returned without balancing them. The project's writer
+                    // preserves the actual region permissions and tracks each
+                    // successful peer suspension through its matching resume.
+                    ModifyExecutableRegion(&pointers[pointerIndex],
+                                           sizeof(replacement), ^{
+                        __atomic_store_n(&pointers[pointerIndex], replacement,
+                                         __ATOMIC_RELEASE);
+                    });
+                }
+                uintptr_t readback = __atomic_load_n(
+                    &pointers[pointerIndex], __ATOMIC_ACQUIRE);
                 if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
                     fprintf(stderr,
                             "[MacWSSteamProcess] rebound import image=%s "
-                            "slot=%p replacement=%p\n",
-                            imageInfo.dli_fname, &pointers[pointerIndex],
-                            MacWSSteamCreateSimpleProcess);
+                            "symbol=%s slot=%p previous=%p replacement=%p "
+                            "readback=%p%s\n",
+                            imageInfo.dli_fname, name,
+                            &pointers[pointerIndex], (void *)previous,
+                            (void *)replacement, (void *)readback,
+                            readback == replacement ? "" : " WRITE-FAILED");
                     fflush(stderr);
                 }
             }
@@ -138,15 +195,6 @@ static bool MacWSIsSteamProcess(void) {
     extern int proc_pidpath(int, void *, uint32_t);
     return proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
         strstr(executable, "/Library/Application Support/Steam/") != NULL;
-}
-
-static bool MacWSIsSteamMainProcess(void) {
-    const char *program = getprogname();
-    if (program && !strcmp(program, "steam_osx")) return true;
-    char executable[PATH_MAX] = {0};
-    extern int proc_pidpath(int, void *, uint32_t);
-    return proc_pidpath(getpid(), executable, sizeof(executable)) > 0 &&
-        MacWSPathEndsWith(executable, "/Steam.app/Contents/MacOS/steam_osx");
 }
 
 static bool MacWSIsTopLevelSteamBrowser(void) {
@@ -212,36 +260,6 @@ static void MacWSPrepareSteamAccessibilityRuntime(void) {
     }
 }
 
-// The top-level browser is a special case. Runtime evidence from Steam build
-// 1785799196 shows that replacing this one launch with posix_spawn leaves
-// transport_steamui.txt uninitialized, while Valve's implementation reaches
-// both WebUITransportController::Initialized and BrowserReady. RE of
-// libtier0_s.dylib _CreateSimpleProcess+0x34..+0x14c confirms the original
-// implementation is fork + chdir + execv/execvp rather than a separate XPC
-// broker. The remaining transport difference (likely process/session or FD
-// inheritance) is still under investigation; do not promote that detail to a
-// fact without a runtime FD comparison.
-//
-// Chromium's renderer/network/GPU descendants do not carry that private
-// parent contract. They are launched from "Steam Helper" with --type=... and
-// must continue through the atomic posix_spawn adapter: the inherited-fork
-// path crashes those descendants with EXC_GUARD on iPadOS. Keep this decision
-// structural (caller + exact executable + absence of --type), not PID- or
-// timing-based.
-static bool MacWSShouldPreserveValveBrowserLaunch(
-    void *commandOrArguments, int flags) {
-    if (!getenv("MACWS_STEAM_NATIVE_BROWSER_LAUNCH") ||
-        !MacWSIsSteamMainProcess() || !(flags & 0x08)) return false;
-    char *const *arguments = (char *const *)commandOrArguments;
-    if (!arguments || !MacWSPathEndsWith(
-            arguments[0],
-            "/Steam Helper.app/Contents/MacOS/Steam Helper")) return false;
-    for (size_t index = 1; arguments[index]; index++) {
-        if (!strncmp(arguments[index], "--type=", 7)) return false;
-    }
-    return true;
-}
-
 // Valve's bit-2 call sites build a sequence of individually single-quoted
 // arguments (runtime example: '.../steamsysinfo' '-steamid' '0' ...). Parse
 // only that unambiguous form so it can be spawned atomically without a second
@@ -304,13 +322,13 @@ static bool MacWSPathEndsWith(const char *path, const char *suffix) {
 }
 
 // Steam's browser process runs under the same explicitly unsandboxed MacWS
-// compatibility profile as its parent.  Chromium 126 nevertheless attempts
-// to construct the macOS Seatbelt parameter table and terminates at
+// compatibility profile as its parent. Chromium 126 nevertheless attempts to
+// construct the macOS Seatbelt parameter table and terminates at
 // sandbox_parameters_mac.mm:69 when iPadOS cannot provide that macOS process
-// metadata (runtime log: errno=EIO).  Select Chromium's supported no-sandbox
+// metadata (runtime log: errno=EIO). Select Chromium's supported no-sandbox
 // launch mode at the parent call site, before initialization; this keeps its
 // internal invariants intact and matches the kernel policy already attached to
-// the process.  Restrict the switch to Valve's exact browser helper.
+// the process. Restrict the switch to Valve's exact browser helper.
 static char **MacWSArgumentsByAddingSteamBrowserPolicy(
     const char *executable, char *const *arguments) {
     static const char helperSuffix[] =
@@ -342,17 +360,6 @@ static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
         fflush(stderr);
     }
     if (getenv("MACWS_STEAM_PROCESS_TRACE_ONLY")) {
-        return gMacWSOriginalCreateSimpleProcess ?
-            gMacWSOriginalCreateSimpleProcess(
-                commandOrArguments, flags, workingDirectory) : 0;
-    }
-    if (MacWSShouldPreserveValveBrowserLaunch(commandOrArguments, flags)) {
-        if (diagnostics) {
-            fprintf(stderr,
-                    "[MacWSSteamProcess] preserving Valve top-level browser "
-                    "launch for WebUI transport flags=%#x\n", flags);
-            fflush(stderr);
-        }
         return gMacWSOriginalCreateSimpleProcess ?
             gMacWSOriginalCreateSimpleProcess(
                 commandOrArguments, flags, workingDirectory) : 0;

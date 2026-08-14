@@ -48,6 +48,7 @@ MACOS_DAEMONS=/var/jb/usr/macOS/LaunchDaemons  # WindowServer + required macOS s
 WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
 SHAREDFILELISTD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.sharedfilelistd.plist"
+MACOS_DISKARBITRATIOND_PLIST="$MACOS_DAEMONS/com.macwsguide.macos-diskarbitrationd.plist"
 SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
 FONTD_PLIST="$MACOS_DAEMONS/com.macwsguide.xtyped.plist"
 VIEWBRIDGE_PLIST="$MACOS_DAEMONS/com.macwsguide.viewbridge.plist"
@@ -121,6 +122,7 @@ HISERVICES_LABEL=com.macwsguide.hiservices
 GEOD_LABEL=com.macwsguide.geod
 OFFICE_LICENSING_LABEL=com.macwsguide.office-licensing
 SHAREDFILELISTD_LABEL=com.apple.coreservices.sharedfilelistd
+MACOS_DISKARBITRATIOND_LABEL=com.macwsguide.macos-diskarbitrationd
 WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
@@ -420,7 +422,14 @@ pattern_is_running() {
 
 kill_by_pattern() {
     local pat="$1" pids pid
-    pids=$(ps aux 2>/dev/null | grep -v grep | grep -F "$pat" | awk '{print $2}')
+    # `ps aux` truncates long command lines on iPadOS 16.  Steam Helper's
+    # executable path only appears past that boundary, so the old cleanup
+    # silently left its CEF/browser descendants alive after the owning job
+    # exited.  `ps ax -o command=` is the same full-width process view used by
+    # the status path and is runtime-confirmed to expose the complete Helper
+    # path on this device.
+    pids=$(ps ax -o pid=,command= 2>/dev/null |
+        grep -v grep | grep -F "$pat" | awk '{print $1}')
     for pid in $pids; do
         [ "$pid" = "$$" ] && continue
         kill "$pid" 2>/dev/null
@@ -723,20 +732,105 @@ stop_ws_dependents() {
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 }
 
+start_macos_diskarbitrationd() {
+    local waited=0 pid=""
+
+    pid=$(launchd_job_pid "$MACOS_DISKARBITRATIOND_LABEL")
+    case "$pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            if kill -0 "$pid" 2>/dev/null; then
+                log "Private Ventura DiskArbitration endpoint already ready."
+                return 0
+            fi
+            ;;
+    esac
+
+    # The public service name belongs to iPadOS and remains untouched.  The
+    # injected Ventura daemon and clients symmetrically rewrite only their own
+    # bootstrap traffic to the private service declared by this exact job.
+    log "Starting private Ventura DiskArbitration endpoint..."
+    launchctl unload "$MACOS_DISKARBITRATIOND_PLIST" 2>/dev/null
+    launchctl remove "$MACOS_DISKARBITRATIOND_LABEL" 2>/dev/null
+    rm -f "$LOGDIR/macos-diskarbitrationd.out" \
+          "$LOGDIR/macos-diskarbitrationd.err"
+    launchctl load "$MACOS_DISKARBITRATIOND_PLIST" || return 1
+    while [ "$waited" -lt 10 ]; do
+        pid=$(launchd_job_pid "$MACOS_DISKARBITRATIOND_LABEL")
+        case "$pid" in
+            ''|*[!0-9]*) ;;
+            *) kill -0 "$pid" 2>/dev/null && break ;;
+        esac
+        sleep 1
+        waited=$((waited + 1))
+    done
+    case "$pid" in
+        ''|*[!0-9]*)
+            log "ERROR: private Ventura DiskArbitration endpoint did not start."
+            tail -n 30 "$LOGDIR/macos-diskarbitrationd.err" 2>/dev/null || true
+            return 1
+            ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 2
+    kill -0 "$pid" 2>/dev/null || {
+        log "ERROR: private Ventura DiskArbitration endpoint exited during readiness."
+        tail -n 30 "$LOGDIR/macos-diskarbitrationd.err" 2>/dev/null || true
+        return 1
+    }
+    log "Private Ventura DiskArbitration endpoint ready (pid=$pid)."
+}
+
+probe_sharedfilelistd() {
+    local probe_pid waited=0 status=0
+    local probe_log="$LOGDIR/sharedfilelistd.ready"
+
+    rm -f "$probe_log"
+    "$CHROOTEXEC" 0 0 "$ROOTFS" \
+        /usr/local/bin/macwsworkspacectl shared-file-list-ready \
+        >"$probe_log" 2>&1 &
+    probe_pid=$!
+    while kill -0 "$probe_pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    if kill -0 "$probe_pid" 2>/dev/null; then
+        kill -TERM "$probe_pid" 2>/dev/null
+        wait "$probe_pid" 2>/dev/null || true
+        log "ERROR: SharedFileList snapshot round-trip timed out."
+        tail -n 20 "$probe_log" 2>/dev/null || true
+        return 1
+    fi
+    wait "$probe_pid" 2>/dev/null || status=$?
+    if [ "$status" -ne 0 ] ||
+       ! grep -q '^shared-file-list-ready ' "$probe_log" 2>/dev/null; then
+        log "ERROR: SharedFileList snapshot round-trip failed (status=$status)."
+        tail -n 20 "$probe_log" 2>/dev/null || true
+        return 1
+    fi
+    log "macOS SharedFileList snapshot round-trip ready."
+}
+
 start_sharedfilelistd() {
     local waited=0
+
+    start_macos_diskarbitrationd || return 1
 
     # AppKit populates the Apple menu and Steam initializes its login UI via
     # LSSharedFileListCopySnapshot. On the 2026-08-14 production run the real
     # Steam main thread blocked synchronously in SFLLoginItemList because the
     # corresponding Ventura Mach service had never been loaded. Loading this
     # stock daemon live released that exact call and Steam immediately reached
-    # its Web Helper launch. Treat the process surviving its startup window as
-    # the readiness witness; a registered MachService alone is insufficient.
+    # its Web Helper launch. A live PID and registered MachService are not
+    # sufficient: require the bounded recent-document snapshot round-trip that
+    # used to hang in VolumeManager::volumes.
     if proc_running "$P_SHAREDFILELISTD"; then
         launchctl list "$SHAREDFILELISTD_LABEL" >/dev/null 2>&1 && {
-            log "macOS SharedFileList endpoint already ready."
-            return 0
+            probe_sharedfilelistd && {
+                log "macOS SharedFileList endpoint already ready."
+                return 0
+            }
+            log "Existing macOS SharedFileList process failed its protocol witness; restarting it."
         }
         kill_by_pattern "$P_SHAREDFILELISTD"
         finish_pattern_cleanup
@@ -760,6 +854,7 @@ start_sharedfilelistd() {
         tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
         return 1
     }
+    probe_sharedfilelistd || return 1
     log "macOS SharedFileList endpoint ready."
 }
 
@@ -2328,12 +2423,14 @@ cleanup_macos() {
     launchctl unload "$PBS_PLIST" 2>/dev/null
     launchctl unload "$OFFICE_LICENSING_PLIST" 2>/dev/null
     launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null
+    launchctl unload "$MACOS_DISKARBITRATIOND_PLIST" 2>/dev/null
     launchctl remove "$VNC_LABEL"  2>/dev/null
     launchctl remove "$TERM_LABEL" 2>/dev/null
     launchctl remove "$PBOARD_LABEL" 2>/dev/null
     launchctl remove "$PBS_LABEL" 2>/dev/null
     launchctl remove "$OFFICE_LICENSING_LABEL" 2>/dev/null
     launchctl remove "$SHAREDFILELISTD_LABEL" 2>/dev/null
+    launchctl remove "$MACOS_DISKARBITRATIOND_LABEL" 2>/dev/null
     launchctl unload "$LSD_PLIST" 2>/dev/null
     launchctl remove "$LSD_LABEL" 2>/dev/null
     launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null

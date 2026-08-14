@@ -11,15 +11,20 @@
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
+#include <pwd.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
@@ -27,6 +32,7 @@
 
 #include "macws_control_protocol.h"
 #include "macws_host_protocol.h"
+#include "macws_steam_mach_rendezvous_protocol.h"
 #include "macws_steam_semaphore_protocol.h"
 #include "macws_stream_protocol.h"
 
@@ -108,6 +114,9 @@ static pid_t WaitForRunningRootExecutable(NSString *rootPath,
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
 static dispatch_queue_t gSteamSemaphoreQueue;
+static dispatch_queue_t gSteamMachRendezvousQueue;
+static dispatch_source_t gSteamSemaphoreWaitListener;
+static int gSteamSemaphoreWaitListenerDescriptor = -1;
 static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gBusy;
 static NSString *gPhase = @"就绪";
@@ -118,12 +127,26 @@ static NSString *gActiveAppID = @"";
 typedef struct {
     uint64_t generation;
     uint32_t references;
+    uint32_t value;
     BOOL unlinked;
     char name[112];
+    mach_port_t waiterPorts[32];
+    uint32_t waiterCount;
+    int waiterSockets[32];
+    uint32_t waiterSocketCount;
+    uint64_t pollingWaiters[64];
+    uint8_t pollingWaiterGranted[64];
+    uint32_t pollingWaiterCount;
 } MacWSSteamSemaphoreEntry;
 
 static NSMutableDictionary<NSString *, NSValue *> *gSteamSemaphoreNames;
+static NSMutableDictionary<NSString *, NSNumber *> *gSteamMachRendezvousPorts;
 static NSMutableDictionary<NSNumber *, NSValue *> *gSteamSemaphoreGenerations;
+// name -> generation returned by the latest successful unlink. A protocol-v20
+// recreate must present that exact receipt before it may retire a name won by
+// a racing opener. This keeps ordinary O_CREAT|O_EXCL strict.
+static NSMutableDictionary<NSString *, NSNumber *> *
+    gSteamSemaphoreUnlinkReceipts;
 static uint64_t gSteamSemaphoreNextGeneration;
 static NSString *gSteamSemaphoreEpoch;
 
@@ -2331,14 +2354,129 @@ static BOOL IsSteamSemaphoreName(const char *name) {
 static BOOL IsSteamSemaphoreOperation(const char *operation) {
     return operation &&
         (!strcmp(operation, MACWS_STEAM_SEM_OP_OPEN) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_RECREATE) ||
          !strcmp(operation, MACWS_STEAM_SEM_OP_CLOSE) ||
          !strcmp(operation, MACWS_STEAM_SEM_OP_UNLINK) ||
-         !strcmp(operation, MACWS_STEAM_SEM_OP_RESET));
+         !strcmp(operation, MACWS_STEAM_SEM_OP_RESET) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_DELAY) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_TRYWAIT) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_WAIT_POLL) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_POST) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_GETVALUE) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_REGISTER_WAIT) ||
+         !strcmp(operation, MACWS_STEAM_SEM_OP_NOTIFY));
 }
 
-static void DestroySteamSemaphoreEntry(MacWSSteamSemaphoreEntry *entry) {
-    if (!entry) return;
-    free(entry);
+static BOOL IsSteamMachRendezvousName(const char *name) {
+    static const char prefix[] = MACWS_STEAM_MACH_RENDEZVOUS_PREFIX;
+    if (!name || strncmp(name, prefix, sizeof(prefix) - 1) != 0 ||
+        strnlen(name, 128) >= 128) return NO;
+    const char *suffix = name + sizeof(prefix) - 1;
+    if (!*suffix) return NO;
+    for (const char *cursor = suffix; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') return NO;
+    }
+    return YES;
+}
+
+static BOOL IsSteamMachRendezvousOperation(const char *operation) {
+    return operation &&
+        (!strcmp(operation, MACWS_STEAM_MACH_OP_REGISTER) ||
+         !strcmp(operation, MACWS_STEAM_MACH_OP_LOOKUP));
+}
+
+static BOOL ReplySteamMachRendezvous(xpc_object_t request, int error,
+                                     mach_port_t sendPort) {
+    xpc_connection_t peer = xpc_dictionary_get_remote_connection(request);
+    xpc_object_t reply = xpc_dictionary_create_reply(request);
+    if (!peer || !reply) return NO;
+    xpc_dictionary_set_int64(reply, MACWS_STEAM_MACH_KEY_ERROR, error);
+    if (error == 0 && MACH_PORT_VALID(sendPort))
+        xpc_dictionary_set_mach_send(
+            reply, MACWS_STEAM_MACH_KEY_PORT, sendPort);
+    xpc_connection_send_message(peer, reply);
+    return YES;
+}
+
+static void ServeSteamMachRendezvousRequest(xpc_object_t request,
+                                            const char *operation) {
+    const char *name = xpc_dictionary_get_string(
+        request, MACWS_STEAM_MACH_KEY_NAME);
+    if (!IsSteamMachRendezvousName(name)) {
+        ReplySteamMachRendezvous(request, EINVAL, MACH_PORT_NULL);
+        return;
+    }
+    NSString *key = @(name);
+    BOOL registerOperation =
+        !strcmp(operation, MACWS_STEAM_MACH_OP_REGISTER);
+    mach_port_t registeredPort = registerOperation
+        ? xpc_dictionary_copy_mach_send(
+            request, MACWS_STEAM_MACH_KEY_PORT)
+        : MACH_PORT_NULL;
+    if (registerOperation && !MACH_PORT_VALID(registeredPort)) {
+        ReplySteamMachRendezvous(request, EINVAL, MACH_PORT_NULL);
+        return;
+    }
+
+    dispatch_async(gSteamMachRendezvousQueue, ^{
+        if (registerOperation) {
+            NSNumber *previous = gSteamMachRendezvousPorts[key];
+            if (!previous && gSteamMachRendezvousPorts.count >= 64) {
+                // PID-qualified entries cannot be reused by a later browser.
+                // Keep the broker bounded across repeated failed launches.
+                NSString *oldest = gSteamMachRendezvousPorts.allKeys.firstObject;
+                NSNumber *stale = oldest
+                    ? gSteamMachRendezvousPorts[oldest] : nil;
+                if (oldest) [gSteamMachRendezvousPorts removeObjectForKey:oldest];
+                if (stale && MACH_PORT_VALID(stale.unsignedIntValue))
+                    (void)mach_port_deallocate(
+                        mach_task_self(), stale.unsignedIntValue);
+            }
+            if (previous && MACH_PORT_VALID(previous.unsignedIntValue))
+                (void)mach_port_deallocate(
+                    mach_task_self(), previous.unsignedIntValue);
+            gSteamMachRendezvousPorts[key] = @(registeredPort);
+            HostLog(@"Steam Mach rendezvous registered name=%@ port=%u",
+                    key, registeredPort);
+            ReplySteamMachRendezvous(request, 0, MACH_PORT_NULL);
+            return;
+        }
+
+        NSNumber *stored = gSteamMachRendezvousPorts[key];
+        mach_port_t sendPort = stored
+            ? (mach_port_t)stored.unsignedIntValue : MACH_PORT_NULL;
+        if (!MACH_PORT_VALID(sendPort)) {
+            ReplySteamMachRendezvous(request, ENOENT, MACH_PORT_NULL);
+            return;
+        }
+        HostLog(@"Steam Mach rendezvous lookup name=%@ port=%u",
+                key, sendPort);
+        ReplySteamMachRendezvous(request, 0, sendPort);
+    });
+}
+
+static BOOL WriteSteamSemaphoreWaitReply(int descriptor, int error,
+                                         uint64_t generation,
+                                         uint32_t value,
+                                         uint64_t requestID) {
+    MacWSSteamSemaphoreWaitReply reply = {
+        .magic = MACWS_STEAM_SEM_WAIT_MAGIC,
+        .version = MACWS_STEAM_SEM_VERSION,
+        .error = error,
+        .value = value,
+        .generation = generation,
+        .requestID = requestID,
+    };
+    const uint8_t *cursor = (const uint8_t *)&reply;
+    size_t remaining = sizeof(reply);
+    while (remaining != 0) {
+        ssize_t amount = write(descriptor, cursor, remaining);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) return NO;
+        cursor += (size_t)amount;
+        remaining -= (size_t)amount;
+    }
+    return YES;
 }
 
 static uint64_t SteamSemaphoreHash(const char *name) {
@@ -2362,14 +2500,14 @@ static void SteamSemaphoreHostPath(const MacWSSteamSemaphoreEntry *entry,
 
 static int CreateSteamSemaphoreState(MacWSSteamSemaphoreEntry *entry,
                                      uint32_t initialValue) {
-    char path[PATH_MAX];
+    char path[PATH_MAX] = {0};
     SteamSemaphoreHostPath(entry, path, sizeof(path));
     int descriptor = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC,
                           0600);
     if (descriptor < 0) return errno;
     MacWSSteamSemaphoreState state = {
-        .magic = MACWS_STEAM_SEM_MAGIC,
-        .version = MACWS_STEAM_SEM_VERSION,
+        .magic = MACWS_STEAM_SEM_STATE_MAGIC,
+        .version = MACWS_STEAM_SEM_STATE_VERSION,
         .value = initialValue,
         .revision = 1,
         .brokerGeneration = entry->generation,
@@ -2389,16 +2527,43 @@ static int CreateSteamSemaphoreState(MacWSSteamSemaphoreEntry *entry,
 
 static void UnlinkSteamSemaphoreState(
         const MacWSSteamSemaphoreEntry *entry) {
-    char path[PATH_MAX];
+    char path[PATH_MAX] = {0};
     SteamSemaphoreHostPath(entry, path, sizeof(path));
     (void)unlink(path);
 }
 
-static void ReplySteamSemaphore(xpc_object_t request, int error,
+static void DestroySteamSemaphoreEntry(MacWSSteamSemaphoreEntry *entry) {
+    if (!entry) return;
+    for (uint32_t index = 0; index < entry->waiterCount; index++) {
+        if (MACH_PORT_VALID(entry->waiterPorts[index]))
+            (void)mach_port_deallocate(
+                mach_task_self(), entry->waiterPorts[index]);
+    }
+    for (uint32_t index = 0; index < entry->waiterSocketCount; index++) {
+        int descriptor = entry->waiterSockets[index];
+        (void)WriteSteamSemaphoreWaitReply(
+            descriptor, ECANCELED, entry->generation, entry->value, 0);
+        close(descriptor);
+    }
+    free(entry);
+}
+
+static BOOL SteamSemaphoreDiagnosticsEnabled(xpc_object_t request) {
+    return getenv("MACWS_STEAM_SEM_DIAGNOSTICS") != NULL ||
+        xpc_dictionary_get_bool(request,
+            MACWS_STEAM_SEM_KEY_DIAGNOSTICS);
+}
+
+static BOOL ReplySteamSemaphore(xpc_object_t request, int error,
                                 uint64_t generation, BOOL created) {
     xpc_connection_t peer = xpc_dictionary_get_remote_connection(request);
     xpc_object_t reply = xpc_dictionary_create_reply(request);
-    if (!peer || !reply) return;
+    BOOL diagnostics = SteamSemaphoreDiagnosticsEnabled(request);
+    if (diagnostics)
+        HostLog(@"Steam semaphore reply request=%p peer=%p reply=%p "
+                "error=%d generation=%llu", request, peer, reply, error,
+                generation);
+    if (!peer || !reply) return NO;
     xpc_dictionary_set_int64(reply, MACWS_STEAM_SEM_KEY_ERROR, error);
     if (error == 0 && generation != 0) {
         xpc_dictionary_set_uint64(reply, MACWS_STEAM_SEM_KEY_GENERATION,
@@ -2406,6 +2571,295 @@ static void ReplySteamSemaphore(xpc_object_t request, int error,
         xpc_dictionary_set_bool(reply, MACWS_STEAM_SEM_KEY_CREATED, created);
     }
     xpc_connection_send_message(peer, reply);
+    return YES;
+}
+
+static BOOL ReplySteamSemaphoreValue(xpc_object_t request, int error,
+                                     uint64_t generation, uint32_t value) {
+    xpc_connection_t peer = xpc_dictionary_get_remote_connection(request);
+    xpc_object_t reply = xpc_dictionary_create_reply(request);
+    BOOL diagnostics = SteamSemaphoreDiagnosticsEnabled(request);
+    // EAGAIN is the expected zero-value polling result. Logging every such
+    // result changed the system being measured: runtime sampling showed
+    // hostd at 92.8% CPU and thousands of lines per second for one generation,
+    // while another connection remained on its first reply port. Preserve
+    // diagnostics for state transitions and actual errors only.
+    if (diagnostics && error != EAGAIN)
+        HostLog(@"Steam semaphore value reply request=%p peer=%p reply=%p "
+                "error=%d generation=%llu value=%u", request, peer, reply,
+                error, generation, value);
+    if (!peer || !reply) return NO;
+    xpc_dictionary_set_int64(reply, MACWS_STEAM_SEM_KEY_ERROR, error);
+    if (error == 0) {
+        xpc_dictionary_set_uint64(reply, MACWS_STEAM_SEM_KEY_GENERATION,
+                                  generation);
+        xpc_dictionary_set_uint64(reply, MACWS_STEAM_SEM_KEY_VALUE, value);
+    }
+    xpc_connection_send_message(peer, reply);
+    return YES;
+}
+
+static BOOL ReadSteamSemaphoreWaitRequest(
+        int descriptor, MacWSSteamSemaphoreWaitRequest *request) {
+    uint8_t *cursor = (uint8_t *)request;
+    size_t remaining = sizeof(*request);
+    while (remaining != 0) {
+        ssize_t amount = read(descriptor, cursor, remaining);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) return NO;
+        cursor += (size_t)amount;
+        remaining -= (size_t)amount;
+    }
+    return YES;
+}
+
+static void RemoveSteamSemaphorePollingWaiter(
+        MacWSSteamSemaphoreEntry *entry, uint32_t index) {
+    if (!entry || index >= entry->pollingWaiterCount) return;
+    entry->pollingWaiterCount--;
+    if (index == entry->pollingWaiterCount) return;
+    memmove(&entry->pollingWaiters[index],
+            &entry->pollingWaiters[index + 1],
+            (entry->pollingWaiterCount - index) *
+                sizeof(entry->pollingWaiters[0]));
+    memmove(&entry->pollingWaiterGranted[index],
+            &entry->pollingWaiterGranted[index + 1],
+            (entry->pollingWaiterCount - index) *
+                sizeof(entry->pollingWaiterGranted[0]));
+}
+
+static BOOL GrantSteamSemaphorePollingWaiter(
+        MacWSSteamSemaphoreEntry *entry, BOOL diagnostics) {
+    for (uint32_t index = 0; index < entry->pollingWaiterCount;) {
+        if (entry->pollingWaiterGranted[index]) {
+            index++;
+            continue;
+        }
+        uint64_t waiter = entry->pollingWaiters[index];
+        pid_t waiterPID = (pid_t)(waiter >> 32);
+        entry->pollingWaiterGranted[index] = 1;
+        if (waiterPID > 1 && kill(waiterPID, SIGUSR2) == 0) {
+            if (diagnostics)
+                HostLog(@"Steam semaphore FIFO grant generation=%llu "
+                        "waiter=%llu pid=%d signal=%d position=%u waiters=%u",
+                        entry->generation, waiter, waiterPID, SIGUSR2, index,
+                        entry->pollingWaiterCount);
+            return YES;
+        }
+        int signalError = waiterPID <= 1 ? EINVAL : errno;
+        if (diagnostics)
+            HostLog(@"Steam semaphore FIFO signal failed generation=%llu "
+                    "waiter=%llu pid=%d errno=%d",
+                    entry->generation, waiter, waiterPID, signalError);
+        RemoveSteamSemaphorePollingWaiter(entry, index);
+    }
+    return NO;
+}
+
+static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
+    int enabled = 1;
+    (void)setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE,
+                     &enabled, sizeof(enabled));
+    struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
+    (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                     &timeout, sizeof(timeout));
+
+    pid_t peerPID = 0;
+    socklen_t peerPIDSize = sizeof(peerPID);
+    if (getsockopt(descriptor, SOL_LOCAL, LOCAL_PEERPID,
+                   &peerPID, &peerPIDSize) != 0 ||
+        peerPIDSize != sizeof(peerPID) || peerPID <= 1) {
+        (void)WriteSteamSemaphoreWaitReply(
+            descriptor, EACCES, 0, 0, 0);
+        close(descriptor);
+        return;
+    }
+
+    MacWSSteamSemaphoreWaitRequest request = {0};
+    if (!ReadSteamSemaphoreWaitRequest(descriptor, &request) ||
+        request.magic != MACWS_STEAM_SEM_WAIT_MAGIC ||
+        request.version != MACWS_STEAM_SEM_VERSION ||
+        request.generation == 0 || request.reserved &
+            ~MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS ||
+        request.requestID == 0 ||
+        (pid_t)(request.waiter >> 32) != peerPID ||
+        request.operation < MACWS_STEAM_SEM_SOCKET_WAIT_POLL ||
+        request.operation > MACWS_STEAM_SEM_SOCKET_GETVALUE) {
+        (void)WriteSteamSemaphoreWaitReply(
+            descriptor, EPROTO, request.generation, 0,
+            request.requestID);
+        close(descriptor);
+        return;
+    }
+
+    dispatch_async(gSteamSemaphoreQueue, ^{
+        BOOL diagnostics = (request.reserved &
+            MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS) != 0;
+        if (diagnostics && request.operation !=
+                MACWS_STEAM_SEM_SOCKET_GETVALUE)
+            HostLog(@"Steam semaphore socket request id=%llu op=%u "
+                    "generation=%llu waiter=%llu peer=%d",
+                    request.requestID, request.operation,
+                    request.generation, request.waiter, peerPID);
+        MacWSSteamSemaphoreEntry *entry =
+            gSteamSemaphoreGenerations[@(request.generation)].pointerValue;
+        if (!entry || entry->references == 0) {
+            (void)WriteSteamSemaphoreWaitReply(
+                descriptor, EINVAL, request.generation, 0,
+                request.requestID);
+            close(descriptor);
+            return;
+        }
+        int replyError = 0;
+        uint32_t replyValue = entry->value;
+
+        if (request.operation == MACWS_STEAM_SEM_SOCKET_WAIT_POLL) {
+            if (request.waiter == 0) {
+                replyError = EINVAL;
+            } else {
+                uint32_t index = 0;
+                for (; index < entry->pollingWaiterCount; index++) {
+                    if (entry->pollingWaiters[index] == request.waiter) break;
+                }
+                if (index == entry->pollingWaiterCount) {
+                    if (index >= sizeof(entry->pollingWaiters) /
+                                     sizeof(entry->pollingWaiters[0])) {
+                        replyError = ENOSPC;
+                    } else {
+                        entry->pollingWaiters[index] = request.waiter;
+                        entry->pollingWaiterGranted[index] = 0;
+                        entry->pollingWaiterCount++;
+                        if (entry->value != 0) {
+                            entry->value--;
+                            entry->pollingWaiterGranted[index] = 1;
+                        }
+                        if (diagnostics)
+                            HostLog(@"Steam semaphore socket FIFO enqueue "
+                                    "generation=%llu waiter=%llu granted=%u "
+                                    "position=%u waiters=%u",
+                                    entry->generation, request.waiter,
+                                    entry->pollingWaiterGranted[index], index,
+                                    entry->pollingWaiterCount);
+                    }
+                }
+                if (replyError == 0)
+                    replyValue = entry->pollingWaiterGranted[index] ? 1 : 0;
+            }
+        } else if (request.operation == MACWS_STEAM_SEM_SOCKET_TRYWAIT) {
+            BOOL consumedGrant = NO;
+            if (request.waiter != 0) {
+                for (uint32_t index = 0;
+                     index < entry->pollingWaiterCount; index++) {
+                    if (entry->pollingWaiters[index] != request.waiter ||
+                        !entry->pollingWaiterGranted[index]) continue;
+                    RemoveSteamSemaphorePollingWaiter(entry, index);
+                    consumedGrant = YES;
+                    break;
+                }
+            }
+            if (!consumedGrant) {
+                if (entry->value == 0) replyError = EAGAIN;
+                else entry->value--;
+            }
+            replyValue = entry->value;
+        } else if (request.operation == MACWS_STEAM_SEM_SOCKET_POST) {
+            if (!GrantSteamSemaphorePollingWaiter(entry, diagnostics)) {
+                if (entry->value == MACWS_STEAM_SEM_VALUE_MAX)
+                    replyError = EOVERFLOW;
+                else entry->value++;
+            }
+            replyValue = entry->value;
+        } else {
+            replyValue = entry->value;
+        }
+
+        if (diagnostics && request.operation !=
+                MACWS_STEAM_SEM_SOCKET_GETVALUE &&
+            (replyError != EAGAIN || replyValue != 0))
+            HostLog(@"Steam semaphore socket reply id=%llu op=%u "
+                    "generation=%llu waiter=%llu error=%d value=%u",
+                    request.requestID, request.operation,
+                    request.generation, request.waiter, replyError,
+                    replyValue);
+        (void)WriteSteamSemaphoreWaitReply(
+            descriptor, replyError, entry->generation, replyValue,
+            request.requestID);
+        close(descriptor);
+    });
+}
+
+static BOOL StartSteamSemaphoreWaitListener(void) {
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
+    int length = snprintf(path, sizeof(path), "%s%s", kRootFS,
+                          MACWS_STEAM_SEM_WAIT_SOCKET_PATH);
+    if (length <= 0 || (size_t)length >= sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return NO;
+    }
+    (void)unlink(path);
+    int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (descriptor < 0) return NO;
+    int enabled = 1;
+    (void)setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE,
+                     &enabled, sizeof(enabled));
+
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strlcpy(address.sun_path, path, sizeof(address.sun_path));
+    struct passwd *mobileAccount = getpwnam("mobile");
+    uid_t clientUID = mobileAccount ? mobileAccount->pw_uid : 501;
+    gid_t clientGID = mobileAccount ? mobileAccount->pw_gid : 501;
+    if (bind(descriptor, (const struct sockaddr *)&address,
+             sizeof(address)) != 0 ||
+        chown(path, clientUID, clientGID) != 0 ||
+        chmod(path, 0600) != 0 || listen(descriptor, 64) != 0) {
+        int savedError = errno;
+        close(descriptor);
+        (void)unlink(path);
+        errno = savedError;
+        return NO;
+    }
+    int flags = fcntl(descriptor, F_GETFL, 0);
+    if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
+        int savedError = errno;
+        close(descriptor);
+        (void)unlink(path);
+        errno = savedError;
+        return NO;
+    }
+
+    gSteamSemaphoreWaitListenerDescriptor = descriptor;
+    dispatch_queue_t listenerQueue = dispatch_queue_create(
+        "com.macwsguide.hostd.steam-semaphore-wait-listener",
+        DISPATCH_QUEUE_SERIAL);
+    gSteamSemaphoreWaitListener = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_READ, (uintptr_t)descriptor, 0, listenerQueue);
+    dispatch_source_set_event_handler(gSteamSemaphoreWaitListener, ^{
+        for (;;) {
+            int client = accept(descriptor, NULL, NULL);
+            if (client < 0) {
+                if (errno == EINTR) continue;
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    HostLog(@"Steam semaphore wait accept failed errno=%d",
+                            errno);
+                break;
+            }
+            // Read and enqueue accepted requests on one serial listener queue.
+            // THEORY under test: the previous global-queue hop could let the
+            // high-rate GETVALUE client overtake an already accepted POST.
+            // Request IDs in the diagnostic log make that ordering directly
+            // observable; the actual counter mutation remains isolated on
+            // gSteamSemaphoreQueue.
+            ServeSteamSemaphoreWaitDescriptor(client);
+        }
+    });
+    dispatch_source_set_cancel_handler(gSteamSemaphoreWaitListener, ^{
+        close(descriptor);
+    });
+    dispatch_resume(gSteamSemaphoreWaitListener);
+    HostLog(@"Steam semaphore wait listener published path=%s protocol=%u",
+            path, MACWS_STEAM_SEM_VERSION);
+    return YES;
 }
 
 static void ServeSteamSemaphoreRequest(xpc_object_t request,
@@ -2415,7 +2869,47 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
     // applying the hostd "busy" gate here would deadlock an unrelated client.
     BOOL resetOperation = !strcmp(operation, MACWS_STEAM_SEM_OP_RESET);
     BOOL openOperation = !strcmp(operation, MACWS_STEAM_SEM_OP_OPEN);
+    BOOL recreateOperation =
+        !strcmp(operation, MACWS_STEAM_SEM_OP_RECREATE);
     BOOL unlinkOperation = !strcmp(operation, MACWS_STEAM_SEM_OP_UNLINK);
+    BOOL delayOperation = !strcmp(operation, MACWS_STEAM_SEM_OP_DELAY);
+    BOOL tryWaitOperation =
+        !strcmp(operation, MACWS_STEAM_SEM_OP_TRYWAIT);
+    BOOL waitPollOperation =
+        !strcmp(operation, MACWS_STEAM_SEM_OP_WAIT_POLL);
+    BOOL postOperation = !strcmp(operation, MACWS_STEAM_SEM_OP_POST);
+    BOOL getValueOperation =
+        !strcmp(operation, MACWS_STEAM_SEM_OP_GETVALUE);
+    BOOL registerWaitOperation =
+        !strcmp(operation, MACWS_STEAM_SEM_OP_REGISTER_WAIT);
+    BOOL notifyOperation = !strcmp(operation, MACWS_STEAM_SEM_OP_NOTIFY);
+
+    if (delayOperation) {
+        uint64_t microseconds = xpc_dictionary_get_uint64(
+            request, MACWS_STEAM_SEM_KEY_VALUE);
+        // Runtime LLDB on the real Steam Helper showed that
+        // macOS-originated nanosleep, kevent timers and thread_switch waits
+        // never expire on this iOS kernel. A first host-side implementation
+        // called usleep, but that blocked the broker itself in
+        // __semwait_signal. Let iOS-native libdispatch own the deadline.
+        //
+        // This operation deliberately bypasses gSteamSemaphoreQueue. CEF can
+        // issue a deadline while steam_osx is publishing a large batch of
+        // logical names; deadline delivery must not depend on draining that
+        // unrelated namespace traffic first.
+        if (microseconds == 0 || microseconds > 100000) {
+            ReplySteamSemaphore(request, EINVAL, 0, NO);
+            return;
+        }
+        dispatch_after(dispatch_time(
+            DISPATCH_TIME_NOW,
+            (int64_t)(microseconds * NSEC_PER_USEC)),
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                ReplySteamSemaphore(request, 0, 0, NO);
+            });
+        return;
+    }
+
     dispatch_async(gSteamSemaphoreQueue, ^{
         if (resetOperation) {
             const char *epoch = xpc_dictionary_get_string(
@@ -2433,6 +2927,7 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
                 gSteamSemaphoreGenerations.allValues.copy;
             [gSteamSemaphoreNames removeAllObjects];
             [gSteamSemaphoreGenerations removeAllObjects];
+            [gSteamSemaphoreUnlinkReceipts removeAllObjects];
             for (NSValue *value in entries) {
                 MacWSSteamSemaphoreEntry *entry = value.pointerValue;
                 UnlinkSteamSemaphoreState(entry);
@@ -2447,7 +2942,7 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
 
         const char *name = xpc_dictionary_get_string(
             request, MACWS_STEAM_SEM_KEY_NAME);
-        if (openOperation) {
+        if (openOperation || recreateOperation) {
             if (!IsSteamSemaphoreName(name)) {
                 ReplySteamSemaphore(request, EINVAL, 0, NO);
                 return;
@@ -2460,11 +2955,49 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
             NSString *key = @(name);
             MacWSSteamSemaphoreEntry *entry =
                 gSteamSemaphoreNames[key].pointerValue;
+            if (recreateOperation) {
+                uint64_t receipt = xpc_dictionary_get_uint64(
+                    request, MACWS_STEAM_SEM_KEY_GENERATION);
+                NSNumber *expected = gSteamSemaphoreUnlinkReceipts[key];
+                if (!(flags & O_CREAT) || !(flags & O_EXCL) || receipt == 0 ||
+                    !expected || expected.unsignedLongLongValue != receipt) {
+                    ReplySteamSemaphore(request, ESTALE, 0, NO);
+                    return;
+                }
+                [gSteamSemaphoreUnlinkReceipts removeObjectForKey:key];
+                uint64_t replacedGeneration = 0;
+                if (entry) {
+                    replacedGeneration = entry->generation;
+                    [gSteamSemaphoreNames removeObjectForKey:key];
+                    entry->unlinked = YES;
+                    UnlinkSteamSemaphoreState(entry);
+                    if (entry->references == 0) {
+                        [gSteamSemaphoreGenerations
+                            removeObjectForKey:@(entry->generation)];
+                        DestroySteamSemaphoreEntry(entry);
+                    }
+                    entry = NULL;
+                }
+                if (SteamSemaphoreDiagnosticsEnabled(request))
+                    HostLog(@"Steam semaphore atomic recreate name=%s "
+                            "receipt=%llu replaced-generation=%llu",
+                            name, receipt, replacedGeneration);
+            }
             if (entry && (flags & O_CREAT) && (flags & O_EXCL)) {
+                if (SteamSemaphoreDiagnosticsEnabled(request))
+                    HostLog(@"Steam semaphore open EEXIST name=%s "
+                            "flags=%#x initial=%llu generation=%llu "
+                            "references=%u unlinked=%d",
+                            name, flags, initialValue, entry->generation,
+                            entry->references, entry->unlinked);
                 ReplySteamSemaphore(request, EEXIST, 0, NO);
                 return;
             }
             if (!entry && !(flags & O_CREAT)) {
+                if (SteamSemaphoreDiagnosticsEnabled(request))
+                    HostLog(@"Steam semaphore open ENOENT name=%s "
+                            "flags=%#x initial=%llu",
+                            name, flags, initialValue);
                 ReplySteamSemaphore(request, ENOENT, 0, NO);
                 return;
             }
@@ -2479,6 +3012,7 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
                     return;
                 }
                 entry->generation = ++gSteamSemaphoreNextGeneration;
+                entry->value = (uint32_t)initialValue;
                 strlcpy(entry->name, name, sizeof(entry->name));
                 int createError = CreateSteamSemaphoreState(
                     entry, (uint32_t)initialValue);
@@ -2516,6 +3050,7 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
             [gSteamSemaphoreNames removeObjectForKey:key];
             entry->unlinked = YES;
             uint64_t generation = entry->generation;
+            gSteamSemaphoreUnlinkReceipts[key] = @(generation);
             UnlinkSteamSemaphoreState(entry);
             if (entry->references == 0) {
                 [gSteamSemaphoreGenerations
@@ -2534,6 +3069,208 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
             ReplySteamSemaphore(request, EINVAL, 0, NO);
             return;
         }
+
+        uint64_t waiter = xpc_dictionary_get_uint64(
+            request, MACWS_STEAM_SEM_KEY_WAITER);
+
+        // Legacy high-frequency RPC adapter retained only for protocol
+        // diagnostics. Protocol v19 clients keep the authoritative counter in
+        // the flock-protected state vnode created above and never enter these
+        // branches. Runtime v18 proved that short Unix-stream RPCs can vanish
+        // before hostd observes a request even while adjacent generations
+        // succeed, so production synchronization cannot depend on this path.
+        if (tryWaitOperation) {
+            if (waiter != 0) {
+                for (uint32_t index = 0;
+                     index < entry->pollingWaiterCount; index++) {
+                    if (entry->pollingWaiters[index] != waiter ||
+                        !entry->pollingWaiterGranted[index]) continue;
+                    entry->pollingWaiterCount--;
+                    if (index != entry->pollingWaiterCount) {
+                        memmove(&entry->pollingWaiters[index],
+                                &entry->pollingWaiters[index + 1],
+                                (entry->pollingWaiterCount - index) *
+                                    sizeof(entry->pollingWaiters[0]));
+                        memmove(&entry->pollingWaiterGranted[index],
+                                &entry->pollingWaiterGranted[index + 1],
+                                (entry->pollingWaiterCount - index) *
+                                    sizeof(entry->pollingWaiterGranted[0]));
+                    }
+                    ReplySteamSemaphoreValue(
+                        request, 0, generation, entry->value);
+                    return;
+                }
+            }
+            if (entry->value == 0) {
+                // A synchronous client cannot enqueue its next poll until it
+                // receives this reply. Yield once before replying so the XPC
+                // listener can enqueue work from another Steam process or
+                // generation; this is a fairness boundary, not a fabricated
+                // timeout or semaphore token.
+                sched_yield();
+                ReplySteamSemaphoreValue(request, EAGAIN, generation, 0);
+                return;
+            }
+            entry->value--;
+            ReplySteamSemaphoreValue(request, 0, generation, entry->value);
+            return;
+        }
+
+        if (postOperation) {
+            if (GrantSteamSemaphorePollingWaiter(
+                    entry, SteamSemaphoreDiagnosticsEnabled(request))) {
+                ReplySteamSemaphoreValue(
+                    request, 0, generation, entry->value);
+                return;
+            }
+            // A successful handoff transfers this post directly to the oldest
+            // blocking stream waiter, exactly as a kernel semaphore would.
+            // Dead clients are removed and do not consume the token.
+            while (entry->waiterSocketCount != 0) {
+                int descriptor = entry->waiterSockets[0];
+                entry->waiterSocketCount--;
+                if (entry->waiterSocketCount != 0) {
+                    memmove(&entry->waiterSockets[0],
+                            &entry->waiterSockets[1],
+                            entry->waiterSocketCount *
+                                sizeof(entry->waiterSockets[0]));
+                }
+                BOOL delivered = WriteSteamSemaphoreWaitReply(
+                    descriptor, 0, generation, entry->value, 0);
+                close(descriptor);
+                if (!delivered) continue;
+                if (SteamSemaphoreDiagnosticsEnabled(request))
+                    HostLog(@"Steam semaphore stream wake generation=%llu "
+                            "remaining=%u", generation,
+                            entry->waiterSocketCount);
+                ReplySteamSemaphoreValue(
+                    request, 0, generation, entry->value);
+                return;
+            }
+            if (entry->value == MACWS_STEAM_SEM_VALUE_MAX) {
+                ReplySteamSemaphoreValue(request, EOVERFLOW, generation,
+                                         entry->value);
+                return;
+            }
+            entry->value++;
+            ReplySteamSemaphoreValue(request, 0, generation, entry->value);
+            return;
+        }
+
+        if (getValueOperation) {
+            ReplySteamSemaphoreValue(request, 0, generation, entry->value);
+            return;
+        }
+
+        if (waitPollOperation) {
+            if (waiter == 0) {
+                ReplySteamSemaphoreValue(request, EINVAL, generation, 0);
+                return;
+            }
+            for (uint32_t index = 0;
+                 index < entry->pollingWaiterCount; index++) {
+                if (entry->pollingWaiters[index] != waiter) continue;
+                ReplySteamSemaphoreValue(
+                    request, 0, generation,
+                    entry->pollingWaiterGranted[index] ? 1 : 0);
+                return;
+            }
+            if (entry->pollingWaiterCount >=
+                sizeof(entry->pollingWaiters) /
+                    sizeof(entry->pollingWaiters[0])) {
+                ReplySteamSemaphoreValue(request, ENOSPC, generation, 0);
+                return;
+            }
+            uint32_t index = entry->pollingWaiterCount++;
+            entry->pollingWaiters[index] = waiter;
+            if (entry->value != 0) {
+                entry->value--;
+                entry->pollingWaiterGranted[index] = 1;
+            }
+            if (SteamSemaphoreDiagnosticsEnabled(request))
+                HostLog(@"Steam semaphore FIFO enqueue generation=%llu "
+                        "waiter=%llu granted=%u position=%u waiters=%u",
+                        generation, waiter,
+                        entry->pollingWaiterGranted[index], index,
+                        entry->pollingWaiterCount);
+            ReplySteamSemaphoreValue(
+                request, 0, generation,
+                entry->pollingWaiterGranted[index] ? 1 : 0);
+            return;
+        }
+
+        if (registerWaitOperation) {
+            mach_port_t port = xpc_dictionary_copy_mach_send(
+                request, MACWS_STEAM_SEM_KEY_WAIT_PORT);
+            if (!MACH_PORT_VALID(port)) {
+                ReplySteamSemaphore(request, EINVAL, 0, NO);
+                return;
+            }
+            BOOL duplicate = NO;
+            for (uint32_t index = 0; index < entry->waiterCount; index++) {
+                if (entry->waiterPorts[index] == port) {
+                    duplicate = YES;
+                    break;
+                }
+            }
+            if (duplicate) {
+                (void)mach_port_deallocate(mach_task_self(), port);
+            } else if (entry->waiterCount >=
+                       sizeof(entry->waiterPorts) /
+                           sizeof(entry->waiterPorts[0])) {
+                (void)mach_port_deallocate(mach_task_self(), port);
+                ReplySteamSemaphore(request, ENOSPC, 0, NO);
+                return;
+            } else {
+                entry->waiterPorts[entry->waiterCount++] = port;
+            }
+            if (SteamSemaphoreDiagnosticsEnabled(request))
+                HostLog(@"Steam semaphore registered wake port "
+                        "generation=%llu port=%u waiters=%u",
+                        generation, port, entry->waiterCount);
+            ReplySteamSemaphore(request, 0, generation, NO);
+            return;
+        }
+
+        if (notifyOperation) {
+            mach_msg_header_t message = {0};
+            message.msgh_bits = MACH_MSGH_BITS(
+                MACH_MSG_TYPE_COPY_SEND, 0);
+            message.msgh_size = sizeof(message);
+            message.msgh_id = 0x4d5753;
+            uint32_t output = 0;
+            for (uint32_t index = 0; index < entry->waiterCount; index++) {
+                mach_port_t port = entry->waiterPorts[index];
+                message.msgh_remote_port = port;
+                mach_msg_return_t sendResult = mach_msg(
+                    &message, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                    sizeof(message), 0, MACH_PORT_NULL, 0,
+                    MACH_PORT_NULL);
+                if (sendResult == MACH_SEND_INVALID_DEST) {
+                    // The failed mach_msg has already disposed the invalid
+                    // destination name.  Deallocating that numeric name a
+                    // second time is not a harmless KERN_INVALID_NAME on this
+                    // iOS kernel: the task has a Mach-port guard and is killed
+                    // with EXC_GUARD/INVALID_NAME.  Runtime witness from the
+                    // production Steam bootstrap (2026-08-14):
+                    //
+                    //   macwshostd[98055] SIGKILL
+                    //   GUARD_TYPE_MACH_PORT INVALID_NAME on mach port 35075
+                    //
+                    // Removing the dead destination from the waiter table is
+                    // the complete ownership transition after this send
+                    // result; there is no remaining right to release.
+                    continue;
+                }
+                entry->waiterPorts[output++] = port;
+            }
+            entry->waiterCount = output;
+            if (SteamSemaphoreDiagnosticsEnabled(request))
+                HostLog(@"Steam semaphore notify generation=%llu "
+                        "waiters=%u", generation, output);
+            return;
+        }
+
         entry->references--;
         if (entry->unlinked && entry->references == 0) {
             [gSteamSemaphoreGenerations removeObjectForKey:@(generation)];
@@ -2552,6 +3289,10 @@ static void ServeRequest(xpc_object_t request) {
     }
     if (IsSteamSemaphoreOperation(op)) {
         ServeSteamSemaphoreRequest(request, op);
+        return;
+    }
+    if (IsSteamMachRendezvousOperation(op)) {
+        ServeSteamMachRendezvousRequest(request, op);
         return;
     }
     if (strcmp(op, MACWS_CONTROL_OP_STATUS) == 0) {
@@ -2668,12 +3409,22 @@ int main(int argc, const char *argv[]) {
         gLogQueue = dispatch_queue_create("com.macwsguide.hostd.log", DISPATCH_QUEUE_SERIAL);
         gSteamSemaphoreQueue = dispatch_queue_create(
             "com.macwsguide.hostd.steam-semaphore", DISPATCH_QUEUE_SERIAL);
+        gSteamMachRendezvousQueue = dispatch_queue_create(
+            "com.macwsguide.hostd.steam-mach-rendezvous",
+            DISPATCH_QUEUE_SERIAL);
         gSteamSemaphoreNames = [NSMutableDictionary dictionary];
+        gSteamMachRendezvousPorts = [NSMutableDictionary dictionary];
         gSteamSemaphoreGenerations = [NSMutableDictionary dictionary];
+        gSteamSemaphoreUnlinkReceipts = [NSMutableDictionary dictionary];
         gSteamSemaphoreNextGeneration =
             ((uint64_t)arc4random() << 32) | arc4random();
         if (gSteamSemaphoreNextGeneration == UINT64_MAX)
             gSteamSemaphoreNextGeneration = 1;
+        if (!StartSteamSemaphoreWaitListener()) {
+            HostLog(@"failed to publish Steam semaphore wait listener "
+                    "errno=%d", errno);
+            return 1;
+        }
         HostLog(@"macwshostd starting pid=%d protocol=%u uid=%d", getpid(),
                 MACWS_CONTROL_VERSION, getuid());
 
