@@ -10454,48 +10454,83 @@ static const char *kMacWSANGLEDefaultMacABIPath =
     "/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib";
 static dispatch_data_t g_macws_angle_default_macabi = NULL;
 
+// Steam build 1785799196 embeds Chromium 126.0.6478.183 and ANGLE revision
+// 5d4df51d1d7d6a290d54111527a4798f10c7ca3c.  Its generated default library
+// has a different function set and must never receive Chromium 148's blob.
+// Runtime capture from Steam Helper's real libGLESv2 image established the
+// exact source container identity below.  The replacement was compiled from
+// that revision's official mtl_internal_shaders_src_autogen.h through the
+// same real MTLCompilerService macabi adapter.
+static const size_t kMacWSSteamANGLEDefaultMacOSBytes = 368459;
+static const uint64_t kMacWSSteamANGLEDefaultMacOSHash =
+    UINT64_C(0xd3e757cc4a31c3c0);
+static const size_t kMacWSSteamANGLEDefaultMacABIBytes = 711592;
+static const uint64_t kMacWSSteamANGLEDefaultMacABIHash =
+    UINT64_C(0x49a40eb36303a603);
+static const char *kMacWSSteamANGLEDefaultMacABIPath =
+    "/usr/local/share/macws/angle/angle-default-5d4df51-macabi.metallib";
+static dispatch_data_t g_macws_steam_angle_default_macabi = NULL;
+
+static dispatch_data_t macws_load_exact_metal_library(
+    const char *path, size_t expected_length, uint64_t expected_hash) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat metadata = {0};
+    if (fstat(fd, &metadata) != 0 || metadata.st_size <= 0 ||
+        (size_t)metadata.st_size != expected_length) {
+        close(fd);
+        return NULL;
+    }
+    uint8_t *bytes = malloc(expected_length);
+    if (!bytes) {
+        close(fd);
+        return NULL;
+    }
+    size_t consumed = 0;
+    while (consumed < expected_length) {
+        ssize_t count = read(fd, bytes + consumed,
+                             expected_length - consumed);
+        if (count <= 0) break;
+        consumed += (size_t)count;
+    }
+    close(fd);
+    uint32_t magic = 0;
+    uint64_t container_length = 0;
+    if (consumed >= 24) {
+        memcpy(&magic, bytes, sizeof(magic));
+        memcpy(&container_length, bytes + 16, sizeof(container_length));
+    }
+    dispatch_data_t result = NULL;
+    if (consumed == expected_length && magic == UINT32_C(0x424c544d) &&
+        container_length == expected_length &&
+        macws_source_fnv1a64(bytes, expected_length) == expected_hash) {
+        result = dispatch_data_create(bytes, expected_length, NULL,
+                                      DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    }
+    free(bytes);
+    return result;
+}
+
 static dispatch_data_t macws_angle_default_macabi_library(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        int fd = open(kMacWSANGLEDefaultMacABIPath, O_RDONLY | O_CLOEXEC);
-        if (fd < 0) return;
-        struct stat metadata = {0};
-        if (fstat(fd, &metadata) != 0 || metadata.st_size <= 0 ||
-            (size_t)metadata.st_size != kMacWSANGLEDefaultMacABIBytes) {
-            close(fd);
-            return;
-        }
-        size_t length = (size_t)metadata.st_size;
-        uint8_t *bytes = malloc(length);
-        if (!bytes) {
-            close(fd);
-            return;
-        }
-        size_t consumed = 0;
-        while (consumed < length) {
-            ssize_t count = read(fd, bytes + consumed, length - consumed);
-            if (count <= 0) break;
-            consumed += (size_t)count;
-        }
-        close(fd);
-        uint32_t magic = 0;
-        uint64_t container_length = 0;
-        if (consumed >= 24) {
-            memcpy(&magic, bytes, sizeof(magic));
-            memcpy(&container_length, bytes + 16, sizeof(container_length));
-        }
-        if (consumed == length && magic == UINT32_C(0x424c544d) &&
-            container_length == length &&
-            macws_source_fnv1a64(bytes, length) ==
-                kMacWSANGLEDefaultMacABIHash) {
-            // DEFAULT copies the package data into immutable dispatch-owned
-            // storage. Keep one process-lifetime object for all ANGLE displays.
-            g_macws_angle_default_macabi = dispatch_data_create(
-                bytes, length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
-        }
-        free(bytes);
+        g_macws_angle_default_macabi = macws_load_exact_metal_library(
+            kMacWSANGLEDefaultMacABIPath,
+            kMacWSANGLEDefaultMacABIBytes,
+            kMacWSANGLEDefaultMacABIHash);
     });
     return g_macws_angle_default_macabi;
+}
+
+static dispatch_data_t macws_steam_angle_default_macabi_library(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_macws_steam_angle_default_macabi = macws_load_exact_metal_library(
+            kMacWSSteamANGLEDefaultMacABIPath,
+            kMacWSSteamANGLEDefaultMacABIBytes,
+            kMacWSSteamANGLEDefaultMacABIHash);
+    });
+    return g_macws_steam_angle_default_macabi;
 }
 
 // Read-only observers at the private Metal library-cache/compiler boundary.
@@ -10902,7 +10937,8 @@ static id macws_new_library_data_compat(id self, SEL selector,
     dispatch_data_t mapped = NULL;
     if (data && (diagnostic ||
                  (getenv("MACWS_AGX_NATIVE") &&
-                  length == kMacWSANGLEDefaultMacOSBytes))) {
+                  (length == kMacWSANGLEDefaultMacOSBytes ||
+                   length == kMacWSSteamANGLEDefaultMacOSBytes)))) {
         mapped = dispatch_data_create_map(data, &bytes, &length);
     }
     uint32_t magic = 0;
@@ -10915,6 +10951,15 @@ static id macws_new_library_data_compat(id self, SEL selector,
         length == kMacWSANGLEDefaultMacOSBytes &&
         hash == kMacWSANGLEDefaultMacOSHash) {
         dispatch_data_t replacement = macws_angle_default_macabi_library();
+        if (replacement) {
+            selected_data = replacement;
+            substituted = YES;
+        }
+    } else if (getenv("MACWS_AGX_NATIVE") &&
+               length == kMacWSSteamANGLEDefaultMacOSBytes &&
+               hash == kMacWSSteamANGLEDefaultMacOSHash) {
+        dispatch_data_t replacement =
+            macws_steam_angle_default_macabi_library();
         if (replacement) {
             selected_data = replacement;
             substituted = YES;
@@ -11265,9 +11310,10 @@ static void macws_install_data_library_compatibility(Class agx) {
     if (access("/private/tmp/macws_mtl_data_diag", F_OK) == 0) {
         dprintf(STDERR_FILENO,
             "#### MTL-LIB-DATA compatibility installed on %s orig=%p "
-            "types=%s replacement=%s\n",
+            "types=%s replacement=%s steamReplacement=%s\n",
             class_getName(agx), (void *)current, types ?: "(nil)",
-            kMacWSANGLEDefaultMacABIPath);
+            kMacWSANGLEDefaultMacABIPath,
+            kMacWSSteamANGLEDefaultMacABIPath);
     }
 }
 

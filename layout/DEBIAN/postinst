@@ -34,6 +34,8 @@ LIPO=/var/jb/usr/bin/lipo
 ROOTFS=/var/mnt/rootfs
 WORKSPACE_WALLPAPER_SOURCE=/var/jb/usr/macOS/share/wallpapers/macws-forest-lake.png
 WORKSPACE_WALLPAPER_TARGET="$ROOTFS/usr/local/share/macws/wallpapers/macws-forest-lake.png"
+ANGLE_ASSET_SOURCE_DIR=/var/jb/usr/macOS/share/angle
+ANGLE_ASSET_TARGET_DIR="$ROOTFS/usr/local/share/macws/angle"
 
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
@@ -212,6 +214,10 @@ trust_installed_macho "$LOCATIOND_PROXY"
 trust_installed_macho "$SETTINGS_EXTENSION_PROXY"
 trust_installed_macho "$LOCATION_BRIDGE"
 trust_installed_macho /var/jb/usr/macOS/bin/launchdchrootexec
+# A fresh package install publishes new exec hooks before App-driven repair.
+# Start the matching signing daemon through the same bounded exact-name
+# supervisor so no old instance remains blocked on an unlinked socket inode.
+bash /var/jb/usr/macOS/bin/restart_autosignd.sh || exit 1
 ensure_interop_signature \
     /var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd || exit 1
 
@@ -443,6 +449,29 @@ if [ -d "$ROOTFS/System/Library" ]; then
         chown root:wheel "$wallpaper_temporary" 2>/dev/null || true
         mv -f "$wallpaper_temporary" "$WORKSPACE_WALLPAPER_TARGET" || exit 1
     fi
+    # These two libraries belong to different exact ANGLE revisions.  Publish
+    # both atomically during dpkg so a cold first launch never depends on the
+    # later interactive repair path.
+    mkdir -p "$ANGLE_ASSET_TARGET_DIR" || exit 1
+    for angle_asset_spec in \
+        'angle-default-1ba8ec3-macabi.metallib:714152' \
+        'angle-default-5d4df51-macabi.metallib:711592'; do
+        angle_asset=${angle_asset_spec%%:*}
+        angle_expected=${angle_asset_spec##*:}
+        angle_source="$ANGLE_ASSET_SOURCE_DIR/$angle_asset"
+        angle_target="$ANGLE_ASSET_TARGET_DIR/$angle_asset"
+        angle_temporary="$angle_target.package-new-$$"
+        if [ ! -f "$angle_source" ] ||
+           [ "$(wc -c < "$angle_source" 2>/dev/null)" != "$angle_expected" ]; then
+            echo "macOS Host install failed: invalid ANGLE asset $angle_source" >&2
+            exit 1
+        fi
+        rm -f "$angle_temporary"
+        cp -f "$angle_source" "$angle_temporary" || exit 1
+        chmod 0644 "$angle_temporary" || exit 1
+        chown root:wheel "$angle_temporary" 2>/dev/null || true
+        mv -f "$angle_temporary" "$angle_target" || exit 1
+    done
     interop_bundle_source=/var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents
     interop_bundle_target="$ROOTFS/usr/local/libexec/MacWSInteropService.app/Contents"
     if [ -f "$interop_bundle_source/MacOS/macwsinteropd" ]; then

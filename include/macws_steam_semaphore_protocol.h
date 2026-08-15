@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-#define MACWS_STEAM_SEM_VERSION 20u
+#define MACWS_STEAM_SEM_VERSION 21u
 #define MACWS_STEAM_SEM_VALUE_MAX 0x7fffffffu
 #define MACWS_STEAM_SEM_NAME_CAPACITY 112u
 #define MACWS_STEAM_SEM_STATE_MAGIC 0x4d575345u /* MWSE */
@@ -53,6 +53,11 @@ enum {
     MACWS_STEAM_SEM_SOCKET_TRYWAIT = 2,
     MACWS_STEAM_SEM_SOCKET_POST = 3,
     MACWS_STEAM_SEM_SOCKET_GETVALUE = 4,
+    // The host retains this stream until the FIFO waiter receives a post.
+    // The macOS client waits for EVFILT_READ; unlike a direct blocking read,
+    // that readiness path is runtime-proven to wake across the chroot/iOS
+    // boundary without a deadline poll.
+    MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK = 5,
 };
 
 #define MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS 0x1u

@@ -516,17 +516,10 @@ if [ -d /var/jb/usr/macOS/LaunchDaemons ]; then
 fi
 
 # ─── On-demand auto-sign daemon (iOS side) ──────────────────────────────────
-# libmachook's exec hooks ask this daemon (over /tmp/autosignd.sock) to
-# sign+trustcache a binary on first exec, so arbitrary macOS programs run in the
-# chroot without pre-listing every binary here. Trustcache it, then (re)start it.
-AUTOSIGND=/var/jb/usr/macOS/bin/autosignd
-if [ -x "$AUTOSIGND" ]; then
-    add_all_trustcache "$AUTOSIGND"
-    pkill -x autosignd 2>/dev/null
-    rm -f /var/mnt/rootfs/tmp/autosignd.sock
-    nohup "$AUTOSIGND" >/var/mnt/rootfs/tmp/autosignd.log 2>&1 &
-    echo "[INFO] started autosignd (on-demand auto-sign daemon)"
-fi
+# Keep package-install and App-driven repair on one exact supervision path.
+# This prevents one blocked daemon from being leaked for each install while
+# retaining the reboot-volatile trustcache repair required by the first exec.
+bash /var/jb/usr/macOS/bin/restart_autosignd.sh || exit 1
 
 # ─── iOS-native IOSurface allocator daemon (for chroot WS CodeHeap) ─────────
 # Chroot WS in AGX-native mode can't allocate via sel=0xa heap-creates (kernel
@@ -1107,6 +1100,23 @@ cp "$ANGLE_MACABI_SOURCE" "$ANGLE_MACABI_TMP" || exit 1
 chmod 0644 "$ANGLE_MACABI_TMP" || exit 1
 mv -f "$ANGLE_MACABI_TMP" "$ANGLE_MACABI_TARGET" || exit 1
 echo '[INFO] installed ANGLE 1ba8ec3 macabi default Metal library'
+
+# Steam build 1785799196 carries Chromium 126 / ANGLE 5d4df51 rather than
+# VS Code's Chromium 148 shader set.  Install its independently generated and
+# byte-validated macabi library; libmachook selects it only for Steam's exact
+# 368459-byte/FNV-identified upstream container.
+STEAM_ANGLE_MACABI_SOURCE=/var/jb/usr/macOS/share/angle/angle-default-5d4df51-macabi.metallib
+STEAM_ANGLE_MACABI_TARGET="$ANGLE_MACABI_DIR/angle-default-5d4df51-macabi.metallib"
+if [ ! -f "$STEAM_ANGLE_MACABI_SOURCE" ] ||
+   [ "$(wc -c < "$STEAM_ANGLE_MACABI_SOURCE" 2>/dev/null)" != 711592 ]; then
+	echo "[ERROR] Packaged Steam ANGLE macabi default library is missing or invalid." >&2
+	exit 1
+fi
+STEAM_ANGLE_MACABI_TMP="$STEAM_ANGLE_MACABI_TARGET.new.$$"
+cp "$STEAM_ANGLE_MACABI_SOURCE" "$STEAM_ANGLE_MACABI_TMP" || exit 1
+chmod 0644 "$STEAM_ANGLE_MACABI_TMP" || exit 1
+mv -f "$STEAM_ANGLE_MACABI_TMP" "$STEAM_ANGLE_MACABI_TARGET" || exit 1
+echo '[INFO] installed Steam ANGLE 5d4df51 macabi default Metal library'
 
 # Metal's on-disk source-library cache key omits the effective target triple.
 # Caches created before the MacWS macabi source adapter therefore contain

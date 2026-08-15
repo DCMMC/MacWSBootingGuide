@@ -12,6 +12,13 @@ the account, password, sign-in and QR controls.
 This milestone does not claim that a game has been installed or run.  It only
 establishes a stable, interactive Steam login client.
 
+The later native-AGX shader, memory-pressure and event-driven semaphore work
+is recorded in
+[`steam-agx-memory-20260815.md`](steam-agx-memory-20260815.md). That bounded
+production run removed the historical shader-target/GPU-restart strings,
+replaced the 500-microsecond semaphore poll with `kqueue/EVFILT_READ`, and saw
+the Steam family fall from 1,546.5 MiB at startup to 1,328.4 MiB at 4m40s.
+
 ## Root causes and evidence
 
 ### 1. Import rebinding froze every existing CEF thread

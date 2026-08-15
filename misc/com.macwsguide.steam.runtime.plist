@@ -18,11 +18,15 @@
              launchdchrootexec drops to uid/gid 501. A root-owned stale FIFO
              from an interrupted older run made Steam's real NamedPipe open
              fail with EACCES, leaving the updater onscreen after verification.
-             Only Steam's exact private endpoints are retired, and only while
-             this single-instance job is starting. -->
+             Jetsam can also kill steam_osx while leaving its random CEF
+             SingletonSocket and steamXXXXXX directories behind; the next
+             bootstrap then takes the existing-instance path and opens a
+             missing /tmp/steam.pipe with ENOENT. If and only if no live Steam
+             main process exists, retire those exact temporary namespaces.
+             Game data, htmlcache, login state and steamapps are untouched. -->
         <string>/var/jb/usr/bin/sh</string>
         <string>-c</string>
-		<string>/var/jb/usr/bin/rm -f /var/mnt/rootfs/private/tmp/steam.pipe; /var/jb/usr/bin/find /var/mnt/rootfs/private/tmp -maxdepth 1 \( -type f -o -type p -o -type s \) \( -name '.macws-steam-sem-*' -o -name '.macws-sysvsem-*' -o -name 'steam_chrome_shmem_uid501_spid*' -o -name 'steam??????' \) -delete; exec /var/jb/usr/macOS/bin/launchdchrootexec 501 501 /var/mnt/rootfs /bin/bash /usr/local/bin/macws-run-steam.sh</string>
+		<string>if ! /var/jb/usr/bin/killall -0 steam_osx 2&gt;/dev/null; then /var/jb/usr/bin/find /var/mnt/rootfs/private/tmp -maxdepth 1 -type d \( -name '.com.valvesoftware.Steam.*' -o -name 'steam??????' -o -name steam \) -exec /var/jb/usr/bin/rm -rf {} +; fi; /var/jb/usr/bin/rm -f /var/mnt/rootfs/private/tmp/steam.pipe; /var/jb/usr/bin/find /var/mnt/rootfs/private/tmp -maxdepth 1 \( -type f -o -type p -o -type s \) \( -name '.macws-steam-sem-*' -o -name '.macws-sysvsem-*' -o -name 'steam_chrome_shmem_uid501_spid*' -o -name 'steam??????' \) -delete; exec /var/jb/usr/macOS/bin/launchdchrootexec 501 501 /var/mnt/rootfs /bin/bash /usr/local/bin/macws-run-steam.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -31,6 +35,14 @@
         <key>LOGNAME</key><string>mobile</string>
         <key>TMPDIR</key><string>/tmp</string>
         <key>CA_VSYNC_OFF</key><string>1</string>
+        <key>CA_DISABLE_SWAP_ICC</key><string>1</string>
+        <!-- Steam's CEF shell and games both inherit this job.  Keep them on
+             the production native AGX path; the previous software CEF path
+             left its gpu-process with a 9.16-GiB resident footprint during
+             an animated download and was Jetsam-killed for compressor space. -->
+        <key>MACWS_AGX_NATIVE</key><string>1</string>
+        <key>MACWS_AGX_REGISTER_CLASSES</key><string>1</string>
+        <key>MACWS_PIN_FALLBACK</key><string>1</string>
         <!--
           Steam's bundled SDL 3 controller backend blocks the AppKit main
           thread on iPadOS while CHIDIO owns SDL's device mutex. Mouse,
@@ -51,6 +63,12 @@
              built-in no-task-port path instead of sending mach_task_self()
              and receiving EXC_GUARD/ILLEGAL_MOVE. -->
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key><string>1</string>
+        <!-- Crashpad's macOS-only nonfatal CPsx simulated dump includes
+             mach_task_self() in exception_raise_state_identity. iPadOS rejects
+             that hard-immovable right with MACH_SEND_INVALID_RIGHT plus a
+             fatal EXC_GUARD. Preserve the same failed-dump return without
+             entering the fatal trap; real exception delivery is untouched. -->
+        <key>MACWS_CRASHPAD_IMMOVABLE_TASK_PORT_COMPAT</key><string>1</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

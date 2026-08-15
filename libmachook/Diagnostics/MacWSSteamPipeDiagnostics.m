@@ -95,6 +95,12 @@ static bool MacWSIsAnySteamHelper(void) {
     return program && strcmp(program, "Steam Helper") == 0;
 }
 
+static bool MacWSIsSteamExecutable(void) {
+    const char *program = getprogname();
+    return program && (!strcmp(program, "steam_osx") ||
+                       !strcmp(program, "Steam Helper"));
+}
+
 static kern_return_t MacWSSteamDiagnosticTaskSetExceptionPorts(
     task_t task, exception_mask_t mask, mach_port_t newPort,
     exception_behavior_t behavior, thread_state_flavor_t flavor) {
@@ -145,6 +151,8 @@ typedef void (*MacWSNoreturnStatusFunction)(int);
 static MacWSNoreturnStatusFunction gMacWSOriginalExit;
 static MacWSNoreturnStatusFunction gMacWSOriginalUnderscoreExit;
 static MacWSNoreturnStatusFunction gMacWSOriginalCapitalExit;
+typedef void (*MacWSNoreturnVoidFunction)(void);
+static MacWSNoreturnVoidFunction gMacWSOriginalAbort;
 
 static void MacWSLogSteamTermination(const char *api, int status) {
     // The ElleKit exception-port worker converts an unhandled Mach exception
@@ -193,11 +201,53 @@ static void MacWSSteamCapitalExit(int status) {
     __builtin_unreachable();
 }
 
+__attribute__((noreturn))
+__attribute__((noinline))
+static void MacWSSteamAbort(void) {
+    // RE-confirmed against the installed Ventura 13.4 HIServices image
+    // (UUID AB1464A5-20E6-3C95-8548-1C03866FB283): the abort return address
+    // at image+0x7e50 follows _RegisterApplication's formatted ASN-failure
+    // message. Its 0x1420-byte frame keeps that 0x1000-byte message at
+    // caller-fp-0x1070. Record the actual LaunchServices error during this
+    // opt-in diagnostic, but only after verifying both the exact image/offset
+    // and that the bounded string lives in the current pthread stack.
+    void *returnAddress = __builtin_return_address(0);
+    Dl_info caller = {0};
+    if (dladdr(returnAddress, &caller) && caller.dli_fname &&
+        strstr(caller.dli_fname, "/HIServices.framework/") &&
+        caller.dli_fbase &&
+        (uintptr_t)returnAddress - (uintptr_t)caller.dli_fbase == 0x7e50) {
+        uintptr_t callerFrame = (uintptr_t)__builtin_frame_address(1);
+        uintptr_t messageAddress = callerFrame - 0x1070;
+        pthread_t thread = pthread_self();
+        uintptr_t stackHigh = (uintptr_t)pthread_get_stackaddr_np(thread);
+        size_t stackSize = pthread_get_stacksize_np(thread);
+        uintptr_t stackLow = stackHigh - stackSize;
+        if (callerFrame && messageAddress >= stackLow &&
+            messageAddress + 1024 <= stackHigh) {
+            fprintf(stderr,
+                    "[MacWSSteamExitDiagnostics] HIServices-ASN-message="
+                    "%.1024s\n",
+                    (const char *)messageAddress);
+            fflush(stderr);
+        }
+    }
+    MacWSLogSteamTermination("abort", SIGABRT);
+    gMacWSOriginalAbort();
+    __builtin_unreachable();
+}
+
 __attribute__((constructor))
 static void MacWSInstallSteamExitDiagnostics(void) {
     if (!getenv("MACWS_STEAM_EXIT_DIAGNOSTICS") ||
-        !MacWSIsAnySteamHelper()) return;
-    atexit(MacWSSteamExitDiagnostics);
+        !MacWSIsSteamExecutable()) return;
+    bool isHelper = MacWSIsAnySteamHelper();
+    if (isHelper) atexit(MacWSSteamExitDiagnostics);
+    void *abortTarget = dlsym(RTLD_DEFAULT, "abort");
+    if (abortTarget)
+        MSHookFunction(abortTarget, (void *)MacWSSteamAbort,
+                       (void **)&gMacWSOriginalAbort);
+    if (!isHelper) return;
     void *exitTarget = dlsym(RTLD_DEFAULT, "exit");
     void *underscoreExitTarget = dlsym(RTLD_DEFAULT, "_exit");
     void *capitalExitTarget = dlsym(RTLD_DEFAULT, "_Exit");

@@ -1,7 +1,9 @@
 #include <errno.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <semaphore.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -116,7 +118,7 @@ static void MacWSSysVSemaphoreCloseState(int fd) {
     errno = saved;
 }
 
-static int MacWSSemget(key_t key, int count, int flags) {
+static int MacWSSemgetImpl(key_t key, int count, int flags) {
     if (count < 0 || count > 1) {
         errno = count > 1 ? ENOSPC : EINVAL;
         return -1;
@@ -159,9 +161,44 @@ static int MacWSSemget(key_t key, int count, int flags) {
     return semid;
 }
 
+// Bounded evidence collector for Steam's global-instance election. The
+// interposer above is the iPadOS ABI implementation, so logging at this
+// boundary records the exact key/flags/result Steam observes without changing
+// the System V state machine. Keep it opt-in: global-instance construction is
+// cold-path work, but production launches should still pay no formatting or
+// symbolication cost.
+static int MacWSSemget(key_t key, int count, int flags) {
+    int result = MacWSSemgetImpl(key, count, flags);
+    int savedError = errno;
+    static unsigned diagnosticCount;
+    if (getenv("MACWS_STEAM_SYSVSEM_DIAGNOSTICS") &&
+        __atomic_fetch_add(&diagnosticCount, 1, __ATOMIC_RELAXED) < 64) {
+        void *caller = __builtin_return_address(0);
+        Dl_info image = {0};
+        (void)dladdr(caller, &image);
+        dprintf(STDERR_FILENO,
+                "[MacWSSysVSem] pid=%d program=%s op=semget key=%#x "
+                "count=%d flags=%#x result=%d errno=%d caller=%p "
+                "image=%s offset=%#llx\n",
+                getpid(), getprogname() ?: "?", (unsigned)key, count,
+                flags, result, result < 0 ? savedError : 0, caller,
+                image.dli_fname ?: "?",
+                image.dli_fbase ? (unsigned long long)(
+                    (uintptr_t)caller - (uintptr_t)image.dli_fbase) : 0);
+    }
+    errno = savedError;
+    return result;
+}
+
 static int MacWSSemctl(int semid, int number, int command, ...) {
     if (number != 0) {
         errno = EINVAL;
+        if (getenv("MACWS_STEAM_SYSVSEM_DIAGNOSTICS"))
+            dprintf(STDERR_FILENO,
+                    "[MacWSSysVSem] pid=%d program=%s op=semctl semid=%#x "
+                    "number=%d command=%#x result=-1 errno=%d caller=%p\n",
+                    getpid(), getprogname() ?: "?", (unsigned)semid,
+                    number, command, errno, __builtin_return_address(0));
         return -1;
     }
     char path[96];
@@ -170,7 +207,18 @@ static int MacWSSemctl(int semid, int number, int command, ...) {
     MacWSSysVSemaphoreState state = {0};
     int fd = MacWSSysVSemaphoreOpenState(
         semid, O_RDWR, 0, &state, NULL);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        int savedError = errno;
+        if (getenv("MACWS_STEAM_SYSVSEM_DIAGNOSTICS"))
+            dprintf(STDERR_FILENO,
+                    "[MacWSSysVSem] pid=%d program=%s op=semctl semid=%#x "
+                    "number=%d command=%#x result=-1 errno=%d caller=%p\n",
+                    getpid(), getprogname() ?: "?", (unsigned)semid,
+                    number, command, savedError,
+                    __builtin_return_address(0));
+        errno = savedError;
+        return -1;
+    }
 
     union semun argument = {0};
     if (command == SETVAL || command == SETALL || command == GETALL ||
@@ -234,6 +282,18 @@ static int MacWSSemctl(int semid, int number, int command, ...) {
     }
     MacWSSysVSemaphoreCloseState(fd);
     if (command == IPC_RMID && result == 0) (void)unlink(path);
+    int savedError = errno;
+    static unsigned diagnosticCount;
+    if (getenv("MACWS_STEAM_SYSVSEM_DIAGNOSTICS") &&
+        __atomic_fetch_add(&diagnosticCount, 1, __ATOMIC_RELAXED) < 128)
+        dprintf(STDERR_FILENO,
+                "[MacWSSysVSem] pid=%d program=%s op=semctl semid=%#x "
+                "number=%d command=%#x result=%d errno=%d value=%d "
+                "lastpid=%d caller=%p\n",
+                getpid(), getprogname() ?: "?", (unsigned)semid, number,
+                command, result, result < 0 ? savedError : 0, state.value,
+                state.lastPID, __builtin_return_address(0));
+    errno = savedError;
     return result;
 }
 
@@ -323,7 +383,18 @@ static int MacWSSemop(int semid, struct sembuf *operations,
     MacWSSysVSemaphoreState state = {0};
     int fd = MacWSSysVSemaphoreOpenState(
         semid, O_RDWR, 0, &state, NULL);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        int savedError = errno;
+        if (getenv("MACWS_STEAM_SYSVSEM_DIAGNOSTICS"))
+            dprintf(STDERR_FILENO,
+                    "[MacWSSysVSem] pid=%d program=%s op=semop semid=%#x "
+                    "count=%zu result=-1 errno=%d caller=%p\n",
+                    getpid(), getprogname() ?: "?", (unsigned)semid,
+                    operationCount, savedError,
+                    __builtin_return_address(0));
+        errno = savedError;
+        return -1;
+    }
     int result = 0;
     for (size_t index = 0; index < operationCount; index++) {
         struct sembuf operation = operations[index];
@@ -380,6 +451,20 @@ static int MacWSSemop(int semid, struct sembuf *operations,
     }
     int saved = errno;
     if (fd >= 0) MacWSSysVSemaphoreCloseState(fd);
+    static unsigned diagnosticCount;
+    if (getenv("MACWS_STEAM_SYSVSEM_DIAGNOSTICS") &&
+        __atomic_fetch_add(&diagnosticCount, 1, __ATOMIC_RELAXED) < 128) {
+        int firstOperation = operationCount > 0 ? operations[0].sem_op : 0;
+        int firstFlags = operationCount > 0 ? operations[0].sem_flg : 0;
+        dprintf(STDERR_FILENO,
+                "[MacWSSysVSem] pid=%d program=%s op=semop semid=%#x "
+                "count=%zu first_op=%d first_flags=%#x result=%d errno=%d "
+                "value=%d lastpid=%d caller=%p\n",
+                getpid(), getprogname() ?: "?", (unsigned)semid,
+                operationCount, firstOperation, firstFlags, result,
+                result < 0 ? saved : 0, state.value, state.lastPID,
+                __builtin_return_address(0));
+    }
     errno = saved;
     return result;
 }

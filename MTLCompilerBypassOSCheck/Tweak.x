@@ -430,6 +430,29 @@ static _Thread_local uint32_t gReplyRequestSequence = 0;
 static _Thread_local uintptr_t gReplyRequestDiscriminator = 0;
 static _Thread_local uint64_t gReplySourceHash = 0;
 
+// Steam's current CEF build does not pass the -fmodules-cache-path argument
+// used by Electron/VS Code, but it does preserve its bundle Resources path as
+// the compiler working directory.  Accept only the two exact Steam Helper
+// bundle locations that MacWS can launch.  This keeps ordinary iOS Metal
+// clients outside the target adapter even though they use the same shared
+// MTLCompilerService process.
+static bool MacWSIsSteamHelperWorkingDirectoryToken(const uint8_t *token,
+                                                     size_t tokenLength) {
+    static const char *const exactTokens[] = {
+        "-working-directory \"/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/Frameworks/Steam Helper.app/Contents/Resources\"",
+        "-working-directory \"/Applications/Steam.app/Contents/Frameworks/Steam Helper.app/Contents/Resources\"",
+    };
+    if (!token) return false;
+    for (size_t i = 0; i < sizeof(exactTokens) / sizeof(exactTokens[0]); i++) {
+        size_t expectedLength = strlen(exactTokens[i]);
+        if (tokenLength == expectedLength &&
+            memcmp(token, exactTokens[i], expectedLength) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void DumpCompilerRequest(uint32_t sequence, uint64_t sourceHash,
                                 const void *request, size_t requestSize) {
     if (!request || !requestSize || sequence > 64) return;
@@ -545,6 +568,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                     head[12], head[13], head[14], head[15]);
     }
     bool adapted = false;
+    bool needsCacheAdapter = false;
     if (request && requestSize >= 16 && a2 == 0xd) {
         // Chromium's MSL requests use two closely related serializations.
         // Most are exactly 16 + source + 8-byte padding + arguments.  Others
@@ -555,6 +579,16 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
         static const char cacheMarker[] =
             "-fmodules-cache-path=\"/var/folders/zz/";
         uint8_t *bytes = (uint8_t *)request;
+        uint64_t sourceLength = 0, argumentLength = 0;
+        memcpy(&sourceLength, bytes, sizeof(sourceLength));
+        memcpy(&argumentLength, bytes + 8, sizeof(argumentLength));
+        bool sourceBoundsValid = sourceLength <= requestSize - 16;
+        size_t sourceHashLength = sourceBoundsValid
+            ? (size_t)sourceLength : 0;
+        if (sourceHashLength && bytes[16 + sourceHashLength - 1] == 0)
+            sourceHashLength--;
+        uint64_t sourceHash = sourceHashLength
+            ? MacWSFNV1a64(bytes + 16, sourceHashLength) : 0;
         size_t prefixLength = sizeof(workingDirectoryPrefix) - 1;
         size_t markerLength = sizeof(cacheMarker) - 1;
         size_t workingOffset = (size_t)-1;
@@ -572,7 +606,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                 break;
             }
         }
-        if (workingOffset != (size_t)-1 && cacheOffset != (size_t)-1) {
+        if (workingOffset != (size_t)-1) {
             size_t closingQuote = workingOffset + prefixLength;
             while (closingQuote < requestSize &&
                    bytes[closingQuote] != '"') {
@@ -581,24 +615,44 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
             size_t targetLength = sizeof(targetArgument) - 1;
             if (closingQuote < requestSize) {
                 size_t tokenLength = closingQuote - workingOffset + 1;
-                if (tokenLength >= targetLength) {
+                bool chrootCacheRequest = cacheOffset != (size_t)-1;
+                bool steamHelperRequest =
+                    MacWSIsSteamHelperWorkingDirectoryToken(
+                        bytes + workingOffset, tokenLength);
+                // Reproducible package-asset builder for Steam's exact
+                // Chromium 126 / ANGLE 5d4df51 default shader source.  Public
+                // Metal always serializes the standalone probe's working
+                // directory as /private/tmp, so it cannot satisfy the normal
+                // Steam-helper token above.  Allow only the byte-exact
+                // upstream source/ABI tuple while an explicit rootless
+                // sentinel exists.  This is diagnostic build machinery, not
+                // a production compatibility bypass; normal iOS requests and
+                // every different source continue unchanged.
+                static const char assetBuildToken[] =
+                    "-working-directory \"/private/tmp\"";
+                bool steamANGLEAssetBuild =
+                    access("/var/jb/var/mobile/"
+                           "macws_steam_angle_asset_build", F_OK) == 0 &&
+                    tokenLength == sizeof(assetBuildToken) - 1 &&
+                    memcmp(bytes + workingOffset, assetBuildToken,
+                           sizeof(assetBuildToken) - 1) == 0 &&
+                    requestSize == 175034 && sourceLength == 174926 &&
+                    argumentLength == 90 &&
+                    sourceHash == UINT64_C(0xa90e497bcdffdc8d);
+                if ((chrootCacheRequest || steamHelperRequest ||
+                     steamANGLEAssetBuild) &&
+                    tokenLength >= targetLength) {
                     memcpy(bytes + workingOffset, targetArgument,
                            targetLength);
                     memset(bytes + workingOffset + targetLength, ' ',
                            tokenLength - targetLength);
                     adapted = true;
+                    needsCacheAdapter = chrootCacheRequest;
                 }
             }
         }
 
-        uint64_t sourceLength = 0, argumentLength = 0;
-        memcpy(&sourceLength, bytes, sizeof(sourceLength));
-        memcpy(&argumentLength, bytes + 8, sizeof(argumentLength));
-        if (sourceLength <= requestSize - 16) {
-            size_t hashLength = (size_t)sourceLength;
-            if (hashLength && bytes[16 + hashLength - 1] == 0)
-                hashLength--;
-            uint64_t sourceHash = MacWSFNV1a64(bytes + 16, hashLength);
+        if (sourceBoundsValid) {
             gReplySourceHash = sourceHash;
             uint64_t expectedSize =
                 ((UINT64_C(16) + sourceLength + 7) & ~UINT64_C(7)) +
@@ -607,7 +661,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                 ? (long long)expectedSize - (long long)requestSize
                 : LLONG_MAX;
             if (adapted || diagnostics) {
-                MTLPatchLog("target adapter #%u request=%p total=%zu source=%llu sourceHash=%016llx args=%llu layoutDelta=%lld workingOffset=%lld cacheOffset=%lld adapted=%d",
+                MTLPatchLog("target adapter #%u request=%p total=%zu source=%llu sourceHash=%016llx args=%llu layoutDelta=%lld workingOffset=%lld cacheOffset=%lld adapted=%d cacheAdapter=%d",
                             sequence, request, requestSize,
                             (unsigned long long)sourceLength,
                             (unsigned long long)sourceHash,
@@ -616,7 +670,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                                 : (long long)workingOffset,
                             cacheOffset == (size_t)-1 ? -1LL
                                 : (long long)cacheOffset,
-                            adapted);
+                            adapted, needsCacheAdapter);
             }
             if (diagnostics)
                 DumpCompilerRequest(sequence, sourceHash,
@@ -635,11 +689,11 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
     // MetalCacheUnlinkAt wrapper and runtime-confirmed stack-canary failures
     // followed.  A MacWS source request is the first legitimate point at
     // which this process needs the chroot cache namespace.
-    if (adapted && !gMetalCacheAdapterInstalled) {
+    if (needsCacheAdapter && !gMetalCacheAdapterInstalled) {
         InstallMetalCachePathAdapter();
         gMetalCacheAdapterInstalled = true;
     }
-    atomic_store_explicit(&gMacWSMetalBuildRequestActive, adapted,
+    atomic_store_explicit(&gMacWSMetalBuildRequestActive, needsCacheAdapter,
                           memory_order_release);
     uintptr_t result = OrigMTLCodeGenServiceBuildRequest(
         a0, a1, a2, request, requestSize, a5);

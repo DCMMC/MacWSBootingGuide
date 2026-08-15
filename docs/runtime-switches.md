@@ -87,16 +87,34 @@ variables. `MallocScribble` is explicitly forbidden.
   plane, keeping video in the AGX-composited scanout captured by MacWS/VNC.
   The exact adapter writes that real field using a verified two-instruction
   dataflow rewrite; it does not install a per-frame function trampoline.
-- Steam's on-demand job enables `MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT=1`
-  plus the same production W^X adapters used by Chromium. The iOS kernel
+- Steam's on-demand job enables the native-AGX application contract
+  (`MACWS_AGX_NATIVE=1`, `MACWS_AGX_REGISTER_CLASSES=1`,
+  `MACWS_PIN_FALLBACK=1`), `MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT=1`, plus
+  the same production W^X adapters used by Chromium. Valve's supported
+  `-cef-force-gpu` switch keeps the client shell on native Metal as well as
+  ensuring games inherit AGX. The retired `-cef-disable-gpu` launch policy
+  still created a CEF gpu-process and, during animated download progress,
+  that process reached 600,180 resident 16-KiB pages before Jetsam reported
+  `vm-compressor-space-shortage`. Minidumps then establish that its native
+  GPU child was being killed while Crashpad attempted to send the hard-
+  immovable task port, after which CEF selected SwiftShader. The exact owner
+  of every page in the 9.16-GiB footprint remains unproven. The iOS kernel
   returns `ENOSYS` for CEF 126's `__sandbox_ms("AMFI", 0x60, ...)` query even
   though task ports are hard-immovable; the exact compatibility result makes
   Chromium use its native no-task-port path. Valve's top-level browser and its
   renderer/network/GPU descendants use atomic `posix_spawn` launch paths, so
   neither the fatal Network/XPC `fork` child nor guarded task-port transfer is
-  reached. Steam's `/BSem`, `/Evt` and `/MTX` POSIX names are
-  backed by hostd-issued generations and flock/vnode notification state, so
-  `sem_unlink` plus same-name recreation cannot alias an old Helper handle.
+  reached. Steam's `/BSem`, `/Evt` and `/MTX` POSIX names are backed by
+  hostd-issued generations and one authoritative hostd counter. Protocol v21
+  retains a zero-valued blocking wait's connected AF_UNIX descriptor in FIFO
+  order; the client sleeps in `kqueue/EVFILT_READ` until post writes its exact
+  reply. Hostd clears inherited `O_NONBLOCK` on every accepted descriptor
+  before reading the request; runtime logs proved that leaving it set could
+  turn an ordinary pre-data `EAGAIN` into `EPROTO` and break Steam's `/MTX`
+  release path. Runtime LLDB captured the event-driven stack, replacing the
+  retired 500-us poll which produced roughly 1,000 wakeups/s. `sem_unlink`
+  plus same-name
+  recreation therefore cannot alias an old Helper handle.
   `MACWS_STEAM_LAUNCH_EPOCH` is generated once by the packaged launch script
   and inherited across the updater/live-client process family; all Steam
   tracing and exit-stop switches remain off.
@@ -209,6 +227,16 @@ embedded source library matches both the runtime-confirmed 361,943-byte length
 and FNV-1a hash `4a17e801057d2e72`; other Electron/ANGLE versions retain their
 own library. The installed replacement is independently checked as a
 714,152-byte MTLB with FNV-1a `2b19e550c422772a` before use.
+
+Steam's Chromium 126.0.6478.183 embeds ANGLE revision `5d4df51` and a distinct
+368,459-byte default Metal library (FNV-1a `d3e757cc4a31c3c0`). The package
+installs that exact revision's macabi rebuild separately as
+`/usr/local/share/macws/angle/angle-default-5d4df51-macabi.metallib` and
+selects it only for that byte-exact source container. The replacement is
+711,592 bytes with FNV-1a `49a40eb36303a603`; it is never shared with VS Code's
+newer ANGLE function set. See
+[`steam-agx-memory-20260815.md`](steam-agx-memory-20260815.md) for the runtime
+AGX, memory-curve and event-driven semaphore evidence.
 
 MacBook reference measurements use the matching guarded entry point:
 

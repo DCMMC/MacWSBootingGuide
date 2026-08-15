@@ -44,15 +44,16 @@ env	MACWS_AGX_KEEP_PINNED_ALLOC	off	A/B control	Absent selects the production iO
 env	MACWS_AGX_KEEP_VALIDATE	off	A/B control	Retains an old validation branch when explicitly set.
 env	MACWS_AGX_LIFE_STACK_LARGE	off	diagnostic	Large lifecycle backtraces.
 env	MACWS_AGX_LIFE_VERBOSE	off	diagnostic	Per-resource lifecycle logging.
-env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo	Select the real iOS AGX driver path; mandatory production invariant.
+env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo,Steam	Select the real iOS AGX driver path; mandatory production invariant.
 env	MACWS_AGX_NATIVE_NON2D	off	A/B control	Broad non-2D native texture allocation experiment.
 env	MACWS_AGX_NATIVE_PLAIN	off	inverse A/B control	Variable is absent in production; absence enables the validated native-plain policy.
-env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo	Realize cross-image AGX Objective-C classes.
+env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo,Steam	Realize cross-image AGX Objective-C classes.
 env	MACWS_AGX_RENAMER_PATCH	off	legacy diagnostic	Superseded AIR renamer patch.
 env	MACWS_AGX_STRIP_OPEN_OPTIONS	off	A/B control	IOServiceOpen option mutation.
 env	MACWS_AGX_TEX_BYPASS_GATE	off	diagnostic scaffold	Texture gate bypass.
 env	MACWS_AGX_ZERO_QUEUE_ARGS	off	disproved experiment	Zeroes command-queue arguments.
 env	MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT	on	VS Code,Chrome,Steam	Narrow Chromium task-policy compatibility; covers newer __mac_syscall and CEF 126 __sandbox_ms entry points.
+env	MACWS_CRASHPAD_IMMOVABLE_TASK_PORT_COMPAT	on	Steam	Returns the kernel-equivalent MACH_SEND_INVALID_RIGHT for Crashpad's exact nonfatal CPsx task-port telemetry request before iPadOS raises fatal EXC_GUARD; real exceptions are unchanged.
 env	MACWS_APP_DISPLAY_SETTLE_MS	on	Terminal=750	Bounded Terminal redraw settlement; not enabled for benchmarks.
 env	MACWS_BLUR_TRACE	off	diagnostic	Blur pipeline trace.
 env	MACWS_BLUR_XPC	off	diagnostic experiment	Blur texture XPC experiment.
@@ -110,6 +111,7 @@ env	MACWS_STEAM_LAUNCH_EPOCH	transient	Steam launch transaction	Identifies one o
 env	MACWS_STEAM_NATIVE_BROWSER_LAUNCH	off	removed Steam diagnostic	Native top-level WebUI fork crashes in the Network/XPC atfork child; production uses the atomic spawn adapter.
 env	MACWS_STEAM_NATIVE_EXCEPTION_DIAGNOSTICS	off	Steam diagnostic	Leaves the top-level Helper's native fault visible to CrashReporter/LLDB during an explicit diagnostic.
 env	MACWS_STEAM_PIPE_DIAGNOSTICS	off	Steam diagnostic	Records bounded steam.pipe syscalls without changing results.
+env	MACWS_STEAM_SYSVSEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded System V semaphore keys, flags, results and callers during global-instance election without changing results.
 env	MACWS_STEAM_PROCESS_DIAGNOSTICS	off	Steam diagnostic	Records exact Valve process-adapter decisions and child argv.
 env	MACWS_STEAM_PROCESS_TRACE_ONLY	off	Steam A/B diagnostic	Observes process launch calls while retaining Valve's implementation.
 env	MACWS_STEAM_SEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded named-semaphore lifecycle and value transitions.
@@ -134,7 +136,7 @@ env	MACWS_METAL_PROBE_SOURCE_ONLY	off	standalone probe	Skips event creation and 
 env	MACWS_METAL_PROBE_SOURCE_PATH	off	standalone probe	Compiles Metal source read from the exact requested path.
 env	MACWS_METAL_PROBE_FUNCTION	off	standalone probe	Loads the named function after a source-path probe compile.
 env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source target.
-env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
+env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo,Steam	Required native-AGX allocation compatibility path.
 env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
 env	MACWS_PING_HOLD_SECONDS	off	standalone probe	Keeps PingMTLCompilerService alive for bounded debugger attachment.
 env	MACWS_PROBE_DETACHED_ENUMERATOR	off	standalone ExtensionRecord probe	Exercises the detached application-extension record enumerator path.
@@ -192,6 +194,7 @@ setting	terminal.integrated.enablePersistentSessions	off	dedicated VS Code bench
 artifact	/var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist	on	VS Code production launcher	Packaged outside auto-scanned LaunchDaemons; loaded explicitly only after the GUI is ready.
 artifact	/var/jb/usr/macOS/share/vscode	on	VS Code production assets	Authoritative targetfix13 settings and Aquarium extension copied into the isolated benchmark profile.
 artifact	/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib	on	VS Code ANGLE Metal compatibility	Exact Chromium 148.0.7778.280 ANGLE 1ba8ec3 default shader source compiled by the real iOS MTLCompilerService through the macabi target adapter; selected only for the byte-exact embedded macOS library.
+artifact	/usr/local/share/macws/angle/angle-default-5d4df51-macabi.metallib	on	Steam ANGLE Metal compatibility	Exact Steam Chromium 126 ANGLE 5d4df51 default shader source compiled by the real iOS MTLCompilerService for macabi; selected only for the 368459-byte embedded container with FNV-1a d3e757cc4a31c3c0.
 state	/tmp/macws-vscode-profile-agx-native-targetfix13	on	dedicated VS Code benchmark profile	Project-owned profile; normal user profile is untouched and Chromium caches persist across warm starts.
 state	/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/C/com.microsoft.VSCode.helper/com.apple.metal/.macws-source-target-schema	on	VS Code Metal library cache	Cold-start schema witness value macws-macabi-source-v1; a missing/mismatched value removes only compiler-31001 libraries.list/data so pure-iOS MTLBs cannot survive the macabi source-target migration.
 flag	/private/tmp/macws_agx_dump_methods	off	diagnostic	AGX Objective-C method dump.
@@ -237,6 +240,7 @@ flag	/var/mobile/Library/Preferences/com.macwsguide.dense-grid.disabled	off	Spri
 flag	/var/jb/var/mobile/macws_catalyst_launch.trace	off	runningboardd diagnostic	Logs only the exact hidden Catalyst launcher job rewrite; production keeps this absent.
 flag	/var/jb/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Enables compiler reply patching/dumps and filesystem log witnesses; production keeps native iOS compiler paths unpatched and quiet.
 flag	/var/mobile/macws_mtlcompiler_diagnostics	off	iOS MTLCompilerService	Native iOS-seatbelt spelling of the compiler diagnostics sentinel; equivalent to the rootless alias and removed by production preflight.
+flag	/var/jb/var/mobile/macws_steam_angle_asset_build	off	Steam ANGLE asset builder	Byte-exact one-shot compiler adapter for rebuilding the packaged 5d4df51 macabi library; production cleanup removes it and preflight rejects it.
 flag	/tmp/macws_stop_after_clear	off	diagnostic	Stops capture after clear pass.
 flag	/tmp/macws_submit_diag	off	diagnostic	Submit translation trace and raw dumps.
 flag	/tmp/macws_submit_fast_ring	off	diagnostic	Fixed-memory submit flight recorder.

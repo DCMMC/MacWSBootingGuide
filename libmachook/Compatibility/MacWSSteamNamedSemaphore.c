@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <sys/event.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -36,16 +37,19 @@
 //   Failed to create BinarySemaphore: ... - /BSem/83ace80d
 //   errno: 28, bCreator: false
 //
-// macwshostd owns only the POSIX name/generation lifetime and creates one
-// state vnode for that generation. Steam processes perform every
-// wait/post/getvalue through flock + pread/pwrite on that vnode. Blocking
-// waiters are persisted in FIFO order and re-read that authoritative vnode
-// after ARM WFE scheduling boundaries. WFE is only a low-power wait hint; the
-// vnode predicate remains authoritative, so spurious returns are harmless.
-// This avoids MAP_SHARED assumptions and every mixed-runtime wake primitive
-// which has failed on the real Helper.
-// Broker generation IDs preserve sem_unlink lifetime until the final
-// already-open handle closes.
+// macwshostd owns the POSIX name/generation lifetime and the authoritative
+// semaphore counter. It also creates one small state vnode per generation,
+// but Steam clients use that vnode only to validate an opened generation.
+// wait/post/trywait/getvalue use protocol-v21 AF_UNIX stream requests. A zero
+// blocking wait transfers its connected descriptor into a hostd FIFO; post
+// writes the reply to the oldest descriptor, and the macOS client sleeps in
+// kqueue/EVFILT_READ until that exact stream becomes readable. The real-iPad
+// steam_kevent_wake_probe returned once after 1.005181 s when an iOS-native
+// peer wrote the byte, and an LLDB snapshot of Steam Helper subsequently
+// captured kevent -> MacWSSteamSemaphoreBrokerSocketValue -> sem_wait. This
+// removes the protocol-v20 500-us predicate polling which generated roughly
+// 1,000 wakeups/s. Broker generation IDs preserve sem_unlink lifetime until
+// the final already-open handle closes.
 //
 // This replaces diagnostics which were not production-safe:
 //  * counter + FIFO: /BSem/7c42de60 was posted while Helper remained in read.
@@ -73,9 +77,10 @@
 //    /BSem/59c896b5 after steam_osx wrote value=1, while the exact Helper
 //    remained in mach_msg receive. Re-open retries accumulated 32 dead waiter
 //    ports and then failed sem_open with ENOSPC.
-//  * per-operation Unix stream RPC: protocol v18 logged adjacent request IDs
-//    successfully while a real Helper sem_post remained in the client read
-//    loop and hostd never logged that request's generation.
+//  * per-operation Unix stream RPC: protocol v18 used an ordinary blocking
+//    read; adjacent request IDs arrived while a real Helper sem_post remained
+//    in that read and hostd never observed its generation. Protocol v21 sends
+//    the complete request first and waits through measured-good EVFILT_READ.
 //  * persisted grant + SIGUSR2: steam_osx successfully granted and signaled
 //    Helper 27164 for /BSem/88ece11, but the Helper exited without returning.
 //  * persisted grant + Unix datagram: fd 59 was runtime-confirmed as the bound
@@ -93,13 +98,10 @@
 typedef struct MacWSSteamSemaphoreHandle {
     uint32_t magic;
     int descriptor;
-    int activeDescriptor;
     uint64_t brokerGeneration;
     unsigned referenceCount;
     bool unlinked;
-    pthread_mutex_t stateLock;
     char name[MACWS_STEAM_SEM_NAME_CAPACITY];
-    char path[160];
     struct MacWSSteamSemaphoreHandle *next;
 } MacWSSteamSemaphoreHandle;
 
@@ -299,15 +301,6 @@ static int MacWSSteamSemaphoreReadState(
         errno = EINVAL;
         return -1;
     }
-    return 0;
-}
-
-static int MacWSSteamSemaphoreWriteState(
-        int descriptor, MacWSSteamSemaphoreState *state) {
-    state->revision++;
-    if (pwrite(descriptor, state, sizeof(*state), 0) !=
-            (ssize_t)sizeof(*state) ||
-        ftruncate(descriptor, sizeof(*state)) != 0) return -1;
     return 0;
 }
 
@@ -658,39 +651,6 @@ static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
                                                 uint64_t generation,
                                                 unsigned *value);
 
-static int MacWSSteamSemaphoreBrokerValue(const char *operation,
-                                          uint64_t generation,
-                                          unsigned *value) {
-    uint32_t socketOperation = 0;
-    if (!strcmp(operation, MACWS_STEAM_SEM_OP_WAIT_POLL))
-        socketOperation = MACWS_STEAM_SEM_SOCKET_WAIT_POLL;
-    else if (!strcmp(operation, MACWS_STEAM_SEM_OP_TRYWAIT))
-        socketOperation = MACWS_STEAM_SEM_SOCKET_TRYWAIT;
-    else if (!strcmp(operation, MACWS_STEAM_SEM_OP_POST))
-        socketOperation = MACWS_STEAM_SEM_SOCKET_POST;
-    else if (!strcmp(operation, MACWS_STEAM_SEM_OP_GETVALUE))
-        socketOperation = MACWS_STEAM_SEM_SOCKET_GETVALUE;
-    if (socketOperation != 0)
-        return MacWSSteamSemaphoreBrokerSocketValue(
-            socketOperation, generation, value);
-
-    xpc_object_t reply = MacWSSteamSemaphoreBrokerRequest(
-        operation, NULL, 0, 0, generation);
-    if (!reply) return -1;
-    uint64_t copiedGeneration = xpc_dictionary_get_uint64(
-        reply, MACWS_STEAM_SEM_KEY_GENERATION);
-    uint64_t copiedValue = xpc_dictionary_get_uint64(
-        reply, MACWS_STEAM_SEM_KEY_VALUE);
-    xpc_release(reply);
-    if (copiedGeneration != generation ||
-        copiedValue > MACWS_STEAM_SEM_VALUE_MAX) {
-        errno = EPROTO;
-        return -1;
-    }
-    if (value) *value = (unsigned)copiedValue;
-    return 0;
-}
-
 static int MacWSSteamWriteAll(int descriptor, const void *bytes,
                               size_t length) {
     const uint8_t *cursor = bytes;
@@ -709,40 +669,53 @@ static int MacWSSteamWriteAll(int descriptor, const void *bytes,
 
 static int MacWSSteamReadAll(int descriptor, void *bytes, size_t length) {
     uint8_t *cursor = bytes;
-    struct timespec started = {0};
-    (void)clock_gettime(CLOCK_MONOTONIC, &started);
-    unsigned emptyReads = 0;
+    int queue = kqueue();
+    if (queue < 0) return -1;
+    struct kevent change = {0};
+    EV_SET(&change, descriptor, EVFILT_READ, EV_ADD | EV_ENABLE,
+           0, 0, NULL);
+    bool registered = false;
     while (length != 0) {
-        // Runtime LLDB on the real Helper showed a blocking read remaining in
-        // the kernel after iOS hostd had successfully written and closed this
-        // exact connected stream. Keep the descriptor nonblocking at the call
-        // boundary so this mixed-runtime missed wake cannot park the thread;
-        // sched_yield preserves scheduler fairness while the authoritative
-        // host-side waiter remains blocked without generating more requests.
         ssize_t amount = recv(descriptor, cursor, length, MSG_DONTWAIT);
         if (amount < 0 && errno == EINTR) continue;
         if (amount < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            // A reply is immediate in the ordered host broker. Bound an
-            // unexpected cross-runtime missed wake so one failed transport
-            // cannot spin a CPU indefinitely and heat the device.
-            if ((++emptyReads & 63u) == 0) {
-                struct timespec now = {0};
-                if (clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
-                    now.tv_sec - started.tv_sec >= 5) {
-                    errno = ETIMEDOUT;
-                    return -1;
-                }
+            // Runtime-confirmed by steam_kevent_wake_probe on the real iPad:
+            // a direct blocking read can miss a cross-runtime socket wake,
+            // while EVFILT_READ returned exactly once 1.005181 s after an
+            // iOS-native writer made this same AF_UNIX stream readable. CEF's
+            // own service threads also rely on this kernel readiness path.
+            // Block here instead of generating 500-us deadline wakeups.
+            struct kevent event = {0};
+            int eventCount = kevent(queue,
+                registered ? NULL : &change,
+                registered ? 0 : 1, &event, 1, NULL);
+            registered = true;
+            if (eventCount < 0 && errno == EINTR) continue;
+            if (eventCount != 1) {
+                int savedError = errno ?: EIO;
+                close(queue);
+                errno = savedError;
+                return -1;
             }
-            sched_yield();
+            if (event.flags & EV_ERROR) {
+                int savedError = event.data ? (int)event.data : EIO;
+                close(queue);
+                errno = savedError;
+                return -1;
+            }
             continue;
         }
         if (amount <= 0) {
             if (amount == 0) errno = ECONNRESET;
+            int savedError = errno;
+            close(queue);
+            errno = savedError;
             return -1;
         }
         cursor += (size_t)amount;
         length -= (size_t)amount;
     }
+    close(queue);
     return 0;
 }
 
@@ -795,10 +768,33 @@ static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
         reply.version != MACWS_STEAM_SEM_VERSION ||
         reply.generation != generation ||
         reply.requestID != request.requestID) {
+        if (getenv("MACWS_STEAM_SEM_DIAGNOSTICS"))
+            dprintf(STDERR_FILENO,
+                    "[MacWSSteamSemSocket] pid=%d program=%s "
+                    "envelope-mismatch op=%u request_id=%llu "
+                    "request_generation=%llu reply_magic=%#x "
+                    "reply_version=%u reply_error=%d reply_value=%u "
+                    "reply_generation=%llu reply_id=%llu\n",
+                    getpid(), getprogname() ?: "?", operation,
+                    (unsigned long long)request.requestID,
+                    (unsigned long long)generation, reply.magic,
+                    reply.version, reply.error, reply.value,
+                    (unsigned long long)reply.generation,
+                    (unsigned long long)reply.requestID);
         errno = EPROTO;
         return -1;
     }
     if (reply.error != 0) {
+        if (reply.error != EAGAIN &&
+            getenv("MACWS_STEAM_SEM_DIAGNOSTICS"))
+            dprintf(STDERR_FILENO,
+                    "[MacWSSteamSemSocket] pid=%d program=%s "
+                    "broker-error op=%u request_id=%llu generation=%llu "
+                    "error=%d value=%u\n",
+                    getpid(), getprogname() ?: "?", operation,
+                    (unsigned long long)request.requestID,
+                    (unsigned long long)generation, reply.error,
+                    reply.value);
         errno = reply.error;
         return -1;
     }
@@ -1001,20 +997,9 @@ static sem_t *MacWSSteamSemOpen(const char *name, int flags, ...) {
     }
     handle->magic = MACWS_STEAM_SEM_HANDLE_MAGIC;
     handle->descriptor = descriptor;
-    handle->activeDescriptor = -1;
     handle->brokerGeneration = brokerGeneration;
     handle->referenceCount = 1;
     strlcpy(handle->name, name, sizeof(handle->name));
-    strlcpy(handle->path, path, sizeof(handle->path));
-    int mutexError = pthread_mutex_init(&handle->stateLock, NULL);
-    if (mutexError != 0) {
-        (void)MacWSSteamSemaphoreBrokerSimple(
-            MACWS_STEAM_SEM_OP_CLOSE, NULL, brokerGeneration);
-        close(descriptor);
-        free(handle);
-        errno = mutexError;
-        return SEM_FAILED;
-    }
 
     pthread_mutex_lock(&gMacWSSteamSemaphoreHandlesLock);
     existing = MacWSSteamSemaphoreFindReusableLocked(
@@ -1029,7 +1014,6 @@ static sem_t *MacWSSteamSemOpen(const char *name, int flags, ...) {
     if (existing) {
         (void)MacWSSteamSemaphoreBrokerSimple(
             MACWS_STEAM_SEM_OP_CLOSE, NULL, brokerGeneration);
-        (void)pthread_mutex_destroy(&handle->stateLock);
         close(descriptor);
         free(handle);
         return (sem_t *)existing;
@@ -1076,7 +1060,6 @@ static int MacWSSteamSemClose(sem_t *semaphore) {
         MACWS_STEAM_SEM_OP_CLOSE, NULL, handle->brokerGeneration);
     int brokerError = errno;
     int descriptorResult = close(handle->descriptor);
-    (void)pthread_mutex_destroy(&handle->stateLock);
     handle->magic = 0;
     free(handle);
     if (brokerResult != 0) {
@@ -1105,164 +1088,18 @@ static int MacWSSteamSemUnlink(const char *name) {
     return 0;
 }
 
-static int MacWSSteamSemaphoreLockState(
-        MacWSSteamSemaphoreHandle *handle,
-        MacWSSteamSemaphoreState *state) {
-    int mutexError = pthread_mutex_lock(&handle->stateLock);
-    if (mutexError != 0) {
-        errno = mutexError;
-        return -1;
-    }
-    // A long-lived descriptor in the real macOS CEF Helper can retain a
-    // stale read view even though proc_pidfdinfo proves it has the same
-    // dev/inode as the producer.  LLDB captured revision=2/grant=0 in the
-    // Helper immediately while iOS read revision=3/grant=1 from that inode.
-    // Resolve a fresh file description for each critical section; the
-    // persistent descriptor remains the unlink-lifetime fallback required by
-    // POSIX sem_open semantics.
-    int descriptor = open(handle->path, O_RDWR | O_CLOEXEC);
-    if (descriptor < 0) descriptor = handle->descriptor;
-    if (MacWSSteamFlockExclusive(descriptor) != 0) {
-        int savedError = errno;
-        if (descriptor != handle->descriptor) close(descriptor);
-        (void)pthread_mutex_unlock(&handle->stateLock);
-        errno = savedError;
-        return -1;
-    }
-    if (MacWSSteamSemaphoreReadState(descriptor, state) != 0 ||
-        state->brokerGeneration != handle->brokerGeneration ||
-        strcmp(state->name, handle->name)) {
-        int savedError = errno ?: EINVAL;
-        (void)flock(descriptor, LOCK_UN);
-        if (descriptor != handle->descriptor) close(descriptor);
-        (void)pthread_mutex_unlock(&handle->stateLock);
-        errno = savedError;
-        return -1;
-    }
-    handle->activeDescriptor = descriptor;
-    return 0;
-}
-
-static int MacWSSteamSemaphoreStateDescriptor(
-        MacWSSteamSemaphoreHandle *handle) {
-    return handle->activeDescriptor >= 0 ?
-        handle->activeDescriptor : handle->descriptor;
-}
-
-static void MacWSSteamSemaphoreUnlockState(
-        MacWSSteamSemaphoreHandle *handle, int savedError) {
-    int descriptor = MacWSSteamSemaphoreStateDescriptor(handle);
-    (void)flock(descriptor, LOCK_UN);
-    if (descriptor != handle->descriptor) close(descriptor);
-    handle->activeDescriptor = -1;
-    (void)pthread_mutex_unlock(&handle->stateLock);
-    errno = savedError;
-}
-
-static uint64_t MacWSSteamSemaphoreWaiterID(void) {
-    uint64_t threadID = MacWSSteamCurrentThreadID();
-    return ((uint64_t)(uint32_t)getpid() << 32) |
-        (threadID & UINT64_C(0xffffffff));
-}
-
-static int MacWSSteamSemaphoreFindWaiter(
-        const MacWSSteamSemaphoreState *state, uint64_t waiter) {
-    for (uint32_t index = 0; index < state->waiterCount; index++) {
-        if (state->waiters[index] == waiter) return (int)index;
-    }
-    return -1;
-}
-
-static void MacWSSteamSemaphoreRemoveWaiter(
-        MacWSSteamSemaphoreState *state, uint32_t index) {
-    if (index >= state->waiterCount) return;
-    state->waiterCount--;
-    if (index == state->waiterCount) return;
-    memmove(&state->waiters[index], &state->waiters[index + 1],
-            (state->waiterCount - index) * sizeof(state->waiters[0]));
-    memmove(&state->waiterGranted[index],
-            &state->waiterGranted[index + 1],
-            (state->waiterCount - index) *
-                sizeof(state->waiterGranted[0]));
-}
-
 static int MacWSSteamSemaphoreConsumeKernelTokenInternal(
         MacWSSteamSemaphoreHandle *handle, bool nonblocking) {
-    uint64_t waiter = nonblocking ? 0 : MacWSSteamSemaphoreWaiterID();
-    uint32_t emptyPolls = 0;
-    for (;;) {
-        MacWSSteamSemaphoreState state = {0};
-        if (MacWSSteamSemaphoreLockState(handle, &state) != 0) return -1;
-        int waiterIndex = nonblocking ? -1 :
-            MacWSSteamSemaphoreFindWaiter(&state, waiter);
-        if (waiterIndex >= 0 && state.waiterGranted[waiterIndex]) {
-            MacWSSteamSemaphoreRemoveWaiter(
-                &state, (uint32_t)waiterIndex);
-            int result = MacWSSteamSemaphoreWriteState(
-                MacWSSteamSemaphoreStateDescriptor(handle), &state);
-            int savedError = errno;
-            MacWSSteamSemaphoreUnlockState(handle, savedError);
-            MacWSSteamSemaphoreDiagnose("wait", handle->name, result,
-                                        state.value, handle);
-            return result;
-        }
-        if (state.value != 0) {
-            state.value--;
-            if (waiterIndex >= 0)
-                MacWSSteamSemaphoreRemoveWaiter(
-                    &state, (uint32_t)waiterIndex);
-            int result = MacWSSteamSemaphoreWriteState(
-                MacWSSteamSemaphoreStateDescriptor(handle), &state);
-            int savedError = errno;
-            MacWSSteamSemaphoreUnlockState(handle, savedError);
-            MacWSSteamSemaphoreDiagnose(
-                nonblocking ? "trywait" : "wait", handle->name, result,
-                state.value, handle);
-            return result;
-        }
-        if (nonblocking) {
-            MacWSSteamSemaphoreUnlockState(handle, EAGAIN);
-            return -1;
-        }
-        if (waiterIndex < 0) {
-            if (state.waiterCount >= MACWS_STEAM_SEM_WAITER_CAPACITY) {
-                MacWSSteamSemaphoreUnlockState(handle, ENOSPC);
-                return -1;
-            }
-            uint32_t index = state.waiterCount++;
-            state.waiters[index] = waiter;
-            state.waiterGranted[index] = 0;
-            if (MacWSSteamSemaphoreWriteState(
-                    MacWSSteamSemaphoreStateDescriptor(handle), &state) != 0) {
-                int savedError = errno;
-                MacWSSteamSemaphoreUnlockState(handle, savedError);
-                return -1;
-            }
-        }
-        MacWSSteamSemaphoreUnlockState(handle, 0);
-
-        // The real CEF waiter has remained asleep in every chroot-originated
-        // kernel wait primitive tested, including a POSIX semaphore whose
-        // queued token an iOS-native process could consume. Repeated one-shot
-        // XPC deadlines also stall during libxpc's fourth bootstrap lookup.
-        // A bare WFE can remain asleep after the producer persists a grant:
-        // flock/pwrite does not issue SEV.  The authoritative vnode captured
-        // revision=3 and waiterGranted=1 while the Helper remained after its
-        // 2048th WFE poll.  mach_wait_until is runtime-proven to return in
-        // this process, so use a bounded low-power poll and always re-read the
-        // predicate.  500 us keeps IPC wake latency below a frame without a
-        // userspace spin loop.
-        (void)MacWSSteamRelativeDelay(500);
-        emptyPolls++;
-        bool reportPoll = emptyPolls <= 8 ||
-            (emptyPolls & (emptyPolls - 1)) == 0;
-        if (getenv("MACWS_STEAM_SEM_DIAGNOSTICS") && reportPoll)
-            dprintf(STDERR_FILENO,
-                    "[MacWSSteamSem] pid=%d program=%s op=wait-event "
-                    "waiter=%#llx poll=%u\n", getpid(),
-                    getprogname() ?: "?", (unsigned long long)waiter,
-                    emptyPolls);
-    }
+    unsigned value = 0;
+    uint32_t operation = nonblocking ?
+        MACWS_STEAM_SEM_SOCKET_TRYWAIT :
+        MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK;
+    int result = MacWSSteamSemaphoreBrokerSocketValue(
+        operation, handle->brokerGeneration, &value);
+    MacWSSteamSemaphoreDiagnose(
+        nonblocking ? "trywait" : "wait", handle->name, result, value,
+        handle);
+    return result;
 }
 
 static int MacWSSteamSemaphoreConsumeKernelToken(
@@ -1295,52 +1132,10 @@ static int MacWSSteamSemWait(sem_t *semaphore) {
 static int MacWSSteamSemPost(sem_t *semaphore) {
     MacWSSteamSemaphoreHandle *handle = MacWSSteamSemaphoreFind(semaphore);
     if (!handle) return sem_post(semaphore);
-    MacWSSteamSemaphoreState state = {0};
-    if (MacWSSteamSemaphoreLockState(handle, &state) != 0) return -1;
-
-    int result = 0;
-    bool granted = false;
-    for (uint32_t index = 0; index < state.waiterCount;) {
-        uint64_t waiter = state.waiters[index];
-        pid_t waiterPID = (pid_t)(waiter >> 32);
-        if (waiterPID <= 1 ||
-            (kill(waiterPID, 0) != 0 && errno == ESRCH)) {
-            MacWSSteamSemaphoreRemoveWaiter(&state, index);
-            continue;
-        }
-        if (state.waiterGranted[index]) {
-            index++;
-            continue;
-        }
-
-        state.waiterGranted[index] = 1;
-        result = MacWSSteamSemaphoreWriteState(
-            MacWSSteamSemaphoreStateDescriptor(handle), &state);
-        if (result == 0) {
-            granted = true;
-            break;
-        }
-        break;
-    }
-    if (result == 0 && !granted) {
-        if (state.value == MACWS_STEAM_SEM_VALUE_MAX) {
-            errno = EOVERFLOW;
-            result = -1;
-        } else {
-            state.value++;
-            result = MacWSSteamSemaphoreWriteState(
-                MacWSSteamSemaphoreStateDescriptor(handle), &state);
-        }
-    } else if (result != 0) {
-        // Persist dead-waiter cleanup even when the grant write fails.
-        int operationError = errno;
-        (void)MacWSSteamSemaphoreWriteState(
-            MacWSSteamSemaphoreStateDescriptor(handle), &state);
-        errno = operationError;
-    }
-    int savedError = errno;
-    MacWSSteamSemaphoreUnlockState(handle, savedError);
-    MacWSSteamSemaphoreDiagnose("post", handle->name, result, state.value,
+    unsigned value = 0;
+    int result = MacWSSteamSemaphoreBrokerSocketValue(
+        MACWS_STEAM_SEM_SOCKET_POST, handle->brokerGeneration, &value);
+    MacWSSteamSemaphoreDiagnose("post", handle->name, result, value,
                                 handle);
     MacWSSteamSemaphoreDiagnoseCaller(
         "post", handle, __builtin_return_address(0));
@@ -1354,11 +1149,12 @@ static int MacWSSteamSemGetValue(sem_t *semaphore, int *value) {
         errno = EINVAL;
         return -1;
     }
-    MacWSSteamSemaphoreState state = {0};
-    if (MacWSSteamSemaphoreLockState(handle, &state) != 0) return -1;
-    *value = (int)state.value;
-    MacWSSteamSemaphoreUnlockState(handle, 0);
-    return 0;
+    unsigned brokerValue = 0;
+    int result = MacWSSteamSemaphoreBrokerSocketValue(
+        MACWS_STEAM_SEM_SOCKET_GETVALUE, handle->brokerGeneration,
+        &brokerValue);
+    if (result == 0) *value = (int)brokerValue;
+    return result;
 }
 
 // Preserve Valve's explicit sem_trywait(EAGAIN) + usleep(timeout) polling

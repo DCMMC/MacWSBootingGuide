@@ -9243,6 +9243,76 @@ static bool macws_mach_msg_trace_enabled(void) {
 static _Atomic bool g_macws_steam_mojo_rendezvous_received = false;
 static _Atomic unsigned g_macws_steam_post_rendezvous_records = 0;
 
+// Chromium/Crashpad's macOS DumpWithoutCrashing path sends the synthetic
+// `CPsx` exception through mach_exception_raise_state_identity (MIG id 2407).
+// That request includes mach_task_self() as a COPY_SEND descriptor. iPadOS
+// makes the task-control send right hard-immovable: the kernel returns
+// MACH_SEND_INVALID_RIGHT and also raises a fatal EXC_GUARD. The failed Steam
+// AGX A/B preserved this exact 0x174-byte request in every GPU minidump:
+// id=0x967, descriptor_count=2, exception='CPsx', task descriptor name equal
+// to mach_task_self(), and trap result 0x1000000a.
+//
+// Preserve the kernel's API result without entering the trap for only that
+// non-fatal telemetry request. Crashpad already treats a failed simulated dump
+// as best-effort and returns to its caller; real Mach exceptions, other MIG
+// requests, and non-task descriptors still use the unmodified kernel path.
+static bool macws_crashpad_immovable_task_port_compat_enabled(void) {
+    if (!atomic_load_explicit(&g_macws_libsystem_runtime_ready,
+                              memory_order_acquire)) {
+        return false;
+    }
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        value = getenv("MACWS_CRASHPAD_IMMOVABLE_TASK_PORT_COMPAT") ? 1 : 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_is_crashpad_simulated_task_port_send(
+    const mach_msg_header_t *message,
+    mach_msg_option_t option,
+    mach_msg_size_t send_size) {
+    enum {
+        kMachExceptionRaiseStateIdentityID = 2407,
+        kMachExceptionSimulated = 0x43507378, // Crashpad 'CPsx'
+    };
+    const size_t descriptorOffset = sizeof(mach_msg_header_t) +
+                                    sizeof(mach_msg_body_t);
+    const size_t ndrOffset = descriptorOffset +
+                             2 * sizeof(mach_msg_port_descriptor_t);
+    const size_t exceptionOffset = ndrOffset + 8;
+    const size_t codeCountOffset = exceptionOffset + sizeof(uint32_t);
+    const size_t requiredSize = codeCountOffset + sizeof(uint32_t);
+
+    if (!macws_crashpad_immovable_task_port_compat_enabled() || !message ||
+        !(option & MACH_SEND_MSG) ||
+        !(message->msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
+        message->msgh_id != kMachExceptionRaiseStateIdentityID ||
+        send_size < requiredSize) {
+        return false;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)message;
+    mach_msg_body_t body = {0};
+    mach_msg_port_descriptor_t taskDescriptor = {0};
+    uint32_t exception = 0;
+    uint32_t codeCount = 0;
+    memcpy(&body, bytes + sizeof(mach_msg_header_t), sizeof(body));
+    memcpy(&taskDescriptor,
+           bytes + descriptorOffset + sizeof(mach_msg_port_descriptor_t),
+           sizeof(taskDescriptor));
+    memcpy(&exception, bytes + exceptionOffset, sizeof(exception));
+    memcpy(&codeCount, bytes + codeCountOffset, sizeof(codeCount));
+
+    return body.msgh_descriptor_count == 2 &&
+           taskDescriptor.type == MACH_MSG_PORT_DESCRIPTOR &&
+           taskDescriptor.disposition == MACH_MSG_TYPE_COPY_SEND &&
+           taskDescriptor.name == mach_task_self() &&
+           exception == kMachExceptionSimulated && codeCount == 2;
+}
+
 mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
                                mach_msg_option_t option,
                                mach_msg_size_t send_size,
@@ -9329,9 +9399,33 @@ mach_msg_return_t mach_msg_new(mach_msg_header_t *message,
             &destination_types);
     }
 
-    mach_msg_return_t result = mach_msg(
-        message, option, send_size, receive_limit, receive_name,
-        timeout, notify);
+    bool rejectCrashpadSimulatedTaskPort =
+        macws_is_crashpad_simulated_task_port_send(message, option,
+                                                    send_size);
+    mach_msg_return_t result;
+    if (rejectCrashpadSimulatedTaskPort) {
+        result = MACH_SEND_INVALID_RIGHT;
+        if (machTraceEnabled) {
+            static _Atomic bool recorded = false;
+            if (!atomic_exchange_explicit(&recorded, true,
+                                          memory_order_relaxed)) {
+                char line[256];
+                int length = snprintf(
+                    line, sizeof(line),
+                    "#### CRASHPAD-IMMOVABLE-TASK-PORT pid=%d id=0x%x "
+                    "size=%u result=0x%x (kernel-equivalent, trap skipped)\n",
+                    getpid(), message->msgh_id, send_size, result);
+                if (length > 0) {
+                    size_t writeLength = (size_t)length < sizeof(line)
+                        ? (size_t)length : sizeof(line) - 1;
+                    (void)write(STDERR_FILENO, line, writeLength);
+                }
+            }
+        }
+    } else {
+        result = mach_msg(message, option, send_size, receive_limit,
+                          receive_name, timeout, notify);
+    }
     if (tracePostRendezvous && postRendezvousRecord < 256) {
         char line[384];
         bool received = result == MACH_MSG_SUCCESS &&

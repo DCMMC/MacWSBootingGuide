@@ -95,6 +95,10 @@ INPUT_PLIST="$MACOS_DAEMONS/com.macwsguide.input.plist"
 DISPLAY_PLIST="$MACOS_DAEMONS/com.macwsguide.display.plist"
 INTEROP_PLIST="$MACOS_DAEMONS/com.macwsguide.interop.plist"
 WINDOWSERVER_LABEL=UIKitApplication:com.macwsguide.windowserver
+# Upgrade-only label used by packages predating the UIKitApplication namespace.
+# A loaded copy owns the same SkyLight MachServices and makes the current job
+# exit 256 before launchd can assign it a PID.
+WINDOWSERVER_LEGACY_LABEL=com.apple.WindowServer
 VNC_LABEL=UIKitApplication:com.macwsguide.osxvnc
 TERM_LABEL=UIKitApplication:com.macwsguide.terminal
 PBOARD_LABEL=com.macwsguide.pboard
@@ -143,6 +147,7 @@ VSCODE_METAL_LIBRARY_CACHE="$VSCODE_METAL_CACHE_ROOT/31001"
 VSCODE_METAL_CACHE_SCHEMA=macws-macabi-source-v1
 VSCODE_METAL_CACHE_MARKER="$VSCODE_METAL_CACHE_ROOT/.macws-source-target-schema"
 VSCODE_ANGLE_MACABI_LIBRARY="$ROOTFS/usr/local/share/macws/angle/angle-default-1ba8ec3-macabi.metallib"
+STEAM_ANGLE_MACABI_LIBRARY="$ROOTFS/usr/local/share/macws/angle/angle-default-5d4df51-macabi.metallib"
 CHROME150_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.chrome150.plist
 CHROME150_LABEL=UIKitApplication:com.macwsguide.chrome150
 EXPERIMENTAL_KCMD="$ROOTFS/private/tmp/macws_kcmd_fix"
@@ -159,6 +164,7 @@ EXPERIMENTAL_FAST_SUBMIT_RING="$ROOTFS/private/tmp/macws_submit_fast_ring"
 EXPERIMENTAL_RUNTIME_DIAGNOSTICS="$ROOTFS/private/tmp/macws_runtime_diagnostics"
 MTLCOMPILER_DIAGNOSTICS="$LOGDIR/macws_mtlcompiler_diagnostics"
 MTLCOMPILER_DIAGNOSTICS_NATIVE=/var/mobile/macws_mtlcompiler_diagnostics
+STEAM_ANGLE_ASSET_BUILD="$LOGDIR/macws_steam_angle_asset_build"
 CATALYST_LAUNCH_TRACE="$LOGDIR/macws_catalyst_launch.trace"
 MAPS_HOST_CARRIER_MARKER="$LOGDIR/macws-maps-host-carrier.pid"
 EXPERIMENTAL_QUEUE_QOS="$ROOTFS/private/tmp/macws_queue_qos_diag"
@@ -1050,7 +1056,7 @@ watchdog_pidfile_cleanup() {
 run_watchdog() {
     local last_pid="" restarts=0 t0 started now pid
     local missing_samples=0 next_thermal=0
-    local ws_seen=0 startup_wait_logged=0
+    local ws_seen=0 startup_wait_logged=0 startup_missing_logged=0
     local startup_owner="${MACWS_WATCHDOG_STARTUP_OWNER:-}"
     local runtime_cap_label="disabled"
     case "$startup_owner" in
@@ -1136,11 +1142,28 @@ run_watchdog() {
                 launchctl start "$WINDOWSERVER_LABEL" 2>/dev/null
             fi
             if [ "$missing_samples" -ge 4 ]; then
+                # The foreground launcher owns the bounded 90-second initial
+                # readiness transaction. Killing its LaunchServices/HIServices
+                # dependencies after only four watchdog samples guarantees
+                # that a cold AGX/JIT retry can never recover, while the
+                # launcher keeps waiting against an already-destroyed stack.
+                # During this phase keep the critical-only thermal guard and
+                # leave lifecycle failure to wait_for_initial_ws_ready(). Once
+                # the owner exits, ordinary missing-PID intervention resumes.
+                if [ -n "$startup_owner" ] &&
+                   kill -0 "$startup_owner" 2>/dev/null; then
+                    if [ "$startup_missing_logged" = 0 ]; then
+                        log "watchdog: launcher pid=$startup_owner still owns initial WindowServer readiness; deferring lifecycle trip."
+                        startup_missing_logged=1
+                    fi
+                    continue
+                fi
                 trip_watchdog "WindowServer 连续 $((missing_samples * WD_POLL)) 秒没有进程，已自动停止 macOS GUI"
                 return 0
             fi
         else
             missing_samples=0
+            startup_missing_logged=0
         fi
         if [ -n "$pid" ] && [ "$pid" != "-" ] && [ -n "$last_pid" ] && [ "$pid" != "$last_pid" ]; then
             restarts=$((restarts + 1))
@@ -2280,6 +2303,7 @@ clear_diagnostic_state() {
         rm -f "$ROOTFS$path"
     done
     rm -f "$MTLCOMPILER_DIAGNOSTICS" "$MTLCOMPILER_DIAGNOSTICS_NATIVE" \
+        "$STEAM_ANGLE_ASSET_BUILD" \
         "$CATALYST_LAUNCH_TRACE"
     # Request/reply captures are created only by the compiler diagnostic
     # sentinel.  Remove these exact project-owned directories before an
@@ -2367,6 +2391,39 @@ production_preflight() {
             fi
         done
     fi
+    if [ -d "$ROOTFS/Applications/Steam.app" ] ||
+       [ -d "$ROOTFS/Users/root/Library/Application Support/Steam/Steam.AppBundle" ]; then
+        if [ ! -f "$STEAM_ANGLE_MACABI_LIBRARY" ] ||
+           [ "$(wc -c < "$STEAM_ANGLE_MACABI_LIBRARY" 2>/dev/null)" != 711592 ]; then
+            log "ERROR: exact Steam ANGLE 5d4df51 macabi default library is missing or invalid: $STEAM_ANGLE_MACABI_LIBRARY"
+            bad=1
+        fi
+    fi
+    if [ -d "$ROOTFS/Applications/Steam.app" ]; then
+        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
+                   MACWS_PIN_FALLBACK MACWS_JIT_MPROTECT_COMPAT \
+                   MACWS_JIT_FAULT_WRITE_COMPAT \
+                   MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
+                   MACWS_CRASHPAD_IMMOVABLE_TASK_PORT_COMPAT; do
+            if ! plutil "$STEAM_PLIST" 2>/dev/null |
+                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+                log "ERROR: required Steam production environment $key=1 missing from $STEAM_PLIST"
+                bad=1
+            fi
+        done
+        steam_launcher="$ROOTFS/usr/local/bin/macws-run-steam.sh"
+        if [ ! -f "$steam_launcher" ] ||
+           ! grep -Ev '^[[:space:]]*#' "$steam_launcher" |
+                grep -Eq -- '(^|[[:space:]])-cef-force-gpu([[:space:]]|$)'; then
+            log "ERROR: Steam launcher does not require native CEF GPU: $steam_launcher"
+            bad=1
+        fi
+        if grep -Ev '^[[:space:]]*#' "$steam_launcher" |
+             grep -Eq -- '(^|[[:space:]])-cef-disable-gpu([[:space:]]|$)'; then
+            log "ERROR: retired Steam software CEF policy survived in $steam_launcher"
+            bad=1
+        fi
+    fi
     for path in /tmp/macws_kcmd_fix /tmp/macws_kcmd_wrapped_fix \
                 /tmp/macws_cancel_completion /tmp/macws_final_composite \
                 /tmp/macws_owned_scanout; do
@@ -2400,7 +2457,8 @@ production_preflight() {
     fi
     rm -f "$ROOTFS/private/tmp/macws_production_preflight.bad"
     for path in "$MTLCOMPILER_DIAGNOSTICS" \
-                "$MTLCOMPILER_DIAGNOSTICS_NATIVE"; do
+                "$MTLCOMPILER_DIAGNOSTICS_NATIVE" \
+                "$STEAM_ANGLE_ASSET_BUILD"; do
         if [ -e "$path" ]; then
             log "ERROR: iOS MTLCompilerService diagnostic flag survived production cleanup: $path"
             bad=1
@@ -2524,8 +2582,14 @@ cleanup_macos() {
     rm -f "$ROOTFS"/private/tmp/macws_menu_snapshot.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_input_target.sock
 
-    # 3) WindowServer and the macOS service daemons loaded with it
+    # 3) WindowServer and the macOS service daemons loaded with it. A plist
+    # label migration cannot be cleaned up by unloading the current directory:
+    # launchd retains the already-loaded old label even though the file at the
+    # same path now names the UIKitApplication job. Remove both exact project
+    # generations before the next one can claim the shared SkyLight services.
     launchctl unload "$MACOS_DAEMONS" 2>/dev/null
+    launchctl remove "$WINDOWSERVER_LABEL" 2>/dev/null
+    launchctl remove "$WINDOWSERVER_LEGACY_LABEL" 2>/dev/null
 
     # 4) anything still lingering
     kill_by_pattern "$P_WINDOWSERVER"
@@ -3132,6 +3196,7 @@ start_macos() {
 
     log "Loading input bridge and WindowServer..."
     launchctl load "$INPUT_PLIST" || return 1
+    launchctl remove "$WINDOWSERVER_LEGACY_LABEL" 2>/dev/null
     launchctl load "$WINDOWSERVER_PLIST" || return 1
     log "Waiting for WindowServer graphics initialization before GUI clients..."
     wait_for_initial_ws_ready "$ws_log_start_line" || return 1

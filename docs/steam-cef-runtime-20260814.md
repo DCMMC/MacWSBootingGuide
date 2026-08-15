@@ -1,5 +1,12 @@
 # Steam CEF bring-up — 2026-08-14
 
+> Historical investigation record. Current production behavior and the
+> completed native-AGX/login/memory witnesses are documented in
+> [`steam-cef-bringup-20260815.md`](steam-cef-bringup-20260815.md) and
+> [`steam-agx-memory-20260815.md`](steam-agx-memory-20260815.md). The pending
+> status and retired semaphore/GPU policies below must not be treated as the
+> current launch contract.
+
 ## Status
 
 Steam client build `1785799196` is installed in the macOS rootfs. Its updater,
