@@ -447,6 +447,47 @@ kill_by_pattern() {
     return 0
 }
 
+# Stop several exact chroot executables from one full-width process snapshot.
+# Routine stop used to invoke `ps ax` once per pattern (more than thirty times
+# on the production path).  Runtime timing on 2026-08-17 showed that all
+# selected processes converged inside the existing shared grace period; the
+# repeated process-table walks and serial launchctl calls, not TERM latency,
+# dominated the 37-second stop.  Keep the same fixed-string executable
+# identities and the same PID-bounded KILL fallback while taking one coherent
+# snapshot for the complete WindowServer generation.
+kill_patterns() {
+    local snapshot="" line="" pid="" command="" pat="" matched=0
+    [ "$#" -gt 0 ] || return 0
+    snapshot=$(ps ax -o pid=,command= 2>/dev/null) || return 0
+    while IFS= read -r line; do
+        pid=${line%%[![:space:]]*}
+        line=${line#"$pid"}
+        line=${line#${line%%[![:space:]]*}}
+        pid=${line%%[[:space:]]*}
+        command=${line#"$pid"}
+        command=${command#${command%%[![:space:]]*}}
+        case "$pid" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$pid" = "$$" ] && continue
+        matched=0
+        for pat in "$@"; do
+            case "$command" in
+                *"$pat"*) matched=1; break ;;
+            esac
+        done
+        [ "$matched" -eq 1 ] || continue
+        kill "$pid" 2>/dev/null
+        case " $CLEANUP_TERM_PIDS " in
+            *" $pid "*) ;;
+            *) CLEANUP_TERM_PIDS="$CLEANUP_TERM_PIDS $pid" ;;
+        esac
+    done <<EOF
+$snapshot
+EOF
+    return 0
+}
+
 # Third-party AppKit applications are just as tightly bound to their creating
 # WindowServer generation as the system applications above.  Runtime-confirmed
 # 2026-08-13 in Amadine.host.log and all three Office host logs: after a WS
@@ -1204,6 +1245,71 @@ run_watchdog() {
 BOOT_TRUSTCACHE_INFO=""
 BOOT_TRUSTCACHE_ADDED=0
 APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
+WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
+WINDOWING_REQUIRED_VERSION=16
+
+current_springboard_pid() {
+    ps ax -o pid=,command= 2>/dev/null | awk \
+        '$2 == "/System/Library/CoreServices/SpringBoard.app/SpringBoard" { print $1; exit }'
+}
+
+windowing_bridge_ready() {
+    local springboard_pid="" witness_pid="" witness_version=""
+    springboard_pid=$(current_springboard_pid)
+    [ -n "$springboard_pid" ] || return 1
+    witness_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' \
+        "$WINDOWING_READY_WITNESS" 2>/dev/null)
+    witness_version=$(sed -n 's/^version=\([0-9][0-9]*\).*/\1/p' \
+        "$WINDOWING_READY_WITNESS" 2>/dev/null)
+    case "$witness_version" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$witness_version" -ge "$WINDOWING_REQUIRED_VERSION" ] || return 1
+    [ "$witness_pid" = "$springboard_pid" ] || return 1
+    grep -Fq \
+        'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
+        "$WINDOWING_READY_WITNESS" 2>/dev/null
+}
+
+# MacWSWindowing is a SpringBoard-resident request bridge. Package replacement
+# cannot update an already-running SpringBoard image, and a stale readiness
+# file previously made Host wait for a fullscreen transaction that no process
+# could receive. Refresh only SpringBoard (not backboardd or the whole
+# userspace) when the witness PID/version does not match, then require the new
+# observer generation before starting WindowServer. This may close the Host
+# once after an upgrade; reopening macPad needs no terminal command.
+ensure_windowing_bridge() {
+    local old_pid="" waited=0 new_pid="" witness_pid=""
+    if windowing_bridge_ready; then
+        log "iPad windowing bridge ready for the current SpringBoard generation."
+        return 0
+    fi
+    old_pid=$(current_springboard_pid)
+    log "Refreshing the stale iPad windowing bridge (SpringBoard pid=${old_pid:-none})..."
+    rm -f "$WINDOWING_READY_WITNESS"
+    if [ -n "$old_pid" ]; then
+        /var/jb/usr/bin/killall SpringBoard 2>/dev/null || return 1
+    else
+        launchctl load "$SPRINGBOARD" 2>/dev/null || true
+    fi
+    while [ "$waited" -lt 80 ]; do
+        if windowing_bridge_ready; then
+            new_pid=$(current_springboard_pid)
+            witness_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' \
+                "$WINDOWING_READY_WITNESS" 2>/dev/null)
+            log "iPad windowing bridge refreshed (SpringBoard pid=$new_pid witness=$witness_pid)."
+            if [ -x /var/jb/usr/bin/uicache ]; then
+                /var/jb/usr/bin/uicache -p \
+                    /var/jb/Applications/MacWSHost.app 2>/dev/null || true
+            fi
+            return 0
+        fi
+        sleep 0.25
+        waited=$((waited + 1))
+    done
+    log "ERROR: iPad windowing bridge did not publish a current observer witness within 20 seconds."
+    return 1
+}
 
 boot_trust_hash() {
     local hash="$1"
@@ -2482,108 +2588,36 @@ cleanup_macos() {
     stop_watchdogs
     CLEANUP_TERM_PIDS=""
 
-    # 1) our VNC / Terminal launchd jobs (by plist, then by label as a fallback)
-    launchctl unload "$VNC_PLIST"  2>/dev/null
-    launchctl unload "$TERM_PLIST" 2>/dev/null
-    launchctl unload "$PBOARD_PLIST" 2>/dev/null
-    launchctl unload "$PBS_PLIST" 2>/dev/null
-    launchctl unload "$OFFICE_LICENSING_PLIST" 2>/dev/null
-    launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null
-    launchctl unload "$MACOS_DISKARBITRATIOND_PLIST" 2>/dev/null
-    launchctl remove "$VNC_LABEL"  2>/dev/null
-    launchctl remove "$TERM_LABEL" 2>/dev/null
-    launchctl remove "$PBOARD_LABEL" 2>/dev/null
-    launchctl remove "$PBS_LABEL" 2>/dev/null
-    launchctl remove "$OFFICE_LICENSING_LABEL" 2>/dev/null
-    launchctl remove "$SHAREDFILELISTD_LABEL" 2>/dev/null
-    launchctl remove "$MACOS_DISKARBITRATIOND_LABEL" 2>/dev/null
-    launchctl unload "$LSD_PLIST" 2>/dev/null
-    launchctl remove "$LSD_LABEL" 2>/dev/null
-    launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
-    launchctl remove "$LSD_SYSTEM_LABEL" 2>/dev/null
-    launchctl unload "$CFPREFSD_AGENT_PLIST" 2>/dev/null
-    launchctl unload "$CFPREFSD_DAEMON_PLIST" 2>/dev/null
-    launchctl remove "$CFPREFSD_AGENT_LABEL" 2>/dev/null
-    launchctl remove "$CFPREFSD_DAEMON_LABEL" 2>/dev/null
-    launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
-    launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
-    launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
-    launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
-    launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
-    launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
-    # Upgrade cleanup for the obsolete direct-DockHelper launchd scaffold.
-    launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist" 2>/dev/null
+    # 1) Unload the two project-owned launchd directories once. launchctl
+    # accepts a directory as an atomic job set (the start path already loads
+    # these same directories). Serial plist unload + label remove pairs made a
+    # routine stop spend tens of seconds crossing the launchd control plane.
+    # Exact process cleanup below remains the postcondition witness and catches
+    # jobs from historical labels or malformed older plists.
+    launchctl unload "$GUI_LAUNCHD_DIR" 2>/dev/null
+    launchctl unload "$MACOS_DAEMONS" 2>/dev/null
+    # Upgrade cleanup for labels no longer represented by a current plist.
     launchctl remove com.macwsguide.dockhelper 2>/dev/null
-    for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
-                           "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
-        launchctl unload "$workspace_plist" 2>/dev/null
-    done
-    for workspace_label in "$FINDER_DESKTOP_LABEL" "$DOCK_LABEL" \
-                           "$SYSTEMUI_LABEL" "$CONTROL_CENTER_LABEL"; do
-        launchctl remove "$workspace_label" 2>/dev/null
-    done
-
-    # inputd blocks in recv(2), so tear its job down explicitly before the
-    # broader directory unload and verify no pre-fix binary remains alive.
-    launchctl unload "$INPUT_PLIST" 2>/dev/null
-    launchctl remove "$INPUT_LABEL" 2>/dev/null
-    launchctl unload "$DISPLAY_PLIST" 2>/dev/null
-    launchctl remove "$DISPLAY_LABEL" 2>/dev/null
-    launchctl unload "$INTEROP_PLIST" 2>/dev/null
-    launchctl remove "$INTEROP_LABEL" 2>/dev/null
+    launchctl remove "$WINDOWSERVER_LEGACY_LABEL" 2>/dev/null
     rm -f "$LOCATION_PROVIDER_READY"
 
-    # VS Code is launched separately from this script, but it is still a CGS
-    # client of this WindowServer.  Runtime-confirmed after the 300-second
-    # safety stop: the GUI jobs were gone while Electron and several Code
-    # Helper processes retained hundreds of MiB and a dead WS connection.
-    # Unload the exact optional job whenever its owning GUI stack is torn down.
-    launchctl unload "$VSCODE_PLIST" 2>/dev/null
-    launchctl remove "$VSCODE_LABEL" 2>/dev/null
-    launchctl unload "$STEAM_PLIST" 2>/dev/null
-    launchctl remove "$STEAM_LABEL" 2>/dev/null
-
-    # These are on-demand Ventura services outside the auto-scanned daemon
-    # directory. Unload exact jobs; killing `locationd` by process name would
-    # also terminate iPadOS's native location daemon.
-    launchctl unload "$CORELOCATIONAGENT_PLIST" 2>/dev/null
-    launchctl remove "$CORELOCATIONAGENT_LABEL" 2>/dev/null
-    launchctl unload "$LOCATIONBRIDGE_PLIST" 2>/dev/null
-    launchctl remove "$LOCATIONBRIDGE_LABEL" 2>/dev/null
-    launchctl unload "$MACOS_LOCATIOND_PLIST" 2>/dev/null
-    launchctl remove "$MACOS_LOCATIOND_LABEL" 2>/dev/null
-
     # 2) stray GUI clients (Terminal, VNC, Activity Monitor, ...)
-    kill_by_pattern "$P_OSXVNC"
-    kill_by_pattern "$P_TERMINAL"
-    kill_by_pattern "$P_PBOARD"
-    kill_by_pattern "$P_PBS"
-    kill_by_pattern "$P_OFFICE_LICENSING"
-    kill_by_pattern "$P_ACTIVITYMON"
-    kill_by_pattern "$P_GLASSDEMO"
-    kill_third_party_ws_clients
+    kill_patterns \
+        "$P_OSXVNC" "$P_TERMINAL" "$P_PBOARD" "$P_PBS" \
+        "$P_OFFICE_LICENSING" "$P_ACTIVITYMON" "$P_GLASSDEMO" \
+        "$P_AMADINE" "$P_WORD" "$P_EXCEL" "$P_POWERPOINT" \
+        "$P_MAPS" "$P_SYSTEM_SETTINGS" "$P_FINDER" "$P_DOCK" \
+        "$P_DOCK_HELPER" "$P_SYSTEMUI" "$P_CONTROL_CENTER" \
+        "$P_ICONSERVICESAGENT" "$P_ICONSERVICESD" \
+        "$P_SHAREDFILELISTD" "$P_INPUTD" "$P_DISPLAYD" \
+        "$P_INTEROPD" "$P_VSCODE" "$P_STEAM_OUTER" \
+        "$P_STEAM_LIVE" "$P_STEAM_HELPER" "$P_WINDOWSERVER" \
+        "$P_LAUNCHSERVICESD" "$P_SYSTEMSTATUSD" "$P_FONTD"
     # Maps cannot survive a WindowServer generation change: its CGS port is
     # permanently bound to the retired server even if the Catalyst carrier
     # process remains live.  The old omission made the next launch falsely
     # reuse that live PID and publish no AppKit window.
-    kill_by_pattern "$P_MAPS"
-    kill_by_pattern "$P_SYSTEM_SETTINGS"
     rm -f "$MAPS_HOST_CARRIER_MARKER"
-    kill_by_pattern "$P_FINDER"
-    kill_by_pattern "$P_DOCK"
-    kill_by_pattern "$P_DOCK_HELPER"
-    kill_by_pattern "$P_SYSTEMUI"
-    kill_by_pattern "$P_CONTROL_CENTER"
-    kill_by_pattern "$P_ICONSERVICESAGENT"
-    kill_by_pattern "$P_ICONSERVICESD"
-    kill_by_pattern "$P_SHAREDFILELISTD"
-    kill_by_pattern "$P_INPUTD"
-    kill_by_pattern "$P_DISPLAYD"
-    kill_by_pattern "$P_INTEROPD"
-    kill_by_pattern "$P_VSCODE"
-    kill_by_pattern "$P_STEAM_OUTER"
-    kill_by_pattern "$P_STEAM_LIVE"
-    kill_by_pattern "$P_STEAM_HELPER"
     rm -f "$ROOTFS"/private/tmp/macws_app_input.*.sock
     rm -f "$ROOTFS"/private/tmp/macws_window_metrics.*.bin
     rm -f "$ROOTFS"/private/tmp/macws_menu_client.*.sock
@@ -2595,16 +2629,10 @@ cleanup_macos() {
     # launchd retains the already-loaded old label even though the file at the
     # same path now names the UIKitApplication job. Remove both exact project
     # generations before the next one can claim the shared SkyLight services.
-    launchctl unload "$MACOS_DAEMONS" 2>/dev/null
     launchctl remove "$WINDOWSERVER_LABEL" 2>/dev/null
     launchctl remove "$WINDOWSERVER_LEGACY_LABEL" 2>/dev/null
 
     # 4) anything still lingering
-    kill_by_pattern "$P_WINDOWSERVER"
-    kill_by_pattern "$P_LAUNCHSERVICESD"
-    kill_by_pattern "$P_SHAREDFILELISTD"
-    kill_by_pattern "$P_SYSTEMSTATUSD"
-    kill_by_pattern "$P_FONTD"
     finish_pattern_cleanup
 
     clear_diagnostic_state
@@ -3776,6 +3804,8 @@ case "$CMD" in
     start)
         require_root "$@"
         acquire_gui_transaction start || exit $?
+        write_gui_start_state windowing "verifying the current SpringBoard request bridge"
+        ensure_windowing_bridge || exit 1
         write_gui_start_state preparing "generating launchd contracts"
         write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
         write_gui_start_state cleaning "retiring the previous service generation"
@@ -3812,6 +3842,8 @@ case "$CMD" in
     restart)
         require_root "$@"
         acquire_gui_transaction restart || exit $?
+        write_gui_start_state windowing "verifying the current SpringBoard request bridge"
+        ensure_windowing_bridge || exit 1
         write_gui_start_state preparing "generating launchd contracts"
         write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
         write_gui_start_state cleaning "retiring the active GUI service generation"

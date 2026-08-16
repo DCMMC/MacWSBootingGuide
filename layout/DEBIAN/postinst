@@ -41,7 +41,12 @@ ANGLE_ASSET_TARGET_DIR="$ROOTFS/usr/local/share/macws/angle"
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
 rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
-rm -f /var/jb/var/mobile/macws-application-trust.boot-ready
+# Third-party /Applications CodeDirectories are not package payloads. Keep the
+# same-boot trust marker: postinst already registers every signature it does
+# mutate, while deleting this unrelated marker forced the next routine service
+# restart to run ldid over 12 bundles / 1156 Mach-O images (174 seconds in the
+# 2026-08-17 device trace). A real iOS reboot still changes kern.boottime and
+# therefore takes the complete cold-boot verification path.
 
 # Files copied directly from layout/ retain the build account's uid/gid in a
 # rootless .deb.  iPadOS launchctl rejects system-domain jobs unless their
@@ -654,6 +659,57 @@ if [ -x "$SETTINGS_EXTENSION_PROXY" ]; then
             /var/jb/Applications/SettingsExtensionProxy.app \
             2>/dev/null || true
     fi
+fi
+
+# MacWSWindowing lives inside SpringBoard. Replacing its dylib cannot update an
+# already-running process, and the old readiness file is otherwise
+# indistinguishable from a live observer to the Host. Refresh SpringBoard only
+# (not backboardd/full userspace) when the published PID/version/capability is
+# stale, then require the new observer witness. This is the package-time half
+# of the same self-healing contract enforced by macos_gui.sh at user startup.
+windowing_witness=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
+springboard_pid() {
+    ps ax -o pid=,command= 2>/dev/null | awk \
+        '$2 == "/System/Library/CoreServices/SpringBoard.app/SpringBoard" { print $1; exit }'
+}
+windowing_ready() {
+    sb_pid=$(springboard_pid)
+    witness_pid=$(sed -n 's/.* pid=\([0-9][0-9]*\).*/\1/p' \
+        "$windowing_witness" 2>/dev/null)
+    witness_version=$(sed -n 's/^version=\([0-9][0-9]*\).*/\1/p' \
+        "$windowing_witness" 2>/dev/null)
+    [ -n "$sb_pid" ] && [ "$witness_pid" = "$sb_pid" ] || return 1
+    case "$witness_version" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$witness_version" -ge 16 ] && grep -Fq \
+        'fullscreen=exact-scene-activate-then-maximization-toggle-action-17' \
+        "$windowing_witness" 2>/dev/null
+}
+if ! windowing_ready; then
+    old_springboard_pid=$(springboard_pid)
+    rm -f "$windowing_witness"
+    if [ -n "$old_springboard_pid" ]; then
+        /var/jb/usr/bin/killall SpringBoard 2>/dev/null || exit 1
+    else
+        /var/jb/usr/bin/launchctl load \
+            /System/Library/LaunchDaemons/com.apple.SpringBoard.plist \
+            2>/dev/null || true
+    fi
+    windowing_waited=0
+    while [ "$windowing_waited" -lt 80 ] && ! windowing_ready; do
+        sleep 0.25
+        windowing_waited=$((windowing_waited + 1))
+    done
+    if ! windowing_ready; then
+        echo 'ERROR: MacWSWindowing did not attach to the current SpringBoard within 20 seconds.' >&2
+        exit 1
+    fi
+    if [ -x /var/jb/usr/bin/uicache ]; then
+        /var/jb/usr/bin/uicache -p \
+            /var/jb/Applications/MacWSHost.app 2>/dev/null || true
+    fi
+    echo "Refreshed MacWSWindowing for SpringBoard pid=$(springboard_pid)."
 fi
 
 # AppKit's ViewBridge, HIServices and open/save-panel helpers, plus

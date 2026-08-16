@@ -337,12 +337,25 @@ static BOOL MacWSWindowingBridgeIsLoadedWithCapability(
     NSRange versionMarker = [witness rangeOfString:@"version="];
     NSInteger version = versionMarker.location == NSNotFound ? 0 :
         [[witness substringFromIndex:NSMaxRange(versionMarker)] integerValue];
-    return version >= 13 && [witness containsString:capability];
+    NSRange pidMarker = [witness rangeOfString:@" pid="];
+    pid_t publisherPID = pidMarker.location == NSNotFound ? 0 :
+        (pid_t)[[witness substringFromIndex:NSMaxRange(pidMarker)] intValue];
+    // The witness is published by SpringBoard only after both Darwin request
+    // observers are installed.  A package update can leave that file behind
+    // while a later SpringBoard generation is running without the tweak.
+    // Runtime-confirmed on 2026-08-17: witness pid=342, live SpringBoard
+    // pid=10865, and two Host maximize notifications produced no SpringBoard
+    // log or geometry transaction. Treat publisher liveness as part of the
+    // readiness contract instead of accepting a stale capability string.
+    BOOL publisherAlive = publisherPID > 1 &&
+        (kill(publisherPID, 0) == 0 || errno == EPERM);
+    return version >= 16 && publisherAlive &&
+        [witness containsString:capability];
 }
 
 static BOOL MacWSWindowingFullscreenBridgeIsLoaded(void) {
     return MacWSWindowingBridgeIsLoadedWithCapability(
-        @"fullscreen=focused-scene-maximization-toggle-action-17");
+        @"fullscreen=exact-scene-activate-then-maximization-toggle-action-17");
 }
 
 static BOOL MacWSWindowingResizeBridgeIsLoaded(void) {

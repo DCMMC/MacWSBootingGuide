@@ -11,7 +11,12 @@ ROOTFS=/var/mnt/rootfs
 # Invalidate the same-bootsession Settings ExtensionKit verification cache
 # before an installation can replace any of its signed runtime dependencies.
 rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
-rm -f /var/jb/var/mobile/macws-application-trust.boot-ready
+# The repair mutates project and system-app runtime, not the signed
+# third-party bundles under /Applications. It registers every CodeDirectory it
+# does change below, so invalidating the independent application-trust marker
+# only forces the next ordinary restart to re-run ldid over 1156 unchanged
+# images. A real userspace/iOS reboot still changes kern.boottime and naturally
+# selects the complete cold-boot trust path.
 
 ENT="/var/jb/usr/macOS/bin/entitlements.plist"
 CFPREFSD_ENT="/var/jb/usr/macOS/bin/cfprefsd-entitlements.plist"
