@@ -2012,11 +2012,29 @@ static void ReconcileTransientStreams(void) {
                 // Retirement and a genuinely new ID still create a fresh
                 // policy.
                 if (isNew) layer.oneShotCapture = desiredOneShot;
-                // CGWindowList is front-to-back. Host draws ascending levels,
-                // so reverse that rank and preserve the actual desktop z-order
-                // even when several ordinary windows all report layer zero.
-                int32_t newLevel = (int32_t)MIN((NSUInteger)INT32_MAX,
-                                                count - index);
+                // CGWindowList is front-to-back, but its cross-level order is
+                // not authoritative on this chroot.  Runtime evidence from
+                // Stray listed its opaque-black SkyLight -1 backing ahead of
+                // the visible level-0 game window; using catalog rank alone
+                // consequently painted the backing over the game in Host.
+                // Preserve catalog rank within each semantic level class,
+                // while enforcing SkyLight's structural invariant that all
+                // negative layers are behind ordinary windows and all
+                // positive system/menu layers are in front.  The fixed bands
+                // leave ample room for the bounded desktop catalog rank and
+                // avoid arithmetic on the private INT32_MIN-adjacent desktop
+                // levels.
+                int32_t catalogRank = (int32_t)MIN(
+                    count - index, (NSUInteger)(INT32_MAX / 8));
+                static const int32_t kMacWSNegativeLayerBand =
+                    -(INT32_MAX / 2);
+                static const int32_t kMacWSPositiveLayerBand =
+                    INT32_MAX / 2;
+                int32_t newLevel = candidateSkyLightLayer < 0
+                    ? kMacWSNegativeLayerBand + catalogRank
+                    : (candidateSkyLightLayer > 0
+                        ? kMacWSPositiveLayerBand + catalogRank
+                        : catalogRank);
                 CGRect newDestination = CGRectMake(
                     (candidateBounds.origin.x - desktopBounds.origin.x) * scale,
                     (candidateBounds.origin.y - desktopBounds.origin.y) * scale,
@@ -2131,7 +2149,18 @@ static void ReconcileTransientStreams(void) {
                 candidateMetrics.logicalGroupID == baseMetrics.logicalGroupID;
             if (attached >= 8 || candidateWindowID == 0 ||
                 candidateWindowID == client.windowID ||
-                (level == 0 && !logicalTransient) ||
+                // The Host paints the subscribed base first and then its
+                // related overlays.  A negative SkyLight level is behind the
+                // base by definition and cannot be represented by that
+                // overlay graph.  Capturing it here reverses z-order: Stray
+                // runtime-confirmed this with window 2347 (level 0, complete
+                // calibration pixels) and its full-size window 2350 (level
+                // -1, opaque black), where 2350 covered 2347 in Host even
+                // though screencapture correctly placed it behind.  Level-0
+                // AppKit sheets remain eligible only through their published
+                // logical-group relationship; positive menu/popup layers
+                // remain ordinary overlays.
+                (level <= 0 && !logicalTransient) ||
                 [info[(id)kCGWindowOwnerPID] intValue] != ownerPID ||
                 [info[(id)kCGWindowAlpha] doubleValue] <= 0.01) continue;
             CGRect candidateBounds = CGRectZero;

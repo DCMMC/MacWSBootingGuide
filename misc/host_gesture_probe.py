@@ -1,6 +1,6 @@
 """Send a bounded native Host scroll or magnify gesture to a real app.
 
-This is a transport/visual-response probe: it uses the same version-4 datagram
+This is a transport/visual-response probe: it uses the same version-5 datagram
 records as UIKit, but deliberately does not claim success from process uptime.
 Pair it with DisplayStream counters or before/after Host screenshots.
 """
@@ -18,6 +18,7 @@ from host_input_matrix import (
     GESTURE_ENDED,
     LATENCY_DIAGNOSTIC,
     MAGNIFY,
+    ROTATE,
     SCROLL,
     SCROLL_MOMENTUM,
     SCROLL_WILL_MOMENTUM,
@@ -36,7 +37,8 @@ GLOBAL_SYSTEM_SURFACE = 1 << 6
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("gesture", choices=(
-        "tap", "double-tap", "right-tap", "drag", "scroll", "magnify"))
+        "tap", "double-tap", "right-tap", "drag", "scroll", "magnify",
+        "rotate"))
     parser.add_argument("--pid", type=int, default=0)
     parser.add_argument("--window", type=int, default=0)
     parser.add_argument("--width", type=int, default=2388)
@@ -48,7 +50,7 @@ def main():
     parser.add_argument("--changes", type=int, default=30)
     parser.add_argument("--hz", type=float, default=60.0)
     parser.add_argument("--delta", type=float, default=-4.0,
-                        help="scroll pixels or incremental magnification")
+                        help="scroll pixels, magnification delta, or rotation degrees")
     parser.add_argument("--momentum", action="store_true",
                         help="mark a scroll sequence as native momentum")
     parser.add_argument("--will-momentum", action="store_true",
@@ -79,8 +81,9 @@ def main():
         pass
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     sock.bind(local)
-    kind = SCROLL if args.gesture == "scroll" else MAGNIFY
-    # Scroll repurposes contactID as the horizontal float in the v4 ABI.
+    kind = (SCROLL if args.gesture == "scroll" else
+            ROTATE if args.gesture == "rotate" else MAGNIFY)
+    # Scroll repurposes contactID as the horizontal float in the v5 ABI.
     # A mnemonic integer such as "GSTR" decodes to a huge finite float and is
     # correctly rejected by macwsinputd's +/-16384 input bound.  Magnify and
     # pointer gestures keep a stable ordinary contact identity.
@@ -156,7 +159,7 @@ def main():
         record_count = args.changes + 2
     elapsed = time.perf_counter() - started
     changed_samples = (args.changes if args.gesture in
-                       ("drag", "scroll", "magnify") else 0)
+                       ("drag", "scroll", "magnify", "rotate") else 0)
     print(
         f"gesture={args.gesture} records={record_count} "
         f"elapsed-ms={elapsed * 1000.0:.3f} "

@@ -23,6 +23,7 @@ GEOD_NATIVE_ENT="/var/jb/usr/macOS/bin/geod-native-entitlements.plist"
 DISKARBITRATIOND_NATIVE_ENT="/var/jb/usr/macOS/bin/diskarbitrationd-native-entitlements.plist"
 INTEROP_LOCATION_ENT="/var/jb/usr/macOS/bin/interop-location-entitlements.plist"
 CODE_REQUIREMENT_WRITER="/var/jb/usr/macOS/bin/write_code_requirement.py"
+WEATHER_PREPARER="/var/jb/usr/macOS/bin/prepare_weather_app.py"
 ASPHALT_CA_INTERMEDIATE="/var/jb/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem"
 ASPHALT_OPENSSL_CONFIG="/var/jb/usr/macOS/share/openssl/openssl.cnf"
 MACOS_CA_BUNDLE="/var/mnt/rootfs/etc/ssl/cert.pem"
@@ -185,6 +186,74 @@ sign_and_trustcache_with_identifier_requirement() {
 
     ldid -q "$path" 2>/dev/null | strings |
         grep -Fqx "$identifier" || return 1
+    local arch h
+    for arch in arm64 arm64e x86_64; do
+        h=$(ldid -arch "$arch" -h "$path" 2>/dev/null |
+            grep CDHash= | cut -c8-)
+        [ -n "$h" ] && trust_cdhash "$h" "$path" "$arch"
+    done
+}
+
+prepare_sign_and_trustcache_weather() {
+    local bundle='/var/mnt/rootfs/System/Applications/Weather.app'
+    local path="$bundle/Contents/MacOS/Weather"
+    local info="$bundle/Contents/Info.plist"
+    [ -f "$path" ] || return 0
+    [ -f "$info" ] || return 1
+    [ -f "$WEATHER_PREPARER" ] || return 1
+    [ -f "$CODE_REQUIREMENT_WRITER" ] || return 1
+
+    local native_input="/tmp/macws-weather-native.$$.plist"
+    local native_sanitized="/tmp/macws-weather-sanitized.$$.plist"
+    local requirement_file="/tmp/macws-weather-requirement.$$.bin"
+    ldid -arch arm64e -e "$path" > "$native_input" 2>/dev/null || {
+        rm -f "$native_input" "$native_sanitized" "$requirement_file"
+        return 1
+    }
+    /var/jb/usr/bin/python3 "$WEATHER_PREPARER" \
+        entitlements "$native_input" "$native_sanitized" || {
+        rm -f "$native_input" "$native_sanitized" "$requirement_file"
+        return 1
+    }
+    /var/jb/usr/bin/python3 "$WEATHER_PREPARER" manifest "$info" || {
+        rm -f "$native_input" "$native_sanitized" "$requirement_file"
+        return 1
+    }
+    /var/jb/usr/bin/python3 "$CODE_REQUIREMENT_WRITER" \
+        'com.apple.weather' "$requirement_file" || {
+        rm -f "$native_input" "$native_sanitized" "$requirement_file"
+        return 1
+    }
+
+    # The stock container-required boolean makes iPadOS containermanagerd
+    # reject this manually carried macOS process.  Preserve every other
+    # Weather capability first, then merge only the common MacWS admission
+    # rights.  Two final passes settle ldid's grown __LINKEDIT page hashes.
+    ldid -I'com.apple.weather' -Q"$requirement_file" \
+        -S"$native_sanitized" "$path" &&
+    ldid -I'com.apple.weather' -Q"$requirement_file" \
+        -S"$ENT" -M "$path" &&
+    ldid -I'com.apple.weather' -Q"$requirement_file" \
+        -S"$ENT" -M "$path" || {
+        rm -f "$native_input" "$native_sanitized" "$requirement_file"
+        return 1
+    }
+    rm -f "$native_input" "$native_sanitized" "$requirement_file"
+
+    local final_entitlements
+    final_entitlements=$(ldid -e "$path" 2>/dev/null || true)
+    printf '%s\n' "$final_entitlements" |
+        grep -Fq '<key>com.apple.private.security.storage.Weather</key>' ||
+        return 1
+    printf '%s\n' "$final_entitlements" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' ||
+        return 1
+    if printf '%s\n' "$final_entitlements" |
+            grep -Fq '<key>com.apple.private.security.container-required</key>'; then
+        return 1
+    fi
+    ldid -q "$path" 2>/dev/null | strings |
+        grep -Fqx 'com.apple.weather' || return 1
     local arch h
     for arch in arm64 arm64e x86_64; do
         h=$(ldid -arch "$arch" -h "$path" 2>/dev/null |
@@ -938,6 +1007,7 @@ sign_and_trustcache '/var/mnt/rootfs/System/Applications/System Settings.app/Con
 sign_and_trustcache_with_identifier_requirement \
     '/var/mnt/rootfs/System/Applications/Maps.app/Contents/MacOS/Maps' \
     'com.apple.Maps' || exit 1
+prepare_sign_and_trustcache_weather || exit 1
 # GlassDemo is launched directly by macwshostd before libmachook can ask
 # autosignd for help. Its persistent signature survives reboot, while
 # Dopamine's dynamic trustcache does not.

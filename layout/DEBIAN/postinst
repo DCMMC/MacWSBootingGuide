@@ -30,6 +30,7 @@ GEOD_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/geod-native-entitlements.plist
 DISKARBITRATIOND_NATIVE_ENTITLEMENTS=/var/jb/usr/macOS/bin/diskarbitrationd-native-entitlements.plist
 INTEROP_LOCATION_ENTITLEMENTS=/var/jb/usr/macOS/bin/interop-location-entitlements.plist
 CODE_REQUIREMENT_WRITER=/var/jb/usr/macOS/bin/write_code_requirement.py
+WEATHER_PREPARER=/var/jb/usr/macOS/bin/prepare_weather_app.py
 LIPO=/var/jb/usr/bin/lipo
 ROOTFS=/var/mnt/rootfs
 WORKSPACE_WALLPAPER_SOURCE=/var/jb/usr/macOS/share/wallpapers/macws-forest-lake.png
@@ -268,6 +269,50 @@ ensure_chroot_identifier_requirement_signature() {
     /var/jb/usr/bin/ldid -q "$path" 2>/dev/null | strings |
         grep -Fqx "$identifier" || return 1
     trust_installed_macho "$path"
+}
+
+ensure_weather_signature() {
+    weather_bundle="$ROOTFS/System/Applications/Weather.app"
+    weather_path="$weather_bundle/Contents/MacOS/Weather"
+    weather_info="$weather_bundle/Contents/Info.plist"
+    [ -f "$weather_path" ] || return 0
+    [ -f "$weather_info" ] || return 1
+    [ -f "$WEATHER_PREPARER" ] || return 1
+    [ -f "$CODE_REQUIREMENT_WRITER" ] || return 1
+
+    weather_native="/tmp/macws-weather-native.$$.plist"
+    weather_sanitized="/tmp/macws-weather-sanitized.$$.plist"
+    weather_requirement="/tmp/macws-weather-requirement.$$.bin"
+    /var/jb/usr/bin/ldid -arch arm64e -e "$weather_path" > "$weather_native" 2>/dev/null || {
+        rm -f "$weather_native" "$weather_sanitized" "$weather_requirement"
+        return 1
+    }
+    /var/jb/usr/bin/python3 "$WEATHER_PREPARER" \
+        entitlements "$weather_native" "$weather_sanitized" || return 1
+    /var/jb/usr/bin/python3 "$WEATHER_PREPARER" \
+        manifest "$weather_info" || return 1
+    /var/jb/usr/bin/python3 "$CODE_REQUIREMENT_WRITER" \
+        'com.apple.weather' "$weather_requirement" || return 1
+    /var/jb/usr/bin/ldid -I'com.apple.weather' -Q"$weather_requirement" \
+        -S"$weather_sanitized" "$weather_path" &&
+    /var/jb/usr/bin/ldid -I'com.apple.weather' -Q"$weather_requirement" \
+        -S"$ENTITLEMENTS" -M "$weather_path" &&
+    /var/jb/usr/bin/ldid -I'com.apple.weather' -Q"$weather_requirement" \
+        -S"$ENTITLEMENTS" -M "$weather_path" || return 1
+    rm -f "$weather_native" "$weather_sanitized" "$weather_requirement"
+
+    weather_final=$(/var/jb/usr/bin/ldid -e "$weather_path" 2>/dev/null || true)
+    printf '%s\n' "$weather_final" |
+        grep -Fq '<key>com.apple.private.security.storage.Weather</key>' || return 1
+    printf '%s\n' "$weather_final" |
+        grep -Fq '<key>com.apple.private.graphics-restart-no-kill</key>' || return 1
+    if printf '%s\n' "$weather_final" |
+            grep -Fq '<key>com.apple.private.security.container-required</key>'; then
+        return 1
+    fi
+    /var/jb/usr/bin/ldid -q "$weather_path" 2>/dev/null | strings |
+        grep -Fqx 'com.apple.weather' || return 1
+    trust_installed_macho "$weather_path"
 }
 
 ensure_chroot_extensionkit_signature() {
@@ -511,6 +556,11 @@ if [ -d "$ROOTFS/System/Library" ]; then
     ensure_chroot_identifier_requirement_signature \
         "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" \
         'com.apple.Maps' || exit 1
+    # Weather also needs its native private capabilities and a Catalyst scene
+    # manifest.  The focused helper removes only container-required, which is
+    # incompatible with the responsible-process carrier, before merging the
+    # common MacWS admission rights.
+    ensure_weather_signature || exit 1
     ensure_chroot_application_signature \
         "$ROOTFS/System/Library/CoreServices/UIKitSystem.app/Contents/MacOS/UIKitSystem" || exit 1
     ensure_chroot_application_signature \

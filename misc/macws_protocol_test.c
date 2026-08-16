@@ -24,7 +24,7 @@ int main(void) {
                                        &physicalWidth, &physicalHeight));
     assert(!MacWSPhysicalDisplayExtent(5000.0, 5000.0, 2.0, 8192,
                                        &physicalWidth, &physicalHeight));
-    assert(MACWS_INPUT_VERSION == 4u);
+    assert(MACWS_INPUT_VERSION == 5u);
     assert(MACWS_STREAM_VERSION == 7u);
     assert(MACWS_FINAL_COMPOSITE_VERSION == 1u);
     assert(sizeof(MacWSFinalCompositeRecord) == 56);
@@ -32,6 +32,7 @@ int main(void) {
     assert(MacWSInputSourcePencil != MacWSInputSourceFinger);
     assert(MacWSInputKindDesktopCommand == 20);
     assert(MacWSInputKindSystemGesture == 21);
+    assert(MacWSInputKindRotate == 22);
     assert(MacWSSystemGestureAxisHorizontal == 1);
     assert(MacWSSystemGestureAxisVertical == 2);
     assert(!MacWSStreamFrameSupersedesLayerRemoval(7, 41, 7, 41));

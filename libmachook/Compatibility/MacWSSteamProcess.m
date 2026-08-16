@@ -1,5 +1,6 @@
 @import Darwin;
 @import CydiaSubstrate;
+@import Foundation;
 @import MachO;
 
 #include <dlfcn.h>
@@ -7,6 +8,8 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <spawn.h>
 
 // Valve's tier0 helper launcher has this exported ABI on Steam client build
@@ -35,6 +38,7 @@ static int MacWSSteamCreateSimpleProcess(void *commandOrArguments, int flags,
                                          const char *workingDirectory);
 static bool MacWSPathEndsWith(const char *path, const char *suffix);
 static bool MacWSIsTopLevelSteamBrowser(void);
+static void MacWSInstallSteamApplicationLaunchCompatibility(void);
 extern kern_return_t bootstrap_check_in_new(
     mach_port_t bootstrapPort, const char *serviceName,
     mach_port_t *servicePort);
@@ -208,6 +212,466 @@ static bool MacWSIsTopLevelSteamBrowser(void) {
     return true;
 }
 
+// Steam's native macOS game path deliberately uses NSWorkspace instead of
+// Valve's _CreateSimpleProcess adapter. Runtime-confirmed with client
+// 1785799196: Stray reaches CreatingProcess with its .app URL, while no
+// _CreateSimpleProcess entry is recorded.
+//
+// There are two incompatible integrity owners on iPadOS. Steam must keep the
+// depot copy byte-for-byte vendor signed or its content verifier reports a
+// corrupt file signature. The iPadOS exec policy rejects that same macOS
+// Developer-ID main executable even after its original CDHash is placed in the
+// jailbreak trustcache. Runtime oslog witness for the untouched Stray binary:
+//
+//   System Policy: bash(...) deny(1) process-exec* .../Stray-Mac-Shipping
+//   process-exec denied while updating label
+//   killing com.annapurnainteractive.Stray ... failed to apply exec policy
+//
+// The root-layer compatibility is a separately prepared APFS-cloned runtime
+// app below steamapps/macws-runtime. Its code files carry the MacWS signing
+// profile while its large resources share storage with the depot copy. Steam
+// continues to verify only steamapps/common. Preserve NSWorkspace as launch
+// owner: first let it attempt the exact vendor bundle, then retry the prepared
+// runtime bundle with the same options/arguments/environment. posix_spawn is a
+// final fallback only if both stock NSWorkspace attempts fail.
+typedef id (*MacWSNSWorkspaceLaunchFunction)(
+    id, SEL, NSURL *, NSUInteger, NSDictionary *, NSError **);
+static MacWSNSWorkspaceLaunchFunction
+    gMacWSOriginalNSWorkspaceLaunchApplication;
+static MacWSNSWorkspaceLaunchFunction gMacWSOriginalNSWorkspaceOpenURL;
+typedef id (*MacWSNSWorkspaceOpenURLsFunction)(
+    id, SEL, NSArray *, NSURL *, NSUInteger, NSDictionary *, NSError **);
+static MacWSNSWorkspaceOpenURLsFunction gMacWSOriginalNSWorkspaceOpenURLs;
+
+static NSURL *MacWSSteamRuntimeApplicationURL(NSString *applicationPath) {
+    static NSString *const steamAppsPrefix =
+        @"/Users/root/Library/Application Support/Steam/steamapps/common/";
+    static NSString *const runtimePrefix =
+        @"/Users/root/Library/Application Support/Steam/steamapps/macws-runtime/";
+    if (![applicationPath hasPrefix:steamAppsPrefix] ||
+        ![applicationPath hasSuffix:@".app"]) return nil;
+
+    NSString *relative = [applicationPath substringFromIndex:
+        steamAppsPrefix.length];
+    if (!relative.length || [relative hasPrefix:@"/"] ||
+        [[relative pathComponents] containsObject:@".."]) return nil;
+    NSString *runtimePath = [runtimePrefix stringByAppendingPathComponent:
+        relative];
+    NSString *readyMarker = [[runtimePath stringByDeletingLastPathComponent]
+        stringByAppendingPathComponent:@".macws-shadow-ready"];
+    NSString *infoPath = [runtimePath stringByAppendingPathComponent:
+        @"Contents/Info.plist"];
+    NSFileManager *files = [NSFileManager defaultManager];
+    if (![files fileExistsAtPath:readyMarker] ||
+        ![files fileExistsAtPath:infoPath]) return nil;
+
+    // Stray's UE4 PhysX loader asks for libAPEXFramework.dylib, while the
+    // vendor bundle spells the file libApexFramework.dylib.  That is the same
+    // file on a stock case-insensitive macOS APFS volume, but not on the
+    // case-sensitive chroot rootfs.  Keep Steam's verified depot untouched and
+    // reproduce the normal macOS lookup contract in the writable runtime
+    // shadow with a relative alias.
+    NSString *physXDirectory = [runtimePath stringByAppendingPathComponent:
+        @"Contents/UE4/Engine/Binaries/ThirdParty/PhysX3/Mac"];
+    NSString *physXTarget = [physXDirectory stringByAppendingPathComponent:
+        @"libApexFramework.dylib"];
+    NSString *physXAlias = [physXDirectory stringByAppendingPathComponent:
+        @"libAPEXFramework.dylib"];
+    if ([files fileExistsAtPath:physXTarget] &&
+        ![files fileExistsAtPath:physXAlias]) {
+        NSError *aliasError = nil;
+        [files createSymbolicLinkAtPath:physXAlias
+                   withDestinationPath:@"libApexFramework.dylib"
+                                  error:&aliasError];
+        if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+            fprintf(stderr,
+                    "[MacWSSteamProcess] PhysX case alias path=%s result=%s "
+                    "error=%s\n",
+                    physXAlias.UTF8String ?: "(null)",
+                    [files fileExistsAtPath:physXAlias] ? "ready" : "failed",
+                    aliasError.localizedDescription.UTF8String ?: "(none)");
+            fflush(stderr);
+        }
+    }
+    return [NSURL fileURLWithPath:runtimePath isDirectory:YES];
+}
+
+static NSString *MacWSInsertLibraryForSteamExecutable(
+        NSString *executablePath) {
+    // Steam's LaunchServices configuration does not retain dyld's insertion
+    // variable.  Runtime LLDB on Stray PID 82012 showed the child stopped in
+    // libSystem_initializer -> os_variant_has_internal_diagnostics while
+    // `image list libmachook*.dylib` returned no modules.  Select the same
+    // thin runtime slice as launchdchrootexec from the executable's actual
+    // Mach-O subtype.  A universal Steam title executes its arm64 slice on
+    // this device, so the non-thin/default result is arm64 rather than arm64e.
+    NSString *insert = @"/usr/local/lib/libmachook_arm64.dylib";
+    int descriptor = open(executablePath.fileSystemRepresentation, O_RDONLY);
+    if (descriptor < 0) return insert;
+    struct mach_header_64 header = {};
+    ssize_t readCount = pread(descriptor, &header, sizeof(header), 0);
+    close(descriptor);
+    if (readCount == sizeof(header) && header.magic == MH_MAGIC_64 &&
+        header.cputype == CPU_TYPE_ARM64 &&
+        (header.cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) {
+        insert = @"/usr/local/lib/libmachook.dylib";
+    }
+    return insert;
+}
+
+static char **MacWSCopyEnvironmentForWorkspaceConfiguration(
+        NSDictionary *configuration, NSString *executablePath) {
+    NSDictionary *configured = [configuration objectForKey:
+        @"NSWorkspaceLaunchConfigurationEnvironment"];
+    NSMutableDictionary *merged = [NSMutableDictionary dictionaryWithDictionary:
+        [[NSProcessInfo processInfo] environment]];
+    if ([configured isKindOfClass:[NSDictionary class]])
+        [merged addEntriesFromDictionary:configured];
+    if (executablePath.length) {
+        merged[@"DYLD_INSERT_LIBRARIES"] =
+            MacWSInsertLibraryForSteamExecutable(executablePath);
+        // Steam's own CEF stays on the bounded CPU download profile, but a
+        // launched macOS game must receive the production native-AGX contract.
+        // Do this in the child environment so enabling a game never revives
+        // Steam Helper's historical GPU/SwiftShader memory growth.
+        if ([executablePath containsString:@"/steamapps/macws-runtime/"]) {
+            [merged removeObjectForKey:@"MACWS_STEAM_CPU_RENDERING"];
+            merged[@"MACWS_AGX_NATIVE"] = @"1";
+            merged[@"MACWS_AGX_REGISTER_CLASSES"] = @"1";
+            merged[@"MACWS_PIN_FALLBACK"] = @"1";
+            // Stray's macOS 13 AGX command records have producer-version ABI
+            // fields that differ from iOS 16's native consumer.  Keep the
+            // exact, anchor-validated adapters game-scoped; Steam itself and
+            // unrelated games must not inherit them.  This also makes the
+            // verified NSWorkspace launch use the same contract as the
+            // direct diagnostic runner instead of depending on the launcher's
+            // ambient environment.
+            if ([executablePath.lastPathComponent
+                    isEqualToString:@"Stray-Mac-Shipping"])
+                merged[@"MACWS_STRAY_AGX_COMPAT"] = @"1";
+        }
+        // Reuse the existing bounded termination recorder only while the
+        // Steam launch adapter's explicit diagnostic mode is enabled.  This
+        // is removed with MACWS_STEAM_PROCESS_DIAGNOSTICS in production.
+        if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS"))
+            merged[@"MACWS_STEAM_EXIT_DIAGNOSTICS"] = @"1";
+        if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS"))
+            merged[@"MACWS_STEAM_UE4_DIAGNOSTICS"] = @"1";
+    }
+    // launchdchrootexec normally supplies this data invariant to descendants.
+    // Keep it explicit when Steam creates a fresh environment dictionary.
+    if (![merged[@"MACWS_CHROOT_HOST_ROOT"] isKindOfClass:[NSString class]])
+        merged[@"MACWS_CHROOT_HOST_ROOT"] = @"/private/var/mnt/rootfs";
+
+    char **environment = calloc(merged.count + 1, sizeof(*environment));
+    if (!environment) return NULL;
+    __block size_t output = 0;
+    __block bool valid = true;
+    [merged enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+        if (![key isKindOfClass:[NSString class]] ||
+            ![value isKindOfClass:[NSString class]]) {
+            valid = false;
+            *stop = YES;
+            return;
+        }
+        const char *keyBytes = [(NSString *)key UTF8String];
+        const char *valueBytes = [(NSString *)value UTF8String];
+        if (!keyBytes || !valueBytes ||
+            asprintf(&environment[output], "%s=%s", keyBytes, valueBytes) < 0) {
+            valid = false;
+            *stop = YES;
+            return;
+        }
+        output++;
+    }];
+    if (valid) return environment;
+    for (size_t index = 0; index < output; index++) free(environment[index]);
+    free(environment);
+    return NULL;
+}
+
+static void MacWSFreeCStringVector(char **vector) {
+    if (!vector) return;
+    for (size_t index = 0; vector[index]; index++) free(vector[index]);
+    free(vector);
+}
+
+static id MacWSSteamLaunchApplicationAtURL(
+        id workspace, SEL selector, NSURL *applicationURL, NSUInteger options,
+        NSDictionary *configuration, NSError **error) {
+    id launched = gMacWSOriginalNSWorkspaceLaunchApplication
+        ? gMacWSOriginalNSWorkspaceLaunchApplication(
+            workspace, selector, applicationURL, options, configuration, error)
+        : nil;
+    NSError *originalError = error ? *error : nil;
+    NSString *applicationPath = [applicationURL path];
+    bool diagnostics = getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS") != NULL;
+    if (diagnostics) {
+        NSDictionary *configuredEnvironment = [configuration objectForKey:
+            @"NSWorkspaceLaunchConfigurationEnvironment"];
+        NSArray *configuredArguments = [configuration objectForKey:
+            @"NSWorkspaceLaunchConfigurationArguments"];
+        fprintf(stderr,
+                "[MacWSSteamProcess] NSWorkspace launch path=%s options=%#lx "
+                "result=%p error-domain=%s error-code=%ld argc=%lu envc=%lu\n",
+                applicationPath.UTF8String ?: "(null)",
+                (unsigned long)options, launched,
+                originalError.domain.UTF8String ?: "(none)",
+                (long)originalError.code,
+                (unsigned long)([configuredArguments isKindOfClass:
+                    [NSArray class]] ? configuredArguments.count : 0),
+                (unsigned long)([configuredEnvironment isKindOfClass:
+                    [NSDictionary class]] ? configuredEnvironment.count : 0));
+        if ([configuredArguments isKindOfClass:[NSArray class]]) {
+            for (NSUInteger index = 0; index < configuredArguments.count;
+                 index++) {
+                NSString *argument = configuredArguments[index];
+                fprintf(stderr,
+                        "[MacWSSteamProcess] workspace-argv[%lu]=%s\n",
+                        (unsigned long)index,
+                        [argument isKindOfClass:[NSString class]]
+                            ? argument.UTF8String : "(non-string)");
+            }
+        }
+        fflush(stderr);
+    }
+    static NSString *const steamAppsPrefix =
+        @"/Users/root/Library/Application Support/Steam/steamapps/common/";
+    if (launched || !getenv("MACWS_STEAM_APP_LAUNCH_COMPAT") ||
+        ![applicationPath hasPrefix:steamAppsPrefix] ||
+        ![applicationPath hasSuffix:@".app"]) {
+        return launched;
+    }
+
+    // Steam has already verified the depot path before it reaches this call.
+    // If the stock NSWorkspace launch failed, give the same LaunchServices
+    // owner a separately signed runtime bundle. This retains app registration,
+    // activation and Steam's launch environment instead of fabricating a
+    // successful return around a failed source-bundle launch.
+    NSURL *runtimeApplicationURL = MacWSSteamRuntimeApplicationURL(
+        applicationPath);
+    if (runtimeApplicationURL &&
+        gMacWSOriginalNSWorkspaceLaunchApplication) {
+        NSError *runtimeError = nil;
+        id runtimeApplication =
+            gMacWSOriginalNSWorkspaceLaunchApplication(
+                workspace, selector, runtimeApplicationURL, options,
+                configuration, &runtimeError);
+        fprintf(stderr,
+                "[MacWSSteamProcess] NSWorkspace runtime launch source=%s "
+                "runtime=%s result=%p error-domain=%s error-code=%ld\n",
+                applicationPath.UTF8String ?: "(null)",
+                runtimeApplicationURL.path.UTF8String ?: "(null)",
+                runtimeApplication,
+                runtimeError.domain.UTF8String ?: "(none)",
+                (long)runtimeError.code);
+        fflush(stderr);
+        if (runtimeApplication) {
+            if (error) *error = nil;
+            return runtimeApplication;
+        }
+        applicationURL = runtimeApplicationURL;
+    }
+
+    CFBundleRef bundle = CFBundleCreate(kCFAllocatorDefault,
+                                        (__bridge CFURLRef)applicationURL);
+    CFURLRef executableURL = bundle ? CFBundleCopyExecutableURL(bundle) : NULL;
+    NSString *executablePath = executableURL
+        ? [(__bridge NSURL *)executableURL path] : nil;
+    NSArray *configuredArguments = [configuration objectForKey:
+        @"NSWorkspaceLaunchConfigurationArguments"];
+    if (![configuredArguments isKindOfClass:[NSArray class]])
+        configuredArguments = @[];
+    // UE4 shipping builds normally keep their early boot log out of stderr.
+    // During the bounded launch diagnostic, request the engine's own log and
+    // preserve it in the chroot tmp directory.  These arguments are never
+    // present when MACWS_STEAM_PROCESS_DIAGNOSTICS is disabled.
+    NSArray *diagnosticArguments = diagnostics ? @[
+        @"-log",
+        @"-stdout",
+        @"-FullStdOutLogOutput",
+        @"-abslog=/tmp/MacWS-Stray.log"
+    ] : @[];
+    char **arguments = executablePath
+        ? calloc(configuredArguments.count + diagnosticArguments.count + 2,
+                 sizeof(*arguments)) : NULL;
+    char **environment = MacWSCopyEnvironmentForWorkspaceConfiguration(
+        configuration, executablePath);
+    bool valid = arguments && environment;
+    if (valid) arguments[0] = strdup(executablePath.UTF8String);
+    for (NSUInteger index = 0; valid && index < configuredArguments.count;
+         index++) {
+        NSString *argument = configuredArguments[index];
+        if (![argument isKindOfClass:[NSString class]] ||
+            !(arguments[index + 1] = strdup(argument.UTF8String))) {
+            valid = false;
+        }
+    }
+    for (NSUInteger index = 0; valid && index < diagnosticArguments.count;
+         index++) {
+        NSString *argument = diagnosticArguments[index];
+        NSUInteger output = configuredArguments.count + index + 1;
+        if (!(arguments[output] = strdup(argument.UTF8String))) valid = false;
+    }
+
+    posix_spawn_file_actions_t actions;
+    bool actionsReady = false;
+    int spawnError = valid ? posix_spawn_file_actions_init(&actions) : EINVAL;
+    if (spawnError == 0) {
+        actionsReady = true;
+        typedef int (*MacWSAddChdirFunction)(
+            posix_spawn_file_actions_t *, const char *);
+        MacWSAddChdirFunction addChdir = (MacWSAddChdirFunction)dlsym(
+            RTLD_DEFAULT, "posix_spawn_file_actions_addchdir_np");
+        NSString *workingDirectory =
+            [executablePath stringByDeletingLastPathComponent];
+        if (addChdir && workingDirectory.length)
+            spawnError = addChdir(&actions, workingDirectory.UTF8String);
+    }
+    pid_t child = 0;
+    if (spawnError == 0) {
+        spawnError = posix_spawn(&child, executablePath.UTF8String,
+                                 &actions, NULL, arguments, environment);
+    }
+    if (actionsReady) posix_spawn_file_actions_destroy(&actions);
+    MacWSFreeCStringVector(arguments);
+    MacWSFreeCStringVector(environment);
+    if (executableURL) CFRelease(executableURL);
+    if (bundle) CFRelease(bundle);
+
+    id runningApplication = nil;
+    if (spawnError == 0) {
+        Class runningApplicationClass = NSClassFromString(@"NSRunningApplication");
+        SEL runningSelector = NSSelectorFromString(
+            @"runningApplicationWithProcessIdentifier:");
+        for (unsigned int attempt = 0;
+             attempt < 200 && !runningApplication; attempt++) {
+            if ([runningApplicationClass respondsToSelector:runningSelector]) {
+                runningApplication = ((id (*)(id, SEL, pid_t))objc_msgSend)(
+                    runningApplicationClass, runningSelector, child);
+            }
+            if (!runningApplication) usleep(10000);
+        }
+        if (error) *error = nil;
+    }
+    fprintf(stderr,
+            "[MacWSSteamProcess] NSWorkspace fallback executable=%s "
+            "insert=%s spawn-error=%d pid=%d running-app=%p "
+            "original-error=%ld\n",
+            executablePath.UTF8String ?: "(null)",
+            MacWSInsertLibraryForSteamExecutable(executablePath).UTF8String,
+            spawnError, child, runningApplication,
+            (long)originalError.code);
+    fflush(stderr);
+    return runningApplication;
+}
+
+static id MacWSSteamOpenURL(
+        id workspace, SEL selector, NSURL *url, NSUInteger options,
+        NSDictionary *configuration, NSError **error) {
+    id launched = gMacWSOriginalNSWorkspaceOpenURL
+        ? gMacWSOriginalNSWorkspaceOpenURL(
+            workspace, selector, url, options, configuration, error) : nil;
+    if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+        NSError *launchError = error ? *error : nil;
+        fprintf(stderr,
+                "[MacWSSteamProcess] NSWorkspace openURL path=%s "
+                "options=%#lx result=%p error-domain=%s error-code=%ld\n",
+                url.path.UTF8String ?: "(null)", (unsigned long)options,
+                launched, launchError.domain.UTF8String ?: "(none)",
+                (long)launchError.code);
+        fflush(stderr);
+    }
+    if (launched || ![url.path hasSuffix:@".app"]) return launched;
+    return MacWSSteamLaunchApplicationAtURL(
+        workspace,
+        NSSelectorFromString(
+            @"launchApplicationAtURL:options:configuration:error:"),
+        url, options, configuration, error);
+}
+
+static id MacWSSteamOpenURLs(
+        id workspace, SEL selector, NSArray *urls, NSURL *applicationURL,
+        NSUInteger options, NSDictionary *configuration, NSError **error) {
+    id launched = gMacWSOriginalNSWorkspaceOpenURLs
+        ? gMacWSOriginalNSWorkspaceOpenURLs(
+            workspace, selector, urls, applicationURL, options,
+            configuration, error) : nil;
+    if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+        NSError *launchError = error ? *error : nil;
+        fprintf(stderr,
+                "[MacWSSteamProcess] NSWorkspace openURLs app=%s items=%lu "
+                "options=%#lx result=%p error-domain=%s error-code=%ld\n",
+                applicationURL.path.UTF8String ?: "(null)",
+                (unsigned long)([urls isKindOfClass:[NSArray class]]
+                    ? urls.count : 0),
+                (unsigned long)options, launched,
+                launchError.domain.UTF8String ?: "(none)",
+                (long)launchError.code);
+        fflush(stderr);
+    }
+    if (launched || ![applicationURL.path hasSuffix:@".app"])
+        return launched;
+    return MacWSSteamLaunchApplicationAtURL(
+        workspace,
+        NSSelectorFromString(
+            @"launchApplicationAtURL:options:configuration:error:"),
+        applicationURL, options, configuration, error);
+}
+
+static void MacWSInstallSteamApplicationLaunchCompatibility(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Class workspaceClass = NSClassFromString(@"NSWorkspace");
+        SEL sharedSelector = NSSelectorFromString(@"sharedWorkspace");
+        id sharedWorkspace = [workspaceClass respondsToSelector:sharedSelector]
+            ? ((id (*)(id, SEL))objc_msgSend)(workspaceClass, sharedSelector)
+            : nil;
+        Class implementationClass = sharedWorkspace
+            ? object_getClass(sharedWorkspace) : workspaceClass;
+        SEL selector = NSSelectorFromString(
+            @"launchApplicationAtURL:options:configuration:error:");
+        Method method = implementationClass
+            ? class_getInstanceMethod(implementationClass, selector) : NULL;
+        if (!method) return;
+        gMacWSOriginalNSWorkspaceLaunchApplication =
+            (MacWSNSWorkspaceLaunchFunction)method_getImplementation(method);
+        method_setImplementation(method,
+                                 (IMP)MacWSSteamLaunchApplicationAtURL);
+        SEL openURLSelector = NSSelectorFromString(
+            @"openURL:options:configuration:error:");
+        Method openURLMethod = class_getInstanceMethod(
+            implementationClass, openURLSelector);
+        if (openURLMethod) {
+            gMacWSOriginalNSWorkspaceOpenURL =
+                (MacWSNSWorkspaceLaunchFunction)method_getImplementation(
+                    openURLMethod);
+            method_setImplementation(openURLMethod, (IMP)MacWSSteamOpenURL);
+        }
+        SEL openURLsSelector = NSSelectorFromString(
+            @"openURLs:withApplicationAtURL:options:configuration:error:");
+        Method openURLsMethod = class_getInstanceMethod(
+            implementationClass, openURLsSelector);
+        if (openURLsMethod) {
+            gMacWSOriginalNSWorkspaceOpenURLs =
+                (MacWSNSWorkspaceOpenURLsFunction)method_getImplementation(
+                    openURLsMethod);
+            method_setImplementation(openURLsMethod, (IMP)MacWSSteamOpenURLs);
+        }
+        if (getenv("MACWS_STEAM_PROCESS_DIAGNOSTICS")) {
+            fprintf(stderr,
+                    "[MacWSSteamProcess] NSWorkspace launch compatibility "
+                    "installed class=%s launch=%p openURL=%p openURLs=%p\n",
+                    implementationClass ? class_getName(implementationClass)
+                        : "(null)",
+                    gMacWSOriginalNSWorkspaceLaunchApplication,
+                    gMacWSOriginalNSWorkspaceOpenURL,
+                    gMacWSOriginalNSWorkspaceOpenURLs);
+            fflush(stderr);
+        }
+    });
+}
+
 // AppKit's first finishLaunching pass asks HIServices for the lazily linked
 // AccessibilityBaseImplementations image.  Steam CEF has already created and
 // retired startup workers by that point.  On the iPadOS 16 kernel the macOS
@@ -329,21 +793,70 @@ static bool MacWSPathEndsWith(const char *path, const char *suffix) {
 // launch mode at the parent call site, before initialization; this keeps its
 // internal invariants intact and matches the kernel policy already attached to
 // the process. Restrict the switch to Valve's exact browser helper.
+static bool MacWSSteamArgumentPresent(char *const *arguments,
+                                      const char *expected) {
+    for (size_t index = 0; arguments && arguments[index]; index++) {
+        if (!strcmp(arguments[index], expected)) return true;
+    }
+    return false;
+}
+
+static bool MacWSSteamArgumentsHaveProcessType(char *const *arguments) {
+    for (size_t index = 0; arguments && arguments[index]; index++) {
+        if (!strncmp(arguments[index], "--type=", 7)) return true;
+    }
+    return false;
+}
+
 static char **MacWSArgumentsByAddingSteamBrowserPolicy(
     const char *executable, char *const *arguments) {
     static const char helperSuffix[] =
         "/Steam Helper.app/Contents/MacOS/Steam Helper";
     if (!MacWSPathEndsWith(executable, helperSuffix) || !arguments) return NULL;
     size_t count = 0;
-    while (arguments[count]) {
-        if (!strcmp(arguments[count], "--no-sandbox")) return NULL;
-        count++;
+    while (arguments[count]) count++;
+
+    // Steam's outer -cef-disable-gpu switch enables Chromium's software
+    // compositor but still allows the GPU helper to instantiate SwiftShader.
+    // The historical Jetsam witness attributed 600180 resident 16-KiB pages
+    // (9.16 GiB) to that exact gpu-process role. In the explicit download/UI
+    // profile, keep software page compositing while disabling the separate
+    // software rasterizer, GPU raster and zero-copy buffer paths. Apply this
+    // only to the top-level Valve Browser command line; Chromium propagates
+    // its supported switches to its own children, while games and unrelated
+    // MacWS applications remain untouched.
+    bool cpuRendering = getenv("MACWS_STEAM_CPU_RENDERING") != NULL &&
+        !MacWSSteamArgumentsHaveProcessType(arguments);
+    static const char *const cpuPolicies[] = {
+        "--disable-software-rasterizer",
+        "--disable-gpu-rasterization",
+        "--disable-zero-copy",
+    };
+    size_t additions = MacWSSteamArgumentPresent(arguments, "--no-sandbox")
+        ? 0 : 1;
+    if (cpuRendering) {
+        for (size_t index = 0;
+             index < sizeof(cpuPolicies) / sizeof(cpuPolicies[0]); index++) {
+            if (!MacWSSteamArgumentPresent(arguments, cpuPolicies[index]))
+                additions++;
+        }
     }
-    char **result = calloc(count + 2, sizeof(*result));
+    if (additions == 0) return NULL;
+
+    char **result = calloc(count + additions + 1, sizeof(*result));
     if (!result) return NULL;
     for (size_t index = 0; index < count; index++)
         result[index] = arguments[index];
-    result[count] = (char *)"--no-sandbox";
+    size_t output = count;
+    if (!MacWSSteamArgumentPresent(arguments, "--no-sandbox"))
+        result[output++] = (char *)"--no-sandbox";
+    if (cpuRendering) {
+        for (size_t index = 0;
+             index < sizeof(cpuPolicies) / sizeof(cpuPolicies[0]); index++) {
+            if (!MacWSSteamArgumentPresent(arguments, cpuPolicies[index]))
+                result[output++] = (char *)cpuPolicies[index];
+        }
+    }
     return result;
 }
 
@@ -571,6 +1084,7 @@ static void MacWSInstallSteamProcessCompatibility(void) {
     if (getenv("MACWS_DISABLE_STEAM_PROCESS_COMPAT")) return;
     if (MacWSIsSteamProcess()) {
         MacWSPrepareSteamAccessibilityRuntime();
+        MacWSInstallSteamApplicationLaunchCompatibility();
         _dyld_register_func_for_add_image(MacWSSteamProcessImageLoaded);
         for (uint32_t index = 0; index < _dyld_image_count(); index++)
             MacWSSteamProcessImageLoaded(_dyld_get_image_header(index),

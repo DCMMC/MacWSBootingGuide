@@ -148,6 +148,7 @@ static const char *KindName(MacWSInputKind kind) {
         case MacWSInputKindSecondaryTap: return "secondary-tap";
         case MacWSInputKindScroll: return "scroll";
         case MacWSInputKindMagnify: return "magnify";
+        case MacWSInputKindRotate: return "rotate";
         case MacWSInputKindConfigureWindow: return "configure-window";
         case MacWSInputKindCloseWindow: return "close-window";
         case MacWSInputKindCreateInitialWindow: return "create-initial-window";
@@ -214,11 +215,13 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
             fabsf(record->pressure) > 16384.0f ||
             fabsf(horizontal) > 16384.0f) return false;
     }
-    if (record->kind == MacWSInputKindMagnify) {
+    if (record->kind == MacWSInputKindMagnify ||
+        record->kind == MacWSInputKindRotate) {
         uint16_t phase = record->flags &
             (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
              MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
-        if (!isfinite(record->pressure) || fabsf(record->pressure) > 4.0f ||
+        float limit = record->kind == MacWSInputKindRotate ? 720.0f : 4.0f;
+        if (!isfinite(record->pressure) || fabsf(record->pressure) > limit ||
             (phase != MacWSInputFlagGestureBegan &&
              phase != MacWSInputFlagGestureChanged &&
              phase != MacWSInputFlagGestureEnded &&
@@ -244,7 +247,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindSystemGesture) {
+        record->kind > MacWSInputKindRotate) {
         return false;
     }
     return true;
@@ -289,6 +292,7 @@ static CGEventType EventTypeForRecord(const MacWSInputRecord *record,
         case MacWSInputKindKeyUp:
         case MacWSInputKindScroll:
         case MacWSInputKindMagnify:
+        case MacWSInputKindRotate:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
@@ -729,6 +733,8 @@ static bool SendToAppInputBridge(int socketFD,
                        (record->flags & MacWSInputFlagScrollChanged)) ||
                       (record->kind == MacWSInputKindMagnify &&
                        (record->flags & MacWSInputFlagGestureChanged)) ||
+                      (record->kind == MacWSInputKindRotate &&
+                       (record->flags & MacWSInputFlagGestureChanged)) ||
                       (record->kind == MacWSInputKindSystemGesture &&
                        (record->flags & MacWSInputFlagGestureChanged));
     unsigned attempts = continuous ? 1 : 2;
@@ -994,6 +1000,7 @@ static MacWSWindowTarget ProbeAppInputTarget(
         record->kind == MacWSInputKindKeyUp ||
         record->kind == MacWSInputKindScroll ||
         record->kind == MacWSInputKindMagnify ||
+        record->kind == MacWSInputKindRotate ||
         record->kind == MacWSInputKindDesktopCommand ||
         systemMenuActivation;
     if (target.pid <= 1 && allowActiveFallback) {
@@ -1371,11 +1378,12 @@ int main(void) {
                          record.kind == MacWSInputKindKeyUp;
         bool scrollRecord = record.kind == MacWSInputKindScroll;
         bool magnifyRecord = record.kind == MacWSInputKindMagnify;
+        bool rotateRecord = record.kind == MacWSInputKindRotate;
         bool desktopCommandRecord =
             record.kind == MacWSInputKindDesktopCommand;
         bool systemGestureRecord =
             record.kind == MacWSInputKindSystemGesture;
-        bool gestureRecord = scrollRecord || magnifyRecord;
+        bool gestureRecord = scrollRecord || magnifyRecord || rotateRecord;
         if (fullscreenGlobalPointerRecord) {
             // A fullscreen workspace is a hardware-style global input
             // surface. Its composited Mission Control/Dock transforms are
@@ -1770,6 +1778,22 @@ int main(void) {
                 fprintf(stderr,
                     "MACWS-INPUT MAGNIFY seq=%llu target=%d phase=%#x "
                     "amount=%.6f app-bridge=%s errno=%d\n",
+                    (unsigned long long)sequence, eventTarget.pid,
+                    record.flags, record.pressure,
+                    appBridgeSent ? "YES" : "NO", appBridgeError);
+                fflush(stderr);
+            }
+            if (record.flags & (MacWSInputFlagGestureEnded |
+                                MacWSInputFlagGestureCancelled))
+                gestureTarget = (MacWSWindowTarget){0};
+            continue;
+        }
+        if (rotateRecord) {
+            sequence++;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT ROTATE seq=%llu target=%d phase=%#x "
+                    "degrees=%.6f app-bridge=%s errno=%d\n",
                     (unsigned long long)sequence, eventTarget.pid,
                     record.flags, record.pressure,
                     appBridgeSent ? "YES" : "NO", appBridgeError);

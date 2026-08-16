@@ -20,6 +20,41 @@ echo === stopping GUI stack ===
 # while the orphan workload had already held the device near 5.2 W.
 # Authenticate with the exact current token, then clear the now-stopped lease
 # so a dead test owner cannot block the next deliberate session.
+# A SIGKILL of macwshostd does not kill its already-spawned macos_gui.sh child;
+# launchd reparents that transaction to pid 1 and its live PID keeps the
+# atomic transition lock authoritative.  Runtime-confirmed 2026-08-16: an
+# interrupted cold trust scan survived the old cleanup and the next macPad
+# retry correctly refused with exit 75.  Emergency recovery owns termination
+# of that exact script, so retire only a numeric lock owner whose current
+# command is still the project macos_gui.sh before asking stop to acquire the
+# transaction itself.
+cleanup_transaction_dir=/var/jb/var/mobile/.macos_gui.transaction
+cleanup_transaction_pid_file="$cleanup_transaction_dir/pid"
+cleanup_transaction_pid=""
+if [ -f "$cleanup_transaction_pid_file" ]; then
+  cleanup_transaction_pid=$(awk 'NR == 1 { print; exit }' \
+    "$cleanup_transaction_pid_file" 2>/dev/null)
+  case "$cleanup_transaction_pid" in
+    ''|*[!0-9]*) cleanup_transaction_pid="" ;;
+  esac
+fi
+if [ -n "$cleanup_transaction_pid" ]; then
+  cleanup_transaction_command=$(ps -p "$cleanup_transaction_pid" \
+    -o command= 2>/dev/null)
+  case "$cleanup_transaction_command" in
+    *'/var/jb/usr/macOS/bin/macos_gui.sh '*)
+      echo "retiring active GUI transaction pid=$cleanup_transaction_pid"
+      kill -TERM "$cleanup_transaction_pid" 2>/dev/null || true
+      cleanup_wait=0
+      while kill -0 "$cleanup_transaction_pid" 2>/dev/null && \
+            [ "$cleanup_wait" -lt 20 ]; do
+        sleep 0.1
+        cleanup_wait=$((cleanup_wait + 1))
+      done
+      kill -9 "$cleanup_transaction_pid" 2>/dev/null || true
+      ;;
+  esac
+fi
 cleanup_lease_file=/var/jb/var/mobile/macws_test_lease
 cleanup_lease_token=""
 if [ -f "$cleanup_lease_file" ]; then
@@ -99,6 +134,20 @@ for pid in $(ps aux 2>/dev/null \
     | awk '/\/oslog( |$)|\/debugserver( |$)|\/lldb( |$)/ && !/awk/{print $2}'); do
   kill -9 "$pid" 2>/dev/null
 done
+
+# cleanup_all deliberately unloads every com.macwsguide job first so a
+# crashing GUI dependency cannot respawn while processes are being reaped.
+# macwshostd is different: it is the iOS-side control plane that lets macPad
+# start a fresh, stopped workspace.  Leaving it unloaded makes the next app
+# launch permanently report "root control service offline" because no process
+# remains that can bootstrap the GUI stack.  Republish only this bounded Mach
+# service after cleanup; its status operation is passive and does not start
+# WindowServer or any chroot service.
+hostd_plist=/var/jb/Library/LaunchDaemons/com.macwsguide.hostd.plist
+if [ -f "$hostd_plist" ]; then
+  echo === restoring macPad root control service ===
+  launchctl load "$hostd_plist" 2>/dev/null || true
+fi
 
 sleep 2
 echo

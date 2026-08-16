@@ -1,5 +1,11 @@
 # Steam native-AGX memory and wakeup repair (2026-08-15)
 
+> Historical native-AGX validation profile. The default Steam launcher later
+> moved to a download-first CPU-compositing profile because its rendered UI is
+> more usable on the current DisplayStream host. The AGX evidence and bounded
+> memory result below remain valid for that explicit profile, but the listed
+> production switches are no longer the default Steam launch contract.
+
 ## Outcome
 
 Steam build `1785799196` now runs its Chromium 126 client shell through the

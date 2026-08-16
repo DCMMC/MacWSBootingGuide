@@ -223,7 +223,8 @@ static bool macws_runtime_diagnostics_enabled(void) {
             access("/tmp/macws_queue_qos_diag", F_OK) == 0 ||
             access("/tmp/macws_kcmd_field_a4_diag", F_OK) == 0 ||
             access("/tmp/macws_kcmd_field_5e3_diag", F_OK) == 0 ||
-            access("/tmp/macws_kcmd_field_6bc_diag", F_OK) == 0;
+            access("/tmp/macws_kcmd_field_6bc_diag", F_OK) == 0 ||
+            access("/tmp/macws_kcmd_stray_subtype3_diag", F_OK) == 0;
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
@@ -280,8 +281,29 @@ MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_5e3_diag_enabled,
                           "/tmp/macws_kcmd_field_5e3_diag")
 MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_6bc_diag_enabled,
                           "/tmp/macws_kcmd_field_6bc_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_4d0_diag_enabled,
+                          "/tmp/macws_kcmd_field_4d0_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_stray_subtype3_diag_enabled,
+                          "/tmp/macws_kcmd_stray_subtype3_diag")
 
 #undef MACWS_DEFINE_STARTUP_FLAG
+
+// Stray's exact producer-version ABI adapters are independent from their
+// flight-recorder diagnostics.  The diagnostic sentinels intentionally turn
+// on synchronous stderr logging; keeping that I/O on during every UE4 submit
+// made shader warm-up take tens of seconds.  The compatibility switch retains
+// every byte-level topology/anchor check below but does not enable tracing.
+static bool macws_stray_agx_compat_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *setting = getenv("MACWS_STRAY_AGX_COMPAT");
+        value = setting != NULL && setting[0] != '\0' &&
+            strcmp(setting, "0") != 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
 
 static bool macws_jit_trace_enabled(void) {
     return macws_runtime_diagnostics_enabled() ||
@@ -13856,7 +13878,13 @@ static _Atomic unsigned g_macws_multisegment_log_batches = 0;
 // observer.  This is diagnostic instrumentation, not an ABI patch: it neither
 // changes submission order nor modifies any additional command bytes.
 #define MACWS_SUBMIT_RING_COUNT 2048
-#define MACWS_SUBMIT_RING_MAX_BYTES 0x10000
+// Stray batches 69 render descriptors into one 0x203b8-byte command stream.
+// The old 64 KiB diagnostic cap retained its 0x61b0-byte segment list but
+// discarded the exact commands that later completed with 00000102, leaving
+// the failure structurally undecodable.  This remains behind the explicit
+// submit-ring sentinel; 144 KiB covers the runtime-confirmed batch with a
+// bounded margin and does not affect production launches.
+#define MACWS_SUBMIT_RING_MAX_BYTES 0x24000
 
 struct macws_submit_ring_entry {
     uint64_t serial;
@@ -15388,6 +15416,169 @@ static unsigned macws_translate_agx_segment_list_records(
     BOOL trailing_wrapper_list =
         encoded_length >= 0x20 &&
         (size_t)encoded_length + 0x18 == segment_length;
+    // The general single-direct path is intentionally handled by the linear
+    // walker.  Admit only the exact flag-gated Stray shape-3 A/B here because
+    // its all-ones core uses the reduction-family deletion at +0x1d0, while
+    // the older linear predicate recognizes only the distinct {1, all-ones}
+    // sentinel at +0x1dc.  The full list still has to yield one unique range
+    // below before any byte can be changed.
+    static const unsigned char stray_subtype3_all_ones[12] = {
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff
+    };
+    BOOL stray_direct_subtype3_diag =
+        (macws_stray_agx_compat_enabled() ||
+         macws_kcmd_stray_subtype3_diag_enabled()) &&
+        direct_list && count == 1 && total == 0x258 &&
+        segment_length == 0xf0 &&
+        *(uint32_t *)(commands + 0x00) == 0x10000 &&
+        *(uint32_t *)(commands + 0x04) == 0x258 &&
+        *(uint32_t *)(commands + 0x24) == 0x60 &&
+        *(uint32_t *)(commands + 0x28) == 0x1e8 &&
+        *(uint32_t *)(commands + 0x2c) == 0x1b8 &&
+        *(uint32_t *)(commands + 0x30) == 0x30 &&
+        *(uint32_t *)(commands + 0x34) == 3 &&
+        *(uint32_t *)(commands + 0x120) == 3 &&
+        *(uint32_t *)(commands + 0x128) == 0x62 &&
+        macws_submit_bytes_are_zero(commands + 0x1cc, 0x14) &&
+        memcmp(commands + 0x1e0, stray_subtype3_all_ones,
+               sizeof(stray_subtype3_all_ones)) == 0 &&
+        *(uint32_t *)(commands + 0x1ec) == 0 &&
+        *(uint32_t *)(commands + 0x1f0) == 0 &&
+        *(uint32_t *)(commands + 0x1f4) == 4 &&
+        *(uint32_t *)(commands + 0x1fc) == 0x15;
+    // Runtime-confirmed failing Stray command buffer (PID 46621, command
+    // buffer 0x12e0982f0, submit serial 16).  The flight recorder matched the
+    // actual NSError-bearing command buffer to descriptor 0, not the nearby
+    // two-record descriptor 2: this direct record is still the macOS 0x210 /
+    // 0x1e8 / 0x1b8 subtype-3 layout and completed with error 0x103 before
+    // the translator admitted it.  Keep the new member under the existing
+    // Stray-only diagnostic A/B until a clean/later completion is captured.
+    BOOL stray_direct_subtype3_shape_5_diag =
+        (macws_stray_agx_compat_enabled() ||
+         macws_kcmd_stray_subtype3_diag_enabled()) &&
+        direct_list && count == 1 && total == 0x210 &&
+        segment_length == 0xb0 &&
+        *(uint32_t *)(commands + 0x00) == 0x10000 &&
+        *(uint32_t *)(commands + 0x04) == 0x210 &&
+        *(uint32_t *)(commands + 0x24) == 0x18 &&
+        *(uint32_t *)(commands + 0x28) == 0x1e8 &&
+        *(uint32_t *)(commands + 0x2c) == 0x1b8 &&
+        *(uint32_t *)(commands + 0x30) == 0x30 &&
+        *(uint32_t *)(commands + 0x34) == 3 &&
+        *(uint32_t *)(commands + 0x120) == 5 &&
+        *(uint32_t *)(commands + 0x128) == 4 &&
+        macws_submit_bytes_are_zero(commands + 0x1cc, 0x14) &&
+        memcmp(commands + 0x1e0, stray_subtype3_all_ones,
+               sizeof(stray_subtype3_all_ones)) == 0 &&
+        *(uint32_t *)(commands + 0x1ec) == 0 &&
+        *(uint32_t *)(commands + 0x1f0) == 0 &&
+        *(uint32_t *)(commands + 0x1f4) == 1 &&
+        *(uint32_t *)(commands + 0x1fc) == 0x15 &&
+        // +0x200 is a per-run resource group ID (0x5f and 0x93 captured),
+        // not a producer-layout constant.  Constrain its stable trailer.
+        *(uint32_t *)(commands + 0x204) == 7 &&
+        *(uint32_t *)(commands + 0x208) == 3 &&
+        *(uint32_t *)(commands + 0x20c) == 0x1000064;
+    // After the exact shape-5 and direct subtype-1 A/Bs moved the failure to
+    // submit serial 22, the NSError-matched descriptor is a direct one-record
+    // instance of the already captured shape-7 family.  Its KCMD/list hashes
+    // are 6fe577391401fa48... / 7c2821cccbd6c2cb..., and it retains the
+    // macOS 0x1e8/0x1b8 core.  Admit this exact direct framing so the existing
+    // shape-7 predicate below can perform the same bounded diagnostic move.
+    BOOL stray_direct_subtype3_shape_7_diag =
+        (macws_stray_agx_compat_enabled() ||
+         macws_kcmd_stray_subtype3_diag_enabled()) &&
+        direct_list && count == 1 && total == 0x288 &&
+        segment_length == 0x130 &&
+        *(uint32_t *)(commands + 0x00) == 0x10000 &&
+        *(uint32_t *)(commands + 0x04) == 0x288 &&
+        *(uint32_t *)(commands + 0x24) == 0x90 &&
+        *(uint32_t *)(commands + 0x28) == 0x1e8 &&
+        *(uint32_t *)(commands + 0x2c) == 0x1b8 &&
+        *(uint32_t *)(commands + 0x30) == 0x30 &&
+        *(uint32_t *)(commands + 0x34) == 3 &&
+        *(uint32_t *)(commands + 0x120) == 7 &&
+        *(uint32_t *)(commands + 0x128) == 0x62 &&
+        macws_submit_bytes_are_zero(commands + 0x1cc, 0x14) &&
+        memcmp(commands + 0x1e0, stray_subtype3_all_ones,
+               sizeof(stray_subtype3_all_ones)) == 0 &&
+        *(uint32_t *)(commands + 0x1ec) == 0 &&
+        *(uint32_t *)(commands + 0x1f0) == 0 &&
+        *(uint32_t *)(commands + 0x1f4) == 6 &&
+        *(uint32_t *)(commands + 0x1fc) == 0x15;
+    // Runtime-confirmed next NSError-bearing Stray submit after the 8/0x49
+    // member below was admitted: PID 71022, serial 3420, descriptor 0 is a
+    // direct one-record list with KCMD/list hashes 025c4ae4.../5a6c1784....
+    // It retained a macOS subtype-3 0x1e8/0x1b8 core and fixed=0.  Admit only
+    // its exact 0x270, resources=7/0x12, mode=5 producer shape for the causal
+    // A/B; no error/completion behavior is changed.
+    BOOL stray_direct_subtype3_shape_7_mode_5_diag =
+        (macws_stray_agx_compat_enabled() ||
+         macws_kcmd_stray_subtype3_diag_enabled()) &&
+        direct_list && count == 1 && total == 0x270 &&
+        segment_length == 0xf0 &&
+        *(uint32_t *)(commands + 0x00) == 0x10000 &&
+        *(uint32_t *)(commands + 0x04) == 0x270 &&
+        *(uint32_t *)(commands + 0x24) == 0x78 &&
+        *(uint32_t *)(commands + 0x28) == 0x1e8 &&
+        *(uint32_t *)(commands + 0x2c) == 0x1b8 &&
+        *(uint32_t *)(commands + 0x30) == 0x30 &&
+        *(uint32_t *)(commands + 0x34) == 3 &&
+        *(uint32_t *)(commands + 0x120) == 7 &&
+        *(uint32_t *)(commands + 0x128) == 0x12 &&
+        macws_submit_bytes_are_zero(commands + 0x1cc, 0x14) &&
+        memcmp(commands + 0x1e0, stray_subtype3_all_ones,
+               sizeof(stray_subtype3_all_ones)) == 0 &&
+        *(uint32_t *)(commands + 0x1ec) == 0 &&
+        *(uint32_t *)(commands + 0x1f0) == 0 &&
+        *(uint32_t *)(commands + 0x1f4) == 5 &&
+        *(uint32_t *)(commands + 0x1fc) == 0x15 &&
+        *(uint32_t *)(commands + 0x204) == 0x500 &&
+        *(uint32_t *)(commands + 0x208) == 3 &&
+        *(uint32_t *)(commands + 0x20c) == 0x100001e &&
+        *(uint32_t *)(commands + 0x214) == 0x15 &&
+        *(uint32_t *)(commands + 0x218) == 0x80 &&
+        *(uint32_t *)(commands + 0x21c) == 0x50 &&
+        *(uint32_t *)(commands + 0x220) == 3 &&
+        *(uint32_t *)(commands + 0x224) == 0x1000002;
+    // Runtime-confirmed producer invariant across every Stray subtype-3
+    // all-ones member captured so far (modes 1, 2, 4, 5, 6 and 0x10;
+    // resource topologies 3/5/7/8): the macOS complete span is exactly the
+    // 0x1f8-byte core plus a 0x18-aligned resource trailer.  Paired iOS-native
+    // controls for modes 1, 2 and 0x10 retain that trailer and omit only the
+    // zero [0x1d0,0x1e0) producer-version window, yielding a 0x1e8-byte core.
+    //
+    // This family invariant replaces topology-by-topology admission for a
+    // direct one-record list while retaining every independent framing/core
+    // anchor.  It remains scoped to the explicit Stray compatibility switch.
+    uint32_t stray_direct_subtype3_trailer = total >= 0x28
+        ? *(uint32_t *)(commands + 0x24) : 0;
+    uint32_t stray_direct_subtype3_mode = total >= 0x1f8
+        ? *(uint32_t *)(commands + 0x1f4) : 0;
+    BOOL stray_direct_subtype3_all_ones_family =
+        macws_stray_agx_compat_enabled() && direct_list && count == 1 &&
+        total >= 0x210 && total <= 0x800 &&
+        stray_direct_subtype3_trailer >= 0x18 &&
+        (stray_direct_subtype3_trailer % 0x18) == 0 &&
+        total == (size_t)0x1f8 + stray_direct_subtype3_trailer &&
+        *(uint32_t *)(commands + 0x00) == 0x10000 &&
+        *(uint32_t *)(commands + 0x04) == total &&
+        *(uint32_t *)(commands + 0x28) == 0x1e8 &&
+        *(uint32_t *)(commands + 0x2c) == 0x1b8 &&
+        *(uint32_t *)(commands + 0x30) == 0x30 &&
+        *(uint32_t *)(commands + 0x34) == 3 &&
+        *(uint32_t *)(commands + 0x120) > 0 &&
+        *(uint32_t *)(commands + 0x120) <= 64 &&
+        macws_submit_bytes_are_zero(commands + 0x1cc, 0x14) &&
+        memcmp(commands + 0x1e0, stray_subtype3_all_ones,
+               sizeof(stray_subtype3_all_ones)) == 0 &&
+        *(uint32_t *)(commands + 0x1ec) == 0 &&
+        *(uint32_t *)(commands + 0x1f0) == 0 &&
+        stray_direct_subtype3_mode >= 1 &&
+        stray_direct_subtype3_mode <= 0x10 &&
+        *(uint32_t *)(commands + 0x1fc) == 0x15;
     // Runtime-confirmed by VS Code 1.130 Aquarium submit serial 155 on
     // 2026-07-30: the direct list contains 69 individually well-framed,
     // uniquely ranged records (KCMD length 0xee60, list length 0x3cf0).  The
@@ -15399,7 +15590,11 @@ static unsigned macws_translate_agx_segment_list_records(
     // still runs before any byte is changed.
     if (!fragmented_list &&
         (count < 1 || count > MACWS_AGX_SEGMENT_LIST_MAX_RECORDS ||
-         (direct_list && count < 2) ||
+         (direct_list && count < 2 && !stray_direct_subtype3_diag &&
+          !stray_direct_subtype3_shape_5_diag &&
+          !stray_direct_subtype3_shape_7_diag &&
+          !stray_direct_subtype3_shape_7_mode_5_diag &&
+          !stray_direct_subtype3_all_ones_family) ||
          (!direct_list && !trailing_wrapper_list)))
         return 0;
 
@@ -15544,6 +15739,31 @@ static unsigned macws_translate_agx_segment_list_records(
             *(uint32_t *)(record + 0x2c) == 0x7e8 &&
             *(uint32_t *)(record + 0x30) == 0x30 &&
             *(uint32_t *)(record + 0x34) == 1;
+        uint32_t subtype1_field_4d0 = subtype1
+            ? *(uint32_t *)(record + 0x4d0) : UINT32_MAX;
+        // DIAGNOSTIC-ONLY producer-version A/B.  Stray's first exactly
+        // correlated failing batch contains ten ordinary subtype-1 records
+        // with macOS record+0x4d0 == 1.0f and one otherwise structurally
+        // identical record with zero.  The public-Metal iOS 16.3
+        // `renderzero` control (clear RGBA all zero) completed status=4 with
+        // the native 0x820/0x7f8/0x7c8 layout and still wrote 1.0f at the
+        // normalized corresponding field +0x4b0.  This opt-in A/B tests that
+        // exact remaining producer delta; it is not yet a production rule.
+        BOOL subtype1_field_4d0_zero_compat = subtype1_field_4d0 == 0 &&
+            (macws_stray_agx_compat_enabled() ||
+             macws_kcmd_field_4d0_diag_enabled());
+        // Runtime-correlated Stray gameplay batch PID 5851 / submit 41126:
+        // its first four records retain the complete macOS subtype-1 layout
+        // and every independent structural anchor below, but carry 0xffff in
+        // this payload field.  The next 65 records were compacted and these
+        // four were the only still-macOS records in the 00000102 submission.
+        // +0x4d0 is moved intact to native +0x4b0; it is not either deleted
+        // ABI window.  Admit the observed value only under the Stray contract
+        // and preserve it byte-for-byte instead of turning payload semantics
+        // into a layout discriminator.
+        BOOL subtype1_field_4d0_ffff_compat =
+            subtype1_field_4d0 == 0xffff &&
+            macws_stray_agx_compat_enabled();
         int subtype1_anchors = subtype1 && span <= 0x1000 &&
             memcmp(record + 0xd8,
                 "\x03\x00\x6b\x00\x12\x00\x3a\x00", 8) == 0 &&
@@ -15554,7 +15774,9 @@ static unsigned macws_translate_agx_segment_list_records(
                 "\xff\xff\xff\xff\xff\xff\xff\xff"
                 "\xff\xff\xff\xff", 12) == 0 &&
             macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
-            *(uint32_t *)(record + 0x4d0) == 0x3f800000 &&
+            (subtype1_field_4d0 == 0x3f800000 ||
+             subtype1_field_4d0_zero_compat ||
+             subtype1_field_4d0_ffff_compat) &&
             (*(uint32_t *)(record + 0x4d4) == 0x100 ||
              *(uint32_t *)(record + 0x4d4) == 0x300) &&
             memcmp(record + 0x4e8,
@@ -15647,12 +15869,318 @@ static unsigned macws_translate_agx_segment_list_records(
             macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
             memcmp(record + 0x1e0, subtype3_reduction_sentinel,
                    sizeof(subtype3_reduction_sentinel)) == 0;
+        // Runtime-confirmed UE4 compute-resource variant.  Stray's first
+        // pipeline-compatible frame reached selector 0x1a and later completed
+        // with MTLCommandBufferErrorDomain 0x103.  The matched flight record
+        // (SHA-256 8d7859cfaef22427c2a7a8125a953c20212a85b4c0b44e26e827f67467deeeb3)
+        // contained two translated subtype-1 records followed by this exact
+        // still-macOS subtype-3 shape.  A public native-iOS control with the
+        // same Metal argument topology -- buffer(8), two writable texture
+        // buffers and six readable texture buffers -- completed status=4,
+        // error=nil and emitted the normal 0x1d8/0x1a8 subtype-3 core
+        // (SHA-256 c17357910c1020f9c256e584def26d5ea3b9fc3cb2cb0721388050b201ca8df9).
+        // Its three all-ones dwords begin at +0x1d0; the game record has the
+        // same sentinel at +0x1e0 after a zero-only 0x10-byte macOS window.
+        // Preserve the complete resource trailer and admit only the observed
+        // 0x378 framing plus the shader-topology scalars that distinguish it
+        // from the already-working standalone subtype-3 records.
+        int subtype3_ue4_resource_anchors = span == 0x378 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x378 &&
+            *(uint32_t *)(record + 0x24) == 0x180 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 8 &&
+            *(uint32_t *)(record + 0x128) == 0x12 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 0x10 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        // Production-shape Stray producer invariant, scoped by
+        // MACWS_STRAY_AGX_COMPAT.  Across the independently captured
+        // 0x210/0x258/0x270/0x288/0x378 records, record+0x24 is always the
+        // complete 0x18-aligned resource trailer size and
+        // span == 0x1f8 + trailer.  The core, zero window, all-ones sentinel,
+        // mode position and resource-count field are invariant while the
+        // resource topology changes.  This is the upstream ABI boundary the
+        // earlier exact predicates were discovering one member at a time.
+        uint32_t subtype3_stray_trailer = *(uint32_t *)(record + 0x24);
+        BOOL subtype3_stray_all_ones_family =
+            span >= 0x210 && span <= 0x800 &&
+            subtype3_stray_trailer >= 0x18 &&
+            (subtype3_stray_trailer % 0x18) == 0 &&
+            span == 0x1f8 + subtype3_stray_trailer &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == span &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) > 0 &&
+            *(uint32_t *)(record + 0x120) <= 64 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            subtype3_mode >= 1 && subtype3_mode <= 0x10 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        // DIAGNOSTIC A/B for the first gameplay-frame batch after all exact
+        // Stray metallibs compiled successfully.  The command-buffer getter
+        // runtime-correlated NSError 00000103 to PID 69083, submit serial
+        // 2314, descriptor 2.  Its 12-range flight record normalized eleven
+        // records; post-compaction range 2 (0x1040..0x13b8) was the sole
+        // remaining macOS subtype-3 core:
+        //
+        //   span=0x378, inner/end=0x1e8/0x1b8, mode=0x10,
+        //   resources=8/0x49, zero [0x1d0,0x1e0), all-ones @0x1e0.
+        //
+        // The existing UE4 8/0x12 member has the same producer layout and a
+        // paired native-iOS control proving the 0x10-byte window is absent.
+        // Admit only this exact newly observed topology under Stray's
+        // compatibility switch.  A later clean completion is required before
+        // treating this as a production-confirmed member of the family.
+        BOOL subtype3_stray_resource_shape_8_mode_16_49 =
+            span == 0x378 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x378 &&
+            *(uint32_t *)(record + 0x24) == 0x180 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 8 &&
+            *(uint32_t *)(record + 0x128) == 0x49 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 0x10 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        // DIAGNOSTIC-ONLY A/B for the next Stray compute-resource shape.
+        // The command-buffer getter runtime-correlated error 00000103 to
+        // submit serial 11 (PID 35851).  Its seven-range list was internally
+        // well framed and six preceding records were normalized, while this
+        // final 0x288-byte subtype-3 record retained the macOS 0x1e8/0x1b8
+        // header.  The complete pre-submit artifacts are:
+        //
+        //   KCMD e49ec82137e0029177322756d42f51fc81ef5c025632680c238eb3bceb11025e
+        //   list 28be4d890a1b55ecc1783c286df82fe705bc336b09abbc07d02a5b8dc70d6581
+        //   range 0x2b98..0x2e20, mode=6, resources=7/0x62
+        //
+        // Its core uses the same zero [0x1d0,0x1e0) producer window and
+        // three-all-ones sentinel as the native-iOS-confirmed reduction and
+        // rich-compute families above.  Do not make that structural analogy
+        // a production rule yet: this exact flag-gated predicate exists to
+        // obtain the causal A/B witness (clean command completion and later
+        // submitted frames) without widening any other subtype-3 path.
+        BOOL subtype3_stray_resource_shape_7 =
+            span == 0x288 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x288 &&
+            *(uint32_t *)(record + 0x24) == 0x90 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 7 &&
+            *(uint32_t *)(record + 0x128) == 0x62 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 6 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        // After the exact shape-7 A/B moved the failure from serial 11 to
+        // serial 12 (PID 37058), the next matched submission exposed a
+        // second member of the same producer family.  It is a direct,
+        // one-range 0x258-byte record (KCMD SHA-256
+        // d87f12985fd552e7f957e66631f170377c7e0075f6b9b67a437936a25c68b4a4)
+        // with three resources and mode 4.  Keep it an independently exact
+        // predicate so the causal A/B cannot accidentally admit an arbitrary
+        // member based only on the common all-ones sentinel.
+        BOOL subtype3_stray_resource_shape_3 =
+            span == 0x258 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x258 &&
+            *(uint32_t *)(record + 0x24) == 0x60 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 3 &&
+            *(uint32_t *)(record + 0x128) == 0x62 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 4 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        // The first 42-range Stray frame reached submit serial 13 after the
+        // exact shape-7/shape-3 A/Bs and the first 53 metallibs had loaded.
+        // Its fast-ring dump (PID 40430) reported fixed=39 and retained
+        // exactly three macOS subtype-3 cores.  Their complete post-capture
+        // record hashes and distinguishing fields are:
+        //
+        //   98b08714... span 0x210, mode 1, resources 8/0x12
+        //   01eb2374... span 0x258, mode 4, resources 8/0x12
+        //   7cfce000... span 0x210, mode 1, resources 7/0x0a
+        //
+        // The records were not otherwise mutated by the reverse-order
+        // compactor: all three still carry the macOS 0x1e8/0x1b8 core, the
+        // zero [0x1d0,0x1e0) window and the three-all-ones sentinel.  Keep
+        // each member exact and under the existing Stray diagnostic flag
+        // until the serial-13 A/B produces a later-completion witness.
+        BOOL subtype3_stray_resource_shape_8_mode_1 =
+            span == 0x210 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x210 &&
+            *(uint32_t *)(record + 0x24) == 0x18 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 8 &&
+            *(uint32_t *)(record + 0x128) == 0x12 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 1 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        BOOL subtype3_stray_resource_shape_8_mode_4 =
+            span == 0x258 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x258 &&
+            *(uint32_t *)(record + 0x24) == 0x60 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 8 &&
+            *(uint32_t *)(record + 0x128) == 0x12 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 4 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        BOOL subtype3_stray_resource_shape_7_mode_1 =
+            span == 0x210 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x210 &&
+            *(uint32_t *)(record + 0x24) == 0x18 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 7 &&
+            *(uint32_t *)(record + 0x128) == 0x0a &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 1 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15;
+        // Exact single-record shape matched to Stray's NSError-bearing
+        // command buffer by the fixed-memory flight recorder.  Its list is a
+        // direct one-record 0xb0-byte list (KCMD SHA-256
+        // 49b2221923d9c486f5a3c38aca09c0373506b9a8a6c7d022143bc4cb4bdfd103;
+        // list SHA-256 d8cba7057eca36dee3fcdcb11c216ab9620b5fdbfe9c09f924f95204d2f3b368).
+        BOOL subtype3_stray_resource_shape_5_mode_1 =
+            span == 0x210 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x210 &&
+            *(uint32_t *)(record + 0x24) == 0x18 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 5 &&
+            *(uint32_t *)(record + 0x128) == 4 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 1 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15 &&
+            // +0x200 is the dynamic resource group ID; the following
+            // topology/count/flags dwords are stable across both captures.
+            *(uint32_t *)(record + 0x204) == 7 &&
+            *(uint32_t *)(record + 0x208) == 3 &&
+            *(uint32_t *)(record + 0x20c) == 0x1000064;
+        // Exact direct-list Stray member runtime-correlated to PID 71022,
+        // submit 3420.  The direct-list admission above and this predicate
+        // intentionally repeat the structural anchors: neither a generic
+        // single-record list nor an unrelated subtype-3 producer can enter
+        // the compaction path through only one relaxed check.
+        BOOL subtype3_stray_resource_shape_7_mode_5 =
+            span == 0x270 &&
+            *(uint32_t *)(record + 0x00) == 0x10000 &&
+            *(uint32_t *)(record + 0x04) == 0x270 &&
+            *(uint32_t *)(record + 0x24) == 0x78 &&
+            *(uint32_t *)(record + 0x28) == 0x1e8 &&
+            *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+            *(uint32_t *)(record + 0x30) == 0x30 &&
+            *(uint32_t *)(record + 0x34) == 3 &&
+            *(uint32_t *)(record + 0x120) == 7 &&
+            *(uint32_t *)(record + 0x128) == 0x12 &&
+            macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+            memcmp(record + 0x1e0, subtype3_reduction_sentinel,
+                   sizeof(subtype3_reduction_sentinel)) == 0 &&
+            *(uint32_t *)(record + 0x1ec) == 0 &&
+            *(uint32_t *)(record + 0x1f0) == 0 &&
+            *(uint32_t *)(record + 0x1f4) == 5 &&
+            *(uint32_t *)(record + 0x1fc) == 0x15 &&
+            *(uint32_t *)(record + 0x204) == 0x500 &&
+            *(uint32_t *)(record + 0x208) == 3 &&
+            *(uint32_t *)(record + 0x20c) == 0x100001e &&
+            *(uint32_t *)(record + 0x214) == 0x15 &&
+            *(uint32_t *)(record + 0x218) == 0x80 &&
+            *(uint32_t *)(record + 0x21c) == 0x50 &&
+            *(uint32_t *)(record + 0x220) == 3 &&
+            *(uint32_t *)(record + 0x224) == 0x1000002;
+        int subtype3_stray_resource_compat =
+            (macws_stray_agx_compat_enabled() ||
+             macws_kcmd_stray_subtype3_diag_enabled()) &&
+            (subtype3_stray_resource_shape_7 ||
+             subtype3_stray_resource_shape_3 ||
+             subtype3_stray_resource_shape_8_mode_1 ||
+             subtype3_stray_resource_shape_8_mode_4 ||
+             subtype3_stray_resource_shape_7_mode_1 ||
+             subtype3_stray_resource_shape_5_mode_1 ||
+             subtype3_stray_resource_shape_8_mode_16_49 ||
+             subtype3_stray_resource_shape_7_mode_5 ||
+             (macws_stray_agx_compat_enabled() &&
+              subtype3_stray_all_ones_family));
         if (!subtype1_anchors && !subtype2_anchors && !subtype3_anchors &&
-            !subtype3_reduction_anchors)
+            !subtype3_reduction_anchors &&
+            !subtype3_ue4_resource_anchors &&
+            !subtype3_stray_resource_compat)
             continue;
 
         uint32_t shrink = subtype1_anchors ? 0x20 : 0x10;
         if (subtype1_anchors) {
+            if (subtype1_field_4d0_zero_compat) {
+                *(uint32_t *)(record + 0x4d0) = 0x3f800000;
+                if (macws_kcmd_field_4d0_diag_enabled())
+                    fprintf(stderr,
+                        "#### AGX-KCMD-FIELD-4D0-DIAG #%u segment=%u "
+                        "macOS+0x4d0=0->1.0f native+0x4b0 witness\n",
+                        sequence, i);
+            }
             // Delete both macOS-only zero windows from the complete remaining
             // storage tail.  Later segments have already been normalized and
             // are intentionally shifted together with that tail.
@@ -15683,12 +16211,24 @@ static unsigned macws_translate_agx_segment_list_records(
             // every Aquarium mode-2 record carry the impossible {2,1}
             // mode/flag pair and the completed command buffer returned 0x103.
             size_t delete_offset =
-                subtype3_mode == 2 ? 0x1d0 : 0x1cc;
+                (subtype3_mode == 2 || subtype3_ue4_resource_anchors ||
+                 subtype3_stray_resource_compat)
+                    ? 0x1d0 : 0x1cc;
             memmove(record + delete_offset, record + delete_offset + 0x10,
                     total - ((size_t)start + delete_offset + 0x10));
             total -= 0x10;
             *(uint32_t *)(record + 0x28) = 0x1d8;
             *(uint32_t *)(record + 0x2c) = 0x1a8;
+            if (subtype3_stray_resource_compat &&
+                macws_kcmd_stray_subtype3_diag_enabled()) {
+                fprintf(stderr,
+                    "#### AGX-KCMD-STRAY-SUBTYPE3-DIAG #%u segment=%u "
+                    "span=%#zx->%#zx mode=%u resources=%u/%#x "
+                    "window=[0x1d0,0x1e0)\n",
+                    sequence, i, span, span - 0x10,
+                    subtype3_mode, *(uint32_t *)(record + 0x120),
+                    *(uint32_t *)(record + 0x128));
+            }
         }
         memset(commands + total, 0, shrink);
         *(uint32_t *)(record + 0x04) = (uint32_t)(span - shrink);
@@ -16098,6 +16638,12 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 macws_submit_save_type1(result.sequence, record_index,
                                         commands + off, end_offset);
 
+            BOOL subtype1_direct_field_4d0_zero_compat =
+                off == 0 && total > 0x4d4 &&
+                *(uint32_t *)(commands + 0x4d0) == 0 &&
+                (macws_stray_agx_compat_enabled() ||
+                 macws_kcmd_field_4d0_diag_enabled());
+
             // TEMPORARY ABI-TRANSLATION EXPERIMENT — native-iOS clear only.
             //
             // Runtime captures on this exact iPad/iOS 16.3 combination show:
@@ -16172,7 +16718,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 uint32_t operation_state =
                     *(uint32_t *)(commands + 0x4d4);
                 int check_4d0 =
-                    *(uint32_t *)(commands + 0x4d0) == 0x3f800000 &&
+                    (*(uint32_t *)(commands + 0x4d0) == 0x3f800000 ||
+                     subtype1_direct_field_4d0_zero_compat) &&
                     (operation_state == 0x100 || operation_state == 0x300);
                 int check_4e8 = memcmp(commands + 0x4e8,
                     "\xff\xff\xff\xff\xff\xff\xff\xff"
@@ -16233,7 +16780,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     "\xff\xff\xff\xff\xff\xff\xff\xff"
                     "\xff\xff\xff\xff", 12) == 0 &&
                 macws_submit_bytes_are_zero(commands + 0x4c0, 0x10) &&
-                *(uint32_t *)(commands + 0x4d0) == 0x3f800000 &&
+                (*(uint32_t *)(commands + 0x4d0) == 0x3f800000 ||
+                 subtype1_direct_field_4d0_zero_compat) &&
                 (*(uint32_t *)(commands + 0x4d4) == 0x100 ||
                  *(uint32_t *)(commands + 0x4d4) == 0x300) &&
                 memcmp(commands + 0x4e8,
@@ -16241,6 +16789,24 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     "\xff\xff\xff\xff", 12) == 0) {
                 result.candidates++;
                 size_t original_total = total;
+
+                // DIAGNOSTIC-ONLY semantic A/B, shared with the exact
+                // multisegment predicate above.  Stray's NSError-matched
+                // serial-21 direct subtype-1 record has the complete known
+                // macOS layout but +0x4d0=0.  The native-iOS renderzero
+                // control writes 1.0f at normalized +0x4b0 even for an all-
+                // zero clear.  Restore that exact witnessed value before the
+                // layout compactor moves it to +0x4b0; do not production-
+                // enable without a later clean completion witness.
+                if (subtype1_direct_field_4d0_zero_compat) {
+                    *(uint32_t *)(commands + 0x4d0) = 0x3f800000;
+                    if (macws_kcmd_field_4d0_diag_enabled())
+                        fprintf(stderr,
+                            "#### AGX-KCMD-FIELD-4D0-DIAG #%u segment=0 "
+                            "direct macOS+0x4d0=0->1.0f "
+                            "native+0x4b0 witness\n",
+                            result.sequence);
+                }
 
                 // Work from the higher original offset downward so both
                 // deletion coordinates continue to refer to the captured

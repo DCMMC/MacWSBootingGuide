@@ -12,6 +12,7 @@
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach/task_info.h>
 #import <ptrauth.h>
 #import "utils.h"
 
@@ -22,6 +23,7 @@
 #import <sys/socket.h>
 #import <sys/stat.h>
 #import <sys/un.h>
+#import <sysdir.h>
 
 #include "macws_catalyst_drawable_protocol.h"
 #import "MacWSFinalCompositePublisher.h"
@@ -32,6 +34,15 @@ static _Atomic uint64_t macws_catalyst_drawable_sequence = 0;
 static pthread_mutex_t macws_catalyst_drawable_service_lock =
     PTHREAD_MUTEX_INITIALIZER;
 static mach_port_t macws_catalyst_drawable_service = MACH_PORT_NULL;
+
+static uint64_t macws_resident_memory_bytes(void) {
+    mach_task_basic_info_data_t info = {0};
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t result = task_info(
+        mach_task_self(), MACH_TASK_BASIC_INFO,
+        (task_info_t)&info, &count);
+    return result == KERN_SUCCESS ? info.resident_size : 0;
+}
 
 static BOOL macws_is_owned_scanout_texture(id<MTLTexture> texture);
 static IOSurfaceRef macws_vnc_bound_surface(id<MTLTexture> texture);
@@ -1191,6 +1202,117 @@ static id (*macws_catalyst_endpoint_for_system_orig)(
     id, SEL, id, id, id) = NULL;
 static id (*macws_catalyst_endpoint_for_mach_orig)(
     id, SEL, id, id, id) = NULL;
+static id (*macws_weather_configuration_orig)(id, SEL, id, id, id) = NULL;
+static void (*macws_weather_did_request_scene_orig)(
+    id, SEL, id, id, id) = NULL;
+static void (*macws_weather_uins_finish_launching_orig)(id, SEL) = NULL;
+static sysdir_search_path_enumeration_state
+    (*macws_weather_sysdir_start_private_orig)(
+        sysdir_search_path_directory_t,
+        sysdir_search_path_domain_mask_t) = NULL;
+static char macws_weather_app_launch_delivered_key;
+static char macws_weather_main_scene_identifier_key;
+static char macws_weather_bootstrap_window_key;
+static char macws_weather_bootstrap_delegate_key;
+static char macws_weather_replaced_scene_delegate_key;
+static _Atomic bool macws_weather_bootstrap_request_completed = false;
+static _Atomic int macws_weather_uins_finish_state = 0;
+static _Atomic unsigned macws_weather_uins_finish_attempts = 0;
+static id macws_weather_pending_uins_finish_delegate = nil;
+static SEL macws_weather_pending_uins_finish_selector = NULL;
+static NSUInteger macws_catalyst_collection_count(id value);
+static id macws_catalyst_send_id(id receiver, const char *selector);
+static BOOL macws_weather_prepare_application_launch(id application,
+                                                      id *delegateOut);
+static BOOL macws_weather_adopt_bootstrap_scene(id application);
+static BOOL macws_install_weather_uins_completion_hook(void);
+static BOOL macws_install_weather_uins_finish_hook(void);
+static void macws_weather_uins_finish_launching_compat(
+    id self, SEL selector);
+static void macws_weather_retry_uins_finish(void *context);
+
+static void macws_weather_bootstrap_will_connect(
+        id self, SEL selector, id scene, id session, id options) {
+    (void)selector;
+    (void)session;
+    (void)options;
+    Class windowClass = objc_getClass("UIWindow");
+    Class controllerClass = objc_getClass("UIViewController");
+    id window = windowClass
+        ? ((id (*)(id, SEL, id))objc_msgSend)(
+              ((id (*)(id, SEL))objc_msgSend)(
+                  (id)windowClass, sel_registerName("alloc")),
+              sel_registerName("initWithWindowScene:"), scene)
+        : nil;
+    id controller = controllerClass
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              ((id (*)(id, SEL))objc_msgSend)(
+                  (id)controllerClass, sel_registerName("alloc")),
+              sel_registerName("init"))
+        : nil;
+    if (window && controller) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            window, sel_registerName("setRootViewController:"), controller);
+        ((void (*)(id, SEL))objc_msgSend)(
+            window, sel_registerName("makeKeyAndVisible"));
+        objc_setAssociatedObject(
+            self, &macws_weather_bootstrap_window_key, window,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    fprintf(stderr,
+            "#### WEATHER-SCENE bootstrap connected scene=%s window=%s "
+            "controller=%s\n", scene ? object_getClassName(scene) : "nil",
+            window ? object_getClassName(window) : "nil",
+            controller ? object_getClassName(controller) : "nil");
+    fflush(stderr);
+}
+
+
+static sysdir_search_path_enumeration_state
+macws_weather_sysdir_start_private_compat(
+    sysdir_search_path_directory_t directory,
+    sysdir_search_path_domain_mask_t domainMask) {
+    // Runtime-confirmed on iPadOS 16.3: the private entry point is a literal
+    // `brk #1`. UIKit calls it for its scene-restoration Library search with
+    // (directory=5, domain=1), while WeatherDaemon calls it with the macOS
+    // private system-domain bit 0x10. The public sysdir ABI is implemented on
+    // this same image and accepts the standard 1/2/4/8 domain mask. Route the
+    // private ABI through that implementation, translating only the extra
+    // macOS system-domain spelling.
+    sysdir_search_path_domain_mask_t publicDomain = domainMask == 0x10
+        ? SYSDIR_DOMAIN_MASK_SYSTEM : domainMask;
+    sysdir_search_path_enumeration_state state =
+        sysdir_start_search_path_enumeration(directory, publicDomain);
+    fprintf(stderr,
+            "#### WEATHER-SYSDIR translated directory=%u "
+            "privateDomain=%#x publicDomain=%#x publicState=%#x\n",
+            (unsigned)directory, (unsigned)domainMask,
+            (unsigned)publicDomain, (unsigned)state);
+    fflush(stderr);
+    return state;
+}
+
+static NSArray *(*macws_weather_search_paths_orig)(NSUInteger, NSUInteger,
+                                                    BOOL) = NULL;
+
+static NSArray *macws_weather_search_paths_compat(NSUInteger directory,
+                                                   NSUInteger domainMask,
+                                                   BOOL expandTilde) {
+    NSMutableArray *paths = [NSMutableArray array];
+    sysdir_search_path_enumeration_state state =
+        sysdir_start_search_path_enumeration(
+            (sysdir_search_path_directory_t)directory,
+            (sysdir_search_path_domain_mask_t)domainMask);
+    while (state != 0) {
+        char path[PATH_MAX] = {0};
+        state = sysdir_get_next_search_path_enumeration(state, path);
+        if (!path[0]) continue;
+        NSString *value = [NSString stringWithUTF8String:path];
+        if (expandTilde) value = [value stringByExpandingTildeInPath];
+        if (value) [paths addObject:value];
+    }
+    return paths;
+}
 
 static id macws_catalyst_private_frontboard_name(id machName) {
     if (!machName || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(
@@ -1207,6 +1329,376 @@ static id macws_catalyst_private_frontboard_name(id machName) {
               (id)stringClass, sel_registerName("stringWithUTF8String:"),
               "com.apple.macosbooter.frontboard.systemappservices")
         : machName;
+}
+
+static Class macws_weather_bootstrap_scene_delegate_class(void) {
+    Class existing = objc_getClass("MacWSWeatherBootstrapSceneDelegate");
+    if (existing) return existing;
+    Class base = objc_getClass("NSObject");
+    if (!base) return Nil;
+    Class created = objc_allocateClassPair(
+        base, "MacWSWeatherBootstrapSceneDelegate", 0);
+    if (!created) return objc_getClass(
+        "MacWSWeatherBootstrapSceneDelegate");
+    class_addMethod(
+        created,
+        sel_registerName("scene:willConnectToSession:options:"),
+        (IMP)macws_weather_bootstrap_will_connect, "v@:@@@");
+    objc_registerClassPair(created);
+    return created;
+}
+
+// Retain the later configuration hook as a second, causally equivalent entry
+// point for OS builds that do ask Weather for a replacement configuration.
+static id macws_weather_configuration_compat(id self, SEL selector,
+                                              id application, id session,
+                                              id options) {
+    BOOL needsBootstrap = !objc_getAssociatedObject(
+        self, &macws_weather_app_launch_delivered_key);
+    id result = nil;
+    Class bootstrapDelegateClass = needsBootstrap
+        ? macws_weather_bootstrap_scene_delegate_class() : Nil;
+    if (!needsBootstrap) {
+        result = macws_weather_configuration_orig(
+            self, selector, application, session, options);
+    } else {
+        Class configurationClass = objc_getClass("UISceneConfiguration");
+        Class windowSceneClass = objc_getClass("UIWindowScene");
+        id role = macws_catalyst_send_id(session, "role");
+        id name = ((id (*)(id, SEL, const char *))objc_msgSend)(
+            (id)objc_getClass("NSString"),
+            sel_registerName("stringWithUTF8String:"),
+            "MacWS Catalyst Bootstrap");
+        SEL initializer = sel_registerName("initWithName:sessionRole:");
+        id bootstrap = configurationClass
+            ? ((id (*)(id, SEL, id, id))objc_msgSend)(
+                  ((id (*)(id, SEL))objc_msgSend)(
+                      (id)configurationClass, sel_registerName("alloc")),
+                  initializer, name, role)
+            : nil;
+        if (bootstrap && windowSceneClass && bootstrapDelegateClass) {
+            ((void (*)(id, SEL, Class))objc_msgSend)(
+                bootstrap, sel_registerName("setSceneClass:"),
+                windowSceneClass);
+            // A nil delegate falls back to SwiftUI.AppSceneDelegate, which
+            // evaluates Weather's root view while the AppDelegate resolver is
+            // still uninitialized and runtime-confirmed traps at Weather
+            // +0x538e34. Use a runtime-created inert delegate instead. This
+            // first scene exists only to let UIKit establish UIScreen;
+            // Weather.SceneDelegate takes ownership immediately afterward.
+            ((void (*)(id, SEL, Class))objc_msgSend)(
+                bootstrap, sel_registerName("setDelegateClass:"),
+                bootstrapDelegateClass);
+            result = bootstrap;
+        }
+    }
+    id name = macws_catalyst_send_id(result, "name");
+    id scenes = macws_catalyst_send_id(application, "connectedScenes");
+    id scene = macws_catalyst_send_id(scenes, "anyObject");
+    id existingDelegate = macws_catalyst_send_id(scene, "delegate");
+    id delegateClass = macws_catalyst_send_id(result, "delegateClass");
+    if (needsBootstrap && scene && bootstrapDelegateClass &&
+        (!existingDelegate || !((BOOL (*)(id, SEL, Class))objc_msgSend)(
+            existingDelegate, sel_registerName("isKindOfClass:"),
+            bootstrapDelegateClass))) {
+        id bootstrapDelegate = ((id (*)(id, SEL))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)(
+                (id)bootstrapDelegateClass, sel_registerName("alloc")),
+            sel_registerName("init"));
+        SEL setDelegate = sel_registerName("setDelegate:");
+        if (bootstrapDelegate && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+                scene, sel_registerName("respondsToSelector:"),
+                setDelegate)) {
+            // Runtime-confirmed in Weather pid 92995: UIKit asked the
+            // AppDelegate for our bootstrap configuration while the already
+            // connected scene still owned SwiftUI.AppSceneDelegate, then
+            // exited without ever invoking the returned delegate class.
+            // Complete that real scene's requested configuration through
+            // UIScene's native strong setter and standard willConnect callback.
+            fprintf(stderr,
+                    "#### WEATHER-SCENE replacing initial delegate old=%s@%p "
+                    "new=%s@%p scene=%p\n",
+                    existingDelegate ? object_getClassName(existingDelegate)
+                                     : "nil",
+                    existingDelegate,
+                    object_getClassName(bootstrapDelegate),
+                    bootstrapDelegate, scene);
+            fflush(stderr);
+            // UIKit created this SwiftUI delegate as the scene-lifetime owner
+            // before it asked the late Weather AppDelegate for a corrected
+            // configuration. Replacing UIScene.delegate releases that owner,
+            // while its already-scheduled AttributeGraph update still holds
+            // unowned references into the graph. Keep the native owner tied
+            // to the same scene lifetime while Weather.SceneDelegate assumes
+            // callback responsibility below. This is a bounded ownership
+            // transfer, not a per-frame or process-global retention.
+            if (existingDelegate) {
+                objc_setAssociatedObject(
+                    scene, &macws_weather_replaced_scene_delegate_key,
+                    existingDelegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            ((void (*)(id, SEL, id))objc_msgSend)(
+                scene, setDelegate, bootstrapDelegate);
+            objc_setAssociatedObject(
+                scene, &macws_weather_bootstrap_delegate_key,
+                bootstrapDelegate, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            macws_weather_bootstrap_will_connect(
+                bootstrapDelegate,
+                sel_registerName("scene:willConnectToSession:options:"),
+                scene, session, options);
+            existingDelegate = bootstrapDelegate;
+
+            // The scene-create transaction does not yield back to the main
+            // queue before AppKit evaluates launch completion; pid 93274
+            // exited after this callback while the scheduled 10 ms adoption
+            // never ran. At this point UIWindowScene, its FUScene identifier
+            // and a real bootstrap UIWindow all exist, so complete the held
+            // UINS launch synchronously at the same configuration boundary.
+            if (atomic_load_explicit(
+                    &macws_weather_uins_finish_state,
+                    memory_order_acquire) == 1 &&
+                macws_weather_pending_uins_finish_delegate &&
+                macws_weather_pending_uins_finish_selector) {
+                macws_weather_uins_finish_launching_compat(
+                    macws_weather_pending_uins_finish_delegate,
+                    macws_weather_pending_uins_finish_selector);
+                existingDelegate = macws_catalyst_send_id(
+                    scene, "delegate");
+            }
+        }
+    }
+    fprintf(stderr,
+            "#### WEATHER-SCENE configuration result=%s name=%s "
+            "delegate=%s connected=%lu existing=%s adopted=%s windows=%lu\n",
+            result ? object_getClassName(result) : "nil",
+            name ? ((const char *(*)(id, SEL))objc_msgSend)(
+                name, sel_registerName("UTF8String")) : "<nil>",
+            delegateClass ? class_getName((Class)delegateClass) : "<nil>",
+            (unsigned long)macws_catalyst_collection_count(scenes),
+            existingDelegate ? object_getClassName(existingDelegate) : "nil",
+            "deferred",
+            (unsigned long)macws_catalyst_collection_count(
+                macws_catalyst_send_id(application, "windows")));
+    fflush(stderr);
+    return result;
+}
+
+static void macws_weather_did_request_scene_compat(
+        id self, SEL selector, id options, id sceneIdentifier, id error) {
+    macws_weather_did_request_scene_orig(
+        self, selector, options, sceneIdentifier, error);
+    // Runtime-confirmed in Weather PID 68870: UIApplication.connectedScenes
+    // became non-empty before UINS completed this callback. Adopting the scene
+    // at that earlier observation caused UINS to open a second creation
+    // transaction with a different persistent ID. This native callback is the
+    // transaction boundary at which UINS has logged didRequestSceneWithOptions
+    // and removed the first request from its creation tracker.
+    bool first = !atomic_exchange_explicit(
+        &macws_weather_bootstrap_request_completed, true,
+        memory_order_acq_rel);
+    if (first) {
+        fprintf(stderr,
+                "#### WEATHER-SCENE bootstrap request completed "
+                "identifier=%s error=%s\n",
+                sceneIdentifier ? object_getClassName(sceneIdentifier) : "nil",
+                error ? object_getClassName(error) : "nil");
+        fflush(stderr);
+    }
+}
+
+static BOOL macws_install_weather_uins_completion_hook(void) {
+    if (macws_weather_did_request_scene_orig) return YES;
+    Class uinsDelegate = objc_getClass("UINSApplicationDelegate");
+    if (!uinsDelegate) return NO;
+    BOOL installed = macws_lp_replace_instance_method(
+        uinsDelegate,
+        "didRequestSceneWithOptions:sceneIdentifier:orError:",
+        (IMP)macws_weather_did_request_scene_compat,
+        (IMP *)&macws_weather_did_request_scene_orig);
+    fprintf(stderr,
+            "#### WEATHER-SCENE completion-hook installed=%d class=%s "
+            "original=%p\n", installed,
+            class_getName(uinsDelegate),
+            macws_weather_did_request_scene_orig);
+    fflush(stderr);
+    return installed;
+}
+
+static void macws_weather_uins_finish_launching_compat(
+        id self, SEL selector) {
+    Class applicationClass = objc_getClass("UIApplication");
+    id application = applicationClass
+        ? macws_catalyst_send_id((id)applicationClass,
+                                  "sharedApplication") : nil;
+    id scenes = macws_catalyst_send_id(application, "connectedScenes");
+    id bootstrapScene = macws_catalyst_send_id(scenes, "anyObject");
+    id sceneIdentifier = macws_catalyst_send_id(
+        bootstrapScene, "_sceneIdentifier");
+    if (!sceneIdentifier) {
+        int state = atomic_load_explicit(
+            &macws_weather_uins_finish_state, memory_order_acquire);
+        if (state == 0) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(
+                    &macws_weather_uins_finish_state, &expected, 1,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                macws_weather_pending_uins_finish_delegate = self;
+                macws_weather_pending_uins_finish_selector = selector;
+                atomic_store_explicit(
+                    &macws_weather_uins_finish_attempts, 0,
+                    memory_order_release);
+                dispatch_after_f(
+                    dispatch_time(DISPATCH_TIME_NOW,
+                                  10 * NSEC_PER_MSEC),
+                    dispatch_get_main_queue(), NULL,
+                    macws_weather_retry_uins_finish);
+                fprintf(stderr,
+                        "#### WEATHER-SCENE finish-launch deferred "
+                        "reason=bootstrap-not-connected\n");
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+    Ivar mainSceneIdentifier = class_getInstanceVariable(
+        object_getClass(self), "_mainSceneIdentifier");
+    id oldIdentifier = mainSceneIdentifier
+        ? object_getIvar(self, mainSceneIdentifier) : nil;
+    BOOL synchronized = NO;
+    if (!oldIdentifier && sceneIdentifier && mainSceneIdentifier) {
+        // RE-confirmed via the target Ventura 13.4 UIKitMacHelper:
+        // UINSApplicationDelegate's runtime ivar table names offset +0x40
+        // `_mainSceneIdentifier`; -_finishLaunching at image +0x4fd4 loads
+        // that exact field and requests a second initial scene only when it is
+        // nil. The FUScene identifier below comes from the already registered
+        // UIWindowScene, so this restores UINS's missing bookkeeping rather
+        // than fabricating a scene or bypassing its launch work.
+        object_setIvar(self, mainSceneIdentifier, sceneIdentifier);
+        objc_setAssociatedObject(
+            self, &macws_weather_main_scene_identifier_key,
+            sceneIdentifier, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        synchronized = object_getIvar(self, mainSceneIdentifier) ==
+            sceneIdentifier;
+    } else if (oldIdentifier) {
+        synchronized = YES;
+    }
+
+    BOOL adopted = synchronized && application &&
+        macws_weather_adopt_bootstrap_scene(application);
+    const char *identifierString = sceneIdentifier &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            sceneIdentifier, sel_registerName("respondsToSelector:"),
+            sel_registerName("UTF8String"))
+        ? ((const char *(*)(id, SEL))objc_msgSend)(
+              sceneIdentifier, sel_registerName("UTF8String")) : NULL;
+    fprintf(stderr,
+            "#### WEATHER-SCENE finish-launch synchronize=%d adopted=%d "
+            "scene=%s connected=%lu old=%s\n",
+            synchronized, adopted, identifierString ?: "nil",
+            (unsigned long)macws_catalyst_collection_count(scenes),
+            oldIdentifier ? object_getClassName(oldIdentifier) : "nil");
+    fflush(stderr);
+
+    // Preserve UIKitMacHelper's complete launch finalization. With its real
+    // main-scene invariant restored, the original follows its native existing
+    // scene branch instead of opening a conflicting second transaction.
+    atomic_store_explicit(
+        &macws_weather_uins_finish_state, 2, memory_order_release);
+    macws_weather_uins_finish_launching_orig(self, selector);
+    macws_weather_pending_uins_finish_delegate = nil;
+    macws_weather_pending_uins_finish_selector = NULL;
+}
+
+static void macws_weather_retry_uins_finish(void *context) {
+    (void)context;
+    id delegate = macws_weather_pending_uins_finish_delegate;
+    SEL selector = macws_weather_pending_uins_finish_selector;
+    if (!delegate || !selector || atomic_load_explicit(
+            &macws_weather_uins_finish_state,
+            memory_order_acquire) != 1) return;
+    unsigned attempt = atomic_fetch_add_explicit(
+        &macws_weather_uins_finish_attempts, 1,
+        memory_order_acq_rel) + 1;
+    Class applicationClass = objc_getClass("UIApplication");
+    id application = applicationClass
+        ? macws_catalyst_send_id((id)applicationClass,
+                                  "sharedApplication") : nil;
+    BOOL connected = macws_catalyst_collection_count(
+        macws_catalyst_send_id(application, "connectedScenes")) > 0;
+    if (connected) {
+        macws_weather_uins_finish_launching_compat(delegate, selector);
+        return;
+    }
+    if (attempt < 200) {
+        dispatch_after_f(
+            dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC),
+            dispatch_get_main_queue(), NULL,
+            macws_weather_retry_uins_finish);
+        return;
+    }
+
+    // A missing bootstrap after two seconds is a distinct failure. Run the
+    // original launch method unchanged so UIKit reports its native error; do
+    // not leave the application silently suspended behind this compatibility
+    // transaction.
+    fprintf(stderr,
+            "#### WEATHER-SCENE finish-launch bootstrap timeout polls=%u\n",
+            attempt);
+    fflush(stderr);
+    atomic_store_explicit(
+        &macws_weather_uins_finish_state, 2, memory_order_release);
+    macws_weather_uins_finish_launching_orig(delegate, selector);
+    macws_weather_pending_uins_finish_delegate = nil;
+    macws_weather_pending_uins_finish_selector = NULL;
+}
+
+static BOOL macws_install_weather_uins_finish_hook(void) {
+    if (macws_weather_uins_finish_launching_orig) return YES;
+    Class uinsDelegate = objc_getClass("UINSApplicationDelegate");
+    if (!uinsDelegate) return NO;
+    BOOL installed = macws_lp_replace_instance_method(
+        uinsDelegate, "_finishLaunching",
+        (IMP)macws_weather_uins_finish_launching_compat,
+        (IMP *)&macws_weather_uins_finish_launching_orig);
+    fprintf(stderr,
+            "#### WEATHER-SCENE finish-hook installed=%d class=%s "
+            "original=%p\n", installed, class_getName(uinsDelegate),
+            macws_weather_uins_finish_launching_orig);
+    fflush(stderr);
+    return installed;
+}
+
+static void macws_install_weather_scene_compatibility(void) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Weather") != 0) return;
+    void *privateSysdir = dlsym(
+        RTLD_DEFAULT, "sysdir_start_search_path_enumeration_private");
+    if (privateSysdir) {
+        MSHookFunction(
+            privateSysdir,
+            (void *)macws_weather_sysdir_start_private_compat,
+            (void **)&macws_weather_sysdir_start_private_orig);
+    }
+    void *searchPaths = dlsym(
+        RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
+    if (searchPaths) {
+        MSHookFunction(searchPaths,
+                       (void *)macws_weather_search_paths_compat,
+                       (void **)&macws_weather_search_paths_orig);
+    }
+    Class appDelegate = objc_getClass("_TtC7Weather11AppDelegate");
+    if (appDelegate) {
+        macws_lp_replace_instance_method(
+            appDelegate,
+            "application:configurationForConnectingSceneSession:options:",
+            (IMP)macws_weather_configuration_compat,
+            (IMP *)&macws_weather_configuration_orig);
+    }
+    // UIKitMacHelper may not have registered UINSApplicationDelegate when
+    // this constructor first runs. Retry at the actual scene-request boundary
+    // below, where the class is necessarily available to the caller.
+    (void)macws_install_weather_uins_completion_hook();
+    (void)macws_install_weather_uins_finish_hook();
 }
 
 static id macws_catalyst_endpoint_for_system_route(
@@ -2230,6 +2722,21 @@ static id macws_uins_framework_noop_scene_completion(Class delegateClass) {
     return className && strstr(className, "Block") ? block : nil;
 }
 
+static BOOL macws_weather_has_configured_scene(id application) {
+    Class weatherSceneDelegateClass =
+        objc_getClass("_TtC7Weather13SceneDelegate");
+    id scenes = macws_catalyst_send_id(application, "connectedScenes");
+    if (!weatherSceneDelegateClass || !scenes) return NO;
+    for (id scene in scenes) {
+        id delegate = macws_catalyst_send_id(scene, "delegate");
+        if (delegate && ((BOOL (*)(id, SEL, Class))objc_msgSend)(
+                delegate, sel_registerName("isKindOfClass:"),
+                weatherSceneDelegateClass))
+            return YES;
+    }
+    return NO;
+}
+
 static void macws_catalyst_finish_after_scene(void *context) {
     (void)context;
     @autoreleasepool {
@@ -2237,7 +2744,53 @@ static void macws_catalyst_finish_after_scene(void *context) {
         if (!application || !macws_catalyst_compell_orig) return;
         NSUInteger sceneCount = macws_catalyst_collection_count(
             macws_catalyst_send_id(application, "connectedScenes"));
-        if (sceneCount > 0) {
+        const char *program = getprogname();
+        BOOL isWeather = program && strcmp(program, "Weather") == 0;
+        BOOL sceneReady = sceneCount > 0;
+        if (sceneReady && isWeather &&
+            !macws_weather_has_configured_scene(application)) {
+            if (!atomic_load_explicit(
+                    &macws_weather_bootstrap_request_completed,
+                    memory_order_acquire)) {
+                // connectedScenes is published before UINS closes the request
+                // transaction. Keep polling until the native completion hook
+                // above records that stronger lifecycle boundary.
+                sceneReady = NO;
+                goto poll_scene;
+            }
+            // The generic UINS bootstrap is intentionally first: the current
+            // iPadOS UIKit runtime publishes UIScreen only after that scene is
+            // connected. Runtime capture on the target showed Weather's
+            // AppDelegate reaching +[UIScreen mainScreen] before this boundary
+            // and aborting with "returning nil screen ... is not allowed".
+            // Once UIScreen is real, run Weather's ordinary launch callbacks
+            // and hand this already-registered scene to Weather's stock
+            // SceneDelegate. A second activation is not equivalent here:
+            // runtime logs showed UINS tracking a new persistent ID while
+            // FuseBoard reused the bootstrap scene's old persistent ID, after
+            // which UINS rejected the real window as an untracked scene.
+            if (!macws_weather_prepare_application_launch(application, NULL)) {
+                atomic_store_explicit(
+                    &macws_catalyst_initial_scene_request_state, 3,
+                    memory_order_release);
+                fprintf(stderr,
+                        "#### WEATHER-LIFECYCLE AppDelegate launch failed "
+                        "after UINS bootstrap scene\n");
+                fflush(stderr);
+                return;
+            }
+            if (!macws_weather_adopt_bootstrap_scene(application)) {
+                atomic_store_explicit(
+                    &macws_catalyst_initial_scene_request_state, 3,
+                    memory_order_release);
+                fprintf(stderr,
+                        "#### WEATHER-SCENE bootstrap adoption failed\n");
+                fflush(stderr);
+                return;
+            }
+            sceneReady = macws_weather_has_configured_scene(application);
+        }
+        if (sceneReady) {
             atomic_store_explicit(
                 &macws_catalyst_initial_scene_request_state, 2,
                 memory_order_release);
@@ -2251,6 +2804,8 @@ static void macws_catalyst_finish_after_scene(void *context) {
             return;
         }
 
+poll_scene:
+        ;
         unsigned attempt = atomic_fetch_add_explicit(
             &macws_catalyst_scene_poll_attempts, 1,
             memory_order_acq_rel) + 1;
@@ -2274,6 +2829,182 @@ static void macws_catalyst_finish_after_scene(void *context) {
     }
 }
 
+static BOOL macws_weather_prepare_application_launch(id application,
+                                                      id *delegateOut) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Weather") != 0 || !application)
+        return NO;
+    Class weatherAppDelegateClass = objc_getClass("_TtC7Weather11AppDelegate");
+    id currentDelegate = macws_catalyst_send_id(application, "delegate");
+    BOOL usesWeatherAppDelegate = currentDelegate && weatherAppDelegateClass &&
+        ((BOOL (*)(id, SEL, Class))objc_msgSend)(
+            currentDelegate, sel_registerName("isKindOfClass:"),
+            weatherAppDelegateClass);
+    if (!usesWeatherAppDelegate && weatherAppDelegateClass &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            application, sel_registerName("respondsToSelector:"),
+            sel_registerName("setDelegate:"))) {
+        id weatherAppDelegate = ((id (*)(id, SEL))objc_msgSend)(
+            ((id (*)(id, SEL))objc_msgSend)((id)weatherAppDelegateClass,
+                                             sel_registerName("alloc")),
+            sel_registerName("init"));
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            application, sel_registerName("setDelegate:"),
+            weatherAppDelegate);
+        objc_setAssociatedObject(application, @selector(delegate),
+                                 weatherAppDelegate,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        currentDelegate = weatherAppDelegate;
+    }
+    if (!currentDelegate || !weatherAppDelegateClass ||
+        !((BOOL (*)(id, SEL, Class))objc_msgSend)(
+            currentDelegate, sel_registerName("isKindOfClass:"),
+            weatherAppDelegateClass)) return NO;
+    if (!objc_getAssociatedObject(
+            currentDelegate, &macws_weather_app_launch_delivered_key)) {
+        id launchOptions = ((id (*)(id, SEL))objc_msgSend)(
+            (id)objc_getClass("NSDictionary"), sel_registerName("dictionary"));
+        SEL willFinish = sel_registerName(
+            "application:willFinishLaunchingWithOptions:");
+        SEL didFinish = sel_registerName(
+            "application:didFinishLaunchingWithOptions:");
+        BOOL willFinishResult = YES;
+        BOOL didFinishResult = YES;
+        if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+                currentDelegate, sel_registerName("respondsToSelector:"),
+                willFinish)) {
+            willFinishResult = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(
+                currentDelegate, willFinish, application, launchOptions);
+        }
+        if (willFinishResult &&
+            ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+                currentDelegate, sel_registerName("respondsToSelector:"),
+                didFinish)) {
+            didFinishResult = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(
+                currentDelegate, didFinish, application, launchOptions);
+        }
+        fprintf(stderr,
+                "#### WEATHER-LIFECYCLE appDelegate launch "
+                "willFinish=%d didFinish=%d\n",
+                willFinishResult, didFinishResult);
+        fflush(stderr);
+        if (!willFinishResult || !didFinishResult) return NO;
+        objc_setAssociatedObject(
+            currentDelegate, &macws_weather_app_launch_delivered_key, @YES,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    if (delegateOut) *delegateOut = currentDelegate;
+    return YES;
+}
+
+static BOOL macws_weather_adopt_bootstrap_scene(id application) {
+    id currentDelegate = nil;
+    if (!macws_weather_prepare_application_launch(application,
+                                                  &currentDelegate))
+        return NO;
+
+    Class weatherSceneDelegateClass =
+        objc_getClass("_TtC7Weather13SceneDelegate");
+    Class windowSceneClass = objc_getClass("UIWindowScene");
+    id scenes = macws_catalyst_send_id(application, "connectedScenes");
+    id bootstrapScene = nil;
+    for (id scene in scenes) {
+        id delegate = macws_catalyst_send_id(scene, "delegate");
+        BOOL isWindowScene = windowSceneClass &&
+            ((BOOL (*)(id, SEL, Class))objc_msgSend)(
+                scene, sel_registerName("isKindOfClass:"), windowSceneClass);
+        BOOL alreadyWeather = delegate && weatherSceneDelegateClass &&
+            ((BOOL (*)(id, SEL, Class))objc_msgSend)(
+                delegate, sel_registerName("isKindOfClass:"),
+                weatherSceneDelegateClass);
+        if (isWindowScene && !alreadyWeather) {
+            bootstrapScene = scene;
+            break;
+        }
+    }
+    if (!bootstrapScene || !weatherSceneDelegateClass) return NO;
+
+    id session = macws_catalyst_send_id(bootstrapScene, "session");
+    Class optionsClass = objc_getClass("UISceneConnectionOptions");
+    id options = optionsClass
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              ((id (*)(id, SEL))objc_msgSend)((id)optionsClass,
+                                               sel_registerName("alloc")),
+              sel_registerName("init"))
+        : nil;
+    SEL configurationSelector = sel_registerName(
+        "application:configurationForConnectingSceneSession:options:");
+    id stockConfiguration = nil;
+    if (session && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            currentDelegate, sel_registerName("respondsToSelector:"),
+            configurationSelector)) {
+        stockConfiguration = ((id (*)(id, SEL, id, id, id))objc_msgSend)(
+            currentDelegate, configurationSelector, application, session,
+            options);
+    }
+    Class delegateClass = stockConfiguration
+        ? (Class)macws_catalyst_send_id(stockConfiguration, "delegateClass")
+        : Nil;
+    if (!delegateClass ||
+        !((BOOL (*)(id, SEL, Class))objc_msgSend)(
+            (id)delegateClass, sel_registerName("isSubclassOfClass:"),
+            weatherSceneDelegateClass)) {
+        delegateClass = weatherSceneDelegateClass;
+    }
+    id sceneDelegate = ((id (*)(id, SEL))objc_msgSend)(
+        ((id (*)(id, SEL))objc_msgSend)((id)delegateClass,
+                                        sel_registerName("alloc")),
+        sel_registerName("init"));
+    SEL setDelegateSelector = sel_registerName("setDelegate:");
+    if (!sceneDelegate || !((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            bootstrapScene, sel_registerName("respondsToSelector:"),
+            setDelegateSelector)) return NO;
+
+    // RE-confirmed via the target's Ventura 13.4 UIKitCore at
+    // -[UIScene setDelegate:] +0x3c..+0x5c: UIKit stores the delegate strongly
+    // and calls _UISceneInspectDelegateSuport to rebuild its callback flags.
+    // This adopts the real scene through UIKit's own lifecycle state rather
+    // than mutating SkyLight window or Space membership.
+    ((void (*)(id, SEL, id))objc_msgSend)(
+        bootstrapScene, setDelegateSelector, sceneDelegate);
+    SEL willConnect = sel_registerName(
+        "scene:willConnectToSession:options:");
+    if (((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            sceneDelegate, sel_registerName("respondsToSelector:"),
+            willConnect)) {
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(
+            sceneDelegate, willConnect, bootstrapScene, session, options);
+    }
+
+    NSInteger activationState = ((NSInteger (*)(id, SEL))objc_msgSend)(
+        bootstrapScene, sel_registerName("activationState"));
+    SEL willEnterForeground = sel_registerName("sceneWillEnterForeground:");
+    if (activationState <= 1 && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            sceneDelegate, sel_registerName("respondsToSelector:"),
+            willEnterForeground)) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            sceneDelegate, willEnterForeground, bootstrapScene);
+    }
+    SEL didBecomeActive = sel_registerName("sceneDidBecomeActive:");
+    if (activationState == 0 && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            sceneDelegate, sel_registerName("respondsToSelector:"),
+            didBecomeActive)) {
+        ((void (*)(id, SEL, id))objc_msgSend)(
+            sceneDelegate, didBecomeActive, bootstrapScene);
+    }
+    fprintf(stderr,
+            "#### WEATHER-SCENE adopted bootstrap scene=%s session=%s "
+            "delegate=%s@%p activation=%ld windows=%lu\n",
+            object_getClassName(bootstrapScene),
+            session ? object_getClassName(session) : "nil",
+            object_getClassName(sceneDelegate), sceneDelegate,
+            (long)activationState,
+            (unsigned long)macws_catalyst_collection_count(
+                macws_catalyst_send_id(application, "windows")));
+    fflush(stderr);
+    return macws_weather_has_configured_scene(application);
+}
+
 static void macws_catalyst_compell_compat(id self, SEL selector) {
     macws_register_catalyst_application_with_fuseboard();
     if (macws_runtime_diagnostics_enabled())
@@ -2281,6 +3012,11 @@ static void macws_catalyst_compell_compat(id self, SEL selector) {
     if (getenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE") &&
         macws_catalyst_collection_count(
             macws_catalyst_send_id(self, "connectedScenes")) == 0) {
+        const char *program = getprogname();
+        if (program && strcmp(program, "Weather") == 0) {
+            (void)macws_install_weather_uins_completion_hook();
+            (void)macws_install_weather_uins_finish_hook();
+        }
         int expected = 0;
         if (atomic_compare_exchange_strong_explicit(
                 &macws_catalyst_initial_scene_request_state, &expected, 1,
@@ -2343,6 +3079,7 @@ static void macws_catalyst_compell_compat(id self, SEL selector) {
 
 static void macws_install_catalyst_launch_compatibility(void) {
     if (!getenv("MACWS_CATALYST_REQUEST_INITIAL_SCENE")) return;
+    macws_install_weather_scene_compatibility();
     Class application = objc_getClass("UIApplication");
     if (!application) return;
     macws_lp_replace_instance_method(
@@ -7801,6 +8538,20 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
         entry[@"last"] = @(g_macws_owned_scanout_clock);
         [shapeEntries addObject:entry];
         g_macws_owned_scanout_pool_bytes += allocation;
+        static NSUInteger lastScanoutWitnessBucket = 0;
+        NSUInteger scanoutWitnessBucket =
+            g_macws_owned_scanout_pool_bytes / (64U * 1024U * 1024U);
+        if (scanoutWitnessBucket > lastScanoutWitnessBucket) {
+            lastScanoutWitnessBucket = scanoutWitnessBucket;
+            dprintf(STDERR_FILENO,
+                "#### MACWS-MEMORY-WITNESS pool=owned-scanout "
+                "idle-and-live=%luMB rss=%lluMB entries=%lu\n",
+                (unsigned long)(g_macws_owned_scanout_pool_bytes /
+                                (1024U * 1024U)),
+                (unsigned long long)(macws_resident_memory_bytes() /
+                                     (1024U * 1024U)),
+                (unsigned long)[shapeEntries count]);
+        }
 
         // This retain is the caller's reservation, separate from the create
         // retain owned by the pool entry.
@@ -7827,7 +8578,13 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
         // Evict only idle older entries.  Live textures may temporarily push
         // the pool over budget; freeing or aliasing one would violate the
         // render-target lifetime contract.
-        const NSUInteger budget = 256U * 1024U * 1024U;
+        // Four Retina BGRA scanouts occupy roughly 61 MiB on the target.
+        // Retaining 256 MiB of *idle* generations kept obsolete orientation,
+        // Scene and display-shape targets resident long after their GPU users
+        // completed.  A 128-MiB idle LRU preserves ample double/triple-buffer
+        // headroom; busy entries remain protected and may exceed this budget
+        // until their real texture retain counts return to baseline.
+        const NSUInteger budget = 128U * 1024U * 1024U;
         while (g_macws_owned_scanout_pool_bytes > budget) {
             NSString *oldestKey = nil;
             NSMutableArray *oldestArray = nil;
@@ -8040,9 +8797,50 @@ static void macws_sigabrt_trampoline(int sig) {
     raise(SIGABRT);
 }
 
+// Preserve macOS descriptor semantics until the request reaches the native
+// iOS AGX device.  The old MTLTextureDescriptorInternal -storageMode hook
+// changed Managed to Shared inside the getter itself, permanently mutating the
+// caller's object.  Metal Validation runtime-confirmed that QuartzCore's
+// CAMetalLayer IOSurface request then failed in the outer macOS Metal layer:
+//
+//   IOSurface textures must use MTLStorageModeManaged
+//
+// iOS AGX cannot consume Managed, so the ABI translation is still necessary,
+// but it belongs at this device boundary.  Copy the descriptor and translate
+// only the copy that is passed to the real iOS driver; QuartzCore/UE4 and an
+// outer MTLDebugDevice continue to observe their original Managed contract.
+static MTLTextureDescriptor *macws_native_agx_texture_descriptor(
+        MTLTextureDescriptor *descriptor, const char *site) {
+    if (!descriptor || !getenv("MACWS_AGX_NATIVE") ||
+        descriptor.storageMode != (MTLStorageMode)1 /* Managed on macOS */) {
+        return descriptor;
+    }
+
+    MTLTextureDescriptor *native = [[descriptor copy] autorelease];
+    if (!native) return descriptor;
+    native.storageMode = MTLStorageModeShared;
+
+    static _Atomic uint64_t translationCount = 0;
+    uint64_t sequence = atomic_fetch_add_explicit(
+        &translationCount, 1, memory_order_relaxed) + 1;
+    if (macws_runtime_diagnostics_enabled() && sequence <= 24) {
+        fprintf(stderr,
+            "#### MTL_TEX MANAGED-BOUNDARY #%llu site=%s "
+            "caller=%p storage=Managed native=%p storage=Shared "
+            "pf=%lu w=%lu h=%lu usage=%#lx\n",
+            (unsigned long long)sequence, site ? site : "(unknown)",
+            (void *)descriptor, (void *)native,
+            (unsigned long)native.pixelFormat,
+            (unsigned long)native.width, (unsigned long)native.height,
+            (unsigned long)native.usage);
+    }
+    return native;
+}
+
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc
                                         iosurface:(IOSurfaceRef)iosurface
                                             plane:(NSUInteger)plane {
+    desc = macws_native_agx_texture_descriptor(desc, "iosurface");
     macws_lock_current_iosurface_scope();
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, iosurface, plane, "iosurf.IN");
@@ -8475,7 +9273,54 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
     }
 }
 
+// Opt-in evidence for plain-texture IOSurface layout failures.  Keep this
+// independent of the broad MACWS_TEX_TRACE environment switch: launchers may
+// intentionally sanitize diagnostic environment variables, while the chroot
+// sentinel remains visible at the exact allocator boundary.  This observer
+// never changes the descriptor or the IOSurface.
+static BOOL macws_texture_stride_diag_enabled(void) {
+    return access("/private/tmp/macws_texture_stride_diag", F_OK) == 0;
+}
+
+static void macws_log_plain_texture_surface_layout(
+        MTLTextureDescriptor *desc, IOSurfaceRef surface,
+        NSUInteger selectedBytesPerElement, uint32_t selectedPixelFormat) {
+    if (!macws_texture_stride_diag_enabled()) return;
+    static _Atomic uint64_t sequence = 0;
+    uint64_t current =
+        atomic_fetch_add_explicit(&sequence, 1, memory_order_relaxed) + 1;
+    dprintf(STDERR_FILENO,
+        "#### MTL_TEX STRIDE-DIAG #%llu "
+        "desc=(pf=%lu type=%lu w=%lu h=%lu d=%lu mips=%lu arr=%lu "
+        "samples=%lu storage=%lu usage=%#lx) "
+        "selected=(bpe=%lu fcc=%#x) "
+        "surface=(%p id=%u w=%zu h=%zu bpr=%zu bpe=%zu fcc=%#x "
+        "planes=%zu alloc=%zu)\n",
+        (unsigned long long)current,
+        (unsigned long)desc.pixelFormat,
+        (unsigned long)desc.textureType,
+        (unsigned long)desc.width,
+        (unsigned long)desc.height,
+        (unsigned long)desc.depth,
+        (unsigned long)desc.mipmapLevelCount,
+        (unsigned long)desc.arrayLength,
+        (unsigned long)desc.sampleCount,
+        (unsigned long)desc.storageMode,
+        (unsigned long)desc.usage,
+        (unsigned long)selectedBytesPerElement,
+        (unsigned)selectedPixelFormat,
+        (void *)surface, surface ? IOSurfaceGetID(surface) : 0,
+        surface ? IOSurfaceGetWidth(surface) : 0,
+        surface ? IOSurfaceGetHeight(surface) : 0,
+        surface ? IOSurfaceGetBytesPerRow(surface) : 0,
+        surface ? IOSurfaceGetBytesPerElement(surface) : 0,
+        surface ? IOSurfaceGetPixelFormat(surface) : 0,
+        surface ? IOSurfaceGetPlaneCount(surface) : 0,
+        surface ? IOSurfaceGetAllocSize(surface) : 0);
+}
+
 - (id<MTLTexture>)hooked_newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
+    desc = macws_native_agx_texture_descriptor(desc, "plain");
     if (getenv("MACWS_TEX_TRACE") != NULL) {
         macws_log_mtldesc(desc, NULL, 0, "plain.IN");
     }
@@ -8802,6 +9647,16 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
             // _mtlValidateStrideTextureParameters for 64x64 (256 < 512).
             fmt4cc = 'w40a'; bpe = 8;
         }
+        else if (pf == 110) {
+            // MTLPixelFormatRGBA16Unorm is eight bytes per pixel.  The former
+            // BGRA8 default allocated a 512-byte row for Stray's 98x64
+            // subsurface-profile texture, while Metal correctly required
+            // 98*8 = 784 bytes and aborted.  CoreVideo's 'l64r' is the exact
+            // little-endian 64-bit RGBA/full-range-16-bit layout.  A native
+            // iOS control using this same descriptor produced bpr=896 and a
+            // real AGXG13GFamilyTexture.
+            fmt4cc = 'l64r'; bpe = 8;
+        }
         else if (pf == 115) { fmt4cc = 'RGhA'; bpe = 8; }
         else if (pf == 125) {
             // Chromium 148 creates a 16x16 RGBA32Float Viz texture during
@@ -8829,7 +9684,7 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
         // If all entries are busy we allocate another entry; aliasing is never
         // used as a memory-pressure fallback.
         //
-        // Idle entries are globally LRU-evicted above 512 MiB.  Busy entries
+        // Idle entries are globally LRU-evicted above 256 MiB.  Busy entries
         // may temporarily exceed the budget because destroying or aliasing a
         // live Metal object would violate the caller's lifetime contract.
         NSString *poolKey = [NSString stringWithFormat:@"%lux%lu-pf%lu-bpe%lu-fcc%u",
@@ -8898,6 +9753,8 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
                     surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
                 }
                 if (surf) {
+                    macws_log_plain_texture_surface_layout(
+                        desc, surf, bpe, fmt4cc);
                     tex = [self hooked_newTextureWithDescriptor:desc
                                                       iosurface:surf
                                                           plane:0];
@@ -8935,6 +9792,21 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
                     entry[@"last"] = @(leaseClock);
                     [shapeEntries addObject:entry];
                     leasePoolBytes += allocation;
+                    static NSUInteger lastPlainWitnessBucket = 0;
+                    NSUInteger plainWitnessBucket =
+                        leasePoolBytes / (64U * 1024U * 1024U);
+                    if (plainWitnessBucket > lastPlainWitnessBucket) {
+                        lastPlainWitnessBucket = plainWitnessBucket;
+                        dprintf(STDERR_FILENO,
+                            "#### MACWS-MEMORY-WITNESS pool=plain-texture "
+                            "idle-and-live=%luMB rss=%lluMB shapes=%lu\n",
+                            (unsigned long)(leasePoolBytes /
+                                            (1024U * 1024U)),
+                            (unsigned long long)(
+                                macws_resident_memory_bytes() /
+                                (1024U * 1024U)),
+                            (unsigned long)[leasePool count]);
+                    }
                     if (macws_runtime_diagnostics_enabled()) leaseNewCount++;
                     if (leaseNewCount &&
                         (leaseNewCount <= 64 ||
@@ -8953,7 +9825,12 @@ static BOOL macws_pixel_format_is_block_compressed(NSUInteger pf) {
                             compressedPF550 ? "PF550-COMPRESSED" : "LINEAR");
                     }
 
-                    const NSUInteger budget = 512U * 1024U * 1024U;
+                    // This is an idle compatibility cache, not an ownership
+                    // budget for live render targets.  Keep the lifetime-safe
+                    // retain-count gate but stop holding half a gigabyte of
+                    // superseded blur/menu intermediates after their users
+                    // finish.  Live entries are never evicted or aliased.
+                    const NSUInteger budget = 256U * 1024U * 1024U;
                     while (leasePoolBytes > budget) {
                         NSString *oldestKey = nil;
                         NSMutableArray *oldestArray = nil;
@@ -10471,6 +11348,133 @@ static const char *kMacWSSteamANGLEDefaultMacABIPath =
     "/usr/local/share/macws/angle/angle-default-5d4df51-macabi.metallib";
 static dispatch_data_t g_macws_steam_angle_default_macabi = NULL;
 
+// Stray 1.5.0 (Steam app 1332010) carries Metal 902.1 MTLB 2.3
+// containers.  The macOS Metal loader accepts those archives, but the real
+// iOS AGX compiler rejects their macOS 10.14 AIR modules when UE4 creates the
+// Bink render pipelines and Main_0000155a_0f9e5cf5 compute pipeline.  Each
+// secondary archive is rebuilt from the captured byte-exact input with every
+// AIR module retargeted to macabi; the legacy container layout is preserved so
+// Ventura's loader still supplies the original function/reflection metadata.
+// Selection is an exact length+FNV identity, never an application-name guess.
+typedef struct {
+    size_t source_length;
+    uint64_t source_hash;
+    size_t replacement_length;
+    uint64_t replacement_hash;
+    const char *replacement_path;
+} MacWSStrayMetalLibrary;
+
+static const MacWSStrayMetalLibrary kMacWSStrayMetalLibraries[] = {
+    { 3569, UINT64_C(0xaa9ab924907db665),
+      4033, UINT64_C(0x024a2ac48e9cb521),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0001_aa9ab924907db665-macabi.metallib" },
+    { 16384, UINT64_C(0x104af2d3aa14effe),
+      18352, UINT64_C(0xa62a9191a1825fc4),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0002_104af2d3aa14effe-macabi.metallib" },
+    { 38944, UINT64_C(0x754e9354d2bed1ce),
+      43120, UINT64_C(0xd91dfc54464816a8),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0003_754e9354d2bed1ce-macabi.metallib" },
+    { 6476, UINT64_C(0x1af3f820eb9c9879),
+      6636, UINT64_C(0x85f3a29ef89f20b6),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0004_1af3f820eb9c9879-macabi.metallib" },
+    { 4684, UINT64_C(0xe49cbc464de177a6),
+      4812, UINT64_C(0xbe6d5c99b52cea6a),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0005_e49cbc464de177a6-macabi.metallib" },
+    { 3974, UINT64_C(0x11d01f9d5be484ce),
+      4102, UINT64_C(0xdc8edcd819b692e5),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0006_11d01f9d5be484ce-macabi.metallib" },
+    { 4092, UINT64_C(0xa0aee2ed34c7cc82),
+      4188, UINT64_C(0x905ea6d6d43ac505),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0007_a0aee2ed34c7cc82-macabi.metallib" },
+    { 3537, UINT64_C(0xadf0091eede46178),
+      3649, UINT64_C(0xd85f854ab1e98001),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0008_adf0091eede46178-macabi.metallib" },
+    { 3452, UINT64_C(0x8b08bdaa4b23b8d6),
+      3564, UINT64_C(0xa1a63337c3f2eea8),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0009_8b08bdaa4b23b8d6-macabi.metallib" },
+    { 3740, UINT64_C(0x1c7d92340be4c066),
+      3852, UINT64_C(0x0587c85e8f62b77c),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0010_1c7d92340be4c066-macabi.metallib" },
+    { 9580, UINT64_C(0xbc43fb96825c1eeb),
+      9804, UINT64_C(0xc5b0e9972beaec2d),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0010_bc43fb96825c1eeb-macabi.metallib" },
+    { 5852, UINT64_C(0xdcd983a35ebe5747),
+      5964, UINT64_C(0x9ceb4ffe2a0f3d1c),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0012_dcd983a35ebe5747-macabi.metallib" },
+    { 3921, UINT64_C(0x57e3ed02b867ab23),
+      4033, UINT64_C(0x313d6a59882adb2e),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0013_57e3ed02b867ab23-macabi.metallib" },
+    { 5724, UINT64_C(0x29e91caa2c4db3e4),
+      5852, UINT64_C(0x19ec70da76ba1542),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0014_29e91caa2c4db3e4-macabi.metallib" },
+    { 3548, UINT64_C(0x77a6bcce69bd35dd),
+      3660, UINT64_C(0x5ed333cb01dd1eff),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0015_77a6bcce69bd35dd-macabi.metallib" },
+    { 3958, UINT64_C(0xfece7c6d28318ea6),
+      4086, UINT64_C(0x057c4c2d79ab8bb7),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0016_fece7c6d28318ea6-macabi.metallib" },
+    { 7884, UINT64_C(0x20009904c48f7940),
+      8092, UINT64_C(0x2d7ac7077756260e),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0017_20009904c48f7940-macabi.metallib" },
+    { 3137, UINT64_C(0xae19226a867a96dd),
+      3233, UINT64_C(0xf726e01fdf69638b),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0018_ae19226a867a96dd-macabi.metallib" },
+    { 4748, UINT64_C(0x48516180d56afb8b),
+      4876, UINT64_C(0xbd76365f15a35cec),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0019_48516180d56afb8b-macabi.metallib" },
+    { 3981, UINT64_C(0xe816a1ceebad3994),
+      4093, UINT64_C(0x6e953e6fd1d80efd),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0020_e816a1ceebad3994-macabi.metallib" },
+    { 5068, UINT64_C(0x0bd6c85cc3c02312),
+      5180, UINT64_C(0x972e073e0e238b9d),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0021_0bd6c85cc3c02312-macabi.metallib" },
+    { 10924, UINT64_C(0x89bd0750856f176a),
+      11180, UINT64_C(0x791eed7a8729df3f),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0022_89bd0750856f176a-macabi.metallib" },
+    { 9756, UINT64_C(0x9dd7f1a79a393b47),
+      9980, UINT64_C(0x3baf8452b34b2d3d),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0023_9dd7f1a79a393b47-macabi.metallib" },
+    { 10620, UINT64_C(0x6dd18b5165d70e7d),
+      10844, UINT64_C(0xfbc182bb2ac11c09),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0024_6dd18b5165d70e7d-macabi.metallib" },
+    { 4572, UINT64_C(0xdb18c0a5a9621796),
+      4684, UINT64_C(0xa88619215c2d700b),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0025_db18c0a5a9621796-macabi.metallib" },
+    { 13420, UINT64_C(0x8726b5069e53decc),
+      13724, UINT64_C(0xb011e362988677e4),
+      "/usr/local/share/macws/stray/"
+      "macws_mtl_data_0026_8726b5069e53decc-macabi.metallib" },
+};
+static dispatch_once_t g_macws_stray_metal_once[
+    sizeof(kMacWSStrayMetalLibraries) / sizeof(kMacWSStrayMetalLibraries[0])];
+static dispatch_data_t g_macws_stray_metal_data[
+    sizeof(kMacWSStrayMetalLibraries) / sizeof(kMacWSStrayMetalLibraries[0])];
+
 static dispatch_data_t macws_load_exact_metal_library(
     const char *path, size_t expected_length, uint64_t expected_hash) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -10531,6 +11535,144 @@ static dispatch_data_t macws_steam_angle_default_macabi_library(void) {
             kMacWSSteamANGLEDefaultMacABIHash);
     });
     return g_macws_steam_angle_default_macabi;
+}
+
+static BOOL macws_is_stray_metal_library_length(size_t length) {
+    for (size_t index = 0;
+         index < sizeof(kMacWSStrayMetalLibraries) /
+                     sizeof(kMacWSStrayMetalLibraries[0]);
+         index++) {
+        if (kMacWSStrayMetalLibraries[index].source_length == length)
+            return YES;
+    }
+    return NO;
+}
+
+static dispatch_data_t macws_stray_macabi_library(size_t index) {
+    const size_t count = sizeof(kMacWSStrayMetalLibraries) /
+                         sizeof(kMacWSStrayMetalLibraries[0]);
+    if (index >= count) return NULL;
+    dispatch_once(&g_macws_stray_metal_once[index], ^{
+        const MacWSStrayMetalLibrary *entry =
+            &kMacWSStrayMetalLibraries[index];
+        g_macws_stray_metal_data[index] = macws_load_exact_metal_library(
+            entry->replacement_path, entry->replacement_length,
+            entry->replacement_hash);
+    });
+    return g_macws_stray_metal_data[index];
+}
+
+// UE4 streams hundreds of small, one-function legacy MTLB archives as levels
+// load.  Recompiling libmachook merely to append every exact fingerprint makes
+// the compatibility data depend on build timing.  Allow post-install to place
+// additional byte-exact conversions in a root-owned directory instead:
+//
+//   exact/<source-length>-<source-fnv>.metallib
+//   exact/<source-length>-<source-fnv>.meta  -> <output-length> <output-fnv>
+//
+// Both files must be owned by root and not group/world writable.  The source
+// still has to match length+FNV before this function is called, and the output
+// is validated again by macws_load_exact_metal_library (size, MTLB magic,
+// container length and FNV).  This is an exact data replacement, not an
+// application-name or function-name heuristic.
+typedef struct {
+    size_t source_length;
+    uint64_t source_hash;
+    dispatch_data_t replacement;
+} MacWSDynamicMetalLibrary;
+
+static pthread_mutex_t g_macws_dynamic_metal_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static MacWSDynamicMetalLibrary g_macws_dynamic_metal_libraries[512];
+static size_t g_macws_dynamic_metal_library_count = 0;
+
+static BOOL macws_root_owned_readonly_file(const char *path) {
+    struct stat metadata = {0};
+    return path && stat(path, &metadata) == 0 &&
+           metadata.st_uid == 0 && S_ISREG(metadata.st_mode) &&
+           (metadata.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static dispatch_data_t macws_dynamic_stray_macabi_library(
+        size_t source_length, uint64_t source_hash) {
+    pthread_mutex_lock(&g_macws_dynamic_metal_lock);
+    for (size_t index = 0; index < g_macws_dynamic_metal_library_count;
+         index++) {
+        MacWSDynamicMetalLibrary *entry =
+            &g_macws_dynamic_metal_libraries[index];
+        if (entry->source_length == source_length &&
+            entry->source_hash == source_hash) {
+            dispatch_data_t cached = entry->replacement;
+            pthread_mutex_unlock(&g_macws_dynamic_metal_lock);
+            return cached;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_dynamic_metal_lock);
+
+    char library_path[PATH_MAX] = {0};
+    char metadata_path[PATH_MAX] = {0};
+    snprintf(library_path, sizeof(library_path),
+             "/usr/local/share/macws/stray/exact/%zu-%016llx.metallib",
+             source_length, (unsigned long long)source_hash);
+    snprintf(metadata_path, sizeof(metadata_path),
+             "/usr/local/share/macws/stray/exact/%zu-%016llx.meta",
+             source_length, (unsigned long long)source_hash);
+    if (!macws_root_owned_readonly_file(library_path) ||
+        !macws_root_owned_readonly_file(metadata_path))
+        return NULL;
+
+    FILE *metadata_file = fopen(metadata_path, "r");
+    if (!metadata_file) return NULL;
+    size_t replacement_length = 0;
+    unsigned long long replacement_hash = 0;
+    char trailing = 0;
+    int fields = fscanf(metadata_file, "%zu %llx %c", &replacement_length,
+                        &replacement_hash, &trailing);
+    fclose(metadata_file);
+    if (fields != 2 || replacement_length < 24 ||
+        replacement_length > 64U * 1024U * 1024U)
+        return NULL;
+
+    dispatch_data_t replacement = macws_load_exact_metal_library(
+        library_path, replacement_length, (uint64_t)replacement_hash);
+    if (!replacement) return NULL;
+
+    pthread_mutex_lock(&g_macws_dynamic_metal_lock);
+    // A competing library-creation thread may have populated this fingerprint
+    // while the file was read.  Prefer that stable object.  The redundant
+    // dispatch object remains process-scoped; this path occurs at most once per
+    // racing fingerprint and avoids an unsafe release under mixed libdispatch
+    // Objective-C ownership ABIs.
+    for (size_t index = 0; index < g_macws_dynamic_metal_library_count;
+         index++) {
+        MacWSDynamicMetalLibrary *entry =
+            &g_macws_dynamic_metal_libraries[index];
+        if (entry->source_length == source_length &&
+            entry->source_hash == source_hash) {
+            replacement = entry->replacement;
+            pthread_mutex_unlock(&g_macws_dynamic_metal_lock);
+            return replacement;
+        }
+    }
+    if (g_macws_dynamic_metal_library_count <
+        sizeof(g_macws_dynamic_metal_libraries) /
+            sizeof(g_macws_dynamic_metal_libraries[0])) {
+        MacWSDynamicMetalLibrary *entry =
+            &g_macws_dynamic_metal_libraries[
+                g_macws_dynamic_metal_library_count++];
+        entry->source_length = source_length;
+        entry->source_hash = source_hash;
+        entry->replacement = replacement;
+    }
+    pthread_mutex_unlock(&g_macws_dynamic_metal_lock);
+    if (macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### MTL-LIB-DYNAMIC source=%zu/%016llx "
+            "replacement=%zu/%016llx path=%s\n",
+            source_length, (unsigned long long)source_hash,
+            replacement_length, replacement_hash, library_path);
+    }
+    return replacement;
 }
 
 // Read-only observers at the private Metal library-cache/compiler boundary.
@@ -10938,7 +12080,9 @@ static id macws_new_library_data_compat(id self, SEL selector,
     if (data && (diagnostic ||
                  (getenv("MACWS_AGX_NATIVE") &&
                   (length == kMacWSANGLEDefaultMacOSBytes ||
-                   length == kMacWSSteamANGLEDefaultMacOSBytes)))) {
+                   length == kMacWSSteamANGLEDefaultMacOSBytes ||
+                   macws_is_stray_metal_library_length(length) ||
+                   (length >= 24 && length <= 256U * 1024U))))) {
         mapped = dispatch_data_create_map(data, &bytes, &length);
     }
     uint32_t magic = 0;
@@ -10964,6 +12108,32 @@ static id macws_new_library_data_compat(id self, SEL selector,
             selected_data = replacement;
             substituted = YES;
         }
+    } else if (getenv("MACWS_AGX_NATIVE")) {
+        const size_t count = sizeof(kMacWSStrayMetalLibraries) /
+                             sizeof(kMacWSStrayMetalLibraries[0]);
+        for (size_t index = 0; index < count; index++) {
+            const MacWSStrayMetalLibrary *entry =
+                &kMacWSStrayMetalLibraries[index];
+            if (length != entry->source_length ||
+                hash != entry->source_hash)
+                continue;
+            dispatch_data_t replacement =
+                macws_stray_macabi_library(index);
+            if (replacement) {
+                selected_data = replacement;
+                substituted = YES;
+            }
+            break;
+        }
+        if (!substituted && magic == UINT32_C(0x424c544d) && hash &&
+            length >= 24 && length <= 256U * 1024U) {
+            dispatch_data_t replacement =
+                macws_dynamic_stray_macabi_library(length, hash);
+            if (replacement) {
+                selected_data = replacement;
+                substituted = YES;
+            }
+        }
     }
 
     id result = g_macws_new_library_data_orig
@@ -10973,8 +12143,14 @@ static id macws_new_library_data_compat(id self, SEL selector,
 
     char path[PATH_MAX] = {0};
     size_t written_total = 0;
+    // UE4 loads many one-function MTLB blobs concurrently after engine init.
+    // Keep the recorder opt-in and size-bounded, but retain enough identities
+    // to correlate every pipeline failure in one bounded startup instead of
+    // repeatedly relaunching a thermally expensive game. Stray reaches more
+    // than 128 unique libraries before the first level, so retain one further
+    // bounded wave while this explicit diagnostic flag is present.
     if (diagnostic && bytes && length && length <= 64 * 1024 * 1024 &&
-        sequence <= 8) {
+        sequence <= 256) {
         snprintf(path, sizeof(path),
                  "/private/tmp/macws_mtl_data_%04u_%016llx.bin",
                  sequence, (unsigned long long)hash);
@@ -11047,8 +12223,14 @@ static _Atomic uint32_t g_macws_pipeline_diag_count = 0;
 typedef id (*macws_compute_pipeline_function_fn)(
     id, SEL, id<MTLFunction>, NSError **)
     __attribute__((ns_returns_retained));
+typedef id (*macws_compute_pipeline_descriptor_fn)(
+    id, SEL, MTLComputePipelineDescriptor *, MTLPipelineOption,
+    MTLAutoreleasedComputePipelineReflection *, NSError **)
+    __attribute__((ns_returns_retained));
 static macws_compute_pipeline_function_fn
     g_macws_compute_pipeline_function_orig = NULL;
+static macws_compute_pipeline_descriptor_fn
+    g_macws_compute_pipeline_descriptor_orig = NULL;
 static _Atomic uint32_t g_macws_compute_pipeline_diag_count = 0;
 
 static id macws_compute_pipeline_function_diag(
@@ -11072,6 +12254,56 @@ static id macws_compute_pipeline_function_diag(
         "caller=%s+%#llx\n",
         sequence, class_getName([self class]),
         function.name.UTF8String ?: "(nil)", (void *)result,
+        result ? class_getName([result class]) : "(nil)",
+        returned_error ? returned_error.domain.UTF8String : "(nil)",
+        returned_error ? (long)returned_error.code : 0L,
+        returned_error ? returned_error.localizedDescription.UTF8String
+                       : "(nil)",
+        returned_error ? returned_error.userInfo.description.UTF8String
+                       : "(nil)",
+        caller.dli_fname ?: "(unknown)",
+        caller.dli_fbase
+            ? (unsigned long long)((uintptr_t)return_address -
+                                   (uintptr_t)caller.dli_fbase) : 0);
+    return result;
+}
+
+static id macws_compute_pipeline_descriptor_diag(
+        id self, SEL selector, MTLComputePipelineDescriptor *descriptor,
+        MTLPipelineOption options,
+        MTLAutoreleasedComputePipelineReflection *reflection,
+        NSError **error) __attribute__((ns_returns_retained));
+static id macws_compute_pipeline_descriptor_diag(
+        id self, SEL selector, MTLComputePipelineDescriptor *descriptor,
+        MTLPipelineOption options,
+        MTLAutoreleasedComputePipelineReflection *reflection,
+        NSError **error) {
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_compute_pipeline_diag_count, 1) + 1;
+    void *return_address = ptrauth_strip(__builtin_return_address(0),
+                                        ptrauth_key_return_address);
+    Dl_info caller = {0};
+    dladdr(return_address, &caller);
+    id result = g_macws_compute_pipeline_descriptor_orig
+        ? g_macws_compute_pipeline_descriptor_orig(
+              self, selector, descriptor, options, reflection, error) : nil;
+    NSError *returned_error = error ? *error : nil;
+    NSString *label = nil;
+    NSString *function_name = nil;
+    @try {
+        label = descriptor.label;
+        function_name = descriptor.computeFunction.name;
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    dprintf(STDERR_FILENO,
+        "#### COMPUTE-PIPELINE #%u variant=descriptor device=%s "
+        "options=%#llx label=%s function=%s result=%p class=%s "
+        "errorDomain=%s errorCode=%ld description=%s userInfo=%s "
+        "caller=%s+%#llx\n",
+        sequence, class_getName([self class]),
+        (unsigned long long)options, label.UTF8String ?: "(nil)",
+        function_name.UTF8String ?: "(nil)", (void *)result,
         result ? class_getName([result class]) : "(nil)",
         returned_error ? returned_error.domain.UTF8String : "(nil)",
         returned_error ? (long)returned_error.code : 0L,
@@ -11127,6 +12359,40 @@ static void macws_log_pipeline_result(uint32_t sequence, id device,
         error ? error.userInfo.description.UTF8String : "(nil)");
 }
 
+static void macws_log_vertex_descriptor(
+        uint32_t sequence, MTLRenderPipelineDescriptor *descriptor) {
+    MTLVertexDescriptor *vertex_descriptor = descriptor.vertexDescriptor;
+    if (!vertex_descriptor) {
+        dprintf(STDERR_FILENO,
+            "#### RENDER-VERTEX-DESCRIPTOR #%u value=(nil)\n", sequence);
+        return;
+    }
+    for (NSUInteger index = 0; index < 31; index++) {
+        MTLVertexAttributeDescriptor *attribute =
+            vertex_descriptor.attributes[index];
+        if (attribute.format == MTLVertexFormatInvalid) continue;
+        dprintf(STDERR_FILENO,
+            "#### RENDER-VERTEX-ATTRIBUTE #%u index=%lu format=%lu "
+            "offset=%lu buffer=%lu\n",
+            sequence, (unsigned long)index,
+            (unsigned long)attribute.format,
+            (unsigned long)attribute.offset,
+            (unsigned long)attribute.bufferIndex);
+    }
+    for (NSUInteger index = 0; index < 31; index++) {
+        MTLVertexBufferLayoutDescriptor *layout =
+            vertex_descriptor.layouts[index];
+        if (layout.stride == 0) continue;
+        dprintf(STDERR_FILENO,
+            "#### RENDER-VERTEX-LAYOUT #%u index=%lu stride=%lu "
+            "stepFunction=%lu stepRate=%lu\n",
+            sequence, (unsigned long)index,
+            (unsigned long)layout.stride,
+            (unsigned long)layout.stepFunction,
+            (unsigned long)layout.stepRate);
+    }
+}
+
 static id macws_render_pipeline_error_diag(
         id self, SEL selector, MTLRenderPipelineDescriptor *descriptor,
         NSError **error) __attribute__((ns_returns_retained));
@@ -11159,6 +12425,144 @@ static id macws_render_pipeline_options_diag(
     NSError *returned_error = error ? *error : nil;
     macws_log_pipeline_result(sequence, self, descriptor, result,
                               returned_error, "options", options);
+    // A failed pipeline may depend on a non-obvious vertex layout even when
+    // it is not a depth pass (for example Stray's color-format-115 pipeline).
+    // Capture the caller's real descriptor for every failure so the exact
+    // pipeline can be replayed without guessing.  This is diagnostic-only:
+    // the original result and error are returned unchanged.
+    if (!result) {
+        macws_log_vertex_descriptor(sequence, descriptor);
+    }
+    // DIAGNOSTIC-ONLY A/B for the exact Stray depth-pass pair that reaches
+    // the iOS 16.3 AGX compiler but returns "Compiler encountered an internal
+    // error" after structural macabi retargeting.  Keep the caller's result
+    // untouched.  The two private compiles distinguish a vertex-stage issue
+    // from the valid macOS depth-only pattern in which a fragment function
+    // retains an unused color-0 output solely while performing alpha discard.
+    NSString *vertex_name = descriptor.vertexFunction.name;
+    NSString *fragment_name = descriptor.fragmentFunction.name;
+    BOOL exact_stray_depth_pair =
+        !result &&
+        [vertex_name isEqualToString:@"Main_00002957_93a803ef"] &&
+        [fragment_name isEqualToString:@"Main_0000134f_d2096084"] &&
+        descriptor.colorAttachments[0].pixelFormat == MTLPixelFormatInvalid &&
+        descriptor.depthAttachmentPixelFormat ==
+            MTLPixelFormatDepth32Float_Stencil8 &&
+        descriptor.stencilAttachmentPixelFormat ==
+            MTLPixelFormatDepth32Float_Stencil8;
+    if (exact_stray_depth_pair && g_macws_pipeline_options_orig) {
+        MTLRenderPipelineDescriptor *vertex_only = [descriptor copy];
+        vertex_only.fragmentFunction = nil;
+        NSError *vertex_error = nil;
+        id vertex_result = g_macws_pipeline_options_orig(
+            self, selector, vertex_only, options, NULL, &vertex_error);
+        dprintf(STDERR_FILENO,
+            "#### RENDER-PIPELINE-AB exact=stray-depth94 case=vertex-only "
+            "result=%p class=%s errorDomain=%s errorCode=%ld "
+            "description=%s\n",
+            (void *)vertex_result,
+            vertex_result ? class_getName([vertex_result class]) : "(nil)",
+            vertex_error ? vertex_error.domain.UTF8String : "(nil)",
+            vertex_error ? (long)vertex_error.code : 0L,
+            vertex_error ? vertex_error.localizedDescription.UTF8String
+                         : "(nil)");
+        [vertex_result release];
+        [vertex_only release];
+
+        MTLRenderPipelineDescriptor *color_control = [descriptor copy];
+        color_control.colorAttachments[0].pixelFormat =
+            MTLPixelFormatBGRA8Unorm;
+        NSError *color_error = nil;
+        id color_result = g_macws_pipeline_options_orig(
+            self, selector, color_control, options, NULL, &color_error);
+        dprintf(STDERR_FILENO,
+            "#### RENDER-PIPELINE-AB exact=stray-depth94 case=color0-bgra8 "
+            "result=%p class=%s errorDomain=%s errorCode=%ld "
+            "description=%s\n",
+            (void *)color_result,
+            color_result ? class_getName([color_result class]) : "(nil)",
+            color_error ? color_error.domain.UTF8String : "(nil)",
+            color_error ? (long)color_error.code : 0L,
+            color_error ? color_error.localizedDescription.UTF8String
+                        : "(nil)");
+        [color_result release];
+        [color_control release];
+    }
+
+    // DIAGNOSTIC-ONLY A/B for the next two Stray shadow-depth pipelines.
+    // Both use Depth16Unorm, no color attachment, and a fragment function
+    // that declares both a dead color-0 output and [[depth(any)]].  Ventura's
+    // AIR loads after exact macabi retargeting, but the iOS 16.3 G13 compiler
+    // returns Code=3.  These controls keep the caller-visible failure intact
+    // while separating a stage compile failure from a depth-format/backend
+    // combination failure.  The descriptor shape is the runtime-confirmed
+    // four-pipeline Stray family (#98..#101 in stray-depth16-ab2.log); this
+    // entire hook is additionally gated by the pipeline-diagnostic flag.
+    BOOL exact_stray_depth16_pair =
+        !result &&
+        descriptor.colorAttachments[0].pixelFormat == MTLPixelFormatInvalid &&
+        descriptor.depthAttachmentPixelFormat == MTLPixelFormatDepth16Unorm &&
+        descriptor.stencilAttachmentPixelFormat == MTLPixelFormatInvalid;
+    if (exact_stray_depth16_pair && g_macws_pipeline_options_orig &&
+        access("/private/tmp/macws_pipeline_ab_diag", F_OK) == 0) {
+        const char *pair_name = vertex_name.UTF8String ?: "stray-depth16";
+
+        MTLRenderPipelineDescriptor *vertex_only = [descriptor copy];
+        vertex_only.fragmentFunction = nil;
+        NSError *vertex_error = nil;
+        id vertex_result = g_macws_pipeline_options_orig(
+            self, selector, vertex_only, options, NULL, &vertex_error);
+        dprintf(STDERR_FILENO,
+            "#### RENDER-PIPELINE-AB exact=%s case=vertex-only "
+            "result=%p class=%s errorDomain=%s errorCode=%ld "
+            "description=%s\n",
+            pair_name, (void *)vertex_result,
+            vertex_result ? class_getName([vertex_result class]) : "(nil)",
+            vertex_error ? vertex_error.domain.UTF8String : "(nil)",
+            vertex_error ? (long)vertex_error.code : 0L,
+            vertex_error ? vertex_error.localizedDescription.UTF8String
+                         : "(nil)");
+        [vertex_result release];
+        [vertex_only release];
+
+        MTLRenderPipelineDescriptor *color_control = [descriptor copy];
+        color_control.colorAttachments[0].pixelFormat =
+            MTLPixelFormatBGRA8Unorm;
+        NSError *color_error = nil;
+        id color_result = g_macws_pipeline_options_orig(
+            self, selector, color_control, options, NULL, &color_error);
+        dprintf(STDERR_FILENO,
+            "#### RENDER-PIPELINE-AB exact=%s case=color0-bgra8 "
+            "result=%p class=%s errorDomain=%s errorCode=%ld "
+            "description=%s\n",
+            pair_name, (void *)color_result,
+            color_result ? class_getName([color_result class]) : "(nil)",
+            color_error ? color_error.domain.UTF8String : "(nil)",
+            color_error ? (long)color_error.code : 0L,
+            color_error ? color_error.localizedDescription.UTF8String
+                        : "(nil)");
+        [color_result release];
+        [color_control release];
+
+        MTLRenderPipelineDescriptor *depth32_control = [descriptor copy];
+        depth32_control.depthAttachmentPixelFormat =
+            MTLPixelFormatDepth32Float;
+        NSError *depth32_error = nil;
+        id depth32_result = g_macws_pipeline_options_orig(
+            self, selector, depth32_control, options, NULL, &depth32_error);
+        dprintf(STDERR_FILENO,
+            "#### RENDER-PIPELINE-AB exact=%s case=depth32 "
+            "result=%p class=%s errorDomain=%s errorCode=%ld "
+            "description=%s\n",
+            pair_name, (void *)depth32_result,
+            depth32_result ? class_getName([depth32_result class]) : "(nil)",
+            depth32_error ? depth32_error.domain.UTF8String : "(nil)",
+            depth32_error ? (long)depth32_error.code : 0L,
+            depth32_error ? depth32_error.localizedDescription.UTF8String
+                          : "(nil)");
+        [depth32_result release];
+        [depth32_control release];
+    }
     return result;
 }
 
@@ -11232,6 +12636,9 @@ static void macws_install_render_pipeline_diagnostic(Class agx) {
             { "newComputePipelineStateWithFunction:error:",
               (IMP)macws_compute_pipeline_function_diag,
               (IMP *)&g_macws_compute_pipeline_function_orig },
+            { "newComputePipelineStateWithDescriptor:options:reflection:error:",
+              (IMP)macws_compute_pipeline_descriptor_diag,
+              (IMP *)&g_macws_compute_pipeline_descriptor_orig },
         };
         for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
             SEL selector = sel_registerName(entries[i].name);
@@ -12732,6 +14139,11 @@ static void install_agx_init_redirect(Class agx) {
             (unsigned long)self.usage);
     }
     if(mode == 1) { // MTLStorageModeManaged (macOS only) → Shared on iOS
+        if (getenv("MACWS_AGX_NATIVE")) {
+            // Keep the macOS-side descriptor truthful. The native AGX device
+            // hooks clone and translate it at the final driver boundary.
+            return mode;
+        }
         self.storageMode = MTLStorageModeShared;
         return MTLStorageModeShared;
     }

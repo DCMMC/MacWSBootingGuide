@@ -1274,6 +1274,7 @@ boot_session_identifier() {
 # while kern.boottime invalidates it naturally after the next cold boot.
 restore_installed_application_trust() {
     local boot_id="" marker_id="" bundle="" path="" bundle_count=0 image_count=0
+    local progress_interval=50 next_progress=50 bundle_name=""
     boot_id=$(boot_session_identifier)
     marker_id=$(sed -n '1p' "$APPLICATION_TRUST_BOOT_MARKER" 2>/dev/null || true)
     if [ -n "$boot_id" ] && [ "$marker_id" = "$boot_id" ]; then
@@ -1284,9 +1285,15 @@ restore_installed_application_trust() {
     for bundle in "$ROOTFS"/Applications/*.app; do
         [ -d "$bundle/Contents" ] || continue
         bundle_count=$((bundle_count + 1))
+        bundle_name=${bundle##*/}
+        log "Restoring application trust: bundle=$bundle_count current=$bundle_name images=$image_count"
         while IFS= read -r -d '' path; do
             boot_trust_macho "$path" || return 1
             image_count=$((image_count + 1))
+            if [ "$image_count" -ge "$next_progress" ]; then
+                log "Application trust progress: images=$image_count current=$bundle_name"
+                next_progress=$((next_progress + progress_interval))
+            fi
         done < <(list_boot_macho_files "$bundle/Contents")
     done
 
@@ -1344,6 +1351,7 @@ restore_cold_boot_trust() {
         "$ROOTFS$OFFICE_LICENSING_BIN" \
         "$ROOTFS/System/Applications/System Settings.app/Contents/MacOS/System Settings" \
         "$ROOTFS/System/Applications/Maps.app/Contents/MacOS/Maps" \
+        "$ROOTFS/System/Applications/Weather.app/Contents/MacOS/Weather" \
         "$ROOTFS/tmp/GlassDemo" \
         "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \
         "$ROOTFS/usr/libexec/locationd" \
@@ -2391,17 +2399,9 @@ production_preflight() {
             fi
         done
     fi
-    if [ -d "$ROOTFS/Applications/Steam.app" ] ||
-       [ -d "$ROOTFS/Users/root/Library/Application Support/Steam/Steam.AppBundle" ]; then
-        if [ ! -f "$STEAM_ANGLE_MACABI_LIBRARY" ] ||
-           [ "$(wc -c < "$STEAM_ANGLE_MACABI_LIBRARY" 2>/dev/null)" != 711592 ]; then
-            log "ERROR: exact Steam ANGLE 5d4df51 macabi default library is missing or invalid: $STEAM_ANGLE_MACABI_LIBRARY"
-            bad=1
-        fi
-    fi
     if [ -d "$ROOTFS/Applications/Steam.app" ]; then
-        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
-                   MACWS_PIN_FALLBACK MACWS_JIT_MPROTECT_COMPAT \
+        for key in MACWS_STEAM_CPU_RENDERING \
+                   MACWS_JIT_MPROTECT_COMPAT \
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
                    MACWS_CRASHPAD_IMMOVABLE_TASK_PORT_COMPAT; do
@@ -2411,16 +2411,24 @@ production_preflight() {
                 bad=1
             fi
         done
+        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
+                   MACWS_PIN_FALLBACK; do
+            if plutil "$STEAM_PLIST" 2>/dev/null |
+                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+                log "ERROR: Steam CPU-download profile unexpectedly enables $key: $STEAM_PLIST"
+                bad=1
+            fi
+        done
         steam_launcher="$ROOTFS/usr/local/bin/macws-run-steam.sh"
         if [ ! -f "$steam_launcher" ] ||
            ! grep -Ev '^[[:space:]]*#' "$steam_launcher" |
-                grep -Eq -- '(^|[[:space:]])-cef-force-gpu([[:space:]]|$)'; then
-            log "ERROR: Steam launcher does not require native CEF GPU: $steam_launcher"
+                grep -Eq -- '(^|[[:space:]])-cef-disable-gpu([[:space:]]|$)'; then
+            log "ERROR: Steam launcher does not select the CPU-download CEF profile: $steam_launcher"
             bad=1
         fi
         if grep -Ev '^[[:space:]]*#' "$steam_launcher" |
-             grep -Eq -- '(^|[[:space:]])-cef-disable-gpu([[:space:]]|$)'; then
-            log "ERROR: retired Steam software CEF policy survived in $steam_launcher"
+             grep -Eq -- '(^|[[:space:]])-cef-force-gpu([[:space:]]|$)'; then
+            log "ERROR: Steam native-AGX CEF policy survived in CPU-download profile: $steam_launcher"
             bad=1
         fi
     fi

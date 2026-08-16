@@ -45,7 +45,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     BOOL _submittedCatalystDrawableWitness;
     NSString *_lastStatus;
     UIView *_directTouchIndicator;
+    UIImageView *_directTouchStateGlyph;
+    NSMutableArray<UIView *> *_multitouchIndicators;
     UIView *_trackpadCursorView;
+    UIImageView *_trackpadStateGlyph;
     UIView *_pencilCursorView;
     UILabel *_inputUnavailableLabel;
     UIView *_tooSmallOverlay;
@@ -114,6 +117,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     UIPanGestureRecognizer *_twoFingerPanRecognizer;
     UIPanGestureRecognizer *_indirectScrollRecognizer;
     UIPinchGestureRecognizer *_pinchRecognizer;
+    UIRotationGestureRecognizer *_rotationRecognizer;
     UIPanGestureRecognizer *_threeFingerPanRecognizer;
     BOOL _threeFingerSystemGestureActive;
     MacWSSystemGestureAxis _threeFingerSystemGestureAxis;
@@ -224,7 +228,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     contactDot.layer.cornerRadius = 4;
     contactDot.userInteractionEnabled = NO;
     [_directTouchIndicator addSubview:contactDot];
+    contactDot.tag = 501;
+    _directTouchStateGlyph = [[UIImageView alloc] initWithFrame:
+        CGRectMake(7, 7, 16, 16)];
+    _directTouchStateGlyph.contentMode = UIViewContentModeScaleAspectFit;
+    _directTouchStateGlyph.tintColor = UIColor.whiteColor;
+    _directTouchStateGlyph.hidden = YES;
+    _directTouchStateGlyph.userInteractionEnabled = NO;
+    [_directTouchIndicator addSubview:_directTouchStateGlyph];
     [self addSubview:_directTouchIndicator];
+    _multitouchIndicators = [NSMutableArray array];
 
     // A finger-driven relative trackpad uses the same circular MacWS pointer
     // language advertised by the control center. The previous black macOS
@@ -246,6 +259,15 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _trackpadCursorView.layer.shadowOffset = CGSizeMake(0, 1.5);
     _trackpadCursorView.userInteractionEnabled = NO;
     _trackpadCursorView.hidden = YES;
+    _trackpadStateGlyph = [[UIImageView alloc] initWithFrame:
+        CGRectMake(5, 5, 14, 14)];
+    _trackpadStateGlyph.contentMode = UIViewContentModeScaleAspectFit;
+    _trackpadStateGlyph.tintColor = UIColor.whiteColor;
+    _trackpadStateGlyph.image = [UIImage systemImageNamed:
+        @"hand.point.up.left.fill"];
+    _trackpadStateGlyph.hidden = YES;
+    _trackpadStateGlyph.userInteractionEnabled = NO;
+    [_trackpadCursorView addSubview:_trackpadStateGlyph];
     [self addSubview:_trackpadCursorView];
 
     // Pencil hover follows iPad's precise-pointer visual language. Native
@@ -412,6 +434,14 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _pinchRecognizer.cancelsTouchesInView = YES;
     _pinchRecognizer.delegate = self;
     [self addGestureRecognizer:_pinchRecognizer];
+    _rotationRecognizer = [[UIRotationGestureRecognizer alloc]
+        initWithTarget:self action:@selector(rotated:)];
+    // Do not restrict allowedTouchTypes here. UIKit's rotation recognizer is
+    // the supported common boundary for both direct fingers and the Magic
+    // Keyboard/trackpad's indirect two-finger rotation stream.
+    _rotationRecognizer.cancelsTouchesInView = YES;
+    _rotationRecognizer.delegate = self;
+    [self addGestureRecognizer:_rotationRecognizer];
     _threeFingerPanRecognizer = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(threeFingerPanned:)];
     _threeFingerPanRecognizer.minimumNumberOfTouches = 3;
@@ -573,6 +603,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // Rendering a deterministic clear frame prevents that stale exact-window
     // image from appearing as a cropped/magnified full desktop.
     _submittedPresentWitness = NO;
+    [self setDirectTouchHeld:NO dragging:NO animated:NO];
+    [self hideMultitouchIndicators];
     _directTouchIndicator.hidden = YES;
     _trackpadCursorView.hidden = YES;
     if (leases.count && _commandQueue) {
@@ -620,6 +652,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (BOOL)hasDirectSurfaceFrame { return _surfaceFrame != nil; }
+- (BOOL)hasFinalCompositeFrame {
+    return _surfaceFrame &&
+        (_surfaceFrame.descriptor.flags & MacWSStreamFrameFinalComposite) != 0;
+}
 - (BOOL)streamServiceConnected { return _streamClient.isConnected; }
 
 - (void)setTargetPID:(int32_t)targetPID {
@@ -831,6 +867,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _trackpadButtonDown = NO;
     _trackpadHadMultipleTouches = NO;
     [self stopScrollMomentumWithTerminalPhase:YES];
+    [self setDirectTouchHeld:NO dragging:NO animated:NO];
+    [self hideMultitouchIndicators];
     [self setTrackpadPointerPressed:NO animated:NO];
     [self updatePresentationGeometry];
     [self refreshPresentationPolicy];
@@ -868,6 +906,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _trackpadButtonDown = NO;
         _trackpadHadMultipleTouches = NO;
         [self stopScrollMomentumWithTerminalPhase:YES];
+        [self setDirectTouchHeld:NO dragging:NO animated:NO];
+        [self hideMultitouchIndicators];
         [self setTrackpadPointerPressed:NO animated:NO];
     }
     _macWSInputEnabled = enabled;
@@ -2121,17 +2161,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         (record->kind == MacWSInputKindScroll &&
          (record->flags & (MacWSInputFlagScrollEnded |
                            MacWSInputFlagScrollCancelled))) ||
-        (record->kind == MacWSInputKindMagnify &&
+        ((record->kind == MacWSInputKindMagnify ||
+          record->kind == MacWSInputKindRotate) &&
          (record->flags & (MacWSInputFlagGestureEnded |
                            MacWSInputFlagGestureCancelled)));
     BOOL begins = record->kind == MacWSInputKindTouchDown ||
         (record->kind == MacWSInputKindScroll &&
          (record->flags & MacWSInputFlagScrollBegan)) ||
-        (record->kind == MacWSInputKindMagnify &&
+        ((record->kind == MacWSInputKindMagnify ||
+          record->kind == MacWSInputKindRotate) &&
          (record->flags & MacWSInputFlagGestureBegan));
     BOOL continuation = record->kind == MacWSInputKindTouchMove || terminal ||
         (record->kind == MacWSInputKindScroll && !begins) ||
-        (record->kind == MacWSInputKindMagnify && !begins);
+        ((record->kind == MacWSInputKindMagnify ||
+          record->kind == MacWSInputKindRotate) && !begins);
     BOOL diagnostic = record->contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC;
     if (diagnostic) {
         MacWSLog(@"fullscreen-route-entry view=%p kind=%u begin=%@ continuation=%@ terminal=%@ active=%@ contact=%u owner-contact=%u frozen-destination=(%d,%d %ux%u)",
@@ -2308,12 +2351,105 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (showPencil) [self bringSubviewToFront:_pencilCursorView];
 }
 
+- (UIView *)makeMultitouchIndicator {
+    UIView *indicator = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 30, 30)];
+    indicator.backgroundColor =
+        [UIColor.systemCyanColor colorWithAlphaComponent:0.16];
+    indicator.layer.borderWidth = 1.5;
+    indicator.layer.borderColor =
+        [UIColor.whiteColor colorWithAlphaComponent:0.86].CGColor;
+    indicator.layer.cornerRadius = 15.0;
+    indicator.layer.shadowColor = UIColor.blackColor.CGColor;
+    indicator.layer.shadowOpacity = 0.24;
+    indicator.layer.shadowRadius = 5.0;
+    indicator.layer.shadowOffset = CGSizeMake(0, 2);
+    indicator.userInteractionEnabled = NO;
+    UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(11, 11, 8, 8)];
+    dot.backgroundColor = [UIColor.whiteColor colorWithAlphaComponent:0.94];
+    dot.layer.cornerRadius = 4.0;
+    dot.userInteractionEnabled = NO;
+    [indicator addSubview:dot];
+    indicator.hidden = YES;
+    [self addSubview:indicator];
+    return indicator;
+}
+
+- (void)hideMultitouchIndicators {
+    for (UIView *indicator in _multitouchIndicators) indicator.hidden = YES;
+}
+
+- (void)updateMultitouchIndicatorsForRecognizer:
+        (UIGestureRecognizer *)recognizer {
+    NSUInteger count = recognizer.numberOfTouches;
+    if (recognizer.state == UIGestureRecognizerStateEnded ||
+        recognizer.state == UIGestureRecognizerStateCancelled ||
+        recognizer.state == UIGestureRecognizerStateFailed || count < 2) {
+        [self hideMultitouchIndicators];
+        return;
+    }
+    while (_multitouchIndicators.count < count)
+        [_multitouchIndicators addObject:[self makeMultitouchIndicator]];
+    for (NSUInteger index = 0; index < _multitouchIndicators.count; index++) {
+        UIView *indicator = _multitouchIndicators[index];
+        indicator.hidden = index >= count;
+        if (index < count) {
+            indicator.center = [recognizer locationOfTouch:index inView:self];
+            [self bringSubviewToFront:indicator];
+        }
+    }
+}
+
+- (void)setDirectTouchHeld:(BOOL)held dragging:(BOOL)dragging
+                  animated:(BOOL)animated {
+    UIView *contactDot = [_directTouchIndicator viewWithTag:501];
+    _directTouchStateGlyph.image = [UIImage systemImageNamed:
+        dragging ? @"hand.draw.fill" : @"hand.point.up.left.fill"];
+    _directTouchStateGlyph.hidden = !held;
+    contactDot.hidden = held;
+    UIColor *accent = dragging ? UIColor.systemPurpleColor
+                               : UIColor.systemOrangeColor;
+    void (^changes)(void) = ^{
+        self->_directTouchIndicator.transform = held
+            ? CGAffineTransformMakeScale(1.22, 1.22)
+            : CGAffineTransformIdentity;
+        self->_directTouchIndicator.backgroundColor = held
+            ? [accent colorWithAlphaComponent:0.58]
+            : [UIColor.systemCyanColor colorWithAlphaComponent:0.15];
+        self->_directTouchIndicator.layer.borderWidth = held ? 2.25 : 1.5;
+        self->_directTouchIndicator.layer.borderColor = held
+            ? UIColor.whiteColor.CGColor
+            : [UIColor.whiteColor colorWithAlphaComponent:0.82].CGColor;
+        self->_directTouchIndicator.layer.shadowColor = held
+            ? accent.CGColor : UIColor.blackColor.CGColor;
+        self->_directTouchIndicator.layer.shadowOpacity = held ? 0.72 : 0.22;
+        self->_directTouchIndicator.layer.shadowRadius = held ? 9.0 : 5.0;
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.14 delay:0
+            usingSpringWithDamping:0.72 initialSpringVelocity:0
+            options:UIViewAnimationOptionBeginFromCurrentState |
+                    UIViewAnimationOptionAllowUserInteraction
+            animations:changes completion:nil];
+    } else {
+        changes();
+    }
+}
+
 - (void)setTrackpadPointerPressed:(BOOL)pressed animated:(BOOL)animated {
+    _trackpadStateGlyph.hidden = !pressed;
     void (^changes)(void) = ^{
         self->_trackpadCursorView.transform = pressed
-            ? CGAffineTransformMakeScale(0.78, 0.78)
+            ? CGAffineTransformMakeScale(1.20, 1.20)
             : CGAffineTransformIdentity;
-        self->_trackpadCursorView.alpha = pressed ? 0.78 : 1.0;
+        self->_trackpadCursorView.alpha = 1.0;
+        self->_trackpadCursorView.backgroundColor = pressed
+            ? [UIColor.systemOrangeColor colorWithAlphaComponent:0.86]
+            : [UIColor.systemGrayColor colorWithAlphaComponent:0.74];
+        self->_trackpadCursorView.layer.borderWidth = pressed ? 2.0 : 1.0;
+        self->_trackpadCursorView.layer.shadowColor = pressed
+            ? UIColor.systemOrangeColor.CGColor : UIColor.blackColor.CGColor;
+        self->_trackpadCursorView.layer.shadowOpacity = pressed ? 0.68 : 0.30;
+        self->_trackpadCursorView.layer.shadowRadius = pressed ? 8.0 : 3.0;
     };
     if (animated) {
         [UIView animateWithDuration:0.12 delay:0
@@ -2447,6 +2583,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     _directTouch = nil;
     _directTouchState = MacWSDirectTouchStateIdle;
     _directScrollAxis = MacWSDirectScrollAxisNone;
+    [self setDirectTouchHeld:NO dragging:NO animated:NO];
     _directTouchIndicator.hidden = YES;
 }
 
@@ -2470,7 +2607,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     uint64_t serial = ++_directTouchSerial;
     [_directTouchFeedback prepare];
     _directTouchIndicator.center = _directTouchStartPoint;
-    _directTouchIndicator.transform = CGAffineTransformIdentity;
+    [self setDirectTouchHeld:NO dragging:NO animated:NO];
     _directTouchIndicator.hidden = NO;
     [self bringSubviewToFront:_directTouchIndicator];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -2492,10 +2629,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         // the armed finger is released without moving, release handling keeps
         // the useful long-press-as-context-menu behavior.
         self->_directTouchState = MacWSDirectTouchStateLongPressArmed;
-        [UIView animateWithDuration:0.12 animations:^{
-            self->_directTouchIndicator.transform =
-                CGAffineTransformMakeScale(0.78, 0.78);
-        }];
+        [self setDirectTouchHeld:YES dragging:NO animated:YES];
         [self->_directTouchFeedback impactOccurred];
         [self publishStatus:@"已进入拖动状态 · 滑动即可拖动"];
     });
@@ -2563,6 +2697,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 // AppKit's synchronous control tracking and two-finger input
                 // still cancels this contact before magnification begins.
                 _directTouchState = MacWSDirectTouchStateDragging;
+                [self setDirectTouchHeld:YES dragging:YES animated:YES];
                 [self emitKind:MacWSInputKindTouchDown touch:touch
                          point:_directTouchStartPoint];
             }
@@ -2630,7 +2765,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             if (_directTouchState == MacWSDirectTouchStateLongPressArmed &&
                 !MacWSTouchReachedLongPress(elapsed)) {
                 _directTouchState = MacWSDirectTouchStateCandidate;
-                _directTouchIndicator.transform = CGAffineTransformIdentity;
+                [self setDirectTouchHeld:NO dragging:NO animated:YES];
             }
             MacWSTouchCandidateDecision decision =
                 MacWSDecideTouchCandidate(
@@ -2639,6 +2774,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                 decision == MacWSTouchCandidateDecisionScroll) {
                 _directTouchSerial++;
                 _directTouchState = MacWSDirectTouchStateScrolling;
+                [self setDirectTouchHeld:NO dragging:NO animated:YES];
                 _directScrollAxis = MacWSChooseDirectScrollAxis(
                     point.x - _directTouchStartPoint.x,
                     point.y - _directTouchStartPoint.y);
@@ -2672,13 +2808,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                        decision == MacWSTouchCandidateDecisionLongPress) {
                 _directTouchSerial++;
                 _directTouchState = MacWSDirectTouchStateLongPressArmed;
-                _directTouchIndicator.transform =
-                    CGAffineTransformMakeScale(0.78, 0.78);
+                [self setDirectTouchHeld:YES dragging:NO animated:YES];
                 [_directTouchFeedback impactOccurred];
             } else if (_directTouchState ==
                            MacWSDirectTouchStateLongPressArmed &&
                        travel >= MACWS_DIRECT_GESTURE_THRESHOLD_POINTS) {
                 _directTouchState = MacWSDirectTouchStateDragging;
+                [self setDirectTouchHeld:YES dragging:YES animated:YES];
                 CGPoint startFrame = CGPointZero;
                 if ([self framePointForViewPoint:_directTouchStartPoint
                                           output:&startFrame]) {
@@ -2802,7 +2938,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             if (_directTouchState == MacWSDirectTouchStateLongPressArmed &&
                 !MacWSTouchReachedLongPress(elapsed)) {
                 _directTouchState = MacWSDirectTouchStateCandidate;
-                _directTouchIndicator.transform = CGAffineTransformIdentity;
+                [self setDirectTouchHeld:NO dragging:NO animated:YES];
             }
             if (_directTouchState == MacWSDirectTouchStateCandidate) {
                 MacWSTouchCandidateDecision decision = MacWSDecideTouchCandidate(
@@ -2944,7 +3080,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             _directTouch = nil;
             _directTouchState = MacWSDirectTouchStateIdle;
             _directScrollAxis = MacWSDirectScrollAxisNone;
-            _directTouchIndicator.transform = CGAffineTransformIdentity;
+            [self setDirectTouchHeld:NO dragging:NO animated:NO];
             _directTouchIndicator.hidden = YES;
         }
         if (event.allTouches.count <= touches.count)
@@ -2997,7 +3133,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             _directTouch = nil;
             _directTouchState = MacWSDirectTouchStateIdle;
             _directScrollAxis = MacWSDirectScrollAxisNone;
-            _directTouchIndicator.transform = CGAffineTransformIdentity;
+            [self setDirectTouchHeld:NO dragging:NO animated:NO];
             _directTouchIndicator.hidden = YES;
         }
         if (event.allTouches.count <= touches.count)
@@ -3106,6 +3242,31 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .y = (float)framePoint.y,
         .pressure = (float)amount,
         .contactID = 0x50494e43u, // "PINC"
+        .frameWidth = [self currentFrameWidth],
+        .frameHeight = [self currentFrameHeight],
+        .targetPID = self.targetPID,
+        .source = MacWSInputSourceFinger,
+        .flags = flags,
+        .sampleSequence = ++_inputSampleSequence,
+    };
+    [self.statusDelegate metalView:self emittedInput:record];
+}
+
+- (void)emitRotationAtFramePoint:(CGPoint)framePoint
+                         degrees:(CGFloat)degrees
+                           flags:(uint16_t)flags
+                       timestamp:(NSTimeInterval)timestamp {
+    if (!self.isMacWSInputEnabled || !isfinite(degrees)) return;
+    MacWSInputRecord record = {
+        .magic = MACWS_INPUT_MAGIC,
+        .version = MACWS_INPUT_VERSION,
+        .kind = MacWSInputKindRotate,
+        .sceneID = [self inputSceneIDWithModifiers:0],
+        .timestamp = timestamp,
+        .x = (float)framePoint.x,
+        .y = (float)framePoint.y,
+        .pressure = (float)degrees,
+        .contactID = 0x524f5441u, // "ROTA"
         .frameWidth = [self currentFrameWidth],
         .frameHeight = [self currentFrameHeight],
         .targetPID = self.targetPID,
@@ -3317,6 +3478,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)twoFingerPanned:(UIPanGestureRecognizer *)recognizer {
     if (!self.isMacWSInputEnabled) return;
+    [self updateMultitouchIndicatorsForRecognizer:recognizer];
     CGPoint translation = [recognizer translationInView:self];
     [recognizer setTranslation:CGPointZero inView:self];
     BOOL moveViewport = self.inputMode == MacWSHostInputModeDirect &&
@@ -3376,6 +3538,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 - (void)pinched:(UIPinchGestureRecognizer *)recognizer {
     if (!self.isMacWSInputEnabled) return;
+    [self updateMultitouchIndicatorsForRecognizer:recognizer];
     CGPoint framePoint = CGPointZero;
     if (![self scrollFramePointForRecognizer:recognizer output:&framePoint])
         return;
@@ -3410,6 +3573,48 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             [self emitMagnifyAtFramePoint:framePoint amount:0.0
                                     flags:MacWSInputFlagGestureCancelled
                                 timestamp:timestamp];
+            break;
+        default:
+            break;
+    }
+}
+
+- (void)rotated:(UIRotationGestureRecognizer *)recognizer {
+    if (!self.isMacWSInputEnabled) return;
+    [self updateMultitouchIndicatorsForRecognizer:recognizer];
+    CGPoint framePoint = CGPointZero;
+    if (![self scrollFramePointForRecognizer:recognizer output:&framePoint])
+        return;
+    NSTimeInterval timestamp = CACurrentMediaTime();
+    switch (recognizer.state) {
+        case UIGestureRecognizerStateBegan:
+            recognizer.rotation = 0.0;
+            [self emitRotationAtFramePoint:framePoint degrees:0.0
+                                     flags:MacWSInputFlagGestureBegan
+                                 timestamp:timestamp];
+            break;
+        case UIGestureRecognizerStateChanged: {
+            // UIKit reports cumulative radians; Ventura NSEvent.rotation is
+            // an incremental degree value. Consume each delta once.
+            CGFloat degrees = recognizer.rotation * 180.0 / M_PI;
+            recognizer.rotation = 0.0;
+            if (fabs(degrees) > 0.0001) {
+                [self emitRotationAtFramePoint:framePoint degrees:degrees
+                                         flags:MacWSInputFlagGestureChanged
+                                     timestamp:timestamp];
+            }
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+            [self emitRotationAtFramePoint:framePoint degrees:0.0
+                                     flags:MacWSInputFlagGestureEnded
+                                 timestamp:timestamp];
+            break;
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed:
+            [self emitRotationAtFramePoint:framePoint degrees:0.0
+                                     flags:MacWSInputFlagGestureCancelled
+                                 timestamp:timestamp];
             break;
         default:
             break;
@@ -3506,6 +3711,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (void)threeFingerPanned:(UIPanGestureRecognizer *)recognizer {
+    [self updateMultitouchIndicatorsForRecognizer:recognizer];
     if (recognizer.state == UIGestureRecognizerStateBegan) {
         [self cancelActiveThreeFingerSystemGestureAtTimestamp:
             CACurrentMediaTime()];
@@ -3777,13 +3983,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
         shouldRecognizeSimultaneouslyWithGestureRecognizer:
             (UIGestureRecognizer *)otherGestureRecognizer {
-    // A physical two-finger gesture carries translation and scale at the same
-    // time. Preserve both streams so Maps/canvas apps can pan while pinching,
-    // matching a MacBook trackpad instead of making UIKit choose one winner.
-    return (gestureRecognizer == _twoFingerPanRecognizer &&
-            otherGestureRecognizer == _pinchRecognizer) ||
-           (gestureRecognizer == _pinchRecognizer &&
-            otherGestureRecognizer == _twoFingerPanRecognizer);
+    // A physical two-finger gesture can carry translation, scale and rotation
+    // in the same sample. Preserve every native stream so Maps can pan, zoom
+    // and rotate without UIKit forcing one recognizer to win.
+    NSSet *twoFingerRecognizers = [NSSet setWithObjects:
+        _twoFingerPanRecognizer, _pinchRecognizer, _rotationRecognizer, nil];
+    return [twoFingerRecognizers containsObject:gestureRecognizer] &&
+           [twoFingerRecognizers containsObject:otherGestureRecognizer];
 }
 
 - (void)trackpadSecondaryTapped:(UITapGestureRecognizer *)recognizer {

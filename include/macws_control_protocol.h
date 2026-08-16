@@ -2,7 +2,7 @@
 #define MACWS_CONTROL_PROTOCOL_H
 
 #define MACWS_CONTROL_SERVICE "com.macwsguide.host.control"
-#define MACWS_CONTROL_VERSION 5u
+#define MACWS_CONTROL_VERSION 6u
 
 #define MACWS_CONTROL_KEY_OP "op"
 #define MACWS_CONTROL_KEY_APP_ID "app_id"

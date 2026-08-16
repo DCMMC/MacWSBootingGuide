@@ -395,7 +395,7 @@ static int macws_exec_requested_catalyst_from_existing_host(void) {
             bundleIdentifier.UTF8String, rootExecutable.UTF8String,
             getpid());
     fflush(stderr);
-    char *const childArgv[] = {
+    char *const ordinaryChildArgv[] = {
         // Catalyst applications belong to the foreground iPadOS login user.
         // Runtime-confirmed root launches receive errSecNotAvailable (-25291)
         // from every modern SecItem operation. This matching-uid launch is an
@@ -404,6 +404,25 @@ static int macws_exec_requested_catalyst_from_existing_host(void) {
         (char *)kChrootExec, "501", "501", (char *)kMacWSRoot,
         (char *)rootExecutable.fileSystemRepresentation, NULL,
     };
+    char *const cleanStateChildArgv[] = {
+        (char *)kChrootExec, "501", "501", (char *)kMacWSRoot,
+        (char *)rootExecutable.fileSystemRepresentation,
+        "-ApplePersistenceIgnoreState", "YES", NULL,
+    };
+    // Runtime-confirmed for Weather pid 90936: even with its on-disk
+    // KnownSceneSessions directory empty before exec, AppKit TAL requested the
+    // old CB25... persistent scene ID, opened a second UINS transaction and
+    // exited status 1. ApplePersistenceIgnoreState is AppKit's native launch
+    // contract for suppressing TAL restoration; it leaves Weather's saved
+    // locations and preferences intact.
+    BOOL cleanState = [bundleIdentifier isEqualToString:@"com.apple.weather"];
+    char *const *childArgv = cleanState
+        ? cleanStateChildArgv : ordinaryChildArgv;
+    fprintf(stderr,
+            "[MacWSCatalystLauncher] Catalyst persistence bundle=%s "
+            "ignore-state=%s\n", bundleIdentifier.UTF8String,
+            cleanState ? "YES" : "NO");
+    fflush(stderr);
     execv(kChrootExec, childArgv);
     return errno ? errno : 78;
 }

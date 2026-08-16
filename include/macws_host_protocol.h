@@ -5,7 +5,7 @@
 
 #define MACWS_FRAME_MAGIC 0x564e4346u /* "VNCF" */
 #define MACWS_INPUT_MAGIC 0x4d574556u /* "MWEV" */
-#define MACWS_INPUT_VERSION 4u
+#define MACWS_INPUT_VERSION 5u
 #define MACWS_INPUT_CONTACT_DIAGNOSTIC 0x44494147u /* "DIAG" */
 #define MACWS_INPUT_WINDOW_SCENE_FLAG UINT64_C(0x0000000080000000)
 #define MACWS_TARGET_PROBE_MAGIC 0x4d575450u /* "MWTP" */
@@ -111,6 +111,11 @@ enum {
     // terminal phase. Dock's Ventura gesture controller, rather than Host,
     // owns the native Mission Control/Spaces animation and completion policy.
     MacWSInputKindSystemGesture = 21,
+    // Native AppKit two-finger rotation. pressure carries the incremental
+    // angle in degrees (matching -[NSEvent rotation]); contactID is stable for
+    // the complete gesture and phase reuses the gesture flag aliases below.
+    // Version 5 adds this kind without changing the 84-byte record layout.
+    MacWSInputKindRotate = 22,
 };
 
 typedef uint32_t MacWSDesktopCommand;

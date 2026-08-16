@@ -233,6 +233,8 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
         NSSelectorFromString(@"activeDisplayWindowScene"));
     id switcherController = MacWSMessageObject(
         activeScene, NSSelectorFromString(@"switcherController"));
+    id coordinator = MacWSMessageObject(
+        switcherController, NSSelectorFromString(@"switcherCoordinator"));
     id contentController = MacWSMessageObject(
         switcherController, NSSelectorFromString(@"contentViewController"));
     if (!contentController) {
@@ -257,8 +259,6 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
         if (focusedLayout) focusSource = @"_currentMainAppLayout";
     }
     if (!focusedLayout) {
-        id coordinator = MacWSMessageObject(
-            switcherController, NSSelectorFromString(@"switcherCoordinator"));
         focusedLayout = MacWSMessageObject(
             coordinator, NSSelectorFromString(@"_currentAppLayout"));
         if (focusedLayout) focusSource = @"_currentAppLayout";
@@ -293,11 +293,35 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
     BOOL actionAvailable = switcherController &&
         [switcherController respondsToSelector:performSelector];
     BOOL allowed = exactScene && actionAvailable;
+
+    // A multi-window Stage Manager group can have a different Scene at the
+    // keyboard focus leaf even though the requesting Scene is present in the
+    // same recent-layout model.  Find that Scene by its exact FBS identifier,
+    // then use SpringBoard's ordinary activating-AppLayout transition to make
+    // it the focused/front item before asking the system to maximize it.
+    // The transition construction and coordinator route are RE-confirmed in
+    // MacWSApplyResizeRequest below; no view frame or private ivar is changed.
+    id exactTargetLayout = nil;
+    id exactTargetItem = nil;
+    if (!exactScene && coordinator) {
+        NSArray *recentLayouts = MacWSMessageObject(
+            coordinator, NSSelectorFromString(@"recentAppLayouts"));
+        for (id layout in recentLayouts) {
+            id item = MacWSAppLayoutExactSceneItem(
+                layout, bundleIdentifier, requestedIdentifier);
+            if (item) {
+                exactTargetLayout = layout;
+                exactTargetItem = item;
+                break;
+            }
+        }
+    }
     MacWSWindowingLogLine([NSString stringWithFormat:
-        @"maximization-request requested=%@ expected-fullscreen=%@ source-geometry-fullscreen=%@ exact-focus=%@ focus-source=%@ role=%ld center=%ld source-fullscreen=%@ source-windowed=%@ manager=%@ switcher=%@ content=%@ action=%@ attempt=%lu",
+        @"maximization-request requested=%@ expected-fullscreen=%@ source-geometry-fullscreen=%@ exact-focus=%@ exact-recent=%@ focus-source=%@ role=%ld center=%ld source-fullscreen=%@ source-windowed=%@ manager=%@ switcher=%@ content=%@ action=%@ attempt=%lu",
         requestedIdentifier, expectedFullscreen ? @"YES" : @"NO",
         sourceGeometryFullscreen ? @"YES" : @"NO",
-        exactScene ? @"YES" : @"NO", focusSource ?: @"none",
+        exactScene ? @"YES" : @"NO",
+        exactTargetItem ? @"YES" : @"NO", focusSource ?: @"none",
         (long)sourceRole, (long)sourceCenter,
         sourceFullscreen ? @"YES" : @"NO",
         sourceWindowed ? @"YES" : @"NO",
@@ -319,6 +343,48 @@ static void MacWSApplyFullscreenRequest(NSDictionary *request,
         return;
     }
     if (!allowed) {
+        if (!exactScene && exactTargetLayout && exactTargetItem &&
+            contentController && coordinator && (attempt == 0 || attempt == 5)) {
+            SEL bringFrontSelector = NSSelectorFromString(
+                @"appLayoutByBringingItemToFront:inAppLayout:");
+            id activatedLayout = exactTargetLayout;
+            if ([contentController respondsToSelector:bringFrontSelector]) {
+                activatedLayout = ((id (*)(id, SEL, id, id))objc_msgSend)(
+                    contentController, bringFrontSelector, exactTargetItem,
+                    exactTargetLayout);
+            }
+            Class requestClass = NSClassFromString(
+                @"SBMutableSwitcherTransitionRequest");
+            id transitionRequest = activatedLayout
+                ? ((id (*)(id, SEL, id))objc_msgSend)(
+                      requestClass,
+                      NSSelectorFromString(@"requestForActivatingAppLayout:"),
+                      activatedLayout)
+                : nil;
+            SEL transitionSelector = NSSelectorFromString(
+                @"switcherContentController:performTransitionWithRequest:gestureInitiated:");
+            if ([transitionRequest respondsToSelector:
+                    NSSelectorFromString(@"setSceneUpdatesOnly:")]) {
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(
+                    transitionRequest,
+                    NSSelectorFromString(@"setSceneUpdatesOnly:"), NO);
+            }
+            if ([transitionRequest respondsToSelector:
+                    NSSelectorFromString(@"setSource:")]) {
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(
+                    transitionRequest, NSSelectorFromString(@"setSource:"),
+                    0x33);
+            }
+            if (transitionRequest &&
+                [coordinator respondsToSelector:transitionSelector]) {
+                ((void (*)(id, SEL, id, id, BOOL))objc_msgSend)(
+                    coordinator, transitionSelector, contentController,
+                    transitionRequest, NO);
+                MacWSWindowingLogLine([NSString stringWithFormat:
+                    @"maximization-focus-submitted scene=%@ attempt=%lu route=exact-recent-app-layout source=0x33",
+                    requestedIdentifier, (unsigned long)(attempt + 1)]);
+            }
+        }
         if (!exactScene && attempt < 10) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          100 * NSEC_PER_MSEC),
@@ -912,9 +978,9 @@ static void MacWSInstallRequestObservers(void *context) {
         int fd = open(MacWSDenseGridLoaded,
                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd >= 0) {
-            dprintf(fd, "version=15 pid=%d step=10 minimum=150 "
+            dprintf(fd, "version=16 pid=%d step=10 minimum=150 "
                         "observers=main-queue-after-dyld "
-                        "fullscreen=focused-scene-maximization-toggle-action-17 "
+                        "fullscreen=exact-scene-activate-then-maximization-toggle-action-17 "
                         "resize=app-layout-transaction "
                         "exit=system-maximization-unzoom "
                         "postcondition=host-scene-screen-geometry\n",

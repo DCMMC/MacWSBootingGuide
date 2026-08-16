@@ -1,6 +1,6 @@
 """Exercise the native MacWS Host input ABI without using RFB.
 
-Run this on the iPadOS side.  It sends the same version-4 records emitted by
+Run this on the iPadOS side.  It sends the same version-5 records emitted by
 MacWSHost's UIKit recognizers to macwsinputd, then validates the resulting real
 AppKit events recorded by InputLab.  The frame coordinates are relative to one
 window DisplayStream IOSurface, not the fullscreen VNC desktop.
@@ -15,7 +15,7 @@ import time
 
 
 INPUT_MAGIC = 0x4D574556
-INPUT_VERSION = 4
+INPUT_VERSION = 5
 WINDOW_SCENE_FLAG = 0x80000000
 
 TOUCH_DOWN = 1
@@ -29,6 +29,7 @@ SECONDARY_TAP = 13
 SCROLL = 14
 MAGNIFY = 19
 DESKTOP_COMMAND = 20
+ROTATE = 22
 
 DOUBLE_CLICK = 1 << 5
 GLOBAL_SYSTEM_SURFACE = 1 << 6

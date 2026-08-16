@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Reassemble selected AIR modules in an iOS/macOS MTLB for Mac Catalyst.
 
-This is a structural target conversion, not a loader/check bypass.  Selected
-AIR modules are round-tripped through llvm-dis/llvm-as with their target triple
-changed from iOS/macOS to macabi.  The MTLB function records receive the real
-new byte sizes, SHA-256 hashes, and bitcode offsets; the container header and
-trailing-section offsets are then rebuilt around the new bitcode section.
+This is a structural target conversion, not a loader/check bypass. Selected
+AIR modules are normally round-tripped through llvm-dis/llvm-as with their
+target triple changed from iOS/macOS to macabi. For legacy Apple AIR whose
+bitcode dialect an upstream llvm-as cannot reproduce, a same-length target
+triple can instead be patched in place. The MTLB function records receive the
+real new byte sizes, SHA-256 hashes, and bitcode offsets; the container header
+and trailing-section offsets are then rebuilt around the new bitcode section.
 
 The parser follows the tag/section layout documented by YuAo's
 MetalLibraryArchive and validates each input function hash before touching it.
@@ -29,8 +31,60 @@ IOS_PLATFORM = 0x0001
 MACOS_TARGET_OS = 0x81
 IOS_TARGET_OS = 0x82
 MACABI_TARGET_OS = 0x86
+UNKNOWN_TARGET_OS = 0x00
+CURRENT_MTLB_FILE_VERSION = (2, 7)
 MTLB_HEADER_SIZE = 88
 OFFSET_SECTION_TAGS = {"HDYN", "VLST", "ILST", "HSRD", "HSRC", "RLST"}
+OUTPUT_CONTAINER_TARGETS = {
+    "macabi": (MACOS_PLATFORM, MACABI_TARGET_OS),
+    "ios": (IOS_PLATFORM, IOS_TARGET_OS),
+    "macos": (MACOS_PLATFORM, MACOS_TARGET_OS),
+}
+
+
+def target_triple_matches_container(target_triple: str,
+                                    container_target: str) -> bool:
+    if container_target == "macabi":
+        return re.fullmatch(
+            r"air64-apple-ios[0-9]+(?:\.[0-9]+){0,2}-macabi",
+            target_triple,
+        ) is not None
+    if container_target == "ios":
+        return re.fullmatch(
+            r"air64-apple-ios[0-9]+(?:\.[0-9]+){0,2}",
+            target_triple,
+        ) is not None
+    if container_target == "macos":
+        return re.fullmatch(
+            r"air64-apple-macosx[0-9]+(?:\.[0-9]+){0,2}",
+            target_triple,
+        ) is not None
+    return False
+
+
+def retarget_air_in_place(module: bytes, name: str,
+                          target_triple: str) -> bytes:
+    """Replace one same-length AIR target without re-encoding Apple bitcode."""
+    pattern = re.compile(
+        rb"air64-apple-(?:ios|macosx)[0-9]+(?:\.[0-9]+){0,2}"
+    )
+    matches = list(pattern.finditer(module))
+    if len(matches) != 1:
+        raise ValueError(
+            f"{name}: expected exactly one AIR target triple, "
+            f"found {len(matches)}"
+        )
+    replacement = target_triple.encode("ascii")
+    match = matches[0]
+    if len(replacement) != match.end() - match.start():
+        source = match.group().decode("ascii")
+        raise ValueError(
+            f"{name}: in-place AIR target must remain {len(source)} bytes "
+            f"({source!r} -> {target_triple!r})"
+        )
+    rebuilt = bytearray(module)
+    rebuilt[match.start():match.end()] = replacement
+    return bytes(rebuilt)
 
 
 def u16(data: bytes | bytearray, offset: int) -> int:
@@ -178,6 +232,104 @@ def rewrite_fract_v3f16(text: str, name: str) -> str:
     return text
 
 
+def lower_zero_memset_24(text: str, name: str) -> str:
+    """Lower one fixed 24-byte zero memset to ordinary AIR stores.
+
+    Ventura's Metal frontend emits this LLVM intrinsic while copying a
+    three-element float2 varying array.  The iOS 16.3 AGX compiler accepts the
+    surrounding AIR but returns an internal compiler error for the intrinsic.
+    Three aligned i64 stores are byte-for-byte equivalent and remain subject
+    to the normal AIR verifier and AGX code generator.
+    """
+    call_pattern = re.compile(
+        r"^(?P<indent>\s*)call void @llvm\.memset\.p0i8\.i64\("
+        r"i8\* nonnull align 8 dereferenceable\(24\) "
+        r"(?P<pointer>%[-a-zA-Z$._0-9]+), i8 0, i64 24, i1 false\)$",
+        re.MULTILINE,
+    )
+
+    def replace_call(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        pointer = match.group("pointer")
+        lines = []
+        for index, offset in enumerate((0, 8, 16)):
+            byte_pointer = pointer
+            if offset:
+                byte_pointer = f"%macws.memset.byte.{index}"
+                lines.append(
+                    f"{indent}{byte_pointer} = getelementptr inbounds i8, "
+                    f"i8* {pointer}, i64 {offset}"
+                )
+            word_pointer = f"%macws.memset.word.{index}"
+            lines.append(
+                f"{indent}{word_pointer} = bitcast i8* {byte_pointer} to i64*"
+            )
+            lines.append(
+                f"{indent}store i64 0, i64* {word_pointer}, align 8"
+            )
+        return "\n".join(lines)
+
+    text, typed_call_count = call_pattern.subn(replace_call, text)
+
+    # LLVM 17+ prints the same AIR intrinsic with opaque pointers.  Metal
+    # 32023.35 emits both spellings across Stray's cached shader set, so keep
+    # the semantic lowering identical while emitting valid opaque-pointer IR.
+    opaque_call_pattern = re.compile(
+        r"^(?P<indent>\s*)call void @llvm\.memset\.p0\.i64\("
+        r"ptr nonnull align 8 dereferenceable\(24\) "
+        r"(?P<pointer>%[-a-zA-Z$._0-9]+), i8 0, i64 24, i1 false\)$",
+        re.MULTILINE,
+    )
+
+    def replace_opaque_call(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        pointer = match.group("pointer")
+        lines = []
+        for index, offset in enumerate((0, 8, 16)):
+            word_pointer = pointer
+            if offset:
+                word_pointer = f"%macws.memset.word.{index}"
+                lines.append(
+                    f"{indent}{word_pointer} = getelementptr inbounds i8, "
+                    f"ptr {pointer}, i64 {offset}"
+                )
+            lines.append(
+                f"{indent}store i64 0, ptr {word_pointer}, align 8"
+            )
+        return "\n".join(lines)
+
+    text, opaque_call_count = opaque_call_pattern.subn(
+        replace_opaque_call, text
+    )
+    declaration_pattern = re.compile(
+        r"^declare void @llvm\.memset\.p0i8\.i64\(i8\* nocapture "
+        r"writeonly, i8, i64, i1 immarg\) #[0-9]+\n?",
+        re.MULTILINE,
+    )
+    text, typed_declaration_count = declaration_pattern.subn("", text)
+    opaque_declaration_pattern = re.compile(
+        r"^declare void @llvm\.memset\.p0\.i64\(ptr writeonly "
+        r"captures\(none\), i8, i64, i1 immarg\) #[0-9]+\n?",
+        re.MULTILINE,
+    )
+    text, opaque_declaration_count = opaque_declaration_pattern.subn(
+        "", text
+    )
+    call_count = typed_call_count + opaque_call_count
+    declaration_count = (
+        typed_declaration_count + opaque_declaration_count
+    )
+    if call_count != 1 or declaration_count != 1:
+        raise ValueError(
+            f"{name}: expected exactly one fixed zero memset "
+            f"call/declaration, found {call_count}/{declaration_count}"
+        )
+    if ("@llvm.memset.p0i8.i64" in text or
+            "@llvm.memset.p0.i64" in text):
+        raise ValueError(f"{name}: residual llvm.memset reference")
+    return text
+
+
 def retarget_air(
     module: bytes,
     name: str,
@@ -186,6 +338,7 @@ def retarget_air(
     target_triple: str,
     scratch: pathlib.Path,
     lower_fract_v3f16: bool,
+    lower_zero_memset: bool,
 ) -> bytes:
     source = scratch / f"{name}.input.air"
     assembly = scratch / f"{name}.ll"
@@ -204,6 +357,8 @@ def retarget_air(
         )
     if lower_fract_v3f16:
         text = rewrite_fract_v3f16(text, name)
+    if lower_zero_memset:
+        text = lower_zero_memset_24(text, name)
     assembly.write_text(text, encoding="utf-8")
     subprocess.run([llvm_as, assembly, "-o", output], check=True)
     rebuilt = output.read_bytes()
@@ -219,14 +374,29 @@ def convert(args: argparse.Namespace) -> None:
     original = input_path.read_bytes()
     if len(original) < MTLB_HEADER_SIZE or original[:4] != b"MTLB":
         raise ValueError("input is not an MTLB container")
-    input_target = (u16(original, 4), original[11])
+    input_platform = u16(original, 4)
+    input_file_version = (u16(original, 6), u16(original, 8))
+    input_target = (input_platform, original[11])
+    legacy_unknown_target = (
+        input_platform in {IOS_PLATFORM, MACOS_PLATFORM}
+        and original[11] == UNKNOWN_TARGET_OS
+        and input_file_version == (2, 3)
+    )
     if input_target not in {
         (IOS_PLATFORM, IOS_TARGET_OS),
         (MACOS_PLATFORM, MACOS_TARGET_OS),
-    }:
+    } and not legacy_unknown_target:
         raise ValueError("input must be an iOS or macOS executable MTLB")
     if original[10] != 0:
         raise ValueError("input must be an executable MTLB")
+    if (not args.preserve_container_target and
+            not target_triple_matches_container(
+                args.target_triple, args.container_target
+            )):
+        raise ValueError(
+            f"AIR target {args.target_triple!r} does not match "
+            f"MTLB container target {args.container_target!r}"
+        )
     if u64(original, 16) != len(original):
         raise ValueError("input file-size field is invalid")
     bitcode_offset = u64(original, 72)
@@ -237,16 +407,59 @@ def convert(args: argparse.Namespace) -> None:
 
     selected_names = set(args.function or [])
     fract_rewrite_names = set(args.rewrite_fract_v3f16_function or [])
-    if args.preserve_container_target and not selected_names:
-        raise ValueError("--preserve-container-target requires --function")
+    zero_memset_names = set(args.lower_zero_memset_function or [])
+    if args.in_place_air_target:
+        if not legacy_unknown_target:
+            raise ValueError(
+                "--in-place-air-target currently accepts only the validated "
+                "legacy 2.3/unknown-target MTLB format"
+            )
+        if (args.preserve_container_target or selected_names or
+                fract_rewrite_names or zero_memset_names):
+            raise ValueError(
+                "--in-place-air-target cannot be combined with selective "
+                "AIR conversion or --preserve-container-target"
+            )
+    if (args.preserve_container_target and not selected_names
+            and not legacy_unknown_target):
+        raise ValueError(
+            "--preserve-container-target without --function is accepted only "
+            "for the validated legacy 2.3/unknown-target MTLB format"
+        )
     if not fract_rewrite_names.issubset(selected_names):
         raise ValueError(
             "--rewrite-fract-v3f16-function must also be selected by "
             "--function"
         )
+    if not zero_memset_names.issubset(selected_names):
+        raise ValueError(
+            "--lower-zero-memset-function must also be selected by "
+            "--function"
+        )
 
     rebuilt = bytearray(original[:bitcode_offset])
     records = parse_function_records(rebuilt)
+    if legacy_unknown_target:
+        # Metal 902.1 emits MTLB 2.3 containers whose target-OS header byte is
+        # zero.  In that format the authoritative target is the AIR triple in
+        # every module.  Fail closed unless all modules agree with the header's
+        # platform; this keeps an arbitrary unknown-target container from being
+        # promoted merely because it happens to use the old header version.
+        expected_triple = (b"air64-apple-macosx" if
+                           input_platform == MACOS_PLATFORM else
+                           b"air64-apple-ios")
+        for record in records:
+            module_offset = int(record["bitcode_offset"])
+            module_size = int(record["bitcode_size"])
+            module = original[
+                bitcode_offset + module_offset:
+                bitcode_offset + module_offset + module_size
+            ]
+            if expected_triple not in module:
+                raise ValueError(
+                    f"{record['name']}: legacy MTLB AIR target does not match "
+                    "the container platform"
+                )
     available_names = {str(record["name"]) for record in records}
     missing_names = selected_names - available_names
     if missing_names:
@@ -270,7 +483,21 @@ def convert(args: argparse.Namespace) -> None:
             hash_offset = tags["HASH"][0]
             if hashlib.sha256(module).digest() != original[hash_offset : hash_offset + 32]:
                 raise ValueError(f"{record['name']}: input SHA-256 mismatch")
-            if not selected_names or str(record["name"]) in selected_names:
+            if args.in_place_air_target:
+                # Keep Apple's AIR record layout byte-for-byte. Upstream
+                # llvm-as
+                # emits records (for example ATTR_KIND_CAPTURES=102) that the
+                # iOS 16 Apple LLVM reader cannot decode, even when the IR is
+                # otherwise unchanged. A same-length target replacement
+                # changes only the original string payload; hashes and the
+                # outer MTLB target are rebuilt normally below.
+                converted = retarget_air_in_place(
+                    module,
+                    f"{record['index']}-{record['name']}",
+                    args.target_triple,
+                )
+                converted_count += 1
+            elif not selected_names or str(record["name"]) in selected_names:
                 converted = retarget_air(
                     module,
                     f"{record['index']}-{record['name']}",
@@ -279,6 +506,7 @@ def convert(args: argparse.Namespace) -> None:
                     args.target_triple,
                     scratch,
                     str(record["name"]) in fract_rewrite_names,
+                    str(record["name"]) in zero_memset_names,
                 )
                 converted_count += 1
             else:
@@ -295,8 +523,20 @@ def convert(args: argparse.Namespace) -> None:
     rebuilt.extend(new_bitcode)
     rebuilt.extend(original[bitcode_end:])
     if not args.preserve_container_target:
-        struct.pack_into("<H", rebuilt, 4, MACOS_PLATFORM)
-        rebuilt[11] = MACABI_TARGET_OS
+        output_platform, output_target_os = OUTPUT_CONTAINER_TARGETS[
+            args.container_target
+        ]
+        struct.pack_into("<H", rebuilt, 4, output_platform)
+        if legacy_unknown_target:
+            # MTLB 2.3 predates the explicit target-OS header field.  Merely
+            # writing macabi into byte 11 leaves iOS Metal rejecting the whole
+            # archive as an old tool format before it inspects a function.
+            # The tag/section layout above has already been fully parsed and
+            # rebuilt, so advertise the modern executable-container revision
+            # alongside the now-explicit macabi target.
+            struct.pack_into("<HH", rebuilt, 6,
+                             *CURRENT_MTLB_FILE_VERSION)
+        rebuilt[11] = output_target_os
         struct.pack_into("<H", rebuilt, 12, args.target_major)
         struct.pack_into("<H", rebuilt, 14, args.target_minor)
     struct.pack_into("<Q", rebuilt, 16, len(rebuilt))
@@ -327,7 +567,7 @@ def convert(args: argparse.Namespace) -> None:
     print(
         f"converted={converted_count}/{len(final_records)} "
         f"target={args.target_triple} "
-        f"container_target={'preserved' if args.preserve_container_target else 'macabi'} "
+        f"container_target={'preserved' if args.preserve_container_target else args.container_target} "
         f"bitcode={bitcode_size}->{len(new_bitcode)} bytes "
         f"file={len(original)}->{len(rebuilt)} bytes output={output_path}"
     )
@@ -342,6 +582,23 @@ def main() -> None:
     parser.add_argument("--target-triple", default="air64-apple-ios19.0.0-macabi")
     parser.add_argument("--target-major", type=int, default=19)
     parser.add_argument("--target-minor", type=int, default=0)
+    parser.add_argument(
+        "--in-place-air-target",
+        action="store_true",
+        help=(
+            "for validated legacy 2.3 archives, replace a same-length AIR "
+            "target string without re-encoding Apple's bitcode dialect"
+        ),
+    )
+    parser.add_argument(
+        "--container-target",
+        choices=sorted(OUTPUT_CONTAINER_TARGETS),
+        default="macabi",
+        help=(
+            "target encoded in the rebuilt MTLB header (default: macabi); "
+            "the AIR target triple must describe the same target"
+        ),
+    )
     parser.add_argument(
         "--function",
         action="append",
@@ -358,6 +615,14 @@ def main() -> None:
         help=(
             "within this selected function, rewrite the exact unsupported "
             "air.fract.v3f16 call as x - air.floor.v3f16(x)"
+        ),
+    )
+    parser.add_argument(
+        "--lower-zero-memset-function",
+        action="append",
+        help=(
+            "within this selected function, lower the exact fixed 24-byte "
+            "zero memset to three verified i64 stores"
         ),
     )
     convert(parser.parse_args())

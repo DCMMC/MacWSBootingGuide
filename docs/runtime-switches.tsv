@@ -18,7 +18,7 @@ env	IOSCLEAR_HEADLESS	off	standalone probe	Runs the iosclear reference without a
 env	IOSCLEAR_HOLD	off	standalone probe	Keeps iosclear_ref alive for debugger attachment.
 env	IOSCLEAR_PF550_MODE	off	standalone probe	Selects the PF550 iosclear experiment.
 env	MACWS_IOS_KCMD_HOLD	off	standalone probe	Stops the native iOS AGX command encoder before commit for LLDB capture.
-env	MACWS_IOS_KCMD_MODE	off	standalone probe	Selects the native iOS AGX command-encoder workload.
+env	MACWS_IOS_KCMD_MODE	off	standalone probe	Selects the native iOS AGX command-encoder workload; renderzero captures an all-zero-clear subtype-1 control without editing submitted bytes.
 env	MACWS_IOS_MIP_TEXTURE_HOLD	off	standalone probe	Keeps the native iOS mipmapped-texture probe alive for LLDB inspection.
 env	MACWS_IOS_MIP_TEXTURE_PROBE	off	standalone probe	Selects the native iOS mipmapped-texture descriptor workload.
 env	MACWS_IOS_NV12_TEXTURE_HOLD	off	standalone probe	Stops the native iOS NV12 texture probe before creating plane textures for project-LLDB attachment.
@@ -44,10 +44,10 @@ env	MACWS_AGX_KEEP_PINNED_ALLOC	off	A/B control	Absent selects the production iO
 env	MACWS_AGX_KEEP_VALIDATE	off	A/B control	Retains an old validation branch when explicitly set.
 env	MACWS_AGX_LIFE_STACK_LARGE	off	diagnostic	Large lifecycle backtraces.
 env	MACWS_AGX_LIFE_VERBOSE	off	diagnostic	Per-resource lifecycle logging.
-env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo,Steam	Select the real iOS AGX driver path; mandatory production invariant.
+env	MACWS_AGX_NATIVE	on	WindowServer,VS Code,Chrome,GlassDemo	Select the real iOS AGX driver path; mandatory production invariant.
 env	MACWS_AGX_NATIVE_NON2D	off	A/B control	Broad non-2D native texture allocation experiment.
 env	MACWS_AGX_NATIVE_PLAIN	off	inverse A/B control	Variable is absent in production; absence enables the validated native-plain policy.
-env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo,Steam	Realize cross-image AGX Objective-C classes.
+env	MACWS_AGX_REGISTER_CLASSES	on	WindowServer,VS Code,Chrome,GlassDemo	Realize cross-image AGX Objective-C classes.
 env	MACWS_AGX_RENAMER_PATCH	off	legacy diagnostic	Superseded AIR renamer patch.
 env	MACWS_AGX_STRIP_OPEN_OPTIONS	off	A/B control	IOServiceOpen option mutation.
 env	MACWS_AGX_TEX_BYPASS_GATE	off	diagnostic scaffold	Texture gate bypass.
@@ -115,6 +115,8 @@ env	MACWS_STEAM_SYSVSEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded System 
 env	MACWS_STEAM_PROCESS_DIAGNOSTICS	off	Steam diagnostic	Records exact Valve process-adapter decisions and child argv.
 env	MACWS_STEAM_PROCESS_TRACE_ONLY	off	Steam A/B diagnostic	Observes process launch calls while retaining Valve's implementation.
 env	MACWS_STEAM_SEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded named-semaphore lifecycle and value transitions.
+env	MACWS_STEAM_CPU_RENDERING	on	Steam download UI	Selects Valve CPU compositing and adds no-SwiftShader/no-GPU-raster/no-zero-copy policies only to the top-level Steam CEF Browser.
+env	MACWS_STRAY_AGX_COMPAT	off	Stray game	Enables only the runtime-confirmed exact Stray subtype-1/subtype-3 producer-version AGX ABI adapters without enabling synchronous per-submit diagnostics; launch only with SteamAppId 1332010.
 env	MACWS_STEAM_VA_DIAGNOSTICS	off	Steam diagnostic	Records only Steam's GiB-scale virtual-memory reservations.
 env	MACWS_STEAM_VOLUME_DIAGNOSTICS	off	Steam diagnostic	Records exact storage-volume property queries used by the Steam bootstrap.
 env	SDL_JOYSTICK_HIDAPI	off	Steam client UI	Disables SDL HIDAPI joystick discovery in the chroot; does not affect macOS input bridging.
@@ -136,7 +138,7 @@ env	MACWS_METAL_PROBE_SOURCE_ONLY	off	standalone probe	Skips event creation and 
 env	MACWS_METAL_PROBE_SOURCE_PATH	off	standalone probe	Compiles Metal source read from the exact requested path.
 env	MACWS_METAL_PROBE_FUNCTION	off	standalone probe	Loads the named function after a source-path probe compile.
 env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source target.
-env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo,Steam	Required native-AGX allocation compatibility path.
+env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
 env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
 env	MACWS_PING_HOLD_SECONDS	off	standalone probe	Keeps PingMTLCompilerService alive for bounded debugger attachment.
 env	MACWS_PROBE_DETACHED_ENUMERATOR	off	standalone ExtensionRecord probe	Exercises the detached application-extension record enumerator path.
@@ -216,6 +218,8 @@ flag	/tmp/macws_inspect_failed_pf550	off	unsafe diagnostic	Inspect failed compre
 flag	/tmp/macws_iogpu_error_diag	off	diagnostic	Raw IOGPU completion/error introspection.
 flag	/tmp/macws_kcmd_field_5e3_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_field_6bc_diag	off	diagnostic	KCMD field trace.
+flag	/tmp/macws_kcmd_field_4d0_diag	off	diagnostic	Adds synchronous tracing to the Stray-only native-iOS-proven subtype-1 constant adapter at macOS +0x4d0 / normalized +0x4b0; compatibility without logging uses MACWS_STRAY_AGX_COMPAT.
+flag	/tmp/macws_kcmd_stray_subtype3_diag	off	diagnostic	Adds synchronous tracing to the exact Stray subtype-3 producer-version ABI family, including the NSError-bearing direct 0x210-byte resources=5/4 mode-1 record; compatibility without logging uses MACWS_STRAY_AGX_COMPAT.
 flag	/tmp/macws_kcmd_field_a4_diag	off	diagnostic	KCMD field trace.
 flag	/tmp/macws_kcmd_fix	on	WindowServer	Required direct native-AGX command ABI adapter.
 flag	/tmp/macws_kcmd_wrapped_fix	on	WindowServer	Required validated wrapped command ABI adapter; generations 0 through 4 are runtime-confirmed, with generation 1 first captured by VSCode video on 2026-08-01.

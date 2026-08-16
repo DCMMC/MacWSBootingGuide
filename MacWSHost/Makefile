@@ -33,5 +33,6 @@ MacWSHost_CFLAGS = -fobjc-arc -Wall -Wextra -I$(CURDIR)/../include \
 	-I$(CURDIR)/Compatibility \
 	-isystem $(CURDIR)/../vendor/ios-xpc -DIOSCLEAR_LIBRARY_MODE=1
 MacWSHost_CODESIGN_FLAGS = -Sentitlements.plist
+MacWSHost_RESOURCE_FILES = Resources/AppIcon.png
 
 include $(THEOS_MAKE_PATH)/application.mk

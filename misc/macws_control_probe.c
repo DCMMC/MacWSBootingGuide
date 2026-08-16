@@ -94,7 +94,18 @@ int main(int argc, const char *argv[]) {
     printf("ok=%s launched-pid=%lld message=%s\n",
            ok ? "yes" : "no", launchedPID, message ?: "");
     if (strcmp(operation, MACWS_CONTROL_OP_STATUS) == 0) {
-        printf("system-settings-available=%s maps-available=%s\n",
+        const char *startupLog = xpc_dictionary_get_string(
+            reply, "startup_log");
+        printf("protocol=%llu startup-retry=%s startup-log-bytes=%zu "
+               "phase=%s error=%s "
+               "system-settings-available=%s maps-available=%s\n",
+               (unsigned long long)xpc_dictionary_get_uint64(
+                   reply, "protocol_version"),
+               xpc_dictionary_get_bool(
+                   reply, "startup_retry_available") ? "yes" : "no",
+               startupLog ? strlen(startupLog) : 0,
+               xpc_dictionary_get_string(reply, "phase") ?: "",
+               xpc_dictionary_get_string(reply, "last_error") ?: "",
                xpc_dictionary_get_bool(
                    reply, "system_settings_available") ? "yes" : "no",
                xpc_dictionary_get_bool(

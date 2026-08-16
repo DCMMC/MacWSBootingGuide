@@ -38,18 +38,13 @@ cd "$MACWS_STEAM_ROOT" || exit 1
 # without the bundle path it skipped that owner setup and the later writer
 # opened a nonexistent FIFO. Preserve Steam's own bootstrap contract.
 export STEAM_APP_BUNDLE_PATH=/Applications/Steam.app
-# Keep Steam's CEF shell on the same native Metal/AGX path as the rest of the
-# desktop.  Runtime Jetsam evidence from 2026-08-15 identified CEF's
-# gpu-process as the largest process at 600,180 16-KiB resident pages while
-# the old -cef-disable-gpu policy was active.  That policy did not remove the
-# GPU helper: Valve also passed --enable-zero-copy and
-# --enable-gpu-memory-buffer-compositor-resources to its renderer. The
-# minidump/EXC_GUARD evidence establishes the native-GPU child death and
-# SwiftShader fallback cycle; whether one particular software-surface owner
-# accounts for all 9.16 GiB remains unproven and is not assumed here.
-# -cef-force-gpu is Valve's supported inverse switch; the launch job supplies
-# the validated native-AGX environment below.  CEF's own sandbox stays off
-# because this foreign macOS task cannot construct the macOS sandbox profile.
+# Download-first production policy: use Valve's supported CPU-compositing
+# switch. libmachook recognizes MACWS_STEAM_CPU_RENDERING only at the exact
+# top-level Steam Helper spawn and adds Chromium's supported no-SwiftShader,
+# no-GPU-raster and no-zero-copy switches. This keeps the functionally stable
+# CPU UI without recreating the historical 9.16-GiB software-GPU role. CEF's
+# own sandbox stays off because this foreign macOS task cannot construct the
+# macOS sandbox profile.
 #
 # Runtime-confirmed on 2026-08-15: Jetsam left the old CEF family in kernel
 # state UE, where even SIGKILL cannot reap it. The bootstrapper consequently
@@ -77,9 +72,11 @@ if [ -n "$steam_installed_version" ] &&
         export STEAM_APP_BUNDLE_PATH="$steam_installed_bundle"
         cd "$steam_installed_root" || exit 1
         exec ./steam_osx -no-cef-sandbox -cef-disable-gpu-sandbox \
-            -cef-force-gpu "$@"
+            -cef-disable-gpu -nobootstrapperupdate -skipinitialbootstrap \
+            -noverifyfiles "$@"
     fi
 fi
 
 exec ./steam_osx -no-cef-sandbox -cef-disable-gpu-sandbox \
-    -cef-force-gpu "$@"
+    -cef-disable-gpu -nobootstrapperupdate -skipinitialbootstrap \
+    -noverifyfiles "$@"

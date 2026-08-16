@@ -36,13 +36,18 @@
         <key>TMPDIR</key><string>/tmp</string>
         <key>CA_VSYNC_OFF</key><string>1</string>
         <key>CA_DISABLE_SWAP_ICC</key><string>1</string>
-        <!-- Steam's CEF shell and games both inherit this job.  Keep them on
-             the production native AGX path; the previous software CEF path
-             left its gpu-process with a 9.16-GiB resident footprint during
-             an animated download and was Jetsam-killed for compressor space. -->
-        <key>MACWS_AGX_NATIVE</key><string>1</string>
-        <key>MACWS_AGX_REGISTER_CLASSES</key><string>1</string>
-        <key>MACWS_PIN_FALLBACK</key><string>1</string>
+        <!-- Download-first production profile. Steam's CEF UI uses CPU page
+             compositing, while libmachook adds the supported Chromium flags
+             that prevent its separate SwiftShader/GPU rasterizer from
+             recreating the historical 9.16-GiB gpu-process footprint. This
+             variable is deliberately Steam-only; games and other MacWS apps
+             keep their own graphics policy. -->
+        <key>MACWS_STEAM_CPU_RENDERING</key><string>1</string>
+        <!-- iPadOS Security rejects valid macOS 4-KiB CodeDirectories before
+             NSWorkspace exec. The Steam-only adapter preserves the original
+             call, then atomically spawns a trustcached vendor executable with
+             Valve's original NSWorkspace argv/environment contract. -->
+        <key>MACWS_STEAM_APP_LAUNCH_COMPAT</key><string>1</string>
         <!--
           Steam's bundled SDL 3 controller backend blocks the AppKit main
           thread on iPadOS while CHIDIO owns SDL's device mutex. Mouse,

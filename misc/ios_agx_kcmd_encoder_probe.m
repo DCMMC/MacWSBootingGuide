@@ -4,10 +4,11 @@
 // context and copies the command buffer's populated KCMD bytes through the
 // same getCurrentKernelCommandBufferStart:current:end: SPI already used by
 // iosclear_ref.m.  It never changes a driver object or command byte.  Select
-// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|statistics|render|draw|drawblit|drawblitsignal|drawblitlegacy|drawchain|aquariumchain
+// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|statistics|render|renderzero|draw|drawblit|drawblitsignal|drawblitlegacy|drawchain|aquariumchain|rawcompute|rawconcurrent|richcompute|externalcompute|iosurfaceformat
 // (default: blit).
 
 @import Foundation;
+@import IOSurface;
 @import Metal;
 @import MetalPerformanceShaders;
 
@@ -582,6 +583,95 @@ static int macws_encode_raw_compute(id<MTLDevice> device,
     return dump_status || command_buffer.error ? 27 : 0;
 }
 
+// Native-iOS control for the resource shape of Stray's first failing UE4
+// skinning dispatch.  The game shader has a 28-byte constant buffer at index
+// 8, two writable texture buffers, and six readable texture buffers.  The
+// shader below deliberately reproduces only that public Metal argument shape;
+// it does not reproduce or consume the proprietary game shader.  A successful
+// submission gives us an authoritative iOS-side subtype-3 command layout with
+// a comparable resource trailer.
+static int macws_encode_rich_compute(id<MTLDevice> device,
+                                     id<MTLCommandQueue> queue) {
+    const char *source_utf8 =
+        "#include <metal_stdlib>\n"
+        "using namespace metal;\n"
+        "kernel void macws_rich(constant uint *globals [[buffer(8)]], "
+        "texture_buffer<float, access::write> out0 [[texture(0)]], "
+        "texture_buffer<float, access::write> out1 [[texture(1)]], "
+        "texture_buffer<float, access::read> in2 [[texture(2)]], "
+        "texture_buffer<float, access::read> in3 [[texture(3)]], "
+        "texture_buffer<float, access::read> in4 [[texture(4)]], "
+        "texture_buffer<uint, access::read> in5 [[texture(5)]], "
+        "texture_buffer<float, access::read> in6 [[texture(6)]], "
+        "texture_buffer<float, access::read> in7 [[texture(7)]], "
+        "uint3 gid [[thread_position_in_grid]]) { "
+        "uint i = gid.x & 63; "
+        "float4 value = in2.read(i) + in3.read(i) + in4.read(i) + "
+        "float4(in5.read(i)) + in6.read(i) + in7.read(i) + "
+        "float4(globals[0]); "
+        "out0.write(value, i); out1.write(value, i); }\n";
+    NSError *error = nil;
+    id<MTLLibrary> library = [device
+        newLibraryWithSource:[NSString stringWithUTF8String:source_utf8]
+        options:nil error:&error];
+    id<MTLFunction> function = [library newFunctionWithName:@"macws_rich"];
+    id<MTLComputePipelineState> pipeline = function
+        ? [device newComputePipelineStateWithFunction:function error:&error]
+        : nil;
+
+    id<MTLBuffer> globals = [device newBufferWithLength:28
+                                                options:MTLResourceStorageModeShared];
+    NSMutableArray<id<MTLTexture>> *textures = [NSMutableArray array];
+    for (NSUInteger index = 0; index < 8; index++) {
+        MTLPixelFormat format = index == 5
+            ? MTLPixelFormatRGBA32Uint : MTLPixelFormatRGBA32Float;
+        MTLTextureUsage usage = index < 2
+            ? MTLTextureUsageShaderWrite : MTLTextureUsageShaderRead;
+        MTLTextureDescriptor *descriptor =
+            [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:format
+                width:64 resourceOptions:MTLResourceStorageModeShared
+                usage:usage];
+        id<MTLTexture> texture = [device newTextureWithDescriptor:descriptor];
+        if (!texture) break;
+        [textures addObject:texture];
+    }
+    fprintf(stderr,
+        "IOS-AGX-KCMD richcompute library=%p function=%p pipeline=%p "
+        "globals=%p textures=%lu error=%s\n",
+        (__bridge void *)library, (__bridge void *)function,
+        (__bridge void *)pipeline, (__bridge void *)globals,
+        (unsigned long)textures.count,
+        error.description.UTF8String ?: "nil");
+    if (!pipeline || !globals || textures.count != 8) return 69;
+
+    id<MTLCommandBuffer> command_buffer = macws_new_command_buffer(queue);
+    id<MTLComputeCommandEncoder> encoder =
+        [command_buffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:globals offset:0 atIndex:8];
+    for (NSUInteger index = 0; index < textures.count; index++)
+        [encoder setTexture:textures[index] atIndex:index];
+    [encoder dispatchThreads:MTLSizeMake(64, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [encoder endEncoding];
+    macws_commit_deferred_encoder(command_buffer);
+
+    int dump_status = macws_dump_kcmd(command_buffer, "richcompute");
+    if (getenv("MACWS_IOS_KCMD_HOLD")) raise(SIGSTOP);
+    [command_buffer commit];
+    int postcommit_dump_status =
+        macws_dump_kcmd(command_buffer, "richcompute-postcommit");
+    [command_buffer waitUntilCompleted];
+    fprintf(stderr,
+        "IOS-AGX-KCMD mode=richcompute status=%ld error=%s "
+        "dump=%d postcommit-dump=%d\n",
+        (long)command_buffer.status,
+        command_buffer.error.description.UTF8String ?: "nil", dump_status,
+        postcommit_dump_status);
+    return dump_status || postcommit_dump_status || command_buffer.error
+        ? 70 : 0;
+}
+
 static int macws_encode_parallel_render(id<MTLDevice> device,
                                         id<MTLCommandQueue> queue) {
     MTLTextureDescriptor *descriptor =
@@ -619,7 +709,8 @@ static int macws_encode_parallel_render(id<MTLDevice> device,
 }
 
 static int macws_encode_render(id<MTLDevice> device,
-                               id<MTLCommandQueue> queue) {
+                               id<MTLCommandQueue> queue,
+                               BOOL zero_clear) {
     MTLTextureDescriptor *descriptor =
         [MTLTextureDescriptor
             texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
@@ -635,18 +726,29 @@ static int macws_encode_render(id<MTLDevice> device,
     pass.colorAttachments[0].texture = target;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-    pass.colorAttachments[0].clearColor =
-        MTLClearColorMake(0.125, 0.25, 0.5, 1.0);
+    // `renderzero` is a native-iOS control for macOS command records whose
+    // clear-value field is zero.  The chroot KCMD translator must distinguish
+    // semantic clear data from the two producer-version padding windows; this
+    // public-Metal control lets us inspect the authoritative iOS layout rather
+    // than broadening a structural predicate from a guess.
+    pass.colorAttachments[0].clearColor = zero_clear
+        ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
+        : MTLClearColorMake(0.125, 0.25, 0.5, 1.0);
     id<MTLRenderCommandEncoder> encoder =
         [command_buffer renderCommandEncoderWithDescriptor:pass];
     [encoder endEncoding];
+    // Render encoders can remain deferred until commit.  Flush the user-space
+    // encoder so the pre-submit dump contains the same finalized KCMD bytes
+    // that the native driver will submit; this does not submit or edit them.
+    macws_commit_deferred_encoder(command_buffer);
 
-    int dump_status = macws_dump_kcmd(command_buffer, "render");
+    const char *mode = zero_clear ? "renderzero" : "render";
+    int dump_status = macws_dump_kcmd(command_buffer, mode);
     if (getenv("MACWS_IOS_KCMD_HOLD")) raise(SIGSTOP);
     [command_buffer commit];
     [command_buffer waitUntilCompleted];
-    fprintf(stderr, "IOS-AGX-KCMD mode=render status=%ld error=%s dump=%d\n",
-        (long)command_buffer.status,
+    fprintf(stderr, "IOS-AGX-KCMD mode=%s status=%ld error=%s dump=%d\n",
+        mode, (long)command_buffer.status,
         command_buffer.error.description.UTF8String ?: "nil", dump_status);
     return dump_status || command_buffer.error ? 31 : 0;
 }
@@ -912,6 +1014,117 @@ static int macws_encode_draw_chain(id<MTLDevice> device,
     return dump_status || command_buffer.error ? 44 : 0;
 }
 
+// Load a byte-exact external MTLB and ask the native iOS AGX device to create
+// the same descriptor-based compute pipeline used by UE4.  This is a bounded
+// compatibility witness: it neither edits the library nor substitutes a
+// result.  The caller supplies both values so a captured game shader is never
+// silently selected by a generic probe invocation.
+static int macws_test_external_compute(id<MTLDevice> device) {
+    const char *path_utf8 = getenv("MACWS_IOS_MTLB_PATH");
+    const char *function_utf8 = getenv("MACWS_IOS_MTLB_FUNCTION");
+    if (!path_utf8 || !*path_utf8 || !function_utf8 || !*function_utf8) {
+        fprintf(stderr,
+            "IOS-AGX-KCMD externalcompute requires MACWS_IOS_MTLB_PATH "
+            "and MACWS_IOS_MTLB_FUNCTION\n");
+        return 65;
+    }
+    NSString *path = [NSString stringWithUTF8String:path_utf8];
+    NSData *bytes = [NSData dataWithContentsOfFile:path];
+    if (!bytes.length) {
+        fprintf(stderr,
+            "IOS-AGX-KCMD externalcompute unreadable path=%s\n", path_utf8);
+        return 66;
+    }
+    NSError *error = nil;
+    id<MTLLibrary> library = [device
+        newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    NSString *function_name = [NSString stringWithUTF8String:function_utf8];
+    id<MTLFunction> function =
+        [library newFunctionWithName:function_name];
+    if (!function) {
+        fprintf(stderr,
+            "IOS-AGX-KCMD externalcompute path=%s bytes=%lu library=%p "
+            "function=%s/(nil) names=%s error-domain=%s error-code=%ld "
+            "description=%s\n",
+            path_utf8, (unsigned long)bytes.length,
+            (__bridge void *)library, function_utf8,
+            library.functionNames.description.UTF8String ?: "(nil)",
+            error.domain.UTF8String ?: "(nil)", (long)error.code,
+            error.localizedDescription.UTF8String ?: "(nil)");
+        return 68;
+    }
+    MTLComputePipelineDescriptor *descriptor =
+        [MTLComputePipelineDescriptor new];
+    descriptor.label = function_name;
+    descriptor.computeFunction = function;
+    MTLAutoreleasedComputePipelineReflection reflection = nil;
+    id<MTLComputePipelineState> pipeline = function
+        ? [device newComputePipelineStateWithDescriptor:descriptor
+                                                options:MTLPipelineOptionNone
+                                             reflection:&reflection
+                                                  error:&error]
+        : nil;
+    fprintf(stderr,
+        "IOS-AGX-KCMD externalcompute path=%s bytes=%lu library=%p "
+        "function=%s/%p pipeline=%p class=%s reflection=%p "
+        "error-domain=%s error-code=%ld description=%s\n",
+        path_utf8, (unsigned long)bytes.length,
+        (__bridge void *)library, function_utf8, (__bridge void *)function,
+        (__bridge void *)pipeline,
+        pipeline ? object_getClassName(pipeline) : "(nil)",
+        (__bridge void *)reflection,
+        error.domain.UTF8String ?: "(nil)", (long)error.code,
+        error.localizedDescription.UTF8String ?: "(nil)");
+    return pipeline ? 0 : 67;
+}
+
+static int macws_test_iosurface_format(id<MTLDevice> device) {
+    // Native-iOS control for the Stray RGBA16Unorm failure.  CoreVideo defines
+    // 'l64r' as little-endian 64-bit RGBA with full-range 16-bit samples,
+    // matching MTLPixelFormatRGBA16Unorm's byte layout.  Exercise the exact
+    // 98x64 descriptor and private-storage contract observed at runtime.
+    const uint32_t pixel_format = 'l64r';
+    NSDictionary *properties = @{
+        @"IOSurfaceWidth": @98,
+        @"IOSurfaceHeight": @64,
+        @"IOSurfaceBytesPerElement": @8,
+        @"IOSurfacePixelFormat": @(pixel_format),
+        @"IOSurfaceIsGlobal": @NO,
+        @"IOSurfaceCacheMode": @0,
+    };
+    IOSurfaceRef surface = IOSurfaceCreate(
+        (__bridge CFDictionaryRef)properties);
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+        texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Unorm
+                                    width:98 height:64 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageUnknown;
+    SEL selector = sel_registerName(
+        "newTextureWithDescriptor:iosurface:plane:");
+    id texture = nil;
+    if (surface && [device respondsToSelector:selector]) {
+        id (*implementation)(id, SEL, id, IOSurfaceRef, NSUInteger) =
+            (void *)objc_msgSend;
+        texture = implementation(device, selector, descriptor, surface, 0);
+    }
+    fprintf(stderr,
+        "IOS-AGX-IOSURFACE-FORMAT pf=%lu desc=98x64 selected-fcc=%#x "
+        "surface=%p id=%u w=%zu h=%zu bpr=%zu bpe=%zu surface-fcc=%#x "
+        "selector=%s texture=%p class=%s\n",
+        (unsigned long)descriptor.pixelFormat, (unsigned)pixel_format,
+        (void *)surface, surface ? IOSurfaceGetID(surface) : 0,
+        surface ? IOSurfaceGetWidth(surface) : 0,
+        surface ? IOSurfaceGetHeight(surface) : 0,
+        surface ? IOSurfaceGetBytesPerRow(surface) : 0,
+        surface ? IOSurfaceGetBytesPerElement(surface) : 0,
+        surface ? IOSurfaceGetPixelFormat(surface) : 0,
+        [device respondsToSelector:selector] ? "YES" : "NO",
+        (__bridge void *)texture,
+        texture ? object_getClassName(texture) : "(nil)");
+    if (surface) CFRelease(surface);
+    return texture ? 0 : 68;
+}
+
 int main(void) {
     @autoreleasepool {
         const char *mode = getenv("MACWS_IOS_KCMD_MODE");
@@ -942,8 +1155,12 @@ int main(void) {
             return macws_encode_raw_compute(device, queue, NO);
         if (strcmp(mode, "rawconcurrent") == 0)
             return macws_encode_raw_compute(device, queue, YES);
+        if (strcmp(mode, "richcompute") == 0)
+            return macws_encode_rich_compute(device, queue);
         if (strcmp(mode, "render") == 0)
-            return macws_encode_render(device, queue);
+            return macws_encode_render(device, queue, NO);
+        if (strcmp(mode, "renderzero") == 0)
+            return macws_encode_render(device, queue, YES);
         if (strcmp(mode, "parallel") == 0)
             return macws_encode_parallel_render(device, queue);
         if (strcmp(mode, "draw") == 0)
@@ -958,6 +1175,10 @@ int main(void) {
             return macws_encode_draw_chain(device, queue);
         if (strcmp(mode, "aquariumchain") == 0)
             return macws_encode_aquarium_chain(device, queue);
+        if (strcmp(mode, "externalcompute") == 0)
+            return macws_test_external_compute(device);
+        if (strcmp(mode, "iosurfaceformat") == 0)
+            return macws_test_iosurface_format(device);
         fprintf(stderr, "IOS-AGX-KCMD unknown mode=%s\n", mode);
         return 64;
     }

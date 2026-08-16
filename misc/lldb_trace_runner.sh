@@ -24,6 +24,7 @@ SSH_USER=${SSH_USER:-root}
 DBG_PORT=${DBG_PORT:-5555}
 RUN_LOG=${RUN_LOG:-/tmp/lldb_trace_run.log}
 LLDB_MEMORY_MODULE_LOAD_LEVEL=${LLDB_MEMORY_MODULE_LOAD_LEVEL:-}
+LLDB_TARGET_BINARY=${LLDB_TARGET_BINARY:-}
 IOS_SYMBOL_ROOT=${IOS_SYMBOL_ROOT:-}
 SUDO_PASSWORD=${SUDO_PASSWORD:-}
 TRACE_CLEANUP_DELAY=${TRACE_CLEANUP_DELAY:-1}
@@ -92,6 +93,9 @@ sleep "$TRACE_TUNNEL_DELAY"
 # `script ... DONE` blocks, lldb python heredocs, etc. (which `-o` would
 # split across separate one-line invocations).
 LLDB_ARGS=(--batch)
+if [ -n "$LLDB_TARGET_BINARY" ]; then
+    LLDB_ARGS+=(--file "$LLDB_TARGET_BINARY")
+fi
 if [ -n "$LLDB_MEMORY_MODULE_LOAD_LEVEL" ]; then
     LLDB_ARGS+=(
         -O "settings set target.memory-module-load-level $LLDB_MEMORY_MODULE_LOAD_LEVEL"

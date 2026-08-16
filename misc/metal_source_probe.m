@@ -4,10 +4,61 @@
 #import <objc/runtime.h>
 #include <dlfcn.h>
 #include <ptrauth.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static BOOL ConfigureVertexDescriptorFromEnvironment(
+        MTLVertexDescriptor *descriptor) {
+    const char *attributeText =
+        getenv("MACWS_METAL_PROBE_VERTEX_ATTRIBUTES");
+    const char *layoutText = getenv("MACWS_METAL_PROBE_VERTEX_LAYOUTS");
+    if ((!attributeText || !attributeText[0]) &&
+        (!layoutText || !layoutText[0])) return YES;
+
+    char *attributes = attributeText ? strdup(attributeText) : NULL;
+    char *save = NULL;
+    for (char *token = attributes
+             ? strtok_r(attributes, ",", &save) : NULL;
+         token; token = strtok_r(NULL, ",", &save)) {
+        unsigned long index = 0, format = 0, offset = 0, buffer = 0;
+        if (sscanf(token, "%lu:%lu:%lu:%lu", &index, &format,
+                   &offset, &buffer) != 4 || index >= 31 || buffer >= 31) {
+            fprintf(stderr,
+                "METAL_SOURCE_PROBE invalidVertexAttribute=%s\n", token);
+            free(attributes);
+            return NO;
+        }
+        MTLVertexAttributeDescriptor *attribute =
+            descriptor.attributes[index];
+        attribute.format = (MTLVertexFormat)format;
+        attribute.offset = offset;
+        attribute.bufferIndex = buffer;
+    }
+    free(attributes);
+
+    char *layouts = layoutText ? strdup(layoutText) : NULL;
+    save = NULL;
+    for (char *token = layouts ? strtok_r(layouts, ",", &save) : NULL;
+         token; token = strtok_r(NULL, ",", &save)) {
+        unsigned long index = 0, stride = 0, stepFunction = 0, stepRate = 0;
+        if (sscanf(token, "%lu:%lu:%lu:%lu", &index, &stride,
+                   &stepFunction, &stepRate) != 4 || index >= 31) {
+            fprintf(stderr,
+                "METAL_SOURCE_PROBE invalidVertexLayout=%s\n", token);
+            free(layouts);
+            return NO;
+        }
+        MTLVertexBufferLayoutDescriptor *layout = descriptor.layouts[index];
+        layout.stride = stride;
+        layout.stepFunction = (MTLVertexStepFunction)stepFunction;
+        layout.stepRate = stepRate;
+    }
+    free(layouts);
+    return YES;
+}
 
 static void DumpNewEventImplementation(id device) {
     if (!getenv("MACWS_METAL_PROBE_DUMP_EVENT_IMP")) return;
@@ -229,6 +280,168 @@ int main(void) {
                     libraryError
                         ? libraryError.localizedDescription.UTF8String : "(nil)");
             if (!library) return 7;
+
+            // Generic precompiled-pipeline replay.  Real clients such as
+            // Unreal load the vertex and fragment AIR from distinct MTLB
+            // blobs, so the older QuartzCore-only probe below cannot replay
+            // their descriptors.  Keep this entirely descriptor-driven: it
+            // reports the concrete driver's result and never substitutes a
+            // function, pipeline or error.
+            const char *vertexFunctionText =
+                getenv("MACWS_METAL_PROBE_VERTEX_FUNCTION");
+            if (vertexFunctionText && vertexFunctionText[0]) {
+                const char *fragmentLibraryPath =
+                    getenv("MACWS_METAL_PROBE_FRAGMENT_LIBRARY_PATH");
+                id<MTLLibrary> fragmentLibrary = library;
+                NSError *fragmentLibraryError = nil;
+                if (fragmentLibraryPath && fragmentLibraryPath[0] &&
+                    strcmp(fragmentLibraryPath, libraryPath) != 0) {
+                    NSURL *fragmentLibraryURL = [NSURL fileURLWithPath:
+                        [NSString stringWithUTF8String:fragmentLibraryPath]];
+                    fragmentLibrary = [device
+                        newLibraryWithURL:fragmentLibraryURL
+                                   error:&fragmentLibraryError];
+                }
+
+                const char *fragmentFunctionText =
+                    getenv("MACWS_METAL_PROBE_FRAGMENT_FUNCTION");
+                NSString *vertexFunctionName =
+                    [NSString stringWithUTF8String:vertexFunctionText];
+                NSString *fragmentFunctionName =
+                    fragmentFunctionText && fragmentFunctionText[0]
+                        ? [NSString stringWithUTF8String:fragmentFunctionText]
+                        : nil;
+                id<MTLFunction> replayVertex =
+                    [library newFunctionWithName:vertexFunctionName];
+                id<MTLFunction> replayFragment =
+                    fragmentFunctionName && fragmentLibrary
+                        ? [fragmentLibrary
+                            newFunctionWithName:fragmentFunctionName]
+                        : nil;
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE replayFunctions vertexLibrary=%p "
+                        "fragmentPath=%s fragmentLibrary=%p vertex=%s/%p "
+                        "fragment=%s/%p fragmentLibraryErrorDomain=%s "
+                        "fragmentLibraryErrorCode=%ld description=%s\n",
+                        library,
+                        fragmentLibraryPath ? fragmentLibraryPath : "(same)",
+                        fragmentLibrary,
+                        vertexFunctionText, replayVertex,
+                        fragmentFunctionText ? fragmentFunctionText : "(nil)",
+                        replayFragment,
+                        fragmentLibraryError
+                            ? fragmentLibraryError.domain.UTF8String : "(nil)",
+                        (long)(fragmentLibraryError
+                            ? fragmentLibraryError.code : 0),
+                        fragmentLibraryError
+                            ? fragmentLibraryError.localizedDescription.UTF8String
+                            : "(nil)");
+                if (!replayVertex ||
+                    (fragmentFunctionName && !replayFragment)) return 11;
+
+                const char *colorText =
+                    getenv("MACWS_METAL_PROBE_COLOR0_FORMAT");
+                const char *depthText =
+                    getenv("MACWS_METAL_PROBE_DEPTH_FORMAT");
+                const char *stencilText =
+                    getenv("MACWS_METAL_PROBE_STENCIL_FORMAT");
+                const char *sampleText =
+                    getenv("MACWS_METAL_PROBE_SAMPLE_COUNT");
+                NSUInteger colorFormat = colorText
+                    ? (NSUInteger)strtoull(colorText, NULL, 0) : 0;
+                NSUInteger depthFormat = depthText
+                    ? (NSUInteger)strtoull(depthText, NULL, 0) : 0;
+                NSUInteger stencilFormat = stencilText
+                    ? (NSUInteger)strtoull(stencilText, NULL, 0) : 0;
+                NSUInteger sampleCount = sampleText
+                    ? (NSUInteger)strtoull(sampleText, NULL, 0) : 1;
+                if (sampleCount == 0) sampleCount = 1;
+
+                MTLRenderPipelineDescriptor *replayDescriptor =
+                    [MTLRenderPipelineDescriptor new];
+                replayDescriptor.label = @"MacWS exact pipeline replay";
+                replayDescriptor.vertexFunction = replayVertex;
+                replayDescriptor.fragmentFunction = replayFragment;
+                MTLVertexDescriptor *vertexDescriptor =
+                    [MTLVertexDescriptor vertexDescriptor];
+                if (!ConfigureVertexDescriptorFromEnvironment(
+                        vertexDescriptor)) return 13;
+                replayDescriptor.vertexDescriptor = vertexDescriptor;
+                replayDescriptor.colorAttachments[0].pixelFormat =
+                    (MTLPixelFormat)colorFormat;
+                replayDescriptor.depthAttachmentPixelFormat =
+                    (MTLPixelFormat)depthFormat;
+                replayDescriptor.stencilAttachmentPixelFormat =
+                    (MTLPixelFormat)stencilFormat;
+                replayDescriptor.sampleCount = sampleCount;
+                const char *pipelinePauseText =
+                    getenv("MACWS_METAL_PROBE_PIPELINE_PAUSE_SECONDS");
+                if (pipelinePauseText) {
+                    unsigned long pauseSeconds =
+                        strtoul(pipelinePauseText, NULL, 10);
+                    if (pauseSeconds > 120) pauseSeconds = 120;
+                    if (pauseSeconds) {
+                        fprintf(stderr,
+                            "METAL_SOURCE_PROBE pipelinePauseSeconds=%lu "
+                            "pid=%d\n",
+                            pauseSeconds, getpid());
+                        sleep((unsigned)pauseSeconds);
+                    }
+                }
+                const char *repeatText =
+                    getenv("MACWS_METAL_PROBE_PIPELINE_REPEAT");
+                unsigned long repeatCount = repeatText
+                    ? strtoul(repeatText, NULL, 10) : 1;
+                if (repeatCount == 0) repeatCount = 1;
+                if (repeatCount > 8) repeatCount = 8;
+                const char *betweenPauseText = getenv(
+                    "MACWS_METAL_PROBE_BETWEEN_PIPELINE_PAUSE_SECONDS");
+                unsigned long betweenPauseSeconds = betweenPauseText
+                    ? strtoul(betweenPauseText, NULL, 10) : 0;
+                if (betweenPauseSeconds > 300)
+                    betweenPauseSeconds = 300;
+                BOOL allReplayPipelinesBuilt = YES;
+                for (unsigned long replayIndex = 0;
+                     replayIndex < repeatCount; replayIndex++) {
+                    NSError *replayError = nil;
+                    id<MTLRenderPipelineState> replayPipeline = [device
+                        newRenderPipelineStateWithDescriptor:replayDescriptor
+                                                       error:&replayError];
+                    fprintf(stderr,
+                            "METAL_SOURCE_PROBE replayPipeline index=%lu/%lu "
+                            "color0=%lu depth=%lu stencil=%lu samples=%lu "
+                            "pipeline=%p class=%s errorDomain=%s "
+                            "errorCode=%ld description=%s userInfo=%s\n",
+                            replayIndex + 1, repeatCount,
+                            (unsigned long)colorFormat,
+                            (unsigned long)depthFormat,
+                            (unsigned long)stencilFormat,
+                            (unsigned long)sampleCount,
+                            replayPipeline,
+                            replayPipeline
+                                ? object_getClassName(replayPipeline) : "(nil)",
+                            replayError
+                                ? replayError.domain.UTF8String : "(nil)",
+                            (long)(replayError ? replayError.code : 0),
+                            replayError
+                                ? replayError.localizedDescription.UTF8String
+                                : "(nil)",
+                            replayError
+                                ? replayError.userInfo.description.UTF8String
+                                : "(nil)");
+                    if (!replayPipeline) allReplayPipelinesBuilt = NO;
+                    if (replayIndex + 1 < repeatCount &&
+                        betweenPauseSeconds) {
+                        fprintf(stderr,
+                            "METAL_SOURCE_PROBE betweenPipelinePauseSeconds="
+                            "%lu pid=%d completed=%lu/%lu\n",
+                            betweenPauseSeconds, getpid(), replayIndex + 1,
+                            repeatCount);
+                        sleep((unsigned)betweenPauseSeconds);
+                    }
+                }
+                return allReplayPipelinesBuilt ? 0 : 12;
+            }
             if (getenv("MACWS_METAL_PROBE_DUMP_FUNCTIONS")) {
                 for (NSString *functionName in functionNames) {
                     fprintf(stderr,

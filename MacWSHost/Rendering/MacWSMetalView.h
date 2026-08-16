@@ -33,6 +33,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic) BOOL targetWindowResizable;
 @property(nonatomic) BOOL softwareKeyboardActive;
 @property(nonatomic, readonly) BOOL hasDirectSurfaceFrame;
+@property(nonatomic, readonly) BOOL hasFinalCompositeFrame;
 @property(nonatomic, readonly) BOOL streamServiceConnected;
 @property(nonatomic, readonly) CGFloat effectiveDensityScale;
 @property(nonatomic, readonly) MacWSPerformanceMonitor *performanceMonitor;

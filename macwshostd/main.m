@@ -50,6 +50,11 @@ extern int posix_spawnattr_setprocesstype_np(posix_spawnattr_t *attr,
 #define MACWS_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT 0x00000100
 
 static const char *const kLogPath = "/var/mobile/Library/Logs/MacWSHostd.log";
+static const char *const kStartupLogPath =
+    "/var/mobile/Library/Logs/MacWSStartup.log";
+static const char *const kGUIStartState =
+    "/var/jb/var/mobile/macos_gui_start.state";
+static const char *const kPostinstLog = "/var/jb/var/mobile/postinst.log";
 static const char *const kRootFS = "/var/mnt/rootfs";
 static const char *const kGUI = "/var/jb/usr/macOS/bin/macos_gui.sh";
 static const char *const kBash = "/var/jb/usr/bin/bash";
@@ -96,6 +101,29 @@ static const char *const kMapsExecutable =
     "/System/Applications/Maps.app/Contents/MacOS/Maps";
 static const char *const kMapsHostCarrierMarker =
     "/var/jb/var/mobile/macws-maps-host-carrier.pid";
+static const char *const kWeatherExecutable =
+    "/System/Applications/Weather.app/Contents/MacOS/Weather";
+static const char *const kWeatherBundleIdentifier = "com.apple.weather";
+static const char *const kWeatherContainerHome =
+    "/Users/mobile/Library/Containers/com.apple.weather/Data";
+static const char *const kWeatherKnownSceneSessions =
+    "/var/mnt/rootfs/Users/mobile/Library/Containers/com.apple.weather/Data/"
+    "Library/Saved Application State/com.apple.weather~iosmac.savedState/"
+    "KnownSceneSessions/data.data";
+static const char *const kWeatherKnownSceneSessionsLegacyPreBootstrap =
+    "/var/mnt/rootfs/Users/mobile/Library/Containers/com.apple.weather/Data/"
+    "Library/Saved Application State/com.apple.weather~iosmac.savedState/"
+    "KnownSceneSessions/data.data.macws-pre-bootstrap";
+static const char *const kWeatherKnownSceneSessionsLegacyLastStale =
+    "/var/mnt/rootfs/Users/mobile/Library/Containers/com.apple.weather/Data/"
+    "Library/Saved Application State/com.apple.weather~iosmac.savedState/"
+    "KnownSceneSessions/data.data.macws-last-stale";
+static const char *const kWeatherKnownSceneSessionsBackup =
+    "/var/mnt/rootfs/Users/mobile/Library/Containers/com.apple.weather/Data/"
+    "Library/.macws-weather-known-scene-last.data";
+static const char *const kWeatherKnownSceneSessionsLegacyBackup =
+    "/var/mnt/rootfs/Users/mobile/Library/Containers/com.apple.weather/Data/"
+    "Library/.macws-weather-known-scene-legacy.data";
 static const char *const kAsphaltExecutable =
     "/Applications/Asphalt.app/Contents/MacOS/Asphalt";
 static const char *const kAsphaltBundleIdentifier =
@@ -104,6 +132,13 @@ static const char *const kAsphaltContainerHome =
     "/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data";
 static const char *const kCatalystRequestPath =
     "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
+static const char *const kSteamLabel = "com.macwsguide.steam";
+static const char *const kSteamPlist =
+    "/var/jb/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist";
+static const char *const kSteamOuterExecutable =
+    "/Applications/Steam.app/Contents/MacOS/steam_osx";
+static const char *const kSteamLiveExecutable =
+    "/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_osx";
 static CFStringRef const kMapsHostLaunchNotification =
     CFSTR("com.macwsguide.host.launch-maps");
 static CFStringRef const kCatalystHostLaunchNotification =
@@ -121,6 +156,9 @@ static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gBusy;
 static NSString *gPhase = @"就绪";
 static NSString *gLastError = @"";
+static BOOL gStartupOperationActive;
+static BOOL gStartupRetryAvailable;
+static time_t gStartupBeganAt;
 static pid_t gActiveAppPID;
 static NSString *gActiveAppID = @"";
 
@@ -193,6 +231,145 @@ static BOOL HasExecutableFileMode(const char *path) {
     struct stat status = {0};
     return path && stat(path, &status) == 0 && S_ISREG(status.st_mode) &&
         (status.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+}
+
+// Catalyst's responsible-process carrier supplies HOME explicitly, but the
+// mounted Ventura filesystem does not have containermanagerd to materialize a
+// first-run container.  Runtime on iPad13,6 showed Weather's executable and
+// UIKitSystem service present while this one directory was absent; the
+// already-working Asphalt carrier has the concrete ownership/mode contract
+// mirrored below.  Only fixed allowlist constants reach this helper.
+static BOOL EnsureCatalystContainer(const char *containerHome,
+                                    NSString **message) {
+    if (!containerHome ||
+        strncmp(containerHome, "/Users/mobile/Library/Containers/",
+                strlen("/Users/mobile/Library/Containers/")) != 0 ||
+        strstr(containerHome, "..") != NULL) {
+        if (message) *message = @"Catalyst 容器路径不在允许范围内";
+        return NO;
+    }
+    NSString *dataPath = [@(kRootFS) stringByAppendingString:@(containerHome)];
+    if (![dataPath.lastPathComponent isEqualToString:@"Data"]) {
+        if (message) *message = @"Catalyst 容器必须以 Data 为根";
+        return NO;
+    }
+    NSString *containerPath = dataPath.stringByDeletingLastPathComponent;
+    NSArray<NSDictionary<NSString *, id> *> *directories = @[
+        @{@"path": containerPath, @"mode": @(0700)},
+        @{@"path": dataPath, @"mode": @(0700)},
+        @{@"path": [dataPath stringByAppendingPathComponent:@"Documents"],
+          @"mode": @(0755)},
+        @{@"path": [dataPath stringByAppendingPathComponent:@"Library"],
+          @"mode": @(0755)},
+    ];
+    for (NSDictionary<NSString *, id> *entry in directories) {
+        NSString *path = entry[@"path"];
+        mode_t mode = (mode_t)[entry[@"mode"] unsignedShortValue];
+        const char *fileSystemPath = path.fileSystemRepresentation;
+        struct stat status = {0};
+        if (lstat(fileSystemPath, &status) != 0) {
+            if (errno != ENOENT || mkdir(fileSystemPath, mode) != 0) {
+                if (message) *message = [NSString stringWithFormat:
+                    @"无法创建 Catalyst 容器 %@（errno=%d）",
+                    path.lastPathComponent, errno];
+                return NO;
+            }
+        } else if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
+            if (message) *message = [NSString stringWithFormat:
+                @"Catalyst 容器路径不是目录：%@", path];
+            return NO;
+        }
+        if (chown(fileSystemPath, 501, 501) != 0 ||
+            chmod(fileSystemPath, mode) != 0) {
+            if (message) *message = [NSString stringWithFormat:
+                @"无法设置 Catalyst 容器权限 %@（errno=%d）",
+                path.lastPathComponent, errno];
+            return NO;
+        }
+    }
+    return YES;
+}
+
+// Runtime-confirmed on iPad13,6 with Weather pids 79331/89014/89042: UIKit
+// first tracked the current process's newly requested persistent scene ID,
+// then restored the preceding process's ID from this exact archive. FuseBoard
+// reused one FUScene identifier for both transactions, after which
+// UINSApplicationDelegate logged "untracked scene, ignoring" and the real
+// Weather NSWindow remained onscreen=false with CGSCopySpacesForWindows=().
+// A clean-launch A/B at pid 90330 then moved data.data but left two earlier
+// MacWS backups in KnownSceneSessions; UIKit still restored the ID contained
+// by those backups. Move every exact, known MacWS filename out of Saved
+// Application State as well as the stock archive. Weather locations and
+// preferences live elsewhere and remain untouched. Two fixed backups retain
+// the last stock/legacy inputs without accumulating files across launches.
+static BOOL MoveWeatherSceneStateFile(const char *source,
+                                      const char *destination,
+                                      const char *label,
+                                      long long *bytesMoved,
+                                      NSString **message) {
+    struct stat stateStatus = {0};
+    if (lstat(source, &stateStatus) != 0) {
+        if (errno == ENOENT) return YES;
+        if (message) *message = [NSString stringWithFormat:
+            @"无法检查天气场景恢复记录（errno=%d）", errno];
+        return NO;
+    }
+    if (!S_ISREG(stateStatus.st_mode) || S_ISLNK(stateStatus.st_mode) ||
+        stateStatus.st_nlink != 1 ||
+        (stateStatus.st_uid != 0 && stateStatus.st_uid != 501)) {
+        HostLog(@"weather scene-restoration reject mode=%#o uid=%u links=%u",
+                stateStatus.st_mode, stateStatus.st_uid,
+                (unsigned)stateStatus.st_nlink);
+        if (message) *message = @"天气场景恢复记录的类型或所有者异常，未修改";
+        return NO;
+    }
+
+    struct stat backupStatus = {0};
+    int backupResult = lstat(destination, &backupStatus);
+    int backupError = errno;
+    if (backupResult == 0 &&
+        (!S_ISREG(backupStatus.st_mode) ||
+         S_ISLNK(backupStatus.st_mode) || backupStatus.st_nlink != 1 ||
+         (backupStatus.st_uid != 0 && backupStatus.st_uid != 501))) {
+        HostLog(@"weather scene-restoration backup-reject mode=%#o uid=%u "
+                "links=%u", backupStatus.st_mode, backupStatus.st_uid,
+                (unsigned)backupStatus.st_nlink);
+        if (message) *message = @"天气场景恢复备份的类型或所有者异常，未修改";
+        return NO;
+    } else if (backupResult != 0 && backupError != ENOENT) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法检查天气场景恢复备份（errno=%d）", backupError];
+        return NO;
+    }
+
+    if (rename(source, destination) != 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法轮换天气场景恢复记录（errno=%d）", errno];
+        return NO;
+    }
+    if (bytesMoved) *bytesMoved += (long long)stateStatus.st_size;
+    HostLog(@"weather scene-restoration moved label=%s bytes=%lld uid=%u "
+            "backup=%s", label, (long long)stateStatus.st_size,
+            stateStatus.st_uid, destination);
+    return YES;
+}
+
+static BOOL RotateWeatherKnownSceneSessions(NSString **message) {
+    long long bytesMoved = 0;
+    if (!MoveWeatherSceneStateFile(
+            kWeatherKnownSceneSessionsLegacyPreBootstrap,
+            kWeatherKnownSceneSessionsLegacyBackup, "legacy-pre-bootstrap",
+            &bytesMoved, message)) return NO;
+    if (!MoveWeatherSceneStateFile(
+            kWeatherKnownSceneSessionsLegacyLastStale,
+            kWeatherKnownSceneSessionsLegacyBackup, "legacy-last-stale",
+            &bytesMoved, message)) return NO;
+    if (!MoveWeatherSceneStateFile(
+            kWeatherKnownSceneSessions, kWeatherKnownSceneSessionsBackup,
+            "stock", &bytesMoved, message)) return NO;
+    HostLog(@"weather scene-restoration clean moved-total-bytes=%lld",
+            bytesMoved);
+    return YES;
 }
 
 // Build a private, deterministic envp for one child. posix_spawn consumes the
@@ -292,12 +469,14 @@ static void RemovePath(const char *path) {
         HostLog(@"unlink failed path=%s errno=%d (%s)", path, errno, strerror(errno));
 }
 
-static int RunCommandWithEnvironment(const char *const argv[],
-                                     char *const environment[],
-                                     BOOL waitForExit) {
+static int RunCommandWithEnvironmentToLog(const char *const argv[],
+                                          char *const environment[],
+                                          BOOL waitForExit,
+                                          const char *logPath) {
     posix_spawn_file_actions_t actions;
     posix_spawn_file_actions_init(&actions);
-    int logFD = open(kLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    int logFD = open(logPath ? logPath : kLogPath,
+                     O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (logFD >= 0) {
         posix_spawn_file_actions_adddup2(&actions, logFD, STDOUT_FILENO);
         posix_spawn_file_actions_adddup2(&actions, logFD, STDERR_FILENO);
@@ -328,8 +507,21 @@ static int RunCommandWithEnvironment(const char *const argv[],
     return 126;
 }
 
+static int RunCommandWithEnvironment(const char *const argv[],
+                                     char *const environment[],
+                                     BOOL waitForExit) {
+    return RunCommandWithEnvironmentToLog(argv, environment, waitForExit,
+                                          kLogPath);
+}
+
 static int RunCommand(const char *const argv[], BOOL waitForExit) {
     return RunCommandWithEnvironment(argv, environ, waitForExit);
+}
+
+static int RunCommandToLog(const char *const argv[], BOOL waitForExit,
+                           const char *logPath) {
+    return RunCommandWithEnvironmentToLog(argv, environ, waitForExit,
+                                          logPath);
 }
 
 static int SpawnMacOSApplication(pid_t *pid,
@@ -509,6 +701,61 @@ static NSString *ReadSmallTextFile(const char *path, NSUInteger limit) {
         NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
 }
 
+static NSString *TailFile(const char *path, NSUInteger limit);
+
+static NSString *GUIStartStateValue(NSString *key) {
+    NSString *state = ReadSmallTextFile(kGUIStartState, 4096);
+    NSString *prefix = [key stringByAppendingString:@"="];
+    for (NSString *line in [state componentsSeparatedByCharactersInSet:
+             NSCharacterSet.newlineCharacterSet]) {
+        if ([line hasPrefix:prefix]) return [line substringFromIndex:prefix.length];
+    }
+    return @"";
+}
+
+static NSString *StartupPhaseDisplay(NSString *phaseCode) {
+    if (!phaseCode.length) return @"检查并修复启动环境…";
+    static NSDictionary<NSString *, NSString *> *phases;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        phases = @{
+            @"preparing": @"正在生成启动配置…",
+            @"cleaning": @"正在清理旧的服务状态…",
+            @"assets": @"正在准备应用运行环境…",
+            @"preflight": @"正在验证图形启动条件…",
+            @"safety": @"正在启动安全保护…",
+            @"trust": @"检查并修复启动环境…",
+            @"services": @"正在启动 macOS 系统服务…",
+            @"first-frame": @"正在等待第一帧画面…",
+            @"ready": @"macOS 工作区已就绪",
+        };
+    });
+    return phases[phaseCode] ?: @"检查并修复启动环境…";
+}
+
+static NSString *StartupLogText(time_t startupBeganAt,
+                                BOOL includePostinst) {
+    NSMutableString *text = [NSMutableString string];
+    NSString *startup = TailFile(kStartupLogPath, 12288);
+    if (startup.length) [text appendString:startup];
+
+    struct stat postinstStatus = {0};
+    BOOL currentPostinst = includePostinst &&
+        stat(kPostinstLog, &postinstStatus) == 0 &&
+        postinstStatus.st_mtime >= startupBeganAt;
+    if (currentPostinst) {
+        NSString *postinst = TailFile(kPostinstLog, 12288);
+        if (postinst.length) {
+            if (text.length) [text appendString:@"\n\n"];
+            [text appendString:@"=== postinst.sh ===\n"];
+            [text appendString:postinst];
+        }
+    }
+    if (!text.length)
+        [text appendString:@"等待启动日志…"];
+    return text;
+}
+
 static void AddStatus(xpc_object_t reply) {
     int wsPID = 0;
     BOOL ws = JobHasPID(kWindowServerLabel, &wsPID);
@@ -519,10 +766,16 @@ static void AddStatus(xpc_object_t reply) {
     BOOL frame = ws && ReadFrame(&width, &height) &&
         ReadCaptureAck(wsPID, 0, &frameGeneration);
     BOOL busy;
+    BOOL startupActive;
+    BOOL startupRetryAvailable;
+    time_t startupBeganAt;
     NSString *phase;
     NSString *lastError;
     os_unfair_lock_lock(&gStateLock);
     busy = gBusy;
+    startupActive = gStartupOperationActive;
+    startupRetryAvailable = gStartupRetryAvailable;
+    startupBeganAt = gStartupBeganAt;
     phase = gPhase;
     lastError = gLastError;
     pid_t activeAppPID = gActiveAppPID;
@@ -534,6 +787,10 @@ static void AddStatus(xpc_object_t reply) {
         activeAppID = @"";
     }
     os_unfair_lock_unlock(&gStateLock);
+
+    NSString *startupPhaseCode = GUIStartStateValue(@"phase");
+    if (startupActive)
+        phase = StartupPhaseDisplay(startupPhaseCode);
 
     // macos_gui.sh runs its watchdog independently so it can still recover the
     // device if this daemon or the App disconnects. Surface its durable reason
@@ -547,6 +804,8 @@ static void AddStatus(xpc_object_t reply) {
 
     xpc_dictionary_set_uint64(reply, "protocol_version", MACWS_CONTROL_VERSION);
     xpc_dictionary_set_bool(reply, "busy", busy);
+    xpc_dictionary_set_bool(reply, "startup_retry_available",
+                            startupRetryAvailable);
     SetString(reply, "phase", phase);
     SetString(reply, "last_error", lastError);
     SetString(reply, "safety_trip", safetyTrip);
@@ -565,6 +824,12 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_uint64(reply, "frame_generation", frameGeneration);
     xpc_dictionary_set_bool(reply, "experimental_mode",
         access(kExperimentalKCmd, F_OK) == 0 || access(kExperimentalCompletion, F_OK) == 0);
+    SetString(reply, "startup_log",
+              (startupActive || startupRetryAvailable)
+                  ? StartupLogText(startupBeganAt,
+                                   [startupPhaseCode isEqualToString:@"trust"] ||
+                                       startupRetryAvailable)
+                  : @"");
     xpc_dictionary_set_bool(reply, "glassdemo_available", access("/var/mnt/rootfs/tmp/GlassDemo", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "terminal_available", access("/var/mnt/rootfs/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal", X_OK) == 0);
     xpc_dictionary_set_bool(reply, "activity_monitor_available", access("/var/mnt/rootfs/System/Applications/Utilities/Activity Monitor.app/Contents/MacOS/Activity Monitor", X_OK) == 0);
@@ -584,6 +849,16 @@ static void AddStatus(xpc_object_t reply) {
         "/var/mnt/rootfs/Applications/Microsoft Excel.app/Contents/MacOS/Microsoft Excel"));
     xpc_dictionary_set_bool(reply, "powerpoint_available", HasExecutableFileMode(
         "/var/mnt/rootfs/Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint"));
+    xpc_dictionary_set_bool(reply, "weather_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/System/Applications/Weather.app/Contents/MacOS/Weather"));
+    xpc_dictionary_set_bool(reply, "sublime_available", HasExecutableFileMode(
+        "/var/mnt/rootfs/Applications/Sublime Text.app/Contents/MacOS/sublime_text"));
+    xpc_dictionary_set_bool(reply, "steam_available",
+        access(kSteamPlist, R_OK) == 0 &&
+        (HasExecutableFileMode(
+             "/var/mnt/rootfs/Applications/Steam.app/Contents/MacOS/steam_osx") ||
+         HasExecutableFileMode(
+             "/var/mnt/rootfs/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_osx")));
     xpc_dictionary_set_bool(reply, "asphalt_available", HasExecutableFileMode(
         "/var/mnt/rootfs/Applications/Asphalt.app/Contents/MacOS/Asphalt"));
 }
@@ -751,7 +1026,10 @@ static BOOL StartGUI(BOOL experimental, NSString **message) {
     SetState(YES, @"检查并修复启动环境…", @"");
     const char *startArgv[] = {kBash, kGUI, "start", "coexist",
                                "--no-terminal", "--no-vnc", NULL};
-    int rc = RunCommand(startArgv, YES);
+    int startupLogFD = open(kStartupLogPath,
+                            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (startupLogFD >= 0) close(startupLogFD);
+    int rc = RunCommandToLog(startArgv, YES, kStartupLogPath);
     if (rc != 0) {
         *message = [NSString stringWithFormat:@"GUI 启动脚本失败（退出码 %d）", rc];
         return NO;
@@ -831,6 +1109,7 @@ static const AllowedApp kAllowedApps[] = {
     {"word", "/Applications/Microsoft Word.app/Contents/MacOS/Microsoft Word", "/var/mobile/Library/Logs/MicrosoftWord.host.log"},
     {"excel", "/Applications/Microsoft Excel.app/Contents/MacOS/Microsoft Excel", "/var/mobile/Library/Logs/MicrosoftExcel.host.log"},
     {"powerpoint", "/Applications/Microsoft PowerPoint.app/Contents/MacOS/Microsoft PowerPoint", "/var/mobile/Library/Logs/MicrosoftPowerPoint.host.log"},
+    {"sublime", "/Applications/Sublime Text.app/Contents/MacOS/sublime_text", "/var/mobile/Library/Logs/SublimeText.host.log"},
 };
 
 static BOOL IsThirdPartyAppIdentifier(const char *identifier) {
@@ -838,7 +1117,8 @@ static BOOL IsThirdPartyAppIdentifier(const char *identifier) {
         (strcmp(identifier, "amadine") == 0 ||
          strcmp(identifier, "word") == 0 ||
          strcmp(identifier, "excel") == 0 ||
-         strcmp(identifier, "powerpoint") == 0);
+         strcmp(identifier, "powerpoint") == 0 ||
+         strcmp(identifier, "sublime") == 0);
 }
 
 // A native Host launch is complete when AppInputBridge has published at least
@@ -1774,17 +2054,24 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
 // Data Protection Keychain session. This is the same upstream
 // UIKit/FrontBoard ancestry that runtime-confirmed the native AGX drawable,
 // not a bare chroot spawn or a second black UIKit scene.
-static BOOL LaunchAsphaltViaUIKitCarrier(NSString **message) {
-    NSString *rootPath = @(kAsphaltExecutable);
+static BOOL LaunchCatalystViaUIKitCarrier(const char *identifier,
+                                          const char *displayName,
+                                          const char *executable,
+                                          const char *bundleIdentifier,
+                                          const char *containerHome,
+                                          NSString **message) {
+    NSString *rootPath = @(executable);
     NSString *hostPath = [@(kRootFS) stringByAppendingString:rootPath];
-    NSString *hostContainer = [@(kRootFS)
-        stringByAppendingString:@"/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data"];
+    NSString *hostContainer = [@(kRootFS) stringByAppendingString:@(containerHome)];
+    NSString *name = @(displayName);
+    if (!EnsureCatalystContainer(containerHome, message)) return NO;
     struct stat containerStatus = {0};
     if (!HasExecutableFileMode(hostPath.fileSystemRepresentation) ||
         stat(hostContainer.fileSystemRepresentation, &containerStatus) != 0 ||
         !S_ISDIR(containerStatus.st_mode) ||
         access(kUIKitSystemPlist, R_OK) != 0) {
-        *message = @"Asphalt 的可执行文件、容器或 Catalyst 服务不完整";
+        *message = [NSString stringWithFormat:
+            @"%@ 的可执行文件、容器或 Catalyst 服务不完整", name];
         return NO;
     }
     if (!JobHasPID(kWindowServerLabel, NULL) ||
@@ -1808,57 +2095,76 @@ static BOOL LaunchAsphaltViaUIKitCarrier(NSString **message) {
         uikitSystemPID = WaitForRunningRootExecutable(
             @(kUIKitSystemExecutable), 8.0);
         if (uikitSystemPID <= 1) {
-            *message = @"UIKitSystem 未能完成 Asphalt 场景服务启动";
+            *message = [NSString stringWithFormat:
+                @"UIKitSystem 未能完成 %@ 场景服务启动", name];
             return NO;
         }
     }
 
-    pid_t asphaltPID = FindRunningRootExecutable(rootPath);
-    if (asphaltPID > 1) {
+    pid_t catalystPID = FindRunningRootExecutable(rootPath);
+    if (catalystPID > 1) {
         BOOL exactCarrier = CatalystChildMarkerMatches(
-            asphaltPID, kAsphaltExecutable, kAsphaltBundleIdentifier);
-        if (exactCarrier && RequestApplicationReopen(asphaltPID, 8.0)) {
+            catalystPID, executable, bundleIdentifier);
+        if (exactCarrier && RequestApplicationReopen(catalystPID, 8.0)) {
             os_unfair_lock_lock(&gStateLock);
-            gActiveAppPID = asphaltPID;
-            gActiveAppID = @"asphalt";
+            gActiveAppPID = catalystPID;
+            gActiveAppID = @(identifier);
             os_unfair_lock_unlock(&gStateLock);
-            *message = @"Asphalt 已在当前 MacWSHost 工作区运行";
+            *message = [NSString stringWithFormat:
+                @"%@ 已在当前 macPad 工作区运行", name];
             return YES;
         }
-        if (!TerminateWindowlessRootExecutable(asphaltPID, rootPath, message))
+        if (!TerminateWindowlessRootExecutable(catalystPID, rootPath, message))
             return NO;
     }
+
+    if (strcmp(identifier, "weather") == 0 &&
+        !RotateWeatherKnownSceneSessions(message)) return NO;
 
     RetireLegacyMapsUIKitCarrier();
     if (!WriteCatalystLaunchRequest(
-            kAsphaltExecutable, kAsphaltBundleIdentifier,
-            kAsphaltContainerHome, message)) return NO;
+            executable, bundleIdentifier, containerHome, message)) return NO;
     CFNotificationCenterPostNotification(
         CFNotificationCenterGetDarwinNotifyCenter(),
         kCatalystHostLaunchNotification, NULL, NULL, true);
-    asphaltPID = WaitForRunningRootExecutable(rootPath, 5.0);
+    catalystPID = WaitForRunningRootExecutable(rootPath, 5.0);
     unlink(kCatalystRequestPath);
-    if (asphaltPID <= 1) {
-        *message = @"MacWSHost 未能在当前工作区启动 Asphalt";
+    if (catalystPID <= 1) {
+        *message = [NSString stringWithFormat:
+            @"macPad 未能在当前工作区启动 %@", name];
         return NO;
     }
     if (!CatalystChildMarkerMatches(
-            asphaltPID, kAsphaltExecutable, kAsphaltBundleIdentifier)) {
+            catalystPID, executable, bundleIdentifier)) {
         NSString *retireMessage = nil;
         (void)TerminateWindowlessRootExecutable(
-            asphaltPID, rootPath, &retireMessage);
-        *message = @"Asphalt 进程缺少匹配的 Host Catalyst 身份，已拒绝";
+            catalystPID, rootPath, &retireMessage);
+        *message = [NSString stringWithFormat:
+            @"%@ 进程缺少匹配的 Host Catalyst 身份，已拒绝", name];
         return NO;
     }
     os_unfair_lock_lock(&gStateLock);
-    gActiveAppPID = asphaltPID;
-    gActiveAppID = @"asphalt";
+    gActiveAppPID = catalystPID;
+    gActiveAppID = @(identifier);
     os_unfair_lock_unlock(&gStateLock);
-    HostLog(@"launch-app process-ready id=asphalt pid=%d uikitsystem=%d "
+    HostLog(@"launch-app process-ready id=%s pid=%d uikitsystem=%d "
             "route=existing-MacWSHost catalog=asynchronous",
-            asphaltPID, uikitSystemPID);
-    *message = @"Asphalt 正在当前工作区打开，未创建新的 iPadOS 窗口";
+            identifier, catalystPID, uikitSystemPID);
+    *message = [NSString stringWithFormat:
+        @"%@ 正在当前工作区打开，未创建新的 iPadOS 窗口", name];
     return YES;
+}
+
+static BOOL LaunchAsphaltViaUIKitCarrier(NSString **message) {
+    return LaunchCatalystViaUIKitCarrier(
+        "asphalt", "Asphalt", kAsphaltExecutable,
+        kAsphaltBundleIdentifier, kAsphaltContainerHome, message);
+}
+
+static BOOL LaunchWeatherViaUIKitCarrier(NSString **message) {
+    return LaunchCatalystViaUIKitCarrier(
+        "weather", "天气", kWeatherExecutable,
+        kWeatherBundleIdentifier, kWeatherContainerHome, message);
 }
 
 static BOOL LaunchVSCode(NSString **message) {
@@ -1971,6 +2277,71 @@ static BOOL LaunchVSCode(NSString **message) {
     }
     HostLog(@"launch-app window-ready id=vscode pid=%d path=DisplayStream", pid);
     *message = @"VS Code 已通过生产 AGX/JIT 配置启动，窗口已进入列表";
+    return YES;
+}
+
+static pid_t FindRunningSteamExecutable(void) {
+    pid_t pid = FindRunningRootExecutable(@(kSteamLiveExecutable));
+    return pid > 1 ? pid : FindRunningRootExecutable(@(kSteamOuterExecutable));
+}
+
+static BOOL LaunchSteam(NSString **message) {
+    NSString *outerHostPath = [@(kRootFS)
+        stringByAppendingString:@(kSteamOuterExecutable)];
+    NSString *liveHostPath = [@(kRootFS)
+        stringByAppendingString:@(kSteamLiveExecutable)];
+    if (access(kSteamPlist, R_OK) != 0 ||
+        (!HasExecutableFileMode(outerHostPath.fileSystemRepresentation) &&
+         !HasExecutableFileMode(liveHostPath.fileSystemRepresentation))) {
+        *message = @"Steam 或其生产运行任务不存在";
+        return NO;
+    }
+    if (!JobHasPID(kWindowServerLabel, NULL) ||
+        !JobHasPID(kDisplayLabel, NULL)) {
+        *message = @"请先启动 macOS GUI 与 DisplayStream";
+        return NO;
+    }
+
+    pid_t steamPID = FindRunningSteamExecutable();
+    if (steamPID > 1) {
+        (void)RequestApplicationReopen(steamPID, 1.0);
+        os_unfair_lock_lock(&gStateLock);
+        gActiveAppPID = steamPID;
+        gActiveAppID = @"steam";
+        os_unfair_lock_unlock(&gStateLock);
+        *message = @"Steam 已在运行，正在打开现有窗口";
+        return YES;
+    }
+
+    int jobPID = 0;
+    BOOL jobLoaded = NO;
+    (void)InspectJob(kSteamLabel, &jobPID, &jobLoaded);
+    const char *startArgv[] = {kLaunchctl, "start", kSteamLabel, NULL};
+    const char *loadArgv[] = {kLaunchctl, "load", kSteamPlist, NULL};
+    int launchResult = jobLoaded
+        ? RunCommand(startArgv, YES) : RunCommand(loadArgv, YES);
+    if (launchResult != 0) {
+        *message = [NSString stringWithFormat:
+            @"Steam 生产任务启动失败（退出码 %d）", launchResult];
+        return NO;
+    }
+    NSTimeInterval deadline = NSDate.date.timeIntervalSince1970 + 20.0;
+    do {
+        steamPID = FindRunningSteamExecutable();
+        if (steamPID > 1) break;
+        usleep(100000);
+    } while (NSDate.date.timeIntervalSince1970 < deadline);
+    if (steamPID <= 1) {
+        *message = @"Steam 生产任务已提交，但 20 秒内没有取得 steam_osx 进程";
+        return NO;
+    }
+    os_unfair_lock_lock(&gStateLock);
+    gActiveAppPID = steamPID;
+    gActiveAppID = @"steam";
+    os_unfair_lock_unlock(&gStateLock);
+    HostLog(@"launch-app process-ready id=steam pid=%d label=%s",
+            steamPID, kSteamLabel);
+    *message = @"Steam 正在通过生产运行任务打开";
     return YES;
 }
 
@@ -2298,6 +2669,11 @@ static BOOL LaunchRequestedPath(const char *requestedPath, NSString **message) {
         return LaunchAllowedApp("vscode", message);
     if ([rootPath isEqualToString:@(kAsphaltExecutable)])
         return LaunchAllowedApp("asphalt", message);
+    if ([rootPath isEqualToString:@(kWeatherExecutable)])
+        return LaunchAllowedApp("weather", message);
+    if ([rootPath isEqualToString:@(kSteamOuterExecutable)] ||
+        [rootPath isEqualToString:@(kSteamLiveExecutable)])
+        return LaunchAllowedApp("steam", message);
     for (NSUInteger index = 0;
          index < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); index++) {
         if ([rootPath isEqualToString:@(kAllowedApps[index].rootPath)])
@@ -2312,6 +2688,10 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         return LaunchVSCode(message);
     if (identifier && strcmp(identifier, "maps") == 0)
         return LaunchMapsViaUIKitCarrier(message);
+    if (identifier && strcmp(identifier, "weather") == 0)
+        return LaunchWeatherViaUIKitCarrier(message);
+    if (identifier && strcmp(identifier, "steam") == 0)
+        return LaunchSteam(message);
     if (identifier && strcmp(identifier, "asphalt") == 0)
         return LaunchAsphaltViaUIKitCarrier(message);
     const AllowedApp *app = NULL;
@@ -3402,8 +3782,17 @@ static void ServeRequest(xpc_object_t request) {
         BOOL ok = NO;
         pid_t launchedAppPID = 0;
         if (strcmp(op, MACWS_CONTROL_OP_START) == 0) {
+            os_unfair_lock_lock(&gStateLock);
+            gStartupOperationActive = YES;
+            gStartupRetryAvailable = NO;
+            gStartupBeganAt = time(NULL);
+            os_unfair_lock_unlock(&gStateLock);
             BOOL experimental = xpc_dictionary_get_bool(request, MACWS_CONTROL_KEY_EXPERIMENTAL);
             ok = StartGUI(experimental, &message);
+            os_unfair_lock_lock(&gStateLock);
+            gStartupOperationActive = NO;
+            gStartupRetryAvailable = !ok;
+            os_unfair_lock_unlock(&gStateLock);
         } else if (strcmp(op, MACWS_CONTROL_OP_STOP) == 0) {
             SetState(YES, @"停止 macOS GUI…", @"");
             ok = StopGUI(&message);

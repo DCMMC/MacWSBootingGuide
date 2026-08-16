@@ -1861,6 +1861,7 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindKeyUp:
         case MacWSInputKindScroll:
         case MacWSInputKindMagnify:
+        case MacWSInputKindRotate:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
@@ -2309,11 +2310,13 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
             fabsf(record->pressure) > 16384.0f ||
             fabsf(horizontal) > 16384.0f) return NO;
     }
-    if (record->kind == MacWSInputKindMagnify) {
+    if (record->kind == MacWSInputKindMagnify ||
+        record->kind == MacWSInputKindRotate) {
         uint16_t phase = record->flags &
             (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
              MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
-        if (!isfinite(record->pressure) || fabsf(record->pressure) > 4.0f ||
+        float limit = record->kind == MacWSInputKindRotate ? 720.0f : 4.0f;
+        if (!isfinite(record->pressure) || fabsf(record->pressure) > limit ||
             (phase != MacWSInputFlagGestureBegan &&
              phase != MacWSInputFlagGestureChanged &&
              phase != MacWSInputFlagGestureEnded &&
@@ -2338,7 +2341,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     return
         record->version == MACWS_INPUT_VERSION &&
         record->kind >= MacWSInputKindTouchDown &&
-        record->kind <= MacWSInputKindSystemGesture &&
+        record->kind <= MacWSInputKindRotate &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -2503,7 +2506,7 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
 //     exported and returns the real 0xf8-byte record.
 // This is target-private ABI encoding, not a check bypass: the resulting
 // NSEvent is validated for both type and magnification before NSWindow sees it.
-static id MacWSCreateAppMagnifyEvent(Class eventClass,
+static id MacWSCreateAppGestureEvent(Class eventClass,
                                      MacWSInputRecord record,
                                      id window,
                                      CGPoint windowPoint,
@@ -2559,14 +2562,20 @@ static id MacWSCreateAppMagnifyEvent(Class eventClass,
     // Changed/Ended samples from that same event family. Keep type 30 for the
     // complete lifecycle; phase, not a separate event type, is the state
     // machine used by native magnification.
-    int64_t gestureKind = 8;
+    // The checked-in IOKit IOHIDEventTypes.h defines Rotation=5 and Zoom=8.
+    // Rotation's scalar is only admitted after the actual Ventura NSEvent
+    // wrapper below round-trips it as type 18 and -rotation; a mismatched
+    // private layout therefore fails closed instead of reaching NSWindow.
+    BOOL rotation = record.kind == MacWSInputKindRotate;
+    int64_t gestureKind = rotation ? 5 : 8;
 
     MacWSCGEventRef cgEvent = createEvent(NULL);
     if (!cgEvent) return nil;
     setType(cgEvent, cgGestureType);
     setInteger(cgEvent, gestureKindField, gestureKind);
     setInteger(cgEvent, gestureIdentityField,
-               record.contactID ? record.contactID : 0x50494e43u);
+               record.contactID ? record.contactID :
+                   (rotation ? 0x524f5441u : 0x50494e43u));
     setInteger(cgEvent, gesturePhaseField, (int64_t)phase);
     if (windowNumber > 0) {
         setInteger(cgEvent, 91, windowNumber);
@@ -2601,10 +2610,10 @@ static id MacWSCreateAppMagnifyEvent(Class eventClass,
     if (!event) return nil;
     NSUInteger eventType = ((MacWSMsgUInteger)objc_msgSend)(
         event, sel_registerName("type"));
-    NSUInteger expectedType = 30;
+    NSUInteger expectedType = rotation ? 18 : 30;
     if (eventType != expectedType) return nil;
     double observed = ((MacWSMsgDouble)objc_msgSend)(
-        event, sel_registerName("magnification"));
+        event, sel_registerName(rotation ? "rotation" : "magnification"));
     if (!isfinite(observed) || fabs(observed - encodedAmount) > 0.0005)
         return nil;
     // `eventWithCGEvent:` in this macOS-on-iOS runtime does not import CG
@@ -5694,6 +5703,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
          (record.kind == MacWSInputKindScroll &&
           !(record.flags & MacWSInputFlagScrollBegan)) ||
          (record.kind == MacWSInputKindMagnify &&
+          !(record.flags & MacWSInputFlagGestureBegan)) ||
+         (record.kind == MacWSInputKindRotate &&
           !(record.flags & MacWSInputFlagGestureBegan)));
     BOOL reusedGestureRoute = requestedWindowNumber != 0 &&
         exactGestureContinuation && MacWSAppInputGestureBaseWindow &&
@@ -5904,6 +5915,8 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         (record.kind == MacWSInputKindScroll &&
          (record.flags & MacWSInputFlagScrollBegan)) ||
         (record.kind == MacWSInputKindMagnify &&
+         (record.flags & MacWSInputFlagGestureBegan)) ||
+        (record.kind == MacWSInputKindRotate &&
          (record.flags & MacWSInputFlagGestureBegan));
     if (requestedBaseWindow && beginsContinuousGesture) {
         MacWSSetAppInputGestureRoute(requestedBaseWindow, window,
@@ -6070,6 +6083,9 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                               MacWSInputFlagScrollCancelled))) ||
             (record.kind == MacWSInputKindMagnify &&
              (record.flags & (MacWSInputFlagGestureEnded |
+                              MacWSInputFlagGestureCancelled))) ||
+            (record.kind == MacWSInputKindRotate &&
+             (record.flags & (MacWSInputFlagGestureEnded |
                               MacWSInputFlagGestureCancelled))))
             MacWSSetAppInputGestureWindow(nil);
         MacWSClearDeferredRFBMoveEvents();
@@ -6172,15 +6188,18 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         }
         return;
     }
-    if (record.kind == MacWSInputKindMagnify) {
-        id gestureEvent = MacWSCreateAppMagnifyEvent(
+    if (record.kind == MacWSInputKindMagnify ||
+        record.kind == MacWSInputKindRotate) {
+        BOOL rotation = record.kind == MacWSInputKindRotate;
+        id gestureEvent = MacWSCreateAppGestureEvent(
             eventClass, record, window, windowPoint, screenFrame,
             windowNumber);
         if (!gestureEvent) {
             fprintf(stderr,
-                "#### APP-INPUT DROP pid=%d reason=magnify-event-create "
+                "#### APP-INPUT DROP pid=%d reason=%s-event-create "
                 "window=%ld phase=%#x amount=%.6f\n",
-                getpid(), (long)windowNumber, record.flags,
+                getpid(), rotation ? "rotate" : "magnify",
+                (long)windowNumber, record.flags,
                 record.pressure);
             return;
         }
@@ -6211,10 +6230,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             MacWSSetAppInputGestureWindow(nil);
         if (MacWSRuntimeDiagnosticsEnabled()) {
             fprintf(stderr,
-                "#### APP-INPUT MAGNIFY-DISPATCH pid=%d target-window=%ld "
+                "#### APP-INPUT %s-DISPATCH pid=%d target-window=%ld "
                 "event-window=%ld type=%lu phase=%#x amount=%.6f "
                 "route=NSWindow._reallySendEvent\n",
-                getpid(), (long)windowNumber,
+                rotation ? "ROTATE" : "MAGNIFY", getpid(),
+                (long)windowNumber,
                 (long)((MacWSMsgInteger)objc_msgSend)(
                     gestureEvent, sel_registerName("windowNumber")),
                 (unsigned long)((MacWSMsgUInteger)objc_msgSend)(
@@ -6819,6 +6839,7 @@ static void MacWSEnqueueAppInputRecord(MacWSInputRecord record) {
                         candidate.kind == MacWSInputKindMenuHover ||
                         candidate.kind == MacWSInputKindScroll ||
                         candidate.kind == MacWSInputKindMagnify ||
+                        candidate.kind == MacWSInputKindRotate ||
                         candidate.kind == MacWSInputKindConfigureWindow) {
                         removable = index;
                         break;

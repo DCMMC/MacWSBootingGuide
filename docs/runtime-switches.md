@@ -87,18 +87,20 @@ variables. `MallocScribble` is explicitly forbidden.
   plane, keeping video in the AGX-composited scanout captured by MacWS/VNC.
   The exact adapter writes that real field using a verified two-instruction
   dataflow rewrite; it does not install a per-frame function trampoline.
-- Steam's on-demand job enables the native-AGX application contract
-  (`MACWS_AGX_NATIVE=1`, `MACWS_AGX_REGISTER_CLASSES=1`,
-  `MACWS_PIN_FALLBACK=1`), `MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT=1`, plus
-  the same production W^X adapters used by Chromium. Valve's supported
-  `-cef-force-gpu` switch keeps the client shell on native Metal as well as
-  ensuring games inherit AGX. The retired `-cef-disable-gpu` launch policy
-  still created a CEF gpu-process and, during animated download progress,
-  that process reached 600,180 resident 16-KiB pages before Jetsam reported
+- Steam's on-demand job defaults to the download-first CPU UI profile:
+  `MACWS_STEAM_CPU_RENDERING=1` and Valve's supported `-cef-disable-gpu`
+  switch. At the exact top-level Steam Helper spawn, the process adapter also
+  adds Chromium's `--disable-software-rasterizer`,
+  `--disable-gpu-rasterization` and `--disable-zero-copy`; games and unrelated
+  processes are untouched. This preserves the functionally reliable CPU page
+  compositor without allowing the separate SwiftShader/GPU raster path that,
+  during an earlier animated download, reached 600,180 resident 16-KiB pages
+  before Jetsam reported
   `vm-compressor-space-shortage`. Minidumps then establish that its native
   GPU child was being killed while Crashpad attempted to send the hard-
   immovable task port, after which CEF selected SwiftShader. The exact owner
-  of every page in the 9.16-GiB footprint remains unproven. The iOS kernel
+  of every page in the 9.16-GiB footprint remains unproven. Native AGX remains
+  a separately validated opt-in profile, not the default download UI. The iOS kernel
   returns `ENOSYS` for CEF 126's `__sandbox_ms("AMFI", 0x60, ...)` query even
   though task ports are hard-immovable; the exact compatibility result makes
   Chromium use its native no-task-port path. Valve's top-level browser and its

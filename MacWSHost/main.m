@@ -84,6 +84,49 @@ static NSString *const MacWSFullscreenRequestPrefix =
     @"com.macwsguide.windowing.fullscreen-request.";
 static NSString *const MacWSResizeRequestPrefix =
     @"com.macwsguide.windowing.resize-request.";
+static NSString *const MacWSControlCenterLanguageDefaultsKey =
+    @"MacWSControlCenterLanguage";
+
+static BOOL MacWSControlCenterUsesEnglish(void) {
+    return [[NSUserDefaults.standardUserDefaults
+        stringForKey:MacWSControlCenterLanguageDefaultsKey]
+        isEqualToString:@"en"];
+}
+
+static NSString *MacWSLocalized(NSString *chinese, NSString *english) {
+    return MacWSControlCenterUsesEnglish() ? english : chinese;
+}
+
+static NSString *MacWSLocalizedPhase(NSString *phase) {
+    if (!MacWSControlCenterUsesEnglish() || phase.length == 0) return phase;
+    static NSDictionary<NSString *, NSString *> *translations;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        translations = @{
+            @"就绪": @"Ready",
+            @"操作失败": @"Operation Failed",
+            @"检查并修复启动环境…": @"Checking and repairing the environment…",
+            @"等待 WindowServer、触控与窗口流…": @"Waiting for WindowServer, touch, and window streaming…",
+            @"停止 macOS GUI…": @"Stopping the macOS GUI…",
+            @"停止工作区并修复启动环境…": @"Stopping and repairing the workspace…",
+            @"重新签名并恢复信任缓存…": @"Re-signing and restoring the trust cache…",
+            @"执行安全恢复…": @"Running safe recovery…",
+            @"启动 macOS 应用…": @"Launching a macOS app…",
+            @"启动 macOS 路径…": @"Launching a macOS path…",
+            @"请求刷新共享帧…": @"Requesting a display refresh…",
+            @"安全保护已触发": @"Safety protection triggered",
+            @"正在生成启动配置…": @"Generating startup configuration…",
+            @"正在清理旧的服务状态…": @"Cleaning previous service state…",
+            @"正在准备应用运行环境…": @"Preparing the application runtime…",
+            @"正在验证图形启动条件…": @"Validating graphics startup requirements…",
+            @"正在启动安全保护…": @"Starting safety protection…",
+            @"正在启动 macOS 系统服务…": @"Starting macOS system services…",
+            @"正在等待第一帧画面…": @"Waiting for the first frame…",
+            @"macOS 工作区已就绪": @"macOS workspace is ready",
+        };
+    });
+    return translations[phase] ?: phase;
+}
 
 @interface MacWSViewController : UIViewController
     <MacWSMetalViewStatusDelegate, MacWSInteropClientDelegate,
@@ -925,6 +968,20 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UILabel *_inputLabel;
     UILabel *_interopLabel;
     UILabel *_noticeLabel;
+    UILabel *_controlTitleLabel;
+    UILabel *_controlSubtitleLabel;
+    UILabel *_touchSectionLabel;
+    UILabel *_displaySectionLabel;
+    UILabel *_performanceSectionLabel;
+    UILabel *_applicationsSectionLabel;
+    UILabel *_interopSectionLabel;
+    UILabel *_zoomSectionLabel;
+    UILabel *_languageSectionLabel;
+    UILabel *_startupLogSectionLabel;
+    UILabel *_experimentalTitleLabel;
+    UILabel *_experimentalDetailLabel;
+    UILabel *_systemHUDTitleLabel;
+    UILabel *_systemHUDDetailLabel;
     UIButton *_primaryButton;
     UIButton *_repairButton;
     UIButton *_recoverButton;
@@ -938,6 +995,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UIButton *_importButton;
     UIButton *_macFilesButton;
     UIButton *_keyboardButton;
+    UIButton *_retryStartupButton;
     UITextField *_keyboardProxy;
     UIView *_softwareKeyBar;
     NSLayoutConstraint *_softwareKeyBarHeightConstraint;
@@ -950,6 +1008,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UISegmentedControl *_densityControl;
     UISegmentedControl *_zoomScaleControl;
     UISegmentedControl *_performanceHUDControl;
+    UISegmentedControl *_languageControl;
     UISwitch *_systemPerformanceHUDSwitch;
     UIButton *_performanceResetButton;
     UIButton *_performanceExportButton;
@@ -962,6 +1021,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     BOOL _experimentalTouched;
     uint64_t _inputLogSequence;
     NSString *_lastLoggedControlSummary;
+    NSString *_lastStartupLog;
     NSArray<MacWSStreamWindow *> *_streamWindows;
     NSArray<NSURL *> *_receivedMacOSFiles;
     int32_t _pendingFinderWindowPID;
@@ -1035,7 +1095,9 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     if (_menuBarButton) {
         [self setButton:_menuBarButton
                   title:fullscreen
-                      ? @"进入窗口模式" : @"打开全屏 macOS 工作区"
+                      ? MacWSLocalized(@"进入窗口模式", @"Enter Window Mode")
+                      : MacWSLocalized(@"打开全屏 macOS 工作区",
+                                       @"Open Full-Screen macOS Workspace")
                   image:fullscreen
                       ? @"arrow.down.right.and.arrow.up.left"
                       : @"arrow.up.left.and.arrow.down.right"];
@@ -1820,12 +1882,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     scroll.showsVerticalScrollIndicator = YES;
     [_controlPanel.contentView addSubview:scroll];
 
-    UILabel *title = MacWSMakeLabel(@"MacWS 控制中心",
+    _controlTitleLabel = MacWSMakeLabel(@"macPad 控制中心",
         [UIFont systemFontOfSize:23 weight:UIFontWeightBold], UIColor.labelColor);
-    UILabel *subtitle = MacWSMakeLabel(@"iPadOS 原生窗口 · macOS AGX 工作区",
+    _controlSubtitleLabel = MacWSMakeLabel(@"iPadOS 原生窗口 · macOS AGX 工作区",
         [UIFont preferredFontForTextStyle:UIFontTextStyleFootnote],
         UIColor.secondaryLabelColor);
-    UIStackView *titleLabels = [[UIStackView alloc] initWithArrangedSubviews:@[title, subtitle]];
+    UIStackView *titleLabels = [[UIStackView alloc]
+        initWithArrangedSubviews:@[_controlTitleLabel, _controlSubtitleLabel]];
     titleLabels.axis = UILayoutConstraintAxisVertical;
     titleLabels.spacing = 1;
 
@@ -1880,14 +1943,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                     action:@selector(primaryAction) prominent:YES];
     [_primaryButton.heightAnchor constraintGreaterThanOrEqualToConstant:48].active = YES;
 
-    UILabel *experimentalText = MacWSMakeLabel(@"实验兼容模式",
+    _experimentalTitleLabel = MacWSMakeLabel(@"实验兼容模式",
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline], UIColor.labelColor);
-    UILabel *experimentalDetail = MacWSMakeLabel(
+    _experimentalDetailLabel = MacWSMakeLabel(
         @"启用命令 ABI / completion 诊断脚手架；受 5 分钟与高 CPU 热保护，不是根因修复。",
         [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
         UIColor.systemOrangeColor);
     UIStackView *experimentalLabels = [[UIStackView alloc]
-        initWithArrangedSubviews:@[experimentalText, experimentalDetail]];
+        initWithArrangedSubviews:@[_experimentalTitleLabel,
+                                   _experimentalDetailLabel]];
     experimentalLabels.axis = UILayoutConstraintAxisVertical;
     experimentalLabels.spacing = 2;
     _experimentalSwitch = [UISwitch new];
@@ -1940,27 +2004,40 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                                           action:@selector(launchApplication:)
                                        prominent:NO];
     powerpoint.accessibilityIdentifier = @"powerpoint";
-    UIButton *asphalt = [self buttonWithTitle:@"Asphalt"
-                                        image:@"flag.checkered"
+    UIButton *steam = [self buttonWithTitle:@"Steam"
+                                      image:@"gamecontroller"
+                                     action:@selector(launchApplication:)
+                                  prominent:NO];
+    steam.accessibilityIdentifier = @"steam";
+    UIButton *weather = [self buttonWithTitle:@"天气"
+                                        image:@"cloud.sun"
                                        action:@selector(launchApplication:)
                                     prominent:NO];
-    asphalt.accessibilityIdentifier = @"asphalt";
+    weather.accessibilityIdentifier = @"weather";
+    UIButton *sublime = [self buttonWithTitle:@"Sublime Text"
+                                        image:@"chevron.left.forwardslash.chevron.right"
+                                       action:@selector(launchApplication:)
+                                    prominent:NO];
+    sublime.accessibilityIdentifier = @"sublime";
     _applicationButtons = @[
         glassDemo, terminal, activity, finder, vscode, settings, maps,
-        amadine, word, excel, powerpoint, asphalt,
+        weather, sublime, steam, amadine, word, excel, powerpoint,
     ];
     UIStackView *appRow1 = [[UIStackView alloc] initWithArrangedSubviews:@[glassDemo, terminal]];
     UIStackView *appRow2 = [[UIStackView alloc] initWithArrangedSubviews:@[activity, finder]];
     UIStackView *appRow3 = [[UIStackView alloc] initWithArrangedSubviews:@[vscode, settings]];
     UIStackView *appRow4 = [[UIStackView alloc] initWithArrangedSubviews:@[maps]];
     UIStackView *appRow5 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[amadine, word]];
+        initWithArrangedSubviews:@[weather, sublime]];
     UIStackView *appRow6 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[excel, powerpoint]];
+        initWithArrangedSubviews:@[steam, amadine]];
     UIStackView *appRow7 = [[UIStackView alloc]
-        initWithArrangedSubviews:@[asphalt]];
+        initWithArrangedSubviews:@[word, excel]];
+    UIStackView *appRow8 = [[UIStackView alloc]
+        initWithArrangedSubviews:@[powerpoint]];
     for (UIStackView *row in @[
-             appRow1, appRow2, appRow3, appRow4, appRow5, appRow6, appRow7]) {
+             appRow1, appRow2, appRow3, appRow4, appRow5, appRow6, appRow7,
+             appRow8]) {
         row.axis = UILayoutConstraintAxisHorizontal;
         row.distribution = UIStackViewDistributionFillEqually;
         row.spacing = 8;
@@ -2086,15 +2163,16 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         action:@selector(performanceHUDChanged:)
         forControlEvents:UIControlEventValueChanged];
 
-    UILabel *systemHUDTitle = MacWSMakeLabel(@"Apple 系统渲染 HUD",
+    _systemHUDTitleLabel = MacWSMakeLabel(@"Apple 系统渲染 HUD",
         [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline],
         UIColor.labelColor);
-    UILabel *systemHUDDetail = MacWSMakeLabel(
+    _systemHUDDetailLabel = MacWSMakeLabel(
         @"QuartzCore RenderServer 全系统 FPS / GPU / 卡顿视图",
         [UIFont preferredFontForTextStyle:UIFontTextStyleCaption1],
         UIColor.secondaryLabelColor);
     UIStackView *systemHUDLabels = [[UIStackView alloc]
-        initWithArrangedSubviews:@[systemHUDTitle, systemHUDDetail]];
+        initWithArrangedSubviews:@[_systemHUDTitleLabel,
+                                   _systemHUDDetailLabel]];
     systemHUDLabels.axis = UILayoutConstraintAxisVertical;
     systemHUDLabels.spacing = 2;
     _systemPerformanceHUDSwitch = [UISwitch new];
@@ -2150,25 +2228,48 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _logsView.layer.cornerRadius = 10;
     _logsView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
     _logsView.hidden = YES;
+    _logsView.accessibilityLabel = @"macPad 启动日志";
     [_logsView.heightAnchor constraintEqualToConstant:220].active = YES;
 
     // Interaction choices are the first controls a user needs. Detailed
     // subsystem rows and recovery/debug tools stay out of the production UI;
     // a compact readiness summary remains at the bottom.
+    _languageSectionLabel = [self sectionTitle:@"语言"];
+    _touchSectionLabel = [self sectionTitle:@"触摸方式"];
+    _displaySectionLabel = [self sectionTitle:@"显示密度"];
+    _performanceSectionLabel = [self sectionTitle:@"性能测量"];
+    _applicationsSectionLabel = [self sectionTitle:@"macOS 应用"];
+    _interopSectionLabel = [self sectionTitle:@"iOS / macOS 互操作"];
+    _zoomSectionLabel = [self sectionTitle:@"放大视角"];
+    _startupLogSectionLabel = [self sectionTitle:@"启动日志（实时）"];
+    _startupLogSectionLabel.hidden = YES;
+    _retryStartupButton = [self buttonWithTitle:@"重新尝试启动"
+        image:@"arrow.clockwise" action:@selector(retryStartupAction)
+        prominent:YES];
+    _retryStartupButton.hidden = YES;
+    _languageControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"中文", @"English"]];
+    _languageControl.selectedSegmentIndex =
+        MacWSControlCenterUsesEnglish() ? 1 : 0;
+    [_languageControl addTarget:self action:@selector(languageChanged:)
+               forControlEvents:UIControlEventValueChanged];
+
     UIStackView *content = [[UIStackView alloc] initWithArrangedSubviews:@[
         header,
-        [self sectionTitle:@"触摸方式"],
+        _languageSectionLabel,
+        _languageControl,
+        _touchSectionLabel,
         _inputModeControl,
-        [self sectionTitle:@"显示密度"],
+        _displaySectionLabel,
         _densityControl,
         _keyboardButton,
         _primaryButton,
-        [self sectionTitle:@"性能测量"],
+        _performanceSectionLabel,
         _performanceHUDControl,
         systemHUDRow,
         performanceActions,
         _performanceRunButton,
-        [self sectionTitle:@"macOS 应用"],
+        _applicationsSectionLabel,
         _appSearchField,
         appRow1,
         appRow2,
@@ -2177,13 +2278,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         appRow5,
         appRow6,
         appRow7,
+        appRow8,
         _windowPickerButton,
         _menuBarButton,
         _closeWindowButton,
-        [self sectionTitle:@"iOS / macOS 互操作"],
+        _interopSectionLabel,
         interopRow,
         _macFilesButton,
-        [self sectionTitle:@"放大视角"],
+        _zoomSectionLabel,
         _zoomScaleControl,
         _resetZoomButton,
         _noticeLabel,
@@ -2192,6 +2294,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _statusLabel,
         _inputLabel,
         _interopLabel,
+        _retryStartupButton,
+        _startupLogSectionLabel,
+        _logsView,
     ]];
     content.axis = UILayoutConstraintAxisVertical;
     content.spacing = 10;
@@ -2293,7 +2398,127 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _controlPanel.hidden = YES;
         _showControlsMaterial.hidden = NO;
     }
+    [self applyControlCenterLanguage];
     [self updateWorkspaceChrome];
+}
+
+- (void)languageChanged:(UISegmentedControl *)sender {
+    NSString *language = sender.selectedSegmentIndex == 1 ? @"en" : @"zh-Hans";
+    [NSUserDefaults.standardUserDefaults setObject:language
+        forKey:MacWSControlCenterLanguageDefaultsKey];
+    [self applyControlCenterLanguage];
+    [self updateWorkspaceChrome];
+    if (_latestStatus) [self applyStatus:_latestStatus];
+}
+
+- (void)applyControlCenterLanguage {
+    BOOL english = MacWSControlCenterUsesEnglish();
+    _controlTitleLabel.text = english ? @"macPad Control Center" : @"macPad 控制中心";
+    _controlSubtitleLabel.text = english
+        ? @"Native iPadOS windows · macOS AGX workspace"
+        : @"iPadOS 原生窗口 · macOS AGX 工作区";
+    _languageSectionLabel.text = (english ? @"LANGUAGE" : @"语言");
+    _touchSectionLabel.text = (english ? @"TOUCH MODE" : @"触摸方式");
+    _displaySectionLabel.text = (english ? @"DISPLAY DENSITY" : @"显示密度");
+    _performanceSectionLabel.text = (english ? @"PERFORMANCE" : @"性能测量");
+    _applicationsSectionLabel.text = (english ? @"MACOS APPS" : @"MACOS 应用");
+    _interopSectionLabel.text = (english ? @"IOS / MACOS INTEROP" : @"IOS / MACOS 互操作");
+    _zoomSectionLabel.text = (english ? @"ZOOM VIEW" : @"放大视角");
+    _startupLogSectionLabel.text = english
+        ? @"STARTUP LOG (LIVE)" : @"启动日志（实时）";
+    _experimentalTitleLabel.text = english ? @"Experimental Compatibility" : @"实验兼容模式";
+    _experimentalDetailLabel.text = english
+        ? @"Enables bounded command ABI/completion diagnostics; this is diagnostic scaffolding, not a root-cause fix."
+        : @"启用命令 ABI / completion 诊断脚手架；受 5 分钟与高 CPU 热保护，不是根因修复。";
+    _systemHUDTitleLabel.text = english ? @"Apple System Rendering HUD" : @"Apple 系统渲染 HUD";
+    _systemHUDDetailLabel.text = english
+        ? @"QuartzCore RenderServer system FPS / GPU / hitch view"
+        : @"QuartzCore RenderServer 全系统 FPS / GPU / 卡顿视图";
+
+    [_inputModeControl setTitle:(english ? @"Direct Touch" : @"直接触控")
+              forSegmentAtIndex:0];
+    [_inputModeControl setTitle:(english ? @"Precision Trackpad" : @"精确触控板")
+              forSegmentAtIndex:1];
+    NSArray *density = english
+        ? @[@"Pixel Match", @"Larger +10%", @"More Space +18%"]
+        : @[@"像素匹配", @"放大 +10%", @"更多空间 +18%"];
+    NSArray *hud = english ? @[@"Off", @"Compact", @"Full"]
+                           : @[@"关闭", @"简洁", @"完整"];
+    NSArray *zoom = english ? @[@"Two-Finger Double-Tap 1.5×",
+                                @"Two-Finger Double-Tap 2.0×"]
+                            : @[@"双指双击 1.5×", @"双指双击 2.0×"];
+    for (NSInteger index = 0; index < 3; index++) {
+        [_densityControl setTitle:density[(NSUInteger)index]
+                forSegmentAtIndex:index];
+        [_performanceHUDControl setTitle:hud[(NSUInteger)index]
+                forSegmentAtIndex:index];
+    }
+    for (NSInteger index = 0; index < 2; index++)
+        [_zoomScaleControl setTitle:zoom[(NSUInteger)index]
+                  forSegmentAtIndex:index];
+
+    NSDictionary<NSString *, NSArray<NSString *> *> *appTitles = @{
+        @"glassdemo": @[@"GlassDemo", @"GlassDemo"],
+        @"terminal": @[@"终端", @"Terminal"],
+        @"activity-monitor": @[@"活动监视器", @"Activity Monitor"],
+        @"finder": @[@"Finder", @"Finder"],
+        @"vscode": @[@"VS Code", @"VS Code"],
+        @"system-settings": @[@"系统设置", @"System Settings"],
+        @"maps": @[@"地图", @"Maps"],
+        @"weather": @[@"天气", @"Weather"],
+        @"sublime": @[@"Sublime Text", @"Sublime Text"],
+        @"steam": @[@"Steam", @"Steam"],
+        @"amadine": @[@"Amadine", @"Amadine"],
+        @"word": @[@"Word", @"Word"],
+        @"excel": @[@"Excel", @"Excel"],
+        @"powerpoint": @[@"PowerPoint", @"PowerPoint"],
+    };
+    for (UIButton *button in _applicationButtons) {
+        NSArray<NSString *> *titles = appTitles[button.accessibilityIdentifier];
+        if (!titles) continue;
+        UIButtonConfiguration *configuration = [button.configuration copy];
+        configuration.title = titles[english ? 1 : 0];
+        button.configuration = configuration;
+    }
+    _appSearchField.placeholder = english
+        ? @"Search apps or enter an absolute macOS path"
+        : @"搜索应用或输入 macOS 绝对路径";
+    [self setButton:_keyboardButton
+              title:english ? @"Open Software Keyboard" : @"打开虚拟键盘"
+              image:@"keyboard"];
+    [self setButton:_captureButton title:english ? @"Refresh Display" : @"刷新画面"
+              image:@"camera.viewfinder"];
+    [self setButton:_repairButton title:english ? @"Repair Environment" : @"修复环境"
+              image:@"wrench.and.screwdriver"];
+    [self setButton:_recoverButton title:english ? @"Safe Recovery" : @"安全恢复"
+              image:@"lifepreserver"];
+    [self setButton:_logsButton title:english ? @"View Logs" : @"查看日志"
+              image:@"doc.text.magnifyingglass"];
+    [self setButton:_exportButton title:english ? @"Export Diagnostics" : @"导出诊断"
+              image:@"square.and.arrow.up"];
+    [self setButton:_windowPickerButton title:english ? @"Open macOS Window" : @"打开 macOS 窗口"
+              image:@"macwindow.on.rectangle"];
+    [self setButton:_closeWindowButton title:english ? @"Close This macOS Window" : @"关闭此 macOS 窗口"
+              image:@"xmark.square"];
+    [self setButton:_clipboardButton title:english ? @"Sync Clipboard to macOS" : @"同步剪贴板到 macOS"
+              image:@"doc.on.clipboard"];
+    [self setButton:_importButton title:english ? @"Import Files to macOS" : @"导入文件到 macOS"
+              image:@"square.and.arrow.down.on.square"];
+    [self setButton:_macFilesButton title:english ? @"macOS Files" : @"macOS 文件"
+              image:@"arrow.up.doc"];
+    [self setButton:_performanceResetButton title:english ? @"Reset Timing" : @"重新计时"
+              image:@"stopwatch"];
+    [self setButton:_performanceExportButton title:english ? @"Export JSON" : @"导出 JSON"
+              image:@"square.and.arrow.up"];
+    [self setButton:_performanceRunButton title:english ? @"Run Touch / Gesture Regression" : @"运行标准触摸 / 手势回归"
+              image:@"hand.draw"];
+    [self setButton:_resetZoomButton title:english ? @"Exit Zoom View" : @"退出放大视角"
+              image:@"arrow.counterclockwise"];
+    [self setButton:_retryStartupButton
+              title:english ? @"Try Starting Again" : @"重新尝试启动"
+              image:@"arrow.clockwise"];
+    _showControlsButton.accessibilityLabel = english
+        ? @"macPad Control Center" : @"macPad 控制中心";
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -2381,6 +2606,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _densityControl.enabled = enabled;
     _zoomScaleControl.enabled = enabled;
     _resetZoomButton.enabled = enabled;
+    _retryStartupButton.enabled = enabled;
     for (UIButton *button in _applicationButtons) button.enabled = enabled;
 }
 
@@ -2505,6 +2731,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         identifier = @"activity-monitor";
     else if ([lower containsString:@"finder"])
         identifier = @"finder";
+    else if ([lower containsString:@"maps"] ||
+             [query containsString:@"地图"])
+        identifier = @"maps";
+    else if ([lower containsString:@"settings"] ||
+             [query containsString:@"设置"])
+        identifier = @"system-settings";
     else if ([lower containsString:@"amadine"])
         identifier = @"amadine";
     else if ([lower isEqualToString:@"word"] ||
@@ -2516,8 +2748,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     else if ([lower containsString:@"powerpoint"] ||
              [lower isEqualToString:@"ppt"])
         identifier = @"powerpoint";
-    else if ([lower containsString:@"asphalt"])
-        identifier = @"asphalt";
+    else if ([lower containsString:@"steam"])
+        identifier = @"steam";
+    else if ([lower containsString:@"weather"] ||
+             [query containsString:@"天气"])
+        identifier = @"weather";
+    else if ([lower containsString:@"sublime"])
+        identifier = @"sublime";
     [textField resignFirstResponder];
     if (identifier) {
         [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
@@ -2526,7 +2763,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self runOperation:@MACWS_CONTROL_OP_LAUNCH_PATH
                  arguments:@{@MACWS_CONTROL_KEY_APP_PATH: query}];
     } else {
-        [self setNotice:@"未找到应用；可搜索 Amadine、Office、Asphalt，或输入 / 开头的 macOS 绝对路径。"
+        [self setNotice:@"未找到应用；可搜索 Steam、天气、Sublime、Office，或输入 / 开头的 macOS 绝对路径。"
                  success:NO];
     }
     return NO;
@@ -2538,8 +2775,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _metalView.inputMode = mode;
     [NSUserDefaults.standardUserDefaults setInteger:mode forKey:@"MacWSInputMode"];
     _inputLabel.text = mode == MacWSHostInputModeTrackpad
-        ? @"输入：单指移动圆形指针，轻点单击，长按拖动，双指滚动/右击"
-        : @"输入：轻点单击、单指滑动滚动；长按后滑动拖动，长按释放右击";
+        ? MacWSLocalized(@"输入：单指移动圆形指针，轻点单击，长按拖动，双指滚动/右击",
+                         @"Input: move the circular pointer with one finger; tap, hold-drag, two-finger scroll/right-click")
+        : MacWSLocalized(@"输入：轻点单击、单指滑动滚动；长按后滑动拖动，长按释放右击",
+                         @"Input: tap to click, swipe to scroll; hold-drag, or hold and release to right-click");
 }
 
 - (void)densityChanged:(UISegmentedControl *)sender {
@@ -3273,6 +3512,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL ws = [status[@"windowserver_running"] boolValue];
     BOOL input = [status[@"input_running"] boolValue];
     BOOL frame = [status[@"frame_ready"] boolValue];
+    BOOL startupRetry = [status[@"startup_retry_available"] boolValue];
     BOOL legacyFramebuffer = MacWSLegacyFramebufferFallbackEnabled();
     BOOL renderableFrame = _metalView.hasDirectSurfaceFrame ||
         (legacyFramebuffer && frame);
@@ -3299,31 +3539,47 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _lastLoggedControlSummary = controlSummary;
         MacWSLog(@"control-status %@", controlSummary);
     }
-    _serviceLabel.text = connected ? @"● root 控制服务已连接" : @"● root 控制服务离线";
+    _serviceLabel.text = connected
+        ? MacWSLocalized(@"● root 控制服务已连接", @"● Root control service connected")
+        : MacWSLocalized(@"● root 控制服务离线", @"● Root control service offline");
     _serviceLabel.textColor = connected ? UIColor.systemGreenColor : UIColor.systemRedColor;
-    _phaseLabel.text = status[@"phase"] ?: status[@"message"] ?: @"等待状态";
-    _rootfsLabel.text = rootfs ? @"就绪" : @"缺失/未挂载";
+    NSString *rawPhase = status[@"phase"] ?: status[@"message"];
+    _phaseLabel.text = MacWSLocalizedPhase(rawPhase) ?:
+        MacWSLocalized(@"等待状态", @"Waiting for status");
+    _rootfsLabel.text = rootfs ? MacWSLocalized(@"就绪", @"Ready")
+                               : MacWSLocalized(@"缺失/未挂载", @"Missing / Unmounted");
     _rootfsLabel.textColor = rootfs ? UIColor.systemGreenColor : UIColor.systemRedColor;
     NSInteger wsPID = [status[@"windowserver_pid"] integerValue];
-    _windowServerLabel.text = ws ? [NSString stringWithFormat:@"运行中 · %ld", (long)wsPID] : @"已停止";
+    _windowServerLabel.text = ws
+        ? [NSString stringWithFormat:MacWSLocalized(@"运行中 · %ld", @"Running · %ld"),
+                                     (long)wsPID]
+        : MacWSLocalized(@"已停止", @"Stopped");
     _windowServerLabel.textColor = ws ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
     _bridgeLabel.text = input
         ? (targetPID > 1 && appInput
-            ? [NSString stringWithFormat:@"在线 · 目标 PID %d", targetPID]
+            ? [NSString stringWithFormat:MacWSLocalized(@"在线 · 目标 PID %d", @"Online · Target PID %d"), targetPID]
             : (fullscreenSystemRoute
-                ? @"在线 · 全桌面逐点命中"
-                : (targetPID > 1 ? @"在线 · 等待应用输入端点" : @"在线 · 等待应用")))
-        : @"离线";
+                ? MacWSLocalized(@"在线 · 全桌面逐点命中", @"Online · Desktop hit testing")
+                : (targetPID > 1
+                    ? MacWSLocalized(@"在线 · 等待应用输入端点", @"Online · Waiting for app input endpoint")
+                    : MacWSLocalized(@"在线 · 等待应用", @"Online · Waiting for app"))))
+        : MacWSLocalized(@"离线", @"Offline");
     _bridgeLabel.textColor = input ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
     if (_metalView.hasDirectSurfaceFrame) {
-        _frameLabel.text = @"DisplayStream · IOSurface";
-        _frameLabel.textColor = UIColor.systemGreenColor;
+        _frameLabel.text = _metalView.hasFinalCompositeFrame
+            ? MacWSLocalized(@"最终合成 · IOSurface", @"Final Composite · IOSurface")
+            : MacWSLocalized(@"窗口层合成 · IOSurface", @"Window-Layer Composite · IOSurface");
+        _frameLabel.textColor =
+            (_streamMode == MacWSStreamModeFullscreen &&
+             !_metalView.hasFinalCompositeFrame)
+                ? UIColor.systemOrangeColor : UIColor.systemGreenColor;
     } else if (legacyFramebuffer && frame) {
         _frameLabel.text = [NSString stringWithFormat:@"%@×%@",
                             status[@"frame_width"], status[@"frame_height"]];
         _frameLabel.textColor = UIColor.systemGreenColor;
     } else {
-        _frameLabel.text = @"等待 DisplayStream IOSurface 首帧";
+        _frameLabel.text = MacWSLocalized(@"等待 DisplayStream IOSurface 首帧",
+                                          @"Waiting for first DisplayStream IOSurface frame");
         _frameLabel.textColor = UIColor.systemOrangeColor;
     }
     if (!_experimentalTouched || ws) {
@@ -3347,31 +3603,51 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL inputReady = connected && ws && input && renderableFrame &&
         ((targetPID > 1 && appInput) || fullscreenSystemRoute);
     NSString *inputReason = nil;
-    if (!connected) inputReason = @"root 控制服务离线";
-    else if (!ws) inputReason = @"macOS 工作区已停止";
-    else if (!input) inputReason = @"触控桥离线";
-    else if (!renderableFrame) inputReason = @"等待 DisplayStream IOSurface 首帧";
+    if (!connected) inputReason = MacWSLocalized(@"root 控制服务离线", @"Root control service offline");
+    else if (!ws) inputReason = MacWSLocalized(@"macOS 工作区已停止", @"macOS workspace stopped");
+    else if (!input) inputReason = MacWSLocalized(@"触控桥离线", @"Touch bridge offline");
+    else if (!renderableFrame) inputReason = MacWSLocalized(@"等待 DisplayStream IOSurface 首帧", @"Waiting for first DisplayStream frame");
     else if (targetPID <= 1 && !fullscreenSystemRoute)
-        inputReason = @"等待该窗口的所属应用";
-    else if (!appInput) inputReason = @"目标应用输入端点尚未就绪";
+        inputReason = MacWSLocalized(@"等待该窗口的所属应用", @"Waiting for this window's app");
+    else if (!appInput) inputReason = MacWSLocalized(@"目标应用输入端点尚未就绪", @"Target app input endpoint is not ready");
     [_metalView setMacWSInputEnabled:inputReady reason:inputReason];
     _inputLabel.text = inputReady
-        ? @"触控：已就绪 · 直接点击或拖动 macOS 画面"
-        : [NSString stringWithFormat:@"触控：不可用 · %@",
-           inputReason ?: @"工作区未就绪"];
+        ? MacWSLocalized(@"触控：已就绪 · 直接点击或拖动 macOS 画面",
+                         @"Touch: Ready · Tap or drag the macOS display")
+        : [NSString stringWithFormat:MacWSLocalized(@"触控：不可用 · %@",
+                                                     @"Touch: Unavailable · %@"),
+           inputReason ?: MacWSLocalized(@"工作区未就绪", @"Workspace not ready")];
     _inputLabel.textColor = inputReady
         ? UIColor.systemGreenColor : UIColor.systemOrangeColor;
 
     [self setControlsEnabled:connected && !busy];
     if (busy) {
-        [self setButton:_primaryButton title:status[@"phase"] ?: @"处理中…"
+        [self setButton:_primaryButton title:MacWSControlCenterUsesEnglish()
+            ? @"Working…" : (status[@"phase"] ?: @"处理中…")
                    image:@"hourglass"];
     } else if (ws) {
-        [self setButton:_primaryButton title:@"停止 macOS" image:@"stop.fill"];
+        [self setButton:_primaryButton title:MacWSLocalized(@"停止 macOS", @"Stop macOS") image:@"stop.fill"];
+    } else if (startupRetry) {
+        [self setButton:_primaryButton
+                  title:MacWSLocalized(@"重新尝试启动", @"Try Starting Again")
+                  image:@"arrow.clockwise"];
     } else {
         [self setButton:_primaryButton
-                  title:rootfs ? @"启动 macOS 工作区" : @"初始化并启动"
+                  title:rootfs ? MacWSLocalized(@"启动 macOS 工作区", @"Start macOS Workspace")
+                               : MacWSLocalized(@"初始化并启动", @"Initialize and Start")
                   image:@"play.fill"];
+    }
+
+    NSString *startupLog = status[@"startup_log"] ?: @"";
+    BOOL showStartupLog = startupLog.length > 0 || startupRetry;
+    _startupLogSectionLabel.hidden = !showStartupLog;
+    _logsView.hidden = !showStartupLog;
+    _retryStartupButton.hidden = !startupRetry;
+    if (showStartupLog && startupLog.length &&
+        ![_lastStartupLog isEqualToString:startupLog]) {
+        _lastStartupLog = [startupLog copy];
+        _logsView.text = startupLog;
+        [_logsView scrollRangeToVisible:NSMakeRange(startupLog.length - 1, 1)];
     }
 
     NSDictionary<NSString *, NSString *> *availability = @{
@@ -3386,7 +3662,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         @"word": @"word_available",
         @"excel": @"excel_available",
         @"powerpoint": @"powerpoint_available",
-        @"asphalt": @"asphalt_available",
+        @"steam": @"steam_available",
+        @"weather": @"weather_available",
+        @"sublime": @"sublime_available",
     };
     for (UIButton *button in _applicationButtons) {
         BOOL available = [status[availability[button.accessibilityIdentifier]] boolValue];
@@ -3456,6 +3734,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self runOperation:@MACWS_CONTROL_OP_STOP arguments:nil];
     } else {
         [self setControlsEnabled:NO];
+        _retryStartupButton.hidden = YES;
+        _startupLogSectionLabel.hidden = NO;
+        _logsView.hidden = NO;
+        _lastStartupLog = MacWSLocalized(@"正在请求启动…", @"Requesting startup…");
+        _logsView.text = _lastStartupLog;
         [self setNotice:_experimentalSwitch.isOn
             ? @"正在用实验兼容模式启动；已启用 5 分钟与高 CPU 自动热保护。"
             : @"正在检查环境；重启后丢失的信任缓存会自动恢复。" success:YES];
@@ -3467,6 +3750,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 [self refreshStatus];
             }];
     }
+}
+
+- (void)retryStartupAction {
+    [self setNotice:MacWSLocalized(
+        @"正在重新执行启动检查；日志会在下方实时更新。",
+        @"Retrying startup checks; the live log will update below.")
+             success:YES];
+    [self primaryAction];
 }
 
 - (void)experimentalChanged:(UISwitch *)sender {
@@ -3567,7 +3858,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSURL *snapshot = [self writeHostUISnapshot];
     [_controlClient fetchLogs:^(NSDictionary<NSString *,id> *reply) {
         NSString *text = [NSString stringWithFormat:
-            @"MacWS Host diagnostics\n%@\n\n=== macwshostd ===\n%@\n\n=== WindowServer ===\n%@\n\n=== input ===\n%@\n\n=== postinst ===\n%@",
+            @"macPad diagnostics\n%@\n\n=== macwshostd ===\n%@\n\n=== WindowServer ===\n%@\n\n=== input ===\n%@\n\n=== postinst ===\n%@",
             self->_latestStatus ?: @{}, reply[@"hostd_log"] ?: @"",
             reply[@"windowserver_log"] ?: @"", reply[@"input_log"] ?: @"",
             reply[@"postinst_log"] ?: @""];
@@ -3607,6 +3898,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                [action isEqualToString:@"finder"] ||
                [action isEqualToString:@"system-settings"] ||
                [action isEqualToString:@"maps"] ||
+               [action isEqualToString:@"weather"] ||
+               [action isEqualToString:@"sublime"] ||
+               [action isEqualToString:@"steam"] ||
                [action isEqualToString:@"amadine"] ||
                [action isEqualToString:@"word"] ||
                [action isEqualToString:@"excel"] ||
@@ -4408,8 +4702,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     int32_t presentationTargetPID = record.targetPID;
     // Fullscreen pointer records become one hardware-style global stream in
     // routeFullscreenInputRecord:, leaving WindowServer authoritative for
-    // Dock/Mission Control transforms. Scroll and magnify still freeze the
-    // captured layer selected at Begin because those gestures belong to one
+    // Dock/Mission Control transforms. Scroll, magnify and rotation still
+    // freeze the captured layer selected at Begin because those gestures
+    // belong to one
     // application-local responder for their complete lifetime.
     if (_streamMode == MacWSStreamModeFullscreen &&
         record.kind != MacWSInputKindKeyDown &&
@@ -4436,6 +4731,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindSecondaryTap: phase = @"secondary"; break;
         case MacWSInputKindScroll: phase = @"scroll"; break;
         case MacWSInputKindMagnify: phase = @"magnify"; break;
+        case MacWSInputKindRotate: phase = @"rotate"; break;
         case MacWSInputKindDesktopCommand: phase = @"desktop-command"; break;
         case MacWSInputKindSystemGesture: phase = @"system-gesture"; break;
         case MacWSInputKindKeyDown: phase = @"key-down"; break;
@@ -4456,10 +4752,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                       record.kind == MacWSInputKindHover ||
                       record.kind == MacWSInputKindScroll ||
                       record.kind == MacWSInputKindMagnify ||
+                      record.kind == MacWSInputKindRotate ||
                       record.kind == MacWSInputKindSystemGesture;
     if (MacWSHostDiagnosticsEnabled() &&
         (!continuous || (_inputLogSequence % 60) == 0)) {
-        MacWSLog(@"input-v4 transport=%@ errno=%d scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",
+        MacWSLog(@"input-v5 transport=%@ errno=%d scene=%llx target=%d kind=%@ source=%u point=(%.2f,%.2f) frame=%ux%u pressure=%.3f contact=%u sample=%u seq=%llu",
                  sent ? @"sent" : @"failed", sendError, record.sceneID,
                  record.targetPID, phase, record.source, record.x, record.y,
                  record.frameWidth, record.frameHeight,
@@ -4997,7 +5294,7 @@ static void MacWSDeduplicateWindowScenes(void) {
                     [controller metalView:nil emittedInput:secondTap];
                 });
             }
-            MacWSLog(@"input-v4 synthetic kind=%@ routed-through-controller scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
+            MacWSLog(@"input-v5 synthetic kind=%@ routed-through-controller scene=%llx target=%d point=(%.2f,%.2f) frame=%ux%u",
                      requestedKind, record.sceneID, record.targetPID,
                      record.x, record.y, record.frameWidth,
                      record.frameHeight);
@@ -5024,7 +5321,8 @@ static void MacWSDeduplicateWindowScenes(void) {
         NSString *host = context.URL.host ?: @"status";
         if ([@[@"status", @"start", @"start-experimental", @"stop",
                @"glassdemo", @"terminal", @"vscode", @"activity-monitor", @"finder",
-               @"system-settings", @"maps", @"amadine", @"word", @"excel",
+               @"system-settings", @"maps", @"weather", @"sublime", @"steam",
+               @"amadine", @"word", @"excel",
                @"powerpoint", @"asphalt",
                @"recover", @"repair", @"capture",
                @"test-open-file", @"fullscreen",
