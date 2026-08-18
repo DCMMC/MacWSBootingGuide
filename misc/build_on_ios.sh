@@ -97,6 +97,24 @@ else
     echo "==> FAST invariant: refreshed all libmachook source mtimes"
 fi
 
+if [ "$FAST" != "1" ]; then
+    # The controller and MacWSMetalView are one Objective-C ABI even though
+    # Theos compiles them as independent translation units.  Source sync tools
+    # preserve the Mac's old mtimes; an on-device object can therefore be newer
+    # than newly copied source with different contents.  Runtime-confirmed on
+    # 2026-08-18: main.m called -hasFinalCompositeFrame while the packaged
+    # MacWSMetalView method table came from an older object and did not contain
+    # that selector, crashing macPad in -applyStatus: as soon as the first
+    # IOSurface arrived.  A normal clean build happened to repair it, but
+    # --resume could recreate the invalid mixed binary.  Refresh the complete
+    # Host ABI on every package build; this is deliberately narrower than
+    # throwing away successful objects for the much larger libmachook target.
+    find MacWSHost -type f \
+        \( -name '*.m' -o -name '*.mm' -o -name '*.c' -o -name '*.h' \) \
+        -exec touch {} +
+    echo "==> Host ABI invariant: refreshed all macPad source/header mtimes"
+fi
+
 echo "==> Building..."
 # Pass LIBMACHOOK_ON_DEVICE_BUILD=1 so libmachook/Makefile adds, for the
 # on-device lld only:
@@ -131,6 +149,29 @@ if [ "$FAST" = "1" ]; then
 else
     make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
         GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
+fi
+
+if [ "$FAST" != "1" ]; then
+    # Do not let packaging install another half-new/half-stale Host.  These
+    # selectors cross source-file boundaries and are exercised only after the
+    # display service publishes a frame, so link success alone is insufficient.
+    HOST_BINARY=$(find .theos/obj -type f \
+        -path '*/MacWSHost.app/MacWSHost' | head -1)
+    if [ -z "$HOST_BINARY" ] || [ ! -x "$HOST_BINARY" ]; then
+        echo "Error: built macPad binary not found for Objective-C ABI verification" >&2
+        exit 1
+    fi
+    for host_method in \
+        '-[MacWSMetalView hasDirectSurfaceFrame]' \
+        '-[MacWSMetalView hasFinalCompositeFrame]' \
+        '-[MacWSMetalView configureStreamMode:windowID:]' \
+        '-[MacWSViewController applyStatus:]'; do
+        if ! nm -nm "$HOST_BINARY" 2>/dev/null | grep -Fq -- "$host_method"; then
+            echo "Error: macPad Objective-C ABI contract missing $host_method" >&2
+            exit 1
+        fi
+    done
+    echo "==> Host ABI invariant: packaged selector contract verified"
 fi
 
 if [ "$FAST" = "1" ]; then

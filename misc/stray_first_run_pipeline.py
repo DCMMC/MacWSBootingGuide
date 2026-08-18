@@ -152,6 +152,25 @@ def largest_game_window(remote: Remote, pid: int, timeout: float):
     raise RuntimeError(f"no valid window catalog for Stray pid={pid}")
 
 
+def activate_game_window(remote: Remote, pid: int, window: dict) -> str:
+    """Activate the exact native window in an existing fullscreen workspace.
+
+    The pipeline launches Stray directly so Steam is not required to stay in
+    memory.  That intentionally bypasses macPad's normal launcher callback,
+    which otherwise activates the new catalog window.  Re-enter the same
+    public Scene URL used by displayd after the catalog has proved the exact
+    PID/window pair; in fullscreen mode macPad activates it in-place instead
+    of creating an iPadOS window.  This keeps VNC/Host visual witnesses bound
+    to the game rather than whichever AppKit window was focused before the
+    benchmark started.
+    """
+    window_id = int(window["window"])
+    url = f"macwshost://new?window={window_id}&pid={pid}&title=Stray"
+    output = remote.run(f"uiopen {shlex.quote(url)}", check=False).strip()
+    time.sleep(0.8)
+    return output or "requested"
+
+
 def game_window_bounds(remote: Remote, pid: int, window: int):
     """Return CGWindow's actual VNC-space bounds for one game window."""
     source = (
@@ -912,6 +931,9 @@ def main():
                     continue
                 entry["window"] = window
                 entry["windows"] = windows
+                entry["workspace_activation"] = activate_game_window(
+                    remote, pid, window
+                )
                 window_bounds = game_window_bounds(
                     remote, pid, window["window"]
                 )

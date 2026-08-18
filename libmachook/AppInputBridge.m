@@ -2784,6 +2784,100 @@ static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
     return postMouse;
 }
 
+// Ordinary AppKit and Electron windows accept the process-local precise pixel
+// NSEvent built below, preserving every native phase and sub-wheel-unit delta.
+// SwiftUI's hosting boundary is different on Ventura: runtime System Settings
+// evidence showed NSWindow.sendEvent: receiving the phased events while its
+// sidebar/content never produced another frame.  Its CGS-connected process
+// does respond to CGPostScrollWheelEvent, so reserve that coarse system route
+// for windows whose actual view-class ancestry comes from SwiftUI.framework.
+//
+// This is a framework-capability decision, not an application allow-list.  It
+// is cached per real NSWindow because walking a view tree at 120 Hz would itself
+// consume the latency this route is intended to recover.
+static const void *MacWSSystemScrollCapabilityKey =
+    &MacWSSystemScrollCapabilityKey;
+
+static BOOL MacWSClassUsesSwiftUI(Class cls, const char **matchedClass,
+                                  const char **matchedImage) {
+    for (unsigned depth = 0; cls && depth < 32;
+         cls = class_getSuperclass(cls), depth++) {
+        const char *name = class_getName(cls);
+        const char *image = class_getImageName(cls);
+        BOOL swiftUI = (image && strstr(image, "/SwiftUI.framework/") != NULL) ||
+            (name && (strstr(name, "NSHostingView") != NULL ||
+                      strstr(name, "SwiftUI") != NULL));
+        if (!swiftUI) continue;
+        if (matchedClass) *matchedClass = name;
+        if (matchedImage) *matchedImage = image;
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL MacWSViewTreeUsesSwiftUI(id view, unsigned *remaining,
+                                     const char **matchedClass,
+                                     const char **matchedImage) {
+    if (!view || !remaining || *remaining == 0) return NO;
+    (*remaining)--;
+    if (MacWSClassUsesSwiftUI(object_getClass(view), matchedClass,
+                              matchedImage)) return YES;
+    SEL subviewsSelector = sel_registerName("subviews");
+    if (!((MacWSMsgBoolSEL)objc_msgSend)(
+            view, sel_registerName("respondsToSelector:"),
+            subviewsSelector)) return NO;
+    id subviews = ((MacWSMsgID)objc_msgSend)(view, subviewsSelector);
+    Class arrayClass = objc_getClass("NSArray");
+    if (!arrayClass || !((MacWSMsgBoolID)objc_msgSend)(
+            subviews, sel_registerName("isKindOfClass:"),
+            (id)arrayClass)) return NO;
+    for (id child in subviews) {
+        if (MacWSViewTreeUsesSwiftUI(child, remaining, matchedClass,
+                                    matchedImage)) return YES;
+        if (*remaining == 0) break;
+    }
+    return NO;
+}
+
+static BOOL MacWSWindowRequiresSystemScroll(id window) {
+    if (!window) return NO;
+    id cached = objc_getAssociatedObject(
+        window, MacWSSystemScrollCapabilityKey);
+    if (cached) return ((MacWSMsgBool)objc_msgSend)(
+        cached, sel_registerName("boolValue"));
+
+    id contentView = ((MacWSMsgID)objc_msgSend)(
+        window, sel_registerName("contentView"));
+    unsigned remaining = 2048;
+    const char *matchedClass = NULL;
+    const char *matchedImage = NULL;
+    BOOL usesSwiftUI = MacWSViewTreeUsesSwiftUI(
+        contentView, &remaining, &matchedClass, &matchedImage);
+    Class numberClass = objc_getClass("NSNumber");
+    id boxed = numberClass
+        ? ((id (*)(id, SEL, BOOL))objc_msgSend)(
+            (id)numberClass, sel_registerName("numberWithBool:"), usesSwiftUI)
+        : nil;
+    if (boxed) objc_setAssociatedObject(
+        window, MacWSSystemScrollCapabilityKey, boxed,
+        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT SCROLL-CAPABILITY pid=%d window=%ld "
+            "window-class=%s route=%s matched-class=%s matched-image=%s "
+            "views-scanned=%u\n",
+            getpid(),
+            (long)((MacWSMsgInteger)objc_msgSend)(
+                window, sel_registerName("windowNumber")),
+            object_getClassName(window),
+            usesSwiftUI ? "CGPostScrollWheelEvent" : "NSWindow.sendEvent",
+            matchedClass ?: "none", matchedImage ?: "none",
+            2048u - remaining);
+        fflush(stderr);
+    }
+    return usesSwiftUI;
+}
+
 // CGEventPost of a pixel-unit event is the ideal route and is exactly what the
 // installed OSXvnc binary uses. Runtime on VSCode PID 64433 nevertheless
 // proved that Electron's target process can construct/post that event while
@@ -2813,6 +2907,7 @@ static BOOL MacWSPostSystemScrollEvent(
         ((MacWSMsgBoolID)objc_msgSend)(
             window, sel_registerName("isKindOfClass:"),
             (id)electronWindowClass)) return NO;
+    if (!MacWSWindowRequiresSystemScroll(window)) return NO;
     static MacWSPostLegacyScrollEvent postScroll;
     static dispatch_once_t onceToken;
     static NSInteger activeWindowNumber;
