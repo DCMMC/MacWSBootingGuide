@@ -91,12 +91,25 @@ int main(int argc, char *argv[], char *envp[]) {
         return 1;
     }
     
-    if(getppid() == 1) {
-        fprintf(stderr, "getppid = 1\n");
+    // PPID 1 alone does not prove launchd created this process.  A manual
+    // background launch is also reparented to launchd as soon as its SSH or
+    // shell owner exits.  Runtime-confirmed with Stray after the 2026-08-17
+    // reboot: that race selected CS_LAUNCH_TYPE_SYSTEM_SERVICE and AMFI killed
+    // the otherwise trusted game with `Launch Constraint Violation`; keeping
+    // the shell alive admitted the identical CDHash and reached UE4.  A real
+    // launchd job also carries XPC_SERVICE_NAME (WindowServer and Steam are
+    // runtime witnesses), so require both facts before requesting the system
+    // service launch contract.
+    const char *xpcServiceName = getenv("XPC_SERVICE_NAME");
+    if(getppid() == 1 && xpcServiceName && *xpcServiceName) {
+        fprintf(stderr, "launchd service = %s\n", xpcServiceName);
         if(posix_spawnattr_set_launch_type_np(&attr, CS_LAUNCH_TYPE_SYSTEM_SERVICE) != 0) {
             perror("posix_spawnattr_set_launch_type_np");
             return 1;
         }
+    } else if (getppid() == 1) {
+        fprintf(stderr,
+                "orphaned manual launch; preserving ordinary launch type\n");
     }
     // if(posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETEXEC | POSIX_SPAWN_START_SUSPENDED) != 0) {
     // env-gated suspend: set MACWS_SUSPEND_AT_EXEC=1 (in WS plist

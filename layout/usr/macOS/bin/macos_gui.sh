@@ -1245,6 +1245,7 @@ run_watchdog() {
 BOOT_TRUSTCACHE_INFO=""
 BOOT_TRUSTCACHE_ADDED=0
 APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
+APPLICATION_TRUST_CLOSURE_VERSION=2
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=16
 
@@ -1370,25 +1371,52 @@ boot_session_identifier() {
 }
 
 # Restore the dependency closure of every already-signed third-party app once
-# per iPad boot.  launchdchrootexec/autosignd can admit a main executable, but
+# per iPad boot.  Include Steam's updater-owned live bundle: unlike a normal
+# application it lives below ~/Library/Application Support rather than
+# /Applications. launchdchrootexec/autosignd can admit a main executable, but
 # dyld validates nested frameworks before either injected code path can run.
 # Runtime-confirmed after the 2026-08-13 reboot: Amadine stopped at Sparkle,
 # Word at Forms, and Excel/PowerPoint at ADAL4 with `code signature invalid`.
+# Runtime-confirmed after the 2026-08-17 userspace reboot: Steam's main image
+# was admitted, then dlopen rejected its updater-owned steamui.dylib with
+# `code signature invalid` because the old /Applications-only walk never
+# restored that live bundle's nested CodeDirectories. After restoring the
+# Steam bundle, the prepared Stray runtime main image CDHash
+# 31b7f2900e3979794b6150b5ba774837f5db1321 and libsteam_api CDHash
+# da197645eae103d2ec246c949d0b8b82a8afca11 were both absent from the rebooted
+# trustcache. Restoring them did not by itself resolve Steam AppError_49, but
+# it is still a required cold-launch invariant. Include every already-prepared
+# runtime shadow as well.
 # Their on-disk CodeDirectories were intact; only Dopamine's dynamic trustcache
 # entries had disappeared.  Never re-sign here, because that would mutate the
 # nested-code relationship.  A successful marker makes warm GUI restarts fast,
 # while kern.boottime invalidates it naturally after the next cold boot.
 restore_installed_application_trust() {
-    local boot_id="" marker_id="" bundle="" path="" bundle_count=0 image_count=0
+    local boot_id="" marker_id="" marker_expected="" bundle="" path=""
+    local steam_live_bundle="" steam_runtime_root=""
+    local bundle_count=0 image_count=0
     local progress_interval=50 next_progress=50 bundle_name=""
     boot_id=$(boot_session_identifier)
+    marker_expected="v${APPLICATION_TRUST_CLOSURE_VERSION}:${boot_id}"
     marker_id=$(sed -n '1p' "$APPLICATION_TRUST_BOOT_MARKER" 2>/dev/null || true)
-    if [ -n "$boot_id" ] && [ "$marker_id" = "$boot_id" ]; then
+    if [ -n "$boot_id" ] && [ "$marker_id" = "$marker_expected" ]; then
         log "Application trust closure already verified for this iPad boot."
         return 0
     fi
 
-    for bundle in "$ROOTFS"/Applications/*.app; do
+    steam_live_bundle="$ROOTFS/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam"
+    steam_runtime_root="$ROOTFS/Users/root/Library/Application Support/Steam/steamapps/macws-runtime"
+    if [ -n "$boot_id" ] && [ "$marker_id" = "$boot_id" ]; then
+        # One-time v1 -> v2 migration: the legacy same-boot marker already
+        # proves /Applications was walked successfully. Restore only the two
+        # newly covered Steam locations, then publish the versioned marker.
+        log "Expanding the same-boot application trust closure for Steam runtime bundles."
+        set -- "$steam_live_bundle" "$steam_runtime_root"/*/*.app
+    else
+        set -- "$ROOTFS"/Applications/*.app "$steam_live_bundle" \
+            "$steam_runtime_root"/*/*.app
+    fi
+    for bundle in "$@"; do
         [ -d "$bundle/Contents" ] || continue
         bundle_count=$((bundle_count + 1))
         bundle_name=${bundle##*/}
@@ -1405,7 +1433,7 @@ restore_installed_application_trust() {
 
     if [ -n "$boot_id" ]; then
         marker_tmp="${APPLICATION_TRUST_BOOT_MARKER}.new.$$"
-        printf '%s\n' "$boot_id" > "$marker_tmp" || return 1
+        printf '%s\n' "$marker_expected" > "$marker_tmp" || return 1
         mv -f "$marker_tmp" "$APPLICATION_TRUST_BOOT_MARKER" || return 1
     fi
     log "Application trust closure ready (bundles=$bundle_count Mach-O images=$image_count)."
@@ -2376,7 +2404,9 @@ diagnostic_flag_paths() {
         /tmp/macws_file_panel_diag \
         /private/tmp/macws_mtl_data_diag \
         /private/tmp/macws_mtl_library_diag \
+        /private/tmp/macws_pipeline_ab_diag \
         /private/tmp/macws_tile_descriptor_diag \
+        /private/tmp/macws_texture_stride_diag \
         /tmp/macws_pipeline_diag \
         /tmp/macws_allow_unsafe_pf550_capture \
         /tmp/macws_command_error_diag \
@@ -2388,9 +2418,11 @@ diagnostic_flag_paths() {
         /tmp/macws_inband_pf550 \
         /tmp/macws_inspect_failed_pf550 \
         /tmp/macws_iogpu_error_diag \
+        /tmp/macws_kcmd_field_4d0_diag \
         /tmp/macws_kcmd_field_5e3_diag \
         /tmp/macws_kcmd_field_6bc_diag \
         /tmp/macws_kcmd_field_a4_diag \
+        /tmp/macws_kcmd_stray_subtype3_diag \
         /tmp/macws_observe_pf550 \
         /tmp/macws_owned_no_read \
         /tmp/macws_owned_unlocked_read \
@@ -2401,6 +2433,8 @@ diagnostic_flag_paths() {
         /tmp/macws_res_diag \
         /tmp/macws_runtime_diagnostics \
         /tmp/macws_stop_after_clear \
+        /tmp/macws_stray_render_trace \
+        /tmp/macws_stray_rt_capture_now \
         /tmp/macws_submit_diag \
         /tmp/macws_submit_fast_ring \
         /tmp/macws_submit_ring \

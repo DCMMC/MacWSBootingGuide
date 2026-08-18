@@ -42,12 +42,18 @@ def main():
     parser.add_argument("--control", action="store_true")
     parser.add_argument("--shift", action="store_true")
     parser.add_argument("--caps-lock", action="store_true")
+    parser.add_argument(
+        "--hold", type=float, default=0.0,
+        help=("seconds to keep each key down before key-up; games that sample "
+              "key state once per render tick need a nonzero hold"))
     parser.add_argument("--interval", type=float, default=0.012)
     parser.add_argument("--socket",
                         default="/var/mnt/rootfs/private/tmp/macws_host_input.sock")
     args = parser.parse_args()
-    if args.pid <= 1 or args.width <= 0 or args.height <= 0 or args.interval < 0:
-        parser.error("pid/geometry must be positive and interval nonnegative")
+    if (args.pid <= 1 or args.width <= 0 or args.height <= 0 or
+            args.interval < 0 or args.hold < 0):
+        parser.error(
+            "pid/geometry must be positive and timing values nonnegative")
     window = resolve_window(args.pid, args.window)
     modifiers = (MOD_COMMAND if args.command else 0) | \
         (MOD_CONTROL if args.control else 0) | \
@@ -79,6 +85,8 @@ def main():
                 args.width / 2, args.height / 2, pressure=code,
                 contact=symbol, source=SOURCE_HARDWARE_KEYBOARD,
                 modifiers=flags), args.socket)
+            if kind == KEY_DOWN and args.hold:
+                time.sleep(args.hold)
         sent.append(value)
         if args.interval:
             time.sleep(args.interval)

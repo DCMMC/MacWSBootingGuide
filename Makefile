@@ -25,6 +25,8 @@ after-stage::
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
 	@install -m 0644 misc/com.macwsguide.steam.runtime.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist
+	@install -m 0644 misc/com.valvesoftware.steam.ipctool.plist \
+		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.valvesoftware.steam.ipctool.plist
 	@install -m 0644 misc/com.macwsguide.macos-locationd.plist \
 		$(THEOS_STAGING_DIR)/usr/macOS/gui-launchd/com.macwsguide.macos-locationd.plist
 	@install -m 0644 misc/com.macwsguide.corelocationagent.plist \

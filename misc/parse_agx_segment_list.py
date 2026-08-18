@@ -45,20 +45,6 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def find_unique_range(data: bytes, start: int, end: int) -> int:
-    needle = struct.pack("<II", start, end)
-    matches = [
-        offset
-        for offset in range(0, len(data) - len(needle) + 1, 8)
-        if data[offset : offset + len(needle)] == needle
-    ]
-    if len(matches) != 1:
-        raise ValueError(
-            f"KCMD range {start:#x}..{end:#x} occurs {len(matches)} times"
-        )
-    return matches[0]
-
-
 def flatten_type5_chain_for_decode(
     commands: bytes, segments: bytes
 ) -> tuple[bytes, bytes, str] | None:
@@ -195,7 +181,10 @@ def flatten_fragmented_lists_for_decode(
                 return None
             resource_count = u32(segments, entry + 0x18)
             group_count = u32(segments, entry + 0x1C)
-            if group_count > 64:
+            maximum_groups = (
+                list_cursor + chunk_length - entry - 0x20
+            ) // 0x40
+            if group_count > maximum_groups:
                 return None
             entry_length = 0x20 + group_count * 0x40
             if entry + entry_length > list_cursor + chunk_length:
@@ -382,6 +371,14 @@ def main() -> None:
         )
         command_start = 0x10
     unique_gids: set[int] = set()
+    # IOGPUSegmentListHeader's runtime type encoding makes this an ordered
+    # variable-length array, not a bag of byte patterns.  Walking from 0x10
+    # by each entry's 0x20 + groupCount*0x40 extent is both stricter and avoids
+    # a false ambiguity when an opaque resource payload happens to repeat a
+    # valid [KCMD start,end) pair.  Stray submit serial 7558 is the witness:
+    # its first 0..0x8e8 range occurs twice as raw bytes, while the structured
+    # 18-entry walk lands exactly at list 0x2b10 and KCMD 0x8370.
+    descriptor_cursor = 0x10
     for segment_index in range(segment_count):
         if command_start + 8 > len(commands):
             raise ValueError(f"segment {segment_index} KCMD header is truncated")
@@ -393,22 +390,34 @@ def main() -> None:
                 f"segment {segment_index} invalid KCMD span {command_span:#x}"
             )
 
-        range_offset = find_unique_range(
-            descriptor_bytes, command_start, command_end
-        )
-        if range_offset < 8:
-            raise ValueError(f"segment {segment_index} range has no Q header")
-        header_offset = range_offset - 8
-        if header_offset + 0x20 > len(list_bytes):
+        header_offset = descriptor_cursor
+        if header_offset + 0x20 > len(descriptor_bytes):
             raise ValueError(f"segment {segment_index} header is truncated")
 
-        segment_token = u64(list_bytes, header_offset)
-        field_10 = u32(list_bytes, header_offset + 0x10)
-        field_14 = u32(list_bytes, header_offset + 0x14)
-        resource_count = u32(list_bytes, header_offset + 0x18)
-        group_count = u32(list_bytes, header_offset + 0x1C)
+        descriptor_start = u32(descriptor_bytes, header_offset + 8)
+        descriptor_end = u32(descriptor_bytes, header_offset + 0x0C)
+        if (descriptor_start, descriptor_end) != (command_start, command_end):
+            raise ValueError(
+                f"segment {segment_index} structured range "
+                f"{descriptor_start:#x}..{descriptor_end:#x} does not match "
+                f"KCMD {command_start:#x}..{command_end:#x}"
+            )
+
+        segment_token = u64(descriptor_bytes, header_offset)
+        field_10 = u32(descriptor_bytes, header_offset + 0x10)
+        field_14 = u32(descriptor_bytes, header_offset + 0x14)
+        resource_count = u32(descriptor_bytes, header_offset + 0x18)
+        group_count = u32(descriptor_bytes, header_offset + 0x1C)
+        maximum_groups = (
+            len(descriptor_bytes) - header_offset - 0x20
+        ) // 0x40
+        if group_count > maximum_groups:
+            raise ValueError(
+                f"segment {segment_index} group count {group_count} exceeds "
+                f"the remaining-list bound {maximum_groups}"
+            )
         entry_end = header_offset + 0x20 + group_count * 0x40
-        if entry_end > len(list_bytes):
+        if entry_end > len(descriptor_bytes):
             raise ValueError(
                 f"segment {segment_index} descriptor groups are truncated"
             )
@@ -416,16 +425,20 @@ def main() -> None:
         resources: list[tuple[int, int, int]] = []
         for group_index in range(group_count):
             group = header_offset + 0x20 + group_index * 0x40
-            valid_count = u16(list_bytes, group + 0x3E)
+            valid_count = u16(descriptor_bytes, group + 0x3E)
             if valid_count > 6:
                 raise ValueError(
                     f"segment {segment_index} group {group_index} "
                     f"valid count {valid_count} > 6"
                 )
             for item_index in range(valid_count):
-                gid = u32(list_bytes, group + item_index * 4)
-                value = u32(list_bytes, group + 0x18 + item_index * 4)
-                flags = u16(list_bytes, group + 0x30 + item_index * 2)
+                gid = u32(descriptor_bytes, group + item_index * 4)
+                value = u32(
+                    descriptor_bytes, group + 0x18 + item_index * 4
+                )
+                flags = u16(
+                    descriptor_bytes, group + 0x30 + item_index * 2
+                )
                 resources.append((gid, value, flags))
                 unique_gids.add(gid)
 
@@ -443,6 +456,13 @@ def main() -> None:
         for gid, value, flags in resources:
             print(f"  gid={gid:#x} value={value:#x} flags={flags:#x}")
         command_start = command_end
+        descriptor_cursor = entry_end
+
+    if descriptor_cursor != len(descriptor_bytes):
+        raise ValueError(
+            f"structured descriptor walk ends at {descriptor_cursor:#x}, "
+            f"expected {len(descriptor_bytes):#x}"
+        )
 
     expected_command_end = len(commands)
     if trailing_wrapper_list:

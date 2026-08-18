@@ -14337,14 +14337,24 @@ void macws_dump_recent_agx_submit_serial(const char *reason,
 // IOGPUMetalCommandBufferStorageGrowKernelCommandBuffer shows the storage
 // doubling below 2 MiB and then growing in 1-MiB increments.
 //
-// Preserve the same 18-MiB explicit-diagnostic footprint while exchanging
-// history depth for enough width to hold the complete observed batch:
-// 48 * (0x40000 + 0x20000) = 18 MiB.  The inspector and translator remain
-// bounded; these are evidence-backed workload ceilings, not protocol claims.
+// Stray's first post-menu 0x103 is runtime-confirmed to use command storage
+// start=0x2cef10000/current=0x2cef58c48/end=0x2cef90000: a 0x48c48-byte
+// command stream inside the native 0x80000-byte allocation.  The former
+// 0x40000 local ceiling skipped that descriptor before translation and before
+// the recorder token was created.  Accept the complete observed allocation.
+// The next Stray witness (PID 8193, submit 9048) also proved the independently
+// bounded segment-list storage can be larger than the former 0x20000 limit:
+// start=0x2aeb00000/current=0x2aeb35850/limit=0x2aeb40000.  Treating that
+// valid 0x35850-byte list as absent compacted 836 KCMD records without their
+// ranges and changed the parser result from 0x103 to 0x0a.  Admit the exact
+// observed 0x40000 allocation class so the list-driven translator keeps both
+// stores synchronized.  The explicit-only flight recorder remains bounded at
+// 48 * (0x80000 + 0x40000) = 36 MiB.  These are evidence-backed workload
+// ceilings, not protocol claims.
 // The pages are written only when /tmp/macws_submit_fast_ring explicitly
 // enables this diagnostic recorder; production preflight removes that flag.
-#define MACWS_AGX_KCMD_INSPECT_MAX 0x40000u
-#define MACWS_AGX_SEGMENT_INSPECT_MAX 0x20000u
+#define MACWS_AGX_KCMD_INSPECT_MAX 0x80000u
+#define MACWS_AGX_SEGMENT_INSPECT_MAX 0x40000u
 #define MACWS_FAST_SUBMIT_RING_COUNT 48u
 #define MACWS_FAST_SUBMIT_COMMAND_CAP MACWS_AGX_KCMD_INSPECT_MAX
 #define MACWS_FAST_SUBMIT_SEGMENT_CAP MACWS_AGX_SEGMENT_INSPECT_MAX
@@ -14988,7 +14998,9 @@ static unsigned macws_translate_agx_wrapped_single_subtype1(
             "\xff\xff\xff\xff\xff\xff\xff\xff"
             "\xff\xff\xff\xff", 12) == 0 &&
         macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
-        *(uint32_t *)(record + 0x4d0) == 0x3f800000 &&
+        (*(uint32_t *)(record + 0x4d0) == 0x3f800000 ||
+         (macws_stray_agx_compat_enabled() &&
+          *(uint32_t *)(record + 0x4d0) == 0)) &&
         (*(uint32_t *)(record + 0x4d4) == 0x100 ||
          *(uint32_t *)(record + 0x4d4) == 0x300) &&
         memcmp(record + 0x4e8,
@@ -15165,7 +15177,9 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
             "\xff\xff\xff\xff\xff\xff\xff\xff"
             "\xff\xff\xff\xff", 12) == 0 &&
         macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
-        *(uint32_t *)(record + 0x4d0) == 0x3f800000 &&
+        (*(uint32_t *)(record + 0x4d0) == 0x3f800000 ||
+         (macws_stray_agx_compat_enabled() &&
+          *(uint32_t *)(record + 0x4d0) == 0)) &&
         (*(uint32_t *)(record + 0x4d4) == 0x100 ||
          *(uint32_t *)(record + 0x4d4) == 0x300) &&
         memcmp(record + 0x4e8,
@@ -15244,7 +15258,22 @@ static unsigned macws_translate_agx_trailing_wrapped_subtype1(
 // 0x103 with fixed=0. Permit count=1 only for that already-validated trailing
 // wrapper contract; a direct one-segment list remains owned by the narrower
 // linear translator below.
-#define MACWS_AGX_SEGMENT_LIST_MAX_RECORDS 256u
+// Runtime-confirmed by Stray's first scene-load batch on 2026-08-17: the
+// NSError-bearing selector-0x1a descriptor (PID 68968, submit serial 7535)
+// is a structurally valid direct list with 369 entries, KCMD length 0x31ff8
+// and list length 0x142f0.  misc/parse_agx_segment_list.py validated every
+// variable-size resource entry, one unique contiguous KCMD range per entry,
+// and complete coverage of both buffers.  The old 256-entry local array cap
+// rejected that entire descriptor before record translation, and the flight
+// recorder consequently reported fixed=0 followed by GPU status 0x103.
+// A later Stray scene batch (PID 80511, exact NSError-bearing submit 7526)
+// increased this to a direct list of 521 entries: KCMD 0x46980, list 0x1c7f0.
+// misc/parse_agx_segment_list.py again validated all 521 variable-size list
+// entries, unique contiguous KCMD ranges, and complete buffer coverage.  The
+// 512-entry workspace therefore returned fixed=0 before translation.  Use the
+// next power of two; the two uint32_t offset arrays consume 8 KiB total and
+// every existing framing/range/record anchor remains mandatory.
+#define MACWS_AGX_SEGMENT_LIST_MAX_RECORDS 1024u
 
 static BOOL macws_agx_fragment_entry_length(
     const unsigned char *entry, size_t available,
@@ -15604,6 +15633,124 @@ static unsigned macws_translate_agx_segment_list_records(
     uint32_t wrapper_opcode = 0;
     uint32_t list_generation = 0;
     if (!fragmented_list) {
+    // The runtime Objective-C type encoding for IOGPUSegmentListHeader gives
+    // each direct-list entry a fixed 0x20-byte header followed by groupCount
+    // 0x40-byte resource groups.  Walk that structure first instead of
+    // searching the complete resource payload for an eight-byte [start,end)
+    // pattern.  Stray PID 12387 / submit serial 7558 is the causal witness:
+    // its valid 18-entry list walks exactly 0x10..0x2b10 and all group valid
+    // counts sum to their enclosing resource counts, but the first KCMD range
+    // [0,0x8e8) also occurs once inside opaque resource data.  The old global
+    // unique-byte search therefore rejected the whole batch (fixed=0) and the
+    // completed command buffer returned 0x102.
+    //
+    // This is protocol parsing, not a relaxed success gate: every entry must
+    // be in bounds, every group count must be <= 6, every resource total must
+    // match, and the ordered ranges must cover the complete KCMD stream with
+    // each record's own type/span agreeing.  Unknown list layouts still fall
+    // through to the older ID-sequence and conservative unique-search paths.
+    BOOL structured_direct_list = direct_list && count >= 2;
+    size_t structured_entry_offset = 0x10;
+    uint32_t structured_command_cursor = 0;
+    for (uint32_t i = 0; structured_direct_list && i < count; i++) {
+        if (structured_entry_offset + 0x20 > segment_length) {
+            structured_direct_list = NO;
+            break;
+        }
+        unsigned char *entry = segment_list + structured_entry_offset;
+        uint32_t start = *(uint32_t *)(entry + 0x08);
+        uint32_t end = *(uint32_t *)(entry + 0x0c);
+        uint32_t resource_count = *(uint32_t *)(entry + 0x18);
+        uint32_t group_count = *(uint32_t *)(entry + 0x1c);
+        if (group_count >
+                (segment_length - structured_entry_offset - 0x20) / 0x40) {
+            structured_direct_list = NO;
+            break;
+        }
+        size_t entry_length = 0x20 + (size_t)group_count * 0x40;
+        if (start != structured_command_cursor || end <= start ||
+            end > total || start + 8 > total ||
+            (*(uint32_t *)(commands + start) != 0x10000 &&
+             *(uint32_t *)(commands + start) != 0x10001) ||
+            *(uint32_t *)(commands + start + 4) != end - start) {
+            structured_direct_list = NO;
+            break;
+        }
+        uint32_t decoded_resources = 0;
+        for (uint32_t group = 0; group < group_count; group++) {
+            unsigned char *group_bytes = entry + 0x20 +
+                (size_t)group * 0x40;
+            uint16_t valid_count = *(uint16_t *)(group_bytes + 0x3e);
+            if (valid_count > 6 ||
+                decoded_resources > UINT32_MAX - valid_count) {
+                structured_direct_list = NO;
+                break;
+            }
+            decoded_resources += valid_count;
+        }
+        if (!structured_direct_list ||
+            decoded_resources != resource_count) {
+            structured_direct_list = NO;
+            break;
+        }
+        pair_offsets[i] = (uint32_t)structured_entry_offset + 8;
+        structured_entry_offset += entry_length;
+        structured_command_cursor = end;
+    }
+    if (structured_direct_list &&
+        (structured_entry_offset != segment_length ||
+         structured_command_cursor != total)) {
+        structured_direct_list = NO;
+    }
+
+    // Runtime-confirmed by two independent Stray NSError-matched submissions.
+    // Serial 9606 has 42 fixed 0xe0-byte entries.  After that batch passed,
+    // serial 7823 exposed the same list directory with a 0x160-byte first
+    // entry and 41 0xe0-byte entries.  Every entry begins with a consecutive
+    // 64-bit identifier and stores its KCMD [start,end) pair at entry+0x08.
+    // The former whole-list range scan found valid pairs duplicated by opaque
+    // resource payload and rejected the entire command buffer with fixed=0.
+    //
+    // Recover the directory from the stronger complete ID sequence.  Each ID
+    // must occur exactly once at an aligned location, entries must be ordered
+    // and bounded, and the subsequent command walk still requires all pairs
+    // to exactly cover the KCMD stream.  Any failed invariant falls back to
+    // the conservative unique whole-list search.
+    BOOL sequenced_direct_list = !structured_direct_list &&
+        direct_list && count >= 2 &&
+        segment_length >= (size_t)0x10 + (size_t)count * 0x18;
+    uint64_t first_entry_id = sequenced_direct_list
+        ? *(uint64_t *)(segment_list + 0x10) : 0;
+    uint32_t previous_entry_offset = 0;
+    if (sequenced_direct_list && first_entry_id == 0)
+        sequenced_direct_list = NO;
+    for (uint32_t i = 0; sequenced_direct_list && i < count; i++) {
+        uint64_t wanted_id = first_entry_id + i;
+        uint32_t entry_offset = 0;
+        unsigned id_matches = 0;
+        for (size_t off = 0x10; off + 0x10 <= segment_length; off += 8) {
+            if (*(uint64_t *)(segment_list + off) == wanted_id) {
+                entry_offset = (uint32_t)off;
+                id_matches++;
+            }
+        }
+        size_t entry_span = i == 0
+            ? entry_offset : (size_t)entry_offset - previous_entry_offset;
+        if (id_matches != 1 || (i == 0 && entry_offset != 0x10) ||
+            (i > 0 && (entry_offset <= previous_entry_offset ||
+                       entry_span < 0x18 || entry_span > 0x1000))) {
+            sequenced_direct_list = NO;
+            break;
+        }
+        pair_offsets[i] = entry_offset + 8;
+        previous_entry_offset = entry_offset;
+    }
+    if (sequenced_direct_list) {
+        size_t final_entry_span =
+            segment_length - (size_t)previous_entry_offset;
+        if (final_entry_span < 0x18 || final_entry_span > 0x1000)
+            sequenced_direct_list = NO;
+    }
     uint32_t cursor = 0;
     for (uint32_t i = 0; i < count; i++) {
         if ((size_t)cursor + 0x38 > total)
@@ -15617,11 +15764,20 @@ static unsigned macws_translate_agx_segment_list_records(
         uint32_t end = cursor + span;
 
         unsigned matches = 0;
-        for (size_t off = 0; off + 8 <= segment_length; off += 8) {
-            if (*(uint32_t *)(segment_list + off) == cursor &&
-                *(uint32_t *)(segment_list + off + 4) == end) {
-                pair_offsets[i] = (uint32_t)off;
-                matches++;
+        if (structured_direct_list || sequenced_direct_list) {
+            size_t pair_offset = pair_offsets[i];
+            if (*(uint32_t *)(segment_list + pair_offset) == cursor &&
+                *(uint32_t *)(segment_list + pair_offset + 4) == end) {
+                pair_offsets[i] = (uint32_t)pair_offset;
+                matches = 1;
+            }
+        } else {
+            for (size_t off = 0; off + 8 <= segment_length; off += 8) {
+                if (*(uint32_t *)(segment_list + off) == cursor &&
+                    *(uint32_t *)(segment_list + off + 4) == end) {
+                    pair_offsets[i] = (uint32_t)off;
+                    matches++;
+                }
             }
         }
         if (matches != 1)
@@ -15741,15 +15897,16 @@ static unsigned macws_translate_agx_segment_list_records(
             *(uint32_t *)(record + 0x34) == 1;
         uint32_t subtype1_field_4d0 = subtype1
             ? *(uint32_t *)(record + 0x4d0) : UINT32_MAX;
-        // DIAGNOSTIC-ONLY producer-version A/B.  Stray's first exactly
-        // correlated failing batch contains ten ordinary subtype-1 records
-        // with macOS record+0x4d0 == 1.0f and one otherwise structurally
-        // identical record with zero.  The public-Metal iOS 16.3
-        // `renderzero` control (clear RGBA all zero) completed status=4 with
-        // the native 0x820/0x7f8/0x7c8 layout and still wrote 1.0f at the
-        // normalized corresponding field +0x4b0.  This opt-in A/B tests that
-        // exact remaining producer delta; it is not yet a production rule.
-        BOOL subtype1_field_4d0_zero_compat = subtype1_field_4d0 == 0 &&
+        // Runtime-confirmed semantic field, not a producer-version constant.
+        // The old A/B inferred from an all-zero *color* clear that native
+        // +0x4b0 should always be 1.0f.  That control had no depth attachment,
+        // so 1.0 was simply the descriptor's default clearDepth.  The paired
+        // PF260 controls are causal: native iOS clearDepth=0 reads back 0;
+        // the chroot record has macOS +0x4d0=0; skipping normalization returns
+        // 0x102; and changing this word to 1.0 makes every depth pixel 1.0.
+        // Admit zero so the proven layout compaction runs, but preserve the
+        // semantic word byte-for-byte as it moves to native +0x4b0.
+        BOOL subtype1_field_4d0_zero_valid = subtype1_field_4d0 == 0 &&
             (macws_stray_agx_compat_enabled() ||
              macws_kcmd_field_4d0_diag_enabled());
         // Runtime-correlated Stray gameplay batch PID 5851 / submit 41126:
@@ -15775,7 +15932,7 @@ static unsigned macws_translate_agx_segment_list_records(
                 "\xff\xff\xff\xff", 12) == 0 &&
             macws_submit_bytes_are_zero(record + 0x4c0, 0x10) &&
             (subtype1_field_4d0 == 0x3f800000 ||
-             subtype1_field_4d0_zero_compat ||
+             subtype1_field_4d0_zero_valid ||
              subtype1_field_4d0_ffff_compat) &&
             (*(uint32_t *)(record + 0x4d4) == 0x100 ||
              *(uint32_t *)(record + 0x4d4) == 0x300) &&
@@ -16173,14 +16330,6 @@ static unsigned macws_translate_agx_segment_list_records(
 
         uint32_t shrink = subtype1_anchors ? 0x20 : 0x10;
         if (subtype1_anchors) {
-            if (subtype1_field_4d0_zero_compat) {
-                *(uint32_t *)(record + 0x4d0) = 0x3f800000;
-                if (macws_kcmd_field_4d0_diag_enabled())
-                    fprintf(stderr,
-                        "#### AGX-KCMD-FIELD-4D0-DIAG #%u segment=%u "
-                        "macOS+0x4d0=0->1.0f native+0x4b0 witness\n",
-                        sequence, i);
-            }
             // Delete both macOS-only zero windows from the complete remaining
             // storage tail.  Later segments have already been normalized and
             // are intentionally shifted together with that tail.
@@ -16638,11 +16787,26 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                 macws_submit_save_type1(result.sequence, record_index,
                                         commands + off, end_offset);
 
-            BOOL subtype1_direct_field_4d0_zero_compat =
+            BOOL subtype1_direct_field_4d0_zero_valid =
                 off == 0 && total > 0x4d4 &&
                 *(uint32_t *)(commands + 0x4d0) == 0 &&
                 (macws_stray_agx_compat_enabled() ||
                  macws_kcmd_field_4d0_diag_enabled());
+            // Runtime-confirmed by Stray PID 88562, NSError-bearing submit
+            // serial 7917 (2026-08-17).  The direct count-1 list is a complete
+            // macOS subtype-1 record (KCMD/list 0x840/0x5f0, every framing,
+            // padding and sentinel anchor below matches), but carries the
+            // same legitimate 0xffff operation payload already admitted and
+            // preserved by the multi-segment Stray path above.  The direct
+            // predicate previously accepted only 1.0f/zero, so it left this
+            // exact record unnormalized (fixed=0) and iOS AGX returned 0x102.
+            // Admit it only under the existing Stray compatibility contract;
+            // unlike the zero A/B, preserve 0xffff byte-for-byte as it moves
+            // from macOS +0x4d0 to native +0x4b0.
+            BOOL subtype1_direct_field_4d0_ffff_compat =
+                off == 0 && total > 0x4d4 &&
+                *(uint32_t *)(commands + 0x4d0) == 0xffff &&
+                macws_stray_agx_compat_enabled();
 
             // TEMPORARY ABI-TRANSLATION EXPERIMENT — native-iOS clear only.
             //
@@ -16719,7 +16883,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     *(uint32_t *)(commands + 0x4d4);
                 int check_4d0 =
                     (*(uint32_t *)(commands + 0x4d0) == 0x3f800000 ||
-                     subtype1_direct_field_4d0_zero_compat) &&
+                     subtype1_direct_field_4d0_zero_valid ||
+                     subtype1_direct_field_4d0_ffff_compat) &&
                     (operation_state == 0x100 || operation_state == 0x300);
                 int check_4e8 = memcmp(commands + 0x4e8,
                     "\xff\xff\xff\xff\xff\xff\xff\xff"
@@ -16781,7 +16946,8 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     "\xff\xff\xff\xff", 12) == 0 &&
                 macws_submit_bytes_are_zero(commands + 0x4c0, 0x10) &&
                 (*(uint32_t *)(commands + 0x4d0) == 0x3f800000 ||
-                 subtype1_direct_field_4d0_zero_compat) &&
+                 subtype1_direct_field_4d0_zero_valid ||
+                 subtype1_direct_field_4d0_ffff_compat) &&
                 (*(uint32_t *)(commands + 0x4d4) == 0x100 ||
                  *(uint32_t *)(commands + 0x4d4) == 0x300) &&
                 memcmp(commands + 0x4e8,
@@ -16789,24 +16955,6 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
                     "\xff\xff\xff\xff", 12) == 0) {
                 result.candidates++;
                 size_t original_total = total;
-
-                // DIAGNOSTIC-ONLY semantic A/B, shared with the exact
-                // multisegment predicate above.  Stray's NSError-matched
-                // serial-21 direct subtype-1 record has the complete known
-                // macOS layout but +0x4d0=0.  The native-iOS renderzero
-                // control writes 1.0f at normalized +0x4b0 even for an all-
-                // zero clear.  Restore that exact witnessed value before the
-                // layout compactor moves it to +0x4b0; do not production-
-                // enable without a later clean completion witness.
-                if (subtype1_direct_field_4d0_zero_compat) {
-                    *(uint32_t *)(commands + 0x4d0) = 0x3f800000;
-                    if (macws_kcmd_field_4d0_diag_enabled())
-                        fprintf(stderr,
-                            "#### AGX-KCMD-FIELD-4D0-DIAG #%u segment=0 "
-                            "direct macOS+0x4d0=0->1.0f "
-                            "native+0x4b0 witness\n",
-                            result.sequence);
-                }
 
                 // Work from the higher original offset downward so both
                 // deletion coordinates continue to refer to the captured

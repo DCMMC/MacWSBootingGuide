@@ -247,6 +247,24 @@ static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
     return value != 0;
 }
 
+// UE4's Mac input backend samples key state from AppKit's event queue on its
+// game tick.  Runtime evidence from Stray's first-run brightness screen is
+// exact: direct -[NSApplication sendEvent:] delivered Return to the real
+// FCocoaWindow in 4.6 ms and switched the displayed input glyph, but the
+// Accept action never observed a down state.  Queueing the same ordinary
+// NSEvent lets the application's normal event pump establish that state
+// before a later key-up; no selector, action, or validation result is forged.
+static BOOL MacWSMainBundleUsesQueuedGameInput(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        NSString *identifier = [[NSBundle mainBundle] bundleIdentifier];
+        value = [identifier isEqualToString:@"com.annapurnainteractive.Stray"];
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
 static void MacWSTrackOrderedWindow(id window) {
     if (!window || !MacWSOrderedWindowRegistry) return;
     [MacWSOrderedWindowRegistry addObject:window];
@@ -5594,8 +5612,9 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         NSInteger keyWindowNumber = keyWindow
             ? ((MacWSMsgInteger)objc_msgSend)(
                 keyWindow, sel_registerName("windowNumber")) : 0;
+        BOOL queueForGameTick = MacWSMainBundleUsesQueuedGameInput();
         if (!MacWSPostKeyRecord(record, application, eventClass,
-                                keyWindowNumber, NO, NO)) {
+                                keyWindowNumber, queueForGameTick, NO)) {
             fprintf(stderr,
                 "#### APP-INPUT DROP pid=%d reason=key-event-create "
                 "kind=%u keycode=%.3f keysym=%#x\n",
