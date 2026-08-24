@@ -27,7 +27,7 @@ import time
 
 
 HERE = pathlib.Path(__file__).resolve().parent
-REPACK = HERE / "repack_metallib_macabi.py"
+METAL2METAL = HERE / "metal2metal.py"
 INSTALLER = HERE / "install_stray_exact_metallib.py"
 VISION_OCR = HERE / "vision_ocr.swift"
 KEY_PROBE = "/var/jb/var/mobile/MacWSBootingGuide/misc/host_key_probe.py"
@@ -661,13 +661,17 @@ def convert_and_install(remote: Remote, misses, wave_dir: pathlib.Path,
         name = pathlib.PurePosixPath(item["path"]).name
         source = wave_dir / name
         replacement = wave_dir / f"{name[:-4]}.macabi.metallib"
+        abi_report = replacement.with_suffix(".abi.json")
         remote.copy_from(f"{CAPTURE_PREFIX}/{name}", source)
         subprocess.run([
-            sys.executable, str(REPACK), str(source), str(replacement),
+            sys.executable, str(METAL2METAL), "translate",
+            str(source), str(replacement),
             "--llvm-dis", str(llvm_dis), "--llvm-as", str(llvm_as),
             "--target-triple", "air64-apple-ios19.0.0-macabi",
             "--container-target", "macabi",
             "--target-major", "19", "--target-minor", "0",
+            "--auto-lower-known-air",
+            "--abi-report", str(abi_report),
         ], check=True)
         remote_replacement = f"/var/jb/var/mobile/{replacement.name}"
         remote.copy_to(replacement, remote_replacement)
@@ -677,7 +681,11 @@ def convert_and_install(remote: Remote, misses, wave_dir: pathlib.Path,
             f"--prebuilt-replacement {remote_replacement}",
             timeout=60,
         ).strip()
-        installed.append({**item, "installer_output": output})
+        installed.append({
+            **item,
+            "abi_report": str(abi_report),
+            "installer_output": output,
+        })
     return installed
 
 

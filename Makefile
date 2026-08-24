@@ -49,8 +49,11 @@ after-stage::
 		misc/vscode-aquarium-runner/extension.js \
 		misc/vscode-aquarium-runner/README.md \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/macwsguide.macws-aquarium-runner-0.0.1/
-	@install -m 0644 misc/repack_metallib_macabi.py \
-		$(THEOS_STAGING_DIR)/usr/macOS/bin/repack_metallib_macabi.py
+	@install -m 0644 misc/metal2metal.py \
+		misc/metal2metal_manifest.py \
+		misc/metal2metal_profiles.py \
+		misc/repack_metallib_macabi.py \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/
 	@install -m 0644 misc/add_macho_load_dylib.py \
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/add_macho_load_dylib.py
 	@install -m 0644 misc/patch_electron_pa_ios_va.py \

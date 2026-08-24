@@ -1084,10 +1084,12 @@ ROOTFS=/var/mnt/rootfs
 # Ventura QuartzCore's real desktop-window-effects shaders are compiled for a
 # macOS AIR target, while this project intentionally executes them on the iOS
 # native AGX driver. The focused provisioner preserves the original library,
-# regenerates the twenty-one-function secondary macabi artifact when required,
-# and performs exact byte validation. It is also called by dpkg's postinst so an
-# upgrade cannot leave a stale shader artifact behind valid trust sentinels.
-QC_REPACKER=/var/jb/usr/macOS/bin/repack_metallib_macabi.py
+# regenerates a complete secondary macabi artifact when required, and verifies
+# the source/output identities recorded by metal2metal. It is also called by
+# dpkg's postinst so an upgrade cannot leave a stale shader artifact behind
+# valid trust sentinels.
+METAL2METAL=/var/jb/usr/macOS/bin/metal2metal.py
+METAL2METAL_ROUTE_DIR="$ROOTFS/usr/local/share/macws/metal2metal/routes"
 QC_LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 QC_LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
 
@@ -1108,52 +1110,63 @@ SKY_DEFAULT="$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Version
 SKY_EXPECTED_SHA256=378174fcbf7fc639aa737cad7a765690b2d76fa3a66c7a8e71018441f3ac3184
 SKY_COMPAT_DIR="$ROOTFS/usr/local/share/macws/skylight"
 SKY_COMPAT_TARGET="$SKY_COMPAT_DIR/SkyLightShaders-desktop-effects-macabi.metallib"
+SKY_MANIFEST_TARGET="$METAL2METAL_ROUTE_DIR/skylight-shaders.route.plist"
 SKY_COMPAT_EXPECTED_SHA256=bfe93e8146325a912a0db9fc1ed28a2de32aa9ccb4065148398be12ac0644df1
 if [ "$(qc_sha256 "$SKY_DEFAULT")" != "$SKY_EXPECTED_SHA256" ]; then
 	echo "[ERROR] SkyLightShaders.air64.metallib is not the supported macOS 13.4 library." >&2
 	exit 1
 fi
-mkdir -p "$SKY_COMPAT_DIR" || exit 1
+mkdir -p "$SKY_COMPAT_DIR" "$METAL2METAL_ROUTE_DIR" || exit 1
 SKY_COMPAT_TMP="$SKY_COMPAT_TARGET.new.$$"
-python3 "$QC_REPACKER" "$SKY_DEFAULT" "$SKY_COMPAT_TMP" \
-	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" || exit 1
+SKY_MANIFEST_TMP="$SKY_MANIFEST_TARGET.new.$$"
+python3 "$METAL2METAL" translate "$SKY_DEFAULT" "$SKY_COMPAT_TMP" \
+	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
+	--runtime-manifest "$SKY_MANIFEST_TMP" \
+	--runtime-source-path "/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/SkyLightShaders.air64.metallib" \
+	--runtime-output-path "/usr/local/share/macws/skylight/SkyLightShaders-desktop-effects-macabi.metallib" || exit 1
 if [ "$(qc_sha256 "$SKY_COMPAT_TMP")" != "$SKY_COMPAT_EXPECTED_SHA256" ]; then
 	echo "[ERROR] Generated SkyLight desktop-effects library failed exact validation." >&2
 	exit 1
 fi
+python3 "$METAL2METAL" verify-runtime-manifest "$SKY_MANIFEST_TMP" \
+	--source "$SKY_DEFAULT" --output "$SKY_COMPAT_TMP" || exit 1
 chmod 0644 "$SKY_COMPAT_TMP" || exit 1
+chmod 0644 "$SKY_MANIFEST_TMP" || exit 1
 mv -f "$SKY_COMPAT_TMP" "$SKY_COMPAT_TARGET" || exit 1
+mv -f "$SKY_MANIFEST_TMP" "$SKY_MANIFEST_TARGET" || exit 1
 echo '[INFO] installed exact SkyLight desktop-effects macabi shader library'
 
 # MPSImage supplies the real desktop-effects reduction kernel reached after
-# SkyLight's desktop surface pipelines are available. The exact runtime
-# failures are sum_rgba_columns and sum_rgba_rows with a macOS AIR target;
-# both report no function constants against the exact Ventura library, so
-# libmachook redirects only base-function creation to this byte-validated
-# selective macabi library.
+# SkyLight's desktop surface pipelines are available. Runtime-confirmed
+# failures first exposed its reduction kernels, but the ABI
+# mismatch belongs to the library target rather than those names. Translate
+# the complete exact Ventura source and let the generated manifest describe
+# base versus function-constant creation structurally.
 MPSIMAGE_DEFAULT="$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib"
 MPSIMAGE_EXPECTED_SHA256=376ded7ee154429f6950656eb668b26af27fc6149b734b11dd48a33d68fe4285
 MPSIMAGE_COMPAT_DIR="$ROOTFS/usr/local/share/macws/mpsimage"
 MPSIMAGE_COMPAT_TARGET="$MPSIMAGE_COMPAT_DIR/default-desktop-effects-macabi.metallib"
-MPSIMAGE_COMPAT_EXPECTED_SHA256=0187b2e6f58659e9974680c1b82d15d393d99f5feb3be85451043c33861b1496
+MPSIMAGE_MANIFEST_TARGET="$METAL2METAL_ROUTE_DIR/mpsimage-default.route.plist"
 if [ "$(qc_sha256 "$MPSIMAGE_DEFAULT")" != "$MPSIMAGE_EXPECTED_SHA256" ]; then
 	echo "[ERROR] MPSImage default.metallib is not the supported macOS 13.4 library." >&2
 	exit 1
 fi
-mkdir -p "$MPSIMAGE_COMPAT_DIR" || exit 1
+mkdir -p "$MPSIMAGE_COMPAT_DIR" "$METAL2METAL_ROUTE_DIR" || exit 1
 MPSIMAGE_COMPAT_TMP="$MPSIMAGE_COMPAT_TARGET.new.$$"
-python3 "$QC_REPACKER" "$MPSIMAGE_DEFAULT" "$MPSIMAGE_COMPAT_TMP" \
+MPSIMAGE_MANIFEST_TMP="$MPSIMAGE_MANIFEST_TARGET.new.$$"
+python3 "$METAL2METAL" translate "$MPSIMAGE_DEFAULT" "$MPSIMAGE_COMPAT_TMP" \
 	--llvm-dis "$QC_LLVM_DIS" --llvm-as "$QC_LLVM_AS" \
-	--function sum_rgba_columns \
-	--function sum_rgba_rows \
-	--preserve-container-target || exit 1
-if [ "$(qc_sha256 "$MPSIMAGE_COMPAT_TMP")" != "$MPSIMAGE_COMPAT_EXPECTED_SHA256" ]; then
-	echo "[ERROR] Generated MPSImage desktop-effects library failed exact validation." >&2
-	exit 1
-fi
+	--auto-lower-known-air \
+	--runtime-manifest "$MPSIMAGE_MANIFEST_TMP" \
+	--runtime-source-path "/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib" \
+	--runtime-output-path "/usr/local/share/macws/mpsimage/default-desktop-effects-macabi.metallib" || exit 1
+python3 "$METAL2METAL" verify-runtime-manifest "$MPSIMAGE_MANIFEST_TMP" \
+	--source "$MPSIMAGE_DEFAULT" --output "$MPSIMAGE_COMPAT_TMP" || exit 1
 chmod 0644 "$MPSIMAGE_COMPAT_TMP" || exit 1
+chmod 0644 "$MPSIMAGE_MANIFEST_TMP" || exit 1
 mv -f "$MPSIMAGE_COMPAT_TMP" "$MPSIMAGE_COMPAT_TARGET" || exit 1
-echo '[INFO] installed exact MPSImage desktop-effects macabi shader library'
+mv -f "$MPSIMAGE_MANIFEST_TMP" "$MPSIMAGE_MANIFEST_TARGET" || exit 1
+echo '[INFO] installed complete MPSImage metal2metal library'
 
 # Chromium 148 / Electron 42 ships ANGLE's default Metal library for macOS.
 # Its container loads in the chroot, but iOS MTLCompilerService rejects

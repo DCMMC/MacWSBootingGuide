@@ -442,13 +442,19 @@ int main(void) {
                 }
                 return allReplayPipelinesBuilt ? 0 : 12;
             }
-            if (getenv("MACWS_METAL_PROBE_DUMP_FUNCTIONS")) {
+            BOOL dumpFunctionNames =
+                getenv("MACWS_METAL_PROBE_DUMP_FUNCTIONS") != NULL;
+            BOOL dumpFunctionRequirements =
+                getenv("MACWS_METAL_PROBE_DUMP_FUNCTION_REQUIREMENTS") !=
+                NULL;
+            if (dumpFunctionNames || dumpFunctionRequirements) {
                 for (NSString *functionName in functionNames) {
-                    fprintf(stderr,
-                            "METAL_SOURCE_PROBE libraryFunction name=%s\n",
-                            functionName.UTF8String);
-                    if (getenv(
-                            "MACWS_METAL_PROBE_DUMP_FUNCTION_REQUIREMENTS")) {
+                    if (dumpFunctionNames) {
+                        fprintf(stderr,
+                                "METAL_SOURCE_PROBE libraryFunction name=%s\n",
+                                functionName.UTF8String);
+                    }
+                    if (dumpFunctionRequirements) {
                         DumpFunctionSpecializationRequirement(
                             [library newFunctionWithName:functionName]);
                     }
@@ -465,36 +471,6 @@ int main(void) {
             DumpFunctionSpecializationRequirement(vertex);
             DumpFunctionSpecializationRequirement(genericVertex);
             DumpFunctionSpecializationRequirement(fragment);
-            for (NSString *extraName in
-                 @[ @"SimpleVertex", @"SimpleTextureFragment",
-                    @"SimpleColorVertex", @"SimpleColorFragment",
-                    @"SimpleVertexShadow", @"ShadowCompositeFragment",
-                    @"ShadowHorizontalBlurFragment",
-                    @"ShadowVerticalBlurFragment",
-                    @"ShadowVerticalBlurRGBAFragment",
-                    @"UberCompositeFragment",
-                    @"UberResampleLanczosFragmentBGRA",
-                    @"sum_rgba_columns", @"sum_rgba_rows",
-                    @"std_vert1_lph", @"inplace_copy_lph",
-                    @"downsample_blur_vert_lph",
-                    @"downsample_8_frag_lph",
-                    @"downsample_4_frag_lph",
-                    @"single_pass_blur_3_lph",
-                    @"tile_downsample_1",
-                    @"tile_downsample_2",
-                    @"tile_downsample_4",
-                    @"tile_downsample_8",
-                    @"narrow_blur_7_frag_lph",
-                    @"narrow_blur_11_frag_lph",
-                    @"narrow_blur_15_frag_lph",
-                    @"narrow_blur_19_frag_lph",
-                    @"narrow_blur_23_frag_lph",
-                    @"narrow_blur_27_frag_lph" ]) {
-                if ([functionNames containsObject:extraName]) {
-                    DumpFunctionSpecializationRequirement(
-                        [library newFunctionWithName:extraName]);
-                }
-            }
             fprintf(stderr,
                     "METAL_SOURCE_PROBE precompiledFunctions vertex=%p "
                     "fragment=%p hasVertexName=%d hasFragmentName=%d\n",

@@ -14559,10 +14559,11 @@ static void macws_install_data_library_compatibility(Class agx) {
 // MTLPixelFormatBGRA10_XR_tile_downsample_2 failing from get_tile_pipeline.
 // The exact library contains only tile_downsample_1/2/4/8 and all four carry
 // that same desktop target, so the tile family follows the same invariant.
-// The package generates a byte-validated secondary library from the device's
-// own Ventura default.metallib: only these twenty-one RE- or runtime-confirmed
-// AIR modules receive a macabi target triple; all other
-// module bytes and every public function signature remain unchanged.
+// Those observations originally grew a twenty-one-name routing table. The
+// package now treats the target mismatch as a library-wide compiler invariant:
+// metal2metal must retarget every module, and the complete generated manifest
+// supplies the function type/constant contract. The runtime accepts neither a
+// partial manifest nor a shader name as provenance.
 //
 // Do not replace QuartzCore's default library.  A mixed-target MTLB used as the
 // process-wide default makes unrelated early CoreAnimation pipelines fail.
@@ -14589,9 +14590,6 @@ static macws_library_specialize_cache_fn
     g_macws_qc_specialize_pipeline_orig = NULL;
 static macws_library_specialize_named_fn
     g_macws_qc_specialize_named_orig = NULL;
-static id<MTLLibrary> g_macws_qc_desktop_library = nil;
-static id<MTLLibrary> g_macws_skylight_desktop_library = nil;
-static id<MTLLibrary> g_macws_mpsimage_desktop_library = nil;
 typedef id (*macws_function_specialize_fn)(
     id, SEL, id, id, id, NSError **) __attribute__((ns_returns_retained));
 static macws_function_specialize_fn
@@ -14600,262 +14598,303 @@ typedef void (*macws_function_specialize_async_fn)(
     id, SEL, id, id, id, BOOL, id);
 static macws_function_specialize_async_fn
     g_macws_desktop_function_specialize_async_orig = NULL;
-static const char *kMacWSQCDesktopLibraryPath =
-    "/usr/local/share/macws/quartzcore/"
-    "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSQCDesktopLibraryBytes = 1052160;
-static const uint64_t kMacWSQCDesktopLibraryHash =
-    // macws_source_fnv1a64 intentionally retains this project's historical
-    // non-standard offset basis. Runtime validation of the exact artifact
-    // produces this value.
-    UINT64_C(0x022d2a0179b8c898);
-static const char *kMacWSSkyLightDesktopLibraryPath =
-    "/usr/local/share/macws/skylight/"
-    "SkyLightShaders-desktop-effects-macabi.metallib";
-static const size_t kMacWSSkyLightDesktopLibraryBytes = 736944;
-static const uint64_t kMacWSSkyLightDesktopLibraryHash =
-    UINT64_C(0xed46648d355bb00e);
-static const char *kMacWSMPSImageDesktopLibraryPath =
-    "/usr/local/share/macws/mpsimage/"
-    "default-desktop-effects-macabi.metallib";
-static const size_t kMacWSMPSImageDesktopLibraryBytes = 16449764;
-static const uint64_t kMacWSMPSImageDesktopLibraryHash =
-    UINT64_C(0x117d8d75f7cff1f4);
 
-static BOOL macws_qc_desktop_function_name(NSString *name) {
-    return [name isEqualToString:@"fixed_vert_lph_spc"] ||
-           [name isEqualToString:@"fixed_vert_lph_gen"] ||
-           [name isEqualToString:@"fixed_frag_lph_cpf"] ||
-           [name isEqualToString:@"path_blit_vert_lph"] ||
-           [name isEqualToString:@"attachment_clear_frag_lph"] ||
-           [name isEqualToString:@"std_vert1_lph"] ||
-           [name isEqualToString:@"inplace_copy_lph"] ||
-           [name isEqualToString:@"downsample_blur_vert_lph"] ||
-           [name isEqualToString:@"downsample_8_frag_lph"] ||
-           [name isEqualToString:@"downsample_4_frag_lph"] ||
-           [name isEqualToString:@"single_pass_blur_3_lph"] ||
-           [name isEqualToString:@"tile_downsample_1"] ||
-           [name isEqualToString:@"tile_downsample_2"] ||
-           [name isEqualToString:@"tile_downsample_4"] ||
-           [name isEqualToString:@"tile_downsample_8"] ||
-           [name isEqualToString:@"narrow_blur_7_frag_lph"] ||
-           [name isEqualToString:@"narrow_blur_11_frag_lph"] ||
-           [name isEqualToString:@"narrow_blur_15_frag_lph"] ||
-           [name isEqualToString:@"narrow_blur_19_frag_lph"] ||
-           [name isEqualToString:@"narrow_blur_23_frag_lph"] ||
-           [name isEqualToString:@"narrow_blur_27_frag_lph"];
+// Versioned metal2metal manifests are the authoritative runtime routing
+// contract. They contain exact source/output identities, the complete source
+// function set, the equally complete translated set, and function-constant
+// requirements derived from AIR metadata.
+// A library is attributed by URL when that public boundary is visible. If a
+// private framework bypasses it, equality of the COMPLETE function-name set
+// against exactly one validated manifest is accepted; one matching shader
+// name is never treated as provenance.
+static const void *kMacWSMetal2MetalLibraryRouteKey =
+    &kMacWSMetal2MetalLibraryRouteKey;
+static const void *kMacWSMetal2MetalFunctionRouteKey =
+    &kMacWSMetal2MetalFunctionRouteKey;
+static const void *kMacWSMetal2MetalCompanionKey =
+    &kMacWSMetal2MetalCompanionKey;
+static NSArray<NSMutableDictionary *> *g_macws_metal2metal_routes = nil;
+
+typedef id (*macws_new_library_url_fn)(id, SEL, NSURL *, NSError **)
+    __attribute__((ns_returns_retained));
+static macws_new_library_url_fn g_macws_new_library_url_orig = NULL;
+
+static uint64_t macws_metal2metal_hex64(NSString *text, BOOL *valid) {
+    if (valid) *valid = NO;
+    if (![text isKindOfClass:[NSString class]] || text.length != 16)
+        return 0;
+    const char *characters = text.UTF8String;
+    if (!characters) return 0;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long value = strtoull(characters, &end, 16);
+    if (errno || !end || *end) return 0;
+    if (valid) *valid = YES;
+    return (uint64_t)value;
 }
 
-static BOOL macws_qc_desktop_base_function_name(NSString *name) {
-    // Runtime-confirmed against the exact Ventura 13.4 library: these are
-    // requested as ordinary base functions. CoreAnimation pairs the first two
-    // for Pw40aXm_TatcA2S1Xhf and the latter two for the Mission Control
-    // transition's Pw40aXm_TipcA2Xhf_Isrc copy pass.
-    return [name isEqualToString:@"path_blit_vert_lph"] ||
-           [name isEqualToString:@"attachment_clear_frag_lph"] ||
-           [name isEqualToString:@"std_vert1_lph"] ||
-           [name isEqualToString:@"inplace_copy_lph"] ||
-           [name isEqualToString:@"tile_downsample_1"] ||
-           [name isEqualToString:@"tile_downsample_2"] ||
-           [name isEqualToString:@"tile_downsample_4"] ||
-           [name isEqualToString:@"tile_downsample_8"];
+static BOOL macws_metal2metal_identity_matches(
+        NSDictionary *identity, NSString *path) {
+    if (![identity isKindOfClass:[NSDictionary class]] || !path.length)
+        return NO;
+    NSData *data = [NSData dataWithContentsOfFile:path
+                         options:NSDataReadingMappedIfSafe error:nil];
+    NSNumber *expected_size = identity[@"size"];
+    BOOL hash_valid = NO;
+    uint64_t expected_hash = macws_metal2metal_hex64(
+        identity[@"fnv1a64"], &hash_valid);
+    return data && [expected_size isKindOfClass:[NSNumber class]] &&
+        data.length == expected_size.unsignedLongLongValue && hash_valid &&
+        macws_source_fnv1a64(data.bytes, data.length) == expected_hash;
 }
 
-static BOOL macws_skylight_desktop_function_name(NSString *name) {
-    // Runtime metal_source_probe enumerated the exact Ventura 13.4 library:
-    // all 54 functions carry the desktop AIR target, so every function must
-    // come from the coherently retargeted companion library.
-    static NSSet<NSString *> *names;
+static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        // Metal_hooks.x is compiled without ARC; the process-lifetime set
-        // must own its storage instead of retaining an autoreleased object in
-        // a static pointer.
-        names = [[NSSet alloc] initWithArray:@[
-            @"RippleFragment", @"GroupFadeTextureFragment",
-            @"SimpleVertex", @"Backdrop_Clear_PlusL",
-            @"DownsampleBloody4x", @"UberCompositeVertex",
-            @"Backdrop_Clear_PlusD", @"Backdrop_Inactive_Sover",
-            @"Backdrop_Clear_Sover", @"BackdropVBlur1x",
-            @"SimpleTextureLightingVertex", @"BackdropVBlur2x",
-            @"Downsample2x", @"Downsample4x",
-            @"SimpleTextureScaleToSDRFragment", @"SimpleColorFragment",
-            @"SimpleTextureLightingFragment", @"SimpleColorVertex",
-            @"ColorFillYCbCr_ChromaOnly", @"UberCompositeFragment",
-            @"BackdropFreezeFragment", @"SimpleTextureFragmentUV",
-            @"BackdropFreezeVertex", @"ShadowCompositeFragment",
-            @"InPlaceAlphaUnpremultiply", @"SimpleTextureFragment",
-            @"SimpleGrayscale", @"Backdrop_Inactive_PlusL",
-            @"UberResampleLanczosFragmentBGRA", @"BackdropHBlur1x",
-            @"ColorFillYCbCr", @"DownsampleClampedBloody4x",
-            @"DownsampleClamped4x", @"UberBackdropFragment",
-            @"Backdrop_Inactive_Masked_PlusL", @"BlurCompositeVertex",
-            @"Backdrop_Inactive_PlusD",
-            @"Backdrop_Inactive_Masked_PlusD", @"UberBackdropVertex",
-            @"BackdropHBlur2x", @"BlurUpsampleVertex",
-            @"BackdropInactiveVertex", @"InPlaceSover",
-            @"SimpleTextureTintFragment", @"ShadowVerticalBlurFragment",
-            @"AlphaTextureFragment", @"BlurComposite",
-            @"SimpleMeshVertex", @"ShadowHorizontalBlurFragment",
-            @"UberResampleLanczosFragmentYCbCr", @"BlurUpsample",
-            @"ShadowVerticalBlurRGBAFragment",
-            @"Backdrop_Inactive_Masked_Sover", @"SimpleVertexShadow"
-        ]];
-    });
-    return [names containsObject:name];
-}
-
-static BOOL macws_skylight_desktop_base_function_name(NSString *name) {
-    // Runtime-confirmed requirements for all 54 functions: these eleven use
-    // function constants and must preserve the caller's specialization path;
-    // every other SkyLight function is an ordinary base request.
-    if (!macws_skylight_desktop_function_name(name)) return NO;
-    return !([name isEqualToString:@"UberCompositeVertex"] ||
-             [name isEqualToString:@"UberCompositeFragment"] ||
-             [name isEqualToString:@"BackdropFreezeFragment"] ||
-             [name isEqualToString:@"ShadowCompositeFragment"] ||
-             [name isEqualToString:@"UberResampleLanczosFragmentBGRA"] ||
-             [name isEqualToString:@"UberBackdropFragment"] ||
-             [name isEqualToString:@"ShadowVerticalBlurFragment"] ||
-             [name isEqualToString:@"BlurComposite"] ||
-             [name isEqualToString:@"ShadowHorizontalBlurFragment"] ||
-             [name isEqualToString:@"UberResampleLanczosFragmentYCbCr"] ||
-             [name isEqualToString:@"ShadowVerticalBlurRGBAFragment"]);
-}
-
-static BOOL macws_mpsimage_desktop_function_name(NSString *name) {
-    return [name isEqualToString:@"sum_rgba_columns"] ||
-           [name isEqualToString:@"sum_rgba_rows"];
-}
-
-static id<MTLLibrary> macws_qc_desktop_library(id<MTLDevice> device) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSData *data = [NSData dataWithContentsOfFile:
-            [NSString stringWithUTF8String:kMacWSQCDesktopLibraryPath]
-                                               options:NSDataReadingMappedIfSafe
-                                                 error:nil];
-        uint64_t observed_hash = data.length
-            ? macws_source_fnv1a64(data.bytes, data.length) : 0;
-        if (data.length != kMacWSQCDesktopLibraryBytes ||
-            observed_hash != kMacWSQCDesktopLibraryHash) {
+        NSString *route_directory =
+            @"/usr/local/share/macws/metal2metal/routes";
+        NSArray<NSString *> *entries = [[[NSFileManager defaultManager]
+            contentsOfDirectoryAtPath:route_directory error:nil]
+            sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray *loaded = [[NSMutableArray alloc] init];
+        for (NSString *entry in entries) {
+            if (![entry hasSuffix:@".route.plist"]) continue;
+            NSString *manifest_path =
+                [route_directory stringByAppendingPathComponent:entry];
+            NSDictionary *manifest = [NSDictionary
+                dictionaryWithContentsOfFile:manifest_path];
+            NSDictionary *source = manifest[@"source"];
+            NSDictionary *output = manifest[@"output"];
+            NSDictionary *translation = manifest[@"translation"];
+            NSDictionary *translated = manifest[@"translated_functions"];
+            NSArray *function_names = source[@"function_names"];
+            NSString *source_path = source[@"runtime_path"];
+            NSString *output_path = output[@"runtime_path"];
+            BOOL valid =
+                [manifest[@"schema_version"] unsignedIntegerValue] == 1 &&
+                [manifest[@"translator"] isEqualToString:
+                    @"macws-metal2metal"] &&
+                [manifest[@"translator_version"] unsignedIntegerValue] == 1 &&
+                [source isKindOfClass:[NSDictionary class]] &&
+                [output isKindOfClass:[NSDictionary class]] &&
+                [translation isKindOfClass:[NSDictionary class]] &&
+                [translated isKindOfClass:[NSDictionary class]] &&
+                translated.count > 0 &&
+                [function_names isKindOfClass:[NSArray class]] &&
+                function_names.count > 0 &&
+                [source_path isKindOfClass:[NSString class]] &&
+                [output_path isKindOfClass:[NSString class]] &&
+                [translation[@"selection_policy"] isEqualToString:
+                    @"all-functions"] &&
+                [translation[@"complete"] boolValue] &&
+                macws_metal2metal_identity_matches(source, source_path) &&
+                macws_metal2metal_identity_matches(output, output_path);
+            NSSet *source_set = valid
+                ? [NSSet setWithArray:function_names] : nil;
+            NSSet *translated_set = valid
+                ? [NSSet setWithArray:translated.allKeys] : nil;
+            valid = valid && source_set.count == function_names.count &&
+                translated_set.count == source_set.count &&
+                [translated_set isEqualToSet:source_set] &&
+                [translation[@"source_function_count"]
+                    unsignedIntegerValue] == source_set.count &&
+                [translation[@"translated_function_count"]
+                    unsignedIntegerValue] == translated_set.count;
+            if (!valid) {
+                if (macws_runtime_diagnostics_enabled()) {
+                    dprintf(STDERR_FILENO,
+                        "#### METAL2METAL rejected-manifest path=%s\n",
+                        manifest_path.UTF8String);
+                }
+                continue;
+            }
+            NSMutableDictionary *route = [manifest mutableCopy];
+            route[@"_manifest_path"] = manifest_path;
+            route[@"_source_names"] = source_set;
+            route[@"_translated_names"] = translated_set;
+            [loaded addObject:route];
+            [route release];
             if (macws_runtime_diagnostics_enabled()) {
                 dprintf(STDERR_FILENO,
-                    "#### QC-DESKTOP-TARGET invalid-library path=%s "
-                    "bytes=%lu hash=%016llx expected=%016llx\n",
-                    kMacWSQCDesktopLibraryPath,
-                    (unsigned long)data.length,
-                    (unsigned long long)observed_hash,
-                    (unsigned long long)kMacWSQCDesktopLibraryHash);
+                    "#### METAL2METAL accepted-manifest path=%s "
+                    "sourceFunctions=%lu translated=%lu\n",
+                    manifest_path.UTF8String,
+                    (unsigned long)source_set.count,
+                    (unsigned long)translated_set.count);
             }
-            return;
         }
-        NSError *error = nil;
-        NSURL *url = [NSURL fileURLWithPath:
-            [NSString stringWithUTF8String:kMacWSQCDesktopLibraryPath]];
-        g_macws_qc_desktop_library = [device newLibraryWithURL:url
-                                                         error:&error];
-        if (macws_runtime_diagnostics_enabled()) {
-            dprintf(STDERR_FILENO,
-                "#### QC-DESKTOP-TARGET library=%p class=%s error=%s\n",
-                (void *)g_macws_qc_desktop_library,
-                g_macws_qc_desktop_library
-                    ? class_getName([g_macws_qc_desktop_library class])
-                    : "(nil)",
-                error ? error.localizedDescription.UTF8String : "(nil)");
-        }
+        g_macws_metal2metal_routes = loaded;
     });
-    return g_macws_qc_desktop_library;
+    return g_macws_metal2metal_routes;
 }
 
-static id<MTLLibrary> macws_skylight_desktop_library(
-        id<MTLDevice> device) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSData *data = [NSData dataWithContentsOfFile:
-            [NSString stringWithUTF8String:kMacWSSkyLightDesktopLibraryPath]
-                                               options:NSDataReadingMappedIfSafe
-                                                 error:nil];
-        if (data.length != kMacWSSkyLightDesktopLibraryBytes ||
-            macws_source_fnv1a64(data.bytes, data.length) !=
-                kMacWSSkyLightDesktopLibraryHash) {
+static NSMutableDictionary *macws_metal2metal_route_for_url(NSURL *url) {
+    NSString *path = url.path.stringByStandardizingPath;
+    if (!path.length) return nil;
+    NSMutableDictionary *match = nil;
+    for (NSMutableDictionary *route in macws_metal2metal_routes()) {
+        NSString *source_path = route[@"source"][@"runtime_path"];
+        if (![path isEqualToString:source_path.stringByStandardizingPath])
+            continue;
+        if (match) {
             if (macws_runtime_diagnostics_enabled()) {
                 dprintf(STDERR_FILENO,
-                    "#### MACWS-METAL-TARGET invalid-library path=%s "
-                    "bytes=%lu\n",
-                    kMacWSSkyLightDesktopLibraryPath,
-                    (unsigned long)data.length);
+                    "#### METAL2METAL ambiguous-url path=%s\n",
+                    path.UTF8String);
             }
-            return;
+            return nil;
         }
-        NSError *error = nil;
-        NSURL *url = [NSURL fileURLWithPath:
-            [NSString stringWithUTF8String:kMacWSSkyLightDesktopLibraryPath]];
-        g_macws_skylight_desktop_library =
-            [device newLibraryWithURL:url error:&error];
-        if (macws_runtime_diagnostics_enabled()) {
-            dprintf(STDERR_FILENO,
-                "#### MACWS-METAL-TARGET library=%p path=%s error=%s\n",
-                (void *)g_macws_skylight_desktop_library,
-                kMacWSSkyLightDesktopLibraryPath,
-                error ? error.localizedDescription.UTF8String : "(nil)");
-        }
-    });
-    return g_macws_skylight_desktop_library;
+        match = route;
+    }
+    return match;
 }
 
-static id<MTLLibrary> macws_mpsimage_desktop_library(
-        id<MTLDevice> device) {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSData *data = [NSData dataWithContentsOfFile:
-            [NSString stringWithUTF8String:kMacWSMPSImageDesktopLibraryPath]
-                                               options:NSDataReadingMappedIfSafe
-                                                 error:nil];
-        if (data.length != kMacWSMPSImageDesktopLibraryBytes ||
-            macws_source_fnv1a64(data.bytes, data.length) !=
-                kMacWSMPSImageDesktopLibraryHash) {
+static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
+    if (!library || objc_getAssociatedObject(
+            library, kMacWSMetal2MetalCompanionKey)) return nil;
+    NSMutableDictionary *associated = objc_getAssociatedObject(
+        library, kMacWSMetal2MetalLibraryRouteKey);
+    if (associated) return associated;
+
+    NSArray *names = nil;
+    @try { names = [(id<MTLLibrary>)library functionNames]; }
+    @catch (NSException *exception) { (void)exception; }
+    if (!names.count) return nil;
+    NSSet *observed = [NSSet setWithArray:names];
+    if (observed.count != names.count) return nil;
+    NSMutableDictionary *match = nil;
+    for (NSMutableDictionary *route in macws_metal2metal_routes()) {
+        NSSet *expected = route[@"_source_names"];
+        if (![observed isEqualToSet:expected]) continue;
+        if (match) {
             if (macws_runtime_diagnostics_enabled()) {
                 dprintf(STDERR_FILENO,
-                    "#### MACWS-METAL-TARGET invalid-library path=%s "
-                    "bytes=%lu\n", kMacWSMPSImageDesktopLibraryPath,
-                    (unsigned long)data.length);
+                    "#### METAL2METAL ambiguous-library library=%p "
+                    "functions=%lu\n", (void *)library,
+                    (unsigned long)observed.count);
             }
-            return;
+            return nil;
         }
-        NSError *error = nil;
-        NSURL *url = [NSURL fileURLWithPath:
-            [NSString stringWithUTF8String:kMacWSMPSImageDesktopLibraryPath]];
-        g_macws_mpsimage_desktop_library =
-            [device newLibraryWithURL:url error:&error];
-        if (macws_runtime_diagnostics_enabled()) {
-            dprintf(STDERR_FILENO,
-                "#### MACWS-METAL-TARGET library=%p path=%s error=%s\n",
-                (void *)g_macws_mpsimage_desktop_library,
-                kMacWSMPSImageDesktopLibraryPath,
-                error ? error.localizedDescription.UTF8String : "(nil)");
-        }
-    });
-    return g_macws_mpsimage_desktop_library;
+        match = route;
+    }
+    if (match) {
+        objc_setAssociatedObject(
+            library, kMacWSMetal2MetalLibraryRouteKey, match,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return match;
 }
 
-static id<MTLLibrary> macws_qc_desktop_library_for_request(
+static NSDictionary *macws_metal2metal_function_contract(
+        NSMutableDictionary *route, NSString *name) {
+    if (!route || !name.length) return nil;
+    NSDictionary *contract = route[@"translated_functions"][name];
+    return [contract isKindOfClass:[NSDictionary class]] ? contract : nil;
+}
+
+static id<MTLLibrary> macws_metal2metal_companion(
+        NSMutableDictionary *route, id<MTLDevice> device) {
+    if (!route || !device) return nil;
+    @synchronized (route) {
+        id<MTLLibrary> library = route[@"_companion"];
+        if (library) return library;
+        NSString *path = route[@"output"][@"runtime_path"];
+        NSURL *url = [NSURL fileURLWithPath:path];
+        NSError *error = nil;
+        library = g_macws_new_library_url_orig
+            ? g_macws_new_library_url_orig(
+                device, @selector(newLibraryWithURL:error:), url, &error)
+            : [device newLibraryWithURL:url error:&error];
+        if (library) {
+            objc_setAssociatedObject(
+                library, kMacWSMetal2MetalCompanionKey, @YES,
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            route[@"_companion"] = library;
+        }
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### METAL2METAL companion=%p path=%s error=%s\n",
+                (void *)library, path.UTF8String,
+                error ? error.localizedDescription.UTF8String : "(nil)");
+        }
+        return library;
+    }
+}
+
+static id<MTLLibrary> macws_metal2metal_library_for_request(
         id self, NSString *name) {
     if (!getenv("MACWS_AGX_NATIVE")) return nil;
-    BOOL quartzcore_function = macws_qc_desktop_function_name(name);
-    BOOL skylight_function = macws_skylight_desktop_function_name(name);
-    BOOL mpsimage_function = macws_mpsimage_desktop_function_name(name);
-    if ((!quartzcore_function && !skylight_function && !mpsimage_function) ||
-        self == g_macws_qc_desktop_library ||
-        self == g_macws_skylight_desktop_library ||
-        self == g_macws_mpsimage_desktop_library) return nil;
+    NSMutableDictionary *route =
+        macws_metal2metal_route_for_library(self);
+    if (!macws_metal2metal_function_contract(route, name)) return nil;
     id<MTLDevice> device = nil;
     @try { device = [(id<MTLLibrary>)self device]; }
     @catch (NSException *exception) { (void)exception; }
-    if (!device) return nil;
-    if (quartzcore_function) return macws_qc_desktop_library(device);
-    if (skylight_function) return macws_skylight_desktop_library(device);
-    return macws_mpsimage_desktop_library(device);
+    return macws_metal2metal_companion(route, device);
+}
+
+static id macws_new_library_url_metal2metal(
+        id self, SEL selector, NSURL *url, NSError **error)
+    __attribute__((ns_returns_retained));
+static id macws_new_library_url_metal2metal(
+        id self, SEL selector, NSURL *url, NSError **error) {
+    id library = g_macws_new_library_url_orig
+        ? g_macws_new_library_url_orig(self, selector, url, error) : nil;
+    if (!library || !getenv("MACWS_AGX_NATIVE")) return library;
+
+    NSString *path = url.path.stringByStandardizingPath;
+    NSMutableDictionary *route = macws_metal2metal_route_for_url(url);
+    if (route) {
+        objc_setAssociatedObject(
+            library, kMacWSMetal2MetalLibraryRouteKey, route,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        for (NSMutableDictionary *candidate in macws_metal2metal_routes()) {
+            NSString *output_path =
+                candidate[@"output"][@"runtime_path"];
+            if (![path isEqualToString:
+                    output_path.stringByStandardizingPath]) continue;
+            objc_setAssociatedObject(
+                library, kMacWSMetal2MetalCompanionKey, @YES,
+                OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            break;
+        }
+    }
+    if (route && macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### METAL2METAL attributed-library library=%p path=%s "
+            "manifest=%s\n", (void *)library, path.UTF8String,
+            [route[@"_manifest_path"] UTF8String]);
+    }
+    return library;
+}
+
+static void macws_install_metal2metal_url_routing(Class agx) {
+    SEL selector = @selector(newLibraryWithURL:error:);
+    Method method = class_getInstanceMethod(agx, selector);
+    if (!method) {
+        if (macws_runtime_diagnostics_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### METAL2METAL missing newLibraryWithURL:error: on %s\n",
+                class_getName(agx));
+        }
+        return;
+    }
+    IMP current = method_getImplementation(method);
+    if (current == (IMP)macws_new_library_url_metal2metal) return;
+    g_macws_new_library_url_orig = (macws_new_library_url_fn)current;
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(
+            agx, selector, (IMP)macws_new_library_url_metal2metal, types)) {
+        Method own = class_getInstanceMethod(agx, selector);
+        method_setImplementation(
+            own, (IMP)macws_new_library_url_metal2metal);
+    }
+    if (macws_runtime_diagnostics_enabled()) {
+        dprintf(STDERR_FILENO,
+            "#### METAL2METAL URL routing installed class=%s orig=%p\n",
+            class_getName(agx), (void *)current);
+    }
 }
 
 static id macws_skylight_function_compat(
@@ -14863,19 +14902,17 @@ static id macws_skylight_function_compat(
     __attribute__((ns_returns_retained));
 static id macws_skylight_function_compat(
         id self, SEL selector, NSString *name) {
-    // Runtime-confirmed by metal_source_probe against every function in the
-    // exact Ventura SkyLightShaders library: redirect the 43 functions with
-    // needsFunctionConstantValues=NO here, and leave the other eleven to the
-    // specialization hooks below. MPSImage's runtime-confirmed reduction
-    // functions have the same zero-constant contract.
-    // QuartzCore's fixed_* functions are intentionally excluded because all
-    // three require specialization.
-    BOOL base_function_target =
-        macws_qc_desktop_base_function_name(name) ||
-        macws_skylight_desktop_base_function_name(name) ||
-        macws_mpsimage_desktop_function_name(name);
-    id<MTLLibrary> library = base_function_target
-        ? macws_qc_desktop_library_for_request(self, name) : nil;
+    NSMutableDictionary *route =
+        macws_metal2metal_route_for_library(self);
+    NSDictionary *contract =
+        macws_metal2metal_function_contract(route, name);
+    BOOL needs_constants =
+        [contract[@"needs_function_constants"] boolValue];
+    id<MTLDevice> device = nil;
+    @try { device = [(id<MTLLibrary>)self device]; }
+    @catch (NSException *exception) { (void)exception; }
+    id<MTLLibrary> library = contract && !needs_constants
+        ? macws_metal2metal_companion(route, device) : nil;
     if (library && g_macws_skylight_function_orig) {
         id function = g_macws_skylight_function_orig(
             library, selector, name);
@@ -14890,8 +14927,14 @@ static id macws_skylight_function_compat(
             return function;
         }
     }
-    return g_macws_skylight_function_orig
+    id original = g_macws_skylight_function_orig
         ? g_macws_skylight_function_orig(self, selector, name) : nil;
+    if (original && contract) {
+        objc_setAssociatedObject(
+            original, kMacWSMetal2MetalFunctionRouteKey, route,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return original;
 }
 
 static id macws_qc_specialization_result(
@@ -14937,14 +14980,15 @@ static id macws_desktop_specialized_function_compat(
         (void)exception;
     }
 
-    BOOL quartzcore_function = macws_qc_desktop_function_name(name);
-    BOOL skylight_function = macws_skylight_desktop_function_name(name);
+    NSMutableDictionary *route = objc_getAssociatedObject(
+        self, kMacWSMetal2MetalFunctionRouteKey);
+    NSDictionary *contract =
+        macws_metal2metal_function_contract(route, name);
     if (getenv("MACWS_AGX_NATIVE") && device &&
-        (quartzcore_function || skylight_function) &&
+        contract &&
         g_macws_desktop_function_specialize_orig) {
-        id<MTLLibrary> library = quartzcore_function
-            ? macws_qc_desktop_library(device)
-            : macws_skylight_desktop_library(device);
+        id<MTLLibrary> library =
+            macws_metal2metal_companion(route, device);
         id base_function = library
             ? [library newFunctionWithName:name] : nil;
         if (base_function && base_function != self) {
@@ -14997,14 +15041,15 @@ static void macws_desktop_specialized_function_async_compat(
         (void)exception;
     }
 
-    BOOL quartzcore_function = macws_qc_desktop_function_name(name);
-    BOOL skylight_function = macws_skylight_desktop_function_name(name);
+    NSMutableDictionary *route = objc_getAssociatedObject(
+        self, kMacWSMetal2MetalFunctionRouteKey);
+    NSDictionary *contract =
+        macws_metal2metal_function_contract(route, name);
     if (getenv("MACWS_AGX_NATIVE") && device &&
-        (quartzcore_function || skylight_function) &&
+        contract &&
         g_macws_desktop_function_specialize_async_orig) {
-        id<MTLLibrary> library = quartzcore_function
-            ? macws_qc_desktop_library(device)
-            : macws_skylight_desktop_library(device);
+        id<MTLLibrary> library =
+            macws_metal2metal_companion(route, device);
         id base_function = library
             ? [library newFunctionWithName:name] : nil;
         if (base_function && base_function != self) {
@@ -15039,7 +15084,7 @@ static id macws_qc_specialize_basic_compat(
         id self, SEL selector, NSString *name,
         MTLFunctionConstantValues *constant_values, NSError **error) {
     id<MTLLibrary> library =
-        macws_qc_desktop_library_for_request(self, name);
+        macws_metal2metal_library_for_request(self, name);
     if (library && g_macws_qc_specialize_basic_orig) {
         NSError *compatibility_error = nil;
         id function = g_macws_qc_specialize_basic_orig(
@@ -15052,20 +15097,15 @@ static id macws_qc_specialize_basic_compat(
     id original_function = g_macws_qc_specialize_basic_orig
         ? g_macws_qc_specialize_basic_orig(
               self, selector, name, constant_values, error) : nil;
-    // ShaderComposer::UberComposite stores the result of this call directly
-    // in its unordered-map cache.  Runtime crash evidence from the native
-    // three-finger Mission Control transition showed that one previously
-    // unseen key stored nil, after which MetalBacking passed that nil
-    // MetalShader to CopyPipelineState and faulted at this+0x28.  Record the
-    // actual Metal specialization result/error here, at the upstream failure
-    // boundary.  Do not replace the nil result or alter the cache contract.
+    // Record every manifest-routed failure at the upstream specialization
+    // boundary. Do not maintain another diagnostic shader-name subset.
+    NSMutableDictionary *route =
+        macws_metal2metal_route_for_library(self);
     if (macws_runtime_diagnostics_enabled() &&
-        ([name isEqualToString:@"UberCompositeVertex"] ||
-         [name isEqualToString:@"UberCompositeFragment"] ||
-         [name isEqualToString:@"UberResampleLanczosFragmentBGRA"])) {
+        macws_metal2metal_function_contract(route, name)) {
         NSError *specialization_error = error ? *error : nil;
         dprintf(STDERR_FILENO,
-            "#### SKYLIGHT-UBER-SPECIALIZE selector=%s name=%s "
+            "#### METAL2METAL-SPECIALIZE selector=%s name=%s "
             "constants=%p function=%p errorDomain=%s errorCode=%ld "
             "description=%s\n",
             sel_getName(selector), name.UTF8String,
@@ -15089,7 +15129,7 @@ static id macws_qc_specialize_cache_compat(
         MTLFunctionConstantValues *constant_values, id function_cache,
         NSError **error) {
     id<MTLLibrary> library =
-        macws_qc_desktop_library_for_request(self, name);
+        macws_metal2metal_library_for_request(self, name);
     if (library && g_macws_qc_specialize_cache_orig) {
         NSError *compatibility_error = nil;
         id function = g_macws_qc_specialize_cache_orig(
@@ -15115,7 +15155,7 @@ static id macws_qc_specialize_pipeline_compat(
         MTLFunctionConstantValues *constant_values, id pipeline_library,
         NSError **error) {
     id<MTLLibrary> library =
-        macws_qc_desktop_library_for_request(self, name);
+        macws_metal2metal_library_for_request(self, name);
     if (library && g_macws_qc_specialize_pipeline_orig) {
         NSError *compatibility_error = nil;
         id function = g_macws_qc_specialize_pipeline_orig(
@@ -15142,7 +15182,7 @@ static id macws_qc_specialize_named_compat(
         MTLFunctionConstantValues *constant_values, id function_cache,
         NSString *specialized_name, NSError **error) {
     id<MTLLibrary> library =
-        macws_qc_desktop_library_for_request(self, name);
+        macws_metal2metal_library_for_request(self, name);
     if (library && g_macws_qc_specialize_named_orig) {
         NSError *compatibility_error = nil;
         id function = g_macws_qc_specialize_named_orig(
@@ -15373,6 +15413,7 @@ static void install_agx_init_redirect(Class agx) {
     macws_install_tile_descriptor_diagnostic();
     macws_install_source_library_diagnostic(agx);
     macws_install_data_library_compatibility(agx);
+    macws_install_metal2metal_url_routing(agx);
     macws_install_qc_desktop_function_compatibility();
     macws_install_render_pipeline_diagnostic(agx);
     macws_install_stray_render_execution_trace();

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reassemble selected AIR modules in an iOS/macOS MTLB for Mac Catalyst.
+"""Reassemble AIR modules in an iOS/macOS MTLB for another Apple target.
 
 This is a structural target conversion, not a loader/check bypass. Selected
 AIR modules are normally round-tripped through llvm-dis/llvm-as with their
@@ -8,6 +8,12 @@ bitcode dialect an upstream llvm-as cannot reproduce, a same-length target
 triple can instead be patched in place. The MTLB function records receive the
 real new byte sizes, SHA-256 hashes, and bitcode offsets; the container header
 and trailing-section offsets are then rebuilt around the new bitcode section.
+
+Known incompatibilities can be lowered by stable AIR/LLVM symbol and IR shape,
+without a function-name allowlist. An optional JSON report inventories each
+function's MTLB type/version fields and its AIR target, stage, layout, ABI
+metadata keys/symbols, and applied lowerings so additions and coverage gaps are
+machine-reviewable.
 
 The parser follows the tag/section layout documented by YuAo's
 MetalLibraryArchive and validates each input function hash before touching it.
@@ -19,11 +25,19 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import pathlib
 import re
 import struct
 import subprocess
 import tempfile
+
+from metal2metal_manifest import (
+    build_runtime_manifest,
+    verify_runtime_manifest,
+    write_runtime_manifest,
+)
+from metal2metal_profiles import DEFAULT_PROFILE, PROFILES, get_profile
 
 
 MACOS_PLATFORM = 0x8001
@@ -35,28 +49,70 @@ UNKNOWN_TARGET_OS = 0x00
 CURRENT_MTLB_FILE_VERSION = (2, 7)
 MTLB_HEADER_SIZE = 88
 OFFSET_SECTION_TAGS = {"HDYN", "VLST", "ILST", "HSRD", "HSRC", "RLST"}
+ABI_REPORT_VERSION = 1
+FUNCTION_TYPES = {
+    0x00: "vertex",
+    0x01: "fragment",
+    0x02: "kernel",
+    0x03: "unqualified",
+    0x04: "visible",
+    0x05: "extern",
+    0x06: "intersection",
+    0x07: "mesh",
+    0x08: "object",
+}
 OUTPUT_CONTAINER_TARGETS = {
     "macabi": (MACOS_PLATFORM, MACABI_TARGET_OS),
     "ios": (IOS_PLATFORM, IOS_TARGET_OS),
     "macos": (MACOS_PLATFORM, MACOS_TARGET_OS),
 }
 
+AIR_TARGET_LINE = re.compile(
+    r'^target triple = "(?P<triple>air64(?:_v[0-9]+)?-apple-'
+    r'(?:ios|macosx)[^\"]*)"$',
+    re.MULTILINE,
+)
+AIR_DATALAYOUT_LINE = re.compile(
+    r'^target datalayout = "(?P<layout>[^\"]+)"$',
+    re.MULTILINE,
+)
+AIR_STAGE_METADATA = {
+    "vertex": re.compile(r"^!air\.vertex\s*=", re.MULTILINE),
+    "fragment": re.compile(r"^!air\.fragment\s*=", re.MULTILINE),
+    "kernel": re.compile(r"^!air\.kernel\s*=", re.MULTILINE),
+    "mesh": re.compile(r"^!air\.mesh\s*=", re.MULTILINE),
+    "object": re.compile(r"^!air\.object\s*=", re.MULTILINE),
+}
+AIR_ABI_SYMBOL = re.compile(
+    r"@(?P<symbol>(?:air|llvm)\.[-a-zA-Z$._0-9]+)\("
+)
+AIR_ABI_METADATA_KEY = re.compile(
+    r'!"(?P<key>air\.[-a-zA-Z$._0-9]+)"'
+)
+AIR_TARGET_BYTES = re.compile(
+    rb"air64(?:_v[0-9]+)?-apple-(?:ios|macosx)[0-9]+"
+    rb"(?:\.[0-9]+){0,2}(?:-macabi)?"
+)
+
 
 def target_triple_matches_container(target_triple: str,
                                     container_target: str) -> bool:
     if container_target == "macabi":
         return re.fullmatch(
-            r"air64-apple-ios[0-9]+(?:\.[0-9]+){0,2}-macabi",
+            r"air64(?:_v[0-9]+)?-apple-ios[0-9]+"
+            r"(?:\.[0-9]+){0,2}-macabi",
             target_triple,
         ) is not None
     if container_target == "ios":
         return re.fullmatch(
-            r"air64-apple-ios[0-9]+(?:\.[0-9]+){0,2}",
+            r"air64(?:_v[0-9]+)?-apple-ios[0-9]+"
+            r"(?:\.[0-9]+){0,2}",
             target_triple,
         ) is not None
     if container_target == "macos":
         return re.fullmatch(
-            r"air64-apple-macosx[0-9]+(?:\.[0-9]+){0,2}",
+            r"air64(?:_v[0-9]+)?-apple-macosx[0-9]+"
+            r"(?:\.[0-9]+){0,2}",
             target_triple,
         ) is not None
     return False
@@ -65,10 +121,7 @@ def target_triple_matches_container(target_triple: str,
 def retarget_air_in_place(module: bytes, name: str,
                           target_triple: str) -> bytes:
     """Replace one same-length AIR target without re-encoding Apple bitcode."""
-    pattern = re.compile(
-        rb"air64-apple-(?:ios|macosx)[0-9]+(?:\.[0-9]+){0,2}"
-    )
-    matches = list(pattern.finditer(module))
+    matches = list(AIR_TARGET_BYTES.finditer(module))
     if len(matches) != 1:
         raise ValueError(
             f"{name}: expected exactly one AIR target triple, "
@@ -135,14 +188,30 @@ def parse_function_records(data: bytes | bytearray) -> list[dict[str, object]]:
             raise ValueError(f"function {index}: incomplete function record")
         if tags["HASH"][1] != 32 or tags["OFFT"][1] != 24 or tags["MDSZ"][1] != 8:
             raise ValueError(f"function {index}: unexpected fixed tag size")
+        if "TYPE" in tags and tags["TYPE"][1] != 1:
+            raise ValueError(f"function {index}: unexpected TYPE tag size")
+        if "VERS" in tags and tags["VERS"][1] != 8:
+            raise ValueError(f"function {index}: unexpected VERS tag size")
         name_offset, name_size = tags["NAME"]
         name_bytes = bytes(data[name_offset : name_offset + name_size])
         if not name_bytes.endswith(b"\0"):
             raise ValueError(f"function {index}: NAME is not NUL-terminated")
+        function_type = None
+        if "TYPE" in tags:
+            function_type = data[tags["TYPE"][0]]
+        versions = None
+        if "VERS" in tags:
+            versions = struct.unpack_from("<HHHH", data, tags["VERS"][0])
         records.append({
             "index": index,
             "name": name_bytes[:-1].decode("utf-8"),
             "tags": tags,
+            "function_type": function_type,
+            "function_type_name": FUNCTION_TYPES.get(
+                function_type, "unknown" if function_type is not None else None
+            ),
+            "air_version": list(versions[:2]) if versions else None,
+            "language_version": list(versions[2:]) if versions else None,
             "bitcode_offset": u64(data, tags["OFFT"][0] + 16),
             "bitcode_size": u64(data, tags["MDSZ"][0]),
         })
@@ -180,8 +249,100 @@ def parse_header_extension_tags(data: bytearray) -> list[tuple[str, int, int]]:
     raise ValueError("header extension has no ENDT marker")
 
 
+def analyze_air_assembly(text: str, name: str) -> dict[str, object]:
+    """Return the target and stable ABI vocabulary declared by one AIR module.
+
+    This mirrors the useful boundary in reims-vgpu/metal2vulkan: metadata and
+    stable AIR/LLVM symbols describe the shader contract; a function name does
+    not.  The report is intentionally read-only and never decides whether a
+    transform is safe.
+    """
+    target_matches = list(AIR_TARGET_LINE.finditer(text))
+    if len(target_matches) != 1:
+        raise ValueError(
+            f"{name}: expected exactly one AIR target triple, "
+            f"found {len(target_matches)}"
+        )
+    datalayout_matches = list(AIR_DATALAYOUT_LINE.finditer(text))
+    if len(datalayout_matches) > 1:
+        raise ValueError(
+            f"{name}: expected at most one AIR datalayout, "
+            f"found {len(datalayout_matches)}"
+        )
+    return {
+        "target_triple": target_matches[0].group("triple"),
+        "datalayout": (
+            datalayout_matches[0].group("layout")
+            if datalayout_matches else None
+        ),
+        "stage_metadata": [
+            stage for stage, pattern in AIR_STAGE_METADATA.items()
+            if pattern.search(text)
+        ],
+        "abi_symbols": sorted({
+            match.group("symbol") for match in AIR_ABI_SYMBOL.finditer(text)
+        }),
+        "abi_metadata_keys": sorted({
+            match.group("key")
+            for match in AIR_ABI_METADATA_KEY.finditer(text)
+        }),
+        "function_constants": parse_function_constants(text),
+    }
+
+
+def parse_function_constants(text: str) -> list[dict[str, object]]:
+    """Read stable AIR function-constant initializer globals.
+
+    Apple's AIR ABI emits one module-scope symbol named
+    ``<base>.MTL_FC_INIT_<index>_<type>`` in the ``air.fc_initializer``
+    section. This is the same structural marker consumed by metal2vulkan;
+    shader names and observed workload names are deliberately irrelevant.
+    """
+    constants: dict[int, dict[str, object]] = {}
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if (not stripped.startswith("@") or
+                ".MTL_FC_INIT_" not in stripped or
+                'section "air.fc_initializer"' not in stripped):
+            continue
+        declaration_parts = stripped.split(" = ", 1)
+        if len(declaration_parts) != 2:
+            continue
+        symbol, declaration = declaration_parts
+        marker_parts = symbol[1:].split(".MTL_FC_INIT_", 1)
+        if len(marker_parts) != 2:
+            continue
+        marker = marker_parts[1]
+        # Only the leading run is the index; ABI encodings may also contain
+        # digits (for example Dv4_j).
+        leading_digits = re.match(r"[0-9]+", marker)
+        if not leading_digits:
+            continue
+        index_text = leading_digits.group(0)
+        index = int(index_text)
+        suffix = marker[len(index_text):]
+        abi_type = suffix[1:] if suffix.startswith("_") else ""
+        type_name = ""
+        for keyword in (" constant ", " global "):
+            if keyword not in declaration:
+                continue
+            remainder = declaration.split(keyword, 1)[1].lstrip()
+            if remainder.startswith("<") and ">" in remainder:
+                type_name = remainder[:remainder.index(">") + 1]
+            elif remainder:
+                type_name = remainder.split(None, 1)[0]
+            break
+        constants.setdefault(index, {
+            "index": index,
+            "name": marker_parts[0],
+            "type": type_name,
+            "abi_type": abi_type,
+        })
+    return [constants[index] for index in sorted(constants)]
+
+
 def rewrite_fract_v3f16(text: str, name: str) -> str:
-    """Lower the one unsupported half3 fract call without weakening AGX.
+    """Lower unsupported half3 fract calls without weakening AGX.
 
     Ventura QuartzCore's fixed_frag_lph_cpf contains one
     air.fract.v3f16(x).  The iOS 16.3 AGX compiler renames that declaration
@@ -198,12 +359,20 @@ def rewrite_fract_v3f16(text: str, name: str) -> str:
         re.MULTILINE,
     )
 
+    if "%macws.fract.v3f16.floor" in text:
+        raise ValueError(f"{name}: reserved fract lowering name already exists")
+    call_index = 0
+
     def replace_call(match: re.Match[str]) -> str:
+        nonlocal call_index
         indent = match.group("indent")
         result = match.group("result")
         argument = match.group("argument")
         attributes = match.group("attributes")
         floor_result = "%macws.fract.v3f16.floor"
+        if call_index:
+            floor_result += f".{call_index}"
+        call_index += 1
         return (
             f"{indent}{floor_result} = tail call fast <3 x half> "
             f"@air.floor.v3f16(<3 x half> {argument}) {attributes}\n"
@@ -222,9 +391,10 @@ def rewrite_fract_v3f16(text: str, name: str) -> str:
         r"local_unnamed_addr \g<attributes>",
         text,
     )
-    if call_count != 1 or declaration_count != 1:
+    if call_count < 1 or declaration_count != 1:
         raise ValueError(
-            f"{name}: expected exactly one fract.v3f16 call/declaration, "
+            f"{name}: expected one or more fract.v3f16 calls and exactly "
+            "one declaration, "
             f"found {call_count}/{declaration_count}"
         )
     if "@air.fract.v3f16" in text:
@@ -233,7 +403,7 @@ def rewrite_fract_v3f16(text: str, name: str) -> str:
 
 
 def lower_zero_memset_24(text: str, name: str) -> str:
-    """Lower one fixed 24-byte zero memset to ordinary AIR stores.
+    """Lower fixed 24-byte zero memsets to ordinary AIR stores.
 
     Ventura's Metal frontend emits this LLVM intrinsic while copying a
     three-element float2 varying array.  The iOS 16.3 AGX compiler accepts the
@@ -241,6 +411,8 @@ def lower_zero_memset_24(text: str, name: str) -> str:
     Three aligned i64 stores are byte-for-byte equivalent and remain subject
     to the normal AIR verifier and AGX code generator.
     """
+    if "%macws.memset." in text:
+        raise ValueError(f"{name}: reserved memset lowering name already exists")
     call_pattern = re.compile(
         r"^(?P<indent>\s*)call void @llvm\.memset\.p0i8\.i64\("
         r"i8\* nonnull align 8 dereferenceable\(24\) "
@@ -248,19 +420,31 @@ def lower_zero_memset_24(text: str, name: str) -> str:
         re.MULTILINE,
     )
 
+    call_index = 0
+
+    def lowered_name(kind: str, word_index: int, lowering_index: int) -> str:
+        if lowering_index == 0:
+            return f"%macws.memset.{kind}.{word_index}"
+        return f"%macws.memset.{kind}.{lowering_index}.{word_index}"
+
     def replace_call(match: re.Match[str]) -> str:
+        nonlocal call_index
         indent = match.group("indent")
         pointer = match.group("pointer")
+        lowering_index = call_index
+        call_index += 1
         lines = []
         for index, offset in enumerate((0, 8, 16)):
             byte_pointer = pointer
             if offset:
-                byte_pointer = f"%macws.memset.byte.{index}"
+                byte_pointer = lowered_name(
+                    "byte", index, lowering_index
+                )
                 lines.append(
                     f"{indent}{byte_pointer} = getelementptr inbounds i8, "
                     f"i8* {pointer}, i64 {offset}"
                 )
-            word_pointer = f"%macws.memset.word.{index}"
+            word_pointer = lowered_name("word", index, lowering_index)
             lines.append(
                 f"{indent}{word_pointer} = bitcast i8* {byte_pointer} to i64*"
             )
@@ -282,13 +466,18 @@ def lower_zero_memset_24(text: str, name: str) -> str:
     )
 
     def replace_opaque_call(match: re.Match[str]) -> str:
+        nonlocal call_index
         indent = match.group("indent")
         pointer = match.group("pointer")
+        lowering_index = call_index
+        call_index += 1
         lines = []
         for index, offset in enumerate((0, 8, 16)):
             word_pointer = pointer
             if offset:
-                word_pointer = f"%macws.memset.word.{index}"
+                word_pointer = lowered_name(
+                    "word", index, lowering_index
+                )
                 lines.append(
                     f"{indent}{word_pointer} = getelementptr inbounds i8, "
                     f"ptr {pointer}, i64 {offset}"
@@ -319,15 +508,92 @@ def lower_zero_memset_24(text: str, name: str) -> str:
     declaration_count = (
         typed_declaration_count + opaque_declaration_count
     )
-    if call_count != 1 or declaration_count != 1:
+    if call_count < 1 or declaration_count < 1:
         raise ValueError(
-            f"{name}: expected exactly one fixed zero memset "
-            f"call/declaration, found {call_count}/{declaration_count}"
+            f"{name}: expected one or more fixed zero memset calls and "
+            "at least one matching declaration, "
+            f"found {call_count}/{declaration_count}"
         )
     if ("@llvm.memset.p0i8.i64" in text or
             "@llvm.memset.p0.i64" in text):
         raise ValueError(f"{name}: residual llvm.memset reference")
     return text
+
+
+KNOWN_AIR_LOWERINGS = (
+    {
+        "name": "fract-v3f16",
+        "detector": re.compile(
+            r"\bcall\b[^\n]*@air\.fract\.v3f16\("
+        ),
+        "apply": rewrite_fract_v3f16,
+    },
+    {
+        "name": "zero-memset-24",
+        "detector": re.compile(
+            r"\bcall\b[^\n]*@llvm\.memset\.p0(?:i8)?\.i64\("
+            r"[^\n]*i64 24, i1 false\)"
+        ),
+        "apply": lower_zero_memset_24,
+    },
+)
+
+
+def apply_air_lowerings(
+    text: str,
+    name: str,
+    explicitly_requested: set[str],
+    auto_lower_known_air: bool,
+) -> tuple[str, list[str]]:
+    """Apply semantic lowerings selected by stable IR shape, never by name."""
+    known_names = {
+        str(lowering["name"]) for lowering in KNOWN_AIR_LOWERINGS
+    }
+    unknown_names = explicitly_requested - known_names
+    if unknown_names:
+        raise ValueError(
+            f"{name}: unknown AIR lowering(s): " +
+            ", ".join(sorted(unknown_names))
+        )
+    selected = set(explicitly_requested)
+    if auto_lower_known_air:
+        for lowering in KNOWN_AIR_LOWERINGS:
+            detector = lowering["detector"]
+            assert isinstance(detector, re.Pattern)
+            if detector.search(text):
+                selected.add(str(lowering["name"]))
+
+    applied: list[str] = []
+    for lowering in KNOWN_AIR_LOWERINGS:
+        lowering_name = str(lowering["name"])
+        if lowering_name not in selected:
+            continue
+        apply = lowering["apply"]
+        text = apply(text, name)
+        applied.append(lowering_name)
+    return text, applied
+
+
+def scratch_stem(name: str) -> str:
+    readable = re.sub(r"[^-a-zA-Z0-9._]", "_", name)[:80] or "module"
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return f"{readable}-{digest}"
+
+
+def inspect_air(
+    module: bytes,
+    name: str,
+    llvm_dis: pathlib.Path,
+    scratch: pathlib.Path,
+) -> dict[str, object]:
+    stem = scratch_stem(name)
+    source = scratch / f"{stem}.inspect.air"
+    assembly = scratch / f"{stem}.inspect.ll"
+    source.write_bytes(module)
+    subprocess.run([llvm_dis, source, "-o", assembly], check=True)
+    return analyze_air_assembly(
+        assembly.read_text(encoding="utf-8"), name
+    )
 
 
 def retarget_air(
@@ -339,36 +605,85 @@ def retarget_air(
     scratch: pathlib.Path,
     lower_fract_v3f16: bool,
     lower_zero_memset: bool,
-) -> bytes:
-    source = scratch / f"{name}.input.air"
-    assembly = scratch / f"{name}.ll"
-    output = scratch / f"{name}.output.air"
+    auto_lower_known_air: bool,
+) -> tuple[bytes, dict[str, object]]:
+    stem = scratch_stem(name)
+    source = scratch / f"{stem}.input.air"
+    assembly = scratch / f"{stem}.ll"
+    output = scratch / f"{stem}.output.air"
     source.write_bytes(module)
     subprocess.run([llvm_dis, source, "-o", assembly], check=True)
     text = assembly.read_text(encoding="utf-8")
-    pattern = re.compile(
-        r'^target triple = "air64-apple-(?:ios|macosx)[^\"]*"$',
-        re.MULTILINE,
+    analysis = analyze_air_assembly(text, name)
+    text, count = AIR_TARGET_LINE.subn(
+        f'target triple = "{target_triple}"', text
     )
-    text, count = pattern.subn(f'target triple = "{target_triple}"', text)
     if count != 1:
         raise ValueError(
             f"{name}: expected one iOS/macOS AIR target triple, found {count}"
         )
+    requested_lowerings = set()
     if lower_fract_v3f16:
-        text = rewrite_fract_v3f16(text, name)
+        requested_lowerings.add("fract-v3f16")
     if lower_zero_memset:
-        text = lower_zero_memset_24(text, name)
+        requested_lowerings.add("zero-memset-24")
+    text, applied_lowerings = apply_air_lowerings(
+        text,
+        name,
+        requested_lowerings,
+        auto_lower_known_air,
+    )
     assembly.write_text(text, encoding="utf-8")
     subprocess.run([llvm_as, assembly, "-o", output], check=True)
     rebuilt = output.read_bytes()
     if rebuilt[:4] != b"\xde\xc0\x17\x0b":
         raise ValueError(f"{name}: llvm-as did not emit wrapped LLVM bitcode")
     padding = (-len(rebuilt)) % 16
-    return rebuilt + b"\0" * padding
+    analysis["output_target_triple"] = target_triple
+    analysis["applied_lowerings"] = applied_lowerings
+    return rebuilt + b"\0" * padding, analysis
 
 
 def convert(args: argparse.Namespace) -> None:
+    profile = get_profile(args.profile)
+    if args.target_triple is None:
+        args.target_triple = profile.target_triple
+    if args.container_target is None:
+        args.container_target = profile.container_target
+    if args.target_major is None:
+        args.target_major = profile.target_major
+    if args.target_minor is None:
+        args.target_minor = profile.target_minor
+    runtime_manifest_fields = (
+        args.runtime_manifest,
+        args.runtime_source_path,
+        args.runtime_output_path,
+    )
+    if any(runtime_manifest_fields) and not all(runtime_manifest_fields):
+        raise ValueError(
+            "--runtime-manifest, --runtime-source-path and "
+            "--runtime-output-path must be supplied together"
+        )
+    if args.runtime_manifest and args.in_place_air_target:
+        raise ValueError(
+            "runtime manifests require decoded AIR metadata; "
+            "--in-place-air-target is target-only"
+        )
+    if args.runtime_manifest and args.function:
+        raise ValueError(
+            "runtime routing manifests require complete-library translation; "
+            "--function is accepted only for diagnostics and offline assets"
+        )
+    if args.runtime_manifest and (
+        args.target_triple != profile.target_triple or
+        args.container_target != profile.container_target or
+        args.target_major != profile.target_major or
+        args.target_minor != profile.target_minor
+    ):
+        raise ValueError(
+            "runtime routing manifests must use the selected profile without "
+            "target overrides"
+        )
     input_path = pathlib.Path(args.input)
     output_path = pathlib.Path(args.output)
     original = input_path.read_bytes()
@@ -415,10 +730,12 @@ def convert(args: argparse.Namespace) -> None:
                 "legacy 2.3/unknown-target MTLB format"
             )
         if (args.preserve_container_target or selected_names or
-                fract_rewrite_names or zero_memset_names):
+                fract_rewrite_names or zero_memset_names or
+                args.auto_lower_known_air):
             raise ValueError(
                 "--in-place-air-target cannot be combined with selective "
-                "AIR conversion or --preserve-container-target"
+                "AIR conversion, semantic lowering, or "
+                "--preserve-container-target"
             )
     if (args.preserve_container_target and not selected_names
             and not legacy_unknown_target):
@@ -468,7 +785,9 @@ def convert(args: argparse.Namespace) -> None:
         )
     next_bitcode_offset = 0
     rebuilt_modules: list[bytes] = []
+    function_reports: list[dict[str, object]] = []
     converted_count = 0
+    lowering_count = 0
     with tempfile.TemporaryDirectory(prefix="macws-macabi-mtlb-") as temp:
         scratch = pathlib.Path(temp)
         for record in records:
@@ -483,6 +802,12 @@ def convert(args: argparse.Namespace) -> None:
             hash_offset = tags["HASH"][0]
             if hashlib.sha256(module).digest() != original[hash_offset : hash_offset + 32]:
                 raise ValueError(f"{record['name']}: input SHA-256 mismatch")
+            logical_name = f"{record['index']}-{record['name']}"
+            selected = (
+                args.in_place_air_target or not selected_names or
+                str(record["name"]) in selected_names
+            )
+            analysis: dict[str, object] | None = None
             if args.in_place_air_target:
                 # Keep Apple's AIR record layout byte-for-byte. Upstream
                 # llvm-as
@@ -493,24 +818,76 @@ def convert(args: argparse.Namespace) -> None:
                 # outer MTLB target are rebuilt normally below.
                 converted = retarget_air_in_place(
                     module,
-                    f"{record['index']}-{record['name']}",
+                    logical_name,
                     args.target_triple,
                 )
+                target_matches = list(AIR_TARGET_BYTES.finditer(module))
+                analysis = {
+                    "target_triple": target_matches[0].group().decode("ascii"),
+                    "output_target_triple": args.target_triple,
+                    "datalayout": None,
+                    "stage_metadata": [],
+                    "abi_symbols": [],
+                    "abi_metadata_keys": [],
+                    "function_constants": [],
+                    "applied_lowerings": [],
+                    "inspection": "in-place-target-only",
+                }
                 converted_count += 1
             elif not selected_names or str(record["name"]) in selected_names:
-                converted = retarget_air(
+                converted, analysis = retarget_air(
                     module,
-                    f"{record['index']}-{record['name']}",
+                    logical_name,
                     pathlib.Path(args.llvm_dis),
                     pathlib.Path(args.llvm_as),
                     args.target_triple,
                     scratch,
                     str(record["name"]) in fract_rewrite_names,
                     str(record["name"]) in zero_memset_names,
+                    args.auto_lower_known_air,
                 )
+                applied = analysis["applied_lowerings"]
+                assert isinstance(applied, list)
+                lowering_count += len(applied)
                 converted_count += 1
             else:
                 converted = module
+                if args.abi_report:
+                    analysis = inspect_air(
+                        module,
+                        logical_name,
+                        pathlib.Path(args.llvm_dis),
+                        scratch,
+                    )
+                    analysis["output_target_triple"] = analysis[
+                        "target_triple"
+                    ]
+                    analysis["applied_lowerings"] = []
+            function_report = {
+                "index": record["index"],
+                "name": record["name"],
+                "function_type": record["function_type"],
+                "function_type_name": record["function_type_name"],
+                "air_version": record["air_version"],
+                "language_version": record["language_version"],
+                "selected": selected,
+                "input_size": len(module),
+                "input_sha256": hashlib.sha256(module).hexdigest(),
+                "output_size": len(converted),
+                "output_sha256": hashlib.sha256(converted).hexdigest(),
+            }
+            if analysis:
+                function_report.update(analysis)
+                expected_stage = record["function_type_name"]
+                stages = analysis.get("stage_metadata", [])
+                if expected_stage in AIR_STAGE_METADATA and stages:
+                    function_report["stage_contract_matches"] = (
+                        expected_stage in stages
+                    )
+                else:
+                    # Absence of stage metadata is not evidence of a match.
+                    function_report["stage_contract_matches"] = None
+            function_reports.append(function_report)
             struct.pack_into("<Q", rebuilt, tags["MDSZ"][0], len(converted))
             rebuilt[hash_offset : hash_offset + 32] = hashlib.sha256(converted).digest()
             struct.pack_into("<Q", rebuilt, tags["OFFT"][0] + 16,
@@ -564,24 +941,77 @@ def convert(args: argparse.Namespace) -> None:
         ]:
             raise ValueError(f"{record['name']}: output SHA-256 mismatch")
     output_path.write_bytes(rebuilt)
+    if args.runtime_manifest:
+        runtime_manifest = build_runtime_manifest(
+            source=original,
+            output=bytes(rebuilt),
+            source_runtime_path=args.runtime_source_path,
+            output_runtime_path=args.runtime_output_path,
+            profile=args.profile,
+            function_reports=function_reports,
+        )
+        write_runtime_manifest(
+            pathlib.Path(args.runtime_manifest), runtime_manifest
+        )
+    if args.abi_report:
+        report_path = pathlib.Path(args.abi_report)
+        report = {
+            "abi_report_version": ABI_REPORT_VERSION,
+            "input": {
+                "path": str(input_path),
+                "size": len(original),
+                "sha256": hashlib.sha256(original).hexdigest(),
+                "platform": input_platform,
+                "file_version": list(input_file_version),
+                "target_os": original[11],
+            },
+            "output": {
+                "path": str(output_path),
+                "size": len(rebuilt),
+                "sha256": hashlib.sha256(rebuilt).hexdigest(),
+                "platform": u16(rebuilt, 4),
+                "file_version": [u16(rebuilt, 6), u16(rebuilt, 8)],
+                "target_os": rebuilt[11],
+            },
+            "requested_target_triple": args.target_triple,
+            "container_target": (
+                "preserved" if args.preserve_container_target
+                else args.container_target
+            ),
+            "converted_functions": converted_count,
+            "applied_lowerings": lowering_count,
+            "functions": function_reports,
+        }
+        report_path.write_text(
+            json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True) +
+            "\n",
+            encoding="utf-8",
+        )
     print(
         f"converted={converted_count}/{len(final_records)} "
+        f"lowerings={lowering_count} "
         f"target={args.target_triple} "
         f"container_target={'preserved' if args.preserve_container_target else args.container_target} "
         f"bitcode={bitcode_size}->{len(new_bitcode)} bytes "
-        f"file={len(original)}->{len(rebuilt)} bytes output={output_path}"
+        f"file={len(original)}->{len(rebuilt)} bytes output={output_path}" +
+        (f" report={args.abi_report}" if args.abi_report else "") +
+        (f" runtime_manifest={args.runtime_manifest}"
+         if args.runtime_manifest else "")
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input")
     parser.add_argument("output")
     parser.add_argument("--llvm-dis", default="/opt/homebrew/opt/llvm/bin/llvm-dis")
     parser.add_argument("--llvm-as", default="/opt/homebrew/opt/llvm/bin/llvm-as")
-    parser.add_argument("--target-triple", default="air64-apple-ios19.0.0-macabi")
-    parser.add_argument("--target-major", type=int, default=19)
-    parser.add_argument("--target-minor", type=int, default=0)
+    parser.add_argument(
+        "--profile", choices=sorted(PROFILES), default=DEFAULT_PROFILE
+    )
+    parser.add_argument("--target-triple")
+    parser.add_argument("--target-major", type=int)
+    parser.add_argument("--target-minor", type=int)
     parser.add_argument(
         "--in-place-air-target",
         action="store_true",
@@ -593,9 +1023,8 @@ def main() -> None:
     parser.add_argument(
         "--container-target",
         choices=sorted(OUTPUT_CONTAINER_TARGETS),
-        default="macabi",
         help=(
-            "target encoded in the rebuilt MTLB header (default: macabi); "
+            "target encoded in the rebuilt MTLB header (default: profile); "
             "the AIR target triple must describe the same target"
         ),
     )
@@ -608,6 +1037,34 @@ def main() -> None:
         "--preserve-container-target",
         action="store_true",
         help="leave the MTLB container target unchanged for a selective rebuild",
+    )
+    parser.add_argument(
+        "--auto-lower-known-air",
+        action="store_true",
+        help=(
+            "apply every registered semantic lowering whose exact AIR/LLVM "
+            "call shape occurs; unknown shapes fail closed"
+        ),
+    )
+    parser.add_argument(
+        "--abi-report",
+        help=(
+            "write a JSON inventory of every function's MTLB TYPE/VERS, "
+            "AIR target/stage/datalayout/ABI keys and symbols, transforms, "
+            "sizes and hashes"
+        ),
+    )
+    parser.add_argument(
+        "--runtime-manifest",
+        help="write the versioned plist consumed by libmachook routing",
+    )
+    parser.add_argument(
+        "--runtime-source-path",
+        help="source MTLLibrary path as seen inside the macOS chroot",
+    )
+    parser.add_argument(
+        "--runtime-output-path",
+        help="companion MTLLibrary path as seen inside the macOS chroot",
     )
     parser.add_argument(
         "--rewrite-fract-v3f16-function",
@@ -625,7 +1082,7 @@ def main() -> None:
             "zero memset to three verified i64 stores"
         ),
     )
-    convert(parser.parse_args())
+    convert(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

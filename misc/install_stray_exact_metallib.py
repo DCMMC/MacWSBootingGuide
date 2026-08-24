@@ -92,7 +92,7 @@ def main() -> None:
     parser.add_argument(
         "--converter",
         type=pathlib.Path,
-        default=pathlib.Path(__file__).with_name("repack_metallib_macabi.py"),
+        default=pathlib.Path(__file__).with_name("metal2metal.py"),
     )
     parser.add_argument(
         "--llvm-dis",
@@ -120,6 +120,8 @@ def main() -> None:
     parser.add_argument("--target-major", type=int, default=19)
     parser.add_argument("--target-minor", type=int, default=0)
     parser.add_argument("--function", action="append")
+    parser.add_argument("--auto-lower-known-air", action="store_true")
+    parser.add_argument("--abi-report", type=pathlib.Path)
     parser.add_argument("--lower-zero-memset-function", action="append")
     parser.add_argument(
         "--archive", type=pathlib.Path,
@@ -195,6 +197,7 @@ def main() -> None:
         converter_command = [
             sys.executable,
             str(args.converter),
+            "translate",
             str(archived_capture),
             str(archived_output),
             "--llvm-dis", args.llvm_dis,
@@ -206,6 +209,10 @@ def main() -> None:
         ]
         for function in args.function or []:
             converter_command.extend(("--function", function))
+        if args.auto_lower_known_air:
+            converter_command.append("--auto-lower-known-air")
+        if args.abi_report:
+            converter_command.extend(("--abi-report", str(args.abi_report)))
         for function in args.lower_zero_memset_function or []:
             converter_command.extend(
                 ("--lower-zero-memset-function", function)
