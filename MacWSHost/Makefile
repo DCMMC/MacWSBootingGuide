@@ -23,7 +23,8 @@ MacWSHost_FILES = main.m MacWSControlClient.m MacWSStreamClient.m \
 	Launch/MacWSCatalystLaunchCoordinator.m \
 	Compatibility/MacWSMappedFrame.m \
 	MacWSMenuClient.m \
-	MacWSInteropClient.m ../misc/iosclear_ref.m
+	MacWSInteropClient.m MacWSRussianSetup.m \
+	../misc/iosclear_ref.m
 MacWSHost_FRAMEWORKS = UIKit Metal MetalKit QuartzCore CoreGraphics Foundation \
 	IOKit IOSurface UniformTypeIdentifiers
 MacWSHost_LIBRARIES = bsm
