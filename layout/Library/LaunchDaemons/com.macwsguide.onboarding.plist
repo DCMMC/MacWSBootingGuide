@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.macwsguide.onboarding</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/var/jb/usr/bin/python3</string>
+        <string>/var/jb/usr/macOS/bin/macws-onboardingd.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/jb/var/log/macws-onboarding.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/jb/var/log/macws-onboarding.log</string>
+</dict>
+</plist>
