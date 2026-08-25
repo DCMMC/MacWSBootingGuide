@@ -79,7 +79,7 @@ jobs:
           ln -sfn "$SDK_PATH" "$THEOS/sdks/MacOSX${SDK_VER}.sdk"
           echo "Using MacOSX${SDK_VER}.sdk"
 
-      - name: Disable incompatible macOS fakeroot and use rootless dpkg-deb packaging
+      - name: Configure rootless dm.pl packaging
         env:
           THEOS: ${{ runner.temp }}/theos
         run: |
@@ -90,12 +90,12 @@ jobs:
           p = Path(os.environ['THEOS']) / 'makefiles/package/deb.mk'
           s = p.read_text()
           old = 'COPYFILE_DISABLE=1 $(FAKEROOT) -r $(_THEOS_PLATFORM_DPKG_DEB) -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
-          new = 'COPYFILE_DISABLE=1 $(_THEOS_PLATFORM_DPKG_DEB) --root-owner-group -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
+          new = 'COPYFILE_DISABLE=1 $(_THEOS_PLATFORM_DPKG_DEB) -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
           if old not in s:
               raise SystemExit('expected deb.mk fakeroot command not found')
           p.write_text(s.replace(old, new, 1))
           PY
-          grep -n 'root-owner-group' "$THEOS/makefiles/package/deb.mk"
+          grep -n '_THEOS_PLATFORM_DPKG_DEB' "$THEOS/makefiles/package/deb.mk"
 
       - name: Build RootHide package
         env:
@@ -106,7 +106,6 @@ jobs:
           THEOS_PACKAGE_SCHEME: roothide
           ARCHS: "arm64 arm64e"
           TARGET: "iphone:clang:16.5:15.0"
-          THEOS_PLATFORM_DPKG_DEB: dpkg-deb
         run: |
           set -euo pipefail
           gmake clean
