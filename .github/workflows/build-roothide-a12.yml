@@ -1,0 +1,79 @@
+name: Build RootHide A12/XS .deb
+
+on:
+  push:
+    branches: [roothide-a12-xs]
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[roothide-build]')
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode.app
+
+      - name: Install host dependencies
+        run: |
+          brew update || true
+          brew install make ldid xz fakeroot dpkg
+
+      - name: Install RootHide Theos
+        run: |
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+
+      - name: Add macOS SDK for macOS subprojects
+        run: |
+          SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
+          SDK_VER="$(xcrun --sdk macosx --show-sdk-version)"
+          mkdir -p "$HOME/theos/sdks"
+          ln -sfn "$SDK_PATH" "$HOME/theos/sdks/MacOSX${SDK_VER}.sdk"
+          echo "Using MacOSX${SDK_VER}.sdk"
+
+      - name: Build RootHide package
+        env:
+          GO_EASY_ON_ME: "1"
+          FINALPACKAGE: "1"
+          STRIP: "0"
+          OPTFLAG: "-O2"
+          THEOS_PACKAGE_SCHEME: roothide
+          ARCHS: "arm64 arm64e"
+          TARGET: "iphone:clang:latest:15.0"
+        run: |
+          gmake clean
+          gmake -j"$(sysctl -n hw.logicalcpu)" package
+
+      - name: Verify package metadata and Mach-O slices
+        run: |
+          set -euo pipefail
+          PKG=$(find packages -maxdepth 1 -name '*.deb' -type f | head -n 1)
+          test -n "$PKG"
+          echo "Package: $PKG"
+          dpkg-deb -I "$PKG" | tee package-info.txt
+          dpkg-deb -I "$PKG" | grep -q 'Architecture: iphoneos-arm64e'
+          mkdir -p extracted
+          dpkg-deb -x "$PKG" extracted
+          found=0
+          while IFS= read -r -d '' f; do
+            if file "$f" | grep -Eq 'Mach-O.*(arm64|arm64e)'; then
+              echo "== $f =="
+              xcrun vtool -show-build "$f" 2>/dev/null || true
+              found=1
+            fi
+          done < <(find extracted -type f -print0)
+          test "$found" -eq 1
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: macosbooter-roothide-a12-xs
+          path: |
+            packages/*.deb
+            package-info.txt
+          if-no-files-found: error
