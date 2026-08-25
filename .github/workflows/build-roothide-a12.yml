@@ -22,14 +22,11 @@ jobs:
       - name: Install host dependencies
         run: |
           brew update || true
-          brew install make ldid xz fakeroot dpkg
+          brew install make ldid xz dpkg
 
       - name: Restore and patch MTLCompilerBypassOSCheck source
         run: |
           set -euo pipefail
-          # The previous commit contains the complete source; use it as the
-          # canonical baseline and apply only the Xcode 18 SDK compatibility
-          # change required for xpc_data_create under ARC.
           git show c09fe186ee1d06fd6abda5b19b15ccf2e2192a71:MTLCompilerBypassOSCheck/Tweak.x \
             > MTLCompilerBypassOSCheck/Tweak.x
           python3 - <<'PY'
@@ -37,7 +34,7 @@ jobs:
           p = Path('MTLCompilerBypassOSCheck/Tweak.x')
           s = p.read_text()
           old = '''// The rootless iOS 16 Theos SDK used by this project omits xpc/xpc.h.  This\n// is the exact public C ABI needed by the UUID-locked reply observer.\nextern void *xpc_data_create(const void *bytes, size_t length);\n'''
-          new = '''// Xcode 18.x SDKs provide the canonical xpc_data_create declaration via\n// the XPC headers. Do not redeclare it as void *: under ARC that conflicts\n// with xpc_object_t and forces an invalid implicit Objective-C/C pointer cast.\n'''
+          new = '''// Xcode 18.x SDKs provide the canonical xpc_data_create declaration via\n// the XPC headers. Do not redeclare it as void *: under ARC that conflicts\n// with xpc_object_t and requires an explicit bridge below.\n'''
           if old not in s:
               raise SystemExit('expected xpc_data_create declaration not found')
           s = s.replace(old, new, 1)
@@ -48,20 +45,59 @@ jobs:
           s = s.replace(old_return, new_return, 1)
           p.write_text(s)
           PY
-          grep -n -A4 -B4 'xpc_data_create' MTLCompilerBypassOSCheck/Tweak.x
 
       - name: Install RootHide Theos
+        env:
+          THEOS: ${{ runner.temp }}/theos
         run: |
-          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          set -euo pipefail
+          rm -rf "$THEOS"
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Install patched iOS SDK without installer API dependency
+        env:
+          THEOS: ${{ runner.temp }}/theos
+        run: |
+          set -euo pipefail
+          curl --fail --retry 5 --retry-delay 2 -L \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz \
+            -o "$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz"
+          tar -xJf "$RUNNER_TEMP/iPhoneOS16.5.sdk.tar.xz" -C "$THEOS/sdks"
+          test -d "$THEOS/sdks/iPhoneOS16.5.sdk"
+          echo "Installed patched iOS SDK: $THEOS/sdks/iPhoneOS16.5.sdk"
 
       - name: Add macOS SDK for macOS subprojects
+        env:
+          THEOS: ${{ runner.temp }}/theos
         run: |
+          set -euo pipefail
           SDK_PATH="$(xcrun --sdk macosx --show-sdk-path)"
           SDK_VER="$(xcrun --sdk macosx --show-sdk-version)"
-          mkdir -p "$HOME/theos/sdks"
-          ln -sfn "$SDK_PATH" "$HOME/theos/sdks/MacOSX${SDK_VER}.sdk"
+          mkdir -p "$THEOS/sdks"
+          ln -sfn "$SDK_PATH" "$THEOS/sdks/MacOSX${SDK_VER}.sdk"
           echo "Using MacOSX${SDK_VER}.sdk"
+
+      - name: Disable incompatible macOS fakeroot and use rootless dpkg-deb packaging
+        env:
+          THEOS: ${{ runner.temp }}/theos
+        run: |
+          set -euo pipefail
+          perl -0pi -e \
+            's#COPYFILE_DISABLE=1 \$\(FAKEROOT\) -r \$\(_THEOS_PLATFORM_DPKG_DEB\) #-# #s' \
+            "$THEOS/makefiles/package/deb.mk"
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path(__import__('os').environ['THEOS']) / 'makefiles/package/deb.mk'
+          s = p.read_text()
+          old = 'COPYFILE_DISABLE=1 $(FAKEROOT) -r $(_THEOS_PLATFORM_DPKG_DEB) -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
+          new = 'COPYFILE_DISABLE=1 $(_THEOS_PLATFORM_DPKG_DEB) --root-owner-group -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
+          if old not in s:
+              raise SystemExit('expected deb.mk fakeroot command not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          grep -n 'root-owner-group' "$THEOS/makefiles/package/deb.mk"
 
       - name: Build RootHide package
         env:
@@ -71,8 +107,10 @@ jobs:
           OPTFLAG: "-O2"
           THEOS_PACKAGE_SCHEME: roothide
           ARCHS: "arm64 arm64e"
-          TARGET: "iphone:clang:latest:15.0"
+          TARGET: "iphone:clang:16.5:15.0"
+          THEOS_PLATFORM_DPKG_DEB: dpkg-deb
         run: |
+          set -euo pipefail
           gmake clean
           gmake -j"$(sysctl -n hw.logicalcpu)" package
 
@@ -90,7 +128,7 @@ jobs:
           while IFS= read -r -d '' f; do
             if file "$f" | grep -Eq 'Mach-O.*(arm64|arm64e)'; then
               echo "== $f =="
-              xcrun vtool -show-build "$f" 2>/dev/null || true
+              file "$f"
               found=1
             fi
           done < <(find extracted -type f -print0)
