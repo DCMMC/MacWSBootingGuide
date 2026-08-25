@@ -8,7 +8,7 @@ on:
 jobs:
   build:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -22,7 +22,7 @@ jobs:
       - name: Install host dependencies
         run: |
           brew update || true
-          brew install make ldid xz dpkg
+          brew install make ldid xz dpkg go
 
       - name: Restore and patch MTLCompilerBypassOSCheck source
         run: |
@@ -79,6 +79,42 @@ jobs:
           ln -sfn "$SDK_PATH" "$THEOS/sdks/MacOSX${SDK_VER}.sdk"
           echo "Using MacOSX${SDK_VER}.sdk"
 
+      - name: Build on-device provisioning tools for iPhone XS
+        run: |
+          set -euo pipefail
+          mkdir -p layout/usr/macOS/bin
+          rm -rf "$RUNNER_TEMP/ipsw-src" "$RUNNER_TEMP/apfs-src"
+
+          git clone --depth 1 https://github.com/blacktop/ipsw.git "$RUNNER_TEMP/ipsw-src"
+          (
+            cd "$RUNNER_TEMP/ipsw-src"
+            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+              go build -trimpath -ldflags='-s -w' -o layout-ipsw ./cmd/ipsw
+          )
+          cp "$RUNNER_TEMP/ipsw-src/layout-ipsw" layout/usr/macOS/bin/ipsw
+          chmod 0755 layout/usr/macOS/bin/ipsw
+
+          git clone --depth 1 https://github.com/deploymenttheory/go-apfs-v2.git "$RUNNER_TEMP/apfs-src"
+          (
+            cd "$RUNNER_TEMP/apfs-src"
+            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+              go build -trimpath -ldflags='-s -w' -o layout-apfs ./cmd/apfs
+          )
+          cp "$RUNNER_TEMP/apfs-src/layout-apfs" layout/usr/macOS/bin/apfs
+          chmod 0755 layout/usr/macOS/bin/apfs
+
+          file layout/usr/macOS/bin/ipsw
+          file layout/usr/macOS/bin/apfs
+
+      - name: Verify new scripts before packaging
+        run: |
+          set -euo pipefail
+          bash -n layout/DEBIAN/postinst
+          bash -n layout/usr/macOS/bin/macws-firstboot.sh
+          bash -n layout/usr/macOS/bin/macws-launch.sh
+          bash -n layout/usr/macOS/bin/macws-stop.sh
+          python3 -m py_compile layout/usr/macOS/bin/macws-onboardingd.py
+
       - name: Configure rootless dm.pl packaging
         env:
           THEOS: ${{ runner.temp }}/theos
@@ -111,7 +147,7 @@ jobs:
           gmake clean
           gmake -j"$(sysctl -n hw.logicalcpu)" package
 
-      - name: Verify package metadata and Mach-O slices
+      - name: Verify package metadata, maintainer script and Mach-O slices
         run: |
           set -euo pipefail
           PKG=$(find packages -maxdepth 1 -name '*.deb' -type f | head -n 1)
@@ -119,8 +155,13 @@ jobs:
           echo "Package: $PKG"
           dpkg-deb -I "$PKG" | tee package-info.txt
           dpkg-deb -I "$PKG" | grep -q 'Architecture: iphoneos-arm64e'
-          mkdir -p extracted
+          mkdir -p extracted control
           dpkg-deb -x "$PKG" extracted
+          dpkg-deb -e "$PKG" control
+          bash -n control/postinst
+          test -x extracted/var/jb/usr/macOS/bin/ipsw
+          test -x extracted/var/jb/usr/macOS/bin/apfs
+          test -f extracted/var/jb/usr/macOS/bin/macws-onboardingd.py
           found=0
           while IFS= read -r -d '' f; do
             if file "$f" | grep -Eq 'Mach-O.*(arm64|arm64e)'; then
