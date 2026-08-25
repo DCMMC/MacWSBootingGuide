@@ -88,7 +88,7 @@ jobs:
           git clone --depth 1 https://github.com/blacktop/ipsw.git "$RUNNER_TEMP/ipsw-src"
           (
             cd "$RUNNER_TEMP/ipsw-src"
-            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
+            CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
               go build -trimpath -ldflags='-s -w' -o layout-ipsw ./cmd/ipsw
           )
           cp "$RUNNER_TEMP/ipsw-src/layout-ipsw" layout/usr/macOS/bin/ipsw
