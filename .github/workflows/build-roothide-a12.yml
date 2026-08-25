@@ -79,7 +79,7 @@ jobs:
           ln -sfn "$SDK_PATH" "$THEOS/sdks/MacOSX${SDK_VER}.sdk"
           echo "Using MacOSX${SDK_VER}.sdk"
 
-      - name: Build on-device provisioning tools for iPhone XS
+      - name: Build native iOS provisioning tools for iPhone XS
         run: |
           set -euo pipefail
           mkdir -p layout/usr/macOS/bin
@@ -88,8 +88,8 @@ jobs:
           git clone --depth 1 https://github.com/blacktop/ipsw.git "$RUNNER_TEMP/ipsw-src"
           (
             cd "$RUNNER_TEMP/ipsw-src"
-            CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
-              go build -trimpath -ldflags='-s -w' -o layout-ipsw ./cmd/ipsw
+            CGO_ENABLED=0 GOOS=ios GOARCH=arm64 \
+              go build -trimpath -buildvcs=false -ldflags='-s -w' -o layout-ipsw ./cmd/ipsw
           )
           cp "$RUNNER_TEMP/ipsw-src/layout-ipsw" layout/usr/macOS/bin/ipsw
           chmod 0755 layout/usr/macOS/bin/ipsw
@@ -97,8 +97,8 @@ jobs:
           git clone --depth 1 https://github.com/deploymenttheory/go-apfs-v2.git "$RUNNER_TEMP/apfs-src"
           (
             cd "$RUNNER_TEMP/apfs-src"
-            CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 \
-              go build -trimpath -ldflags='-s -w' -o layout-apfs ./cmd/apfs
+            CGO_ENABLED=0 GOOS=ios GOARCH=arm64 \
+              go build -trimpath -buildvcs=false -ldflags='-s -w' -o layout-apfs ./cmd/apfs
           )
           cp "$RUNNER_TEMP/apfs-src/layout-apfs" layout/usr/macOS/bin/apfs
           chmod 0755 layout/usr/macOS/bin/apfs
