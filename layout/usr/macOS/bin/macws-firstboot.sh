@@ -6,7 +6,6 @@ WORK=/var/jb/var/macws-bootstrap
 IPSW=$WORK/UniversalMac_13.4_22F66_Restore.ipsw
 FS_DMG=$WORK/filesystem.dmg
 SYS_DMG=$WORK/system.dmg
-IPS W=/var/jb/usr/macOS/bin/ipsw
 APFS=/var/jb/usr/macOS/bin/apfs
 BASH=/var/jb/usr/bin/bash
 
