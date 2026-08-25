@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOTFS=/var/mnt/rootfs
 WORK=/var/jb/var/macws-bootstrap
+MARKER=$WORK/.macos-13.4-rootfs-ready
 IPSW=$WORK/UniversalMac_13.4_22F66_Restore.ipsw
 FS_DMG=$WORK/filesystem.dmg
 SYS_DMG=$WORK/system.dmg
@@ -12,14 +13,19 @@ BASH=/var/jb/usr/bin/bash
 mkdir -p "$WORK" "$ROOTFS" "$ROOTFS/System/Volumes/Preboot/Cryptexes/OS" "$ROOTFS/Users/root"
 log() { printf '[macws-setup] %s\n' "$*"; }
 
-IPSW_TOOL=/var/jb/usr/macOS/bin/ipsw
-[ -x "$IPSW_TOOL" ] || { echo 'ipsw tool missing from package' >&2; exit 20; }
+[ -x /var/jb/usr/macOS/bin/ipsw ] || { echo 'ipsw tool missing from package' >&2; exit 20; }
 [ -x "$APFS" ] || { echo 'APFS extractor missing from package' >&2; exit 21; }
+
+if [ -f "$MARKER" ] && [ -x "$ROOTFS/usr/bin/sh" ]; then
+    log 'macOS 13.4 rootfs уже подготовлен; повторное скачивание не требуется.'
+    "$BASH" /var/jb/usr/macOS/bin/postinst.sh
+    exit 0
+fi
 
 if [ ! -f "$IPSW" ] || [ "$(wc -c < "$IPSW")" -lt 1000000000 ]; then
     log 'Скачиваю официальный macOS 13.4 IPSW для Mac14,7 (22F66)…'
     rm -f "$IPSW"
-    "$IPSW_TOOL" download ipsw --confirm --macos --device Mac14,7 --version 13.4 --output "$WORK"
+    /var/jb/usr/macOS/bin/ipsw download ipsw --confirm --macos --device Mac14,7 --version 13.4 --output "$WORK"
     found=$(find "$WORK" -maxdepth 1 -type f -name '*.ipsw' -print -quit)
     [ -n "$found" ] || { echo 'IPSW download did not produce a file' >&2; exit 22; }
     [ "$found" = "$IPSW" ] || mv -f "$found" "$IPSW"
@@ -29,7 +35,7 @@ if [ ! -f "$FS_DMG" ]; then
     log 'Извлекаю файловую систему macOS из IPSW…'
     rm -rf "$WORK/fs-extract"
     mkdir -p "$WORK/fs-extract"
-    "$IPSW_TOOL" extract --dmg fs "$IPSW" --output "$WORK/fs-extract"
+    /var/jb/usr/macOS/bin/ipsw extract --dmg fs "$IPSW" --output "$WORK/fs-extract"
     candidate=$(find "$WORK/fs-extract" -type f -name '*.dmg' -print -quit)
     [ -n "$candidate" ] || { echo 'filesystem DMG was not extracted' >&2; exit 23; }
     cp -f "$candidate" "$FS_DMG"
@@ -39,7 +45,7 @@ if [ ! -f "$SYS_DMG" ]; then
     log 'Извлекаю системный cryptex macOS из IPSW…'
     rm -rf "$WORK/sys-extract"
     mkdir -p "$WORK/sys-extract"
-    "$IPSW_TOOL" extract --dmg sys "$IPSW" --output "$WORK/sys-extract"
+    /var/jb/usr/macOS/bin/ipsw extract --dmg sys "$IPSW" --output "$WORK/sys-extract"
     candidate=$(find "$WORK/sys-extract" -type f -name '*.dmg' -print -quit)
     [ -n "$candidate" ] || { echo 'SystemOS DMG was not extracted' >&2; exit 24; }
     cp -f "$candidate" "$SYS_DMG"
@@ -75,4 +81,10 @@ fi
 mkdir -p "$ROOTFS/var/jb"
 log 'Запускаю встроенную автоматическую пост-установку проекта…'
 "$BASH" /var/jb/usr/macOS/bin/postinst.sh
+
+# The IPSW and intermediate DMGs are only provisioning inputs. Removing them
+# frees many GB after a successful first boot while the prepared rootfs stays.
+rm -rf "$WORK/fs-extract" "$WORK/sys-extract"
+rm -f "$IPSW" "$FS_DMG" "$SYS_DMG"
+touch "$MARKER"
 log 'Готово: rootfs, cryptex, структура каталогов и runtime provisioning установлены.'
