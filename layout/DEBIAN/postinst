@@ -1,34 +1,59 @@
 # No shebang: dpkg invokes maintainer scripts through its shell.
 #
-# The old maintainer script ran the entire MacWS runtime repair synchronously.
-# A single missing rootfs file, trustcache entry, or optional helper therefore
-# made dpkg report "error configuring package" even though the package files
-# themselves were already installed. Keep Debian configuration transactional:
-# install the privileged onboarding daemon, start the runtime repair in the
-# background, and return success to dpkg. The app exposes the Russian setup and
-# launch controls and shows the background log/status to the user.
-
+# Keep Debian configuration transactional. The runtime repair can touch a
+# large macOS rootfs and therefore must not make `dpkg --configure` fail.
 set +e
 
 RUNDIR=/var/jb/var/run
 LOGDIR=/var/jb/var/log
 SETUP_PLIST=/var/jb/Library/LaunchDaemons/com.macwsguide.onboarding.plist
+ONBOARDING=/var/jb/usr/macOS/bin/macws-onboardingd.py
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
 BASH=/var/jb/usr/bin/bash
+PYTHON=/var/jb/usr/bin/python3
+NOHUP=/var/jb/usr/bin/nohup
 LAUNCHCTL=/var/jb/usr/bin/launchctl
+LDID=/var/jb/usr/bin/ldid
+JBCTL=/var/jb/usr/bin/jbctl
 
 mkdir -p "$RUNDIR" "$LOGDIR"
 
-if [ -f "$SETUP_PLIST" ]; then
-    chown root:wheel "$SETUP_PLIST" 2>/dev/null || true
-    chmod 0644 "$SETUP_PLIST" 2>/dev/null || true
+# These two helpers are native iOS arm64 binaries. Admit them before the
+# onboarding daemon can download the macOS image for the first time. Do not
+# attach the huge MacWS entitlement profile: these are ordinary CLI tools.
+for tool in \
+    /var/jb/usr/macOS/bin/ipsw \
+    /var/jb/usr/macOS/bin/apfs; do
+    if [ -x "$tool" ] && [ -x "$LDID" ] && [ -x "$JBCTL" ]; then
+        "$LDID" -S "$tool" >/dev/null 2>&1 || true
+        hash=$($LDID -arch arm64 -h "$tool" 2>/dev/null | grep CDHash= | cut -c8-)
+        [ -n "$hash" ] && "$JBCTL" trustcache add "$hash" >/dev/null 2>&1 || true
+    fi
+done
+
+if [ -f "$SETUP_PLIST" ] && [ -x "$LAUNCHCTL" ]; then
+    chown root:wheel "$SETUP_PLIST" >/dev/null 2>&1 || true
+    chmod 0644 "$SETUP_PLIST" >/dev/null 2>&1 || true
     "$LAUNCHCTL" unload "$SETUP_PLIST" >/dev/null 2>&1 || true
     "$LAUNCHCTL" load "$SETUP_PLIST" >/dev/null 2>&1 || true
 fi
 
+# Launch directly as a fallback for package-install environments where the
+# launchd job is not yet accepted. This makes the app's large setup button work
+# immediately after installation rather than relying on a later reboot.
+if [ -x "$PYTHON" ] && [ -f "$ONBOARDING" ] && [ ! -S "$RUNDIR/macws-onboarding.sock" ]; then
+    if [ -x "$NOHUP" ]; then
+        "$NOHUP" "$PYTHON" "$ONBOARDING" >>"$LOGDIR/macws-onboarding.log" 2>&1 &
+    else
+        "$PYTHON" "$ONBOARDING" >>"$LOGDIR/macws-onboarding.log" 2>&1 &
+    fi
+fi
+
+# Preserve the full runtime verifier, but never make dpkg configuration depend
+# on its success. All output is kept for the in-app status/log view.
 if [ -x "$BASH" ] && [ -f "$POSTINST" ]; then
     "$BASH" "$POSTINST" >>"$LOGDIR/macws-postinst.log" 2>&1 < /dev/null &
 fi
 
-printf '%s\n' 'MacWS RootHide package configured; runtime provisioning continues in background.' > "$LOGDIR/macws-dpkg-configured"
+printf '%s\n' 'MacWS RootHide package configured successfully; runtime provisioning continues in background.' > "$LOGDIR/macws-dpkg-configured"
 exit 0
