@@ -180,3 +180,5 @@ jobs:
             packages/*.deb
             package-info.txt
           if-no-files-found: error
+
+# Triggered by a harmless workflow-file commit so the current branch build can be started automatically.
