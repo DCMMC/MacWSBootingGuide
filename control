@@ -1,8 +1,8 @@
 Package: com.kdt.macosbooter
 Name: macOSBooter
-Version: 0.3.4
-Architecture: iphoneos-arm
-Description: Native iPadOS control and display host for the chroot macOS GUI stack
+Version: 0.3.4-1
+Architecture: iphoneos-arm64e
+Description: Native iPadOS control and display host for the chroot macOS GUI stack (RootHide, A12/arm64e)
 Maintainer: khanhduytran0
 Author: khanhduytran0
 Section: System
