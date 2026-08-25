@@ -84,12 +84,10 @@ jobs:
           THEOS: ${{ runner.temp }}/theos
         run: |
           set -euo pipefail
-          perl -0pi -e \
-            's#COPYFILE_DISABLE=1 \$\(FAKEROOT\) -r \$\(_THEOS_PLATFORM_DPKG_DEB\) #-# #s' \
-            "$THEOS/makefiles/package/deb.mk"
           python3 - <<'PY'
           from pathlib import Path
-          p = Path(__import__('os').environ['THEOS']) / 'makefiles/package/deb.mk'
+          import os
+          p = Path(os.environ['THEOS']) / 'makefiles/package/deb.mk'
           s = p.read_text()
           old = 'COPYFILE_DISABLE=1 $(FAKEROOT) -r $(_THEOS_PLATFORM_DPKG_DEB) -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
           new = 'COPYFILE_DISABLE=1 $(_THEOS_PLATFORM_DPKG_DEB) --root-owner-group -Z$(_THEOS_PLATFORM_DPKG_DEB_COMPRESSION) -z$(THEOS_PLATFORM_DEB_COMPRESSION_LEVEL) -b "$(THEOS_STAGING_DIR)" "$(_THEOS_DEB_PACKAGE_FILENAME)"'
