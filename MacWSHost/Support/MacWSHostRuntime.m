@@ -35,6 +35,10 @@ BOOL MacWSLegacyFramebufferFallbackEnabled(void) {
 
 BOOL MacWSAppInputEndpointReady(int32_t pid) {
     if (pid <= 1) return NO;
+    // Socket path existence alone accepts an endpoint left behind by a dead
+    // process.  kill(pid, 0) is a read-only existence probe; EPERM still means
+    // the root-owned chroot process exists from this mobile UIKit process.
+    if (kill(pid, 0) != 0 && errno != EPERM) return NO;
     char path[PATH_MAX] = {0};
     int length = snprintf(path, sizeof(path),
         "/var/mnt/rootfs/private/tmp/macws_app_input.%d.sock", pid);

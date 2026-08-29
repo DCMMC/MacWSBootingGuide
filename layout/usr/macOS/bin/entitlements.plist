@@ -264,6 +264,7 @@
 		<string>IOAccelSubmitter2</string>
 		<string>IOHIDEventServiceFastPathUserClient</string>
 		<string>IOHIDLibUserClient</string>
+		<string>H11ANEInDirectPathClient</string>
 		<string>IOMobileFramebufferUserClient</string>
 		<string>IOReportUserClient</string>
 		<string>IOSurfaceAcceleratorClient</string>

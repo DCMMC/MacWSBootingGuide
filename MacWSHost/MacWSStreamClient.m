@@ -1,5 +1,7 @@
 #import "MacWSStreamClient.h"
 
+#import "MacWSHostDiagnostics.h"
+
 #import <QuartzCore/QuartzCore.h>
 
 #include <dlfcn.h>
@@ -208,6 +210,48 @@
     [self releaseToken:frame.descriptor.leaseToken];
 }
 
+- (void)noteDirectDrawableForOwnerPID:(int32_t)ownerPID
+                        layerWindowID:(uint32_t)layerWindowID
+                                width:(uint32_t)width
+                               height:(uint32_t)height {
+    if (ownerPID <= 1 || layerWindowID == 0 || width == 0 || height == 0 ||
+        width > MACWS_STREAM_MAX_DIMENSION ||
+        height > MACWS_STREAM_MAX_DIMENSION) return;
+    dispatch_async(self.queue, ^{
+        if (!self.connection || !self.isConnected ||
+            !self.subscriptionActive ||
+            self.mode != MacWSStreamModeFullscreen) return;
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(
+            request, MACWS_STREAM_KEY_OP,
+            MACWS_STREAM_OP_DIRECT_DRAWABLE_ACTIVITY);
+        xpc_dictionary_set_uint64(request,
+            MACWS_STREAM_KEY_PROTOCOL_VERSION, MACWS_STREAM_VERSION);
+        xpc_dictionary_set_bool(request, MACWS_STREAM_KEY_ACTIVE, true);
+        xpc_dictionary_set_int64(request, MACWS_STREAM_KEY_OWNER_PID,
+                                 ownerPID);
+        xpc_dictionary_set_uint64(request, MACWS_STREAM_KEY_LAYER_WINDOW_ID,
+                                  layerWindowID);
+        xpc_dictionary_set_uint64(request, MACWS_STREAM_KEY_WIDTH, width);
+        xpc_dictionary_set_uint64(request, MACWS_STREAM_KEY_HEIGHT, height);
+        xpc_connection_send_message(self.connection, request);
+    });
+}
+
+- (void)clearDirectDrawableActivity {
+    dispatch_async(self.queue, ^{
+        if (!self.connection) return;
+        xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+        xpc_dictionary_set_string(
+            request, MACWS_STREAM_KEY_OP,
+            MACWS_STREAM_OP_DIRECT_DRAWABLE_ACTIVITY);
+        xpc_dictionary_set_uint64(request,
+            MACWS_STREAM_KEY_PROTOCOL_VERSION, MACWS_STREAM_VERSION);
+        xpc_dictionary_set_bool(request, MACWS_STREAM_KEY_ACTIVE, false);
+        xpc_connection_send_message(self.connection, request);
+    });
+}
+
 - (void)releaseToken:(uint64_t)leaseToken {
     if (!leaseToken) return;
     dispatch_async(self.queue, ^{
@@ -293,6 +337,12 @@
     // import observes frameDeliveryScheduled=NO and queues a later unpause;
     // it cannot be accidentally cancelled by the end of this callback.
     displayLink.paused = YES;
+    static BOOL reportedFirstDisplayLinkDrain = NO;
+    if (!reportedFirstDisplayLinkDrain && frames.count != 0) {
+        reportedFirstDisplayLinkDrain = YES;
+        MacWSLog(@"display-stream frame-transport display-link-drain "
+                 "frames=%lu", (unsigned long)frames.count);
+    }
     for (MacWSSurfaceFrame *latest in frames)
         [self.delegate streamClient:self receivedFrame:latest];
 }
@@ -512,6 +562,17 @@
         return;
     }
     memcpy(&descriptor, descriptorBytes, sizeof(descriptor));
+    static BOOL reportedFirstFrameEnvelope = NO;
+    if (!reportedFirstFrameEnvelope) {
+        reportedFirstFrameEnvelope = YES;
+        MacWSLog(@"display-stream frame-transport envelope stream=%llu "
+                 "sequence=%llu layer=%u lease=%llu descriptor-size=%lu",
+                 (unsigned long long)descriptor.streamID,
+                 (unsigned long long)descriptor.sequence,
+                 descriptor.layerWindowID,
+                 (unsigned long long)eventLease,
+                 (unsigned long)descriptorSize);
+    }
     if (!MacWSStreamFrameDescriptorIsValid(&descriptor, descriptorSize) ||
         eventLease == 0 || descriptor.leaseToken != eventLease) {
         [self releaseToken:eventLease];
@@ -602,6 +663,15 @@
 
     MacWSSurfaceFrame *frame = [[MacWSSurfaceFrame alloc]
         initWithDescriptor:descriptor surface:surface receiptTime:receiptTime];
+    static BOOL reportedFirstSurfaceImport = NO;
+    if (!reportedFirstSurfaceImport) {
+        reportedFirstSurfaceImport = YES;
+        MacWSLog(@"display-stream frame-transport surface-import stream=%llu "
+                 "layer=%u surface=%u size=%ux%u",
+                 (unsigned long long)descriptor.streamID,
+                 descriptor.layerWindowID, IOSurfaceGetID(surface),
+                 descriptor.width, descriptor.height);
+    }
     CFRelease(surface);
     [self enqueueFrameForMainDelivery:frame];
 }

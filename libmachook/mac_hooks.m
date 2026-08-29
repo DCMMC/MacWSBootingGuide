@@ -4,6 +4,7 @@
 @import Foundation;
 @import MachO;
 #import <IOKit/IOKitLib.h>
+#import <dispatch/dispatch.h>
 #import <xpc/xpc.h>
 #import <sys/sysctl.h>
 #import <sys/file.h>
@@ -221,10 +222,40 @@ static bool macws_runtime_diagnostics_enabled(void) {
             access("/tmp/macws_iogpu_error_diag", F_OK) == 0 ||
             access("/tmp/macws_command_error_diag", F_OK) == 0 ||
             access("/tmp/macws_queue_qos_diag", F_OK) == 0 ||
+            access("/tmp/macws_submit_forward_progress_bridge", F_OK) == 0 ||
             access("/tmp/macws_kcmd_field_a4_diag", F_OK) == 0 ||
             access("/tmp/macws_kcmd_field_5e3_diag", F_OK) == 0 ||
             access("/tmp/macws_kcmd_field_6bc_diag", F_OK) == 0 ||
             access("/tmp/macws_kcmd_stray_subtype3_diag", F_OK) == 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+// These process-start switches are queried from allocation and IOSurface
+// compatibility paths.  getenv(3) takes the environment lock and showed up
+// directly in Stray's preserving gameplay sample on 2026-08-23.  The launch
+// environment cannot change for the lifetime of a process, so resolve each
+// switch once instead of paying that lock on every ObjC/IOSurface operation.
+static bool macws_agx_native_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *setting = getenv("MACWS_AGX_NATIVE");
+        value = setting != NULL && setting[0] != '\0' &&
+            strcmp(setting, "0") != 0;
+        atomic_store_explicit(&cached, value, memory_order_release);
+    }
+    return value != 0;
+}
+
+static bool macws_agx_register_classes_enabled(void) {
+    static _Atomic int cached = -1;
+    int value = atomic_load_explicit(&cached, memory_order_acquire);
+    if (value < 0) {
+        const char *setting = getenv("MACWS_AGX_REGISTER_CLASSES");
+        value = setting != NULL && setting[0] != '\0' &&
+            strcmp(setting, "0") != 0;
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
@@ -275,6 +306,10 @@ MACWS_DEFINE_STARTUP_FLAG(macws_submit_ring_enabled,
                           "/tmp/macws_submit_ring")
 MACWS_DEFINE_STARTUP_FLAG(macws_queue_qos_diag_enabled,
                           "/tmp/macws_queue_qos_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_submit_timing_diag_enabled,
+                          "/tmp/macws_submit_timing_diag")
+MACWS_DEFINE_STARTUP_FLAG(macws_submit_forward_progress_bridge_enabled,
+                          "/tmp/macws_submit_forward_progress_bridge")
 MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_a4_diag_enabled,
                           "/tmp/macws_kcmd_field_a4_diag")
 MACWS_DEFINE_STARTUP_FLAG(macws_kcmd_field_5e3_diag_enabled,
@@ -1652,6 +1687,10 @@ static inline uint64_t macws_pac_sign(uint64_t ptr, uint64_t mod, uint8_t key) {
 // service executable, whose _xpc_main chained bind is not rewritten by the
 // iPadOS 16 dyld.
 void macws_xpc_main(xpc_connection_handler_t handler);
+
+typedef struct MacWSLSLaunchURLSpec MacWSLSLaunchURLSpec;
+static OSStatus macws_LSOpenFromURLSpec(
+    const MacWSLSLaunchURLSpec *launchSpec, CFURLRef *outLaunchedURL);
 
 // Repair __got / __auth_got slots via indirect symbol table + LC_SYMTAB. Used
 // for dlopen'd DSC-bound images that have no LC_DYLD_CHAINED_FIXUPS (because
@@ -3710,9 +3749,79 @@ static void macws_extend_locationd_initial_idle_window(
     }
 }
 
+// Steam's required FPS overlay wraps every MTLCommandBuffer commit.  In the
+// exact arm64 overlay shipped by client 1785799196 it formats the private
+// Metal debug-group label @"Update tex %d" before every overlay texture
+// update, then immediately passes the resulting NSString to
+// -pushDebugGroup:.  The number is diagnostic metadata only; it is not read
+// by the encoder or by Steam's render stream.
+//
+// Runtime-confirmed via the preserving Stray sample captured on 2026-08-24:
+// 240/2237 RHI-thread samples were below +[NSString stringWithFormat:] from
+// overlay+0x154e8, nested inside 473 samples in Steam's command-buffer commit
+// wrapper.  RE-confirmed via UUID 529F4E8F-0FFB-30F9-88EF-AE0918F4C325 and
+// the actual arm64 instructions below.  Forward the already-loaded constant
+// format NSString as the debug-group label, retaining the debug group and all
+// overlay drawing while removing per-frame allocation/formatting work.
+static void macws_optimize_stray_steam_overlay_debug_label(
+        const struct mach_header *untyped_header) {
+    const char *program = getprogname();
+    if (!program || strcmp(program, "Stray-Mac-Shipping") != 0) return;
+
+    static _Atomic int installed = 0;
+    if (atomic_exchange_explicit(&installed, 1, memory_order_acq_rel))
+        return;
+
+    static const uint8_t expected_uuid[16] = {
+        0x52, 0x9f, 0x4e, 0x8f, 0x0f, 0xfb, 0x30, 0xf9,
+        0x88, 0xef, 0xae, 0x09, 0x18, 0xf4, 0xc3, 0x25,
+    };
+    static const uint32_t expected[] = {
+        0xf0000082, // adrp x2, ObjC constant-string page
+        0x912e6042, // add  x2, x2, #0xb98  (@"Update tex %d")
+        0x94002d4c, // bl   objc_msgSend$stringWithFormat:
+        0xaa0003e2, // mov  x2, x0
+        0xaa1603e0, // mov  x0, x22 (MTLRenderCommandEncoder)
+        0x94002b91, // bl   objc_msgSend$pushDebugGroup:
+    };
+    static const uint32_t replacement = 0xaa0203e0; // mov x0, x2
+    enum { kLabelSequenceOffset = 0x154e0, kFormatCallIndex = 2 };
+
+    const struct mach_header_64 *header =
+        (const struct mach_header_64 *)untyped_header;
+    if (!macws_macho_uuid_matches(header, expected_uuid)) {
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+    uint32_t *sequence = (uint32_t *)((uintptr_t)header +
+                                      kLabelSequenceOffset);
+    if (sequence[kFormatCallIndex] == replacement) return;
+    if (memcmp(sequence, expected, sizeof(expected)) != 0) {
+        dprintf(STDERR_FILENO,
+            "#### MACWS-STEAM-OVERLAY label optimization skipped: "
+            "instruction precondition mismatch at %p\n", sequence);
+        atomic_store_explicit(&installed, 0, memory_order_release);
+        return;
+    }
+    ModifyExecutableRegion(&sequence[kFormatCallIndex],
+                           sizeof(sequence[kFormatCallIndex]), ^{
+        sequence[kFormatCallIndex] = replacement;
+    });
+    dprintf(STDERR_FILENO,
+        "#### MACWS-STEAM-OVERLAY label optimization %s at %p "
+        "format=constant debug-group=preserved\n",
+        sequence[kFormatCallIndex] == replacement ? "installed" :
+                                                   "write-failed",
+        &sequence[kFormatCallIndex]);
+}
+
 void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) {
     Dl_info info;
     dladdr(header, &info);
+    if (info.dli_fname &&
+        strstr(info.dli_fname, "gameoverlayrenderer") != NULL) {
+        macws_optimize_stray_steam_overlay_debug_label(header);
+    }
     if (info.dli_fname &&
         strcmp(info.dli_fname, "/usr/libexec/locationd") == 0) {
         macws_extend_locationd_initial_idle_window(header);
@@ -4075,7 +4184,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // returning YES on MTLTextureDescriptor (and any subclass), so the
         // AGXTexture init's cbz w0 check (at 0x1e5a5b7d8) passes and the
         // init proceeds.
-        if (getenv("MACWS_AGX_NATIVE") &&
+        if (macws_agx_native_enabled() &&
             macws_runtime_diagnostics_enabled()) {
             Class kDesc = objc_getClass("MTLTextureDescriptor");
             if (kDesc) {
@@ -4237,7 +4346,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
                 }
             });
         }
-    } else if(getenv("MACWS_AGX_NATIVE") && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
+    } else if(macws_agx_native_enabled() && !strncmp(info.dli_fname, AGXMetalPath, strlen(AGXMetalPath))) {
         // 2026-06-20 — One-shot guard.  AGXMetal13_3 is dlopen'd multiple
         // times across the WS lifetime (initial Metal load + chroot's
         // explicit re-dlopen + dyld notify on dependent-loads).  Re-running
@@ -4406,7 +4515,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // texture wrap fails. If it's AGXG13GFamilyTexture (subclass with
         // the real impl), the wrap should work. Log which one only when the
         // explicit runtime diagnostics profile is armed.
-        if (getenv("MACWS_AGX_NATIVE") &&
+        if (macws_agx_native_enabled() &&
             macws_runtime_diagnostics_enabled()) {
             void **classref_slot = (void **)(0x21a8a9298 + slide);
             void *cls = *classref_slot;
@@ -4534,7 +4643,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // which is 0x138 from the start of __objc_superrefs == the 40th /
         // last superref entry). Other superref entries used by other AGX
         // classes are TODO — patch reactively as more nil-exits surface.
-        if (getenv("MACWS_AGX_NATIVE")) {
+        if (macws_agx_native_enabled()) {
             // 2026-06-17 lldb-confirmed root cause of texture-init nil-exit
             // (and the actual fix that worked):
             //
@@ -4641,7 +4750,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         //
         // Print the first 96 bytes at the slid VA so we can see what
         // actually lives there.
-        if (getenv("MACWS_AGX_NATIVE")) {
+        if (macws_agx_native_enabled()) {
             uint64_t sel_static = 0x1cffc6f26;
             const char *sel_runtime = (const char *)(sel_static + slide);
             char preview[97] = {0};
@@ -4789,7 +4898,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // default is to let the real check return and expose downstream
         // failure (newTextureWithDescriptor:iosurface:plane: → nil).
         // See AGENTS.md "Patch Discipline".
-        if (getenv("MACWS_AGX_NATIVE") &&
+        if (macws_agx_native_enabled() &&
             !getenv("MACWS_AGX_KEEP_VALIDATE") &&
             getenv("MACWS_KEEP_VALIDATE_ALWAYS")) {
             uint64_t fn_static = 0x1e576ef94;
@@ -4830,7 +4939,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
         // strict AGX-native" path. Default off so the prior stable baseline
         // (MACWS_AGX_NATIVE=1 only → MTLSim path with stable nil-tolerate
         // hooks) keeps working without regressions.
-        if (!getenv("MACWS_AGX_REGISTER_CLASSES")) {
+        if (!macws_agx_register_classes_enabled()) {
             return;
         }
         // Diagnostic: check if AGXBuffer class is registered + __objc_classrefs
@@ -5472,7 +5581,7 @@ void loadImageCallback(const struct mach_header* header, intptr_t vmaddr_slide) 
     }
 }
 
-// MACWS_AGX_CRASH_DIAG: install SIGSEGV/SIGBUS/SIGILL handlers so the faulting
+// MACWS_AGX_CRASH_DIAG: install SIGSEGV/SIGBUS/SIGILL/SIGABRT handlers so the faulting
 // PC (slid + unslid) and backtrace land in stderr before the process exits.
 // Faster than racing lldb against a short-lived crash. Gated by env var so
 // production runs aren't affected.
@@ -5691,6 +5800,7 @@ static void macws_install_crash_diag(void) {
     sigaction(SIGBUS,  &sa, NULL);
     sigaction(SIGILL,  &sa, NULL);
     sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
     fprintf(stderr, "#### MACWS_AGX_CRASH_DIAG handlers installed\n");
 }
 
@@ -8994,7 +9104,7 @@ __attribute__((constructor)) void InitStuff() {
     // agx-mempool-grow-fault-decomposed). Doing this in the constructor
     // (instead of in the getMetalPluginClassForService hook) guarantees IOGPU
     // is bound before Metal touches AGXMetal13_3.
-    if (getenv("MACWS_AGX_NATIVE")) {
+    if (macws_agx_native_enabled()) {
         const char *iogpuPaths[] = {
             "/System/Library/PrivateFrameworks/IOGPU.framework/IOGPU",
             "/System/Library/PrivateFrameworks/IOGPU.framework/Versions/A/IOGPU",
@@ -10566,18 +10676,20 @@ static void macws_install_corelocation_requirement_interpose(void) {
 // /open -a Finder` witness reaches the same boundary and reports
 // RBSAssertionErrorDomain Code=2 (missing domain-plist attribute).
 //
-// Preserve LaunchServices as the first owner.  Only its exact failed
-// application-bundle transaction is handed to macwshostd, which already owns
-// the validated chroot spawn/reopen/readiness lifecycle used by Control
-// Center.  Documents, folders, successful LS requests and multi-item opens
-// never enter this adapter.
-typedef struct {
+// Preserve LaunchServices as the first owner.  Dock's exact single-bundle
+// transaction is then handed to macwshostd, which owns the validated chroot
+// spawn/reopen/content-readiness lifecycle used by Control Center. This also
+// covers the stale-record case where LaunchServices returns noErr without
+// creating or reopening a window. Non-Dock callers retain the narrower exact
+// -10810 fallback. Documents, folders and multi-item opens never enter this
+// adapter.
+struct MacWSLSLaunchURLSpec {
     CFURLRef appURL;
     CFArrayRef itemURLs;
     const void *passThruParams;
     uint32_t launchFlags;
     void *asyncRefCon;
-} MacWSLSLaunchURLSpec;
+};
 
 extern OSStatus LSOpenFromURLSpec(const MacWSLSLaunchURLSpec *launchSpec,
                                   CFURLRef *outLaunchedURL);
@@ -10619,7 +10731,28 @@ static CFURLRef macws_failed_application_url(
         (suffix[1] == 'a' || suffix[1] == 'A') &&
         (suffix[2] == 'p' || suffix[2] == 'P') &&
         (suffix[3] == 'p' || suffix[3] == 'P');
-    return application ? candidate : NULL;
+    if (application) return candidate;
+
+    // Runtime-confirmed from Dock's real Steam Open transaction on
+    // 2026-08-22: appURL=NULL, itemURLs contains exactly one file URL at
+    //   ~/Library/Application Support/Steam/Steam.AppBundle/Steam
+    // Valve's live app bundle deliberately has no `.app` suffix, but retains
+    // the canonical Contents/Info.plist bundle contract. Accept a suffixless
+    // directory only when that on-disk bundle marker exists. hostd then reads
+    // CFBundleExecutable and independently realpath/mode/boundary-validates
+    // the resolved executable. Ordinary documents and folders still cannot
+    // enter the application lifecycle adapter.
+    struct stat candidateStatus = {0};
+    struct stat infoStatus = {0};
+    char infoPath[PATH_MAX] = {0};
+    int infoLength = snprintf(infoPath, sizeof(infoPath),
+                              "%s/Contents/Info.plist", pathBytes);
+    BOOL suffixlessBundle = infoLength > 0 &&
+        (size_t)infoLength < sizeof(infoPath) &&
+        stat((const char *)pathBytes, &candidateStatus) == 0 &&
+        S_ISDIR(candidateStatus.st_mode) &&
+        stat(infoPath, &infoStatus) == 0 && S_ISREG(infoStatus.st_mode);
+    return suffixlessBundle ? candidate : NULL;
 }
 
 static BOOL macws_launch_application_path_via_host(CFURLRef applicationURL) {
@@ -10663,17 +10796,86 @@ static BOOL macws_launch_application_path_via_host(CFURLRef applicationURL) {
     return launched;
 }
 
+static BOOL macws_process_is_dock(void) {
+    const char *service = getenv("XPC_SERVICE_NAME");
+    if (service && strcmp(service, "com.macwsguide.dock") == 0) return YES;
+    const char *program = getprogname();
+    if (program && strcmp(program, "Dock") == 0) return YES;
+    char executable[PATH_MAX] = {0};
+    if (proc_pidpath(getpid(), executable, sizeof(executable)) <= 0)
+        return NO;
+    const char *dockSuffix =
+        "/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock";
+    size_t pathLength = strlen(executable);
+    size_t suffixLength = strlen(dockSuffix);
+    // Runtime-confirmed elsewhere in the same chroot that proc_pidpath may
+    // expose either the namespace-relative path or its
+    // /private/var/mnt/rootfs-prefixed host spelling. Identity is the exact
+    // executable suffix, not one particular namespace spelling.
+    return pathLength >= suffixLength &&
+        strcmp(executable + pathLength - suffixLength, dockSuffix) == 0;
+}
+
 static OSStatus macws_LSOpenFromURLSpec(
         const MacWSLSLaunchURLSpec *launchSpec,
         CFURLRef *outLaunchedURL) {
+    if (macws_process_is_dock()) {
+        UInt8 appPath[PATH_MAX] = {0};
+        CFIndex itemCount = -1;
+        if (launchSpec && launchSpec->appURL &&
+            CFGetTypeID(launchSpec->appURL) == CFURLGetTypeID()) {
+            (void)CFURLGetFileSystemRepresentation(
+                launchSpec->appURL, true, appPath, sizeof(appPath));
+        }
+        if (launchSpec && launchSpec->itemURLs &&
+            CFGetTypeID(launchSpec->itemURLs) == CFArrayGetTypeID())
+            itemCount = CFArrayGetCount(launchSpec->itemURLs);
+        fprintf(stderr,
+                "#### MACWS LS-APP-REQUEST owner=Dock app=%s items=%ld "
+                "flags=%#x passthru=%p async=%p\n",
+                appPath[0] ? (const char *)appPath : "(none)",
+                (long)itemCount, launchSpec ? launchSpec->launchFlags : 0,
+                launchSpec ? launchSpec->passThruParams : NULL,
+                launchSpec ? launchSpec->asyncRefCon : NULL);
+        if (itemCount > 0) {
+            CFIndex limit = MIN(itemCount, (CFIndex)4);
+            for (CFIndex index = 0; index < limit; index++) {
+                CFTypeRef item = CFArrayGetValueAtIndex(
+                    launchSpec->itemURLs, index);
+                UInt8 itemPath[PATH_MAX] = {0};
+                if (item && CFGetTypeID(item) == CFURLGetTypeID())
+                    (void)CFURLGetFileSystemRepresentation(
+                        (CFURLRef)item, true, itemPath, sizeof(itemPath));
+                fprintf(stderr,
+                        "#### MACWS LS-APP-REQUEST-ITEM owner=Dock index=%ld "
+                        "type=%lu path=%s\n", (long)index,
+                        (unsigned long)(item ? CFGetTypeID(item) : 0),
+                        itemPath[0] ? (const char *)itemPath : "(non-file-url)");
+            }
+        }
+        fflush(stderr);
+    }
     OSStatus status = LSOpenFromURLSpec(launchSpec, outLaunchedURL);
     // -10810 is the exact kLSUnknownErr returned after LaunchServices has
     // resolved the application but its foreign-platform RBS launch failed.
-    // Do not turn unrelated LS failures into success.
-    if (status != -10810) return status;
+    // Dock additionally needs hostd convergence even when a stale LS running
+    // record converts the request to noErr without a visible app window.
+    BOOL dockRequest = macws_process_is_dock();
+    if (status != -10810 && !dockRequest) return status;
     CFURLRef applicationURL = macws_failed_application_url(launchSpec);
-    if (!applicationURL ||
-        !macws_launch_application_path_via_host(applicationURL)) return status;
+    if (!applicationURL) return status;
+    BOOL launched = macws_launch_application_path_via_host(applicationURL);
+    if (dockRequest) {
+        UInt8 path[PATH_MAX] = {0};
+        (void)CFURLGetFileSystemRepresentation(
+            applicationURL, true, path, sizeof(path));
+        fprintf(stderr,
+                "#### MACWS LS-APP-ROUTE owner=Dock stock=%d path=%s "
+                "host=%s\n", (int)status, path,
+                launched ? "ready" : "failed");
+        fflush(stderr);
+    }
+    if (!launched) return status;
     if (outLaunchedURL && !*outLaunchedURL)
         *outLaunchedURL = (CFURLRef)CFRetain(applicationURL);
     return noErr;
@@ -10723,8 +10925,10 @@ DYLD_INTERPOSE(pthread_jit_write_protect_np_new,
 extern id objc_alloc(Class);
 id objc_alloc_trace(Class cls) {
     id r = objc_alloc(cls);
-    if (!getenv("MACWS_AGX_REGISTER_CLASSES") ||
-        !macws_runtime_diagnostics_enabled()) return r;
+    // Production has no allocation tracing. Check the already-cached
+    // diagnostic bit first so ordinary objc_alloc calls never enter getenv.
+    if (!macws_runtime_diagnostics_enabled() ||
+        !macws_agx_register_classes_enabled()) return r;
     if (cls) {
         const char *n = class_getName(cls);
         if (n && strncmp(n, "AGX", 3) == 0) {
@@ -11709,6 +11913,114 @@ static const MacWSIOSurfacePropertyKeys *macws_iosurface_property_keys(void) {
     return &keys;
 }
 
+// A single Metal texture import asks for several fields of the same
+// IOSurface in succession. The ABI-compatibility implementation used to call
+// IOSurfaceCopyAllValues for every individual width/stride/offset query.
+// Stray's preserving 2026-08-23 sample caught that property-list walk in the
+// render/RHI hot path. Keep one immutable property snapshot per calling
+// thread and replace it when that thread moves to another IOSurface. Resolve
+// each immutable plane/property pair only once within that snapshot as well;
+// the 2026-08-29 Stray sample still found 100+ stack-top hits in the repeated
+// CFDictionary walk after the dictionary-level cache had shipped. The cache
+// does not retain the surface itself (so it cannot extend a GPU lease), and
+// its pthread destructor releases the copied dictionary and parsed values.
+typedef struct {
+    uint64_t values[MacWSIOSurfacePlanePropertyCount];
+    uint32_t resolvedMask;
+    uint32_t foundMask;
+    uint64_t componentCount;
+    bool componentCountResolved;
+    bool componentCountFound;
+} MacWSIOSurfacePlanePropertyCache;
+
+typedef struct {
+    IOSurfaceRef surface;
+    uint32_t surfaceID;
+    CFDictionaryRef values;
+    MacWSIOSurfacePlanePropertyCache *planeProperties;
+    size_t planePropertyCount;
+    bool loading;
+} MacWSIOSurfacePropertyCache;
+
+static pthread_key_t MacWSIOSurfacePropertyCacheKey;
+static pthread_once_t MacWSIOSurfacePropertyCacheKeyOnce = PTHREAD_ONCE_INIT;
+static bool MacWSIOSurfacePropertyCacheKeyValid;
+
+static void macws_iosurface_property_cache_destroy(void *context) {
+    MacWSIOSurfacePropertyCache *cache = context;
+    if (!cache) return;
+    if (cache->values) CFRelease(cache->values);
+    free(cache->planeProperties);
+    free(cache);
+}
+
+static void macws_iosurface_property_cache_create_key(void) {
+    MacWSIOSurfacePropertyCacheKeyValid = pthread_key_create(
+        &MacWSIOSurfacePropertyCacheKey,
+        macws_iosurface_property_cache_destroy) == 0;
+}
+
+static CFDictionaryRef macws_iosurface_cached_values(
+        IOSurfaceRef surface, MacWSIOSurfacePropertyCache **cacheOut) {
+    if (cacheOut) *cacheOut = NULL;
+    if (!surface) return NULL;
+    pthread_once(&MacWSIOSurfacePropertyCacheKeyOnce,
+                 macws_iosurface_property_cache_create_key);
+    if (!MacWSIOSurfacePropertyCacheKeyValid) return NULL;
+    MacWSIOSurfacePropertyCache *cache = pthread_getspecific(
+        MacWSIOSurfacePropertyCacheKey);
+    if (!cache) {
+        cache = calloc(1, sizeof(*cache));
+        if (!cache || pthread_setspecific(
+                MacWSIOSurfacePropertyCacheKey, cache) != 0) {
+            free(cache);
+            return NULL;
+        }
+    }
+    uint32_t surfaceID = IOSurfaceGetID(surface);
+    if (cache->surface == surface && cache->surfaceID == surfaceID) {
+        if (cacheOut) *cacheOut = cache;
+        return cache->values;
+    }
+    // IOSurfaceCopyAllValues is not expected to re-enter these public plane
+    // accessors, but retain a strict guard so an implementation change falls
+    // back to the original field instead of recursing.
+    if (cache->loading) return NULL;
+    cache->loading = true;
+    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    cache->loading = false;
+    if (!copied) return NULL;
+    if (cache->values) CFRelease(cache->values);
+    free(cache->planeProperties);
+    cache->planeProperties = NULL;
+    cache->planePropertyCount = 0;
+    cache->surface = surface;
+    cache->surfaceID = surfaceID;
+    cache->values = copied;
+    if (cacheOut) *cacheOut = cache;
+    return cache->values;
+}
+
+static MacWSIOSurfacePlanePropertyCache *
+macws_iosurface_plane_property_cache(
+        MacWSIOSurfacePropertyCache *cache, size_t plane) {
+    if (!cache) return NULL;
+    if (plane < cache->planePropertyCount)
+        return &cache->planeProperties[plane];
+    if (plane == SIZE_MAX ||
+        plane + 1 > SIZE_MAX / sizeof(*cache->planeProperties)) return NULL;
+    size_t oldCount = cache->planePropertyCount;
+    size_t newCount = plane + 1;
+    MacWSIOSurfacePlanePropertyCache *resized = realloc(
+        cache->planeProperties, newCount * sizeof(*resized));
+    if (!resized) return NULL;
+    memset(resized + oldCount, 0,
+           (newCount - oldCount) * sizeof(*resized));
+    cache->planeProperties = resized;
+    cache->planePropertyCount = newCount;
+    return &cache->planeProperties[plane];
+}
+
 // arm64e runtime-confirmed on 2026-08-04: using an on-device-linked
 // Objective-C constant string here put the unauthenticated
 // __CFConstantStringClassReference (0x00200001eed885d8) into
@@ -11726,8 +12038,17 @@ static bool macws_iosurface_plane_property_value(
     const MacWSIOSurfacePropertyKeys *keys = macws_iosurface_property_keys();
     if (!keys->creationProperties || !keys->planeInfo ||
         !keys->shortKeys[property] || !keys->fullKeys[property]) return false;
-    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    MacWSIOSurfacePropertyCache *cache = NULL;
+    CFDictionaryRef copied = macws_iosurface_cached_values(surface, &cache);
     if (!copied) return false;
+    MacWSIOSurfacePlanePropertyCache *planeCache =
+        macws_iosurface_plane_property_cache(cache, plane);
+    uint32_t propertyBit = 1u << (unsigned)property;
+    if (planeCache && (planeCache->resolvedMask & propertyBit)) {
+        if (!(planeCache->foundMask & propertyBit)) return false;
+        *valueOut = planeCache->values[property];
+        return true;
+    }
     uint64_t value = 0;
     bool found = false;
     if (CFGetTypeID(copied) == CFDictionaryGetTypeID()) {
@@ -11763,7 +12084,13 @@ static bool macws_iosurface_plane_property_value(
             }
         }
     }
-    CFRelease(copied);
+    if (planeCache) {
+        planeCache->resolvedMask |= propertyBit;
+        if (found) {
+            planeCache->foundMask |= propertyBit;
+            planeCache->values[property] = value;
+        }
+    }
     if (found) *valueOut = value;
     return found;
 }
@@ -11779,8 +12106,16 @@ static bool macws_iosurface_plane_component_count(IOSurfaceRef surface,
     if (!surface || !valueOut || !keys->creationProperties ||
         !keys->planeInfo || !keys->componentInfo ||
         !keys->fullComponentInfo) return false;
-    CFDictionaryRef copied = IOSurfaceCopyAllValues(surface);
+    MacWSIOSurfacePropertyCache *cache = NULL;
+    CFDictionaryRef copied = macws_iosurface_cached_values(surface, &cache);
     if (!copied) return false;
+    MacWSIOSurfacePlanePropertyCache *planeCache =
+        macws_iosurface_plane_property_cache(cache, plane);
+    if (planeCache && planeCache->componentCountResolved) {
+        if (!planeCache->componentCountFound) return false;
+        *valueOut = planeCache->componentCount;
+        return true;
+    }
     bool found = false;
     if (CFGetTypeID(copied) == CFDictionaryGetTypeID()) {
         CFTypeRef creationValue = CFDictionaryGetValue(
@@ -11813,7 +12148,11 @@ static bool macws_iosurface_plane_component_count(IOSurfaceRef surface,
             }
         }
     }
-    CFRelease(copied);
+    if (planeCache) {
+        planeCache->componentCountResolved = true;
+        planeCache->componentCountFound = found;
+        if (found) planeCache->componentCount = *valueOut;
+    }
     return found;
 }
 
@@ -11837,7 +12176,7 @@ static uint64_t macws_iosurface_plane_property(IOSurfaceRef surface,
 // format or return a constant merely to pass Chromium's bounds check.
 size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetWidthOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneWidth);
     if (property == 0 || property > SIZE_MAX || property == original)
@@ -11857,7 +12196,7 @@ size_t macws_IOSurfaceGetWidthOfPlane(IOSurfaceRef surface, size_t plane) {
 
 size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetHeightOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneHeight);
     if (property == 0 || property > SIZE_MAX || property == original)
@@ -11878,7 +12217,7 @@ size_t macws_IOSurfaceGetHeightOfPlane(IOSurfaceRef surface, size_t plane) {
 uint32_t macws_IOSurfaceGetCompressionTypeOfPlane(IOSurfaceRef surface,
                                                    size_t plane) {
     uint32_t original = IOSurfaceGetCompressionTypeOfPlane(surface, plane);
-    if (original != 0 || !getenv("MACWS_AGX_NATIVE")) return original;
+    if (original != 0 || !macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneCompressionType);
     if (property == 0 || property > UINT32_MAX) return original;
@@ -11898,7 +12237,7 @@ size_t macws_IOSurfaceGetHeightInCompressedTilesOfPlane(
         IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetHeightInCompressedTilesOfPlane(
         surface, plane);
-    if (original != 0 || !getenv("MACWS_AGX_NATIVE")) return original;
+    if (original != 0 || !macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneHeightInCompressedTiles);
     if (property == 0 || property > SIZE_MAX) return original;
@@ -11918,7 +12257,7 @@ size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
         IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetWidthInCompressedTilesOfPlane(
         surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneWidthInCompressedTiles);
     if (property == 0 || property > SIZE_MAX || property == original)
@@ -11938,7 +12277,7 @@ size_t macws_IOSurfaceGetWidthInCompressedTilesOfPlane(
 size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
                                             size_t plane) {
     size_t original = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneBytesPerRow);
     if (property == 0 || property > SIZE_MAX || property == original)
@@ -11972,7 +12311,7 @@ size_t macws_IOSurfaceGetBytesPerRowOfPlane(IOSurfaceRef surface,
 static size_t macws_iosurface_explicit_plane_size(
         IOSurfaceRef surface, size_t plane, size_t original,
         MacWSIOSurfacePlaneProperty propertyKey, const char *field) {
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, propertyKey);
     if (property == 0 || property > SIZE_MAX || property == original)
@@ -12021,7 +12360,7 @@ size_t macws_IOSurfaceGetSizeOfPlane(IOSurfaceRef surface, size_t plane) {
 size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
                                                     size_t plane) {
     size_t original = IOSurfaceGetNumberOfComponentsOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = 0;
     if (!macws_iosurface_plane_component_count(surface, plane, &property) ||
         property == 0 || property > SIZE_MAX || property == original)
@@ -12039,7 +12378,7 @@ size_t macws_IOSurfaceGetNumberOfComponentsOfPlane(IOSurfaceRef surface,
 size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
                                                  size_t plane) {
     size_t original = IOSurfaceGetBytesPerTileDataOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneBytesPerTileData);
     if (property == 0 || property > SIZE_MAX || property == original)
@@ -12058,7 +12397,7 @@ size_t macws_IOSurfaceGetBytesPerTileDataOfPlane(IOSurfaceRef surface,
 
 size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
     size_t original = IOSurfaceGetOffsetOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = 0;
     bool found = macws_iosurface_plane_property_value(
         surface, plane, MacWSIOSurfacePlaneOffset, &property);
@@ -12079,7 +12418,7 @@ size_t macws_IOSurfaceGetOffsetOfPlane(IOSurfaceRef surface, size_t plane) {
 void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
                                            size_t plane) {
     void *original = IOSurfaceGetBaseAddressOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t propertyOffset = 0;
     bool found = macws_iosurface_plane_property_value(
         surface, plane, MacWSIOSurfacePlaneOffset, &propertyOffset);
@@ -12104,7 +12443,7 @@ void *macws_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef surface,
 uint32_t macws_IOSurfaceGetAddressFormatOfPlane(IOSurfaceRef surface,
                                                 size_t plane) {
     uint32_t original = IOSurfaceGetAddressFormatOfPlane(surface, plane);
-    if (!getenv("MACWS_AGX_NATIVE")) return original;
+    if (!macws_agx_native_enabled()) return original;
     uint64_t property = macws_iosurface_plane_property(
         surface, plane, MacWSIOSurfacePlaneAddressFormat);
     if (property == 0 || property > UINT32_MAX || property == original)
@@ -12715,7 +13054,7 @@ static int g_agxIdMapCount;
 //   ioGPUResourceFinalize+24 loads wrapper+0x30 and passes it as selector 0xb's
 //   sole scalar. out+0x28 is copied to wrapper+0x50 and is NOT the resource ID.
 #define MACWS_AGX_LIFE_CAP 16384u
-#define MACWS_AGX_CPU_DUMP_CAP 64u
+#define MACWS_AGX_CPU_DUMP_CAP 128u
 #define MACWS_AGX_CPU_DUMP_BYTES 0x10000u
 #define MACWS_AGX_T82_REQUEST_CAP 512u
 #define MACWS_AGX_T82_REQUEST_BYTES 0x100u
@@ -12723,6 +13062,7 @@ static int g_agxIdMapCount;
 #define MACWS_AGX_SURFACE_DUMP_BYTES 0x100000u
 struct macws_agx_life_entry {
     uint64_t gid;       // 0 = empty, UINT64_MAX = tombstone
+    uint64_t create_event_serial; // successful-create generation
     uint64_t gpu_address; // kernel-returned GPU VA (out+0x00)
     uint64_t data_bytes; // CPU mapping returned by GetDataBytes (out+0x08)
     uint64_t client_shared; // client-shared state returned from out+0x10
@@ -12884,7 +13224,9 @@ static void macws_agx_life_create(uint64_t gid, uint8_t type,
             g_agxLifeBytes[old_type] -= g_agxLife[slot].bytes;
         }
         g_agxLife[slot] = (struct macws_agx_life_entry){
-            .gid = gid, .gpu_address = gpu_address,
+            .gid = gid,
+            .create_event_serial = g_agxLifeEventSerial + 1,
+            .gpu_address = gpu_address,
             .data_bytes = data_bytes, .client_shared = client_shared,
             .bytes = bytes,
             .request_50 = request_50, .client_id = client_id,
@@ -13036,6 +13378,12 @@ struct macws_agx_surface_dump {
     BOOL has_request;
 };
 
+// Implemented by Metal_hooks.x.  The table is populated only under the same
+// pre-launch IOGPU error sentinel and contains public MTLBuffer observations;
+// this call merely emits its already-captured state beside the kernel-resource
+// snapshot.
+extern void MacWSMetalDumpAGXBufferDiagnostics(const char *directory);
+
 // Read-only error artifact.  Correlate aligned 64-bit KCMD words against the
 // kernel-returned VA ranges, and preserve the complete active/recent resource
 // state.  A match is evidence; unmatched address-looking words remain opaque
@@ -13057,6 +13405,7 @@ static void macws_agx_life_dump_snapshot(const char *directory,
     // The fixed count and per-resource byte cap keep a PageFault storm bounded.
     struct macws_agx_life_entry cpu_dumps[MACWS_AGX_CPU_DUMP_CAP];
     unsigned cpu_dump_count = 0;
+    BOOL dump_ring_buffer_peers = NO;
     struct macws_agx_surface_dump
         surface_dumps[MACWS_AGX_SURFACE_DUMP_CAP];
     unsigned surface_dump_count = 0;
@@ -13076,10 +13425,12 @@ static void macws_agx_life_dump_snapshot(const char *directory,
         const struct macws_agx_life_entry *entry = &g_agxLife[i];
         if (entry->gid == 0 || entry->gid == UINT64_MAX) continue;
         fprintf(output,
-            "gid=%#llx va=%#llx data=%#llx shared=%#llx bytes=%#llx "
+            "gid=%#llx create_event=%llu va=%#llx data=%#llx "
+            "shared=%#llx bytes=%#llx "
             "type=%#x surface=%#x "
             "client=%#x flags14=%#x request50=%#llx\n",
             (unsigned long long)entry->gid,
+            (unsigned long long)entry->create_event_serial,
             (unsigned long long)entry->gpu_address,
             (unsigned long long)entry->data_bytes,
             (unsigned long long)entry->client_shared,
@@ -13114,6 +13465,18 @@ static void macws_agx_life_dump_snapshot(const char *directory,
                 }
                 if (!duplicate) cpu_dumps[cpu_dump_count++] = *active;
             }
+            // The Stray MetalFX timeout capture referenced a 64-KiB type-0
+            // allocation from a rotating family whose accepted request was
+            // flags14=0x430/request50=0x18000000.  Preserve all live peers of
+            // that exact kernel request family when one member is referenced
+            // by the failing KCMD.  This is observation only: no resource is
+            // retained, synchronized, or modified.  Comparing the peers can
+            // prove or refute stale indirect addresses without a blanket
+            // cache flush.
+            if (active->type == 0 && active->bytes == 0x10000 &&
+                active->flags_14 == 0x430 &&
+                active->request_50 == 0x18000000)
+                dump_ring_buffer_peers = YES;
             if (active->type == 0x82 && active->surface_id != 0 &&
                 surface_dump_count < MACWS_AGX_SURFACE_DUMP_CAP) {
                 BOOL duplicate = NO;
@@ -13159,6 +13522,25 @@ static void macws_agx_life_dump_snapshot(const char *directory,
                 entry->surface_id);
         }
     }
+    if (dump_ring_buffer_peers) {
+        for (unsigned slot = 0;
+             slot < MACWS_AGX_LIFE_CAP &&
+             cpu_dump_count < MACWS_AGX_CPU_DUMP_CAP; slot++) {
+            const struct macws_agx_life_entry *entry = &g_agxLife[slot];
+            if (entry->gid == 0 || entry->gid == UINT64_MAX ||
+                entry->type != 0 || entry->bytes != 0x10000 ||
+                entry->data_bytes == 0 || entry->flags_14 != 0x430 ||
+                entry->request_50 != 0x18000000) continue;
+            BOOL duplicate = NO;
+            for (unsigned saved = 0; saved < cpu_dump_count; saved++) {
+                if (cpu_dumps[saved].gid == entry->gid) {
+                    duplicate = YES;
+                    break;
+                }
+            }
+            if (!duplicate) cpu_dumps[cpu_dump_count++] = *entry;
+        }
+    }
     fprintf(output, "[recent-events]\n");
     uint64_t newest = g_agxLifeEventSerial;
     uint64_t oldest = newest > MACWS_AGX_LIFE_EVENT_CAP
@@ -13169,12 +13551,14 @@ static void macws_agx_life_dump_snapshot(const char *directory,
         if (event->serial != serial) continue;
         const struct macws_agx_life_entry *entry = &event->resource;
         fprintf(output,
-            "event=%llu action=%s gid=%#llx va=%#llx data=%#llx "
+            "event=%llu action=%s gid=%#llx create_event=%llu "
+            "va=%#llx data=%#llx "
             "shared=%#llx bytes=%#llx type=%#x surface=%#x client=%#x "
             "flags14=%#x request50=%#llx\n",
             (unsigned long long)serial,
             event->action == 1 ? "CREATE" : "DESTROY",
             (unsigned long long)entry->gid,
+            (unsigned long long)entry->create_event_serial,
             (unsigned long long)entry->gpu_address,
             (unsigned long long)entry->data_bytes,
             (unsigned long long)entry->client_shared,
@@ -13185,9 +13569,10 @@ static void macws_agx_life_dump_snapshot(const char *directory,
     pthread_mutex_unlock(&g_agxLifeLock);
 
     fprintf(output,
-        "[direct-type0-cpu-dumps] selected=%u max_resources=%u "
+        "[direct-type0-cpu-dumps] selected=%u ring_peers=%s max_resources=%u "
         "max_bytes_each=%#x\n",
-        cpu_dump_count, MACWS_AGX_CPU_DUMP_CAP, MACWS_AGX_CPU_DUMP_BYTES);
+        cpu_dump_count, dump_ring_buffer_peers ? "YES" : "NO",
+        MACWS_AGX_CPU_DUMP_CAP, MACWS_AGX_CPU_DUMP_BYTES);
     for (unsigned i = 0; i < cpu_dump_count; i++) {
         const struct macws_agx_life_entry *entry = &cpu_dumps[i];
         size_t wanted = entry->bytes < MACWS_AGX_CPU_DUMP_BYTES
@@ -13213,9 +13598,11 @@ static void macws_agx_life_dump_snapshot(const char *directory,
             }
         }
         fprintf(output,
-            "gid=%#llx va=%#llx data=%#llx bytes=%#llx wanted=%#zx "
+            "gid=%#llx create_event=%llu va=%#llx data=%#llx "
+            "bytes=%#llx wanted=%#zx "
             "vm_read_kr=%#x received=%#llx written=%#zx file=%s\n",
             (unsigned long long)entry->gid,
+            (unsigned long long)entry->create_event_serial,
             (unsigned long long)entry->gpu_address,
             (unsigned long long)entry->data_bytes,
             (unsigned long long)entry->bytes, wanted, kr,
@@ -13359,6 +13746,7 @@ static void macws_agx_life_dump_snapshot(const char *directory,
         CFRelease((CFTypeRef)surface);
     }
     fclose(output);
+    MacWSMetalDumpAGXBufferDiagnostics(directory);
 }
 
 // 2026-06-19 — sel=0xa double-translation root cause:
@@ -15303,6 +15691,196 @@ static BOOL macws_agx_fragment_entry_length(
     return YES;
 }
 
+// Runtime-confirmed MetalFX command/list producer-version boundary.
+// The same 720x450 -> 1440x900 temporal frame was captured from the macOS
+// 13.4 chroot and from an iOS 16.3-native process on this iPad.  Native
+// completed status=4/error=nil (GPU time 0.320 ms); the chroot's matching
+// second internal submit returned `Internal Error (00000103:Internal Error)`.
+// All three compute submits have the same semantic framing:
+//
+//   leading two 0x18-byte event commands + one subtype-3 vendor command +
+//   one/two trailing 0x18-byte event commands.
+//
+// In every pair, macOS's subtype-3 command is exactly 0x10 bytes larger.
+// The first native capture ran at -commit entry and therefore observed the
+// list before AGX's final queue packaging; at that earlier point the trailing
+// 0x18-byte event range had not yet been appended.  A second native capture
+// at -[AGXG13GFamilyCommandQueue submitCommandBuffers:count:] disproved the
+// initial list-removal interpretation: all three successful native submits
+// retain the trailing event commands AND their final 0x18-byte list range at
+// the actual submission boundary.  Exact boundary-equivalent sizes:
+//
+//   submit 2: macOS 0x300/0x160 -> iOS 0x2f0/0x160
+//   submit 3: macOS 0x348/0x1e0 -> iOS 0x338/0x1e0
+//   submit 5: macOS 0x2b8/0x1a0 -> iOS 0x2a8/0x1a0
+//
+// Preserve every event command and every resource descriptor.  Normalize the
+// already RE-confirmed subtype-3 zero window, update the vendor range and the
+// following event range by the same 0x10 shrink, and retain the complete list.
+// This is a structural wire-ABI adapter, not a shader-name list or an
+// error/completion bypass.  It remains scoped to the established Stray
+// compatibility contract (or its explicit subtype-3 diagnostic switch), and
+// every captured list/record invariant must match before any byte is changed.
+static unsigned macws_translate_agx_event_wrapped_single_subtype3(
+    unsigned sequence, unsigned char *commands, size_t *total_io,
+    unsigned char *segment_list, size_t *segment_length_io) {
+    if (!commands || !total_io || !segment_list || !segment_length_io ||
+        !(macws_stray_agx_compat_enabled() ||
+          macws_kcmd_stray_subtype3_diag_enabled()))
+        return 0;
+
+    size_t total = *total_io;
+    size_t segment_length = *segment_length_io;
+    if (total < 0x258 || total > 0x900 || segment_length < 0x90)
+        return 0;
+
+    uint64_t list_token = *(uint64_t *)(segment_list + 0x00);
+    uint32_t prefix_start = *(uint32_t *)(segment_list + 0x10);
+    uint32_t prefix_end = *(uint32_t *)(segment_list + 0x14);
+    BOOL prefix_list_ok =
+        *(uint32_t *)(segment_list + 0x08) == 1 &&
+        *(uint32_t *)(segment_list + 0x0c) == 0x40000001U &&
+        prefix_start == 0 && prefix_end == 0x30;
+    if (!prefix_list_ok)
+        return 0;
+
+    unsigned char *vendor_list = segment_list + 0x18;
+    if (*(uint64_t *)(vendor_list + 0x00) != list_token ||
+        *(uint32_t *)(vendor_list + 0x08) != 1)
+        return 0;
+    uint32_t vendor_list_length =
+        *(uint32_t *)(vendor_list + 0x0c);
+    if (vendor_list_length < 0x30 ||
+        (size_t)0x18 + vendor_list_length + 0x18 != segment_length)
+        return 0;
+
+    unsigned char *vendor_entry = vendor_list + 0x10;
+    size_t vendor_entry_length = 0;
+    if (!macws_agx_fragment_entry_length(
+            vendor_entry, vendor_list_length - 0x10,
+            &vendor_entry_length) ||
+        vendor_entry_length + 0x10 != vendor_list_length)
+        return 0;
+    uint32_t vendor_start = *(uint32_t *)(vendor_entry + 0x08);
+    uint32_t vendor_end = *(uint32_t *)(vendor_entry + 0x0c);
+    if (vendor_start != prefix_end || vendor_end <= vendor_start ||
+        vendor_end > total)
+        return 0;
+
+    unsigned char *tail_list = vendor_list + vendor_list_length;
+    BOOL tail_list_ok =
+        *(uint64_t *)(tail_list + 0x00) == list_token &&
+        *(uint32_t *)(tail_list + 0x08) == 1 &&
+        *(uint32_t *)(tail_list + 0x0c) == 0xc0000001U &&
+        *(uint32_t *)(tail_list + 0x10) == vendor_end &&
+        *(uint32_t *)(tail_list + 0x14) == total;
+    if (!tail_list_ok)
+        return 0;
+
+    // The paired native captures retain the complete leading and trailing
+    // event sequences byte-for-byte.  Validate their framing before moving
+    // the vendor tail.  Types 3/4/5/6/10 are the complete observed family in
+    // these native controls; all have a nonzero event/token dword at +0x08.
+    const uint32_t allowed_event_types[] = {3, 4, 5, 6, 10};
+    struct {
+        uint32_t start;
+        uint32_t end;
+    } event_ranges[] = {
+        {prefix_start, prefix_end}, {vendor_end, (uint32_t)total}
+    };
+    for (size_t range_index = 0;
+         range_index < sizeof(event_ranges) / sizeof(event_ranges[0]);
+         range_index++) {
+        uint32_t start = event_ranges[range_index].start;
+        uint32_t end = event_ranges[range_index].end;
+        if (end <= start || (end - start) % 0x18 != 0 ||
+            end - start > 0x30)
+            return 0;
+        for (uint32_t offset = start; offset < end; offset += 0x18) {
+            uint32_t type = *(uint32_t *)(commands + offset + 0x00);
+            BOOL allowed = NO;
+            for (size_t type_index = 0;
+                 type_index < sizeof(allowed_event_types) /
+                                  sizeof(allowed_event_types[0]);
+                 type_index++) {
+                if (type == allowed_event_types[type_index]) {
+                    allowed = YES;
+                    break;
+                }
+            }
+            if (!allowed ||
+                *(uint32_t *)(commands + offset + 0x04) != 0x18 ||
+                *(uint32_t *)(commands + offset + 0x08) == 0)
+                return 0;
+        }
+    }
+
+    unsigned char *record = commands + vendor_start;
+    size_t span = (size_t)vendor_end - vendor_start;
+    static const unsigned char all_ones[12] = {
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff
+    };
+    uint32_t trailer = *(uint32_t *)(record + 0x24);
+    uint32_t mode = *(uint32_t *)(record + 0x1f4);
+    BOOL vendor_ok =
+        span >= 0x210 && span <= 0x800 && trailer >= 0x18 &&
+        trailer % 0x18 == 0 && span == (size_t)0x1f8 + trailer &&
+        *(uint32_t *)(record + 0x00) == 0x10000 &&
+        *(uint32_t *)(record + 0x04) == span &&
+        *(uint32_t *)(record + 0x28) == 0x1e8 &&
+        *(uint32_t *)(record + 0x2c) == 0x1b8 &&
+        *(uint32_t *)(record + 0x30) == 0x30 &&
+        *(uint32_t *)(record + 0x34) == 3 &&
+        *(uint32_t *)(record + 0x120) > 0 &&
+        *(uint32_t *)(record + 0x120) <= 64 &&
+        *(uint32_t *)(record + 0x1c8) == 0 &&
+        macws_submit_bytes_are_zero(record + 0x1cc, 0x14) &&
+        memcmp(record + 0x1e0, all_ones, sizeof(all_ones)) == 0 &&
+        *(uint32_t *)(record + 0x1ec) == 0 &&
+        *(uint32_t *)(record + 0x1f0) == 0 &&
+        mode >= 1 && mode <= 0x10 &&
+        *(uint32_t *)(record + 0x1fc) == 0x15;
+    if (!vendor_ok)
+        return 0;
+
+    size_t delete_offset = (size_t)vendor_start + 0x1d0;
+    memmove(commands + delete_offset, commands + delete_offset + 0x10,
+            total - delete_offset - 0x10);
+    total -= 0x10;
+    memset(commands + total, 0, 0x10);
+    *(uint32_t *)(record + 0x04) = (uint32_t)(span - 0x10);
+    *(uint32_t *)(record + 0x28) = 0x1d8;
+    *(uint32_t *)(record + 0x2c) = 0x1a8;
+    // Runtime-confirmed from the successful native submission-boundary
+    // captures /var/tmp/metalfx-native-17850-s{2,3,5}-kcmd.bin: the four
+    // bytes at record+0x1c8 are 00 00 00 01 in all three submits, i.e. the
+    // little-endian word 0x01000000.  The previous adapter wrote integer 1,
+    // producing the reversed bytes 01 00 00 00; r23 serial 390 captured that
+    // incorrect post-translation value on the command that then held the GPU
+    // dependency for about four seconds.  Require the paired macOS producer's
+    // zero source field above and reproduce the exact native wire bytes here.
+    // This is a producer-version ABI translation, not an error-status bypass.
+    *(uint32_t *)(record + 0x1c8) = 0x01000000U;
+    *(uint32_t *)(vendor_entry + 0x0c) = vendor_end - 0x10;
+    *(uint32_t *)(tail_list + 0x10) = vendor_end - 0x10;
+    *(uint32_t *)(tail_list + 0x14) = (uint32_t)total;
+    *total_io = total;
+    *segment_length_io = segment_length;
+
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+            "#### AGX_SUBMIT_DIAG #%u METALFX-EVENT-WRAPPED-SUBTYPE3 "
+            "record=%#x..%#x->%#x mode=%u resources=%u/%#x "
+            "kcmd=%#zx list=%#zx\n",
+            sequence, vendor_start, vendor_end, vendor_end - 0x10,
+            mode, *(uint32_t *)(record + 0x120),
+            *(uint32_t *)(record + 0x128), total, segment_length);
+    }
+    return 1;
+}
+
 // Parse, but do not flatten, the segmented signal-event contract.  A paired
 // selector-0x1a capture from this exact iPad/iOS build now proves that native
 // IOGPU uses the same framing for both _MTLSharedEvent (type 3) and the legacy
@@ -15336,6 +15914,55 @@ static BOOL macws_collect_agx_fragmented_list_ranges(
             return NO;
         uint32_t count = *(uint32_t *)(chunk + 0x08);
         uint32_t encoded_length = *(uint32_t *)(chunk + 0x0c);
+        BOOL event_range = encoded_length == 0x40000001U ||
+            encoded_length == 0xc0000001U;
+        if (event_range) {
+            // Runtime-confirmed via Stray PID 31183, submit serial 16
+            // (fast-ring KCMD/list dd2defcd.../da383e23...): the failing
+            // MetalFX frame begins with an event range [0,0x30), then a
+            // one-record vendor chunk, another event range [0x2d0,0x300),
+            // and finally a terminal 28-record vendor chunk.  The former
+            // parser assumed every fragmented list began with a vendor chunk,
+            // so it rejected this fully contiguous producer framing before
+            // any of its 29 vendor records could reach the ABI normalizer
+            // (completion 0x103, fixed=0).
+            //
+            // Treat event ranges as first-class chunks wherever they occur.
+            // This retains every event command byte-for-byte and changes only
+            // the already RE-confirmed macOS-only windows inside subsequent
+            // vendor records.  The bounded event family and 0x18-byte command
+            // framing are the same invariants used by the independently
+            // successful MetalFX native-boundary controls above.
+            if (count != 1 || list_cursor + 0x18 > list_length ||
+                signal_count >= MACWS_AGX_SEGMENT_LIST_MAX_RECORDS)
+                return NO;
+            uint32_t event_start = *(uint32_t *)(chunk + 0x10);
+            uint32_t event_end = *(uint32_t *)(chunk + 0x14);
+            if (event_start != command_cursor || event_end <= event_start ||
+                event_end > total || event_end - event_start > 0x30 ||
+                (event_end - event_start) % 0x18 != 0)
+                return NO;
+            for (uint32_t offset = event_start; offset < event_end;
+                 offset += 0x18) {
+                const unsigned char *event = commands + offset;
+                uint32_t event_type = *(uint32_t *)(event + 0x00);
+                BOOL event_type_ok = event_type == 3 || event_type == 4 ||
+                    event_type == 5 || event_type == 6 || event_type == 10;
+                if (!event_type_ok ||
+                    *(uint32_t *)(event + 0x04) != 0x18 ||
+                    *(uint32_t *)(event + 0x08) == 0 ||
+                    // iOS _MTLSharedEvent explicitly zeroes this word;
+                    // legacy event producers leave their padding opaque.
+                    (event_type == 3 &&
+                     *(uint32_t *)(event + 0x0c) != 0))
+                    return NO;
+            }
+            signal_pair_offsets[signal_count++] =
+                (uint32_t)(list_cursor + 0x10);
+            command_cursor = event_end;
+            list_cursor += 0x18;
+            continue;
+        }
         BOOL terminal_direct = (encoded_length & 0x80000000U) != 0;
         uint32_t chunk_length = encoded_length & 0x7fffffffU;
         if (count < 1 ||
@@ -15375,40 +16002,19 @@ static BOOL macws_collect_agx_fragmented_list_ranges(
                 return NO;
             break;
         }
-        if (list_cursor + 0x18 > list_length ||
-            signal_count >= MACWS_AGX_SEGMENT_LIST_MAX_RECORDS)
-            return NO;
-
-        const unsigned char *signal_list = segment_list + list_cursor;
-        uint32_t signal_flags = *(uint32_t *)(signal_list + 0x0c);
-        uint32_t signal_start = *(uint32_t *)(signal_list + 0x10);
-        uint32_t signal_end = *(uint32_t *)(signal_list + 0x14);
-        if (*(uint64_t *)(signal_list + 0x00) != list_token ||
-            *(uint32_t *)(signal_list + 0x08) != 1 ||
-            (signal_flags != 0x40000001U &&
-             signal_flags != 0xc0000001U) ||
-            signal_start != command_cursor ||
-            signal_end != signal_start + 0x18 || signal_end > total)
-            return NO;
-
-        const unsigned char *signal = commands + signal_start;
-        uint32_t signal_type = *(uint32_t *)(signal + 0x00);
-        uint32_t event_id = *(uint32_t *)(signal + 0x08);
-        if ((signal_type != 3 && signal_type != 5) ||
-            *(uint32_t *)(signal + 0x04) != 0x18 || event_id == 0 ||
-            // iOS _MTLSharedEvent explicitly zeroes this word; legacy
-            // IOGPUMTLEvent does not write it, so type 5 padding is opaque.
-            (signal_type == 3 && *(uint32_t *)(signal + 0x0c) != 0))
-            return NO;
-        signal_pair_offsets[signal_count++] =
-            (uint32_t)(list_cursor + 0x10);
-        command_cursor = signal_end;
-        list_cursor += 0x18;
-        if (list_cursor == list_length)
-            break;
     }
 
-    if (fragment_count < 2 || signal_count < 1 || vendor_count < 2 ||
+    // Runtime-confirmed by paired selector-0x1a captures of the same
+    // MetalFX temporal frame at the actual queue submission boundary.  The
+    // successful iOS-native submissions use one vendor fragment bracketed
+    // by two signal/event records (fragment_count=1, vendor_count=1,
+    // signal_count=2); the Ventura producer emits the identical topology
+    // with only its subtype-3 vendor record 0x10 bytes longer.  The complete
+    // coverage, token, entry-length, command-type, range-order, and terminal
+    // cursor checks above already establish the list invariant, so requiring
+    // a second unrelated vendor fragment rejected a valid wire shape before
+    // the ordinary subtype-3 ABI normalizer could run.
+    if (fragment_count < 1 || signal_count < 1 || vendor_count < 1 ||
         command_cursor != total || list_cursor != list_length)
         return NO;
     *vendor_count_out = vendor_count;
@@ -15608,6 +16214,30 @@ static unsigned macws_translate_agx_segment_list_records(
         stray_direct_subtype3_mode >= 1 &&
         stray_direct_subtype3_mode <= 0x10 &&
         *(uint32_t *)(commands + 0x1fc) == 0x15;
+    // Runtime-confirmed by Stray PID 75296's NSError-bearing command buffer,
+    // submit serial 103757 (2026-08-23).  The fixed-memory flight recorder
+    // matched descriptor 0 and retained the complete, untruncated artifacts:
+    //
+    //   KCMD 0x418, SHA-256 aa8040456bf48265...;
+    //   direct count-1 list 0xf0, SHA-256 c25f48a99ba0120e...;
+    //   exact range [0,0x418), subtype 2, fixed=0, completion 0x102.
+    //
+    // The subtype-2 producer ABI and its macOS-only [0x288,0x298) aligned
+    // member are already RE-confirmed by the paired macOS/iOS AGXMetal13_3
+    // implementations and native controls below.  The remaining bug is the
+    // dispatcher: count-1 direct lists are sent to the linear walker, which
+    // implements subtype 1 and 3 but has no subtype-2 path.  Admit this
+    // producer family to the same structured list parser used for count>=2;
+    // the parser must still validate the one variable-size resource entry,
+    // exact range coverage, and every full subtype-2 anchor before mutation.
+    BOOL direct_subtype2_record =
+        direct_list && count == 1 && total == 0x418 &&
+        *(uint32_t *)(commands + 0x00) == 0x10000 &&
+        *(uint32_t *)(commands + 0x04) == 0x418 &&
+        *(uint32_t *)(commands + 0x28) == 0x3f0 &&
+        *(uint32_t *)(commands + 0x2c) == 0x3c0 &&
+        *(uint32_t *)(commands + 0x30) == 0x30 &&
+        *(uint32_t *)(commands + 0x34) == 2;
     // Runtime-confirmed by VS Code 1.130 Aquarium submit serial 155 on
     // 2026-07-30: the direct list contains 69 individually well-framed,
     // uniquely ranged records (KCMD length 0xee60, list length 0x3cf0).  The
@@ -15623,7 +16253,8 @@ static unsigned macws_translate_agx_segment_list_records(
           !stray_direct_subtype3_shape_5_diag &&
           !stray_direct_subtype3_shape_7_diag &&
           !stray_direct_subtype3_shape_7_mode_5_diag &&
-          !stray_direct_subtype3_all_ones_family) ||
+          !stray_direct_subtype3_all_ones_family &&
+          !direct_subtype2_record) ||
          (!direct_list && !trailing_wrapper_list)))
         return 0;
 
@@ -15649,7 +16280,8 @@ static unsigned macws_translate_agx_segment_list_records(
     // match, and the ordered ranges must cover the complete KCMD stream with
     // each record's own type/span agreeing.  Unknown list layouts still fall
     // through to the older ID-sequence and conservative unique-search paths.
-    BOOL structured_direct_list = direct_list && count >= 2;
+    BOOL structured_direct_list = direct_list &&
+        (count >= 2 || direct_subtype2_record);
     size_t structured_entry_offset = 0x10;
     uint32_t structured_command_cursor = 0;
     for (uint32_t i = 0; structured_direct_list && i < count; i++) {
@@ -16722,10 +17354,17 @@ macws_inspect_agx_submit(const uint64_t *in, uint32_t inCnt,
 
         if (allow_fix && segment_length >= 0x20) {
             unsigned multisegment_fixed =
-                macws_translate_agx_segment_list_records(
+                macws_translate_agx_event_wrapped_single_subtype3(
                     result.sequence, commands, &total,
                     (unsigned char *)(uintptr_t)segment_start,
                     &segment_length);
+            if (!multisegment_fixed) {
+                multisegment_fixed =
+                    macws_translate_agx_segment_list_records(
+                        result.sequence, commands, &total,
+                        (unsigned char *)(uintptr_t)segment_start,
+                        &segment_length);
+            }
             if (multisegment_fixed) {
                 result.candidates += multisegment_fixed;
                 result.fixed += multisegment_fixed;
@@ -17167,8 +17806,22 @@ static uint32_t dyld_get_active_platform_new(void) {
     // (0x0001/0x8200), which the macOS Metal loader rejects.  Keep it opt-in
     // while the unmodified macOS-platform request is measured with the now
     // working compiler cache path.
-    if (!getenv("MACWS_AGX_NATIVE") ||
-        !getenv("MACWS_METAL_SOURCE_FORCE_IOS"))
+    // CoreFoundation asks for the active platform from its string formatter;
+    // Stray's 2026-08-24 gameplay sample caught 34/2248 RHI-thread samples in
+    // getenv->__findenv_locked through this interpose while Steam's required
+    // FPS overlay formatted its per-frame state.  The environment is immutable
+    // after exec, so keep the diagnostic gate out of that unrelated hot path.
+    static _Atomic int forceIOSCached = -1;
+    int forceIOS = atomic_load_explicit(&forceIOSCached,
+                                        memory_order_acquire);
+    if (forceIOS < 0) {
+        const char *setting = getenv("MACWS_METAL_SOURCE_FORCE_IOS");
+        forceIOS = setting != NULL && setting[0] != '\0' &&
+            strcmp(setting, "0") != 0;
+        atomic_store_explicit(&forceIOSCached, forceIOS,
+                              memory_order_release);
+    }
+    if (!macws_agx_native_enabled() || !forceIOS)
         return actual;
 
     void *signed_return_address = __builtin_return_address(0);
@@ -17293,6 +17946,150 @@ kern_return_t IOConnectTrap1_new(io_connect_t connect, uint32_t index,
     return IOConnectTrap1(connect, index, p1);
 }
 
+// Diagnostic bridge for a cross-version submit-progress invariant.  Ventura's
+// IOGPU producer issues selector 0x1e with four scalar inputs, a count*stride
+// descriptor array, and no outputs (RE-confirmed at macOS 13.4 IOGPU
+// 0x19d145fac and 0x19d155c14).  On this iOS 16.3 kernel the translated 0x1a
+// call can remain inside the external method while a submitted queue waits on
+// an event whose producer is still waiting to enter from another queue.
+//
+// Enter each call on a concurrent worker, then keep the macOS caller waiting
+// briefly so all ordinary acceptance errors retain the original synchronous
+// behavior and the call has entered the kernel before any later submission
+// can be issued by that caller.  Only a call that has demonstrably exceeded
+// that acceptance window is left running while the macOS submitter continues
+// far enough to enqueue its peer event producer.  A serial lane is incorrect
+// here: Stray's runtime-confirmed failing producer and consumer both carry
+// scalar0=2 and must be inside the external method concurrently.  The real
+// kernel calls and completion callbacks are never skipped or rewritten.  This
+// remains marker-gated until an A/B proves forward progress and clean callbacks.
+struct macws_submit_forward_progress_context {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    _Atomic unsigned references;
+    BOOL completed;
+    IOReturn result;
+    io_connect_t client;
+    uint64_t scalars[4];
+    uint32_t scalar_count;
+    size_t struct_count;
+    uint64_t queue_scalar;
+    uint64_t sequence;
+    unsigned char struct_bytes[];
+};
+
+static dispatch_queue_t macws_submit_forward_progress_lane(
+    uint64_t queue_scalar) {
+    static dispatch_once_t once;
+    static dispatch_queue_t lane;
+    dispatch_once(&once, ^{
+        lane = dispatch_queue_create(
+            "com.macwsguide.iogpu-submit-forward-progress",
+            DISPATCH_QUEUE_CONCURRENT);
+    });
+    (void)queue_scalar;
+    return lane;
+}
+
+static void macws_submit_forward_progress_context_release(
+    struct macws_submit_forward_progress_context *context) {
+    if (!context || atomic_fetch_sub_explicit(
+            &context->references, 1, memory_order_acq_rel) != 1)
+        return;
+    pthread_cond_destroy(&context->condition);
+    pthread_mutex_destroy(&context->mutex);
+    free(context);
+}
+
+static BOOL macws_submit_with_forward_progress_bridge(
+    io_connect_t client, const uint64_t *inputs, uint32_t input_count,
+    const void *input_struct, size_t input_struct_count,
+    IOReturn *result_out) {
+    if (!result_out || !inputs || input_count != 4 || !input_struct ||
+        input_struct_count == 0 || input_struct_count > 0x10000 ||
+        input_struct_count % 0x38 != 0)
+        return NO;
+
+    dispatch_queue_t lane = macws_submit_forward_progress_lane(inputs[0]);
+    if (!lane) return NO;
+    size_t allocation_size = sizeof(
+        struct macws_submit_forward_progress_context) + input_struct_count;
+    struct macws_submit_forward_progress_context *context =
+        calloc(1, allocation_size);
+    if (!context) return NO;
+    if (pthread_mutex_init(&context->mutex, NULL) != 0) {
+        free(context);
+        return NO;
+    }
+    if (pthread_cond_init(&context->condition, NULL) != 0) {
+        pthread_mutex_destroy(&context->mutex);
+        free(context);
+        return NO;
+    }
+    static _Atomic uint64_t bridge_sequence = 0;
+    context->references = 2;
+    context->client = client;
+    context->scalar_count = input_count;
+    context->struct_count = input_struct_count;
+    context->queue_scalar = inputs[0];
+    context->sequence = atomic_fetch_add_explicit(
+        &bridge_sequence, 1, memory_order_relaxed) + 1;
+    memcpy(context->scalars, inputs, sizeof(context->scalars));
+    memcpy(context->struct_bytes, input_struct, input_struct_count);
+
+    dispatch_async(lane, ^{
+        IOReturn worker_result = IOConnectCallMethod(
+            context->client, 0x1a,
+            context->scalars, context->scalar_count,
+            context->struct_bytes, context->struct_count,
+            NULL, NULL, NULL, NULL);
+        pthread_mutex_lock(&context->mutex);
+        context->result = worker_result;
+        context->completed = YES;
+        pthread_cond_broadcast(&context->condition);
+        pthread_mutex_unlock(&context->mutex);
+        if (worker_result != KERN_SUCCESS) {
+            dprintf(STDERR_FILENO,
+                "#### AGX_SUBMIT_FORWARD_PROGRESS LATE-RESULT sequence=%llu "
+                "queue=%llu result=%#x\n",
+                (unsigned long long)context->sequence,
+                (unsigned long long)context->queue_scalar, worker_result);
+        }
+        macws_submit_forward_progress_context_release(context);
+    });
+
+    struct timespec deadline = {0};
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += 25000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&context->mutex);
+    while (!context->completed) {
+        int wait_result = pthread_cond_timedwait(
+            &context->condition, &context->mutex, &deadline);
+        if (wait_result == ETIMEDOUT) break;
+        if (wait_result != 0) break;
+    }
+    BOOL completed = context->completed;
+    IOReturn result = completed ? context->result : KERN_SUCCESS;
+    uint64_t sequence = context->sequence;
+    uint64_t queue_scalar = context->queue_scalar;
+    pthread_mutex_unlock(&context->mutex);
+    if (!completed) {
+        dprintf(STDERR_FILENO,
+            "#### AGX_SUBMIT_FORWARD_PROGRESS DETACHED sequence=%llu "
+            "queue=%llu descriptors=%zu wait_ms=25\n",
+            (unsigned long long)sequence,
+            (unsigned long long)queue_scalar,
+            input_struct_count / 0x38);
+    }
+    macws_submit_forward_progress_context_release(context);
+    *result_out = result;
+    return YES;
+}
+
 IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const uint64_t *in, uint32_t inCnt, const void *inStruct, size_t inStructCnt, uint64_t *out, uint32_t *outCnt, void *outStruct, size_t *outStructCnt) {
     uint32_t orig = selector;
     int skip = caller_is_libmachook(__builtin_return_address(0));
@@ -17372,7 +18169,6 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         }
         uint8_t  f15  = src[0x15];                                // flag byte; bit-3 = "has parent"
         uint64_t bc   = *(const uint64_t *)(src + 0x40);          // for type=0: heap byte-count
-        uint64_t f30  = *(const uint64_t *)(src + 0x30);
         uint64_t va38 = *(const uint64_t *)(src + 0x38);
         uint64_t va48 = *(const uint64_t *)(src + 0x48);          // parent_id OR length depending on type/flags
         // RE confirms (iOS kernel IOGPUDevice::new_resource @
@@ -17550,13 +18346,19 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
                 *(uint64_t *)(shadowbuf + 0x38) = 0;
                 patched = 1;
             }
-            // args+0x14 flag mask: known-good values are 0x470 / 0x430.
-            // SkyLight texture path sends 0x2c30 (type=0) or 0x0c30
-            // (type=0x80) — both add bit 11 (0x800), 0x2c30 also adds
-            // bit 13 (0x2000). These are macOS-only options that iOS
-            // kernel rejects. Strip 0x2800.
+            // args+0x14 flag mask: known-good translated values are 0x470 /
+            // 0x430 for the macOS-produced resource shapes.  A parent-backed
+            // type-0x80 request is different: it is assembled by the live
+            // iOS 16.3 IOGPUMetalBuffer implementation after the chroot has
+            // already crossed into the iOS IOGPU framework.  RE-confirmed at
+            // -[IOGPUMetalBuffer initWithPrimaryBuffer:...]
+            // 0x1c468e08c..0x1c468e108: that producer starts from zero,
+            // writes 0x800 at +0x14, then passes the request to the common
+            // initializer which produces the observed 0x0c30. Preserve the
+            // native flag instead of treating it as a desktop option.
             uint32_t f14 = *(const uint32_t *)(src + 0x14);
-            uint32_t f14_clean = f14 & ~0x2800u;
+            uint32_t f14_clean = t80_has_parent
+                ? f14 : (f14 & ~0x2800u);
             if (f14_clean != f14) {
                 static int log_once_14 = 0;
                 if (macws_runtime_diagnostics_enabled() &&
@@ -17602,46 +18404,62 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
         // macOS leaves args+0x40 = 0; the size we cap is the one we
         // derive from src+0x58, not bc.)
         if(agxType == 0x80 && t80_has_parent) {
-            // Sub-resource carved from a tracked parent heap.
-            int mapped = 0;
-            for(int i = 0; i < g_agxIdMapCount; i++) if(g_agxIdMap[i].clientID == agxClientID) {
-                // Runtime-confirmed with the exact native iOS 16.3 producer
-                // through IOGPUResourceCreate+0xf0 (w0=0):
-                //
-                //   native: +0x30=base, +0x38=base,
-                //           +0x40=parent span, +0x48=kernel resource ID
-                //   macOS:  +0x30=0,    +0x38=base,
-                //           +0x40=base, +0x48=client parent ID
-                //
-                // The old translation sent base+span / 0 / base / ID.
-                // Once base crossed 3*(IOGPU+0x108)/4, that VA in +0x40
-                // hit the RE-confirmed size gate and returned 0xe00002c2.
-                // Translate the producer ABI itself; do not bypass the
-                // kernel check or manufacture a texture on failure.
+            // The object-level parent contract is iOS-native. RE-confirmed
+            // via the live iOS 16.3 IOGPU method at
+            // 0x1c468e08c..0x1c468e108:
+            //
+            //   +0x30 = 0
+            //   +0x38 = primary CPU VA + bufferOffset
+            //   +0x40 = primary CPU VA
+            //   +0x48 = primary length
+            //   +0x50 = primary kernel resource ID
+            //
+            // Passing +0x40's CPU VA through the chroot user-client was
+            // runtime-confirmed to return kIOReturnNoBandwidth. The kernel
+            // wire boundary needs the parent span there and the resource ID
+            // moved from object-layer +0x50 to wire-layer +0x48. Leaving the
+            // producer length at +0x48 returned kIOReturnNoMemory. The former
+            // translator copied the resource ID to +0x48 but failed to clear
+            // its old +0x50 slot. Runtime evidence from
+            // metalfx-buffer-entry.log then showed bufferOffset=0 and parent
+            // GPU VA 0x1500000000, but that duplicated-ID call returned
+            // 0x1500028000 and tripped IOGPUMetalBuffer's real equality
+            // assertion. A subsequent offset-0x200 witness proved the wire
+            // layer also derives the suballocation offset from
+            // (+0x30 current CPU VA) - (+0x38 parent CPU VA). Copying the
+            // current VA into both fields erased that offset and returned the
+            // parent GPU base. Complete both field moves instead.
+            //
+            // The request already carries every required semantic field. Do
+            // not look the parent up in g_agxIdMap: type-0's macOS +0x48 is a
+            // span rather than a unique client ID, so equal-sized parents
+            // overwrite one another in that legacy table. Runtime evidence
+            // reached the 16th Mempool suballocation before exactly that
+            // collision made a valid parent stop translating. Validate the
+            // producer's own base/current/length/id tuple instead; an invalid
+            // tuple reaches the real kernel unchanged and fails observably.
+            uint32_t producer_resource_id =
+                *(const uint32_t *)(src + 0x50);
+            uint64_t producer_offset = va38 >= bc ? va38 - bc : UINT64_MAX;
+            if (producer_resource_id != 0 && bc != 0 && va48 != 0 &&
+                va48 <= 0x40000000ULL && producer_offset < va48) {
                 *(uint64_t *)(shadowbuf + 0x30) = va38;
-                *(uint64_t *)(shadowbuf + 0x38) = va38;
-                *(uint64_t *)(shadowbuf + 0x40) = g_agxIdMap[i].size;
-                *(uint32_t *)(shadowbuf + 0x48) =
-                    (uint32_t)g_agxIdMap[i].iosResourceID;
-                patched = 1; mapped = 1;
+                *(uint64_t *)(shadowbuf + 0x38) = bc;
+                *(uint64_t *)(shadowbuf + 0x40) = va48;
+                *(uint64_t *)(shadowbuf + 0x48) = producer_resource_id;
+                *(uint64_t *)(shadowbuf + 0x50) = 0;
+                patched = 1;
                 if (macws_runtime_diagnostics_enabled()) {
                     fprintf(stderr,
-                        "#### AGXIOC subres parent %#x -> resourceID %#llx, "
-                        "base=%#llx span=%#llx\n",
-                        agxClientID,
-                        (unsigned long long)g_agxIdMap[i].iosResourceID,
+                        "#### AGXIOC parent-wire translate client=%#x "
+                        "resourceID=%#x current=%#llx base=%#llx "
+                        "offset=%#llx span=%#llx\n",
+                        agxClientID, producer_resource_id,
                         (unsigned long long)va38,
-                        (unsigned long long)g_agxIdMap[i].size);
+                        (unsigned long long)bc,
+                        (unsigned long long)producer_offset,
+                        (unsigned long long)va48);
                 }
-                break;
-            }
-            if(!mapped && f30 == 0 && va38) {
-                // Preserve the native base/base relationship, but leave the
-                // unresolved parent ID and span untouched so the real call
-                // fails observably instead of being synthesized as valid.
-                *(uint64_t *)(shadowbuf + 0x30) = va38;
-                *(uint64_t *)(shadowbuf + 0x38) = va38;
-                patched = 1;
             }
         } else if(agxType == 0x80) {
             // ONE-SHOT raw-bytes dump: capture the EXACT inStruct bytes
@@ -17932,7 +18750,77 @@ IOReturn IOConnectCallMethod_new(io_connect_t client, uint32_t selector, const u
             }
         }
     }
-    IOReturn r = IOConnectCallMethod(client, selector, in, inCnt, inStruct, inStructCnt, out, outCnt, outStruct, outStructCnt);
+    // Read-only timing witness for cross-queue submit stalls.  A successful
+    // IOConnect return only proves that the external method accepted the
+    // request; it does not show whether the call itself blocked long enough
+    // to prevent a peer queue from submitting the event that this request
+    // waits on.  Record the real call boundary, queue scalar and thread for a
+    // bounded diagnostic run without changing arguments or ordering.
+    unsigned submit_timing_sequence = 0;
+    uint64_t submit_timing_thread = 0;
+    struct timespec submit_timing_before = {0};
+    if (translated_agx_submit && macws_submit_timing_diag_enabled()) {
+        static _Atomic unsigned submit_timing_count = 0;
+        submit_timing_sequence =
+            atomic_fetch_add(&submit_timing_count, 1) + 1;
+        if (submit_timing_sequence <= 1024) {
+            pthread_threadid_np(NULL, &submit_timing_thread);
+            clock_gettime(CLOCK_MONOTONIC, &submit_timing_before);
+            // This is a narrow, marker-gated diagnostic.  Do not route it
+            // through macws_filtered_fprintf: that would require the broad
+            // runtime-diagnostics switch and silently suppress the evidence
+            // this marker exists to collect.
+            dprintf(STDERR_FILENO,
+                "#### AGX_SUBMIT_TIMING #%u BEGIN translateSequence=%u "
+                "thread=%llu scalar0=%#llx scalar1=%#llx "
+                "scalar2=%#llx scalar3=%#llx scalars=%u structs=%zu "
+                "entries=%zu fixed=%u candidates=%u time=%lld.%09ld\n",
+                submit_timing_sequence, submit_diag.sequence,
+                (unsigned long long)submit_timing_thread,
+                (unsigned long long)(in && inCnt ? in[0] : 0),
+                (unsigned long long)(in && inCnt > 1 ? in[1] : 0),
+                (unsigned long long)(in && inCnt > 2 ? in[2] : 0),
+                (unsigned long long)(in && inCnt > 3 ? in[3] : 0),
+                inCnt, inStructCnt, inStructCnt / 0x38,
+                submit_diag.fixed, submit_diag.candidates,
+                (long long)submit_timing_before.tv_sec,
+                submit_timing_before.tv_nsec);
+        }
+    }
+    IOReturn r = KERN_SUCCESS;
+    BOOL submit_forward_progress_bridge_used = NO;
+    if (translated_agx_submit &&
+        macws_submit_forward_progress_bridge_enabled() &&
+        out == NULL && outCnt == NULL && outStruct == NULL &&
+        outStructCnt == NULL) {
+        submit_forward_progress_bridge_used =
+            macws_submit_with_forward_progress_bridge(
+                client, in, inCnt, inStruct, inStructCnt, &r);
+    }
+    if (!submit_forward_progress_bridge_used) {
+        r = IOConnectCallMethod(client, selector, in, inCnt,
+                                inStruct, inStructCnt,
+                                out, outCnt, outStruct, outStructCnt);
+    }
+    if (submit_timing_sequence && submit_timing_sequence <= 1024) {
+        struct timespec submit_timing_after = {0};
+        clock_gettime(CLOCK_MONOTONIC, &submit_timing_after);
+        int64_t elapsed_ns =
+            (int64_t)(submit_timing_after.tv_sec -
+                      submit_timing_before.tv_sec) * 1000000000LL +
+            (int64_t)(submit_timing_after.tv_nsec -
+                      submit_timing_before.tv_nsec);
+        dprintf(STDERR_FILENO,
+            "#### AGX_SUBMIT_TIMING #%u END translateSequence=%u "
+            "thread=%llu scalar0=%#llx result=%#x elapsed_ns=%lld "
+            "time=%lld.%09ld\n",
+            submit_timing_sequence, submit_diag.sequence,
+            (unsigned long long)submit_timing_thread,
+            (unsigned long long)(in && inCnt ? in[0] : 0), r,
+            (long long)elapsed_ns,
+            (long long)submit_timing_after.tv_sec,
+            submit_timing_after.tv_nsec);
+    }
     if (queue_qos_diag_sequence && queue_qos_diag_sequence <= 8) {
         uint32_t queue_id = 0;
         uint64_t queue_token = 0;
@@ -18300,7 +19188,12 @@ static uint32_t macws_coexist_completion_pace_us(void) {
     enum {
         kDefaultPaceUS = 16667,
         kMinimumPaceUS = 8333,
-        kMaximumPaceUS = 100000,
+        // Static macOS desktops still kept the iPad AGX at 27% device
+        // utilization with the previous 100-ms ceiling.  Permit a slower
+        // idle-only A/B; macws_coexist_activity_pace_us() continues to select
+        // the independently bounded interactive/render cadence as soon as a
+        // real input or versioned render-activity record arrives.
+        kMaximumPaceUS = 500000,
     };
     static dispatch_once_t once;
     static uint32_t pace_us = kDefaultPaceUS;
@@ -18362,44 +19255,134 @@ static uint32_t macws_coexist_activity_pace_us(uint32_t idle_pace_us) {
         // Idle still uses idle_pace_us (100 ms in production), limiting this
         // work to the bounded one-second window after real input.
         kInteractivePaceUS = 8333,
+        // Timestamp-only activity records shipped before the producer could
+        // advertise its real target. Preserve their 60-Hz behavior.
+        kLegacyRenderPaceUS = 16667,
+        kMinimumRenderPaceUS = 8333,
+        kMaximumRenderPaceUS = 100000,
         kInteractionWindowNS = 1000 * NSEC_PER_MSEC,
+        // A validated direct CAMetalDrawable already supplies the complete
+        // fullscreen game frame to Host.  Runtime A/B on the exact
+        // 2388x1668 Stray scene kept drawable presentation live at this
+        // cadence while WindowServer fell from 19.1% to 4.8% CPU.  A slower
+        // 500-ms A/B improved a static 60-second sample, but the following
+        // eight-traversal pointer run stopped at present sequence 11880 and
+        // UE reported MTLCommandBufferErrorTimeout.  Keep the conservative
+        // validated cadence until a same-input A/B separates compositor
+        // pacing from the game's MetalFX/AGX timeout.
+        kDirectDrawableDesktopPaceUS = 100000,
+        kDirectDrawableFreshnessNS = 4 * NSEC_PER_SEC,
     };
     if (idle_pace_us <= kInteractivePaceUS) return idle_pace_us;
 
-    static int activity_fd = -1;
-    if (activity_fd < 0) {
-        activity_fd = open("/private/tmp/macws_vnc_activity",
-                           O_RDONLY | O_CLOEXEC);
-    }
-    uint64_t activity_ns = 0;
-    BOOL interactive = NO;
-    if (activity_fd >= 0 &&
-        pread(activity_fd, &activity_ns,
-              sizeof(activity_ns), 0) == sizeof(activity_ns)) {
-        struct timespec now = {0};
-        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
-            uint64_t now_ns = (uint64_t)now.tv_sec * NSEC_PER_SEC +
-                (uint64_t)now.tv_nsec;
-            interactive = now_ns >= activity_ns &&
-                now_ns - activity_ns <= kInteractionWindowNS;
+    static int interaction_activity_fd = -1;
+    static int render_activity_fd = -1;
+    static int direct_drawable_activity_fd = -1;
+    if (interaction_activity_fd < 0)
+        interaction_activity_fd = open(
+            "/private/tmp/macws_vnc_activity", O_RDONLY | O_CLOEXEC);
+    if (render_activity_fd < 0)
+        render_activity_fd = open(
+            MACWS_RENDER_ACTIVITY_PATH, O_RDONLY | O_CLOEXEC);
+    if (direct_drawable_activity_fd < 0)
+        direct_drawable_activity_fd = open(
+            MACWS_DIRECT_DRAWABLE_ACTIVITY_PATH, O_RDONLY | O_CLOEXEC);
+
+    struct timespec now = {0};
+    uint64_t now_ns = clock_gettime(CLOCK_MONOTONIC, &now) == 0
+        ? (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec
+        : 0;
+    uint64_t interaction_ns = 0;
+    uint64_t render_ns = 0;
+    uint32_t render_pace_us = kLegacyRenderPaceUS;
+    BOOL interactive = now_ns && interaction_activity_fd >= 0 &&
+        pread(interaction_activity_fd, &interaction_ns,
+              sizeof(interaction_ns), 0) == sizeof(interaction_ns) &&
+        now_ns >= interaction_ns &&
+        now_ns - interaction_ns <= kInteractionWindowNS;
+    BOOL render_record_valid = NO;
+    if (now_ns && render_activity_fd >= 0) {
+        MacWSRenderActivityRecord record = {0};
+        ssize_t count = pread(render_activity_fd, &record,
+                              sizeof(record), 0);
+        if (count == sizeof(record) &&
+            record.magic == MACWS_RENDER_ACTIVITY_MAGIC &&
+            record.version == MACWS_RENDER_ACTIVITY_VERSION &&
+            record.size == sizeof(record) &&
+            record.targetPaceUS >= kMinimumRenderPaceUS &&
+            record.targetPaceUS <= kMaximumRenderPaceUS) {
+            render_ns = record.timestampNS;
+            render_pace_us = record.targetPaceUS;
+            render_record_valid = YES;
+        } else if (count == sizeof(render_ns)) {
+            // Backward compatibility for an already-running producer from
+            // the timestamp-only protocol.
+            memcpy(&render_ns, &record, sizeof(render_ns));
+            render_record_valid = YES;
         }
+    }
+    BOOL rendering = render_record_valid && now_ns >= render_ns &&
+        now_ns - render_ns <= kInteractionWindowNS;
+    BOOL direct_drawable = NO;
+    if (now_ns && direct_drawable_activity_fd >= 0) {
+        MacWSDirectDrawableActivityRecord record = {0};
+        ssize_t count = pread(direct_drawable_activity_fd, &record,
+                              sizeof(record), 0);
+        direct_drawable = count == sizeof(record) &&
+            record.magic == MACWS_DIRECT_DRAWABLE_ACTIVITY_MAGIC &&
+            record.version == MACWS_DIRECT_DRAWABLE_ACTIVITY_VERSION &&
+            record.size == sizeof(record) && record.ownerPID > 1 &&
+            record.layerWindowID != 0 && record.width != 0 &&
+            record.height != 0 && now_ns >= record.timestampNS &&
+            now_ns - record.timestampNS <= kDirectDrawableFreshnessNS;
+        if (!direct_drawable) {
+            // unlink(2) leaves an already-open descriptor attached to the
+            // retired inode.  Close on any invalid/stale read so the next
+            // frame can discover a later validated lease at the same path.
+            close(direct_drawable_activity_fd);
+            direct_drawable_activity_fd = -1;
+        }
+    }
+    // Pointer samples may still arrive at 120 Hz, but when a game is already
+    // driving the complete desktop there is no useful frame to composite
+    // between its advertised presentation slots. Desktop-only interaction
+    // retains the existing 120-Hz response.
+    uint32_t interactive_pace_us = rendering
+        ? render_pace_us : (uint32_t)kInteractivePaceUS;
+    uint32_t selected_pace_us = interactive
+        ? MIN(interactive_pace_us, idle_pace_us)
+        : rendering
+            ? MIN(render_pace_us, idle_pace_us)
+            : idle_pace_us;
+    if (direct_drawable) {
+        selected_pace_us = MAX(
+            selected_pace_us,
+            MIN((uint32_t)kDirectDrawableDesktopPaceUS, idle_pace_us));
     }
 
     if (macws_runtime_diagnostics_enabled()) {
         static _Atomic int prior_mode = -1;
-        int mode = interactive ? 1 : 0;
+        int mode = direct_drawable ? 3 : interactive ? 2 : rendering ? 1 : 0;
         int prior = atomic_exchange_explicit(
             &prior_mode, mode, memory_order_acq_rel);
         if (prior != mode) {
             fprintf(stderr,
                 "#### COEXIST DIAGNOSTIC activity pace: mode=%s "
-                "pace=%u us idle=%u us window=1000ms\n",
-                interactive ? "interactive" : "idle",
-                interactive ? kInteractivePaceUS : idle_pace_us,
-                idle_pace_us);
+                "pace=%u us idle=%u us renderTarget=%u us "
+                "record=%s window=1000ms "
+                "interactionAgeMS=%.3f renderAgeMS=%.3f\n",
+                direct_drawable ? "direct-drawable" :
+                    interactive ? "interactive" :
+                    rendering ? "render" : "idle",
+                selected_pace_us, idle_pace_us, render_pace_us,
+                render_record_valid ? "versioned-or-legacy" : "missing",
+                now_ns && interaction_ns && now_ns >= interaction_ns
+                    ? (double)(now_ns - interaction_ns) / NSEC_PER_MSEC : -1.0,
+                now_ns && render_ns && now_ns >= render_ns
+                    ? (double)(now_ns - render_ns) / NSEC_PER_MSEC : -1.0);
         }
     }
-    return interactive ? kInteractivePaceUS : idle_pace_us;
+    return selected_pace_us;
 }
 
 // Pace completion timestamps, not post-render delays.  The former fixed
@@ -19059,7 +20042,7 @@ kern_return_t IOServiceOpen_new(io_service_t service, task_port_t owningTask, ui
     // Keep the former high-word mask as an explicit diagnostic A/B only.  It
     // is not a fix: queue-only probing shows both types can create equivalent
     // kernel queues, while the high word changes real device state.
-    if (getenv("MACWS_AGX_NATIVE") && service == agxService) {
+    if (macws_agx_native_enabled() && service == agxService) {
         if (getenv("MACWS_AGX_STRIP_OPEN_OPTIONS")) {
             type &= 0xFFFF;
         }

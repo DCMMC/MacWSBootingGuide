@@ -1,0 +1,26 @@
+Stray half-float compatibility runtime witness, 2026-08-24
+
+Production source identity:
+  length=14876 fnv1a64=b6c8ed737d6da3db
+Production variant identity:
+  length=15676 fnv1a64=449477f78c137aa7
+Function and AIR-derived writable texture mask:
+  Main_000054ef_c016cab8 mask=0x2
+
+RG16Float output, mechanically saturated variant selected at dispatch:
+#### METAL-HALF-VARIANT library source=14876/b6c8ed737d6da3db ordinary=0x12e604ff0 variant=0x12e605550 path=/usr/local/share/macws/stray/variants/14876-b6c8ed737d6da3db.metallib
+#### METAL-HALF-VARIANT function=Main_000054ef_c016cab8 ordinary=0x12e605680 variant=0x12e605950 writeTextureMask=0x2
+#### METAL-HALF-VARIANT compute-descriptor function=Main_000054ef_c016cab8 ordinary=0x13f035200 variant=0x13f035ed0 writeTextureMask=0x2 errorDomain=(nil) errorCode=0 description=(nil)
+METAL_SOURCE_PROBE computeReplay function=Main_000054ef_c016cab8/0x12e605680 pipeline=0x13f035200 class=AGXG13GFamilyComputePipeline reflection=0x0 errorDomain=(nil) errorCode=0 description=(nil) userInfo=(nil)
+#### METAL-HALF-VARIANT dispatch-switch #1 encoder=0x13f040bc0 ordinary=0x13f035200 selected=0x13f035ed0 mode=half-float writeTextureMask=0x2
+METAL_SOURCE_PROBE shadowHalfDispatch status=4 errorDomain=(nil) errorCode=0 description=(nil) userInfo=(nil) finiteMax=64 infinity=0 other=0 first=0x3c00,0x7bff
+
+RG32Float control, ordinary pipeline retained:
+#### METAL-HALF-VARIANT library source=14876/b6c8ed737d6da3db ordinary=0x12af1b670 variant=0x12af1bbf0 path=/usr/local/share/macws/stray/variants/14876-b6c8ed737d6da3db.metallib
+#### METAL-HALF-VARIANT function=Main_000054ef_c016cab8 ordinary=0x12af1bd20 variant=0x12af1bff0 writeTextureMask=0x2
+#### METAL-HALF-VARIANT compute-descriptor function=Main_000054ef_c016cab8 ordinary=0x12af20280 variant=0x12af20600 writeTextureMask=0x2 errorDomain=(nil) errorCode=0 description=(nil)
+METAL_SOURCE_PROBE computeReplay function=Main_000054ef_c016cab8/0x12af1bd20 pipeline=0x12af20280 class=AGXG13GFamilyComputePipeline reflection=0x0 errorDomain=(nil) errorCode=0 description=(nil) userInfo=(nil)
+METAL_SOURCE_PROBE shadowControlDispatch status=4 errorDomain=(nil) errorCode=0 description=(nil) userInfo=(nil) first=1,1e+08
+
+This is a functional shader/selector witness, not a performance result. The
+iPadOS thermal state was serious, so no FPS inference is made from this run.

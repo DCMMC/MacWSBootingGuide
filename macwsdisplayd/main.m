@@ -10,12 +10,15 @@
 #include <mach/mach_time.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
+#include <sys/proc_info.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <xpc/xpc.h>
 
 #include "macws_menu_protocol.h"
 #include "macws_display_geometry.h"
+#include "macws_host_protocol.h"
 #include "macws_stream_protocol.h"
 #import "MacWSFinalCompositeReceiver.h"
 
@@ -51,6 +54,18 @@ static NSMutableDictionary<NSNumber *, id> *Leases;
 // the current native desktop immediately without waiting for unrelated damage.
 static IOSurfaceRef FinalCompositeSurface;
 static MacWSFinalCompositeRecord FinalCompositeRecord;
+// A final-composite frame remains authoritative while the desktop is static:
+// expiring it merely because no new frame arrived discards SkyLight's native
+// Dock/menu material and shadow pixels.  The exact-window graph provides the
+// missing invalidation witness.  Only when that graph observes newer content,
+// geometry or topology and WindowServer's final composite has not caught up
+// within one second do we retire the obsolete snapshot.  A subsequent
+// validated final snapshot naturally reacquires the base.
+static dispatch_source_t FinalCompositeExpiryTimer;
+static uint64_t WorkspaceGraphMutationTime;
+static NSString *WorkspaceGraphMutationReason;
+static uint64_t FinalCompositeReplayRequestedThroughMutationTime;
+static const uint64_t FinalCompositeCatchUpNanoseconds = NSEC_PER_SEC;
 // A SkyLight popup can disappear while its final AGX command buffer is still
 // retiring.  Keep the capture object alive for a bounded grace period instead
 // of synchronously stopping it from the catalog-removal stack.
@@ -92,6 +107,11 @@ static CFTimeInterval WorkspaceAnimationSamplingDeadline;
 // SkyLight presentation geometry is still changing, with this hard bound so a
 // noisy catalog can never turn one gesture into permanent high-rate polling.
 static CFTimeInterval WorkspaceAnimationSettlementHardDeadline;
+// AppKit window move/resize notifications are authoritative producer edges,
+// unlike Dock's best-effort animation pulse. Give them a separate sliding
+// sampling tail so a long title-bar drag stays smooth without weakening the
+// immutable bound which protects against a noisy Dock animation source.
+static CFTimeInterval WorkspaceAppKitGeometrySamplingDeadline;
 static BOOL WorkspaceGeometryQueryInFlight;
 static BOOL WorkspaceGeometryQueryPending;
 static BOOL WorkspaceGeometryBurstActive;
@@ -106,11 +126,93 @@ static _Atomic uint64_t GeometryRestartSerial;
 static NSMutableDictionary<NSNumber *, NSValue *> *GeometryTargets;
 static CGFloat ObservedWindowBackingScale;
 static CGFloat AppKitMainDisplayBackingScale;
+
+static inline CFTimeInterval WorkspaceGeometrySamplingDeadline(void) {
+    return fmax(WorkspaceAnimationSamplingDeadline,
+                WorkspaceAppKitGeometrySamplingDeadline);
+}
+// The heartbeat shares MacWSStreamClient's ordered queue with frame-lease
+// releases from every workspace layer. Runtime-confirmed during Stray's
+// first fullscreen graph transition: a 750 ms lease repeatedly expired even
+// while completed direct drawables continued arriving at Host. Three seconds
+// absorbs that bounded control-plane backlog while still restoring exact
+// capture promptly after a game exit or producer failure.
+static const CFTimeInterval MacWSDirectDrawableLeaseSeconds = 3.0;
+static int DirectDrawableActivityDescriptor = -1;
+static NSString *const FinalCompositeStatePath =
+    @"/private/tmp/macws_final_composite.state";
+// The final WindowServer composite is the preferred desktop-material source,
+// but it is not the only pixel-valid presentation route.  A fullscreen Space
+// teardown can leave the publisher without a compositor command newer than
+// the topology mutation while the exact Dock wallpaper, Dock and WindowServer
+// menubar IOSurfaces are all current. Those three layers are a complete
+// visible desktop: the wallpaper is the opaque canvas and the latter two add
+// the native glass surfaces. WindowServer's optional negative-level Desktop
+// backing can disappear after a fullscreen Space teardown without removing
+// visible pixels. Publish that independent graph witness so Repair Desktop
+// can distinguish a verified layer fallback from a genuinely blank workspace
+// instead of destructively rebuilding the whole WindowServer session.
+static NSString *const WorkspaceGraphStatePath =
+    @"/private/tmp/macws_workspace_graph.state";
+static uint64_t WorkspaceGraphStateSignature;
+@class MacWSDisplayClient;
 static void ScheduleTransientReconcile(uint64_t delayNanoseconds);
 static void RequestWorkspaceGeometrySample(void);
 static void ScheduleGeometryStreamRestart(void);
 static void ScheduleCatalogBroadcast(void);
 static void EnqueueRetiredTransientStop(dispatch_block_t stopBlock);
+static void SuspendFullscreenLayerCapturesForFinalComposite(void);
+static void ResumeFullscreenLayerCapturesForFallback(void);
+static void ClearDirectDrawableActivity(MacWSDisplayClient *client,
+                                        NSString *reason);
+static NSDictionary<NSNumber *, NSValue *> *CopyWindowMetrics(int32_t pid);
+
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer,
+                        int buffersize);
+
+static uint64_t MonotonicNanoseconds(void) {
+    struct timespec value = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
+    return (uint64_t)value.tv_sec * NSEC_PER_SEC + (uint64_t)value.tv_nsec;
+}
+
+static void PublishDirectDrawablePacingLease(
+        int32_t ownerPID, uint32_t layerWindowID,
+        uint32_t width, uint32_t height) {
+    uint64_t now = MonotonicNanoseconds();
+    if (!now || ownerPID <= 1 || !layerWindowID || !width || !height) return;
+    if (DirectDrawableActivityDescriptor < 0) {
+        DirectDrawableActivityDescriptor = open(
+            MACWS_DIRECT_DRAWABLE_ACTIVITY_PATH,
+            O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    }
+    if (DirectDrawableActivityDescriptor < 0) return;
+    MacWSDirectDrawableActivityRecord record = {
+        .magic = MACWS_DIRECT_DRAWABLE_ACTIVITY_MAGIC,
+        .version = MACWS_DIRECT_DRAWABLE_ACTIVITY_VERSION,
+        .size = sizeof(record),
+        .timestampNS = now,
+        .ownerPID = ownerPID,
+        .layerWindowID = layerWindowID,
+        .width = width,
+        .height = height,
+    };
+    if (pwrite(DirectDrawableActivityDescriptor, &record,
+               sizeof(record), 0) != sizeof(record) ||
+        ftruncate(DirectDrawableActivityDescriptor, sizeof(record)) != 0) {
+        close(DirectDrawableActivityDescriptor);
+        DirectDrawableActivityDescriptor = -1;
+        (void)unlink(MACWS_DIRECT_DRAWABLE_ACTIVITY_PATH);
+    }
+}
+
+static void RetireDirectDrawablePacingLease(void) {
+    if (DirectDrawableActivityDescriptor >= 0) {
+        close(DirectDrawableActivityDescriptor);
+        DirectDrawableActivityDescriptor = -1;
+    }
+    (void)unlink(MACWS_DIRECT_DRAWABLE_ACTIVITY_PATH);
+}
 
 static void DisplayLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static BOOL MacWSDisplayDiagnosticsEnabled(void) {
@@ -132,6 +234,20 @@ static void DisplayLog(NSString *format, ...) {
     fflush(stderr);
 }
 
+static void WriteFinalCompositeState(NSString *state, pid_t producerPID,
+                                     uint64_t sequence, NSString *reason) {
+    NSString *payload = [NSString stringWithFormat:
+        @"state=%@\nproducer=%d\nsequence=%llu\nupdated=%.6f\nreason=%@\n",
+        state ?: @"missing", producerPID, (unsigned long long)sequence,
+        NSDate.date.timeIntervalSince1970, reason ?: @""];
+    NSError *error = nil;
+    if (![payload writeToFile:FinalCompositeStatePath atomically:YES
+                     encoding:NSUTF8StringEncoding error:&error]) {
+        DisplayLog(@"final-composite-state-write-failed state=%@ error=%@",
+                   state ?: @"missing", error.localizedDescription ?: @"");
+    }
+}
+
 @interface MacWSDisplayLease : NSObject
 @property(nonatomic) uint64_t token;
 @property(nonatomic) IOSurfaceRef surface;
@@ -147,8 +263,6 @@ static void DisplayLog(NSString *format, ...) {
     if (_surface) CFRelease(_surface);
 }
 @end
-
-@class MacWSDisplayClient;
 
 @interface MacWSTransientLayer : NSObject {
     IOSurfaceRef _latestSurface;
@@ -168,6 +282,11 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic, copy) NSString *windowName;
 @property(nonatomic) NSInteger skyLightLayer;
 @property(nonatomic) int32_t level;
+// AppInputBridge's semantic flags for this exact AppKit window. The final
+// composite producer owns ordinary AppKit pixels and native effects; this
+// exact layer remains the identity/geometry witness and the bounded fallback
+// source if that final producer becomes unavailable.
+@property(nonatomic) MacWSStreamWindowFlags windowFlags;
 @property(nonatomic) CGRect destinationBounds;
 @property(nonatomic) uint64_t streamID;
 @property(nonatomic) uint64_t sequence;
@@ -179,6 +298,22 @@ static void DisplayLog(NSString *format, ...) {
 @property(nonatomic) uint64_t latestDisplayTime;
 @property(nonatomic) BOOL oneShotCapture;
 @property(nonatomic) BOOL snapshotComplete;
+// A completed WindowServer final composite contains desktop material. Keep
+// catalog/geometry identity for every layer, but suspend full-resolution
+// capture for layers outside the focused application until fallback needs it.
+@property(nonatomic) BOOL finalCompositeCaptureSuspensionPending;
+// The foreground Host is presenting this exact layer's completed
+// CAMetalDrawable. Keep the last captured surface for fallback/hit testing,
+// but stop its duplicate full-resolution SkyLight capture until the bounded
+// activity lease expires.
+@property(nonatomic) BOOL directDrawableCaptureSuspended;
+@property(nonatomic) BOOL directDrawableCaptureSuspensionPending;
+@property(nonatomic) BOOL reportedDirectDrawableFocusedLevelAcceptance;
+// CGWindowListCreateDescriptionFromArray can expose a live presentation
+// rectangle in backing pixels even though the ordinary window catalog uses
+// AppKit points.  Record the first surface-backed normalization so the exact
+// coordinate-space decision remains visible in runtime evidence.
+@property(nonatomic) BOOL reportedPresentationScaleNormalization;
 @property(nonatomic) BOOL retiring;
 @property(nonatomic) uint64_t retirementGeneration;
 - (void)recordActiveFrameAtDisplayTime:(uint64_t)displayTime;
@@ -283,6 +418,32 @@ static int MacWSCompareFrameInterval(const void *left, const void *right) {
 }
 @end
 
+static BOOL LayerNeedsIndependentFinalCompositeCapture(
+        MacWSTransientLayer *layer) {
+    if (!layer || layer.retiring || layer.ownerPID <= 1 ||
+        layer.skyLightLayer < 0) return NO;
+    // Stray's AppKit fullscreen transition runtime-publishes 0x140
+    // (Focused|FullscreenCanvas) while the same window remains in the real
+    // CGWindow desktop catalog. Requiring the ordinary Visible/OnScreen bits
+    // here stopped its only pixel stream even though the bundle-level canvas
+    // capability and live catalog identity were still authoritative.
+    if ((layer.windowFlags & MacWSStreamWindowFullscreenCanvas) != 0)
+        return YES;
+    MacWSStreamWindowFlags visible =
+        MacWSStreamWindowVisible | MacWSStreamWindowOnScreen;
+    if ((layer.windowFlags & visible) != visible) return NO;
+    // The owned-scanout FinalComposite contains ordinary focused AppKit
+    // windows, their native external shadows and the desktop effects around
+    // them. Capture one exact frame when a new focused window first appears
+    // so Host retains its identity/geometry and Catalyst can join a separately
+    // completed CAMetalLayer. Once that witness exists, continuing the
+    // duplicate full-resolution stream only redraws pixels which the final
+    // composite already owns. A final-composite expiry resumes every exact
+    // stream through ResumeFullscreenLayerCapturesForFallback().
+    return (layer.windowFlags & MacWSStreamWindowFocused) != 0 &&
+        layer.latestSurface == NULL;
+}
+
 @interface MacWSDisplayClient : NSObject
 @property(nonatomic) xpc_connection_t connection;
 // A full-desktop subscription owns a complete SkyLight capture graph (menu
@@ -306,12 +467,28 @@ static int MacWSCompareFrameInterval(const void *left, const void *right) {
 @property(nonatomic) uint64_t geometryRestartGeneration;
 @property(nonatomic) NSMutableDictionary<NSNumber *, MacWSTransientLayer *> *transientLayers;
 @property(nonatomic) NSMutableDictionary<NSNumber *, NSNumber *> *outstandingByLayer;
+// A release token is the end-to-end witness that this XPC client imported at
+// least one IOSurface frame. Connection-ready and catalog messages contain no
+// Mach surface right and therefore cannot establish this transport invariant.
+@property(nonatomic) BOOL frameAcknowledged;
 // A fullscreen Host can be relaunched or have its UIWindowScene recreated
 // while WindowServer keeps producing the same desktop. Keep a generation for
 // the bounded disconnect handoff instead of tearing down the whole capture
 // graph synchronously from the XPC error callback.
 @property(nonatomic) uint64_t disconnectGeneration;
 @property(nonatomic) BOOL deliveryPaused;
+@property(nonatomic) BOOL directDrawableActive;
+@property(nonatomic) BOOL directDrawableExpiryPending;
+@property(nonatomic) CFTimeInterval directDrawableDeadline;
+@property(nonatomic) int32_t directDrawableOwnerPID;
+@property(nonatomic) uint32_t directDrawableLayerWindowID;
+@property(nonatomic) uint32_t directDrawableWidth;
+@property(nonatomic) uint32_t directDrawableHeight;
+@property(nonatomic) CFTimeInterval directDrawableLastRejectionLogTime;
+// Exact focused identities from the last catalog this client received.
+// Retain the decision that Host acted on even if SkyLight changes the same
+// window's presentation level before the first direct drawable heartbeat.
+@property(nonatomic) NSDictionary<NSNumber *, NSNumber *> *focusedWindowOwners;
 - (void)stopStream;
 - (void)stopTransientLayers;
 @end
@@ -339,6 +516,203 @@ static int MacWSCompareFrameInterval(const void *left, const void *right) {
     _sequence = 0;
 }
 @end
+
+static BOOL MacWSLayerSurfaceMatchesSize(MacWSTransientLayer *layer,
+                                         size_t width, size_t height) {
+    return layer.latestSurface &&
+        IOSurfaceGetWidth(layer.latestSurface) == width &&
+        IOSurfaceGetHeight(layer.latestSurface) == height;
+}
+
+static BOOL MacWSLayerDestinationMatchesCanvas(MacWSTransientLayer *layer,
+                                               size_t width, size_t height) {
+    CGRect destination = layer.destinationBounds;
+    return !CGRectIsNull(destination) && !CGRectIsEmpty(destination) &&
+        fabs(destination.origin.x) <= 0.5 &&
+        fabs(destination.origin.y) <= 0.5 &&
+        fabs(destination.size.width - width) <= 0.5 &&
+        fabs(destination.size.height - height) <= 0.5;
+}
+
+// A fullscreen application's CGWindow can move above level zero while its
+// drawable remains the workspace presentation. AppInput publishes the exact
+// windowID+ownerPID identity and the Focused|FullscreenCanvas state for that
+// transition. Once a direct-drawable heartbeat has arrived, the same exact
+// identity remains authoritative through short AppKit focus-state changes.
+// Neither path is PID-only, title-based, or geometry-based.
+static BOOL MacWSLayerOwnsFullscreenCanvas(MacWSDisplayClient *client,
+                                           MacWSTransientLayer *layer) {
+    if (!client || !layer) return NO;
+    MacWSStreamWindowFlags fullscreenAuthority =
+        MacWSStreamWindowFocused | MacWSStreamWindowFullscreenCanvas;
+    BOOL semanticAuthority =
+        (layer.windowFlags & fullscreenAuthority) == fullscreenAuthority;
+    BOOL directAuthority = client.directDrawableActive &&
+        client.directDrawableOwnerPID == layer.ownerPID &&
+        client.directDrawableLayerWindowID == layer.windowID;
+    return semanticAuthority || directAuthority;
+}
+
+static CGRect MacWSWorkspaceLayerDestination(
+        MacWSDisplayClient *client, MacWSTransientLayer *layer,
+        CGRect windowBounds, CGRect desktopBounds, CGFloat presentationScale,
+        BOOL usedSurfaceMeasurement) {
+    BOOL coversDesktop = MacWSLayerCoversLogicalDisplay(
+        windowBounds.origin.x, windowBounds.origin.y,
+        windowBounds.size.width, windowBounds.size.height,
+        desktopBounds.origin.x, desktopBounds.origin.y,
+        desktopBounds.size.width, desktopBounds.size.height);
+    if (client.workspaceCanvas &&
+        (MacWSLayerOwnsFullscreenCanvas(client, layer) || coversDesktop)) {
+        size_t width = IOSurfaceGetWidth(client.workspaceCanvas);
+        size_t height = IOSurfaceGetHeight(client.workspaceCanvas);
+        if (width && height)
+            return CGRectMake(0.0, 0.0, width, height);
+    }
+    return CGRectMake(
+        (windowBounds.origin.x - desktopBounds.origin.x) *
+            presentationScale,
+        (windowBounds.origin.y - desktopBounds.origin.y) *
+            presentationScale,
+        usedSurfaceMeasurement
+            ? IOSurfaceGetWidth(layer.latestSurface)
+            : windowBounds.size.width * presentationScale,
+        usedSurfaceMeasurement
+            ? IOSurfaceGetHeight(layer.latestSurface)
+            : windowBounds.size.height * presentationScale);
+}
+
+static uint64_t MacWSWorkspaceGraphHash(NSString *payload) {
+    const uint8_t *bytes = (const uint8_t *)payload.UTF8String;
+    uint64_t hash = 1469598103934665603ULL;
+    if (!bytes) return hash;
+    for (size_t index = 0; bytes[index] != '\0'; index++) {
+        hash ^= bytes[index];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static void UpdateWorkspaceGraphState(MacWSDisplayClient *client,
+                                      NSString *reason) {
+    if (!client || !client.subscriptionActive || client.deliveryPaused ||
+        client.mode != MacWSStreamModeFullscreen || !client.workspaceCanvas)
+        return;
+
+    size_t canvasWidth = IOSurfaceGetWidth(client.workspaceCanvas);
+    size_t canvasHeight = IOSurfaceGetHeight(client.workspaceCanvas);
+    if (!canvasWidth || !canvasHeight) return;
+
+    MacWSTransientLayer *wallpaper = nil;
+    MacWSTransientLayer *dock = nil;
+    MacWSTransientLayer *menubar = nil;
+    MacWSTransientLayer *windowServerBacking = nil;
+    for (MacWSTransientLayer *layer in client.transientLayers.allValues) {
+        if (!layer || layer.retiring) continue;
+        BOOL canvasDestination = MacWSLayerDestinationMatchesCanvas(
+            layer, canvasWidth, canvasHeight);
+        BOOL canvasSurface = MacWSLayerSurfaceMatchesSize(
+            layer, canvasWidth, canvasHeight);
+        if ([layer.ownerName isEqualToString:@"Dock"] &&
+            layer.skyLightLayer < 0 &&
+            [layer.windowName hasPrefix:@"Desktop Picture"] &&
+            (!wallpaper || (canvasDestination && canvasSurface))) {
+            wallpaper = layer;
+        } else if ([layer.ownerName isEqualToString:@"Dock"] &&
+                   layer.skyLightLayer > 0 &&
+                   [layer.windowName isEqualToString:@"Dock"] &&
+                   (!dock || (canvasDestination && canvasSurface))) {
+            dock = layer;
+        } else if ([layer.ownerName isEqualToString:@"Window Server"] &&
+                   [layer.windowName isEqualToString:@"Menubar"] &&
+                   (!menubar || (fabs(layer.destinationBounds.origin.x) <=
+                                 0.5 && layer.latestSurface))) {
+            menubar = layer;
+        } else if ([layer.ownerName isEqualToString:@"Window Server"] &&
+                   layer.skyLightLayer < 0 &&
+                   [layer.windowName isEqualToString:@"Desktop"] &&
+                   (!windowServerBacking ||
+                    (canvasDestination && canvasSurface))) {
+            windowServerBacking = layer;
+        }
+    }
+
+    BOOL wallpaperReady = wallpaper &&
+        MacWSLayerDestinationMatchesCanvas(wallpaper, canvasWidth,
+                                           canvasHeight) &&
+        MacWSLayerSurfaceMatchesSize(wallpaper, canvasWidth, canvasHeight);
+    BOOL dockReady = dock &&
+        MacWSLayerDestinationMatchesCanvas(dock, canvasWidth, canvasHeight) &&
+        MacWSLayerSurfaceMatchesSize(dock, canvasWidth, canvasHeight);
+    BOOL menubarReady = menubar && menubar.latestSurface &&
+        fabs(menubar.destinationBounds.origin.x) <= 0.5 &&
+        fabs(menubar.destinationBounds.origin.y) <= 0.5 &&
+        fabs(menubar.destinationBounds.size.width - canvasWidth) <= 0.5 &&
+        IOSurfaceGetWidth(menubar.latestSurface) == canvasWidth &&
+        IOSurfaceGetHeight(menubar.latestSurface) > 0;
+    BOOL backingReady = windowServerBacking &&
+        MacWSLayerDestinationMatchesCanvas(windowServerBacking, canvasWidth,
+                                           canvasHeight) &&
+        MacWSLayerSurfaceMatchesSize(windowServerBacking, canvasWidth,
+                                     canvasHeight) &&
+        windowServerBacking.ownerPID > 1;
+    // Runtime-confirmed after Stray fullscreen teardown on iPad13,6: the Host
+    // automation screenshot at 1787730807 was pixel-complete while the graph
+    // recorded wallpaper=571, Dock=357 and menubar=166 but backing=0. The
+    // negative Desktop layer is compositor scaffolding, not a fourth visible
+    // prerequisite. The menubar's real IOSurface supplies the exact
+    // WindowServer generation required by the repair-side PID witness.
+    BOOL ready = wallpaperReady && dockReady && menubarReady;
+    pid_t windowServerPID = menubarReady
+        ? menubar.ownerPID
+        : (windowServerBacking ? windowServerBacking.ownerPID : 0);
+
+#define MACWS_GRAPH_LAYER_FIELD(name, layer) \
+    (layer ? [NSString stringWithFormat: \
+        @"%s=%u/%d/%u/%d,%d,%u,%u", name, layer.windowID, \
+        layer.ownerPID, layer.latestSurface \
+            ? IOSurfaceGetID(layer.latestSurface) : 0, \
+        (int)llround(layer.destinationBounds.origin.x), \
+        (int)llround(layer.destinationBounds.origin.y), \
+        (unsigned)llround(layer.destinationBounds.size.width), \
+        (unsigned)llround(layer.destinationBounds.size.height)] \
+      : [NSString stringWithFormat:@"%s=missing", name])
+    NSString *identity = [NSString stringWithFormat:
+        @"state=%@\nwindowserver=%d\ncanvas=%zux%zu\n%@\n%@\n%@\n%@\n",
+        ready ? @"ready" : @"recovering", windowServerPID,
+        canvasWidth, canvasHeight,
+        MACWS_GRAPH_LAYER_FIELD("wallpaper", wallpaper),
+        MACWS_GRAPH_LAYER_FIELD("dock", dock),
+        MACWS_GRAPH_LAYER_FIELD("menubar", menubar),
+        MACWS_GRAPH_LAYER_FIELD("backing", windowServerBacking)];
+#undef MACWS_GRAPH_LAYER_FIELD
+    uint64_t signature = MacWSWorkspaceGraphHash(identity);
+    if (signature == WorkspaceGraphStateSignature) return;
+    WorkspaceGraphStateSignature = signature;
+
+    NSString *payload = [identity stringByAppendingFormat:
+        @"publisher=%d\nsignature=%016llx\nupdated=%.6f\nreason=%@\n",
+        getpid(), (unsigned long long)signature,
+        NSDate.date.timeIntervalSince1970, reason ?: @"reconcile"];
+    NSError *error = nil;
+    if (![payload writeToFile:WorkspaceGraphStatePath atomically:YES
+                      encoding:NSUTF8StringEncoding error:&error]) {
+        DisplayLog(@"workspace-graph-state-write-failed state=%@ error=%@",
+                   ready ? @"ready" : @"recovering",
+                   error.localizedDescription ?: @"");
+        return;
+    }
+    DisplayLog(@"workspace-graph-state state=%@ windowserver=%d "
+               "canvas=%zux%zu wallpaper=%@ dock=%@ menubar=%@ backing=%@ "
+               "signature=%016llx reason=%@",
+               ready ? @"ready" : @"recovering", windowServerPID,
+               canvasWidth, canvasHeight,
+               wallpaperReady ? @"ready" : @"missing-or-shifted",
+               dockReady ? @"ready" : @"missing-or-shifted",
+               menubarReady ? @"ready" : @"missing-or-shifted",
+               backingReady ? @"ready" : @"missing-or-shifted",
+               (unsigned long long)signature, reason ?: @"reconcile");
+}
 
 static void SendStatus(MacWSDisplayClient *client, const char *eventName,
                        NSString *message, BOOL ok) {
@@ -380,91 +754,158 @@ static NSData *MenuErrorResponse(const MacWSMenuRequest *request,
     return [NSData dataWithBytes:&header length:sizeof(header)];
 }
 
+static NSData *RelayMenuRequestToExactTarget(MacWSMenuRequest request) {
+    int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (socketFD < 0)
+        return MenuErrorResponse(&request, MacWSMenuStatusInternalError);
+    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+    (void)setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO,
+                     &timeout, sizeof(timeout));
+    char sourcePath[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
+    snprintf(sourcePath, sizeof(sourcePath),
+             "/private/tmp/macws_menu_client.%d.%08x.sock",
+             getpid(), arc4random());
+    struct sockaddr_un source = {0};
+    source.sun_family = AF_UNIX;
+    strlcpy(source.sun_path, sourcePath, sizeof(source.sun_path));
+    unlink(sourcePath);
+    if (bind(socketFD, (const struct sockaddr *)&source, sizeof(source)) != 0) {
+        close(socketFD);
+        return MenuErrorResponse(&request, MacWSMenuStatusInternalError);
+    }
+
+    char targetPath[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
+    snprintf(targetPath, sizeof(targetPath),
+             "/private/tmp/macws_app_input.%d.sock", request.ownerPID);
+    struct stat targetStatus = {0};
+    if (stat(targetPath, &targetStatus) != 0 ||
+        !S_ISSOCK(targetStatus.st_mode) ||
+        chown(sourcePath, targetStatus.st_uid, targetStatus.st_gid) != 0 ||
+        chmod(sourcePath, 0600) != 0) {
+        close(socketFD);
+        unlink(sourcePath);
+        return MenuErrorResponse(&request,
+                                 MacWSMenuStatusTargetUnavailable);
+    }
+    struct sockaddr_un target = {0};
+    target.sun_family = AF_UNIX;
+    strlcpy(target.sun_path, targetPath, sizeof(target.sun_path));
+    ssize_t sent = sendto(socketFD, &request, sizeof(request), 0,
+                          (const struct sockaddr *)&target, sizeof(target));
+    MacWSMenuResponseHeader acknowledgement = {0};
+    ssize_t received = sent == sizeof(request)
+        ? recv(socketFD, &acknowledgement, sizeof(acknowledgement), 0) : -1;
+    int receiveError = errno;
+    close(socketFD);
+    unlink(sourcePath);
+
+    MacWSMenuStatus failure = received < 0 &&
+        (receiveError == EAGAIN || receiveError == EWOULDBLOCK)
+        ? MacWSMenuStatusTimeout : MacWSMenuStatusTargetUnavailable;
+    if (received != sizeof(acknowledgement) ||
+        !MacWSMenuResponseIsValid(&acknowledgement,
+                                  sizeof(acknowledgement)) ||
+        acknowledgement.nonce != request.nonce ||
+        acknowledgement.ownerPID != request.ownerPID ||
+        acknowledgement.windowID != request.windowID) {
+        return MenuErrorResponse(&request, failure);
+    }
+    if (request.operation != MacWSMenuOperationSnapshot ||
+        acknowledgement.status != MacWSMenuStatusOK) {
+        return [NSData dataWithBytes:&acknowledgement
+                              length:sizeof(acknowledgement)];
+    }
+
+    NSString *snapshotPath = [NSString stringWithFormat:
+        @"/private/tmp/macws_menu_snapshot.%d.%016llx.bin",
+        request.ownerPID, (unsigned long long)request.nonce];
+    NSData *snapshot = [NSData dataWithContentsOfFile:snapshotPath
+        options:NSDataReadingMappedIfSafe error:nil];
+    unlink(snapshotPath.fileSystemRepresentation);
+    const MacWSMenuResponseHeader *header = snapshot.length >=
+        sizeof(MacWSMenuResponseHeader) ? snapshot.bytes : NULL;
+    if (!MacWSMenuResponseIsValid(header, snapshot.length) ||
+        header->status != MacWSMenuStatusOK ||
+        header->nonce != request.nonce ||
+        header->ownerPID != request.ownerPID ||
+        header->windowID != request.windowID ||
+        header->generation != acknowledgement.generation) {
+        return MenuErrorResponse(&request, MacWSMenuStatusInternalError);
+    }
+    return snapshot;
+}
+
+static pid_t ParentProcessPID(pid_t pid) {
+    if (pid <= 1) return 0;
+    struct proc_bsdinfo child = {0};
+    int childBytes = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &child,
+                                  sizeof(child));
+    DisplayLog(@"menu-parent-query child=%d bytes=%d record-pid=%u "
+               "parent=%u uid=%u expected=%lu", pid, childBytes,
+               child.pbi_pid, child.pbi_ppid, child.pbi_uid,
+               (unsigned long)sizeof(child));
+    if (childBytes != sizeof(child) || child.pbi_pid != (uint32_t)pid ||
+        child.pbi_ppid <= 1) return 0;
+    struct proc_bsdinfo parent = {0};
+    int parentBytes = proc_pidinfo((pid_t)child.pbi_ppid,
+                                   PROC_PIDTBSDINFO, 0, &parent,
+                                   sizeof(parent));
+    DisplayLog(@"menu-parent-query parent=%u bytes=%d record-pid=%u "
+               "uid=%u child-uid=%u expected=%lu", child.pbi_ppid,
+               parentBytes, parent.pbi_pid, parent.pbi_uid, child.pbi_uid,
+               (unsigned long)sizeof(parent));
+    if (parentBytes != sizeof(parent) ||
+        parent.pbi_pid != child.pbi_ppid || parent.pbi_uid != child.pbi_uid)
+        return 0;
+    return (pid_t)child.pbi_ppid;
+}
+
+static NSData *RelayMenuRequestWithSessionFallback(MacWSMenuRequest request) {
+    NSData *response = RelayMenuRequestToExactTarget(request);
+    const MacWSMenuResponseHeader *header =
+        response.length >= sizeof(MacWSMenuResponseHeader)
+        ? response.bytes : NULL;
+    if (request.operation != MacWSMenuOperationSnapshot || !header ||
+        header->status != MacWSMenuStatusTargetUnavailable) return response;
+
+    int32_t visibleOwner = request.ownerPID;
+    pid_t candidate = visibleOwner;
+    for (NSUInteger depth = 1; depth <= 2; depth++) {
+        candidate = ParentProcessPID(candidate);
+        if (candidate <= 1) break;
+        NSArray<NSNumber *> *windowIDs =
+            [CopyWindowMetrics(candidate).allKeys
+                sortedArrayUsingSelector:@selector(compare:)];
+        for (NSNumber *windowID in windowIDs) {
+            if (windowID.unsignedIntValue == 0) continue;
+            MacWSMenuRequest fallback = request;
+            fallback.ownerPID = candidate;
+            fallback.windowID = windowID.unsignedIntValue;
+            NSData *candidateResponse =
+                RelayMenuRequestToExactTarget(fallback);
+            const MacWSMenuResponseHeader *candidateHeader =
+                candidateResponse.length >= sizeof(MacWSMenuResponseHeader)
+                    ? candidateResponse.bytes : NULL;
+            if (!candidateHeader ||
+                candidateHeader->status != MacWSMenuStatusOK) continue;
+            DisplayLog(@"menu-provider-fallback visible-owner=%d "
+                       "visible-window=%u provider=%d provider-window=%u "
+                       "depth=%lu nodes=%u",
+                       visibleOwner, request.windowID, candidate,
+                       windowID.unsignedIntValue, (unsigned long)depth,
+                       candidateHeader->nodeCount);
+            return candidateResponse;
+        }
+    }
+    return response;
+}
+
 static void RelayMenuRequest(MacWSDisplayClient *client,
                              MacWSMenuRequest request) {
     dispatch_async(MenuQueue, ^{
         @autoreleasepool {
-            int socketFD = socket(AF_UNIX, SOCK_DGRAM, 0);
-            if (socketFD < 0) {
-                SendMenuResponse(client, MenuErrorResponse(
-                    &request, MacWSMenuStatusInternalError));
-                return;
-            }
-            struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
-            (void)setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO,
-                             &timeout, sizeof(timeout));
-            char sourcePath[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
-            snprintf(sourcePath, sizeof(sourcePath),
-                     "/private/tmp/macws_menu_client.%d.%08x.sock",
-                     getpid(), arc4random());
-            struct sockaddr_un source = {0};
-            source.sun_family = AF_UNIX;
-            strlcpy(source.sun_path, sourcePath, sizeof(source.sun_path));
-            unlink(sourcePath);
-            if (bind(socketFD, (const struct sockaddr *)&source,
-                     sizeof(source)) != 0) {
-                close(socketFD);
-                SendMenuResponse(client, MenuErrorResponse(
-                    &request, MacWSMenuStatusInternalError));
-                return;
-            }
-
-            char targetPath[sizeof(((struct sockaddr_un *)0)->sun_path)] = {0};
-            snprintf(targetPath, sizeof(targetPath),
-                     "/private/tmp/macws_app_input.%d.sock",
-                     request.ownerPID);
-            struct sockaddr_un target = {0};
-            target.sun_family = AF_UNIX;
-            strlcpy(target.sun_path, targetPath, sizeof(target.sun_path));
-            ssize_t sent = sendto(socketFD, &request, sizeof(request), 0,
-                                  (const struct sockaddr *)&target,
-                                  sizeof(target));
-            MacWSMenuResponseHeader acknowledgement = {0};
-            ssize_t received = sent == sizeof(request)
-                ? recv(socketFD, &acknowledgement,
-                       sizeof(acknowledgement), 0) : -1;
-            close(socketFD);
-            unlink(sourcePath);
-
-            MacWSMenuStatus failure = received < 0 &&
-                (errno == EAGAIN || errno == EWOULDBLOCK)
-                ? MacWSMenuStatusTimeout
-                : MacWSMenuStatusTargetUnavailable;
-            if (received != sizeof(acknowledgement) ||
-                !MacWSMenuResponseIsValid(&acknowledgement,
-                                           sizeof(acknowledgement)) ||
-                acknowledgement.nonce != request.nonce ||
-                acknowledgement.ownerPID != request.ownerPID ||
-                acknowledgement.windowID != request.windowID) {
-                SendMenuResponse(client, MenuErrorResponse(&request, failure));
-                return;
-            }
-            if (request.operation != MacWSMenuOperationSnapshot ||
-                acknowledgement.status != MacWSMenuStatusOK) {
-                SendMenuResponse(client, [NSData dataWithBytes:&acknowledgement
-                                                         length:sizeof(acknowledgement)]);
-                return;
-            }
-
-            NSString *snapshotPath = [NSString stringWithFormat:
-                @"/private/tmp/macws_menu_snapshot.%d.%016llx.bin",
-                request.ownerPID, (unsigned long long)request.nonce];
-            NSData *snapshot = [NSData dataWithContentsOfFile:snapshotPath
-                options:NSDataReadingMappedIfSafe error:nil];
-            unlink(snapshotPath.fileSystemRepresentation);
-            const MacWSMenuResponseHeader *header = snapshot.length >=
-                sizeof(MacWSMenuResponseHeader) ? snapshot.bytes : NULL;
-            if (!MacWSMenuResponseIsValid(header, snapshot.length) ||
-                header->status != MacWSMenuStatusOK ||
-                header->nonce != request.nonce ||
-                header->ownerPID != request.ownerPID ||
-                header->windowID != request.windowID ||
-                header->generation != acknowledgement.generation) {
-                SendMenuResponse(client, MenuErrorResponse(
-                    &request, MacWSMenuStatusInternalError));
-                return;
-            }
-            SendMenuResponse(client, snapshot);
+            SendMenuResponse(client,
+                RelayMenuRequestWithSessionFallback(request));
         }
     });
 }
@@ -533,6 +974,40 @@ static CGFloat MainDisplayBackingScale(void) {
     if (bounds.size.width <= 0 || pixelWidth == 0) return 1.0;
     CGFloat scale = pixelWidth / bounds.size.width;
     return scale > 0 && scale <= 8.0 ? scale : 1.0;
+}
+
+static CGFloat LayerPresentationScale(CGRect bounds, IOSurfaceRef surface,
+                                      CGFloat fallbackScale,
+                                      BOOL *usedSurfaceMeasurement) {
+    if (usedSurfaceMeasurement) *usedSurfaceMeasurement = NO;
+    if (!surface || CGRectIsEmpty(bounds) || !isfinite(fallbackScale) ||
+        fallbackScale < 0.5 || fallbackScale > 8.0) return fallbackScale;
+
+    size_t surfaceWidth = IOSurfaceGetWidth(surface);
+    size_t surfaceHeight = IOSurfaceGetHeight(surface);
+    if (surfaceWidth == 0 || surfaceHeight == 0) return fallbackScale;
+    CGFloat scaleX = surfaceWidth / bounds.size.width;
+    CGFloat scaleY = surfaceHeight / bounds.size.height;
+    if (!isfinite(scaleX) || !isfinite(scaleY) || scaleX < 0.5 ||
+        scaleX > 8.0 || scaleY < 0.5 || scaleY > 8.0 ||
+        fabs(scaleX - scaleY) > 0.08) return fallbackScale;
+
+    CGFloat measured = (scaleX + scaleY) * 0.5;
+    // Accept only the two coordinate systems observed at this boundary:
+    // logical AppKit points (surface/bounds ~= display scale) and backing
+    // pixels (surface/bounds ~= 1).  A resize can briefly pair new bounds
+    // with an old surface; that arbitrary ratio must not move the layer.
+    CGFloat pixelDistance = fabs(measured - 1.0);
+    CGFloat logicalDistance = fabs(measured - fallbackScale);
+    if (pixelDistance > 0.08 && logicalDistance > 0.08)
+        return fallbackScale;
+    if (usedSurfaceMeasurement) *usedSurfaceMeasurement = YES;
+    // The ratio is evidence for which coordinate space owns the rectangle,
+    // not a scale transform in its own right.  Snap to that coordinate
+    // space: small AppKit decoration/crop differences (Stray runtime-
+    // confirmed 2388x1696 bounds around a 2388x1668 capture) must not turn
+    // into fractional stretching of every pixel.
+    return pixelDistance <= logicalDistance ? 1.0 : fallbackScale;
 }
 
 static BOOL CopyWindowBounds(uint32_t windowID, CGRect *result) {
@@ -611,7 +1086,8 @@ static MacWSStreamWindowDescriptor WindowDescriptor(
         descriptor.flags |= metrics->flags &
             (MacWSStreamWindowVisible | MacWSStreamWindowHasShadow |
              MacWSStreamWindowResizable |
-             MacWSStreamWindowFocused | MacWSStreamWindowSpatialCanvas);
+             MacWSStreamWindowFocused | MacWSStreamWindowSpatialCanvas |
+             MacWSStreamWindowFullscreenCanvas);
     }
     if ([info[(id)kCGWindowIsOnscreen] boolValue])
         descriptor.flags |= MacWSStreamWindowOnScreen;
@@ -627,28 +1103,47 @@ static void SendWindowList(MacWSDisplayClient *client) {
     NSUInteger emitted = 0;
     NSMutableDictionary<NSNumber *, NSDictionary *> *metricsByPID =
         [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, NSNumber *> *focusedWindowOwners =
+        [client.focusedWindowOwners mutableCopy] ?:
+            [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, NSNumber *> *liveWindowOwners =
+        [NSMutableDictionary dictionary];
     for (NSDictionary *info in CopyCatalogWindowInfo()) {
         if (emitted >= MACWS_STREAM_MAX_WINDOWS) break;
         int32_t ownerPID = [info[(id)kCGWindowOwnerPID] intValue];
+        uint32_t candidateWindowID =
+            [info[(id)kCGWindowNumber] unsignedIntValue];
+        if (candidateWindowID != 0 && ownerPID > 1)
+            liveWindowOwners[@(candidateWindowID)] = @(ownerPID);
         NSNumber *pidKey = @(ownerPID);
         NSDictionary<NSNumber *, NSValue *> *processMetrics = metricsByPID[pidKey];
         if (!processMetrics) {
             processMetrics = CopyWindowMetrics(ownerPID);
             metricsByPID[pidKey] = processMetrics;
         }
-        uint32_t candidateWindowID =
-            [info[(id)kCGWindowNumber] unsignedIntValue];
         MacWSWindowMetricsEntry metrics = {0};
         NSValue *metricsValue = processMetrics[@(candidateWindowID)];
         // A selectable Scene must correspond to a real, published AppKit
         // top-level window. Cursor/menu-bar/plugin surfaces have no matching
         // per-process metrics entry, while menus and overlays use nonzero
-        // Quartz layers. Excluding both categories removes the black phantom
-        // Scene without guessing from localized titles.
-        NSInteger layer = [info[(id)kCGWindowLayer] integerValue];
-        if (!metricsValue || layer != 0) continue;
+        // Quartz layers. A bundle-declared fullscreen canvas remains eligible
+        // during AppKit's 0x140 transition even when ordered Visible is clear;
+        // its live CGWindow identity and exact layer remain independently
+        // validated below.
+        if (!metricsValue) continue;
         [metricsValue getValue:&metrics];
-        if ((metrics.flags & MacWSStreamWindowVisible) == 0 ||
+        MacWSStreamWindowFlags fullscreenAuthority =
+            MacWSStreamWindowFocused | MacWSStreamWindowFullscreenCanvas;
+        BOOL focusedFullscreenCanvas =
+            (metrics.flags & fullscreenAuthority) == fullscreenAuthority;
+        NSInteger layer = [info[(id)kCGWindowLayer] integerValue];
+        if (layer != 0 &&
+            (!focusedFullscreenCanvas ||
+             layer >= CGWindowLevelForKey(kCGCursorWindowLevelKey)))
+            continue;
+        BOOL visibleAppWindow =
+            (metrics.flags & MacWSStreamWindowVisible) != 0;
+        if ((!visibleAppWindow && !focusedFullscreenCanvas) ||
             (metrics.flags & MacWSStreamWindowTransient) != 0) continue;
         MacWSStreamWindowDescriptor descriptor = WindowDescriptor(
             info, &metrics);
@@ -665,8 +1160,34 @@ static void SendWindowList(MacWSDisplayClient *client) {
         [bytes appendData:titleData];
         xpc_object_t item = xpc_data_create(bytes.bytes, bytes.length);
         xpc_array_append_value(array, item);
+        MacWSStreamWindowFlags requiredDirectFlags =
+            MacWSStreamWindowFocused | MacWSStreamWindowVisible |
+            MacWSStreamWindowOnScreen;
+        MacWSStreamWindowFlags requiredFullscreenFlags =
+            MacWSStreamWindowFocused | MacWSStreamWindowFullscreenCanvas;
+        if ((descriptor.flags & requiredDirectFlags) == requiredDirectFlags ||
+            (descriptor.flags & requiredFullscreenFlags) ==
+                requiredFullscreenFlags) {
+            // This is an authorization history for an exact live CGWindow,
+            // not a mirror of the most recent focus snapshot. Host can keep
+            // presenting the window it selected while AppKit publishes a
+            // later non-focused catalog during the fullscreen transition.
+            // Removing that identity here races the first drawable activity
+            // heartbeat. Keep it only while the same window ID and owner are
+            // still present in CGWindowList; the liveness pass below is the
+            // authoritative revocation edge.
+            focusedWindowOwners[@(descriptor.windowID)] =
+                @(descriptor.ownerPID);
+        }
         emitted++;
     }
+    for (NSNumber *windowID in [focusedWindowOwners.allKeys copy]) {
+        NSNumber *liveOwner = liveWindowOwners[windowID];
+        if (!liveOwner || liveOwner.intValue !=
+                focusedWindowOwners[windowID].intValue)
+            [focusedWindowOwners removeObjectForKey:windowID];
+    }
+    client.focusedWindowOwners = focusedWindowOwners;
     xpc_dictionary_set_value(event, MACWS_STREAM_KEY_WINDOWS, array);
     xpc_connection_send_message(client.connection, event);
 }
@@ -744,15 +1265,22 @@ static void StartInvalidationListener(void) {
                             objCType:@encode(MacWSGeometryInvalidation)];
                 }
                 geometryChanged = YES;
-                catalogChanged = YES;
             } else {
                 for (ssize_t index = 0; index < count; index++) {
                     if (bytes[index] == 'a') {
                         workspaceAnimationAdvanced = YES;
                         continue;
                     }
+                    // A geometry edge changes an existing layer's rectangle,
+                    // not the window catalog. Sending it through the catalog
+                    // path used to perform a complete CGWindow snapshot and
+                    // request a full-screen final-composite replay for every
+                    // title-bar drag sample.
+                    if (bytes[index] == 'g') {
+                        geometryChanged = YES;
+                        continue;
+                    }
                     catalogChanged = YES;
-                    if (bytes[index] == 'g') geometryChanged = YES;
                     if (bytes[index] == 't')
                         semanticPointerClickCompleted = YES;
                 }
@@ -763,9 +1291,18 @@ static void StartInvalidationListener(void) {
         if (workspaceAnimationAdvanced) {
             CFTimeInterval now = CFAbsoluteTimeGetCurrent();
             BOOL wasSampling = now < WorkspaceAnimationSamplingDeadline;
-            WorkspaceAnimationSamplingDeadline =
-                now + 0.25;
-            WorkspaceAnimationSettlementHardDeadline = now + 0.80;
+            // The hard deadline is the bound of one animation burst, not a
+            // sliding deadline.  Dock/WindowServer can publish continuous
+            // animation edges while the desktop is otherwise idle.  Sliding
+            // both deadlines kept DisplayQueue in geometry-only sampling
+            // indefinitely, so a Dock restart was never reconciled into the
+            // retained fullscreen layer catalog.  Begin a fresh bounded burst
+            // only after the previous one has ended, and cap its soft tail at
+            // that immutable boundary.
+            if (!wasSampling)
+                WorkspaceAnimationSettlementHardDeadline = now + 0.80;
+            WorkspaceAnimationSamplingDeadline = fmin(
+                now + 0.25, WorkspaceAnimationSettlementHardDeadline);
             // This path only needs compositor geometry. Avoid broadcasting a
             // complete application-window list for every gesture sample. A
             // targeted asynchronous query is single-flight: 120-Hz input can
@@ -774,7 +1311,17 @@ static void StartInvalidationListener(void) {
             RequestWorkspaceGeometrySample();
         }
         if (catalogChanged) ScheduleCatalogBroadcast();
-        if (geometryChanged) ScheduleGeometryStreamRestart();
+        if (geometryChanged) {
+            // NSWindow move/resize notifications continue for the real
+            // duration of a drag. A sliding 250-ms tail keeps the lightweight
+            // targeted descriptions alive, while the 150-ms restart debounce
+            // below performs one final exact-stream shape check after resize.
+            CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+            WorkspaceAppKitGeometrySamplingDeadline = fmax(
+                WorkspaceAppKitGeometrySamplingDeadline, now + 0.25);
+            RequestWorkspaceGeometrySample();
+            ScheduleGeometryStreamRestart();
+        }
     });
     dispatch_source_set_cancel_handler(InvalidationSource, ^{
         if (InvalidationSocket >= 0) close(InvalidationSocket);
@@ -1028,6 +1575,131 @@ static void PublishFrame(MacWSDisplayClient *client,
     mach_port_deallocate(mach_task_self(), port);
 }
 
+static BOOL FinalCompositeIsLive(void) {
+    return FinalCompositeSurface != NULL &&
+        FinalCompositeRecord.completionTime != 0;
+}
+
+static void ExpireFinalCompositeIfObsolete(void) {
+    if (!FinalCompositeSurface || WorkspaceGraphMutationTime == 0 ||
+        WorkspaceGraphMutationTime <= FinalCompositeRecord.completionTime)
+        return;
+    IOSurfaceRef expiredSurface = FinalCompositeSurface;
+    uint32_t expiredSurfaceID = IOSurfaceGetID(expiredSurface);
+    pid_t producerPID = FinalCompositeRecord.producerPID;
+    uint64_t producerSequence = FinalCompositeRecord.sequence;
+    // Clear the authoritative-base identity before publishing the fallback so
+    // its descriptor cannot be mislabeled as a final-composite frame.
+    FinalCompositeSurface = NULL;
+
+    // Re-arm the exact-window fallback graph before exposing its graphite
+    // base. Newly started streams will replace that base with authoritative
+    // layer IOSurfaces as their first complete frames arrive.
+    ResumeFullscreenLayerCapturesForFallback();
+
+    NSUInteger subscribers = 0;
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive || client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen ||
+            !client.workspaceCanvas) continue;
+        subscribers++;
+        PublishFrame(client, nil, mach_absolute_time(),
+                     client.workspaceCanvas);
+    }
+    IOSurfaceDecrementUseCount(expiredSurface);
+    CFRelease(expiredSurface);
+    WriteFinalCompositeState(@"fallback", producerPID, producerSequence,
+                             WorkspaceGraphMutationReason ?: @"unknown");
+    DisplayLog(@"final-composite-obsolete producer=%d sequence=%llu "
+               "surface=%u catch-up-ms=1000 mutation=%@ "
+               "fallback=window-iosurface-composite subscribers=%lu",
+               producerPID, (unsigned long long)producerSequence,
+               expiredSurfaceID, WorkspaceGraphMutationReason ?: @"unknown",
+               (unsigned long)subscribers);
+}
+
+static void ScheduleFinalCompositeCatchUpDeadline(void) {
+    if (!FinalCompositeExpiryTimer) {
+        FinalCompositeExpiryTimer = dispatch_source_create(
+            DISPATCH_SOURCE_TYPE_TIMER, 0, 0, DisplayQueue);
+        dispatch_source_set_event_handler(FinalCompositeExpiryTimer, ^{
+            ExpireFinalCompositeIfObsolete();
+        });
+        dispatch_resume(FinalCompositeExpiryTimer);
+    }
+    dispatch_source_set_timer(
+        FinalCompositeExpiryTimer,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)FinalCompositeCatchUpNanoseconds),
+        DISPATCH_TIME_FOREVER, 0);
+}
+
+static uint64_t ReplayMinimumForObservedTopology(uint64_t observedTime) {
+    if (observedTime == 0) return 1;
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        if (mach_timebase_info(&timebase) != KERN_SUCCESS ||
+            timebase.numer == 0 || timebase.denom == 0) {
+            timebase.numer = 1;
+            timebase.denom = 1;
+        }
+    });
+    // Runtime-confirmed in WindowServer.err on 2026-08-28: for ten ordinary
+    // Dock/window topology changes, the completed owned-scanout source
+    // preceded displayd's later catalog-observation timestamp by
+    // 0.442-11.593 ms.  Requiring source >= observation therefore rejected
+    // the frame which caused the observation and left the desktop permanently
+    // in layer fallback.  A separate 105.190-ms source was genuinely old.
+    // Admit only one bounded 20-ms observation-latency window; older sources
+    // still fail and force the typed full-session recovery path.
+    static const uint64_t observationSlackNS = 20 * NSEC_PER_MSEC;
+    __uint128_t numerator = (__uint128_t)observationSlackNS *
+        timebase.denom + timebase.numer - 1;
+    uint64_t slackTicks = (uint64_t)(numerator / timebase.numer);
+    return observedTime > slackTicks ? observedTime - slackTicks : 1;
+}
+
+static void NoteWorkspaceGraphMutation(uint64_t displayTime,
+                                       NSString *reason) {
+    if (displayTime == 0) displayTime = mach_absolute_time();
+    if (displayTime >= WorkspaceGraphMutationTime) {
+        WorkspaceGraphMutationTime = displayTime;
+        WorkspaceGraphMutationReason = [reason copy] ?: @"unknown";
+    }
+    // A topology transaction is discrete; request at most once for each
+    // observed topology timestamp. Application content is carried by its
+    // independent exact-window stream and is not a mutation of the retained
+    // desktop-material base.
+    // This request must not depend on FinalCompositeSurface being non-null:
+    // after the one-second expiry the old implementation permanently lost
+    // its only path back from window-layer fallback, so "repair desktop"
+    // could restart Dock successfully without ever reacquiring SkyLight's
+    // authoritative material composite.
+    if ([reason isEqualToString:@"layer-topology"] &&
+        WorkspaceGraphMutationTime >
+            FinalCompositeReplayRequestedThroughMutationTime) {
+        FinalCompositeReplayRequestedThroughMutationTime =
+            WorkspaceGraphMutationTime;
+        uint64_t replayMinimum = ReplayMinimumForObservedTopology(
+            WorkspaceGraphMutationTime);
+        MacWSRequestFinalCompositeReplay(replayMinimum);
+        DisplayLog(@"final-composite-catch-up-request producer=%d "
+                   "sequence=%llu surface=%@ mutation=%@ "
+                   "observed=%llu replay-minimum=%llu slack-ms=20",
+                   FinalCompositeRecord.producerPID,
+                   (unsigned long long)FinalCompositeRecord.sequence,
+                   FinalCompositeSurface ? @"ready" : @"missing",
+                   WorkspaceGraphMutationReason ?: @"unknown",
+                   (unsigned long long)WorkspaceGraphMutationTime,
+                   (unsigned long long)replayMinimum);
+    }
+    if (FinalCompositeSurface &&
+        WorkspaceGraphMutationTime > FinalCompositeRecord.completionTime) {
+        ScheduleFinalCompositeCatchUpDeadline();
+    }
+}
+
 static void DeliverFinalComposite(
         IOSurfaceRef surface, MacWSFinalCompositeRecord record) {
     if (!surface) return;
@@ -1041,10 +1713,26 @@ static void DeliverFinalComposite(
     IOSurfaceIncrementUseCount(surface);
     FinalCompositeSurface = (IOSurfaceRef)CFRetain(surface);
     FinalCompositeRecord = record;
+    WriteFinalCompositeState(@"ready", record.producerPID, record.sequence,
+                             @"validated-final-composite");
+    if (WorkspaceGraphMutationTime > record.completionTime) {
+        ScheduleFinalCompositeCatchUpDeadline();
+    } else if (FinalCompositeExpiryTimer) {
+        dispatch_source_set_timer(FinalCompositeExpiryTimer,
+            DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+    }
     if (oldSurface) {
         IOSurfaceDecrementUseCount(oldSurface);
         CFRelease(oldSurface);
     }
+
+    // The completed final composite is the complete native desktop authority
+    // for a fullscreen Host. Retain exact-layer identities and their latest
+    // surfaces for fallback/Catalyst geometry, but suspend duplicate native
+    // capture streams one display interval apart. FullscreenCanvas remains an
+    // independent direct-drawable authority and is handled by its validated
+    // activity lease.
+    SuspendFullscreenLayerCapturesForFinalComposite();
 
     NSUInteger subscribers = 0;
     for (MacWSDisplayClient *client in [Clients copy]) {
@@ -1319,10 +2007,27 @@ static void ApplyWorkspaceGeometryDescriptions(
             if (!CGRectMakeWithDictionaryRepresentation(
                     (__bridge CFDictionaryRef)info[(id)kCGWindowBounds],
                     &bounds) || CGRectIsEmpty(bounds)) continue;
-            CGRect destination = CGRectMake(
-                (bounds.origin.x - desktopBounds.origin.x) * scale,
-                (bounds.origin.y - desktopBounds.origin.y) * scale,
-                bounds.size.width * scale, bounds.size.height * scale);
+            BOOL usedSurfaceMeasurement = NO;
+            CGFloat presentationScale = LayerPresentationScale(
+                bounds, layer.latestSurface, scale,
+                &usedSurfaceMeasurement);
+            if (usedSurfaceMeasurement &&
+                fabs(presentationScale - scale) > 0.08 &&
+                !layer.reportedPresentationScaleNormalization) {
+                layer.reportedPresentationScaleNormalization = YES;
+                DisplayLog(@"runtime-confirmed presentation-scale-normalized "
+                           "layer=%u owner-pid=%d bounds=%.0fx%.0f "
+                           "surface=%zux%zu display-scale=%.3f "
+                           "presentation-scale=%.3f",
+                           layer.windowID, layer.ownerPID,
+                           bounds.size.width, bounds.size.height,
+                           IOSurfaceGetWidth(layer.latestSurface),
+                           IOSurfaceGetHeight(layer.latestSurface), scale,
+                           presentationScale);
+            }
+            CGRect destination = MacWSWorkspaceLayerDestination(
+                client, layer, bounds, desktopBounds, presentationScale,
+                usedSurfaceMeasurement);
             if (CGRectEqualToRect(layer.destinationBounds, destination))
                 continue;
             layer.destinationBounds = destination;
@@ -1336,7 +2041,7 @@ static void ApplyWorkspaceGeometryDescriptions(
 
 static void RequestWorkspaceGeometrySample(void) {
     CFTimeInterval now = CFAbsoluteTimeGetCurrent();
-    if (now >= WorkspaceAnimationSamplingDeadline) {
+    if (now >= WorkspaceGeometrySamplingDeadline()) {
         if (WorkspaceGeometryBurstActive &&
             !WorkspaceGeometryQueryInFlight) {
             WorkspaceGeometryQueryPending = NO;
@@ -1399,7 +2104,7 @@ static void RequestWorkspaceGeometrySample(void) {
                                                     queryFinished);
 
                 CFTimeInterval completedAt = CFAbsoluteTimeGetCurrent();
-                if (completedAt < WorkspaceAnimationSamplingDeadline) {
+                if (completedAt < WorkspaceGeometrySamplingDeadline()) {
                     const double frameBudgetMS = 1000.0 / 60.0;
                     uint64_t delay = duration < frameBudgetMS
                         ? (uint64_t)llround((frameBudgetMS - duration) *
@@ -1519,7 +2224,9 @@ static void RetireTransientLayer(MacWSDisplayClient *client,
 
 static void StartTransientLayer(MacWSTransientLayer *layer) {
     MacWSDisplayClient *client = layer.client;
-    if (!client || layer.windowID == 0) return;
+    if (!client || layer.windowID == 0 ||
+        layer.directDrawableCaptureSuspended ||
+        layer.directDrawableCaptureSuspensionPending) return;
     // Preserve the last complete IOSurface while SkyLight retires/recreates
     // the exact-window stream. Host can keep compositing it at the newly
     // committed destination instead of flashing a black hole during resize.
@@ -1540,6 +2247,14 @@ static void StartTransientLayer(MacWSTransientLayer *layer) {
             if (!strongLayer || !strongClient ||
                 strongLayer.streamID != generation) return;
             if (status == kCGDisplayStreamFrameStatusFrameComplete) {
+                // Runtime-confirmed during Stray: treating every exact-window
+                // frame as a mutation of the desktop-material base expired
+                // final-composite after one second, restarted the full Dock /
+                // Finder / menu capture graph, cleared Host's fullscreen crop
+                // and added avoidable sustained load. The layer IOSurface is
+                // already the authoritative content update. Geometry/catalog
+                // changes continue to call NoteWorkspaceGraphMutation with
+                // layer-topology below.
                 PublishFrame(strongClient, strongLayer, displayTime,
                              frameSurface);
                 if (strongLayer.oneShotCapture &&
@@ -1589,6 +2304,362 @@ static void StartTransientLayer(MacWSTransientLayer *layer) {
         layer.destinationBounds.size.height);
 }
 
+static MacWSTransientLayer *ValidatedDirectDrawableLayer(
+        MacWSDisplayClient *client, int32_t ownerPID, uint32_t layerWindowID,
+        uint32_t width, uint32_t height, NSString **rejectionReason) {
+    if (rejectionReason) *rejectionReason = nil;
+    if (!client || !client.subscriptionActive || client.deliveryPaused ||
+        client.mode != MacWSStreamModeFullscreen || !client.workspaceCanvas) {
+        if (rejectionReason) *rejectionReason = @"client-state";
+        return nil;
+    }
+    if (ownerPID <= 1 || layerWindowID == 0 || width == 0 || height == 0 ||
+        width > MACWS_STREAM_MAX_DIMENSION ||
+        height > MACWS_STREAM_MAX_DIMENSION) {
+        if (rejectionReason) *rejectionReason = @"malformed-identity";
+        return nil;
+    }
+    MacWSTransientLayer *layer =
+        client.transientLayers[@(layerWindowID)];
+    if (!layer) {
+        if (rejectionReason) *rejectionReason = @"layer-missing";
+        return nil;
+    }
+    if (layer.client != client || layer.ownerPID != ownerPID) {
+        if (rejectionReason) *rejectionReason = @"layer-identity";
+        return nil;
+    }
+    if (layer.retiring) {
+        if (rejectionReason) *rejectionReason = @"layer-retiring";
+        return nil;
+    }
+    if (layer.oneShotCapture) {
+        if (rejectionReason) *rejectionReason = @"snapshot-layer";
+        return nil;
+    }
+    if ((layer.windowFlags & MacWSStreamWindowFullscreenCanvas) == 0) {
+        if (rejectionReason) *rejectionReason = @"not-fullscreen-canvas";
+        return nil;
+    }
+    BOOL alreadyValidated = client.directDrawableActive &&
+        client.directDrawableOwnerPID == ownerPID &&
+        client.directDrawableLayerWindowID == layerWindowID;
+    NSNumber *catalogOwner = client.focusedWindowOwners[@(layerWindowID)];
+    if (!alreadyValidated && catalogOwner.intValue != ownerPID) {
+        if (rejectionReason) {
+            *rejectionReason = layer.skyLightLayer != 0
+                ? @"layer-level-focus" : @"catalog-focus";
+        }
+        return nil;
+    }
+    // A real fullscreen transition can move the focused Stray NSWindow from
+    // SkyLight level 0 to level 25 without changing its CGWindow ID or
+    // drawable. The exact catalog owner above, not PID or geometry alone,
+    // authorizes that transition.
+    if (layer.skyLightLayer != 0 &&
+        !layer.reportedDirectDrawableFocusedLevelAcceptance) {
+        layer.reportedDirectDrawableFocusedLevelAcceptance = YES;
+        DisplayLog(@"runtime-confirmed direct-drawable-focused-level "
+                   "owner-pid=%d layer=%u skylight-level=%ld "
+                   "catalog-focused=YES",
+                   ownerPID, layerWindowID, (long)layer.skyLightLayer);
+    }
+    if (!layer.latestSurface) {
+        if (rejectionReason) *rejectionReason = @"surface-missing";
+        return nil;
+    }
+    size_t canvasWidth = IOSurfaceGetWidth(client.workspaceCanvas);
+    size_t canvasHeight = IOSurfaceGetHeight(client.workspaceCanvas);
+    CGRect destination = layer.destinationBounds;
+    CGRect canvas = CGRectMake(0, 0, canvasWidth, canvasHeight);
+    if (width < 320 || height < 240) {
+        if (rejectionReason) *rejectionReason = @"drawable-size";
+        return nil;
+    }
+    if (CGRectIsNull(destination) || CGRectIsEmpty(destination) ||
+        CGRectGetWidth(destination) < 320.0 ||
+        CGRectGetHeight(destination) < 240.0 ||
+        !CGRectContainsRect(CGRectInset(canvas, -0.5, -0.5), destination)) {
+        if (rejectionReason) *rejectionReason = @"destination";
+        return nil;
+    }
+    return layer;
+}
+
+static void ClearDirectDrawableActivity(MacWSDisplayClient *client,
+                                        NSString *reason) {
+    if (!client) return;
+    BOOL wasActive = client.directDrawableActive;
+    int32_t ownerPID = client.directDrawableOwnerPID;
+    uint32_t layerWindowID = client.directDrawableLayerWindowID;
+    client.directDrawableActive = NO;
+    client.directDrawableDeadline = 0;
+    client.directDrawableOwnerPID = 0;
+    client.directDrawableLayerWindowID = 0;
+    client.directDrawableWidth = 0;
+    client.directDrawableHeight = 0;
+    if (wasActive) RetireDirectDrawablePacingLease();
+    NSUInteger resumed = 0;
+    for (MacWSTransientLayer *layer in
+            [client.transientLayers.allValues copy]) {
+        BOOL ownedSuspension = layer.directDrawableCaptureSuspended ||
+            layer.directDrawableCaptureSuspensionPending;
+        if (!ownedSuspension) continue;
+        layer.directDrawableCaptureSuspended = NO;
+        layer.directDrawableCaptureSuspensionPending = NO;
+        if ((!FinalCompositeIsLive() ||
+             LayerNeedsIndependentFinalCompositeCapture(layer)) &&
+            !layer.stream && !layer.retiring &&
+            !(layer.oneShotCapture && layer.snapshotComplete &&
+              layer.latestSurface)) {
+            StartTransientLayer(layer);
+            if (layer.stream) resumed++;
+        }
+    }
+    if (wasActive || resumed) {
+        DisplayLog(@"direct-drawable-capture-cleared owner-pid=%d layer=%u "
+                   "resumed=%lu reason=%@",
+                   ownerPID, layerWindowID, (unsigned long)resumed,
+                   reason ?: @"inactive");
+    }
+}
+
+static void ScheduleDirectDrawableExpiry(MacWSDisplayClient *client) {
+    if (!client || client.directDrawableExpiryPending) return;
+    client.directDrawableExpiryPending = YES;
+    __weak MacWSDisplayClient *weakClient = client;
+    __block void (^checkExpiry)(void) = nil;
+    checkExpiry = ^{
+        MacWSDisplayClient *strongClient = weakClient;
+        if (!strongClient) {
+            checkExpiry = nil;
+            return;
+        }
+        if (!strongClient.directDrawableActive) {
+            strongClient.directDrawableExpiryPending = NO;
+            checkExpiry = nil;
+            return;
+        }
+        CFTimeInterval remaining = strongClient.directDrawableDeadline -
+            CFAbsoluteTimeGetCurrent();
+        if (remaining > 0) {
+            uint64_t delayNS = (uint64_t)llround(
+                MIN(remaining, MacWSDirectDrawableLeaseSeconds) *
+                    (double)NSEC_PER_SEC);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNS),
+                           DisplayQueue, checkExpiry);
+            return;
+        }
+        strongClient.directDrawableExpiryPending = NO;
+        ClearDirectDrawableActivity(strongClient, @"heartbeat-timeout");
+        checkExpiry = nil;
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)llround(
+                                     MacWSDirectDrawableLeaseSeconds *
+                                     (double)NSEC_PER_SEC)),
+                   DisplayQueue, checkExpiry);
+}
+
+static void HandleDirectDrawableActivity(MacWSDisplayClient *client,
+                                         xpc_object_t request) {
+    uint64_t version = xpc_dictionary_get_uint64(
+        request, MACWS_STREAM_KEY_PROTOCOL_VERSION);
+    BOOL active = xpc_dictionary_get_bool(request,
+                                           MACWS_STREAM_KEY_ACTIVE);
+    if (version != MACWS_STREAM_VERSION || !active) {
+        ClearDirectDrawableActivity(client,
+            version == MACWS_STREAM_VERSION ? @"host-clear" :
+                                               @"protocol-mismatch");
+        return;
+    }
+    int64_t ownerValue = xpc_dictionary_get_int64(
+        request, MACWS_STREAM_KEY_OWNER_PID);
+    uint64_t layerValue = xpc_dictionary_get_uint64(
+        request, MACWS_STREAM_KEY_LAYER_WINDOW_ID);
+    uint64_t widthValue = xpc_dictionary_get_uint64(
+        request, MACWS_STREAM_KEY_WIDTH);
+    uint64_t heightValue = xpc_dictionary_get_uint64(
+        request, MACWS_STREAM_KEY_HEIGHT);
+    if (ownerValue <= 1 || ownerValue > INT32_MAX || layerValue == 0 ||
+        layerValue > UINT32_MAX || widthValue == 0 ||
+        widthValue > MACWS_STREAM_MAX_DIMENSION || heightValue == 0 ||
+        heightValue > MACWS_STREAM_MAX_DIMENSION) return;
+    NSString *rejectionReason = nil;
+    MacWSTransientLayer *layer = ValidatedDirectDrawableLayer(
+        client, (int32_t)ownerValue, (uint32_t)layerValue,
+        (uint32_t)widthValue, (uint32_t)heightValue, &rejectionReason);
+    if (!layer) {
+        CFTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - client.directDrawableLastRejectionLogTime >= 1.0) {
+            client.directDrawableLastRejectionLogTime = now;
+            MacWSTransientLayer *candidate =
+                client.transientLayers[@((uint32_t)layerValue)];
+            CGRect destination = candidate
+                ? candidate.destinationBounds : CGRectZero;
+            DisplayLog(@"direct-drawable-activity-rejected reason=%@ "
+                       "owner-pid=%lld layer=%llu size=%llux%llu "
+                       "candidate-owner=%d retiring=%@ level=%ld "
+                       "surface=%zux%zu destination=(%.0f,%.0f %.0fx%.0f)",
+                       rejectionReason ?: @"unknown", (long long)ownerValue,
+                       (unsigned long long)layerValue,
+                       (unsigned long long)widthValue,
+                       (unsigned long long)heightValue,
+                       candidate ? candidate.ownerPID : 0,
+                       candidate.retiring ? @"YES" : @"NO",
+                       candidate ? (long)candidate.skyLightLayer : 0L,
+                       candidate.latestSurface
+                           ? IOSurfaceGetWidth(candidate.latestSurface) : 0,
+                       candidate.latestSurface
+                           ? IOSurfaceGetHeight(candidate.latestSurface) : 0,
+                       destination.origin.x, destination.origin.y,
+                       destination.size.width, destination.size.height);
+        }
+        return;
+    }
+
+    BOOL identityChanged = !client.directDrawableActive ||
+        client.directDrawableOwnerPID != ownerValue ||
+        client.directDrawableLayerWindowID != layerValue;
+    client.directDrawableActive = YES;
+    client.directDrawableDeadline = CFAbsoluteTimeGetCurrent() +
+        MacWSDirectDrawableLeaseSeconds;
+    client.directDrawableOwnerPID = (int32_t)ownerValue;
+    client.directDrawableLayerWindowID = (uint32_t)layerValue;
+    client.directDrawableWidth = (uint32_t)widthValue;
+    client.directDrawableHeight = (uint32_t)heightValue;
+    PublishDirectDrawablePacingLease(
+        client.directDrawableOwnerPID,
+        client.directDrawableLayerWindowID,
+        client.directDrawableWidth,
+        client.directDrawableHeight);
+    ScheduleDirectDrawableExpiry(client);
+    if (layer.directDrawableCaptureSuspended ||
+        layer.directDrawableCaptureSuspensionPending) return;
+
+    layer.directDrawableCaptureSuspensionPending = YES;
+    __weak MacWSTransientLayer *weakLayer = layer;
+    __weak MacWSDisplayClient *weakClient = client;
+    EnqueueRetiredTransientStop(^{
+        MacWSTransientLayer *strongLayer = weakLayer;
+        MacWSDisplayClient *strongClient = weakClient;
+        if (!strongLayer) return;
+        strongLayer.directDrawableCaptureSuspensionPending = NO;
+        if (!strongClient || !strongClient.directDrawableActive ||
+            strongLayer.client != strongClient || strongLayer.retiring ||
+            strongClient.directDrawableOwnerPID != strongLayer.ownerPID ||
+            strongClient.directDrawableLayerWindowID !=
+                strongLayer.windowID ||
+            strongClient.directDrawableDeadline <=
+                CFAbsoluteTimeGetCurrent()) return;
+        uint64_t oldStreamID = strongLayer.streamID;
+        strongLayer.directDrawableCaptureSuspended = YES;
+        if (strongLayer.stream) {
+            strongLayer.streamID = NextStreamID++;
+            if (strongLayer.streamID == 0)
+                strongLayer.streamID = NextStreamID++;
+            [strongLayer finishActiveFrameBurstWithReason:
+                @"direct-drawable-authoritative"];
+            [strongLayer stopCapturePreservingSurface];
+        }
+        DisplayLog(@"direct-drawable-capture-suspended owner-pid=%d "
+                   "layer=%u old-stream=%llu generation=%llu size=%ux%u",
+                   strongLayer.ownerPID, strongLayer.windowID,
+                   (unsigned long long)oldStreamID,
+                   (unsigned long long)strongLayer.streamID,
+                   strongClient.directDrawableWidth,
+                   strongClient.directDrawableHeight);
+    });
+    if (identityChanged) {
+        DisplayLog(@"direct-drawable-activity-validated owner-pid=%lld "
+                   "layer=%llu size=%llux%llu timeout-ms=%.0f",
+                   (long long)ownerValue, (unsigned long long)layerValue,
+                   (unsigned long long)widthValue,
+                   (unsigned long long)heightValue,
+                   MacWSDirectDrawableLeaseSeconds * 1000.0);
+    }
+}
+
+static void SuspendFullscreenLayerCapturesForFinalComposite(void) {
+    if (!FinalCompositeIsLive()) return;
+    NSUInteger scheduled = 0;
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive || client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen) continue;
+        for (MacWSTransientLayer *layer in
+                [client.transientLayers.allValues copy]) {
+            if (!layer.stream || layer.retiring ||
+                LayerNeedsIndependentFinalCompositeCapture(layer) ||
+                layer.finalCompositeCaptureSuspensionPending ||
+                layer.directDrawableCaptureSuspended ||
+                layer.directDrawableCaptureSuspensionPending) continue;
+            layer.finalCompositeCaptureSuspensionPending = YES;
+            __weak MacWSTransientLayer *weakLayer = layer;
+            __weak MacWSDisplayClient *weakClient = client;
+            EnqueueRetiredTransientStop(^{
+                MacWSTransientLayer *strongLayer = weakLayer;
+                MacWSDisplayClient *strongClient = weakClient;
+                if (!strongLayer) return;
+                strongLayer.finalCompositeCaptureSuspensionPending = NO;
+                if (!FinalCompositeIsLive() || !strongClient ||
+                    strongLayer.client != strongClient ||
+                    !strongClient.subscriptionActive ||
+                    strongClient.deliveryPaused ||
+                    strongClient.mode != MacWSStreamModeFullscreen ||
+                    strongLayer.retiring || !strongLayer.stream ||
+                    LayerNeedsIndependentFinalCompositeCapture(strongLayer))
+                    return;
+                uint64_t oldStreamID = strongLayer.streamID;
+                // Invalidate the asynchronous terminal callback before
+                // stopping the capture object. A later fallback restart owns
+                // a fresh generation and cannot be overwritten by this one.
+                strongLayer.streamID = NextStreamID++;
+                if (strongLayer.streamID == 0)
+                    strongLayer.streamID = NextStreamID++;
+                [strongLayer finishActiveFrameBurstWithReason:
+                    @"final-composite-authoritative"];
+                [strongLayer stopCapturePreservingSurface];
+                DisplayLog(@"layer-capture-suspended layer=%u old-stream=%llu "
+                           "generation=%llu reason=final-composite-authoritative",
+                           strongLayer.windowID,
+                           (unsigned long long)oldStreamID,
+                           (unsigned long long)strongLayer.streamID);
+            });
+            scheduled++;
+        }
+    }
+    if (scheduled) {
+        DisplayLog(@"layer-capture-suspend-batch count=%lu interval-ms=16 "
+                   "reason=final-composite-authoritative",
+                   (unsigned long)scheduled);
+    }
+}
+
+static void ResumeFullscreenLayerCapturesForFallback(void) {
+    if (FinalCompositeIsLive()) return;
+    NSUInteger resumed = 0;
+    for (MacWSDisplayClient *client in [Clients copy]) {
+        if (!client.subscriptionActive || client.deliveryPaused ||
+            client.mode != MacWSStreamModeFullscreen) continue;
+        for (MacWSTransientLayer *layer in
+                [client.transientLayers.allValues copy]) {
+            layer.finalCompositeCaptureSuspensionPending = NO;
+            if (layer.stream || layer.retiring ||
+                layer.directDrawableCaptureSuspended ||
+                layer.directDrawableCaptureSuspensionPending ||
+                (layer.oneShotCapture && layer.snapshotComplete &&
+                 layer.latestSurface)) continue;
+            StartTransientLayer(layer);
+            if (layer.stream) resumed++;
+        }
+    }
+    if (resumed) {
+        DisplayLog(@"layer-capture-resume-batch count=%lu "
+                   "reason=final-composite-fallback",
+                   (unsigned long)resumed);
+    }
+}
+
 static void StartClientStream(MacWSDisplayClient *client) {
     [client stopStream];
     client.streamID = NextStreamID++;
@@ -1602,16 +2673,17 @@ static void StartClientStream(MacWSDisplayClient *client) {
                        @"无法创建 Retina 桌面 IOSurface 画布", NO);
             return;
         }
-        IOSurfaceRef base = FinalCompositeSurface
+        BOOL hasLiveFinalComposite = FinalCompositeIsLive();
+        IOSurfaceRef base = hasLiveFinalComposite
             ? FinalCompositeSurface : client.workspaceCanvas;
-        uint64_t baseTime = FinalCompositeSurface
+        uint64_t baseTime = hasLiveFinalComposite
             ? FinalCompositeRecord.completionTime : mach_absolute_time();
         PublishFrame(client, nil, baseTime, base);
         DisplayLog(@"workspace-start id=%llu display=%zux%zu scale=%.3f transport=%@",
                    (unsigned long long)client.streamID,
                    IOSurfaceGetWidth(base), IOSurfaceGetHeight(base),
                    client.windowBackingScale,
-                   FinalCompositeSurface
+                   hasLiveFinalComposite
                        ? @"final-composite-iosurface"
                        : @"window-iosurface-composite");
         return;
@@ -1737,11 +2809,12 @@ static void StartSubscription(MacWSDisplayClient *client,
             DisplayLog(@"workspace-resume stream=%llu layers=%lu transport=retained-graph",
                        (unsigned long long)client.streamID,
                        (unsigned long)client.transientLayers.count);
-            IOSurfaceRef retainedBase = FinalCompositeSurface
+            BOOL hasLiveFinalComposite = FinalCompositeIsLive();
+            IOSurfaceRef retainedBase = hasLiveFinalComposite
                 ? FinalCompositeSurface : client.workspaceCanvas;
             if (retainedBase)
                 PublishFrame(client, nil,
-                    FinalCompositeSurface
+                    hasLiveFinalComposite
                         ? FinalCompositeRecord.completionTime
                         : mach_absolute_time(), retainedBase);
             for (MacWSTransientLayer *layer in
@@ -1770,6 +2843,7 @@ static void StartSubscription(MacWSDisplayClient *client,
             }
         }
         if (owner) {
+            ClearDirectDrawableActivity(owner, @"workspace-handoff");
             BOOL ownerDisconnected = owner.connection == nil;
             owner.disconnectGeneration++;
             // Stop only this client's former exact-window graph.  The desktop
@@ -1779,6 +2853,7 @@ static void StartSubscription(MacWSDisplayClient *client,
             [client stopTransientLayers];
             [client stopStream];
             client.outstandingByLayer = [NSMutableDictionary dictionary];
+            client.frameAcknowledged = NO;
             client.subscriptionActive = YES;
             client.deliveryPaused = NO;
             client.mode = MacWSStreamModeFullscreen;
@@ -1818,11 +2893,12 @@ static void StartSubscription(MacWSDisplayClient *client,
             // Republish the retained current generation before waiting for a
             // future damage callback; static wallpaper/menu layers may not
             // otherwise emit another frame for the new Scene.
-            IOSurfaceRef retainedBase = FinalCompositeSurface
+            BOOL hasLiveFinalComposite = FinalCompositeIsLive();
+            IOSurfaceRef retainedBase = hasLiveFinalComposite
                 ? FinalCompositeSurface : client.workspaceCanvas;
             if (retainedBase) {
                 PublishFrame(client, nil,
-                    FinalCompositeSurface
+                    hasLiveFinalComposite
                         ? FinalCompositeRecord.completionTime
                         : mach_absolute_time(), retainedBase);
             }
@@ -1859,6 +2935,7 @@ static void StartSubscription(MacWSDisplayClient *client,
     }
     client.subscriptionActive = YES;
     client.deliveryPaused = NO;
+    client.frameAcknowledged = NO;
     client.mode = mode;
     client.windowID = mode == MacWSStreamModeWindow ? windowID : 0;
     client.windowBackingScale = 0.0;
@@ -1890,6 +2967,7 @@ static void ReconcileTransientStreams(void) {
     BOOL workspaceMissingLayerNeedsConfirmation = NO;
     BOOL urgentPopupPresent = NO;
     BOOL workspacePresentationChanged = NO;
+    BOOL workspaceTopologyChanged = NO;
     for (MacWSDisplayClient *client in [Clients copy]) {
         if (!client.subscriptionActive || client.deliveryPaused) continue;
         if (client.mode == MacWSStreamModeFullscreen) {
@@ -1907,6 +2985,8 @@ static void ReconcileTransientStreams(void) {
                     sizeof(MacWSStreamLayerGeometry)];
             uint64_t geometryDisplayTime = mach_absolute_time();
             NSMutableSet<NSNumber *> *seen = [NSMutableSet set];
+            NSMutableDictionary<NSNumber *, NSDictionary<NSNumber *, NSValue *> *>
+                *metricsByPID = [NSMutableDictionary dictionary];
             NSUInteger attached = 0;
             NSUInteger count = desktopInfo.count;
             // The frontmost full-display negative-level window is Finder's
@@ -1986,6 +3066,24 @@ static void ReconcileTransientStreams(void) {
                 layer.windowName = [windowName isKindOfClass:NSString.class]
                     ? windowName : @"";
                 layer.skyLightLayer = candidateSkyLightLayer;
+                NSNumber *ownerPIDKey = @(layer.ownerPID);
+                NSDictionary<NSNumber *, NSValue *> *processMetrics =
+                    metricsByPID[ownerPIDKey];
+                if (!processMetrics) {
+                    processMetrics = CopyWindowMetrics(layer.ownerPID);
+                    metricsByPID[ownerPIDKey] = processMetrics;
+                }
+                MacWSWindowMetricsEntry windowMetrics = {0};
+                NSValue *windowMetricsValue =
+                    processMetrics[@(candidateWindowID)];
+                if (windowMetricsValue)
+                    [windowMetricsValue getValue:&windowMetrics];
+                layer.windowFlags = windowMetrics.flags &
+                    (MacWSStreamWindowVisible |
+                     MacWSStreamWindowFocused |
+                     MacWSStreamWindowFullscreenCanvas);
+                if ([info[(id)kCGWindowIsOnscreen] boolValue])
+                    layer.windowFlags |= MacWSStreamWindowOnScreen;
                 if (urgentRetireConfirmation &&
                     layer.skyLightLayer >=
                         CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) &&
@@ -2035,11 +3133,28 @@ static void ReconcileTransientStreams(void) {
                     : (candidateSkyLightLayer > 0
                         ? kMacWSPositiveLayerBand + catalogRank
                         : catalogRank);
-                CGRect newDestination = CGRectMake(
-                    (candidateBounds.origin.x - desktopBounds.origin.x) * scale,
-                    (candidateBounds.origin.y - desktopBounds.origin.y) * scale,
-                    candidateBounds.size.width * scale,
-                    candidateBounds.size.height * scale);
+                BOOL usedSurfaceMeasurement = NO;
+                CGFloat presentationScale = LayerPresentationScale(
+                    candidateBounds, layer.latestSurface, scale,
+                    &usedSurfaceMeasurement);
+                if (usedSurfaceMeasurement &&
+                    fabs(presentationScale - scale) > 0.08 &&
+                    !layer.reportedPresentationScaleNormalization) {
+                    layer.reportedPresentationScaleNormalization = YES;
+                    DisplayLog(@"runtime-confirmed presentation-scale-normalized "
+                               "layer=%u owner-pid=%d bounds=%.0fx%.0f "
+                               "surface=%zux%zu display-scale=%.3f "
+                               "presentation-scale=%.3f",
+                               layer.windowID, layer.ownerPID,
+                               candidateBounds.size.width,
+                               candidateBounds.size.height,
+                               IOSurfaceGetWidth(layer.latestSurface),
+                               IOSurfaceGetHeight(layer.latestSurface), scale,
+                               presentationScale);
+                }
+                CGRect newDestination = MacWSWorkspaceLayerDestination(
+                    client, layer, candidateBounds, desktopBounds,
+                    presentationScale, usedSurfaceMeasurement);
                 BOOL presentationChanged = !isNew &&
                     (layer.level != newLevel ||
                      !CGRectEqualToRect(layer.destinationBounds,
@@ -2049,10 +3164,13 @@ static void ReconcileTransientStreams(void) {
                 layer.missCount = 0;
                 workspacePresentationChanged |=
                     isNew || presentationChanged || returnedFromCatalog;
-                if (isNew ||
-                           (!layer.stream &&
-                            !(layer.oneShotCapture &&
-                              layer.snapshotComplete))) {
+                workspaceTopologyChanged |= isNew || returnedFromCatalog;
+                if ((!FinalCompositeIsLive() ||
+                     LayerNeedsIndependentFinalCompositeCapture(layer)) &&
+                    (isNew ||
+                     (!layer.stream &&
+                      !(layer.oneShotCapture &&
+                        layer.snapshotComplete)))) {
                     StartTransientLayer(layer);
                 }
                 // Window movement does not necessarily damage its backing
@@ -2101,8 +3219,11 @@ static void ReconcileTransientStreams(void) {
                 SendLayerRemoved(client, layer);
                 RetireTransientLayer(client, key, layer,
                                      @"workspace-catalog-removed");
+                workspacePresentationChanged = YES;
+                workspaceTopologyChanged = YES;
             }
             workspaceNeedsFollowup |= client.transientLayers.count != 0;
+            UpdateWorkspaceGraphState(client, @"fullscreen-reconcile");
             continue;
         }
         if (client.mode != MacWSStreamModeWindow || client.windowID == 0)
@@ -2247,7 +3368,20 @@ static void ReconcileTransientStreams(void) {
         }
         if (client.transientLayers.count) needsFollowup = YES;
     }
+    // Focus can move between two application owners without producing a new
+    // final-composite IOSurface first. Re-apply the focused-layer policy from
+    // the freshly read AppInput metrics so the previous application does not
+    // keep a hidden high-rate capture stream alive and heat the device.
+    if (FinalCompositeIsLive())
+        SuspendFullscreenLayerCapturesForFinalComposite();
+
     CFTimeInterval reconcileFinished = CFAbsoluteTimeGetCurrent();
+    // Geometry has its own ordered layer transaction and the normal
+    // WindowServer compositor produces a fresh final frame for it. Only a
+    // real layer add/remove can invalidate the topology represented by the
+    // retained final composite and therefore authorize a replay request.
+    if (workspaceTopologyChanged)
+        NoteWorkspaceGraphMutation(mach_absolute_time(), @"layer-topology");
     if (workspacePresentationChanged &&
         reconcileFinished < WorkspaceAnimationSettlementHardDeadline) {
         CFTimeInterval settlementDeadline = fmin(
@@ -2257,7 +3391,7 @@ static void ReconcileTransientStreams(void) {
             WorkspaceAnimationSamplingDeadline, settlementDeadline);
     }
     BOOL workspaceAnimationSampling =
-        reconcileFinished < WorkspaceAnimationSamplingDeadline;
+        reconcileFinished < WorkspaceGeometrySamplingDeadline();
     if (workspaceAnimationSampling) RequestWorkspaceGeometrySample();
     if ((needsFollowup || workspaceNeedsFollowup) &&
         !workspaceAnimationSampling) {
@@ -2297,6 +3431,7 @@ static void ScheduleTransientReconcile(uint64_t delayNanoseconds) {
 static void ReleaseLease(uint64_t token, MacWSDisplayClient *client) {
     MacWSDisplayLease *lease = Leases[@(token)];
     if (!lease || lease.owner != client) return;
+    client.frameAcknowledged = YES;
     NSUInteger outstanding = OutstandingFramesForLayer(
         client, lease.layerWindowID);
     if (outstanding)
@@ -2383,6 +3518,45 @@ static void PreserveFullscreenClientForHandoff(
     });
 }
 
+static void RepublishUnacknowledgedWorkspaceGraph(
+        MacWSDisplayClient *client) {
+    if (!client || client.frameAcknowledged || !client.connection ||
+        !client.subscriptionActive || client.deliveryPaused ||
+        client.mode != MacWSStreamModeFullscreen) return;
+    BOOL hasLiveFinalComposite = FinalCompositeIsLive();
+    IOSurfaceRef base = hasLiveFinalComposite
+        ? FinalCompositeSurface : client.workspaceCanvas;
+    NSUInteger published = 0;
+    if (base) {
+        PublishFrame(client, nil,
+            hasLiveFinalComposite
+                ? FinalCompositeRecord.completionTime
+                : mach_absolute_time(), base);
+        published++;
+    }
+    NSArray<MacWSTransientLayer *> *layers =
+        [client.transientLayers.allValues
+            sortedArrayUsingComparator:^NSComparisonResult(
+                MacWSTransientLayer *left, MacWSTransientLayer *right) {
+            if (left.level < right.level) return NSOrderedAscending;
+            if (left.level > right.level) return NSOrderedDescending;
+            if (left.windowID < right.windowID) return NSOrderedAscending;
+            if (left.windowID > right.windowID) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+    for (MacWSTransientLayer *layer in layers) {
+        if (!layer.latestSurface) continue;
+        PublishFrame(client, layer,
+            layer.latestDisplayTime ?: mach_absolute_time(),
+            layer.latestSurface);
+        published++;
+    }
+    DisplayLog(@"workspace-unacknowledged-republish stream=%llu frames=%lu "
+               "catalog-barrier=YES",
+               (unsigned long long)client.streamID,
+               (unsigned long)published);
+}
+
 static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
     if (request == XPC_ERROR_CONNECTION_INVALID ||
         request == XPC_ERROR_CONNECTION_INTERRUPTED) {
@@ -2410,6 +3584,24 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
         SendStatus(client, MACWS_STREAM_EVENT_READY, @"ready", YES);
     } else if (strcmp(operation, MACWS_STREAM_OP_LIST_WINDOWS) == 0) {
         SendWindowList(client);
+        // LIST_WINDOWS is the client's post-connection synchronization
+        // barrier. Runtime-confirmed on 2026-08-29: the new Host received the
+        // ready and catalog events but none of the IOSurface events emitted
+        // synchronously while SUBSCRIBE was building eleven capture streams.
+        // If no lease has made the complete Host -> RELEASE_FRAME round trip,
+        // republish the retained immutable graph once the catalog event is
+        // already ahead of it in the XPC stream. Stop automatically after the
+        // first real acknowledgement; this is not a periodic frame replay.
+        if (client.subscriptionActive &&
+            client.mode == MacWSStreamModeFullscreen &&
+            !client.frameAcknowledged) {
+            __weak MacWSDisplayClient *weakClient = client;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         50 * NSEC_PER_MSEC),
+                           DisplayQueue, ^{
+                RepublishUnacknowledgedWorkspaceGraph(weakClient);
+            });
+        }
     } else if (strcmp(operation, MACWS_STREAM_OP_SUBSCRIBE) == 0) {
         MacWSStreamMode mode = (MacWSStreamMode)xpc_dictionary_get_uint64(
             request, MACWS_STREAM_KEY_MODE);
@@ -2450,6 +3642,9 @@ static void HandleRequest(MacWSDisplayClient *client, xpc_object_t request) {
     } else if (strcmp(operation, MACWS_STREAM_OP_RELEASE_FRAME) == 0) {
         ReleaseLease(xpc_dictionary_get_uint64(
             request, MACWS_STREAM_KEY_LEASE_TOKEN), client);
+    } else if (strcmp(operation,
+                      MACWS_STREAM_OP_DIRECT_DRAWABLE_ACTIVITY) == 0) {
+        HandleDirectDrawableActivity(client, request);
     } else if (strcmp(operation, MACWS_MENU_XPC_OP_SNAPSHOT) == 0 ||
                strcmp(operation, MACWS_MENU_XPC_OP_ACTION) == 0) {
         size_t byteCount = 0;
@@ -2503,6 +3698,11 @@ int main(void) {
         RetiredTransientLayers = [NSMutableArray array];
         RetiredTransientStopBlocks = [NSMutableArray array];
         GeometryTargets = [NSMutableDictionary dictionary];
+        WriteFinalCompositeState(@"missing", 0, 0, @"displayd-start");
+        WorkspaceGraphStateSignature = 0;
+        [@"state=missing\nwindowserver=0\npublisher=0\nreason=displayd-start\n"
+            writeToFile:WorkspaceGraphStatePath atomically:YES
+               encoding:NSUTF8StringEncoding error:nil];
         StartInvalidationListener();
         xpc_connection_t listener = xpc_connection_create_mach_service(
             MACWS_STREAM_SERVICE, DisplayQueue,

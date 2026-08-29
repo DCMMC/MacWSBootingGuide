@@ -17,8 +17,8 @@ machine-reviewable.
 
 The parser follows the tag/section layout documented by YuAo's
 MetalLibraryArchive and validates each input function hash before touching it.
-It deliberately accepts only an iOS/macOS executable MTLB and fails closed on
-tags or section layouts that it does not understand.
+It accepts iOS, macOS, and already-Mac-Catalyst executable MTLBs and fails
+closed on tags or section layouts that it does not understand.
 """
 
 from __future__ import annotations
@@ -596,6 +596,116 @@ def inspect_air(
     )
 
 
+def saturate_half_float_texture_writes(text: str, name: str) -> str:
+    """Build a macOS-compatible variant for half-float texture bindings.
+
+    macOS Metal converts finite float values beyond the binary16 range to
+    +/-65504 when a float write intrinsic targets an R/RG/RGBA16Float
+    texture.  iOS Metal converts the same value to infinity.  Pixel format is
+    a runtime binding property, so this rewrite is intentionally a *variant*:
+    the runtime must select it only when every rewritten writable texture is
+    actually a half-float format.  R32/RG32/RGBA32 bindings must keep the
+    ordinary translated function.
+    """
+    if "@air.fast_clamp.f32" in text:
+        declaration_present = re.search(
+            r"^declare float @air\.fast_clamp\.f32\(",
+            text, re.MULTILINE,
+        ) is not None
+    else:
+        declaration_present = False
+    attribute = re.search(
+        r"^attributes #(\d+) = \{ "
+        r"(?=[^}]*\bnounwind\b)"
+        r"(?=[^}]*(?:memory\(none\)|\breadnone\b))[^}]*\}$",
+        text, re.MULTILINE,
+    )
+    if attribute:
+        attribute_number = attribute.group(1)
+        clamp_attribute_syntax = None
+    else:
+        attribute_definitions = list(re.finditer(
+            r"^attributes #(\d+) = \{[^\n]*\}$", text, re.MULTILINE
+        ))
+        if not attribute_definitions:
+            raise ValueError(f"{name}: AIR attribute table is missing")
+        attribute_number = str(max(
+            int(match.group(1)) for match in attribute_definitions
+        ) + 1)
+        clamp_attribute_syntax = (
+            "nounwind memory(none)" if "memory(" in text
+            else "nounwind readnone"
+        )
+        insert_offset = attribute_definitions[-1].end()
+        text = (
+            text[:insert_offset] +
+            f"\nattributes #{attribute_number} = "
+            f"{{ {clamp_attribute_syntax} }}" +
+            text[insert_offset:]
+        )
+    pattern = re.compile(
+        r"^(?P<indent>\s*)(?P<prefix>(?:tail )?call void "
+        r"@air\.write_texture_[123]d\.v4f32\(.*"
+        r"<4 x float> )(?P<value>%[-a-zA-Z$._0-9]+|<float [^>]+>)"
+        r"(?P<suffix>,.*)$",
+        re.MULTILINE,
+    )
+    sequence = 0
+
+    def replace_write(match: re.Match[str]) -> str:
+        nonlocal sequence
+        value = match.group("value")
+        write_sequence = sequence
+        sequence += 1
+        lines = []
+        aggregate = "undef"
+        for lane in range(4):
+            extracted = f"%macws.half.write.extract.{write_sequence}.{lane}"
+            clamped = f"%macws.half.write.clamp.{write_sequence}.{lane}"
+            inserted = f"%macws.half.write.value.{write_sequence}.{lane}"
+            lines.append(
+                f"{match.group('indent')}{extracted} = extractelement "
+                f"<4 x float> {value}, i64 {lane}"
+            )
+            lines.append(
+                f"{match.group('indent')}{clamped} = tail call fast float "
+                f"@air.fast_clamp.f32(float {extracted}, "
+                f"float -6.550400e+04, float 6.550400e+04) "
+                f"#{attribute_number}"
+            )
+            lines.append(
+                f"{match.group('indent')}{inserted} = insertelement "
+                f"<4 x float> {aggregate}, float {clamped}, i64 {lane}"
+            )
+            aggregate = inserted
+        write = (
+            f"{match.group('indent')}{match.group('prefix')}{aggregate}"
+            f"{match.group('suffix')}"
+        )
+        lines.append(write)
+        return "\n".join(lines)
+
+    text = pattern.sub(replace_write, text)
+    if sequence == 0:
+        raise ValueError(
+            f"{name}: no float texture write intrinsic for half variant"
+        )
+    if not declaration_present:
+        attribute_description = (
+            clamp_attribute_syntax or "nounwind memory(none)"
+        )
+        declaration = (
+            f"; Function Attrs: {attribute_description}\n"
+            "declare float @air.fast_clamp.f32(float, float, float) "
+            f"local_unnamed_addr #{attribute_number}\n\n"
+        )
+        attributes_offset = text.find("attributes #")
+        if attributes_offset < 0:
+            raise ValueError(f"{name}: AIR attribute table is missing")
+        text = text[:attributes_offset] + declaration + text[attributes_offset:]
+    return text
+
+
 def retarget_air(
     module: bytes,
     name: str,
@@ -606,6 +716,7 @@ def retarget_air(
     lower_fract_v3f16: bool,
     lower_zero_memset: bool,
     auto_lower_known_air: bool,
+    saturate_half_float_writes: bool,
 ) -> tuple[bytes, dict[str, object]]:
     stem = scratch_stem(name)
     source = scratch / f"{stem}.input.air"
@@ -633,6 +744,9 @@ def retarget_air(
         requested_lowerings,
         auto_lower_known_air,
     )
+    if saturate_half_float_writes:
+        text = saturate_half_float_texture_writes(text, name)
+        applied_lowerings.append("half-float-write-saturation")
     assembly.write_text(text, encoding="utf-8")
     subprocess.run([llvm_as, assembly, "-o", output], check=True)
     rebuilt = output.read_bytes()
@@ -700,8 +814,11 @@ def convert(args: argparse.Namespace) -> None:
     if input_target not in {
         (IOS_PLATFORM, IOS_TARGET_OS),
         (MACOS_PLATFORM, MACOS_TARGET_OS),
+        (MACOS_PLATFORM, MACABI_TARGET_OS),
     } and not legacy_unknown_target:
-        raise ValueError("input must be an iOS or macOS executable MTLB")
+        raise ValueError(
+            "input must be an iOS, macOS, or Mac Catalyst executable MTLB"
+        )
     if original[10] != 0:
         raise ValueError("input must be an executable MTLB")
     if (not args.preserve_container_target and
@@ -723,6 +840,9 @@ def convert(args: argparse.Namespace) -> None:
     selected_names = set(args.function or [])
     fract_rewrite_names = set(args.rewrite_fract_v3f16_function or [])
     zero_memset_names = set(args.lower_zero_memset_function or [])
+    half_float_write_names = set(
+        args.saturate_half_float_texture_writes_function or []
+    )
     if args.in_place_air_target:
         if not legacy_unknown_target:
             raise ValueError(
@@ -731,7 +851,7 @@ def convert(args: argparse.Namespace) -> None:
             )
         if (args.preserve_container_target or selected_names or
                 fract_rewrite_names or zero_memset_names or
-                args.auto_lower_known_air):
+                args.auto_lower_known_air or half_float_write_names):
             raise ValueError(
                 "--in-place-air-target cannot be combined with selective "
                 "AIR conversion, semantic lowering, or "
@@ -743,15 +863,21 @@ def convert(args: argparse.Namespace) -> None:
             "--preserve-container-target without --function is accepted only "
             "for the validated legacy 2.3/unknown-target MTLB format"
         )
-    if not fract_rewrite_names.issubset(selected_names):
+    if selected_names and not fract_rewrite_names.issubset(selected_names):
         raise ValueError(
             "--rewrite-fract-v3f16-function must also be selected by "
             "--function"
         )
-    if not zero_memset_names.issubset(selected_names):
+    if selected_names and not zero_memset_names.issubset(selected_names):
         raise ValueError(
             "--lower-zero-memset-function must also be selected by "
             "--function"
+        )
+    if (selected_names and
+            not half_float_write_names.issubset(selected_names)):
+        raise ValueError(
+            "--saturate-half-float-texture-writes-function must also be "
+            "selected by --function"
         )
 
     rebuilt = bytearray(original[:bitcode_offset])
@@ -845,6 +971,7 @@ def convert(args: argparse.Namespace) -> None:
                     str(record["name"]) in fract_rewrite_names,
                     str(record["name"]) in zero_memset_names,
                     args.auto_lower_known_air,
+                    str(record["name"]) in half_float_write_names,
                 )
                 applied = analysis["applied_lowerings"]
                 assert isinstance(applied, list)
@@ -1080,6 +1207,14 @@ def main(argv: list[str] | None = None) -> None:
         help=(
             "within this selected function, lower the exact fixed 24-byte "
             "zero memset to three verified i64 stores"
+        ),
+    )
+    parser.add_argument(
+        "--saturate-half-float-texture-writes-function",
+        action="append",
+        help=(
+            "build a runtime-selectable variant whose float texture writes "
+            "use macOS finite saturation for half-float bindings; repeatable"
         ),
     )
     convert(parser.parse_args(argv))

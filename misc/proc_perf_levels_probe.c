@@ -4,7 +4,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
-#include <libproc.h>
+#include <mach/mach_time.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +15,12 @@
 #define PROC_PIDLISTTHREADIDS 28
 #define PROC_PIDTHREADCOUNTS 34
 #define MAX_THREAD_IDS 4096
+
+// libproc is present on iOS but its public SDK omits libproc.h.  Keep the one
+// stable C entry point used by this read-only probe local instead of importing
+// macOS SDK headers into an iOS translation unit.
+extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer,
+                        int buffersize);
 
 struct perf_count {
     uint64_t instructions;
@@ -59,6 +65,12 @@ int main(int argc, char **argv) {
         perror("sysctl hw.nperflevels");
         return 1;
     }
+    mach_timebase_info_data_t timebase = {0};
+    if (mach_timebase_info(&timebase) != KERN_SUCCESS ||
+        timebase.numer == 0 || timebase.denom == 0) {
+        fprintf(stderr, "mach_timebase_info failed\n");
+        return 1;
+    }
 
     uint64_t *thread_ids = calloc(MAX_THREAD_IDS, sizeof(*thread_ids));
     struct perf_count *totals = calloc(level_count, sizeof(*totals));
@@ -100,8 +112,9 @@ int main(int argc, char **argv) {
     }
 
     printf("process_perf_levels pid=%d listed_threads=%u read_threads=%u "
-           "failed_threads=%u levels=%u\n", pid, listed, read, failed,
-           level_count);
+           "failed_threads=%u levels=%u timebase_numer=%u "
+           "timebase_denom=%u\n", pid, listed, read, failed, level_count,
+           timebase.numer, timebase.denom);
     for (uint32_t level = 0; level < level_count; level++) {
         char key[64] = {0};
         char name[64] = "unknown";

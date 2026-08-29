@@ -118,13 +118,17 @@ env	MACWS_STEAM_SYSVSEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded System 
 env	MACWS_STEAM_PROCESS_DIAGNOSTICS	off	Steam diagnostic	Records exact Valve process-adapter decisions and child argv.
 env	MACWS_STEAM_PROCESS_TRACE_ONLY	off	Steam A/B diagnostic	Observes process launch calls while retaining Valve's implementation.
 env	MACWS_STEAM_SEM_DIAGNOSTICS	off	Steam diagnostic	Records bounded named-semaphore lifecycle and value transitions.
+env	MACWS_STEAM_SEM_TIMING_DIAGNOSTICS	off	Steam diagnostic	Measures real brokered named-semaphore call counts and wall/RPC time without changing any semaphore result or wait behavior.
 env	MACWS_STEAM_CPU_RENDERING	on	Steam download UI	Selects Valve CPU compositing and adds no-SwiftShader/no-GPU-raster/no-zero-copy policies only to the top-level Steam CEF Browser.
 env	MACWS_STEAM_APP_LAUNCH_COMPAT	on	Steam runtime job	When Steam's stock NSWorkspace launch fails for a verified depot app, retries the separately signed runtime shadow with the original activation, argv, and environment contract.
 env	MACWS_STEAM_SEM_CALLER_DIAGNOSTICS	off	Steam diagnostic	Optional semaphore-name substring filter that emits bounded caller images and stacks for the matching real semaphore operations.
 env	MACWS_STEAM_SHM_DIAGNOSTICS	off	Steam diagnostic	Logs bounded Steam shared-memory open/unlink results and object metadata without changing the operation.
 env	MACWS_STEAM_THREAD_DIAGNOSTICS	off	Steam diagnostic	Logs Steam Helper pthread creation results and caller chains.
 env	MACWS_STEAM_UE4_DIAGNOSTICS	off	Stray diagnostic	Installs UUID-bound, read-only UE4 fatal/config snapshots only for an explicitly diagnosed Stray runtime process.
-env	MACWS_STRAY_AGX_COMPAT	off	Stray game	Enables only the runtime-confirmed exact Stray subtype-1/subtype-3 producer-version AGX ABI adapters without enabling synchronous per-submit diagnostics; launch only with SteamAppId 1332010.
+env	MACWS_STRAY_AGX_COMPAT	off	Stray game	Enables the runtime-confirmed exact Stray subtype-1/subtype-3 producer-version AGX ABI adapters and exact-manifest MetalFX macabi function routing without synchronous per-submit diagnostics; the Steam launcher injects it only into Stray-Mac-Shipping.
+env	MACWS_STRAY_TARGET_FPS	54	Stray launched by Steam	Publishes the calibrated synthetic-completion target in the versioned render-activity record; 54 Hz yields about 50 completed UE frames while preventing pointer movement from switching the full game desktop to 120 Hz.
+env	MACWS_STRAY_DISABLE_DISPLAY_SYNC	on	Stray launched by Steam	Exact-process presentation policy: sets the public CAMetalLayer displaySyncEnabled property to NO before calling the original nextDrawable; selected by thermally-valid actual-gameplay A/B, never fabricates a drawable or bypasses validation.
+env	MACWS_CFPREFERENCES_CLIENT	transient	macos_gui defaults probe	Selects the narrow headless CFPreferences client path: installs only the private XPC name mapping and skips GUI/Metal/input hook initialization for the bounded defaults persistence probe.
 env	MACWS_STEAM_VA_DIAGNOSTICS	off	Steam diagnostic	Records only Steam's GiB-scale virtual-memory reservations.
 env	MACWS_STEAM_VOLUME_DIAGNOSTICS	off	Steam diagnostic	Records exact storage-volume property queries used by the Steam bootstrap.
 env	SDL_JOYSTICK_HIDAPI	off	Steam client UI	Disables SDL HIDAPI joystick discovery in the chroot; does not affect macOS input bridging.
@@ -158,6 +162,7 @@ env	MACWS_METAL_PROBE_PIPELINE	off	standalone probe	Continues a precompiled-libr
 env	MACWS_METAL_PROBE_SOURCE_ONLY	off	standalone probe	Skips event creation and GPU submission so a captured MSL library can be replayed in isolation.
 env	MACWS_METAL_PROBE_SOURCE_PATH	off	standalone probe	Compiles Metal source read from the exact requested path.
 env	MACWS_METAL_PROBE_FUNCTION	off	standalone probe	Loads the named function after a source-path probe compile.
+env	MACWS_METAL2METAL_NON_WS_DIAGNOSTIC	off	standalone probe	Installs exact-manifest metal2metal function routing outside WindowServer for a bounded compatibility probe; never ship in an app launch environment.
 env	MACWS_METAL_SOURCE_FORCE_IOS	off	A/B control	Forces an iOS Metal source target.
 env	MACWS_PIN_FALLBACK	on	WindowServer,VS Code,Chrome,GlassDemo	Required native-AGX allocation compatibility path.
 env	MACWS_PIPELINE_FALLBACK	off	temporary scaffold	Unsupported pipeline survival fallback.
@@ -252,6 +257,13 @@ flag	/tmp/macws_owned_scanout	on	WindowServer/VNC	Process-owned linear BGRA scan
 flag	/tmp/macws_owned_unlocked_read	off	unsafe A/B	Reads IOSurface without ownership lock.
 flag	/tmp/macws_pf550_metadata_diag	off	diagnostic	PF550 metadata observer.
 flag	/tmp/macws_pipeline_diag	off	diagnostic	Read-only render-pipeline result and NSError witness.
+flag	/tmp/macws_steam_overlay_spawn_diag	off	Steam diagnostic	Records gameoverlayui spawn argv and selected environment fields without changing launch, process status or Steam retry policy.
+flag	/tmp/macws_stray_disable_display_sync	off	Stray A/B diagnostic	Marker-only control for the same public CAMetalLayer displaySyncEnabled=NO policy shipped through MACWS_STRAY_DISABLE_DISPLAY_SYNC; original nextDrawable remains unchanged.
+flag	/tmp/macws_stray_drawable_timing	off	Stray diagnostic	Times original nextDrawable, drawable presentation and command-buffer completion; installs completion handlers and is excluded from production FPS evidence.
+flag	/tmp/macws_stray_no_overlay_injection	off	Stray A/B diagnostic	Omits only Valve's requested gameoverlayrenderer from the verified Stray child environment to measure overlay cost; intentionally invalidates the required Steam FPS HUD.
+flag	/tmp/macws_stray_present_trace	transient	Stray benchmark	Low-overhead exact-process presentation counter; one atomic increment per frame and one log record per 120 frames, removed after the bounded run.
+flag	/tmp/macws_stray_wait_trace_capture	off	Stray diagnostic	Temporarily captures bounded native callers around the original waitUntilCompleted/surface-lock path without changing results.
+flag	/tmp/macws_stray_wait_trace_install	off	Stray diagnostic	Installs exact-process preserving Metal wait/surface-lock instrumentation for a bounded diagnosis; capture remains separately gated.
 flag	/tmp/macws_probe_small_pf550	off	diagnostic	Small compressed-texture probe.
 flag	/tmp/macws_queue_qos_diag	off	diagnostic	Command-queue QoS trace.
 flag	/tmp/macws_real_swapend	off	unsafe A/B	Lets macOS contend for the physical panel in coexistence.
@@ -280,7 +292,7 @@ flag	/tmp/macws_video_diag	off	diagnostic	Read-only NV12 texture creation-to-fra
 flag	/tmp/macws_vnc_share	on	WindowServer/VNC	Enable shared Retina framebuffer publication.
 flag	/tmp/macws_vnc_test	off	diagnostic	Synthetic VNC gradient.
 flag	/private/tmp/macws_xpc_proxy_trace	off	XPC proxy diagnostic	Logs the real process/service environment for compatibility-service attribution; production startup removes it.
-state	/tmp/macws_coexist_pace_us	on	WindowServer	Production idle completion interval, currently 100000 us.
+state	/tmp/macws_coexist_pace_us	on	WindowServer	Production base completion interval: 100000 us when neither real input nor real Stray presentation activity is current.
 state	/tmp/macws_capture_done	transient	VNC startup	PID and generation acknowledgement for the one-shot frame request.
 state	/tmp/macws_graphics_ready	transient	startup	PID witness written after first clean producer completion.
 state	/var/jb/var/mobile/.macos_gui.transaction	transient	GUI lifecycle transaction	Atomic mkdir lock with exact owner PID; overlapping start, restart, and stop operations return 75, while an ownerless stale lock is recoverable.
@@ -294,8 +306,9 @@ request	/var/mobile/Library/Preferences/com.macwsguide.windowing.resize-request.
 notification	com.macwsguide.windowing.request-fullscreen	transient	MacWSHost to SpringBoard	Wakeup only; authority and exact target are read from the bounded fullscreen request plist.
 notification	com.macwsguide.windowing.request-resize	transient	MacWSHost to SpringBoard	Wakeup only; authority, dimensions and exact target are read from the bounded resize request plist.
 default	NSUseRemoteSavePanel	off	macOS GUI clients	Set in-process so Ventura AppKit uses its native NSLocalOpenPanel/NSLocalSavePanel instead of the unavailable remote ViewBridge service; this does not substitute an iOS picker.
-state	/tmp/macws_vnc_activity	transient	VNC input	Monotonic input timestamp selecting the 16.667 ms interactive interval.
-state	/tmp/macws_interaction_wake.sock	transient	VNC/Host input	WindowServer-owned datagram wakeup for interrupting the current 100 ms idle completion wait; event producers only signal it after publishing macws_vnc_activity.
+state	/tmp/macws_vnc_activity	transient	VNC/Host input	Boot-monotonic input timestamp selecting the 8.333 ms interactive interval for one second.
+state	/tmp/macws_render_activity	transient	Stray presentation	Boot-monotonic timestamp published from real drawable presentation at most 10 Hz; selects the 16.667 ms render interval for one second.
+state	/tmp/macws_interaction_wake.sock	transient	VNC/Host input and Stray presentation	WindowServer-owned datagram wakeup for interrupting the current 100 ms idle completion wait; producers signal it only after publishing the corresponding activity timestamp.
 state	/tmp/macws_vnc_activation_reply.sock	transient	VNC input	Bound OSXvnc acknowledgement endpoint; skips the historical fixed 20 ms wait only when macwsinputd proves the hit target is already active/frontmost.
 state	/tmp/macws_vnc_damage.sock	transient	VNC transport	Damage notification datagram socket.
 state	/tmp/macws_vnc_fb	transient	VNC transport	Retina mmap pixel transport and publication sequence.

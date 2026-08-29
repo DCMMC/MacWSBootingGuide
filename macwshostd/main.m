@@ -14,12 +14,15 @@
 #include <limits.h>
 #include <netdb.h>
 #include <pwd.h>
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/event.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -28,13 +31,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
+#include <mach/mach_time.h>
 #include <mach/task.h>
 
-#include "macws_control_protocol.h"
-#include "macws_host_protocol.h"
-#include "macws_steam_mach_rendezvous_protocol.h"
-#include "macws_steam_semaphore_protocol.h"
-#include "macws_stream_protocol.h"
+// Use the repository's one canonical protocol directory explicitly. Device
+// source sync is deliberately non-destructive, so an old device-only header
+// left beside main.m must never shadow a newly synchronized protocol through
+// quoted-include search order.
+#include "../include/macws_control_protocol.h"
+#include "../include/macws_host_protocol.h"
+#include "../include/macws_steam_mach_rendezvous_protocol.h"
+#include "../include/macws_steam_semaphore_protocol.h"
+#include "../include/macws_stream_protocol.h"
 
 extern char **environ;
 
@@ -50,8 +58,13 @@ extern int posix_spawnattr_setprocesstype_np(posix_spawnattr_t *attr,
 #define MACWS_POSIX_SPAWN_PROC_TYPE_APP_DEFAULT 0x00000100
 
 static const char *const kLogPath = "/var/mobile/Library/Logs/MacWSHostd.log";
+static const char *const kPreviousLogPath =
+    "/var/mobile/Library/Logs/MacWSHostd.log.previous";
+static const off_t kMaximumLogBytes = 16 * 1024 * 1024;
 static const char *const kStartupLogPath =
     "/var/mobile/Library/Logs/MacWSStartup.log";
+static const char *const kDesktopRepairLogPath =
+    "/var/mobile/Library/Logs/MacWSDesktopRepair.log";
 static const char *const kGUIStartState =
     "/var/jb/var/mobile/macos_gui_start.state";
 static const char *const kPostinstLog = "/var/jb/var/mobile/postinst.log";
@@ -63,6 +76,10 @@ static const char *const kKillall = "/var/jb/usr/bin/killall";
 static const char *const kChrootExec = "/var/jb/usr/macOS/bin/launchdchrootexec";
 static const char *const kWorkspaceCtl = "/usr/local/bin/macwsworkspacectl";
 static const char *const kPostinst = "/var/jb/usr/macOS/bin/postinst.sh";
+static const char *const kSettingsExtensionsRuntime =
+    "/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh";
+static const char *const kSettingsExtensionsRuntimeLog =
+    "/var/jb/var/mobile/settings-extensions-runtime.log";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 static const char *const kShareFlag = "/var/mnt/rootfs/private/tmp/macws_vnc_share";
@@ -78,6 +95,7 @@ static const char *const kInputLabel =
     "UIKitApplication:com.macwsguide.input";
 static const char *const kDisplayLabel =
     "UIKitApplication:com.macwsguide.display";
+static const char *const kDockLabel = "com.macwsguide.dock";
 static const char *const kVSCodeLabel =
     "UIKitApplication:com.macwsguide.vscode";
 static const char *const kVSCodePlist =
@@ -132,27 +150,60 @@ static const char *const kAsphaltContainerHome =
     "/Users/mobile/Library/Containers/com.gameloft.asphalt9mac/Data";
 static const char *const kCatalystRequestPath =
     "/var/jb/var/mobile/macws-catalyst-launch-request.plist";
-static const char *const kSteamLabel = "com.macwsguide.steam";
+static const char *const kSteamLabel =
+    "UIKitApplication:com.macwsguide.steam";
 static const char *const kSteamPlist =
     "/var/jb/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist";
 static const char *const kSteamOuterExecutable =
     "/Applications/Steam.app/Contents/MacOS/steam_osx";
 static const char *const kSteamLiveExecutable =
     "/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/steam_osx";
+static const char *const kSteamUIExecutable =
+    "/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/Frameworks/Steam Helper.app/Contents/MacOS/Steam Helper";
+static const char *const kSteamOverlayExecutable =
+    "/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/gameoverlayui";
+static const char *const kStrayExecutable =
+    "/Users/root/Library/Application Support/Steam/steamapps/macws-runtime/Stray/Stray.app/Contents/MacOS/Stray-Mac-Shipping";
+static const char *const kMetalCompatWorkingDirectory =
+    "/var/jb/var/mobile/macws-metal-compat";
+static const char *const kMetalCompatExactDirectory =
+    "/var/mnt/rootfs/usr/local/share/macws/stray/exact";
+static const char *const kMetalCompatConverter =
+    "/var/jb/usr/macOS/bin/repack_metallib_macabi.py";
+static const char *const kMetalCompatInstaller =
+    "/var/jb/usr/macOS/bin/install_stray_exact_metallib.py";
+static const char *const kProcursusPython = "/var/jb/usr/bin/python3";
+static const char *const kLLVM16Dis =
+    "/var/jb/usr/lib/llvm-16/bin/llvm-dis";
+static const char *const kLLVM16As =
+    "/var/jb/usr/lib/llvm-16/bin/llvm-as";
+static const char *const kMetalCompatLog =
+    "/var/jb/var/mobile/macws-metal-compat.log";
+static const char *const kMetalCompatProbeExecutable =
+    "/var/jb/usr/macOS/bin/macws_control_probe";
 static CFStringRef const kMapsHostLaunchNotification =
     CFSTR("com.macwsguide.host.launch-maps");
 static CFStringRef const kCatalystHostLaunchNotification =
     CFSTR("com.macwsguide.host.launch-catalyst");
 static pid_t WaitForRunningRootExecutable(NSString *rootPath,
                                           NSTimeInterval timeout);
+static pid_t FindRunningSteamExecutable(void);
+static BOOL SteamPIDMatchesProductionJob(pid_t pid, NSString *actualPath);
+static void TrackApplicationSession(NSString *identifier,
+                                    NSString *rootPath, pid_t pid);
+static void ApplicationSessionObservedExit(pid_t pid, NSString *identifier,
+                                           NSString *witness);
+static void StartApplicationSessionSupervisor(void);
 
 static dispatch_queue_t gControlQueue;
 static dispatch_queue_t gLogQueue;
 static dispatch_queue_t gSteamSemaphoreQueue;
 static dispatch_queue_t gSteamMachRendezvousQueue;
+static dispatch_queue_t gMetalCompatQueue;
 static dispatch_source_t gSteamSemaphoreWaitListener;
 static int gSteamSemaphoreWaitListenerDescriptor = -1;
 static os_unfair_lock gStateLock = OS_UNFAIR_LOCK_INIT;
+static os_unfair_lock gStatusJobsLock = OS_UNFAIR_LOCK_INIT;
 static BOOL gBusy;
 static NSString *gPhase = @"就绪";
 static NSString *gLastError = @"";
@@ -161,12 +212,35 @@ static BOOL gStartupRetryAvailable;
 static time_t gStartupBeganAt;
 static pid_t gActiveAppPID;
 static NSString *gActiveAppID = @"";
+// All application entry points (Control Center, Dock and direct AppKit
+// relaunch) converge on this process-identity table.  It is deliberately
+// owned by gControlQueue so launch, exit, Dock convergence and orphan cleanup
+// form one serialized session transaction instead of racing independent
+// one-shot repairs.
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *gApplicationSessions;
+static dispatch_source_t gApplicationSupervisorTimer;
+static uint64_t gDockConvergenceGeneration;
+static pid_t gObservedOrphanOverlayPID;
+static CFAbsoluteTime gObservedOrphanOverlaySince;
+// Steam's overlay is discovered while a Steam session is live and then
+// followed by exact PID/path identity.  Do not rescan every process once per
+// second after Steam has exited: on-device sampling showed that the old idle
+// supervisor spent most of its runnable time in that global scan.
+static pid_t gKnownSteamOverlayPID;
+static pid_t gKnownStrayPID;
+static BOOL gSteamProcessDiscoveryPrimed;
+static BOOL gSteamOwnerWasPresent;
+static CFAbsoluteTime gNextSteamProcessDiscovery;
 
 typedef struct {
     uint64_t generation;
     uint32_t references;
     uint32_t value;
     BOOL unlinked;
+    // Retained for the complete POSIX generation, including after unlink.
+    // Protocol v23 makes this vnode the counter authority shared with the
+    // chroot clients; entry->value is only a synchronized log/reply mirror.
+    int stateDescriptor;
     char name[112];
     mach_port_t waiterPorts[32];
     uint32_t waiterCount;
@@ -182,7 +256,7 @@ typedef struct {
 static NSMutableDictionary<NSString *, NSValue *> *gSteamSemaphoreNames;
 static NSMutableDictionary<NSString *, NSNumber *> *gSteamMachRendezvousPorts;
 static NSMutableDictionary<NSNumber *, NSValue *> *gSteamSemaphoreGenerations;
-// name -> generation returned by the latest successful unlink. A protocol-v21
+// name -> generation returned by the latest successful unlink. A protocol-v23
 // recreate must present that exact receipt before it may retire a name won by
 // a racing opener. This keeps ordinary O_CREAT|O_EXCL strict.
 static NSMutableDictionary<NSString *, NSNumber *> *
@@ -192,19 +266,43 @@ static NSString *gSteamSemaphoreEpoch;
 
 static void HostLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void HostLog(NSString *format, ...) {
+    // HostLog is already the daemon's authoritative timestamped persistent
+    // channel. Mirroring every Steam semaphore/rendezvous event through
+    // NSLog wrote the same stream into launchd's stderr file as well; runtime
+    // on 2026-08-28 found 230 MB and 173 MB copies with matching tail lines.
+    // Keep framework/uncaught diagnostics on launchd stderr, but do not send
+    // this deliberately high-rate application log there a second time.
     va_list args;
     va_start(args, format);
     NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
     va_end(args);
-    NSLog(@"%@", message);
     dispatch_async(gLogQueue ?: dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         @autoreleasepool {
-            int fd = open(kLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-            if (fd < 0) return;
+            static off_t logBytes = 0;
+            static BOOL logBytesKnown = NO;
             NSString *line = [NSString stringWithFormat:@"%.3f %@\n",
                               NSDate.date.timeIntervalSince1970, message];
             NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
-            (void)write(fd, data.bytes, data.length);
+            if (!logBytesKnown) {
+                struct stat status = {0};
+                if (stat(kLogPath, &status) == 0 && status.st_size > 0) {
+                    logBytes = status.st_size;
+                }
+                logBytesKnown = YES;
+            }
+            if (logBytes >= kMaximumLogBytes ||
+                data.length > (NSUInteger)(kMaximumLogBytes - logBytes)) {
+                (void)unlink(kPreviousLogPath);
+                if (rename(kLogPath, kPreviousLogPath) == 0 ||
+                    errno == ENOENT) {
+                    logBytes = 0;
+                }
+            }
+            int fd = open(kLogPath,
+                          O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (fd < 0) return;
+            ssize_t written = write(fd, data.bytes, data.length);
+            if (written > 0) logBytes += written;
             close(fd);
         }
     });
@@ -609,6 +707,72 @@ static BOOL JobHasPID(const char *label, int *pidOut) {
     return InspectJob(label, pidOut, NULL);
 }
 
+// AddStatus is the UI's polling hot path.  Do not synthesize one logical
+// status reply from several independently spawned `launchctl list <label>`
+// commands: on the production iPad that accumulated 27,152 hostd forks, and
+// a 2026-08-27 live witness had all three calls report false while one
+// `launchctl list` snapshot contained WindowServer=49273, input=49266 and
+// Dock=63979.  Read the launchd namespace once so the reply is coherent.  A
+// failed snapshot may reuse only a recent PID which the kernel still reports
+// alive; a successful snapshot, including an absent job, always replaces the
+// cache immediately.
+static void InspectStatusJobs(int *windowServerPIDOut,
+                              int *inputPIDOut,
+                              int *dockPIDOut) {
+    const char *argv[] = {kLaunchctl, "list", NULL};
+    NSString *output = CaptureCommand(argv, 32768);
+    int windowServerPID = 0;
+    int inputPID = 0;
+    int dockPID = 0;
+    NSUInteger parsedRows = 0;
+    for (NSString *line in [output componentsSeparatedByCharactersInSet:
+             NSCharacterSet.newlineCharacterSet]) {
+        NSArray<NSString *> *columns = [line componentsSeparatedByString:@"\t"];
+        if (columns.count < 3) continue;
+        NSInteger pid = columns[0].integerValue;
+        if (pid <= 1) continue;
+        parsedRows++;
+        NSString *label = columns[2];
+        if ([label isEqualToString:@(kWindowServerLabel)])
+            windowServerPID = (int)pid;
+        else if ([label isEqualToString:@(kInputLabel)])
+            inputPID = (int)pid;
+        else if ([label isEqualToString:@(kDockLabel)])
+            dockPID = (int)pid;
+    }
+
+    NSTimeInterval now = NSDate.timeIntervalSinceReferenceDate;
+    static int cachedWindowServerPID = 0;
+    static int cachedInputPID = 0;
+    static int cachedDockPID = 0;
+    static NSTimeInterval cachedAt = 0;
+    os_unfair_lock_lock(&gStatusJobsLock);
+    if (parsedRows != 0) {
+        cachedWindowServerPID = windowServerPID;
+        cachedInputPID = inputPID;
+        cachedDockPID = dockPID;
+        cachedAt = now;
+    } else if (cachedAt != 0 && now - cachedAt <= 5.0) {
+        windowServerPID = cachedWindowServerPID;
+        inputPID = cachedInputPID;
+        dockPID = cachedDockPID;
+    }
+    os_unfair_lock_unlock(&gStatusJobsLock);
+
+    // The fallback is only a short transport-failure grace period.  It cannot
+    // turn a dead cached job into a positive status witness.
+    if (windowServerPID > 1 && kill(windowServerPID, 0) != 0)
+        windowServerPID = 0;
+    if (inputPID > 1 && kill(inputPID, 0) != 0)
+        inputPID = 0;
+    if (dockPID > 1 && kill(dockPID, 0) != 0)
+        dockPID = 0;
+
+    if (windowServerPIDOut) *windowServerPIDOut = windowServerPID;
+    if (inputPIDOut) *inputPIDOut = inputPID;
+    if (dockPIDOut) *dockPIDOut = dockPID;
+}
+
 static BOOL WaitForJobPID(const char *label, NSTimeInterval timeout,
                           int *pidOut) {
     int pid = 0;
@@ -625,9 +789,64 @@ static BOOL WaitForJobPID(const char *label, NSTimeInterval timeout,
 }
 
 static BOOL RootFSReady(void) {
-    return access("/var/mnt/rootfs/bin/bash", X_OK) == 0 &&
-           access("/var/mnt/rootfs/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer", X_OK) == 0 &&
-           access(kGUI, R_OK) == 0 && access(kChrootExec, X_OK) == 0;
+    static const char *const paths[] = {
+        "/var/mnt/rootfs/bin/bash",
+        "/var/mnt/rootfs/System/Library/PrivateFrameworks/"
+            "SkyLight.framework/Resources/WindowServer",
+        kGUI,
+        kChrootExec,
+    };
+    static const int modes[] = {X_OK, X_OK, R_OK, X_OK};
+    static const BOOL chrootExecutables[] = {YES, YES, NO, NO};
+    int errors[sizeof(paths) / sizeof(paths[0])] = {0};
+    uint32_t readyMask = 0;
+    for (NSUInteger index = 0;
+         index < sizeof(paths) / sizeof(paths[0]); index++) {
+        errno = 0;
+        if (chrootExecutables[index]) {
+            // These macOS binaries are executed by launchdchrootexec after it
+            // changes root, not by this iOS daemon.  iOS MAC policy can make
+            // access(X_OK) report EPERM for the hostd security principal even
+            // while the real chroot launcher executes the same vnode.  Check
+            // the invariant hostd actually owns here: the mounted vnode must
+            // be reachable, regular, and carry an executable mode bit.  The
+            // subsequent startup path still executes it and waits for the
+            // real WindowServer/input/display endpoints before declaring the
+            // workspace ready.
+            struct stat status = {0};
+            if (stat(paths[index], &status) == 0 &&
+                S_ISREG(status.st_mode) &&
+                (status.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0) {
+                readyMask |= 1u << index;
+            } else {
+                errors[index] = errno ?: EACCES;
+            }
+        } else if (access(paths[index], modes[index]) == 0) {
+            readyMask |= 1u << index;
+        } else {
+            errors[index] = errno;
+        }
+    }
+
+    // Keep one transition witness for the daemon's own filesystem view. This
+    // is intentionally not a bypass: the UI must stay disabled when the
+    // launcher itself cannot prove the files are reachable, but the exact
+    // errno is required to distinguish a missing mount from a process-policy
+    // failure. AddStatus polls frequently, so log only when the result changes.
+    static uint64_t previousSignature = UINT64_MAX;
+    uint64_t signature = readyMask;
+    for (NSUInteger index = 0;
+         index < sizeof(errors) / sizeof(errors[0]); index++) {
+        signature = (signature * 1315423911u) ^ (uint32_t)errors[index];
+    }
+    if (signature != previousSignature) {
+        previousSignature = signature;
+        HostLog(@"rootfs-probe ready=%@ mask=%#x "
+                "bash-errno=%d ws-errno=%d gui-errno=%d exec-errno=%d",
+                readyMask == 0xf ? @"YES" : @"NO", readyMask,
+                errors[0], errors[1], errors[2], errors[3]);
+    }
+    return readyMask == 0xf;
 }
 
 static BOOL ReadFrame(uint32_t *width, uint32_t *height) {
@@ -758,9 +977,13 @@ static NSString *StartupLogText(time_t startupBeganAt,
 
 static void AddStatus(xpc_object_t reply) {
     int wsPID = 0;
-    BOOL ws = JobHasPID(kWindowServerLabel, &wsPID);
     int inputPID = 0;
-    BOOL inputJob = JobHasPID(kInputLabel, &inputPID);
+    int systemInputPID = 0;
+    InspectStatusJobs(&wsPID, &inputPID, &systemInputPID);
+    BOOL ws = wsPID > 1;
+    BOOL inputJob = inputPID > 1;
+    BOOL systemInputReady = systemInputPID > 1 &&
+        IsAppInputSocket(systemInputPID);
     uint32_t width = 0, height = 0;
     uint64_t frameGeneration = 0;
     BOOL frame = ws && ReadFrame(&width, &height) &&
@@ -814,6 +1037,10 @@ static void AddStatus(xpc_object_t reply) {
     xpc_dictionary_set_int64(reply, "windowserver_pid", wsPID);
     xpc_dictionary_set_bool(reply, "input_running", inputJob && IsSocket(kInputSocket));
     xpc_dictionary_set_int64(reply, "input_pid", inputPID);
+    xpc_dictionary_set_bool(reply, MACWS_CONTROL_KEY_SYSTEM_INPUT_READY,
+                            systemInputReady);
+    xpc_dictionary_set_int64(reply, MACWS_CONTROL_KEY_SYSTEM_INPUT_PID,
+                             systemInputReady ? systemInputPID : 0);
     xpc_dictionary_set_int64(reply, "active_app_pid", activeAppPID);
     SetString(reply, "active_app_id", activeAppID);
     xpc_dictionary_set_bool(reply, "app_input_ready",
@@ -1078,6 +1305,14 @@ static BOOL StopGUI(NSString **message) {
     gActiveAppPID = 0;
     gActiveAppID = @"";
     os_unfair_lock_unlock(&gStateLock);
+    [gApplicationSessions removeAllObjects];
+    gObservedOrphanOverlayPID = 0;
+    gObservedOrphanOverlaySince = 0;
+    gKnownSteamOverlayPID = 0;
+    gKnownStrayPID = 0;
+    gSteamProcessDiscoveryPrimed = NO;
+    gSteamOwnerWasPresent = NO;
+    gNextSteamProcessDiscovery = 0;
     RemovePath(kFrame);
     RemovePath(kShareFlag);
     RemovePath(kCaptureFlag);
@@ -1240,12 +1475,11 @@ static void BeginApplicationChildReaper(pid_t pid, NSString *identifier) {
                     : [NSString stringWithFormat:@"status-%d", status]);
             HostLog(@"launch-app reaped id=%@ pid=%d result=%@",
                     identifierCopy, pid, result);
-            os_unfair_lock_lock(&gStateLock);
-            if (gActiveAppPID == pid) {
-                gActiveAppPID = 0;
-                gActiveAppID = @"";
-            }
-            os_unfair_lock_unlock(&gStateLock);
+            dispatch_async(gControlQueue, ^{
+                ApplicationSessionObservedExit(
+                    pid, identifierCopy,
+                    [@"waitpid:" stringByAppendingString:result]);
+            });
         } else if (errno != ECHILD) {
             HostLog(@"launch-app reap-failed id=%@ pid=%d errno=%d (%s)",
                     identifierCopy, pid, errno, strerror(errno));
@@ -1514,9 +1748,11 @@ static BOOL ReadVSCodeHealthMarker(pid_t *pidOut, off_t *logOffsetOut) {
     return YES;
 }
 
-static BOOL VSCodeLogContainsUnresponsiveAfter(off_t startOffset) {
-    static const char needle[] = "CodeWindow: detected unresponsive";
-    const NSUInteger overlap = sizeof(needle) - 2;
+static BOOL VSCodeLogContainsNeedleAfter(off_t startOffset,
+                                         const char *needle) {
+    if (!needle || !*needle) return NO;
+    const NSUInteger needleLength = strlen(needle);
+    const NSUInteger overlap = needleLength > 0 ? needleLength - 1 : 0;
     int fd = open(kVSCodeLog, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return NO;
     struct stat st = {0};
@@ -1528,7 +1764,7 @@ static BOOL VSCodeLogContainsUnresponsiveAfter(off_t startOffset) {
         close(fd);
         return NO;
     }
-    NSData *needleData = [NSData dataWithBytes:needle length:sizeof(needle) - 1];
+    NSData *needleData = [NSData dataWithBytes:needle length:needleLength];
     NSMutableData *window = [NSMutableData data];
     uint8_t buffer[32768];
     for (;;) {
@@ -1554,6 +1790,17 @@ static BOOL VSCodeLogContainsUnresponsiveAfter(off_t startOffset) {
     }
     close(fd);
     return NO;
+}
+
+static BOOL VSCodeLogContainsUnresponsiveAfter(off_t startOffset) {
+    return VSCodeLogContainsNeedleAfter(
+        startOffset, "CodeWindow: detected unresponsive");
+}
+
+static BOOL VSCodeLogContainsCommandBufferFailureAfter(off_t startOffset) {
+    return VSCodeLogContainsNeedleAfter(
+        startOffset, "Completed MTLCommandBuffer failed, and error is "
+                     "Internal Error");
 }
 
 // Return an already-running instance of this exact chroot executable. App
@@ -1671,6 +1918,382 @@ static BOOL RefreshDockAfterProcessExit(pid_t targetPID, NSString **message) {
             targetPID, oldDockPID, newDockPID);
     *message = @"应用已退出，Dock 运行状态已重建";
     return YES;
+}
+
+static NSString *RootExecutablePathForPID(pid_t pid) {
+    if (pid <= 1) return nil;
+    typedef int (*MacWSProcPIDPath)(int, void *, uint32_t);
+    static MacWSProcPIDPath procPIDPath;
+    static dispatch_once_t procOnce;
+    dispatch_once(&procOnce, ^{
+        procPIDPath = (MacWSProcPIDPath)dlsym(
+            RTLD_DEFAULT, "proc_pidpath");
+    });
+    if (!procPIDPath) return nil;
+    char processPath[PATH_MAX] = {0};
+    if (procPIDPath(pid, processPath, sizeof(processPath)) <= 0) return nil;
+    NSString *path = [NSString stringWithUTF8String:processPath];
+    // proc_pidpath() canonicalizes the bind-mounted macOS root differently
+    // across iOS vnode generations. Runtime-confirmed on 2026-08-22: the
+    // VS Code PID 61312 resolved through `/private/var/mnt/rootfs/...`, while
+    // the supervisor had stored `/Applications/...`; treating those as two
+    // identities produced a false exit one second after a healthy launch.
+    // Strip either spelling before comparing the executable identity.
+    static NSArray<NSString *> *hostRoots;
+    static dispatch_once_t rootsOnce;
+    dispatch_once(&rootsOnce, ^{
+        hostRoots = @[@"/private/var/mnt/rootfs", @"/var/mnt/rootfs"];
+    });
+    for (NSString *hostRoot in hostRoots) {
+        if (![path hasPrefix:[hostRoot stringByAppendingString:@"/"]])
+            continue;
+        path = [path substringFromIndex:hostRoot.length];
+        break;
+    }
+    // Runtime-confirmed by MacWSHostd.log at 1787515957.282: a rootless
+    // native executable launched through `/var/jb/usr/...` is reported by
+    // proc_pidpath as
+    // `/private/preboot/<hash>/dopamine-*/procursus/usr/...`.  Normalize the
+    // real rootless mount to its stable public alias before applying exact
+    // executable allowlists.  Require both the private-preboot root and the
+    // `/procursus/` component so an unrelated path containing that word
+    // cannot acquire a native-service identity.
+    if ([path hasPrefix:@"/private/preboot/"]) {
+        NSRange procursus = [path rangeOfString:@"/procursus/"];
+        if (procursus.location != NSNotFound) {
+            NSString *suffix = [path substringFromIndex:
+                NSMaxRange(procursus) - 1];
+            path = [@"/var/jb" stringByAppendingString:suffix];
+        }
+    }
+    return path;
+}
+
+// Steam is one user-visible application session split across processes:
+// steam_osx owns the launchd job and lifetime, while its direct, argument-free
+// Steam Helper child owns the AppKit window and AppInputBridge endpoint.  Do
+// not scan by process name: CEF renderer/GPU helpers have the same executable,
+// and a helper left by a different Steam generation must not satisfy launch.
+static pid_t FindSteamUIProcess(pid_t steamPID, BOOL requireVisibleWindow) {
+    if (steamPID <= 1) return 0;
+    typedef int (*MacWSProcListChildPIDs)(pid_t, void *, int);
+    static MacWSProcListChildPIDs procListChildPIDs;
+    static dispatch_once_t procOnce;
+    dispatch_once(&procOnce, ^{
+        procListChildPIDs = (MacWSProcListChildPIDs)dlsym(
+            RTLD_DEFAULT, "proc_listchildpids");
+    });
+    if (!procListChildPIDs) return 0;
+
+    pid_t children[512] = {0};
+    // Runtime-confirmed on iPadOS 16.3 on 2026-08-22: for Steam PID 22860,
+    // proc_listchildpids returned 36 PID entries (not a byte count), including
+    // direct UI owner 23268.  A fixed, bounded buffer avoids the API's NULL
+    // sizing result, which describes global capacity rather than this parent.
+    int count = procListChildPIDs(
+        steamPID, children, (int)sizeof(children));
+    if (count <= 0) return 0;
+    count = MIN(count, (int)(sizeof(children) / sizeof(children[0])));
+    for (int index = 0; index < count; index++) {
+        pid_t child = children[index];
+        if (child <= 1) continue;
+        NSString *path = RootExecutablePathForPID(child);
+        if (![path isEqualToString:@(kSteamUIExecutable)]) continue;
+        errno = 0;
+        if (kill(child, 0) != 0 && errno == ESRCH) continue;
+        if (!requireVisibleWindow) return child;
+        int exitStatus = -1;
+        if (WaitForWindowMetrics(child, 0.11, &exitStatus)) return child;
+    }
+    return 0;
+}
+
+static pid_t WaitForSteamUIProcess(pid_t steamPID, NSTimeInterval timeout) {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (deadline.timeIntervalSinceNow > 0) {
+        pid_t owner = FindSteamUIProcess(steamPID, YES);
+        if (owner > 1) return owner;
+        errno = 0;
+        if (kill(steamPID, 0) != 0 && errno == ESRCH) return 0;
+        usleep(100000);
+    }
+    return 0;
+}
+
+static NSString *ApplicationSessionIdentifierForPath(NSString *rootPath) {
+    if (!rootPath.length) return @"app";
+    if ([rootPath isEqualToString:@(kVSCodeExecutable)] ||
+        [rootPath isEqualToString:@(kVSCodeBundleExecutable)]) return @"vscode";
+    if ([rootPath isEqualToString:@(kSteamOuterExecutable)] ||
+        [rootPath isEqualToString:@(kSteamLiveExecutable)]) return @"steam";
+    if ([rootPath isEqualToString:@(kMapsExecutable)]) return @"maps";
+    if ([rootPath isEqualToString:@(kWeatherExecutable)]) return @"weather";
+    if ([rootPath isEqualToString:@(kAsphaltExecutable)]) return @"asphalt";
+    for (NSUInteger index = 0;
+         index < sizeof(kAllowedApps) / sizeof(kAllowedApps[0]); index++) {
+        if ([rootPath isEqualToString:@(kAllowedApps[index].rootPath)])
+            return @(kAllowedApps[index].identifier);
+    }
+    return rootPath.lastPathComponent.length
+        ? rootPath.lastPathComponent : @"app";
+}
+
+static NSString *ApplicationSessionKey(NSString *identifier,
+                                       NSString *rootPath) {
+    return [NSString stringWithFormat:@"%@|%@", identifier ?: @"app",
+                                      rootPath ?: @""];
+}
+
+// Track the concrete process that owns one user-visible application session.
+// Process identity is always the resolved executable path plus PID; a Dock
+// label, p_comm string or a stale LaunchServices record is never accepted as
+// proof that the session is reusable.
+static void TrackApplicationSession(NSString *identifier,
+                                    NSString *rootPath, pid_t pid) {
+    if (pid <= 1 || !rootPath.length || !gApplicationSessions) return;
+    NSString *resolvedIdentifier = identifier.length
+        ? identifier : ApplicationSessionIdentifierForPath(rootPath);
+    NSString *key = ApplicationSessionKey(resolvedIdentifier, rootPath);
+    NSNumber *oldPID = gApplicationSessions[key][@"pid"];
+    gApplicationSessions[key] = [@{
+        @"identifier": resolvedIdentifier,
+        @"rootPath": rootPath,
+        @"pid": @(pid),
+    } mutableCopy];
+    if (oldPID.intValue != pid) {
+        HostLog(@"app-session track id=%@ pid=%d executable=%@ previous=%d",
+                resolvedIdentifier, pid, rootPath, oldPID.intValue);
+    }
+    if ([resolvedIdentifier isEqualToString:@"steam"] ||
+        [resolvedIdentifier isEqualToString:@"stray"] ||
+        [rootPath isEqualToString:@(kStrayExecutable)]) {
+        // A newly tracked owner starts one bounded discovery cycle so the
+        // exact overlay/game PIDs can subsequently be followed without a
+        // process-table scan on every supervisor tick.
+        gNextSteamProcessDiscovery = 0;
+    }
+}
+
+static void ScheduleDockConvergenceAfterExit(pid_t targetPID,
+                                             NSString *identifier) {
+    if (targetPID <= 1) return;
+    uint64_t generation = ++gDockConvergenceGeneration;
+    NSString *identifierCopy = [identifier copy] ?: @"app";
+    // A single application can retire several tracked entry points during one
+    // quit. Debounce that cluster so Dock rebuilds its LS-derived state once.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC),
+                   gControlQueue, ^{
+        if (generation != gDockConvergenceGeneration) return;
+        // An exact app replacement can become ready before the retired PID's
+        // delayed Dock convergence fires. Runtime-confirmed on 2026-08-22:
+        // Steam PID 29644 and UI owner 30049 were already visible when the
+        // old PID 22860 transaction restarted Dock 20533. That unnecessary
+        // restart races the fresh LaunchServices registration and is itself a
+        // source of missing tiles/glass. A live replacement owns convergence;
+        // only a session with no replacement requires a Dock state rebuild.
+        for (NSDictionary *session in gApplicationSessions.allValues) {
+            if (![session[@"identifier"] isEqualToString:identifierCopy] ||
+                [session[@"pid"] intValue] == targetPID) continue;
+            HostLog(@"app-session dock-converge id=%@ target=%d "
+                    "result=skipped reason=replacement-live replacement=%d",
+                    identifierCopy, targetPID,
+                    [session[@"pid"] intValue]);
+            return;
+        }
+        NSString *message = nil;
+        BOOL refreshed = RefreshDockAfterProcessExit(targetPID, &message);
+        HostLog(@"app-session dock-converge id=%@ target=%d result=%@ "
+                "message=%@", identifierCopy, targetPID,
+                refreshed ? @"ready" : @"failed", message ?: @"");
+    });
+}
+
+static void ApplicationSessionObservedExit(pid_t pid, NSString *identifier,
+                                           NSString *witness) {
+    if (pid <= 1) return;
+    BOOL removed = NO;
+    NSString *resolvedIdentifier = identifier.length ? identifier : @"app";
+    for (NSString *key in [gApplicationSessions.allKeys copy]) {
+        NSDictionary *session = gApplicationSessions[key];
+        if ([session[@"pid"] intValue] != pid) continue;
+        if (!identifier.length)
+            resolvedIdentifier = session[@"identifier"] ?: @"app";
+        [gApplicationSessions removeObjectForKey:key];
+        removed = YES;
+    }
+    os_unfair_lock_lock(&gStateLock);
+    if (gActiveAppPID == pid) {
+        gActiveAppPID = 0;
+        gActiveAppID = @"";
+        removed = YES;
+    }
+    os_unfair_lock_unlock(&gStateLock);
+    if (!removed) return;
+    HostLog(@"app-session exit id=%@ pid=%d witness=%@",
+            resolvedIdentifier, pid, witness ?: @"process-absent");
+    ScheduleDockConvergenceAfterExit(pid, resolvedIdentifier);
+}
+
+static BOOL ApplicationSessionPIDMatchesPath(pid_t pid, NSString *rootPath,
+                                             NSString *identifier) {
+    errno = 0;
+    if (kill(pid, 0) != 0 && errno == ESRCH) return NO;
+    NSString *actualPath = RootExecutablePathForPID(pid);
+    if (!actualPath.length) return errno == EPERM;
+    if ([identifier isEqualToString:@"steam"])
+        return [actualPath isEqualToString:@(kSteamOuterExecutable)] ||
+               [actualPath isEqualToString:@(kSteamLiveExecutable)] ||
+               SteamPIDMatchesProductionJob(pid, actualPath);
+    return [actualPath isEqualToString:rootPath];
+}
+
+static void RetireConfirmedSteamOverlayOrphan(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    pid_t steamPID = 0;
+    for (NSDictionary *session in gApplicationSessions.allValues) {
+        NSString *identifier = session[@"identifier"] ?: @"";
+        NSString *rootPath = session[@"rootPath"] ?: @"";
+        if ([identifier isEqualToString:@"steam"]) {
+            steamPID = (pid_t)[session[@"pid"] intValue];
+            break;
+        }
+        if ([identifier isEqualToString:@"stray"] ||
+            [rootPath isEqualToString:@(kStrayExecutable)])
+            gKnownStrayPID = (pid_t)[session[@"pid"] intValue];
+    }
+
+    if (gKnownSteamOverlayPID > 1 &&
+        !ApplicationSessionPIDMatchesPath(
+            gKnownSteamOverlayPID, @(kSteamOverlayExecutable), @"overlay"))
+        gKnownSteamOverlayPID = 0;
+    if (gKnownStrayPID > 1 &&
+        !ApplicationSessionPIDMatchesPath(
+            gKnownStrayPID, @(kStrayExecutable), @"stray"))
+        gKnownStrayPID = 0;
+
+    BOOL trackedOwnerPresent = steamPID > 1 || gKnownStrayPID > 1;
+    BOOL transitionNeedsDiscovery =
+        gSteamOwnerWasPresent && !trackedOwnerPresent;
+    BOOL discoveryDue = !gSteamProcessDiscoveryPrimed ||
+        transitionNeedsDiscovery ||
+        (steamPID > 1 && now >= gNextSteamProcessDiscovery);
+    if (discoveryDue) {
+        // These are the only full process-table walks in this lifecycle.  One
+        // runs when hostd starts, one every five seconds while Steam is live,
+        // and one when its tracked owner disappears so a still-live Stray is
+        // not mistaken for an orphaned overlay owner.
+        gKnownSteamOverlayPID =
+            FindRunningRootExecutable(@(kSteamOverlayExecutable));
+        gKnownStrayPID = FindRunningRootExecutable(@(kStrayExecutable));
+        gSteamProcessDiscoveryPrimed = YES;
+        gNextSteamProcessDiscovery = now + 5.0;
+        trackedOwnerPresent = steamPID > 1 || gKnownStrayPID > 1;
+    }
+    gSteamOwnerWasPresent = trackedOwnerPresent;
+
+    pid_t overlayPID = gKnownSteamOverlayPID;
+    pid_t strayPID = gKnownStrayPID;
+    if (overlayPID <= 1 || steamPID > 1 || strayPID > 1) {
+        gObservedOrphanOverlayPID = 0;
+        gObservedOrphanOverlaySince = 0;
+        return;
+    }
+    if (gObservedOrphanOverlayPID != overlayPID) {
+        gObservedOrphanOverlayPID = overlayPID;
+        gObservedOrphanOverlaySince = now;
+        HostLog(@"app-session orphan-observed id=steam-overlay pid=%d "
+                "owners=absent grace=2s", overlayPID);
+        return;
+    }
+    if (now - gObservedOrphanOverlaySince < 2.0) return;
+
+    // Runtime-confirmed on 2026-08-22: overlay PID 11489 survived both Stray
+    // PID 11479 and Steam PID 5656, was reparented to launchd, consumed ~44%%
+    // CPU and ignored SIGTERM.  Only the exact installed overlay executable
+    // reaches this path, and both of its legitimate owners must remain absent
+    // for a complete grace interval before the bounded TERM/KILL transaction.
+    HostLog(@"app-session orphan-retire id=steam-overlay pid=%d signal=TERM",
+            overlayPID);
+    if (kill(overlayPID, SIGTERM) != 0 && errno != ESRCH) return;
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:0.4];
+    while (deadline.timeIntervalSinceNow > 0) {
+        errno = 0;
+        if (kill(overlayPID, 0) != 0 && errno == ESRCH) break;
+        usleep(50000);
+    }
+    errno = 0;
+    if (kill(overlayPID, 0) == 0 || errno != ESRCH) {
+        HostLog(@"app-session orphan-retire id=steam-overlay pid=%d "
+                "signal=KILL reason=term-timeout", overlayPID);
+        (void)kill(overlayPID, SIGKILL);
+    }
+    gKnownSteamOverlayPID = 0;
+    gObservedOrphanOverlayPID = 0;
+    gObservedOrphanOverlaySince = 0;
+}
+
+static void SeedApplicationSessions(void) {
+    // Recover sessions that predate a hostd restart from the authoritative
+    // per-process window catalogs.  This is what makes quit convergence a
+    // service invariant rather than state remembered only by the launch UI.
+    NSString *metricsDirectory = @"/var/mnt/rootfs/private/tmp";
+    NSArray<NSString *> *entries =
+        [NSFileManager.defaultManager contentsOfDirectoryAtPath:metricsDirectory
+                                                          error:nil];
+    for (NSString *entry in entries) {
+        int pid = 0;
+        char extra = 0;
+        if (sscanf(entry.UTF8String, "macws_window_metrics.%d.bin%c",
+                   &pid, &extra) != 1 || pid <= 1) continue;
+        NSString *rootPath = RootExecutablePathForPID((pid_t)pid);
+        if (![rootPath containsString:@".app/Contents/MacOS/"]) continue;
+        if ([rootPath containsString:@"/Dock.app/"] ||
+            [rootPath containsString:@"/SystemUIServer.app/"] ||
+            [rootPath containsString:@"/ControlCenter.app/"] ||
+            [rootPath containsString:@"/NotificationCenter.app/"] ||
+            [rootPath containsString:@"/loginwindow.app/"] ||
+            [rootPath containsString:@"/CoreLocationAgent.app/"] ||
+            [rootPath containsString:@"/UIKitSystem.app/"] ||
+            [rootPath containsString:@"/Frameworks/"]) continue;
+        TrackApplicationSession(
+            ApplicationSessionIdentifierForPath(rootPath), rootPath,
+            (pid_t)pid);
+    }
+    pid_t vscodePID = FindRunningRootExecutable(@(kVSCodeExecutable));
+    if (vscodePID > 1)
+        TrackApplicationSession(@"vscode", @(kVSCodeExecutable), vscodePID);
+    pid_t steamPID = FindRunningSteamExecutable();
+    if (steamPID > 1) {
+        NSString *steamPath = RootExecutablePathForPID(steamPID);
+        TrackApplicationSession(@"steam",
+            steamPath.length ? steamPath : @(kSteamLiveExecutable), steamPID);
+    }
+}
+
+static void StartApplicationSessionSupervisor(void) {
+    if (gApplicationSupervisorTimer) return;
+    SeedApplicationSessions();
+    gApplicationSupervisorTimer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0, gControlQueue);
+    dispatch_source_set_timer(gApplicationSupervisorTimer,
+        dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), NSEC_PER_SEC,
+        100 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(gApplicationSupervisorTimer, ^{
+        for (NSString *key in [gApplicationSessions.allKeys copy]) {
+            NSDictionary *session = gApplicationSessions[key];
+            pid_t pid = (pid_t)[session[@"pid"] intValue];
+            NSString *identifier = session[@"identifier"] ?: @"app";
+            NSString *rootPath = session[@"rootPath"] ?: @"";
+            if (ApplicationSessionPIDMatchesPath(
+                    pid, rootPath, identifier)) continue;
+            ApplicationSessionObservedExit(
+                pid, identifier, @"supervisor:path-or-process-absent");
+        }
+        RetireConfirmedSteamOverlayOrphan();
+    });
+    dispatch_resume(gApplicationSupervisorTimer);
+    HostLog(@"app-session supervisor-ready interval=1s sessions=%lu",
+            (unsigned long)gApplicationSessions.count);
 }
 
 // An AppKit application can outlive its last NSWindow.  That is the normal
@@ -1825,6 +2448,43 @@ static BOOL EnsureSystemSettingsCatalog(BOOL *repairedOut,
         return NO;
     }
     if (repairedOut) *repairedOut = YES;
+    return YES;
+}
+
+// The desktop needs the shared ViewBridge/ExtensionKit service contracts, but
+// it does not execute any of System Settings' 48 pane binaries.  Reconcile
+// those per-pane carriers at the actual application boundary so a libmachook
+// deployment cannot hold WindowServer startup behind minutes of unrelated
+// signing and trustcache work.  This remains fail-closed: System Settings is
+// launched only after the unchanged complete verifier succeeds.
+static BOOL EnsureSystemSettingsExtensionRuntime(NSString **message) {
+    const char *verify[] = {
+        kBash, kSettingsExtensionsRuntime, "--verify", NULL,
+    };
+    int initialVerify = RunCommandToLog(
+        verify, YES, kSettingsExtensionsRuntimeLog);
+    if (initialVerify == 0) {
+        HostLog(@"system-settings runtime result=verified action=reuse");
+        return YES;
+    }
+
+    const char *prepare[] = {
+        kBash, kSettingsExtensionsRuntime, NULL,
+    };
+    int prepareResult = RunCommandToLog(
+        prepare, YES, kSettingsExtensionsRuntimeLog);
+    int finalVerify = prepareResult == 0
+        ? RunCommandToLog(verify, YES, kSettingsExtensionsRuntimeLog) : 126;
+    HostLog(@"system-settings runtime result=%s initial_verify=%d "
+            "prepare=%d final_verify=%d",
+            finalVerify == 0 ? "prepared" : "failed",
+            initialVerify, prepareResult, finalVerify);
+    if (finalVerify != 0) {
+        *message = [NSString stringWithFormat:
+            @"系统设置扩展运行时准备失败（验证 %d，准备 %d，复验 %d）",
+            initialVerify, prepareResult, finalVerify];
+        return NO;
+    }
     return YES;
 }
 
@@ -2004,6 +2664,7 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
             gActiveAppPID = mapsPID;
             gActiveAppID = @"maps";
             os_unfair_lock_unlock(&gStateLock);
+            TrackApplicationSession(@"maps", mapsRootPath, mapsPID);
             HostLog(@"launch-app reuse id=maps pid=%d route=existing-window",
                     mapsPID);
             *message = @"地图已在运行，现有原生窗口已进入窗口列表";
@@ -2018,7 +2679,16 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
         CFNotificationCenterPostNotification(
             CFNotificationCenterGetDarwinNotifyCenter(),
             kMapsHostLaunchNotification, NULL, NULL, true);
-        mapsPID = WaitForRunningRootExecutable(mapsRootPath, 3.0);
+        // The Host-owned setuid carrier intentionally waits up to 30 seconds
+        // for macwsinteropd's real location-provider readiness marker before
+        // it execs Maps.  A three-second parent timeout reported failure and
+        // the frontend retry then called RetireLegacyMapsUIKitCarrier(),
+        // SIGTERM'ing the still-correct helper every ~5 seconds.  Runtime
+        // witness 2026-08-21: helpers 77970 and 77991 were killed this way;
+        // generation 78017 succeeded only after the provider became ready.
+        // Give that upstream protocol its declared 30 seconds plus a bounded
+        // five-second exec/process-publication allowance.
+        mapsPID = WaitForRunningRootExecutable(mapsRootPath, 35.0);
         freshHostChild = MapsHostCarrierMarkerMatches(mapsPID);
     }
     if (mapsPID <= 1) {
@@ -2039,6 +2709,7 @@ static BOOL LaunchMapsViaUIKitCarrier(NSString **message) {
     gActiveAppPID = mapsPID;
     gActiveAppID = @"maps";
     os_unfair_lock_unlock(&gStateLock);
+    TrackApplicationSession(@"maps", mapsRootPath, mapsPID);
     HostLog(@"launch-app process-ready id=maps pid=%d uikitsystem=%d "
             "route=existing-MacWSHost catalog=asynchronous", mapsPID,
             uikitSystemPID);
@@ -2110,6 +2781,7 @@ static BOOL LaunchCatalystViaUIKitCarrier(const char *identifier,
             gActiveAppPID = catalystPID;
             gActiveAppID = @(identifier);
             os_unfair_lock_unlock(&gStateLock);
+            TrackApplicationSession(@(identifier), rootPath, catalystPID);
             *message = [NSString stringWithFormat:
                 @"%@ 已在当前 macPad 工作区运行", name];
             return YES;
@@ -2147,6 +2819,7 @@ static BOOL LaunchCatalystViaUIKitCarrier(const char *identifier,
     gActiveAppPID = catalystPID;
     gActiveAppID = @(identifier);
     os_unfair_lock_unlock(&gStateLock);
+    TrackApplicationSession(@(identifier), rootPath, catalystPID);
     HostLog(@"launch-app process-ready id=%s pid=%d uikitsystem=%d "
             "route=existing-MacWSHost catalog=asynchronous",
             identifier, catalystPID, uikitSystemPID);
@@ -2232,11 +2905,13 @@ static BOOL LaunchVSCode(NSString **message) {
                              markerPID == pid;
         BOOL electronUnresponsive = markerMatches &&
             VSCodeLogContainsUnresponsiveAfter(markerOffset);
+        BOOL metalCommandFailure = markerMatches &&
+            VSCodeLogContainsCommandBufferFailureAfter(markerOffset);
         BOOL workspaceReady = WaitForWindowMetricsFlags(
             pid, 3.0, workspaceFlags, &reuseExitStatus);
         if (!markerMatches)
             WriteVSCodeHealthMarker(pid, FileSizeAtPath(kVSCodeLog));
-        if (!workspaceReady || electronUnresponsive) {
+        if (!workspaceReady || electronUnresponsive || metalCommandFailure) {
             // Runtime-confirmed on 2026-07-31: Electron logged
             // `CodeWindow: detected unresponsive`; its metrics sidecar then
             // continued to describe a visible/resizable base NSWindow under
@@ -2246,7 +2921,8 @@ static BOOL LaunchVSCode(NSString **message) {
             HostLog(@"launch-app vscode-restart pid=%d "
                     "reason=%@", pid,
                     electronUnresponsive ? @"electron-unresponsive" :
-                                           @"no-resizable-workspace");
+                    (metalCommandFailure ? @"metal-command-buffer-failure" :
+                                           @"no-resizable-workspace"));
             const char *unloadArgv[] = {kLaunchctl, "unload", kVSCodePlist, NULL};
             (void)RunCommand(unloadArgv, YES);
             launchLogOffset = FileSizeAtPath(kVSCodeLog);
@@ -2268,6 +2944,7 @@ static BOOL LaunchVSCode(NSString **message) {
     gActiveAppPID = pid;
     gActiveAppID = @"vscode";
     os_unfair_lock_unlock(&gStateLock);
+    TrackApplicationSession(@"vscode", @(kVSCodeExecutable), pid);
     int exitStatus = -1;
     if (!WaitForWindowMetricsFlags(pid, 30.0,
             MacWSStreamWindowVisible | MacWSStreamWindowResizable,
@@ -2275,14 +2952,64 @@ static BOOL LaunchVSCode(NSString **message) {
         *message = @"VS Code 正在运行，但 30 秒内没有发布可调尺寸的工作区窗口";
         return NO;
     }
+    // A black Electron client still owns a perfectly real, visible NSWindow.
+    // Runtime-confirmed on VS Code PID 27637 / GPU helper 27643 on
+    // 2026-08-22: the raw WindowServer capture and macPad capture were both
+    // black while this exact Metal completion error repeated in vscode.log.
+    // Treat renderer completion as part of content readiness; geometry alone
+    // must never turn that failure into a successful launch result.
+    usleep(500000);
+    pid_t healthPID = 0;
+    off_t healthOffset = 0;
+    if (ReadVSCodeHealthMarker(&healthPID, &healthOffset) &&
+        healthPID == pid &&
+        VSCodeLogContainsCommandBufferFailureAfter(healthOffset)) {
+        HostLog(@"launch-app content-failed id=vscode pid=%d "
+                "reason=metal-command-buffer-failure", pid);
+        *message = @"VS Code 窗口已出现，但渲染命令失败，未把黑色窗口视为可用";
+        return NO;
+    }
     HostLog(@"launch-app window-ready id=vscode pid=%d path=DisplayStream", pid);
     *message = @"VS Code 已通过生产 AGX/JIT 配置启动，窗口已进入列表";
     return YES;
 }
 
+static BOOL SteamPIDMatchesProductionJob(pid_t pid, NSString *actualPath) {
+    if (pid <= 1) return NO;
+    int jobPID = 0;
+    if (!JobHasPID(kSteamLabel, &jobPID) || jobPID != pid) return NO;
+    NSString *path = actualPath.length
+        ? actualPath : RootExecutablePathForPID(pid);
+    // Runtime-confirmed on 2026-08-22 for the production Steam job PID 12654:
+    // proc_pidpath returned the argv-relative spelling `./steam_osx`, even
+    // though launchd had already exec'd the exact Steam job and its visible
+    // AppKit/CEF window was live. Bind that spelling only to the PID currently
+    // owned by the exact launchd label; the preflight shell is rejected by its
+    // different basename until exec completes.
+    return [path isEqualToString:@(kSteamOuterExecutable)] ||
+           [path isEqualToString:@(kSteamLiveExecutable)] ||
+           [path.lastPathComponent isEqualToString:@"steam_osx"];
+}
+
 static pid_t FindRunningSteamExecutable(void) {
     pid_t pid = FindRunningRootExecutable(@(kSteamLiveExecutable));
-    return pid > 1 ? pid : FindRunningRootExecutable(@(kSteamOuterExecutable));
+    if (pid > 1) return pid;
+    pid = FindRunningRootExecutable(@(kSteamOuterExecutable));
+    if (pid > 1) return pid;
+    int jobPID = 0;
+    if (JobHasPID(kSteamLabel, &jobPID) &&
+        SteamPIDMatchesProductionJob((pid_t)jobPID,
+                                     RootExecutablePathForPID(jobPID))) {
+        static pid_t loggedJobPID = 0;
+        if (loggedJobPID != (pid_t)jobPID) {
+            loggedJobPID = (pid_t)jobPID;
+            HostLog(@"launch-app steam-identity pid=%d "
+                    "source=launchd-job proc-path=%@", jobPID,
+                    RootExecutablePathForPID(jobPID) ?: @"(unavailable)");
+        }
+        return (pid_t)jobPID;
+    }
+    return 0;
 }
 
 static BOOL LaunchSteam(NSString **message) {
@@ -2304,13 +3031,46 @@ static BOOL LaunchSteam(NSString **message) {
 
     pid_t steamPID = FindRunningSteamExecutable();
     if (steamPID > 1) {
-        (void)RequestApplicationReopen(steamPID, 1.0);
-        os_unfair_lock_lock(&gStateLock);
-        gActiveAppPID = steamPID;
-        gActiveAppID = @"steam";
-        os_unfair_lock_unlock(&gStateLock);
-        *message = @"Steam 已在运行，正在打开现有窗口";
-        return YES;
+        NSString *steamPath = RootExecutablePathForPID(steamPID);
+        if (![steamPath isEqualToString:@(kSteamOuterExecutable)] &&
+            ![steamPath isEqualToString:@(kSteamLiveExecutable)])
+            steamPath = @(kSteamLiveExecutable);
+        TrackApplicationSession(@"steam", steamPath, steamPID);
+        pid_t windowOwner = FindSteamUIProcess(steamPID, YES);
+        if (windowOwner > 1 &&
+            RequestApplicationReopen(windowOwner, 2.0)) {
+            os_unfair_lock_lock(&gStateLock);
+            gActiveAppPID = steamPID;
+            gActiveAppID = @"steam";
+            os_unfair_lock_unlock(&gStateLock);
+            HostLog(@"launch-app steam-reopen main=%d owner=%d result=ready",
+                    steamPID, windowOwner);
+            *message = @"Steam 已在运行，现有窗口已重新进入工作区";
+            return YES;
+        }
+        // Runtime-confirmed on 2026-08-22: launchd reported the Steam job as
+        // not running while a prior Dock launch still looked active and its
+        // tile could not reopen a window.  A process is reusable only after
+        // the real AppKit reopen transaction publishes a fresh window.  If
+        // that fails, retire this exact executable before starting the same
+        // production launchd job; do not report PID uptime as launch success.
+        HostLog(@"launch-app steam-restart pid=%d reason=no-visible-window",
+                steamPID);
+        NSString *retireMessage = nil;
+        if (!TerminateWindowlessRootExecutable(
+                steamPID, steamPath, &retireMessage)) {
+            *message = retireMessage ?: @"Steam 无窗口实例无法退出";
+            return NO;
+        }
+        ApplicationSessionObservedExit(
+            steamPID, @"steam", @"reopen-failed:exact-retire");
+        NSDate *jobExitDeadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
+        int staleJobPID = 0;
+        while (jobExitDeadline.timeIntervalSinceNow > 0 &&
+               JobHasPID(kSteamLabel, &staleJobPID) &&
+               staleJobPID == steamPID) {
+            usleep(50000);
+        }
     }
 
     int jobPID = 0;
@@ -2339,9 +3099,21 @@ static BOOL LaunchSteam(NSString **message) {
     gActiveAppPID = steamPID;
     gActiveAppID = @"steam";
     os_unfair_lock_unlock(&gStateLock);
+    NSString *steamPath = RootExecutablePathForPID(steamPID);
+    TrackApplicationSession(@"steam",
+        steamPath.length ? steamPath : @(kSteamLiveExecutable), steamPID);
     HostLog(@"launch-app process-ready id=steam pid=%d label=%s",
             steamPID, kSteamLabel);
-    *message = @"Steam 正在通过生产运行任务打开";
+    pid_t windowOwner = WaitForSteamUIProcess(steamPID, 30.0);
+    if (windowOwner <= 1) {
+        *message = @"Steam 主进程已启动，但 30 秒内没有 Helper 发布可用窗口";
+        HostLog(@"launch-app steam-window result=timeout main=%d owner=absent",
+                steamPID);
+        return NO;
+    }
+    HostLog(@"launch-app steam-window result=ready main=%d owner=%d "
+            "path=DisplayStream", steamPID, windowOwner);
+    *message = @"Steam 已通过生产运行任务打开并发布窗口";
     return YES;
 }
 
@@ -2418,6 +3190,7 @@ static BOOL LaunchRootExecutable(const char *identifier,
             gActiveAppPID = existingPID;
             gActiveAppID = [@(identifier) copy];
             os_unfair_lock_unlock(&gStateLock);
+            TrackApplicationSession(@(identifier), rootPath, existingPID);
             HostLog(@"launch-app reuse id=%s pid=%d executable=%@ "
                     "identity=proc_pidpath",
                     identifier, existingPID, rootPath);
@@ -2517,6 +3290,7 @@ static BOOL LaunchRootExecutable(const char *identifier,
     gActiveAppPID = pid;
     gActiveAppID = [@(identifier) copy];
     os_unfair_lock_unlock(&gStateLock);
+    TrackApplicationSession(@(identifier), rootPath, pid);
     if (JobHasPID(kDisplayLabel, NULL)) {
         int exitStatus = -1;
         BOOL finder = strcmp(identifier, "finder") == 0;
@@ -2706,6 +3480,7 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         return NO;
     }
     if (strcmp(identifier, "system-settings") == 0) {
+        if (!EnsureSystemSettingsExtensionRuntime(message)) return NO;
         BOOL repaired = NO;
         if (!EnsureSystemSettingsCatalog(&repaired, message)) return NO;
         if (repaired) {
@@ -2902,9 +3677,70 @@ static int CreateSteamSemaphoreState(MacWSSteamSemaphoreEntry *entry,
             (ssize_t)sizeof(state) ||
         ftruncate(descriptor, sizeof(state)) != 0)
         error = errno ?: EIO;
-    close(descriptor);
-    if (error != 0) (void)unlink(path);
+    if (error == 0) entry->stateDescriptor = descriptor;
+    else {
+        close(descriptor);
+        (void)unlink(path);
+    }
     return error;
+}
+
+static int LockSteamSemaphoreState(MacWSSteamSemaphoreEntry *entry,
+                                   MacWSSteamSemaphoreState *state) {
+    if (!entry || entry->stateDescriptor < 0 || !state) return EINVAL;
+    // A blocking flock waiter in the macOS runtime was runtime-confirmed not
+    // to resume after a cross-runtime unlock. Keep both sides on the same
+    // nonblocking predicate. The lock spans only one fixed-size pread/pwrite.
+    for (uint32_t attempt = 0; attempt < 20000; attempt++) {
+        if (flock(entry->stateDescriptor, LOCK_EX | LOCK_NB) == 0) break;
+        int lockError = errno;
+        if (lockError != EWOULDBLOCK && lockError != EAGAIN &&
+            lockError != EINTR) return lockError;
+        if (attempt == 19999) return ETIMEDOUT;
+        if (attempt < 32) sched_yield();
+        else usleep(250);
+    }
+    ssize_t amount = pread(entry->stateDescriptor, state, sizeof(*state), 0);
+    if (amount != (ssize_t)sizeof(*state) ||
+        state->magic != MACWS_STEAM_SEM_STATE_MAGIC ||
+        state->version != MACWS_STEAM_SEM_STATE_VERSION ||
+        state->brokerGeneration != entry->generation ||
+        strcmp(state->name, entry->name) ||
+        state->waiterCount > MACWS_STEAM_SEM_WAITER_CAPACITY) {
+        (void)flock(entry->stateDescriptor, LOCK_UN);
+        return amount < 0 ? errno : EPROTO;
+    }
+    entry->value = state->value;
+    return 0;
+}
+
+static int StoreAndUnlockSteamSemaphoreState(
+        MacWSSteamSemaphoreEntry *entry,
+        MacWSSteamSemaphoreState *state) {
+    if (!entry || entry->stateDescriptor < 0 || !state) return EINVAL;
+    state->revision++;
+    ssize_t amount = pwrite(
+        entry->stateDescriptor, state, sizeof(*state), 0);
+    int result = amount == (ssize_t)sizeof(*state) ? 0 : (errno ?: EIO);
+    entry->value = state->value;
+    if (flock(entry->stateDescriptor, LOCK_UN) != 0 && result == 0)
+        result = errno ?: EIO;
+    return result;
+}
+
+static void UnlockSteamSemaphoreState(MacWSSteamSemaphoreEntry *entry) {
+    if (entry && entry->stateDescriptor >= 0)
+        (void)flock(entry->stateDescriptor, LOCK_UN);
+}
+
+static uint32_t SteamSemaphoreHostWaiterCount(
+        const MacWSSteamSemaphoreEntry *entry) {
+    if (!entry) return 0;
+    uint64_t count = entry->waiterSocketCount;
+    for (uint32_t index = 0; index < entry->pollingWaiterCount; index++)
+        if (!entry->pollingWaiterGranted[index]) count++;
+    return count > MACWS_STEAM_SEM_WAITER_CAPACITY ?
+        MACWS_STEAM_SEM_WAITER_CAPACITY : (uint32_t)count;
 }
 
 static void UnlinkSteamSemaphoreState(
@@ -2928,6 +3764,7 @@ static void DestroySteamSemaphoreEntry(MacWSSteamSemaphoreEntry *entry) {
             entry->waiterSocketRequestIDs[index]);
         close(descriptor);
     }
+    if (entry->stateDescriptor >= 0) close(entry->stateDescriptor);
     free(entry);
 }
 
@@ -2967,6 +3804,177 @@ static BOOL GrantSteamSemaphoreSocketWaiter(
         return YES;
     }
     return NO;
+}
+
+static void ExpireSteamSemaphoreSocketWaiter(uint64_t generation,
+                                             uint64_t requestID,
+                                             BOOL diagnostics) {
+    MacWSSteamSemaphoreEntry *entry =
+        gSteamSemaphoreGenerations[@(generation)].pointerValue;
+    if (!entry) return;
+    for (uint32_t index = 0; index < entry->waiterSocketCount; index++) {
+        if (entry->waiterSocketRequestIDs[index] != requestID) continue;
+        int descriptor = entry->waiterSockets[index];
+        uint64_t waiter = entry->waiterSocketIDs[index];
+        RemoveSteamSemaphoreSocketWaiter(entry, index);
+        MacWSSteamSemaphoreState state = {0};
+        int stateError = LockSteamSemaphoreState(entry, &state);
+        if (stateError == 0) {
+            state.waiterCount = SteamSemaphoreHostWaiterCount(entry);
+            stateError = StoreAndUnlockSteamSemaphoreState(entry, &state);
+        }
+        (void)WriteSteamSemaphoreWaitReply(
+            descriptor, stateError ?: EAGAIN, entry->generation,
+            entry->value, requestID);
+        close(descriptor);
+        if (stateError != 0)
+            HostLog(@"Steam semaphore timeout state update failed "
+                    "generation=%llu request=%llu error=%d",
+                    entry->generation, requestID, stateError);
+        if (diagnostics)
+            HostLog(@"Steam semaphore EVFILT_READ timed out generation=%llu "
+                    "waiter=%llu request=%llu remaining=%u",
+                    entry->generation, waiter, requestID,
+                    entry->waiterSocketCount);
+        return;
+    }
+}
+
+static mach_timebase_info_data_t gSteamSemaphoreTimebase;
+static dispatch_once_t gSteamSemaphoreTimebaseOnce;
+
+typedef struct {
+    uint64_t generation;
+    uint64_t requestID;
+    uint64_t deadline;
+    BOOL diagnostics;
+} MacWSSteamSemaphoreDeadline;
+
+#define MACWS_STEAM_SEM_DEADLINE_CAPACITY 64u
+static pthread_mutex_t gSteamSemaphoreDeadlineLock =
+    PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gSteamSemaphoreDeadlineCondition =
+    PTHREAD_COND_INITIALIZER;
+static MacWSSteamSemaphoreDeadline
+    gSteamSemaphoreDeadlines[MACWS_STEAM_SEM_DEADLINE_CAPACITY];
+static uint32_t gSteamSemaphoreDeadlineHead;
+static uint32_t gSteamSemaphoreDeadlineCount;
+
+static uint64_t SteamSemaphoreDeadlineAfterMicroseconds(
+        uint32_t microseconds) {
+    dispatch_once(&gSteamSemaphoreTimebaseOnce, ^{
+        (void)mach_timebase_info(&gSteamSemaphoreTimebase);
+    });
+    if (gSteamSemaphoreTimebase.numer == 0 ||
+        gSteamSemaphoreTimebase.denom == 0) return 0;
+    uint64_t nanoseconds = (uint64_t)microseconds * UINT64_C(1000);
+    __uint128_t scaled = (__uint128_t)nanoseconds *
+        gSteamSemaphoreTimebase.denom + gSteamSemaphoreTimebase.numer - 1;
+    uint64_t interval = (uint64_t)(scaled / gSteamSemaphoreTimebase.numer);
+    uint64_t now = mach_absolute_time();
+    return UINT64_MAX - now < interval ? UINT64_MAX : now + interval;
+}
+
+static void *SteamSemaphoreDeadlineThread(void *context) {
+    (void)context;
+    int qosResult = pthread_set_qos_class_self_np(
+        QOS_CLASS_USER_INTERACTIVE, 0);
+    // EVFILT_TIMER with NOTE_CRITICAL supplies the measured 10 ms deadline.
+    // Do not request THREAD_TIME_CONSTRAINT_POLICY: the deadline thread sleeps
+    // between sparse diagnostic requests, and the accepted policy did not
+    // improve mach_wait_until wake latency in the on-device probe.
+    HostLog(@"Steam semaphore deadline thread qos-result=%d", qosResult);
+    int timerQueue = kqueue();
+    HostLog(@"Steam semaphore deadline kqueue=%d errno=%d", timerQueue,
+            timerQueue >= 0 ? 0 : errno);
+    for (;;) {
+        pthread_mutex_lock(&gSteamSemaphoreDeadlineLock);
+        while (gSteamSemaphoreDeadlineCount == 0)
+            pthread_cond_wait(&gSteamSemaphoreDeadlineCondition,
+                              &gSteamSemaphoreDeadlineLock);
+        MacWSSteamSemaphoreDeadline item =
+            gSteamSemaphoreDeadlines[gSteamSemaphoreDeadlineHead];
+        gSteamSemaphoreDeadlineHead =
+            (gSteamSemaphoreDeadlineHead + 1) %
+            MACWS_STEAM_SEM_DEADLINE_CAPACITY;
+        gSteamSemaphoreDeadlineCount--;
+        pthread_mutex_unlock(&gSteamSemaphoreDeadlineLock);
+        int timerResult = -1;
+        if (timerQueue >= 0) {
+            struct kevent change = {0}, event = {0};
+            EV_SET(&change, 1, EVFILT_TIMER,
+                   EV_ADD | EV_ENABLE | EV_ONESHOT,
+                   NOTE_ABSOLUTE | NOTE_MACHTIME | NOTE_CRITICAL,
+                   (intptr_t)item.deadline, NULL);
+            do {
+                timerResult = kevent(
+                    timerQueue, &change, 1, &event, 1, NULL);
+            } while (timerResult < 0 && errno == EINTR);
+        }
+        if (timerResult != 1)
+            (void)mach_wait_until(item.deadline);
+        if (item.diagnostics) {
+            uint64_t woke = mach_absolute_time();
+            uint64_t lateTicks = woke > item.deadline ?
+                woke - item.deadline : 0;
+            double lateMicroseconds = gSteamSemaphoreTimebase.denom ?
+                (double)lateTicks * gSteamSemaphoreTimebase.numer /
+                    gSteamSemaphoreTimebase.denom / 1000.0 : -1.0;
+            HostLog(@"Steam semaphore deadline woke generation=%llu "
+                    "request=%llu timer-result=%d late-us=%.3f",
+                    item.generation, item.requestID, timerResult,
+                    lateMicroseconds);
+        }
+        dispatch_sync(gSteamSemaphoreQueue, ^{
+            ExpireSteamSemaphoreSocketWaiter(
+                item.generation, item.requestID, item.diagnostics);
+        });
+    }
+    return NULL;
+}
+
+static BOOL StartSteamSemaphoreDeadlineThread(void) {
+    pthread_attr_t attributes;
+    if (pthread_attr_init(&attributes) != 0) return NO;
+    (void)pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+    (void)pthread_attr_set_qos_class_np(
+        &attributes, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_t thread = NULL;
+    int result = pthread_create(
+        &thread, &attributes, SteamSemaphoreDeadlineThread, NULL);
+    pthread_attr_destroy(&attributes);
+    return result == 0;
+}
+
+static BOOL ScheduleSteamSemaphoreSocketTimeout(uint64_t generation,
+                                                uint64_t requestID,
+                                                uint32_t microseconds,
+                                                BOOL diagnostics) {
+    uint64_t deadline = SteamSemaphoreDeadlineAfterMicroseconds(microseconds);
+    if (deadline == 0) return NO;
+    // Runtime-confirmed by macws_control_probe on this host service:
+    // dispatch_after(10 ms) delivered at 106.530 ms while idle. Use the same
+    // absolute Mach deadline primitive on one permanent QoS-bound thread.
+    // The thread sleeps without polling and at most 64 exact waiters can be
+    // pending, matching the broker's existing bounded waiter storage.
+    pthread_mutex_lock(&gSteamSemaphoreDeadlineLock);
+    if (gSteamSemaphoreDeadlineCount >=
+            MACWS_STEAM_SEM_DEADLINE_CAPACITY) {
+        pthread_mutex_unlock(&gSteamSemaphoreDeadlineLock);
+        return NO;
+    }
+    uint32_t tail = (gSteamSemaphoreDeadlineHead +
+        gSteamSemaphoreDeadlineCount) % MACWS_STEAM_SEM_DEADLINE_CAPACITY;
+    gSteamSemaphoreDeadlines[tail] = (MacWSSteamSemaphoreDeadline){
+        .generation = generation,
+        .requestID = requestID,
+        .deadline = deadline,
+        .diagnostics = diagnostics,
+    };
+    gSteamSemaphoreDeadlineCount++;
+    pthread_cond_signal(&gSteamSemaphoreDeadlineCondition);
+    pthread_mutex_unlock(&gSteamSemaphoreDeadlineLock);
+    return YES;
 }
 
 static BOOL SteamSemaphoreDiagnosticsEnabled(xpc_object_t request) {
@@ -3100,34 +4108,61 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
         return;
     }
 
-    MacWSSteamSemaphoreWaitRequest request = {0};
-    BOOL readRequest = ReadSteamSemaphoreWaitRequest(descriptor, &request);
-    BOOL validRequest = readRequest &&
-        request.magic == MACWS_STEAM_SEM_WAIT_MAGIC &&
-        request.version == MACWS_STEAM_SEM_VERSION &&
-        request.generation != 0 && !(request.reserved &
-            ~MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS) &&
-        request.requestID != 0 &&
-        (pid_t)(request.waiter >> 32) == peerPID &&
-        request.operation >= MACWS_STEAM_SEM_SOCKET_WAIT_POLL &&
-        request.operation <= MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK;
-    if (!validRequest) {
-        int readError = readRequest ? 0 : errno;
-        HostLog(@"Steam semaphore socket request rejected fd=%d read=%d "
-                "errno=%d peer=%d magic=%#x version=%u op=%u flags=%#x "
-                "generation=%llu waiter=%llu waiter_pid=%d request=%llu",
-                descriptor, readRequest, readError, peerPID, request.magic,
-                request.version, request.operation, request.reserved,
-                request.generation, request.waiter,
-                (pid_t)(request.waiter >> 32), request.requestID);
-        (void)WriteSteamSemaphoreWaitReply(
-            descriptor, EPROTO, request.generation, 0,
-            request.requestID);
-        close(descriptor);
-        return;
-    }
+    BOOL handledRequest = NO;
+    for (;;) {
+        MacWSSteamSemaphoreWaitRequest request = {0};
+        BOOL readRequest = ReadSteamSemaphoreWaitRequest(
+            descriptor, &request);
+        if (!readRequest && handledRequest) {
+            // A legacy one-request client closes immediately after its reply;
+            // EOF is normal during a rolling hostd/libmachook deployment.
+            close(descriptor);
+            return;
+        }
+        BOOL validRequest = readRequest &&
+            request.magic == MACWS_STEAM_SEM_WAIT_MAGIC &&
+            request.version == MACWS_STEAM_SEM_VERSION &&
+            request.generation != 0 && !(request.reserved &
+                ~MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS) &&
+            request.reserved2 == 0 &&
+            request.requestID != 0 &&
+            (pid_t)(request.waiter >> 32) == peerPID &&
+            request.operation >= MACWS_STEAM_SEM_SOCKET_WAIT_POLL &&
+            request.operation <= MACWS_STEAM_SEM_SOCKET_WAIT_TIMED &&
+            ((request.operation == MACWS_STEAM_SEM_SOCKET_WAIT_TIMED &&
+              request.timeoutMicroseconds == 10000) ||
+             (request.operation != MACWS_STEAM_SEM_SOCKET_WAIT_TIMED &&
+              request.timeoutMicroseconds == 0));
+        if (!validRequest) {
+            int readError = readRequest ? 0 : errno;
+            HostLog(@"Steam semaphore socket request rejected fd=%d read=%d "
+                    "errno=%d peer=%d magic=%#x version=%u op=%u flags=%#x "
+                    "generation=%llu waiter=%llu waiter_pid=%d request=%llu",
+                    descriptor, readRequest, readError, peerPID, request.magic,
+                    request.version, request.operation, request.reserved,
+                    request.generation, request.waiter,
+                    (pid_t)(request.waiter >> 32), request.requestID);
+            (void)WriteSteamSemaphoreWaitReply(
+                descriptor, EPROTO, request.generation, 0,
+                request.requestID);
+            close(descriptor);
+            return;
+        }
+        if (!handledRequest) {
+            // The first request remains bounded against a peer that connects
+            // but sends no envelope. A validated Steam client may retain this
+            // channel for its thread lifetime, eliminating one connect,
+            // accept, dispatch allocation and close for every 10 ms poll.
+            struct timeval persistentTimeout = {0};
+            (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                             &persistentTimeout,
+                             sizeof(persistentTimeout));
+            handledRequest = YES;
+        }
 
-    dispatch_async(gSteamSemaphoreQueue, ^{
+        __block BOOL descriptorRetainedByWaiter = NO;
+        __block BOOL connectionFailed = NO;
+        dispatch_sync(gSteamSemaphoreQueue, ^{
         BOOL diagnostics = (request.reserved &
             MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS) != 0;
         if (diagnostics && request.operation !=
@@ -3139,19 +4174,26 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
         MacWSSteamSemaphoreEntry *entry =
             gSteamSemaphoreGenerations[@(request.generation)].pointerValue;
         if (!entry || entry->references == 0) {
-            (void)WriteSteamSemaphoreWaitReply(
-                descriptor, EINVAL, request.generation, 0,
-                request.requestID);
-            close(descriptor);
+            if (!WriteSteamSemaphoreWaitReply(
+                    descriptor, EINVAL, request.generation, 0,
+                    request.requestID))
+                connectionFailed = YES;
             return;
         }
         int replyError = 0;
         uint32_t replyValue = entry->value;
-
-        if (request.operation == MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK) {
-            if (entry->value != 0) {
-                entry->value--;
-                replyValue = entry->value;
+        MacWSSteamSemaphoreState state = {0};
+        int stateError = LockSteamSemaphoreState(entry, &state);
+        BOOL stateDirty = NO;
+        if (stateError != 0) {
+            replyError = stateError;
+        } else if (request.operation ==
+                       MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK ||
+                   request.operation ==
+                       MACWS_STEAM_SEM_SOCKET_WAIT_TIMED) {
+            if (state.value != 0) {
+                state.value--;
+                stateDirty = YES;
             } else if (entry->waiterSocketCount >=
                        sizeof(entry->waiterSockets) /
                            sizeof(entry->waiterSockets[0])) {
@@ -3161,6 +4203,9 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
                 entry->waiterSockets[index] = descriptor;
                 entry->waiterSocketRequestIDs[index] = request.requestID;
                 entry->waiterSocketIDs[index] = request.waiter;
+                state.waiterCount = SteamSemaphoreHostWaiterCount(entry);
+                stateDirty = YES;
+                descriptorRetainedByWaiter = YES;
                 if (diagnostics)
                     HostLog(@"Steam semaphore EVFILT_READ enqueue "
                             "generation=%llu waiter=%llu request=%llu "
@@ -3168,11 +4213,9 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
                             entry->generation, request.waiter,
                             request.requestID, index,
                             entry->waiterSocketCount);
-                // Ownership of descriptor moved to the FIFO. A later post,
-                // unlink/reset or peer failure writes/closes it.
-                return;
             }
-        } else if (request.operation == MACWS_STEAM_SEM_SOCKET_WAIT_POLL) {
+        } else if (request.operation ==
+                   MACWS_STEAM_SEM_SOCKET_WAIT_POLL) {
             if (request.waiter == 0) {
                 replyError = EINVAL;
             } else {
@@ -3188,10 +4231,13 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
                         entry->pollingWaiters[index] = request.waiter;
                         entry->pollingWaiterGranted[index] = 0;
                         entry->pollingWaiterCount++;
-                        if (entry->value != 0) {
-                            entry->value--;
+                        if (state.value != 0) {
+                            state.value--;
                             entry->pollingWaiterGranted[index] = 1;
                         }
+                        state.waiterCount =
+                            SteamSemaphoreHostWaiterCount(entry);
+                        stateDirty = YES;
                         if (diagnostics)
                             HostLog(@"Steam semaphore socket FIFO enqueue "
                                     "generation=%llu waiter=%llu granted=%u "
@@ -3204,7 +4250,8 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
                 if (replyError == 0)
                     replyValue = entry->pollingWaiterGranted[index] ? 1 : 0;
             }
-        } else if (request.operation == MACWS_STEAM_SEM_SOCKET_TRYWAIT) {
+        } else if (request.operation ==
+                   MACWS_STEAM_SEM_SOCKET_TRYWAIT) {
             BOOL consumedGrant = NO;
             if (request.waiter != 0) {
                 for (uint32_t index = 0;
@@ -3212,25 +4259,62 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
                     if (entry->pollingWaiters[index] != request.waiter ||
                         !entry->pollingWaiterGranted[index]) continue;
                     RemoveSteamSemaphorePollingWaiter(entry, index);
+                    state.waiterCount =
+                        SteamSemaphoreHostWaiterCount(entry);
                     consumedGrant = YES;
+                    stateDirty = YES;
                     break;
                 }
             }
             if (!consumedGrant) {
-                if (entry->value == 0) replyError = EAGAIN;
-                else entry->value--;
+                if (state.value == 0) replyError = EAGAIN;
+                else {
+                    state.value--;
+                    stateDirty = YES;
+                }
             }
-            replyValue = entry->value;
         } else if (request.operation == MACWS_STEAM_SEM_SOCKET_POST) {
-            if (!GrantSteamSemaphoreSocketWaiter(entry, diagnostics) &&
-                !GrantSteamSemaphorePollingWaiter(entry, diagnostics)) {
-                if (entry->value == MACWS_STEAM_SEM_VALUE_MAX)
-                    replyError = EOVERFLOW;
-                else entry->value++;
+            if (GrantSteamSemaphoreSocketWaiter(entry, diagnostics) ||
+                GrantSteamSemaphorePollingWaiter(entry, diagnostics)) {
+                state.waiterCount = SteamSemaphoreHostWaiterCount(entry);
+                stateDirty = YES;
+            } else if (state.value == MACWS_STEAM_SEM_VALUE_MAX) {
+                replyError = EOVERFLOW;
+            } else {
+                state.value++;
+                stateDirty = YES;
             }
-            replyValue = entry->value;
-        } else {
-            replyValue = entry->value;
+        }
+
+        if (stateError == 0) {
+            replyValue = state.value;
+            int storeError = stateDirty ?
+                StoreAndUnlockSteamSemaphoreState(entry, &state) : 0;
+            if (!stateDirty) UnlockSteamSemaphoreState(entry);
+            if (storeError != 0) {
+                replyError = storeError;
+                if (descriptorRetainedByWaiter) {
+                    for (uint32_t index = 0;
+                         index < entry->waiterSocketCount; index++) {
+                        if (entry->waiterSocketRequestIDs[index] !=
+                                request.requestID) continue;
+                        RemoveSteamSemaphoreSocketWaiter(entry, index);
+                        break;
+                    }
+                    descriptorRetainedByWaiter = NO;
+                }
+            }
+        }
+
+        if (descriptorRetainedByWaiter) {
+            if (request.operation == MACWS_STEAM_SEM_SOCKET_WAIT_TIMED &&
+                !ScheduleSteamSemaphoreSocketTimeout(
+                    request.generation, request.requestID,
+                    request.timeoutMicroseconds, diagnostics)) {
+                ExpireSteamSemaphoreSocketWaiter(
+                    request.generation, request.requestID, diagnostics);
+            }
+            return;
         }
 
         if (diagnostics && request.operation !=
@@ -3241,11 +4325,17 @@ static void ServeSteamSemaphoreWaitDescriptor(int descriptor) {
                     request.requestID, request.operation,
                     request.generation, request.waiter, replyError,
                     replyValue);
-        (void)WriteSteamSemaphoreWaitReply(
-            descriptor, replyError, entry->generation, replyValue,
-            request.requestID);
-        close(descriptor);
-    });
+        if (!WriteSteamSemaphoreWaitReply(
+                descriptor, replyError, entry->generation, replyValue,
+                request.requestID))
+            connectionFailed = YES;
+        });
+        if (descriptorRetainedByWaiter) return;
+        if (connectionFailed) {
+            close(descriptor);
+            return;
+        }
+    }
 }
 
 static BOOL StartSteamSemaphoreWaitListener(void) {
@@ -3321,13 +4411,14 @@ static BOOL StartSteamSemaphoreWaitListener(void) {
                 close(client);
                 continue;
             }
-            // Read and enqueue accepted requests on one serial listener queue.
-            // THEORY under test: the previous global-queue hop could let the
-            // high-rate GETVALUE client overtake an already accepted POST.
-            // Request IDs in the diagnostic log make that ordering directly
-            // observable; the actual counter mutation remains isolated on
-            // gSteamSemaphoreQueue.
-            ServeSteamSemaphoreWaitDescriptor(client);
+            // A validated client keeps one channel per calling thread. Do not
+            // block the serial accept queue while that channel waits for its
+            // next request. Counter mutation and reply ordering remain
+            // serialized by gSteamSemaphoreQueue inside the worker.
+            dispatch_async(dispatch_get_global_queue(
+                QOS_CLASS_USER_INITIATED, 0), ^{
+                    ServeSteamSemaphoreWaitDescriptor(client);
+                });
         }
     });
     dispatch_source_set_cancel_handler(gSteamSemaphoreWaitListener, ^{
@@ -3488,6 +4579,7 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
                     ReplySteamSemaphore(request, ENOMEM, 0, NO);
                     return;
                 }
+                entry->stateDescriptor = -1;
                 entry->generation = ++gSteamSemaphoreNextGeneration;
                 entry->value = (uint32_t)initialValue;
                 strlcpy(entry->name, name, sizeof(entry->name));
@@ -3551,69 +4643,89 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
             request, MACWS_STEAM_SEM_KEY_WAITER);
 
         // Legacy XPC high-frequency adapter retained only for protocol
-        // diagnostics and older clients. Protocol v21 clients mutate the same
-        // authoritative counter through the Unix-stream listener above;
-        // blocking waits leave their connected descriptor in a FIFO until a
-        // post writes the exact reply. Runtime v18 proved that an ordinary
-        // blocking read could miss a cross-runtime stream wake, so v21 clients
-        // block through measured-good kqueue/EVFILT_READ instead.
+        // diagnostics. Protocol v23 clients mutate the authoritative state
+        // vnode directly for uncontended value operations and use the stream
+        // listener only for real waiters. Keep these diagnostic operations on
+        // that same locked state transaction: entry->value is a reply/log
+        // mirror, never an independent counter.
         if (tryWaitOperation) {
+            MacWSSteamSemaphoreState state = {0};
+            int stateError = LockSteamSemaphoreState(entry, &state);
+            if (stateError != 0) {
+                ReplySteamSemaphoreValue(
+                    request, stateError, generation, entry->value);
+                return;
+            }
             if (waiter != 0) {
                 for (uint32_t index = 0;
                      index < entry->pollingWaiterCount; index++) {
                     if (entry->pollingWaiters[index] != waiter ||
                         !entry->pollingWaiterGranted[index]) continue;
-                    entry->pollingWaiterCount--;
-                    if (index != entry->pollingWaiterCount) {
-                        memmove(&entry->pollingWaiters[index],
-                                &entry->pollingWaiters[index + 1],
-                                (entry->pollingWaiterCount - index) *
-                                    sizeof(entry->pollingWaiters[0]));
-                        memmove(&entry->pollingWaiterGranted[index],
-                                &entry->pollingWaiterGranted[index + 1],
-                                (entry->pollingWaiterCount - index) *
-                                    sizeof(entry->pollingWaiterGranted[0]));
-                    }
+                    RemoveSteamSemaphorePollingWaiter(entry, index);
+                    state.waiterCount =
+                        SteamSemaphoreHostWaiterCount(entry);
+                    stateError = StoreAndUnlockSteamSemaphoreState(
+                        entry, &state);
                     ReplySteamSemaphoreValue(
-                        request, 0, generation, entry->value);
+                        request, stateError, generation, state.value);
                     return;
                 }
             }
-            if (entry->value == 0) {
+            if (state.value == 0) {
                 // A synchronous client cannot enqueue its next poll until it
                 // receives this reply. Yield once before replying so the XPC
                 // listener can enqueue work from another Steam process or
                 // generation; this is a fairness boundary, not a fabricated
                 // timeout or semaphore token.
+                UnlockSteamSemaphoreState(entry);
                 sched_yield();
                 ReplySteamSemaphoreValue(request, EAGAIN, generation, 0);
                 return;
             }
-            entry->value--;
-            ReplySteamSemaphoreValue(request, 0, generation, entry->value);
+            state.value--;
+            stateError = StoreAndUnlockSteamSemaphoreState(entry, &state);
+            ReplySteamSemaphoreValue(
+                request, stateError, generation, state.value);
             return;
         }
 
         if (postOperation) {
+            MacWSSteamSemaphoreState state = {0};
+            int stateError = LockSteamSemaphoreState(entry, &state);
+            if (stateError != 0) {
+                ReplySteamSemaphoreValue(
+                    request, stateError, generation, entry->value);
+                return;
+            }
             BOOL diagnostics = SteamSemaphoreDiagnosticsEnabled(request);
             if (GrantSteamSemaphoreSocketWaiter(entry, diagnostics) ||
                 GrantSteamSemaphorePollingWaiter(entry, diagnostics)) {
+                state.waiterCount = SteamSemaphoreHostWaiterCount(entry);
+                stateError = StoreAndUnlockSteamSemaphoreState(entry, &state);
                 ReplySteamSemaphoreValue(
-                    request, 0, generation, entry->value);
+                    request, stateError, generation, state.value);
                 return;
             }
-            if (entry->value == MACWS_STEAM_SEM_VALUE_MAX) {
+            if (state.value == MACWS_STEAM_SEM_VALUE_MAX) {
+                UnlockSteamSemaphoreState(entry);
                 ReplySteamSemaphoreValue(request, EOVERFLOW, generation,
-                                         entry->value);
+                                         state.value);
                 return;
             }
-            entry->value++;
-            ReplySteamSemaphoreValue(request, 0, generation, entry->value);
+            state.value++;
+            stateError = StoreAndUnlockSteamSemaphoreState(entry, &state);
+            ReplySteamSemaphoreValue(
+                request, stateError, generation, state.value);
             return;
         }
 
         if (getValueOperation) {
-            ReplySteamSemaphoreValue(request, 0, generation, entry->value);
+            MacWSSteamSemaphoreState state = {0};
+            int stateError = LockSteamSemaphoreState(entry, &state);
+            if (stateError == 0) UnlockSteamSemaphoreState(entry);
+            ReplySteamSemaphoreValue(
+                request, stateError, generation,
+                stateError == 0 ? state.value : entry->value);
             return;
         }
 
@@ -3622,9 +4734,17 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
                 ReplySteamSemaphoreValue(request, EINVAL, generation, 0);
                 return;
             }
+            MacWSSteamSemaphoreState state = {0};
+            int stateError = LockSteamSemaphoreState(entry, &state);
+            if (stateError != 0) {
+                ReplySteamSemaphoreValue(
+                    request, stateError, generation, entry->value);
+                return;
+            }
             for (uint32_t index = 0;
                  index < entry->pollingWaiterCount; index++) {
                 if (entry->pollingWaiters[index] != waiter) continue;
+                UnlockSteamSemaphoreState(entry);
                 ReplySteamSemaphoreValue(
                     request, 0, generation,
                     entry->pollingWaiterGranted[index] ? 1 : 0);
@@ -3633,15 +4753,18 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
             if (entry->pollingWaiterCount >=
                 sizeof(entry->pollingWaiters) /
                     sizeof(entry->pollingWaiters[0])) {
+                UnlockSteamSemaphoreState(entry);
                 ReplySteamSemaphoreValue(request, ENOSPC, generation, 0);
                 return;
             }
             uint32_t index = entry->pollingWaiterCount++;
             entry->pollingWaiters[index] = waiter;
-            if (entry->value != 0) {
-                entry->value--;
+            if (state.value != 0) {
+                state.value--;
                 entry->pollingWaiterGranted[index] = 1;
             }
+            state.waiterCount = SteamSemaphoreHostWaiterCount(entry);
+            stateError = StoreAndUnlockSteamSemaphoreState(entry, &state);
             if (SteamSemaphoreDiagnosticsEnabled(request))
                 HostLog(@"Steam semaphore FIFO enqueue generation=%llu "
                         "waiter=%llu granted=%u position=%u waiters=%u",
@@ -3649,7 +4772,7 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
                         entry->pollingWaiterGranted[index], index,
                         entry->pollingWaiterCount);
             ReplySteamSemaphoreValue(
-                request, 0, generation,
+                request, stateError, generation,
                 entry->pollingWaiterGranted[index] ? 1 : 0);
             return;
         }
@@ -3735,6 +4858,460 @@ static void ServeSteamSemaphoreRequest(xpc_object_t request,
     });
 }
 
+// UE4's Metal backend streams complete legacy MTLB archives rather than MSL.
+// Ventura accepts the container at newLibraryWithData:, but iOS AGX later
+// rejects a pipeline whose AIR module still targets macOS.  Translate that
+// target at the library boundary in this iOS-native helper, where the device's
+// real LLVM tools are available, and persist a byte-exact cache entry.  This
+// is deliberately a typed Stray-only operation: no caller supplies a path or
+// argv, and a failed structural conversion is returned as a real failure.
+enum {
+    MacWSMetalLibraryHeaderSize = 88,
+    MacWSMetalLibraryMaximumSize = 1024 * 1024,
+};
+
+static uint16_t MetalReadU16(const uint8_t *bytes, size_t offset) {
+    uint16_t value = 0;
+    memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+static uint32_t MetalReadU32(const uint8_t *bytes, size_t offset) {
+    uint32_t value = 0;
+    memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+static uint64_t MetalReadU64(const uint8_t *bytes, size_t offset) {
+    uint64_t value = 0;
+    memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+static uint64_t MetalFNV1a64(const uint8_t *bytes, size_t length) {
+    uint64_t value = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < length; index++) {
+        value ^= bytes[index];
+        value *= UINT64_C(1099511628211);
+    }
+    return value;
+}
+
+static BOOL ValidateMetalLibraryData(NSData *data, BOOL source,
+                                     uint64_t *hashOut,
+                                     NSString **message) {
+    const uint8_t *bytes = data.bytes;
+    size_t length = data.length;
+    if (!bytes || length < MacWSMetalLibraryHeaderSize ||
+        length > MacWSMetalLibraryMaximumSize ||
+        memcmp(bytes, "MTLB", 4) != 0 ||
+        MetalReadU64(bytes, 16) != length) {
+        if (message) *message = @"MTLB 头或容器长度无效";
+        return NO;
+    }
+    uint16_t platform = MetalReadU16(bytes, 4);
+    uint8_t targetOS = bytes[11];
+    if (source) {
+        // Metal 902.1 legacy archives encode targetOS=0 and carry the
+        // authoritative macOS triple inside each AIR module.  Newer macOS
+        // archives use the explicit 0x81 value.  An iOS/macabi archive must
+        // never enter this conversion path.
+        if (platform != 0x8001 || (targetOS != 0x00 && targetOS != 0x81)) {
+            if (message) *message = @"输入不是受支持的 macOS MTLB";
+            return NO;
+        }
+    } else if (platform != 0x8001 || targetOS != 0x86) {
+        if (message) *message = @"转换结果没有声明 macabi 目标";
+        return NO;
+    }
+    static const size_t sectionOffsets[] = {24, 40, 56, 72};
+    for (size_t index = 0;
+         index < sizeof(sectionOffsets) / sizeof(sectionOffsets[0]); index++) {
+        size_t field = sectionOffsets[index];
+        uint64_t offset = MetalReadU64(bytes, field);
+        uint64_t size = MetalReadU64(bytes, field + 8);
+        if (offset > length || size > length - offset ||
+            ((index == 0 || index == 3) &&
+             (offset < MacWSMetalLibraryHeaderSize || size == 0))) {
+            if (message) *message = [NSString stringWithFormat:
+                @"MTLB section %zu 越界", index];
+            return NO;
+        }
+    }
+    uint64_t functionOffset = MetalReadU64(bytes, 24);
+    if (functionOffset > length - sizeof(uint32_t)) {
+        if (message) *message = @"MTLB function table 越界";
+        return NO;
+    }
+    uint32_t functionCount = MetalReadU32(bytes, (size_t)functionOffset);
+    if (functionCount == 0 || functionCount > 65536) {
+        if (message) *message = @"MTLB function count 无效";
+        return NO;
+    }
+    if (hashOut) *hashOut = MetalFNV1a64(bytes, length);
+    return YES;
+}
+
+static BOOL EnsureMetalCompatDirectory(NSString **message) {
+    struct stat status = {0};
+    if (lstat(kMetalCompatWorkingDirectory, &status) != 0) {
+        if (errno != ENOENT ||
+            mkdir(kMetalCompatWorkingDirectory, 0700) != 0) {
+            if (message) *message = [NSString stringWithFormat:
+                @"无法创建 Metal 转换目录（errno=%d）", errno];
+            return NO;
+        }
+    } else if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
+        if (message) *message = @"Metal 转换目录类型无效";
+        return NO;
+    }
+    if (chown(kMetalCompatWorkingDirectory, 0, 0) != 0 ||
+        chmod(kMetalCompatWorkingDirectory, 0700) != 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法保护 Metal 转换目录（errno=%d）", errno];
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL WriteMetalDataAtomically(NSData *data, NSString *path,
+                                     NSString **message) {
+    NSString *template = [path stringByAppendingString:@".XXXXXX"];
+    char temporary[PATH_MAX] = {0};
+    if (![template getFileSystemRepresentation:temporary
+                                      maxLength:sizeof(temporary)]) {
+        if (message) *message = @"Metal 临时路径过长";
+        return NO;
+    }
+    int descriptor = mkstemp(temporary);
+    if (descriptor < 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"无法创建 Metal 临时文件（errno=%d）", errno];
+        return NO;
+    }
+    BOOL ok = fchmod(descriptor, 0600) == 0;
+    int savedErrno = ok ? 0 : errno;
+    const uint8_t *bytes = data.bytes;
+    size_t written = 0;
+    while (ok && written < data.length) {
+        ssize_t count = write(descriptor, bytes + written,
+                              data.length - written);
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            ok = NO;
+            savedErrno = count < 0 ? errno : EIO;
+        }
+    }
+    if (ok && fsync(descriptor) != 0) {
+        ok = NO;
+        savedErrno = errno;
+    }
+    if (close(descriptor) != 0 && ok) {
+        ok = NO;
+        savedErrno = errno;
+    }
+    if (ok && rename(temporary, path.fileSystemRepresentation) != 0) {
+        ok = NO;
+        savedErrno = errno;
+    }
+    if (!ok) {
+        (void)unlink(temporary);
+        if (message) *message = [NSString stringWithFormat:
+            @"写入 Metal 转换输入失败（errno=%d）", savedErrno];
+    }
+    return ok;
+}
+
+// The game waits synchronously at -newLibraryWithData:error:, so a wedged
+// converter must have a real upper bound.  Put the fixed converter argv in a
+// fresh process group, poll the real child status, and terminate that whole
+// group on timeout.  Returning 124 keeps Metal's original failure semantics;
+// no library or pipeline success is fabricated.
+static int RunMetalCompatCommand(const char *const argv[],
+                                 NSTimeInterval timeout) {
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawn_file_actions_init(&actions);
+    if (error != 0) return 128 + error;
+    int logFD = open(kMetalCompatLog,
+                     O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (logFD >= 0) {
+        (void)posix_spawn_file_actions_adddup2(
+            &actions, logFD, STDOUT_FILENO);
+        (void)posix_spawn_file_actions_adddup2(
+            &actions, logFD, STDERR_FILENO);
+        (void)posix_spawn_file_actions_addclose(&actions, logFD);
+    }
+    posix_spawnattr_t attributes;
+    error = posix_spawnattr_init(&attributes);
+    BOOL attributesInitialized = error == 0;
+    if (error == 0)
+        error = posix_spawnattr_setflags(&attributes,
+                                         POSIX_SPAWN_SETPGROUP);
+    if (error == 0)
+        error = posix_spawnattr_setpgroup(&attributes, 0);
+    pid_t pid = 0;
+    if (error == 0) {
+        error = posix_spawn(&pid, argv[0], &actions, &attributes,
+                            (char *const *)argv, environ);
+    }
+    if (attributesInitialized) posix_spawnattr_destroy(&attributes);
+    posix_spawn_file_actions_destroy(&actions);
+    if (logFD >= 0) close(logFD);
+    if (error != 0) {
+        HostLog(@"metal-retarget spawn failed executable=%s error=%d (%s)",
+                argv[0], error, strerror(error));
+        return 128 + error;
+    }
+
+    HostLog(@"metal-retarget spawned pid=%d executable=%s timeout=%.1fs",
+            pid, argv[0], timeout);
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    int status = 0;
+    for (;;) {
+        pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid) break;
+        if (waited < 0 && errno != EINTR) return 127;
+        if (deadline.timeIntervalSinceNow <= 0) {
+            HostLog(@"metal-retarget timeout pid=%d executable=%s",
+                    pid, argv[0]);
+            (void)kill(-pid, SIGTERM);
+            NSDate *termDeadline =
+                [NSDate dateWithTimeIntervalSinceNow:0.5];
+            do {
+                waited = waitpid(pid, &status, WNOHANG);
+                if (waited == pid) return 124;
+                usleep(20000);
+            } while (termDeadline.timeIntervalSinceNow > 0);
+            (void)kill(-pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+            return 124;
+        }
+        usleep(20000);
+    }
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+    return 126;
+}
+
+static pid_t MetalCompatPeerPID(xpc_object_t request) {
+    xpc_connection_t peer = xpc_dictionary_get_remote_connection(request);
+    if (!peer) return 0;
+    typedef pid_t (*ConnectionGetPID)(xpc_connection_t);
+    static ConnectionGetPID getPID;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        getPID = (ConnectionGetPID)dlsym(
+            RTLD_DEFAULT, "xpc_connection_get_pid");
+    });
+    return getPID ? getPID(peer) : 0;
+}
+
+static NSData *LoadCachedMetalReplacement(size_t sourceLength,
+                                          uint64_t sourceHash,
+                                          uint64_t *replacementHashOut,
+                                          NSString **message) {
+    NSString *stem = [NSString stringWithFormat:@"%zu-%016llx",
+                      sourceLength, (unsigned long long)sourceHash];
+    NSString *libraryPath = [@(kMetalCompatExactDirectory)
+        stringByAppendingPathComponent:[stem stringByAppendingString:
+            @".metallib"]];
+    NSString *metadataPath = [@(kMetalCompatExactDirectory)
+        stringByAppendingPathComponent:[stem stringByAppendingString:@".meta"]];
+    struct stat libraryStatus = {0}, metadataStatus = {0};
+    if (stat(libraryPath.fileSystemRepresentation, &libraryStatus) != 0 ||
+        stat(metadataPath.fileSystemRepresentation, &metadataStatus) != 0 ||
+        libraryStatus.st_uid != 0 || metadataStatus.st_uid != 0 ||
+        !S_ISREG(libraryStatus.st_mode) || !S_ISREG(metadataStatus.st_mode) ||
+        (libraryStatus.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        (metadataStatus.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        return nil;
+    }
+    NSString *metadata = ReadSmallTextFile(
+        metadataPath.fileSystemRepresentation, 128);
+    unsigned long long expectedHash = 0;
+    unsigned long long expectedLength = 0;
+    char trailing = 0;
+    if (sscanf(metadata.UTF8String ?: "", "%llu %llx %c",
+               &expectedLength, &expectedHash, &trailing) != 2 ||
+        expectedLength < MacWSMetalLibraryHeaderSize ||
+        expectedLength > MacWSMetalLibraryMaximumSize ||
+        libraryStatus.st_size != (off_t)expectedLength) {
+        if (message) *message = @"Metal 精确缓存 metadata 无效";
+        return nil;
+    }
+    NSData *replacement = [NSData dataWithContentsOfFile:libraryPath];
+    uint64_t observedHash = 0;
+    NSString *validationMessage = nil;
+    if (!ValidateMetalLibraryData(replacement, NO, &observedHash,
+                                  &validationMessage) ||
+        observedHash != (uint64_t)expectedHash) {
+        if (message) *message = validationMessage ?:
+            @"Metal 精确缓存哈希不匹配";
+        return nil;
+    }
+    if (replacementHashOut) *replacementHashOut = observedHash;
+    return replacement;
+}
+
+static NSData *ConvertAndCacheMetalLibrary(NSData *source,
+                                           uint64_t sourceHash,
+                                           uint64_t *replacementHashOut,
+                                           BOOL *cacheHitOut,
+                                           NSString **message) {
+    NSData *cached = LoadCachedMetalReplacement(
+        source.length, sourceHash, replacementHashOut, nil);
+    if (cached) {
+        if (cacheHitOut) *cacheHitOut = YES;
+        return cached;
+    }
+    if (cacheHitOut) *cacheHitOut = NO;
+    if (!EnsureMetalCompatDirectory(message)) return nil;
+    const char *required[] = {
+        kProcursusPython, kMetalCompatConverter, kMetalCompatInstaller,
+        kLLVM16Dis, kLLVM16As,
+    };
+    for (size_t index = 0;
+         index < sizeof(required) / sizeof(required[0]); index++) {
+        if (access(required[index], index == 0 || index >= 3 ? X_OK : R_OK)
+                != 0) {
+            if (message) *message = [NSString stringWithFormat:
+                @"Metal 转换依赖缺失：%s", required[index]];
+            return nil;
+        }
+    }
+
+    NSString *sourceName = [NSString stringWithFormat:
+        @"macws_mtl_data_0000_%016llx.bin",
+        (unsigned long long)sourceHash];
+    NSString *sourcePath = [@(kMetalCompatWorkingDirectory)
+        stringByAppendingPathComponent:sourceName];
+    NSString *outputPath = [@(kMetalCompatWorkingDirectory)
+        stringByAppendingPathComponent:[NSString stringWithFormat:
+            @"%zu-%016llx.converted.metallib", source.length,
+            (unsigned long long)sourceHash]];
+    (void)unlink(outputPath.fileSystemRepresentation);
+    if (!WriteMetalDataAtomically(source, sourcePath, message)) return nil;
+
+    const char *convert[] = {
+        kProcursusPython, kMetalCompatConverter,
+        sourcePath.fileSystemRepresentation,
+        outputPath.fileSystemRepresentation,
+        "--llvm-dis", kLLVM16Dis,
+        "--llvm-as", kLLVM16As,
+        "--target-triple", "air64-apple-ios19.0.0-macabi",
+        "--container-target", "macabi",
+        "--target-major", "19",
+        "--target-minor", "0",
+        // Apply only lowerings whose complete, registered AIR/LLVM call shape
+        // is present.  Runtime A/B for Stray's scene-transition pipeline
+        // proved that target retargeting alone leaves a fixed 24-byte memset
+        // which iOS 16 AGX rejects, while the equivalent three i64 stores
+        // build with the unchanged descriptor.  Unknown shapes still fail
+        // closed in the converter.
+        "--auto-lower-known-air",
+        NULL,
+    };
+    int conversionResult = RunMetalCompatCommand(convert, 20.0);
+    if (conversionResult != 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"MTLB 转换失败（退出码 %d）", conversionResult];
+        (void)unlink(sourcePath.fileSystemRepresentation);
+        (void)unlink(outputPath.fileSystemRepresentation);
+        return nil;
+    }
+    const char *install[] = {
+        kProcursusPython, kMetalCompatInstaller,
+        sourcePath.fileSystemRepresentation,
+        "--prebuilt-replacement", outputPath.fileSystemRepresentation,
+        NULL,
+    };
+    int installResult = RunMetalCompatCommand(install, 10.0);
+    (void)unlink(sourcePath.fileSystemRepresentation);
+    (void)unlink(outputPath.fileSystemRepresentation);
+    if (installResult != 0) {
+        if (message) *message = [NSString stringWithFormat:
+            @"MTLB 精确缓存安装失败（退出码 %d）", installResult];
+        return nil;
+    }
+    NSData *replacement = LoadCachedMetalReplacement(
+        source.length, sourceHash, replacementHashOut, message);
+    if (!replacement && message && !*message)
+        *message = @"MTLB 转换完成但精确缓存验证失败";
+    return replacement;
+}
+
+static void ServeMetalLibraryRetargetRequest(xpc_object_t request) {
+    pid_t peerPID = MetalCompatPeerPID(request);
+    NSString *peerPath = RootExecutablePathForPID(peerPID);
+    struct stat probeStatus = {0};
+    BOOL productionPeer =
+        [peerPath isEqualToString:@(kStrayExecutable)];
+    BOOL diagnosticPeer =
+        [peerPath isEqualToString:@(kMetalCompatProbeExecutable)] &&
+        stat(kMetalCompatProbeExecutable, &probeStatus) == 0 &&
+        S_ISREG(probeStatus.st_mode) && probeStatus.st_uid == 0 &&
+        (probeStatus.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+    if (peerPID <= 1 || (!productionPeer && !diagnosticPeer)) {
+        ReplyResult(request, NO, @"调用者不是受支持的 Stray 进程", nil);
+        HostLog(@"metal-retarget rejected peer=%d path=%@", peerPID,
+                peerPath ?: @"(unknown)");
+        return;
+    }
+    size_t sourceLength = 0;
+    const void *sourceBytes = xpc_dictionary_get_data(
+        request, MACWS_CONTROL_KEY_METAL_LIBRARY, &sourceLength);
+    NSData *source = sourceBytes && sourceLength
+        ? [NSData dataWithBytes:sourceBytes length:sourceLength] : nil;
+    uint64_t sourceHash = 0;
+    NSString *message = nil;
+    if (!ValidateMetalLibraryData(source, YES, &sourceHash, &message)) {
+        ReplyResult(request, NO, message ?: @"MTLB 输入无效", nil);
+        return;
+    }
+    uint64_t claimedLength = xpc_dictionary_get_uint64(
+        request, MACWS_CONTROL_KEY_SOURCE_LENGTH);
+    uint64_t claimedHash = xpc_dictionary_get_uint64(
+        request, MACWS_CONTROL_KEY_SOURCE_HASH);
+    if (claimedLength != sourceLength || claimedHash != sourceHash) {
+        ReplyResult(request, NO, @"MTLB 请求身份与字节不匹配", nil);
+        return;
+    }
+    CFAbsoluteTime began = CFAbsoluteTimeGetCurrent();
+    uint64_t replacementHash = 0;
+    BOOL cacheHit = NO;
+    NSData *replacement = ConvertAndCacheMetalLibrary(
+        source, sourceHash, &replacementHash, &cacheHit, &message);
+    double elapsedMS = (CFAbsoluteTimeGetCurrent() - began) * 1000.0;
+    BOOL ok = replacement != nil;
+    HostLog(@"metal-retarget peer=%d kind=%@ source=%zu/%016llx result=%@ "
+            "replacement=%lu/%016llx cache=%@ elapsed-ms=%.3f message=%@",
+            peerPID, productionPeer ? @"stray" : @"diagnostic",
+            sourceLength, (unsigned long long)sourceHash,
+            ok ? @"ok" : @"failed", (unsigned long)replacement.length,
+            (unsigned long long)replacementHash,
+            cacheHit ? @"hit" : @"converted", elapsedMS, message ?: @"");
+    ReplyResult(request, ok, ok ? @"MTLB 已转换为 macabi" : message,
+                ^(xpc_object_t reply) {
+        xpc_dictionary_set_uint64(reply, MACWS_CONTROL_KEY_SOURCE_LENGTH,
+                                  sourceLength);
+        xpc_dictionary_set_uint64(reply, MACWS_CONTROL_KEY_SOURCE_HASH,
+                                  sourceHash);
+        xpc_dictionary_set_bool(reply, "cache_hit", cacheHit);
+        xpc_dictionary_set_double(reply, "elapsed_ms", elapsedMS);
+        if (!replacement) return;
+        xpc_dictionary_set_uint64(
+            reply, MACWS_CONTROL_KEY_REPLACEMENT_LENGTH,
+            replacement.length);
+        xpc_dictionary_set_uint64(
+            reply, MACWS_CONTROL_KEY_REPLACEMENT_HASH, replacementHash);
+        xpc_dictionary_set_data(reply, MACWS_CONTROL_KEY_METAL_LIBRARY,
+                                replacement.bytes, replacement.length);
+    });
+}
+
 static void ServeRequest(xpc_object_t request) {
     if (xpc_get_type(request) != XPC_TYPE_DICTIONARY) return;
     const char *op = xpc_dictionary_get_string(request, MACWS_CONTROL_KEY_OP);
@@ -3765,6 +5342,14 @@ static void ServeRequest(xpc_object_t request) {
     }
     if (strcmp(op, MACWS_CONTROL_OP_RESOLVE_HOST) == 0) {
         ReplyHostResolution(request);
+        return;
+    }
+    if (strcmp(op, MACWS_CONTROL_OP_RETARGET_METAL_LIBRARY) == 0) {
+        dispatch_async(gMetalCompatQueue, ^{
+            @autoreleasepool {
+                ServeMetalLibraryRetargetRequest(request);
+            }
+        });
         return;
     }
 
@@ -3815,6 +5400,98 @@ static void ServeRequest(xpc_object_t request) {
             ok = rc == 0;
             message = ok ? @"启动环境修复完成" :
                 [NSString stringWithFormat:@"环境修复失败（退出码 %d）", rc];
+        } else if (strcmp(op, MACWS_CONTROL_OP_REPAIR_DESKTOP) == 0) {
+            // This is intentionally distinct from the full environment
+            // repair above.  The script keeps WindowServer and ordinary app
+            // PIDs alive, then rebuilds only the login-session services that
+            // own icons, Dock/Spaces, wallpaper and the menu extras.
+            SetState(YES, @"保留应用并修复桌面服务…", @"");
+            BOOL windowServerWasRunning =
+                JobHasPID(kWindowServerLabel, NULL);
+            int rc = 0;
+            BOOL escalated = NO;
+            BOOL minimalRebuild = NO;
+            if (!windowServerWasRunning) {
+                // Runtime-confirmed via MacWSDesktopRepair.log:174-177 on
+                // 2026-08-23: after an escalated rebuild stopped the damaged
+                // generation but its replacement failed preflight, every
+                // later Repair Desktop request called the in-place script
+                // again.  That script correctly returned "requires a running
+                // WindowServer", but hostd treated the typed offline state as
+                // a terminal rc=1 and left the button unable to recover the
+                // workspace.  A stopped desktop has no application PIDs to
+                // preserve, so enter the same production StartGUI transaction
+                // used by the primary button and require all of its service
+                // endpoint witnesses before reporting success.
+                BOOL experimental = access(kExperimentalKCmd, F_OK) == 0 ||
+                    access(kExperimentalCompletion, F_OK) == 0;
+                SetState(YES, @"桌面会话离线，正在完整恢复…", @"");
+                NSString *startMessage = nil;
+                ok = StartGUI(experimental, &startMessage);
+                message = ok
+                    ? @"macOS 桌面会话已重新启动；Dock、桌布、菜单服务与最终合成已恢复"
+                    : [NSString stringWithFormat:
+                        @"桌面会话离线且恢复失败：%@",
+                        startMessage ?: @"启动失败"];
+            } else {
+                const char *argv[] = {kBash, kGUI, "repair-desktop", NULL};
+                rc = RunCommandToLog(argv, YES, kDesktopRepairLogPath);
+                escalated = rc == 2;
+                if (escalated) {
+                    // The in-place path proved its service PIDs but did not
+                    // get a fresh WindowServer-owned final-composite witness.
+                    // Keeping that generation alive would knowingly return
+                    // the Host to a window-layer fallback that cannot
+                    // reproduce Dock/menu materials. Escalate only on this
+                    // typed result; ordinary script failures never trigger a
+                    // broader teardown.
+                    SetState(YES, @"最终合成无响应，正在快速切换显示会话…", @"");
+                    const char *rebuildArgv[] = {
+                        kBash, kGUI, "rebuild-desktop-session",
+                        "--no-terminal", "--no-vnc", NULL,
+                    };
+                    int rebuildRC = RunCommandToLog(
+                        rebuildArgv, YES, kDesktopRepairLogPath);
+                    minimalRebuild = rebuildRC == 0;
+                    if (minimalRebuild) {
+                        ok = YES;
+                        message = @"最终合成曾失去响应；已快速切换 WindowServer 显示会话并验证 Dock、毛玻璃和输入";
+                    } else {
+                        // The bounded session-only path changes neither the
+                        // persistent LaunchServices catalog nor trust state.
+                        // Fall back to the full production transaction only
+                        // when its real pixel/input postconditions fail.
+                        BOOL experimental =
+                            access(kExperimentalKCmd, F_OK) == 0 ||
+                            access(kExperimentalCompletion, F_OK) == 0;
+                        SetState(YES, @"快速切换失败，正在完整恢复桌面…", @"");
+                        NSString *stopMessage = nil;
+                        NSString *startMessage = nil;
+                        BOOL stopped = StopGUI(&stopMessage);
+                        BOOL started = stopped && StartGUI(experimental,
+                                                           &startMessage);
+                        ok = stopped && started;
+                        message = ok
+                            ? @"快速切换未通过验证；已完成全量桌面恢复"
+                            : [NSString stringWithFormat:
+                                @"桌面最终合成恢复失败：%@",
+                                stopped ? (startMessage ?: @"启动失败")
+                                        : (stopMessage ?: @"停止失败")];
+                    }
+                } else {
+                    ok = rc == 0;
+                    message = ok
+                        ? @"Dock、图标、桌布、菜单服务与最终合成已验证；当前应用已保留"
+                        : [NSString stringWithFormat:
+                            @"桌面修复失败（退出码 %d），请查看诊断日志", rc];
+                }
+            }
+            HostLog(@"desktop-repair result=%@ rc=%d recovery=%s log=%s",
+                    ok ? (!windowServerWasRunning ? @"started-offline" :
+                          (escalated ? (minimalRebuild ? @"rebuilt-session" : @"rebuilt-full") : @"ready")) : @"failed",
+                    rc,
+                    escalated ? (minimalRebuild ? "session" : "full") : "in-place",
+                    kDesktopRepairLogPath);
         } else if (strcmp(op, MACWS_CONTROL_OP_RECOVER) == 0) {
             SetState(YES, @"执行安全恢复…", @"");
             ok = StopGUI(&message);
@@ -3873,13 +5550,18 @@ int main(int argc, const char *argv[]) {
         gLogQueue = dispatch_queue_create("com.macwsguide.hostd.log", DISPATCH_QUEUE_SERIAL);
         gSteamSemaphoreQueue = dispatch_queue_create(
             "com.macwsguide.hostd.steam-semaphore", DISPATCH_QUEUE_SERIAL);
+        if (!StartSteamSemaphoreDeadlineThread())
+            HostLog(@"Steam semaphore deadline thread failed to start");
         gSteamMachRendezvousQueue = dispatch_queue_create(
             "com.macwsguide.hostd.steam-mach-rendezvous",
             DISPATCH_QUEUE_SERIAL);
+        gMetalCompatQueue = dispatch_queue_create(
+            "com.macwsguide.hostd.metal-compat", DISPATCH_QUEUE_SERIAL);
         gSteamSemaphoreNames = [NSMutableDictionary dictionary];
         gSteamMachRendezvousPorts = [NSMutableDictionary dictionary];
         gSteamSemaphoreGenerations = [NSMutableDictionary dictionary];
         gSteamSemaphoreUnlinkReceipts = [NSMutableDictionary dictionary];
+        gApplicationSessions = [NSMutableDictionary dictionary];
         gSteamSemaphoreNextGeneration =
             ((uint64_t)arc4random() << 32) | arc4random();
         if (gSteamSemaphoreNextGeneration == UINT64_MAX)
@@ -3891,6 +5573,7 @@ int main(int argc, const char *argv[]) {
         }
         HostLog(@"macwshostd starting pid=%d protocol=%u uid=%d", getpid(),
                 MACWS_CONTROL_VERSION, getuid());
+        StartApplicationSessionSupervisor();
 
         xpc_connection_t (*createMach)(const char *, dispatch_queue_t, uint64_t) =
             dlsym(RTLD_DEFAULT, "xpc_connection_create_mach_service");

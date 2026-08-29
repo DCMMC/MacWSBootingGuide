@@ -209,7 +209,14 @@
             finish(NO, @"悬停测试适配器不可用");
             return;
         }
-        const NSInteger steps = 120;
+        // Keep this bounded, but exercise the repeated left/right camera
+        // motion used to reproduce Stray's lazy-pipeline failures.  A single
+        // one-way one-second sweep only exposed the first visible material;
+        // eight traversals cover both directions through the same production
+        // indirect-pointer route at 120 Hz.
+        const NSInteger traversalCount = 8;
+        const NSInteger stepsPerTraversal = 120;
+        const NSInteger steps = traversalCount * stepsPerTraversal;
         const uint64_t stepNanoseconds = NSEC_PER_SEC / 120;
         CGPoint start = CGPointMake(
             fmax(0.0, center.x - width * 0.06), center.y);
@@ -219,7 +226,11 @@
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                          index * stepNanoseconds),
                            dispatch_get_main_queue(), ^{
-                CGFloat progress = index / (CGFloat)steps;
+                NSInteger traversal = index / stepsPerTraversal;
+                NSInteger traversalStep = index % stepsPerTraversal;
+                CGFloat progress =
+                    traversalStep / (CGFloat)stepsPerTraversal;
+                if (traversal & 1) progress = 1.0 - progress;
                 self.emitPointer(MacWSInputKindHover, CGPointMake(
                     start.x + (end.x - start.x) * progress, start.y),
                     0.0f, 0);
@@ -229,8 +240,10 @@
                                      (steps + 1) * stepNanoseconds +
                                      400 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
-            MacWSLog(@"performance-gesture-end scenario=hover success=YES");
-            finish(YES, @"120 Hz 悬停场景已完成");
+            MacWSLog(@"performance-gesture-end scenario=hover success=YES "
+                     "traversals=%ld samples=%ld",
+                     (long)traversalCount, (long)(steps + 1));
+            finish(YES, @"120 Hz 八次往返悬停场景已完成");
         });
         return;
     }
@@ -337,7 +350,7 @@
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (steps + 1) * stepNanoseconds +
-                                     250 * NSEC_PER_MSEC),
+                                     400 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             if (self.missionControlDidCommit)
                 self.missionControlDidCommit();
@@ -348,7 +361,7 @@
         // independent input-to-visible sample.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (steps + 1) * stepNanoseconds +
-                                     300 * NSEC_PER_MSEC),
+                                     800 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             self.emitPointer(
                 MacWSInputKindTap, center, 1.0f,
@@ -356,7 +369,7 @@
         });
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (steps + 1) * stepNanoseconds +
-                                     1250 * NSEC_PER_MSEC),
+                                     2200 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
             MacWSLog(@"performance-gesture-end "
                      "scenario=mission-select success=YES");

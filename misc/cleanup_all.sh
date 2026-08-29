@@ -96,6 +96,18 @@ for pat in WindowServer launchservicesd OSXvnc-server Terminal GlassDemo \
   pkill -9 -f "$pat" 2>/dev/null
 done
 
+# Retire the bounded Stray runner's device-local launchd safety lease after
+# its job has been unloaded above.  Also name the exact prepared executable so
+# emergency cleanup does not depend on the wider GUI shutdown succeeding.
+stray_exec='/Users/root/Library/Application Support/Steam/steamapps/macws-runtime/Stray/Stray.app/Contents/MacOS/Stray-Mac-Shipping'
+for pid in $(ps -axo pid=,command= 2>/dev/null |
+    awk -v exact="$stray_exec" '$0 ~ exact {print $1}'); do
+  command=$(ps -p "$pid" -o command= 2>/dev/null)
+  [ "$command" = "$stray_exec" ] && kill -9 "$pid" 2>/dev/null
+done
+rm -f /var/mobile/Library/Logs/macws-stray-safety.heartbeat \
+      /var/jb/Library/LaunchDaemons/com.macwsguide.stray-safety.plist
+
 # A running UIKit application is owned by mobile and may survive root's
 # procursus pkill on this jailbreak. Remove its exact dynamic launchd label,
 # then kill only the executable path if SpringBoard has not reaped it yet.
@@ -124,8 +136,9 @@ rm -f /var/mnt/rootfs/private/tmp/macws_menu_client.*.sock 2>/dev/null
 rm -f /var/mnt/rootfs/private/tmp/macws_menu_snapshot.*.bin 2>/dev/null
 
 echo === killing orphan build/debug scripts ===
-for pat in 'sh /tmp/' oslog build_on_ios.sh find_crash.sh '/var/jb/usr/bin/lldb' \
-           debugserver tmux; do
+for pat in 'sh /tmp/' oslog build_on_ios.sh \
+           '/var/jb/usr/macOS/bin/postinst.sh' '/var/jb/usr/bin/ldid' \
+           find_crash.sh '/var/jb/usr/bin/lldb' debugserver tmux; do
   pkill -9 -f "$pat" 2>/dev/null
 done
 # procursus pkill has occasionally missed an already-orphaned oslog process.

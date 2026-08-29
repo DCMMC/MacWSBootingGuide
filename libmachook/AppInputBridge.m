@@ -17,6 +17,7 @@
 #import <mach-o/loader.h>
 #import <ptrauth.h>
 #import <ctype.h>
+#import <crt_externs.h>
 #import <stdatomic.h>
 #import <stdarg.h>
 #import <sys/socket.h>
@@ -107,6 +108,7 @@ typedef CGPoint (*MacWSMouseLocation)(id, SEL);
 typedef int32_t (*MacWSCancelMenuTrackingPrivate)(uint8_t);
 typedef int32_t (*MacWSCGWindowLevelForKey)(int32_t);
 typedef void (*MacWSOrderWindow)(id, SEL, NSInteger, NSInteger);
+typedef void (*MacWSToggleFullScreen)(id, SEL, id);
 
 static int MacWSAppInputSocket = -1;
 static _Atomic int MacWSAppInputInstallState;
@@ -120,6 +122,8 @@ static void MacWSNotifyDisplayCatalogChanged(uint8_t reason);
 static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
                                               CGRect appliedFrame);
 static void MacWSInstallWindowGeometryObservers(void);
+static BOOL MacWSMainBundleUsesFullscreenCanvasPresentation(void);
+static void MacWSInstallFullscreenTransitionPrerequisite(void);
 // Main-thread-only semantic menu snapshot cache. ObjC objects never cross the
 // process boundary: Host receives generation-scoped integer IDs, while the
 // target process retains the corresponding item and index path solely long
@@ -162,6 +166,7 @@ static NSUInteger MacWSAppInputRFBTrackingButtons;
 // outside click on the base window.
 static NSHashTable *MacWSOrderedWindowRegistry;
 static MacWSOrderWindow MacWSOriginalOrderWindow;
+static MacWSToggleFullScreen MacWSOriginalToggleFullScreen;
 static MacWSPressedMouseButtons MacWSOriginalPressedMouseButtons;
 static MacWSMouseLocation MacWSOriginalMouseLocation;
 // Main-thread scoped. AppKit's menu-bar tracker ignores the passed NSEvent's
@@ -319,6 +324,65 @@ static void MacWSInstallOrderedWindowRegistry(void) {
     // _RegisterApplication. Existing document windows remain discoverable
     // through the request-time application.windows scan; this registry is
     // specifically for later transient windows crossing orderWindow:.
+}
+
+// UE4's native fullscreen state machine assumes the NSWindow is already
+// ordered before -toggleFullScreen: begins.  That prerequisite normally comes
+// from LaunchServices activating the application.  Steam's chroot fallback is
+// a direct posix_spawn because NSWorkspace returns NSCocoaErrorDomain/259, so
+// no open-application event orders the first FCocoaWindow.  Runtime evidence
+// from Stray PID 69345 captured the resulting invariant failure without any
+// input: the only window-metrics entry was invisible 10x28 window 554, while
+// 2016/2016 game-thread samples were in
+// FMacWindow::WaitForFullScreenTransition and the live non-fragile ivars were
+// WindowMode=2, TargetWindowMode=1.  The exact Stray binary shows that only
+// -windowDidEnterFullScreen: copies TargetWindowMode into WindowMode.
+//
+// Fulfil the missing AppKit prerequisite at the real transition boundary.
+// This does not forge a fullscreen notification or a UE mode field: AppKit's
+// original -toggleFullScreen: still owns the transition and its delegate
+// callbacks remain the sole authority that advances UE's state machine.
+static void MacWSAppInputToggleFullScreen(id self, SEL selector, id sender) {
+    BOOL visibleBefore = ((MacWSMsgBool)objc_msgSend)(
+        self, sel_registerName("isVisible"));
+    if (MacWSMainBundleUsesFullscreenCanvasPresentation() &&
+        !visibleBefore) {
+        NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+            self, sel_registerName("windowNumber"));
+        CGRect frame = ((MacWSMsgRect)objc_msgSend)(
+            self, sel_registerName("frame"));
+        ((MacWSMsgVoidID)objc_msgSend)(
+            self, sel_registerName("makeKeyAndOrderFront:"), nil);
+        BOOL visibleAfter = ((MacWSMsgBool)objc_msgSend)(
+            self, sel_registerName("isVisible"));
+        fprintf(stderr,
+            "#### STRAY-FULLSCREEN prerequisite=ordered-window "
+            "pid=%d window=%ld class=%s visible=%s->%s "
+            "frame=(%.1f,%.1f %.1fx%.1f)\n",
+            getpid(), (long)number, object_getClassName(self),
+            visibleBefore ? "YES" : "NO",
+            visibleAfter ? "YES" : "NO",
+            frame.origin.x, frame.origin.y,
+            frame.size.width, frame.size.height);
+        fflush(stderr);
+    }
+    MacWSOriginalToggleFullScreen(self, selector, sender);
+}
+
+static void MacWSInstallFullscreenTransitionPrerequisite(void) {
+    if (!MacWSMainBundleUsesFullscreenCanvasPresentation() ||
+        MacWSOriginalToggleFullScreen) return;
+    Class windowClass = objc_getClass("NSWindow");
+    SEL selector = sel_registerName("toggleFullScreen:");
+    Method method = windowClass
+        ? class_getInstanceMethod(windowClass, selector) : NULL;
+    if (!method) return;
+    IMP implementation = method_getImplementation(method);
+    if (implementation == (IMP)MacWSAppInputToggleFullScreen) return;
+    MacWSOriginalToggleFullScreen =
+        (MacWSToggleFullScreen)implementation;
+    method_setImplementation(
+        method, (IMP)MacWSAppInputToggleFullScreen);
 }
 
 // Objective-C constant-string objects emitted into this injected arm64e dylib
@@ -1585,6 +1649,20 @@ static const char *MacWSAppInputProgramName(void) {
     return basename;
 }
 
+static BOOL MacWSAppInputIsTopLevelSteamBrowser(void) {
+    const char *program = MacWSAppInputProgramName();
+    if (!program || strcmp(program, "Steam Helper") != 0) return NO;
+    int *argumentCount = _NSGetArgc();
+    char ***argumentVector = _NSGetArgv();
+    int count = argumentCount ? *argumentCount : 0;
+    char **arguments = argumentVector ? *argumentVector : NULL;
+    for (int index = 1; arguments && index < count; index++) {
+        if (arguments[index] && !strncmp(arguments[index], "--type=", 7))
+            return NO;
+    }
+    return YES;
+}
+
 static BOOL MacWSAppInputSupportedProcess(void) {
     const char *program = MacWSAppInputProgramName();
     // Dock is not an NSApplication process.  It owns a native CGS event port
@@ -1608,7 +1686,15 @@ static BOOL MacWSAppInputSupportedProcess(void) {
     // It must provide Catalyst/FrontBoard services without an AppInput socket,
     // an NSApplication instance, or a synthetic window-catalog publisher.
     if (strcmp(program, "UIKitSystem") == 0) return NO;
-    if (strstr(program, "Helper") || strstr(program, "Renderer") ||
+    // Steam's visible Store/Library NSWindows belong to the one top-level
+    // CEF browser process named "Steam Helper".  Its renderer, GPU, network,
+    // storage and Crashpad descendants use the same executable name but all
+    // carry a Chromium --type= role.  Treat only the role-less AppKit owner as
+    // an input endpoint; otherwise macPad can display its real window yet has
+    // no process-local socket with which to activate or click it.
+    BOOL topLevelSteamBrowser = MacWSAppInputIsTopLevelSteamBrowser();
+    if ((strstr(program, "Helper") && !topLevelSteamBrowser) ||
+        strstr(program, "Renderer") ||
         strstr(program, "GPU") || strcmp(program, "WindowServer") == 0 ||
         strstr(program, "OSXvnc") || strcmp(program, "launchservicesd") == 0 ||
         strcmp(program, "macwsdisplayd") == 0 ||
@@ -4956,6 +5042,18 @@ static BOOL MacWSMainBundleUsesSpatialCanvasTouch(void) {
         MacWSRuntimeString("com.apple.Maps")];
 }
 
+static BOOL MacWSMainBundleUsesFullscreenCanvasPresentation(void) {
+    id identifier = MacWSMainBundleIdentifier();
+    // Runtime-confirmed from the installed Stray.app Info.plist on the target
+    // iPad: CFBundleIdentifier=com.annapurnainteractive.Stray.  The game's
+    // lower-resolution FCocoaWindow remains a real WindowServer layer rather
+    // than resizing the 2388x1668 desktop.  Publish that application-level
+    // presentation capability here so Host can fit the exact catalog window
+    // without guessing from a localized title or a transient rectangle.
+    return [identifier isEqualToString:
+        MacWSRuntimeString("com.annapurnainteractive.Stray")];
+}
+
 static NSSet *MacWSVisibleWindowNumberSnapshot(id application) {
     NSMutableSet *numbers = [NSMutableSet set];
     id windows = ((MacWSMsgID)objc_msgSend)(
@@ -6846,9 +6944,38 @@ static void MacWSDrainOneAppInputOnMainThread(void);
 
 static void MacWSScheduleAppInputDrain(void) {
     CFRunLoopRef mainRunLoop = CFRunLoopGetMain();
-    CFRunLoopPerformBlock(mainRunLoop, kCFRunLoopCommonModes, ^{
+    if (!mainRunLoop) return;
+
+    // Some applications (runtime-confirmed with steam_osx PID 46986 on
+    // 2026-08-21) drive AppKit through a nested
+    // -[NSApplication _nextEventMatchingEventMask:untilDate:inMode:dequeue:]
+    // loop. A block queued only in kCFRunLoopCommonModes is not guaranteed to
+    // be serviced by that application's current, private mode. Queue the same
+    // FIFO token in the mode that is actually active as well. Both copies
+    // share this main-thread-only guard, so exactly one record is consumed.
+    CFStringRef activeMode = CFRunLoopCopyCurrentMode(mainRunLoop);
+    __block BOOL consumed = NO;
+    void (^drainOnce)(void) = ^{
+        if (consumed) return;
+        consumed = YES;
         MacWSDrainOneAppInputOnMainThread();
-    });
+    };
+    if (activeMode) {
+        CFRunLoopPerformBlock(mainRunLoop, activeMode, drainOnce);
+    }
+    CFRunLoopPerformBlock(mainRunLoop, kCFRunLoopCommonModes, drainOnce);
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        char modeName[192] = "(none)";
+        if (activeMode) {
+            CFStringGetCString(activeMode, modeName, sizeof(modeName),
+                               kCFStringEncodingUTF8);
+        }
+        fprintf(stderr,
+            "#### APP-INPUT SCHEDULE pid=%d active-mode=%s route=current+common\n",
+            getpid(), modeName);
+        fflush(stderr);
+    }
+    if (activeMode) CFRelease(activeMode);
     CFRunLoopWakeUp(mainRunLoop);
 }
 
@@ -7897,6 +8024,8 @@ static void MacWSPublishWindowMetrics(void) {
     id keyWindow = ((MacWSMsgID)objc_msgSend)(
         application, sel_registerName("keyWindow"));
     BOOL spatialCanvas = MacWSMainBundleUsesSpatialCanvasTouch();
+    BOOL fullscreenCanvas =
+        MacWSMainBundleUsesFullscreenCanvasPresentation();
     NSMutableData *entries = [NSMutableData data];
     NSUInteger count = [windows count];
     for (NSUInteger index = 0;
@@ -7943,7 +8072,9 @@ static void MacWSPublishWindowMetrics(void) {
                 (transient ? MacWSStreamWindowTransient : 0) |
                 (window == keyWindow ? MacWSStreamWindowFocused : 0) |
                 (hasShadow ? MacWSStreamWindowHasShadow : 0) |
-                (spatialCanvas ? MacWSStreamWindowSpatialCanvas : 0),
+                (spatialCanvas ? MacWSStreamWindowSpatialCanvas : 0) |
+                (fullscreenCanvas ?
+                    MacWSStreamWindowFullscreenCanvas : 0),
             .logicalGroupID = MacWSLogicalWindowGroupID(window, application),
             .minimumLogicalWidth = (float)minimum.width,
             .minimumLogicalHeight = (float)minimum.height,
@@ -8059,6 +8190,7 @@ static void MacWSInstallAppInputBridgeNow(void) {
         MacWSInstallApplicationKeyWitness();
         MacWSInstallMenuEventLoopWitness();
         MacWSInstallOrderedWindowRegistry();
+        MacWSInstallFullscreenTransitionPrerequisite();
         if (!MacWSOriginalApplicationSendEvent ||
             !MacWSOriginalHandleActivatedEvent)
             MacWSScheduleApplicationKeyWitnessInstall(0);

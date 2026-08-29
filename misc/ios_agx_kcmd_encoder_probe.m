@@ -4,7 +4,7 @@
 // context and copies the command buffer's populated KCMD bytes through the
 // same getCurrentKernelCommandBufferStart:current:end: SPI already used by
 // iosclear_ref.m.  It never changes a driver object or command byte.  Select
-// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|statistics|render|renderzero|draw|drawblit|drawblitsignal|drawblitlegacy|drawchain|aquariumchain|rawcompute|rawconcurrent|richcompute|externalcompute|iosurfaceformat
+// the public encoder with MACWS_IOS_KCMD_MODE=blit|blittexture|mipmap|scale|compute|statistics|render|renderzero|draw|drawblit|drawblitsignal|drawblitlegacy|eventqueues|eventcycle|drawchain|aquariumchain|rawcompute|rawconcurrent|richcompute|externalcompute|iosurfaceformat
 // (default: blit).
 
 @import Foundation;
@@ -111,7 +111,7 @@ static int macws_dump_kcmd(id<MTLCommandBuffer> command_buffer,
     fprintf(stderr,
         "IOS-AGX-KCMD mode=%s start=%p current=%p end=%p length=%#zx\n",
         mode, start, current, end, length);
-    if (!start || length < 0x38 || length > 0x10000) return 3;
+    if (!start || length < 0x18 || length > 0x10000) return 3;
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/tmp/ios-agx-kcmd-%s.bin", mode);
@@ -120,6 +120,25 @@ static int macws_dump_kcmd(id<MTLCommandBuffer> command_buffer,
     const unsigned char *bytes = start;
     size_t offset = 0;
     unsigned record = 0;
+    while (offset + 0x18 <= length && record < 64) {
+        uint32_t type = macws_u32(bytes, offset + 0x00);
+        uint32_t span = macws_u32(bytes, offset + 0x04);
+        if ((type != 3 && type != 4 && type != 5 && type != 6 &&
+             type != 10) || span != 0x18) {
+            break;
+        }
+        uint32_t event_id = macws_u32(bytes, offset + 0x08);
+        uint32_t word_0c = macws_u32(bytes, offset + 0x0c);
+        uint64_t value = 0;
+        memcpy(&value, bytes + offset + 0x10, sizeof(value));
+        fprintf(stderr,
+            "IOS-AGX-KCMD event=%u offset=%#zx type=%#x span=%#x "
+            "id=%#x word0c=%#x value=%llu\n",
+            record, offset, type, span, event_id, word_0c,
+            (unsigned long long)value);
+        record++;
+        offset += 0x18;
+    }
     while (offset + 0x38 <= length && record < 64) {
         uint32_t type = macws_u32(bytes, offset + 0x00);
         uint32_t span = macws_u32(bytes, offset + 0x04);
@@ -931,6 +950,135 @@ static int macws_encode_draw_blit(id<MTLDevice> device,
     return dump_status || command_buffer.error ? 50 : 0;
 }
 
+// Native-iOS control for the cross-command-queue legacy-event topology found
+// in Stray's post-processing submissions.  Commit the waiter first, then
+// immediately commit the producer on a second ordinary command queue.  This
+// deliberately exercises forward cross-queue dependencies while preserving
+// every event command byte produced by iOS's own IOGPU framework.
+//
+// The macOS 13.4 IOGPU implementation selects wait record type 6 when the
+// legacy event's barrier flag is enabled and type 10 when it is disabled.
+// Encode one of each, matching the two wait families captured from Stray,
+// and dump both command buffers before submission for byte-level comparison.
+static int macws_encode_event_queues(id<MTLDevice> device,
+                                     id<MTLCommandQueue> wait_queue) {
+    id<MTLCommandQueue> signal_queue = [device newCommandQueue];
+    id<MTLEvent> barrier_event = [device newEvent];
+    id<MTLEvent> nonbarrier_event = [device newEvent];
+    SEL set_barrier = sel_registerName("setEnableBarrier:");
+    if (nonbarrier_event &&
+        [(NSObject *)nonbarrier_event respondsToSelector:set_barrier]) {
+        IMP method = [(NSObject *)nonbarrier_event
+            methodForSelector:set_barrier];
+        ((void (*)(id, SEL, BOOL))method)(nonbarrier_event, set_barrier, NO);
+    }
+    if (!signal_queue || !barrier_event || !nonbarrier_event) {
+        fprintf(stderr,
+            "IOS-AGX-EVENTQUEUES setup wait-queue=%p signal-queue=%p "
+            "barrier-event=%p nonbarrier-event=%p\n",
+            (__bridge void *)wait_queue, (__bridge void *)signal_queue,
+            (__bridge void *)barrier_event,
+            (__bridge void *)nonbarrier_event);
+        return 51;
+    }
+
+    id<MTLCommandBuffer> wait_buffer =
+        macws_new_command_buffer(wait_queue);
+    id<MTLCommandBuffer> signal_buffer =
+        macws_new_command_buffer(signal_queue);
+    [wait_buffer encodeWaitForEvent:barrier_event value:64];
+    [wait_buffer encodeWaitForEvent:nonbarrier_event value:32];
+    [signal_buffer encodeSignalEvent:barrier_event value:64];
+    [signal_buffer encodeSignalEvent:nonbarrier_event value:32];
+
+    int wait_dump = macws_dump_kcmd(wait_buffer, "eventqueues-wait");
+    int signal_dump = macws_dump_kcmd(signal_buffer, "eventqueues-signal");
+    if (getenv("MACWS_IOS_KCMD_HOLD")) raise(SIGSTOP);
+
+    struct timespec before = {0}, after = {0};
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    [wait_buffer commit];
+    [signal_buffer commit];
+    [wait_buffer waitUntilCompleted];
+    [signal_buffer waitUntilCompleted];
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    double wall_ms = (double)(after.tv_sec - before.tv_sec) * 1000.0 +
+        (double)(after.tv_nsec - before.tv_nsec) / 1000000.0;
+    fprintf(stderr,
+        "IOS-AGX-EVENTQUEUES wait-status=%ld signal-status=%ld "
+        "wait-error=%s signal-error=%s wall-ms=%.3f "
+        "wait-gpu=%.6f..%.6f signal-gpu=%.6f..%.6f dumps=%d/%d\n",
+        (long)wait_buffer.status, (long)signal_buffer.status,
+        wait_buffer.error.description.UTF8String ?: "nil",
+        signal_buffer.error.description.UTF8String ?: "nil", wall_ms,
+        wait_buffer.GPUStartTime, wait_buffer.GPUEndTime,
+        signal_buffer.GPUStartTime, signal_buffer.GPUEndTime,
+        wait_dump, signal_dump);
+    BOOL completed =
+        wait_buffer.status == MTLCommandBufferStatusCompleted &&
+        signal_buffer.status == MTLCommandBufferStatusCompleted &&
+        wait_buffer.error == nil && signal_buffer.error == nil;
+    return completed && wait_dump == 0 && signal_dump == 0 ? 0 : 52;
+}
+
+// Two-way legacy-event handshake matching the scheduling invariant in the
+// Stray failure window.  Queue A cannot finish until B advances, and B cannot
+// advance until A has run its preceding signal.  A second reverse handshake
+// proves that the scheduler can switch back to A and then back to B again.
+static int macws_encode_event_cycle(id<MTLDevice> device,
+                                    id<MTLCommandQueue> queue_a) {
+    id<MTLCommandQueue> queue_b = [device newCommandQueue];
+    id<MTLEvent> event_a0 = [device newEvent];
+    id<MTLEvent> event_b0 = [device newEvent];
+    id<MTLEvent> event_a1 = [device newEvent];
+    id<MTLEvent> event_b1 = [device newEvent];
+    SEL set_barrier = sel_registerName("setEnableBarrier:");
+    if (event_b1 && [(NSObject *)event_b1
+            respondsToSelector:set_barrier]) {
+        IMP method = [(NSObject *)event_b1 methodForSelector:set_barrier];
+        ((void (*)(id, SEL, BOOL))method)(event_b1, set_barrier, NO);
+    }
+    if (!queue_b || !event_a0 || !event_b0 || !event_a1 || !event_b1)
+        return 53;
+
+    id<MTLCommandBuffer> buffer_a = macws_new_command_buffer(queue_a);
+    id<MTLCommandBuffer> buffer_b = macws_new_command_buffer(queue_b);
+    [buffer_a encodeSignalEvent:event_a0 value:32];
+    [buffer_a encodeWaitForEvent:event_b0 value:64];
+    [buffer_a encodeSignalEvent:event_a1 value:32];
+    [buffer_a encodeWaitForEvent:event_b1 value:32];
+    [buffer_b encodeWaitForEvent:event_a0 value:32];
+    [buffer_b encodeSignalEvent:event_b0 value:64];
+    [buffer_b encodeWaitForEvent:event_a1 value:32];
+    [buffer_b encodeSignalEvent:event_b1 value:32];
+
+    int dump_a = macws_dump_kcmd(buffer_a, "eventcycle-a");
+    int dump_b = macws_dump_kcmd(buffer_b, "eventcycle-b");
+    struct timespec before = {0}, after = {0};
+    clock_gettime(CLOCK_MONOTONIC, &before);
+    [buffer_a commit];
+    [buffer_b commit];
+    [buffer_a waitUntilCompleted];
+    [buffer_b waitUntilCompleted];
+    clock_gettime(CLOCK_MONOTONIC, &after);
+    double wall_ms = (double)(after.tv_sec - before.tv_sec) * 1000.0 +
+        (double)(after.tv_nsec - before.tv_nsec) / 1000000.0;
+    fprintf(stderr,
+        "IOS-AGX-EVENTCYCLE a-status=%ld b-status=%ld a-error=%s "
+        "b-error=%s wall-ms=%.3f a-gpu=%.6f..%.6f "
+        "b-gpu=%.6f..%.6f dumps=%d/%d\n",
+        (long)buffer_a.status, (long)buffer_b.status,
+        buffer_a.error.description.UTF8String ?: "nil",
+        buffer_b.error.description.UTF8String ?: "nil", wall_ms,
+        buffer_a.GPUStartTime, buffer_a.GPUEndTime,
+        buffer_b.GPUStartTime, buffer_b.GPUEndTime, dump_a, dump_b);
+    BOOL completed =
+        buffer_a.status == MTLCommandBufferStatusCompleted &&
+        buffer_b.status == MTLCommandBufferStatusCompleted &&
+        buffer_a.error == nil && buffer_b.error == nil;
+    return completed && dump_a == 0 && dump_b == 0 ? 0 : 54;
+}
+
 // Native control for Chromium's runtime-captured multi-segment submission.
 // Encode thirteen ordinary render passes into one command buffer so the iOS
 // AGX producer, rather than a guessed C layout, shows how repeated subtype-1
@@ -1171,6 +1319,10 @@ int main(void) {
             return macws_encode_draw_blit(device, queue, 1);
         if (strcmp(mode, "drawblitlegacy") == 0)
             return macws_encode_draw_blit(device, queue, 2);
+        if (strcmp(mode, "eventqueues") == 0)
+            return macws_encode_event_queues(device, queue);
+        if (strcmp(mode, "eventcycle") == 0)
+            return macws_encode_event_cycle(device, queue);
         if (strcmp(mode, "drawchain") == 0)
             return macws_encode_draw_chain(device, queue);
         if (strcmp(mode, "aquariumchain") == 0)

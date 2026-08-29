@@ -13,14 +13,18 @@
 #define MACWS_STREAM_INVALIDATE_SOCKET_PATH \
     "/private/tmp/macws_display_invalidate.sock"
 #define MACWS_STREAM_MAGIC 0x4d575354u /* "MWST" */
-// Version 7 adds an explicit final-composite base-frame flag. Version 6
+// Version 8 adds a validated fullscreen direct-drawable activity lease so the
+// display service can suspend exactly one redundant full-resolution
+// exact-window capture while Host is already presenting that application's
+// completed CAMetalDrawable. Version 7 adds an explicit final-composite
+// base-frame flag. Version 6
 // separated ordered layer geometry transactions from IOSurface content
 // frames. Version 5 republished the same IOSurface Mach right and acquired
 // another lease for every native Spaces/Mission Control position; that
 // multiplied one 60-Hz catalog sample by every moving desktop layer.
 // Keep this as a hard wire boundary so an old daemon cannot silently send a
 // message shape that a new Host interprets without the sequence invariant.
-#define MACWS_STREAM_VERSION 7u
+#define MACWS_STREAM_VERSION 8u
 
 #define MACWS_STREAM_MAX_DIMENSION 16384u
 #define MACWS_STREAM_MAX_BYTES_PER_ROW (MACWS_STREAM_MAX_DIMENSION * 16u)
@@ -49,12 +53,18 @@
 #define MACWS_STREAM_KEY_LEASE_TOKEN "lease_token"
 #define MACWS_STREAM_KEY_MESSAGE "message"
 #define MACWS_STREAM_KEY_OK "ok"
+#define MACWS_STREAM_KEY_ACTIVE "active"
+#define MACWS_STREAM_KEY_OWNER_PID "owner_pid"
+#define MACWS_STREAM_KEY_WIDTH "width"
+#define MACWS_STREAM_KEY_HEIGHT "height"
 
 #define MACWS_STREAM_OP_HELLO "hello"
 #define MACWS_STREAM_OP_LIST_WINDOWS "list_windows"
 #define MACWS_STREAM_OP_SUBSCRIBE "subscribe"
 #define MACWS_STREAM_OP_UNSUBSCRIBE "unsubscribe"
 #define MACWS_STREAM_OP_RELEASE_FRAME "release_frame"
+#define MACWS_STREAM_OP_DIRECT_DRAWABLE_ACTIVITY \
+    "direct_drawable_activity"
 
 #define MACWS_STREAM_EVENT_READY "ready"
 #define MACWS_STREAM_EVENT_WINDOWS "windows"
@@ -88,6 +98,15 @@ enum {
     // it with each native window; Host never guesses from localized titles or
     // control coordinates. Two-finger magnification remains independent.
     MacWSStreamWindowSpatialCanvas = 1u << 7,
+    // The owning application intentionally renders a self-contained game
+    // canvas.  While that exact window is the active target of the iPad's
+    // fullscreen workspace, Host may crop the authoritative WindowServer
+    // composite to its published destination and fit it to the iPad Scene.
+    // This keeps native overlays (including Steam's FPS panel) and uses the
+    // same crop for input-coordinate mapping.  AppInputBridge derives this
+    // capability from the real bundle identity; Host never guesses from a
+    // title, process name or hard-coded desktop rectangle.
+    MacWSStreamWindowFullscreenCanvas = 1u << 8,
 };
 
 typedef uint32_t MacWSStreamFrameFlags;

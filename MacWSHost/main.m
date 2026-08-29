@@ -141,6 +141,7 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
                            preferredSize:(CGSize)preferredSize
                                resizable:(BOOL)resizable;
 - (void)performURLAction:(NSString *)action;
+- (void)resetPerformanceMeasurementForTargetPID:(int32_t)targetPID;
 - (void)launchApplicationIdentifier:(NSString *)identifier;
 - (void)setFullscreenWorkspaceEnabled:(BOOL)enabled;
 - (void)openWindowInCurrentScene:(MacWSStreamWindow *)window
@@ -162,6 +163,7 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
                                         ownerPID:(int32_t)ownerPID
                                            title:(NSString *)title;
 - (void)reassertFullscreenScenePresentation;
+- (void)restoreHardwareKeyboardFocusWithReason:(NSString *)reason;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 - (BOOL)detachMissingWorkspaceReturnOwnerPID:(int32_t)ownerPID
                                     windowID:(uint32_t)windowID;
@@ -996,6 +998,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UILabel *_systemHUDTitleLabel;
     UILabel *_systemHUDDetailLabel;
     UIButton *_primaryButton;
+    UIButton *_repairDesktopButton;
     UIButton *_repairButton;
     UIButton *_recoverButton;
     UIButton *_captureButton;
@@ -1019,6 +1022,7 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     UISwitch *_experimentalSwitch;
     UISegmentedControl *_inputModeControl;
     UISegmentedControl *_densityControl;
+    UISegmentedControl *_presentationResolutionControl;
     UISegmentedControl *_zoomScaleControl;
     UISegmentedControl *_performanceHUDControl;
     UISegmentedControl *_languageControl;
@@ -1046,9 +1050,13 @@ typedef void (^MacWSCompactMenuSelection)(MacWSMenuItem *item);
     BOOL _pendingApplicationWindowRetryScheduled;
     uint32_t _pendingApplicationCandidateWindowID;
     CFTimeInterval _pendingApplicationCandidateSince;
+    int32_t _fullscreenCatalogRetainedInputPID;
+    uint32_t _fullscreenActivatedInputWindowID;
+    int32_t _fullscreenActivatedInputOwnerPID;
     BOOL _bootstrapTerminalPending;
     BOOL _bootstrapWindowReplacementPending;
     BOOL _bootstrapWorkspaceStartInFlight;
+    BOOL _bootstrapWorkspaceStartAttempted;
     BOOL _targetWindowObservedInCatalog;
     BOOL _targetWindowMissingCheckPending;
     BOOL _sceneDestructionRequested;
@@ -1494,6 +1502,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // target. Waiting for another catalog callback reintroduced stale focus
     // from unrelated processes before this activation had even committed.
     _metalView.targetPID = window.descriptor.ownerPID;
+    if (_streamMode == MacWSStreamModeFullscreen) {
+        _fullscreenActivatedInputWindowID = window.descriptor.windowID;
+        _fullscreenActivatedInputOwnerPID = window.descriptor.ownerPID;
+        if ((window.descriptor.flags &
+                MacWSStreamWindowFullscreenCanvas) != 0) {
+            [_metalView noteValidatedFullscreenCanvasForPID:
+                window.descriptor.ownerPID
+                                                   windowID:
+                window.descriptor.windowID];
+        }
+    }
     MacWSInputRecord activation = {
         .magic = MACWS_INPUT_MAGIC,
         .version = MACWS_INPUT_VERSION,
@@ -1545,13 +1564,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)performSemanticShortcutForDiagnostics:(NSString *)shortcut {
-    if (_windowID == 0 || _windowOwnerPID <= 1 || !shortcut.length) {
+    uint32_t targetWindowID = _windowID;
+    int32_t targetOwnerPID = _windowOwnerPID;
+    if (_streamMode == MacWSStreamModeFullscreen && targetWindowID == 0) {
+        targetOwnerPID = _metalView.targetPID;
+        for (MacWSStreamWindow *window in _streamWindows) {
+            if (window.descriptor.ownerPID != targetOwnerPID ||
+                window.descriptor.windowID == 0 ||
+                (window.descriptor.flags & MacWSStreamWindowVisible) == 0)
+                continue;
+            targetWindowID = window.descriptor.windowID;
+            break;
+        }
+    }
+    if (targetWindowID == 0 || targetOwnerPID <= 1 || !shortcut.length) {
         MacWSLog(@"diagnostic-menu shortcut=%@ result=no-exact-window",
                  shortcut ?: @"");
         return;
     }
-    [self refreshSemanticMenuWithCompletion:^(MacWSMenuSnapshot *snapshot,
-                                               NSError *error) {
+    [_menuClient requestSnapshotForPID:targetOwnerPID
+                              windowID:targetWindowID
+                            completion:^(MacWSMenuSnapshot *snapshot,
+                                         NSError *error) {
         if (!snapshot || error) {
             MacWSLog(@"diagnostic-menu shortcut=%@ result=snapshot-failed "
                      "error=%@", shortcut,
@@ -1577,7 +1611,12 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         MacWSLog(@"diagnostic-menu shortcut=%@ item=%@ owner=%d window=%u",
                  shortcut, match.title, snapshot.ownerPID,
                  snapshot.windowID);
-        [self activateCurrentMacWindow];
+        if (self->_streamMode == MacWSStreamModeFullscreen) {
+            [self activateMacWindowIDInFullscreenWorkspace:targetWindowID
+                ownerPID:targetOwnerPID title:match.title];
+        } else {
+            [self activateCurrentMacWindow];
+        }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                       120 * NSEC_PER_MSEC),
                        dispatch_get_main_queue(), ^{
@@ -1774,6 +1813,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             forKey:@"MacWSDisplayDensity"];
     }
     _metalView.displayDensity = savedDensity;
+    MacWSHostPresentationResolution savedPresentationResolution =
+        (MacWSHostPresentationResolution)
+        [NSUserDefaults.standardUserDefaults integerForKey:
+            @"MacWSPresentationResolution"];
+    if (savedPresentationResolution !=
+            MacWSHostPresentationResolutionAutomatic &&
+        savedPresentationResolution !=
+            MacWSHostPresentationResolutionSourceNative &&
+        savedPresentationResolution !=
+            MacWSHostPresentationResolutionPerformance)
+        savedPresentationResolution =
+            MacWSHostPresentationResolutionAutomatic;
+    _metalView.presentationResolution = savedPresentationResolution;
     CGFloat savedZoomScale =
         [NSUserDefaults.standardUserDefaults doubleForKey:@"MacWSFixedZoomScale"];
     _metalView.fixedZoomScale = savedZoomScale >= 1.75 ? 2.0 : 1.5;
@@ -2077,6 +2129,11 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
     _captureButton = [self buttonWithTitle:@"刷新画面" image:@"camera.viewfinder"
                                     action:@selector(captureAction) prominent:NO];
+    _repairDesktopButton = [self buttonWithTitle:@"修复桌面"
+                                           image:@"arrow.clockwise.circle"
+                                          action:@selector(repairDesktopAction)
+                                       prominent:YES];
+    _repairDesktopButton.accessibilityIdentifier = @"repair-desktop";
     _repairButton = [self buttonWithTitle:@"修复环境" image:@"wrench.and.screwdriver"
                                    action:@selector(repairAction) prominent:NO];
     _recoverButton = [self buttonWithTitle:@"安全恢复" image:@"lifepreserver"
@@ -2168,6 +2225,14 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         (_metalView.displayDensity == MacWSHostDisplayDensityComfort ? 1 : 0);
     [_densityControl addTarget:self action:@selector(densityChanged:)
                forControlEvents:UIControlEventValueChanged];
+
+    _presentationResolutionControl = [[UISegmentedControl alloc]
+        initWithItems:@[@"自动清晰", @"始终清晰", @"性能优先"]];
+    _presentationResolutionControl.selectedSegmentIndex =
+        _metalView.presentationResolution;
+    [_presentationResolutionControl addTarget:self
+        action:@selector(presentationResolutionChanged:)
+        forControlEvents:UIControlEventValueChanged];
 
     _performanceHUDControl = [[UISegmentedControl alloc]
         initWithItems:@[@"关闭", @"简洁", @"完整"]];
@@ -2275,8 +2340,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _inputModeControl,
         _displaySectionLabel,
         _densityControl,
+        _presentationResolutionControl,
         _keyboardButton,
         _primaryButton,
+        _repairDesktopButton,
         _performanceSectionLabel,
         _performanceHUDControl,
         systemHUDRow,
@@ -2404,12 +2471,19 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             [_semanticMenuBar.topAnchor constraintEqualToAnchor:safe.topAnchor],
             _semanticMenuHeightConstraint,
         ]];
-        // A native macOS window should open as content, not as a settings
-        // sheet. Keep the compact menu visible and expose Control Center as a
-        // small explicit affordance; fullscreen/bootstrap scenes still open
-        // with controls shown.
-        _controlPanel.hidden = YES;
-        _showControlsMaterial.hidden = NO;
+        // _semanticMenuBar is constructed for every controller and hidden by
+        // updateWorkspaceChrome in fullscreen mode.  Its mere existence is
+        // therefore not evidence that this Scene owns a concrete AppKit
+        // window. Runtime-confirmed via MacWSHost-ui.png on 2026-08-29: after
+        // the desktop had been stopped, a freshly launched fullscreen Scene
+        // entered this branch and showed a black canvas with only the tiny
+        // Control Center affordance. Hide the panel only for an exact native
+        // macOS window; a workspace/bootstrap Scene must remain an operable
+        // launcher while its display service is offline.
+        if (_streamMode == MacWSStreamModeWindow && _windowID != 0) {
+            _controlPanel.hidden = YES;
+            _showControlsMaterial.hidden = NO;
+        }
     }
     [self applyControlCenterLanguage];
     [self updateWorkspaceChrome];
@@ -2455,6 +2529,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSArray *density = english
         ? @[@"Pixel Match", @"Larger +10%", @"More Space +18%"]
         : @[@"像素匹配", @"放大 +10%", @"更多空间 +18%"];
+    NSArray *presentationResolution = english
+        ? @[@"Auto Sharp", @"Always Sharp", @"Performance"]
+        : @[@"自动清晰", @"始终清晰", @"性能优先"];
     NSArray *hud = english ? @[@"Off", @"Compact", @"Full"]
                            : @[@"关闭", @"简洁", @"完整"];
     NSArray *zoom = english ? @[@"Two-Finger Double-Tap 1.5×",
@@ -2465,6 +2542,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                 forSegmentAtIndex:index];
         [_performanceHUDControl setTitle:hud[(NSUInteger)index]
                 forSegmentAtIndex:index];
+        [_presentationResolutionControl
+            setTitle:presentationResolution[(NSUInteger)index]
+            forSegmentAtIndex:index];
     }
     for (NSInteger index = 0; index < 2; index++)
         [_zoomScaleControl setTitle:zoom[(NSUInteger)index]
@@ -2501,6 +2581,9 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
               image:@"keyboard"];
     [self setButton:_captureButton title:english ? @"Refresh Display" : @"刷新画面"
               image:@"camera.viewfinder"];
+    [self setButton:_repairDesktopButton
+              title:english ? @"Repair Desktop" : @"修复桌面"
+              image:@"arrow.clockwise.circle"];
     [self setButton:_repairButton title:english ? @"Repair Environment" : @"修复环境"
               image:@"wrench.and.screwdriver"];
     [self setButton:_recoverButton title:english ? @"Safe Recovery" : @"安全恢复"
@@ -2549,6 +2632,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         selector:@selector(refreshStatus) userInfo:nil repeats:YES];
     [_metalView requestStreamWindowList];
     [_interopClient connect];
+    [self restoreHardwareKeyboardFocusWithReason:@"view-did-appear"];
 }
 
 - (void)viewWillTransitionToSize:(CGSize)size
@@ -2584,12 +2668,22 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _controlPanel.hidden = YES;
     _controlDismissLayer.hidden = YES;
     _showControlsMaterial.hidden = NO;
+    // The tapped control remains UIKit's responder until this event returns.
+    // Reclaim the workspace's physical-keyboard focus on the next main turn.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self restoreHardwareKeyboardFocusWithReason:@"controls-hidden"];
+    });
 }
 
 - (void)showControls {
     _controlDismissLayer.hidden = NO;
     _controlPanel.hidden = NO;
     _showControlsMaterial.hidden = YES;
+}
+
+- (void)restoreHardwareKeyboardFocusWithReason:(NSString *)reason {
+    if (!_controlPanel.hidden || _keyboardProxy.isFirstResponder) return;
+    [_metalView restoreHardwareKeyboardFocusWithReason:reason];
 }
 
 - (void)setNotice:(NSString *)notice success:(BOOL)success {
@@ -2600,6 +2694,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)setControlsEnabled:(BOOL)enabled {
     _primaryButton.enabled = enabled;
+    _repairDesktopButton.enabled = enabled;
     _repairButton.enabled = enabled;
     _recoverButton.enabled = enabled;
     _captureButton.enabled = enabled;
@@ -2617,6 +2712,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     _performanceExportButton.enabled = YES;
     _performanceRunButton.enabled = enabled;
     _densityControl.enabled = enabled;
+    _presentationResolutionControl.enabled = enabled;
     _zoomScaleControl.enabled = enabled;
     _resetZoomButton.enabled = enabled;
     _retryStartupButton.enabled = enabled;
@@ -2815,6 +2911,24 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         _inputLabel.text = [NSString stringWithFormat:
             @"显示：像素匹配 Retina；当前有效密度 %.0f%%（随 iPadOS 合成比例自动调整）",
             _metalView.effectiveDensityScale * 100.0];
+    }
+}
+
+- (void)presentationResolutionChanged:(UISegmentedControl *)sender {
+    MacWSHostPresentationResolution resolution =
+        (MacWSHostPresentationResolution)sender.selectedSegmentIndex;
+    _metalView.presentationResolution = resolution;
+    [NSUserDefaults.standardUserDefaults setInteger:resolution
+        forKey:@"MacWSPresentationResolution"];
+    if (resolution == MacWSHostPresentationResolutionSourceNative) {
+        [self setNotice:@"显示清晰度：始终保留 WindowServer 源像素；全屏游戏会增加显示合成负载。"
+                 success:YES];
+    } else if (resolution == MacWSHostPresentationResolutionPerformance) {
+        [self setNotice:@"显示清晰度：性能优先；输出为每个 UIKit 点一个像素。"
+                 success:YES];
+    } else {
+        [self setNotice:@"显示清晰度：桌面保留源像素，全屏游戏自动切换性能分辨率。"
+                 success:YES];
     }
 }
 
@@ -3490,9 +3604,29 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (void)setFullscreenWorkspaceEnabled:(BOOL)enabled {
     BOOL active = _streamMode == MacWSStreamModeFullscreen;
     if (active == enabled) {
-        MacWSLog(@"workspace-mode request idempotent requested=%@ active=%@",
+        MacWSLog(@"workspace-mode request idempotent requested=%@ active=%@ recovery=%@",
                  enabled ? @"fullscreen" : @"window",
-                 active ? @"fullscreen" : @"window");
+                 active ? @"fullscreen" : @"window",
+                 enabled ? @"YES" : @"NO");
+        // A service restart does not change the controller's persisted mode,
+        // but it can invalidate the DisplayStream connection and the system's
+        // presentation transaction.  Treat a repeated enter-workspace request
+        // as an explicit recovery operation: reassert the real UIKit scene
+        // geometry and refreshStatus will reconnect the stream when its live
+        // connection witness is false.  Exiting an already-windowed workspace
+        // remains a true no-op.
+        if (enabled) {
+            // A Host restart can restore the persisted fullscreen stream mode
+            // while the freshly-created controller still has its bootstrap
+            // control panel visible.  Reasserting only the Scene geometry then
+            // leaves a screen-filling control center over a healthy macOS
+            // desktop.  Converge the presentation state as well as the stream
+            // and geometry state, matching the first-entry path below.
+            [self hideControls];
+            [self reassertFullscreenScenePresentation];
+            [self refreshStatus];
+            MacWSLog(@"workspace-mode recovery controls-hidden=YES");
+        }
         return;
     }
     [self openFullscreenWorkspace];
@@ -3524,6 +3658,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     BOOL rootfs = [status[@"rootfs_ready"] boolValue];
     BOOL ws = [status[@"windowserver_running"] boolValue];
     BOOL input = [status[@"input_running"] boolValue];
+    BOOL systemInputReady =
+        [status[@MACWS_CONTROL_KEY_SYSTEM_INPUT_READY] boolValue];
+    int32_t systemInputPID = systemInputReady
+        ? [status[@MACWS_CONTROL_KEY_SYSTEM_INPUT_PID] intValue] : 0;
     BOOL frame = [status[@"frame_ready"] boolValue];
     BOOL startupRetry = [status[@"startup_retry_available"] boolValue];
     BOOL legacyFramebuffer = MacWSLegacyFramebufferFallbackEnabled();
@@ -3541,16 +3679,30 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     // both exact-window and full-workspace routing.
     BOOL appInput = MacWSAppInputEndpointReady(targetPID);
     BOOL fullscreenSystemRoute =
-        _streamMode == MacWSStreamModeFullscreen && targetPID <= 1;
+        _streamMode == MacWSStreamModeFullscreen && targetPID <= 1 &&
+        systemInputReady && systemInputPID > 1;
     NSString *controlSummary = [NSString stringWithFormat:
-        @"connected=%@ busy=%@ rootfs=%@ ws=%@ input=%@ frame=%@ phase=%@ error=%@",
+        @"connected=%@ busy=%@ rootfs=%@ ws=%@ input=%@ system-input=%@/%d frame=%@ phase=%@ error=%@",
         connected ? @"YES" : @"NO", busy ? @"YES" : @"NO",
         rootfs ? @"YES" : @"NO", ws ? @"YES" : @"NO",
-        input ? @"YES" : @"NO", frame ? @"YES" : @"NO",
+        input ? @"YES" : @"NO", systemInputReady ? @"YES" : @"NO",
+        systemInputPID, frame ? @"YES" : @"NO",
         status[@"phase"] ?: @"", status[@"last_error"] ?: @""];
     if (![_lastLoggedControlSummary isEqualToString:controlSummary]) {
         _lastLoggedControlSummary = controlSummary;
         MacWSLog(@"control-status %@", controlSummary);
+    }
+    // A persisted fullscreen Scene can reconnect before the root control
+    // reply reveals that WindowServer is gone (for example after an iPadOS
+    // respring retires the UIKit-hosted bridge generation).  The black Metal
+    // canvas is not a usable recovery UI.  Converge any such stale Scene on
+    // the Control Center as soon as the authoritative WindowServer state is
+    // known. This also repairs already-persisted sessions created by older
+    // builds rather than relying only on the initializer above.
+    if (!ws && _controlPanel.hidden) {
+        [self showControls];
+        MacWSLog(@"workspace-offline controls-shown=YES mode=%u window=%u",
+                 _streamMode, _windowID);
     }
     _serviceLabel.text = connected
         ? MacWSLocalized(@"● root 控制服务已连接", @"● Root control service connected")
@@ -3607,6 +3759,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (ws && !_interopClient.isConnected) [_interopClient connect];
 
     _metalView.targetPID = targetPID;
+    _metalView.systemInputPID = systemInputPID;
     // A root control transaction (for example a 30-second application launch
     // witness) does not stop WindowServer, DisplayStream, or the per-process
     // input sockets.  Coupling desktop input to hostd's unrelated `busy` bit
@@ -3620,10 +3773,23 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     else if (!ws) inputReason = MacWSLocalized(@"macOS 工作区已停止", @"macOS workspace stopped");
     else if (!input) inputReason = MacWSLocalized(@"触控桥离线", @"Touch bridge offline");
     else if (!renderableFrame) inputReason = MacWSLocalized(@"等待 DisplayStream IOSurface 首帧", @"Waiting for first DisplayStream frame");
+    else if (_streamMode == MacWSStreamModeFullscreen && targetPID <= 1 &&
+             !fullscreenSystemRoute)
+        inputReason = MacWSLocalized(@"等待桌面系统输入端点", @"Waiting for desktop system input endpoint");
     else if (targetPID <= 1 && !fullscreenSystemRoute)
         inputReason = MacWSLocalized(@"等待该窗口的所属应用", @"Waiting for this window's app");
     else if (!appInput) inputReason = MacWSLocalized(@"目标应用输入端点尚未就绪", @"Target app input endpoint is not ready");
+    BOOL inputWasReady = _metalView.isMacWSInputEnabled;
     [_metalView setMacWSInputEnabled:inputReady reason:inputReason];
+    if (inputReady && !inputWasReady) {
+        // Scene activation and control dismissal can precede the first
+        // DisplayStream frame. Their focus requests correctly decline while
+        // input is unavailable; complete the same ownership transaction on
+        // the actual not-ready -> ready edge instead of waiting for a click.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self restoreHardwareKeyboardFocusWithReason:@"input-ready"];
+        });
+    }
     _inputLabel.text = inputReady
         ? MacWSLocalized(@"触控：已就绪 · 直接点击或拖动 macOS 画面",
                          @"Touch: Ready · Tap or drag the macOS display")
@@ -3693,13 +3859,25 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             _bootstrapTerminalPending = NO;
             [self runOperation:@MACWS_CONTROL_OP_LAUNCH_APP
                      arguments:@{@MACWS_CONTROL_KEY_APP_ID: @"terminal"}];
-        } else if (!_bootstrapWorkspaceStartInFlight) {
+        } else if (!_bootstrapWorkspaceStartInFlight &&
+                   !_bootstrapWorkspaceStartAttempted) {
+            // One Scene owns at most one automatic workspace start. A failed
+            // start leaves ws=NO; applyStatus: is called again by the status
+            // timer, so checking only the in-flight bit created an unbounded
+            // restart loop. Runtime-confirmed on 2026-08-29 by consecutive
+            // macos_gui.sh owners 40307 -> 42910 -> 45547. Explicit retry and
+            // repair controls remain available after this one attempt.
+            _bootstrapWorkspaceStartAttempted = YES;
             _bootstrapWorkspaceStartInFlight = YES;
+            MacWSLog(@"bootstrap-workspace automatic-start attempt=1");
             [self setNotice:@"正在启动 macOS，并准备默认终端窗口…" success:YES];
             [_controlClient startWithExperimentalMode:YES
                 completion:^(NSDictionary<NSString *,id> *reply) {
                     self->_bootstrapWorkspaceStartInFlight = NO;
                     BOOL ok = [reply[@"ok"] boolValue];
+                    MacWSLog(@"bootstrap-workspace automatic-start completed=%@ message=%@",
+                             ok ? @"YES" : @"NO",
+                             reply[@"message"] ?: @"(nil)");
                     [self applyStatus:reply];
                     if (!ok) {
                         [self setNotice:reply[@"message"] ?:
@@ -3712,7 +3890,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)runOperation:(NSString *)operation arguments:(NSDictionary *)arguments {
     [self setControlsEnabled:NO];
-    [self setNotice:@"操作已提交，请保持 App 在前台…" success:YES];
+    NSString *submitted = [operation isEqualToString:
+        @MACWS_CONTROL_OP_REPAIR_DESKTOP]
+        ? MacWSLocalized(
+            @"正在保留当前应用并重建 Dock、图标、桌布与菜单服务…",
+            @"Keeping current apps open while rebuilding Dock, icons, wallpaper, and menu services…")
+        : @"操作已提交，请保持 App 在前台…";
+    [self setNotice:submitted success:YES];
     [_controlClient performOperation:operation arguments:arguments
         completion:^(NSDictionary<NSString *,id> *reply) {
             BOOL ok = [reply[@"ok"] boolValue];
@@ -3737,6 +3921,20 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
                     [self schedulePendingApplicationWindowRetry];
                 }
                 [self->_metalView requestStreamWindowList];
+            }
+            if (ok && [operation isEqualToString:
+                       @MACWS_CONTROL_OP_REPAIR_DESKTOP]) {
+                // Dock/SystemUIServer replacement changes the fullscreen
+                // layer graph while WindowServer and ordinary applications
+                // remain alive. Reconnect only this Host's display stream so
+                // the repaired final composite and icon-backed Dock windows
+                // replace any retained pre-repair frame.
+                [self->_metalView suspendStream];
+                [self->_metalView configureStreamMode:self->_streamMode
+                                              windowID:self->_windowID];
+                [self->_metalView requestStreamWindowList];
+                if (self->_windowID != 0)
+                    [self refreshSemanticMenuWithCompletion:nil];
             }
             [self refreshStatus];
         }];
@@ -3809,6 +4007,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [self runOperation:@MACWS_CONTROL_OP_REPAIR arguments:nil];
 }
 
+- (void)repairDesktopAction {
+    [self runOperation:@MACWS_CONTROL_OP_REPAIR_DESKTOP arguments:nil];
+}
+
 - (void)recoverAction {
     [self runOperation:@MACWS_CONTROL_OP_RECOVER arguments:nil];
 }
@@ -3833,7 +4035,13 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (NSURL *)writeHostUISnapshot {
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-    format.scale = UIScreen.mainScreen.scale;
+    // Automation classifies logical UI state, not individual Retina pixels.
+    // Encoding the 1389x970-point workspace at the physical 2x scale produced
+    // 2778x1940 PNGs of roughly 7.5 MB every observation cycle.  Keep the
+    // content and coordinate space exact while avoiding that diagnostic-only
+    // encode/transfer load. writeHostScreenSnapshot remains the full-density
+    // system-composite capture when pixel-level evidence is required.
+    format.scale = 1.0;
     UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
         initWithSize:self.view.bounds.size format:format];
     UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
@@ -3843,8 +4051,35 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     NSData *png = UIImagePNGRepresentation(image);
     NSString *path = @"/var/mobile/Library/Logs/MacWSHost-ui.png";
     BOOL written = [png writeToFile:path options:NSDataWritingAtomic error:nil];
-    MacWSLog(@"ui-snapshot written=%@ bytes=%lu path=%@",
-             written ? @"YES" : @"NO", (unsigned long)png.length, path);
+    MacWSLog(@"ui-snapshot written=%@ bytes=%lu scale=%.1f path=%@",
+             written ? @"YES" : @"NO", (unsigned long)png.length,
+             format.scale, path);
+    return written ? [NSURL fileURLWithPath:path] : nil;
+}
+
+- (NSURL *)writeHostAutomationSnapshot {
+    // The state machine needs scene identity and readable labels, not a
+    // lossless Retina artifact. The hierarchy must still be rendered at its
+    // exact logical bounds: runtime comparison showed that drawing MTKView
+    // into a smaller target loses its CAMetalLayer pixels and preserves only
+    // the UIKit FPS overlay. JPEG removes the expensive lossless encode and
+    // transfer without changing that capture semantic.
+    CGSize size = self.view.bounds.size;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.scale = 1.0;
+    format.opaque = YES;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc]
+        initWithSize:size format:format];
+    UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+        (void)context;
+        [self.view drawViewHierarchyInRect:self.view.bounds afterScreenUpdates:YES];
+    }];
+    NSData *jpeg = UIImageJPEGRepresentation(image, 0.58);
+    NSString *path = @"/var/mobile/Library/Logs/MacWSHost-automation.jpg";
+    BOOL written = [jpeg writeToFile:path options:NSDataWritingAtomic error:nil];
+    MacWSLog(@"automation-snapshot written=%@ bytes=%lu size=%.0fx%.0f path=%@",
+             written ? @"YES" : @"NO", (unsigned long)jpeg.length,
+             size.width, size.height, path);
     return written ? [NSURL fileURLWithPath:path] : nil;
 }
 
@@ -3924,10 +4159,18 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self recoverAction];
     } else if ([action isEqualToString:@"repair"]) {
         [self repairAction];
+    } else if ([action isEqualToString:@"repair-desktop"]) {
+        [self repairDesktopAction];
     } else if ([action isEqualToString:@"capture"]) {
         [self captureAction];
     } else if ([action isEqualToString:@"test-open-file"]) {
         [self performSemanticShortcutForDiagnostics:@"⌘O"];
+    } else if ([action isEqualToString:@"test-quit"]) {
+        // Exercise the same serialized NSMenuItem action used by macPad's
+        // mirrored menu bar. This is an end-to-end quit witness, unlike a
+        // signal or a direct process kill, and lets the session supervisor
+        // prove Dock convergence after the application accepts termination.
+        [self performSemanticShortcutForDiagnostics:@"⌘Q"];
     } else if ([action isEqualToString:@"fullscreen"]) {
         [self openFullscreenWorkspace];
     } else if ([action isEqualToString:@"enter-workspace"]) {
@@ -3938,22 +4181,24 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [self closeCurrentWindow];
     } else if ([action isEqualToString:@"screenshot-ui"]) {
         [self writeHostUISnapshot];
+    } else if ([action isEqualToString:@"screenshot-automation"]) {
+        [self writeHostAutomationSnapshot];
     } else if ([action isEqualToString:@"screenshot-screen"]) {
         [self writeHostScreenSnapshot];
+    } else if ([action isEqualToString:@"screenshot-rendered"]) {
+        [_metalView requestRenderedDrawableSnapshotToPath:
+            @"/var/mobile/Library/Logs/MacWSHost-rendered.png"];
     } else if ([action isEqualToString:@"screenshot-base"]) {
         [_metalView writeBaseSurfaceSnapshotToPath:
             @"/var/mobile/Library/Logs/MacWSHost-base.png"];
+    } else if ([action isEqualToString:@"screenshot-layers"]) {
+        [_metalView writeWorkspaceSurfaceSnapshotsToDirectory:
+            @"/var/mobile/Library/Logs/MacWSHost-layers"];
     } else if ([action isEqualToString:@"performance-snapshot"]) {
         [_metalView logPerformanceSnapshotWithReason:@"url-control"];
         [self exportPerformanceMeasurement];
     } else if ([action isEqualToString:@"performance-reset"]) {
-        [_metalView.performanceMonitor resetWithReason:@"url-control"];
-        // Give the external regression runner a fresh focus witness for this
-        // exact reset.  Reading the last historical catalog message can bind
-        // a new run to an application that was frontmost minutes earlier.
-        MacWSLog(@"performance-profile-target pid=%d window=%u mode=%lu",
-                 _metalView.targetPID, _metalView.targetWindowID,
-                 (unsigned long)_streamMode);
+        [self resetPerformanceMeasurementForTargetPID:0];
     } else if ([action isEqualToString:@"performance-gesture-suite"]) {
         [self runPerformanceGestureSuite];
     } else if ([action hasPrefix:@"performance-gesture-"]) {
@@ -3981,6 +4226,35 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if ([action isEqualToString:@"show-controls"]) {
         [self showControls];
     }
+}
+
+- (void)resetPerformanceMeasurementForTargetPID:(int32_t)targetPID {
+    int32_t previousPID = _metalView.targetPID;
+    if (targetPID > 1) {
+        // A benchmark has already proved the exact process and its AppKit
+        // input endpoint before requesting a measurement generation.  Bind
+        // the Host monitor to that explicit identity instead of whichever
+        // ordinary desktop window happened to be foremost when the URL was
+        // delivered.  Runtime-confirmed on 2026-08-29: an otherwise healthy
+        // Stray run requested pid=68082 while stale VSCode pid=54057 was the
+        // passive catalog target, invalidating the whole scored interval.
+        if (!MacWSAppInputEndpointReady(targetPID)) {
+            MacWSLog(@"performance-profile-target-rejected requested=%d "
+                     "previous=%d reason=input-endpoint-missing",
+                     targetPID, previousPID);
+            return;
+        }
+        _metalView.targetPID = targetPID;
+    }
+    [_metalView.performanceMonitor resetWithReason:
+        targetPID > 1 ? @"url-control-explicit-pid" : @"url-control"];
+    // Give the external regression runner a fresh focus witness for this
+    // exact reset.  Reading the last historical catalog message can bind a
+    // new run to an application that was frontmost minutes earlier.
+    MacWSLog(@"performance-profile-target pid=%d window=%u mode=%lu "
+             "requested=%d previous=%d",
+             _metalView.targetPID, _metalView.targetWindowID,
+             (unsigned long)_streamMode, targetPID, previousPID);
 }
 
 - (void)metalView:(MacWSMetalView *)view statusChanged:(NSString *)status {
@@ -4318,9 +4592,28 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         [MacWSObservedWindowIdentities setSet:
             [NSSet setWithArray:current.allKeys]];
         [MacWSPendingWindowSceneIdentities removeAllObjects];
-        if (newTarget) {
+        BOOL changesInputOwner = newTarget &&
+            newTarget.descriptor.ownerPID != _metalView.targetPID;
+        BOOL isFocusedWindow = newTarget &&
+            (newTarget.descriptor.flags & MacWSStreamWindowFocused) != 0;
+        if (newTarget && (changesInputOwner || isFocusedWindow)) {
             [self activateMacWindow:newTarget];
             MacWSLog(@"window-auto-scene activated-fullscreen-catalog pid=%d window=%u group=%u score=%lu",
+                     newTarget.descriptor.ownerPID,
+                     newTarget.descriptor.windowID,
+                     newTarget.descriptor.logicalGroupID,
+                     (unsigned long)newTargetScore);
+        } else if (newTarget) {
+            // Runtime-confirmed with Stray pid=37813: its focused FCocoaWindow
+            // 410 was followed by non-focused window 417 (score 3), which was
+            // retired 571 ms later.  Activating every same-process catalog
+            // edge replaced inputd's valid key target with that temporary
+            // window, so AppInputBridge later rejected W as
+            // target-window-closed.  A non-focused window from the already
+            // active owner is observational only; pointer hit-testing still
+            // reaches it, while a real focused replacement takes the branch
+            // above and updates keyboard ownership.
+            MacWSLog(@"window-auto-scene observed-same-owner-nonfocused pid=%d window=%u group=%u score=%lu activation=SKIPPED",
                      newTarget.descriptor.ownerPID,
                      newTarget.descriptor.windowID,
                      newTarget.descriptor.logicalGroupID,
@@ -4446,10 +4739,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         for (MacWSStreamWindow *window in windows) {
             MacWSStreamWindowDescriptor descriptor = window.descriptor;
             MacWSStreamWindowFlags flags = descriptor.flags;
+            MacWSStreamWindowFlags fullscreenAuthority =
+                MacWSStreamWindowFocused |
+                MacWSStreamWindowFullscreenCanvas;
+            BOOL ordinaryAuthority =
+                (flags & MacWSStreamWindowVisible) != 0 &&
+                (flags & MacWSStreamWindowOnScreen) != 0;
+            BOOL focusedFullscreenCanvas =
+                (flags & fullscreenAuthority) == fullscreenAuthority;
             if (descriptor.ownerPID > 1 &&
                 MacWSAppInputEndpointReady(descriptor.ownerPID) &&
-                (flags & MacWSStreamWindowVisible) != 0 &&
-                (flags & MacWSStreamWindowOnScreen) != 0) {
+                (ordinaryAuthority || focusedFullscreenCanvas)) {
                 [eligiblePIDs addObject:@(descriptor.ownerPID)];
             }
         }
@@ -4459,10 +4759,17 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         for (MacWSStreamWindow *window in windows) {
             MacWSStreamWindowDescriptor descriptor = window.descriptor;
             MacWSStreamWindowFlags flags = descriptor.flags;
+            MacWSStreamWindowFlags fullscreenAuthority =
+                MacWSStreamWindowFocused |
+                MacWSStreamWindowFullscreenCanvas;
+            BOOL ordinaryAuthority =
+                (flags & MacWSStreamWindowVisible) != 0 &&
+                (flags & MacWSStreamWindowOnScreen) != 0;
+            BOOL focusedFullscreenCanvas =
+                (flags & fullscreenAuthority) == fullscreenAuthority;
             if (descriptor.ownerPID <= 1 ||
                 !MacWSAppInputEndpointReady(descriptor.ownerPID) ||
-                (flags & MacWSStreamWindowVisible) == 0 ||
-                (flags & MacWSStreamWindowOnScreen) == 0) continue;
+                (!ordinaryAuthority && !focusedFullscreenCanvas)) continue;
             if (descriptor.ownerPID != visualPID) continue;
             // The compositor graph is already the exact presentation order
             // Host draws. Do not prefer the process-local Focused bit here:
@@ -4475,11 +4782,54 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             frontmost = window;
             break;
         }
-        MacWSStreamWindow *target = frontmost;
         int32_t previousPID = _metalView.targetPID;
+        int32_t catalogFallbackPID = visualPID;
+        BOOL retainedPreviousTarget =
+            visualPID != previousPID && previousPID > 1 &&
+            MacWSAppInputEndpointReady(previousPID) &&
+            ![eligiblePIDs containsObject:@(previousPID)];
+        if (retainedPreviousTarget) {
+            // A fullscreen Metal application may stop publishing its AppKit
+            // catalog window while its process-local input endpoint and the
+            // full-display stream remain live.  The next ordinary overlay in
+            // paint order (usually Terminal) is not evidence of a foreground
+            // change. Explicit activation and pointer hit-testing already set
+            // targetPID at their user-action boundaries, so keep that live
+            // target until it exits or a real user action selects another.
+            // Runtime-confirmed with Stray pid=69410: layer 661 retired at
+            // 1787255929.503, then the old callback incorrectly selected
+            // Terminal pid=15404 at 1787255930.463 even though Stray's input
+            // socket and display presentation continued.
+            visualPID = previousPID;
+            frontmost = nil;
+            if (_fullscreenCatalogRetainedInputPID != previousPID) {
+                _fullscreenCatalogRetainedInputPID = previousPID;
+                MacWSLog(@"fullscreen-input-target retained-live-endpoint pid=%d rejected-catalog-fallback-pid=%d",
+                         previousPID, catalogFallbackPID);
+            }
+        } else {
+            _fullscreenCatalogRetainedInputPID = 0;
+        }
+        MacWSStreamWindow *target = frontmost;
         int32_t targetPID = visualPID;
+        if (target) {
+            MacWSStreamWindowFlags fullscreenAuthority =
+                MacWSStreamWindowFocused |
+                MacWSStreamWindowFullscreenCanvas;
+            if ((target.descriptor.flags & fullscreenAuthority) ==
+                    fullscreenAuthority) {
+                [_metalView noteValidatedFullscreenCanvasForPID:
+                    target.descriptor.ownerPID
+                                                       windowID:
+                    target.descriptor.windowID];
+            }
+        }
         if (targetPID != previousPID) {
             _metalView.targetPID = targetPID;
+            if (_fullscreenActivatedInputOwnerPID != targetPID) {
+                _fullscreenActivatedInputWindowID = 0;
+                _fullscreenActivatedInputOwnerPID = 0;
+            }
             MacWSLog(@"fullscreen-input-target pid=%d window=%u source=%@ title=%@",
                      targetPID, target ? target.descriptor.windowID : 0,
                      target ? @"frontmost-presented-layer" :
@@ -4492,6 +4842,57 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
             // loop (activation -> catalog -> activation) and makes a capture
             // transport bug look like application flicker.
             [self refreshStatus];
+        }
+
+        // An explicit activation carries an exact NSWindow number into
+        // inputd's cached keyboard target.  If that native window is later
+        // removed while its application remains the live fullscreen owner,
+        // follow the best remaining ordinary window from the authoritative
+        // catalog.  This is a lifecycle repair, not passive focus
+        // reconciliation: it runs only after the exact activated identity is
+        // absent, so it cannot create activation -> catalog feedback on an
+        // otherwise stable desktop.
+        if (_fullscreenActivatedInputWindowID != 0 &&
+            _fullscreenActivatedInputOwnerPID == _metalView.targetPID) {
+            BOOL activatedWindowPresent = NO;
+            MacWSStreamWindow *replacement = nil;
+            NSUInteger replacementScore = 0;
+            CGFloat replacementArea = 0.0;
+            for (MacWSStreamWindow *window in windows) {
+                MacWSStreamWindowDescriptor descriptor = window.descriptor;
+                if (descriptor.ownerPID !=
+                    _fullscreenActivatedInputOwnerPID) continue;
+                if (descriptor.windowID ==
+                    _fullscreenActivatedInputWindowID) {
+                    activatedWindowPresent = YES;
+                    break;
+                }
+                MacWSStreamWindowFlags flags = descriptor.flags;
+                if (descriptor.windowID == 0 ||
+                    (flags & MacWSStreamWindowTransient) != 0 ||
+                    (flags & MacWSStreamWindowVisible) == 0 ||
+                    (flags & MacWSStreamWindowOnScreen) == 0) continue;
+                NSUInteger score =
+                    ((flags & MacWSStreamWindowFocused) ? 4 : 0) |
+                    ((flags & MacWSStreamWindowOnScreen) ? 2 : 0) | 1;
+                CGFloat area = descriptor.logicalWidth *
+                               descriptor.logicalHeight;
+                if (!replacement || score > replacementScore ||
+                    (score == replacementScore && area > replacementArea)) {
+                    replacement = window;
+                    replacementScore = score;
+                    replacementArea = area;
+                }
+            }
+            if (!activatedWindowPresent && replacement) {
+                uint32_t retiredWindowID =
+                    _fullscreenActivatedInputWindowID;
+                [self activateMacWindow:replacement];
+                MacWSLog(@"fullscreen-input-window-follow pid=%d old=%u new=%u score=%lu reason=activated-window-absent",
+                         replacement.descriptor.ownerPID, retiredWindowID,
+                         replacement.descriptor.windowID,
+                         (unsigned long)replacementScore);
+            }
         }
     }
     // Establish the first complete catalog as a baseline before an explicit
@@ -5106,17 +5507,30 @@ static void MacWSDeduplicateWindowScenes(void) {
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {
     (void)scene;
+    // A fullscreen macOS workspace is an interactive display session.  Keep
+    // iPadOS from auto-locking while that Scene is in the foreground; once
+    // locked, FrontBoard only prewarms a relaunched Host (ActivePrewarm=1)
+    // and cannot reconnect its UIWindowScene until the user authenticates.
+    // Restore the ordinary system policy as soon as the Scene backgrounds so
+    // this does not turn a dormant Host process into a permanent wake lock.
+    UIApplication.sharedApplication.idleTimerDisabled = YES;
     [(MacWSViewController *)self.window.rootViewController resumeSceneStream];
 }
 
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     (void)scene;
-    [(MacWSViewController *)self.window.rootViewController
-        reassertFullscreenScenePresentation];
+    UIApplication.sharedApplication.idleTimerDisabled = YES;
+    MacWSViewController *controller =
+        (MacWSViewController *)self.window.rootViewController;
+    [controller reassertFullscreenScenePresentation];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [controller restoreHardwareKeyboardFocusWithReason:@"scene-active"];
+    });
 }
 
 - (void)sceneDidEnterBackground:(UIScene *)scene {
     (void)scene;
+    UIApplication.sharedApplication.idleTimerDisabled = NO;
     [(MacWSViewController *)self.window.rootViewController suspendSceneStream];
 }
 
@@ -5332,16 +5746,35 @@ static void MacWSDeduplicateWindowScenes(void) {
             break;
         }
         NSString *host = context.URL.host ?: @"status";
+        if ([host isEqualToString:@"performance-reset"]) {
+            int32_t targetPID = 0;
+            NSURLComponents *components = [NSURLComponents
+                componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"pid"] &&
+                    item.value.intValue > 1) {
+                    targetPID = item.value.intValue;
+                    break;
+                }
+            }
+            MacWSViewController *controller =
+                (MacWSViewController *)self.window.rootViewController;
+            [controller resetPerformanceMeasurementForTargetPID:targetPID];
+            break;
+        }
         if ([@[@"status", @"start", @"start-experimental", @"stop",
                @"glassdemo", @"terminal", @"vscode", @"activity-monitor", @"finder",
                @"system-settings", @"maps", @"weather", @"sublime", @"steam",
                @"amadine", @"word", @"excel",
                @"powerpoint", @"asphalt",
-               @"recover", @"repair", @"capture",
-               @"test-open-file", @"fullscreen",
+               @"recover", @"repair", @"repair-desktop", @"capture",
+               @"test-open-file", @"test-quit", @"fullscreen",
                @"enter-workspace", @"exit-workspace",
                @"close-window",
-               @"screenshot-ui", @"screenshot-screen", @"screenshot-base",
+               @"screenshot-ui", @"screenshot-automation",
+               @"screenshot-rendered",
+               @"screenshot-screen", @"screenshot-base",
+               @"screenshot-layers",
                @"performance-snapshot", @"performance-reset",
                @"performance-gesture-suite", @"performance-gesture-tap",
                @"performance-gesture-tap-burst",

@@ -19,7 +19,7 @@
 #   --diagnostics         also enable high-overhead AGX flight recorders/traces
 #   --no-terminal         start WindowServer + VNC only, no Terminal
 #   --no-vnc              start WindowServer (+ Terminal) but no VNC server
-#   --pace-us=N           diagnostic synthetic-completion pace (8333..100000)
+#   --pace-us=N           diagnostic synthetic-completion pace (8333..500000)
 #   --runtime-cap=N        optional automation wall-clock cap (minimum 60s)
 #
 # The iOS-native temperature watchdog is mandatory.  There is deliberately no
@@ -59,7 +59,8 @@ OFFICE_LICENSING_PLIST="$MACOS_DAEMONS/com.macwsguide.office-licensing.plist"
 CHROOTEXEC=/var/jb/usr/macOS/bin/launchdchrootexec
 RUN_BASH=/var/jb/usr/macOS/bin/run_bash.sh
 POSTINST=/var/jb/usr/macOS/bin/postinst.sh
-QUARTZCORE_COMPAT_PROVISIONER=/var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh
+RESTART_AUTOSIGND=/var/jb/usr/macOS/bin/restart_autosignd.sh
+METAL2METAL_COMPAT_PROVISIONER=/var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh
 THERMAL_HELPER=/var/jb/usr/macOS/bin/macwsthermal
 MOUNTDEVFS=/var/jb/usr/macOS/bin/mountdevfs
 LOGDIR=/var/jb/var/mobile
@@ -131,7 +132,11 @@ WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
 STEAM_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.steam.runtime.plist"
-STEAM_LABEL=com.macwsguide.steam
+STEAM_LABEL=UIKitApplication:com.macwsguide.steam
+# Upgrade-only label used by packages predating Steam's application-class
+# migration.  Leaving it registered would let the old efficient coalition
+# race the new production job for Steam's singleton namespace.
+STEAM_LEGACY_LABEL=com.macwsguide.steam
 VSCODE_TRUST_SENTINEL="$ROOTFS/Applications/Visual Studio Code.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
 VSCODE_PROFILE_DIR="$ROOTFS/private/tmp/macws-vscode-profile-agx-native-targetfix13"
 VSCODE_EXTENSIONS_DIR="$ROOTFS/private/tmp/macws-vscode-extensions"
@@ -175,6 +180,7 @@ EXPERIMENTAL_CAPTURE_DONE="$ROOTFS/private/tmp/macws_capture_done"
 VNC_SHARED_FRAME="$ROOTFS/private/tmp/macws_vnc_fb"
 VNC_SHARED_SURFID="$ROOTFS/private/tmp/macws_vnc_surfid"
 VNC_ACTIVITY="$ROOTFS/private/tmp/macws_vnc_activity"
+RENDER_ACTIVITY="$ROOTFS/private/tmp/macws_render_activity"
 INTERACTION_WAKE="$ROOTFS/private/tmp/macws_interaction_wake.sock"
 VNC_ACTIVATION_REPLY="$ROOTFS/private/tmp/macws_vnc_activation_reply.sock"
 GRAPHICS_READY="$ROOTFS/private/tmp/macws_graphics_ready"
@@ -221,6 +227,8 @@ SETTINGS_EXTENSION_REGISTER_LOG="$LOGDIR/settings-extension-register.log"
 SETTINGS_EXTENSIONS_RUNTIME=/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
 SETTINGS_EXTENSIONS_RUNTIME_LOG="$LOGDIR/settings-extensions-runtime.log"
 WORKSPACE_WALLPAPER='/usr/local/share/macws/wallpapers/macws-forest-lake.png'
+FINAL_COMPOSITE_STATE="$ROOTFS/private/tmp/macws_final_composite.state"
+WORKSPACE_GRAPH_STATE="$ROOTFS/private/tmp/macws_workspace_graph.state"
 VNC_DESKTOP=macOS-iPad
 
 SPRINGBOARD=/System/Library/LaunchDaemons/com.apple.SpringBoard.plist
@@ -292,7 +300,7 @@ fi
 #
 # `status` remains read-only and is always allowed.
 case "${1:-}" in
-    start|restart|stop|production)
+    start|restart|stop|production|repair-desktop)
         if [ -f "$TEST_LEASE" ]; then
             expected_lease=$(awk 'NR == 1 { print; exit }' "$TEST_LEASE" 2>/dev/null)
             provided_lease="${MACWS_TEST_LEASE_TOKEN:-}"
@@ -535,8 +543,33 @@ proc_running() {
 
 # launchd's current PID for one exact job (empty / "-" when not running).
 launchd_job_pid() {
-    launchctl list "$1" 2>/dev/null \
-        | awk -F'= ' '/"PID"/{gsub(/[ ";]/,"",$2); print $2}'
+    local snapshot="" line="" value=""
+    # Keep PID parsing in this shell.  At the Stray/Steam allocation peak the
+    # old ``launchctl | awk`` pipeline runtime-confirmed an ENOMEM in awk and
+    # returned an empty PID even though WindowServer remained alive.  Callers
+    # which need to make lifecycle decisions must also check this function's
+    # status: a failed launchctl observation is unknown, never "no process".
+    snapshot=$(launchctl list "$1" 2>/dev/null) || return 75
+    while IFS= read -r line; do
+        case "$line" in
+            *'"PID"'*'= '*)
+                value=${line#*= }
+                value=${value%%;*}
+                value=${value#\"}
+                value=${value%\"}
+                value=${value#${value%%[![:space:]]*}}
+                value=${value%${value##*[![:space:]]}}
+                case "$value" in
+                    ''|*[!0-9]*) ;;
+                    *) printf '%s\n' "$value"; return 0 ;;
+                esac
+                ;;
+        esac
+    done <<EOF
+$snapshot
+EOF
+    printf '%s\n' '-'
+    return 0
 }
 
 ws_pid() { launchd_job_pid "$WINDOWSERVER_LABEL"; }
@@ -659,6 +692,11 @@ record_thermal_snapshot() {
 # a permanently dead CGS session.  Tear down only WS-dependent clients, wait for
 # launchd's replacement WS to stay alive for two samples, then reconnect them.
 stop_ws_dependents() {
+    # LaunchServices, IconServices, named-data and SharedFileList are session
+    # catalogs, not CGS clients. A controlled WindowServer generation change
+    # can preserve them; full cleanup still omits the option and retires them.
+    local preserve_catalog_services=0
+    [ "${1:-}" = preserve-catalog-services ] && preserve_catalog_services=1
     CLEANUP_TERM_PIDS=""
     RESTORE_MAPS_AFTER_WS=0
     # Maps was previously omitted from the dependent set. Runtime evidence
@@ -694,8 +732,11 @@ stop_ws_dependents() {
     launchctl remove "$VSCODE_LABEL" 2>/dev/null
     launchctl unload "$STEAM_PLIST" 2>/dev/null
     launchctl remove "$STEAM_LABEL" 2>/dev/null
-    launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null
-    launchctl remove "$SHAREDFILELISTD_LABEL" 2>/dev/null
+    launchctl remove "$STEAM_LEGACY_LABEL" 2>/dev/null
+    if [ "$preserve_catalog_services" -ne 1 ]; then
+        launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null
+        launchctl remove "$SHAREDFILELISTD_LABEL" 2>/dev/null
+    fi
 
     # These are on-demand Ventura location services, kept outside the
     # auto-scanned LaunchDaemons directory so they can never race a missing
@@ -710,16 +751,18 @@ stop_ws_dependents() {
     launchctl remove "$MACOS_LOCATIOND_LABEL" 2>/dev/null
     launchctl unload "$CHROME150_PLIST" 2>/dev/null
     launchctl remove "$CHROME150_LABEL" 2>/dev/null
-    launchctl unload "$LSD_PLIST" 2>/dev/null
-    launchctl remove "$LSD_LABEL" 2>/dev/null
-    launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
-    launchctl remove "$LSD_SYSTEM_LABEL" 2>/dev/null
-    launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
-    launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
-    launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
-    launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
-    launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
-    launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
+    if [ "$preserve_catalog_services" -ne 1 ]; then
+        launchctl unload "$LSD_PLIST" 2>/dev/null
+        launchctl remove "$LSD_LABEL" 2>/dev/null
+        launchctl unload "$LSD_SYSTEM_PLIST" 2>/dev/null
+        launchctl remove "$LSD_SYSTEM_LABEL" 2>/dev/null
+        launchctl unload "$ICONSERVICESAGENT_PLIST" 2>/dev/null
+        launchctl unload "$ICONSERVICESD_PLIST" 2>/dev/null
+        launchctl remove "$ICONSERVICESAGENT_LABEL" 2>/dev/null
+        launchctl remove "$ICONSERVICESD_LABEL" 2>/dev/null
+        launchctl unload "$CSNAMEDDATAD_PLIST" 2>/dev/null
+        launchctl remove "$CSNAMEDDATAD_LABEL" 2>/dev/null
+    fi
     for workspace_plist in "$FINDER_DESKTOP_PLIST" "$DOCK_PLIST" \
                            "$SYSTEMUI_PLIST" "$CONTROL_CENTER_PLIST"; do
         launchctl unload "$workspace_plist" 2>/dev/null
@@ -738,6 +781,7 @@ stop_ws_dependents() {
     launchctl asuser 501 launchctl remove "$VSCODE_LABEL" 2>/dev/null
     launchctl asuser 501 launchctl unload "$STEAM_PLIST" 2>/dev/null
     launchctl asuser 501 launchctl remove "$STEAM_LABEL" 2>/dev/null
+    launchctl asuser 501 launchctl remove "$STEAM_LEGACY_LABEL" 2>/dev/null
     launchctl asuser 501 launchctl unload "$CHROME150_PLIST" 2>/dev/null
     launchctl asuser 501 launchctl remove "$CHROME150_LABEL" 2>/dev/null
 
@@ -759,10 +803,12 @@ stop_ws_dependents() {
     kill_by_pattern "$P_DOCK_HELPER"
     kill_by_pattern "$P_SYSTEMUI"
     kill_by_pattern "$P_CONTROL_CENTER"
-    kill_by_pattern "$P_ICONSERVICESAGENT"
-    kill_by_pattern "$P_ICONSERVICESD"
-    kill_by_pattern "$P_CSNAMEDDATAD"
-    kill_by_pattern "$P_SHAREDFILELISTD"
+    if [ "$preserve_catalog_services" -ne 1 ]; then
+        kill_by_pattern "$P_ICONSERVICESAGENT"
+        kill_by_pattern "$P_ICONSERVICESD"
+        kill_by_pattern "$P_CSNAMEDDATAD"
+        kill_by_pattern "$P_SHAREDFILELISTD"
+    fi
     kill_by_pattern "$P_INPUTD"
     kill_by_pattern "$P_DISPLAYD"
     kill_by_pattern "$P_INTEROPD"
@@ -843,6 +889,21 @@ probe_sharedfilelistd() {
     done
     if kill -0 "$probe_pid" 2>/dev/null; then
         kill -TERM "$probe_pid" 2>/dev/null
+        local terminate_wait=0
+        while kill -0 "$probe_pid" 2>/dev/null &&
+              [ "$terminate_wait" -lt 10 ]; do
+            sleep 0.1
+            terminate_wait=$((terminate_wait + 1))
+        done
+        if kill -0 "$probe_pid" 2>/dev/null; then
+            # Runtime-confirmed on 2026-08-23: the probe was blocked in
+            # LSSharedFileListCopySnapshot -> SFLGenericList snapshotItems,
+            # while its worker waited synchronously for sharedfilelistd. It
+            # did not leave after SIGTERM, and this formerly unbounded wait
+            # wedged the entire Repair Desktop transaction. The target is the
+            # exact child PID created above; force only that timed-out probe.
+            kill -KILL "$probe_pid" 2>/dev/null
+        fi
         wait "$probe_pid" 2>/dev/null || true
         log "ERROR: SharedFileList snapshot round-trip timed out."
         tail -n 20 "$probe_log" 2>/dev/null || true
@@ -858,8 +919,30 @@ probe_sharedfilelistd() {
     log "macOS SharedFileList snapshot round-trip ready."
 }
 
-start_sharedfilelistd() {
+start_sharedfilelistd_generation() {
     local waited=0
+    rm -f "$LOGDIR/sharedfilelistd.out" "$LOGDIR/sharedfilelistd.err"
+    launchctl load "$SHAREDFILELISTD_PLIST" || return 1
+    while ! proc_running "$P_SHAREDFILELISTD" && [ "$waited" -lt 10 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    proc_running "$P_SHAREDFILELISTD" || {
+        log "ERROR: macOS sharedfilelistd did not reach a live process."
+        tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
+        return 1
+    }
+    sleep 2
+    proc_running "$P_SHAREDFILELISTD" || {
+        log "ERROR: macOS sharedfilelistd exited during its readiness window."
+        tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
+        return 1
+    }
+    probe_sharedfilelistd || return 1
+}
+
+start_sharedfilelistd() {
+    local generation=1
 
     start_macos_diskarbitrationd || return 1
 
@@ -884,25 +967,27 @@ start_sharedfilelistd() {
     fi
 
     log "Starting macOS SharedFileList service before GUI applications..."
-    rm -f "$LOGDIR/sharedfilelistd.out" "$LOGDIR/sharedfilelistd.err"
-    launchctl load "$SHAREDFILELISTD_PLIST" || return 1
-    while ! proc_running "$P_SHAREDFILELISTD" && [ "$waited" -lt 10 ]; do
-        sleep 1
-        waited=$((waited + 1))
+    while [ "$generation" -le 2 ]; do
+        if [ "$generation" -gt 1 ]; then
+            # Runtime-confirmed 2026-08-21: one cold-start launchd generation
+            # produced only launchdchrootexec's pre-exec lines and no durable
+            # process.  A full unload/load of the same stock daemon immediately
+            # produced a real PID that stayed Ss for the ten-second observation
+            # window.  Retire the failed generation, but keep every production
+            # PID/stability/protocol witness mandatory on the replacement.
+            log "Retrying macOS SharedFileList with a fresh launchd generation..."
+            launchctl unload "$SHAREDFILELISTD_PLIST" 2>/dev/null || true
+            kill_by_pattern "$P_SHAREDFILELISTD"
+            finish_pattern_cleanup
+            sleep 1
+        fi
+        if start_sharedfilelistd_generation; then
+            log "macOS SharedFileList endpoint ready (generation=$generation)."
+            return 0
+        fi
+        generation=$((generation + 1))
     done
-    proc_running "$P_SHAREDFILELISTD" || {
-        log "ERROR: macOS sharedfilelistd did not reach a live process."
-        tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
-        return 1
-    }
-    sleep 2
-    proc_running "$P_SHAREDFILELISTD" || {
-        log "ERROR: macOS sharedfilelistd exited during its readiness window."
-        tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
-        return 1
-    }
-    probe_sharedfilelistd || return 1
-    log "macOS SharedFileList endpoint ready."
+    return 1
 }
 
 wait_for_replacement_ws() {
@@ -991,12 +1076,8 @@ refresh_dock_after_navigation_spaces() {
     return 1
 }
 
-recover_ws_dependents() {
+start_ws_dependents_after_replacement() {
     local old_pid="$1" observed_pid="$2"
-    log "watchdog: reconnecting GUI clients to replacement WindowServer $observed_pid"
-    stop_ws_dependents
-    rm -f "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
-
     if ! wait_for_replacement_ws "$observed_pid"; then
         log "watchdog: replacement WindowServer did not become stable within 20 seconds"
         return 1
@@ -1064,7 +1145,7 @@ recover_ws_dependents() {
         # macwshost://maps is the sole production Catalyst launch route. It
         # brings the existing Host Scene forward, then the foreground Host
         # performs the responsible-process spawn required by UIKitSystem.
-        /var/jb/usr/bin/uiopen 'macwshost://maps' >/dev/null 2>&1 ||
+        /var/jb/usr/bin/uiopen --url 'macwshost://maps' >/dev/null 2>&1 ||
             log "watchdog: WARNING: Maps restoration request was rejected"
     fi
     if [ "$WANT_EXPERIMENTAL" = 1 ] && [ "$WANT_VNC" = 1 ] &&
@@ -1074,6 +1155,14 @@ recover_ws_dependents() {
     fi
     log "watchdog: GUI clients reconnected after WS $old_pid -> $RECOVERED_WS_PID (vnc=$WANT_VNC terminal=$WANT_TERMINAL)"
     return 0
+}
+
+recover_ws_dependents() {
+    local old_pid="$1" observed_pid="$2"
+    log "watchdog: reconnecting GUI clients to replacement WindowServer $observed_pid"
+    stop_ws_dependents preserve-catalog-services
+    rm -f "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
+    start_ws_dependents_after_replacement "$old_pid" "$observed_pid"
 }
 
 trip_watchdog() {
@@ -1086,18 +1175,19 @@ trip_watchdog() {
 watchdog_pidfile_cleanup() {
     local owner=""
     [ -f "$WD_PIDFILE" ] || return 0
-    owner=$(awk 'NR == 1 { print $1 }' "$WD_PIDFILE" 2>/dev/null)
+    IFS=' ' read -r owner _ 2>/dev/null < "$WD_PIDFILE" || owner=""
     [ "$owner" = "$$" ] && rm -f "$WD_PIDFILE" "$WD_READY"
     return 0
 }
 
-# Watchdog loop (runs iOS-side, backgrounded by `start`). Thermal intervention
-# is critical-only; WindowServer lifecycle and explicit runtime caps are
+# Watchdog loop (runs iOS-side, backgrounded by `start`). Thermal telemetry is
+# observation-only; WindowServer lifecycle and explicit runtime caps are
 # independent non-thermal trip paths.
 run_watchdog() {
-    local last_pid="" restarts=0 t0 started now pid
+    local last_pid="" restarts=0 t0 started now pid pid_probe_rc=0
     local missing_samples=0 next_thermal=0
     local ws_seen=0 startup_wait_logged=0 startup_missing_logged=0
+    local observation_unavailable_logged=0
     local startup_owner="${MACWS_WATCHDOG_STARTUP_OWNER:-}"
     local runtime_cap_label="disabled"
     case "$startup_owner" in
@@ -1114,55 +1204,49 @@ run_watchdog() {
     # running. Runtime-confirmed 2026-08-04: the old nohup watchdog vanished
     # with a stale pidfile while macwsdisplayd outlived WindowServer; restarting
     # only macwsdisplayd immediately restored every workspace capture layer.
-    last_pid=$(awk 'NR == 1 { print $1 }' "$WD_WS_PIDFILE" 2>/dev/null)
+    IFS=' ' read -r last_pid _ 2>/dev/null < "$WD_WS_PIDFILE" || last_pid=""
     case "$last_pid" in
         ''|*[!0-9]*) last_pid="" ;;
     esac
-    t0=$(date +%s)
+    t0=$SECONDS
     started=$t0
     next_thermal=$((started + WD_THERMAL_POLL))
     [ "$WD_MAX_RUNTIME" -gt 0 ] &&
         runtime_cap_label="${WD_MAX_RUNTIME}s"
 
-    # Handshake proves that the independent watchdog process is alive. Missing
-    # telemetry is logged but does not block work: thermal intervention is
-    # deliberately limited to an explicitly observed `critical` state.
+    # Handshake proves that the independent watchdog process is alive. Thermal
+    # state is observation-only and never controls Stray or the GUI session.
     if thermal_snapshot; then
         record_thermal_snapshot "$THERMAL_LINE"
         log "watchdog: initial thermal sample: $THERMAL_LINE"
-        if [ "$THERMAL_STATE" = critical ]; then
-            trip_watchdog "启动时 iPadOS 温度状态为 critical，已拒绝启动 macOS GUI"
-            return 0
-        fi
     else
         record_thermal_snapshot "unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'"
-        log "watchdog: WARNING: initial thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; continuing because only an observed critical state may intervene"
+        log "watchdog: WARNING: initial thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; observation-only"
     fi
 
     echo "$$" > "$WD_READY"
-    log "watchdog: armed (temperature every ${WD_THERMAL_POLL}s, critical-only; memory guard=disabled; restarts>=$WD_RESTART_LIMIT/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
+    log "watchdog: armed (temperature every ${WD_THERMAL_POLL}s, observe-only; memory guard=disabled; restarts>=$WD_RESTART_LIMIT/${WD_WINDOW}s; runtime cap=$runtime_cap_label)"
     while :; do
         sleep "$WD_POLL"
-        now=$(date +%s)
+        now=$SECONDS
         if [ "$now" -ge "$next_thermal" ]; then
             next_thermal=$((now + WD_THERMAL_POLL))
             if thermal_snapshot; then
                 record_thermal_snapshot "$THERMAL_LINE"
                 log "watchdog: thermal sample: $THERMAL_LINE"
-                if [ "$THERMAL_STATE" = critical ]; then
-                    trip_watchdog "iPadOS 温度状态达到 critical，已停止 macOS GUI"
-                    return 0
-                fi
             else
                 record_thermal_snapshot "unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'"
-                log "watchdog: WARNING: thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; no intervention without an observed critical state"
+                log "watchdog: WARNING: thermal telemetry unavailable rc=$THERMAL_HELPER_RC output='${THERMAL_LINE:-}'; observation-only"
             fi
         fi
 
-        # Exit only when the GUI was actually torn down (the WindowServer launchd
-        # job is unloaded). A momentarily-absent PROCESS just means launchd is
-        # relaunching it after a crash — keep guarding (and count it as a restart).
-        if ! launchctl list "$WINDOWSERVER_LABEL" >/dev/null 2>&1; then
+        # One allocation-safe launchctl snapshot supplies both job and PID
+        # state.  If launchctl itself cannot be executed, the observation is
+        # unknown: preserve the live GUI and retry instead of incrementing a
+        # missing-process counter from missing evidence.
+        pid=$(ws_pid)
+        pid_probe_rc=$?
+        if [ "$pid_probe_rc" -ne 0 ]; then
             if [ "$ws_seen" = 0 ] && [ -n "$startup_owner" ] &&
                kill -0 "$startup_owner" 2>/dev/null; then
                 if [ "$startup_wait_logged" = 0 ]; then
@@ -1171,11 +1255,15 @@ run_watchdog() {
                 fi
                 continue
             fi
-            log "watchdog: WindowServer job unloaded (GUI stopped) — exiting."
-            return 0
+            if [ "$observation_unavailable_logged" = 0 ]; then
+                log "watchdog: WARNING: WindowServer launchd observation unavailable rc=$pid_probe_rc; preserving session and retrying."
+                observation_unavailable_logged=1
+            fi
+            missing_samples=0
+            continue
         fi
+        observation_unavailable_logged=0
         ws_seen=1
-        pid=$(ws_pid)
         if [ -z "$pid" ] || [ "$pid" = "-" ]; then
             missing_samples=$((missing_samples + 1))
             if [ "$missing_samples" -eq 1 ] || [ "$missing_samples" -eq 3 ]; then
@@ -1188,7 +1276,7 @@ run_watchdog() {
                 # dependencies after only four watchdog samples guarantees
                 # that a cold AGX/JIT retry can never recover, while the
                 # launcher keeps waiting against an already-destroyed stack.
-                # During this phase keep the critical-only thermal guard and
+                # During this phase keep the observe-only health guard and
                 # leave lifecycle failure to wait_for_initial_ws_ready(). Once
                 # the owner exits, ordinary missing-PID intervention resumes.
                 if [ -n "$startup_owner" ] &&
@@ -1221,7 +1309,7 @@ run_watchdog() {
             record_ws_pid "$pid" || \
                 log "watchdog: WARNING: could not persist WindowServer pid=$pid"
         fi
-        now=$(date +%s)
+        now=$SECONDS
         if [ $((now - t0)) -ge "$WD_WINDOW" ]; then restarts=0; t0=$now; fi
         if [ "$restarts" -ge "$WD_RESTART_LIMIT" ]; then
             trip_watchdog "WindowServer 在 ${WD_WINDOW} 秒内重启 ${restarts} 次，已自动停止"
@@ -1245,7 +1333,8 @@ run_watchdog() {
 BOOT_TRUSTCACHE_INFO=""
 BOOT_TRUSTCACHE_ADDED=0
 APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
-APPLICATION_TRUST_CLOSURE_VERSION=2
+APPLICATION_TRUST_PROGRESS="$LOGDIR/macws-application-trust.progress"
+APPLICATION_TRUST_CLOSURE_VERSION=3
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=16
 
@@ -1365,9 +1454,84 @@ for base, _, names in os.walk(sys.argv[1]):
 ' "$1"
 }
 
+# A completed-bundle checkpoint is reusable only while both the iPad boot and
+# the exact bundle tree are unchanged.  Walking metadata is much cheaper than
+# invoking ldid twice for every image; inode, size, mtime and ctime together
+# also invalidate the checkpoint when an updater replaces or rewrites code.
+bundle_trust_source_fingerprint() {
+    /var/jb/usr/bin/python3 -c '
+import hashlib, os, stat, sys
+
+magics = {
+    b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca",
+}
+root = sys.argv[1]
+records = []
+for base, _, names in os.walk(root):
+    for name in names:
+        path = os.path.join(base, name)
+        try:
+            info = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            with open(path, "rb") as stream:
+                if stream.read(4) not in magics:
+                    continue
+            records.append((os.path.relpath(path, root), info.st_ino,
+                            info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+        except OSError:
+            pass
+digest = hashlib.sha256()
+for record in sorted(records):
+    digest.update(os.fsencode(record[0]))
+    for value in record[1:]:
+        digest.update(b"\0" + str(value).encode("ascii"))
+    digest.update(b"\n")
+print(digest.hexdigest())
+' "$1"
+}
+
+application_trust_thermally_safe() {
+    if ! thermal_snapshot; then
+        log "ERROR: application trust scan could not read the mandatory thermal sensor."
+        return 1
+    fi
+    case "$THERMAL_TEMP_CENTIC" in
+        ''|*[!0-9]*)
+            log "ERROR: application trust scan received an invalid temperature: $THERMAL_LINE"
+            return 1
+            ;;
+    esac
+    # Admission follows iPadOS's own aggregate pressure classification.  A
+    # fixed battery-temperature cutoff rejected a measured `nominal` state at
+    # 36.09 C during Repair Desktop, after the old session had already been
+    # stopped, and left the user without a desktop.  Keep the numeric sensor
+    # as an observation/validity witness; only a non-nominal state pauses the
+    # expensive trust walk.
+    if [ "$THERMAL_STATE" != nominal ]; then
+        log "THERMAL-PAUSE: application trust checkpoint preserved; $THERMAL_LINE"
+        return 1
+    fi
+    return 0
+}
+
 boot_session_identifier() {
+    local session_uuid=""
+    session_uuid=$(/var/jb/usr/sbin/sysctl -n kern.bootsessionuuid \
+        2>/dev/null | /var/jb/usr/bin/tr -d '[:space:]')
+    case "$session_uuid" in
+        ''|*[!0-9A-Fa-f-]*) ;;
+        *) printf 'uuid=%s\n' "$session_uuid"; return 0 ;;
+    esac
+    # Older kernels may not publish a boot-session UUID.  Keep a fallback,
+    # but use only the integer second: this device's formatted kern.boottime
+    # includes a derived microsecond value that moved across repeated reads
+    # during one live boot and invalidated the expensive trust-closure cache.
     /var/jb/usr/sbin/sysctl -n kern.boottime 2>/dev/null |
-        /var/jb/usr/bin/tr -cd '0-9,='
+        /var/jb/usr/bin/sed -n 's/.*sec = \([0-9][0-9]*\).*/sec=\1/p'
 }
 
 # Restore the dependency closure of every already-signed third-party app once
@@ -1396,12 +1560,27 @@ restore_installed_application_trust() {
     local steam_live_bundle="" steam_runtime_root=""
     local bundle_count=0 image_count=0
     local progress_interval=50 next_progress=50 bundle_name=""
+    local progress_id="" progress_tmp="" bundle_fingerprint=""
+    local progress_entry="" image_entry=""
     boot_id=$(boot_session_identifier)
     marker_expected="v${APPLICATION_TRUST_CLOSURE_VERSION}:${boot_id}"
     marker_id=$(sed -n '1p' "$APPLICATION_TRUST_BOOT_MARKER" 2>/dev/null || true)
     if [ -n "$boot_id" ] && [ "$marker_id" = "$marker_expected" ]; then
         log "Application trust closure already verified for this iPad boot."
         return 0
+    fi
+
+    application_trust_thermally_safe || return 1
+    if [ -n "$boot_id" ]; then
+        progress_id=$(sed -n '1p' "$APPLICATION_TRUST_PROGRESS" \
+            2>/dev/null || true)
+        if [ "$progress_id" != "$marker_expected" ]; then
+            progress_tmp="${APPLICATION_TRUST_PROGRESS}.new.$$"
+            printf '%s\n' "$marker_expected" > "$progress_tmp" || return 1
+            mv -f "$progress_tmp" "$APPLICATION_TRUST_PROGRESS" || return 1
+        fi
+    else
+        rm -f "$APPLICATION_TRUST_PROGRESS"
     fi
 
     steam_live_bundle="$ROOTFS/Users/root/Library/Application Support/Steam/Steam.AppBundle/Steam"
@@ -1420,15 +1599,43 @@ restore_installed_application_trust() {
         [ -d "$bundle/Contents" ] || continue
         bundle_count=$((bundle_count + 1))
         bundle_name=${bundle##*/}
+        bundle_fingerprint=$(bundle_trust_source_fingerprint \
+            "$bundle/Contents") || return 1
+        progress_entry=$(printf 'bundle\t%s\t%s' \
+            "$bundle_fingerprint" "$bundle")
+        if [ -n "$boot_id" ] &&
+           /var/jb/usr/bin/grep -Fqx "$progress_entry" \
+                "$APPLICATION_TRUST_PROGRESS" 2>/dev/null; then
+            log "Application trust checkpoint reused: bundle=$bundle_count current=$bundle_name"
+            continue
+        fi
         log "Restoring application trust: bundle=$bundle_count current=$bundle_name images=$image_count"
         while IFS= read -r -d '' path; do
+            image_entry=$(printf 'image\t%s\t%s' \
+                "$bundle_fingerprint" "$path")
+            if [ -n "$boot_id" ] &&
+               /var/jb/usr/bin/grep -Fqx "$image_entry" \
+                    "$APPLICATION_TRUST_PROGRESS" 2>/dev/null; then
+                continue
+            fi
             boot_trust_macho "$path" || return 1
             image_count=$((image_count + 1))
+            if [ -n "$boot_id" ]; then
+                printf '%s\n' "$image_entry" >> \
+                    "$APPLICATION_TRUST_PROGRESS" || return 1
+            fi
+            if [ $((image_count % 25)) -eq 0 ]; then
+                application_trust_thermally_safe || return 1
+            fi
             if [ "$image_count" -ge "$next_progress" ]; then
                 log "Application trust progress: images=$image_count current=$bundle_name"
                 next_progress=$((next_progress + progress_interval))
             fi
         done < <(list_boot_macho_files "$bundle/Contents")
+        if [ -n "$boot_id" ]; then
+            printf '%s\n' "$progress_entry" >> "$APPLICATION_TRUST_PROGRESS" ||
+                return 1
+        fi
     done
 
     if [ -n "$boot_id" ]; then
@@ -1436,6 +1643,7 @@ restore_installed_application_trust() {
         printf '%s\n' "$marker_expected" > "$marker_tmp" || return 1
         mv -f "$marker_tmp" "$APPLICATION_TRUST_BOOT_MARKER" || return 1
     fi
+    rm -f "$APPLICATION_TRUST_PROGRESS"
     log "Application trust closure ready (bundles=$bundle_count Mach-O images=$image_count)."
 }
 
@@ -1462,6 +1670,7 @@ restore_cold_boot_trust() {
         "$ROOTFS/bin/bash" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd" \
         "$ROOTFS/System/Library/CoreServices/launchservicesd.dylib" \
+        "$ROOTFS$P_SHAREDFILELISTD" \
         "$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer" \
         "$ROOTFS/System/Library/PrivateFrameworks/SystemStatusServer.framework/Support/systemstatusd" \
         "$ROOTFS/usr/local/libexec/macws-cfprefsd" \
@@ -1507,6 +1716,28 @@ chroot_works() {
         *__CHROOT_OK__*) return 0 ;;
         *)               return 1 ;;
     esac
+}
+
+# launchdchrootexec's injected JIT authorization path is a live autosignd
+# round-trip, not just an executable-trust probe.  Emergency cleanup
+# deliberately kills autosignd so a wedged signing transaction cannot survive
+# recovery; a later GUI start must therefore republish that bounded prerequisite
+# before asking bash to prove the chroot.  Runtime-confirmed on 2026-08-21: with
+# the base trust closure already restored, the old ordering produced
+# `autosignd connected=0 connect_errno=61` followed by the EnableJIT assertion;
+# ensure_chroot_works then misreported that as an incomplete base trustcache and
+# launched the much more expensive postinst path.
+ensure_autosignd_ready() {
+    if [ ! -f "$RESTART_AUTOSIGND" ]; then
+        log "ERROR: autosignd lifecycle helper is missing at $RESTART_AUTOSIGND"
+        return 1
+    fi
+    if ! bash "$RESTART_AUTOSIGND" > "$LOGDIR/restart-autosignd.log" 2>&1; then
+        log "ERROR: autosignd could not publish its chroot-visible socket."
+        tail -n 10 "$LOGDIR/restart-autosignd.log" 2>/dev/null || true
+        return 1
+    fi
+    log "autosignd is running with a verified chroot-visible socket."
 }
 
 # The executable signature persists across a reboot, but Dopamine's dynamic
@@ -1596,6 +1827,7 @@ ensure_chroot_works() {
         log "ERROR: reboot-volatile macOS trust closure could not be restored."
         return 1
     }
+    ensure_autosignd_ready || return 1
     # devfs mounts are reboot-volatile, unlike the rootfs contents and package
     # signatures.  A successful trust probe alone therefore cannot establish
     # that GUI clients can create pseudo-terminals. Runtime evidence from the
@@ -1615,8 +1847,8 @@ ensure_chroot_works() {
     # while every executable trust sentinel remains valid. Hash-check the
     # focused provisioner on every cold start; its matching path is one 1-MiB
     # read and performs no compiler or signing work.
-    if [ ! -f "$QUARTZCORE_COMPAT_PROVISIONER" ] ||
-       ! bash "$QUARTZCORE_COMPAT_PROVISIONER" \
+    if [ ! -f "$METAL2METAL_COMPAT_PROVISIONER" ] ||
+       ! bash "$METAL2METAL_COMPAT_PROVISIONER" \
             > "$LOGDIR/quartzcore-compat.log" 2>&1; then
         log "ERROR: exact QuartzCore native-AGX compatibility library is unavailable."
         tail -n 20 "$LOGDIR/quartzcore-compat.log" 2>/dev/null || true
@@ -1715,6 +1947,38 @@ write_plists() {
     launchctl unload "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist" 2>/dev/null
     launchctl remove com.macwsguide.dockhelper 2>/dev/null
     rm -f "$GUI_LAUNCHD_DIR/com.macwsguide.dockhelper.plist"
+
+    # Ventura normally installs this as both a system daemon and login agent.
+    # MacWS has one outer launchd domain, so publish one stock protocol owner
+    # and execute the real macOS binary in the chroot.  start_sharedfilelistd
+    # requires a PID before it performs the typed snapshot round-trip, hence
+    # RunAtLoad is intentional here even though the stock plist is on-demand.
+    # Runtime-confirmed via MacWSStartup.log on 2026-08-23: the startup path
+    # previously referenced this generated location without ever creating it,
+    # and both launch attempts failed with ENOENT after an otherwise complete
+    # application-trust walk.
+    cat > "$SHAREDFILELISTD_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${SHAREDFILELISTD_LABEL}</string>
+    <key>POSIXSpawnType</key><string>Adaptive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${CHROOTEXEC}</string><string>0</string><string>0</string>
+        <string>${ROOTFS}</string><string>${P_SHAREDFILELISTD}</string>
+    </array>
+    <key>MachServices</key>
+    <dict><key>com.apple.coreservices.sharedfilelistd.xpc</key><true/></dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key><string>${LOGDIR}/sharedfilelistd.out</string>
+    <key>StandardErrorPath</key><string>${LOGDIR}/sharedfilelistd.err</string>
+</dict>
+</plist>
+PLIST
 
     cat > "$VNC_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -2516,12 +2780,10 @@ production_preflight() {
             log "ERROR: exact ANGLE 1ba8ec3 macabi default library is missing or invalid: $VSCODE_ANGLE_MACABI_LIBRARY"
             bad=1
         fi
-        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
-                   MACWS_PIN_FALLBACK MACWS_JIT_MPROTECT_COMPAT \
+        for key in MACWS_JIT_MPROTECT_COMPAT \
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
-                   MACWS_MACOS_SYSTEM_POLICY_COMPAT \
-                   MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
+                   MACWS_MACOS_SYSTEM_POLICY_COMPAT; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"
@@ -2529,12 +2791,20 @@ production_preflight() {
             fi
         done
         for path in \
-            '--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix13' \
+            '--user-data-dir=/tmp/macws-vscode-profile-software-composite1' \
             '--extensions-dir=/tmp/macws-vscode-extensions' \
-            '--use-angle=metal' '--ignore-gpu-blocklist' \
+            '--disable-gpu' \
             '--disable-features=SkiaGraphite'; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null | grep -Fq -- "$path"; then
                 log "ERROR: required VS Code production argument missing: $path"
+                bad=1
+            fi
+        done
+        for key in MACWS_AGX_NATIVE MACWS_AGX_REGISTER_CLASSES \
+                   MACWS_PIN_FALLBACK MACWS_CHROMIUM_COMPOSITE_OVERLAYS; do
+            if plutil "$VSCODE_PLIST" 2>/dev/null |
+                 grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
+                log "ERROR: VS Code software-compositor profile unexpectedly enables $key: $VSCODE_PLIST"
                 bad=1
             fi
         done
@@ -2686,7 +2956,8 @@ cleanup_macos() {
         "$EXPERIMENTAL_OBSERVE_PF550" \
         "$EXPERIMENTAL_SUBMIT_RING" "$EXPERIMENTAL_FAST_SUBMIT_RING" \
         "$EXPERIMENTAL_OWNED_SCANOUT" "$EXPERIMENTAL_QUEUE_QOS" \
-        "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" "$EXPERIMENTAL_PACE"
+        "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" "$EXPERIMENTAL_PACE" \
+        "$RENDER_ACTIVITY"
     sleep 1
     log "Cleanup done."
 }
@@ -2760,7 +3031,7 @@ launchservices_source_fingerprint() {
 
 seed_launchservices_database() {
     local fingerprint="" marker_value="" marker_tmp="" catalog_current=0
-    local root="" bundle=""
+    local root="" bundle="" activation_attempt=0
     local -a application_paths=()
     if [ ! -x "$ROOTFS$LSREGISTER_BIN" ]; then
         log "ERROR: stock macOS lsregister is missing at $LSREGISTER_BIN"
@@ -2781,13 +3052,6 @@ seed_launchservices_database() {
          "$marker_value" ]; then
         catalog_current=1
         rm -f "$LAUNCHSERVICES_VERIFY_LOG"
-        if "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-                verify-launchservices-catalog \
-                > "$LAUNCHSERVICES_VERIFY_LOG" 2>&1; then
-            log "LaunchServices catalog reused after platform-1 record verification."
-            return 0
-        fi
-
         # Runtime A/B on 2026-08-07 established the actual reboot invariant:
         # the same healthy, seeded csstore reports Terminal as `mounted`
         # immediately after registration and `not mounted` after only the
@@ -2800,7 +3064,14 @@ seed_launchservices_database() {
         # A/B over all 184 application bundles took 3 seconds and left the
         # csstore byte size unchanged, while restoring arbitrary Spotlight-
         # style launches instead of only the five startup witnesses.
-        log "Reactivating persisted LaunchServices records for the mounted chroot..."
+        # start_macos has just loaded a fresh private system/session lsd pair,
+        # so asking NSWorkspace to prove those known-inactive records first is
+        # redundant. Runtime-confirmed on 2026-08-28: that pre-reactivation
+        # verification spent about 78 seconds before returning Terminal
+        # resolvedURL=<nil>; the required registration plus final typed
+        # verification then succeeded. Repair Desktop has a separate live-
+        # session fast verifier and does not call this cold-start path.
+        log "Reactivating persisted LaunchServices records after the private lsd reload..."
         for root in \
             "$ROOTFS/System/Applications" \
             "$ROOTFS/Applications" \
@@ -2812,22 +3083,48 @@ seed_launchservices_database() {
             done < <(find "$root" -type d -name '*.app' -prune -print \
                 2>/dev/null | sort)
         done
+        # A healthy activation completed in 3-4 seconds in the retained A/B.
+        # Runtime-confirmed on 2026-08-29: the same stock call remained at
+        # zero CPU for more than 110 seconds while lsd stayed alive, holding
+        # the entire GUI transaction and causing Host startup retries. Bound
+        # only this reactivation attempt; failure continues into the existing
+        # stock -kill -seed path and typed catalog verification below.
         if [ "${#application_paths[@]}" -gt 0 ] &&
-           "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" -f \
+           /var/jb/usr/bin/timeout -k 2 20 \
+                "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" -f \
                 "${application_paths[@]}" \
-                > "$LOGDIR/lsregister-reactivate.log" 2>&1 &&
-           MACWS_CATALOG_REGISTRATION=1 \
-                "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-                register-settings-extensions \
-                > "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1 &&
-           "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-                verify-launchservices-catalog \
-                >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
-            log "LaunchServices catalog reactivated and verified."
-            return 0
+                > "$LOGDIR/lsregister-reactivate.log" 2>&1; then
+            # Runtime-confirmed by launchservices-reactivation-ab.log on
+            # 2026-08-23: after both private lsd jobs reload, `lsregister -f`
+            # restored all 193 application records in 4s, but the first typed
+            # verification failed only because the 48 ExtensionKit records
+            # were still absent. Replaying register-settings-extensions then
+            # passed the same typed verification immediately. A transient
+            # extension registration failure previously fell straight into
+            # `-kill -seed`, making service startup take 275s. Retry that real
+            # upstream registration once; never accept an unverified catalog.
+            : > "$SETTINGS_EXTENSION_REGISTER_LOG"
+            activation_attempt=1
+            while [ "$activation_attempt" -le 2 ]; do
+                log "Activating LaunchServices ExtensionKit records (attempt=$activation_attempt/2)..."
+                if MACWS_CATALOG_REGISTRATION=1 \
+                       "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                       register-settings-extensions \
+                       >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1 &&
+                   "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+                       verify-launchservices-catalog \
+                       >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
+                    log "LaunchServices catalog reactivated and verified."
+                    return 0
+                fi
+                log "LaunchServices ExtensionKit activation attempt $activation_attempt failed typed verification."
+                activation_attempt=$((activation_attempt + 1))
+                [ "$activation_attempt" -gt 2 ] || sleep 1
+            done
         fi
         log "Targeted LaunchServices reactivation failed; rebuilding the clean catalog."
-        tail -n 8 "$LAUNCHSERVICES_VERIFY_LOG" 2>/dev/null || true
+        tail -n 8 "$SETTINGS_EXTENSION_REGISTER_LOG" 2>/dev/null ||
+            tail -n 8 "$LAUNCHSERVICES_VERIFY_LOG" 2>/dev/null || true
     fi
 
     # A changed rootfs/catalog schema needs one authoritative rebuild.  The
@@ -2878,6 +3175,25 @@ seed_launchservices_database() {
     log "LaunchServices application catalog ready."
 }
 
+verify_launchservices_database_for_desktop_repair() {
+    # Repair Desktop runs inside one live GUI transaction: it neither installs
+    # applications nor replaces the mounted rootfs. Recomputing the complete
+    # 193-bundle source fingerprint here cost 15 seconds on the target while
+    # the typed catalog verification itself completed in 0.21 seconds. Keep
+    # the full fingerprint/seed path for cold start and package changes; for an
+    # online repair, accept the existing catalog only after its real records
+    # pass the same workspacectl protocol witness.
+    if [ -f "$LAUNCHSERVICES_CATALOG_MARKER" ] &&
+       "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
+            verify-launchservices-catalog \
+            > "$LAUNCHSERVICES_VERIFY_LOG" 2>&1; then
+        log "LaunchServices live catalog verified without a redundant source-tree rescan."
+        return 0
+    fi
+    log "Live LaunchServices catalog verification failed; running the full fingerprint/seed transaction."
+    seed_launchservices_database
+}
+
 prepare_settings_service_proxies() {
     local proxy=""
     # These freestanding iOS first images chroot before libSystem consumes
@@ -2906,18 +3222,27 @@ prepare_settings_service_proxies() {
         chmod 4755 "$proxy" || return 1
     done
 
-    # Every Ventura Settings pane is a distinct ExtensionKit executable and
-    # therefore needs a distinct registered iOS first-image carrier.  Runtime
-    # on 2026-08-05 proved that sharing one path makes RunningBoard reject the
-    # second pane with unequal identities, while preparing only Appearance
-    # leaves Wi-Fi/Bluetooth/etc. at OSLaunchdErrorDomain/2.  Reconcile the
-    # complete metadata-selected set at production start so restored
-    # trustcaches and iOS LaunchServices state cannot silently regress after a
-    # cold jailbreak bootstrap.
+    # The generic ViewBridge/ExtensionKit/HIServices contracts are desktop
+    # dependencies, but the 48 per-pane iOS carrier binaries are not.  Keep
+    # this startup path limited to the service proxies it is about to publish.
+    # System Settings performs the full pane reconciliation through hostd at
+    # its own launch boundary, where success is still required before the app
+    # can start.
     if [ ! -f "$SETTINGS_EXTENSIONS_RUNTIME" ]; then
         log "ERROR: Settings ExtensionKit runtime helper is missing."
         return 1
     fi
+    log "Settings service proxies ready; per-pane runtimes are prepared on demand."
+}
+
+prepare_settings_extension_runtimes() {
+    # Every Ventura Settings pane is a distinct ExtensionKit executable and
+    # therefore needs a distinct registered iOS first-image carrier.  Runtime
+    # on 2026-08-05 proved that sharing one path makes RunningBoard reject the
+    # second pane with unequal identities, while preparing only Appearance
+    # leaves Wi-Fi/Bluetooth/etc. at OSLaunchdErrorDomain/2.  This expensive
+    # transaction is intentionally called only when System Settings is being
+    # launched, and it retains the same complete verification invariant.
     rm -f "$SETTINGS_EXTENSIONS_RUNTIME_LOG"
     if ! bash "$SETTINGS_EXTENSIONS_RUNTIME" --verify \
             > "$SETTINGS_EXTENSIONS_RUNTIME_LOG" 2>&1; then
@@ -2955,18 +3280,34 @@ publish_settings_service_contracts() {
     log "Private macOS ViewBridge, ExtensionKit, HIServices and GeoServices contracts ready."
 }
 
+run_defaults_utility() {
+    # defaults is a headless startup probe, but CoreFoundation performs its
+    # cfprefsd connection from inside the shared cache.  Select libmachook's
+    # narrow preferences-client path: install only the two private XPC name
+    # hooks, then skip CGSession/AppKit/Metal/input initialization.
+    # A registered launchd service is not proof that cfprefsd is processing
+    # requests.  A half-started generation previously left this exact utility
+    # blocked for more than a minute while the startup/trust workload pushed
+    # iPadOS thermal state to serious.  Bound every real protocol round-trip;
+    # the caller still verifies the write/read value and fails startup if the
+    # service is unhealthy.
+    MACWS_CFPREFERENCES_CLIENT=1 \
+        /var/jb/usr/bin/timeout -k 2 15 \
+        "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" "$@"
+}
+
 verify_preferences_persistence() {
     local value="" mission_control="" app_expose=""
     local dock_magnification="" dock_large_size="" dock_minimize_effect=""
     rm -f "$LOGDIR/cfprefsd-probe.log"
-    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+    if ! run_defaults_utility write \
             com.macwsguide.bootstrap PersistentPreferencesReady -bool true \
             > "$LOGDIR/cfprefsd-probe.log" 2>&1; then
         log "ERROR: private macOS CFPreferences write failed."
         tail -n 20 "$LOGDIR/cfprefsd-probe.log" 2>/dev/null || true
         return 1
     fi
-    value=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+    value=$(run_defaults_utility read \
         com.macwsguide.bootstrap PersistentPreferencesReady 2>> \
         "$LOGDIR/cfprefsd-probe.log") || value=""
     if [ "$value" != 1 ]; then
@@ -2981,38 +3322,38 @@ verify_preferences_persistence() {
     # ignored.  Persist the stock Dock preferences before Dock is launched and
     # verify the values through cfprefsd instead of installing another handler.
     rm -f "$LOGDIR/dock-gesture-preferences.log"
-    if ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+    if ! run_defaults_utility write \
             com.apple.dock showMissionControlGestureEnabled -bool true \
             > "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
-       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+       ! run_defaults_utility write \
             com.apple.dock showAppExposeGestureEnabled -bool true \
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
-       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+       ! run_defaults_utility write \
             com.apple.dock magnification -bool true \
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
-       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+       ! run_defaults_utility write \
             com.apple.dock largesize -int 128 \
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1 ||
-       ! "$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" write \
+       ! run_defaults_utility write \
             com.apple.dock mineffect -string genie \
             >> "$LOGDIR/dock-gesture-preferences.log" 2>&1; then
         log "ERROR: native Dock gesture/magnification preferences could not be persisted."
         tail -n 20 "$LOGDIR/dock-gesture-preferences.log" 2>/dev/null || true
         return 1
     fi
-    mission_control=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+    mission_control=$(run_defaults_utility read \
         com.apple.dock showMissionControlGestureEnabled 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || mission_control=""
-    app_expose=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+    app_expose=$(run_defaults_utility read \
         com.apple.dock showAppExposeGestureEnabled 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || app_expose=""
-    dock_magnification=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+    dock_magnification=$(run_defaults_utility read \
         com.apple.dock magnification 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || dock_magnification=""
-    dock_large_size=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+    dock_large_size=$(run_defaults_utility read \
         com.apple.dock largesize 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || dock_large_size=""
-    dock_minimize_effect=$("$CHROOTEXEC" 0 0 "$ROOTFS" "$DEFAULTS_BIN" read \
+    dock_minimize_effect=$(run_defaults_utility read \
         com.apple.dock mineffect 2>> \
         "$LOGDIR/dock-gesture-preferences.log") || dock_minimize_effect=""
     if [ "$mission_control" != 1 ] || [ "$app_expose" != 1 ] ||
@@ -3048,6 +3389,527 @@ apply_workspace_wallpaper() {
     log "Native macOS desktop wallpaper ready."
 }
 
+desktop_job_loaded() {
+    launchctl list "$1" >/dev/null 2>&1
+}
+
+wait_for_desktop_job_pid() {
+    local label="$1" previous_pid="${2:-}" waited=0 pid=""
+    while [ "$waited" -lt 100 ]; do
+        pid=$(launchd_job_pid "$label")
+        case "$pid" in
+            ''|'-'|*[!0-9]*) ;;
+            *)
+                if [ "$pid" != "$previous_pid" ] &&
+                   kill -0 "$pid" 2>/dev/null; then
+                    DESKTOP_JOB_PID="$pid"
+                    return 0
+                fi
+                ;;
+        esac
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    DESKTOP_JOB_PID=""
+    return 1
+}
+
+wait_for_desktop_input_route() {
+    local waited=0 dock_pid="" endpoint=""
+    while [ "$waited" -lt 100 ]; do
+        dock_pid=$(launchd_job_pid "$DOCK_LABEL")
+        case "$dock_pid" in
+            ''|'-'|*[!0-9]*) ;;
+            *)
+                endpoint="$ROOTFS/private/tmp/macws_app_input.$dock_pid.sock"
+                if kill -0 "$dock_pid" 2>/dev/null &&
+                   [ -S "$ROOTFS/private/tmp/macws_host_input.sock" ] &&
+                   [ -S "$endpoint" ]; then
+                    DESKTOP_INPUT_PID="$dock_pid"
+                    log "Desktop input route ready (Dock pid=$dock_pid)."
+                    return 0
+                fi
+                ;;
+        esac
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    DESKTOP_INPUT_PID=""
+    log "ERROR: current Dock launchd owner did not publish its AppInput endpoint within 10 seconds."
+    return 1
+}
+
+retire_desktop_job() {
+    local plist="$1" label="$2" old_pid="" waited=0
+    old_pid=$(launchd_job_pid "$label")
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl remove "$label" 2>/dev/null || true
+    case "$old_pid" in
+        ''|'-'|*[!0-9]*) return 0 ;;
+    esac
+    while kill -0 "$old_pid" 2>/dev/null && [ "$waited" -lt 20 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    # Unload should retire its exact child.  If that child ignored TERM, kill
+    # only the PID obtained from this exact launchd label; never match the
+    # same-named native iPadOS service by process name.
+    if kill -0 "$old_pid" 2>/dev/null; then
+        kill -KILL "$old_pid" 2>/dev/null || return 1
+    fi
+}
+
+retire_desktop_job_pair() {
+    local first_plist="$1" first_label="$2" second_plist="$3" second_label="$4"
+    local first_pid="" second_pid="" first_unload="" second_unload=""
+    local first_remove="" second_remove="" waited=0
+
+    first_pid=$(launchd_job_pid "$first_label")
+    second_pid=$(launchd_job_pid "$second_label")
+
+    # These jobs have independent launchd contracts.  Runtime timing on the
+    # iPad showed sequential retirement costing 4s + 3s while reloading both
+    # took less than one second.  Issue both launchd transitions together,
+    # then apply one shared bounded exit window.  PID fallback remains scoped
+    # to the exact label snapshots above, never to a process-name match.
+    launchctl unload "$first_plist" >/dev/null 2>&1 & first_unload=$!
+    launchctl unload "$second_plist" >/dev/null 2>&1 & second_unload=$!
+    wait "$first_unload" 2>/dev/null || true
+    wait "$second_unload" 2>/dev/null || true
+    launchctl remove "$first_label" >/dev/null 2>&1 & first_remove=$!
+    launchctl remove "$second_label" >/dev/null 2>&1 & second_remove=$!
+    wait "$first_remove" 2>/dev/null || true
+    wait "$second_remove" 2>/dev/null || true
+
+    while [ "$waited" -lt 20 ]; do
+        if ! { case "$first_pid" in ''|'-'|*[!0-9]*) false ;; *) kill -0 "$first_pid" 2>/dev/null ;; esac; } &&
+           ! { case "$second_pid" in ''|'-'|*[!0-9]*) false ;; *) kill -0 "$second_pid" 2>/dev/null ;; esac; }; then
+            return 0
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+
+    case "$first_pid" in
+        ''|'-'|*[!0-9]*) ;;
+        *) kill -0 "$first_pid" 2>/dev/null &&
+               kill -KILL "$first_pid" 2>/dev/null || true ;;
+    esac
+    case "$second_pid" in
+        ''|'-'|*[!0-9]*) ;;
+        *) kill -0 "$second_pid" 2>/dev/null &&
+               kill -KILL "$second_pid" 2>/dev/null || true ;;
+    esac
+    return 0
+}
+
+load_desktop_job() {
+    local plist="$1" label="$2" name="$3" previous_pid="${4:-}"
+    [ -f "$plist" ] || {
+        log "ERROR: $name launch contract is missing: $plist"
+        return 1
+    }
+    launchctl load "$plist" || {
+        log "ERROR: $name launch contract could not be loaded."
+        return 1
+    }
+    wait_for_desktop_job_pid "$label" "$previous_pid" || {
+        log "ERROR: $name did not publish a live launchd PID within 10 seconds."
+        return 1
+    }
+    log "$name ready (pid=$DESKTOP_JOB_PID)."
+}
+
+ensure_desktop_job() {
+    local plist="$1" label="$2" name="$3" pid=""
+    if desktop_job_loaded "$label"; then
+        pid=$(launchd_job_pid "$label")
+        case "$pid" in
+            ''|'-'|*[!0-9]*)
+                launchctl start "$label" 2>/dev/null || true
+                if wait_for_desktop_job_pid "$label" ""; then
+                    log "$name resumed from its existing contract (pid=$DESKTOP_JOB_PID)."
+                    return 0
+                fi
+                ;;
+            *)
+                if kill -0 "$pid" 2>/dev/null; then
+                    log "$name already ready (pid=$pid)."
+                    return 0
+                fi
+                ;;
+        esac
+    fi
+    retire_desktop_job "$plist" "$label" || return 1
+    load_desktop_job "$plist" "$label" "$name"
+}
+
+reload_desktop_job() {
+    local plist="$1" label="$2" name="$3" old_pid=""
+    old_pid=$(launchd_job_pid "$label")
+    retire_desktop_job "$plist" "$label" || return 1
+    load_desktop_job "$plist" "$label" "$name" "$old_pid"
+}
+
+wait_for_fresh_final_composite() {
+    local marker="$1" expected_ws="$2" timeout="${3:-10}"
+    local waited=0 stable=0 state='' producer=''
+    local graph_state='' graph_ws='' route=''
+    while [ "$waited" -lt "$timeout" ]; do
+        state=$(awk -F= '$1 == "state" { print $2; exit }' \
+            "$FINAL_COMPOSITE_STATE" 2>/dev/null)
+        producer=$(awk -F= '$1 == "producer" { print $2; exit }' \
+            "$FINAL_COMPOSITE_STATE" 2>/dev/null)
+        graph_state=$(awk -F= '$1 == "state" { print $2; exit }' \
+            "$WORKSPACE_GRAPH_STATE" 2>/dev/null)
+        graph_ws=$(awk -F= '$1 == "windowserver" { print $2; exit }' \
+            "$WORKSPACE_GRAPH_STATE" 2>/dev/null)
+        if [ -f "$FINAL_COMPOSITE_STATE" ] &&
+           [ "$FINAL_COMPOSITE_STATE" -nt "$marker" ] &&
+           [ "$state" = ready ] && [ "$producer" = "$expected_ws" ]; then
+            route=final-composite
+            stable=$((stable + 1))
+            if [ "$stable" -ge 2 ]; then
+                DESKTOP_PRESENTATION_ROUTE=$route
+                return 0
+            fi
+        else
+            stable=0
+            route=''
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    log "ERROR: desktop presentation did not publish a stable fresh pixel route for WindowServer pid=$expected_ws (final-state=${state:-missing} final-producer=${producer:-missing} graph-state=${graph_state:-missing} graph-windowserver=${graph_ws:-missing})."
+    return 1
+}
+
+repair_desktop() {
+    local original_ws="" final_ws=""
+    local composite_marker="$LOGDIR/macws-desktop-repair-composite.$$"
+    local repair_started=$SECONDS stage_started=$SECONDS
+
+    original_ws=$(ws_pid)
+    case "$original_ws" in
+        ''|'-'|*[!0-9]*)
+            log "ERROR: desktop repair requires a running WindowServer."
+            return 1
+            ;;
+    esac
+    proc_running "$P_INPUTD" && proc_running "$P_DISPLAYD" || {
+        log "ERROR: desktop repair requires the live input and display bridges."
+        return 1
+    }
+
+    log "Repairing desktop services in place; preserving WindowServer pid=$original_ws and ordinary applications."
+    # Regenerate the fixed contracts first.  This changes no loaded job and
+    # makes recovery work even after an interrupted startup removed or left an
+    # older plist on disk.
+    write_plists || {
+        log "ERROR: desktop launch contracts could not be regenerated."
+        return 1
+    }
+
+    # DisplayStream is a presentation bridge, not an application owner. Keep
+    # its healthy generation: restarting it used to abandon the explicit
+    # IOSurface use-count protecting its last WindowServer snapshot. After
+    # four repairs all four publisher slots remained permanently in-use, so a
+    # replay reached WindowServer with `source=ready published=NO` and every
+    # later Repair Desktop unnecessarily escalated to a full session rebuild.
+    # Runtime-confirmed in WindowServer.err.previous on 2026-08-23 for
+    # requester=58388, sequence=7420. Dock's topology mutation below already
+    # asks this live receiver for a fresh authoritative composite; only create
+    # the bridge here when its launchd endpoint is actually absent.
+    ensure_desktop_job "$DISPLAY_PLIST" "$DISPLAY_LABEL" \
+        "DisplayStream bridge" || return 1
+    log "TIMING desktop-repair stage=contracts-display seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
+    stage_started=$SECONDS
+
+    # Preferences and LaunchServices are upstream of IconServices and Dock.
+    # Preserve a healthy generation; recreate only a missing/dormant one so
+    # existing applications keep their live service connections.
+    ensure_desktop_job "$CFPREFSD_DAEMON_PLIST" \
+        "$CFPREFSD_DAEMON_LABEL" "macOS CFPreferences daemon" || return 1
+    ensure_desktop_job "$CFPREFSD_AGENT_PLIST" \
+        "$CFPREFSD_AGENT_LABEL" "macOS CFPreferences agent" || return 1
+    verify_preferences_persistence || return 1
+    log "TIMING desktop-repair stage=preferences seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
+    stage_started=$SECONDS
+    ensure_desktop_job "$LSD_SYSTEM_PLIST" "$LSD_SYSTEM_LABEL" \
+        "macOS LaunchServices system store" || return 1
+    ensure_desktop_job "$LSD_PLIST" "$LSD_LABEL" \
+        "macOS LaunchServices session service" || return 1
+    verify_launchservices_database_for_desktop_repair || return 1
+    ensure_desktop_job "$PBOARD_PLIST" "$PBOARD_LABEL" \
+        "macOS pasteboard service" || return 1
+    log "TIMING desktop-repair stage=launchservices-pasteboard seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
+    stage_started=$SECONDS
+
+    # Icon question marks are stale/fallback Dock tiles, not a reason to
+    # fabricate images.  Recreate the two real Ventura IconServices endpoints
+    # and then restart Dock so it resolves every tile from those endpoints.
+    local icon_stage_started=$SECONDS csnamed_retire_task=""
+    # The named-data launch contract is independent from both IconServices
+    # contracts while retiring.  Start its exact-label retirement alongside
+    # the IconServices pair, then publish all three fresh endpoints before
+    # Dock is allowed to restart.
+    retire_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" &
+    csnamed_retire_task=$!
+    retire_desktop_job_pair \
+        "$ICONSERVICESAGENT_PLIST" "$ICONSERVICESAGENT_LABEL" \
+        "$ICONSERVICESD_PLIST" "$ICONSERVICESD_LABEL" || {
+            wait "$csnamed_retire_task" 2>/dev/null || true
+            return 1
+        }
+    wait "$csnamed_retire_task" || return 1
+    log "TIMING desktop-repair detail=iconservices-nameddata-retire seconds=$((SECONDS - icon_stage_started))"
+    icon_stage_started=$SECONDS
+    rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
+    load_desktop_job "$ICONSERVICESD_PLIST" "$ICONSERVICESD_LABEL" \
+        "macOS IconServices store" || return 1
+    load_desktop_job "$ICONSERVICESAGENT_PLIST" \
+        "$ICONSERVICESAGENT_LABEL" "macOS IconServices agent" || return 1
+    load_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" \
+        "Dock CarbonCore named-data service" || return 1
+    log "TIMING desktop-repair detail=iconservices-nameddata-load seconds=$((SECONDS - icon_stage_started))"
+    icon_stage_started=$SECONDS
+    sleep 2
+    desktop_job_loaded "$ICONSERVICESD_LABEL" &&
+        desktop_job_loaded "$ICONSERVICESAGENT_LABEL" &&
+        desktop_job_loaded "$CSNAMEDDATAD_LABEL" || {
+            log "ERROR: IconServices/named-data did not survive its readiness window."
+            return 1
+        }
+    log "TIMING desktop-repair detail=iconservices-nameddata-survival seconds=$((SECONDS - icon_stage_started))"
+    log "TIMING desktop-repair stage=icons-nameddata seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
+    stage_started=$SECONDS
+
+    : > "$composite_marker" || return 1
+
+    # Finder owns desktop items but may have live user windows.  Keep that
+    # exact process if it exists; only launch the production job when absent.
+    if proc_running "$P_FINDER"; then
+        log "Finder is live; preserving its windows."
+    else
+        ensure_desktop_job "$FINDER_DESKTOP_PLIST" \
+            "$FINDER_DESKTOP_LABEL" "Finder desktop owner" || return 1
+    fi
+
+    reload_desktop_job "$DOCK_PLIST" "$DOCK_LABEL" \
+        "Dock and desktop-picture owner" || return 1
+    reload_desktop_job "$SYSTEMUI_PLIST" "$SYSTEMUI_LABEL" \
+        "macOS SystemUIServer" || return 1
+    reload_desktop_job "$CONTROL_CENTER_PLIST" "$CONTROL_CENTER_LABEL" \
+        "macOS Control Center" || return 1
+    apply_workspace_wallpaper || return 1
+    wait_for_desktop_input_route || return 1
+    log "TIMING desktop-repair stage=desktop-agents-wallpaper seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
+    stage_started=$SECONDS
+
+    final_ws=$(ws_pid)
+    if [ "$final_ws" != "$original_ws" ] ||
+       ! kill -0 "$original_ws" 2>/dev/null; then
+        log "ERROR: WindowServer changed during desktop repair ($original_ws -> ${final_ws:-missing})."
+        return 1
+    fi
+    for label in "$ICONSERVICESD_LABEL" "$ICONSERVICESAGENT_LABEL" \
+                 "$CSNAMEDDATAD_LABEL" "$DOCK_LABEL" "$SYSTEMUI_LABEL" \
+                 "$CONTROL_CENTER_LABEL"; do
+        desktop_job_loaded "$label" || {
+            log "ERROR: repaired desktop contract is not loaded: $label"
+            return 1
+        }
+    done
+    if ! wait_for_fresh_final_composite "$composite_marker" \
+            "$original_ws" 12; then
+        rm -f "$composite_marker"
+        log "Desktop agents recovered, but the WindowServer final compositor is unhealthy; requesting a controlled full session rebuild."
+        return 2
+    fi
+    rm -f "$composite_marker"
+    log "TIMING desktop-repair stage=final-composite seconds=$((SECONDS - stage_started)) total=$((SECONDS - repair_started))"
+    log "Desktop repair complete: WindowServer pid=$original_ws preserved; icons, Dock, wallpaper and menu services are live (presentation=${DESKTOP_PRESENTATION_ROUTE:-unknown})."
+}
+
+rebuild_desktop_session() {
+    local original_ws="" current_ws="" rebuilt_ws="" stable=0 waited=0
+    local state="" producer="" dock_pid="" endpoint=""
+    local composite_marker="$LOGDIR/macws-desktop-session-composite.$$"
+    local rebuild_started=$SECONDS
+
+    original_ws=$(ws_pid)
+    case "$original_ws" in
+        ''|'-'|*[!0-9]*)
+            log "ERROR: desktop-session rebuild requires a running WindowServer."
+            return 1
+            ;;
+    esac
+    desktop_job_loaded "$WATCHDOG_LABEL" || {
+        # The session-only path briefly pauses this production safety owner
+        # while it performs the same dependency transaction synchronously,
+        # then must rearm it. An absent initial owner is therefore a typed
+        # failure for the caller's full cold-start fallback, not permission to
+        # leave a replacement desktop without lifecycle/thermal observation.
+        log "ERROR: desktop-session rebuild requires the live lifecycle watchdog."
+        return 1
+    }
+
+    : > "$composite_marker" || return 1
+    log "Rebuilding only the WindowServer desktop generation (old pid=$original_ws); persistent catalogs, trust state and mounted assets remain live."
+
+    # A client cannot reuse a dead CGS connection. Retire the exact established
+    # WS-dependent set before changing the server generation, then republish
+    # the service endpoints which WindowServer contacts synchronously during
+    # startup. Runtime-confirmed by the first session-only test: starting WS
+    # first and letting the ten-second watchdog poll unload/reload lsd later
+    # left the new server without a final composite for 149 seconds. The cold
+    # production order publishes lsd/SharedFileList/input first; preserve that
+    # causal order here while reusing the existing databases and trust state.
+    stop_ws_dependents preserve-catalog-services
+    rm -f "$EXPERIMENTAL_CAPTURE" "$EXPERIMENTAL_CAPTURE_DONE"
+    publish_settings_service_contracts || {
+        rm -f "$composite_marker"
+        log "ERROR: settings service contracts were not ready for the replacement WindowServer."
+        return 1
+    }
+    ensure_desktop_job "$LSD_SYSTEM_PLIST" "$LSD_SYSTEM_LABEL" \
+        "macOS LaunchServices system store" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$LSD_PLIST" "$LSD_LABEL" \
+        "macOS LaunchServices session service" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    verify_launchservices_database_for_desktop_repair || {
+        rm -f "$composite_marker"; return 1;
+    }
+    start_sharedfilelistd || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$ICONSERVICESD_PLIST" "$ICONSERVICESD_LABEL" \
+        "macOS IconServices store" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$ICONSERVICESAGENT_PLIST" \
+        "$ICONSERVICESAGENT_LABEL" "macOS IconServices agent" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$CSNAMEDDATAD_PLIST" "$CSNAMEDDATAD_LABEL" \
+        "Dock CarbonCore named-data service" || {
+        rm -f "$composite_marker"; return 1;
+    }
+    ensure_desktop_job "$INPUT_PLIST" "$INPUT_LABEL" \
+        "macOS input bridge" || {
+        rm -f "$composite_marker"; return 1;
+    }
+
+    # From this point the explicit transaction owns the generation change, so
+    # pause the watchdog to prevent a second recovery owner from racing these
+    # already ordered jobs. A new mandatory watchdog is armed only after the
+    # replacement desktop passes its service setup below.
+    stop_watchdogs
+    kill -KILL "$original_ws" 2>/dev/null || {
+        rm -f "$composite_marker"
+        log "ERROR: could not retire unhealthy WindowServer pid=$original_ws."
+        start_watchdog >/dev/null 2>&1 || true
+        return 1
+    }
+    launchctl start "$WINDOWSERVER_LABEL" 2>/dev/null || true
+
+    waited=0
+    stable=0
+    while [ "$waited" -lt 30 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        current_ws=$(ws_pid)
+        case "$current_ws" in
+            ''|'-'|*[!0-9]*|"$original_ws") stable=0; continue ;;
+        esac
+        rebuilt_ws="$current_ws"
+        stable=$((stable + 1))
+        [ "$stable" -ge 2 ] && break
+    done
+    if [ "$stable" -lt 2 ]; then
+        rm -f "$composite_marker"
+        log "ERROR: replacement WindowServer did not publish a stable PID within 30 seconds."
+        start_watchdog >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! start_ws_dependents_after_replacement "$original_ws" "$rebuilt_ws"; then
+        rm -f "$composite_marker"
+        log "ERROR: replacement WindowServer clients did not reconnect."
+        start_watchdog >/dev/null 2>&1 || true
+        return 1
+    fi
+    rebuilt_ws="$RECOVERED_WS_PID"
+    if ! start_watchdog; then
+        rm -f "$composite_marker"
+        log "ERROR: mandatory lifecycle watchdog could not be rearmed after desktop-session rebuild."
+        return 1
+    fi
+
+    # Require the complete user-visible postcondition rather than a process log
+    # message: a replacement WS, current Dock input endpoint, all desktop jobs,
+    # and two consecutive fresh authoritative final-composite observations.
+    # This is the same pixel invariant used by the in-place repair and cannot
+    # succeed on the layer-only fallback that lacks native backdrop materials.
+    waited=0
+    stable=0
+    while [ "$waited" -lt 90 ]; do
+        sleep 1
+        waited=$((waited + 1))
+        current_ws=$(ws_pid)
+        case "$current_ws" in
+            ''|'-'|*[!0-9]*|"$original_ws") stable=0; continue ;;
+        esac
+        if [ -n "$rebuilt_ws" ] && [ "$current_ws" != "$rebuilt_ws" ]; then
+            log "Desktop-session replacement changed during recovery ($rebuilt_ws -> $current_ws); validating the newest generation."
+            stable=0
+        fi
+        rebuilt_ws="$current_ws"
+
+        dock_pid=$(launchd_job_pid "$DOCK_LABEL")
+        case "$dock_pid" in
+            ''|'-'|*[!0-9]*) stable=0; continue ;;
+        esac
+        endpoint="$ROOTFS/private/tmp/macws_app_input.$dock_pid.sock"
+        if ! kill -0 "$rebuilt_ws" 2>/dev/null ||
+           ! kill -0 "$dock_pid" 2>/dev/null ||
+           [ ! -S "$ROOTFS/private/tmp/macws_host_input.sock" ] ||
+           [ ! -S "$endpoint" ] ||
+           ! proc_running "$P_INPUTD" || ! proc_running "$P_DISPLAYD"; then
+            stable=0
+            continue
+        fi
+        state=$(awk -F= '$1 == "state" { print $2; exit }' \
+            "$FINAL_COMPOSITE_STATE" 2>/dev/null)
+        producer=$(awk -F= '$1 == "producer" { print $2; exit }' \
+            "$FINAL_COMPOSITE_STATE" 2>/dev/null)
+        if [ -f "$FINAL_COMPOSITE_STATE" ] &&
+           [ "$FINAL_COMPOSITE_STATE" -nt "$composite_marker" ] &&
+           [ "$state" = ready ] && [ "$producer" = "$rebuilt_ws" ] &&
+           desktop_job_loaded "$ICONSERVICESD_LABEL" &&
+           desktop_job_loaded "$ICONSERVICESAGENT_LABEL" &&
+           desktop_job_loaded "$CSNAMEDDATAD_LABEL" &&
+           desktop_job_loaded "$DOCK_LABEL" &&
+           desktop_job_loaded "$SYSTEMUI_LABEL" &&
+           desktop_job_loaded "$CONTROL_CENTER_LABEL"; then
+            stable=$((stable + 1))
+            if [ "$stable" -ge 2 ]; then
+                rm -f "$composite_marker"
+                log "Desktop-session rebuild complete: WindowServer $original_ws -> $rebuilt_ws, Dock pid=$dock_pid, presentation=final-composite, seconds=$((SECONDS - rebuild_started))."
+                return 0
+            fi
+        else
+            stable=0
+        fi
+    done
+
+    rm -f "$composite_marker"
+    log "ERROR: minimal desktop-session rebuild did not reach its pixel/input postcondition within 90 seconds (WindowServer ${original_ws}->${rebuilt_ws:-missing}, final-state=${state:-missing}, final-producer=${producer:-missing}, Dock=${dock_pid:-missing})."
+    return 1
+}
+
 toggle_native_launchpad() {
     [ -x "$ROOTFS$WORKSPACECTL_BIN" ] || {
         log "ERROR: native workspace controller is missing at $WORKSPACECTL_BIN"
@@ -3061,7 +3923,7 @@ toggle_native_launchpad() {
 }
 
 start_macos() {
-    local ws_log_start_line=1 waited=0
+    local ws_log_start_line=1 waited=0 macos_started=$SECONDS macos_stage_started=$SECONDS
     if [ -f "$LOGDIR/WindowServer.err" ]; then
         ws_log_start_line=$(( $(wc -l < "$LOGDIR/WindowServer.err") + 1 ))
     fi
@@ -3113,6 +3975,8 @@ start_macos() {
         return 1
     }
     verify_preferences_persistence || return 1
+    log "TIMING start-macos stage=status-preferences seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     # Office's serializer and applications do not write the volume-license
     # plist in-process. They synchronously call the stock privileged helper's
@@ -3225,8 +4089,12 @@ start_macos() {
         return 1
     }
     log "CarbonCore named-data endpoint ready."
+    log "TIMING start-macos stage=catalog-services seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     seed_launchservices_database || return 1
+    log "TIMING start-macos stage=launchservices-catalog seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     # System Settings' first visible pane is a stock ExtensionKit scene.  Its
     # host synchronously resolves ViewBridgeAuxiliary and HIServices before
@@ -3263,6 +4131,8 @@ start_macos() {
     log "Legacy macOS LaunchServices endpoint ready."
 
     start_sharedfilelistd || return 1
+    log "TIMING start-macos stage=settings-legacy-sharedfile seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     log "Loading input bridge and WindowServer..."
     launchctl load "$INPUT_PLIST" || return 1
@@ -3270,6 +4140,8 @@ start_macos() {
     launchctl load "$WINDOWSERVER_PLIST" || return 1
     log "Waiting for WindowServer graphics initialization before GUI clients..."
     wait_for_initial_ws_ready "$ws_log_start_line" || return 1
+    log "TIMING start-macos stage=windowserver seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     # Maps uses Ventura CoreLocationAgent and the four Ventura desktop
     # locationd protocols.  iPadOS publishes colliding but wire-incompatible
@@ -3344,6 +4216,8 @@ start_macos() {
         log "ERROR: macOS pbs process did not start."
         return 1
     }
+    log "TIMING start-macos stage=bridges-pasteboard-services seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     # DockHelper is an Application-type XPC service and must remain on-demand.
     # libmachook registers this proxy bundle in Dock; xpcproxy gives the stock
@@ -3398,6 +4272,9 @@ start_macos() {
     ensure_navigation_spaces || return 1
     refresh_dock_after_navigation_spaces || return 1
     apply_workspace_wallpaper || return 1
+    wait_for_desktop_input_route || return 1
+    log "TIMING start-macos stage=aqua-spaces-wallpaper seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
+    macos_stage_started=$SECONDS
 
     if [ "$WANT_VNC" = 1 ]; then
         log "Starting VNC server (launchd job '$VNC_LABEL', persistent)..."
@@ -3423,6 +4300,7 @@ start_macos() {
         sleep 5
         started_ws_unchanged "Terminal startup" || return 1
     fi
+    log "TIMING start-macos stage=optional-clients seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
 }
 
 stop_all() {
@@ -3439,7 +4317,8 @@ stop_all() {
         "$EXPERIMENTAL_FAST_SUBMIT_RING" \
         "$EXPERIMENTAL_QUEUE_QOS" "$EXPERIMENTAL_RUNTIME_DIAGNOSTICS" \
         "$EXPERIMENTAL_CAPTURE" \
-        "$EXPERIMENTAL_CAPTURE_DONE" "$EXPERIMENTAL_PACE"
+        "$EXPERIMENTAL_CAPTURE_DONE" "$EXPERIMENTAL_PACE" \
+        "$RENDER_ACTIVITY"
     log "Restoring iOS (SpringBoard / backboardd)..."
     launchctl load "$BACKBOARDD"  2>/dev/null
     launchctl load "$SPRINGBOARD" 2>/dev/null
@@ -3517,6 +4396,8 @@ Usage (run as root):
   sudo bash $0 start [coexist|exclusive] [--no-experimental] [--diagnostics] [--pace-us=N] [--runtime-cap=SECONDS] [--no-terminal] [--no-vnc]
   sudo bash $0 switches
   sudo bash $0 guard [coexist|exclusive] [...]  # re-arm only; no GUI restart
+  sudo bash $0 repair-desktop  # preserve apps; rebuild icons, Dock, wallpaper and menus
+  sudo bash $0 rebuild-desktop-session  # bounded WS-only fallback; preserves catalogs/trust
   sudo bash $0 launchpad
   sudo bash $0 stop
   sudo bash $0 restart [coexist|exclusive] [...]
@@ -3531,9 +4412,9 @@ Safety: start launches a mandatory launchd-backed iOS-native health watchdog
 before the GUI. If the guard is killed abnormally, launchd restarts it and its
 persisted WindowServer generation reconnects stale GUI bridges.
 It records a startup snapshot, samples temperature every five minutes, and
-stops for thermal reasons only when iPadOS explicitly reports critical.
-Nominal/fair/serious states, numeric temperatures, and unreadable samples are
-logged without intervention. The former free-memory percentage guard is
+never stops Stray or the GUI for thermal reasons. Thermal state, numeric
+temperatures, and unreadable samples are logged without intervention. The
+former free-memory percentage guard is
 disabled; iOS/XNU memorystatus owns cache reclamation and memory pressure.
 Crash-loop and explicit runtime-cap guards remain separate. The watchdog
 cannot be disabled. Logs to
@@ -3625,12 +4506,12 @@ if [ -n "$COEXIST_PACE_US" ]; then
     fi
     case "$COEXIST_PACE_US" in
         *[!0-9]*|'')
-            echo "macos_gui.sh: --pace-us must be an integer from 8333 to 100000" >&2
+            echo "macos_gui.sh: --pace-us must be an integer from 8333 to 500000" >&2
             exit 1
             ;;
     esac
-    if [ "$COEXIST_PACE_US" -lt 8333 ] || [ "$COEXIST_PACE_US" -gt 100000 ]; then
-        echo "macos_gui.sh: --pace-us must be from 8333 to 100000" >&2
+    if [ "$COEXIST_PACE_US" -lt 8333 ] || [ "$COEXIST_PACE_US" -gt 500000 ]; then
+        echo "macos_gui.sh: --pace-us must be from 8333 to 500000" >&2
         exit 1
     fi
 fi
@@ -3816,10 +4697,11 @@ start_watchdog() {
     fi
     while [ "$waited" -lt 10 ]; do
         child=$(launchd_job_pid "$WATCHDOG_LABEL")
-        ready_owner=$(awk 'NR == 1 { print $1 }' "$WD_READY" 2>/dev/null)
+        IFS=' ' read -r ready_owner _ 2>/dev/null < "$WD_READY" || \
+            ready_owner=""
         if [ -n "$child" ] && [ "$child" != "-" ] &&
            [ "$ready_owner" = "$child" ]; then
-            log "watchdog: launchd-backed health guard ready (pid=$child; temperature=${WD_THERMAL_POLL}s critical-only; memory guard=disabled; log=$WD_LOG)."
+            log "watchdog: launchd-backed health guard ready (pid=$child; temperature=${WD_THERMAL_POLL}s observe-only; memory guard=disabled; log=$WD_LOG)."
             return 0
         fi
         if [ -f "$WD_TRIP" ]; then
@@ -3838,12 +4720,20 @@ case "$CMD" in
     start)
         require_root "$@"
         acquire_gui_transaction start || exit $?
+        start_started=$SECONDS
+        start_stage_started=$SECONDS
         write_gui_start_state windowing "verifying the current SpringBoard request bridge"
         ensure_windowing_bridge || exit 1
+        log "TIMING gui-start stage=windowing seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
         write_gui_start_state preparing "generating launchd contracts"
         write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
+        log "TIMING gui-start stage=contracts seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
         write_gui_start_state cleaning "retiring the previous service generation"
         cleanup_macos
+        log "TIMING gui-start stage=cleanup seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
         write_gui_start_state assets "preparing the production application profile"
         prepare_vscode_production_assets || { stop_all; exit 1; }
         enable_experimental_if_requested
@@ -3852,15 +4742,24 @@ case "$CMD" in
             production_preflight || { stop_all; exit 1; }
         fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
-        write_gui_start_state safety "arming the critical-only thermal watchdog"
+        log "TIMING gui-start stage=assets-preflight-mode seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
+        write_gui_start_state safety "arming the observe-only health watchdog"
         start_watchdog || { stop_all; exit 1; }
+        log "TIMING gui-start stage=watchdog seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
         write_gui_start_state trust "restoring executable trust for this boot"
         ensure_chroot_works || { stop_all; exit 1; }
+        log "TIMING gui-start stage=trust seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
         write_gui_start_state services "starting catalogs, WindowServer, bridges, and applications"
         start_macos || { stop_all; exit 1; }
+        log "TIMING gui-start stage=services seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
+        start_stage_started=$SECONDS
         write_gui_start_state first-frame "waiting for the optional initial VNC capture"
         arm_initial_vnc_capture_if_requested
         wait_for_initial_vnc_capture_if_requested
+        log "TIMING gui-start stage=first-frame seconds=$((SECONDS - start_stage_started)) total=$((SECONDS - start_started))"
         write_gui_start_state ready "WindowServer and requested clients are ready"
         echo
         log "Started in $MODE mode."
@@ -3890,7 +4789,7 @@ case "$CMD" in
             production_preflight || { stop_all; exit 1; }
         fi
         if [ "$MODE" = exclusive ]; then mode_exclusive; else mode_coexist; fi
-        write_gui_start_state safety "arming the critical-only thermal watchdog"
+        write_gui_start_state safety "arming the observe-only health watchdog"
         start_watchdog || { stop_all; exit 1; }
         write_gui_start_state trust "restoring executable trust for this boot"
         ensure_chroot_works || { stop_all; exit 1; }
@@ -3903,6 +4802,35 @@ case "$CMD" in
         echo
         log "Restarted in $MODE mode."
         status
+        ;;
+    repair-desktop)
+        require_root "$@"
+        acquire_gui_transaction repair-desktop || exit $?
+        write_gui_start_state desktop-repair \
+            "preserving applications while rebuilding desktop services"
+        repair_desktop
+        repair_rc=$?
+        if [ "$repair_rc" -ne 0 ]; then
+            write_gui_start_state desktop-repair-failed \
+                "desktop services did not satisfy their readiness witnesses"
+            exit "$repair_rc"
+        fi
+        write_gui_start_state ready \
+            "desktop services repaired without restarting WindowServer or applications"
+        ;;
+    rebuild-desktop-session)
+        require_root "$@"
+        acquire_gui_transaction rebuild-desktop-session || exit $?
+        write_gui_start_state desktop-session-rebuild \
+            "replacing only WindowServer and its connection-bound clients"
+        rebuild_desktop_session || {
+            rebuild_rc=$?
+            write_gui_start_state desktop-session-rebuild-failed \
+                "minimal WindowServer generation rebuild failed its postconditions"
+            exit "$rebuild_rc"
+        }
+        write_gui_start_state ready \
+            "replacement WindowServer, desktop input and final composite are ready"
         ;;
     status)
         status

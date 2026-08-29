@@ -194,12 +194,12 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
         latency_offset = int(remote.run(
             f"wc -c < {latency_path} 2>/dev/null || printf 0",
             check=False).strip() or 0)
-        remote.run("uiopen macwshost://performance-reset")
+        remote.run("uiopen --url macwshost://performance-reset")
         time.sleep(0.25)
         offset = int(remote.run(
             f"wc -c < {log_path} 2>/dev/null || printf 0").strip() or 0)
         started = time.monotonic()
-        remote.run(f"uiopen macwshost://performance-gesture-{name}")
+        remote.run(f"uiopen --url macwshost://performance-gesture-{name}")
         deadline = time.monotonic() + 6.0
         log_delta = ""
         success = False
@@ -250,7 +250,7 @@ def execute_gesture_suite(remote, dock_pid, target_pid, requested=None):
                 time.sleep(0.1)
         else:
             time.sleep(0.45)
-        remote.run("uiopen macwshost://performance-snapshot")
+        remote.run("uiopen --url macwshost://performance-snapshot")
         marker, profile = wait_for_profile(remote, previous_marker)
         app_input_latency = summarize_real_app_input_latency(
             latency_records)
@@ -340,6 +340,10 @@ def score_profile(profile, *, target_pid, system_gesture=False,
     transport = profile.get("presentation_transport", {})
     final_composite_active = bool(
         transport.get("final_composite_active", False))
+    direct_target = profile.get("direct_drawable", {}).get("target")
+    if not isinstance(direct_target, dict) or \
+            direct_target.get("owner_pid") != target_pid:
+        direct_target = None
     # Mission Control/Spaces is one native compositor animation assembled
     # from several Dock, WindowServer and application layers.  No individual
     # source represents what the user saw; score the final drawable cadence.
@@ -347,8 +351,23 @@ def score_profile(profile, *, target_pid, system_gesture=False,
     # authority. Per-window streams remain diagnostic metadata but are no
     # longer pixels painted by the Host, so scoring them would measure the
     # retired reconstruction path rather than what the user saw.
-    motion_metric = (visible if system_gesture or final_composite_active
-                     else motion_source)
+    if system_gesture or final_composite_active:
+        motion_metric = visible
+    elif direct_target:
+        # A direct Catalyst/Metal game frame bypasses the ordinary
+        # DisplayStream source cadence.  Score only unique producer sequences
+        # that reached MacWSHost's real drawable presentation callback; the
+        # Host can otherwise redraw one retained IOSurface many times.
+        motion_metric = {
+            "active_average_fps": direct_target.get(
+                "host_visible_average_fps", 0),
+            "one_percent_low_fps": direct_target.get(
+                "host_visible_one_percent_low_fps", 0),
+            "frame_interval": direct_target.get(
+                "host_visible_frame_interval", {}),
+        }
+    else:
+        motion_metric = motion_source
     frame = motion_metric.get("frame_interval", {})
     input_visible = profile.get("pipeline", {}).get(
         "input_dispatch_to_visible_callback", {})
@@ -415,11 +434,14 @@ def score_profile(profile, *, target_pid, system_gesture=False,
         "result": "PASS" if all(checks.values()) else "FAIL",
         "checks": checks,
         "target_source": motion_source,
+        "target_direct_drawable": direct_target,
         "presentation_transport": transport,
-        "scored_cadence": ("visible_final_composite"
-                            if final_composite_active
-                            else ("visible_system_gesture"
-                                  if system_gesture else "target_source")),
+        "scored_cadence": (
+            "visible_final_composite" if final_composite_active else
+            "visible_system_gesture" if system_gesture else
+            "target_direct_drawable" if direct_target else
+            "target_source"
+        ),
         "visible_presentation": visible,
     }
 
@@ -477,9 +499,9 @@ def main():
 
     # Hide both HUDs during the measured workload. The fixed rings remain
     # active, and the explicit snapshot below exports them after the run.
-    remote.run("uiopen macwshost://performance-hud-off")
-    remote.run("uiopen macwshost://system-performance-hud-off")
-    remote.run("uiopen macwshost://performance-reset")
+    remote.run("uiopen --url macwshost://performance-hud-off")
+    remote.run("uiopen --url macwshost://system-performance-hud-off")
+    remote.run("uiopen --url macwshost://performance-reset")
     time.sleep(0.5)
     focus_witness = remote.run(
         "tail -n 500 /var/mobile/Library/Logs/MacWSHost.log | "

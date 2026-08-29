@@ -21,6 +21,7 @@
 #include <spawn.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/un.h>
 #include <sys/time.h>
 #include "interpose.h"
@@ -90,11 +91,23 @@ static void request_sign(const char *path) {
     close(fd);
 }
 
-// Resolve a bare command name via $PATH to an absolute path (malloc'd), or NULL.
-// Absolute / relative-with-slash names are returned as a copy unchanged.
+// Resolve a command name, including cwd-relative spellings, to an absolute
+// path (malloc'd), or NULL.
 static char *resolve(const char *file) {
     if (!file || !*file) return NULL;
-    if (strchr(file, '/')) return strdup(file);
+    if (file[0] == '/') return strdup(file);
+
+    // A path containing a slash is relative to the caller's cwd, not PATH.
+    // Steam's verified-client launcher uses `exec ./steam_osx`; returning that
+    // spelling unchanged made request_sign() reject it because its protocol
+    // deliberately accepts only chroot-absolute paths.  Resolve the existing
+    // executable before contacting autosignd so an updater-replaced image is
+    // admitted before the kernel evaluates its new CodeDirectory.
+    if (strchr(file, '/')) {
+        char absolute[MACWS_PROC_PIDPATH_MAX];
+        if (realpath(file, absolute)) return strdup(absolute);
+        return NULL;
+    }
 
     const char *path = getenv("PATH");
     if (!path) path = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -105,7 +118,11 @@ static char *resolve(const char *file) {
         char cand[1024];
         if (snprintf(cand, sizeof(cand), "%s/%s", dir, file) >= (int)sizeof(cand)) continue;
         struct stat st;
-        if (stat(cand, &st) == 0 && (st.st_mode & S_IXUSR)) { out = strdup(cand); break; }
+        if (stat(cand, &st) == 0 && (st.st_mode & S_IXUSR)) {
+            char absolute[MACWS_PROC_PIDPATH_MAX];
+            out = realpath(cand, absolute) ? strdup(absolute) : strdup(cand);
+            break;
+        }
     }
     free(dup);
     return out;
@@ -149,6 +166,46 @@ typedef struct {
     char **items;
     char *insert_entry;
 } selected_env_t;
+
+static bool is_macws_insert_library(const char *path) {
+    return path &&
+        (strcmp(path, "/usr/local/lib/libmachook.dylib") == 0 ||
+         strcmp(path, "/usr/local/lib/libmachook_arm64.dylib") == 0);
+}
+
+static char *env_build_selected_insert(char *const source[],
+                                       const char *selected_insert) {
+    static const char prefix[] = "DYLD_INSERT_LIBRARIES=";
+    const char *existing = NULL;
+    for (size_t i = 0; source && source[i]; i++) {
+        if (strncmp(source[i], prefix, sizeof(prefix) - 1) == 0)
+            existing = source[i] + sizeof(prefix) - 1;
+    }
+
+    size_t capacity = sizeof(prefix) + strlen(selected_insert) +
+        (existing ? strlen(existing) + 1 : 0);
+    char *entry = calloc(capacity, 1);
+    if (!entry) return NULL;
+    snprintf(entry, capacity, "%s%s", prefix, selected_insert);
+
+    // The architecture selector owns only libmachook's slice. Preserve every
+    // additional dylib explicitly requested by the parent while removing both
+    // possible libmachook spellings first. Runtime-confirmed with Stray PID
+    // 87905: the prior blanket replacement discarded Steam's trusted thin
+    // steamloader/gameoverlayrenderer entries, so no overlay process was even
+    // requested. Keeping the other entries restores the caller's launch
+    // contract without enabling an overlay for processes that did not ask.
+    char *copy = existing ? strdup(existing) : NULL;
+    char *cursor = NULL;
+    for (char *item = copy ? strtok_r(copy, ":", &cursor) : NULL;
+         item; item = strtok_r(NULL, ":", &cursor)) {
+        if (!*item || is_macws_insert_library(item)) continue;
+        strlcat(entry, ":", capacity);
+        strlcat(entry, item, capacity);
+    }
+    free(copy);
+    return entry;
+}
 
 static bool terminal_direct_bash_child(
     const char *path, char *const envp[]) {
@@ -205,8 +262,8 @@ static selected_env_t env_select_insert(char *const envp[], const char *path) {
     // insert dylib + four Terminal shell entries + trailing NULL.
     selected.items = calloc(count + (terminal_bash ? 6 : 2), sizeof(char *));
     const char *insert = insert_for_target(path, NULL);
-    if (!selected.items || asprintf(&selected.insert_entry,
-            "DYLD_INSERT_LIBRARIES=%s", insert) < 0) {
+    selected.insert_entry = env_build_selected_insert(source, insert);
+    if (!selected.items || !selected.insert_entry) {
         free(selected.items);
         free(selected.insert_entry);
         selected.items = NULL;
@@ -263,7 +320,16 @@ static saved_insert_t process_env_select_insert(const char *path) {
         saved.old_value = strdup(old);
         saved.had_old_value = 1;
     }
-    setenv("DYLD_INSERT_LIBRARIES", insert_for_target(path, NULL), 1);
+    extern char **environ;
+    char *entry = env_build_selected_insert(
+        environ, insert_for_target(path, NULL));
+    static const char prefix[] = "DYLD_INSERT_LIBRARIES=";
+    if (entry) {
+        setenv("DYLD_INSERT_LIBRARIES", entry + sizeof(prefix) - 1, 1);
+        free(entry);
+    } else {
+        setenv("DYLD_INSERT_LIBRARIES", insert_for_target(path, NULL), 1);
+    }
     return saved;
 }
 
@@ -302,6 +368,76 @@ static bool path_has_suffix(const char *path, const char *suffix) {
     size_t suffix_len = strlen(suffix);
     return path_len >= suffix_len &&
         strcmp(path + path_len - suffix_len, suffix) == 0;
+}
+
+// Steam's overlay helper is intentionally short-lived when its launch
+// contract is incomplete, and the client only reports it later as an
+// "unknown" reaped PID.  Keep this diagnostic behind a filesystem sentinel
+// so ordinary production exec/wait traffic pays only one access() for the
+// exact helper path.  The output records evidence; it does not alter argv,
+// environment, process status, or Steam's retry policy.
+static bool steam_overlay_spawn_diagnostics_enabled(const char *path) {
+    return path_has_suffix(path, "/gameoverlayui") &&
+        access("/tmp/macws_steam_overlay_spawn_diag", F_OK) == 0;
+}
+
+static void steam_overlay_dump_spawn(
+    const char *api, const char *path, char *const argv[],
+    char *const envp[]) {
+    fprintf(stderr, "#### STEAM-OVERLAY-SPAWN api=%s path=%s argv=",
+        api ? api : "(null)", path ? path : "(null)");
+    for (size_t i = 0; argv && argv[i] && i < 32; i++)
+        fprintf(stderr, "%s[%zu]=<%.512s>", i ? " " : "", i, argv[i]);
+    fputc('\n', stderr);
+
+    static const char *const prefixes[] = {
+        "DYLD_INSERT_LIBRARIES=", "SteamAppId=", "SteamGameId=",
+        "SteamOverlayGameId=", "STEAM_GAME_PIDS=", "HOME=", "USER=",
+        "LOGNAME=", "TMPDIR=", "PATH=", NULL
+    };
+    fprintf(stderr, "#### STEAM-OVERLAY-SPAWN env=");
+    for (size_t i = 0; envp && envp[i]; i++) {
+        for (size_t j = 0; prefixes[j]; j++) {
+            size_t length = strlen(prefixes[j]);
+            if (strncmp(envp[i], prefixes[j], length) == 0) {
+                fprintf(stderr, "<%.1024s> ", envp[i]);
+                break;
+            }
+        }
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
+static pthread_mutex_t g_steam_overlay_pid_lock = PTHREAD_MUTEX_INITIALIZER;
+static pid_t g_steam_overlay_pids[16];
+
+static void steam_overlay_remember_pid(pid_t pid) {
+    if (pid <= 0) return;
+    pthread_mutex_lock(&g_steam_overlay_pid_lock);
+    for (size_t i = 0; i < sizeof(g_steam_overlay_pids) /
+                            sizeof(g_steam_overlay_pids[0]); i++) {
+        if (g_steam_overlay_pids[i] == 0) {
+            g_steam_overlay_pids[i] = pid;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_steam_overlay_pid_lock);
+}
+
+static bool steam_overlay_forget_pid(pid_t pid) {
+    bool found = false;
+    pthread_mutex_lock(&g_steam_overlay_pid_lock);
+    for (size_t i = 0; i < sizeof(g_steam_overlay_pids) /
+                            sizeof(g_steam_overlay_pids[0]); i++) {
+        if (g_steam_overlay_pids[i] == pid) {
+            g_steam_overlay_pids[i] = 0;
+            found = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_steam_overlay_pid_lock);
+    return found;
 }
 
 static bool vscode_shell_env_printer_request(
@@ -417,6 +553,7 @@ static int my_posix_spawn(pid_t *pid, const char *path,
                           char *const argv[], char *const envp[]) {
     ensure_signed(path);
     selected_env_t selected = env_select_insert(envp, path);
+    bool overlay_diag = steam_overlay_spawn_diagnostics_enabled(path);
     char *terminal_argv[] = {
         argv && argv[0] ? argv[0] : (char *)"/bin/bash",
         (char *)"-c",
@@ -431,8 +568,19 @@ static int my_posix_spawn(pid_t *pid, const char *path,
     char *const *selected_argv = argv;
     if (terminal_direct_bash_child(path, envp) && argv && !argv[1])
         selected_argv = terminal_argv;
+    if (overlay_diag)
+        steam_overlay_dump_spawn("posix_spawn", path, selected_argv,
+            selected.items ? selected.items : envp);
     int result = posix_spawn(pid, path, fa, attr, selected_argv,
         selected.items ? selected.items : envp);
+    if (overlay_diag) {
+        pid_t child = result == 0 && pid ? *pid : -1;
+        fprintf(stderr,
+            "#### STEAM-OVERLAY-SPAWN result=%d child=%d\n",
+            result, child);
+        fflush(stderr);
+        if (result == 0) steam_overlay_remember_pid(child);
+    }
     env_selected_free(&selected);
     return result;
 }
@@ -444,10 +592,44 @@ static int my_posix_spawnp(pid_t *pid, const char *file,
     ensure_signed(file);
     char *resolved = resolve(file);
     selected_env_t selected = env_select_insert(envp, resolved ? resolved : file);
+    bool overlay_diag = steam_overlay_spawn_diagnostics_enabled(
+        resolved ? resolved : file);
+    if (overlay_diag)
+        steam_overlay_dump_spawn("posix_spawnp", resolved ? resolved : file,
+            argv, selected.items ? selected.items : envp);
     int result = posix_spawnp(pid, file, fa, attr, argv,
         selected.items ? selected.items : envp);
+    if (overlay_diag) {
+        pid_t child = result == 0 && pid ? *pid : -1;
+        fprintf(stderr,
+            "#### STEAM-OVERLAY-SPAWN result=%d child=%d\n",
+            result, child);
+        fflush(stderr);
+        if (result == 0) steam_overlay_remember_pid(child);
+    }
     env_selected_free(&selected);
     free(resolved);
+    return result;
+}
+
+static pid_t my_waitpid(pid_t pid, int *status, int options) {
+    pid_t result = waitpid(pid, status, options);
+    if (result > 0 && steam_overlay_forget_pid(result)) {
+        if (status && WIFEXITED(*status)) {
+            fprintf(stderr,
+                "#### STEAM-OVERLAY-EXIT child=%d exited=%d\n",
+                result, WEXITSTATUS(*status));
+        } else if (status && WIFSIGNALED(*status)) {
+            fprintf(stderr,
+                "#### STEAM-OVERLAY-EXIT child=%d signal=%d\n",
+                result, WTERMSIG(*status));
+        } else {
+            fprintf(stderr,
+                "#### STEAM-OVERLAY-EXIT child=%d raw-status=%d\n",
+                result, status ? *status : -1);
+        }
+        fflush(stderr);
+    }
     return result;
 }
 
@@ -457,6 +639,7 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
         vscode_shell_env_print(envp, token);
     ensure_signed(path);
     selected_env_t selected = env_select_insert(envp, path);
+    bool overlay_diag = steam_overlay_spawn_diagnostics_enabled(path);
     char *terminal_argv[] = {
         argv && argv[0] ? argv[0] : (char *)"/bin/bash",
         (char *)"-c",
@@ -468,8 +651,16 @@ static int my_execve(const char *path, char *const argv[], char *const envp[]) {
     // this build; the posix_spawn branch above remains for other profiles.
     if (terminal_direct_bash_child(path, envp) && argv && !argv[1])
         selected_argv = terminal_argv;
+    if (overlay_diag)
+        steam_overlay_dump_spawn("execve", path, selected_argv,
+            selected.items ? selected.items : envp);
     int result = execve(path, selected_argv,
                         selected.items ? selected.items : envp);
+    if (overlay_diag) {
+        fprintf(stderr,
+            "#### STEAM-OVERLAY-SPAWN execve-return=%d\n", result);
+        fflush(stderr);
+    }
     env_selected_free(&selected);
     return result;
 }
@@ -481,7 +672,17 @@ static int my_execv(const char *path, char *const argv[]) {
     ensure_signed(path);
     pthread_mutex_lock(&g_exec_env_lock);
     saved_insert_t saved = process_env_select_insert(path);
+    bool overlay_diag = steam_overlay_spawn_diagnostics_enabled(path);
+    if (overlay_diag) {
+        extern char **environ;
+        steam_overlay_dump_spawn("execv", path, argv, environ);
+    }
     int result = execv(path, argv);
+    if (overlay_diag) {
+        fprintf(stderr, "#### STEAM-OVERLAY-SPAWN execv-return=%d\n",
+            result);
+        fflush(stderr);
+    }
     process_env_restore_insert(&saved);
     pthread_mutex_unlock(&g_exec_env_lock);
     return result;
@@ -496,7 +697,19 @@ static int my_execvp(const char *file, char *const argv[]) {
     ensure_signed(file);
     pthread_mutex_lock(&g_exec_env_lock);
     saved_insert_t saved = process_env_select_insert(resolved ? resolved : file);
+    bool overlay_diag = steam_overlay_spawn_diagnostics_enabled(
+        resolved ? resolved : file);
+    if (overlay_diag) {
+        extern char **environ;
+        steam_overlay_dump_spawn("execvp", resolved ? resolved : file,
+            argv, environ);
+    }
     int result = execvp(file, argv);
+    if (overlay_diag) {
+        fprintf(stderr, "#### STEAM-OVERLAY-SPAWN execvp-return=%d\n",
+            result);
+        fflush(stderr);
+    }
     process_env_restore_insert(&saved);
     pthread_mutex_unlock(&g_exec_env_lock);
     free(resolved);
@@ -505,6 +718,7 @@ static int my_execvp(const char *file, char *const argv[]) {
 
 DYLD_INTERPOSE(my_posix_spawn, posix_spawn);
 DYLD_INTERPOSE(my_posix_spawnp, posix_spawnp);
+DYLD_INTERPOSE(my_waitpid, waitpid);
 DYLD_INTERPOSE(my_execve, execve);
 DYLD_INTERPOSE(my_execv, execv);
 DYLD_INTERPOSE(my_execvp, execvp);

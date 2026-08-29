@@ -3,11 +3,11 @@
 
 #include <stdint.h>
 
-#define MACWS_STEAM_SEM_VERSION 21u
+#define MACWS_STEAM_SEM_VERSION 23u
 #define MACWS_STEAM_SEM_VALUE_MAX 0x7fffffffu
 #define MACWS_STEAM_SEM_NAME_CAPACITY 112u
 #define MACWS_STEAM_SEM_STATE_MAGIC 0x4d575345u /* MWSE */
-#define MACWS_STEAM_SEM_STATE_VERSION 1u
+#define MACWS_STEAM_SEM_STATE_VERSION 2u
 #define MACWS_STEAM_SEM_WAITER_CAPACITY 64u
 #define MACWS_STEAM_SEM_WAIT_MAGIC 0x4d575357u /* MWSW */
 #define MACWS_STEAM_SEM_WAIT_SOCKET_PATH \
@@ -21,6 +21,10 @@ typedef struct MacWSSteamSemaphoreWaitRequest {
     uint64_t generation;
     uint64_t waiter;
     uint64_t requestID;
+    // Duration for WAIT_TIMED. Every other operation must send zero. Protocol
+    // v23 accepts exactly the RE-confirmed overlay polling interval (10 ms).
+    uint32_t timeoutMicroseconds;
+    uint32_t reserved2;
 } MacWSSteamSemaphoreWaitRequest;
 
 typedef struct MacWSSteamSemaphoreWaitReply {
@@ -32,9 +36,11 @@ typedef struct MacWSSteamSemaphoreWaitReply {
     uint64_t requestID;
 } MacWSSteamSemaphoreWaitReply;
 
-// Authoritative high-frequency state. macwshostd creates and unlinks this
-// vnode with the POSIX name lifecycle; Steam processes mutate it only through
-// flock + pread/pwrite. No mapped-memory coherence is assumed.
+// Authoritative high-frequency state. macwshostd retains the creator file
+// descriptor for the full generation and unlinks the name with POSIX
+// semantics. Steam processes mutate the same kernel-backed vnode only through
+// nonblocking flock + pread/pwrite; no cross-runtime mapped-memory coherence
+// or fabricated semaphore token is assumed.
 typedef struct MacWSSteamSemaphoreState {
     uint32_t magic;
     uint32_t version;
@@ -58,6 +64,10 @@ enum {
     // that readiness path is runtime-proven to wake across the chroot/iOS
     // boundary without a deadline poll.
     MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK = 5,
+    // Event-driven equivalent of sem_trywait + userspace deadline polling.
+    // The broker consumes a real token immediately/on post, or returns
+    // EAGAIN once timeoutMicroseconds expires. It never grants synthetically.
+    MACWS_STEAM_SEM_SOCKET_WAIT_TIMED = 6,
 };
 
 #define MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS 0x1u

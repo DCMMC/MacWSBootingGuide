@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <ptrauth.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -218,6 +219,230 @@ static void DumpFunctionSpecializationRequirement(id function) {
             ? [[function functionConstantsDictionary] count] : 0));
 }
 
+static void StoreIdentityMatrix(uint8_t *bytes, NSUInteger offset) {
+    float *matrix = (float *)(bytes + offset);
+    memset(matrix, 0, 16 * sizeof(float));
+    matrix[0] = matrix[5] = matrix[10] = matrix[15] = 1.0f;
+}
+
+static id<MTLTexture> NewProbeTextureBuffer(
+        id<MTLDevice> device, MTLPixelFormat pixelFormat,
+        NSUInteger width, NSUInteger bytesPerPixel,
+        MTLTextureUsage usage, id<MTLBuffer> __strong *backingOut) {
+    NSUInteger length = (width * bytesPerPixel + 255u) & ~255u;
+    id<MTLBuffer> backing = [device newBufferWithLength:length
+        options:MTLResourceStorageModeShared];
+    if (!backing) return nil;
+    MTLTextureDescriptor *descriptor =
+        [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:
+            pixelFormat width:width
+            resourceOptions:MTLResourceStorageModeShared usage:usage];
+    id<MTLTexture> texture = [backing newTextureWithDescriptor:descriptor
+        offset:0 bytesPerRow:width * bytesPerPixel];
+    if (texture && backingOut) *backingOut = backing;
+    return texture;
+}
+
+// Execute the exact captured Stray capsule-shadow compute function once with
+// a bounded 8x8 resource set.  This is a semantic witness for the generic
+// half-float pipeline selector, not a game/performance benchmark.  The View
+// and Globals layouts/locations below come from this function's actual AIR
+// metadata; a different function is rejected by the caller before entry.
+static BOOL RunStrayShadowHalfFloatWitness(
+        id<MTLDevice> device, id<MTLComputePipelineState> pipeline) {
+    const char *formatText = getenv("MACWS_METAL_PROBE_SHADOW_FORMAT");
+    BOOL halfOutput = !formatText || strcmp(formatText, "rg32float") != 0;
+    id<MTLBuffer> view = [device newBufferWithLength:2128
+        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> globals = [device newBufferWithLength:64
+        options:MTLResourceStorageModeShared];
+    if (!view || !globals) return NO;
+    uint8_t *viewBytes = view.contents;
+    uint8_t *globalBytes = globals.contents;
+    memset(viewBytes, 0, 2128);
+    StoreIdentityMatrix(viewBytes, 256);
+    StoreIdentityMatrix(viewBytes, 448);
+    StoreIdentityMatrix(viewBytes, 576);
+    StoreIdentityMatrix(viewBytes, 768);
+    float *inverseZ = (float *)(viewBytes + 1040);
+    inverseZ[0] = 0.0f;
+    inverseZ[1] = 0.0f;
+    inverseZ[2] = 1.0f;
+    inverseZ[3] = -1.0e-8f;
+    float *screenBias = (float *)(viewBytes + 1056);
+    screenBias[0] = screenBias[1] = 1.0f;
+    float *viewSize = (float *)(viewBytes + 2080);
+    viewSize[0] = viewSize[1] = 8.0f;
+    viewSize[2] = viewSize[3] = 0.125f;
+    float *bufferSize = (float *)(viewBytes + 2112);
+    memcpy(bufferSize, viewSize, 4 * sizeof(float));
+
+    uint32_t *scissor = (uint32_t *)(globalBytes + 16);
+    scissor[0] = scissor[1] = 0;
+    scissor[2] = scissor[3] = 8;
+    float *groups = (float *)(globalBytes + 32);
+    groups[0] = groups[1] = 1.0f;
+    *(uint32_t *)(globalBytes + 48) = 1;
+    *(float *)(globalBytes + 52) = 20000.0f;
+    uint32_t *tileDimensions = (uint32_t *)(globalBytes + 56);
+    tileDimensions[0] = tileDimensions[1] = 8;
+
+    id<MTLBuffer> countsBacking = nil;
+    id<MTLBuffer> shapesBacking = nil;
+    id<MTLBuffer> lightBacking = nil;
+    id<MTLTexture> counts = NewProbeTextureBuffer(
+        device, MTLPixelFormatR32Uint, 64, 4,
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite,
+        &countsBacking);
+    id<MTLTexture> shapes = NewProbeTextureBuffer(
+        device, MTLPixelFormatRGBA32Float, 16, 16,
+        MTLTextureUsageShaderRead, &shapesBacking);
+    id<MTLTexture> light = NewProbeTextureBuffer(
+        device, MTLPixelFormatRGBA32Float, 16, 16,
+        MTLTextureUsageShaderRead, &lightBacking);
+
+    MTLTextureDescriptor *shadowDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            (halfOutput ? MTLPixelFormatRG16Float : MTLPixelFormatRG32Float)
+            width:8 height:8 mipmapped:NO];
+    shadowDescriptor.storageMode = MTLStorageModeShared;
+    shadowDescriptor.usage =
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> shadow = [device newTextureWithDescriptor:shadowDescriptor];
+    MTLTextureDescriptor *depthDescriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            MTLPixelFormatR32Float width:8 height:8 mipmapped:NO];
+    depthDescriptor.storageMode = MTLStorageModeShared;
+    depthDescriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> depth = [device newTextureWithDescriptor:depthDescriptor];
+    float depthBytes[64] = {0};
+    [depth replaceRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0
+               withBytes:depthBytes bytesPerRow:8 * sizeof(float)];
+
+    MTLSamplerDescriptor *samplerDescriptor = [MTLSamplerDescriptor new];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterNearest;
+    samplerDescriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    samplerDescriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    id<MTLSamplerState> sampler =
+        [device newSamplerStateWithDescriptor:samplerDescriptor];
+    if (!counts || !shapes || !light || !shadow || !depth || !sampler)
+        return NO;
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder =
+        [commandBuffer computeCommandEncoder];
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:view offset:0 atIndex:4];
+    [encoder setBuffer:globals offset:0 atIndex:5];
+    [encoder setTexture:counts atIndex:0];
+    [encoder setTexture:shadow atIndex:1];
+    [encoder setTexture:shapes atIndex:2];
+    [encoder setTexture:light atIndex:3];
+    [encoder setTexture:depth atIndex:4];
+    [encoder setSamplerState:sampler atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+
+    if (!halfOutput) {
+        float control[8 * 8 * 2] = {0};
+        [shadow getBytes:control bytesPerRow:8 * 2 * sizeof(float)
+                 fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+        fprintf(stderr,
+            "METAL_SOURCE_PROBE shadowControlDispatch status=%lu "
+            "errorDomain=%s errorCode=%ld description=%s userInfo=%s "
+            "first=%g,%g\n",
+            (unsigned long)commandBuffer.status,
+            commandBuffer.error ? commandBuffer.error.domain.UTF8String
+                                : "(nil)",
+            (long)(commandBuffer.error ? commandBuffer.error.code : 0),
+            commandBuffer.error
+                ? commandBuffer.error.localizedDescription.UTF8String
+                : "(nil)",
+            commandBuffer.error
+                ? commandBuffer.error.userInfo.description.UTF8String
+                : "(nil)",
+            control[0], control[1]);
+        return commandBuffer.status == MTLCommandBufferStatusCompleted &&
+               isfinite(control[0]) && isfinite(control[1]);
+    }
+
+    uint16_t result[8 * 8 * 2] = {0};
+    [shadow getBytes:result bytesPerRow:8 * 2 * sizeof(uint16_t)
+             fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+    NSUInteger finiteMaximum = 0, infinity = 0, other = 0;
+    for (NSUInteger pixel = 0; pixel < 64; pixel++) {
+        uint16_t green = result[pixel * 2 + 1];
+        if (green == UINT16_C(0x7bff)) finiteMaximum++;
+        else if (green == UINT16_C(0x7c00)) infinity++;
+        else other++;
+    }
+    fprintf(stderr,
+        "METAL_SOURCE_PROBE shadowHalfDispatch status=%lu errorDomain=%s "
+        "errorCode=%ld description=%s userInfo=%s "
+        "finiteMax=%lu infinity=%lu other=%lu "
+        "first=0x%04x,0x%04x\n",
+        (unsigned long)commandBuffer.status,
+        commandBuffer.error ? commandBuffer.error.domain.UTF8String : "(nil)",
+        (long)(commandBuffer.error ? commandBuffer.error.code : 0),
+        commandBuffer.error
+            ? commandBuffer.error.localizedDescription.UTF8String : "(nil)",
+        commandBuffer.error
+            ? commandBuffer.error.userInfo.description.UTF8String : "(nil)",
+        (unsigned long)finiteMaximum, (unsigned long)infinity,
+        (unsigned long)other, result[0], result[1]);
+    return commandBuffer.status == MTLCommandBufferStatusCompleted &&
+           infinity == 0 && finiteMaximum == 64;
+}
+
+// Minimal format-semantic witness for the generic half-float selector.  The
+// source function is intentionally ordinary Metal source and its identity,
+// function name and writable slot are discovered by the offline builder.
+// Nothing in libmachook is keyed to this probe.
+static BOOL RunHalfSaturationWitness(
+        id<MTLDevice> device, id<MTLComputePipelineState> pipeline) {
+    MTLTextureDescriptor *descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            MTLPixelFormatRGBA16Float width:1 height:1 mipmapped:NO];
+    descriptor.storageMode = MTLStorageModeShared;
+    descriptor.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    id<MTLTexture> output = [device newTextureWithDescriptor:descriptor];
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder =
+        [commandBuffer computeCommandEncoder];
+    if (!output || !queue || !commandBuffer || !encoder) return NO;
+    [encoder setComputePipelineState:pipeline];
+    [encoder setTexture:output atIndex:0];
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+
+    uint16_t result[4] = {0};
+    [output getBytes:result bytesPerRow:sizeof(result)
+              fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+    fprintf(stderr,
+        "METAL_SOURCE_PROBE halfSaturationDispatch status=%lu "
+        "errorDomain=%s errorCode=%ld description=%s "
+        "rgba=0x%04x,0x%04x,0x%04x,0x%04x\n",
+        (unsigned long)commandBuffer.status,
+        commandBuffer.error ? commandBuffer.error.domain.UTF8String : "(nil)",
+        (long)(commandBuffer.error ? commandBuffer.error.code : 0),
+        commandBuffer.error
+            ? commandBuffer.error.localizedDescription.UTF8String : "(nil)",
+        result[0], result[1], result[2], result[3]);
+    return commandBuffer.status == MTLCommandBufferStatusCompleted &&
+           result[0] == UINT16_C(0x7bff) &&
+           result[1] == UINT16_C(0xfbff) &&
+           result[2] == UINT16_C(0x3c00) && result[3] == 0;
+}
+
 // Minimal chroot-side witness for the MTLCompilerService bridge.  It avoids
 // WindowServer, Electron and Aquarium so one source compile can be tested
 // without a GPU-process restart loop or sustained compositor load.
@@ -244,8 +469,26 @@ int main(void) {
             NSError *libraryError = nil;
             NSURL *libraryURL = [NSURL fileURLWithPath:
                 [NSString stringWithUTF8String:libraryPath]];
-            id<MTLLibrary> library = [device newLibraryWithURL:libraryURL
-                                                        error:&libraryError];
+            id<MTLLibrary> library = nil;
+            if (getenv("MACWS_METAL_PROBE_LIBRARY_DATA")) {
+                NSData *libraryBytes = [NSData dataWithContentsOfURL:libraryURL
+                                                              options:0
+                                                                error:&libraryError];
+                dispatch_data_t libraryData = libraryBytes
+                    ? dispatch_data_create(
+                          libraryBytes.bytes, libraryBytes.length,
+                          dispatch_get_global_queue(
+                              QOS_CLASS_DEFAULT, 0),
+                          ^{ (void)libraryBytes; })
+                    : NULL;
+                if (libraryData) {
+                    library = [device newLibraryWithData:libraryData
+                                                   error:&libraryError];
+                }
+            } else {
+                library = [device newLibraryWithURL:libraryURL
+                                             error:&libraryError];
+            }
             NSArray<NSString *> *functionNames = library.functionNames;
             if (getenv("MACWS_METAL_PROBE_DUMP_LIBRARY_METHODS")) {
                 for (Class cls = object_getClass(library); cls;
@@ -280,6 +523,64 @@ int main(void) {
                     libraryError
                         ? libraryError.localizedDescription.UTF8String : "(nil)");
             if (!library) return 7;
+
+            // Descriptor-based compute replay for one byte-exact external
+            // MTLB.  Stray's UE4 path fails at this public API only after the
+            // library has loaded, so a library-load witness alone is not
+            // sufficient.  Forward the supplied function unchanged and
+            // report the real AGX result/error; never retry or substitute.
+            const char *computeFunctionText =
+                getenv("MACWS_METAL_PROBE_COMPUTE_FUNCTION");
+            if (computeFunctionText && computeFunctionText[0]) {
+                NSString *computeFunctionName =
+                    [NSString stringWithUTF8String:computeFunctionText];
+                id<MTLFunction> computeFunction =
+                    [library newFunctionWithName:computeFunctionName];
+                MTLComputePipelineDescriptor *computeDescriptor =
+                    [MTLComputePipelineDescriptor new];
+                computeDescriptor.label = computeFunctionName;
+                computeDescriptor.computeFunction = computeFunction;
+                MTLAutoreleasedComputePipelineReflection computeReflection =
+                    nil;
+                NSError *computeError = nil;
+                id<MTLComputePipelineState> computePipeline = computeFunction
+                    ? [device
+                        newComputePipelineStateWithDescriptor:computeDescriptor
+                        options:MTLPipelineOptionNone
+                        reflection:&computeReflection
+                        error:&computeError]
+                    : nil;
+                fprintf(stderr,
+                        "METAL_SOURCE_PROBE computeReplay function=%s/%p "
+                        "pipeline=%p class=%s reflection=%p errorDomain=%s "
+                        "errorCode=%ld description=%s userInfo=%s\n",
+                        computeFunctionText, computeFunction,
+                        computePipeline,
+                        computePipeline
+                            ? object_getClassName(computePipeline) : "(nil)",
+                        computeReflection,
+                        computeError ? computeError.domain.UTF8String : "(nil)",
+                        (long)(computeError ? computeError.code : 0),
+                        computeError
+                            ? computeError.localizedDescription.UTF8String
+                            : "(nil)",
+                        computeError
+                            ? computeError.userInfo.description.UTF8String
+                            : "(nil)");
+                if (computePipeline &&
+                    getenv("MACWS_METAL_PROBE_STRAY_SHADOW_DISPATCH") &&
+                    strcmp(computeFunctionText,
+                           "Main_000054ef_c016cab8") == 0) {
+                    return RunStrayShadowHalfFloatWitness(
+                        device, computePipeline) ? 0 : 14;
+                }
+                if (computePipeline &&
+                    getenv("MACWS_METAL_PROBE_HALF_SATURATION_DISPATCH")) {
+                    return RunHalfSaturationWitness(
+                        device, computePipeline) ? 0 : 15;
+                }
+                return computePipeline ? 0 : 13;
+            }
 
             // Generic precompiled-pipeline replay.  Real clients such as
             // Unreal load the vertex and fragment AIR from distinct MTLB
@@ -341,6 +642,8 @@ int main(void) {
 
                 const char *colorText =
                     getenv("MACWS_METAL_PROBE_COLOR0_FORMAT");
+                const char *colorFormatsText =
+                    getenv("MACWS_METAL_PROBE_COLOR_FORMATS");
                 const char *depthText =
                     getenv("MACWS_METAL_PROBE_DEPTH_FORMAT");
                 const char *stencilText =
@@ -369,6 +672,27 @@ int main(void) {
                 replayDescriptor.vertexDescriptor = vertexDescriptor;
                 replayDescriptor.colorAttachments[0].pixelFormat =
                     (MTLPixelFormat)colorFormat;
+                if (colorFormatsText && colorFormatsText[0]) {
+                    char *colorFormats = strdup(colorFormatsText);
+                    char *colorSave = NULL;
+                    for (char *token = strtok_r(
+                             colorFormats, ",", &colorSave);
+                         token;
+                         token = strtok_r(NULL, ",", &colorSave)) {
+                        unsigned long index = 0, format = 0;
+                        if (sscanf(token, "%lu:%lu", &index, &format) != 2 ||
+                            index >= 8) {
+                            fprintf(stderr,
+                                "METAL_SOURCE_PROBE invalidColorFormat=%s\n",
+                                token);
+                            free(colorFormats);
+                            return 13;
+                        }
+                        replayDescriptor.colorAttachments[index].pixelFormat =
+                            (MTLPixelFormat)format;
+                    }
+                    free(colorFormats);
+                }
                 replayDescriptor.depthAttachmentPixelFormat =
                     (MTLPixelFormat)depthFormat;
                 replayDescriptor.stencilAttachmentPixelFormat =
@@ -610,6 +934,158 @@ int main(void) {
                     respondsToNewEvent, legacyEvent,
                     legacyEvent ? object_getClassName(legacyEvent) : "(nil)");
 
+            // Cross-version control for Stray's forward cross-queue event
+            // dependency.  The paired iOS-native probe commits this exact
+            // topology in well under one millisecond.  Exercise it through
+            // the chroot's unmodified macOS Metal/IOGPU producer so we can
+            // distinguish queue-submit translation from game workload.
+            const char *eventQueuesMode =
+                getenv("MACWS_METAL_PROBE_EVENT_QUEUES");
+            if (eventQueuesMode &&
+                strcmp(eventQueuesMode, "cycle") == 0) {
+                id eventA0 = respondsToNewEvent
+                    ? ((id (*)(id, SEL))objc_msgSend)(device,
+                                                      newEventSelector)
+                    : nil;
+                id eventB0 = respondsToNewEvent
+                    ? ((id (*)(id, SEL))objc_msgSend)(device,
+                                                      newEventSelector)
+                    : nil;
+                id eventA1 = respondsToNewEvent
+                    ? ((id (*)(id, SEL))objc_msgSend)(device,
+                                                      newEventSelector)
+                    : nil;
+                id eventB1 = respondsToNewEvent
+                    ? ((id (*)(id, SEL))objc_msgSend)(device,
+                                                      newEventSelector)
+                    : nil;
+                SEL setBarrierSelector = sel_registerName(
+                    "setEnableBarrier:");
+                if (eventB1 &&
+                    [eventB1 respondsToSelector:setBarrierSelector]) {
+                    IMP method = [eventB1
+                        methodForSelector:setBarrierSelector];
+                    ((void (*)(id, SEL, BOOL))method)(
+                        eventB1, setBarrierSelector, NO);
+                }
+                id<MTLCommandQueue> queueA = [device newCommandQueue];
+                id<MTLCommandQueue> queueB = [device newCommandQueue];
+                id<MTLCommandBuffer> bufferA = [queueA commandBuffer];
+                id<MTLCommandBuffer> bufferB = [queueB commandBuffer];
+                BOOL setupOK = eventA0 && eventB0 && eventA1 && eventB1 &&
+                    queueA && queueB && bufferA && bufferB;
+                struct timespec before = {0}, after = {0};
+                if (setupOK) {
+                    [bufferA encodeSignalEvent:(id<MTLEvent>)eventA0
+                                         value:32];
+                    [bufferA encodeWaitForEvent:(id<MTLEvent>)eventB0
+                                           value:64];
+                    [bufferA encodeSignalEvent:(id<MTLEvent>)eventA1
+                                         value:32];
+                    [bufferA encodeWaitForEvent:(id<MTLEvent>)eventB1
+                                           value:32];
+                    [bufferB encodeWaitForEvent:(id<MTLEvent>)eventA0
+                                           value:32];
+                    [bufferB encodeSignalEvent:(id<MTLEvent>)eventB0
+                                         value:64];
+                    [bufferB encodeWaitForEvent:(id<MTLEvent>)eventA1
+                                           value:32];
+                    [bufferB encodeSignalEvent:(id<MTLEvent>)eventB1
+                                         value:32];
+                    clock_gettime(CLOCK_MONOTONIC, &before);
+                    [bufferA commit];
+                    [bufferB commit];
+                    [bufferA waitUntilCompleted];
+                    [bufferB waitUntilCompleted];
+                    clock_gettime(CLOCK_MONOTONIC, &after);
+                }
+                double wallMilliseconds =
+                    (double)(after.tv_sec - before.tv_sec) * 1000.0 +
+                    (double)(after.tv_nsec - before.tv_nsec) / 1000000.0;
+                BOOL cycleOK = setupOK &&
+                    bufferA.status == MTLCommandBufferStatusCompleted &&
+                    bufferB.status == MTLCommandBufferStatusCompleted &&
+                    bufferA.error == nil && bufferB.error == nil;
+                fprintf(stderr,
+                    "METAL_SOURCE_PROBE eventCycle setup=%s result=%s "
+                    "aStatus=%ld bStatus=%ld wallMilliseconds=%.3f "
+                    "aGPU=%.6f..%.6f bGPU=%.6f..%.6f "
+                    "aError=%s bError=%s\n",
+                    setupOK ? "YES" : "NO", cycleOK ? "PASS" : "FAIL",
+                    (long)bufferA.status, (long)bufferB.status,
+                    wallMilliseconds,
+                    bufferA.GPUStartTime, bufferA.GPUEndTime,
+                    bufferB.GPUStartTime, bufferB.GPUEndTime,
+                    bufferA.error.localizedDescription.UTF8String
+                        ?: "(nil)",
+                    bufferB.error.localizedDescription.UTF8String
+                        ?: "(nil)");
+                return cycleOK ? 0 : 8;
+            }
+            if (eventQueuesMode) {
+                id secondLegacyEvent = respondsToNewEvent
+                    ? ((id (*)(id, SEL))objc_msgSend)(device,
+                                                      newEventSelector)
+                    : nil;
+                SEL setBarrierSelector = sel_registerName(
+                    "setEnableBarrier:");
+                if (secondLegacyEvent &&
+                    [secondLegacyEvent respondsToSelector:setBarrierSelector]) {
+                    IMP method = [secondLegacyEvent
+                        methodForSelector:setBarrierSelector];
+                    ((void (*)(id, SEL, BOOL))method)(
+                        secondLegacyEvent, setBarrierSelector, NO);
+                }
+                id<MTLCommandQueue> waitQueue = [device newCommandQueue];
+                id<MTLCommandQueue> signalQueue = [device newCommandQueue];
+                id<MTLCommandBuffer> waitBuffer = [waitQueue commandBuffer];
+                id<MTLCommandBuffer> signalBuffer =
+                    [signalQueue commandBuffer];
+                BOOL setupOK = legacyEvent && secondLegacyEvent &&
+                    waitQueue && signalQueue && waitBuffer && signalBuffer;
+                struct timespec before = {0}, after = {0};
+                if (setupOK) {
+                    [waitBuffer encodeWaitForEvent:(id<MTLEvent>)legacyEvent
+                                             value:64];
+                    [waitBuffer
+                        encodeWaitForEvent:(id<MTLEvent>)secondLegacyEvent
+                                    value:32];
+                    [signalBuffer
+                        encodeSignalEvent:(id<MTLEvent>)legacyEvent value:64];
+                    [signalBuffer
+                        encodeSignalEvent:(id<MTLEvent>)secondLegacyEvent
+                                    value:32];
+                    clock_gettime(CLOCK_MONOTONIC, &before);
+                    [waitBuffer commit];
+                    [signalBuffer commit];
+                    [waitBuffer waitUntilCompleted];
+                    [signalBuffer waitUntilCompleted];
+                    clock_gettime(CLOCK_MONOTONIC, &after);
+                }
+                double wallMilliseconds =
+                    (double)(after.tv_sec - before.tv_sec) * 1000.0 +
+                    (double)(after.tv_nsec - before.tv_nsec) / 1000000.0;
+                BOOL queuesOK = setupOK &&
+                    waitBuffer.status == MTLCommandBufferStatusCompleted &&
+                    signalBuffer.status == MTLCommandBufferStatusCompleted &&
+                    waitBuffer.error == nil && signalBuffer.error == nil;
+                fprintf(stderr,
+                    "METAL_SOURCE_PROBE eventQueues setup=%s result=%s "
+                    "waitStatus=%ld signalStatus=%ld wallMilliseconds=%.3f "
+                    "waitGPU=%.6f..%.6f signalGPU=%.6f..%.6f "
+                    "waitError=%s signalError=%s\n",
+                    setupOK ? "YES" : "NO", queuesOK ? "PASS" : "FAIL",
+                    (long)waitBuffer.status, (long)signalBuffer.status,
+                    wallMilliseconds,
+                    waitBuffer.GPUStartTime, waitBuffer.GPUEndTime,
+                    signalBuffer.GPUStartTime, signalBuffer.GPUEndTime,
+                    waitBuffer.error.localizedDescription.UTF8String
+                        ?: "(nil)",
+                    signalBuffer.error.localizedDescription.UTF8String
+                        ?: "(nil)");
+                return queuesOK ? 0 : 7;
+            }
+
             BOOL sharedEventCommandsOK = NO;
             if (sharedEvent) {
                 id<MTLCommandQueue> queue = [device newCommandQueue];
@@ -737,6 +1213,44 @@ int main(void) {
                 (long)(error ? error.code : 0),
                 error ? error.localizedDescription.UTF8String : "(nil)");
         if (!library) return 3;
+        const char *serializePath =
+            getenv("MACWS_METAL_PROBE_SERIALIZE_LIBRARY_PATH");
+        if (serializePath && serializePath[0]) {
+            SEL serializeSelector = sel_registerName("serializeToURL:error:");
+            NSError *serializeError = nil;
+            NSURL *serializeURL = [NSURL fileURLWithPath:
+                [NSString stringWithUTF8String:serializePath]];
+            BOOL serialized = [library respondsToSelector:serializeSelector] &&
+                ((BOOL (*)(id, SEL, NSURL *, NSError **))objc_msgSend)(
+                    library, serializeSelector, serializeURL, &serializeError);
+            fprintf(stderr,
+                "METAL_SOURCE_PROBE serialize path=%s result=%d "
+                "errorDomain=%s errorCode=%ld description=%s\n",
+                serializePath, serialized,
+                serializeError ? serializeError.domain.UTF8String : "(nil)",
+                (long)(serializeError ? serializeError.code : 0),
+                serializeError
+                    ? serializeError.localizedDescription.UTF8String : "(nil)");
+            if (!serialized) return 16;
+        }
+        if (getenv("MACWS_METAL_PROBE_DUMP_LIBRARY_ALL_METHODS")) {
+            for (Class cls = object_getClass(library); cls;
+                 cls = class_getSuperclass(cls)) {
+                unsigned int methodCount = 0;
+                Method *methods = class_copyMethodList(cls, &methodCount);
+                for (unsigned int methodIndex = 0;
+                     methods && methodIndex < methodCount; methodIndex++) {
+                    fprintf(stderr,
+                        "METAL_SOURCE_PROBE libraryAllMethod class=%s "
+                        "selector=%s types=%s imp=%p\n",
+                        class_getName(cls),
+                        sel_getName(method_getName(methods[methodIndex])),
+                        method_getTypeEncoding(methods[methodIndex]),
+                        method_getImplementation(methods[methodIndex]));
+                }
+                free(methods);
+            }
+        }
 
         id<MTLFunction> function = [library newFunctionWithName:functionName];
         fprintf(stderr,

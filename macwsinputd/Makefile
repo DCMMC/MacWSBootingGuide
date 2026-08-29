@@ -6,8 +6,8 @@ include $(THEOS)/makefiles/common.mk
 TOOL_NAME = macwsinputd
 
 macwsinputd_FILES = main.c
-macwsinputd_CFLAGS = -Wall -Wextra -I$(CURDIR)/../include
-macwsinputd_FRAMEWORKS = CoreFoundation CoreGraphics
+macwsinputd_CFLAGS = -x objective-c -Wall -Wextra -I$(CURDIR)/../include
+macwsinputd_FRAMEWORKS = AppKit CoreFoundation CoreGraphics
 macwsinputd_CODESIGN_FLAGS = -S../layout/usr/macOS/bin/entitlements.plist
 macwsinputd_INSTALL_PATH = /usr/macOS/bin
 

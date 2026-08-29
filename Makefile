@@ -4,7 +4,7 @@ ARCHS = arm64
 include $(THEOS)/makefiles/common.mk
 
 # iOS subprojects
-SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwskeychaind macwsthermal macwslocationd mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy DockHelperChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy GeodChrootProxy WriteConfigChrootProxy LocationdChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
+SUBPROJECTS += MTLCompilerBypassOSCheck MacWSWindowing MacWSCatalystLaunch MTLSimDriverHost launchdchrootexec autosignd macwsallocd macwshostd macwscontrolprobe macwskeychaind macwsthermal macwslocationd mountdevfs ViewBridgeChrootProxy HIServicesChrootProxy OpenAndSavePanelChrootProxy DockHelperChrootProxy ExtensionKitChrootProxy SettingsExtensionChrootProxy FileCoordinationChrootProxy GeodChrootProxy WriteConfigChrootProxy LocationdChrootProxy mtl_keepalive MacWSHost MacWSCatalystLauncher SettingsExtensionMetadata misc/PingMTLCompilerService
 # macOS subprojects
 SUBPROJECTS += launchservicesd libmachook macwsinputd macwsdisplayd macwsinteropd macwsworkspacectl
 
@@ -43,6 +43,7 @@ after-stage::
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/settings.json
 	@install -m 0644 layout/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/certificates/SectigoPublicServerAuthenticationCAOVR36.pem
+
 	@install -m 0644 misc/vscode-aquarium-runner/extensions.json \
 		$(THEOS_STAGING_DIR)/usr/macOS/share/vscode/extensions.json
 	@install -m 0644 misc/vscode-aquarium-runner/package.json \
@@ -54,6 +55,8 @@ after-stage::
 		misc/metal2metal_profiles.py \
 		misc/repack_metallib_macabi.py \
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/
+	@install -m 0644 misc/install_stray_exact_metallib.py \
+		$(THEOS_STAGING_DIR)/usr/macOS/bin/install_stray_exact_metallib.py
 	@install -m 0644 misc/add_macho_load_dylib.py \
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/add_macho_load_dylib.py
 	@install -m 0644 misc/patch_electron_pa_ios_va.py \
@@ -62,3 +65,20 @@ after-stage::
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/
 	@install -m 0755 misc/run_steam_live.sh \
 		$(THEOS_STAGING_DIR)/usr/macOS/bin/run_steam_live.sh
+
+# SpringBoard is arm64e and requires authenticated data fixups for Objective-C
+# and CF constant objects. The iPad's lld does not encode those fixups correctly
+# even with -fixup_chains; SpringBoard-2026-08-28-001431.ips trapped in CFHash
+# on the first Darwin-observer registration. Full on-device builds still build
+# the subproject to keep Theos's dependency graph intact, but the final staging
+# transaction must atomically replace that unsafe intermediate with the
+# Apple-ld64 artifact validated and cached by deploy_macwswindowing.sh.
+ifneq ($(strip $(MACWS_WINDOWING_CROSS_PREBUILT)),)
+after-stage::
+	@test -s "$(MACWS_WINDOWING_CROSS_PREBUILT)" || { \
+		echo 'ERROR: validated MacWSWindowing cross-build is missing.' >&2; exit 1; }
+	@mkdir -p $(THEOS_STAGING_DIR)/usr/lib/TweakInject
+	@install -m 0755 "$(MACWS_WINDOWING_CROSS_PREBUILT)" \
+		$(THEOS_STAGING_DIR)/usr/lib/TweakInject/MacWSWindowing.dylib
+	@echo '==> Replaced on-device MacWSWindowing intermediate with validated Apple-ld64 artifact'
+endif

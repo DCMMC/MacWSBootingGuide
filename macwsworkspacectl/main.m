@@ -482,53 +482,89 @@ static int RegisterSettingsExtensions(BOOL registerRecords) {
     // accepted as success: every record must still resolve to the exact
     // platform-1 identifier and URL before services are published.
     NSUInteger registeredCount = 0;
-    for (NSDictionary<NSString *, id> *candidate in candidates) {
-        @autoreleasepool {
-            NSURL *url = candidate[@"url"];
-            NSString *expectedIdentifier = candidate[@"identifier"];
-            NSError *recordError = nil;
-            id record = ((id (*)(id, SEL))objc_msgSend)(
-                (id)recordClass, sel_registerName("alloc"));
-            record = record
-                ? ((id (*)(id, SEL, id, id *))objc_msgSend)(
-                      record, sel_registerName("initWithURL:error:"),
-                      url, &recordError)
-                : nil;
-            NSString *identifier = record
-                ? ((id (*)(id, SEL))objc_msgSend)(
-                      record, sel_registerName("bundleIdentifier"))
-                : nil;
-            unsigned platform = record
-                ? ((unsigned (*)(id, SEL))objc_msgSend)(
-                      record, sel_registerName("platform"))
-                : 0;
-            NSURL *recordURL = record
-                ? ((id (*)(id, SEL))objc_msgSend)(
-                      record, sel_registerName("URL"))
-                : nil;
-            BOOL valid = [identifier isEqualToString:expectedIdentifier] &&
-                platform == 1 &&
-                [recordURL.path isEqualToString:url.path];
-            if (!valid) {
-                fprintf(stderr,
-                        "macwsworkspacectl: registered settings record "
-                        "failed validation expected=%s identifier=%s "
-                        "platform=%u url=%s error=%s\n",
-                        expectedIdentifier.UTF8String,
-                        identifier.UTF8String ?: "<nil>", platform,
-                        recordURL.path.UTF8String ?: "<nil>",
-                        recordError.description.UTF8String ?: "none");
-                dlclose(launchServices);
-                return 1;
+    NSUInteger validationAttempts = registerRecords ? 41 : 1;
+    NSString *failedExpected = nil;
+    NSString *failedIdentifier = nil;
+    NSString *failedURL = nil;
+    NSString *failedError = nil;
+    unsigned failedPlatform = 0;
+    for (NSUInteger attempt = 0; attempt < validationAttempts; attempt++) {
+        registeredCount = 0;
+        failedExpected = nil;
+        failedIdentifier = nil;
+        failedURL = nil;
+        failedError = nil;
+        failedPlatform = 0;
+        for (NSDictionary<NSString *, id> *candidate in candidates) {
+            @autoreleasepool {
+                NSURL *url = candidate[@"url"];
+                NSString *expectedIdentifier = candidate[@"identifier"];
+                NSError *recordError = nil;
+                id record = ((id (*)(id, SEL))objc_msgSend)(
+                    (id)recordClass, sel_registerName("alloc"));
+                record = record
+                    ? ((id (*)(id, SEL, id, id *))objc_msgSend)(
+                          record, sel_registerName("initWithURL:error:"),
+                          url, &recordError)
+                    : nil;
+                NSString *identifier = record
+                    ? ((id (*)(id, SEL))objc_msgSend)(
+                          record, sel_registerName("bundleIdentifier"))
+                    : nil;
+                unsigned platform = record
+                    ? ((unsigned (*)(id, SEL))objc_msgSend)(
+                          record, sel_registerName("platform"))
+                    : 0;
+                NSURL *recordURL = record
+                    ? ((id (*)(id, SEL))objc_msgSend)(
+                          record, sel_registerName("URL"))
+                    : nil;
+                BOOL valid =
+                    [identifier isEqualToString:expectedIdentifier] &&
+                    platform == 1 &&
+                    [recordURL.path isEqualToString:url.path];
+                if (!valid) {
+                    failedExpected = expectedIdentifier;
+                    failedIdentifier = identifier;
+                    failedPlatform = platform;
+                    failedURL = recordURL.path;
+                    failedError = recordError.description;
+                    break;
+                }
+                registeredCount++;
             }
-            registeredCount++;
-            fprintf(stdout,
-                    "settings-extension-%s identifier=%s platform=%u "
-                    "path=%s\n",
-                    registerRecords ? "ready" : "verified",
-                    identifier.UTF8String, platform,
-                    recordURL.path.fileSystemRepresentation);
         }
+        if (registeredCount == candidates.count) break;
+        // Runtime-confirmed via launchservices-reactivation-ab.log on
+        // 2026-08-23: _LSRegisterPluginURL accepted all 48 URLs, while an
+        // immediate LSApplicationExtensionRecord lookup could still return
+        // -10814 midway through the same asynchronous database commit. A
+        // second process one second later verified all 48. Wait on the actual
+        // records here for at most two seconds; success still requires every
+        // exact identifier, platform and URL, so this is not a check bypass.
+        if (attempt + 1 < validationAttempts) usleep(50 * 1000);
+    }
+
+    if (registeredCount != candidates.count) {
+        fprintf(stderr,
+                "macwsworkspacectl: registered settings record failed "
+                "validation expected=%s identifier=%s platform=%u url=%s "
+                "error=%s attempts=%lu\n",
+                failedExpected.UTF8String ?: "<nil>",
+                failedIdentifier.UTF8String ?: "<nil>", failedPlatform,
+                failedURL.UTF8String ?: "<nil>",
+                failedError.UTF8String ?: "none",
+                (unsigned long)validationAttempts);
+        dlclose(launchServices);
+        return 1;
+    }
+    for (NSDictionary<NSString *, id> *candidate in candidates) {
+        NSURL *url = candidate[@"url"];
+        NSString *identifier = candidate[@"identifier"];
+        fprintf(stdout,
+                "settings-extension-%s identifier=%s platform=1 path=%s\n",
+                registerRecords ? "ready" : "verified",
+                identifier.UTF8String, url.path.fileSystemRepresentation);
     }
 
     NSUInteger candidateCount = candidates.count;

@@ -20,6 +20,7 @@
 #define MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND 80.0
 #define MACWS_SYSTEM_GESTURE_RECOGNITION_FRACTION 0.012
 #define MACWS_SYSTEM_GESTURE_REFERENCE_FRACTION 0.28
+#define MACWS_THREE_FINGER_CHORD_GRACE_SECONDS 0.10
 
 // A dispatch_after callback is only a visual/feedback hint.  The Host main
 // queue can be busy presenting a large IOSurface when that callback becomes
@@ -48,6 +49,27 @@ static inline bool MacWSShouldStartScrollMomentum(double velocityX,
                                                   double velocityY) {
     return hypot(velocityX, velocityY) >=
         MACWS_SCROLL_MOMENTUM_MINIMUM_POINTS_PER_SECOND;
+}
+
+// UIKit measures rotation in its top-left-origin view coordinates, while the
+// reconstructed Ventura NSEvent uses AppKit's rotation convention.  Passing
+// the UIKit sign through unchanged made Maps rotate horizontally opposite to
+// the two physical fingers.  Keep the convention crossing in the shared
+// policy instead of compensating inside Maps or the AppKit event consumer.
+static inline double MacWSAppKitRotationDegreesForUIKitRadians(
+        double radians) {
+    return isfinite(radians) ? -radians * 57.2957795130823208768 : 0.0;
+}
+
+// A hover immediately followed by a click is one pointer transaction. The
+// click is the action whose first visible response matters; retaining the
+// older hover as the sole pending latency sample can consume that response
+// and make the atomic click disappear from performance evidence.
+static inline bool MacWSInputSupersedesPendingVisibilitySample(
+        uint16_t pendingKind, uint16_t newKind) {
+    return pendingKind == MacWSInputKindHover &&
+        (newKind == MacWSInputKindTap ||
+         newKind == MacWSInputKindSecondaryTap);
 }
 
 typedef enum {

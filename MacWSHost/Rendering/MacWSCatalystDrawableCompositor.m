@@ -18,6 +18,7 @@
 
 @implementation MacWSCatalystDrawableFrame {
     IOSurfaceRef _surface;
+    BOOL _holdsTransferredUseCount;
 }
 
 - (instancetype)initWithRecord:(MacWSCatalystDrawableRecord)record
@@ -27,11 +28,15 @@
     if (!self) return nil;
     _record = record;
     _surface = surface ? (IOSurfaceRef)CFRetain(surface) : NULL;
+    _holdsTransferredUseCount = surface &&
+        (record.flags & MacWSCatalystDrawableTransfersUseCount) != 0;
     _texture = texture;
     return self;
 }
 
 - (void)dealloc {
+    if (_surface && _holdsTransferredUseCount)
+        IOSurfaceDecrementUseCount(_surface);
     if (_surface) CFRelease(_surface);
 }
 
@@ -45,6 +50,8 @@
 @implementation MacWSCatalystDrawableCompositor {
     id<MTLDevice> _device;
     NSMutableDictionary<NSNumber *, MacWSCatalystDrawableFrame *> *_frames;
+    BOOL _reportedGeometryRejection;
+    BOOL _reportedTextureRejection;
 }
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device {
@@ -82,8 +89,25 @@
     NSUInteger alignment = [_device respondsToSelector:
         @selector(iosurfaceReadOnlyTextureAlignmentBytes)]
         ? [(id)_device iosurfaceReadOnlyTextureAlignmentBytes] : 0;
-    if (!geometryMatches || (alignment && record.bytesPerRow % alignment != 0))
+    if (!geometryMatches ||
+        (alignment && record.bytesPerRow % alignment != 0)) {
+        if (!_reportedGeometryRejection) {
+            _reportedGeometryRejection = YES;
+            MacWSLog(@"catalyst-drawable reject-geometry pid=%d sequence=%llu "
+                     "record=%ux%u/bpr%u/pf%u actual=%zux%zu/bpr%zu/pf%u "
+                     "alignment=%lu remainder=%lu",
+                     record.ownerPID, (unsigned long long)record.sequence,
+                     record.width, record.height, record.bytesPerRow,
+                     record.ioSurfacePixelFormat, IOSurfaceGetWidth(surface),
+                     IOSurfaceGetHeight(surface),
+                     IOSurfaceGetBytesPerRow(surface),
+                     IOSurfaceGetPixelFormat(surface),
+                     (unsigned long)alignment,
+                     (unsigned long)(alignment
+                         ? record.bytesPerRow % alignment : 0));
+        }
         return nil;
+    }
 
     MTLTextureDescriptor *descriptor =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
@@ -94,13 +118,29 @@
     id<MTLTexture> texture = [_device newTextureWithDescriptor:descriptor
                                                      iosurface:surface
                                                          plane:0];
-    if (!texture) return nil;
+    if (!texture) {
+        if (!_reportedTextureRejection) {
+            _reportedTextureRejection = YES;
+            MacWSLog(@"catalyst-drawable reject-texture pid=%d sequence=%llu "
+                     "size=%ux%u bpr=%u metal-pf=%u",
+                     record.ownerPID, (unsigned long long)record.sequence,
+                     record.width, record.height, record.bytesPerRow,
+                     record.metalPixelFormat);
+        }
+        return nil;
+    }
 
     MacWSCatalystDrawableFrame *frame =
         [[MacWSCatalystDrawableFrame alloc] initWithRecord:record
                                                    surface:surface
                                                    texture:texture];
     _frames[ownerKey] = frame;
+    // Notification delivery is synchronous.  Mark the mutable envelope only
+    // after the IOSurface-backed texture and frame lease both exist; the
+    // receiver returns the producer-transferred use count on every rejected
+    // path.
+    if ([delivery isKindOfClass:NSMutableDictionary.class])
+        ((NSMutableDictionary *)delivery)[@"accepted"] = @YES;
     if (!previous) {
         MacWSLog(@"runtime-confirmed catalyst-drawable imported pid=%d "
                  "surface=%u size=%ux%u bpr=%u metal-pf=%u",

@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach-o/loader.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -37,13 +38,13 @@
 //   Failed to create BinarySemaphore: ... - /BSem/83ace80d
 //   errno: 28, bCreator: false
 //
-// macwshostd owns the POSIX name/generation lifetime and the authoritative
-// semaphore counter. It also creates one small state vnode per generation,
-// but Steam clients use that vnode only to validate an opened generation.
-// wait/post/trywait/getvalue use protocol-v21 AF_UNIX stream requests. A zero
-// blocking wait transfers its connected descriptor into a hostd FIFO; post
-// writes the reply to the oldest descriptor, and the macOS client sleeps in
-// kqueue/EVFILT_READ until that exact stream becomes readable. The real-iPad
+// macwshostd owns the POSIX name/generation lifetime and creates one retained
+// state vnode per generation. Protocol v23 makes flock + pread/pwrite on that
+// vnode authoritative for uncontended post/trywait/getvalue. A zero blocking
+// wait transfers its connected AF_UNIX descriptor into a hostd FIFO; a post
+// seeing state.waiterCount delegates to hostd, which writes the reply to the
+// oldest descriptor. The macOS client sleeps in kqueue/EVFILT_READ until that
+// exact stream becomes readable. The real-iPad
 // steam_kevent_wake_probe returned once after 1.005181 s when an iOS-native
 // peer wrote the byte, and an LLDB snapshot of Steam Helper subsequently
 // captured kevent -> MacWSSteamSemaphoreBrokerSocketValue -> sem_wait. This
@@ -79,7 +80,7 @@
 //    ports and then failed sem_open with ENOSPC.
 //  * per-operation Unix stream RPC: protocol v18 used an ordinary blocking
 //    read; adjacent request IDs arrived while a real Helper sem_post remained
-//    in that read and hostd never observed its generation. Protocol v21 sends
+//    in that read and hostd never observed its generation. Protocol v23 sends
 //    the complete request first and waits through measured-good EVFILT_READ.
 //  * persisted grant + SIGUSR2: steam_osx successfully granted and signaled
 //    Helper 27164 for /BSem/88ece11, but the Helper exited without returning.
@@ -135,6 +136,24 @@ static int gMacWSSteamBrokerResetError;
 static pthread_mutex_t gMacWSSteamShmManifestLock =
     PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t gMacWSSteamSocketRequestID;
+static _Atomic uint64_t gMacWSSteamSocketTimingFirstNanoseconds;
+static _Atomic uint64_t gMacWSSteamSocketTimingCalls;
+static _Atomic uint64_t gMacWSSteamSocketTimingNanoseconds;
+static _Atomic uint64_t gMacWSSteamSocketTimingFailures;
+static _Atomic uint64_t gMacWSSteamSocketTimingEagain;
+static _Atomic uint64_t gMacWSSteamSocketTimingOperationCalls[7];
+static _Atomic uint64_t gMacWSSteamSocketTimingOperationNanoseconds[7];
+// Nonblocking value operations are synchronous per caller thread. Retaining
+// one authenticated AF_UNIX stream in TLS preserves their exact broker order
+// together with its EVFILT_READ kqueue while avoiding connect/accept/close and
+// kqueue/create/register/close transactions for Steam's measured 10 ms
+// controller poll. Blocking waits remain one-shot because hostd moves their
+// descriptor into the semaphore FIFO until a producer posts.
+static _Thread_local int gMacWSSteamValueSocket = -1;
+static _Thread_local int gMacWSSteamValueKqueue = -1;
+static _Thread_local bool gMacWSSteamValueKqueueRegistered;
+static _Thread_local pid_t gMacWSSteamValueSocketPID;
+static _Atomic uintptr_t gMacWSExactOverlayImageBase;
 extern xpc_connection_t MacWSXPCConnectionCreateMachServiceRaw(
     const char *, dispatch_queue_t, uint64_t)
     __asm("_xpc_connection_create_mach_service");
@@ -154,6 +173,65 @@ static bool MacWSIsSteamProcess(void) {
                     "/Library/Application Support/Steam/") != NULL);
     }
     return steamProcess;
+}
+
+// The named-semaphore/shm compatibility above must include Steam-launched
+// games because Valve's injected overlay uses those primitives in the game
+// process.  The deadline substitutions below are narrower: their runtime
+// witnesses are Steam's CEF command pump and controller thread, and applying
+// them to every executable below Application Support/Steam also classifies
+// steamapps/macws-runtime games as the Steam client.
+static bool MacWSIsSteamClientProcess(void) {
+    const char *program = getprogname();
+    return program && (!strcmp(program, "steam_osx") ||
+                       !strcmp(program, "Steam Helper"));
+}
+
+static bool MacWSImageHasUUID(const struct mach_header_64 *header,
+                             const uint8_t expected[16]) {
+    if (!header || header->magic != MH_MAGIC_64) return false;
+    const struct load_command *command =
+        (const struct load_command *)(header + 1);
+    for (uint32_t index = 0; index < header->ncmds; index++) {
+        if (command->cmd == LC_UUID) {
+            const struct uuid_command *uuid =
+                (const struct uuid_command *)command;
+            return memcmp(uuid->uuid, expected, 16) == 0;
+        }
+        command = (const struct load_command *)
+            ((const uint8_t *)command + command->cmdsize);
+    }
+    return false;
+}
+
+static bool MacWSIsExactOverlayEventWaitCallSite(const void *caller,
+                                                 uintptr_t expectedOffset) {
+    const char *enabled = getenv(
+        "MACWS_STRAY_OVERLAY_EVENT_WAIT_DIAGNOSTIC");
+    if (!enabled || strcmp(enabled, "1") || !caller) return false;
+    uintptr_t base = atomic_load_explicit(
+        &gMacWSExactOverlayImageBase, memory_order_relaxed);
+    if (base != 0)
+        return (uintptr_t)caller == base + expectedOffset;
+
+    Dl_info image = {0};
+    if (!dladdr(caller, &image) || !image.dli_fname || !image.dli_fbase ||
+        !strstr(image.dli_fname, "gameoverlayrenderer")) return false;
+    static const uint8_t expectedUUID[16] = {
+        0x52, 0x9f, 0x4e, 0x8f, 0x0f, 0xfb, 0x30, 0xf9,
+        0x88, 0xef, 0xae, 0x09, 0x18, 0xf4, 0xc3, 0x25,
+    };
+    if (!MacWSImageHasUUID(
+            (const struct mach_header_64 *)image.dli_fbase,
+            expectedUUID)) return false;
+    base = (uintptr_t)image.dli_fbase;
+    atomic_store_explicit(
+        &gMacWSExactOverlayImageBase, base, memory_order_relaxed);
+    dprintf(STDERR_FILENO,
+            "[MacWSSteamSem] Stray overlay event-wait diagnostic armed "
+            "image=%s base=%p UUID=529F4E8F-0FFB-30F9-88EF-AE0918F4C325\n",
+            image.dli_fname, image.dli_fbase);
+    return (uintptr_t)caller == base + expectedOffset;
 }
 
 static uint64_t MacWSSteamCurrentThreadID(void) {
@@ -302,6 +380,19 @@ static int MacWSSteamSemaphoreReadState(
         return -1;
     }
     return 0;
+}
+
+static int MacWSSteamSemaphoreWriteState(
+        int descriptor, MacWSSteamSemaphoreState *state) {
+    if (!state || state->revision == UINT32_MAX) {
+        errno = state ? EOVERFLOW : EINVAL;
+        return -1;
+    }
+    state->revision++;
+    ssize_t amount = pwrite(descriptor, state, sizeof(*state), 0);
+    if (amount == (ssize_t)sizeof(*state)) return 0;
+    if (amount >= 0) errno = EIO;
+    return -1;
 }
 
 // Darwin's POSIX-shm namespace survives the crashing process which created an
@@ -667,14 +758,17 @@ static int MacWSSteamWriteAll(int descriptor, const void *bytes,
     return 0;
 }
 
-static int MacWSSteamReadAll(int descriptor, void *bytes, size_t length) {
+static int MacWSSteamReadAll(int descriptor, int retainedQueue,
+                             bool *retainedRegistered,
+                             void *bytes, size_t length) {
     uint8_t *cursor = bytes;
-    int queue = kqueue();
+    bool ownsQueue = retainedQueue < 0;
+    int queue = ownsQueue ? kqueue() : retainedQueue;
     if (queue < 0) return -1;
     struct kevent change = {0};
     EV_SET(&change, descriptor, EVFILT_READ, EV_ADD | EV_ENABLE,
            0, 0, NULL);
-    bool registered = false;
+    bool registered = retainedRegistered && *retainedRegistered;
     while (length != 0) {
         ssize_t amount = recv(descriptor, cursor, length, MSG_DONTWAIT);
         if (amount < 0 && errno == EINTR) continue;
@@ -689,17 +783,18 @@ static int MacWSSteamReadAll(int descriptor, void *bytes, size_t length) {
             int eventCount = kevent(queue,
                 registered ? NULL : &change,
                 registered ? 0 : 1, &event, 1, NULL);
-            registered = true;
             if (eventCount < 0 && errno == EINTR) continue;
             if (eventCount != 1) {
                 int savedError = errno ?: EIO;
-                close(queue);
+                if (ownsQueue) close(queue);
                 errno = savedError;
                 return -1;
             }
+            registered = true;
+            if (retainedRegistered) *retainedRegistered = true;
             if (event.flags & EV_ERROR) {
                 int savedError = event.data ? (int)event.data : EIO;
-                close(queue);
+                if (ownsQueue) close(queue);
                 errno = savedError;
                 return -1;
             }
@@ -708,20 +803,18 @@ static int MacWSSteamReadAll(int descriptor, void *bytes, size_t length) {
         if (amount <= 0) {
             if (amount == 0) errno = ECONNRESET;
             int savedError = errno;
-            close(queue);
+            if (ownsQueue) close(queue);
             errno = savedError;
             return -1;
         }
         cursor += (size_t)amount;
         length -= (size_t)amount;
     }
-    close(queue);
+    if (ownsQueue) close(queue);
     return 0;
 }
 
-static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
-                                                uint64_t generation,
-                                                unsigned *value) {
+static int MacWSSteamConnectValueSocket(void) {
     int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
     if (descriptor < 0) return -1;
     int enabled = 1;
@@ -739,6 +832,49 @@ static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
         errno = savedError;
         return -1;
     }
+    return descriptor;
+}
+
+static void MacWSSteamResetThreadValueSocket(void) {
+    if (gMacWSSteamValueKqueue >= 0) close(gMacWSSteamValueKqueue);
+    if (gMacWSSteamValueSocket >= 0) close(gMacWSSteamValueSocket);
+    gMacWSSteamValueKqueue = -1;
+    gMacWSSteamValueSocket = -1;
+    gMacWSSteamValueKqueueRegistered = false;
+    gMacWSSteamValueSocketPID = 0;
+}
+
+static int MacWSSteamSemaphoreBrokerSocketValueImpl(uint32_t operation,
+                                                    uint64_t generation,
+                                                    unsigned *value,
+                                                    uint32_t timeoutMicroseconds) {
+    bool persistent = operation != MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK &&
+        operation != MACWS_STEAM_SEM_SOCKET_WAIT_TIMED;
+    pid_t process = getpid();
+    int descriptor = -1;
+    if (persistent) {
+        // A fork inherits the descriptor number but not a valid per-thread
+        // request stream identity. Never let child and parent interleave
+        // envelopes on the same connection.
+        if (gMacWSSteamValueSocketPID != process)
+            MacWSSteamResetThreadValueSocket();
+        if (gMacWSSteamValueSocket < 0) {
+            gMacWSSteamValueSocket = MacWSSteamConnectValueSocket();
+            if (gMacWSSteamValueSocket < 0) return -1;
+            gMacWSSteamValueKqueue = kqueue();
+            if (gMacWSSteamValueKqueue < 0) {
+                int savedError = errno;
+                MacWSSteamResetThreadValueSocket();
+                errno = savedError;
+                return -1;
+            }
+            gMacWSSteamValueSocketPID = process;
+        }
+        descriptor = gMacWSSteamValueSocket;
+    } else {
+        descriptor = MacWSSteamConnectValueSocket();
+        if (descriptor < 0) return -1;
+    }
 
     MacWSSteamSemaphoreWaitRequest request = {
         .magic = MACWS_STEAM_SEM_WAIT_MAGIC,
@@ -747,6 +883,7 @@ static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
         .reserved = getenv("MACWS_STEAM_SEM_DIAGNOSTICS") ?
             MACWS_STEAM_SEM_SOCKET_FLAG_DIAGNOSTICS : 0,
         .generation = generation,
+        .timeoutMicroseconds = timeoutMicroseconds,
     };
     uint64_t threadID = 0;
     if (pthread_threadid_np(NULL, &threadID) != 0) threadID = 1;
@@ -757,13 +894,20 @@ static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
                                    memory_order_relaxed) + 1);
     MacWSSteamSemaphoreWaitReply reply = {0};
     if (MacWSSteamWriteAll(descriptor, &request, sizeof(request)) != 0 ||
-        MacWSSteamReadAll(descriptor, &reply, sizeof(reply)) != 0) {
+        MacWSSteamReadAll(
+            descriptor,
+            persistent ? gMacWSSteamValueKqueue : -1,
+            persistent ? &gMacWSSteamValueKqueueRegistered : NULL,
+            &reply, sizeof(reply)) != 0) {
         int savedError = errno;
-        close(descriptor);
+        if (persistent)
+            MacWSSteamResetThreadValueSocket();
+        else
+            close(descriptor);
         errno = savedError;
         return -1;
     }
-    close(descriptor);
+    if (!persistent) close(descriptor);
     if (reply.magic != MACWS_STEAM_SEM_WAIT_MAGIC ||
         reply.version != MACWS_STEAM_SEM_VERSION ||
         reply.generation != generation ||
@@ -804,6 +948,131 @@ static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
     }
     if (value) *value = reply.value;
     return 0;
+}
+
+static void MacWSSteamSemaphoreReportSocketTiming(uint32_t operation,
+                                                  uint64_t startedAt,
+                                                  int result,
+                                                  int resultError) {
+    if (startedAt == 0) return;
+    uint64_t finishedAt = MacWSSteamMonotonicNanoseconds();
+    if (finishedAt < startedAt) return;
+    uint64_t elapsed = finishedAt - startedAt;
+    uint64_t expectedFirst = 0;
+    (void)atomic_compare_exchange_strong_explicit(
+        &gMacWSSteamSocketTimingFirstNanoseconds, &expectedFirst,
+        startedAt, memory_order_relaxed, memory_order_relaxed);
+    uint64_t calls = atomic_fetch_add_explicit(
+        &gMacWSSteamSocketTimingCalls, 1, memory_order_relaxed) + 1;
+    atomic_fetch_add_explicit(&gMacWSSteamSocketTimingNanoseconds,
+                              elapsed, memory_order_relaxed);
+    if (result != 0) {
+        atomic_fetch_add_explicit(&gMacWSSteamSocketTimingFailures, 1,
+                                  memory_order_relaxed);
+        if (resultError == EAGAIN)
+            atomic_fetch_add_explicit(&gMacWSSteamSocketTimingEagain, 1,
+                                      memory_order_relaxed);
+    }
+    if (operation < 7) {
+        atomic_fetch_add_explicit(
+            &gMacWSSteamSocketTimingOperationCalls[operation], 1,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &gMacWSSteamSocketTimingOperationNanoseconds[operation],
+            elapsed, memory_order_relaxed);
+    }
+    if (calls % 100 != 0) return;
+
+    uint64_t first = atomic_load_explicit(
+        &gMacWSSteamSocketTimingFirstNanoseconds, memory_order_relaxed);
+    uint64_t wall = finishedAt > first ? finishedAt - first : 0;
+    uint64_t total = atomic_load_explicit(
+        &gMacWSSteamSocketTimingNanoseconds, memory_order_relaxed);
+    uint64_t failures = atomic_load_explicit(
+        &gMacWSSteamSocketTimingFailures, memory_order_relaxed);
+    uint64_t eagain = atomic_load_explicit(
+        &gMacWSSteamSocketTimingEagain, memory_order_relaxed);
+    uint64_t trywaitCalls = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationCalls[
+            MACWS_STEAM_SEM_SOCKET_TRYWAIT], memory_order_relaxed);
+    uint64_t trywaitTime = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationNanoseconds[
+            MACWS_STEAM_SEM_SOCKET_TRYWAIT], memory_order_relaxed);
+    uint64_t postCalls = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationCalls[
+            MACWS_STEAM_SEM_SOCKET_POST], memory_order_relaxed);
+    uint64_t postTime = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationNanoseconds[
+            MACWS_STEAM_SEM_SOCKET_POST], memory_order_relaxed);
+    uint64_t getvalueCalls = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationCalls[
+            MACWS_STEAM_SEM_SOCKET_GETVALUE], memory_order_relaxed);
+    uint64_t getvalueTime = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationNanoseconds[
+            MACWS_STEAM_SEM_SOCKET_GETVALUE], memory_order_relaxed);
+    uint64_t waitCalls = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationCalls[
+            MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK], memory_order_relaxed);
+    uint64_t waitTime = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationNanoseconds[
+            MACWS_STEAM_SEM_SOCKET_WAIT_BLOCK], memory_order_relaxed);
+    uint64_t timedWaitCalls = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationCalls[
+            MACWS_STEAM_SEM_SOCKET_WAIT_TIMED], memory_order_relaxed);
+    uint64_t timedWaitTime = atomic_load_explicit(
+        &gMacWSSteamSocketTimingOperationNanoseconds[
+            MACWS_STEAM_SEM_SOCKET_WAIT_TIMED], memory_order_relaxed);
+    dprintf(STDERR_FILENO,
+            "[MacWSSteamSemTiming] pid=%d program=%s calls=%llu "
+            "wall_ms=%.3f calls_per_s=%.3f rpc_ms=%.3f avg_us=%.3f "
+            "failures=%llu eagain=%llu trywait=%llu/%.3fms "
+            "post=%llu/%.3fms getvalue=%llu/%.3fms wait=%llu/%.3fms "
+            "timed=%llu/%.3fms\n",
+            getpid(), getprogname() ?: "?", (unsigned long long)calls,
+            (double)wall / 1000000.0,
+            wall ? (double)calls * 1000000000.0 / (double)wall : 0.0,
+            (double)total / 1000000.0,
+            calls ? (double)total / (double)calls / 1000.0 : 0.0,
+            (unsigned long long)failures, (unsigned long long)eagain,
+            (unsigned long long)trywaitCalls,
+            (double)trywaitTime / 1000000.0,
+            (unsigned long long)postCalls,
+            (double)postTime / 1000000.0,
+            (unsigned long long)getvalueCalls,
+            (double)getvalueTime / 1000000.0,
+            (unsigned long long)waitCalls,
+            (double)waitTime / 1000000.0,
+            (unsigned long long)timedWaitCalls,
+            (double)timedWaitTime / 1000000.0);
+}
+
+static int MacWSSteamSemaphoreBrokerSocketValue(uint32_t operation,
+                                                uint64_t generation,
+                                                unsigned *value) {
+    uint64_t startedAt = getenv("MACWS_STEAM_SEM_TIMING_DIAGNOSTICS") ?
+        MacWSSteamMonotonicNanoseconds() : 0;
+    int result = MacWSSteamSemaphoreBrokerSocketValueImpl(
+        operation, generation, value, 0);
+    int resultError = errno;
+    MacWSSteamSemaphoreReportSocketTiming(
+        operation, startedAt, result, resultError);
+    errno = resultError;
+    return result;
+}
+
+static int MacWSSteamSemaphoreBrokerSocketTimedWait(
+        uint64_t generation, uint32_t timeoutMicroseconds) {
+    uint64_t startedAt = getenv("MACWS_STEAM_SEM_TIMING_DIAGNOSTICS") ?
+        MacWSSteamMonotonicNanoseconds() : 0;
+    unsigned value = 0;
+    int result = MacWSSteamSemaphoreBrokerSocketValueImpl(
+        MACWS_STEAM_SEM_SOCKET_WAIT_TIMED, generation, &value,
+        timeoutMicroseconds);
+    int resultError = errno;
+    MacWSSteamSemaphoreReportSocketTiming(
+        MACWS_STEAM_SEM_SOCKET_WAIT_TIMED, startedAt, result, resultError);
+    errno = resultError;
+    return result;
 }
 
 // Timed waits entered from this macOS CEF image do not receive their timeout
@@ -1108,12 +1377,106 @@ static int MacWSSteamSemaphoreConsumeKernelToken(
         handle, nonblocking);
 }
 
+static int MacWSSteamSemaphoreLockState(
+        MacWSSteamSemaphoreHandle *handle,
+        MacWSSteamSemaphoreState *state) {
+    if (!handle || !state || handle->descriptor < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (MacWSSteamFlockExclusive(handle->descriptor) != 0) return -1;
+    if (MacWSSteamSemaphoreReadState(handle->descriptor, state) != 0 ||
+        state->brokerGeneration != handle->brokerGeneration ||
+        strcmp(state->name, handle->name)) {
+        int savedError = errno ?: EPROTO;
+        (void)flock(handle->descriptor, LOCK_UN);
+        errno = savedError;
+        return -1;
+    }
+    return 0;
+}
+
+static int MacWSSteamSemaphoreUnlockState(
+        MacWSSteamSemaphoreHandle *handle, int result, int resultError) {
+    if (flock(handle->descriptor, LOCK_UN) != 0 && result == 0) {
+        result = -1;
+        resultError = errno ?: EIO;
+    }
+    errno = resultError;
+    return result;
+}
+
+static int MacWSSteamSemaphoreLocalTryWait(
+        MacWSSteamSemaphoreHandle *handle) {
+    MacWSSteamSemaphoreState state = {0};
+    if (MacWSSteamSemaphoreLockState(handle, &state) != 0) return -1;
+    int result = 0;
+    int resultError = 0;
+    if (state.value == 0) {
+        result = -1;
+        resultError = EAGAIN;
+    } else {
+        state.value--;
+        if (MacWSSteamSemaphoreWriteState(handle->descriptor, &state) != 0) {
+            result = -1;
+            resultError = errno;
+        }
+    }
+    return MacWSSteamSemaphoreUnlockState(
+        handle, result, resultError);
+}
+
+static int MacWSSteamSemaphoreLocalPost(
+        MacWSSteamSemaphoreHandle *handle, bool *brokerRequired) {
+    if (brokerRequired) *brokerRequired = false;
+    MacWSSteamSemaphoreState state = {0};
+    if (MacWSSteamSemaphoreLockState(handle, &state) != 0) return -1;
+    int result = 0;
+    int resultError = 0;
+    if (state.waiterCount != 0) {
+        if (brokerRequired) *brokerRequired = true;
+    } else if (state.value == MACWS_STEAM_SEM_VALUE_MAX) {
+        result = -1;
+        resultError = EOVERFLOW;
+    } else {
+        state.value++;
+        if (MacWSSteamSemaphoreWriteState(handle->descriptor, &state) != 0) {
+            result = -1;
+            resultError = errno;
+        }
+    }
+    return MacWSSteamSemaphoreUnlockState(
+        handle, result, resultError);
+}
+
+static int MacWSSteamSemaphoreLocalGetValue(
+        MacWSSteamSemaphoreHandle *handle, int *value) {
+    if (!value) {
+        errno = EINVAL;
+        return -1;
+    }
+    MacWSSteamSemaphoreState state = {0};
+    if (MacWSSteamSemaphoreLockState(handle, &state) != 0) return -1;
+    *value = (int)state.value;
+    return MacWSSteamSemaphoreUnlockState(handle, 0, 0);
+}
+
 static int MacWSSteamSemTryWait(sem_t *semaphore) {
     MacWSSteamSemaphoreHandle *handle = MacWSSteamSemaphoreFind(semaphore);
     if (!handle) return sem_trywait(semaphore);
-    int result = MacWSSteamSemaphoreConsumeKernelToken(handle, true);
+    void *caller = __builtin_return_address(0);
+    // RE-confirmed via gameoverlayrenderer UUID
+    // 529F4E8F-0FFB-30F9-88EF-AE0918F4C325: +0xa278 implements its bounded
+    // semaphore acquisition as usleep(10000) at +0xa2d8 followed by
+    // sem_trywait at +0xa2e0 (return +0xa2e4). In the opt-in A/B, replace
+    // only that exact polling pair with a brokered 10 ms event wait. The
+    // broker consumes a real token or returns EAGAIN at the same deadline.
+    int result = MacWSIsExactOverlayEventWaitCallSite(caller, 0xa2e4) ?
+        MacWSSteamSemaphoreBrokerSocketTimedWait(
+            handle->brokerGeneration, 10000) :
+        MacWSSteamSemaphoreLocalTryWait(handle);
     MacWSSteamSemaphoreDiagnoseCaller(
-        "trywait", handle, __builtin_return_address(0));
+        "trywait", handle, caller);
     return result;
 }
 
@@ -1123,7 +1486,9 @@ static int MacWSSteamSemWait(sem_t *semaphore) {
     MacWSSteamSemaphoreDiagnose("wait-enter", handle->name, 0, 0, handle);
     MacWSSteamSemaphoreDiagnoseCaller(
         "wait-enter", handle, __builtin_return_address(0));
-    int result = MacWSSteamSemaphoreConsumeKernelToken(handle, false);
+    int result = MacWSSteamSemaphoreLocalTryWait(handle);
+    if (result != 0 && errno == EAGAIN)
+        result = MacWSSteamSemaphoreConsumeKernelToken(handle, false);
     MacWSSteamSemaphoreDiagnoseCaller(
         "wait-return", handle, __builtin_return_address(0));
     return result;
@@ -1132,9 +1497,12 @@ static int MacWSSteamSemWait(sem_t *semaphore) {
 static int MacWSSteamSemPost(sem_t *semaphore) {
     MacWSSteamSemaphoreHandle *handle = MacWSSteamSemaphoreFind(semaphore);
     if (!handle) return sem_post(semaphore);
+    bool brokerRequired = false;
+    int result = MacWSSteamSemaphoreLocalPost(handle, &brokerRequired);
     unsigned value = 0;
-    int result = MacWSSteamSemaphoreBrokerSocketValue(
-        MACWS_STEAM_SEM_SOCKET_POST, handle->brokerGeneration, &value);
+    if (result == 0 && brokerRequired)
+        result = MacWSSteamSemaphoreBrokerSocketValue(
+            MACWS_STEAM_SEM_SOCKET_POST, handle->brokerGeneration, &value);
     MacWSSteamSemaphoreDiagnose("post", handle->name, result, value,
                                 handle);
     MacWSSteamSemaphoreDiagnoseCaller(
@@ -1149,19 +1517,19 @@ static int MacWSSteamSemGetValue(sem_t *semaphore, int *value) {
         errno = EINVAL;
         return -1;
     }
-    unsigned brokerValue = 0;
-    int result = MacWSSteamSemaphoreBrokerSocketValue(
-        MACWS_STEAM_SEM_SOCKET_GETVALUE, handle->brokerGeneration,
-        &brokerValue);
-    if (result == 0) *value = (int)brokerValue;
-    return result;
+    return MacWSSteamSemaphoreLocalGetValue(handle, value);
 }
 
 // Preserve Valve's explicit sem_trywait(EAGAIN) + usleep(timeout) polling
 // contract. Runtime LLDB showed that discarding this deadline left steam_osx
 // indefinitely blocked on a process-local semaphore which Helper never opens.
 static int MacWSSteamUsleep(useconds_t microseconds) {
-    if (!MacWSIsSteamProcess()) return usleep(microseconds);
+    // The matching +0xa2e4 sem_trywait above now performs this exact 10 ms
+    // deadline as an event wait. Suppress only its UUID-locked predecessor;
+    // leaving both would double Valve's timeout to 20 ms on EAGAIN.
+    if (microseconds == 10000 && MacWSIsExactOverlayEventWaitCallSite(
+            __builtin_return_address(0), 0xa2dc)) return 0;
+    if (!MacWSIsSteamClientProcess()) return usleep(microseconds);
     char threadName[64] = {0};
     if (pthread_getname_np(pthread_self(), threadName,
                            sizeof(threadName)) == 0 &&
@@ -1180,7 +1548,7 @@ static int MacWSSteamUsleep(useconds_t microseconds) {
 
 static int MacWSSteamNanosleep(const struct timespec *requested,
                                struct timespec *remaining) {
-    if (!MacWSIsSteamProcess()) return nanosleep(requested, remaining);
+    if (!MacWSIsSteamClientProcess()) return nanosleep(requested, remaining);
     char threadName[64] = {0};
     if (pthread_getname_np(pthread_self(), threadName,
                            sizeof(threadName)) != 0 ||

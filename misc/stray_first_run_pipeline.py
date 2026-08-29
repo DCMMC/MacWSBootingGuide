@@ -82,8 +82,14 @@ class Remote:
 
     def sudo(self, command: str, *, check: bool = True,
              timeout: float = 30):
+        # A compound command must stay inside the privileged shell.  With a
+        # raw ``sudo A && B`` prefix only A is elevated and B runs in the SSH
+        # user's launchd domain, which makes service recovery nondeterministic.
+        privileged = (
+            f"/var/jb/usr/bin/bash -c {shlex.quote(command)}"
+        )
         prefix = f"printf '%s\\n' {shlex.quote(self.password)} | sudo -S "
-        return self.run(prefix + command, check=check, timeout=timeout)
+        return self.run(prefix + privileged, check=check, timeout=timeout)
 
     def copy_from(self, remote_path: str, local_path: pathlib.Path):
         subprocess.run([
@@ -166,7 +172,9 @@ def activate_game_window(remote: Remote, pid: int, window: dict) -> str:
     """
     window_id = int(window["window"])
     url = f"macwshost://new?window={window_id}&pid={pid}&title=Stray"
-    output = remote.run(f"uiopen {shlex.quote(url)}", check=False).strip()
+    output = remote.run(
+        f"uiopen --url {shlex.quote(url)}", check=False
+    ).strip()
     time.sleep(0.8)
     return output or "requested"
 
@@ -235,26 +243,18 @@ def wait_for_pid(remote: Remote, timeout: float):
 
 
 def ensure_ipctool(remote: Remote):
-    # A live full Steam client owns the game IPC graph and /tmp/steam.pipe.
-    # Loading Valve's standalone ipcserver beside it is both unnecessary and
-    # can fail because the client has already claimed the corresponding
-    # endpoint.  Runtime evidence from Stray then shows steamclient.dylib
-    # loading with the real nonzero Steam ID.  Use the small ipcserver job only
-    # for the direct/no-client fallback.
-    steam_contract = remote.run(
-        "/var/jb/usr/bin/killall -0 steam_osx 2>/dev/null && "
-        "test -p /var/mnt/rootfs/private/tmp/steam.pipe && "
-        "echo steam-client-running",
-        check=False,
-    ).strip()
-    if steam_contract == "steam-client-running":
-        return steam_contract
-
-    # Rootless launchctl resolves this UID-501 plist into the user domain even
-    # when `sudo launchctl load` is the submitting command.  The previous
-    # system-only probe therefore declared a live endpoint missing and retried
-    # until timeout.  Check both legal domains; Stray itself runs as UID 501
-    # and can consume the user-domain Mach service.
+    # RE-confirmed in Stray's shipped arm64 libsteam_api.dylib: the internal
+    # SteamAPI_IsSteamRunning path references the exact Mach service
+    # "com.valvesoftware.steam.ipctool" and calls bootstrap_look_up.  A live
+    # steam_osx plus /tmp/steam.pipe does not publish that launchd endpoint on
+    # this chroot.  Runtime-confirmed before this job was loaded: Stray logged
+    # "ipcserver init failed"; after loading it, the same binary loaded the
+    # real steamclient.dylib and cached Steam ID 76561198257074938.  Therefore
+    # always verify the Mach service itself, even when the full client is live.
+    #
+    # Rootless launchctl may resolve this UID-501 plist into the user domain
+    # even when `sudo launchctl load` is the submitting command. Check both
+    # legal domains; Stray itself runs as UID 501 and consumes that service.
     status_command = (
         f"launchctl print system/{IPCTOOL_LABEL} 2>/dev/null || "
         f"launchctl print user/501/{IPCTOOL_LABEL} 2>/dev/null || true"
@@ -280,7 +280,7 @@ def ensure_ipctool(remote: Remote):
 
 def start_game(remote: Remote, log_path: pathlib.Path, stat_fps: bool,
                game_args: list[str], exec_commands: list[str],
-               native_plain: bool):
+               native_plain: bool, production_profile: bool):
     # iPadOS's noninteractive sudo PATH does not contain Procursus and this
     # device has no pkill binary.  The former best-effort command therefore
     # left UE's fatal-spin process alive; wait_for_pid could bind the next wave
@@ -311,8 +311,9 @@ def start_game(remote: Remote, log_path: pathlib.Path, stat_fps: bool,
         "SteamOverlayGameId=1332010", "SteamClientLaunch=1",
         "MACWS_AGX_NATIVE=1", "MACWS_AGX_REGISTER_CLASSES=1",
         "MACWS_PIN_FALLBACK=1", "MACWS_STRAY_AGX_COMPAT=1",
-        "MACWS_APP_INPUT_DIAGNOSTICS=1",
     ]
+    if not production_profile:
+        environment.append("MACWS_APP_INPUT_DIAGNOSTICS=1")
     if native_plain:
         environment.append("MACWS_AGX_NATIVE_PLAIN=1")
     command = (
@@ -329,6 +330,34 @@ def start_game(remote: Remote, log_path: pathlib.Path, stat_fps: bool,
     return process, output
 
 
+def fullscreen_key_window_fallback(remote: Remote, pid: int,
+                                   retained: dict):
+    """Use AppKit's live keyWindow while UE replaces its FCocoaWindow.
+
+    AppInputBridge defines a zero window identifier as the target
+    application's current keyWindow. Use that real protocol route only while
+    both the process and its PID-scoped input endpoint remain present.
+    """
+    endpoint = f"/var/mnt/rootfs/private/tmp/macws_app_input.{pid}.sock"
+    ready = remote.run(
+        f"test -S {shlex.quote(endpoint)} && kill -0 {pid} 2>/dev/null "
+        "&& echo ready",
+        check=False,
+    ).strip()
+    if ready != "ready":
+        raise RuntimeError(
+            f"fullscreen keyWindow route unavailable for Stray pid={pid}"
+        )
+    return {
+        "window": 0,
+        "flags": 0,
+        "logical_group": 0,
+        "width": retained["width"],
+        "height": retained["height"],
+        "route": "application-key-window",
+    }
+
+
 def send_key(remote: Remote, pid: int, window: dict, key: str, hold: float):
     width = max(1, round(window["width"]))
     height = max(1, round(window["height"]))
@@ -336,8 +365,10 @@ def send_key(remote: Remote, pid: int, window: dict, key: str, hold: float):
     # Leave enough time for SSH setup/teardown instead of racing the Remote
     # default when a sustained gameplay sample is exactly 30 seconds long.
     command_timeout = max(30.0, hold + 15.0)
+    window_argument = ("--key-window" if int(window["window"]) == 0 else
+                       f"--window {int(window['window'])}")
     return remote.run(
-        f"python3 {KEY_PROBE} --pid {pid} --window {window['window']} "
+        f"python3 {KEY_PROBE} --pid {pid} {window_argument} "
         f"--width {width} --height {height} --key {shlex.quote(key)} "
         f"--hold {hold}",
         timeout=command_timeout,
@@ -481,6 +512,70 @@ def send_resume_action(remote: Remote, pid: int, window: dict, hold: float):
     return f"{tap}; {activate}"
 
 
+def analyze_bgrx(raw: bytes, screen_width: int, screen_height: int,
+                 content_bounds: list[int] | None = None):
+    metrics = {
+        "colorful_pixel_ratio": None,
+        "mean_brightness": None,
+        "edge_pixel_ratio": None,
+        "mean_local_delta": None,
+        "analysis_bounds": None,
+    }
+    if screen_width <= 0 or screen_height <= 0 or \
+            screen_width * screen_height * 4 != len(raw):
+        return metrics
+    left = 0
+    top = 0
+    right = screen_width
+    bottom = screen_height
+    if content_bounds:
+        window_x, window_y, content_width, content_height = content_bounds
+        # CGWindow bounds use the same top-left screen coordinates as the
+        # RFB framebuffer. AppKit includes the 28-point title bar, so exclude
+        # it from scene classification. Host rendered captures already focus
+        # the selected fullscreen canvas and therefore pass no bounds here.
+        left = max(0, window_x)
+        top = max(0, window_y + 28)
+        right = min(screen_width, window_x + content_width)
+        bottom = min(screen_height, window_y + content_height)
+    metrics["analysis_bounds"] = [left, top, right, bottom]
+    sampled = 0
+    colorful = 0
+    brightness_total = 0
+    edge_count = 0
+    local_delta_total = 0
+    # One in every 16 pixels is enough to distinguish Stray's black/gray
+    # setup menus from a rendered 3D scene without making classification part
+    # of the frame-time workload.
+    for y in range(top, bottom, 4):
+        for x in range(left, right, 4):
+            offset = (y * screen_width + x) * 4
+            blue, green, red = raw[offset:offset + 3]
+            brightness = max(red, green, blue)
+            brightness_total += brightness
+            sampled += 1
+            if brightness >= 24 and max(red, green, blue) - \
+                    min(red, green, blue) >= 18:
+                colorful += 1
+            if x + 4 < right:
+                neighbor = offset + 16
+                delta = max(
+                    abs(raw[offset + channel] - raw[neighbor + channel])
+                    for channel in range(3)
+                )
+                local_delta_total += delta
+                if delta >= 18:
+                    edge_count += 1
+    if sampled:
+        metrics.update({
+            "colorful_pixel_ratio": colorful / sampled,
+            "mean_brightness": brightness_total / sampled,
+            "edge_pixel_ratio": edge_count / sampled,
+            "mean_local_delta": local_delta_total / sampled,
+        })
+    return metrics
+
+
 def capture_vnc(host: str, port: int, destination: pathlib.Path,
                 content_bounds: list[int] | None = None):
     raw_path = destination.with_suffix(".bgrx")
@@ -490,11 +585,9 @@ def capture_vnc(host: str, port: int, destination: pathlib.Path,
         "--raw", str(raw_path),
     ]
     result = subprocess.run(command, capture_output=True, text=True)
-    colorful_ratio = None
-    mean_brightness = None
-    edge_ratio = None
-    mean_local_delta = None
-    analysis_bounds = None
+    raw = b""
+    screen_width = 0
+    screen_height = 0
     try:
         raw = raw_path.read_bytes()
         size_match = re.search(r"size=(\d+)x(\d+)", result.stdout)
@@ -502,71 +595,104 @@ def capture_vnc(host: str, port: int, destination: pathlib.Path,
         screen_height = int(size_match.group(2)) if size_match else 0
         if screen_width * screen_height * 4 != len(raw):
             screen_width = screen_height = 0
-        left = 0
-        top = 0
-        right = screen_width
-        bottom = screen_height
-        if content_bounds and screen_width and screen_height:
-            window_x, window_y, content_width, content_height = \
-                content_bounds
-            # CGWindow bounds use the same top-left screen coordinates as the
-            # RFB framebuffer.  AppKit includes the 28-point title bar, so
-            # exclude it from scene classification.  Sampling the entire VNC
-            # desktop caused Steam's blue background and the colorful Dock to
-            # turn Stray's black SELECT SAVE screen into a false success.
-            left = max(0, window_x)
-            top = max(0, window_y + 28)
-            right = min(screen_width, window_x + content_width)
-            bottom = min(screen_height, window_y + content_height)
-        analysis_bounds = [left, top, right, bottom]
-        sampled = 0
-        colorful = 0
-        brightness_total = 0
-        edge_count = 0
-        local_delta_total = 0
-        # One in every 16 pixels is enough to distinguish Stray's black/gray
-        # setup menus from a rendered 3D scene without making screenshot
-        # classification part of the frame-time workload.
-        if screen_width and screen_height:
-            for y in range(top, bottom, 4):
-                for x in range(left, right, 4):
-                    offset = (y * screen_width + x) * 4
-                    blue, green, red = raw[offset:offset + 3]
-                    brightness = max(red, green, blue)
-                    brightness_total += brightness
-                    sampled += 1
-                    if brightness >= 24 and max(red, green, blue) - \
-                            min(red, green, blue) >= 18:
-                        colorful += 1
-                    if x + 4 < right:
-                        neighbor = offset + 16
-                        delta = max(
-                            abs(raw[offset + channel] -
-                                raw[neighbor + channel])
-                            for channel in range(3)
-                        )
-                        local_delta_total += delta
-                        if delta >= 18:
-                            edge_count += 1
-        if sampled:
-            colorful_ratio = colorful / sampled
-            mean_brightness = brightness_total / sampled
-            edge_ratio = edge_count / sampled
-            mean_local_delta = local_delta_total / sampled
     except OSError:
         pass
+    metrics = analyze_bgrx(raw, screen_width, screen_height, content_bounds)
     return {
         "path": str(destination),
         "raw_path": str(raw_path),
+        "source": "vnc",
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
-        "colorful_pixel_ratio": colorful_ratio,
-        "mean_brightness": mean_brightness,
-        "edge_pixel_ratio": edge_ratio,
-        "mean_local_delta": mean_local_delta,
-        "analysis_bounds": analysis_bounds,
+        **metrics,
     }
+
+
+def capture_host_rendered(remote: Remote, destination: pathlib.Path):
+    """Capture the exact drawable currently visible in the macPad Host."""
+    remote_path = "/var/mobile/Library/Logs/MacWSHost-rendered.png"
+    command = (
+        "LOG=/var/mobile/Library/Logs/MacWSHost.log; "
+        "START=$(( $(wc -l < \"$LOG\") + 1 )); "
+        "/var/jb/usr/bin/uiopen macwshost://screenshot-rendered "
+        ">/dev/null 2>&1; "
+        "I=0; LINE=; while [ $I -lt 50 ]; do I=$((I + 1)); "
+        "LINE=$(tail -n +\"$START\" \"$LOG\" | "
+        "grep -F 'rendered-drawable-snapshot written=YES' | tail -n 1); "
+        "[ -n \"$LINE\" ] && break; sleep 0.1; done; "
+        "printf '%s\\n' \"$LINE\"; "
+        f"test -n \"$LINE\" && test -s {remote_path}"
+    )
+    stdout = remote.run(command, check=False, timeout=10)
+    result = {
+        "path": str(destination),
+        "raw_path": str(destination.with_suffix(".bgrx")),
+        "source": "macpad-rendered-drawable",
+        "returncode": 1,
+        "stdout": stdout,
+        "stderr": "",
+        **analyze_bgrx(b"", 0, 0),
+    }
+    if "rendered-drawable-snapshot written=YES" not in stdout:
+        result["stderr"] = "MacWSHost did not publish a fresh drawable snapshot"
+        return result
+    try:
+        remote.copy_from(remote_path, destination)
+        bmp_path = destination.with_suffix(".host.bmp")
+        conversion = subprocess.run(
+            ["/usr/bin/sips", "-s", "format", "bmp", str(destination),
+             "--out", str(bmp_path)],
+            capture_output=True, text=True,
+        )
+        if conversion.returncode:
+            result["stderr"] = conversion.stderr
+            return result
+        bitmap = bmp_path.read_bytes()
+        if len(bitmap) < 54 or bitmap[:2] != b"BM":
+            raise ValueError("invalid BMP produced by sips")
+        pixel_offset = struct.unpack_from("<I", bitmap, 10)[0]
+        width, signed_height, planes, bits_per_pixel = struct.unpack_from(
+            "<iiHH", bitmap, 18
+        )
+        if width <= 0 or signed_height == 0 or planes != 1 or \
+                bits_per_pixel != 32:
+            raise ValueError(
+                "unexpected BMP geometry "
+                f"{width}x{signed_height}/{planes}/{bits_per_pixel}"
+            )
+        height = abs(signed_height)
+        stride = width * 4
+        payload = bitmap[pixel_offset:pixel_offset + stride * height]
+        if len(payload) != stride * height:
+            raise ValueError("truncated BMP pixel payload")
+        if signed_height > 0:
+            rows = [payload[index * stride:(index + 1) * stride]
+                    for index in range(height)]
+            payload = b"".join(reversed(rows))
+        raw_path = destination.with_suffix(".bgrx")
+        raw_path.write_bytes(payload)
+        result.update({
+            "returncode": 0,
+            "stdout": stdout +
+                f"host-rendered size={width}x{height} via=sips-bmp\n",
+            **analyze_bgrx(payload, width, height),
+        })
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        result["stderr"] = str(error)
+    return result
+
+
+def capture_frame(remote: Remote, host: str, port: int,
+                  destination: pathlib.Path,
+                  content_bounds: list[int] | None = None):
+    vnc = capture_vnc(host, port, destination, content_bounds)
+    if vnc["returncode"] == 0 and \
+            vnc["colorful_pixel_ratio"] is not None:
+        return vnc
+    host_capture = capture_host_rendered(remote, destination)
+    host_capture["vnc_fallback_reason"] = vnc["stderr"].strip()
+    return host_capture
 
 
 def recognize_screen_text(capture: dict):
@@ -726,8 +852,14 @@ def main():
         help="seconds between first-run default confirmations after Start Game",
     )
     parser.add_argument(
-        "--prompt-steps", type=int, default=6,
+        "--prompt-steps", type=int, default=18,
         help="maximum default confirmations before a gameplay frame is required",
+    )
+    parser.add_argument(
+        "--gameplay-min-delay", type=float, default=120,
+        help=("minimum seconds after selecting a new save before a colorful "
+              "frame may count as gameplay; prevents the intro movie from "
+              "becoming a false performance witness"),
     )
     parser.add_argument(
         "--movie-skip-at", type=int, default=0,
@@ -743,7 +875,7 @@ def main():
         help=("sampled horizontal-edge ratio required with color; rejects "
               "uniform or low-frequency corrupted frames"),
     )
-    parser.add_argument("--wave-timeout", type=float, default=100)
+    parser.add_argument("--wave-timeout", type=float, default=240)
     parser.add_argument("--key-hold", type=float, default=0.12)
     parser.add_argument(
         "--movement-hold", type=float, default=1.0,
@@ -755,6 +887,11 @@ def main():
               "seconds and record present-rate witnesses; zero disables it"),
     )
     parser.add_argument("--stat-fps", action="store_true")
+    parser.add_argument(
+        "--production-profile", action="store_true",
+        help=("disable pipeline/MTL/input diagnostics and install only the "
+              "bounded present-cadence counter; requires --no-auto-convert"),
+    )
     parser.add_argument(
         "--native-plain", action="store_true",
         help=("diagnostic A/B: route ordinary plain textures through the "
@@ -798,11 +935,16 @@ def main():
         parser.error("provide --sudo-password or MACWS_DEVICE_SUDO_PASSWORD")
     if args.capture_render_targets and not args.render_trace:
         parser.error("--capture-render-targets requires --render-trace")
+    if args.production_profile and args.render_trace:
+        parser.error("--production-profile cannot enable --render-trace")
+    if args.production_profile and not args.no_auto_convert:
+        parser.error("--production-profile requires --no-auto-convert")
     if (args.max_waves < 1 or args.key_hold < 0 or args.movement_hold <= 0 or
             args.gameplay_movement_hold < 0 or
             args.prompt_delay <= 0 or
             args.prompt_steps < 1 or args.movie_skip_at < 0 or
             args.movie_skip_at >= args.prompt_steps or
+            args.gameplay_min_delay < 0 or
             not 0 < args.scene_color_ratio < 1 or
             not 0 < args.scene_edge_ratio < 1 or
             args.capture_after_prompt < 0 or
@@ -826,11 +968,16 @@ def main():
                    "/var/jb/var/mobile/MacWSBootingGuide/misc/"
                    "host_key_probe.py")
     ipctool = ensure_ipctool(remote)
-    diagnostic_flags = [
-        "/var/mnt/rootfs/private/tmp/macws_pipeline_diag",
-        "/var/mnt/rootfs/private/tmp/macws_mtl_data_diag",
-    ]
-    if args.render_trace:
+    if args.production_profile:
+        diagnostic_flags = [
+            "/var/mnt/rootfs/private/tmp/macws_stray_present_trace",
+        ]
+    else:
+        diagnostic_flags = [
+            "/var/mnt/rootfs/private/tmp/macws_pipeline_diag",
+            "/var/mnt/rootfs/private/tmp/macws_mtl_data_diag",
+        ]
+    if args.render_trace and not args.production_profile:
         diagnostic_flags.append(
             "/var/mnt/rootfs/private/tmp/macws_stray_render_trace"
         )
@@ -851,10 +998,12 @@ def main():
                          args.exec_command,
         "movie_skip_at": args.movie_skip_at,
         "render_trace": args.render_trace,
+        "production_profile": args.production_profile,
         "native_plain": args.native_plain,
         "capture_render_targets": args.capture_render_targets,
         "capture_after_prompt": args.capture_after_prompt,
         "gameplay_movement_hold": args.gameplay_movement_hold,
+        "gameplay_min_delay": args.gameplay_min_delay,
         "scene_classifier": {
             "colorful_pixel_ratio": args.scene_color_ratio,
             "edge_pixel_ratio": args.scene_edge_ratio,
@@ -879,6 +1028,7 @@ def main():
             process, output_handle = start_game(
                 remote, log_path, args.stat_fps,
                 args.game_arg, args.exec_command, args.native_plain,
+                args.production_profile,
             )
             pid = 0
             entry = {"wave": wave, "thermal_before": thermal}
@@ -909,8 +1059,8 @@ def main():
                         "process_exited": process.poll() is not None,
                         "scene_detected": False,
                         "exact_misses": misses,
-                        "after_wait": capture_vnc(
-                            args.host, args.vnc_port,
+                        "after_wait": capture_frame(
+                            remote, args.host, args.vnc_port,
                             wave_dir / "after-wait.png",
                         ),
                     })
@@ -947,8 +1097,8 @@ def main():
                 )
                 entry["window_bounds"] = window_bounds
                 time.sleep(args.accept_delay)
-                entry["before_accept"] = capture_vnc(
-                    args.host, args.vnc_port,
+                entry["before_accept"] = capture_frame(
+                    remote, args.host, args.vnc_port,
                     wave_dir / "before-accept.png",
                     window_bounds,
                 )
@@ -969,45 +1119,53 @@ def main():
                     text = read_log(log_path)
                     detected_fatal = fatal_kind(text)
                     if not detected_fatal:
-                        raise
-                    misses = exact_misses(text)
-                    entry.update({
-                        "window_catalog_lost_before_accept": True,
-                        "fatal_kind": detected_fatal,
-                        "fatal_shader":
-                            detected_fatal == "shader_target_os",
-                        "process_exited": process.poll() is not None,
-                        "scene_detected": False,
-                        "exact_misses": misses,
-                        "after_wait": capture_vnc(
-                            args.host, args.vnc_port,
-                            wave_dir / "after-wait.png",
-                            window_bounds,
-                        ),
-                    })
-                    stop_game(remote, pid, process, output_handle)
-                    output_handle = None
-                    if args.no_auto_convert and misses:
-                        summary["result"] = "EXACT_SHADER_MISS"
-                        summary["waves"].append(entry)
-                        break
-                    if not misses:
-                        summary["result"] = (
-                            "COMMAND_BUFFER_ERROR"
-                            if detected_fatal == "command_buffer"
-                            else "FATAL_WITHOUT_CAPTURE"
+                        accept_window = fullscreen_key_window_fallback(
+                            remote, pid, window
+                        )
+                        accept_windows = []
+                        entry["accept_window_fallback"] = (
+                            "application-key-window-after-fullscreen-"
+                            "metrics-gap"
+                        )
+                    else:
+                        misses = exact_misses(text)
+                        entry.update({
+                            "window_catalog_lost_before_accept": True,
+                            "fatal_kind": detected_fatal,
+                            "fatal_shader":
+                                detected_fatal == "shader_target_os",
+                            "process_exited": process.poll() is not None,
+                            "scene_detected": False,
+                            "exact_misses": misses,
+                            "after_wait": capture_frame(
+                                remote, args.host, args.vnc_port,
+                                wave_dir / "after-wait.png",
+                                window_bounds,
+                            ),
+                        })
+                        stop_game(remote, pid, process, output_handle)
+                        output_handle = None
+                        if args.no_auto_convert and misses:
+                            summary["result"] = "EXACT_SHADER_MISS"
+                            summary["waves"].append(entry)
+                            break
+                        if not misses:
+                            summary["result"] = (
+                                "COMMAND_BUFFER_ERROR"
+                                if detected_fatal == "command_buffer"
+                                else "FATAL_WITHOUT_CAPTURE"
+                            )
+                            summary["waves"].append(entry)
+                            break
+                        entry["installed"] = convert_and_install(
+                            remote, misses, wave_dir, llvm_dis, llvm_as
                         )
                         summary["waves"].append(entry)
-                        break
-                    entry["installed"] = convert_and_install(
-                        remote, misses, wave_dir, llvm_dis, llvm_as
-                    )
-                    summary["waves"].append(entry)
-                    summary_path.write_text(
-                        json.dumps(summary, ensure_ascii=False, indent=2) +
-                        "\n"
-                    )
-                    continue
+                        summary_path.write_text(
+                            json.dumps(summary, ensure_ascii=False,
+                                       indent=2) + "\n"
+                        )
+                        continue
                 entry["accept_window"] = accept_window
                 entry["accept_windows"] = accept_windows
                 entry["accept"] = send_return(
@@ -1028,14 +1186,24 @@ def main():
                         break
                     time.sleep(0.5)
                 if not detected_fatal and not process_exited:
-                    entry["before_start_game"] = capture_vnc(
-                        args.host, args.vnc_port,
+                    entry["before_start_game"] = capture_frame(
+                        remote, args.host, args.vnc_port,
                         wave_dir / "before-start-game.png",
                         window_bounds,
                     )
-                    start_window, start_windows = largest_game_window(
-                        remote, pid, 5
-                    )
+                    try:
+                        start_window, start_windows = largest_game_window(
+                            remote, pid, 5
+                        )
+                    except RuntimeError:
+                        start_window = fullscreen_key_window_fallback(
+                            remote, pid, accept_window
+                        )
+                        start_windows = []
+                        entry["start_game_window_fallback"] = (
+                            "application-key-window-after-fullscreen-"
+                            "metrics-gap"
+                        )
                     entry["start_game_window"] = start_window
                     entry["start_game_windows"] = start_windows
                     entry["start_game"] = send_return(
@@ -1054,6 +1222,7 @@ def main():
                     prompt_index = 0
                     movie_skip_sent = args.movie_skip_at == 0
                     save_flow_started = False
+                    save_flow_started_at = None
                     post_save_actions = 0
                     gameplay_movement_sent = False
                     while time.monotonic() < deadline:
@@ -1068,8 +1237,8 @@ def main():
                                 prompt_index < args.prompt_steps and
                                 time.monotonic() >= next_prompt):
                             prompt_index += 1
-                            prompt_capture = capture_vnc(
-                                args.host, args.vnc_port,
+                            prompt_capture = capture_frame(
+                                remote, args.host, args.vnc_port,
                                 wave_dir / f"prompt-{prompt_index:02d}.png",
                                 window_bounds,
                             )
@@ -1095,11 +1264,16 @@ def main():
                             edge_ratio = prompt_capture.get(
                                 "edge_pixel_ratio"
                             )
+                            post_save_elapsed = (
+                                time.monotonic() - save_flow_started_at
+                                if save_flow_started_at is not None else 0.0
+                            )
                             scene_classification_ready = (
                                 save_flow_started and
                                 ((args.movie_skip_at == 0 and
-                                  post_save_actions >= 1) or
-                                (args.movie_skip_at > 0 and
+                                  post_save_elapsed >=
+                                      args.gameplay_min_delay) or
+                                 (args.movie_skip_at > 0 and
                                  movie_skip_sent and
                                  prompt_index >= args.movie_skip_at + 4))
                             )
@@ -1157,8 +1331,8 @@ def main():
                                              present_before["total_seconds"])
                                         )
                                     movement_entry["after_movement"] = \
-                                        capture_vnc(
-                                            args.host, args.vnc_port,
+                                        capture_frame(
+                                            remote, args.host, args.vnc_port,
                                             wave_dir /
                                             "after-gameplay-movement.png",
                                             window_bounds,
@@ -1177,13 +1351,16 @@ def main():
                                         largest_game_window(remote, pid, 5)
                                     last_input_window = prompt_window
                                 except RuntimeError:
-                                    # The FCocoaWindow remains alive while UE
-                                    # momentarily stops refreshing its metrics
-                                    # sidecar during menu transitions.  Reuse
-                                    # the last structurally validated target;
-                                    # the app-input receiver independently
-                                    # rejects a stale window number.
-                                    prompt_window = last_input_window
+                                    # Fullscreen transitions can retire the
+                                    # previously validated FCocoaWindow while
+                                    # the PID and AppInput endpoint remain
+                                    # healthy. Route keyboard input through
+                                    # AppKit's live keyWindow contract instead
+                                    # of replaying a known-stale window ID.
+                                    prompt_window = \
+                                        fullscreen_key_window_fallback(
+                                            remote, pid, last_input_window
+                                        )
                                     prompt_windows = []
                                 if (args.movie_skip_at > 0 and
                                         prompt_index == args.movie_skip_at):
@@ -1225,10 +1402,23 @@ def main():
                                         input_kind = (
                                             "select_save_slot_then_start"
                                         )
-                                        select_result = \
-                                            send_normalized_rfb_tap(
-                                                args.host, args.vnc_port,
-                                                prompt_window, 0.167, 0.47)
+                                        try:
+                                            select_result = \
+                                                send_normalized_rfb_tap(
+                                                    args.host, args.vnc_port,
+                                                    prompt_window,
+                                                    0.167, 0.47)
+                                            selection_route = "rfb"
+                                        except OSError as error:
+                                            select_result = \
+                                                send_select_save_slot_tap(
+                                                    remote, pid,
+                                                    prompt_window)
+                                            selection_route = \
+                                                "macpad-host-input"
+                                            entry["prompts"][-1][
+                                                "rfb_selection_error"
+                                            ] = str(error)
                                         # The slot card is a focus target, not
                                         # the START GAME action itself.  The
                                         # live screen advertises ENTER Select,
@@ -1236,12 +1426,23 @@ def main():
                                         # pointer lands inside SLOT 1.  Confirm
                                         # the focused card before looking for
                                         # the action exposed by that selection.
-                                        confirm_result = send_rfb_key(
-                                            args.host, args.vnc_port,
-                                            "return", args.key_hold)
+                                        try:
+                                            confirm_result = send_rfb_key(
+                                                args.host, args.vnc_port,
+                                                "return", args.key_hold)
+                                            confirmation_route = "rfb"
+                                        except OSError as error:
+                                            confirm_result = send_return(
+                                                remote, pid, prompt_window,
+                                                args.key_hold)
+                                            confirmation_route = \
+                                                "macpad-host-input"
+                                            entry["prompts"][-1][
+                                                "rfb_confirmation_error"
+                                            ] = str(error)
                                         time.sleep(1.5)
-                                        after_slot = capture_vnc(
-                                            args.host, args.vnc_port,
+                                        after_slot = capture_frame(
+                                            remote, args.host, args.vnc_port,
                                             wave_dir /
                                             "after-slot-selection.png",
                                             window_bounds,
@@ -1259,9 +1460,21 @@ def main():
                                         # visible, activate it with the same
                                         # independent RFB keyboard route.
                                         if "START GAME" in after_slot_text:
-                                            start_result = send_rfb_key(
-                                                args.host, args.vnc_port,
-                                                "return", args.key_hold)
+                                            try:
+                                                start_result = send_rfb_key(
+                                                    args.host, args.vnc_port,
+                                                    "return", args.key_hold)
+                                                start_route = "rfb"
+                                            except OSError as error:
+                                                start_result = send_return(
+                                                    remote, pid,
+                                                    prompt_window,
+                                                    args.key_hold)
+                                                start_route = \
+                                                    "macpad-host-input"
+                                                entry["prompts"][-1][
+                                                    "rfb_start_error"
+                                                ] = str(error)
                                         elif ("SELECT SAVE" in after_slot_text or
                                               ("SLOT 1" in after_slot_text and
                                                "SLOT 2" in after_slot_text)):
@@ -1274,21 +1487,56 @@ def main():
                                                 "slot-confirm transitioned "
                                                 "directly"
                                             )
+                                            start_route = "not-required"
+                                        entry["prompts"][-1][
+                                            "save_input_routes"
+                                        ] = {
+                                            "selection": selection_route,
+                                            "confirmation":
+                                                confirmation_route,
+                                            "start": start_route,
+                                        }
                                         prompt_result = (
                                             f"{select_result}; "
                                             f"{confirm_result}; "
                                             f"{start_result}"
                                         )
                                         save_flow_started = True
+                                        save_flow_started_at = \
+                                            time.monotonic()
                                     else:
                                         # Do not toggle the selected slot.
                                         # Retry its advertised ENTER action
                                         # through OSXvnc's keyboard route.
                                         input_kind = \
                                             "retry_start_game_rfb_return"
-                                        prompt_result = send_rfb_key(
-                                            args.host, args.vnc_port,
-                                            "return", args.key_hold)
+                                        try:
+                                            prompt_result = send_rfb_key(
+                                                args.host, args.vnc_port,
+                                                "return", args.key_hold)
+                                        except OSError as error:
+                                            prompt_result = send_return(
+                                                remote, pid, prompt_window,
+                                                args.key_hold)
+                                            entry["prompts"][-1][
+                                                "rfb_retry_error"
+                                            ] = str(error)
+                                elif (save_flow_started and
+                                      args.movie_skip_at == 0 and
+                                      post_save_elapsed <
+                                          args.gameplay_min_delay):
+                                    # A valid colorful/edged frame during this
+                                    # interval is Stray's non-interactive intro
+                                    # movie, not a controllable level. Observe
+                                    # it without injecting Return/W so the test
+                                    # cannot skip or perturb the user's path.
+                                    input_kind = "wait_intro"
+                                    prompt_result = (
+                                        "no-input intro-elapsed="
+                                        f"{post_save_elapsed:.1f}s "
+                                        "required="
+                                        f"{args.gameplay_min_delay:.1f}s"
+                                    )
                                 elif (save_flow_started and
                                       post_save_actions >= 3):
                                     # A held movement key is both a first-run
@@ -1348,8 +1596,8 @@ def main():
                     entry["render_targets"] = collect_render_targets(
                         remote, wave_dir
                     )
-                entry["after_wait"] = capture_vnc(
-                    args.host, args.vnc_port,
+                entry["after_wait"] = capture_frame(
+                    remote, args.host, args.vnc_port,
                     wave_dir / "after-wait.png",
                     window_bounds,
                 )

@@ -108,14 +108,19 @@ void MacWSStartCatalystDrawableReceiver(void) {
                 if (!surface) continue;
                 NSData *payload = [NSData dataWithBytes:&record
                                                   length:sizeof(record)];
-                NSDictionary *delivery = @{
+                NSMutableDictionary *delivery = [@{
                     @"record": payload,
                     @"surface": (__bridge id)surface,
-                };
+                } mutableCopy];
                 [NSNotificationCenter.defaultCenter
                     postNotificationName:
                         MacWSCatalystDrawableDidPresentNotification
                     object:delivery];
+                if ((record.flags &
+                        MacWSCatalystDrawableTransfersUseCount) != 0 &&
+                    ![delivery[@"accepted"] boolValue]) {
+                    IOSurfaceDecrementUseCount(surface);
+                }
                 CFRelease(surface);
             }
         });

@@ -20,12 +20,14 @@ KEY_CODES = {
     "u": 32, "[": 33, "i": 34, "p": 35, "return": 36, "l": 37,
     "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43,
     "/": 44, "n": 45, "m": 46, ".": 47, "tab": 48,
-    "space": 49, "backspace": 51, "escape": 53,
+    "space": 49, "`": 50, "grave": 50, "backspace": 51, "escape": 53,
+    "left": 123, "right": 124, "down": 125, "up": 126,
 }
 
 SPECIAL_SYMBOLS = {
     "return": 0xFF0D, "tab": 0xFF09, "backspace": 0xFF08,
-    "escape": 0xFF1B, "space": ord(" "),
+    "escape": 0xFF1B, "space": ord(" "), "grave": ord("`"),
+    "left": 0xFF51, "up": 0xFF52, "right": 0xFF53, "down": 0xFF54,
 }
 
 
@@ -33,6 +35,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--window", type=int, default=0)
+    parser.add_argument(
+        "--key-window", action="store_true",
+        help=("leave the protocol window identifier at zero so the target "
+              "application resolves its current AppKit keyWindow"),
+    )
     parser.add_argument("--width", type=int, required=True)
     parser.add_argument("--height", type=int, required=True)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -50,11 +57,13 @@ def main():
     parser.add_argument("--socket",
                         default="/var/mnt/rootfs/private/tmp/macws_host_input.sock")
     args = parser.parse_args()
+    if args.key_window and args.window != 0:
+        parser.error("--key-window cannot be combined with --window")
     if (args.pid <= 1 or args.width <= 0 or args.height <= 0 or
             args.interval < 0 or args.hold < 0):
         parser.error(
             "pid/geometry must be positive and timing values nonnegative")
-    window = resolve_window(args.pid, args.window)
+    window = 0 if args.key_window else resolve_window(args.pid, args.window)
     modifiers = (MOD_COMMAND if args.command else 0) | \
         (MOD_CONTROL if args.control else 0) | \
         (MOD_SHIFT if args.shift else 0) | \

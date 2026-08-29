@@ -71,12 +71,22 @@ if [ -n "$steam_installed_version" ] &&
         echo "Steam installed/pending manifests match version $steam_installed_version; launching verified installed client"
         export STEAM_APP_BUNDLE_PATH="$steam_installed_bundle"
         cd "$steam_installed_root" || exit 1
+        # RE-confirmed in this exact arm64 steamclient.dylib at cstring
+        # +0x1666a0e: Valve registers `-nojoy` with the description
+        # "Disable controller support". Runtime sampling of the production
+        # Steam Helper showed CGamepadAPITask::Run issuing sem_trywait broker
+        # requests about 83 times/second even though all SDL controller
+        # backends were disabled. Magic Keyboard mouse/keyboard input travels
+        # through AppKit/CGEvent, so use Valve's own controller policy at the
+        # Steam-client boundary instead of weakening semaphore correctness.
         exec ./steam_osx -no-cef-sandbox -cef-disable-gpu-sandbox \
-            -cef-disable-gpu -nobootstrapperupdate -skipinitialbootstrap \
+            -cef-disable-gpu -nojoy \
+            -nobootstrapperupdate -skipinitialbootstrap \
             -noverifyfiles "$@"
     fi
 fi
 
 exec ./steam_osx -no-cef-sandbox -cef-disable-gpu-sandbox \
-    -cef-disable-gpu -nobootstrapperupdate -skipinitialbootstrap \
+    -cef-disable-gpu -nojoy \
+    -nobootstrapperupdate -skipinitialbootstrap \
     -noverifyfiles "$@"

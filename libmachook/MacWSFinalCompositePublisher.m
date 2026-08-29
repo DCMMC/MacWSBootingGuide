@@ -6,6 +6,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/bootstrap.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -16,6 +17,7 @@
 #include "macws_final_composite_protocol.h"
 
 extern void MacWSHideNativeCursorAfterFirstComposite(void);
+extern pid_t audit_token_to_pid(audit_token_t token);
 
 static _Atomic uint64_t PublishedSequence;
 static _Atomic bool ContentValidated;
@@ -25,11 +27,34 @@ static uint64_t ServiceRefreshDeadlineNS;
 static _Atomic uint32_t FailureWitnesses;
 static _Atomic uint32_t LookupWitnesses;
 static NSObject *CompletionLock;
+static dispatch_once_t CompletionLockOnce;
 static id<MTLCommandBuffer> PendingCommand;
 static id<MTLTexture> PendingSourceTexture;
 static IOSurfaceRef PendingSurface;
 static uint32_t PendingPixelFormat;
 static _Atomic bool CompletionWorkerRunning;
+static id<MTLCommandBuffer> ReplayCommand;
+static id<MTLTexture> ReplaySourceTexture;
+static uint32_t ReplayPixelFormat;
+static uint64_t ReplaySourceCompletionTime;
+static mach_port_t ReplayReceivePort = MACH_PORT_NULL;
+static pthread_mutex_t ReplayReceiverLock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic bool ReplayReceiverStarted;
+static _Atomic uint32_t ReplayFailureWitnesses;
+static pthread_mutex_t ReplayWorkLock = PTHREAD_MUTEX_INITIALIZER;
+static pid_t PendingReplayRequesterPID;
+static uint64_t PendingReplayMinimumCompletionTime;
+static bool ReplayWorkScheduled;
+static _Atomic uint64_t ReplayReceivedRequests;
+
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
+extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+
+static void StartReplayRequestReceiver(void);
+static bool SnapshotAndPublish(id<MTLCommandBuffer> completedCommand,
+                               id<MTLTexture> sourceTexture,
+                               uint32_t pixelFormat,
+                               uint64_t minimumCompletionTime);
 
 // The SkyLight display target is intentionally reused by WindowServer. A
 // completion callback proves that one render finished, but it does not stop a
@@ -77,6 +102,21 @@ static uint64_t MonotonicNanoseconds(void) {
     struct timespec now = {0};
     return clock_gettime(CLOCK_MONOTONIC, &now) == 0
         ? (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec : 0;
+}
+
+static uint64_t MachDurationNanoseconds(uint64_t ticks) {
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        if (mach_timebase_info(&timebase) != KERN_SUCCESS ||
+            timebase.numer == 0 || timebase.denom == 0) {
+            timebase.numer = 1;
+            timebase.denom = 1;
+        }
+    });
+    __uint128_t nanoseconds = (__uint128_t)ticks * timebase.numer /
+        timebase.denom;
+    return nanoseconds > UINT64_MAX ? UINT64_MAX : (uint64_t)nanoseconds;
 }
 
 // Returns a caller-owned reference. CachedService remains an independent
@@ -147,6 +187,7 @@ static mach_msg_return_t SendMessage(
 
 void MacWSFinalCompositePublisherMarkContentValidated(void) {
     atomic_store_explicit(&ContentValidated, true, memory_order_release);
+    StartReplayRequestReceiver();
     MacWSHideNativeCursorAfterFirstComposite();
 }
 
@@ -162,6 +203,7 @@ bool MacWSFinalCompositePublisherPublishSurface(
         IOSurfaceRef surface, uint32_t metalPixelFormat) {
     if (!surface || metalPixelFormat !=
             MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM) return false;
+    StartReplayRequestReceiver();
 
     size_t width = IOSurfaceGetWidth(surface);
     size_t height = IOSurfaceGetHeight(surface);
@@ -266,6 +308,20 @@ static dispatch_queue_t CompletionQueue(void) {
     return queue;
 }
 
+static dispatch_queue_t ReplayQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // Replay snapshotting can wait on AGX. Keep that work off the
+        // permanent Mach receive thread, and coalesce topology bursts before
+        // they reach this serial queue.
+        queue = dispatch_queue_create(
+            "com.macwsguide.final-composite-replay",
+            DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
 static id RetainObject(id object) {
 #if __has_feature(objc_arc)
     return object;
@@ -280,6 +336,11 @@ static void ReleaseObject(id object) {
 #else
     [object release];
 #endif
+}
+
+static NSObject *PublisherStateLock(void) {
+    dispatch_once(&CompletionLockOnce, ^{ CompletionLock = [NSObject new]; });
+    return CompletionLock;
 }
 
 static void ResetSnapshotSlot(MacWSFinalCompositeSnapshotSlot *slot) {
@@ -369,7 +430,8 @@ static MacWSFinalCompositeSnapshotSlot *AcquireSnapshotSlot(
 
 static bool SnapshotAndPublish(id<MTLCommandBuffer> completedCommand,
                                id<MTLTexture> sourceTexture,
-                               uint32_t pixelFormat) {
+                               uint32_t pixelFormat,
+                               uint64_t minimumCompletionTime) {
     if (!completedCommand || !sourceTexture ||
         pixelFormat != MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM)
         return false;
@@ -413,10 +475,287 @@ static bool SnapshotAndPublish(id<MTLCommandBuffer> completedCommand,
         SnapshotLogFailure("copy-completion", copyCommand);
         return false;
     }
+    // This copy is submitted on the retained source command's queue. Metal's
+    // queue ordering makes its completion the causal freshness witness: it is
+    // after every desktop update already submitted when the replay request
+    // arrived. The remembered source command may legitimately be old on a
+    // static desktop, but the newly completed copy is not.
+    uint64_t snapshotCompletionTime = mach_absolute_time();
+    if (minimumCompletionTime != 0 &&
+        snapshotCompletionTime < minimumCompletionTime) {
+        SnapshotLogFailure("copy-freshness", copyCommand);
+        return false;
+    }
     bool published = MacWSFinalCompositePublisherPublishSurface(
         slot->surface, pixelFormat);
     if (published) slot->lastPublishedNS = MonotonicNanoseconds();
     return published;
+}
+
+static BOOL ReplayRequesterIsDisplayd(pid_t pid) {
+    if (pid <= 1) return NO;
+    char path[PATH_MAX] = {0};
+    int length = proc_pidpath(pid, path, sizeof(path));
+    if (length > 0 && length < (int)sizeof(path)) {
+        path[sizeof(path) - 1] = '\0';
+        if (strcmp(path, "/usr/local/bin/macwsdisplayd") == 0 ||
+            strcmp(path,
+                   "/var/mnt/rootfs/usr/local/bin/macwsdisplayd") == 0)
+            return YES;
+    }
+    // Runtime-confirmed from the native root context on 2026-08-22:
+    // `pid=37829 name=macwsdisplayd path=<unavailable>`. Cross-chroot vnode
+    // resolution is therefore not a valid admission prerequisite. The Mach
+    // audit trailer still binds this exact PID to the sender; use the bounded
+    // kernel command name only when the preferred full path is unavailable.
+    char name[64] = {0};
+    int nameLength = proc_name(pid, name, sizeof(name));
+    return nameLength > 0 && nameLength < (int)sizeof(name) &&
+        strcmp(name, "macwsdisplayd") == 0;
+}
+
+static uint32_t NextReplayFailureWitness(void) {
+    return atomic_fetch_add_explicit(
+        &ReplayFailureWitnesses, 1, memory_order_relaxed) + 1;
+}
+
+static void RememberReplaySource(id<MTLCommandBuffer> command,
+                                 id<MTLTexture> sourceTexture,
+                                 uint32_t pixelFormat) {
+    if (!command || !sourceTexture || pixelFormat !=
+            MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM) return;
+    id retainedCommand = RetainObject(command);
+    id retainedSource = RetainObject(sourceTexture);
+    @synchronized (PublisherStateLock()) {
+        id oldCommand = ReplayCommand;
+        id oldSource = ReplaySourceTexture;
+        ReplayCommand = retainedCommand;
+        ReplaySourceTexture = retainedSource;
+        ReplayPixelFormat = pixelFormat;
+        ReplaySourceCompletionTime = mach_absolute_time();
+        ReleaseObject(oldCommand);
+        ReleaseObject(oldSource);
+    }
+}
+
+static void PublishReplaySnapshot(pid_t requesterPID,
+                                  uint64_t minimumCompletionTime) {
+    id<MTLCommandBuffer> command = nil;
+    id<MTLTexture> sourceTexture = nil;
+    uint32_t pixelFormat = 0;
+    uint64_t sourceCompletionTime = 0;
+    @synchronized (PublisherStateLock()) {
+        command = RetainObject(ReplayCommand);
+        sourceTexture = RetainObject(ReplaySourceTexture);
+        pixelFormat = ReplayPixelFormat;
+        sourceCompletionTime = ReplaySourceCompletionTime;
+    }
+    uint64_t sourceLagNS = sourceCompletionTime < minimumCompletionTime
+        ? MachDurationNanoseconds(
+            minimumCompletionTime - sourceCompletionTime) : 0;
+    BOOL sourceFresh = sourceCompletionTime >= minimumCompletionTime;
+    BOOL sourceReady = command && sourceTexture &&
+        command.status == MTLCommandBufferStatusCompleted &&
+        command.error == nil && MacWSFinalCompositePublisherCanPublish();
+    // The copy command proves that the retained texture can still be read; it
+    // does not prove that SkyLight rendered the topology change which caused
+    // this replay request.  Re-copying an older texture advances the transport
+    // sequence and completion timestamp while preserving stale desktop pixels.
+    // Require the remembered compositor source itself to postdate the caller's
+    // mutation witness.  A wedged WindowServer will now leave displayd in its
+    // typed fallback state, allowing Repair Desktop to rebuild the session
+    // instead of falsely reporting success from a replayed old frame.
+    BOOL published = sourceReady && sourceFresh && SnapshotAndPublish(
+        command, sourceTexture, pixelFormat, minimumCompletionTime);
+    uint32_t witness = published ? 0 : NextReplayFailureWitness();
+    if (published || witness <= 12) {
+        dprintf(STDERR_FILENO,
+            "#### FINAL-COMPOSITE replay-request requester=%d "
+            "min-completion=%llu source-completion=%llu source=%s "
+            "source-lag-ns=%llu freshness=%s published=%s sequence=%llu\n",
+            requesterPID, (unsigned long long)minimumCompletionTime,
+            (unsigned long long)sourceCompletionTime,
+            sourceReady ? "ready" : "unavailable",
+            (unsigned long long)sourceLagNS,
+            published ? "source-fresh-replay-copy-completed"
+                : (!sourceReady ? "source-unavailable"
+                    : (!sourceFresh ? "source-stale"
+                                    : "replay-copy-failed")),
+            published ? "YES" : "NO",
+            (unsigned long long)MacWSFinalCompositePublisherPublishedSequence());
+    }
+    ReleaseObject(command);
+    ReleaseObject(sourceTexture);
+}
+
+static void DrainReplaySnapshotWork(void) {
+    for (;;) {
+        pid_t requesterPID = 0;
+        uint64_t minimumCompletionTime = 0;
+        pthread_mutex_lock(&ReplayWorkLock);
+        requesterPID = PendingReplayRequesterPID;
+        minimumCompletionTime = PendingReplayMinimumCompletionTime;
+        PendingReplayRequesterPID = 0;
+        PendingReplayMinimumCompletionTime = 0;
+        if (requesterPID <= 1 || minimumCompletionTime == 0) {
+            ReplayWorkScheduled = false;
+            pthread_mutex_unlock(&ReplayWorkLock);
+            return;
+        }
+        pthread_mutex_unlock(&ReplayWorkLock);
+        PublishReplaySnapshot(requesterPID, minimumCompletionTime);
+    }
+}
+
+static void ScheduleReplaySnapshot(pid_t requesterPID,
+                                   uint64_t minimumCompletionTime) {
+    bool startWorker = false;
+    pthread_mutex_lock(&ReplayWorkLock);
+    if (PendingReplayRequesterPID != requesterPID) {
+        // A displayd relaunch starts a new authenticated request generation;
+        // its startup minimum of 1 must not be shadowed by the old process's
+        // larger graph timestamp.
+        PendingReplayRequesterPID = requesterPID;
+        PendingReplayMinimumCompletionTime = minimumCompletionTime;
+    } else if (minimumCompletionTime >
+               PendingReplayMinimumCompletionTime) {
+        PendingReplayMinimumCompletionTime = minimumCompletionTime;
+    }
+    if (!ReplayWorkScheduled) {
+        ReplayWorkScheduled = true;
+        startWorker = true;
+    }
+    pthread_mutex_unlock(&ReplayWorkLock);
+    if (startWorker) {
+        dispatch_async(ReplayQueue(), ^{
+            DrainReplaySnapshotWork();
+        });
+    }
+}
+
+static void *ReplayReceiveThreadMain(void *context) {
+    (void)context;
+    pthread_setname_np("macws.final-replay-rx");
+    for (;;) {
+        @autoreleasepool {
+            _Alignas(8) uint8_t bytes[
+                sizeof(MacWSFinalCompositeReplayMachMessage) +
+                MAX_TRAILER_SIZE] = {0};
+            MacWSFinalCompositeReplayMachMessage *message =
+                (MacWSFinalCompositeReplayMachMessage *)bytes;
+            mach_msg_return_t received = mach_msg(
+                &message->header,
+                MACH_RCV_MSG |
+                    MACH_RCV_TRAILER_TYPE(MACH_MSG_TRAILER_FORMAT_0) |
+                    MACH_RCV_TRAILER_ELEMENTS(MACH_RCV_TRAILER_AUDIT),
+                0, sizeof(bytes), ReplayReceivePort,
+                MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+            if (received == MACH_RCV_INTERRUPTED) continue;
+            if (received != MACH_MSG_SUCCESS) {
+                uint32_t witness = NextReplayFailureWitness();
+                if (witness <= 12) {
+                    dprintf(STDERR_FILENO,
+                        "#### FINAL-COMPOSITE replay-receive-failed "
+                        "witness=%u kr=%d\n", witness, received);
+                }
+                break;
+            }
+
+            mach_msg_audit_trailer_t *trailer =
+                (mach_msg_audit_trailer_t *)(bytes +
+                    round_msg(message->header.msgh_size));
+            BOOL trailerValid = (uint8_t *)(trailer + 1) <=
+                    bytes + sizeof(bytes) &&
+                trailer->msgh_trailer_type == MACH_MSG_TRAILER_FORMAT_0 &&
+                trailer->msgh_trailer_size >= sizeof(*trailer);
+            pid_t senderPID = trailerValid
+                ? audit_token_to_pid(trailer->msgh_audit) : -1;
+            BOOL envelopeValid = message->header.msgh_id ==
+                    MACWS_FINAL_COMPOSITE_REPLAY_MACH_MESSAGE_ID &&
+                message->header.msgh_size == sizeof(*message) &&
+                !(message->header.msgh_bits & MACH_MSGH_BITS_COMPLEX) &&
+                trailerValid;
+            BOOL recordValid = MacWSFinalCompositeReplayRecordIsValid(
+                &message->record, sizeof(message->record));
+            BOOL identityValid = recordValid &&
+                message->record.requesterPID == senderPID &&
+                ReplayRequesterIsDisplayd(senderPID);
+            if (!envelopeValid || !identityValid) {
+                uint32_t witness = NextReplayFailureWitness();
+                if (witness <= 12) {
+                    dprintf(STDERR_FILENO,
+                        "#### FINAL-COMPOSITE replay-rejected witness=%u "
+                        "sender=%d envelope=%s record=%s identity=%s\n",
+                        witness, senderPID,
+                        envelopeValid ? "valid" : "invalid",
+                        recordValid ? "valid" : "invalid",
+                        identityValid ? "valid" : "invalid");
+                }
+                continue;
+            }
+            uint64_t receiveCount = atomic_fetch_add_explicit(
+                &ReplayReceivedRequests, 1, memory_order_relaxed) + 1;
+            if (receiveCount <= 12 || receiveCount % 64 == 0) {
+                dprintf(STDERR_FILENO,
+                    "#### FINAL-COMPOSITE replay-received count=%llu "
+                    "requester=%d min-completion=%llu\n",
+                    (unsigned long long)receiveCount, senderPID,
+                    (unsigned long long)
+                        message->record.minimumCompletionTime);
+            }
+            ScheduleReplaySnapshot(
+                senderPID, message->record.minimumCompletionTime);
+        }
+    }
+    return NULL;
+}
+
+static void StartReplayRequestReceiver(void) {
+    if (atomic_load_explicit(&ReplayReceiverStarted, memory_order_acquire))
+        return;
+    pthread_mutex_lock(&ReplayReceiverLock);
+    if (atomic_load_explicit(&ReplayReceiverStarted,
+                             memory_order_relaxed)) {
+        pthread_mutex_unlock(&ReplayReceiverLock);
+        return;
+    }
+    mach_port_t receivePort = MACH_PORT_NULL;
+    kern_return_t result = bootstrap_check_in(
+        bootstrap_port, MACWS_FINAL_COMPOSITE_REPLAY_MACH_SERVICE,
+        &receivePort);
+    if (result != BOOTSTRAP_SUCCESS || !MACH_PORT_VALID(receivePort)) {
+        uint32_t witness = NextReplayFailureWitness();
+        if (witness <= 12) {
+            dprintf(STDERR_FILENO,
+                "#### FINAL-COMPOSITE replay-check-in-failed "
+                "witness=%u service=%s kr=%#x port=%u\n", witness,
+                MACWS_FINAL_COMPOSITE_REPLAY_MACH_SERVICE, result,
+                receivePort);
+        }
+        pthread_mutex_unlock(&ReplayReceiverLock);
+        return;
+    }
+    ReplayReceivePort = receivePort;
+    pthread_t receiverThread;
+    int threadResult = pthread_create(&receiverThread, NULL,
+                                      ReplayReceiveThreadMain, NULL);
+    if (threadResult != 0) {
+        uint32_t witness = NextReplayFailureWitness();
+        dprintf(STDERR_FILENO,
+            "#### FINAL-COMPOSITE replay-thread-create-failed "
+            "witness=%u errno=%d port=%u\n", witness, threadResult,
+            receivePort);
+        pthread_mutex_unlock(&ReplayReceiverLock);
+        return;
+    }
+    (void)pthread_detach(receiverThread);
+    atomic_store_explicit(&ReplayReceiverStarted, true,
+                          memory_order_release);
+    dprintf(STDERR_FILENO,
+        "#### FINAL-COMPOSITE replay-receiver-ready service=%s port=%u "
+        "transport=pthread-blocking work=latest-coalesced\n",
+        MACWS_FINAL_COMPOSITE_REPLAY_MACH_SERVICE, receivePort);
+    pthread_mutex_unlock(&ReplayReceiverLock);
 }
 
 void MacWSFinalCompositePublisherEnqueueCompletion(
@@ -425,8 +764,7 @@ void MacWSFinalCompositePublisherEnqueueCompletion(
         uint32_t metalPixelFormat) {
     if (!commandBuffer || !sourceTexture || !surface || metalPixelFormat !=
             MACWS_FINAL_COMPOSITE_METAL_BGRA8_UNORM) return;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{ CompletionLock = [NSObject new]; });
+    (void)PublisherStateLock();
 
     id<MTLCommandBuffer> retainedCommand = RetainObject(commandBuffer);
     id<MTLTexture> retainedSource = RetainObject(sourceTexture);
@@ -478,6 +816,10 @@ void MacWSFinalCompositePublisherEnqueueCompletion(
                     polls++;
                 }
                 if (status == MTLCommandBufferStatusCompleted &&
+                    command.error == nil) {
+                    RememberReplaySource(command, sourceTexture, pixelFormat);
+                }
+                if (status == MTLCommandBufferStatusCompleted &&
                     command.error == nil &&
                     MacWSFinalCompositePublisherCanPublish()) {
                     if (DirectCompositeTransportRequested()) {
@@ -485,7 +827,7 @@ void MacWSFinalCompositePublisherEnqueueCompletion(
                             completedSurface, pixelFormat);
                     } else {
                         (void)SnapshotAndPublish(command, sourceTexture,
-                                                 pixelFormat);
+                                                 pixelFormat, 0);
                     }
                 }
                 ReleaseObject(command);

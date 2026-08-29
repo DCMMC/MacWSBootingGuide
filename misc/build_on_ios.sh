@@ -23,6 +23,16 @@ for arg in "$@"; do [ "$arg" = "--fast" ] && FAST=1; done
 for arg in "$@"; do [ "$arg" = "--fast-force" ] && FAST=1 && FAST_FORCE=1; done
 for arg in "$@"; do [ "$arg" = "--resume" ] && SKIP_CLEAN=1; done
 
+# MacWSWindowing is injected into arm64e SpringBoard. The iPad's lld emits
+# unauthenticated plain binds for __CFConstantStringClassReference; merely
+# enabling LC_DYLD_CHAINED_FIXUPS does not repair them. A full on-device build
+# must therefore package the Apple-ld64 artifact produced on the Mac and cached
+# by misc/deploy_macwswindowing.sh. Verify its whole-file hash before allowing
+# dpkg anywhere near SpringBoard.
+WINDOWING_CROSS_DIR=/var/jb/var/mobile/macws-cross-build
+WINDOWING_CROSS_BINARY="$WINDOWING_CROSS_DIR/MacWSWindowing.dylib"
+WINDOWING_CROSS_SHA="$WINDOWING_CROSS_DIR/MacWSWindowing.sha256"
+
 # Guardrail: FAST only copies libmachook.{arm64,arm64e}.dylib to the rootfs.
 # Any other build artefact (CydiaSubstrate tweak under TweakInject, iOS-side
 # binaries like launchdchrootexec / autosignd / MTLSimDriverHost, scripts in
@@ -75,9 +85,29 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" = "1" ]; then
     echo "==> FAST_FORCE: explicitly shipping libmachook only; non-libmachook changes are not packaged"
 fi
 
+# The FAST guardrail above may promote an incremental request to a full package
+# build. Perform this check only after that decision so no promoted build can
+# bypass the SpringBoard linker invariant.
+if [ "$FAST" != "1" ]; then
+    if [ ! -s "$WINDOWING_CROSS_BINARY" ] || [ ! -s "$WINDOWING_CROSS_SHA" ]; then
+        echo "Error: validated Apple-ld64 MacWSWindowing artifact is missing." >&2
+        echo "Run misc/deploy_macwswindowing.sh from the Mac before a full on-device build." >&2
+        exit 1
+    fi
+    windowing_expected_sha=$(sed -n '1s/[[:space:]].*//p' "$WINDOWING_CROSS_SHA")
+    windowing_actual_sha=$(sha256sum "$WINDOWING_CROSS_BINARY" | sed 's/[[:space:]].*//')
+    if [ -z "$windowing_expected_sha" ] || \
+       [ "$windowing_actual_sha" != "$windowing_expected_sha" ]; then
+        echo "Error: cached MacWSWindowing hash mismatch; refusing unsafe SpringBoard package." >&2
+        exit 1
+    fi
+    echo "==> SpringBoard linker invariant: validated cached Apple-ld64 MacWSWindowing"
+fi
+
 if [ "$FAST" != "1" ] && [ "$SKIP_CLEAN" != "1" ]; then
     echo "==> Cleaning previous build..."
-    make clean 2>/dev/null || true
+    make MACWS_WINDOWING_CROSS_PREBUILT="$WINDOWING_CROSS_BINARY" \
+        clean 2>/dev/null || true
 elif [ "$FAST" != "1" ]; then
     echo "==> RESUME mode: preserving successful objects from the interrupted full build"
 else
@@ -136,6 +166,7 @@ echo "==> Building..."
 # -O0 from STRIP=0.  FINALPACKAGE does not override that rule: common.mk picks
 # OPTFLAG=-O0 whenever stripping is disabled.  Pass -O2 explicitly so both a
 # full build and every later FAST incremental object use production codegen.
+PACKAGE_READY=0
 if [ "$FAST" = "1" ]; then
     # The aggregate Makefile walks every subproject even when FAST will ship
     # only libmachook.  Build the library subproject directly while preserving
@@ -147,8 +178,18 @@ if [ "$FAST" = "1" ]; then
         FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
         GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
 else
-    make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless \
-        GO_EASY_ON_ME=1 LIBMACHOOK_ON_DEVICE_BUILD=1
+    # Theos's package target already depends on compilation and staging. A
+    # separate aggregate `make` immediately before it caused Logos targets
+    # (notably Metal_hooks.x) to preprocess and compile twice, adding roughly
+    # two minutes of CPU heat without producing a different object. Build,
+    # stage and package in one dependency graph, then verify the resulting
+    # binary below before dpkg sees it.
+    echo "==> Building, staging, and packaging in one pass..."
+    make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+        THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+        LIBMACHOOK_ON_DEVICE_BUILD=1 \
+        MACWS_WINDOWING_CROSS_PREBUILT="$WINDOWING_CROSS_BINARY" package
+    PACKAGE_READY=1
 fi
 
 if [ "$FAST" != "1" ]; then
@@ -165,12 +206,17 @@ if [ "$FAST" != "1" ]; then
         '-[MacWSMetalView hasDirectSurfaceFrame]' \
         '-[MacWSMetalView hasFinalCompositeFrame]' \
         '-[MacWSMetalView configureStreamMode:windowID:]' \
+        '-[MacWSViewController repairDesktopAction]' \
         '-[MacWSViewController applyStatus:]'; do
         if ! nm -nm "$HOST_BINARY" 2>/dev/null | grep -Fq -- "$host_method"; then
             echo "Error: macPad Objective-C ABI contract missing $host_method" >&2
             exit 1
         fi
     done
+    if ! grep -Fqa -- 'repair-desktop' "$HOST_BINARY"; then
+        echo "Error: macPad Control Center is missing the repair-desktop operation" >&2
+        exit 1
+    fi
     echo "==> Host ABI invariant: packaged selector contract verified"
 fi
 
@@ -189,9 +235,14 @@ if [ "$FAST" = "1" ]; then
 fi
 
 if [ "$FAST" != "1" ]; then
-echo "==> Packaging..."
-make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
-	LIBMACHOOK_ON_DEVICE_BUILD=1 package
+if [ "$PACKAGE_READY" != "1" ]; then
+    # Only the FAST missing-object fallback reaches this branch.
+    echo "==> Packaging fallback..."
+    make FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \
+        THEOS_PACKAGE_SCHEME=rootless GO_EASY_ON_ME=1 \
+        LIBMACHOOK_ON_DEVICE_BUILD=1 \
+        MACWS_WINDOWING_CROSS_PREBUILT="$WINDOWING_CROSS_BINARY" package
+fi
 
 # Find the built .deb
 DEB=$(ls -t packages/*.deb 2>/dev/null | head -1)
@@ -203,6 +254,28 @@ fi
 echo "==> Installing $DEB..."
 sudo dpkg -i "$DEB"
 fi  # end !FAST
+
+if [ "$FAST" != "1" ]; then
+    # dpkg has already run layout/DEBIAN/postinst.  That transaction patches
+    # LC_BUILD_VERSION, splits/signs/trustcaches both libmachook slices and
+    # synchronizes the runtime into the mounted rootfs.  Repeating postinst
+    # here used to scan every installed application (including thousands of
+    # Office proofing-tool Mach-Os) a second time, add minutes of CPU heat, and
+    # needlessly change libmachook's just-trusted signatures again.
+    for installed_slice in \
+        /var/jb/usr/macOS/lib/libmachook.dylib \
+        /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
+        /var/mnt/rootfs/usr/local/lib/libmachook.dylib \
+        /var/mnt/rootfs/usr/local/lib/libmachook_arm64.dylib; do
+        [ -s "$installed_slice" ] || {
+            echo "Error: package postinst did not install $installed_slice" >&2
+            exit 1
+        }
+    done
+    echo "==> Full package postinst completed during dpkg; skipping duplicate scan"
+    echo "==> Done! Package installed successfully."
+    exit 0
+fi
 
 # Set the macOS build version on the FAT libmachook (both slices; equivalent to
 # vtool) — without this macOS dyld rejects the library as an iOS binary.

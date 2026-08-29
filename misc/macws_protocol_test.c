@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "macws_interop_protocol.h"
+#include "macws_composite_candidate_policy.h"
 #include "macws_display_geometry.h"
 #include "macws_final_composite_protocol.h"
 #include "macws_host_protocol.h"
@@ -16,6 +17,21 @@ static int Near(float lhs, float rhs) {
 }
 
 int main(void) {
+    assert(MacWSCompositeCandidateShouldReplace(
+        false, false, 0, false, 3983184));
+    // A larger offscreen target must not poison a later owned desktop target.
+    assert(MacWSCompositeCandidateShouldReplace(
+        true, false, 4255000, true, 3983184));
+    assert(!MacWSCompositeCandidateShouldReplace(
+        true, true, 3983184, false, 4255000));
+    // Within the same update, unowned fallbacks still select by area.
+    assert(MacWSCompositeCandidateShouldReplace(
+        true, false, 1000, false, 2000));
+    assert(!MacWSCompositeCandidateShouldReplace(
+        true, false, 2000, false, 1000));
+    // Later owned scanouts represent the later composite in the update.
+    assert(MacWSCompositeCandidateShouldReplace(
+        true, true, 3983184, true, 3983184));
     size_t physicalWidth = 0, physicalHeight = 0;
     assert(MacWSPhysicalDisplayExtent(1194.0, 834.0, 2.0, 8192,
                                       &physicalWidth, &physicalHeight));
@@ -24,8 +40,15 @@ int main(void) {
                                        &physicalWidth, &physicalHeight));
     assert(!MacWSPhysicalDisplayExtent(5000.0, 5000.0, 2.0, 8192,
                                        &physicalWidth, &physicalHeight));
+    assert(MacWSLayerCoversLogicalDisplay(
+        0.0, 0.0, 1194.0, 834.0, 0.0, 0.0, 1194.0, 834.0));
+    assert(MacWSLayerCoversLogicalDisplay(
+        -0.25, -0.25, 1194.25, 834.25,
+        0.0, 0.0, 1194.0, 834.0));
+    assert(!MacWSLayerCoversLogicalDisplay(
+        0.0, 0.0, 1194.0, 417.0, 0.0, 0.0, 1194.0, 834.0));
     assert(MACWS_INPUT_VERSION == 5u);
-    assert(MACWS_STREAM_VERSION == 7u);
+    assert(MACWS_STREAM_VERSION == 8u);
     assert(MACWS_FINAL_COMPOSITE_VERSION == 1u);
     assert(sizeof(MacWSFinalCompositeRecord) == 56);
     assert(sizeof(MacWSInputRecord) == 84);
@@ -75,6 +98,20 @@ int main(void) {
     assert(!MacWSShouldStartScrollMomentum(79.99, 0.0));
     assert(MacWSShouldStartScrollMomentum(80.0, 0.0));
     assert(MacWSShouldStartScrollMomentum(60.0, 60.0));
+    assert(Near((float)MacWSAppKitRotationDegreesForUIKitRadians(
+                    3.14159265358979323846 / 2.0), -90.0f));
+    assert(Near((float)MacWSAppKitRotationDegreesForUIKitRadians(
+                    -3.14159265358979323846 / 4.0), 45.0f));
+    assert(MacWSInputSupersedesPendingVisibilitySample(
+        MacWSInputKindHover, MacWSInputKindTap));
+    assert(MacWSInputSupersedesPendingVisibilitySample(
+        MacWSInputKindHover, MacWSInputKindSecondaryTap));
+    assert(!MacWSInputSupersedesPendingVisibilitySample(
+        MacWSInputKindScroll, MacWSInputKindTap));
+    assert(!MacWSInputSupersedesPendingVisibilitySample(
+        MacWSInputKindHover, MacWSInputKindTouchMove));
+    assert(MACWS_THREE_FINGER_CHORD_GRACE_SECONDS >= 0.08);
+    assert(MACWS_THREE_FINGER_CHORD_GRACE_SECONDS <= 0.15);
     assert(MacWSChooseDirectScrollAxis(2.0, 6.0) ==
            MacWSDirectScrollAxisVertical);
     assert(MacWSChooseDirectScrollAxis(6.0, 4.6) ==

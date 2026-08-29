@@ -119,7 +119,12 @@ variables. `MallocScribble` is explicitly forbidden.
   recreation therefore cannot alias an old Helper handle.
   `MACWS_STEAM_LAUNCH_EPOCH` is generated once by the packaged launch script
   and inherited across the updater/live-client process family; all Steam
-  tracing and exit-stop switches remain off.
+  tracing and exit-stop switches remain off.  The same job exports
+  `MACWS_STRAY_DISABLE_DISPLAY_SYNC=1`; libmachook applies it only after the
+  executable/UUID Stray gate and sets the public CAMetalLayer
+  `displaySyncEnabled` property to `NO` before calling the unchanged
+  `nextDrawable`.  A thermally valid actual-gameplay A/B measured 56.269
+  versus 53.6765 FPS at the same 1194x834 High/85% profile.
 - Submit rings, raw command dumps, lifecycle backtraces, method enumeration,
   PF550 experiments, XPC/RFB/JIT/IOSurface traces, unsafe readbacks and broad
   assert bypasses are off.
@@ -128,9 +133,12 @@ variables. `MallocScribble` is explicitly forbidden.
   process-visible root refnum; the RE and runtime witnesses are in
   [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md).
   FileCache/DesktopServices volume-map probes remain off in production.
-- The 100,000-us idle virtual-display interval temporarily changes to
-  16,667 us for one second after real VNC input. This is compatibility pacing,
-  not a hardware-vblank claim.
+- The 100,000-us idle virtual-display interval temporarily changes to 8,333 us
+  for one second after real Host/VNC input. A real Stray drawable presentation
+  selects 16,667 us for one second and refreshes that bounded lease while the
+  game keeps presenting; a stopped or wedged client naturally returns to the
+  cool idle cadence. This is compatibility pacing, not a hardware-vblank
+  claim.
 - Performance comparisons are valid only when the iOS thermal helper reports
   its startup and five-minute snapshots. Per current policy, only `critical`
   intervenes; `nominal`, `fair`, `serious`, numeric temperatures and missing
@@ -279,7 +287,7 @@ job; scored runs keep those synchronous logs off.
 |---|---|---|---|
 | `MacWSPerformanceHUDMode` (`NSUserDefaults`) | `0` | each Host Scene | `0` off, `1` compact, `2` full; off has one atomic fast-path check unless an explicit Reset-to-Export recording is active |
 | Apple system performance HUD | off | system-wide QuartzCore RenderServer | Control Center toggle uses CAPerfHUD-compatible Full level 5; `com.apple.QuartzCore.debug` is required |
-| `macwshost://performance-reset` | explicit | active Host Scene | clears all fixed rings and starts a new measurement generation |
+| `macwshost://performance-reset[?pid=<exact-app-pid>]` | explicit | active Host Scene | clears all fixed rings and starts a new measurement generation; the optional PID must have a live AppInput endpoint and prevents a passive/stale frontmost window from contaminating an automated score |
 | `macwshost://performance-snapshot` | explicit | active Host Scene | writes `latest.json` and a timestamped bounded archive |
 | `macwshost://performance-hud-{off,compact,full}` | off | active Host Scene | changes only the MacWS overlay |
 | `macwshost://system-performance-hud-{on,off}` | off | system-wide | selects Apple Full level 5 or clears flag `0x10000000` |

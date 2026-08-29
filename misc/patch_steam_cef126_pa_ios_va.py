@@ -40,6 +40,16 @@ EXPECTED_INPUT_SHA256S = {
     "343e02d60ca848927c031eea73f8a938e8e376d6a12fb08cdb0b9fc7b7bc9d5f",
 }
 
+# Code-signing rewrites Mach-O load commands and __LINKEDIT, so a whole-file
+# digest cannot identify an already-ported image after ldid has signed it.
+# The executable __text bytes are invariant across those signatures.  This
+# digest was produced by the complete 54,310-instruction transformation below
+# and is therefore both cheap to verify and strict enough to reject a partial
+# or updater-replaced port.
+EXPECTED_PATCHED_TEXT_SHA256 = (
+    "56c9c8a25a07f21c9311ef1b6d39e6766bed8217fd09b3952c267db79cd9fc8b"
+)
+
 OLD_POOL_BASE_MASK = 0xFFFFFFFC00000000  # ~(16 GiB - 1)
 NEW_POOL_BASE_MASK = 0xFFFFFFFE00000000  # ~(8 GiB - 1)
 EXPECTED_INLINED_MASK_COUNT = 54298
@@ -138,6 +148,15 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
         changed.append(offset)
         materialization_sites.append(offset)
 
+    patched_text_hash = hashlib.sha256(
+        data[text_offset:text_offset + text_size]
+    ).hexdigest()
+    if patched_text_hash != EXPECTED_PATCHED_TEXT_SHA256:
+        raise ValueError(
+            "patched __text SHA-256 "
+            f"{patched_text_hash}; expected {EXPECTED_PATCHED_TEXT_SHA256}"
+        )
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(data)
     shutil.copymode(input_path, output_path)
@@ -146,6 +165,7 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
         "uuid": image_uuid,
         "input_sha256": original_hash,
         "output_sha256": hashlib.sha256(data).hexdigest(),
+        "patched_text_sha256": patched_text_hash,
         "inlined_pool_masks": len(mask_sites),
         "pool_size_sites": [f"{x:#x}" for x in size_sites],
         "pool_base_mask_materializations": [
@@ -155,13 +175,69 @@ def patch(input_path: Path, output_path: Path) -> dict[str, object]:
     }
 
 
+def verify_patched(input_path: Path) -> dict[str, object]:
+    """Verify the exact executable port independently of its signature."""
+    data = bytearray(input_path.read_bytes())
+    image_uuid, text_address, text_size, text_offset = engine.parse_macho(data)
+    if image_uuid.lower() != EXPECTED_UUID:
+        raise ValueError(
+            f"unsupported CEF UUID {image_uuid}; expected {EXPECTED_UUID}"
+        )
+    if text_address != text_offset:
+        raise ValueError("manifest requires identical __text VM/file offsets")
+    text_hash = hashlib.sha256(
+        data[text_offset:text_offset + text_size]
+    ).hexdigest()
+    if text_hash != EXPECTED_PATCHED_TEXT_SHA256:
+        raise ValueError(
+            f"unported or partial __text SHA-256 {text_hash}; "
+            f"expected {EXPECTED_PATCHED_TEXT_SHA256}"
+        )
+
+    for offset in sorted(POOL_SIZE_SITES):
+        actual = engine.decode_move_wide(struct.unpack_from("<I", data, offset)[0])
+        if actual != 8 << 30:
+            raise ValueError(
+                f"ported size site {offset:#x}: got {actual!r}, expected 8 GiB"
+            )
+    for offset in sorted(POOL_BASE_MASK_MATERIALIZATIONS):
+        word = struct.unpack_from("<I", data, offset)[0]
+        immediate = engine.decode_logical_immediate(word)
+        opcode = (word >> 29) & 3
+        source_register = (word >> 5) & 31
+        if (immediate != NEW_POOL_BASE_MASK or opcode != 1 or
+                source_register != 31):
+            raise ValueError(
+                f"ported mask materialization {offset:#x}: "
+                f"unexpected word {word:#010x}"
+            )
+    return {
+        "profile": "Steam CEF 126.0.6478.183 arm64 / iPadOS VA",
+        "uuid": image_uuid,
+        "patched_text_sha256": text_hash,
+        "pool_size_gib": 8,
+        "status": "verified",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--verify-patched", action="store_true",
+        help="verify an already-ported arm64 slice without modifying it",
+    )
     parser.add_argument("input", type=Path)
-    parser.add_argument("output", type=Path)
+    parser.add_argument("output", type=Path, nargs="?")
     args = parser.parse_args()
     try:
-        manifest = patch(args.input, args.output)
+        if args.verify_patched:
+            if args.output is not None:
+                parser.error("--verify-patched does not accept an output path")
+            manifest = verify_patched(args.input)
+        else:
+            if args.output is None:
+                parser.error("output path is required when applying the port")
+            manifest = patch(args.input, args.output)
     except (OSError, ValueError, struct.error) as error:
         print(f"patch_steam_cef126_pa_ios_va: {error}", file=sys.stderr)
         return 1

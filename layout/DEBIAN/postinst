@@ -624,7 +624,7 @@ if [ -d "$ROOTFS/System/Library" ]; then
     # upgrade can therefore leave every executable sentinel valid while an old
     # secondary QuartzCore library remains installed. Provision and validate
     # it here so the first GUI launch after dpkg is never the repair boundary.
-    bash /var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh || exit 1
+    bash /var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh || exit 1
     echo 'Synchronized package runtime into the mounted macOS rootfs.'
 else
     echo 'macOS rootfs is not mounted; chroot runtime sync deferred.'

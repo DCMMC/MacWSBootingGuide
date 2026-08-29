@@ -115,7 +115,7 @@ def test_app(remote, app, output, timeout):
     hostd_offset = remote.offset(hostd_log)
     screenshot_path = "/var/mobile/Library/Logs/MacWSHost-ui.png"
     began = time.monotonic()
-    remote.run(f"uiopen macwshost://{app}")
+    remote.run(f"uiopen --url macwshost://{app}")
 
     pid = 0
     metrics = None
@@ -144,7 +144,7 @@ def test_app(remote, app, output, timeout):
                 break
         time.sleep(0.35)
 
-    remote.run("uiopen macwshost://screenshot-ui")
+    remote.run("uiopen --url macwshost://screenshot-ui")
     time.sleep(0.8)
     screenshot = remote.read_binary(screenshot_path)
     screenshot_file = output / f"{app}.png"

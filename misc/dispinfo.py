@@ -17,6 +17,19 @@ class CGRect(ctypes.Structure):
 cg.CGDisplayBounds.restype = CGRect
 cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
 cg.CGMainDisplayID.restype = ctypes.c_uint32
+cg.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+cg.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+for fn in ["CGDisplayModeGetWidth", "CGDisplayModeGetHeight",
+           "CGDisplayModeGetPixelWidth", "CGDisplayModeGetPixelHeight"]:
+    getattr(cg, fn).restype = ctypes.c_size_t
+    getattr(cg, fn).argtypes = [ctypes.c_void_p]
+cg.CGDisplayModeGetRefreshRate.restype = ctypes.c_double
+cg.CGDisplayModeGetRefreshRate.argtypes = [ctypes.c_void_p]
+cg.CGDisplayModeGetIODisplayModeID.restype = ctypes.c_uint32
+cg.CGDisplayModeGetIODisplayModeID.argtypes = [ctypes.c_void_p]
+core_foundation = ctypes.CDLL(
+    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
 U32P = ctypes.POINTER(ctypes.c_uint32)
 for fn in ["CGGetActiveDisplayList", "CGGetOnlineDisplayList"]:
     getattr(cg, fn).argtypes = [ctypes.c_uint32, U32P, U32P]
@@ -39,8 +52,21 @@ for label, fn in [("ACTIVE", "CGGetActiveDisplayList"), ("ONLINE", "CGGetOnlineD
     print(f"=== {label} displays: err={err} count={len(lst)} ===")
     for d in lst:
         b = cg.CGDisplayBounds(d)
+        mode = cg.CGDisplayCopyDisplayMode(d)
+        if mode:
+            mode_description = (
+                f"mode={cg.CGDisplayModeGetWidth(mode)}x"
+                f"{cg.CGDisplayModeGetHeight(mode)} "
+                f"modePx={cg.CGDisplayModeGetPixelWidth(mode)}x"
+                f"{cg.CGDisplayModeGetPixelHeight(mode)} "
+                f"refresh={cg.CGDisplayModeGetRefreshRate(mode):.6f} "
+                f"ioMode={cg.CGDisplayModeGetIODisplayModeID(mode)}")
+            core_foundation.CFRelease(mode)
+        else:
+            mode_description = "mode=unavailable"
         print(f"  id={d} bounds=({b.origin.x:.0f},{b.origin.y:.0f} {b.size.width:.0f}x{b.size.height:.0f}) "
               f"px={cg.CGDisplayPixelsWide(d)}x{cg.CGDisplayPixelsHigh(d)} "
+              f"{mode_description} "
               f"main={cg.CGDisplayIsMain(d)} builtin={cg.CGDisplayIsBuiltin(d)} "
               f"active={cg.CGDisplayIsActive(d)} online={cg.CGDisplayIsOnline(d)} "
               f"mirrorOf={cg.CGDisplayMirrorsDisplay(d)} inMirrorSet={cg.CGDisplayIsInMirrorSet(d)} "

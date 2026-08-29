@@ -59,6 +59,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
     const char *boolKeys[] = {
         "ok", "busy", "rootfs_ready", "windowserver_running",
         "input_running", "frame_ready", "experimental_mode",
+        MACWS_CONTROL_KEY_SYSTEM_INPUT_READY,
         "app_input_ready", "startup_retry_available",
         "glassdemo_available", "terminal_available",
         "activity_monitor_available", "finder_available",
@@ -82,7 +83,7 @@ static NSDictionary<NSString *, id> *MacWSDictionaryFromReply(xpc_object_t reply
     }
     const char *intKeys[] = {
         "windowserver_pid", "input_pid", "active_app_pid",
-        "launched_app_pid",
+        "launched_app_pid", MACWS_CONTROL_KEY_SYSTEM_INPUT_PID,
     };
     for (NSUInteger i = 0; i < sizeof(intKeys) / sizeof(intKeys[0]); i++) {
         xpc_object_t value = xpc_dictionary_get_value(reply, intKeys[i]);

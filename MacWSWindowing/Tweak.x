@@ -996,8 +996,10 @@ __attribute__((constructor)) static void MacWSDenseGridLoadedWitness(void) {
     // was NOT constructor timing: SpringBoard-2026-08-04-124439.ips reproduced
     // the same CFHash trap from the main queue and its register dump proved the
     // on-device arm64e linker emitted a malformed constant-object class
-    // pointer.  MacWSWindowing/Makefile now prevents that unsafe slice from
-    // being produced on-device.
+    // pointer. SpringBoard-2026-08-28-001431.ips proved that -fixup_chains
+    // alone still emits plain, unauthenticated __cfstring binds. The packaging
+    // invariant now replaces the on-device intermediate with an Apple-ld64
+    // cross-build whose __cfstring class references are auth-bind/key=DA.
     unlink(MacWSDenseGridLoaded);
     dispatch_async_f(dispatch_get_main_queue(), NULL,
                      MacWSInstallRequestObservers);

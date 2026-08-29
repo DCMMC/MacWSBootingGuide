@@ -28,10 +28,21 @@ extern kern_return_t bootstrap_register(
 // numeric IOSurface ID remains diagnostic metadata; cross-task ownership is
 // carried only by the port descriptor.
 #define MACWS_CATALYST_DRAWABLE_MAGIC 0x4d574344u /* "MWCD" */
-#define MACWS_CATALYST_DRAWABLE_VERSION 1u
+#define MACWS_CATALYST_DRAWABLE_VERSION 2u
 #define MACWS_CATALYST_DRAWABLE_MACH_SERVICE \
     "com.macwsguide.catalyst-drawable"
 #define MACWS_CATALYST_DRAWABLE_MACH_MESSAGE_ID 0x4d574344
+
+typedef uint32_t MacWSCatalystDrawableFlags;
+enum {
+    // The producer incremented the IOSurface cross-process use count before
+    // sending this record.  A receiver that accepts the frame adopts that
+    // exact count and must decrement it only after its last GPU reference has
+    // completed.  This closes the old race where CAMetalLayer recycled a
+    // drawable while Host was still sampling it, producing mixed old/new
+    // tiles.  Rejected deliveries return the count synchronously.
+    MacWSCatalystDrawableTransfersUseCount = 1u << 0,
+};
 
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -46,7 +57,7 @@ typedef struct __attribute__((packed)) {
     uint32_t bytesPerRow;
     uint32_t ioSurfacePixelFormat;
     uint32_t metalPixelFormat;
-    uint32_t reserved;
+    uint32_t flags;
 } MacWSCatalystDrawableRecord;
 
 typedef struct {
@@ -60,11 +71,14 @@ static inline bool MacWSCatalystDrawableRecordIsValid(
         const MacWSCatalystDrawableRecord *record, size_t byteCount) {
     if (!record || byteCount != sizeof(*record) ||
         record->magic != MACWS_CATALYST_DRAWABLE_MAGIC ||
-        record->version != MACWS_CATALYST_DRAWABLE_VERSION ||
+        (record->version != 1u &&
+         record->version != MACWS_CATALYST_DRAWABLE_VERSION) ||
         record->size != sizeof(*record) || record->ownerPID <= 1 ||
         record->surfaceID == 0 || record->width == 0 ||
         record->height == 0 || record->width > 16384u ||
-        record->height > 16384u || record->bytesPerRow > 16384u * 16u)
+        record->height > 16384u || record->bytesPerRow > 16384u * 16u ||
+        (record->flags & ~MacWSCatalystDrawableTransfersUseCount) != 0 ||
+        (record->version == 1u && record->flags != 0))
         return false;
     return record->bytesPerRow >= record->width * 4u;
 }

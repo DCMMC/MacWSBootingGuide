@@ -12,13 +12,15 @@
         <string>0</string>
         <string>/var/mnt/rootfs</string>
         <string>/Applications/Visual Studio Code.app/Contents/MacOS/Electron</string>
-		<!-- targetfix13 started as a cache-clean control after targetfix12 ran
-		     a runtime-disproved broad type-5 command translation.  A subsequent
-		     empty-profile A/B disproved cache state as the primary completion
-		     failure and exposed the cold generation-0 command form.  Keep this
-		     benchmark profile isolated; never delete or rewrite the user's
-		     normal VS Code profile. -->
-		<string>--user-data-dir=/tmp/macws-vscode-profile-agx-native-targetfix13</string>
+		<!-- Runtime-confirmed on 2026-08-22: the native-Metal profile published
+		     a real visible NSWindow, but both the WindowServer and macPad captures
+		     showed black client pixels while the GPU helper repeatedly reported
+		     Completed MTLCommandBuffer failed / Internal Error 00000102/103.
+		     Use Chromium's supported software-compositing mode for this 2D editor
+		     instead of declaring a geometrically valid black window ready. Keep
+		     the profile isolated; never delete or rewrite the user's normal VS
+		     Code profile. -->
+		<string>--user-data-dir=/tmp/macws-vscode-profile-software-composite1</string>
         <string>--extensions-dir=/tmp/macws-vscode-extensions</string>
         <string>--disable-updates</string>
         <!-- launchdchrootexec already supplies the complete chroot HOME, USER,
@@ -30,16 +32,11 @@
              starting a second full Chromium instance. -->
         <string>--force-disable-user-env</string>
         <string>--no-sandbox</string>
-        <string>--disable-gpu-sandbox</string>
         <string>--remote-debugging-port=9222</string>
         <string>--remote-allow-origins=*</string>
-        <string>--use-angle=metal</string>
-        <string>--ignore-gpu-blocklist</string>
-        <!-- Skia Graphite is independent of WebGL/ANGLE.  Chromium 148's
-             Graphite pipeline compiler currently rejects its generated MSL
-             against the macOS 13/iOS 16 Metal stack, then Chromium disables
-             the whole GPU process after repeated exits.  Keep ANGLE Metal
-             enabled while isolating only Graphite. -->
+        <string>--disable-gpu</string>
+        <!-- Keep Graphite off as part of the explicit software compositor
+             contract; Skia's ordinary CPU raster path remains enabled. -->
         <string>--disable-features=SkiaGraphite</string>
         <!-- Keep Chromium's production JIT scheduling.  The W^X adapter now
              reports successful RX transitions without late retries, while a
@@ -53,12 +50,6 @@
         <string>1</string>
         <key>CA_DISABLE_SWAP_ICC</key>
         <string>1</string>
-        <key>MACWS_AGX_NATIVE</key>
-        <string>1</string>
-        <key>MACWS_AGX_REGISTER_CLASSES</key>
-        <string>1</string>
-        <key>MACWS_PIN_FALLBACK</key>
-        <string>1</string>
         <key>MACWS_JIT_MPROTECT_COMPAT</key>
         <string>1</string>
         <!-- iOS 16 cannot provide macOS MAP_JIT/APRR.  Keep the V8 CodeRange
@@ -71,8 +62,6 @@
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>
         <string>1</string>
         <key>MACWS_MACOS_SYSTEM_POLICY_COMPAT</key>
-        <string>1</string>
-        <key>MACWS_CHROMIUM_COMPOSITE_OVERLAYS</key>
         <string>1</string>
     </dict>
     <key>RunAtLoad</key>

@@ -54,6 +54,26 @@ typedef NS_ENUM(NSInteger, MacWSPerformanceHUDMode) {
                              receiptTime:(uint64_t)receiptTime;
 - (void)recordGeometryBatchReceived;
 
+// Records one producer-completed Catalyst CAMetalLayer drawable.  The
+// completion timestamp and monotonically increasing sequence originate in
+// the game process, so this cadence cannot be inflated by MacWSHost drawing
+// the same retained IOSurface more than once.
+- (void)recordDirectDrawableReceivedForOwnerPID:(int32_t)ownerPID
+                                        sequence:(uint64_t)sequence
+                                  completionTime:(uint64_t)completionTime
+                                     receiptTime:(uint64_t)receiptTime
+                                        isTarget:(BOOL)isTarget;
+
+// Call before -presentDrawable: for every direct drawable sampled by this
+// Host submission.  Repeated submissions of the same producer sequence are
+// coalesced; the resulting visible cadence counts only unique game frames
+// that reached an actual CAMetalDrawable presentation callback.
+- (void)recordDirectDrawableSubmissionForOwnerPID:(int32_t)ownerPID
+                                          sequence:(uint64_t)sequence
+                                      completionTime:(uint64_t)completionTime
+                                          isTarget:(BOOL)isTarget
+                                           drawable:(id<MTLDrawable>)drawable;
+
 // Call before -presentDrawable:. This registers Metal completion and actual
 // drawable-presentation handlers, so the result is visible-frame timing and
 // not merely command submission throughput.

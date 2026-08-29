@@ -67,6 +67,12 @@
 			<key>HideUntilCheckIn</key>
 			<true/>
 		</dict>
+		<!-- displayd is independently restartable. WindowServer owns this
+		     request port so a new receiver can ask for a fresh snapshot of the
+		     latest completed native composite instead of falling back to a
+		     per-window reconstruction that cannot preserve backdrop materials. -->
+		<key>com.macwsguide.windowserver.final-composite-replay</key>
+		<true/>
 	</dict>
 	<key>POSIXSpawnType</key>
 	<string>Interactive</string>

@@ -152,7 +152,7 @@ def flatten_type5_chain_for_decode(
 def flatten_fragmented_lists_for_decode(
     commands: bytes, segments: bytes
 ) -> tuple[bytes, bytes, str] | None:
-    """Flatten validated list fragments separated by type-5 signals."""
+    """Flatten validated vendor/event fragments for offline decoding."""
     if len(commands) < 0x100 or len(segments) < 0x60:
         return None
     token = u64(segments, 0)
@@ -167,6 +167,36 @@ def flatten_fragmented_lists_for_decode(
             return None
         count = u32(segments, list_cursor + 8)
         encoded = u32(segments, list_cursor + 0x0C)
+        if encoded in (0x40000001, 0xC0000001):
+            if count != 1 or list_cursor + 0x18 > len(segments):
+                return None
+            event_start = u32(segments, list_cursor + 0x10)
+            event_end = u32(segments, list_cursor + 0x14)
+            if not (
+                event_start == command_cursor
+                and event_end > event_start
+                and event_end <= len(commands)
+                and event_end - event_start <= 0x30
+                and (event_end - event_start) % 0x18 == 0
+            ):
+                return None
+            for event_offset in range(event_start, event_end, 0x18):
+                event_type = u32(commands, event_offset)
+                if not (
+                    event_type in (3, 4, 5, 6, 10)
+                    and u32(commands, event_offset + 4) == 0x18
+                    and u32(commands, event_offset + 8) != 0
+                    # RE-confirmed in mac_hooks.m from the macOS 13.4
+                    # IOGPUMTLEvent producer: type-5 +0x0c is unwritten
+                    # padding. _MTLSharedEvent type 3 writes zero there.
+                    and (event_type != 3 or
+                         u32(commands, event_offset + 0x0C) == 0)
+                ):
+                    return None
+            signal_count += 1
+            command_cursor = event_end
+            list_cursor += 0x18
+            continue
         terminal = bool(encoded & 0x80000000)
         chunk_length = encoded & 0x7FFFFFFF
         if count < 1 or count > 1024 or chunk_length < 0x30:
@@ -203,7 +233,7 @@ def flatten_fragmented_lists_for_decode(
                 start == command_cursor
                 and end > start
                 and end <= len(commands)
-                and u32(commands, start) == 0x10000
+                and u32(commands, start) in (0x10000, 0x10001)
                 and u32(commands, start + 4) == end - start
             ):
                 return None
@@ -219,38 +249,18 @@ def flatten_fragmented_lists_for_decode(
             if list_cursor != len(segments):
                 return None
             break
-        if list_cursor + 0x18 > len(segments):
-            return None
-        signal_list = list_cursor
-        signal_start = u32(segments, signal_list + 0x10)
-        signal_end = u32(segments, signal_list + 0x14)
-        signal_flags = u32(segments, signal_list + 0x0C)
-        expected_ordinal = signal_count + 1
-        if not (
-            u64(segments, signal_list) == token
-            and u32(segments, signal_list + 8) == 1
-            and signal_flags in (0x40000001, 0xC0000001)
-            and signal_start == command_cursor
-            and signal_end == signal_start + 0x18
-            and signal_end <= len(commands)
-            and u32(commands, signal_start) == 5
-            and u32(commands, signal_start + 4) == 0x18
-            and u32(commands, signal_start + 8) == expected_ordinal
-            and u32(commands, signal_start + 0x0C) in (0, 0x18)
-            and u32(commands, signal_start + 0x10) == 1
-            and u32(commands, signal_start + 0x14) == 0
-        ):
-            return None
-        signal_count += 1
-        command_cursor = signal_end
-        list_cursor += 0x18
-        if list_cursor == len(segments):
-            break
 
+    # Stray r23 serial 390 is the minimal valid member of this framing:
+    # event range, one vendor fragment, event range.  Its list walks exactly
+    # to the 0x1e0-byte boundary and its KCMD ranges cover 0..0x338 without a
+    # gap.  Requiring two vendor fragments made the offline decoder reject
+    # that captured producer even though every structural invariant above had
+    # passed.  This only changes offline evidence decoding; the runtime
+    # translator continues to use its own validation.
     if not (
-        fragment_count >= 2
+        fragment_count >= 1
         and signal_count >= 1
-        and len(entries) >= 2
+        and len(entries) >= 1
         and command_cursor == len(commands)
         and list_cursor == len(segments)
     ):
@@ -285,19 +295,81 @@ def flatten_fragmented_lists_for_decode(
     return direct_commands, bytes(direct_segments), description
 
 
+def interleaved_event_records(
+    commands: bytes, segments: bytes
+) -> list[tuple[int, int, int, int, int]]:
+    """Return neutral fields for validated 0x18-byte event-list ranges.
+
+    Event commands are load-bearing synchronization records, so the ordinary
+    direct-list view must not make them invisible during failure analysis.
+    Keep the two producer-specific dwords neutral: only the type-5 producer's
+    +0x0c padding and +0x10 value have independently been RE-confirmed.
+    """
+    if len(segments) < 0x10:
+        return []
+    token = u64(segments, 0)
+    cursor = 0
+    records: list[tuple[int, int, int, int, int]] = []
+    while cursor + 0x10 <= len(segments):
+        if u64(segments, cursor) != token:
+            return []
+        count = u32(segments, cursor + 8)
+        encoded = u32(segments, cursor + 0x0C)
+        if encoded in (0x40000001, 0xC0000001):
+            if count != 1 or cursor + 0x18 > len(segments):
+                return []
+            start = u32(segments, cursor + 0x10)
+            end = u32(segments, cursor + 0x14)
+            if (
+                end <= start
+                or end > len(commands)
+                or (end - start) % 0x18 != 0
+            ):
+                return []
+            for offset in range(start, end, 0x18):
+                if u32(commands, offset + 4) != 0x18:
+                    return []
+                records.append(
+                    (
+                        offset,
+                        u32(commands, offset),
+                        u32(commands, offset + 8),
+                        u32(commands, offset + 0x0C),
+                        u64(commands, offset + 0x10),
+                    )
+                )
+            cursor += 0x18
+            continue
+        chunk_length = encoded & 0x7FFFFFFF
+        if count < 1 or chunk_length < 0x30 or (
+            cursor + chunk_length > len(segments)
+        ):
+            return []
+        cursor += chunk_length
+        if encoded & 0x80000000:
+            break
+    return records if cursor == len(segments) else []
+
+
 def main() -> None:
     arguments = parse_arguments()
     raw_commands = arguments.kcmd.read_bytes()
     raw_segments = arguments.segments.read_bytes()
+    event_records = interleaved_event_records(raw_commands, raw_segments)
     commands = raw_commands
     segments = raw_segments
     if len(segments) < 0x10:
         raise ValueError("segment list is shorter than its 0x10-byte header")
 
     chain_description = None
+    chain_form = None
     flattened_chain = flatten_fragmented_lists_for_decode(commands, segments)
+    if flattened_chain is not None:
+        chain_form = "fragmented-list->direct"
     if flattened_chain is None:
         flattened_chain = flatten_type5_chain_for_decode(commands, segments)
+        if flattened_chain is not None:
+            chain_form = "type5-chain->direct"
     if flattened_chain is not None:
         commands, segments, chain_description = flattened_chain
 
@@ -339,11 +411,16 @@ def main() -> None:
     )
     if chain_description is not None:
         print(f"source_form={chain_description}")
+    for offset, event_type, event_id, word_0c, value in event_records:
+        print(
+            f"event kcmd={offset:#x} type={event_type:#x} "
+            f"id={event_id:#x} word0c={word_0c:#x} value={value:#x}"
+        )
     form_name = (
         "leading-wrapper"
         if leading_wrapper_list
         else (
-            "type5-chain->direct"
+            chain_form
             if chain_description is not None
             else ("direct" if direct_list else "trailing-wrapper")
         )

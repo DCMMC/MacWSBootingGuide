@@ -50,6 +50,11 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)requestWindowList;
 - (void)unsubscribe;
 - (void)releaseFrame:(MacWSSurfaceFrame *)frame;
+- (void)noteDirectDrawableForOwnerPID:(int32_t)ownerPID
+                        layerWindowID:(uint32_t)layerWindowID
+                                width:(uint32_t)width
+                               height:(uint32_t)height;
+- (void)clearDirectDrawableActivity;
 - (void)invalidate;
 @end
 

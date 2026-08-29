@@ -148,6 +148,95 @@ PY
 }
 # ── core sign + trustcache function ──────────────────────────────────────────
 
+# Steam validates gameoverlayrenderer*.dylib itself before creating the game
+# process. Replacing Valve's embedded CMS signature with an ad-hoc CodeDirectory
+# makes that validator fail and Steam maps the failure to AppError 49 before it
+# calls NSWorkspace. These two vendor dylibs ship without entitlements, so the
+# iOS kernel can admit their original bytes through the trustcache alone.
+# Keep the exception deliberately narrow: other third-party dylibs may carry
+# entitlements which iPadOS rejects on non-main images.
+macho_has_embedded_cms_signature() {
+    "$PYTHON" - "$1" <<'PY'
+import struct
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as stream:
+    data = stream.read()
+
+def slices(blob):
+    magic = blob[:4]
+    if magic in (b"\xca\xfe\xba\xbe", b"\xca\xfe\xba\xbf"):
+        count = struct.unpack_from(">I", blob, 4)[0]
+        width = 32 if magic == b"\xca\xfe\xba\xbf" else 20
+        for index in range(count):
+            entry = 8 + index * width
+            offset = struct.unpack_from(">Q" if width == 32 else ">I",
+                                        blob, entry + 8)[0]
+            size = struct.unpack_from(">Q" if width == 32 else ">I",
+                                      blob, entry + (16 if width == 32 else 12))[0]
+            yield offset, size
+    else:
+        yield 0, len(blob)
+
+def has_cms(blob, base, size):
+    magic = blob[base:base + 4]
+    if magic == b"\xcf\xfa\xed\xfe":
+        endian, header_size = "<", 32
+    elif magic == b"\xfe\xed\xfa\xcf":
+        endian, header_size = ">", 32
+    elif magic == b"\xce\xfa\xed\xfe":
+        endian, header_size = "<", 28
+    elif magic == b"\xfe\xed\xfa\xce":
+        endian, header_size = ">", 28
+    else:
+        return False
+    ncmds = struct.unpack_from(endian + "I", blob, base + 16)[0]
+    cursor = base + header_size
+    for _ in range(ncmds):
+        command, command_size = struct.unpack_from(endian + "II", blob, cursor)
+        if command == 0x1d:  # LC_CODE_SIGNATURE
+            dataoff, datasize = struct.unpack_from(endian + "II", blob, cursor + 8)
+            signature = base + dataoff
+            if signature + datasize > base + size or datasize < 12:
+                return False
+            super_magic, _, count = struct.unpack_from(">III", blob, signature)
+            if super_magic != 0xfade0cc0:
+                return False
+            for index in range(count):
+                slot, offset = struct.unpack_from(">II", blob,
+                                                  signature + 12 + index * 8)
+                if slot != 0x10000:  # CSSLOT_SIGNATURE / CMS wrapper
+                    continue
+                cms_magic, cms_size = struct.unpack_from(">II", blob,
+                                                         signature + offset)
+                return cms_magic == 0xfade0b01 and cms_size > 8
+            return False
+        if command_size < 8:
+            return False
+        cursor += command_size
+    return False
+
+found = False
+for base, size in slices(data):
+    found = True
+    if not has_cms(data, base, size):
+        raise SystemExit(1)
+raise SystemExit(0 if found else 1)
+PY
+}
+
+is_vendor_signed_steam_overlay() {
+    local f="$1"
+    case "$f" in
+        */Steam.AppBundle/Steam/Contents/MacOS/gameoverlayrenderer.dylib|\
+        */Steam.AppBundle/Steam/Contents/MacOS/gameoverlayrenderer32.dylib)
+            macho_has_embedded_cms_signature "$f"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 sign_one() {
     local f="$1"
     local effective_ent="$SIGN_ENT"
@@ -162,6 +251,35 @@ sign_one() {
         else
             is_executable=0
         fi
+    fi
+
+    if [ "$SIGN_PROFILE" = third-party-nonplatform ] &&
+       [ "$is_executable" -eq 0 ] &&
+       is_vendor_signed_steam_overlay "$f"; then
+        local preserved_added=0 preserved_existing=0 preserved_hash
+        for arch in arm64 arm64e x86_64; do
+            preserved_hash=$("$LDID" -arch "$arch" -h "$f" 2>/dev/null | \
+                grep 'CDHash=' | cut -c8- | tr '[:upper:]' '[:lower:]')
+            [ -n "$preserved_hash" ] || continue
+            if grep -qF "$preserved_hash" "$TC_CACHE" 2>/dev/null; then
+                preserved_existing=$((preserved_existing+1))
+            else
+                "$JBCTL" trustcache add "$preserved_hash" 2>/dev/null
+                printf '%s\n' "$preserved_hash" >> "$TC_CACHE"
+                preserved_added=$((preserved_added+1))
+            fi
+        done
+        if [ "$preserved_added" -gt 0 ]; then
+            inc_counter 1
+            printf '  +trust-vendor  %s\n' "$(basename "$f")"
+        elif [ "$preserved_existing" -gt 0 ]; then
+            inc_counter 2
+            printf '  keep-vendor    %s\n' "$(basename "$f")"
+        else
+            inc_counter 4
+            printf '  noarch         %s\n' "$f"
+        fi
+        return 0
     fi
 
     if current_file_is_trusted "$f" &&
@@ -288,11 +406,12 @@ for base, _, names in os.walk(sys.argv[1]):
 
 # Steam's bootstrapper owns a second integrity database in addition to the
 # Mach-O code signature. Each line in package/*.installed stores
-# relative-path,size,mtime,CRC32. Re-signing a binary is required before the
-# iOS kernel will admit it into the macOS chroot, but that legitimate signature
-# change also changes all four recorded values. On the next launch Steam then
-# restores Valve's original binary, whose macOS signature the iOS kernel kills,
-# creating an updater -> AMFI -> updater loop.
+# relative-path,size,mtime,CRC32. Most executable images need the MacWS
+# compatibility signature before the iOS kernel will admit them into the macOS
+# chroot. The overlay dylibs above retain Valve's CMS signature and enter via
+# the trustcache without being rewritten. Re-signing every other binary changes
+# all four recorded inventory values; without refreshing them, Steam can restore
+# Valve's original executable and create an updater -> AMFI -> updater loop.
 #
 # Update only records that already exist and whose current target is a Mach-O.
 # Non-code resources, package manifests, versions, and download hashes remain

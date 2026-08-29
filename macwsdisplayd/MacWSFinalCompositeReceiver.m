@@ -5,7 +5,10 @@
 #include <limits.h>
 #include <mach/bootstrap.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <stdatomic.h>
+#include <time.h>
+#include <unistd.h>
 
 extern pid_t audit_token_to_pid(audit_token_t token);
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
@@ -15,6 +18,10 @@ static mach_port_t ReceivePort = MACH_PORT_NULL;
 static _Atomic uint32_t RejectWitnesses;
 static MacWSFinalCompositeAcceptedHandler AcceptedHandler;
 static MacWSFinalCompositeReceiverLogHandler LogHandler;
+static dispatch_queue_t ReceiverQueue;
+static _Atomic bool FinalCompositeAccepted;
+static _Atomic uint64_t ReplayRequestGeneration;
+static _Atomic uint64_t ReplayMinimumCompletionTime;
 
 static void ReceiverLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 static void ReceiverLog(NSString *format, ...) {
@@ -154,17 +161,28 @@ static void ReceiveAvailableMessages(void) {
             IOSurfaceGetBytesPerRow(surface) == record.bytesPerRow &&
             (IOSurfaceGetPixelFormat(surface) == 0 ||
              IOSurfaceGetPixelFormat(surface) == record.ioSurfacePixelFormat);
-        if (surfaceValid) {
+        uint64_t requiredCompletionTime = atomic_load_explicit(
+            &ReplayMinimumCompletionTime, memory_order_acquire);
+        BOOL fresh = requiredCompletionTime == 0 ||
+            record.completionTime >= requiredCompletionTime;
+        if (surfaceValid && fresh) {
+            atomic_store_explicit(&FinalCompositeAccepted, true,
+                                  memory_order_release);
             if (AcceptedHandler) AcceptedHandler(surface, record);
         } else {
             uint32_t witness = NextRejectWitness();
             if (witness <= 8) {
-                ReceiverLog(@"final-composite-rejected stage=surface "
+                ReceiverLog(@"final-composite-rejected stage=%@ "
                             "witness=%u producer=%d sequence=%llu "
+                            "completion=%llu required=%llu fresh=%@ "
                             "expected=(%u %ux%u bpr=%u pf=%08x) "
                             "actual=(%u %zux%zu bpr=%zu pf=%08x)",
+                            surfaceValid ? @"freshness" : @"surface",
                             witness, senderPID,
                             (unsigned long long)record.sequence,
+                            (unsigned long long)record.completionTime,
+                            (unsigned long long)requiredCompletionTime,
+                            fresh ? @"YES" : @"NO",
                             record.surfaceID, record.width, record.height,
                             record.bytesPerRow, record.ioSurfacePixelFormat,
                             IOSurfaceGetID(surface), IOSurfaceGetWidth(surface),
@@ -177,6 +195,77 @@ static void ReceiveAvailableMessages(void) {
     }
 }
 
+static void RequestFinalCompositeReplay(unsigned attempt,
+                                        uint64_t generation) {
+    if (generation != atomic_load_explicit(
+            &ReplayRequestGeneration, memory_order_acquire)) return;
+    if (atomic_load_explicit(&FinalCompositeAccepted, memory_order_acquire))
+        return;
+    mach_port_t service = MACH_PORT_NULL;
+    kern_return_t lookup = bootstrap_look_up(
+        bootstrap_port, MACWS_FINAL_COMPOSITE_REPLAY_MACH_SERVICE,
+        &service);
+    mach_msg_return_t sent = MACH_SEND_INVALID_DEST;
+    if (lookup == BOOTSTRAP_SUCCESS && MACH_PORT_VALID(service)) {
+        MacWSFinalCompositeReplayMachMessage message = {0};
+        message.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+        message.header.msgh_size = sizeof(message);
+        message.header.msgh_remote_port = service;
+        message.header.msgh_local_port = MACH_PORT_NULL;
+        message.header.msgh_id =
+            MACWS_FINAL_COMPOSITE_REPLAY_MACH_MESSAGE_ID;
+        message.record = (MacWSFinalCompositeReplayRecord) {
+            .magic = MACWS_FINAL_COMPOSITE_REPLAY_MAGIC,
+            .version = MACWS_FINAL_COMPOSITE_REPLAY_VERSION,
+            .size = sizeof(MacWSFinalCompositeReplayRecord),
+            .requesterPID = getpid(),
+            .minimumCompletionTime = atomic_load_explicit(
+                &ReplayMinimumCompletionTime, memory_order_acquire),
+        };
+        sent = mach_msg(&message.header,
+                        MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                        sizeof(message), 0, MACH_PORT_NULL, 0,
+                        MACH_PORT_NULL);
+        (void)mach_port_deallocate(mach_task_self(), service);
+    }
+    ReceiverLog(@"final-composite-replay-request attempt=%u min-completion=%llu "
+                "lookup=%#x service=%u send=%d", attempt + 1,
+                (unsigned long long)atomic_load_explicit(
+                    &ReplayMinimumCompletionTime, memory_order_acquire),
+                lookup, service, sent);
+
+    // WindowServer and displayd are independent launchd jobs.  Retry only for
+    // a bounded startup window, and stop as soon as a validated final frame is
+    // accepted.  This is recovery traffic, never a frame clock.
+    static const int64_t retryDelaysNS[] = {
+        250 * NSEC_PER_MSEC,
+        750 * NSEC_PER_MSEC,
+        2 * NSEC_PER_SEC,
+        5 * NSEC_PER_SEC,
+    };
+    if (attempt < sizeof(retryDelaysNS) / sizeof(retryDelaysNS[0])) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     retryDelaysNS[attempt]),
+                       ReceiverQueue, ^{
+            RequestFinalCompositeReplay(attempt + 1, generation);
+        });
+    }
+}
+
+void MacWSRequestFinalCompositeReplay(uint64_t minimumCompletionTime) {
+    if (!ReceiverQueue || !ReceiveSource) return;
+    if (minimumCompletionTime == 0) minimumCompletionTime = 1;
+    atomic_store_explicit(&ReplayMinimumCompletionTime,
+                          minimumCompletionTime, memory_order_release);
+    uint64_t generation = atomic_fetch_add_explicit(
+        &ReplayRequestGeneration, 1, memory_order_acq_rel) + 1;
+    atomic_store_explicit(&FinalCompositeAccepted, false,
+                          memory_order_release);
+    dispatch_async(ReceiverQueue, ^{
+        RequestFinalCompositeReplay(0, generation);
+    });
+}
+
 BOOL MacWSStartFinalCompositeReceiver(
         dispatch_queue_t queue,
         MacWSFinalCompositeAcceptedHandler acceptedHandler,
@@ -184,6 +273,9 @@ BOOL MacWSStartFinalCompositeReceiver(
     if (!queue || ReceiveSource) return ReceiveSource != nil;
     AcceptedHandler = [acceptedHandler copy];
     LogHandler = [logHandler copy];
+    ReceiverQueue = queue;
+    atomic_store_explicit(&FinalCompositeAccepted, false,
+                          memory_order_release);
     mach_port_t receivePort = MACH_PORT_NULL;
     kern_return_t result = bootstrap_check_in(
         bootstrap_port, MACWS_FINAL_COMPOSITE_MACH_SERVICE, &receivePort);
@@ -201,5 +293,6 @@ BOOL MacWSStartFinalCompositeReceiver(
     dispatch_resume(ReceiveSource);
     ReceiverLog(@"final-composite receiver-ready service=%s port=%u",
                 MACWS_FINAL_COMPOSITE_MACH_SERVICE, receivePort);
+    MacWSRequestFinalCompositeReplay(1);
     return YES;
 }

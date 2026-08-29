@@ -23,6 +23,8 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 
 #include "macws_host_protocol.h"
 
@@ -336,6 +338,10 @@ typedef int32_t (*MacWSSLSConnectionGetPIDFn)(SLSConnectionID connection,
 typedef int32_t (*MacWSGetFrontProcessFn)(MacWSProcessSerialNumber *process);
 typedef int32_t (*MacWSGetProcessPIDFn)(const MacWSProcessSerialNumber *process,
                                        pid_t *pid);
+typedef int32_t (*MacWSGetProcessForPIDFn)(pid_t pid,
+                                           MacWSProcessSerialNumber *process);
+typedef int32_t (*MacWSSetFrontProcessWithOptionsFn)(
+    const MacWSProcessSerialNumber *process, uint32_t options);
 
 typedef struct {
     bool attempted;
@@ -404,6 +410,67 @@ static pid_t FrontUIProcessPID(void) {
         return 0;
     }
     return pid;
+}
+
+// The broker, rather than the inactive target application, owns the missing
+// cross-process Workspace transaction. Runtime-confirmed on 2026-08-20:
+// Steam's in-process repair returned ls-set=-54 and remained active=NO, while
+// macwsworkspacectl's public NSRunningApplication + HIServices transaction
+// activated the same PID and the next identical click opened Steam's Library
+// menu.  A follow-up isolated the two halves: HIServices alone returned 0 but
+// Steam still logged active-before=NO active-after=NO.  Keep the same ordering
+// as macwsworkspacectl: Workspace activation first, then the front-window
+// transaction. Neither path forges isActive/keyWindow or a control hit.
+static bool ActivateRunningApplication(pid_t pid) {
+    @autoreleasepool {
+        Class applicationClass = objc_getClass("NSRunningApplication");
+        if (!applicationClass) return false;
+        id (*runningApplication)(id, SEL, pid_t) =
+            (id (*)(id, SEL, pid_t))(void *)objc_msgSend;
+        id application = runningApplication(
+            (id)applicationClass,
+            sel_registerName("runningApplicationWithProcessIdentifier:"), pid);
+        if (!application) return false;
+        bool (*activate)(id, SEL, unsigned long) =
+            (bool (*)(id, SEL, unsigned long))(void *)objc_msgSend;
+        // NSApplicationActivateAllWindows | IgnoringOtherApps. Keep these
+        // public stable bit values local to avoid importing AppKit's umbrella
+        // headers, which conflict with Theos's legacy IOKit vendor headers.
+        return activate(application, sel_registerName("activateWithOptions:"),
+                        (1ul << 0) | (1ul << 1));
+    }
+}
+
+static int32_t ActivateFrontProcess(pid_t pid) {
+    static bool attempted;
+    static void *applicationServices;
+    static MacWSGetProcessForPIDFn getProcessForPID;
+    static MacWSSetFrontProcessWithOptionsFn setFrontProcessWithOptions;
+    if (!attempted) {
+        attempted = true;
+        getProcessForPID = (MacWSGetProcessForPIDFn)dlsym(
+            RTLD_DEFAULT, "GetProcessForPID");
+        setFrontProcessWithOptions =
+            (MacWSSetFrontProcessWithOptionsFn)dlsym(
+                RTLD_DEFAULT, "SetFrontProcessWithOptions");
+        if (!getProcessForPID || !setFrontProcessWithOptions) {
+            applicationServices = dlopen(
+                "/System/Library/Frameworks/ApplicationServices.framework/"
+                "ApplicationServices", RTLD_LAZY | RTLD_LOCAL);
+            if (applicationServices) {
+                getProcessForPID = (MacWSGetProcessForPIDFn)dlsym(
+                    applicationServices, "GetProcessForPID");
+                setFrontProcessWithOptions =
+                    (MacWSSetFrontProcessWithOptionsFn)dlsym(
+                        applicationServices, "SetFrontProcessWithOptions");
+            }
+        }
+    }
+    if (!getProcessForPID || !setFrontProcessWithOptions) return INT32_MIN;
+    MacWSProcessSerialNumber process = {0};
+    int32_t status = getProcessForPID(pid, &process);
+    if (status != 0) return status;
+    return setFrontProcessWithOptions(&process, (1u << 0) | (1u << 1));
 }
 
 // RE-confirmed against macOS 13.4 SkyLight:
@@ -479,6 +546,51 @@ static MacWSWindowTarget WindowServerRoutingTargetAtPoint(CGPoint point) {
     }
     CFRelease(response);
     return target;
+}
+
+// Final-composite presentation deliberately retires duplicate Dock capture
+// surfaces after their pixels have been folded into WindowServer's completed
+// desktop.  A fullscreen Host can therefore send a zero-target hardware-style
+// pointer record even though the live SLS route below resolves that point to
+// Dock.  Preserve the same GlobalSystemSurface contract used by a retained
+// displayd descriptor, but derive it from WindowServer's exact window/PID
+// tuple rather than guessing a process name from an unrelated process list.
+static bool WindowTargetIsDockSystemSurface(MacWSWindowTarget target) {
+    if (target.pid <= 1 || target.windowID <= 0) return false;
+    CFArrayRef windows = CGWindowListCopyWindowInfo(
+        MacWSCGWindowListOptionOnScreenOnly, 0);
+    if (!windows || CFGetTypeID(windows) != CFArrayGetTypeID()) {
+        if (windows) CFRelease(windows);
+        return false;
+    }
+    bool matches = false;
+    for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+        CFTypeRef value = CFArrayGetValueAtIndex(windows, index);
+        if (!value || CFGetTypeID(value) != CFDictionaryGetTypeID()) continue;
+        CFDictionaryRef window = (CFDictionaryRef)value;
+        CFNumberRef number = (CFNumberRef)CFDictionaryGetValue(
+            window, kCGWindowNumber);
+        CFNumberRef ownerPID = (CFNumberRef)CFDictionaryGetValue(
+            window, kCGWindowOwnerPID);
+        CFStringRef ownerName = (CFStringRef)CFDictionaryGetValue(
+            window, kCGWindowOwnerName);
+        int32_t windowID = 0;
+        int32_t pid = 0;
+        if (number && ownerPID && ownerName &&
+            CFGetTypeID(number) == CFNumberGetTypeID() &&
+            CFGetTypeID(ownerPID) == CFNumberGetTypeID() &&
+            CFGetTypeID(ownerName) == CFStringGetTypeID() &&
+            CFNumberGetValue(number, kCFNumberSInt32Type, &windowID) &&
+            CFNumberGetValue(ownerPID, kCFNumberSInt32Type, &pid) &&
+            windowID == target.windowID && pid == target.pid &&
+            CFStringCompare(ownerName, CFSTR("Dock"), 0) ==
+                kCFCompareEqualTo) {
+            matches = true;
+            break;
+        }
+    }
+    CFRelease(windows);
+    return matches;
 }
 
 // CGEventPost(kCGHIDEventTap) updates only the posting process's cursor state
@@ -1599,6 +1711,10 @@ int main(void) {
             gestureTarget = eventTarget;
         if (record.kind == MacWSInputKindActivateTarget)
             menuTarget = eventTarget;
+        bool resolvedDockSystemSurface =
+            record.targetPID <= 1 && exactWindowID == 0 &&
+            IsSystemPointerKind((MacWSInputKind)record.kind) &&
+            WindowTargetIsDockSystemSurface(eventTarget);
         uint64_t captureGeneration = ArmCaptureForInput(&record);
         // WindowTargetAtPoint resolves targetPID=0 producers (including RFB)
         // to an actual layer-zero AppKit window. Send that resolved PID on the
@@ -1606,6 +1722,16 @@ int main(void) {
         // SendToAppInputBridge reject it before sendto(2).
         MacWSInputRecord routedRecord = record;
         routedRecord.targetPID = eventTarget.pid;
+        if (resolvedDockSystemSurface) {
+            routedRecord.flags |= MacWSInputFlagGlobalSystemSurface;
+            if (RuntimeDiagnosticsEnabled()) {
+                fprintf(stderr,
+                    "MACWS-INPUT GLOBAL-SURFACE-INFER pid=%d window=%d "
+                    "source=live-sls-dock\n",
+                    eventTarget.pid, eventTarget.windowID);
+                fflush(stderr);
+            }
+        }
         // WindowTargetAtPoint resolved both halves of the destination.  The
         // per-process bridge reads its window identity from sceneID, so
         // forwarding only the resolved PID silently turns a precise
@@ -1619,6 +1745,8 @@ int main(void) {
                 MacWSInputModifiersForScene(record.sceneID));
         }
         size_t deactivated = 0;
+        bool workspaceActivationSucceeded = false;
+        int32_t publicActivationStatus = INT32_MIN;
         bool activationRepairNeeded =
             record.kind == MacWSInputKindActivateTarget &&
             eventTarget.pid > 1 &&
@@ -1639,6 +1767,12 @@ int main(void) {
             eventTarget.pid > 1 && record.frameHeight > 0 &&
             record.y >= 0.0f &&
             record.y <= (float)record.frameHeight * 0.04f;
+        if (record.kind == MacWSInputKindActivateTarget &&
+            eventTarget.pid > 1) {
+            workspaceActivationSucceeded =
+                ActivateRunningApplication(eventTarget.pid);
+            publicActivationStatus = ActivateFrontProcess(eventTarget.pid);
+        }
         if (activationRepairNeeded) {
             deactivated = DeactivateOtherAppInputBridges(
                 socketFD, eventTarget.pid, &record);
@@ -1654,7 +1788,9 @@ int main(void) {
              activationRepairNeeded || systemMenuPreflightNeeded);
         bool appBridgeSent = appBridgeAttempted &&
             SendToAppInputBridge(socketFD, &routedRecord, &appBridgeError);
-        if (globalSystemSurfaceRecord &&
+        bool effectiveGlobalSystemSurface =
+            globalSystemSurfaceRecord || resolvedDockSystemSurface;
+        if (effectiveGlobalSystemSurface &&
             (record.kind == MacWSInputKindSecondaryTap ||
              armSystemMenuCapture) && appBridgeSent &&
             eventTarget.pid > 1 && eventTarget.windowID > 0 &&
@@ -1708,13 +1844,17 @@ int main(void) {
             sequence++;
             if (RuntimeDiagnosticsEnabled()) fprintf(stderr,
                     "MACWS-INPUT ACTIVATE seq=%llu kind=%s target=%d "
-                    "window=%d repair=%s menu-preflight=%s deactivated=%zu "
+                    "window=%d repair=%s menu-preflight=%s workspace=%s "
+                    "hiservices=%d "
+                    "deactivated=%zu "
                     "sent=%s errno=%d\n",
                     (unsigned long long)sequence,
                     KindName((MacWSInputKind)record.kind),
                     eventTarget.pid, eventTarget.windowID,
                     activationRepairNeeded ? "YES" : "NO",
-                    systemMenuPreflightNeeded ? "YES" : "NO", deactivated,
+                    systemMenuPreflightNeeded ? "YES" : "NO",
+                    workspaceActivationSucceeded ? "YES" : "NO",
+                    publicActivationStatus, deactivated,
                     !appBridgeAttempted ? "SKIPPED" :
                         (appBridgeSent ? "YES" : "NO"), appBridgeError);
             if (RuntimeDiagnosticsEnabled()) fflush(stderr);

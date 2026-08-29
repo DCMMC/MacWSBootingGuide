@@ -484,6 +484,45 @@ static void DumpCompilerRequest(uint32_t sequence, uint64_t sourceHash,
                 requestSize - remaining, requestSize);
 }
 
+// Diagnostic-only, byte-for-byte request witness for non-source compiler
+// operations.  A scene transition can make the long-lived worker abort while
+// reading a binary module, after which launchd replays the same request into a
+// fresh worker.  Keep the first 64 inputs from each worker so that replayed
+// request is preserved without adding unbounded I/O to normal gameplay.  This
+// runs before any source-target adaptation and never changes the request.
+static void DumpRawCompilerRequest(uint32_t sequence, uintptr_t discriminator,
+                                   const void *request, size_t requestSize) {
+    if (!request || !requestSize || sequence > 64) return;
+    const char *directory = "/var/jb/var/mobile/mtlcompiler_requests";
+    mkdir(directory, 0755);
+    uint64_t requestHash = MacWSFNV1a64(request, requestSize);
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path),
+             "%s/raw-%d-%03u-%lx-%zu-%016llx.bin",
+             directory, getpid(), sequence,
+             (unsigned long)discriminator, requestSize,
+             (unsigned long long)requestHash);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        MTLPatchLog("raw compiler request #%u discriminator=%#lx dump open failed path=%s errno=%d",
+                    sequence, (unsigned long)discriminator, path, errno);
+        return;
+    }
+    const uint8_t *cursor = (const uint8_t *)request;
+    size_t remaining = requestSize;
+    while (remaining) {
+        ssize_t written = write(fd, cursor, remaining);
+        if (written <= 0) break;
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    close(fd);
+    MTLPatchLog("raw compiler request #%u discriminator=%#lx hash=%016llx dump=%s written=%zu/%zu",
+                sequence, (unsigned long)discriminator,
+                (unsigned long long)requestHash, path,
+                requestSize - remaining, requestSize);
+}
+
 // Read-only compiler-result witness.  MTLCompilerService's exact executable
 // reply block calls xpc_data_create at UUID-locked __TEXT+0x2770 with the
 // compiler result bytes and length.  The adapter redirects only that BL here,
@@ -567,6 +606,8 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                     head[8], head[9], head[10], head[11],
                     head[12], head[13], head[14], head[15]);
     }
+    if (diagnostics)
+        DumpRawCompilerRequest(sequence, a2, request, requestSize);
     bool adapted = false;
     bool needsCacheAdapter = false;
     if (request && requestSize >= 16 && a2 == 0xd) {
@@ -619,6 +660,25 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                 bool steamHelperRequest =
                     MacWSIsSteamHelperWorkingDirectoryToken(
                         bytes + workingOffset, tokenLength);
+                // Runtime-confirmed by request-3749-019 on 2026-08-19:
+                // Steam's in-game overlay compiles this source with nil
+                // MTLCompileOptions, so the request has no module-cache
+                // marker.  Its working directory is the prepared Stray
+                // runtime bundle, not Steam Helper.  Match the complete
+                // source/serialization tuple and exact directory before
+                // selecting the macOS target; unrelated iOS compiler traffic
+                // remains untouched.
+                static const char strayOverlayToken[] =
+                    "-working-directory \"/Users/root/Library/Application "
+                    "Support/Steam/steamapps/macws-runtime/Stray/Stray.app/"
+                    "Contents/Resources\"";
+                bool strayOverlayRequest =
+                    tokenLength == sizeof(strayOverlayToken) - 1 &&
+                    memcmp(bytes + workingOffset, strayOverlayToken,
+                           sizeof(strayOverlayToken) - 1) == 0 &&
+                    requestSize == 2390 && sourceLength == 2189 &&
+                    argumentLength == 182 &&
+                    sourceHash == UINT64_C(0xc9b090f289e24745);
                 // Reproducible package-asset builder for Steam's exact
                 // Chromium 126 / ANGLE 5d4df51 default shader source.  Public
                 // Metal always serializes the standalone probe's working
@@ -640,7 +700,7 @@ static uintptr_t MacWSMTLCodeGenServiceBuildRequest(
                     argumentLength == 90 &&
                     sourceHash == UINT64_C(0xa90e497bcdffdc8d);
                 if ((chrootCacheRequest || steamHelperRequest ||
-                     steamANGLEAssetBuild) &&
+                     strayOverlayRequest || steamANGLEAssetBuild) &&
                     tokenLength >= targetLength) {
                     memcpy(bytes + workingOffset, targetArgument,
                            targetLength);

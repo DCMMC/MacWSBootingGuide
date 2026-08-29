@@ -15,6 +15,14 @@
 #define MACWS_INPUT_ACK_VERSION 1u
 #define MACWS_INTERACTION_WAKE_SOCKET_PATH \
     "/private/tmp/macws_interaction_wake.sock"
+#define MACWS_RENDER_ACTIVITY_PATH \
+    "/private/tmp/macws_render_activity"
+#define MACWS_RENDER_ACTIVITY_MAGIC 0x4d575241u /* "MWRA" */
+#define MACWS_RENDER_ACTIVITY_VERSION 1u
+#define MACWS_DIRECT_DRAWABLE_ACTIVITY_PATH \
+    "/private/tmp/macws_direct_drawable_activity"
+#define MACWS_DIRECT_DRAWABLE_ACTIVITY_MAGIC 0x4d574441u /* "MWDA" */
+#define MACWS_DIRECT_DRAWABLE_ACTIVITY_VERSION 1u
 #define MACWS_VNC_ACTIVATION_REPLY_SOCKET_PATH \
     "/private/tmp/macws_vnc_activation_reply.sock"
 
@@ -24,6 +32,41 @@ typedef struct __attribute__((packed)) {
     uint32_t height;
     uint32_t stride;
 } MacWSFrameHeader;
+
+// A presenting application publishes both freshness and the cadence it can
+// actually consume.  The earlier timestamp-only file made WindowServer run a
+// fixed 60-Hz completion loop even when Stray was deliberately capped at
+// 50 FPS, and pointer activity temporarily raised that full-desktop loop to
+// 120 Hz.  Keep the record versioned so the consumer can reject torn or stale
+// data while retaining an explicit legacy timestamp fallback.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint64_t timestampNS;
+    uint32_t targetPaceUS;
+    uint32_t reserved;
+} MacWSRenderActivityRecord;
+
+// macwsdisplayd publishes this only after the Host's direct-drawable
+// heartbeat has matched a live, focused SkyLight layer carrying
+// AppInputBridge's FullscreenCanvas capability. The drawable may use the
+// game's configured render resolution rather than the desktop pixel size. It
+// lets
+// WindowServer pace the now-redundant physical desktop composite without
+// trusting a marker created by the game itself.  Freshness is monotonic and
+// fail-closed so a dead Host/display service naturally restores the ordinary
+// render cadence.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    uint64_t timestampNS;
+    int32_t ownerPID;
+    uint32_t layerWindowID;
+    uint32_t width;
+    uint32_t height;
+} MacWSDirectDrawableActivityRecord;
 
 typedef uint16_t MacWSInputKind;
 enum {

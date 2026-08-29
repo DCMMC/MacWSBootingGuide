@@ -7,8 +7,10 @@
 #import <xpc/xpc.h>
 #import <dlfcn.h>
 #import <execinfo.h>
+#import <math.h>
 #import <stdatomic.h>
 #import <stdarg.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -26,7 +28,13 @@
 #import <sysdir.h>
 
 #include "macws_catalyst_drawable_protocol.h"
+#include "macws_composite_candidate_policy.h"
+#include "macws_control_protocol.h"
+#include "macws_host_protocol.h"
 #import "MacWSFinalCompositePublisher.h"
+
+static BOOL macws_macho_has_uuid(const struct mach_header *header,
+                                 const uint8_t expected[16]);
 
 typedef void (*macws_present_drawable_fn)(id, SEL, id);
 typedef void (*macws_present_drawable_timed_fn)(id, SEL, id, CFTimeInterval);
@@ -44,9 +52,450 @@ static _Atomic uint64_t macws_catalyst_drawable_sequence = 0;
 static _Atomic uint64_t macws_stray_present_sequence = 0;
 static uint64_t macws_stray_present_first_time = 0;
 static uint64_t macws_stray_present_window_time = 0;
+static _Atomic uint64_t macws_stray_next_drawable_count = 0;
+static _Atomic uint64_t macws_stray_next_drawable_total_ticks = 0;
+static _Atomic uint64_t macws_stray_next_drawable_max_ticks = 0;
+static _Atomic uint64_t macws_stray_next_drawable_slow_8ms = 0;
+static _Atomic uint64_t macws_stray_next_drawable_slow_16ms = 0;
+static _Atomic uint64_t macws_stray_present_complete_count = 0;
+static _Atomic uint64_t macws_stray_present_complete_total_ticks = 0;
+static _Atomic uint64_t macws_stray_present_complete_max_ticks = 0;
+static _Atomic uint64_t macws_stray_commit_timing_submitted = 0;
+static _Atomic uint64_t macws_stray_commit_timing_completed = 0;
+static _Atomic uint64_t macws_stray_commit_timing_total_ticks = 0;
+static _Atomic uint64_t macws_stray_commit_timing_max_ticks = 0;
+static _Atomic uint64_t macws_stray_commit_timing_in_flight = 0;
+static _Atomic uint64_t macws_stray_commit_timing_max_in_flight = 0;
+static _Atomic uint64_t macws_stray_drawable_presented_count = 0;
+static _Atomic uint64_t macws_stray_drawable_presented_total_ticks = 0;
+static _Atomic uint64_t macws_stray_drawable_presented_max_ticks = 0;
+typedef void (*macws_stray_commit_timing_fn)(id, SEL);
+static macws_stray_commit_timing_fn
+    g_macws_stray_commit_timing_orig = NULL;
 static pthread_mutex_t macws_catalyst_drawable_service_lock =
     PTHREAD_MUTEX_INITIALIZER;
 static mach_port_t macws_catalyst_drawable_service = MACH_PORT_NULL;
+static _Atomic uint64_t macws_stray_last_render_activity_ns = 0;
+static int macws_stray_render_activity_fd = -1;
+static int macws_stray_render_wake_fd = -1;
+
+static uint32_t macws_stray_target_pace_us(void) {
+    static dispatch_once_t onceToken;
+    static uint32_t paceUS = 16667;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MACWS_STRAY_TARGET_FPS");
+        if (!value || !*value) return;
+        char *end = NULL;
+        errno = 0;
+        double fps = strtod(value, &end);
+        while (end && (*end == ' ' || *end == '\t' ||
+                       *end == '\r' || *end == '\n')) end++;
+        if (errno != 0 || !end || end == value || *end != '\0' ||
+            !isfinite(fps) || fps < 10.0 || fps > 120.0) return;
+        paceUS = (uint32_t)llround(1000000.0 / fps);
+    });
+    return paceUS;
+}
+
+static BOOL macws_is_stray_process(void) {
+    static dispatch_once_t onceToken;
+    static BOOL isStray = NO;
+    dispatch_once(&onceToken, ^{
+        const char *program = getprogname();
+        if (program && strcmp(program, "Stray-Mac-Shipping") == 0) {
+            isStray = YES;
+            return;
+        }
+        char executablePath[PATH_MAX] = {0};
+        uint32_t capacity = sizeof(executablePath);
+        if (_NSGetExecutablePath(executablePath, &capacity) == 0) {
+            const char *basename = strrchr(executablePath, '/');
+            basename = basename ? basename + 1 : executablePath;
+            isStray = strcmp(basename, "Stray-Mac-Shipping") == 0;
+        }
+    });
+    return isStray;
+}
+
+static BOOL macws_stray_agx_compat_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MACWS_STRAY_AGX_COMPAT");
+        enabled = macws_is_stray_process() && value && value[0] != '\0' &&
+            strcmp(value, "0") != 0;
+    });
+    return enabled;
+}
+
+// Production virtual-display pacing signal.  The WindowServer intentionally
+// idles its synthetic completion adapter at 100 ms to control desktop heat,
+// but a game can continuously present without producing pointer activity.
+// Publish that real presentation demand at most ten times per second and wake
+// the existing completion wait.  The versioned record also carries the exact
+// production target cadence, so WindowServer does not render more complete
+// desktop frames than the game can present.  A stopped or wedged game still
+// returns naturally to the cool idle cadence.  This neither fabricates a
+// drawable nor reports completion early.
+static void macws_stray_note_render_activity(void) {
+    if (!macws_is_stray_process()) return;
+    struct timespec now = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return;
+    uint64_t now_ns = (uint64_t)now.tv_sec * NSEC_PER_SEC +
+        (uint64_t)now.tv_nsec;
+    const uint64_t minimum_interval_ns = 100ull * NSEC_PER_MSEC;
+    uint64_t previous = atomic_load_explicit(
+        &macws_stray_last_render_activity_ns, memory_order_acquire);
+    for (;;) {
+        if (previous && now_ns >= previous &&
+            now_ns - previous < minimum_interval_ns) return;
+        if (atomic_compare_exchange_weak_explicit(
+                &macws_stray_last_render_activity_ns, &previous, now_ns,
+                memory_order_acq_rel, memory_order_acquire)) break;
+    }
+
+    if (macws_stray_render_activity_fd < 0) {
+        macws_stray_render_activity_fd = open(
+            MACWS_RENDER_ACTIVITY_PATH,
+            O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    }
+    MacWSRenderActivityRecord record = {
+        .magic = MACWS_RENDER_ACTIVITY_MAGIC,
+        .version = MACWS_RENDER_ACTIVITY_VERSION,
+        .size = sizeof(MacWSRenderActivityRecord),
+        .timestampNS = now_ns,
+        .targetPaceUS = macws_stray_target_pace_us(),
+    };
+    if (macws_stray_render_activity_fd >= 0 &&
+        pwrite(macws_stray_render_activity_fd, &record,
+               sizeof(record), 0) != sizeof(record)) {
+        close(macws_stray_render_activity_fd);
+        macws_stray_render_activity_fd = -1;
+    }
+
+    if (macws_stray_render_wake_fd < 0) {
+        macws_stray_render_wake_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+        if (macws_stray_render_wake_fd >= 0) {
+            (void)fcntl(macws_stray_render_wake_fd,
+                        F_SETFD, FD_CLOEXEC);
+            int flags = fcntl(macws_stray_render_wake_fd, F_GETFL, 0);
+            if (flags >= 0)
+                (void)fcntl(macws_stray_render_wake_fd,
+                            F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+    if (macws_stray_render_wake_fd < 0) return;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    address.sun_len = sizeof(address);
+    strlcpy(address.sun_path, MACWS_INTERACTION_WAKE_SOCKET_PATH,
+            sizeof(address.sun_path));
+    const uint8_t token = 1;
+    if (sendto(macws_stray_render_wake_fd, &token, sizeof(token),
+               MSG_DONTWAIT, (const struct sockaddr *)&address,
+               sizeof(address)) < 0 &&
+        (errno == EBADF || errno == ENOTSOCK)) {
+        close(macws_stray_render_wake_fd);
+        macws_stray_render_wake_fd = -1;
+    }
+}
+
+// A full Stray render trace interposes every encoder state mutation and draw,
+// which is intentionally useful for ABI diagnosis but is not a valid FPS
+// witness.  Keep presentation cadence independently measurable with one
+// process-start flag: the present-only path performs an atomic increment per
+// frame and one log write per 120 frames, without installing any encoder/draw
+// hooks.  Cache the flags because access(2) on every frame is itself avoidable
+// measurement overhead.
+static BOOL macws_stray_full_render_trace_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        enabled = macws_is_stray_process() &&
+            access("/tmp/macws_stray_render_trace", F_OK) == 0;
+    });
+    return enabled;
+}
+
+// Focused read-only compute-encoder trace for the standalone MetalFX probe.
+// Keep this out of every production process: the explicit environment switch
+// is accepted only by the exact bounded probe executable.  The wrappers below
+// always forward the real encoder calls and record only object identity,
+// pipeline name, and dispatch geometry needed to join a failing IOGPU submit
+// to MetalFX's internal compute stage.
+static BOOL macws_metalfx_encoder_diag_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MACWS_METALFX_ENCODER_DIAG");
+        const char *program = getprogname();
+        enabled = value && strcmp(value, "1") == 0 && program &&
+            strcmp(program, "metalfx_temporal_probe") == 0;
+    });
+    return enabled;
+}
+
+static BOOL macws_stray_present_trace_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        enabled = macws_is_stray_process() &&
+            (macws_stray_full_render_trace_enabled() ||
+             access("/tmp/macws_stray_present_trace", F_OK) == 0);
+    });
+    return enabled;
+}
+
+// Opt-in until the cross-process lifetime A/B is complete.  Production apps
+// may set the environment explicitly; Stray's bounded runner uses a chroot
+// marker because Steam intentionally sanitizes unapproved child variables.
+// Cache this once per process so the present hot path performs no filesystem
+// work per frame.
+static BOOL macws_catalyst_direct_drawable_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MACWS_CATALYST_DIRECT_DRAWABLE");
+        enabled = value && strcmp(value, "1") == 0;
+        if (!enabled && macws_is_stray_process()) {
+            enabled = access(
+                "/tmp/macws_catalyst_direct_drawable_lease", F_OK) == 0;
+        }
+    });
+    return enabled;
+}
+
+// The lease marker above installs the publisher before Steam creates Stray's
+// concrete CAMetalDrawable class.  A separate activation marker lets the
+// bounded runner defer cross-process publication until it has visually
+// confirmed real gameplay, avoiding three minutes of unnecessary capture
+// traffic during startup.  Poll only once per 30 presents until activation,
+// then latch the result; the steady-state hot path is one atomic load.
+static _Atomic bool macws_catalyst_direct_drawable_active_latched = false;
+static _Atomic uint32_t macws_catalyst_direct_drawable_activation_probes = 0;
+
+static BOOL macws_catalyst_direct_drawable_active(void) {
+    if (!macws_catalyst_direct_drawable_enabled()) return NO;
+    if (atomic_load_explicit(
+            &macws_catalyst_direct_drawable_active_latched,
+            memory_order_acquire)) return YES;
+    const char *value = getenv("MACWS_CATALYST_DIRECT_DRAWABLE");
+    if (value && strcmp(value, "1") == 0) {
+        atomic_store_explicit(
+            &macws_catalyst_direct_drawable_active_latched, true,
+            memory_order_release);
+        return YES;
+    }
+    uint32_t probe = atomic_fetch_add_explicit(
+        &macws_catalyst_direct_drawable_activation_probes, 1,
+        memory_order_relaxed);
+    if (probe % 30 != 0 ||
+        access("/tmp/macws_catalyst_direct_drawable_active", F_OK) != 0) {
+        return NO;
+    }
+    atomic_store_explicit(
+        &macws_catalyst_direct_drawable_active_latched, true,
+        memory_order_release);
+    dprintf(STDERR_FILENO,
+        "#### MACWS-DIRECT-DRAWABLE activation=runtime-marker "
+        "probe=%u\n", probe);
+    return YES;
+}
+
+// Diagnostic-only timing for the drawable-pool bottleneck.  This marker is
+// intentionally independent from the normal low-overhead present counter:
+// every presented command buffer receives a completion handler, so it must
+// never become part of a production FPS run.  Both the CAMetalLayer call and
+// the command buffer still execute with their original arguments and return
+// values.
+static BOOL macws_stray_drawable_timing_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        enabled = macws_is_stray_process() &&
+            access("/tmp/macws_stray_drawable_timing", F_OK) == 0;
+    });
+    return enabled;
+}
+
+// Stray presentation policy.  The production Steam job opts in after a
+// thermally-valid actual-gameplay A/B; the marker remains available for a
+// diagnostic control run.  Neither path suppresses validation or fabricates a
+// drawable: both change the public CAMetalLayer display-sync property before
+// the original nextDrawable call.
+static BOOL macws_stray_disable_display_sync_enabled(void) {
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        const char *production = getenv(
+            "MACWS_STRAY_DISABLE_DISPLAY_SYNC");
+        enabled = macws_is_stray_process() &&
+            ((production && strcmp(production, "1") == 0) ||
+             access("/tmp/macws_stray_disable_display_sync", F_OK) == 0);
+    });
+    return enabled;
+}
+
+static double macws_stray_ticks_to_milliseconds(uint64_t ticks) {
+    static dispatch_once_t onceToken;
+    static mach_timebase_info_data_t timebase = {0};
+    dispatch_once(&onceToken, ^{ (void)mach_timebase_info(&timebase); });
+    if (!timebase.denom) return 0.0;
+    return (double)ticks * (double)timebase.numer /
+        (double)timebase.denom / 1000000.0;
+}
+
+static void macws_stray_atomic_update_max(
+        _Atomic uint64_t *maximum, uint64_t candidate) {
+    uint64_t observed = atomic_load_explicit(maximum, memory_order_relaxed);
+    while (observed < candidate &&
+           !atomic_compare_exchange_weak_explicit(
+               maximum, &observed, candidate,
+               memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+static void macws_record_stray_present_completion(id commandBuffer) {
+    if (!macws_stray_drawable_timing_enabled() || !commandBuffer ||
+        ![commandBuffer respondsToSelector:@selector(addCompletedHandler:)])
+        return;
+    uint64_t begin = mach_absolute_time();
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        uint64_t elapsed = mach_absolute_time() - begin;
+        uint64_t count = atomic_fetch_add_explicit(
+            &macws_stray_present_complete_count, 1,
+            memory_order_relaxed) + 1;
+        uint64_t total = atomic_fetch_add_explicit(
+            &macws_stray_present_complete_total_ticks, elapsed,
+            memory_order_relaxed) + elapsed;
+        macws_stray_atomic_update_max(
+            &macws_stray_present_complete_max_ticks, elapsed);
+        if (count != 1 && count % 60 != 0) return;
+
+        CFTimeInterval gpuStart = 0.0;
+        CFTimeInterval gpuEnd = 0.0;
+        @try {
+            gpuStart = completed.GPUStartTime;
+            gpuEnd = completed.GPUEndTime;
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        uint64_t maximum = atomic_load_explicit(
+            &macws_stray_present_complete_max_ticks,
+            memory_order_relaxed);
+        NSError *error = completed.error;
+        dprintf(STDERR_FILENO,
+            "#### STRAY-PRESENT-COMPLETE completed=%llu "
+            "averageCPUms=%.3f maxCPUms=%.3f currentCPUms=%.3f "
+            "currentGPUms=%.3f status=%lu error=%ld\n",
+            (unsigned long long)count,
+            macws_stray_ticks_to_milliseconds(total) / (double)count,
+            macws_stray_ticks_to_milliseconds(maximum),
+            macws_stray_ticks_to_milliseconds(elapsed),
+            gpuEnd >= gpuStart ? (gpuEnd - gpuStart) * 1000.0 : -1.0,
+            (unsigned long)completed.status,
+            (long)(error ? error.code : 0));
+    }];
+}
+
+static void macws_stray_command_commit_timing(id commandBuffer,
+                                              SEL selector) {
+    if (!macws_stray_drawable_timing_enabled() || !commandBuffer ||
+        ![commandBuffer respondsToSelector:@selector(addCompletedHandler:)]) {
+        if (g_macws_stray_commit_timing_orig)
+            g_macws_stray_commit_timing_orig(commandBuffer, selector);
+        return;
+    }
+
+    uint64_t begin = mach_absolute_time();
+    uint64_t submitted = atomic_fetch_add_explicit(
+        &macws_stray_commit_timing_submitted, 1,
+        memory_order_relaxed) + 1;
+    uint64_t inFlight = atomic_fetch_add_explicit(
+        &macws_stray_commit_timing_in_flight, 1,
+        memory_order_relaxed) + 1;
+    macws_stray_atomic_update_max(
+        &macws_stray_commit_timing_max_in_flight, inFlight);
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        uint64_t elapsed = mach_absolute_time() - begin;
+        uint64_t count = atomic_fetch_add_explicit(
+            &macws_stray_commit_timing_completed, 1,
+            memory_order_relaxed) + 1;
+        uint64_t total = atomic_fetch_add_explicit(
+            &macws_stray_commit_timing_total_ticks, elapsed,
+            memory_order_relaxed) + elapsed;
+        macws_stray_atomic_update_max(
+            &macws_stray_commit_timing_max_ticks, elapsed);
+        uint64_t remaining = atomic_fetch_sub_explicit(
+            &macws_stray_commit_timing_in_flight, 1,
+            memory_order_relaxed) - 1;
+        if (count != 1 && count % 120 != 0) return;
+
+        CFTimeInterval gpuStart = 0.0;
+        CFTimeInterval gpuEnd = 0.0;
+        @try {
+            gpuStart = completed.GPUStartTime;
+            gpuEnd = completed.GPUEndTime;
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        uint64_t maximum = atomic_load_explicit(
+            &macws_stray_commit_timing_max_ticks,
+            memory_order_relaxed);
+        uint64_t maximumInFlight = atomic_load_explicit(
+            &macws_stray_commit_timing_max_in_flight,
+            memory_order_relaxed);
+        NSError *error = completed.error;
+        dprintf(STDERR_FILENO,
+            "#### STRAY-COMMIT-COMPLETE submitted=%llu completed=%llu "
+            "averageCPUms=%.3f maxCPUms=%.3f currentCPUms=%.3f "
+            "currentGPUms=%.3f inFlight=%llu maxInFlight=%llu "
+            "status=%lu error=%ld\n",
+            (unsigned long long)submitted,
+            (unsigned long long)count,
+            macws_stray_ticks_to_milliseconds(total) / (double)count,
+            macws_stray_ticks_to_milliseconds(maximum),
+            macws_stray_ticks_to_milliseconds(elapsed),
+            gpuEnd >= gpuStart ? (gpuEnd - gpuStart) * 1000.0 : -1.0,
+            (unsigned long long)remaining,
+            (unsigned long long)maximumInFlight,
+            (unsigned long)completed.status,
+            (long)(error ? error.code : 0));
+    }];
+    if (g_macws_stray_commit_timing_orig)
+        g_macws_stray_commit_timing_orig(commandBuffer, selector);
+}
+
+static void macws_record_stray_drawable_presented(id drawable) {
+    if (!macws_stray_drawable_timing_enabled() || !drawable ||
+        ![drawable respondsToSelector:@selector(addPresentedHandler:)])
+        return;
+    uint64_t begin = mach_absolute_time();
+    [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+        uint64_t elapsed = mach_absolute_time() - begin;
+        uint64_t count = atomic_fetch_add_explicit(
+            &macws_stray_drawable_presented_count, 1,
+            memory_order_relaxed) + 1;
+        uint64_t total = atomic_fetch_add_explicit(
+            &macws_stray_drawable_presented_total_ticks, elapsed,
+            memory_order_relaxed) + elapsed;
+        macws_stray_atomic_update_max(
+            &macws_stray_drawable_presented_max_ticks, elapsed);
+        if (count != 1 && count % 60 != 0) return;
+        uint64_t maximum = atomic_load_explicit(
+            &macws_stray_drawable_presented_max_ticks,
+            memory_order_relaxed);
+        CFTimeInterval presentedTime = 0.0;
+        @try { presentedTime = presented.presentedTime; }
+        @catch (NSException *exception) { (void)exception; }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-DRAWABLE-PRESENTED count=%llu averageMS=%.3f "
+            "maxMS=%.3f currentMS=%.3f presentedTime=%.6f\n",
+            (unsigned long long)count,
+            macws_stray_ticks_to_milliseconds(total) / (double)count,
+            macws_stray_ticks_to_milliseconds(maximum),
+            macws_stray_ticks_to_milliseconds(elapsed), presentedTime);
+    }];
+}
 
 static uint64_t macws_resident_memory_bytes(void) {
     mach_task_basic_info_data_t info = {0};
@@ -87,10 +536,19 @@ static void macws_publish_completed_catalyst_drawable(
         MacWSCatalystDrawableRecord record, IOSurfaceRef retainedSurface) {
     if (!retainedSurface) return;
     record.completionTime = mach_absolute_time();
+    // Transfer one explicit cross-process IOSurface use count with the Mach
+    // right.  Retaining the CF object alone did not prevent CAMetalLayer from
+    // recycling its drawable storage after presentation; Host screenshots
+    // then contained tiles from two producer generations.  The v2 receiver
+    // either adopts this count into a frame lease or returns it immediately
+    // when the delivery is rejected.
+    IOSurfaceIncrementUseCount(retainedSurface);
+    record.flags |= MacWSCatalystDrawableTransfersUseCount;
     mach_port_t surfacePort = IOSurfaceCreateMachPort(retainedSurface);
-    CFRelease(retainedSurface);
     mach_port_t service = macws_catalyst_drawable_service_port();
     if (!MACH_PORT_VALID(surfacePort) || !MACH_PORT_VALID(service)) {
+        IOSurfaceDecrementUseCount(retainedSurface);
+        CFRelease(retainedSurface);
         if (MACH_PORT_VALID(surfacePort))
             (void)mach_port_deallocate(mach_task_self(), surfacePort);
         return;
@@ -118,13 +576,15 @@ static void macws_publish_completed_catalyst_drawable(
         sizeof(message), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
     (void)mach_port_deallocate(mach_task_self(), surfacePort);
     if (result != MACH_MSG_SUCCESS) {
+        IOSurfaceDecrementUseCount(retainedSurface);
         if (result == MACH_SEND_INVALID_DEST)
             macws_invalidate_catalyst_drawable_service(service);
     }
+    CFRelease(retainedSurface);
 }
 
 static void macws_record_stray_present(id drawable, SEL selector) {
-    if (access("/tmp/macws_stray_render_trace", F_OK) != 0) return;
+    if (!macws_stray_present_trace_enabled()) return;
     uint64_t now = mach_absolute_time();
     uint64_t sequence = atomic_fetch_add_explicit(
         &macws_stray_present_sequence, 1, memory_order_relaxed) + 1;
@@ -173,12 +633,23 @@ static void macws_record_stray_present(id drawable, SEL selector) {
 
 static void macws_before_present_drawable(id commandBuffer, SEL selector,
                                           id drawable) {
+    macws_stray_note_render_activity();
     IOSurfaceRef retainedSurface = NULL;
     MacWSCatalystDrawableRecord record = {0};
     const char *directValue = getenv("MACWS_CATALYST_DIRECT_DRAWABLE");
-    BOOL publishDirectly = directValue && strcmp(directValue, "1") == 0;
-    BOOL traceStray =
-        access("/tmp/macws_stray_render_trace", F_OK) == 0;
+    BOOL publishDirectly = macws_catalyst_direct_drawable_active();
+    BOOL traceStray = macws_stray_present_trace_enabled();
+    if (traceStray) {
+        static _Atomic bool directDrawableEnvironmentWitnessed = false;
+        if (!atomic_exchange_explicit(
+                &directDrawableEnvironmentWitnessed, true,
+                memory_order_acq_rel)) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-DIRECT-DRAWABLE environment enabled=%d "
+                "value=%s\n",
+                publishDirectly, directValue ?: "(nil)");
+        }
+    }
     if (publishDirectly) @try {
         id texture = drawable &&
                 [drawable respondsToSelector:@selector(texture)]
@@ -209,13 +680,39 @@ static void macws_before_present_drawable(id commandBuffer, SEL selector,
                 retainedSurface = NULL;
             }
         }
+        static _Atomic bool directDrawableWitnessed = false;
+        if (!atomic_exchange_explicit(
+                &directDrawableWitnessed, true, memory_order_acq_rel)) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-DIRECT-DRAWABLE boundary=%s command=%s/%p "
+                "drawable=%s/%p texture=%s/%p surface=%p id=%u "
+                "size=%ux%u pf=%u\n",
+                retainedSurface ? "publish-ready" : "no-iosurface",
+                commandBuffer ? class_getName([commandBuffer class]) : "(nil)",
+                (__bridge void *)commandBuffer,
+                drawable ? class_getName([drawable class]) : "(nil)",
+                (__bridge void *)drawable,
+                texture ? class_getName([texture class]) : "(nil)",
+                (__bridge void *)texture, surface, surfaceID,
+                record.width, record.height, record.metalPixelFormat);
+        }
     } @catch (NSException *exception) {
+        static _Atomic bool directDrawableExceptionWitnessed = false;
+        if (!atomic_exchange_explicit(
+                &directDrawableExceptionWitnessed, true,
+                memory_order_acq_rel)) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-DIRECT-DRAWABLE exception name=%s reason=%s\n",
+                exception.name.UTF8String ?: "(nil)",
+                exception.reason.UTF8String ?: "(nil)");
+        }
         (void)exception;
         if (retainedSurface) CFRelease(retainedSurface);
         retainedSurface = NULL;
     }
 
     if (traceStray) macws_record_stray_present(drawable, selector);
+    macws_record_stray_present_completion(commandBuffer);
 
     if (retainedSurface &&
         [commandBuffer respondsToSelector:@selector(addCompletedHandler:)]) {
@@ -296,15 +793,197 @@ static pthread_mutex_t g_macws_stray_drawable_hook_lock =
     PTHREAD_MUTEX_INITIALIZER;
 static Class g_macws_stray_drawable_hooked_class = Nil;
 
+// Diagnostic witness for the AppKit/QuartzCore visibility contract around
+// Stray's CAMetalLayer.  The WindowServer catalog can carry pixels for a
+// window even when AppKit reports that window as not ordered visible.  That
+// distinction matters here because QuartzCore owns drawable recycling.  Read
+// the state on the main queue and leave every lifecycle/property value
+// untouched; this is evidence collection, not a visibility bypass.
+static BOOL macws_stray_object_responds(id object, const char *name) {
+    if (!object) return NO;
+    return ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+        object, sel_registerName("respondsToSelector:"),
+        sel_registerName(name));
+}
+
+static id macws_stray_object_value(id object, const char *name) {
+    return macws_stray_object_responds(object, name)
+        ? ((id (*)(id, SEL))objc_msgSend)(object, sel_registerName(name))
+        : nil;
+}
+
+static BOOL macws_stray_bool_value(id object, const char *name) {
+    return macws_stray_object_responds(object, name) &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(object, sel_registerName(name));
+}
+
+static NSInteger macws_stray_integer_value(id object, const char *name) {
+    return macws_stray_object_responds(object, name)
+        ? ((NSInteger (*)(id, SEL))objc_msgSend)(
+              object, sel_registerName(name))
+        : 0;
+}
+
+static NSUInteger macws_stray_unsigned_value(id object, const char *name) {
+    return macws_stray_object_responds(object, name)
+        ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+              object, sel_registerName(name))
+        : 0;
+}
+
+static void macws_schedule_stray_app_state(id layer, uint64_t sample) {
+    if (!macws_stray_drawable_timing_enabled()) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class applicationClass = objc_getClass("NSApplication");
+        id application = applicationClass
+            ? ((id (*)(id, SEL))objc_msgSend)(
+                  (id)applicationClass,
+                  sel_registerName("sharedApplication"))
+            : nil;
+        id keyWindow = macws_stray_object_value(application, "keyWindow");
+        id mainWindow = macws_stray_object_value(application, "mainWindow");
+        id windows = macws_stray_object_value(application, "windows");
+        id orderedWindows = macws_stray_object_value(
+            application, "orderedWindows");
+        id delegate = macws_stray_object_value(layer, "delegate");
+        id delegateWindow = macws_stray_object_value(delegate, "window");
+        id keyScreen = macws_stray_object_value(keyWindow, "screen");
+        dprintf(STDERR_FILENO,
+            "#### STRAY-APP-STATE sample=%llu app=%p active=%s "
+            "activationPolicy=%ld windows=%lu orderedWindows=%lu "
+            "key=%p main=%p keyNumber=%ld visible=%s keyFlag=%s "
+            "mainFlag=%s miniaturized=%s occlusion=%#lx "
+            "onActiveSpace=%s level=%ld style=%#lx collection=%#lx "
+            "screen=%p layer=%p layerHidden=%s delegate=%s/%p "
+            "delegateWindow=%p delegateWindowNumber=%ld\n",
+            (unsigned long long)sample, (__bridge void *)application,
+            macws_stray_bool_value(application, "isActive") ? "YES" : "NO",
+            (long)macws_stray_integer_value(application, "activationPolicy"),
+            (unsigned long)[windows count],
+            (unsigned long)[orderedWindows count],
+            (__bridge void *)keyWindow, (__bridge void *)mainWindow,
+            (long)macws_stray_integer_value(keyWindow, "windowNumber"),
+            macws_stray_bool_value(keyWindow, "isVisible") ? "YES" : "NO",
+            macws_stray_bool_value(keyWindow, "isKeyWindow") ? "YES" : "NO",
+            macws_stray_bool_value(keyWindow, "isMainWindow") ? "YES" : "NO",
+            macws_stray_bool_value(keyWindow, "isMiniaturized")
+                ? "YES" : "NO",
+            (unsigned long)macws_stray_unsigned_value(
+                keyWindow, "occlusionState"),
+            macws_stray_bool_value(keyWindow, "isOnActiveSpace")
+                ? "YES" : "NO",
+            (long)macws_stray_integer_value(keyWindow, "level"),
+            (unsigned long)macws_stray_unsigned_value(keyWindow, "styleMask"),
+            (unsigned long)macws_stray_unsigned_value(
+                keyWindow, "collectionBehavior"),
+            (__bridge void *)keyScreen, (__bridge void *)layer,
+            macws_stray_bool_value(layer, "isHidden") ? "YES" : "NO",
+            delegate ? class_getName([delegate class]) : "(nil)",
+            (__bridge void *)delegate, (__bridge void *)delegateWindow,
+            (long)macws_stray_integer_value(
+                delegateWindow, "windowNumber"));
+    });
+}
+
+// UE4 presents through CAMetalDrawable's MTLDrawable entry point instead of
+// -[MTLCommandBuffer presentDrawable:]. Register the public presented
+// callback before forwarding that call, then transfer the IOSurface only
+// after Metal reports the drawable as presented. This is the same completed
+// surface contract as the command-buffer path above; no GPU completion or
+// presentation result is fabricated.
+static void macws_publish_direct_drawable_after_presentation(id drawable,
+                                                              SEL selector) {
+    if (!macws_catalyst_direct_drawable_active() || !drawable) return;
+
+    IOSurfaceRef retainedSurface = NULL;
+    MacWSCatalystDrawableRecord record = {0};
+    const char *boundary = "missing-presented-handler";
+    @try {
+        id texture = [drawable respondsToSelector:@selector(texture)]
+            ? [drawable texture] : nil;
+        IOSurfaceRef surface = texture &&
+                [texture respondsToSelector:@selector(iosurface)]
+            ? (IOSurfaceRef)[texture iosurface] : NULL;
+        uint32_t surfaceID = surface ? IOSurfaceGetID(surface) : 0;
+        if (surface && surfaceID != 0 &&
+            [drawable respondsToSelector:@selector(addPresentedHandler:)]) {
+            retainedSurface = (IOSurfaceRef)CFRetain(surface);
+            record = (MacWSCatalystDrawableRecord){
+                .magic = MACWS_CATALYST_DRAWABLE_MAGIC,
+                .version = MACWS_CATALYST_DRAWABLE_VERSION,
+                .size = sizeof(record),
+                .ownerPID = getpid(),
+                .surfaceID = surfaceID,
+                .sequence = atomic_fetch_add_explicit(
+                    &macws_catalyst_drawable_sequence, 1,
+                    memory_order_relaxed) + 1,
+                .width = (uint32_t)[texture width],
+                .height = (uint32_t)[texture height],
+                .bytesPerRow = (uint32_t)IOSurfaceGetBytesPerRow(surface),
+                .ioSurfacePixelFormat = IOSurfaceGetPixelFormat(surface),
+                .metalPixelFormat = (uint32_t)[texture pixelFormat],
+            };
+            if (MacWSCatalystDrawableRecordIsValid(
+                    &record, sizeof(record))) {
+                IOSurfaceRef surfaceForPresentation = retainedSurface;
+                MacWSCatalystDrawableRecord recordForPresentation = record;
+                [drawable addPresentedHandler:^(__unused id presented) {
+                    macws_publish_completed_catalyst_drawable(
+                        recordForPresentation, surfaceForPresentation);
+                }];
+                retainedSurface = NULL;
+                boundary = "drawable-publish-ready";
+            } else {
+                CFRelease(retainedSurface);
+                retainedSurface = NULL;
+                boundary = "invalid-record";
+            }
+        } else if (!surface || surfaceID == 0) {
+            boundary = "no-iosurface";
+        }
+        static _Atomic bool drawableBoundaryWitnessed = false;
+        if (!atomic_exchange_explicit(
+                &drawableBoundaryWitnessed, true, memory_order_acq_rel)) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-DIRECT-DRAWABLE boundary=%s selector=%s "
+                "drawable=%s/%p texture=%s/%p surface=%p id=%u "
+                "size=%ux%u pf=%u\n",
+                boundary, sel_getName(selector),
+                class_getName([drawable class]), (__bridge void *)drawable,
+                texture ? class_getName([texture class]) : "(nil)",
+                (__bridge void *)texture, surface, surfaceID,
+                record.width, record.height, record.metalPixelFormat);
+        }
+    } @catch (NSException *exception) {
+        if (retainedSurface) CFRelease(retainedSurface);
+        static _Atomic bool drawableExceptionWitnessed = false;
+        if (!atomic_exchange_explicit(
+                &drawableExceptionWitnessed, true,
+                memory_order_acq_rel)) {
+            dprintf(STDERR_FILENO,
+                "#### MACWS-DIRECT-DRAWABLE drawable-exception "
+                "name=%s reason=%s\n",
+                exception.name.UTF8String ?: "(nil)",
+                exception.reason.UTF8String ?: "(nil)");
+        }
+    }
+}
+
 static void macws_stray_drawable_present_trace(id drawable, SEL selector) {
+    macws_stray_note_render_activity();
+    macws_publish_direct_drawable_after_presentation(drawable, selector);
     macws_record_stray_present(drawable, selector);
+    macws_record_stray_drawable_presented(drawable);
     if (g_macws_stray_drawable_present_orig)
         g_macws_stray_drawable_present_orig(drawable, selector);
 }
 
 static void macws_stray_drawable_present_at_time_trace(
         id drawable, SEL selector, CFTimeInterval time) {
+    macws_stray_note_render_activity();
+    macws_publish_direct_drawable_after_presentation(drawable, selector);
     macws_record_stray_present(drawable, selector);
+    macws_record_stray_drawable_presented(drawable);
     if (g_macws_stray_drawable_present_at_time_orig)
         g_macws_stray_drawable_present_at_time_orig(
             drawable, selector, time);
@@ -312,7 +991,10 @@ static void macws_stray_drawable_present_at_time_trace(
 
 static void macws_stray_drawable_present_after_duration_trace(
         id drawable, SEL selector, CFTimeInterval duration) {
+    macws_stray_note_render_activity();
+    macws_publish_direct_drawable_after_presentation(drawable, selector);
     macws_record_stray_present(drawable, selector);
+    macws_record_stray_drawable_presented(drawable);
     if (g_macws_stray_drawable_present_after_duration_orig)
         g_macws_stray_drawable_present_after_duration_orig(
             drawable, selector, duration);
@@ -379,8 +1061,78 @@ static void macws_install_stray_drawable_class_trace(Class drawableClass) {
 }
 
 static id macws_stray_next_drawable_trace(id layer, SEL selector) {
+    if (macws_stray_disable_display_sync_enabled() &&
+        [layer respondsToSelector:@selector(displaySyncEnabled)] &&
+        [layer respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
+        BOOL before = ((BOOL (*)(id, SEL))objc_msgSend)(
+            layer, @selector(displaySyncEnabled));
+        if (before) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(
+                layer, @selector(setDisplaySyncEnabled:), NO);
+            BOOL after = ((BOOL (*)(id, SEL))objc_msgSend)(
+                layer, @selector(displaySyncEnabled));
+            static _Atomic BOOL logged = NO;
+            if (!atomic_exchange_explicit(
+                    &logged, YES, memory_order_acq_rel)) {
+                dprintf(STDERR_FILENO,
+                    "#### STRAY-DISPLAY-SYNC policy=%s layer=%s "
+                    "before=%s requested=NO after=%s\n",
+                    (getenv("MACWS_STRAY_DISABLE_DISPLAY_SYNC") &&
+                     strcmp(getenv("MACWS_STRAY_DISABLE_DISPLAY_SYNC"),
+                            "1") == 0) ? "production-env" :
+                    "diagnostic-marker",
+                    class_getName([layer class]), before ? "YES" : "NO",
+                    after ? "YES" : "NO");
+            }
+        }
+    }
+    BOOL timing = macws_stray_drawable_timing_enabled();
+    uint64_t begin = timing ? mach_absolute_time() : 0;
     id drawable = g_macws_stray_next_drawable_orig
         ? g_macws_stray_next_drawable_orig(layer, selector) : nil;
+    if (timing) {
+        uint64_t elapsed = mach_absolute_time() - begin;
+        uint64_t count = atomic_fetch_add_explicit(
+            &macws_stray_next_drawable_count, 1,
+            memory_order_relaxed) + 1;
+        uint64_t total = atomic_fetch_add_explicit(
+            &macws_stray_next_drawable_total_ticks, elapsed,
+            memory_order_relaxed) + elapsed;
+        macws_stray_atomic_update_max(
+            &macws_stray_next_drawable_max_ticks, elapsed);
+        double elapsedMS = macws_stray_ticks_to_milliseconds(elapsed);
+        if (elapsedMS >= 8.0)
+            atomic_fetch_add_explicit(
+                &macws_stray_next_drawable_slow_8ms, 1,
+                memory_order_relaxed);
+        if (elapsedMS >= 16.0)
+            atomic_fetch_add_explicit(
+                &macws_stray_next_drawable_slow_16ms, 1,
+                memory_order_relaxed);
+        if (count == 1 || count % 60 == 0) {
+            uint64_t maximum = atomic_load_explicit(
+                &macws_stray_next_drawable_max_ticks,
+                memory_order_relaxed);
+            uint64_t slow8 = atomic_load_explicit(
+                &macws_stray_next_drawable_slow_8ms,
+                memory_order_relaxed);
+            uint64_t slow16 = atomic_load_explicit(
+                &macws_stray_next_drawable_slow_16ms,
+                memory_order_relaxed);
+            dprintf(STDERR_FILENO,
+                "#### STRAY-DRAWABLE-TIMING calls=%llu "
+                "averageMS=%.3f maxMS=%.3f currentMS=%.3f "
+                "slow8=%llu slow16=%llu drawable=%p\n",
+                (unsigned long long)count,
+                macws_stray_ticks_to_milliseconds(total) / (double)count,
+                macws_stray_ticks_to_milliseconds(maximum), elapsedMS,
+                (unsigned long long)slow8,
+                (unsigned long long)slow16,
+                (__bridge void *)drawable);
+            if (count == 1 || count % 120 == 0)
+                macws_schedule_stray_app_state(layer, count);
+        }
+    }
     if (drawable) {
         macws_install_stray_drawable_class_trace([drawable class]);
         static _Atomic BOOL logged = NO;
@@ -391,21 +1143,66 @@ static id macws_stray_next_drawable_trace(id layer, SEL selector) {
             @catch (NSException *exception) { (void)exception; }
             dprintf(STDERR_FILENO,
                 "#### STRAY-DRAWABLE nextDrawable layer=%s drawable=%s/%p "
-                "texture=%s/%p\n",
+                "texture=%s/%p maximumDrawableCount=%lu "
+                "displaySyncEnabled=%s presentsWithTransaction=%s "
+                "allowsNextDrawableTimeout=%s framebufferOnly=%s\n",
                 class_getName([layer class]),
                 class_getName([drawable class]), (__bridge void *)drawable,
                 texture ? class_getName([texture class]) : "(nil)",
-                (__bridge void *)texture);
+                (__bridge void *)texture,
+                (unsigned long)([layer respondsToSelector:
+                    @selector(maximumDrawableCount)]
+                    ? ((NSUInteger (*)(id, SEL))objc_msgSend)(
+                        layer, @selector(maximumDrawableCount)) : 0),
+                ([layer respondsToSelector:@selector(displaySyncEnabled)] &&
+                 ((BOOL (*)(id, SEL))objc_msgSend)(
+                    layer, @selector(displaySyncEnabled))) ? "YES" : "NO",
+                ([layer respondsToSelector:@selector(presentsWithTransaction)] &&
+                 ((BOOL (*)(id, SEL))objc_msgSend)(
+                    layer, @selector(presentsWithTransaction))) ? "YES" : "NO",
+                ([layer respondsToSelector:
+                    @selector(allowsNextDrawableTimeout)] &&
+                 ((BOOL (*)(id, SEL))objc_msgSend)(
+                    layer, @selector(allowsNextDrawableTimeout))) ? "YES" : "NO",
+                ([layer respondsToSelector:@selector(framebufferOnly)] &&
+                 ((BOOL (*)(id, SEL))objc_msgSend)(
+                    layer, @selector(framebufferOnly))) ? "YES" : "NO");
         }
     }
     return drawable;
 }
 
+static void macws_install_stray_drawable_present_trace(void) {
+    Class metalLayer = objc_getClass("CAMetalLayer");
+    SEL nextDrawableSelector = sel_registerName("nextDrawable");
+    Method nextDrawableMethod = metalLayer
+        ? class_getInstanceMethod(metalLayer, nextDrawableSelector) : NULL;
+    if (nextDrawableMethod) {
+        IMP original = method_getImplementation(nextDrawableMethod);
+        if (!macws_imp_equal_ignoring_pac(
+                original, (IMP)macws_stray_next_drawable_trace)) {
+            g_macws_stray_next_drawable_orig =
+                (macws_next_drawable_fn)original;
+            method_setImplementation(
+                nextDrawableMethod, (IMP)macws_stray_next_drawable_trace);
+            dprintf(STDERR_FILENO,
+                "#### STRAY-DRAWABLE installed selector=%s class=%s "
+                "original=%p types=%s\n",
+                sel_getName(nextDrawableSelector), class_getName(metalLayer),
+                (void *)original,
+                method_getTypeEncoding(nextDrawableMethod) ?: "(nil)");
+        }
+    } else {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-DRAWABLE missing selector=%s class=%s\n",
+            sel_getName(nextDrawableSelector),
+            metalLayer ? class_getName(metalLayer) : "(nil)");
+    }
+}
+
 static void macws_install_catalyst_drawable_publisher(void) {
-    const char *enabled = getenv("MACWS_CATALYST_DIRECT_DRAWABLE");
-    BOOL directEnabled = enabled && strcmp(enabled, "1") == 0;
-    BOOL traceEnabled =
-        access("/tmp/macws_stray_render_trace", F_OK) == 0;
+    BOOL directEnabled = macws_catalyst_direct_drawable_enabled();
+    BOOL traceEnabled = macws_stray_present_trace_enabled();
     if (!directEnabled && !traceEnabled) return;
     Class commandBufferClass = objc_getClass("_MTLCommandBuffer");
     if (!commandBufferClass) return;
@@ -446,6 +1243,391 @@ static void macws_install_catalyst_drawable_publisher(void) {
                 entries[i].name, class_getName(commandBufferClass),
                 (void *)current, method_getTypeEncoding(method) ?: "(nil)");
     }
+}
+
+// Diagnostic only: preserve the command buffer's real synchronization while
+// recording the native caller that requested it.  Installation and capture
+// use separate sentinels so a steady-state frame can be sampled without
+// spending the bounded trace budget on UE startup uploads.  This is not an
+// FPS patch and must never suppress or replace -waitUntilCompleted.
+typedef void (*macws_wait_until_completed_fn)(id, SEL);
+static macws_wait_until_completed_fn
+    g_macws_stray_wait_until_completed_orig = NULL;
+static _Atomic uint32_t g_macws_stray_wait_trace_count = 0;
+
+static void macws_stray_wait_until_completed_trace(
+        id commandBuffer, SEL selector) {
+    if (access("/tmp/macws_stray_wait_trace_capture", F_OK) == 0) {
+        uint32_t sequence = atomic_fetch_add_explicit(
+            &g_macws_stray_wait_trace_count, 1, memory_order_relaxed) + 1;
+        if (sequence <= 24) {
+            void *frames[48] = {0};
+            int frameCount = backtrace(
+                frames, (int)(sizeof(frames) / sizeof(frames[0])));
+            dprintf(STDERR_FILENO,
+                "#### STRAY-WAIT sequence=%u thread=%u buffer=%p "
+                "class=%s frames=%d begin\n",
+                sequence, (unsigned)pthread_mach_thread_np(pthread_self()),
+                (__bridge void *)commandBuffer,
+                commandBuffer ? class_getName([commandBuffer class]) :
+                    "(nil)",
+                frameCount);
+            if (frameCount > 0)
+                backtrace_symbols_fd(frames, frameCount, STDERR_FILENO);
+            dprintf(STDERR_FILENO,
+                "#### STRAY-WAIT sequence=%u end\n", sequence);
+        }
+    }
+    if (g_macws_stray_wait_until_completed_orig)
+        g_macws_stray_wait_until_completed_orig(commandBuffer, selector);
+}
+
+static void macws_install_stray_wait_until_completed_diagnostic(void) {
+    if (!macws_is_stray_process() ||
+        access("/tmp/macws_stray_wait_trace_install", F_OK) != 0) return;
+    Class commandBuffer = objc_getClass("AGXG13GFamilyCommandBuffer");
+    SEL selector = sel_registerName("waitUntilCompleted");
+    Method method = commandBuffer
+        ? class_getInstanceMethod(commandBuffer, selector) : NULL;
+    if (!method) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-WAIT missing selector=%s class=%s\n",
+            sel_getName(selector),
+            commandBuffer ? class_getName(commandBuffer) : "(nil)");
+        return;
+    }
+    IMP current = method_getImplementation(method);
+    if (macws_imp_equal_ignoring_pac(
+            current, (IMP)macws_stray_wait_until_completed_trace)) return;
+    g_macws_stray_wait_until_completed_orig =
+        (macws_wait_until_completed_fn)current;
+    const char *types = method_getTypeEncoding(method);
+    BOOL added = class_addMethod(
+        commandBuffer, selector,
+        (IMP)macws_stray_wait_until_completed_trace, types);
+    if (!added) {
+        Method own = class_getInstanceMethod(commandBuffer, selector);
+        method_setImplementation(
+            own, (IMP)macws_stray_wait_until_completed_trace);
+    }
+    dprintf(STDERR_FILENO,
+        "#### STRAY-WAIT installed selector=%s class=%s original=%p "
+        "subclassOverride=%s types=%s\n",
+        sel_getName(selector), class_getName(commandBuffer), (void *)current,
+        added ? "YES" : "NO", types ?: "(nil)");
+}
+
+// Diagnostic only: observe the actual EMetalSubmitFlags entering the target
+// Stray build's FMetalRenderPass::Submit. The MTLCommandBuffer backtrace alone
+// cannot distinguish the two adjacent waits in FMetalCommandList::Commit once
+// tail calls have removed the originating RHI command frame. Keep the real
+// function and every submit flag unchanged; an exact main-binary UUID and
+// prologue guard prevent this private C++ hook from being applied to any other
+// build.
+typedef void (*macws_stray_render_pass_submit_fn)(void *, uint32_t);
+static macws_stray_render_pass_submit_fn
+    g_macws_stray_render_pass_submit_orig = NULL;
+static _Atomic uint32_t g_macws_stray_submit_flags_count = 0;
+static const uint32_t *g_macws_stray_runtime_debug_level = NULL;
+typedef void *(*macws_stray_surface_lock_fn)(
+    void *, uint32_t, uint32_t, uint32_t, uint32_t *, bool);
+static macws_stray_surface_lock_fn g_macws_stray_surface_lock_orig = NULL;
+static _Atomic uint32_t g_macws_stray_surface_lock_count = 0;
+typedef void (*macws_stray_mac_key_down_fn)(
+    void *application, const uint8_t *event, const void *window);
+typedef bool (*macws_stray_slate_key_down_fn)(
+    void *application, uint32_t keyCode, uint32_t charCode, bool repeat);
+static macws_stray_mac_key_down_fn g_macws_stray_mac_key_down_orig = NULL;
+static macws_stray_slate_key_down_fn g_macws_stray_slate_key_down_orig = NULL;
+static macws_stray_slate_key_down_fn g_macws_stray_slate_key_up_orig = NULL;
+static _Atomic uint32_t g_macws_stray_mac_key_down_count = 0;
+static _Atomic uint32_t g_macws_stray_slate_key_down_count = 0;
+static _Atomic uint32_t g_macws_stray_slate_key_up_count = 0;
+
+static void macws_stray_mac_key_down_trace(
+        void *application, const uint8_t *event, const void *window) {
+    uint32_t sequence = atomic_fetch_add_explicit(
+        &g_macws_stray_mac_key_down_count, 1, memory_order_relaxed) + 1;
+    if (sequence <= 32) {
+        uint16_t keyCode = event ? *(const uint16_t *)(event + 0x64) : 0;
+        uint8_t charCode = event ? *(event + 0x66) : 0;
+        uint32_t translated = event
+            ? *(const uint32_t *)(event + 0x68) : 0;
+        uint8_t deferring = application
+            ? *((const uint8_t *)application + 0x190) : 0;
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME mac-key-down sequence=%u "
+            "application=%p event=%p window=%p keyCode=%u charCode=%u "
+            "translated=%u deferring=%u begin\n",
+            sequence, application, event, window, keyCode, charCode,
+            translated, deferring);
+    }
+    if (g_macws_stray_mac_key_down_orig)
+        g_macws_stray_mac_key_down_orig(application, event, window);
+    if (sequence <= 32)
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME mac-key-down sequence=%u end\n",
+            sequence);
+}
+
+static bool macws_stray_slate_key_down_trace(
+        void *application, uint32_t keyCode, uint32_t charCode, bool repeat) {
+    uint32_t sequence = atomic_fetch_add_explicit(
+        &g_macws_stray_slate_key_down_count, 1, memory_order_relaxed) + 1;
+    if (sequence <= 32)
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME slate-key-down sequence=%u "
+            "application=%p keyCode=%u charCode=%u repeat=%s begin\n",
+            sequence, application, keyCode, charCode,
+            repeat ? "YES" : "NO");
+    bool result = g_macws_stray_slate_key_down_orig
+        ? g_macws_stray_slate_key_down_orig(
+              application, keyCode, charCode, repeat)
+        : false;
+    if (sequence <= 32)
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME slate-key-down sequence=%u "
+            "result=%s end\n", sequence, result ? "YES" : "NO");
+    return result;
+}
+
+static bool macws_stray_slate_key_up_trace(
+        void *application, uint32_t keyCode, uint32_t charCode, bool repeat) {
+    uint32_t sequence = atomic_fetch_add_explicit(
+        &g_macws_stray_slate_key_up_count, 1, memory_order_relaxed) + 1;
+    if (sequence <= 32)
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME slate-key-up sequence=%u "
+            "application=%p keyCode=%u charCode=%u repeat=%s begin\n",
+            sequence, application, keyCode, charCode,
+            repeat ? "YES" : "NO");
+    bool result = g_macws_stray_slate_key_up_orig
+        ? g_macws_stray_slate_key_up_orig(
+              application, keyCode, charCode, repeat)
+        : false;
+    if (sequence <= 32)
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME slate-key-up sequence=%u "
+            "result=%s end\n", sequence, result ? "YES" : "NO");
+    return result;
+}
+
+// Preserving diagnostic at the real UE4 input-consumption boundary.  The
+// offsets and ABI come from otool disassembly of the exact UUID-checked Stray
+// executable: FMacApplication::ProcessKeyDownEvent reads event+0x64/+0x66/
+// +0x68 and the TSharedPtr through x2; FSlateApplication::OnKeyDown and
+// FSlateApplication::OnKeyUp receive (this,w1,w2,w3) and return their handled
+// bits in w0.  Every original always runs with unchanged arguments and return
+// value.
+static void macws_install_stray_input_consume_diagnostic(void) {
+    if (!macws_is_stray_process() ||
+        access("/tmp/macws_app_input_diagnostics", F_OK) != 0) return;
+
+    static const uint8_t stray_uuid[16] = {
+        0xc7, 0x2d, 0x3f, 0x73, 0x25, 0xf4, 0x33, 0x3b,
+        0x91, 0x08, 0x83, 0x43, 0x2e, 0x09, 0xe6, 0x87,
+    };
+    static const uint32_t mac_key_prologue[] = {
+        0xd10243ff, 0xa90657f6, 0xa9074ff4, 0xa9087bfd,
+        0x910203fd, 0xaa0103f3, 0x39464008, 0x34000328,
+    };
+    static const uint32_t slate_key_prologue[] = {
+        0xd102c3ff, 0xa9075ff8, 0xa90857f6, 0xa9094ff4,
+        0xa90a7bfd, 0x910283fd, 0xaa0303f6, 0xaa0203f5,
+    };
+    static const uint32_t slate_key_up_prologue[] = {
+        0xd102c3ff, 0xa9075ff8, 0xa90857f6, 0xa9094ff4,
+        0xa90a7bfd, 0x910283fd, 0xaa0303f6, 0xaa0203f5,
+    };
+    const uintptr_t macKeyOffset = 0x168ded4;
+    const uintptr_t slateKeyOffset = 0x17d0a88;
+    const uintptr_t slateKeyUpOffset = 0x17d1c5c;
+    const struct mach_header *mainHeader = NULL;
+    for (uint32_t index = 0; index < _dyld_image_count(); index++) {
+        const struct mach_header *header = _dyld_get_image_header(index);
+        if (header && header->filetype == MH_EXECUTE &&
+            macws_macho_has_uuid(header, stray_uuid)) {
+            mainHeader = header;
+            break;
+        }
+    }
+    if (!mainHeader) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME install rejected reason=uuid\n");
+        return;
+    }
+    uint8_t *base = (uint8_t *)mainHeader;
+    void *macTarget = base + macKeyOffset;
+    void *slateTarget = base + slateKeyOffset;
+    void *slateUpTarget = base + slateKeyUpOffset;
+    if (memcmp(macTarget, mac_key_prologue, sizeof(mac_key_prologue)) != 0 ||
+        memcmp(slateTarget, slate_key_prologue,
+               sizeof(slate_key_prologue)) != 0 ||
+        memcmp(slateUpTarget, slate_key_up_prologue,
+               sizeof(slate_key_up_prologue)) != 0) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-INPUT-CONSUME install rejected reason=prologue "
+            "mac=%p slate=%p slateUp=%p\n",
+            macTarget, slateTarget, slateUpTarget);
+        return;
+    }
+    static _Atomic bool installed = false;
+    if (atomic_exchange_explicit(&installed, true, memory_order_acq_rel))
+        return;
+    MSHookFunction(macTarget, (void *)macws_stray_mac_key_down_trace,
+                   (void **)&g_macws_stray_mac_key_down_orig);
+    MSHookFunction(slateTarget, (void *)macws_stray_slate_key_down_trace,
+                   (void **)&g_macws_stray_slate_key_down_orig);
+    MSHookFunction(slateUpTarget, (void *)macws_stray_slate_key_up_trace,
+                   (void **)&g_macws_stray_slate_key_up_orig);
+    dprintf(STDERR_FILENO,
+        "#### STRAY-INPUT-CONSUME installed mac=%p/%p slate=%p/%p "
+        "slateUp=%p/%p\n",
+        macTarget, (void *)g_macws_stray_mac_key_down_orig,
+        slateTarget, (void *)g_macws_stray_slate_key_down_orig,
+        slateUpTarget, (void *)g_macws_stray_slate_key_up_orig);
+}
+
+static void macws_stray_render_pass_submit_trace(
+        void *renderPass, uint32_t flags) {
+    if (access("/tmp/macws_stray_wait_trace_capture", F_OK) == 0) {
+        uint32_t sequence = atomic_fetch_add_explicit(
+            &g_macws_stray_submit_flags_count, 1,
+            memory_order_relaxed) + 1;
+        if (sequence <= 64) {
+            uint32_t debugLevel = g_macws_stray_runtime_debug_level
+                ? __atomic_load_n(g_macws_stray_runtime_debug_level,
+                                  __ATOMIC_RELAXED)
+                : UINT32_MAX;
+            dprintf(STDERR_FILENO,
+                "#### STRAY-SUBMIT-FLAGS sequence=%u flags=%#x "
+                "explicitWait=%s runtimeDebugLevel=%u caller=%p\n",
+                sequence, flags, (flags & 0x2) ? "YES" : "NO",
+                debugLevel, __builtin_return_address(0));
+        }
+    }
+    if (g_macws_stray_render_pass_submit_orig)
+        g_macws_stray_render_pass_submit_orig(renderPass, flags);
+}
+
+static void *macws_stray_surface_lock_trace(
+        void *surface, uint32_t mip, uint32_t arraySlice,
+        uint32_t mode, uint32_t *stride, bool singleLayer) {
+    BOOL capture = access(
+        "/tmp/macws_stray_wait_trace_capture", F_OK) == 0;
+    uint32_t sequence = capture ? atomic_fetch_add_explicit(
+        &g_macws_stray_surface_lock_count, 1,
+        memory_order_relaxed) + 1 : 0;
+    void *frames[32] = {0};
+    int frameCount = sequence && sequence <= 16
+        ? backtrace(frames, (int)(sizeof(frames) / sizeof(frames[0]))) : 0;
+    uint64_t begin = sequence && sequence <= 16 ? mach_absolute_time() : 0;
+    if (sequence && sequence <= 16) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SURFACE-LOCK sequence=%u surface=%p mip=%u "
+            "slice=%u mode=%u singleLayer=%s caller=%p frames=%d begin\n",
+            sequence, surface, mip, arraySlice, mode,
+            singleLayer ? "YES" : "NO", __builtin_return_address(0),
+            frameCount);
+        if (frameCount > 0)
+            backtrace_symbols_fd(frames, frameCount, STDERR_FILENO);
+    }
+    void *result = g_macws_stray_surface_lock_orig
+        ? g_macws_stray_surface_lock_orig(
+              surface, mip, arraySlice, mode, stride, singleLayer)
+        : NULL;
+    if (sequence && sequence <= 16) {
+        uint64_t elapsed = mach_absolute_time() - begin;
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SURFACE-LOCK sequence=%u result=%p stride=%u "
+            "elapsedMS=%.3f end\n", sequence, result,
+            stride ? *stride : 0,
+            macws_stray_ticks_to_milliseconds(elapsed));
+    }
+    return result;
+}
+
+static void macws_install_stray_submit_flags_diagnostic(void) {
+    if (!macws_is_stray_process() ||
+        access("/tmp/macws_stray_wait_trace_install", F_OK) != 0) return;
+
+    static const uint8_t stray_uuid[16] = {
+        0xc7, 0x2d, 0x3f, 0x73, 0x25, 0xf4, 0x33, 0x3b,
+        0x91, 0x08, 0x83, 0x43, 0x2e, 0x09, 0xe6, 0x87,
+    };
+    static const uint32_t submit_prologue[] = {
+        0xd10143ff, // sub sp, sp, #0x50
+        0xa9015ff8, // stp x24, x23, [sp, #0x10]
+        0xa90257f6, // stp x22, x21, [sp, #0x20]
+        0xa9034ff4, // stp x20, x19, [sp, #0x30]
+        0xa9047bfd, // stp x29, x30, [sp, #0x40]
+        0x910103fd, // add x29, sp, #0x40
+        0xaa0103f4, // mov x20, x1
+        0xaa0003f3, // mov x19, x0
+    };
+    static const uint32_t surface_lock_prologue[] = {
+        0xd10483ff, // sub sp, sp, #0x120
+        0xa90e5ff8, // stp x24, x23, [sp, #0xe0]
+        0xa90f57f6, // stp x22, x21, [sp, #0xf0]
+        0xa9104ff4, // stp x20, x19, [sp, #0x100]
+        0xa9117bfd, // stp x29, x30, [sp, #0x110]
+        0x910443fd, // add x29, sp, #0x110
+        0xaa0503f7, // mov x23, x5
+        0xaa0403f4, // mov x20, x4
+    };
+    const uintptr_t submitOffset = 0x1210218;
+    const uintptr_t surfaceLockOffset = 0x1239d34;
+    const uintptr_t debugLevelOffset = 0x53bc010;
+    const struct mach_header *mainHeader = NULL;
+    for (uint32_t index = 0; index < _dyld_image_count(); index++) {
+        const struct mach_header *header = _dyld_get_image_header(index);
+        if (header && header->filetype == MH_EXECUTE &&
+            macws_macho_has_uuid(header, stray_uuid)) {
+            mainHeader = header;
+            break;
+        }
+    }
+    if (!mainHeader) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SUBMIT-FLAGS install rejected reason=uuid\n");
+        return;
+    }
+    uint8_t *base = (uint8_t *)mainHeader;
+    void *target = base + submitOffset;
+    if (memcmp(target, submit_prologue, sizeof(submit_prologue)) != 0) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SUBMIT-FLAGS install rejected reason=prologue "
+            "target=%p\n", target);
+        return;
+    }
+    static _Atomic bool installed = false;
+    if (atomic_exchange_explicit(&installed, true, memory_order_acq_rel))
+        return;
+    g_macws_stray_runtime_debug_level =
+        (const uint32_t *)(base + debugLevelOffset);
+    MSHookFunction(target, (void *)macws_stray_render_pass_submit_trace,
+                   (void **)&g_macws_stray_render_pass_submit_orig);
+    dprintf(STDERR_FILENO,
+        "#### STRAY-SUBMIT-FLAGS installed target=%p original=%p "
+        "runtimeDebugLevel=%u\n", target,
+        (void *)g_macws_stray_render_pass_submit_orig,
+        __atomic_load_n(g_macws_stray_runtime_debug_level,
+                        __ATOMIC_RELAXED));
+
+    void *surfaceLockTarget = base + surfaceLockOffset;
+    if (memcmp(surfaceLockTarget, surface_lock_prologue,
+               sizeof(surface_lock_prologue)) != 0) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SURFACE-LOCK install rejected reason=prologue "
+            "target=%p\n", surfaceLockTarget);
+        return;
+    }
+    MSHookFunction(surfaceLockTarget,
+                   (void *)macws_stray_surface_lock_trace,
+                   (void **)&g_macws_stray_surface_lock_orig);
+    dprintf(STDERR_FILENO,
+        "#### STRAY-SURFACE-LOCK installed target=%p original=%p\n",
+        surfaceLockTarget, (void *)g_macws_stray_surface_lock_orig);
 }
 
 // Match mac_hooks.m's production/diagnostic boundary. This is intentionally
@@ -788,6 +1970,13 @@ static CFDictionaryRef macws_cgsession_public_compat(void) {
 }
 
 static void macws_install_cgsession_login_handoff_compatibility(void) {
+    // The provider is an AppKit login-state dependency.  Headless tools and
+    // daemons cannot consume this result, and patching the shared-cache entry
+    // while a short-lived utility is still in dyld initialization can block
+    // ElleKit's stop-the-world allocator.  Use framework capability rather
+    // than an executable-name list: every real consumer has NSApplication
+    // loaded before this constructor, while defaults/cfprefsd do not.
+    if (!objc_getClass("NSApplication")) return;
     void *privateProvider = dlsym(
         RTLD_DEFAULT, "CGSSessionCopyCurrentSessionProperties");
     void *publicProvider = dlsym(
@@ -827,6 +2016,139 @@ typedef Boolean (*macws_cfurl_copy_resource_property_fn)(
     CFURLRef, CFStringRef, void *, CFErrorRef *);
 static macws_cfurl_copy_resource_property_fn
     macws_cfurl_copy_resource_property_orig = NULL;
+
+// A chroot does not create a separate CF distributed-notification namespace.
+// Runtime-confirmed on iPadOS 16.3 (2026-08-21): Ventura lsd posts
+// `com.apple.LaunchServices.applicationRegistered`; the outer iOS dmd consumes
+// that notification and posts `dmf.policy.monitor.app`; Finder and Dock then
+// receive the iOS policy notification and synchronously ask LaunchServices for
+// their application DMF policy. Finder's captured stack was:
+//
+//   DMFPolicyMonitor registration callback
+//   -> TFSInfo::FetchApplicationDMFPolicy
+//   -> prepareApplicationDeviceManagementPolicyValue
+//   -> _LSFindOrRegisterBundleNode
+//   -> _LSRegisterItemInfo
+//
+// That registration posts applicationRegistered again, closing a loop that
+// held the session lsd near 80% CPU at an otherwise idle desktop. Preserve the
+// complete distributed-notification protocol among macOS peers, but map this
+// one cross-OS-colliding name symmetrically at the CoreFoundation boundary.
+// iOS processes do not load libmachook, so their dmd remains subscribed to the
+// stock name and cannot consume the private MacWS event. This does not suppress
+// registration, DMF evaluation, callbacks, or delivery among chroot clients.
+typedef void (*macws_cf_notification_post_options_fn)(
+    CFNotificationCenterRef, CFNotificationName, const void *,
+    CFDictionaryRef, CFOptionFlags);
+typedef void (*macws_cf_notification_post_fn)(
+    CFNotificationCenterRef, CFNotificationName, const void *,
+    CFDictionaryRef, Boolean);
+typedef void (*macws_cf_notification_add_observer_fn)(
+    CFNotificationCenterRef, const void *, CFNotificationCallback,
+    CFNotificationName, const void *, CFNotificationSuspensionBehavior);
+typedef void (*macws_cf_notification_remove_observer_fn)(
+    CFNotificationCenterRef, const void *, CFNotificationName, const void *);
+
+// Public on macOS (runtime symbol: CoreFoundation.__TEXT+0x446b4 on the
+// installed Ventura cache), intentionally absent from the iPhoneOS SDK.
+extern CFNotificationCenterRef CFNotificationCenterGetDistributedCenter(void);
+
+static macws_cf_notification_post_options_fn
+    macws_cf_notification_post_options_orig = NULL;
+static macws_cf_notification_post_fn macws_cf_notification_post_orig = NULL;
+static macws_cf_notification_add_observer_fn
+    macws_cf_notification_add_observer_orig = NULL;
+static macws_cf_notification_remove_observer_fn
+    macws_cf_notification_remove_observer_orig = NULL;
+
+static CFNotificationName macws_private_distributed_notification_name(
+    CFNotificationCenterRef center, CFNotificationName name) {
+    if (!center || !name ||
+        center != CFNotificationCenterGetDistributedCenter()) return name;
+
+    static dispatch_once_t once;
+    static CFStringRef publicName = NULL;
+    static CFStringRef privateName = NULL;
+    dispatch_once(&once, ^{
+        publicName = CFStringCreateWithCString(
+            kCFAllocatorDefault,
+            "com.apple.LaunchServices.applicationRegistered",
+            kCFStringEncodingUTF8);
+        privateName = CFStringCreateWithCString(
+            kCFAllocatorDefault,
+            "com.macwsguide.macOS.LaunchServices.applicationRegistered",
+            kCFStringEncodingUTF8);
+    });
+    return publicName && privateName && CFEqual(name, publicName)
+        ? privateName : name;
+}
+
+static void macws_cf_notification_post_options_compat(
+    CFNotificationCenterRef center, CFNotificationName name,
+    const void *object, CFDictionaryRef userInfo, CFOptionFlags options) {
+    CFNotificationName mapped =
+        macws_private_distributed_notification_name(center, name);
+    macws_cf_notification_post_options_orig(
+        center, mapped, object, userInfo, options);
+}
+
+static void macws_cf_notification_post_compat(
+    CFNotificationCenterRef center, CFNotificationName name,
+    const void *object, CFDictionaryRef userInfo, Boolean immediately) {
+    CFNotificationName mapped =
+        macws_private_distributed_notification_name(center, name);
+    macws_cf_notification_post_orig(
+        center, mapped, object, userInfo, immediately);
+}
+
+static void macws_cf_notification_add_observer_compat(
+    CFNotificationCenterRef center, const void *observer,
+    CFNotificationCallback callback, CFNotificationName name,
+    const void *object, CFNotificationSuspensionBehavior behavior) {
+    CFNotificationName mapped =
+        macws_private_distributed_notification_name(center, name);
+    macws_cf_notification_add_observer_orig(
+        center, observer, callback, mapped, object, behavior);
+}
+
+static void macws_cf_notification_remove_observer_compat(
+    CFNotificationCenterRef center, const void *observer,
+    CFNotificationName name, const void *object) {
+    CFNotificationName mapped =
+        macws_private_distributed_notification_name(center, name);
+    macws_cf_notification_remove_observer_orig(
+        center, observer, mapped, object);
+}
+
+static void macws_install_distributed_notification_namespace_compatibility(
+    void) {
+    const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
+    if (!hostRoot || hostRoot[0] != '/') return;
+
+    void *postOptions = dlsym(
+        RTLD_DEFAULT, "CFNotificationCenterPostNotificationWithOptions");
+    void *post = dlsym(RTLD_DEFAULT, "CFNotificationCenterPostNotification");
+    void *add = dlsym(RTLD_DEFAULT, "CFNotificationCenterAddObserver");
+    void *remove = dlsym(RTLD_DEFAULT, "CFNotificationCenterRemoveObserver");
+    if (postOptions) {
+        MSHookFunction(
+            postOptions, (void *)macws_cf_notification_post_options_compat,
+            (void **)&macws_cf_notification_post_options_orig);
+    }
+    if (post) {
+        MSHookFunction(post, (void *)macws_cf_notification_post_compat,
+                       (void **)&macws_cf_notification_post_orig);
+    }
+    if (add) {
+        MSHookFunction(add, (void *)macws_cf_notification_add_observer_compat,
+                       (void **)&macws_cf_notification_add_observer_orig);
+    }
+    if (remove) {
+        MSHookFunction(
+            remove, (void *)macws_cf_notification_remove_observer_compat,
+            (void **)&macws_cf_notification_remove_observer_orig);
+    }
+}
 
 static BOOL macws_needs_application_mount_namespace_compatibility(void) {
     // Third-party AppKit executables launched through macwshostd's validated
@@ -3818,6 +5140,44 @@ static void macws_iogpu_dump_error_user_info(id error) {
                     "value=%p class=%s\n",
                     (unsigned long)i, key_text, (__bridge void *)value,
                     value_class);
+                if ([key isKindOfClass:[NSString class]] &&
+                    [key isEqualToString:MTLCommandBufferEncoderInfoErrorKey] &&
+                    [value isKindOfClass:[NSArray class]]) {
+                    NSArray *encoder_infos = (NSArray *)value;
+                    NSUInteger encoder_count = [encoder_infos count];
+                    NSUInteger encoder_limit = encoder_count < 128
+                        ? encoder_count : 128;
+                    fprintf(stderr,
+                        "#### IOGPU-CALLBACK-ENCODER-INFO count=%lu "
+                        "limit=%lu\n",
+                        (unsigned long)encoder_count,
+                        (unsigned long)encoder_limit);
+                    for (NSUInteger encoder_index = 0;
+                         encoder_index < encoder_limit; encoder_index++) {
+                        id<MTLCommandBufferEncoderInfo> info =
+                            [encoder_infos objectAtIndex:encoder_index];
+                        NSString *label = [info respondsToSelector:@selector(label)]
+                            ? [info label] : nil;
+                        NSInteger error_state =
+                            [info respondsToSelector:@selector(errorState)]
+                            ? (NSInteger)[info errorState] : -1;
+                        id signposts =
+                            [info respondsToSelector:@selector(debugSignposts)]
+                            ? [info debugSignposts] : nil;
+                        fprintf(stderr,
+                            "#### IOGPU-CALLBACK-ENCODER-INFO-ENTRY "
+                            "index=%lu object=%p class=%s label=%s "
+                            "errorState=%ld signposts=%s\n",
+                            (unsigned long)encoder_index,
+                            (__bridge void *)info,
+                            info ? class_getName([info class]) : "(nil)",
+                            label ? [label UTF8String] : "(nil)",
+                            (long)error_state,
+                            signposts
+                                ? [[signposts description] UTF8String]
+                                : "(nil)");
+                    }
+                }
             }
         }
     } @catch (NSException *exception) {
@@ -3890,16 +5250,28 @@ static void macws_iogpu_buffer_complete(id self, SEL selector,
             (void)macws_agx_submit_dimensions(
                 submit_serial, &submit_width, &submit_height);
         }
-        if (!error && fixed_count >= 8) {
+        // The ordinary error flight-recorder logs only the larger translated
+        // batches.  MetalFX's cross-queue worker is a one-record submission,
+        // so that threshold made its absence/presence at the failing fence
+        // impossible to distinguish.  During Stray's explicit pipeline
+        // diagnostic, also report every mapped translated completion.  This
+        // remains read-only and bounded to the opted-in game process; the
+        // callback, status, and command-buffer lifetime are unchanged.
+        BOOL trace_mapped_metalfx_completion =
+            macws_is_stray_process() && macws_pipeline_diag_enabled() &&
+            fixed_count > 0;
+        if (!error &&
+            (fixed_count >= 8 || trace_mapped_metalfx_completion)) {
             fprintf(stderr,
                 "#### IOGPU-CALLBACK-BUFFER-CLEAN commandBuffer=%p "
                 "class=%s submitSerial=%llu fixed=%u target=%ux%u "
-                "start=%#llx end=%#llx\n",
+                "start=%#llx end=%#llx pipelineMapped=%s\n",
                 (__bridge void *)self, class_getName([self class]),
                 (unsigned long long)submit_serial, fixed_count,
                 submit_width, submit_height,
                 (unsigned long long)start_time,
-                (unsigned long long)end_time);
+                (unsigned long long)end_time,
+                trace_mapped_metalfx_completion ? "YES" : "NO");
             int expected_clean_dump = 0;
             uint32_t fault_width = atomic_load(
                 &g_macws_iogpu_page_fault_width);
@@ -4606,6 +5978,8 @@ static inline uint8_t macws_half_to_u8(uint16_t h) {
 // StartComposite argument may be released as soon as its hook returns.
 static id<MTLTexture> g_vnc_comp_tex = nil;
 static id g_vnc_lock = nil;
+// Legacy second-queue VNC capture only. Final-composite admission below must
+// never consult this process-lifetime watermark.
 static _Atomic uint64_t g_vnc_comp_max_area = 0;
 static id macws_vnc_retain(id obj) {
 #if __has_feature(objc_arc)
@@ -6166,23 +7540,36 @@ void macws_vnc_complete_composite(void *context) {
     // matching command buffer at MetalContext+0x68 has actually completed.
     if (width >= 1000 && height >= 600 &&
         (pixelFormat == 550 || pixelFormat == 80 || pixelFormat == 115)) {
-        // The same MetalContext also completes per-window intermediates. Keep
-        // the largest display-sized target invariant for PF550 as well as the
-        // PF80 blit path; otherwise a later 1140x798 Terminal composite can
-        // replace the completed 2388x1668 scanout before EndUpdate publishes
-        // it, producing the magnified/cropped VNC frame seen at runtime.
+        // The same MetalContext also completes per-window intermediates. Pick
+        // an authority within this update: a process-owned scanout always
+        // outranks an intermediate, while unowned candidates compete by area.
+        // A process-lifetime maximum is invalid here. A transient 2500x1702
+        // intermediate was runtime-observed to raise that maximum to 4,255,000
+        // pixels and permanently reject the real 2388x1668 (3,983,184-pixel)
+        // desktop target, freezing final-composite publication at sequence
+        // 38410. The pending dictionary is cleared by EndUpdate, so comparing
+        // against its current value preserves the intended per-update scope.
         uint64_t candidateArea = (uint64_t)width * height;
-        uint64_t maxArea = atomic_load(&g_vnc_comp_max_area);
-        while (candidateArea > maxArea &&
-               !atomic_compare_exchange_weak(&g_vnc_comp_max_area,
-                                             &maxArea, candidateArea)) {}
-        maxArea = atomic_load(&g_vnc_comp_max_area);
-        if (candidateArea >= maxArea) {
-            BOOL replacedPending = NO;
-            @synchronized(g_vnc_composite_stages) {
-                replacedPending = g_vnc_composite_pending[key] != nil;
-                g_vnc_composite_pending[key] = texture;
+        BOOL candidateOwned = macws_is_owned_scanout_texture(texture);
+        BOOL replacedPending = NO;
+        BOOL accepted = NO;
+        uint64_t existingArea = 0;
+        BOOL existingOwned = NO;
+        @synchronized(g_vnc_composite_stages) {
+            id<MTLTexture> existing = g_vnc_composite_pending[key];
+            replacedPending = existing != nil;
+            if (existing) {
+                existingArea = (uint64_t)[existing width] *
+                    (uint64_t)[existing height];
+                existingOwned = macws_is_owned_scanout_texture(existing);
             }
+            accepted = MacWSCompositeCandidateShouldReplace(
+                replacedPending, existingOwned, existingArea,
+                candidateOwned, candidateArea);
+            if (accepted)
+                g_vnc_composite_pending[key] = texture;
+        }
+        if (accepted) {
             uint64_t completed = 0, replaced = 0;
             if (macws_runtime_diagnostics_enabled()) {
                 completed =
@@ -6195,9 +7582,11 @@ void macws_vnc_complete_composite(void *context) {
                 (completed <= 32 || (completed % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-FLOW staged #%llu context=%p tex=%p "
-                    "%zux%zu pf=%lu replaced=%s replaceTotal=%llu\n",
+                    "%zux%zu pf=%lu owned=%s replaced=%s "
+                    "replaceTotal=%llu\n",
                     (unsigned long long)completed, context, (void *)texture,
                     width, height, pixelFormat,
+                    candidateOwned ? "YES" : "NO",
                     replacedPending ? "YES" : "NO",
                     (unsigned long long)replaced);
             }
@@ -6209,10 +7598,13 @@ void macws_vnc_complete_composite(void *context) {
                 (rejected <= 8 || (rejected % 600) == 0)) {
                 fprintf(stderr,
                     "#### VNC-ENDCOMPOSITE reject intermediate #%u "
-                    "%zux%zu pf=%lu area=%llu displayArea=%llu\n",
+                    "%zux%zu pf=%lu owned=%s area=%llu "
+                    "existingOwned=%s existingArea=%llu\n",
                     rejected, width, height, pixelFormat,
+                    candidateOwned ? "YES" : "NO",
                     (unsigned long long)candidateArea,
-                    (unsigned long long)maxArea);
+                    existingOwned ? "YES" : "NO",
+                    (unsigned long long)existingArea);
             }
         }
     }
@@ -6270,8 +7662,14 @@ static void macws_vnc_process_completion_observation(
     }
     NSError *error = status == MTLCommandBufferStatusError
         ? [commandBuffer error] : nil;
-    NSInteger errorCode = error ? [error code] : 0;
-    NSString *errorDomain = error ? [error domain] : nil;
+    // Runtime-confirmed by WindowServer-2026-08-22-035831.ips: the private
+    // AGX command buffer returned a non-nil error pointer whose `-domain`
+    // dispatch faulted at 0x10 on this cross-image ObjC runtime. Completion
+    // admission needs the public command-buffer status, not NSError metadata.
+    // Keep the opaque pointer as a diagnostic witness but never dispatch ObjC
+    // methods to it from this production observer.
+    NSInteger errorCode = 0;
+    NSString *errorDomain = nil;
     unsigned long completedPF = (unsigned long)[texture pixelFormat];
     static _Atomic int pollLog = 0;
     int n = diagnostics ? atomic_fetch_add(&pollLog, 1) : INT_MAX;
@@ -6286,8 +7684,7 @@ static void macws_vnc_process_completion_observation(
             (void *)commandBuffer, (long)status, polls,
             (void *)error, (void *)errorDomain, (long)errorCode);
     }
-    BOOL completedCleanly =
-        status == MTLCommandBufferStatusCompleted && !error;
+    BOOL completedCleanly = status == MTLCommandBufferStatusCompleted;
     if (completedCleanly) macws_publish_graphics_ready_once();
     if (completedPF == 550) {
         macws_observe_pf550_metadata(texture, submitSerial,
@@ -6318,14 +7715,10 @@ static void macws_vnc_process_completion_observation(
     if (diagnostics && !completedCleanly && error && errorTotal <= 4) {
         macws_log_failed_texture_descriptor(
             texture, (__bridge const void *)commandBuffer, submitSerial);
-        NSString *errorDescription = [error description];
-        NSDictionary *errorUserInfo = [error userInfo];
         fprintf(stderr,
-            "#### VNC-FLOW command-error #%llu description=%s "
-            "userInfo=%s\n",
-            (unsigned long long)errorTotal,
-            [errorDescription UTF8String] ?: "(nil)",
-            [[errorUserInfo description] UTF8String] ?: "(nil)");
+            "#### VNC-FLOW command-error #%llu error=%p "
+            "metadata=unsafe-private-object\n",
+            (unsigned long long)errorTotal, (void *)error);
         if (errorTotal == 1)
             macws_log_command_buffer_ivars(commandBuffer);
         if (errorTotal == 1)
@@ -11593,6 +12986,29 @@ typedef id (*macws_new_library_data_fn)(id, SEL, dispatch_data_t, NSError **)
 static macws_new_library_data_fn g_macws_new_library_data_orig = NULL;
 static _Atomic uint32_t g_macws_new_library_data_count = 0;
 
+// Stray creates UE graphics pipelines lazily as a level begins accepting
+// input.  A macOS-target MTLB can load successfully and only fail later when
+// AGX specializes one of its functions, so an NSError from
+// -newLibraryWithData:error: is not a sufficient failure witness.  Retain a
+// small process-local ring of byte-exact, not-yet-substituted MTLBs and write
+// it only after a real render/compute pipeline call returns nil.  Production
+// already maps and hashes these <=256 KiB containers for exact substitution;
+// this adds no normal-path file I/O and at most 16 MiB of retained input.
+// The original Metal result/error is never changed.
+#define MACWS_STRAY_FAILURE_LIBRARY_CAP 64u
+typedef struct {
+    dispatch_data_t data;
+    size_t length;
+    uint64_t hash;
+    uint32_t sequence;
+} MacWSStrayFailureLibrary;
+static pthread_mutex_t g_macws_stray_failure_library_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static MacWSStrayFailureLibrary
+    g_macws_stray_failure_libraries[MACWS_STRAY_FAILURE_LIBRARY_CAP];
+static uint32_t g_macws_stray_failure_library_cursor = 0;
+static _Atomic uint32_t g_macws_stray_pipeline_failure_dumped = 0;
+
 static uint64_t macws_source_fnv1a64(const void *data, size_t length) {
     const uint8_t *bytes = (const uint8_t *)data;
     uint64_t hash = UINT64_C(1469598103934665603);
@@ -11601,6 +13017,115 @@ static uint64_t macws_source_fnv1a64(const void *data, size_t length) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
+}
+
+static void macws_remember_unknown_stray_library(
+        dispatch_data_t data, size_t length, uint64_t hash,
+        uint32_t sequence) {
+    if (!macws_is_stray_process() || !data || !hash || length < 24 ||
+        length > 256U * 1024U) return;
+
+    pthread_mutex_lock(&g_macws_stray_failure_library_lock);
+    for (size_t index = 0; index < MACWS_STRAY_FAILURE_LIBRARY_CAP; index++) {
+        MacWSStrayFailureLibrary *entry =
+            &g_macws_stray_failure_libraries[index];
+        if (entry->data && entry->length == length && entry->hash == hash) {
+            entry->sequence = sequence;
+            pthread_mutex_unlock(&g_macws_stray_failure_library_lock);
+            return;
+        }
+    }
+    size_t slot = g_macws_stray_failure_library_cursor++ %
+        MACWS_STRAY_FAILURE_LIBRARY_CAP;
+    MacWSStrayFailureLibrary *entry =
+        &g_macws_stray_failure_libraries[slot];
+    dispatch_data_t previous = entry->data;
+    dispatch_retain(data);
+    entry->data = data;
+    entry->length = length;
+    entry->hash = hash;
+    entry->sequence = sequence;
+    pthread_mutex_unlock(&g_macws_stray_failure_library_lock);
+    if (previous) dispatch_release(previous);
+}
+
+static void macws_dump_unknown_stray_libraries_after_pipeline_failure(
+        const char *pipeline_kind, NSError *error) {
+    if (!macws_is_stray_process() ||
+        atomic_exchange_explicit(&g_macws_stray_pipeline_failure_dumped, 1,
+                                 memory_order_acq_rel)) return;
+
+    MacWSStrayFailureLibrary snapshot[MACWS_STRAY_FAILURE_LIBRARY_CAP] = {0};
+    size_t count = 0;
+    pthread_mutex_lock(&g_macws_stray_failure_library_lock);
+    for (size_t index = 0; index < MACWS_STRAY_FAILURE_LIBRARY_CAP; index++) {
+        MacWSStrayFailureLibrary *entry =
+            &g_macws_stray_failure_libraries[index];
+        if (!entry->data) continue;
+        snapshot[count] = *entry;
+        dispatch_retain(snapshot[count].data);
+        count++;
+    }
+    pthread_mutex_unlock(&g_macws_stray_failure_library_lock);
+
+    size_t written_files = 0;
+    for (size_t index = 0; index < count; index++) {
+        MacWSStrayFailureLibrary *entry = &snapshot[index];
+        const void *bytes = NULL;
+        size_t length = 0;
+        dispatch_data_t mapped = dispatch_data_create_map(
+            entry->data, &bytes, &length);
+        uint32_t magic = 0;
+        if (bytes && length >= sizeof(magic))
+            memcpy(&magic, bytes, sizeof(magic));
+        if (bytes && length == entry->length &&
+            magic == UINT32_C(0x424c544d) &&
+            macws_source_fnv1a64(bytes, length) == entry->hash) {
+            char path[PATH_MAX] = {0};
+            const char *disposition = "open-failed";
+            int saved_errno = 0;
+            snprintf(path, sizeof(path),
+                     "/private/tmp/macws_mtl_data_%04u_%016llx.bin",
+                     entry->sequence, (unsigned long long)entry->hash);
+            int fd = open(path,
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (fd >= 0) {
+                const uint8_t *cursor = (const uint8_t *)bytes;
+                size_t remaining = length;
+                while (remaining) {
+                    ssize_t amount = write(fd, cursor, remaining);
+                    if (amount <= 0) break;
+                    cursor += amount;
+                    remaining -= (size_t)amount;
+                }
+                close(fd);
+                if (remaining == 0) {
+                    written_files++;
+                    disposition = "written";
+                } else {
+                    disposition = "short-write";
+                }
+            } else {
+                saved_errno = errno;
+                if (saved_errno == EEXIST) disposition = "existing";
+            }
+            dprintf(STDERR_FILENO,
+                "#### STRAY-PIPELINE-FAILURE-SOURCE sequence=%u "
+                "length=%zu hash=%016llx path=%s disposition=%s errno=%d\n",
+                entry->sequence, entry->length,
+                (unsigned long long)entry->hash, path, disposition,
+                saved_errno);
+        }
+        if (mapped) dispatch_release(mapped);
+        dispatch_release(entry->data);
+    }
+    dprintf(STDERR_FILENO,
+        "#### STRAY-PIPELINE-FAILURE-CAPTURE kind=%s retained=%zu "
+        "written=%zu errorDomain=%s errorCode=%ld description=%s\n",
+        pipeline_kind ?: "unknown", count, written_files,
+        error ? error.domain.UTF8String : "(nil)",
+        error ? (long)error.code : 0L,
+        error ? error.localizedDescription.UTF8String : "(nil)");
 }
 
 // Chromium 148.0.7778.280 embeds ANGLE revision
@@ -11966,6 +13491,142 @@ static dispatch_data_t macws_dynamic_stray_macabi_library(
     return replacement;
 }
 
+extern xpc_connection_t macws_xpc_connection_create_mach_service_raw(
+    const char *, dispatch_queue_t, uint64_t)
+    __asm("_xpc_connection_create_mach_service");
+
+static uint16_t macws_metal_read_u16(const uint8_t *bytes, size_t offset) {
+    uint16_t value = 0;
+    memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+static uint64_t macws_metal_read_u64(const uint8_t *bytes, size_t offset) {
+    uint64_t value = 0;
+    memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+static BOOL macws_validate_retargetable_metal_library(
+        const void *storage, size_t length, BOOL source,
+        uint64_t expected_hash) {
+    const uint8_t *bytes = (const uint8_t *)storage;
+    if (!bytes || length < 88 || length > 1024U * 1024U ||
+        memcmp(bytes, "MTLB", 4) != 0 ||
+        macws_metal_read_u64(bytes, 16) != length ||
+        macws_metal_read_u16(bytes, 4) != UINT16_C(0x8001)) return NO;
+    uint8_t target_os = bytes[11];
+    if (source) {
+        if (target_os != 0x00 && target_os != 0x81) return NO;
+    } else if (target_os != 0x86) {
+        return NO;
+    }
+    static const size_t section_offsets[] = {24, 40, 56, 72};
+    for (size_t index = 0;
+         index < sizeof(section_offsets) / sizeof(section_offsets[0]);
+         index++) {
+        size_t field = section_offsets[index];
+        uint64_t offset = macws_metal_read_u64(bytes, field);
+        uint64_t size = macws_metal_read_u64(bytes, field + 8);
+        if (offset > length || size > length - offset ||
+            ((index == 0 || index == 3) &&
+             (offset < 88 || size == 0))) return NO;
+    }
+    return !expected_hash ||
+        macws_source_fnv1a64(bytes, length) == expected_hash;
+}
+
+// Root-side macwshostd owns the LLVM toolchain and exact-cache directory.
+// The injected game process supplies only one structurally validated MTLB and
+// its byte identity; it cannot select a path, executable, or argv.  The reply
+// is copied and revalidated before the original AGX library constructor sees
+// it.  AGX still performs its normal AIR/pipeline verification afterward.
+static dispatch_data_t macws_retarget_stray_metal_library(
+        const void *source_bytes, size_t source_length, uint64_t source_hash) {
+    if (!macws_is_stray_process() ||
+        !macws_validate_retargetable_metal_library(
+            source_bytes, source_length, YES, source_hash)) return NULL;
+
+    xpc_connection_t connection =
+        macws_xpc_connection_create_mach_service_raw(
+            MACWS_CONTROL_SERVICE,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), 0);
+    if (!connection) return NULL;
+    xpc_connection_set_event_handler(connection,
+        ^(xpc_object_t event) { (void)event; });
+    xpc_connection_resume(connection);
+    xpc_object_t request = xpc_dictionary_create(NULL, NULL, 0);
+    if (!request) {
+        xpc_connection_cancel(connection);
+        xpc_release(connection);
+        return NULL;
+    }
+    xpc_dictionary_set_string(request, MACWS_CONTROL_KEY_OP,
+                              MACWS_CONTROL_OP_RETARGET_METAL_LIBRARY);
+    xpc_dictionary_set_uint64(request, MACWS_CONTROL_KEY_SOURCE_LENGTH,
+                              source_length);
+    xpc_dictionary_set_uint64(request, MACWS_CONTROL_KEY_SOURCE_HASH,
+                              source_hash);
+    xpc_dictionary_set_data(request, MACWS_CONTROL_KEY_METAL_LIBRARY,
+                            source_bytes, source_length);
+    xpc_object_t reply = xpc_connection_send_message_with_reply_sync(
+        connection, request);
+
+    dispatch_data_t replacement = NULL;
+    const char *failure = "invalid-reply";
+    if (reply && xpc_get_type(reply) == XPC_TYPE_DICTIONARY) {
+        failure = xpc_dictionary_get_string(reply, "message") ?: "failed";
+        uint64_t echoed_length = xpc_dictionary_get_uint64(
+            reply, MACWS_CONTROL_KEY_SOURCE_LENGTH);
+        uint64_t echoed_hash = xpc_dictionary_get_uint64(
+            reply, MACWS_CONTROL_KEY_SOURCE_HASH);
+        uint64_t replacement_length = xpc_dictionary_get_uint64(
+            reply, MACWS_CONTROL_KEY_REPLACEMENT_LENGTH);
+        uint64_t replacement_hash = xpc_dictionary_get_uint64(
+            reply, MACWS_CONTROL_KEY_REPLACEMENT_HASH);
+        size_t received_length = 0;
+        const void *received = xpc_dictionary_get_data(
+            reply, MACWS_CONTROL_KEY_METAL_LIBRARY, &received_length);
+        if (xpc_dictionary_get_bool(reply, "ok") &&
+            echoed_length == source_length && echoed_hash == source_hash &&
+            replacement_length == received_length &&
+            macws_validate_retargetable_metal_library(
+                received, received_length, NO, replacement_hash)) {
+            void *owned = malloc(received_length);
+            if (owned) {
+                memcpy(owned, received, received_length);
+                replacement = dispatch_data_create(
+                    owned, received_length, NULL,
+                    DISPATCH_DATA_DESTRUCTOR_FREE);
+            }
+            if (replacement) {
+                dprintf(STDERR_FILENO,
+                    "#### STRAY-METAL-AUTOTRANSLATE "
+                    "source=%zu/%016llx replacement=%zu/%016llx "
+                    "cache=%s elapsedMS=%.3f\n",
+                    source_length, (unsigned long long)source_hash,
+                    received_length, (unsigned long long)replacement_hash,
+                    xpc_dictionary_get_bool(reply, "cache_hit")
+                        ? "hit" : "converted",
+                    xpc_dictionary_get_double(reply, "elapsed_ms"));
+            } else {
+                failure = "allocation-failed";
+            }
+        }
+    }
+    if (!replacement) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-METAL-AUTOTRANSLATE-FAIL source=%zu/%016llx "
+            "reason=%s\n", source_length,
+            (unsigned long long)source_hash, failure);
+    }
+    if (reply) xpc_release(reply);
+    xpc_release(request);
+    xpc_connection_cancel(connection);
+    xpc_release(connection);
+    return replacement;
+}
+
 // Read-only observers at the private Metal library-cache/compiler boundary.
 // RE-confirmed against macOS 13.4 Metal UUID
 // 2BAB169C-42DA-36E3-955A-F30B709EC2AD:
@@ -12271,7 +13932,9 @@ static id macws_new_library_source_diag(id self, SEL selector,
     // Chromium creates dozens of UI libraries before the first media shader.
     // Keep this bounded, but large enough that a post-navigation ANGLE failure
     // cannot fall past the recorder as it did with the former 32-call limit.
-    BOOL log_this = sequence <= 256;
+    BOOL diagnostic =
+        access("/private/tmp/macws_mtl_library_diag", F_OK) == 0;
+    BOOL log_this = diagnostic && sequence <= 256;
     const char *source_utf8 = source.UTF8String ?: "";
     size_t source_utf8_length = strlen(source_utf8);
     uint64_t source_hash = macws_source_fnv1a64(source_utf8,
@@ -12327,7 +13990,7 @@ static id macws_new_library_source_diag(id self, SEL selector,
             returned_error ? returned_error.userInfo.description.UTF8String
                            : "(nil)");
     }
-    if (!result && source_utf8_length && sequence <= 256) {
+    if (diagnostic && !result && source_utf8_length && sequence <= 256) {
         char failure_path[PATH_MAX];
         snprintf(failure_path, sizeof(failure_path),
                  "/private/tmp/macws_mtl_source_failure_%016llx.metal",
@@ -12354,6 +14017,449 @@ static id macws_new_library_source_diag(id self, SEL selector,
     return result;
 }
 
+// macOS and iOS differ when a finite float outside binary16's range is
+// written through texture*.write(float4) to an R/RG/RGBA16Float binding.
+// Runtime-confirmed with the same MSL kernel on Apple M1 macOS and this iPad:
+// macOS stores 0x7bff while iOS stores 0x7c00.  A shader's AIR argument type
+// says only `texture2d<float, write>`; the concrete pixel format is not known
+// until encoding.  Keep the ordinary pipeline and a mechanically saturated
+// variant together, then select at dispatch from the real bound textures.
+//
+// The root-owned index is data, not executable policy.  One line describes:
+//   sourceLength sourceFNV variantLength variantFNV function writeTextureMask
+// The variant path is derived from source identity, never supplied by the
+// file.  Multiple function lines may share one library variant.  This makes
+// new witnesses an offline translation/cache operation instead of another
+// function-name branch in libmachook.
+#define MACWS_HALF_FLOAT_VARIANT_CAP 64u
+#define MACWS_HALF_FLOAT_LIBRARY_CAP 32u
+#define MACWS_HALF_FLOAT_FUNCTION_CAP 128u
+#define MACWS_HALF_FLOAT_PIPELINE_CAP 128u
+static const char *kMacWSHalfFloatVariantDirectory =
+    "/usr/local/share/macws/stray/variants";
+static const char *kMacWSHalfFloatVariantIndex =
+    "/usr/local/share/macws/stray/variants/index.meta";
+
+typedef struct {
+    size_t sourceLength;
+    uint64_t sourceHash;
+    size_t variantLength;
+    uint64_t variantHash;
+    char function[128];
+    uint32_t writeTextureMask;
+} MacWSHalfFloatVariantSpec;
+
+typedef struct {
+    uintptr_t ordinaryLibrary;
+    id variantLibrary;
+    size_t sourceLength;
+    uint64_t sourceHash;
+} MacWSHalfFloatLibraryMapping;
+
+typedef struct {
+    uintptr_t ordinaryFunction;
+    id variantFunction;
+    uint32_t writeTextureMask;
+} MacWSHalfFloatFunctionMapping;
+
+typedef struct {
+    uintptr_t ordinaryPipeline;
+    id variantPipeline;
+    uint32_t writeTextureMask;
+} MacWSHalfFloatPipelineMapping;
+
+static dispatch_once_t g_macws_half_float_variant_once;
+static MacWSHalfFloatVariantSpec
+    g_macws_half_float_variant_specs[MACWS_HALF_FLOAT_VARIANT_CAP];
+static size_t g_macws_half_float_variant_count = 0;
+static pthread_mutex_t g_macws_half_float_variant_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static MacWSHalfFloatLibraryMapping
+    g_macws_half_float_libraries[MACWS_HALF_FLOAT_LIBRARY_CAP];
+static size_t g_macws_half_float_library_count = 0;
+static MacWSHalfFloatFunctionMapping
+    g_macws_half_float_functions[MACWS_HALF_FLOAT_FUNCTION_CAP];
+static size_t g_macws_half_float_function_count = 0;
+static MacWSHalfFloatPipelineMapping
+    g_macws_half_float_pipelines[MACWS_HALF_FLOAT_PIPELINE_CAP];
+// Pipeline mappings are append-only after their retained objects are fully
+// initialized. Compute dispatch is a frame hot path, so publish the completed
+// prefix with release/acquire ordering instead of taking the loader mutex for
+// every setComputePipelineState call.
+static _Atomic size_t g_macws_half_float_pipeline_count = 0;
+
+static BOOL macws_half_float_function_name_valid(const char *name) {
+    if (!name || !name[0]) return NO;
+    for (const unsigned char *cursor = (const unsigned char *)name;
+         *cursor; cursor++) {
+        if ((*cursor >= 'a' && *cursor <= 'z') ||
+            (*cursor >= 'A' && *cursor <= 'Z') ||
+            (*cursor >= '0' && *cursor <= '9') ||
+            *cursor == '_' || *cursor == '.' || *cursor == '$') continue;
+        return NO;
+    }
+    return YES;
+}
+
+static void macws_load_half_float_variant_index(void) {
+    if (!macws_is_stray_process() || !getenv("MACWS_AGX_NATIVE")) return;
+    struct stat status = {0};
+    if (stat(kMacWSHalfFloatVariantIndex, &status) != 0 ||
+        status.st_uid != 0 || !S_ISREG(status.st_mode) ||
+        (status.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+        status.st_size <= 0 || status.st_size > 64 * 1024) return;
+    FILE *file = fopen(kMacWSHalfFloatVariantIndex, "r");
+    if (!file) return;
+    char line[512] = {0};
+    BOOL valid = YES;
+    while (fgets(line, sizeof(line), file)) {
+        char *cursor = line;
+        while (*cursor == ' ' || *cursor == '\t') cursor++;
+        if (!*cursor || *cursor == '\n' || *cursor == '#') continue;
+        unsigned long long sourceLength = 0, sourceHash = 0;
+        unsigned long long variantLength = 0, variantHash = 0;
+        unsigned long long writeMask = 0;
+        char function[128] = {0};
+        char trailing = 0;
+        if (sscanf(cursor, "%llu %llx %llu %llx %127s %llx %c",
+                   &sourceLength, &sourceHash,
+                   &variantLength, &variantHash,
+                   function, &writeMask, &trailing) != 6 ||
+            sourceLength < 88 || sourceLength > 1024U * 1024U ||
+            variantLength < 88 || variantLength > 1024U * 1024U ||
+            !sourceHash || !variantHash || !writeMask ||
+            writeMask > UINT32_MAX ||
+            !macws_half_float_function_name_valid(function) ||
+            g_macws_half_float_variant_count >=
+                MACWS_HALF_FLOAT_VARIANT_CAP) {
+            valid = NO;
+            break;
+        }
+        for (size_t index = 0;
+             index < g_macws_half_float_variant_count; index++) {
+            MacWSHalfFloatVariantSpec *old =
+                &g_macws_half_float_variant_specs[index];
+            if (old->sourceLength != (size_t)sourceLength ||
+                old->sourceHash != (uint64_t)sourceHash) continue;
+            if (old->variantLength != (size_t)variantLength ||
+                old->variantHash != (uint64_t)variantHash ||
+                strcmp(old->function, function) == 0) {
+                valid = NO;
+                break;
+            }
+        }
+        if (!valid) break;
+        MacWSHalfFloatVariantSpec *spec =
+            &g_macws_half_float_variant_specs[
+                g_macws_half_float_variant_count++];
+        spec->sourceLength = (size_t)sourceLength;
+        spec->sourceHash = (uint64_t)sourceHash;
+        spec->variantLength = (size_t)variantLength;
+        spec->variantHash = (uint64_t)variantHash;
+        spec->writeTextureMask = (uint32_t)writeMask;
+        snprintf(spec->function, sizeof(spec->function), "%s", function);
+    }
+    fclose(file);
+    if (!valid) {
+        memset(g_macws_half_float_variant_specs, 0,
+               sizeof(g_macws_half_float_variant_specs));
+        g_macws_half_float_variant_count = 0;
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT rejected invalid index=%s\n",
+            kMacWSHalfFloatVariantIndex);
+        return;
+    }
+    if (g_macws_half_float_variant_count) {
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT index=%s entries=%zu\n",
+            kMacWSHalfFloatVariantIndex,
+            g_macws_half_float_variant_count);
+    }
+}
+
+static BOOL macws_half_float_variants_available(void) {
+    dispatch_once(&g_macws_half_float_variant_once, ^{
+        macws_load_half_float_variant_index();
+    });
+    return g_macws_half_float_variant_count != 0;
+}
+
+static const MacWSHalfFloatVariantSpec *
+macws_half_float_spec_for_source(size_t length, uint64_t hash) {
+    if (!macws_half_float_variants_available()) return NULL;
+    for (size_t index = 0;
+         index < g_macws_half_float_variant_count; index++) {
+        MacWSHalfFloatVariantSpec *spec =
+            &g_macws_half_float_variant_specs[index];
+        if (spec->sourceLength == length && spec->sourceHash == hash)
+            return spec;
+    }
+    return NULL;
+}
+
+static void macws_remember_half_float_library(
+        id ordinaryLibrary, id variantLibrary,
+        size_t sourceLength, uint64_t sourceHash) {
+    if (!ordinaryLibrary || !variantLibrary) return;
+    pthread_mutex_lock(&g_macws_half_float_variant_lock);
+    if (g_macws_half_float_library_count < MACWS_HALF_FLOAT_LIBRARY_CAP) {
+        MacWSHalfFloatLibraryMapping *mapping =
+            &g_macws_half_float_libraries[
+                g_macws_half_float_library_count++];
+        mapping->ordinaryLibrary =
+            (uintptr_t)(__bridge void *)[ordinaryLibrary retain];
+        mapping->variantLibrary = [variantLibrary retain];
+        mapping->sourceLength = sourceLength;
+        mapping->sourceHash = sourceHash;
+    }
+    pthread_mutex_unlock(&g_macws_half_float_variant_lock);
+}
+
+static void macws_create_half_float_library_variant(
+        id device, SEL selector, id ordinaryLibrary,
+        size_t sourceLength, uint64_t sourceHash) {
+    const MacWSHalfFloatVariantSpec *spec =
+        macws_half_float_spec_for_source(sourceLength, sourceHash);
+    if (!spec || !g_macws_new_library_data_orig || !ordinaryLibrary) return;
+    char path[PATH_MAX] = {0};
+    snprintf(path, sizeof(path), "%s/%zu-%016llx.metallib",
+             kMacWSHalfFloatVariantDirectory, sourceLength,
+             (unsigned long long)sourceHash);
+    struct stat status = {0};
+    if (stat(path, &status) != 0 || status.st_uid != 0 ||
+        !S_ISREG(status.st_mode) ||
+        (status.st_mode & (S_IWGRP | S_IWOTH)) != 0) return;
+    dispatch_data_t data = macws_load_exact_metal_library(
+        path, spec->variantLength, spec->variantHash);
+    if (!data) return;
+    const void *bytes = NULL;
+    size_t length = 0;
+    dispatch_data_t mapped = dispatch_data_create_map(data, &bytes, &length);
+    BOOL valid = bytes && length == spec->variantLength &&
+        macws_validate_retargetable_metal_library(
+            bytes, length, NO, spec->variantHash);
+    if (mapped) dispatch_release(mapped);
+    if (!valid) {
+        dispatch_release(data);
+        return;
+    }
+    NSError *variantError = nil;
+    id variantLibrary = g_macws_new_library_data_orig(
+        device, selector, data, &variantError);
+    dispatch_release(data);
+    if (!variantLibrary) {
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT library source=%zu/%016llx "
+            "result=nil errorDomain=%s errorCode=%ld description=%s\n",
+            sourceLength, (unsigned long long)sourceHash,
+            variantError ? variantError.domain.UTF8String : "(nil)",
+            variantError ? (long)variantError.code : 0L,
+            variantError
+                ? variantError.localizedDescription.UTF8String : "(nil)");
+        return;
+    }
+    macws_remember_half_float_library(
+        ordinaryLibrary, variantLibrary, sourceLength, sourceHash);
+    dprintf(STDERR_FILENO,
+        "#### METAL-HALF-VARIANT library source=%zu/%016llx "
+        "ordinary=%p variant=%p path=%s\n",
+        sourceLength, (unsigned long long)sourceHash,
+        (__bridge void *)ordinaryLibrary,
+        (__bridge void *)variantLibrary, path);
+    [variantLibrary release];
+}
+
+typedef id (*macws_library_new_function_fn)(id, SEL, NSString *)
+    __attribute__((ns_returns_retained));
+static macws_library_new_function_fn
+    g_macws_half_float_new_function_orig = NULL;
+static macws_library_new_function_fn g_macws_skylight_function_orig = NULL;
+
+static id macws_skylight_function_compat(
+        id self, SEL selector, NSString *name)
+    __attribute__((ns_returns_retained));
+
+static id macws_half_float_record_function(
+        id library, SEL selector, NSString *name, id ordinaryFunction)
+    __attribute__((ns_returns_retained));
+static id macws_half_float_record_function(
+        id library, SEL selector, NSString *name, id ordinaryFunction) {
+    // This compatibility layer does not replace the function returned to the
+    // caller. It records the paired half-float function for the later
+    // pipeline/encoder adapter. Keeping that operation separate from the
+    // concrete _MTLLibrary entry point lets it compose with metal2metal's
+    // library route without building a second Objective-C hook chain.
+    if (!ordinaryFunction || !name.length) return ordinaryFunction;
+    if (!g_macws_half_float_new_function_orig) return ordinaryFunction;
+
+    id variantLibrary = nil;
+    size_t sourceLength = 0;
+    uint64_t sourceHash = 0;
+    uintptr_t libraryValue = (uintptr_t)(__bridge void *)library;
+    pthread_mutex_lock(&g_macws_half_float_variant_lock);
+    for (size_t index = 0;
+         index < g_macws_half_float_library_count; index++) {
+        MacWSHalfFloatLibraryMapping *mapping =
+            &g_macws_half_float_libraries[index];
+        if (mapping->ordinaryLibrary != libraryValue) continue;
+        variantLibrary = mapping->variantLibrary;
+        sourceLength = mapping->sourceLength;
+        sourceHash = mapping->sourceHash;
+        break;
+    }
+    pthread_mutex_unlock(&g_macws_half_float_variant_lock);
+    if (!variantLibrary) return ordinaryFunction;
+
+    uint32_t writeTextureMask = 0;
+    for (size_t index = 0;
+         index < g_macws_half_float_variant_count; index++) {
+        MacWSHalfFloatVariantSpec *spec =
+            &g_macws_half_float_variant_specs[index];
+        if (spec->sourceLength == sourceLength &&
+            spec->sourceHash == sourceHash &&
+            strcmp(spec->function, name.UTF8String ?: "") == 0) {
+            writeTextureMask = spec->writeTextureMask;
+            break;
+        }
+    }
+    if (!writeTextureMask) return ordinaryFunction;
+    id variantFunction = g_macws_half_float_new_function_orig(
+        variantLibrary, selector, name);
+    if (!variantFunction) return ordinaryFunction;
+    pthread_mutex_lock(&g_macws_half_float_variant_lock);
+    if (g_macws_half_float_function_count <
+            MACWS_HALF_FLOAT_FUNCTION_CAP) {
+        MacWSHalfFloatFunctionMapping *mapping =
+            &g_macws_half_float_functions[
+                g_macws_half_float_function_count++];
+        mapping->ordinaryFunction =
+            (uintptr_t)(__bridge void *)[ordinaryFunction retain];
+        mapping->variantFunction = [variantFunction retain];
+        mapping->writeTextureMask = writeTextureMask;
+    }
+    pthread_mutex_unlock(&g_macws_half_float_variant_lock);
+    dprintf(STDERR_FILENO,
+        "#### METAL-HALF-VARIANT function=%s ordinary=%p variant=%p "
+        "writeTextureMask=%#x\n",
+        name.UTF8String ?: "(nil)",
+        (__bridge void *)ordinaryFunction,
+        (__bridge void *)variantFunction, writeTextureMask);
+    [variantFunction release];
+    return ordinaryFunction;
+}
+
+static id macws_half_float_new_function(
+        id library, SEL selector, NSString *name)
+    __attribute__((ns_returns_retained));
+static id macws_half_float_new_function(
+        id library, SEL selector, NSString *name) {
+    id ordinaryFunction = g_macws_half_float_new_function_orig
+        ? g_macws_half_float_new_function_orig(library, selector, name) : nil;
+    return macws_half_float_record_function(
+        library, selector, name, ordinaryFunction);
+}
+
+static BOOL macws_half_float_variant_for_function(
+        id ordinaryFunction, id *variantFunction,
+        uint32_t *writeTextureMask) {
+    uintptr_t value = (uintptr_t)(__bridge void *)ordinaryFunction;
+    BOOL found = NO;
+    pthread_mutex_lock(&g_macws_half_float_variant_lock);
+    for (size_t index = 0;
+         index < g_macws_half_float_function_count; index++) {
+        MacWSHalfFloatFunctionMapping *mapping =
+            &g_macws_half_float_functions[index];
+        if (mapping->ordinaryFunction != value) continue;
+        if (variantFunction) *variantFunction = mapping->variantFunction;
+        if (writeTextureMask)
+            *writeTextureMask = mapping->writeTextureMask;
+        found = YES;
+        break;
+    }
+    pthread_mutex_unlock(&g_macws_half_float_variant_lock);
+    return found;
+}
+
+static void macws_remember_half_float_pipeline(
+        id ordinaryPipeline, id variantPipeline, uint32_t writeTextureMask) {
+    if (!ordinaryPipeline || !variantPipeline || !writeTextureMask) return;
+    pthread_mutex_lock(&g_macws_half_float_variant_lock);
+    size_t count = atomic_load_explicit(
+        &g_macws_half_float_pipeline_count, memory_order_relaxed);
+    if (count < MACWS_HALF_FLOAT_PIPELINE_CAP) {
+        MacWSHalfFloatPipelineMapping *mapping =
+            &g_macws_half_float_pipelines[count];
+        mapping->ordinaryPipeline =
+            (uintptr_t)(__bridge void *)[ordinaryPipeline retain];
+        mapping->variantPipeline = [variantPipeline retain];
+        mapping->writeTextureMask = writeTextureMask;
+        atomic_store_explicit(&g_macws_half_float_pipeline_count, count + 1,
+                              memory_order_release);
+    }
+    pthread_mutex_unlock(&g_macws_half_float_variant_lock);
+}
+
+static uintptr_t macws_half_float_variant_pipeline(
+        uintptr_t ordinaryPipeline, uint32_t *writeTextureMask) {
+    uintptr_t variant = 0;
+    size_t count = atomic_load_explicit(
+        &g_macws_half_float_pipeline_count, memory_order_acquire);
+    for (size_t index = 0;
+         index < count; index++) {
+        MacWSHalfFloatPipelineMapping *mapping =
+            &g_macws_half_float_pipelines[index];
+        if (mapping->ordinaryPipeline != ordinaryPipeline) continue;
+        variant = (uintptr_t)(__bridge void *)mapping->variantPipeline;
+        if (writeTextureMask)
+            *writeTextureMask = mapping->writeTextureMask;
+        break;
+    }
+    return variant;
+}
+
+static void macws_install_half_float_function_compatibility(void) {
+    if (!macws_half_float_variants_available()) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class libraryClass = objc_getClass("_MTLLibrary");
+        SEL selector = sel_registerName("newFunctionWithName:");
+        Method method = libraryClass
+            ? class_getInstanceMethod(libraryClass, selector) : NULL;
+        if (!method) return;
+        IMP current = method_getImplementation(method);
+        if (macws_imp_equal_ignoring_pac(
+                current, (IMP)macws_half_float_new_function)) return;
+        if (macws_imp_equal_ignoring_pac(
+                current, (IMP)macws_skylight_function_compat)) {
+            // metal2metal owns the one concrete newFunctionWithName: hook.
+            // It calls macws_half_float_record_function after invoking this
+            // same real upstream IMP. Runtime-confirmed by
+            // Stray-Mac-Shipping-2026-08-27-125331.ips: installing both
+            // wrappers independently made their saved IMPs point at each
+            // other and produced a 511-frame recursion before SIGILL.
+            g_macws_half_float_new_function_orig =
+                g_macws_skylight_function_orig;
+            dprintf(STDERR_FILENO,
+                "#### METAL-HALF-VARIANT integrated class=%s upstream=%p\n",
+                class_getName(libraryClass),
+                (void *)g_macws_half_float_new_function_orig);
+            return;
+        }
+        g_macws_half_float_new_function_orig =
+            (macws_library_new_function_fn)current;
+        const char *types = method_getTypeEncoding(method);
+        if (!class_addMethod(libraryClass, selector,
+                             (IMP)macws_half_float_new_function, types)) {
+            Method own = class_getInstanceMethod(libraryClass, selector);
+            method_setImplementation(
+                own, (IMP)macws_half_float_new_function);
+        }
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT function hook class=%s original=%p\n",
+            class_getName(libraryClass), (void *)current);
+    });
+}
+
 static id macws_new_library_data_compat(id self, SEL selector,
                                         dispatch_data_t data,
                                         NSError **error)
@@ -12373,7 +14479,8 @@ static id macws_new_library_data_compat(id self, SEL selector,
                   (length == kMacWSANGLEDefaultMacOSBytes ||
                    length == kMacWSSteamANGLEDefaultMacOSBytes ||
                    macws_is_stray_metal_library_length(length) ||
-                   (length >= 24 && length <= 256U * 1024U))))) {
+                   (macws_is_stray_process() &&
+                    length >= 88 && length <= 1024U * 1024U))))) {
         mapped = dispatch_data_create_map(data, &bytes, &length);
     }
     uint32_t magic = 0;
@@ -12381,6 +14488,7 @@ static id macws_new_library_data_compat(id self, SEL selector,
     uint64_t hash = bytes && length
         ? macws_source_fnv1a64(bytes, length) : 0;
     dispatch_data_t selected_data = data;
+    dispatch_data_t transient_replacement = NULL;
     BOOL substituted = NO;
     if (getenv("MACWS_AGX_NATIVE") &&
         length == kMacWSANGLEDefaultMacOSBytes &&
@@ -12417,7 +14525,8 @@ static id macws_new_library_data_compat(id self, SEL selector,
             break;
         }
         if (!substituted && magic == UINT32_C(0x424c544d) && hash &&
-            length >= 24 && length <= 256U * 1024U) {
+            macws_is_stray_process() &&
+            length >= 88 && length <= 1024U * 1024U) {
             dispatch_data_t replacement =
                 macws_dynamic_stray_macabi_library(length, hash);
             if (replacement) {
@@ -12425,11 +14534,39 @@ static id macws_new_library_data_compat(id self, SEL selector,
                 substituted = YES;
             }
         }
+        if (!substituted && magic == UINT32_C(0x424c544d) && hash &&
+            macws_is_stray_process() &&
+            macws_validate_retargetable_metal_library(
+                bytes, length, YES, hash)) {
+            // Preserve the original input as a failure witness before the
+            // synchronous conversion. If real AGX later rejects the converted
+            // library at pipeline specialization, the existing recorder can
+            // still emit the byte-exact source and descriptor.
+            macws_remember_unknown_stray_library(
+                data, length, hash, sequence);
+            transient_replacement = macws_retarget_stray_metal_library(
+                bytes, length, hash);
+            if (transient_replacement) {
+                selected_data = transient_replacement;
+                substituted = YES;
+            }
+        }
+    }
+
+    if (!substituted && magic == UINT32_C(0x424c544d)) {
+        macws_remember_unknown_stray_library(
+            data, length, hash, sequence);
     }
 
     id result = g_macws_new_library_data_orig
         ? g_macws_new_library_data_orig(self, selector, selected_data, error)
         : nil;
+    if (transient_replacement) dispatch_release(transient_replacement);
+    if (result && hash && macws_is_stray_process() &&
+        getenv("MACWS_AGX_NATIVE")) {
+        macws_create_half_float_library_variant(
+            self, selector, result, length, hash);
+    }
     NSError *returned_error = error ? *error : nil;
 
     char path[PATH_MAX] = {0};
@@ -12515,9 +14652,18 @@ static macws_render_pipeline_async_fn g_macws_pipeline_async_orig = NULL;
 static macws_render_pipeline_async_options_fn
     g_macws_pipeline_async_options_orig = NULL;
 static _Atomic uint32_t g_macws_pipeline_diag_count = 0;
+// Filled only by the explicit Stray render-pipeline diagnostic.  The stage
+// bisector runtime-confirmed that this exact pipeline is the first writer of
+// the canonical-NaN block; subsequent capture code uses the identity only to
+// collect its real inputs for an offline arithmetic replay.  It never changes
+// a descriptor, shader, binding or draw.
+static _Atomic uintptr_t g_macws_stray_nan_pipeline = 0;
 
 typedef id (*macws_compute_pipeline_function_fn)(
     id, SEL, id<MTLFunction>, NSError **)
+    __attribute__((ns_returns_retained));
+typedef id (*macws_compute_pipeline_descriptor_error_fn)(
+    id, SEL, MTLComputePipelineDescriptor *, NSError **)
     __attribute__((ns_returns_retained));
 typedef id (*macws_compute_pipeline_descriptor_fn)(
     id, SEL, MTLComputePipelineDescriptor *, MTLPipelineOption,
@@ -12525,9 +14671,61 @@ typedef id (*macws_compute_pipeline_descriptor_fn)(
     __attribute__((ns_returns_retained));
 static macws_compute_pipeline_function_fn
     g_macws_compute_pipeline_function_orig = NULL;
+static macws_compute_pipeline_descriptor_error_fn
+    g_macws_compute_pipeline_descriptor_error_orig = NULL;
 static macws_compute_pipeline_descriptor_fn
     g_macws_compute_pipeline_descriptor_orig = NULL;
 static _Atomic uint32_t g_macws_compute_pipeline_diag_count = 0;
+
+#define MACWS_COMPUTE_PIPELINE_NAME_CAP 2048u
+typedef struct {
+    uintptr_t pipeline;
+    char function[128];
+} MacWSComputePipelineName;
+static pthread_mutex_t g_macws_compute_pipeline_name_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static MacWSComputePipelineName
+    g_macws_compute_pipeline_names[MACWS_COMPUTE_PIPELINE_NAME_CAP];
+static size_t g_macws_compute_pipeline_name_count = 0;
+
+static void macws_remember_compute_pipeline_name(id pipeline,
+                                                  NSString *functionName) {
+    if (!pipeline || !functionName.length) return;
+    uintptr_t value = (uintptr_t)(__bridge void *)pipeline;
+    pthread_mutex_lock(&g_macws_compute_pipeline_name_lock);
+    size_t index = g_macws_compute_pipeline_name_count;
+    for (size_t i = 0; i < g_macws_compute_pipeline_name_count; i++) {
+        if (g_macws_compute_pipeline_names[i].pipeline == value) {
+            index = i;
+            break;
+        }
+    }
+    if (index == g_macws_compute_pipeline_name_count &&
+        index < MACWS_COMPUTE_PIPELINE_NAME_CAP)
+        g_macws_compute_pipeline_name_count++;
+    if (index < MACWS_COMPUTE_PIPELINE_NAME_CAP) {
+        g_macws_compute_pipeline_names[index].pipeline = value;
+        snprintf(g_macws_compute_pipeline_names[index].function,
+                 sizeof(g_macws_compute_pipeline_names[index].function),
+                 "%s", functionName.UTF8String ?: "(nil)");
+    }
+    pthread_mutex_unlock(&g_macws_compute_pipeline_name_lock);
+}
+
+static void macws_compute_pipeline_name(uintptr_t pipeline,
+                                        char *output, size_t capacity) {
+    if (!output || !capacity) return;
+    snprintf(output, capacity, "unknown");
+    pthread_mutex_lock(&g_macws_compute_pipeline_name_lock);
+    for (size_t i = 0; i < g_macws_compute_pipeline_name_count; i++) {
+        if (g_macws_compute_pipeline_names[i].pipeline == pipeline) {
+            snprintf(output, capacity, "%s",
+                     g_macws_compute_pipeline_names[i].function);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_compute_pipeline_name_lock);
+}
 
 static id macws_compute_pipeline_function_diag(
         id self, SEL selector, id<MTLFunction> function, NSError **error)
@@ -12543,8 +14741,36 @@ static id macws_compute_pipeline_function_diag(
     id result = g_macws_compute_pipeline_function_orig
         ? g_macws_compute_pipeline_function_orig(self, selector, function,
                                                   error) : nil;
+    macws_remember_compute_pipeline_name(result, function.name);
+    id variantFunction = nil;
+    uint32_t writeTextureMask = 0;
+    if (result && macws_half_float_variant_for_function(
+            function, &variantFunction, &writeTextureMask)) {
+        NSError *variantError = nil;
+        id variantPipeline = g_macws_compute_pipeline_function_orig(
+            self, selector, variantFunction, &variantError);
+        if (variantPipeline) {
+            macws_remember_half_float_pipeline(
+                result, variantPipeline, writeTextureMask);
+        }
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT compute function=%s ordinary=%p "
+            "variant=%p writeTextureMask=%#x errorDomain=%s "
+            "errorCode=%ld description=%s\n",
+            function.name.UTF8String ?: "(nil)", (void *)result,
+            (void *)variantPipeline, writeTextureMask,
+            variantError ? variantError.domain.UTF8String : "(nil)",
+            variantError ? (long)variantError.code : 0L,
+            variantError
+                ? variantError.localizedDescription.UTF8String : "(nil)");
+        [variantPipeline release];
+    }
     NSError *returned_error = error ? *error : nil;
-    dprintf(STDERR_FILENO,
+    if (!result) {
+        macws_dump_unknown_stray_libraries_after_pipeline_failure(
+            "compute-function", returned_error);
+    }
+    if (macws_pipeline_diag_enabled() || !result) dprintf(STDERR_FILENO,
         "#### COMPUTE-PIPELINE #%u device=%s function=%s result=%p "
         "class=%s errorDomain=%s errorCode=%ld description=%s userInfo=%s "
         "caller=%s+%#llx\n",
@@ -12592,7 +14818,43 @@ static id macws_compute_pipeline_descriptor_diag(
     } @catch (NSException *exception) {
         (void)exception;
     }
-    dprintf(STDERR_FILENO,
+    macws_remember_compute_pipeline_name(result, function_name);
+    id ordinaryFunction = nil;
+    @try { ordinaryFunction = descriptor.computeFunction; }
+    @catch (NSException *exception) { (void)exception; }
+    id variantFunction = nil;
+    uint32_t writeTextureMask = 0;
+    if (result && ordinaryFunction &&
+        macws_half_float_variant_for_function(
+            ordinaryFunction, &variantFunction, &writeTextureMask)) {
+        MTLComputePipelineDescriptor *variantDescriptor = [descriptor copy];
+        variantDescriptor.computeFunction = variantFunction;
+        NSError *variantError = nil;
+        id variantPipeline = g_macws_compute_pipeline_descriptor_orig(
+            self, selector, variantDescriptor, options, NULL,
+            &variantError);
+        if (variantPipeline) {
+            macws_remember_half_float_pipeline(
+                result, variantPipeline, writeTextureMask);
+        }
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT compute-descriptor function=%s "
+            "ordinary=%p variant=%p writeTextureMask=%#x "
+            "errorDomain=%s errorCode=%ld description=%s\n",
+            function_name.UTF8String ?: "(nil)", (void *)result,
+            (void *)variantPipeline, writeTextureMask,
+            variantError ? variantError.domain.UTF8String : "(nil)",
+            variantError ? (long)variantError.code : 0L,
+            variantError
+                ? variantError.localizedDescription.UTF8String : "(nil)");
+        [variantPipeline release];
+        [variantDescriptor release];
+    }
+    if (!result) {
+        macws_dump_unknown_stray_libraries_after_pipeline_failure(
+            "compute-descriptor", returned_error);
+    }
+    if (macws_pipeline_diag_enabled() || !result) dprintf(STDERR_FILENO,
         "#### COMPUTE-PIPELINE #%u variant=descriptor device=%s "
         "options=%#llx label=%s function=%s result=%p class=%s "
         "errorDomain=%s errorCode=%ld description=%s userInfo=%s "
@@ -12614,11 +14876,291 @@ static id macws_compute_pipeline_descriptor_diag(
     return result;
 }
 
+// Read-only MetalFX input witness.  The translated 720x450 -> 1440x900
+// standalone control now completes on this device, while Stray's first real
+// frame still times out after creating the same BRNet pipelines successfully.
+// Log the actual scaler dimensions and texture descriptors at the public
+// encode boundary so the two workloads can be reproduced byte-for-byte.  The
+// hook is installed only for Stray's explicit pipeline diagnostic and always
+// forwards the original object and command buffer unchanged.
+typedef void (*macws_metalfx_encode_fn)(id, SEL, id);
+static macws_metalfx_encode_fn g_macws_metalfx_encode_orig = NULL;
+static _Atomic uint32_t g_macws_metalfx_encode_count = 0;
+
+// Runtime-confirmed on the iOS-native AGX path with the exact Stray scaler
+// profile (640x448/content 640x447 -> 1280x894): one unreset Ventura MetalFX
+// V3 scaler completes frames 1..31, then frame 32 fails in
+// MetalFX_TemporalV3_MidProcessing with MTLCommandBufferErrorDomain code 2.
+// The same failure reproduces in native-entitled, shared-queue and per-frame
+// autorelease-pool controls, so it is upstream of the macOS KCMD translator.
+// Using the public reset property at frames 1, 31 and 61 completes 64/64
+// native frames with status=4/error=nil. Track each scaler independently and
+// request that supported history discontinuity before its 31st encode. This
+// changes neither command-buffer completion nor error reporting.
+#define MACWS_METALFX_RESET_INTERVAL 30u
+#define MACWS_METALFX_SCALER_SLOTS 16u
+struct macws_metalfx_scaler_slot {
+    uintptr_t scaler;
+    uint32_t encode_count;
+    uint64_t access_sequence;
+};
+static pthread_mutex_t g_macws_metalfx_scaler_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static struct macws_metalfx_scaler_slot
+    g_macws_metalfx_scaler_slots[MACWS_METALFX_SCALER_SLOTS];
+static uint64_t g_macws_metalfx_scaler_access_sequence = 0;
+
+static uint32_t macws_metalfx_next_scaler_encode(id scaler) {
+    uintptr_t key = (uintptr_t)(__bridge void *)scaler;
+    if (!key) return 0;
+    pthread_mutex_lock(&g_macws_metalfx_scaler_lock);
+    uint64_t access = ++g_macws_metalfx_scaler_access_sequence;
+    unsigned selected = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (unsigned index = 0; index < MACWS_METALFX_SCALER_SLOTS; index++) {
+        struct macws_metalfx_scaler_slot *slot =
+            &g_macws_metalfx_scaler_slots[index];
+        if (slot->scaler == key) {
+            selected = index;
+            oldest = 0;
+            break;
+        }
+        if (slot->scaler == 0) {
+            selected = index;
+            oldest = 0;
+            break;
+        }
+        if (slot->access_sequence < oldest) {
+            oldest = slot->access_sequence;
+            selected = index;
+        }
+    }
+    struct macws_metalfx_scaler_slot *slot =
+        &g_macws_metalfx_scaler_slots[selected];
+    if (slot->scaler != key) {
+        slot->scaler = key;
+        slot->encode_count = 0;
+    }
+    slot->access_sequence = access;
+    uint32_t count = ++slot->encode_count;
+    pthread_mutex_unlock(&g_macws_metalfx_scaler_lock);
+    return count;
+}
+
+static NSUInteger macws_metalfx_diag_unsigned(id object,
+                                               const char *selector_name) {
+    if (!object || !selector_name) return 0;
+    SEL selector = sel_registerName(selector_name);
+    if (![object respondsToSelector:selector]) return 0;
+    return ((NSUInteger (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static id macws_metalfx_diag_object(id object, const char *selector_name) {
+    if (!object || !selector_name) return nil;
+    SEL selector = sel_registerName(selector_name);
+    if (![object respondsToSelector:selector]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static void macws_metalfx_log_texture(uint32_t sequence, const char *role,
+                                      id texture) {
+    dprintf(STDERR_FILENO,
+        "#### METALFX-ENCODE #%u texture=%s object=%p class=%s "
+        "size=%lux%lux%lu format=%lu usage=%#lx storage=%lu "
+        "resourceOptions=%#lx samples=%lu array=%lu mipmaps=%lu\n",
+        sequence, role ?: "(nil)", (__bridge void *)texture,
+        texture ? class_getName([texture class]) : "(nil)",
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "width"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "height"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "depth"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "pixelFormat"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "usage"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "storageMode"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture,
+                                                   "resourceOptions"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "sampleCount"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture, "arrayLength"),
+        (unsigned long)macws_metalfx_diag_unsigned(texture,
+                                                   "mipmapLevelCount"));
+}
+
+static void macws_metalfx_encode_diag(id self, SEL selector,
+                                      id command_buffer) {
+    uint32_t sequence = atomic_fetch_add(
+        &g_macws_metalfx_encode_count, 1) + 1;
+    uint32_t scaler_sequence = 0;
+    BOOL periodic_reset = NO;
+    if (macws_stray_agx_compat_enabled()) {
+        scaler_sequence = macws_metalfx_next_scaler_encode(self);
+        periodic_reset = scaler_sequence != 0 &&
+            (scaler_sequence - 1) % MACWS_METALFX_RESET_INTERVAL == 0;
+        if (periodic_reset &&
+            [self respondsToSelector:sel_registerName("setReset:")]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(
+                self, sel_registerName("setReset:"), YES);
+            if (scaler_sequence <= MACWS_METALFX_RESET_INTERVAL * 2 + 1) {
+                dprintf(STDERR_FILENO,
+                    "#### METALFX-HISTORY-RESET scaler=%p encode=%u "
+                    "interval=%u\n", (__bridge void *)self,
+                    scaler_sequence, MACWS_METALFX_RESET_INTERVAL);
+            }
+        }
+    }
+    if ((macws_pipeline_diag_enabled() && sequence <= 8) ||
+        (macws_stray_agx_compat_enabled() && scaler_sequence == 1)) {
+        dprintf(STDERR_FILENO,
+            "#### METALFX-ENCODE #%u scaler=%p class=%s commandBuffer=%p "
+            "input=%lux%lu content=%lux%lu output=%lux%lu "
+            "formats=%lu/%lu/%lu/%lu usages=%#lx/%#lx/%#lx/%#lx "
+            "reset=%lu autoExposure=%lu reversedDepth=%lu\n",
+            sequence, (__bridge void *)self, class_getName([self class]),
+            (__bridge void *)command_buffer,
+            (unsigned long)macws_metalfx_diag_unsigned(self, "inputWidth"),
+            (unsigned long)macws_metalfx_diag_unsigned(self, "inputHeight"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "inputContentWidth"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "inputContentHeight"),
+            (unsigned long)macws_metalfx_diag_unsigned(self, "outputWidth"),
+            (unsigned long)macws_metalfx_diag_unsigned(self, "outputHeight"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "colorTextureFormat"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "depthTextureFormat"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "motionTextureFormat"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "outputTextureFormat"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "colorTextureUsage"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "depthTextureUsage"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "motionTextureUsage"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "outputTextureUsage"),
+            (unsigned long)macws_metalfx_diag_unsigned(self, "reset"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "isAutoExposureEnabled"),
+            (unsigned long)macws_metalfx_diag_unsigned(
+                self, "isDepthReversed"));
+        struct {
+            const char *role;
+            const char *selector_name;
+        } textures[] = {
+            { "color", "colorTexture" },
+            { "depth", "depthTexture" },
+            { "motion", "motionTexture" },
+            { "output", "outputTexture" },
+            { "exposure", "exposureTexture" },
+        };
+        for (size_t index = 0;
+             index < sizeof(textures) / sizeof(textures[0]); index++) {
+            macws_metalfx_log_texture(
+                sequence, textures[index].role,
+                macws_metalfx_diag_object(self,
+                                          textures[index].selector_name));
+        }
+    }
+    if (g_macws_metalfx_encode_orig)
+        g_macws_metalfx_encode_orig(self, selector, command_buffer);
+}
+
+static void macws_install_metalfx_encode_diagnostic(void) {
+    static _Atomic bool installed = false;
+    if (!macws_is_stray_process() ||
+        (!macws_stray_agx_compat_enabled() &&
+         !macws_pipeline_diag_enabled()) ||
+        atomic_load_explicit(&installed, memory_order_acquire)) return;
+    Class scaler = objc_getClass("_MFXTemporalScalingEffectV3");
+    SEL selector = sel_registerName("encodeToCommandBuffer:");
+    Method method = scaler
+        ? class_getInstanceMethod(scaler, selector) : NULL;
+    if (!method) return;
+    if (atomic_exchange_explicit(&installed, true,
+                                 memory_order_acq_rel)) return;
+    MSHookMessageEx(scaler, selector, (IMP)macws_metalfx_encode_diag,
+                    (IMP *)&g_macws_metalfx_encode_orig);
+    dprintf(STDERR_FILENO,
+        "#### METALFX-ENCODE hook installed class=%s selector=%s "
+        "original=%p periodicReset=%s interval=%u diagnostic=%s\n",
+        class_getName(scaler), sel_getName(selector),
+        (void *)g_macws_metalfx_encode_orig,
+        macws_stray_agx_compat_enabled() ? "YES" : "NO",
+        MACWS_METALFX_RESET_INTERVAL,
+        macws_pipeline_diag_enabled() ? "YES" : "NO");
+}
+
+// Ventura MetalFX V3 builds every BRNet compute pipeline through the private
+// two-argument selector -newComputePipelineStateWithDescriptor:error:, not
+// either public selector above. RE-confirmed in the loaded MetalFX image at
+// BRNet_v3_Filter pipeline helper 0x21030ad8c+0x74..+0xb4. Observe the real
+// AGX result and NSError without changing the descriptor or return value.
+static id macws_compute_pipeline_descriptor_error_diag(
+        id self, SEL selector, MTLComputePipelineDescriptor *descriptor,
+        NSError **error) __attribute__((ns_returns_retained));
+static id macws_compute_pipeline_descriptor_error_diag(
+        id self, SEL selector, MTLComputePipelineDescriptor *descriptor,
+        NSError **error) {
+    macws_install_metalfx_encode_diagnostic();
+    uint32_t sequence =
+        atomic_fetch_add(&g_macws_compute_pipeline_diag_count, 1) + 1;
+    void *return_address = ptrauth_strip(__builtin_return_address(0),
+                                        ptrauth_key_return_address);
+    Dl_info caller = {0};
+    dladdr(return_address, &caller);
+    NSError *captured_error = nil;
+    // MetalFX passes NULL here. The iOS AGX implementation at 0x20cc84274
+    // forwards this pointer unchanged to its common pipeline builder, so the
+    // original failure otherwise has no witness. Supplying storage for the
+    // optional out parameter does not retry or alter the returned pipeline.
+    NSError **forwarded_error = error;
+    if (!forwarded_error && macws_pipeline_diag_enabled())
+        forwarded_error = &captured_error;
+    id result = g_macws_compute_pipeline_descriptor_error_orig
+        ? g_macws_compute_pipeline_descriptor_error_orig(
+              self, selector, descriptor, forwarded_error) : nil;
+    NSError *returned_error = error ? *error : captured_error;
+    NSString *label = nil;
+    NSString *function_name = nil;
+    BOOL multiple = NO;
+    @try {
+        label = descriptor.label;
+        function_name = descriptor.computeFunction.name;
+        multiple = descriptor.threadGroupSizeIsMultipleOfThreadExecutionWidth;
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    macws_remember_compute_pipeline_name(result, function_name);
+    if (macws_pipeline_diag_enabled() || !result) dprintf(STDERR_FILENO,
+        "#### COMPUTE-PIPELINE #%u variant=descriptor-error device=%s "
+        "label=%s function=%s threadGroupMultiple=%d result=%p class=%s "
+        "errorDomain=%s errorCode=%ld description=%s userInfo=%s "
+        "caller=%s+%#llx\n",
+        sequence, class_getName([self class]),
+        label.UTF8String ?: "(nil)",
+        function_name.UTF8String ?: "(nil)", multiple,
+        (void *)result,
+        result ? class_getName([result class]) : "(nil)",
+        returned_error ? returned_error.domain.UTF8String : "(nil)",
+        returned_error ? (long)returned_error.code : 0L,
+        returned_error ? returned_error.localizedDescription.UTF8String
+                       : "(nil)",
+        returned_error ? returned_error.userInfo.description.UTF8String
+                       : "(nil)",
+        caller.dli_fname ?: "(unknown)",
+        caller.dli_fbase
+            ? (unsigned long long)((uintptr_t)return_address -
+                                   (uintptr_t)caller.dli_fbase) : 0);
+    return result;
+}
+
 static void macws_log_pipeline_result(uint32_t sequence, id device,
                                       MTLRenderPipelineDescriptor *descriptor,
                                       id result, NSError *error,
                                       const char *variant,
                                       unsigned long long options) {
+    if (!macws_pipeline_diag_enabled() && result) return;
     BOOL log_this = sequence <= 512;
     if (!log_this) return;
     NSString *label = nil, *vertex_name = nil, *fragment_name = nil;
@@ -12635,6 +15177,17 @@ static void macws_log_pipeline_result(uint32_t sequence, id device,
         sample_count = descriptor.sampleCount;
     } @catch (NSException *exception) {
         (void)exception;
+    }
+    if (result && macws_is_stray_process() &&
+        [vertex_name isEqualToString:@"Main_000007f5_a7fec0ce"] &&
+        [fragment_name isEqualToString:@"Main_00000f37_fead035c"]) {
+        atomic_store_explicit(
+            &g_macws_stray_nan_pipeline,
+            (uintptr_t)(__bridge void *)result, memory_order_release);
+        dprintf(STDERR_FILENO,
+            "#### STRAY-NAN-PIPELINE identified result=%p vertex=%s "
+            "fragment=%s\n", (void *)result,
+            vertex_name.UTF8String, fragment_name.UTF8String);
     }
     dprintf(STDERR_FILENO,
         "#### RENDER-PIPELINE #%u variant=%s device=%s options=%#llx "
@@ -12699,6 +15252,10 @@ static id macws_render_pipeline_error_diag(
     id result = g_macws_pipeline_error_orig
         ? g_macws_pipeline_error_orig(self, selector, descriptor, error) : nil;
     NSError *returned_error = error ? *error : nil;
+    if (!result) {
+        macws_dump_unknown_stray_libraries_after_pipeline_failure(
+            "render-error", returned_error);
+    }
     macws_log_pipeline_result(sequence, self, descriptor, result,
                               returned_error, "error", 0);
     return result;
@@ -12719,6 +15276,10 @@ static id macws_render_pipeline_options_diag(
         ? g_macws_pipeline_options_orig(self, selector, descriptor, options,
                                         reflection, error) : nil;
     NSError *returned_error = error ? *error : nil;
+    if (!result) {
+        macws_dump_unknown_stray_libraries_after_pipeline_failure(
+            "render-options", returned_error);
+    }
     macws_log_pipeline_result(sequence, self, descriptor, result,
                               returned_error, "options", options);
     // A failed pipeline may depend on a non-obvious vertex layout even when
@@ -12746,7 +15307,8 @@ static id macws_render_pipeline_options_diag(
             MTLPixelFormatDepth32Float_Stencil8 &&
         descriptor.stencilAttachmentPixelFormat ==
             MTLPixelFormatDepth32Float_Stencil8;
-    if (exact_stray_depth_pair && g_macws_pipeline_options_orig) {
+    if (macws_pipeline_diag_enabled() && exact_stray_depth_pair &&
+        g_macws_pipeline_options_orig) {
         MTLRenderPipelineDescriptor *vertex_only = [descriptor copy];
         vertex_only.fragmentFunction = nil;
         NSError *vertex_error = nil;
@@ -12876,6 +15438,10 @@ static void macws_render_pipeline_async_diag(
     g_macws_pipeline_async_orig(
         self, selector, descriptor,
         ^(id<MTLRenderPipelineState> pipeline, NSError *error) {
+            if (!pipeline) {
+                macws_dump_unknown_stray_libraries_after_pipeline_failure(
+                    "render-async", error);
+            }
             macws_log_pipeline_result(sequence, self, descriptor, pipeline,
                                       error, "async", 0);
             completion(pipeline, error);
@@ -12897,6 +15463,10 @@ static void macws_render_pipeline_async_options_diag(
         self, selector, descriptor, options,
         ^(id<MTLRenderPipelineState> pipeline,
           MTLRenderPipelineReflection *reflection, NSError *error) {
+            if (!pipeline) {
+                macws_dump_unknown_stray_libraries_after_pipeline_failure(
+                    "render-async-options", error);
+            }
             macws_log_pipeline_result(sequence, self, descriptor, pipeline,
                                       error, "async-options", options);
             completion(pipeline, reflection, error);
@@ -12909,7 +15479,9 @@ static void macws_render_pipeline_async_options_diag(
 // is the exact implementation that ordinary dispatch selected before the
 // override, and every caller argument is forwarded unchanged.
 static void macws_install_render_pipeline_diagnostic(Class agx) {
-    if (!macws_pipeline_diag_enabled()) return;
+    BOOL full_diagnostic = macws_pipeline_diag_enabled();
+    if (!full_diagnostic &&
+        (!macws_is_stray_process() || !getenv("MACWS_AGX_NATIVE"))) return;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         struct {
@@ -12932,6 +15504,9 @@ static void macws_install_render_pipeline_diagnostic(Class agx) {
             { "newComputePipelineStateWithFunction:error:",
               (IMP)macws_compute_pipeline_function_diag,
               (IMP *)&g_macws_compute_pipeline_function_orig },
+            { "newComputePipelineStateWithDescriptor:error:",
+              (IMP)macws_compute_pipeline_descriptor_error_diag,
+              (IMP *)&g_macws_compute_pipeline_descriptor_error_orig },
             { "newComputePipelineStateWithDescriptor:options:reflection:error:",
               (IMP)macws_compute_pipeline_descriptor_diag,
               (IMP *)&g_macws_compute_pipeline_descriptor_orig },
@@ -12940,9 +15515,11 @@ static void macws_install_render_pipeline_diagnostic(Class agx) {
             SEL selector = sel_registerName(entries[i].name);
             Method inherited = class_getInstanceMethod(agx, selector);
             if (!inherited) {
-                dprintf(STDERR_FILENO,
-                    "#### RENDER-PIPELINE diagnostic missing %s on %s\n",
-                    entries[i].name, class_getName(agx));
+                if (full_diagnostic) {
+                    dprintf(STDERR_FILENO,
+                        "#### RENDER-PIPELINE diagnostic missing %s on %s\n",
+                        entries[i].name, class_getName(agx));
+                }
                 continue;
             }
             IMP original = method_getImplementation(inherited);
@@ -12954,11 +15531,19 @@ static void macws_install_render_pipeline_diagnostic(Class agx) {
                 Method own = class_getInstanceMethod(agx, selector);
                 method_setImplementation(own, entries[i].replacement);
             }
+            if (full_diagnostic) {
+                dprintf(STDERR_FILENO,
+                    "#### RENDER-PIPELINE diagnostic installed selector=%s "
+                    "class=%s original=%p subclassOverride=%s types=%s\n",
+                    entries[i].name, class_getName(agx), (void *)original,
+                    added ? "YES" : "NO", types ?: "(nil)");
+            }
+        }
+        if (!full_diagnostic) {
             dprintf(STDERR_FILENO,
-                "#### RENDER-PIPELINE diagnostic installed selector=%s "
-                "class=%s original=%p subclassOverride=%s types=%s\n",
-                entries[i].name, class_getName(agx), (void *)original,
-                added ? "YES" : "NO", types ?: "(nil)");
+                "#### STRAY-PIPELINE-FAILURE-CAPTURE installed class=%s "
+                "retainedCap=%u\n",
+                class_getName(agx), MACWS_STRAY_FAILURE_LIBRARY_CAP);
         }
     });
 }
@@ -12970,6 +15555,10 @@ static void macws_install_render_pipeline_diagnostic(Class agx) {
 // pointer-only tables are bounded, process-local and enabled only when the
 // sentinel existed before launch; production pays no method-interpose cost.
 #define MACWS_STRAY_RENDER_TRACE_CAP 2048u
+#define MACWS_STRAY_ENCODER_PIPELINE_CAP 32u
+#define MACWS_STRAY_FRAGMENT_TEXTURE_CAP 8u
+#define MACWS_STRAY_FRAGMENT_BUFFER_CAP 4u
+#define MACWS_STRAY_FRAGMENT_INLINE_CAP 64u
 typedef struct {
     uintptr_t buffer;
     uint64_t offset;
@@ -12984,6 +15573,10 @@ typedef struct {
     uint32_t colorFormat;
     uint32_t colorLoadAction;
     uint32_t colorStoreAction;
+    uintptr_t shadowTexture;
+    uint32_t shadowAttachment;
+    uint32_t shadowLoadAction;
+    uint32_t shadowStoreAction;
     uintptr_t depthTexture;
     uint32_t depthWidth;
     uint32_t depthHeight;
@@ -12998,13 +15591,45 @@ typedef struct {
     uint32_t frontFacingWinding;
     BOOL viewportSet;
     BOOL scissorSet;
+    uint32_t drawCount;
+    uint32_t pipelineCount;
+    uintptr_t pipelines[MACWS_STRAY_ENCODER_PIPELINE_CAP];
     MacWSStrayBufferBinding vertexBuffers[31];
+    MacWSStrayBufferBinding
+        fragmentBuffers[MACWS_STRAY_FRAGMENT_BUFFER_CAP];
+    uintptr_t fragmentTextures[MACWS_STRAY_FRAGMENT_TEXTURE_CAP];
+    uint32_t fragmentInlineLengths[MACWS_STRAY_FRAGMENT_BUFFER_CAP];
+    uint8_t fragmentInlineBytes[MACWS_STRAY_FRAGMENT_BUFFER_CAP]
+                               [MACWS_STRAY_FRAGMENT_INLINE_CAP];
 } MacWSStrayEncoderPipeline;
 typedef struct {
     uintptr_t pipeline;
     BOOL bindLogged;
     BOOL drawLogged;
 } MacWSStrayPipelineWitness;
+typedef struct {
+    uintptr_t encoder;
+    MacWSStrayBufferBinding
+        fragmentBuffers[MACWS_STRAY_FRAGMENT_BUFFER_CAP];
+    uintptr_t fragmentTextures[MACWS_STRAY_FRAGMENT_TEXTURE_CAP];
+    uint32_t fragmentInlineLengths[MACWS_STRAY_FRAGMENT_BUFFER_CAP];
+    uint8_t fragmentInlineBytes[MACWS_STRAY_FRAGMENT_BUFFER_CAP]
+                               [MACWS_STRAY_FRAGMENT_INLINE_CAP];
+} MacWSStrayPersistentFragmentBindings;
+
+#define MACWS_STRAY_COMPUTE_TEXTURE_CAP 32u
+#define MACWS_STRAY_COMPUTE_DISPATCH_CAP 8u
+typedef struct {
+    uintptr_t encoder;
+    uintptr_t commandBuffer;
+    uintptr_t pipeline;
+    uintptr_t activePipeline;
+    uintptr_t halfFloatVariantPipeline;
+    uint32_t halfFloatWriteTextureMask;
+    uintptr_t textures[MACWS_STRAY_COMPUTE_TEXTURE_CAP];
+    uint32_t dispatchCount;
+    uintptr_t dispatchPipelines[MACWS_STRAY_COMPUTE_DISPATCH_CAP];
+} MacWSStrayComputeState;
 
 static pthread_mutex_t g_macws_stray_render_trace_lock =
     PTHREAD_MUTEX_INITIALIZER;
@@ -13012,8 +15637,120 @@ static MacWSStrayEncoderPipeline
     g_macws_stray_encoder_pipelines[MACWS_STRAY_RENDER_TRACE_CAP];
 static MacWSStrayPipelineWitness
     g_macws_stray_pipeline_witnesses[MACWS_STRAY_RENDER_TRACE_CAP];
+#define MACWS_STRAY_PERSISTENT_BINDING_CAP 64u
+static MacWSStrayPersistentFragmentBindings
+    g_macws_stray_persistent_bindings[MACWS_STRAY_PERSISTENT_BINDING_CAP];
+#define MACWS_STRAY_COMPUTE_STATE_CAP 128u
+static MacWSStrayComputeState
+    g_macws_stray_compute_states[MACWS_STRAY_COMPUTE_STATE_CAP];
+// Production half-float selection follows UE's serial RHI encoder stream.
+// Keep that current encoder state on the calling thread so ordinary compute
+// binding does not contend on the diagnostic render-trace table. The full
+// capture mode below deliberately retains the global table because it joins
+// state across diagnostic completion handlers.
+static _Thread_local MacWSStrayComputeState
+    g_macws_stray_compute_thread_state;
+static size_t g_macws_stray_compute_state_count = 0;
+static size_t g_macws_stray_compute_recycle_cursor = 0;
 static size_t g_macws_stray_encoder_pipeline_count = 0;
 static size_t g_macws_stray_pipeline_witness_count = 0;
+static size_t g_macws_stray_encoder_recycle_cursor = 0;
+static size_t g_macws_stray_persistent_binding_count = 0;
+static size_t g_macws_stray_persistent_binding_recycle_cursor = 0;
+static MacWSStrayEncoderPipeline *
+macws_stray_encoder_state_locked(id encoder);
+
+static MacWSStrayPersistentFragmentBindings *
+macws_stray_persistent_bindings_locked(id encoder) {
+    uintptr_t value = (uintptr_t)(__bridge void *)encoder;
+    for (size_t i = 0; i < g_macws_stray_persistent_binding_count; i++) {
+        if (g_macws_stray_persistent_bindings[i].encoder == value)
+            return &g_macws_stray_persistent_bindings[i];
+    }
+    size_t index = 0;
+    if (g_macws_stray_persistent_binding_count <
+        MACWS_STRAY_PERSISTENT_BINDING_CAP) {
+        index = g_macws_stray_persistent_binding_count++;
+    } else {
+        index = g_macws_stray_persistent_binding_recycle_cursor++ %
+            MACWS_STRAY_PERSISTENT_BINDING_CAP;
+    }
+    MacWSStrayPersistentFragmentBindings *bindings =
+        &g_macws_stray_persistent_bindings[index];
+    memset(bindings, 0, sizeof(*bindings));
+    bindings->encoder = value;
+    return bindings;
+}
+
+static void macws_stray_copy_persistent_bindings_locked(
+        id encoder, MacWSStrayEncoderPipeline *state) {
+    MacWSStrayPersistentFragmentBindings *bindings =
+        macws_stray_persistent_bindings_locked(encoder);
+    memcpy(state->fragmentBuffers, bindings->fragmentBuffers,
+           sizeof(state->fragmentBuffers));
+    memcpy(state->fragmentTextures, bindings->fragmentTextures,
+           sizeof(state->fragmentTextures));
+    memcpy(state->fragmentInlineLengths, bindings->fragmentInlineLengths,
+           sizeof(state->fragmentInlineLengths));
+    memcpy(state->fragmentInlineBytes, bindings->fragmentInlineBytes,
+           sizeof(state->fragmentInlineBytes));
+}
+
+static MacWSStrayComputeState *macws_stray_compute_state_locked(
+        id encoder, BOOL create) {
+    uintptr_t value = (uintptr_t)(__bridge void *)encoder;
+    size_t empty = MACWS_STRAY_COMPUTE_STATE_CAP;
+    for (size_t i = 0; i < g_macws_stray_compute_state_count; i++) {
+        if (g_macws_stray_compute_states[i].encoder == value)
+            return &g_macws_stray_compute_states[i];
+        if (!g_macws_stray_compute_states[i].encoder &&
+            empty == MACWS_STRAY_COMPUTE_STATE_CAP) empty = i;
+    }
+    if (!create) return NULL;
+    size_t index = empty;
+    if (index == MACWS_STRAY_COMPUTE_STATE_CAP &&
+        g_macws_stray_compute_state_count < MACWS_STRAY_COMPUTE_STATE_CAP) {
+        index = g_macws_stray_compute_state_count++;
+    }
+    if (index == MACWS_STRAY_COMPUTE_STATE_CAP) {
+        index = g_macws_stray_compute_recycle_cursor++ %
+            MACWS_STRAY_COMPUTE_STATE_CAP;
+    }
+    MacWSStrayComputeState *state = &g_macws_stray_compute_states[index];
+    memset(state, 0, sizeof(*state));
+    state->encoder = value;
+    return state;
+}
+
+static void macws_stray_compute_begin(id commandBuffer, id encoder) {
+    if (!encoder) return;
+    if (!macws_stray_full_render_trace_enabled()) {
+        MacWSStrayComputeState *state =
+            &g_macws_stray_compute_thread_state;
+        memset(state, 0, sizeof(*state));
+        state->encoder = (uintptr_t)(__bridge void *)encoder;
+        state->commandBuffer =
+            (uintptr_t)(__bridge void *)commandBuffer;
+        if (macws_metalfx_encoder_diag_enabled()) {
+            dprintf(STDERR_FILENO,
+                "#### METALFX-ENCODER begin commandBuffer=%p encoder=%p "
+                "class=%s\n",
+                (__bridge void *)commandBuffer, (__bridge void *)encoder,
+                class_getName([encoder class]));
+        }
+        return;
+    }
+    pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+    MacWSStrayComputeState *state =
+        macws_stray_compute_state_locked(encoder, YES);
+    if (state) {
+        memset(state, 0, sizeof(*state));
+        state->encoder = (uintptr_t)(__bridge void *)encoder;
+        state->commandBuffer =
+            (uintptr_t)(__bridge void *)commandBuffer;
+    }
+    pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+}
 
 #define MACWS_STRAY_RT_COMMAND_CAP 64u
 #define MACWS_STRAY_RT_PRIORITY_CAP 16u
@@ -13072,6 +15809,10 @@ typedef void (*macws_set_vertex_buffer_fn)(
     id, SEL, id, NSUInteger, NSUInteger);
 typedef void (*macws_set_vertex_buffers_fn)(
     id, SEL, const id *, const NSUInteger *, NSRange);
+typedef void (*macws_set_texture_fn)(id, SEL, id, NSUInteger);
+typedef void (*macws_set_textures_fn)(id, SEL, const id *, NSRange);
+typedef void (*macws_set_bytes_fn)(
+    id, SEL, const void *, NSUInteger, NSUInteger);
 typedef id (*macws_new_depth_state_fn)(id, SEL, MTLDepthStencilDescriptor *);
 
 static macws_set_render_pipeline_fn g_macws_stray_set_pipeline_orig = NULL;
@@ -13091,6 +15832,11 @@ static macws_set_uint_state_fn g_macws_stray_set_winding_orig = NULL;
 static macws_set_object_state_fn g_macws_stray_set_depth_state_orig = NULL;
 static macws_set_vertex_buffer_fn g_macws_stray_set_vertex_buffer_orig = NULL;
 static macws_set_vertex_buffers_fn g_macws_stray_set_vertex_buffers_orig = NULL;
+static macws_set_vertex_buffer_fn g_macws_stray_set_fragment_buffer_orig = NULL;
+static macws_set_vertex_buffers_fn g_macws_stray_set_fragment_buffers_orig = NULL;
+static macws_set_texture_fn g_macws_stray_set_fragment_texture_orig = NULL;
+static macws_set_textures_fn g_macws_stray_set_fragment_textures_orig = NULL;
+static macws_set_bytes_fn g_macws_stray_set_fragment_bytes_orig = NULL;
 static macws_new_depth_state_fn g_macws_stray_new_depth_state_orig = NULL;
 typedef struct {
     uintptr_t state;
@@ -13104,8 +15850,20 @@ static size_t g_macws_stray_depth_state_count = 0;
 typedef id (*macws_stray_render_encoder_fn)(id, SEL, id);
 static macws_stray_render_encoder_fn
     g_macws_stray_render_encoder_orig = NULL;
+typedef id (*macws_stray_queue_command_buffer_fn)(id, SEL);
+typedef id (*macws_stray_queue_command_buffer_descriptor_fn)(
+    id, SEL, MTLCommandBufferDescriptor *);
+static macws_stray_queue_command_buffer_fn
+    g_macws_stray_queue_command_buffer_orig = NULL;
+static macws_stray_queue_command_buffer_fn
+    g_macws_stray_queue_command_buffer_unretained_orig = NULL;
+static macws_stray_queue_command_buffer_descriptor_fn
+    g_macws_stray_queue_command_buffer_descriptor_orig = NULL;
 typedef void (*macws_stray_command_commit_fn)(id, SEL);
 static macws_stray_command_commit_fn g_macws_stray_command_commit_orig = NULL;
+typedef void (*macws_stray_end_encoding_fn)(id, SEL);
+static macws_stray_end_encoding_fn g_macws_stray_end_encoding_orig = NULL;
+static void macws_install_stray_concrete_end_encoding(id encoder);
 
 static void macws_stray_remember_render_target(
         id commandBuffer, id texture, NSUInteger attachment,
@@ -13131,14 +15889,15 @@ static void macws_stray_remember_render_target(
         (void)exception;
         return;
     }
-    // The game window is not fixed at the old 960x540 diagnostic size.
-    // Runtime evidence from Stray PID 65936 records its current deferred MRT
-    // as 1196x836 while the drawable is 1194x834.  Match a bounded wide
-    // world-render target instead of silently discarding every attachment
-    // after a Retina/window-size change.  The aspect gate excludes the
-    // preceding 1024x1024 shadow MRTs, leaving the priority slots for
-    // SceneColor/GBuffer/depth and the tail slots for post-processing.
-    if (candidate.width < 800 || candidate.height < 450 ||
+    // The game window and its internal rendering percentage are independent.
+    // Runtime-confirmed via Stray PID 2273's exact STRAY-MRT lines at
+    // 1400x900/35%: the deferred targets are 492x316 and then 448x316 while
+    // the postprocess target remains 1400x900.  The old 800x450 floor silently
+    // excluded every SceneColor/GBuffer/depth attachment and could only show
+    // that the final postprocess result was already wrong.  Admit the exact
+    // bounded internal-resolution family; the aspect gate still excludes the
+    // preceding square 1024x1024 shadow MRTs.
+    if (candidate.width < 320 || candidate.height < 180 ||
         candidate.width > 4096 || candidate.height > 2160 ||
         (uint64_t)candidate.width * 10 <
             (uint64_t)candidate.height * 12 ||
@@ -13244,7 +16003,9 @@ static void macws_stray_remember_buffer(
 static void macws_stray_trace_remember_target(
         id commandBuffer, id encoder, id colorTexture,
         NSUInteger colorLoadAction,
-        NSUInteger colorStoreAction, id depthTexture,
+        NSUInteger colorStoreAction, id shadowTexture,
+        NSUInteger shadowAttachment, NSUInteger shadowLoadAction,
+        NSUInteger shadowStoreAction, id depthTexture,
         NSUInteger depthLoadAction, NSUInteger depthStoreAction,
         double clearDepth) {
     if (!encoder) return;
@@ -13255,6 +16016,10 @@ static void macws_stray_trace_remember_target(
         .colorTexture = (uintptr_t)(__bridge void *)colorTexture,
         .colorLoadAction = (uint32_t)colorLoadAction,
         .colorStoreAction = (uint32_t)colorStoreAction,
+        .shadowTexture = (uintptr_t)(__bridge void *)shadowTexture,
+        .shadowAttachment = (uint32_t)shadowAttachment,
+        .shadowLoadAction = (uint32_t)shadowLoadAction,
+        .shadowStoreAction = (uint32_t)shadowStoreAction,
         .depthTexture = (uintptr_t)(__bridge void *)depthTexture,
         .depthLoadAction = (uint32_t)depthLoadAction,
         .depthStoreAction = (uint32_t)depthStoreAction,
@@ -13275,23 +16040,18 @@ static void macws_stray_trace_remember_target(
         (void)exception;
     }
     pthread_mutex_lock(&g_macws_stray_render_trace_lock);
-    size_t index = g_macws_stray_encoder_pipeline_count;
-    for (size_t i = 0; i < g_macws_stray_encoder_pipeline_count; i++) {
-        if (g_macws_stray_encoder_pipelines[i].encoder == target.encoder) {
-            index = i;
-            break;
-        }
-    }
-    if (index == g_macws_stray_encoder_pipeline_count &&
-        index < MACWS_STRAY_RENDER_TRACE_CAP) {
-        g_macws_stray_encoder_pipeline_count++;
-        g_macws_stray_encoder_pipelines[index] = target;
-    } else if (index < MACWS_STRAY_RENDER_TRACE_CAP) {
+    MacWSStrayEncoderPipeline *state =
+        macws_stray_encoder_state_locked(encoder);
+    if (state) {
         // A reused Objective-C address denotes a new render encoder.  Do not
         // carry its predecessor's viewport, buffers or raster state into the
         // new witness; every relevant binding will be observed again before
-        // the first draw.
-        g_macws_stray_encoder_pipelines[index] = target;
+        // the first draw.  Fragment resources are different: the concrete AGX
+        // context is reused and UE may omit an unchanged binding on the next
+        // logical encoder.  Copy only the independently observed binding
+        // state after resetting the command/raster lifetime.
+        *state = target;
+        macws_stray_copy_persistent_bindings_locked(encoder, state);
     }
     pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
 }
@@ -13351,7 +16111,24 @@ static id macws_stray_render_encoder_trace(id self, SEL selector,
     id encoder = g_macws_stray_render_encoder_orig
         ? g_macws_stray_render_encoder_orig(self, selector, passDescriptor)
         : nil;
-    if (depthTexture && depthWidth >= 800 && depthHeight >= 450 &&
+    if (encoder && macws_stray_full_render_trace_enabled()) {
+        static _Atomic uint64_t encoderSequence = 0;
+        uint64_t sequence = atomic_fetch_add_explicit(
+            &encoderSequence, 1, memory_order_relaxed) + 1;
+        NSString *label = [NSString stringWithFormat:
+            @"MACWS-R%llu C%lux%lu-PF%lu D%lux%lu-PF%lu",
+            (unsigned long long)sequence,
+            (unsigned long)colorWidths[0],
+            (unsigned long)colorHeights[0],
+            (unsigned long)colorFormats[0],
+            (unsigned long)depthWidth,
+            (unsigned long)depthHeight,
+            (unsigned long)depthFormat];
+        @try { [encoder setLabel:label]; }
+        @catch (NSException *exception) { (void)exception; }
+    }
+    macws_install_stray_concrete_end_encoding(encoder);
+    if (depthTexture && depthWidth >= 320 && depthHeight >= 180 &&
         depthWidth <= 4096 && depthHeight <= 2160 &&
         (uint64_t)depthWidth * 10 >= (uint64_t)depthHeight * 12 &&
         (uint64_t)depthWidth * 10 <= (uint64_t)depthHeight * 24) {
@@ -13415,16 +16192,48 @@ static id macws_stray_render_encoder_trace(id self, SEL selector,
     // for depth and cannot collide with a Metal color attachment index.
     macws_stray_remember_render_target(
         self, depthTexture, 255, YES);
+    id shadowTraceTexture = nil;
+    NSUInteger shadowTraceAttachment = UINT32_MAX;
+    NSUInteger shadowTraceLoadAction = 0;
+    NSUInteger shadowTraceStoreAction = 0;
+    for (NSUInteger i = 0; i < 4; i++) {
+        if (colorTextures[i] && colorWidths[i] == 246 &&
+            colorHeights[i] == 158 && colorFormats[i] == 65) {
+            shadowTraceTexture = colorTextures[i];
+            shadowTraceAttachment = i;
+            shadowTraceLoadAction = colorLoadActions[i];
+            shadowTraceStoreAction = colorStoreActions[i];
+            dprintf(STDERR_FILENO,
+                "#### STRAY-SHADOW-TARGET command=%p encoder=%p "
+                "texture=%p attachment=%lu load=%lu store=%lu mrt=%s\n",
+                (__bridge void *)self, (__bridge void *)encoder,
+                (__bridge void *)shadowTraceTexture,
+                (unsigned long)shadowTraceAttachment,
+                (unsigned long)shadowTraceLoadAction,
+                (unsigned long)shadowTraceStoreAction,
+                isMRT ? "YES" : "NO");
+            break;
+        }
+    }
     macws_stray_trace_remember_target(
-        self, encoder, colorTexture, loadAction, storeAction, depthTexture,
+        self, encoder, colorTexture, loadAction, storeAction,
+        shadowTraceTexture, shadowTraceAttachment, shadowTraceLoadAction,
+        shadowTraceStoreAction, depthTexture,
         depthLoadAction, depthStoreAction, clearDepth);
     return encoder;
 }
 
 static NSUInteger macws_stray_bytes_per_pixel(NSUInteger pixelFormat) {
     switch (pixelFormat) {
-        case 10: return 1;              // R8Unorm
-        case 23: return 4;              // RG16Float
+        case 10: case 11: case 12:      // R8 family
+        case 13: case 14: return 1;
+        case 20: case 22: case 23:      // R16 family
+        case 24: case 25: return 2;
+        case 30: case 31: case 32:      // RG8 family
+        case 33: case 34: return 2;
+        case 53: case 54: case 55:      // R32 family
+        case 60: case 62: case 63:      // RG16 family
+        case 64: case 65: return 4;
         case 70: case 71:               // RGBA8
         case 80: case 81:               // BGRA8
         case 90: case 92: return 4;     // RGB10A2 / RG11B10Float
@@ -13662,6 +16471,26 @@ static void macws_stray_command_commit_trace(id self, SEL selector) {
     if (g_macws_stray_command_commit_orig)
         g_macws_stray_command_commit_orig(self, selector);
 
+    // Read-only join between the public Metal command-buffer boundary and
+    // the exact parser-facing submit serial.  AGX recycles Objective-C
+    // command-buffer addresses, so a pointer alone cannot distinguish the
+    // clean submission from a later timeout.  The fast submit recorder is
+    // populated by the original -commit path above; recording its newest
+    // serial here gives the per-pass END summaries an unambiguous batch
+    // boundary without retaining an object or changing command bytes/order.
+    if (macws_stray_full_render_trace_enabled()) {
+        uint64_t submitSerial = macws_fast_latest_agx_submit_serial(
+            (__bridge const void *)self);
+        if (!submitSerial) {
+            submitSerial = macws_latest_agx_submit_serial(
+                (__bridge const void *)self);
+        }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-RENDER-COMMIT command=%p submitSerial=%llu\n",
+            (__bridge void *)self,
+            (unsigned long long)submitSerial);
+    }
+
     // Join the render-target witness to the exact parser-facing KCMD that
     // produced it.  A command buffer with remembered large-draw buffers is
     // the deferred world pass, rather than a menu/postprocess tail.  The
@@ -13679,24 +16508,26 @@ static void macws_stray_command_commit_trace(id self, SEL selector) {
 }
 
 static BOOL macws_stray_trace_remember_pipeline(id encoder, id pipeline) {
-    uintptr_t encoderValue = (uintptr_t)(__bridge void *)encoder;
     uintptr_t pipelineValue = (uintptr_t)(__bridge void *)pipeline;
     BOOL firstBind = NO;
     pthread_mutex_lock(&g_macws_stray_render_trace_lock);
-    size_t encoderIndex = g_macws_stray_encoder_pipeline_count;
-    for (size_t i = 0; i < g_macws_stray_encoder_pipeline_count; i++) {
-        if (g_macws_stray_encoder_pipelines[i].encoder == encoderValue) {
-            encoderIndex = i;
-            break;
+    MacWSStrayEncoderPipeline *encoderState =
+        macws_stray_encoder_state_locked(encoder);
+    if (encoderState) {
+        encoderState->pipeline = pipelineValue;
+        BOOL alreadyRemembered = NO;
+        for (uint32_t i = 0; i < encoderState->pipelineCount; i++) {
+            if (encoderState->pipelines[i] == pipelineValue) {
+                alreadyRemembered = YES;
+                break;
+            }
+        }
+        if (pipelineValue && !alreadyRemembered &&
+            encoderState->pipelineCount < MACWS_STRAY_ENCODER_PIPELINE_CAP) {
+            encoderState->pipelines[encoderState->pipelineCount++] =
+                pipelineValue;
         }
     }
-    if (encoderIndex == g_macws_stray_encoder_pipeline_count &&
-        encoderIndex < MACWS_STRAY_RENDER_TRACE_CAP) {
-        g_macws_stray_encoder_pipeline_count++;
-        g_macws_stray_encoder_pipelines[encoderIndex].encoder = encoderValue;
-    }
-    if (encoderIndex < MACWS_STRAY_RENDER_TRACE_CAP)
-        g_macws_stray_encoder_pipelines[encoderIndex].pipeline = pipelineValue;
 
     size_t pipelineIndex = g_macws_stray_pipeline_witness_count;
     for (size_t i = 0; i < g_macws_stray_pipeline_witness_count; i++) {
@@ -13729,6 +16560,7 @@ static uintptr_t macws_stray_trace_pipeline_for_draw(id encoder,
     for (size_t i = 0; i < g_macws_stray_encoder_pipeline_count; i++) {
         if (g_macws_stray_encoder_pipelines[i].encoder == encoderValue) {
             pipelineValue = g_macws_stray_encoder_pipelines[i].pipeline;
+            g_macws_stray_encoder_pipelines[i].drawCount++;
             break;
         }
     }
@@ -13748,15 +16580,35 @@ static uintptr_t macws_stray_trace_pipeline_for_draw(id encoder,
 static MacWSStrayEncoderPipeline *
 macws_stray_encoder_state_locked(id encoder) {
     uintptr_t value = (uintptr_t)(__bridge void *)encoder;
+    size_t emptyIndex = MACWS_STRAY_RENDER_TRACE_CAP;
     for (size_t i = 0; i < g_macws_stray_encoder_pipeline_count; i++) {
         if (g_macws_stray_encoder_pipelines[i].encoder == value)
             return &g_macws_stray_encoder_pipelines[i];
+        if (!g_macws_stray_encoder_pipelines[i].encoder &&
+            emptyIndex == MACWS_STRAY_RENDER_TRACE_CAP)
+            emptyIndex = i;
     }
-    if (g_macws_stray_encoder_pipeline_count >=
-        MACWS_STRAY_RENDER_TRACE_CAP) return NULL;
+    size_t index = 0;
+    if (emptyIndex < MACWS_STRAY_RENDER_TRACE_CAP) {
+        // endEncoding releases a slot as soon as the encoder lifetime ends.
+        // Prefer that slot so the table tracks live encoders and does not
+        // evict another encoder which has not ended yet.
+        index = emptyIndex;
+    } else if (g_macws_stray_encoder_pipeline_count <
+        MACWS_STRAY_RENDER_TRACE_CAP) {
+        index = g_macws_stray_encoder_pipeline_count++;
+    } else {
+        // Runtime-confirmed via Stray PID 24802: the append-only table had
+        // consumed all 2048 slots before playable gameplay.  A later encoder
+        // address then matched stale state and the diagnostic tried to append
+        // a blit to an already committed command buffer.  The trace is a
+        // bounded flight recorder, not a lifetime registry: recycle one old
+        // slot for a newly observed encoder and erase it at endEncoding.
+        index = g_macws_stray_encoder_recycle_cursor++ %
+            MACWS_STRAY_RENDER_TRACE_CAP;
+    }
     MacWSStrayEncoderPipeline *state =
-        &g_macws_stray_encoder_pipelines[
-            g_macws_stray_encoder_pipeline_count++];
+        &g_macws_stray_encoder_pipelines[index];
     memset(state, 0, sizeof(*state));
     state->encoder = value;
     return state;
@@ -13901,6 +16753,185 @@ static void macws_stray_set_vertex_buffers_trace(
     if (g_macws_stray_set_vertex_buffers_orig)
         g_macws_stray_set_vertex_buffers_orig(
             self, selector, buffers, offsets, range);
+}
+
+static void macws_stray_set_fragment_buffer_trace(
+        id self, SEL selector, id buffer, NSUInteger offset,
+        NSUInteger index) {
+    if (index < MACWS_STRAY_FRAGMENT_BUFFER_CAP) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayEncoderPipeline *state =
+            macws_stray_encoder_state_locked(self);
+        if (state) {
+            state->fragmentBuffers[index].buffer =
+                (uintptr_t)(__bridge void *)buffer;
+            state->fragmentBuffers[index].offset = offset;
+            state->fragmentInlineLengths[index] = 0;
+        }
+        MacWSStrayPersistentFragmentBindings *persistent =
+            macws_stray_persistent_bindings_locked(self);
+        persistent->fragmentBuffers[index].buffer =
+            (uintptr_t)(__bridge void *)buffer;
+        persistent->fragmentBuffers[index].offset = offset;
+        persistent->fragmentInlineLengths[index] = 0;
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (g_macws_stray_set_fragment_buffer_orig)
+        g_macws_stray_set_fragment_buffer_orig(
+            self, selector, buffer, offset, index);
+}
+
+static void macws_stray_set_fragment_buffers_trace(
+        id self, SEL selector, const id *buffers,
+        const NSUInteger *offsets, NSRange range) {
+    if (buffers && range.location < MACWS_STRAY_FRAGMENT_BUFFER_CAP) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayEncoderPipeline *state =
+            macws_stray_encoder_state_locked(self);
+        NSUInteger end = MIN(
+            NSMaxRange(range), MACWS_STRAY_FRAGMENT_BUFFER_CAP);
+        for (NSUInteger index = range.location; state && index < end;
+             index++) {
+            NSUInteger source = index - range.location;
+            state->fragmentBuffers[index].buffer =
+                (uintptr_t)(__bridge void *)buffers[source];
+            state->fragmentBuffers[index].offset =
+                offsets ? offsets[source] : 0;
+            state->fragmentInlineLengths[index] = 0;
+        }
+        MacWSStrayPersistentFragmentBindings *persistent =
+            macws_stray_persistent_bindings_locked(self);
+        for (NSUInteger index = range.location; index < end; index++) {
+            NSUInteger source = index - range.location;
+            persistent->fragmentBuffers[index].buffer =
+                (uintptr_t)(__bridge void *)buffers[source];
+            persistent->fragmentBuffers[index].offset =
+                offsets ? offsets[source] : 0;
+            persistent->fragmentInlineLengths[index] = 0;
+        }
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (g_macws_stray_set_fragment_buffers_orig)
+        g_macws_stray_set_fragment_buffers_orig(
+            self, selector, buffers, offsets, range);
+}
+
+static void macws_stray_set_fragment_texture_trace(
+        id self, SEL selector, id texture, NSUInteger index) {
+    if (index == 2) {
+        static _Atomic uint32_t sequence = 0;
+        uint32_t current = atomic_fetch_add_explicit(
+            &sequence, 1, memory_order_relaxed) + 1;
+        if (current <= 256) {
+            NSUInteger width = 0, height = 0, format = 0;
+            @try {
+                width = [texture width];
+                height = [texture height];
+                format = [texture pixelFormat];
+            } @catch (NSException *exception) { (void)exception; }
+            dprintf(STDERR_FILENO,
+                "#### STRAY-FRAGMENT-BIND #%u source=single encoder=%p "
+                "index=%lu texture=%p size=%lux%lu pf=%lu\n",
+                current, (__bridge void *)self, (unsigned long)index,
+                (__bridge void *)texture, (unsigned long)width,
+                (unsigned long)height, (unsigned long)format);
+        }
+    }
+    if (index < MACWS_STRAY_FRAGMENT_TEXTURE_CAP) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayEncoderPipeline *state =
+            macws_stray_encoder_state_locked(self);
+        if (state)
+            state->fragmentTextures[index] =
+                (uintptr_t)(__bridge void *)texture;
+        MacWSStrayPersistentFragmentBindings *persistent =
+            macws_stray_persistent_bindings_locked(self);
+        persistent->fragmentTextures[index] =
+            (uintptr_t)(__bridge void *)texture;
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (g_macws_stray_set_fragment_texture_orig)
+        g_macws_stray_set_fragment_texture_orig(
+            self, selector, texture, index);
+}
+
+static void macws_stray_set_fragment_textures_trace(
+        id self, SEL selector, const id *textures, NSRange range) {
+    if (textures && range.location <= 2 && NSMaxRange(range) > 2) {
+        static _Atomic uint32_t sequence = 0;
+        uint32_t current = atomic_fetch_add_explicit(
+            &sequence, 1, memory_order_relaxed) + 1;
+        if (current <= 256) {
+            id texture = textures[2 - range.location];
+            NSUInteger width = 0, height = 0, format = 0;
+            @try {
+                width = [texture width];
+                height = [texture height];
+                format = [texture pixelFormat];
+            } @catch (NSException *exception) { (void)exception; }
+            dprintf(STDERR_FILENO,
+                "#### STRAY-FRAGMENT-BIND #%u source=bulk encoder=%p "
+                "range=%lu+%lu index=2 texture=%p size=%lux%lu pf=%lu\n",
+                current, (__bridge void *)self,
+                (unsigned long)range.location,
+                (unsigned long)range.length, (__bridge void *)texture,
+                (unsigned long)width, (unsigned long)height,
+                (unsigned long)format);
+        }
+    }
+    if (textures && range.location < MACWS_STRAY_FRAGMENT_TEXTURE_CAP) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayEncoderPipeline *state =
+            macws_stray_encoder_state_locked(self);
+        NSUInteger end = MIN(
+            NSMaxRange(range), MACWS_STRAY_FRAGMENT_TEXTURE_CAP);
+        for (NSUInteger index = range.location; state && index < end;
+             index++) {
+            state->fragmentTextures[index] = (uintptr_t)
+                (__bridge void *)textures[index - range.location];
+        }
+        MacWSStrayPersistentFragmentBindings *persistent =
+            macws_stray_persistent_bindings_locked(self);
+        for (NSUInteger index = range.location; index < end; index++) {
+            persistent->fragmentTextures[index] = (uintptr_t)
+                (__bridge void *)textures[index - range.location];
+        }
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (g_macws_stray_set_fragment_textures_orig)
+        g_macws_stray_set_fragment_textures_orig(
+            self, selector, textures, range);
+}
+
+static void macws_stray_set_fragment_bytes_trace(
+        id self, SEL selector, const void *bytes, NSUInteger length,
+        NSUInteger index) {
+    if (index < MACWS_STRAY_FRAGMENT_BUFFER_CAP) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayEncoderPipeline *state =
+            macws_stray_encoder_state_locked(self);
+        if (state) {
+            NSUInteger captured = bytes
+                ? MIN(length, MACWS_STRAY_FRAGMENT_INLINE_CAP) : 0;
+            state->fragmentBuffers[index] = (MacWSStrayBufferBinding){0};
+            state->fragmentInlineLengths[index] = (uint32_t)captured;
+            if (captured)
+                memcpy(state->fragmentInlineBytes[index], bytes, captured);
+        }
+        MacWSStrayPersistentFragmentBindings *persistent =
+            macws_stray_persistent_bindings_locked(self);
+        NSUInteger captured = bytes
+            ? MIN(length, MACWS_STRAY_FRAGMENT_INLINE_CAP) : 0;
+        persistent->fragmentBuffers[index] =
+            (MacWSStrayBufferBinding){0};
+        persistent->fragmentInlineLengths[index] = (uint32_t)captured;
+        if (captured)
+            memcpy(persistent->fragmentInlineBytes[index], bytes, captured);
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (g_macws_stray_set_fragment_bytes_orig)
+        g_macws_stray_set_fragment_bytes_orig(
+            self, selector, bytes, length, index);
 }
 
 typedef struct {
@@ -14200,8 +17231,1379 @@ static void macws_stray_draw_indexed_base_trace(
             instances, baseVertex, baseInstance);
 }
 
+// Diagnostic-only render-pass bisector.  The command-buffer-level capture
+// proved that Stray's 492x316 RG11B10Float scene color contains a canonical
+// NaN rectangle, but a texture can be written by several encoders before
+// commit.  While the explicit one-shot marker is live, insert an ordinary
+// blit immediately after each encoder that targeted this exact scene-color
+// family.  This preserves submission order and records the first pass whose
+// completed output contains the NaNs; it does not sanitize a value, replace a
+// shader, or alter any production path.  Full-size snapshots are bounded to
+// 32 passes so a moving artifact is still observable without relying on the
+// coordinates from one prior frame.
+#define MACWS_STRAY_STAGE_CAPTURE_CAP 32u
+static _Atomic uint32_t g_macws_stray_stage_capture_sequence = 0;
+static _Atomic uint32_t g_macws_stray_stage_pass_sequence = 0;
+static _Atomic uint32_t g_macws_stray_nan_input_capture_claimed = 0;
+static _Atomic uint32_t g_macws_stray_shadow_stage_sequence = 0;
+static _Atomic uint32_t g_macws_stray_compute_stage_sequence = 0;
+
+typedef id (*macws_compute_encoder_create_fn)(id, SEL);
+typedef id (*macws_compute_encoder_dispatch_create_fn)(id, SEL, NSUInteger);
+typedef void (*macws_compute_set_pipeline_fn)(id, SEL, id);
+typedef void (*macws_compute_set_texture_fn)(id, SEL, id, NSUInteger);
+typedef void (*macws_compute_set_textures_fn)(id, SEL, id const *, NSRange);
+typedef void (*macws_compute_dispatch_fn)(id, SEL, MTLSize, MTLSize);
+typedef void (*macws_compute_end_fn)(id, SEL);
+static macws_compute_encoder_create_fn
+    g_macws_stray_compute_encoder_orig = NULL;
+static macws_compute_encoder_dispatch_create_fn
+    g_macws_stray_compute_encoder_dispatch_orig = NULL;
+static macws_compute_set_pipeline_fn
+    g_macws_stray_compute_set_pipeline_orig = NULL;
+static macws_compute_set_texture_fn
+    g_macws_stray_compute_set_texture_orig = NULL;
+static macws_compute_set_textures_fn
+    g_macws_stray_compute_set_textures_orig = NULL;
+static macws_compute_dispatch_fn
+    g_macws_stray_compute_dispatch_groups_orig = NULL;
+static macws_compute_dispatch_fn
+    g_macws_stray_compute_dispatch_threads_orig = NULL;
+static macws_compute_end_fn g_macws_stray_compute_end_orig = NULL;
+
+static id macws_stray_compute_encoder_trace(id self, SEL selector) {
+    id encoder = g_macws_stray_compute_encoder_orig
+        ? g_macws_stray_compute_encoder_orig(self, selector) : nil;
+    macws_stray_compute_begin(self, encoder);
+    return encoder;
+}
+
+static id macws_stray_compute_encoder_dispatch_trace(
+        id self, SEL selector, NSUInteger dispatchType) {
+    id encoder = g_macws_stray_compute_encoder_dispatch_orig
+        ? g_macws_stray_compute_encoder_dispatch_orig(
+            self, selector, dispatchType) : nil;
+    macws_stray_compute_begin(self, encoder);
+    return encoder;
+}
+
+static void macws_stray_compute_set_pipeline_trace(
+        id self, SEL selector, id pipeline) {
+    uint32_t writeTextureMask = 0;
+    uintptr_t pipelineValue = (uintptr_t)(__bridge void *)pipeline;
+    uintptr_t variantPipeline = macws_half_float_variant_pipeline(
+        pipelineValue, &writeTextureMask);
+    BOOL fullRenderTrace = macws_stray_full_render_trace_enabled();
+    MacWSStrayComputeState *state = NULL;
+    if (fullRenderTrace) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        state = macws_stray_compute_state_locked(self, YES);
+    } else {
+        state = &g_macws_stray_compute_thread_state;
+        uintptr_t encoderValue = (uintptr_t)(__bridge void *)self;
+        if (state->encoder != encoderValue) {
+            memset(state, 0, sizeof(*state));
+            state->encoder = encoderValue;
+        }
+    }
+    if (state) {
+        state->pipeline = pipelineValue;
+        state->activePipeline = state->pipeline;
+        state->halfFloatVariantPipeline = variantPipeline;
+        state->halfFloatWriteTextureMask = writeTextureMask;
+    }
+    if (fullRenderTrace)
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    if (macws_metalfx_encoder_diag_enabled()) {
+        char function[128] = {0};
+        macws_compute_pipeline_name(pipelineValue, function,
+                                    sizeof(function));
+        dprintf(STDERR_FILENO,
+            "#### METALFX-ENCODER pipeline encoder=%p commandBuffer=%#llx "
+            "pipeline=%p function=%s\n",
+            (__bridge void *)self,
+            (unsigned long long)(state ? state->commandBuffer : 0),
+            (__bridge void *)pipeline, function);
+    }
+    if (g_macws_stray_compute_set_pipeline_orig)
+        g_macws_stray_compute_set_pipeline_orig(self, selector, pipeline);
+}
+
+static void macws_stray_compute_set_texture_trace(
+        id self, SEL selector, id texture, NSUInteger index) {
+    BOOL fullRenderTrace = macws_stray_full_render_trace_enabled();
+    MacWSStrayComputeState *state = NULL;
+    if (fullRenderTrace) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        state = macws_stray_compute_state_locked(self, YES);
+    } else if (g_macws_stray_compute_thread_state.encoder ==
+               (uintptr_t)(__bridge void *)self) {
+        state = &g_macws_stray_compute_thread_state;
+    }
+    if (state && index < MACWS_STRAY_COMPUTE_TEXTURE_CAP)
+        state->textures[index] =
+            (uintptr_t)(__bridge void *)texture;
+    if (fullRenderTrace)
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    if (g_macws_stray_compute_set_texture_orig)
+        g_macws_stray_compute_set_texture_orig(
+            self, selector, texture, index);
+}
+
+static void macws_stray_compute_set_textures_trace(
+        id self, SEL selector, id const *textures, NSRange range) {
+    BOOL fullRenderTrace = macws_stray_full_render_trace_enabled();
+    MacWSStrayComputeState *state = NULL;
+    if (fullRenderTrace) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        state = macws_stray_compute_state_locked(self, YES);
+    } else if (g_macws_stray_compute_thread_state.encoder ==
+               (uintptr_t)(__bridge void *)self) {
+        state = &g_macws_stray_compute_thread_state;
+    }
+    if (state && textures) {
+        for (NSUInteger offset = 0; offset < range.length; offset++) {
+            NSUInteger index = range.location + offset;
+            if (index < MACWS_STRAY_COMPUTE_TEXTURE_CAP)
+                state->textures[index] =
+                    (uintptr_t)(__bridge void *)textures[offset];
+        }
+    }
+    if (fullRenderTrace)
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    if (g_macws_stray_compute_set_textures_orig)
+        g_macws_stray_compute_set_textures_orig(
+            self, selector, textures, range);
+}
+
+static BOOL macws_half_float_texture_format(NSUInteger pixelFormat) {
+    return pixelFormat == MTLPixelFormatR16Float ||
+           pixelFormat == MTLPixelFormatRG16Float ||
+           pixelFormat == MTLPixelFormatRGBA16Float;
+}
+
+static void macws_stray_select_compute_pipeline_for_bound_formats(id encoder) {
+    if (!g_macws_stray_compute_set_pipeline_orig) return;
+    uintptr_t pipeline = 0;
+    uintptr_t activePipeline = 0;
+    uintptr_t variantPipeline = 0;
+    uint32_t writeTextureMask = 0;
+    uintptr_t textures[MACWS_STRAY_COMPUTE_TEXTURE_CAP] = {0};
+    BOOL fullRenderTrace = macws_stray_full_render_trace_enabled();
+    MacWSStrayComputeState *state = NULL;
+    if (fullRenderTrace) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        state = macws_stray_compute_state_locked(encoder, NO);
+    } else if (g_macws_stray_compute_thread_state.encoder ==
+               (uintptr_t)(__bridge void *)encoder) {
+        state = &g_macws_stray_compute_thread_state;
+    }
+    if (state) {
+        pipeline = state->pipeline;
+        activePipeline = state->activePipeline;
+        variantPipeline = state->halfFloatVariantPipeline;
+        writeTextureMask = state->halfFloatWriteTextureMask;
+        if (variantPipeline && writeTextureMask)
+            memcpy(textures, state->textures, sizeof(textures));
+    }
+    if (fullRenderTrace)
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    if (!pipeline || !variantPipeline || !writeTextureMask) return;
+    uintptr_t desiredPipeline = pipeline;
+    BOOL compatible = variantPipeline && writeTextureMask;
+    for (uint32_t index = 0; compatible && index < 32; index++) {
+        if (!(writeTextureMask & (UINT32_C(1) << index))) continue;
+        if (index >= MACWS_STRAY_COMPUTE_TEXTURE_CAP ||
+            !textures[index]) {
+            compatible = NO;
+            break;
+        }
+        id texture = (__bridge id)(void *)textures[index];
+        NSUInteger pixelFormat = MTLPixelFormatInvalid;
+        @try { pixelFormat = [texture pixelFormat]; }
+        @catch (NSException *exception) {
+            (void)exception;
+            compatible = NO;
+            break;
+        }
+        if (!macws_half_float_texture_format(pixelFormat)) compatible = NO;
+    }
+    if (compatible) desiredPipeline = variantPipeline;
+    if (!desiredPipeline || desiredPipeline == activePipeline)
+        return;
+
+    g_macws_stray_compute_set_pipeline_orig(
+        encoder, sel_registerName("setComputePipelineState:"),
+        (__bridge id)(void *)desiredPipeline);
+    if (fullRenderTrace) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        state = macws_stray_compute_state_locked(encoder, NO);
+    } else if (g_macws_stray_compute_thread_state.encoder ==
+               (uintptr_t)(__bridge void *)encoder) {
+        state = &g_macws_stray_compute_thread_state;
+    } else {
+        state = NULL;
+    }
+    if (state && state->pipeline == pipeline)
+        state->activePipeline = desiredPipeline;
+    if (fullRenderTrace)
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    static _Atomic uint32_t switchCount = 0;
+    uint32_t sequence = atomic_fetch_add_explicit(
+        &switchCount, 1, memory_order_relaxed) + 1;
+    if (sequence <= 32) {
+        dprintf(STDERR_FILENO,
+            "#### METAL-HALF-VARIANT dispatch-switch #%u encoder=%p "
+            "ordinary=%#llx selected=%#llx mode=%s "
+            "writeTextureMask=%#x\n",
+            sequence, (__bridge void *)encoder,
+            (unsigned long long)pipeline,
+            (unsigned long long)desiredPipeline,
+            compatible ? "half-float" : "ordinary",
+            writeTextureMask);
+    }
+}
+
+static void macws_stray_compute_dispatch_groups_trace(
+        id self, SEL selector, MTLSize groups, MTLSize threads) {
+    macws_stray_select_compute_pipeline_for_bound_formats(self);
+    if (macws_stray_full_render_trace_enabled()) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayComputeState *state =
+            macws_stray_compute_state_locked(self, YES);
+        if (state) {
+            if (state->dispatchCount < MACWS_STRAY_COMPUTE_DISPATCH_CAP)
+                state->dispatchPipelines[state->dispatchCount] =
+                    state->activePipeline ?: state->pipeline;
+            state->dispatchCount++;
+        }
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (macws_metalfx_encoder_diag_enabled()) {
+        MacWSStrayComputeState *state =
+            g_macws_stray_compute_thread_state.encoder ==
+                    (uintptr_t)(__bridge void *)self
+                ? &g_macws_stray_compute_thread_state : NULL;
+        char function[128] = {0};
+        macws_compute_pipeline_name(
+            state ? state->activePipeline ?: state->pipeline : 0,
+            function, sizeof(function));
+        dprintf(STDERR_FILENO,
+            "#### METALFX-ENCODER dispatch-groups encoder=%p "
+            "commandBuffer=%#llx function=%s groups=%lux%lux%lu "
+            "threads=%lux%lux%lu\n",
+            (__bridge void *)self,
+            (unsigned long long)(state ? state->commandBuffer : 0),
+            function, (unsigned long)groups.width,
+            (unsigned long)groups.height, (unsigned long)groups.depth,
+            (unsigned long)threads.width, (unsigned long)threads.height,
+            (unsigned long)threads.depth);
+    }
+    if (g_macws_stray_compute_dispatch_groups_orig)
+        g_macws_stray_compute_dispatch_groups_orig(
+            self, selector, groups, threads);
+}
+
+static void macws_stray_compute_dispatch_threads_trace(
+        id self, SEL selector, MTLSize grid, MTLSize threads) {
+    macws_stray_select_compute_pipeline_for_bound_formats(self);
+    if (macws_stray_full_render_trace_enabled()) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayComputeState *state =
+            macws_stray_compute_state_locked(self, YES);
+        if (state) {
+            if (state->dispatchCount < MACWS_STRAY_COMPUTE_DISPATCH_CAP)
+                state->dispatchPipelines[state->dispatchCount] =
+                    state->activePipeline ?: state->pipeline;
+            state->dispatchCount++;
+        }
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    }
+    if (macws_metalfx_encoder_diag_enabled()) {
+        MacWSStrayComputeState *state =
+            g_macws_stray_compute_thread_state.encoder ==
+                    (uintptr_t)(__bridge void *)self
+                ? &g_macws_stray_compute_thread_state : NULL;
+        char function[128] = {0};
+        macws_compute_pipeline_name(
+            state ? state->activePipeline ?: state->pipeline : 0,
+            function, sizeof(function));
+        dprintf(STDERR_FILENO,
+            "#### METALFX-ENCODER dispatch-threads encoder=%p "
+            "commandBuffer=%#llx function=%s grid=%lux%lux%lu "
+            "threads=%lux%lux%lu\n",
+            (__bridge void *)self,
+            (unsigned long long)(state ? state->commandBuffer : 0),
+            function, (unsigned long)grid.width,
+            (unsigned long)grid.height, (unsigned long)grid.depth,
+            (unsigned long)threads.width, (unsigned long)threads.height,
+            (unsigned long)threads.depth);
+    }
+    if (g_macws_stray_compute_dispatch_threads_orig)
+        g_macws_stray_compute_dispatch_threads_orig(
+            self, selector, grid, threads);
+}
+
+static void macws_stray_capture_compute_stage(
+        MacWSStrayComputeState state) {
+    if (!state.commandBuffer || !state.dispatchCount) return;
+    id commandBuffer = (__bridge id)(void *)state.commandBuffer;
+    NSUInteger commandStatus = MTLCommandBufferStatusError;
+    @try { commandStatus = [commandBuffer status]; }
+    @catch (NSException *exception) { (void)exception; }
+    if (commandStatus >= MTLCommandBufferStatusCommitted) return;
+
+    NSMutableArray *buffers = [NSMutableArray array];
+    NSMutableArray *metadata = [NSMutableArray array];
+    id blit = nil;
+    uint32_t stage = UINT32_MAX;
+    uintptr_t seen[MACWS_STRAY_COMPUTE_TEXTURE_CAP] = {0};
+    size_t seenCount = 0;
+    for (uint32_t index = 0;
+         index < MACWS_STRAY_COMPUTE_TEXTURE_CAP; index++) {
+        uintptr_t value = state.textures[index];
+        if (!value) continue;
+        BOOL duplicate = NO;
+        for (size_t old = 0; old < seenCount; old++) {
+            if (seen[old] == value) { duplicate = YES; break; }
+        }
+        if (duplicate) continue;
+        seen[seenCount++] = value;
+        id texture = (__bridge id)(void *)value;
+        NSUInteger width = 0, height = 0, pixelFormat = 0, usage = 0;
+        @try {
+            width = [texture width];
+            height = [texture height];
+            pixelFormat = [texture pixelFormat];
+            usage = [texture usage];
+        } @catch (NSException *exception) {
+            (void)exception;
+            continue;
+        }
+        if (width != 246 || height != 158 || pixelFormat != 65 ||
+            !(usage & MTLTextureUsageShaderWrite)) continue;
+        if (stage == UINT32_MAX) {
+            stage = atomic_fetch_add_explicit(
+                &g_macws_stray_compute_stage_sequence, 1,
+                memory_order_acq_rel);
+            if (stage >= MACWS_STRAY_STAGE_CAPTURE_CAP) return;
+        }
+        const NSUInteger bytesPerRow =
+            (width * sizeof(uint32_t) + 255u) & ~255u;
+        const NSUInteger length = bytesPerRow * height;
+        id destination = nil;
+        @try {
+            id device = [texture device];
+            destination = [device newBufferWithLength:length
+                options:MTLResourceStorageModeShared];
+            if (!blit && destination)
+                blit = [commandBuffer blitCommandEncoder];
+            if (destination && blit) {
+                [blit copyFromTexture:texture
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(width, height, 1)
+                             toBuffer:destination
+                    destinationOffset:0
+               destinationBytesPerRow:bytesPerRow
+             destinationBytesPerImage:length];
+            }
+        } @catch (NSException *exception) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-COMPUTE-STAGE encode throw=%s reason=%s "
+                "encoder=%#llx texture=%#llx index=%u\n",
+                exception.name.UTF8String ?: "(nil)",
+                exception.reason.UTF8String ?: "(nil)",
+                (unsigned long long)state.encoder,
+                (unsigned long long)value, index);
+            destination = nil;
+        }
+        if (!destination || !blit) continue;
+        [buffers addObject:destination];
+        [metadata addObject:@{
+            @"index": @(index), @"texture": @(value),
+            @"bytesPerRow": @(bytesPerRow), @"length": @(length),
+        }];
+    }
+    if (blit) [blit endEncoding];
+    if (![buffers count] ||
+        ![commandBuffer respondsToSelector:@selector(addCompletedHandler:)])
+        return;
+    char dispatchSequence[1280] = {0};
+    size_t dispatchUsed = 0;
+    uint32_t recordedDispatches = MIN(
+        state.dispatchCount, MACWS_STRAY_COMPUTE_DISPATCH_CAP);
+    for (uint32_t i = 0; i < recordedDispatches; i++) {
+        char function[128] = {0};
+        macws_compute_pipeline_name(
+            state.dispatchPipelines[i], function, sizeof(function));
+        int written = snprintf(
+            dispatchSequence + dispatchUsed,
+            sizeof(dispatchSequence) - dispatchUsed,
+            "%s%#llx/%s", i ? "," : "",
+            (unsigned long long)state.dispatchPipelines[i], function);
+        if (written <= 0 ||
+            (size_t)written >= sizeof(dispatchSequence) - dispatchUsed)
+            break;
+        dispatchUsed += (size_t)written;
+    }
+    NSString *dispatchMetadata =
+        [NSString stringWithUTF8String:dispatchSequence];
+    dprintf(STDERR_FILENO,
+        "#### STRAY-COMPUTE-STAGE scheduled stage=%u command=%#llx "
+        "encoder=%#llx pipeline=%#llx dispatches=%u sequence=%s "
+        "resources=%lu\n",
+        stage, (unsigned long long)state.commandBuffer,
+        (unsigned long long)state.encoder,
+        (unsigned long long)state.pipeline, state.dispatchCount,
+        dispatchSequence[0] ? dispatchSequence : "(none)",
+        (unsigned long)[buffers count]);
+    [commandBuffer addCompletedHandler:^(__unused id completed) {
+        for (NSUInteger item = 0; item < [buffers count]; item++) {
+            id destination = buffers[item];
+            NSDictionary *info = metadata[item];
+            char path[PATH_MAX] = {0};
+            snprintf(path, sizeof(path),
+                "/tmp/macws_stray_compute_stage_%03u_t%02u.raw", stage,
+                [info[@"index"] unsignedIntValue]);
+            FILE *file = fopen(path, "wb");
+            if (!file) continue;
+            fprintf(file,
+                "MACWSRT w=246 h=158 pf=65 attachment=%u bpr=%u "
+                "length=%u texture=%#llx computeStage=%u command=%#llx "
+                "encoder=%#llx pipeline=%#llx dispatches=%u "
+                "sequence=%s\n",
+                [info[@"index"] unsignedIntValue],
+                [info[@"bytesPerRow"] unsignedIntValue],
+                [info[@"length"] unsignedIntValue],
+                [info[@"texture"] unsignedLongLongValue], stage,
+                (unsigned long long)state.commandBuffer,
+                (unsigned long long)state.encoder,
+                (unsigned long long)state.pipeline, state.dispatchCount,
+                dispatchMetadata.UTF8String ?: "(none)");
+            fwrite([destination contents], 1,
+                   [info[@"length"] unsignedIntegerValue], file);
+            fclose(file);
+            dprintf(STDERR_FILENO,
+                "#### STRAY-COMPUTE-STAGE wrote=%s\n", path);
+        }
+    }];
+}
+
+static void macws_stray_compute_end_trace(id self, SEL selector) {
+    MacWSStrayComputeState state = {0};
+    BOOL fullRenderTrace = macws_stray_full_render_trace_enabled();
+    if (fullRenderTrace) {
+        pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+        MacWSStrayComputeState *stored =
+            macws_stray_compute_state_locked(self, NO);
+        if (stored) {
+            state = *stored;
+            memset(stored, 0, sizeof(*stored));
+        }
+        pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+    } else if (g_macws_stray_compute_thread_state.encoder ==
+               (uintptr_t)(__bridge void *)self) {
+        if (macws_metalfx_encoder_diag_enabled()) {
+            char function[128] = {0};
+            macws_compute_pipeline_name(
+                g_macws_stray_compute_thread_state.activePipeline ?:
+                    g_macws_stray_compute_thread_state.pipeline,
+                function, sizeof(function));
+            dprintf(STDERR_FILENO,
+                "#### METALFX-ENCODER end encoder=%p commandBuffer=%#llx "
+                "function=%s\n",
+                (__bridge void *)self,
+                (unsigned long long)
+                    g_macws_stray_compute_thread_state.commandBuffer,
+                function);
+        }
+        memset(&g_macws_stray_compute_thread_state, 0,
+               sizeof(g_macws_stray_compute_thread_state));
+    }
+    if (g_macws_stray_compute_end_orig)
+        g_macws_stray_compute_end_orig(self, selector);
+    if (fullRenderTrace &&
+        access("/tmp/macws_stray_rt_capture_now", F_OK) == 0)
+        macws_stray_capture_compute_stage(state);
+}
+
+// Capture the producer history of the exact RG16Float half-resolution
+// resource later observed as ShadowFactorsTexture.  This is a bounded,
+// marker-gated provenance recorder: it snapshots what each real render pass
+// stored, including the real pipeline list, and never changes a shader value
+// or render-pass descriptor.
+static void macws_stray_capture_shadow_stage(
+        MacWSStrayEncoderPipeline target) {
+    if (!target.commandBuffer || !target.shadowTexture) return;
+    id commandBuffer = (__bridge id)(void *)target.commandBuffer;
+    id texture = (__bridge id)(void *)target.shadowTexture;
+    NSUInteger commandStatus = MTLCommandBufferStatusError;
+    @try { commandStatus = [commandBuffer status]; }
+    @catch (NSException *exception) { (void)exception; }
+    if (commandStatus >= MTLCommandBufferStatusCommitted) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SHADOW-STAGE skip command=%#llx status=%lu "
+            "reason=not-encodable\n",
+            (unsigned long long)target.commandBuffer,
+            (unsigned long)commandStatus);
+        return;
+    }
+    uint32_t stage = atomic_fetch_add_explicit(
+        &g_macws_stray_shadow_stage_sequence, 1, memory_order_acq_rel);
+    if (stage >= MACWS_STRAY_STAGE_CAPTURE_CAP) return;
+    const NSUInteger width = 246;
+    const NSUInteger height = 158;
+    const NSUInteger bytesPerRow =
+        (width * sizeof(uint32_t) + 255u) & ~255u;
+    const NSUInteger length = bytesPerRow * height;
+    id buffer = nil;
+    id blit = nil;
+    @try {
+        id device = [texture device];
+        buffer = [device newBufferWithLength:length
+                                      options:MTLResourceStorageModeShared];
+        if (buffer) blit = [commandBuffer blitCommandEncoder];
+        if (buffer && blit) {
+            [blit copyFromTexture:texture
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(width, height, 1)
+                         toBuffer:buffer
+                destinationOffset:0
+           destinationBytesPerRow:bytesPerRow
+         destinationBytesPerImage:length];
+            [blit endEncoding];
+        }
+    } @catch (NSException *exception) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SHADOW-STAGE encode throw=%s reason=%s "
+            "stage=%u encoder=%#llx texture=%#llx\n",
+            exception.name.UTF8String ?: "(nil)",
+            exception.reason.UTF8String ?: "(nil)", stage,
+            (unsigned long long)target.encoder,
+            (unsigned long long)target.shadowTexture);
+        buffer = nil;
+        blit = nil;
+    }
+    if (!buffer || !blit ||
+        ![commandBuffer respondsToSelector:@selector(addCompletedHandler:)])
+        return;
+
+    char pipelineList[768] = {0};
+    size_t used = 0;
+    for (uint32_t i = 0; i < target.pipelineCount; i++) {
+        int written = snprintf(
+            pipelineList + used, sizeof(pipelineList) - used,
+            "%s%#llx", i ? "," : "",
+            (unsigned long long)target.pipelines[i]);
+        if (written <= 0 || (size_t)written >= sizeof(pipelineList) - used)
+            break;
+        used += (size_t)written;
+    }
+    NSString *pipelineMetadata = [NSString stringWithUTF8String:pipelineList];
+    dprintf(STDERR_FILENO,
+        "#### STRAY-SHADOW-STAGE scheduled stage=%u command=%#llx "
+        "encoder=%#llx texture=%#llx attachment=%u draws=%u "
+        "pipelines=%u/%s load=%u store=%u\n",
+        stage, (unsigned long long)target.commandBuffer,
+        (unsigned long long)target.encoder,
+        (unsigned long long)target.shadowTexture,
+        target.shadowAttachment, target.drawCount, target.pipelineCount,
+        pipelineList[0] ? pipelineList : "(none)",
+        target.shadowLoadAction, target.shadowStoreAction);
+    [commandBuffer addCompletedHandler:^(__unused id completed) {
+        char path[PATH_MAX] = {0};
+        snprintf(path, sizeof(path),
+                 "/tmp/macws_stray_shadow_stage_%03u.raw", stage);
+        FILE *file = fopen(path, "wb");
+        if (!file) return;
+        fprintf(file,
+            "MACWSRT w=%u h=%u pf=65 attachment=%u bpr=%u length=%u "
+            "texture=%#llx shadowStage=%u command=%#llx encoder=%#llx "
+            "draws=%u load=%u store=%u pipelines=%s\n",
+            (unsigned int)width, (unsigned int)height,
+            target.shadowAttachment, (unsigned int)bytesPerRow,
+            (unsigned int)length,
+            (unsigned long long)target.shadowTexture, stage,
+            (unsigned long long)target.commandBuffer,
+            (unsigned long long)target.encoder, target.drawCount,
+            target.shadowLoadAction, target.shadowStoreAction,
+            pipelineMetadata.UTF8String ?: "(none)");
+        fwrite([buffer contents], 1, length, file);
+        fclose(file);
+        dprintf(STDERR_FILENO,
+            "#### STRAY-SHADOW-STAGE wrote=%s\n", path);
+    }];
+}
+
+static void macws_stray_capture_nan_pipeline_inputs(
+        MacWSStrayEncoderPipeline target, id commandBuffer,
+        uint32_t stage) {
+    uintptr_t badPipeline = atomic_load_explicit(
+        &g_macws_stray_nan_pipeline, memory_order_acquire);
+    if (!badPipeline || target.pipeline != badPipeline) return;
+    uint32_t expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(
+            &g_macws_stray_nan_input_capture_claimed, &expected, 1,
+            memory_order_acq_rel, memory_order_relaxed)) return;
+
+    NSMutableArray *buffers = [NSMutableArray array];
+    NSMutableArray *metadata = [NSMutableArray array];
+    id blit = nil;
+    for (uint32_t index = 0;
+         index < MACWS_STRAY_FRAGMENT_TEXTURE_CAP; index++) {
+        uintptr_t textureValue = target.fragmentTextures[index];
+        if (!textureValue) continue;
+        id texture = (__bridge id)(void *)textureValue;
+        NSUInteger width = 0, height = 0, pixelFormat = 0;
+        NSUInteger textureType = 0, usage = 0, storageMode = 0;
+        @try {
+            width = [texture width];
+            height = [texture height];
+            pixelFormat = [texture pixelFormat];
+            textureType = [texture textureType];
+            usage = [texture usage];
+            storageMode = [texture storageMode];
+        } @catch (NSException *exception) {
+            (void)exception;
+            continue;
+        }
+        NSUInteger bytesPerPixel = macws_stray_bytes_per_pixel(pixelFormat);
+        dprintf(STDERR_FILENO,
+            "#### STRAY-NAN-TEXTURE index=%u texture=%p width=%lu "
+            "height=%lu pf=%lu type=%lu usage=%#lx storage=%lu bpp=%lu\n",
+            index, (void *)textureValue, (unsigned long)width,
+            (unsigned long)height, (unsigned long)pixelFormat,
+            (unsigned long)textureType, (unsigned long)usage,
+            (unsigned long)storageMode, (unsigned long)bytesPerPixel);
+        if (!width || !height || width > 4096 || height > 2160 ||
+            !bytesPerPixel) continue;
+        NSUInteger bytesPerRow =
+            (width * bytesPerPixel + 255u) & ~255u;
+        NSUInteger length = bytesPerRow * height;
+        id destination = nil;
+        @try {
+            id device = [texture device];
+            destination = [device newBufferWithLength:length
+                options:MTLResourceStorageModeShared];
+            if (!blit && destination)
+                blit = [commandBuffer blitCommandEncoder];
+            if (destination && blit) {
+                [blit copyFromTexture:texture
+                          sourceSlice:0
+                          sourceLevel:0
+                         sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(width, height, 1)
+                             toBuffer:destination
+                    destinationOffset:0
+               destinationBytesPerRow:bytesPerRow
+             destinationBytesPerImage:length];
+            }
+        } @catch (NSException *exception) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-NAN-INPUT texture encode throw=%s reason=%s "
+                "index=%u texture=%p pf=%lu\n",
+                exception.name.UTF8String ?: "(nil)",
+                exception.reason.UTF8String ?: "(nil)", index,
+                (void *)textureValue, (unsigned long)pixelFormat);
+            destination = nil;
+        }
+        if (!destination || !blit) continue;
+        [buffers addObject:destination];
+        [metadata addObject:@{
+            @"kind": @"texture", @"index": @(index),
+            @"texture": @(textureValue), @"width": @(width),
+            @"height": @(height), @"pixelFormat": @(pixelFormat),
+            @"bytesPerRow": @(bytesPerRow), @"length": @(length),
+        }];
+    }
+    for (uint32_t index = 0;
+         index < MACWS_STRAY_FRAGMENT_BUFFER_CAP; index++) {
+        MacWSStrayBufferBinding binding = target.fragmentBuffers[index];
+        if (!binding.buffer) continue;
+        id source = (__bridge id)(void *)binding.buffer;
+        NSUInteger sourceLength = 0, copyLength = 0;
+        id destination = nil;
+        @try {
+            sourceLength = [source length];
+            if (binding.offset < sourceLength)
+                copyLength = MIN((NSUInteger)4096,
+                                 sourceLength - binding.offset);
+            id device = [source device];
+            if (copyLength)
+                destination = [device newBufferWithLength:copyLength
+                    options:MTLResourceStorageModeShared];
+            if (!blit && destination)
+                blit = [commandBuffer blitCommandEncoder];
+            if (destination && blit) {
+                [blit copyFromBuffer:source
+                       sourceOffset:(NSUInteger)binding.offset
+                           toBuffer:destination
+                  destinationOffset:0 size:copyLength];
+            }
+        } @catch (NSException *exception) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-NAN-INPUT buffer encode throw=%s reason=%s "
+                "index=%u buffer=%p offset=%llu\n",
+                exception.name.UTF8String ?: "(nil)",
+                exception.reason.UTF8String ?: "(nil)", index,
+                (void *)binding.buffer,
+                (unsigned long long)binding.offset);
+            destination = nil;
+        }
+        if (!destination || !blit) continue;
+        [buffers addObject:destination];
+        [metadata addObject:@{
+            @"kind": @"buffer", @"index": @(index),
+            @"buffer": @(binding.buffer), @"offset": @(binding.offset),
+            @"length": @(copyLength), @"sourceLength": @(sourceLength),
+        }];
+    }
+    if (blit) [blit endEncoding];
+
+    for (uint32_t index = 0;
+         index < MACWS_STRAY_FRAGMENT_BUFFER_CAP; index++) {
+        uint32_t length = target.fragmentInlineLengths[index];
+        if (!length) continue;
+        char path[PATH_MAX] = {0};
+        snprintf(path, sizeof(path),
+            "/tmp/macws_stray_input_inline_f%02u.raw", index);
+        FILE *file = fopen(path, "wb");
+        if (!file) continue;
+        fprintf(file,
+            "MACWSBUF role=fragment-inline index=%u offset=0 length=%u "
+            "sourceLength=%u pipeline=%#llx stage=%u\n",
+            index, length, length, (unsigned long long)target.pipeline,
+            stage);
+        fwrite(target.fragmentInlineBytes[index], 1, length, file);
+        fclose(file);
+        dprintf(STDERR_FILENO,
+            "#### STRAY-NAN-INPUT wrote=%s\n", path);
+    }
+
+    if (![buffers count] ||
+        ![commandBuffer respondsToSelector:@selector(addCompletedHandler:)]) {
+        if (![buffers count]) atomic_store_explicit(
+            &g_macws_stray_nan_input_capture_claimed, 0,
+            memory_order_release);
+        return;
+    }
+    dprintf(STDERR_FILENO,
+        "#### STRAY-NAN-INPUT scheduled pipeline=%#llx stage=%u "
+        "resources=%lu textures=%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx,%#llx\n",
+        (unsigned long long)target.pipeline, stage,
+        (unsigned long)[buffers count],
+        (unsigned long long)target.fragmentTextures[0],
+        (unsigned long long)target.fragmentTextures[1],
+        (unsigned long long)target.fragmentTextures[2],
+        (unsigned long long)target.fragmentTextures[3],
+        (unsigned long long)target.fragmentTextures[4],
+        (unsigned long long)target.fragmentTextures[5],
+        (unsigned long long)target.fragmentTextures[6],
+        (unsigned long long)target.fragmentTextures[7]);
+    [commandBuffer addCompletedHandler:^(__unused id completed) {
+        for (NSUInteger item = 0; item < [buffers count]; item++) {
+            id destination = buffers[item];
+            NSDictionary *info = metadata[item];
+            char path[PATH_MAX] = {0};
+            BOOL texture = [info[@"kind"] isEqualToString:@"texture"];
+            if (texture) {
+                snprintf(path, sizeof(path),
+                    "/tmp/macws_stray_input_t%02u_pf%u.raw",
+                    [info[@"index"] unsignedIntValue],
+                    [info[@"pixelFormat"] unsignedIntValue]);
+            } else {
+                snprintf(path, sizeof(path),
+                    "/tmp/macws_stray_input_b%02u.raw",
+                    [info[@"index"] unsignedIntValue]);
+            }
+            FILE *file = fopen(path, "wb");
+            if (!file) continue;
+            if (texture) {
+                fprintf(file,
+                    "MACWSRT w=%u h=%u pf=%u attachment=%u bpr=%u "
+                    "length=%u texture=%#llx input=fragment "
+                    "pipeline=%#llx stage=%u\n",
+                    [info[@"width"] unsignedIntValue],
+                    [info[@"height"] unsignedIntValue],
+                    [info[@"pixelFormat"] unsignedIntValue],
+                    [info[@"index"] unsignedIntValue],
+                    [info[@"bytesPerRow"] unsignedIntValue],
+                    [info[@"length"] unsignedIntValue],
+                    [info[@"texture"] unsignedLongLongValue],
+                    (unsigned long long)target.pipeline, stage);
+            } else {
+                fprintf(file,
+                    "MACWSBUF role=fragment index=%u offset=%llu "
+                    "length=%u sourceLength=%u buffer=%#llx "
+                    "pipeline=%#llx stage=%u\n",
+                    [info[@"index"] unsignedIntValue],
+                    [info[@"offset"] unsignedLongLongValue],
+                    [info[@"length"] unsignedIntValue],
+                    [info[@"sourceLength"] unsignedIntValue],
+                    [info[@"buffer"] unsignedLongLongValue],
+                    (unsigned long long)target.pipeline, stage);
+            }
+            fwrite([destination contents], 1,
+                   [info[@"length"] unsignedIntegerValue], file);
+            fclose(file);
+            dprintf(STDERR_FILENO,
+                "#### STRAY-NAN-INPUT wrote=%s\n", path);
+        }
+    }];
+}
+
+static void macws_stray_end_encoding_trace(id self, SEL selector) {
+    MacWSStrayEncoderPipeline target = {0};
+    uintptr_t encoderValue = (uintptr_t)(__bridge void *)self;
+    pthread_mutex_lock(&g_macws_stray_render_trace_lock);
+    for (size_t i = 0; i < g_macws_stray_encoder_pipeline_count; i++) {
+        if (g_macws_stray_encoder_pipelines[i].encoder == encoderValue) {
+            target = g_macws_stray_encoder_pipelines[i];
+            memset(&g_macws_stray_encoder_pipelines[i], 0,
+                   sizeof(g_macws_stray_encoder_pipelines[i]));
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_macws_stray_render_trace_lock);
+
+    if (macws_stray_full_render_trace_enabled()) {
+        char pipelineList[384] = {0};
+        size_t used = 0;
+        for (uint32_t i = 0; i < target.pipelineCount; i++) {
+            int written = snprintf(
+                pipelineList + used, sizeof(pipelineList) - used,
+                "%s%#llx", i ? "," : "",
+                (unsigned long long)target.pipelines[i]);
+            if (written <= 0 ||
+                (size_t)written >= sizeof(pipelineList) - used)
+                break;
+            used += (size_t)written;
+        }
+        static _Atomic uint64_t passSequence = 0;
+        uint64_t pass = atomic_fetch_add_explicit(
+            &passSequence, 1, memory_order_relaxed) + 1;
+        dprintf(STDERR_FILENO,
+            "#### STRAY-RENDER-END pass=%llu command=%#llx encoder=%#llx "
+            "draws=%u pipelines=%u/%s color=%#llx/%ux%u/pf%u/load%u/store%u "
+            "depth=%#llx/%ux%u/pf%u/load%u/store%u/clear%.9g\n",
+            (unsigned long long)pass,
+            (unsigned long long)target.commandBuffer,
+            (unsigned long long)target.encoder,
+            target.drawCount, target.pipelineCount,
+            pipelineList[0] ? pipelineList : "(none)",
+            (unsigned long long)target.colorTexture,
+            target.colorWidth, target.colorHeight, target.colorFormat,
+            target.colorLoadAction, target.colorStoreAction,
+            (unsigned long long)target.depthTexture,
+            target.depthWidth, target.depthHeight, target.depthFormat,
+            target.depthLoadAction, target.depthStoreAction,
+            target.clearDepth);
+    }
+
+    if (target.commandBuffer &&
+        access("/tmp/macws_stray_rt_capture_now", F_OK) == 0) {
+        uint32_t pass = atomic_fetch_add_explicit(
+            &g_macws_stray_stage_pass_sequence, 1,
+            memory_order_relaxed);
+        if (pass < 64) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-STAGE-PASS pass=%u class=%s command=%#llx "
+                "encoder=%#llx color=%#llx/%ux%u/pf%u draws=%u "
+                "pipelines=%u\n",
+                pass, class_getName([self class]),
+                (unsigned long long)target.commandBuffer,
+                (unsigned long long)target.encoder,
+                (unsigned long long)target.colorTexture,
+                target.colorWidth, target.colorHeight, target.colorFormat,
+                target.drawCount, target.pipelineCount);
+        }
+    }
+
+    if (g_macws_stray_end_encoding_orig)
+        g_macws_stray_end_encoding_orig(self, selector);
+
+    if (access("/tmp/macws_stray_rt_capture_now", F_OK) == 0)
+        macws_stray_capture_shadow_stage(target);
+
+    if (access("/tmp/macws_stray_rt_capture_now", F_OK) != 0 ||
+        !target.commandBuffer || !target.colorTexture ||
+        !target.drawCount || !target.pipelineCount ||
+        target.colorFormat != MTLPixelFormatRG11B10Float ||
+        target.colorWidth != 492 || target.colorHeight != 316)
+        return;
+    id commandBuffer = (__bridge id)(void *)target.commandBuffer;
+    id texture = (__bridge id)(void *)target.colorTexture;
+    NSUInteger commandStatus = MTLCommandBufferStatusError;
+    @try { commandStatus = [commandBuffer status]; }
+    @catch (NSException *exception) { (void)exception; }
+    if (commandStatus >= MTLCommandBufferStatusCommitted) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-STAGE-CAPTURE skip command=%#llx "
+            "status=%lu reason=not-encodable\n",
+            (unsigned long long)target.commandBuffer,
+            (unsigned long)commandStatus);
+        return;
+    }
+    uint32_t stage = atomic_fetch_add_explicit(
+        &g_macws_stray_stage_capture_sequence, 1, memory_order_acq_rel);
+    if (stage >= MACWS_STRAY_STAGE_CAPTURE_CAP) return;
+    macws_stray_capture_nan_pipeline_inputs(target, commandBuffer, stage);
+    const NSUInteger bytesPerRow =
+        (target.colorWidth * sizeof(uint32_t) + 255u) & ~255u;
+    const NSUInteger length = bytesPerRow * target.colorHeight;
+    id buffer = nil;
+    id blit = nil;
+    @try {
+        id device = [texture device];
+        buffer = [device newBufferWithLength:length
+                                      options:MTLResourceStorageModeShared];
+        if (buffer) blit = [commandBuffer blitCommandEncoder];
+        if (buffer && blit) {
+            [blit copyFromTexture:texture
+                      sourceSlice:0
+                      sourceLevel:0
+                     sourceOrigin:MTLOriginMake(0, 0, 0)
+                       sourceSize:MTLSizeMake(
+                           target.colorWidth, target.colorHeight, 1)
+                         toBuffer:buffer
+                destinationOffset:0
+           destinationBytesPerRow:bytesPerRow
+         destinationBytesPerImage:length];
+            [blit endEncoding];
+        }
+    } @catch (NSException *exception) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-STAGE-CAPTURE encode throw=%s reason=%s "
+            "stage=%u encoder=%p texture=%p\n",
+            exception.name.UTF8String ?: "(nil)",
+            exception.reason.UTF8String ?: "(nil)", stage,
+            (__bridge void *)self, (void *)target.colorTexture);
+        buffer = nil;
+        blit = nil;
+    }
+    if (!buffer || !blit ||
+        ![commandBuffer respondsToSelector:@selector(addCompletedHandler:)])
+        return;
+
+    char pipelineList[768] = {0};
+    size_t used = 0;
+    for (uint32_t i = 0; i < target.pipelineCount; i++) {
+        int written = snprintf(
+            pipelineList + used, sizeof(pipelineList) - used,
+            "%s%#llx", i ? "," : "",
+            (unsigned long long)target.pipelines[i]);
+        if (written <= 0 || (size_t)written >= sizeof(pipelineList) - used)
+            break;
+        used += (size_t)written;
+    }
+    dprintf(STDERR_FILENO,
+        "#### STRAY-STAGE-CAPTURE scheduled stage=%u command=%#llx "
+        "encoder=%#llx texture=%#llx draws=%u pipelines=%u/%s\n",
+        stage, (unsigned long long)target.commandBuffer,
+        (unsigned long long)target.encoder,
+        (unsigned long long)target.colorTexture, target.drawCount,
+        target.pipelineCount, pipelineList[0] ? pipelineList : "(none)");
+    NSString *pipelineMetadata = [NSString stringWithUTF8String:pipelineList];
+    [commandBuffer addCompletedHandler:^(__unused id completed) {
+        char path[PATH_MAX] = {0};
+        snprintf(path, sizeof(path),
+                 "/tmp/macws_stray_stage_%03u.raw", stage);
+        FILE *file = fopen(path, "wb");
+        if (!file) return;
+        fprintf(file,
+            "MACWSRT w=%u h=%u pf=%u attachment=0 bpr=%u length=%u "
+            "texture=%#llx stage=%u command=%#llx encoder=%#llx "
+            "draws=%u pipelines=%s\n",
+            target.colorWidth, target.colorHeight, target.colorFormat,
+            (unsigned int)bytesPerRow, (unsigned int)length,
+            (unsigned long long)target.colorTexture, stage,
+            (unsigned long long)target.commandBuffer,
+            (unsigned long long)target.encoder, target.drawCount,
+            pipelineMetadata.UTF8String ?: "(none)");
+        fwrite([buffer contents], 1, length, file);
+        fclose(file);
+        dprintf(STDERR_FILENO,
+            "#### STRAY-STAGE-CAPTURE wrote=%s\n", path);
+    }];
+}
+
+static void macws_install_stray_concrete_end_encoding(id encoder) {
+    if (!encoder) return;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class concrete = [encoder class];
+        SEL selector = sel_registerName("endEncoding");
+        Method method = class_getInstanceMethod(concrete, selector);
+        if (!method) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-STAGE-CAPTURE concrete missing selector=%s "
+                "class=%s\n", sel_getName(selector),
+                class_getName(concrete));
+            return;
+        }
+        IMP current = method_getImplementation(method);
+        BOOL inheritedTrace = macws_imp_equal_ignoring_pac(
+            current, (IMP)macws_stray_end_encoding_trace);
+        BOOL added = NO;
+        if (!inheritedTrace) {
+            g_macws_stray_end_encoding_orig =
+                (macws_stray_end_encoding_fn)current;
+            const char *types = method_getTypeEncoding(method);
+            added = class_addMethod(
+                concrete, selector,
+                (IMP)macws_stray_end_encoding_trace, types);
+            if (!added) {
+                Method own = class_getInstanceMethod(concrete, selector);
+                method_setImplementation(
+                    own, (IMP)macws_stray_end_encoding_trace);
+            }
+        }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-STAGE-CAPTURE concrete selector=%s class=%s "
+            "current=%p inheritedTrace=%s subclassOverride=%s\n",
+            sel_getName(selector), class_getName(concrete),
+            (void *)current, inheritedTrace ? "YES" : "NO",
+            added ? "YES" : "NO");
+    });
+}
+
+// AGXG13GFamilyCommandBuffer implements its own presentation methods instead
+// of inheriting _MTLCommandBuffer's implementations.  Hooking only the base
+// class therefore produced no cadence samples in the low-overhead production
+// profile even though the game was submitting work.  Install just these three
+// wrappers whenever present telemetry is requested.  The full render trace
+// below recognizes the same IMPs and will not wrap them twice.
+static void macws_install_stray_agx_present_trace(void) {
+    if (!macws_is_stray_process()) return;
+    // UE can present either by asking the command buffer to schedule a
+    // drawable or by calling the concrete CAMetalDrawable directly.  The
+    // low-overhead cadence witness must cover both public presentation paths;
+    // the drawable hook is installed lazily after the first nextDrawable so
+    // it records the concrete private class actually returned on this OS.
+    macws_install_stray_drawable_present_trace();
+    Class commandBuffer = objc_getClass("AGXG13GFamilyCommandBuffer");
+    if (!commandBuffer) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-PRESENT missing AGXG13GFamilyCommandBuffer\n");
+        return;
+    }
+    if (macws_stray_drawable_timing_enabled()) {
+        SEL commitSelector = sel_registerName("commit");
+        Method commitMethod = class_getInstanceMethod(
+            commandBuffer, commitSelector);
+        if (commitMethod) {
+            IMP current = method_getImplementation(commitMethod);
+            if (!macws_imp_equal_ignoring_pac(
+                    current, (IMP)macws_stray_command_commit_timing)) {
+                g_macws_stray_commit_timing_orig =
+                    (macws_stray_commit_timing_fn)current;
+                const char *types = method_getTypeEncoding(commitMethod);
+                BOOL added = class_addMethod(
+                    commandBuffer, commitSelector,
+                    (IMP)macws_stray_command_commit_timing, types);
+                if (!added) {
+                    Method own = class_getInstanceMethod(
+                        commandBuffer, commitSelector);
+                    method_setImplementation(
+                        own, (IMP)macws_stray_command_commit_timing);
+                }
+                dprintf(STDERR_FILENO,
+                    "#### STRAY-COMMIT-TIMING installed selector=%s "
+                    "class=%s original=%p subclassOverride=%s\n",
+                    sel_getName(commitSelector), class_getName(commandBuffer),
+                    (void *)current, added ? "YES" : "NO");
+            }
+        } else {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-COMMIT-TIMING missing selector=%s class=%s\n",
+                sel_getName(commitSelector), class_getName(commandBuffer));
+        }
+    }
+    struct {
+        const char *name;
+        IMP replacement;
+        IMP *original;
+    } entries[] = {
+        { "presentDrawable:",
+          (IMP)macws_agx_present_drawable_trace,
+          (IMP *)&macws_agx_present_drawable_orig },
+        { "presentDrawable:atTime:",
+          (IMP)macws_agx_present_drawable_at_time_trace,
+          (IMP *)&macws_agx_present_drawable_at_time_orig },
+        { "presentDrawable:afterMinimumDuration:",
+          (IMP)macws_agx_present_drawable_after_duration_trace,
+          (IMP *)&macws_agx_present_drawable_after_duration_orig },
+    };
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+        SEL selector = sel_registerName(entries[i].name);
+        Method method = class_getInstanceMethod(commandBuffer, selector);
+        if (!method) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-PRESENT missing selector=%s class=%s\n",
+                entries[i].name, class_getName(commandBuffer));
+            continue;
+        }
+        IMP current = method_getImplementation(method);
+        if (macws_imp_equal_ignoring_pac(
+                current, entries[i].replacement)) continue;
+        *entries[i].original = current;
+        const char *types = method_getTypeEncoding(method);
+        BOOL added = class_addMethod(
+            commandBuffer, selector, entries[i].replacement, types);
+        if (!added) {
+            Method own = class_getInstanceMethod(commandBuffer, selector);
+            method_setImplementation(own, entries[i].replacement);
+        }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-PRESENT installed selector=%s class=%s "
+            "original=%p subclassOverride=%s types=%s\n",
+            entries[i].name, class_getName(commandBuffer),
+            (void *)current, added ? "YES" : "NO", types ?: "(nil)");
+    }
+}
+
+static void macws_install_stray_compute_execution_trace(
+        Class commandBuffer) {
+    if (!commandBuffer) return;
+    // Half-float pipeline variants are created only for Stray (see the
+    // macws_is_stray_process() gate in macws_new_library_with_data_diag).
+    // Do not let the mere presence of Stray's on-disk variant index install
+    // these concrete AGX encoder wrappers into every unrelated Metal process.
+    // Besides having no compatible pipeline mapping there, that global hook
+    // made the bounded MetalFX temporal control enter Stray-specific encoder
+    // bookkeeping before its first dispatch.  The explicit MetalFX trace
+    // below remains available to that exact probe executable.
+    BOOL strayHalfFloatCompatibility = macws_is_stray_process() &&
+        macws_half_float_variants_available();
+    if (!macws_stray_full_render_trace_enabled() &&
+        !strayHalfFloatCompatibility &&
+        !macws_metalfx_encoder_diag_enabled()) return;
+    static _Atomic bool installed = false;
+    if (atomic_exchange_explicit(
+            &installed, true, memory_order_acq_rel)) return;
+    struct {
+        const char *name;
+        IMP replacement;
+        IMP *original;
+    } creators[] = {
+        { "computeCommandEncoder",
+          (IMP)macws_stray_compute_encoder_trace,
+          (IMP *)&g_macws_stray_compute_encoder_orig },
+        { "computeCommandEncoderWithDispatchType:",
+          (IMP)macws_stray_compute_encoder_dispatch_trace,
+          (IMP *)&g_macws_stray_compute_encoder_dispatch_orig },
+    };
+    for (size_t i = 0; i < sizeof(creators) / sizeof(creators[0]); i++) {
+        SEL selector = sel_registerName(creators[i].name);
+        Method method = class_getInstanceMethod(commandBuffer, selector);
+        if (!method) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-COMPUTE missing selector=%s class=%s\n",
+                creators[i].name, class_getName(commandBuffer));
+            continue;
+        }
+        IMP original = method_getImplementation(method);
+        *creators[i].original = original;
+        const char *types = method_getTypeEncoding(method);
+        BOOL added = class_addMethod(
+            commandBuffer, selector, creators[i].replacement, types);
+        if (!added) {
+            Method own = class_getInstanceMethod(commandBuffer, selector);
+            method_setImplementation(own, creators[i].replacement);
+        }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-COMPUTE installed selector=%s class=%s "
+            "original=%p subclassOverride=%s\n",
+            creators[i].name, class_getName(commandBuffer),
+            (void *)original, added ? "YES" : "NO");
+    }
+
+    Class computeContext = objc_getClass("AGXG13GFamilyComputeContext");
+    if (!computeContext) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-COMPUTE missing class=AGXG13GFamilyComputeContext\n");
+        return;
+    }
+    struct {
+        const char *name;
+        IMP replacement;
+        IMP *original;
+    } methods[] = {
+        { "setComputePipelineState:",
+          (IMP)macws_stray_compute_set_pipeline_trace,
+          (IMP *)&g_macws_stray_compute_set_pipeline_orig },
+        { "setTexture:atIndex:",
+          (IMP)macws_stray_compute_set_texture_trace,
+          (IMP *)&g_macws_stray_compute_set_texture_orig },
+        { "setTextures:withRange:",
+          (IMP)macws_stray_compute_set_textures_trace,
+          (IMP *)&g_macws_stray_compute_set_textures_orig },
+        { "dispatchThreadgroups:threadsPerThreadgroup:",
+          (IMP)macws_stray_compute_dispatch_groups_trace,
+          (IMP *)&g_macws_stray_compute_dispatch_groups_orig },
+        { "dispatchThreads:threadsPerThreadgroup:",
+          (IMP)macws_stray_compute_dispatch_threads_trace,
+          (IMP *)&g_macws_stray_compute_dispatch_threads_orig },
+        { "endEncoding", (IMP)macws_stray_compute_end_trace,
+          (IMP *)&g_macws_stray_compute_end_orig },
+    };
+    for (size_t i = 0; i < sizeof(methods) / sizeof(methods[0]); i++) {
+        SEL selector = sel_registerName(methods[i].name);
+        Method method = class_getInstanceMethod(computeContext, selector);
+        if (!method) {
+            dprintf(STDERR_FILENO,
+                "#### STRAY-COMPUTE missing selector=%s class=%s\n",
+                methods[i].name, class_getName(computeContext));
+            continue;
+        }
+        IMP original = method_getImplementation(method);
+        *methods[i].original = original;
+        const char *types = method_getTypeEncoding(method);
+        BOOL added = class_addMethod(
+            computeContext, selector, methods[i].replacement, types);
+        if (!added) {
+            Method own = class_getInstanceMethod(computeContext, selector);
+            method_setImplementation(own, methods[i].replacement);
+        }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-COMPUTE installed selector=%s class=%s "
+            "original=%p subclassOverride=%s\n",
+            methods[i].name, class_getName(computeContext),
+            (void *)original, added ? "YES" : "NO");
+    }
+}
+
+static id macws_stray_queue_command_buffer_with_descriptor_trace(
+        id self, SEL selector, MTLCommandBufferDescriptor *descriptor) {
+    if (descriptor) {
+        @try {
+            descriptor.errorOptions |=
+                MTLCommandBufferErrorOptionEncoderExecutionStatus;
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+    }
+    return g_macws_stray_queue_command_buffer_descriptor_orig
+        ? g_macws_stray_queue_command_buffer_descriptor_orig(
+            self, selector, descriptor) : nil;
+}
+
+static id macws_stray_queue_command_buffer_diagnostic(
+        id self, SEL selector) {
+    MTLCommandBufferDescriptor *descriptor =
+        [[MTLCommandBufferDescriptor alloc] init];
+    descriptor.retainedReferences = YES;
+    descriptor.errorOptions =
+        MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    id result = g_macws_stray_queue_command_buffer_descriptor_orig
+        ? g_macws_stray_queue_command_buffer_descriptor_orig(
+            self, sel_registerName("commandBufferWithDescriptor:"),
+            descriptor) : nil;
+    macws_vnc_release(descriptor);
+    if (!result && g_macws_stray_queue_command_buffer_orig)
+        result = g_macws_stray_queue_command_buffer_orig(self, selector);
+    return result;
+}
+
+static id macws_stray_queue_command_buffer_unretained_diagnostic(
+        id self, SEL selector) {
+    MTLCommandBufferDescriptor *descriptor =
+        [[MTLCommandBufferDescriptor alloc] init];
+    descriptor.retainedReferences = NO;
+    descriptor.errorOptions =
+        MTLCommandBufferErrorOptionEncoderExecutionStatus;
+    id result = g_macws_stray_queue_command_buffer_descriptor_orig
+        ? g_macws_stray_queue_command_buffer_descriptor_orig(
+            self, sel_registerName("commandBufferWithDescriptor:"),
+            descriptor) : nil;
+    macws_vnc_release(descriptor);
+    if (!result && g_macws_stray_queue_command_buffer_unretained_orig)
+        result = g_macws_stray_queue_command_buffer_unretained_orig(
+            self, selector);
+    return result;
+}
+
+static void macws_install_stray_encoder_status_diagnostic(void) {
+    if (!macws_stray_full_render_trace_enabled()) return;
+    Class queue = objc_getClass("AGXG13GFamilyCommandQueue");
+    if (!queue) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-ENCODER-STATUS missing "
+            "class=AGXG13GFamilyCommandQueue\n");
+        return;
+    }
+
+    SEL descriptorSelector = sel_registerName(
+        "commandBufferWithDescriptor:");
+    Method descriptorMethod = class_getInstanceMethod(
+        queue, descriptorSelector);
+    if (!descriptorMethod) {
+        dprintf(STDERR_FILENO,
+            "#### STRAY-ENCODER-STATUS missing selector=%s class=%s\n",
+            sel_getName(descriptorSelector), class_getName(queue));
+        return;
+    }
+    g_macws_stray_queue_command_buffer_descriptor_orig =
+        (macws_stray_queue_command_buffer_descriptor_fn)
+        method_getImplementation(descriptorMethod);
+    const char *descriptorTypes = method_getTypeEncoding(descriptorMethod);
+    BOOL descriptorAdded = class_addMethod(
+        queue, descriptorSelector,
+        (IMP)macws_stray_queue_command_buffer_with_descriptor_trace,
+        descriptorTypes);
+    if (!descriptorAdded) {
+        Method own = class_getInstanceMethod(queue, descriptorSelector);
+        method_setImplementation(
+            own,
+            (IMP)macws_stray_queue_command_buffer_with_descriptor_trace);
+    }
+
+    struct {
+        const char *name;
+        IMP replacement;
+        macws_stray_queue_command_buffer_fn *original;
+    } creators[] = {
+        { "commandBuffer",
+          (IMP)macws_stray_queue_command_buffer_diagnostic,
+          &g_macws_stray_queue_command_buffer_orig },
+        { "commandBufferWithUnretainedReferences",
+          (IMP)macws_stray_queue_command_buffer_unretained_diagnostic,
+          &g_macws_stray_queue_command_buffer_unretained_orig },
+    };
+    for (size_t i = 0; i < sizeof(creators) / sizeof(creators[0]); i++) {
+        SEL selector = sel_registerName(creators[i].name);
+        Method method = class_getInstanceMethod(queue, selector);
+        if (!method) continue;
+        *creators[i].original = (macws_stray_queue_command_buffer_fn)
+            method_getImplementation(method);
+        const char *types = method_getTypeEncoding(method);
+        BOOL added = class_addMethod(
+            queue, selector, creators[i].replacement, types);
+        if (!added) {
+            Method own = class_getInstanceMethod(queue, selector);
+            method_setImplementation(own, creators[i].replacement);
+        }
+        dprintf(STDERR_FILENO,
+            "#### STRAY-ENCODER-STATUS installed selector=%s class=%s "
+            "original=%p subclassOverride=%s\n",
+            creators[i].name, class_getName(queue),
+            (void *)*creators[i].original, added ? "YES" : "NO");
+    }
+    dprintf(STDERR_FILENO,
+        "#### STRAY-ENCODER-STATUS installed selector=%s class=%s "
+        "original=%p subclassOverride=%s\n",
+        sel_getName(descriptorSelector), class_getName(queue),
+        (void *)g_macws_stray_queue_command_buffer_descriptor_orig,
+        descriptorAdded ? "YES" : "NO");
+}
+
 static void macws_install_stray_render_execution_trace(void) {
-    if (access("/tmp/macws_stray_render_trace", F_OK) != 0) return;
+    if (!macws_stray_full_render_trace_enabled()) return;
+    macws_install_stray_encoder_status_diagnostic();
     Class renderContext = objc_getClass("AGXG13GFamilyRenderContext");
     if (!renderContext) {
         dprintf(STDERR_FILENO,
@@ -14273,6 +18675,21 @@ static void macws_install_stray_render_execution_trace(void) {
         { "setVertexBuffers:offsets:withRange:",
           (IMP)macws_stray_set_vertex_buffers_trace,
           (IMP *)&g_macws_stray_set_vertex_buffers_orig },
+        { "setFragmentBuffer:offset:atIndex:",
+          (IMP)macws_stray_set_fragment_buffer_trace,
+          (IMP *)&g_macws_stray_set_fragment_buffer_orig },
+        { "setFragmentBuffers:offsets:withRange:",
+          (IMP)macws_stray_set_fragment_buffers_trace,
+          (IMP *)&g_macws_stray_set_fragment_buffers_orig },
+        { "setFragmentTexture:atIndex:",
+          (IMP)macws_stray_set_fragment_texture_trace,
+          (IMP *)&g_macws_stray_set_fragment_texture_orig },
+        { "setFragmentTextures:withRange:",
+          (IMP)macws_stray_set_fragment_textures_trace,
+          (IMP *)&g_macws_stray_set_fragment_textures_orig },
+        { "setFragmentBytes:length:atIndex:",
+          (IMP)macws_stray_set_fragment_bytes_trace,
+          (IMP *)&g_macws_stray_set_fragment_bytes_orig },
         { "drawPrimitives:vertexStart:vertexCount:",
           (IMP)macws_stray_draw_primitives_trace,
           (IMP *)&g_macws_stray_draw_primitives_orig },
@@ -14291,6 +18708,9 @@ static void macws_install_stray_render_execution_trace(void) {
           "indexBufferOffset:instanceCount:baseVertex:baseInstance:",
           (IMP)macws_stray_draw_indexed_base_trace,
           (IMP *)&g_macws_stray_draw_indexed_base_orig },
+        { "endEncoding",
+          (IMP)macws_stray_end_encoding_trace,
+          (IMP *)&g_macws_stray_end_encoding_orig },
     };
     for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
         SEL selector = sel_registerName(entries[i].name);
@@ -14347,6 +18767,8 @@ static void macws_install_stray_render_execution_trace(void) {
             sel_getName(renderSelector),
             commandBuffer ? class_getName(commandBuffer) : "(nil)");
     }
+
+    macws_install_stray_compute_execution_trace(commandBuffer);
 
     SEL commitSelector = sel_registerName("commit");
     Method commitMethod = commandBuffer
@@ -14444,34 +18866,15 @@ static void macws_install_stray_render_execution_trace(void) {
         }
     }
 
-    Class metalLayer = objc_getClass("CAMetalLayer");
-    SEL nextDrawableSelector = sel_registerName("nextDrawable");
-    Method nextDrawableMethod = metalLayer
-        ? class_getInstanceMethod(metalLayer, nextDrawableSelector) : NULL;
-    if (nextDrawableMethod) {
-        IMP original = method_getImplementation(nextDrawableMethod);
-        if (!macws_imp_equal_ignoring_pac(
-                original, (IMP)macws_stray_next_drawable_trace)) {
-            g_macws_stray_next_drawable_orig =
-                (macws_next_drawable_fn)original;
-            method_setImplementation(
-                nextDrawableMethod, (IMP)macws_stray_next_drawable_trace);
-            dprintf(STDERR_FILENO,
-                "#### STRAY-DRAWABLE installed selector=%s class=%s "
-                "original=%p types=%s\n",
-                sel_getName(nextDrawableSelector), class_getName(metalLayer),
-                (void *)original,
-                method_getTypeEncoding(nextDrawableMethod) ?: "(nil)");
-        }
-    } else {
-        dprintf(STDERR_FILENO,
-            "#### STRAY-DRAWABLE missing selector=%s class=%s\n",
-            sel_getName(nextDrawableSelector),
-            metalLayer ? class_getName(metalLayer) : "(nil)");
-    }
 }
 
 static void macws_install_source_library_diagnostic(Class agx) {
+    // Runtime-confirmed 2026-08-21 in steam-runtime.log: production Stray
+    // sessions installed this wrapper twelve times with no diagnostic marker
+    // and emitted zero MTL-LIB-SOURCE input records.  The wrapper is not a
+    // compatibility adapter: it forwards every argument/result unchanged,
+    // but otherwise performs UTF-8 conversion, strlen and a full-source hash
+    // on every compile. Keep that startup CPU/thermal work opt-in.
     if (access("/private/tmp/macws_mtl_library_diag", F_OK) != 0) return;
     SEL selector = sel_registerName("newLibraryWithSource:options:error:");
     Method method = class_getInstanceMethod(agx, selector);
@@ -14574,8 +18977,6 @@ static void macws_install_data_library_compatibility(Class agx) {
 typedef id (*macws_library_specialize_fn)(
     id, SEL, NSString *, MTLFunctionConstantValues *, NSError **)
     __attribute__((ns_returns_retained));
-typedef id (*macws_library_function_fn)(id, SEL, NSString *)
-    __attribute__((ns_returns_retained));
 typedef id (*macws_library_specialize_cache_fn)(
     id, SEL, NSString *, MTLFunctionConstantValues *, id, NSError **)
     __attribute__((ns_returns_retained));
@@ -14583,7 +18984,6 @@ typedef id (*macws_library_specialize_named_fn)(
     id, SEL, NSString *, MTLFunctionConstantValues *, id, NSString *,
     NSError **) __attribute__((ns_returns_retained));
 static macws_library_specialize_fn g_macws_qc_specialize_basic_orig = NULL;
-static macws_library_function_fn g_macws_skylight_function_orig = NULL;
 static macws_library_specialize_cache_fn
     g_macws_qc_specialize_cache_orig = NULL;
 static macws_library_specialize_cache_fn
@@ -14613,7 +19013,93 @@ static const void *kMacWSMetal2MetalFunctionRouteKey =
     &kMacWSMetal2MetalFunctionRouteKey;
 static const void *kMacWSMetal2MetalCompanionKey =
     &kMacWSMetal2MetalCompanionKey;
+static const void *kMacWSMetal2MetalRouteCheckedKey =
+    &kMacWSMetal2MetalRouteCheckedKey;
 static NSArray<NSMutableDictionary *> *g_macws_metal2metal_routes = nil;
+
+// Maps-2026-08-29-152646.ips runtime-confirmed that the generic route loader
+// crossed the iOS-host/macOS-cache boundary with the on-device-linked
+// @"/usr/local/share/macws/metal2metal/routes" literal.  NSFileManager's path
+// normalization then sent -stringByStandardizingPath through that object's
+// unauthenticated __CFConstantStringClassReference and PAC-faulted in
+// objc_msgSend.  Every manifest key/value below has the same image-level ABI,
+// so fixing only the first path would merely move the fault to the next
+// objectForKeyedSubscript:.  Construct the complete immutable vocabulary with
+// the live CoreFoundation runtime once and use it throughout the router.
+typedef struct {
+    NSString *routeDirectory;
+    NSString *routeSuffix;
+    NSString *size;
+    NSString *fnv1a64;
+    NSString *source;
+    NSString *output;
+    NSString *translation;
+    NSString *translatedFunctions;
+    NSString *functionNames;
+    NSString *runtimePath;
+    NSString *schemaVersion;
+    NSString *translator;
+    NSString *translatorName;
+    NSString *translatorVersion;
+    NSString *selectionPolicy;
+    NSString *selectionPolicyAll;
+    NSString *complete;
+    NSString *sourceFunctionCount;
+    NSString *translatedFunctionCount;
+    NSString *manifestPathInternal;
+    NSString *sourceNamesInternal;
+    NSString *translatedNamesInternal;
+    NSString *companionInternal;
+    NSString *needsFunctionConstants;
+    NSString *checkedMarker;
+    NSString *companionMarker;
+} MacWSMetal2MetalRuntimeObjects;
+
+static NSString *macws_metal2metal_runtime_string(const char *text) {
+    return (NSString *)CFStringCreateWithCString(
+        kCFAllocatorDefault, text, kCFStringEncodingUTF8);
+}
+
+static const MacWSMetal2MetalRuntimeObjects *
+macws_metal2metal_runtime_objects(void) {
+    static dispatch_once_t once;
+    static MacWSMetal2MetalRuntimeObjects objects;
+    dispatch_once(&once, ^{
+#define MACWS_M2M_STRING(field, value) \
+        objects.field = macws_metal2metal_runtime_string(value)
+        MACWS_M2M_STRING(routeDirectory,
+            "/usr/local/share/macws/metal2metal/routes");
+        MACWS_M2M_STRING(routeSuffix, ".route.plist");
+        MACWS_M2M_STRING(size, "size");
+        MACWS_M2M_STRING(fnv1a64, "fnv1a64");
+        MACWS_M2M_STRING(source, "source");
+        MACWS_M2M_STRING(output, "output");
+        MACWS_M2M_STRING(translation, "translation");
+        MACWS_M2M_STRING(translatedFunctions, "translated_functions");
+        MACWS_M2M_STRING(functionNames, "function_names");
+        MACWS_M2M_STRING(runtimePath, "runtime_path");
+        MACWS_M2M_STRING(schemaVersion, "schema_version");
+        MACWS_M2M_STRING(translator, "translator");
+        MACWS_M2M_STRING(translatorName, "macws-metal2metal");
+        MACWS_M2M_STRING(translatorVersion, "translator_version");
+        MACWS_M2M_STRING(selectionPolicy, "selection_policy");
+        MACWS_M2M_STRING(selectionPolicyAll, "all-functions");
+        MACWS_M2M_STRING(complete, "complete");
+        MACWS_M2M_STRING(sourceFunctionCount, "source_function_count");
+        MACWS_M2M_STRING(translatedFunctionCount,
+            "translated_function_count");
+        MACWS_M2M_STRING(manifestPathInternal, "_manifest_path");
+        MACWS_M2M_STRING(sourceNamesInternal, "_source_names");
+        MACWS_M2M_STRING(translatedNamesInternal, "_translated_names");
+        MACWS_M2M_STRING(companionInternal, "_companion");
+        MACWS_M2M_STRING(needsFunctionConstants,
+            "needs_function_constants");
+        MACWS_M2M_STRING(checkedMarker, "macws-metal2metal-checked");
+        MACWS_M2M_STRING(companionMarker, "macws-metal2metal-companion");
+#undef MACWS_M2M_STRING
+    });
+    return &objects;
+}
 
 typedef id (*macws_new_library_url_fn)(id, SEL, NSURL *, NSError **)
     __attribute__((ns_returns_retained));
@@ -14637,12 +19123,14 @@ static BOOL macws_metal2metal_identity_matches(
         NSDictionary *identity, NSString *path) {
     if (![identity isKindOfClass:[NSDictionary class]] || !path.length)
         return NO;
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
     NSData *data = [NSData dataWithContentsOfFile:path
                          options:NSDataReadingMappedIfSafe error:nil];
-    NSNumber *expected_size = identity[@"size"];
+    NSNumber *expected_size = identity[keys->size];
     BOOL hash_valid = NO;
     uint64_t expected_hash = macws_metal2metal_hex64(
-        identity[@"fnv1a64"], &hash_valid);
+        identity[keys->fnv1a64], &hash_valid);
     return data && [expected_size isKindOfClass:[NSNumber class]] &&
         data.length == expected_size.unsignedLongLongValue && hash_valid &&
         macws_source_fnv1a64(data.bytes, data.length) == expected_hash;
@@ -14651,30 +19139,32 @@ static BOOL macws_metal2metal_identity_matches(
 static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *route_directory =
-            @"/usr/local/share/macws/metal2metal/routes";
+        const MacWSMetal2MetalRuntimeObjects *keys =
+            macws_metal2metal_runtime_objects();
+        NSString *route_directory = keys->routeDirectory;
         NSArray<NSString *> *entries = [[[NSFileManager defaultManager]
             contentsOfDirectoryAtPath:route_directory error:nil]
             sortedArrayUsingSelector:@selector(compare:)];
         NSMutableArray *loaded = [[NSMutableArray alloc] init];
         for (NSString *entry in entries) {
-            if (![entry hasSuffix:@".route.plist"]) continue;
+            if (![entry hasSuffix:keys->routeSuffix]) continue;
             NSString *manifest_path =
                 [route_directory stringByAppendingPathComponent:entry];
             NSDictionary *manifest = [NSDictionary
                 dictionaryWithContentsOfFile:manifest_path];
-            NSDictionary *source = manifest[@"source"];
-            NSDictionary *output = manifest[@"output"];
-            NSDictionary *translation = manifest[@"translation"];
-            NSDictionary *translated = manifest[@"translated_functions"];
-            NSArray *function_names = source[@"function_names"];
-            NSString *source_path = source[@"runtime_path"];
-            NSString *output_path = output[@"runtime_path"];
+            NSDictionary *source = manifest[keys->source];
+            NSDictionary *output = manifest[keys->output];
+            NSDictionary *translation = manifest[keys->translation];
+            NSDictionary *translated = manifest[keys->translatedFunctions];
+            NSArray *function_names = source[keys->functionNames];
+            NSString *source_path = source[keys->runtimePath];
+            NSString *output_path = output[keys->runtimePath];
             BOOL valid =
-                [manifest[@"schema_version"] unsignedIntegerValue] == 1 &&
-                [manifest[@"translator"] isEqualToString:
-                    @"macws-metal2metal"] &&
-                [manifest[@"translator_version"] unsignedIntegerValue] == 1 &&
+                [manifest[keys->schemaVersion] unsignedIntegerValue] == 1 &&
+                [manifest[keys->translator] isEqualToString:
+                    keys->translatorName] &&
+                [manifest[keys->translatorVersion]
+                    unsignedIntegerValue] == 1 &&
                 [source isKindOfClass:[NSDictionary class]] &&
                 [output isKindOfClass:[NSDictionary class]] &&
                 [translation isKindOfClass:[NSDictionary class]] &&
@@ -14684,9 +19174,9 @@ static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
                 function_names.count > 0 &&
                 [source_path isKindOfClass:[NSString class]] &&
                 [output_path isKindOfClass:[NSString class]] &&
-                [translation[@"selection_policy"] isEqualToString:
-                    @"all-functions"] &&
-                [translation[@"complete"] boolValue] &&
+                [translation[keys->selectionPolicy] isEqualToString:
+                    keys->selectionPolicyAll] &&
+                [translation[keys->complete] boolValue] &&
                 macws_metal2metal_identity_matches(source, source_path) &&
                 macws_metal2metal_identity_matches(output, output_path);
             NSSet *source_set = valid
@@ -14696,9 +19186,9 @@ static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
             valid = valid && source_set.count == function_names.count &&
                 translated_set.count == source_set.count &&
                 [translated_set isEqualToSet:source_set] &&
-                [translation[@"source_function_count"]
+                [translation[keys->sourceFunctionCount]
                     unsignedIntegerValue] == source_set.count &&
-                [translation[@"translated_function_count"]
+                [translation[keys->translatedFunctionCount]
                     unsignedIntegerValue] == translated_set.count;
             if (!valid) {
                 if (macws_runtime_diagnostics_enabled()) {
@@ -14709,9 +19199,9 @@ static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
                 continue;
             }
             NSMutableDictionary *route = [manifest mutableCopy];
-            route[@"_manifest_path"] = manifest_path;
-            route[@"_source_names"] = source_set;
-            route[@"_translated_names"] = translated_set;
+            route[keys->manifestPathInternal] = manifest_path;
+            route[keys->sourceNamesInternal] = source_set;
+            route[keys->translatedNamesInternal] = translated_set;
             [loaded addObject:route];
             [route release];
             if (macws_runtime_diagnostics_enabled()) {
@@ -14729,11 +19219,13 @@ static NSArray<NSMutableDictionary *> *macws_metal2metal_routes(void) {
 }
 
 static NSMutableDictionary *macws_metal2metal_route_for_url(NSURL *url) {
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
     NSString *path = url.path.stringByStandardizingPath;
     if (!path.length) return nil;
     NSMutableDictionary *match = nil;
     for (NSMutableDictionary *route in macws_metal2metal_routes()) {
-        NSString *source_path = route[@"source"][@"runtime_path"];
+        NSString *source_path = route[keys->source][keys->runtimePath];
         if (![path isEqualToString:source_path.stringByStandardizingPath])
             continue;
         if (match) {
@@ -14755,6 +19247,15 @@ static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
     NSMutableDictionary *associated = objc_getAssociatedObject(
         library, kMacWSMetal2MetalLibraryRouteKey);
     if (associated) return associated;
+    // Most application libraries are not one of the three framework inputs
+    // in the validated route directory.  Their function-name set is
+    // immutable after MTLLibrary creation, so a complete negative match is
+    // authoritative for that object.  Without this marker every hooked
+    // newFunctionWithName: call rebuilt the full NSSet and re-walked all
+    // manifests, turning the generic router into repeated application-side
+    // work even though no translation applied.
+    if (objc_getAssociatedObject(
+            library, kMacWSMetal2MetalRouteCheckedKey)) return nil;
 
     NSArray *names = nil;
     @try { names = [(id<MTLLibrary>)library functionNames]; }
@@ -14762,9 +19263,11 @@ static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
     if (!names.count) return nil;
     NSSet *observed = [NSSet setWithArray:names];
     if (observed.count != names.count) return nil;
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
     NSMutableDictionary *match = nil;
     for (NSMutableDictionary *route in macws_metal2metal_routes()) {
-        NSSet *expected = route[@"_source_names"];
+        NSSet *expected = route[keys->sourceNamesInternal];
         if (![observed isEqualToSet:expected]) continue;
         if (match) {
             if (macws_runtime_diagnostics_enabled()) {
@@ -14781,6 +19284,10 @@ static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
         objc_setAssociatedObject(
             library, kMacWSMetal2MetalLibraryRouteKey, match,
             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        objc_setAssociatedObject(
+            library, kMacWSMetal2MetalRouteCheckedKey, keys->checkedMarker,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     return match;
 }
@@ -14788,17 +19295,21 @@ static NSMutableDictionary *macws_metal2metal_route_for_library(id library) {
 static NSDictionary *macws_metal2metal_function_contract(
         NSMutableDictionary *route, NSString *name) {
     if (!route || !name.length) return nil;
-    NSDictionary *contract = route[@"translated_functions"][name];
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
+    NSDictionary *contract = route[keys->translatedFunctions][name];
     return [contract isKindOfClass:[NSDictionary class]] ? contract : nil;
 }
 
 static id<MTLLibrary> macws_metal2metal_companion(
         NSMutableDictionary *route, id<MTLDevice> device) {
     if (!route || !device) return nil;
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
     @synchronized (route) {
-        id<MTLLibrary> library = route[@"_companion"];
+        id<MTLLibrary> library = route[keys->companionInternal];
         if (library) return library;
-        NSString *path = route[@"output"][@"runtime_path"];
+        NSString *path = route[keys->output][keys->runtimePath];
         NSURL *url = [NSURL fileURLWithPath:path];
         NSError *error = nil;
         library = g_macws_new_library_url_orig
@@ -14807,9 +19318,10 @@ static id<MTLLibrary> macws_metal2metal_companion(
             : [device newLibraryWithURL:url error:&error];
         if (library) {
             objc_setAssociatedObject(
-                library, kMacWSMetal2MetalCompanionKey, @YES,
+                library, kMacWSMetal2MetalCompanionKey,
+                keys->companionMarker,
                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            route[@"_companion"] = library;
+            route[keys->companionInternal] = library;
         }
         if (macws_runtime_diagnostics_enabled()) {
             dprintf(STDERR_FILENO,
@@ -14842,20 +19354,26 @@ static id macws_new_library_url_metal2metal(
         ? g_macws_new_library_url_orig(self, selector, url, error) : nil;
     if (!library || !getenv("MACWS_AGX_NATIVE")) return library;
 
+    const MacWSMetal2MetalRuntimeObjects *keys =
+        macws_metal2metal_runtime_objects();
     NSString *path = url.path.stringByStandardizingPath;
     NSMutableDictionary *route = macws_metal2metal_route_for_url(url);
     if (route) {
         objc_setAssociatedObject(
             library, kMacWSMetal2MetalLibraryRouteKey, route,
             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(
+            library, kMacWSMetal2MetalRouteCheckedKey, keys->checkedMarker,
+            OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     } else {
         for (NSMutableDictionary *candidate in macws_metal2metal_routes()) {
             NSString *output_path =
-                candidate[@"output"][@"runtime_path"];
+                candidate[keys->output][keys->runtimePath];
             if (![path isEqualToString:
                     output_path.stringByStandardizingPath]) continue;
             objc_setAssociatedObject(
-                library, kMacWSMetal2MetalCompanionKey, @YES,
+                library, kMacWSMetal2MetalCompanionKey,
+                keys->companionMarker,
                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             break;
         }
@@ -14864,7 +19382,7 @@ static id macws_new_library_url_metal2metal(
         dprintf(STDERR_FILENO,
             "#### METAL2METAL attributed-library library=%p path=%s "
             "manifest=%s\n", (void *)library, path.UTF8String,
-            [route[@"_manifest_path"] UTF8String]);
+            [route[keys->manifestPathInternal] UTF8String]);
     }
     return library;
 }
@@ -14906,8 +19424,9 @@ static id macws_skylight_function_compat(
         macws_metal2metal_route_for_library(self);
     NSDictionary *contract =
         macws_metal2metal_function_contract(route, name);
-    BOOL needs_constants =
-        [contract[@"needs_function_constants"] boolValue];
+    BOOL needs_constants = [contract[
+        macws_metal2metal_runtime_objects()->needsFunctionConstants]
+        boolValue];
     id<MTLDevice> device = nil;
     @try { device = [(id<MTLLibrary>)self device]; }
     @catch (NSException *exception) { (void)exception; }
@@ -14916,6 +19435,8 @@ static id macws_skylight_function_compat(
     if (library && g_macws_skylight_function_orig) {
         id function = g_macws_skylight_function_orig(
             library, selector, name);
+        function = macws_half_float_record_function(
+            library, selector, name, function);
         if (function) {
             if (macws_runtime_diagnostics_enabled()) {
                 dprintf(STDERR_FILENO,
@@ -14929,6 +19450,8 @@ static id macws_skylight_function_compat(
     }
     id original = g_macws_skylight_function_orig
         ? g_macws_skylight_function_orig(self, selector, name) : nil;
+    original = macws_half_float_record_function(
+        self, selector, name, original);
     if (original && contract) {
         objc_setAssociatedObject(
             original, kMacWSMetal2MetalFunctionRouteKey, route,
@@ -15203,7 +19726,20 @@ static id macws_qc_specialize_named_compat(
 static void macws_install_qc_desktop_function_compatibility(void) {
     if (!getenv("MACWS_AGX_NATIVE")) return;
     const char *program = getprogname();
-    if (!program || strcmp(program, "WindowServer") != 0) return;
+    BOOL is_window_server =
+        program && strcmp(program, "WindowServer") == 0;
+    const char *stray_compat = getenv("MACWS_STRAY_AGX_COMPAT");
+    BOOL is_stray = program &&
+        strcmp(program, "Stray-Mac-Shipping") == 0 && stray_compat &&
+        stray_compat[0] != '\0' && strcmp(stray_compat, "0") != 0;
+    // The Steam launcher injects MACWS_STRAY_AGX_COMPAT only into the exact
+    // Stray child.  Its MetalFX default.metallib now has a complete verified
+    // route and the paired native/chroot submission A/B completes status=4,
+    // error=nil.  Admit that production child here; every actual library and
+    // function replacement remains constrained by the route manifest's
+    // source path, byte length, hash and full function inventory below.
+    if (!is_window_server && !is_stray &&
+        !getenv("MACWS_METAL2METAL_NON_WS_DIAGNOSTIC")) return;
     Class library_class = objc_getClass("_MTLLibrary");
     if (!library_class) return;
     struct {
@@ -15240,8 +19776,25 @@ static void macws_install_qc_desktop_function_compatibility(void) {
             continue;
         }
         IMP current = method_getImplementation(method);
-        if (current == entries[index].replacement) continue;
-        *entries[index].original = current;
+        if (macws_imp_equal_ignoring_pac(
+                current, entries[index].replacement)) continue;
+        IMP upstream = current;
+        if (index == 0 && macws_imp_equal_ignoring_pac(
+                current, (IMP)macws_half_float_new_function)) {
+            // Collapse the older standalone half-float wrapper into this
+            // single dispatcher. Saving that wrapper as our upstream while
+            // it saved us as its upstream is the exact recursion invariant
+            // caught in the 2026-08-27 Stray crash report.
+            upstream = (IMP)g_macws_half_float_new_function_orig;
+            if (!upstream) {
+                dprintf(STDERR_FILENO,
+                    "#### QC-DESKTOP-TARGET invariant-failed "
+                    "selector=%s half-float-upstream=nil\n",
+                    entries[index].selector_name);
+                continue;
+            }
+        }
+        *entries[index].original = upstream;
         const char *types = method_getTypeEncoding(method);
         if (!class_addMethod(library_class, selector,
                              entries[index].replacement, types)) {
@@ -15255,7 +19808,7 @@ static void macws_install_qc_desktop_function_compatibility(void) {
                 "#### QC-DESKTOP-TARGET installed class=%s selector=%s "
                 "original=%p\n",
                 class_getName(library_class), entries[index].selector_name,
-                (void *)current);
+                (void *)upstream);
         }
     }
 
@@ -15406,6 +19959,334 @@ static void macws_install_new_event_compat(Class agx) {
         (void *)current, added);
 }
 
+// Read-only lifecycle witness for Stray's rotating 64-KiB argument buffers.
+// The GPU timeout artifact identifies the corresponding kernel resource by
+// GPU VA, but IOGPUResourceCreate does not retain the public MTLResourceOptions
+// or tell us whether the producer later called -didModifyRange:.  Observe
+// those two API boundaries and retain only compact counters in process memory;
+// the error callback writes the table once through the exported dumper below.
+// No storage mode, cache policy, contents, or synchronization call is changed.
+typedef id (*macws_agx_new_buffer_fn)(id, SEL, NSUInteger,
+                                      MTLResourceOptions)
+    __attribute__((ns_returns_retained));
+typedef void (*macws_agx_did_modify_fn)(id, SEL, NSRange);
+
+#define MACWS_AGX_BUFFER_DIAG_CAP 256u
+struct macws_agx_buffer_diag_entry {
+    uintptr_t object;
+    uint64_t gpu_address;
+    uintptr_t contents;
+    uint64_t create_sequence;
+    uint64_t modify_count;
+    uint64_t last_modify_time_ns;
+    NSUInteger length;
+    NSUInteger options;
+    NSUInteger storage_mode;
+    NSUInteger cpu_cache_mode;
+    NSUInteger hazard_mode;
+    NSUInteger last_modify_location;
+    NSUInteger last_modify_length;
+};
+
+static macws_agx_new_buffer_fn g_macws_agx_new_buffer_orig;
+static macws_agx_did_modify_fn g_macws_agx_did_modify_orig;
+static pthread_mutex_t g_macws_agx_buffer_diag_lock =
+    PTHREAD_MUTEX_INITIALIZER;
+static struct macws_agx_buffer_diag_entry
+    g_macws_agx_buffer_diag[MACWS_AGX_BUFFER_DIAG_CAP];
+static uint64_t g_macws_agx_buffer_create_sequence;
+
+static uint64_t macws_agx_buffer_gpu_address(id buffer) {
+    SEL selector = sel_registerName("gpuAddress");
+    if (!buffer || ![buffer respondsToSelector:selector]) return 0;
+    return ((uint64_t (*)(id, SEL))objc_msgSend)(buffer, selector);
+}
+
+static void macws_agx_buffer_diag_remember(
+        id buffer, NSUInteger length, NSUInteger options) {
+    if (!buffer || length != 0x10000 ||
+        !macws_iogpu_error_diag_enabled()) return;
+    uint64_t gpu_address = macws_agx_buffer_gpu_address(buffer);
+    void *contents = nil;
+    NSUInteger storage_mode = NSUIntegerMax;
+    NSUInteger cpu_cache_mode = NSUIntegerMax;
+    NSUInteger hazard_mode = NSUIntegerMax;
+    @try {
+        id<MTLBuffer> metal_buffer = (id<MTLBuffer>)buffer;
+        contents = metal_buffer.contents;
+        storage_mode = metal_buffer.storageMode;
+        cpu_cache_mode = metal_buffer.cpuCacheMode;
+        if ([buffer respondsToSelector:@selector(hazardTrackingMode)])
+            hazard_mode = metal_buffer.hazardTrackingMode;
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+
+    pthread_mutex_lock(&g_macws_agx_buffer_diag_lock);
+    uint64_t sequence = ++g_macws_agx_buffer_create_sequence;
+    unsigned slot = (unsigned)((sequence - 1) % MACWS_AGX_BUFFER_DIAG_CAP);
+    g_macws_agx_buffer_diag[slot] =
+        (struct macws_agx_buffer_diag_entry){
+            .object = (uintptr_t)(__bridge void *)buffer,
+            .gpu_address = gpu_address,
+            .contents = (uintptr_t)contents,
+            .create_sequence = sequence,
+            .length = length,
+            .options = options,
+            .storage_mode = storage_mode,
+            .cpu_cache_mode = cpu_cache_mode,
+            .hazard_mode = hazard_mode,
+        };
+    pthread_mutex_unlock(&g_macws_agx_buffer_diag_lock);
+
+    dprintf(STDERR_FILENO,
+        "#### AGX-BUFFER-REUSE CREATE sequence=%llu object=%p class=%s "
+        "gpu=%#llx contents=%p length=%#lx options=%#lx storage=%#lx "
+        "cpuCache=%#lx hazard=%#lx\n",
+        (unsigned long long)sequence, (__bridge void *)buffer,
+        class_getName([buffer class]), (unsigned long long)gpu_address,
+        contents, (unsigned long)length, (unsigned long)options,
+        (unsigned long)storage_mode, (unsigned long)cpu_cache_mode,
+        (unsigned long)hazard_mode);
+    if (sequence <= 32) {
+        void *frames[16];
+        int count = backtrace(frames, 16);
+        for (int index = 0; index < count; index++) {
+            Dl_info info = {0};
+            dladdr(frames[index], &info);
+            dprintf(STDERR_FILENO,
+                "#### AGX-BUFFER-REUSE CREATE-BT sequence=%llu frame=%d "
+                "pc=%p image=%s imageBase=%p symbol=%s symbolBase=%p\n",
+                (unsigned long long)sequence, index, frames[index],
+                info.dli_fname ?: "(unknown)", info.dli_fbase,
+                info.dli_sname ?: "(unknown)", info.dli_saddr);
+        }
+    }
+}
+
+static id macws_agx_new_buffer_diag(id self, SEL selector,
+                                    NSUInteger length,
+                                    MTLResourceOptions options)
+    __attribute__((ns_returns_retained));
+static id macws_agx_new_buffer_diag(id self, SEL selector,
+                                    NSUInteger length,
+                                    MTLResourceOptions options) {
+    id result = g_macws_agx_new_buffer_orig
+        ? g_macws_agx_new_buffer_orig(self, selector, length, options) : nil;
+    macws_agx_buffer_diag_remember(result, length, options);
+    return result;
+}
+
+static void macws_agx_did_modify_diag(id self, SEL selector, NSRange range) {
+    if (macws_iogpu_error_diag_enabled()) {
+        NSUInteger length = 0;
+        @try {
+            if ([self respondsToSelector:@selector(length)])
+                length = ((NSUInteger (*)(id, SEL))objc_msgSend)(
+                    self, @selector(length));
+        } @catch (NSException *exception) {
+            (void)exception;
+        }
+        if (length == 0x10000) {
+            uintptr_t object = (uintptr_t)(__bridge void *)self;
+            uint64_t gpu_address = macws_agx_buffer_gpu_address(self);
+            uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+            pthread_mutex_lock(&g_macws_agx_buffer_diag_lock);
+            for (unsigned slot = 0; slot < MACWS_AGX_BUFFER_DIAG_CAP; slot++) {
+                struct macws_agx_buffer_diag_entry *entry =
+                    &g_macws_agx_buffer_diag[slot];
+                if (entry->object != object &&
+                    (!gpu_address || entry->gpu_address != gpu_address))
+                    continue;
+                entry->modify_count++;
+                entry->last_modify_time_ns = now;
+                entry->last_modify_location = range.location;
+                entry->last_modify_length = range.length;
+                break;
+            }
+            pthread_mutex_unlock(&g_macws_agx_buffer_diag_lock);
+        }
+    }
+    if (g_macws_agx_did_modify_orig)
+        g_macws_agx_did_modify_orig(self, selector, range);
+}
+
+void MacWSMetalDumpAGXBufferDiagnostics(const char *directory) {
+    if (!directory || !macws_iogpu_error_diag_enabled()) return;
+    char path[PATH_MAX] = {0};
+    snprintf(path, sizeof(path), "%s/buffer_objects.txt", directory);
+    FILE *output = fopen(path, "w");
+    if (!output) return;
+    pthread_mutex_lock(&g_macws_agx_buffer_diag_lock);
+    fprintf(output, "create_newest=%llu capacity=%u\n",
+        (unsigned long long)g_macws_agx_buffer_create_sequence,
+        MACWS_AGX_BUFFER_DIAG_CAP);
+    for (unsigned slot = 0; slot < MACWS_AGX_BUFFER_DIAG_CAP; slot++) {
+        const struct macws_agx_buffer_diag_entry *entry =
+            &g_macws_agx_buffer_diag[slot];
+        if (!entry->create_sequence) continue;
+        fprintf(output,
+            "create=%llu object=%#llx gpu=%#llx contents=%#llx "
+            "length=%#lx options=%#lx storage=%#lx cpuCache=%#lx "
+            "hazard=%#lx modify_count=%llu last_modify_ns=%llu "
+            "last_range=%#lx+%#lx\n",
+            (unsigned long long)entry->create_sequence,
+            (unsigned long long)entry->object,
+            (unsigned long long)entry->gpu_address,
+            (unsigned long long)entry->contents,
+            (unsigned long)entry->length,
+            (unsigned long)entry->options,
+            (unsigned long)entry->storage_mode,
+            (unsigned long)entry->cpu_cache_mode,
+            (unsigned long)entry->hazard_mode,
+            (unsigned long long)entry->modify_count,
+            (unsigned long long)entry->last_modify_time_ns,
+            (unsigned long)entry->last_modify_location,
+            (unsigned long)entry->last_modify_length);
+    }
+    pthread_mutex_unlock(&g_macws_agx_buffer_diag_lock);
+    fclose(output);
+}
+
+static void macws_install_agx_buffer_reuse_diagnostic(Class agx) {
+    if (!agx || !macws_iogpu_error_diag_enabled() ||
+        g_macws_agx_new_buffer_orig) return;
+    SEL new_buffer = @selector(newBufferWithLength:options:);
+    Method new_buffer_method = class_getInstanceMethod(agx, new_buffer);
+    if (new_buffer_method) {
+        MSHookMessageEx(agx, new_buffer, (IMP)macws_agx_new_buffer_diag,
+                        (IMP *)&g_macws_agx_new_buffer_orig);
+        dprintf(STDERR_FILENO,
+            "#### AGX-BUFFER-REUSE newBuffer diagnostic installed "
+            "class=%s original=%p\n", class_getName(agx),
+            (void *)g_macws_agx_new_buffer_orig);
+    }
+    Class buffer_class = objc_getClass("AGXBuffer");
+    SEL did_modify = @selector(didModifyRange:);
+    Method did_modify_method = buffer_class
+        ? class_getInstanceMethod(buffer_class, did_modify) : NULL;
+    if (did_modify_method) {
+        MSHookMessageEx(buffer_class, did_modify,
+                        (IMP)macws_agx_did_modify_diag,
+                        (IMP *)&g_macws_agx_did_modify_orig);
+        dprintf(STDERR_FILENO,
+            "#### AGX-BUFFER-REUSE didModify diagnostic installed "
+            "class=%s original=%p\n", class_getName(buffer_class),
+            (void *)g_macws_agx_did_modify_orig);
+    } else {
+        dprintf(STDERR_FILENO,
+            "#### AGX-BUFFER-REUSE didModify diagnostic missing "
+            "class=%p\n", (void *)buffer_class);
+    }
+}
+
+// Focused read-only witness for the IOGPU parent-buffer invariant.  This is
+// intentionally opt-in and forwards the exact arguments/result unchanged;
+// it exists to correlate the Objective-C bufferOffset with the raw sel=0x9
+// resource request/return logged by mac_hooks.m.  Do not turn the assertion
+// in IOGPUMetalBuffer into a success path: a mismatched GPU VA would only
+// move the corruption into the first command-buffer submission.
+typedef id (*macws_iogpu_primary_buffer_init_fn)(
+    id, SEL, id, NSUInteger, NSUInteger, NSUInteger, NSUInteger,
+    const void *, NSUInteger) __attribute__((ns_returns_retained));
+static macws_iogpu_primary_buffer_init_fn
+    g_macws_iogpu_primary_buffer_init_orig = NULL;
+
+static id macws_iogpu_primary_buffer_init_diag(
+        id self, SEL selector, id primary_buffer, NSUInteger heap_index,
+        NSUInteger buffer_index, NSUInteger buffer_offset, NSUInteger length,
+        const void *args, NSUInteger args_size)
+    __attribute__((ns_returns_retained));
+static id macws_iogpu_primary_buffer_init_diag(
+        id self, SEL selector, id primary_buffer, NSUInteger heap_index,
+        NSUInteger buffer_index, NSUInteger buffer_offset, NSUInteger length,
+        const void *args, NSUInteger args_size) {
+    uint64_t primary_gpu_address = 0;
+    uint64_t primary_virtual_address = 0;
+    NSUInteger primary_length = 0;
+    void *primary_contents = NULL;
+    @try {
+        SEL gpu = sel_registerName("gpuAddress");
+        SEL va = sel_registerName("virtualAddress");
+        SEL contents = sel_registerName("contents");
+        SEL buffer_length = sel_registerName("length");
+        if ([primary_buffer respondsToSelector:gpu])
+            primary_gpu_address = ((uint64_t (*)(id, SEL))objc_msgSend)(
+                primary_buffer, gpu);
+        if ([primary_buffer respondsToSelector:va])
+            primary_virtual_address = ((uint64_t (*)(id, SEL))objc_msgSend)(
+                primary_buffer, va);
+        if ([primary_buffer respondsToSelector:contents])
+            primary_contents = ((void *(*)(id, SEL))objc_msgSend)(
+                primary_buffer, contents);
+        if ([primary_buffer respondsToSelector:buffer_length])
+            primary_length = ((NSUInteger (*)(id, SEL))objc_msgSend)(
+                primary_buffer, buffer_length);
+    } @catch (NSException *exception) {
+        (void)exception;
+    }
+    uint64_t request_30 = 0, request_38 = 0, request_40 = 0;
+    uint64_t request_48 = 0, request_50 = 0, request_58 = 0;
+    if (args && args_size >= 0x60) {
+        const uint8_t *bytes = (const uint8_t *)args;
+        memcpy(&request_30, bytes + 0x30, sizeof(request_30));
+        memcpy(&request_38, bytes + 0x38, sizeof(request_38));
+        memcpy(&request_40, bytes + 0x40, sizeof(request_40));
+        memcpy(&request_48, bytes + 0x48, sizeof(request_48));
+        memcpy(&request_50, bytes + 0x50, sizeof(request_50));
+        memcpy(&request_58, bytes + 0x58, sizeof(request_58));
+    }
+    dprintf(STDERR_FILENO,
+        "#### IOGPU-PRIMARY-BUFFER ENTRY self=%p primary=%p "
+        "heapIndex=%lu bufferIndex=%lu bufferOffset=%#lx length=%#lx "
+        "primaryGPU=%#llx primaryVA=%#llx primaryContents=%p "
+        "primaryLength=%#lx args=%p argsSize=%#lx "
+        "+30=%#llx +38=%#llx +40=%#llx +48=%#llx +50=%#llx "
+        "+58=%#llx\n",
+        (void *)self, (void *)primary_buffer,
+        (unsigned long)heap_index, (unsigned long)buffer_index,
+        (unsigned long)buffer_offset, (unsigned long)length,
+        (unsigned long long)primary_gpu_address,
+        (unsigned long long)primary_virtual_address, primary_contents,
+        (unsigned long)primary_length, args, (unsigned long)args_size,
+        (unsigned long long)request_30,
+        (unsigned long long)request_38,
+        (unsigned long long)request_40,
+        (unsigned long long)request_48,
+        (unsigned long long)request_50,
+        (unsigned long long)request_58);
+    return g_macws_iogpu_primary_buffer_init_orig
+        ? g_macws_iogpu_primary_buffer_init_orig(
+              self, selector, primary_buffer, heap_index, buffer_index,
+              buffer_offset, length, args, args_size)
+        : nil;
+}
+
+static void macws_install_iogpu_primary_buffer_init_diag(void) {
+    if (!getenv("MACWS_BUFFER_SUBALLOC_DIAG") ||
+        g_macws_iogpu_primary_buffer_init_orig) return;
+    Class buffer_class = objc_getClass("IOGPUMetalBuffer");
+    SEL selector = sel_registerName(
+        "initWithPrimaryBuffer:heapIndex:bufferIndex:bufferOffset:length:"
+        "args:argsSize:");
+    Method method = buffer_class
+        ? class_getInstanceMethod(buffer_class, selector) : NULL;
+    if (!method) {
+        dprintf(STDERR_FILENO,
+            "#### IOGPU-PRIMARY-BUFFER missing class=%p selector=%s\n",
+            (void *)buffer_class, sel_getName(selector));
+        return;
+    }
+    MSHookMessageEx(
+        buffer_class, selector, (IMP)macws_iogpu_primary_buffer_init_diag,
+        (IMP *)&g_macws_iogpu_primary_buffer_init_orig);
+    dprintf(STDERR_FILENO,
+        "#### IOGPU-PRIMARY-BUFFER diagnostic installed class=%s "
+        "selector=%s original=%p\n",
+        class_getName(buffer_class), sel_getName(selector),
+        (void *)g_macws_iogpu_primary_buffer_init_orig);
+}
+
 static void install_agx_init_redirect(Class agx) {
     install_agx_initimpl_hook();  // install diag hook on texture class
     install_iogpu_init_hook();    // install diag hook on IOGPUMetalTexture super-init
@@ -15414,10 +20295,19 @@ static void install_agx_init_redirect(Class agx) {
     macws_install_source_library_diagnostic(agx);
     macws_install_data_library_compatibility(agx);
     macws_install_metal2metal_url_routing(agx);
+    macws_install_half_float_function_compatibility();
     macws_install_qc_desktop_function_compatibility();
     macws_install_render_pipeline_diagnostic(agx);
+    macws_install_stray_compute_execution_trace(
+        objc_getClass("AGXG13GFamilyCommandBuffer"));
+    macws_install_stray_agx_present_trace();
+    macws_install_stray_input_consume_diagnostic();
+    macws_install_stray_submit_flags_diagnostic();
+    macws_install_stray_wait_until_completed_diagnostic();
     macws_install_stray_render_execution_trace();
     macws_install_new_event_compat(agx);
+    macws_install_agx_buffer_reuse_diagnostic(agx);
+    macws_install_iogpu_primary_buffer_init_diag();
     // (no pipeline fallback — see removed block above)
 
     SEL sel = @selector(initWithAcceleratorPort:);
@@ -15681,6 +20571,33 @@ static void install_agx_init_redirect(Class agx) {
                     macws_log_video_texture_binding(self_, tex, idx);
                 }
                 if (!tex) {
+                    BOOL forwardStrayNil =
+                        macws_is_stray_process() &&
+                        access("/tmp/macws_stray_forward_nil_texture",
+                               F_OK) == 0;
+                    if (macws_is_stray_process() &&
+                        access("/tmp/macws_stray_render_trace", F_OK) == 0) {
+                        static _Atomic uint32_t strayNilSequence = 0;
+                        uint32_t sequence = atomic_fetch_add_explicit(
+                            &strayNilSequence, 1, memory_order_relaxed) + 1;
+                        if (sequence <= 256) {
+                            fprintf(stderr,
+                                "#### STRAY-NIL-TEXTURE #%u selector=%s "
+                                "encoder=%p index=%lu action=%s original=%p\n",
+                                sequence, sel_name_copy, (void *)self_,
+                                (unsigned long)idx,
+                                forwardStrayNil ? "forward" : "skip",
+                                (void *)orig);
+                        }
+                    }
+                    // Diagnostic A/B for the exact protocol regression above:
+                    // restore the original driver's nil-binding call for
+                    // Stray only.  This is marker-gated until runtime proves
+                    // whether skipped unbinds are the NaN writer's cause.
+                    if (forwardStrayNil && orig) {
+                        orig(self_, sel, tex, idx);
+                        return;
+                    }
                     static int nil_guard_log[2] = {0, 0};
                     int slot = (strstr(sel_name_copy, "Fragment") != NULL) ? 0 : 1;
                     if (nil_guard_log[slot]++ < 3) {
@@ -16338,6 +21255,22 @@ xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t
     return orig_xpc_connection_create(name, queue);
 }
 
+static void macws_install_private_xpc_name_hooks(void) {
+    // CoreFoundation performs the cfprefsd lookup from inside the shared
+    // cache, so a client dylib's static interpose alone cannot rewrite it.
+    // Keep these two hooks as the complete, narrow shared-cache boundary for
+    // private MacWS services.
+    MSImageRef xpc =
+        MSGetImageByName("/usr/lib/system/libxpc.dylib");
+    MSHookFunction(
+        MSFindSymbol(xpc, "_xpc_connection_create_mach_service"),
+        hooked_xpc_connection_create_mach_service,
+        (void *)&orig_xpc_connection_create_mach_service);
+    MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"),
+                   hooked_xpc_connection_create,
+                   (void *)&orig_xpc_connection_create);
+}
+
 extern int xpc_connection_enable_sim2host_4sim();
 %hookf(int, xpc_connection_enable_sim2host_4sim) {
     return 0;
@@ -16452,15 +21385,51 @@ static void macws_terminal_order_window_onscreen(id app, id target,
 }
 
 __attribute__((constructor)) static void InitMetalHooks() {
+    // The startup `defaults` probe is a headless preferences client: it needs
+    // the shared-cache XPC name mapping, but no CGSession, AppKit, Metal,
+    // input, or diagnostic hook.  Install exactly that protocol boundary and
+    // return.  This differs intentionally from MACWS_UTILITY_PROCESS, whose
+    // codesign/provisioning callers do not use CFPreferences at all.
+    const char *preferences_client =
+        getenv("MACWS_CFPREFERENCES_CLIENT");
+    if (preferences_client && strcmp(preferences_client, "1") == 0) {
+        macws_install_private_xpc_name_hooks();
+        return;
+    }
+    // Command-line utilities launched during provisioning/startup need the
+    // dylib's static syscall/bootstrap interposes, but they do not consume any
+    // GUI or Metal hook.  Honor the existing utility contract before the first
+    // MSHookFunction call.  Runtime-confirmed on 2026-08-18: the startup
+    // `defaults write` probe blocked here in
+    // macws_install_cgsession_login_handoff_compatibility -> MSHookFunction ->
+    // ellekit.stopAllThreads, before defaults entered CFPreferences at all.
+    const char *utility_process = getenv("MACWS_UTILITY_PROCESS");
+    if (utility_process && strcmp(utility_process, "1") == 0) return;
     macws_record_xpc_service_context_if_requested();
     const char *initialProgram = getprogname();
     if (initialProgram &&
-        (strcmp(initialProgram, "com.apple.hiservices-xpcservice") == 0 ||
+        (strcmp(initialProgram, "bash") == 0 ||
+         strcmp(initialProgram, "sh") == 0 ||
+         strcmp(initialProgram, "zsh") == 0 ||
+         strcmp(initialProgram, "launchctl") == 0 ||
+         strcmp(initialProgram, "com.apple.hiservices-xpcservice") == 0 ||
          strcmp(initialProgram, "fontd") == 0 ||
          strcmp(initialProgram, "fontworker") == 0)) {
-        // These are headless request brokers. Their bootstrap/XPC adaptation
-        // is implemented by static interposes in mac_hooks.m; none creates a
-        // Metal device or presents UI.
+        // These are headless command interpreters, launchd clients, or request
+        // brokers. Their exec/bootstrap/XPC adaptation is implemented by
+        // static interposes outside this file; none creates a Metal device or
+        // presents UI.
+        //
+        // Runtime-confirmed on 2026-08-18: Steam's exact
+        // `system("launchctl remove com.valvesoftware.steamclean")` child was
+        // still in dyld initialization after 103 seconds. Every main-thread
+        // sample was InitMetalHooks -> MSHookFunction -> stopAllThreads ->
+        // swift_slowAlloc, while its parent remained in __wait4_nocancel.
+        // Installing the entire UI/Metal hook family in a transient shell is
+        // both outside its contract and a deterministic launch deadlock.
+        // The shell keeps libmachook's static exec/platform interposes, and
+        // the executable it launches receives a fresh process-specific hook
+        // initialization of its own.
         //
         // Runtime-confirmed on 2026-08-06: Terminal pid 95025 was permanently
         // blocked in HIS_XPC_GetCapsLockLanguageSwitch while the corresponding
@@ -16476,6 +21445,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         // otherwise-dead PID visible.
         return;
     }
+    macws_install_distributed_notification_namespace_compatibility();
     macws_install_iconservices_quarantine_fallback();
     macws_install_cgsession_login_handoff_compatibility();
     macws_install_launchpad_mount_namespace_compatibility();
@@ -16489,8 +21459,6 @@ __attribute__((constructor)) static void InitMetalHooks() {
     macws_install_catalyst_launch_compatibility();
     macws_install_catalyst_launch_diagnostics();
     macws_install_catalyst_drawable_publisher();
-    const char *utility_process = getenv("MACWS_UTILITY_PROCESS");
-    if (utility_process && strcmp(utility_process, "1") == 0) return;
     const char *shell_env = getenv("VSCODE_RESOLVING_ENVIRONMENT");
     if (shell_env && strcmp(shell_env, "1") == 0) return;
     const char *appExtension = getenv("MACWS_APP_EXTENSION");
@@ -16560,15 +21528,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
     // InitStuff returns (and EnableJIT asserts that state), so the same two
     // narrow hooks used by ordinary MacWS clients are valid here too.  Do not
     // broaden this to any of libxpc's protocol or object functions.
-    MSImageRef xpc =
-        MSGetImageByName("/usr/lib/system/libxpc.dylib");
-    MSHookFunction(
-        MSFindSymbol(xpc, "_xpc_connection_create_mach_service"),
-        hooked_xpc_connection_create_mach_service,
-        (void *)&orig_xpc_connection_create_mach_service);
-    MSHookFunction(MSFindSymbol(xpc, "_xpc_connection_create"),
-                   hooked_xpc_connection_create,
-                   (void *)&orig_xpc_connection_create);
+    macws_install_private_xpc_name_hooks();
 
     dispatch_async(dispatch_get_main_queue(), ^{
         // (NOTE: tried calling MTLCreateSystemDefaultDevice here to force Metal load

@@ -16,3 +16,7 @@ BOOL MacWSStartFinalCompositeReceiver(
     dispatch_queue_t queue,
     MacWSFinalCompositeAcceptedHandler acceptedHandler,
     MacWSFinalCompositeReceiverLogHandler logHandler);
+
+// Requests a fresh snapshot of WindowServer's latest completed composite.
+// Calls are generation-coalesced by the receiver and never form a frame clock.
+void MacWSRequestFinalCompositeReplay(uint64_t minimumCompletionTime);

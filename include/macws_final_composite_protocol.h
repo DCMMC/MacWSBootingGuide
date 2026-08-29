@@ -18,6 +18,9 @@
 #define MACWS_FINAL_COMPOSITE_MACH_SERVICE \
     "com.macwsguide.display.final-composite"
 #define MACWS_FINAL_COMPOSITE_MACH_MESSAGE_ID 0x4d574643
+#define MACWS_FINAL_COMPOSITE_REPLAY_MACH_SERVICE \
+    "com.macwsguide.windowserver.final-composite-replay"
+#define MACWS_FINAL_COMPOSITE_REPLAY_MACH_MESSAGE_ID 0x4d574652
 
 #define MACWS_FINAL_COMPOSITE_MAX_DIMENSION 16384u
 #define MACWS_FINAL_COMPOSITE_MAX_BYTES_PER_ROW \
@@ -61,6 +64,43 @@ typedef struct {
     MacWSFinalCompositeRecord record;
 } MacWSFinalCompositeMachMessage;
 
+// displayd is independently restartable.  A one-way producer push leaves a
+// relaunched receiver on the exact-window fallback until WindowServer happens
+// to submit another owned scanout.  This authenticated, payload-free request
+// asks the live producer to snapshot its latest completed scanout again.  The
+// response remains the normal surface message above, so there is only one
+// ownership and validation path for final-composite frames.
+#define MACWS_FINAL_COMPOSITE_REPLAY_MAGIC 0x4d574652u /* "MWFR" */
+#define MACWS_FINAL_COMPOSITE_REPLAY_VERSION 1u
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t size;
+    int32_t requesterPID;
+    uint32_t reserved;
+    // Earliest producer-side completion timestamp acceptable to the caller.
+    // Startup uses 1 (latest available snapshot). Mutation catch-up uses the
+    // earliest producer completion causally compatible with the catalog
+    // observation. The receiver may subtract one runtime-measured, bounded
+    // observation latency because displayd necessarily sees the topology
+    // after the compositor command which created it has completed.
+    uint64_t minimumCompletionTime;
+} MacWSFinalCompositeReplayRecord;
+
+typedef struct {
+    mach_msg_header_t header;
+    MacWSFinalCompositeReplayRecord record;
+} MacWSFinalCompositeReplayMachMessage;
+
+static inline bool MacWSFinalCompositeReplayRecordIsValid(
+        const MacWSFinalCompositeReplayRecord *record, size_t byteCount) {
+    return record && byteCount == sizeof(*record) &&
+        record->magic == MACWS_FINAL_COMPOSITE_REPLAY_MAGIC &&
+        record->version == MACWS_FINAL_COMPOSITE_REPLAY_VERSION &&
+        record->size == sizeof(*record) && record->requesterPID > 1 &&
+        record->reserved == 0 && record->minimumCompletionTime != 0;
+}
+
 static inline bool MacWSFinalCompositeRecordIsValid(
         const MacWSFinalCompositeRecord *record, size_t byteCount) {
     if (!record || byteCount != sizeof(*record) ||
@@ -86,6 +126,14 @@ static_assert(sizeof(MacWSFinalCompositeRecord) == 56,
 #else
 _Static_assert(sizeof(MacWSFinalCompositeRecord) == 56,
                "MacWS final composite record ABI");
+#endif
+
+#if defined(__cplusplus)
+static_assert(sizeof(MacWSFinalCompositeReplayRecord) == 24,
+              "MacWS final composite replay record ABI");
+#else
+_Static_assert(sizeof(MacWSFinalCompositeReplayRecord) == 24,
+               "MacWS final composite replay record ABI");
 #endif
 
 #endif

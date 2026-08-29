@@ -30,4 +30,27 @@ static inline bool MacWSPhysicalDisplayExtent(double logicalWidth,
     return true;
 }
 
+// A compositor-owned layer whose logical bounds cover the complete display
+// still owns the complete physical canvas even when its IOSurface is rendered
+// at a lower material/effect resolution.  Mission Control is the concrete
+// witness: Dock keeps the 1194x834 logical desktop bounds while temporarily
+// publishing a 1194x834 wallpaper surface on a 2388x1668 Retina canvas.  The
+// surface dimensions describe sampling resolution, not destination geometry.
+static inline bool MacWSLayerCoversLogicalDisplay(
+        double layerX, double layerY, double layerWidth, double layerHeight,
+        double displayX, double displayY, double displayWidth,
+        double displayHeight) {
+    if (!isfinite(layerX) || !isfinite(layerY) ||
+        !isfinite(layerWidth) || !isfinite(layerHeight) ||
+        !isfinite(displayX) || !isfinite(displayY) ||
+        !isfinite(displayWidth) || !isfinite(displayHeight) ||
+        layerWidth <= 0.0 || layerHeight <= 0.0 ||
+        displayWidth <= 0.0 || displayHeight <= 0.0) return false;
+    const double tolerance = 0.5;
+    return layerX <= displayX + tolerance &&
+        layerY <= displayY + tolerance &&
+        layerX + layerWidth >= displayX + displayWidth - tolerance &&
+        layerY + layerHeight >= displayY + displayHeight - tolerance;
+}
+
 #endif
