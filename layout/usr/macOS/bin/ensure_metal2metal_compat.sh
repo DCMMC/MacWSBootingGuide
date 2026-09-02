@@ -6,11 +6,50 @@
 # both verify against its manifest. Existing valid routes are constant-time
 # no-ops, so package upgrades and GUI cold starts share this one boundary
 # without repeating LLVM work.
+set -o pipefail
+
 ROOTFS=/var/mnt/rootfs
 METAL2METAL=/var/jb/usr/macOS/bin/metal2metal.py
 LLVM_DIS=/var/jb/usr/lib/llvm-16/bin/llvm-dis
 LLVM_AS=/var/jb/usr/lib/llvm-16/bin/llvm-as
 ROUTE_DIR="$ROOTFS/usr/local/share/macws/metal2metal/routes"
+BOOT_READY_MARKER=/var/jb/var/mobile/macws-metal2metal.boot-ready
+
+# Full manifest verification reads and hashes four source/output metallib
+# pairs and starts Python once per route. That remains the authoritative
+# deployment/update boundary. During one live iPad boot, reuse its success
+# only while the exact scripts, sources, outputs and manifests retain their
+# filesystem identities. APFS replacement changes inode/ctime even when an
+# installer preserves mtime, while a reboot changes the first stamp field.
+metal2metal_runtime_stamp() {
+	local boot_id="" path=""
+	boot_id=$(/var/jb/usr/sbin/sysctl -n kern.bootsessionuuid 2>/dev/null |
+		/var/jb/usr/bin/tr -d '[:space:]')
+	[ -n "$boot_id" ] || return 1
+	{
+		printf 'schema=1 boot=%s\n' "$boot_id"
+		for path in \
+			/var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh \
+			/var/jb/usr/macOS/bin/ensure_quartzcore_compat.sh \
+			"$METAL2METAL" \
+			"$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib" \
+			"$ROOTFS/System/Library/Frameworks/QuartzCore.framework/Versions/A/Resources/default.metallib.macws-macos13.4-original" \
+			"$ROOTFS/usr/local/share/macws/quartzcore/default-desktop-effects-macabi.metallib" \
+			"$ROUTE_DIR/quartzcore-default.route.plist" \
+			"$ROOTFS/System/Library/PrivateFrameworks/SkyLight.framework/Versions/A/Resources/SkyLightShaders.air64.metallib" \
+			"$ROOTFS/usr/local/share/macws/skylight/SkyLightShaders-desktop-effects-macabi.metallib" \
+			"$ROUTE_DIR/skylight-shaders.route.plist" \
+			"$ROOTFS/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/MPSImage.framework/Versions/A/Resources/default.metallib" \
+			"$ROOTFS/usr/local/share/macws/mpsimage/default-desktop-effects-macabi.metallib" \
+			"$ROUTE_DIR/mpsimage-default.route.plist" \
+			"$ROOTFS/System/Library/Frameworks/MetalFX.framework/Versions/A/Resources/default.metallib" \
+			"$ROOTFS/usr/local/share/macws/metalfx/default-temporal-macabi.metallib" \
+			"$ROUTE_DIR/metalfx-default.route.plist"; do
+			[ -f "$path" ] || return 1
+			/var/jb/usr/bin/stat -c '%d:%i:%s:%Y:%Z' "$path" || return 1
+		done
+	} | /var/jb/usr/bin/sha256sum | /var/jb/usr/bin/awk '{print $1}'
+}
 
 metal2metal_sha256() {
 	sha256sum "$1" 2>/dev/null | awk '{print $1}'
@@ -20,6 +59,13 @@ if [ ! -f "$METAL2METAL" ] || [ ! -x "$LLVM_DIS" ] ||
    [ ! -x "$LLVM_AS" ]; then
 	echo "[ERROR] metal2metal or device LLVM 16 is unavailable." >&2
 	exit 1
+fi
+
+runtime_stamp=$(metal2metal_runtime_stamp 2>/dev/null || true)
+if [ -n "$runtime_stamp" ] && [ -f "$BOOT_READY_MARKER" ] &&
+   [ "$(/var/jb/usr/bin/sed -n '1p' "$BOOT_READY_MARKER" 2>/dev/null)" = "$runtime_stamp" ]; then
+	echo '[INFO] complete metal2metal runtime verification reused for this bootsession'
+	exit 0
 fi
 
 # QuartzCore also owns restoration of a diagnostically replaced system
@@ -117,3 +163,11 @@ provision_route \
 	"/usr/local/share/macws/metalfx/default-temporal-macabi.metallib" \
 	"" \
 	1 || exit 1
+
+runtime_stamp=$(metal2metal_runtime_stamp 2>/dev/null || true)
+if [ -n "$runtime_stamp" ]; then
+	marker_tmp="$BOOT_READY_MARKER.new.$$"
+	printf '%s\n' "$runtime_stamp" > "$marker_tmp" || exit 1
+	chmod 0644 "$marker_tmp" || exit 1
+	mv -f "$marker_tmp" "$BOOT_READY_MARKER" || exit 1
+fi

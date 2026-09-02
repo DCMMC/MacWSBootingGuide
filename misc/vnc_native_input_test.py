@@ -148,12 +148,13 @@ def send_pointer_double_click(sock, point, button_mask, hold_seconds=0.04,
     send_pointer_click(sock, point, button_mask, hold_seconds)
 
 
-def send_text(sock, text, key_delay):
+def send_text(sock, text, key_delay, send_return=True):
     for character in text:
         send_key(sock, ord(character))
         if key_delay:
             time.sleep(key_delay)
-    send_key(sock, 0xFF0D)
+    if send_return:
+        send_key(sock, 0xFF0D)
 
 
 def settle_and_drain(sock, width, height, framebuffer, digest, seconds):
@@ -212,6 +213,16 @@ def main():
     parser.add_argument("--drag-steps", type=int, default=8)
     parser.add_argument("--drag-step-delay", type=float, default=0.02)
     parser.add_argument("--key-delay", type=float, default=0.015)
+    parser.add_argument(
+        "--pre-input-delay", type=float, default=0.0,
+        help=("seconds to wait after the retained initial framebuffer and "
+              "before the first input operation; useful for arming an "
+              "external bounded trace without reconnecting RFB"))
+    parser.add_argument(
+        "--trace-sentinel",
+        help=("create this sentinel immediately before the first input and "
+              "remove it on exit; intended for bounded producer/display "
+              "frame traces on the machine running this probe"))
     parser.add_argument("--click-hold", type=float, default=0.04,
                         help="seconds between pointer down/up (default: 0.04)")
     parser.add_argument("--settle-seconds", type=float, default=1.5,
@@ -238,6 +249,9 @@ def main():
                         metavar=("X", "Y"),
                         help="send one button-free RFB pointer move")
     parser.add_argument("--text")
+    parser.add_argument(
+        "--no-return", action="store_true",
+        help="do not append Return after --text (interactive typing probe)")
     parser.add_argument("--command-key", metavar="KEY",
                         help="send Command+KEY using X11 Alt_L (0xffe9); "
                              "KEY may also be Tab")
@@ -258,6 +272,7 @@ def main():
         parser.error("select at least one input operation")
     if (args.timeout <= 0 or args.max_updates < 1 or args.drag_steps < 1 or
             args.drag_step_delay < 0 or args.key_delay < 0 or
+            args.pre_input_delay < 0 or
             args.click_hold < 0 or
             args.settle_seconds < 0):
         parser.error("timeouts/steps must be positive and delays nonnegative")
@@ -278,6 +293,15 @@ def main():
               f"initial_rectangles={len(initial)} "
               f"initial_pixels={initial_pixels} digest={digest}",
               flush=True)
+
+        if args.pre_input_delay:
+            print(f"INPUT armed delay={args.pre_input_delay:.3f}s",
+                  flush=True)
+            time.sleep(args.pre_input_delay)
+        if args.trace_sentinel:
+            with open(args.trace_sentinel, "a", encoding="utf-8"):
+                pass
+            print(f"INPUT trace-sentinel={args.trace_sentinel}", flush=True)
 
         if args.capture_only:
             if args.output:
@@ -353,7 +377,8 @@ def main():
             if args.keyboard_burst:
                 vnc_live_click.request_update(sock, width, height, True)
                 started = time.monotonic()
-                send_text(sock, args.text, args.key_delay)
+                send_text(sock, args.text, args.key_delay,
+                          send_return=not args.no_return)
                 digest, _ = request_and_wait(
                     sock, width, height, framebuffer, digest, "keyboard",
                     started, args.timeout, args.max_updates)
@@ -361,7 +386,8 @@ def main():
                 key_latencies = []
                 keys = [(repr(character), ord(character))
                         for character in args.text]
-                keys.append(("Return", 0xFF0D))
+                if not args.no_return:
+                    keys.append(("Return", 0xFF0D))
                 for key_index, (label, keysym) in enumerate(keys, 1):
                     vnc_live_click.request_update(
                         sock, width, height, True)
@@ -419,6 +445,11 @@ def main():
         raise SystemExit(2) from error
     finally:
         sock.close()
+        if args.trace_sentinel:
+            try:
+                os.unlink(args.trace_sentinel)
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":

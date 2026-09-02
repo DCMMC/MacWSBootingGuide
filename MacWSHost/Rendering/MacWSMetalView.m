@@ -804,7 +804,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (uint64_t)inputSceneIDWithModifiers:(uint32_t)modifiers {
     if (self.targetWindowID != 0)
         return MacWSInputSceneForWindow(self.targetWindowID, modifiers);
-    return modifiers ? (uint64_t)modifiers : self.sceneID;
+    // sceneID's low 32 bits are the keyboard modifier ABI.  A fullscreen
+    // UIWindowScene identity is an opaque hash and must never occupy that
+    // field: runtime record 0xe94da71f accidentally asserted AlphaShift,
+    // Control and Option, making both hardware and software input uppercase.
+    // The protocol already defines a marked zero-window encoding for a
+    // fullscreen system surface; use it even when modifiers are zero.
+    return MacWSInputSceneForWindow(0, modifiers);
 }
 
 - (void)requestStreamWindowList {
@@ -1351,7 +1357,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     return focused;
 }
 
-- (void)emitKeyPresses:(NSSet<UIPress *> *)presses kind:(MacWSInputKind)kind {
+- (BOOL)emitKeyPresses:(NSSet<UIPress *> *)presses kind:(MacWSInputKind)kind {
     if (MacWSHostDiagnosticsEnabled()) {
         MacWSLog(@"hardware-key-callback kind=%u presses=%lu responder=%@ "
                   "input-enabled=%@ target=%d frame=%ux%u",
@@ -1361,18 +1367,43 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                  self.targetPID, [self currentFrameWidth],
                  [self currentFrameHeight]);
     }
-    if (!self.isMacWSInputEnabled) return;
+    if (!self.isMacWSInputEnabled) return NO;
     uint32_t width = [self currentFrameWidth];
     uint32_t height = [self currentFrameHeight];
-    if (width == 0 || height == 0) return;
+    if (width == 0 || height == 0) return NO;
+    BOOL emitted = NO;
     for (UIPress *press in presses) {
         UIKey *key = press.key;
         if (!key) continue;
         uint16_t keyCode = MacWSMacKeyCodeForHIDUsage(key.keyCode);
         if (keyCode == UINT16_MAX) continue;
+        // sceneID forwards UIKit's modifier flags to AppKit as the authority
+        // for Shift/Caps/Option state. If UIKit supplies a pre-transformed
+        // `characters` value while declaring none of those text modifiers,
+        // forwarding that transformed scalar makes the remote application
+        // type uppercase even though its NSEvent has no Shift/Caps flag. Use
+        // the layout-aware unmodified value in precisely that inconsistent
+        // state; real Shift, Caps Lock and Option input continues to use
+        // UIKit's transformed characters unchanged.
+        UIKeyModifierFlags textModifiers = UIKeyModifierShift |
+            UIKeyModifierAlphaShift | UIKeyModifierAlternate;
+        NSString *mappedCharacters = key.characters;
+        if ((key.modifierFlags & textModifiers) == 0 &&
+            key.charactersIgnoringModifiers.length != 0) {
+            mappedCharacters = key.charactersIgnoringModifiers;
+        }
         uint32_t keySym = MacWSKeySymForHIDUsage(
-            key.keyCode, key.characters, key.modifierFlags);
+            key.keyCode, mappedCharacters, key.modifierFlags);
         if (keySym == 0) continue;
+        if (MacWSHostDiagnosticsEnabled()) {
+            MacWSLog(@"hardware-key-map kind=%u usage=%ld keycode=%u "
+                     "characters=%@ ignoring=%@ mapped=%@ modifiers=%#lx "
+                     "keysym=%#x",
+                     kind, (long)key.keyCode, keyCode,
+                     key.characters ?: @"", key.charactersIgnoringModifiers ?: @"",
+                     mappedCharacters ?: @"",
+                     (unsigned long)key.modifierFlags, keySym);
+        }
         CGPoint keyPoint = _trackpadCursor;
         if (keyPoint.x < 0 || keyPoint.y < 0 ||
             keyPoint.x >= width || keyPoint.y >= height)
@@ -1397,7 +1428,16 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             .sampleSequence = ++_inputSampleSequence,
         };
         [self.statusDelegate metalView:self emittedInput:record];
+        emitted = YES;
     }
+    return emitted;
+}
+
+- (BOOL)forwardHardwarePresses:(NSSet<UIPress *> *)presses
+                       keyDown:(BOOL)keyDown {
+    return [self emitKeyPresses:presses
+                           kind:keyDown ? MacWSInputKindKeyDown
+                                        : MacWSInputKindKeyUp];
 }
 
 - (void)emitSoftwareKeySym:(uint32_t)keySym modifiers:(uint32_t)modifiers {
@@ -2836,13 +2876,36 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 }
 
 - (int32_t)frontmostInputApplicationPIDAmongPIDs:(NSSet<NSNumber *> *)pids {
-    // This is the exact graph Host paints, not a second process-local focus
-    // opinion. Its reverse order is front-to-back and therefore remains
-    // stable even when several chrooted NSApplications incorrectly retain
-    // isActive/isKeyWindow at the same time. A nonempty catalog constrains the
-    // candidates. An empty catalog is a real fullscreen-game state (runtime:
-    // Stray PID 22119 kept layer 67 and its input endpoint while publishing no
-    // AppKit catalog item), so the same painted graph remains authoritative.
+    // Prefer the session-wide LaunchServices authority published by
+    // macwsdisplayd.  Unlike process-local keyWindow/Focused state, exactly
+    // one application owns this flag.  It also follows the already-composited
+    // final desktop when an old independent capture layer has stopped
+    // producing and therefore retains obsolete z-order metadata.
+    for (MacWSStreamWindow *window in _latestWindows) {
+        MacWSStreamWindowDescriptor descriptor = window.descriptor;
+        if ((descriptor.flags &
+                MacWSStreamWindowFrontmostApplication) == 0 ||
+            descriptor.ownerPID <= 1 ||
+            (pids.count != 0 &&
+             ![pids containsObject:@(descriptor.ownerPID)]) ||
+            !MacWSAppInputEndpointReady(descriptor.ownerPID)) continue;
+        return descriptor.ownerPID;
+    }
+    // The workspace layer graph carries displayd's current on-screen ordering
+    // as layerLevel. It remains the z-order authority even while an independent
+    // FinalComposite supplies the pixels: CopyCatalogWindowInfo's OptionAll
+    // catalog is an identity/lifecycle list and is not reordered by every
+    // activation on this chroot. Runtime-confirmed on 2026-08-30 after bringing
+    // Settings window 320 forward: retained layer levels were Activity=4,
+    // Terminal=5, Settings=6 (matching the rendered snapshot), while
+    // _latestWindows remained Activity, Terminal, Settings. Selecting the
+    // catalog first therefore reset keyboard targetPID to the covered Activity
+    // Monitor immediately after the correct pointer activation.
+    //
+    // A nonempty catalog still constrains eligible identities. An empty catalog
+    // is a real fullscreen-game state (runtime: Stray PID 22119 kept layer 67
+    // and its input endpoint while publishing no AppKit catalog item), so the
+    // same live layer graph remains authoritative there as well.
     BOOL restrictToCatalogPIDs = pids.count != 0;
     for (NSNumber *key in [[self overlayKeysBackToFront]
             reverseObjectEnumerator]) {
@@ -2863,11 +2926,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             MacWSStreamWindowFlags required =
                 MacWSStreamWindowVisible | MacWSStreamWindowOnScreen;
             if (descriptor.ownerPID <= 1 || descriptor.windowID == 0 ||
-                ![pids containsObject:@(descriptor.ownerPID)] ||
+                (restrictToCatalogPIDs &&
+                 ![pids containsObject:@(descriptor.ownerPID)]) ||
                 (descriptor.flags & required) != required ||
                 !MacWSAppInputEndpointReady(descriptor.ownerPID)) continue;
-            MacWSLog(@"fullscreen-frontmost route=final-composite-catalog "
-                     "pid=%d window=%u flags=%#x",
+            MacWSLog(@"fullscreen-frontmost route=final-composite-catalog-"
+                     "fallback pid=%d window=%u flags=%#x",
                      descriptor.ownerPID, descriptor.windowID,
                      descriptor.flags);
             return descriptor.ownerPID;
@@ -3040,9 +3104,22 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
                                   pid:(int32_t *)pidOut
                              windowID:(uint32_t *)windowIDOut
                            descriptor:(MacWSStreamFrameDescriptor *)descriptorOut {
-    // Traverse the exact graph used by drawInMTKView: in reverse paint order.
+    // A live FinalComposite is the surface drawInMTKView actually presents.
+    // Resolve it against displayd's live front-to-back OnScreenOnly catalog
+    // before consulting independent layer captures. Those captures are
+    // intentionally suspended once FinalComposite is authoritative and can
+    // therefore be minutes stale: runtime snapshot on 2026-08-30 measured
+    // Settings child 302 at 144 s old and its main layer at 2212 s old while
+    // the base composite was current. Overlay-first hit-testing consequently
+    // sent Activity Monitor scrolling to stale Settings PID 95665.
+    if ([self resolveFinalCompositeCatalogAtPoint:point pid:pidOut
+                                         windowID:windowIDOut
+                                       descriptor:descriptorOut]) return YES;
+
+    // Without a catalog-resolvable final composite (notably a fullscreen game
+    // drawable), traverse the exact independent graph in reverse paint order.
     // This is main-thread, in-process O(visible layers): no WindowServer IPC
-    // and no bounded 150-ms all-process target-probe round trip.
+    // and no bounded all-process target-probe round trip.
     for (NSNumber *key in [[self overlayKeysBackToFront]
             reverseObjectEnumerator]) {
         MacWSSurfaceFrame *frame = _overlayFrames[key];
@@ -3087,9 +3164,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         if (descriptorOut) *descriptorOut = descriptor;
         return YES;
     }
-    return [self resolveFinalCompositeCatalogAtPoint:point pid:pidOut
-                                            windowID:windowIDOut
-                                          descriptor:descriptorOut];
+    return NO;
 }
 
 - (BOOL)performanceVisiblePointForTargetPID:(int32_t)targetPID
@@ -3330,8 +3405,18 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         (record->kind == MacWSInputKindScroll && !begins) ||
         ((record->kind == MacWSInputKindMagnify ||
           record->kind == MacWSInputKindRotate) && !begins);
-    BOOL diagnostic = record->contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC;
-    if (diagnostic) {
+    // Continuous scroll records encode horizontal delta bits in contactID, so
+    // the URL performance suite cannot use the legacy "DIAG" contact value.
+    // Its typed latency flag is the common diagnostic identity for pointer,
+    // scroll, magnify and rotate. Log only transaction edges to keep a 120 Hz
+    // validation run bounded while retaining the resolved Begin descriptor
+    // and the frozen End route as runtime evidence.
+    BOOL diagnostic =
+        record->contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC ||
+        (record->flags & MacWSInputFlagLatencyDiagnostic) != 0;
+    BOOL diagnosticEdge = diagnostic &&
+        (!continuation || begins || terminal);
+    if (diagnosticEdge) {
         MacWSLog(@"fullscreen-route-entry view=%p kind=%u begin=%@ continuation=%@ terminal=%@ active=%@ contact=%u owner-contact=%u frozen-destination=(%d,%d %ux%u)",
                  self, record->kind, begins ? @"YES" : @"NO",
                  continuation ? @"YES" : @"NO", terminal ? @"YES" : @"NO",
@@ -3407,7 +3492,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
             record->flags |= MacWSInputFlagGlobalSystemSurface;
         }
         record->sceneID = MacWSInputSceneForWindow(windowID, modifiers);
-        if (record->contactID == MACWS_INPUT_CONTACT_DIAGNOSTIC) {
+        if (diagnosticEdge) {
             MacWSLog(@"fullscreen-layer-input runtime-confirmed pid=%d target=%d route=%@ window=%u flags=%#x desktop=(%.1f,%.1f) local=(%.1f,%.1f)/%ux%u destination=(%d,%d %ux%u)",
                      ownerPID, record->targetPID,
                      globalSystemSurface ? @"global-system" : @"app",
@@ -5593,6 +5678,7 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     NSUInteger count = updates.length / sizeof(*records);
     [_performanceMonitor recordGeometryBatchReceived];
     BOOL changed = NO;
+    BOOL presentationOrderChanged = NO;
     for (NSUInteger index = 0; index < count; index++) {
         const MacWSStreamLayerGeometry *geometry = &records[index];
         if (!MacWSStreamLayerGeometryIsValid(geometry,
@@ -5622,7 +5708,10 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         _overlayFrames[key] = [[MacWSSurfaceFrame alloc]
             initWithDescriptor:descriptor surface:frame.surface
             receiptTime:receiptTime];
-        if (levelChanged) _sortedOverlayKeys = nil;
+        if (levelChanged) {
+            _sortedOverlayKeys = nil;
+            presentationOrderChanged = YES;
+        }
         [_performanceMonitor recordGeometryReceivedForStream:
             descriptor.streamID sequence:descriptor.sequence
             layerWindowID:descriptor.layerWindowID
@@ -5631,6 +5720,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         changed = YES;
     }
     if (changed) [self setNeedsDisplay];
+    if (presentationOrderChanged && _latestWindows.count) {
+        // A native activation reorders retained layers without necessarily
+        // changing the OptionAll identity catalog. Re-evaluate targetPID on
+        // that exact ordered-geometry transaction; otherwise the visible app
+        // changes while subsequent hardware keys remain bound to the previous
+        // PID until an unrelated catalog mutation occurs. This is local and
+        // event-driven, so dragging a window (geometry only, same level) does
+        // not trigger catalog work or a target-selection loop.
+        MacWSLog(@"display-stream input-target-revalidate "
+                 "reason=layer-order-changed layers=%lu windows=%lu",
+                 (unsigned long)_overlayFrames.count,
+                 (unsigned long)_latestWindows.count);
+        [self.statusDelegate metalView:self receivedWindows:_latestWindows];
+    }
 }
 
 - (void)streamClient:(MacWSStreamClient *)client

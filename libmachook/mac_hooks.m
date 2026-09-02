@@ -1,10 +1,12 @@
 @import CoreServices;
+@import CoreGraphics;
 @import CydiaSubstrate;
 @import Darwin;
 @import Foundation;
 @import MachO;
 #import <IOKit/IOKitLib.h>
 #import <dispatch/dispatch.h>
+#import <dlfcn.h>
 #import <xpc/xpc.h>
 #import <sys/sysctl.h>
 #import <sys/file.h>
@@ -1256,7 +1258,9 @@ static IOReturn (*g_macws_orig_iomfb_swap_end)(void *framebuffer) = NULL;
 static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer);
 
 // IOSurface
+#ifndef CGBASE_H_
 typedef id IOSurfaceRef;
+#endif
 extern IOSurfaceRef IOSurfaceCreate(NSDictionary* properties);
 extern IOSurfaceRef IOSurfaceLookup(uint32_t surface_id);
 extern CFDictionaryRef IOSurfaceCopyAllValues(IOSurfaceRef surface);
@@ -3009,42 +3013,291 @@ static void macws_schedule_uttype_coretypes_compatibility(void) {
 // succeed, and failure begins at
 // -[_CUIGraphicVariantVectorGlyph rasterizeImageUsingScaleFactor:forTargetSize:].
 //
-// Preserve IconFoundation's full path first.  Only when it returns nil for an
-// ISGraphicSymbolResource do we rasterize the already-resolved source glyph
-// and wrap that CGImage in IconFoundation's IFImage container.
-// This keeps real Settings artwork and dimensions; it is a narrow CPU-backed
-// compatibility fallback for an unsupported CoreUI graphic-variant renderer,
-// not a success-forcing or placeholder-image patch.
+// Preserve IconFoundation's full path first and capture the exact CoreUI
+// graphic variant it creates. The target runtime can return either nil or a
+// displayable-but-uncomposited image, so rebuild only this resource class from
+// IconFoundation's resolved glyph/colors and CoreUI's own safe-content
+// geometry, then wrap the CGImage in IconFoundation's IFImage container. This
+// keeps the real Settings artwork, per-glyph aspect ratio and enclosure recipe;
+// it is a narrow CPU-backed compatibility path for the unsupported variant
+// compositor, not a success-forcing or placeholder-image patch.
 static id (*g_macws_orig_settings_symbol_image)(id, SEL, CGSize, double);
+static id (*g_macws_orig_settings_concrete_icon_image)(id, SEL, id);
+static id (*g_macws_orig_graphic_variant_with_options)(id, SEL, id);
 static __thread BOOL g_macws_rendering_settings_symbol;
+static __thread BOOL g_macws_rendering_settings_concrete_icon;
+static __thread BOOL g_macws_capturing_settings_graphic_variant;
+static __thread CFTypeRef g_macws_captured_settings_graphic_variant;
 static id g_macws_settings_private_symbol_catalog;
 static id g_macws_settings_public_symbol_catalog;
+static void *g_macws_settings_icon_services;
+
+static id macws_graphic_variant_with_options(id self, SEL selector,
+                                              id options) {
+    id variant = g_macws_orig_graphic_variant_with_options
+        ? g_macws_orig_graphic_variant_with_options(self, selector, options)
+        : nil;
+    if (g_macws_capturing_settings_graphic_variant && variant) {
+        if (g_macws_captured_settings_graphic_variant)
+            CFRelease(g_macws_captured_settings_graphic_variant);
+        g_macws_captured_settings_graphic_variant =
+            CFRetain((__bridge CFTypeRef)variant);
+    }
+    return variant;
+}
+
+static CGColorRef macws_settings_resolved_color(id descriptor,
+                                                 const char *selectorName) {
+    SEL colorsSelector = sel_registerName(selectorName);
+    id colors = descriptor && [descriptor respondsToSelector:colorsSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(descriptor, colorsSelector) : nil;
+    id color = [colors respondsToSelector:@selector(firstObject)]
+        ? ((id (*)(id, SEL))objc_msgSend)(colors, @selector(firstObject))
+        : nil;
+    SEL cgColorSelector = sel_registerName("cgColor");
+    return color && [color respondsToSelector:cgColorSelector]
+        ? ((CGColorRef (*)(id, SEL))objc_msgSend)(color, cgColorSelector)
+        : NULL;
+}
+
+// IconFoundation resolves each Settings extension's graphic-icon recipe to a
+// real vector glyph plus concrete IFColor values before asking CoreUI to
+// rasterize it. Runtime captures from the stock Appearance recipe showed that
+// the GPU graphic-variant path alternated between an all-black CGImage and a
+// near-white/transparent result when IconServices initialization order was
+// changed, while its source CUINamedVectorGlyph and resolved colors remained
+// valid (black enclosure, white symbol). Recreate that final composition in
+// CoreGraphics for this Settings-only resource class. This consumes
+// IconFoundation's resolved recipe rather than inventing per-pane images or
+// bypassing resource validation.
+static BOOL macws_settings_graphic_variant_geometry(
+    id variant, CGSize size, CGRect *contentRectOut,
+    CGFloat *cornerRadiusFractionOut) {
+    if (!variant || size.width <= 0 || size.height <= 0) return NO;
+    SEL safeAreaSelector = sel_registerName(
+        "_safeContentAreaBoundsForBackgroundSize:");
+    SEL contentRectSelector = sel_registerName(
+        "_scaledContentRectForBackgroundSize:safeContentArea:");
+    if (![variant respondsToSelector:safeAreaSelector] ||
+        ![variant respondsToSelector:contentRectSelector]) return NO;
+
+    // RE-confirmed in CoreUI 13.4 at
+    // -[_CUIGraphicVariantVectorGlyph
+    // rasterizeImageUsingScaleFactor:forTargetSize:] (0x18ef24704): the stock
+    // implementation calls these two selectors, rasterizes its source glyph
+    // at contentRect.size, then composites it into contentRect. Reusing those
+    // methods preserves the recipe invariant instead of approximating insets.
+    CGRect safeArea = ((CGRect (*)(id, SEL, CGSize))objc_msgSend)(
+        variant, safeAreaSelector, size);
+    CGRect contentRect = ((CGRect (*)(id, SEL, CGSize, CGRect))objc_msgSend)(
+        variant, contentRectSelector, size, safeArea);
+    if (!isfinite(contentRect.origin.x) ||
+        !isfinite(contentRect.origin.y) ||
+        !isfinite(contentRect.size.width) ||
+        !isfinite(contentRect.size.height) ||
+        contentRect.size.width <= 0 || contentRect.size.height <= 0 ||
+        CGRectGetMinX(contentRect) < 0 || CGRectGetMinY(contentRect) < 0 ||
+        CGRectGetMaxX(contentRect) > size.width + 0.01 ||
+        CGRectGetMaxY(contentRect) > size.height + 0.01) return NO;
+
+    CGFloat cornerRadiusFraction = 0.225;
+    Ivar optionsIvar = class_getInstanceVariable(
+        object_getClass(variant), "_options");
+    id options = optionsIvar ? object_getIvar(variant, optionsIvar) : nil;
+    SEL cornerSelector = sel_registerName("roundedRectCornerRadius");
+    if (options && [options respondsToSelector:cornerSelector]) {
+        double candidate = ((double (*)(id, SEL))objc_msgSend)(
+            options, cornerSelector);
+        if (isfinite(candidate) && candidate >= 0 && candidate <= 0.5)
+            cornerRadiusFraction = candidate;
+    }
+    if (contentRectOut) *contentRectOut = contentRect;
+    if (cornerRadiusFractionOut)
+        *cornerRadiusFractionOut = cornerRadiusFraction;
+    return YES;
+}
+
+// CoreUI's graphic-variant implementation does not perform a second symbol
+// catalog lookup.  RE-confirmed in Ventura 13.4 CoreUI at
+// -[_CUIGraphicVariantVectorGlyph
+// rasterizeImageUsingScaleFactor:forTargetSize:] +0xb0..+0xd8: it sends the
+// same rasterize selector to `super`, using contentRect.size, and passes that
+// exact CGImage to _createGraphicVariantImageAtScale:... .  Reuse that source
+// object so the inherited vector's imageSize/imageOffset and recipe-specific
+// glyph selection remain intact.  objc_msgSendSuper starts lookup at the
+// supplied class, unlike the compiler-only objc_msgSendSuper2 entry point.
+static CGImageRef macws_copy_settings_graphic_variant_source_image(
+    id graphicVariant, double scale, CGSize targetSize) {
+    if (!graphicVariant || scale <= 0 || targetSize.width <= 0 ||
+        targetSize.height <= 0) return NULL;
+    SEL rasterSelector = sel_registerName(
+        "rasterizeImageUsingScaleFactor:forTargetSize:");
+    Class variantClass = object_getClass(graphicVariant);
+    Class sourceClass = class_getSuperclass(variantClass);
+    if (!sourceClass || !class_getInstanceMethod(sourceClass,
+                                                  rasterSelector))
+        return NULL;
+    struct objc_super superInfo = {
+        .receiver = graphicVariant,
+        .super_class = sourceClass,
+    };
+    id raster = ((id (*)(struct objc_super *, SEL, double, CGSize))
+        objc_msgSendSuper)(&superInfo, rasterSelector, scale, targetSize);
+    if (!raster ||
+        CFGetTypeID((__bridge CFTypeRef)raster) != CGImageGetTypeID())
+        return NULL;
+    // The stock caller releases this result immediately after composing it.
+    // Return an independent reference so the compatibility path has the same
+    // ownership boundary regardless of the private method's annotation.
+    return CGImageRetain((__bridge CGImageRef)raster);
+}
+
+static CGImageRef macws_copy_tinted_settings_image(CGImageRef source,
+                                                    CGColorRef color) {
+    if (!source) return NULL;
+    size_t width = CGImageGetWidth(source);
+    size_t height = CGImageGetHeight(source);
+    if (width == 0 || height == 0 || width > 4096 || height > 4096 ||
+        width > SIZE_MAX / 4) return NULL;
+    size_t rowBytes = width * 4;
+    if (height > SIZE_MAX / rowBytes) return NULL;
+    void *pixels = calloc(height, rowBytes);
+    if (!pixels) return NULL;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = colorSpace ? CGBitmapContextCreate(
+        pixels, width, height, 8, rowBytes, colorSpace,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big) : NULL;
+    if (colorSpace) CGColorSpaceRelease(colorSpace);
+    if (!context) {
+        free(pixels);
+        return NULL;
+    }
+    CGRect bounds = CGRectMake(0, 0, width, height);
+    CGContextDrawImage(context, bounds, source);
+    if (color) {
+        CGContextSetBlendMode(context, kCGBlendModeSourceIn);
+        CGContextSetFillColorWithColor(context, color);
+        CGContextFillRect(context, bounds);
+    }
+    CGImageRef result = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    free(pixels);
+    return result;
+}
+
+static CGImageRef macws_create_settings_graphic_recipe_image(
+    id descriptor, id graphicVariant, CGImageRef backgroundImage,
+    CGImageRef symbolMask, CGSize size, CGRect contentRect,
+    CGFloat cornerRadiusFraction, double scale) {
+    if (!descriptor || !graphicVariant || !symbolMask || size.width <= 0 ||
+        size.height <= 0 || contentRect.size.width <= 0 ||
+        contentRect.size.height <= 0 || scale <= 0) return NULL;
+    size_t width = (size_t)ceil(size.width * scale);
+    size_t height = (size_t)ceil(size.height * scale);
+    if (width == 0 || height == 0 || width > 4096 || height > 4096)
+        return NULL;
+    size_t rowBytes = width * 4;
+    void *pixels = calloc(height, rowBytes);
+    if (!pixels) return NULL;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef context = CGBitmapContextCreate(
+        pixels, width, height, 8, rowBytes, colorSpace,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(colorSpace);
+    if (!context) {
+        free(pixels);
+        return NULL;
+    }
+
+    CGRect bounds = CGRectMake(0, 0, width, height);
+    CGColorRef enclosureColor = macws_settings_resolved_color(
+        descriptor, "resolvedEnclosureColors");
+    if (enclosureColor) {
+        // `_createBackgroundImageOfSize:scale:` is permitted to return a
+        // transparent CI-effect input rather than the final visible shape.
+        // Runtime-confirmed after the first exact-source build: accepting that
+        // non-nil but transparent image removed every colored Settings
+        // enclosure. The descriptor's resolved enclosure color plus CoreUI's
+        // real roundedRectCornerRadius are the already-resolved CPU recipe,
+        // so keep them authoritative when present.
+        CGFloat cornerRadius = fmin(width, height) * cornerRadiusFraction;
+        CGPathRef enclosure = CGPathCreateWithRoundedRect(
+            bounds, cornerRadius, cornerRadius, NULL);
+        CGContextAddPath(context, enclosure);
+        CGContextSetFillColorWithColor(context, enclosureColor);
+        CGContextFillPath(context);
+        CGPathRelease(enclosure);
+    } else if (backgroundImage) {
+        CGImageRef coloredBackground =
+            macws_copy_tinted_settings_image(backgroundImage, NULL);
+        if (coloredBackground) {
+            CGContextDrawImage(context, bounds, coloredBackground);
+            CGImageRelease(coloredBackground);
+        }
+    }
+
+    CGColorRef symbolColor = macws_settings_resolved_color(
+        descriptor, "resolvedSymbolColors");
+    if (!symbolColor) symbolColor = CGColorGetConstantColor(kCGColorWhite);
+    // RE-confirmed in
+    // _createGraphicVariantImageAtScale:... +0xfc..+0x124: CoreUI offsets
+    // the source CIImage by destinationRect.origin * rasterScale and then
+    // composites it at its natural extent.  It does not resize the already
+    // rasterized symbol to a rounded destination rectangle.  The previous
+    // rounded draw both discarded fractional placement and resampled some
+    // non-integral glyph extents, producing visibly cut/tangent silhouettes.
+    size_t symbolWidth = CGImageGetWidth(symbolMask);
+    size_t symbolHeight = CGImageGetHeight(symbolMask);
+    CGImageRef coloredSymbol = macws_copy_tinted_settings_image(
+        symbolMask, symbolColor);
+    if (coloredSymbol && symbolWidth > 0 && symbolHeight > 0) {
+        CGRect symbolBounds = CGRectMake(
+            contentRect.origin.x * scale,
+            contentRect.origin.y * scale,
+            symbolWidth, symbolHeight);
+        CGContextDrawImage(context, symbolBounds, coloredSymbol);
+        CGImageRelease(coloredSymbol);
+    }
+
+    CGImageRef result = CGBitmapContextCreateImage(context);
+    CGContextRelease(context);
+    free(pixels);
+    return result;
+}
 
 static id macws_settings_symbol_image(id self, SEL selector,
                                       CGSize size, double scale) {
-    id image = g_macws_orig_settings_symbol_image
-        ? g_macws_orig_settings_symbol_image(self, selector, size, scale)
-        : nil;
     // IFSymbol's source-glyph lookup may consult another
     // ISGraphicSymbolResource.  Let that nested lookup use Apple's original
     // result; only the outer request owns the compatibility rasterization.
-    if (g_macws_rendering_settings_symbol) return image;
-    SEL cgImageSelector = sel_registerName("CGImage");
-    void *originalCGImage = image &&
-            [image respondsToSelector:cgImageSelector]
-        ? ((void *(*)(id, SEL))objc_msgSend)(image, cgImageSelector)
-        : NULL;
-    // Runtime-confirmed on iOS 16.3/macOS 13.4: the stock method can return
-    // a non-nil ISImage whose CGImage is nil after CoreUI's private graphic-
-    // variant rasterizer fails.  Treat that object as a failed render, while
-    // preserving every original image that actually owns displayable pixels.
-    if (image && originalCGImage) {
-        return image;
+    if (g_macws_rendering_settings_symbol) {
+        return g_macws_orig_settings_symbol_image
+            ? g_macws_orig_settings_symbol_image(
+                  self, selector, size, scale) : nil;
     }
+    g_macws_rendering_settings_symbol = YES;
+    if (g_macws_captured_settings_graphic_variant) {
+        CFRelease(g_macws_captured_settings_graphic_variant);
+        g_macws_captured_settings_graphic_variant = NULL;
+    }
+    g_macws_capturing_settings_graphic_variant = YES;
+    id image = g_macws_orig_settings_symbol_image
+        ? g_macws_orig_settings_symbol_image(self, selector, size, scale)
+        : nil;
+    g_macws_capturing_settings_graphic_variant = NO;
+    id graphicVariant = (__bridge id)
+        g_macws_captured_settings_graphic_variant;
+    SEL cgImageSelector = sel_registerName("CGImage");
     if (!self) {
+        if (g_macws_captured_settings_graphic_variant) {
+            CFRelease(g_macws_captured_settings_graphic_variant);
+            g_macws_captured_settings_graphic_variant = NULL;
+        }
+        g_macws_rendering_settings_symbol = NO;
         return image;
     }
 
+    do {
     id descriptor = nil;
     id symbolName = nil;
     Ivar descriptorIvar = class_getInstanceVariable(
@@ -3054,11 +3307,12 @@ static id macws_settings_symbol_image(id self, SEL selector,
     descriptor = descriptorIvar ? object_getIvar(self, descriptorIvar) : nil;
     symbolName = symbolNameIvar ? object_getIvar(self, symbolNameIvar) : nil;
     Class symbolClass = objc_getClass("IFSymbol");
-    if (!descriptor || !symbolName || !symbolClass) {
-        return nil;
-    }
-
-    g_macws_rendering_settings_symbol = YES;
+    CGRect contentRect = CGRectZero;
+    CGFloat cornerRadiusFraction = 0;
+    if (!descriptor || !symbolName || !symbolClass ||
+        !macws_settings_graphic_variant_geometry(
+            graphicVariant, size, &contentRect,
+            &cornerRadiusFraction)) break;
 
     SEL namedGlyphSelector = sel_registerName(
         "namedVectorGlyphWithName:scaleFactor:deviceIdiom:layoutDirection:"
@@ -3096,11 +3350,14 @@ static id macws_settings_symbol_image(id self, SEL selector,
     SEL rasterSelector = sel_registerName(
         "rasterizeImageUsingScaleFactor:forTargetSize:");
     if (!vectorGlyph || ![vectorGlyph respondsToSelector:rasterSelector]) {
-        g_macws_rendering_settings_symbol = NO;
-        return nil;
+        break;
     }
-    id raster = ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
-        vectorGlyph, rasterSelector, scale, size);
+    CGImageRef exactVariantSource =
+        macws_copy_settings_graphic_variant_source_image(
+            graphicVariant, scale, contentRect.size);
+    id raster = exactVariantSource ? (__bridge id)exactVariantSource :
+        ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
+            vectorGlyph, rasterSelector, scale, contentRect.size);
     // CUINamedVectorGlyph's rasterizer returns a CGImageRef directly on the
     // Ventura 13.4 runtime (runtime probe class=__NSCFType and
     // CFGetTypeID==CGImageGetTypeID), not an Objective-C wrapper exposing a
@@ -3111,6 +3368,19 @@ static id macws_settings_symbol_image(id self, SEL selector,
         : raster && [raster respondsToSelector:cgImageSelector]
             ? ((void *(*)(id, SEL))objc_msgSend)(raster, cgImageSelector)
             : NULL;
+    SEL backgroundSelector = sel_registerName(
+        "_createBackgroundImageOfSize:scale:");
+    CGImageRef backgroundImage =
+        [graphicVariant respondsToSelector:backgroundSelector]
+        ? ((CGImageRef (*)(id, SEL, CGSize, double))objc_msgSend)(
+              graphicVariant, backgroundSelector, size, scale)
+        : NULL;
+    CGImageRef recipeImage = macws_create_settings_graphic_recipe_image(
+        descriptor, graphicVariant, backgroundImage, (CGImageRef)cgImage,
+        size, contentRect, cornerRadiusFraction, scale);
+    if (backgroundImage) CGImageRelease(backgroundImage);
+    if (exactVariantSource) CGImageRelease(exactVariantSource);
+    if (recipeImage) cgImage = recipeImage;
     Class imageClass = objc_getClass("IFImage");
     SEL imageInitializer = sel_registerName("initWithCGImage:scale:");
     id fallback = imageClass && cgImage
@@ -3118,14 +3388,90 @@ static id macws_settings_symbol_image(id self, SEL selector,
               ((id (*)(id, SEL))objc_msgSend)(imageClass, @selector(alloc)),
               imageInitializer, cgImage, scale)
         : nil;
-    g_macws_rendering_settings_symbol = NO;
+    if (recipeImage) CGImageRelease(recipeImage);
     if (fallback && macws_runtime_diagnostics_enabled()) {
         fprintf(stderr,
-                "#### MACWS SETTINGS symbol raster fallback name=%s "
-                "size=%.1fx%.1f scale=%.1f\n",
-                [symbolName UTF8String], size.width, size.height, scale);
+                "#### MACWS SETTINGS CoreGraphics recipe name=%s "
+                "size=%.1fx%.1f content=(%.2f,%.2f %.2fx%.2f) "
+                "corner=%.3f scale=%.1f\n",
+                [symbolName UTF8String], size.width, size.height,
+                contentRect.origin.x, contentRect.origin.y,
+                contentRect.size.width, contentRect.size.height,
+                cornerRadiusFraction, scale);
     }
-    return fallback;
+    if (fallback) image = fallback;
+    } while (0);
+
+    if (g_macws_captured_settings_graphic_variant) {
+        CFRelease(g_macws_captured_settings_graphic_variant);
+        g_macws_captured_settings_graphic_variant = NULL;
+    }
+    g_macws_rendering_settings_symbol = NO;
+    return image;
+}
+
+static id macws_settings_concrete_icon_image(id self, SEL selector,
+                                              id imageDescriptor) {
+    id image = g_macws_orig_settings_concrete_icon_image
+        ? g_macws_orig_settings_concrete_icon_image(
+              self, selector, imageDescriptor) : nil;
+    if (g_macws_rendering_settings_concrete_icon || !self ||
+        !imageDescriptor) return image;
+    g_macws_rendering_settings_concrete_icon = YES;
+
+    SEL providerSelector = sel_registerName("makeSymbolResourceProvider");
+    id provider = [self respondsToSelector:providerSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(self, providerSelector) : nil;
+    SEL supportsSelector = sel_registerName("supportsGraphicIcons");
+    BOOL supportsGraphic = provider &&
+        [provider respondsToSelector:supportsSelector] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(provider, supportsSelector);
+    if (supportsGraphic && [provider respondsToSelector:
+            sel_registerName("resolveResources")]) {
+        ((void (*)(id, SEL))objc_msgSend)(
+            provider, sel_registerName("resolveResources"));
+    }
+    id resource = supportsGraphic && [provider respondsToSelector:
+            sel_registerName("iconResource")]
+        ? ((id (*)(id, SEL))objc_msgSend)(
+              provider, sel_registerName("iconResource")) : nil;
+
+    CGSize size = CGSizeMake(32.0, 32.0);
+    SEL sizeSelector = sel_registerName("size");
+    Method sizeMethod = class_getInstanceMethod(
+        object_getClass(imageDescriptor), sizeSelector);
+    const char *sizeTypes = sizeMethod ? method_getTypeEncoding(sizeMethod)
+                                       : NULL;
+    if (sizeTypes && sizeTypes[0] == '{') {
+        CGSize candidate = ((CGSize (*)(id, SEL))objc_msgSend)(
+            imageDescriptor, sizeSelector);
+        if (candidate.width > 0 && candidate.height > 0)
+            size = candidate;
+    }
+    double scale = [imageDescriptor respondsToSelector:
+            sel_registerName("scale")]
+        ? ((double (*)(id, SEL))objc_msgSend)(
+              imageDescriptor, sel_registerName("scale")) : 2.0;
+    if (scale <= 0 || scale > 8.0) scale = 2.0;
+    id replacement = resource && [resource respondsToSelector:
+            sel_registerName("imageForSize:scale:")]
+        ? ((id (*)(id, SEL, CGSize, double))objc_msgSend)(
+              resource, sel_registerName("imageForSize:scale:"), size, scale)
+        : nil;
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS SETTINGS concrete icon class=%s descriptor=%s "
+                "provider=%s graphic=%d resource=%s replacement=%s "
+                "size=%.1fx%.1f scale=%.1f\n",
+                object_getClassName(self), object_getClassName(imageDescriptor),
+                provider ? object_getClassName(provider) : "nil",
+                supportsGraphic, resource ? object_getClassName(resource) : "nil",
+                replacement ? object_getClassName(replacement) : "nil",
+                size.width, size.height, scale);
+        fflush(stderr);
+    }
+    g_macws_rendering_settings_concrete_icon = NO;
+    return replacement ?: image;
 }
 
 static void macws_install_settings_symbol_raster_compatibility(void) {
@@ -3135,6 +3481,15 @@ static void macws_install_settings_symbol_raster_compatibility(void) {
     Method method = resourceClass
         ? class_getInstanceMethod(resourceClass, selector) : NULL;
     if (!method || g_macws_orig_settings_symbol_image) return;
+    Class vectorGlyphClass = objc_getClass("CUINamedVectorGlyph");
+    SEL variantSelector = sel_registerName("graphicVariantWithOptions:");
+    Method variantMethod = vectorGlyphClass
+        ? class_getInstanceMethod(vectorGlyphClass, variantSelector) : NULL;
+    if (variantMethod && !g_macws_orig_graphic_variant_with_options) {
+        g_macws_orig_graphic_variant_with_options =
+            (id (*)(id, SEL, id))method_setImplementation(
+                variantMethod, (IMP)macws_graphic_variant_with_options);
+    }
     Class symbolClass = objc_getClass("IFSymbol");
     const SEL privateCatalogSelector =
         sel_registerName("coreGlyphsPrivateCatalog");
@@ -3154,6 +3509,40 @@ static void macws_install_settings_symbol_raster_compatibility(void) {
     g_macws_orig_settings_symbol_image =
         (id (*)(id, SEL, CGSize, double))method_setImplementation(
             method, (IMP)macws_settings_symbol_image);
+    Class concreteIconClass = objc_getClass("ISConcreteIcon");
+    SEL concreteSelector = sel_registerName("imageForDescriptor:");
+    Method concreteMethod = concreteIconClass
+        ? class_getInstanceMethod(concreteIconClass, concreteSelector) : NULL;
+    if (concreteMethod && !g_macws_orig_settings_concrete_icon_image) {
+        g_macws_orig_settings_concrete_icon_image =
+            (id (*)(id, SEL, id))method_setImplementation(
+                concreteMethod, (IMP)macws_settings_concrete_icon_image);
+    }
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS SETTINGS graphic recipe hook installed class=%s "
+                "original=%p concrete=%p variant=%p\n",
+                class_getName(resourceClass),
+                g_macws_orig_settings_symbol_image,
+                g_macws_orig_settings_concrete_icon_image,
+                g_macws_orig_graphic_variant_with_options);
+        fflush(stderr);
+    }
+}
+
+static void macws_load_settings_icon_services(void) {
+    if (!macws_process_needs_settings_symbol_raster() ||
+        g_macws_settings_icon_services) return;
+    g_macws_settings_icon_services = dlopen(
+        "/System/Library/PrivateFrameworks/IconServices.framework/"
+        "IconServices", RTLD_NOW | RTLD_LOCAL);
+    if (macws_runtime_diagnostics_enabled()) {
+        fprintf(stderr,
+                "#### MACWS SETTINGS IconServices preload handle=%p error=%s\n",
+                g_macws_settings_icon_services,
+                g_macws_settings_icon_services ? "none" : (dlerror() ?: "?"));
+        fflush(stderr);
+    }
 }
 
 static void macws_schedule_settings_symbol_raster_compatibility(void) {
@@ -9126,9 +9515,11 @@ __attribute__((constructor)) void InitStuff() {
 
     _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))loadImageCallback);
 
-    // IconServices is part of System Settings' initial dyld closure.  Install
-    // synchronously here: its SwiftUI sidebar requests every image before the
-    // first main-queue turn, so an async-only install observes no calls.
+    // System Settings requests every sidebar image before the first main-queue
+    // turn. Force its already-declared IconServices dependency to realize its
+    // Objective-C classes, then install synchronously; an async-only install
+    // observes the completed first render and cannot repair cached icons.
+    macws_load_settings_icon_services();
     macws_install_settings_symbol_raster_compatibility();
     macws_schedule_settings_symbol_raster_compatibility();
 

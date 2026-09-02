@@ -219,7 +219,7 @@ CFPREFSD_BIN=/usr/local/libexec/macws-cfprefsd
 DEFAULTS_BIN=/usr/bin/defaults
 LSREGISTER_BIN=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 WORKSPACECTL_BIN=/usr/local/bin/macwsworkspacectl
-LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v2
+LAUNCHSERVICES_CATALOG_SCHEMA=macws-launchservices-catalog-v3
 LAUNCHSERVICES_CATALOG_MARKER="$ROOTFS/var/db/macws/launchservices-catalog.ready"
 LSD_SESSION_USER_DIR=/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/0/macws-lsd-session/
 LAUNCHSERVICES_VERIFY_LOG="$LOGDIR/launchservices-catalog-verify.log"
@@ -1335,8 +1335,53 @@ BOOT_TRUSTCACHE_ADDED=0
 APPLICATION_TRUST_BOOT_MARKER="$LOGDIR/macws-application-trust.boot-ready"
 APPLICATION_TRUST_PROGRESS="$LOGDIR/macws-application-trust.progress"
 APPLICATION_TRUST_CLOSURE_VERSION=3
+BASE_TRUST_BOOT_MARKER="$LOGDIR/macws-base-trust.boot-ready"
+BASE_TRUST_CLOSURE_VERSION=1
+BASE_TRUST_READY=0
 WINDOWING_READY_WITNESS=/var/mobile/Library/Preferences/com.macwsguide.dense-grid.loaded
 WINDOWING_REQUIRED_VERSION=16
+WINDOWING_TWEAK=/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
+WINDOWING_VALIDATED_CACHE=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.dylib
+WINDOWING_VALIDATED_SHA=/var/jb/var/mobile/macws-cross-build/MacWSWindowing.sha256
+
+# SpringBoard cannot publish the observer witness unless its arm64e tweak is
+# physically present when the process starts.  The package database can still
+# claim ownership after that file has disappeared: runtime on 2026-08-30 had a
+# live SpringBoard pid=5322, no dense-grid witness, and dpkg listed the dylib
+# while the packaged MobileSubstrate MacWSWindowing image did not exist. The
+# macOS-linked artifact cache is produced by deploy_macwswindowing.sh only
+# after its authenticated __cfstring fixups pass dyld_info validation.  Recover
+# a missing installed copy from that exact content-addressed artifact before
+# restarting SpringBoard; never substitute an on-device-linked image.
+restore_windowing_bridge_binary() {
+    local expected_hash="" cached_hash="" temporary=""
+    [ -s "$WINDOWING_TWEAK" ] && return 0
+    if [ ! -s "$WINDOWING_VALIDATED_CACHE" ] ||
+       [ ! -s "$WINDOWING_VALIDATED_SHA" ]; then
+        log "ERROR: MacWSWindowing is missing and no validated cross-build cache is available."
+        return 1
+    fi
+    expected_hash=$(awk 'NR == 1 { print $1; exit }' \
+        "$WINDOWING_VALIDATED_SHA" 2>/dev/null)
+    cached_hash=$(sha256sum "$WINDOWING_VALIDATED_CACHE" 2>/dev/null |
+        awk 'NR == 1 { print $1; exit }')
+    if [ -z "$expected_hash" ] || [ "$cached_hash" != "$expected_hash" ]; then
+        log "ERROR: MacWSWindowing validated cache failed its SHA-256 invariant."
+        return 1
+    fi
+    temporary="${WINDOWING_TWEAK}.restore.$$"
+    rm -f "$temporary"
+    if ! cp "$WINDOWING_VALIDATED_CACHE" "$temporary" ||
+       ! chown root:wheel "$temporary" ||
+       ! chmod 0755 "$temporary" ||
+       ! ldid -h "$temporary" >/dev/null 2>&1 ||
+       ! mv -f "$temporary" "$WINDOWING_TWEAK"; then
+        rm -f "$temporary"
+        log "ERROR: failed to restore the validated MacWSWindowing image."
+        return 1
+    fi
+    log "Restored missing MacWSWindowing from validated cache (sha256=$cached_hash)."
+}
 
 current_springboard_pid() {
     ps ax -o pid=,command= 2>/dev/null | awk \
@@ -1370,6 +1415,7 @@ windowing_bridge_ready() {
 # once after an upgrade; reopening macPad needs no terminal command.
 ensure_windowing_bridge() {
     local old_pid="" waited=0 new_pid="" witness_pid=""
+    restore_windowing_bridge_binary || return 1
     if windowing_bridge_ready; then
         log "iPad windowing bridge ready for the current SpringBoard generation."
         return 0
@@ -1534,6 +1580,37 @@ boot_session_identifier() {
         /var/jb/usr/bin/sed -n 's/.*sec = \([0-9][0-9]*\).*/sec=\1/p'
 }
 
+# The dynamic trustcache is monotonic for one iPad boot: project code can add
+# entries, but an existing entry disappears only when XNU creates the next
+# boot session.  Re-reading the complete jbctl dump and re-hashing roughly 50
+# unchanged binaries cost 23 seconds on the 2026-09-02 warm-start trace.  Bind
+# a reusable success witness to both the boot ID and the four project-owned
+# images that can actually change between package/FAST deployments.  A changed
+# dylib invalidates the witness naturally; a reboot changes the first field.
+base_trust_marker_value() {
+    local boot_id="" path="" arch="" hash="" value=""
+    boot_id=$(boot_session_identifier) || return 1
+    [ -n "$boot_id" ] || return 1
+    value="v${BASE_TRUST_CLOSURE_VERSION}:${boot_id}"
+    for path in \
+        /var/jb/usr/macOS/bin/launchdchrootexec \
+        /var/jb/usr/macOS/lib/libmachook.dylib \
+        /var/jb/usr/macOS/lib/libmachook_arm64.dylib \
+        "$ROOTFS$CFPREFSD_BIN" \
+        "$VSCODE_TRUST_SENTINEL"; do
+        [ -f "$path" ] || { value="$value|absent"; continue; }
+        hash=""
+        for arch in arm64 arm64e; do
+            hash=$(/var/jb/usr/bin/ldid -arch "$arch" -h "$path" 2>/dev/null |
+                /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
+            [ -z "$hash" ] || break
+        done
+        [ -n "$hash" ] || return 1
+        value="$value|$hash"
+    done
+    printf '%s' "$value"
+}
+
 # Restore the dependency closure of every already-signed third-party app once
 # per iPad boot.  Include Steam's updater-owned live bundle: unlike a normal
 # application it lives below ~/Library/Application Support rather than
@@ -1648,7 +1725,17 @@ restore_installed_application_trust() {
 }
 
 restore_cold_boot_trust() {
-    local path=""
+    local path="" marker_expected="" marker_tmp=""
+    BASE_TRUST_READY=0
+    marker_expected=$(base_trust_marker_value 2>/dev/null || true)
+    if [ -n "$marker_expected" ] && [ -f "$BASE_TRUST_BOOT_MARKER" ] &&
+       [ "$(sed -n '1p' "$BASE_TRUST_BOOT_MARKER" 2>/dev/null)" = \
+         "$marker_expected" ]; then
+        BASE_TRUST_READY=1
+        restore_installed_application_trust || return 1
+        log "Base executable trust closure reused for this iPad boot."
+        return 0
+    fi
     BOOT_TRUSTCACHE_INFO=$(/var/jb/usr/bin/jbctl trustcache info 2>/dev/null || true)
     BOOT_TRUSTCACHE_ADDED=0
 
@@ -1707,6 +1794,13 @@ restore_cold_boot_trust() {
     done
 
     restore_installed_application_trust || return 1
+    if [ -n "$marker_expected" ]; then
+        marker_tmp="${BASE_TRUST_BOOT_MARKER}.new.$$"
+        printf '%s\n' "$marker_expected" > "$marker_tmp" || return 1
+        chmod 0644 "$marker_tmp" || return 1
+        mv -f "$marker_tmp" "$BASE_TRUST_BOOT_MARKER" || return 1
+    fi
+    BASE_TRUST_READY=1
     log "Cold-boot trust closure ready (registered=$BOOT_TRUSTCACHE_ADDED existing CodeDirectories)."
 }
 
@@ -1753,7 +1847,8 @@ vscode_bundle_trusted() {
     hash=$(/var/jb/usr/bin/ldid -arch arm64 -h "$VSCODE_TRUST_SENTINEL" 2>/dev/null |
         /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
     [ -n "$hash" ] || return 1
-    /var/jb/usr/bin/jbctl trustcache info 2>/dev/null |
+    [ "$BASE_TRUST_READY" = 1 ] && return 0
+    printf '%s\n' "$BOOT_TRUSTCACHE_INFO" |
         /var/jb/usr/bin/grep -Fqi "$hash"
 }
 
@@ -1772,7 +1867,8 @@ macos_cfprefsd_trusted() {
     hash=$(/var/jb/usr/bin/ldid -arch arm64e -h "$binary" 2>/dev/null |
         /var/jb/usr/bin/grep 'CDHash=' | /var/jb/usr/bin/cut -c8-)
     [ -n "$hash" ] || return 1
-    /var/jb/usr/bin/jbctl trustcache info 2>/dev/null |
+    [ "$BASE_TRUST_READY" = 1 ] && return 0
+    printf '%s\n' "$BOOT_TRUSTCACHE_INFO" |
         /var/jb/usr/bin/grep -Fqi "$hash"
 }
 
@@ -2783,7 +2879,8 @@ production_preflight() {
         for key in MACWS_JIT_MPROTECT_COMPAT \
                    MACWS_JIT_FAULT_WRITE_COMPAT \
                    MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT \
-                   MACWS_MACOS_SYSTEM_POLICY_COMPAT; do
+                   MACWS_MACOS_SYSTEM_POLICY_COMPAT \
+                   MACWS_APP_MOUNT_COMPAT; do
             if ! plutil "$VSCODE_PLIST" 2>/dev/null |
                  grep -Eq "\"?$key\"?[[:space:]]*=[[:space:]]*1;"; then
                 log "ERROR: required VS Code production environment $key=1 missing from $VSCODE_PLIST"
@@ -2981,52 +3078,51 @@ mode_exclusive() {
 }
 
 launchservices_source_fingerprint() {
-    local manifest="$ROOTFS/private/tmp/macws-launchservices-source.$$"
-    local root="" bundle="" info="" checksum=""
-    {
-        printf '%s\n' "$LAUNCHSERVICES_CATALOG_SCHEMA"
-        for root in \
-            "$ROOTFS/System/Applications" \
-            "$ROOTFS/Applications" \
-            "$ROOTFS/Users/root/Applications" \
-            "$ROOTFS/System/Library/CoreServices"; do
-            [ -d "$root" ] || continue
-            find "$root" -type d -name '*.app' -prune -print 2>/dev/null
-        done | sort | while IFS= read -r bundle; do
-            info="$bundle/Contents/Info.plist"
-            printf '%s|' "${bundle#$ROOTFS}"
-            if [ -f "$info" ]; then
-                checksum=$(cksum "$info" 2>/dev/null) || checksum=unreadable
-                printf '%s\n' "$checksum"
-            else
-                printf '%s\n' missing-info
-            fi
-        done
-        root="$ROOTFS/System/Library/ExtensionKit/Extensions"
-        if [ -d "$root" ]; then
-            find "$root" -type d -name '*.appex' -prune -print 2>/dev/null |
-                sort | while IFS= read -r bundle; do
-                    info="$bundle/Contents/Info.plist"
-                    printf '%s|' "${bundle#$ROOTFS}"
-                    if [ -f "$info" ]; then
-                        checksum=$(cksum "$info" 2>/dev/null) ||
-                            checksum=unreadable
-                        printf '%s\n' "$checksum"
-                    else
-                        printf '%s\n' missing-info
-                    fi
-                done
-        fi
-        info="$ROOTFS/System/Library/CoreServices/SystemVersion.plist"
-        [ ! -f "$info" ] || cksum "$info" 2>/dev/null
-    } > "$manifest" || {
-        rm -f "$manifest"
-        return 1
-    }
-    checksum=$(cksum "$manifest" 2>/dev/null | awk '{print $1 ":" $2}')
-    rm -f "$manifest"
-    [ -n "$checksum" ] || return 1
-    printf '%s' "$checksum"
+    # The v2 implementation spawned one `cksum` process for every discovered
+    # Info.plist. On the target's 193 applications plus 48 Settings extensions,
+    # the process-creation overhead consumed a large part of the 29-second
+    # catalog stage even though the files are small. One bounded Python walk
+    # preserves the stronger content fingerprint while hashing every record in
+    # one process. App/appex directories are pruned exactly like `find -prune`,
+    # so embedded bundles cannot change the catalog membership accidentally.
+    /var/jb/usr/bin/python3 -c '
+import hashlib, os, sys
+
+rootfs, schema = sys.argv[1:3]
+roots = [
+    ("/System/Applications", ".app"),
+    ("/Applications", ".app"),
+    ("/Users/root/Applications", ".app"),
+    ("/System/Library/CoreServices", ".app"),
+    ("/System/Library/ExtensionKit/Extensions", ".appex"),
+]
+records = []
+for visible_root, suffix in roots:
+    host_root = rootfs + visible_root
+    if not os.path.isdir(host_root):
+        continue
+    for base, directories, _ in os.walk(host_root):
+        matches = [name for name in directories if name.endswith(suffix)]
+        for name in matches:
+            bundle = os.path.join(base, name)
+            records.append((bundle[len(rootfs):],
+                            os.path.join(bundle, "Contents", "Info.plist")))
+        directories[:] = [name for name in directories
+                          if not name.endswith(suffix)]
+
+system_version = rootfs + "/System/Library/CoreServices/SystemVersion.plist"
+records.append(("@SystemVersion", system_version))
+digest = hashlib.sha256(schema.encode("utf-8") + b"\0")
+for visible, info in sorted(records):
+    digest.update(os.fsencode(visible) + b"\0")
+    try:
+        with open(info, "rb") as stream:
+            payload = stream.read()
+    except OSError:
+        payload = b"<missing>"
+    digest.update(str(len(payload)).encode("ascii") + b"\0" + payload + b"\n")
+print(digest.hexdigest())
+' "$ROOTFS" "$LAUNCHSERVICES_CATALOG_SCHEMA"
 }
 
 seed_launchservices_database() {
@@ -3215,19 +3311,14 @@ prepare_settings_service_proxies() {
         chown root:wheel "$proxy" || return 1
         chmod 4755 "$proxy" || return 1
     done
-    for proxy in \
-        /var/jb/Applications/MacWSSettingsExtension-com.apple.*.app/SettingsExtensionProxy; do
-        [ -x "$proxy" ] || continue
-        chown root:wheel "$proxy" || return 1
-        chmod 4755 "$proxy" || return 1
-    done
-
     # The generic ViewBridge/ExtensionKit/HIServices contracts are desktop
     # dependencies, but the 48 per-pane iOS carrier binaries are not.  Keep
     # this startup path limited to the service proxies it is about to publish.
     # System Settings performs the full pane reconciliation through hostd at
-    # its own launch boundary, where success is still required before the app
-    # can start.
+    # its own launch boundary, where the verifier requires every carrier to be
+    # executable and setuid before the app can start. Re-running chown+chmod as
+    # 96 separate processes here cost 2.11 seconds on the 2026-09-02 warm-start
+    # trace even though none of those binaries participates in desktop launch.
     if [ ! -f "$SETTINGS_EXTENSIONS_RUNTIME" ]; then
         log "ERROR: Settings ExtensionKit runtime helper is missing."
         return 1
@@ -4779,6 +4870,40 @@ case "$CMD" in
         ensure_windowing_bridge || exit 1
         write_gui_start_state preparing "generating launchd contracts"
         write_plists || { log "ERROR: failed to write GUI launch plists."; exit 1; }
+        # A desktop restart does not require destroying the persistent
+        # LaunchServices/CFPreferences/IconServices stores. When the complete
+        # live-session prerequisite set exists and the requested display mode
+        # matches it, replace only WindowServer and its connection-bound
+        # clients. The routine below retains the same PID, input-socket and
+        # two-consecutive-final-composite postconditions as the recovery path.
+        # A failed fast transaction falls through to the authoritative full
+        # stop/start below, so this changes latency rather than correctness.
+        restart_ws=$(ws_pid)
+        restart_mode_matches=0
+        if { [ "$MODE" = coexist ] && [ -f "$FLAG" ]; } ||
+           { [ "$MODE" = exclusive ] && [ ! -f "$FLAG" ]; }; then
+            restart_mode_matches=1
+        fi
+        case "$restart_ws" in
+            ''|'-'|*[!0-9]*) restart_live=0 ;;
+            *) restart_live=1 ;;
+        esac
+        if [ "$restart_live" = 1 ] && [ "$restart_mode_matches" = 1 ] &&
+           [ "$WANT_EXPERIMENTAL" = 1 ] &&
+           proc_running "$P_INPUTD" && proc_running "$P_DISPLAYD" &&
+           desktop_job_loaded "$WATCHDOG_LABEL"; then
+            enable_experimental_if_requested
+            write_gui_start_state desktop-session-rebuild \
+                "replacing only WindowServer and its connection-bound clients"
+            if rebuild_desktop_session; then
+                write_gui_start_state ready \
+                    "replacement WindowServer, desktop input and final composite are ready"
+                log "Restarted the live $MODE desktop through the minimal session path."
+                status
+                exit 0
+            fi
+            log "Minimal desktop restart failed its postconditions; falling back to a full service generation."
+        fi
         write_gui_start_state cleaning "retiring the active GUI service generation"
         stop_all
         write_gui_start_state assets "preparing the production application profile"

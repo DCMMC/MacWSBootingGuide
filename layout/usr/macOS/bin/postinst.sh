@@ -10,7 +10,8 @@ ROOTFS=/var/mnt/rootfs
 
 # Invalidate the same-bootsession Settings ExtensionKit verification cache
 # before an installation can replace any of its signed runtime dependencies.
-rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
+rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready \
+      /var/jb/var/mobile/macws-base-trust.boot-ready
 # The repair mutates project and system-app runtime, not the signed
 # third-party bundles under /Applications. It registers every CodeDirectory it
 # does change below, so invalidating the independent application-trust marker
@@ -36,6 +37,7 @@ ASPHALT_CA_BUNDLE="/var/mnt/rootfs/usr/local/ssl/cert.pem"
 ASPHALT_OPENSSL_CONFIG_DEST="/var/mnt/rootfs/usr/local/ssl/openssl.cnf"
 
 MACHO_PATCHER="/var/jb/usr/macOS/bin/set_macos_version.py"
+OBJC_TRAMPOLINE_PATCHER="/var/jb/usr/macOS/bin/ensure_objc_trampolines_arm64.py"
 LIBMACHOOK="/var/jb/usr/macOS/lib/libmachook.dylib"
 LIBMACHOOK_ARM64="/var/jb/usr/macOS/lib/libmachook_arm64.dylib"
 LIPO="/var/jb/usr/bin/lipo"
@@ -593,7 +595,7 @@ fi
 # Keep package-install and App-driven repair on one exact supervision path.
 # This prevents one blocked daemon from being leaked for each install while
 # retaining the reboot-volatile trustcache repair required by the first exec.
-bash /var/jb/usr/macOS/bin/restart_autosignd.sh || exit 1
+bash /var/jb/usr/macOS/bin/restart_autosignd.sh --force || exit 1
 
 # ─── iOS-native IOSurface allocator daemon (for chroot WS CodeHeap) ─────────
 # Chroot WS in AGX-native mode can't allocate via sel=0xa heap-creates (kernel
@@ -988,6 +990,31 @@ ensure_project_signature_and_trustcache \
 # every post-reboot repair.
 ensure_project_signature_and_trustcache \
     '/var/mnt/rootfs/System/Library/Frameworks/ApplicationServices.framework/Frameworks/ATS.framework/Support/fontd' || exit 1
+# Ventura ships libobjc-trampolines without an ARM64/ALL slice even though the
+# WindowServer executable in this rootfs is ARM64/ALL.  libobjc lazily dlopens
+# this file at the first imp_implementationWithBlock call.  Runtime-confirmed
+# after the 2026-09-02 iPad reboot: every WindowServer generation aborted in
+# TrampolinePointerWrapper::Initialize with
+#   have 'x86_64,x86_64h,arm64e', need 'arm64'
+# before graphics-ready.  Add the architecture the real caller requires,
+# preserve ARM64/E for ordinary Ventura processes, then re-sign the structurally
+# changed universal file before registering all of its CodeDirectories.
+OBJC_TRAMPOLINES='/var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib'
+if [ -f "$OBJC_TRAMPOLINES" ] && [ -f "$OBJC_TRAMPOLINE_PATCHER" ]; then
+    if ! /var/jb/usr/bin/python3 "$OBJC_TRAMPOLINE_PATCHER" \
+            --check "$OBJC_TRAMPOLINES" >/dev/null 2>&1; then
+        OBJC_TRAMPOLINES_BACKUP="${OBJC_TRAMPOLINES}.pre-macws-arm64"
+        [ -e "$OBJC_TRAMPOLINES_BACKUP" ] ||
+            cp -p "$OBJC_TRAMPOLINES" "$OBJC_TRAMPOLINES_BACKUP" || exit 1
+        /var/jb/usr/bin/python3 "$OBJC_TRAMPOLINE_PATCHER" \
+            "$OBJC_TRAMPOLINES" || exit 1
+        # The appended slice begins as a byte-for-byte ARM64/E copy with only
+        # its Mach subtype corrected.  Re-sign twice so the final CodeDirectory
+        # covers ldid's settled __LINKEDIT layout for every fat slice.
+        /var/jb/usr/bin/ldid -S "$OBJC_TRAMPOLINES" || exit 1
+        /var/jb/usr/bin/ldid -S "$OBJC_TRAMPOLINES" || exit 1
+    fi
+fi
 add_all_trustcache /var/mnt/rootfs/usr/lib/libobjc-trampolines.dylib
 add_all_trustcache /var/mnt/rootfs/usr/lib/dyld
 add_all_trustcache /var/mnt/rootfs/bin/ps

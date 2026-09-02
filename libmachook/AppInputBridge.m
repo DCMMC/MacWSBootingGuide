@@ -233,6 +233,7 @@ static BOOL MacWSExactSystemPointerActive;
 static uint32_t MacWSExactSystemPointerContact;
 static uint32_t MacWSExactSystemPointerWindow;
 static CGRect MacWSExactSystemPointerMappingFrame;
+static NSString *MacWSRuntimeString(const char *utf8);
 
 static BOOL MacWSRuntimeDiagnosticsEnabled(void) {
     static _Atomic int cached = -1;
@@ -264,7 +265,14 @@ static BOOL MacWSMainBundleUsesQueuedGameInput(void) {
     int value = atomic_load_explicit(&cached, memory_order_acquire);
     if (value < 0) {
         NSString *identifier = [[NSBundle mainBundle] bundleIdentifier];
-        value = [identifier isEqualToString:@"com.annapurnainteractive.Stray"];
+        // Never message an Objective-C constant string emitted by this
+        // injected arm64e image.  Runtime LLDB on Terminal pid 61544 stopped
+        // the first key-down in -[__NSCFString isEqualToString:] with a PAC
+        // failure and this literal in x2.  Construct the comparison object
+        // through the target process's realized NSString class, like every
+        // other bundle-identity check in this bridge.
+        value = [identifier isEqualToString:
+            MacWSRuntimeString("com.annapurnainteractive.Stray")];
         atomic_store_explicit(&cached, value, memory_order_release);
     }
     return value != 0;
@@ -855,7 +863,10 @@ static void MacWSAppInputHandleActivatedEvent(id self, SEL command, id event) {
 // renders without this callback.  Therefore this is NOT a replacement display
 // clock and must not be installed globally: only an application whose launch
 // environment explicitly sets MACWS_APP_DISPLAY_SETTLE_MS gets one debounced
-// post-key-up invalidation.  A 250-ms displayIfNeeded-only A/B observed
+// post-Return invalidation.  Ordinary character key-ups must not enter this
+// path: forcing TTView to invalidate and synchronously flushing CATransaction
+// while the user types makes the complete terminal contents flash.  A 250-ms
+// displayIfNeeded-only A/B observed
 // viewsNeedDisplay=NO and did not recover the fast-output race; the forced
 // responder invalidation is intentionally labelled a scaffold, not a root fix.
 static void MacWSScheduleApplicationDisplaySettle(void) {
@@ -1158,8 +1169,14 @@ static void MacWSAppInputApplicationSendEvent(id self, SEL command, id event) {
             (finished - mouseStarted) * 1000.0, finished);
         fflush(stderr);
     }
-    if (type == 11 && MacWSApplicationDisplaySettleMilliseconds != 0)
+    if (type == 11 && MacWSApplicationDisplaySettleMilliseconds != 0 &&
+        event && ((MacWSMsgInteger)objc_msgSend)(
+            event, sel_registerName("keyCode")) == 36) {
+        // macOS virtual keycode 36 is Return.  This is the only transition
+        // whose fast pty-output race the bounded settle was introduced for;
+        // typed characters already produce their own native TTView commits.
         MacWSScheduleApplicationDisplaySettle();
+    }
     if (serial != 0 && serial <= 48) {
         double finished = MacWSAppInputMonotonicSeconds();
         BOOL hasString = responder && ((MacWSMsgBoolSEL)objc_msgSend)(
@@ -2870,100 +2887,6 @@ static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
     return postMouse;
 }
 
-// Ordinary AppKit and Electron windows accept the process-local precise pixel
-// NSEvent built below, preserving every native phase and sub-wheel-unit delta.
-// SwiftUI's hosting boundary is different on Ventura: runtime System Settings
-// evidence showed NSWindow.sendEvent: receiving the phased events while its
-// sidebar/content never produced another frame.  Its CGS-connected process
-// does respond to CGPostScrollWheelEvent, so reserve that coarse system route
-// for windows whose actual view-class ancestry comes from SwiftUI.framework.
-//
-// This is a framework-capability decision, not an application allow-list.  It
-// is cached per real NSWindow because walking a view tree at 120 Hz would itself
-// consume the latency this route is intended to recover.
-static const void *MacWSSystemScrollCapabilityKey =
-    &MacWSSystemScrollCapabilityKey;
-
-static BOOL MacWSClassUsesSwiftUI(Class cls, const char **matchedClass,
-                                  const char **matchedImage) {
-    for (unsigned depth = 0; cls && depth < 32;
-         cls = class_getSuperclass(cls), depth++) {
-        const char *name = class_getName(cls);
-        const char *image = class_getImageName(cls);
-        BOOL swiftUI = (image && strstr(image, "/SwiftUI.framework/") != NULL) ||
-            (name && (strstr(name, "NSHostingView") != NULL ||
-                      strstr(name, "SwiftUI") != NULL));
-        if (!swiftUI) continue;
-        if (matchedClass) *matchedClass = name;
-        if (matchedImage) *matchedImage = image;
-        return YES;
-    }
-    return NO;
-}
-
-static BOOL MacWSViewTreeUsesSwiftUI(id view, unsigned *remaining,
-                                     const char **matchedClass,
-                                     const char **matchedImage) {
-    if (!view || !remaining || *remaining == 0) return NO;
-    (*remaining)--;
-    if (MacWSClassUsesSwiftUI(object_getClass(view), matchedClass,
-                              matchedImage)) return YES;
-    SEL subviewsSelector = sel_registerName("subviews");
-    if (!((MacWSMsgBoolSEL)objc_msgSend)(
-            view, sel_registerName("respondsToSelector:"),
-            subviewsSelector)) return NO;
-    id subviews = ((MacWSMsgID)objc_msgSend)(view, subviewsSelector);
-    Class arrayClass = objc_getClass("NSArray");
-    if (!arrayClass || !((MacWSMsgBoolID)objc_msgSend)(
-            subviews, sel_registerName("isKindOfClass:"),
-            (id)arrayClass)) return NO;
-    for (id child in subviews) {
-        if (MacWSViewTreeUsesSwiftUI(child, remaining, matchedClass,
-                                    matchedImage)) return YES;
-        if (*remaining == 0) break;
-    }
-    return NO;
-}
-
-static BOOL MacWSWindowRequiresSystemScroll(id window) {
-    if (!window) return NO;
-    id cached = objc_getAssociatedObject(
-        window, MacWSSystemScrollCapabilityKey);
-    if (cached) return ((MacWSMsgBool)objc_msgSend)(
-        cached, sel_registerName("boolValue"));
-
-    id contentView = ((MacWSMsgID)objc_msgSend)(
-        window, sel_registerName("contentView"));
-    unsigned remaining = 2048;
-    const char *matchedClass = NULL;
-    const char *matchedImage = NULL;
-    BOOL usesSwiftUI = MacWSViewTreeUsesSwiftUI(
-        contentView, &remaining, &matchedClass, &matchedImage);
-    Class numberClass = objc_getClass("NSNumber");
-    id boxed = numberClass
-        ? ((id (*)(id, SEL, BOOL))objc_msgSend)(
-            (id)numberClass, sel_registerName("numberWithBool:"), usesSwiftUI)
-        : nil;
-    if (boxed) objc_setAssociatedObject(
-        window, MacWSSystemScrollCapabilityKey, boxed,
-        OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (MacWSRuntimeDiagnosticsEnabled()) {
-        fprintf(stderr,
-            "#### APP-INPUT SCROLL-CAPABILITY pid=%d window=%ld "
-            "window-class=%s route=%s matched-class=%s matched-image=%s "
-            "views-scanned=%u\n",
-            getpid(),
-            (long)((MacWSMsgInteger)objc_msgSend)(
-                window, sel_registerName("windowNumber")),
-            object_getClassName(window),
-            usesSwiftUI ? "CGPostScrollWheelEvent" : "NSWindow.sendEvent",
-            matchedClass ?: "none", matchedImage ?: "none",
-            2048u - remaining);
-        fflush(stderr);
-    }
-    return usesSwiftUI;
-}
-
 // CGEventPost of a pixel-unit event is the ideal route and is exactly what the
 // installed OSXvnc binary uses. Runtime on VSCode PID 64433 nevertheless
 // proved that Electron's target process can construct/post that event while
@@ -2987,13 +2910,20 @@ static BOOL MacWSPostSystemScrollEvent(
     // fallback at 240 CSS px for six 10-point samples (4x the finger travel),
     // while the window-local event preserves unit=pixel and native phases.
     // Select by framework capability/class, not bundle ID, so every Electron
-    // application receives the same coherent input contract.
+    // application receives the same coherent input contract. All ordinary
+    // AppKit windows use the real WindowServer wheel route when the global hit
+    // test identifies this exact window. Runtime on Activity Monitor pid
+    // 60424 proved that its process-local NSWindow.sendEvent: accepted every
+    // phase at the correct point while the NSTableView did not move. The same
+    // CGPostScrollWheelEvent route already restored System Settings' SwiftUI
+    // scroll boundary, and the exact global-window equality below prevents it
+    // from escaping into a covered or stale scene.
     Class electronWindowClass = objc_getClass("ElectronNSWindow");
     if (window && electronWindowClass &&
         ((MacWSMsgBoolID)objc_msgSend)(
             window, sel_registerName("isKindOfClass:"),
             (id)electronWindowClass)) return NO;
-    if (!MacWSWindowRequiresSystemScroll(window)) return NO;
+    if (!window) return NO;
     static MacWSPostLegacyScrollEvent postScroll;
     static dispatch_once_t onceToken;
     static NSInteger activeWindowNumber;

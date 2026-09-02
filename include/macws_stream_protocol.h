@@ -107,6 +107,12 @@ enum {
     // capability from the real bundle identity; Host never guesses from a
     // title, process name or hard-coded desktop rectangle.
     MacWSStreamWindowFullscreenCanvas = 1u << 8,
+    // macwsdisplayd resolves this from the first eligible level-zero AppKit
+    // window in WindowServer's live on-screen front-to-back list. Several
+    // simultaneously running applications can each retain a process-local
+    // key window, and NSWorkspace can lag an explicit CGS activation in this
+    // chroot, so neither source alone identifies the visibly frontmost app.
+    MacWSStreamWindowFrontmostApplication = 1u << 9,
 };
 
 typedef uint32_t MacWSStreamFrameFlags;

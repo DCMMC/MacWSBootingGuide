@@ -16,6 +16,7 @@
 #import <mach-o/loader.h>
 #import <mach/task_info.h>
 #import <ptrauth.h>
+#import "interpose.h"
 #import "utils.h"
 
 #import <IOSurface/IOSurfaceRef.h>
@@ -2005,9 +2006,6 @@ static void (*macws_lp_source_bring_online_orig)(id, SEL) = NULL;
 static void (*macws_lp_source_rescan_orig)(id, SEL) = NULL;
 static BOOL (*macws_lp_source_start_watching_orig)(id, SEL, BOOL *) = NULL;
 static void (*macws_lp_scan_path_orig)(id, SEL, id, id, NSUInteger, id) = NULL;
-static int (*macws_lp_fstatfs_orig)(int, struct statfs *) = NULL;
-static int (*macws_lp_statfs_orig)(const char *, struct statfs *) = NULL;
-static ssize_t (*macws_fsgetpath_orig)(char *, size_t, fsid_t *, uint64_t) = NULL;
 static BOOL macws_chroot_root_mount_needs_rebase = NO;
 static fsid_t macws_chroot_root_fsid = {};
 static char macws_chroot_root_host_mount[MAXPATHLEN] = {};
@@ -2037,33 +2035,14 @@ static macws_cfurl_copy_resource_property_fn
 // iOS processes do not load libmachook, so their dmd remains subscribed to the
 // stock name and cannot consume the private MacWS event. This does not suppress
 // registration, DMF evaluation, callbacks, or delivery among chroot clients.
-typedef void (*macws_cf_notification_post_options_fn)(
-    CFNotificationCenterRef, CFNotificationName, const void *,
-    CFDictionaryRef, CFOptionFlags);
-typedef void (*macws_cf_notification_post_fn)(
-    CFNotificationCenterRef, CFNotificationName, const void *,
-    CFDictionaryRef, Boolean);
-typedef void (*macws_cf_notification_add_observer_fn)(
-    CFNotificationCenterRef, const void *, CFNotificationCallback,
-    CFNotificationName, const void *, CFNotificationSuspensionBehavior);
-typedef void (*macws_cf_notification_remove_observer_fn)(
-    CFNotificationCenterRef, const void *, CFNotificationName, const void *);
-
 // Public on macOS (runtime symbol: CoreFoundation.__TEXT+0x446b4 on the
 // installed Ventura cache), intentionally absent from the iPhoneOS SDK.
 extern CFNotificationCenterRef CFNotificationCenterGetDistributedCenter(void);
 
-static macws_cf_notification_post_options_fn
-    macws_cf_notification_post_options_orig = NULL;
-static macws_cf_notification_post_fn macws_cf_notification_post_orig = NULL;
-static macws_cf_notification_add_observer_fn
-    macws_cf_notification_add_observer_orig = NULL;
-static macws_cf_notification_remove_observer_fn
-    macws_cf_notification_remove_observer_orig = NULL;
-
 static CFNotificationName macws_private_distributed_notification_name(
     CFNotificationCenterRef center, CFNotificationName name) {
-    if (!center || !name ||
+    const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
+    if (!hostRoot || hostRoot[0] != '/' || !center || !name ||
         center != CFNotificationCenterGetDistributedCenter()) return name;
 
     static dispatch_once_t once;
@@ -2088,7 +2067,7 @@ static void macws_cf_notification_post_options_compat(
     const void *object, CFDictionaryRef userInfo, CFOptionFlags options) {
     CFNotificationName mapped =
         macws_private_distributed_notification_name(center, name);
-    macws_cf_notification_post_options_orig(
+    CFNotificationCenterPostNotificationWithOptions(
         center, mapped, object, userInfo, options);
 }
 
@@ -2097,7 +2076,7 @@ static void macws_cf_notification_post_compat(
     const void *object, CFDictionaryRef userInfo, Boolean immediately) {
     CFNotificationName mapped =
         macws_private_distributed_notification_name(center, name);
-    macws_cf_notification_post_orig(
+    CFNotificationCenterPostNotification(
         center, mapped, object, userInfo, immediately);
 }
 
@@ -2107,7 +2086,7 @@ static void macws_cf_notification_add_observer_compat(
     const void *object, CFNotificationSuspensionBehavior behavior) {
     CFNotificationName mapped =
         macws_private_distributed_notification_name(center, name);
-    macws_cf_notification_add_observer_orig(
+    CFNotificationCenterAddObserver(
         center, observer, callback, mapped, object, behavior);
 }
 
@@ -2116,39 +2095,25 @@ static void macws_cf_notification_remove_observer_compat(
     CFNotificationName name, const void *object) {
     CFNotificationName mapped =
         macws_private_distributed_notification_name(center, name);
-    macws_cf_notification_remove_observer_orig(
+    CFNotificationCenterRemoveObserver(
         center, observer, mapped, object);
 }
 
-static void macws_install_distributed_notification_namespace_compatibility(
-    void) {
-    const char *hostRoot = getenv("MACWS_CHROOT_HOST_ROOT");
-    if (!hostRoot || hostRoot[0] != '/') return;
-
-    void *postOptions = dlsym(
-        RTLD_DEFAULT, "CFNotificationCenterPostNotificationWithOptions");
-    void *post = dlsym(RTLD_DEFAULT, "CFNotificationCenterPostNotification");
-    void *add = dlsym(RTLD_DEFAULT, "CFNotificationCenterAddObserver");
-    void *remove = dlsym(RTLD_DEFAULT, "CFNotificationCenterRemoveObserver");
-    if (postOptions) {
-        MSHookFunction(
-            postOptions, (void *)macws_cf_notification_post_options_compat,
-            (void **)&macws_cf_notification_post_options_orig);
-    }
-    if (post) {
-        MSHookFunction(post, (void *)macws_cf_notification_post_compat,
-                       (void **)&macws_cf_notification_post_orig);
-    }
-    if (add) {
-        MSHookFunction(add, (void *)macws_cf_notification_add_observer_compat,
-                       (void **)&macws_cf_notification_add_observer_orig);
-    }
-    if (remove) {
-        MSHookFunction(
-            remove, (void *)macws_cf_notification_remove_observer_compat,
-            (void **)&macws_cf_notification_remove_observer_orig);
-    }
-}
+// Runtime-confirmed by path_helper-2026-09-02-193200.ips: patching the
+// CoreFoundation implementation with MSHookFunction crashed the short-lived
+// helper in MSHookFunction -> hook -> NSString componentsSeparatedByString:.
+// Keep the notification namespace model at the client binding boundary. As
+// with the filesystem interposes below, calls issued by these replacements
+// resolve to CoreFoundation's stock implementations without dirtying shared
+// executable pages or running Substrate's Swift hook installer in every helper.
+DYLD_INTERPOSE(macws_cf_notification_post_options_compat,
+               CFNotificationCenterPostNotificationWithOptions)
+DYLD_INTERPOSE(macws_cf_notification_post_compat,
+               CFNotificationCenterPostNotification)
+DYLD_INTERPOSE(macws_cf_notification_add_observer_compat,
+               CFNotificationCenterAddObserver)
+DYLD_INTERPOSE(macws_cf_notification_remove_observer_compat,
+               CFNotificationCenterRemoveObserver)
 
 static BOOL macws_needs_application_mount_namespace_compatibility(void) {
     // Third-party AppKit executables launched through macwshostd's validated
@@ -2240,7 +2205,7 @@ static void macws_rebase_application_mount_namespace(
 
 static int macws_lp_fstatfs_namespace_compat(int descriptor,
                                             struct statfs *buffer) {
-    int result = macws_lp_fstatfs_orig(descriptor, buffer);
+    int result = fstatfs(descriptor, buffer);
     if (result != 0 || !buffer) return result;
 
     char path[MAXPATHLEN] = {};
@@ -2251,11 +2216,18 @@ static int macws_lp_fstatfs_namespace_compat(int descriptor,
 
 static int macws_lp_statfs_namespace_compat(const char *path,
                                            struct statfs *buffer) {
-    int result = macws_lp_statfs_orig(path, buffer);
+    int result = statfs(path, buffer);
     if (result == 0 && buffer)
         macws_rebase_application_mount_namespace(path, buffer);
     return result;
 }
+
+// Like fsgetpath below, keep the logical-root filesystem model fork-safe.
+// Static dyld interposes leave libsystem_kernel's shared executable pages
+// untouched, while calls made by these replacements resolve to the stock
+// functions from within libmachook.
+DYLD_INTERPOSE(macws_lp_fstatfs_namespace_compat, fstatfs)
+DYLD_INTERPOSE(macws_lp_statfs_namespace_compat, statfs)
 
 // CFURL's resource-property provider is where NSURLParentDirectoryURLKey and
 // NSURLVolumeURLKey cross from a process-visible URL into the kernel's host
@@ -2317,8 +2289,7 @@ static Boolean macws_cfurl_copy_resource_property_compat(
         CFTypeRef property = *(CFTypeRef *)value;
         char volumePath[MAXPATHLEN] = {};
         struct statfs inputFileSystem = {};
-        BOOL isRootFileSystem = macws_lp_statfs_orig &&
-            macws_lp_statfs_orig(visiblePath, &inputFileSystem) == 0 &&
+        BOOL isRootFileSystem = statfs(visiblePath, &inputFileSystem) == 0 &&
             inputFileSystem.f_fsid.val[0] == macws_chroot_root_fsid.val[0] &&
             inputFileSystem.f_fsid.val[1] == macws_chroot_root_fsid.val[1];
         BOOL isLeakedHostMount = property &&
@@ -2388,7 +2359,11 @@ static void macws_install_root_parent_namespace_compatibility(void) {
 static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
                                                 fsid_t *fsid,
                                                 uint64_t objectID) {
-    ssize_t result = macws_fsgetpath_orig(buffer, capacity, fsid, objectID);
+    // A call from the replacement image is not rewritten by dyld's static
+    // interpose tuple, so this reaches the stock libsystem_kernel entry without
+    // modifying its executable page.  That distinction is load-bearing for
+    // applications such as Electron which fork after AppKit initialization.
+    ssize_t result = fsgetpath(buffer, capacity, fsid, objectID);
     if (result < 0 || !buffer || !macws_chroot_host_root[0]) return result;
 
     size_t hostRootLength = strlen(macws_chroot_host_root);
@@ -2425,6 +2400,16 @@ static ssize_t macws_fsgetpath_namespace_compat(char *buffer, size_t capacity,
     return result;
 }
 
+// Do not install an MSHookFunction trampoline on fsgetpath. Runtime sampling
+// of VS Code pid 44947 on 2026-09-02 captured its fork child permanently in
+// fork -> libSystem_atfork_child -> _pthread_main_thread_postfork_init ->
+// __sigreturn after inheriting the dirtied libsystem_kernel page. The same
+// page-sharing failure was previously reproduced by Terminal around
+// mach_port_construct. A dyld interpose preserves the exact logical-root ABI
+// for CoreServices callers without modifying shared executable text, so fork
+// children retain the kernel's post-fork entry points byte-for-byte.
+DYLD_INTERPOSE(macws_fsgetpath_namespace_compat, fsgetpath)
+
 static void macws_install_launchpad_mount_namespace_compatibility(void) {
     // This compatibility belongs to application-catalog owners and to the
     // validated third-party AppKit launch transaction only.
@@ -2442,34 +2427,16 @@ static void macws_install_launchpad_mount_namespace_compatibility(void) {
     if (hostRoot && hostRoot[0] == '/' && strcmp(hostRoot, "/") != 0) {
         strlcpy(macws_chroot_host_root, hostRoot,
                 sizeof(macws_chroot_host_root));
-        void *fsgetpathSymbol = dlsym(RTLD_DEFAULT, "fsgetpath");
-        if (fsgetpathSymbol) {
-            MSHookFunction(fsgetpathSymbol,
-                           (void *)macws_fsgetpath_namespace_compat,
-                           (void **)&macws_fsgetpath_orig);
-        }
     }
 
-    void *statSymbol = dlsym(RTLD_DEFAULT, "statfs");
-    if (!statSymbol) return;
-
-    macws_lp_statfs_orig = (int (*)(const char *, struct statfs *))statSymbol;
     struct statfs rootFileSystem = {};
-    if (macws_lp_statfs_orig("/", &rootFileSystem) != 0 ||
+    if (statfs("/", &rootFileSystem) != 0 ||
         strcmp(rootFileSystem.f_mntonname, "/") == 0) return;
 
     macws_chroot_root_mount_needs_rebase = YES;
     macws_chroot_root_fsid = rootFileSystem.f_fsid;
     strlcpy(macws_chroot_root_host_mount, rootFileSystem.f_mntonname,
             sizeof(macws_chroot_root_host_mount));
-
-    void *fstatSymbol = dlsym(RTLD_DEFAULT, "fstatfs");
-    if (fstatSymbol) {
-        MSHookFunction(fstatSymbol, (void *)macws_lp_fstatfs_namespace_compat,
-                       (void **)&macws_lp_fstatfs_orig);
-    }
-    MSHookFunction(statSymbol, (void *)macws_lp_statfs_namespace_compat,
-                       (void **)&macws_lp_statfs_orig);
 
     macws_install_root_parent_namespace_compatibility();
 
@@ -10112,10 +10079,12 @@ static const NSUInteger kMacwsTexFmt550Fallbacks[] = {
 // SwapCancel so iPadOS keeps ownership of the panel.  Rendering the virtual
 // desktop into DCP's compressed '&b38' page anyway leaves VNC with a resource
 // that cannot be read safely after the page is recycled.  The gated owned-
-// scanout experiment substitutes one ordinary BGRA IOSurface for each IOMFB
-// page at texture-wrap time.  It preserves QuartzCore's real page/swap state
-// (the original IOSurface is still returned by currentSurface and cancelled),
-// but makes the Metal render destination process-owned and CPU-readable.
+// scanout path substitutes one canonical ordinary BGRA IOSurface for every
+// IOMFB page in the current display geometry. It preserves QuartzCore's real
+// page/swap state (the original IOSurface is still returned by currentSurface
+// and cancelled), while every partial-load composite starts from the latest
+// complete desktop instead of the unrelated history of whichever physical
+// IOMFB page happened to rotate in.
 //
 // The returned IOSurface carries a temporary reservation retain.  The caller
 // must release that retain only after the native AGX texture initializer has
@@ -10143,17 +10112,21 @@ static IOSurfaceRef macws_owned_scanout_for_original(IOSurfaceRef original,
         g_macws_owned_scanout_pool = [NSMutableDictionary new];
     });
     uint32_t originalID = IOSurfaceGetID(original);
-    // Preserve the substitution contract described above: one owned backing
-    // for one real IOMFB page.  The former shape-only pool refused to reuse a
-    // surface while any Metal texture retained it.  SkyLight legitimately
-    // keeps those texture views alive, so every subsequent wrap allocated a
-    // second 15-MiB backing for the very same page.  Runtime evidence reached
-    // 3,552 entries / 53,552 MiB before WindowServer generation 46805 died.
-    // Multiple texture views of the same original IOSurface are aliases by
-    // definition; make their replacement views alias the same owned surface
-    // as well.  Include geometry so an ID reused after a display-mode change
-    // cannot select an allocation with the wrong stride or extent.
-    NSString *key = [NSString stringWithFormat:@"%u-%zux%zu", originalID,
+    // Runtime-confirmed by the bounded final-composite trace on 2026-08-30:
+    // seven owned source IOSurfaces rotated on the exact same Metal command
+    // queue while a newer Terminal line briefly appeared and then reverted.
+    // The old originalID-width-height key therefore preserved seven unrelated
+    // histories. The captured later submission could consequently be newer
+    // in queue order while carrying older untouched desktop pixels.
+    //
+    // Alias every IOMFB page for one display geometry to a canonical owned
+    // backing. All traced producers use one queue, whose ordering serializes
+    // writes to the shared target. Unlike the old shape-only implementation,
+    // this pool reuses a live surface intentionally; it never allocates a new
+    // entry merely because a Metal texture retains the existing one. Geometry
+    // remains in the key so a display-mode change cannot reuse the wrong
+    // stride or extent.
+    NSString *key = [NSString stringWithFormat:@"display-%zux%zu",
                      width, height];
     @synchronized(g_macws_owned_scanout_lock) {
         g_macws_owned_scanout_clock++;
@@ -21445,7 +21418,6 @@ __attribute__((constructor)) static void InitMetalHooks() {
         // otherwise-dead PID visible.
         return;
     }
-    macws_install_distributed_notification_namespace_compatibility();
     macws_install_iconservices_quarantine_fallback();
     macws_install_cgsession_login_handoff_compatibility();
     macws_install_launchpad_mount_namespace_compatibility();

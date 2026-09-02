@@ -3,8 +3,10 @@
 #import <xpc/xpc.h>
 
 #include <limits.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 // Runtime-confirmed on iPadOS 16.3.1 (RunningBoard 803.120.4):
 // RBLaunchdInterface's ABI is @48@0:8@16@24@32o^@40 and System Settings
@@ -173,3 +175,29 @@ static BOOL MacWSPrepareSettingsExtensionOverlay(
 }
 
 %end
+
+static void MacWSPublishRunningBoardBridgeReadiness(void) {
+    static const char marker[] =
+        "/var/jb/var/mobile/macws-runningboard-settings-bridge.ready";
+    char temporary[PATH_MAX];
+    int length = snprintf(temporary, sizeof(temporary), "%s.new-%d", marker,
+                          getpid());
+    if (length <= 0 || length >= (int)sizeof(temporary)) return;
+    int descriptor = open(temporary,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (descriptor < 0) return;
+    dprintf(descriptor, "schema=1\npid=%d\n", getpid());
+    (void)fsync(descriptor);
+    close(descriptor);
+    (void)rename(temporary, marker);
+}
+
+%ctor {
+    %init;
+    // runningboardd is born before Dopamine's tweak environment on a fresh
+    // boot and can therefore survive without this image. Publish a concrete
+    // process-generation witness once the Logos hook is installed; hostd uses
+    // it to restart only that stale pre-jailbreak generation before launching
+    // the first Settings pane.
+    MacWSPublishRunningBoardBridgeReadiness();
+}

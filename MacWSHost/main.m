@@ -113,6 +113,9 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
             @"执行安全恢复…": @"Running safe recovery…",
             @"启动 macOS 应用…": @"Launching a macOS app…",
             @"启动 macOS 路径…": @"Launching a macOS path…",
+            @"正在验证系统设置扩展运行时…": @"Verifying System Settings extensions…",
+            @"正在增量更新系统设置依赖…": @"Updating System Settings dependencies…",
+            @"正在完整修复系统设置扩展…": @"Fully repairing System Settings extensions…",
             @"请求刷新共享帧…": @"Requesting a display refresh…",
             @"安全保护已触发": @"Safety protection triggered",
             @"正在生成启动配置…": @"Generating startup configuration…",
@@ -164,6 +167,7 @@ static NSString *MacWSLocalizedPhase(NSString *phase) {
                                            title:(NSString *)title;
 - (void)reassertFullscreenScenePresentation;
 - (void)restoreHardwareKeyboardFocusWithReason:(NSString *)reason;
+- (BOOL)forwardHardwarePressEvent:(UIPressesEvent *)event;
 - (void)restoreWorkspaceReturnFromActivity:(NSUserActivity *)activity;
 - (BOOL)detachMissingWorkspaceReturnOwnerPID:(int32_t)ownerPID
                                     windowID:(uint32_t)windowID;
@@ -2686,6 +2690,33 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     [_metalView restoreHardwareKeyboardFocusWithReason:reason];
 }
 
+- (BOOL)forwardHardwarePressEvent:(UIPressesEvent *)event {
+    if (!_controlPanel.hidden || !_metalView.isMacWSInputEnabled || !event)
+        return NO;
+    BOOL forwarded = NO;
+    for (UIPress *press in event.allPresses) {
+        BOOL keyDown = NO;
+        switch (press.phase) {
+            case UIPressPhaseBegan:
+                keyDown = YES;
+                break;
+            case UIPressPhaseEnded:
+            case UIPressPhaseCancelled:
+                keyDown = NO;
+                break;
+            default:
+                continue;
+        }
+        forwarded = [_metalView forwardHardwarePresses:[NSSet setWithObject:press]
+                                               keyDown:keyDown] || forwarded;
+    }
+    if (forwarded && MacWSHostDiagnosticsEnabled()) {
+        MacWSLog(@"hardware-key-window-route presses=%lu target=%d",
+                 (unsigned long)event.allPresses.count, _metalView.targetPID);
+    }
+    return forwarded;
+}
+
 - (void)setNotice:(NSString *)notice success:(BOOL)success {
     _noticeLabel.hidden = notice.length == 0;
     _noticeLabel.text = notice;
@@ -5202,6 +5233,30 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 @end
 
+// Hardware keyboard UIPressesEvents always enter UIWindow before UIKit chooses
+// a first responder. Route them at that stable public boundary while the macOS
+// workspace is the active UI. The former MTKView-only pressesBegan: path had a
+// responder ownership precondition even though this app intentionally moves
+// first responder among the Metal view, controls, restored Scenes and a hidden
+// keyboard proxy. Returning to UIKit for control-center/unsupported events
+// preserves native text-field and Scene behavior, while a forwarded event is
+// consumed exactly once so MTKView's responder fallback cannot duplicate it.
+@interface MacWSWorkspaceWindow : UIWindow
+@end
+
+@implementation MacWSWorkspaceWindow
+- (void)sendEvent:(UIEvent *)event {
+    if ([event isKindOfClass:UIPressesEvent.class]) {
+        UIViewController *root = self.rootViewController;
+        if ([root isKindOfClass:MacWSViewController.class] &&
+            [(MacWSViewController *)root
+                forwardHardwarePressEvent:(UIPressesEvent *)event])
+            return;
+    }
+    [super sendEvent:event];
+}
+@end
+
 static NSUserActivity *MacWSLiveRestorationActivity(UIScene *scene) {
     if (![scene isKindOfClass:UIWindowScene.class])
         return scene.session.stateRestorationActivity;
@@ -5427,7 +5482,7 @@ static void MacWSDeduplicateWindowScenes(void) {
                   preferredSize:preferredSize
                       resizable:resizable];
     [controller restoreWorkspaceReturnFromActivity:activity];
-    self.window = [[UIWindow alloc] initWithWindowScene:windowScene];
+    self.window = [[MacWSWorkspaceWindow alloc] initWithWindowScene:windowScene];
     self.window.rootViewController = controller;
     [self.window makeKeyAndVisible];
     // Scene restoration can reconnect directly in fullscreen mode without

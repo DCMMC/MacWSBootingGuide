@@ -77,8 +77,10 @@ ifneq ($(strip $(MACWS_WINDOWING_CROSS_PREBUILT)),)
 after-stage::
 	@test -s "$(MACWS_WINDOWING_CROSS_PREBUILT)" || { \
 		echo 'ERROR: validated MacWSWindowing cross-build is missing.' >&2; exit 1; }
-	@mkdir -p $(THEOS_STAGING_DIR)/usr/lib/TweakInject
+	@mkdir -p $(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries
 	@install -m 0755 "$(MACWS_WINDOWING_CROSS_PREBUILT)" \
-		$(THEOS_STAGING_DIR)/usr/lib/TweakInject/MacWSWindowing.dylib
+		$(THEOS_STAGING_DIR)/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
+	@rm -f $(THEOS_STAGING_DIR)/usr/lib/TweakInject/MacWSWindowing.dylib
+	@rmdir $(THEOS_STAGING_DIR)/usr/lib/TweakInject 2>/dev/null || true
 	@echo '==> Replaced on-device MacWSWindowing intermediate with validated Apple-ld64 artifact'
 endif

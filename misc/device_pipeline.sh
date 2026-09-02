@@ -28,7 +28,7 @@ Usage: bash misc/device_pipeline.sh [options]
   --verify-only                Do not copy; fail if local/device source differs
   --component NAME             runtime | display | input | workspace | host | hostd | compiler | libmachook | metal | full
   --no-sync                    Build current device tree without synchronizing
-  --restart-workspace          Stop/start the GUI after deployment and verify it
+  --restart-workspace          Rebuild the live GUI session after deployment and verify it
   --repair-desktop             Run the in-place desktop repair after deployment
   --device USER@HOST           Override mobile@192.168.1.6
   --port PORT                  Override SSH port 22
@@ -301,6 +301,12 @@ set -euo pipefail
 PROJECT='$REMOTE_PROJECT'
 THEOS='$THEOS_PATH'
 cd "\$PROJECT"
+# Full/package builds and pre-deploy signing can leave shared Theos cache
+# entries owned by root. Repair ownership only when drift exists so the normal
+# incremental path never fails at Swift's before-all marker cleanup.
+if find .theos ! -user "\$(id -u)" -print -quit 2>/dev/null | grep -q .; then
+    sudo chown -R "\$(id -u):\$(id -g)" .theos
+fi
 HOST_WAS_RUNNING=0
 if ps -axo command= | awk \
         '/Applications\/MacWSHost.app\/MacWSHost/{found=1} END{exit !found}'; then
@@ -431,6 +437,11 @@ set -euo pipefail
 PROJECT='$REMOTE_PROJECT'
 THEOS='$THEOS_PATH'
 cd "\$PROJECT"
+# See build_host: a prior signed/package build can leave shared marker files
+# root-owned even though this component is compiled as mobile.
+if find .theos ! -user "\$(id -u)" -print -quit 2>/dev/null | grep -q .; then
+    sudo chown -R "\$(id -u):\$(id -g)" .theos
+fi
 # main.m deliberately resolves every shared protocol through ../include.
 # Assert that invariant before compiling so a non-destructive device sync can
 # never silently select a device-only shadow header from macwshostd/ again.
@@ -509,6 +520,12 @@ sudo install -o root -g wheel -m 0755 \
     "\$PROJECT/layout/usr/macOS/bin/macos_gui.sh" \
     /var/jb/usr/macOS/bin/macos_gui.sh
 sudo install -o root -g wheel -m 0755 \
+    "\$PROJECT/layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh" \
+    /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
+sudo install -o root -g wheel -m 0755 \
+    "\$PROJECT/layout/usr/macOS/bin/ensure_objc_trampolines_arm64.py" \
+    /var/jb/usr/macOS/bin/ensure_objc_trampolines_arm64.py
+sudo install -o root -g wheel -m 0755 \
     "\$PROJECT/layout/usr/macOS/bin/ensure_metal2metal_compat.sh" \
     /var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh
 sudo install -o root -g wheel -m 0644 \
@@ -520,15 +537,27 @@ sudo install -o root -g wheel -m 0644 \
 sudo install -o root -g wheel -m 0644 \
     "\$PROJECT/misc/com.macwsguide.steam.runtime.plist" \
     /var/jb/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist
+sudo install -o root -g wheel -m 0644 \
+    "\$PROJECT/misc/com.macwsguide.vscode.plist" \
+    /var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
 sudo bash /var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh
 cmp -s "\$PROJECT/layout/usr/macOS/bin/ensure_steam_trust.sh" \
     /var/jb/usr/macOS/bin/ensure_steam_trust.sh
 cmp -s "\$PROJECT/layout/usr/macOS/bin/prepare_steam_runtime.sh" \
     /var/jb/usr/macOS/bin/prepare_steam_runtime.sh
+cmp -s "\$PROJECT/layout/usr/macOS/bin/macos_gui.sh" \
+    /var/jb/usr/macOS/bin/macos_gui.sh
+cmp -s "\$PROJECT/layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh" \
+    /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh
+cmp -s "\$PROJECT/layout/usr/macOS/bin/ensure_objc_trampolines_arm64.py" \
+    /var/jb/usr/macOS/bin/ensure_objc_trampolines_arm64.py
 cmp -s "\$PROJECT/layout/usr/macOS/bin/ensure_metal2metal_compat.sh" \
     /var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh
 cmp -s "\$PROJECT/misc/com.macwsguide.steam.runtime.plist" \
     /var/jb/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist
+/var/jb/usr/bin/python3 -c 'import plistlib,sys; a=plistlib.load(open(sys.argv[1],"rb")); b=plistlib.load(open(sys.argv[2],"rb")); assert a == b' \
+    "\$PROJECT/misc/com.macwsguide.vscode.plist" \
+    /var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist
 REMOTE
 }
 
@@ -545,9 +574,12 @@ verify_runtime_artifacts() {
     echo "==> Verifying source/install/runtime contract"
     device_ssh "set -e; \
         cmp -s '$REMOTE_PROJECT/layout/usr/macOS/bin/macos_gui.sh' /var/jb/usr/macOS/bin/macos_gui.sh; \
+        cmp -s '$REMOTE_PROJECT/layout/usr/macOS/bin/ensure_settings_extensions_runtime.sh' /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh; \
+        cmp -s '$REMOTE_PROJECT/layout/usr/macOS/bin/ensure_objc_trampolines_arm64.py' /var/jb/usr/macOS/bin/ensure_objc_trampolines_arm64.py; \
         cmp -s '$REMOTE_PROJECT/layout/usr/macOS/bin/prepare_steam_runtime.sh' /var/jb/usr/macOS/bin/prepare_steam_runtime.sh; \
         cmp -s '$REMOTE_PROJECT/layout/usr/macOS/bin/ensure_metal2metal_compat.sh' /var/jb/usr/macOS/bin/ensure_metal2metal_compat.sh; \
         /var/jb/usr/bin/python3 -c 'import plistlib,sys; a=plistlib.load(open(sys.argv[1],\"rb\")); b=plistlib.load(open(sys.argv[2],\"rb\")); assert a == b' '$REMOTE_PROJECT/misc/com.macwsguide.steam.runtime.plist' /var/jb/usr/macOS/gui-launchd/com.macwsguide.steam.runtime.plist; \
+        /var/jb/usr/bin/python3 -c 'import plistlib,sys; a=plistlib.load(open(sys.argv[1],\"rb\")); b=plistlib.load(open(sys.argv[2],\"rb\")); assert a == b' '$REMOTE_PROJECT/misc/com.macwsguide.vscode.plist' /var/jb/usr/macOS/gui-launchd/com.macwsguide.vscode.plist; \
         grep -Fqa 'repair-desktop' /var/jb/Applications/MacWSHost.app/MacWSHost; \
         grep -Fqa 'macws_final_composite.state' /var/jb/usr/macOS/bin/macwsdisplayd; \
         cmp -s /var/jb/usr/macOS/bin/macwsdisplayd /var/mnt/rootfs/usr/local/bin/macwsdisplayd; \
@@ -576,9 +608,13 @@ wait_for_host_operation() {
 }
 
 restart_workspace() {
-    echo "==> Restarting workspace through the production controller"
-    wait_for_host_operation stop 'state busy=NO phase=就绪 error=' 90
-    wait_for_host_operation start 'state busy=NO phase=就绪 error=' 240
+    echo "==> Restarting the live workspace through the bounded session path"
+    run_privileged_device_script <<'REMOTE'
+set -euo pipefail
+sudo env PATH=/var/jb/usr/bin:/var/jb/usr/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
+    bash /var/jb/usr/macOS/bin/macos_gui.sh restart coexist \
+        --no-terminal --no-vnc
+REMOTE
     device_ssh "set -e; \
         ps -axo pid,comm | grep 'WindowServer$'; \
         ps -axo pid,comm | grep 'macwsdisplayd$'; \
@@ -597,9 +633,9 @@ case "$COMPONENT" in
     runtime) deploy_runtime_assets ;;
     display) build_display ;;
     input) build_input ;;
-    workspace) build_workspace ;;
+    workspace) deploy_runtime_assets; build_workspace ;;
     host) build_host ;;
-    hostd) build_hostd ;;
+    hostd) deploy_runtime_assets; build_hostd ;;
     compiler) build_compiler ;;
     libmachook) build_libmachook ;;
     metal) build_hostd; build_libmachook ;;

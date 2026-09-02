@@ -26,6 +26,9 @@ UICACHE_LIST=""
 TRUSTCACHE_INFO=""
 RUNTIME_SCHEMA="macws-settings-extension-runtime-v2"
 RUNTIME_BASE_FINGERPRINT=""
+RUNTIME_HOOK_HASH=""
+RUNTIME_SUBSTRATE_HASH=""
+RUNTIME_TRAMPOLINES_HASH=""
 CURRENT_BOOT_ID=""
 
 if [ ! -d "$EXTENSIONS_ROOT" ]; then
@@ -56,7 +59,15 @@ selected_cdhash() {
     printf '%s' "$hash"
 }
 
-RUNTIME_BASE_FINGERPRINT="$RUNTIME_SCHEMA|$(selected_cdhash "$LIBMACHOOK")|$(selected_cdhash "$SUBSTRATE")|$(selected_cdhash "$TRAMPOLINES")"
+RUNTIME_HOOK_HASH=$(selected_cdhash "$LIBMACHOOK")
+RUNTIME_SUBSTRATE_HASH=$(selected_cdhash "$SUBSTRATE")
+RUNTIME_TRAMPOLINES_HASH=$(selected_cdhash "$TRAMPOLINES")
+[ -n "$RUNTIME_HOOK_HASH" ] && [ -n "$RUNTIME_SUBSTRATE_HASH" ] &&
+    [ -n "$RUNTIME_TRAMPOLINES_HASH" ] || {
+    echo '[ERROR] Settings runtime dependency hash is missing' >&2
+    exit 1
+}
+RUNTIME_BASE_FINGERPRINT="$RUNTIME_SCHEMA|$RUNTIME_HOOK_HASH|$RUNTIME_SUBSTRATE_HASH|$RUNTIME_TRAMPOLINES_HASH"
 if [ -x "$SYSCTL" ]; then
     CURRENT_BOOT_ID=$($SYSCTL -n kern.bootsessionuuid 2>/dev/null || true)
 fi
@@ -130,6 +141,16 @@ write_runtime_trust_manifest() {
     }
     chmod 0644 "$temporary" || return 1
     mv -f "$temporary" "$TRUST_MANIFEST"
+}
+
+publish_boot_ready_marker() {
+    local temporary
+    [ -n "$CURRENT_BOOT_ID" ] || return 0
+    temporary="${BOOT_READY_MARKER}.new-$$"
+    printf '%s\n' "$CURRENT_BOOT_ID|$RUNTIME_BASE_FINGERPRINT" > \
+        "$temporary" || return 1
+    chmod 0644 "$temporary" || return 1
+    mv -f "$temporary" "$BOOT_READY_MARKER"
 }
 
 # The dynamic trustcache is recreated after a device boot.  Re-add only the
@@ -424,6 +445,121 @@ verify_current_runtime() {
     echo "[INFO] Settings ExtensionKit runtime verification passed: $verified_count"
 }
 
+# A libmachook FAST deployment changes the dependency fingerprint embedded in
+# every pane marker, but it does not change those 48 stock executables or their
+# already-registered per-identity carrier apps. The former fallback repeated
+# the complete carrier/uicache/entitlement pipeline and held macwshostd's
+# launch-path transaction for 201.5 seconds on 2026-09-02. Reconcile exactly
+# the dependency copies and trust entries first. Any missing/ambiguous bundle,
+# malformed marker, changed substrate platform image, or verifier failure still
+# falls through to the unchanged full preparation path in macwshostd.
+repair_dependency_runtime() {
+    local bundle contents info executable_name identifier executable frameworks
+    local carrier_app carrier_executable runtime_marker candidate candidate_count
+    local candidate_path marker_schema marker_base_hook marker_base_substrate
+    local marker_base_tramp marker_executable marker_carrier marker_hook
+    local marker_substrate marker_tramp marker_extra substrate_local
+    local output local_substrate_hash="" repaired_count=0 hash=""
+
+    ensure_trust_hash "$RUNTIME_HOOK_HASH" || return 1
+    ensure_trust_hash "$RUNTIME_TRAMPOLINES_HASH" || return 1
+    for bundle in "$EXTENSIONS_ROOT"/*.appex; do
+        [ -d "$bundle" ] || continue
+        contents="$bundle/Contents"
+        info="$contents/Info.plist"
+        [ -f "$info" ] || continue
+        $PLUTIL -show "$info" 2>&1 |
+            grep -Fq 'EXExtensionPointIdentifier = "com.apple.Settings.extension.ui";' ||
+            continue
+        executable_name=$($PLUTIL -key CFBundleExecutable "$info" 2>/dev/null)
+        identifier=$($PLUTIL -key CFBundleIdentifier "$info" 2>/dev/null)
+        if [ -z "$executable_name" ]; then
+            candidate=""
+            candidate_count=0
+            for candidate_path in "$contents"/MacOS/*; do
+                [ -f "$candidate_path" ] || continue
+                case "$candidate_path" in
+                    *.macws-preload-backup|*.new-*) continue ;;
+                esac
+                candidate="$candidate_path"
+                candidate_count=$((candidate_count + 1))
+            done
+            [ "$candidate_count" -eq 1 ] && executable_name=${candidate##*/}
+        fi
+        [ -n "$identifier" ] && [ -n "$executable_name" ] || return 1
+        executable="$contents/MacOS/$executable_name"
+        frameworks="$contents/Frameworks"
+        carrier_app="/var/jb/Applications/MacWSSettingsExtension-$identifier.app"
+        carrier_executable="$carrier_app/SettingsExtensionProxy"
+        runtime_marker="$frameworks/.macws-settings-runtime"
+        substrate_local="$frameworks/.jbroot/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate"
+        [ -x "$executable" ] && [ -x "$carrier_executable" ] &&
+            [ -u "$carrier_executable" ] && [ -f "$runtime_marker" ] &&
+            [ -f "$substrate_local" ] || return 1
+        [ "$($PLUTIL -key CFBundleIdentifier \
+                "$carrier_app/Info.plist" 2>/dev/null)" = \
+            "com.macwsguide.settings-extension-carrier.$identifier" ] ||
+            return 1
+        printf '%s\n' "$UICACHE_LIST" | grep -Fq \
+            "com.macwsguide.settings-extension-carrier.$identifier : " ||
+            return 1
+        IFS='|' read -r marker_schema marker_base_hook \
+            marker_base_substrate marker_base_tramp marker_executable \
+            marker_carrier marker_hook marker_substrate marker_tramp \
+            marker_extra < "$runtime_marker"
+        [ "$marker_schema" = "$RUNTIME_SCHEMA" ] && [ -z "$marker_extra" ] &&
+            [ -n "$marker_executable" ] && [ -n "$marker_carrier" ] &&
+            [ -n "$marker_substrate" ] && [ -n "$marker_tramp" ] || return 1
+
+        mkdir -p "$frameworks"
+        fresh_copy_if_changed \
+            "$LIBMACHOOK" "$frameworks/libmachook.dylib" || return 1
+        fresh_copy_if_changed \
+            "$TRAMPOLINES" "$frameworks/libobjc-trampolines.dylib" || return 1
+        cmp -s "$LIBMACHOOK" "$frameworks/libmachook.dylib" &&
+            cmp -s "$TRAMPOLINES" \
+                "$frameworks/libobjc-trampolines.dylib" || return 1
+
+        if [ "$marker_base_substrate" != "$RUNTIME_SUBSTRATE_HASH" ] ||
+           ! $OTOOL -l "$substrate_local" 2>/dev/null |
+               grep -A4 LC_BUILD_VERSION | grep -q 'platform 1'; then
+            fresh_copy_if_changed "$SUBSTRATE" "$substrate_local" ||
+                return 1
+            /var/jb/usr/bin/python3 "$MACHO_PATCHER" "$substrate_local" ||
+                return 1
+            $LDID -S -M "$substrate_local" || return 1
+            $LDID -S -M "$substrate_local" || return 1
+            local_substrate_hash=$(selected_cdhash "$substrate_local")
+            [ -n "$local_substrate_hash" ] || return 1
+        else
+            local_substrate_hash="$marker_substrate"
+        fi
+
+        for hash in "$marker_executable" "$marker_carrier" \
+                    "$RUNTIME_HOOK_HASH" "$local_substrate_hash" \
+                    "$RUNTIME_TRAMPOLINES_HASH"; do
+            ensure_trust_hash "$hash" || return 1
+        done
+        printf '%s|%s|%s|%s|%s|%s\n' \
+            "$RUNTIME_BASE_FINGERPRINT" "$marker_executable" \
+            "$marker_carrier" "$RUNTIME_HOOK_HASH" \
+            "$local_substrate_hash" "$RUNTIME_TRAMPOLINES_HASH" > \
+            "$runtime_marker" || return 1
+        chmod 0644 "$runtime_marker" || return 1
+        repaired_count=$((repaired_count + 1))
+    done
+    [ "$repaired_count" -gt 0 ] || return 1
+    write_runtime_trust_manifest || return 1
+    # This loop has now checked the same executable/carrier/setuid/uicache,
+    # dependency-copy, marker and trustcache predicates as the complete
+    # verifier while updating each dependency transactionally. Publish the
+    # aggregate marker only after every pane converges, so macwshostd's
+    # mandatory post-repair --verify remains fail-closed but can prove this
+    # exact bootsession/fingerprint in O(1) instead of rescanning 48 panes.
+    publish_boot_ready_marker || return 1
+    echo "[INFO] Settings dependency runtimes reconciled and verified incrementally: $repaired_count"
+}
+
 prepared_count=0
 if [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; then
     verify_current_runtime || {
@@ -434,13 +570,16 @@ if [ "$#" -eq 1 ] && [ "$1" = "--verify" ]; then
         echo '[ERROR] Settings runtime trust manifest update failed' >&2
         exit 1
     }
-    if [ -n "$CURRENT_BOOT_ID" ]; then
-        boot_marker_temporary="${BOOT_READY_MARKER}.new-$$"
-        printf '%s\n' "$CURRENT_BOOT_ID|$RUNTIME_BASE_FINGERPRINT" > \
-            "$boot_marker_temporary"
-        chmod 644 "$boot_marker_temporary"
-        mv -f "$boot_marker_temporary" "$BOOT_READY_MARKER"
-    fi
+    publish_boot_ready_marker || {
+        echo '[ERROR] Settings runtime boot marker update failed' >&2
+        exit 1
+    }
+    exit 0
+elif [ "$#" -eq 1 ] && [ "$1" = "--repair-dependencies" ]; then
+    repair_dependency_runtime || {
+        echo '[ERROR] Settings dependency-only reconciliation failed' >&2
+        exit 1
+    }
     exit 0
 elif [ "$#" -gt 0 ]; then
     for bundle in "$@"; do

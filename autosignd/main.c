@@ -12,6 +12,7 @@
 // Protocol:
 //   "<chroot-path>\n"  sign/trustcache that chroot-absolute path
 //   "DEBUG\n"         mark the connecting process CS_DEBUGGED
+//   "PING\n"          verify that the published socket has a live server
 //
 // The second operation replaces libmachook's historical constructor-time
 // fork()+ptrace JIT bootstrap.  Forking while dyld is still running image
@@ -30,6 +31,7 @@
 #include <signal.h>
 #include <spawn.h>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -39,6 +41,7 @@ extern char **environ;
 
 // Socket path as seen from the iOS side (== chroot /tmp/autosignd.sock).
 #define SOCK_PATH   "/var/mnt/rootfs/tmp/autosignd.sock"
+#define LOCK_PATH   "/var/mnt/rootfs/tmp/autosignd.lock"
 #define ROOTFS      "/var/mnt/rootfs"
 #define LDID        "/var/jb/usr/bin/ldid"
 #define JBCTL       "/var/jb/usr/bin/jbctl"
@@ -250,9 +253,60 @@ static int mark_peer_debugged(pid_t peer_pid) {
     return 1;
 }
 
-int main(void) {
+static int probe_server(void) {
+    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (socket_fd < 0) return 1;
+    struct sockaddr_un address = {0};
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, SOCK_PATH, sizeof(address.sun_path) - 1);
+    if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(socket_fd);
+        return 1;
+    }
+    static const char request[] = "PING\n";
+    if (write(socket_fd, request, sizeof(request) - 1) !=
+        (ssize_t)(sizeof(request) - 1)) {
+        close(socket_fd);
+        return 1;
+    }
+    char reply[4] = {0};
+    size_t offset = 0;
+    while (offset < 3) {
+        ssize_t count = read(socket_fd, reply + offset, 3 - offset);
+        if (count > 0) {
+            offset += (size_t)count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        close(socket_fd);
+        return 1;
+    }
+    close(socket_fd);
+    return memcmp(reply, "OK\n", 3) == 0 ? 0 : 1;
+}
+
+int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
+
+    if (argc == 2 && strcmp(argv[1], "--probe") == 0)
+        return probe_server();
+
+    // The lifecycle helper is the normal owner, but package configuration and
+    // GUI recovery can overlap. Runtime on 2026-08-30 found one live autosignd
+    // whose pathname had disappeared; every ViewBridge child then failed its
+    // JIT handshake with connect_errno=61. Source inspection confirms that a
+    // second daemon unconditionally unlinked SOCK_PATH before binding. Hold a
+    // process-lifetime lock before touching that name so no concurrent direct
+    // launch can detach the active listener from the filesystem namespace.
+    int lock_fd = open(LOCK_PATH, O_CREAT | O_RDWR, 0600);
+    if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        logmsg("singleton lock %s: %s", LOCK_PATH, strerror(errno));
+        if (lock_fd >= 0) close(lock_fd);
+        return 2;
+    }
+    (void)ftruncate(lock_fd, 0);
+    dprintf(lock_fd, "%d\n", getpid());
 
     unlink(SOCK_PATH);
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -296,6 +350,8 @@ int main(void) {
             } else {
                 ok = mark_peer_debugged(peer_pid);
             }
+        } else if (strcmp(buf, "PING") == 0) {
+            // The reply below is the complete liveness contract.
         } else if (buf[0]) {
             handle_request(buf);
         }
@@ -304,5 +360,7 @@ int main(void) {
         close(c);
     }
     close(s);
+    unlink(SOCK_PATH);
+    close(lock_fd);
     return 0;
 }

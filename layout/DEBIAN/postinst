@@ -40,7 +40,8 @@ ANGLE_ASSET_TARGET_DIR="$ROOTFS/usr/local/share/macws/angle"
 
 # A package install may replace libmachook or an ExtensionKit carrier.  Force
 # the next launch through the deep verifier before allowing the boot cache.
-rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready
+rm -f /var/jb/var/mobile/macws-settings-runtime.boot-ready \
+      /var/jb/var/mobile/macws-base-trust.boot-ready
 # Third-party /Applications CodeDirectories are not package payloads. Keep the
 # same-boot trust marker: postinst already registers every signature it does
 # mutate, while deleting this unrelated marker forced the next routine service
@@ -223,7 +224,7 @@ trust_installed_macho /var/jb/usr/macOS/bin/launchdchrootexec
 # A fresh package install publishes new exec hooks before App-driven repair.
 # Start the matching signing daemon through the same bounded exact-name
 # supervisor so no old instance remains blocked on an unlinked socket inode.
-bash /var/jb/usr/macOS/bin/restart_autosignd.sh || exit 1
+bash /var/jb/usr/macOS/bin/restart_autosignd.sh --force || exit 1
 ensure_interop_signature \
     /var/jb/usr/macOS/libexec/MacWSInteropService.app/Contents/MacOS/macwsinteropd || exit 1
 
@@ -587,13 +588,21 @@ if [ -d "$ROOTFS/System/Library" ]; then
         "$ROOTFS/System/Library/ExtensionKit/Extensions/Appearance.appex/Contents/MacOS/Appearance" || exit 1
     # Preserve Appearance's stock private capabilities first, then reconcile
     # every Settings pane's bundle-local libmachook/Substrate/trampoline
-    # closure, common MacWS service contract, unique iOS carrier, runtime
-    # fingerprint and resulting CDHashes.  The generic helper merges rather
-    # than replaces each pane's native entitlements.
-    bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh || exit 1
-    # Publish the bootsession/dependency witness and persistent trust-hash
-    # manifest during installation; do not defer a 48-pane deep verification
-    # to the first interactive MacWS launch.
+    # closure. Package upgrades normally change only those dependencies, so
+    # retain the already-verified pane executable, unique carrier identity and
+    # uicache registration. The transactional repair checks all of those
+    # invariants and publishes its aggregate marker only after all 48 panes
+    # converge. A first install or any malformed/missing identity falls back to
+    # the complete entitlement/carrier preparation path.
+    if ! bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh \
+            --repair-dependencies; then
+        echo '[INFO] Incremental Settings dependency repair unavailable; running complete preparation.'
+        bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh ||
+            exit 1
+    fi
+    # Keep the mandatory postcondition. A successful transactional repair can
+    # satisfy it from the exact boot/dependency marker; a full preparation runs
+    # the unchanged deep verifier here before installation is accepted.
     bash /var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh --verify || exit 1
     ensure_chroot_native_service_signature \
         "$ROOTFS/System/Library/CoreServices/CoreLocationAgent.app/Contents/MacOS/CoreLocationAgent" \

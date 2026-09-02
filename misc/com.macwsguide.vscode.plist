@@ -40,7 +40,7 @@
         <string>--disable-features=SkiaGraphite</string>
         <!-- Keep Chromium's production JIT scheduling.  The W^X adapter now
              reports successful RX transitions without late retries, while a
-             runtime sample with the old --no-concurrent-* group found the
+             runtime sample with the old no-concurrent option group found the
              Electron main thread permanently waiting in
              OptimizingCompileTaskExecutor::WaitUntilCompilationJobsDoneForIsolate. -->
     </array>
@@ -62,6 +62,13 @@
         <key>MACWS_AMFI_IMMOVABLE_TASK_PORT_COMPAT</key>
         <string>1</string>
         <key>MACWS_MACOS_SYSTEM_POLICY_COMPAT</key>
+        <string>1</string>
+        <!-- NSOpenPanel/FinderKit is a CoreServices filesystem-catalog
+             consumer.  Keep the chroot root as its logical volume root so
+             FileCache cannot construct a host-mount parent cycle.  The
+             underlying statfs/fsgetpath adapters are dyld interposes and are
+             therefore safe across Electron's early fork. -->
+        <key>MACWS_APP_MOUNT_COMPAT</key>
         <string>1</string>
     </dict>
     <key>RunAtLoad</key>

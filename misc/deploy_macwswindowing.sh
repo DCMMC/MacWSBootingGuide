@@ -15,7 +15,7 @@ REMOTE_DIR=/var/jb/var/mobile/macws-cross-build
 REMOTE_NEW="$REMOTE_DIR/MacWSWindowing.dylib.new"
 REMOTE_BINARY="$REMOTE_DIR/MacWSWindowing.dylib"
 REMOTE_SHA="$REMOTE_DIR/MacWSWindowing.sha256"
-INSTALLED=/var/jb/usr/lib/TweakInject/MacWSWindowing.dylib
+INSTALLED=/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib
 
 gmake -C "$BUILD_DIR" clean all \
     FINALPACKAGE=1 STRIP=0 OPTFLAG=-O2 \

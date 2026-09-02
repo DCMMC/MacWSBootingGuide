@@ -8,7 +8,7 @@
 #include <unistd.h>
 
 static const char *const kTarget =
-    "/var/jb/usr/lib/TweakInject/MacWSWindowing.dylib";
+    "/var/jb/Library/MobileSubstrate/DynamicLibraries/MacWSWindowing.dylib";
 static const char *const kLog =
     "/var/mobile/Library/Logs/MacWSWindowingLoaderProbe.log";
 

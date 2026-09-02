@@ -62,6 +62,8 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)suspendStream;
 - (void)emitSoftwareText:(NSString *)text modifiers:(uint32_t)modifiers;
 - (void)emitSoftwareKeySym:(uint32_t)keySym modifiers:(uint32_t)modifiers;
+- (BOOL)forwardHardwarePresses:(NSSet<UIPress *> *)presses
+                       keyDown:(BOOL)keyDown;
 - (BOOL)restoreHardwareKeyboardFocusWithReason:(NSString *)reason;
 - (void)updatePresentationGeometry;
 - (void)updatePointerVisibility;

@@ -80,6 +80,8 @@ static const char *const kSettingsExtensionsRuntime =
     "/var/jb/usr/macOS/bin/ensure_settings_extensions_runtime.sh";
 static const char *const kSettingsExtensionsRuntimeLog =
     "/var/jb/var/mobile/settings-extensions-runtime.log";
+static const char *const kRunningBoardSettingsBridgeMarker =
+    "/var/jb/var/mobile/macws-runningboard-settings-bridge.ready";
 static const char *const kFrame = "/var/mnt/rootfs/private/tmp/macws_vnc_fb";
 static const char *const kInputSocket = "/var/mnt/rootfs/private/tmp/macws_host_input.sock";
 static const char *const kShareFlag = "/var/mnt/rootfs/private/tmp/macws_vnc_share";
@@ -2451,6 +2453,77 @@ static BOOL EnsureSystemSettingsCatalog(BOOL *repairedOut,
     return YES;
 }
 
+static pid_t RunningBoardSettingsBridgeMarkerPID(void) {
+    int descriptor = open(kRunningBoardSettingsBridgeMarker,
+                          O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) return 0;
+    char payload[96] = {0};
+    ssize_t count;
+    do {
+        count = read(descriptor, payload, sizeof(payload) - 1);
+    } while (count < 0 && errno == EINTR);
+    close(descriptor);
+    if (count <= 0) return 0;
+    payload[count] = '\0';
+    int pid = 0;
+    char trailing = '\0';
+    if (sscanf(payload, "schema=1\npid=%d\n%c", &pid, &trailing) != 1 ||
+        pid <= 1) return 0;
+    return (pid_t)pid;
+}
+
+// RunningBoard is a stock iOS daemon and can predate Dopamine's injection
+// environment after a fresh boot. Runtime LLDB on pid 48077 proved that its
+// image list lacked MacWSCatalystLaunch.dylib; the next Settings request then
+// reached launchd with the real macOS Appearance path and failed with
+// OSLaunchdErrorDomain/148. Restart exactly that daemon only when the tweak's
+// constructor marker does not identify the current process generation, and
+// require the new hook-installed marker before any pane request is submitted.
+static BOOL EnsureRunningBoardSettingsBridge(NSString **message) {
+    NSString *runningBoardPath = @"/usr/libexec/runningboardd";
+    pid_t currentPID = FindRunningRootExecutable(runningBoardPath);
+    pid_t markerPID = RunningBoardSettingsBridgeMarkerPID();
+    if (currentPID > 1 && markerPID == currentPID) {
+        HostLog(@"system-settings runningboard-bridge result=verified pid=%d",
+                currentPID);
+        return YES;
+    }
+
+    HostLog(@"system-settings runningboard-bridge action=restart "
+            "current-pid=%d marker-pid=%d", currentPID, markerPID);
+    unlink(kRunningBoardSettingsBridgeMarker);
+    const char *restart[] = {
+        kLaunchctl, "kickstart", "-k",
+        "user/foreground/com.apple.runningboardd", NULL,
+    };
+    int restartResult = RunCommand(restart, YES);
+    if (restartResult != 0) {
+        *message = [NSString stringWithFormat:
+            @"系统设置启动桥接器重启失败（状态 %d）", restartResult];
+        return NO;
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:6.0];
+    pid_t replacementPID = 0;
+    do {
+        replacementPID = FindRunningRootExecutable(runningBoardPath);
+        markerPID = RunningBoardSettingsBridgeMarkerPID();
+        if (replacementPID > 1 && replacementPID != currentPID &&
+            markerPID == replacementPID) {
+            HostLog(@"system-settings runningboard-bridge result=recovered "
+                    "old-pid=%d new-pid=%d", currentPID, replacementPID);
+            return YES;
+        }
+        usleep(100000);
+    } while (deadline.timeIntervalSinceNow > 0);
+
+    HostLog(@"system-settings runningboard-bridge result=failed old-pid=%d "
+            "replacement-pid=%d marker-pid=%d", currentPID, replacementPID,
+            markerPID);
+    *message = @"系统设置启动桥接器未进入就绪状态";
+    return NO;
+}
+
 // The desktop needs the shared ViewBridge/ExtensionKit service contracts, but
 // it does not execute any of System Settings' 48 pane binaries.  Reconcile
 // those per-pane carriers at the actual application boundary so a libmachook
@@ -2458,6 +2531,8 @@ static BOOL EnsureSystemSettingsCatalog(BOOL *repairedOut,
 // signing and trustcache work.  This remains fail-closed: System Settings is
 // launched only after the unchanged complete verifier succeeds.
 static BOOL EnsureSystemSettingsExtensionRuntime(NSString **message) {
+    SetState(YES, @"正在验证系统设置扩展运行时…", @"");
+    (void)unlink(kSettingsExtensionsRuntimeLog);
     const char *verify[] = {
         kBash, kSettingsExtensionsRuntime, "--verify", NULL,
     };
@@ -2468,6 +2543,22 @@ static BOOL EnsureSystemSettingsExtensionRuntime(NSString **message) {
         return YES;
     }
 
+    SetState(YES, @"正在增量更新系统设置依赖…", @"");
+    const char *repairDependencies[] = {
+        kBash, kSettingsExtensionsRuntime, "--repair-dependencies", NULL,
+    };
+    int dependencyRepair = RunCommandToLog(
+        repairDependencies, YES, kSettingsExtensionsRuntimeLog);
+    int dependencyVerify = dependencyRepair == 0
+        ? RunCommandToLog(verify, YES, kSettingsExtensionsRuntimeLog) : 126;
+    if (dependencyVerify == 0) {
+        HostLog(@"system-settings runtime result=verified "
+                "action=dependency-reconcile initial_verify=%d repair=%d",
+                initialVerify, dependencyRepair);
+        return YES;
+    }
+
+    SetState(YES, @"正在完整修复系统设置扩展…", @"");
     const char *prepare[] = {
         kBash, kSettingsExtensionsRuntime, NULL,
     };
@@ -2476,9 +2567,11 @@ static BOOL EnsureSystemSettingsExtensionRuntime(NSString **message) {
     int finalVerify = prepareResult == 0
         ? RunCommandToLog(verify, YES, kSettingsExtensionsRuntimeLog) : 126;
     HostLog(@"system-settings runtime result=%s initial_verify=%d "
-            "prepare=%d final_verify=%d",
+            "dependency_repair=%d dependency_verify=%d prepare=%d "
+            "final_verify=%d",
             finalVerify == 0 ? "prepared" : "failed",
-            initialVerify, prepareResult, finalVerify);
+            initialVerify, dependencyRepair, dependencyVerify,
+            prepareResult, finalVerify);
     if (finalVerify != 0) {
         *message = [NSString stringWithFormat:
             @"系统设置扩展运行时准备失败（验证 %d，准备 %d，复验 %d）",
@@ -3226,7 +3319,32 @@ static BOOL LaunchRootExecutable(const char *identifier,
     pid_t pid = 0;
     char **childEnvironment = environ;
     char **ownedEnvironment = NULL;
-    if (strcmp(identifier, "glassdemo") == 0) {
+    if (strcmp(identifier, "terminal") == 0) {
+        // Keep the Control Center/Dock launch transaction equivalent to the
+        // production Terminal launchd job emitted by macos_gui.sh. Runtime on
+        // Terminal pid 92921 proved that Host-v5 key events reached its real
+        // TTView and bash stayed alive, while the captured window remained
+        // blank for more than 40 seconds: this direct-spawn path had omitted
+        // both of that job's display-clock contracts. The existing 750-ms
+        // settle remains explicitly scoped/labeled as a Terminal usability
+        // scaffold in AppInputBridge; this branch fixes launch-environment
+        // drift rather than introducing another redraw mechanism.
+        static const char *const terminalDisplayEnvironment[] = {
+            "CA_VSYNC_OFF=1",
+            "MACWS_APP_DISPLAY_SETTLE_MS=750",
+        };
+        ownedEnvironment = CopyEnvironmentAdding(
+            terminalDisplayEnvironment,
+            sizeof(terminalDisplayEnvironment) /
+                sizeof(terminalDisplayEnvironment[0]));
+        if (!ownedEnvironment) {
+            posix_spawn_file_actions_destroy(&actions);
+            if (logFD >= 0) close(logFD);
+            *message = @"无法为 Terminal 构造显示提交环境";
+            return NO;
+        }
+        childEnvironment = ownedEnvironment;
+    } else if (strcmp(identifier, "glassdemo") == 0) {
         static const char *const nativeAGXEnvironment[] = {
             "MACWS_AGX_NATIVE=1",
             "MACWS_AGX_REGISTER_CLASSES=1",
@@ -3239,7 +3357,8 @@ static BOOL LaunchRootExecutable(const char *identifier,
         if (!ownedEnvironment) {
             posix_spawn_file_actions_destroy(&actions);
             if (logFD >= 0) close(logFD);
-            *message = @"无法为 GlassDemo 构造 native AGX 启动环境";
+            *message = [NSString stringWithFormat:
+                @"无法为 %s 构造 native AGX 启动环境", identifier];
             return NO;
         }
         childEnvironment = ownedEnvironment;
@@ -3480,6 +3599,7 @@ static BOOL LaunchAllowedApp(const char *identifier, NSString **message) {
         return NO;
     }
     if (strcmp(identifier, "system-settings") == 0) {
+        if (!EnsureRunningBoardSettingsBridge(message)) return NO;
         if (!EnsureSystemSettingsExtensionRuntime(message)) return NO;
         BOOL repaired = NO;
         if (!EnsureSystemSettingsCatalog(&repaired, message)) return NO;

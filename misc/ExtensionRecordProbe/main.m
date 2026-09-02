@@ -80,6 +80,39 @@ static id ObjectIvarNamed(id object, const char *name) {
     return nil;
 }
 
+static void WriteProbeCGImage(id image, NSString *path) {
+    if (!image || !path) return;
+    SEL cgImageSelector = sel_registerName("CGImage");
+    CGImageRef cgImage = [image respondsToSelector:cgImageSelector]
+        ? ((CGImageRef (*)(id, SEL))objc_msgSend)(image, cgImageSelector)
+        : NULL;
+    if (!cgImage && CFGetTypeID((__bridge CFTypeRef)image) ==
+                        CGImageGetTypeID()) {
+        cgImage = (__bridge CGImageRef)image;
+    }
+    NSBitmapImageRep *representation = cgImage
+        ? [[NSBitmapImageRep alloc] initWithCGImage:cgImage] : nil;
+    NSData *png = [representation representationUsingType:NSBitmapImageFileTypePNG
+                                                properties:@{}];
+    BOOL wrote = png.length && [png writeToFile:path atomically:YES];
+    printf("PROBE_IMAGE_WRITE path=%s bytes=%lu result=%u\n",
+           path.UTF8String, (unsigned long)png.length, wrote ? 1u : 0u);
+}
+
+static void DumpProbeMethods(Class cls, const char *label) {
+    for (Class owner = cls; owner; owner = class_getSuperclass(owner)) {
+        unsigned count = 0;
+        Method *methods = class_copyMethodList(owner, &count);
+        for (unsigned index = 0; index < count; index++) {
+            printf("PROBE_METHOD label=%s owner=%s selector=%s types=%s\n",
+                   label, class_getName(owner),
+                   sel_getName(method_getName(methods[index])),
+                   method_getTypeEncoding(methods[index]));
+        }
+        free(methods);
+    }
+}
+
 static IMP gOriginalGraphicVariantWithOptions;
 
 static id ProbeGraphicVariantWithOptions(id self, SEL selector, id options) {
@@ -105,6 +138,26 @@ static id ProbeGraphicVariantWithOptions(id self, SEL selector, id options) {
            result ? object_getClassName(result) : "nil",
            result ? [[result description] UTF8String] : "nil");
     DumpObjectIvars(result, "graphic-variant-result");
+    SEL safeAreaSelector = sel_registerName(
+        "_safeContentAreaBoundsForBackgroundSize:");
+    SEL scaledRectSelector = sel_registerName(
+        "_scaledContentRectForBackgroundSize:safeContentArea:");
+    if (result && [result respondsToSelector:safeAreaSelector] &&
+        [result respondsToSelector:scaledRectSelector]) {
+        CGSize backgroundSize = CGSizeMake(32.0, 32.0);
+        CGRect safeArea = ((CGRect (*)(id, SEL, CGSize))objc_msgSend)(
+            result, safeAreaSelector, backgroundSize);
+        CGRect contentRect = ((CGRect (*)(id, SEL, CGSize, CGRect))objc_msgSend)(
+            result, scaledRectSelector, backgroundSize, safeArea);
+        printf("GRAPHIC_VARIANT_GEOMETRY background=%.3fx%.3f "
+               "safe=(%.3f,%.3f %.3fx%.3f) "
+               "content=(%.3f,%.3f %.3fx%.3f)\n",
+               backgroundSize.width, backgroundSize.height,
+               safeArea.origin.x, safeArea.origin.y,
+               safeArea.size.width, safeArea.size.height,
+               contentRect.origin.x, contentRect.origin.y,
+               contentRect.size.width, contentRect.size.height);
+    }
     if (result && [result respondsToSelector:
             sel_registerName("rasterizeImageUsingScaleFactor:forTargetSize:")]) {
         id raster = ((id (*)(id, SEL, double, CGSize))objc_msgSend)(
@@ -454,6 +507,45 @@ static int DumpIconRecord(void) {
     DumpObjectIvars(iconResource, "resource-after-resolve");
     id resourceDescriptor = ObjectIvarNamed(iconResource, "_descriptor");
     DumpObjectIvars(resourceDescriptor, "resource-descriptor-after-resolve");
+    DumpProbeMethods(object_getClass(resourceDescriptor),
+                     "resource-descriptor-after-resolve");
+    const char *const descriptorSelectors[] = {
+        "enclosureColors", "symbolColors", "resolvedEnclosureColors",
+        "resolvedSymbolColors", "_defaultEnclosureColor",
+        "_defaultSymbolColor", "resolvedName", NULL,
+    };
+    for (const char *const *name = descriptorSelectors; *name; name++) {
+        id value = SendObject(resourceDescriptor, *name);
+        printf("DESCRIPTOR_VALUE selector=%s class=%s value=%s\n", *name,
+               value ? object_getClassName(value) : "nil",
+               value ? [[value description] UTF8String] : "nil");
+    }
+    NSArray *resolvedEnclosure = SendObject(resourceDescriptor,
+                                             "resolvedEnclosureColors");
+    NSArray *resolvedSymbol = SendObject(resourceDescriptor,
+                                          "resolvedSymbolColors");
+    DumpObjectIvars(resolvedEnclosure.firstObject,
+                    "resolved-enclosure-color");
+    DumpObjectIvars(resolvedSymbol.firstObject, "resolved-symbol-color");
+    DumpProbeMethods(objc_getClass("IFColor"), "if-color");
+    printf("DESCRIPTOR_NUMERIC resolvedShape=%ld shape=%ld resolvedFill=%ld "
+           "fill=%ld symbolOffset=%.3f,%.3f\n",
+           (long)SendInteger(resourceDescriptor, "resolvedShape"),
+           (long)SendInteger(resourceDescriptor, "shape"),
+           (long)SendInteger(resourceDescriptor, "resolvedFill"),
+           (long)SendInteger(resourceDescriptor, "fill"),
+           ((CGSize (*)(id, SEL))objc_msgSend)(
+               resourceDescriptor, sel_registerName("symbolOffset")).width,
+           ((CGSize (*)(id, SEL))objc_msgSend)(
+               resourceDescriptor, sel_registerName("symbolOffset")).height);
+    SEL shapeNameSelector = sel_registerName("_overridesShapeStringForShape:");
+    for (NSInteger shape = 0; shape < 8; shape++) {
+        id value = [resourceDescriptor respondsToSelector:shapeNameSelector]
+            ? ((id (*)(id, SEL, NSInteger))objc_msgSend)(
+                  resourceDescriptor, shapeNameSelector, shape) : nil;
+        printf("DESCRIPTOR_SHAPE value=%ld name=%s\n", (long)shape,
+               value ? [[value description] UTF8String] : "nil");
+    }
     DumpObjectIvars(SendObject(resourceDescriptor, "_resourceProvider"),
                     "resource-descriptor-provider-after-resolve");
     Class ifSymbolClass = objc_getClass("IFSymbol");
@@ -525,6 +617,8 @@ static int DumpIconRecord(void) {
                raster && [raster respondsToSelector:sel_registerName("CGImage")]
                    ? ((void *(*)(id, SEL))objc_msgSend)(
                          raster, sel_registerName("CGImage")) : NULL);
+        WriteProbeCGImage(raster,
+                          @"/tmp/macws-settings-appearance-raw-symbol.png");
     }
     printf("ICON_PROVIDER class=%s value=%s supports=%u only=%u "
            "resource-class=%s resource=%s template-class=%s template=%s\n",
@@ -551,6 +645,7 @@ static int DumpIconRecord(void) {
         printf("ICON_PROVIDER_IMAGE class=%s value=%s\n",
                image ? object_getClassName(image) : "nil",
                image ? [[image description] UTF8String] : "nil");
+        WriteProbeCGImage(image, @"/tmp/macws-settings-appearance-icon.png");
         if (image && [image respondsToSelector:sel_registerName("TIFFRepresentation")]) {
             NSData *tiff = SendObject(image, "TIFFRepresentation");
             NSString *outputPath = @"/tmp/macws-settings-appearance-icon.tiff";
@@ -559,6 +654,17 @@ static int DumpIconRecord(void) {
                    [outputPath UTF8String], (unsigned long)tiff.length,
                    wrote ? 1u : 0u);
         }
+    }
+    if (templateResource && [templateResource respondsToSelector:
+            sel_registerName("imageForSize:scale:")]) {
+        id image = ((id (*)(id, SEL, CGSize, double))objc_msgSend)(
+            templateResource, sel_registerName("imageForSize:scale:"),
+            CGSizeMake(32.0, 32.0), 2.0);
+        printf("TEMPLATE_PROVIDER_IMAGE class=%s value=%s\n",
+               image ? object_getClassName(image) : "nil",
+               image ? [[image description] UTF8String] : "nil");
+        WriteProbeCGImage(image,
+                          @"/tmp/macws-settings-appearance-template.png");
     }
     NSDictionary *iconsDictionary = bundle.infoDictionary[@"CFBundleIcons"];
     id graphicConfiguration = iconsDictionary[@"ISGraphicIconConfiguration"];

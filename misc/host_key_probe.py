@@ -54,13 +54,20 @@ def main():
         help=("seconds to keep each key down before key-up; games that sample "
               "key state once per render tick need a nonzero hold"))
     parser.add_argument("--interval", type=float, default=0.012)
+    parser.add_argument(
+        "--trace-sentinel",
+        help=("create this sentinel immediately before sending input and "
+              "remove it after --trace-settle"))
+    parser.add_argument(
+        "--trace-settle", type=float, default=0.0,
+        help="seconds to retain --trace-sentinel after the last key")
     parser.add_argument("--socket",
                         default="/var/mnt/rootfs/private/tmp/macws_host_input.sock")
     args = parser.parse_args()
     if args.key_window and args.window != 0:
         parser.error("--key-window cannot be combined with --window")
     if (args.pid <= 1 or args.width <= 0 or args.height <= 0 or
-            args.interval < 0 or args.hold < 0):
+            args.interval < 0 or args.hold < 0 or args.trace_settle < 0):
         parser.error(
             "pid/geometry must be positive and timing values nonnegative")
     window = 0 if args.key_window else resolve_window(args.pid, args.window)
@@ -77,30 +84,43 @@ def main():
     sock.bind(local)
     sequence = 0
     sent = []
-    for value, flags in values:
-        name = value.lower()
-        if value == "\n":
-            name = "return"
-        elif value == "\t":
-            name = "tab"
-        elif value == " ":
-            name = "space"
-        code = KEY_CODES.get(name, 0)
-        symbol = SPECIAL_SYMBOLS.get(name, ord(value) if len(value) == 1 else 0)
-        for kind in (KEY_DOWN, KEY_UP):
-            sequence += 1
-            sock.sendto(record(
-                kind, sequence, args.pid, window, args.width, args.height,
-                args.width / 2, args.height / 2, pressure=code,
-                contact=symbol, source=SOURCE_HARDWARE_KEYBOARD,
-                modifiers=flags), args.socket)
-            if kind == KEY_DOWN and args.hold:
-                time.sleep(args.hold)
-        sent.append(value)
-        if args.interval:
-            time.sleep(args.interval)
-    sock.close()
-    os.unlink(local)
+    try:
+        if args.trace_sentinel:
+            with open(args.trace_sentinel, "a", encoding="utf-8"):
+                pass
+        for value, flags in values:
+            name = value.lower()
+            if value == "\n":
+                name = "return"
+            elif value == "\t":
+                name = "tab"
+            elif value == " ":
+                name = "space"
+            code = KEY_CODES.get(name, 0)
+            symbol = SPECIAL_SYMBOLS.get(
+                name, ord(value) if len(value) == 1 else 0)
+            for kind in (KEY_DOWN, KEY_UP):
+                sequence += 1
+                sock.sendto(record(
+                    kind, sequence, args.pid, window, args.width, args.height,
+                    args.width / 2, args.height / 2, pressure=code,
+                    contact=symbol, source=SOURCE_HARDWARE_KEYBOARD,
+                    modifiers=flags), args.socket)
+                if kind == KEY_DOWN and args.hold:
+                    time.sleep(args.hold)
+            sent.append(value)
+            if args.interval:
+                time.sleep(args.interval)
+        if args.trace_settle:
+            time.sleep(args.trace_settle)
+    finally:
+        sock.close()
+        os.unlink(local)
+        if args.trace_sentinel:
+            try:
+                os.unlink(args.trace_sentinel)
+            except FileNotFoundError:
+                pass
     print(f"keys={len(sent)} records={sequence} pid={args.pid} window={window}")
 
 

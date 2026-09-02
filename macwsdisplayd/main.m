@@ -1103,12 +1103,78 @@ static void SendWindowList(MacWSDisplayClient *client) {
     NSUInteger emitted = 0;
     NSMutableDictionary<NSNumber *, NSDictionary *> *metricsByPID =
         [NSMutableDictionary dictionary];
+    NSArray<NSDictionary *> *onScreenWindowInfo = CopyOnScreenWindowInfo();
+    NSArray<NSDictionary *> *catalogWindowInfo = CopyCatalogWindowInfo();
+    // The Host uses this array for hit-testing pixels from FinalComposite, so
+    // preserve WindowServer's live front-to-back OnScreenOnly order. Append
+    // OptionAll-only entries afterward to retain lifecycle/fullscreen
+    // identities without allowing that unordered identity catalog to shadow
+    // what is actually visible. Runtime-confirmed on 2026-08-30: the old
+    // OptionAll-first array retained Settings child window 302 over Activity
+    // Monitor and routed scroll records to PID 95665 even after Activity was
+    // frontmost.
+    NSMutableArray<NSDictionary *> *orderedWindowInfo =
+        [NSMutableArray arrayWithCapacity:
+            onScreenWindowInfo.count + catalogWindowInfo.count];
+    NSMutableSet<NSNumber *> *orderedWindowIDs = [NSMutableSet set];
+    for (NSDictionary *info in onScreenWindowInfo) {
+        uint32_t windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
+        if (windowID == 0) continue;
+        [orderedWindowInfo addObject:info];
+        [orderedWindowIDs addObject:@(windowID)];
+    }
+    for (NSDictionary *info in catalogWindowInfo) {
+        uint32_t windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
+        if (windowID == 0 || [orderedWindowIDs containsObject:@(windowID)])
+            continue;
+        [orderedWindowInfo addObject:info];
+        [orderedWindowIDs addObject:@(windowID)];
+    }
+    // The live OnScreenOnly list is WindowServer's front-to-back presentation
+    // order. Runtime-confirmed after activating System Settings and Terminal
+    // over the same desktop: this ordering followed the rendered menu bar and
+    // window stack while NSWorkspace.frontmostApplication briefly retained
+    // the previous process. Select the first real AppKit level-zero window by
+    // joining it with that process's published window metrics. OptionAll is
+    // still used below for lifecycle/fullscreen identities, but never as a
+    // z-order authority.
+    pid_t frontmostPID = 0;
+    uint32_t frontmostWindowID = 0;
+    for (NSDictionary *info in onScreenWindowInfo) {
+        pid_t ownerPID = [info[(id)kCGWindowOwnerPID] intValue];
+        uint32_t windowID = [info[(id)kCGWindowNumber] unsignedIntValue];
+        if (ownerPID <= 1 || windowID == 0) continue;
+        NSNumber *pidKey = @(ownerPID);
+        NSDictionary<NSNumber *, NSValue *> *processMetrics =
+            metricsByPID[pidKey];
+        if (!processMetrics) {
+            processMetrics = CopyWindowMetrics(ownerPID);
+            metricsByPID[pidKey] = processMetrics;
+        }
+        NSValue *metricsValue = processMetrics[@(windowID)];
+        if (!metricsValue) continue;
+        MacWSWindowMetricsEntry metrics = {0};
+        [metricsValue getValue:&metrics];
+        if ((metrics.flags & MacWSStreamWindowVisible) == 0 ||
+            (metrics.flags & MacWSStreamWindowTransient) != 0) continue;
+        MacWSStreamWindowFlags fullscreenAuthority =
+            MacWSStreamWindowFocused | MacWSStreamWindowFullscreenCanvas;
+        BOOL focusedFullscreenCanvas =
+            (metrics.flags & fullscreenAuthority) == fullscreenAuthority;
+        NSInteger layer = [info[(id)kCGWindowLayer] integerValue];
+        if (layer != 0 && !focusedFullscreenCanvas) continue;
+        frontmostPID = ownerPID;
+        frontmostWindowID = windowID;
+        break;
+    }
+    NSRunningApplication *workspaceFrontmost =
+        NSWorkspace.sharedWorkspace.frontmostApplication;
     NSMutableDictionary<NSNumber *, NSNumber *> *focusedWindowOwners =
         [client.focusedWindowOwners mutableCopy] ?:
             [NSMutableDictionary dictionary];
     NSMutableDictionary<NSNumber *, NSNumber *> *liveWindowOwners =
         [NSMutableDictionary dictionary];
-    for (NSDictionary *info in CopyCatalogWindowInfo()) {
+    for (NSDictionary *info in orderedWindowInfo) {
         if (emitted >= MACWS_STREAM_MAX_WINDOWS) break;
         int32_t ownerPID = [info[(id)kCGWindowOwnerPID] intValue];
         uint32_t candidateWindowID =
@@ -1147,6 +1213,9 @@ static void SendWindowList(MacWSDisplayClient *client) {
             (metrics.flags & MacWSStreamWindowTransient) != 0) continue;
         MacWSStreamWindowDescriptor descriptor = WindowDescriptor(
             info, &metrics);
+        if (frontmostPID > 1 && descriptor.ownerPID == frontmostPID &&
+            descriptor.windowID == frontmostWindowID)
+            descriptor.flags |= MacWSStreamWindowFrontmostApplication;
         if (descriptor.windowID == 0 || descriptor.ownerPID <= 1 ||
             descriptor.logicalWidth <= 1 || descriptor.logicalHeight <= 1)
             continue;
@@ -1188,6 +1257,15 @@ static void SendWindowList(MacWSDisplayClient *client) {
             [focusedWindowOwners removeObjectForKey:windowID];
     }
     client.focusedWindowOwners = focusedWindowOwners;
+    if (MacWSDisplayDiagnosticsEnabled()) {
+        DisplayLog(@"window-list frontmost-pid=%d frontmost-window=%u "
+                   "source=onscreen-front-to-back workspace-pid=%d "
+                   "workspace-name=%@ emitted=%lu", frontmostPID,
+                   frontmostWindowID,
+                   workspaceFrontmost.processIdentifier,
+                   workspaceFrontmost.localizedName ?: @"",
+                   (unsigned long)emitted);
+    }
     xpc_dictionary_set_value(event, MACWS_STREAM_KEY_WINDOWS, array);
     xpc_connection_send_message(client.connection, event);
 }
