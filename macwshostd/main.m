@@ -216,12 +216,11 @@ static pid_t gActiveAppPID;
 static NSString *gActiveAppID = @"";
 // All application entry points (Control Center, Dock and direct AppKit
 // relaunch) converge on this process-identity table.  It is deliberately
-// owned by gControlQueue so launch, exit, Dock convergence and orphan cleanup
+// owned by gControlQueue so launch, exit observation and orphan cleanup
 // form one serialized session transaction instead of racing independent
 // one-shot repairs.
 static NSMutableDictionary<NSString *, NSMutableDictionary *> *gApplicationSessions;
 static dispatch_source_t gApplicationSupervisorTimer;
-static uint64_t gDockConvergenceGeneration;
 static pid_t gObservedOrphanOverlayPID;
 static CFAbsoluteTime gObservedOrphanOverlaySince;
 // Steam's overlay is discovered while a Steam session is live and then
@@ -1856,16 +1855,13 @@ static pid_t FindRunningRootExecutable(NSString *rootPath) {
     return found;
 }
 
-// LaunchServices' authoritative running-application record does retire when a
-// bridged AppKit process exits, but the macOS 13.4 Dock in this chroot does not
-// receive the corresponding termination notification. Runtime evidence: after
-// a clean final-window close, lsappinfo no longer listed Terminal while Dock
-// kept its running dot; restarting only Dock removed it. RE evidence from the
-// exact Dock binary: its state rebuild calls _LSCopyRunningApplicationArray at
-// Dock+0x2a8cd4. Rebuild only after the exact target process is gone, and only
-// terminate the exact Dock executable. This is deliberately a bounded
-// compatibility repair for the missing notification, not an assertion that
-// the native notification path is fixed.
+// Observe the target's exit without mutating Dock. Runtime log
+// 1788447667.111..1788447668.038 proves the old "refresh" implementation sent
+// SIGTERM to healthy Dock PID 72537 after VS Code PID 65948 had already exited,
+// then waited for Dock PID 54080. That compatibility repair was the reported
+// Dock restart; process exit is not authority to tear down Dock's menus,
+// Spaces, or unrelated application state. The still-missing LaunchServices
+// termination notification remains a separately labelled compatibility gap.
 static BOOL RefreshDockAfterProcessExit(pid_t targetPID, NSString **message) {
     if (targetPID <= 1) {
         *message = @"缺少有效的应用进程标识，Dock 未改动";
@@ -1886,39 +1882,10 @@ static BOOL RefreshDockAfterProcessExit(pid_t targetPID, NSString **message) {
         return YES;
     }
 
-    NSString *dockPath =
-        @"/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock";
-    pid_t oldDockPID = FindRunningRootExecutable(dockPath);
-    if (oldDockPID <= 1) {
-        HostLog(@"dock-refresh target=%d state=already-absent", targetPID);
-        *message = @"应用已退出；Dock 当前未运行，无陈旧状态可清理";
-        return YES;
-    }
-    HostLog(@"dock-refresh target=%d dock=%d signal=TERM", targetPID,
-            oldDockPID);
-    if (kill(oldDockPID, SIGTERM) != 0 && errno != ESRCH) {
-        *message = [NSString stringWithFormat:
-            @"应用已退出，但 Dock 状态重建失败（PID %d，errno=%d）",
-            oldDockPID, errno];
-        return NO;
-    }
-
-    NSDate *restartDeadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
-    pid_t newDockPID = 0;
-    while (restartDeadline.timeIntervalSinceNow > 0) {
-        newDockPID = FindRunningRootExecutable(dockPath);
-        if (newDockPID > 1 && newDockPID != oldDockPID) break;
-        usleep(50000);
-    }
-    if (newDockPID <= 1 || newDockPID == oldDockPID) {
-        *message = [NSString stringWithFormat:
-            @"应用已退出，但 Dock 未在时限内完成状态重建（旧 PID %d）",
-            oldDockPID];
-        return NO;
-    }
-    HostLog(@"dock-refresh complete target=%d old-dock=%d new-dock=%d",
-            targetPID, oldDockPID, newDockPID);
-    *message = @"应用已退出，Dock 运行状态已重建";
+    HostLog(@"dock-refresh target=%d result=preserved "
+            "compatibility-gap=launchservices-termination-notification",
+            targetPID);
+    *message = @"应用已退出；Dock 保持运行";
     return YES;
 }
 
@@ -2076,40 +2043,6 @@ static void TrackApplicationSession(NSString *identifier,
     }
 }
 
-static void ScheduleDockConvergenceAfterExit(pid_t targetPID,
-                                             NSString *identifier) {
-    if (targetPID <= 1) return;
-    uint64_t generation = ++gDockConvergenceGeneration;
-    NSString *identifierCopy = [identifier copy] ?: @"app";
-    // A single application can retire several tracked entry points during one
-    // quit. Debounce that cluster so Dock rebuilds its LS-derived state once.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 350 * NSEC_PER_MSEC),
-                   gControlQueue, ^{
-        if (generation != gDockConvergenceGeneration) return;
-        // An exact app replacement can become ready before the retired PID's
-        // delayed Dock convergence fires. Runtime-confirmed on 2026-08-22:
-        // Steam PID 29644 and UI owner 30049 were already visible when the
-        // old PID 22860 transaction restarted Dock 20533. That unnecessary
-        // restart races the fresh LaunchServices registration and is itself a
-        // source of missing tiles/glass. A live replacement owns convergence;
-        // only a session with no replacement requires a Dock state rebuild.
-        for (NSDictionary *session in gApplicationSessions.allValues) {
-            if (![session[@"identifier"] isEqualToString:identifierCopy] ||
-                [session[@"pid"] intValue] == targetPID) continue;
-            HostLog(@"app-session dock-converge id=%@ target=%d "
-                    "result=skipped reason=replacement-live replacement=%d",
-                    identifierCopy, targetPID,
-                    [session[@"pid"] intValue]);
-            return;
-        }
-        NSString *message = nil;
-        BOOL refreshed = RefreshDockAfterProcessExit(targetPID, &message);
-        HostLog(@"app-session dock-converge id=%@ target=%d result=%@ "
-                "message=%@", identifierCopy, targetPID,
-                refreshed ? @"ready" : @"failed", message ?: @"");
-    });
-}
-
 static void ApplicationSessionObservedExit(pid_t pid, NSString *identifier,
                                            NSString *witness) {
     if (pid <= 1) return;
@@ -2133,7 +2066,6 @@ static void ApplicationSessionObservedExit(pid_t pid, NSString *identifier,
     if (!removed) return;
     HostLog(@"app-session exit id=%@ pid=%d witness=%@",
             resolvedIdentifier, pid, witness ?: @"process-absent");
-    ScheduleDockConvergenceAfterExit(pid, resolvedIdentifier);
 }
 
 static BOOL ApplicationSessionPIDMatchesPath(pid_t pid, NSString *rootPath,
@@ -5638,9 +5570,9 @@ static void ServeRequest(xpc_object_t request) {
             message = ok ? @"共享帧已刷新并由 WindowServer 确认" :
                 @"WindowServer 未在 60 秒内确认刷新帧";
         } else if (strcmp(op, MACWS_CONTROL_OP_REFRESH_DOCK) == 0) {
-            // This operation is internal to the Scene close transaction. It
-            // never terminates the target application; it only observes that
-            // the application has already exited before rebuilding Dock.
+            // Retained for protocol compatibility with older Host builds. It
+            // now only verifies that the target exited; a normal app close is
+            // never authority to terminate the healthy Dock process.
             pid_t targetPID = (pid_t)xpc_dictionary_get_int64(
                 request, MACWS_CONTROL_KEY_TARGET_PID);
             ok = RefreshDockAfterProcessExit(targetPID, &message);

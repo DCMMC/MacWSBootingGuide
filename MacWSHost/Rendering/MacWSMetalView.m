@@ -4863,13 +4863,20 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         case UIGestureRecognizerStateBegan: {
             // UIKit has already accumulated real movement while Possible,
             // including the short three-finger chord interval. Preserve that
-            // first delta; resetting it here caused the visible pinch dead
-            // zone even after gesture recognition had succeeded.
+            // first delta. The Ventura event bridge deliberately encodes a
+            // scalar only for Changed, because Began establishes the latched
+            // AppKit responder. Emit those two native phases in order before
+            // resetting UIKit's cumulative value.
             CGFloat initialAmount = recognizer.scale - 1.0;
             recognizer.scale = 1.0;
-            [self emitMagnifyAtFramePoint:framePoint amount:initialAmount
+            [self emitMagnifyAtFramePoint:framePoint amount:0.0
                                     flags:MacWSInputFlagGestureBegan
                                 timestamp:timestamp];
+            if (fabs(initialAmount) > 0.00001) {
+                [self emitMagnifyAtFramePoint:framePoint amount:initialAmount
+                                        flags:MacWSInputFlagGestureChanged
+                                    timestamp:timestamp];
+            }
             break;
         }
         case UIGestureRecognizerStateChanged: {
@@ -4909,12 +4916,28 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     NSTimeInterval timestamp = CACurrentMediaTime();
     switch (recognizer.state) {
-        case UIGestureRecognizerStateBegan:
+        case UIGestureRecognizerStateBegan: {
+            // Source-confirmed: the chord gate can leave this recognizer
+            // Possible while it accumulates rotation. The Ventura event
+            // bridge intentionally consumes rotation only on Changed, so a
+            // nonzero Began scalar would still be discarded. Establish the
+            // native responder with Began, then deliver the accumulated
+            // physical delta as the immediately following Changed phase.
+            CGFloat initialDegrees =
+                MacWSAppKitRotationDegreesForUIKitRadians(
+                    recognizer.rotation);
             recognizer.rotation = 0.0;
             [self emitRotationAtFramePoint:framePoint degrees:0.0
                                      flags:MacWSInputFlagGestureBegan
                                  timestamp:timestamp];
+            if (fabs(initialDegrees) > 0.0001) {
+                [self emitRotationAtFramePoint:framePoint
+                                       degrees:initialDegrees
+                                         flags:MacWSInputFlagGestureChanged
+                                     timestamp:timestamp];
+            }
             break;
+        }
         case UIGestureRecognizerStateChanged: {
             // UIKit reports cumulative radians; Ventura NSEvent.rotation is
             // an incremental degree value. Consume each delta once.

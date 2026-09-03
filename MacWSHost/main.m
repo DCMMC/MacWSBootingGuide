@@ -765,29 +765,11 @@ static BOOL MacWSCloseMacWindowForSceneSession(UISceneSession *session,
         [MacWSSceneBindings removeObjectForKey:identifier];
         MacWSSetPersistedSceneBinding(identifier, nil);
 
-        // Runtime-confirmed on macOS 13.4 in this chroot: after Terminal's
-        // final window accepted performClose: and NSApplication terminated,
-        // lsappinfo immediately stopped listing the process but Dock retained
-        // its running dot. Restarting only Dock rebuilt the correct state via
-        // its imported _LSCopyRunningApplicationArray. Ask root hostd to do
-        // that bounded repair only after it proves this exact owner PID has
-        // exited. A vetoed close or a process with another window stays alive
-        // and therefore cannot trigger the repair.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     450 * NSEC_PER_MSEC),
-                       dispatch_get_main_queue(), ^{
-            MacWSControlClient *client = [MacWSControlClient new];
-            [client performOperation:@MACWS_CONTROL_OP_REFRESH_DOCK
-                           arguments:@{
-                               @MACWS_CONTROL_KEY_TARGET_PID: @(ownerPID)
-                           }
-                          completion:^(NSDictionary<NSString *,id> *reply) {
-                MacWSLog(@"scene-close dock-refresh target=%d ok=%@ message=%@",
-                         ownerPID,
-                         [reply[@"ok"] boolValue] ? @"YES" : @"NO",
-                         reply[@"message"] ?: @"");
-            }];
-        });
+        // Do not mutate Dock from the Scene teardown. Runtime log
+        // 1788447667.111..1788447668.038 proved that the former delayed
+        // request explicitly sent SIGTERM to a healthy Dock after VS Code had
+        // already exited. The app-session supervisor remains the process-exit
+        // authority; the native Dock must keep its own menu/Space lifetime.
     }
     MacWSLog(@"scene-close source=%@ id=%@ window=%u target=%d sent=%@ errno=%d",
              source ?: @"unknown", identifier, windowID, ownerPID,
@@ -2686,12 +2668,21 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 }
 
 - (void)restoreHardwareKeyboardFocusWithReason:(NSString *)reason {
-    if (!_controlPanel.hidden || _keyboardProxy.isFirstResponder) return;
+    // Ownership, not overlay visibility, decides where a physical key goes.
+    // Runtime-confirmed via MacWSHost.log 1788452170.166: the current
+    // fullscreen workspace (mode=1) can restore hardware focus while this
+    // source keeps its control panel visible. The former `_controlPanel.hidden`
+    // predicate rejected that route before the already-healthy broker could
+    // see it. Preserve UIKit typing only for the two real text responders
+    // owned by this controller.
+    if (_keyboardProxy.isFirstResponder || _appSearchField.isFirstResponder)
+        return;
     [_metalView restoreHardwareKeyboardFocusWithReason:reason];
 }
 
 - (BOOL)forwardHardwarePressEvent:(UIPressesEvent *)event {
-    if (!_controlPanel.hidden || !_metalView.isMacWSInputEnabled || !event)
+    if (_keyboardProxy.isFirstResponder || _appSearchField.isFirstResponder ||
+        !_metalView.isMacWSInputEnabled || !event)
         return NO;
     BOOL forwarded = NO;
     for (UIPress *press in event.allPresses) {
@@ -4199,8 +4190,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     } else if ([action isEqualToString:@"test-quit"]) {
         // Exercise the same serialized NSMenuItem action used by macPad's
         // mirrored menu bar. This is an end-to-end quit witness, unlike a
-        // signal or a direct process kill, and lets the session supervisor
-        // prove Dock convergence after the application accepts termination.
+        // signal or a direct process kill, and proves that the application
+        // accepted its normal termination action without restarting Dock.
         [self performSemanticShortcutForDiagnostics:@"⌘Q"];
     } else if ([action isEqualToString:@"fullscreen"]) {
         [self openFullscreenWorkspace];
@@ -5276,9 +5267,10 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 // workspace is the active UI. The former MTKView-only pressesBegan: path had a
 // responder ownership precondition even though this app intentionally moves
 // first responder among the Metal view, controls, restored Scenes and a hidden
-// keyboard proxy. Returning to UIKit for control-center/unsupported events
-// preserves native text-field and Scene behavior, while a forwarded event is
-// consumed exactly once so MTKView's responder fallback cannot duplicate it.
+// keyboard proxy. Returning to UIKit while an actual Host text field owns the
+// responder preserves native typing; merely showing the control panel does not
+// take the macOS keyboard route away. A forwarded event is consumed exactly
+// once so MTKView's responder fallback cannot duplicate it.
 @interface MacWSWorkspaceWindow : UIWindow
 @end
 

@@ -5552,6 +5552,11 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                                dispatch_get_main_queue(), ^{
                     BOOL visibleAfterLifecycle = NO;
                     id orderCandidate = nil;
+                    NSInteger orderCandidateRank = 0;
+                    id keyWindow = ((MacWSMsgID)objc_msgSend)(
+                        application, sel_registerName("keyWindow"));
+                    id mainWindow = ((MacWSMsgID)objc_msgSend)(
+                        application, sel_registerName("mainWindow"));
                     id reopenedWindows = ((MacWSMsgID)objc_msgSend)(
                         application, sel_registerName("windows"));
                     for (id window in reopenedWindows) {
@@ -5563,32 +5568,37 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                                 window, &presentationKnown);
                         BOOL visible = logicalVisible &&
                             (!presentationKnown || presentationOnScreen);
-                        if (visible) {
-                            visibleAfterLifecycle = YES;
-                            break;
-                        }
+                        if (visible) visibleAfterLifecycle = YES;
                         BOOL canBecomeKey = ((MacWSMsgBool)objc_msgSend)(
                             window, sel_registerName("canBecomeKeyWindow"));
                         NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
                             window, sel_registerName("windowNumber"));
-                        if (!orderCandidate && canBecomeKey && number > 0)
+                        NSInteger level = ((MacWSMsgInteger)objc_msgSend)(
+                            window, sel_registerName("level"));
+                        NSInteger rank = window == keyWindow ? 3 :
+                            (window == mainWindow ? 2 : (level == 0 ? 1 : 0));
+                        if (canBecomeKey && number > 0 &&
+                            rank > orderCandidateRank) {
                             orderCandidate = window;
+                            orderCandidateRank = rank;
+                        }
                     }
                     BOOL orderedExisting = NO;
-                    if (!visibleAfterLifecycle && orderCandidate) {
+                    if (orderCandidate) {
                         SEL orderFront = sel_registerName(
                             "makeKeyAndOrderFront:");
                         if (((MacWSMsgBoolSEL)objc_msgSend)(
                                 orderCandidate,
                                 sel_registerName("respondsToSelector:"),
                                 orderFront)) {
-                            // Runtime-confirmed System Settings invariant:
-                            // finishLaunching created one real, key-capable
-                            // NSWindow at (239,87,715x625), but the missing LS
-                            // event left only its ordering transaction undone.
-                            // Use that existing app-owned window's ordinary
-                            // AppKit order method; never synthesize a window or
-                            // bypass validation inside WindowServer/SkyLight.
+                            // Runtime-confirmed on 2026-09-03: activating Maps
+                            // changed the global menu owner to Maps while an
+                            // Activity Monitor window remained above its real
+                            // window. Logical visibility is therefore not the
+                            // reopen postcondition. Use the app's existing
+                            // key/main level-zero window and AppKit's ordinary
+                            // ordering method; never synthesize a window or
+                            // bypass WindowServer/SkyLight validation.
                             ((MacWSMsgVoidID)objc_msgSend)(
                                 orderCandidate, orderFront, nil);
                             SEL activate = sel_registerName(
@@ -5610,16 +5620,16 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                                       sel_registerName("isVisible"));
                         }
                     }
-                    if (MacWSRuntimeDiagnosticsEnabled() ||
-                        (!visibleAfterLifecycle && !orderedExisting)) {
+                    if (MacWSRuntimeDiagnosticsEnabled() || !orderedExisting) {
                         fprintf(stderr,
                             "#### APP-INPUT REOPEN-WINDOW pid=%d "
-                            "visible-after-lifecycle=%s candidate=%s "
+                            "visible-before-order=%s candidate=%s rank=%ld "
                             "ordered-existing=%s\n",
                             getpid(),
                             visibleAfterLifecycle ? "YES" : "NO",
                             orderCandidate
                                 ? object_getClassName(orderCandidate) : "nil",
+                            (long)orderCandidateRank,
                             orderedExisting ? "YES" : "NO");
                         fflush(stderr);
                     }
