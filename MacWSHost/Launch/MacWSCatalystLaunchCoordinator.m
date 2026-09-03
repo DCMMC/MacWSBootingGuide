@@ -3,6 +3,7 @@
 #import "MacWSHostDiagnostics.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -15,6 +16,8 @@ CFStringRef const MacWSLaunchCatalystFromHostNotification =
 static const char MacWSCatalystLauncherPath[] =
     "/var/jb/Applications/MacWSCatalystLauncher.app/"
     "MacWSCatalystLauncher";
+static const char MacWSCatalystLauncherLogPath[] =
+    "/var/mobile/Library/Logs/MacWSCatalystLauncher.host.log";
 
 static BOOL MacWSSpawnCatalystLauncher(const char *mode,
                                        const char *logPrefix,
@@ -25,9 +28,27 @@ static BOOL MacWSSpawnCatalystLauncher(const char *mode,
         NULL,
     };
     extern char **environ;
+    posix_spawn_file_actions_t actions;
+    int actionsError = posix_spawn_file_actions_init(&actions);
+    int logDescriptor = -1;
+    if (actionsError == 0) {
+        logDescriptor = open(MacWSCatalystLauncherLogPath,
+                             O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC,
+                             0644);
+        if (logDescriptor >= 0) {
+            (void)posix_spawn_file_actions_adddup2(
+                &actions, logDescriptor, STDOUT_FILENO);
+            (void)posix_spawn_file_actions_adddup2(
+                &actions, logDescriptor, STDERR_FILENO);
+            (void)posix_spawn_file_actions_addclose(&actions, logDescriptor);
+        }
+    }
     pid_t child = 0;
     int error = posix_spawn(&child, MacWSCatalystLauncherPath,
-                            NULL, NULL, arguments, environ);
+                            actionsError == 0 ? &actions : NULL,
+                            NULL, arguments, environ);
+    if (actionsError == 0) posix_spawn_file_actions_destroy(&actions);
+    if (logDescriptor >= 0) close(logDescriptor);
     if (errorOut) *errorOut = error;
     MacWSLog(@"%s spawn result=%d child=%d parent=%d",
              logPrefix, error, child, getpid());

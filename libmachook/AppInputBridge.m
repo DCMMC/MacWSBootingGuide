@@ -107,6 +107,7 @@ typedef NSUInteger (*MacWSPressedMouseButtons)(id, SEL);
 typedef CGPoint (*MacWSMouseLocation)(id, SEL);
 typedef int32_t (*MacWSCancelMenuTrackingPrivate)(uint8_t);
 typedef int32_t (*MacWSCGWindowLevelForKey)(int32_t);
+typedef CFArrayRef (*MacWSCGWindowListCopyWindowInfo)(uint32_t, uint32_t);
 typedef void (*MacWSOrderWindow)(id, SEL, NSInteger, NSInteger);
 typedef void (*MacWSToggleFullScreen)(id, SEL, id);
 
@@ -124,6 +125,8 @@ static void MacWSNotifyDisplayGeometryChanged(uint32_t windowID, id window,
 static void MacWSInstallWindowGeometryObservers(void);
 static BOOL MacWSMainBundleUsesFullscreenCanvasPresentation(void);
 static void MacWSInstallFullscreenTransitionPrerequisite(void);
+static BOOL MacWSWindowPresentationIsOnScreen(id window,
+                                              BOOL *knownOut);
 // Main-thread-only semantic menu snapshot cache. ObjC objects never cross the
 // process boundary: Host receives generation-scoped integer IDs, while the
 // target process retains the corresponding item and index path solely long
@@ -2904,7 +2907,8 @@ static MacWSPostLegacyMouseEvent MacWSLegacySystemMousePoster(void) {
 // at the application boundary below.
 static BOOL MacWSPostSystemScrollEvent(
         MacWSInputRecord record, CGPoint screenPoint, CGRect screenFrame,
-        id window, NSInteger windowNumber, NSInteger globalWindowNumber) {
+        id window, CGPoint windowPoint, NSInteger windowNumber,
+        NSInteger globalWindowNumber) {
     // Electron's renderer consumes the ordinary process-local precise NSEvent
     // path below. Runtime CDP on VSCode PID 65571 measured the remote wheel
     // fallback at 240 CSS px for six 10-point samples (4x the finger travel),
@@ -2918,6 +2922,15 @@ static BOOL MacWSPostSystemScrollEvent(
     // CGPostScrollWheelEvent route already restored System Settings' SwiftUI
     // scroll boundary, and the exact global-window equality below prevents it
     // from escaping into a covered or stale scene.
+    // Mac Catalyst's real client-area owner is the process-local UINS view
+    // hierarchy, just like Electron's renderer. Sending that content through
+    // CGPostScrollWheelEvent quantizes 40 logical pixels into one legacy wheel
+    // unit; Weather consequently moved much less than the same gesture in
+    // VSCode. The existing generic Catalyst policy identifies only the client
+    // area, so title bars and every native AppKit window retain the proven
+    // WindowServer route while Catalyst receives the precise pixel NSEvent.
+    if (MacWSCatalystWindowUsesProcessLocalInputAtPoint(
+            window, windowPoint)) return NO;
     Class electronWindowClass = objc_getClass("ElectronNSWindow");
     if (window && electronWindowClass &&
         ((MacWSMsgBoolID)objc_msgSend)(
@@ -4524,6 +4537,52 @@ static id MacWSWindowWithNumber(id application, uint32_t windowNumber) {
     return nil;
 }
 
+static BOOL MacWSWindowPresentationIsOnScreen(id window, BOOL *knownOut) {
+    if (knownOut) *knownOut = NO;
+    if (!window) return NO;
+    NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+        window, sel_registerName("windowNumber"));
+    if (number <= 0 || (uint64_t)number > UINT32_MAX) return NO;
+
+    static MacWSCGWindowListCopyWindowInfo copyWindowInfo;
+    static id windowNumberKey;
+    static id windowOnScreenKey;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *coreGraphics = dlopen(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics",
+            RTLD_LAZY | RTLD_LOCAL);
+        if (!coreGraphics) return;
+        copyWindowInfo = (MacWSCGWindowListCopyWindowInfo)dlsym(
+            coreGraphics, "CGWindowListCopyWindowInfo");
+        CFStringRef *numberSymbol = (CFStringRef *)dlsym(
+            coreGraphics, "kCGWindowNumber");
+        CFStringRef *onScreenSymbol = (CFStringRef *)dlsym(
+            coreGraphics, "kCGWindowIsOnscreen");
+        if (numberSymbol) windowNumberKey = [(id)*numberSymbol retain];
+        if (onScreenSymbol) windowOnScreenKey = [(id)*onScreenSymbol retain];
+    });
+    if (!copyWindowInfo || !windowNumberKey || !windowOnScreenKey) return NO;
+
+    // `kCGWindowListOptionAll` and `kCGNullWindowID` are both zero.  The
+    // target application shares WindowServer's login session, unlike the
+    // isolated macwsinputd launchd session, so this is the authoritative
+    // presentation state for the existing AppKit window number.
+    CFArrayRef copied = copyWindowInfo(0, 0);
+    if (!copied) return NO;
+    BOOL found = NO;
+    BOOL onScreen = NO;
+    for (NSDictionary *description in (NSArray *)copied) {
+        if ([description[windowNumberKey] integerValue] != number) continue;
+        found = YES;
+        onScreen = [description[windowOnScreenKey] boolValue];
+        break;
+    }
+    CFRelease(copied);
+    if (knownOut) *knownOut = found;
+    return onScreen;
+}
+
 // Return the frontmost real popup-menu-level window that is visible but does
 // not contain this click. CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey) is
 // the public source of the level value; no application/class name participates
@@ -5382,8 +5441,33 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
             application, sel_registerName("windows"));
         BOOL hasVisibleWindows = NO;
         for (id window in windows) {
-            if (((MacWSMsgBool)objc_msgSend)(
-                    window, sel_registerName("isVisible"))) {
+            BOOL logicalVisible = ((MacWSMsgBool)objc_msgSend)(
+                window, sel_registerName("isVisible"));
+            BOOL presentationKnown = NO;
+            BOOL presentationOnScreen = MacWSWindowPresentationIsOnScreen(
+                window, &presentationKnown);
+            BOOL visible = logicalVisible &&
+                (!presentationKnown || presentationOnScreen);
+            if (MacWSRuntimeDiagnosticsEnabled()) {
+                BOOL canBecomeKey = ((MacWSMsgBool)objc_msgSend)(
+                    window, sel_registerName("canBecomeKeyWindow"));
+                NSInteger number = ((MacWSMsgInteger)objc_msgSend)(
+                    window, sel_registerName("windowNumber"));
+                id title = ((MacWSMsgID)objc_msgSend)(
+                    window, sel_registerName("title"));
+                fprintf(stderr,
+                    "#### APP-INPUT REOPEN-INSPECT pid=%d class=%s "
+                    "number=%ld logical-visible=%s presentation-known=%s "
+                    "onscreen=%s can-key=%s title=%s\n",
+                    getpid(), object_getClassName(window), (long)number,
+                    logicalVisible ? "YES" : "NO",
+                    presentationKnown ? "YES" : "NO",
+                    presentationOnScreen ? "YES" : "NO",
+                    canBecomeKey ? "YES" : "NO",
+                    title ? [title UTF8String] : "nil");
+                fflush(stderr);
+            }
+            if (visible) {
                 hasVisibleWindows = YES;
                 break;
             }
@@ -5471,8 +5555,14 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                     id reopenedWindows = ((MacWSMsgID)objc_msgSend)(
                         application, sel_registerName("windows"));
                     for (id window in reopenedWindows) {
-                        BOOL visible = ((MacWSMsgBool)objc_msgSend)(
+                        BOOL logicalVisible = ((MacWSMsgBool)objc_msgSend)(
                             window, sel_registerName("isVisible"));
+                        BOOL presentationKnown = NO;
+                        BOOL presentationOnScreen =
+                            MacWSWindowPresentationIsOnScreen(
+                                window, &presentationKnown);
+                        BOOL visible = logicalVisible &&
+                            (!presentationKnown || presentationOnScreen);
                         if (visible) {
                             visibleAfterLifecycle = YES;
                             break;
@@ -5509,8 +5599,15 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
                                     activate))
                                 ((MacWSMsgVoidBool)objc_msgSend)(
                                     application, activate, YES);
-                            orderedExisting = ((MacWSMsgBool)objc_msgSend)(
-                                orderCandidate, sel_registerName("isVisible"));
+                            BOOL presentationKnownAfter = NO;
+                            BOOL presentationOnScreenAfter =
+                                MacWSWindowPresentationIsOnScreen(
+                                    orderCandidate, &presentationKnownAfter);
+                            orderedExisting = presentationKnownAfter
+                                ? presentationOnScreenAfter
+                                : ((MacWSMsgBool)objc_msgSend)(
+                                      orderCandidate,
+                                      sel_registerName("isVisible"));
                         }
                     }
                     if (MacWSRuntimeDiagnosticsEnabled() ||
@@ -6235,7 +6332,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
     }
     if (record.kind == MacWSInputKindScroll &&
         MacWSPostSystemScrollEvent(
-            record, screenPoint, screenFrame, window, windowNumber,
+            record, screenPoint, screenFrame, window, windowPoint, windowNumber,
             globalWindowNumber)) {
         if (record.flags & (MacWSInputFlagScrollEnded |
                             MacWSInputFlagScrollCancelled))

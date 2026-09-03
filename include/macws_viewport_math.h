@@ -32,6 +32,24 @@ static inline float MacWSClampFloat(float value, float minimum,
     return fminf(fmaxf(value, minimum), maximum);
 }
 
+// Window-mode density is a device-scale conversion, not a measurement of the
+// current source window. Deriving it from sourcePixels / HostBounds creates a
+// feedback loop: every AppKit resize changes the next density and therefore
+// the next requested resize. One macOS logical point contains backingScale
+// source pixels, while one UIKit point contains displayScale physical pixels.
+static inline float MacWSStableWindowDensity(float backingScale,
+                                              float displayScale,
+                                              float modeFactor) {
+    if (!isfinite(backingScale) || backingScale < 0.5f ||
+        backingScale > 8.0f) backingScale = 2.0f;
+    if (!isfinite(displayScale) || displayScale < 0.5f ||
+        displayScale > 8.0f) displayScale = 2.0f;
+    if (!isfinite(modeFactor) || modeFactor < 0.5f ||
+        modeFactor > 2.0f) modeFactor = 1.0f;
+    return MacWSClampFloat(backingScale / displayScale, 0.5f, 2.0f) *
+        modeFactor;
+}
+
 static inline bool MacWSComputeViewport(float sourceWidth, float sourceHeight,
                                         float viewWidth, float viewHeight,
                                         float requestedZoom,

@@ -21,6 +21,20 @@
 #define MACWS_SYSTEM_GESTURE_RECOGNITION_FRACTION 0.012
 #define MACWS_SYSTEM_GESTURE_REFERENCE_FRACTION 0.28
 #define MACWS_THREE_FINGER_CHORD_GRACE_SECONDS 0.10
+#define MACWS_TWO_FINGER_INTENT_THRESHOLD_POINTS 2.0
+
+// A staggered third finger deserves a short chord window only while the first
+// two contacts are still effectively stationary. Once either contact has
+// travelled far enough to express a pan/pinch/rotation, continuing to hold all
+// two-finger recognizers in Possible turns the grace interval into a visible
+// dead zone. The threshold is above normal sub-point capacitive jitter but
+// below UIKit's own useful gesture displacement.
+static inline bool MacWSTwoFingerMotionHasCommitted(double maximumTouchTravel,
+                                                     double spanChange) {
+    return isfinite(maximumTouchTravel) && isfinite(spanChange) &&
+        (maximumTouchTravel >= MACWS_TWO_FINGER_INTENT_THRESHOLD_POINTS ||
+         fabs(spanChange) >= MACWS_TWO_FINGER_INTENT_THRESHOLD_POINTS);
+}
 
 // A dispatch_after callback is only a visual/feedback hint.  The Host main
 // queue can be busy presenting a large IOSurface when that callback becomes

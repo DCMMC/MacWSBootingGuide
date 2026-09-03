@@ -932,13 +932,17 @@ start_sharedfilelistd_generation() {
         tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
         return 1
     }
-    sleep 2
+    # The protocol round-trip below is a stronger readiness witness than a
+    # blind two-second sleep: it constructs a fresh client, obtains the real
+    # recent-document snapshot, and is bounded to five seconds. Check process
+    # liveness again after that completed transaction so a daemon which exits
+    # during the former quarantine window still fails this generation.
+    probe_sharedfilelistd || return 1
     proc_running "$P_SHAREDFILELISTD" || {
-        log "ERROR: macOS sharedfilelistd exited during its readiness window."
+        log "ERROR: macOS sharedfilelistd exited after its protocol witness."
         tail -n 30 "$LOGDIR/sharedfilelistd.err" 2>/dev/null || true
         return 1
     }
-    probe_sharedfilelistd || return 1
 }
 
 start_sharedfilelistd() {
@@ -3127,8 +3131,6 @@ print(digest.hexdigest())
 
 seed_launchservices_database() {
     local fingerprint="" marker_value="" marker_tmp="" catalog_current=0
-    local root="" bundle="" activation_attempt=0
-    local -a application_paths=()
     if [ ! -x "$ROOTFS$LSREGISTER_BIN" ]; then
         log "ERROR: stock macOS lsregister is missing at $LSREGISTER_BIN"
         return 1
@@ -3148,79 +3150,25 @@ seed_launchservices_database() {
          "$marker_value" ]; then
         catalog_current=1
         rm -f "$LAUNCHSERVICES_VERIFY_LOG"
-        # Runtime A/B on 2026-08-07 established the actual reboot invariant:
-        # the same healthy, seeded csstore reports Terminal as `mounted`
-        # immediately after registration and `not mounted` after only the
-        # session lsd is reloaded.  _LSCopyLocalDatabase still returns the
-        # non-null database with no error; NSWorkspace filters those inactive
-        # records and returns nil.  A normal macOS login receives a root-volume
-        # mount notification that reactivates them, while the bind-mounted
-        # chroot does not.  Re-register each already-known application path and
-        # the Settings extensions through stock LaunchServices.  An on-device
-        # A/B over all 184 application bundles took 3 seconds and left the
-        # csstore byte size unchanged, while restoring arbitrary Spotlight-
-        # style launches instead of only the five startup witnesses.
-        # start_macos has just loaded a fresh private system/session lsd pair,
-        # so asking NSWorkspace to prove those known-inactive records first is
-        # redundant. Runtime-confirmed on 2026-08-28: that pre-reactivation
-        # verification spent about 78 seconds before returning Terminal
-        # resolvedURL=<nil>; the required registration plus final typed
-        # verification then succeeded. Repair Desktop has a separate live-
-        # session fast verifier and does not call this cold-start path.
-        log "Reactivating persisted LaunchServices records after the private lsd reload..."
-        for root in \
-            "$ROOTFS/System/Applications" \
-            "$ROOTFS/Applications" \
-            "$ROOTFS/Users/root/Applications" \
-            "$ROOTFS/System/Library/CoreServices"; do
-            [ -d "$root" ] || continue
-            while IFS= read -r bundle; do
-                application_paths+=("${bundle#$ROOTFS}")
-            done < <(find "$root" -type d -name '*.app' -prune -print \
-                2>/dev/null | sort)
-        done
-        # A healthy activation completed in 3-4 seconds in the retained A/B.
-        # Runtime-confirmed on 2026-08-29: the same stock call remained at
-        # zero CPU for more than 110 seconds while lsd stayed alive, holding
-        # the entire GUI transaction and causing Host startup retries. Bound
-        # only this reactivation attempt; failure continues into the existing
-        # stock -kill -seed path and typed catalog verification below.
-        if [ "${#application_paths[@]}" -gt 0 ] &&
-           /var/jb/usr/bin/timeout -k 2 20 \
-                "$CHROOTEXEC" 0 0 "$ROOTFS" "$LSREGISTER_BIN" -f \
-                "${application_paths[@]}" \
-                > "$LOGDIR/lsregister-reactivate.log" 2>&1; then
-            # Runtime-confirmed by launchservices-reactivation-ab.log on
-            # 2026-08-23: after both private lsd jobs reload, `lsregister -f`
-            # restored all 193 application records in 4s, but the first typed
-            # verification failed only because the 48 ExtensionKit records
-            # were still absent. Replaying register-settings-extensions then
-            # passed the same typed verification immediately. A transient
-            # extension registration failure previously fell straight into
-            # `-kill -seed`, making service startup take 275s. Retry that real
-            # upstream registration once; never accept an unverified catalog.
-            : > "$SETTINGS_EXTENSION_REGISTER_LOG"
-            activation_attempt=1
-            while [ "$activation_attempt" -le 2 ]; do
-                log "Activating LaunchServices ExtensionKit records (attempt=$activation_attempt/2)..."
-                if MACWS_CATALOG_REGISTRATION=1 \
-                       "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-                       register-settings-extensions \
-                       >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1 &&
-                   "$CHROOTEXEC" 0 0 "$ROOTFS" "$WORKSPACECTL_BIN" \
-                       verify-launchservices-catalog \
-                       >> "$SETTINGS_EXTENSION_REGISTER_LOG" 2>&1; then
-                    log "LaunchServices catalog reactivated and verified."
-                    return 0
-                fi
-                log "LaunchServices ExtensionKit activation attempt $activation_attempt failed typed verification."
-                activation_attempt=$((activation_attempt + 1))
-                [ "$activation_attempt" -gt 2 ] || sleep 1
-            done
-        fi
-        log "Targeted LaunchServices reactivation failed; rebuilding the clean catalog."
-        tail -n 8 "$SETTINGS_EXTENSION_REGISTER_LOG" 2>/dev/null ||
-            tail -n 8 "$LAUNCHSERVICES_VERIFY_LOG" 2>/dev/null || true
+        # Runtime-confirmed on 2026-09-02 by MacWSStartup.log: after a fresh
+        # private system/session lsd pair, the persisted-record path spent 20
+        # seconds in bounded `lsregister -f`, then failed both ExtensionKit
+        # commit-boundary verifications.  The authoritative stock `-kill
+        # -seed` transaction immediately following it succeeded and passed the
+        # complete typed application/ExtensionKit witness; the LaunchServices
+        # stage took 44 seconds in total.  Earlier retained A/Bs also showed
+        # the targeted call can idle for more than 110 seconds.  A bind-mounted
+        # root never receives macOS's root-volume mount activation, so make the
+        # already-proven clean transaction the cold-session authority instead
+        # of speculatively mutating every persisted record first.  Repair
+        # Desktop retains its separate live-session fast verifier below.
+        # Runtime-confirmed on the 2026-09-03 true cold start: the newly
+        # loaded private session lsd resolved Terminal to nil before the seed,
+        # even though the source marker matched and the previous generation
+        # had passed the complete catalog witness. This private bootstrap does
+        # not retain an on-disk session csstore, so probing for reuse cannot
+        # make progress. Go directly to the measured 7-8 second clean seed.
+        log "Refreshing the LaunchServices catalog for the new private lsd generation..."
     fi
 
     # A changed rootfs/catalog schema needs one authoritative rebuild.  The
@@ -3230,7 +3178,7 @@ seed_launchservices_database() {
     # transaction produced a clean 6-10 MB store in 6 seconds on this device
     # and immediately passed every application/ExtensionKit witness.
     if [ "$catalog_current" -eq 1 ]; then
-        log "Rebuilding the real macOS application catalog after failed reactivation..."
+        log "Rebuilding the real macOS application catalog for this lsd generation..."
     else
         log "Building the real macOS application catalog for this rootfs generation..."
     fi
@@ -4123,10 +4071,23 @@ start_macos() {
     rm -f "$LOGDIR/iconservicesd.log" "$LOGDIR/iconservicesagent.log"
     launchctl load "$ICONSERVICESD_PLIST" || return 1
     launchctl load "$ICONSERVICESAGENT_PLIST" || return 1
+
+    # CarbonCore's named-data endpoint is independent of IconServices but is
+    # needed by Dock later in the same transaction. Start all three cold-boot
+    # services together and share one liveness/stability window instead of
+    # serially paying two identical two-second quarantine witnesses.
+    log "Publishing CarbonCore named-data service for Dock menus..."
+    rm -f "$LOGDIR/csnameddatad.log"
+    launchctl load "$CSNAMEDDATAD_PLIST" || return 1
+    launchctl list "$CSNAMEDDATAD_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: CarbonCore named-data MachService contract was not registered."
+        return 1
+    }
     waited=0
     while [ "$waited" -lt 10 ]; do
         proc_running "$P_ICONSERVICESD" &&
-            proc_running "$P_ICONSERVICESAGENT" && break
+            proc_running "$P_ICONSERVICESAGENT" &&
+            proc_running "$P_CSNAMEDDATAD" && break
         sleep 1
         waited=$((waited + 1))
     done
@@ -4138,24 +4099,24 @@ start_macos() {
         log "ERROR: macOS iconservicesagent did not stay alive. See $LOGDIR/iconservicesagent.log"
         return 1
     }
+    proc_running "$P_CSNAMEDDATAD" || {
+        log "ERROR: CarbonCore named-data service did not reach a live process."
+        tail -n 30 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
+        return 1
+    }
     # The former quarantine failure happened after the process was briefly
     # visible, so a single ps sample falsely declared readiness.  Require the
-    # same two endpoints to survive beyond that startup window.
+    # all three prerequisites to survive beyond that startup window.
     sleep 2
-    proc_running "$P_ICONSERVICESD" && proc_running "$P_ICONSERVICESAGENT" || {
-        log "ERROR: a macOS IconServices endpoint exited during startup."
-        tail -n 20 "$LOGDIR/iconservicesagent.log" 2>/dev/null || true
-        return 1
-    }
+    proc_running "$P_ICONSERVICESD" &&
+        proc_running "$P_ICONSERVICESAGENT" &&
+        proc_running "$P_CSNAMEDDATAD" || {
+            log "ERROR: a catalog prerequisite exited during startup."
+            tail -n 20 "$LOGDIR/iconservicesagent.log" 2>/dev/null || true
+            tail -n 20 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
+            return 1
+        }
     log "Private macOS IconServices endpoints ready."
-
-    log "Publishing CarbonCore named-data service for Dock menus..."
-    rm -f "$LOGDIR/csnameddatad.log"
-    launchctl load "$CSNAMEDDATAD_PLIST" || return 1
-    launchctl list "$CSNAMEDDATAD_LABEL" >/dev/null 2>&1 || {
-        log "ERROR: CarbonCore named-data MachService contract was not registered."
-        return 1
-    }
     # A registered launchd label is not a readiness witness: on the 2026-08-13
     # cold start, csnameddatad's persistent signature survived while its
     # reboot-volatile arm64e CDHash did not. launchd published the MachService
@@ -4163,22 +4124,6 @@ start_macos() {
     # in CarbonCore `_CSGetNamedData` and could not drain native gesture work.
     # `restore_cold_boot_trust` now restores the exact executable hash above;
     # require the real process to survive its former AMFI failure window too.
-    waited=0
-    while ! proc_running "$P_CSNAMEDDATAD" && [ "$waited" -lt 10 ]; do
-        sleep 1
-        waited=$((waited + 1))
-    done
-    proc_running "$P_CSNAMEDDATAD" || {
-        log "ERROR: CarbonCore named-data service did not reach a live process."
-        tail -n 30 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
-        return 1
-    }
-    sleep 2
-    proc_running "$P_CSNAMEDDATAD" || {
-        log "ERROR: CarbonCore named-data service exited during its readiness window."
-        tail -n 30 "$LOGDIR/csnameddatad.log" 2>/dev/null || true
-        return 1
-    }
     log "CarbonCore named-data endpoint ready."
     log "TIMING start-macos stage=catalog-services seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
     macos_stage_started=$SECONDS
@@ -4387,8 +4332,23 @@ start_macos() {
     if [ "$WANT_TERMINAL" = 1 ]; then
         log "Starting Terminal (launchd job '$TERM_LABEL')..."
         rm -f "$LOGDIR/terminal.log"
-        launchctl load "$TERM_PLIST"
-        sleep 5
+        launchctl load "$TERM_PLIST" || return 1
+        # The desktop readiness transaction has already completed. RunAtLoad
+        # owns Terminal's asynchronous application/window lifecycle; a fixed
+        # five-second sleep delayed every cold launch even when the process was
+        # alive after one scheduler turn. Require the launchd contract and a
+        # bounded live-process witness, while first-frame capture (when VNC is
+        # requested) remains the downstream pixel postcondition.
+        launchctl list "$TERM_LABEL" >/dev/null 2>&1 || return 1
+        waited=0
+        while ! proc_running "$P_TERMINAL" && [ "$waited" -lt 20 ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+        proc_running "$P_TERMINAL" || {
+            log "ERROR: Terminal did not reach a live process within 2 seconds."
+            return 1
+        }
         started_ws_unchanged "Terminal startup" || return 1
     fi
     log "TIMING start-macos stage=optional-clients seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"

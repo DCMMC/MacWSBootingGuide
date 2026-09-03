@@ -112,6 +112,9 @@ int main(void) {
         MacWSInputKindHover, MacWSInputKindTouchMove));
     assert(MACWS_THREE_FINGER_CHORD_GRACE_SECONDS >= 0.08);
     assert(MACWS_THREE_FINGER_CHORD_GRACE_SECONDS <= 0.15);
+    assert(!MacWSTwoFingerMotionHasCommitted(1.99, -1.99));
+    assert(MacWSTwoFingerMotionHasCommitted(2.0, 0.0));
+    assert(MacWSTwoFingerMotionHasCommitted(0.5, -2.0));
     assert(MacWSChooseDirectScrollAxis(2.0, 6.0) ==
            MacWSDirectScrollAxisVertical);
     assert(MacWSChooseDirectScrollAxis(6.0, 4.6) ==
@@ -174,6 +177,10 @@ int main(void) {
     assert(constrainedX == 4.0 && constrainedY == -7.0);
 
     MacWSViewport viewport = {0};
+    assert(Near(MacWSStableWindowDensity(2.0, 2.0, 1.0), 1.0f));
+    assert(Near(MacWSStableWindowDensity(2.0, 2.0, 0.85), 0.85f));
+    assert(Near(MacWSStableWindowDensity(2.0, 2.0, 1.10), 1.10f));
+    assert(Near(MacWSStableWindowDensity(0.0, 0.0, 1.0), 1.0f));
     assert(MacWSComputeViewport(1600, 1000, 600, 800, 1, 0.5, 0.5,
                                 &viewport));
     assert(Near(viewport.visibleSource.width, 0.46875f));

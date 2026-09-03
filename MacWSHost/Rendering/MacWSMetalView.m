@@ -42,19 +42,24 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 
 @implementation MacWSThreeFingerChordGateGestureRecognizer {
     NSMutableSet<UITouch *> *_directTouches;
+    NSMutableDictionary<NSValue *, NSValue *> *_initialTouchLocations;
     uint64_t _deadlineGeneration;
     BOOL _deadlineScheduled;
 }
 
 - (instancetype)initWithTarget:(id)target action:(SEL)action {
     self = [super initWithTarget:target action:action];
-    if (self) _directTouches = [NSMutableSet set];
+    if (self) {
+        _directTouches = [NSMutableSet set];
+        _initialTouchLocations = [NSMutableDictionary dictionary];
+    }
     return self;
 }
 
 - (void)reset {
     [super reset];
     [_directTouches removeAllObjects];
+    [_initialTouchLocations removeAllObjects];
     _deadlineScheduled = NO;
     _deadlineGeneration++;
 }
@@ -70,6 +75,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     }
     if (_directTouches.count != 2 || _deadlineScheduled) return;
+    [_initialTouchLocations removeAllObjects];
+    for (UITouch *touch in _directTouches) {
+        _initialTouchLocations[[NSValue valueWithNonretainedObject:touch]] =
+            [NSValue valueWithCGPoint:[touch locationInView:self.view]];
+    }
     _deadlineScheduled = YES;
     uint64_t generation = ++_deadlineGeneration;
     __weak typeof(self) weakSelf = self;
@@ -87,6 +97,42 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
     (void)touches;
     (void)event;
+    if (self.state == UIGestureRecognizerStatePossible &&
+        _directTouches.count == 2 && _initialTouchLocations.count == 2) {
+        NSArray<UITouch *> *contacts = _directTouches.allObjects;
+        CGPoint initial[2] = {CGPointZero, CGPointZero};
+        CGPoint current[2] = {CGPointZero, CGPointZero};
+        double maximumTravel = 0.0;
+        BOOL complete = YES;
+        for (NSUInteger index = 0; index < 2; index++) {
+            UITouch *touch = contacts[index];
+            NSValue *value = _initialTouchLocations[
+                [NSValue valueWithNonretainedObject:touch]];
+            if (!value) {
+                complete = NO;
+                break;
+            }
+            initial[index] = value.CGPointValue;
+            current[index] = [touch locationInView:self.view];
+            maximumTravel = fmax(maximumTravel,
+                hypot(current[index].x - initial[index].x,
+                      current[index].y - initial[index].y));
+        }
+        if (complete) {
+            double initialSpan = hypot(initial[1].x - initial[0].x,
+                                       initial[1].y - initial[0].y);
+            double currentSpan = hypot(current[1].x - current[0].x,
+                                       current[1].y - current[0].y);
+            if (MacWSTwoFingerMotionHasCommitted(
+                    maximumTravel, currentSpan - initialSpan)) {
+                // Release dependencies on this same UIKit movement event.
+                // UIPinch/UIPan retain their accumulated displacement and can
+                // begin without waiting for the fixed chord deadline.
+                self.state = UIGestureRecognizerStateFailed;
+                return;
+            }
+        }
+    }
     if (self.state == UIGestureRecognizerStateBegan ||
         self.state == UIGestureRecognizerStateChanged)
         self.state = UIGestureRecognizerStateChanged;
@@ -243,6 +289,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGSize _pendingRequestedWindowSize;
     CGFloat _pendingRequestedDensityScale;
     uint32_t _inputSampleSequence;
+    uint32_t _lastKeyboardFrameWidth;
+    uint32_t _lastKeyboardFrameHeight;
     CGSize _lastRequestedWindowSize;
     CGFloat _lastRequestedDensityScale;
     uint64_t _windowConfigurationSettlementSerial;
@@ -886,6 +934,12 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     // bounds=1389x970 preserve the existing ~1.16 mapping.
     CGFloat backingScale = _surfaceFrame.descriptor.backingScale;
     if (!isfinite(backingScale) || backingScale < 0.5) backingScale = 2.0;
+    if (_streamClient.mode == MacWSStreamModeWindow) {
+        UIScreen *screen = self.window.windowScene.screen ?: UIScreen.mainScreen;
+        return MacWSStableWindowDensity(
+            backingScale, screen.scale,
+            MacWSDensityModeFactor(self.displayDensity));
+    }
     CGFloat sourceWidth = [self currentFrameWidth];
     CGFloat sourceHeight = [self currentFrameHeight];
     CGFloat scaleX = self.bounds.size.width > 0 && sourceWidth > 0
@@ -918,6 +972,8 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
 - (void)setTargetPID:(int32_t)targetPID {
     if (_targetPID == targetPID) return;
     int32_t previousTargetPID = _targetPID;
+    _lastKeyboardFrameWidth = 0;
+    _lastKeyboardFrameHeight = 0;
     MacWSLog(@"presentation-target-change previous=%d next=%d "
              "direct-heartbeat=%d/%u fullscreen-canvas=%d/%u mode=%lu",
              previousTargetPID, targetPID, _directDrawableHeartbeatPID,
@@ -1370,6 +1426,19 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!self.isMacWSInputEnabled) return NO;
     uint32_t width = [self currentFrameWidth];
     uint32_t height = [self currentFrameHeight];
+    if (width != 0 && height != 0) {
+        _lastKeyboardFrameWidth = width;
+        _lastKeyboardFrameHeight = height;
+    } else {
+        // DisplayStream retires the old surface before publishing the resized
+        // successor. Runtime log 1788371421.797 captured a real hardware key
+        // callback in that interval with input enabled and target PID stable,
+        // but frame=0x0 made the key disappear. Keyboard dispatch does not use
+        // the pointer coordinates; retain only the same target's last valid
+        // dimensions so a geometry handoff cannot swallow physical keys.
+        width = _lastKeyboardFrameWidth;
+        height = _lastKeyboardFrameHeight;
+    }
     if (width == 0 || height == 0) return NO;
     BOOL emitted = NO;
     for (UIPress *press in presses) {
@@ -1444,6 +1513,13 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     if (!self.isMacWSInputEnabled || keySym == 0) return;
     uint32_t width = [self currentFrameWidth];
     uint32_t height = [self currentFrameHeight];
+    if (width != 0 && height != 0) {
+        _lastKeyboardFrameWidth = width;
+        _lastKeyboardFrameHeight = height;
+    } else {
+        width = _lastKeyboardFrameWidth;
+        height = _lastKeyboardFrameHeight;
+    }
     if (width == 0 || height == 0) return;
     uint32_t scalar = (keySym & 0xff000000u) == 0x01000000u
         ? keySym & 0x00ffffffu : keySym;
@@ -4784,12 +4860,18 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         return;
     NSTimeInterval timestamp = CACurrentMediaTime();
     switch (recognizer.state) {
-        case UIGestureRecognizerStateBegan:
+        case UIGestureRecognizerStateBegan: {
+            // UIKit has already accumulated real movement while Possible,
+            // including the short three-finger chord interval. Preserve that
+            // first delta; resetting it here caused the visible pinch dead
+            // zone even after gesture recognition had succeeded.
+            CGFloat initialAmount = recognizer.scale - 1.0;
             recognizer.scale = 1.0;
-            [self emitMagnifyAtFramePoint:framePoint amount:0.0
+            [self emitMagnifyAtFramePoint:framePoint amount:initialAmount
                                     flags:MacWSInputFlagGestureBegan
                                 timestamp:timestamp];
             break;
+        }
         case UIGestureRecognizerStateChanged: {
             // UIPinchGestureRecognizer.scale is cumulative. AppKit's
             // magnification is an incremental delta, so consume and reset the
@@ -5616,6 +5698,11 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     }
     _surfaceFrame = frame;
     _surfaceTexture = texture;
+    if (frame.descriptor.contentWidth != 0 &&
+        frame.descriptor.contentHeight != 0) {
+        _lastKeyboardFrameWidth = frame.descriptor.contentWidth;
+        _lastKeyboardFrameHeight = frame.descriptor.contentHeight;
+    }
     _streamConnected = YES;
     if (_windowConfigurationAwaitingAcknowledgement &&
         self.targetWindowID != 0 &&

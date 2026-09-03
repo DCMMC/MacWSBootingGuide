@@ -2763,10 +2763,15 @@ static id (*macws_weather_configuration_orig)(id, SEL, id, id, id) = NULL;
 static void (*macws_weather_did_request_scene_orig)(
     id, SEL, id, id, id) = NULL;
 static void (*macws_weather_uins_finish_launching_orig)(id, SEL) = NULL;
-static sysdir_search_path_enumeration_state
-    (*macws_weather_sysdir_start_private_orig)(
-        sysdir_search_path_directory_t,
-        sysdir_search_path_domain_mask_t) = NULL;
+static void (*macws_weather_uins_did_create_scene_orig)(id, SEL, id, id) =
+    NULL;
+static void (*macws_weather_uins_configure_window_orig)(id, SEL, id, id) =
+    NULL;
+static id (*macws_weather_uins_new_window_controller_orig)(id, SEL, id) =
+    NULL;
+static void (*macws_weather_uins_show_window_orig)(id, SEL, BOOL, id) = NULL;
+static void (*macws_weather_uins_make_key_and_order_front_orig)(id, SEL, id) =
+    NULL;
 static char macws_weather_app_launch_delivered_key;
 static char macws_weather_main_scene_identifier_key;
 static char macws_weather_bootstrap_window_key;
@@ -2779,11 +2784,16 @@ static id macws_weather_pending_uins_finish_delegate = nil;
 static SEL macws_weather_pending_uins_finish_selector = NULL;
 static NSUInteger macws_catalyst_collection_count(id value);
 static id macws_catalyst_send_id(id receiver, const char *selector);
+static BOOL macws_catalyst_send_bool(id receiver, const char *selector,
+                                     BOOL *supportedOut);
+static NSInteger macws_catalyst_send_integer(id receiver,
+                                              const char *selector);
 static BOOL macws_weather_prepare_application_launch(id application,
                                                       id *delegateOut);
 static BOOL macws_weather_adopt_bootstrap_scene(id application);
 static BOOL macws_install_weather_uins_completion_hook(void);
 static BOOL macws_install_weather_uins_finish_hook(void);
+static void macws_install_weather_uins_scene_trace(void);
 static void macws_weather_uins_finish_launching_compat(
     id self, SEL selector);
 static void macws_weather_retry_uins_finish(void *context);
@@ -2823,30 +2833,118 @@ static void macws_weather_bootstrap_will_connect(
             controller ? object_getClassName(controller) : "nil");
     fflush(stderr);
 }
-
-
-static sysdir_search_path_enumeration_state
-macws_weather_sysdir_start_private_compat(
-    sysdir_search_path_directory_t directory,
-    sysdir_search_path_domain_mask_t domainMask) {
-    // Runtime-confirmed on iPadOS 16.3: the private entry point is a literal
-    // `brk #1`. UIKit calls it for its scene-restoration Library search with
-    // (directory=5, domain=1), while WeatherDaemon calls it with the macOS
-    // private system-domain bit 0x10. The public sysdir ABI is implemented on
-    // this same image and accepts the standard 1/2/4/8 domain mask. Route the
-    // private ABI through that implementation, translating only the extra
-    // macOS system-domain spelling.
-    sysdir_search_path_domain_mask_t publicDomain = domainMask == 0x10
+static char *macws_weather_system_directory_compat(unsigned directory,
+                                                    unsigned domainMask) {
+    // RE-confirmed via the target WeatherDaemon shared-cache image at
+    // WDWeatherLibraryDirectory block +0x14..+0x1c: it calls
+    // WDSystemDirectoryDirectoryPath(5, 0x10). iPadOS's direct lowercase
+    // CoreServices entry returns NULL for that macOS-private spelling, which
+    // runtime-confirmed becomes a nil NSURL and throws at createDirectory.
+    // Translate at WeatherDaemon's documented path boundary, preserving its
+    // allocation/ownership and all subsequent URL construction.
+    unsigned publicDomain = domainMask == 0x10
         ? SYSDIR_DOMAIN_MASK_SYSTEM : domainMask;
+    char resolvedPath[PATH_MAX] = {0};
     sysdir_search_path_enumeration_state state =
         sysdir_start_search_path_enumeration(directory, publicDomain);
+    while (state != 0 && !resolvedPath[0]) {
+        state = sysdir_get_next_search_path_enumeration(
+            state, resolvedPath);
+    }
+    char *path = resolvedPath[0] ? strdup(resolvedPath) : NULL;
     fprintf(stderr,
-            "#### WEATHER-SYSDIR translated directory=%u "
-            "privateDomain=%#x publicDomain=%#x publicState=%#x\n",
-            (unsigned)directory, (unsigned)domainMask,
-            (unsigned)publicDomain, (unsigned)state);
+            "#### WEATHER-SYSDIR WeatherDaemon directory=%u "
+            "privateDomain=%#x publicDomain=%#x path=%s\n",
+            directory, domainMask, publicDomain, path ?: "<null>");
     fflush(stderr);
-    return state;
+    return path;
+}
+
+static BOOL macws_patch_weather_system_directory_entry(void *target) {
+    if (!target) return NO;
+    uint32_t *instructions = (uint32_t *)ptrauth_strip(
+        target, ptrauth_key_function_pointer);
+    void *replacement = ptrauth_strip(
+        (void *)macws_weather_system_directory_compat,
+        ptrauth_key_function_pointer);
+    // Startup-time, in-place absolute branch. Unlike MSHookFunction this does
+    // not suspend the application's already-running RBS/AppInput threads.
+    // Weather pid 35447 runtime-confirmed that suspension deadlocked while an
+    // RBS thread held libmalloc's tiny-zone lock. The target is not reachable
+    // until WeatherDaemon asks for its Library directory later in launch.
+    struct __attribute__((packed)) {
+        uint32_t loadTarget;
+        uint32_t branchTarget;
+        uint64_t target;
+    } patch = {
+        .loadTarget = 0x58000050,  // ldr x16, #8
+        .branchTarget = 0xd61f0200, // br x16
+        .target = (uint64_t)(uintptr_t)replacement,
+    };
+    __block BOOL wrote = NO;
+    ModifyExecutableRegion(instructions, sizeof(patch), ^{
+        memcpy(instructions, &patch, sizeof(patch));
+        wrote = YES;
+    });
+    BOOL ready = memcmp(instructions, &patch, sizeof(patch)) == 0;
+    fprintf(stderr,
+            "#### WEATHER-SYSDIR WeatherDaemon direct-entry target=%p "
+            "replacement=%p write=%d ready=%d\n",
+            target, replacement, wrote, ready);
+    fflush(stderr);
+    return ready;
+}
+
+static BOOL macws_patch_weather_private_sysdir_trap(void *privateSysdir) {
+    if (!privateSysdir) return NO;
+    // dlsym returns a callable arm64e function pointer carrying PAC. It is
+    // valid for MSHookFunction but not as a data address: Weather pid 95977
+    // runtime-confirmed a data-abort/PAC failure when the signed value
+    // 0x842d0001ae3c92e8 was read directly. Strip only for instruction
+    // inspection/writing; keep the signed spelling at the call-hook boundary.
+    uint32_t *instructions = (uint32_t *)ptrauth_strip(
+        privateSysdir, ptrauth_key_function_pointer);
+    static const uint32_t kUnsupportedTrap = 0xd4200020;  // brk #1
+    static const uint32_t kInitializePrivateFlags = 0x52800002; // mov w2,#0
+    uint32_t first = instructions[0];
+    uint32_t second = instructions[1];
+    if (first == kInitializePrivateFlags &&
+        (second & 0xfc000000) == 0x14000000) return YES;
+    if (first != kUnsupportedTrap ||
+        (second & 0xfc000000) != 0x14000000) {
+        fprintf(stderr,
+                "#### WEATHER-SYSDIR direct-entry patch refused target=%p "
+                "instructions=%#x/%#x\n", privateSysdir, first, second);
+        fflush(stderr);
+        return NO;
+    }
+
+    // RE-confirmed on the target's iPadOS 16.3 libsystem_coreservices:
+    // lowercase `sysdir_start_search_path_enumeration_private` is exactly
+    //   brk #1; b NSStartSearchPathEnumerationStatic
+    // while the supported uppercase `NSStartSearchPathEnumerationPrivate`
+    // five instructions later is exactly
+    //   mov w2,#0; b NSStartSearchPathEnumerationStatic.
+    // Runtime LLDB on Weather pid 94647 captured AppKit's direct shared-cache
+    // call with x0=5/x1=1 bypassing the import-level Substrate hook and
+    // trapping here. Replacing only the unavailable API marker with the
+    // neighboring implementation's real flags initialization preserves the
+    // directory/domain arguments and executes the stock enumerator. A live
+    // LLDB A/B on pid 94928 advanced Weather from the 2-second trap to its
+    // next lifecycle boundary roughly 39 seconds later.
+    __block BOOL wrote = NO;
+    ModifyExecutableRegion(instructions, sizeof(*instructions), ^{
+        if (instructions[0] == kUnsupportedTrap) {
+            instructions[0] = kInitializePrivateFlags;
+            wrote = YES;
+        }
+    });
+    BOOL ready = instructions[0] == kInitializePrivateFlags;
+    fprintf(stderr,
+            "#### WEATHER-SYSDIR direct-entry target=%p old=%#x/%#x "
+            "write=%d ready=%d\n", privateSysdir, first, second, wrote, ready);
+    fflush(stderr);
+    return ready;
 }
 
 static NSArray *(*macws_weather_search_paths_orig)(NSUInteger, NSUInteger,
@@ -3005,6 +3103,26 @@ static id macws_weather_configuration_compat(id self, SEL selector,
                 scene, session, options);
             existingDelegate = bootstrapDelegate;
 
+            // Runtime-confirmed in Weather pid 66538: returning only the
+            // bootstrap configuration lets UIApplicationMain exit before the
+            // 50 ms generic scene poll can run. Deliver Weather's ordinary
+            // AppDelegate launch callbacks at this synchronous boundary so
+            // the application stays alive. Keep scene adoption owned by the
+            // existing UINS finish path when that path is already pending;
+            // otherwise the completion callback below performs it after the
+            // native scene-create tracker closes.
+            BOOL preparedAtConfigurationBoundary =
+                macws_weather_prepare_application_launch(application, NULL);
+            fprintf(stderr,
+                    "#### WEATHER-SCENE configuration-boundary prepared=%d "
+                    "delegate=%s windows=%lu\n",
+                    preparedAtConfigurationBoundary,
+                    existingDelegate
+                        ? object_getClassName(existingDelegate) : "nil",
+                    (unsigned long)macws_catalyst_collection_count(
+                        macws_catalyst_send_id(application, "windows")));
+            fflush(stderr);
+
             // The scene-create transaction does not yield back to the main
             // queue before AppKit evaluates launch completion; pid 93274
             // exited after this callback while the scheduled 10 ms adoption
@@ -3060,6 +3178,22 @@ static void macws_weather_did_request_scene_compat(
                 sceneIdentifier ? object_getClassName(sceneIdentifier) : "nil",
                 error ? object_getClassName(error) : "nil");
         fflush(stderr);
+
+        Class applicationClass = objc_getClass("UIApplication");
+        id application = applicationClass
+            ? macws_catalyst_send_id(
+                  (id)applicationClass, "sharedApplication") : nil;
+        BOOL adopted = application &&
+            macws_weather_adopt_bootstrap_scene(application);
+        fprintf(stderr,
+                "#### WEATHER-SCENE completion-boundary adopted=%d "
+                "finish=deferred-to-stock-compell\n", adopted);
+        fflush(stderr);
+        // Do not invoke UINSApplicationDelegate::_finishLaunching re-entrantly
+        // from inside this scene-request completion callback. The generic
+        // compell transaction is already suspended until this callback
+        // publishes the configured Weather delegate; its next main-queue turn
+        // completes the ordinary application launch transaction first.
     }
 }
 
@@ -3148,12 +3282,24 @@ static void macws_weather_uins_finish_launching_compat(
             sel_registerName("UTF8String"))
         ? ((const char *(*)(id, SEL))objc_msgSend)(
               sceneIdentifier, sel_registerName("UTF8String")) : NULL;
+    const char *oldIdentifierString = oldIdentifier &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            oldIdentifier, sel_registerName("respondsToSelector:"),
+            sel_registerName("UTF8String"))
+        ? ((const char *(*)(id, SEL))objc_msgSend)(
+              oldIdentifier, sel_registerName("UTF8String")) : NULL;
     fprintf(stderr,
             "#### WEATHER-SCENE finish-launch synchronize=%d adopted=%d "
-            "scene=%s connected=%lu old=%s\n",
+            "scene=%s connected=%lu old=%s old-value=%s equal=%d\n",
             synchronized, adopted, identifierString ?: "nil",
             (unsigned long)macws_catalyst_collection_count(scenes),
-            oldIdentifier ? object_getClassName(oldIdentifier) : "nil");
+            oldIdentifier ? object_getClassName(oldIdentifier) : "nil",
+            oldIdentifierString ?: "nil",
+            oldIdentifier == sceneIdentifier ||
+                (oldIdentifier && sceneIdentifier &&
+                 ((BOOL (*)(id, SEL, id))objc_msgSend)(
+                     oldIdentifier, sel_registerName("isEqual:"),
+                     sceneIdentifier)));
     fflush(stderr);
 
     // Preserve UIKitMacHelper's complete launch finalization. With its real
@@ -3225,17 +3371,265 @@ static BOOL macws_install_weather_uins_finish_hook(void) {
     return installed;
 }
 
+static BOOL macws_weather_uins_did_configure_window(id delegate) {
+    BOOL supported = NO;
+    BOOL configured = macws_catalyst_send_bool(
+        delegate, "didConfigureWindow", &supported);
+    return supported && configured;
+}
+
+static void macws_weather_uins_did_create_scene_trace(
+        id self, SEL selector, id scene, id transitionContext) {
+    id session = macws_catalyst_send_id(scene, "session");
+    id role = macws_catalyst_send_id(session, "role");
+    const char *roleString = role &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            role, sel_registerName("respondsToSelector:"),
+            sel_registerName("UTF8String"))
+        ? ((const char *(*)(id, SEL))objc_msgSend)(
+              role, sel_registerName("UTF8String")) : NULL;
+    fprintf(stderr,
+            "#### WEATHER-UINS event=didCreate-enter scene=%s@%p "
+            "transition=%s@%p session=%s role=%s configured=%d\n",
+            scene ? object_getClassName(scene) : "nil", scene,
+            transitionContext ? object_getClassName(transitionContext) : "nil",
+            transitionContext, session ? object_getClassName(session) : "nil",
+            roleString ?: "nil",
+            macws_weather_uins_did_configure_window(self));
+    fflush(stderr);
+    macws_weather_uins_did_create_scene_orig(
+        self, selector, scene, transitionContext);
+    BOOL applicationRole = roleString &&
+        strcmp(roleString, "UIWindowSceneSessionRoleApplication") == 0;
+    BOOL configuredAfterOriginal =
+        macws_weather_uins_did_configure_window(self);
+    id keyHostWindow = macws_catalyst_send_id(self, "keyHostWindow");
+    fprintf(stderr,
+            "#### WEATHER-UINS event=didCreate-return role-application=%d "
+            "configured=%d->%d controllers=%lu key-host=%s\n",
+            applicationRole, configuredAfterOriginal,
+            macws_weather_uins_did_configure_window(self),
+            (unsigned long)macws_catalyst_collection_count(
+                macws_catalyst_send_id(self, "sceneWindowControllers")),
+            keyHostWindow ? object_getClassName(keyHostWindow) : "nil");
+    fflush(stderr);
+}
+
+static void macws_weather_uins_configure_window_trace(
+        id self, SEL selector, id scene, id transitionContext) {
+    fprintf(stderr,
+            "#### WEATHER-UINS event=configure-enter scene=%s@%p "
+            "transition=%s@%p configured=%d\n",
+            scene ? object_getClassName(scene) : "nil", scene,
+            transitionContext ? object_getClassName(transitionContext) : "nil",
+            transitionContext,
+            macws_weather_uins_did_configure_window(self));
+    fflush(stderr);
+    macws_weather_uins_configure_window_orig(
+        self, selector, scene, transitionContext);
+    fprintf(stderr,
+            "#### WEATHER-UINS event=configure-return configured=%d\n",
+            macws_weather_uins_did_configure_window(self));
+    fflush(stderr);
+}
+
+static void macws_weather_uins_show_window_trace(
+        id self, SEL selector, BOOL firstWindow, id transitionContext) {
+    id window = macws_catalyst_send_id(self, "window");
+    BOOL visibleSupported = NO;
+    BOOL visibleBefore = macws_catalyst_send_bool(
+        window, "isVisible", &visibleSupported);
+    fprintf(stderr,
+            "#### WEATHER-UINS event=show-window-enter controller=%s@%p "
+            "window=%s@%p first=%d transition=%s@%p visible=%s/%d\n",
+            self ? object_getClassName(self) : "nil", self,
+            window ? object_getClassName(window) : "nil", window,
+            firstWindow,
+            transitionContext ? object_getClassName(transitionContext) : "nil",
+            transitionContext,
+            visibleSupported ? "supported" : "unsupported", visibleBefore);
+    fflush(stderr);
+    macws_weather_uins_show_window_orig(
+        self, selector, firstWindow, transitionContext);
+    BOOL visibleAfter = macws_catalyst_send_bool(
+        window, "isVisible", &visibleSupported);
+    fprintf(stderr,
+            "#### WEATHER-UINS event=show-window-return visible=%s/%d "
+            "number=%ld\n",
+            visibleSupported ? "supported" : "unsupported", visibleAfter,
+            (long)macws_catalyst_send_integer(window, "windowNumber"));
+    fflush(stderr);
+}
+
+static void macws_weather_uins_make_key_and_order_front_trace(
+        id self, SEL selector, id sender) {
+    fprintf(stderr,
+            "#### WEATHER-UINS event=make-key-order-front-enter window=%s@%p "
+            "number=%ld sender=%s@%p\n",
+            self ? object_getClassName(self) : "nil", self,
+            (long)macws_catalyst_send_integer(self, "windowNumber"),
+            sender ? object_getClassName(sender) : "nil", sender);
+    fflush(stderr);
+    macws_weather_uins_make_key_and_order_front_orig(self, selector, sender);
+    BOOL visibleSupported = NO;
+    BOOL visible = macws_catalyst_send_bool(
+        self, "isVisible", &visibleSupported);
+    fprintf(stderr,
+            "#### WEATHER-UINS event=make-key-order-front-return "
+            "visible=%s/%d key=%d main=%d\n",
+            visibleSupported ? "supported" : "unsupported", visible,
+            macws_catalyst_send_bool(self, "isKeyWindow", NULL),
+            macws_catalyst_send_bool(self, "isMainWindow", NULL));
+    fflush(stderr);
+}
+
+static id macws_weather_uins_new_window_controller_trace(
+        id self, SEL selector, id scene) {
+    id controller = macws_weather_uins_new_window_controller_orig(
+        self, selector, scene);
+    id window = macws_catalyst_send_id(controller, "window");
+    typedef BOOL (*MacWSShouldHideHostWindowFunction)(id);
+    MacWSShouldHideHostWindowFunction shouldHide =
+        (MacWSShouldHideHostWindowFunction)dlsym(
+            RTLD_DEFAULT, "_UINSShouldHideHostWindowForScene");
+    NSInteger activationState = scene &&
+        ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            scene, sel_registerName("respondsToSelector:"),
+            sel_registerName("activationState"))
+        ? ((NSInteger (*)(id, SEL))objc_msgSend)(
+              scene, sel_registerName("activationState")) : NSIntegerMin;
+    BOOL hideHostWindow = shouldHide ? shouldHide(scene) : NO;
+    BOOL iOSAppOnMac = [NSProcessInfo.processInfo respondsToSelector:
+        sel_registerName("isiOSAppOnMac")]
+        ? ((BOOL (*)(id, SEL))objc_msgSend)(
+              NSProcessInfo.processInfo,
+              sel_registerName("isiOSAppOnMac")) : NO;
+    typedef BOOL (*MacWSApplicationLaunchToFullScreenFunction)(void);
+    MacWSApplicationLaunchToFullScreenFunction launchToFullScreen =
+        (MacWSApplicationLaunchToFullScreenFunction)dlsym(
+            RTLD_DEFAULT, "UINSApplicationLaunchToFullScreen");
+    BOOL launchesToFullScreen = launchToFullScreen
+        ? launchToFullScreen() : NO;
+    BOOL visibleSupported = NO;
+    BOOL visible = macws_catalyst_send_bool(
+        window, "isVisible", &visibleSupported);
+    fprintf(stderr,
+            "#### WEATHER-UINS event=new-window-controller scene=%s@%p "
+            "controller=%s@%p window=%s@%p visible=%s/%d "
+            "activation=%ld hide-host=%d hide-fn=%d ios-app-on-mac=%d "
+            "launch-fullscreen=%d launch-fullscreen-fn=%d\n",
+            scene ? object_getClassName(scene) : "nil", scene,
+            controller ? object_getClassName(controller) : "nil", controller,
+            window ? object_getClassName(window) : "nil", window,
+            visibleSupported ? "supported" : "unsupported", visible,
+            (long)activationState, hideHostWindow, shouldHide != NULL,
+            iOSAppOnMac, launchesToFullScreen,
+            launchToFullScreen != NULL);
+    fflush(stderr);
+    return controller;
+}
+
+static void macws_install_weather_uins_scene_trace(void) {
+    if (!macws_runtime_diagnostics_enabled()) return;
+    Class delegate = objc_getClass("UINSApplicationDelegate");
+    if (!delegate) return;
+    if (!macws_weather_uins_did_create_scene_orig &&
+        !macws_weather_uins_configure_window_orig) {
+      const char *selectors[] = {
+        "didCreateUIScene:transitionContextDictionary:",
+        "_configureWindowControllerCreatingIfNeededForScene:"
+        "transitionContextDictionary:",
+        "_newWindowControllerForScene:",
+    };
+    const char *paths[] = {
+        "/tmp/macws_weather_uins_did_create.bin",
+        "/tmp/macws_weather_uins_configure.bin",
+        "/tmp/macws_weather_uins_new_controller.bin",
+    };
+      for (NSUInteger index = 0; index < 3; index++) {
+        Method method = class_getInstanceMethod(
+            delegate, sel_registerName(selectors[index]));
+        void *signedImplementation = method
+            ? (void *)method_getImplementation(method) : NULL;
+        void *implementation = signedImplementation
+            ? ptrauth_strip(signedImplementation,
+                            ptrauth_key_function_pointer) : NULL;
+        Dl_info info = {0};
+        if (implementation) (void)dladdr(implementation, &info);
+        FILE *dump = implementation ? fopen(paths[index], "wb") : NULL;
+        size_t written = dump
+            ? fwrite(implementation, 1, 512, dump) : 0;
+        if (dump) fclose(dump);
+        fprintf(stderr,
+                "#### WEATHER-UINS implementation selector=%s imp=%p "
+                "image=%s base=%p dump=%zu\n",
+                selectors[index], implementation,
+                info.dli_fname ?: "nil", info.dli_fbase, written);
+      }
+    }
+    if (!macws_weather_uins_did_create_scene_orig) {
+        macws_lp_replace_instance_method(
+            delegate, "didCreateUIScene:transitionContextDictionary:",
+            (IMP)macws_weather_uins_did_create_scene_trace,
+            (IMP *)&macws_weather_uins_did_create_scene_orig);
+    }
+    if (!macws_weather_uins_configure_window_orig) {
+        macws_lp_replace_instance_method(
+            delegate,
+            "_configureWindowControllerCreatingIfNeededForScene:"
+            "transitionContextDictionary:",
+            (IMP)macws_weather_uins_configure_window_trace,
+            (IMP *)&macws_weather_uins_configure_window_orig);
+    }
+    if (!macws_weather_uins_new_window_controller_orig) {
+        macws_lp_replace_instance_method(
+            delegate, "_newWindowControllerForScene:",
+            (IMP)macws_weather_uins_new_window_controller_trace,
+            (IMP *)&macws_weather_uins_new_window_controller_orig);
+    }
+    Class controller = objc_getClass("UINSSceneWindowController");
+    if (controller && !macws_weather_uins_show_window_orig) {
+        macws_lp_replace_instance_method(
+            controller,
+            "_showWindowPostLoadIsFirstWindow:transitionContextDictionary:",
+            (IMP)macws_weather_uins_show_window_trace,
+            (IMP *)&macws_weather_uins_show_window_orig);
+    }
+    Class window = objc_getClass("UINSWindow");
+    if (window && !macws_weather_uins_make_key_and_order_front_orig) {
+        macws_lp_replace_instance_method(
+            window, "makeKeyAndOrderFront:",
+            (IMP)macws_weather_uins_make_key_and_order_front_trace,
+            (IMP *)&macws_weather_uins_make_key_and_order_front_orig);
+    }
+    fprintf(stderr,
+            "#### WEATHER-UINS scene-trace installed didCreate=%d "
+            "configure=%d new-controller=%d show-window=%d "
+            "make-key-order-front=%d\n",
+            macws_weather_uins_did_create_scene_orig != NULL,
+            macws_weather_uins_configure_window_orig != NULL,
+            macws_weather_uins_new_window_controller_orig != NULL,
+            macws_weather_uins_show_window_orig != NULL,
+            macws_weather_uins_make_key_and_order_front_orig != NULL);
+    fflush(stderr);
+}
+
 static void macws_install_weather_scene_compatibility(void) {
     const char *program = getprogname();
     if (!program || strcmp(program, "Weather") != 0) return;
     void *privateSysdir = dlsym(
         RTLD_DEFAULT, "sysdir_start_search_path_enumeration_private");
     if (privateSysdir) {
-        MSHookFunction(
-            privateSysdir,
-            (void *)macws_weather_sysdir_start_private_compat,
-            (void **)&macws_weather_sysdir_start_private_orig);
+        // Repair the literal shared-cache entry itself. All symbol-level and
+        // optimized direct calls converge here, so a stop-the-world function
+        // hook is both redundant and unsafe during process initialization.
+        (void)macws_patch_weather_private_sysdir_trap(privateSysdir);
     }
+    void *weatherSystemDirectory = dlsym(
+        RTLD_DEFAULT, "WDSystemDirectoryDirectoryPath");
+    if (weatherSystemDirectory)
+        (void)macws_patch_weather_system_directory_entry(
+            weatherSystemDirectory);
     void *searchPaths = dlsym(
         RTLD_DEFAULT, "NSSearchPathForDirectoriesInDomains");
     if (searchPaths) {
@@ -3256,6 +3650,7 @@ static void macws_install_weather_scene_compatibility(void) {
     // below, where the class is necessarily available to the caller.
     (void)macws_install_weather_uins_completion_hook();
     (void)macws_install_weather_uins_finish_hook();
+    macws_install_weather_uins_scene_trace();
 }
 
 static id macws_catalyst_endpoint_for_system_route(
@@ -4193,6 +4588,16 @@ static BOOL macws_catalyst_send_bool(id receiver, const char *selector,
     return ((BOOL (*)(id, SEL))objc_msgSend)(receiver, sel);
 }
 
+static NSInteger macws_catalyst_send_integer(id receiver,
+                                              const char *selector) {
+    if (!receiver) return NSIntegerMin;
+    SEL sel = sel_registerName(selector);
+    if (!((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+            receiver, sel_registerName("respondsToSelector:"), sel))
+        return NSIntegerMin;
+    return ((NSInteger (*)(id, SEL))objc_msgSend)(receiver, sel);
+}
+
 static void macws_catalyst_log_state(const char *stage, id application) {
     Class delegateClass = objc_getClass("UINSApplicationDelegate");
     id delegate = delegateClass
@@ -4355,6 +4760,52 @@ static void macws_catalyst_finish_after_scene(void *context) {
             macws_catalyst_pending_application = nil;
             macws_catalyst_pending_compell_selector = NULL;
             macws_catalyst_compell_orig(application, selector);
+            if (isWeather && atomic_load_explicit(
+                    &macws_weather_uins_finish_state,
+                    memory_order_acquire) != 2) {
+                Class uinsDelegateClass = objc_getClass(
+                    "UINSApplicationDelegate");
+                id uinsDelegate = uinsDelegateClass
+                    ? macws_catalyst_send_id(
+                          (id)uinsDelegateClass, "sharedDelegate") : nil;
+                SEL finishLaunching = sel_registerName("_finishLaunching");
+                BOOL canFinish = uinsDelegate &&
+                    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(
+                        uinsDelegate, sel_registerName("respondsToSelector:"),
+                        finishLaunching);
+                if (!canFinish) {
+                    atomic_store_explicit(
+                        &macws_catalyst_initial_scene_request_state, 3,
+                        memory_order_release);
+                    fprintf(stderr,
+                            "#### WEATHER-SCENE stock finish unavailable "
+                            "after application compell\n");
+                    fflush(stderr);
+                    return;
+                }
+                // Runtime-confirmed by the pid 26526/27746 sequence: calling
+                // this boundary re-entrantly from didRequestScene produced an
+                // off-Space window, while omitting it entirely left
+                // didConfigureWindow=NO and the same sole off-Space window.
+                // At this point didRequestScene has returned and the stock
+                // UIApplication compell continuation has completed. Run the
+                // complete UIKitMacHelper finish method in its normal order;
+                // our hook supplies only the genuine connected FUScene ID.
+                ((void (*)(id, SEL))objc_msgSend)(
+                    uinsDelegate, finishLaunching);
+                if (atomic_load_explicit(
+                        &macws_weather_uins_finish_state,
+                        memory_order_acquire) != 2) {
+                    atomic_store_explicit(
+                        &macws_catalyst_initial_scene_request_state, 3,
+                        memory_order_release);
+                    fprintf(stderr,
+                            "#### WEATHER-SCENE stock finish did not "
+                            "complete after application compell\n");
+                    fflush(stderr);
+                    return;
+                }
+            }
             if (macws_runtime_diagnostics_enabled())
                 macws_catalyst_log_state(
                     "UIApplication.compell-scene-ready", application);
@@ -4573,6 +5024,7 @@ static void macws_catalyst_compell_compat(id self, SEL selector) {
         if (program && strcmp(program, "Weather") == 0) {
             (void)macws_install_weather_uins_completion_hook();
             (void)macws_install_weather_uins_finish_hook();
+            macws_install_weather_uins_scene_trace();
         }
         int expected = 0;
         if (atomic_compare_exchange_strong_explicit(

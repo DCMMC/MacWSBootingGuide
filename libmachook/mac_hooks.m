@@ -3210,6 +3210,20 @@ static CGImageRef macws_create_settings_graphic_recipe_image(
     }
 
     CGRect bounds = CGRectMake(0, 0, width, height);
+    // Runtime final-composite capture on 2026-09-03 showed the resolved 32-pt
+    // enclosures touching all four edges of their Settings image slots. The
+    // glyph geometry was otherwise correct, but antialiased symbol pixels at
+    // the recipe edge were visibly clipped. Preserve the complete resolved
+    // recipe as one unit and apply CoreUI's missing one-point image margin to
+    // both enclosure and symbol; do not independently resize or reposition a
+    // glyph, which previously distorted non-integral silhouettes.
+    CGFloat margin = scale;
+    if (width > margin * 2.0 && height > margin * 2.0) {
+        CGFloat recipeScale = fmin((width - margin * 2.0) / width,
+                                   (height - margin * 2.0) / height);
+        CGContextTranslateCTM(context, margin, margin);
+        CGContextScaleCTM(context, recipeScale, recipeScale);
+    }
     CGColorRef enclosureColor = macws_settings_resolved_color(
         descriptor, "resolvedEnclosureColors");
     if (enclosureColor) {

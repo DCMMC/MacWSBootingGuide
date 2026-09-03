@@ -4765,6 +4765,44 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
   receivedWindows:(NSArray<MacWSStreamWindow *> *)windows {
     (void)view;
     _streamWindows = [windows copy];
+    if (_streamMode == MacWSStreamModeWindow && _windowID != 0 &&
+        _windowOwnerPID > 1) {
+        errno = 0;
+        BOOL ownerMissing = kill(_windowOwnerPID, 0) != 0 && errno == ESRCH;
+        if (ownerMissing) {
+            // Runtime-confirmed after the 2026-09-03 full-package cold start:
+            // the restored Scene still targeted Weather pid 45820/window 122
+            // after desktop cleanup had removed that process. The new
+            // DisplayStream catalog was healthy (Terminal was present), but
+            // an exact-window subscription can never publish a first frame
+            // for a dead owner, leaving the Host black indefinitely. Process
+            // absence is the authoritative generation boundary; clear the
+            // invalid return identity and reuse this same foreground Scene as
+            // the full desktop. A live root-owned process returns EPERM and
+            // is deliberately retained while its first window is launching.
+            int32_t missingOwnerPID = _windowOwnerPID;
+            uint32_t missingWindowID = _windowID;
+            _windowID = 0;
+            _windowOwnerPID = 0;
+            _windowGroupID = 0;
+            _windowMinimumSize = CGSizeZero;
+            _windowPreferredSize = CGSizeZero;
+            _windowResizable = NO;
+            _workspaceReturnValid = NO;
+            _workspaceReturnWindowID = 0;
+            _workspaceReturnOwnerPID = 0;
+            _workspaceReturnGroupID = 0;
+            _metalView.targetPID = 0;
+            _metalView.minimumLogicalSize = CGSizeZero;
+            _metalView.targetWindowResizable = NO;
+            MacWSLog(@"runtime-confirmed stale-window-generation "
+                     "owner=%d window=%u catalog=%lu recovery=desktop",
+                     missingOwnerPID, missingWindowID,
+                     (unsigned long)windows.count);
+            [self openFullscreenWorkspace];
+            return;
+        }
+    }
     if (_streamMode == MacWSStreamModeFullscreen) {
         NSMutableSet<NSNumber *> *eligiblePIDs = [NSMutableSet set];
         for (MacWSStreamWindow *window in windows) {
