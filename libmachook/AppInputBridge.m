@@ -53,6 +53,7 @@ typedef void (*MacWSMsgVoidID)(id, SEL, id);
 typedef void (*MacWSMsgVoidIDBool)(id, SEL, id, BOOL);
 typedef void (*MacWSMsgVoidRectBoolBool)(id, SEL, CGRect, BOOL, BOOL);
 typedef double (*MacWSMsgDouble)(id, SEL);
+typedef float (*MacWSMsgFloat)(id, SEL);
 typedef id (*MacWSMsgIDPoint)(id, SEL, CGPoint);
 typedef id (*MacWSMouseEventFactory)(id, SEL, NSUInteger, CGPoint, NSUInteger,
                                      NSTimeInterval, NSInteger, id, NSInteger,
@@ -2633,6 +2634,7 @@ static id MacWSCreateAppScrollEvent(Class eventClass,
 static id MacWSCreateAppGestureEvent(Class eventClass,
                                      MacWSInputRecord record,
                                      id window,
+                                     CGPoint screenPoint,
                                      CGPoint windowPoint,
                                      CGRect screenFrame,
                                      NSInteger windowNumber) {
@@ -2670,6 +2672,7 @@ static id MacWSCreateAppGestureEvent(Class eventClass,
     const uint32_t gestureKindField = 110;
     const uint32_t gestureIdentityField = 117;
     const uint32_t gesturePhaseField = 132;
+    const uint32_t appKitWindowNumberField = 51;
     uint16_t phaseFlags = record.flags &
         (MacWSInputFlagGestureBegan | MacWSInputFlagGestureChanged |
          MacWSInputFlagGestureEnded | MacWSInputFlagGestureCancelled);
@@ -2702,16 +2705,31 @@ static id MacWSCreateAppGestureEvent(Class eventClass,
                    (rotation ? 0x524f5441u : 0x50494e43u));
     setInteger(cgEvent, gesturePhaseField, (int64_t)phase);
     if (windowNumber > 0) {
+        // RE-confirmed via Ventura AppKit's
+        // -[NSEvent _initWithCGEvent:eventRef:] at +0x88: field 0x33 is
+        // passed to -[NSApplication windowWithWindowNumber:]. When it names
+        // a real window, +0x130 calls through that window's _cgsWindow to
+        // convert the global CG location into the local coordinates stored at
+        // NSEvent+0x8. Fields 91/92 alone are not consulted by this path in
+        // the mixed runtime and left the screen origin in locationInWindow.
+        setInteger(cgEvent, appKitWindowNumberField, windowNumber);
         setInteger(cgEvent, 91, windowNumber);
         setInteger(cgEvent, 92, windowNumber);
     }
     if (setTimestamp && record.timestamp > 0.0)
         setTimestamp(cgEvent, (uint64_t)llround(record.timestamp * 1.0e9));
-    CGPoint cgWindowPoint = {
-        windowPoint.x,
-        screenFrame.origin.y + screenFrame.size.height - windowPoint.y,
+    // CGEventSetLocation consumes global Quartz coordinates. RE-confirmed via
+    // Ventura AppKit's _routeRotateEvent: phase Began reads locationInWindow
+    // and passes it to the window border view's hitTest:. Runtime LLDB before
+    // the target-window field above was restored observed (512,244.5) and a
+    // nil hit; after it was restored, AppKit's initializer performed its own
+    // global-to-window conversion. Supply the already-resolved global point
+    // and validate the resulting local point below.
+    CGPoint cgScreenPoint = {
+        screenPoint.x,
+        screenFrame.origin.y + screenFrame.size.height - screenPoint.y,
     };
-    if (setLocation) setLocation(cgEvent, cgWindowPoint);
+    if (setLocation) setLocation(cgEvent, cgScreenPoint);
     if (setFlags) setFlags(cgEvent,
         MacWSInputModifiersForScene(record.sceneID));
 
@@ -2736,8 +2754,16 @@ static id MacWSCreateAppGestureEvent(Class eventClass,
         event, sel_registerName("type"));
     NSUInteger expectedType = rotation ? 18 : 30;
     if (eventType != expectedType) return nil;
-    double observed = ((MacWSMsgDouble)objc_msgSend)(
-        event, sel_registerName(rotation ? "rotation" : "magnification"));
+    // NSEvent's public ABI is deliberately asymmetric here: magnification is
+    // CGFloat (double on arm64), while rotation is float. Runtime-confirmed on
+    // the installed Ventura AppKit: -rotation returned the encoded 2.0 bits in
+    // s0 (0x40000000); reading d0 produced 5.3049894774131808e-315 and made
+    // every non-zero Changed event fail this equivalence check.
+    double observed = rotation
+        ? (double)((MacWSMsgFloat)objc_msgSend)(
+              event, sel_registerName("rotation"))
+        : ((MacWSMsgDouble)objc_msgSend)(
+              event, sel_registerName("magnification"));
     if (!isfinite(observed) || fabs(observed - encodedAmount) > 0.0005)
         return nil;
     // `eventWithCGEvent:` in this macOS-on-iOS runtime does not import CG
@@ -2771,8 +2797,23 @@ static id MacWSCreateAppGestureEvent(Class eventClass,
         event, sel_registerName("window"));
     NSInteger observedWindowNumber = ((MacWSMsgInteger)objc_msgSend)(
         event, sel_registerName("windowNumber"));
-    if (observedWindow != window || observedWindowNumber != windowNumber)
-        return nil;
+    CGPoint observedPoint = ((MacWSMsgPoint)objc_msgSend)(
+        event, sel_registerName("locationInWindow"));
+    BOOL routeEquivalent = observedWindow == window &&
+        observedWindowNumber == windowNumber &&
+        isfinite(observedPoint.x) && isfinite(observedPoint.y) &&
+        fabs(observedPoint.x - windowPoint.x) <= 2.0 &&
+        fabs(observedPoint.y - windowPoint.y) <= 2.0;
+    if (MacWSRuntimeDiagnosticsEnabled()) {
+        fprintf(stderr,
+            "#### APP-INPUT GESTURE-ROUTE pid=%d window=%ld->%ld "
+            "local=(%.2f,%.2f)->(%.2f,%.2f) equivalent=%s\n",
+            getpid(), (long)windowNumber, (long)observedWindowNumber,
+            windowPoint.x, windowPoint.y, observedPoint.x, observedPoint.y,
+            routeEquivalent ? "YES" : "NO");
+        fflush(stderr);
+    }
+    if (!routeEquivalent) return nil;
     return event;
 }
 
@@ -6441,7 +6482,7 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
         record.kind == MacWSInputKindRotate) {
         BOOL rotation = record.kind == MacWSInputKindRotate;
         id gestureEvent = MacWSCreateAppGestureEvent(
-            eventClass, record, window, windowPoint, screenFrame,
+            eventClass, record, window, screenPoint, windowPoint, screenFrame,
             windowNumber);
         if (!gestureEvent) {
             fprintf(stderr,
