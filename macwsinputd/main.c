@@ -1597,6 +1597,18 @@ int main(void) {
             // its pointer or keyboard record into another application.
             eventTarget.pid = record.targetPID;
             eventTarget.windowID = (int32_t)exactWindowID;
+        } else if (keyRecord && record.targetPID > 1) {
+            // A fullscreen Host keyboard record carries the application that
+            // was frontmost when UIKit produced this exact press.  Treat that
+            // live identity as authoritative before consulting pointer/menu
+            // caches.  Runtime-confirmed on 2026-09-04: Host emitted `w` for
+            // Terminal pid 87219, but a retained Activity Monitor menuTarget
+            // rewrote both key records to pid 30246.  Activity Monitor's
+            // search field therefore typed while Terminal, VSCode and Sublime
+            // appeared keyboard-dead.  Records from legacy/global producers
+            // with targetPID=0 still use the established menu/hover fallback
+            // below.
+            eventTarget.pid = record.targetPID;
         } else if ((keyRecord || gestureRecord) && menuTarget.pid > 1) {
             // ActivateTarget is resolved before the authoritative native
             // mouse-down and remains the front application target after the
