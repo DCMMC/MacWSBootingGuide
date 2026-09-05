@@ -12242,6 +12242,141 @@ static void macws_log_plain_texture_surface_layout(
     return result;
 }
 @end
+
+// Ventura's CA::OGL::MetalContext::update_image normally keeps a private
+// no-copy texture coherent by calling -didModifyData after the backing-store
+// seed changes.  RE-confirmed in QuartzCore 13.4 UUID
+// CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC at image+0x6f9c0..0x6fa2c:
+// MetalImage flag 0x200 selects didModifyData; the adjacent non-client-storage
+// path uploads the same Render::Image bytes with -replaceRegion:... .
+//
+// Runtime-confirmed on iPad13,6 (2026-09-06): Terminal's reused 1140x686
+// MetalImage had flags=0x20a, one plane, one mip level, a Managed
+// AGXG13GFamilyTexture, and IOGPUMetalTexture's didModifyData IMP was exactly
+// one `ret` instruction.  The CPU backing contained every character, but a
+// 20-ms `testme` burst displayed only `t`.  Redirecting that exact update
+// through QuartzCore's complete replaceRegion path made `testme` visible.
+// Preserve QuartzCore's bookkeeping first, then supply the missing upload only
+// for that versioned, simple 2D IOGPU client-storage shape.
+typedef void (*MacwsQuartzCoreUpdateImageFn)(
+    void *context, void *metalImage, void *image, uint32_t flags,
+    const char *label);
+static MacwsQuartzCoreUpdateImageFn
+    g_macws_quartzcore_update_image_original = NULL;
+
+static BOOL macws_object_has_iogpu_texture_ancestor(id object) {
+    for (Class current = object ? object_getClass(object) : Nil;
+         current; current = class_getSuperclass(current)) {
+        const char *name = class_getName(current);
+        if (name && strcmp(name, "IOGPUMetalTexture") == 0) return YES;
+    }
+    return NO;
+}
+
+static BOOL macws_texture_has_noop_did_modify_data(id texture) {
+    Method method = texture ? class_getInstanceMethod(
+        object_getClass(texture), sel_registerName("didModifyData")) : NULL;
+    IMP implementation = method ? method_getImplementation(method) : NULL;
+    const uint32_t *code = implementation
+        ? (const uint32_t *)ptrauth_strip(
+            implementation, ptrauth_key_function_pointer)
+        : NULL;
+    return code && *code == 0xd65f03c0; // ret
+}
+
+static void macws_quartzcore_update_image(
+        void *context, void *metalImage, void *image, uint32_t flags,
+        const char *label) {
+    id textureBefore = metalImage
+        ? *(id const volatile *)((const char *)metalImage + 0x40) : nil;
+    g_macws_quartzcore_update_image_original(
+        context, metalImage, image, flags, label);
+
+    if (!textureBefore || !metalImage || !image ||
+        !getenv("MACWS_AGX_NATIVE")) return;
+    id<MTLTexture> texture =
+        *(id const volatile *)((const char *)metalImage + 0x40);
+    uint16_t metalFlags =
+        *(const volatile uint16_t *)((const char *)metalImage + 0x7b);
+    uint16_t planeCount =
+        *(const volatile uint16_t *)((const char *)metalImage + 0x78);
+    uint8_t mipLevelCount =
+        *(const volatile uint8_t *)((const char *)image + 0x99);
+    const void *source =
+        *(const void *const volatile *)((const char *)image + 0x60);
+    uint32_t width =
+        *(const volatile uint32_t *)((const char *)image + 0x10);
+    uint32_t height =
+        *(const volatile uint32_t *)((const char *)image + 0x14);
+    NSUInteger bytesPerRow =
+        *(const volatile NSUInteger *)((const char *)image + 0xa0);
+
+    if (texture != textureBefore || !(metalFlags & 0x200) ||
+        planeCount != 1 || mipLevelCount != 1 || !source || !width ||
+        !height || !bytesPerRow || height > NSUIntegerMax / bytesPerRow ||
+        !macws_object_has_iogpu_texture_ancestor(texture) ||
+        !macws_texture_has_noop_did_modify_data(texture) ||
+        texture.storageMode != (MTLStorageMode)1 ||
+        texture.textureType != MTLTextureType2D || texture.depth != 1 ||
+        texture.arrayLength != 1 || texture.mipmapLevelCount != 1 ||
+        texture.width != width || texture.height != height) {
+        return;
+    }
+
+    [texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+               mipmapLevel:0
+                     slice:0
+                 withBytes:source
+               bytesPerRow:bytesPerRow
+             bytesPerImage:bytesPerRow * height];
+
+    if (macws_runtime_diagnostics_enabled()) {
+        static _Atomic uint64_t uploadCount = 0;
+        uint64_t sequence = atomic_fetch_add_explicit(
+            &uploadCount, 1, memory_order_relaxed) + 1;
+        if (sequence <= 24 || (sequence % 600) == 0) {
+            fprintf(stderr,
+                "#### MACWS_AGX_NATIVE client-storage upload #%llu "
+                "texture=%p size=%ux%u bpr=%lu source=%p\n",
+                (unsigned long long)sequence, (void *)texture, width, height,
+                (unsigned long)bytesPerRow, source);
+        }
+    }
+}
+
+static void macws_install_quartzcore_update_image(
+        const struct mach_header *header, intptr_t slide) {
+    (void)slide;
+    if (!getenv("MACWS_AGX_NATIVE") ||
+        g_macws_quartzcore_update_image_original) return;
+    const char *program = getprogname();
+    if (!program || strcmp(program, "WindowServer") != 0) return;
+    Dl_info info = {0};
+    if (!dladdr((const void *)header, &info) || !info.dli_fname ||
+        !strstr(info.dli_fname, "/QuartzCore.framework/")) return;
+    static const uint8_t expectedUUID[16] = {
+        0xcf, 0x85, 0x3b, 0xbd, 0x01, 0xb6, 0x3f, 0x46,
+        0xad, 0xa1, 0xec, 0x70, 0xfd, 0x2d, 0xc9, 0xdc,
+    };
+    static const uint32_t expectedPrologue[] = {
+        0xd503237f, 0xd103c3ff, 0xa9096ffc,
+        0xa90a67fa, 0xa90b5ff8, 0xa90c57f6,
+    };
+    if (!macws_macho_has_uuid(header, expectedUUID)) return;
+    void *target = (void *)((uintptr_t)header + 0x6f750);
+    if (memcmp(target, expectedPrologue, sizeof(expectedPrologue)) != 0) {
+        fprintf(stderr,
+            "#### MACWS_AGX_NATIVE QuartzCore update_image skipped: "
+            "version/prologue mismatch at %p\n", target);
+        return;
+    }
+    MSHookFunction(target, (void *)macws_quartzcore_update_image,
+        (void **)&g_macws_quartzcore_update_image_original);
+    fprintf(stderr,
+        "#### MACWS_AGX_NATIVE hooked QuartzCore client-storage update "
+        "target=%p trampoline=%p\n",
+        target, (void *)g_macws_quartzcore_update_image_original);
+}
 #endif // MTLFakeDevice static class (off for arm64e on-device)
 
 // Forward declarations for AGX init redirect (definitions below the hook).
@@ -21870,6 +22005,13 @@ __attribute__((constructor)) static void InitMetalHooks() {
         // otherwise-dead PID visible.
         return;
     }
+#if !defined(__arm64e__) || !defined(LIBMACHOOK_ON_DEVICE_BUILD)
+    // Register before the AGX device is created. dyld immediately visits an
+    // already-loaded QuartzCore image, so its client-storage update path is
+    // wrapped before the compositor creates the first MetalImage.
+    _dyld_register_func_for_add_image(
+        macws_install_quartzcore_update_image);
+#endif
     macws_install_iconservices_quarantine_fallback();
     macws_install_cgsession_login_handoff_compatibility();
     macws_install_launchpad_mount_namespace_compatibility();

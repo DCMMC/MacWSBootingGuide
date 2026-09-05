@@ -2448,11 +2448,24 @@ static void hooked_skylight_end_current_composite(void *self, bool synchronize) 
 // thread; it does not wait, commit, or add a post-commit completion handler.
 typedef void (*EndUpdate_t)(void *self, bool waitUntilSubmitted);
 static EndUpdate_t orig_skylight_end_update = NULL;
+// EndUpdate and IOMFB SwapEnd run on WindowServer's main thread. Preserve the
+// exact MetalContext whose outermost Flush submitted this swap so the
+// coexistence completion below can fence the matching command buffer.
+static _Thread_local void *g_macws_last_end_update_metal_context;
+
+static NSUInteger macws_command_buffer_status(id command_buffer) {
+    if (!command_buffer) return NSUIntegerMax;
+    SEL selector = sel_registerName("status");
+    if (![command_buffer respondsToSelector:selector]) return NSUIntegerMax;
+    return ((NSUInteger (*)(id, SEL))objc_msgSend)(command_buffer, selector);
+}
+
 static void hooked_skylight_end_update(void *self, bool waitUntilSubmitted) {
     bool outermost = self &&
         *(volatile int32_t *)((char *)self + 0x178) == 1;
     orig_skylight_end_update(self, waitUntilSubmitted);
     if (outermost) {
+        g_macws_last_end_update_metal_context = self;
         extern void macws_vnc_finish_update(void *);
         macws_vnc_finish_update(self);
     }
@@ -14509,9 +14522,21 @@ static void macws_install_quartzcore_coexist_pacing_hooks(
     }
 }
 
+static dispatch_queue_t macws_iomfb_gpu_completion_queue(void) {
+    static dispatch_once_t once;
+    static dispatch_queue_t queue;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create(
+            "com.macwsguide.iomfb-gpu-completion",
+            DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
 static void macws_iomfb_complete_cancelled_swap(
     io_connect_t client, uint32_t swap_id,
-    uint64_t requested_presentation_time) {
+    uint64_t requested_presentation_time,
+    void *submitted_command_buffer_witness) {
     if (!macws_cancel_completion_enabled())
         return;
 
@@ -14549,7 +14574,7 @@ static void macws_iomfb_complete_cancelled_swap(
             "client=%u fb=%p\n",
             sequence, swap_id, client, registration.framebuffer);
     }
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_block_t deliver = ^{
         // RE-confirmed from the exact macOS 13.4 QuartzCore image
         // CF853BBD-01B6-3F46-ADA1-EC70FD2DC9DC. frame_info_callback at
         // 0x187c5009c reads Presentation_time, Vbl_FrameTime (falling back to
@@ -14617,13 +14642,61 @@ static void macws_iomfb_complete_cancelled_swap(
             fprintf(stderr,
                 "#### IOMFB CANCEL-COMPLETION delivered #%lu swapID=%u "
                 "client=%u requested=%llu presentation=%llu delta=%llu "
-                "pending=%zu->%zu\n",
+                "pending=%zu->%zu commandBuffer=%p\n",
                 delivered, swap_id, client,
                 (unsigned long long)requested_presentation_time,
                 (unsigned long long)presentation_time,
                 (unsigned long long)presentation_delta,
-                pending_before, pending_after);
+                pending_before, pending_after,
+                submitted_command_buffer_witness);
         }
+    };
+
+    id submitted_command_buffer =
+        (__bridge id)submitted_command_buffer_witness;
+    if (!submitted_command_buffer ||
+        ![submitted_command_buffer respondsToSelector:
+            sel_registerName("status")]) {
+        if (diagnostics) {
+            fprintf(stderr,
+                "#### IOMFB GPU-FENCE unavailable swapID=%u "
+                "commandBuffer=%p; delivering no-work cancellation\n",
+                swap_id, submitted_command_buffer_witness);
+        }
+        dispatch_async(dispatch_get_main_queue(), deliver);
+        return;
+    }
+
+    // Runtime-confirmed on iPad13,6 native AGX (2026-09-05): the old
+    // synthetic frame-info callback ran while the command buffer retained by
+    // MetalContext::Flush at self+0x68 still had status=3 (Scheduled). That
+    // callback retires QuartzCore backing-store generations, so delivery must
+    // follow GPU completion just as real IOMFB presentation completion does.
+    // EndUpdate has already committed the buffer and Metal rejects adding a
+    // completion handler this late; observe its real status on one serial
+    // worker. The serial queue preserves frame-info ordering, and there is no
+    // timeout that would manufacture a completion for a stuck GPU.
+    dispatch_async(macws_iomfb_gpu_completion_queue(), ^{
+        NSUInteger status =
+            macws_command_buffer_status(submitted_command_buffer);
+        unsigned polls = 0;
+        while (status < 4) {
+            usleep(250);
+            status = macws_command_buffer_status(submitted_command_buffer);
+            polls++;
+        }
+        if (diagnostics) {
+            static _Atomic unsigned long fence_count = 0;
+            unsigned long fence = atomic_fetch_add(&fence_count, 1) + 1;
+            if (fence <= 16 || (fence % 600) == 0 || status != 4) {
+                fprintf(stderr,
+                    "#### IOMFB GPU-FENCE ready #%lu swapID=%u "
+                    "commandBuffer=%p status=%lu polls=%u\n",
+                    fence, swap_id, submitted_command_buffer_witness,
+                    (unsigned long)status, polls);
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), deliver);
     });
 }
 
@@ -19951,8 +20024,12 @@ static IOReturn MacwsIOMobileFramebufferSwapEnd_new(void *framebuffer) {
         }
         io_connect_t client = *(const volatile io_connect_t *)
             ((const char *)framebuffer + 0x14);
+        void *submitted_command_buffer = g_macws_last_end_update_metal_context
+            ? *(void **)((char *)g_macws_last_end_update_metal_context + 0x68)
+            : NULL;
         macws_iomfb_complete_cancelled_swap(
-            client, swap_id, requested_presentation_time);
+            client, swap_id, requested_presentation_time,
+            submitted_command_buffer);
         if (sequence && sequence <= 4) {
             fprintf(stderr,
                 "#### COEXIST completion pace #%lu: interval=%u us "
@@ -20018,7 +20095,11 @@ IOReturn IOConnectCallStructMethod_new(io_connect_t client, uint32_t selector, c
                 slept_us = macws_coexist_wait_for_completion_slot(pace_us);
             }
             macws_iomfb_complete_cancelled_swap(
-                client, swap_id, requested_presentation_time);
+                client, swap_id, requested_presentation_time,
+                g_macws_last_end_update_metal_context
+                    ? *(void **)((char *)
+                        g_macws_last_end_update_metal_context + 0x68)
+                    : NULL);
             if (cancel_n && cancel_n <= 4) {
                 fprintf(stderr,
                     "#### COEXIST fallback completion pace #%lu: "
