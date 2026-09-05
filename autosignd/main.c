@@ -36,6 +36,10 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <limits.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <CommonCrypto/CommonDigest.h>
 
 extern char **environ;
 
@@ -45,9 +49,23 @@ extern char **environ;
 #define ROOTFS      "/var/mnt/rootfs"
 #define LDID        "/var/jb/usr/bin/ldid"
 #define JBCTL       "/var/jb/usr/bin/jbctl"
+#define OTOOL       "/var/jb/usr/bin/otool"
 #define ENT         "/var/jb/usr/macOS/bin/entitlements.plist"
 
 static const char *kArches[] = { "arm64", "arm64e", "x86_64", NULL };
+
+typedef struct {
+    char *path;
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    struct timespec mtime;
+    struct timespec ctime;
+} ValidatedSignature;
+
+static ValidatedSignature *g_validated_signatures;
+static size_t g_validated_signature_count;
+static size_t g_validated_signature_capacity;
 
 // ── simple in-memory set of already-processed rootfs paths ──────────────────
 static char **g_seen = NULL;
@@ -64,6 +82,11 @@ static void mark_seen(const char *p) {
         g_seen = realloc(g_seen, g_seen_cap * sizeof(char *));
     }
     g_seen[g_seen_n++] = strdup(p);
+}
+
+static void clear_seen(void) {
+    for (size_t index = 0; index < g_seen_n; index++) free(g_seen[index]);
+    g_seen_n = 0;
 }
 
 static void logmsg(const char *fmt, ...) {
@@ -137,20 +160,329 @@ static void trustcache_add(const char *hash) {
     capture(argv, NULL, 0);
 }
 
-static void adhoc_sign(const char *path) {
-    char sflag[] = "-S" ENT;
-    char *const argv[] = { (char *)LDID, sflag, "-M", (char *)path, NULL };
-    capture(argv, NULL, 0);
+static int adhoc_sign(const char *path, int dependency) {
+    char executable_sflag[] = "-S" ENT;
+    char library_sflag[] = "-S";
+    // A loaded dylib must not carry the executable compatibility entitlement
+    // profile. iPadOS logged "has entitlements but is not a main binary" for
+    // third-party libraries signed that way. Entry executables retain the
+    // established MacWS profile; dependencies get a plain ad-hoc signature.
+    if (dependency) {
+        // Do not pass -M here: merging would preserve executable-only
+        // entitlements already embedded by an older autosignd revision.
+        char *const argv[] = {
+            (char *)LDID, library_sflag, (char *)path, NULL
+        };
+        return capture(argv, NULL, 0);
+    }
+    char *const argv[] = {
+        (char *)LDID, executable_sflag, "-M", (char *)path, NULL
+    };
+    return capture(argv, NULL, 0);
 }
 
-// A current CDHash in Dopamine's dynamic trustcache is a byte-level witness
-// that this exact Mach-O has already completed the project's signing policy.
+static uint32_t read_u32(const uint8_t *bytes, int little_endian) {
+    if (little_endian)
+        return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+               ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+    return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) |
+           ((uint32_t)bytes[2] << 8) | (uint32_t)bytes[3];
+}
+
+static uint64_t read_u64(const uint8_t *bytes, int little_endian) {
+    uint64_t low = read_u32(bytes + (little_endian ? 0 : 4), little_endian);
+    uint64_t high = read_u32(bytes + (little_endian ? 4 : 0), little_endian);
+    return low | (high << 32);
+}
+
+static int pread_all(int fd, void *buffer, size_t length, off_t offset) {
+    uint8_t *cursor = buffer;
+    while (length) {
+        ssize_t count = pread(fd, cursor, length, offset);
+        if (count > 0) {
+            cursor += count;
+            length -= (size_t)count;
+            offset += count;
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int stat_matches(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+           left->st_size == right->st_size &&
+           left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
+           left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+}
+
+static int validated_signature_cached(const char *path,
+                                      const struct stat *status) {
+    for (size_t index = 0; index < g_validated_signature_count; index++) {
+        ValidatedSignature *entry = &g_validated_signatures[index];
+        if (strcmp(entry->path, path) == 0 &&
+            entry->device == status->st_dev &&
+            entry->inode == status->st_ino && entry->size == status->st_size &&
+            entry->mtime.tv_sec == status->st_mtimespec.tv_sec &&
+            entry->mtime.tv_nsec == status->st_mtimespec.tv_nsec &&
+            entry->ctime.tv_sec == status->st_ctimespec.tv_sec &&
+            entry->ctime.tv_nsec == status->st_ctimespec.tv_nsec)
+            return 1;
+    }
+    return 0;
+}
+
+static void cache_validated_signature(const char *path,
+                                      const struct stat *status) {
+    for (size_t index = 0; index < g_validated_signature_count; index++) {
+        ValidatedSignature *entry = &g_validated_signatures[index];
+        if (strcmp(entry->path, path) != 0) continue;
+        entry->device = status->st_dev;
+        entry->inode = status->st_ino;
+        entry->size = status->st_size;
+        entry->mtime = status->st_mtimespec;
+        entry->ctime = status->st_ctimespec;
+        return;
+    }
+    if (g_validated_signature_count == g_validated_signature_capacity) {
+        size_t capacity = g_validated_signature_capacity
+                            ? g_validated_signature_capacity * 2 : 64;
+        ValidatedSignature *entries = realloc(
+            g_validated_signatures, capacity * sizeof(*entries));
+        if (!entries) return;
+        g_validated_signatures = entries;
+        g_validated_signature_capacity = capacity;
+    }
+    ValidatedSignature *entry =
+        &g_validated_signatures[g_validated_signature_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->path = strdup(path);
+    if (!entry->path) {
+        g_validated_signature_count--;
+        return;
+    }
+    entry->device = status->st_dev;
+    entry->inode = status->st_ino;
+    entry->size = status->st_size;
+    entry->mtime = status->st_mtimespec;
+    entry->ctime = status->st_ctimespec;
+}
+
+static size_t code_digest(uint8_t hash_type, const void *bytes, size_t length,
+                          uint8_t digest[CC_SHA512_DIGEST_LENGTH]) {
+    if (length > UINT32_MAX) return 0;
+    switch (hash_type) {
+        case 1:
+            CC_SHA1(bytes, (CC_LONG)length, digest);
+            return CC_SHA1_DIGEST_LENGTH;
+        case 2:
+        case 3:
+            CC_SHA256(bytes, (CC_LONG)length, digest);
+            return CC_SHA256_DIGEST_LENGTH;
+        case 4:
+            CC_SHA384(bytes, (CC_LONG)length, digest);
+            return CC_SHA384_DIGEST_LENGTH;
+        default:
+            return 0;
+    }
+}
+
+static int code_directory_pages_are_valid(int fd, uint64_t slice_offset,
+                                          uint64_t slice_size,
+                                          const uint8_t *directory,
+                                          size_t available) {
+    if (available < 44 || read_u32(directory, 0) != 0xfade0c02) return 0;
+    uint32_t length = read_u32(directory + 4, 0);
+    uint32_t version = read_u32(directory + 8, 0);
+    uint32_t hash_offset = read_u32(directory + 16, 0);
+    uint32_t code_slots = read_u32(directory + 28, 0);
+    uint64_t code_limit = read_u32(directory + 32, 0);
+    uint8_t hash_size = directory[36];
+    uint8_t hash_type = directory[37];
+    uint8_t page_shift = directory[39];
+    if (length < 44 || length > available || page_shift < 9 ||
+        page_shift > 20 || hash_size == 0 || hash_size > 64)
+        return 0;
+    if (version >= 0x20300 && length >= 64 && code_limit == 0)
+        code_limit = read_u64(directory + 56, 0);
+    uint64_t page_size = UINT64_C(1) << page_shift;
+    uint64_t expected_slots = (code_limit + page_size - 1) / page_size;
+    uint64_t hashes_end = (uint64_t)hash_offset +
+                          (uint64_t)code_slots * hash_size;
+    if (code_limit > slice_size || expected_slots != code_slots ||
+        hashes_end > length) return 0;
+
+    uint8_t *page = malloc((size_t)page_size);
+    if (!page) return 0;
+    int valid = 1;
+    for (uint32_t slot = 0; slot < code_slots; slot++) {
+        uint64_t page_offset = (uint64_t)slot * page_size;
+        size_t page_length = (size_t)((code_limit - page_offset) < page_size
+                            ? (code_limit - page_offset) : page_size);
+        if (!pread_all(fd, page, page_length,
+                       (off_t)(slice_offset + page_offset))) {
+            valid = 0;
+            break;
+        }
+        uint8_t digest[CC_SHA512_DIGEST_LENGTH];
+        size_t digest_length = code_digest(hash_type, page, page_length,
+                                           digest);
+        const uint8_t *expected = directory + hash_offset +
+                                  (uint64_t)slot * hash_size;
+        if (digest_length < hash_size ||
+            memcmp(digest, expected, hash_size) != 0) {
+            valid = 0;
+            break;
+        }
+    }
+    free(page);
+    return valid;
+}
+
+static int macho_slice_signature_is_valid(int fd, uint64_t slice_offset,
+                                          uint64_t slice_size) {
+    uint8_t header[32];
+    if (slice_size < 28 || !pread_all(fd, header, sizeof(header),
+                                      (off_t)slice_offset)) return 0;
+    int little_endian;
+    size_t header_size;
+    if (memcmp(header, "\xcf\xfa\xed\xfe", 4) == 0) {
+        little_endian = 1; header_size = 32;
+    } else if (memcmp(header, "\xfe\xed\xfa\xcf", 4) == 0) {
+        little_endian = 0; header_size = 32;
+    } else if (memcmp(header, "\xce\xfa\xed\xfe", 4) == 0) {
+        little_endian = 1; header_size = 28;
+    } else if (memcmp(header, "\xfe\xed\xfa\xce", 4) == 0) {
+        little_endian = 0; header_size = 28;
+    } else {
+        return 0;
+    }
+    uint32_t command_count = read_u32(header + 16, little_endian);
+    uint32_t commands_size = read_u32(header + 20, little_endian);
+    if ((uint64_t)header_size + commands_size > slice_size ||
+        commands_size > 32 * 1024 * 1024) return 0;
+    uint8_t *commands = malloc(commands_size);
+    if (!commands || !pread_all(fd, commands, commands_size,
+                                (off_t)(slice_offset + header_size))) {
+        free(commands);
+        return 0;
+    }
+
+    uint32_t signature_offset = 0, signature_size = 0;
+    size_t cursor = 0;
+    for (uint32_t index = 0; index < command_count; index++) {
+        if (cursor + 8 > commands_size) break;
+        uint32_t command = read_u32(commands + cursor, little_endian);
+        uint32_t command_size = read_u32(commands + cursor + 4,
+                                         little_endian);
+        if (command_size < 8 || cursor + command_size > commands_size) break;
+        if (command == 0x1d && command_size >= 16) {
+            signature_offset = read_u32(commands + cursor + 8,
+                                        little_endian);
+            signature_size = read_u32(commands + cursor + 12,
+                                      little_endian);
+            break;
+        }
+        cursor += command_size;
+    }
+    free(commands);
+    if (!signature_size || (uint64_t)signature_offset + signature_size >
+                           slice_size || signature_size > 64 * 1024 * 1024)
+        return 0;
+    uint8_t *signature = malloc(signature_size);
+    if (!signature || !pread_all(fd, signature, signature_size,
+                                 (off_t)(slice_offset + signature_offset))) {
+        free(signature);
+        return 0;
+    }
+
+    int valid = 1, found = 0;
+    if (signature_size < 12 || read_u32(signature, 0) != 0xfade0cc0) {
+        valid = 0;
+    } else {
+        uint32_t super_length = read_u32(signature + 4, 0);
+        uint32_t count = read_u32(signature + 8, 0);
+        if (super_length < 12 || super_length > signature_size || count >
+            (super_length - 12) / 8) {
+            valid = 0;
+        } else {
+            for (uint32_t index = 0; index < count; index++) {
+                uint32_t offset = read_u32(signature + 12 + index * 8 + 4,
+                                           0);
+                if (offset + 8 > super_length ||
+                    read_u32(signature + offset, 0) != 0xfade0c02)
+                    continue;
+                found = 1;
+                if (!code_directory_pages_are_valid(
+                        fd, slice_offset, slice_size, signature + offset,
+                        super_length - offset)) {
+                    valid = 0;
+                    break;
+                }
+            }
+        }
+    }
+    free(signature);
+    return valid && found;
+}
+
+static int code_signature_pages_are_valid(const char *path) {
+    struct stat before, after;
+    if (stat(path, &before) != 0 || !S_ISREG(before.st_mode)) return 0;
+    if (validated_signature_cached(path, &before)) return 1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t header[8];
+    int valid = pread_all(fd, header, sizeof(header), 0);
+    if (valid && (memcmp(header, "\xca\xfe\xba\xbe", 4) == 0 ||
+                  memcmp(header, "\xca\xfe\xba\xbf", 4) == 0 ||
+                  memcmp(header, "\xbe\xba\xfe\xca", 4) == 0 ||
+                  memcmp(header, "\xbf\xba\xfe\xca", 4) == 0)) {
+        int little_endian = header[0] == 0xbe || header[0] == 0xbf;
+        int fat64 = header[3] == 0xbf || header[0] == 0xbf;
+        uint32_t count = read_u32(header + 4, little_endian);
+        size_t entry_size = fat64 ? 32 : 20;
+        if (count == 0 || count > 64) valid = 0;
+        size_t table_size = valid ? (size_t)count * entry_size : 0;
+        uint8_t *table = valid ? malloc(table_size) : NULL;
+        if (valid && (!table || !pread_all(fd, table, table_size, 8)))
+            valid = 0;
+        for (uint32_t index = 0; valid && index < count; index++) {
+            const uint8_t *entry = table + (size_t)index * entry_size;
+            uint64_t offset = fat64 ? read_u64(entry + 8, little_endian)
+                                    : read_u32(entry + 8, little_endian);
+            uint64_t size = fat64 ? read_u64(entry + 16, little_endian)
+                                  : read_u32(entry + 12, little_endian);
+            if (offset > (uint64_t)before.st_size ||
+                size > (uint64_t)before.st_size - offset ||
+                !macho_slice_signature_is_valid(fd, offset, size))
+                valid = 0;
+        }
+        free(table);
+    } else if (valid) {
+        valid = macho_slice_signature_is_valid(fd, 0,
+                                                (uint64_t)before.st_size);
+    }
+    valid = valid && fstat(fd, &after) == 0 && stat_matches(&before, &after);
+    close(fd);
+    if (valid) cache_validated_signature(path, &after);
+    return valid;
+}
+
+// Both matching CodeDirectory page hashes and a current CDHash in Dopamine's
+// dynamic trustcache are required witnesses that this exact Mach-O has already
+// completed the project's signing policy.
 // Preserve it verbatim. Re-running ldid is not semantically idempotent for all
 // vendor signatures: Steam 1785799196 runtime-confirmed that a second pass
 // grew three child executables by 64 bytes after sign_installed.sh had already
 // synchronized package/*.installed, causing the updater to restore them and
 // enter a verify/update loop.
 static int current_hashes_are_trusted(const char *path) {
+    if (!code_signature_pages_are_valid(path)) return 0;
     char hashes[3][128] = {{0}};
     size_t hash_count = 0;
     for (const char **arch = kArches; *arch; arch++) {
@@ -194,16 +526,229 @@ static int current_hashes_are_trusted(const char *path) {
     return trusted;
 }
 
-// Ad-hoc re-sign + trustcache every Mach-O slice of one rootfs path.
-static void process_path(const char *realpath) {
+static int normalize_rootfs_path(const char *input, char *output,
+                                 size_t output_size) {
+    static const char prefix[] = ROOTFS "/";
+    if (!input || !output || output_size <= sizeof(ROOTFS) ||
+        strncmp(input, prefix, sizeof(prefix) - 1) != 0)
+        return 0;
+
+    char copy[PATH_MAX];
+    if (strlcpy(copy, input + sizeof(prefix) - 1, sizeof(copy)) >=
+        sizeof(copy)) return 0;
+    const char *components[PATH_MAX / 2];
+    size_t count = 0;
+    char *state = NULL;
+    for (char *item = strtok_r(copy, "/", &state); item;
+         item = strtok_r(NULL, "/", &state)) {
+        if (strcmp(item, ".") == 0 || item[0] == '\0') continue;
+        if (strcmp(item, "..") == 0) {
+            if (count == 0) return 0;
+            count--;
+            continue;
+        }
+        if (count >= sizeof(components) / sizeof(components[0])) return 0;
+        components[count++] = item;
+    }
+
+    size_t used = strlcpy(output, ROOTFS, output_size);
+    if (used >= output_size) return 0;
+    for (size_t index = 0; index < count; index++) {
+        if (strlcat(output, "/", output_size) >= output_size ||
+            strlcat(output, components[index], output_size) >= output_size)
+            return 0;
+    }
+    return count != 0;
+}
+
+static int package_dependency_path(const char *path) {
+    static const char *prefixes[] = {
+        ROOTFS "/opt/local/",
+        ROOTFS "/opt/homebrew/",
+        ROOTFS "/usr/local/",
+        NULL
+    };
+    for (const char **prefix = prefixes; *prefix; prefix++) {
+        if (strncmp(path, *prefix, strlen(*prefix)) == 0) return 1;
+    }
+    return 0;
+}
+
+static int directory_for_path(const char *path, char *directory,
+                              size_t directory_size) {
+    if (!path || strlcpy(directory, path, directory_size) >= directory_size)
+        return 0;
+    char *slash = strrchr(directory, '/');
+    if (!slash || slash == directory) return 0;
+    *slash = '\0';
+    return 1;
+}
+
+static int expand_loader_token(const char *value, const char *loader_dir,
+                               const char *executable_dir, char *expanded,
+                               size_t expanded_size) {
+    static const char loader[] = "@loader_path";
+    static const char executable[] = "@executable_path";
+    const char *base = NULL;
+    const char *suffix = NULL;
+    if (strncmp(value, loader, sizeof(loader) - 1) == 0) {
+        base = loader_dir;
+        suffix = value + sizeof(loader) - 1;
+    } else if (strncmp(value, executable, sizeof(executable) - 1) == 0) {
+        base = executable_dir;
+        suffix = value + sizeof(executable) - 1;
+    } else if (value[0] == '/') {
+        int length = snprintf(expanded, expanded_size, "%s%s", ROOTFS,
+                              value);
+        return length > 0 && (size_t)length < expanded_size;
+    } else {
+        return 0;
+    }
+    if (!base || !suffix || (*suffix && *suffix != '/')) return 0;
+    int length = snprintf(expanded, expanded_size, "%s%s", base, suffix);
+    return length > 0 && (size_t)length < expanded_size;
+}
+
+enum { MAX_MACHO_RPATHS = 64, MAX_MACHO_DEPENDENCIES = 512 };
+
+static size_t load_rpaths(const char *path, const char *loader_dir,
+                          const char *executable_dir,
+                          char rpaths[MAX_MACHO_RPATHS][PATH_MAX]) {
+    const size_t output_size = 128 * 1024;
+    char *output = calloc(1, output_size);
+    if (!output) return 0;
+    char *const argv[] = { (char *)OTOOL, "-l", (char *)path, NULL };
+    if (capture(argv, output, output_size) != 0) {
+        free(output);
+        return 0;
+    }
+    size_t count = 0;
+    int expecting_path = 0;
+    char *state = NULL;
+    for (char *line = strtok_r(output, "\n", &state); line;
+         line = strtok_r(NULL, "\n", &state)) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (strcmp(line, "cmd LC_RPATH") == 0) {
+            expecting_path = 1;
+            continue;
+        }
+        if (!expecting_path || strncmp(line, "path ", 5) != 0) continue;
+        expecting_path = 0;
+        char *value = line + 5;
+        char *offset = strstr(value, " (offset ");
+        if (offset) *offset = '\0';
+        char candidate[PATH_MAX];
+        if (count < MAX_MACHO_RPATHS &&
+            expand_loader_token(value, loader_dir, executable_dir,
+                                candidate, sizeof(candidate)) &&
+            normalize_rootfs_path(candidate, rpaths[count], PATH_MAX)) {
+            count++;
+        }
+    }
+    free(output);
+    return count;
+}
+
+static void process_path_recursive(const char *realpath,
+                                   const char *executable_dir,
+                                   unsigned depth, int dependency);
+
+static void process_dependencies(const char *realpath,
+                                 const char *executable_dir,
+                                 unsigned depth) {
+    if (depth >= 32) {
+        logmsg("dependency closure exceeded depth limit at: %s", realpath);
+        return;
+    }
+    char loader_dir[PATH_MAX];
+    if (!directory_for_path(realpath, loader_dir, sizeof(loader_dir))) return;
+
+    char (*rpaths)[PATH_MAX] = calloc(MAX_MACHO_RPATHS, PATH_MAX);
+    const size_t output_size = 256 * 1024;
+    char *output = calloc(1, output_size);
+    if (!rpaths || !output) {
+        free(rpaths);
+        free(output);
+        logmsg("dependency closure allocation failed at: %s", realpath);
+        return;
+    }
+    size_t rpath_count = load_rpaths(realpath, loader_dir, executable_dir,
+                                     rpaths);
+    char *const argv[] = { (char *)OTOOL, "-L", (char *)realpath, NULL };
+    if (capture(argv, output, output_size) != 0) {
+        free(output);
+        free(rpaths);
+        return;
+    }
+
+    size_t dependency_count = 0;
+    char *state = NULL;
+    for (char *line = strtok_r(output, "\n", &state); line;
+         line = strtok_r(NULL, "\n", &state)) {
+        if (dependency_count >= MAX_MACHO_DEPENDENCIES) {
+            logmsg("dependency closure exceeded image limit at: %s",
+                   realpath);
+            break;
+        }
+        while (*line == ' ' || *line == '\t') line++;
+        char *metadata = strstr(line, " (compatibility version ");
+        if (!metadata) continue;
+        *metadata = '\0';
+
+        char candidate[PATH_MAX] = {0};
+        char normalized[PATH_MAX] = {0};
+        int resolved = 0;
+        if (strncmp(line, "@rpath/", 7) == 0) {
+            for (size_t index = 0; index < rpath_count; index++) {
+                int length = snprintf(candidate, sizeof(candidate), "%s/%s",
+                                      rpaths[index], line + 7);
+                if (length <= 0 || (size_t)length >= sizeof(candidate) ||
+                    !normalize_rootfs_path(candidate, normalized,
+                                           sizeof(normalized))) continue;
+                struct stat st;
+                if (stat(normalized, &st) == 0 && S_ISREG(st.st_mode)) {
+                    resolved = 1;
+                    break;
+                }
+            }
+        } else if (expand_loader_token(line, loader_dir, executable_dir,
+                                       candidate, sizeof(candidate)) &&
+                   normalize_rootfs_path(candidate, normalized,
+                                          sizeof(normalized))) {
+            resolved = 1;
+        }
+        if (!resolved || !package_dependency_path(normalized)) continue;
+        struct stat st;
+        if (stat(normalized, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        dependency_count++;
+        process_path_recursive(normalized, executable_dir, depth + 1, 1);
+    }
+    free(output);
+    free(rpaths);
+}
+
+// Ad-hoc re-sign + trustcache every Mach-O slice of one rootfs path and the
+// package-manager dependency closure dyld will load for it. Runtime-confirmed
+// with Terminal's /opt/local/bin/htop: its executable CDHash was trusted, but
+// dyld rejected /opt/local/lib/libncurses.6.dylib as "code signature invalid".
+// Signing only the exec target therefore cannot establish the launch invariant.
+static void process_path_recursive(const char *realpath,
+                                   const char *executable_dir,
+                                   unsigned depth, int dependency) {
     if (seen(realpath)) return;
 
     struct stat st;
     if (stat(realpath, &st) != 0 || !S_ISREG(st.st_mode)) { mark_seen(realpath); return; }
 
+    // Mark before walking LC_LOAD_DYLIB edges so cyclic dylib graphs terminate.
+    // Dependencies are still checked even when this image's current CDHash is
+    // trusted: that exact htop/main + libncurses/untrusted split is the failure
+    // this closure repairs.
+    mark_seen(realpath);
+    process_dependencies(realpath, executable_dir, depth);
+
     if (current_hashes_are_trusted(realpath)) {
         logmsg("preserved already-trusted signature: %s", realpath);
-        mark_seen(realpath);
         return;
     }
 
@@ -212,7 +757,25 @@ static void process_path(const char *realpath) {
     // library-validation policy is not the MacWS chroot policy. Re-sign once,
     // then register the resulting hashes. Subsequent requests take the exact
     // trusted-byte fast path above.
-    adhoc_sign(realpath);
+    int sign_status = adhoc_sign(realpath, dependency);
+    if (sign_status != 0) {
+        logmsg("ad-hoc signing failed status=%d: %s", sign_status, realpath);
+        return;
+    }
+    // ldid can grow LC_CODE_SIGNATURE while signing a transformed thin image;
+    // the first pass then describes the pre-growth layout. Validate the actual
+    // code pages before trusting the CDHash and give that known layout case one
+    // bounded settling pass.
+    if (!code_signature_pages_are_valid(realpath)) {
+        logmsg("first signing pass left invalid page hashes; retrying: %s",
+               realpath);
+        sign_status = adhoc_sign(realpath, dependency);
+        if (sign_status != 0 || !code_signature_pages_are_valid(realpath)) {
+            logmsg("ad-hoc signature validation failed status=%d: %s",
+                   sign_status, realpath);
+            return;
+        }
+    }
 
     char hash[128];
     int added = 0;
@@ -223,7 +786,13 @@ static void process_path(const char *realpath) {
         }
     }
     if (added) logmsg("signed+trusted (%d slice%s): %s", added, added == 1 ? "" : "s", realpath);
-    mark_seen(realpath);
+}
+
+static void process_path(const char *realpath) {
+    char executable_dir[PATH_MAX];
+    if (!directory_for_path(realpath, executable_dir, sizeof(executable_dir)))
+        return;
+    process_path_recursive(realpath, executable_dir, 0, 0);
 }
 
 // Map a chroot-absolute path to its rootfs location and process it.
@@ -232,7 +801,12 @@ static void handle_request(const char *chroot_path) {
     char real[1024];
     int n = snprintf(real, sizeof(real), "%s%s", ROOTFS, chroot_path);
     if (n <= 0 || (size_t)n >= sizeof(real)) return;
+    // g_seen terminates cycles within one Mach-O dependency graph. It cannot
+    // be a process-lifetime pathname cache: package managers replace bytes at
+    // the same path, and a later exec must evaluate the replacement's CDHash.
+    clear_seen();
     process_path(real);
+    clear_seen();
 }
 
 static int mark_peer_debugged(pid_t peer_pid) {
