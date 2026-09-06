@@ -62,6 +62,15 @@ typedef NS_ENUM(NSUInteger, MacWSHostPresentationResolution) {
 - (void)suspendStream;
 - (void)emitSoftwareText:(NSString *)text modifiers:(uint32_t)modifiers;
 - (void)emitSoftwareKeySym:(uint32_t)keySym modifiers:(uint32_t)modifiers;
+// Drag interoperability uses the same versioned input records as ordinary
+// touch. The probe makes the target AppKit view populate NSDragPboard; the
+// matching finish always releases the synthetic primary-button transaction.
+- (BOOL)beginInteropDragProbeAtViewPoint:(CGPoint)viewPoint;
+- (void)finishInteropDragProbeCancelled:(BOOL)cancelled;
+// A UIKit drop is committed to the exact visible macOS point, then routed
+// through the target application's enabled Command-V menu action after
+// macwsinteropd acknowledges the full pasteboard archive.
+- (void)performInteropPasteAtViewPoint:(CGPoint)viewPoint;
 - (BOOL)forwardHardwarePresses:(NSSet<UIPress *> *)presses
                        keyDown:(BOOL)keyDown;
 - (BOOL)restoreHardwareKeyboardFocusWithReason:(NSString *)reason;

@@ -49,6 +49,7 @@ WINDOWSERVER_PLIST="$MACOS_DAEMONS/com.apple.WindowServer.plist"
 LAUNCHSERVICESD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.launchservicesd.plist"
 SHAREDFILELISTD_PLIST="$MACOS_DAEMONS/com.apple.coreservices.sharedfilelistd.plist"
 MACOS_DISKARBITRATIOND_PLIST="$MACOS_DAEMONS/com.macwsguide.macos-diskarbitrationd.plist"
+FILECOORDINATION_PLIST="$MACOS_DAEMONS/com.macwsguide.filecoordination.plist"
 SYSTEMSTATUSD_PLIST="$MACOS_DAEMONS/com.apple.systemstatusd.plist"
 FONTD_PLIST="$MACOS_DAEMONS/com.macwsguide.xtyped.plist"
 VIEWBRIDGE_PLIST="$MACOS_DAEMONS/com.macwsguide.viewbridge.plist"
@@ -128,6 +129,7 @@ GEOD_LABEL=com.macwsguide.geod
 OFFICE_LICENSING_LABEL=com.macwsguide.office-licensing
 SHAREDFILELISTD_LABEL=com.apple.coreservices.sharedfilelistd
 MACOS_DISKARBITRATIOND_LABEL=com.macwsguide.macos-diskarbitrationd
+FILECOORDINATION_LABEL=com.macwsguide.filecoordination
 WATCHDOG_LABEL=com.macwsguide.watchdog
 VSCODE_PLIST="$GUI_LAUNCHD_DIR/com.macwsguide.vscode.plist"
 VSCODE_LABEL=UIKitApplication:com.macwsguide.vscode
@@ -4167,6 +4169,16 @@ start_macos() {
     log "Legacy macOS LaunchServices endpoint ready."
 
     start_sharedfilelistd || return 1
+    log "Publishing private Ventura file-coordination services..."
+    [ -f "$FILECOORDINATION_PLIST" ] || {
+        log "ERROR: packaged Ventura file-coordination launch contract is missing."
+        return 1
+    }
+    launchctl load "$FILECOORDINATION_PLIST" || return 1
+    launchctl list "$FILECOORDINATION_LABEL" >/dev/null 2>&1 || {
+        log "ERROR: Ventura file-coordination contract was not registered."
+        return 1
+    }
     log "TIMING start-macos stage=settings-legacy-sharedfile seconds=$((SECONDS - macos_stage_started)) total=$((SECONDS - macos_started))"
     macos_stage_started=$SECONDS
 

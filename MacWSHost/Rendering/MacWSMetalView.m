@@ -289,6 +289,9 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
     CGSize _pendingRequestedWindowSize;
     CGFloat _pendingRequestedDensityScale;
     uint32_t _inputSampleSequence;
+    BOOL _interopDragProbeActive;
+    CGPoint _interopDragProbeFramePoint;
+    uint32_t _interopDragProbeContactID;
     uint32_t _lastKeyboardFrameWidth;
     uint32_t _lastKeyboardFrameHeight;
     CGSize _lastRequestedWindowSize;
@@ -3800,6 +3803,80 @@ typedef NS_ENUM(uint8_t, MacWSDirectTouchState) {
         .sampleSequence = ++_inputSampleSequence,
     };
     [self.statusDelegate metalView:self emittedInput:record];
+}
+
+- (BOOL)beginInteropDragProbeAtViewPoint:(CGPoint)viewPoint {
+    if (!self.isMacWSInputEnabled || _interopDragProbeActive ||
+        self.targetPID <= 1) return NO;
+    CGPoint startFrame = CGPointZero;
+    if (![self framePointForViewPoint:viewPoint output:&startFrame]) return NO;
+    CGFloat direction = viewPoint.x + 16.0 <= CGRectGetMaxX(_contentRect)
+        ? 16.0 : -16.0;
+    CGPoint movedPoint = CGPointMake(viewPoint.x + direction, viewPoint.y);
+    CGPoint movedFrame = CGPointZero;
+    if (![self framePointForViewPoint:movedPoint output:&movedFrame
+                    clampContinuationToContent:YES]) return NO;
+    _interopDragProbeActive = YES;
+    _interopDragProbeFramePoint = movedFrame;
+    _interopDragProbeContactID = 0x44524700u |
+        ((++_directTouchSerial) & 0xffu); // "DRG"
+    NSTimeInterval now = CACurrentMediaTime();
+    [self emitKind:MacWSInputKindTouchDown framePoint:startFrame pressure:1.0f
+         contactID:_interopDragProbeContactID timestamp:now];
+    [self emitKind:MacWSInputKindTouchMove framePoint:movedFrame pressure:1.0f
+         contactID:_interopDragProbeContactID timestamp:now + 0.001];
+    return YES;
+}
+
+- (void)finishInteropDragProbeCancelled:(BOOL)cancelled {
+    if (!_interopDragProbeActive) return;
+    [self emitKind:cancelled ? MacWSInputKindTouchCancel : MacWSInputKindTouchUp
+          framePoint:_interopDragProbeFramePoint pressure:0.0f
+           contactID:_interopDragProbeContactID timestamp:CACurrentMediaTime()];
+    _interopDragProbeActive = NO;
+    _interopDragProbeContactID = 0;
+}
+
+- (void)performInteropPasteAtViewPoint:(CGPoint)viewPoint {
+    if (!self.isMacWSInputEnabled || self.targetPID <= 1) return;
+    CGPoint framePoint = CGPointZero;
+    if (![self framePointForViewPoint:viewPoint output:&framePoint]) return;
+    uint32_t contactID = 0x50535400u |
+        ((++_directTouchSerial) & 0xffu); // "PST"
+    NSTimeInterval now = CACurrentMediaTime();
+    [self emitKind:MacWSInputKindTouchDown framePoint:framePoint pressure:1.0f
+         contactID:contactID timestamp:now];
+    [self emitKind:MacWSInputKindTouchUp framePoint:framePoint pressure:0.0f
+         contactID:contactID timestamp:now + 0.001];
+    _trackpadCursor = framePoint;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 80 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        uint32_t width = [self currentFrameWidth];
+        uint32_t height = [self currentFrameHeight];
+        if (width != 0 && height != 0) {
+            self->_lastKeyboardFrameWidth = width;
+            self->_lastKeyboardFrameHeight = height;
+        } else {
+            width = self->_lastKeyboardFrameWidth;
+            height = self->_lastKeyboardFrameHeight;
+        }
+        if (width == 0 || height == 0) return;
+        MacWSInputRecord record = {
+            .magic = MACWS_INPUT_MAGIC,
+            .version = MACWS_INPUT_VERSION,
+            .kind = MacWSInputKindPerformPaste,
+            .sceneID = [self inputSceneIDWithModifiers:0],
+            .timestamp = CACurrentMediaTime(),
+            .x = (float)framePoint.x,
+            .y = (float)framePoint.y,
+            .frameWidth = width,
+            .frameHeight = height,
+            .targetPID = self.targetPID,
+            .source = MacWSInputSourceSoftwareKeyboard,
+            .sampleSequence = ++self->_inputSampleSequence,
+        };
+        [self.statusDelegate metalView:self emittedInput:record];
+    });
 }
 
 - (void)emitKind:(MacWSInputKind)kind

@@ -7,10 +7,11 @@
 
 #define MACWS_INTEROP_SERVICE "com.macwsguide.interop"
 #define MACWS_INTEROP_MAGIC 0x4d57494fu /* "MWIO" */
-#define MACWS_INTEROP_VERSION 1u
+#define MACWS_INTEROP_VERSION 2u
 
-#define MACWS_INTEROP_MAX_INLINE_BYTES (8u * 1024u * 1024u)
+#define MACWS_INTEROP_MAX_INLINE_BYTES (64u * 1024u * 1024u)
 #define MACWS_INTEROP_MAX_ITEMS 32u
+#define MACWS_INTEROP_MAX_REPRESENTATIONS 128u
 #define MACWS_INTEROP_MAX_TYPE_BYTES 256u
 #define MACWS_INTEROP_MAX_PATH_BYTES 4096u
 
@@ -36,6 +37,9 @@
 #define MACWS_INTEROP_KEY_LOCATION_TYPE "location_type"
 #define MACWS_INTEROP_KEY_REFERENCE_FRAME "reference_frame"
 #define MACWS_INTEROP_KEY_RAW_REFERENCE_FRAME "raw_reference_frame"
+#define MACWS_INTEROP_KEY_CHANGE_COUNT "change_count"
+#define MACWS_INTEROP_KEY_AFTER_CHANGE_COUNT "after_change_count"
+#define MACWS_INTEROP_KEY_WAIT_MILLISECONDS "wait_milliseconds"
 
 #define MACWS_INTEROP_OP_HELLO "hello"
 #define MACWS_INTEROP_OP_SUBSCRIBE "subscribe"
@@ -43,11 +47,14 @@
 #define MACWS_INTEROP_OP_IMPORT_FILES "import_files"
 #define MACWS_INTEROP_OP_EXPORT_FILES "export_files"
 #define MACWS_INTEROP_OP_PUBLISH_LOCATION "publish_location"
+#define MACWS_INTEROP_OP_PUBLISH_PASTEBOARD "publish_pasteboard"
+#define MACWS_INTEROP_OP_SNAPSHOT_DRAG_PASTEBOARD "snapshot_drag_pasteboard"
 
 #define MACWS_INTEROP_EVENT_CLIPBOARD "clipboard"
 #define MACWS_INTEROP_EVENT_FILES_READY "files_ready"
 #define MACWS_INTEROP_EVENT_READY "ready"
 #define MACWS_INTEROP_EVENT_ERROR "error"
+#define MACWS_INTEROP_EVENT_PASTEBOARD "pasteboard"
 
 typedef uint16_t MacWSInteropKind;
 enum {
@@ -55,6 +62,10 @@ enum {
     MacWSInteropKindPNG = 2,
     MacWSInteropKindJPEG = 3,
     MacWSInteropKindFile = 4,
+    // A binary property-list archive containing ordered pasteboard items and
+    // every bounded representation declared by each item. File URLs remain
+    // staged paths in the archive instead of copying their contents inline.
+    MacWSInteropKindPasteboardArchive = 5,
 };
 
 typedef uint16_t MacWSInteropFlags;
@@ -88,7 +99,7 @@ static inline bool MacWSInteropItemDescriptorIsValid(
         descriptor->version != MACWS_INTEROP_VERSION ||
         descriptor->size != sizeof(*descriptor) ||
         descriptor->kind < MacWSInteropKindUTF8Text ||
-        descriptor->kind > MacWSInteropKindFile ||
+        descriptor->kind > MacWSInteropKindPasteboardArchive ||
         descriptor->itemIndex >= MACWS_INTEROP_MAX_ITEMS ||
         descriptor->generation == 0 || descriptor->originID == 0) {
         return false;

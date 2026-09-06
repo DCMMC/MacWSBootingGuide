@@ -21620,6 +21620,12 @@ static const char *macws_private_chroot_service_name(const char *name) {
         return "com.apple.macosbooter.carboncore.csnameddata";
     if (!strcmp(name, "com.apple.dock.helper"))
         return "com.apple.macosbooter.dock.helper";
+    if (!strcmp(name, "com.apple.FileCoordination"))
+        return "com.apple.macosbooter.FileCoordination";
+    if (!strcmp(name, "com.apple.FileCoordination.kernel.ipc"))
+        return "com.apple.macosbooter.FileCoordination.kernel.ipc";
+    if (!strcmp(name, "com.apple.ProgressReporting"))
+        return "com.apple.macosbooter.ProgressReporting";
     const char *lsdEndpoint = macws_private_lsd_service_name(name);
     if (lsdEndpoint != name) return lsdEndpoint;
     if (!strcmp(name, "com.apple.locationd.desktop.agent"))
@@ -21767,10 +21773,30 @@ static void macws_install_iconservices_quarantine_fallback(void) {
     }
 }
 
+xpc_connection_t (*orig_xpc_connection_create)(const char *name,
+                                                dispatch_queue_t queue);
 xpc_connection_t (*orig_xpc_connection_create_mach_service)(const char * name, dispatch_queue_t targetq, uint64_t flags);
 xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, dispatch_queue_t targetq, uint64_t flags) {
     flags &= ~XPC_CONNECTION_MACH_SERVICE_PRIVILEGED;
     const char *originalName = name;
+    BOOL isFileCoordinationClient = name &&
+        (!strcmp(name, "com.apple.FileCoordination") ||
+         !strcmp(name, "com.apple.ProgressReporting")) &&
+        !(flags & XPC_CONNECTION_MACH_SERVICE_LISTENER);
+    if (isFileCoordinationClient) {
+        // Runtime-confirmed on 2026-09-06: MacWS GUI processes are classified
+        // as System-session daemons while the stock Ventura filecoordinationd
+        // job is necessarily in user/501. A direct lookup is rejected by
+        // Ventura libxpc with reason 9 before any protocol message is sent.
+        // Activate the matching iOS XPC relay in the caller's application
+        // domain; it forwards the original dictionaries to the private
+        // Ventura endpoint without disabling libxpc's session invariant.
+        if (getenv("MACWS_XPC_DEBUG")) {
+            fprintf(stderr,
+                    "#### XPC_TRACE file-coordination relay: '%s'\n", name);
+        }
+        return orig_xpc_connection_create(name, targetq);
+    }
     name = macws_private_chroot_service_name(name);
     // Connection tracing is a diagnostic flight recorder.  Terminal used to
     // enable it implicitly, making an ordinary production shell write every
@@ -21788,21 +21814,16 @@ xpc_connection_t hooked_xpc_connection_create_mach_service(const char * name, di
     if(name && !strncmp(name, metalSimService, strlen(metalSimService))) {
         return xpc_connection_create(metalSimService, 0);
     }
-    // macOS Foundation's NSProgress registrar is provided by the native iOS
-    // filecoordinationd through a byte-for-byte relay XPC bundle.  The chroot
-    // process cannot resolve the user/501 endpoint directly from its root
-    // application domain; routing this one name through bundle activation
-    // keeps the real NSProgress protocol and replies intact.
-    if (name && !strcmp(name, "com.apple.ProgressReporting")) {
-        return xpc_connection_create("com.apple.ProgressReporting", targetq);
-    }
     return orig_xpc_connection_create_mach_service(name, targetq, flags);
 }
 
 // Also trace xpc_connection_create (the XPC service / bundle-name style)
-xpc_connection_t (*orig_xpc_connection_create)(const char *name, dispatch_queue_t queue);
 xpc_connection_t hooked_xpc_connection_create(const char *name, dispatch_queue_t queue) {
     const char *originalName = name;
+    if (name && (!strcmp(name, "com.apple.FileCoordination") ||
+                 !strcmp(name, "com.apple.ProgressReporting"))) {
+        return orig_xpc_connection_create(name, queue);
+    }
     name = macws_private_chroot_service_name(name);
     if (originalName && getenv("MACWS_XPC_DEBUG")) {
         fprintf(stderr, "#### XPC_TRACE service create: '%s'%s%s%s\n",
@@ -22218,6 +22239,7 @@ __attribute__((constructor)) static void InitMetalHooks() {
         "/Dock.framework/Versions/A/XPCServices/DockHelperProxy.xpc",
         "/ExtensionFoundation.framework/Versions/A/XPCServices/ExtensionKitProxy.xpc",
         "/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc",
+        "/FileCoordination.framework/Versions/A/XPCServices/ProgressReportingProxy.xpc",
         NULL,
     };
     for (const char *const *relative = proxyRelativePaths; *relative; relative++) {

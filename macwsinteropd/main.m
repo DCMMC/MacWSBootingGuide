@@ -5,9 +5,12 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
 #include <math.h>
+#include <mach/mach_time.h>
 #include <objc/message.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <sys/fsgetpath.h>
+#include <sys/mount.h>
 #include <unistd.h>
 #include <xpc/xpc.h>
 
@@ -34,6 +37,71 @@ static BOOL LocationRetryScheduled;
 static CLLocationManager *LocationKeepaliveManager;
 static id LocationKeepaliveDelegate;
 static id WorkspaceLaunchObserver;
+
+static NSString *const MacWSArchiveVersionKey = @"version";
+static NSString *const MacWSArchiveItemsKey = @"items";
+static NSString *const MacWSArchiveRepresentationsKey = @"representations";
+static NSString *const MacWSArchiveTypeKey = @"type";
+static NSString *const MacWSArchiveDataKey = @"data";
+static NSString *const MacWSArchiveFilePathKey = @"file_path";
+static const NSUInteger MacWSArchiveVersion = 1;
+static NSString *const MacWSImportsRoot = @"/Users/Shared/MacWS Imports";
+static NSString *const MacWSExportsRoot = @"/Users/Shared/MacWS Exports";
+
+@interface MacWSArchivePasteboardWriter : NSObject <NSPasteboardWriting>
+@property(nonatomic, copy) NSArray<NSDictionary *> *representations;
+@property(nonatomic, strong) NSURL *fileURL;
+@end
+
+@implementation MacWSArchivePasteboardWriter
+
+- (NSArray<NSPasteboardType> *)writableTypesForPasteboard:
+    (NSPasteboard *)pasteboard {
+    NSMutableOrderedSet<NSPasteboardType> *types = [NSMutableOrderedSet
+        orderedSet];
+    id<NSPasteboardWriting> fileWriter =
+        (id<NSPasteboardWriting>)self.fileURL;
+    if (fileWriter) [types addObjectsFromArray:
+        [fileWriter writableTypesForPasteboard:pasteboard]];
+    for (NSDictionary *representation in self.representations) {
+        NSString *type = representation[MacWSArchiveTypeKey];
+        if (type.length) [types addObject:type];
+    }
+    return types.array;
+}
+
+- (id)pasteboardPropertyListForType:(NSPasteboardType)type {
+    id<NSPasteboardWriting> fileWriter =
+        (id<NSPasteboardWriting>)self.fileURL;
+    if (fileWriter && [[fileWriter writableTypesForPasteboard:
+            NSPasteboard.generalPasteboard]
+            containsObject:type]) {
+        id value = [fileWriter pasteboardPropertyListForType:type];
+        if (value) return value;
+    }
+    for (NSDictionary *representation in self.representations) {
+        if (![representation[MacWSArchiveTypeKey] isEqualToString:type])
+            continue;
+        NSData *data = representation[MacWSArchiveDataKey];
+        if (data) return data;
+        NSString *path = representation[MacWSArchiveFilePathKey];
+        if (path) return [NSURL fileURLWithPath:path].absoluteString;
+    }
+    return nil;
+}
+
+- (NSPasteboardWritingOptions)writingOptionsForType:(NSPasteboardType)type
+                                         pasteboard:(NSPasteboard *)pasteboard {
+    id fileWriter = self.fileURL;
+    if ([fileWriter respondsToSelector:_cmd] &&
+        [[fileWriter writableTypesForPasteboard:pasteboard]
+            containsObject:type]) {
+        return [fileWriter writingOptionsForType:type pasteboard:pasteboard];
+    }
+    return 0;
+}
+
+@end
 
 // Ventura's private locationd protocol can return the iOS-compatible
 // authorized-when-in-use value even though the public macOS SDK marks that
@@ -643,28 +711,317 @@ static void Digest(NSData *data, uint8_t output[16]) {
     memcpy(output, digest, 16);
 }
 
-static xpc_object_t EventForData(MacWSInteropKind kind, NSData *data,
-                                 NSString *type) {
+static BOOL MacWSAbsoluteArchivePath(NSString *path) {
+    if (![path isKindOfClass:NSString.class] || ![path hasPrefix:@"/"] ||
+        [path lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >
+            MACWS_INTEROP_MAX_PATH_BYTES ||
+        [path rangeOfString:@"\0"].location != NSNotFound) return NO;
+    return [path.stringByStandardizingPath hasPrefix:@"/"];
+}
+
+static NSArray<NSDictionary *> *ValidatedArchiveItems(NSData *archive,
+                                                       NSString **message) {
+    if (!archive.length || archive.length > MACWS_INTEROP_MAX_INLINE_BYTES) {
+        if (message) *message = @"pasteboard archive size is invalid";
+        return nil;
+    }
+    NSError *error = nil;
+    id root = [NSPropertyListSerialization propertyListWithData:archive
+        options:NSPropertyListImmutable format:nil error:&error];
+    NSArray *items = [root isKindOfClass:NSDictionary.class]
+        ? root[MacWSArchiveItemsKey] : nil;
+    if (![root isKindOfClass:NSDictionary.class] ||
+        ![root[MacWSArchiveVersionKey] isEqual:@(MacWSArchiveVersion)] ||
+        ![items isKindOfClass:NSArray.class] || !items.count ||
+        items.count > MACWS_INTEROP_MAX_ITEMS) {
+        if (message) *message = @"pasteboard archive structure is invalid";
+        return nil;
+    }
+    NSMutableArray *normalizedItems = [NSMutableArray array];
+    NSUInteger representationCount = 0;
+    NSUInteger inlineBytes = 0;
+    for (id itemValue in items) {
+        NSArray *representations = [itemValue isKindOfClass:NSDictionary.class]
+            ? itemValue[MacWSArchiveRepresentationsKey] : nil;
+        if (![representations isKindOfClass:NSArray.class] ||
+            !representations.count) {
+            if (message) *message = @"pasteboard item has no representations";
+            return nil;
+        }
+        NSMutableArray *normalizedRepresentations = [NSMutableArray array];
+        for (id representationValue in representations) {
+            if (++representationCount > MACWS_INTEROP_MAX_REPRESENTATIONS ||
+                ![representationValue isKindOfClass:NSDictionary.class]) {
+                if (message) *message = @"pasteboard representation count is invalid";
+                return nil;
+            }
+            NSString *type = representationValue[MacWSArchiveTypeKey];
+            NSData *data = representationValue[MacWSArchiveDataKey];
+            NSString *path = representationValue[MacWSArchiveFilePathKey];
+            if (![type isKindOfClass:NSString.class] || !type.length ||
+                [type lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >
+                    MACWS_INTEROP_MAX_TYPE_BYTES ||
+                ((data != nil) == (path != nil))) {
+                if (message) *message = @"pasteboard representation is malformed";
+                return nil;
+            }
+            if (data) {
+                if (![data isKindOfClass:NSData.class] ||
+                    data.length > MACWS_INTEROP_MAX_INLINE_BYTES - inlineBytes) {
+                    if (message) *message = @"pasteboard representation data is invalid";
+                    return nil;
+                }
+                inlineBytes += data.length;
+                [normalizedRepresentations addObject:@{
+                    MacWSArchiveTypeKey: type, MacWSArchiveDataKey: data
+                }];
+            } else {
+                if (!MacWSAbsoluteArchivePath(path)) {
+                    if (message) *message = @"pasteboard file path is invalid";
+                    return nil;
+                }
+                [normalizedRepresentations addObject:@{
+                    MacWSArchiveTypeKey: type,
+                    MacWSArchiveFilePathKey: path.stringByStandardizingPath
+                }];
+            }
+        }
+        [normalizedItems addObject:@{
+            MacWSArchiveRepresentationsKey: normalizedRepresentations
+        }];
+    }
+    return normalizedItems;
+}
+
+static NSString *ResolvedFileURLString(NSString *urlString) {
+    NSURL *url = urlString.length ? [NSURL URLWithString:urlString] : nil;
+    if (!url.isFileURL) return nil;
+    NSString *path = url.path;
+    // NSURL deliberately leaves -path nil for a file-reference URL when the
+    // underlying /.file resolver is unavailable. The serialized URL remains
+    // an ordinary percent-encoded file URL, so retain its path component for
+    // the fsgetpath fallback below.
+    if (!path.length && [urlString hasPrefix:@"file://"])
+        path = [[urlString substringFromIndex:@"file://".length]
+            stringByRemovingPercentEncoding];
+    path = path.stringByStandardizingPath;
+    if (path.length && ![path hasPrefix:@"/.file/id="] &&
+        [NSFileManager.defaultManager fileExistsAtPath:path]) return path;
+
+    // Runtime-confirmed on the target with Ventura Finder: NSDragPboard first
+    // advertises com.apple.finder.node as a file-reference URL such as
+    // file:///.file/id=6620456.35919769/. NSURL.filePathURL cannot resolve it
+    // because this chroot's synthetic /.file is not the APFS magic directory.
+    // The public fsgetpath(2) API resolves the same catalog object ID against
+    // the real mounted filesystem (object 35919769 ->
+    // /private/var/root/Documents in the captured run).
+    NSRange marker = [path rangeOfString:@"/.file/id="];
+    if (marker.location != 0) return nil;
+    NSString *reference = [path substringFromIndex:marker.length];
+    NSArray<NSString *> *parts = [reference componentsSeparatedByString:@"."];
+    if (parts.count < 2) return nil;
+    const char *objectText = parts[1].UTF8String;
+    if (!objectText || !*objectText) return nil;
+    char *end = NULL;
+    errno = 0;
+    uint64_t objectID = strtoull(objectText, &end, 10);
+    if (errno || !objectID || end == objectText) return nil;
+
+    struct statfs *mounts = NULL;
+    int mountCount = getmntinfo(&mounts, MNT_NOWAIT);
+    for (int index = 0; index < mountCount; index++) {
+        char resolved[MACWS_INTEROP_MAX_PATH_BYTES + 1] = {0};
+        if (fsgetpath(resolved, sizeof(resolved), &mounts[index].f_fsid,
+                      objectID) < 0 || resolved[0] != '/') continue;
+        NSString *candidate = [[NSString stringWithUTF8String:resolved]
+            stringByStandardizingPath];
+        if (![NSFileManager.defaultManager fileExistsAtPath:candidate])
+            continue;
+        InteropLog(@"resolved Finder file-reference object=%llu path=%@",
+            (unsigned long long)objectID, candidate);
+        return candidate;
+    }
+    return nil;
+}
+
+static void MakeExportReadable(NSString *path) {
+    BOOL isDirectory = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:path
+                                            isDirectory:&isDirectory]) return;
+    [NSFileManager.defaultManager setAttributes:@{
+        NSFilePosixPermissions: @(isDirectory ? 0755 : 0644)
+    } ofItemAtPath:path error:nil];
+    if (!isDirectory) return;
+    NSDirectoryEnumerator *enumerator = [NSFileManager.defaultManager
+        enumeratorAtURL:[NSURL fileURLWithPath:path]
+        includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+        options:0
+        errorHandler:^BOOL(NSURL *url, NSError *error) {
+            InteropLog(@"export traversal skipped url=%@ error=%@", url, error);
+            return YES;
+        }];
+    for (NSURL *url in enumerator) {
+        NSNumber *directory = nil;
+        [url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:nil];
+        [NSFileManager.defaultManager setAttributes:@{
+            NSFilePosixPermissions: @(directory.boolValue ? 0755 : 0644)
+        } ofItemAtPath:url.path error:nil];
+    }
+}
+
+static NSString *StageMacOSExport(NSString *sourcePath,
+                                  NSString **batchPath,
+                                  NSString **message) {
+    NSString *source = sourcePath.stringByStandardizingPath;
+    if (!source.length || ![source hasPrefix:@"/"]) return nil;
+    // iPadOS-originated files already live in a mobile-readable shared cache.
+    if ([source isEqualToString:MacWSImportsRoot] ||
+        [source hasPrefix:[MacWSImportsRoot stringByAppendingString:@"/"]] ||
+        [source isEqualToString:MacWSExportsRoot] ||
+        [source hasPrefix:[MacWSExportsRoot stringByAppendingString:@"/"]])
+        return source;
+    BOOL isDirectory = NO;
+    if (![NSFileManager.defaultManager fileExistsAtPath:source
+                                            isDirectory:&isDirectory]) return nil;
+    NSError *error = nil;
+    if (!batchPath || !*batchPath) {
+        NSString *batch = [MacWSExportsRoot stringByAppendingPathComponent:
+            NSUUID.UUID.UUIDString];
+        if (![NSFileManager.defaultManager createDirectoryAtPath:batch
+                                      withIntermediateDirectories:YES
+                                                       attributes:@{
+                    NSFilePosixPermissions: @0755
+                } error:&error]) {
+            if (message) *message = error.localizedDescription;
+            return nil;
+        }
+        if (batchPath) *batchPath = batch;
+    }
+    NSString *name = source.lastPathComponent.length
+        ? source.lastPathComponent : @"Exported Item";
+    NSString *destination = [*batchPath stringByAppendingPathComponent:name];
+    NSString *stem = name.stringByDeletingPathExtension;
+    NSString *extension = name.pathExtension;
+    NSUInteger suffix = 2;
+    while ([NSFileManager.defaultManager fileExistsAtPath:destination]) {
+        NSString *numbered = [NSString stringWithFormat:@"%@-%lu",
+            stem.length ? stem : @"Exported Item", (unsigned long)suffix++];
+        destination = [*batchPath stringByAppendingPathComponent:
+            extension.length ? [numbered stringByAppendingPathExtension:extension]
+                             : numbered];
+    }
+    if (![NSFileManager.defaultManager copyItemAtPath:source
+                                               toPath:destination error:&error]) {
+        if (message) *message = error.localizedDescription;
+        return nil;
+    }
+    MakeExportReadable(destination);
+    InteropLog(@"staged macOS export source=%@ destination=%@ directory=%@",
+        source, destination, isDirectory ? @"YES" : @"NO");
+    return destination;
+}
+
+static NSData *ArchiveDataForPasteboard(NSPasteboard *pasteboard,
+                                        NSString **message) {
+    NSMutableArray *items = [NSMutableArray array];
+    NSUInteger representationCount = 0;
+    NSUInteger inlineBytes = 0;
+    NSString *exportBatch = nil;
+    for (NSPasteboardItem *pasteboardItem in pasteboard.pasteboardItems) {
+        if (items.count >= MACWS_INTEROP_MAX_ITEMS) break;
+        NSMutableArray *representations = [NSMutableArray array];
+        NSString *fileURLString = [pasteboardItem
+            stringForType:NSPasteboardTypeFileURL];
+        if (!fileURLString.length) {
+            NSData *finderNode = [pasteboardItem
+                dataForType:@"com.apple.finder.node"];
+            fileURLString = [[NSString alloc] initWithData:finderNode
+                                                   encoding:NSUTF8StringEncoding];
+        }
+        NSString *resolvedFilePath = ResolvedFileURLString(fileURLString);
+        NSString *stagedFilePath = resolvedFilePath
+            ? StageMacOSExport(resolvedFilePath, &exportBatch, message) : nil;
+        if (stagedFilePath &&
+            representationCount < MACWS_INTEROP_MAX_REPRESENTATIONS) {
+            [representations addObject:@{
+                MacWSArchiveTypeKey: NSPasteboardTypeFileURL,
+                MacWSArchiveFilePathKey: stagedFilePath
+            }];
+            representationCount++;
+        }
+        for (NSPasteboardType type in pasteboardItem.types) {
+            if (representationCount >= MACWS_INTEROP_MAX_REPRESENTATIONS)
+                break;
+            if (![type isKindOfClass:NSString.class] || !type.length ||
+                [type lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >
+                    MACWS_INTEROP_MAX_TYPE_BYTES) continue;
+            NSDictionary *representation = nil;
+            if ([type isEqualToString:NSPasteboardTypeFileURL]) {
+                if (!stagedFilePath) {
+                    NSString *path = [NSURL URLWithString:fileURLString].path;
+                    if (MacWSAbsoluteArchivePath(path)) {
+                        representation = @{
+                            MacWSArchiveTypeKey: type,
+                            MacWSArchiveFilePathKey: path.stringByStandardizingPath
+                        };
+                    }
+                }
+            } else {
+                NSData *data = [pasteboardItem dataForType:type];
+                if (data && data.length <=
+                    MACWS_INTEROP_MAX_INLINE_BYTES - inlineBytes) {
+                    inlineBytes += data.length;
+                    representation = @{
+                        MacWSArchiveTypeKey: type, MacWSArchiveDataKey: data
+                    };
+                }
+            }
+            if (representation) {
+                [representations addObject:representation];
+                representationCount++;
+            }
+        }
+        if (representations.count) [items addObject:@{
+            MacWSArchiveRepresentationsKey: representations
+        }];
+    }
+    if (!items.count) {
+        if (message) *message = @"pasteboard has no bounded representations";
+        return nil;
+    }
+    NSError *error = nil;
+    NSData *archive = [NSPropertyListSerialization dataWithPropertyList:@{
+        MacWSArchiveVersionKey: @(MacWSArchiveVersion),
+        MacWSArchiveItemsKey: items
+    } format:NSPropertyListBinaryFormat_v1_0 options:0 error:&error];
+    if (!archive.length || archive.length > MACWS_INTEROP_MAX_INLINE_BYTES) {
+        if (message) *message = error.localizedDescription ?:
+            @"pasteboard archive exceeds 64 MiB";
+        return nil;
+    }
+    return archive;
+}
+
+static void AttachArchive(xpc_object_t dictionary, NSData *archive,
+                          const char *eventName) {
     MacWSInteropItemDescriptor descriptor = {
         .magic = MACWS_INTEROP_MAGIC,
         .version = MACWS_INTEROP_VERSION,
         .size = sizeof(MacWSInteropItemDescriptor),
-        .kind = kind,
+        .kind = MacWSInteropKindPasteboardArchive,
         .flags = MacWSInteropInlinePayload | MacWSInteropFromMacOS,
         .generation = ++Generation,
         .originID = DaemonOriginID,
-        .payloadLength = data.length,
+        .payloadLength = archive.length,
     };
-    Digest(data, descriptor.digest);
-    xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
-    xpc_dictionary_set_string(event, MACWS_INTEROP_KEY_EVENT,
-                              MACWS_INTEROP_EVENT_CLIPBOARD);
-    xpc_dictionary_set_data(event, MACWS_INTEROP_KEY_DESCRIPTOR,
+    Digest(archive, descriptor.digest);
+    if (eventName)
+        xpc_dictionary_set_string(dictionary, MACWS_INTEROP_KEY_EVENT,
+                                  eventName);
+    xpc_dictionary_set_data(dictionary, MACWS_INTEROP_KEY_DESCRIPTOR,
                             &descriptor, sizeof(descriptor));
-    xpc_dictionary_set_data(event, MACWS_INTEROP_KEY_PAYLOAD,
-                            data.bytes, data.length);
-    xpc_dictionary_set_string(event, MACWS_INTEROP_KEY_TYPE, type.UTF8String);
-    return event;
+    xpc_dictionary_set_data(dictionary, MACWS_INTEROP_KEY_PAYLOAD,
+                            archive.bytes, archive.length);
 }
 
 static void Broadcast(xpc_object_t event) {
@@ -681,37 +1038,12 @@ static void PublishPasteboardIfChanged(void) {
     LastPasteboardChange = change;
     if (change == AppliedPasteboardChange) return;
 
-    NSArray<NSURL *> *urls = [pasteboard readObjectsForClasses:@[NSURL.class]
-        options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    if (urls.count) {
-        xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
-        xpc_dictionary_set_string(event, MACWS_INTEROP_KEY_EVENT,
-                                  MACWS_INTEROP_EVENT_FILES_READY);
-        xpc_object_t paths = xpc_array_create(NULL, 0);
-        NSUInteger count = MIN(urls.count, MACWS_INTEROP_MAX_ITEMS);
-        for (NSUInteger index = 0; index < count; index++) {
-            NSString *path = urls[index].path;
-            if (path.length && path.length <= MACWS_INTEROP_MAX_PATH_BYTES)
-                xpc_array_set_string(paths, XPC_ARRAY_APPEND,
-                                     path.fileSystemRepresentation);
-        }
-        xpc_dictionary_set_value(event, MACWS_INTEROP_KEY_ITEMS, paths);
-        xpc_dictionary_set_uint64(event, "origin_id", DaemonOriginID);
-        xpc_dictionary_set_uint64(event, "generation", ++Generation);
-        Broadcast(event);
-        return;
-    }
-
-    NSData *png = [pasteboard dataForType:NSPasteboardTypePNG];
-    if (png.length && png.length <= MACWS_INTEROP_MAX_INLINE_BYTES) {
-        Broadcast(EventForData(MacWSInteropKindPNG, png, @"public.png"));
-        return;
-    }
-    NSString *string = [pasteboard stringForType:NSPasteboardTypeString];
-    NSData *text = [string dataUsingEncoding:NSUTF8StringEncoding];
-    if (text.length && text.length <= MACWS_INTEROP_MAX_INLINE_BYTES)
-        Broadcast(EventForData(MacWSInteropKindUTF8Text, text,
-                               @"public.utf8-plain-text"));
+    NSString *message = nil;
+    NSData *archive = ArchiveDataForPasteboard(pasteboard, &message);
+    if (!archive) return;
+    xpc_object_t event = xpc_dictionary_create(NULL, NULL, 0);
+    AttachArchive(event, archive, MACWS_INTEROP_EVENT_PASTEBOARD);
+    Broadcast(event);
 }
 
 static BOOL SafeImportedPath(NSString *path) {
@@ -795,6 +1127,152 @@ static void ApplyImportedFiles(xpc_object_t request) {
     }
 }
 
+static BOOL ApplyPasteboardArchive(xpc_object_t request, NSString **message) {
+    size_t descriptorSize = 0;
+    const void *descriptorBytes = xpc_dictionary_get_data(
+        request, MACWS_INTEROP_KEY_DESCRIPTOR, &descriptorSize);
+    if (!descriptorBytes || descriptorSize != sizeof(MacWSInteropItemDescriptor)) {
+        if (message) *message = @"missing pasteboard descriptor";
+        return NO;
+    }
+    MacWSInteropItemDescriptor descriptor;
+    memcpy(&descriptor, descriptorBytes, sizeof(descriptor));
+    if (!MacWSInteropItemDescriptorIsValid(&descriptor, descriptorSize) ||
+        descriptor.kind != MacWSInteropKindPasteboardArchive ||
+        descriptor.originID == DaemonOriginID ||
+        (descriptor.flags & MacWSInteropFromIOS) == 0) {
+        if (message) *message = @"invalid pasteboard descriptor";
+        return NO;
+    }
+    size_t payloadSize = 0;
+    const void *payloadBytes = xpc_dictionary_get_data(
+        request, MACWS_INTEROP_KEY_PAYLOAD, &payloadSize);
+    if (!payloadBytes || payloadSize != descriptor.payloadLength ||
+        payloadSize > MACWS_INTEROP_MAX_INLINE_BYTES) {
+        if (message) *message = @"invalid pasteboard payload length";
+        return NO;
+    }
+    NSData *archive = [NSData dataWithBytes:payloadBytes length:payloadSize];
+    uint8_t digest[16];
+    Digest(archive, digest);
+    if (memcmp(digest, descriptor.digest, sizeof(digest)) != 0) {
+        if (message) *message = @"pasteboard digest mismatch";
+        return NO;
+    }
+    if (descriptor.originID == LastIncomingOrigin &&
+        descriptor.generation <= LastIncomingGeneration) {
+        if (message) *message = @"duplicate pasteboard generation";
+        return NO;
+    }
+    NSArray *items = ValidatedArchiveItems(archive, message);
+    if (!items) return NO;
+
+    NSPasteboard *pasteboard = NSPasteboard.generalPasteboard;
+    NSMutableArray<id<NSPasteboardWriting>> *pasteboardItems =
+        [NSMutableArray array];
+    for (NSDictionary *item in items) {
+        NSMutableArray<NSDictionary *> *safeRepresentations =
+            [NSMutableArray array];
+        NSURL *fileURL = nil;
+        for (NSDictionary *representation in
+                item[MacWSArchiveRepresentationsKey]) {
+            NSString *type = representation[MacWSArchiveTypeKey];
+            NSString *path = representation[MacWSArchiveFilePathKey];
+            if (path) {
+                BOOL isDirectory = NO;
+                if (SafeImportedPath(path) &&
+                    [NSFileManager.defaultManager fileExistsAtPath:path
+                                                        isDirectory:&isDirectory]) {
+                    NSURL *url = [NSURL fileURLWithPath:path
+                                           isDirectory:isDirectory];
+                    if ([type isEqualToString:NSPasteboardTypeFileURL])
+                        fileURL = url;
+                    [safeRepresentations addObject:representation];
+                }
+            } else {
+                [safeRepresentations addObject:representation];
+            }
+        }
+        if (safeRepresentations.count) {
+            MacWSArchivePasteboardWriter *writer =
+                [MacWSArchivePasteboardWriter new];
+            writer.representations = safeRepresentations;
+            writer.fileURL = fileURL;
+            [pasteboardItems addObject:writer];
+        }
+    }
+    if (!pasteboardItems.count) {
+        if (message) *message = @"no safe pasteboard representations to apply";
+        return NO;
+    }
+    [pasteboard clearContents];
+    if (![pasteboard writeObjects:pasteboardItems]) {
+        if (message) *message = @"NSPasteboard rejected the archive";
+        return NO;
+    }
+    LastIncomingOrigin = descriptor.originID;
+    LastIncomingGeneration = descriptor.generation;
+    AppliedPasteboardChange = pasteboard.changeCount;
+    LastPasteboardChange = AppliedPasteboardChange;
+    InteropLog(@"applied iPadOS pasteboard generation=%llu items=%lu change=%ld",
+        (unsigned long long)descriptor.generation,
+        (unsigned long)pasteboardItems.count, (long)AppliedPasteboardChange);
+    return YES;
+}
+
+static void ReplyWithDragPasteboard(xpc_connection_t peer,
+                                    xpc_object_t request) {
+    NSPasteboard *pasteboard = [NSPasteboard pasteboardWithName:NSPasteboardNameDrag];
+    xpc_object_t reply = xpc_dictionary_create_reply(request);
+    if (!reply) return;
+    xpc_object_t afterValue = xpc_dictionary_get_value(
+        request, MACWS_INTEROP_KEY_AFTER_CHANGE_COUNT);
+    uint64_t after = afterValue ? xpc_dictionary_get_uint64(
+        request, MACWS_INTEROP_KEY_AFTER_CHANGE_COUNT) : 0;
+    uint64_t waitMilliseconds = MIN(xpc_dictionary_get_uint64(
+        request, MACWS_INTEROP_KEY_WAIT_MILLISECONDS), 600);
+    uint64_t deadline = mach_absolute_time();
+    mach_timebase_info_data_t timebase;
+    mach_timebase_info(&timebase);
+    deadline += waitMilliseconds * 1000000ull * timebase.denom / timebase.numer;
+    uint64_t stableTicks = 60ull * 1000000ull * timebase.denom / timebase.numer;
+    uint64_t observedChange = (uint64_t)MAX(pasteboard.changeCount, 0);
+    uint64_t stableSince = mach_absolute_time();
+    while (afterValue && mach_absolute_time() < deadline) {
+        uint64_t current = (uint64_t)MAX(pasteboard.changeCount, 0);
+        if (current != observedChange) {
+            observedChange = current;
+            stableSince = mach_absolute_time();
+        } else if (current > after &&
+                   mach_absolute_time() - stableSince >= stableTicks) {
+            // Runtime-confirmed with Ventura Finder on the target: the first
+            // drag-board generation exposes only com.apple.finder.node; its
+            // native release/finalization adds public.file-url in a later
+            // generation. Do not snapshot the private intermediate form.
+            BOOL finderNodePending = [pasteboard availableTypeFromArray:@[
+                @"com.apple.finder.node"]] != nil &&
+                [pasteboard availableTypeFromArray:@[
+                    NSPasteboardTypeFileURL]] == nil;
+            if (!finderNodePending) break;
+        }
+        usleep(10000);
+    }
+    uint64_t change = (uint64_t)MAX(pasteboard.changeCount, 0);
+    xpc_dictionary_set_uint64(reply, MACWS_INTEROP_KEY_CHANGE_COUNT, change);
+    if (afterValue && change > after) {
+        NSString *message = nil;
+        NSData *archive = ArchiveDataForPasteboard(pasteboard, &message);
+        if (archive) {
+            AttachArchive(reply, archive, NULL);
+            xpc_dictionary_set_bool(reply, MACWS_INTEROP_KEY_OK, true);
+        } else if (message.length) {
+            xpc_dictionary_set_string(reply, MACWS_INTEROP_KEY_MESSAGE,
+                                      message.UTF8String);
+        }
+    }
+    xpc_connection_send_message(peer, reply);
+}
+
 static void HandleMessage(xpc_connection_t peer, xpc_object_t message) {
     if (message == XPC_ERROR_CONNECTION_INVALID ||
         message == XPC_ERROR_CONNECTION_INTERRUPTED) {
@@ -827,6 +1305,20 @@ static void HandleMessage(xpc_connection_t peer, xpc_object_t message) {
         ApplyInlineClipboard(message);
     } else if (strcmp(operation, MACWS_INTEROP_OP_IMPORT_FILES) == 0) {
         ApplyImportedFiles(message);
+    } else if (strcmp(operation, MACWS_INTEROP_OP_PUBLISH_PASTEBOARD) == 0) {
+        NSString *replyMessage = nil;
+        BOOL applied = ApplyPasteboardArchive(message, &replyMessage);
+        xpc_object_t reply = xpc_dictionary_create_reply(message);
+        if (reply) {
+            xpc_dictionary_set_bool(reply, MACWS_INTEROP_KEY_OK, applied);
+            if (replyMessage.length)
+                xpc_dictionary_set_string(reply, MACWS_INTEROP_KEY_MESSAGE,
+                                          replyMessage.UTF8String);
+            xpc_connection_send_message(peer, reply);
+        }
+    } else if (strcmp(operation,
+                      MACWS_INTEROP_OP_SNAPSHOT_DRAG_PASTEBOARD) == 0) {
+        ReplyWithDragPasteboard(peer, message);
     } else if (strcmp(operation, MACWS_INTEROP_OP_PUBLISH_LOCATION) == 0) {
         ApplyNativeLocation(message);
     }

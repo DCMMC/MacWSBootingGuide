@@ -2,7 +2,7 @@
 
 > 目标平台：iPadOS 16、台前调度、macOS 13.4 chroot。
 > 设计优先级：触屏体验 > 妙控键盘体验 > 兼容性回退。
-> 文档状态：2026-08-12；单窗 DisplayStream、全屏 WindowServer 最终 AGX 合成 IOSurface、瞬态窗口输入图、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。全屏 Host 已直接显示与 VNC 同源的最终合成像素，窗口外部阴影、Dock 毛玻璃和 Genie 最小化变形不再由分层窗口近似重建。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 与 Maps 证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。完整最终合成协议、视觉和性能证据见 [`final-composite-effects-20260812.md`](final-composite-effects-20260812.md)。四窗与完整长期压力门槛仍单列为未完成。
+> 文档状态：2026-09-06；单窗 DisplayStream、全屏 WindowServer 最终 AGX 合成 IOSurface、瞬态窗口输入图、原生输入、Carbon 右键菜单选择、Ventura 原生 `NSOpenPanel`、当前 Scene 的真实系统全屏以及 Finder/Dock/Launchpad/SystemUIServer/ControlCenter Aqua 工作区均已在目标 iPad 运行确认。全屏 Host 已直接显示与 VNC 同源的最终合成像素，窗口外部阴影、Dock 毛玻璃和 Genie 最小化变形不再由分层窗口近似重建。Launchpad 已由空数据库恢复为 63 个应用，Finder/IconServices 的 chroot root-volume 回归已在实际 DesktopServicesPriv 二进制上完成 RE、修复并通过生产运行，见 [`finder-iconservices-root-volume-20260804.md`](finder-iconservices-root-volume-20260804.md)。System Settings 与 Maps 证据见 [`catalyst-system-apps-20260804.md`](catalyst-system-apps-20260804.md)。完整最终合成协议、视觉和性能证据见 [`final-composite-effects-20260812.md`](final-composite-effects-20260812.md)。多格式剪贴板、单窗跨应用拖放和 File Coordination 修复证据见 [`drag-clipboard-interop-20260906.md`](evidence/drag-clipboard-interop-20260906.md)。四窗与完整长期压力门槛仍单列为未完成。
 
 ## 一、方案总览
 
@@ -26,7 +26,7 @@
 | 直接触控与触控板 | 单指可直接点控；也可把玻璃当相对触控板；妙控键盘指针始终保持绝对坐标；全桌面按真实 CGWindow 前后顺序逐点选择 owner | 原生协议语义矩阵、60 Hz 拖动、Carbon 右键菜单、Dock/Launchpad 和 ControlCenter 点击、滚动压力已在 iPad 通过；真实手指主观手感继续回归 |
 | 全屏桌面手势 | 全屏工作区的屏幕虚拟触控板识别三指方向手势，发送一次性 macOS 桌面命令；外接妙控板保留 iPadOS 系统三指手势 | 规划；桌面命令路径与设备输入边界待验证 |
 | Scene 顶部菜单栏 | 从目标 AppKit 进程同步 `NSMainMenu` 语义；触屏采用“紧凑可读 → 首次点击展开 → 第二次点击执行”，键鼠保持紧凑桌面逻辑 | 精确 PID/window、generation 快照和动作桥已实现；macOS 外观、hover/键盘导航与复杂菜单仍待完善 |
-| 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界 XPC 协议同步文本/图片并暂存文件，使用 generation 防回环 | 已实现；权限与拖放待验证 |
+| 剪贴板、图片与文件 | iOS 与 macOS 之间通过有界二进制 plist 归档同步有序 item/UTI 表示；文件只传共享暂存路径，使用 digest、origin 和 generation 校验与防回环 | 双向多格式归档、Finder 文件引用解析、iPadOS 拖入后的真实 Command-V 与 macOS 拖出均已 runtime-confirmed；完整应用矩阵与长期清理待继续验证 |
 | 性能与稳定性 | 每个基础/瞬态 producer 独立最多三帧在途；最终合成以一深度 latest-state observer 合并积压，Producer 完成后才发布，Host Metal 完成后释放消费 lease | 最终合成真实手势 soak 为 82.94 可见 FPS、47.98 FPS 1% low、GPU p95 0.863 ms、0 次 Metal error；四窗和长期压力仍待验收 |
 
 ### 3. 端到端结构
@@ -53,7 +53,7 @@ MacWSHost（iPadOS）
   ├─ 全屏精确层不重复绘制，仅用于指针/触摸 owner 命中
   ├─ 等比视口、缩放、遮罩、密度选择
   └─ Scene 顶部语义菜单 / 触摸 / 全屏桌面手势 / 妙控键盘 / 拖放 / 剪贴板
-             │ 84-byte v4 有版本输入记录
+             │ 84-byte v5 有版本输入记录
              ▼
 macwsinputd → 精确 owner PID → AppInputBridge → 目标 NSWindow
 ```
@@ -282,12 +282,13 @@ iPadOS 的三指左/右滑撤销/重做属于 UIKit 标准编辑交互，应用�
 
 ### 8. 剪贴板、图片、文件与拖放
 
-- 文本、PNG、JPEG 通过 XPC inline 传输，单项最多 8 MiB；描述符含 generation、origin 和 SHA-256 截断摘要。
-- iPad → macOS 的文件先复制到 `/Users/Shared/MacWS Imports/<UUID>/`，然后作为原生 file URL 写入 NSPasteboard。
-- macOS → iPad 的 file URL 经 `/var/mnt/rootfs` 映射，供粘贴、拖出和 share sheet 使用。
-- 每次读取 iPadOS general pasteboard 必须由用户动作触发，避免无意触发系统粘贴隐私提示。
-- 同一内容由 origin/generation 去重，服务重启后也不得在两端无限回弹。
-- 安全作用域 URL 必须在复制完成后成对结束访问；路径需 canonicalize 并限制在允许的 rootfs/暂存目录内。
+- 协议 v2 使用有界 binary-plist 归档保留最多 32 个有序 pasteboard item、128 个 UTI 表示和总计 64 MiB inline 数据；文本、RTF、HTML、图片及应用自定义表示不再被降级为单一字符串或 PNG。描述符仍包含 generation、origin 和 SHA-256 截断摘要。
+- iPadOS general pasteboard 在 Host 前台发生真实 change-count 变化时自动同步；远端应用期间用进程级 origin/generation 抑制回弹。多 Scene 只由一个 Host client 发布，publisher 销毁后由仍存活的 Scene 接管。
+- iPad → macOS 文件先复制到 `/Users/Shared/MacWS Imports/<UUID>/`，然后由一个实现 `NSPasteboardWriting` 的归档 writer 写成 NSURL 的原生 pasteboard 格式。iPadOS drop 只在 macwsinteropd 确认归档落板后点击精确落点，再执行目标应用当前 enabled 的真实 Command-V menu action。
+- macOS → iPad 文件先复制到 `/Users/Shared/MacWS Exports/<UUID>/` 并递归赋予 Host 可读权限，再通过 `/var/mnt/rootfs` 映射为 `NSItemProvider`。Ventura Finder 的 `com.apple.finder.node` file-reference URL 用公开 `fsgetpath(2)` 和卷 fsid 恢复真实路径；不伪造文件内容或绕过 Finder 检查。
+- 单窗长按由 `UIDragInteraction` 启动；Host 在同一触点完成一次有配对 release/cancel 的 AppKit drag transaction，macwsinteropd 等待 `NSDragPboard` 的 `public.file-url` 生成稳定后，将原 item/UTI 表示转换成原生 iPadOS drag items。用户取消仍会释放合成的主键按下状态。
+- 所有归档文件路径 canonicalize 后必须位于 `MacWS Imports` 或 `MacWS Exports`，安全作用域 URL 在复制完成后成对结束访问。归档 item、表示数量、类型长度、payload 长度与 digest 均在收发两侧重新校验。
+- Ventura `NSFileCoordinator` 不能由当前 System-session GUI 进程直接连接 user/501 的 stock daemon。正式路径保留真实 user/501 `filecoordinationd`，以两个 iOS 原生 XPC bundle 分别中继 `FileCoordination` 与 `ProgressReporting` 到私有 Ventura Mach endpoint；每个下游 client 使用独立上游连接，消息与 reply dictionary 保持原协议语义。
 
 **macOS 原生打开/保存面板**
 

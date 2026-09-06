@@ -5,13 +5,13 @@
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleExecutable</key>
-    <string>FileCoordinationProxy</string>
+    <string>ProgressReportingProxy</string>
     <key>CFBundleIdentifier</key>
     <string>com.apple.ProgressReporting</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>FileCoordination Chroot Proxy</string>
+    <string>Progress Reporting Chroot Proxy</string>
     <key>CFBundlePackageType</key>
     <string>XPC!</string>
     <key>CFBundleSupportedPlatforms</key>

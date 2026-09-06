@@ -1987,6 +1987,7 @@ static NSUInteger MacWSNSEventType(MacWSInputKind kind) {
         case MacWSInputKindScroll:
         case MacWSInputKindMagnify:
         case MacWSInputKindRotate:
+        case MacWSInputKindPerformPaste:
         case MacWSInputKindConfigureWindow:
         case MacWSInputKindCloseWindow:
         case MacWSInputKindCreateInitialWindow:
@@ -2466,7 +2467,7 @@ static BOOL MacWSInputRecordIsValid(const MacWSInputRecord *record) {
     return
         record->version == MACWS_INPUT_VERSION &&
         record->kind >= MacWSInputKindTouchDown &&
-        record->kind <= MacWSInputKindRotate &&
+        record->kind <= MacWSInputKindPerformPaste &&
         record->x >= 0.0f && record->y >= 0.0f &&
         record->x < record->frameWidth &&
         record->y < record->frameHeight;
@@ -4972,12 +4973,12 @@ static BOOL MacWSDeliverMissingActivateEvent(id application) {
         application, sel_registerName("isActive"));
 }
 
-// Resolve the application's current native menu instead of assuming a Finder
-// private selector. AppKit defines Command-N as the standard new-window/new-
-// document action, but the concrete target and action belong to the running
-// application and may change with localization or responder state.
-static id MacWSFindInitialWindowMenuItem(id menu, NSUInteger depth) {
-    if (!menu || depth >= MACWS_MENU_MAX_DEPTH) return nil;
+// Resolve a current native menu item by its actual key equivalent instead of
+// assuming an application-private selector. The concrete target and action
+// belong to the running application and may change with responder state.
+static id MacWSFindEnabledCommandMenuItem(id menu, NSString *wantedKey,
+                                          NSUInteger depth) {
+    if (!menu || !wantedKey.length || depth >= MACWS_MENU_MAX_DEPTH) return nil;
     SEL updateSelector = sel_registerName("update");
     if (((MacWSMsgBoolSEL)objc_msgSend)(
             menu, sel_registerName("respondsToSelector:"), updateSelector))
@@ -4988,13 +4989,13 @@ static id MacWSFindInitialWindowMenuItem(id menu, NSUInteger depth) {
     for (id item in items) {
         id submenu = ((MacWSMsgID)objc_msgSend)(
             item, sel_registerName("submenu"));
-        id nested = MacWSFindInitialWindowMenuItem(submenu, depth + 1);
+        id nested = MacWSFindEnabledCommandMenuItem(
+            submenu, wantedKey, depth + 1);
         if (nested) return nested;
         id key = ((MacWSMsgID)objc_msgSend)(
             item, sel_registerName("keyEquivalent"));
         if (![key isKindOfClass:objc_getClass("NSString")] ||
-            [key caseInsensitiveCompare:MacWSRuntimeString("n")] !=
-                NSOrderedSame)
+            [key caseInsensitiveCompare:wantedKey] != NSOrderedSame)
             continue;
         NSUInteger modifiers = ((MacWSMsgUInteger)objc_msgSend)(
             item, sel_registerName("keyEquivalentModifierMask"));
@@ -5011,6 +5012,12 @@ static id MacWSFindInitialWindowMenuItem(id menu, NSUInteger depth) {
         return item;
     }
     return nil;
+}
+
+// AppKit defines Command-N as the standard new-window/new-document action.
+static id MacWSFindInitialWindowMenuItem(id menu, NSUInteger depth) {
+    return MacWSFindEnabledCommandMenuItem(
+        menu, MacWSRuntimeString("n"), depth);
 }
 
 static id MacWSFindEnabledMenuItemWithTitle(id menu, NSString *wantedTitle,
@@ -5859,6 +5866,47 @@ static void MacWSPostInputOnMainThread(MacWSInputRecord record) {
 
     if (record.kind == MacWSInputKindDesktopCommand) {
         (void)MacWSPostDesktopCommand((MacWSDesktopCommand)record.contactID);
+        return;
+    }
+
+    if (record.kind == MacWSInputKindPerformPaste) {
+        uint32_t requestedWindowNumber =
+            MacWSInputWindowIDForScene(record.sceneID);
+        id requestedWindow = requestedWindowNumber
+            ? MacWSWindowWithNumber(application, requestedWindowNumber) : nil;
+        if (requestedWindowNumber && !requestedWindow) {
+            fprintf(stderr,
+                "#### APP-INPUT PASTE pid=%d window=%u item=nil "
+                "action=nil performed=NO reason=target-window-closed\n",
+                getpid(), requestedWindowNumber);
+            fflush(stderr);
+            return;
+        }
+        if (requestedWindow && ((MacWSMsgBool)objc_msgSend)(
+                requestedWindow, sel_registerName("canBecomeKeyWindow"))) {
+            ((MacWSMsgVoid)objc_msgSend)(
+                requestedWindow, sel_registerName("makeKeyWindow"));
+        }
+        id mainMenu = ((MacWSMsgID)objc_msgSend)(
+            application, sel_registerName("mainMenu"));
+        id item = MacWSFindEnabledCommandMenuItem(
+            mainMenu, MacWSRuntimeString("v"), 0);
+        SEL action = item ? ((SEL (*)(id, SEL))objc_msgSend)(
+            item, sel_registerName("action")) : NULL;
+        id target = item ? ((MacWSMsgID)objc_msgSend)(
+            item, sel_registerName("target")) : nil;
+        BOOL performed = action && ((MacWSMsgBoolSELIDID)objc_msgSend)(
+            application, sel_registerName("sendAction:to:from:"),
+            action, target, item);
+        fprintf(stderr,
+            "#### APP-INPUT PASTE pid=%d window=%u item=%s action=%s "
+            "target=%s performed=%s\n",
+            getpid(), requestedWindowNumber,
+            item ? "Command-V" : "nil",
+            action ? sel_getName(action) : "nil",
+            target ? object_getClassName(target) : "nil",
+            performed ? "YES" : "NO");
+        fflush(stderr);
         return;
     }
 

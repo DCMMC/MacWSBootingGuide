@@ -55,6 +55,7 @@ if [ "$FAST" = "1" ] && [ "$FAST_FORCE" != "1" ]; then
                      ExtensionKitChrootProxy \
                      SettingsExtensionChrootProxy \
                      FileCoordinationChrootProxy \
+                     FileCoordinationMachBridge \
                      GeodChrootProxy \
                      WriteConfigChrootProxy \
                      LocationdChrootProxy \

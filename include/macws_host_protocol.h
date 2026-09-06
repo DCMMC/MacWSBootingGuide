@@ -159,6 +159,10 @@ enum {
     // the complete gesture and phase reuses the gesture flag aliases below.
     // Version 5 adds this kind without changing the 84-byte record layout.
     MacWSInputKindRotate = 22,
+    // Invoke the target application's currently enabled Command-V menu item.
+    // The item supplies its real AppKit target/action after the Host has
+    // focused the exact drop point and macwsinteropd has committed the data.
+    MacWSInputKindPerformPaste = 23,
 };
 
 typedef uint32_t MacWSDesktopCommand;

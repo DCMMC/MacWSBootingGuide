@@ -698,6 +698,7 @@ if [ -x /var/jb/Applications/SettingsExtensionProxy.app/SettingsExtensionProxy ]
     uicache -p /var/jb/Applications/SettingsExtensionProxy.app >/dev/null 2>&1 || true
 fi
 add_all_trustcache "/var/jb/usr/macOS/Frameworks/FileCoordination.framework/Versions/A/XPCServices/FileCoordinationProxy.xpc/FileCoordinationProxy"
+add_all_trustcache "/var/jb/usr/macOS/Frameworks/FileCoordination.framework/Versions/A/XPCServices/ProgressReportingProxy.xpc/ProgressReportingProxy"
 # The flat iOS proxy bundles above are only the launch images visible to the
 # iOS XPC service manager.  Their SETEXEC targets live inside the macOS rootfs
 # and are admitted by iOS AMFI before libmachook/autosignd can run.  Runtime

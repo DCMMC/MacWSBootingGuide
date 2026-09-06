@@ -206,6 +206,8 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         return record->targetPID > 1;
     if (record->kind == MacWSInputKindReopenApplication)
         return record->targetPID > 1;
+    if (record->kind == MacWSInputKindPerformPaste)
+        return record->targetPID > 1;
     if (record->kind == MacWSInputKindDesktopCommand)
         return record->targetPID > 1 &&
             record->contactID >= MacWSDesktopCommandSpaceLeft &&
@@ -249,7 +251,7 @@ static bool RecordIsValid(const MacWSInputRecord *record) {
         record->x < 0.0f || record->y < 0.0f ||
         record->x >= record->frameWidth || record->y >= record->frameHeight ||
         record->kind < MacWSInputKindTouchDown ||
-        record->kind > MacWSInputKindRotate) {
+        record->kind > MacWSInputKindPerformPaste) {
         return false;
     }
     return true;

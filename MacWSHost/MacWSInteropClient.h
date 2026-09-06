@@ -3,6 +3,7 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @class MacWSInteropClient;
+@class NSItemProvider;
 
 @protocol MacWSInteropClientDelegate <NSObject>
 - (void)interopClient:(MacWSInteropClient *)client
@@ -17,9 +18,17 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly, getter=isConnected) BOOL connected;
 
 - (void)connect;
-// This is deliberately user initiated. Reading the general pasteboard in the
-// background can trigger iPadOS paste privacy UI and is poor touch UX.
+// Publishes every bounded representation of every ordered UIPasteboard item.
+// The client also observes pasteboard changes while MacWSHost is active; this
+// explicit entry point remains useful for retrying after an iPadOS privacy
+// prompt or a temporarily unavailable provider.
 - (void)publishGeneralPasteboard;
+- (void)publishItemProviders:(NSArray<NSItemProvider *> *)providers
+                  completion:(void (^)(BOOL applied,
+                                       NSError * _Nullable error))completion;
+- (uint64_t)macOSDragPasteboardChangeCount;
+- (NSArray<NSItemProvider *> *)macOSDragItemProvidersAfterChangeCount:
+    (uint64_t)changeCount waitMilliseconds:(uint64_t)waitMilliseconds;
 - (void)stageAndPublishFiles:(NSArray<NSURL *> *)urls
                   completion:(void (^)(NSArray<NSURL *> *stagedURLs,
                                        NSError * _Nullable error))completion;

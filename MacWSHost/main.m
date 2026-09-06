@@ -2161,6 +2161,15 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     interopRow.spacing = 8;
     [_macFilesButton addInteraction:[[UIDragInteraction alloc]
         initWithDelegate:self]];
+    // In per-window mode, a long press on rendered macOS content asks the
+    // source AppKit view to populate NSDragPboard, then promotes those exact
+    // representations into a native iPadOS drag session.
+    if (_windowID != 0) {
+        UIDragInteraction *contentDrag = [[UIDragInteraction alloc]
+            initWithDelegate:self];
+        contentDrag.enabled = YES;
+        [_metalView addInteraction:contentDrag];
+    }
     [_metalView addInteraction:[[UIDropInteraction alloc]
         initWithDelegate:self]];
     UIStackView *toolRow1 = [[UIStackView alloc]
@@ -3132,6 +3141,8 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         statusChanged:(NSString *)status
             connected:(BOOL)connected {
     (void)client;
+    MacWSLog(@"interop-status connected=%@ message=%@",
+             connected ? @"YES" : @"NO", status ?: @"");
     _interopLabel.text = [@"互操作：" stringByAppendingString:status];
     _interopLabel.textColor = connected ? UIColor.systemGreenColor
                                         : UIColor.systemOrangeColor;
@@ -3150,13 +3161,37 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (NSArray<UIDragItem *> *)dragInteraction:(UIDragInteraction *)interaction
                      itemsForBeginningSession:(id<UIDragSession>)session {
-    (void)interaction;
-    (void)session;
     NSMutableArray<UIDragItem *> *items = [NSMutableArray array];
+    if (interaction.view == _metalView) {
+        if (_windowID == 0 || !_interopClient.isConnected) return @[];
+        CGPoint point = [session locationInView:_metalView];
+        uint64_t changeCount = [_interopClient macOSDragPasteboardChangeCount];
+        if (![_metalView beginInteropDragProbeAtViewPoint:point]) return @[];
+        // Complete the native AppKit drag transaction before snapshotting.
+        // Runtime evidence from Finder on the target shows its first
+        // mouseDragged publishes only com.apple.finder.node; the matching
+        // release promotes that item to public.file-url on NSDragPboard.
+        [_metalView finishInteropDragProbeCancelled:YES];
+        NSArray<NSItemProvider *> *providers = [_interopClient
+            macOSDragItemProvidersAfterChangeCount:changeCount
+                                  waitMilliseconds:500];
+        for (NSItemProvider *provider in providers)
+            [items addObject:[[UIDragItem alloc] initWithItemProvider:provider]];
+        if (items.count) {
+            [self setNotice:[NSString stringWithFormat:
+                @"已从 macOS 窗口提取 %lu 个可跨 App 拖放项目",
+                (unsigned long)items.count] success:YES];
+        }
+        MacWSLog(@"interop-drag-source window=%u pid=%d point=(%.1f,%.1f) before=%llu providers=%lu",
+            _windowID, _metalView.targetPID, point.x, point.y,
+            (unsigned long long)changeCount, (unsigned long)items.count);
+        return items;
+    }
     for (NSURL *url in _receivedMacOSFiles) {
-        NSItemProvider *provider = [[NSItemProvider alloc] initWithContentsOfURL:url];
-        if (provider) [items addObject:[[UIDragItem alloc]
-            initWithItemProvider:provider]];
+        NSItemProvider *provider = [[NSItemProvider alloc]
+            initWithContentsOfURL:url];
+        if (provider)
+            [items addObject:[[UIDragItem alloc] initWithItemProvider:provider]];
     }
     return items;
 }
@@ -3164,9 +3199,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 - (BOOL)dropInteraction:(UIDropInteraction *)interaction
         canHandleSession:(id<UIDropSession>)session {
     (void)interaction;
-    return [session hasItemsConformingToTypeIdentifiers:@[
-        @"public.item", @"public.image", @"public.text"
-    ]];
+    return session.items.count > 0;
 }
 
 - (UIDropProposal *)dropInteraction:(UIDropInteraction *)interaction
@@ -3178,54 +3211,25 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
 
 - (void)dropInteraction:(UIDropInteraction *)interaction
       performDrop:(id<UIDropSession>)session {
-    (void)interaction;
-    for (UIDragItem *dragItem in session.items) {
-        NSItemProvider *provider = dragItem.itemProvider;
-        if ([provider hasItemConformingToTypeIdentifier:@"public.item"]) {
-            [provider loadFileRepresentationForTypeIdentifier:@"public.item"
-                completionHandler:^(NSURL *url, NSError *error) {
-                    if (!url || error) return;
-                    NSString *cacheDirectory = [@"/var/mobile/Library/Caches/MacWSDrops"
-                        stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-                    [NSFileManager.defaultManager
-                        createDirectoryAtPath:cacheDirectory
-                  withIntermediateDirectories:YES attributes:nil error:nil];
-                    NSString *name = url.lastPathComponent.length
-                        ? url.lastPathComponent : @"Dropped Item";
-                    NSURL *copy = [NSURL fileURLWithPath:
-                        [cacheDirectory stringByAppendingPathComponent:name]];
-                    NSError *copyError = nil;
-                    if (![NSFileManager.defaultManager copyItemAtURL:url
-                                                               toURL:copy
-                                                               error:&copyError]) return;
-                    [self->_interopClient stageAndPublishFiles:@[copy]
-                        completion:^(NSArray<NSURL *> *staged, NSError *stageError) {
-                            [self setNotice:stageError ? stageError.localizedDescription :
-                                [NSString stringWithFormat:@"已拖入 %lu 个文件到 macOS",
-                                 (unsigned long)staged.count]
-                                success:stageError == nil];
-                        }];
-                }];
-        } else if ([provider canLoadObjectOfClass:UIImage.class]) {
-            [provider loadObjectOfClass:UIImage.class
-                completionHandler:^(UIImage *image, NSError *error) {
-                    if (!image || error) return;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        UIPasteboard.generalPasteboard.image = image;
-                        [self->_interopClient publishGeneralPasteboard];
-                    });
-                }];
-        } else if ([provider canLoadObjectOfClass:NSString.class]) {
-            [provider loadObjectOfClass:NSString.class
-                completionHandler:^(NSString *text, NSError *error) {
-                    if (!text || error) return;
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        UIPasteboard.generalPasteboard.string = text;
-                        [self->_interopClient publishGeneralPasteboard];
-                    });
-                }];
-        }
-    }
+    CGPoint point = [session locationInView:_metalView];
+    NSMutableArray<NSItemProvider *> *providers = [NSMutableArray array];
+    for (UIDragItem *dragItem in session.items)
+        if (dragItem.itemProvider) [providers addObject:dragItem.itemProvider];
+    [_interopClient publishItemProviders:providers
+        completion:^(BOOL applied, NSError *error) {
+            MacWSLog(@"interop-drop-target window=%u pid=%d point=(%.1f,%.1f) providers=%lu applied=%@ error=%@",
+                self->_windowID, self->_metalView.targetPID, point.x, point.y,
+                (unsigned long)providers.count, applied ? @"YES" : @"NO",
+                error ?: @"nil");
+            if (applied) {
+                [self->_metalView performInteropPasteAtViewPoint:point];
+                [self setNotice:[NSString stringWithFormat:
+                    @"已在 macOS 落点粘贴 %lu 个拖放项目（保留多格式）",
+                    (unsigned long)providers.count] success:YES];
+            } else {
+                [self setNotice:error.localizedDescription success:NO];
+            }
+        }];
 }
 
 - (NSArray<MacWSStreamWindow *> *)logicalWindowRepresentatives {
@@ -4193,6 +4197,79 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         // signal or a direct process kill, and proves that the application
         // accepted its normal termination action without restarting Dock.
         [self performSemanticShortcutForDiagnostics:@"⌘Q"];
+    } else if ([action isEqualToString:@"test-pasteboard-write"]) {
+        NSString *directory = @"/var/mnt/rootfs/Users/Shared/MacWS Imports/Probe";
+        [NSFileManager.defaultManager createDirectoryAtPath:directory
+                                withIntermediateDirectories:YES
+                                                 attributes:nil error:nil];
+        NSString *path = [directory stringByAppendingPathComponent:
+            @"ipad-rich-clipboard.txt"];
+        [@"MacWS iPadOS file representation\n" writeToFile:path atomically:YES
+            encoding:NSUTF8StringEncoding error:nil];
+        UIPasteboard.generalPasteboard.items = @[
+            @{
+                @"public.utf8-plain-text": @"MacWS iPadOS rich clipboard fixture",
+                @"public.html": [@"<i>MacWS iPadOS rich clipboard fixture</i>"
+                    dataUsingEncoding:NSUTF8StringEncoding],
+                @"public.rtf": [@"{\\rtf1\\ansi MacWS iPadOS rich clipboard fixture}"
+                    dataUsingEncoding:NSUTF8StringEncoding],
+                @"com.macwsguide.ios-probe": [@"opaque-ios-representation"
+                    dataUsingEncoding:NSUTF8StringEncoding],
+            },
+            @{ @"public.file-url": [NSURL fileURLWithPath:path] }
+        ];
+        MacWSLog(@"interop-pasteboard-probe wrote-ios items=%lu change=%ld",
+            (unsigned long)UIPasteboard.generalPasteboard.items.count,
+            (long)UIPasteboard.generalPasteboard.changeCount);
+    } else if ([action isEqualToString:@"test-pasteboard-read"]) {
+        NSMutableArray *types = [NSMutableArray array];
+        NSUInteger representationCount = 0;
+        for (NSDictionary<NSString *, id> *item in
+                UIPasteboard.generalPasteboard.items) {
+            representationCount += item.count;
+            [types addObject:[[item.allKeys sortedArrayUsingSelector:
+                @selector(compare:)] componentsJoinedByString:@","]];
+        }
+        MacWSLog(@"interop-pasteboard-probe read-ios items=%lu reps=%lu types=%@ change=%ld",
+            (unsigned long)UIPasteboard.generalPasteboard.items.count,
+            (unsigned long)representationCount,
+            [types componentsJoinedByString:@" | "],
+            (long)UIPasteboard.generalPasteboard.changeCount);
+    } else if ([action isEqualToString:@"test-drag-snapshot"]) {
+        uint64_t change = [_interopClient macOSDragPasteboardChangeCount];
+        NSArray<NSItemProvider *> *providers = [_interopClient
+            macOSDragItemProvidersAfterChangeCount:(change ? change - 1 : 0)
+                                  waitMilliseconds:0];
+        NSMutableArray *types = [NSMutableArray array];
+        for (NSItemProvider *provider in providers)
+            [types addObject:[provider.registeredTypeIdentifiers
+                componentsJoinedByString:@","]];
+        MacWSLog(@"interop-drag-probe change=%llu providers=%lu types=%@",
+            (unsigned long long)change, (unsigned long)providers.count,
+            [types componentsJoinedByString:@" | "]);
+    } else if ([action isEqualToString:@"test-drop-file"]) {
+        NSString *directory = @"/var/mobile/Library/Caches/MacWSDropProbe";
+        [NSFileManager.defaultManager createDirectoryAtPath:directory
+                                withIntermediateDirectories:YES
+                                                 attributes:nil error:nil];
+        NSString *name = [NSString stringWithFormat:@"macws-drop-probe-%@.txt",
+            NSUUID.UUID.UUIDString];
+        NSURL *url = [NSURL fileURLWithPath:
+            [directory stringByAppendingPathComponent:name]];
+        [@"MacWS iPadOS-to-macOS drop witness\n" writeToURL:url atomically:YES
+            encoding:NSUTF8StringEncoding error:nil];
+        NSItemProvider *provider = [[NSItemProvider alloc]
+            initWithContentsOfURL:url];
+        CGPoint point = CGPointMake(CGRectGetMidX(_metalView.bounds),
+                                    CGRectGetMidY(_metalView.bounds));
+        [_interopClient publishItemProviders:provider ? @[provider] : @[]
+            completion:^(BOOL applied, NSError *error) {
+                if (applied)
+                    [self->_metalView performInteropPasteAtViewPoint:point];
+                MacWSLog(@"interop-drop-probe file=%@ window=%u pid=%d applied=%@ error=%@",
+                    name, self->_windowID, self->_metalView.targetPID,
+                    applied ? @"YES" : @"NO", error ?: @"nil");
+            }];
     } else if ([action isEqualToString:@"fullscreen"]) {
         [self openFullscreenWorkspace];
     } else if ([action isEqualToString:@"enter-workspace"]) {
@@ -5183,6 +5260,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
     if (_streamMode == MacWSStreamModeFullscreen &&
         record.kind != MacWSInputKindKeyDown &&
         record.kind != MacWSInputKindKeyUp &&
+        record.kind != MacWSInputKindPerformPaste &&
         record.kind != MacWSInputKindActivateTarget &&
         record.kind != MacWSInputKindDesktopCommand &&
         record.kind != MacWSInputKindSystemGesture) {
@@ -5206,6 +5284,7 @@ static UILabel *MacWSMakeLabel(NSString *text, UIFont *font, UIColor *color) {
         case MacWSInputKindScroll: phase = @"scroll"; break;
         case MacWSInputKindMagnify: phase = @"magnify"; break;
         case MacWSInputKindRotate: phase = @"rotate"; break;
+        case MacWSInputKindPerformPaste: phase = @"perform-paste"; break;
         case MacWSInputKindDesktopCommand: phase = @"desktop-command"; break;
         case MacWSInputKindSystemGesture: phase = @"system-gesture"; break;
         case MacWSInputKindKeyDown: phase = @"key-down"; break;
@@ -5812,6 +5891,38 @@ static void MacWSDeduplicateWindowScenes(void) {
                      record.frameHeight);
             break;
         }
+        if ([context.URL.host isEqualToString:@"test-drag-source"]) {
+            MacWSViewController *controller =
+                (MacWSViewController *)self.window.rootViewController;
+            MacWSMetalView *metalView = [controller valueForKey:@"metalView"];
+            MacWSInteropClient *interop = [controller valueForKey:@"interopClient"];
+            CGFloat x = CGRectGetMidX(metalView.bounds);
+            CGFloat y = CGRectGetMidY(metalView.bounds);
+            NSURLComponents *components = [NSURLComponents
+                componentsWithURL:context.URL resolvingAgainstBaseURL:NO];
+            for (NSURLQueryItem *item in components.queryItems) {
+                if ([item.name isEqualToString:@"x"]) x = item.value.doubleValue;
+                else if ([item.name isEqualToString:@"y"])
+                    y = item.value.doubleValue;
+            }
+            CGPoint point = CGPointMake(x, y);
+            uint64_t before = [interop macOSDragPasteboardChangeCount];
+            BOOL began = [metalView beginInteropDragProbeAtViewPoint:point];
+            if (began) [metalView finishInteropDragProbeCancelled:YES];
+            NSArray<NSItemProvider *> *providers = began ? [interop
+                macOSDragItemProvidersAfterChangeCount:before
+                                      waitMilliseconds:500] : @[];
+            NSMutableArray *types = [NSMutableArray array];
+            for (NSItemProvider *provider in providers)
+                [types addObject:[provider.registeredTypeIdentifiers
+                    componentsJoinedByString:@","]];
+            MacWSLog(@"interop-drag-source-probe window=%u pid=%d point=(%.1f,%.1f) before=%llu began=%@ providers=%lu types=%@",
+                metalView.targetWindowID, metalView.targetPID, x, y,
+                (unsigned long long)before, began ? @"YES" : @"NO",
+                (unsigned long)providers.count,
+                [types componentsJoinedByString:@" | "]);
+            break;
+        }
         if ([context.URL.host isEqualToString:@"test-catalyst-drawable"]) {
             MacWSViewController *controller =
                 (MacWSViewController *)self.window.rootViewController;
@@ -5853,7 +5964,9 @@ static void MacWSDeduplicateWindowScenes(void) {
                @"amadine", @"word", @"excel",
                @"powerpoint", @"asphalt",
                @"recover", @"repair", @"repair-desktop", @"capture",
-               @"test-open-file", @"test-quit", @"fullscreen",
+               @"test-open-file", @"test-quit", @"test-pasteboard-write",
+               @"test-pasteboard-read", @"test-drag-snapshot",
+               @"test-drop-file", @"fullscreen",
                @"enter-workspace", @"exit-workspace",
                @"close-window",
                @"screenshot-ui", @"screenshot-automation",
